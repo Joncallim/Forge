@@ -98,7 +98,6 @@ export async function installSessionCookie(
       name: 'forge_session',
       value: session.sessionId,
       url: getBaseUrl(),
-      path: '/',
       httpOnly: true,
       sameSite: 'Strict',
     },
