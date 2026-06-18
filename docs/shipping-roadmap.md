@@ -20,9 +20,9 @@ Ship Forge first as a helper-stage beta:
 - App/runtime files under `web/app`, `web/lib`, `web/worker`, and `web/db`.
 - Release checks: `npm run lint`, `npx tsc --noEmit`, `npm test`, and
   `npm run build` from `web/`.
-- Product-design audit lens: used for repo-level UX risks. A screenshot-backed
-  UI audit should be run once seeded runtime data and a target viewport matrix
-  are available.
+- Product-design audit lens: used for repo-level UX risks. The screenshot-backed
+  helper-stage audit is enforced by Playwright and summarized in
+  `docs/ux-audit.md`.
 
 ## Resolved In This Pass
 
@@ -31,9 +31,12 @@ Ship Forge first as a helper-stage beta:
 - Redis singleton no longer tries to connect during import-time build analysis.
 - Lint now passes with current client-fetch dashboard architecture.
 - Stale test comments and unused symbols no longer produce false bug signals.
-- Web CI now gates lint, typecheck, tests, and production build.
+- Web CI now gates lint, typecheck, tests, production build, and the
+  helper-stage E2E smoke path.
 
 ## P0 Before Helper-Stage Beta
+
+Status: complete as of 2026-06-18.
 
 1. Add an end-to-end smoke test for the main path:
    register/login, setup wizard preset, provider health, project creation, task

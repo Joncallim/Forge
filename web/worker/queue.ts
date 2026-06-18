@@ -1,9 +1,20 @@
 import Redis from 'ioredis'
+import { getRequiredEnv } from '../lib/env'
 
 const TASK_QUEUE_KEY = 'forge:tasks'
 const TASK_PROCESSING_QUEUE_KEY = 'forge:tasks:processing'
 const APPROVAL_QUEUE_KEY = 'forge:approvals'
 const APPROVAL_PROCESSING_QUEUE_KEY = 'forge:approvals:processing'
+
+function redisErrorMessage(err: Error): string {
+  const aggregate = err as Error & { code?: string; errors?: { code?: string; message?: string }[] }
+  return (
+    err.message ||
+    aggregate.code ||
+    aggregate.errors?.map((nested) => nested.code ?? nested.message).filter(Boolean).join(', ') ||
+    err.name
+  )
+}
 
 export interface TaskJob {
   taskId: string
@@ -27,14 +38,13 @@ export interface ClaimedApprovalJob {
 export class TaskQueue {
   private readonly client: Redis
 
-  constructor(redisUrl = process.env.REDIS_URL) {
-    if (!redisUrl) {
-      throw new Error('REDIS_URL is required to start the worker')
-    }
-
+  constructor(redisUrl = getRequiredEnv('REDIS_URL')) {
     this.client = new Redis(redisUrl, {
       maxRetriesPerRequest: null,
       retryStrategy: (times) => Math.min(times * 100, 3000),
+    })
+    this.client.on('error', (err) => {
+      console.warn('[worker/queue] Redis connection error:', redisErrorMessage(err))
     })
   }
 
@@ -73,14 +83,13 @@ export class TaskQueue {
 export class ApprovalQueue {
   private readonly client: Redis
 
-  constructor(redisUrl = process.env.REDIS_URL) {
-    if (!redisUrl) {
-      throw new Error('REDIS_URL is required to start the worker')
-    }
-
+  constructor(redisUrl = getRequiredEnv('REDIS_URL')) {
     this.client = new Redis(redisUrl, {
       maxRetriesPerRequest: null,
       retryStrategy: (times) => Math.min(times * 100, 3000),
+    })
+    this.client.on('error', (err) => {
+      console.warn('[worker/queue] Redis connection error:', redisErrorMessage(err))
     })
   }
 

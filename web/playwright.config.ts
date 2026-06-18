@@ -1,0 +1,43 @@
+import { defineConfig, devices } from '@playwright/test'
+
+const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
+
+export default defineConfig({
+  testDir: './e2e',
+  timeout: 60_000,
+  expect: {
+    timeout: 15_000,
+  },
+  fullyParallel: false,
+  reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : 'list',
+  use: {
+    baseURL,
+    trace: 'retain-on-failure',
+    screenshot: 'only-on-failure',
+  },
+  webServer: {
+    command: 'npm run dev -- --hostname 127.0.0.1',
+    url: baseURL,
+    reuseExistingServer: !process.env.CI,
+    timeout: 120_000,
+    env: {
+      DATABASE_URL: process.env.DATABASE_URL ?? '',
+      REDIS_URL: process.env.REDIS_URL ?? '',
+      SESSION_SECRET: process.env.SESSION_SECRET ?? '',
+      WEBAUTHN_RP_ID: process.env.WEBAUTHN_RP_ID ?? 'localhost',
+      WEBAUTHN_RP_NAME: process.env.WEBAUTHN_RP_NAME ?? 'Forge',
+      WEBAUTHN_ORIGIN: process.env.WEBAUTHN_ORIGIN ?? baseURL,
+      NEXT_PUBLIC_APP_URL: process.env.NEXT_PUBLIC_APP_URL ?? baseURL,
+    },
+  },
+  projects: [
+    {
+      name: 'chromium-desktop',
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'chromium-mobile',
+      use: { ...devices['Pixel 5'] },
+    },
+  ],
+})

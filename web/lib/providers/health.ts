@@ -23,6 +23,15 @@ export async function checkProviderHealth(
   // Check whether the API key env var is present (local providers with no key are always "present")
   const envVarPresent = config.apiKeyEnvVar ? !!process.env[config.apiKeyEnvVar] : true
 
+  if (!envVarPresent) {
+    return {
+      reachable: false,
+      envVarPresent,
+      latencyMs: null,
+      error: `Missing environment variable ${config.apiKeyEnvVar}`,
+    }
+  }
+
   let reachable = false
   let latencyMs: number | null = null
   let error: string | null = null
