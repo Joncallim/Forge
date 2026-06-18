@@ -1,0 +1,311 @@
+'use client'
+
+import { useState, useEffect, useCallback } from 'react'
+import { useRouter, useParams } from 'next/navigation'
+import { PlusIcon, ExternalLinkIcon, ArrowLeftIcon } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+  DialogTrigger,
+} from '@/components/ui/dialog'
+
+interface Project {
+  id: string
+  name: string
+  githubRepo: string | null
+  pmProviderConfigId: string | null
+  defaultBranch: string
+  createdAt: string
+  archivedAt: string | null
+}
+
+interface Task {
+  id: string
+  projectId: string
+  title: string
+  prompt: string
+  status: string
+  githubPrUrl: string | null
+  errorMessage: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+type StatusVariant = 'default' | 'secondary' | 'destructive' | 'outline'
+
+function statusBadgeVariant(status: string): StatusVariant {
+  switch (status) {
+    case 'running': return 'default'
+    case 'awaiting_approval': return 'outline'
+    case 'approved':
+    case 'completed': return 'secondary'
+    case 'failed':
+    case 'rejected':
+    case 'cancelled': return 'destructive'
+    default: return 'outline'
+  }
+}
+
+function statusLabel(status: string): string {
+  return status.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+}
+
+function formatDate(iso: string): string {
+  return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(new Date(iso))
+}
+
+export default function ProjectDetailPage() {
+  const router = useRouter()
+  const params = useParams()
+  const projectId = params.id as string
+
+  const [project, setProject] = useState<Project | null>(null)
+  const [tasks, setTasks] = useState<Task[]>([])
+  const [loading, setLoading] = useState(true)
+  const [fetchError, setFetchError] = useState<string | null>(null)
+  const [dialogOpen, setDialogOpen] = useState(false)
+
+  // Task creation form state
+  const [formTitle, setFormTitle] = useState('')
+  const [formPrompt, setFormPrompt] = useState('')
+  const [formError, setFormError] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+
+  const loadData = useCallback(async () => {
+    setLoading(true)
+    setFetchError(null)
+    try {
+      const [projectRes, tasksRes] = await Promise.all([
+        fetch(`/api/projects/${projectId}`),
+        fetch(`/api/tasks?projectId=${projectId}`),
+      ])
+
+      if (!projectRes.ok) {
+        const body = await projectRes.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to load project')
+      }
+      if (!tasksRes.ok) {
+        const body = await tasksRes.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to load tasks')
+      }
+
+      const [projectData, tasksData] = await Promise.all([
+        projectRes.json(),
+        tasksRes.json(),
+      ])
+
+      setProject(projectData.project ?? null)
+      setTasks(tasksData.tasks ?? [])
+    } catch (err) {
+      setFetchError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setLoading(false)
+    }
+  }, [projectId])
+
+  useEffect(() => {
+    loadData()
+  }, [loadData])
+
+  async function handleCreateTask(e: React.FormEvent) {
+    e.preventDefault()
+    setFormError(null)
+    setSubmitting(true)
+    try {
+      const res = await fetch('/api/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          projectId,
+          title: formTitle.trim(),
+          prompt: formPrompt.trim(),
+        }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to create task')
+      }
+      const data = await res.json()
+      const newTaskId = data.task?.id
+      setDialogOpen(false)
+      setFormTitle('')
+      setFormPrompt('')
+      if (newTaskId) {
+        router.push(`/dashboard/tasks/${newTaskId}`)
+      }
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center px-4 py-16" role="status" aria-live="polite">
+        <span className="text-sm text-muted-foreground">Loading project…</span>
+      </div>
+    )
+  }
+
+  if (fetchError !== null) {
+    return (
+      <div className="px-4 py-6 sm:px-6 lg:px-8">
+        <div
+          role="alert"
+          className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+        >
+          {fetchError}
+          <button
+            onClick={loadData}
+            className="ml-2 underline underline-offset-2 hover:no-underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  if (project === null) {
+    return (
+      <div className="px-4 py-6 sm:px-6 lg:px-8">
+        <p className="text-sm text-muted-foreground">Project not found.</p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="px-4 py-6 sm:px-6 lg:px-8">
+      {/* Back navigation */}
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={() => router.push('/dashboard/projects')}
+        className="mb-4 -ml-2"
+        aria-label="Back to projects"
+      >
+        <ArrowLeftIcon aria-hidden="true" />
+        Projects
+      </Button>
+
+      {/* Project heading */}
+      <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-semibold text-foreground">{project.name}</h1>
+          {project.githubRepo !== null && (
+            <a
+              href={`https://github.com/${project.githubRepo}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mt-1 inline-flex items-center gap-1 text-sm text-muted-foreground underline-offset-4 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              aria-label={`Open ${project.githubRepo} on GitHub`}
+            >
+              {project.githubRepo}
+              <ExternalLinkIcon className="size-3.5" aria-hidden="true" />
+            </a>
+          )}
+        </div>
+
+        <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+          <DialogTrigger
+            render={
+              <Button size="sm" aria-label="Create new task">
+                <PlusIcon aria-hidden="true" />
+                New Task
+              </Button>
+            }
+          />
+          <DialogContent className="sm:max-w-lg" aria-labelledby="new-task-title">
+            <DialogHeader>
+              <DialogTitle id="new-task-title">New Task</DialogTitle>
+            </DialogHeader>
+
+            <form onSubmit={handleCreateTask} className="flex flex-col gap-4">
+              <div className="flex flex-col gap-1.5">
+                <label htmlFor="task-title" className="text-sm font-medium text-foreground">
+                  Title <span aria-hidden="true" className="text-destructive">*</span>
+                </label>
+                <input
+                  id="task-title"
+                  type="text"
+                  required
+                  value={formTitle}
+                  onChange={(e) => setFormTitle(e.target.value)}
+                  placeholder="Implement feature X"
+                  className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                  aria-required="true"
+                />
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <label htmlFor="task-prompt" className="text-sm font-medium text-foreground">
+                  Prompt <span aria-hidden="true" className="text-destructive">*</span>
+                </label>
+                <textarea
+                  id="task-prompt"
+                  required
+                  rows={6}
+                  value={formPrompt}
+                  onChange={(e) => setFormPrompt(e.target.value)}
+                  placeholder="Describe what you want the agents to build or change…"
+                  className="resize-y rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                  aria-required="true"
+                />
+              </div>
+
+              {formError !== null && (
+                <p role="alert" aria-live="assertive" className="text-sm text-destructive">
+                  {formError}
+                </p>
+              )}
+
+              <DialogFooter>
+                <Button type="submit" disabled={submitting} aria-busy={submitting}>
+                  {submitting ? 'Creating…' : 'Create Task'}
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      </div>
+
+      {/* Tasks section */}
+      <h2 className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
+        Tasks
+      </h2>
+
+      {tasks.length === 0 ? (
+        <div className="flex flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border py-12 text-center">
+          <p className="text-sm text-muted-foreground">No tasks yet. Create a task to get started.</p>
+        </div>
+      ) : (
+        <ul className="flex flex-col divide-y divide-border rounded-xl border border-border" role="list">
+          {tasks.map((task) => (
+            <li key={task.id}>
+              <button
+                type="button"
+                onClick={() => router.push(`/dashboard/tasks/${task.id}`)}
+                className="flex w-full items-center justify-between gap-4 px-4 py-3 text-left transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50 first:rounded-t-xl last:rounded-b-xl"
+                aria-label={`Open task: ${task.title}`}
+              >
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-medium text-foreground">{task.title}</p>
+                  <p className="mt-0.5 text-xs text-muted-foreground">{formatDate(task.createdAt)}</p>
+                </div>
+                <Badge variant={statusBadgeVariant(task.status)}>
+                  {statusLabel(task.status)}
+                </Badge>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
