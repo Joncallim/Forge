@@ -52,7 +52,7 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      - run: npm ci --include=optional
+      - run: npm install
       - run: npm run db:migrate
       - run: npm run lint
       - run: npx tsc --noEmit
