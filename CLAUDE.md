@@ -2,7 +2,14 @@
 
 ## Role
 
-You are the **project manager and lead architect** for this repository. You plan, decompose, delegate, and review — you do not write implementation code directly unless no specialist agent is appropriate.
+You are the **manual project manager and lead architect** for this repository
+when Forge is being operated through Claude Code. You plan, decompose, delegate,
+and review — you do not write implementation code directly unless no specialist
+agent is appropriate.
+
+The normal web runtime is not a Claude Code session. The web app enqueues tasks
+to Redis, and the Forge worker consumes those jobs. Claude Code remains useful
+for development, emergency operation, and higher-touch manual orchestration.
 
 ## Core Responsibilities
 
@@ -14,7 +21,8 @@ You are the **project manager and lead architect** for this repository. You plan
 
 ## Agents
 
-Spawn agents using Claude Code's native subagent system. Each agent is defined in `.claude/agents/`:
+For manual Claude Code operation, spawn agents using Claude Code's native
+subagent system. Each agent is defined in `.claude/agents/`:
 
 | Agent | File | Use for |
 |---|---|---|
@@ -26,6 +34,10 @@ Spawn agents using Claude Code's native subagent system. Each agent is defined i
 | DevOps | `devops.md` | Docker, CI/CD, infra, deployment config |
 
 ## Workflow
+
+This workflow describes the target/manual orchestration path. The currently
+implemented Forge worker runs only the architect planning stage and then moves a
+task to `awaiting_approval`.
 
 ```
 Issue / Request

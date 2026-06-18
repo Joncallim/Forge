@@ -4,7 +4,7 @@ set -euo pipefail
 echo "==> Forge setup"
 
 # Check dependencies
-for cmd in docker docker-compose claude; do
+for cmd in docker docker-compose; do
   if ! command -v "$cmd" &>/dev/null; then
     echo "ERROR: $cmd is not installed" >&2
     exit 1
@@ -20,10 +20,11 @@ fi
 
 # Start infrastructure
 echo "==> Starting Redis and PostgreSQL"
-docker compose up -d --wait
+docker compose up -d --wait postgres redis
 
 echo "==> Infrastructure ready"
 echo "    PostgreSQL: localhost:5432"
 echo "    Redis:      localhost:6379"
 echo ""
-echo "==> Run 'claude' in this directory to start the Forge PM session"
+echo "==> Start the web UI:  cd web && npm run dev"
+echo "==> Start the worker:  cd web && npm run worker"

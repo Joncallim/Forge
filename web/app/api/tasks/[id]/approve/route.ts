@@ -46,6 +46,11 @@ export async function POST(
       .returning()
 
     await redis.lpush('forge:approvals', JSON.stringify({ taskId, action: 'approve' }))
+    await redis.publish('forge:task:' + taskId, JSON.stringify({
+      type: 'task:status',
+      status: 'approved',
+      updatedAt: task.updatedAt.toISOString(),
+    }))
 
     console.info('[POST /api/tasks/:id/approve] Approved task', { id: taskId })
     return NextResponse.json({ task })

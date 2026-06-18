@@ -2,8 +2,8 @@
 
 This document defines the built-in recommendation presets that the Forge web app
 ships with. The app reads this data at runtime from
-`web/src/lib/recommendations.ts` to populate the setup wizard and the agent
-config UI. No database queries needed — it is static config.
+`web/lib/recommendations.ts` to populate provider presets and the agent config
+UI. No database queries needed — it is static config.
 
 ---
 
@@ -132,19 +132,19 @@ user is manually editing a single agent's provider, regardless of preset.
 
 ## App implementation notes
 
-- `web/src/lib/recommendations.ts` — exports `PRESETS` (the four named configs
+- `web/lib/recommendations.ts` — exports `PRESETS` (the four named configs
   above) and `ROLE_RECOMMENDATIONS` (per-role inline suggestions). Both are
   plain TypeScript constants, no DB required.
-- Setup wizard (first-run, or accessible from Settings) — shows the four
-  presets with estimated monthly cost range. User picks one; the app creates
+- Provider presets UI — shows the four presets. User picks one; the app creates
   the corresponding `provider_configs` rows and sets each `agent_configs` row's
-  `provider_config_id`. Required API keys are flagged as missing if the
-  relevant env vars are not set.
+  `provider_config_id`. Required API keys are flagged as missing if the relevant
+  env vars are not set.
 - Agent config UI — when editing a single agent's provider, the sidebar shows
   the relevant `ROLE_RECOMMENDATIONS` entries with "Recommended" badges,
   grouped by routing layer (Anthropic API / OpenAI API / OpenRouter / LiteLLM
   / Ollama).
 - Cross-provider dispatch — provider selection per agent is stored in
-  `agent_configs.provider_config_id`. The architect agent, when running inside
-  the app, reads each worker's config from this table at dispatch time. It does
-  not assume homogeneity across worker providers.
+  `agent_configs.provider_config_id`. The worker reads the active agent config
+  from this table at dispatch time. The current helper dispatches only the
+  architect stage; future specialist stages should use the same per-agent
+  provider mapping.

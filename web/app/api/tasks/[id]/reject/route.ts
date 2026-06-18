@@ -5,6 +5,7 @@ import { db } from '@/db'
 import { tasks } from '@/db/schema'
 import { eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
+import { redis } from '@/lib/redis'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -74,6 +75,13 @@ export async function POST(
       })
       .where(eq(tasks.id, taskId))
       .returning()
+
+    await redis.publish('forge:task:' + taskId, JSON.stringify({
+      type: 'task:status',
+      status: 'rejected',
+      errorMessage: task.errorMessage,
+      updatedAt: task.updatedAt.toISOString(),
+    }))
 
     console.info('[POST /api/tasks/:id/reject] Rejected task', { id: taskId, reason })
     return NextResponse.json({ task })

@@ -411,7 +411,7 @@ export default function TaskDetailPage() {
       {isAwaitingApproval && (
         <div className="mb-6 rounded-xl border border-border bg-card p-4">
           <p className="mb-3 text-sm font-medium text-foreground">
-            This task is awaiting your approval before continuing.
+            Review the generated plan before closing this helper stage.
           </p>
 
           {actionError !== null && (
@@ -427,7 +427,7 @@ export default function TaskDetailPage() {
                 onClick={handleApprove}
                 disabled={actionLoading}
                 aria-busy={actionLoading}
-                aria-label="Approve task and continue"
+                aria-label="Approve generated plan"
               >
                 {actionLoading ? 'Approving…' : 'Approve'}
               </Button>
