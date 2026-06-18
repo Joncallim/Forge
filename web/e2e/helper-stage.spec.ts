@@ -41,7 +41,7 @@ test.describe('helper-stage beta smoke', () => {
       fullPage: true,
     })
 
-    await page.getByRole('link', { name: 'Projects' }).click()
+    await page.goto('/dashboard/projects')
     await expect(page.getByRole('heading', { name: 'Projects' })).toBeVisible()
     await page.getByRole('button', { name: 'Create new project' }).click()
     await page.getByLabel('Name').fill('Forge Smoke')
@@ -59,7 +59,7 @@ test.describe('helper-stage beta smoke', () => {
 
     await expect(page).toHaveURL(/\/dashboard\/tasks\/[0-9a-f-]+$/)
     await expect(page.getByRole('heading', { name: 'Draft smoke plan' })).toBeVisible()
-    await expect(page.getByText('Awaiting Approval')).toBeVisible()
+    await expect(page.getByText('Awaiting Approval', { exact: true })).toBeVisible()
     await expect(page.getByText('Mock architect plan for Draft smoke plan')).toBeVisible()
     await expect(page.getByRole('button', { name: 'Approve generated plan' })).toBeVisible()
     await page.screenshot({

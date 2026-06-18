@@ -52,6 +52,9 @@ running `npm run e2e`.
 
 - Long provider/model labels should be checked at mobile width in the Providers
   and Setup views.
+- Mobile bottom-tab navigation should be rechecked from deep scroll positions;
+  an early CI trace showed page content intercepting the Projects tab click, so
+  the smoke test now routes directly to the Projects page.
 - The task detail page should be checked with longer architect artifacts to
   ensure review controls remain easy to reach.
 - Empty, loading, failed, and degraded-provider states need a second audit pass
