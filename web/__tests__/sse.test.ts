@@ -35,7 +35,7 @@ const state = vi.hoisted(() => ({
 // We must export a real class (constructor function) so `new` works.
 vi.mock('ioredis', () => {
   class RedisMock {
-    constructor(_url: string) {
+    constructor() {
       // Build a fresh sub stub and store it for test access
       const sub = new EventEmitter() as EventEmitter & {
         subscribe: ReturnType<typeof vi.fn>

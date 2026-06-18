@@ -17,7 +17,6 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { db } from './index'
 import { agentConfigs } from './schema'
-import { eq } from 'drizzle-orm'
 
 // Agents directory is two levels above web/ (repo root .claude/agents/)
 const AGENTS_DIR = path.resolve(__dirname, '../../.claude/agents')

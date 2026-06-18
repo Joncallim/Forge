@@ -210,13 +210,10 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
 // ---------------------------------------------------------------------------
 // Suite 3.5 — Agent type sanitisation: PUT /api/agents/../../etc/passwd returns 400
 //
-// BUG FOUND: The route handler at app/api/agents/[type]/route.ts validates the
-// agent type against a strict allowlist (VALID_AGENT_TYPES). A path segment
-// like "../../etc/passwd" is URL-decoded to "../../etc/passwd" before being
-// passed as `type`. Since it is not in the allowlist, the handler returns 400.
-// This means the path traversal is blocked by the allowlist check, NOT by an
-// explicit path normalisation step — which is the correct outcome but for a
-// slightly different reason. The test documents that the endpoint returns 400.
+// The route handler validates agent types against a strict allowlist
+// (VALID_AGENT_TYPES). A path segment like "../../etc/passwd" is URL-decoded
+// before being passed as `type`, then rejected because it is not allowlisted.
+// This test documents the path traversal regression guard.
 // ---------------------------------------------------------------------------
 
 describe('PUT /api/agents/[type] — path traversal blocked', () => {

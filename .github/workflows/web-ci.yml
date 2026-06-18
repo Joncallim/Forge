@@ -1,0 +1,36 @@
+name: Web CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    env:
+      DATABASE_URL: postgresql://forge:forge@localhost:5432/forge
+      REDIS_URL: redis://localhost:6379/0
+      SESSION_SECRET: 0000000000000000000000000000000000000000000000000000000000000000
+      WEBAUTHN_RP_ID: localhost
+      WEBAUTHN_RP_NAME: Forge
+      WEBAUTHN_ORIGIN: http://localhost:3000
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: npm test
+      - run: npm run build

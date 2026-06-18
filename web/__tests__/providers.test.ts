@@ -26,7 +26,6 @@ const {
   mockCreateOllama,
   mockAnthropicInstance,
   mockOpenAIInstance,
-  mockGoogleInstance,
   mockOllamaInstance,
 } = vi.hoisted(() => {
   const mockAnthropicInstance = vi.fn().mockReturnValue({ _tag: 'anthropic-model' })
