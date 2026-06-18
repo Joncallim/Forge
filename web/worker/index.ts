@@ -4,9 +4,6 @@ import { loadEnvConfig } from '@next/env'
 loadEnvConfig(path.resolve(process.cwd(), '..'))
 loadEnvConfig(process.cwd())
 
-const { ApprovalQueue, TaskQueue } = await import('./queue')
-const { processApproval, processTask } = await import('./orchestrator')
-
 const DEFAULT_CLAIM_TIMEOUT_SECONDS = 5
 const APPROVAL_CLAIM_TIMEOUT_SECONDS = 1
 
@@ -23,6 +20,11 @@ function getClaimTimeoutSeconds(): number {
 }
 
 async function main(): Promise<void> {
+  const [{ ApprovalQueue, TaskQueue }, { processApproval, processTask }] = await Promise.all([
+    import('./queue'),
+    import('./orchestrator'),
+  ])
+
   const taskQueue = new TaskQueue()
   const approvalQueue = new ApprovalQueue()
   const claimTimeoutSeconds = getClaimTimeoutSeconds()
