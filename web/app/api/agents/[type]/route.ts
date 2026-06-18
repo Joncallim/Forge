@@ -16,6 +16,9 @@ import { redis } from '@/lib/redis'
 const VALID_AGENT_TYPES = ['architect', 'backend', 'frontend', 'qa', 'reviewer', 'devops'] as const
 type AgentType = (typeof VALID_AGENT_TYPES)[number]
 
+const AGENT_CONFIG_DIR =
+  process.env.FORGE_AGENT_CONFIG_DIR?.trim() || path.resolve(process.cwd(), '../../.claude/agents')
+
 function isValidAgentType(value: string): value is AgentType {
   return (VALID_AGENT_TYPES as readonly string[]).includes(value)
 }
@@ -35,7 +38,7 @@ const updateAgentSchema = z.object({
 // ---------------------------------------------------------------------------
 
 async function syncAgentFileToDisk(type: AgentType, newSystemPrompt: string): Promise<void> {
-  const agentFilePath = path.resolve(process.cwd(), `../../.claude/agents/${type}.md`)
+  const agentFilePath = path.resolve(AGENT_CONFIG_DIR, `${type}.md`)
 
   let existing = ''
   try {
@@ -44,6 +47,7 @@ async function syncAgentFileToDisk(type: AgentType, newSystemPrompt: string): Pr
     // File does not exist — write without frontmatter
     const errCode = (err as NodeJS.ErrnoException).code
     if (errCode !== 'ENOENT') throw err
+    await fs.mkdir(path.dirname(agentFilePath), { recursive: true })
     await fs.writeFile(agentFilePath, `${newSystemPrompt}\n`, 'utf8')
     console.info('[agents/sync] Created new agent file (no existing frontmatter)', {
       type,

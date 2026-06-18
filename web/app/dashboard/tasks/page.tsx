@@ -15,6 +15,7 @@ import {
 interface Task {
   id: string
   projectId: string
+  projectName?: string
   title: string
   prompt: string
   status: string
@@ -181,7 +182,9 @@ export default function TasksPage() {
                     </button>
                   </td>
                   <td className="hidden px-4 py-3 text-muted-foreground sm:table-cell">
-                    <span className="font-mono text-xs">{task.projectId.slice(0, 8)}</span>
+                    <span className="block max-w-48 truncate text-xs">
+                      {task.projectName ?? task.projectId.slice(0, 8)}
+                    </span>
                   </td>
                   <td className="px-4 py-3">
                     <Badge variant={statusBadgeVariant(task.status)}>

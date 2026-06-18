@@ -79,7 +79,7 @@ function chain(resolveValue: unknown) {
     catch: (onRejected: (e: unknown) => unknown) =>
       Promise.resolve(resolveValue).catch(onRejected),
   }
-  const methods = ['from', 'where', 'limit', 'orderBy', 'values', 'returning', 'set', 'offset']
+  const methods = ['from', 'where', 'limit', 'orderBy', 'values', 'returning', 'set', 'offset', 'innerJoin']
   methods.forEach((m) => { thenable[m] = () => thenable })
   return thenable
 }
@@ -92,6 +92,12 @@ const FAKE_SESSION = { sessionId: 'sess-123', userId: 'user-abc' }
 
 function authRequest(path: string, init: RequestInit = {}) {
   return new Request(`http://localhost${path}`, init)
+}
+
+function nextAuthRequest(path: string, init: RequestInit = {}) {
+  return Object.assign(authRequest(path, init), {
+    nextUrl: new URL(`http://localhost${path}`),
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -315,5 +321,51 @@ describe('POST /api/tasks — enqueues to Redis', () => {
     expect(queueKey).toBe('forge:tasks')
     const parsed = JSON.parse(payload as string)
     expect(parsed).toHaveProperty('taskId', 'task-new')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Suite 3.8 — Task listing includes the project name from the joined project
+// ---------------------------------------------------------------------------
+
+describe('GET /api/tasks — includes project name', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('returns task rows with projectName', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+
+    const listedTask = {
+      id: 'task-listed',
+      projectId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+      projectName: 'Forge Web',
+      title: 'Listed task',
+      prompt: 'Do a listed thing',
+      status: 'pending',
+      submittedBy: 'user-abc',
+      pmProviderConfigId: null,
+      githubBranch: null,
+      githubPrUrl: null,
+      errorMessage: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      completedAt: null,
+    }
+
+    mockDbSelect
+      .mockReturnValueOnce(chain([listedTask]))
+      .mockReturnValueOnce(chain([{ total: 1 }]))
+
+    const { GET } = await import('@/app/api/tasks/route')
+    const res = await GET(nextAuthRequest('/api/tasks') as never)
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.tasks).toHaveLength(1)
+    expect(body.tasks[0]).toMatchObject({
+      id: 'task-listed',
+      projectId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+      projectName: 'Forge Web',
+    })
+    expect(body.total).toBe(1)
   })
 })

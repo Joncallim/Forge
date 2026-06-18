@@ -2,8 +2,8 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/db'
-import { tasks } from '@/db/schema'
-import { eq, desc, count } from 'drizzle-orm'
+import { projects, tasks } from '@/db/schema'
+import { eq, desc, count, getTableColumns } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 
@@ -17,6 +17,10 @@ const createTaskSchema = z.object({
   prompt: z.string().min(1),
   pmProviderConfigId: z.string().uuid().optional(),
 })
+
+type TaskListRow = typeof tasks.$inferSelect & {
+  projectName: string
+}
 
 // ---------------------------------------------------------------------------
 // GET /api/tasks
@@ -42,10 +46,16 @@ export async function GET(request: NextRequest) {
     if (status) conditions.push(eq(tasks.status, status))
 
     // Execute count and data queries
-    const baseQuery = db.select().from(tasks)
+    const baseQuery = db
+      .select({
+        ...getTableColumns(tasks),
+        projectName: projects.name,
+      })
+      .from(tasks)
+      .innerJoin(projects, eq(tasks.projectId, projects.id))
     const countQuery = db.select({ total: count() }).from(tasks)
 
-    let rows: typeof tasks.$inferSelect[]
+    let rows: TaskListRow[]
     let totalResult: { total: number }[]
 
     if (conditions.length === 0) {
