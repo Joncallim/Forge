@@ -2,8 +2,8 @@
 
 This document defines the built-in recommendation presets that the Forge web app
 ships with. The app reads this data at runtime from
-`web/lib/recommendations.ts` to populate provider presets and the agent config
-UI. No database queries needed — it is static config.
+`web/lib/recommendations.ts` to populate the setup wizard, provider presets, and
+the agent config UI. No database queries needed — it is static config.
 
 ---
 
@@ -135,10 +135,10 @@ user is manually editing a single agent's provider, regardless of preset.
 - `web/lib/recommendations.ts` — exports `PRESETS` (the four named configs
   above) and `ROLE_RECOMMENDATIONS` (per-role inline suggestions). Both are
   plain TypeScript constants, no DB required.
-- Provider presets UI — shows the four presets. User picks one; the app creates
-  the corresponding `provider_configs` rows and sets each `agent_configs` row's
-  `provider_config_id`. Required API keys are flagged as missing if the relevant
-  env vars are not set.
+- Setup wizard and provider presets UI — show the four presets. User picks one;
+  the app creates the corresponding `provider_configs` rows and sets each
+  `agent_configs` row's `provider_config_id`. Provider health checks flag
+  missing API key environment variables after providers exist.
 - Agent config UI — when editing a single agent's provider, the sidebar shows
   the relevant `ROLE_RECOMMENDATIONS` entries with "Recommended" badges,
   grouped by routing layer (Anthropic API / OpenAI API / OpenRouter / LiteLLM

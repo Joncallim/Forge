@@ -26,6 +26,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { PRESETS } from '@/lib/recommendations'
+import { applyPreset } from '@/lib/applyPreset'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -595,60 +596,7 @@ export default function ProvidersPage() {
     setPresetError(null)
 
     try {
-      // Refresh providers first so we work with the latest state
-      const res = await fetch('/api/providers')
-      if (!res.ok) throw new Error('Failed to load providers')
-      const data = await res.json() as { providers: ProviderConfig[] }
-      const current = data.providers ?? []
-
-      // For each agent in preset: create a providerConfig if one with that
-      // providerType+modelId doesn't already exist, then link agentConfig.
-      const providerIdByKey: Record<string, string> = {}
-
-      for (const [agentType, spec] of Object.entries(preset.agents)) {
-        const key = `${spec.providerType}:${spec.modelId}`
-
-        if (providerIdByKey[key] === undefined) {
-          const existing = current.find(
-            (p) => p.providerType === spec.providerType && p.modelId === spec.modelId,
-          )
-          if (existing) {
-            providerIdByKey[key] = existing.id
-          } else {
-            // Create new provider config
-            const createRes = await fetch('/api/providers', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                displayName: `${spec.providerType} / ${spec.modelId}`,
-                providerType: spec.providerType,
-                modelId: spec.modelId,
-                baseUrl: spec.baseUrl ?? null,
-                apiKeyEnvVar: spec.apiKeyEnvVar ?? null,
-                isLocal: spec.isLocal,
-              }),
-            })
-            if (!createRes.ok) {
-              const body = await createRes.json().catch(() => ({}))
-              throw new Error((body as { error?: string }).error ?? 'Failed to create provider')
-            }
-            const created = await createRes.json() as { provider: ProviderConfig }
-            providerIdByKey[key] = created.provider.id
-          }
-        }
-
-        // Update agent config
-        const updateRes = await fetch(`/api/agents/${agentType}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ providerConfigId: providerIdByKey[key] }),
-        })
-        if (!updateRes.ok) {
-          const body = await updateRes.json().catch(() => ({}))
-          throw new Error((body as { error?: string }).error ?? `Failed to update agent config for ${agentType}`)
-        }
-      }
-
+      await applyPreset(preset)
       await loadProviders()
     } catch (err) {
       setPresetError(err instanceof Error ? err.message : 'Failed to apply preset')

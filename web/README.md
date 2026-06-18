@@ -25,6 +25,10 @@ npm run worker
 
 Open [http://localhost:3000](http://localhost:3000).
 
+If no providers exist yet, the dashboard opens the setup wizard first. Choose a
+preset to create providers and assign them to agents, then review provider
+health from the Providers page.
+
 ## Runtime Dependencies
 
 - PostgreSQL for users, projects, providers, tasks, runs, and artifacts.

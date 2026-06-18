@@ -46,6 +46,9 @@ npm run worker
 
 Open `http://localhost:3000`.
 
+The first dashboard visit opens the setup wizard when no providers exist. Choose
+a preset there, then review provider health from the Providers page.
+
 Containerized web and worker processes are available but intentionally separate
 from the default setup command:
 
