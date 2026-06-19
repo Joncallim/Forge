@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { db } from '@/db'
 import { tasks } from '@/db/schema'
-import { eq } from 'drizzle-orm'
+import { and, eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 
@@ -42,8 +42,15 @@ export async function POST(
     const [task] = await db
       .update(tasks)
       .set({ status: 'approved', updatedAt: new Date() })
-      .where(eq(tasks.id, taskId))
+      .where(and(eq(tasks.id, taskId), eq(tasks.status, 'awaiting_approval')))
       .returning()
+
+    if (!task) {
+      return NextResponse.json(
+        { error: `Cannot approve task with status '${existing.status}'. Task must be in 'awaiting_approval' status.` },
+        { status: 409 },
+      )
+    }
 
     await redis.lpush('forge:approvals', JSON.stringify({ taskId, action: 'approve' }))
     await redis.publish('forge:task:' + taskId, JSON.stringify({

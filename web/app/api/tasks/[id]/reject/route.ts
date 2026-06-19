@@ -3,7 +3,7 @@ import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/db'
 import { tasks } from '@/db/schema'
-import { eq } from 'drizzle-orm'
+import { and, eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 
@@ -73,8 +73,15 @@ export async function POST(
         errorMessage: reason ?? null,
         updatedAt: new Date(),
       })
-      .where(eq(tasks.id, taskId))
+      .where(and(eq(tasks.id, taskId), eq(tasks.status, 'awaiting_approval')))
       .returning()
+
+    if (!task) {
+      return NextResponse.json(
+        { error: `Cannot reject task with status '${existing.status}'. Task must be in 'awaiting_approval' status.` },
+        { status: 409 },
+      )
+    }
 
     await redis.publish('forge:task:' + taskId, JSON.stringify({
       type: 'task:status',

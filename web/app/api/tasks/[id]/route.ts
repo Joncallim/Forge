@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { db } from '@/db'
 import { tasks, agentRuns, artifacts } from '@/db/schema'
-import { eq, asc } from 'drizzle-orm'
+import { and, eq, asc, or } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 
 // ---------------------------------------------------------------------------
@@ -89,10 +89,18 @@ export async function DELETE(
       )
     }
 
-    await db
+    const [cancelled] = await db
       .update(tasks)
       .set({ status: 'cancelled', updatedAt: new Date() })
-      .where(eq(tasks.id, id))
+      .where(and(eq(tasks.id, id), or(eq(tasks.status, 'pending'), eq(tasks.status, 'failed'))!))
+      .returning({ id: tasks.id })
+
+    if (!cancelled) {
+      return NextResponse.json(
+        { error: `Cannot cancel task with status '${existing.status}'. Only 'pending' or 'failed' tasks can be cancelled.` },
+        { status: 409 },
+      )
+    }
 
     console.info('[DELETE /api/tasks/:id] Cancelled task', { id })
     return NextResponse.json({ ok: true })

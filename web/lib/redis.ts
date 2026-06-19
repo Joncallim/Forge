@@ -2,6 +2,7 @@ import Redis from 'ioredis'
 import { getRequiredEnv } from '@/lib/env'
 
 const globalForRedis = globalThis as unknown as { redis: Redis | undefined }
+let redisProxy: Redis | undefined
 
 function redisErrorMessage(err: Error): string {
   const aggregate = err as Error & { code?: string; errors?: { code?: string; message?: string }[] }
@@ -13,18 +14,34 @@ function redisErrorMessage(err: Error): string {
   )
 }
 
-export const redis =
-  globalForRedis.redis ??
-  new Redis(getRequiredEnv('REDIS_URL'), {
+function createRedisClient(): Redis {
+  const client = new Redis(getRequiredEnv('REDIS_URL'), {
     lazyConnect: true,
     maxRetriesPerRequest: 3,
     retryStrategy: (times) => Math.min(times * 100, 3000),
   })
 
-if (redis.listenerCount('error') === 0) {
-  redis.on('error', (err) => {
+  client.on('error', (err) => {
     console.warn('[redis] connection error:', redisErrorMessage(err))
   })
+
+  return client
 }
 
-if (process.env.NODE_ENV !== 'production') globalForRedis.redis = redis
+function getRedisClient(): Redis {
+  if (globalForRedis.redis) return globalForRedis.redis
+
+  const client = createRedisClient()
+  if (process.env.NODE_ENV !== 'production') globalForRedis.redis = client
+  return client
+}
+
+export const redis =
+  redisProxy ??
+  (redisProxy = new Proxy({} as Redis, {
+    get(_target, prop, receiver) {
+      const client = getRedisClient()
+      const value = Reflect.get(client, prop, receiver)
+      return typeof value === 'function' ? value.bind(client) : value
+    },
+  }))

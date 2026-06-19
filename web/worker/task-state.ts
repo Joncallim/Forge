@@ -1,6 +1,6 @@
 import { db } from '../db'
 import { tasks } from '../db/schema'
-import { eq } from 'drizzle-orm'
+import { and, eq } from 'drizzle-orm'
 import { publishTaskEvent } from './events'
 
 export type TaskStatus =
@@ -37,4 +37,34 @@ export async function updateTaskStatus(
     errorMessage,
     updatedAt: now.toISOString(),
   })
+}
+
+export async function updateTaskStatusIfCurrent(
+  taskId: string,
+  currentStatus: TaskStatus,
+  nextStatus: TaskStatus,
+  errorMessage: string | null = null,
+): Promise<boolean> {
+  const now = new Date()
+
+  const [updated] = await db
+    .update(tasks)
+    .set({
+      status: nextStatus,
+      errorMessage,
+      updatedAt: now,
+      completedAt: TERMINAL_STATUSES.has(nextStatus) ? now : null,
+    })
+    .where(and(eq(tasks.id, taskId), eq(tasks.status, currentStatus)))
+    .returning({ id: tasks.id })
+
+  if (!updated) return false
+
+  await publishTaskEvent(taskId, 'task:status', {
+    status: nextStatus,
+    errorMessage,
+    updatedAt: now.toISOString(),
+  })
+
+  return true
 }

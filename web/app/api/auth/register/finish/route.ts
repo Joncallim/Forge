@@ -9,6 +9,8 @@ import { createSession, sessionCookieOptions } from '@/lib/session'
 import { count } from 'drizzle-orm'
 
 export async function POST(request: NextRequest) {
+  let registrationLock: { key: string; token: string } | null = null
+
   // Always clear reg_nonce cookie on exit (success or failure)
   const clearNonce = (response: NextResponse): NextResponse => {
     response.cookies.set('reg_nonce', '', {
@@ -94,6 +96,14 @@ export async function POST(request: NextRequest) {
     let userId: string
     let credentialId: string
 
+    const lockKey = 'webauthn:registration:first-user-lock'
+    const lockToken = crypto.randomUUID()
+    const lockResult = await redis.set(lockKey, lockToken, 'EX', 30, 'NX')
+    if (lockResult !== 'OK') {
+      return clearNonce(NextResponse.json({ error: 'Registration closed' }, { status: 409 }))
+    }
+    registrationLock = { key: lockKey, token: lockToken }
+
     await db.transaction(async (tx) => {
       // Atomically gate: if any user already exists, reject (prevents concurrent first-registration race)
       const [{ value: userCount }] = await tx.select({ value: count() }).from(users)
@@ -153,5 +163,16 @@ export async function POST(request: NextRequest) {
     }
     console.error('[register/finish] Unexpected error', err)
     return clearNonce(NextResponse.json({ error: 'Internal server error' }, { status: 500 }))
+  } finally {
+    if (registrationLock) {
+      try {
+        const currentToken = await redis.get(registrationLock.key)
+        if (currentToken === registrationLock.token) {
+          await redis.del(registrationLock.key)
+        }
+      } catch (err) {
+        console.error('[register/finish] Failed to release registration lock', err)
+      }
+    }
   }
 }

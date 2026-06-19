@@ -280,6 +280,7 @@ describe('POST /api/tasks — enqueues to Redis', () => {
 
   it('calls redis.lpush("forge:tasks", ...) when task is created', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{ id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' }]))
 
     const createdTask = {
       id: 'task-new',
@@ -318,6 +319,30 @@ describe('POST /api/tasks — enqueues to Redis', () => {
     expect(queueKey).toBe('forge:tasks')
     const parsed = JSON.parse(payload as string)
     expect(parsed).toHaveProperty('taskId', 'task-new')
+  })
+
+  it('returns 404 and does not enqueue when the project is missing', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([]))
+
+    const { POST } = await import('@/app/api/tasks/route')
+    const req = authRequest('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+        title: 'My task',
+        prompt: 'Do a thing',
+      }),
+    })
+
+    const res = await POST(req as never)
+
+    expect(res.status).toBe(404)
+    const body = await res.json()
+    expect(body.error).toMatch(/project not found/i)
+    expect(mockDbInsert).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
   })
 })
 

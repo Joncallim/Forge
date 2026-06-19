@@ -3,7 +3,7 @@ import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/db'
 import { projects, tasks } from '@/db/schema'
-import { eq, desc, count, getTableColumns } from 'drizzle-orm'
+import { eq, desc, count, getTableColumns, and, isNull } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 
@@ -116,6 +116,16 @@ export async function POST(request: NextRequest) {
     }
 
     const data = parsed.data
+
+    const [project] = await db
+      .select({ id: projects.id })
+      .from(projects)
+      .where(and(eq(projects.id, data.projectId), isNull(projects.archivedAt)))
+      .limit(1)
+
+    if (!project) {
+      return NextResponse.json({ error: 'Project not found' }, { status: 404 })
+    }
 
     const [task] = await db
       .insert(tasks)

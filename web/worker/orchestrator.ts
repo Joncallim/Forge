@@ -5,7 +5,7 @@ import { agentConfigs, agentRuns, artifacts, projects, tasks } from '../db/schem
 import { getProvider } from '../lib/providers/registry'
 import { and, eq } from 'drizzle-orm'
 import { publishTaskEvent } from './events'
-import { updateTaskStatus } from './task-state'
+import { updateTaskStatus, updateTaskStatusIfCurrent } from './task-state'
 
 type TaskRow = typeof tasks.$inferSelect
 type ProjectRow = typeof projects.$inferSelect
@@ -233,7 +233,14 @@ export async function processTask(taskId: string): Promise<void> {
   }
 
   try {
-    await updateTaskStatus(task.id, 'running')
+    const claimed = await updateTaskStatusIfCurrent(task.id, 'pending', 'running')
+    if (!claimed) {
+      console.info('[worker/orchestrator] Skipping task that was claimed by another worker', {
+        taskId,
+      })
+      return
+    }
+
     await runArchitect(task, project)
 
     if (await isTaskCancelled(task.id)) {
@@ -268,5 +275,10 @@ export async function processApproval(taskId: string): Promise<void> {
     return
   }
 
-  await updateTaskStatus(taskId, 'completed')
+  const completed = await updateTaskStatusIfCurrent(taskId, 'approved', 'completed')
+  if (!completed) {
+    console.info('[worker/orchestrator] Skipping approval that was changed by another actor', {
+      taskId,
+    })
+  }
 }
