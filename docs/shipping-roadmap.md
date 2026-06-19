@@ -46,8 +46,7 @@ Ship Forge first as a helper-stage beta:
 
 ## P0 Before Helper-Stage Beta
 
-Status: complete as of 2026-06-19, with the dependency-audit exception noted
-below.
+Status: complete as of 2026-06-19.
 
 1. Add an end-to-end smoke test for the main path:
    register/login, setup wizard preset, provider health, project creation, task
@@ -74,16 +73,15 @@ Security:
   and run-stream access.
 - Agent prompt file writes are limited to allowlisted agent types.
 - Secrets are stored as environment-variable names, not provider key values.
-- Residual risk: `npm audit --audit-level=moderate` reports transitive
-  advisories in `ollama-ai-provider`/`@ai-sdk/provider-utils`,
-  `drizzle-kit`/`esbuild`, and `next`/`postcss`. Current audit output does not
-  identify a safe non-breaking upgrade path; do not expose development servers
-  publicly, keep provider endpoints operator-controlled, and revisit these on
-  every dependency update.
+- Dependency audit is clean as of the latest local run. Ollama now routes
+  through the existing OpenAI-compatible provider path instead of the vulnerable
+  `ollama-ai-provider` package, and npm overrides pin patched `esbuild` and
+  `postcss` versions for nested dependency chains.
 
 Stability:
 
 - Production build passes without live PostgreSQL or Redis env vars.
+- `npm audit --audit-level=moderate` reports zero vulnerabilities.
 - Task creation rejects missing or archived projects before queueing.
 - Task lifecycle writes use conditional transitions for user actions and worker
   claims.
@@ -120,9 +118,9 @@ Run from `web/` on 2026-06-19:
 ```bash
 npm run lint              # pass
 npx tsc --noEmit          # pass
-npm test                  # pass, 37 tests
+npm test                  # pass, 38 tests
 npm run build             # pass
-npm audit --audit-level=moderate  # fails; see dependency-audit exception
+npm audit --audit-level=moderate  # pass, 0 vulnerabilities
 ```
 
 ## P1 Product Hardening

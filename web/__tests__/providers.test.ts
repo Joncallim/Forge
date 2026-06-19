@@ -23,25 +23,20 @@ const {
   mockCreateAnthropic,
   mockCreateOpenAI,
   mockCreateGoogleGenerativeAI,
-  mockCreateOllama,
   mockAnthropicInstance,
   mockOpenAIInstance,
-  mockOllamaInstance,
 } = vi.hoisted(() => {
   const mockAnthropicInstance = vi.fn().mockReturnValue({ _tag: 'anthropic-model' })
   const mockOpenAIInstance = vi.fn().mockReturnValue({ _tag: 'openai-model' })
   const mockGoogleInstance = vi.fn().mockReturnValue({ _tag: 'google-model' })
-  const mockOllamaInstance = vi.fn().mockReturnValue({ _tag: 'ollama-model' })
   return {
     mockDbSelect: vi.fn(),
     mockCreateAnthropic: vi.fn().mockReturnValue(mockAnthropicInstance),
     mockCreateOpenAI: vi.fn().mockReturnValue(mockOpenAIInstance),
     mockCreateGoogleGenerativeAI: vi.fn().mockReturnValue(mockGoogleInstance),
-    mockCreateOllama: vi.fn().mockReturnValue(mockOllamaInstance),
     mockAnthropicInstance,
     mockOpenAIInstance,
     mockGoogleInstance,
-    mockOllamaInstance,
   }
 })
 
@@ -56,7 +51,6 @@ vi.mock('@/db', () => ({
 vi.mock('@ai-sdk/anthropic', () => ({ createAnthropic: mockCreateAnthropic }))
 vi.mock('@ai-sdk/openai', () => ({ createOpenAI: mockCreateOpenAI }))
 vi.mock('@ai-sdk/google', () => ({ createGoogleGenerativeAI: mockCreateGoogleGenerativeAI }))
-vi.mock('ollama-ai-provider', () => ({ createOllama: mockCreateOllama }))
 
 // ---------------------------------------------------------------------------
 // Drizzle chain factory
@@ -110,7 +104,6 @@ describe('getProvider', () => {
     // Reset factory mocks to their default return values
     mockCreateAnthropic.mockReturnValue(mockAnthropicInstance)
     mockCreateOpenAI.mockReturnValue(mockOpenAIInstance)
-    mockCreateOllama.mockReturnValue(mockOllamaInstance)
     // Clear env vars
     delete process.env.TEST_ANTHROPIC_KEY
     delete process.env.TEST_OPENAI_KEY
@@ -144,15 +137,27 @@ describe('getProvider', () => {
     )
   })
 
-  it('instantiates createOllama with baseURL from the DB row', async () => {
+  it('routes ollama through the OpenAI-compatible /v1 endpoint', async () => {
     mockDbSelect.mockReturnValue(chain([
       makeRow({ providerType: 'ollama', baseUrl: 'http://localhost:11434', apiKeyEnvVar: null }),
     ]))
 
     await getProvider('config-id')
 
-    expect(mockCreateOllama).toHaveBeenCalledWith(
-      expect.objectContaining({ baseURL: 'http://localhost:11434' }),
+    expect(mockCreateOpenAI).toHaveBeenCalledWith(
+      expect.objectContaining({ apiKey: 'ollama', baseURL: 'http://localhost:11434/v1' }),
+    )
+  })
+
+  it('does not append /v1 twice for ollama base URLs that already include it', async () => {
+    mockDbSelect.mockReturnValue(chain([
+      makeRow({ providerType: 'ollama', baseUrl: 'http://localhost:11434/v1', apiKeyEnvVar: null }),
+    ]))
+
+    await getProvider('config-id')
+
+    expect(mockCreateOpenAI).toHaveBeenCalledWith(
+      expect.objectContaining({ apiKey: 'ollama', baseURL: 'http://localhost:11434/v1' }),
     )
   })
 

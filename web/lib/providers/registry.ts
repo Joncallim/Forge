@@ -1,7 +1,6 @@
 import { createAnthropic } from '@ai-sdk/anthropic'
 import { createOpenAI } from '@ai-sdk/openai'
 import { createGoogleGenerativeAI } from '@ai-sdk/google'
-import { createOllama } from 'ollama-ai-provider'
 import type { LanguageModel } from 'ai'
 import { db } from '@/db'
 import { providerConfigs } from '@/db/schema'
@@ -16,7 +15,6 @@ type ProviderFactory =
   | ReturnType<typeof createAnthropic>
   | ReturnType<typeof createOpenAI>
   | ReturnType<typeof createGoogleGenerativeAI>
-  | ReturnType<typeof createOllama>
 
 export type ProviderResult = {
   provider: ProviderFactory
@@ -26,6 +24,13 @@ export type ProviderResult = {
 // ---------------------------------------------------------------------------
 // Internal: build a provider factory from a DB row
 // ---------------------------------------------------------------------------
+
+function normalizeOllamaBaseUrl(baseUrl: string | null): string | undefined {
+  if (!baseUrl) return undefined
+
+  const trimmed = baseUrl.replace(/\/+$/, '')
+  return trimmed.endsWith('/v1') ? trimmed : `${trimmed}/v1`
+}
 
 function buildProvider(config: ProviderConfig): ProviderFactory {
   const apiKey = config.apiKeyEnvVar ? process.env[config.apiKeyEnvVar] : undefined
@@ -59,8 +64,9 @@ function buildProvider(config: ProviderConfig): ProviderFactory {
       })
 
     case 'ollama':
-      return createOllama({
-        baseURL: config.baseUrl ?? undefined,
+      return createOpenAI({
+        apiKey: apiKey ?? 'ollama',
+        baseURL: normalizeOllamaBaseUrl(config.baseUrl),
       })
 
     default:
