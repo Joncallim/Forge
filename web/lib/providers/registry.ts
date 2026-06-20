@@ -6,6 +6,7 @@ import { db } from '@/db'
 import { providerConfigs } from '@/db/schema'
 import type { ProviderConfig } from '@/db/schema'
 import { eq, asc } from 'drizzle-orm'
+import { requiresProviderBaseUrl } from './types'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -58,6 +59,13 @@ function buildProvider(config: ProviderConfig): ProviderFactory {
       })
 
     case 'litellm':
+    case 'custom':
+      if (requiresProviderBaseUrl(config.providerType) && !config.baseUrl) {
+        throw new Error(
+          `[providers/registry] baseUrl is required for ${config.providerType} provider config ${config.id}`,
+        )
+      }
+
       return createOpenAI({
         apiKey,
         baseURL: config.baseUrl ?? undefined,

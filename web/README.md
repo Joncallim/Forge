@@ -14,6 +14,8 @@ Install dependencies and run the development server:
 
 ```bash
 npm install
+npm run db:migrate
+npm run db:seed-agents
 npm run dev
 ```
 
@@ -29,11 +31,16 @@ If no providers exist yet, the dashboard opens the setup wizard first. Choose a
 preset to create providers and assign them to agents, then review provider
 health from the Providers page.
 
+To test a real custom helper model, use the single guide at
+[`../docs/helper-model-install-test.md`](../docs/helper-model-install-test.md).
+
 ## Runtime Dependencies
 
 - PostgreSQL for users, projects, providers, tasks, runs, and artifacts.
 - Redis for job queues, SSE replay, and cross-process events.
 - Provider API keys or local model gateways for agent execution.
+- Custom OpenAI-compatible endpoints can be configured with Provider type
+  `Custom`, any model ID, and an API-key environment variable name.
 - A Forge worker process for executing queued tasks.
 
 When running from `web/`, both Next.js and the worker load the repository-root

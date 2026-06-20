@@ -106,9 +106,9 @@ export const providerConfigs = pgTable(
   {
     id: uuid('id').primaryKey().defaultRandom(),
     displayName: text('display_name').notNull(),
-    providerType: text('provider_type').notNull(), // 'anthropic'|'openai'|'google'|'openrouter'|'ollama'|'litellm'
+    providerType: text('provider_type').notNull(), // see lib/providers/types.ts
     modelId: text('model_id').notNull(),
-    baseUrl: text('base_url'), // required for ollama and litellm
+    baseUrl: text('base_url'), // required for custom, ollama, and litellm
     apiKeyEnvVar: text('api_key_env_var'), // env var NAME only, never the secret
     isLocal: boolean('is_local').notNull().default(false),
     isActive: boolean('is_active').notNull().default(true),

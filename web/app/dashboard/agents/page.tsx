@@ -23,14 +23,18 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { ROLE_RECOMMENDATIONS, type RoleRecommendation } from '@/lib/recommendations'
+import {
+  PROVIDER_TYPE_LABELS,
+  PROVIDER_TYPE_OPTIONS,
+  requiresProviderBaseUrl,
+  type ProviderType,
+} from '@/lib/providers/types'
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 type AgentType = 'architect' | 'backend' | 'frontend' | 'qa' | 'reviewer' | 'devops'
-
-type ProviderType = 'anthropic' | 'openai' | 'google' | 'openrouter' | 'ollama' | 'litellm'
 
 type ProviderConfig = {
   id: string
@@ -86,6 +90,26 @@ const LAYER_ORDER: RoleRecommendation['layer'][] = [
   'Ollama',
 ]
 
+const CUSTOM_PROVIDER_VALUE = '__custom_provider__'
+
+type CustomProviderFormState = {
+  displayName: string
+  providerType: ProviderType
+  modelId: string
+  baseUrl: string
+  apiKeyEnvVar: string
+  isLocal: boolean
+}
+
+const DEFAULT_CUSTOM_PROVIDER_FORM: CustomProviderFormState = {
+  displayName: '',
+  providerType: 'custom',
+  modelId: '',
+  baseUrl: '',
+  apiKeyEnvVar: '',
+  isLocal: false,
+}
+
 // Group recommendations by layer
 function groupByLayer(recs: RoleRecommendation[]): Map<RoleRecommendation['layer'], RoleRecommendation[]> {
   const map = new Map<RoleRecommendation['layer'], RoleRecommendation[]>()
@@ -109,6 +133,8 @@ interface EditDrawerProps {
 
 function EditDrawer({ agent, providers, onClose, onSaved }: EditDrawerProps) {
   const [selectedProviderId, setSelectedProviderId] = useState<string>('')
+  const [isCustomProvider, setIsCustomProvider] = useState(false)
+  const [customProviderForm, setCustomProviderForm] = useState<CustomProviderFormState>(DEFAULT_CUSTOM_PROVIDER_FORM)
   const [systemPrompt, setSystemPrompt] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -117,6 +143,11 @@ function EditDrawer({ agent, providers, onClose, onSaved }: EditDrawerProps) {
   useEffect(() => {
     if (agent) {
       setSelectedProviderId(agent.providerConfigId ?? '')
+      setIsCustomProvider(false)
+      setCustomProviderForm({
+        ...DEFAULT_CUSTOM_PROVIDER_FORM,
+        displayName: `Custom ${agent.agentType === 'architect' ? 'Orchestrator' : agent.agentType}`,
+      })
       setSystemPrompt(agent.systemPrompt)
       setError(null)
     }
@@ -139,11 +170,78 @@ function EditDrawer({ agent, providers, onClose, onSaved }: EditDrawerProps) {
       (p) => p.providerType === rec.providerType && p.modelId === rec.modelId,
     )
     if (match) {
+      setIsCustomProvider(false)
       setSelectedProviderId(match.id)
     } else {
       // No match — inform the user to create it first
       toast.info(`No provider found for ${rec.providerType} / ${rec.modelId}. Create it on the Providers page first.`)
     }
+  }
+
+  function setCustomProviderValue<K extends keyof CustomProviderFormState>(
+    key: K,
+    value: CustomProviderFormState[K],
+  ) {
+    setCustomProviderForm((current) => ({ ...current, [key]: value }))
+  }
+
+  function handleProviderSelection(value: string | null) {
+    if (value === CUSTOM_PROVIDER_VALUE) {
+      setIsCustomProvider(true)
+      setSelectedProviderId('')
+      return
+    }
+
+    setIsCustomProvider(false)
+    setSelectedProviderId(value ?? '')
+  }
+
+  function handleCustomProviderTypeChange(value: string | null) {
+    if (!value) return
+    const providerType = value as ProviderType
+    setCustomProviderForm((current) => ({
+      ...current,
+      providerType,
+      isLocal: providerType === 'ollama',
+    }))
+  }
+
+  async function createCustomProvider(agentType: AgentType): Promise<ProviderConfig> {
+    const displayName = customProviderForm.displayName.trim()
+    const modelId = customProviderForm.modelId.trim()
+    const baseUrl = customProviderForm.baseUrl.trim() || null
+    const apiKeyEnvVar = customProviderForm.isLocal ? null : customProviderForm.apiKeyEnvVar.trim() || null
+
+    if (!displayName) {
+      throw new Error('Display name is required for custom providers.')
+    }
+    if (!modelId) {
+      throw new Error('Model ID is required for custom providers.')
+    }
+    if (requiresProviderBaseUrl(customProviderForm.providerType) && !baseUrl) {
+      throw new Error('Base URL is required for this provider type.')
+    }
+
+    const res = await fetch('/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        displayName,
+        providerType: customProviderForm.providerType,
+        modelId,
+        baseUrl,
+        apiKeyEnvVar,
+        isLocal: customProviderForm.isLocal,
+      }),
+    })
+
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error((body as { error?: string }).error ?? `Failed to create custom provider for ${agentType}`)
+    }
+
+    const created = await res.json() as { provider: ProviderConfig }
+    return created.provider
   }
 
   async function handleSave() {
@@ -158,11 +256,15 @@ function EditDrawer({ agent, providers, onClose, onSaved }: EditDrawerProps) {
 
     setSubmitting(true)
     try {
+      const providerConfigId = isCustomProvider
+        ? (await createCustomProvider(agent.agentType)).id
+        : selectedProviderId || null
+
       const res = await fetch(`/api/agents/${agent.agentType}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          providerConfigId: selectedProviderId || null,
+          providerConfigId,
           systemPrompt: trimmedPrompt,
         }),
       })
@@ -204,8 +306,8 @@ function EditDrawer({ agent, providers, onClose, onSaved }: EditDrawerProps) {
                   Provider
                 </label>
                 <Select
-                  value={selectedProviderId}
-                  onValueChange={(value) => setSelectedProviderId(value ?? '')}
+                  value={isCustomProvider ? CUSTOM_PROVIDER_VALUE : selectedProviderId}
+                  onValueChange={handleProviderSelection}
                 >
                   <SelectTrigger id="ea-provider" className="w-full">
                     <SelectValue placeholder="None — use default" />
@@ -213,11 +315,12 @@ function EditDrawer({ agent, providers, onClose, onSaved }: EditDrawerProps) {
                   <SelectContent>
                     <SelectGroup>
                       <SelectItem value="">None — use default</SelectItem>
+                      <SelectItem value={CUSTOM_PROVIDER_VALUE}>Custom</SelectItem>
                     </SelectGroup>
                     {providers.length > 0 && <SelectSeparator />}
                     {Array.from(providersByType.entries()).map(([type, group]) => (
                       <SelectGroup key={type}>
-                        <SelectLabel>{type}</SelectLabel>
+                        <SelectLabel>{PROVIDER_TYPE_LABELS[type]}</SelectLabel>
                         {group.map((p) => (
                           <SelectItem key={p.id} value={p.id}>
                             {p.displayName} ({p.modelId})
@@ -228,6 +331,105 @@ function EditDrawer({ agent, providers, onClose, onSaved }: EditDrawerProps) {
                   </SelectContent>
                 </Select>
               </div>
+
+              {isCustomProvider && (
+                <div className="grid gap-3 rounded-xl border border-border bg-muted/30 p-3">
+                  <div className="flex flex-col gap-1.5">
+                    <label htmlFor="ea-customDisplayName" className="text-sm font-medium text-foreground">
+                      Display name
+                    </label>
+                    <input
+                      id="ea-customDisplayName"
+                      type="text"
+                      value={customProviderForm.displayName}
+                      onChange={(e) => setCustomProviderValue('displayName', e.target.value)}
+                      className="rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                    />
+                  </div>
+
+                  <div className="flex flex-col gap-1.5">
+                    <label htmlFor="ea-customProviderType" className="text-sm font-medium text-foreground">
+                      Provider type
+                    </label>
+                    <Select
+                      value={customProviderForm.providerType}
+                      onValueChange={handleCustomProviderTypeChange}
+                    >
+                      <SelectTrigger id="ea-customProviderType" className="w-full">
+                        <SelectValue placeholder="Select provider type" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          {PROVIDER_TYPE_OPTIONS.map((opt) => (
+                            <SelectItem key={opt.value} value={opt.value}>
+                              {opt.label}
+                            </SelectItem>
+                          ))}
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  <div className="flex flex-col gap-1.5">
+                    <label htmlFor="ea-customModelId" className="text-sm font-medium text-foreground">
+                      Model ID
+                    </label>
+                    <input
+                      id="ea-customModelId"
+                      type="text"
+                      value={customProviderForm.modelId}
+                      onChange={(e) => setCustomProviderValue('modelId', e.target.value)}
+                      placeholder="gpt-5.5 or provider/model"
+                      className="rounded-lg border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                    />
+                  </div>
+
+                  {requiresProviderBaseUrl(customProviderForm.providerType) && (
+                    <div className="flex flex-col gap-1.5">
+                      <label htmlFor="ea-customBaseUrl" className="text-sm font-medium text-foreground">
+                        Base URL
+                      </label>
+                      <input
+                        id="ea-customBaseUrl"
+                        type="url"
+                        value={customProviderForm.baseUrl}
+                        onChange={(e) => setCustomProviderValue('baseUrl', e.target.value)}
+                        placeholder={customProviderForm.providerType === 'ollama' ? 'http://localhost:11434' : 'https://api.example.com/v1'}
+                        className="rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                      />
+                    </div>
+                  )}
+
+                  {!customProviderForm.isLocal && (
+                    <div className="flex flex-col gap-1.5">
+                      <label htmlFor="ea-customApiKeyEnvVar" className="text-sm font-medium text-foreground">
+                        API key environment variable
+                      </label>
+                      <input
+                        id="ea-customApiKeyEnvVar"
+                        type="text"
+                        value={customProviderForm.apiKeyEnvVar}
+                        onChange={(e) => setCustomProviderValue('apiKeyEnvVar', e.target.value)}
+                        placeholder="OPENAI_API_KEY"
+                        className="rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                      />
+                    </div>
+                  )}
+
+                  <div className="flex items-center gap-3">
+                    <input
+                      id="ea-customIsLocal"
+                      type="checkbox"
+                      checked={customProviderForm.isLocal}
+                      onChange={(e) => setCustomProviderValue('isLocal', e.target.checked)}
+                      className="size-4 rounded border-input accent-primary"
+                    />
+                    <label htmlFor="ea-customIsLocal" className="text-sm font-medium text-foreground">
+                      Local provider
+                    </label>
+                  </div>
+                </div>
+              )}
 
               {/* Recommendations */}
               {recsByLayer.size > 0 && (

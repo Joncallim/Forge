@@ -36,6 +36,7 @@ Set provider-specific keys only for the providers you configure:
 | `ANTHROPIC_API_KEY` | Anthropic API. |
 | `OPENAI_API_KEY` | OpenAI API. |
 | `OPENROUTER_API_KEY` | OpenRouter. |
+| Any custom env var, for example `CUSTOM_MODEL_API_KEY` | Custom OpenAI-compatible provider. Store the env var name in Forge, not the secret value. |
 | `LITELLM_BASE_URL` | LiteLLM gateway URL. |
 | `LITELLM_API_KEY` | LiteLLM gateway auth if enabled. |
 
@@ -51,6 +52,8 @@ Worker-only:
 From `web/`:
 
 ```bash
+npm run db:migrate
+npm run db:seed-agents
 npm run doctor
 npm run lint
 npx tsc --noEmit
@@ -63,6 +66,7 @@ migrations, install Playwright browsers once, and run:
 
 ```bash
 npm run db:migrate
+npm run db:seed-agents
 npx playwright install chromium
 npm run e2e
 ```

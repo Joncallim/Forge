@@ -142,7 +142,8 @@ user is manually editing a single agent's provider, regardless of preset.
 - Agent config UI — when editing a single agent's provider, the sidebar shows
   the relevant `ROLE_RECOMMENDATIONS` entries with "Recommended" badges,
   grouped by routing layer (Anthropic API / OpenAI API / OpenRouter / LiteLLM
-  / Ollama).
+  / Ollama), plus an inline Custom path for creating and assigning any model
+  supported by a configured provider endpoint.
 - Cross-provider dispatch — provider selection per agent is stored in
   `agent_configs.provider_config_id`. The worker reads the active agent config
   from this table at dispatch time. The current helper dispatches only the

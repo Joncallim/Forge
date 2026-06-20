@@ -27,12 +27,15 @@ import {
 } from '@/components/ui/select'
 import { PRESETS } from '@/lib/recommendations'
 import { applyPreset } from '@/lib/applyPreset'
+import {
+  PROVIDER_TYPE_OPTIONS,
+  requiresProviderBaseUrl,
+  type ProviderType,
+} from '@/lib/providers/types'
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-
-type ProviderType = 'anthropic' | 'openai' | 'google' | 'openrouter' | 'ollama' | 'litellm'
 
 type ProviderConfig = {
   id: string
@@ -60,17 +63,6 @@ type HealthMap = Record<string, ProviderHealth | 'loading' | 'error'>
 // Constants
 // ---------------------------------------------------------------------------
 
-const PROVIDER_TYPE_OPTIONS: { value: ProviderType; label: string }[] = [
-  { value: 'anthropic',  label: 'Anthropic' },
-  { value: 'openai',     label: 'OpenAI' },
-  { value: 'google',     label: 'Google' },
-  { value: 'openrouter', label: 'OpenRouter' },
-  { value: 'ollama',     label: 'Ollama' },
-  { value: 'litellm',    label: 'LiteLLM' },
-]
-
-const LOCAL_PROVIDER_TYPES: ProviderType[] = ['ollama', 'litellm']
-
 const MODEL_PLACEHOLDERS: Record<ProviderType, string> = {
   anthropic:  'claude-opus-4-8',
   openai:     'gpt-4.1',
@@ -78,6 +70,7 @@ const MODEL_PLACEHOLDERS: Record<ProviderType, string> = {
   openrouter: 'moonshotai/kimi-k2',
   ollama:     'devstral-small:24b',
   litellm:    'litellm/claude-opus-4-8',
+  custom:     'gpt-5.5 or provider/model',
 }
 
 const PROVIDER_TYPE_COLORS: Record<ProviderType, string> = {
@@ -87,6 +80,7 @@ const PROVIDER_TYPE_COLORS: Record<ProviderType, string> = {
   openrouter: 'bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-300',
   ollama:     'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300',
   litellm:    'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300',
+  custom:     'bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-300',
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +185,7 @@ interface ProviderFormProps {
 }
 
 function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel }: ProviderFormProps) {
-  const needsBaseUrl = LOCAL_PROVIDER_TYPES.includes(form.providerType)
+  const needsBaseUrl = requiresProviderBaseUrl(form.providerType)
   const needsApiKey = !form.isLocal
 
   function set<K extends keyof ProviderFormState>(key: K, value: ProviderFormState[K]) {
@@ -262,7 +256,7 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
         />
       </div>
 
-      {/* Base URL — shown for ollama / litellm */}
+      {/* Base URL — shown for provider types that require an OpenAI-compatible endpoint */}
       {needsBaseUrl && (
         <div className="flex flex-col gap-1.5">
           <label htmlFor="pf-baseUrl" className="text-sm font-medium text-foreground">
@@ -274,7 +268,7 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
             required
             value={form.baseUrl}
             onChange={(e) => set('baseUrl', e.target.value)}
-            placeholder="http://localhost:11434"
+            placeholder={form.providerType === 'ollama' ? 'http://localhost:11434' : 'https://api.example.com/v1'}
             className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
             aria-required="true"
           />
@@ -473,12 +467,12 @@ export default function ProvidersPage() {
     const displayName = addForm.displayName.trim()
     const modelId = addForm.modelId.trim()
     const baseUrl = addForm.baseUrl.trim() || null
-    const apiKeyEnvVar = addForm.apiKeyEnvVar.trim() || null
+    const apiKeyEnvVar = addForm.isLocal ? null : addForm.apiKeyEnvVar.trim() || null
 
     if (!displayName) { setAddError('Display name is required.'); return }
     if (!modelId) { setAddError('Model ID is required.'); return }
-    if (LOCAL_PROVIDER_TYPES.includes(addForm.providerType) && !baseUrl) {
-      setAddError('Base URL is required for Ollama and LiteLLM providers.')
+    if (requiresProviderBaseUrl(addForm.providerType) && !baseUrl) {
+      setAddError('Base URL is required for this provider type.')
       return
     }
 
@@ -527,12 +521,12 @@ export default function ProvidersPage() {
     const displayName = editForm.displayName.trim()
     const modelId = editForm.modelId.trim()
     const baseUrl = editForm.baseUrl.trim() || null
-    const apiKeyEnvVar = editForm.apiKeyEnvVar.trim() || null
+    const apiKeyEnvVar = editForm.isLocal ? null : editForm.apiKeyEnvVar.trim() || null
 
     if (!displayName) { setEditError('Display name is required.'); return }
     if (!modelId) { setEditError('Model ID is required.'); return }
-    if (LOCAL_PROVIDER_TYPES.includes(editForm.providerType) && !baseUrl) {
-      setEditError('Base URL is required for Ollama and LiteLLM providers.')
+    if (requiresProviderBaseUrl(editForm.providerType) && !baseUrl) {
+      setEditError('Base URL is required for this provider type.')
       return
     }
 

@@ -31,11 +31,19 @@ cp .env.example .env        # fill in provider, GitHub, database, and Redis sett
 bash scripts/setup.sh       # starts PostgreSQL + Redis via Docker
 ```
 
-Then run the web app and worker from `web/` in separate terminals:
+Then prepare the web app and database from `web/`:
 
 ```bash
 cd web
 npm install
+npm run db:migrate
+npm run db:seed-agents
+```
+
+Run the web app and worker from `web/` in separate terminals:
+
+```bash
+cd web
 npm run dev
 ```
 
@@ -48,6 +56,10 @@ Open `http://localhost:3000`.
 
 The first dashboard visit opens the setup wizard when no providers exist. Choose
 a preset there, then review provider health from the Providers page.
+
+For a step-by-step custom helper-model test, including the new `Custom` provider
+option for the Architect helper, see
+[docs/helper-model-install-test.md](docs/helper-model-install-test.md).
 
 ## GUI Screenshots
 

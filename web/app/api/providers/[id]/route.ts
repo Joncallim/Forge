@@ -5,12 +5,13 @@ import { db } from '@/db'
 import { providerConfigs, tasks, agentRuns, agentConfigs } from '@/db/schema'
 import { eq, and, isNotNull, count } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
+import { PROVIDER_TYPES, requiresProviderBaseUrl } from '@/lib/providers/types'
 
 // ---------------------------------------------------------------------------
 // Validation schema (all fields optional for PUT)
 // ---------------------------------------------------------------------------
 
-const providerTypeEnum = z.enum(['anthropic', 'openai', 'google', 'openrouter', 'ollama', 'litellm'])
+const providerTypeEnum = z.enum(PROVIDER_TYPES)
 
 const updateProviderSchema = z.object({
   displayName: z.string().min(1).max(100).optional(),
@@ -98,12 +99,12 @@ export async function PUT(
 
     const data = parsed.data
 
-    // Conditional validation: if providerType is being set to ollama/litellm, baseUrl must be present
+    // Conditional validation: if providerType requires baseUrl, baseUrl must be present.
     const effectiveType = data.providerType ?? existing.providerType
     const effectiveBaseUrl = 'baseUrl' in data ? data.baseUrl : existing.baseUrl
-    if ((effectiveType === 'ollama' || effectiveType === 'litellm') && !effectiveBaseUrl) {
+    if (requiresProviderBaseUrl(effectiveType) && !effectiveBaseUrl) {
       return NextResponse.json(
-        { error: 'baseUrl is required for ollama and litellm providers' },
+        { error: `baseUrl is required for ${effectiveType} providers` },
         { status: 400 },
       )
     }

@@ -108,6 +108,7 @@ describe('getProvider', () => {
     delete process.env.TEST_ANTHROPIC_KEY
     delete process.env.TEST_OPENAI_KEY
     delete process.env.TEST_OPENROUTER_KEY
+    delete process.env.TEST_CUSTOM_KEY
     delete process.env.UNSET_KEY_VARIABLE
   })
 
@@ -171,6 +172,34 @@ describe('getProvider', () => {
     expect(mockCreateOpenAI).toHaveBeenCalledWith(
       expect.objectContaining({ baseURL: 'http://litellm:4000' }),
     )
+  })
+
+  it('instantiates createOpenAI with baseURL from the DB row for custom providers', async () => {
+    process.env.TEST_CUSTOM_KEY = 'sk-custom-test'
+    mockDbSelect.mockReturnValue(chain([
+      makeRow({
+        providerType: 'custom',
+        baseUrl: 'https://models.example.com/v1',
+        apiKeyEnvVar: 'TEST_CUSTOM_KEY',
+      }),
+    ]))
+
+    await getProvider('config-id')
+
+    expect(mockCreateOpenAI).toHaveBeenCalledWith(
+      expect.objectContaining({
+        apiKey: 'sk-custom-test',
+        baseURL: 'https://models.example.com/v1',
+      }),
+    )
+  })
+
+  it('throws when a custom provider is missing baseUrl', async () => {
+    mockDbSelect.mockReturnValue(chain([
+      makeRow({ providerType: 'custom', baseUrl: null }),
+    ]))
+
+    await expect(getProvider('config-id')).rejects.toThrow(/baseUrl is required/i)
   })
 
   it('returns null for an isActive=false row', async () => {

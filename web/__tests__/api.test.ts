@@ -269,6 +269,69 @@ describe('POST /api/providers — baseUrl required for ollama', () => {
     const body = await res.json()
     expect(body.error).toMatch(/baseUrl/i)
   })
+
+  it('returns 400 when providerType is custom and baseUrl is missing', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+
+    const { POST } = await import('@/app/api/providers/route')
+    const req = authRequest('/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        displayName: 'Custom Orchestrator',
+        providerType: 'custom',
+        modelId: 'gpt-5.5',
+        isLocal: false,
+      }),
+    })
+
+    const res = await POST(req as never)
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error).toMatch(/baseUrl/i)
+  })
+
+  it('creates a custom provider when baseUrl is present', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const createdProvider = {
+      id: 'provider-custom',
+      displayName: 'Custom Orchestrator',
+      providerType: 'custom',
+      modelId: 'provider/model-anything',
+      baseUrl: 'https://models.example.com/v1',
+      apiKeyEnvVar: 'CUSTOM_API_KEY',
+      isLocal: false,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }
+    mockDbInsert.mockReturnValue(chain([createdProvider]))
+
+    const { POST } = await import('@/app/api/providers/route')
+    const req = authRequest('/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        displayName: createdProvider.displayName,
+        providerType: createdProvider.providerType,
+        modelId: createdProvider.modelId,
+        baseUrl: createdProvider.baseUrl,
+        apiKeyEnvVar: createdProvider.apiKeyEnvVar,
+        isLocal: createdProvider.isLocal,
+      }),
+    })
+
+    const res = await POST(req as never)
+
+    expect(res.status).toBe(201)
+    const body = await res.json()
+    expect(body.provider).toMatchObject({
+      providerType: 'custom',
+      modelId: 'provider/model-anything',
+      baseUrl: 'https://models.example.com/v1',
+    })
+  })
 })
 
 // ---------------------------------------------------------------------------

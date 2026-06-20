@@ -5,12 +5,13 @@ import { db } from '@/db'
 import { providerConfigs } from '@/db/schema'
 import { getSession } from '@/lib/session'
 import { listActiveProviders } from '@/lib/providers/registry'
+import { PROVIDER_TYPES, requiresProviderBaseUrl } from '@/lib/providers/types'
 
 // ---------------------------------------------------------------------------
 // Validation schema
 // ---------------------------------------------------------------------------
 
-const providerTypeEnum = z.enum(['anthropic', 'openai', 'google', 'openrouter', 'ollama', 'litellm'])
+const providerTypeEnum = z.enum(PROVIDER_TYPES)
 
 const createProviderSchema = z.object({
   displayName: z.string().min(1).max(100),
@@ -68,10 +69,10 @@ export async function POST(request: NextRequest) {
 
     const data = parsed.data
 
-    // Conditional validation: baseUrl is required for ollama and litellm
-    if ((data.providerType === 'ollama' || data.providerType === 'litellm') && !data.baseUrl) {
+    // Conditional validation: baseUrl is required for provider types with a custom endpoint.
+    if (requiresProviderBaseUrl(data.providerType) && !data.baseUrl) {
       return NextResponse.json(
-        { error: 'baseUrl is required for ollama and litellm providers' },
+        { error: `baseUrl is required for ${data.providerType} providers` },
         { status: 400 },
       )
     }
