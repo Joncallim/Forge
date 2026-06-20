@@ -49,6 +49,27 @@ Open `http://localhost:3000`.
 The first dashboard visit opens the setup wizard when no providers exist. Choose
 a preset there, then review provider health from the Providers page.
 
+## GUI Screenshots
+
+These screenshots come from the passing helper-stage Playwright smoke test in
+GitHub Actions.
+
+### Setup Wizard
+
+![Forge setup wizard](docs/assets/gui/desktop-01-setup.png)
+
+### Provider Review
+
+![Forge providers page after applying a preset](docs/assets/gui/desktop-02-providers.png)
+
+### Architect Plan Awaiting Approval
+
+![Forge task detail page awaiting approval](docs/assets/gui/desktop-03-task-awaiting-approval.png)
+
+### Completed Helper Task
+
+![Forge task detail page after approval](docs/assets/gui/desktop-04-task-completed.png)
+
 Containerized web and worker processes are available but intentionally separate
 from the default setup command:
 

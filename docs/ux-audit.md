@@ -1,6 +1,6 @@
 # Forge Helper-Stage UX Audit
 
-Last updated: 2026-06-18
+Last updated: 2026-06-20
 
 ## Scope
 
@@ -16,22 +16,23 @@ This audit covers the helper-stage beta path:
 
 ## Screenshot Evidence
 
-The Playwright smoke test captures full-page screenshots for the key states:
+The Playwright smoke test captures full-page screenshots for the key states.
+These checked-in copies come from the passing `Web CI` run for commit
+`d8c4dad` on 2026-06-19.
 
-| State | Screenshot file |
-|---|---|
-| Setup wizard | `01-setup.png` |
-| Providers after preset | `02-providers.png` |
-| Task awaiting approval | `03-task-awaiting-approval.png` |
-| Task completed | `04-task-completed.png` |
+| State | Desktop | Mobile |
+|---|---|---|
+| Setup wizard | <img src="assets/gui/desktop-01-setup.png" alt="Desktop setup wizard" width="420"> | <img src="assets/gui/mobile-01-setup.png" alt="Mobile setup wizard" width="220"> |
+| Providers after preset | <img src="assets/gui/desktop-02-providers.png" alt="Desktop providers page" width="420"> | <img src="assets/gui/mobile-02-providers.png" alt="Mobile providers page" width="220"> |
+| Task awaiting approval | <img src="assets/gui/desktop-03-task-awaiting-approval.png" alt="Desktop task awaiting approval" width="420"> | <img src="assets/gui/mobile-03-task-awaiting-approval.png" alt="Mobile task awaiting approval" width="220"> |
+| Task completed | <img src="assets/gui/desktop-04-task-completed.png" alt="Desktop task completed" width="420"> | <img src="assets/gui/mobile-04-task-completed.png" alt="Mobile task completed" width="220"> |
 
-The CI workflow uploads these files in the `playwright-artifacts` artifact from
-`web/test-results`, along with the HTML report in `web/playwright-report`.
+The CI workflow also uploads fresh copies in the `playwright-artifacts` artifact
+from `web/test-results`, along with the HTML report in `web/playwright-report`.
 
-The current execution environment cannot run the screenshot test locally because
-PostgreSQL/Redis are not running and Docker access is unavailable. The audit is
-therefore enforced through CI services, which start PostgreSQL and Redis before
-running `npm run e2e`.
+The checked-in screenshots are documentation assets, not the release gate. The
+audit remains enforced through CI services, which start PostgreSQL and Redis
+before running `npm run e2e`.
 
 ## Findings
 
