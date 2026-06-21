@@ -72,6 +72,7 @@ function chain(resolveValue: unknown) {
 // ---------------------------------------------------------------------------
 
 import { getProvider, getModel } from '@/lib/providers/registry'
+import { encryptSecret } from '@/lib/crypto'
 import type { ProviderConfig } from '@/db/schema'
 
 // ---------------------------------------------------------------------------
@@ -86,6 +87,7 @@ function makeRow(overrides: Partial<ProviderConfig>): ProviderConfig {
     modelId: 'claude-3-5-sonnet-20241022',
     baseUrl: null,
     apiKeyEnvVar: null,
+    apiKeyCiphertext: null,
     isLocal: false,
     isActive: true,
     createdAt: new Date(),
@@ -231,6 +233,26 @@ describe('getProvider', () => {
     )
 
     warnSpy.mockRestore()
+  })
+
+  it('prefers the encrypted stored key over the env var', async () => {
+    process.env.SESSION_SECRET = 'a'.repeat(64)
+    process.env.TEST_ANTHROPIC_KEY = 'from-env'
+    const apiKeyCiphertext = encryptSecret('from-db')
+
+    mockDbSelect.mockReturnValue(chain([
+      makeRow({
+        providerType: 'anthropic',
+        apiKeyEnvVar: 'TEST_ANTHROPIC_KEY',
+        apiKeyCiphertext,
+      }),
+    ]))
+
+    await getProvider('config-id')
+
+    expect(mockCreateAnthropic).toHaveBeenCalledWith(
+      expect.objectContaining({ apiKey: 'from-db' }),
+    )
   })
 })
 

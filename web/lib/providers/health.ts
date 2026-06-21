@@ -20,15 +20,22 @@ export type ProviderHealthResult = {
 export async function checkProviderHealth(
   config: ProviderConfig,
 ): Promise<ProviderHealthResult> {
-  // Check whether the API key env var is present (local providers with no key are always "present")
-  const envVarPresent = config.apiKeyEnvVar ? !!process.env[config.apiKeyEnvVar] : true
+  // A credential is "present" if a key was entered via the UI (stored
+  // encrypted), or the configured env var is set, or none is configured
+  // (local/keyless providers). `envVarPresent` is kept as the field name for
+  // wire compatibility but now means "credential present".
+  const envVarPresent =
+    !!config.apiKeyCiphertext ||
+    (config.apiKeyEnvVar ? !!process.env[config.apiKeyEnvVar] : true)
 
   if (!envVarPresent) {
     return {
       reachable: false,
       envVarPresent,
       latencyMs: null,
-      error: `Missing environment variable ${config.apiKeyEnvVar}`,
+      error: config.apiKeyEnvVar
+        ? `No API key set (enter one in the UI, or set ${config.apiKeyEnvVar})`
+        : 'No API key set',
     }
   }
 

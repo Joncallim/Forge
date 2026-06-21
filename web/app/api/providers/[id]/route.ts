@@ -6,6 +6,8 @@ import { providerConfigs, tasks, agentRuns, agentConfigs } from '@/db/schema'
 import { eq, and, isNotNull, count } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { PROVIDER_TYPES, requiresProviderBaseUrl } from '@/lib/providers/types'
+import { toPublicProvider } from '@/lib/providers/serialize'
+import { encryptSecret } from '@/lib/crypto'
 
 // ---------------------------------------------------------------------------
 // Validation schema (all fields optional for PUT)
@@ -19,6 +21,7 @@ const updateProviderSchema = z.object({
   modelId: z.string().min(1).max(200).optional(),
   baseUrl: z.string().max(2048).nullable().optional(),
   apiKeyEnvVar: z.string().max(200).nullable().optional(),
+  apiKey: z.string().max(8192).nullable().optional(),
   isLocal: z.boolean().optional(),
 })
 
@@ -48,7 +51,7 @@ export async function GET(
       return NextResponse.json({ error: 'Provider config not found' }, { status: 404 })
     }
 
-    return NextResponse.json({ provider })
+    return NextResponse.json({ provider: toPublicProvider(provider) })
   } catch (err) {
     console.error('[GET /api/providers/:id] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
@@ -118,6 +121,13 @@ export async function PUT(
     if ('apiKeyEnvVar' in data) updateSet.apiKeyEnvVar = data.apiKeyEnvVar ?? null
     if (data.isLocal !== undefined) updateSet.isLocal = data.isLocal
 
+    // API key: present-and-non-empty replaces the stored key; explicit null or
+    // empty string clears it; omitted leaves the existing key untouched.
+    if ('apiKey' in data) {
+      const key = data.apiKey?.trim()
+      updateSet.apiKeyCiphertext = key ? encryptSecret(key) : null
+    }
+
     const [updated] = await db
       .update(providerConfigs)
       .set(updateSet)
@@ -125,7 +135,7 @@ export async function PUT(
       .returning()
 
     console.info('[PUT /api/providers/:id] Updated provider config', { id: updated.id })
-    return NextResponse.json({ provider: updated })
+    return NextResponse.json({ provider: toPublicProvider(updated) })
   } catch (err) {
     console.error('[PUT /api/providers/:id] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
