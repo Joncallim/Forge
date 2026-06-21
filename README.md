@@ -24,10 +24,40 @@ worker process. See [docs/worker-process.md](docs/worker-process.md).
 Web task -> Redis queue -> Forge worker -> Architect plan -> Approval
 ```
 
-## Quick Start
+## Quick Start (macOS — no Docker)
+
+One command installs Postgres + Redis via Homebrew, generates every secret,
+writes `.env` for you, prepares the database, and sets up **zero-config local
+AI** — it installs Ollama, pulls a small model, and wires every agent to it so
+you can run tasks with no API keys at all:
 
 ```bash
-cp .env.example .env        # fill in provider, GitHub, database, and Redis settings
+bash scripts/install-mac.sh
+```
+
+You never edit `.env` by hand and you don't need Docker. To use cloud models
+instead, add a provider and its key on the Providers page (keys are stored
+encrypted in the database, never in `.env`). The script is idempotent — safe to
+re-run. To skip the local-AI setup and configure cloud providers yourself, run
+`FORGE_SKIP_OLLAMA=1 bash scripts/install-mac.sh`.
+
+Then run the web app and worker in separate terminals (both from `web/`):
+
+```bash
+cd web && npm run dev      # web UI at http://localhost:3000
+```
+
+```bash
+cd web && npm run worker
+```
+
+Open `http://localhost:3000`, register your passkey, and submit a task — local
+AI is already configured, so no provider setup is required.
+
+## Quick Start (Docker — other platforms)
+
+```bash
+cp .env.example .env        # infra defaults work as-is for local Docker
 bash scripts/setup.sh       # starts PostgreSQL + Redis via Docker
 ```
 
