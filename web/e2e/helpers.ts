@@ -6,6 +6,8 @@ import postgres from 'postgres'
 import type { BrowserContext, TestInfo } from '@playwright/test'
 
 const root = path.resolve(__dirname, '..')
+const workerLogs = new WeakMap<ChildProcessWithoutNullStreams, string[]>()
+const useProcessGroup = process.platform !== 'win32'
 
 export type SeededSession = {
   userId: string
@@ -26,6 +28,77 @@ function redisClient() {
   const redisUrl = process.env.REDIS_URL
   if (!redisUrl) throw new Error('REDIS_URL is required for E2E tests')
   return new Redis(redisUrl, { maxRetriesPerRequest: 3 })
+}
+
+function isProcessMissing(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as NodeJS.ErrnoException).code === 'ESRCH'
+  )
+}
+
+function signalWorker(worker: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): boolean {
+  if (!worker.pid) return false
+
+  try {
+    if (useProcessGroup) {
+      process.kill(-worker.pid, signal)
+      return true
+    }
+
+    return worker.kill(signal)
+  } catch (error) {
+    if (isProcessMissing(error)) return false
+    throw error
+  }
+}
+
+function isWorkerRunning(worker: ChildProcessWithoutNullStreams): boolean {
+  if (!worker.pid) return worker.exitCode === null && worker.signalCode === null
+
+  if (!useProcessGroup) return worker.exitCode === null && worker.signalCode === null
+
+  try {
+    process.kill(-worker.pid, 0)
+    return true
+  } catch (error) {
+    if (isProcessMissing(error)) return false
+    throw error
+  }
+}
+
+async function waitForWorkerStop(
+  worker: ChildProcessWithoutNullStreams,
+  timeoutMs: number,
+): Promise<void> {
+  if (!isWorkerRunning(worker)) return
+
+  await new Promise<void>((resolve) => {
+    let settled = false
+
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearInterval(poll)
+      clearTimeout(timeout)
+      worker.off('exit', handleExit)
+      resolve()
+    }
+
+    const handleExit = () => {
+      if (!isWorkerRunning(worker)) finish()
+    }
+
+    const poll = setInterval(() => {
+      if (!isWorkerRunning(worker)) finish()
+    }, 100)
+
+    const timeout = setTimeout(finish, timeoutMs)
+
+    worker.once('exit', handleExit)
+  })
 }
 
 export async function resetState(): Promise<void> {
@@ -107,6 +180,7 @@ export async function installSessionCookie(
 export async function startMockWorker(testInfo: TestInfo): Promise<ChildProcessWithoutNullStreams> {
   const worker = spawn('npm', ['run', 'worker'], {
     cwd: root,
+    detached: useProcessGroup,
     env: {
       ...process.env,
       FORGE_WORKER_MOCK_ARCHITECT: '1',
@@ -115,33 +189,45 @@ export async function startMockWorker(testInfo: TestInfo): Promise<ChildProcessW
   })
 
   const logs: string[] = []
+  workerLogs.set(worker, logs)
+
   const append = (chunk: Buffer) => logs.push(chunk.toString())
   worker.stdout.on('data', append)
   worker.stderr.on('data', append)
 
   await new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
+      cleanup()
       reject(new Error(`Worker did not start.\n${logs.join('')}`))
     }, 15_000)
 
+    const cleanup = () => {
+      clearTimeout(timeout)
+      worker.stdout.off('data', handleData)
+      worker.stderr.off('data', handleData)
+      worker.off('exit', handleExit)
+    }
+
     const handleData = () => {
       if (logs.join('').includes('[worker] Started')) {
-        clearTimeout(timeout)
-        worker.stdout.off('data', handleData)
-        worker.stderr.off('data', handleData)
+        cleanup()
         resolve()
       }
     }
 
+    const handleExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup()
+      reject(
+        new Error(`Worker exited before startup with code ${code} and signal ${signal}.\n${logs.join('')}`),
+      )
+    }
+
     worker.stdout.on('data', handleData)
     worker.stderr.on('data', handleData)
-    worker.once('exit', (code) => {
-      clearTimeout(timeout)
-      reject(new Error(`Worker exited before startup with code ${code}.\n${logs.join('')}`))
-    })
+    worker.once('exit', handleExit)
   })
 
-  testInfo.attach('worker-startup.log', {
+  await testInfo.attach('worker-startup.log', {
     body: logs.join(''),
     contentType: 'text/plain',
   })
@@ -149,20 +235,28 @@ export async function startMockWorker(testInfo: TestInfo): Promise<ChildProcessW
   return worker
 }
 
-export async function stopWorker(worker: ChildProcessWithoutNullStreams | null): Promise<void> {
-  if (!worker || worker.killed) return
+export async function stopWorker(
+  worker: ChildProcessWithoutNullStreams | null,
+  testInfo?: TestInfo,
+): Promise<void> {
+  if (!worker) return
 
-  await new Promise<void>((resolve) => {
-    const timeout = setTimeout(() => {
-      worker.kill('SIGKILL')
-      resolve()
-    }, 5_000)
+  if (isWorkerRunning(worker)) {
+    signalWorker(worker, 'SIGTERM')
+    await waitForWorkerStop(worker, 5_000)
+  }
 
-    worker.once('exit', () => {
-      clearTimeout(timeout)
-      resolve()
+  if (isWorkerRunning(worker)) {
+    signalWorker(worker, 'SIGKILL')
+    await waitForWorkerStop(worker, 10_000)
+  }
+
+  const logs = workerLogs.get(worker)
+  if (testInfo && logs) {
+    await testInfo.attach('worker-full.log', {
+      body: logs.join(''),
+      contentType: 'text/plain',
     })
-
-    worker.kill('SIGTERM')
-  })
+  }
+  workerLogs.delete(worker)
 }
