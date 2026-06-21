@@ -1,0 +1,1 @@
+ALTER TABLE "provider_configs" ADD COLUMN "api_key_ciphertext" text;

@@ -109,7 +109,8 @@ export const providerConfigs = pgTable(
     providerType: text('provider_type').notNull(), // see lib/providers/types.ts
     modelId: text('model_id').notNull(),
     baseUrl: text('base_url'), // required for custom, ollama, and litellm
-    apiKeyEnvVar: text('api_key_env_var'), // env var NAME only, never the secret
+    apiKeyEnvVar: text('api_key_env_var'), // optional fallback: env var NAME only, never the secret
+    apiKeyCiphertext: text('api_key_ciphertext'), // AES-256-GCM key entered via the UI (see lib/crypto.ts)
     isLocal: boolean('is_local').notNull().default(false),
     isActive: boolean('is_active').notNull().default(true),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
