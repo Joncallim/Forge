@@ -4,9 +4,51 @@ import { db } from '@/db'
 import { users } from '@/db/schema'
 import { createSession, sessionCookieOptions } from '@/lib/session'
 import { verifyPassword } from '@/lib/password'
+import { redis } from '@/lib/redis'
+
+// Passwords can be guessed online, unlike passkeys. Keep a short fixed-window
+// throttle per client and globally so exposed installs are not unlimited.
+const RATE_LIMIT_WINDOW_SECONDS = 900
+const RATE_LIMIT_PER_IP = 10
+const RATE_LIMIT_GLOBAL = 50
+
+function clientIp(request: NextRequest): string {
+  return (
+    request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
+    request.headers.get('x-real-ip') ||
+    'unknown'
+  )
+}
+
+async function hitRateLimit(key: string): Promise<number> {
+  const count = await redis.incr(key)
+  if (count === 1) {
+    await redis.expire(key, RATE_LIMIT_WINDOW_SECONDS)
+  }
+  return count
+}
 
 export async function POST(request: NextRequest) {
   try {
+    const ip = clientIp(request)
+    const ipKey = `ratelimit:login:password:ip:${ip}`
+    const globalKey = 'ratelimit:login:password:global'
+
+    const [ipCount, globalCount] = await Promise.all([
+      hitRateLimit(ipKey),
+      hitRateLimit(globalKey),
+    ])
+
+    if (ipCount > RATE_LIMIT_PER_IP || globalCount > RATE_LIMIT_GLOBAL) {
+      return NextResponse.json(
+        { error: 'Too many sign-in attempts. Please wait and try again.' },
+        {
+          status: 429,
+          headers: { 'Retry-After': String(RATE_LIMIT_WINDOW_SECONDS) },
+        },
+      )
+    }
+
     let body: unknown
     try {
       body = await request.json()
@@ -25,6 +67,8 @@ export async function POST(request: NextRequest) {
 
     const { password } = body as { password: string }
 
+    // Forge currently has one user. If multi-user sign-in is added later, this
+    // must look up the user by a stable identifier instead of taking the first row.
     const [user] = await db
       .select({
         id: users.id,
@@ -39,13 +83,12 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid password' }, { status: 401 })
     }
 
-    const userAgent = request.headers.get('user-agent')
-    const ip =
-      request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ??
-      request.headers.get('x-real-ip') ??
-      null
+    await Promise.all([redis.del(ipKey), redis.del(globalKey)]).catch(() => {})
 
-    const sessionId = await createSession(user.id, null, { userAgent, ip })
+    const userAgent = request.headers.get('user-agent')
+    const sessionIp = ip === 'unknown' ? null : ip
+
+    const sessionId = await createSession(user.id, null, { userAgent, ip: sessionIp })
 
     const cookieOpts = sessionCookieOptions()
     const response = NextResponse.json({ userId: user.id, displayName: user.displayName })

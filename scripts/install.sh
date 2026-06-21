@@ -1036,7 +1036,7 @@ fi
 
 install_base_dependencies
 
-DB_PASSWORD="$(env_value DATABASE_URL | sed -n 's#^postgresql://forge:\([^@]*\)@.*#\1#p' | head -1)"
+DB_PASSWORD="$(env_value DATABASE_URL | sed -n 's#^postgres\(ql\)\?://forge:\(.*\)@localhost:5432/forge.*#\2#p' | head -1)"
 DB_PASSWORD="${DB_PASSWORD:-$(env_value POSTGRES_PASSWORD)}"
 if placeholder_value "$DB_PASSWORD"; then
   DB_PASSWORD=""

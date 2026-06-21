@@ -97,16 +97,6 @@ if [ -z "$KEEP_DATA" ]; then
   fi
 fi
 
-run() {
-  local description="$1"
-  shift
-  if [ "$DRY_RUN" = "1" ]; then
-    info "[dry-run] $description"
-    return 0
-  fi
-  "$@" >/dev/null 2>&1
-}
-
 remove_path() {
   local path="$1"
   if [ -e "$path" ] || [ -L "$path" ]; then
