@@ -97,6 +97,9 @@ export function SetupWizard({ hasProviders }: SetupWizardProps) {
                   {preset.description}
                 </p>
               </div>
+              {preset.id === 'zero-config' && (
+                <Badge variant="secondary">No API key</Badge>
+              )}
               {preset.id === 'best-value' && (
                 <Badge variant="secondary">Default</Badge>
               )}

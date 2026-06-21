@@ -44,6 +44,7 @@ type ProviderConfig = {
   modelId: string
   baseUrl: string | null
   apiKeyEnvVar: string | null
+  hasApiKey: boolean
   isLocal: boolean
   isActive: boolean
   createdAt: string
@@ -92,6 +93,7 @@ type ProviderFormState = {
   providerType: ProviderType
   modelId: string
   baseUrl: string
+  apiKey: string
   apiKeyEnvVar: string
   isLocal: boolean
 }
@@ -101,6 +103,7 @@ const DEFAULT_FORM: ProviderFormState = {
   providerType: 'anthropic',
   modelId: '',
   baseUrl: '',
+  apiKey: '',
   apiKeyEnvVar: '',
   isLocal: false,
 }
@@ -111,6 +114,7 @@ function formFromProvider(p: ProviderConfig): ProviderFormState {
     providerType: p.providerType,
     modelId: p.modelId,
     baseUrl: p.baseUrl ?? '',
+    apiKey: '', // never prefilled — the stored secret is never sent to the client
     apiKeyEnvVar: p.apiKeyEnvVar ?? '',
     isLocal: p.isLocal,
   }
@@ -182,9 +186,10 @@ interface ProviderFormProps {
   submitting: boolean
   onSubmit: (e: React.FormEvent) => void
   submitLabel: string
+  keyAlreadySet?: boolean
 }
 
-function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel }: ProviderFormProps) {
+function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel, keyAlreadySet = false }: ProviderFormProps) {
   const needsBaseUrl = requiresProviderBaseUrl(form.providerType)
   const needsApiKey = !form.isLocal
 
@@ -275,24 +280,50 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
         </div>
       )}
 
-      {/* API key env var — shown for cloud providers */}
+      {/* API key — entered here and stored encrypted; no .env editing required */}
       {needsApiKey && (
         <div className="flex flex-col gap-1.5">
-          <label htmlFor="pf-apiKeyEnvVar" className="text-sm font-medium text-foreground">
-            API key environment variable
+          <label htmlFor="pf-apiKey" className="text-sm font-medium text-foreground">
+            API key
           </label>
           <input
-            id="pf-apiKeyEnvVar"
-            type="text"
-            value={form.apiKeyEnvVar}
-            onChange={(e) => set('apiKeyEnvVar', e.target.value)}
-            placeholder="ANTHROPIC_API_KEY"
-            className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+            id="pf-apiKey"
+            type="password"
+            autoComplete="off"
+            value={form.apiKey}
+            onChange={(e) => set('apiKey', e.target.value)}
+            placeholder={keyAlreadySet ? '•••••••• stored — leave blank to keep' : 'sk-…'}
+            className="rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
           />
           <p className="text-xs text-muted-foreground">
-            Name of the environment variable holding the key, e.g. ANTHROPIC_API_KEY
+            Stored encrypted in the database. You only enter this once a provider needs it.
           </p>
         </div>
+      )}
+
+      {/* Advanced: read the key from an environment variable instead */}
+      {needsApiKey && (
+        <details className="rounded-lg border border-border px-3 py-2">
+          <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
+            Advanced: use an environment variable instead
+          </summary>
+          <div className="mt-2 flex flex-col gap-1.5">
+            <label htmlFor="pf-apiKeyEnvVar" className="text-sm font-medium text-foreground">
+              API key environment variable
+            </label>
+            <input
+              id="pf-apiKeyEnvVar"
+              type="text"
+              value={form.apiKeyEnvVar}
+              onChange={(e) => set('apiKeyEnvVar', e.target.value)}
+              placeholder="ANTHROPIC_API_KEY"
+              className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+            />
+            <p className="text-xs text-muted-foreground">
+              Fallback used only when no key is entered above. The stored key takes precedence.
+            </p>
+          </div>
+        </details>
       )}
 
       {/* Is local toggle */}
@@ -468,6 +499,7 @@ export default function ProvidersPage() {
     const modelId = addForm.modelId.trim()
     const baseUrl = addForm.baseUrl.trim() || null
     const apiKeyEnvVar = addForm.isLocal ? null : addForm.apiKeyEnvVar.trim() || null
+    const apiKey = addForm.isLocal ? null : addForm.apiKey.trim() || null
 
     if (!displayName) { setAddError('Display name is required.'); return }
     if (!modelId) { setAddError('Model ID is required.'); return }
@@ -487,6 +519,7 @@ export default function ProvidersPage() {
           modelId,
           baseUrl,
           apiKeyEnvVar,
+          apiKey,
           isLocal: addForm.isLocal,
         }),
       })
@@ -522,6 +555,8 @@ export default function ProvidersPage() {
     const modelId = editForm.modelId.trim()
     const baseUrl = editForm.baseUrl.trim() || null
     const apiKeyEnvVar = editForm.isLocal ? null : editForm.apiKeyEnvVar.trim() || null
+    // Only send apiKey when the user typed one; a blank field keeps the stored key.
+    const typedApiKey = editForm.isLocal ? '' : editForm.apiKey.trim()
 
     if (!displayName) { setEditError('Display name is required.'); return }
     if (!modelId) { setEditError('Model ID is required.'); return }
@@ -541,6 +576,7 @@ export default function ProvidersPage() {
           modelId,
           baseUrl,
           apiKeyEnvVar,
+          ...(typedApiKey !== '' ? { apiKey: typedApiKey } : {}),
           isLocal: editForm.isLocal,
         }),
       })
@@ -741,6 +777,7 @@ export default function ProvidersPage() {
                             submitting={editSubmitting}
                             onSubmit={handleEdit}
                             submitLabel="Save Changes"
+                            keyAlreadySet={provider.hasApiKey}
                           />
                         </DialogContent>
                       </Dialog>
