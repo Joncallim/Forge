@@ -24,13 +24,6 @@ cd web
 npm run dev
 ```
 
-In another terminal:
-
-```bash
-cd web
-npm run worker
-```
-
 Open `http://localhost:3000`.
 
 ## Docker Path
@@ -67,8 +60,9 @@ Open:
 http://localhost:3000
 ```
 
-The first account creates both a password and a passkey. Later, the login page
-lets you choose either method.
+The first account creates a password and, by default, a passkey. To use password
+only, set `FORGE_PASSKEYS_ENABLED=0` in `.env` before creating the first
+account.
 
 Use `http://localhost:3000` for local passkeys. Do not use an IP address unless
 you also change the WebAuthn settings.
@@ -84,7 +78,8 @@ To use a custom model, put the real API key in `.env`, for example:
 CUSTOM_MODEL_API_KEY=sk-your-real-key
 ```
 
-Restart both `npm run dev` and `npm run worker` after changing `.env`.
+Restart `npm run dev` after changing `.env`. If you run a standalone worker,
+restart that too.
 
 In Forge:
 
@@ -146,7 +141,7 @@ Keep the task page open.
 A successful run looks like this:
 
 1. The task changes from `Pending` to `Running`.
-2. The worker terminal logs activity.
+2. The terminal running `npm run dev` logs worker activity.
 3. The task changes to `Awaiting Approval`.
 4. The page shows an Architect run and a generated plan.
 5. The plan is not `Mock architect plan...`.
@@ -165,12 +160,12 @@ Completed
 
 ## No-Cost Mock Test
 
-To test Forge's plumbing without calling a real model, stop the worker and
-restart it like this:
+To test Forge's plumbing without calling a real model, stop Forge and restart it
+like this:
 
 ```bash
 cd web
-FORGE_WORKER_MOCK_ARCHITECT=1 npm run worker
+FORGE_WORKER_MOCK_ARCHITECT=1 npm run dev
 ```
 
 Then create a task. It should reach `Awaiting Approval`, but the plan will say:
@@ -205,12 +200,12 @@ If `npm run doctor` fails:
 If the task stays `Pending`:
 
 - The worker is not running, or it cannot reach Redis.
-- Start it with `cd web && npm run worker`.
+- Start Forge with `cd web && npm run dev`.
 
 If the task changes to `Failed`:
 
 - Read the error on the task page.
-- Check the worker terminal.
+- Check the terminal running Forge.
 - Confirm the Architect agent has a provider assigned.
 - Confirm the provider has the right model ID, base URL, and API-key variable
   name.
@@ -219,7 +214,7 @@ If provider health says an environment variable is missing:
 
 - The provider stores only the variable name.
 - The real key must be in `.env`.
-- Restart both web and worker after editing `.env`.
+- Restart Forge after editing `.env`.
 
 If passkey registration fails:
 
@@ -233,6 +228,6 @@ If passkey registration fails:
 - `npm run db:migrate` has completed.
 - `npm run doctor` passes.
 - The web app is running.
-- The worker is running.
+- The embedded or standalone worker is running.
 - The Architect agent has a provider.
 - A task reaches `Awaiting Approval`.

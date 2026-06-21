@@ -120,6 +120,85 @@ describe('GET /api/projects — auth guard', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Suite 3.1b — Project creation supports GitHub and local sources
+// ---------------------------------------------------------------------------
+
+describe('POST /api/projects — source handling', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('returns 400 when a GitHub project is missing githubRepo', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+
+    const { POST } = await import('@/app/api/projects/route')
+    const res = await POST(authRequest('/api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'GitHub project',
+        source: 'github',
+      }),
+    }) as never)
+
+    expect(res.status).toBe(400)
+    expect(mockDbInsert).not.toHaveBeenCalled()
+  })
+
+  it('creates a local project with no githubRepo', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const createdProject = {
+      id: 'project-local',
+      name: 'Local project',
+      githubRepo: null,
+      localPath: '/tmp/forge-games',
+      githubTokenEnvVar: null,
+      pmProviderConfigId: null,
+      defaultBranch: 'main',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      archivedAt: null,
+    }
+    mockDbInsert.mockReturnValue(chain([createdProject]))
+
+    const { POST } = await import('@/app/api/projects/route')
+    const res = await POST(authRequest('/api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Local project',
+        source: 'local',
+        localPath: '/tmp/forge-games',
+        defaultBranch: 'main',
+      }),
+    }) as never)
+
+    expect(res.status).toBe(201)
+    const body = await res.json()
+    expect(body.project.githubRepo).toBeNull()
+    expect(body.project.localPath).toBe('/tmp/forge-games')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Suite 3.1c — Folder browser lists local directories for authenticated users
+// ---------------------------------------------------------------------------
+
+describe('GET /api/filesystem/directories — folder selector', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('returns the requested directory listing', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+
+    const { GET } = await import('@/app/api/filesystem/directories/route')
+    const res = await GET(nextAuthRequest('/api/filesystem/directories?path=/tmp') as never)
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.path).toBe('/tmp')
+    expect(Array.isArray(body.directories)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Suite 3.2 — 404: GET /api/projects/:id when project does not exist
 // ---------------------------------------------------------------------------
 

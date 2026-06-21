@@ -13,6 +13,7 @@ import { getSession } from '@/lib/session'
 const updateProjectSchema = z.object({
   name: z.string().min(1).max(200).optional(),
   githubRepo: z.string().nullable().optional(),
+  localPath: z.string().nullable().optional(),
   githubTokenEnvVar: z.string().nullable().optional(),
   pmProviderConfigId: z.string().uuid().nullable().optional(),
   defaultBranch: z.string().optional(),
@@ -97,6 +98,7 @@ export async function PUT(
     const updateSet: Record<string, unknown> = { updatedAt: new Date() }
     if (data.name !== undefined) updateSet.name = data.name
     if ('githubRepo' in data) updateSet.githubRepo = data.githubRepo ?? null
+    if ('localPath' in data) updateSet.localPath = data.localPath ?? null
     if ('githubTokenEnvVar' in data) updateSet.githubTokenEnvVar = data.githubTokenEnvVar ?? null
     if ('pmProviderConfigId' in data) updateSet.pmProviderConfigId = data.pmProviderConfigId ?? null
     if (data.defaultBranch !== undefined) updateSet.defaultBranch = data.defaultBranch

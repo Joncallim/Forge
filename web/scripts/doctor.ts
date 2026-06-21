@@ -15,34 +15,40 @@ async function main(): Promise<void> {
     throw new Error(`Missing required env vars: ${missing.map((check) => check.name).join(', ')}`)
   }
 
-  const { db } = await import('../db')
+  const { closeDb, db } = await import('../db')
   const { redis } = await import('../lib/redis')
 
   let failed = false
 
   try {
-    await db.execute(sql`SELECT 1`)
-    console.info('ok DATABASE_URL connection')
-  } catch (err) {
-    failed = true
-    console.error('failed DATABASE_URL connection')
-    console.error(err instanceof Error ? err.message : err)
+    try {
+      await db.execute(sql`SELECT 1`)
+      console.info('ok DATABASE_URL connection')
+    } catch (err) {
+      failed = true
+      console.error('failed DATABASE_URL connection')
+      console.error(err instanceof Error ? err.message : err)
+    }
+
+    try {
+      await redis.ping()
+      console.info('ok REDIS_URL connection')
+    } catch (err) {
+      failed = true
+      console.error('failed REDIS_URL connection')
+      console.error(err instanceof Error ? err.message : err)
+    }
+  } finally {
+    await closeDb().catch(() => {})
+    redis.disconnect()
   }
 
-  try {
-    await redis.ping()
-    console.info('ok REDIS_URL connection')
-  } catch (err) {
-    failed = true
-    console.error('failed REDIS_URL connection')
-    console.error(err instanceof Error ? err.message : err)
-  }
-
-  redis.disconnect()
 
   if (failed) {
     process.exit(1)
   }
+
+  process.exit(0)
 }
 
 main().catch((err) => {

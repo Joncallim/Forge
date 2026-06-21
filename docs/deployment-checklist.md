@@ -9,7 +9,8 @@ Forge needs these running:
 - PostgreSQL 16 or newer.
 - Redis 7 or newer.
 - The Next.js web process.
-- The Forge worker process.
+- The Forge worker loop, embedded in the web process or run as a standalone
+  worker process.
 
 The web process and worker must point at the same PostgreSQL and Redis
 instances.
@@ -23,16 +24,24 @@ Set these for both the web process and worker:
 | `DATABASE_URL` | Where PostgreSQL is running. |
 | `REDIS_URL` | Where Redis is running. |
 | `SESSION_SECRET` | Secret value used for local session/security material. |
-| `WEBAUTHN_RP_ID` | Passkey domain, usually the hostname. |
-| `WEBAUTHN_RP_NAME` | Display name shown by passkey prompts. |
-| `WEBAUTHN_ORIGIN` | Public app origin, such as `https://forge.example.com`. |
 | `NEXT_PUBLIC_APP_URL` | Public browser URL for the Forge web app. |
 
 Optional for standalone deployments:
 
 | Variable | Purpose |
 |---|---|
+| `FORGE_EMBED_WORKER` | Set to `0` when running a separate worker process. Defaults to embedded. |
+| `FORGE_AGENT_WEB_SEARCH` | Set to `0` to disable no-key web research context for architect planning. Defaults to enabled. |
 | `FORGE_AGENT_CONFIG_DIR` | Absolute path where agent prompt files can be read and written. |
+
+Passkey-related:
+
+| Variable | Purpose |
+|---|---|
+| `FORGE_PASSKEYS_ENABLED` | Set to `0` to hide and disable passkey registration/sign-in. Defaults to `1`. |
+| `WEBAUTHN_RP_ID` | Passkey domain, usually the hostname. Required when passkeys are enabled. |
+| `WEBAUTHN_RP_NAME` | Display name shown by passkey prompts. Required when passkeys are enabled. |
+| `WEBAUTHN_ORIGIN` | Public app origin, such as `https://forge.example.com`. Required when passkeys are enabled. |
 
 Provider keys are needed only for the providers you configure:
 
@@ -107,9 +116,9 @@ Status meanings:
 ## Manual Launch Check
 
 1. Open the app.
-2. Create the first account with a password and passkey.
+2. Create the first account with a password and, if enabled, a passkey.
 3. Sign out and confirm password login works.
-4. Confirm passkey login works on the same browser/device.
+4. If passkeys are enabled, confirm passkey login works on the same browser/device.
 5. If no providers exist, confirm the setup wizard opens.
 6. Apply a preset or add a provider manually.
 7. Confirm provider health.

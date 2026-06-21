@@ -135,6 +135,11 @@ function fakeRequest(cookieValue?: string): Request {
   return new Request('http://localhost/', { headers })
 }
 
+beforeEach(() => {
+  delete process.env.FORGE_PASSKEYS_ENABLED
+  delete process.env.FORGE_DISABLE_PASSKEYS
+})
+
 // ---------------------------------------------------------------------------
 // Tests — register/start
 // ---------------------------------------------------------------------------
@@ -559,5 +564,67 @@ describe('register/finish — password validation', () => {
     expect(res.status).toBe(400)
     const json = await res.json()
     expect(json.error).toMatch(/at least 8 characters/i)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tests — password-only registration
+// ---------------------------------------------------------------------------
+
+describe('register/password — passkeys disabled', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    process.env.FORGE_PASSKEYS_ENABLED = '0'
+    mockRedisSet.mockResolvedValue('OK')
+    mockRedisGet.mockResolvedValue('lock-token')
+    mockRedisDel.mockResolvedValue(1)
+    mockHashPassword.mockResolvedValue('hashed-password')
+    mockDbInsert
+      .mockReturnValueOnce(chain([{ id: 'user-1' }]))
+      .mockReturnValueOnce(chain(undefined))
+  })
+
+  it('creates the first user without a passkey when passkeys are disabled', async () => {
+    mockDbSelect.mockReturnValue(chain([{ value: 0 }]))
+
+    const { POST } = await import('@/app/api/auth/register/password/route')
+    const { NextRequest } = await import('next/server')
+
+    const req = new NextRequest('http://localhost/api/auth/register/password', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ displayName: 'Alice', password: 'correct-password' }),
+    })
+
+    const res = await POST(req)
+
+    expect(res.status).toBe(200)
+    expect(mockHashPassword).toHaveBeenCalledWith('correct-password')
+    expect(mockDbInsert).toHaveBeenCalledTimes(2)
+    expect(mockRedisSet).toHaveBeenCalledWith(
+      'webauthn:registration:first-user-lock',
+      expect.any(String),
+      'EX',
+      30,
+      'NX',
+    )
+  })
+
+  it('is not available while passkeys are enabled', async () => {
+    process.env.FORGE_PASSKEYS_ENABLED = '1'
+
+    const { POST } = await import('@/app/api/auth/register/password/route')
+    const { NextRequest } = await import('next/server')
+
+    const req = new NextRequest('http://localhost/api/auth/register/password', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ displayName: 'Alice', password: 'correct-password' }),
+    })
+
+    const res = await POST(req)
+
+    expect(res.status).toBe(404)
+    expect(mockDbSelect).not.toHaveBeenCalled()
   })
 })

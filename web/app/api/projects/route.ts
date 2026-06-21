@@ -12,7 +12,9 @@ import { getSession } from '@/lib/session'
 
 const createProjectSchema = z.object({
   name: z.string().min(1).max(200),
-  githubRepo: z.string().optional(),
+  source: z.enum(['github', 'local']).optional(),
+  githubRepo: z.string().trim().min(1).max(200).optional(),
+  localPath: z.string().trim().min(1).max(1000).optional(),
   githubTokenEnvVar: z.string().optional(),
   pmProviderConfigId: z.string().uuid().optional(),
   defaultBranch: z.string().optional(),
@@ -69,12 +71,20 @@ export async function POST(request: NextRequest) {
     }
 
     const data = parsed.data
+    const source = data.source ?? (data.githubRepo ? 'github' : 'local')
+    if (source === 'github' && !data.githubRepo) {
+      return NextResponse.json(
+        { error: 'GitHub repo is required for GitHub projects' },
+        { status: 400 },
+      )
+    }
 
     const [project] = await db
       .insert(projects)
       .values({
         name: data.name,
-        githubRepo: data.githubRepo ?? null,
+        githubRepo: source === 'github' ? data.githubRepo ?? null : null,
+        localPath: source === 'local' ? data.localPath ?? null : null,
         githubTokenEnvVar: data.githubTokenEnvVar ?? null,
         pmProviderConfigId: data.pmProviderConfigId ?? null,
         defaultBranch: data.defaultBranch ?? 'main',

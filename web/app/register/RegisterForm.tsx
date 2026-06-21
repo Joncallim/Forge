@@ -7,7 +7,11 @@ import Link from 'next/link'
 import { startRegistration } from '@simplewebauthn/browser'
 import { Button } from '@/components/ui/button'
 
-export function RegisterForm() {
+type RegisterFormProps = {
+  passkeysEnabled?: boolean
+}
+
+export function RegisterForm({ passkeysEnabled = true }: RegisterFormProps) {
   const router = useRouter()
   const [displayName, setDisplayName] = useState('')
   const [password, setPassword] = useState('')
@@ -40,6 +44,29 @@ export function RegisterForm() {
     setErrorMessage(null)
 
     try {
+      if (!passkeysEnabled) {
+        const response = await fetch('/api/auth/register/password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            displayName: displayName.trim(),
+            password,
+          }),
+        })
+
+        if (response.status === 409) {
+          throw new Error('Registration is closed - an account already exists.')
+        }
+
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}))
+          throw new Error(data.error ?? 'Registration failed. Please try again.')
+        }
+
+        router.push('/dashboard')
+        return
+      }
+
       // Step 1: Request registration options from the server
       const startResponse = await fetch('/api/auth/register/start', {
         method: 'POST',
@@ -110,7 +137,7 @@ export function RegisterForm() {
             Forge
           </h1>
           <p className="mt-2 text-sm text-muted-foreground">
-            Create a password and passkey
+            {passkeysEnabled ? 'Create a password and passkey' : 'Create a password'}
           </p>
         </div>
 

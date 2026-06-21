@@ -1,4 +1,4 @@
-import { generateText } from 'ai'
+import { streamText } from 'ai'
 import type { LanguageModel } from 'ai'
 import { db } from '../db'
 import { agentConfigs, agentRuns, artifacts, projects, tasks } from '../db/schema'
@@ -6,6 +6,11 @@ import { getProvider } from '../lib/providers/registry'
 import { and, eq } from 'drizzle-orm'
 import { publishTaskEvent } from './events'
 import { updateTaskStatus, updateTaskStatusIfCurrent } from './task-state'
+import {
+  buildSpecialistContext,
+  buildWebResearchContext,
+  detectSoftwareProfile,
+} from './architect-context'
 
 type TaskRow = typeof tasks.$inferSelect
 type ProjectRow = typeof projects.$inferSelect
@@ -51,10 +56,16 @@ async function isTaskCancelled(taskId: string): Promise<boolean> {
   return task !== undefined
 }
 
-function buildArchitectPrompt(task: TaskRow, project: ProjectRow): string {
+function buildArchitectPrompt(
+  task: TaskRow,
+  project: ProjectRow,
+  specialistContext: string,
+  webResearchContext: string,
+): string {
   return [
     `Project: ${project.name}`,
     `Repository: ${project.githubRepo ?? 'not configured'}`,
+    `Local folder: ${project.localPath ?? 'not configured'}`,
     `Default branch: ${project.defaultBranch}`,
     '',
     `Task title: ${task.title}`,
@@ -63,7 +74,14 @@ function buildArchitectPrompt(task: TaskRow, project: ProjectRow): string {
     task.prompt,
     '',
     'Produce a concise implementation plan for this task.',
-    'Include assumptions, recommended files/modules to inspect, implementation steps, verification steps, and notable risks.',
+    'Write the plan in Markdown.',
+    'Include assumptions, recommended files/modules to inspect, specialist handoffs, implementation steps, verification steps, and notable risks.',
+    'Specialist handoffs must name the capability/persona, not only broad coding roles.',
+    '',
+    specialistContext,
+    '',
+    webResearchContext,
+    '',
     'Do not claim that code has been changed. This worker stage only creates the initial architecture artifact.',
   ].join('\n')
 }
@@ -156,40 +174,60 @@ async function runArchitect(task: TaskRow, project: ProjectRow): Promise<void> {
   })
 
   try {
-    const result = process.env.FORGE_WORKER_MOCK_ARCHITECT === '1'
-      ? {
-          text: mockArchitectPlan(task, project),
-          usage: { inputTokens: 0, outputTokens: 0 },
-        }
-      : await generateText({
+    let text = ''
+    let usage = { inputTokens: 0, outputTokens: 0 }
+
+    if (process.env.FORGE_WORKER_MOCK_ARCHITECT === '1') {
+      text = mockArchitectPlan(task, project)
+      await publishTaskEvent(task.id, 'run:chunk', {
+        runId: run.id,
+        delta: text,
+      })
+    } else {
+      const profile = detectSoftwareProfile(task, project)
+      const [specialistContext, webResearchContext] = await Promise.all([
+        Promise.resolve(buildSpecialistContext(profile)),
+        buildWebResearchContext(profile, task),
+      ])
+      const result = streamText({
           model,
           system: config.systemPrompt,
-          prompt: buildArchitectPrompt(task, project),
+          prompt: buildArchitectPrompt(task, project, specialistContext, webResearchContext),
           temperature: 0.2,
         })
 
-    await publishTaskEvent(task.id, 'run:chunk', {
-      runId: run.id,
-      delta: result.text,
-    })
+      for await (const delta of result.textStream) {
+        text += delta
+        await publishTaskEvent(task.id, 'run:chunk', {
+          runId: run.id,
+          delta,
+        })
+      }
 
-    await createArtifact(task.id, run.id, result.text)
+      const streamUsage = await result.usage
+      usage = {
+        inputTokens: streamUsage.inputTokens ?? 0,
+        outputTokens: streamUsage.outputTokens ?? 0,
+      }
+    }
+
+    await createArtifact(task.id, run.id, text)
 
     const completedAt = new Date()
     await db
       .update(agentRuns)
       .set({
         status: 'completed',
-        inputTokens: result.usage.inputTokens ?? null,
-        outputTokens: result.usage.outputTokens ?? null,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
         completedAt,
       })
       .where(eq(agentRuns.id, run.id))
 
     await publishTaskEvent(task.id, 'run:completed', {
       runId: run.id,
-      inputTokens: result.usage.inputTokens ?? null,
-      outputTokens: result.usage.outputTokens ?? null,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
       costUsd: null,
       completedAt: completedAt.toISOString(),
     })

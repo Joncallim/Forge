@@ -853,7 +853,10 @@ write_env_file() {
   ensure_env_value REDIS_URL "redis://localhost:6379/0"
   ensure_env_value NEXT_PUBLIC_APP_URL "http://localhost:3000"
   ensure_env_value NEXT_TELEMETRY_DISABLED "1"
+  ensure_env_value FORGE_EMBED_WORKER "1"
+  ensure_env_value FORGE_AGENT_WEB_SEARCH "1"
   ensure_env_value FORGE_WORKER_CLAIM_TIMEOUT_SECONDS "5"
+  ensure_env_value FORGE_PASSKEYS_ENABLED "1"
   ensure_env_value SESSION_SECRET "$SESSION_SECRET" placeholder
   ensure_env_value WEBAUTHN_RP_ID "localhost"
   ensure_env_value WEBAUTHN_RP_NAME "Forge"
@@ -962,8 +965,8 @@ seed_local_ai_if_ready() {
 prepare_web_app() {
   step "Installing web dependencies and preparing the database"
   info "npm install can take a few minutes on the first run."
-  run "npm install" bash -c 'cd "$1" && npm install' _ "$REPO_ROOT/web"
-  run "npm run db:migrate" bash -c 'cd "$1" && npm run db:migrate' _ "$REPO_ROOT/web"
+  run "npm install" bash -c 'cd "$1" && npm install --loglevel=error --no-audit --no-fund' _ "$REPO_ROOT/web"
+  run "npm run db:migrate" bash -c 'cd "$1" && FORGE_SUPPRESS_MIGRATION_NOTICES=1 npm run db:migrate --silent' _ "$REPO_ROOT/web"
   run "npm run db:seed-agents" bash -c 'cd "$1" && npm run db:seed-agents' _ "$REPO_ROOT/web"
 }
 
@@ -985,13 +988,14 @@ print_summary() {
 
   Forge is installed for $OS_NAME using service mode: $SERVICE_MODE.
 
-  Start the app in two terminals:
+  Start the app:
 
-    cd web && npm run dev       # web UI at http://localhost:3000
-    cd web && npm run worker    # task worker
+    cd web && npm run dev
 
   Then open http://localhost:3000 and create the first account.
-  The first account creates both a password and a passkey.
+  The web app starts the task worker automatically. Set FORGE_EMBED_WORKER=0
+  and run "cd web && npm run worker" separately if you want split processes.
+  The first account creates a password and, when enabled, a passkey.
 EOF
 
   if [ "$SKIP_OLLAMA" != "1" ]; then

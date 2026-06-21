@@ -8,7 +8,13 @@
  * see `DATABASE_URL` (and friends) as undefined even though the file exists.
  */
 export async function register(): Promise<void> {
-  if (process.env.NEXT_RUNTIME === 'nodejs') {
-    await import('./lib/load-env')
-  }
+  if (process.env.NEXT_RUNTIME === 'edge') return
+
+  await import('./lib/load-env')
+
+  const building = process.env.npm_lifecycle_event === 'build'
+  if (building || process.env.FORGE_EMBED_WORKER === '0') return
+
+  const { startWorker } = await import('./worker/runtime')
+  await startWorker('embedded')
 }

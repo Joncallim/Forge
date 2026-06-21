@@ -27,10 +27,10 @@ The web app already enqueues tasks:
 3. The task remains `pending` until a worker consumes it.
 
 An initial worker helper exists. It consumes queued tasks, runs the architect
-planning stage through the configured provider, stores the plan as an artifact,
-publishes live task events, and moves the task to `awaiting_approval`. It also
-consumes approval jobs from `forge:approvals` and marks approved helper-stage
-tasks `completed`.
+planning stage through the configured provider, streams Markdown plan output,
+stores the plan as an artifact, publishes live task events, and moves the task
+to `awaiting_approval`. It also consumes approval jobs from `forge:approvals`
+and marks approved helper-stage tasks `completed`.
 
 Claude Code can still be used manually for development, debugging, or emergency
 operation, but it is no longer the only path for a queued task to leave
@@ -38,9 +38,14 @@ operation, but it is no longer the only path for a queued task to leave
 
 ## Target Runtime
 
-The worker runs as a long-lived Node.js process separate from Next.js. The
-current implementation handles the architect planning step; the target pipeline
-adds repository edits, specialist agents, reviews, and GitHub automation:
+For local single-user installs, the worker starts inside the Next.js server
+unless `FORGE_EMBED_WORKER=0` is set. This makes `npm run dev` enough to run the
+dashboard and helper loop together.
+
+For split deployments, the same worker runtime can run as a long-lived Node.js
+process separate from Next.js. The current implementation handles the architect
+planning step; the target pipeline adds repository edits, specialist agents,
+reviews, and GitHub automation:
 
 ```text
 Redis forge:tasks
@@ -54,15 +59,22 @@ Redis forge:tasks
   -> marks task awaiting_approval, completed, failed, or cancelled
 ```
 
-Host command:
+Embedded local command:
+
+```bash
+cd web
+npm run dev
+```
+
+Standalone host command:
 
 ```bash
 cd web
 npm run worker
 ```
 
-This starts the long-running helper process. Run it separately from
-`npm run dev`.
+Set `FORGE_EMBED_WORKER=0` for the web process when running a standalone worker
+to avoid duplicate local consumers.
 
 Container command:
 
@@ -80,7 +92,10 @@ Current responsibilities:
 - Load task, project, architect agent, and provider configuration from the
   database.
 - Store the architect run in `agent_runs`.
-- Store the generated plan in `artifacts`.
+- Stream and store the generated Markdown plan in `artifacts`.
+- Detect broad software type and prompt the architect with a matching design
+  persona and specialist-agent handoff catalog.
+- Attach no-key web research context unless `FORGE_AGENT_WEB_SEARCH=0`.
 - Publish live run events for the UI.
 - Avoid storing provider secrets directly; resolve API keys from configured
   environment variable names.

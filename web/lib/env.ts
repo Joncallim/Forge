@@ -1,3 +1,5 @@
+import { passkeysEnabled } from '@/lib/auth-options'
+
 type EnvVarName =
   | 'DATABASE_URL'
   | 'REDIS_URL'
@@ -6,10 +8,13 @@ type EnvVarName =
   | 'WEBAUTHN_RP_NAME'
   | 'WEBAUTHN_ORIGIN'
 
-export const REQUIRED_RUNTIME_ENV: EnvVarName[] = [
+const BASE_RUNTIME_ENV: EnvVarName[] = [
   'DATABASE_URL',
   'REDIS_URL',
   'SESSION_SECRET',
+]
+
+const PASSKEY_RUNTIME_ENV: EnvVarName[] = [
   'WEBAUTHN_RP_ID',
   'WEBAUTHN_RP_NAME',
   'WEBAUTHN_ORIGIN',
@@ -32,8 +37,14 @@ export function getRequiredEnv(name: EnvVarName): string {
   return value
 }
 
+export function requiredRuntimeEnv(): EnvVarName[] {
+  return passkeysEnabled()
+    ? [...BASE_RUNTIME_ENV, ...PASSKEY_RUNTIME_ENV]
+    : BASE_RUNTIME_ENV
+}
+
 export function checkRuntimeEnv(): RuntimeEnvCheck[] {
-  return REQUIRED_RUNTIME_ENV.map((name) => {
+  return requiredRuntimeEnv().map((name) => {
     const value = process.env[name]
     const present = value !== undefined && value.trim() !== ''
     return {

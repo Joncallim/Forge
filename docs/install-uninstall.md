@@ -1,6 +1,8 @@
 # Install And Uninstall
 
-This page explains what Forge puts on your machine and how to remove it later.
+The README contains the quick install/uninstall summary. This page is the
+detailed reference for what Forge puts on your machine and how to remove it
+later.
 
 ## What Forge Installs
 
@@ -28,6 +30,12 @@ It can install these pieces:
 It also creates local project files:
 
 - `.env`, which contains local URLs and generated secrets.
+- `FORGE_EMBED_WORKER=1`, so `npm run dev` starts the web app and task worker
+  together by default.
+- `FORGE_AGENT_WEB_SEARCH=1`, so architect planning can include no-key web
+  research context.
+- `FORGE_PASSKEYS_ENABLED=1`, which you can set to `0` before first account
+  creation for password-only sign-in.
 - `.forge/install-manifest`, which records only the packages Forge installed.
 - `web/node_modules`, which contains JavaScript packages for this checkout.
 - PostgreSQL and Redis data, which hold settings, credentials, sessions, and

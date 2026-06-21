@@ -9,7 +9,11 @@ import { Button } from '@/components/ui/button'
 
 type SignInMethod = 'password' | 'passkey'
 
-export function LoginForm() {
+type LoginFormProps = {
+  passkeysEnabled?: boolean
+}
+
+export function LoginForm({ passkeysEnabled = true }: LoginFormProps) {
   const router = useRouter()
   const [method, setMethod] = useState<SignInMethod>('password')
   const [password, setPassword] = useState('')
@@ -50,6 +54,8 @@ export function LoginForm() {
   }
 
   async function handlePasskeySignIn() {
+    if (!passkeysEnabled) return
+
     setLoadingMethod('passkey')
     setErrorMessage(null)
 
@@ -108,6 +114,7 @@ export function LoginForm() {
 
   function selectMethod(nextMethod: SignInMethod) {
     if (loading) return
+    if (nextMethod === 'passkey' && !passkeysEnabled) return
     setMethod(nextMethod)
     setErrorMessage(null)
   }
@@ -121,46 +128,48 @@ export function LoginForm() {
             Forge
           </h1>
           <p className="mt-2 text-sm text-muted-foreground">
-            Sign in with your password or passkey
+            {passkeysEnabled ? 'Sign in with your password or passkey' : 'Sign in with your password'}
           </p>
         </div>
 
-        <div
-          role="tablist"
-          aria-label="Sign-in method"
-          className="mb-5 grid grid-cols-2 rounded-lg border border-border bg-muted p-1"
-        >
-          <button
-            type="button"
-            role="tab"
-            aria-selected={method === 'password'}
-            className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ${
-              method === 'password'
-                ? 'bg-background text-foreground shadow-sm'
-                : 'text-muted-foreground hover:text-foreground'
-            }`}
-            onClick={() => selectMethod('password')}
-            disabled={loading}
+        {passkeysEnabled && (
+          <div
+            role="tablist"
+            aria-label="Sign-in method"
+            className="mb-5 grid grid-cols-2 rounded-lg border border-border bg-muted p-1"
           >
-            Password
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={method === 'passkey'}
-            className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ${
-              method === 'passkey'
-                ? 'bg-background text-foreground shadow-sm'
-                : 'text-muted-foreground hover:text-foreground'
-            }`}
-            onClick={() => selectMethod('passkey')}
-            disabled={loading}
-          >
-            Passkey
-          </button>
-        </div>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={method === 'password'}
+              className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ${
+                method === 'password'
+                  ? 'bg-background text-foreground shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+              onClick={() => selectMethod('password')}
+              disabled={loading}
+            >
+              Password
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={method === 'passkey'}
+              className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ${
+                method === 'passkey'
+                  ? 'bg-background text-foreground shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+              onClick={() => selectMethod('passkey')}
+              disabled={loading}
+            >
+              Passkey
+            </button>
+          </div>
+        )}
 
-        {method === 'password' ? (
+        {method === 'password' || !passkeysEnabled ? (
           <form onSubmit={handlePasswordSignIn} className="space-y-4">
             <div>
               <label

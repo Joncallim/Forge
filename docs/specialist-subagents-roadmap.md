@@ -45,6 +45,12 @@ it, stores the output, and can hand that output to another specialist.
 The first implementation can run subagents sequentially. Parallel execution can
 come later when artifact merging and conflict handling are reliable.
 
+Current helper-stage behavior teaches the Architect to detect the broad software
+type, adopt a matching design persona, and include specialist handoffs in the
+Markdown plan. It also attaches web research context by default so non-coding
+specialists, such as marketing, documentation, release, or product agents, are
+not treated as second-class citizens.
+
 ## Initial Specialist Catalog
 
 | Area | Specialist subagent | Main job |

@@ -18,6 +18,7 @@ interface Project {
   id: string
   name: string
   githubRepo: string | null
+  localPath: string | null
   pmProviderConfigId: string | null
   defaultBranch: string
   createdAt: string
@@ -209,6 +210,11 @@ export default function ProjectDetailPage() {
               {project.githubRepo}
               <ExternalLinkIcon className="size-3.5" aria-hidden="true" />
             </a>
+          )}
+          {project.githubRepo === null && (
+            <p className="mt-1 font-mono text-sm text-muted-foreground">
+              {project.localPath ?? 'Local project'}
+            </p>
           )}
         </div>
 

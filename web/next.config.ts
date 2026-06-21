@@ -9,6 +9,9 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: process.cwd(),
   },
+  outputFileTracingExcludes: {
+    '/api/filesystem/directories': ['**/*'],
+  },
 }
 
 export default nextConfig

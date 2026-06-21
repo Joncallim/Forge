@@ -6,9 +6,14 @@ import { db } from '@/db'
 import { users } from '@/db/schema'
 import { redis } from '@/lib/redis'
 import { count } from 'drizzle-orm'
+import { passkeysEnabled } from '@/lib/auth-options'
 
 export async function POST(request: NextRequest) {
   try {
+    if (!passkeysEnabled()) {
+      return NextResponse.json({ error: 'Passkeys are disabled' }, { status: 404 })
+    }
+
     // Parse and validate request body
     let body: unknown
     try {
