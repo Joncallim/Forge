@@ -164,8 +164,8 @@ run_quiet() {
     printf 'Command:'
     printf ' %q' "$@"
     printf '\n'
-    "$@"
   } >> "$INSTALL_LOG" 2>&1
+  "$@" >> "$INSTALL_LOG" 2>&1
 }
 
 ensure_install_state() {
@@ -863,21 +863,33 @@ write_env_file() {
   info "Environment file is ready at $ENV_FILE."
 }
 
-start_ollama() {
-  [ "$SKIP_OLLAMA" = "1" ] && return 0
-
-  step "Starting Ollama"
-  if [ "$PACKAGE_MANAGER" = "brew" ]; then
-    run_quiet "Start Ollama" brew services start ollama
-  elif command -v systemctl >/dev/null 2>&1 && service_exists_systemd ollama; then
-    run_quiet "Start Ollama service" "${SUDO[@]}" systemctl enable --now ollama
-  elif [ "$DRY_RUN" = "1" ]; then
+start_ollama_background() {
+  if [ "$DRY_RUN" = "1" ]; then
     info "[dry-run] Start ollama serve"
   else
     ensure_install_state
     nohup ollama serve > "$INSTALL_STATE_DIR/ollama.log" 2>&1 &
     record_manifest "ollama_pid" "$!"
     info "Started Ollama with nohup. Log: $INSTALL_STATE_DIR/ollama.log"
+  fi
+}
+
+start_ollama() {
+  [ "$SKIP_OLLAMA" = "1" ] && return 0
+
+  step "Starting Ollama"
+  if [ "$PACKAGE_MANAGER" = "brew" ]; then
+    if ! run_quiet "Start Ollama" brew services start ollama; then
+      warn "Homebrew could not start Ollama. Trying a local background process instead."
+      start_ollama_background
+    fi
+  elif command -v systemctl >/dev/null 2>&1 && service_exists_systemd ollama; then
+    if ! run_quiet "Start Ollama service" "${SUDO[@]}" systemctl enable --now ollama; then
+      warn "systemd could not start Ollama. Trying a local background process instead."
+      start_ollama_background
+    fi
+  else
+    start_ollama_background
   fi
 
   [ "$DRY_RUN" = "1" ] && return 0
@@ -935,7 +947,11 @@ seed_local_ai_if_ready() {
     info "Pulling $ZERO_CONFIG_MODEL. The first pull can take several minutes."
   fi
 
-  ollama pull "$ZERO_CONFIG_MODEL"
+  if ! ollama pull "$ZERO_CONFIG_MODEL"; then
+    warn "Could not pull $ZERO_CONFIG_MODEL. Forge can still run; add a provider from the Providers page or pull the model later."
+    SKIP_OLLAMA=1
+    return 0
+  fi
   if [ "$model_was_present" = "0" ]; then
     record_manifest "ollama_model" "$ZERO_CONFIG_MODEL"
   fi
@@ -1058,8 +1074,8 @@ else
   provision_database
 fi
 
-install_ollama_if_needed
 prepare_web_app
+install_ollama_if_needed
 seed_local_ai_if_ready
 run_doctor
 print_summary
