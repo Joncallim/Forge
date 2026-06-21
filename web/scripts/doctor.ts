@@ -1,10 +1,6 @@
-import { loadEnvConfig } from '@next/env'
-import path from 'node:path'
+import '../lib/load-env'
 import { sql } from 'drizzle-orm'
 import { checkRuntimeEnv } from '../lib/env'
-
-loadEnvConfig(path.resolve(process.cwd(), '..'))
-loadEnvConfig(process.cwd())
 
 async function main(): Promise<void> {
   const envChecks = checkRuntimeEnv()

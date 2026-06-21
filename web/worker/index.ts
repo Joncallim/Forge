@@ -1,8 +1,4 @@
-import path from 'node:path'
-import { loadEnvConfig } from '@next/env'
-
-loadEnvConfig(path.resolve(process.cwd(), '..'))
-loadEnvConfig(process.cwd())
+import '../lib/load-env'
 
 const DEFAULT_CLAIM_TIMEOUT_SECONDS = 5
 const APPROVAL_CLAIM_TIMEOUT_SECONDS = 1

@@ -11,6 +11,7 @@
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio",
     "db:seed-agents": "npx tsx db/seed-agents.ts",
+    "db:seed-providers": "npx tsx db/seed-providers.ts",
     "worker": "tsx worker/index.ts",
     "worker:dev": "tsx watch worker/index.ts",
     "doctor": "tsx scripts/doctor.ts",

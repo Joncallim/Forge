@@ -13,6 +13,7 @@
  * updating systemPrompt + updatedAt on subsequent runs.
  */
 
+import '../lib/load-env'
 import fs from 'node:fs'
 import path from 'node:path'
 import { db } from './index'

@@ -7,6 +7,7 @@ import { providerConfigs } from '@/db/schema'
 import type { ProviderConfig } from '@/db/schema'
 import { eq, asc } from 'drizzle-orm'
 import { requiresProviderBaseUrl } from './types'
+import { decryptSecret } from '@/lib/crypto'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -33,14 +34,39 @@ function normalizeOllamaBaseUrl(baseUrl: string | null): string | undefined {
   return trimmed.endsWith('/v1') ? trimmed : `${trimmed}/v1`
 }
 
-function buildProvider(config: ProviderConfig): ProviderFactory {
-  const apiKey = config.apiKeyEnvVar ? process.env[config.apiKeyEnvVar] : undefined
-
-  if (config.apiKeyEnvVar && apiKey === undefined) {
-    console.warn(
-      `[providers/registry] env var "${config.apiKeyEnvVar}" is not set for provider config ${config.id} (${config.displayName}). The provider will be instantiated but calls will likely fail.`,
-    )
+/**
+ * Resolve the API key for a provider. A key entered via the UI (stored
+ * encrypted in `apiKeyCiphertext`) takes precedence; otherwise we fall back to
+ * the legacy `apiKeyEnvVar` env-var lookup for backward compatibility.
+ */
+function resolveApiKey(config: ProviderConfig): string | undefined {
+  if (config.apiKeyCiphertext) {
+    try {
+      return decryptSecret(config.apiKeyCiphertext)
+    } catch (err) {
+      console.error(
+        `[providers/registry] failed to decrypt stored key for provider config ${config.id} (${config.displayName}):`,
+        err instanceof Error ? err.message : err,
+      )
+      // Fall through to the env-var path rather than failing hard.
+    }
   }
+
+  if (config.apiKeyEnvVar) {
+    const fromEnv = process.env[config.apiKeyEnvVar]
+    if (fromEnv === undefined) {
+      console.warn(
+        `[providers/registry] env var "${config.apiKeyEnvVar}" is not set for provider config ${config.id} (${config.displayName}). The provider will be instantiated but calls will likely fail.`,
+      )
+    }
+    return fromEnv
+  }
+
+  return undefined
+}
+
+function buildProvider(config: ProviderConfig): ProviderFactory {
+  const apiKey = resolveApiKey(config)
 
   switch (config.providerType) {
     case 'anthropic':

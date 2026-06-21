@@ -1,11 +1,14 @@
-import path from 'node:path'
-import { loadEnvConfig } from '@next/env'
+import './lib/load-env'
 import type { NextConfig } from 'next'
 
-loadEnvConfig(path.resolve(process.cwd(), '..'))
-
 const nextConfig: NextConfig = {
-  /* config options here */
+  // Pin Turbopack's project root to this app directory. Without this, Next
+  // infers the workspace root from the nearest lockfile and can pick a stray
+  // lockfile in a parent/home directory, emitting a "inferred your workspace
+  // root" warning and watching the wrong tree.
+  turbopack: {
+    root: process.cwd(),
+  },
 }
 
 export default nextConfig
