@@ -33,6 +33,7 @@ const tsOpts = { mode: 'date' as const, withTimezone: true }
 export const users = pgTable('users', {
   id: uuid('id').primaryKey().defaultRandom(),
   displayName: text('display_name').notNull(),
+  passwordHash: text('password_hash'),
   createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
   lastSeenAt: timestamp('last_seen_at', tsOpts),
 })

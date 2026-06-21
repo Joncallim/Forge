@@ -29,6 +29,8 @@ const {
   mockRedisSet,
   mockRedisDel,
   mockRedisLpush,
+  mockHashPassword,
+  mockVerifyPassword,
   mockGenerateRegistrationOptions,
   mockVerifyAuthenticationResponse,
   mockVerifyRegistrationResponse,
@@ -41,6 +43,8 @@ const {
   mockRedisSet: vi.fn(),
   mockRedisDel: vi.fn(),
   mockRedisLpush: vi.fn(),
+  mockHashPassword: vi.fn(),
+  mockVerifyPassword: vi.fn(),
   mockGenerateRegistrationOptions: vi.fn(),
   mockVerifyAuthenticationResponse: vi.fn(),
   mockVerifyRegistrationResponse: vi.fn(),
@@ -66,6 +70,13 @@ vi.mock('@/lib/redis', () => ({
     del: mockRedisDel,
     lpush: mockRedisLpush,
   },
+}))
+
+vi.mock('@/lib/password', () => ({
+  hashPassword: mockHashPassword,
+  verifyPassword: mockVerifyPassword,
+  validatePassword: (password: string) =>
+    password.length >= 8 ? null : 'Password must be at least 8 characters.',
 }))
 
 vi.mock('@simplewebauthn/server', () => ({
@@ -418,5 +429,58 @@ describe('login/finish — clone detection', () => {
     expect(res.status).toBe(403)
     const body = await res.json()
     expect(body.error).toMatch(/counter regression/i)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tests — password login
+// ---------------------------------------------------------------------------
+
+describe('login/password', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockRedisSet.mockResolvedValue('OK')
+    mockDbInsert.mockReturnValue(chain(undefined))
+  })
+
+  it('creates a session when the password matches', async () => {
+    mockDbSelect.mockReturnValue(
+      chain([{ id: 'user-1', displayName: 'Alice', passwordHash: 'stored-hash' }]),
+    )
+    mockVerifyPassword.mockResolvedValue(true)
+
+    const { POST } = await import('@/app/api/auth/login/password/route')
+
+    const req = new Request('http://localhost/api/auth/login/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'correct-password' }),
+    })
+
+    const res = await POST(req as never)
+    expect(res.status).toBe(200)
+    expect(mockVerifyPassword).toHaveBeenCalledWith('correct-password', 'stored-hash')
+    expect(mockRedisSet).toHaveBeenCalledOnce()
+    expect(mockDbInsert).toHaveBeenCalledOnce()
+  })
+
+  it('returns 401 when the password does not match', async () => {
+    mockDbSelect.mockReturnValue(
+      chain([{ id: 'user-1', displayName: 'Alice', passwordHash: 'stored-hash' }]),
+    )
+    mockVerifyPassword.mockResolvedValue(false)
+
+    const { POST } = await import('@/app/api/auth/login/password/route')
+
+    const req = new Request('http://localhost/api/auth/login/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'wrong-password' }),
+    })
+
+    const res = await POST(req as never)
+    expect(res.status).toBe(401)
+    expect(mockRedisSet).not.toHaveBeenCalled()
+    expect(mockDbInsert).not.toHaveBeenCalled()
   })
 })

@@ -6,6 +6,7 @@ import { db } from '@/db'
 import { users, credentials } from '@/db/schema'
 import { redis } from '@/lib/redis'
 import { createSession, sessionCookieOptions } from '@/lib/session'
+import { hashPassword, validatePassword } from '@/lib/password'
 import { count } from 'drizzle-orm'
 
 export async function POST(request: NextRequest) {
@@ -32,6 +33,36 @@ export async function POST(request: NextRequest) {
       )
     }
 
+    // Parse request body
+    let body: unknown
+    try {
+      body = await request.json()
+    } catch {
+      return clearNonce(NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 }))
+    }
+
+    if (
+      !body ||
+      typeof body !== 'object' ||
+      !('credential' in body) ||
+      !('password' in body) ||
+      typeof (body as Record<string, unknown>).password !== 'string'
+    ) {
+      return clearNonce(
+        NextResponse.json({ error: 'Missing credential or password in body' }, { status: 400 }),
+      )
+    }
+
+    const { credential, password } = body as {
+      credential: RegistrationResponseJSON
+      password: string
+    }
+
+    const passwordError = validatePassword(password)
+    if (passwordError) {
+      return clearNonce(NextResponse.json({ error: passwordError }, { status: 400 }))
+    }
+
     // Fetch and atomically consume challenge from Redis (prevents replay attacks)
     const redisKey = `webauthn:challenge:reg:${tempUserId}`
     const raw = await redis.getdel(redisKey)
@@ -47,20 +78,6 @@ export async function POST(request: NextRequest) {
     } catch {
       return clearNonce(NextResponse.json({ error: 'Invalid challenge data' }, { status: 400 }))
     }
-
-    // Parse request body
-    let body: unknown
-    try {
-      body = await request.json()
-    } catch {
-      return clearNonce(NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 }))
-    }
-
-    if (!body || typeof body !== 'object' || !('credential' in body)) {
-      return clearNonce(NextResponse.json({ error: 'Missing credential in body' }, { status: 400 }))
-    }
-
-    const { credential } = body as { credential: RegistrationResponseJSON }
 
     // Verify the registration response
     let verification: Awaited<ReturnType<typeof verifyRegistrationResponse>>
@@ -92,6 +109,8 @@ export async function POST(request: NextRequest) {
     const transports: AuthenticatorTransportFuture[] =
       (credential.response.transports as AuthenticatorTransportFuture[] | undefined) ?? []
 
+    const passwordHash = await hashPassword(password)
+
     // Persist in a transaction
     let userId: string
     let credentialId: string
@@ -114,7 +133,7 @@ export async function POST(request: NextRequest) {
       // Insert user
       const [newUser] = await tx
         .insert(users)
-        .values({ displayName: stored.displayName })
+        .values({ displayName: stored.displayName, passwordHash })
         .returning({ id: users.id })
       userId = newUser.id
 

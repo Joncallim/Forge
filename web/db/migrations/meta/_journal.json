@@ -8,6 +8,20 @@
       "when": 1781742014357,
       "tag": "0000_green_black_queen",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1782012541882,
+      "tag": "0001_acoustic_triathlon",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1782026263629,
+      "tag": "0002_add_password_hash",
+      "breakpoints": true
     }
   ]
 }

@@ -1,6 +1,6 @@
 # Forge Shipping Roadmap
 
-Last updated: 2026-06-19
+Last updated: 2026-06-21
 
 ## Release Target
 
@@ -12,6 +12,12 @@ Ship Forge first as a helper-stage beta:
 - The current worker scope is architect planning plus human approval. Repository
   edits, specialist implementation agents, test execution, commits, and GitHub
   pull requests are the next product stage.
+- The next orchestration stage should support specialist subagents with
+  different harnesses: purpose-built prompts, tools, references, output schemas,
+  validation checks, and model preferences.
+- Install and uninstall tooling are part of the beta quality bar: setup should
+  explain what is happening, and uninstall should avoid removing anything the
+  user had before Forge.
 
 ## Assessment Inputs
 
@@ -28,21 +34,29 @@ Ship Forge first as a helper-stage beta:
 
 - Production build no longer requires `DATABASE_URL` or `REDIS_URL` during
   Next.js route analysis; both clients are resolved lazily at runtime.
-- First-user registration now takes a short Redis lock before creating the
+- First-user registration uses a short Redis lock before creating the
   account, closing the concurrent registration race.
-- Task creation now validates that the target project exists and is not
+- Task creation validates that the target project exists and is not
   archived before inserting or enqueuing work.
 - Task approval, rejection, cancellation, worker task claims, and approval
-  completion now use conditional status updates to avoid stale check-then-write
+  completion use conditional status updates to avoid stale check-then-write
   races.
 - Task creation tests cover the missing-project no-enqueue path.
 - Production build no longer prerenders DB-backed dashboard routes.
 - Next.js proxy convention replaces deprecated `middleware.ts`.
 - Redis singleton no longer tries to connect during import-time build analysis.
-- Lint now passes with current client-fetch dashboard architecture.
+- Lint passes with current client-fetch dashboard architecture.
 - Stale test comments and unused symbols no longer produce false bug signals.
-- Web CI now gates lint, typecheck, tests, production build, and the
+- Web CI gates lint, typecheck, tests, production build, and the
   helper-stage E2E smoke path.
+- Login supports password and passkey sign-in. First-user registration
+  creates both.
+- The cross-platform installer supports macOS and Linux from one entrypoint. It
+  records what it installs so uninstall helpers can avoid user-owned packages.
+- Migration documentation includes a plain-English guide and a README inside the
+  migrations folder.
+- Specialist subagent planning is captured in
+  `docs/specialist-subagents-roadmap.md`.
 
 ## P0 Before Helper-Stage Beta
 
@@ -67,13 +81,14 @@ gates pass in the target environment.
 
 Security:
 
-- Passkey-backed single-operator registration is gated after the first user and
-  protected against concurrent first-user creation.
+- Single-operator registration is gated after the first user and protected
+  against concurrent first-user creation. The first account gets both password
+  and passkey sign-in.
 - Route handlers require a valid session before project, provider, agent, task,
   and run-stream access.
 - Agent prompt file writes are limited to allowlisted agent types.
 - Secrets are stored as environment-variable names, not provider key values.
-- Dependency audit is clean as of the latest local run. Ollama now routes
+- Dependency audit is clean as of the latest local run. Ollama routes
   through the existing OpenAI-compatible provider path instead of the vulnerable
   `ollama-ai-provider` package, and npm overrides pin patched `esbuild` and
   `postcss` versions for nested dependency chains.
@@ -97,8 +112,9 @@ Scalability:
 
 Sustainability:
 
-- The roadmap, deployment checklist, worker process notes, and UX audit are the
-  source of truth for the helper-stage release.
+- The README, deployment checklist, migration guide, install/uninstall guide,
+  worker process notes, and UX audit are the source of truth for the
+  helper-stage release.
 - Large dashboard page decomposition and server-owned initial dashboard data are
   intentionally left in P1.
 
@@ -106,21 +122,19 @@ User experience:
 
 - The helper-stage path is documented and smoke-tested from setup through
   approval/completion.
-- Missing-project task submission now returns a clear 404 instead of an
+- Missing-project task submission returns a clear 404 instead of an
   internal error.
 - Long-label, deep mobile navigation, long-artifact, and degraded-state visual
   checks remain UX follow-up items from `docs/ux-audit.md`.
 
 ## Latest Gate Results
 
-Run from `web/` on 2026-06-19:
+Run from `web/` on 2026-06-21:
 
 ```bash
 npm run lint              # pass
-npx tsc --noEmit          # pass
-npm test                  # pass, 38 tests
+npm test                  # pass, 54 tests
 npm run build             # pass
-npm audit --audit-level=moderate  # pass, 0 vulnerabilities
 ```
 
 ## P1 Product Hardening
@@ -141,13 +155,23 @@ npm audit --audit-level=moderate  # pass, 0 vulnerabilities
 
 ## P2 Autonomous Coding Stage
 
-1. Add repository checkout and branch management.
-2. Dispatch backend, frontend, QA, devops, and reviewer stages using the same
-   per-agent provider mapping as the architect stage.
-3. Persist implementation artifacts, diffs, test output, review comments, and
-   final decision logs.
-4. Create commits and GitHub pull requests.
-5. Add merge/rework gates driven by reviewer and QA outcomes.
+1. Add a specialist subagent registry and harness model. Each harness should
+   define prompt, references, tools, output schema, validation checks, and model
+   preference.
+2. Add an orchestrator dispatcher that maps Architect work packages to
+   specialist capabilities, not only fixed stage names.
+3. Start with a small enabled set:
+   requirements analyst, web design specialist, React implementation specialist,
+   API specialist, database specialist, unit test specialist, E2E test
+   specialist, code reviewer, and security reviewer.
+4. Add repository checkout and branch management.
+5. Persist specialist artifacts, diffs, test output, review comments, routing
+   decisions, and final decision logs.
+6. Create commits and GitHub pull requests.
+7. Add merge/rework gates driven by reviewer and QA outcomes.
+
+See [specialist-subagents-roadmap.md](specialist-subagents-roadmap.md) for the
+full plan.
 
 ## Ongoing Release Gates
 

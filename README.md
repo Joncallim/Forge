@@ -1,67 +1,103 @@
 # Forge
 
-Autonomous coding factory with a web control plane, provider-configurable agents,
-and a queued execution model.
+Forge is a local web app for running AI coding helpers from your browser.
 
-## How It Works
+Think of it as a control panel:
 
-Forge is split into two runtime surfaces:
+1. You create a project.
+2. You describe a task.
+3. Forge sends that task to a configured AI helper.
+4. The helper writes a plan.
+5. You review and approve the result.
 
-- **Web UI**: project setup, provider configuration, agent prompt editing, task
-  submission, task status, run logs, and artifacts.
-- **Worker process**: consumes queued tasks, runs helper stages through
-  configured providers, updates task state, and publishes live run events.
+Today, Forge handles the first helper stage: planning. It does not yet edit your
+repository, make commits, or open pull requests by itself.
 
-The web UI does not execute tasks by itself. When a user submits a task, the API
-persists it in PostgreSQL and pushes a job to Redis. A worker must consume that
-job for the task to move beyond `pending`.
+## What Runs On Your Computer
 
-Claude Code can be used as a manual development-time orchestrator, but it is not
-the desired production dependency. The target architecture is a dedicated Forge
-worker process. See [docs/worker-process.md](docs/worker-process.md).
+Forge has four main pieces:
+
+- **Web app**: the dashboard you open at `http://localhost:3000`.
+- **Worker**: the background process that picks up tasks and calls AI models.
+- **PostgreSQL**: the database that stores settings, users, tasks, and results.
+- **Redis**: the queue that passes work from the web app to the worker.
+
+The web app and worker are separate. If the worker is not running, new tasks stay
+waiting in the queue.
 
 ```text
-Web task -> Redis queue -> Forge worker -> Architect plan -> Approval
+Browser -> Forge web app -> Redis queue -> Forge worker -> AI helper -> review in browser
 ```
 
-## Quick Start (macOS — no Docker)
+## Fastest Setup On macOS Or Linux
 
-One command installs Postgres + Redis via Homebrew, generates every secret,
-writes `.env` for you, prepares the database, and sets up **zero-config local
-AI** — it installs Ollama, pulls a small model, and wires every agent to it so
-you can run tasks with no API keys at all:
+From the repository root:
 
 ```bash
-bash scripts/install-mac.sh
+bash scripts/install.sh
 ```
 
-You never edit `.env` by hand and you don't need Docker. To use cloud models
-instead, add a provider and its key on the Providers page (keys are stored
-encrypted in the database, never in `.env`). The script is idempotent — safe to
-re-run. To skip the local-AI setup and configure cloud providers yourself, run
-`FORGE_SKIP_OLLAMA=1 bash scripts/install-mac.sh`.
+The installer:
 
-Then run the web app and worker in separate terminals (both from `web/`):
+- installs missing local tools,
+- starts PostgreSQL and Redis,
+- creates `.env` with generated secrets,
+- prepares the database,
+- installs web dependencies,
+- optionally installs Ollama and a small local AI model,
+- records what it installed so uninstall avoids tools you already had.
+
+The first run can be slow because Homebrew, npm, Docker images, or AI models may
+need to download files.
+
+To skip the local Ollama model and configure AI providers later:
 
 ```bash
-cd web && npm run dev      # web UI at http://localhost:3000
+FORGE_SKIP_OLLAMA=1 bash scripts/install.sh
 ```
+
+## Start Forge
+
+After install, open two terminals.
+
+Terminal 1:
 
 ```bash
-cd web && npm run worker
+cd web
+npm run dev
 ```
 
-Open `http://localhost:3000`, register your passkey, and submit a task — local
-AI is already configured, so no provider setup is required.
-
-## Quick Start (Docker — other platforms)
+Terminal 2:
 
 ```bash
-cp .env.example .env        # infra defaults work as-is for local Docker
-bash scripts/setup.sh       # starts PostgreSQL + Redis via Docker
+cd web
+npm run worker
 ```
 
-Then prepare the web app and database from `web/`:
+Then open:
+
+```text
+http://localhost:3000
+```
+
+The first account creates both a password and a passkey. Later, the login page
+lets you sign in with either method.
+
+## Docker Setup For Services Only
+
+Use this if you only want Docker to start PostgreSQL and Redis and prefer to run
+the rest manually.
+
+From the repository root:
+
+```bash
+bash scripts/setup.sh
+```
+
+If the script creates `.env` and exits, review the file, then run the script
+again.
+
+Then prepare the web app:
 
 ```bash
 cd web
@@ -70,7 +106,7 @@ npm run db:migrate
 npm run db:seed-agents
 ```
 
-Run the web app and worker from `web/` in separate terminals:
+Start the web app and worker in separate terminals:
 
 ```bash
 cd web
@@ -82,19 +118,86 @@ cd web
 npm run worker
 ```
 
-Open `http://localhost:3000`.
+You can also ask the main installer to use Docker for PostgreSQL and Redis:
 
-The first dashboard visit opens the setup wizard when no providers exist. Choose
-a preset there, then review provider health from the Providers page.
+```bash
+bash scripts/install.sh --service-mode docker
+```
 
-For a step-by-step custom helper-model test, including the new `Custom` provider
-option for the Architect helper, see
-[docs/helper-model-install-test.md](docs/helper-model-install-test.md).
+## Uninstall
 
-## GUI Screenshots
+To remove Forge from macOS or Linux:
 
-These screenshots come from the passing helper-stage Playwright smoke test in
-GitHub Actions.
+```bash
+bash scripts/uninstall.sh
+```
+
+The script asks whether to keep settings and credentials. Keeping them preserves
+`.env`, database data, Redis data, Docker volumes, and the install record for a
+future reinstall.
+
+Preview first:
+
+```bash
+bash scripts/uninstall.sh --dry-run
+```
+
+Full local wipe:
+
+```bash
+bash scripts/uninstall.sh --remove-data
+```
+
+The uninstall helper removes only packages that Forge recorded as newly
+installed for Forge. Packages that were already installed are left alone. On
+Linux, the helper supports `apt`, `dnf`, `yum`, `zypper`, and `pacman`.
+
+See [docs/install-uninstall.md](docs/install-uninstall.md).
+
+## Database Updates
+
+After pulling new code, apply database migrations:
+
+```bash
+cd web
+npm run db:migrate
+```
+
+For the migration workflow, see
+[docs/database-migrations.md](docs/database-migrations.md).
+
+## Helpful Docs
+
+- [Install and uninstall](docs/install-uninstall.md)
+- [Database migrations](docs/database-migrations.md)
+- [Helper model test guide](docs/helper-model-install-test.md)
+- [Deployment checklist](docs/deployment-checklist.md)
+- [Worker process notes](docs/worker-process.md)
+- [Specialist subagents roadmap](docs/specialist-subagents-roadmap.md)
+- [Terminal installer plan](docs/terminal-installer-plan.md)
+
+## Current Status
+
+Forge is in a helper-stage beta.
+
+Available today:
+
+- local dashboard,
+- password or passkey sign-in,
+- provider setup,
+- project and task creation,
+- queued worker execution,
+- AI-generated planning artifact,
+- human approval flow.
+
+Not built yet:
+
+- automatic repository edits,
+- multi-agent implementation,
+- test execution by agents,
+- GitHub branch and pull request automation.
+
+## Screenshots
 
 ### Setup Wizard
 
@@ -111,65 +214,3 @@ GitHub Actions.
 ### Completed Helper Task
 
 ![Forge task detail page after approval](docs/assets/gui/desktop-04-task-completed.png)
-
-Containerized web and worker processes are available but intentionally separate
-from the default setup command:
-
-```bash
-docker compose up web
-docker compose --profile worker up worker
-```
-
-At the current stage, the web app can create projects, configure providers, edit
-agent prompts, and enqueue tasks. The worker consumes queued tasks and runs the
-first helper stage: an architect model call that produces a planning artifact,
-records an `agent_runs` row, streams events to the task page, and moves the task
-to `awaiting_approval`. Approving that plan queues an approval job; the worker
-then closes the helper task as `completed`. Full code modification, GitHub branch
-creation, and PR automation are still future worker stages.
-
-Target future execution expands the worker pipeline to:
-
-```text
-Architect -> Backend / Frontend / QA / DevOps -> Reviewer -> PR / Merge
-```
-
-## Agents
-
-| Agent | Model | Role |
-|---|---|---|
-| architect | kimi-k2 | Design, API contracts, task decomposition |
-| backend | gpt-4.1 | APIs, migrations, business logic |
-| frontend | gpt-4.1 | UI, state, API integration |
-| reviewer | deepseek-r1 | Code review, security, correctness |
-| qa | deepseek-r1 | Tests, coverage, regression |
-| devops | minimax-01 | Docker, CI/CD, deployment |
-
-## Stack
-
-- **Next.js**: web dashboard and API routes
-- **Forge worker**: background executor for queued task helper stages
-- **OpenRouter**: routes worker agents to cloud models
-- **LiteLLM**: self-hosted OpenAI-compatible gateway for local and hybrid routing
-- **Ollama**: local model runner
-- **PostgreSQL 16**: task history, agent state, decision logs
-- **Redis 7**: job queues, scheduling, session state
-- **Docker Compose**: local infrastructure
-
-## Execution Status
-
-The web control plane and initial worker helper are present. Submitted tasks no
-longer require a manually started Claude Code session to leave `pending`; the
-worker can claim the Redis job, run the architect planning step, persist an
-artifact, move the task to `awaiting_approval`, and complete the helper stage
-after approval.
-
-The worker does not yet modify repositories, run specialist implementation
-agents, create commits, or open GitHub PRs.
-
-## Architecture
-
-See [docs/worker-process.md](docs/worker-process.md) for the worker process
-plan. The Notion architecture doc linked from earlier versions may contain
-broader design context, but this repository documentation is the source of truth
-for the current runtime model.
