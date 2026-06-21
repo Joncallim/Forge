@@ -17,7 +17,7 @@ test.describe('helper-stage beta smoke', () => {
     worker = await startMockWorker(testInfo)
   })
 
-  test.afterEach(async (_fixtures, testInfo) => {
+  test.afterEach(async ({}, testInfo) => {
     await stopWorker(worker, testInfo)
     worker = null
   })
