@@ -156,7 +156,13 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     vi.clearAllMocks()
     state.mockSub = null
     mockGetSession.mockResolvedValue({ sessionId: 'sess-abc', userId: 'user-1' })
-    mockDbSelect.mockReturnValue(dbChain([fakeTask()]))
+    let selectCount = 0
+    mockDbSelect.mockImplementation(() => {
+      selectCount += 1
+      if (selectCount === 1) return dbChain([fakeTask()])
+      if (selectCount === 2) return dbChain([{ status: fakeTask().status }])
+      return dbChain([])
+    })
   })
 
   it('returns 401 when session is missing', async () => {
@@ -195,6 +201,16 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     expect(text).toContain('retry: 5000')
   })
 
+  it('emits the current task status snapshot on connect', async () => {
+    const { GET } = await import('@/app/api/tasks/[id]/runs/route')
+    const params = Promise.resolve({ id: 'task-sse-1' })
+    const res = await GET(sseRequest() as never, { params })
+
+    const lines = await readLines(res.body!, 500)
+    expect(lines).toContain('event: task:status')
+    expect(lines.join('\n')).toContain('"status":"running"')
+  }, 2000)
+
   it('emits event: run:started within 500ms when a run:started message is published', async () => {
     const { GET } = await import('@/app/api/tasks/[id]/runs/route')
     const params = Promise.resolve({ id: 'task-sse-1' })
@@ -210,7 +226,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     }, 100)
 
     const lines = await readLines(res.body!, 500)
-    const eventLine = lines.find((l) => l.startsWith('event:'))
+    const eventLine = lines.find((l) => l.startsWith('event: run:started'))
     expect(eventLine).toBeDefined()
     expect(eventLine).toContain('run:started')
   }, 2000)

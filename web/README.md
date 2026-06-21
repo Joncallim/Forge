@@ -1,16 +1,24 @@
-# Forge Web
+# Forge Web App
 
-Forge Web is the dashboard and API surface for Forge. It is responsible for
-project setup, provider configuration, agent configuration, task submission, and
-task/run visibility.
+This folder contains the Forge dashboard, API routes, database schema, tests,
+and worker.
 
-It is not the task executor. Submitting a task writes to PostgreSQL and enqueues
-a Redis job. A separate Forge worker process must consume that job and update the
-task lifecycle.
+The dashboard lets an operator:
 
-## Getting Started
+- sign in with a password or passkey,
+- configure AI providers,
+- create projects,
+- submit tasks,
+- review generated plans,
+- approve or reject helper-stage work.
 
-Install dependencies and run the development server:
+The dashboard does not do background work by itself. When a task is created, the
+API stores it in PostgreSQL and puts a job in Redis. The worker process must be
+running to pick up that job.
+
+## Local Development
+
+From `web/`:
 
 ```bash
 npm install
@@ -19,61 +27,78 @@ npm run db:seed-agents
 npm run dev
 ```
 
-In a second terminal, start the worker helper:
+In a second terminal:
 
 ```bash
+cd web
 npm run worker
 ```
 
-Open [http://localhost:3000](http://localhost:3000).
+Open:
 
-If no providers exist yet, the dashboard opens the setup wizard first. Choose a
-preset to create providers and assign them to agents, then review provider
-health from the Providers page.
+```text
+http://localhost:3000
+```
 
-To test a real custom helper model, use the single guide at
-[`../docs/helper-model-install-test.md`](../docs/helper-model-install-test.md).
+## Required Services
 
-## Runtime Dependencies
+Forge Web expects:
 
-- PostgreSQL for users, projects, providers, tasks, runs, and artifacts.
-- Redis for job queues, SSE replay, and cross-process events.
-- Provider API keys or local model gateways for agent execution.
-- Custom OpenAI-compatible endpoints can be configured with Provider type
-  `Custom`, any model ID, and an API-key environment variable name.
-- A Forge worker process for executing queued tasks.
+- PostgreSQL, for app data and encrypted provider settings.
+- Redis, for task queues and live task events.
+- A worker process, for executing queued helper tasks.
+- At least one AI provider, unless you only run mock tests.
 
 When running from `web/`, both Next.js and the worker load the repository-root
-`.env` file. Keep host-local values such as `DATABASE_URL=...localhost...` in
-that file. Docker Compose services inject container-local URLs automatically.
+`.env` file.
 
-## Task Lifecycle
+## Common Commands
 
-1. User creates a task in the web UI.
-2. `POST /api/tasks` inserts a task row with status `pending`.
-3. `POST /api/tasks` pushes `{ taskId }` to Redis queue `forge:tasks`.
-4. A worker claims the job, updates the task to `running`, creates an architect
-   agent run, streams events, stores the planning artifact, and marks the task
-   `awaiting_approval` or `failed`.
-5. If the generated plan is approved, `POST /api/tasks/:id/approve` pushes an
-   approval job to `forge:approvals`.
-6. The worker consumes the approval and marks the helper-stage task `completed`.
+```bash
+npm run dev             # start the dashboard
+npm run worker          # start the task worker
+npm run db:migrate      # apply database migrations
+npm run db:seed-agents  # load default agent prompts
+npm run doctor          # check env, PostgreSQL, and Redis
+npm test                # run unit tests
+npm run build           # production build check
+```
 
-Claude Code is not required by the web UI. It can still be used for development,
-debugging, and manual operation, but normal task execution starts with the worker
-described in `../docs/worker-process.md`.
+## Task Flow
 
-## Current Worker Scope
+1. The user creates a task in the browser.
+2. `POST /api/tasks` saves the task as `pending`.
+3. The API pushes `{ taskId }` to Redis queue `forge:tasks`.
+4. The worker claims the job and marks the task `running`.
+5. The worker calls the configured Architect provider.
+6. The worker stores the generated plan as an artifact.
+7. The task becomes `awaiting_approval`.
+8. The user approves or rejects the plan.
+9. Approved helper-stage tasks become `completed`.
 
-The worker currently implements the first helper stage only. It consumes
-`forge:tasks`, runs the configured architect model, writes an `adr_text` artifact,
-updates task state, and consumes `forge:approvals` to complete approved planning
-tasks. It does not yet edit repositories, run backend/frontend worker agents,
-create commits, or open pull requests.
+## Database Migrations
 
-## Docker Compose
+Schema lives in [db/schema.ts](db/schema.ts).
 
-`scripts/setup.sh` starts only PostgreSQL and Redis for host-based development.
+To apply migrations:
+
+```bash
+npm run db:migrate
+```
+
+To create a new migration after changing `db/schema.ts`:
+
+```bash
+npm run db:generate -- --name short_change_name
+```
+
+See [../docs/database-migrations.md](../docs/database-migrations.md).
+
+## Docker
+
+The root `scripts/setup.sh` starts only PostgreSQL and Redis for host-based
+development.
+
 To run the app itself in containers:
 
 ```bash
@@ -81,8 +106,9 @@ docker compose up web
 docker compose --profile worker up worker
 ```
 
-## Agent Config Files
+## Current Worker Scope
 
-Agent prompts are stored in the database and can be synced to disk. For
-standalone Next.js deployments, set `FORGE_AGENT_CONFIG_DIR` to an absolute path
-where the app can read and write agent prompt files.
+The worker currently runs only the Architect planning stage. It does not yet edit
+repositories, run implementation agents, create commits, or open pull requests.
+
+See [../docs/worker-process.md](../docs/worker-process.md).

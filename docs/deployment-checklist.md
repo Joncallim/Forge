@@ -1,104 +1,127 @@
-# Forge Deployment Checklist
+# Deployment Checklist
 
-Use this checklist before running the helper-stage beta outside local
-development.
+Use this before running Forge anywhere beyond a quick local test.
 
-## Required Services
+## Services
 
-- PostgreSQL 16 or newer is reachable from the web and worker processes.
-- Redis 7 or newer is reachable from the web and worker processes.
-- The web process and worker process use the same PostgreSQL and Redis
-  instances.
-- Database migrations have been applied from `web/db/migrations`.
-- A long-running worker process is started separately from the Next.js web
-  process.
+Forge needs these running:
 
-## Required Environment
+- PostgreSQL 16 or newer.
+- Redis 7 or newer.
+- The Next.js web process.
+- The Forge worker process.
 
-Set these for the web process, worker process, and CI smoke tests where
-applicable:
+The web process and worker must point at the same PostgreSQL and Redis
+instances.
+
+## Required Environment Variables
+
+Set these for both the web process and worker:
+
+| Variable | Plain-English purpose |
+|---|---|
+| `DATABASE_URL` | Where PostgreSQL is running. |
+| `REDIS_URL` | Where Redis is running. |
+| `SESSION_SECRET` | Secret value used for local session/security material. |
+| `WEBAUTHN_RP_ID` | Passkey domain, usually the hostname. |
+| `WEBAUTHN_RP_NAME` | Display name shown by passkey prompts. |
+| `WEBAUTHN_ORIGIN` | Public app origin, such as `https://forge.example.com`. |
+| `NEXT_PUBLIC_APP_URL` | Public browser URL for the Forge web app. |
+
+Optional for standalone deployments:
 
 | Variable | Purpose |
 |---|---|
-| `DATABASE_URL` | PostgreSQL connection string. |
-| `REDIS_URL` | Redis connection string. |
-| `SESSION_SECRET` | 32-byte hex secret reserved for signed session material. |
-| `WEBAUTHN_RP_ID` | Passkey relying-party ID, usually the hostname. |
-| `WEBAUTHN_RP_NAME` | Passkey relying-party display name. |
-| `WEBAUTHN_ORIGIN` | Public web origin, including scheme and port if needed. |
-| `NEXT_PUBLIC_APP_URL` | Public app URL used by browser-facing code. |
-| `FORGE_AGENT_CONFIG_DIR` | Absolute prompt-file path for standalone Next.js deployments. |
+| `FORGE_AGENT_CONFIG_DIR` | Absolute path where agent prompt files can be read and written. |
 
-Set provider-specific keys only for the providers you configure:
+Provider keys are needed only for the providers you configure:
 
 | Variable | Provider |
 |---|---|
-| `ANTHROPIC_API_KEY` | Anthropic API. |
-| `OPENAI_API_KEY` | OpenAI API. |
+| `ANTHROPIC_API_KEY` | Anthropic. |
+| `OPENAI_API_KEY` | OpenAI. |
 | `OPENROUTER_API_KEY` | OpenRouter. |
-| Any custom env var, for example `CUSTOM_MODEL_API_KEY` | Custom OpenAI-compatible provider. Store the env var name in Forge, not the secret value. |
 | `LITELLM_BASE_URL` | LiteLLM gateway URL. |
-| `LITELLM_API_KEY` | LiteLLM gateway auth if enabled. |
+| `LITELLM_API_KEY` | LiteLLM gateway key, if enabled. |
+| Any custom name, such as `CUSTOM_MODEL_API_KEY` | Custom OpenAI-compatible provider. |
+
+Forge stores provider API keys encrypted in the database when entered through
+the UI. If you use an environment variable instead, Forge stores the variable
+name, not the secret value.
 
 Worker-only:
 
 | Variable | Purpose |
 |---|---|
 | `FORGE_WORKER_CLAIM_TIMEOUT_SECONDS` | Redis claim timeout. Defaults to 5 seconds. |
-| `FORGE_WORKER_MOCK_ARCHITECT` | Test-only. Set to `1` only in smoke tests to bypass model calls. |
+| `FORGE_WORKER_MOCK_ARCHITECT` | Test-only mock mode. Do not enable for real runs. |
 
-## Preflight Commands
+## Database
 
-From `web/`:
+Apply migrations before starting a new version:
 
 ```bash
+cd web
 npm run db:migrate
 npm run db:seed-agents
+```
+
+See [database-migrations.md](database-migrations.md) for the migration workflow.
+
+## Preflight Checks
+
+Run from `web/`:
+
+```bash
 npm run doctor
 npm run lint
-npx tsc --noEmit
 npm test
 npm run build
 ```
 
-For the full helper-stage smoke path, start PostgreSQL and Redis, apply
-migrations, install Playwright browsers once, and run:
+For the full browser smoke test:
 
 ```bash
-npm run db:migrate
-npm run db:seed-agents
 npx playwright install chromium
 npm run e2e
 ```
 
-The E2E suite seeds its own user/session, applies the setup wizard preset,
-creates a project and task, runs the worker with
-`FORGE_WORKER_MOCK_ARCHITECT=1`, verifies the generated artifact, approves it,
-and confirms the helper-stage task completes.
+The E2E test uses a mock helper model. It proves the web app, database, Redis,
+worker, setup wizard, task flow, and approval flow are connected.
 
 ## Runtime Health
 
-`GET /api/health` reports:
+`GET /api/health` checks:
 
-- required environment variable presence,
+- required environment variables,
 - PostgreSQL connectivity,
 - Redis connectivity,
 - active provider reachability.
 
 Status meanings:
 
-- `ok`: required env, PostgreSQL, Redis, and active providers are healthy.
-- `degraded`: PostgreSQL and Redis are reachable but env or provider checks need
-  attention.
+- `ok`: ready.
+- `degraded`: running, but something needs attention.
 - `down`: PostgreSQL or Redis is unavailable.
 
-## Launch Verification
+## Manual Launch Check
 
-1. Open the app and register a passkey-backed operator account.
-2. Confirm first dashboard visit opens the setup wizard if no providers exist.
-3. Apply a preset and inspect provider health.
-4. Create a project.
-5. Create a task and confirm it moves from `pending` to `running` to
-   `awaiting_approval`.
-6. Review the architect artifact.
-7. Approve the generated plan and confirm the task moves to `completed`.
+1. Open the app.
+2. Create the first account with a password and passkey.
+3. Sign out and confirm password login works.
+4. Confirm passkey login works on the same browser/device.
+5. If no providers exist, confirm the setup wizard opens.
+6. Apply a preset or add a provider manually.
+7. Confirm provider health.
+8. Create a project.
+9. Create a task.
+10. Confirm it moves from `pending` to `running` to `awaiting_approval`.
+11. Review the Architect artifact.
+12. Approve the plan.
+13. Confirm the task moves to `completed`.
+
+## Rollback Notes
+
+Before replacing a running deployment, back up PostgreSQL. Forge settings,
+encrypted provider credentials, users, sessions, tasks, and artifacts are stored
+there.

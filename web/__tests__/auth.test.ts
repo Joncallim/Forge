@@ -28,7 +28,11 @@ const {
   mockRedisGetdel,
   mockRedisSet,
   mockRedisDel,
+  mockRedisIncr,
+  mockRedisExpire,
   mockRedisLpush,
+  mockHashPassword,
+  mockVerifyPassword,
   mockGenerateRegistrationOptions,
   mockVerifyAuthenticationResponse,
   mockVerifyRegistrationResponse,
@@ -40,7 +44,11 @@ const {
   mockRedisGetdel: vi.fn(),
   mockRedisSet: vi.fn(),
   mockRedisDel: vi.fn(),
+  mockRedisIncr: vi.fn(),
+  mockRedisExpire: vi.fn(),
   mockRedisLpush: vi.fn(),
+  mockHashPassword: vi.fn(),
+  mockVerifyPassword: vi.fn(),
   mockGenerateRegistrationOptions: vi.fn(),
   mockVerifyAuthenticationResponse: vi.fn(),
   mockVerifyRegistrationResponse: vi.fn(),
@@ -64,8 +72,17 @@ vi.mock('@/lib/redis', () => ({
     getdel: mockRedisGetdel,
     set: mockRedisSet,
     del: mockRedisDel,
+    incr: mockRedisIncr,
+    expire: mockRedisExpire,
     lpush: mockRedisLpush,
   },
+}))
+
+vi.mock('@/lib/password', () => ({
+  hashPassword: mockHashPassword,
+  verifyPassword: mockVerifyPassword,
+  validatePassword: (password: string) =>
+    password.length >= 8 ? null : 'Password must be at least 8 characters.',
 }))
 
 vi.mock('@simplewebauthn/server', () => ({
@@ -418,5 +435,129 @@ describe('login/finish — clone detection', () => {
     expect(res.status).toBe(403)
     const body = await res.json()
     expect(body.error).toMatch(/counter regression/i)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tests — password login
+// ---------------------------------------------------------------------------
+
+describe('login/password', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockRedisSet.mockResolvedValue('OK')
+    mockRedisDel.mockResolvedValue(1)
+    mockRedisIncr.mockResolvedValue(1)
+    mockRedisExpire.mockResolvedValue(1)
+    mockDbInsert.mockReturnValue(chain(undefined))
+  })
+
+  it('creates a session when the password matches', async () => {
+    mockDbSelect.mockReturnValue(
+      chain([{ id: 'user-1', displayName: 'Alice', passwordHash: 'stored-hash' }]),
+    )
+    mockVerifyPassword.mockResolvedValue(true)
+
+    const { POST } = await import('@/app/api/auth/login/password/route')
+
+    const req = new Request('http://localhost/api/auth/login/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'correct-password' }),
+    })
+
+    const res = await POST(req as never)
+    expect(res.status).toBe(200)
+    expect(mockVerifyPassword).toHaveBeenCalledWith('correct-password', 'stored-hash')
+    expect(mockRedisSet).toHaveBeenCalledOnce()
+    expect(mockDbInsert).toHaveBeenCalledOnce()
+  })
+
+  it('returns 401 when the password does not match', async () => {
+    mockDbSelect.mockReturnValue(
+      chain([{ id: 'user-1', displayName: 'Alice', passwordHash: 'stored-hash' }]),
+    )
+    mockVerifyPassword.mockResolvedValue(false)
+
+    const { POST } = await import('@/app/api/auth/login/password/route')
+
+    const req = new Request('http://localhost/api/auth/login/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'wrong-password' }),
+    })
+
+    const res = await POST(req as never)
+    expect(res.status).toBe(401)
+    expect(mockRedisSet).not.toHaveBeenCalled()
+    expect(mockDbInsert).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tests — password login rate limiting
+// ---------------------------------------------------------------------------
+
+describe('login/password — rate limiting', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockRedisExpire.mockResolvedValue(1)
+  })
+
+  it('returns 429 once the per-IP attempt limit is exceeded', async () => {
+    mockRedisIncr.mockResolvedValue(11)
+
+    const { POST } = await import('@/app/api/auth/login/password/route')
+
+    const req = new Request('http://localhost/api/auth/login/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'whatever' }),
+    })
+
+    const res = await POST(req as never)
+    expect(res.status).toBe(429)
+    expect(mockVerifyPassword).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tests — register/finish password validation
+// ---------------------------------------------------------------------------
+
+describe('register/finish — password validation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('returns 400 when the password is missing', async () => {
+    const { POST } = await import('@/app/api/auth/register/finish/route')
+    const { NextRequest } = await import('next/server')
+
+    const req = new NextRequest('http://localhost/api/auth/register/finish', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: 'reg_nonce=temp-user' },
+      body: JSON.stringify({ credential: { id: 'x' } }),
+    })
+
+    const res = await POST(req)
+    expect(res.status).toBe(400)
+    expect(mockRedisGetdel).not.toHaveBeenCalled()
+  })
+
+  it('returns 400 when the password is too short', async () => {
+    const { POST } = await import('@/app/api/auth/register/finish/route')
+    const { NextRequest } = await import('next/server')
+
+    const req = new NextRequest('http://localhost/api/auth/register/finish', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: 'reg_nonce=temp-user' },
+      body: JSON.stringify({ credential: { id: 'x' }, password: 'short' }),
+    })
+
+    const res = await POST(req)
+    expect(res.status).toBe(400)
+    const json = await res.json()
+    expect(json.error).toMatch(/at least 8 characters/i)
   })
 })

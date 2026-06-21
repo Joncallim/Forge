@@ -1,7 +1,7 @@
 import type { NextRequest } from 'next/server'
 import { db } from '@/db'
-import { tasks } from '@/db/schema'
-import { eq } from 'drizzle-orm'
+import { agentRuns, artifacts, tasks } from '@/db/schema'
+import { asc, eq, inArray } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 
@@ -47,6 +47,78 @@ export async function GET(
         controller.enqueue(encoder.encode(line))
       }
 
+      const sendSnapshotEvent = (type: string, data: unknown) => {
+        controller.enqueue(encoder.encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`))
+      }
+
+      const sendCurrentSnapshot = async () => {
+        const [freshTask] = await db
+          .select({ status: tasks.status })
+          .from(tasks)
+          .where(eq(tasks.id, taskId))
+          .limit(1)
+
+        if (freshTask) {
+          sendSnapshotEvent('task:status', { type: 'task:status', status: freshTask.status })
+        }
+
+        const runs = await db
+          .select()
+          .from(agentRuns)
+          .where(eq(agentRuns.taskId, taskId))
+          .orderBy(asc(agentRuns.createdAt))
+
+        for (const run of runs) {
+          if (run.status !== 'pending') {
+            sendSnapshotEvent('run:started', {
+              id: run.id,
+              runId: run.id,
+              taskId,
+              agentType: run.agentType,
+              modelIdUsed: run.modelIdUsed,
+              startedAt: run.startedAt,
+            })
+          }
+
+          if (run.status === 'completed') {
+            sendSnapshotEvent('run:completed', {
+              id: run.id,
+              runId: run.id,
+              inputTokens: run.inputTokens,
+              outputTokens: run.outputTokens,
+              costUsd: run.costUsd,
+              completedAt: run.completedAt,
+            })
+          } else if (run.status === 'failed') {
+            sendSnapshotEvent('run:failed', {
+              id: run.id,
+              runId: run.id,
+              completedAt: run.completedAt,
+              errorMessage: run.errorMessage,
+            })
+          }
+        }
+
+        const runIds = runs.map((run) => run.id)
+        if (runIds.length === 0) return
+
+        const existingArtifacts = await db
+          .select()
+          .from(artifacts)
+          .where(inArray(artifacts.agentRunId, runIds))
+
+        for (const artifact of existingArtifacts) {
+          sendSnapshotEvent('artifact:created', {
+            id: artifact.id,
+            artifactId: artifact.id,
+            agentRunId: artifact.agentRunId,
+            artifactType: artifact.artifactType,
+            content: artifact.content,
+            metadata: artifact.metadata,
+          })
+        }
+      }
+
       controller.enqueue(encoder.encode('retry: 5000\n\n'))
 
       // Replay missed events if Last-Event-ID was provided
@@ -76,11 +148,14 @@ export async function GET(
       const sub = new Redis(process.env.REDIS_URL!)
 
       let closed = false
+      let heartbeat: ReturnType<typeof setInterval> | null = null
 
       const cleanup = () => {
         if (closed) return
         closed = true
-        clearInterval(heartbeat)
+        if (heartbeat !== null) {
+          clearInterval(heartbeat)
+        }
         sub.disconnect()
         try {
           controller.close()
@@ -95,6 +170,12 @@ export async function GET(
         console.error('[SSE /api/tasks/:id/runs] Failed to subscribe to Redis channel', err)
         cleanup()
         return
+      }
+
+      try {
+        await sendCurrentSnapshot()
+      } catch (err) {
+        console.error('[SSE /api/tasks/:id/runs] Error sending current snapshot', err)
       }
 
       const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'rejected'])
@@ -122,7 +203,7 @@ export async function GET(
         cleanup()
       })
 
-      const heartbeat = setInterval(() => {
+      heartbeat = setInterval(() => {
         if (closed) return
         try {
           // Heartbeats are ephemeral — enqueue directly without persisting

@@ -5,6 +5,9 @@ ships with. The app reads this data at runtime from
 `web/lib/recommendations.ts` to populate the setup wizard, provider presets, and
 the agent config UI. No database queries needed — it is static config.
 
+In plain English: these presets are starter choices for which AI model should do
+each job. They are not required. Users can change providers later in the web UI.
+
 ---
 
 ## Presets

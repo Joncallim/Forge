@@ -1,18 +1,56 @@
 'use client'
 
+import type { FormEvent } from 'react'
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { startAuthentication } from '@simplewebauthn/browser'
 import { Button } from '@/components/ui/button'
 
+type SignInMethod = 'password' | 'passkey'
+
 export function LoginForm() {
   const router = useRouter()
-  const [loading, setLoading] = useState(false)
+  const [method, setMethod] = useState<SignInMethod>('password')
+  const [password, setPassword] = useState('')
+  const [loadingMethod, setLoadingMethod] = useState<SignInMethod | null>(null)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
 
-  async function handleSignIn() {
-    setLoading(true)
+  const loading = loadingMethod !== null
+
+  async function handlePasswordSignIn(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!password) return
+
+    setLoadingMethod('password')
+    setErrorMessage(null)
+
+    try {
+      const response = await fetch('/api/auth/login/password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      })
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.error ?? 'Sign-in failed. Please try again.')
+      }
+
+      router.push('/dashboard')
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'An unexpected error occurred. Please try again.'
+      setErrorMessage(message)
+    } finally {
+      setLoadingMethod(null)
+    }
+  }
+
+  async function handlePasskeySignIn() {
+    setLoadingMethod('passkey')
     setErrorMessage(null)
 
     try {
@@ -64,8 +102,14 @@ export function LoginForm() {
           : 'An unexpected error occurred. Please try again.'
       setErrorMessage(message)
     } finally {
-      setLoading(false)
+      setLoadingMethod(null)
     }
+  }
+
+  function selectMethod(nextMethod: SignInMethod) {
+    if (loading) return
+    setMethod(nextMethod)
+    setErrorMessage(null)
   }
 
   return (
@@ -77,25 +121,95 @@ export function LoginForm() {
             Forge
           </h1>
           <p className="mt-2 text-sm text-muted-foreground">
-            Sign in with your passkey
+            Sign in with your password or passkey
           </p>
         </div>
 
-        {/* Sign-in button */}
-        <Button
-          size="lg"
-          className="w-full"
-          onClick={handleSignIn}
-          disabled={loading}
-          aria-busy={loading}
-          aria-label={loading ? 'Signing in, please wait' : 'Sign in with passkey'}
+        <div
+          role="tablist"
+          aria-label="Sign-in method"
+          className="mb-5 grid grid-cols-2 rounded-lg border border-border bg-muted p-1"
         >
-          {loading ? 'Signing in...' : 'Sign in'}
-        </Button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={method === 'password'}
+            className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ${
+              method === 'password'
+                ? 'bg-background text-foreground shadow-sm'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+            onClick={() => selectMethod('password')}
+            disabled={loading}
+          >
+            Password
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={method === 'passkey'}
+            className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ${
+              method === 'passkey'
+                ? 'bg-background text-foreground shadow-sm'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+            onClick={() => selectMethod('passkey')}
+            disabled={loading}
+          >
+            Passkey
+          </button>
+        </div>
+
+        {method === 'password' ? (
+          <form onSubmit={handlePasswordSignIn} className="space-y-4">
+            <div>
+              <label
+                htmlFor="password"
+                className="mb-1.5 block text-sm font-medium text-foreground"
+              >
+                Password
+              </label>
+              <input
+                id="password"
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                disabled={loading}
+                aria-required="true"
+                aria-describedby={errorMessage !== null ? 'login-error' : undefined}
+                className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-50"
+              />
+            </div>
+
+            <Button
+              type="submit"
+              size="lg"
+              className="w-full"
+              disabled={loading || !password}
+              aria-busy={loadingMethod === 'password'}
+              aria-label={loadingMethod === 'password' ? 'Signing in, please wait' : 'Sign in with password'}
+            >
+              {loadingMethod === 'password' ? 'Signing in...' : 'Sign in with password'}
+            </Button>
+          </form>
+        ) : (
+          <Button
+            size="lg"
+            className="w-full"
+            onClick={handlePasskeySignIn}
+            disabled={loading}
+            aria-busy={loadingMethod === 'passkey'}
+            aria-label={loadingMethod === 'passkey' ? 'Signing in, please wait' : 'Sign in with passkey'}
+          >
+            {loadingMethod === 'passkey' ? 'Signing in...' : 'Sign in with passkey'}
+          </Button>
+        )}
 
         {/* Error message */}
         {errorMessage !== null && (
           <p
+            id="login-error"
             role="alert"
             aria-live="assertive"
             className="mt-4 text-center text-sm text-destructive"
@@ -111,7 +225,7 @@ export function LoginForm() {
             href="/register"
             className="font-medium text-foreground underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
           >
-            Register your passkey
+            Create your account
           </Link>
           {' '}
           &#8594;

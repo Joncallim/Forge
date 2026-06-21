@@ -1,8 +1,14 @@
 # Dedicated Worker Process
 
+The worker is the part of Forge that does the background work.
+
+The browser dashboard creates tasks. The worker picks them up, calls the chosen
+AI model, saves the result, and updates the task status. Without the worker, a
+task can be created but it will stay waiting.
+
 Forge should not require a manually started Claude Code session for normal task
 execution. Claude Code can remain useful for development, debugging, or emergency
-manual operation, but the production path should be a dedicated worker process.
+manual operation, but the normal path is a dedicated worker process.
 
 ## Purpose
 
@@ -20,7 +26,7 @@ The web app already enqueues tasks:
 2. The API pushes `{ taskId }` to Redis list `forge:tasks`.
 3. The task remains `pending` until a worker consumes it.
 
-An initial worker helper now exists. It consumes queued tasks, runs the architect
+An initial worker helper exists. It consumes queued tasks, runs the architect
 planning stage through the configured provider, stores the plan as an artifact,
 publishes live task events, and moves the task to `awaiting_approval`. It also
 consumes approval jobs from `forge:approvals` and marks approved helper-stage
@@ -84,8 +90,33 @@ Future responsibilities:
 - Claim jobs from Redis without double-processing.
 - Recover safely after process crashes.
 - Dispatch architect, backend, frontend, QA, reviewer, and devops agents.
+- Dispatch specialist subagents through explicit harnesses, such as web design,
+  accessibility, API, database, auth/security, E2E QA, CI, and documentation.
 - Create branches, commits, and pull requests through GitHub.
 - Enforce cancellation and approval gates.
+
+## Specialist Subagent Harnesses
+
+Future orchestration should not rely only on broad fixed roles. The worker
+should be able to run a specialist subagent through a named harness.
+
+A harness defines how a subagent is run:
+
+- prompt,
+- allowed tools,
+- required references,
+- expected input packet,
+- expected output artifact,
+- validation checks,
+- default provider/model preference.
+
+For example, a web design specialist can receive product context, relevant
+component files, design-system references, viewport expectations, and an
+accessibility checklist. Its output should be a structured UI plan and QA
+checklist, not an unstructured chat response.
+
+The detailed rollout plan lives in
+[`specialist-subagents-roadmap.md`](specialist-subagents-roadmap.md).
 
 ## Queue Design
 

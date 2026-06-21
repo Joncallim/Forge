@@ -1,18 +1,19 @@
 # Forge Helper-Stage UX Audit
 
-Last updated: 2026-06-20
+Last updated: 2026-06-21
 
 ## Scope
 
 This audit covers the helper-stage beta path:
 
 1. first dashboard visit with no providers,
-2. setup wizard preset application,
-3. provider health review,
-4. project creation,
-5. task creation,
-6. worker-generated architect artifact,
-7. approval and completion.
+2. account creation with password and passkey,
+3. setup wizard preset application,
+4. provider health review,
+5. project creation,
+6. task creation,
+7. worker-generated architect artifact,
+8. approval and completion.
 
 ## Screenshot Evidence
 
@@ -39,6 +40,8 @@ before running `npm run e2e`.
 - The setup wizard is the correct first screen for an unconfigured instance. It
   offers concrete provider presets and avoids sending operators to an empty
   dashboard.
+- The auth screens should stay direct and low-friction: first setup creates both
+  a password and passkey, while login lets users choose either method.
 - The Providers page is the right post-preset destination because it exposes
   health and missing-key feedback before a task is submitted.
 - Project and task creation use direct, focused dialogs with required fields and
@@ -55,7 +58,7 @@ before running `npm run e2e`.
   and Setup views.
 - Mobile bottom-tab navigation should be rechecked from deep scroll positions;
   an early CI trace showed page content intercepting the Projects tab click, so
-  the smoke test now routes directly to the Projects page.
+  the smoke test routes directly to the Projects page.
 - The task detail page should be checked with longer architect artifacts to
   ensure review controls remain easy to reach.
 - Empty, loading, failed, and degraded-provider states need a second audit pass
