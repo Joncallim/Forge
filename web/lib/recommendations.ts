@@ -2,7 +2,7 @@
 // Sourced from docs/agent-recommendations.md.
 
 export type Preset = {
-  id: 'best-quality' | 'best-value' | 'hybrid' | 'fully-local'
+  id: 'zero-config' | 'best-quality' | 'best-value' | 'hybrid' | 'fully-local'
   label: string
   description: string
   estimatedMonthlyCost: string
@@ -18,7 +18,36 @@ export type Preset = {
   >
 }
 
+// Zero-config defaults: one small, broadly-capable coding model served locally
+// by Ollama. ~4.7 GB download, runs comfortably on an 18 GB Mac. The macOS
+// installer pulls this model and seeds the matching providers, so a fresh
+// install can do AI with no API keys and no manual configuration.
+export const ZERO_CONFIG_MODEL_ID = 'qwen2.5-coder:7b'
+export const ZERO_CONFIG_BASE_URL = 'http://localhost:11434'
+
+const ZERO_CONFIG_AGENT = {
+  providerType: 'ollama',
+  modelId: ZERO_CONFIG_MODEL_ID,
+  baseUrl: ZERO_CONFIG_BASE_URL,
+  isLocal: true,
+} as const
+
 export const PRESETS: Preset[] = [
+  {
+    id: 'zero-config',
+    label: 'Zero-Config (Local)',
+    description:
+      'Runs entirely on your machine via Ollama with one small model. No API keys, no cloud, $0. Set up automatically by the macOS installer.',
+    estimatedMonthlyCost: '$0 / month',
+    agents: {
+      architect: ZERO_CONFIG_AGENT,
+      backend:   ZERO_CONFIG_AGENT,
+      frontend:  ZERO_CONFIG_AGENT,
+      reviewer:  ZERO_CONFIG_AGENT,
+      qa:        ZERO_CONFIG_AGENT,
+      devops:    ZERO_CONFIG_AGENT,
+    },
+  },
   {
     id: 'best-quality',
     label: 'Best Quality',
