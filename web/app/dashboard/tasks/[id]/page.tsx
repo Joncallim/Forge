@@ -21,6 +21,21 @@ interface Task {
   updatedAt: string
 }
 
+interface TaskAttempt {
+  id: string
+  taskId: string
+  queueName: string
+  attemptNumber: number
+  status: string
+  workerId: string | null
+  errorMessage: string | null
+  claimedAt: string
+  startedAt: string | null
+  completedAt: string | null
+  nextRetryAt: string | null
+  createdAt: string
+}
+
 type StatusVariant = 'default' | 'secondary' | 'destructive' | 'outline'
 
 function statusBadgeVariant(status: string): StatusVariant {
@@ -214,6 +229,51 @@ function ArtifactView({ artifact }: { artifact: Artifact }) {
   )
 }
 
+function TaskAttemptRow({ attempt }: { attempt: TaskAttempt }) {
+  const variant: StatusVariant =
+    attempt.status === 'completed'
+      ? 'secondary'
+      : attempt.status === 'failed' || attempt.status === 'dead_lettered'
+        ? 'destructive'
+        : 'outline'
+
+  return (
+    <li className="border-b border-border px-4 py-3 last:border-0">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <span className="font-medium text-foreground">{attempt.queueName}</span>
+          <span className="text-muted-foreground">attempt {attempt.attemptNumber}</span>
+          <Badge variant={variant}>{statusLabel(attempt.status)}</Badge>
+        </div>
+        <span className="font-mono text-xs text-muted-foreground">
+          {attempt.workerId ?? 'worker pending'}
+        </span>
+      </div>
+
+      <dl className="mt-2 grid gap-x-4 gap-y-1 text-xs sm:grid-cols-3">
+        <div>
+          <dt className="text-muted-foreground">Started</dt>
+          <dd>{formatDatetime(attempt.startedAt ?? attempt.claimedAt)}</dd>
+        </div>
+        <div>
+          <dt className="text-muted-foreground">Completed</dt>
+          <dd>{formatDatetime(attempt.completedAt)}</dd>
+        </div>
+        <div>
+          <dt className="text-muted-foreground">Next Retry</dt>
+          <dd>{formatDatetime(attempt.nextRetryAt)}</dd>
+        </div>
+      </dl>
+
+      {attempt.errorMessage !== null && (
+        <p className="mt-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          {attempt.errorMessage}
+        </p>
+      )}
+    </li>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // TaskDetailPage
 // ---------------------------------------------------------------------------
@@ -225,6 +285,7 @@ export default function TaskDetailPage() {
   const [task, setTask] = useState<Task | null>(null)
   const [initialRuns, setInitialRuns] = useState<AgentRun[]>([])
   const [initialArtifacts, setInitialArtifacts] = useState<Artifact[]>([])
+  const [attempts, setAttempts] = useState<TaskAttempt[]>([])
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
 
@@ -255,6 +316,7 @@ export default function TaskDetailPage() {
       setTask(data.task ?? null)
       setInitialRuns(data.runs ?? [])
       setInitialArtifacts(data.artifacts ?? [])
+      setAttempts(data.attempts ?? [])
     } catch (err) {
       setFetchError(err instanceof Error ? err.message : 'An unexpected error occurred')
     } finally {
@@ -416,7 +478,7 @@ export default function TaskDetailPage() {
       {isAwaitingApproval && (
         <div className="mb-6 rounded-xl border border-border bg-card p-4">
           <p className="mb-3 text-sm font-medium text-foreground">
-            Review the generated plan before closing this helper stage.
+            Review the generated plan before closing this Orchestrator stage.
           </p>
 
           {actionError !== null && (
@@ -502,6 +564,24 @@ export default function TaskDetailPage() {
           >
             {mergedRuns.map((run) => (
               <AgentRunRow key={run.id} run={run} />
+            ))}
+          </ul>
+        )}
+      </section>
+
+      {/* Task attempt history */}
+      <section aria-labelledby="attempts-heading" className="mb-6">
+        <h2 id="attempts-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
+          Task Attempts
+        </h2>
+        {attempts.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-border px-4 py-8 text-center">
+            <p className="text-sm text-muted-foreground">No attempts recorded yet.</p>
+          </div>
+        ) : (
+          <ul className="rounded-xl border border-border" aria-label="Task attempt history">
+            {attempts.map((attempt) => (
+              <TaskAttemptRow key={attempt.id} attempt={attempt} />
             ))}
           </ul>
         )}

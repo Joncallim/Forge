@@ -25,6 +25,7 @@ It can install these pieces:
 - Node.js, used to run the web app and worker.
 - PostgreSQL 16, used as Forge's database.
 - Redis, used as Forge's job queue.
+- GitHub CLI, used for repository, issue, pull request, and Actions tooling.
 - Ollama, optional, used for local AI.
 
 It also creates local project files:
@@ -45,6 +46,18 @@ The installer records what was missing before Forge installed it. The uninstall
 script uses that record to remove Forge-only packages without removing packages
 you already had.
 
+## Check Readiness Without Installing
+
+Use this when you want to see whether the machine already has what Forge needs:
+
+```bash
+bash scripts/install.sh --check
+```
+
+This prints the detected OS, package manager, service mode, key tool status,
+GitHub CLI authentication status, and local file readiness. It does not change
+files, install packages, start services, or create databases.
+
 ## Uninstall Forge
 
 Run this from the repository root on macOS or Linux:
@@ -57,10 +70,10 @@ By default, it asks whether to keep settings and credentials. Keeping them means
 Forge can be reinstalled later without losing provider settings, encrypted API
 keys, and task history.
 
-The helper supports Homebrew on macOS and `apt`, `dnf`, `yum`, `zypper`, and
-`pacman` on Linux. It removes a package only when the install manifest says
-Forge added it. If the package manager says another package still needs it, the
-helper leaves it installed.
+The uninstall script supports Homebrew on macOS and `apt`, `dnf`, `yum`,
+`zypper`, and `pacman` on Linux. It removes a package only when the install
+manifest says Forge added it. If the package manager says another package still
+needs it, the script leaves it installed.
 
 ## Keep Settings And Credentials
 

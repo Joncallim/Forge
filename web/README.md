@@ -10,7 +10,7 @@ The dashboard lets an operator:
 - create projects,
 - submit tasks,
 - review generated plans,
-- approve or reject helper-stage work.
+- approve or reject Orchestrator-stage work.
 
 When a task is created, the API stores it in PostgreSQL and puts a job in Redis.
 By default, `npm run dev` starts an embedded worker loop to pick up that job.
@@ -51,7 +51,7 @@ npm run dev             # start the dashboard and embedded task worker
 npm run worker          # start only the task worker for split deployments
 npm run db:migrate      # apply database migrations
 npm run db:seed-agents  # load default agent prompts
-npm run doctor          # check env, PostgreSQL, and Redis
+npm run doctor          # check env, PostgreSQL, Redis, and GitHub CLI readiness
 npm test                # run unit tests
 npm run build           # production build check
 ```
@@ -66,7 +66,7 @@ npm run build           # production build check
 6. The worker stores the generated plan as an artifact.
 7. The task becomes `awaiting_approval`.
 8. The user approves or rejects the plan.
-9. Approved helper-stage tasks become `completed`.
+9. Approved Orchestrator-stage tasks become `completed`.
 
 ## Database Migrations
 

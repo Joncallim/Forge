@@ -149,6 +149,6 @@ user is manually editing a single agent's provider, regardless of preset.
   supported by a configured provider endpoint.
 - Cross-provider dispatch — provider selection per agent is stored in
   `agent_configs.provider_config_id`. The worker reads the active agent config
-  from this table at dispatch time. The current helper dispatches only the
+  from this table at dispatch time. The current Orchestrator dispatches only the
   architect stage; future specialist stages should use the same per-agent
   provider mapping.

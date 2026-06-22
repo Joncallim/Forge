@@ -24,6 +24,7 @@ INSTALL_LOG="$INSTALL_STATE_DIR/install.log"
 
 OS_NAME="${FORGE_OS_OVERRIDE:-$(uname -s)}"
 DRY_RUN="${FORGE_DRY_RUN:-0}"
+CHECK_ONLY="${FORGE_CHECK_ONLY:-0}"
 YES="${FORGE_ASSUME_YES:-0}"
 SKIP_OLLAMA="${FORGE_SKIP_OLLAMA:-0}"
 ZERO_CONFIG_MODEL="${FORGE_ZERO_CONFIG_MODEL:-qwen2.5-coder:7b}"
@@ -54,6 +55,7 @@ truthy() {
 }
 
 DRY_RUN="$(truthy "$DRY_RUN" && printf 1 || printf 0)"
+CHECK_ONLY="$(truthy "$CHECK_ONLY" && printf 1 || printf 0)"
 YES="$(truthy "$YES" && printf 1 || printf 0)"
 SKIP_OLLAMA="$(truthy "$SKIP_OLLAMA" && printf 1 || printf 0)"
 
@@ -68,6 +70,7 @@ Options:
                          native uses Homebrew on macOS and system packages on Linux.
                          docker starts only PostgreSQL and Redis via Docker Compose.
   --yes, -y              Assume yes for package manager prompts where supported.
+  --check                Inspect local readiness without changing the machine.
   --dry-run              Print the planned work without changing the machine.
   --help, -h             Show this help.
 
@@ -75,6 +78,7 @@ Environment:
   FORGE_SKIP_OLLAMA=1
   FORGE_ZERO_CONFIG_MODEL=qwen2.5-coder:7b
   FORGE_SERVICE_MODE=auto|native|docker
+  FORGE_CHECK_ONLY=1
   FORGE_DRY_RUN=1
   FORGE_OS_OVERRIDE=Darwin|Linux              # dry-run/testing helper
   FORGE_PACKAGE_MANAGER_OVERRIDE=apt|brew     # dry-run/testing helper
@@ -121,6 +125,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --yes|-y)
       YES=1
+      ;;
+    --check)
+      CHECK_ONLY=1
+      DRY_RUN=1
       ;;
     --dry-run)
       DRY_RUN=1
@@ -483,6 +491,18 @@ node_major() {
   node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0
 }
 
+command_status() {
+  local label="$1"
+  local command_name="$2"
+  if command -v "$command_name" >/dev/null 2>&1; then
+    info "ok      $label: $(command -v "$command_name")"
+    return 0
+  fi
+
+  info "missing $label"
+  return 1
+}
+
 ensure_node() {
   local major
   major="$(node_major)"
@@ -519,6 +539,63 @@ ensure_node() {
   info "Node $(node -v) is ready."
 }
 
+github_cli_package() {
+  case "$PACKAGE_MANAGER" in
+    brew|apt|dnf|yum|zypper|pacman) printf 'gh' ;;
+  esac
+}
+
+install_github_cli_apt_source() {
+  install_packages curl ca-certificates
+  info "Installing GitHub CLI from the official apt repository."
+
+  if [ "$DRY_RUN" = "1" ]; then
+    info "[dry-run] Install GitHub CLI apt keyring and source list"
+  else
+    run_quiet "Create apt keyring directory" "${SUDO[@]}" install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg |
+      "${SUDO[@]}" tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
+    run_quiet "Set GitHub CLI apt keyring permissions" "${SUDO[@]}" chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+    {
+      printf 'deb [arch='
+      dpkg --print-architecture
+      printf ' signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\n'
+    } | "${SUDO[@]}" tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+    record_manifest "apt_source" "github_cli"
+    APT_UPDATED=0
+  fi
+
+  install_packages gh
+}
+
+ensure_github_cli() {
+  step "Checking GitHub CLI"
+
+  if command -v gh >/dev/null 2>&1; then
+    info "$(gh --version | head -1) is ready."
+  else
+    local package_name
+    package_name="$(github_cli_package)"
+    info "GitHub CLI is missing. Forge uses it for repository, issue, pull request, and Actions tooling."
+    if [ "$PACKAGE_MANAGER" = "apt" ]; then
+      install_github_cli_apt_source
+    else
+      install_packages "$package_name"
+    fi
+  fi
+
+  if [ "$DRY_RUN" = "1" ]; then
+    info "[dry-run] Check gh auth status"
+    return 0
+  fi
+
+  if gh auth status >/dev/null 2>&1; then
+    info "GitHub CLI is authenticated."
+  else
+    warn "GitHub CLI is installed but not authenticated. Run: gh auth login --scopes repo,workflow"
+  fi
+}
+
 install_base_dependencies() {
   step "Installing base dependencies"
 
@@ -532,6 +609,7 @@ install_base_dependencies() {
   fi
 
   ensure_node
+  ensure_github_cli
 }
 
 install_native_services() {
@@ -982,6 +1060,99 @@ resolve_service_mode() {
   record_manifest "service_mode" "$SERVICE_MODE"
 }
 
+print_preflight_summary() {
+  step "Preflight summary"
+  info "Repository: $REPO_ROOT"
+  info "Environment file: $ENV_FILE"
+  info "Install log: $INSTALL_LOG"
+  info "Install manifest: $INSTALL_MANIFEST"
+  info "Operating system: $OS_NAME"
+  info "Package manager: $PACKAGE_MANAGER"
+  info "Service mode: $SERVICE_MODE"
+  info "Local AI model: $([ "$SKIP_OLLAMA" = "1" ] && printf 'skip' || printf '%s' "$ZERO_CONFIG_MODEL")"
+
+  info "Current tool status:"
+  command_status "Node.js" node || true
+  command_status "npm" npm || true
+  command_status "GitHub CLI" gh || true
+  if [ "$SERVICE_MODE" = "docker" ]; then
+    command_status "Docker" docker || true
+  else
+    command_status "PostgreSQL client" psql || true
+    command_status "Redis CLI" redis-cli || true
+  fi
+  if [ "$SKIP_OLLAMA" != "1" ]; then
+    command_status "Ollama" ollama || true
+  fi
+
+  if [ "$CHECK_ONLY" = "1" ]; then
+    info "--check is active. No files, services, packages, or databases will be changed."
+  elif [ "$DRY_RUN" = "1" ]; then
+    info "--dry-run is active. The script will preview work without changing this machine."
+  else
+    info "The installer will preserve existing settings, install missing dependencies, prepare services, and run the doctor."
+  fi
+}
+
+run_check_only() {
+  step "Readiness check"
+  local failed=0
+  local major
+
+  major="$(node_major)"
+  if [ "$major" -ge 20 ]; then
+    info "ok      Node.js version: $(node -v)"
+  else
+    warn "Node.js 20 or newer is required."
+    failed=1
+  fi
+
+  command_status "npm" npm || failed=1
+  command_status "GitHub CLI" gh || failed=1
+
+  if command -v gh >/dev/null 2>&1; then
+    if gh auth status >/dev/null 2>&1; then
+      info "ok      GitHub CLI authentication"
+    else
+      warn "GitHub CLI is not authenticated. Run: gh auth login --scopes repo,workflow"
+      failed=1
+    fi
+  fi
+
+  if [ "$SERVICE_MODE" = "docker" ]; then
+    command_status "Docker" docker || failed=1
+    if command -v docker >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then
+      warn "Docker is installed but not running."
+      failed=1
+    fi
+  else
+    command_status "PostgreSQL readiness tool" pg_isready || failed=1
+    command_status "Redis CLI" redis-cli || warn "Redis readiness will fall back to npm run doctor after install."
+  fi
+
+  if [ -f "$ENV_FILE" ]; then
+    info "ok      Environment file exists: $ENV_FILE"
+  else
+    warn "Environment file is missing. Run bash scripts/install.sh to create it."
+    failed=1
+  fi
+
+  if [ -d "$REPO_ROOT/web/node_modules" ]; then
+    info "ok      web/node_modules exists"
+  else
+    warn "web/node_modules is missing. Run bash scripts/install.sh or cd web && npm install."
+    failed=1
+  fi
+
+  if [ "$failed" = "0" ]; then
+    info "Forge looks ready. Run cd web && npm run doctor for runtime connectivity checks."
+  else
+    warn "Forge is not fully ready yet. The installer can fix most missing local dependencies."
+  fi
+
+  return "$failed"
+}
+
 print_summary() {
   step "Install complete"
   cat <<EOF
@@ -996,6 +1167,9 @@ print_summary() {
   The web app starts the task worker automatically. Set FORGE_EMBED_WORKER=0
   and run "cd web && npm run worker" separately if you want split processes.
   The first account creates a password and, when enabled, a passkey.
+  For repository tooling, confirm GitHub CLI access with:
+
+    gh auth status
 EOF
 
   if [ "$SKIP_OLLAMA" != "1" ]; then
@@ -1044,6 +1218,13 @@ info "Install record: $INSTALL_MANIFEST"
 validate_repo_layout
 detect_package_manager
 resolve_service_mode
+print_preflight_summary
+if [ "$CHECK_ONLY" = "1" ]; then
+  if run_check_only; then
+    exit 0
+  fi
+  exit 1
+fi
 setup_sudo
 ensure_install_state
 acquire_install_lock

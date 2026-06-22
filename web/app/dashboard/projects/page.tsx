@@ -41,6 +41,24 @@ function formatDate(iso: string): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(new Date(iso))
 }
 
+function folderNameFromProjectName(name: string): string {
+  if (!name.trim()) return ''
+  const slug = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return slug || 'forge-project'
+}
+
+function joinPathPreview(parentPath: string, folderName: string): string {
+  const parent = parentPath.trim()
+  const folder = folderName.trim()
+  if (!parent || !folder) return ''
+  if (parent.endsWith('/') || parent.endsWith('\\')) return `${parent}${folder}`
+  return `${parent}${parent.includes('\\') && !parent.includes('/') ? '\\' : '/'}${folder}`
+}
+
 export default function ProjectsPage() {
   const router = useRouter()
   const [projects, setProjects] = useState<Project[]>([])
@@ -52,7 +70,9 @@ export default function ProjectsPage() {
   const [formSource, setFormSource] = useState<ProjectSource>('github')
   const [formName, setFormName] = useState('')
   const [formRepo, setFormRepo] = useState('')
-  const [formLocalPath, setFormLocalPath] = useState('')
+  const [formLocalParentPath, setFormLocalParentPath] = useState('')
+  const [formLocalFolderName, setFormLocalFolderName] = useState('')
+  const [folderNameEdited, setFolderNameEdited] = useState(false)
   const [formBranch, setFormBranch] = useState('main')
   const [formError, setFormError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
@@ -107,11 +127,53 @@ export default function ProjectsPage() {
     }
   }, [dialogOpen, folderListing, folderLoading, formSource, loadFolders])
 
+  useEffect(() => {
+    if (!folderNameEdited) {
+      setFormLocalFolderName(folderNameFromProjectName(formName))
+    }
+  }, [folderNameEdited, formName])
+
+  useEffect(() => {
+    if (formSource === 'local' && folderListing !== null && formLocalParentPath.trim() === '') {
+      setFormLocalParentPath(folderListing.path)
+    }
+  }, [folderListing, formLocalParentPath, formSource])
+
+  async function createLocalProjectFolder(): Promise<string | undefined> {
+    if (formSource !== 'local') return undefined
+
+    const parentPath = formLocalParentPath.trim()
+    const folderName = formLocalFolderName.trim()
+    if (!parentPath) {
+      throw new Error('Choose a parent folder for this local project')
+    }
+    if (!folderName) {
+      throw new Error('Enter a folder name for this local project')
+    }
+
+    const res = await fetch('/api/filesystem/directories', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ parentPath, name: folderName }),
+    })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error(body.error ?? 'Failed to create project folder')
+    }
+
+    const body = await res.json()
+    if (typeof body.path !== 'string' || body.path.length === 0) {
+      throw new Error('Project folder was created, but the path was not returned')
+    }
+    return body.path
+  }
+
   async function handleCreateProject(e: React.FormEvent) {
     e.preventDefault()
     setFormError(null)
     setSubmitting(true)
     try {
+      const localPath = await createLocalProjectFolder()
       const res = await fetch('/api/projects', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -119,7 +181,7 @@ export default function ProjectsPage() {
           name: formName.trim(),
           source: formSource,
           githubRepo: formSource === 'github' ? formRepo.trim() : undefined,
-          localPath: formSource === 'local' ? formLocalPath.trim() || undefined : undefined,
+          localPath,
           defaultBranch: formBranch.trim() || 'main',
         }),
       })
@@ -131,7 +193,9 @@ export default function ProjectsPage() {
       setFormSource('github')
       setFormName('')
       setFormRepo('')
-      setFormLocalPath('')
+      setFormLocalParentPath('')
+      setFormLocalFolderName('')
+      setFolderNameEdited(false)
       setFormBranch('main')
       setFolderListing(null)
       await loadProjects()
@@ -141,6 +205,8 @@ export default function ProjectsPage() {
       setSubmitting(false)
     }
   }
+
+  const localPathPreview = joinPathPreview(formLocalParentPath, formLocalFolderName)
 
   return (
     <div className="px-4 py-6 sm:px-6 lg:px-8">
@@ -242,24 +308,25 @@ export default function ProjectsPage() {
 
               {formSource === 'local' && (
                 <div className="flex flex-col gap-2">
-                  <label htmlFor="project-local-path" className="text-sm font-medium text-foreground">
-                    Local Folder
+                  <label htmlFor="project-local-parent-path" className="text-sm font-medium text-foreground">
+                    Parent Folder <span aria-hidden="true" className="text-destructive">*</span>
                   </label>
                   <div className="flex gap-2">
                     <input
-                      id="project-local-path"
+                      id="project-local-parent-path"
                       type="text"
-                      value={formLocalPath}
-                      onChange={(e) => setFormLocalPath(e.target.value)}
-                      placeholder="/Users/alex/Games/my-game"
+                      required
+                      value={formLocalParentPath}
+                      onChange={(e) => setFormLocalParentPath(e.target.value)}
+                      placeholder="/Users/alex/Projects"
                       autoComplete="off"
                       className="min-w-0 flex-1 rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                      aria-describedby="project-local-path-help"
+                      aria-describedby="project-local-parent-path-help"
                     />
                     <Button
                       type="button"
                       variant="outline"
-                      onClick={() => void loadFolders(formLocalPath || undefined)}
+                      onClick={() => void loadFolders(formLocalParentPath || undefined)}
                       disabled={folderLoading}
                       aria-label="Browse local folders"
                     >
@@ -267,26 +334,62 @@ export default function ProjectsPage() {
                       Browse
                     </Button>
                   </div>
-                  <p id="project-local-path-help" className="text-xs text-muted-foreground">
-                    Choose the local folder Forge should use for this project.
+                  <p id="project-local-parent-path-help" className="text-xs text-muted-foreground">
+                    Choose where Forge should create the new project folder.
                   </p>
+
+                  <div className="flex flex-col gap-1.5">
+                    <label htmlFor="project-local-folder-name" className="text-sm font-medium text-foreground">
+                      New Folder Name <span aria-hidden="true" className="text-destructive">*</span>
+                    </label>
+                    <input
+                      id="project-local-folder-name"
+                      type="text"
+                      required
+                      value={formLocalFolderName}
+                      onChange={(e) => {
+                        setFolderNameEdited(true)
+                        setFormLocalFolderName(e.target.value)
+                      }}
+                      placeholder="my-project"
+                      autoComplete="off"
+                      className="rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                      aria-describedby="project-local-folder-name-help"
+                    />
+                    <p id="project-local-folder-name-help" className="text-xs text-muted-foreground">
+                      Forge will create this folder before saving the project.
+                    </p>
+                  </div>
 
                   <div className="rounded-lg border border-border bg-muted/30">
                     <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
                       <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
                         {folderListing?.path ?? 'Loading folders...'}
                       </span>
-                      {folderListing?.parentPath && (
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => void loadFolders(folderListing.parentPath ?? undefined)}
-                          disabled={folderLoading}
-                        >
-                          Up
-                        </Button>
-                      )}
+                      <div className="flex shrink-0 items-center gap-1">
+                        {folderListing !== null && (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setFormLocalParentPath(folderListing.path)}
+                            disabled={folderLoading}
+                          >
+                            Use
+                          </Button>
+                        )}
+                        {folderListing?.parentPath && (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => void loadFolders(folderListing.parentPath ?? undefined)}
+                            disabled={folderLoading}
+                          >
+                            Up
+                          </Button>
+                        )}
+                      </div>
                     </div>
 
                     {folderError !== null && (
@@ -306,9 +409,9 @@ export default function ProjectsPage() {
                             type="button"
                             key={directory.path}
                             onDoubleClick={() => void loadFolders(directory.path)}
-                            onClick={() => setFormLocalPath(directory.path)}
+                            onClick={() => setFormLocalParentPath(directory.path)}
                             className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors hover:bg-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
-                              formLocalPath === directory.path ? 'bg-background text-foreground' : 'text-muted-foreground'
+                              formLocalParentPath === directory.path ? 'bg-background text-foreground' : 'text-muted-foreground'
                             }`}
                           >
                             <FolderOpenIcon className="size-3.5 shrink-0" aria-hidden="true" />
@@ -322,6 +425,13 @@ export default function ProjectsPage() {
                       </p>
                     )}
                   </div>
+
+                  {localPathPreview !== '' && (
+                    <div className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                      New project path:{' '}
+                      <code className="break-all font-mono text-foreground">{localPathPreview}</code>
+                    </div>
+                  )}
                 </div>
               )}
 

@@ -8,7 +8,7 @@ import {
   stopWorker,
 } from './helpers'
 
-test.describe('helper-stage beta smoke', () => {
+test.describe('Orchestrator-stage beta smoke', () => {
   let worker: ChildProcessWithoutNullStreams | null = null
 
   test.beforeEach(async ({ context }, testInfo) => {

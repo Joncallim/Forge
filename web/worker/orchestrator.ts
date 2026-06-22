@@ -102,7 +102,7 @@ function mockArchitectPlan(task: TaskRow, project: ProjectRow): string {
     '',
     'Verification steps:',
     '- Confirm the task detail page shows the agent run and artifact.',
-    '- Approve the generated plan and confirm the helper stage completes.',
+    '- Approve the generated plan and confirm the Orchestrator stage completes.',
   ].join('\n')
 }
 
@@ -254,7 +254,10 @@ async function runArchitect(task: TaskRow, project: ProjectRow): Promise<void> {
   }
 }
 
-export async function processTask(taskId: string): Promise<void> {
+export async function processTask(
+  taskId: string,
+  options: { finalAttempt?: boolean } = {},
+): Promise<void> {
   const context = await loadTaskContext(taskId)
   if (!context) {
     console.warn('[worker/orchestrator] Task not found', { taskId })
@@ -288,7 +291,11 @@ export async function processTask(taskId: string): Promise<void> {
     await updateTaskStatus(task.id, 'awaiting_approval')
   } catch (err) {
     const message = errorMessage(err)
-    await updateTaskStatus(task.id, 'failed', message)
+    if (options.finalAttempt ?? true) {
+      await updateTaskStatus(task.id, 'failed', message)
+    } else if (!(await isTaskCancelled(task.id))) {
+      await updateTaskStatus(task.id, 'pending', `Retrying after error: ${message}`)
+    }
     throw err
   }
 }
