@@ -5,6 +5,7 @@ import { db } from '@/db'
 import { projects } from '@/db/schema'
 import { isNull, desc } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
+import { registerProjectPath } from '@/lib/project-registry'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -90,6 +91,10 @@ export async function POST(request: NextRequest) {
         defaultBranch: data.defaultBranch ?? 'main',
       })
       .returning()
+
+    if (project.localPath) {
+      await registerProjectPath(project.localPath)
+    }
 
     console.info('[POST /api/projects] Created project', { id: project.id, name: project.name })
     return NextResponse.json({ project }, { status: 201 })

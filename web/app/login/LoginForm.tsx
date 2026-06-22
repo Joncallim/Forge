@@ -19,8 +19,9 @@ export function LoginForm({ passkeysEnabled = true }: LoginFormProps) {
   const [password, setPassword] = useState('')
   const [loadingMethod, setLoadingMethod] = useState<SignInMethod | null>(null)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [signedInVia, setSignedInVia] = useState<SignInMethod | null>(null)
 
-  const loading = loadingMethod !== null
+  const loading = loadingMethod !== null || signedInVia !== null
 
   async function handlePasswordSignIn(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -99,15 +100,19 @@ export function LoginForm({ passkeysEnabled = true }: LoginFormProps) {
         throw new Error(data.error ?? 'Sign-in failed. Please try again.')
       }
 
-      // Step 4: Navigate to the dashboard on success
-      router.push('/dashboard')
+      // Step 4: Show a brief confirmation screen, then navigate to the dashboard.
+      setLoadingMethod(null)
+      setSignedInVia('passkey')
+      router.prefetch('/dashboard')
+      setTimeout(() => {
+        router.push('/dashboard')
+      }, 1200)
     } catch (err) {
       const message =
         err instanceof Error
           ? err.message
           : 'An unexpected error occurred. Please try again.'
       setErrorMessage(message)
-    } finally {
       setLoadingMethod(null)
     }
   }
@@ -117,6 +122,35 @@ export function LoginForm({ passkeysEnabled = true }: LoginFormProps) {
     if (nextMethod === 'passkey' && !passkeysEnabled) return
     setMethod(nextMethod)
     setErrorMessage(null)
+  }
+
+  if (signedInVia !== null) {
+    return (
+      <div
+        className="flex min-h-full flex-1 flex-col items-center justify-center bg-background px-4 py-12"
+        role="status"
+        aria-live="polite"
+      >
+        <div className="flex w-full max-w-sm flex-col items-center gap-4 rounded-xl border border-border bg-card p-8 text-center shadow-sm">
+          <span
+            aria-hidden="true"
+            className="flex size-12 items-center justify-center rounded-full bg-muted text-2xl"
+          >
+            🔑
+          </span>
+          <div>
+            <p className="text-base font-semibold text-foreground">
+              {signedInVia === 'passkey' ? 'Signed in with your passkey' : 'Signed in'}
+            </p>
+            <p className="mt-1 text-sm text-muted-foreground">Taking you to your dashboard…</p>
+          </div>
+          <span
+            aria-hidden="true"
+            className="size-5 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-foreground"
+          />
+        </div>
+      </div>
+    )
   }
 
   return (

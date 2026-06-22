@@ -112,8 +112,11 @@ export default function ProjectsPage() {
         const body = await res.json().catch(() => ({}))
         throw new Error(body.error ?? 'Failed to load folders')
       }
-      const data = await res.json()
+      const data: DirectoryListing = await res.json()
       setFolderListing(data)
+      // Wherever the user has browsed to is the folder the project will be
+      // created in. Keep the parent-path input in sync with the listing.
+      setFormLocalParentPath(data.path)
     } catch (err) {
       setFolderError(err instanceof Error ? err.message : 'Unable to load folders')
     } finally {
@@ -133,12 +136,6 @@ export default function ProjectsPage() {
     }
   }, [folderNameEdited, formName])
 
-  useEffect(() => {
-    if (formSource === 'local' && folderListing !== null && formLocalParentPath.trim() === '') {
-      setFormLocalParentPath(folderListing.path)
-    }
-  }, [folderListing, formLocalParentPath, formSource])
-
   async function createLocalProjectFolder(): Promise<string | undefined> {
     if (formSource !== 'local') return undefined
 
@@ -151,21 +148,56 @@ export default function ProjectsPage() {
       throw new Error('Enter a folder name for this local project')
     }
 
-    const res = await fetch('/api/filesystem/directories', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ parentPath, name: folderName }),
-    })
-    if (!res.ok) {
+    // We POST up to a few times: the first call may report that the parent
+    // folder is missing or that the target already exists. In those cases we
+    // ask the user with a pop-up and retry with the matching flag set.
+    let createParents = false
+    let allowExisting = false
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const res = await fetch('/api/filesystem/directories', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parentPath, name: folderName, createParents, allowExisting }),
+      })
+
+      if (res.ok) {
+        const body = await res.json()
+        if (typeof body.path !== 'string' || body.path.length === 0) {
+          throw new Error('Project folder was ready, but the path was not returned')
+        }
+        return body.path
+      }
+
       const body = await res.json().catch(() => ({}))
+
+      if (res.status === 409 && body.code === 'PARENT_MISSING' && !createParents) {
+        const ok = window.confirm(
+          `The folder "${parentPath}" does not exist yet.\n\nCreate it now?`,
+        )
+        if (!ok) {
+          throw new Error('Cancelled: the parent folder was not created.')
+        }
+        createParents = true
+        continue
+      }
+
+      if (res.status === 409 && body.code === 'DIR_EXISTS' && !allowExisting) {
+        const detail = body.empty === false ? ' It already contains files.' : ''
+        const ok = window.confirm(
+          `A folder named "${folderName}" already exists here.${detail}\n\nUse the existing folder for this project?`,
+        )
+        if (!ok) {
+          throw new Error('Cancelled: choose a different folder name.')
+        }
+        allowExisting = true
+        continue
+      }
+
       throw new Error(body.error ?? 'Failed to create project folder')
     }
 
-    const body = await res.json()
-    if (typeof body.path !== 'string' || body.path.length === 0) {
-      throw new Error('Project folder was created, but the path was not returned')
-    }
-    return body.path
+    throw new Error('Could not prepare the project folder. Please try again.')
   }
 
   async function handleCreateProject(e: React.FormEvent) {
@@ -265,11 +297,19 @@ export default function ProjectsPage() {
                 </label>
                 <input
                   id="project-name"
+                  name="forge-project-name"
                   type="text"
                   required
                   value={formName}
                   onChange={(e) => setFormName(e.target.value)}
                   placeholder="My Project"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                  data-1p-ignore="true"
+                  data-lpignore="true"
+                  data-form-type="other"
                   className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
                   aria-required="true"
                 />
@@ -335,7 +375,8 @@ export default function ProjectsPage() {
                     </Button>
                   </div>
                   <p id="project-local-parent-path-help" className="text-xs text-muted-foreground">
-                    Choose where Forge should create the new project folder.
+                    Type a path and press Browse, or click folders below to open them. The folder
+                    shown below is where Forge will create the new project folder.
                   </p>
 
                   <div className="flex flex-col gap-1.5">
@@ -367,17 +408,6 @@ export default function ProjectsPage() {
                         {folderListing?.path ?? 'Loading folders...'}
                       </span>
                       <div className="flex shrink-0 items-center gap-1">
-                        {folderListing !== null && (
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => setFormLocalParentPath(folderListing.path)}
-                            disabled={folderLoading}
-                          >
-                            Use
-                          </Button>
-                        )}
                         {folderListing?.parentPath && (
                           <Button
                             type="button"
@@ -385,6 +415,7 @@ export default function ProjectsPage() {
                             size="sm"
                             onClick={() => void loadFolders(folderListing.parentPath ?? undefined)}
                             disabled={folderLoading}
+                            aria-label="Go up one folder"
                           >
                             Up
                           </Button>
@@ -408,11 +439,10 @@ export default function ProjectsPage() {
                           <button
                             type="button"
                             key={directory.path}
-                            onDoubleClick={() => void loadFolders(directory.path)}
-                            onClick={() => setFormLocalParentPath(directory.path)}
-                            className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors hover:bg-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
-                              formLocalParentPath === directory.path ? 'bg-background text-foreground' : 'text-muted-foreground'
-                            }`}
+                            onClick={() => void loadFolders(directory.path)}
+                            disabled={folderLoading}
+                            className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-background hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            aria-label={`Open folder ${directory.name}`}
                           >
                             <FolderOpenIcon className="size-3.5 shrink-0" aria-hidden="true" />
                             <span className="min-w-0 truncate">{directory.name}</span>

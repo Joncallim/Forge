@@ -35,13 +35,18 @@ export function SetupWizard({ hasProviders }: SetupWizardProps) {
 
     try {
       await applyPreset(preset)
-      router.push('/dashboard/providers')
-      router.refresh()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to apply preset')
-    } finally {
       setApplyingPreset(null)
+      return
     }
+
+    // On success, keep the button in its in-flight state and navigate. We do not
+    // call router.refresh() here: calling it immediately after push() can cancel
+    // the in-flight navigation and strand the user on /dashboard/setup (the
+    // source of the flaky chromium-mobile e2e failure). push() already fetches
+    // fresh server data for the destination route.
+    router.push('/dashboard/providers')
   }
 
   return (

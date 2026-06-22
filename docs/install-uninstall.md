@@ -104,6 +104,17 @@ This removes local build artifacts, recorded Forge-only packages, `.env`,
 Docker volumes, recorded PostgreSQL database objects, recorded Ollama models,
 and Forge's local install state.
 
+By default it does **not** delete the local project folders Forge created. When
+run interactively it asks whether to delete them, or you can opt in directly:
+
+```bash
+bash scripts/uninstall.sh --remove-data --remove-projects
+```
+
+This deletes every folder listed in `.forge/project-paths` (the local projects
+Forge created) along with their files. Use `--keep-projects` to skip the prompt
+and always keep them.
+
 It still does not remove Homebrew, Linux package managers, Docker
 Desktop/Engine, packages that existed before Forge, or recorded packages that
 the package manager says are still needed elsewhere.

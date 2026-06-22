@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { useRouter, useParams } from 'next/navigation'
-import { PlusIcon, ExternalLinkIcon, ArrowLeftIcon } from 'lucide-react'
+import { PlusIcon, ExternalLinkIcon, ArrowLeftIcon, Trash2Icon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
@@ -76,6 +76,7 @@ export default function ProjectDetailPage() {
   const [formPrompt, setFormPrompt] = useState('')
   const [formError, setFormError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const [deleting, setDeleting] = useState(false)
 
   const loadData = useCallback(async () => {
     setLoading(true)
@@ -143,6 +144,38 @@ export default function ProjectDetailPage() {
       setFormError(err instanceof Error ? err.message : 'An unexpected error occurred')
     } finally {
       setSubmitting(false)
+    }
+  }
+
+  async function handleDeleteProject() {
+    if (!project || deleting) return
+
+    const confirmed = window.confirm(
+      `Delete the project "${project.name}"?\n\nThis permanently removes the project and all of its tasks and history.`,
+    )
+    if (!confirmed) return
+
+    let deleteFiles = false
+    if (project.localPath) {
+      deleteFiles = window.confirm(
+        `Also delete the project folder and everything inside it from disk?\n\n${project.localPath}\n\nClick Cancel to keep the files on disk.`,
+      )
+    }
+
+    setDeleting(true)
+    try {
+      const res = await fetch(
+        `/api/projects/${projectId}${deleteFiles ? '?deleteFiles=true' : ''}`,
+        { method: 'DELETE' },
+      )
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to delete project')
+      }
+      router.push('/dashboard/projects')
+    } catch (err) {
+      setFetchError(err instanceof Error ? err.message : 'An unexpected error occurred')
+      setDeleting(false)
     }
   }
 
@@ -218,6 +251,19 @@ export default function ProjectDetailPage() {
           )}
         </div>
 
+        <div className="flex items-center gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={handleDeleteProject}
+          disabled={deleting}
+          aria-busy={deleting}
+          aria-label={`Delete project ${project.name}`}
+          className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+        >
+          <Trash2Icon aria-hidden="true" />
+          {deleting ? 'Deleting…' : 'Delete'}
+        </Button>
         <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
           <DialogTrigger
             render={
@@ -279,6 +325,7 @@ export default function ProjectDetailPage() {
             </form>
           </DialogContent>
         </Dialog>
+        </div>
       </div>
 
       {/* Tasks section */}
