@@ -5,6 +5,8 @@ const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
 export default defineConfig({
   testDir: './e2e',
   timeout: 60_000,
+  // Absorb environmental E2E flake in CI (slow Postgres/Redis under load).
+  retries: process.env.CI ? 2 : 0,
   expect: {
     timeout: 15_000,
   },

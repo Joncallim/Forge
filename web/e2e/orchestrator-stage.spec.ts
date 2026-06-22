@@ -68,7 +68,12 @@ test.describe('Orchestrator-stage beta smoke', () => {
     })
 
     await page.getByRole('button', { name: 'Approve generated plan' }).click()
-    await expect(page.getByText('Completed')).toBeVisible()
+    // Scope to the header status badge — the task-attempt history and agent-run
+    // sections also render "Completed" badges, so a bare getByText is ambiguous.
+    const taskStatusBadge = page
+      .getByRole('heading', { name: 'Draft smoke plan' })
+      .locator('xpath=following-sibling::*[1]')
+    await expect(taskStatusBadge).toHaveText('Completed')
     await expect(page.getByText('Mock architect plan for Draft smoke plan')).toBeVisible()
     await page.screenshot({
       path: testInfo.outputPath('04-task-completed.png'),
