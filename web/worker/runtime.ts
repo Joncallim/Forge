@@ -75,7 +75,7 @@ async function startWorkerOnce(
   source: WorkerSource,
   currentState: WorkerState,
 ): Promise<WorkerHandle> {
-  const [{ ApprovalQueue, TaskQueue }, { processApproval, processTask }] = await Promise.all([
+  const [{ AnswersQueue, ApprovalQueue, TaskQueue }, { processAnsweredQuestions, processApproval, processTask }] = await Promise.all([
     import('./queue'),
     import('./orchestrator'),
   ])
@@ -83,6 +83,7 @@ async function startWorkerOnce(
 
   const taskQueue = new TaskQueue()
   const approvalQueue = new ApprovalQueue()
+  const answersQueue = new AnswersQueue()
   const claimTimeoutSeconds = getClaimTimeoutSeconds()
   const maxAttempts = getPositiveIntegerEnv('FORGE_WORKER_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS)
   const stuckJobRecoveryMs =
@@ -101,26 +102,30 @@ async function startWorkerOnce(
     })
 
     try {
-      const [recoveredApprovals, recoveredTasks] = await Promise.all([
+      const [recoveredApprovals, recoveredAnswers, recoveredTasks] = await Promise.all([
         approvalQueue.recoverStuckJobs(stuckJobRecoveryMs),
+        answersQueue.recoverStuckJobs(stuckJobRecoveryMs),
         taskQueue.recoverStuckJobs(stuckJobRecoveryMs),
       ])
-      if (recoveredApprovals > 0 || recoveredTasks > 0) {
+      if (recoveredApprovals > 0 || recoveredAnswers > 0 || recoveredTasks > 0) {
         console.warn('[worker] Recovered stuck jobs', {
           approvals: recoveredApprovals,
+          answers: recoveredAnswers,
           tasks: recoveredTasks,
           workerId,
         })
       }
 
       while (!shuttingDown) {
-        const [promotedApprovals, promotedTasks] = await Promise.all([
+        const [promotedApprovals, promotedAnswers, promotedTasks] = await Promise.all([
           approvalQueue.promoteDueRetries(),
+          answersQueue.promoteDueRetries(),
           taskQueue.promoteDueRetries(),
         ])
-        if (promotedApprovals > 0 || promotedTasks > 0) {
+        if (promotedApprovals > 0 || promotedAnswers > 0 || promotedTasks > 0) {
           console.info('[worker] Promoted retry jobs', {
             approvals: promotedApprovals,
+            answers: promotedAnswers,
             tasks: promotedTasks,
             workerId,
           })
@@ -195,6 +200,83 @@ async function startWorkerOnce(
               } catch (err) {
                 console.error('[worker] Failed to acknowledge approval', {
                   taskId: claimedApproval.job.taskId,
+                  err,
+                  workerId,
+                })
+              }
+            }
+          }
+        }
+
+        let claimedAnswers = null as Awaited<ReturnType<InstanceType<typeof AnswersQueue>['claim']>>
+
+        try {
+          claimedAnswers = await answersQueue.claim(APPROVAL_CLAIM_TIMEOUT_SECONDS)
+        } catch (err) {
+          if (shuttingDown) break
+          console.error('[worker] Failed to claim answers job', err)
+        }
+
+        if (claimedAnswers !== null) {
+          let ackedAnswers = false
+          let answersAttemptId: string | null = null
+          try {
+            answersAttemptId = await startTaskAttempt({
+              attemptNumber: claimedAnswers.job.attempt,
+              jobPayload: claimedAnswers.job,
+              queueName: 'answers',
+              taskId: claimedAnswers.job.taskId,
+              workerId,
+            })
+            console.info('[worker] Processing answered questions', {
+              attempt: claimedAnswers.job.attempt,
+              taskId: claimedAnswers.job.taskId,
+              workerId,
+            })
+            await processAnsweredQuestions(claimedAnswers.job.taskId)
+            if (answersAttemptId) {
+              await finishTaskAttempt({ attemptId: answersAttemptId, status: 'completed' })
+            }
+            await answersQueue.ack(claimedAnswers.raw)
+            ackedAnswers = true
+          } catch (err) {
+            const message = errorMessage(err)
+            const finalAttempt = claimedAnswers.job.attempt >= maxAttempts
+            const nextRetryAt = finalAttempt
+              ? null
+              : new Date(Date.now() + backoffDelayMs(claimedAnswers.job.attempt))
+            if (answersAttemptId) {
+              await finishTaskAttempt({
+                attemptId: answersAttemptId,
+                errorMessage: message,
+                nextRetryAt,
+                status: finalAttempt ? 'dead_lettered' : 'failed',
+              })
+            }
+            if (finalAttempt) {
+              await answersQueue.deadLetter(claimedAnswers.raw, message)
+            } else {
+              await answersQueue.retry(
+                claimedAnswers.raw,
+                claimedAnswers.job,
+                backoffDelayMs(claimedAnswers.job.attempt),
+              )
+            }
+            ackedAnswers = true
+            console.error('[worker] Answered-questions re-plan failed', {
+              attempt: claimedAnswers.job.attempt,
+              finalAttempt,
+              taskId: claimedAnswers.job.taskId,
+              err,
+              workerId,
+            })
+          } finally {
+            if (!ackedAnswers) {
+              try {
+                await answersQueue.ack(claimedAnswers.raw)
+              } catch (err) {
+                console.error('[worker] Failed to acknowledge answers job', {
+                  taskId: claimedAnswers.job.taskId,
                   err,
                   workerId,
                 })
@@ -286,6 +368,7 @@ async function startWorkerOnce(
     } finally {
       taskQueue.disconnect()
       approvalQueue.disconnect()
+      answersQueue.disconnect()
       currentState.handle = null
       console.info('[worker] Stopped')
     }
@@ -303,6 +386,7 @@ async function startWorkerOnce(
       shuttingDown = true
       taskQueue.disconnect()
       approvalQueue.disconnect()
+      answersQueue.disconnect()
       await done.catch(() => {})
     },
   }

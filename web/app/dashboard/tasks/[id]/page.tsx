@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { MarkdownView } from '@/components/MarkdownView'
 import { useTaskStream } from '@/hooks/useTaskStream'
-import type { AgentRun, Artifact } from '@/hooks/useTaskStream'
+import type { AgentRun, Artifact, TaskQuestion } from '@/hooks/useTaskStream'
 
 interface Task {
   id: string
@@ -229,6 +229,131 @@ function ArtifactView({ artifact }: { artifact: Artifact }) {
   )
 }
 
+// ---------------------------------------------------------------------------
+// QuestionsPanel — answer inputs for open questions, plus resolved Q&A history
+// ---------------------------------------------------------------------------
+function QuestionsPanel({
+  taskId,
+  questions,
+  onAnswered,
+}: {
+  taskId: string
+  questions: TaskQuestion[]
+  onAnswered: () => void
+}) {
+  const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const [submitting, setSubmitting] = useState(false)
+  const [submitError, setSubmitError] = useState<string | null>(null)
+
+  const openQuestions = questions.filter((q) => q.status !== 'answered')
+  const answeredQuestions = questions.filter((q) => q.status === 'answered')
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault()
+    setSubmitError(null)
+
+    const answers = openQuestions
+      .map((q) => ({ id: q.id, answer: (drafts[q.id] ?? '').trim() }))
+      .filter((a) => a.answer.length > 0)
+
+    if (answers.length === 0) {
+      setSubmitError('Answer at least one question before submitting.')
+      return
+    }
+
+    setSubmitting(true)
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/questions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answers }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to submit answers')
+      }
+      setDrafts({})
+      onAnswered()
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <section aria-labelledby="questions-heading" className="mb-6">
+      <h2 id="questions-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
+        Open Questions
+      </h2>
+
+      {openQuestions.length > 0 && (
+        <form onSubmit={handleSubmit} className="mb-4 rounded-xl border border-border bg-card p-4">
+          <p className="mb-3 text-sm font-medium text-foreground">
+            The architect needs answers to these questions before the plan can be approved.
+          </p>
+
+          {submitError !== null && (
+            <p role="alert" aria-live="assertive" className="mb-3 text-sm text-destructive">
+              {submitError}
+            </p>
+          )}
+
+          <div className="flex flex-col gap-4">
+            {openQuestions.map((q) => (
+              <div key={q.id} className="flex flex-col gap-1.5">
+                <label htmlFor={`question-${q.id}`} className="text-sm font-medium text-foreground">
+                  {q.question}
+                </label>
+                <textarea
+                  id={`question-${q.id}`}
+                  rows={2}
+                  value={drafts[q.id] ?? ''}
+                  onChange={(e) => setDrafts((prev) => ({ ...prev, [q.id]: e.target.value }))}
+                  placeholder="Your answer…"
+                  className="resize-y rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                />
+              </div>
+            ))}
+          </div>
+
+          <Button
+            type="submit"
+            size="sm"
+            className="mt-4"
+            disabled={submitting}
+            aria-busy={submitting}
+          >
+            {submitting ? 'Submitting…' : 'Submit Answers'}
+          </Button>
+        </form>
+      )}
+
+      {answeredQuestions.length > 0 && (
+        <div className="rounded-xl border border-border">
+          <p className="px-4 py-2 text-xs font-medium text-muted-foreground uppercase tracking-wide border-b border-border">
+            Resolved Q&amp;A
+          </p>
+          <ul aria-label="Resolved questions and answers">
+            {answeredQuestions.map((q) => (
+              <li key={q.id} className="border-b border-border px-4 py-3 last:border-0">
+                <p className="text-sm font-medium text-foreground">{q.question}</p>
+                <p className="mt-1 text-sm text-muted-foreground">{q.answer}</p>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {openQuestions.length === 0 && answeredQuestions.length === 0 && (
+        <div className="rounded-xl border border-dashed border-border px-4 py-8 text-center">
+          <p className="text-sm text-muted-foreground">No open questions.</p>
+        </div>
+      )}
+    </section>
+  )
+}
+
 function TaskAttemptRow({ attempt }: { attempt: TaskAttempt }) {
   const variant: StatusVariant =
     attempt.status === 'completed'
@@ -285,6 +410,7 @@ export default function TaskDetailPage() {
   const [task, setTask] = useState<Task | null>(null)
   const [initialRuns, setInitialRuns] = useState<AgentRun[]>([])
   const [initialArtifacts, setInitialArtifacts] = useState<Artifact[]>([])
+  const [initialQuestions, setInitialQuestions] = useState<TaskQuestion[]>([])
   const [attempts, setAttempts] = useState<TaskAttempt[]>([])
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
@@ -297,11 +423,12 @@ export default function TaskDetailPage() {
   const [replanFeedback, setReplanFeedback] = useState('')
 
   // SSE stream
-  const { runs: streamRuns, artifacts: streamArtifacts, taskStatus, error: streamError } = useTaskStream(taskId)
+  const { runs: streamRuns, artifacts: streamArtifacts, taskStatus, error: streamError, questions: streamQuestions } = useTaskStream(taskId)
 
   // Merge initial data with live stream data
   const mergedRuns: AgentRun[] = streamRuns.length > 0 ? streamRuns : initialRuns
   const mergedArtifacts: Artifact[] = streamArtifacts.length > 0 ? streamArtifacts : initialArtifacts
+  const mergedQuestions: TaskQuestion[] = streamQuestions.length > 0 ? streamQuestions : initialQuestions
   const currentStatus = taskStatus ?? task?.status ?? null
 
   const loadTask = useCallback(async () => {
@@ -317,6 +444,7 @@ export default function TaskDetailPage() {
       setTask(data.task ?? null)
       setInitialRuns(data.runs ?? [])
       setInitialArtifacts(data.artifacts ?? [])
+      setInitialQuestions(data.questions ?? [])
       setAttempts(data.attempts ?? [])
     } catch (err) {
       setFetchError(err instanceof Error ? err.message : 'An unexpected error occurred')
@@ -513,6 +641,11 @@ export default function TaskDetailPage() {
           <MarkdownView content={task.prompt} />
         </div>
       </section>
+
+      {/* Open questions — answer before the plan can be approved */}
+      {mergedQuestions.length > 0 && (
+        <QuestionsPanel taskId={taskId} questions={mergedQuestions} onAnswered={loadTask} />
+      )}
 
       {/* Approve / Change plan / Restart actions */}
       {isAwaitingApproval && (

@@ -405,6 +405,40 @@ describe('POST /api/providers/discover-local — auth guard', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Suite 3.4d — Open questions: POST /api/tasks/:id/questions
+// ---------------------------------------------------------------------------
+
+describe('POST /api/tasks/:id/questions', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('returns 401 when not authenticated', async () => {
+    mockGetSession.mockResolvedValue(null)
+    const { POST } = await import('@/app/api/tasks/[id]/questions/route')
+    const req = authRequest('/api/tasks/task-1/questions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers: [{ id: 'q1', answer: 'yes' }] }),
+    })
+    const res = await POST(req as never, { params: Promise.resolve({ id: 'task-1' }) })
+    expect(res.status).toBe(401)
+  })
+
+  it('returns 409 when the task is not awaiting answers', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{ id: 'task-1', status: 'awaiting_approval' }]))
+    const { POST } = await import('@/app/api/tasks/[id]/questions/route')
+    const req = authRequest('/api/tasks/task-1/questions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers: [{ id: 'q1', answer: 'yes' }] }),
+    })
+    const res = await POST(req as never, { params: Promise.resolve({ id: 'task-1' }) })
+    expect(res.status).toBe(409)
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Suite 3.5 — Agent type sanitisation: PUT /api/agents/../../etc/passwd returns 400
 //
 // The route handler validates agent types against a strict allowlist

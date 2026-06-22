@@ -6,6 +6,7 @@ import { publishTaskEvent } from './events'
 export type TaskStatus =
   | 'pending'
   | 'running'
+  | 'awaiting_answers'
   | 'awaiting_approval'
   | 'approved'
   | 'rejected'

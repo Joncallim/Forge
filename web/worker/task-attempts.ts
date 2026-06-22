@@ -2,7 +2,7 @@ import { db } from '../db'
 import { taskAttempts } from '../db/schema'
 import { eq } from 'drizzle-orm'
 
-type QueueName = 'tasks' | 'approvals'
+type QueueName = 'tasks' | 'approvals' | 'answers'
 type AttemptStatus = 'running' | 'completed' | 'failed' | 'dead_lettered'
 
 export async function startTaskAttempt({
