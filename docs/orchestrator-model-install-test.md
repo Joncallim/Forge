@@ -1,8 +1,8 @@
-# Helper Model Install And Test Guide
+# Orchestrator Model Install And Test Guide
 
-This guide shows how to prove Forge can call an AI helper model.
+This guide shows how to prove Forge can call an AI Orchestrator model.
 
-In the current beta, the helper model is the Architect. It reads your task,
+In the current beta, the Orchestrator model is the Architect. It reads your task,
 writes an implementation plan, and waits for you to approve it. It does not edit
 code yet.
 
@@ -50,7 +50,7 @@ npm run doctor
 ```
 
 `npm run doctor` should report that required environment variables,
-PostgreSQL, and Redis are healthy.
+PostgreSQL, Redis, and GitHub CLI readiness are healthy or clearly warned.
 
 ## Sign In
 
@@ -67,7 +67,7 @@ account.
 Use `http://localhost:3000` for local passkeys. Do not use an IP address unless
 you also change the WebAuthn settings.
 
-## Configure A Helper Model
+## Configure An Orchestrator Model
 
 If the installer set up local Ollama, Forge already has a local provider.
 You can skip to the test task.
@@ -90,7 +90,7 @@ Dashboard -> Providers -> Add Provider
 Example for an OpenAI-compatible endpoint:
 
 ```text
-Display name: GPT Helper
+Display name: GPT Orchestrator
 Provider type: Custom
 Model ID: gpt-example
 Base URL: https://api.example.com/v1
@@ -122,15 +122,15 @@ Dashboard -> Projects
 Create a project:
 
 ```text
-Name: Helper Model Test
-GitHub Repo: owner/helper-model-test
+Name: Orchestrator Model Test
+GitHub Repo: owner/orchestrator-model-test
 Default Branch: main
 ```
 
 Open the project and create a task:
 
 ```text
-Title: Test helper model
+Title: Test Orchestrator model
 Prompt: Write a short implementation plan for adding a hello-world endpoint.
 ```
 
@@ -178,7 +178,7 @@ That confirms the web app, database, Redis queue, and worker are connected.
 
 ## Automated Smoke Test
 
-The automated smoke test uses the mock helper:
+The automated smoke test uses the mock Orchestrator:
 
 ```bash
 cd web
@@ -187,7 +187,7 @@ npm run e2e
 ```
 
 It creates a temporary session, applies a setup preset, creates a project and
-task, runs the mock helper, approves the plan, and confirms the task completes.
+task, runs the mock Orchestrator, approves the plan, and confirms the task completes.
 
 ## Troubleshooting
 

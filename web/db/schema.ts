@@ -187,6 +187,39 @@ export type Task = InferSelectModel<typeof tasks>
 export type NewTask = InferInsertModel<typeof tasks>
 
 // ---------------------------------------------------------------------------
+// taskAttempts
+// ---------------------------------------------------------------------------
+export const taskAttempts = pgTable(
+  'task_attempts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id')
+      .notNull()
+      .references(() => tasks.id, { onDelete: 'cascade' }),
+    queueName: text('queue_name').notNull(),
+    attemptNumber: integer('attempt_number').notNull().default(1),
+    // 'running'|'completed'|'failed'|'dead_lettered'
+    status: text('status').notNull().default('running'),
+    workerId: text('worker_id'),
+    jobPayload: jsonb('job_payload'),
+    errorMessage: text('error_message'),
+    claimedAt: timestamp('claimed_at', tsOpts).defaultNow().notNull(),
+    startedAt: timestamp('started_at', tsOpts),
+    completedAt: timestamp('completed_at', tsOpts),
+    nextRetryAt: timestamp('next_retry_at', tsOpts),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    index('task_attempts_task_id_created_at_idx').on(t.taskId, t.createdAt),
+    index('task_attempts_status_idx').on(t.status),
+    index('task_attempts_queue_name_idx').on(t.queueName),
+  ],
+)
+
+export type TaskAttempt = InferSelectModel<typeof taskAttempts>
+export type NewTaskAttempt = InferInsertModel<typeof taskAttempts>
+
+// ---------------------------------------------------------------------------
 // agentRuns
 // ---------------------------------------------------------------------------
 export const agentRuns = pgTable(

@@ -22,7 +22,7 @@ clear steps, visible progress, simple choices, and useful recovery messages.
 
 1. Welcome
    - Detect macOS/Linux, Docker, Homebrew or Linux package manager, Node,
-     PostgreSQL, Redis, and Ollama.
+     PostgreSQL, Redis, GitHub CLI, and Ollama.
    - Show what is already installed.
 2. Install mode
    - Native local services.
@@ -58,6 +58,9 @@ The shell scripts should remain available for automation and recovery.
 Before building the full TUI, keep improving the current shell scripts:
 
 - print clear step names,
+- print a preflight summary before machine changes,
+- support `--check` for non-mutating readiness checks,
+- detect GitHub CLI and authentication status,
 - explain long waits before they happen,
 - record install state,
 - make uninstall safe and reversible by default,

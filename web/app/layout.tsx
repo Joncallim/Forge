@@ -16,7 +16,8 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Forge",
-  description: "Autonomous coding factory control plane",
+  description:
+    "Self-hosted AI coding orchestration dashboard for Orchestrator-led software engineering workflows.",
 };
 
 export default function RootLayout({

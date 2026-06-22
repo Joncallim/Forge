@@ -1,6 +1,42 @@
 import '../lib/load-env'
 import { sql } from 'drizzle-orm'
 import { checkRuntimeEnv } from '../lib/env'
+import { execFile as execFileCallback } from 'node:child_process'
+import { promisify } from 'node:util'
+
+const execFile = promisify(execFileCallback)
+
+function truthy(value: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test(value ?? '')
+}
+
+async function checkGitHubCli(): Promise<boolean> {
+  const required = truthy(process.env.FORGE_REQUIRE_GITHUB_CLI)
+  let failed = false
+
+  try {
+    const version = await execFile('gh', ['--version'])
+    const firstLine = version.stdout.trim().split('\n')[0] || 'gh installed'
+    console.info(`ok GITHUB_CLI installed (${firstLine})`)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    const label = required ? 'failed' : 'warn'
+    console.info(`${label} GITHUB_CLI installed (${message})`)
+    return required
+  }
+
+  try {
+    await execFile('gh', ['auth', 'status'])
+    console.info('ok GITHUB_CLI authenticated')
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    const label = required ? 'failed' : 'warn'
+    console.info(`${label} GITHUB_CLI authenticated (${message})`)
+    failed = required
+  }
+
+  return failed
+}
 
 async function main(): Promise<void> {
   const envChecks = checkRuntimeEnv()
@@ -37,6 +73,10 @@ async function main(): Promise<void> {
       failed = true
       console.error('failed REDIS_URL connection')
       console.error(err instanceof Error ? err.message : err)
+    }
+
+    if (await checkGitHubCli()) {
+      failed = true
     }
   } finally {
     await closeDb().catch(() => {})

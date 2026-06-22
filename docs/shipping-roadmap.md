@@ -4,7 +4,7 @@ Last updated: 2026-06-21
 
 ## Release Target
 
-Ship Forge first as a helper-stage beta:
+Ship Forge first as an Orchestrator-stage beta:
 
 - The web app is the control plane for projects, providers, agents, tasks, run
   logs, artifacts, and approvals.
@@ -27,7 +27,7 @@ Ship Forge first as a helper-stage beta:
 - Release checks: `npm run lint`, `npx tsc --noEmit`, `npm test`, and
   `npm run build` from `web/`.
 - Product-design audit lens: used for repo-level UX risks. The screenshot-backed
-  helper-stage audit is enforced by Playwright and summarized in
+  Orchestrator-stage audit is enforced by Playwright and summarized in
   `docs/ux-audit.md`.
 
 ## Resolved In This Pass
@@ -48,7 +48,7 @@ Ship Forge first as a helper-stage beta:
 - Lint passes with current client-fetch dashboard architecture.
 - Stale test comments and unused symbols no longer produce false bug signals.
 - Web CI gates lint, typecheck, tests, production build, and the
-  helper-stage E2E smoke path.
+  Orchestrator-stage E2E smoke path.
 - Login supports password sign-in and optional passkeys. First-user
   registration can be password-only when `FORGE_PASSKEYS_ENABLED=0`.
 - The cross-platform installer supports macOS and Linux from one entrypoint. It
@@ -58,7 +58,7 @@ Ship Forge first as a helper-stage beta:
 - Specialist subagent planning is captured in
   `docs/specialist-subagents-roadmap.md`.
 
-## P0 Before Helper-Stage Beta
+## P0 Before Orchestrator-Stage Beta
 
 Status: complete as of 2026-06-19.
 
@@ -75,7 +75,7 @@ Status: complete as of 2026-06-19.
 
 ## Release 1 Assessment
 
-Release 1 is the helper-stage beta described above. The app is ready for a
+Release 1 is the Orchestrator-stage beta described above. The app is ready for a
 single-operator beta when the deployment checklist is satisfied and the release
 gates pass in the target environment.
 
@@ -107,20 +107,21 @@ Scalability:
 
 - The web process and worker process remain separated by Redis queues.
 - Duplicate queue delivery is guarded at the task-status layer.
-- Full retry, dead-letter, stuck-job recovery, and structured attempt history
-  remain P1 hardening work.
+- Worker retry, dead-letter, stuck-job recovery, and structured task attempt
+  history now have a first implementation. Broader observability and
+  tool-capable execution remain P1/P2 work.
 
 Sustainability:
 
 - The README, deployment checklist, migration guide, install/uninstall guide,
   worker process notes, and UX audit are the source of truth for the
-  helper-stage release.
+  Orchestrator-stage release.
 - Large dashboard page decomposition and server-owned initial dashboard data are
   intentionally left in P1.
 
 User experience:
 
-- The helper-stage path is documented and smoke-tested from setup through
+- The Orchestrator-stage path is documented and smoke-tested from setup through
   approval/completion.
 - Missing-project task submission returns a clear 404 instead of an
   internal error.
@@ -144,9 +145,9 @@ npm run build             # pass
 2. Move mutable dashboard data loading toward server-owned initial data plus
    focused client refreshes, then re-enable the React compiler
    `set-state-in-effect` lint rule.
-3. Improve worker recovery:
-   retries, dead-letter queues, stuck-job recovery, cancellation checks between
-   major steps, and structured task attempt history.
+3. Continue worker recovery hardening:
+   expand retry policy tests, add richer cancellation checks between major
+   steps, and use task attempt history for operator diagnostics.
 4. Add observability:
    structured logs, health/readiness endpoints for worker dependencies, and
    task/run correlation IDs.

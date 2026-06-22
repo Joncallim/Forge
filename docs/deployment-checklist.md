@@ -8,6 +8,7 @@ Forge needs these running:
 
 - PostgreSQL 16 or newer.
 - Redis 7 or newer.
+- GitHub CLI, for repository and pull request tooling.
 - The Next.js web process.
 - The Forge worker loop, embedded in the web process or run as a standalone
   worker process.
@@ -63,7 +64,10 @@ Worker-only:
 | Variable | Purpose |
 |---|---|
 | `FORGE_WORKER_CLAIM_TIMEOUT_SECONDS` | Redis claim timeout. Defaults to 5 seconds. |
+| `FORGE_WORKER_MAX_ATTEMPTS` | Number of times a task or approval job can retry before dead-lettering. Defaults to 3. |
+| `FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS` | Age after which processing-list jobs are considered stale and recovered. Defaults to 900 seconds. |
 | `FORGE_WORKER_MOCK_ARCHITECT` | Test-only mock mode. Do not enable for real runs. |
+| `FORGE_REQUIRE_GITHUB_CLI` | Set to `1` when `npm run doctor` should fail if `gh` is missing or unauthenticated. Defaults to warning only. |
 
 ## Database
 
@@ -88,6 +92,13 @@ npm test
 npm run build
 ```
 
+Confirm GitHub CLI readiness:
+
+```bash
+gh --version
+gh auth status
+```
+
 For the full browser smoke test:
 
 ```bash
@@ -95,8 +106,8 @@ npx playwright install chromium
 npm run e2e
 ```
 
-The E2E test uses a mock helper model. It proves the web app, database, Redis,
-worker, setup wizard, task flow, and approval flow are connected.
+The E2E test uses a mock Orchestrator model. It proves the web app, database,
+Redis, worker, setup wizard, task flow, and approval flow are connected.
 
 ## Runtime Health
 
@@ -105,6 +116,7 @@ worker, setup wizard, task flow, and approval flow are connected.
 - required environment variables,
 - PostgreSQL connectivity,
 - Redis connectivity,
+- GitHub CLI availability and authentication,
 - active provider reachability.
 
 Status meanings:

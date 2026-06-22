@@ -1,10 +1,10 @@
-# Forge Helper-Stage UX Audit
+# Forge Orchestrator-Stage UX Audit
 
 Last updated: 2026-06-21
 
 ## Scope
 
-This audit covers the helper-stage beta path:
+This audit covers the Orchestrator-stage beta path:
 
 1. first dashboard visit with no providers,
 2. account creation with password and optional passkey,
@@ -47,10 +47,10 @@ before running `npm run e2e`.
 - Project and task creation use direct, focused dialogs with required fields and
   clear submit states.
 - The task detail page exposes the current status, agent run, generated
-  artifact, and approval action in one place, which matches the helper-stage
+  artifact, and approval action in one place, which matches the Orchestrator-stage
   beta workflow.
 - The approval flow has a clear terminal state: after approval, the worker marks
-  the helper-stage task `completed` and the generated artifact remains visible.
+  the Orchestrator-stage task `completed` and the generated artifact remains visible.
 
 ## Risks To Recheck After Visual Artifact Review
 

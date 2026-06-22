@@ -1,17 +1,23 @@
 # Forge
 
-Forge is a local web app for running AI coding helpers from your browser.
+Forge is an open-source, self-hosted AI coding orchestration dashboard for
+running an AI Orchestrator, coding agents, GitHub workflows, and local or cloud
+LLM providers from your browser.
+
+It is built for developers exploring AI tools, autonomous coding agents,
+multi-agent software engineering, LLM orchestration, and self-hosted coding
+assistants.
 
 Think of it as a control panel:
 
 1. You create a project.
 2. You describe a task.
-3. Forge sends that task to a configured AI helper.
-4. The helper streams a Markdown plan shaped for the kind of software requested.
+3. Forge sends that task to a configured AI Orchestrator.
+4. The Orchestrator streams a Markdown plan shaped for the kind of software requested.
 5. You review and approve the result.
 
-Today, Forge handles the first helper stage: planning. It does not yet edit your
-repository, make commits, or open pull requests by itself.
+Today, Forge handles the first Orchestrator stage: planning. It does not yet
+edit your repository, make commits, or open pull requests by itself.
 
 ## What Runs On Your Computer
 
@@ -28,7 +34,7 @@ into its own process with `FORGE_EMBED_WORKER=0` when you want production-style
 process isolation.
 
 ```text
-Browser -> Forge web app -> Redis queue -> Forge worker -> AI helper -> review in browser
+Browser -> Forge web app -> Redis queue -> Forge worker -> AI Orchestrator -> review in browser
 ```
 
 ## Fastest Setup On macOS Or Linux
@@ -43,6 +49,7 @@ The installer:
 
 - installs missing local tools,
 - starts PostgreSQL and Redis,
+- installs or checks GitHub CLI for repository tooling,
 - creates `.env` with generated secrets,
 - prepares the database,
 - installs web dependencies,
@@ -56,6 +63,12 @@ To skip the local Ollama model and configure AI providers later:
 
 ```bash
 FORGE_SKIP_OLLAMA=1 bash scripts/install.sh
+```
+
+To inspect readiness without changing the machine:
+
+```bash
+bash scripts/install.sh --check
 ```
 
 ## Start Forge
@@ -89,8 +102,9 @@ The first account creates a password and, by default, a passkey. To skip
 passkeys for convenience, set `FORGE_PASSKEYS_ENABLED=0` in `.env` before
 creating the first account.
 
-Local projects can be tied to a folder from the project dialog. Use the folder
-selector when you want Forge to plan work for a specific games/apps workspace.
+Local projects can be created from the project dialog. Use the folder selector
+to choose a parent location; Forge creates a new project folder there and stores
+that path for future worker runs.
 
 ## Docker Setup For Services Only
 
@@ -182,7 +196,7 @@ For the migration workflow, see
 
 - [Install/uninstall reference](docs/install-uninstall.md)
 - [Database migrations](docs/database-migrations.md)
-- [Helper model test guide](docs/helper-model-install-test.md)
+- [Orchestrator model test guide](docs/orchestrator-model-install-test.md)
 - [Deployment checklist](docs/deployment-checklist.md)
 - [Worker process notes](docs/worker-process.md)
 - [Specialist subagents roadmap](docs/specialist-subagents-roadmap.md)
@@ -190,7 +204,7 @@ For the migration workflow, see
 
 ## Current Status
 
-Forge is in a helper-stage beta.
+Forge is in an Orchestrator-stage beta.
 
 Available today:
 
@@ -225,6 +239,6 @@ Not built yet:
 
 ![Forge task detail page awaiting approval](docs/assets/gui/desktop-03-task-awaiting-approval.png)
 
-### Completed Helper Task
+### Completed Orchestrator Task
 
 ![Forge task detail page after approval](docs/assets/gui/desktop-04-task-completed.png)

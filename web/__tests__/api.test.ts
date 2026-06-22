@@ -11,6 +11,9 @@
  *  - @/lib/providers/registry — listActiveProviders
  */
 
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 import { vi, describe, it, expect, beforeEach } from 'vitest'
 
 // ---------------------------------------------------------------------------
@@ -195,6 +198,46 @@ describe('GET /api/filesystem/directories — folder selector', () => {
     const body = await res.json()
     expect(body.path).toBe('/tmp')
     expect(Array.isArray(body.directories)).toBe(true)
+  })
+})
+
+describe('POST /api/filesystem/directories — folder creation', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('creates a child folder for authenticated users', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const parentPath = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-folder-test-'))
+
+    try {
+      const { POST } = await import('@/app/api/filesystem/directories/route')
+      const res = await POST(nextAuthRequest('/api/filesystem/directories', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parentPath, name: 'new-app' }),
+      }) as never)
+
+      expect(res.status).toBe(201)
+      const body = await res.json()
+      const createdPath = path.join(parentPath, 'new-app')
+      expect(body.path).toBe(createdPath)
+      const stat = await fs.stat(createdPath)
+      expect(stat.isDirectory()).toBe(true)
+    } finally {
+      await fs.rm(parentPath, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects folder names with path traversal', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+
+    const { POST } = await import('@/app/api/filesystem/directories/route')
+    const res = await POST(nextAuthRequest('/api/filesystem/directories', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ parentPath: '/tmp', name: '../bad' }),
+    }) as never)
+
+    expect(res.status).toBe(400)
   })
 })
 

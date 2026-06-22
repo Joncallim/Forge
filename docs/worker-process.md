@@ -26,11 +26,11 @@ The web app already enqueues tasks:
 2. The API pushes `{ taskId }` to Redis list `forge:tasks`.
 3. The task remains `pending` until a worker consumes it.
 
-An initial worker helper exists. It consumes queued tasks, runs the architect
+An initial Orchestrator-stage worker exists. It consumes queued tasks, runs the architect
 planning stage through the configured provider, streams Markdown plan output,
 stores the plan as an artifact, publishes live task events, and moves the task
 to `awaiting_approval`. It also consumes approval jobs from `forge:approvals`
-and marks approved helper-stage tasks `completed`.
+and marks approved Orchestrator-stage tasks `completed`.
 
 Claude Code can still be used manually for development, debugging, or emergency
 operation, but it is no longer the only path for a queued task to leave
@@ -40,7 +40,7 @@ operation, but it is no longer the only path for a queued task to leave
 
 For local single-user installs, the worker starts inside the Next.js server
 unless `FORGE_EMBED_WORKER=0` is set. This makes `npm run dev` enough to run the
-dashboard and helper loop together.
+dashboard and Orchestrator loop together.
 
 For split deployments, the same worker runtime can run as a long-lived Node.js
 process separate from Next.js. The current implementation handles the architect
@@ -147,6 +147,18 @@ forge:approvals -> forge:approvals:processing
 On success, remove the job from the processing list. On failure, record the
 failure on the task and remove or retry based on retry policy.
 
+The worker also uses retry sorted sets and dead-letter lists:
+
+```text
+forge:tasks:retry
+forge:tasks:dead
+forge:approvals:retry
+forge:approvals:dead
+```
+
+Each claimed job records a claim timestamp so startup recovery can move stale
+processing jobs back to the live queue after a crash.
+
 A later version can move to Redis Streams for stronger delivery semantics,
 consumer groups, and replayable job history. A list-based worker is sufficient
 for the first implementation if task state in PostgreSQL remains authoritative.
@@ -192,19 +204,26 @@ Minimum viable behavior:
 - Leave enough structured logs to diagnose the failed step.
 - Do not retry GitHub write operations blindly if they may have succeeded.
 
-Recommended next step:
+Implemented hardening:
 
-- Add a retry count to the job payload or a task attempt table.
-- Use exponential backoff for transient provider and network failures.
-- Move permanently failed jobs to a dead-letter queue such as
+- Attempt counts are carried in the job payload.
+- Each claim is recorded in `task_attempts`.
+- Retryable task and approval failures move to retry sorted sets with
+  exponential backoff.
+- Permanently failed jobs move to dead-letter queues such as
   `forge:tasks:dead`.
+- Worker startup recovers stale processing-list jobs after
+  `FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS`.
 
-## Implemented Helper Scope
+## Implemented Orchestrator Scope
 
 The current worker implementation is intentionally narrow:
 
 - Claims jobs from `forge:tasks` into `forge:tasks:processing`.
 - Claims approvals from `forge:approvals` into `forge:approvals:processing`.
+- Recovers stale jobs left in processing queues after worker crashes.
+- Retries failed task and approval jobs up to `FORGE_WORKER_MAX_ATTEMPTS`.
+- Persists task attempt history in `task_attempts`.
 - Loads the task, project, architect agent config, and provider config.
 - Marks the task `running`.
 - Creates an architect `agent_runs` row.
@@ -214,7 +233,7 @@ The current worker implementation is intentionally narrow:
   detail page.
 - Marks the task `awaiting_approval` on success or `failed` on unrecoverable
   error.
-- Marks approved helper-stage tasks `completed`.
+- Marks approved Orchestrator-stage tasks `completed`.
 
 It does not yet execute repository edits, specialist implementation agents, test
 runs, branch creation, commits, or PR creation.
@@ -229,6 +248,7 @@ web/worker/queue.ts
 web/worker/orchestrator.ts
 web/worker/task-state.ts
 web/worker/events.ts
+web/worker/task-attempts.ts
 ```
 
 Suggested package scripts:
