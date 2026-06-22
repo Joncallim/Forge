@@ -154,6 +154,37 @@ all_project_paths() {
   { project_paths; db_project_paths; } | grep -v '^[[:space:]]*$' | awk '!seen[$0]++'
 }
 
+# Guard against deleting paths that are clearly not a project folder Forge
+# created. Project rows can hold arbitrary paths (set via the project update API
+# or edited by hand), so a row pointing at $HOME, the repo checkout, or a
+# top-level directory must never be passed to rm -rf. Mirrors isSafeToDelete in
+# web/app/api/projects/[id]/route.ts: must be absolute, not the filesystem root,
+# not $HOME, not the repo root, and at least two segments deep.
+is_safe_project_path() {
+  local raw="$1" p depth
+  [ -n "$raw" ] || return 1
+  case "$raw" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  p="$raw"
+  while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+  [ "$p" = "/" ] && return 1
+  [ -n "${HOME:-}" ] && [ "$p" = "$HOME" ] && return 1
+  [ "$p" = "$REPO_ROOT" ] && return 1
+  depth="$(printf '%s\n' "${p#/}" | awk -F/ '{c=0; for (i=1;i<=NF;i++) if ($i != "") c++; print c}')"
+  [ "${depth:-0}" -ge 2 ] || return 1
+  return 0
+}
+
+# Project folders safe to delete, after applying the guard above.
+safe_project_paths() {
+  local dir
+  while IFS= read -r dir; do
+    is_safe_project_path "$dir" && printf '%s\n' "$dir"
+  done < <(all_project_paths)
+}
+
 resolve_remove_projects() {
   [ -n "$REMOVE_PROJECTS" ] && return 0
 
@@ -162,7 +193,7 @@ resolve_remove_projects() {
     return 0
   fi
 
-  if [ -z "$(all_project_paths)" ]; then
+  if [ -z "$(safe_project_paths)" ]; then
     REMOVE_PROJECTS=0
     return 0
   fi
@@ -171,7 +202,7 @@ resolve_remove_projects() {
   info "Forge created these local project folders:"
   while IFS= read -r project_dir; do
     [ -n "$project_dir" ] && info "  - $project_dir"
-  done < <(all_project_paths)
+  done < <(safe_project_paths)
   printf "    Delete all of these project folders and their files? [y/N] "
   read -r answer || answer=""
   case "$answer" in
@@ -185,6 +216,14 @@ remove_project_files() {
   [ -n "$(all_project_paths)" ] || return 0
 
   step "Removing local project folders"
+
+  # Surface anything we refuse to touch so an operator can clean it up by hand.
+  while IFS= read -r project_dir; do
+    [ -n "$project_dir" ] || continue
+    is_safe_project_path "$project_dir" && continue
+    warn "Skipped unsafe project path (not deleted): $project_dir"
+  done < <(all_project_paths)
+
   while IFS= read -r project_dir; do
     [ -n "$project_dir" ] || continue
     if [ ! -e "$project_dir" ]; then
@@ -196,7 +235,7 @@ remove_project_files() {
     else
       rm -rf "$project_dir" && info "Removed $project_dir" || warn "Could not remove $project_dir"
     fi
-  done < <(all_project_paths)
+  done < <(safe_project_paths)
 
   if [ "$DRY_RUN" != "1" ]; then
     rm -f "$PROJECT_PATHS_FILE" 2>/dev/null || true
