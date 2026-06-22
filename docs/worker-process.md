@@ -76,12 +76,6 @@ npm run worker
 Set `FORGE_EMBED_WORKER=0` for the web process when running a standalone worker
 to avoid duplicate local consumers.
 
-Container command:
-
-```bash
-docker compose --profile worker up worker
-```
-
 ## Worker Responsibilities
 
 Current responsibilities:
@@ -270,9 +264,6 @@ proven.
 When run from `web/`, the worker loads both the repository-root `.env` and
 `web/.env*` files before importing database, Redis, or provider modules. This
 keeps the host workflow aligned with the root `.env.example`.
-
-Docker Compose injects container-local `DATABASE_URL` and `REDIS_URL` values so
-services use `postgres` and `redis` hostnames instead of `localhost`.
 
 ## Relationship To Claude Code
 

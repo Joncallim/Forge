@@ -56,8 +56,8 @@ The installer:
 - optionally installs Ollama and a small local AI model,
 - records what it installed so uninstall avoids tools you already had.
 
-The first run can be slow because Homebrew, npm, Docker images, or AI models may
-need to download files.
+The first run can be slow because Homebrew, npm, or AI models may need to
+download files.
 
 To skip the local Ollama model and configure AI providers later:
 
@@ -106,31 +106,6 @@ Local projects can be created from the project dialog. Use the folder selector
 to choose a parent location; Forge creates a new project folder there and stores
 that path for future worker runs.
 
-## Docker Setup For Services Only
-
-Use this if you only want Docker to start PostgreSQL and Redis.
-
-From the repository root:
-
-```bash
-bash scripts/setup.sh
-```
-
-This runs in a single pass: it creates `.env` if needed (local Docker defaults
-work as-is), starts PostgreSQL and Redis, installs web dependencies, applies
-database migrations, and seeds the agents. When it finishes, start Forge:
-
-```bash
-cd web
-npm run dev
-```
-
-You can also ask the main installer to use Docker for PostgreSQL and Redis:
-
-```bash
-bash scripts/install.sh --service-mode docker
-```
-
 ## Uninstall
 
 The install and uninstall scripts are conservative:
@@ -140,10 +115,10 @@ The install and uninstall scripts are conservative:
   and records only packages it added in `.forge/install-manifest`.
 - `scripts/uninstall.sh` removes Forge build artifacts and recorded Forge-only
   packages. Packages that existed before Forge are left alone.
-- Keeping data preserves `.env`, PostgreSQL/Redis data, Docker volumes, and the
-  install manifest so a future reinstall can pick up your settings.
-- Removing data wipes Forge-local settings, database/Redis data, Docker
-  volumes, recorded Ollama models, and install state.
+- Keeping data preserves `.env`, PostgreSQL/Redis data, and the install manifest
+  so a future reinstall can pick up your settings.
+- Removing data wipes Forge-local settings, the application database, Redis data,
+  recorded Ollama models, and install state.
 
 To remove Forge from macOS or Linux:
 
@@ -152,9 +127,9 @@ bash scripts/uninstall.sh
 ```
 
 The script asks whether to keep settings and credentials. Keeping them preserves
-`.env`, database data, Redis data, Docker volumes, and the install record for a
-future reinstall. It also asks whether to delete the local project folders Forge
-created (tracked in `.forge/project-paths`); answer no to keep your project files.
+`.env`, database data, Redis data, and the install record for a future reinstall.
+It also asks whether to delete the local project folders Forge created; answer no
+to keep your project files.
 
 Preview first:
 

@@ -10,23 +10,22 @@ clear steps, visible progress, simple choices, and useful recovery messages.
 
 - Explain each install step in plain English.
 - Show progress for slow steps such as Homebrew or Linux package installs,
-  `npm install`, Docker image pulls, database migrations, and Ollama model
-  downloads.
+  `npm install`, database migrations, and Ollama model downloads.
 - Let the user choose between local AI, cloud AI, or configuring providers
   later.
-- Let the user choose whether to use native services or Docker services.
+- Install PostgreSQL and Redis as native local services, so Docker is not
+  required.
 - Keep secrets out of terminal history.
 - Write a clear install summary and an uninstall record.
 
 ## Proposed Screens
 
 1. Welcome
-   - Detect macOS/Linux, Docker, Homebrew or Linux package manager, Node,
+   - Detect macOS/Linux, Homebrew or Linux package manager, Node,
      PostgreSQL, Redis, GitHub CLI, and Ollama.
    - Show what is already installed.
 2. Install mode
-   - Native local services.
-   - Docker local services.
+   - Native local services (default).
    - Advanced/manual.
 3. AI setup
    - Local Ollama model.

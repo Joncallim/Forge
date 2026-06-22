@@ -50,24 +50,23 @@ bookkeeping. Prefer `npm run db:generate`.
 | `0000_green_black_queen.sql` | Creates the first Forge tables. |
 | `0001_acoustic_triathlon.sql` | Adds encrypted provider API-key storage. |
 | `0002_add_password_hash.sql` | Adds password-hash storage for password sign-in. |
+| `0003_add_project_local_path.sql` | Adds the local-folder path for projects. |
+| `0004_mean_deadpool.sql` | Adds worker task-attempt history. |
+| `0005_add_task_questions.sql` | Adds the open-questions table for the approval Q&A loop. |
+| `0006_add_app_settings.sql` | Adds the key/value settings store (used for the GitHub token). |
 
 ## Common Problems
 
 If `db:migrate` cannot connect, check that PostgreSQL is running and that
 `DATABASE_URL` points to the right place.
 
-For local Docker:
-
-```bash
-bash scripts/setup.sh
-cd web
-npm run db:migrate
-```
-
-For the cross-platform installer:
+If PostgreSQL is not installed yet, run the installer first; it sets up local
+services and prepares the database:
 
 ```bash
 bash scripts/install.sh
+cd web
+npm run db:migrate
 ```
 
 That installer runs migrations for you.
