@@ -307,6 +307,19 @@ export type AgentConfig = InferSelectModel<typeof agentConfigs>
 export type NewAgentConfig = InferInsertModel<typeof agentConfigs>
 
 // ---------------------------------------------------------------------------
+// appSettings — generic key/value store for app-wide settings and secrets.
+// Used for the GitHub Personal Access Token (stored encrypted via lib/crypto.ts).
+// ---------------------------------------------------------------------------
+export const appSettings = pgTable('app_settings', {
+  key: text('key').primaryKey(),
+  value: text('value').notNull(),
+  updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+})
+
+export type AppSetting = InferSelectModel<typeof appSettings>
+export type NewAppSetting = InferInsertModel<typeof appSettings>
+
+// ---------------------------------------------------------------------------
 // taskQuestions
 // ---------------------------------------------------------------------------
 export const taskQuestions = pgTable(

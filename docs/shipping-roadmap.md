@@ -162,12 +162,15 @@ not already authenticated** (detected via `gh auth status`, the same probe used 
 `web/app/api/health/route.ts`). When the CLI is already logged in, Forge uses that
 token and never prompts.
 
-- **Phase 1 — Personal Access Token (PAT).** When the CLI is not authenticated, the
-  web UI prompts for a PAT, validates it against `GET https://api.github.com/user`,
-  and stores it encrypted via `web/lib/crypto.ts` (the same mechanism as provider
-  keys). Token resolution order for repo operations: stored PAT → `gh` CLI token →
-  legacy per-project `githubTokenEnvVar`. Tracked in
-  [issue #12](https://github.com/Joncallim/Forge/issues/12).
+- **Phase 1 — Personal Access Token (PAT). _(implemented)_** When the CLI is not
+  authenticated, the Settings page prompts for a PAT, validates it against
+  `GET https://api.github.com/user`, and stores it encrypted via `web/lib/crypto.ts`
+  (the same mechanism as provider keys), in the `app_settings` table. The connection
+  status comes from `GET /api/github/status`; the PAT is set/cleared via
+  `POST`/`DELETE /api/github/token`. Token resolution order for repo operations
+  (`resolveGitHubToken` in `web/lib/github.ts`): stored PAT → `gh` CLI token →
+  legacy per-project `githubTokenEnvVar`. The PAT form only appears when the `gh`
+  CLI is not already authenticated.
 - **Phase 2 — GitHub OAuth (device flow).** Register a GitHub OAuth app and run the
   device-code flow in the web UI so the user authorizes Forge without creating a PAT
   by hand; store the resulting token encrypted. This is the preferred end state once

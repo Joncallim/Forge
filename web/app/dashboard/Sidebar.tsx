@@ -7,6 +7,7 @@ import {
   ListTodoIcon,
   ServerIcon,
   BotIcon,
+  SettingsIcon,
   LogOutIcon,
   HammerIcon,
 } from 'lucide-react'
@@ -19,6 +20,7 @@ const NAV_ITEMS = [
   { href: '/dashboard/tasks', label: 'Tasks', icon: ListTodoIcon },
   { href: '/dashboard/providers', label: 'Providers', icon: ServerIcon },
   { href: '/dashboard/agents', label: 'Agents', icon: BotIcon },
+  { href: '/dashboard/settings', label: 'Settings', icon: SettingsIcon },
 ] as const
 
 interface NavLinkProps {
