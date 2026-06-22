@@ -22,7 +22,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { ROLE_RECOMMENDATIONS, type RoleRecommendation } from '@/lib/recommendations'
+import { PRESETS, ROLE_RECOMMENDATIONS, type RoleRecommendation } from '@/lib/recommendations'
+import { applyPreset } from '@/lib/applyPreset'
 import {
   PROVIDER_TYPE_LABELS,
   PROVIDER_TYPE_OPTIONS,
@@ -533,6 +534,8 @@ export default function AgentsPage() {
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
   const [editingAgent, setEditingAgent] = useState<AgentConfig | null>(null)
+  const [applyingPreset, setApplyingPreset] = useState<string | null>(null)
+  const [presetError, setPresetError] = useState<string | null>(null)
 
   // ---------------------------------------------------------------------------
   // Load data
@@ -598,6 +601,27 @@ export default function AgentsPage() {
     },
     [providers],
   )
+
+  // ---------------------------------------------------------------------------
+  // Apply recommended configuration (preset) — configures providers + agents
+  // ---------------------------------------------------------------------------
+
+  async function handleApplyPreset(presetId: string) {
+    const preset = PRESETS.find((p) => p.id === presetId)
+    if (!preset) return
+
+    setApplyingPreset(presetId)
+    setPresetError(null)
+
+    try {
+      await applyPreset(preset)
+      await loadData()
+    } catch (err) {
+      setPresetError(err instanceof Error ? err.message : 'Failed to apply preset')
+    } finally {
+      setApplyingPreset(null)
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Render
@@ -695,6 +719,55 @@ export default function AgentsPage() {
             </tbody>
           </table>
         </div>
+      )}
+
+      {/* Recommended configurations — apply a vetted provider + agent setup */}
+      {!loading && fetchError === null && (
+        <section aria-labelledby="presets-heading" className="mt-10">
+          <h2 id="presets-heading" className="mb-1 text-lg font-semibold text-foreground">
+            Recommended configurations
+          </h2>
+          <p className="mb-4 text-sm text-muted-foreground">
+            Apply a vetted setup to configure providers and assign a model to every agent
+            in one step.
+          </p>
+          {presetError !== null && (
+            <div
+              role="alert"
+              className="mb-4 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+            >
+              {presetError}
+            </div>
+          )}
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            {PRESETS.map((preset) => (
+              <div
+                key={preset.id}
+                className="flex flex-col gap-3 rounded-xl border border-border bg-card p-4"
+              >
+                <div className="flex flex-col gap-1">
+                  <span className="font-medium text-foreground">{preset.label}</span>
+                  <p className="text-xs text-muted-foreground leading-relaxed">
+                    {preset.description}
+                  </p>
+                </div>
+                <p className="text-xs font-medium text-foreground">
+                  {preset.estimatedMonthlyCost}
+                </p>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={applyingPreset !== null}
+                  aria-busy={applyingPreset === preset.id}
+                  onClick={() => handleApplyPreset(preset.id)}
+                  aria-label={`Apply preset ${preset.label}`}
+                >
+                  {applyingPreset === preset.id ? 'Applying…' : 'Apply'}
+                </Button>
+              </div>
+            ))}
+          </div>
+        </section>
       )}
 
       {/* Edit drawer */}

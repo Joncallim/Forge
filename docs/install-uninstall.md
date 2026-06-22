@@ -101,8 +101,11 @@ bash scripts/uninstall.sh --remove-data
 ```
 
 This removes local build artifacts, recorded Forge-only packages, `.env`,
-Docker volumes, recorded PostgreSQL database objects, recorded Ollama models,
-and Forge's local install state.
+Docker volumes, recorded Ollama models, and Forge's local install state. It also
+**drops the Forge application database** named in `DATABASE_URL` (default
+`forge`), which clears saved logins, projects, and task history — so a fresh
+install starts from a clean login. The drop runs whenever PostgreSQL is reachable,
+even if the database existed before Forge installed.
 
 By default it does **not** delete the local project folders Forge created. When
 run interactively it asks whether to delete them, or you can opt in directly:
@@ -111,9 +114,10 @@ run interactively it asks whether to delete them, or you can opt in directly:
 bash scripts/uninstall.sh --remove-data --remove-projects
 ```
 
-This deletes every folder listed in `.forge/project-paths` (the local projects
-Forge created) along with their files. Use `--keep-projects` to skip the prompt
-and always keep them.
+This deletes every local project folder Forge created, along with their files.
+Folders are discovered both from `.forge/project-paths` and from the `projects`
+table in the database (so projects created through the web UI are removed too).
+Use `--keep-projects` to skip the prompt and always keep them.
 
 It still does not remove Homebrew, Linux package managers, Docker
 Desktop/Engine, packages that existed before Forge, or recorded packages that

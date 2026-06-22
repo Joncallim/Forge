@@ -7,6 +7,7 @@ import { providerConfigs } from '@/db/schema'
 import type { ProviderConfig } from '@/db/schema'
 import { eq, asc } from 'drizzle-orm'
 import { requiresProviderBaseUrl } from './types'
+import { PROVIDER_CATALOG } from './catalog'
 import { decryptSecret } from '@/lib/crypto'
 
 // ---------------------------------------------------------------------------
@@ -79,9 +80,14 @@ function buildProvider(config: ProviderConfig): ProviderFactory {
       return createGoogleGenerativeAI({ apiKey })
 
     case 'openrouter':
+    case 'xai':
+    case 'deepseek':
+    case 'moonshot':
+    case 'zhipu':
+      // OpenAI-compatible cloud providers with a known, fixed base URL.
       return createOpenAI({
         apiKey,
-        baseURL: 'https://openrouter.ai/api/v1',
+        baseURL: config.baseUrl ?? PROVIDER_CATALOG[config.providerType].defaultBaseUrl,
       })
 
     case 'litellm':
@@ -94,13 +100,20 @@ function buildProvider(config: ProviderConfig): ProviderFactory {
 
       return createOpenAI({
         apiKey,
-        baseURL: config.baseUrl ?? undefined,
+        baseURL: config.baseUrl ?? PROVIDER_CATALOG[config.providerType].defaultBaseUrl,
       })
 
     case 'ollama':
       return createOpenAI({
         apiKey: apiKey ?? 'ollama',
-        baseURL: normalizeOllamaBaseUrl(config.baseUrl),
+        baseURL: normalizeOllamaBaseUrl(config.baseUrl ?? PROVIDER_CATALOG.ollama.defaultBaseUrl ?? null),
+      })
+
+    case 'lmstudio':
+      // OpenAI-compatible local server (LM Studio). No real key required.
+      return createOpenAI({
+        apiKey: apiKey ?? 'lm-studio',
+        baseURL: config.baseUrl ?? PROVIDER_CATALOG.lmstudio.defaultBaseUrl,
       })
 
     default:

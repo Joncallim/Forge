@@ -289,11 +289,12 @@ export default function TaskDetailPage() {
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
 
-  // Approve / reject state
+  // Approve / change-plan / restart state
   const [actionLoading, setActionLoading] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
-  const [showRejectForm, setShowRejectForm] = useState(false)
+  const [actionMode, setActionMode] = useState<'none' | 'restart' | 'replan'>('none')
   const [rejectReason, setRejectReason] = useState('')
+  const [replanFeedback, setReplanFeedback] = useState('')
 
   // SSE stream
   const { runs: streamRuns, artifacts: streamArtifacts, taskStatus, error: streamError } = useTaskStream(taskId)
@@ -365,10 +366,39 @@ export default function TaskDetailPage() {
       })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
-        throw new Error(body.error ?? 'Failed to reject task')
+        throw new Error(body.error ?? 'Failed to restart task')
       }
-      setShowRejectForm(false)
+      setActionMode('none')
       setRejectReason('')
+      await loadTask()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
+  async function handleReplan(e: React.FormEvent) {
+    e.preventDefault()
+    const feedback = replanFeedback.trim()
+    if (!feedback) {
+      setActionError('Describe what to change before requesting a revised plan.')
+      return
+    }
+    setActionLoading(true)
+    setActionError(null)
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/replan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ feedback }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to request a revised plan')
+      }
+      setActionMode('none')
+      setReplanFeedback('')
       await loadTask()
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
@@ -474,11 +504,22 @@ export default function TaskDetailPage() {
         )}
       </div>
 
-      {/* Approve / Reject actions */}
+      {/* Task prompt — always shown, so the originating instruction is visible */}
+      <section aria-labelledby="prompt-heading" className="mb-6">
+        <h2 id="prompt-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
+          Prompt
+        </h2>
+        <div className="rounded-xl border border-border bg-muted/30 px-4 py-3">
+          <MarkdownView content={task.prompt} />
+        </div>
+      </section>
+
+      {/* Approve / Change plan / Restart actions */}
       {isAwaitingApproval && (
         <div className="mb-6 rounded-xl border border-border bg-card p-4">
           <p className="mb-3 text-sm font-medium text-foreground">
-            Review the generated plan before closing this Orchestrator stage.
+            Review the generated plan. You can approve it, ask for a revised plan, or
+            restart the task.
           </p>
 
           {actionError !== null && (
@@ -487,7 +528,7 @@ export default function TaskDetailPage() {
             </p>
           )}
 
-          {!showRejectForm ? (
+          {actionMode === 'none' && (
             <div className="flex flex-wrap gap-2">
               <Button
                 size="sm"
@@ -499,16 +540,68 @@ export default function TaskDetailPage() {
                 {actionLoading ? 'Approving…' : 'Approve'}
               </Button>
               <Button
+                variant="outline"
+                size="sm"
+                onClick={() => { setActionMode('replan'); setActionError(null) }}
+                disabled={actionLoading}
+                aria-label="Change the plan"
+              >
+                Change plan
+              </Button>
+              <Button
                 variant="destructive"
                 size="sm"
-                onClick={() => setShowRejectForm(true)}
+                onClick={() => { setActionMode('restart'); setActionError(null) }}
                 disabled={actionLoading}
-                aria-label="Reject task"
+                aria-label="Restart task"
               >
-                Reject
+                Restart (reject)
               </Button>
             </div>
-          ) : (
+          )}
+
+          {actionMode === 'replan' && (
+            <form onSubmit={handleReplan} className="flex flex-col gap-3">
+              <div className="flex flex-col gap-1.5">
+                <label htmlFor="replan-feedback" className="text-sm font-medium text-foreground">
+                  What should change?
+                </label>
+                <textarea
+                  id="replan-feedback"
+                  rows={3}
+                  value={replanFeedback}
+                  onChange={(e) => setReplanFeedback(e.target.value)}
+                  placeholder="Describe the adjustments the orchestrator should make to the plan…"
+                  className="resize-y rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Your notes are appended to the task prompt and the orchestrator re-plans
+                  with the full history.
+                </p>
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  size="sm"
+                  type="submit"
+                  disabled={actionLoading}
+                  aria-busy={actionLoading}
+                >
+                  {actionLoading ? 'Requesting…' : 'Request revised plan'}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  type="button"
+                  onClick={() => { setActionMode('none'); setReplanFeedback('') }}
+                  disabled={actionLoading}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </form>
+          )}
+
+          {actionMode === 'restart' && (
             <form onSubmit={handleReject} className="flex flex-col gap-3">
               <div className="flex flex-col gap-1.5">
                 <label htmlFor="reject-reason" className="text-sm font-medium text-foreground">
@@ -519,7 +612,7 @@ export default function TaskDetailPage() {
                   rows={3}
                   value={rejectReason}
                   onChange={(e) => setRejectReason(e.target.value)}
-                  placeholder="Explain why the task is being rejected…"
+                  placeholder="Explain why the task is being restarted…"
                   className="resize-y rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
                 />
               </div>
@@ -531,13 +624,13 @@ export default function TaskDetailPage() {
                   disabled={actionLoading}
                   aria-busy={actionLoading}
                 >
-                  {actionLoading ? 'Rejecting…' : 'Confirm Reject'}
+                  {actionLoading ? 'Restarting…' : 'Confirm restart'}
                 </Button>
                 <Button
                   variant="outline"
                   size="sm"
                   type="button"
-                  onClick={() => { setShowRejectForm(false); setRejectReason('') }}
+                  onClick={() => { setActionMode('none'); setRejectReason('') }}
                   disabled={actionLoading}
                 >
                   Cancel

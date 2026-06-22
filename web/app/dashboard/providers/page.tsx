@@ -8,7 +8,6 @@ import {
   RefreshCwIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
 import {
   Dialog,
   DialogContent,
@@ -25,13 +24,17 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { PRESETS } from '@/lib/recommendations'
-import { applyPreset } from '@/lib/applyPreset'
 import {
+  PROVIDER_TYPE_LABELS,
   PROVIDER_TYPE_OPTIONS,
-  requiresProviderBaseUrl,
   type ProviderType,
 } from '@/lib/providers/types'
+import {
+  PROVIDER_CATALOG,
+  PROVIDER_CATEGORY_LABELS,
+  providerCategory,
+  type ProviderCategory,
+} from '@/lib/providers/catalog'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -64,24 +67,10 @@ type HealthMap = Record<string, ProviderHealth | 'loading' | 'error'>
 // Constants
 // ---------------------------------------------------------------------------
 
-const MODEL_PLACEHOLDERS: Record<ProviderType, string> = {
-  anthropic:  'claude-opus-4-8',
-  openai:     'gpt-4.1',
-  google:     'gemini-2.0-flash',
-  openrouter: 'moonshotai/kimi-k2',
-  ollama:     'devstral-small:24b',
-  litellm:    'litellm/claude-opus-4-8',
-  custom:     'gpt-5.5 or provider/model',
-}
-
-const PROVIDER_TYPE_COLORS: Record<ProviderType, string> = {
-  anthropic:  'bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-300',
-  openai:     'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300',
-  google:     'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300',
-  openrouter: 'bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-300',
-  ollama:     'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300',
-  litellm:    'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300',
-  custom:     'bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-300',
+const CATEGORY_COLORS: Record<ProviderCategory, string> = {
+  local:  'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300',
+  remote: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300',
+  cloud:  'bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-300',
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +83,6 @@ type ProviderFormState = {
   modelId: string
   baseUrl: string
   apiKey: string
-  apiKeyEnvVar: string
   isLocal: boolean
 }
 
@@ -104,7 +92,6 @@ const DEFAULT_FORM: ProviderFormState = {
   modelId: '',
   baseUrl: '',
   apiKey: '',
-  apiKeyEnvVar: '',
   isLocal: false,
 }
 
@@ -115,7 +102,6 @@ function formFromProvider(p: ProviderConfig): ProviderFormState {
     modelId: p.modelId,
     baseUrl: p.baseUrl ?? '',
     apiKey: '', // never prefilled — the stored secret is never sent to the client
-    apiKeyEnvVar: p.apiKeyEnvVar ?? '',
     isLocal: p.isLocal,
   }
 }
@@ -190,8 +176,11 @@ interface ProviderFormProps {
 }
 
 function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel, keyAlreadySet = false }: ProviderFormProps) {
-  const needsBaseUrl = requiresProviderBaseUrl(form.providerType)
-  const needsApiKey = !form.isLocal
+  const entry = PROVIDER_CATALOG[form.providerType]
+  const needsApiKey = entry.requiresApiKey
+  const showBaseUrl = entry.requiresBaseUrl || entry.category === 'local'
+  const baseUrlRequired = entry.requiresBaseUrl
+  const category = providerCategory(form.providerType, form.isLocal)
 
   function set<K extends keyof ProviderFormState>(key: K, value: ProviderFormState[K]) {
     onChange({ ...form, [key]: value })
@@ -200,8 +189,14 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
   function handleProviderTypeChange(value: string | null) {
     if (!value) return
     const pt = value as ProviderType
-    const isLocal = pt === 'ollama'
-    onChange({ ...form, providerType: pt, isLocal })
+    const next = PROVIDER_CATALOG[pt]
+    onChange({
+      ...form,
+      providerType: pt,
+      isLocal: next.category === 'local',
+      // Suggest the known base URL for the newly chosen provider.
+      baseUrl: next.defaultBaseUrl ?? '',
+    })
   }
 
   return (
@@ -226,7 +221,7 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
       {/* Provider type */}
       <div className="flex flex-col gap-1.5">
         <label htmlFor="pf-providerType" className="text-sm font-medium text-foreground">
-          Provider type <span aria-hidden="true" className="text-destructive">*</span>
+          Provider <span aria-hidden="true" className="text-destructive">*</span>
         </label>
         <Select value={form.providerType} onValueChange={handleProviderTypeChange}>
           <SelectTrigger id="pf-providerType" className="w-full" aria-required="true">
@@ -242,6 +237,10 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
             </SelectGroup>
           </SelectContent>
         </Select>
+        <p className="text-xs text-muted-foreground">
+          {PROVIDER_CATEGORY_LABELS[category]}
+          {entry.helpText ? ` — ${entry.helpText}` : ''}
+        </p>
       </div>
 
       {/* Model ID */}
@@ -255,27 +254,30 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
           required
           value={form.modelId}
           onChange={(e) => set('modelId', e.target.value)}
-          placeholder={MODEL_PLACEHOLDERS[form.providerType]}
+          placeholder={entry.modelPlaceholder}
           className="rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
           aria-required="true"
         />
       </div>
 
-      {/* Base URL — shown for provider types that require an OpenAI-compatible endpoint */}
-      {needsBaseUrl && (
+      {/* Base URL — for self-hosted endpoints (required) and local runtimes (optional override) */}
+      {showBaseUrl && (
         <div className="flex flex-col gap-1.5">
           <label htmlFor="pf-baseUrl" className="text-sm font-medium text-foreground">
-            Base URL <span aria-hidden="true" className="text-destructive">*</span>
+            Base URL{' '}
+            {baseUrlRequired
+              ? <span aria-hidden="true" className="text-destructive">*</span>
+              : <span className="text-muted-foreground font-normal">(optional)</span>}
           </label>
           <input
             id="pf-baseUrl"
             type="url"
-            required
+            required={baseUrlRequired}
             value={form.baseUrl}
             onChange={(e) => set('baseUrl', e.target.value)}
-            placeholder={form.providerType === 'ollama' ? 'http://localhost:11434' : 'https://api.example.com/v1'}
+            placeholder={entry.defaultBaseUrl ?? 'https://api.example.com/v1'}
             className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-            aria-required="true"
+            aria-required={baseUrlRequired}
           />
         </div>
       )}
@@ -296,49 +298,23 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
             className="rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
           />
           <p className="text-xs text-muted-foreground">
-            Stored encrypted in the database. You only enter this once a provider needs it.
+            Stored encrypted in the database.
+            {entry.apiKeyUrl && (
+              <>
+                {' '}
+                <a
+                  href={entry.apiKeyUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-primary underline-offset-2 hover:underline"
+                >
+                  Get a {PROVIDER_TYPE_LABELS[form.providerType]} API key →
+                </a>
+              </>
+            )}
           </p>
         </div>
       )}
-
-      {/* Advanced: read the key from an environment variable instead */}
-      {needsApiKey && (
-        <details className="rounded-lg border border-border px-3 py-2">
-          <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
-            Advanced: use an environment variable instead
-          </summary>
-          <div className="mt-2 flex flex-col gap-1.5">
-            <label htmlFor="pf-apiKeyEnvVar" className="text-sm font-medium text-foreground">
-              API key environment variable
-            </label>
-            <input
-              id="pf-apiKeyEnvVar"
-              type="text"
-              value={form.apiKeyEnvVar}
-              onChange={(e) => set('apiKeyEnvVar', e.target.value)}
-              placeholder="ANTHROPIC_API_KEY"
-              className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-            />
-            <p className="text-xs text-muted-foreground">
-              Fallback used only when no key is entered above. The stored key takes precedence.
-            </p>
-          </div>
-        </details>
-      )}
-
-      {/* Is local toggle */}
-      <div className="flex items-center gap-3">
-        <input
-          id="pf-isLocal"
-          type="checkbox"
-          checked={form.isLocal}
-          onChange={(e) => set('isLocal', e.target.checked)}
-          className="size-4 rounded border-input accent-primary"
-        />
-        <label htmlFor="pf-isLocal" className="text-sm font-medium text-foreground">
-          Local provider (no API key required)
-        </label>
-      </div>
 
       {error !== null && (
         <p role="alert" aria-live="assertive" className="text-sm text-destructive">
@@ -414,8 +390,8 @@ export default function ProvidersPage() {
   const [fetchError, setFetchError] = useState<string | null>(null)
   const [healthMap, setHealthMap] = useState<HealthMap>({})
   const [deletingId, setDeletingId] = useState<string | null>(null)
-  const [applyingPreset, setApplyingPreset] = useState<string | null>(null)
-  const [presetError, setPresetError] = useState<string | null>(null)
+  const [discovering, setDiscovering] = useState(false)
+  const [discoverMsg, setDiscoverMsg] = useState<string | null>(null)
 
   // Add dialog
   const [addOpen, setAddOpen] = useState(false)
@@ -495,15 +471,15 @@ export default function ProvidersPage() {
     e.preventDefault()
     setAddError(null)
 
+    const entry = PROVIDER_CATALOG[addForm.providerType]
     const displayName = addForm.displayName.trim()
     const modelId = addForm.modelId.trim()
-    const baseUrl = addForm.baseUrl.trim() || null
-    const apiKeyEnvVar = addForm.isLocal ? null : addForm.apiKeyEnvVar.trim() || null
-    const apiKey = addForm.isLocal ? null : addForm.apiKey.trim() || null
+    const baseUrl = addForm.baseUrl.trim() || entry.defaultBaseUrl || null
+    const apiKey = entry.requiresApiKey ? addForm.apiKey.trim() || null : null
 
     if (!displayName) { setAddError('Display name is required.'); return }
     if (!modelId) { setAddError('Model ID is required.'); return }
-    if (requiresProviderBaseUrl(addForm.providerType) && !baseUrl) {
+    if (entry.requiresBaseUrl && !baseUrl) {
       setAddError('Base URL is required for this provider type.')
       return
     }
@@ -518,7 +494,6 @@ export default function ProvidersPage() {
           providerType: addForm.providerType,
           modelId,
           baseUrl,
-          apiKeyEnvVar,
           apiKey,
           isLocal: addForm.isLocal,
         }),
@@ -551,16 +526,16 @@ export default function ProvidersPage() {
     if (!editProvider) return
     setEditError(null)
 
+    const entry = PROVIDER_CATALOG[editForm.providerType]
     const displayName = editForm.displayName.trim()
     const modelId = editForm.modelId.trim()
-    const baseUrl = editForm.baseUrl.trim() || null
-    const apiKeyEnvVar = editForm.isLocal ? null : editForm.apiKeyEnvVar.trim() || null
+    const baseUrl = editForm.baseUrl.trim() || entry.defaultBaseUrl || null
     // Only send apiKey when the user typed one; a blank field keeps the stored key.
-    const typedApiKey = editForm.isLocal ? '' : editForm.apiKey.trim()
+    const typedApiKey = entry.requiresApiKey ? editForm.apiKey.trim() : ''
 
     if (!displayName) { setEditError('Display name is required.'); return }
     if (!modelId) { setEditError('Model ID is required.'); return }
-    if (requiresProviderBaseUrl(editForm.providerType) && !baseUrl) {
+    if (entry.requiresBaseUrl && !baseUrl) {
       setEditError('Base URL is required for this provider type.')
       return
     }
@@ -575,7 +550,6 @@ export default function ProvidersPage() {
           providerType: editForm.providerType,
           modelId,
           baseUrl,
-          apiKeyEnvVar,
           ...(typedApiKey !== '' ? { apiKey: typedApiKey } : {}),
           isLocal: editForm.isLocal,
         }),
@@ -615,23 +589,38 @@ export default function ProvidersPage() {
   }
 
   // ---------------------------------------------------------------------------
-  // Apply preset
+  // Detect local models (Ollama / LM Studio)
   // ---------------------------------------------------------------------------
 
-  async function handleApplyPreset(presetId: string) {
-    const preset = PRESETS.find((p) => p.id === presetId)
-    if (!preset) return
-
-    setApplyingPreset(presetId)
-    setPresetError(null)
-
+  async function handleDiscoverLocal() {
+    setDiscovering(true)
+    setDiscoverMsg(null)
     try {
-      await applyPreset(preset)
-      await loadProviders()
+      const res = await fetch('/api/providers/discover-local', { method: 'POST' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error((body as { error?: string }).error ?? 'Local detection failed')
+      }
+      const data = await res.json() as {
+        found: number
+        added: { providerType: string; modelId: string }[]
+        ollamaReachable: boolean
+        lmstudioReachable: boolean
+      }
+      if (data.added.length > 0) {
+        setDiscoverMsg(`Added ${data.added.length} local model${data.added.length === 1 ? '' : 's'}.`)
+        await loadProviders()
+      } else if (data.found > 0) {
+        setDiscoverMsg('Local models found are already configured.')
+      } else if (!data.ollamaReachable && !data.lmstudioReachable) {
+        setDiscoverMsg('No running Ollama or LM Studio detected on localhost.')
+      } else {
+        setDiscoverMsg('No local models found.')
+      }
     } catch (err) {
-      setPresetError(err instanceof Error ? err.message : 'Failed to apply preset')
+      setDiscoverMsg(err instanceof Error ? err.message : 'Local detection failed')
     } finally {
-      setApplyingPreset(null)
+      setDiscovering(false)
     }
   }
 
@@ -644,6 +633,17 @@ export default function ProvidersPage() {
       {/* Page header */}
       <div className="mb-6 flex items-center justify-between gap-4">
         <h1 className="text-xl font-semibold text-foreground">Providers</h1>
+        <div className="flex items-center gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={handleDiscoverLocal}
+          disabled={discovering}
+          aria-busy={discovering}
+          aria-label="Detect local models from Ollama and LM Studio"
+        >
+          {discovering ? 'Detecting…' : 'Detect local models'}
+        </Button>
         <Dialog open={addOpen} onOpenChange={setAddOpen}>
           <DialogTrigger
             render={
@@ -667,7 +667,15 @@ export default function ProvidersPage() {
             />
           </DialogContent>
         </Dialog>
+        </div>
       </div>
+
+      {/* Discovery feedback */}
+      {discoverMsg !== null && (
+        <p role="status" aria-live="polite" className="mb-4 text-sm text-muted-foreground">
+          {discoverMsg}
+        </p>
+      )}
 
       {/* Loading */}
       {loading && (
@@ -696,7 +704,8 @@ export default function ProvidersPage() {
       {!loading && fetchError === null && providers.length === 0 && (
         <div className="mb-8 flex flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border py-12 text-center">
           <p className="text-sm text-muted-foreground">
-            No providers configured yet. Add one or apply a preset below.
+            No providers configured yet. Add one above, or apply a recommended
+            configuration from the Agents page.
           </p>
         </div>
       )}
@@ -708,9 +717,9 @@ export default function ProvidersPage() {
             <thead>
               <tr className="border-b border-border bg-muted/40">
                 <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Display name</th>
-                <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Type</th>
+                <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Provider</th>
                 <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Model ID</th>
-                <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Source</th>
+                <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Category</th>
                 <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Health</th>
                 <th scope="col" className="px-4 py-3 text-right font-medium text-muted-foreground">
                   <span className="sr-only">Actions</span>
@@ -724,10 +733,8 @@ export default function ProvidersPage() {
                     {provider.displayName}
                   </td>
                   <td className="px-4 py-3">
-                    <span
-                      className={`inline-flex h-5 items-center rounded-full px-2 text-xs font-medium ${PROVIDER_TYPE_COLORS[provider.providerType]}`}
-                    >
-                      {provider.providerType}
+                    <span className="text-sm text-foreground">
+                      {PROVIDER_TYPE_LABELS[provider.providerType] ?? provider.providerType}
                     </span>
                   </td>
                   <td className="px-4 py-3">
@@ -739,9 +746,16 @@ export default function ProvidersPage() {
                     </span>
                   </td>
                   <td className="px-4 py-3">
-                    <Badge variant="outline">
-                      {provider.isLocal ? 'Local' : 'Cloud'}
-                    </Badge>
+                    {(() => {
+                      const category = providerCategory(provider.providerType, provider.isLocal)
+                      return (
+                        <span
+                          className={`inline-flex h-5 items-center rounded-full px-2 text-xs font-medium ${CATEGORY_COLORS[category]}`}
+                        >
+                          {PROVIDER_CATEGORY_LABELS[category]}
+                        </span>
+                      )
+                    })()}
                   </td>
                   <td className="px-4 py-3">
                     <HealthDot health={healthMap[provider.id]} />
@@ -812,48 +826,6 @@ export default function ProvidersPage() {
         </div>
       )}
 
-      {/* Recommended configurations */}
-      <section aria-labelledby="presets-heading">
-        <h2 id="presets-heading" className="mb-4 text-lg font-semibold text-foreground">
-          Recommended configurations
-        </h2>
-        {presetError !== null && (
-          <div
-            role="alert"
-            className="mb-4 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive"
-          >
-            {presetError}
-          </div>
-        )}
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          {PRESETS.map((preset) => (
-            <div
-              key={preset.id}
-              className="flex flex-col gap-3 rounded-xl border border-border bg-card p-4"
-            >
-              <div className="flex flex-col gap-1">
-                <span className="font-medium text-foreground">{preset.label}</span>
-                <p className="text-xs text-muted-foreground leading-relaxed">
-                  {preset.description}
-                </p>
-              </div>
-              <p className="text-xs font-medium text-foreground">
-                {preset.estimatedMonthlyCost}
-              </p>
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={applyingPreset !== null}
-                aria-busy={applyingPreset === preset.id}
-                onClick={() => handleApplyPreset(preset.id)}
-                aria-label={`Apply preset ${preset.label}`}
-              >
-                {applyingPreset === preset.id ? 'Applying…' : 'Apply'}
-              </Button>
-            </div>
-          ))}
-        </div>
-      </section>
     </div>
   )
 }

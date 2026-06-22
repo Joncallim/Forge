@@ -114,6 +114,77 @@ project_paths() {
   fi
 }
 
+# Read a key from the first .env file that defines it. The .env files still
+# exist at this point because remove_env_files runs near the end of uninstall.
+read_env_var() {
+  local key="$1" file value
+  for file in "$REPO_ROOT/.env" "$REPO_ROOT/.env.local" "$REPO_ROOT/web/.env" "$REPO_ROOT/web/.env.local"; do
+    [ -f "$file" ] || continue
+    value="$(grep -E "^${key}=" "$file" 2>/dev/null | tail -n1)" || true
+    if [ -n "$value" ]; then
+      value="${value#"${key}="}"
+      value="${value%\"}"; value="${value#\"}"
+      value="${value%\'}"; value="${value#\'}"
+      printf '%s' "$value"
+      return 0
+    fi
+  done
+}
+
+app_database_url() {
+  read_env_var DATABASE_URL
+}
+
+# Local project folders recorded in the database. This catches projects created
+# through the web UI, which the on-disk registry (.forge/project-paths) does not
+# always record. Best-effort: silent when psql or the database is unavailable.
+db_project_paths() {
+  local url
+  url="$(app_database_url)"
+  [ -n "$url" ] || return 0
+  command -v psql >/dev/null 2>&1 || return 0
+  psql "$url" -tAc \
+    "SELECT local_path FROM projects WHERE local_path IS NOT NULL AND local_path <> ''" \
+    2>/dev/null | grep -v '^[[:space:]]*$' || true
+}
+
+# Union of folders from the on-disk registry and the database, de-duplicated
+# while preserving order.
+all_project_paths() {
+  { project_paths; db_project_paths; } | grep -v '^[[:space:]]*$' | awk '!seen[$0]++'
+}
+
+# Guard against deleting paths that are clearly not a project folder Forge
+# created. Project rows can hold arbitrary paths (set via the project update API
+# or edited by hand), so a row pointing at $HOME, the repo checkout, or a
+# top-level directory must never be passed to rm -rf. Mirrors isSafeToDelete in
+# web/app/api/projects/[id]/route.ts: must be absolute, not the filesystem root,
+# not $HOME, not the repo root, and at least two segments deep.
+is_safe_project_path() {
+  local raw="$1" p depth
+  [ -n "$raw" ] || return 1
+  case "$raw" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  p="$raw"
+  while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+  [ "$p" = "/" ] && return 1
+  [ -n "${HOME:-}" ] && [ "$p" = "$HOME" ] && return 1
+  [ "$p" = "$REPO_ROOT" ] && return 1
+  depth="$(printf '%s\n' "${p#/}" | awk -F/ '{c=0; for (i=1;i<=NF;i++) if ($i != "") c++; print c}')"
+  [ "${depth:-0}" -ge 2 ] || return 1
+  return 0
+}
+
+# Project folders safe to delete, after applying the guard above.
+safe_project_paths() {
+  local dir
+  while IFS= read -r dir; do
+    is_safe_project_path "$dir" && printf '%s\n' "$dir"
+  done < <(all_project_paths)
+}
+
 resolve_remove_projects() {
   [ -n "$REMOVE_PROJECTS" ] && return 0
 
@@ -122,7 +193,7 @@ resolve_remove_projects() {
     return 0
   fi
 
-  if [ -z "$(project_paths)" ]; then
+  if [ -z "$(safe_project_paths)" ]; then
     REMOVE_PROJECTS=0
     return 0
   fi
@@ -131,7 +202,7 @@ resolve_remove_projects() {
   info "Forge created these local project folders:"
   while IFS= read -r project_dir; do
     [ -n "$project_dir" ] && info "  - $project_dir"
-  done < <(project_paths)
+  done < <(safe_project_paths)
   printf "    Delete all of these project folders and their files? [y/N] "
   read -r answer || answer=""
   case "$answer" in
@@ -142,9 +213,17 @@ resolve_remove_projects() {
 
 remove_project_files() {
   [ "$REMOVE_PROJECTS" = "1" ] || return 0
-  [ -n "$(project_paths)" ] || return 0
+  [ -n "$(all_project_paths)" ] || return 0
 
   step "Removing local project folders"
+
+  # Surface anything we refuse to touch so an operator can clean it up by hand.
+  while IFS= read -r project_dir; do
+    [ -n "$project_dir" ] || continue
+    is_safe_project_path "$project_dir" && continue
+    warn "Skipped unsafe project path (not deleted): $project_dir"
+  done < <(all_project_paths)
+
   while IFS= read -r project_dir; do
     [ -n "$project_dir" ] || continue
     if [ ! -e "$project_dir" ]; then
@@ -156,7 +235,7 @@ remove_project_files() {
     else
       rm -rf "$project_dir" && info "Removed $project_dir" || warn "Could not remove $project_dir"
     fi
-  done < <(project_paths)
+  done < <(safe_project_paths)
 
   if [ "$DRY_RUN" != "1" ]; then
     rm -f "$PROJECT_PATHS_FILE" 2>/dev/null || true
@@ -314,6 +393,41 @@ drop_recorded_postgres_data() {
       fi
     fi
   fi
+}
+
+# Drop the Forge application database named in DATABASE_URL (default: forge),
+# even when the installer did not record creating it (e.g. a reused database).
+# This is what actually removes saved logins, projects, and task history on
+# --remove-data. The recorded role/database cleanup still runs afterwards via
+# drop_recorded_postgres_data, which uses the local maintenance connection.
+drop_app_database() {
+  [ "$KEEP_DATA" = "0" ] || return 0
+
+  local url dbname admin_url
+  url="$(app_database_url)"
+  if [ -n "$url" ]; then
+    dbname="${url##*/}"
+    dbname="${dbname%%\?*}"
+    admin_url="${url%/*}/postgres"
+    if [ -n "$dbname" ]; then
+      step "Removing the Forge application database"
+      if [ "$DRY_RUN" = "1" ]; then
+        info "[dry-run] Drop database $dbname (removes saved logins, projects, and history)"
+      elif ! command -v psql >/dev/null 2>&1; then
+        info "psql is not installed, so database $dbname was left in place. Saved logins remain."
+      elif ! psql "$admin_url" -tAc 'SELECT 1' >/dev/null 2>&1; then
+        info "PostgreSQL is not reachable, so the database was left in place. Saved logins and projects remain."
+      elif psql "$admin_url" -c "DROP DATABASE IF EXISTS \"$dbname\" WITH (FORCE);" >/dev/null 2>&1; then
+        info "Dropped database $dbname (removed saved logins, projects, and task history)."
+      else
+        info "Database $dbname could not be dropped now, so it was left in place."
+      fi
+    fi
+  fi
+
+  # Recorded role/database cleanup via the local maintenance connection.
+  # Idempotent with the URL-based drop above.
+  drop_recorded_postgres_data
 }
 
 stop_docker_services() {
@@ -644,7 +758,7 @@ fi
 
 remove_project_files
 remove_build_artifacts
-drop_recorded_postgres_data
+drop_app_database
 stop_docker_services
 remove_recorded_ollama_models
 remove_recorded_packages
