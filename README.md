@@ -108,8 +108,7 @@ that path for future worker runs.
 
 ## Docker Setup For Services Only
 
-Use this if you only want Docker to start PostgreSQL and Redis and prefer to run
-the rest manually.
+Use this if you only want Docker to start PostgreSQL and Redis.
 
 From the repository root:
 
@@ -117,19 +116,9 @@ From the repository root:
 bash scripts/setup.sh
 ```
 
-If the script creates `.env` and exits, review the file, then run the script
-again.
-
-Then prepare the web app:
-
-```bash
-cd web
-npm install
-npm run db:migrate
-npm run db:seed-agents
-```
-
-Start Forge:
+This runs in a single pass: it creates `.env` if needed (local Docker defaults
+work as-is), starts PostgreSQL and Redis, installs web dependencies, applies
+database migrations, and seeds the agents. When it finishes, start Forge:
 
 ```bash
 cd web
@@ -164,7 +153,8 @@ bash scripts/uninstall.sh
 
 The script asks whether to keep settings and credentials. Keeping them preserves
 `.env`, database data, Redis data, Docker volumes, and the install record for a
-future reinstall.
+future reinstall. It also asks whether to delete the local project folders Forge
+created (tracked in `.forge/project-paths`); answer no to keep your project files.
 
 Preview first:
 
@@ -176,6 +166,12 @@ Full local wipe:
 
 ```bash
 bash scripts/uninstall.sh --remove-data
+```
+
+Also delete every local project folder Forge created:
+
+```bash
+bash scripts/uninstall.sh --remove-data --remove-projects
 ```
 
 Detailed install/uninstall reference: [docs/install-uninstall.md](docs/install-uninstall.md).

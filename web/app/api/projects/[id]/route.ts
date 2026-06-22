@@ -1,10 +1,14 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 import { z } from 'zod'
 import { db } from '@/db'
 import { projects } from '@/db/schema'
 import { eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
+import { unregisterProjectPath } from '@/lib/project-registry'
 
 // ---------------------------------------------------------------------------
 // Validation schema (all fields optional for PUT)
@@ -118,8 +122,25 @@ export async function PUT(
 }
 
 // ---------------------------------------------------------------------------
-// DELETE /api/projects/:id  (soft-delete by setting archivedAt)
+// DELETE /api/projects/:id
+//
+// Removes the project (cascading to its tasks/runs/artifacts). With
+// ?deleteFiles=true it also removes the local project folder from disk.
 // ---------------------------------------------------------------------------
+
+/**
+ * Guard against deleting paths that are clearly not a project folder we created
+ * (filesystem root, the user's home directory, very shallow paths).
+ */
+function isSafeToDelete(target: string): boolean {
+  const resolved = path.resolve(target)
+  const root = path.parse(resolved).root
+  if (resolved === root) return false
+  if (resolved === path.resolve(os.homedir())) return false
+  // Require at least two path segments below root (e.g. /Users/alex/proj).
+  const relativeDepth = resolved.slice(root.length).split(path.sep).filter(Boolean).length
+  return relativeDepth >= 2
+}
 
 export async function DELETE(
   request: NextRequest,
@@ -132,6 +153,7 @@ export async function DELETE(
     }
 
     const { id } = await params
+    const deleteFiles = request.nextUrl.searchParams.get('deleteFiles') === 'true'
 
     const [existing] = await db
       .select()
@@ -143,13 +165,34 @@ export async function DELETE(
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
     }
 
-    await db
-      .update(projects)
-      .set({ archivedAt: new Date(), updatedAt: new Date() })
-      .where(eq(projects.id, id))
+    let filesDeleted = false
+    if (deleteFiles && existing.localPath) {
+      if (!isSafeToDelete(existing.localPath)) {
+        return NextResponse.json(
+          { error: 'Refusing to delete files: the project path looks unsafe to remove.' },
+          { status: 400 },
+        )
+      }
+      try {
+        await fs.rm(existing.localPath, { recursive: true, force: true })
+        filesDeleted = true
+      } catch (err) {
+        console.error('[DELETE /api/projects/:id] Failed to remove project files', err)
+        return NextResponse.json(
+          { error: `Could not delete project files: ${err instanceof Error ? err.message : 'unknown error'}` },
+          { status: 500 },
+        )
+      }
+    }
 
-    console.info('[DELETE /api/projects/:id] Archived project', { id })
-    return NextResponse.json({ ok: true })
+    if (existing.localPath) {
+      await unregisterProjectPath(existing.localPath)
+    }
+
+    await db.delete(projects).where(eq(projects.id, id))
+
+    console.info('[DELETE /api/projects/:id] Deleted project', { id, filesDeleted })
+    return NextResponse.json({ ok: true, filesDeleted })
   } catch (err) {
     console.error('[DELETE /api/projects/:id] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

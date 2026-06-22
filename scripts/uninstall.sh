@@ -18,10 +18,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INSTALL_STATE_DIR="$REPO_ROOT/.forge"
 INSTALL_MANIFEST="$INSTALL_STATE_DIR/install-manifest"
+PROJECT_PATHS_FILE="$INSTALL_STATE_DIR/project-paths"
 
 YES=0
 DRY_RUN=0
 KEEP_DATA=""
+REMOVE_PROJECTS=""
 OS_NAME="${FORGE_OS_OVERRIDE:-$(uname -s)}"
 PACKAGE_MANAGER="${FORGE_PACKAGE_MANAGER_OVERRIDE:-}"
 SUDO=()
@@ -37,12 +39,15 @@ usage() {
 Forge uninstall helper for macOS and Linux.
 
 Options:
-  --keep-data     Keep .env, database data, Redis data, and install state.
-  --remove-data   Remove .env, Forge database/role when recorded, Docker volumes,
-                  Redis data, recorded local models, and install state.
-  --yes           Do not prompt. Defaults to --keep-data unless --remove-data is set.
-  --dry-run       Print what would happen without changing anything.
-  --help          Show this help.
+  --keep-data       Keep .env, database data, Redis data, and install state.
+  --remove-data     Remove .env, Forge database/role when recorded, Docker volumes,
+                    Redis data, recorded local models, and install state.
+  --remove-projects Delete every local project folder Forge created (listed in
+                    .forge/project-paths). This deletes your project files.
+  --keep-projects   Never delete local project folders (the default).
+  --yes             Do not prompt. Defaults to --keep-data and --keep-projects.
+  --dry-run         Print what would happen without changing anything.
+  --help            Show this help.
 
 The script removes packages only when Forge's install manifest says the
 installer added them. Packages that were already present are left alone.
@@ -60,6 +65,12 @@ while [ "$#" -gt 0 ]; do
       ;;
     --remove-data)
       KEEP_DATA=0
+      ;;
+    --remove-projects)
+      REMOVE_PROJECTS=1
+      ;;
+    --keep-projects)
+      REMOVE_PROJECTS=0
       ;;
     --yes|-y)
       YES=1
@@ -96,6 +107,61 @@ if [ -z "$KEEP_DATA" ]; then
     esac
   fi
 fi
+
+project_paths() {
+  if [ -f "$PROJECT_PATHS_FILE" ]; then
+    grep -v '^[[:space:]]*$' "$PROJECT_PATHS_FILE" 2>/dev/null || true
+  fi
+}
+
+resolve_remove_projects() {
+  [ -n "$REMOVE_PROJECTS" ] && return 0
+
+  if [ "$YES" = "1" ] || [ ! -t 0 ]; then
+    REMOVE_PROJECTS=0
+    return 0
+  fi
+
+  if [ -z "$(project_paths)" ]; then
+    REMOVE_PROJECTS=0
+    return 0
+  fi
+
+  bold "Forge local projects"
+  info "Forge created these local project folders:"
+  while IFS= read -r project_dir; do
+    [ -n "$project_dir" ] && info "  - $project_dir"
+  done < <(project_paths)
+  printf "    Delete all of these project folders and their files? [y/N] "
+  read -r answer || answer=""
+  case "$answer" in
+    y|Y|yes|YES|Yes) REMOVE_PROJECTS=1 ;;
+    *) REMOVE_PROJECTS=0 ;;
+  esac
+}
+
+remove_project_files() {
+  [ "$REMOVE_PROJECTS" = "1" ] || return 0
+  [ -n "$(project_paths)" ] || return 0
+
+  step "Removing local project folders"
+  while IFS= read -r project_dir; do
+    [ -n "$project_dir" ] || continue
+    if [ ! -e "$project_dir" ]; then
+      info "Already gone: $project_dir"
+      continue
+    fi
+    if [ "$DRY_RUN" = "1" ]; then
+      info "[dry-run] Remove $project_dir"
+    else
+      rm -rf "$project_dir" && info "Removed $project_dir" || warn "Could not remove $project_dir"
+    fi
+  done < <(project_paths)
+
+  if [ "$DRY_RUN" != "1" ]; then
+    rm -f "$PROJECT_PATHS_FILE" 2>/dev/null || true
+  fi
+}
 
 remove_path() {
   local path="$1"
@@ -569,6 +635,14 @@ else
   info "Mode: remove app/runtime pieces and delete Forge settings/data."
 fi
 
+resolve_remove_projects
+if [ "$REMOVE_PROJECTS" = "1" ]; then
+  info "Local projects: delete all Forge-created project folders."
+else
+  info "Local projects: keep all project folders on disk."
+fi
+
+remove_project_files
 remove_build_artifacts
 drop_recorded_postgres_data
 stop_docker_services

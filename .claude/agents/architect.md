@@ -52,6 +52,22 @@ For each design task, produce:
 4. **Task breakdown** — numbered list of implementation subtasks with assigned agent type
 5. **Open questions** — anything requiring PM or human decision
 
+## Right-Sizing
+
+Match the design to the size of the problem. The goal is the simplest solution that fully
+satisfies the requirements — not the most sophisticated one.
+
+- Do not introduce new frameworks, libraries, or heavyweight patterns (global state managers
+  such as Redux, message queues, microservices, extra build tooling) unless the task genuinely
+  needs them. Justify any new dependency in one line; otherwise prefer the standard library and
+  what the repository already uses.
+- Scale the task breakdown to the scope. A small, self-contained feature should yield a short
+  plan that uses only the agents it actually needs (often one implementation agent plus QA and
+  Reviewer). Do not pad the plan with agents or steps the task does not require.
+- Keep handoffs assigned to the real Forge worker agents only: [Architect], [Backend],
+  [Frontend], [QA], [Reviewer], [DevOps]. Never invent specialist job titles.
+- Reference concrete files and modules from the actual repository wherever possible.
+
 ## Constraints
 
 - Do not write implementation code

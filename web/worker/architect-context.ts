@@ -213,14 +213,22 @@ export async function buildWebResearchContext(profile: SoftwareProfile, task: Ta
 
 export function buildSpecialistContext(profile: SoftwareProfile): string {
   return [
-    `Detected software type: ${profile.type}`,
-    `Architect persona: ${profile.persona}`,
+    `Detected work type: ${profile.type}`,
+    `Lens to design through: ${profile.persona}`,
     '',
-    'Relevant specialist agents/capabilities to consider:',
+    'Forge has exactly these worker agents. Every implementation handoff MUST be assigned to one of them, using the [Role] tag verbatim:',
+    '- [Architect] — only when a step needs further design (API contract, data model, ADR) before it can be built',
+    '- [Backend] — server code, APIs, database/migrations, background jobs, scripts, CLI tooling',
+    '- [Frontend] — UI components, client-side state, routing, styling, calling APIs',
+    '- [QA] — tests and coverage for the work produced above',
+    '- [Reviewer] — security, correctness, and performance review before merge',
+    '- [DevOps] — Docker, CI/CD, install/deploy scripts, environment configuration',
+    '',
+    'Do NOT invent specialist job titles such as "UX flow designer" or "React implementation specialist". Fold those concerns into the matching agent above. The detected lens and the considerations below are framing only — they are not agents.',
+    '',
+    `Considerations worth weighing for ${profile.type} work (attach each to whichever agent above owns it, and skip any that do not apply to this specific task):`,
     ...profile.specialists.map((specialist) => `- ${specialist}`),
     '',
-    'When breaking down work, route each work package to the most specific specialist capability, even when the specialist is not a coding agent.',
-    'Examples of non-coding specialists include product planner, game designer, marketing strategist, copywriter, documentation specialist, release manager, and QA reviewer.',
-    'State whether each specialist needs current web research, repository inspection, design review, implementation, or verification.',
+    'Assign work to the smallest set of agents the task actually needs. Many small tasks need only one implementation agent plus [QA] and [Reviewer]. For each handoff, state whether it needs repository inspection, implementation, or verification.',
   ].join('\n')
 }

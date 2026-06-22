@@ -1,6 +1,6 @@
 # Forge Shipping Roadmap
 
-Last updated: 2026-06-21
+Last updated: 2026-06-22
 
 ## Release Target
 
@@ -130,11 +130,12 @@ User experience:
 
 ## Latest Gate Results
 
-Run from `web/` on 2026-06-21:
+Run from `web/` on 2026-06-22:
 
 ```bash
 npm run lint              # pass
-npm test                  # pass, 54 tests
+npx tsc --noEmit          # pass
+npm test                  # pass, 65 tests
 npm run build             # pass
 ```
 

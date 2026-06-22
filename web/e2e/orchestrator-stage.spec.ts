@@ -33,6 +33,9 @@ test.describe('Orchestrator-stage beta smoke', () => {
     })
 
     await page.getByLabel('Apply Best Value preset').click()
+    // Wait explicitly for the navigation to settle before asserting on the URL,
+    // so a slow applyPreset server action does not race the route change.
+    await page.waitForURL(/\/dashboard\/providers$/)
     await expect(page).toHaveURL(/\/dashboard\/providers$/)
     await expect(page.getByRole('heading', { name: 'Providers' })).toBeVisible()
     await expect(page.getByText('anthropic / claude-sonnet-4-6')).toBeVisible()
