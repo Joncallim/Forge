@@ -13,12 +13,8 @@ bash scripts/install.sh
 ```
 
 On macOS it uses Homebrew. On Linux it uses the detected package manager:
-`apt`, `dnf`, `yum`, `zypper`, or `pacman`. It can also start PostgreSQL and
-Redis with Docker Compose:
-
-```bash
-bash scripts/install.sh --service-mode docker
-```
+`apt`, `dnf`, `yum`, `zypper`, or `pacman`. It installs PostgreSQL and Redis as
+native local services, so Docker is not required.
 
 It can install these pieces:
 
@@ -89,7 +85,6 @@ installer. It keeps:
 - `.env`
 - PostgreSQL data
 - Redis data
-- Docker volumes
 - `.forge/install-manifest`
 
 ## Remove Everything Forge Created
@@ -101,7 +96,7 @@ bash scripts/uninstall.sh --remove-data
 ```
 
 This removes local build artifacts, recorded Forge-only packages, `.env`,
-Docker volumes, recorded Ollama models, and Forge's local install state. It also
+recorded Ollama models, and Forge's local install state. It also
 **drops the Forge application database** named in `DATABASE_URL` (default
 `forge`), which clears saved logins, projects, and task history — so a fresh
 install starts from a clean login. The drop runs whenever PostgreSQL is reachable,
@@ -142,5 +137,4 @@ bash scripts/uninstall.sh --remove-data --yes
 
 If your Forge install happened before `.forge/install-manifest` existed, the
 uninstall script will not guess which packages are safe to remove. It will still
-remove Forge-local build artifacts and Docker services, but it will leave
-system packages alone.
+remove Forge-local build artifacts, but it will leave system packages alone.

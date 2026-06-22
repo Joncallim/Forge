@@ -26,31 +26,17 @@ npm run dev
 
 Open `http://localhost:3000`.
 
-## Docker Path
+## Verify Readiness
 
-Use this if you only want Docker to start PostgreSQL and Redis and prefer to run
-the rest manually.
-
-From the repository root:
-
-```bash
-bash scripts/setup.sh
-```
-
-If it creates `.env` and exits, review `.env`, then run the script again.
-
-Then:
+After installing, confirm the core services are healthy:
 
 ```bash
 cd web
-npm install
-npm run db:migrate
-npm run db:seed-agents
 npm run doctor
 ```
 
-`npm run doctor` should report that required environment variables,
-PostgreSQL, Redis, and GitHub CLI readiness are healthy or clearly warned.
+`npm run doctor` should report that required environment variables, PostgreSQL,
+Redis, and GitHub CLI readiness are healthy or clearly warned.
 
 ## Sign In
 
@@ -217,7 +203,6 @@ If `npm run doctor` fails:
 
 - Check that `.env` exists in the repository root.
 - Check that PostgreSQL and Redis are running.
-- For Docker, run `docker compose ps`.
 
 If the task stays `Pending`:
 
