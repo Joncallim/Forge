@@ -1,2 +1,10 @@
 .DS_Store
 .forge/
+
+# Local agent worktrees (scratch checkouts created during development)
+.claude/worktrees/
+
+# Local environment / secrets — the installer writes secrets to ./.env
+.env
+.env.*
+!.env.example

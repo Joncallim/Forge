@@ -330,6 +330,81 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Suite 3.4b — Change plan: POST /api/tasks/:id/replan
+// ---------------------------------------------------------------------------
+
+describe('POST /api/tasks/:id/replan', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('returns 409 when task is not awaiting approval', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{ id: 'task-9', status: 'pending', prompt: 'do x' }]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/replan/route')
+    const req = authRequest('/api/tasks/task-9/replan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ feedback: 'tweak it' }),
+    })
+    const res = await POST(req as never, { params: Promise.resolve({ id: 'task-9' }) })
+
+    expect(res.status).toBe(409)
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+  })
+
+  it('returns 400 when feedback is missing', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{ id: 'task-9', status: 'awaiting_approval', prompt: 'do x' }]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/replan/route')
+    const req = authRequest('/api/tasks/task-9/replan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })
+    const res = await POST(req as never, { params: Promise.resolve({ id: 'task-9' }) })
+
+    expect(res.status).toBe(400)
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+  })
+
+  it('re-queues the task and appends feedback to the prompt on success', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{ id: 'task-9', status: 'awaiting_approval', prompt: 'do x' }]))
+    mockDbUpdate.mockReturnValue(chain([{ id: 'task-9', status: 'pending', updatedAt: new Date() }]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/replan/route')
+    const req = authRequest('/api/tasks/task-9/replan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ feedback: 'use a queue instead' }),
+    })
+    const res = await POST(req as never, { params: Promise.resolve({ id: 'task-9' }) })
+
+    expect(res.status).toBe(200)
+    expect(mockDbUpdate).toHaveBeenCalled()
+    expect(mockRedisLpush).toHaveBeenCalledWith('forge:tasks', expect.stringContaining('task-9'))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Suite 3.4c — Local discovery: POST /api/providers/discover-local auth guard
+// ---------------------------------------------------------------------------
+
+describe('POST /api/providers/discover-local — auth guard', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('returns 401 when not authenticated', async () => {
+    mockGetSession.mockResolvedValue(null)
+
+    const { POST } = await import('@/app/api/providers/discover-local/route')
+    const res = await POST(authRequest('/api/providers/discover-local', { method: 'POST' }) as never)
+
+    expect(res.status).toBe(401)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Suite 3.5 — Agent type sanitisation: PUT /api/agents/../../etc/passwd returns 400
 //
 // The route handler validates agent types against a strict allowlist
@@ -362,14 +437,15 @@ describe('PUT /api/agents/[type] — path traversal blocked', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Suite 3.6 — Provider validation: POST /api/providers with providerType='ollama'
-//              and no baseUrl returns 400
+// Suite 3.6 — Provider validation: baseUrl is required only for self-hosted
+//              endpoints (custom/litellm). Local runtimes like ollama default to
+//              a known localhost URL, so no baseUrl is required.
 // ---------------------------------------------------------------------------
 
-describe('POST /api/providers — baseUrl required for ollama', () => {
+describe('POST /api/providers — baseUrl requirement', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
-  it('returns 400 when providerType is ollama and baseUrl is missing', async () => {
+  it('allows ollama without baseUrl (defaults to the local endpoint)', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
 
     const { POST } = await import('@/app/api/providers/route')
@@ -381,15 +457,13 @@ describe('POST /api/providers — baseUrl required for ollama', () => {
         providerType: 'ollama',
         modelId: 'llama3',
         isLocal: true,
-        // no baseUrl
+        // no baseUrl — ollama defaults to http://localhost:11434
       }),
     })
 
     const res = await POST(req as never)
 
-    expect(res.status).toBe(400)
-    const body = await res.json()
-    expect(body.error).toMatch(/baseUrl/i)
+    expect(res.status).toBe(201)
   })
 
   it('returns 400 when providerType is custom and baseUrl is missing', async () => {
