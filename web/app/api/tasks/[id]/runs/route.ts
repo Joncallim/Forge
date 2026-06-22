@@ -1,6 +1,6 @@
 import type { NextRequest } from 'next/server'
 import { db } from '@/db'
-import { agentRuns, artifacts, tasks } from '@/db/schema'
+import { agentRuns, artifacts, taskQuestions, tasks } from '@/db/schema'
 import { asc, eq, inArray } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
@@ -115,6 +115,23 @@ export async function GET(
             artifactType: artifact.artifactType,
             content: artifact.content,
             metadata: artifact.metadata,
+          })
+        }
+
+        const existingQuestions = await db
+          .select()
+          .from(taskQuestions)
+          .where(eq(taskQuestions.taskId, taskId))
+          .orderBy(asc(taskQuestions.createdAt))
+
+        if (existingQuestions.length > 0) {
+          sendSnapshotEvent('questions:created', {
+            questions: existingQuestions.map((q) => ({
+              id: q.id,
+              question: q.question,
+              answer: q.answer,
+              status: q.status,
+            })),
           })
         }
       }

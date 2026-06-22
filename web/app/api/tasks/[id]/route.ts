@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { db } from '@/db'
-import { tasks, agentRuns, artifacts, taskAttempts } from '@/db/schema'
+import { tasks, agentRuns, artifacts, taskAttempts, taskQuestions } from '@/db/schema'
 import { and, eq, asc, or } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 
@@ -44,6 +44,12 @@ export async function GET(
       .where(eq(taskAttempts.taskId, id))
       .orderBy(asc(taskAttempts.createdAt))
 
+    const questions = await db
+      .select()
+      .from(taskQuestions)
+      .where(eq(taskQuestions.taskId, id))
+      .orderBy(asc(taskQuestions.createdAt))
+
     // Fetch artifacts for all runs
     const runIds = runs.map((r) => r.id)
     let taskArtifacts: typeof artifacts.$inferSelect[] = []
@@ -55,7 +61,7 @@ export async function GET(
         .where(inArray(artifacts.agentRunId, runIds))
     }
 
-    return NextResponse.json({ task, runs, artifacts: taskArtifacts, attempts })
+    return NextResponse.json({ task, runs, artifacts: taskArtifacts, attempts, questions })
   } catch (err) {
     console.error('[GET /api/tasks/:id] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
