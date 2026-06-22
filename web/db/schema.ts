@@ -133,6 +133,7 @@ export const projects = pgTable('projects', {
   id: uuid('id').primaryKey().defaultRandom(),
   name: text('name').notNull(),
   githubRepo: text('github_repo'), // 'owner/repo'
+  localPath: text('local_path'),
   githubTokenEnvVar: text('github_token_env_var'),
   pmProviderConfigId: uuid('pm_provider_config_id').references(
     () => providerConfigs.id,

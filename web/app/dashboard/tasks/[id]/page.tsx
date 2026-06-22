@@ -5,6 +5,7 @@ import { useParams, useRouter } from 'next/navigation'
 import { ExternalLinkIcon, ArrowLeftIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { MarkdownView } from '@/components/MarkdownView'
 import { useTaskStream } from '@/hooks/useTaskStream'
 import type { AgentRun, Artifact } from '@/hooks/useTaskStream'
 
@@ -55,7 +56,11 @@ function formatCost(usd: string | null): string {
 // AgentRunRow — expandable row showing a single agent run and its log output
 // ---------------------------------------------------------------------------
 function AgentRunRow({ run }: { run: AgentRun }) {
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(run.status === 'running')
+
+  useEffect(() => {
+    if (run.status === 'running') setExpanded(true)
+  }, [run.status])
 
   const runStatusVariant = (): StatusVariant => {
     switch (run.status) {
@@ -133,13 +138,13 @@ function AgentRunRow({ run }: { run: AgentRun }) {
           {/* Streaming log output */}
           {run.logOutput !== undefined && run.logOutput !== '' && (
             <div>
-              <p className="mb-1 text-xs font-medium text-muted-foreground">Log output</p>
-              <pre
-                className="max-h-72 overflow-y-auto rounded-lg bg-background/80 p-3 font-mono text-xs text-foreground ring-1 ring-border"
-                aria-label="Agent log output"
+              <p className="mb-1 text-xs font-medium text-muted-foreground">Live output</p>
+              <div
+                className="max-h-96 overflow-y-auto rounded-lg bg-background/80 p-3 ring-1 ring-border"
+                aria-label="Agent live Markdown output"
               >
-                {run.logOutput}
-              </pre>
+                <MarkdownView content={run.logOutput} compact />
+              </div>
             </div>
           )}
 
@@ -186,8 +191,8 @@ function ArtifactView({ artifact }: { artifact: Artifact }) {
       case 'adr_text':
       case 'review_finding':
         return (
-          <div className="rounded-lg bg-muted/40 px-4 py-3 text-sm text-foreground whitespace-pre-wrap">
-            {artifact.content}
+          <div className="rounded-lg bg-muted/40 px-4 py-3">
+            <MarkdownView content={artifact.content} />
           </div>
         )
       default:

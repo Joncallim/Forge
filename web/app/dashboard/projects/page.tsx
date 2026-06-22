@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
-import { PlusIcon, ExternalLinkIcon, FolderOpenIcon } from 'lucide-react'
+import { PlusIcon, ExternalLinkIcon, FolderOpenIcon, GitBranchIcon, HardDriveIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -17,10 +17,24 @@ interface Project {
   id: string
   name: string
   githubRepo: string | null
+  localPath: string | null
   pmProviderConfigId: string | null
   defaultBranch: string
   createdAt: string
   archivedAt: string | null
+}
+
+type ProjectSource = 'github' | 'local'
+
+type DirectoryEntry = {
+  name: string
+  path: string
+}
+
+type DirectoryListing = {
+  path: string
+  parentPath: string | null
+  directories: DirectoryEntry[]
 }
 
 function formatDate(iso: string): string {
@@ -35,11 +49,16 @@ export default function ProjectsPage() {
   const [dialogOpen, setDialogOpen] = useState(false)
 
   // Form state
+  const [formSource, setFormSource] = useState<ProjectSource>('github')
   const [formName, setFormName] = useState('')
   const [formRepo, setFormRepo] = useState('')
+  const [formLocalPath, setFormLocalPath] = useState('')
   const [formBranch, setFormBranch] = useState('main')
   const [formError, setFormError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const [folderListing, setFolderListing] = useState<DirectoryListing | null>(null)
+  const [folderLoading, setFolderLoading] = useState(false)
+  const [folderError, setFolderError] = useState<string | null>(null)
 
   const loadProjects = useCallback(async () => {
     setLoading(true)
@@ -63,6 +82,31 @@ export default function ProjectsPage() {
     loadProjects()
   }, [loadProjects])
 
+  const loadFolders = useCallback(async (path?: string) => {
+    setFolderLoading(true)
+    setFolderError(null)
+    try {
+      const params = path ? `?path=${encodeURIComponent(path)}` : ''
+      const res = await fetch(`/api/filesystem/directories${params}`)
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to load folders')
+      }
+      const data = await res.json()
+      setFolderListing(data)
+    } catch (err) {
+      setFolderError(err instanceof Error ? err.message : 'Unable to load folders')
+    } finally {
+      setFolderLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (dialogOpen && formSource === 'local' && folderListing === null && !folderLoading) {
+      void loadFolders()
+    }
+  }, [dialogOpen, folderListing, folderLoading, formSource, loadFolders])
+
   async function handleCreateProject(e: React.FormEvent) {
     e.preventDefault()
     setFormError(null)
@@ -73,7 +117,9 @@ export default function ProjectsPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: formName.trim(),
-          githubRepo: formRepo.trim() || undefined,
+          source: formSource,
+          githubRepo: formSource === 'github' ? formRepo.trim() : undefined,
+          localPath: formSource === 'local' ? formLocalPath.trim() || undefined : undefined,
           defaultBranch: formBranch.trim() || 'main',
         }),
       })
@@ -82,9 +128,12 @@ export default function ProjectsPage() {
         throw new Error(body.error ?? 'Failed to create project')
       }
       setDialogOpen(false)
+      setFormSource('github')
       setFormName('')
       setFormRepo('')
+      setFormLocalPath('')
       setFormBranch('main')
+      setFolderListing(null)
       await loadProjects()
     } catch (err) {
       setFormError(err instanceof Error ? err.message : 'An unexpected error occurred')
@@ -113,6 +162,37 @@ export default function ProjectsPage() {
             </DialogHeader>
 
             <form onSubmit={handleCreateProject} className="flex flex-col gap-4">
+              <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="Project source">
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={formSource === 'github'}
+                  onClick={() => setFormSource('github')}
+                  className={`flex items-center justify-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50 ${
+                    formSource === 'github'
+                      ? 'border-ring bg-muted text-foreground'
+                      : 'border-border text-muted-foreground hover:text-foreground'
+                  }`}
+                >
+                  <GitBranchIcon className="size-4" aria-hidden="true" />
+                  GitHub
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={formSource === 'local'}
+                  onClick={() => setFormSource('local')}
+                  className={`flex items-center justify-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50 ${
+                    formSource === 'local'
+                      ? 'border-ring bg-muted text-foreground'
+                      : 'border-border text-muted-foreground hover:text-foreground'
+                  }`}
+                >
+                  <HardDriveIcon className="size-4" aria-hidden="true" />
+                  Local
+                </button>
+              </div>
+
               <div className="flex flex-col gap-1.5">
                 <label htmlFor="project-name" className="text-sm font-medium text-foreground">
                   Name <span aria-hidden="true" className="text-destructive">*</span>
@@ -129,23 +209,125 @@ export default function ProjectsPage() {
                 />
               </div>
 
-              <div className="flex flex-col gap-1.5">
-                <label htmlFor="project-repo" className="text-sm font-medium text-foreground">
-                  GitHub Repo
-                </label>
-                <input
-                  id="project-repo"
-                  type="text"
-                  value={formRepo}
-                  onChange={(e) => setFormRepo(e.target.value)}
-                  placeholder="owner/repo"
-                  className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                />
-              </div>
+              {formSource === 'github' && (
+                <div className="flex flex-col gap-1.5">
+                  <label htmlFor="github-repository" className="text-sm font-medium text-foreground">
+                    GitHub Repo <span aria-hidden="true" className="text-destructive">*</span>
+                  </label>
+                  <input
+                    id="github-repository"
+                    name="github-repository"
+                    type="text"
+                    required
+                    inputMode="text"
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                    value={formRepo}
+                    onChange={(e) => setFormRepo(e.target.value)}
+                    placeholder="owner/repo"
+                    className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                    aria-describedby="github-repository-help"
+                    aria-required="true"
+                  />
+                  <div
+                    id="github-repository-help"
+                    className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+                  >
+                    Need repo permissions? Run <code className="font-mono text-foreground">gh auth login --scopes repo,workflow</code>.
+                  </div>
+                </div>
+              )}
+
+              {formSource === 'local' && (
+                <div className="flex flex-col gap-2">
+                  <label htmlFor="project-local-path" className="text-sm font-medium text-foreground">
+                    Local Folder
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      id="project-local-path"
+                      type="text"
+                      value={formLocalPath}
+                      onChange={(e) => setFormLocalPath(e.target.value)}
+                      placeholder="/Users/alex/Games/my-game"
+                      autoComplete="off"
+                      className="min-w-0 flex-1 rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                      aria-describedby="project-local-path-help"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => void loadFolders(formLocalPath || undefined)}
+                      disabled={folderLoading}
+                      aria-label="Browse local folders"
+                    >
+                      <FolderOpenIcon aria-hidden="true" />
+                      Browse
+                    </Button>
+                  </div>
+                  <p id="project-local-path-help" className="text-xs text-muted-foreground">
+                    Choose the local folder Forge should use for this project.
+                  </p>
+
+                  <div className="rounded-lg border border-border bg-muted/30">
+                    <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                      <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
+                        {folderListing?.path ?? 'Loading folders...'}
+                      </span>
+                      {folderListing?.parentPath && (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => void loadFolders(folderListing.parentPath ?? undefined)}
+                          disabled={folderLoading}
+                        >
+                          Up
+                        </Button>
+                      )}
+                    </div>
+
+                    {folderError !== null && (
+                      <p role="alert" className="px-3 py-2 text-xs text-destructive">
+                        {folderError}
+                      </p>
+                    )}
+
+                    {folderLoading ? (
+                      <p className="px-3 py-4 text-center text-xs text-muted-foreground">
+                        Loading...
+                      </p>
+                    ) : folderListing !== null && folderListing.directories.length > 0 ? (
+                      <div className="max-h-52 overflow-y-auto p-1">
+                        {folderListing.directories.map((directory) => (
+                          <button
+                            type="button"
+                            key={directory.path}
+                            onDoubleClick={() => void loadFolders(directory.path)}
+                            onClick={() => setFormLocalPath(directory.path)}
+                            className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors hover:bg-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+                              formLocalPath === directory.path ? 'bg-background text-foreground' : 'text-muted-foreground'
+                            }`}
+                          >
+                            <FolderOpenIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                            <span className="min-w-0 truncate">{directory.name}</span>
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="px-3 py-4 text-center text-xs text-muted-foreground">
+                        No child folders.
+                      </p>
+                    )}
+                  </div>
+                </div>
+              )}
 
               <div className="flex flex-col gap-1.5">
                 <label htmlFor="project-branch" className="text-sm font-medium text-foreground">
-                  Default Branch
+                  {formSource === 'github' ? 'Default Branch' : 'Initial Branch'}
                 </label>
                 <input
                   id="project-branch"
@@ -153,6 +335,7 @@ export default function ProjectsPage() {
                   value={formBranch}
                   onChange={(e) => setFormBranch(e.target.value)}
                   placeholder="main"
+                  autoComplete="off"
                   className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
                 />
               </div>
@@ -230,9 +413,9 @@ export default function ProjectsPage() {
                     </a>
                   )}
                 </div>
-                {project.githubRepo !== null && (
-                  <p className="mt-1 text-xs text-muted-foreground">{project.githubRepo}</p>
-                )}
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {project.githubRepo ?? project.localPath ?? 'Local project'}
+                </p>
                 <p className="mt-3 text-xs text-muted-foreground">
                   Created {formatDate(project.createdAt)}
                 </p>

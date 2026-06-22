@@ -7,7 +7,7 @@ Last updated: 2026-06-21
 This audit covers the helper-stage beta path:
 
 1. first dashboard visit with no providers,
-2. account creation with password and passkey,
+2. account creation with password and optional passkey,
 3. setup wizard preset application,
 4. provider health review,
 5. project creation,
@@ -40,8 +40,8 @@ before running `npm run e2e`.
 - The setup wizard is the correct first screen for an unconfigured instance. It
   offers concrete provider presets and avoids sending operators to an empty
   dashboard.
-- The auth screens should stay direct and low-friction: first setup creates both
-  a password and passkey, while login lets users choose either method.
+- The auth screens should stay direct and low-friction: first setup creates a
+  password and, when enabled, a passkey. Login should show only enabled methods.
 - The Providers page is the right post-preset destination because it exposes
   health and missing-key feedback before a task is submitted.
 - Project and task creation use direct, focused dialogs with required fields and

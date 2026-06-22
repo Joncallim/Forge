@@ -7,7 +7,7 @@ Think of it as a control panel:
 1. You create a project.
 2. You describe a task.
 3. Forge sends that task to a configured AI helper.
-4. The helper writes a plan.
+4. The helper streams a Markdown plan shaped for the kind of software requested.
 5. You review and approve the result.
 
 Today, Forge handles the first helper stage: planning. It does not yet edit your
@@ -18,12 +18,14 @@ repository, make commits, or open pull requests by itself.
 Forge has four main pieces:
 
 - **Web app**: the dashboard you open at `http://localhost:3000`.
-- **Worker**: the background process that picks up tasks and calls AI models.
+- **Worker**: the background loop that picks up tasks and calls AI models.
 - **PostgreSQL**: the database that stores settings, users, tasks, and results.
 - **Redis**: the queue that passes work from the web app to the worker.
 
-The web app and worker are separate. If the worker is not running, new tasks stay
-waiting in the queue.
+Local installs start the worker inside the web process by default, so `npm run
+dev` is enough for the usual single-user setup. You can still split the worker
+into its own process with `FORGE_EMBED_WORKER=0` when you want production-style
+process isolation.
 
 ```text
 Browser -> Forge web app -> Redis queue -> Forge worker -> AI helper -> review in browser
@@ -58,20 +60,11 @@ FORGE_SKIP_OLLAMA=1 bash scripts/install.sh
 
 ## Start Forge
 
-After install, open two terminals.
-
-Terminal 1:
+After install:
 
 ```bash
 cd web
 npm run dev
-```
-
-Terminal 2:
-
-```bash
-cd web
-npm run worker
 ```
 
 Then open:
@@ -80,8 +73,24 @@ Then open:
 http://localhost:3000
 ```
 
-The first account creates both a password and a passkey. Later, the login page
-lets you sign in with either method.
+The web app starts the task worker automatically. To run the worker as a
+separate process instead:
+
+```bash
+FORGE_EMBED_WORKER=0 npm run dev
+```
+
+```bash
+cd web
+npm run worker
+```
+
+The first account creates a password and, by default, a passkey. To skip
+passkeys for convenience, set `FORGE_PASSKEYS_ENABLED=0` in `.env` before
+creating the first account.
+
+Local projects can be tied to a folder from the project dialog. Use the folder
+selector when you want Forge to plan work for a specific games/apps workspace.
 
 ## Docker Setup For Services Only
 
@@ -106,16 +115,11 @@ npm run db:migrate
 npm run db:seed-agents
 ```
 
-Start the web app and worker in separate terminals:
+Start Forge:
 
 ```bash
 cd web
 npm run dev
-```
-
-```bash
-cd web
-npm run worker
 ```
 
 You can also ask the main installer to use Docker for PostgreSQL and Redis:
@@ -125,6 +129,18 @@ bash scripts/install.sh --service-mode docker
 ```
 
 ## Uninstall
+
+The install and uninstall scripts are conservative:
+
+- `scripts/install.sh` creates `.env`, installs missing tools, prepares
+  PostgreSQL/Redis, installs `web/node_modules`, optionally configures Ollama,
+  and records only packages it added in `.forge/install-manifest`.
+- `scripts/uninstall.sh` removes Forge build artifacts and recorded Forge-only
+  packages. Packages that existed before Forge are left alone.
+- Keeping data preserves `.env`, PostgreSQL/Redis data, Docker volumes, and the
+  install manifest so a future reinstall can pick up your settings.
+- Removing data wipes Forge-local settings, database/Redis data, Docker
+  volumes, recorded Ollama models, and install state.
 
 To remove Forge from macOS or Linux:
 
@@ -148,11 +164,7 @@ Full local wipe:
 bash scripts/uninstall.sh --remove-data
 ```
 
-The uninstall helper removes only packages that Forge recorded as newly
-installed for Forge. Packages that were already installed are left alone. On
-Linux, the helper supports `apt`, `dnf`, `yum`, `zypper`, and `pacman`.
-
-See [docs/install-uninstall.md](docs/install-uninstall.md).
+Detailed install/uninstall reference: [docs/install-uninstall.md](docs/install-uninstall.md).
 
 ## Database Updates
 
@@ -168,7 +180,7 @@ For the migration workflow, see
 
 ## Helpful Docs
 
-- [Install and uninstall](docs/install-uninstall.md)
+- [Install/uninstall reference](docs/install-uninstall.md)
 - [Database migrations](docs/database-migrations.md)
 - [Helper model test guide](docs/helper-model-install-test.md)
 - [Deployment checklist](docs/deployment-checklist.md)
@@ -183,11 +195,13 @@ Forge is in a helper-stage beta.
 Available today:
 
 - local dashboard,
-- password or passkey sign-in,
+- password sign-in with optional passkeys,
 - provider setup,
-- project and task creation,
+- GitHub and local-folder project creation,
 - queued worker execution,
-- AI-generated planning artifact,
+- live Markdown planning output,
+- software-type-aware architect personas with specialist handoffs,
+- web research context for architect planning,
 - human approval flow.
 
 Not built yet:

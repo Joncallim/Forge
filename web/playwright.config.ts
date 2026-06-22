@@ -28,6 +28,7 @@ export default defineConfig({
       WEBAUTHN_RP_NAME: process.env.WEBAUTHN_RP_NAME ?? 'Forge',
       WEBAUTHN_ORIGIN: process.env.WEBAUTHN_ORIGIN ?? baseURL,
       NEXT_PUBLIC_APP_URL: process.env.NEXT_PUBLIC_APP_URL ?? baseURL,
+      FORGE_EMBED_WORKER: '0',
     },
   },
   projects: [

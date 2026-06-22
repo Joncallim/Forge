@@ -8,6 +8,7 @@ import { redis } from '@/lib/redis'
 import { createSession, sessionCookieOptions } from '@/lib/session'
 import { hashPassword, validatePassword } from '@/lib/password'
 import { count } from 'drizzle-orm'
+import { passkeysEnabled } from '@/lib/auth-options'
 
 export async function POST(request: NextRequest) {
   let registrationLock: { key: string; token: string } | null = null
@@ -25,6 +26,10 @@ export async function POST(request: NextRequest) {
   }
 
   try {
+    if (!passkeysEnabled()) {
+      return clearNonce(NextResponse.json({ error: 'Passkeys are disabled' }, { status: 404 }))
+    }
+
     // Read reg_nonce cookie
     const tempUserId = request.cookies.get('reg_nonce')?.value
     if (!tempUserId) {

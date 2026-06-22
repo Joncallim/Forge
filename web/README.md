@@ -5,16 +5,15 @@ and worker.
 
 The dashboard lets an operator:
 
-- sign in with a password or passkey,
+- sign in with a password and optional passkey,
 - configure AI providers,
 - create projects,
 - submit tasks,
 - review generated plans,
 - approve or reject helper-stage work.
 
-The dashboard does not do background work by itself. When a task is created, the
-API stores it in PostgreSQL and puts a job in Redis. The worker process must be
-running to pick up that job.
+When a task is created, the API stores it in PostgreSQL and puts a job in Redis.
+By default, `npm run dev` starts an embedded worker loop to pick up that job.
 
 ## Local Development
 
@@ -25,13 +24,6 @@ npm install
 npm run db:migrate
 npm run db:seed-agents
 npm run dev
-```
-
-In a second terminal:
-
-```bash
-cd web
-npm run worker
 ```
 
 Open:
@@ -46,7 +38,7 @@ Forge Web expects:
 
 - PostgreSQL, for app data and encrypted provider settings.
 - Redis, for task queues and live task events.
-- A worker process, for executing queued helper tasks.
+- A worker loop, embedded by default or run separately for split deployments.
 - At least one AI provider, unless you only run mock tests.
 
 When running from `web/`, both Next.js and the worker load the repository-root
@@ -55,8 +47,8 @@ When running from `web/`, both Next.js and the worker load the repository-root
 ## Common Commands
 
 ```bash
-npm run dev             # start the dashboard
-npm run worker          # start the task worker
+npm run dev             # start the dashboard and embedded task worker
+npm run worker          # start only the task worker for split deployments
 npm run db:migrate      # apply database migrations
 npm run db:seed-agents  # load default agent prompts
 npm run doctor          # check env, PostgreSQL, and Redis

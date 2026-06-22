@@ -117,6 +117,7 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
 
     es.addEventListener('run:completed', (e) => {
       try {
+        flushChunks()
         const data = JSON.parse((e as MessageEvent).data)
         const runId: string = data.runId ?? data.id
         setRuns((prev) =>
@@ -140,6 +141,7 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
 
     es.addEventListener('run:failed', (e) => {
       try {
+        flushChunks()
         const data = JSON.parse((e as MessageEvent).data)
         const runId: string = data.runId ?? data.id
         setRuns((prev) =>

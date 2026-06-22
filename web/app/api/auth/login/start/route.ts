@@ -1,9 +1,14 @@
 import { NextResponse } from 'next/server'
 import { generateAuthenticationOptions } from '@simplewebauthn/server'
 import { redis } from '@/lib/redis'
+import { passkeysEnabled } from '@/lib/auth-options'
 
 export async function POST() {
   try {
+    if (!passkeysEnabled()) {
+      return NextResponse.json({ error: 'Passkeys are disabled' }, { status: 404 })
+    }
+
     const nonce = crypto.randomUUID()
 
     // Generate authentication options (discoverable credential — no allowCredentials hint)

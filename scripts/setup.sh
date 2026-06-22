@@ -41,5 +41,5 @@ info "PostgreSQL: localhost:5432"
 info "Redis:      localhost:6379"
 printf '\n'
 info "Next: cd web && npm install && npm run db:migrate && npm run db:seed-agents"
-info "Then start the web UI: cd web && npm run dev"
-info "And in another terminal: cd web && npm run worker"
+info "Then start Forge: cd web && npm run dev"
+info "The web UI starts the task worker automatically unless FORGE_EMBED_WORKER=0."

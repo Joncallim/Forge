@@ -49,8 +49,8 @@ Ship Forge first as a helper-stage beta:
 - Stale test comments and unused symbols no longer produce false bug signals.
 - Web CI gates lint, typecheck, tests, production build, and the
   helper-stage E2E smoke path.
-- Login supports password and passkey sign-in. First-user registration
-  creates both.
+- Login supports password sign-in and optional passkeys. First-user
+  registration can be password-only when `FORGE_PASSKEYS_ENABLED=0`.
 - The cross-platform installer supports macOS and Linux from one entrypoint. It
   records what it installs so uninstall helpers can avoid user-owned packages.
 - Migration documentation includes a plain-English guide and a README inside the
@@ -82,8 +82,8 @@ gates pass in the target environment.
 Security:
 
 - Single-operator registration is gated after the first user and protected
-  against concurrent first-user creation. The first account gets both password
-  and passkey sign-in.
+  against concurrent first-user creation. The first account gets password
+  sign-in and, when enabled, passkey sign-in.
 - Route handlers require a valid session before project, provider, agent, task,
   and run-stream access.
 - Agent prompt file writes are limited to allowlisted agent types.
