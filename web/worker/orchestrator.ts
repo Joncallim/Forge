@@ -1,7 +1,7 @@
 import { streamText } from 'ai'
 import type { LanguageModel } from 'ai'
 import { db } from '../db'
-import { agentConfigs, agentRuns, artifacts, projects, tasks } from '../db/schema'
+import { agentConfigs, agentRuns, artifacts, projects, taskQuestions, tasks } from '../db/schema'
 import { getProvider } from '../lib/providers/registry'
 import { and, eq } from 'drizzle-orm'
 import { publishTaskEvent } from './events'
@@ -11,6 +11,7 @@ import {
   buildWebResearchContext,
   detectSoftwareProfile,
 } from './architect-context'
+import { parseOpenQuestions } from './open-questions'
 
 type TaskRow = typeof tasks.$inferSelect
 type ProjectRow = typeof projects.$inferSelect
@@ -56,12 +57,27 @@ async function isTaskCancelled(taskId: string): Promise<boolean> {
   return task !== undefined
 }
 
+export interface AnsweredQuestion {
+  question: string
+  answer: string
+}
+
 function buildArchitectPrompt(
   task: TaskRow,
   project: ProjectRow,
   specialistContext: string,
   webResearchContext: string,
+  answeredQuestions: AnsweredQuestion[] = [],
 ): string {
+  const answeredSection =
+    answeredQuestions.length === 0
+      ? []
+      : [
+          '',
+          'The task originator has answered the open questions from your previous plan. Incorporate these answers and adjust the plan accordingly:',
+          ...answeredQuestions.map((q) => `- Q: ${q.question}\n  A: ${q.answer}`),
+        ]
+
   return [
     `Project: ${project.name}`,
     `Repository: ${project.githubRepo ?? 'not configured'}`,
@@ -72,6 +88,7 @@ function buildArchitectPrompt(
     '',
     'Task prompt:',
     task.prompt,
+    ...answeredSection,
     '',
     'Produce a concise implementation plan for this task. Write it in Markdown.',
     'Include: assumptions, the specific files/modules to inspect first, the chosen approach, task breakdown (handoffs), verification steps, and notable risks.',
@@ -84,6 +101,12 @@ function buildArchitectPrompt(
     'Task breakdown rules:',
     '- Assign every implementation step to one of Forge\'s worker agents using its [Role] tag (e.g. "[Frontend] Build the task list component"). Never invent specialist titles.',
     '- Prefer concrete, repository-specific guidance: name the actual files, directories, or modules the implementer should create or change. If the repository or local folder above is configured, base your file references on it; if it is not, say so and keep paths illustrative.',
+    '',
+    'Open questions:',
+    answeredQuestions.length === 0
+      ? '- If anything is genuinely ambiguous and a wrong guess would be costly, list it as an open question instead of guessing. Otherwise make the most reasonable assumption and proceed — most tasks should have zero open questions.'
+      : '- All previously open questions have been answered above. Only raise NEW open questions if the answers introduce fresh ambiguity; otherwise return an empty list.',
+    '- After the Markdown plan, append a fenced code block tagged exactly `open_questions_json` containing a single JSON object of the shape `{"questions": ["...", "..."]}`. Use an empty array when there are no open questions. This block is parsed by software — emit nothing else inside it.',
     '',
     specialistContext,
     '',
@@ -110,6 +133,10 @@ function mockArchitectPlan(task: TaskRow, project: ProjectRow): string {
     'Verification steps:',
     '- Confirm the task detail page shows the agent run and artifact.',
     '- Approve the generated plan and confirm the Orchestrator stage completes.',
+    '',
+    '```open_questions_json',
+    '{"questions": []}',
+    '```',
   ].join('\n')
 }
 
@@ -117,6 +144,7 @@ async function createArtifact(
   taskId: string,
   agentRunId: string,
   content: string,
+  metadataExtra: Record<string, unknown> = {},
 ): Promise<void> {
   const [artifact] = await db
     .insert(artifacts)
@@ -127,6 +155,7 @@ async function createArtifact(
       metadata: {
         stage: 'architect_plan',
         generatedBy: 'forge-worker',
+        ...metadataExtra,
       },
     })
     .returning()
@@ -141,7 +170,36 @@ async function createArtifact(
   })
 }
 
-async function runArchitect(task: TaskRow, project: ProjectRow): Promise<void> {
+/**
+ * Persists the open questions extracted from an architect run, replacing any
+ * previously stored questions for the task. Returns the number of open
+ * (unanswered) questions persisted.
+ */
+async function persistOpenQuestions(taskId: string, questions: string[]): Promise<number> {
+  // Clear any prior questions from an earlier architect run for this task —
+  // each run represents the current/latest plan, so stale questions from a
+  // previous round should not linger.
+  await db.delete(taskQuestions).where(eq(taskQuestions.taskId, taskId))
+
+  if (questions.length === 0) return 0
+
+  const rows = await db
+    .insert(taskQuestions)
+    .values(questions.map((question) => ({ taskId, question, status: 'open' as const })))
+    .returning()
+
+  await publishTaskEvent(taskId, 'questions:created', {
+    questions: rows.map((row) => ({ id: row.id, question: row.question, status: row.status })),
+  })
+
+  return rows.length
+}
+
+async function runArchitect(
+  task: TaskRow,
+  project: ProjectRow,
+  answeredQuestions: AnsweredQuestion[] = [],
+): Promise<{ openQuestionCount: number }> {
   const config = await loadAgentConfig(ARCHITECT_AGENT)
   if (!config) {
     throw new Error('Architect agent config is missing')
@@ -199,7 +257,7 @@ async function runArchitect(task: TaskRow, project: ProjectRow): Promise<void> {
       const result = streamText({
           model,
           system: config.systemPrompt,
-          prompt: buildArchitectPrompt(task, project, specialistContext, webResearchContext),
+          prompt: buildArchitectPrompt(task, project, specialistContext, webResearchContext, answeredQuestions),
           temperature: 0.2,
         })
 
@@ -218,7 +276,12 @@ async function runArchitect(task: TaskRow, project: ProjectRow): Promise<void> {
       }
     }
 
-    await createArtifact(task.id, run.id, text)
+    const { planText, questions } = parseOpenQuestions(text)
+    await createArtifact(task.id, run.id, planText, {
+      openQuestionCount: questions.length,
+      revisedFromAnswers: answeredQuestions.length > 0,
+    })
+    const openQuestionCount = await persistOpenQuestions(task.id, questions)
 
     const completedAt = new Date()
     await db
@@ -238,6 +301,8 @@ async function runArchitect(task: TaskRow, project: ProjectRow): Promise<void> {
       costUsd: null,
       completedAt: completedAt.toISOString(),
     })
+
+    return { openQuestionCount }
   } catch (err) {
     const message = errorMessage(err)
     const completedAt = new Date()
@@ -289,13 +354,13 @@ export async function processTask(
       return
     }
 
-    await runArchitect(task, project)
+    const { openQuestionCount } = await runArchitect(task, project)
 
     if (await isTaskCancelled(task.id)) {
       return
     }
 
-    await updateTaskStatus(task.id, 'awaiting_approval')
+    await updateTaskStatus(task.id, openQuestionCount > 0 ? 'awaiting_answers' : 'awaiting_approval')
   } catch (err) {
     const message = errorMessage(err)
     if (options.finalAttempt ?? true) {
@@ -303,6 +368,72 @@ export async function processTask(
     } else if (!(await isTaskCancelled(task.id))) {
       await updateTaskStatus(task.id, 'pending', `Retrying after error: ${message}`)
     }
+    throw err
+  }
+}
+
+/**
+ * Re-runs the architect once every open question for a task has been
+ * answered, appending the Q&A pairs to the prompt context. Produces an
+ * adjusted plan and moves the task to `awaiting_approval` (or back to
+ * `awaiting_answers` if the adjusted plan raises new questions).
+ *
+ * Called by the questions API route once the last open question is
+ * answered. Idempotent: skips tasks that are not currently
+ * `awaiting_answers`, or that still have unanswered questions.
+ */
+export async function processAnsweredQuestions(taskId: string): Promise<void> {
+  const context = await loadTaskContext(taskId)
+  if (!context) {
+    console.warn('[worker/orchestrator] Task not found', { taskId })
+    return
+  }
+
+  const { task, project } = context
+  if (task.status !== 'awaiting_answers') {
+    console.info('[worker/orchestrator] Skipping re-plan for task with non-awaiting_answers status', {
+      taskId,
+      status: task.status,
+    })
+    return
+  }
+
+  const existingQuestions = await db
+    .select()
+    .from(taskQuestions)
+    .where(eq(taskQuestions.taskId, taskId))
+
+  const unanswered = existingQuestions.filter((q) => q.status !== 'answered')
+  if (unanswered.length > 0) {
+    console.info('[worker/orchestrator] Skipping re-plan; questions still unanswered', {
+      taskId,
+      unanswered: unanswered.length,
+    })
+    return
+  }
+
+  const claimed = await updateTaskStatusIfCurrent(taskId, 'awaiting_answers', 'running')
+  if (!claimed) {
+    console.info('[worker/orchestrator] Skipping re-plan claimed by another worker', { taskId })
+    return
+  }
+
+  try {
+    const answeredQuestions: AnsweredQuestion[] = existingQuestions.map((q) => ({
+      question: q.question,
+      answer: q.answer ?? '',
+    }))
+
+    const { openQuestionCount } = await runArchitect(task, project, answeredQuestions)
+
+    if (await isTaskCancelled(taskId)) {
+      return
+    }
+
+    await updateTaskStatus(taskId, openQuestionCount > 0 ? 'awaiting_answers' : 'awaiting_approval')
+  } catch (err) {
+    const message = errorMessage(err)
+    await updateTaskStatus(taskId, 'failed', message)
     throw err
   }
 }

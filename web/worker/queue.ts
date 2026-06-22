@@ -11,6 +11,11 @@ const APPROVAL_PROCESSING_QUEUE_KEY = 'forge:approvals:processing'
 const APPROVAL_RETRY_QUEUE_KEY = 'forge:approvals:retry'
 const APPROVAL_DEAD_QUEUE_KEY = 'forge:approvals:dead'
 const APPROVAL_CLAIMS_KEY = 'forge:approvals:claims'
+const ANSWERS_QUEUE_KEY = 'forge:answers'
+const ANSWERS_PROCESSING_QUEUE_KEY = 'forge:answers:processing'
+const ANSWERS_RETRY_QUEUE_KEY = 'forge:answers:retry'
+const ANSWERS_DEAD_QUEUE_KEY = 'forge:answers:dead'
+const ANSWERS_CLAIMS_KEY = 'forge:answers:claims'
 
 type RetryableJob = {
   attempt?: number
@@ -45,6 +50,16 @@ export interface ApprovalJob {
 export interface ClaimedApprovalJob {
   raw: string
   job: ApprovalJob
+}
+
+export interface AnswersJob {
+  taskId: string
+  attempt: number
+}
+
+export interface ClaimedAnswersJob {
+  raw: string
+  job: AnswersJob
 }
 
 abstract class RedisListQueue<TJob extends RetryableJob> {
@@ -235,6 +250,32 @@ export class ApprovalQueue extends RedisListQueue<ApprovalJob> {
   }
 
   override async claim(timeoutSeconds: number): Promise<ClaimedApprovalJob | null> {
+    return super.claim(timeoutSeconds)
+  }
+}
+
+export class AnswersQueue extends RedisListQueue<AnswersJob> {
+  constructor(redisUrl = getRequiredEnv('REDIS_URL')) {
+    super(
+      ANSWERS_QUEUE_KEY,
+      ANSWERS_PROCESSING_QUEUE_KEY,
+      ANSWERS_RETRY_QUEUE_KEY,
+      ANSWERS_DEAD_QUEUE_KEY,
+      ANSWERS_CLAIMS_KEY,
+      redisUrl,
+    )
+  }
+
+  protected parse(raw: string): AnswersJob {
+    const job = JSON.parse(raw) as Partial<AnswersJob>
+    if (typeof job.taskId !== 'string' || job.taskId.length === 0) {
+      throw new Error('taskId is required')
+    }
+
+    return { taskId: job.taskId, attempt: normalizeAttempt(job) }
+  }
+
+  override async claim(timeoutSeconds: number): Promise<ClaimedAnswersJob | null> {
     return super.claim(timeoutSeconds)
   }
 }

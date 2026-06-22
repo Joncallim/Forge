@@ -163,7 +163,7 @@ export const tasks = pgTable(
     }),
     title: text('title').notNull(),
     prompt: text('prompt').notNull(),
-    // 'pending'|'running'|'awaiting_approval'|'approved'|'rejected'|'completed'|'failed'|'cancelled'
+    // 'pending'|'running'|'awaiting_answers'|'awaiting_approval'|'approved'|'rejected'|'completed'|'failed'|'cancelled'
     status: text('status').notNull().default('pending'),
     pmProviderConfigId: uuid('pm_provider_config_id').references(
       () => providerConfigs.id,
@@ -318,3 +318,32 @@ export const appSettings = pgTable('app_settings', {
 
 export type AppSetting = InferSelectModel<typeof appSettings>
 export type NewAppSetting = InferInsertModel<typeof appSettings>
+
+// ---------------------------------------------------------------------------
+// taskQuestions
+// ---------------------------------------------------------------------------
+export const taskQuestions = pgTable(
+  'task_questions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id')
+      .notNull()
+      .references(() => tasks.id, { onDelete: 'cascade' }),
+    question: text('question').notNull(),
+    answer: text('answer'),
+    // 'open'|'answered'
+    status: text('status').notNull().default('open'),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    answeredAt: timestamp('answered_at', tsOpts),
+    answeredBy: uuid('answered_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+  },
+  (t) => [
+    index('task_questions_task_id_idx').on(t.taskId),
+    index('task_questions_task_id_status_idx').on(t.taskId, t.status),
+  ],
+)
+
+export type TaskQuestion = InferSelectModel<typeof taskQuestions>
+export type NewTaskQuestion = InferInsertModel<typeof taskQuestions>

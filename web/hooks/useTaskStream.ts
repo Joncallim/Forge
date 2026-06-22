@@ -25,11 +25,19 @@ export interface Artifact {
   metadata: unknown
 }
 
+export interface TaskQuestion {
+  id: string
+  question: string
+  answer: string | null
+  status: string
+}
+
 interface UseTaskStreamResult {
   runs: AgentRun[]
   artifacts: Artifact[]
   taskStatus: string | null
   error: string | null
+  questions: TaskQuestion[]
 }
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'rejected'])
@@ -39,6 +47,7 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
   const [taskStatus, setTaskStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [questions, setQuestions] = useState<TaskQuestion[]>([])
 
   // Store streaming log chunks outside React state to avoid excessive re-renders.
   // Key: runId, Value: accumulated log string
@@ -180,6 +189,29 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
       }
     })
 
+    es.addEventListener('questions:created', (e) => {
+      try {
+        const data = JSON.parse((e as MessageEvent).data)
+        const incoming: TaskQuestion[] = Array.isArray(data.questions) ? data.questions : []
+        // A fresh architect run replaces the prior question set for the task.
+        setQuestions(incoming)
+      } catch {
+        // Ignore malformed event
+      }
+    })
+
+    es.addEventListener('questions:answered', (e) => {
+      try {
+        const data = JSON.parse((e as MessageEvent).data)
+        const answered: TaskQuestion[] = Array.isArray(data.questions) ? data.questions : []
+        setQuestions((prev) =>
+          prev.map((q) => answered.find((a) => a.id === q.id) ?? q),
+        )
+      } catch {
+        // Ignore malformed event
+      }
+    })
+
     es.addEventListener('task:status', (e) => {
       try {
         const data = JSON.parse((e as MessageEvent).data)
@@ -214,5 +246,5 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
     }
   }, [taskId, flushChunks])
 
-  return { runs, artifacts, taskStatus, error }
+  return { runs, artifacts, taskStatus, error, questions }
 }

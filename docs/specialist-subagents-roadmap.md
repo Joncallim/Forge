@@ -203,3 +203,23 @@ history understandable and helps improve routing later.
 - Run tests after implementation specialists.
 - Require reviewer sign-off before merge or user approval.
 - Track cost, duration, and failure rate per harness.
+
+## Agent Role Self-Evaluation (web-search backed)
+
+The orchestrator can evaluate its configured agents and recommend the best model
+for each role (`web/lib/agent-evaluation.ts`, exposed at
+`POST /api/agents/evaluate` and surfaced as "Re-evaluate roles" on the Agents
+page).
+
+- **Web search.** The evaluation reuses the architect's `buildWebResearchContext`
+  (`web/worker/architect-context.ts`) so recommendations can reflect current
+  model-capability information instead of a static table. Web research is
+  best-effort and degrades gracefully when no search provider is configured.
+- **Structured output.** The model returns a validated JSON array of
+  `{ agentType, recommendedProviderConfigId, recommendedModelId, rationale,
+  confidence }`; malformed output is rejected before anything is shown or applied.
+- **Minimal-token provider test command.** `npm run test:providers`
+  (`web/scripts/test-providers.ts`) reuses the same 1-output-token, 3-second
+  health probe as the Providers page to verify every active provider for
+  effectively $0, and exits non-zero on failure for CI. See
+  [orchestrator-model-install-test.md](orchestrator-model-install-test.md).
