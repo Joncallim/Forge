@@ -189,6 +189,28 @@ npm run e2e
 It creates a temporary session, applies a setup preset, creates a project and
 task, runs the mock Orchestrator, approves the plan, and confirms the task completes.
 
+## Automated Provider Test Command
+
+To check every active provider's reachability from the command line without
+opening the dashboard:
+
+```bash
+cd web
+npm run test:providers
+```
+
+To check a single provider by its display name or id:
+
+```bash
+cd web
+npm run test:providers -- --provider "GPT Orchestrator"
+```
+
+This reuses the same 1-output-token, 3-second-timeout probe as the Providers
+page health check, so it costs effectively $0 to run. Pass `--provider
+<id-or-displayName>` to filter to a single provider. The command exits
+non-zero if any checked provider fails, so it is suitable for wiring into CI.
+
 ## Troubleshooting
 
 If `npm run doctor` fails:
