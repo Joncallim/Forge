@@ -281,17 +281,15 @@ export default function ProjectDetailPage() {
             <form onSubmit={handleCreateTask} className="flex flex-col gap-4">
               <div className="flex flex-col gap-1.5">
                 <label htmlFor="task-title" className="text-sm font-medium text-foreground">
-                  Title <span aria-hidden="true" className="text-destructive">*</span>
+                  Title <span className="text-muted-foreground">(optional)</span>
                 </label>
                 <input
                   id="task-title"
                   type="text"
-                  required
                   value={formTitle}
                   onChange={(e) => setFormTitle(e.target.value)}
-                  placeholder="Implement feature X"
+                  placeholder="Leave blank to auto-generate from the prompt"
                   className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                  aria-required="true"
                 />
               </div>
 

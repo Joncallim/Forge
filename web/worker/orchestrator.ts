@@ -116,7 +116,7 @@ function buildArchitectPrompt(
     'Task breakdown rules:',
     '- Assign every implementation step to one of Forge\'s worker agents using its [Role] tag (e.g. "[Frontend] Build the task list component"). Never invent specialist titles.',
     '- Prefer concrete, repository-specific guidance: name the actual files, directories, or modules the implementer should create or change. If the repository or local folder above is configured, base your file references on it; if it is not, say so and keep paths illustrative.',
-    '- After the Markdown plan, append a fenced code block tagged exactly `agent_breakdown_json` containing a single JSON object of the shape `{"agents":[{"role":"Frontend","tasks":2,"summary":"Build task page UI and state handling"}]}`. Derive this from the [Role] assignments in the task breakdown. Use an empty array only if the plan truly assigns no worker tasks.',
+    '- After the Markdown plan, append a fenced code block tagged exactly `agent_breakdown_json` containing a single JSON object of the shape `{"agents":[{"role":"Frontend","tasks":2,"summary":"Build task page UI and state handling","steps":["Build the task list component","Wire up state handling"]}]}`. Derive this from the [Role] assignments in the task breakdown. Each agent\'s `steps` should be a short array of 1-2 sentence imperative strings, one per individual task assigned to that agent — specific enough to stand alone, not just a restatement of `summary`. Use an empty array only if the plan truly assigns no worker tasks.',
     '',
     'Open questions:',
     answeredQuestions.length === 0

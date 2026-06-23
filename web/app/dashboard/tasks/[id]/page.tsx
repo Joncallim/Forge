@@ -2,12 +2,31 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import { ExternalLinkIcon, ArrowLeftIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, UsersIcon } from 'lucide-react'
+import {
+  ExternalLinkIcon,
+  ArrowLeftIcon,
+  ChevronDownIcon,
+  ChevronUpIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  CircleAlertIcon,
+  UsersIcon,
+  ListIcon,
+} from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from '@/components/ui/dialog'
 import { MarkdownView } from '@/components/MarkdownView'
+import { PlanDiffView } from '@/components/PlanDiffView'
 import { useTaskStream } from '@/hooks/useTaskStream'
 import type { AgentRun, Artifact, TaskQuestion } from '@/hooks/useTaskStream'
+import { stripKnownFences } from '@/lib/plan-fences'
 
 interface Task {
   id: string
@@ -84,10 +103,16 @@ interface PlannedAgent {
   role: string
   tasks: number
   summary: string
+  steps: string[]
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
+}
+
+function normalizeStepsField(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is string => typeof item === 'string')
 }
 
 function agentsFromMetadata(metadata: unknown): PlannedAgent[] {
@@ -101,6 +126,7 @@ function agentsFromMetadata(metadata: unknown): PlannedAgent[] {
         role: item.role.trim(),
         tasks: Math.max(1, Math.floor(tasks)),
         summary: typeof item.summary === 'string' ? item.summary.trim() : '',
+        steps: normalizeStepsField(item.steps),
       }
     })
     .filter((item): item is PlannedAgent => item !== null && item.role !== '')
@@ -118,14 +144,15 @@ function agentsFromPlanText(content: string): PlannedAgent[] {
     const task = match[2].replace(/^[-*]\s*/, '').replace(/^\d+[.)]\s*/, '').trim()
     const existing = byRole.get(role) ?? { role, tasks: 0, snippets: [] }
     existing.tasks += 1
-    if (task !== '' && existing.snippets.length < 2) existing.snippets.push(task)
+    if (task !== '' && existing.snippets.length < 20) existing.snippets.push(task)
     byRole.set(role, existing)
   }
 
   return [...byRole.values()].map((agent) => ({
     role: agent.role,
     tasks: agent.tasks,
-    summary: agent.snippets.join('; '),
+    summary: agent.snippets.slice(0, 2).join('; '),
+    steps: agent.snippets,
   }))
 }
 
@@ -247,7 +274,7 @@ function AgentRunRow({ run }: { run: AgentRun }) {
                 className="max-h-96 overflow-y-auto rounded-lg bg-background/80 p-3 ring-1 ring-border"
                 aria-label="Agent live Markdown output"
               >
-                <MarkdownView content={run.logOutput} compact />
+                <MarkdownView content={stripKnownFences(run.logOutput)} compact />
               </div>
             </div>
           )}
@@ -296,6 +323,11 @@ function ArtifactView({ artifact }: { artifact: Artifact }) {
           </pre>
         )
       case 'adr_text':
+        return (
+          <div className="rounded-lg bg-muted/40 px-4 py-3">
+            <MarkdownView content={stripKnownFences(artifact.content)} />
+          </div>
+        )
       case 'review_finding':
         return (
           <div className="rounded-lg bg-muted/40 px-4 py-3">
@@ -350,9 +382,16 @@ function QuestionsPanel({
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   const [submitting, setSubmitting] = useState(false)
   const [submitError, setSubmitError] = useState<string | null>(null)
+  const [currentIndex, setCurrentIndex] = useState(0)
+  const [resolvedExpanded, setResolvedExpanded] = useState(false)
 
   const openQuestions = questions.filter((q) => q.status !== 'answered')
   const answeredQuestions = questions.filter((q) => q.status === 'answered')
+
+  // Clamp the carousel position if the open-questions list shrinks (e.g. after a submit).
+  const safeIndex = openQuestions.length === 0 ? 0 : Math.min(currentIndex, openQuestions.length - 1)
+  const currentQuestion = openQuestions[safeIndex] ?? null
+  const isLastQuestion = safeIndex === openQuestions.length - 1
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -379,6 +418,7 @@ function QuestionsPanel({
         throw new Error(body.error ?? 'Failed to submit answers')
       }
       setDrafts({})
+      setCurrentIndex(0)
       onAnswered()
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : 'An unexpected error occurred')
@@ -388,16 +428,21 @@ function QuestionsPanel({
   }
 
   return (
-    <section aria-labelledby="questions-heading" className="mb-6">
-      <h2 id="questions-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
+    <section aria-labelledby="questions-heading" className="flex flex-col gap-3">
+      <h2 id="questions-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
         Open Questions
       </h2>
 
-      {openQuestions.length > 0 && (
-        <form onSubmit={handleSubmit} className="mb-4 rounded-xl border border-border bg-card p-4">
-          <p className="mb-3 text-sm font-medium text-foreground">
-            The architect needs answers to these questions before the plan can be approved.
-          </p>
+      {openQuestions.length > 0 && currentQuestion !== null && (
+        <form onSubmit={handleSubmit} className="rounded-xl border border-border bg-card p-4">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <p className="text-sm font-medium text-foreground">
+              The architect needs answers to these questions before the plan can be approved.
+            </p>
+            <span className="shrink-0 text-xs text-muted-foreground" aria-live="polite">
+              Question {safeIndex + 1} of {openQuestions.length}
+            </span>
+          </div>
 
           {submitError !== null && (
             <p role="alert" aria-live="assertive" className="mb-3 text-sm text-destructive">
@@ -405,12 +450,14 @@ function QuestionsPanel({
             </p>
           )}
 
-          <div className="flex flex-col gap-4">
-            {openQuestions.map((q) => {
-              const suggestions = Array.isArray(q.suggestions) ? q.suggestions.slice(0, 4) : []
-              const draft = drafts[q.id] ?? ''
-              return (
-                <div key={q.id} className="flex flex-col gap-2">
+          {(() => {
+            const q = currentQuestion
+            const suggestions = Array.isArray(q.suggestions) ? q.suggestions.slice(0, 4) : []
+            const draft = drafts[q.id] ?? ''
+            const hasDraft = draft.trim().length > 0
+            return (
+              <div className="flex flex-col gap-4">
+                <div className="flex flex-col gap-2">
                   <p className="text-sm font-medium text-foreground">{q.question}</p>
                   {suggestions.length > 0 && (
                     <div className="flex flex-wrap gap-2" role="group" aria-label={`Suggested answers for ${q.question}`}>
@@ -446,35 +493,76 @@ function QuestionsPanel({
                     className="resize-y rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
                   />
                 </div>
-              )
-            })}
-          </div>
 
-          <Button
-            type="submit"
-            size="sm"
-            className="mt-4"
-            disabled={submitting}
-            aria-busy={submitting}
-          >
-            {submitting ? 'Submitting…' : 'Submit Answers'}
-          </Button>
+                <div className="flex items-center justify-between gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setCurrentIndex((idx) => Math.max(0, idx - 1))}
+                    disabled={safeIndex === 0}
+                    aria-label="Previous question"
+                  >
+                    <ChevronLeftIcon aria-hidden="true" />
+                    Previous
+                  </Button>
+
+                  {isLastQuestion ? (
+                    <Button
+                      type="submit"
+                      size="sm"
+                      disabled={submitting}
+                      aria-busy={submitting}
+                    >
+                      {submitting ? 'Submitting…' : 'Submit Answers'}
+                    </Button>
+                  ) : (
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={() => setCurrentIndex((idx) => Math.min(openQuestions.length - 1, idx + 1))}
+                      disabled={!hasDraft}
+                      aria-label="Next question"
+                    >
+                      Next
+                      <ChevronRightIcon aria-hidden="true" />
+                    </Button>
+                  )}
+                </div>
+              </div>
+            )
+          })()}
         </form>
       )}
 
-      {answeredQuestions.length > 0 && (
+      {openQuestions.length === 0 && answeredQuestions.length > 0 && (
         <div className="rounded-xl border border-border">
-          <p className="px-4 py-2 text-xs font-medium text-muted-foreground uppercase tracking-wide border-b border-border">
-            Resolved Q&amp;A
-          </p>
-          <ul aria-label="Resolved questions and answers">
-            {answeredQuestions.map((q) => (
-              <li key={q.id} className="border-b border-border px-4 py-3 last:border-0">
-                <p className="text-sm font-medium text-foreground">{q.question}</p>
-                <p className="mt-1 text-sm text-muted-foreground">{q.answer}</p>
-              </li>
-            ))}
-          </ul>
+          <button
+            type="button"
+            onClick={() => setResolvedExpanded((v) => !v)}
+            className="flex w-full items-center justify-between gap-3 px-4 py-2 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+            aria-expanded={resolvedExpanded}
+            aria-label={`${resolvedExpanded ? 'Collapse' : 'Expand'} resolved questions and answers`}
+          >
+            <span className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+              {answeredQuestions.length} {answeredQuestions.length === 1 ? 'question' : 'questions'} answered ✓
+            </span>
+            {resolvedExpanded ? (
+              <ChevronUpIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+            ) : (
+              <ChevronDownIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+            )}
+          </button>
+          {resolvedExpanded && (
+            <ul aria-label="Resolved questions and answers" className="border-t border-border">
+              {answeredQuestions.map((q) => (
+                <li key={q.id} className="border-b border-border px-4 py-3 last:border-0">
+                  <p className="text-sm font-medium text-foreground">{q.question}</p>
+                  <p className="mt-1 text-sm text-muted-foreground">{q.answer}</p>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
 
@@ -487,10 +575,119 @@ function QuestionsPanel({
   )
 }
 
+// ---------------------------------------------------------------------------
+// AgentTasksModal — shows an agent's full task list alongside its system
+// prompt ("Instructions"), fetched lazily and cached for the page's lifetime.
+// ---------------------------------------------------------------------------
+const agentInstructionsCache = new Map<string, string>()
+
+function AgentTasksModal({ agent, open, onOpenChange }: {
+  agent: PlannedAgent
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const [instructions, setInstructions] = useState<string | null>(null)
+  const [loadingInstructions, setLoadingInstructions] = useState(false)
+  const [instructionsError, setInstructionsError] = useState<string | null>(null)
+
+  const roleSlug = agent.role.toLowerCase()
+
+  useEffect(() => {
+    if (!open) return
+
+    const cached = agentInstructionsCache.get(roleSlug)
+    if (cached !== undefined) {
+      setInstructions(cached)
+      setInstructionsError(null)
+      return
+    }
+
+    let cancelled = false
+    setLoadingInstructions(true)
+    setInstructionsError(null)
+
+    fetch(`/api/agents/${roleSlug}`)
+      .then(async (res) => {
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}))
+          throw new Error(body.error ?? 'Failed to load agent instructions')
+        }
+        return res.json()
+      })
+      .then((data) => {
+        if (cancelled) return
+        const systemPrompt = typeof data?.agent?.systemPrompt === 'string' ? data.agent.systemPrompt : ''
+        agentInstructionsCache.set(roleSlug, systemPrompt)
+        setInstructions(systemPrompt)
+      })
+      .catch((err) => {
+        if (cancelled) return
+        setInstructionsError(err instanceof Error ? err.message : 'An unexpected error occurred')
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingInstructions(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [open, roleSlug])
+
+  const taskItems = agent.steps.length > 0 ? agent.steps : (agent.summary !== '' ? [agent.summary] : [])
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-3xl" aria-labelledby={`agent-tasks-title-${roleSlug}`}>
+        <DialogHeader>
+          <DialogTitle id={`agent-tasks-title-${roleSlug}`}>{agent.role} — Tasks &amp; Instructions</DialogTitle>
+        </DialogHeader>
+
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="min-w-0">
+            <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">Tasks</h3>
+            {taskItems.length > 0 ? (
+              <ul className="flex flex-col gap-1.5 text-sm text-foreground" aria-label={`${agent.role} tasks`}>
+                {taskItems.map((item, idx) => (
+                  <li key={idx} className="flex gap-2">
+                    <span aria-hidden="true" className="text-muted-foreground">•</span>
+                    <span>{item}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-sm text-muted-foreground">No task details available.</p>
+            )}
+          </div>
+
+          <div className="min-w-0">
+            <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">Instructions</h3>
+            {loadingInstructions && (
+              <p className="text-sm text-muted-foreground" role="status" aria-live="polite">Loading instructions…</p>
+            )}
+            {instructionsError !== null && (
+              <p role="alert" className="text-sm text-destructive">{instructionsError}</p>
+            )}
+            {!loadingInstructions && instructionsError === null && instructions !== null && (
+              <div className="max-h-80 overflow-y-auto rounded-lg bg-muted/40 px-3 py-2">
+                <pre className="whitespace-pre-wrap font-mono text-xs text-foreground">{instructions}</pre>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <DialogFooter showCloseButton />
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 function PlannedAgentsPanel({ agents }: { agents: PlannedAgent[] }) {
+  const [openRole, setOpenRole] = useState<string | null>(null)
+
   if (agents.length === 0) return null
 
   const totalTasks = agents.reduce((sum, agent) => sum + agent.tasks, 0)
+  const activeAgent = agents.find((agent) => agent.role === openRole) ?? null
 
   return (
     <section aria-labelledby="planned-agents-heading" className="rounded-lg border border-border p-4">
@@ -508,9 +705,20 @@ function PlannedAgentsPanel({ agents }: { agents: PlannedAgent[] }) {
           <li key={agent.role} className="border-t border-border pt-3 first:border-t-0 first:pt-0">
             <div className="flex items-center justify-between gap-3">
               <p className="text-sm font-medium text-foreground">{agent.role}</p>
-              <Badge variant="outline">
-                {agent.tasks} {agent.tasks === 1 ? 'step' : 'steps'}
-              </Badge>
+              <div className="flex items-center gap-2">
+                <Badge variant="outline">
+                  {agent.tasks} {agent.tasks === 1 ? 'task' : 'tasks'}
+                </Badge>
+                <button
+                  type="button"
+                  onClick={() => setOpenRole(agent.role)}
+                  title={`${agent.tasks} ${agent.tasks === 1 ? 'task' : 'tasks'} · ${agent.summary}`}
+                  aria-label={`View tasks and instructions for ${agent.role}`}
+                  className="inline-flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+                >
+                  <ListIcon className="size-3.5" aria-hidden="true" />
+                </button>
+              </div>
             </div>
             {agent.summary !== '' && (
               <p className="mt-1 text-sm text-muted-foreground">{agent.summary}</p>
@@ -518,17 +726,28 @@ function PlannedAgentsPanel({ agents }: { agents: PlannedAgent[] }) {
           </li>
         ))}
       </ul>
+
+      {activeAgent !== null && (
+        <AgentTasksModal
+          agent={activeAgent}
+          open={openRole !== null}
+          onOpenChange={(value) => setOpenRole(value ? activeAgent.role : null)}
+        />
+      )}
     </section>
   )
 }
 
-function TaskAttemptRow({ attempt }: { attempt: TaskAttempt }) {
+function TaskAttemptRow({ attempt, runs }: { attempt: TaskAttempt; runs: AgentRun[] }) {
   const variant: StatusVariant =
     attempt.status === 'completed'
       ? 'secondary'
       : attempt.status === 'failed' || attempt.status === 'dead_lettered'
         ? 'destructive'
         : 'outline'
+
+  const matchedRun = runs.find((run) => run.agentType === attempt.queueName)
+  const modelLabel = matchedRun?.modelIdUsed || (attempt.workerId ? 'Model pending' : 'Worker pending')
 
   return (
     <li className="border-b border-border px-4 py-3 last:border-0">
@@ -538,8 +757,8 @@ function TaskAttemptRow({ attempt }: { attempt: TaskAttempt }) {
           <span className="text-muted-foreground">attempt {attempt.attemptNumber}</span>
           <Badge variant={variant}>{statusLabel(attempt.status)}</Badge>
         </div>
-        <span className="font-mono text-xs text-muted-foreground">
-          {attempt.workerId ?? 'worker pending'}
+        <span className="font-mono text-xs text-muted-foreground" title={attempt.workerId ?? undefined}>
+          {modelLabel}
         </span>
       </div>
 
@@ -741,6 +960,14 @@ export default function TaskDetailPage() {
   const isAwaitingApproval = (currentStatus ?? task.status) === 'awaiting_approval'
   const plannedAgents = plannedAgentsFromArtifacts(mergedArtifacts)
 
+  const adrArtifacts = mergedArtifacts.filter((artifact) => artifact.artifactType === 'adr_text')
+  const otherArtifacts = mergedArtifacts.filter((artifact) => artifact.artifactType !== 'adr_text')
+  const sortedAdrArtifacts = [...adrArtifacts].sort((a, b) => {
+    const aTime = a.createdAt ? new Date(a.createdAt).getTime() : 0
+    const bTime = b.createdAt ? new Date(b.createdAt).getTime() : 0
+    return aTime - bTime
+  })
+
   return (
     <div className="px-4 py-6 sm:px-6 lg:px-8">
       {/* Back navigation */}
@@ -800,11 +1027,6 @@ export default function TaskDetailPage() {
           </p>
         )}
       </div>
-
-      {/* Open questions — answer before the plan can be approved */}
-      {mergedQuestions.length > 0 && (
-        <QuestionsPanel taskId={taskId} questions={mergedQuestions} onAnswered={loadTask} />
-      )}
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(320px,420px)] lg:items-start">
         <div className="min-w-0">
@@ -977,7 +1199,7 @@ export default function TaskDetailPage() {
             ) : (
               <ul className="rounded-lg border border-border" aria-label="Task attempt history">
                 {attempts.map((attempt) => (
-                  <TaskAttemptRow key={attempt.id} attempt={attempt} />
+                  <TaskAttemptRow key={attempt.id} attempt={attempt} runs={mergedRuns} />
                 ))}
               </ul>
             )}
@@ -987,6 +1209,11 @@ export default function TaskDetailPage() {
         <aside className="flex min-w-0 flex-col gap-6">
           <PlannedAgentsPanel agents={plannedAgents} />
 
+          {/* Open questions — answer before the plan can be approved */}
+          {mergedQuestions.length > 0 && (
+            <QuestionsPanel taskId={taskId} questions={mergedQuestions} onAnswered={loadTask} />
+          )}
+
           {/* Artifacts */}
           {mergedArtifacts.length > 0 && (
             <section aria-labelledby="artifacts-heading">
@@ -994,9 +1221,24 @@ export default function TaskDetailPage() {
                 Artifacts
               </h2>
               <div className="flex flex-col gap-3">
-                {mergedArtifacts.map((artifact) => (
+                {otherArtifacts.map((artifact) => (
                   <ArtifactView key={artifact.id} artifact={artifact} />
                 ))}
+                {adrArtifacts.length >= 2 ? (
+                  <div className="rounded-lg border border-border p-4">
+                    <p className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                      Plan Revision
+                    </p>
+                    <PlanDiffView
+                      oldContent={sortedAdrArtifacts[sortedAdrArtifacts.length - 2].content}
+                      newContent={sortedAdrArtifacts[sortedAdrArtifacts.length - 1].content}
+                    />
+                  </div>
+                ) : (
+                  adrArtifacts.map((artifact) => (
+                    <ArtifactView key={artifact.id} artifact={artifact} />
+                  ))
+                )}
               </div>
             </section>
           )}

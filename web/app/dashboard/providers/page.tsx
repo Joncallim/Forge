@@ -210,9 +210,36 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
   const showBaseUrl = entry.requiresBaseUrl || entry.category === 'local'
   const baseUrlRequired = entry.requiresBaseUrl
   const category = providerCategory(form.providerType, form.isLocal)
+  const [availableModels, setAvailableModels] = useState<string[] | null>(null)
+  const [modelsLoading, setModelsLoading] = useState(false)
+  const [modelsError, setModelsError] = useState<string | null>(null)
 
   function set<K extends keyof ProviderFormState>(key: K, value: ProviderFormState[K]) {
     onChange({ ...form, [key]: value })
+  }
+
+  async function handleFetchModels() {
+    setModelsLoading(true)
+    setModelsError(null)
+    setAvailableModels(null)
+    try {
+      const res = await fetch('/api/providers/list-models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          providerType: form.providerType,
+          apiKey: form.apiKey.trim() || undefined,
+          baseUrl: form.baseUrl.trim() || undefined,
+        }),
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(body.error ?? 'Failed to list models')
+      setAvailableModels(body.models ?? [])
+    } catch (err) {
+      setModelsError(err instanceof Error ? err.message : 'Failed to list models')
+    } finally {
+      setModelsLoading(false)
+    }
   }
 
   function handleProviderTypeChange(value: string | null) {
@@ -277,16 +304,47 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
         <label htmlFor="pf-modelId" className="text-sm font-medium text-foreground">
           Model ID <span aria-hidden="true" className="text-destructive">*</span>
         </label>
-        <input
-          id="pf-modelId"
-          type="text"
-          required
-          value={form.modelId}
-          onChange={(e) => set('modelId', e.target.value)}
-          placeholder={entry.modelPlaceholder}
-          className="rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-          aria-required="true"
-        />
+        <div className="flex gap-2">
+          <input
+            id="pf-modelId"
+            type="text"
+            required
+            value={form.modelId}
+            onChange={(e) => set('modelId', e.target.value)}
+            placeholder={entry.modelPlaceholder}
+            className="min-w-0 flex-1 rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+            aria-required="true"
+          />
+          {category === 'cloud' && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void handleFetchModels()}
+              disabled={modelsLoading || (needsApiKey && !form.apiKey.trim() && !keyAlreadySet)}
+              aria-label="Fetch available models from provider API"
+            >
+              {modelsLoading ? 'Fetching…' : 'Fetch models'}
+            </Button>
+          )}
+        </div>
+        {modelsError !== null && (
+          <p role="alert" className="text-xs text-destructive">{modelsError}</p>
+        )}
+        {availableModels !== null && (
+          <Select value={form.modelId || undefined} onValueChange={(v) => v && set('modelId', v)}>
+            <SelectTrigger aria-label="Available models" className="w-full">
+              <SelectValue placeholder={availableModels.length > 0 ? 'Choose a model' : 'No models returned'} />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                {availableModels.map((id) => (
+                  <SelectItem key={id} value={id}>{id}</SelectItem>
+                ))}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+        )}
       </div>
 
       {/* Base URL — for self-hosted endpoints (required) and local runtimes (optional override) */}

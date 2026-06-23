@@ -16,7 +16,9 @@
  * the human-readable plan.
  */
 
-export const OPEN_QUESTIONS_FENCE = 'open_questions_json'
+import { OPEN_QUESTIONS_FENCE } from '@/lib/plan-fences'
+
+export { OPEN_QUESTIONS_FENCE }
 
 export interface OpenQuestion {
   question: string
@@ -31,7 +33,7 @@ export interface ParsedArchitectPlan {
 }
 
 const FENCE_REGEX = new RegExp(
-  '```' + OPEN_QUESTIONS_FENCE + '\\s*\\n([\\s\\S]*?)\\n?```',
+  '```' + OPEN_QUESTIONS_FENCE + '\\s*\\n([\\s\\S]*?)[ \\t]*\\n?[ \\t]*```',
   'i',
 )
 
