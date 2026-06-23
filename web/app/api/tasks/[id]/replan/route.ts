@@ -19,9 +19,9 @@ const replanSchema = z.object({
 // POST /api/tasks/:id/replan
 //
 // Requests a revised plan for a task awaiting approval. The reviewer's feedback
-// is appended to the task prompt as a clearly delimited revision note so the
-// orchestrator re-plans with the full, stored history, and the task is re-queued
-// for the architect stage (status -> pending).
+// is appended as a clearly delimited revision note, while the orchestrator also
+// loads the previous plan artifact and edits that plan in place. The task is
+// re-queued for the architect stage (status -> pending).
 // ---------------------------------------------------------------------------
 
 export async function POST(

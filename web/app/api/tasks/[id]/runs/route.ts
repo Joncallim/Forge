@@ -129,6 +129,7 @@ export async function GET(
             questions: existingQuestions.map((q) => ({
               id: q.id,
               question: q.question,
+              suggestions: q.suggestions,
               answer: q.answer,
               status: q.status,
             })),

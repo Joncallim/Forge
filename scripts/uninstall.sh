@@ -26,6 +26,7 @@ KEEP_DATA=""
 REMOVE_PROJECTS=""
 OS_NAME="${FORGE_OS_OVERRIDE:-$(uname -s)}"
 PACKAGE_MANAGER="${FORGE_PACKAGE_MANAGER_OVERRIDE:-}"
+REMOVE_TIMEOUT_SECONDS="${FORGE_REMOVE_TIMEOUT_SECONDS:-180}"
 SUDO=()
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
@@ -55,6 +56,7 @@ installer added them. Packages that were already present are left alone.
 Testing helpers:
   FORGE_OS_OVERRIDE=Darwin|Linux
   FORGE_PACKAGE_MANAGER_OVERRIDE=brew|apt|dnf|yum|zypper|pacman
+  FORGE_REMOVE_TIMEOUT_SECONDS=180
 EOF
 }
 
@@ -88,6 +90,15 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+case "$REMOVE_TIMEOUT_SECONDS" in
+  ''|*[!0-9]*)
+    die "FORGE_REMOVE_TIMEOUT_SECONDS must be a positive integer."
+    ;;
+  *)
+    [ "$REMOVE_TIMEOUT_SECONDS" -gt 0 ] || die "FORGE_REMOVE_TIMEOUT_SECONDS must be a positive integer."
+    ;;
+esac
 
 if [ -z "$KEEP_DATA" ]; then
   if [ "$YES" = "1" ] || [ ! -t 0 ]; then
@@ -242,15 +253,74 @@ remove_project_files() {
   fi
 }
 
+warn_running_forge_processes() {
+  command -v pgrep >/dev/null 2>&1 || return 0
+
+  local matches
+  matches="$(
+    pgrep -fl 'next dev|next-server|npm run dev|tsx .*worker|worker/index.ts' 2>/dev/null || true
+  )"
+  [ -n "$matches" ] || return 0
+
+  warn "Forge-related processes appear to be running. Stop dev servers, workers, and file watchers if removal stalls."
+  while IFS= read -r line; do
+    [ -n "$line" ] && info "process: $line"
+  done <<EOF
+$matches
+EOF
+}
+
 remove_path() {
   local path="$1"
-  if [ -e "$path" ] || [ -L "$path" ]; then
-    if [ "$DRY_RUN" = "1" ]; then
-      info "[dry-run] Remove $path"
-    else
-      rm -rf "$path"
-      info "Removed $path"
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    return 0
+  fi
+
+  if [ "$DRY_RUN" = "1" ]; then
+    info "[dry-run] Remove $path"
+    return 0
+  fi
+
+  case "$path" in
+    */node_modules)
+      info "Removing $path. This can take a while because node_modules contains many small files."
+      ;;
+    *)
+      info "Removing $path"
+      ;;
+  esac
+
+  local pid elapsed timed_out
+  command rm -rf "$path" &
+  pid="$!"
+  elapsed=0
+  timed_out=0
+
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 2
+    elapsed=$((elapsed + 2))
+    if [ $((elapsed % 10)) -eq 0 ]; then
+      info "Still removing $path after ${elapsed}s"
     fi
+    if [ "$elapsed" -ge "$REMOVE_TIMEOUT_SECONDS" ]; then
+      timed_out=1
+      warn "Removal timed out for $path after ${REMOVE_TIMEOUT_SECONDS}s."
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 2
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      break
+    fi
+  done
+
+  if [ "$timed_out" = "0" ]; then
+    wait "$pid" 2>/dev/null || true
+  fi
+
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    warn "Could not fully remove $path. Close running Forge processes and check for root-owned files, then re-run uninstall."
+  else
+    info "Removed $path"
   fi
 }
 
@@ -338,6 +408,7 @@ postgres_ready() {
 
 remove_build_artifacts() {
   step "Removing local build artifacts"
+  warn_running_forge_processes
   remove_path "$REPO_ROOT/web/node_modules"
   remove_path "$REPO_ROOT/web/.next"
   remove_path "$REPO_ROOT/web/playwright-report"

@@ -7,7 +7,7 @@
  * `open_questions_json`:
  *
  *   ```open_questions_json
- *   { "questions": ["...", "..."] }
+ *   { "questions": [{ "question": "...", "suggestions": ["...", "..."] }] }
  *   ```
  *
  * If the architect has no open questions it should emit an empty array.
@@ -18,11 +18,16 @@
 
 export const OPEN_QUESTIONS_FENCE = 'open_questions_json'
 
+export interface OpenQuestion {
+  question: string
+  suggestions: string[]
+}
+
 export interface ParsedArchitectPlan {
   /** Markdown plan with the open-questions fenced block removed. */
   planText: string
-  /** Open question strings extracted from the fenced block (deduped, trimmed). */
-  questions: string[]
+  /** Open questions extracted from the fenced block (deduped, trimmed). */
+  questions: OpenQuestion[]
 }
 
 const FENCE_REGEX = new RegExp(
@@ -30,17 +35,47 @@ const FENCE_REGEX = new RegExp(
   'i',
 )
 
-function normalizeQuestions(raw: unknown): string[] {
+function normalizeSuggestions(raw: unknown): string[] {
   if (!Array.isArray(raw)) return []
 
   const seen = new Set<string>()
-  const questions: string[] = []
+  const suggestions: string[] = []
   for (const item of raw) {
     if (typeof item !== 'string') continue
     const trimmed = item.trim()
     if (trimmed === '' || seen.has(trimmed)) continue
     seen.add(trimmed)
-    questions.push(trimmed)
+    suggestions.push(trimmed)
+    if (suggestions.length === 4) break
+  }
+  return suggestions
+}
+
+function normalizeQuestions(raw: unknown): OpenQuestion[] {
+  if (!Array.isArray(raw)) return []
+
+  const seen = new Set<string>()
+  const questions: OpenQuestion[] = []
+  for (const item of raw) {
+    const question =
+      typeof item === 'string'
+        ? item
+        : typeof item === 'object' &&
+            item !== null &&
+            typeof (item as { question?: unknown }).question === 'string'
+          ? (item as { question: string }).question
+          : ''
+
+    const trimmed = question.trim()
+    if (trimmed === '' || seen.has(trimmed)) continue
+    seen.add(trimmed)
+    questions.push({
+      question: trimmed,
+      suggestions:
+        typeof item === 'object' && item !== null
+          ? normalizeSuggestions((item as { suggestions?: unknown }).suggestions)
+          : [],
+    })
   }
   return questions
 }
@@ -60,7 +95,7 @@ export function parseOpenQuestions(rawText: string): ParsedArchitectPlan {
   }
 
   const jsonBlock = match[1]
-  let questions: string[] = []
+  let questions: OpenQuestion[] = []
   try {
     const parsed = JSON.parse(jsonBlock)
     questions = normalizeQuestions(parsed?.questions)

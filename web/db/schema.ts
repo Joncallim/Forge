@@ -127,6 +127,29 @@ export type ProviderConfig = InferSelectModel<typeof providerConfigs>
 export type NewProviderConfig = InferInsertModel<typeof providerConfigs>
 
 // ---------------------------------------------------------------------------
+// providerHealthChecks
+// ---------------------------------------------------------------------------
+export const providerHealthChecks = pgTable(
+  'provider_health_checks',
+  {
+    providerConfigId: uuid('provider_config_id')
+      .primaryKey()
+      .references(() => providerConfigs.id, { onDelete: 'cascade' }),
+    reachable: boolean('reachable').notNull().default(false),
+    envVarPresent: boolean('env_var_present').notNull().default(false),
+    latencyMs: integer('latency_ms'),
+    error: text('error'),
+    checkedAt: timestamp('checked_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    index('provider_health_checks_checked_at_idx').on(t.checkedAt),
+  ],
+)
+
+export type ProviderHealthCheck = InferSelectModel<typeof providerHealthChecks>
+export type NewProviderHealthCheck = InferInsertModel<typeof providerHealthChecks>
+
+// ---------------------------------------------------------------------------
 // projects
 // ---------------------------------------------------------------------------
 export const projects = pgTable('projects', {
@@ -330,6 +353,7 @@ export const taskQuestions = pgTable(
       .notNull()
       .references(() => tasks.id, { onDelete: 'cascade' }),
     question: text('question').notNull(),
+    suggestions: jsonb('suggestions').$type<string[]>().notNull().default([]),
     answer: text('answer'),
     // 'open'|'answered'
     status: text('status').notNull().default('open'),

@@ -8,6 +8,8 @@ import { encryptSecret, decryptSecret } from '@/lib/crypto'
 const execFile = promisify(execFileCallback)
 
 export const GITHUB_PAT_SETTING_KEY = 'github_pat'
+const GITHUB_CLI_TIMEOUT_MS = 3000
+const GITHUB_STATUS_CACHE_MS = 30_000
 
 export type GitHubTokenSource = 'cli' | 'pat' | 'env' | 'none'
 
@@ -24,24 +26,35 @@ export interface GitHubStatus {
   login: string | null
 }
 
+let cliAuthCache: { value: boolean; expiresAt: number } | null = null
+
 // ---------------------------------------------------------------------------
 // gh CLI
 // ---------------------------------------------------------------------------
 
 /** Whether the `gh` CLI is installed and authenticated (`gh auth status`). */
 export async function isCliAuthenticated(): Promise<boolean> {
-  try {
-    await execFile('gh', ['auth', 'status'])
-    return true
-  } catch {
-    return false
+  const now = Date.now()
+  if (cliAuthCache && cliAuthCache.expiresAt > now) {
+    return cliAuthCache.value
   }
+
+  let value = false
+  try {
+    await execFile('gh', ['auth', 'status'], { timeout: GITHUB_CLI_TIMEOUT_MS })
+    value = true
+  } catch {
+    value = false
+  }
+
+  cliAuthCache = { value, expiresAt: now + GITHUB_STATUS_CACHE_MS }
+  return value
 }
 
 /** The token the `gh` CLI would use, or null when unavailable. */
 export async function getCliToken(): Promise<string | null> {
   try {
-    const { stdout } = await execFile('gh', ['auth', 'token'])
+    const { stdout } = await execFile('gh', ['auth', 'token'], { timeout: GITHUB_CLI_TIMEOUT_MS })
     const token = stdout.trim()
     return token.length > 0 ? token : null
   } catch {
@@ -99,8 +112,11 @@ export async function clearStoredPat(): Promise<void> {
 
 /** Validate a PAT against the GitHub API. Returns the login on success. */
 export async function validatePat(token: string): Promise<{ login: string } | null> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 5000)
   try {
     const res = await fetch('https://api.github.com/user', {
+      signal: controller.signal,
       headers: {
         Authorization: `Bearer ${token}`,
         Accept: 'application/vnd.github+json',
@@ -113,6 +129,8 @@ export async function validatePat(token: string): Promise<{ login: string } | nu
     return typeof body.login === 'string' ? { login: body.login } : { login: 'unknown' }
   } catch {
     return null
+  } finally {
+    clearTimeout(timer)
   }
 }
 
@@ -156,14 +174,12 @@ export async function getGitHubStatus(): Promise<GitHubStatus> {
     return { connected: true, source: 'cli', cliAuthenticated, patStored, login: null }
   }
   if (patStored) {
-    const pat = await getStoredPat()
-    const validated = pat ? await validatePat(pat) : null
     return {
       connected: true,
       source: 'pat',
       cliAuthenticated,
       patStored,
-      login: validated?.login ?? null,
+      login: null,
     }
   }
   return { connected: false, source: 'none', cliAuthenticated, patStored, login: null }

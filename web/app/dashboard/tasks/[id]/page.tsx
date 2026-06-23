@@ -1,8 +1,8 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import { ExternalLinkIcon, ArrowLeftIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon } from 'lucide-react'
+import { ExternalLinkIcon, ArrowLeftIcon, ChevronDownIcon, ChevronUpIcon, CircleAlertIcon, UsersIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { MarkdownView } from '@/components/MarkdownView'
@@ -67,15 +67,102 @@ function formatCost(usd: string | null): string {
   return `$${num.toFixed(4)}`
 }
 
+const ARTIFACT_LABELS: Record<string, string> = {
+  adr_text: 'Implementation Plan',
+  pr_url: 'Pull Request',
+  file_diff: 'Code Changes',
+  test_report: 'Test Report',
+  review_finding: 'Review Finding',
+  log_output: 'Log Output',
+}
+
+function artifactTypeLabel(type: string): string {
+  return ARTIFACT_LABELS[type] ?? type.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+}
+
+interface PlannedAgent {
+  role: string
+  tasks: number
+  summary: string
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+function agentsFromMetadata(metadata: unknown): PlannedAgent[] {
+  if (!isRecord(metadata) || !Array.isArray(metadata.agentBreakdown)) return []
+
+  return metadata.agentBreakdown
+    .map((item): PlannedAgent | null => {
+      if (!isRecord(item) || typeof item.role !== 'string') return null
+      const tasks = typeof item.tasks === 'number' && Number.isFinite(item.tasks) ? item.tasks : 1
+      return {
+        role: item.role.trim(),
+        tasks: Math.max(1, Math.floor(tasks)),
+        summary: typeof item.summary === 'string' ? item.summary.trim() : '',
+      }
+    })
+    .filter((item): item is PlannedAgent => item !== null && item.role !== '')
+}
+
+function agentsFromPlanText(content: string): PlannedAgent[] {
+  const byRole = new Map<string, { role: string; tasks: number; snippets: string[] }>()
+  const roleLine = /(?:^|\s)\[([A-Za-z][A-Za-z0-9 /_-]{0,38})\]\s*(.+)$/u
+
+  for (const line of content.split('\n')) {
+    const match = roleLine.exec(line)
+    if (!match) continue
+
+    const role = match[1].trim()
+    const task = match[2].replace(/^[-*]\s*/, '').replace(/^\d+[.)]\s*/, '').trim()
+    const existing = byRole.get(role) ?? { role, tasks: 0, snippets: [] }
+    existing.tasks += 1
+    if (task !== '' && existing.snippets.length < 2) existing.snippets.push(task)
+    byRole.set(role, existing)
+  }
+
+  return [...byRole.values()].map((agent) => ({
+    role: agent.role,
+    tasks: agent.tasks,
+    summary: agent.snippets.join('; '),
+  }))
+}
+
+function plannedAgentsFromArtifacts(artifacts: Artifact[]): PlannedAgent[] {
+  const plans = artifacts.filter((artifact) => artifact.artifactType === 'adr_text')
+  for (const plan of [...plans].reverse()) {
+    const agents = agentsFromMetadata(plan.metadata)
+    if (agents.length > 0) return agents
+    const fallback = agentsFromPlanText(plan.content)
+    if (fallback.length > 0) return fallback
+  }
+  return []
+}
+
 // ---------------------------------------------------------------------------
 // AgentRunRow — expandable row showing a single agent run and its log output
 // ---------------------------------------------------------------------------
 function AgentRunRow({ run }: { run: AgentRun }) {
   const [expanded, setExpanded] = useState(run.status === 'running')
+  const logRef = useRef<HTMLDivElement | null>(null)
+  const pinnedToBottomRef = useRef(true)
 
   useEffect(() => {
     if (run.status === 'running') setExpanded(true)
   }, [run.status])
+
+  useEffect(() => {
+    if (!expanded || !pinnedToBottomRef.current || !logRef.current) return
+    logRef.current.scrollTop = logRef.current.scrollHeight
+  }, [expanded, run.logOutput])
+
+  function handleLogScroll() {
+    const node = logRef.current
+    if (!node) return
+    const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight
+    pinnedToBottomRef.current = distanceFromBottom < 32
+  }
 
   const runStatusVariant = (): StatusVariant => {
     switch (run.status) {
@@ -155,6 +242,8 @@ function AgentRunRow({ run }: { run: AgentRun }) {
             <div>
               <p className="mb-1 text-xs font-medium text-muted-foreground">Live output</p>
               <div
+                ref={logRef}
+                onScroll={handleLogScroll}
                 className="max-h-96 overflow-y-auto rounded-lg bg-background/80 p-3 ring-1 ring-border"
                 aria-label="Agent live Markdown output"
               >
@@ -176,6 +265,9 @@ function AgentRunRow({ run }: { run: AgentRun }) {
 // ArtifactView — renders a single artifact based on its type
 // ---------------------------------------------------------------------------
 function ArtifactView({ artifact }: { artifact: Artifact }) {
+  const isLongArtifact = artifact.content.length > 1400 || artifact.content.split('\n').length > 28
+  const [expanded, setExpanded] = useState(!isLongArtifact)
+
   const renderContent = () => {
     switch (artifact.artifactType) {
       case 'pr_url':
@@ -193,13 +285,13 @@ function ArtifactView({ artifact }: { artifact: Artifact }) {
         )
       case 'file_diff':
         return (
-          <pre className="max-h-80 overflow-y-auto rounded-lg bg-background/80 p-3 font-mono text-xs text-foreground ring-1 ring-border">
+          <pre className="overflow-x-auto rounded-lg bg-background/80 p-3 font-mono text-xs text-foreground ring-1 ring-border">
             {artifact.content}
           </pre>
         )
       case 'test_report':
         return (
-          <pre className="max-h-80 overflow-y-auto rounded-lg bg-background/80 p-3 font-mono text-xs text-foreground ring-1 ring-border">
+          <pre className="overflow-x-auto rounded-lg bg-background/80 p-3 font-mono text-xs text-foreground ring-1 ring-border">
             {artifact.content}
           </pre>
         )
@@ -212,19 +304,33 @@ function ArtifactView({ artifact }: { artifact: Artifact }) {
         )
       default:
         return (
-          <pre className="max-h-72 overflow-y-auto rounded-lg bg-background/80 p-3 font-mono text-xs text-foreground ring-1 ring-border">
+          <pre className="overflow-x-auto rounded-lg bg-background/80 p-3 font-mono text-xs text-foreground ring-1 ring-border">
             {artifact.content}
           </pre>
         )
     }
   }
 
-  const typeLabel = artifact.artifactType.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+  const typeLabel = artifactTypeLabel(artifact.artifactType)
 
   return (
-    <div className="rounded-xl border border-border p-4">
+    <div className="rounded-lg border border-border p-4">
       <p className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">{typeLabel}</p>
-      {renderContent()}
+      <div className={isLongArtifact && !expanded ? 'max-h-80 overflow-hidden' : 'max-h-[70vh] overflow-y-auto'}>
+        {renderContent()}
+      </div>
+      {isLongArtifact && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="mt-2 px-0"
+          onClick={() => setExpanded((value) => !value)}
+          aria-expanded={expanded}
+        >
+          {expanded ? 'Show less' : 'Show more'}
+        </Button>
+      )}
     </div>
   )
 }
@@ -300,21 +406,48 @@ function QuestionsPanel({
           )}
 
           <div className="flex flex-col gap-4">
-            {openQuestions.map((q) => (
-              <div key={q.id} className="flex flex-col gap-1.5">
-                <label htmlFor={`question-${q.id}`} className="text-sm font-medium text-foreground">
-                  {q.question}
-                </label>
-                <textarea
-                  id={`question-${q.id}`}
-                  rows={2}
-                  value={drafts[q.id] ?? ''}
-                  onChange={(e) => setDrafts((prev) => ({ ...prev, [q.id]: e.target.value }))}
-                  placeholder="Your answer…"
-                  className="resize-y rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                />
-              </div>
-            ))}
+            {openQuestions.map((q) => {
+              const suggestions = Array.isArray(q.suggestions) ? q.suggestions.slice(0, 4) : []
+              const draft = drafts[q.id] ?? ''
+              return (
+                <div key={q.id} className="flex flex-col gap-2">
+                  <p className="text-sm font-medium text-foreground">{q.question}</p>
+                  {suggestions.length > 0 && (
+                    <div className="flex flex-wrap gap-2" role="group" aria-label={`Suggested answers for ${q.question}`}>
+                      {suggestions.map((suggestion) => {
+                        const selected = draft === suggestion
+                        return (
+                          <button
+                            key={suggestion}
+                            type="button"
+                            onClick={() => setDrafts((prev) => ({ ...prev, [q.id]: suggestion }))}
+                            className={`rounded-full border px-3 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50 ${
+                              selected
+                                ? 'border-primary bg-primary text-primary-foreground'
+                                : 'border-border bg-background text-foreground hover:bg-muted'
+                            }`}
+                            aria-pressed={selected}
+                          >
+                            {suggestion}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  )}
+                  <label htmlFor={`question-${q.id}`} className="text-xs font-medium text-muted-foreground">
+                    {suggestions.length > 0 ? 'Other answer' : 'Your answer'}
+                  </label>
+                  <textarea
+                    id={`question-${q.id}`}
+                    rows={2}
+                    value={draft}
+                    onChange={(e) => setDrafts((prev) => ({ ...prev, [q.id]: e.target.value }))}
+                    placeholder={suggestions.length > 0 ? 'Type a different answer…' : 'Your answer…'}
+                    className="resize-y rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                  />
+                </div>
+              )
+            })}
           </div>
 
           <Button
@@ -350,6 +483,41 @@ function QuestionsPanel({
           <p className="text-sm text-muted-foreground">No open questions.</p>
         </div>
       )}
+    </section>
+  )
+}
+
+function PlannedAgentsPanel({ agents }: { agents: PlannedAgent[] }) {
+  if (agents.length === 0) return null
+
+  const totalTasks = agents.reduce((sum, agent) => sum + agent.tasks, 0)
+
+  return (
+    <section aria-labelledby="planned-agents-heading" className="rounded-lg border border-border p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <h2 id="planned-agents-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
+          Planned Agents
+        </h2>
+        <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+          <UsersIcon className="size-3.5" aria-hidden="true" />
+          {agents.length} {agents.length === 1 ? 'agent' : 'agents'} · {totalTasks} {totalTasks === 1 ? 'task' : 'tasks'}
+        </span>
+      </div>
+      <ul className="flex flex-col gap-3">
+        {agents.map((agent) => (
+          <li key={agent.role} className="border-t border-border pt-3 first:border-t-0 first:pt-0">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-sm font-medium text-foreground">{agent.role}</p>
+              <Badge variant="outline">
+                {agent.tasks} {agent.tasks === 1 ? 'step' : 'steps'}
+              </Badge>
+            </div>
+            {agent.summary !== '' && (
+              <p className="mt-1 text-sm text-muted-foreground">{agent.summary}</p>
+            )}
+          </li>
+        ))}
+      </ul>
     </section>
   )
 }
@@ -571,6 +739,7 @@ export default function TaskDetailPage() {
   }
 
   const isAwaitingApproval = (currentStatus ?? task.status) === 'awaiting_approval'
+  const plannedAgents = plannedAgentsFromArtifacts(mergedArtifacts)
 
   return (
     <div className="px-4 py-6 sm:px-6 lg:px-8">
@@ -632,200 +801,207 @@ export default function TaskDetailPage() {
         )}
       </div>
 
-      {/* Task prompt — always shown, so the originating instruction is visible */}
-      <section aria-labelledby="prompt-heading" className="mb-6">
-        <h2 id="prompt-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
-          Prompt
-        </h2>
-        <div className="rounded-xl border border-border bg-muted/30 px-4 py-3">
-          <MarkdownView content={task.prompt} />
-        </div>
-      </section>
-
       {/* Open questions — answer before the plan can be approved */}
       {mergedQuestions.length > 0 && (
         <QuestionsPanel taskId={taskId} questions={mergedQuestions} onAnswered={loadTask} />
       )}
 
-      {/* Approve / Change plan / Restart actions */}
-      {isAwaitingApproval && (
-        <div className="mb-6 rounded-xl border border-border bg-card p-4">
-          <p className="mb-3 text-sm font-medium text-foreground">
-            Review the generated plan. You can approve it, ask for a revised plan, or
-            restart the task.
-          </p>
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(320px,420px)] lg:items-start">
+        <div className="min-w-0">
+          {/* Task prompt — always shown, so the originating instruction is visible */}
+          <section aria-labelledby="prompt-heading" className="mb-6">
+            <h2 id="prompt-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
+              Prompt
+            </h2>
+            <div className="rounded-lg border border-border bg-muted/30 px-4 py-3">
+              <MarkdownView content={task.prompt} />
+            </div>
+          </section>
 
-          {actionError !== null && (
-            <p role="alert" aria-live="assertive" className="mb-3 text-sm text-destructive">
-              {actionError}
-            </p>
-          )}
+          {/* Approve / Change plan / Restart actions */}
+          {isAwaitingApproval && (
+            <div className="mb-6 rounded-lg border border-border bg-card p-4">
+              <p className="mb-3 text-sm font-medium text-foreground">
+                Review the generated plan. You can approve it, ask for a revised plan, or
+                restart the task.
+              </p>
 
-          {actionMode === 'none' && (
-            <div className="flex flex-wrap gap-2">
-              <Button
-                size="sm"
-                onClick={handleApprove}
-                disabled={actionLoading}
-                aria-busy={actionLoading}
-                aria-label="Approve generated plan"
-              >
-                {actionLoading ? 'Approving…' : 'Approve'}
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => { setActionMode('replan'); setActionError(null) }}
-                disabled={actionLoading}
-                aria-label="Change the plan"
-              >
-                Change plan
-              </Button>
-              <Button
-                variant="destructive"
-                size="sm"
-                onClick={() => { setActionMode('restart'); setActionError(null) }}
-                disabled={actionLoading}
-                aria-label="Restart task"
-              >
-                Restart (reject)
-              </Button>
+              {actionError !== null && (
+                <p role="alert" aria-live="assertive" className="mb-3 text-sm text-destructive">
+                  {actionError}
+                </p>
+              )}
+
+              {actionMode === 'none' && (
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    onClick={handleApprove}
+                    disabled={actionLoading}
+                    aria-busy={actionLoading}
+                    aria-label="Approve generated plan"
+                  >
+                    {actionLoading ? 'Approving…' : 'Approve'}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => { setActionMode('replan'); setActionError(null) }}
+                    disabled={actionLoading}
+                    aria-label="Change the plan"
+                  >
+                    Change plan
+                  </Button>
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    onClick={() => { setActionMode('restart'); setActionError(null) }}
+                    disabled={actionLoading}
+                    aria-label="Restart task"
+                  >
+                    Restart (reject)
+                  </Button>
+                </div>
+              )}
+
+              {actionMode === 'replan' && (
+                <form onSubmit={handleReplan} className="flex flex-col gap-3">
+                  <div className="flex flex-col gap-1.5">
+                    <label htmlFor="replan-feedback" className="text-sm font-medium text-foreground">
+                      What should change?
+                    </label>
+                    <textarea
+                      id="replan-feedback"
+                      rows={3}
+                      value={replanFeedback}
+                      onChange={(e) => setReplanFeedback(e.target.value)}
+                      placeholder="Describe the adjustments the orchestrator should make to the plan…"
+                      className="resize-y rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      The orchestrator will revise the current plan and preserve unaffected sections.
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      size="sm"
+                      type="submit"
+                      disabled={actionLoading}
+                      aria-busy={actionLoading}
+                    >
+                      {actionLoading ? 'Requesting…' : 'Request revised plan'}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      type="button"
+                      onClick={() => { setActionMode('none'); setReplanFeedback('') }}
+                      disabled={actionLoading}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                </form>
+              )}
+
+              {actionMode === 'restart' && (
+                <form onSubmit={handleReject} className="flex flex-col gap-3">
+                  <div className="flex flex-col gap-1.5">
+                    <label htmlFor="reject-reason" className="text-sm font-medium text-foreground">
+                      Reason <span className="text-muted-foreground font-normal">(optional)</span>
+                    </label>
+                    <textarea
+                      id="reject-reason"
+                      rows={3}
+                      value={rejectReason}
+                      onChange={(e) => setRejectReason(e.target.value)}
+                      placeholder="Explain why the task is being restarted…"
+                      className="resize-y rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                    />
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      type="submit"
+                      disabled={actionLoading}
+                      aria-busy={actionLoading}
+                    >
+                      {actionLoading ? 'Restarting…' : 'Confirm restart'}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      type="button"
+                      onClick={() => { setActionMode('none'); setRejectReason('') }}
+                      disabled={actionLoading}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                </form>
+              )}
             </div>
           )}
 
-          {actionMode === 'replan' && (
-            <form onSubmit={handleReplan} className="flex flex-col gap-3">
-              <div className="flex flex-col gap-1.5">
-                <label htmlFor="replan-feedback" className="text-sm font-medium text-foreground">
-                  What should change?
-                </label>
-                <textarea
-                  id="replan-feedback"
-                  rows={3}
-                  value={replanFeedback}
-                  onChange={(e) => setReplanFeedback(e.target.value)}
-                  placeholder="Describe the adjustments the orchestrator should make to the plan…"
-                  className="resize-y rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                />
-                <p className="text-xs text-muted-foreground">
-                  Your notes are appended to the task prompt and the orchestrator re-plans
-                  with the full history.
-                </p>
+          {/* Agent run timeline */}
+          <section aria-labelledby="runs-heading" className="mb-6">
+            <h2 id="runs-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
+              Agent Runs
+            </h2>
+            {mergedRuns.length === 0 ? (
+              <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center">
+                <p className="text-sm text-muted-foreground">No agent runs yet.</p>
               </div>
-              <div className="flex gap-2">
-                <Button
-                  size="sm"
-                  type="submit"
-                  disabled={actionLoading}
-                  aria-busy={actionLoading}
-                >
-                  {actionLoading ? 'Requesting…' : 'Request revised plan'}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  type="button"
-                  onClick={() => { setActionMode('none'); setReplanFeedback('') }}
-                  disabled={actionLoading}
-                >
-                  Cancel
-                </Button>
-              </div>
-            </form>
-          )}
+            ) : (
+              <ul
+                className="rounded-lg border border-border"
+                aria-label="Agent run timeline"
+              >
+                {mergedRuns.map((run) => (
+                  <AgentRunRow key={run.id} run={run} />
+                ))}
+              </ul>
+            )}
+          </section>
 
-          {actionMode === 'restart' && (
-            <form onSubmit={handleReject} className="flex flex-col gap-3">
-              <div className="flex flex-col gap-1.5">
-                <label htmlFor="reject-reason" className="text-sm font-medium text-foreground">
-                  Reason <span className="text-muted-foreground font-normal">(optional)</span>
-                </label>
-                <textarea
-                  id="reject-reason"
-                  rows={3}
-                  value={rejectReason}
-                  onChange={(e) => setRejectReason(e.target.value)}
-                  placeholder="Explain why the task is being restarted…"
-                  className="resize-y rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                />
+          {/* Task attempt history */}
+          <section aria-labelledby="attempts-heading" className="mb-6">
+            <h2 id="attempts-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
+              Task Attempts
+            </h2>
+            {attempts.length === 0 ? (
+              <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center">
+                <p className="text-sm text-muted-foreground">No attempts recorded yet.</p>
               </div>
-              <div className="flex gap-2">
-                <Button
-                  variant="destructive"
-                  size="sm"
-                  type="submit"
-                  disabled={actionLoading}
-                  aria-busy={actionLoading}
-                >
-                  {actionLoading ? 'Restarting…' : 'Confirm restart'}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  type="button"
-                  onClick={() => { setActionMode('none'); setRejectReason('') }}
-                  disabled={actionLoading}
-                >
-                  Cancel
-                </Button>
-              </div>
-            </form>
-          )}
+            ) : (
+              <ul className="rounded-lg border border-border" aria-label="Task attempt history">
+                {attempts.map((attempt) => (
+                  <TaskAttemptRow key={attempt.id} attempt={attempt} />
+                ))}
+              </ul>
+            )}
+          </section>
         </div>
-      )}
 
-      {/* Agent run timeline */}
-      <section aria-labelledby="runs-heading" className="mb-6">
-        <h2 id="runs-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
-          Agent Runs
-        </h2>
-        {mergedRuns.length === 0 ? (
-          <div className="rounded-xl border border-dashed border-border px-4 py-8 text-center">
-            <p className="text-sm text-muted-foreground">No agent runs yet.</p>
-          </div>
-        ) : (
-          <ul
-            className="rounded-xl border border-border"
-            aria-label="Agent run timeline"
-          >
-            {mergedRuns.map((run) => (
-              <AgentRunRow key={run.id} run={run} />
-            ))}
-          </ul>
-        )}
-      </section>
+        <aside className="flex min-w-0 flex-col gap-6">
+          <PlannedAgentsPanel agents={plannedAgents} />
 
-      {/* Task attempt history */}
-      <section aria-labelledby="attempts-heading" className="mb-6">
-        <h2 id="attempts-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
-          Task Attempts
-        </h2>
-        {attempts.length === 0 ? (
-          <div className="rounded-xl border border-dashed border-border px-4 py-8 text-center">
-            <p className="text-sm text-muted-foreground">No attempts recorded yet.</p>
-          </div>
-        ) : (
-          <ul className="rounded-xl border border-border" aria-label="Task attempt history">
-            {attempts.map((attempt) => (
-              <TaskAttemptRow key={attempt.id} attempt={attempt} />
-            ))}
-          </ul>
-        )}
-      </section>
-
-      {/* Artifacts */}
-      {mergedArtifacts.length > 0 && (
-        <section aria-labelledby="artifacts-heading">
-          <h2 id="artifacts-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
-            Artifacts
-          </h2>
-          <div className="flex flex-col gap-3">
-            {mergedArtifacts.map((artifact) => (
-              <ArtifactView key={artifact.id} artifact={artifact} />
-            ))}
-          </div>
-        </section>
-      )}
+          {/* Artifacts */}
+          {mergedArtifacts.length > 0 && (
+            <section aria-labelledby="artifacts-heading">
+              <h2 id="artifacts-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
+                Artifacts
+              </h2>
+              <div className="flex flex-col gap-3">
+                {mergedArtifacts.map((artifact) => (
+                  <ArtifactView key={artifact.id} artifact={artifact} />
+                ))}
+              </div>
+            </section>
+          )}
+        </aside>
+      </div>
     </div>
   )
 }

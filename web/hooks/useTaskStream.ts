@@ -28,6 +28,7 @@ export interface Artifact {
 export interface TaskQuestion {
   id: string
   question: string
+  suggestions?: string[]
   answer: string | null
   status: string
 }

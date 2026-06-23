@@ -50,6 +50,13 @@
       "when": 1782133269954,
       "tag": "0006_add_app_settings",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1782166200157,
+      "tag": "0007_real_the_liberteens",
+      "breakpoints": true
     }
   ]
 }
