@@ -264,11 +264,32 @@ describe('getSession', () => {
     }
     mockRedisGet.mockResolvedValue(JSON.stringify(sessionData))
     mockRedisSet.mockResolvedValue('OK')
+    mockDbSelect.mockReturnValue(chain([{ id: 'user-abc' }]))
     mockDbUpdate.mockReturnValue(chain(undefined))
 
     const req = fakeRequest('my-session-id')
     const result = await getSession(req)
     expect(result).toEqual({ sessionId: 'my-session-id', userId: 'user-abc' })
+  })
+
+  it('returns null and deletes the Redis key when the user no longer exists in Postgres', async () => {
+    const sessionData = {
+      userId: 'deleted-user',
+      credentialId: null,
+      userAgent: null,
+      ip: null,
+      lastSeenAt: Date.now(),
+    }
+    mockRedisGet.mockResolvedValue(JSON.stringify(sessionData))
+    mockRedisDel.mockResolvedValue(1)
+    mockDbSelect.mockReturnValue(chain([]))
+
+    const req = fakeRequest('stale-session-id')
+    const result = await getSession(req)
+
+    expect(result).toBeNull()
+    expect(mockRedisDel).toHaveBeenCalledOnce()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
   })
 })
 
@@ -281,6 +302,7 @@ describe('getSession — write-behind logic', () => {
     vi.clearAllMocks()
     vi.useFakeTimers()
     mockRedisSet.mockResolvedValue('OK')
+    mockDbSelect.mockReturnValue(chain([{ id: 'user-1' }]))
     mockDbUpdate.mockReturnValue(chain(undefined))
   })
 

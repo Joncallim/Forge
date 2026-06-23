@@ -1,5 +1,5 @@
 import { db } from '@/db'
-import { sessions } from '@/db/schema'
+import { sessions, users } from '@/db/schema'
 import { eq } from 'drizzle-orm'
 import { redis } from '@/lib/redis'
 
@@ -75,6 +75,20 @@ export async function getSession(
   try {
     data = JSON.parse(raw) as SessionData
   } catch {
+    return null
+  }
+
+  // The Postgres users row may have been deleted (DB reset, fresh install with
+  // a surviving Redis volume, etc.) while the Redis session entry outlives it.
+  // Re-validate on every call so a dead userId never reaches callers.
+  const [user] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.id, data.userId))
+    .limit(1)
+
+  if (!user) {
+    await redis.del(redisKey(sessionId)).catch(() => {})
     return null
   }
 

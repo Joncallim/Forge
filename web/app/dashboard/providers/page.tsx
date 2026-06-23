@@ -523,15 +523,17 @@ export default function ProvidersPage() {
   // Health cache — read cached rows by default; live probes only on explicit refresh
   // ---------------------------------------------------------------------------
 
-  const loadHealth = useCallback(async (refresh = false) => {
+  const loadHealth = useCallback(async (refresh = false, silent = false) => {
     if (providers.length === 0) {
       setHealthMap({})
       return
     }
 
-    const initial: HealthMap = {}
-    for (const p of providers) initial[p.id] = 'loading'
-    setHealthMap(initial)
+    if (!silent) {
+      const initial: HealthMap = {}
+      for (const p of providers) initial[p.id] = 'loading'
+      setHealthMap(initial)
+    }
 
     await Promise.allSettled(
       providers.map(async (p) => {
@@ -549,6 +551,16 @@ export default function ProvidersPage() {
 
   useEffect(() => {
     void loadHealth(false)
+  }, [loadHealth])
+
+  // Background refresh: re-probe reachability periodically so local LLM
+  // (e.g. Ollama) status doesn't go stale until the user clicks "Refresh".
+  // Silent so rows update in place instead of flashing back to "loading".
+  useEffect(() => {
+    const interval = setInterval(() => {
+      void loadHealth(false, true)
+    }, 20_000)
+    return () => clearInterval(interval)
   }, [loadHealth])
 
   async function handleRefreshHealth() {

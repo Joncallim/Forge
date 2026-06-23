@@ -365,7 +365,7 @@ export default function ProjectsPage() {
               <DialogTitle id="new-project-title">New Project</DialogTitle>
             </DialogHeader>
 
-            <form onSubmit={handleCreateProject} className="flex flex-col gap-4">
+            <form onSubmit={handleCreateProject} className="flex flex-col gap-4" autoComplete="off">
               <div className="grid grid-cols-3 gap-2" role="radiogroup" aria-label="Project source">
                 <button
                   type="button"
@@ -480,6 +480,7 @@ export default function ProjectsPage() {
                   <div className="flex gap-2">
                     <input
                       id="project-local-parent-path"
+                      name="forge-local-parent-path"
                       type="text"
                       required
                       value={formLocalParentPath}
@@ -525,6 +526,7 @@ export default function ProjectsPage() {
                       </label>
                       <input
                         id="project-local-folder-name"
+                        name="forge-local-folder-name"
                         type="text"
                         required
                         value={formLocalFolderName}
@@ -663,6 +665,7 @@ export default function ProjectsPage() {
                       {cloneRepos.length > 15 && (
                         <input
                           type="text"
+                          name="forge-clone-repo-filter"
                           value={cloneRepoFilter}
                           onChange={(e) => setCloneRepoFilter(e.target.value)}
                           placeholder="Filter repositories…"
@@ -695,6 +698,7 @@ export default function ProjectsPage() {
                   <div className="flex gap-2">
                     <input
                       id="clone-local-parent-path"
+                      name="forge-clone-local-parent-path"
                       type="text"
                       required
                       value={formLocalParentPath}
@@ -729,6 +733,7 @@ export default function ProjectsPage() {
                     </label>
                     <input
                       id="clone-local-folder-name"
+                      name="forge-clone-local-folder-name"
                       type="text"
                       required
                       value={formLocalFolderName}
@@ -838,6 +843,7 @@ export default function ProjectsPage() {
                 </label>
                 <input
                   id="project-branch"
+                  name="forge-project-branch"
                   type="text"
                   value={formBranch}
                   onChange={(e) => setFormBranch(e.target.value)}
