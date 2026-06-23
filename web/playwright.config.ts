@@ -5,6 +5,10 @@ const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
 export default defineConfig({
   testDir: './e2e',
   timeout: 60_000,
+  // Tests share one dev Postgres/Redis instance and each does a global
+  // truncate in beforeEach, so concurrent workers race on each other's data.
+  // Force fully sequential execution across all files and projects.
+  workers: 1,
   // Absorb environmental E2E flake in CI (slow Postgres/Redis under load).
   retries: process.env.CI ? 2 : 0,
   expect: {
