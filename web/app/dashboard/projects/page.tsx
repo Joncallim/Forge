@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
-import { PlusIcon, ExternalLinkIcon, FolderOpenIcon, GitBranchIcon, HardDriveIcon } from 'lucide-react'
+import { PlusIcon, ExternalLinkIcon, FolderOpenIcon, GitBranchIcon, HardDriveIcon, CloudDownloadIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -12,6 +12,13 @@ import {
   DialogFooter,
   DialogTrigger,
 } from '@/components/ui/dialog'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 
 interface Project {
   id: string
@@ -24,17 +31,29 @@ interface Project {
   archivedAt: string | null
 }
 
-type ProjectSource = 'github' | 'local'
+type ProjectSource = 'github' | 'local' | 'clone'
 
 type DirectoryEntry = {
   name: string
   path: string
+  isGitRepo: boolean
 }
 
 type DirectoryListing = {
   path: string
   parentPath: string | null
   directories: DirectoryEntry[]
+  currentPathIsGitRepo: boolean
+}
+
+type GithubRepo = {
+  nameWithOwner: string
+  description: string | null
+}
+
+function repoShortName(nameWithOwner: string): string {
+  const idx = nameWithOwner.lastIndexOf('/')
+  return idx === -1 ? nameWithOwner : nameWithOwner.slice(idx + 1)
 }
 
 function formatDate(iso: string): string {
@@ -69,6 +88,7 @@ export default function ProjectsPage() {
   // Form state
   const [formSource, setFormSource] = useState<ProjectSource>('github')
   const [formName, setFormName] = useState('')
+  const [nameEdited, setNameEdited] = useState(false)
   const [formRepo, setFormRepo] = useState('')
   const [formLocalParentPath, setFormLocalParentPath] = useState('')
   const [formLocalFolderName, setFormLocalFolderName] = useState('')
@@ -79,6 +99,14 @@ export default function ProjectsPage() {
   const [folderListing, setFolderListing] = useState<DirectoryListing | null>(null)
   const [folderLoading, setFolderLoading] = useState(false)
   const [folderError, setFolderError] = useState<string | null>(null)
+  const [showHiddenFolders, setShowHiddenFolders] = useState(false)
+
+  // Clone-source state
+  const [cloneRepo, setCloneRepo] = useState('')
+  const [cloneRepos, setCloneRepos] = useState<GithubRepo[] | null>(null)
+  const [cloneReposLoading, setCloneReposLoading] = useState(false)
+  const [cloneReposError, setCloneReposError] = useState<string | null>(null)
+  const [cloneRepoFilter, setCloneRepoFilter] = useState('')
 
   const loadProjects = useCallback(async () => {
     setLoading(true)
@@ -102,12 +130,15 @@ export default function ProjectsPage() {
     loadProjects()
   }, [loadProjects])
 
-  const loadFolders = useCallback(async (path?: string) => {
+  const loadFolders = useCallback(async (path?: string, showHidden?: boolean) => {
     setFolderLoading(true)
     setFolderError(null)
     try {
-      const params = path ? `?path=${encodeURIComponent(path)}` : ''
-      const res = await fetch(`/api/filesystem/directories${params}`)
+      const params = new URLSearchParams()
+      if (path) params.set('path', path)
+      if (showHidden ?? showHiddenFolders) params.set('showHidden', '1')
+      const query = params.toString()
+      const res = await fetch(`/api/filesystem/directories${query ? `?${query}` : ''}`)
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
         throw new Error(body.error ?? 'Failed to load folders')
@@ -122,10 +153,10 @@ export default function ProjectsPage() {
     } finally {
       setFolderLoading(false)
     }
-  }, [])
+  }, [showHiddenFolders])
 
   useEffect(() => {
-    if (dialogOpen && formSource === 'local' && folderListing === null && !folderLoading) {
+    if (dialogOpen && (formSource === 'local' || formSource === 'clone') && folderListing === null && !folderLoading) {
       void loadFolders()
     }
   }, [dialogOpen, folderListing, folderLoading, formSource, loadFolders])
@@ -136,8 +167,50 @@ export default function ProjectsPage() {
     }
   }, [folderNameEdited, formName])
 
+  const loadCloneRepos = useCallback(async () => {
+    setCloneReposLoading(true)
+    setCloneReposError(null)
+    try {
+      const res = await fetch('/api/github/repos')
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to load GitHub repositories')
+      }
+      const data = await res.json()
+      setCloneRepos(data.repos ?? [])
+    } catch (err) {
+      setCloneReposError(err instanceof Error ? err.message : 'Unable to load GitHub repositories')
+    } finally {
+      setCloneReposLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (dialogOpen && formSource === 'clone' && cloneRepos === null && !cloneReposLoading) {
+      void loadCloneRepos()
+    }
+  }, [dialogOpen, formSource, cloneRepos, cloneReposLoading, loadCloneRepos])
+
+  // F2/F3: auto-fill the project Name from the chosen GitHub repo's short name,
+  // for both the 'github' and 'clone' sources, unless the user has manually
+  // edited the Name field.
+  useEffect(() => {
+    if (!nameEdited && (formSource === 'github' || formSource === 'clone')) {
+      const repo = formSource === 'github' ? formRepo : cloneRepo
+      if (repo.trim()) {
+        setFormName(repoShortName(repo.trim()))
+      }
+    }
+  }, [nameEdited, formSource, formRepo, cloneRepo])
+
   async function createLocalProjectFolder(): Promise<string | undefined> {
     if (formSource !== 'local') return undefined
+
+    // F1: if the folder currently being browsed is already a Git repo, use it
+    // as-is — Forge should not require (or create) a new subfolder.
+    if (folderListing?.currentPathIsGitRepo) {
+      return folderListing.path
+    }
 
     const parentPath = formLocalParentPath.trim()
     const folderName = formLocalFolderName.trim()
@@ -205,31 +278,60 @@ export default function ProjectsPage() {
     setFormError(null)
     setSubmitting(true)
     try {
-      const localPath = await createLocalProjectFolder()
+      let localPath: string | undefined
+      let githubRepo: string | undefined
+
+      if (formSource === 'github') {
+        githubRepo = formRepo.trim()
+      } else if (formSource === 'clone') {
+        if (!cloneRepo.trim()) {
+          throw new Error('Choose a GitHub repository to clone')
+        }
+        const parentPath = formLocalParentPath.trim()
+        const folderName = formLocalFolderName.trim()
+        if (!parentPath) {
+          throw new Error('Choose a destination parent folder')
+        }
+        if (!folderName) {
+          throw new Error('Enter a folder name for the cloned project')
+        }
+        githubRepo = cloneRepo.trim()
+        localPath = joinPathPreview(parentPath, folderName)
+      } else {
+        localPath = await createLocalProjectFolder()
+      }
+
       const res = await fetch('/api/projects', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: formName.trim(),
           source: formSource,
-          githubRepo: formSource === 'github' ? formRepo.trim() : undefined,
+          githubRepo,
           localPath,
           defaultBranch: formBranch.trim() || 'main',
         }),
       })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
+        if (res.status === 409) {
+          throw new Error(body.error ?? 'That destination folder already exists and is not empty')
+        }
         throw new Error(body.error ?? 'Failed to create project')
       }
       setDialogOpen(false)
       setFormSource('github')
       setFormName('')
+      setNameEdited(false)
       setFormRepo('')
       setFormLocalParentPath('')
       setFormLocalFolderName('')
       setFolderNameEdited(false)
       setFormBranch('main')
       setFolderListing(null)
+      setCloneRepo('')
+      setCloneRepos(null)
+      setCloneRepoFilter('')
       await loadProjects()
     } catch (err) {
       setFormError(err instanceof Error ? err.message : 'An unexpected error occurred')
@@ -239,6 +341,10 @@ export default function ProjectsPage() {
   }
 
   const localPathPreview = joinPathPreview(formLocalParentPath, formLocalFolderName)
+  const currentFolderIsGitRepo = formSource === 'local' && folderListing?.currentPathIsGitRepo === true
+  const filteredCloneRepos = (cloneRepos ?? []).filter((r) =>
+    cloneRepoFilter.trim() === '' || r.nameWithOwner.toLowerCase().includes(cloneRepoFilter.trim().toLowerCase()),
+  )
 
   return (
     <div className="px-4 py-6 sm:px-6 lg:px-8">
@@ -260,7 +366,7 @@ export default function ProjectsPage() {
             </DialogHeader>
 
             <form onSubmit={handleCreateProject} className="flex flex-col gap-4">
-              <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="Project source">
+              <div className="grid grid-cols-3 gap-2" role="radiogroup" aria-label="Project source">
                 <button
                   type="button"
                   role="radio"
@@ -289,6 +395,20 @@ export default function ProjectsPage() {
                   <HardDriveIcon className="size-4" aria-hidden="true" />
                   Local
                 </button>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={formSource === 'clone'}
+                  onClick={() => setFormSource('clone')}
+                  className={`flex items-center justify-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50 ${
+                    formSource === 'clone'
+                      ? 'border-ring bg-muted text-foreground'
+                      : 'border-border text-muted-foreground hover:text-foreground'
+                  }`}
+                >
+                  <CloudDownloadIcon className="size-4" aria-hidden="true" />
+                  Clone
+                </button>
               </div>
 
               <div className="flex flex-col gap-1.5">
@@ -301,7 +421,10 @@ export default function ProjectsPage() {
                   type="text"
                   required
                   value={formName}
-                  onChange={(e) => setFormName(e.target.value)}
+                  onChange={(e) => {
+                    setNameEdited(true)
+                    setFormName(e.target.value)
+                  }}
                   placeholder="My Project"
                   autoComplete="off"
                   autoCorrect="off"
@@ -330,6 +453,9 @@ export default function ProjectsPage() {
                     autoCorrect="off"
                     autoCapitalize="none"
                     spellCheck={false}
+                    data-1p-ignore="true"
+                    data-lpignore="true"
+                    data-form-type="other"
                     value={formRepo}
                     onChange={(e) => setFormRepo(e.target.value)}
                     placeholder="owner/repo"
@@ -360,6 +486,9 @@ export default function ProjectsPage() {
                       onChange={(e) => setFormLocalParentPath(e.target.value)}
                       placeholder="/Users/alex/Projects"
                       autoComplete="off"
+                      data-1p-ignore="true"
+                      data-lpignore="true"
+                      data-form-type="other"
                       className="min-w-0 flex-1 rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
                       aria-describedby="project-local-parent-path-help"
                     />
@@ -379,35 +508,64 @@ export default function ProjectsPage() {
                     shown below is where Forge will create the new project folder.
                   </p>
 
-                  <div className="flex flex-col gap-1.5">
-                    <label htmlFor="project-local-folder-name" className="text-sm font-medium text-foreground">
-                      New Folder Name <span aria-hidden="true" className="text-destructive">*</span>
-                    </label>
-                    <input
-                      id="project-local-folder-name"
-                      type="text"
-                      required
-                      value={formLocalFolderName}
-                      onChange={(e) => {
-                        setFolderNameEdited(true)
-                        setFormLocalFolderName(e.target.value)
-                      }}
-                      placeholder="my-project"
-                      autoComplete="off"
-                      className="rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                      aria-describedby="project-local-folder-name-help"
-                    />
-                    <p id="project-local-folder-name-help" className="text-xs text-muted-foreground">
-                      Forge will create this folder before saving the project.
-                    </p>
-                  </div>
+                  {currentFolderIsGitRepo && (
+                    <div
+                      role="status"
+                      className="flex items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+                    >
+                      <GitBranchIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                      This folder is already a Git repository — Forge will use it as-is.
+                    </div>
+                  )}
+
+                  {!currentFolderIsGitRepo && (
+                    <div className="flex flex-col gap-1.5">
+                      <label htmlFor="project-local-folder-name" className="text-sm font-medium text-foreground">
+                        New Folder Name <span aria-hidden="true" className="text-destructive">*</span>
+                      </label>
+                      <input
+                        id="project-local-folder-name"
+                        type="text"
+                        required
+                        value={formLocalFolderName}
+                        onChange={(e) => {
+                          setFolderNameEdited(true)
+                          setFormLocalFolderName(e.target.value)
+                        }}
+                        placeholder="my-project"
+                        autoComplete="off"
+                        data-1p-ignore="true"
+                        data-lpignore="true"
+                        data-form-type="other"
+                        className="rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                        aria-describedby="project-local-folder-name-help"
+                      />
+                      <p id="project-local-folder-name-help" className="text-xs text-muted-foreground">
+                        Forge will create this folder before saving the project.
+                      </p>
+                    </div>
+                  )}
 
                   <div className="rounded-lg border border-border bg-muted/30">
                     <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
                       <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
                         {folderListing?.path ?? 'Loading folders...'}
                       </span>
-                      <div className="flex shrink-0 items-center gap-1">
+                      <div className="flex shrink-0 items-center gap-2">
+                        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                          <input
+                            type="checkbox"
+                            checked={showHiddenFolders}
+                            onChange={(e) => {
+                              const next = e.target.checked
+                              setShowHiddenFolders(next)
+                              void loadFolders(folderListing?.path, next)
+                            }}
+                            className="size-3.5 rounded border-input"
+                            aria-label="Show hidden folders"
+                          />
+                          Show hidden
+                        </label>
                         {folderListing?.parentPath && (
                           <Button
                             type="button"
@@ -442,10 +600,219 @@ export default function ProjectsPage() {
                             onClick={() => void loadFolders(directory.path)}
                             disabled={folderLoading}
                             className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-background hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                            aria-label={`Open folder ${directory.name}`}
+                            aria-label={`Open folder ${directory.name}${directory.isGitRepo ? ' (Git repository)' : ''}`}
                           >
                             <FolderOpenIcon className="size-3.5 shrink-0" aria-hidden="true" />
                             <span className="min-w-0 truncate">{directory.name}</span>
+                            {directory.isGitRepo && (
+                              <GitBranchIcon
+                                className="ml-auto size-3.5 shrink-0 text-muted-foreground"
+                                aria-hidden="true"
+                              />
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="px-3 py-4 text-center text-xs text-muted-foreground">
+                        No child folders.
+                      </p>
+                    )}
+                  </div>
+
+                  {!currentFolderIsGitRepo && localPathPreview !== '' && (
+                    <div className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                      New project path:{' '}
+                      <code className="break-all font-mono text-foreground">{localPathPreview}</code>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {formSource === 'clone' && (
+                <div className="flex flex-col gap-2">
+                  <label htmlFor="clone-repository" className="text-sm font-medium text-foreground">
+                    GitHub Repo <span aria-hidden="true" className="text-destructive">*</span>
+                  </label>
+
+                  {cloneReposLoading && (
+                    <p className="px-1 py-1 text-xs text-muted-foreground">Loading your repositories...</p>
+                  )}
+
+                  {cloneReposError !== null && (
+                    <div
+                      role="alert"
+                      className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+                    >
+                      {cloneReposError}
+                      <div className="mt-1 text-muted-foreground">
+                        Need repo permissions? Run <code className="font-mono text-foreground">gh auth login --scopes repo,workflow</code>.
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void loadCloneRepos()}
+                        className="mt-1 underline underline-offset-2 hover:no-underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      >
+                        Retry
+                      </button>
+                    </div>
+                  )}
+
+                  {!cloneReposLoading && cloneReposError === null && cloneRepos !== null && (
+                    <>
+                      {cloneRepos.length > 15 && (
+                        <input
+                          type="text"
+                          value={cloneRepoFilter}
+                          onChange={(e) => setCloneRepoFilter(e.target.value)}
+                          placeholder="Filter repositories…"
+                          autoComplete="off"
+                          data-1p-ignore="true"
+                          data-lpignore="true"
+                          data-form-type="other"
+                          className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                          aria-label="Filter repositories"
+                        />
+                      )}
+                      <Select value={cloneRepo || undefined} onValueChange={(v) => v && setCloneRepo(v)}>
+                        <SelectTrigger id="clone-repository" className="w-full" aria-required="true">
+                          <SelectValue placeholder={cloneRepos.length > 0 ? 'Choose a repository' : 'No repositories found'} />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {filteredCloneRepos.map((repo) => (
+                            <SelectItem key={repo.nameWithOwner} value={repo.nameWithOwner}>
+                              {repo.nameWithOwner}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </>
+                  )}
+
+                  <label htmlFor="clone-local-parent-path" className="mt-2 text-sm font-medium text-foreground">
+                    Destination Folder <span aria-hidden="true" className="text-destructive">*</span>
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      id="clone-local-parent-path"
+                      type="text"
+                      required
+                      value={formLocalParentPath}
+                      onChange={(e) => setFormLocalParentPath(e.target.value)}
+                      placeholder="/Users/alex/Projects"
+                      autoComplete="off"
+                      data-1p-ignore="true"
+                      data-lpignore="true"
+                      data-form-type="other"
+                      className="min-w-0 flex-1 rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                      aria-describedby="clone-local-parent-path-help"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => void loadFolders(formLocalParentPath || undefined)}
+                      disabled={folderLoading}
+                      aria-label="Browse local folders"
+                    >
+                      <FolderOpenIcon aria-hidden="true" />
+                      Browse
+                    </Button>
+                  </div>
+                  <p id="clone-local-parent-path-help" className="text-xs text-muted-foreground">
+                    Type a path and press Browse, or click folders below to open them. Forge will
+                    clone the repository into a new folder inside the folder shown below.
+                  </p>
+
+                  <div className="flex flex-col gap-1.5">
+                    <label htmlFor="clone-local-folder-name" className="text-sm font-medium text-foreground">
+                      New Folder Name <span aria-hidden="true" className="text-destructive">*</span>
+                    </label>
+                    <input
+                      id="clone-local-folder-name"
+                      type="text"
+                      required
+                      value={formLocalFolderName}
+                      onChange={(e) => {
+                        setFolderNameEdited(true)
+                        setFormLocalFolderName(e.target.value)
+                      }}
+                      placeholder="my-project"
+                      autoComplete="off"
+                      data-1p-ignore="true"
+                      data-lpignore="true"
+                      data-form-type="other"
+                      className="rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                      aria-describedby="clone-local-folder-name-help"
+                    />
+                    <p id="clone-local-folder-name-help" className="text-xs text-muted-foreground">
+                      Forge will clone the repository into this new folder.
+                    </p>
+                  </div>
+
+                  <div className="rounded-lg border border-border bg-muted/30">
+                    <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                      <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
+                        {folderListing?.path ?? 'Loading folders...'}
+                      </span>
+                      <div className="flex shrink-0 items-center gap-2">
+                        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                          <input
+                            type="checkbox"
+                            checked={showHiddenFolders}
+                            onChange={(e) => {
+                              const next = e.target.checked
+                              setShowHiddenFolders(next)
+                              void loadFolders(folderListing?.path, next)
+                            }}
+                            className="size-3.5 rounded border-input"
+                            aria-label="Show hidden folders"
+                          />
+                          Show hidden
+                        </label>
+                        {folderListing?.parentPath && (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => void loadFolders(folderListing.parentPath ?? undefined)}
+                            disabled={folderLoading}
+                            aria-label="Go up one folder"
+                          >
+                            Up
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+
+                    {folderError !== null && (
+                      <p role="alert" className="px-3 py-2 text-xs text-destructive">
+                        {folderError}
+                      </p>
+                    )}
+
+                    {folderLoading ? (
+                      <p className="px-3 py-4 text-center text-xs text-muted-foreground">
+                        Loading...
+                      </p>
+                    ) : folderListing !== null && folderListing.directories.length > 0 ? (
+                      <div className="max-h-52 overflow-y-auto p-1">
+                        {folderListing.directories.map((directory) => (
+                          <button
+                            type="button"
+                            key={directory.path}
+                            onClick={() => void loadFolders(directory.path)}
+                            disabled={folderLoading}
+                            className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-background hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            aria-label={`Open folder ${directory.name}${directory.isGitRepo ? ' (Git repository)' : ''}`}
+                          >
+                            <FolderOpenIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                            <span className="min-w-0 truncate">{directory.name}</span>
+                            {directory.isGitRepo && (
+                              <GitBranchIcon
+                                className="ml-auto size-3.5 shrink-0 text-muted-foreground"
+                                aria-hidden="true"
+                              />
+                            )}
                           </button>
                         ))}
                       </div>
@@ -458,7 +825,7 @@ export default function ProjectsPage() {
 
                   {localPathPreview !== '' && (
                     <div className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-                      New project path:{' '}
+                      Repository will be cloned to:{' '}
                       <code className="break-all font-mono text-foreground">{localPathPreview}</code>
                     </div>
                   )}
@@ -467,7 +834,7 @@ export default function ProjectsPage() {
 
               <div className="flex flex-col gap-1.5">
                 <label htmlFor="project-branch" className="text-sm font-medium text-foreground">
-                  {formSource === 'github' ? 'Default Branch' : 'Initial Branch'}
+                  {formSource === 'local' ? 'Initial Branch' : 'Default Branch'}
                 </label>
                 <input
                   id="project-branch"
@@ -476,6 +843,9 @@ export default function ProjectsPage() {
                   onChange={(e) => setFormBranch(e.target.value)}
                   placeholder="main"
                   autoComplete="off"
+                  data-1p-ignore="true"
+                  data-lpignore="true"
+                  data-form-type="other"
                   className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
                 />
               </div>
@@ -488,7 +858,7 @@ export default function ProjectsPage() {
 
               <DialogFooter>
                 <Button type="submit" disabled={submitting} aria-busy={submitting}>
-                  {submitting ? 'Creating…' : 'Create Project'}
+                  {submitting ? (formSource === 'clone' ? 'Cloning…' : 'Creating…') : 'Create Project'}
                 </Button>
               </DialogFooter>
             </form>

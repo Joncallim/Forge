@@ -6,6 +6,7 @@ import { projects, tasks } from '@/db/schema'
 import { eq, desc, count, getTableColumns, and, isNull } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
+import { generateTaskTitle } from '@/lib/task-title'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -13,7 +14,7 @@ import { redis } from '@/lib/redis'
 
 const createTaskSchema = z.object({
   projectId: z.string().uuid(),
-  title: z.string().min(1).max(500),
+  title: z.string().max(500).optional().default(''),
   prompt: z.string().min(1),
   pmProviderConfigId: z.string().uuid().optional(),
 })
@@ -127,11 +128,13 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
     }
 
+    const title = data.title.trim() || (await generateTaskTitle(data.prompt, data.pmProviderConfigId))
+
     const [task] = await db
       .insert(tasks)
       .values({
         projectId: data.projectId,
-        title: data.title,
+        title,
         prompt: data.prompt,
         status: 'pending',
         submittedBy: session.userId,

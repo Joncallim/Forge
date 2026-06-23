@@ -135,6 +135,81 @@ export async function validatePat(token: string): Promise<{ login: string } | nu
 }
 
 // ---------------------------------------------------------------------------
+// Repo listing
+// ---------------------------------------------------------------------------
+
+const GITHUB_API_HEADERS = (token: string) => ({
+  Authorization: `Bearer ${token}`,
+  Accept: 'application/vnd.github+json',
+  'User-Agent': 'forge',
+  'X-GitHub-Api-Version': '2022-11-28',
+})
+
+const LIST_REPOS_PAGE_SIZE = 100
+const LIST_REPOS_MAX_TOTAL = 500
+const LIST_REPOS_TIMEOUT_MS = 5000
+
+/** Parse the `rel="next"` URL out of a GitHub `Link` response header, if present. */
+function parseNextLink(linkHeader: string | null): string | null {
+  if (!linkHeader) return null
+  const parts = linkHeader.split(',')
+  for (const part of parts) {
+    const match = part.match(/<([^>]+)>\s*;\s*rel="next"/)
+    if (match) return match[1]
+  }
+  return null
+}
+
+/**
+ * List the authenticated user's GitHub repos, paginating via the `Link` header
+ * up to a hard cap of 500 repos. Throws on any fetch/parse error so the caller
+ * can distinguish "no repos" from "the call failed".
+ */
+export async function listRepos(
+  token: string,
+): Promise<{ nameWithOwner: string; description: string | null }[]> {
+  const results: { nameWithOwner: string; description: string | null }[] = []
+  let url: string | null = `https://api.github.com/user/repos?per_page=${LIST_REPOS_PAGE_SIZE}&sort=updated&page=1`
+
+  while (url && results.length < LIST_REPOS_MAX_TOTAL) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), LIST_REPOS_TIMEOUT_MS)
+    let res: Response
+    try {
+      res = await fetch(url, {
+        signal: controller.signal,
+        headers: GITHUB_API_HEADERS(token),
+      })
+    } finally {
+      clearTimeout(timer)
+    }
+
+    if (!res.ok) {
+      throw new Error(`GitHub API returned ${res.status} while listing repos`)
+    }
+
+    const body = (await res.json()) as Array<{
+      full_name?: string
+      description?: string | null
+    }>
+
+    for (const repo of body) {
+      if (typeof repo.full_name !== 'string') continue
+      results.push({ nameWithOwner: repo.full_name, description: repo.description ?? null })
+      if (results.length >= LIST_REPOS_MAX_TOTAL) break
+    }
+
+    if (body.length < LIST_REPOS_PAGE_SIZE) {
+      url = null
+    } else {
+      url = parseNextLink(res.headers.get('Link'))
+    }
+  }
+
+  return results
+}
+
+// ---------------------------------------------------------------------------
 // Token resolution + status
 // ---------------------------------------------------------------------------
 

@@ -23,6 +23,7 @@ export interface Artifact {
   artifactType: string
   content: string
   metadata: unknown
+  createdAt?: string
 }
 
 export interface TaskQuestion {

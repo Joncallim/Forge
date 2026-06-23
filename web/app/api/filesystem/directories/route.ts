@@ -8,11 +8,6 @@ import { getSession } from '@/lib/session'
 
 export const runtime = 'nodejs'
 
-type DirectoryEntry = {
-  name: string
-  path: string
-}
-
 const createDirectorySchema = z.object({
   parentPath: z.string().trim().min(1).max(1000).optional(),
   name: z.string().trim().min(1).max(120),
@@ -27,6 +22,15 @@ const createDirectorySchema = z.object({
 async function isDirectoryEmpty(dirPath: string): Promise<boolean> {
   const entries = await fs.readdir(dirPath)
   return entries.length === 0
+}
+
+async function hasGitSubdirectory(dirPath: string): Promise<boolean> {
+  try {
+    const stat = await fs.stat(path.join(/*turbopackIgnore: true*/ dirPath, '.git'))
+    return stat.isDirectory()
+  } catch {
+    return false
+  }
 }
 
 function defaultStartPath(): string {
@@ -59,6 +63,7 @@ export async function GET(request: NextRequest) {
     }
 
     const requestedPath = request.nextUrl.searchParams.get('path')
+    const showHidden = request.nextUrl.searchParams.get('showHidden') === '1'
     const currentPath = resolveDirectoryPath(requestedPath)
     const stat = await fs.stat(currentPath)
     if (!stat.isDirectory()) {
@@ -66,18 +71,30 @@ export async function GET(request: NextRequest) {
     }
 
     const dirents = await fs.readdir(currentPath, { withFileTypes: true })
-    const directories: DirectoryEntry[] = []
+    const candidates: { name: string; path: string }[] = []
 
     for (const dirent of dirents) {
       if (!dirent.isDirectory()) continue
       if (dirent.name === 'node_modules' || dirent.name === '.git') continue
-      directories.push({
+      if (!showHidden && dirent.name.startsWith('.')) continue
+      candidates.push({
         name: dirent.name,
         path: path.join(/*turbopackIgnore: true*/ currentPath, dirent.name),
       })
     }
 
-    directories.sort((a, b) => a.name.localeCompare(b.name))
+    candidates.sort((a, b) => a.name.localeCompare(b.name))
+    const bounded = candidates.slice(0, 200)
+
+    const [directories, currentPathIsGitRepo] = await Promise.all([
+      Promise.all(
+        bounded.map(async (entry) => ({
+          ...entry,
+          isGitRepo: await hasGitSubdirectory(entry.path),
+        })),
+      ),
+      hasGitSubdirectory(currentPath),
+    ])
 
     const parsed = path.parse(currentPath)
     const parentPath = currentPath === parsed.root ? null : path.dirname(currentPath)
@@ -85,7 +102,8 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({
       path: currentPath,
       parentPath,
-      directories: directories.slice(0, 200),
+      currentPathIsGitRepo,
+      directories,
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unable to read directory'

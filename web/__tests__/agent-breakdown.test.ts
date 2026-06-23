@@ -12,10 +12,27 @@ describe('parseAgentBreakdown', () => {
     )
 
     expect(agents).toEqual([
-      { role: 'Frontend', tasks: 2, summary: 'Build the task page' },
+      { role: 'Frontend', tasks: 2, summary: 'Build the task page', steps: [] },
     ])
     expect(planText).toContain('[Frontend] Build UI')
     expect(planText).not.toContain(AGENT_BREAKDOWN_FENCE)
+  })
+
+  it('extracts the steps array when present', () => {
+    const { agents } = parseAgentBreakdown(
+      withFence(
+        '{"agents":[{"role":"Frontend","tasks":2,"summary":"Build the task page","steps":["Build the task list component","Wire up state handling"]}]}',
+      ),
+    )
+
+    expect(agents).toEqual([
+      {
+        role: 'Frontend',
+        tasks: 2,
+        summary: 'Build the task page',
+        steps: ['Build the task list component', 'Wire up state handling'],
+      },
+    ])
   })
 
   it('falls back to role tags when the structured block is absent', () => {
@@ -28,8 +45,8 @@ describe('parseAgentBreakdown', () => {
     ].join('\n'))
 
     expect(agents).toEqual([
-      { role: 'Frontend', tasks: 2, summary: 'Build UI; Wire state' },
-      { role: 'Backend', tasks: 1, summary: 'Add API' },
+      { role: 'Frontend', tasks: 2, summary: 'Build UI; Wire state', steps: ['Build UI', 'Wire state'] },
+      { role: 'Backend', tasks: 1, summary: 'Add API', steps: ['Add API'] },
     ])
   })
 })
