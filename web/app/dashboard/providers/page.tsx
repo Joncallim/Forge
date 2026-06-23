@@ -59,6 +59,7 @@ type ProviderHealth = {
   envVarPresent: boolean
   latencyMs: number | null
   error: string | null
+  checkedAt: string | null
 }
 
 type HealthMap = Record<string, ProviderHealth | 'loading' | 'error'>
@@ -111,52 +112,80 @@ function formFromProvider(p: ProviderConfig): ProviderFormState {
 // ---------------------------------------------------------------------------
 
 function HealthDot({ health }: { health: ProviderHealth | 'loading' | 'error' | undefined }) {
+  const lastChecked =
+    typeof health === 'object' && health.checkedAt
+      ? new Intl.DateTimeFormat(undefined, { dateStyle: 'short', timeStyle: 'short' }).format(new Date(health.checkedAt))
+      : null
+
   if (health === undefined || health === 'loading') {
     return (
       <span
-        className="inline-flex items-center gap-1.5"
+        className="inline-flex flex-col gap-0.5"
         aria-label="Checking health"
         title="Checking health"
       >
-        <span className="size-2 rounded-full bg-gray-300 dark:bg-gray-600 animate-pulse" aria-hidden="true" />
-        <span className="text-xs text-muted-foreground">Checking</span>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="size-2 rounded-full bg-gray-300 dark:bg-gray-600 animate-pulse" aria-hidden="true" />
+          <span className="text-xs text-muted-foreground">Checking</span>
+        </span>
       </span>
     )
   }
   if (health === 'error') {
     return (
-      <span className="inline-flex items-center gap-1.5" aria-label="Health check failed" title="Health check failed">
-        <span className="size-2 rounded-full bg-gray-400" aria-hidden="true" />
-        <span className="text-xs text-muted-foreground">Unknown</span>
+      <span className="inline-flex flex-col gap-0.5" aria-label="Health check failed" title="Health check failed">
+        <span className="inline-flex items-center gap-1.5">
+          <span className="size-2 rounded-full bg-gray-400" aria-hidden="true" />
+          <span className="text-xs text-muted-foreground">Unknown</span>
+        </span>
+      </span>
+    )
+  }
+  if (health.checkedAt === null) {
+    return (
+      <span className="inline-flex flex-col gap-0.5" aria-label="Provider health not checked" title={health.error ?? 'Not checked'}>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="size-2 rounded-full bg-gray-400" aria-hidden="true" />
+          <span className="text-xs text-muted-foreground">Not checked</span>
+        </span>
       </span>
     )
   }
   if (!health.envVarPresent) {
     return (
-      <span className="inline-flex items-center gap-1.5" aria-label="Environment variable missing" title="Environment variable missing">
-        <span className="size-2 rounded-full bg-yellow-400" aria-hidden="true" />
-        <span className="text-xs text-muted-foreground">Env var missing</span>
+      <span className="inline-flex flex-col gap-0.5" aria-label="Environment variable missing" title="Environment variable missing">
+        <span className="inline-flex items-center gap-1.5">
+          <span className="size-2 rounded-full bg-yellow-400" aria-hidden="true" />
+          <span className="text-xs text-muted-foreground">Env var missing</span>
+        </span>
+        <span className="text-[11px] text-muted-foreground">{lastChecked ?? 'Not checked'}</span>
       </span>
     )
   }
   if (!health.reachable) {
     return (
-      <span className="inline-flex items-center gap-1.5" aria-label="Provider unreachable" title={health.error ?? 'Unreachable'}>
-        <span className="size-2 rounded-full bg-red-500" aria-hidden="true" />
-        <span className="text-xs text-muted-foreground">Unreachable</span>
+      <span className="inline-flex flex-col gap-0.5" aria-label="Provider unreachable" title={health.error ?? 'Unreachable'}>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="size-2 rounded-full bg-red-500" aria-hidden="true" />
+          <span className="text-xs text-muted-foreground">Unreachable</span>
+        </span>
+        <span className="text-[11px] text-muted-foreground">{lastChecked ?? 'Not checked'}</span>
       </span>
     )
   }
   return (
     <span
-      className="inline-flex items-center gap-1.5"
+      className="inline-flex flex-col gap-0.5"
       aria-label={`Reachable${health.latencyMs !== null ? `, ${health.latencyMs} ms` : ''}`}
-      title={health.latencyMs !== null ? `${health.latencyMs} ms` : 'Reachable'}
+      title={lastChecked ? `Last checked ${lastChecked}` : 'Reachable'}
     >
-      <span className="size-2 rounded-full bg-green-500" aria-hidden="true" />
-      <span className="text-xs text-muted-foreground">
-        {health.latencyMs !== null ? `${health.latencyMs} ms` : 'OK'}
+      <span className="inline-flex items-center gap-1.5">
+        <span className="size-2 rounded-full bg-green-500" aria-hidden="true" />
+        <span className="text-xs text-muted-foreground">
+          {health.latencyMs !== null ? `${health.latencyMs} ms` : 'OK'}
+        </span>
       </span>
+      <span className="text-[11px] text-muted-foreground">{lastChecked ?? 'Not checked'}</span>
     </span>
   )
 }
@@ -389,6 +418,7 @@ export default function ProvidersPage() {
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
   const [healthMap, setHealthMap] = useState<HealthMap>({})
+  const [refreshingHealth, setRefreshingHealth] = useState(false)
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [discovering, setDiscovering] = useState(false)
   const [discoverMsg, setDiscoverMsg] = useState<string | null>(null)
@@ -432,21 +462,23 @@ export default function ProvidersPage() {
   }, [loadProviders])
 
   // ---------------------------------------------------------------------------
-  // Health checks — run in parallel after providers load
+  // Health cache — read cached rows by default; live probes only on explicit refresh
   // ---------------------------------------------------------------------------
 
-  useEffect(() => {
-    if (providers.length === 0) return
+  const loadHealth = useCallback(async (refresh = false) => {
+    if (providers.length === 0) {
+      setHealthMap({})
+      return
+    }
 
-    // Set all to loading
     const initial: HealthMap = {}
     for (const p of providers) initial[p.id] = 'loading'
     setHealthMap(initial)
 
-    void Promise.allSettled(
+    await Promise.allSettled(
       providers.map(async (p) => {
         try {
-          const res = await fetch(`/api/providers/${p.id}/health`)
+          const res = await fetch(`/api/providers/${p.id}/health${refresh ? '?refresh=1' : ''}`)
           if (!res.ok) throw new Error('Health check failed')
           const health = await res.json() as ProviderHealth
           setHealthMap((prev) => ({ ...prev, [p.id]: health }))
@@ -456,6 +488,19 @@ export default function ProvidersPage() {
       })
     )
   }, [providers])
+
+  useEffect(() => {
+    void loadHealth(false)
+  }, [loadHealth])
+
+  async function handleRefreshHealth() {
+    setRefreshingHealth(true)
+    try {
+      await loadHealth(true)
+    } finally {
+      setRefreshingHealth(false)
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Add provider
@@ -813,7 +858,18 @@ export default function ProvidersPage() {
 
       {/* Refresh button */}
       {!loading && (
-        <div className="mb-10 flex justify-end">
+        <div className="mb-10 flex justify-end gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleRefreshHealth}
+            disabled={refreshingHealth || providers.length === 0}
+            aria-busy={refreshingHealth}
+            aria-label="Refresh provider health"
+          >
+            <RefreshCwIcon className="size-4" aria-hidden="true" />
+            {refreshingHealth ? 'Checking…' : 'Refresh health'}
+          </Button>
           <Button
             variant="outline"
             size="sm"

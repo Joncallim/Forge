@@ -42,6 +42,17 @@ The installer records what was missing before Forge installed it. The uninstall
 script uses that record to remove Forge-only packages without removing packages
 you already had.
 
+The web dependency step uses `npm ci` for a clean lockfile install and falls
+back to `npm install` when an existing `node_modules` tree is present. It times
+out and retries once instead of hanging forever. Tune the guard with:
+
+```bash
+FORGE_NPM_INSTALL_TIMEOUT_SECONDS=1200 bash scripts/install.sh
+```
+
+If an install is interrupted with Ctrl+C, re-run `bash scripts/install.sh`; the
+installer preserves existing settings and resumes idempotent setup steps.
+
 ## Check Readiness Without Installing
 
 Use this when you want to see whether the machine already has what Forge needs:
@@ -86,6 +97,14 @@ installer. It keeps:
 - PostgreSQL data
 - Redis data
 - `.forge/install-manifest`
+
+Large folders such as `web/node_modules` are removed with per-path progress and
+a timeout guard. If a delete stalls, stop any running `npm run dev`, worker, or
+file watcher processes and re-run uninstall. Tune the guard with:
+
+```bash
+FORGE_REMOVE_TIMEOUT_SECONDS=300 bash scripts/uninstall.sh
+```
 
 ## Remove Everything Forge Created
 

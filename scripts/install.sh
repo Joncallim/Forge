@@ -30,6 +30,7 @@ SKIP_OLLAMA="${FORGE_SKIP_OLLAMA:-0}"
 ZERO_CONFIG_MODEL="${FORGE_ZERO_CONFIG_MODEL:-qwen2.5-coder:7b}"
 SERVICE_MODE="${FORGE_SERVICE_MODE:-auto}"
 PACKAGE_MANAGER_OVERRIDE="${FORGE_PACKAGE_MANAGER_OVERRIDE:-}"
+NPM_INSTALL_TIMEOUT_SECONDS="${FORGE_NPM_INSTALL_TIMEOUT_SECONDS:-900}"
 PACKAGE_MANAGER=""
 SUDO=()
 APT_UPDATED=0
@@ -83,6 +84,7 @@ Environment:
   FORGE_OS_OVERRIDE=Darwin|Linux              # dry-run/testing helper
   FORGE_PACKAGE_MANAGER_OVERRIDE=apt|brew     # dry-run/testing helper
   FORGE_ENV_FILE=/path/to/.env                # testing/advanced helper
+  FORGE_NPM_INSTALL_TIMEOUT_SECONDS=900       # npm install/ci timeout guard
 EOF
 }
 
@@ -149,6 +151,15 @@ case "$SERVICE_MODE" in
   *) die "Unsupported service mode: $SERVICE_MODE" ;;
 esac
 
+case "$NPM_INSTALL_TIMEOUT_SECONDS" in
+  ''|*[!0-9]*)
+    die "FORGE_NPM_INSTALL_TIMEOUT_SECONDS must be a positive integer."
+    ;;
+  *)
+    [ "$NPM_INSTALL_TIMEOUT_SECONDS" -gt 0 ] || die "FORGE_NPM_INSTALL_TIMEOUT_SECONDS must be a positive integer."
+    ;;
+esac
+
 run() {
   local description="$1"
   shift
@@ -174,6 +185,62 @@ run_quiet() {
     printf '\n'
   } >> "$INSTALL_LOG" 2>&1
   "$@" >> "$INSTALL_LOG" 2>&1
+}
+
+run_with_timeout() {
+  local description="$1"
+  local timeout_seconds="$2"
+  shift 2
+
+  if [ "$DRY_RUN" = "1" ]; then
+    info "[dry-run] $description"
+    return 0
+  fi
+
+  local attempt max_attempts pid elapsed exit_code timed_out
+  max_attempts=2
+  attempt=1
+
+  while [ "$attempt" -le "$max_attempts" ]; do
+    info "$description (attempt $attempt/$max_attempts; timeout ${timeout_seconds}s)"
+    "$@" &
+    pid="$!"
+    elapsed=0
+    timed_out=0
+
+    while kill -0 "$pid" 2>/dev/null; do
+      sleep 5
+      elapsed=$((elapsed + 5))
+      if [ $((elapsed % 30)) -eq 0 ]; then
+        info "Still running after ${elapsed}s: $description"
+      fi
+      if [ "$elapsed" -ge "$timeout_seconds" ]; then
+        timed_out=1
+        warn "$description timed out after ${timeout_seconds}s. Stopping it and retrying if possible."
+        kill -TERM "$pid" 2>/dev/null || true
+        sleep 5
+        kill -KILL "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        exit_code=124
+        break
+      fi
+    done
+
+    if [ "$timed_out" = "0" ]; then
+      if wait "$pid"; then
+        return 0
+      else
+        exit_code="$?"
+      fi
+    fi
+
+    if [ "$attempt" -lt "$max_attempts" ]; then
+      warn "$description failed. Retrying once."
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  return "$exit_code"
 }
 
 ensure_install_state() {
@@ -1042,8 +1109,14 @@ seed_local_ai_if_ready() {
 
 prepare_web_app() {
   step "Installing web dependencies and preparing the database"
-  info "npm install can take a few minutes on the first run."
-  run "npm install" bash -c 'cd "$1" && npm install --loglevel=error --no-audit --no-fund' _ "$REPO_ROOT/web"
+  info "The npm dependency step can take a few minutes on the first run. If interrupted, re-run this installer."
+  if [ -f "$REPO_ROOT/web/package-lock.json" ] && [ ! -d "$REPO_ROOT/web/node_modules" ]; then
+    run_with_timeout "npm ci" "$NPM_INSTALL_TIMEOUT_SECONDS" \
+      bash -c 'cd "$1" && npm ci --no-audit --no-fund --progress=true' _ "$REPO_ROOT/web"
+  else
+    run_with_timeout "npm install" "$NPM_INSTALL_TIMEOUT_SECONDS" \
+      bash -c 'cd "$1" && npm install --no-audit --no-fund --progress=true' _ "$REPO_ROOT/web"
+  fi
   run "npm run db:migrate" bash -c 'cd "$1" && FORGE_SUPPRESS_MIGRATION_NOTICES=1 npm run db:migrate --silent' _ "$REPO_ROOT/web"
   run "npm run db:seed-agents" bash -c 'cd "$1" && npm run db:seed-agents' _ "$REPO_ROOT/web"
 }
@@ -1140,7 +1213,7 @@ run_check_only() {
   if [ -d "$REPO_ROOT/web/node_modules" ]; then
     info "ok      web/node_modules exists"
   else
-    warn "web/node_modules is missing. Run bash scripts/install.sh or cd web && npm install."
+    warn "web/node_modules is missing. Run bash scripts/install.sh to install web dependencies."
     failed=1
   fi
 

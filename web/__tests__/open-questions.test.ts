@@ -16,7 +16,10 @@ describe('parseOpenQuestions', () => {
     const { planText, questions } = parseOpenQuestions(
       withFence('{"questions": ["Which DB?", "Auth method?"]}'),
     )
-    expect(questions).toEqual(['Which DB?', 'Auth method?'])
+    expect(questions).toEqual([
+      { question: 'Which DB?', suggestions: [] },
+      { question: 'Auth method?', suggestions: [] },
+    ])
     expect(planText).not.toContain(OPEN_QUESTIONS_FENCE)
     expect(planText).toContain('Do the thing.')
   })
@@ -25,7 +28,19 @@ describe('parseOpenQuestions', () => {
     const { questions } = parseOpenQuestions(
       withFence('{"questions": ["  A  ", "A", "", 5, "B"]}'),
     )
-    expect(questions).toEqual(['A', 'B'])
+    expect(questions).toEqual([
+      { question: 'A', suggestions: [] },
+      { question: 'B', suggestions: [] },
+    ])
+  })
+
+  it('extracts structured questions with up to four suggestions', () => {
+    const { questions } = parseOpenQuestions(
+      withFence('{"questions":[{"question":"Pick a DB","suggestions":["Postgres","SQLite","Postgres","MySQL","DuckDB"]}]}'),
+    )
+    expect(questions).toEqual([
+      { question: 'Pick a DB', suggestions: ['Postgres', 'SQLite', 'MySQL', 'DuckDB'] },
+    ])
   })
 
   it('treats an empty array as no questions', () => {

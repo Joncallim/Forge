@@ -2,6 +2,7 @@ const DEFAULT_CLAIM_TIMEOUT_SECONDS = 5
 const APPROVAL_CLAIM_TIMEOUT_SECONDS = 1
 const DEFAULT_MAX_ATTEMPTS = 3
 const DEFAULT_STUCK_JOB_RECOVERY_SECONDS = 15 * 60
+const DEFAULT_PROVIDER_HEALTH_INTERVAL_SECONDS = 5 * 60
 
 type WorkerSource = 'standalone' | 'embedded'
 
@@ -48,6 +49,18 @@ function getPositiveIntegerEnv(name: string, defaultValue: number): number {
   return parsed
 }
 
+function getNonNegativeIntegerEnv(name: string, defaultValue: number): number {
+  const raw = process.env[name]
+  if (!raw) return defaultValue
+
+  const parsed = Number(raw)
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer`)
+  }
+
+  return parsed
+}
+
 function backoffDelayMs(attempt: number): number {
   return Math.min(2 ** Math.max(attempt - 1, 0) * 1000, 30_000)
 }
@@ -89,19 +102,53 @@ async function startWorkerOnce(
   const stuckJobRecoveryMs =
     getPositiveIntegerEnv('FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS', DEFAULT_STUCK_JOB_RECOVERY_SECONDS) *
     1000
+  const providerHealthIntervalSeconds = getNonNegativeIntegerEnv(
+    'FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS',
+    DEFAULT_PROVIDER_HEALTH_INTERVAL_SECONDS,
+  )
   const workerId = `${source}-${process.pid}-${Date.now().toString(36)}`
   let shuttingDown = false
+  let providerHealthTimer: ReturnType<typeof setInterval> | null = null
+  let providerHealthRunning = false
+
+  const refreshProviderHealth = async (): Promise<void> => {
+    if (providerHealthIntervalSeconds === 0 || providerHealthRunning) return
+    providerHealthRunning = true
+    try {
+      const { refreshStaleProviderHealth } = await import('../lib/providers/health')
+      const checked = await refreshStaleProviderHealth(providerHealthIntervalSeconds * 1000)
+      if (checked > 0) {
+        console.info('[worker] Refreshed provider health cache', { checked, workerId })
+      }
+    } catch (err) {
+      console.warn('[worker] Provider health refresh failed', {
+        err: errorMessage(err),
+        workerId,
+      })
+    } finally {
+      providerHealthRunning = false
+    }
+  }
 
   const run = async (): Promise<void> => {
     console.info('[worker] Started', {
       claimTimeoutSeconds,
       maxAttempts,
+      providerHealthIntervalSeconds,
       source,
       stuckJobRecoveryMs,
       workerId,
     })
 
     try {
+      if (providerHealthIntervalSeconds > 0) {
+        void refreshProviderHealth()
+        providerHealthTimer = setInterval(
+          () => void refreshProviderHealth(),
+          providerHealthIntervalSeconds * 1000,
+        )
+      }
+
       const [recoveredApprovals, recoveredAnswers, recoveredTasks] = await Promise.all([
         approvalQueue.recoverStuckJobs(stuckJobRecoveryMs),
         answersQueue.recoverStuckJobs(stuckJobRecoveryMs),
@@ -366,6 +413,10 @@ async function startWorkerOnce(
         }
       }
     } finally {
+      if (providerHealthTimer !== null) {
+        clearInterval(providerHealthTimer)
+        providerHealthTimer = null
+      }
       taskQueue.disconnect()
       approvalQueue.disconnect()
       answersQueue.disconnect()

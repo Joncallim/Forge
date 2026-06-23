@@ -4,7 +4,7 @@ import { db } from '@/db'
 import { providerConfigs } from '@/db/schema'
 import { eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
-import { checkProviderHealth } from '@/lib/providers/health'
+import { getCachedProviderHealth, refreshProviderHealth } from '@/lib/providers/health'
 
 // ---------------------------------------------------------------------------
 // GET /api/providers/:id/health
@@ -32,8 +32,22 @@ export async function GET(
       return NextResponse.json({ error: 'Provider config not found' }, { status: 404 })
     }
 
-    const health = await checkProviderHealth(config)
-    return NextResponse.json(health)
+    const refresh = request.nextUrl.searchParams.get('refresh') === '1'
+    if (refresh) {
+      const health = await refreshProviderHealth(config)
+      return NextResponse.json(health)
+    }
+
+    const cached = await getCachedProviderHealth(config.id)
+    return NextResponse.json(
+      cached ?? {
+        reachable: false,
+        envVarPresent: true,
+        latencyMs: null,
+        error: 'Health check has not run yet',
+        checkedAt: null,
+      },
+    )
   } catch (err) {
     console.error('[GET /api/providers/:id/health] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
