@@ -214,6 +214,141 @@ function GitHubCard() {
 }
 
 // ---------------------------------------------------------------------------
+// Security card — manage passkeys
+// ---------------------------------------------------------------------------
+
+type CredentialSummary = {
+  id: string
+  friendlyName: string | null
+  deviceType: string
+  backedUp: boolean
+  createdAt: string
+  lastUsedAt: string | null
+}
+
+function SecurityCard() {
+  const [credentialList, setCredentialList] = useState<CredentialSummary[] | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [fetchError, setFetchError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [removingId, setRemovingId] = useState<string | null>(null)
+
+  const loadCredentials = useCallback(async () => {
+    setLoading(true)
+    setFetchError(null)
+    try {
+      const res = await fetch('/api/auth/credentials')
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error((body as { error?: string }).error ?? 'Failed to load passkeys')
+      }
+      const body = (await res.json()) as { credentials: CredentialSummary[] }
+      setCredentialList(body.credentials)
+    } catch (err) {
+      setFetchError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadCredentials()
+  }, [loadCredentials])
+
+  async function handleRemove(id: string) {
+    setRemovingId(id)
+    setActionError(null)
+    try {
+      const res = await fetch(`/api/auth/credentials/${id}`, { method: 'DELETE' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error((body as { error?: string }).error ?? 'Failed to remove passkey')
+      }
+      await loadCredentials()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setRemovingId(null)
+    }
+  }
+
+  return (
+    <section aria-labelledby="security-heading" className="rounded-xl border border-border bg-card p-5">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <h2 id="security-heading" className="text-lg font-semibold text-foreground">
+          Security
+        </h2>
+      </div>
+
+      {loading && (
+        <p className="text-sm text-muted-foreground" role="status" aria-live="polite">
+          Loading passkeys…
+        </p>
+      )}
+
+      {!loading && fetchError !== null && (
+        <div role="alert" className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          {fetchError}
+          <button onClick={loadCredentials} className="ml-2 underline underline-offset-2 hover:no-underline">
+            Retry
+          </button>
+        </div>
+      )}
+
+      {!loading && credentialList !== null && (
+        <div className="flex flex-col gap-4">
+          {credentialList.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No passkeys are registered. You can sign in with your password.</p>
+          ) : (
+            <ul className="flex flex-col gap-2">
+              {credentialList.map((cred) => (
+                <li
+                  key={cred.id}
+                  className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2"
+                >
+                  <div>
+                    <p className="text-sm font-medium text-foreground">
+                      {cred.friendlyName ?? 'Passkey'}
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      Added {new Date(cred.createdAt).toLocaleDateString()}
+                      {cred.lastUsedAt
+                        ? ` · last used ${new Date(cred.lastUsedAt).toLocaleDateString()}`
+                        : ' · never used'}
+                    </p>
+                  </div>
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    onClick={() => handleRemove(cred.id)}
+                    disabled={removingId === cred.id}
+                    aria-busy={removingId === cred.id}
+                  >
+                    {removingId === cred.id ? 'Removing…' : 'Remove'}
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {actionError !== null && (
+            <p role="alert" className="text-sm text-destructive">{actionError}</p>
+          )}
+
+          <p className="text-xs text-muted-foreground">
+            Removing a passkey here deletes it permanently — Forge will no longer accept it for
+            sign-in. If you ever lose access to both your passkey and your password, an operator
+            with shell access to this install can run{' '}
+            <code className="font-mono">npm run auth:reset-password -- &lt;new-password&gt;</code>{' '}
+            from the <code className="font-mono">web</code> directory to set a new password.
+          </p>
+        </div>
+      )}
+    </section>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Settings page
 // ---------------------------------------------------------------------------
 
@@ -227,8 +362,9 @@ export default function SettingsPage() {
         </p>
       </div>
 
-      <div className="max-w-2xl">
+      <div className="max-w-2xl flex flex-col gap-6">
         <GitHubCard />
+        <SecurityCard />
       </div>
     </div>
   )

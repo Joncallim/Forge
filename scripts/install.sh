@@ -1107,15 +1107,61 @@ seed_local_ai_if_ready() {
   (cd "$REPO_ROOT/web" && npm run db:seed-providers)
 }
 
+lockfile_hash() {
+  local lockfile="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$lockfile" | awk '{print $1}'
+  else
+    shasum -a 256 "$lockfile" | awk '{print $1}'
+  fi
+}
+
+# Marker written only after npm install/ci completes successfully, recording
+# the package-lock.json hash it was run against. Without this, a node_modules
+# directory left behind by an interrupted previous run (e.g. the user
+# Ctrl-C'd a prior install) looks "present" to a plain directory check, so a
+# rerun took the `npm install` branch instead of a clean `npm ci` and left
+# partially-extracted packages in place (missing files like @next/env).
+# Treating any hash mismatch/missing marker as "not installed" forces a clean
+# `npm ci`, which removes node_modules before installing and so always
+# recovers from a partial state.
+web_node_modules_marker() {
+  printf '%s' "$INSTALL_STATE_DIR/web-node-modules.ok"
+}
+
+web_node_modules_is_clean() {
+  local marker lockfile
+  marker="$(web_node_modules_marker)"
+  lockfile="$REPO_ROOT/web/package-lock.json"
+  [ -d "$REPO_ROOT/web/node_modules" ] || return 1
+  [ -f "$marker" ] || return 1
+  [ -f "$lockfile" ] || return 1
+  [ "$(cat "$marker" 2>/dev/null)" = "$(lockfile_hash "$lockfile")" ]
+}
+
+mark_web_node_modules_clean() {
+  [ "$DRY_RUN" = "1" ] && return 0
+  local lockfile="$REPO_ROOT/web/package-lock.json"
+  [ -f "$lockfile" ] || return 0
+  ensure_install_state
+  lockfile_hash "$lockfile" > "$(web_node_modules_marker)"
+}
+
 prepare_web_app() {
   step "Installing web dependencies and preparing the database"
   info "The npm dependency step can take a few minutes on the first run. If interrupted, re-run this installer."
-  if [ -f "$REPO_ROOT/web/package-lock.json" ] && [ ! -d "$REPO_ROOT/web/node_modules" ]; then
+  if [ "$DRY_RUN" != "1" ] && web_node_modules_is_clean; then
+    info "web/node_modules already matches package-lock.json. Skipping reinstall."
+  elif [ -f "$REPO_ROOT/web/package-lock.json" ]; then
+    # npm ci always deletes node_modules first, so this also self-heals a
+    # node_modules directory left partially populated by an interrupted run.
     run_with_timeout "npm ci" "$NPM_INSTALL_TIMEOUT_SECONDS" \
       bash -c 'cd "$1" && npm ci --no-audit --no-fund --progress=true' _ "$REPO_ROOT/web"
+    mark_web_node_modules_clean
   else
     run_with_timeout "npm install" "$NPM_INSTALL_TIMEOUT_SECONDS" \
       bash -c 'cd "$1" && npm install --no-audit --no-fund --progress=true' _ "$REPO_ROOT/web"
+    mark_web_node_modules_clean
   fi
   run "npm run db:migrate" bash -c 'cd "$1" && FORGE_SUPPRESS_MIGRATION_NOTICES=1 npm run db:migrate --silent' _ "$REPO_ROOT/web"
   run "npm run db:seed-agents" bash -c 'cd "$1" && npm run db:seed-agents' _ "$REPO_ROOT/web"
