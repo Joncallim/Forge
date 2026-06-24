@@ -1,7 +1,14 @@
 import type { ProjectMcpOverview } from '@/lib/mcps/types'
 import { parseAgentBreakdown, type PlannedAgent } from './agent-breakdown'
 import { parseCapabilityClassification, type CapabilityClassificationMetadata } from './capability-classification'
-import { parseMcpExecutionDesign, type McpExecutionDesign, type McpExecutionValidation, validateMcpExecutionDesign } from './mcp-execution-design'
+import {
+  deriveMcpGrantDecisions,
+  parseMcpExecutionDesign,
+  type McpExecutionDesign,
+  type McpExecutionValidation,
+  type McpGrantDecisions,
+  validateMcpExecutionDesign,
+} from './mcp-execution-design'
 import { parseOpenQuestions, type OpenQuestion } from './open-questions'
 
 export type PreparedArchitectArtifact = {
@@ -12,6 +19,7 @@ export type PreparedArchitectArtifact = {
   mcpExecutionDesign: {
     proposed: McpExecutionDesign | null
     validation: McpExecutionValidation
+    grantDecisions: McpGrantDecisions
   }
 }
 
@@ -32,6 +40,7 @@ export function prepareArchitectArtifact(
     mcpExecutionDesign: {
       proposed: design,
       validation: validateMcpExecutionDesign(design, mcpOverview),
+      grantDecisions: deriveMcpGrantDecisions(design, mcpOverview),
     },
   }
 }

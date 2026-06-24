@@ -837,6 +837,7 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
   const requirements = proposed?.requirements ?? []
   const overlayCount = proposed ? Object.keys(proposed.promptOverlays).length : 0
   const subtaskCount = proposed?.mcpAwareSubtasks.length ?? 0
+  const grantPreview = design.grantDecisions
   const statusVariant: StatusVariant =
     design.validation.status === 'blocked'
       ? 'destructive'
@@ -878,6 +879,59 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
             {design.validation.warnings.map((item) => (
               <li key={item}>{item}</li>
             ))}
+          </ul>
+        </div>
+      )}
+
+      {grantPreview && grantPreview.decisions.length > 0 && (
+        <div className="mb-3 rounded-lg border border-border px-3 py-2">
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Grant Decision Preview</p>
+            <div className="flex flex-wrap gap-1.5">
+              <Badge variant="secondary">{grantPreview.summary.proposed} proposed</Badge>
+              <Badge variant="outline">{grantPreview.summary.warning} warning</Badge>
+              <Badge variant={grantPreview.summary.blocked > 0 ? 'destructive' : 'secondary'}>
+                {grantPreview.summary.blocked} blocked
+              </Badge>
+            </div>
+          </div>
+          <ul className="grid gap-2 text-xs">
+            {grantPreview.decisions.map((decision) => {
+              const variant: StatusVariant =
+                decision.status === 'blocked'
+                  ? 'destructive'
+                  : decision.status === 'warning'
+                    ? 'outline'
+                    : 'secondary'
+              const statusText = decision.status === 'blocked'
+                ? 'Do not assign MCP-backed work until this MCP issue is resolved.'
+                : decision.status === 'warning'
+                  ? 'Optional MCP access is unavailable. Continue using the Architect fallback.'
+                  : 'Proposed only. MCP is currently healthy, but no runtime tools are granted.'
+
+              return (
+                <li key={decision.decisionId} className="rounded-md border border-border bg-muted/20 px-2.5 py-2">
+                  <div className="mb-1 flex flex-wrap items-center gap-2">
+                    <Badge variant={variant}>{decision.status}</Badge>
+                    <span className="font-medium text-foreground">{decision.agent}</span>
+                    <span className="text-muted-foreground">{decision.mcpId}</span>
+                    {decision.promptOverlayPresent && <Badge variant="outline">overlay</Badge>}
+                  </div>
+                  <p className="text-muted-foreground">{statusText}</p>
+                  {decision.capabilities.length > 0 && (
+                    <p className="mt-1 break-words text-muted-foreground">
+                      Capabilities: {decision.capabilities.join(', ')}
+                    </p>
+                  )}
+                  {decision.health.status !== 'healthy' && (
+                    <p className="mt-1 text-muted-foreground">
+                      Health: {decision.health.installState}/{decision.health.status}
+                      {decision.health.error ? `: ${decision.health.error}` : ''}
+                    </p>
+                  )}
+                </li>
+              )
+            })}
           </ul>
         </div>
       )}

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  deriveMcpGrantDecisions,
   parseMcpExecutionDesign,
   validateMcpExecutionDesign,
 } from '@/worker/mcp-execution-design'
@@ -166,5 +167,113 @@ describe('validateMcpExecutionDesign', () => {
     const result = validateMcpExecutionDesign(design, overview([]))
     expect(result.status).toBe('warnings')
     expect(result.warnings.join('\n')).toMatch(/not configured/)
+  })
+})
+
+describe('deriveMcpGrantDecisions', () => {
+  it('creates proposed decisions for healthy MCP permissions', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Need issue context","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{"backend":["github.issues.read"]},"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{"backend":"Use scoped GitHub tools."},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const result = deriveMcpGrantDecisions(design, overview([healthyGithub]))
+
+    expect(result.summary).toEqual({ proposed: 1, warning: 0, blocked: 0 })
+    expect(result.decisions[0]).toMatchObject({
+      decisionId: 'req-0:backend:github',
+      agent: 'backend',
+      mcpId: 'github',
+      capabilities: ['github.issues.read'],
+      status: 'proposed',
+      promptOverlayPresent: true,
+    })
+    expect(result.runtimeEnforcement).toBe('not_implemented')
+  })
+
+  it('creates one decision per permitted agent', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"workforce","targetAgents":["architect","backend"]},"agentPermissions":{"architect":["github.issues.read"],"backend":["github.contents.write"]},"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const result = deriveMcpGrantDecisions(design, overview([healthyGithub]))
+
+    expect(result.summary.proposed).toBe(2)
+    expect(result.decisions.map((decision) => decision.agent)).toEqual(['architect', 'backend'])
+  })
+
+  it('blocks required unhealthy or unknown MCP requirements', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{"backend":["github.issues.read"]},"fallback":{"action":"ask_user","message":"Connect GitHub."}},{"mcpId":"slack","requirement":"required","assignment":{"type":"agent","targetAgents":["qa"]},"agentPermissions":{"qa":["slack.read"]},"fallback":{"action":"block","message":"Slack required."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const result = deriveMcpGrantDecisions(design, overview([unhealthyGithub]))
+
+    expect(result.summary).toEqual({ proposed: 0, warning: 0, blocked: 2 })
+    expect(result.decisions.map((decision) => decision.status)).toEqual(['blocked', 'blocked'])
+    expect(result.decisions[0].health.status).toBe('auth_required')
+    expect(result.decisions[1].health.status).toBe('unknown')
+  })
+
+  it('warns for optional unavailable MCP access with a non-blocking fallback', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"optional","assignment":{"type":"agent","targetAgents":["reviewer"]},"agentPermissions":{"reviewer":["github.pull_requests.read"]},"fallback":{"action":"continue_without_mcp","message":"Review local diff instead."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const result = deriveMcpGrantDecisions(design, overview([]))
+
+    expect(result.summary).toEqual({ proposed: 0, warning: 1, blocked: 0 })
+    expect(result.decisions[0]).toMatchObject({
+      agent: 'reviewer',
+      status: 'warning',
+      fallback: { action: 'continue_without_mcp' },
+    })
+  })
+
+  it('blocks unknown MCPs even when they are optional with a non-blocking fallback', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"slack","requirement":"optional","assignment":{"type":"agent","targetAgents":["reviewer"]},"agentPermissions":{"reviewer":["slack.read"]},"fallback":{"action":"continue_without_mcp","message":"Review without Slack."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const result = deriveMcpGrantDecisions(design, overview([]))
+
+    expect(result.summary).toEqual({ proposed: 0, warning: 0, blocked: 1 })
+    expect(result.decisions[0]).toMatchObject({
+      mcpId: 'slack',
+      status: 'blocked',
+    })
+  })
+
+  it('does not propose healthy MCP access without explicit agent capabilities', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{},"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const result = deriveMcpGrantDecisions(design, overview([healthyGithub]))
+
+    expect(result.summary).toEqual({ proposed: 0, warning: 0, blocked: 1 })
+    expect(result.decisions[0]).toMatchObject({
+      agent: 'backend',
+      capabilities: [],
+      status: 'blocked',
+    })
+  })
+
+  it('returns an empty preview when the Architect omitted the design block', () => {
+    const result = deriveMcpGrantDecisions(null, overview([]))
+
+    expect(result.summary).toEqual({ proposed: 0, warning: 0, blocked: 0 })
+    expect(result.decisions).toEqual([])
   })
 })

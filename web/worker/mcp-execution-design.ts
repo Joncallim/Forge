@@ -63,6 +63,39 @@ export type McpExecutionValidation = {
   warnings: string[]
 }
 
+export type McpGrantDecisionStatus = 'proposed' | 'warning' | 'blocked'
+
+export type McpGrantDecisions = {
+  schemaVersion: 1
+  runtimeEnforcement: typeof MCP_EXECUTION_DESIGN_RUNTIME_ENFORCEMENT
+  summary: Record<McpGrantDecisionStatus, number>
+  decisions: Array<{
+    decisionId: string
+    sourceRequirementIndex: number
+    agent: string
+    mcpId: string
+    capabilities: string[]
+    requirement: McpRequirementLevel
+    status: McpGrantDecisionStatus
+    reason: string
+    assignment: {
+      type: McpAssignmentType
+      targetId: string | null
+    }
+    fallback: {
+      action: McpFallbackAction
+      message: string
+    }
+    health: {
+      installState: ProjectMcpStatus['installState'] | 'unknown'
+      status: ProjectMcpStatus['status'] | 'unknown'
+      enabled: boolean
+      error: string | null
+    }
+    promptOverlayPresent: boolean
+  }>
+}
+
 export type ParsedMcpExecutionDesign = {
   planText: string
   design: McpExecutionDesign | null
@@ -269,5 +302,91 @@ export function validateMcpExecutionDesign(
     health,
     blocked,
     warnings,
+  }
+}
+
+function agentsForRequirement(requirement: McpExecutionRequirement): string[] {
+  const agents = new Set<string>([
+    ...requirement.assignment.targetAgents,
+    ...Object.keys(requirement.agentPermissions),
+  ])
+
+  if (requirement.assignment.type === 'architect_only') agents.add('architect')
+  if (requirement.assignment.type === 'reviewer_only') agents.add('reviewer')
+
+  return [...agents].filter((agent) => KNOWN_AGENTS.has(agent)).sort()
+}
+
+function decisionStatus(
+  requirement: McpExecutionRequirement,
+  status: ProjectMcpStatus | null,
+  capabilities: string[],
+): McpGrantDecisionStatus {
+  if (!isKnownMcpId(requirement.mcpId)) return 'blocked'
+  if (capabilities.length === 0) return requirement.requirement === 'optional' ? 'warning' : 'blocked'
+  const healthy = status?.installState === 'installed' && status.enabled && status.status === 'healthy'
+  if (healthy) return 'proposed'
+  if (requirement.requirement === 'optional' && requirement.fallback.action !== 'block') return 'warning'
+  return 'blocked'
+}
+
+export function deriveMcpGrantDecisions(
+  design: McpExecutionDesign | null,
+  mcpOverview: ProjectMcpOverview,
+): McpGrantDecisions {
+  const summary: Record<McpGrantDecisionStatus, number> = {
+    proposed: 0,
+    warning: 0,
+    blocked: 0,
+  }
+
+  if (!design) {
+    return {
+      schemaVersion: 1,
+      runtimeEnforcement: MCP_EXECUTION_DESIGN_RUNTIME_ENFORCEMENT,
+      summary,
+      decisions: [],
+    }
+  }
+
+  const decisions: McpGrantDecisions['decisions'] = []
+  design.requirements.forEach((requirement, index) => {
+    const status = healthFor(mcpOverview, requirement.mcpId)
+    const agents = agentsForRequirement(requirement)
+
+    for (const agent of agents) {
+      const capabilities = requirement.agentPermissions[agent] ?? []
+      const grantStatus = decisionStatus(requirement, status, capabilities)
+      summary[grantStatus] += 1
+      decisions.push({
+        decisionId: `req-${index}:${agent}:${requirement.mcpId}`,
+        sourceRequirementIndex: index,
+        agent,
+        mcpId: requirement.mcpId,
+        capabilities,
+        requirement: requirement.requirement,
+        status: grantStatus,
+        reason: requirement.reason,
+        assignment: {
+          type: requirement.assignment.type,
+          targetId: requirement.assignment.targetId,
+        },
+        fallback: requirement.fallback,
+        health: {
+          installState: status?.installState ?? 'unknown',
+          status: status?.status ?? 'unknown',
+          enabled: status?.enabled ?? false,
+          error: status?.error ?? null,
+        },
+        promptOverlayPresent: typeof design.promptOverlays[agent] === 'string',
+      })
+    }
+  })
+
+  return {
+    schemaVersion: 1,
+    runtimeEnforcement: MCP_EXECUTION_DESIGN_RUNTIME_ENFORCEMENT,
+    summary,
+    decisions,
   }
 }

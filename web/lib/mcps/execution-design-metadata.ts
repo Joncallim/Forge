@@ -39,6 +39,40 @@ export type McpExecutionDesignMetadata = {
       error: string | null
     }>
   }
+  grantDecisions: {
+    schemaVersion: 1
+    runtimeEnforcement: 'not_implemented'
+    summary: {
+      proposed: number
+      warning: number
+      blocked: number
+    }
+    decisions: Array<{
+      decisionId: string
+      sourceRequirementIndex: number
+      agent: string
+      mcpId: string
+      capabilities: string[]
+      requirement: 'required' | 'optional'
+      status: 'proposed' | 'warning' | 'blocked'
+      reason: string
+      assignment: {
+        type: string
+        targetId: string | null
+      }
+      fallback: {
+        action: string
+        message: string
+      }
+      health: {
+        installState: string
+        status: string
+        enabled: boolean
+        error: string | null
+      }
+      promptOverlayPresent: boolean
+    }>
+  } | null
 }
 
 export type McpExecutionDesignArtifact = {
@@ -60,6 +94,52 @@ function artifactTime(artifact: McpExecutionDesignArtifact): number {
   if (!artifact.createdAt) return 0
   const timestamp = new Date(artifact.createdAt).getTime()
   return Number.isFinite(timestamp) ? timestamp : 0
+}
+
+function normalizeGrantDecisions(raw: unknown): McpExecutionDesignMetadata['grantDecisions'] {
+  if (!isRecord(raw) || raw.schemaVersion !== 1) return null
+  const summary = isRecord(raw.summary) ? raw.summary : {}
+  return {
+    schemaVersion: 1,
+    runtimeEnforcement: 'not_implemented',
+    summary: {
+      proposed: typeof summary.proposed === 'number' ? summary.proposed : 0,
+      warning: typeof summary.warning === 'number' ? summary.warning : 0,
+      blocked: typeof summary.blocked === 'number' ? summary.blocked : 0,
+    },
+    decisions: Array.isArray(raw.decisions)
+      ? raw.decisions.filter(isRecord).map((item) => {
+          const assignment = isRecord(item.assignment) ? item.assignment : {}
+          const fallback = isRecord(item.fallback) ? item.fallback : {}
+          const health = isRecord(item.health) ? item.health : {}
+          return {
+            decisionId: typeof item.decisionId === 'string' ? item.decisionId : '',
+            sourceRequirementIndex: typeof item.sourceRequirementIndex === 'number' ? item.sourceRequirementIndex : 0,
+            agent: typeof item.agent === 'string' ? item.agent : '',
+            mcpId: typeof item.mcpId === 'string' ? item.mcpId : '',
+            capabilities: normalizeStringArray(item.capabilities),
+            requirement: item.requirement === 'optional' ? 'optional' as const : 'required' as const,
+            status: item.status === 'blocked' ? 'blocked' as const : item.status === 'warning' ? 'warning' as const : 'proposed' as const,
+            reason: typeof item.reason === 'string' ? item.reason : '',
+            assignment: {
+              type: typeof assignment.type === 'string' ? assignment.type : 'agent',
+              targetId: typeof assignment.targetId === 'string' ? assignment.targetId : null,
+            },
+            fallback: {
+              action: typeof fallback.action === 'string' ? fallback.action : 'ask_user',
+              message: typeof fallback.message === 'string' ? fallback.message : '',
+            },
+            health: {
+              installState: typeof health.installState === 'string' ? health.installState : 'unknown',
+              status: typeof health.status === 'string' ? health.status : 'unknown',
+              enabled: health.enabled === true,
+              error: typeof health.error === 'string' ? health.error : null,
+            },
+            promptOverlayPresent: item.promptOverlayPresent === true,
+          }
+        })
+      : [],
+  }
 }
 
 export function latestMcpExecutionDesignFromArtifacts(
@@ -144,6 +224,7 @@ export function latestMcpExecutionDesignFromArtifacts(
             }))
           : [],
       },
+      grantDecisions: normalizeGrantDecisions(design.grantDecisions),
     }
   }
 
