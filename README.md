@@ -71,6 +71,13 @@ To inspect readiness without changing the machine:
 bash scripts/install.sh --check
 ```
 
+After pulling new changes, sync dependencies and apply new database
+migrations without redoing the full install:
+
+```bash
+bash scripts/install.sh --upgrade
+```
+
 ## Start Forge
 
 After install:
@@ -86,8 +93,11 @@ Then open:
 http://localhost:3000
 ```
 
-The web app starts the task worker automatically. To run the worker as a
-separate process instead:
+The web app starts the task worker automatically — `npm run dev` alone is
+enough to use Forge at `http://localhost:3000`. Only run the worker as a
+separate process if you've explicitly disabled the embedded one; running
+`npm run worker` by itself does not serve HTTP and will not make the app
+reachable in a browser:
 
 ```bash
 FORGE_EMBED_WORKER=0 npm run dev

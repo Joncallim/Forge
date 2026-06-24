@@ -12,6 +12,7 @@
 #   bash scripts/install.sh --skip-ollama
 #   bash scripts/install.sh --service-mode docker
 #   bash scripts/install.sh --dry-run
+#   bash scripts/install.sh --upgrade
 #
 set -Eeuo pipefail
 
@@ -27,6 +28,8 @@ DRY_RUN="${FORGE_DRY_RUN:-0}"
 CHECK_ONLY="${FORGE_CHECK_ONLY:-0}"
 YES="${FORGE_ASSUME_YES:-0}"
 SKIP_OLLAMA="${FORGE_SKIP_OLLAMA:-0}"
+UPGRADE_MODE="${FORGE_UPGRADE:-0}"
+WITH_OLLAMA=0
 ZERO_CONFIG_MODEL="${FORGE_ZERO_CONFIG_MODEL:-qwen2.5-coder:7b}"
 SERVICE_MODE="${FORGE_SERVICE_MODE:-auto}"
 PACKAGE_MANAGER_OVERRIDE="${FORGE_PACKAGE_MANAGER_OVERRIDE:-}"
@@ -59,10 +62,16 @@ DRY_RUN="$(truthy "$DRY_RUN" && printf 1 || printf 0)"
 CHECK_ONLY="$(truthy "$CHECK_ONLY" && printf 1 || printf 0)"
 YES="$(truthy "$YES" && printf 1 || printf 0)"
 SKIP_OLLAMA="$(truthy "$SKIP_OLLAMA" && printf 1 || printf 0)"
+UPGRADE_MODE="$(truthy "$UPGRADE_MODE" && printf 1 || printf 0)"
 
 usage() {
   cat <<'EOF'
 Forge installer for macOS and Linux.
+
+Day-to-day workflow:
+  After `git pull`, run `bash scripts/install.sh --upgrade` to sync
+  dependencies and apply new database migrations without reinstalling
+  system packages.
 
 Options:
   --skip-ollama          Do not install or configure local Ollama AI.
@@ -70,6 +79,13 @@ Options:
   --service-mode MODE    auto, native, or docker. Default: auto.
                          native uses Homebrew on macOS and system packages on Linux.
                          docker starts only PostgreSQL and Redis via Docker Compose.
+  --upgrade              Lightweight mode for machines that already have Forge
+                         installed: skips Homebrew/package-manager installs and
+                         the Ollama install step, but still starts services,
+                         provisions the database, writes the env file, runs
+                         npm install/db:migrate/db:seed-agents, and runs the
+                         doctor. Implies --yes. Skips the Ollama model pull
+                         unless --with-ollama is also passed.
   --yes, -y              Assume yes for package manager prompts where supported.
   --check                Inspect local readiness without changing the machine.
   --dry-run              Print the planned work without changing the machine.
@@ -81,6 +97,7 @@ Environment:
   FORGE_SERVICE_MODE=auto|native|docker
   FORGE_CHECK_ONLY=1
   FORGE_DRY_RUN=1
+  FORGE_UPGRADE=1
   FORGE_OS_OVERRIDE=Darwin|Linux              # dry-run/testing helper
   FORGE_PACKAGE_MANAGER_OVERRIDE=apt|brew     # dry-run/testing helper
   FORGE_ENV_FILE=/path/to/.env                # testing/advanced helper
@@ -119,6 +136,11 @@ while [ "$#" -gt 0 ]; do
       ;;
     --with-ollama)
       SKIP_OLLAMA=0
+      WITH_OLLAMA=1
+      ;;
+    --upgrade)
+      UPGRADE_MODE=1
+      YES=1
       ;;
     --service-mode)
       shift
@@ -482,6 +504,7 @@ record_package_diff() {
 }
 
 install_homebrew_if_needed() {
+  [ "$UPGRADE_MODE" = "1" ] && return 0
   [ "$PACKAGE_MANAGER" = "brew" ] || return 0
 
   step "Checking Homebrew"
@@ -664,6 +687,7 @@ ensure_github_cli() {
 }
 
 install_base_dependencies() {
+  [ "$UPGRADE_MODE" = "1" ] && return 0
   step "Installing base dependencies"
 
   if [ "$PACKAGE_MANAGER" = "brew" ]; then
@@ -680,11 +704,13 @@ install_base_dependencies() {
 }
 
 install_native_services() {
-  step "Installing PostgreSQL and Redis"
+  [ "$UPGRADE_MODE" = "1" ] || step "Installing PostgreSQL and Redis"
 
   case "$PACKAGE_MANAGER" in
     brew)
-      install_packages "$PG_FORMULA" redis
+      [ "$UPGRADE_MODE" = "1" ] || install_packages "$PG_FORMULA" redis
+      # Keg-only on Homebrew: psql/pg_isready are never on the default PATH,
+      # so this must still run in upgrade mode even though installation is skipped.
       if [ "$DRY_RUN" = "1" ] && ! command -v brew >/dev/null 2>&1; then
         PG_BIN="/opt/homebrew/opt/$PG_FORMULA/bin"
       else
@@ -693,16 +719,16 @@ install_native_services() {
       export PATH="$PG_BIN:$PATH"
       ;;
     apt)
-      install_packages postgresql redis-server
+      [ "$UPGRADE_MODE" = "1" ] || install_packages postgresql redis-server
       ;;
     dnf|yum)
-      install_packages postgresql-server postgresql redis
+      [ "$UPGRADE_MODE" = "1" ] || install_packages postgresql-server postgresql redis
       ;;
     zypper)
-      install_packages postgresql-server postgresql redis
+      [ "$UPGRADE_MODE" = "1" ] || install_packages postgresql-server postgresql redis
       ;;
     pacman)
-      install_packages postgresql redis
+      [ "$UPGRADE_MODE" = "1" ] || install_packages postgresql redis
       ;;
   esac
 }
@@ -1056,6 +1082,7 @@ start_ollama() {
 }
 
 install_ollama_if_needed() {
+  [ "$UPGRADE_MODE" = "1" ] && return 0
   [ "$SKIP_OLLAMA" = "1" ] && return 0
 
   step "Installing Ollama for local AI"
@@ -1079,6 +1106,9 @@ install_ollama_if_needed() {
 
 seed_local_ai_if_ready() {
   [ "$SKIP_OLLAMA" = "1" ] && return 0
+  if [ "$UPGRADE_MODE" = "1" ] && [ "$WITH_OLLAMA" != "1" ]; then
+    return 0
+  fi
 
   step "Setting up zero-config local AI"
   if [ "$DRY_RUN" = "1" ]; then
@@ -1093,14 +1123,11 @@ seed_local_ai_if_ready() {
     info "$ZERO_CONFIG_MODEL is already present."
   else
     info "Pulling $ZERO_CONFIG_MODEL. The first pull can take several minutes."
-  fi
-
-  if ! ollama pull "$ZERO_CONFIG_MODEL"; then
-    warn "Could not pull $ZERO_CONFIG_MODEL. Forge can still run; add a provider from the Providers page or pull the model later."
-    SKIP_OLLAMA=1
-    return 0
-  fi
-  if [ "$model_was_present" = "0" ]; then
+    if ! ollama pull "$ZERO_CONFIG_MODEL"; then
+      warn "Could not pull $ZERO_CONFIG_MODEL. Forge can still run; add a provider from the Providers page or pull the model later."
+      SKIP_OLLAMA=1
+      return 0
+    fi
     record_manifest "ollama_model" "$ZERO_CONFIG_MODEL"
   fi
 
@@ -1206,8 +1233,12 @@ print_preflight_summary() {
 
   if [ "$CHECK_ONLY" = "1" ]; then
     info "--check is active. No files, services, packages, or databases will be changed."
+  elif [ "$DRY_RUN" = "1" ] && [ "$UPGRADE_MODE" = "1" ]; then
+    info "--upgrade --dry-run is active. The script will preview the lightweight upgrade path without changing this machine."
   elif [ "$DRY_RUN" = "1" ]; then
     info "--dry-run is active. The script will preview work without changing this machine."
+  elif [ "$UPGRADE_MODE" = "1" ]; then
+    info "--upgrade is active. The installer will skip package-manager and Ollama installs, and only sync npm dependencies, apply database migrations, reseed agents, and run the doctor."
   else
     info "The installer will preserve existing settings, install missing dependencies, prepare services, and run the doctor."
   fi
