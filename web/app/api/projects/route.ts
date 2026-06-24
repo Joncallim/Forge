@@ -6,11 +6,12 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { z } from 'zod'
 import { db } from '@/db'
-import { projects } from '@/db/schema'
+import { DEFAULT_PROJECT_MCP_CONFIG, projects, type ProjectMcpConfig } from '@/db/schema'
 import { isNull, desc } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { registerProjectPath } from '@/lib/project-registry'
 import { resolveGitHubToken } from '@/lib/github'
+import { getCachedProjectMcpSummaries } from '@/lib/mcps/manager'
 import { collapseHomePath, getWorkspaceSettings, isWithinPath } from '@/lib/workspace'
 
 const execFile = promisify(execFileCallback)
@@ -86,6 +87,7 @@ async function writeProjectConfig(project: {
   name: string
   githubRepo: string | null
   localPath: string | null
+  mcpConfig?: ProjectMcpConfig | null
   defaultBranch: string
   createdAt: Date
   updatedAt: Date
@@ -99,6 +101,9 @@ async function writeProjectConfig(project: {
     githubRepo: project.githubRepo,
     defaultBranch: project.defaultBranch,
     localPath: collapseHomePath(project.localPath),
+    mcpProfile: project.mcpConfig?.profile ?? DEFAULT_PROJECT_MCP_CONFIG.profile,
+    requiredMcps: project.mcpConfig?.requiredMcps ?? DEFAULT_PROJECT_MCP_CONFIG.requiredMcps,
+    mcpOverrides: project.mcpConfig?.overrides ?? DEFAULT_PROJECT_MCP_CONFIG.overrides,
     createdAt: project.createdAt.toISOString(),
     updatedAt: project.updatedAt.toISOString(),
   }
@@ -122,7 +127,13 @@ export async function GET(request: NextRequest) {
       .where(isNull(projects.archivedAt))
       .orderBy(desc(projects.createdAt))
 
-    return NextResponse.json({ projects: rows })
+    const summaries = await getCachedProjectMcpSummaries(rows.map((project) => project.id))
+    const projectsWithMcp = rows.map((project) => ({
+      ...project,
+      mcpSummary: summaries.get(project.id) ?? null,
+    }))
+
+    return NextResponse.json({ projects: projectsWithMcp })
   } catch (err) {
     console.error('[GET /api/projects] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

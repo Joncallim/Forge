@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { useRouter, useParams } from 'next/navigation'
-import { PlusIcon, ExternalLinkIcon, ArrowLeftIcon, Trash2Icon } from 'lucide-react'
+import { PlusIcon, ExternalLinkIcon, ArrowLeftIcon, Trash2Icon, RefreshCwIcon, DownloadIcon, SettingsIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
@@ -23,6 +23,34 @@ interface Project {
   defaultBranch: string
   createdAt: string
   archivedAt: string | null
+}
+
+type McpStatusName = 'healthy' | 'unhealthy' | 'disabled' | 'auth_required' | 'configuration_required' | 'unknown'
+
+type ProjectMcpStatus = {
+  mcpId: string
+  displayName: string
+  description: string
+  installPath: string
+  installState: 'installed' | 'missing'
+  status: McpStatusName
+  enabled: boolean
+  error: string | null
+  checkedAt: string
+}
+
+type ProjectMcpOverview = {
+  projectId: string
+  mcpsRoot: string
+  statuses: ProjectMcpStatus[]
+  summary: {
+    label: string
+    status: McpStatusName | 'missing'
+    missing: number
+    authRequired: number
+    unhealthy: number
+    disabled: number
+  }
 }
 
 interface Task {
@@ -56,6 +84,20 @@ function statusLabel(status: string): string {
   return status.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
 }
 
+function mcpPillClass(status: McpStatusName | 'missing'): string {
+  const base = 'inline-flex h-6 items-center rounded-full px-2.5 text-xs font-medium'
+  if (status === 'healthy') {
+    return `${base} bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300`
+  }
+  if (status === 'missing' || status === 'auth_required') {
+    return `${base} bg-amber-100 text-amber-900 dark:bg-amber-900/30 dark:text-amber-300`
+  }
+  if (status === 'disabled' || status === 'unknown') {
+    return `${base} bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300`
+  }
+  return `${base} bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300`
+}
+
 function formatDate(iso: string): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(new Date(iso))
 }
@@ -67,6 +109,10 @@ export default function ProjectDetailPage() {
 
   const [project, setProject] = useState<Project | null>(null)
   const [tasks, setTasks] = useState<Task[]>([])
+  const [mcpOverview, setMcpOverview] = useState<ProjectMcpOverview | null>(null)
+  const [mcpActionError, setMcpActionError] = useState<string | null>(null)
+  const [installingMcps, setInstallingMcps] = useState(false)
+  const [refreshingMcps, setRefreshingMcps] = useState(false)
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
   const [dialogOpen, setDialogOpen] = useState(false)
@@ -103,6 +149,17 @@ export default function ProjectDetailPage() {
 
       setProject(projectData.project ?? null)
       setTasks(tasksData.tasks ?? [])
+
+      const mcpRes = await fetch(`/api/projects/${projectId}/mcps`)
+      if (mcpRes.ok) {
+        const mcpData = await mcpRes.json()
+        setMcpOverview(mcpData.overview ?? null)
+        setMcpActionError(null)
+      } else {
+        const body = await mcpRes.json().catch(() => ({}))
+        setMcpOverview(null)
+        setMcpActionError(body.error ?? 'Failed to load MCP status')
+      }
     } catch (err) {
       setFetchError(err instanceof Error ? err.message : 'An unexpected error occurred')
     } finally {
@@ -144,6 +201,42 @@ export default function ProjectDetailPage() {
       setFormError(err instanceof Error ? err.message : 'An unexpected error occurred')
     } finally {
       setSubmitting(false)
+    }
+  }
+
+  async function refreshMcpStatus() {
+    setRefreshingMcps(true)
+    setMcpActionError(null)
+    try {
+      const res = await fetch(`/api/projects/${projectId}/mcps`)
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to refresh MCP status')
+      }
+      const data = await res.json()
+      setMcpOverview(data.overview ?? null)
+    } catch (err) {
+      setMcpActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setRefreshingMcps(false)
+    }
+  }
+
+  async function installRecommendedMcps() {
+    setInstallingMcps(true)
+    setMcpActionError(null)
+    try {
+      const res = await fetch(`/api/projects/${projectId}/mcps/install-recommended`, { method: 'POST' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to install recommended MCPs')
+      }
+      const data = await res.json()
+      setMcpOverview(data.overview ?? null)
+    } catch (err) {
+      setMcpActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setInstallingMcps(false)
     }
   }
 
@@ -325,6 +418,91 @@ export default function ProjectDetailPage() {
         </Dialog>
         </div>
       </div>
+
+      <section aria-labelledby="project-mcps-heading" className="mb-6 rounded-xl border border-border bg-card p-4">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 id="project-mcps-heading" className="text-sm font-medium text-foreground">
+              MCPs
+            </h2>
+            {mcpOverview && (
+              <p className="mt-1 font-mono text-xs text-muted-foreground break-all">
+                {mcpOverview.mcpsRoot}
+              </p>
+            )}
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {mcpOverview && (
+              <span className={mcpPillClass(mcpOverview.summary.status)}>
+                {mcpOverview.summary.label}
+              </span>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={installRecommendedMcps}
+              disabled={installingMcps}
+              aria-busy={installingMcps}
+              aria-label="Install recommended MCPs"
+            >
+              <DownloadIcon aria-hidden="true" />
+              {installingMcps ? 'Installing…' : 'Install recommended MCPs'}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={refreshMcpStatus}
+              disabled={refreshingMcps}
+              aria-busy={refreshingMcps}
+              aria-label="Refresh MCP status"
+            >
+              <RefreshCwIcon aria-hidden="true" />
+              Refresh
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => router.push('/dashboard/settings#mcps')}
+              aria-label="Open MCP settings"
+            >
+              <SettingsIcon aria-hidden="true" />
+              Settings
+            </Button>
+          </div>
+        </div>
+
+        {mcpActionError !== null && (
+          <p role="alert" className="mb-3 text-sm text-destructive">
+            {mcpActionError}
+          </p>
+        )}
+
+        {mcpOverview === null ? (
+          <p className="text-sm text-muted-foreground">MCP status has not been checked.</p>
+        ) : (
+          <ul className="divide-y divide-border rounded-lg border border-border" role="list">
+            {mcpOverview.statuses.map((status) => (
+              <li key={status.mcpId} className="flex flex-col gap-2 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="text-sm font-medium text-foreground">{status.displayName}</p>
+                    <span className={mcpPillClass(status.installState === 'missing' ? 'missing' : status.status)}>
+                      {status.installState === 'missing' ? 'Missing' : statusLabel(status.status)}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">{status.description}</p>
+                  {status.error && (
+                    <p className="mt-1 text-xs text-muted-foreground">{status.error}</p>
+                  )}
+                </div>
+                <code className="max-w-full truncate rounded-md bg-muted px-2 py-1 font-mono text-xs text-muted-foreground sm:max-w-xs">
+                  {status.installPath}
+                </code>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
 
       {/* Tasks section */}
       <h2 className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">

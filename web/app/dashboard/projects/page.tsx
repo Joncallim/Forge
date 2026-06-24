@@ -29,9 +29,19 @@ interface Project {
   defaultBranch: string
   createdAt: string
   archivedAt: string | null
+  mcpSummary: McpSummary | null
 }
 
 type ProjectSource = 'github' | 'local' | 'clone'
+
+type McpSummary = {
+  label: string
+  status: 'healthy' | 'unhealthy' | 'disabled' | 'auth_required' | 'configuration_required' | 'unknown' | 'missing'
+  missing: number
+  authRequired: number
+  unhealthy: number
+  disabled: number
+}
 
 type DirectoryEntry = {
   name: string
@@ -58,6 +68,20 @@ function repoShortName(nameWithOwner: string): string {
 
 function formatDate(iso: string): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(new Date(iso))
+}
+
+function mcpSummaryClassName(summary: McpSummary | null): string {
+  const base = 'mt-3 inline-flex h-6 max-w-full items-center rounded-full px-2.5 text-xs font-medium'
+  if (!summary) {
+    return `${base} bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300`
+  }
+  if (summary.status === 'healthy') {
+    return `${base} bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300`
+  }
+  if (summary.status === 'missing' || summary.status === 'auth_required') {
+    return `${base} bg-amber-100 text-amber-900 dark:bg-amber-900/30 dark:text-amber-300`
+  }
+  return `${base} bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300`
 }
 
 function folderNameFromProjectName(name: string): string {
@@ -932,6 +956,9 @@ export default function ProjectsPage() {
                 <p className="mt-1 text-xs text-muted-foreground">
                   {project.githubRepo ?? project.localPath ?? 'Local project'}
                 </p>
+                <span className={mcpSummaryClassName(project.mcpSummary)}>
+                  <span className="truncate">{project.mcpSummary?.label ?? 'MCPs: Not checked'}</span>
+                </span>
                 <p className="mt-3 text-xs text-muted-foreground">
                   Created {formatDate(project.createdAt)}
                 </p>

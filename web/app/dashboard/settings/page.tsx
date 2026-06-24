@@ -72,7 +72,7 @@ function WorkspaceCard() {
       const res = await fetch('/api/settings/workspace', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workspaceRoot }),
+        body: JSON.stringify({ workspaceRoot, mcpsRoot: workspace?.mcpsRoot }),
       })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
@@ -169,6 +169,149 @@ function WorkspaceCard() {
           <div>
             <Button type="submit" size="sm" disabled={saving || workspace.envLocked} aria-busy={saving}>
               {saving ? 'Saving…' : 'Save Workspace'}
+            </Button>
+          </div>
+        </form>
+      )}
+    </section>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// MCP card
+// ---------------------------------------------------------------------------
+
+function McpSettingsCard() {
+  const [workspace, setWorkspace] = useState<WorkspaceSettings | null>(null)
+  const [mcpsRoot, setMcpsRoot] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [fetchError, setFetchError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [savedMsg, setSavedMsg] = useState<string | null>(null)
+
+  const loadWorkspace = useCallback(async () => {
+    setLoading(true)
+    setFetchError(null)
+    try {
+      const res = await fetch('/api/settings/workspace')
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error((body as { error?: string }).error ?? 'Failed to load MCP settings')
+      }
+      const body = (await res.json()) as { workspace: WorkspaceSettings }
+      setWorkspace(body.workspace)
+      setMcpsRoot(body.workspace.mcpsRoot)
+    } catch (err) {
+      setFetchError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadWorkspace()
+  }, [loadWorkspace])
+
+  async function handleSave(e: React.FormEvent) {
+    e.preventDefault()
+    if (!workspace) return
+    setSaving(true)
+    setActionError(null)
+    setSavedMsg(null)
+    try {
+      const res = await fetch('/api/settings/workspace', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workspaceRoot: workspace.workspaceRoot,
+          mcpsRoot,
+        }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error((body as { error?: string }).error ?? 'Failed to save MCP settings')
+      }
+      const body = (await res.json()) as { workspace: WorkspaceSettings }
+      setWorkspace(body.workspace)
+      setMcpsRoot(body.workspace.mcpsRoot)
+      setSavedMsg('MCP settings saved.')
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <section id="mcps" aria-labelledby="mcps-heading" className="rounded-xl border border-border bg-card p-5">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <h2 id="mcps-heading" className="text-lg font-semibold text-foreground">
+          MCPs
+        </h2>
+        <span className="inline-flex h-6 items-center rounded-full bg-gray-100 px-2.5 text-xs font-medium text-gray-700 dark:bg-gray-800 dark:text-gray-300">
+          Shared
+        </span>
+      </div>
+
+      {loading && (
+        <p className="text-sm text-muted-foreground" role="status" aria-live="polite">
+          Loading MCP settings…
+        </p>
+      )}
+
+      {!loading && fetchError !== null && (
+        <div role="alert" className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          {fetchError}
+          <button onClick={loadWorkspace} className="ml-2 underline underline-offset-2 hover:no-underline">
+            Retry
+          </button>
+        </div>
+      )}
+
+      {!loading && workspace && (
+        <form onSubmit={handleSave} className="flex flex-col gap-4">
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="mcps-root" className="text-sm font-medium text-foreground">
+              MCP Root
+            </label>
+            <input
+              id="mcps-root"
+              type="text"
+              value={mcpsRoot}
+              onChange={(e) => setMcpsRoot(e.target.value)}
+              disabled={workspace.envLocked || saving}
+              autoComplete="off"
+              className="rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-60"
+            />
+          </div>
+          <dl className="grid gap-2 text-xs text-muted-foreground">
+            <div>
+              <dt className="font-medium text-foreground">Managed Catalog</dt>
+              <dd>Filesystem, GitHub</dd>
+            </div>
+          </dl>
+          <p className="text-xs text-muted-foreground">
+            Recommended MCP installation creates Forge-managed manifests under the shared root and checks project health from that state.
+          </p>
+
+          {workspace.envLocked && (
+            <p className="text-xs text-muted-foreground">
+              <code className="font-mono">FORGE_WORKSPACE_ROOT</code> or{' '}
+              <code className="font-mono">FORGE_MCPS_ROOT</code> is set for this process.
+            </p>
+          )}
+
+          {actionError !== null && (
+            <p role="alert" className="text-sm text-destructive">{actionError}</p>
+          )}
+          {savedMsg !== null && (
+            <p role="status" aria-live="polite" className="text-sm text-muted-foreground">{savedMsg}</p>
+          )}
+
+          <div>
+            <Button type="submit" size="sm" disabled={saving || workspace.envLocked} aria-busy={saving}>
+              {saving ? 'Saving…' : 'Save MCPs'}
             </Button>
           </div>
         </form>
@@ -524,6 +667,7 @@ export default function SettingsPage() {
 
       <div className="max-w-2xl flex flex-col gap-6">
         <WorkspaceCard />
+        <McpSettingsCard />
         <GitHubCard />
         <SecurityCard />
       </div>

@@ -2,10 +2,11 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { getSession } from '@/lib/session'
-import { getWorkspaceSettings, saveWorkspaceRoot } from '@/lib/workspace'
+import { getWorkspaceSettings, saveWorkspaceSettings } from '@/lib/workspace'
 
 const updateSchema = z.object({
   workspaceRoot: z.string().trim().min(1).max(1000),
+  mcpsRoot: z.string().trim().min(1).max(1000).optional(),
 })
 
 export async function GET(request: NextRequest) {
@@ -39,7 +40,7 @@ export async function PUT(request: NextRequest) {
     }
 
     try {
-      const workspace = await saveWorkspaceRoot(parsed.data.workspaceRoot)
+      const workspace = await saveWorkspaceSettings(parsed.data)
       return NextResponse.json({ workspace })
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to save workspace root'

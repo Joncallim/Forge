@@ -57,6 +57,13 @@
       "when": 1782166200157,
       "tag": "0007_real_the_liberteens",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1782281947388,
+      "tag": "0008_add_mcp_status",
+      "breakpoints": true
     }
   ]
 }

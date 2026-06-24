@@ -35,6 +35,13 @@ Optional for standalone deployments:
 | `FORGE_AGENT_WEB_SEARCH` | Set to `0` to disable no-key web research context for architect planning. Defaults to enabled. |
 | `FORGE_AGENT_CONFIG_DIR` | Absolute path where agent prompt files can be read and written. |
 | `FORGE_WORKSPACE_ROOT` | Optional hard override for the Forge workspace root. When unset, Forge defaults new local projects and runtime registry files to `~/Documents/Forge`, writes `global-settings.json` there, and creates `mcps`/`templates` subfolders for the workspace structure. |
+| `FORGE_MCPS_ROOT` | Optional hard override for the shared MCP root. Must stay inside `FORGE_WORKSPACE_ROOT` or the active workspace root. When unset, Forge defaults to the active workspace's `mcps` directory, and users can change the root from Settings. |
+
+MCP deployment notes:
+
+- Forge-managed MCP installation currently scaffolds catalog manifests under the shared workspace `mcps` root and records install/status state in PostgreSQL.
+- The first managed catalog entries are Filesystem and GitHub. Health checks verify the project path and GitHub connection state; Forge does not execute arbitrary MCP install commands.
+- Project-specific MCP overrides must stay inside the active workspace root.
 
 Passkey-related:
 

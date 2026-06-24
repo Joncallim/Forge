@@ -71,6 +71,13 @@ vi.mock('@/lib/providers/registry', () => ({
   getModel: vi.fn().mockResolvedValue(null),
 }))
 
+const mockGetGitHubStatus = vi.fn()
+const mockResolveGitHubToken = vi.fn()
+vi.mock('@/lib/github', () => ({
+  getGitHubStatus: mockGetGitHubStatus,
+  resolveGitHubToken: mockResolveGitHubToken,
+}))
+
 // ---------------------------------------------------------------------------
 // Drizzle chain factory
 // ---------------------------------------------------------------------------
@@ -187,10 +194,20 @@ describe('POST /api/projects — source handling', () => {
 
       const projectConfig = JSON.parse(
         await fs.readFile(path.join(localPath, 'forge.project.json'), 'utf-8'),
-      ) as { projectId: string; name: string; localPath: string }
+      ) as {
+        projectId: string
+        name: string
+        localPath: string
+        mcpProfile: string
+        requiredMcps: string[]
+        mcpOverrides: Record<string, unknown>
+      }
       expect(projectConfig.projectId).toBe('project-local')
       expect(projectConfig.name).toBe('Local project')
       expect(projectConfig.localPath).toMatch(/forge-games$/)
+      expect(projectConfig.mcpProfile).toBe('default')
+      expect(projectConfig.requiredMcps).toEqual(['filesystem', 'github'])
+      expect(projectConfig.mcpOverrides).toEqual({})
     } finally {
       if (previousRoot === undefined) {
         delete process.env.FORGE_WORKSPACE_ROOT
@@ -446,6 +463,84 @@ describe('GET/PUT /api/settings/workspace', () => {
     }
   })
 
+  it('saves a custom shared MCP root with workspace settings', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert.mockReturnValue(chain(undefined))
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const previousMcpsRoot = process.env.FORGE_MCPS_ROOT
+    delete process.env.FORGE_WORKSPACE_ROOT
+    delete process.env.FORGE_MCPS_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-workspace-mcps-'))
+    const mcpsRoot = path.join(workspaceRoot, 'custom-mcps')
+
+    try {
+      const { PUT } = await import('@/app/api/settings/workspace/route')
+      const res = await PUT(authRequest('/api/settings/workspace', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceRoot, mcpsRoot }),
+      }) as never)
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.workspace.workspaceRoot).toBe(workspaceRoot)
+      expect(body.workspace.mcpsRoot).toBe(mcpsRoot)
+      await expect(fs.stat(mcpsRoot)).resolves.toMatchObject({})
+      const globalSettings = JSON.parse(
+        await fs.readFile(path.join(workspaceRoot, 'global-settings.json'), 'utf-8'),
+      ) as { mcpsRoot: string }
+      expect(globalSettings.mcpsRoot).toMatch(/custom-mcps$/)
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      if (previousMcpsRoot === undefined) {
+        delete process.env.FORGE_MCPS_ROOT
+      } else {
+        process.env.FORGE_MCPS_ROOT = previousMcpsRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects custom shared MCP roots outside the active workspace', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const previousMcpsRoot = process.env.FORGE_MCPS_ROOT
+    delete process.env.FORGE_WORKSPACE_ROOT
+    delete process.env.FORGE_MCPS_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-workspace-mcps-boundary-'))
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-outside-mcps-'))
+
+    try {
+      const { PUT } = await import('@/app/api/settings/workspace/route')
+      const res = await PUT(authRequest('/api/settings/workspace', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceRoot, mcpsRoot: path.join(outsideRoot, 'mcps') }),
+      }) as never)
+
+      expect(res.status).toBe(409)
+      const body = await res.json()
+      expect(body.error).toMatch(/active workspace root/)
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      if (previousMcpsRoot === undefined) {
+        delete process.env.FORGE_MCPS_ROOT
+      } else {
+        process.env.FORGE_MCPS_ROOT = previousMcpsRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+      await fs.rm(outsideRoot, { recursive: true, force: true })
+    }
+  })
+
   it('rejects workspace override writes when FORGE_WORKSPACE_ROOT is set', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const previousRoot = process.env.FORGE_WORKSPACE_ROOT
@@ -471,6 +566,351 @@ describe('GET/PUT /api/settings/workspace', () => {
       }
       await fs.rm(workspaceRoot, { recursive: true, force: true })
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Suite 3.1e — Project MCP status and installation
+// ---------------------------------------------------------------------------
+
+describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockGetGitHubStatus.mockResolvedValue({
+      connected: false,
+      source: 'none',
+      cliAuthenticated: false,
+      patStored: false,
+      login: null,
+    })
+  })
+
+  async function withWorkspaceProject<T>(
+    callback: (project: {
+      id: string
+      name: string
+      githubRepo: string | null
+      localPath: string
+      githubTokenEnvVar: string | null
+      pmProviderConfigId: string | null
+      mcpConfig: {
+        profile: 'default'
+        requiredMcps: string[]
+        overrides: Record<string, never>
+      }
+      defaultBranch: string
+      createdAt: Date
+      updatedAt: Date
+      archivedAt: null
+    }, workspaceRoot: string) => Promise<T>,
+  ): Promise<T> {
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-mcp-test-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const localPath = path.join(workspaceRoot, 'projects', 'demo')
+    await fs.mkdir(localPath, { recursive: true })
+    const project = {
+      id: 'project-mcp',
+      name: 'MCP project',
+      githubRepo: 'Joncallim/Forge',
+      localPath,
+      githubTokenEnvVar: null,
+      pmProviderConfigId: null,
+      mcpConfig: {
+        profile: 'default' as const,
+        requiredMcps: ['filesystem', 'github'],
+        overrides: {},
+      },
+      defaultBranch: 'main',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      archivedAt: null,
+    }
+
+    try {
+      return await callback(project, workspaceRoot)
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  }
+
+  async function writeMcpManifest(workspaceRoot: string, mcpId: string, manifestId = mcpId) {
+    const installPath = path.join(workspaceRoot, 'mcps', mcpId)
+    await fs.mkdir(installPath, { recursive: true })
+    await fs.writeFile(
+      path.join(installPath, 'forge.mcp.json'),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        id: manifestId,
+        displayName: mcpId,
+        source: 'forge-catalog',
+        createdAt: new Date().toISOString(),
+      })}\n`,
+    )
+    return installPath
+  }
+
+  it('reports recommended MCPs as missing before installation', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert.mockReturnValue(chain(undefined))
+
+    await withWorkspaceProject(async (project) => {
+      mockDbSelect
+        .mockReturnValueOnce(chain([project]))
+        .mockReturnValueOnce(chain([]))
+
+      const { GET } = await import('@/app/api/projects/[id]/mcps/route')
+      const res = await GET(authRequest('/api/projects/project-mcp/mcps') as never, {
+        params: Promise.resolve({ id: project.id }),
+      })
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.overview.summary.missing).toBe(2)
+      expect(body.overview.statuses.map((status: { installState: string }) => status.installState)).toEqual([
+        'missing',
+        'missing',
+      ])
+    })
+  })
+
+  it('installs recommended MCP manifests and returns cached health status', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const insertTables: unknown[] = []
+    mockDbInsert.mockImplementation((table: unknown) => {
+      insertTables.push(table)
+      return chain(undefined)
+    })
+
+    await withWorkspaceProject(async (project, workspaceRoot) => {
+      const { mcpInstallations, projectMcpStatusChecks } = await import('@/db/schema')
+      mockDbSelect
+        .mockReturnValueOnce(chain([project]))
+        .mockReturnValueOnce(chain([]))
+        .mockReturnValueOnce(chain([]))
+
+      const { POST } = await import('@/app/api/projects/[id]/mcps/install-recommended/route')
+      const res = await POST(authRequest('/api/projects/project-mcp/mcps/install-recommended', {
+        method: 'POST',
+      }) as never, {
+        params: Promise.resolve({ id: project.id }),
+      })
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      const statuses = body.overview.statuses as Array<{ mcpId: string; installState: string; status: string }>
+      expect(statuses.find((status) => status.mcpId === 'filesystem')).toMatchObject({
+        installState: 'installed',
+        status: 'healthy',
+      })
+      expect(statuses.find((status) => status.mcpId === 'github')).toMatchObject({
+        installState: 'installed',
+        status: 'auth_required',
+      })
+      await expect(fs.stat(path.join(workspaceRoot, 'mcps', 'filesystem', 'forge.mcp.json'))).resolves.toMatchObject({})
+      await expect(fs.stat(path.join(workspaceRoot, 'mcps', 'github', 'forge.mcp.json'))).resolves.toMatchObject({})
+      expect(insertTables.filter((table) => table === mcpInstallations)).toHaveLength(2)
+      expect(insertTables.filter((table) => table === projectMcpStatusChecks)).toHaveLength(2)
+    })
+  })
+
+  it('returns MCP summaries from the projects list endpoint', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert.mockReturnValue(chain(undefined))
+
+    await withWorkspaceProject(async (project) => {
+      mockDbSelect
+        .mockReturnValueOnce(chain([project]))
+        .mockReturnValueOnce(chain([
+          {
+            projectId: project.id,
+            mcpId: 'filesystem',
+            status: 'unknown',
+            installState: 'missing',
+            error: 'MCP is not installed.',
+            details: null,
+            checkedAt: new Date(),
+          },
+          {
+            projectId: project.id,
+            mcpId: 'github',
+            status: 'unknown',
+            installState: 'missing',
+            error: 'MCP is not installed.',
+            details: null,
+            checkedAt: new Date(),
+          },
+        ]))
+
+      const { GET } = await import('@/app/api/projects/route')
+      const res = await GET(authRequest('/api/projects') as never)
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.projects[0].mcpSummary).toMatchObject({
+        label: 'MCPs: 2 missing',
+        status: 'missing',
+        missing: 2,
+      })
+      expect(mockDbInsert).not.toHaveBeenCalled()
+    })
+  })
+
+  it('distinguishes disabled, unhealthy, and configuration-required MCP states', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert.mockReturnValue(chain(undefined))
+
+    await withWorkspaceProject(async (project, workspaceRoot) => {
+      const filesystemPath = await writeMcpManifest(workspaceRoot, 'filesystem')
+      const invalidPath = await writeMcpManifest(workspaceRoot, 'github', 'filesystem')
+      const { GET } = await import('@/app/api/projects/[id]/mcps/route')
+
+      const disabledProject = {
+        ...project,
+        mcpConfig: {
+          profile: 'custom' as const,
+          requiredMcps: ['filesystem'],
+          overrides: {},
+        },
+      }
+      mockDbSelect
+        .mockReturnValueOnce(chain([disabledProject]))
+        .mockReturnValueOnce(chain([
+          { mcpId: 'filesystem', installPath: filesystemPath, enabled: false },
+        ]))
+
+      const disabledRes = await GET(authRequest('/api/projects/project-mcp/mcps') as never, {
+        params: Promise.resolve({ id: project.id }),
+      })
+      expect(disabledRes.status).toBe(200)
+      expect((await disabledRes.json()).overview.statuses[0]).toMatchObject({
+        installState: 'installed',
+        status: 'disabled',
+      })
+
+      const unhealthyProject = {
+        ...project,
+        mcpConfig: {
+          profile: 'custom' as const,
+          requiredMcps: ['github'],
+          overrides: {},
+        },
+      }
+      mockDbSelect
+        .mockReturnValueOnce(chain([unhealthyProject]))
+        .mockReturnValueOnce(chain([
+          { mcpId: 'github', installPath: invalidPath, enabled: true },
+        ]))
+
+      const unhealthyRes = await GET(authRequest('/api/projects/project-mcp/mcps') as never, {
+        params: Promise.resolve({ id: project.id }),
+      })
+      expect(unhealthyRes.status).toBe(200)
+      expect((await unhealthyRes.json()).overview.statuses[0]).toMatchObject({
+        installState: 'installed',
+        status: 'unhealthy',
+      })
+
+      const missingLocalPathProject = {
+        ...disabledProject,
+        localPath: path.join(workspaceRoot, 'projects', 'missing'),
+      }
+      mockDbSelect
+        .mockReturnValueOnce(chain([missingLocalPathProject]))
+        .mockReturnValueOnce(chain([
+          { mcpId: 'filesystem', installPath: filesystemPath, enabled: true },
+        ]))
+
+      const configRes = await GET(authRequest('/api/projects/project-mcp/mcps') as never, {
+        params: Promise.resolve({ id: project.id }),
+      })
+      expect(configRes.status).toBe(200)
+      expect((await configRes.json()).overview.statuses[0]).toMatchObject({
+        installState: 'installed',
+        status: 'configuration_required',
+      })
+    })
+  })
+
+  it('rejects project MCP override paths outside the shared MCP root', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+
+    await withWorkspaceProject(async (project) => {
+      mockDbSelect.mockReturnValueOnce(chain([project]))
+
+      const { PUT } = await import('@/app/api/projects/[id]/mcps/route')
+      const res = await PUT(authRequest('/api/projects/project-mcp/mcps', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          profile: 'custom',
+          requiredMcps: ['filesystem'],
+          overrides: {
+            filesystem: { installPath: '/tmp/outside-forge-mcps' },
+          },
+        }),
+      }) as never, {
+        params: Promise.resolve({ id: project.id }),
+      })
+
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error).toMatch(/active workspace root/)
+      expect(mockDbUpdate).not.toHaveBeenCalled()
+    })
+  })
+
+  it('allows project MCP override paths inside the active workspace root', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbUpdate.mockReturnValue(chain(undefined))
+    mockDbInsert.mockReturnValue(chain(undefined))
+
+    await withWorkspaceProject(async (project, workspaceRoot) => {
+      const customPath = path.join(workspaceRoot, 'custom-mcps', 'filesystem')
+      await fs.mkdir(customPath, { recursive: true })
+      await fs.writeFile(
+        path.join(customPath, 'forge.mcp.json'),
+        `${JSON.stringify({
+          schemaVersion: 1,
+          id: 'filesystem',
+          displayName: 'Filesystem',
+          source: 'forge-catalog',
+          createdAt: new Date().toISOString(),
+        })}\n`,
+      )
+      mockDbSelect
+        .mockReturnValueOnce(chain([project]))
+        .mockReturnValueOnce(chain([]))
+
+      const { PUT } = await import('@/app/api/projects/[id]/mcps/route')
+      const res = await PUT(authRequest('/api/projects/project-mcp/mcps', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          profile: 'custom',
+          requiredMcps: ['filesystem'],
+          overrides: {
+            filesystem: { installPath: customPath },
+          },
+        }),
+      }) as never, {
+        params: Promise.resolve({ id: project.id }),
+      })
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.overview.statuses[0]).toMatchObject({
+        installPath: customPath,
+        installState: 'installed',
+        status: 'healthy',
+      })
+      expect(mockDbUpdate).toHaveBeenCalled()
+    })
   })
 })
 

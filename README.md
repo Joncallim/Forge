@@ -116,6 +116,11 @@ Local projects can be created from the project dialog. Forge defaults to a
 workspace at `~/Documents/Forge`, with projects under
 `~/Documents/Forge/projects`. You can change the active workspace root from
 Settings or set `FORGE_WORKSPACE_ROOT` for deployments that need a fixed path.
+Recommended MCPs are tracked as shared workspace runtime infrastructure under
+`~/Documents/Forge/mcps`. The current catalog manages Forge manifests for the
+Filesystem and GitHub MCPs, shows per-project health in the project dashboard,
+and stores the default MCP profile in each new `forge.project.json`. Advanced
+users can change the shared MCP root from Settings or set `FORGE_MCPS_ROOT`.
 
 ## Uninstall
 

@@ -1,11 +1,12 @@
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { eq } from 'drizzle-orm'
+import { inArray } from 'drizzle-orm'
 import { db } from '@/db'
 import { appSettings } from '@/db/schema'
 
 export const WORKSPACE_ROOT_SETTING_KEY = 'workspaceRoot'
+export const MCPS_ROOT_SETTING_KEY = 'mcpsRoot'
 export const DEFAULT_WORKSPACE_ROOT = '~/Documents/Forge'
 
 export type WorkspaceSettings = {
@@ -47,11 +48,19 @@ export function collapseHomePath(resolvedPath: string): string {
   return absolute
 }
 
-function settingsForRoot(workspaceRoot: string, source: WorkspaceSettings['source']): WorkspaceSettings {
+function defaultMcpsRootForWorkspace(workspaceRoot: string): string {
+  return path.join(/*turbopackIgnore: true*/ workspaceRoot, 'mcps')
+}
+
+function settingsForRoot(
+  workspaceRoot: string,
+  source: WorkspaceSettings['source'],
+  mcpsRoot = defaultMcpsRootForWorkspace(workspaceRoot),
+): WorkspaceSettings {
   return {
     workspaceRoot,
     projectsRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'projects'),
-    mcpsRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'mcps'),
+    mcpsRoot,
     templatesRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'templates'),
     globalSettingsPath: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'global-settings.json'),
     source,
@@ -63,42 +72,62 @@ function defaultWorkspaceRootAbsolute(): string {
   return normalizeWorkspaceRoot(DEFAULT_WORKSPACE_ROOT)
 }
 
-async function readWorkspaceRootFromGlobalSettings(filePath: string): Promise<string | null> {
+async function readWorkspaceConfigFromGlobalSettings(filePath: string): Promise<{
+  workspaceRoot: string | null
+  mcpsRoot: string | null
+}> {
   try {
     const raw = await fs.readFile(filePath, 'utf-8')
-    const parsed = JSON.parse(raw) as { workspaceRoot?: unknown }
-    return typeof parsed.workspaceRoot === 'string' && parsed.workspaceRoot.trim()
+    const parsed = JSON.parse(raw) as { workspaceRoot?: unknown; mcpsRoot?: unknown }
+    const workspaceRoot = typeof parsed.workspaceRoot === 'string' && parsed.workspaceRoot.trim()
       ? normalizeWorkspaceRoot(parsed.workspaceRoot)
       : null
+    const mcpsRoot = typeof parsed.mcpsRoot === 'string' && parsed.mcpsRoot.trim()
+      ? normalizeWorkspaceRoot(parsed.mcpsRoot)
+      : null
+    return { workspaceRoot, mcpsRoot }
   } catch {
-    return null
+    return { workspaceRoot: null, mcpsRoot: null }
   }
 }
 
-async function readStoredWorkspaceRoot(): Promise<string | null> {
+async function readStoredWorkspaceConfig(): Promise<{ workspaceRoot: string | null; mcpsRoot: string | null }> {
+  let workspaceRoot: string | null = null
+  let mcpsRoot: string | null = null
+
   try {
-    const [row] = await db
-      .select({ value: appSettings.value })
+    const rows = await db
+      .select({ key: appSettings.key, value: appSettings.value })
       .from(appSettings)
-      .where(eq(appSettings.key, WORKSPACE_ROOT_SETTING_KEY))
-      .limit(1)
-    if (row?.value?.trim()) return row.value.trim()
+      .where(inArray(appSettings.key, [WORKSPACE_ROOT_SETTING_KEY, MCPS_ROOT_SETTING_KEY]))
+    for (const row of rows) {
+      if (!row.value?.trim()) continue
+      if (row.key === WORKSPACE_ROOT_SETTING_KEY) workspaceRoot = row.value.trim()
+      if (row.key === MCPS_ROOT_SETTING_KEY) mcpsRoot = row.value.trim()
+    }
   } catch {
     // Fall through to the DB-independent pointer below.
   }
 
-  return readWorkspaceRootFromGlobalSettings(
+  if (workspaceRoot && mcpsRoot) return { workspaceRoot, mcpsRoot }
+
+  const globalConfig = await readWorkspaceConfigFromGlobalSettings(
     path.join(/*turbopackIgnore: true*/ defaultWorkspaceRootAbsolute(), 'global-settings.json'),
   )
+
+  return {
+    workspaceRoot: workspaceRoot ?? globalConfig.workspaceRoot,
+    mcpsRoot: mcpsRoot ?? globalConfig.mcpsRoot,
+  }
 }
 
-async function writeStoredWorkspaceRoot(workspaceRoot: string): Promise<void> {
+async function writeStoredSetting(key: string, value: string): Promise<void> {
   await db
     .insert(appSettings)
-    .values({ key: WORKSPACE_ROOT_SETTING_KEY, value: workspaceRoot })
+    .values({ key, value })
     .onConflictDoUpdate({
       target: appSettings.key,
-      set: { value: workspaceRoot, updatedAt: new Date() },
+      set: { value, updatedAt: new Date() },
     })
 }
 
@@ -140,11 +169,23 @@ async function writeDefaultWorkspacePointer(settings: WorkspaceSettings): Promis
 
 export async function getWorkspaceSettings(options: { ensure?: boolean } = {}): Promise<WorkspaceSettings> {
   const envRoot = process.env.FORGE_WORKSPACE_ROOT?.trim()
-  const storedRoot = envRoot ? null : await readStoredWorkspaceRoot()
+  const envMcpsRoot = process.env.FORGE_MCPS_ROOT?.trim()
+  const storedConfig = envRoot || envMcpsRoot ? { workspaceRoot: null, mcpsRoot: null } : await readStoredWorkspaceConfig()
   const source: WorkspaceSettings['source'] =
-    envRoot ? 'env' : storedRoot && normalizeWorkspaceRoot(storedRoot) !== defaultWorkspaceRootAbsolute() ? 'setting' : 'default'
-  const rawRoot = envRoot || storedRoot || DEFAULT_WORKSPACE_ROOT
-  const settings = settingsForRoot(normalizeWorkspaceRoot(rawRoot), source)
+    envRoot || envMcpsRoot
+      ? 'env'
+      : storedConfig.workspaceRoot && normalizeWorkspaceRoot(storedConfig.workspaceRoot) !== defaultWorkspaceRootAbsolute()
+        ? 'setting'
+        : storedConfig.mcpsRoot
+          ? 'setting'
+          : 'default'
+  const rawRoot = envRoot || storedConfig.workspaceRoot || DEFAULT_WORKSPACE_ROOT
+  const workspaceRoot = normalizeWorkspaceRoot(rawRoot)
+  const mcpsRoot = normalizeWorkspaceRoot(envMcpsRoot || storedConfig.mcpsRoot || defaultMcpsRootForWorkspace(workspaceRoot))
+  if (!isWithinPath(workspaceRoot, mcpsRoot)) {
+    throw new Error('MCP root must stay inside the active workspace root.')
+  }
+  const settings = settingsForRoot(workspaceRoot, source, mcpsRoot)
 
   if (options.ensure ?? true) {
     await ensureWorkspace(settings)
@@ -154,17 +195,29 @@ export async function getWorkspaceSettings(options: { ensure?: boolean } = {}): 
 }
 
 export async function saveWorkspaceRoot(rawRoot: string): Promise<WorkspaceSettings> {
-  if (process.env.FORGE_WORKSPACE_ROOT?.trim()) {
-    throw new Error('FORGE_WORKSPACE_ROOT is set, so the workspace root is controlled by the environment.')
+  return saveWorkspaceSettings({ workspaceRoot: rawRoot })
+}
+
+export async function saveWorkspaceSettings(input: {
+  workspaceRoot: string
+  mcpsRoot?: string
+}): Promise<WorkspaceSettings> {
+  if (process.env.FORGE_WORKSPACE_ROOT?.trim() || process.env.FORGE_MCPS_ROOT?.trim()) {
+    throw new Error('FORGE_WORKSPACE_ROOT or FORGE_MCPS_ROOT is set, so workspace paths are controlled by the environment.')
   }
-  if (rawRoot.includes('\0')) {
+  if (input.workspaceRoot.includes('\0') || input.mcpsRoot?.includes('\0')) {
     throw new Error('Workspace root cannot contain null bytes.')
   }
-  const workspaceRoot = normalizeWorkspaceRoot(rawRoot)
-  const settings = settingsForRoot(workspaceRoot, 'setting')
+  const workspaceRoot = normalizeWorkspaceRoot(input.workspaceRoot)
+  const mcpsRoot = normalizeWorkspaceRoot(input.mcpsRoot || defaultMcpsRootForWorkspace(workspaceRoot))
+  if (!isWithinPath(workspaceRoot, mcpsRoot)) {
+    throw new Error('MCP root must stay inside the active workspace root.')
+  }
+  const settings = settingsForRoot(workspaceRoot, 'setting', mcpsRoot)
   await ensureWorkspace(settings)
   await writeDefaultWorkspacePointer(settings)
-  await writeStoredWorkspaceRoot(workspaceRoot)
+  await writeStoredSetting(WORKSPACE_ROOT_SETTING_KEY, workspaceRoot)
+  await writeStoredSetting(MCPS_ROOT_SETTING_KEY, mcpsRoot)
   return settings
 }
 

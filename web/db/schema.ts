@@ -13,6 +13,7 @@ import {
   index,
   uniqueIndex,
 } from 'drizzle-orm/pg-core'
+import { sql } from 'drizzle-orm'
 import type { InferSelectModel, InferInsertModel } from 'drizzle-orm'
 
 // bytea is not in drizzle-orm/pg-core as a named export, so we declare it once
@@ -149,6 +150,18 @@ export const providerHealthChecks = pgTable(
 export type ProviderHealthCheck = InferSelectModel<typeof providerHealthChecks>
 export type NewProviderHealthCheck = InferInsertModel<typeof providerHealthChecks>
 
+export type ProjectMcpConfig = {
+  profile: 'default' | 'custom'
+  requiredMcps: string[]
+  overrides: Record<string, { enabled?: boolean; installPath?: string }>
+}
+
+export const DEFAULT_PROJECT_MCP_CONFIG: ProjectMcpConfig = {
+  profile: 'default',
+  requiredMcps: ['filesystem', 'github'],
+  overrides: {},
+}
+
 // ---------------------------------------------------------------------------
 // projects
 // ---------------------------------------------------------------------------
@@ -162,6 +175,10 @@ export const projects = pgTable('projects', {
     () => providerConfigs.id,
     { onDelete: 'set null' },
   ),
+  mcpConfig: jsonb('mcp_config')
+    .$type<ProjectMcpConfig>()
+    .notNull()
+    .default(sql`'{"profile":"default","requiredMcps":["filesystem","github"],"overrides":{}}'::jsonb`),
   defaultBranch: text('default_branch').notNull().default('main'),
   createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
@@ -170,6 +187,58 @@ export const projects = pgTable('projects', {
 
 export type Project = InferSelectModel<typeof projects>
 export type NewProject = InferInsertModel<typeof projects>
+
+// ---------------------------------------------------------------------------
+// mcpInstallations
+// ---------------------------------------------------------------------------
+export const mcpInstallations = pgTable(
+  'mcp_installations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    mcpId: text('mcp_id').notNull(),
+    installPath: text('install_path').notNull(),
+    enabled: boolean('enabled').notNull().default(true),
+    source: text('source').notNull().default('catalog'),
+    metadata: jsonb('metadata'),
+    installedAt: timestamp('installed_at', tsOpts).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('mcp_installations_mcp_id_idx').on(t.mcpId),
+    index('mcp_installations_enabled_idx').on(t.enabled),
+  ],
+)
+
+export type McpInstallation = InferSelectModel<typeof mcpInstallations>
+export type NewMcpInstallation = InferInsertModel<typeof mcpInstallations>
+
+// ---------------------------------------------------------------------------
+// projectMcpStatusChecks
+// ---------------------------------------------------------------------------
+export const projectMcpStatusChecks = pgTable(
+  'project_mcp_status_checks',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    mcpId: text('mcp_id').notNull(),
+    status: text('status').notNull(),
+    installState: text('install_state').notNull(),
+    error: text('error'),
+    details: jsonb('details'),
+    checkedAt: timestamp('checked_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('project_mcp_status_project_mcp_idx').on(t.projectId, t.mcpId),
+    index('project_mcp_status_project_id_idx').on(t.projectId),
+    index('project_mcp_status_mcp_id_idx').on(t.mcpId),
+    index('project_mcp_status_checked_at_idx').on(t.checkedAt),
+  ],
+)
+
+export type ProjectMcpStatusCheck = InferSelectModel<typeof projectMcpStatusChecks>
+export type NewProjectMcpStatusCheck = InferInsertModel<typeof projectMcpStatusChecks>
 
 // ---------------------------------------------------------------------------
 // tasks
