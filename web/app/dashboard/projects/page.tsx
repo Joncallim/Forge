@@ -365,7 +365,7 @@ export default function ProjectsPage() {
               <DialogTitle id="new-project-title">New Project</DialogTitle>
             </DialogHeader>
 
-            <form onSubmit={handleCreateProject} className="flex flex-col gap-4" autoComplete="off">
+            <form onSubmit={handleCreateProject} className="flex min-w-0 flex-col gap-4" autoComplete="off">
               <div className="grid grid-cols-3 gap-2" role="radiogroup" aria-label="Project source">
                 <button
                   type="button"
@@ -473,7 +473,7 @@ export default function ProjectsPage() {
               )}
 
               {formSource === 'local' && (
-                <div className="flex flex-col gap-2">
+                <div className="flex min-w-0 flex-col gap-2">
                   <label htmlFor="project-local-parent-path" className="text-sm font-medium text-foreground">
                     Parent Folder <span aria-hidden="true" className="text-destructive">*</span>
                   </label>
@@ -548,8 +548,8 @@ export default function ProjectsPage() {
                     </div>
                   )}
 
-                  <div className="rounded-lg border border-border bg-muted/30">
-                    <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                  <div className="min-w-0 rounded-lg border border-border bg-muted/30">
+                    <div className="flex min-w-0 items-center justify-between gap-2 border-b border-border px-3 py-2">
                       <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
                         {folderListing?.path ?? 'Loading folders...'}
                       </span>
@@ -594,14 +594,14 @@ export default function ProjectsPage() {
                         Loading...
                       </p>
                     ) : folderListing !== null && folderListing.directories.length > 0 ? (
-                      <div className="max-h-52 overflow-y-auto p-1">
+                      <div className="max-h-52 overflow-x-hidden overflow-y-auto p-1">
                         {folderListing.directories.map((directory) => (
                           <button
                             type="button"
                             key={directory.path}
                             onClick={() => void loadFolders(directory.path)}
                             disabled={folderLoading}
-                            className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-background hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            className="flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-background hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                             aria-label={`Open folder ${directory.name}${directory.isGitRepo ? ' (Git repository)' : ''}`}
                           >
                             <FolderOpenIcon className="size-3.5 shrink-0" aria-hidden="true" />
@@ -632,7 +632,7 @@ export default function ProjectsPage() {
               )}
 
               {formSource === 'clone' && (
-                <div className="flex flex-col gap-2">
+                <div className="flex min-w-0 flex-col gap-2">
                   <label htmlFor="clone-repository" className="text-sm font-medium text-foreground">
                     GitHub Repo <span aria-hidden="true" className="text-destructive">*</span>
                   </label>
@@ -754,8 +754,8 @@ export default function ProjectsPage() {
                     </p>
                   </div>
 
-                  <div className="rounded-lg border border-border bg-muted/30">
-                    <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                  <div className="min-w-0 rounded-lg border border-border bg-muted/30">
+                    <div className="flex min-w-0 items-center justify-between gap-2 border-b border-border px-3 py-2">
                       <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
                         {folderListing?.path ?? 'Loading folders...'}
                       </span>
@@ -800,14 +800,14 @@ export default function ProjectsPage() {
                         Loading...
                       </p>
                     ) : folderListing !== null && folderListing.directories.length > 0 ? (
-                      <div className="max-h-52 overflow-y-auto p-1">
+                      <div className="max-h-52 overflow-x-hidden overflow-y-auto p-1">
                         {folderListing.directories.map((directory) => (
                           <button
                             type="button"
                             key={directory.path}
                             onClick={() => void loadFolders(directory.path)}
                             disabled={folderLoading}
-                            className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-background hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            className="flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-background hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                             aria-label={`Open folder ${directory.name}${directory.isGitRepo ? ' (Git repository)' : ''}`}
                           >
                             <FolderOpenIcon className="size-3.5 shrink-0" aria-hidden="true" />

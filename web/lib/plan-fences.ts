@@ -9,6 +9,14 @@
  * constants so both stay in sync, and provides a defensive helper that
  * strips both blocks even if a caller never ran the real parsers (e.g. a
  * consumer that only wants clean display text).
+ *
+ * Many models don't follow the exact custom tag and instead emit a generic
+ * ```json fence (or no language tag at all), since that's the overwhelmingly
+ * common pattern in training data. `findFence()` below handles both: it
+ * prefers the exact tag, and falls back to scanning generic json/untagged
+ * fences for one whose parsed JSON shape matches `isMatch`, so an unrelated
+ * generic JSON block elsewhere in the plan (e.g. an example API response)
+ * isn't mistaken for the structured block.
  */
 
 export const AGENT_BREAKDOWN_FENCE = 'agent_breakdown_json'
@@ -21,17 +29,103 @@ function fenceRegex(tag: string): RegExp {
   return new RegExp('```' + tag + '\\s*\\n([\\s\\S]*?)[ \\t]*\\n?[ \\t]*```', 'gi')
 }
 
+// Matches a generic ```json fence or a bare ``` fence with no language tag.
+// Deliberately excludes the exact custom tags above (those are matched by
+// fenceRegex first); this only catches the common fallback shape.
+const GENERIC_JSON_FENCE_REGEX = /```(?:json)?[ \t]*\n([\s\S]*?)[ \t]*\n?[ \t]*```/gi
+
 const AGENT_BREAKDOWN_REGEX = fenceRegex(AGENT_BREAKDOWN_FENCE)
 const OPEN_QUESTIONS_REGEX = fenceRegex(OPEN_QUESTIONS_FENCE)
+
+export interface FenceMatch {
+  /** Full matched text, including the fence delimiters. */
+  fullMatch: string
+  /** JSON content between the fences. */
+  jsonBlock: string
+}
+
+/**
+ * Finds the fenced JSON block for a known tag within `text`. Tries the exact
+ * tag first (most reliable when the model complies); if absent, scans
+ * generic ```json / bare ``` fences for the first whose parsed content
+ * satisfies `isMatch`, so we only claim a generic fence that actually looks
+ * like the expected shape.
+ */
+export function findFence(
+  text: string,
+  exactRegex: RegExp,
+  isMatch: (parsed: unknown) => boolean,
+): FenceMatch | null {
+  const exact = new RegExp(exactRegex.source, exactRegex.flags.replace('g', ''))
+  const exactMatch = exact.exec(text)
+  if (exactMatch) {
+    return { fullMatch: exactMatch[0], jsonBlock: exactMatch[1] }
+  }
+
+  const generic = new RegExp(GENERIC_JSON_FENCE_REGEX.source, GENERIC_JSON_FENCE_REGEX.flags)
+  let match: RegExpExecArray | null
+  while ((match = generic.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1])
+      if (isMatch(parsed)) {
+        return { fullMatch: match[0], jsonBlock: match[1] }
+      }
+    } catch {
+      continue
+    }
+  }
+
+  return null
+}
+
+// Beyond an array under the right key, require elements shaped like the real
+// thing (an object with the field the parser actually reads) so an unrelated
+// generic JSON example elsewhere in the plan — e.g. a sample API response
+// that happens to have a top-level "agents" or "questions" array of strings —
+// isn't mistaken for the structured block. An empty array is accepted since
+// "no agents"/"no open questions" is a valid, expected real shape.
+export function isAgentBreakdownShape(parsed: unknown): boolean {
+  const agents = (parsed as { agents?: unknown } | null)?.agents
+  if (!Array.isArray(agents)) return false
+  return agents.every(
+    (a) => typeof a === 'object' && a !== null && typeof (a as { role?: unknown }).role === 'string',
+  )
+}
+
+export function isOpenQuestionsShape(parsed: unknown): boolean {
+  const questions = (parsed as { questions?: unknown } | null)?.questions
+  if (!Array.isArray(questions)) return false
+  // normalizeQuestions() (worker/open-questions.ts) accepts both a bare
+  // string and an object with a `question` field — mirror that here.
+  return questions.every(
+    (q) =>
+      typeof q === 'string' ||
+      (typeof q === 'object' && q !== null && typeof (q as { question?: unknown }).question === 'string'),
+  )
+}
 
 /**
  * Removes any `agent_breakdown_json` and `open_questions_json` fenced code
  * blocks from `text`, regardless of order or whether either is present.
- * Pure function, no DB/IO — safe to call from both server and client code.
+ * Falls back to shape-matched generic json fences when the exact tag is
+ * absent, mirroring the parsers in worker/agent-breakdown.ts and
+ * worker/open-questions.ts. Pure function, no DB/IO — safe to call from both
+ * server and client code.
  */
 export function stripKnownFences(text: string): string {
-  return text
+  let result = text
     .replace(AGENT_BREAKDOWN_REGEX, '')
     .replace(OPEN_QUESTIONS_REGEX, '')
-    .trim()
+
+  const agentBreakdownFallback = findFence(result, AGENT_BREAKDOWN_REGEX, isAgentBreakdownShape)
+  if (agentBreakdownFallback) {
+    result = result.replace(agentBreakdownFallback.fullMatch, '')
+  }
+
+  const openQuestionsFallback = findFence(result, OPEN_QUESTIONS_REGEX, isOpenQuestionsShape)
+  if (openQuestionsFallback) {
+    result = result.replace(openQuestionsFallback.fullMatch, '')
+  }
+
+  return result.trim()
 }

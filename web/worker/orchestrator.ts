@@ -214,7 +214,13 @@ async function persistOpenQuestions(taskId: string, questions: OpenQuestion[]): 
   // previous round should not linger.
   await db.delete(taskQuestions).where(eq(taskQuestions.taskId, taskId))
 
-  if (questions.length === 0) return 0
+  if (questions.length === 0) {
+    // Still notify connected clients — a replan that resolves every open
+    // question must clear a stale carousel from the previous round, not just
+    // silently skip the event.
+    await publishTaskEvent(taskId, 'questions:created', { questions: [] })
+    return 0
+  }
 
   const rows = await db
     .insert(taskQuestions)
