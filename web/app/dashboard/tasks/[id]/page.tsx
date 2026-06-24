@@ -27,6 +27,10 @@ import { MarkdownView } from '@/components/MarkdownView'
 import { PlanDiffView } from '@/components/PlanDiffView'
 import { useTaskStream } from '@/hooks/useTaskStream'
 import type { AgentRun, Artifact, TaskQuestion } from '@/hooks/useTaskStream'
+import {
+  latestCapabilityClassificationFromArtifacts,
+  type CapabilityClassificationMetadata,
+} from '@/lib/capabilities/classification-metadata'
 import { stripKnownFences } from '@/lib/plan-fences'
 import {
   latestMcpExecutionDesignFromArtifacts,
@@ -743,6 +747,89 @@ function PlannedAgentsPanel({ agents }: { agents: PlannedAgent[] }) {
   )
 }
 
+function CapabilityClassificationPanel({ classification }: { classification: CapabilityClassificationMetadata | null }) {
+  if (!classification) return null
+
+  const { proposed, validation } = classification
+  const total =
+    proposed.required.length +
+    proposed.optional.length +
+    proposed.excluded.length
+  const statusVariant: StatusVariant = validation.status === 'warnings' ? 'outline' : 'secondary'
+
+  return (
+    <section aria-labelledby="capability-classification-heading" className="rounded-lg border border-border p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <h2 id="capability-classification-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
+          Capability Classification
+        </h2>
+        <Badge variant={statusVariant}>{statusLabel(validation.status)}</Badge>
+      </div>
+
+      <p className="mb-3 text-xs text-muted-foreground">
+        Read-only planning metadata. Agent routing and execution are still driven by the approved plan.
+      </p>
+
+      {validation.warnings.length > 0 && (
+        <div className="mb-3 rounded-lg border border-amber-300/40 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-700/40 dark:bg-amber-950/30 dark:text-amber-200">
+          <p className="font-medium">Warnings</p>
+          <ul className="mt-1 list-disc pl-4">
+            {validation.warnings.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {total === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          The Architect did not classify any work capabilities for this plan.
+        </p>
+      ) : (
+        <dl className="grid gap-3 text-sm">
+          <div>
+            <dt className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Required</dt>
+            <dd className="flex flex-wrap gap-1.5">
+              {proposed.required.length > 0
+                ? proposed.required.map((capability) => (
+                    <Badge key={capability} variant="default">{capability}</Badge>
+                  ))
+                : <span className="text-muted-foreground">None</span>}
+            </dd>
+          </div>
+          <div>
+            <dt className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Optional</dt>
+            <dd className="flex flex-wrap gap-1.5">
+              {proposed.optional.length > 0
+                ? proposed.optional.map((capability) => (
+                    <Badge key={capability} variant="outline">{capability}</Badge>
+                  ))
+                : <span className="text-muted-foreground">None</span>}
+            </dd>
+          </div>
+          <div>
+            <dt className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Excluded</dt>
+            <dd>
+              {proposed.excluded.length > 0 ? (
+                <ul className="grid gap-2">
+                  {proposed.excluded.map((item) => (
+                    <li key={item.capability}>
+                      <Badge variant="secondary">{item.capability}</Badge>
+                      <p className="mt-1 text-xs text-muted-foreground">{item.reason}</p>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <span className="text-muted-foreground">None</span>
+              )}
+            </dd>
+          </div>
+        </dl>
+      )}
+    </section>
+  )
+}
+
 function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | null }) {
   if (!design) return null
 
@@ -1093,6 +1180,7 @@ export default function TaskDetailPage() {
 
   const isAwaitingApproval = (currentStatus ?? task.status) === 'awaiting_approval'
   const plannedAgents = plannedAgentsFromArtifacts(mergedArtifacts)
+  const capabilityClassification = latestCapabilityClassificationFromArtifacts(mergedArtifacts)
   const mcpExecutionDesign = latestMcpExecutionDesignFromArtifacts(mergedArtifacts)
 
   const adrArtifacts = mergedArtifacts.filter((artifact) => artifact.artifactType === 'adr_text')
@@ -1343,6 +1431,7 @@ export default function TaskDetailPage() {
 
         <aside className="flex min-w-0 flex-col gap-6">
           <PlannedAgentsPanel agents={plannedAgents} />
+          <CapabilityClassificationPanel classification={capabilityClassification} />
           <McpAccessPlanPanel design={mcpExecutionDesign} />
 
           {/* Open questions — answer before the plan can be approved */}

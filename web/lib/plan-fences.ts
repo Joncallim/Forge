@@ -2,13 +2,13 @@
  * Shared fence tags for the architect's machine-parseable JSON blocks.
  * ------------------------------------------------------------------------
  * The architect prompt (see `buildArchitectPrompt` in worker/orchestrator.ts)
- * asks the model to follow its Markdown plan with two fenced JSON code
- * blocks tagged `agent_breakdown_json` and `open_questions_json`. Both
- * worker/agent-breakdown.ts and worker/open-questions.ts parse one of these
- * blocks out of the raw text; this module centralizes the fence tag
- * constants so both stay in sync, and provides a defensive helper that
- * strips both blocks even if a caller never ran the real parsers (e.g. a
- * consumer that only wants clean display text).
+ * asks the model to follow its Markdown plan with several fenced JSON code
+ * blocks, including `agent_breakdown_json`, `capability_classification_json`,
+ * `mcp_execution_design_json`, and `open_questions_json`. Worker parsers each
+ * parse one block out of the raw text; this module centralizes the fence tag
+ * constants so they stay in sync, and provides a defensive helper that strips
+ * known blocks even if a caller never ran the real parsers (e.g. a consumer
+ * that only wants clean display text).
  *
  * Many models don't follow the exact custom tag and instead emit a generic
  * ```json fence (or no language tag at all), since that's the overwhelmingly
@@ -20,6 +20,7 @@
  */
 
 export const AGENT_BREAKDOWN_FENCE = 'agent_breakdown_json'
+export const CAPABILITY_CLASSIFICATION_FENCE = 'capability_classification_json'
 export const MCP_EXECUTION_DESIGN_FENCE = 'mcp_execution_design_json'
 export const OPEN_QUESTIONS_FENCE = 'open_questions_json'
 
@@ -36,6 +37,7 @@ function fenceRegex(tag: string): RegExp {
 const GENERIC_JSON_FENCE_REGEX = /```(?:json)?[ \t]*\n([\s\S]*?)[ \t]*\n?[ \t]*```/gi
 
 const AGENT_BREAKDOWN_REGEX = fenceRegex(AGENT_BREAKDOWN_FENCE)
+const CAPABILITY_CLASSIFICATION_REGEX = fenceRegex(CAPABILITY_CLASSIFICATION_FENCE)
 const MCP_EXECUTION_DESIGN_REGEX = fenceRegex(MCP_EXECUTION_DESIGN_FENCE)
 const OPEN_QUESTIONS_REGEX = fenceRegex(OPEN_QUESTIONS_FENCE)
 
@@ -118,9 +120,20 @@ export function isMcpExecutionDesignShape(parsed: unknown): boolean {
   )
 }
 
+export function isCapabilityClassificationShape(parsed: unknown): boolean {
+  if (typeof parsed !== 'object' || parsed === null) return false
+  const value = parsed as { schemaVersion?: unknown; required?: unknown; optional?: unknown; excluded?: unknown }
+  return (
+    value.schemaVersion === 1 &&
+    Array.isArray(value.required) &&
+    Array.isArray(value.optional) &&
+    Array.isArray(value.excluded)
+  )
+}
+
 /**
- * Removes any `agent_breakdown_json` and `open_questions_json` fenced code
- * blocks from `text`, regardless of order or whether either is present.
+ * Removes known machine-readable fenced code blocks from `text`, regardless
+ * of order or whether every block is present.
  * Falls back to shape-matched generic json fences when the exact tag is
  * absent, mirroring the parsers in worker/agent-breakdown.ts and
  * worker/open-questions.ts. Pure function, no DB/IO — safe to call from both
@@ -129,12 +142,18 @@ export function isMcpExecutionDesignShape(parsed: unknown): boolean {
 export function stripKnownFences(text: string): string {
   let result = text
     .replace(AGENT_BREAKDOWN_REGEX, '')
+    .replace(CAPABILITY_CLASSIFICATION_REGEX, '')
     .replace(MCP_EXECUTION_DESIGN_REGEX, '')
     .replace(OPEN_QUESTIONS_REGEX, '')
 
   const agentBreakdownFallback = findFence(result, AGENT_BREAKDOWN_REGEX, isAgentBreakdownShape)
   if (agentBreakdownFallback) {
     result = result.replace(agentBreakdownFallback.fullMatch, '')
+  }
+
+  const capabilityClassificationFallback = findFence(result, CAPABILITY_CLASSIFICATION_REGEX, isCapabilityClassificationShape)
+  if (capabilityClassificationFallback) {
+    result = result.replace(capabilityClassificationFallback.fullMatch, '')
   }
 
   const mcpExecutionDesignFallback = findFence(result, MCP_EXECUTION_DESIGN_REGEX, isMcpExecutionDesignShape)

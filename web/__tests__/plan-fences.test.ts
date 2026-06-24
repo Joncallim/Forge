@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { AGENT_BREAKDOWN_FENCE, MCP_EXECUTION_DESIGN_FENCE, OPEN_QUESTIONS_FENCE, stripKnownFences } from '@/lib/plan-fences'
+import { AGENT_BREAKDOWN_FENCE, CAPABILITY_CLASSIFICATION_FENCE, MCP_EXECUTION_DESIGN_FENCE, OPEN_QUESTIONS_FENCE, stripKnownFences } from '@/lib/plan-fences'
 
 describe('stripKnownFences', () => {
   it('removes both fenced blocks, in either order', () => {
@@ -94,5 +94,18 @@ describe('stripKnownFences', () => {
     ].join('\n')
 
     expect(stripKnownFences(text)).toBe('# Plan\nUse scoped capabilities.')
+  })
+
+  it('removes the capability classification fence', () => {
+    const text = [
+      '# Plan',
+      'Classify the work.',
+      '',
+      '```' + CAPABILITY_CLASSIFICATION_FENCE,
+      '{"schemaVersion":1,"required":["api-implementation"],"optional":[],"excluded":[]}',
+      '```',
+    ].join('\n')
+
+    expect(stripKnownFences(text)).toBe('# Plan\nClassify the work.')
   })
 })
