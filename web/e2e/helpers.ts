@@ -4,6 +4,7 @@ import path from 'node:path'
 import Redis from 'ioredis'
 import postgres from 'postgres'
 import type { BrowserContext, TestInfo } from '@playwright/test'
+import { seedAgentConfigs } from '../db/seed-agents'
 
 const root = path.resolve(__dirname, '..')
 const workerLogs = new WeakMap<ChildProcessWithoutNullStreams, string[]>()
@@ -124,6 +125,8 @@ export async function resetState(): Promise<void> {
     await sql.end()
     redis.disconnect()
   }
+
+  await seedAgentConfigs()
 }
 
 export async function seedSession(displayName = 'E2E Operator'): Promise<SeededSession> {

@@ -146,8 +146,7 @@ function loadAgentFiles(): ParsedAgent[] {
   const parser = useCodex ? parseCodexAgentFile : parseClaudeAgentFile
 
   if (!fs.existsSync(dir)) {
-    console.error(`[seed-agents] Agents directory not found: ${dir}`)
-    process.exit(1)
+    throw new Error(`[seed-agents] Agents directory not found: ${dir}`)
   }
 
   const files = fs
@@ -157,7 +156,7 @@ function loadAgentFiles(): ParsedAgent[] {
 
   if (files.length === 0) {
     console.warn('[seed-agents] No agent files found in', dir)
-    process.exit(0)
+    return []
   }
 
   const parsed: ParsedAgent[] = []
@@ -171,12 +170,12 @@ function loadAgentFiles(): ParsedAgent[] {
   return parsed
 }
 
-async function main() {
+export async function seedAgentConfigs(): Promise<void> {
   const parsed = loadAgentFiles()
 
   if (parsed.length === 0) {
     console.warn('[seed-agents] No valid agent files parsed — nothing to seed')
-    process.exit(0)
+    return
   }
 
   console.log(`[seed-agents] Seeding ${parsed.length} agent(s)...`)
@@ -253,10 +252,13 @@ async function main() {
   }
 
   console.log('[seed-agents] Done.')
-  process.exit(0)
 }
 
-main().catch((err) => {
-  console.error('[seed-agents] Fatal error:', err)
-  process.exit(1)
-})
+if (require.main === module) {
+  seedAgentConfigs()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      console.error('[seed-agents] Fatal error:', err)
+      process.exit(1)
+    })
+}

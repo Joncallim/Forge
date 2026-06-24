@@ -31,9 +31,7 @@ export async function applyPreset(preset: Preset): Promise<void> {
   const existingAgentTypes = new Set((agentsData.agents ?? []).map((agent) => agent.agentType))
   const providerIdByKey: Record<string, string> = {}
 
-  for (const [agentType, spec] of Object.entries(preset.agents)) {
-    if (!existingAgentTypes.has(agentType)) continue
-
+  for (const spec of Object.values(preset.agents)) {
     const key = `${spec.providerType}:${spec.modelId}`
 
     if (providerIdByKey[key] === undefined) {
@@ -63,6 +61,12 @@ export async function applyPreset(preset: Preset): Promise<void> {
         current.push(created.provider)
       }
     }
+  }
+
+  for (const [agentType, spec] of Object.entries(preset.agents)) {
+    if (!existingAgentTypes.has(agentType)) continue
+
+    const key = `${spec.providerType}:${spec.modelId}`
 
     const updateRes = await fetch(`/api/agents/${agentType}`, {
       method: 'PUT',
