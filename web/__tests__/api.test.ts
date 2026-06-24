@@ -40,12 +40,23 @@ vi.mock('@/lib/session', () => ({
 const mockDbSelect = vi.fn()
 const mockDbInsert = vi.fn()
 const mockDbUpdate = vi.fn()
+const mockDbDelete = vi.fn()
+const mockDbTransaction = vi.fn(async (callback: (tx: unknown) => unknown) =>
+  callback({
+    select: mockDbSelect,
+    insert: mockDbInsert,
+    update: mockDbUpdate,
+    delete: mockDbDelete,
+  }),
+)
 
 vi.mock('@/db', () => ({
   db: {
     select: mockDbSelect,
     insert: mockDbInsert,
     update: mockDbUpdate,
+    delete: mockDbDelete,
+    transaction: mockDbTransaction,
   },
 }))
 
@@ -89,7 +100,7 @@ function chain(resolveValue: unknown) {
     catch: (onRejected: (e: unknown) => unknown) =>
       Promise.resolve(resolveValue).catch(onRejected),
   }
-  const methods = ['from', 'where', 'limit', 'orderBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'onConflictDoUpdate']
+  const methods = ['from', 'where', 'limit', 'orderBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'onConflictDoUpdate', 'onConflictDoNothing']
   methods.forEach((m) => { thenable[m] = () => thenable })
   return thenable
 }
@@ -1234,16 +1245,16 @@ describe('POST /api/tasks/:id/questions', () => {
 // ---------------------------------------------------------------------------
 // Suite 3.5 — Agent type sanitisation: PUT /api/agents/../../etc/passwd returns 400
 //
-// The route handler validates agent types against a strict allowlist
-// (VALID_AGENT_TYPES). A path segment like "../../etc/passwd" is URL-decoded
-// before being passed as `type`, then rejected because it is not allowlisted.
+// The route handler validates agent types against a safe slug pattern. A path
+// segment like "../../etc/passwd" is URL-decoded before being passed as `type`,
+// then rejected because it is not a safe slug.
 // This test documents the path traversal regression guard.
 // ---------------------------------------------------------------------------
 
 describe('PUT /api/agents/[type] — path traversal blocked', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
-  it('returns 400 for a non-allowlisted agent type (path traversal attempt)', async () => {
+  it('returns 400 for an unsafe agent slug path traversal attempt', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
 
     const { PUT } = await import('@/app/api/agents/[type]/route')
@@ -1260,6 +1271,90 @@ describe('PUT /api/agents/[type] — path traversal blocked', () => {
     expect(res.status).toBe(400)
     const body = await res.json()
     expect(body.error).toMatch(/invalid agent type/i)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Suite 3.5b — Dynamic agents and editable workforces
+// ---------------------------------------------------------------------------
+
+describe('dynamic agents and workforces', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('creates an arbitrary safe agent slug instead of requiring a fixed role', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert.mockReturnValue(chain([{
+      id: 'agent-1',
+      agentType: 'security-red-team',
+      displayName: 'Security Red Team',
+      description: 'Adversarial review specialist.',
+      isSystem: false,
+      isActive: true,
+      providerConfigId: null,
+      systemPrompt: 'Review changes adversarially.',
+      frontmatterOverrides: null,
+      updatedAt: new Date(),
+      updatedBy: FAKE_SESSION.userId,
+    }]))
+
+    const { POST } = await import('@/app/api/agents/route')
+    const req = authRequest('/api/agents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agentType: 'security-red-team',
+        displayName: 'Security Red Team',
+        description: 'Adversarial review specialist.',
+        systemPrompt: 'Review changes adversarially.',
+      }),
+    })
+
+    const res = await POST(req as never)
+    expect(res.status).toBe(201)
+    const body = await res.json()
+    expect(body.agent.agentType).toBe('security-red-team')
+    expect(mockDbInsert).toHaveBeenCalledOnce()
+  })
+
+  it('creates an editable workforce with selected agent memberships', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert
+      .mockReturnValueOnce(chain([{ id: 'workforce-1' }]))
+      .mockReturnValueOnce(chain([]))
+    mockDbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'workforce-1',
+        slug: 'release-squad',
+        displayName: 'Release Squad',
+        description: '',
+        isDefault: false,
+        isActive: true,
+        metadata: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }]))
+      .mockReturnValueOnce(chain([]))
+
+    const { POST } = await import('@/app/api/workforces/route')
+    const req = authRequest('/api/workforces', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        slug: 'release-squad',
+        displayName: 'Release Squad',
+        members: [
+          {
+            agentConfigId: '00000000-0000-4000-8000-000000000001',
+            roleLabel: 'Release reviewer',
+          },
+        ],
+      }),
+    })
+
+    const res = await POST(req as never)
+    expect(res.status).toBe(201)
+    expect(mockDbTransaction).toHaveBeenCalledOnce()
+    expect(mockDbInsert).toHaveBeenCalledTimes(2)
   })
 })
 

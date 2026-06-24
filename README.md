@@ -1,43 +1,34 @@
 # Forge
 
-Forge is an open-source, self-hosted AI coding orchestration dashboard for
-running an AI Orchestrator, coding agents, GitHub workflows, and local or cloud
-LLM providers from your browser.
+Forge is a local control room for AI coding work.
 
-It is built for developers exploring AI tools, autonomous coding agents,
-multi-agent software engineering, LLM orchestration, and self-hosted coding
-assistants.
+You open Forge in a browser, connect one or more AI models, create a software
+task, and review the plan Forge produces. The long-term goal is a managed AI
+workforce that can plan, build, test, review, and prepare pull requests while a
+human stays in control of the important decisions.
 
-Think of it as a control panel:
+Today, Forge is an Orchestrator-stage beta. It plans work and waits for your
+approval. It does not yet edit your repository, make commits, or open pull
+requests by itself.
+
+## What Forge Does Today
 
 1. You create a project.
 2. You describe a task.
-3. Forge sends that task to a configured AI Orchestrator.
-4. The Orchestrator streams a Markdown plan shaped for the kind of software requested.
-5. You review and approve the result.
+3. Forge queues the task.
+4. A background worker asks the Architect agent to write a plan.
+5. Forge saves the plan and shows it in the dashboard.
+6. You approve, reject, or revise the plan.
 
-Today, Forge handles the first Orchestrator stage: planning. It does not yet
-edit your repository, make commits, or open pull requests by itself.
-
-## What Runs On Your Computer
-
-Forge has four main pieces:
-
-- **Web app**: the dashboard you open at `http://localhost:3000`.
-- **Worker**: the background loop that picks up tasks and calls AI models.
-- **PostgreSQL**: the database that stores settings, users, tasks, and results.
-- **Redis**: the queue that passes work from the web app to the worker.
-
-Local installs start the worker inside the web process by default, so `npm run
-dev` is enough for the usual single-user setup. You can still split the worker
-into its own process with `FORGE_EMBED_WORKER=0` when you want production-style
-process isolation.
+Under the hood, Forge runs a web app, PostgreSQL, Redis, and a worker process.
+For normal local use, the worker starts inside the web app, so one command starts
+the dashboard and the task loop together.
 
 ```text
-Browser -> Forge web app -> Redis queue -> Forge worker -> AI Orchestrator -> review in browser
+Browser -> Forge dashboard -> Redis queue -> Forge worker -> AI model -> review in browser
 ```
 
-## Fastest Setup On macOS Or Linux
+## Fast Setup
 
 From the repository root:
 
@@ -45,178 +36,61 @@ From the repository root:
 bash scripts/install.sh
 ```
 
-The installer:
+The installer prepares local services, creates `.env`, installs web
+dependencies, prepares the database, and can set up a small local Ollama model
+so Forge can run without API keys.
 
-- installs missing local tools,
-- starts PostgreSQL and Redis,
-- installs or checks GitHub CLI for repository tooling,
-- creates `.env` with generated secrets,
-- prepares the database,
-- installs web dependencies,
-- optionally installs Ollama and a small local AI model,
-- records what it installed so uninstall avoids tools you already had.
-
-The first run can be slow because Homebrew, npm, or AI models may need to
-download files.
-
-If the install is interrupted or a later step fails, re-run
-`bash scripts/install.sh`; the installer preserves existing settings and
-resumes idempotent setup steps. Detailed installer output is saved to
-`.forge/install.log`.
-
-To skip the local Ollama model and configure AI providers later:
+Useful variants:
 
 ```bash
+bash scripts/install.sh --check      # inspect readiness without changing the machine
+bash scripts/install.sh --upgrade    # sync dependencies and migrations after pulling updates
 FORGE_SKIP_OLLAMA=1 bash scripts/install.sh
 ```
 
-To inspect readiness without changing the machine:
-
-```bash
-bash scripts/install.sh --check
-```
-
-After pulling new changes, sync dependencies and apply new database
-migrations without redoing the full install:
-
-```bash
-bash scripts/install.sh --upgrade
-```
-
-## Start Forge
-
-After install:
+Then start Forge:
 
 ```bash
 cd web
 npm run dev
 ```
 
-Then open:
+Open:
 
 ```text
 http://localhost:3000
 ```
 
-The web app starts the task worker automatically — `npm run dev` alone is
-enough to use Forge at `http://localhost:3000`. Only run the worker as a
-separate process if you've explicitly disabled the embedded one; running
-`npm run worker` by itself does not serve HTTP and will not make the app
-reachable in a browser:
+The first account creates a password and, by default, a passkey. To use password
+only, set `FORGE_PASSKEYS_ENABLED=0` in `.env` before creating the first account.
 
-```bash
-FORGE_EMBED_WORKER=0 npm run dev
-```
+## Try A Task
 
-```bash
-cd web
-npm run worker
-```
+1. Open the dashboard.
+2. Apply a provider preset in setup, or add a provider manually.
+3. Create a project from a GitHub repo or local folder.
+4. Create a task with a short prompt.
+5. Wait for the task to reach `Awaiting Approval`.
+6. Read the Architect plan and approve or reject it.
 
-The first account creates a password and, by default, a passkey. To skip
-passkeys for convenience, set `FORGE_PASSKEYS_ENABLED=0` in `.env` before
-creating the first account.
-
-Local projects can be created from the project dialog. Forge defaults to a
-workspace at `~/Documents/Forge`, with projects under
-`~/Documents/Forge/projects`. You can change the active workspace root from
-Settings or set `FORGE_WORKSPACE_ROOT` for deployments that need a fixed path.
-Recommended MCPs are tracked as shared workspace runtime infrastructure under
-`~/Documents/Forge/mcps`. The current catalog manages Forge manifests for the
-Filesystem and GitHub MCPs, shows per-project health in the project dashboard,
-and stores the default MCP profile in each new `forge.project.json`. Advanced
-users can change the shared MCP root from Settings or set `FORGE_MCPS_ROOT`.
-
-## Uninstall
-
-The install and uninstall scripts are conservative:
-
-- `scripts/install.sh` creates `.env`, installs missing tools, prepares
-  PostgreSQL/Redis, installs `web/node_modules`, optionally configures Ollama,
-  and records only packages it added in `.forge/install-manifest`.
-- `scripts/uninstall.sh` removes Forge build artifacts and recorded Forge-only
-  packages. Packages that existed before Forge are left alone.
-- Keeping data preserves `.env`, PostgreSQL/Redis data, and the install manifest
-  so a future reinstall can pick up your settings.
-- Removing data wipes Forge-local settings, the application database, Redis data,
-  recorded Ollama models, and install state.
-
-To remove Forge from macOS or Linux:
-
-```bash
-bash scripts/uninstall.sh
-```
-
-The script asks whether to keep settings and credentials. Keeping them preserves
-`.env`, database data, Redis data, and the install record for a future reinstall.
-It also asks whether to delete the local project folders Forge created; answer no
-to keep your project files.
-
-Preview first:
-
-```bash
-bash scripts/uninstall.sh --dry-run
-```
-
-Full local wipe:
-
-```bash
-bash scripts/uninstall.sh --remove-data
-```
-
-Also delete every local project folder Forge created:
-
-```bash
-bash scripts/uninstall.sh --remove-data --remove-projects
-```
-
-Detailed install/uninstall reference: [docs/install-uninstall.md](docs/install-uninstall.md).
-
-## Database Updates
-
-After pulling new code, apply database migrations:
+For a no-cost plumbing test, run with the mock Architect:
 
 ```bash
 cd web
-npm run db:migrate
+FORGE_WORKER_MOCK_ARCHITECT=1 npm run dev
 ```
 
-For the migration workflow, see
-[docs/database-migrations.md](docs/database-migrations.md).
+## What Is Not Built Yet
 
-## Helpful Docs
+- Automatic repository edits.
+- Multi-agent implementation runs.
+- Test execution by agents.
+- Branch, commit, pull request, and merge automation.
+- Full specialist harness execution from the Workforce roadmap.
 
-- [Install/uninstall reference](docs/install-uninstall.md)
-- [Database migrations](docs/database-migrations.md)
-- [Orchestrator model test guide](docs/orchestrator-model-install-test.md)
-- [Deployment checklist](docs/deployment-checklist.md)
-- [Worker process notes](docs/worker-process.md)
-- [Specialist subagents roadmap](docs/specialist-subagents-roadmap.md)
-- [Terminal installer plan](docs/terminal-installer-plan.md)
-- [CLI command architecture](docs/cli-command-architecture.md)
-
-## Current Status
-
-Forge is in an Orchestrator-stage beta.
-
-Available today:
-
-- local dashboard,
-- password sign-in with optional passkeys,
-- provider setup,
-- GitHub and local-folder project creation,
-- queued worker execution,
-- live Markdown planning output,
-- software-type-aware architect personas with specialist handoffs,
-- web research context for architect planning,
-- human approval flow.
-
-Not built yet:
-
-- automatic repository edits,
-- multi-agent implementation,
-- test execution by agents,
-- GitHub branch and pull request automation.
+The first Workforce build slice is present as durable planning records:
+work packages, harness metadata, approval gates, and VCS summaries can now be
+stored and displayed. Execution remains a later slice.
 
 ## Screenshots
 
@@ -235,3 +109,11 @@ Not built yet:
 ### Completed Orchestrator Task
 
 ![Forge task detail page after approval](docs/assets/gui/desktop-04-task-completed.png)
+
+## Docs
+
+- [Operator guide](docs/operator-guide.md) - install, run, deploy, uninstall, and troubleshoot Forge.
+- [Developer guide](docs/developer-guide.md) - web app, worker, database, tests, prompts, and coding standards.
+- [Design guide](docs/design.md) - product model, UI principles, screenshot evidence, and visual QA notes.
+- [Roadmap](docs/roadmap.md) - current beta status, Workforce architecture, and upcoming slices.
+- [Architecture decisions](docs/adr/) - durable ADRs for major technical decisions.

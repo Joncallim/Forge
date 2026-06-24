@@ -2,7 +2,6 @@ import { MCP_EXECUTION_DESIGN_FENCE, findFence, isMcpExecutionDesignShape } from
 import { isKnownMcpId } from '@/lib/mcps/catalog'
 import type { ProjectMcpOverview, ProjectMcpStatus } from '@/lib/mcps/types'
 
-const KNOWN_AGENTS = new Set(['architect', 'backend', 'frontend', 'qa', 'reviewer', 'devops'])
 const ASSIGNMENT_TYPES = new Set(['agent', 'multiple_agents', 'workforce', 'architect_only', 'reviewer_only'])
 const FALLBACK_ACTIONS = new Set(['block', 'continue_without_mcp', 'ask_user'])
 
@@ -125,7 +124,7 @@ function cleanTextArray(value: unknown, maxItems: number, maxLength: number): st
 
 function cleanAgent(value: unknown): string | null {
   const agent = cleanText(value, 40).toLowerCase()
-  return KNOWN_AGENTS.has(agent) ? agent : null
+  return /^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$/.test(agent) ? agent : null
 }
 
 function normalizeAssignment(raw: unknown): McpExecutionRequirement['assignment'] {
@@ -314,7 +313,7 @@ function agentsForRequirement(requirement: McpExecutionRequirement): string[] {
   if (requirement.assignment.type === 'architect_only') agents.add('architect')
   if (requirement.assignment.type === 'reviewer_only') agents.add('reviewer')
 
-  return [...agents].filter((agent) => KNOWN_AGENTS.has(agent)).sort()
+  return [...agents].filter((agent) => /^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$/.test(agent)).sort()
 }
 
 function decisionStatus(

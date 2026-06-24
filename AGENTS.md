@@ -30,9 +30,15 @@ subagent system. Each agent is defined in `.codex/agents/`:
 | Backend | `backend.toml` | APIs, DB migrations, business logic, services |
 | Frontend | `frontend.toml` | UI components, state, routing, API integration |
 | Reviewer | `reviewer.toml` | Code review, security, perf, correctness |
+| Adversarial | `adversarial.toml` | Reviewer-family red-team review for high-risk changes |
 | QA | `qa.toml` | Test writing, coverage analysis, regression checks |
 | DevOps | `devops.toml` | Docker, CI/CD, infra, deployment config |
-| Documentation | `documentation.toml` | `docs/` authoring/review, 4-layer pyramid enforcement |
+| Documentation | `documentation.toml` | README/docs/wiki shaping and ADR polish |
+
+The web app stores agents as editable database records. The repository ships
+seed prompts for these Codex roles, but users may add more app agents and assign
+them to editable workforces. Treat the Codex files as defaults, not as the full
+runtime catalog.
 
 ## Workflow
 
@@ -56,6 +62,9 @@ Issue / Request
 4. Reviewer agent → audit PRs
       │
       ▼
+4a. Adversarial agent → red-team high-risk changes when needed
+      │
+      ▼
 5. PM (you) → merge or rework
 ```
 
@@ -66,6 +75,8 @@ Issue / Request
 - **Never** merge without passing QA tests
 - For refactors touching >3 files, run Architect before Backend/Frontend
 - For security-sensitive changes (auth, payments, data access), escalate Reviewer findings before merge
+- Run Adversarial review for auth, secrets, filesystem, command execution,
+  repository-write, tool-permission, prompt-injection, or merge-automation work
 
 ## Stack Constraints
 

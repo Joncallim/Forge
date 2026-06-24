@@ -57,8 +57,7 @@ npm run build           # production build check
 ```
 
 These npm commands remain canonical until the future global CLI described in
-[../docs/cli-command-architecture.md](../docs/cli-command-architecture.md)
-exists.
+[../docs/operator-guide.md](../docs/operator-guide.md) exists.
 
 ## Task Flow
 
@@ -88,7 +87,7 @@ To create a new migration after changing `db/schema.ts`:
 npm run db:generate -- --name short_change_name
 ```
 
-See [../docs/database-migrations.md](../docs/database-migrations.md).
+See [../docs/developer-guide.md](../docs/developer-guide.md).
 
 ## Docker
 
@@ -107,4 +106,4 @@ docker compose --profile worker up worker
 The worker currently runs only the Architect planning stage. It does not yet edit
 repositories, run implementation agents, create commits, or open pull requests.
 
-See [../docs/worker-process.md](../docs/worker-process.md).
+See [../docs/developer-guide.md](../docs/developer-guide.md).

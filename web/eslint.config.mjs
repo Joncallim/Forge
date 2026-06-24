@@ -8,7 +8,7 @@ const eslintConfig = defineConfig([
   {
     rules: {
       // Forge's dashboard client pages fetch mutable data after mount today.
-      // Track the larger server/client split in docs/shipping-roadmap.md.
+      // Track the larger server/client split in docs/roadmap.md.
       "react-hooks/set-state-in-effect": "off",
     },
   },

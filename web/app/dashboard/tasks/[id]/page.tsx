@@ -11,18 +11,11 @@ import {
   ChevronRightIcon,
   CircleAlertIcon,
   UsersIcon,
-  ListIcon,
   ShieldCheckIcon,
+  GitBranchIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
-} from '@/components/ui/dialog'
 import { MarkdownView } from '@/components/MarkdownView'
 import { PlanDiffView } from '@/components/PlanDiffView'
 import { useTaskStream } from '@/hooks/useTaskStream'
@@ -62,6 +55,22 @@ interface TaskAttempt {
   completedAt: string | null
   nextRetryAt: string | null
   createdAt: string
+}
+
+type WorkforceRecord = Record<string, unknown>
+type WorkPackage = WorkforceRecord
+type ApprovalGate = WorkforceRecord
+type VcsChange = WorkforceRecord
+
+interface TaskDetailResponse {
+  task?: Task | null
+  runs?: AgentRun[]
+  artifacts?: Artifact[]
+  questions?: TaskQuestion[]
+  attempts?: TaskAttempt[]
+  workPackages?: WorkPackage[]
+  approvalGates?: ApprovalGate[]
+  vcsChanges?: VcsChange[]
 }
 
 type StatusVariant = 'default' | 'secondary' | 'destructive' | 'outline'
@@ -174,6 +183,43 @@ function plannedAgentsFromArtifacts(artifacts: Artifact[]): PlannedAgent[] {
     if (fallback.length > 0) return fallback
   }
   return []
+}
+
+function stringField(record: WorkforceRecord, keys: string[]): string {
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'string' && value.trim() !== '') return value.trim()
+  }
+  return ''
+}
+
+function booleanField(record: WorkforceRecord, keys: string[]): boolean | null {
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'boolean') return value
+  }
+  return null
+}
+
+function stringArrayField(record: WorkforceRecord, keys: string[]): string[] {
+  for (const key of keys) {
+    const value = record[key]
+    if (!Array.isArray(value)) continue
+
+    const strings = value.filter((item): item is string => typeof item === 'string' && item.trim() !== '')
+    if (strings.length > 0) return strings.map((item) => item.trim())
+  }
+  return []
+}
+
+function recordKey(record: WorkforceRecord, prefix: string, index: number): string {
+  return stringField(record, ['id']) || `${prefix}-${index}`
+}
+
+function previewList(items: string[], limit = 4): string {
+  const visible = items.slice(0, limit)
+  const remaining = items.length - visible.length
+  return remaining > 0 ? `${visible.join(', ')} +${remaining} more` : visible.join(', ')
 }
 
 // ---------------------------------------------------------------------------
@@ -584,164 +630,176 @@ function QuestionsPanel({
   )
 }
 
-// ---------------------------------------------------------------------------
-// AgentTasksModal — shows an agent's full task list alongside its system
-// prompt ("Instructions"), fetched lazily and cached for the page's lifetime.
-// ---------------------------------------------------------------------------
-const agentInstructionsCache = new Map<string, string>()
-
-function AgentTasksModal({ agent, open, onOpenChange }: {
-  agent: PlannedAgent
-  open: boolean
-  onOpenChange: (open: boolean) => void
+function WorkforcePanel({
+  workPackages,
+  approvalGates,
+  vcsChanges,
+  fallbackAgents,
+}: {
+  workPackages: WorkPackage[]
+  approvalGates: ApprovalGate[]
+  vcsChanges: VcsChange[]
+  fallbackAgents: PlannedAgent[]
 }) {
-  const [instructions, setInstructions] = useState<string | null>(null)
-  const [loadingInstructions, setLoadingInstructions] = useState(false)
-  const [instructionsError, setInstructionsError] = useState<string | null>(null)
+  const hasPersistedPlan = workPackages.length > 0 || approvalGates.length > 0
+  const hasFallback = fallbackAgents.length > 0
+  if (!hasPersistedPlan && !hasFallback && vcsChanges.length === 0) return null
 
-  const roleSlug = agent.role.toLowerCase()
-
-  useEffect(() => {
-    if (!open) return
-
-    const cached = agentInstructionsCache.get(roleSlug)
-    if (cached !== undefined) {
-      setInstructions(cached)
-      setInstructionsError(null)
-      return
-    }
-
-    let cancelled = false
-    setLoadingInstructions(true)
-    setInstructionsError(null)
-
-    fetch(`/api/agents/${roleSlug}`)
-      .then(async (res) => {
-        if (!res.ok) {
-          const body = await res.json().catch(() => ({}))
-          throw new Error(body.error ?? 'Failed to load agent instructions')
-        }
-        return res.json()
-      })
-      .then((data) => {
-        if (cancelled) return
-        const systemPrompt = typeof data?.agent?.systemPrompt === 'string' ? data.agent.systemPrompt : ''
-        agentInstructionsCache.set(roleSlug, systemPrompt)
-        setInstructions(systemPrompt)
-      })
-      .catch((err) => {
-        if (cancelled) return
-        setInstructionsError(err instanceof Error ? err.message : 'An unexpected error occurred')
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingInstructions(false)
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [open, roleSlug])
-
-  const taskItems = agent.steps.length > 0 ? agent.steps : (agent.summary !== '' ? [agent.summary] : [])
+  const fallbackTasks = fallbackAgents.reduce((sum, agent) => sum + agent.tasks, 0)
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-3xl" aria-labelledby={`agent-tasks-title-${roleSlug}`}>
-        <DialogHeader>
-          <DialogTitle id={`agent-tasks-title-${roleSlug}`}>{agent.role} — Tasks &amp; Instructions</DialogTitle>
-        </DialogHeader>
-
-        <div className="grid gap-4 sm:grid-cols-2">
-          <div className="min-w-0">
-            <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">Tasks</h3>
-            {taskItems.length > 0 ? (
-              <ul className="flex flex-col gap-1.5 text-sm text-foreground" aria-label={`${agent.role} tasks`}>
-                {taskItems.map((item, idx) => (
-                  <li key={idx} className="flex gap-2">
-                    <span aria-hidden="true" className="text-muted-foreground">•</span>
-                    <span>{item}</span>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="text-sm text-muted-foreground">No task details available.</p>
-            )}
-          </div>
-
-          <div className="min-w-0">
-            <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">Instructions</h3>
-            {loadingInstructions && (
-              <p className="text-sm text-muted-foreground" role="status" aria-live="polite">Loading instructions…</p>
-            )}
-            {instructionsError !== null && (
-              <p role="alert" className="text-sm text-destructive">{instructionsError}</p>
-            )}
-            {!loadingInstructions && instructionsError === null && instructions !== null && (
-              <div className="max-h-80 overflow-y-auto rounded-lg bg-muted/40 px-3 py-2">
-                <pre className="whitespace-pre-wrap font-mono text-xs text-foreground">{instructions}</pre>
-              </div>
-            )}
-          </div>
-        </div>
-
-        <DialogFooter showCloseButton />
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function PlannedAgentsPanel({ agents }: { agents: PlannedAgent[] }) {
-  const [openRole, setOpenRole] = useState<string | null>(null)
-
-  if (agents.length === 0) return null
-
-  const totalTasks = agents.reduce((sum, agent) => sum + agent.tasks, 0)
-  const activeAgent = agents.find((agent) => agent.role === openRole) ?? null
-
-  return (
-    <section aria-labelledby="planned-agents-heading" className="rounded-lg border border-border p-4">
+    <section aria-labelledby="workforce-heading" className="rounded-lg border border-border p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
-        <h2 id="planned-agents-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
-          Planned Agents
+        <h2 id="workforce-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
+          Workforce
         </h2>
         <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
           <UsersIcon className="size-3.5" aria-hidden="true" />
-          {agents.length} {agents.length === 1 ? 'agent' : 'agents'} · {totalTasks} {totalTasks === 1 ? 'task' : 'tasks'}
+          {hasPersistedPlan
+            ? `${workPackages.length} packages · ${approvalGates.length} gates`
+            : `${fallbackAgents.length} agents · ${fallbackTasks} tasks`}
         </span>
       </div>
-      <ul className="flex flex-col gap-3">
-        {agents.map((agent) => (
-          <li key={agent.role} className="border-t border-border pt-3 first:border-t-0 first:pt-0">
-            <div className="flex items-center justify-between gap-3">
-              <p className="text-sm font-medium text-foreground">{agent.role}</p>
-              <div className="flex items-center gap-2">
-                <Badge variant="outline">
-                  {agent.tasks} {agent.tasks === 1 ? 'task' : 'tasks'}
-                </Badge>
-                <button
-                  type="button"
-                  onClick={() => setOpenRole(agent.role)}
-                  title={`${agent.tasks} ${agent.tasks === 1 ? 'task' : 'tasks'} · ${agent.summary}`}
-                  aria-label={`View tasks and instructions for ${agent.role}`}
-                  className="inline-flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
-                >
-                  <ListIcon className="size-3.5" aria-hidden="true" />
-                </button>
-              </div>
-            </div>
-            {agent.summary !== '' && (
-              <p className="mt-1 text-sm text-muted-foreground">{agent.summary}</p>
-            )}
-          </li>
-        ))}
-      </ul>
 
-      {activeAgent !== null && (
-        <AgentTasksModal
-          agent={activeAgent}
-          open={openRole !== null}
-          onOpenChange={(value) => setOpenRole(value ? activeAgent.role : null)}
-        />
+      <div className="mb-3 flex items-start gap-2 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+        <ShieldCheckIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+        <p>
+          Read-only workforce state. This slice only displays persisted planning records and does not write to the repository.
+        </p>
+      </div>
+
+      {hasPersistedPlan ? (
+        <div className="grid gap-4">
+          <div>
+            <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">Work Packages</h3>
+            {workPackages.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No work packages persisted yet.</p>
+            ) : (
+              <ul className="flex flex-col gap-3" aria-label="Persisted work packages">
+                {workPackages.map((pkg, index) => {
+                  const title = stringField(pkg, ['title', 'name', 'summary', 'agentType', 'role']) || `Work package ${index + 1}`
+                  const owner = stringField(pkg, ['assignedRole', 'agentType', 'agent', 'role', 'assignee', 'harnessSlug'])
+                  const status = stringField(pkg, ['status', 'state'])
+                  const summary = stringField(pkg, ['summary', 'description', 'objective'])
+                  const criteria = stringArrayField(pkg, ['acceptanceCriteria', 'criteria', 'steps'])
+                  const files = stringArrayField(pkg, ['files', 'paths', 'targetFiles'])
+
+                  return (
+                    <li key={recordKey(pkg, 'work-package', index)} className="border-t border-border pt-3 first:border-t-0 first:pt-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="text-sm font-medium text-foreground">{title}</p>
+                        {owner !== '' && <Badge variant="outline">{owner}</Badge>}
+                        {status !== '' && <Badge variant={statusBadgeVariant(status)}>{statusLabel(status)}</Badge>}
+                      </div>
+                      {summary !== '' && <p className="mt-1 text-sm text-muted-foreground">{summary}</p>}
+                      {criteria.length > 0 && (
+                        <p className="mt-1 text-xs text-muted-foreground">Acceptance: {previewList(criteria)}</p>
+                      )}
+                      {files.length > 0 && (
+                        <p className="mt-1 break-words font-mono text-xs text-muted-foreground">{previewList(files)}</p>
+                      )}
+                    </li>
+                  )
+                })}
+              </ul>
+            )}
+          </div>
+
+          <div>
+            <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">Approval Gates</h3>
+            {approvalGates.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No approval gates persisted yet.</p>
+            ) : (
+              <ul className="flex flex-col gap-3" aria-label="Persisted approval gates">
+                {approvalGates.map((gate, index) => {
+                  const title = stringField(gate, ['title', 'name', 'gateType', 'type']) || `Gate ${index + 1}`
+                  const status = stringField(gate, ['status', 'state'])
+                  const summary = stringField(gate, ['summary', 'description', 'reason', 'instructions'])
+                  const required = booleanField(gate, ['required', 'isRequired'])
+                  const packageId = stringField(gate, ['workPackageId'])
+
+                  return (
+                    <li key={recordKey(gate, 'approval-gate', index)} className="border-t border-border pt-3 first:border-t-0 first:pt-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="text-sm font-medium text-foreground">{title}</p>
+                        {status !== '' && <Badge variant={statusBadgeVariant(status)}>{statusLabel(status)}</Badge>}
+                        {required !== null && (
+                          <Badge variant={required ? 'outline' : 'secondary'}>{required ? 'required' : 'optional'}</Badge>
+                        )}
+                      </div>
+                      {packageId !== '' && (
+                        <p className="mt-1 font-mono text-xs text-muted-foreground">Package {packageId}</p>
+                      )}
+                      {summary !== '' && <p className="mt-1 text-sm text-muted-foreground">{summary}</p>}
+                    </li>
+                  )
+                })}
+              </ul>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div>
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Planner Fallback</h3>
+            <Badge variant="outline">planned metadata</Badge>
+          </div>
+          <p className="mb-3 text-xs text-muted-foreground">
+            Persisted workforce records are not available for this task, so Forge is showing the Architect plan metadata.
+          </p>
+          <ul className="flex flex-col gap-3" aria-label="Planned workforce fallback">
+            {fallbackAgents.map((agent) => (
+              <li key={agent.role} className="border-t border-border pt-3 first:border-t-0 first:pt-0">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-sm font-medium text-foreground">{agent.role}</p>
+                  <Badge variant="outline">
+                    {agent.tasks} {agent.tasks === 1 ? 'task' : 'tasks'}
+                  </Badge>
+                </div>
+                {agent.summary !== '' && <p className="mt-1 text-sm text-muted-foreground">{agent.summary}</p>}
+                {agent.steps.length > 0 && (
+                  <p className="mt-1 text-xs text-muted-foreground">Tasks: {previewList(agent.steps, 3)}</p>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {vcsChanges.length > 0 && (
+        <div className="mt-4 border-t border-border pt-3">
+          <div className="mb-2 flex items-center gap-2">
+            <GitBranchIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
+            <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wide">VCS Changes</h3>
+          </div>
+          <ul className="flex flex-col gap-2" aria-label="Persisted VCS changes">
+            {vcsChanges.map((change, index) => {
+              const path = stringField(change, [
+                'path',
+                'filePath',
+                'file',
+                'branchName',
+                'pullRequestUrl',
+                'repository',
+                'commitSha',
+              ]) || `Change ${index + 1}`
+              const status = stringField(change, ['status', 'state'])
+              const type = stringField(change, ['changeType', 'type', 'operation'])
+              const summary = stringField(change, ['summary', 'description', 'diffSummary'])
+
+              return (
+                <li key={recordKey(change, 'vcs-change', index)} className="rounded-md border border-border bg-muted/20 px-2.5 py-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="break-all font-mono text-xs text-foreground">{path}</span>
+                    {type !== '' && <Badge variant="outline">{type}</Badge>}
+                    {status !== '' && <Badge variant={statusBadgeVariant(status)}>{statusLabel(status)}</Badge>}
+                  </div>
+                  {summary !== '' && <p className="mt-1 text-xs text-muted-foreground">{summary}</p>}
+                </li>
+              )
+            })}
+          </ul>
+        </div>
       )}
     </section>
   )
@@ -1070,6 +1128,9 @@ export default function TaskDetailPage() {
   const [initialArtifacts, setInitialArtifacts] = useState<Artifact[]>([])
   const [initialQuestions, setInitialQuestions] = useState<TaskQuestion[]>([])
   const [attempts, setAttempts] = useState<TaskAttempt[]>([])
+  const [workPackages, setWorkPackages] = useState<WorkPackage[]>([])
+  const [approvalGates, setApprovalGates] = useState<ApprovalGate[]>([])
+  const [vcsChanges, setVcsChanges] = useState<VcsChange[]>([])
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
 
@@ -1102,12 +1163,15 @@ export default function TaskDetailPage() {
         const body = await res.json().catch(() => ({}))
         throw new Error(body.error ?? 'Failed to load task')
       }
-      const data = await res.json()
+      const data = await res.json() as TaskDetailResponse
       setTask(data.task ?? null)
       setInitialRuns(data.runs ?? [])
       setInitialArtifacts(data.artifacts ?? [])
       setInitialQuestions(data.questions ?? [])
       setAttempts(data.attempts ?? [])
+      setWorkPackages(data.workPackages ?? [])
+      setApprovalGates(data.approvalGates ?? [])
+      setVcsChanges(data.vcsChanges ?? [])
     } catch (err) {
       setFetchError(err instanceof Error ? err.message : 'An unexpected error occurred')
     } finally {
@@ -1119,10 +1183,17 @@ export default function TaskDetailPage() {
     loadTask()
   }, [loadTask])
 
-  // Refresh task when SSE reports a terminal status
+  // Refresh task when SSE reports a state where persisted side data may have changed.
   useEffect(() => {
-    const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'rejected'])
-    if (taskStatus && TERMINAL.has(taskStatus)) {
+    const REFRESH_STATUSES = new Set([
+      'awaiting_answers',
+      'awaiting_approval',
+      'completed',
+      'failed',
+      'cancelled',
+      'rejected',
+    ])
+    if (taskStatus && REFRESH_STATUSES.has(taskStatus)) {
       loadTask()
     }
   }, [taskStatus, loadTask])
@@ -1484,7 +1555,12 @@ export default function TaskDetailPage() {
         </div>
 
         <aside className="flex min-w-0 flex-col gap-6">
-          <PlannedAgentsPanel agents={plannedAgents} />
+          <WorkforcePanel
+            workPackages={workPackages}
+            approvalGates={approvalGates}
+            vcsChanges={vcsChanges}
+            fallbackAgents={plannedAgents}
+          />
           <CapabilityClassificationPanel classification={capabilityClassification} />
           <McpAccessPlanPanel design={mcpExecutionDesign} />
 

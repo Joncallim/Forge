@@ -4,7 +4,7 @@ import { z } from 'zod'
 import path from 'path'
 import fs from 'fs/promises'
 import { db } from '@/db'
-import { agentConfigs } from '@/db/schema'
+import { agentConfigs, workforceAgents } from '@/db/schema'
 import { eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
@@ -13,14 +13,11 @@ import { redis } from '@/lib/redis'
 // Constants
 // ---------------------------------------------------------------------------
 
-const VALID_AGENT_TYPES = ['architect', 'backend', 'frontend', 'qa', 'reviewer', 'devops'] as const
-type AgentType = (typeof VALID_AGENT_TYPES)[number]
-
 const AGENT_CONFIG_DIR =
   process.env.FORGE_AGENT_CONFIG_DIR?.trim() || path.resolve(process.cwd(), '../../.claude/agents')
 
-function isValidAgentType(value: string): value is AgentType {
-  return (VALID_AGENT_TYPES as readonly string[]).includes(value)
+function isValidAgentType(value: string): boolean {
+  return /^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$/.test(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -28,6 +25,9 @@ function isValidAgentType(value: string): value is AgentType {
 // ---------------------------------------------------------------------------
 
 const updateAgentSchema = z.object({
+  displayName: z.string().trim().min(1).max(120).optional(),
+  description: z.string().trim().max(500).optional(),
+  isActive: z.boolean().optional(),
   providerConfigId: z.string().uuid().nullable().optional(),
   systemPrompt: z.string().min(1).optional(),
   frontmatterOverrides: z.record(z.unknown()).optional(),
@@ -37,7 +37,7 @@ const updateAgentSchema = z.object({
 // Disk sync helper — preserves YAML frontmatter block
 // ---------------------------------------------------------------------------
 
-async function syncAgentFileToDisk(type: AgentType, newSystemPrompt: string): Promise<void> {
+async function syncAgentFileToDisk(type: string, newSystemPrompt: string): Promise<void> {
   const agentFilePath = path.resolve(AGENT_CONFIG_DIR, `${type}.md`)
 
   let existing = ''
@@ -100,7 +100,7 @@ export async function GET(
 
     if (!isValidAgentType(type)) {
       return NextResponse.json(
-        { error: `Invalid agent type '${type}'. Must be one of: ${VALID_AGENT_TYPES.join(', ')}` },
+        { error: `Invalid agent type '${type}'. Use a lowercase slug with letters, numbers, hyphens, or underscores.` },
         { status: 400 },
       )
     }
@@ -140,7 +140,7 @@ export async function PUT(
 
     if (!isValidAgentType(type)) {
       return NextResponse.json(
-        { error: `Invalid agent type '${type}'. Must be one of: ${VALID_AGENT_TYPES.join(', ')}` },
+        { error: `Invalid agent type '${type}'. Use a lowercase slug with letters, numbers, hyphens, or underscores.` },
         { status: 400 },
       )
     }
@@ -169,47 +169,25 @@ export async function PUT(
       .where(eq(agentConfigs.agentType, type))
       .limit(1)
 
-    // Build the values for upsert
-    const upsertValues: {
-      agentType: AgentType
-      systemPrompt: string
-      providerConfigId?: string | null
-      frontmatterOverrides?: Record<string, unknown>
-      updatedAt: Date
-      updatedBy: string
-    } = {
-      agentType: type,
-      // systemPrompt must always have a value — fall back to existing or placeholder
-      systemPrompt: data.systemPrompt ?? existing?.systemPrompt ?? '',
-      updatedAt: new Date(),
-      updatedBy: session.userId,
-    }
-
-    if ('providerConfigId' in data) {
-      upsertValues.providerConfigId = data.providerConfigId ?? null
-    } else if (existing?.providerConfigId) {
-      upsertValues.providerConfigId = existing.providerConfigId
-    }
-
-    if (data.frontmatterOverrides !== undefined) {
-      upsertValues.frontmatterOverrides = data.frontmatterOverrides
+    if (!existing) {
+      return NextResponse.json({ error: 'Agent config not found' }, { status: 404 })
     }
 
     const [agent] = await db
-      .insert(agentConfigs)
-      .values(upsertValues)
-      .onConflictDoUpdate({
-        target: agentConfigs.agentType,
-        set: {
-          ...(data.systemPrompt !== undefined && { systemPrompt: data.systemPrompt }),
-          ...('providerConfigId' in data && { providerConfigId: data.providerConfigId ?? null }),
-          ...(data.frontmatterOverrides !== undefined && {
-            frontmatterOverrides: data.frontmatterOverrides,
-          }),
-          updatedAt: new Date(),
-          updatedBy: session.userId,
-        },
+      .update(agentConfigs)
+      .set({
+        ...(data.systemPrompt !== undefined && { systemPrompt: data.systemPrompt }),
+        ...(data.displayName !== undefined && { displayName: data.displayName }),
+        ...(data.description !== undefined && { description: data.description }),
+        ...(data.isActive !== undefined && { isActive: data.isActive }),
+        ...('providerConfigId' in data && { providerConfigId: data.providerConfigId ?? null }),
+        ...(data.frontmatterOverrides !== undefined && {
+          frontmatterOverrides: data.frontmatterOverrides,
+        }),
+        updatedAt: new Date(),
+        updatedBy: session.userId,
       })
+      .where(eq(agentConfigs.agentType, type))
       .returning()
 
     // Auto-sync to disk if systemPrompt was provided
@@ -234,6 +212,68 @@ export async function PUT(
     return NextResponse.json({ agent })
   } catch (err) {
     console.error('[PUT /api/agents/:type] Unexpected error', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /api/agents/:type
+// ---------------------------------------------------------------------------
+
+export async function DELETE(
+  request: NextRequest,
+  { params }: { params: Promise<{ type: string }> },
+) {
+  try {
+    const session = await getSession(request)
+    if (!session) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const { type } = await params
+
+    if (!isValidAgentType(type)) {
+      return NextResponse.json(
+        { error: `Invalid agent type '${type}'. Use a lowercase slug with letters, numbers, hyphens, or underscores.` },
+        { status: 400 },
+      )
+    }
+
+    if (type === 'architect') {
+      return NextResponse.json(
+        { error: 'The architect agent is required for the current planning worker.' },
+        { status: 409 },
+      )
+    }
+
+    const [existing] = await db
+      .select()
+      .from(agentConfigs)
+      .where(eq(agentConfigs.agentType, type))
+      .limit(1)
+
+    if (!existing) {
+      return NextResponse.json({ error: 'Agent config not found' }, { status: 404 })
+    }
+
+    await db.transaction(async (tx) => {
+      await tx.delete(workforceAgents).where(eq(workforceAgents.agentConfigId, existing.id))
+      await tx
+        .update(agentConfigs)
+        .set({
+          isActive: false,
+          providerConfigId: null,
+          updatedAt: new Date(),
+          updatedBy: session.userId,
+        })
+        .where(eq(agentConfigs.id, existing.id))
+    })
+
+    await redis.publish('forge:agent-config-changed', JSON.stringify({ agentType: type }))
+
+    return NextResponse.json({ ok: true })
+  } catch (err) {
+    console.error('[DELETE /api/agents/:type] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

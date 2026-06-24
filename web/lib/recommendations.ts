@@ -1,5 +1,5 @@
-// Static recommendation data — no runtime reads, no DB queries.
-// Sourced from docs/agent-recommendations.md.
+// Static recommendation data - no runtime reads, no DB queries.
+// Documented in docs/developer-guide.md.
 
 export type Preset = {
   id: 'zero-config' | 'best-quality' | 'best-value' | 'hybrid' | 'fully-local'

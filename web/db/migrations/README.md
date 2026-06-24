@@ -19,4 +19,4 @@ The `meta` folder is Drizzle bookkeeping. Do not hand-edit it during normal
 development.
 
 For a fuller explanation, see
-[`docs/database-migrations.md`](../../../docs/database-migrations.md).
+[`docs/developer-guide.md`](../../../docs/developer-guide.md).

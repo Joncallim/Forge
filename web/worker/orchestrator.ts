@@ -2,7 +2,7 @@ import { streamText } from 'ai'
 import { db } from '../db'
 import { agentConfigs, agentRuns, artifacts, projects, taskQuestions, tasks } from '../db/schema'
 import { getModel, getProvider } from '../lib/providers/registry'
-import { and, desc, eq } from 'drizzle-orm'
+import { and, asc, desc, eq } from 'drizzle-orm'
 import { publishTaskEvent } from './events'
 import { updateTaskStatus, updateTaskStatusIfCurrent, type TaskStatus } from './task-state'
 import {
@@ -13,6 +13,7 @@ import {
 import type { OpenQuestion } from './open-questions'
 import { getProjectMcpOverview } from '../lib/mcps/manager'
 import { prepareArchitectArtifact } from './architect-artifact'
+import { materializeWorkforceFromArchitectArtifact } from './workforce-materializer'
 import {
   readLatestArchitectCheckpointSafely,
   writeArchitectCheckpointSafely,
@@ -72,6 +73,14 @@ async function loadAgentConfig(agentType: string): Promise<AgentConfigRow | null
   return config ?? null
 }
 
+async function loadActiveAgentCatalog(): Promise<AgentConfigRow[]> {
+  return db
+    .select()
+    .from(agentConfigs)
+    .where(eq(agentConfigs.isActive, true))
+    .orderBy(asc(agentConfigs.agentType))
+}
+
 async function isTaskCancelled(taskId: string): Promise<boolean> {
   const [task] = await db
     .select({ status: tasks.status })
@@ -95,6 +104,7 @@ export function buildArchitectPrompt(
   answeredQuestions: AnsweredQuestion[] = [],
   previousPlan: string | null = null,
   resumeCheckpoint: ArchitectResumeCheckpoint | null = null,
+  configuredAgents: AgentConfigRow[] = [],
 ): string {
   const answeredSection =
     answeredQuestions.length === 0
@@ -138,6 +148,19 @@ export function buildArchitectPrompt(
           }),
           '```',
         ]
+  const agentCatalogSection =
+    configuredAgents.length === 0
+      ? [
+          'Configured agent catalog is unavailable. Use clear role tags that match the work, such as [Backend] or [Frontend], and keep each role name stable enough to become an agent slug.',
+        ]
+      : [
+          'Configured agent catalog:',
+          ...configuredAgents.map((agent) => {
+            const name = agent.displayName || agent.agentType
+            const description = agent.description ? ` - ${agent.description}` : ''
+            return `- [${name}] slug: ${agent.agentType}${description}`
+          }),
+        ]
 
   return [
     `Project: ${project.name}`,
@@ -161,7 +184,8 @@ export function buildArchitectPrompt(
     '- Match the number of steps and agents to the scope. A small, self-contained task should produce a short plan and use only the agents it needs.',
     '',
     'Task breakdown rules:',
-    '- Assign every implementation step to one of Forge\'s worker agents using its [Role] tag (e.g. "[Frontend] Build the task list component"). Never invent specialist titles.',
+    ...agentCatalogSection,
+    '- Assign every implementation step to a configured agent using its [Display Name] tag when a suitable agent exists. If no configured agent fits, use a concise new specialist tag and make clear why a new agent should be added.',
     '- Prefer concrete, repository-specific guidance: name the actual files, directories, or modules the implementer should create or change. If the repository or local folder above is configured, base your file references on it; if it is not, say so and keep paths illustrative.',
     '- After the Markdown plan, append a fenced code block tagged exactly `agent_breakdown_json` containing a single JSON object of the shape `{"agents":[{"role":"Frontend","tasks":2,"summary":"Build task page UI and state handling","steps":["Build the task list component","Wire up state handling"]}]}`. Derive this from the [Role] assignments in the task breakdown. Each agent\'s `steps` should be a short array of 1-2 sentence imperative strings, one per individual task assigned to that agent — specific enough to stand alone, not just a restatement of `summary`. Use an empty array only if the plan truly assigns no worker tasks.',
     '',
@@ -386,9 +410,10 @@ async function runArchitect(
       })
     } else {
       const profile = detectSoftwareProfile(task, project)
-      const [specialistContext, webResearchContext] = await Promise.all([
+      const [specialistContext, webResearchContext, configuredAgents] = await Promise.all([
         Promise.resolve(buildSpecialistContext(profile)),
         buildWebResearchContext(profile, task),
+        loadActiveAgentCatalog(),
       ])
       const result = streamText({
         model,
@@ -401,6 +426,7 @@ async function runArchitect(
           answeredQuestions,
           previousPlan,
           resumeCheckpoint,
+          configuredAgents,
         ),
         temperature: 0.2,
       })
@@ -431,6 +457,15 @@ async function runArchitect(
       mcpExecutionDesign: prepared.mcpExecutionDesign,
     })
     const openQuestionCount = await persistOpenQuestions(task.id, prepared.questions)
+
+    if (openQuestionCount === 0) {
+      await materializeWorkforceFromArchitectArtifact({
+        taskId: task.id,
+        architectRunId: run.id,
+        artifactId: artifact.id,
+        prepared,
+      })
+    }
 
     const completedAt = new Date()
     await db

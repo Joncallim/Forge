@@ -8,20 +8,32 @@ type ProviderConfig = {
   modelId: string
 }
 
+type AgentConfig = {
+  agentType: string
+}
+
 async function readJsonError(response: Response, fallback: string): Promise<Error> {
   const body = await response.json().catch(() => ({})) as { error?: string }
   return new Error(body.error ?? fallback)
 }
 
 export async function applyPreset(preset: Preset): Promise<void> {
-  const res = await fetch('/api/providers')
-  if (!res.ok) throw await readJsonError(res, 'Failed to load providers')
+  const [providersRes, agentsRes] = await Promise.all([
+    fetch('/api/providers'),
+    fetch('/api/agents'),
+  ])
+  if (!providersRes.ok) throw await readJsonError(providersRes, 'Failed to load providers')
+  if (!agentsRes.ok) throw await readJsonError(agentsRes, 'Failed to load agents')
 
-  const data = await res.json() as { providers: ProviderConfig[] }
+  const data = await providersRes.json() as { providers: ProviderConfig[] }
+  const agentsData = await agentsRes.json() as { agents: AgentConfig[] }
   const current = data.providers ?? []
+  const existingAgentTypes = new Set((agentsData.agents ?? []).map((agent) => agent.agentType))
   const providerIdByKey: Record<string, string> = {}
 
   for (const [agentType, spec] of Object.entries(preset.agents)) {
+    if (!existingAgentTypes.has(agentType)) continue
+
     const key = `${spec.providerType}:${spec.modelId}`
 
     if (providerIdByKey[key] === undefined) {

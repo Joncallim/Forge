@@ -28,7 +28,7 @@ describe('zero-config preset', () => {
     }
   })
 
-  it('covers all six agent roles', () => {
+  it('covers the seeded default delivery roles', () => {
     expect(Object.keys(preset!.agents).sort()).toEqual([
       'architect',
       'backend',

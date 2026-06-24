@@ -1,7 +1,16 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { db } from '@/db'
-import { tasks, agentRuns, artifacts, taskAttempts, taskQuestions } from '@/db/schema'
+import {
+  approvalGates,
+  artifacts,
+  agentRuns,
+  taskAttempts,
+  taskQuestions,
+  tasks,
+  vcsChanges,
+  workPackages,
+} from '@/db/schema'
 import { and, eq, asc, or } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 
@@ -62,7 +71,34 @@ export async function GET(
         .orderBy(asc(artifacts.createdAt))
     }
 
-    return NextResponse.json({ task, runs, artifacts: taskArtifacts, attempts, questions })
+    const [taskWorkPackages, taskApprovalGates, taskVcsChanges] = await Promise.all([
+      db
+        .select()
+        .from(workPackages)
+        .where(eq(workPackages.taskId, id))
+        .orderBy(asc(workPackages.sequence), asc(workPackages.createdAt)),
+      db
+        .select()
+        .from(approvalGates)
+        .where(eq(approvalGates.taskId, id))
+        .orderBy(asc(approvalGates.createdAt)),
+      db
+        .select()
+        .from(vcsChanges)
+        .where(eq(vcsChanges.taskId, id))
+        .orderBy(asc(vcsChanges.createdAt)),
+    ])
+
+    return NextResponse.json({
+      task,
+      runs,
+      artifacts: taskArtifacts,
+      attempts,
+      questions,
+      workPackages: taskWorkPackages,
+      approvalGates: taskApprovalGates,
+      vcsChanges: taskVcsChanges,
+    })
   } catch (err) {
     console.error('[GET /api/tasks/:id] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

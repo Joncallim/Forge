@@ -30,7 +30,7 @@ export function getRequiredEnv(name: EnvVarName): string {
   const value = process.env[name]
   if (value === undefined || value.trim() === '') {
     throw new Error(
-      `[env] ${name} is required. See docs/deployment-checklist.md for deployment values.`,
+      `[env] ${name} is required. See docs/operator-guide.md for deployment values.`,
     )
   }
 
