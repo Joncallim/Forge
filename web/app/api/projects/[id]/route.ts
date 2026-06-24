@@ -8,7 +8,8 @@ import { db } from '@/db'
 import { projects } from '@/db/schema'
 import { eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
-import { unregisterProjectPath } from '@/lib/project-registry'
+import { registerProjectPath, unregisterProjectPath } from '@/lib/project-registry'
+import { getWorkspaceSettings, isWithinPath } from '@/lib/workspace'
 
 // ---------------------------------------------------------------------------
 // Validation schema (all fields optional for PUT)
@@ -102,7 +103,27 @@ export async function PUT(
     const updateSet: Record<string, unknown> = { updatedAt: new Date() }
     if (data.name !== undefined) updateSet.name = data.name
     if ('githubRepo' in data) updateSet.githubRepo = data.githubRepo ?? null
-    if ('localPath' in data) updateSet.localPath = data.localPath ?? null
+    if ('localPath' in data) {
+      const rawLocalPath = data.localPath?.trim() ?? ''
+      if (rawLocalPath.includes('\0')) {
+        return NextResponse.json({ error: 'Invalid local path' }, { status: 400 })
+      }
+      if (!rawLocalPath) {
+        updateSet.localPath = null
+      } else {
+        const workspace = await getWorkspaceSettings()
+        const resolvedLocalPath = path.isAbsolute(rawLocalPath)
+          ? path.resolve(/*turbopackIgnore: true*/ rawLocalPath)
+          : path.resolve(/*turbopackIgnore: true*/ workspace.projectsRoot, rawLocalPath)
+        if (!isWithinPath(workspace.workspaceRoot, resolvedLocalPath)) {
+          return NextResponse.json(
+            { error: 'localPath must be inside the active workspace root' },
+            { status: 400 },
+          )
+        }
+        updateSet.localPath = resolvedLocalPath
+      }
+    }
     if ('githubTokenEnvVar' in data) updateSet.githubTokenEnvVar = data.githubTokenEnvVar ?? null
     if ('pmProviderConfigId' in data) updateSet.pmProviderConfigId = data.pmProviderConfigId ?? null
     if (data.defaultBranch !== undefined) updateSet.defaultBranch = data.defaultBranch
@@ -114,6 +135,10 @@ export async function PUT(
       .returning()
 
     console.info('[PUT /api/projects/:id] Updated project', { id: updated.id })
+    if ('localPath' in updateSet && existing.localPath !== updated.localPath) {
+      if (existing.localPath) await unregisterProjectPath(existing.localPath)
+      if (updated.localPath) await registerProjectPath(updated.localPath)
+    }
     return NextResponse.json({ project: updated })
   } catch (err) {
     console.error('[PUT /api/projects/:id] Unexpected error', err)

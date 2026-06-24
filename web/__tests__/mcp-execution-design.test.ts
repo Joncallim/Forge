@@ -10,6 +10,22 @@ function overview(statuses: ProjectMcpOverview['statuses']): ProjectMcpOverview 
   return {
     projectId: 'project-1',
     config: { profile: 'default', requiredMcps: ['filesystem', 'github'], overrides: {} },
+    catalog: [
+      {
+        id: 'filesystem',
+        displayName: 'Filesystem',
+        description: 'Filesystem MCP',
+        recommended: true,
+        requiresAuth: false,
+      },
+      {
+        id: 'github',
+        displayName: 'GitHub',
+        description: 'GitHub MCP',
+        recommended: true,
+        requiresAuth: true,
+      },
+    ],
     mcpsRoot: '/tmp/forge/mcps',
     statuses,
     summary: {

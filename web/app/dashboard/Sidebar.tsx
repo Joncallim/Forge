@@ -18,6 +18,7 @@ import { cn } from '@/lib/utils'
 const NAV_ITEMS = [
   { href: '/dashboard/projects', label: 'Projects', icon: FolderOpenIcon },
   { href: '/dashboard/tasks', label: 'Tasks', icon: ListTodoIcon },
+  { href: '/dashboard/mcps', label: 'MCPs', icon: ServerIcon },
   { href: '/dashboard/providers', label: 'Providers', icon: ServerIcon },
   { href: '/dashboard/agents', label: 'Agents', icon: BotIcon },
   { href: '/dashboard/settings', label: 'Settings', icon: SettingsIcon },

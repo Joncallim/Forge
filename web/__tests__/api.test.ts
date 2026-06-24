@@ -684,6 +684,7 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
 
       expect(res.status).toBe(200)
       const body = await res.json()
+      expect(body.overview.catalog.map((entry: { id: string }) => entry.id)).toEqual(['filesystem', 'github'])
       expect(body.overview.summary.missing).toBe(2)
       expect(body.overview.statuses.map((status: { installState: string }) => status.installState)).toEqual([
         'missing',
@@ -729,6 +730,41 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
       await expect(fs.stat(path.join(workspaceRoot, 'mcps', 'github', 'forge.mcp.json'))).resolves.toMatchObject({})
       expect(insertTables.filter((table) => table === mcpInstallations)).toHaveLength(2)
       expect(insertTables.filter((table) => table === projectMcpStatusChecks)).toHaveLength(2)
+    })
+  })
+
+  it('installs only selected MCP manifests when requested', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert.mockReturnValue(chain(undefined))
+
+    await withWorkspaceProject(async (project, workspaceRoot) => {
+      mockDbSelect
+        .mockReturnValueOnce(chain([project]))
+        .mockReturnValueOnce(chain([]))
+        .mockReturnValueOnce(chain([]))
+
+      const { POST } = await import('@/app/api/projects/[id]/mcps/install-recommended/route')
+      const res = await POST(authRequest('/api/projects/project-mcp/mcps/install-recommended', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mcpIds: ['filesystem'] }),
+      }) as never, {
+        params: Promise.resolve({ id: project.id }),
+      })
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.overview.statuses.find((status: { mcpId: string }) => status.mcpId === 'filesystem')).toMatchObject({
+        installState: 'installed',
+        status: 'healthy',
+      })
+      expect(body.overview.statuses.find((status: { mcpId: string }) => status.mcpId === 'github')).toMatchObject({
+        installState: 'missing',
+      })
+      await expect(fs.stat(path.join(workspaceRoot, 'mcps', 'filesystem', 'forge.mcp.json'))).resolves.toMatchObject({})
+      await expect(fs.stat(path.join(workspaceRoot, 'mcps', 'github', 'forge.mcp.json'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      })
     })
   })
 
@@ -921,6 +957,43 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
         installPath: customPath,
         installState: 'installed',
         status: 'healthy',
+      })
+      expect(mockDbUpdate).toHaveBeenCalled()
+    })
+  })
+
+  it('persists an empty custom MCP selection as an explicit rejection of all catalog MCPs', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbUpdate.mockReturnValue(chain(undefined))
+
+    await withWorkspaceProject(async (project) => {
+      mockDbSelect
+        .mockReturnValueOnce(chain([project]))
+        .mockReturnValueOnce(chain([]))
+
+      const { PUT } = await import('@/app/api/projects/[id]/mcps/route')
+      const res = await PUT(authRequest('/api/projects/project-mcp/mcps', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          profile: 'custom',
+          requiredMcps: [],
+          overrides: {},
+        }),
+      }) as never, {
+        params: Promise.resolve({ id: project.id }),
+      })
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.overview.config).toMatchObject({
+        profile: 'custom',
+        requiredMcps: [],
+      })
+      expect(body.overview.statuses).toEqual([])
+      expect(body.overview.summary).toMatchObject({
+        label: 'MCPs: None selected',
+        status: 'disabled',
       })
       expect(mockDbUpdate).toHaveBeenCalled()
     })

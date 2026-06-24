@@ -13,7 +13,15 @@ import {
 import { getGitHubStatus } from '@/lib/github'
 import { getWorkspaceSettings, isWithinPath } from '@/lib/workspace'
 import { MCP_CATALOG, RECOMMENDED_MCP_IDS, isKnownMcpId } from './catalog'
-import type { McpHealthStatus, McpInstallState, McpManifest, ProjectMcpOverview, ProjectMcpStatus } from './types'
+import type {
+  McpCatalogEntry,
+  McpHealthStatus,
+  McpId,
+  McpInstallState,
+  McpManifest,
+  ProjectMcpOverview,
+  ProjectMcpStatus,
+} from './types'
 
 type McpInstallationRow = typeof mcpInstallations.$inferSelect
 type CachedProjectMcpStatusRow = typeof projectMcpStatusChecks.$inferSelect
@@ -28,8 +36,8 @@ function manifestPath(installPath: string): string {
 
 function normalizeProjectMcpConfig(rawConfig: Project['mcpConfig'] | null | undefined): ProjectMcpConfig {
   const raw = rawConfig && typeof rawConfig === 'object' ? rawConfig : DEFAULT_PROJECT_MCP_CONFIG
-  const requiredMcps = Array.isArray(raw.requiredMcps) && raw.requiredMcps.length > 0
-    ? raw.requiredMcps.filter((id): id is string => typeof id === 'string')
+  const requiredMcps = Array.isArray(raw.requiredMcps)
+    ? Array.from(new Set(raw.requiredMcps.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)))
     : DEFAULT_PROJECT_MCP_CONFIG.requiredMcps
 
   return {
@@ -37,6 +45,10 @@ function normalizeProjectMcpConfig(rawConfig: Project['mcpConfig'] | null | unde
     requiredMcps,
     overrides: raw.overrides && typeof raw.overrides === 'object' ? raw.overrides : {},
   }
+}
+
+function catalogEntries(): McpCatalogEntry[] {
+  return Object.values(MCP_CATALOG)
 }
 
 async function readManifest(installPath: string): Promise<McpManifest | null> {
@@ -97,17 +109,22 @@ async function upsertInstallation(mcpId: keyof typeof MCP_CATALOG, installPath: 
     })
 }
 
-export async function installRecommendedMcps(): Promise<ProjectMcpStatus[]> {
+export async function installMcps(mcpIds: McpId[] = RECOMMENDED_MCP_IDS): Promise<ProjectMcpStatus[]> {
   const workspace = await getWorkspaceSettings()
+  const uniqueMcpIds = Array.from(new Set(mcpIds))
 
-  for (const mcpId of RECOMMENDED_MCP_IDS) {
+  for (const mcpId of uniqueMcpIds) {
     const installPath = defaultInstallPath(workspace.mcpsRoot, mcpId)
     await writeManifest(mcpId, installPath)
     await upsertInstallation(mcpId, installPath)
   }
 
   const rows = await listInstallationRows()
-  return Promise.all(RECOMMENDED_MCP_IDS.map((mcpId) => buildStandaloneStatus(mcpId, rows.get(mcpId))))
+  return Promise.all(uniqueMcpIds.map((mcpId) => buildStandaloneStatus(mcpId, rows.get(mcpId))))
+}
+
+export async function installRecommendedMcps(): Promise<ProjectMcpStatus[]> {
+  return installMcps(RECOMMENDED_MCP_IDS)
 }
 
 async function buildStandaloneStatus(
@@ -259,6 +276,10 @@ async function cacheProjectStatus(projectId: string, status: ProjectMcpStatus): 
 }
 
 function summarizeStatuses(statuses: ProjectMcpStatus[]): ProjectMcpOverview['summary'] {
+  if (statuses.length === 0) {
+    return { label: 'MCPs: None selected', status: 'disabled', missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 }
+  }
+
   const missing = statuses.filter((s) => s.installState === 'missing').length
   const authRequired = statuses.filter((s) => s.status === 'auth_required').length
   const unhealthy = statuses.filter((s) => s.status === 'unhealthy' || s.status === 'configuration_required').length
@@ -328,6 +349,7 @@ export async function getProjectMcpOverview(project: Project): Promise<ProjectMc
   return {
     projectId: project.id,
     config,
+    catalog: catalogEntries(),
     mcpsRoot: workspace.mcpsRoot,
     statuses,
     summary: summarizeStatuses(statuses),

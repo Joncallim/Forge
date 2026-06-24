@@ -12,7 +12,7 @@ import { getWorkspaceSettings, isWithinPath } from '@/lib/workspace'
 
 const mcpConfigSchema = z.object({
   profile: z.enum(['default', 'custom']).default('custom'),
-  requiredMcps: z.array(z.string().trim().min(1)).min(1),
+  requiredMcps: z.array(z.string().trim().min(1)),
   overrides: z.record(z.object({
     enabled: z.boolean().optional(),
     installPath: z.string().trim().min(1).max(1000).optional(),

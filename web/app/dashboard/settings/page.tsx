@@ -401,7 +401,7 @@ function GitHubCard() {
   }
 
   return (
-    <section aria-labelledby="github-heading" className="rounded-xl border border-border bg-card p-5">
+    <section id="github" aria-labelledby="github-heading" className="rounded-xl border border-border bg-card p-5">
       <div className="mb-3 flex items-center justify-between gap-3">
         <h2 id="github-heading" className="text-lg font-semibold text-foreground">
           GitHub

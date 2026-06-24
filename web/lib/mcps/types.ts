@@ -43,6 +43,7 @@ export type ProjectMcpStatus = {
 export type ProjectMcpOverview = {
   projectId: string
   config: ProjectMcpConfig
+  catalog: McpCatalogEntry[]
   mcpsRoot: string
   statuses: ProjectMcpStatus[]
   summary: {

@@ -39,8 +39,24 @@ type ProjectMcpStatus = {
   checkedAt: string
 }
 
+type ProjectMcpConfig = {
+  profile: 'default' | 'custom'
+  requiredMcps: string[]
+  overrides: Record<string, { enabled?: boolean; installPath?: string }>
+}
+
+type McpCatalogEntry = {
+  id: string
+  displayName: string
+  description: string
+  recommended: boolean
+  requiresAuth: boolean
+}
+
 type ProjectMcpOverview = {
   projectId: string
+  config: ProjectMcpConfig
+  catalog: McpCatalogEntry[]
   mcpsRoot: string
   statuses: ProjectMcpStatus[]
   summary: {
@@ -98,6 +114,22 @@ function mcpPillClass(status: McpStatusName | 'missing'): string {
   return `${base} bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300`
 }
 
+function sameStringSet(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false
+  const rightSet = new Set(right)
+  return left.every((item) => rightSet.has(item))
+}
+
+function mcpErrorClass(status: ProjectMcpStatus): string {
+  if (status.status === 'unhealthy') {
+    return 'mt-1 text-xs font-medium text-destructive'
+  }
+  if (status.installState === 'missing' || status.status === 'auth_required' || status.status === 'configuration_required') {
+    return 'mt-1 text-xs font-medium text-amber-700 dark:text-amber-300'
+  }
+  return 'mt-1 text-xs text-muted-foreground'
+}
+
 function formatDate(iso: string): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(new Date(iso))
 }
@@ -110,12 +142,17 @@ export default function ProjectDetailPage() {
   const [project, setProject] = useState<Project | null>(null)
   const [tasks, setTasks] = useState<Task[]>([])
   const [mcpOverview, setMcpOverview] = useState<ProjectMcpOverview | null>(null)
+  const [selectedMcpIds, setSelectedMcpIds] = useState<string[]>([])
   const [mcpActionError, setMcpActionError] = useState<string | null>(null)
-  const [installingMcps, setInstallingMcps] = useState(false)
+  const [savingMcpSelection, setSavingMcpSelection] = useState(false)
   const [refreshingMcps, setRefreshingMcps] = useState(false)
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
   const [dialogOpen, setDialogOpen] = useState(false)
+  const [projectPathDialogOpen, setProjectPathDialogOpen] = useState(false)
+  const [projectPathInput, setProjectPathInput] = useState('')
+  const [projectPathError, setProjectPathError] = useState<string | null>(null)
+  const [savingProjectPath, setSavingProjectPath] = useState(false)
 
   // Task creation form state
   const [formTitle, setFormTitle] = useState('')
@@ -123,6 +160,11 @@ export default function ProjectDetailPage() {
   const [formError, setFormError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [deleting, setDeleting] = useState(false)
+
+  const applyMcpOverview = useCallback((overview: ProjectMcpOverview | null) => {
+    setMcpOverview(overview)
+    setSelectedMcpIds(overview?.config.requiredMcps ?? [])
+  }, [])
 
   const loadData = useCallback(async () => {
     setLoading(true)
@@ -153,11 +195,11 @@ export default function ProjectDetailPage() {
       const mcpRes = await fetch(`/api/projects/${projectId}/mcps`)
       if (mcpRes.ok) {
         const mcpData = await mcpRes.json()
-        setMcpOverview(mcpData.overview ?? null)
+        applyMcpOverview(mcpData.overview ?? null)
         setMcpActionError(null)
       } else {
         const body = await mcpRes.json().catch(() => ({}))
-        setMcpOverview(null)
+        applyMcpOverview(null)
         setMcpActionError(body.error ?? 'Failed to load MCP status')
       }
     } catch (err) {
@@ -165,7 +207,7 @@ export default function ProjectDetailPage() {
     } finally {
       setLoading(false)
     }
-  }, [projectId])
+  }, [applyMcpOverview, projectId])
 
   useEffect(() => {
     loadData()
@@ -214,7 +256,7 @@ export default function ProjectDetailPage() {
         throw new Error(body.error ?? 'Failed to refresh MCP status')
       }
       const data = await res.json()
-      setMcpOverview(data.overview ?? null)
+      applyMcpOverview(data.overview ?? null)
     } catch (err) {
       setMcpActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
     } finally {
@@ -222,21 +264,99 @@ export default function ProjectDetailPage() {
     }
   }
 
-  async function installRecommendedMcps() {
-    setInstallingMcps(true)
+  function toggleMcpSelection(mcpId: string) {
+    setSelectedMcpIds((current) => (
+      current.includes(mcpId)
+        ? current.filter((id) => id !== mcpId)
+        : [...current, mcpId]
+    ))
+  }
+
+  async function saveAndInstallSelectedMcps() {
+    if (!mcpOverview) return
+    const selectedIds = mcpOverview.catalog
+      .map((entry) => entry.id)
+      .filter((id) => selectedMcpIds.includes(id))
+    const selectedSet = new Set(selectedIds)
+    const overrides = Object.fromEntries(
+      Object.entries(mcpOverview.config.overrides ?? {}).filter(([mcpId]) => selectedSet.has(mcpId)),
+    )
+
+    setSavingMcpSelection(true)
     setMcpActionError(null)
     try {
-      const res = await fetch(`/api/projects/${projectId}/mcps/install-recommended`, { method: 'POST' })
+      const configRes = await fetch(`/api/projects/${projectId}/mcps`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          profile: 'custom',
+          requiredMcps: selectedIds,
+          overrides,
+        }),
+      })
+      if (!configRes.ok) {
+        const body = await configRes.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to save MCP selection')
+      }
+
+      const configData = await configRes.json()
+      const nextOverview = (configData.overview ?? null) as ProjectMcpOverview | null
+      const missingSelected = nextOverview?.statuses
+        .filter((status) => selectedSet.has(status.mcpId) && status.installState === 'missing')
+        .map((status) => status.mcpId) ?? []
+
+      if (missingSelected.length === 0) {
+        applyMcpOverview(nextOverview)
+        return
+      }
+
+      const res = await fetch(`/api/projects/${projectId}/mcps/install-recommended`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mcpIds: missingSelected }),
+      })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
-        throw new Error(body.error ?? 'Failed to install recommended MCPs')
+        throw new Error(body.error ?? 'Failed to install selected MCPs')
       }
       const data = await res.json()
-      setMcpOverview(data.overview ?? null)
+      applyMcpOverview(data.overview ?? null)
     } catch (err) {
       setMcpActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
     } finally {
-      setInstallingMcps(false)
+      setSavingMcpSelection(false)
+    }
+  }
+
+  function openProjectPathDialog() {
+    setProjectPathInput(project?.localPath ?? '')
+    setProjectPathError(null)
+    setProjectPathDialogOpen(true)
+  }
+
+  async function saveProjectPath(e: React.FormEvent) {
+    e.preventDefault()
+    setSavingProjectPath(true)
+    setProjectPathError(null)
+    try {
+      const trimmedPath = projectPathInput.trim()
+      const res = await fetch(`/api/projects/${projectId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ localPath: trimmedPath || null }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to save project path')
+      }
+      const data = await res.json()
+      setProject(data.project ?? project)
+      setProjectPathDialogOpen(false)
+      await refreshMcpStatus()
+    } catch (err) {
+      setProjectPathError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setSavingProjectPath(false)
     }
   }
 
@@ -306,6 +426,13 @@ export default function ProjectDetailPage() {
       </div>
     )
   }
+
+  const configuredMcpIds = mcpOverview?.config.requiredMcps ?? []
+  const mcpSelectionChanged = mcpOverview ? !sameStringSet(selectedMcpIds, configuredMcpIds) : false
+  const statusByMcpId = new Map(mcpOverview?.statuses.map((status) => [status.mcpId, status]) ?? [])
+  const selectedMissingCount = mcpOverview?.statuses.filter((status) => (
+    selectedMcpIds.includes(status.mcpId) && status.installState === 'missing'
+  )).length ?? 0
 
   return (
     <div className="px-4 py-6 sm:px-6 lg:px-8">
@@ -419,6 +546,46 @@ export default function ProjectDetailPage() {
         </div>
       </div>
 
+      <Dialog open={projectPathDialogOpen} onOpenChange={setProjectPathDialogOpen}>
+        <DialogContent className="sm:max-w-lg" aria-labelledby="project-path-title">
+          <DialogHeader>
+            <DialogTitle id="project-path-title">Project Path</DialogTitle>
+          </DialogHeader>
+
+          <form onSubmit={saveProjectPath} className="flex flex-col gap-4">
+            <div className="flex flex-col gap-1.5">
+              <label htmlFor="project-local-path" className="text-sm font-medium text-foreground">
+                Local path
+              </label>
+              <input
+                id="project-local-path"
+                type="text"
+                value={projectPathInput}
+                onChange={(e) => setProjectPathInput(e.target.value)}
+                autoComplete="off"
+                placeholder="~/Documents/Forge/projects/example"
+                className="rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+              />
+              <p className="text-xs text-muted-foreground">
+                Filesystem MCP health uses this folder when checking project access.
+              </p>
+            </div>
+
+            {projectPathError !== null && (
+              <p role="alert" className="text-sm text-destructive">
+                {projectPathError}
+              </p>
+            )}
+
+            <DialogFooter>
+              <Button type="submit" disabled={savingProjectPath} aria-busy={savingProjectPath}>
+                {savingProjectPath ? 'Saving…' : 'Save Path'}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
       <section aria-labelledby="project-mcps-heading" className="mb-6 rounded-xl border border-border bg-card p-4">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -440,13 +607,13 @@ export default function ProjectDetailPage() {
             <Button
               variant="outline"
               size="sm"
-              onClick={installRecommendedMcps}
-              disabled={installingMcps}
-              aria-busy={installingMcps}
-              aria-label="Install recommended MCPs"
+              onClick={saveAndInstallSelectedMcps}
+              disabled={!mcpOverview || savingMcpSelection || (!mcpSelectionChanged && selectedMissingCount === 0)}
+              aria-busy={savingMcpSelection}
+              aria-label="Save MCP selection and install selected MCPs"
             >
               <DownloadIcon aria-hidden="true" />
-              {installingMcps ? 'Installing…' : 'Install recommended MCPs'}
+              {savingMcpSelection ? 'Saving…' : selectedMissingCount > 0 ? 'Save & Install' : 'Save Selection'}
             </Button>
             <Button
               variant="outline"
@@ -481,25 +648,64 @@ export default function ProjectDetailPage() {
           <p className="text-sm text-muted-foreground">MCP status has not been checked.</p>
         ) : (
           <ul className="divide-y divide-border rounded-lg border border-border" role="list">
-            {mcpOverview.statuses.map((status) => (
-              <li key={status.mcpId} className="flex flex-col gap-2 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
-                <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <p className="text-sm font-medium text-foreground">{status.displayName}</p>
-                    <span className={mcpPillClass(status.installState === 'missing' ? 'missing' : status.status)}>
-                      {status.installState === 'missing' ? 'Missing' : statusLabel(status.status)}
-                    </span>
+            {mcpOverview.catalog.map((entry) => {
+              const selected = selectedMcpIds.includes(entry.id)
+              const status = statusByMcpId.get(entry.id)
+              const statusText = !selected
+                ? 'Not selected'
+                : status
+                  ? status.installState === 'missing' ? 'Missing' : statusLabel(status.status)
+                  : 'Pending'
+              const pillClass = selected && status
+                ? mcpPillClass(status.installState === 'missing' ? 'missing' : status.status)
+                : mcpPillClass('disabled')
+
+              return (
+                <li key={entry.id} className="flex flex-col gap-3 px-3 py-3 lg:flex-row lg:items-center lg:justify-between">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <label className="inline-flex items-center gap-2 text-sm font-medium text-foreground">
+                        <input
+                          type="checkbox"
+                          checked={selected}
+                          onChange={() => toggleMcpSelection(entry.id)}
+                          className="size-4 rounded border-input accent-foreground"
+                          aria-label={`${selected ? 'Reject' : 'Select'} ${entry.displayName} MCP`}
+                        />
+                        {entry.displayName}
+                      </label>
+                      <span className={pillClass}>{statusText}</span>
+                      {entry.recommended && (
+                        <span className="inline-flex h-6 items-center rounded-full bg-muted px-2.5 text-xs font-medium text-muted-foreground">
+                          Recommended
+                        </span>
+                      )}
+                    </div>
+                    <p className="mt-1 text-xs text-muted-foreground">{entry.description}</p>
+                    {selected && status?.error && (
+                      <p className={mcpErrorClass(status)}>{status.error}</p>
+                    )}
                   </div>
-                  <p className="mt-1 text-xs text-muted-foreground">{status.description}</p>
-                  {status.error && (
-                    <p className="mt-1 text-xs text-muted-foreground">{status.error}</p>
-                  )}
-                </div>
-                <code className="max-w-full truncate rounded-md bg-muted px-2 py-1 font-mono text-xs text-muted-foreground sm:max-w-xs">
-                  {status.installPath}
-                </code>
-              </li>
-            ))}
+                  <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center lg:justify-end">
+                    {selected && status?.mcpId === 'filesystem' && status.status === 'configuration_required' && (
+                      <Button type="button" variant="outline" size="sm" onClick={openProjectPathDialog}>
+                        <SettingsIcon aria-hidden="true" />
+                        Configure
+                      </Button>
+                    )}
+                    {selected && status?.mcpId === 'github' && status.status === 'auth_required' && (
+                      <Button type="button" variant="outline" size="sm" onClick={() => router.push('/dashboard/settings#github')}>
+                        <SettingsIcon aria-hidden="true" />
+                        Connect
+                      </Button>
+                    )}
+                    <code className="max-w-full truncate rounded-md bg-muted px-2 py-1 font-mono text-xs text-muted-foreground sm:max-w-xs">
+                      {status?.installPath ?? `${mcpOverview.mcpsRoot}/${entry.id}`}
+                    </code>
+                  </div>
+                </li>
+              )
+            })}
           </ul>
         )}
       </section>
