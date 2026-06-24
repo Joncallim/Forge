@@ -39,7 +39,11 @@ interface UseTaskStreamResult {
   artifacts: Artifact[]
   taskStatus: string | null
   error: string | null
-  questions: TaskQuestion[]
+  // null means no questions:created/questions:answered event has been
+  // received yet this session — callers should fall back to initial data
+  // fetched on mount. Once an event arrives (even with an empty array), this
+  // is trusted as the definitive current state.
+  questions: TaskQuestion[] | null
 }
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'rejected'])
@@ -49,7 +53,7 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
   const [taskStatus, setTaskStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [questions, setQuestions] = useState<TaskQuestion[]>([])
+  const [questions, setQuestions] = useState<TaskQuestion[] | null>(null)
 
   // Store streaming log chunks outside React state to avoid excessive re-renders.
   // Key: runId, Value: accumulated log string
@@ -207,7 +211,7 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
         const data = JSON.parse((e as MessageEvent).data)
         const answered: TaskQuestion[] = Array.isArray(data.questions) ? data.questions : []
         setQuestions((prev) =>
-          prev.map((q) => answered.find((a) => a.id === q.id) ?? q),
+          (prev ?? []).map((q) => answered.find((a) => a.id === q.id) ?? q),
         )
       } catch {
         // Ignore malformed event

@@ -7,7 +7,7 @@
  * missing or malformed.
  */
 
-import { AGENT_BREAKDOWN_FENCE } from '@/lib/plan-fences'
+import { AGENT_BREAKDOWN_FENCE, findFence, isAgentBreakdownShape } from '@/lib/plan-fences'
 
 export { AGENT_BREAKDOWN_FENCE }
 
@@ -109,13 +109,13 @@ function fallbackAgentsFromRoleTags(planText: string): PlannedAgent[] {
 }
 
 export function parseAgentBreakdown(rawText: string): ParsedAgentBreakdown {
-  const match = FENCE_REGEX.exec(rawText)
+  const match = findFence(rawText, FENCE_REGEX, isAgentBreakdownShape)
   if (!match) {
     const planText = rawText.trim()
     return { planText, agents: fallbackAgentsFromRoleTags(planText) }
   }
 
-  const jsonBlock = match[1]
+  const jsonBlock = match.jsonBlock
   let agents: PlannedAgent[] = []
   try {
     agents = normalizeAgents(JSON.parse(jsonBlock))
@@ -123,7 +123,7 @@ export function parseAgentBreakdown(rawText: string): ParsedAgentBreakdown {
     agents = []
   }
 
-  const planText = rawText.replace(match[0], '').trim()
+  const planText = rawText.replace(match.fullMatch, '').trim()
   return {
     planText,
     agents: agents.length > 0 ? agents : fallbackAgentsFromRoleTags(planText),

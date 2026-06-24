@@ -35,4 +35,51 @@ describe('stripKnownFences', () => {
     const text = '# Plan\n\n```' + AGENT_BREAKDOWN_FENCE + '\n{"agents":[]}\n```'
     expect(stripKnownFences(text)).toBe('# Plan')
   })
+
+  it('falls back to a generic ```json fence matching the agent-breakdown shape', () => {
+    const text = ['# Plan', 'Do the thing.', '', '```json', '{"agents":[{"role":"Backend"}]}', '```'].join('\n')
+    const stripped = stripKnownFences(text)
+    expect(stripped).toBe('# Plan\nDo the thing.')
+  })
+
+  it('falls back to a generic ```json fence matching the open-questions shape', () => {
+    const text = ['# Plan', 'Do the thing.', '', '```json', '{"questions":["Which DB?"]}', '```'].join('\n')
+    const stripped = stripKnownFences(text)
+    expect(stripped).toBe('# Plan\nDo the thing.')
+  })
+
+  it('falls back to a bare untagged fence matching a known shape', () => {
+    const text = ['# Plan', 'Do the thing.', '', '```', '{"agents":[{"role":"Backend"}]}', '```'].join('\n')
+    const stripped = stripKnownFences(text)
+    expect(stripped).toBe('# Plan\nDo the thing.')
+  })
+
+  it('prefers the exact tag over a coincidental generic-json fence elsewhere', () => {
+    const text = [
+      '# Plan',
+      'Example API response:',
+      '```json',
+      '{"agents":["not the real shape, ignored anyway"]}',
+      '```',
+      '',
+      '```' + AGENT_BREAKDOWN_FENCE,
+      '{"agents":[{"role":"Backend"}]}',
+      '```',
+    ].join('\n')
+
+    const stripped = stripKnownFences(text)
+    expect(stripped).not.toContain(AGENT_BREAKDOWN_FENCE)
+  })
+
+  it('leaves an unrelated generic JSON code block untouched (does not match either known shape)', () => {
+    const text = [
+      '# Plan',
+      'Example API response:',
+      '```json',
+      '{"status": "ok", "data": {"id": 1}}',
+      '```',
+    ].join('\n')
+
+    expect(stripKnownFences(text)).toBe(text.trim())
+  })
 })

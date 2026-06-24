@@ -51,4 +51,56 @@ describe('parseOpenQuestions', () => {
     const { questions } = parseOpenQuestions(withFence('{ not valid json'))
     expect(questions).toEqual([])
   })
+
+  it('falls back to a generic ```json fence when the model misses the exact tag', () => {
+    const text = [
+      '# Plan',
+      '',
+      'Do the thing.',
+      '',
+      '```json',
+      '{"questions": ["Which DB?", "Auth method?"]}',
+      '```',
+    ].join('\n')
+
+    const { planText, questions } = parseOpenQuestions(text)
+    expect(questions).toEqual([
+      { question: 'Which DB?', suggestions: [] },
+      { question: 'Auth method?', suggestions: [] },
+    ])
+    expect(planText).not.toContain('```json')
+    expect(planText).toContain('Do the thing.')
+  })
+
+  it('prefers the exact tag over a coincidental generic-json fence', () => {
+    const text = [
+      '# Plan',
+      'Example response:',
+      '```json',
+      '{"questions": ["Coincidental, should be ignored"]}',
+      '```',
+      '',
+      '```' + OPEN_QUESTIONS_FENCE,
+      '{"questions": ["Real question"]}',
+      '```',
+    ].join('\n')
+
+    const { questions } = parseOpenQuestions(text)
+    expect(questions).toEqual([{ question: 'Real question', suggestions: [] }])
+  })
+
+  it('does not strip or extract from a generic JSON block that does not match the expected shape', () => {
+    const text = [
+      '# Plan',
+      'Example API response:',
+      '```json',
+      '{"status": "ok", "data": {"id": 1}}',
+      '```',
+    ].join('\n')
+
+    const { planText, questions } = parseOpenQuestions(text)
+    expect(questions).toEqual([])
+    expect(planText).toContain('```json')
+    expect(planText).toContain('"status": "ok"')
+  })
 })

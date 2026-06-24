@@ -815,7 +815,11 @@ export default function TaskDetailPage() {
   // Merge initial data with live stream data
   const mergedRuns: AgentRun[] = streamRuns.length > 0 ? streamRuns : initialRuns
   const mergedArtifacts: Artifact[] = streamArtifacts.length > 0 ? streamArtifacts : initialArtifacts
-  const mergedQuestions: TaskQuestion[] = streamQuestions.length > 0 ? streamQuestions : initialQuestions
+  // streamQuestions is null until the SSE layer has reported a definitive
+  // question set (even an empty one); only fall back to the once-fetched
+  // initialQuestions while that hasn't happened yet, so an explicitly-empty
+  // stream result isn't overridden by stale data from a prior plan round.
+  const mergedQuestions: TaskQuestion[] = streamQuestions ?? initialQuestions
   const currentStatus = taskStatus ?? task?.status ?? null
 
   const loadTask = useCallback(async () => {

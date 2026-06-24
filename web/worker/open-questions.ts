@@ -16,7 +16,7 @@
  * the human-readable plan.
  */
 
-import { OPEN_QUESTIONS_FENCE } from '@/lib/plan-fences'
+import { findFence, isOpenQuestionsShape, OPEN_QUESTIONS_FENCE } from '@/lib/plan-fences'
 
 export { OPEN_QUESTIONS_FENCE }
 
@@ -91,12 +91,12 @@ function normalizeQuestions(raw: unknown): OpenQuestion[] {
  * block the whole pipeline.
  */
 export function parseOpenQuestions(rawText: string): ParsedArchitectPlan {
-  const match = FENCE_REGEX.exec(rawText)
+  const match = findFence(rawText, FENCE_REGEX, isOpenQuestionsShape)
   if (!match) {
     return { planText: rawText.trim(), questions: [] }
   }
 
-  const jsonBlock = match[1]
+  const jsonBlock = match.jsonBlock
   let questions: OpenQuestion[] = []
   try {
     const parsed = JSON.parse(jsonBlock)
@@ -105,6 +105,6 @@ export function parseOpenQuestions(rawText: string): ParsedArchitectPlan {
     questions = []
   }
 
-  const planText = rawText.replace(match[0], '').trim()
+  const planText = rawText.replace(match.fullMatch, '').trim()
   return { planText, questions }
 }
