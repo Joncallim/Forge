@@ -593,6 +593,44 @@ command_status() {
   return 1
 }
 
+command_succeeds_with_timeout() {
+  local timeout_seconds="$1"
+  shift
+
+  if [ "$DRY_RUN" = "1" ] && [ "$CHECK_ONLY" != "1" ]; then
+    return 0
+  fi
+
+  command -v node >/dev/null 2>&1 || return 127
+
+  node - "$timeout_seconds" "$@" <<'NODE'
+const { spawn } = require('node:child_process')
+
+const timeoutMs = Number(process.argv[2]) * 1000
+const command = process.argv[3]
+const args = process.argv.slice(4)
+let timedOut = false
+
+const child = spawn(command, args, { stdio: 'ignore' })
+const timer = setTimeout(() => {
+  timedOut = true
+  child.kill('SIGTERM')
+  setTimeout(() => child.kill('SIGKILL'), 1000).unref()
+}, timeoutMs)
+
+child.on('error', () => {
+  clearTimeout(timer)
+  process.exit(127)
+})
+
+child.on('exit', (code) => {
+  clearTimeout(timer)
+  if (timedOut) process.exit(124)
+  process.exit(code ?? 1)
+})
+NODE
+}
+
 ensure_node() {
   local major
   major="$(node_major)"
@@ -662,7 +700,7 @@ ensure_github_cli() {
   step "Checking GitHub CLI"
 
   if command -v gh >/dev/null 2>&1; then
-    info "$(gh --version | head -1) is ready."
+    info "GitHub CLI found: $(command -v gh)"
   else
     local package_name
     package_name="$(github_cli_package)"
@@ -679,8 +717,12 @@ ensure_github_cli() {
     return 0
   fi
 
-  if gh auth status >/dev/null 2>&1; then
+  local gh_status=0
+  command_succeeds_with_timeout 5 gh auth status || gh_status="$?"
+  if [ "$gh_status" = "0" ]; then
     info "GitHub CLI is authenticated."
+  elif [ "$gh_status" = "124" ]; then
+    warn "GitHub CLI authentication check timed out after 5s. Run: gh auth status"
   else
     warn "GitHub CLI is installed but not authenticated. Run: gh auth login --scopes repo,workflow"
   fi
@@ -1261,8 +1303,13 @@ run_check_only() {
   command_status "GitHub CLI" gh || failed=1
 
   if command -v gh >/dev/null 2>&1; then
-    if gh auth status >/dev/null 2>&1; then
+    local gh_status=0
+    command_succeeds_with_timeout 5 gh auth status || gh_status="$?"
+    if [ "$gh_status" = "0" ]; then
       info "ok      GitHub CLI authentication"
+    elif [ "$gh_status" = "124" ]; then
+      warn "GitHub CLI authentication check timed out after 5s. Run: gh auth status"
+      failed=1
     else
       warn "GitHub CLI is not authenticated. Run: gh auth login --scopes repo,workflow"
       failed=1

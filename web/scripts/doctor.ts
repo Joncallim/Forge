@@ -5,6 +5,7 @@ import { execFile as execFileCallback } from 'node:child_process'
 import { promisify } from 'node:util'
 
 const execFile = promisify(execFileCallback)
+const GITHUB_CLI_TIMEOUT_MS = 5000
 
 function truthy(value: string | undefined): boolean {
   return /^(1|true|yes|on)$/i.test(value ?? '')
@@ -15,7 +16,7 @@ async function checkGitHubCli(): Promise<boolean> {
   let failed = false
 
   try {
-    const version = await execFile('gh', ['--version'])
+    const version = await execFile('gh', ['--version'], { timeout: GITHUB_CLI_TIMEOUT_MS })
     const firstLine = version.stdout.trim().split('\n')[0] || 'gh installed'
     console.info(`ok GITHUB_CLI installed (${firstLine})`)
   } catch (err) {
@@ -26,7 +27,7 @@ async function checkGitHubCli(): Promise<boolean> {
   }
 
   try {
-    await execFile('gh', ['auth', 'status'])
+    await execFile('gh', ['auth', 'status'], { timeout: GITHUB_CLI_TIMEOUT_MS })
     console.info('ok GITHUB_CLI authenticated')
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
