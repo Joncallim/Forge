@@ -1,8 +1,7 @@
 import { streamText } from 'ai'
-import type { LanguageModel } from 'ai'
 import { db } from '../db'
 import { agentConfigs, agentRuns, artifacts, projects, taskQuestions, tasks } from '../db/schema'
-import { getProvider } from '../lib/providers/registry'
+import { getModel, getProvider } from '../lib/providers/registry'
 import { and, desc, eq } from 'drizzle-orm'
 import { publishTaskEvent } from './events'
 import { updateTaskStatus, updateTaskStatusIfCurrent, type TaskStatus } from './task-state'
@@ -348,9 +347,10 @@ async function runArchitect(
     throw new Error(`Provider config ${providerConfigId} is missing or inactive`)
   }
 
-  const model = (providerResult.provider as (modelId: string) => LanguageModel)(
-    providerResult.config.modelId,
-  )
+  const model = await getModel(providerConfigId)
+  if (!model) {
+    throw new Error(`Provider config ${providerConfigId} is missing or inactive`)
+  }
   const previousPlan = await loadLatestPlanArtifact(task.id)
   const resumeCheckpoint = await readLatestArchitectCheckpointSafely(task.id)
   const startedAt = new Date()

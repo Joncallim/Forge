@@ -2,12 +2,13 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/db'
-import { providerConfigs, tasks, agentRuns, agentConfigs } from '@/db/schema'
+import { providerConfigs, tasks, agentRuns, agentConfigs, type ProviderConfig } from '@/db/schema'
 import { eq, and, isNotNull, count } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { PROVIDER_TYPES, requiresProviderBaseUrl } from '@/lib/providers/types'
 import { toPublicProvider } from '@/lib/providers/serialize'
 import { encryptSecret } from '@/lib/crypto'
+import { isAcpAgentId } from '@/lib/providers/acp/catalog'
 
 // ---------------------------------------------------------------------------
 // Validation schema (all fields optional for PUT)
@@ -24,6 +25,35 @@ const updateProviderSchema = z.object({
   apiKey: z.string().max(8192).nullable().optional(),
   isLocal: z.boolean().optional(),
 })
+
+function validateAcpProviderUpdate(
+  data: z.infer<typeof updateProviderSchema>,
+  existing: ProviderConfig,
+): string | null {
+  const effectiveType = data.providerType ?? existing.providerType
+  if (effectiveType !== 'acp') return null
+
+  const effectiveModelId = data.modelId ?? existing.modelId
+  const switchingToAcp = existing.providerType !== 'acp' && data.providerType === 'acp'
+  const effectiveBaseUrl = switchingToAcp ? null : 'baseUrl' in data ? data.baseUrl : existing.baseUrl
+  const effectiveApiKeyEnvVar = switchingToAcp ? null : 'apiKeyEnvVar' in data ? data.apiKeyEnvVar : existing.apiKeyEnvVar
+  const typedApiKey = 'apiKey' in data ? data.apiKey : null
+
+  if (!isAcpAgentId(effectiveModelId)) {
+    return 'modelId must be a known ACP agent id'
+  }
+  if (effectiveBaseUrl && effectiveBaseUrl.trim() !== '') {
+    return 'baseUrl is not supported for ACP providers'
+  }
+  if (effectiveApiKeyEnvVar && effectiveApiKeyEnvVar.trim() !== '') {
+    return 'apiKeyEnvVar is not supported for ACP providers'
+  }
+  if (typedApiKey && typedApiKey.trim() !== '') {
+    return 'apiKey is not supported for ACP providers'
+  }
+
+  return null
+}
 
 // ---------------------------------------------------------------------------
 // GET /api/providers/:id
@@ -101,6 +131,10 @@ export async function PUT(
     }
 
     const data = parsed.data
+    const acpError = validateAcpProviderUpdate(data, existing)
+    if (acpError) {
+      return NextResponse.json({ error: acpError }, { status: 400 })
+    }
 
     // Conditional validation: if providerType requires baseUrl, baseUrl must be present.
     const effectiveType = data.providerType ?? existing.providerType
@@ -121,9 +155,16 @@ export async function PUT(
     if ('apiKeyEnvVar' in data) updateSet.apiKeyEnvVar = data.apiKeyEnvVar ?? null
     if (data.isLocal !== undefined) updateSet.isLocal = data.isLocal
 
+    if ((data.providerType ?? existing.providerType) === 'acp') {
+      updateSet.baseUrl = null
+      updateSet.apiKeyEnvVar = null
+      updateSet.apiKeyCiphertext = null
+      updateSet.isLocal = true
+    }
+
     // API key: present-and-non-empty replaces the stored key; explicit null or
     // empty string clears it; omitted leaves the existing key untouched.
-    if ('apiKey' in data) {
+    if ('apiKey' in data && (data.providerType ?? existing.providerType) !== 'acp') {
       const key = data.apiKey?.trim()
       updateSet.apiKeyCiphertext = key ? encryptSecret(key) : null
     }

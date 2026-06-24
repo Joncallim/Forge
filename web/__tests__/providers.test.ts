@@ -13,6 +13,8 @@
  */
 
 import { vi, describe, it, expect, beforeEach } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
 
 // ---------------------------------------------------------------------------
 // Hoisted mock functions
@@ -25,9 +27,14 @@ const {
   mockCreateGoogleGenerativeAI,
   mockAnthropicInstance,
   mockOpenAIInstance,
+  mockOpenAIChat,
 } = vi.hoisted(() => {
   const mockAnthropicInstance = vi.fn().mockReturnValue({ _tag: 'anthropic-model' })
-  const mockOpenAIInstance = vi.fn().mockReturnValue({ _tag: 'openai-model' })
+  const mockOpenAIChat = vi.fn().mockReturnValue({ _tag: 'openai-chat-model' })
+  const mockOpenAIInstance = Object.assign(
+    vi.fn().mockReturnValue({ _tag: 'openai-model' }),
+    { chat: mockOpenAIChat },
+  )
   const mockGoogleInstance = vi.fn().mockReturnValue({ _tag: 'google-model' })
   return {
     mockDbSelect: vi.fn(),
@@ -36,6 +43,7 @@ const {
     mockCreateGoogleGenerativeAI: vi.fn().mockReturnValue(mockGoogleInstance),
     mockAnthropicInstance,
     mockOpenAIInstance,
+    mockOpenAIChat,
     mockGoogleInstance,
   }
 })
@@ -72,6 +80,9 @@ function chain(resolveValue: unknown) {
 // ---------------------------------------------------------------------------
 
 import { getProvider, getModel } from '@/lib/providers/registry'
+import { checkProviderHealth } from '@/lib/providers/health'
+import { ACP_AGENTS, ACP_AGENTS_SOURCE_URL, getAcpAgent } from '@/lib/providers/acp/catalog'
+import { PROVIDER_CATALOG, providerCategory } from '@/lib/providers/catalog'
 import { encryptSecret } from '@/lib/crypto'
 import type { ProviderConfig } from '@/db/schema'
 
@@ -204,6 +215,16 @@ describe('getProvider', () => {
     await expect(getProvider('config-id')).rejects.toThrow(/baseUrl is required/i)
   })
 
+  it('throws a clear non-executable error for ACP providers', async () => {
+    mockDbSelect.mockReturnValue(chain([
+      makeRow({ providerType: 'acp', modelId: 'claude-agent', isLocal: true }),
+    ]))
+
+    await expect(getProvider('config-id')).rejects.toThrow(/ACP provider execution is not implemented yet/i)
+    expect(mockCreateOpenAI).not.toHaveBeenCalled()
+    expect(mockCreateAnthropic).not.toHaveBeenCalled()
+  })
+
   it('returns null for an isActive=false row', async () => {
     mockDbSelect.mockReturnValue(chain([makeRow({ isActive: false })]))
 
@@ -287,5 +308,75 @@ describe('getModel', () => {
     // The anthropic factory instance was called with the modelId
     expect(mockAnthropicInstance).toHaveBeenCalledWith('claude-opus-4-5')
     expect(model).toEqual({ _tag: 'anthropic-model' })
+  })
+
+  it('uses chat completions for LM Studio models instead of the Responses API', async () => {
+    mockDbSelect.mockReturnValue(chain([
+      makeRow({
+        providerType: 'lmstudio',
+        baseUrl: 'http://localhost:1234/v1',
+        modelId: 'google/gemma-4-e4b',
+        isLocal: true,
+      }),
+    ]))
+
+    const model = await getModel('config-id')
+
+    expect(mockOpenAIChat).toHaveBeenCalledWith('google/gemma-4-e4b')
+    expect(mockOpenAIInstance).not.toHaveBeenCalledWith('google/gemma-4-e4b')
+    expect(model).toEqual({ _tag: 'openai-chat-model' })
+  })
+})
+
+describe('ACP provider catalog', () => {
+  it('defines a keyless local provider family and sourced agent list', () => {
+    expect(PROVIDER_CATALOG.acp).toMatchObject({
+      category: 'local',
+      requiresApiKey: false,
+      requiresBaseUrl: false,
+    })
+    expect(providerCategory('acp')).toBe('local')
+    expect(ACP_AGENTS_SOURCE_URL).toBe('https://agentclientprotocol.com/get-started/agents')
+    expect(ACP_AGENTS.length).toBeGreaterThan(10)
+    expect(getAcpAgent('claude-agent')).toMatchObject({
+      label: 'Claude Agent',
+      adapterUrl: 'https://github.com/zed-industries/claude-agent-acp',
+    })
+    expect(getAcpAgent('codex-cli')).toMatchObject({
+      label: 'Codex CLI',
+      adapterUrl: 'https://github.com/zed-industries/codex-acp',
+    })
+  })
+})
+
+describe('checkProviderHealth', () => {
+  it('reports ACP providers as configured but not executable', async () => {
+    const result = await checkProviderHealth(
+      makeRow({ providerType: 'acp', modelId: 'codex-cli', isLocal: true }),
+    )
+
+    expect(result).toMatchObject({
+      reachable: false,
+      envVarPresent: true,
+      latencyMs: null,
+      error: 'ACP provider execution is not implemented yet',
+    })
+  })
+})
+
+describe('provider model construction call sites', () => {
+  it('keeps runtime generation paths on getModel so OpenAI-compatible providers use chat completions', () => {
+    const repoRoot = path.resolve(__dirname, '..')
+    const files = [
+      'worker/orchestrator.ts',
+      'lib/agent-evaluation.ts',
+      'lib/task-title.ts',
+    ]
+
+    for (const file of files) {
+      const source = fs.readFileSync(path.join(repoRoot, file), 'utf8')
+      expect(source).toContain('getModel(')
+      expect(source).not.toMatch(/providerResult\.provider\s+as/)
+    }
   })
 })

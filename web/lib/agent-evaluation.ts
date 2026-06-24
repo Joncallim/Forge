@@ -1,8 +1,7 @@
 import { generateText } from 'ai'
-import type { LanguageModel } from 'ai'
 import { z } from 'zod'
 import type { AgentConfig, ProviderConfig, tasks } from '@/db/schema'
-import { getProvider } from '@/lib/providers/registry'
+import { getModel, getProvider } from '@/lib/providers/registry'
 import { buildWebResearchContext } from '@/worker/architect-context'
 
 // ---------------------------------------------------------------------------
@@ -160,9 +159,11 @@ export async function evaluateAgentRoles(
     throw new Error(`Provider config ${architectConfig.providerConfigId} is missing or inactive`)
   }
 
-  const model = (providerResult.provider as (modelId: string) => LanguageModel)(
-    providerResult.config.modelId,
-  )
+  const model = await getModel(architectConfig.providerConfigId)
+  if (!model) {
+    throw new Error(`Provider config ${architectConfig.providerConfigId} is missing or inactive`)
+  }
+  const evaluationModel = model
 
   let webResearchContext: string
   if (options.enableWebResearch !== false && process.env.FORGE_AGENT_WEB_SEARCH !== '0') {
@@ -188,7 +189,7 @@ export async function evaluateAgentRoles(
 
   async function attempt(attemptPrompt: string): Promise<{ recommendations: AgentRoleRecommendation[]; raw: string; usage: { inputTokens: number; outputTokens: number } }> {
     const result = await generateText({
-      model,
+      model: evaluationModel,
       system: architectConfig!.systemPrompt,
       prompt: attemptPrompt,
       temperature: 0.2,

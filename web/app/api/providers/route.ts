@@ -8,6 +8,7 @@ import { listActiveProviders } from '@/lib/providers/registry'
 import { PROVIDER_TYPES, requiresProviderBaseUrl } from '@/lib/providers/types'
 import { toPublicProvider } from '@/lib/providers/serialize'
 import { encryptSecret } from '@/lib/crypto'
+import { isAcpAgentId } from '@/lib/providers/acp/catalog'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -24,6 +25,25 @@ const createProviderSchema = z.object({
   apiKey: z.string().max(8192).nullable().optional(),
   isLocal: z.boolean(),
 })
+
+function validateAcpProvider(data: z.infer<typeof createProviderSchema>): string | null {
+  if (data.providerType !== 'acp') return null
+
+  if (!isAcpAgentId(data.modelId)) {
+    return 'modelId must be a known ACP agent id'
+  }
+  if (data.baseUrl && data.baseUrl.trim() !== '') {
+    return 'baseUrl is not supported for ACP providers'
+  }
+  if (data.apiKeyEnvVar && data.apiKeyEnvVar.trim() !== '') {
+    return 'apiKeyEnvVar is not supported for ACP providers'
+  }
+  if (data.apiKey && data.apiKey.trim() !== '') {
+    return 'apiKey is not supported for ACP providers'
+  }
+
+  return null
+}
 
 // ---------------------------------------------------------------------------
 // GET /api/providers
@@ -71,6 +91,10 @@ export async function POST(request: NextRequest) {
     }
 
     const data = parsed.data
+    const acpError = validateAcpProvider(data)
+    if (acpError) {
+      return NextResponse.json({ error: acpError }, { status: 400 })
+    }
 
     // Conditional validation: baseUrl is required for provider types with a custom endpoint.
     if (requiresProviderBaseUrl(data.providerType) && !data.baseUrl) {
@@ -89,10 +113,10 @@ export async function POST(request: NextRequest) {
         displayName: data.displayName,
         providerType: data.providerType,
         modelId: data.modelId,
-        baseUrl: data.baseUrl ?? null,
-        apiKeyEnvVar: data.apiKeyEnvVar ?? null,
+        baseUrl: data.providerType === 'acp' ? null : data.baseUrl ?? null,
+        apiKeyEnvVar: data.providerType === 'acp' ? null : data.apiKeyEnvVar ?? null,
         apiKeyCiphertext,
-        isLocal: data.isLocal,
+        isLocal: data.providerType === 'acp' ? true : data.isLocal,
       })
       .returning()
 

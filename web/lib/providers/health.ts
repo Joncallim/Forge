@@ -25,6 +25,15 @@ const DEFAULT_STALE_AFTER_MS = 5 * 60 * 1000
 export async function checkProviderHealth(
   config: ProviderConfig,
 ): Promise<ProviderHealthResult> {
+  if (config.providerType === 'acp') {
+    return {
+      reachable: false,
+      envVarPresent: true,
+      latencyMs: null,
+      error: 'ACP provider execution is not implemented yet',
+    }
+  }
+
   // A credential is "present" if a key was entered via the UI (stored
   // encrypted), or the configured env var is set, or none is configured
   // (local/keyless providers). `envVarPresent` is kept as the field name for

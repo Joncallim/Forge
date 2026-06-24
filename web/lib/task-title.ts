@@ -1,6 +1,5 @@
 import { generateText } from 'ai'
-import type { LanguageModel } from 'ai'
-import { getProvider, listActiveProviders } from '@/lib/providers/registry'
+import { getModel, getProvider, listActiveProviders } from '@/lib/providers/registry'
 
 const TITLE_SYSTEM_PROMPT =
   'You write short task titles. Given a task prompt, respond with ONLY a concise, ' +
@@ -41,9 +40,8 @@ export async function generateTaskTitle(
 
     if (!providerResult) return fallbackTitle(prompt)
 
-    const model = (providerResult.provider as (modelId: string) => LanguageModel)(
-      providerResult.config.modelId,
-    )
+    const model = await getModel(providerResult.config.id)
+    if (!model) return fallbackTitle(prompt)
 
     const result = await generateText({
       model,

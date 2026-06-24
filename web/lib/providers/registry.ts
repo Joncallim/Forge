@@ -9,6 +9,7 @@ import { eq, asc } from 'drizzle-orm'
 import { requiresProviderBaseUrl } from './types'
 import { PROVIDER_CATALOG } from './catalog'
 import { decryptSecret } from '@/lib/crypto'
+import type { ProviderType } from './types'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -18,6 +19,18 @@ type ProviderFactory =
   | ReturnType<typeof createAnthropic>
   | ReturnType<typeof createOpenAI>
   | ReturnType<typeof createGoogleGenerativeAI>
+
+const CHAT_COMPLETIONS_PROVIDER_TYPES = new Set<ProviderType>([
+  'openrouter',
+  'xai',
+  'deepseek',
+  'moonshot',
+  'zhipu',
+  'litellm',
+  'custom',
+  'ollama',
+  'lmstudio',
+])
 
 export type ProviderResult = {
   provider: ProviderFactory
@@ -70,6 +83,9 @@ function buildProvider(config: ProviderConfig): ProviderFactory {
   const apiKey = resolveApiKey(config)
 
   switch (config.providerType) {
+    case 'acp':
+      throw new Error('ACP provider execution is not implemented yet')
+
     case 'anthropic':
       return createAnthropic({ apiKey })
 
@@ -151,6 +167,10 @@ export async function getModel(configId: string): Promise<LanguageModel | null> 
   if (!result) return null
 
   const { provider, config } = result
+  if (CHAT_COMPLETIONS_PROVIDER_TYPES.has(config.providerType as ProviderType)) {
+    return (provider as { chat: (modelId: string) => LanguageModel }).chat(config.modelId)
+  }
+
   // All Vercel AI SDK provider factories are callable with a model ID.
   // The return type is LanguageModelV1 / LanguageModelV3 which satisfy LanguageModel.
   return (provider as (modelId: string) => LanguageModel)(config.modelId)

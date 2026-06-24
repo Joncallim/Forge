@@ -92,6 +92,7 @@ const LAYER_ORDER: RoleRecommendation['layer'][] = [
 ]
 
 const CUSTOM_PROVIDER_VALUE = '__custom_provider__'
+const ASSIGNABLE_PROVIDER_TYPE_OPTIONS = PROVIDER_TYPE_OPTIONS.filter((opt) => opt.value !== 'acp')
 
 type CustomProviderFormState = {
   displayName: string
@@ -143,7 +144,10 @@ function EditDrawer({ agent, providers, onClose, onSaved }: EditDrawerProps) {
   // Sync form when agent changes
   useEffect(() => {
     if (agent) {
-      setSelectedProviderId(agent.providerConfigId ?? '')
+      const assignableProviderId = providers.some((provider) => provider.id === agent.providerConfigId)
+        ? agent.providerConfigId
+        : ''
+      setSelectedProviderId(assignableProviderId ?? '')
       setIsCustomProvider(false)
       setCustomProviderForm({
         ...DEFAULT_CUSTOM_PROVIDER_FORM,
@@ -152,7 +156,7 @@ function EditDrawer({ agent, providers, onClose, onSaved }: EditDrawerProps) {
       setSystemPrompt(agent.systemPrompt)
       setError(null)
     }
-  }, [agent])
+  }, [agent, providers])
 
   const agentType = agent?.agentType
   const recs = agentType ? ROLE_RECOMMENDATIONS[agentType] ?? [] : []
@@ -361,7 +365,7 @@ function EditDrawer({ agent, providers, onClose, onSaved }: EditDrawerProps) {
                       </SelectTrigger>
                       <SelectContent>
                         <SelectGroup>
-                          {PROVIDER_TYPE_OPTIONS.map((opt) => (
+                          {ASSIGNABLE_PROVIDER_TYPE_OPTIONS.map((opt) => (
                             <SelectItem key={opt.value} value={opt.value}>
                               {opt.label}
                             </SelectItem>
@@ -601,6 +605,7 @@ export default function AgentsPage() {
     },
     [providers],
   )
+  const assignableProviders = providers.filter((provider) => provider.providerType !== 'acp')
 
   // ---------------------------------------------------------------------------
   // Apply recommended configuration (preset) — configures providers + agents
@@ -773,7 +778,7 @@ export default function AgentsPage() {
       {/* Edit drawer */}
       <EditDrawer
         agent={editingAgent}
-        providers={providers}
+        providers={assignableProviders}
         onClose={() => setEditingAgent(null)}
         onSaved={loadData}
       />

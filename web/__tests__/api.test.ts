@@ -1295,6 +1295,75 @@ describe('POST /api/providers — baseUrl requirement', () => {
       baseUrl: 'https://models.example.com/v1',
     })
   })
+
+  it('creates an ACP provider with a known agent id and no credentials', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const createdProvider = {
+      id: 'provider-acp',
+      displayName: 'Claude Agent ACP',
+      providerType: 'acp',
+      modelId: 'claude-agent',
+      baseUrl: null,
+      apiKeyEnvVar: null,
+      apiKeyCiphertext: null,
+      isLocal: true,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }
+    mockDbInsert.mockReturnValue(chain([createdProvider]))
+
+    const { POST } = await import('@/app/api/providers/route')
+    const req = authRequest('/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        displayName: createdProvider.displayName,
+        providerType: 'acp',
+        modelId: 'claude-agent',
+        isLocal: false,
+      }),
+    })
+
+    const res = await POST(req as never)
+
+    expect(res.status).toBe(201)
+    const body = await res.json()
+    expect(body.provider).toMatchObject({
+      providerType: 'acp',
+      modelId: 'claude-agent',
+      baseUrl: null,
+      apiKeyEnvVar: null,
+      hasApiKey: false,
+      isLocal: true,
+    })
+  })
+
+  it('rejects ACP providers that include credentials or endpoints', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+
+    const { POST } = await import('@/app/api/providers/route')
+    const req = authRequest('/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        displayName: 'Codex ACP',
+        providerType: 'acp',
+        modelId: 'codex-cli',
+        baseUrl: 'http://localhost:9999',
+        apiKeyEnvVar: 'OPENAI_API_KEY',
+        apiKey: 'secret',
+        isLocal: true,
+      }),
+    })
+
+    const res = await POST(req as never)
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error).toMatch(/baseUrl|apiKey/i)
+    expect(mockDbInsert).not.toHaveBeenCalled()
+  })
 })
 
 // ---------------------------------------------------------------------------

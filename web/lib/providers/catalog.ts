@@ -35,6 +35,14 @@ export interface ProviderCatalogEntry {
 }
 
 export const PROVIDER_CATALOG: Record<ProviderType, ProviderCatalogEntry> = {
+  acp: {
+    type: 'acp',
+    category: 'local',
+    requiresApiKey: false,
+    requiresBaseUrl: false,
+    modelPlaceholder: 'claude-agent',
+    helpText: 'Configures an ACP agent. Task execution is not enabled yet.',
+  },
   anthropic: {
     type: 'anthropic',
     category: 'cloud',

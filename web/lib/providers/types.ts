@@ -1,4 +1,5 @@
 export const PROVIDER_TYPES = [
+  'acp',
   'anthropic',
   'openai',
   'google',
@@ -16,6 +17,7 @@ export const PROVIDER_TYPES = [
 export type ProviderType = (typeof PROVIDER_TYPES)[number]
 
 export const PROVIDER_TYPE_LABELS: Record<ProviderType, string> = {
+  acp: 'Agent Client Protocol',
   anthropic: 'Anthropic',
   openai: 'OpenAI',
   google: 'Google (Gemini)',

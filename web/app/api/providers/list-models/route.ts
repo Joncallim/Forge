@@ -45,6 +45,9 @@ function extractOpenAiCompatibleIds(data: unknown): string[] {
 
 async function listModels(providerType: ProviderType, apiKey: string, baseUrl?: string): Promise<string[]> {
   switch (providerType) {
+    case 'acp':
+      throw new Error('ACP providers do not expose model listing through this endpoint')
+
     case 'anthropic': {
       const data = await fetchJson('https://api.anthropic.com/v1/models', {
         'x-api-key': apiKey,

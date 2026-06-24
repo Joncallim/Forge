@@ -6,6 +6,7 @@ import {
   PencilIcon,
   Trash2Icon,
   RefreshCwIcon,
+  ExternalLinkIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -35,6 +36,12 @@ import {
   providerCategory,
   type ProviderCategory,
 } from '@/lib/providers/catalog'
+import {
+  ACP_AGENTS,
+  ACP_AGENTS_SOURCE_URL,
+  getAcpAgent,
+  type AcpAuthMode,
+} from '@/lib/providers/acp/catalog'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -72,6 +79,12 @@ const CATEGORY_COLORS: Record<ProviderCategory, string> = {
   local:  'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300',
   remote: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300',
   cloud:  'bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-300',
+}
+
+const ACP_AUTH_LABELS: Record<AcpAuthMode, string> = {
+  web: 'Web login',
+  cli: 'CLI login',
+  unknown: 'Agent-managed auth',
 }
 
 // ---------------------------------------------------------------------------
@@ -206,10 +219,12 @@ interface ProviderFormProps {
 
 function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel, keyAlreadySet = false }: ProviderFormProps) {
   const entry = PROVIDER_CATALOG[form.providerType]
+  const isAcp = form.providerType === 'acp'
   const needsApiKey = entry.requiresApiKey
-  const showBaseUrl = entry.requiresBaseUrl || entry.category === 'local'
+  const showBaseUrl = !isAcp && (entry.requiresBaseUrl || entry.category === 'local')
   const baseUrlRequired = entry.requiresBaseUrl
   const category = providerCategory(form.providerType, form.isLocal)
+  const selectedAcpAgent = isAcp ? getAcpAgent(form.modelId) : undefined
   const [availableModels, setAvailableModels] = useState<string[] | null>(null)
   const [modelsLoading, setModelsLoading] = useState(false)
   const [modelsError, setModelsError] = useState<string | null>(null)
@@ -246,12 +261,16 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
     if (!value) return
     const pt = value as ProviderType
     const next = PROVIDER_CATALOG[pt]
+    setAvailableModels(null)
+    setModelsError(null)
     onChange({
       ...form,
       providerType: pt,
-      isLocal: next.category === 'local',
+      modelId: pt === 'acp' ? ACP_AGENTS[0]?.id ?? '' : '',
+      apiKey: pt === 'acp' ? '' : form.apiKey,
+      isLocal: pt === 'acp' ? true : next.category === 'local',
       // Suggest the known base URL for the newly chosen provider.
-      baseUrl: next.defaultBaseUrl ?? '',
+      baseUrl: pt === 'acp' ? '' : next.defaultBaseUrl ?? '',
     })
   }
 
@@ -299,35 +318,89 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
         </p>
       </div>
 
-      {/* Model ID */}
+      {/* Model ID / ACP agent */}
       <div className="flex flex-col gap-1.5">
         <label htmlFor="pf-modelId" className="text-sm font-medium text-foreground">
-          Model ID <span aria-hidden="true" className="text-destructive">*</span>
+          {isAcp ? 'ACP agent' : 'Model ID'} <span aria-hidden="true" className="text-destructive">*</span>
         </label>
-        <div className="flex gap-2">
-          <input
-            id="pf-modelId"
-            type="text"
-            required
-            value={form.modelId}
-            onChange={(e) => set('modelId', e.target.value)}
-            placeholder={entry.modelPlaceholder}
-            className="min-w-0 flex-1 rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-            aria-required="true"
-          />
-          {category === 'cloud' && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => void handleFetchModels()}
-              disabled={modelsLoading || (needsApiKey && !form.apiKey.trim() && !keyAlreadySet)}
-              aria-label="Fetch available models from provider API"
-            >
-              {modelsLoading ? 'Fetching…' : 'Fetch models'}
-            </Button>
-          )}
-        </div>
+        {isAcp ? (
+          <>
+            <Select value={form.modelId || undefined} onValueChange={(v) => v && set('modelId', v)}>
+              <SelectTrigger id="pf-modelId" className="w-full" aria-required="true">
+                <SelectValue placeholder="Select ACP agent" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  {ACP_AGENTS.map((agent) => (
+                    <SelectItem key={agent.id} value={agent.id}>
+                      {agent.label}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <div className="rounded-lg border border-yellow-200 bg-yellow-50 px-3 py-2 text-xs text-yellow-900 dark:border-yellow-900/40 dark:bg-yellow-950/20 dark:text-yellow-200">
+              ACP configs are saved for setup only. Task execution is not enabled yet.
+            </div>
+            {selectedAcpAgent && (
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                <span>{ACP_AUTH_LABELS[selectedAcpAgent.authMode]}</span>
+                <a
+                  href={selectedAcpAgent.sourceUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 text-primary underline-offset-2 hover:underline"
+                >
+                  Source <ExternalLinkIcon className="size-3" aria-hidden="true" />
+                </a>
+                {selectedAcpAgent.adapterUrl && (
+                  <a
+                    href={selectedAcpAgent.adapterUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 text-primary underline-offset-2 hover:underline"
+                  >
+                    Adapter <ExternalLinkIcon className="size-3" aria-hidden="true" />
+                  </a>
+                )}
+                <a
+                  href={ACP_AGENTS_SOURCE_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 text-primary underline-offset-2 hover:underline"
+                >
+                  ACP list <ExternalLinkIcon className="size-3" aria-hidden="true" />
+                </a>
+                {selectedAcpAgent.note && <span>{selectedAcpAgent.note}</span>}
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="flex gap-2">
+            <input
+              id="pf-modelId"
+              type="text"
+              required
+              value={form.modelId}
+              onChange={(e) => set('modelId', e.target.value)}
+              placeholder={entry.modelPlaceholder}
+              className="min-w-0 flex-1 rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+              aria-required="true"
+            />
+            {category === 'cloud' && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void handleFetchModels()}
+                disabled={modelsLoading || (needsApiKey && !form.apiKey.trim() && !keyAlreadySet)}
+                aria-label="Fetch available models from provider API"
+              >
+                {modelsLoading ? 'Fetching…' : 'Fetch models'}
+              </Button>
+            )}
+          </div>
+        )}
         {modelsError !== null && (
           <p role="alert" className="text-xs text-destructive">{modelsError}</p>
         )}
@@ -587,13 +660,14 @@ export default function ProvidersPage() {
     setAddError(null)
 
     const entry = PROVIDER_CATALOG[addForm.providerType]
+    const isAcp = addForm.providerType === 'acp'
     const displayName = addForm.displayName.trim()
     const modelId = addForm.modelId.trim()
-    const baseUrl = addForm.baseUrl.trim() || entry.defaultBaseUrl || null
-    const apiKey = entry.requiresApiKey ? addForm.apiKey.trim() || null : null
+    const baseUrl = isAcp ? null : addForm.baseUrl.trim() || entry.defaultBaseUrl || null
+    const apiKey = !isAcp && entry.requiresApiKey ? addForm.apiKey.trim() || null : null
 
     if (!displayName) { setAddError('Display name is required.'); return }
-    if (!modelId) { setAddError('Model ID is required.'); return }
+    if (!modelId) { setAddError(isAcp ? 'ACP agent is required.' : 'Model ID is required.'); return }
     if (entry.requiresBaseUrl && !baseUrl) {
       setAddError('Base URL is required for this provider type.')
       return
@@ -610,7 +684,7 @@ export default function ProvidersPage() {
           modelId,
           baseUrl,
           apiKey,
-          isLocal: addForm.isLocal,
+          isLocal: isAcp ? true : addForm.isLocal,
         }),
       })
       if (!res.ok) {
@@ -642,14 +716,15 @@ export default function ProvidersPage() {
     setEditError(null)
 
     const entry = PROVIDER_CATALOG[editForm.providerType]
+    const isAcp = editForm.providerType === 'acp'
     const displayName = editForm.displayName.trim()
     const modelId = editForm.modelId.trim()
-    const baseUrl = editForm.baseUrl.trim() || entry.defaultBaseUrl || null
+    const baseUrl = isAcp ? null : editForm.baseUrl.trim() || entry.defaultBaseUrl || null
     // Only send apiKey when the user typed one; a blank field keeps the stored key.
-    const typedApiKey = entry.requiresApiKey ? editForm.apiKey.trim() : ''
+    const typedApiKey = !isAcp && entry.requiresApiKey ? editForm.apiKey.trim() : ''
 
     if (!displayName) { setEditError('Display name is required.'); return }
-    if (!modelId) { setEditError('Model ID is required.'); return }
+    if (!modelId) { setEditError(isAcp ? 'ACP agent is required.' : 'Model ID is required.'); return }
     if (entry.requiresBaseUrl && !baseUrl) {
       setEditError('Base URL is required for this provider type.')
       return
@@ -666,7 +741,7 @@ export default function ProvidersPage() {
           modelId,
           baseUrl,
           ...(typedApiKey !== '' ? { apiKey: typedApiKey } : {}),
-          isLocal: editForm.isLocal,
+          isLocal: isAcp ? true : editForm.isLocal,
         }),
       })
       if (!res.ok) {
@@ -833,7 +908,7 @@ export default function ProvidersPage() {
               <tr className="border-b border-border bg-muted/40">
                 <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Display name</th>
                 <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Provider</th>
-                <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Model ID</th>
+                <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Model / Agent</th>
                 <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Category</th>
                 <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Health</th>
                 <th scope="col" className="px-4 py-3 text-right font-medium text-muted-foreground">
@@ -857,7 +932,9 @@ export default function ProvidersPage() {
                       className="max-w-[180px] truncate font-mono text-xs text-foreground block"
                       title={provider.modelId}
                     >
-                      {provider.modelId}
+                      {provider.providerType === 'acp'
+                        ? getAcpAgent(provider.modelId)?.label ?? provider.modelId
+                        : provider.modelId}
                     </span>
                   </td>
                   <td className="px-4 py-3">
