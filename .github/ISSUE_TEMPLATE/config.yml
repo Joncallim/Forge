@@ -1,0 +1,6 @@
+blank_issues_enabled: false
+
+contact_links:
+  - name: FORGE Product Discussion
+    url: https://github.com/Joncallim/Forge/discussions
+    about: Discuss rough ideas before converting them into Feature, Bug, or Other issues.
