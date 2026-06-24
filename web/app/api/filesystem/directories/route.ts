@@ -1,10 +1,10 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import fs from 'node:fs/promises'
-import os from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
 import { getSession } from '@/lib/session'
+import { getWorkspaceSettings } from '@/lib/workspace'
 
 export const runtime = 'nodejs'
 
@@ -33,12 +33,13 @@ async function hasGitSubdirectory(dirPath: string): Promise<boolean> {
   }
 }
 
-function defaultStartPath(): string {
-  return process.env.FORGE_WORKSPACE_ROOT?.trim() || os.homedir() || process.cwd()
+async function defaultStartPath(): Promise<string> {
+  const workspace = await getWorkspaceSettings()
+  return workspace.projectsRoot
 }
 
-function resolveDirectoryPath(rawPath: string | null): string {
-  const start = defaultStartPath()
+async function resolveDirectoryPath(rawPath: string | null): Promise<string> {
+  const start = await defaultStartPath()
   if (!rawPath || rawPath.trim() === '') return path.resolve(/*turbopackIgnore: true*/ start)
   return path.isAbsolute(rawPath)
     ? path.resolve(/*turbopackIgnore: true*/ rawPath)
@@ -64,7 +65,7 @@ export async function GET(request: NextRequest) {
 
     const requestedPath = request.nextUrl.searchParams.get('path')
     const showHidden = request.nextUrl.searchParams.get('showHidden') === '1'
-    const currentPath = resolveDirectoryPath(requestedPath)
+    const currentPath = await resolveDirectoryPath(requestedPath)
     const stat = await fs.stat(currentPath)
     if (!stat.isDirectory()) {
       return NextResponse.json({ error: 'Path is not a directory' }, { status: 400 })
@@ -142,7 +143,7 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const parentPath = resolveDirectoryPath(parsed.data.parentPath ?? null)
+    const parentPath = await resolveDirectoryPath(parsed.data.parentPath ?? null)
     const directoryPath = path.join(/*turbopackIgnore: true*/ parentPath, directoryName)
 
     // Check the parent folder first so we can ask the user before creating it.

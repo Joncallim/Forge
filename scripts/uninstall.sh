@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INSTALL_STATE_DIR="$REPO_ROOT/.forge"
 INSTALL_MANIFEST="$INSTALL_STATE_DIR/install-manifest"
-PROJECT_PATHS_FILE="$INSTALL_STATE_DIR/project-paths"
+LEGACY_PROJECT_PATHS_FILE="$INSTALL_STATE_DIR/project-paths"
 
 YES=0
 DRY_RUN=0
@@ -44,7 +44,8 @@ Options:
   --remove-data     Remove .env, Forge database/role when recorded, Docker volumes,
                     Redis data, recorded local models, and install state.
   --remove-projects Delete every local project folder Forge created (listed in
-                    .forge/project-paths). This deletes your project files.
+                    the workspace runtime registry or legacy .forge/project-paths).
+                    This deletes your project files.
   --keep-projects   Never delete local project folders (the default).
   --yes             Do not prompt. Defaults to --keep-data and --keep-projects.
   --dry-run         Print what would happen without changing anything.
@@ -119,12 +120,6 @@ if [ -z "$KEEP_DATA" ]; then
   fi
 fi
 
-project_paths() {
-  if [ -f "$PROJECT_PATHS_FILE" ]; then
-    grep -v '^[[:space:]]*$' "$PROJECT_PATHS_FILE" 2>/dev/null || true
-  fi
-}
-
 # Read a key from the first .env file that defines it. The .env files still
 # exist at this point because remove_env_files runs near the end of uninstall.
 read_env_var() {
@@ -146,9 +141,62 @@ app_database_url() {
   read_env_var DATABASE_URL
 }
 
+workspace_project_paths_file() {
+  local root
+  root="${FORGE_WORKSPACE_ROOT:-$(read_env_var FORGE_WORKSPACE_ROOT)}"
+  if [ -z "$root" ]; then
+    root="$(workspace_root_from_default_settings)"
+  fi
+  if [ -z "$root" ]; then
+    root="$(default_workspace_root)"
+  fi
+  [ -n "$root" ] || return 0
+  root="$(expand_home_path "$root")"
+  [ -n "$root" ] || return 0
+  printf '%s/runtime/project-paths\n' "$root"
+}
+
+default_workspace_root() {
+  [ -n "${HOME:-}" ] || return 0
+  printf '%s/Documents/Forge\n' "$HOME"
+}
+
+expand_home_path() {
+  local raw="$1"
+  case "$raw" in
+    "~") [ -n "${HOME:-}" ] && printf '%s\n' "$HOME" ;;
+    "~/"*) [ -n "${HOME:-}" ] && printf '%s/%s\n' "$HOME" "${raw#~/}" ;;
+    *) printf '%s\n' "$raw" ;;
+  esac
+}
+
+workspace_root_from_default_settings() {
+  local default_root settings_file root
+  default_root="$(default_workspace_root)"
+  [ -n "$default_root" ] || return 0
+  settings_file="$default_root/global-settings.json"
+  [ -f "$settings_file" ] || return 0
+  root="$(
+    sed -n 's/^[[:space:]]*"workspaceRoot"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$settings_file" |
+      head -n1
+  )"
+  [ -n "$root" ] || return 0
+  printf '%s\n' "$root"
+}
+
+project_paths() {
+  local file
+  for file in "$(workspace_project_paths_file)" "$LEGACY_PROJECT_PATHS_FILE"; do
+    [ -n "$file" ] || continue
+    if [ -f "$file" ]; then
+      grep -v '^[[:space:]]*$' "$file" 2>/dev/null || true
+    fi
+  done
+}
+
 # Local project folders recorded in the database. This catches projects created
-# through the web UI, which the on-disk registry (.forge/project-paths) does not
-# always record. Best-effort: silent when psql or the database is unavailable.
+# through the web UI, which the on-disk registry may not always record.
+# Best-effort: silent when psql or the database is unavailable.
 db_project_paths() {
   local url
   url="$(app_database_url)"
@@ -249,7 +297,7 @@ remove_project_files() {
   done < <(safe_project_paths)
 
   if [ "$DRY_RUN" != "1" ]; then
-    rm -f "$PROJECT_PATHS_FILE" 2>/dev/null || true
+    rm -f "$(workspace_project_paths_file)" "$LEGACY_PROJECT_PATHS_FILE" 2>/dev/null || true
   fi
 }
 

@@ -34,7 +34,7 @@ Optional for standalone deployments:
 | `FORGE_EMBED_WORKER` | Set to `0` when running a separate worker process. Defaults to embedded. |
 | `FORGE_AGENT_WEB_SEARCH` | Set to `0` to disable no-key web research context for architect planning. Defaults to enabled. |
 | `FORGE_AGENT_CONFIG_DIR` | Absolute path where agent prompt files can be read and written. |
-| `FORGE_WORKSPACE_ROOT` | Default root directory for the project folder selector and folder-creation API (`GET`/`POST /api/filesystem/directories`). When unset, falls back to the OS home directory, then the process working directory. |
+| `FORGE_WORKSPACE_ROOT` | Optional hard override for the Forge workspace root. When unset, Forge defaults new local projects and runtime registry files to `~/Documents/Forge`, writes `global-settings.json` there, and creates `mcps`/`templates` subfolders for the workspace structure. |
 
 Passkey-related:
 

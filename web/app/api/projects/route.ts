@@ -11,6 +11,7 @@ import { isNull, desc } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { registerProjectPath } from '@/lib/project-registry'
 import { resolveGitHubToken } from '@/lib/github'
+import { collapseHomePath, getWorkspaceSettings, isWithinPath } from '@/lib/workspace'
 
 const execFile = promisify(execFileCallback)
 
@@ -58,17 +59,50 @@ async function pathExistsNonEmpty(targetPath: string): Promise<boolean> {
   }
 }
 
-function defaultWorkspaceRoot(): string | null {
-  const root = process.env.FORGE_WORKSPACE_ROOT?.trim()
-  return root ? path.resolve(/*turbopackIgnore: true*/ root) : null
+function folderNameFromProjectName(name: string): string {
+  const slug = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return slug || 'forge-project'
 }
 
-/** Mirrors the filesystem route's boundary check: only enforced when FORGE_WORKSPACE_ROOT is set. */
-function isWithinWorkspaceRoot(resolvedPath: string): boolean {
-  const root = defaultWorkspaceRoot()
-  if (!root) return true
-  const relative = path.relative(root, resolvedPath)
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
+async function ensureLocalProjectDirectory(localPath: string): Promise<void> {
+  try {
+    const stat = await fs.stat(localPath)
+    if (!stat.isDirectory()) {
+      throw new Error('localPath exists but is not a directory')
+    }
+    return
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+  }
+  await fs.mkdir(localPath, { recursive: true })
+}
+
+async function writeProjectConfig(project: {
+  id: string
+  name: string
+  githubRepo: string | null
+  localPath: string | null
+  defaultBranch: string
+  createdAt: Date
+  updatedAt: Date
+}): Promise<void> {
+  if (!project.localPath) return
+
+  const configPath = path.join(/*turbopackIgnore: true*/ project.localPath, 'forge.project.json')
+  const payload = {
+    projectId: project.id,
+    name: project.name,
+    githubRepo: project.githubRepo,
+    defaultBranch: project.defaultBranch,
+    localPath: collapseHomePath(project.localPath),
+    createdAt: project.createdAt.toISOString(),
+    updatedAt: project.updatedAt.toISOString(),
+  }
+  await fs.writeFile(configPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 })
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +157,7 @@ export async function POST(request: NextRequest) {
 
     const data = parsed.data
     const source = data.source ?? (data.githubRepo ? 'github' : 'local')
+    const workspace = await getWorkspaceSettings()
     if (source === 'github' && !data.githubRepo) {
       return NextResponse.json(
         { error: 'GitHub repo is required for GitHub projects' },
@@ -151,10 +186,12 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: 'Invalid local path' }, { status: 400 })
       }
 
-      const resolvedLocalPath = path.resolve(/*turbopackIgnore: true*/ data.localPath)
-      if (!isWithinWorkspaceRoot(resolvedLocalPath)) {
+      const resolvedLocalPath = path.isAbsolute(data.localPath)
+        ? path.resolve(/*turbopackIgnore: true*/ data.localPath)
+        : path.resolve(/*turbopackIgnore: true*/ workspace.projectsRoot, data.localPath)
+      if (!isWithinPath(workspace.workspaceRoot, resolvedLocalPath)) {
         return NextResponse.json(
-          { error: 'localPath must be inside the configured workspace root' },
+          { error: 'localPath must be inside the active workspace root' },
           { status: 400 },
         )
       }
@@ -195,9 +232,32 @@ export async function POST(request: NextRequest) {
         .returning()
 
       await registerProjectPath(project.localPath)
+      await writeProjectConfig(project)
 
       console.info('[POST /api/projects] Cloned project', { id: project.id, name: project.name })
       return NextResponse.json({ project }, { status: 201 })
+    }
+
+    const localPathInput =
+      source === 'local' ? data.localPath ?? folderNameFromProjectName(data.name) : null
+    if (localPathInput?.includes('\0')) {
+      return NextResponse.json({ error: 'Invalid local path' }, { status: 400 })
+    }
+    const resolvedLocalPath =
+      localPathInput !== null
+        ? path.isAbsolute(localPathInput)
+          ? path.resolve(/*turbopackIgnore: true*/ localPathInput)
+          : path.resolve(/*turbopackIgnore: true*/ workspace.projectsRoot, localPathInput)
+        : null
+
+    if (resolvedLocalPath) {
+      if (!isWithinPath(workspace.workspaceRoot, resolvedLocalPath)) {
+        return NextResponse.json(
+          { error: 'localPath must be inside the active workspace root' },
+          { status: 400 },
+        )
+      }
+      await ensureLocalProjectDirectory(resolvedLocalPath)
     }
 
     const [project] = await db
@@ -205,7 +265,7 @@ export async function POST(request: NextRequest) {
       .values({
         name: data.name,
         githubRepo: source === 'github' ? data.githubRepo ?? null : null,
-        localPath: source === 'local' ? data.localPath ?? null : null,
+        localPath: resolvedLocalPath,
         githubTokenEnvVar: data.githubTokenEnvVar ?? null,
         pmProviderConfigId: data.pmProviderConfigId ?? null,
         defaultBranch: data.defaultBranch ?? 'main',
@@ -214,6 +274,7 @@ export async function POST(request: NextRequest) {
 
     if (project.localPath) {
       await registerProjectPath(project.localPath)
+      await writeProjectConfig(project)
     }
 
     console.info('[POST /api/projects] Created project', { id: project.id, name: project.name })

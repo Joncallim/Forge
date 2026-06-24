@@ -11,6 +11,8 @@ const nextConfig: NextConfig = {
   },
   outputFileTracingExcludes: {
     '/api/filesystem/directories': ['**/*'],
+    '/api/projects': ['**/*'],
+    '/api/settings/workspace': ['**/*'],
   },
 }
 

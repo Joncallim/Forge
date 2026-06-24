@@ -112,9 +112,10 @@ The first account creates a password and, by default, a passkey. To skip
 passkeys for convenience, set `FORGE_PASSKEYS_ENABLED=0` in `.env` before
 creating the first account.
 
-Local projects can be created from the project dialog. Use the folder selector
-to choose a parent location; Forge creates a new project folder there and stores
-that path for future worker runs.
+Local projects can be created from the project dialog. Forge defaults to a
+workspace at `~/Documents/Forge`, with projects under
+`~/Documents/Forge/projects`. You can change the active workspace root from
+Settings or set `FORGE_WORKSPACE_ROOT` for deployments that need a fixed path.
 
 ## Uninstall
 

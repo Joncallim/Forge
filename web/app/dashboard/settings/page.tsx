@@ -15,7 +15,167 @@ type GitHubStatus = {
   login: string | null
 }
 
+type WorkspaceSettings = {
+  workspaceRoot: string
+  projectsRoot: string
+  mcpsRoot: string
+  templatesRoot: string
+  globalSettingsPath: string
+  source: 'env' | 'setting' | 'default'
+  envLocked: boolean
+}
+
 const PAT_CREATE_URL = 'https://github.com/settings/tokens/new?scopes=repo,workflow&description=Forge'
+
+// ---------------------------------------------------------------------------
+// Workspace card
+// ---------------------------------------------------------------------------
+
+function WorkspaceCard() {
+  const [workspace, setWorkspace] = useState<WorkspaceSettings | null>(null)
+  const [workspaceRoot, setWorkspaceRoot] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [fetchError, setFetchError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [savedMsg, setSavedMsg] = useState<string | null>(null)
+
+  const loadWorkspace = useCallback(async () => {
+    setLoading(true)
+    setFetchError(null)
+    try {
+      const res = await fetch('/api/settings/workspace')
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error((body as { error?: string }).error ?? 'Failed to load workspace settings')
+      }
+      const body = (await res.json()) as { workspace: WorkspaceSettings }
+      setWorkspace(body.workspace)
+      setWorkspaceRoot(body.workspace.workspaceRoot)
+    } catch (err) {
+      setFetchError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadWorkspace()
+  }, [loadWorkspace])
+
+  async function handleSave(e: React.FormEvent) {
+    e.preventDefault()
+    setSaving(true)
+    setActionError(null)
+    setSavedMsg(null)
+    try {
+      const res = await fetch('/api/settings/workspace', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceRoot }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error((body as { error?: string }).error ?? 'Failed to save workspace settings')
+      }
+      const body = (await res.json()) as { workspace: WorkspaceSettings }
+      setWorkspace(body.workspace)
+      setWorkspaceRoot(body.workspace.workspaceRoot)
+      setSavedMsg('Workspace saved.')
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <section aria-labelledby="workspace-heading" className="rounded-xl border border-border bg-card p-5">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <h2 id="workspace-heading" className="text-lg font-semibold text-foreground">
+          Workspace
+        </h2>
+        {workspace && (
+          <span className="inline-flex h-6 items-center rounded-full bg-gray-100 px-2.5 text-xs font-medium text-gray-700 dark:bg-gray-800 dark:text-gray-300">
+            {workspace.source === 'env' ? 'Environment' : workspace.source === 'setting' ? 'Custom' : 'Default'}
+          </span>
+        )}
+      </div>
+
+      {loading && (
+        <p className="text-sm text-muted-foreground" role="status" aria-live="polite">
+          Loading workspace…
+        </p>
+      )}
+
+      {!loading && fetchError !== null && (
+        <div role="alert" className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          {fetchError}
+          <button onClick={loadWorkspace} className="ml-2 underline underline-offset-2 hover:no-underline">
+            Retry
+          </button>
+        </div>
+      )}
+
+      {!loading && workspace && (
+        <form onSubmit={handleSave} className="flex flex-col gap-4">
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="workspace-root" className="text-sm font-medium text-foreground">
+              Workspace Root
+            </label>
+            <input
+              id="workspace-root"
+              type="text"
+              value={workspaceRoot}
+              onChange={(e) => setWorkspaceRoot(e.target.value)}
+              disabled={workspace.envLocked || saving}
+              autoComplete="off"
+              className="rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-60"
+            />
+          </div>
+
+          <dl className="grid gap-2 text-xs text-muted-foreground">
+            <div>
+              <dt className="font-medium text-foreground">Projects</dt>
+              <dd className="break-all font-mono">{workspace.projectsRoot}</dd>
+            </div>
+            <div>
+              <dt className="font-medium text-foreground">MCPs</dt>
+              <dd className="break-all font-mono">{workspace.mcpsRoot}</dd>
+            </div>
+            <div>
+              <dt className="font-medium text-foreground">Templates</dt>
+              <dd className="break-all font-mono">{workspace.templatesRoot}</dd>
+            </div>
+            <div>
+              <dt className="font-medium text-foreground">Global Settings</dt>
+              <dd className="break-all font-mono">{workspace.globalSettingsPath}</dd>
+            </div>
+          </dl>
+
+          {workspace.envLocked && (
+            <p className="text-xs text-muted-foreground">
+              <code className="font-mono">FORGE_WORKSPACE_ROOT</code> is set for this process.
+            </p>
+          )}
+
+          {actionError !== null && (
+            <p role="alert" className="text-sm text-destructive">{actionError}</p>
+          )}
+          {savedMsg !== null && (
+            <p role="status" aria-live="polite" className="text-sm text-muted-foreground">{savedMsg}</p>
+          )}
+
+          <div>
+            <Button type="submit" size="sm" disabled={saving || workspace.envLocked} aria-busy={saving}>
+              {saving ? 'Saving…' : 'Save Workspace'}
+            </Button>
+          </div>
+        </form>
+      )}
+    </section>
+  )
+}
 
 // ---------------------------------------------------------------------------
 // GitHub connection card
@@ -363,6 +523,7 @@ export default function SettingsPage() {
       </div>
 
       <div className="max-w-2xl flex flex-col gap-6">
+        <WorkspaceCard />
         <GitHubCard />
         <SecurityCard />
       </div>

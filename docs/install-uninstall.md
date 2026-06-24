@@ -128,10 +128,12 @@ run interactively it asks whether to delete them, or you can opt in directly:
 bash scripts/uninstall.sh --remove-data --remove-projects
 ```
 
-This deletes every local project folder Forge created, along with their files.
-Folders are discovered both from `.forge/project-paths` and from the `projects`
-table in the database (so projects created through the web UI are removed too).
-Use `--keep-projects` to skip the prompt and always keep them.
+This deletes recorded project folders that pass Forge's safety check, along
+with their files. Folders are discovered from the workspace runtime registry
+(`~/Documents/Forge/runtime/project-paths` by default), the legacy
+`.forge/project-paths` file, and the `projects` table in the database. Unsafe
+paths are skipped with a warning and may need manual cleanup. Use
+`--keep-projects` to skip the prompt and always keep them.
 
 It still does not remove Homebrew, Linux package managers, Docker
 Desktop/Engine, packages that existed before Forge, or recorded packages that
