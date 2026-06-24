@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { WorkspaceSettings } from '@/lib/workspace'
 import {
   architectCheckpointPaths,
+  readLatestArchitectCheckpointSafely,
   renderArchitectCheckpoint,
   taskCheckpointDirectory,
   writeArchitectCheckpoint,
@@ -165,5 +166,89 @@ describe('worker checkpoints', () => {
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
+  })
+
+  it('returns null when no latest checkpoint exists', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-checkpoint-missing-'))
+    process.env.FORGE_WORKSPACE_ROOT = root
+
+    try {
+      await expect(readLatestArchitectCheckpointSafely('missing-task')).resolves.toBeNull()
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reads the latest checkpoint with a bounded byte limit', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-checkpoint-read-'))
+    process.env.FORGE_WORKSPACE_ROOT = root
+
+    try {
+      await writeArchitectCheckpoint(checkpointInput({
+        planText: 'abcdef',
+      }))
+      const checkpoint = await readLatestArchitectCheckpointSafely(
+        '11111111-1111-1111-1111-111111111111',
+        { maxBytes: 10 },
+      )
+
+      expect(checkpoint).toMatchObject({
+        taskId: '11111111-1111-1111-1111-111111111111',
+        maxBytes: 10,
+        truncated: true,
+      })
+      expect(checkpoint?.originalBytes).toBeGreaterThan(10)
+      expect(Buffer.byteLength(checkpoint?.markdown ?? '')).toBeLessThanOrEqual(10)
+      expect(checkpoint?.latestPath).toContain(path.join('local-memory', 'checkpoints'))
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reads the full checkpoint when it is below the byte limit', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-checkpoint-full-read-'))
+    process.env.FORGE_WORKSPACE_ROOT = root
+
+    try {
+      await writeArchitectCheckpoint(checkpointInput())
+      const checkpoint = await readLatestArchitectCheckpointSafely(
+        '11111111-1111-1111-1111-111111111111',
+        { maxBytes: 50_000 },
+      )
+
+      expect(checkpoint?.truncated).toBe(false)
+      expect(checkpoint?.markdown).toContain('# Forge Checkpoint')
+      expect(checkpoint?.markdown).toContain('## Plan')
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not follow latest checkpoint symlinks outside local memory', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-checkpoint-symlink-'))
+    process.env.FORGE_WORKSPACE_ROOT = root
+
+    try {
+      const secretPath = path.join(root, 'secret-outside-checkpoints.txt')
+      await fs.writeFile(secretPath, 'do not leak this into the model prompt')
+
+      const latestPath = path.join(root, 'local-memory', 'checkpoints', 'tasks', 'symlink-task', 'latest.md')
+      await fs.mkdir(path.dirname(latestPath), { recursive: true })
+      await fs.symlink(secretPath, latestPath)
+
+      await expect(readLatestArchitectCheckpointSafely('symlink-task')).resolves.toBeNull()
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('returns null for invalid read limits', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    await expect(readLatestArchitectCheckpointSafely('task-id', { maxBytes: 0 })).resolves.toBeNull()
+    expect(warn).toHaveBeenCalledWith(
+      '[worker/checkpoints] Invalid Architect checkpoint read limit',
+      expect.objectContaining({ taskId: 'task-id', maxBytes: 0 }),
+    )
   })
 })

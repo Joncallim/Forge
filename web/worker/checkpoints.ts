@@ -1,7 +1,10 @@
+import { constants } from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { getWorkspaceSettings, type WorkspaceSettings } from '../lib/workspace'
 import type { TaskStatus } from './task-state'
+
+export const DEFAULT_ARCHITECT_RESUME_CHECKPOINT_MAX_BYTES = 12_000
 
 type CheckpointKind = 'architect-success' | 'architect-failure' | 'architect-replan'
 type RunStatus = 'completed' | 'failed'
@@ -48,6 +51,16 @@ export type ArchitectCheckpointInput = {
 export type CheckpointWriteResult = {
   runPath: string
   latestPath: string
+}
+
+export type ArchitectResumeCheckpoint = {
+  taskId: string
+  latestPath: string
+  markdown: string
+  originalBytes: number
+  maxBytes: number
+  truncated: boolean
+  loadedAt: Date
 }
 
 function safePathSegment(segment: string): string {
@@ -202,6 +215,66 @@ export async function writeArchitectCheckpointSafely(
       checkpointKind: input.checkpointKind,
       error: message,
     })
+    return null
+  }
+}
+
+export async function readLatestArchitectCheckpointSafely(
+  taskId: string,
+  options: { maxBytes?: number } = {},
+): Promise<ArchitectResumeCheckpoint | null> {
+  const maxBytes = options.maxBytes ?? DEFAULT_ARCHITECT_RESUME_CHECKPOINT_MAX_BYTES
+  if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
+    console.warn('[worker/checkpoints] Invalid Architect checkpoint read limit', {
+      taskId,
+      maxBytes,
+    })
+    return null
+  }
+
+  let latestPath = ''
+  try {
+    const workspace = await getWorkspaceSettings()
+    latestPath = architectCheckpointPaths(workspace, taskId, 'latest').latestPath
+    const taskDir = taskCheckpointDirectory(workspace, taskId)
+    const checkpointRoot = await fs.realpath(workspace.checkpointsRoot)
+    const realTaskDir = await fs.realpath(taskDir)
+    const taskDirRelative = path.relative(checkpointRoot, realTaskDir)
+    if (taskDirRelative.startsWith('..') || path.isAbsolute(taskDirRelative)) return null
+
+    const stat = await fs.lstat(latestPath)
+    if (!stat.isFile() || stat.isSymbolicLink()) return null
+
+    const noFollowFlag = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)
+    const handle = await fs.open(latestPath, noFollowFlag)
+    try {
+      const openedStat = await handle.stat()
+      if (!openedStat.isFile()) return null
+      const readLength = Math.min(openedStat.size, maxBytes)
+      const buffer = Buffer.alloc(readLength)
+      const { bytesRead } = await handle.read(buffer, 0, readLength, 0)
+      return {
+        taskId,
+        latestPath,
+        markdown: buffer.subarray(0, bytesRead).toString('utf-8'),
+        originalBytes: openedStat.size,
+        maxBytes,
+        truncated: openedStat.size > maxBytes,
+        loadedAt: new Date(),
+      }
+    } finally {
+      await handle.close()
+    }
+  } catch (err) {
+    const code = typeof err === 'object' && err !== null && 'code' in err ? (err as { code?: unknown }).code : null
+    if (code !== 'ENOENT') {
+      const message = err instanceof Error ? err.message : String(err)
+      console.warn('[worker/checkpoints] Failed to read Architect resume checkpoint', {
+        taskId,
+        latestPath: latestPath || null,
+        error: message,
+      })
+    }
     return null
   }
 }

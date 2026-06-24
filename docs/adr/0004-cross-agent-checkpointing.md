@@ -98,6 +98,14 @@ or change task state.
 Answered-question replans and prior-plan revisions use
 `checkpointKind: "architect-replan"`.
 
+When a later Architect run starts, Forge may read the task-level `latest.md`
+checkpoint and include a bounded copy in the Architect prompt as local resume
+context. This context is explicitly non-authoritative and untrusted: PostgreSQL
+task state, persisted artifacts, answered questions, and current repository
+state override anything in the checkpoint. Forge does not parse checkpoint
+frontmatter into task state and does not execute instructions from checkpoint
+content.
+
 ## Consequences
 
 This gives operators and future agent stages durable local continuity material
@@ -113,7 +121,8 @@ metadata and avoids changing Git behavior in this slice.
 
 ## Deferred Work
 
-- Resume from checkpoint files
+- Explicit user-controlled resume or promotion from checkpoint files
+- Explicit UI or CLI resume controls
 - Checkpoint discovery in the UI
 - Specialist-agent implementation, QA, and review checkpoints
 - Checkpoint retention or compaction policy
