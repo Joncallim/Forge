@@ -52,6 +52,11 @@ full-screen UI is too much for the first version.
 The TUI should call the same shell-safe operations used by the existing scripts.
 The shell scripts should remain available for automation and recovery.
 
+The broader command taxonomy is reserved in
+[`cli-command-architecture.md`](cli-command-architecture.md). The terminal
+installer should preserve the existing scripts and avoid introducing a global
+`forge` launcher before that architecture is approved.
+
 ## First Milestone
 
 Before building the full TUI, keep improving the current shell scripts:

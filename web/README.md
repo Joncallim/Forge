@@ -56,6 +56,10 @@ npm test                # run unit tests
 npm run build           # production build check
 ```
 
+These npm commands remain canonical until the future global CLI described in
+[../docs/cli-command-architecture.md](../docs/cli-command-architecture.md)
+exists.
+
 ## Task Flow
 
 1. The user creates a task in the browser.

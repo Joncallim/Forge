@@ -65,6 +65,11 @@ This prints the detected OS, package manager, service mode, key tool status,
 GitHub CLI authentication status, and local file readiness. It does not change
 files, install packages, start services, or create databases.
 
+For the planned future command taxonomy, see
+[`cli-command-architecture.md`](cli-command-architecture.md). That document does
+not replace these scripts; `scripts/install.sh` and `scripts/uninstall.sh`
+remain the source of truth.
+
 ## Uninstall Forge
 
 Run this from the repository root on macOS or Linux:

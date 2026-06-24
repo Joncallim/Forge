@@ -344,3 +344,6 @@ FORGE_AGENT_WEB_SEARCH                   # 0 to disable no-key web research cont
 
 - [`specialist-subagents-roadmap.md`](specialist-subagents-roadmap.md) — the
   rollout plan for specialist subagent harnesses.
+- [`cli-command-architecture.md`](cli-command-architecture.md) — the reserved
+  future CLI taxonomy, including how worker commands should route to existing
+  npm workflows.

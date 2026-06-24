@@ -188,6 +188,7 @@ For the migration workflow, see
 - [Worker process notes](docs/worker-process.md)
 - [Specialist subagents roadmap](docs/specialist-subagents-roadmap.md)
 - [Terminal installer plan](docs/terminal-installer-plan.md)
+- [CLI command architecture](docs/cli-command-architecture.md)
 
 ## Current Status
 
