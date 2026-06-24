@@ -1,24 +1,77 @@
 # Dedicated Worker Process
 
-The worker is the part of Forge that does the background work.
+## Plain-English Summary
 
-The browser dashboard creates tasks. The worker picks them up, calls the chosen
-AI model, saves the result, and updates the task status. Without the worker, a
-task can be created but it will stay waiting.
+The worker is the part of Forge that quietly does the work in the background.
 
-Forge should not require a manually started Claude Code session for normal task
-execution. Claude Code can remain useful for development, debugging, or emergency
-manual operation, but the normal path is a dedicated worker process.
+You create a task in the Forge dashboard — "build this feature", "review this
+change". The worker picks that task up, runs the AI on it, saves the result, and
+marks the task done. The dashboard hands work out; the worker gets it done.
 
-## Purpose
+This means Forge keeps running on its own: you don't have to babysit it for your
+tasks to make progress, and a task you create never just vanishes — it waits
+until the worker can get to it.
+
+## Operational Understanding
+
+### Running it locally
+
+For a normal single-user install, you don't run the worker separately. It starts
+automatically inside the Forge web server, so this is enough:
+
+```bash
+cd web
+npm run dev
+```
+
+That one command runs both the dashboard and the worker together. Create a task
+in the dashboard and it will start being worked on.
+
+If you want to turn the embedded worker off, set `FORGE_EMBED_WORKER=0`.
+
+### Running it standalone (split deployments)
+
+For larger or split setups, you can run the worker as its own long-lived process,
+separate from the web app:
+
+```bash
+cd web
+npm run worker
+```
+
+When you do this, set `FORGE_EMBED_WORKER=0` on the web process so you don't end
+up with two workers fighting over the same tasks.
+
+### What happens if it's down
+
+Nothing is lost. If no worker is running, new tasks simply stay in line, waiting.
+The dashboard still records them; they remain `pending` until a worker comes back
+and picks them up. When the worker restarts, it resumes from the waiting line.
+
+The dashboard is the control plane — where work is requested and watched. The
+worker is the execution plane — where work actually happens. The two stay
+loosely coupled, so the dashboard staying up while the worker is down (or vice
+versa) is a normal, safe state.
+
+### Common workflow today
+
+1. You create a task in the dashboard.
+2. The worker picks it up and runs the planning (architect) stage.
+3. The worker produces a Markdown plan and pauses the task for your approval.
+4. You approve it, and the task is marked complete.
+
+Claude Code is still available for development, debugging, or emergency manual
+operation — but it is no longer required for a queued task to start running.
+
+## Technical Details
+
+### Purpose and shape
 
 The worker is the background executor for Forge tasks. It consumes queued work,
 coordinates agent runs, updates task state, emits run events, and integrates with
-GitHub.
+GitHub. The web app is the control plane; the worker is the execution plane.
 
-The web app remains the control plane. The worker remains the execution plane.
-
-## Current State
+### Current state
 
 The web app already enqueues tasks:
 
@@ -26,26 +79,23 @@ The web app already enqueues tasks:
 2. The API pushes `{ taskId }` to Redis list `forge:tasks`.
 3. The task remains `pending` until a worker consumes it.
 
-An initial Orchestrator-stage worker exists. It consumes queued tasks, runs the architect
-planning stage through the configured provider, streams Markdown plan output,
-stores the plan as an artifact, publishes live task events, and moves the task
-to `awaiting_approval`. It also consumes approval jobs from `forge:approvals`
+An initial Orchestrator-stage worker exists. It consumes queued tasks, runs the
+architect planning stage through the configured provider, streams Markdown plan
+output, stores the plan as an artifact, publishes live task events, and moves the
+task to `awaiting_approval`. It also consumes approval jobs from `forge:approvals`
 and marks approved Orchestrator-stage tasks `completed`.
 
-Claude Code can still be used manually for development, debugging, or emergency
-operation, but it is no longer the only path for a queued task to leave
-`pending`.
-
-## Target Runtime
+### Target runtime
 
 For local single-user installs, the worker starts inside the Next.js server
-unless `FORGE_EMBED_WORKER=0` is set. This makes `npm run dev` enough to run the
-dashboard and Orchestrator loop together.
+unless `FORGE_EMBED_WORKER=0` is set, which is why `npm run dev` runs the
+dashboard and Orchestrator loop together. For split deployments, the same worker
+runtime runs as a long-lived Node.js process separate from Next.js (`npm run
+worker`).
 
-For split deployments, the same worker runtime can run as a long-lived Node.js
-process separate from Next.js. The current implementation handles the architect
-planning step; the target pipeline adds repository edits, specialist agents,
-reviews, and GitHub automation:
+The current implementation handles the architect planning step; the target
+pipeline adds repository edits, specialist agents, reviews, and GitHub
+automation:
 
 ```text
 Redis forge:tasks
@@ -59,24 +109,7 @@ Redis forge:tasks
   -> marks task awaiting_approval, completed, failed, or cancelled
 ```
 
-Embedded local command:
-
-```bash
-cd web
-npm run dev
-```
-
-Standalone host command:
-
-```bash
-cd web
-npm run worker
-```
-
-Set `FORGE_EMBED_WORKER=0` for the web process when running a standalone worker
-to avoid duplicate local consumers.
-
-## Worker Responsibilities
+### Worker responsibilities
 
 Current responsibilities:
 
@@ -104,10 +137,10 @@ Future responsibilities:
 - Create branches, commits, and pull requests through GitHub.
 - Enforce cancellation and approval gates.
 
-## Specialist Subagent Harnesses
+### Specialist subagent harnesses
 
-Future orchestration should not rely only on broad fixed roles. The worker
-should be able to run a specialist subagent through a named harness.
+Future orchestration should not rely only on broad fixed roles. The worker should
+be able to run a specialist subagent through a named harness.
 
 A harness defines how a subagent is run:
 
@@ -127,11 +160,11 @@ checklist, not an unstructured chat response.
 The detailed rollout plan lives in
 [`specialist-subagents-roadmap.md`](specialist-subagents-roadmap.md).
 
-## Queue Design
+### Queue design
 
 The existing enqueue path uses Redis list `forge:tasks`. Approval uses
-`forge:approvals`. The worker claims each list with `BRPOPLPUSH` into a
-processing list:
+`forge:approvals`. The worker claims each list with `BRPOPLPUSH` into a processing
+list:
 
 ```text
 forge:tasks -> forge:tasks:processing
@@ -157,7 +190,7 @@ A later version can move to Redis Streams for stronger delivery semantics,
 consumer groups, and replayable job history. A list-based worker is sufficient
 for the first implementation if task state in PostgreSQL remains authoritative.
 
-## State Transitions
+### State transitions
 
 Initial transition set:
 
@@ -175,7 +208,7 @@ pending/running -> cancelled
 The worker should check the current task status before every major step so a
 cancelled task stops promptly.
 
-## Concurrency
+### Concurrency
 
 Start with one worker process and one active task at a time. Add concurrency only
 after the single-task path is reliable.
@@ -189,7 +222,7 @@ FORGE_WORKER_CONCURRENCY=1
 Per-task agent steps can be sequential at first. Parallel specialist agents can
 come later once artifact merging and conflict handling are well-defined.
 
-## Failure Handling
+### Failure handling
 
 Minimum viable behavior:
 
@@ -202,14 +235,13 @@ Implemented hardening:
 
 - Attempt counts are carried in the job payload.
 - Each claim is recorded in `task_attempts`.
-- Retryable task and approval failures move to retry sorted sets with
-  exponential backoff.
-- Permanently failed jobs move to dead-letter queues such as
-  `forge:tasks:dead`.
+- Retryable task and approval failures move to retry sorted sets with exponential
+  backoff.
+- Permanently failed jobs move to dead-letter queues such as `forge:tasks:dead`.
 - Worker startup recovers stale processing-list jobs after
   `FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS`.
 
-## Implemented Orchestrator Scope
+### Implemented orchestrator scope
 
 The current worker implementation is intentionally narrow:
 
@@ -232,40 +264,13 @@ The current worker implementation is intentionally narrow:
 It does not yet execute repository edits, specialist implementation agents, test
 runs, branch creation, commits, or PR creation.
 
-## Implementation Outline
-
-Implemented files:
-
-```text
-web/worker/index.ts
-web/worker/queue.ts
-web/worker/orchestrator.ts
-web/worker/task-state.ts
-web/worker/events.ts
-web/worker/task-attempts.ts
-```
-
-Suggested package scripts:
-
-```json
-{
-  "worker": "tsx worker/index.ts",
-  "worker:dev": "tsx watch worker/index.ts"
-}
-```
-
-The first worker implementation focuses on reliable task claiming, status
-updates, event publishing, and a minimal architect orchestrator. Full multi-agent
-coding automation can be layered on after the queue and lifecycle behavior is
-proven.
-
-## Environment Loading
+### Environment loading
 
 When run from `web/`, the worker loads both the repository-root `.env` and
 `web/.env*` files before importing database, Redis, or provider modules. This
 keeps the host workflow aligned with the root `.env.example`.
 
-## Relationship To Claude Code
+### Relationship to Claude Code
 
 Claude Code is optional. It can help build, inspect, or manually operate Forge,
 but it should not be required for the web interface to execute tasks once the
@@ -282,3 +287,53 @@ Not:
 ```text
 Next.js web app + manually supervised Claude Code session
 ```
+
+## Reference Material
+
+### Implemented files
+
+```text
+web/worker/index.ts
+web/worker/queue.ts
+web/worker/orchestrator.ts
+web/worker/task-state.ts
+web/worker/events.ts
+web/worker/task-attempts.ts
+```
+
+### Package scripts
+
+```json
+{
+  "worker": "tsx worker/index.ts",
+  "worker:dev": "tsx watch worker/index.ts"
+}
+```
+
+### Queue and list names
+
+```text
+forge:tasks               # primary task queue
+forge:tasks:processing    # in-flight task claims
+forge:tasks:retry         # task retry sorted set
+forge:tasks:dead          # task dead-letter list
+forge:approvals           # approval queue
+forge:approvals:processing # in-flight approval claims
+forge:approvals:retry     # approval retry sorted set
+forge:approvals:dead      # approval dead-letter list
+```
+
+### Key environment variables
+
+```text
+FORGE_EMBED_WORKER                       # 0 to disable the embedded worker
+FORGE_WORKER_CONCURRENCY                 # active tasks per worker (start at 1)
+FORGE_WORKER_MAX_ATTEMPTS                # retry ceiling per job
+FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS  # stale processing-job recovery window
+FORGE_AGENT_WEB_SEARCH                   # 0 to disable no-key web research context
+```
+
+### Related docs
+
+- [`specialist-subagents-roadmap.md`](specialist-subagents-roadmap.md) — the
+  rollout plan for specialist subagent harnesses.

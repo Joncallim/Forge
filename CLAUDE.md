@@ -32,6 +32,7 @@ subagent system. Each agent is defined in `.claude/agents/`:
 | Reviewer | `reviewer.md` | Code review, security, perf, correctness |
 | QA | `qa.md` | Test writing, coverage analysis, regression checks |
 | DevOps | `devops.md` | Docker, CI/CD, infra, deployment config |
+| Documentation | `documentation.md` | `docs/` authoring/review, 4-layer pyramid enforcement |
 
 ## Workflow
 
