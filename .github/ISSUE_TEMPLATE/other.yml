@@ -1,0 +1,86 @@
+name: Other
+description: Capture chores, documentation, refactors, research, governance, or uncategorised work
+title: "[OTHER] "
+labels:
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this when the work is not clearly a feature or bug. This includes documentation, technical debt, refactors, research, governance, project setup, and follow-up tasks.
+
+  - type: dropdown
+    id: issue_type
+    attributes:
+      label: Issue Type
+      description: Choose the closest category.
+      options:
+        - Documentation
+        - Technical Debt
+        - Refactor
+        - Research
+        - Governance
+        - Project Setup
+        - Design / UX
+        - Question / Decision Needed
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: What prompted this issue? What background does the agent need?
+      placeholder: "Example: We need a repo-level rule so coding agents refuse incomplete GitHub issues before implementation."
+    validations:
+      required: true
+
+  - type: textarea
+    id: desired_outcome
+    attributes:
+      label: Desired Outcome
+      description: What should be true when this issue is complete?
+    validations:
+      required: true
+
+  - type: textarea
+    id: tasks
+    attributes:
+      label: Tasks
+      description: List the concrete work items.
+      placeholder: |
+        - [ ] Task 1
+        - [ ] Task 2
+        - [ ] Task 3
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance Criteria
+      description: How do we know this issue is complete?
+      placeholder: |
+        - [ ] Outcome is documented or implemented
+        - [ ] Relevant files are updated
+        - [ ] Existing behaviour remains unaffected
+    validations:
+      required: true
+
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: Out of Scope
+      description: What should not be handled in this issue?
+    validations:
+      required: false
+
+  - type: textarea
+    id: technical_notes
+    attributes:
+      label: Technical Notes
+      description: Optional notes, references, links, screenshots, or implementation hints.
+      render: markdown
+    validations:
+      required: false
