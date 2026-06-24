@@ -1,0 +1,106 @@
+name: Bug Report
+description: Report broken, incorrect, or unintended behaviour
+title: "[BUG] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this when FORGE behaves incorrectly. The issue should let an AI coding agent reproduce the problem, understand the expected behaviour, and prove the fix.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Bug Summary
+      description: What is broken?
+      placeholder: "Example: The project dashboard does not refresh after a worker agent completes a task."
+    validations:
+      required: true
+
+  - type: textarea
+    id: current_behaviour
+    attributes:
+      label: Current Behaviour
+      description: What actually happens now?
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_behaviour
+    attributes:
+      label: Expected Behaviour
+      description: What should happen instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction_steps
+    attributes:
+      label: Reproduction Steps
+      description: Provide the shortest reliable path to reproduce the issue.
+      placeholder: |
+        1. Open ...
+        2. Click ...
+        3. Run ...
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Why does this matter? Who or what workflow is affected?
+      placeholder: "Example: Users cannot trust the project dashboard as the source of truth for agent progress."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: Choose the closest severity level.
+      options:
+        - Critical - data loss, security issue, or app unusable
+        - High - major workflow broken
+        - Medium - feature partially broken
+        - Low - minor bug or polish issue
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance Criteria
+      description: How do we know the bug is fixed?
+      placeholder: |
+        - [ ] Bug no longer occurs using the reproduction steps above
+        - [ ] Expected behaviour is restored
+        - [ ] Regression test or validation step is included
+        - [ ] Existing related behaviour remains unaffected
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Add OS, browser, runtime, branch, commit, deployment, or logs where relevant.
+      placeholder: |
+        - OS:
+        - Browser:
+        - Branch/commit:
+        - Deployment:
+        - Logs:
+    validations:
+      required: false
+
+  - type: textarea
+    id: technical_notes
+    attributes:
+      label: Technical Notes
+      description: Optional debugging notes, suspected files, screenshots, or references.
+      render: markdown
+    validations:
+      required: false
