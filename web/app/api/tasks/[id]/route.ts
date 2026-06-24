@@ -59,6 +59,7 @@ export async function GET(
         .select()
         .from(artifacts)
         .where(inArray(artifacts.agentRunId, runIds))
+        .orderBy(asc(artifacts.createdAt))
     }
 
     return NextResponse.json({ task, runs, artifacts: taskArtifacts, attempts, questions })

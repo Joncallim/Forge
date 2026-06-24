@@ -106,6 +106,7 @@ export async function GET(
           .select()
           .from(artifacts)
           .where(inArray(artifacts.agentRunId, runIds))
+          .orderBy(asc(artifacts.createdAt))
 
         for (const artifact of existingArtifacts) {
           sendSnapshotEvent('artifact:created', {
@@ -115,6 +116,7 @@ export async function GET(
             artifactType: artifact.artifactType,
             content: artifact.content,
             metadata: artifact.metadata,
+            createdAt: artifact.createdAt,
           })
         }
 

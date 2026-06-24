@@ -11,8 +11,9 @@ import {
   buildWebResearchContext,
   detectSoftwareProfile,
 } from './architect-context'
-import { parseOpenQuestions, type OpenQuestion } from './open-questions'
-import { parseAgentBreakdown } from './agent-breakdown'
+import type { OpenQuestion } from './open-questions'
+import { getProjectMcpOverview } from '../lib/mcps/manager'
+import { prepareArchitectArtifact } from './architect-artifact'
 
 type TaskRow = typeof tasks.$inferSelect
 type ProjectRow = typeof projects.$inferSelect
@@ -118,6 +119,18 @@ function buildArchitectPrompt(
     '- Prefer concrete, repository-specific guidance: name the actual files, directories, or modules the implementer should create or change. If the repository or local folder above is configured, base your file references on it; if it is not, say so and keep paths illustrative.',
     '- After the Markdown plan, append a fenced code block tagged exactly `agent_breakdown_json` containing a single JSON object of the shape `{"agents":[{"role":"Frontend","tasks":2,"summary":"Build task page UI and state handling","steps":["Build the task list component","Wire up state handling"]}]}`. Derive this from the [Role] assignments in the task breakdown. Each agent\'s `steps` should be a short array of 1-2 sentence imperative strings, one per individual task assigned to that agent — specific enough to stand alone, not just a restatement of `summary`. Use an empty array only if the plan truly assigns no worker tasks.',
     '',
+    'MCP execution design:',
+    '- If the task would benefit from project MCP access, recommend the minimum MCP capabilities for the affected agents or workforce.',
+    '- Treat MCP access as a proposal only: Forge validates it and does not currently issue runtime MCP tools from this plan.',
+    '- Use only known MCP ids unless the task explicitly requires a future MCP: `filesystem`, `github`.',
+    '- Prefer static capability strings such as `filesystem.project.read`, `filesystem.project.write`, `github.issues.read`, `github.pull_requests.read`, and `github.contents.write`.',
+    '- Required unavailable MCPs should declare a fallback with action `block` or `ask_user`; optional unavailable MCPs should declare `continue_without_mcp` where reasonable.',
+    '- After the agent breakdown block, append a fenced code block tagged exactly `mcp_execution_design_json` containing a single JSON object of this shape:',
+    '```json',
+    '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Inspect issue context and repository state.","assignment":{"type":"agent","targetAgents":["backend"],"targetId":null},"agentPermissions":{"backend":["github.issues.read","github.contents.write"]},"prohibitedCapabilities":["github.pull_requests.merge"],"fallback":{"action":"ask_user","message":"Connect GitHub before implementation."}}],"promptOverlays":{"backend":"Use GitHub MCP only for the approved repository and issue context. Do not merge pull requests."},"mcpAwareSubtasks":[{"id":"inspect-repository","agent":"backend","dependsOn":[],"mcpCapabilities":["github.issues.read"],"inputs":["Task prompt"],"outputs":["Repository context"],"verification":["Relevant files identified"],"stoppingCondition":"Repository context is captured.","fallback":"Ask user for repository context manually."}]}',
+    '```',
+    '- Use empty arrays/objects when no MCP access is needed.',
+    '',
     'Open questions:',
     answeredQuestions.length === 0
       ? '- If anything is genuinely ambiguous and a wrong guess would be costly, list it as an open question instead of guessing. Otherwise make the most reasonable assumption and proceed — most tasks should have zero open questions.'
@@ -153,6 +166,10 @@ function mockArchitectPlan(task: TaskRow, project: ProjectRow): string {
     '',
     '```agent_breakdown_json',
     '{"agents":[{"role":"Backend","tasks":2,"summary":"Verify worker routing and persisted planning artifacts"}]}',
+    '```',
+    '',
+    '```mcp_execution_design_json',
+    '{"schemaVersion":1,"requirements":[],"promptOverlays":{},"mcpAwareSubtasks":[]}',
     '```',
     '',
     '```open_questions_json',
@@ -200,6 +217,7 @@ async function createArtifact(
     artifactType: artifact.artifactType,
     content: artifact.content,
     metadata: artifact.metadata,
+    createdAt: artifact.createdAt,
   })
 }
 
@@ -335,15 +353,16 @@ async function runArchitect(
       }
     }
 
-    const { planText: planWithoutQuestions, questions } = parseOpenQuestions(text)
-    const { planText, agents } = parseAgentBreakdown(planWithoutQuestions)
-    await createArtifact(task.id, run.id, planText, {
-      openQuestionCount: questions.length,
+    const mcpOverview = await getProjectMcpOverview(project)
+    const prepared = prepareArchitectArtifact(text, mcpOverview)
+    await createArtifact(task.id, run.id, prepared.planText, {
+      openQuestionCount: prepared.questions.length,
       revisedFromAnswers: answeredQuestions.length > 0,
       revisedFromPlan: previousPlan !== null,
-      agentBreakdown: agents,
+      agentBreakdown: prepared.agents,
+      mcpExecutionDesign: prepared.mcpExecutionDesign,
     })
-    const openQuestionCount = await persistOpenQuestions(task.id, questions)
+    const openQuestionCount = await persistOpenQuestions(task.id, prepared.questions)
 
     const completedAt = new Date()
     await db

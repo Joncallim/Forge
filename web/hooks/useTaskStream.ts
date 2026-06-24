@@ -48,6 +48,18 @@ interface UseTaskStreamResult {
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'rejected'])
 
+export function artifactFromStreamEventData(data: unknown): Artifact {
+  const value = data as Record<string, unknown>
+  return {
+    id: typeof value.id === 'string' ? value.id : value.artifactId as string,
+    agentRunId: value.agentRunId as string,
+    artifactType: value.artifactType as string,
+    content: value.content as string,
+    metadata: value.metadata ?? null,
+    createdAt: typeof value.createdAt === 'string' ? value.createdAt : undefined,
+  }
+}
+
 export function useTaskStream(taskId: string): UseTaskStreamResult {
   const [runs, setRuns] = useState<AgentRun[]>([])
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
@@ -179,13 +191,7 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
     es.addEventListener('artifact:created', (e) => {
       try {
         const data = JSON.parse((e as MessageEvent).data)
-        const artifact: Artifact = {
-          id: data.id ?? data.artifactId,
-          agentRunId: data.agentRunId,
-          artifactType: data.artifactType,
-          content: data.content,
-          metadata: data.metadata ?? null,
-        }
+        const artifact = artifactFromStreamEventData(data)
         setArtifacts((prev) => {
           if (prev.some((a) => a.id === artifact.id)) return prev
           return [...prev, artifact]

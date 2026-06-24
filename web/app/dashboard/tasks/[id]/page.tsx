@@ -12,6 +12,7 @@ import {
   CircleAlertIcon,
   UsersIcon,
   ListIcon,
+  ShieldCheckIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -27,6 +28,10 @@ import { PlanDiffView } from '@/components/PlanDiffView'
 import { useTaskStream } from '@/hooks/useTaskStream'
 import type { AgentRun, Artifact, TaskQuestion } from '@/hooks/useTaskStream'
 import { stripKnownFences } from '@/lib/plan-fences'
+import {
+  latestMcpExecutionDesignFromArtifacts,
+  type McpExecutionDesignMetadata,
+} from '@/lib/mcps/execution-design-metadata'
 
 interface Task {
   id: string
@@ -738,6 +743,131 @@ function PlannedAgentsPanel({ agents }: { agents: PlannedAgent[] }) {
   )
 }
 
+function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | null }) {
+  if (!design) return null
+
+  const proposed = design.proposed
+  const requirements = proposed?.requirements ?? []
+  const overlayCount = proposed ? Object.keys(proposed.promptOverlays).length : 0
+  const subtaskCount = proposed?.mcpAwareSubtasks.length ?? 0
+  const statusVariant: StatusVariant =
+    design.validation.status === 'blocked'
+      ? 'destructive'
+      : design.validation.status === 'warnings'
+        ? 'outline'
+        : 'secondary'
+
+  return (
+    <section aria-labelledby="mcp-access-plan-heading" className="rounded-lg border border-border p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <h2 id="mcp-access-plan-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
+          MCP Access Plan
+        </h2>
+        <Badge variant={statusVariant}>{statusLabel(design.validation.status)}</Badge>
+      </div>
+
+      <div className="mb-3 flex items-start gap-2 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+        <ShieldCheckIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+        <p>
+          Planning recommendation only. Runtime MCP tool issuance and enforcement are not implemented yet.
+        </p>
+      </div>
+
+      {design.validation.blocked.length > 0 && (
+        <div role="alert" className="mb-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          <p className="font-medium">Blocked recommendations</p>
+          <ul className="mt-1 list-disc pl-4">
+            {design.validation.blocked.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {design.validation.warnings.length > 0 && (
+        <div className="mb-3 rounded-lg border border-amber-300/40 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-700/40 dark:bg-amber-950/30 dark:text-amber-200">
+          <p className="font-medium">Warnings</p>
+          <ul className="mt-1 list-disc pl-4">
+            {design.validation.warnings.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {requirements.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          The Architect did not request MCP-backed execution for this plan.
+        </p>
+      ) : (
+        <ul className="flex flex-col gap-3" aria-label="MCP requirements">
+          {requirements.map((requirement, index) => {
+            const permissionEntries = Object.entries(requirement.agentPermissions)
+            return (
+              <li key={`${requirement.mcpId}-${requirement.assignment.type}-${index}`} className="border-t border-border pt-3 first:border-t-0 first:pt-0">
+                <div className="mb-1 flex flex-wrap items-center gap-2">
+                  <p className="text-sm font-medium text-foreground">{requirement.mcpId}</p>
+                  <Badge variant={requirement.requirement === 'required' ? 'outline' : 'secondary'}>
+                    {requirement.requirement}
+                  </Badge>
+                </div>
+                {requirement.reason && (
+                  <p className="text-sm text-muted-foreground">{requirement.reason}</p>
+                )}
+                <dl className="mt-2 grid gap-1 text-xs text-muted-foreground">
+                  <div>
+                    <dt className="font-medium text-foreground">Assignment</dt>
+                    <dd>
+                      {requirement.assignment.type}
+                      {requirement.assignment.targetAgents.length > 0 ? ` · ${requirement.assignment.targetAgents.join(', ')}` : ''}
+                      {requirement.assignment.targetId ? ` · ${requirement.assignment.targetId}` : ''}
+                    </dd>
+                  </div>
+                  {permissionEntries.length > 0 && (
+                    <div>
+                      <dt className="font-medium text-foreground">Planned Capabilities</dt>
+                      <dd>
+                        {permissionEntries.map(([agent, permissions]) => (
+                          <span key={agent} className="block">
+                            {agent}: {permissions.join(', ')}
+                          </span>
+                        ))}
+                      </dd>
+                    </div>
+                  )}
+                  {requirement.prohibitedCapabilities.length > 0 && (
+                    <div>
+                      <dt className="font-medium text-foreground">Prohibited</dt>
+                      <dd>{requirement.prohibitedCapabilities.join(', ')}</dd>
+                    </div>
+                  )}
+                  <div>
+                    <dt className="font-medium text-foreground">Fallback</dt>
+                    <dd>{requirement.fallback.action}: {requirement.fallback.message}</dd>
+                  </div>
+                </dl>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+
+      {(overlayCount > 0 || subtaskCount > 0) && (
+        <dl className="mt-3 grid gap-1 border-t border-border pt-3 text-xs text-muted-foreground">
+          <div>
+            <dt className="font-medium text-foreground">Prompt Overlays</dt>
+            <dd>{overlayCount}</dd>
+          </div>
+          <div>
+            <dt className="font-medium text-foreground">MCP-aware Subtasks</dt>
+            <dd>{subtaskCount}</dd>
+          </div>
+        </dl>
+      )}
+    </section>
+  )
+}
+
 function TaskAttemptRow({ attempt, runs }: { attempt: TaskAttempt; runs: AgentRun[] }) {
   const variant: StatusVariant =
     attempt.status === 'completed'
@@ -963,6 +1093,7 @@ export default function TaskDetailPage() {
 
   const isAwaitingApproval = (currentStatus ?? task.status) === 'awaiting_approval'
   const plannedAgents = plannedAgentsFromArtifacts(mergedArtifacts)
+  const mcpExecutionDesign = latestMcpExecutionDesignFromArtifacts(mergedArtifacts)
 
   const adrArtifacts = mergedArtifacts.filter((artifact) => artifact.artifactType === 'adr_text')
   const otherArtifacts = mergedArtifacts.filter((artifact) => artifact.artifactType !== 'adr_text')
@@ -1212,6 +1343,7 @@ export default function TaskDetailPage() {
 
         <aside className="flex min-w-0 flex-col gap-6">
           <PlannedAgentsPanel agents={plannedAgents} />
+          <McpAccessPlanPanel design={mcpExecutionDesign} />
 
           {/* Open questions — answer before the plan can be approved */}
           {mergedQuestions.length > 0 && (

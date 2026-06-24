@@ -255,6 +255,13 @@ The current worker implementation is intentionally narrow:
 - Creates an architect `agent_runs` row.
 - Calls the configured provider through the AI SDK.
 - Stores the generated plan as an `adr_text` artifact.
+- Stores the Architect's proposed MCP execution design in the plan artifact
+  metadata, including requested MCPs, assigned agents, planned capabilities,
+  prompt overlays, MCP-aware subtasks, and validation against current project
+  MCP health.
+- Shows the MCP execution design as a read-only planning recommendation. Runtime
+  MCP tool issuance, user-edited grants, and tool-call audit records are not
+  implemented yet.
 - Publishes `run:*`, `artifact:created`, and `task:status` events for the task
   detail page.
 - Marks the task `awaiting_approval` on success or `failed` on unrecoverable

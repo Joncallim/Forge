@@ -20,6 +20,7 @@
  */
 
 export const AGENT_BREAKDOWN_FENCE = 'agent_breakdown_json'
+export const MCP_EXECUTION_DESIGN_FENCE = 'mcp_execution_design_json'
 export const OPEN_QUESTIONS_FENCE = 'open_questions_json'
 
 // Case-insensitive tag match, tolerant of trailing whitespace before the
@@ -35,6 +36,7 @@ function fenceRegex(tag: string): RegExp {
 const GENERIC_JSON_FENCE_REGEX = /```(?:json)?[ \t]*\n([\s\S]*?)[ \t]*\n?[ \t]*```/gi
 
 const AGENT_BREAKDOWN_REGEX = fenceRegex(AGENT_BREAKDOWN_FENCE)
+const MCP_EXECUTION_DESIGN_REGEX = fenceRegex(MCP_EXECUTION_DESIGN_FENCE)
 const OPEN_QUESTIONS_REGEX = fenceRegex(OPEN_QUESTIONS_FENCE)
 
 export interface FenceMatch {
@@ -104,6 +106,18 @@ export function isOpenQuestionsShape(parsed: unknown): boolean {
   )
 }
 
+export function isMcpExecutionDesignShape(parsed: unknown): boolean {
+  if (typeof parsed !== 'object' || parsed === null) return false
+  const value = parsed as { schemaVersion?: unknown; requirements?: unknown; promptOverlays?: unknown; mcpAwareSubtasks?: unknown }
+  return (
+    value.schemaVersion === 1 &&
+    Array.isArray(value.requirements) &&
+    typeof value.promptOverlays === 'object' &&
+    value.promptOverlays !== null &&
+    Array.isArray(value.mcpAwareSubtasks)
+  )
+}
+
 /**
  * Removes any `agent_breakdown_json` and `open_questions_json` fenced code
  * blocks from `text`, regardless of order or whether either is present.
@@ -115,11 +129,17 @@ export function isOpenQuestionsShape(parsed: unknown): boolean {
 export function stripKnownFences(text: string): string {
   let result = text
     .replace(AGENT_BREAKDOWN_REGEX, '')
+    .replace(MCP_EXECUTION_DESIGN_REGEX, '')
     .replace(OPEN_QUESTIONS_REGEX, '')
 
   const agentBreakdownFallback = findFence(result, AGENT_BREAKDOWN_REGEX, isAgentBreakdownShape)
   if (agentBreakdownFallback) {
     result = result.replace(agentBreakdownFallback.fullMatch, '')
+  }
+
+  const mcpExecutionDesignFallback = findFence(result, MCP_EXECUTION_DESIGN_REGEX, isMcpExecutionDesignShape)
+  if (mcpExecutionDesignFallback) {
+    result = result.replace(mcpExecutionDesignFallback.fullMatch, '')
   }
 
   const openQuestionsFallback = findFence(result, OPEN_QUESTIONS_REGEX, isOpenQuestionsShape)
