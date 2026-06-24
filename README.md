@@ -59,6 +59,11 @@ The installer:
 The first run can be slow because Homebrew, npm, or AI models may need to
 download files.
 
+If the install is interrupted or a later step fails, re-run
+`bash scripts/install.sh`; the installer preserves existing settings and
+resumes idempotent setup steps. Detailed installer output is saved to
+`.forge/install.log`.
+
 To skip the local Ollama model and configure AI providers later:
 
 ```bash

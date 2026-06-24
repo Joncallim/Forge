@@ -1361,9 +1361,17 @@ print_summary() {
     cd web && npm run dev
 
   Then open http://localhost:3000 and create the first account.
+  For password-only first sign-in, set FORGE_PASSKEYS_ENABLED=0 in .env before
+  creating that account.
   The web app starts the task worker automatically. Set FORGE_EMBED_WORKER=0
   and run "cd web && npm run worker" separately if you want split processes.
   The first account creates a password and, when enabled, a passkey.
+
+  Recovery:
+    - Check readiness any time with: bash scripts/install.sh --check
+    - If setup was interrupted or failed, re-run: bash scripts/install.sh
+    - Detailed install log: $INSTALL_LOG
+
   For repository tooling, confirm GitHub CLI access with:
 
     gh auth status
