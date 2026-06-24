@@ -449,10 +449,23 @@ describe('GET/PUT /api/settings/workspace', () => {
       await expect(fs.stat(path.join(workspaceRoot, 'projects'))).resolves.toMatchObject({})
       const globalSettings = JSON.parse(
         await fs.readFile(path.join(workspaceRoot, 'global-settings.json'), 'utf-8'),
-      ) as { workspaceRoot: string; projectsRoot: string; mcpsRoot: string; templatesRoot: string }
+      ) as {
+        workspaceRoot: string
+        projectsRoot: string
+        mcpsRoot: string
+        templatesRoot: string
+        localMemoryRoot: string
+        checkpointsRoot: string
+      }
       expect(globalSettings.projectsRoot).toMatch(/\/projects$/)
       expect(globalSettings.mcpsRoot).toMatch(/\/mcps$/)
       expect(globalSettings.templatesRoot).toMatch(/\/templates$/)
+      expect(globalSettings.localMemoryRoot).toMatch(/\/local-memory$/)
+      expect(globalSettings.checkpointsRoot).toMatch(/\/local-memory\/checkpoints$/)
+      await expect(fs.stat(path.join(workspaceRoot, 'local-memory', 'checkpoints'))).resolves.toMatchObject({})
+      await expect(fs.readFile(path.join(workspaceRoot, 'local-memory', '.gitignore'), 'utf-8')).resolves.toBe(
+        '*\n!.gitignore\n',
+      )
     } finally {
       if (previousRoot === undefined) {
         delete process.env.FORGE_WORKSPACE_ROOT

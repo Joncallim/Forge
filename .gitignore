@@ -1,5 +1,6 @@
 .DS_Store
 .forge/
+local-memory/
 
 # Local agent worktrees (scratch checkouts created during development)
 .claude/worktrees/

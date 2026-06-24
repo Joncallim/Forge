@@ -5,7 +5,7 @@ import { agentConfigs, agentRuns, artifacts, projects, taskQuestions, tasks } fr
 import { getProvider } from '../lib/providers/registry'
 import { and, desc, eq } from 'drizzle-orm'
 import { publishTaskEvent } from './events'
-import { updateTaskStatus, updateTaskStatusIfCurrent } from './task-state'
+import { updateTaskStatus, updateTaskStatusIfCurrent, type TaskStatus } from './task-state'
 import {
   buildSpecialistContext,
   buildWebResearchContext,
@@ -14,6 +14,10 @@ import {
 import type { OpenQuestion } from './open-questions'
 import { getProjectMcpOverview } from '../lib/mcps/manager'
 import { prepareArchitectArtifact } from './architect-artifact'
+import {
+  writeArchitectCheckpointSafely,
+  type ArchitectCheckpointInput,
+} from './checkpoints'
 
 type TaskRow = typeof tasks.$inferSelect
 type ProjectRow = typeof projects.$inferSelect
@@ -21,8 +25,26 @@ type AgentConfigRow = typeof agentConfigs.$inferSelect
 
 const ARCHITECT_AGENT = 'architect'
 
+type PendingArchitectCheckpoint = Omit<ArchitectCheckpointInput, 'taskStatus'>
+
+class ArchitectRunFailedError extends Error {
+  readonly checkpoint: PendingArchitectCheckpoint
+  readonly cause: unknown
+
+  constructor(cause: unknown, checkpoint: PendingArchitectCheckpoint) {
+    super(errorMessage(cause))
+    this.name = 'ArchitectRunFailedError'
+    this.cause = cause
+    this.checkpoint = checkpoint
+  }
+}
+
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
+}
+
+function architectCheckpointFromError(err: unknown): PendingArchitectCheckpoint | null {
+  return err instanceof ArchitectRunFailedError ? err.checkpoint : null
 }
 
 async function loadTaskContext(taskId: string): Promise<{ task: TaskRow; project: ProjectRow } | null> {
@@ -209,7 +231,7 @@ async function createArtifact(
   agentRunId: string,
   content: string,
   metadataExtra: Record<string, unknown> = {},
-): Promise<void> {
+): Promise<typeof artifacts.$inferSelect> {
   const [artifact] = await db
     .insert(artifacts)
     .values({
@@ -233,6 +255,8 @@ async function createArtifact(
     metadata: artifact.metadata,
     createdAt: artifact.createdAt,
   })
+
+  return artifact
 }
 
 /**
@@ -282,7 +306,7 @@ async function runArchitect(
   task: TaskRow,
   project: ProjectRow,
   answeredQuestions: AnsweredQuestion[] = [],
-): Promise<{ openQuestionCount: number }> {
+): Promise<{ openQuestionCount: number; checkpoint: PendingArchitectCheckpoint }> {
   const config = await loadAgentConfig(ARCHITECT_AGENT)
   if (!config) {
     throw new Error('Architect agent config is missing')
@@ -322,8 +346,9 @@ async function runArchitect(
     startedAt: startedAt.toISOString(),
   })
 
+  let text = ''
+
   try {
-    let text = ''
     let usage = { inputTokens: 0, outputTokens: 0 }
 
     if (process.env.FORGE_WORKER_MOCK_ARCHITECT === '1') {
@@ -369,7 +394,7 @@ async function runArchitect(
 
     const mcpOverview = await getProjectMcpOverview(project)
     const prepared = prepareArchitectArtifact(text, mcpOverview)
-    await createArtifact(task.id, run.id, prepared.planText, {
+    const artifact = await createArtifact(task.id, run.id, prepared.planText, {
       openQuestionCount: prepared.questions.length,
       revisedFromAnswers: answeredQuestions.length > 0,
       revisedFromPlan: previousPlan !== null,
@@ -398,7 +423,29 @@ async function runArchitect(
       completedAt: completedAt.toISOString(),
     })
 
-    return { openQuestionCount }
+    const checkpoint: PendingArchitectCheckpoint = {
+      task,
+      project,
+      run: {
+        id: run.id,
+        agentType: ARCHITECT_AGENT,
+        modelIdUsed: providerResult.config.modelId,
+        startedAt,
+        completedAt,
+      },
+      checkpointKind: answeredQuestions.length > 0 || previousPlan !== null
+        ? 'architect-replan'
+        : 'architect-success',
+      runStatus: 'completed',
+      artifactId: artifact.id,
+      openQuestionCount,
+      openQuestions: prepared.questions.map((question) => question.question),
+      revisedFromAnswers: answeredQuestions.length > 0,
+      revisedFromPlan: previousPlan !== null,
+      planText: prepared.planText,
+    }
+
+    return { openQuestionCount, checkpoint }
   } catch (err) {
     const message = errorMessage(err)
     const completedAt = new Date()
@@ -418,7 +465,27 @@ async function runArchitect(
       completedAt: completedAt.toISOString(),
     })
 
-    throw err
+    const checkpoint: PendingArchitectCheckpoint = {
+      task,
+      project,
+      run: {
+        id: run.id,
+        agentType: ARCHITECT_AGENT,
+        modelIdUsed: providerResult.config.modelId,
+        startedAt,
+        completedAt,
+      },
+      checkpointKind: 'architect-failure',
+      runStatus: 'failed',
+      openQuestionCount: 0,
+      openQuestions: [],
+      revisedFromAnswers: answeredQuestions.length > 0,
+      revisedFromPlan: previousPlan !== null,
+      errorMessage: message,
+      partialOutput: text,
+    }
+
+    throw new ArchitectRunFailedError(err, checkpoint)
   }
 }
 
@@ -450,19 +517,28 @@ export async function processTask(
       return
     }
 
-    const { openQuestionCount } = await runArchitect(task, project)
+    const { openQuestionCount, checkpoint } = await runArchitect(task, project)
 
     if (await isTaskCancelled(task.id)) {
       return
     }
 
-    await updateTaskStatus(task.id, openQuestionCount > 0 ? 'awaiting_answers' : 'awaiting_approval')
+    const nextStatus: TaskStatus = openQuestionCount > 0 ? 'awaiting_answers' : 'awaiting_approval'
+    await updateTaskStatus(task.id, nextStatus)
+    await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: nextStatus })
   } catch (err) {
     const message = errorMessage(err)
+    const checkpoint = architectCheckpointFromError(err)
     if (options.finalAttempt ?? true) {
       await updateTaskStatus(task.id, 'failed', message)
+      if (checkpoint) {
+        await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: 'failed' })
+      }
     } else if (!(await isTaskCancelled(task.id))) {
       await updateTaskStatus(task.id, 'pending', `Retrying after error: ${message}`)
+      if (checkpoint) {
+        await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: 'pending' })
+      }
     }
     throw err
   }
@@ -520,16 +596,22 @@ export async function processAnsweredQuestions(taskId: string): Promise<void> {
       answer: q.answer ?? '',
     }))
 
-    const { openQuestionCount } = await runArchitect(task, project, answeredQuestions)
+    const { openQuestionCount, checkpoint } = await runArchitect(task, project, answeredQuestions)
 
     if (await isTaskCancelled(taskId)) {
       return
     }
 
-    await updateTaskStatus(taskId, openQuestionCount > 0 ? 'awaiting_answers' : 'awaiting_approval')
+    const nextStatus: TaskStatus = openQuestionCount > 0 ? 'awaiting_answers' : 'awaiting_approval'
+    await updateTaskStatus(taskId, nextStatus)
+    await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: nextStatus })
   } catch (err) {
     const message = errorMessage(err)
+    const checkpoint = architectCheckpointFromError(err)
     await updateTaskStatus(taskId, 'failed', message)
+    if (checkpoint) {
+      await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: 'failed' })
+    }
     throw err
   }
 }

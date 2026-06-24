@@ -14,6 +14,8 @@ export type WorkspaceSettings = {
   projectsRoot: string
   mcpsRoot: string
   templatesRoot: string
+  localMemoryRoot: string
+  checkpointsRoot: string
   globalSettingsPath: string
   source: 'env' | 'setting' | 'default'
   envLocked: boolean
@@ -62,6 +64,8 @@ function settingsForRoot(
     projectsRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'projects'),
     mcpsRoot,
     templatesRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'templates'),
+    localMemoryRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'local-memory'),
+    checkpointsRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'local-memory', 'checkpoints'),
     globalSettingsPath: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'global-settings.json'),
     source,
     envLocked: source === 'env',
@@ -136,6 +140,8 @@ export async function ensureWorkspace(settings: WorkspaceSettings): Promise<void
     fs.mkdir(settings.projectsRoot, { recursive: true }),
     fs.mkdir(settings.mcpsRoot, { recursive: true }),
     fs.mkdir(settings.templatesRoot, { recursive: true }),
+    fs.mkdir(settings.localMemoryRoot, { recursive: true }),
+    fs.mkdir(settings.checkpointsRoot, { recursive: true }),
   ])
 
   const payload = {
@@ -143,7 +149,15 @@ export async function ensureWorkspace(settings: WorkspaceSettings): Promise<void
     projectsRoot: collapseHomePath(settings.projectsRoot),
     mcpsRoot: collapseHomePath(settings.mcpsRoot),
     templatesRoot: collapseHomePath(settings.templatesRoot),
+    localMemoryRoot: collapseHomePath(settings.localMemoryRoot),
+    checkpointsRoot: collapseHomePath(settings.checkpointsRoot),
   }
+
+  await fs.writeFile(
+    path.join(/*turbopackIgnore: true*/ settings.localMemoryRoot, '.gitignore'),
+    '*\n!.gitignore\n',
+    { mode: 0o600 },
+  )
 
   await fs.writeFile(
     settings.globalSettingsPath,
@@ -163,6 +177,8 @@ async function writeDefaultWorkspacePointer(settings: WorkspaceSettings): Promis
     projectsRoot: collapseHomePath(settings.projectsRoot),
     mcpsRoot: collapseHomePath(settings.mcpsRoot),
     templatesRoot: collapseHomePath(settings.templatesRoot),
+    localMemoryRoot: collapseHomePath(settings.localMemoryRoot),
+    checkpointsRoot: collapseHomePath(settings.checkpointsRoot),
   }
   await fs.writeFile(pointerPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 })
 }
