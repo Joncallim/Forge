@@ -1,0 +1,98 @@
+name: Feature Request
+description: Propose a new user-facing capability or product improvement
+title: "[FEATURE] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for new FORGE capabilities. The goal is to make the issue specific enough for an AI coding agent to implement without inventing missing requirements.
+
+  - type: textarea
+    id: problem_statement
+    attributes:
+      label: Problem Statement
+      description: What problem are we solving? Explain the user pain, workflow gap, or product limitation.
+      placeholder: "Example: Users need a way to manage MCP installations across projects without mixing MCP files into each project repository."
+    validations:
+      required: true
+
+  - type: textarea
+    id: desired_outcome
+    attributes:
+      label: Desired Outcome
+      description: What should be true when this is completed?
+      placeholder: "Example: Users can install, view, and reuse MCPs from a shared FORGE-managed location."
+    validations:
+      required: true
+
+  - type: textarea
+    id: user_story
+    attributes:
+      label: User Story
+      description: Frame the feature from the user's perspective.
+      placeholder: |
+        As a FORGE user,
+        I want ...
+        So that ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: requirements
+    attributes:
+      label: Requirements
+      description: List concrete functional requirements. Keep each item testable.
+      placeholder: |
+        - Requirement 1
+        - Requirement 2
+        - Requirement 3
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance Criteria
+      description: These are the implementation contract for Claude Code or any other coding agent.
+      placeholder: |
+        - [ ] User can ...
+        - [ ] System supports ...
+        - [ ] Existing behaviour remains unaffected
+        - [ ] Tests or validation steps are included
+    validations:
+      required: true
+
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: Out of Scope
+      description: What should not be implemented as part of this issue?
+      placeholder: |
+        - Do not change ...
+        - Do not add ...
+    validations:
+      required: false
+
+  - type: dropdown
+    id: implementation_scope
+    attributes:
+      label: Implementation Scope
+      description: Estimate the rough scope for planning.
+      options:
+        - Small - isolated change
+        - Medium - multiple files or components
+        - Large - architecture or workflow change
+        - Unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: technical_notes
+    attributes:
+      label: Technical Notes
+      description: Optional architecture notes, file paths, references, or suggested implementation direction.
+      render: markdown
+    validations:
+      required: false
