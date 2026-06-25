@@ -147,6 +147,12 @@ async function readLines(stream: ReadableStream<Uint8Array>, timeoutMs: number):
   return lines
 }
 
+function dataPayloads(lines: string[]): Array<Record<string, unknown>> {
+  return lines
+    .filter((line) => line.startsWith('data: '))
+    .map((line) => JSON.parse(line.slice('data: '.length)) as Record<string, unknown>)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -209,6 +215,87 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     const lines = await readLines(res.body!, 500)
     expect(lines).toContain('event: task:status')
     expect(lines.join('\n')).toContain('"status":"running"')
+  }, 2000)
+
+  it('includes workPackageId on package-scoped artifact snapshot events', async () => {
+    let selectCount = 0
+    mockDbSelect.mockImplementation(() => {
+      selectCount += 1
+      if (selectCount === 1) return dbChain([fakeTask()])
+      if (selectCount === 2) return dbChain([{ status: fakeTask().status }])
+      if (selectCount === 3) {
+        return dbChain([
+          {
+            id: 'run-package',
+            taskId: 'task-sse-1',
+            workPackageId: 'package-1',
+            agentType: 'handoff',
+            modelIdUsed: 'forge-handoff/no-op',
+            status: 'completed',
+            inputTokens: null,
+            outputTokens: null,
+            costUsd: null,
+            startedAt: new Date('2026-06-25T00:00:00.000Z'),
+            completedAt: new Date('2026-06-25T00:00:01.000Z'),
+            errorMessage: null,
+            createdAt: new Date('2026-06-25T00:00:00.000Z'),
+          },
+          {
+            id: 'run-task',
+            taskId: 'task-sse-1',
+            workPackageId: null,
+            agentType: 'architect',
+            modelIdUsed: 'openrouter/architect',
+            status: 'completed',
+            inputTokens: null,
+            outputTokens: null,
+            costUsd: null,
+            startedAt: new Date('2026-06-25T00:00:02.000Z'),
+            completedAt: new Date('2026-06-25T00:00:03.000Z'),
+            errorMessage: null,
+            createdAt: new Date('2026-06-25T00:00:02.000Z'),
+          },
+        ])
+      }
+      if (selectCount === 4) {
+        return dbChain([
+          {
+            id: 'artifact-package',
+            agentRunId: 'run-package',
+            artifactType: 'log_output',
+            content: 'Package handoff summary.',
+            metadata: {},
+            createdAt: new Date('2026-06-25T00:00:01.000Z'),
+          },
+          {
+            id: 'artifact-task',
+            agentRunId: 'run-task',
+            artifactType: 'adr_text',
+            content: 'Task-level plan.',
+            metadata: {},
+            createdAt: new Date('2026-06-25T00:00:03.000Z'),
+          },
+        ])
+      }
+      return dbChain([])
+    })
+
+    const { GET } = await import('@/app/api/tasks/[id]/runs/route')
+    const params = Promise.resolve({ id: 'task-sse-1' })
+    const res = await GET(sseRequest() as never, { params })
+
+    const lines = await readLines(res.body!, 500)
+    const artifactPayloads = dataPayloads(lines).filter((payload) => payload.artifactType)
+    expect(artifactPayloads).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'artifact-package',
+        workPackageId: 'package-1',
+      }),
+      expect.objectContaining({
+        id: 'artifact-task',
+      }),
+    ]))
+    expect(artifactPayloads.find((payload) => payload.id === 'artifact-task')).not.toHaveProperty('workPackageId')
   }, 2000)
 
   it('emits event: run:started within 500ms when a run:started message is published', async () => {

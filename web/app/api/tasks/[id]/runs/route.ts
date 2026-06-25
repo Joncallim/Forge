@@ -100,6 +100,11 @@ export async function GET(
         }
 
         const runIds = runs.map((run) => run.id)
+        const workPackageIdByRunId = new Map(
+          runs
+            .filter((run) => typeof run.workPackageId === 'string' && run.workPackageId.length > 0)
+            .map((run) => [run.id, run.workPackageId as string]),
+        )
         if (runIds.length === 0) return
 
         const existingArtifacts = await db
@@ -117,6 +122,7 @@ export async function GET(
             content: artifact.content,
             metadata: artifact.metadata,
             createdAt: artifact.createdAt,
+            workPackageId: workPackageIdByRunId.get(artifact.agentRunId),
           })
         }
 

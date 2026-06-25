@@ -24,6 +24,7 @@ export interface Artifact {
   content: string
   metadata: unknown
   createdAt?: string
+  workPackageId?: string
 }
 
 export interface TaskQuestion {
@@ -51,14 +52,28 @@ const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'rejected
 
 export function artifactFromStreamEventData(data: unknown): Artifact {
   const value = data as Record<string, unknown>
+  const metadata = value.metadata ?? null
+  const metadataWorkPackageId = (
+    typeof metadata === 'object' &&
+    metadata !== null &&
+    !Array.isArray(metadata) &&
+    typeof (metadata as Record<string, unknown>).workPackageId === 'string'
+  )
+    ? (metadata as Record<string, unknown>).workPackageId as string
+    : undefined
   return {
     id: typeof value.id === 'string' ? value.id : value.artifactId as string,
     agentRunId: value.agentRunId as string,
     artifactType: value.artifactType as string,
     content: value.content as string,
-    metadata: value.metadata ?? null,
+    metadata,
     createdAt: typeof value.createdAt === 'string' ? value.createdAt : undefined,
+    workPackageId: typeof value.workPackageId === 'string' ? value.workPackageId : metadataWorkPackageId,
   }
+}
+
+export function shouldRefreshTaskDetailsForArtifact(artifact: Artifact): boolean {
+  return typeof artifact.workPackageId === 'string' && artifact.workPackageId.length > 0
 }
 
 export function useTaskStream(taskId: string): UseTaskStreamResult {
@@ -202,6 +217,9 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
           if (prev.some((a) => a.id === artifact.id)) return prev
           return [...prev, artifact]
         })
+        if (shouldRefreshTaskDetailsForArtifact(artifact)) {
+          requestDetailRefresh()
+        }
       } catch {
         // Ignore malformed event
       }
