@@ -1843,13 +1843,13 @@ describe('GET /api/projects/:id — 404 when project not found', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Suite 3.3 — Task status guard: DELETE /api/tasks/:id returns 409 when status is 'running'
+// Suite 3.3 — Task details include package-scoped artifacts
 // ---------------------------------------------------------------------------
 
-describe('DELETE /api/tasks/:id — 409 when status is running', () => {
+describe('GET /api/tasks/:id — task details', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
-  it('hydrates work-package harness prompts in task details', async () => {
+  it('hydrates work-package harness prompts and package-scoped artifacts in task details', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const task = {
       id: 'task-work-packages',
@@ -1884,20 +1884,99 @@ describe('DELETE /api/tasks/:id — 409 when status is running', () => {
       createdAt: new Date(),
       updatedAt: new Date(),
     }
+    const qaWorkPackage = {
+      ...workPackage,
+      id: 'package-2',
+      harnessId: 'harness-2',
+      title: 'QA verification',
+      sequence: 2,
+      metadata: {
+        promptOverlay: 'Verify the Providers list after local detection.',
+      },
+    }
+    const packageRun = {
+      id: 'run-1',
+      taskId: task.id,
+      workPackageId: 'package-1',
+      harnessId: 'harness-1',
+      agentType: 'handoff',
+      stage: 'handoff',
+      attemptNumber: 1,
+      providerConfigId: null,
+      modelIdUsed: 'forge-handoff/no-op',
+      status: 'completed',
+      inputTokens: null,
+      outputTokens: null,
+      costUsd: null,
+      startedAt: new Date(),
+      completedAt: new Date(),
+      errorMessage: null,
+      createdAt: new Date(),
+    }
+    const qaPackageRun = {
+      ...packageRun,
+      id: 'run-2',
+      workPackageId: 'package-2',
+      harnessId: 'harness-2',
+      agentType: 'qa',
+      modelIdUsed: 'openrouter/test',
+    }
+    const taskLevelRun = {
+      ...packageRun,
+      id: 'run-task',
+      workPackageId: null,
+      harnessId: null,
+      agentType: 'architect',
+      stage: 'planning',
+      modelIdUsed: 'openrouter/architect',
+    }
+    const packageArtifact = {
+      id: 'artifact-1',
+      agentRunId: 'run-1',
+      artifactType: 'log_output',
+      content: 'Package handoff summary.',
+      metadata: { repositoryWrites: false },
+      createdAt: new Date(),
+    }
+    const qaPackageArtifact = {
+      id: 'artifact-2',
+      agentRunId: 'run-2',
+      artifactType: 'test_report',
+      content: 'Package QA summary.',
+      metadata: { repositoryWrites: false },
+      createdAt: new Date(),
+    }
+    const taskLevelArtifact = {
+      id: 'artifact-task',
+      agentRunId: 'run-task',
+      artifactType: 'adr_text',
+      content: 'Task-level plan.',
+      metadata: { revision: 1 },
+      createdAt: new Date(),
+    }
     mockDbSelect
       .mockReturnValueOnce(chain([task]))
+      .mockReturnValueOnce(chain([packageRun, qaPackageRun, taskLevelRun]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([packageArtifact, qaPackageArtifact, taskLevelArtifact]))
+      .mockReturnValueOnce(chain([workPackage, qaWorkPackage]))
       .mockReturnValueOnce(chain([]))
-      .mockReturnValueOnce(chain([workPackage]))
       .mockReturnValueOnce(chain([]))
-      .mockReturnValueOnce(chain([]))
-      .mockReturnValueOnce(chain([{
-        id: 'harness-1',
-        role: 'frontend',
-        displayName: 'Frontend',
-        description: 'Dashboard UI specialist.',
-      }]))
+      .mockReturnValueOnce(chain([
+        {
+          id: 'harness-1',
+          role: 'frontend',
+          displayName: 'Frontend',
+          description: 'Dashboard UI specialist.',
+        },
+        {
+          id: 'harness-2',
+          role: 'qa',
+          displayName: 'QA',
+          description: 'Regression specialist.',
+        },
+      ]))
 
     const { GET } = await import('@/app/api/tasks/[id]/route')
     const res = await GET(authRequest(`/api/tasks/${task.id}`) as never, {
@@ -1912,8 +1991,42 @@ describe('DELETE /api/tasks/:id — 409 when status is running', () => {
       harnessDisplayName: 'Frontend',
       harnessDescription: 'Dashboard UI specialist.',
       promptOverlay: 'Keep the Providers list synced after local detection.',
+      artifacts: [{
+        id: 'artifact-1',
+        agentRunId: 'run-1',
+        artifactType: 'log_output',
+        content: 'Package handoff summary.',
+      }],
+    }, {
+      id: 'package-2',
+      harnessRole: 'qa',
+      harnessDisplayName: 'QA',
+      harnessDescription: 'Regression specialist.',
+      promptOverlay: 'Verify the Providers list after local detection.',
+      artifacts: [{
+        id: 'artifact-2',
+        agentRunId: 'run-2',
+        artifactType: 'test_report',
+        content: 'Package QA summary.',
+      }],
     }])
+    expect(body.artifacts.map((artifact: { id: string }) => artifact.id)).toEqual([
+      'artifact-1',
+      'artifact-2',
+      'artifact-task',
+    ])
+    expect(body.workPackages.flatMap(
+      (pkg: { artifacts: Array<{ id: string }> }) => pkg.artifacts.map((artifact) => artifact.id),
+    )).toEqual(['artifact-1', 'artifact-2'])
   })
+})
+
+// ---------------------------------------------------------------------------
+// Suite 3.4 — Task status guard: DELETE /api/tasks/:id returns 409 when status is 'running'
+// ---------------------------------------------------------------------------
+
+describe('DELETE /api/tasks/:id — 409 when status is running', () => {
+  beforeEach(() => { vi.clearAllMocks() })
 
   it('returns 409 when task status is running', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)

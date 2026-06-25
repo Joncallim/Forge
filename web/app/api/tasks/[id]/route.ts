@@ -72,6 +72,11 @@ export async function GET(
 
     // Fetch artifacts for all runs
     const runIds = runs.map((r) => r.id)
+    const workPackageIdByRunId = new Map(
+      runs
+        .filter((run) => typeof run.workPackageId === 'string' && run.workPackageId.length > 0)
+        .map((run) => [run.id, run.workPackageId as string]),
+    )
     let taskArtifacts: typeof artifacts.$inferSelect[] = []
     if (runIds.length > 0) {
       taskArtifacts = await db
@@ -79,6 +84,14 @@ export async function GET(
         .from(artifacts)
         .where(inArray(artifacts.agentRunId, runIds))
         .orderBy(asc(artifacts.createdAt))
+    }
+    const artifactsByWorkPackageId = new Map<string, typeof taskArtifacts>()
+    for (const artifact of taskArtifacts) {
+      const workPackageId = workPackageIdByRunId.get(artifact.agentRunId)
+      if (!workPackageId) continue
+      const existing = artifactsByWorkPackageId.get(workPackageId) ?? []
+      existing.push(artifact)
+      artifactsByWorkPackageId.set(workPackageId, existing)
     }
 
     const [taskWorkPackages, taskApprovalGates, taskVcsChanges] = await Promise.all([
@@ -125,6 +138,7 @@ export async function GET(
         harnessDisplayName: harness?.displayName ?? null,
         harnessDescription: harness?.description ?? null,
         promptOverlay: metadataString(pkg.metadata, 'promptOverlay'),
+        artifacts: artifactsByWorkPackageId.get(pkg.id) ?? [],
       }
     })
 

@@ -150,6 +150,7 @@ describe('handoffApprovedWorkPackages', () => {
       artifactId: 'artifact-1',
       content: 'handoff log',
       metadata: expect.objectContaining({ repositoryWrites: false }),
+      workPackageId: 'pkg-1',
     }))
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:handoff', expect.objectContaining({
       repositoryWrites: false,

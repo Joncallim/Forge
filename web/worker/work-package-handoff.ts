@@ -279,6 +279,7 @@ export async function handoffApprovedWorkPackages(
     content: handoff.artifact.content,
     metadata: handoff.artifact.metadata,
     createdAt: handoff.artifact.createdAt,
+    workPackageId: nextPackage.id,
   })
   await publishTaskEvent(taskId, 'run:completed', {
     runId: handoff.run.id,

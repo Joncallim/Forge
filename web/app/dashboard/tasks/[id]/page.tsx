@@ -29,6 +29,12 @@ import {
   latestMcpExecutionDesignFromArtifacts,
   type McpExecutionDesignMetadata,
 } from '@/lib/mcps/execution-design-metadata'
+import {
+  artifactArrayField,
+  mergeArtifacts,
+  taskLevelArtifactsForWorkPackages,
+  type WorkforceRecord,
+} from '@/lib/task-artifacts'
 
 interface Task {
   id: string
@@ -57,7 +63,6 @@ interface TaskAttempt {
   createdAt: string
 }
 
-type WorkforceRecord = Record<string, unknown>
 type WorkPackage = WorkforceRecord
 type ApprovalGate = WorkforceRecord
 type VcsChange = WorkforceRecord
@@ -723,6 +728,7 @@ function WorkforcePanel({
                   const prompt = stringField(pkg, ['promptOverlay'])
                   const harnessName = stringField(pkg, ['harnessDisplayName', 'harnessRole'])
                   const mcpRequirements = jsonArrayField(pkg, ['mcpRequirements'])
+                  const packageArtifacts = artifactArrayField<Artifact>(pkg, ['artifacts', 'packageArtifacts'])
 
                   return (
                     <li key={recordKey(pkg, 'work-package', index)} className="border-t border-border pt-3 first:border-t-0 first:pt-0">
@@ -776,6 +782,16 @@ function WorkforcePanel({
                               <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-background p-2 font-mono text-[11px] text-foreground ring-1 ring-border">
                                 {JSON.stringify(mcpRequirements, null, 2)}
                               </pre>
+                            </div>
+                          )}
+                          {packageArtifacts.length > 0 && (
+                            <div>
+                              <p className="font-medium text-muted-foreground">Package artifacts</p>
+                              <div className="mt-2 grid gap-2">
+                                {packageArtifacts.map((artifact) => (
+                                  <ArtifactView key={artifact.id} artifact={artifact} />
+                                ))}
+                              </div>
                             </div>
                           )}
                         </div>
@@ -1235,7 +1251,7 @@ export default function TaskDetailPage() {
 
   // Merge initial data with live stream data
   const mergedRuns: AgentRun[] = streamRuns.length > 0 ? streamRuns : initialRuns
-  const mergedArtifacts: Artifact[] = streamArtifacts.length > 0 ? streamArtifacts : initialArtifacts
+  const mergedArtifacts: Artifact[] = mergeArtifacts(initialArtifacts, streamArtifacts)
   // streamQuestions is null until the SSE layer has reported a definitive
   // question set (even an empty one); only fall back to the once-fetched
   // initialQuestions while that hasn't happened yet, so an explicitly-empty
@@ -1404,8 +1420,9 @@ export default function TaskDetailPage() {
   const capabilityClassification = latestCapabilityClassificationFromArtifacts(mergedArtifacts)
   const mcpExecutionDesign = latestMcpExecutionDesignFromArtifacts(mergedArtifacts)
 
-  const adrArtifacts = mergedArtifacts.filter((artifact) => artifact.artifactType === 'adr_text')
-  const otherArtifacts = mergedArtifacts.filter((artifact) => artifact.artifactType !== 'adr_text')
+  const taskLevelArtifacts = taskLevelArtifactsForWorkPackages(mergedArtifacts, workPackages)
+  const adrArtifacts = taskLevelArtifacts.filter((artifact) => artifact.artifactType === 'adr_text')
+  const otherArtifacts = taskLevelArtifacts.filter((artifact) => artifact.artifactType !== 'adr_text')
   const sortedAdrArtifacts = [...adrArtifacts].sort((a, b) => {
     const aTime = a.createdAt ? new Date(a.createdAt).getTime() : 0
     const bTime = b.createdAt ? new Date(b.createdAt).getTime() : 0
@@ -1666,7 +1683,7 @@ export default function TaskDetailPage() {
           )}
 
           {/* Artifacts */}
-          {mergedArtifacts.length > 0 && (
+          {taskLevelArtifacts.length > 0 && (
             <section aria-labelledby="artifacts-heading">
               <h2 id="artifacts-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
                 Artifacts
