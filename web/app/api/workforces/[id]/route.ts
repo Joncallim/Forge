@@ -5,6 +5,7 @@ import { eq } from 'drizzle-orm'
 import { db } from '@/db'
 import { workforceAgents, workforces } from '@/db/schema'
 import { getSession } from '@/lib/session'
+import { exportWorkforcesToWorkspace } from '@/lib/workforce-exports'
 
 const idSchema = z.string().uuid()
 const slugSchema = z
@@ -29,6 +30,16 @@ const updateWorkforceSchema = z.object({
   isActive: z.boolean().optional(),
   members: z.array(memberSchema).optional(),
 })
+
+async function exportWorkforceMirror(): Promise<string | null> {
+  try {
+    await exportWorkforcesToWorkspace()
+    return null
+  } catch (err) {
+    console.error('[api/workforces/:id] Workspace export failed after DB commit', err)
+    return 'Workspace workforce files could not be refreshed; database changes were saved.'
+  }
+}
 
 export async function PUT(
   request: NextRequest,
@@ -101,7 +112,12 @@ export async function PUT(
       }
     })
 
-    return NextResponse.json({ ok: true })
+    const exportWarning = await exportWorkforceMirror()
+
+    return NextResponse.json({
+      ok: true,
+      ...(exportWarning ? { warnings: [exportWarning] } : {}),
+    })
   } catch (err) {
     if (
       typeof err === 'object' &&
@@ -142,7 +158,12 @@ export async function DELETE(
       })
       .where(eq(workforces.id, id))
 
-    return NextResponse.json({ ok: true })
+    const exportWarning = await exportWorkforceMirror()
+
+    return NextResponse.json({
+      ok: true,
+      ...(exportWarning ? { warnings: [exportWarning] } : {}),
+    })
   } catch (err) {
     console.error('[DELETE /api/workforces/:id] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

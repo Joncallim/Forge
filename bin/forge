@@ -20,6 +20,29 @@ BIN_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 REPO_ROOT="$(cd "$BIN_DIR/.." && pwd)"
 WEB_DIR="$REPO_ROOT/web"
 
+expand_home_path() {
+  case "${1:-}" in
+    "~") [ -n "${HOME:-}" ] && printf '%s\n' "$HOME" ;;
+    "~/"*) [ -n "${HOME:-}" ] && printf '%s/%s\n' "$HOME" "${1#\~/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+workspace_root() {
+  local root settings_file
+  root="${FORGE_WORKSPACE_ROOT:-}"
+  if [ -z "$root" ] && [ -n "${HOME:-}" ]; then
+    settings_file="$HOME/Documents/Forge/global-settings.json"
+    if [ -f "$settings_file" ]; then
+      root="$(sed -n 's/^[[:space:]]*"workspaceRoot"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$settings_file" | head -n1)"
+    fi
+  fi
+  [ -n "$root" ] || root="~/Documents/Forge"
+  expand_home_path "$root"
+}
+
+ENV_FILE="${FORGE_ENV_FILE:-$(workspace_root)/config/forge.env}"
+
 usage() {
   cat <<'EOF'
 Forge CLI
@@ -54,14 +77,17 @@ require_uninstaller() {
 }
 
 env_value() {
-  local key="$1" file="$REPO_ROOT/.env" value
-  [ -f "$file" ] || return 0
-  value="$(grep -E "^${key}=" "$file" 2>/dev/null | tail -n1)" || true
-  [ -n "$value" ] || return 0
-  value="${value#"${key}="}"
-  value="${value%\"}"; value="${value#\"}"
-  value="${value%\'}"; value="${value#\'}"
-  printf '%s' "$value"
+  local key="$1" file value
+  for file in "$ENV_FILE" "$REPO_ROOT/.env"; do
+    [ -f "$file" ] || continue
+    value="$(grep -E "^${key}=" "$file" 2>/dev/null | tail -n1)" || true
+    [ -n "$value" ] || continue
+    value="${value#"${key}="}"
+    value="${value%\"}"; value="${value#\"}"
+    value="${value%\'}"; value="${value#\'}"
+    printf '%s' "$value"
+    return 0
+  done
 }
 
 local_url() {

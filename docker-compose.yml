@@ -33,7 +33,7 @@ services:
     working_dir: /app
     volumes:
       - ./web:/app
-      - ./.claude:/forge/.claude
+      - ${FORGE_WORKSPACE_ROOT:-${HOME}/Documents/Forge}:/forge-workspace
     command: sh -c "npm install && npm run dev"
     ports:
       - "3000:3000"
@@ -46,11 +46,9 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:-forge}@postgres:5432/${POSTGRES_DB:-forge}
       REDIS_URL: redis://redis:6379/0
       NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
-      SESSION_SECRET: ${SESSION_SECRET:-change_me_generate_with_openssl_rand_hex_32}
-      WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:-localhost}
-      WEBAUTHN_RP_NAME: ${WEBAUTHN_RP_NAME:-Forge}
-      WEBAUTHN_ORIGIN: ${WEBAUTHN_ORIGIN:-http://localhost:3000}
-      FORGE_AGENT_CONFIG_DIR: /forge/.claude/agents
+      FORGE_WORKSPACE_ROOT: /forge-workspace
+      FORGE_AGENT_CONFIG_DIR: /forge-workspace/prompts/agents
+      FORGE_ENV_FILE: /forge-workspace/config/forge.env
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || exit 1"]
       interval: 30s
@@ -64,6 +62,7 @@ services:
     working_dir: /app
     volumes:
       - ./web:/app
+      - ${FORGE_WORKSPACE_ROOT:-${HOME}/Documents/Forge}:/forge-workspace
     command: sh -c "npm install && npm run worker"
     depends_on:
       postgres:
@@ -74,13 +73,9 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-forge}:${POSTGRES_PASSWORD:-forge}@postgres:5432/${POSTGRES_DB:-forge}
       REDIS_URL: redis://redis:6379/0
       FORGE_WORKER_CLAIM_TIMEOUT_SECONDS: ${FORGE_WORKER_CLAIM_TIMEOUT_SECONDS:-5}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
-      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-http://litellm:4000}
-      LITELLM_API_KEY: ${LITELLM_API_KEY:-}
-      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
-      GITHUB_REPO: ${GITHUB_REPO:-}
+      FORGE_WORKSPACE_ROOT: /forge-workspace
+      FORGE_AGENT_CONFIG_DIR: /forge-workspace/prompts/agents
+      FORGE_ENV_FILE: /forge-workspace/config/forge.env
 
 volumes:
   postgres_data:

@@ -20,10 +20,27 @@ const PASSKEY_RUNTIME_ENV: EnvVarName[] = [
   'WEBAUTHN_ORIGIN',
 ]
 
+const SECRET_ENV_NAMES = new Set(['SESSION_SECRET', 'FORGE_ENCRYPTION_KEY'])
+const UNSAFE_SECRET_VALUES = new Set([
+  'change_me',
+  'change_me_generate_with_openssl_rand_hex_32',
+  'placeholder',
+])
+
 export type RuntimeEnvCheck = {
   name: EnvVarName
   present: boolean
   message?: string
+}
+
+export function unsafeRuntimeSecretReason(name: string, value: string | undefined): string | null {
+  if (!SECRET_ENV_NAMES.has(name)) return null
+  const normalized = value?.trim()
+  if (!normalized) return null
+  if (UNSAFE_SECRET_VALUES.has(normalized.toLowerCase()) || normalized.toLowerCase().startsWith('change_me')) {
+    return `${name} must be set to a generated secret, not the placeholder value`
+  }
+  return null
 }
 
 export function getRequiredEnv(name: EnvVarName): string {
@@ -32,6 +49,10 @@ export function getRequiredEnv(name: EnvVarName): string {
     throw new Error(
       `[env] ${name} is required. See docs/operator-guide.md for deployment values.`,
     )
+  }
+  const unsafeSecretReason = unsafeRuntimeSecretReason(name, value)
+  if (unsafeSecretReason) {
+    throw new Error(`[env] ${unsafeSecretReason}.`)
   }
 
   return value
@@ -47,10 +68,11 @@ export function checkRuntimeEnv(): RuntimeEnvCheck[] {
   return requiredRuntimeEnv().map((name) => {
     const value = process.env[name]
     const present = value !== undefined && value.trim() !== ''
+    const unsafeSecretReason = present ? unsafeRuntimeSecretReason(name, value) : null
     return {
       name,
-      present,
-      message: present ? undefined : `${name} is required`,
+      present: present && !unsafeSecretReason,
+      message: unsafeSecretReason ?? (present ? undefined : `${name} is required`),
     }
   })
 }

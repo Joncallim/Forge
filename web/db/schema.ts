@@ -10,6 +10,7 @@ import {
   jsonb,
   bigint,
   customType,
+  check,
   index,
   uniqueIndex,
 } from 'drizzle-orm/pg-core'
@@ -668,6 +669,7 @@ export const workforces = pgTable(
     uniqueIndex('workforces_slug_idx').on(t.slug),
     index('workforces_is_active_idx').on(t.isActive),
     index('workforces_is_default_idx').on(t.isDefault),
+    check('workforces_slug_safe_chk', sql`${t.slug} ~ '^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$'`),
   ],
 )
 

@@ -1,4 +1,5 @@
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'node:crypto'
+import { unsafeRuntimeSecretReason } from '@/lib/env'
 
 /**
  * Symmetric encryption for secrets at rest (provider API keys).
@@ -18,11 +19,16 @@ const VERSION = 'v1'
 const SALT = 'forge.provider.secret.v1'
 
 function getKey(): Buffer {
+  const secretName = process.env.FORGE_ENCRYPTION_KEY ? 'FORGE_ENCRYPTION_KEY' : 'SESSION_SECRET'
   const secret = process.env.FORGE_ENCRYPTION_KEY ?? process.env.SESSION_SECRET
   if (!secret || secret.trim() === '') {
     throw new Error(
       '[crypto] FORGE_ENCRYPTION_KEY or SESSION_SECRET must be set to encrypt/decrypt stored secrets',
     )
+  }
+  const unsafeSecretReason = unsafeRuntimeSecretReason(secretName, secret)
+  if (unsafeSecretReason) {
+    throw new Error(`[crypto] ${unsafeSecretReason}.`)
   }
   return scryptSync(secret, SALT, 32)
 }

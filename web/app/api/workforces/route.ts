@@ -5,6 +5,7 @@ import { asc, eq } from 'drizzle-orm'
 import { db } from '@/db'
 import { agentConfigs, workforceAgents, workforces } from '@/db/schema'
 import { getSession } from '@/lib/session'
+import { exportWorkforcesToWorkspace } from '@/lib/workforce-exports'
 
 const slugSchema = z
   .string()
@@ -36,6 +37,16 @@ function slugify(value: string): string {
     .replace(/[^a-z0-9_-]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 64)
+}
+
+async function exportWorkforceMirror(workforceRows: Awaited<ReturnType<typeof listWorkforces>>): Promise<string | null> {
+  try {
+    await exportWorkforcesToWorkspace(workforceRows)
+    return null
+  } catch (err) {
+    console.error('[api/workforces] Workspace export failed after DB commit', err)
+    return 'Workspace workforce files could not be refreshed; database changes were saved.'
+  }
 }
 
 async function listWorkforces() {
@@ -153,7 +164,16 @@ export async function POST(request: NextRequest) {
       }
     })
 
-    return NextResponse.json({ workforces: await listWorkforces() }, { status: 201 })
+    const nextWorkforces = await listWorkforces()
+    const exportWarning = await exportWorkforceMirror(nextWorkforces)
+
+    return NextResponse.json(
+      {
+        workforces: nextWorkforces,
+        ...(exportWarning ? { warnings: [exportWarning] } : {}),
+      },
+      { status: 201 },
+    )
   } catch (err) {
     if (
       typeof err === 'object' &&

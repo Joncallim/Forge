@@ -36,9 +36,10 @@ From the repository root:
 bash scripts/install.sh
 ```
 
-The installer prepares local services, creates `.env`, installs web
-dependencies, prepares the database, and can set up a small local Ollama model
-so Forge can run without API keys.
+The installer prepares local services, creates
+`~/Documents/Forge/config/forge.env`, installs web dependencies, prepares the
+database, and can set up a small local Ollama model so Forge can run without API
+keys.
 
 Useful variants:
 
@@ -61,7 +62,8 @@ http://localhost:3000
 ```
 
 The first account creates a password and, by default, a passkey. To use password
-only, set `FORGE_PASSKEYS_ENABLED=0` in `.env` before creating the first account.
+only, set `FORGE_PASSKEYS_ENABLED=0` in
+`~/Documents/Forge/config/forge.env` before creating the first account.
 
 If you kept settings during uninstall/reinstall, Forge keeps the existing
 single-user account. Registration will stay closed, so recover from the shell:
@@ -71,7 +73,7 @@ forge reset-credentials
 ```
 
 Use `http://localhost:3000` for local passkeys unless you also update
-`WEBAUTHN_RP_ID` and `WEBAUTHN_ORIGIN` in `.env`.
+`WEBAUTHN_RP_ID` and `WEBAUTHN_ORIGIN` in the workspace env file.
 
 ## Try A Task
 
