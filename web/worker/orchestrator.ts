@@ -14,6 +14,7 @@ import type { OpenQuestion } from './open-questions'
 import { getProjectMcpOverview } from '../lib/mcps/manager'
 import { prepareArchitectArtifact } from './architect-artifact'
 import { materializeWorkforceFromArchitectArtifact } from './workforce-materializer'
+import { displayPathForWorkspacePath, getWorkspaceSettings } from '../lib/workspace'
 import {
   readLatestArchitectCheckpointSafely,
   writeArchitectCheckpointSafely,
@@ -105,6 +106,7 @@ export function buildArchitectPrompt(
   previousPlan: string | null = null,
   resumeCheckpoint: ArchitectResumeCheckpoint | null = null,
   configuredAgents: AgentConfigRow[] = [],
+  displayLocalPath: string | null = null,
 ): string {
   const answeredSection =
     answeredQuestions.length === 0
@@ -161,11 +163,17 @@ export function buildArchitectPrompt(
             return `- [${name}] slug: ${agent.agentType}${description}`
           }),
         ]
+  const localFolder = project.localPath ?? 'not configured'
+  const displayFolderSection =
+    displayLocalPath && displayLocalPath !== localFolder
+      ? [`Display folder (UI only): ${displayLocalPath}`]
+      : []
 
   return [
     `Project: ${project.name}`,
     `Repository: ${project.githubRepo ?? 'not configured'}`,
-    `Local folder: ${project.localPath ?? 'not configured'}`,
+    `Local folder: ${localFolder}`,
+    ...displayFolderSection,
     `Default branch: ${project.defaultBranch}`,
     '',
     `Task title: ${task.title}`,
@@ -186,7 +194,7 @@ export function buildArchitectPrompt(
     'Task breakdown rules:',
     ...agentCatalogSection,
     '- Assign every implementation step to a configured agent using its [Display Name] tag when a suitable agent exists. If no configured agent fits, use a concise new specialist tag and make clear why a new agent should be added.',
-    '- Prefer concrete, repository-specific guidance: name the actual files, directories, or modules the implementer should create or change. If the repository or local folder above is configured, base your file references on it; if it is not, say so and keep paths illustrative.',
+    '- Prefer concrete, repository-specific guidance: name the actual files, directories, or modules the implementer should create or change. If the repository or canonical local folder above is configured, base actionable file references on it; if it is not, say so and keep paths illustrative. Treat any display folder as UI-only.',
     '- After the Markdown plan, append a fenced code block tagged exactly `agent_breakdown_json` containing a single JSON object of the shape `{"agents":[{"role":"Frontend","tasks":2,"summary":"Build task page UI and state handling","steps":["Build the task list component","Wire up state handling"]}]}`. Derive this from the [Role] assignments in the task breakdown. Each agent\'s `steps` should be a short array of 1-2 sentence imperative strings, one per individual task assigned to that agent — specific enough to stand alone, not just a restatement of `summary`. Use an empty array only if the plan truly assigns no worker tasks.',
     '',
     'Capability classification:',
@@ -451,11 +459,15 @@ async function runArchitect(
       })
     } else {
       const profile = detectSoftwareProfile(task, project)
-      const [specialistContext, webResearchContext, configuredAgents] = await Promise.all([
+      const [specialistContext, webResearchContext, configuredAgents, workspace] = await Promise.all([
         Promise.resolve(buildSpecialistContext(profile)),
         buildWebResearchContext(profile, task),
         loadActiveAgentCatalog(),
+        getWorkspaceSettings({ ensure: false }),
       ])
+      const displayLocalPath = project.localPath
+        ? displayPathForWorkspacePath(workspace, project.localPath)
+        : null
       const result = streamText({
         model,
         system: config.systemPrompt,
@@ -468,6 +480,7 @@ async function runArchitect(
           previousPlan,
           resumeCheckpoint,
           configuredAgents,
+          displayLocalPath,
         ),
         temperature: 0.2,
       })

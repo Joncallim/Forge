@@ -191,6 +191,45 @@ describe('workspace-native storage safeguards', () => {
     }
   })
 
+  it('maps temporary launch workspace roots to the default Forge display root', async () => {
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const previousHome = process.env.HOME
+    const workspaceRoot = path.join('/var/folders/j5/example/T', 'Forge')
+
+    try {
+      process.env.HOME = '/Users/tester'
+      process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+      const {
+        getWorkspaceSettings,
+        resolveWorkspaceInputPath,
+        serializeWorkspaceSettings,
+      } = await import('@/lib/workspace')
+
+      const settings = await getWorkspaceSettings({ ensure: false })
+      const dto = serializeWorkspaceSettings(settings)
+
+      expect(dto.workspaceRoot).toBe(workspaceRoot)
+      expect(dto.displayPaths.workspaceRoot).toBe('~/Documents/Forge')
+      expect(dto.displayPaths.projectsRoot).toBe('~/Documents/Forge/projects')
+      expect(resolveWorkspaceInputPath(
+        '~/Documents/Forge/projects/demo',
+        settings,
+        settings.projectsRoot,
+      )).toBe(path.join(workspaceRoot, 'projects', 'demo'))
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      if (previousHome === undefined) {
+        delete process.env.HOME
+      } else {
+        process.env.HOME = previousHome
+      }
+    }
+  })
+
   it('maps configured display root paths back to canonical workspace paths', async () => {
     const previousRoot = process.env.FORGE_WORKSPACE_ROOT
     const previousDisplayRoot = process.env.FORGE_WORKSPACE_DISPLAY_ROOT

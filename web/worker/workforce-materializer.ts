@@ -184,7 +184,7 @@ export function buildWorkforceMaterializationRows(
       displayName: agent.role || displayNameForSlug(agentType),
       category: agentType,
       description: `${agent.role || displayNameForSlug(agentType)} harness seeded from Architect workforce planning.`,
-      systemPrompt: promptOverlay ?? '',
+      systemPrompt: '',
       toolPolicy: {
         mcpGrants: mcpGrantsForAgent(input.prepared, agentType),
       },
@@ -218,6 +218,7 @@ export function buildWorkforceMaterializationRows(
         source: 'architect-artifact',
         architectRunId: input.architectRunId,
         artifactId: input.artifactId,
+        promptOverlay,
         plannedTasks: agent.tasks,
         mcpAwareSubtasks: mcpSubtasks,
       },

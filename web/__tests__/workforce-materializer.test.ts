@@ -152,7 +152,7 @@ describe('workforce materializer', () => {
     expect(rows.harnesses[0]).toMatchObject({
       slug: 'backend',
       role: 'backend',
-      systemPrompt: 'Use GitHub read tools only.',
+      systemPrompt: '',
       toolPolicy: {
         mcpGrants: [
           expect.objectContaining({
@@ -165,6 +165,7 @@ describe('workforce materializer', () => {
     })
     expect(rows.workPackages[0].metadata).toMatchObject({
       source: 'architect-artifact',
+      promptOverlay: 'Use GitHub read tools only.',
       mcpAwareSubtasks: [
         expect.objectContaining({
           id: 'inspect-issue',

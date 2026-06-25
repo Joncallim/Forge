@@ -72,6 +72,27 @@ describe('buildArchitectPrompt checkpoint resume context', () => {
     expect(prompt).not.toContain('Local resume checkpoint context')
   })
 
+  it('keeps the canonical local path actionable and labels display paths UI-only', () => {
+    const prompt = buildArchitectPrompt(
+      task,
+      {
+        ...project,
+        localPath: '/var/folders/j5/example/T/Forge/projects/Forge',
+      },
+      'Specialist context',
+      'Web context',
+      [],
+      null,
+      null,
+      [],
+      '~/Documents/Forge/projects/Forge',
+    )
+
+    expect(prompt).toContain('Local folder: /var/folders/j5/example/T/Forge/projects/Forge')
+    expect(prompt).toContain('Display folder (UI only): ~/Documents/Forge/projects/Forge')
+    expect(prompt).toContain('Treat any display folder as UI-only.')
+  })
+
   it('includes bounded checkpoint JSON as untrusted non-authoritative context', () => {
     const prompt = buildArchitectPrompt(
       task,

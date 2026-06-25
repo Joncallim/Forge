@@ -571,7 +571,7 @@ export default function ProvidersPage() {
   // Load providers
   // ---------------------------------------------------------------------------
 
-  const loadProviders = useCallback(async () => {
+  const loadProviders = useCallback(async (): Promise<ProviderConfig[]> => {
     setLoading(true)
     setFetchError(null)
     try {
@@ -581,9 +581,12 @@ export default function ProvidersPage() {
         throw new Error((body as { error?: string }).error ?? 'Failed to load providers')
       }
       const data = await res.json() as { providers: ProviderConfig[] }
-      setProviders(data.providers ?? [])
+      const nextProviders = data.providers ?? []
+      setProviders(nextProviders)
+      return nextProviders
     } catch (err) {
       setFetchError(err instanceof Error ? err.message : 'An unexpected error occurred')
+      return []
     } finally {
       setLoading(false)
     }
@@ -597,20 +600,24 @@ export default function ProvidersPage() {
   // Health cache — read cached rows by default; live probes only on explicit refresh
   // ---------------------------------------------------------------------------
 
-  const loadHealth = useCallback(async (refresh = false, silent = false) => {
-    if (providers.length === 0) {
+  const loadHealth = useCallback(async (
+    refresh = false,
+    silent = false,
+    providerList = providers,
+  ) => {
+    if (providerList.length === 0) {
       setHealthMap({})
       return
     }
 
     if (!silent) {
       const initial: HealthMap = {}
-      for (const p of providers) initial[p.id] = 'loading'
+      for (const p of providerList) initial[p.id] = 'loading'
       setHealthMap(initial)
     }
 
     await Promise.allSettled(
-      providers.map(async (p) => {
+      providerList.map(async (p) => {
         try {
           const res = await fetch(`/api/providers/${p.id}/health${refresh ? '?refresh=1' : ''}`)
           if (!res.ok) throw new Error('Health check failed')
@@ -795,18 +802,23 @@ export default function ProvidersPage() {
       const data = await res.json() as {
         found: number
         added: { providerType: string; modelId: string }[]
+        updated?: { providerType: string; modelId: string }[]
         ollamaReachable: boolean
         lmstudioReachable: boolean
       }
-      if (data.added.length > 0) {
-        setDiscoverMsg(`Added ${data.added.length} local model${data.added.length === 1 ? '' : 's'}.`)
-        await loadProviders()
+      const changed = data.added.length + (data.updated?.length ?? 0)
+      if (changed > 0) {
+        setDiscoverMsg(`Updated ${changed} local model${changed === 1 ? '' : 's'}.`)
       } else if (data.found > 0) {
         setDiscoverMsg('Local models found are already configured.')
       } else if (!data.ollamaReachable && !data.lmstudioReachable) {
         setDiscoverMsg('No running Ollama or LM Studio detected on localhost.')
       } else {
         setDiscoverMsg('No local models found.')
+      }
+      if (data.found > 0 || changed > 0) {
+        const nextProviders = await loadProviders()
+        await loadHealth(true, true, nextProviders)
       }
     } catch (err) {
       setDiscoverMsg(err instanceof Error ? err.message : 'Local detection failed')

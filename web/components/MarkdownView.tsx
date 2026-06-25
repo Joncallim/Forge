@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react'
+import { normalizeMarkdownDisplayText } from '@/lib/display-text'
 
 type MarkdownViewProps = {
   content: string
@@ -67,7 +68,7 @@ function tableCells(line: string): string[] {
 }
 
 export function MarkdownView({ content, compact = false }: MarkdownViewProps) {
-  const lines = content.replace(/\r\n/g, '\n').split('\n')
+  const lines = normalizeMarkdownDisplayText(content).replace(/\r\n/g, '\n').split('\n')
   const blocks: ReactNode[] = []
   let index = 0
 

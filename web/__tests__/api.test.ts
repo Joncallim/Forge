@@ -1849,6 +1849,72 @@ describe('GET /api/projects/:id — 404 when project not found', () => {
 describe('DELETE /api/tasks/:id — 409 when status is running', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
+  it('hydrates work-package harness prompts in task details', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const task = {
+      id: 'task-work-packages',
+      status: 'awaiting_approval',
+      projectId: 'proj-1',
+      title: 'Inspect assigned work packages',
+      prompt: 'Show assigned work.',
+      submittedBy: 'user-abc',
+      pmProviderConfigId: null,
+      githubBranch: null,
+      githubPrUrl: null,
+      errorMessage: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      completedAt: null,
+    }
+    const workPackage = {
+      id: 'package-1',
+      taskId: task.id,
+      harnessId: 'harness-1',
+      title: 'Frontend handoff',
+      summary: 'Update the Providers page.',
+      sequence: 1,
+      status: 'pending',
+      dependsOn: [],
+      targetFiles: ['web/app/dashboard/providers/page.tsx'],
+      targetAreas: ['Providers'],
+      mcpRequirements: {},
+      metadata: {
+        promptOverlay: 'Keep the Providers list synced after local detection.',
+      },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }
+    mockDbSelect
+      .mockReturnValueOnce(chain([task]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([workPackage]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{
+        id: 'harness-1',
+        role: 'frontend',
+        displayName: 'Frontend',
+        description: 'Dashboard UI specialist.',
+      }]))
+
+    const { GET } = await import('@/app/api/tasks/[id]/route')
+    const res = await GET(authRequest(`/api/tasks/${task.id}`) as never, {
+      params: Promise.resolve({ id: task.id }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.workPackages).toMatchObject([{
+      id: 'package-1',
+      harnessRole: 'frontend',
+      harnessDisplayName: 'Frontend',
+      harnessDescription: 'Dashboard UI specialist.',
+      promptOverlay: 'Keep the Providers list synced after local detection.',
+    }])
+  })
+
   it('returns 409 when task status is running', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const runningTask = {
@@ -2015,6 +2081,141 @@ describe('POST /api/providers/discover-local — auth guard', () => {
         lmstudioReachable: true,
       })
       expect(mockDbInsert).toHaveBeenCalledOnce()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('does not reactivate a disabled provider discovered by model id', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{
+      id: 'provider-existing',
+      displayName: 'Old Gemma',
+      baseUrl: 'http://localhost:1234/old',
+      isLocal: true,
+      isActive: false,
+    }]))
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === 'http://localhost:11434/api/tags') {
+        return new Response(JSON.stringify({ models: [] }), { status: 200 })
+      }
+      if (url === 'http://localhost:1234/api/v1/models') {
+        return new Response(JSON.stringify({
+          models: [{ type: 'llm', key: 'google/gemma-local' }],
+        }), { status: 200 })
+      }
+      return new Response('{}', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const { POST } = await import('@/app/api/providers/discover-local/route')
+      const res = await POST(authRequest('/api/providers/discover-local', { method: 'POST' }) as never)
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body).toMatchObject({
+        found: 1,
+        added: [],
+        updated: [],
+        skipped: [{
+          providerType: 'lmstudio',
+          modelId: 'google/gemma-local',
+          reason: 'provider_disabled',
+        }],
+      })
+      expect(mockDbUpdate).not.toHaveBeenCalled()
+      expect(mockDbInsert).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('normalizes the base URL for an active local LM Studio provider discovered by model id', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{
+      id: 'provider-existing',
+      displayName: 'Old Gemma',
+      baseUrl: 'http://localhost:1234',
+      isLocal: true,
+      isActive: true,
+    }]))
+    mockDbUpdate.mockReturnValue(chain(undefined))
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === 'http://localhost:11434/api/tags') {
+        return new Response(JSON.stringify({ models: [] }), { status: 200 })
+      }
+      if (url === 'http://localhost:1234/api/v1/models') {
+        return new Response(JSON.stringify({
+          models: [{ type: 'llm', key: 'google/gemma-local' }],
+        }), { status: 200 })
+      }
+      return new Response('{}', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const { POST } = await import('@/app/api/providers/discover-local/route')
+      const res = await POST(authRequest('/api/providers/discover-local', { method: 'POST' }) as never)
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body).toMatchObject({
+        found: 1,
+        added: [],
+        updated: [{ providerType: 'lmstudio', modelId: 'google/gemma-local' }],
+        skipped: [],
+      })
+      expect(mockDbUpdate).toHaveBeenCalledOnce()
+      expect(mockDbInsert).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('does not overwrite an active local provider using a different base URL', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{
+      id: 'provider-existing',
+      displayName: 'Remote Gemma',
+      baseUrl: 'http://localhost:4321/v1',
+      isLocal: true,
+      isActive: true,
+    }]))
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === 'http://localhost:11434/api/tags') {
+        return new Response(JSON.stringify({ models: [] }), { status: 200 })
+      }
+      if (url === 'http://localhost:1234/api/v1/models') {
+        return new Response(JSON.stringify({
+          models: [{ type: 'llm', key: 'google/gemma-local' }],
+        }), { status: 200 })
+      }
+      return new Response('{}', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const { POST } = await import('@/app/api/providers/discover-local/route')
+      const res = await POST(authRequest('/api/providers/discover-local', { method: 'POST' }) as never)
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body).toMatchObject({
+        found: 1,
+        added: [],
+        updated: [],
+        skipped: [{
+          providerType: 'lmstudio',
+          modelId: 'google/gemma-local',
+          reason: 'base_url_conflict',
+        }],
+      })
+      expect(mockDbUpdate).not.toHaveBeenCalled()
+      expect(mockDbInsert).not.toHaveBeenCalled()
     } finally {
       vi.unstubAllGlobals()
     }
@@ -2342,6 +2543,48 @@ describe('dynamic agents and workforces', () => {
       }
       await fs.rm(workspaceRoot, { recursive: true, force: true })
     }
+  })
+
+  it('returns workforce member assignment details without exposing system prompts', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'workforce-1',
+        slug: 'release-squad',
+        displayName: 'Release Squad',
+        description: 'Release readiness team.',
+        isDefault: false,
+        isActive: true,
+        metadata: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }]))
+      .mockReturnValueOnce(chain([{
+        id: 'member-1',
+        workforceId: 'workforce-1',
+        agentConfigId: '00000000-0000-4000-8000-000000000001',
+        roleLabel: 'Release reviewer',
+        sequence: 1,
+        isRequired: true,
+        metadata: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        agentType: 'reviewer',
+        displayName: 'Reviewer',
+        description: 'Review work.',
+        isActive: true,
+      }]))
+
+    const { GET } = await import('@/app/api/workforces/route')
+    const res = await GET(authRequest('/api/workforces') as never)
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.workforces[0].members[0]).toMatchObject({
+      agentType: 'reviewer',
+      roleLabel: 'Release reviewer',
+    })
+    expect(body.workforces[0].members[0].systemPrompt).toBeUndefined()
   })
 
   it('removes the inserted agent row if prompt file creation fails', async () => {

@@ -110,6 +110,23 @@ function configuredWorkspaceDisplayRoot(): string | null {
   return rawRoot ? normalizeDisplayRoot(rawRoot) : null
 }
 
+function defaultWorkspaceDisplayRoot(settings: Pick<WorkspaceSettings, 'workspaceRoot'>): string | null {
+  const workspaceRoot = path.resolve(/*turbopackIgnore: true*/ settings.workspaceRoot)
+  if (workspaceRoot === defaultWorkspaceRootAbsolute()) return DEFAULT_WORKSPACE_ROOT
+
+  const temporaryRoot = path.resolve(/*turbopackIgnore: true*/ '/var/folders')
+  const relativeToTemporaryRoot = path.relative(temporaryRoot, workspaceRoot)
+  if (
+    relativeToTemporaryRoot !== '' &&
+    !relativeToTemporaryRoot.startsWith('..') &&
+    !path.isAbsolute(relativeToTemporaryRoot)
+  ) {
+    return DEFAULT_WORKSPACE_ROOT
+  }
+
+  return null
+}
+
 function joinDisplayPath(displayRoot: string, relativePath: string): string {
   if (!relativePath) return displayRoot
   const normalizedRelative = relativePath.split(path.sep).join('/')
@@ -141,7 +158,7 @@ export function displayPathForWorkspacePath(
   settings: Pick<WorkspaceSettings, 'workspaceRoot'>,
   resolvedPath: string,
 ): string {
-  const displayRoot = configuredWorkspaceDisplayRoot()
+  const displayRoot = configuredWorkspaceDisplayRoot() ?? defaultWorkspaceDisplayRoot(settings)
   if (displayRoot) {
     const relative = displayRelativeToWorkspace(settings.workspaceRoot, resolvedPath)
     if (relative !== null) return joinDisplayPath(displayRoot, relative)
@@ -170,6 +187,7 @@ function mapDisplayPathToWorkspacePath(
   const trimmed = rawPath.trim()
   const displayRoots = [
     configuredWorkspaceDisplayRoot(),
+    defaultWorkspaceDisplayRoot(workspace),
     collapseHomePath(workspace.workspaceRoot),
   ].filter((root): root is string => Boolean(root))
 
