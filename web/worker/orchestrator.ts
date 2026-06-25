@@ -21,6 +21,11 @@ import {
   type ArchitectCheckpointInput,
   type ArchitectResumeCheckpoint,
 } from './checkpoints'
+import {
+  handoffApprovedWorkPackages,
+  isWorkPackageHandoffEnabled,
+  previewWorkPackageHandoff,
+} from './work-package-handoff'
 
 type TaskRow = typeof tasks.$inferSelect
 type ProjectRow = typeof projects.$inferSelect
@@ -749,7 +754,10 @@ export async function processAnsweredQuestions(
   }
 }
 
-export async function processApproval(taskId: string): Promise<void> {
+export async function processApproval(
+  taskId: string,
+  options: { finalAttempt?: boolean } = {},
+): Promise<void> {
   const [task] = await db
     .select({ status: tasks.status })
     .from(tasks)
@@ -769,10 +777,68 @@ export async function processApproval(taskId: string): Promise<void> {
     return
   }
 
-  const completed = await updateTaskStatusIfCurrent(taskId, 'approved', 'completed')
-  if (!completed) {
-    console.info('[worker/orchestrator] Skipping approval that was changed by another actor', {
+  const preview = await previewWorkPackageHandoff(taskId)
+
+  if (preview.status === 'no_work_packages') {
+    const completed = await updateTaskStatusIfCurrent(taskId, 'approved', 'completed')
+    if (!completed) {
+      console.info('[worker/orchestrator] Skipping approval that was changed by another actor', {
+        taskId,
+      })
+    }
+    return
+  }
+
+  if (preview.status === 'no_ready_packages') {
+    await publishTaskEvent(taskId, 'task:handoff', {
+      claimedPackageId: null,
+      readyPackageIds: preview.readyPackageIds,
+      status: 'no_ready_packages',
+    })
+    return
+  }
+
+  const claimEnabled = isWorkPackageHandoffEnabled()
+  if (!claimEnabled) {
+    const handoff = await handoffApprovedWorkPackages(taskId, { claimEnabled: false })
+    await publishTaskEvent(taskId, 'task:handoff', {
+      claimedPackageId: null,
+      readyPackageIds: handoff.readyPackageIds,
+      status: handoff.status,
+    })
+    return
+  }
+
+  const running = await updateTaskStatusIfCurrent(taskId, 'approved', 'running')
+  if (!running) {
+    console.info('[worker/orchestrator] Skipping approval handoff that was changed by another actor', {
+      handoffStatus: preview.status,
       taskId,
     })
+    return
   }
+
+  let handoff: Awaited<ReturnType<typeof handoffApprovedWorkPackages>>
+  try {
+    handoff = await handoffApprovedWorkPackages(taskId, { claimEnabled: true })
+  } catch (err) {
+    const finalAttempt = options.finalAttempt ?? true
+    if (finalAttempt) {
+      await updateTaskStatusIfCurrent(taskId, 'running', 'failed', errorMessage(err))
+    } else {
+      await updateTaskStatusIfCurrent(taskId, 'running', 'approved', `Retrying handoff after error: ${errorMessage(err)}`)
+    }
+    throw err
+  }
+
+  if (handoff.claimedPackageId === null && handoff.status === 'no_ready_packages') {
+    await updateTaskStatus(taskId, 'approved', 'No ready work packages were available for handoff.')
+    return
+  }
+
+  await publishTaskEvent(taskId, 'task:handoff', {
+    claimedPackageId: handoff.claimedPackageId,
+    readyPackageIds: handoff.readyPackageIds,
+    status: handoff.status,
+  })
 }

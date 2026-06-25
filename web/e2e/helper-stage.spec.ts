@@ -22,7 +22,7 @@ test.describe('helper-stage beta smoke', () => {
     worker = null
   })
 
-  test('setup, task execution, artifact review, and approval complete', async ({ page }, testInfo) => {
+  test('setup, task execution, artifact review, and approval handoff', async ({ page }, testInfo) => {
     // Unique per project (desktop/mobile) and distinct from orchestrator-stage.spec.ts's
     // fixture name, since both specs share one dev database across concurrent projects.
     const projectName = `Forge Smoke Helper ${testInfo.project.name}`
@@ -72,15 +72,15 @@ test.describe('helper-stage beta smoke', () => {
     })
 
     await page.getByRole('button', { name: 'Approve generated plan' }).click()
-    // Scope to the header status badge — the task-attempt history and agent-run
-    // sections also render "Completed" badges, so a bare getByText is ambiguous.
+    // Scope to the header status badge because agent-run and package sections
+    // can also render their own status badges.
     const taskStatusBadge = page
       .getByRole('heading', { name: 'Draft smoke plan' })
       .locator('xpath=following-sibling::*[1]')
-    await expect(taskStatusBadge).toHaveText('Completed')
+    await expect(taskStatusBadge).toHaveText('Running')
     await expect(page.getByText('Mock architect plan for Draft smoke plan')).toBeVisible()
     await page.screenshot({
-      path: testInfo.outputPath('04-task-completed.png'),
+      path: testInfo.outputPath('04-task-handoff.png'),
       fullPage: true,
     })
   })

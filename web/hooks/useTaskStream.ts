@@ -39,6 +39,7 @@ interface UseTaskStreamResult {
   artifacts: Artifact[]
   taskStatus: string | null
   error: string | null
+  refreshRevision: number
   // null means no questions:created/questions:answered event has been
   // received yet this session — callers should fall back to initial data
   // fetched on mount. Once an event arrives (even with an empty array), this
@@ -66,6 +67,7 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
   const [taskStatus, setTaskStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [questions, setQuestions] = useState<TaskQuestion[] | null>(null)
+  const [refreshRevision, setRefreshRevision] = useState(0)
 
   // Store streaming log chunks outside React state to avoid excessive re-renders.
   // Key: runId, Value: accumulated log string
@@ -88,6 +90,10 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
       buffer.clear()
       return changed ? next : prev
     })
+  }, [])
+
+  const requestDetailRefresh = useCallback(() => {
+    setRefreshRevision((revision) => revision + 1)
   }, [])
 
   useEffect(() => {
@@ -201,6 +207,15 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
       }
     })
 
+    for (const eventType of [
+      'approval_gate:decided',
+      'task:handoff',
+      'work_package:handoff',
+      'work_package:status',
+    ]) {
+      es.addEventListener(eventType, requestDetailRefresh)
+    }
+
     es.addEventListener('questions:created', (e) => {
       try {
         const data = JSON.parse((e as MessageEvent).data)
@@ -256,7 +271,7 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
       es.close()
       esRef.current = null
     }
-  }, [taskId, flushChunks])
+  }, [taskId, flushChunks, requestDetailRefresh])
 
-  return { runs, artifacts, taskStatus, error, questions }
+  return { runs, artifacts, taskStatus, error, questions, refreshRevision }
 }
