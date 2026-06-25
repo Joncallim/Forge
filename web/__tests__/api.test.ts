@@ -1971,6 +1971,58 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     const body = await res.json()
     expect(body.error).toMatch(/awaiting_approval/i)
   })
+
+  it('approves the plan gate and queues the approval worker job', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const awaitingTask = {
+      id: 'task-approval',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-06-25T00:00:00.000Z'),
+    }
+    const approvedTask = {
+      ...awaitingTask,
+      status: 'approved',
+      updatedAt: new Date('2026-06-25T00:01:00.000Z'),
+    }
+    const taskUpdate = chain([approvedTask])
+    taskUpdate.set = vi.fn(() => taskUpdate)
+    const gateUpdate = chain([{ id: 'gate-1' }])
+    gateUpdate.set = vi.fn(() => gateUpdate)
+    mockDbSelect.mockReturnValue(chain([awaitingTask]))
+    mockDbUpdate
+      .mockReturnValueOnce(taskUpdate)
+      .mockReturnValueOnce(gateUpdate)
+    mockRedisLpush.mockResolvedValue(1)
+    mockRedisPublish.mockResolvedValue(1)
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest('/api/tasks/task-approval/approve', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: 'task-approval' }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(mockDbUpdate).toHaveBeenCalledTimes(2)
+    expect(gateUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      decidedBy: FAKE_SESSION.userId,
+      status: 'approved',
+    }))
+    expect(mockRedisLpush).toHaveBeenCalledWith(
+      'forge:approvals',
+      JSON.stringify({ taskId: 'task-approval', action: 'approve' }),
+    )
+    const gateEvent = mockRedisPublish.mock.calls
+      .map(([, payload]) => JSON.parse(payload as string))
+      .find((payload) => payload.type === 'approval_gate:decided')
+    expect(gateEvent).toMatchObject({
+      gateId: 'gate-1',
+      gateType: 'plan_approval',
+      status: 'approved',
+    })
+    expect(mockRedisPublish).toHaveBeenCalledWith(
+      'forge:task:task-approval',
+      expect.stringContaining('"type":"approval_gate:decided"'),
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------

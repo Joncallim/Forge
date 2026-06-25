@@ -190,6 +190,7 @@ async function startWorkerOnce(
         if (claimedApproval !== null) {
           let ackedApproval = false
           let approvalAttemptId: string | null = null
+          const finalAttempt = claimedApproval.job.attempt >= maxAttempts
           try {
             approvalAttemptId = await startTaskAttempt({
               attemptNumber: claimedApproval.job.attempt,
@@ -203,7 +204,7 @@ async function startWorkerOnce(
               taskId: claimedApproval.job.taskId,
               workerId,
             })
-            await processApproval(claimedApproval.job.taskId)
+            await processApproval(claimedApproval.job.taskId, { finalAttempt })
             if (approvalAttemptId) {
               await finishTaskAttempt({ attemptId: approvalAttemptId, status: 'completed' })
             }
@@ -211,7 +212,6 @@ async function startWorkerOnce(
             ackedApproval = true
           } catch (err) {
             const message = errorMessage(err)
-            const finalAttempt = claimedApproval.job.attempt >= maxAttempts
             const nextRetryAt = finalAttempt
               ? null
               : new Date(Date.now() + backoffDelayMs(claimedApproval.job.attempt))

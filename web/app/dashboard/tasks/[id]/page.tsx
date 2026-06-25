@@ -1224,7 +1224,14 @@ export default function TaskDetailPage() {
   const [replanFeedback, setReplanFeedback] = useState('')
 
   // SSE stream
-  const { runs: streamRuns, artifacts: streamArtifacts, taskStatus, error: streamError, questions: streamQuestions } = useTaskStream(taskId)
+  const {
+    runs: streamRuns,
+    artifacts: streamArtifacts,
+    taskStatus,
+    error: streamError,
+    questions: streamQuestions,
+    refreshRevision: streamRefreshRevision,
+  } = useTaskStream(taskId)
 
   // Merge initial data with live stream data
   const mergedRuns: AgentRun[] = streamRuns.length > 0 ? streamRuns : initialRuns
@@ -1270,6 +1277,7 @@ export default function TaskDetailPage() {
     const REFRESH_STATUSES = new Set([
       'awaiting_answers',
       'awaiting_approval',
+      'running',
       'completed',
       'failed',
       'cancelled',
@@ -1279,6 +1287,12 @@ export default function TaskDetailPage() {
       loadTask()
     }
   }, [taskStatus, loadTask])
+
+  useEffect(() => {
+    if (streamRefreshRevision > 0) {
+      loadTask()
+    }
+  }, [streamRefreshRevision, loadTask])
 
   async function handleApprove() {
     setActionLoading(true)
