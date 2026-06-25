@@ -106,6 +106,7 @@ vi.mock('@simplewebauthn/server/helpers', () => ({
 // ---------------------------------------------------------------------------
 
 import { createSession, getSession, destroySession } from '@/lib/session'
+import { sessions } from '@/db/schema'
 
 // ---------------------------------------------------------------------------
 // Drizzle chain factory
@@ -119,7 +120,7 @@ function chain(resolveValue: unknown) {
       Promise.resolve(resolveValue).catch(onRejected),
   }
   const methods = ['from', 'where', 'limit', 'orderBy', 'values', 'returning', 'set', 'execute']
-  methods.forEach((m) => { t[m] = () => t })
+  methods.forEach((m) => { t[m] = vi.fn(() => t) })
   return t
 }
 
@@ -222,6 +223,18 @@ describe('createSession', () => {
   it('inserts a sessions row into the DB', async () => {
     await createSession('user-1', 'cred-1', { userAgent: 'UA', ip: '1.2.3.4' })
     expect(mockDbInsert).toHaveBeenCalledOnce()
+  })
+
+  it('stores null when session metadata has a non-IP rate-limit bucket', async () => {
+    await createSession('user-1', null, { userAgent: 'UA', ip: 'direct' })
+
+    const [, data] = mockRedisSet.mock.calls[0]
+    expect(JSON.parse(data as string).ip).toBeNull()
+    expect(mockDbInsert).toHaveBeenCalledOnce()
+    expect(mockDbInsert.mock.calls[0][0]).toBe(sessions)
+    expect(mockDbInsert.mock.results[0].value.values).toHaveBeenCalledWith(
+      expect.objectContaining({ ipAddress: undefined }),
+    )
   })
 
   it('returns the generated sessionId as a non-empty string', async () => {
@@ -498,6 +511,9 @@ describe('login/password', () => {
     expect(mockVerifyPassword).toHaveBeenCalledWith('correct-password', 'stored-hash')
     expect(mockRedisSet).toHaveBeenCalledOnce()
     expect(mockDbInsert).toHaveBeenCalledOnce()
+    expect(mockDbInsert.mock.results[0].value.values).toHaveBeenCalledWith(
+      expect.objectContaining({ ipAddress: undefined }),
+    )
   })
 
   it('returns 401 when the password does not match', async () => {
@@ -585,6 +601,33 @@ describe('login/password — rate limiting', () => {
     await POST(req as never)
 
     expect(mockRedisIncr).toHaveBeenCalledWith('ratelimit:login:password:ip:203.0.113.10')
+  })
+
+  it('does not write malformed trusted proxy headers to the sessions inet column', async () => {
+    process.env.FORGE_TRUST_PROXY = '1'
+    mockRedisIncr.mockResolvedValue(1)
+    mockDbSelect.mockReturnValue(
+      chain([{ id: 'user-1', displayName: 'Alice', passwordHash: 'stored-hash' }]),
+    )
+    mockVerifyPassword.mockResolvedValue(true)
+    mockDbInsert.mockReturnValue(chain(undefined))
+
+    const { POST } = await import('@/app/api/auth/login/password/route')
+
+    const req = new Request('http://localhost/api/auth/login/password', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-forwarded-for': 'not-an-ip',
+      },
+      body: JSON.stringify({ password: 'correct-password' }),
+    })
+
+    const res = await POST(req as never)
+    expect(res.status).toBe(200)
+    expect(mockDbInsert.mock.results[0].value.values).toHaveBeenCalledWith(
+      expect.objectContaining({ ipAddress: undefined }),
+    )
   })
 })
 

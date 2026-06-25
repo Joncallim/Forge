@@ -2,6 +2,7 @@ import { db } from '@/db'
 import { sessions, users } from '@/db/schema'
 import { eq } from 'drizzle-orm'
 import { redis } from '@/lib/redis'
+import { isIP } from 'node:net'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -42,6 +43,11 @@ const WRITE_BEHIND_INTERVAL_MS = 60 * 1000 // 60 seconds
 
 function redisKey(sessionId: string): string {
   return `session:${sessionId}`
+}
+
+function sessionIp(ip: string | null | undefined): string | null {
+  if (!ip) return null
+  return isIP(ip) === 0 ? null : ip
 }
 
 // ---------------------------------------------------------------------------
@@ -122,12 +128,13 @@ export async function createSession(
 ): Promise<string> {
   const sessionId = crypto.randomUUID()
   const now = Date.now()
+  const ip = sessionIp(meta.ip)
 
   const data: SessionData = {
     userId,
     credentialId,
     userAgent: meta.userAgent ?? null,
-    ip: meta.ip ?? null,
+    ip,
     lastSeenAt: now,
   }
 
@@ -140,7 +147,7 @@ export async function createSession(
     userId,
     credentialId: credentialId ?? undefined,
     userAgent: meta.userAgent ?? undefined,
-    ipAddress: meta.ip ?? undefined,
+    ipAddress: ip ?? undefined,
   })
 
   return sessionId
