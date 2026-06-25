@@ -162,7 +162,7 @@ export function LoginForm({ passkeysEnabled = true }: LoginFormProps) {
             Forge
           </h1>
           <p className="mt-2 text-sm text-muted-foreground">
-            {passkeysEnabled ? 'Sign in with your password or passkey' : 'Sign in with your password'}
+            {passkeysEnabled ? 'Sign in to the local account with your password or passkey' : 'Sign in to the local account with your password'}
           </p>
         </div>
 
@@ -210,7 +210,7 @@ export function LoginForm({ passkeysEnabled = true }: LoginFormProps) {
                 htmlFor="password"
                 className="mb-1.5 block text-sm font-medium text-foreground"
               >
-                Password
+                Local account password
               </label>
               <input
                 id="password"
