@@ -217,8 +217,8 @@ opening; move it lower in the document.
 - Keep UI dense, readable, keyboard-accessible, and explicit about state.
 - Run Reviewer and QA before merge.
 
-## Future CLI Notes
+## CLI Notes
 
-Until a global CLI exists, route through existing scripts instead of duplicating
-logic. Future commands should wrap the same install, doctor, worker, and npm
-flows documented in the operator guide.
+The global `forge` launcher is a thin operator wrapper. Keep implementation
+logic in the existing install, doctor, worker, and npm flows; CLI commands
+should route to those sources of truth instead of duplicating behavior.

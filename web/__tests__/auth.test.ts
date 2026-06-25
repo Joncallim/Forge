@@ -528,6 +528,7 @@ describe('login/password', () => {
 describe('login/password — rate limiting', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    delete process.env.FORGE_TRUST_PROXY
     mockRedisExpire.mockResolvedValue(1)
   })
 
@@ -545,6 +546,45 @@ describe('login/password — rate limiting', () => {
     const res = await POST(req as never)
     expect(res.status).toBe(429)
     expect(mockVerifyPassword).not.toHaveBeenCalled()
+  })
+
+  it('does not trust forwarded IP headers unless proxy mode is enabled', async () => {
+    mockRedisIncr.mockResolvedValue(11)
+
+    const { POST } = await import('@/app/api/auth/login/password/route')
+
+    const req = new Request('http://localhost/api/auth/login/password', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-forwarded-for': '203.0.113.10',
+      },
+      body: JSON.stringify({ password: 'whatever' }),
+    })
+
+    await POST(req as never)
+
+    expect(mockRedisIncr).toHaveBeenCalledWith('ratelimit:login:password:ip:direct')
+  })
+
+  it('uses forwarded IP headers when trusted proxy mode is enabled', async () => {
+    process.env.FORGE_TRUST_PROXY = '1'
+    mockRedisIncr.mockResolvedValue(11)
+
+    const { POST } = await import('@/app/api/auth/login/password/route')
+
+    const req = new Request('http://localhost/api/auth/login/password', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-forwarded-for': '203.0.113.10, 198.51.100.20',
+      },
+      body: JSON.stringify({ password: 'whatever' }),
+    })
+
+    await POST(req as never)
+
+    expect(mockRedisIncr).toHaveBeenCalledWith('ratelimit:login:password:ip:203.0.113.10')
   })
 })
 

@@ -2,7 +2,8 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { getSession } from '@/lib/session'
-import { PROVIDER_CATALOG } from '@/lib/providers/catalog'
+import { PROVIDER_CATALOG, providerSupportsUserBaseUrl } from '@/lib/providers/catalog'
+import { validateProviderBaseUrl } from '@/lib/providers/credentials'
 import type { ProviderType } from '@/lib/providers/types'
 
 // ---------------------------------------------------------------------------
@@ -19,7 +20,7 @@ const FETCH_TIMEOUT_MS = 8000
 const requestSchema = z.object({
   providerType: z.string(),
   apiKey: z.string().optional(),
-  baseUrl: z.string().optional(),
+  baseUrl: z.string().nullable().optional(),
 })
 
 async function fetchJson(url: string, headers: Record<string, string>): Promise<unknown> {
@@ -43,7 +44,23 @@ function extractOpenAiCompatibleIds(data: unknown): string[] {
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
 }
 
-async function listModels(providerType: ProviderType, apiKey: string, baseUrl?: string): Promise<string[]> {
+function baseUrlForModelListing(providerType: ProviderType, baseUrl?: string | null): string {
+  if (providerSupportsUserBaseUrl(providerType)) {
+    return (baseUrl?.trim() || PROVIDER_CATALOG[providerType]?.defaultBaseUrl || '').replace(/\/+$/, '')
+  }
+
+  if (providerType === 'openai') {
+    return 'https://api.openai.com/v1'
+  }
+
+  return (PROVIDER_CATALOG[providerType]?.defaultBaseUrl || '').replace(/\/+$/, '')
+}
+
+async function listModels(
+  providerType: ProviderType,
+  apiKey: string,
+  baseUrl?: string | null,
+): Promise<string[]> {
   switch (providerType) {
     case 'acp':
       throw new Error('ACP providers do not expose model listing through this endpoint')
@@ -69,8 +86,7 @@ async function listModels(providerType: ProviderType, apiKey: string, baseUrl?: 
     default: {
       // OpenAI-compatible providers: openai, openrouter, xai, deepseek, moonshot,
       // zhipu, litellm, custom — all expose GET {baseUrl}/models.
-      const entry = PROVIDER_CATALOG[providerType]
-      const resolvedBaseUrl = (baseUrl || entry?.defaultBaseUrl || '').replace(/\/$/, '')
+      const resolvedBaseUrl = baseUrlForModelListing(providerType, baseUrl)
       if (!resolvedBaseUrl) {
         throw new Error('A base URL is required to list models for this provider')
       }
@@ -101,6 +117,10 @@ export async function POST(request: NextRequest) {
     }
     if (entry.requiresApiKey && !apiKey) {
       return NextResponse.json({ error: 'An API key is required to list models' }, { status: 400 })
+    }
+    const baseUrlError = validateProviderBaseUrl(providerType, baseUrl)
+    if (baseUrlError) {
+      return NextResponse.json({ error: baseUrlError }, { status: 400 })
     }
 
     try {

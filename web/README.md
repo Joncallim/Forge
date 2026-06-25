@@ -47,6 +47,10 @@ When running from `web/`, both Next.js and the worker load the repository-root
 ## Common Commands
 
 ```bash
+forge                   # start the dashboard and embedded task worker
+forge doctor            # check env, PostgreSQL, Redis, and GitHub CLI readiness
+forge upgrade           # sync dependencies, migrations, seeds, and checks
+forge reset-credentials # reset the local account password
 npm run dev             # start the dashboard and embedded task worker
 npm run worker          # start only the task worker for split deployments
 npm run db:migrate      # apply database migrations
@@ -56,8 +60,9 @@ npm test                # run unit tests
 npm run build           # production build check
 ```
 
-These npm commands remain canonical until the future global CLI described in
-[../docs/operator-guide.md](../docs/operator-guide.md) exists.
+The `forge` launcher is the operator-facing wrapper. The npm commands remain
+the source of truth for development and split-process workflows. See
+[../docs/cli-command-architecture.md](../docs/cli-command-architecture.md).
 
 ## Task Flow
 

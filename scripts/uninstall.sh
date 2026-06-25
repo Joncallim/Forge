@@ -14,8 +14,8 @@
 #
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd)"
 INSTALL_STATE_DIR="$REPO_ROOT/.forge"
 INSTALL_MANIFEST="$INSTALL_STATE_DIR/install-manifest"
 LEGACY_PROJECT_PATHS_FILE="$INSTALL_STATE_DIR/project-paths"
@@ -184,6 +184,46 @@ workspace_root_from_default_settings() {
   printf '%s\n' "$root"
 }
 
+active_workspace_root() {
+  local root
+  root="${FORGE_WORKSPACE_ROOT:-$(read_env_var FORGE_WORKSPACE_ROOT)}"
+  if [ -z "$root" ]; then
+    root="$(workspace_root_from_default_settings)"
+  fi
+  if [ -z "$root" ]; then
+    root="$(default_workspace_root)"
+  fi
+  [ -n "$root" ] || return 0
+  expand_home_path "$root"
+}
+
+workspace_settings_value() {
+  local key="$1" root settings_file value
+  root="$(active_workspace_root)"
+  [ -n "$root" ] || return 0
+  settings_file="$root/global-settings.json"
+  [ -f "$settings_file" ] || return 0
+  value="$(
+    sed -n "s/^[[:space:]]*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$settings_file" |
+      head -n1
+  )"
+  [ -n "$value" ] || return 0
+  expand_home_path "$value"
+}
+
+workspace_projects_root() {
+  local root projects_root
+  projects_root="$(workspace_settings_value projectsRoot)"
+  if [ -n "$projects_root" ]; then
+    printf '%s\n' "$projects_root"
+    return 0
+  fi
+
+  root="$(active_workspace_root)"
+  [ -n "$root" ] || return 0
+  printf '%s/projects\n' "$root"
+}
+
 project_paths() {
   local file
   for file in "$(workspace_project_paths_file)" "$LEGACY_PROJECT_PATHS_FILE"; do
@@ -194,54 +234,156 @@ project_paths() {
   done
 }
 
+project_marker_project_id() {
+  local dir="$1" marker
+  marker="$dir/forge.project.json"
+  [ -f "$marker" ] || return 0
+  sed -n 's/.*"projectId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$marker" |
+    head -n1
+}
+
+project_path_records() {
+  local dir project_id
+  while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    project_id="$(project_marker_project_id "$dir")"
+    printf '%s\t%s\n' "$project_id" "$dir"
+  done < <(project_paths)
+}
+
 # Local project folders recorded in the database. This catches projects created
 # through the web UI, which the on-disk registry may not always record.
 # Best-effort: silent when psql or the database is unavailable.
-db_project_paths() {
+db_project_records() {
   local url
   url="$(app_database_url)"
   [ -n "$url" ] || return 0
   command -v psql >/dev/null 2>&1 || return 0
-  psql "$url" -tAc \
-    "SELECT local_path FROM projects WHERE local_path IS NOT NULL AND local_path <> ''" \
+  psql "$url" -tA -F $'\t' -c \
+    "SELECT id, local_path FROM projects WHERE local_path IS NOT NULL AND local_path <> ''" \
     2>/dev/null | grep -v '^[[:space:]]*$' || true
 }
 
-# Union of folders from the on-disk registry and the database, de-duplicated
-# while preserving order.
-all_project_paths() {
-  { project_paths; db_project_paths; } | grep -v '^[[:space:]]*$' | awk '!seen[$0]++'
+all_project_records() {
+  local record project_dir seen
+  seen=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    project_dir="$(record_project_path "$record")"
+    [ -n "$project_dir" ] || continue
+    case "$seen" in
+      *"|$project_dir|"*) continue ;;
+    esac
+    seen="${seen}|${project_dir}|"
+    printf '%s\n' "$record"
+  done < <({ project_path_records; db_project_records; } 2>/dev/null)
 }
 
-# Guard against deleting paths that are clearly not a project folder Forge
-# created. Project rows can hold arbitrary paths (set via the project update API
-# or edited by hand), so a row pointing at $HOME, the repo checkout, or a
-# top-level directory must never be passed to rm -rf. Mirrors isSafeToDelete in
-# web/app/api/projects/[id]/route.ts: must be absolute, not the filesystem root,
-# not $HOME, not the repo root, and at least two segments deep.
-is_safe_project_path() {
-  local raw="$1" p depth
-  [ -n "$raw" ] || return 1
-  case "$raw" in
-    /*) ;;
+record_project_id() {
+  local record="$1"
+  printf '%s\n' "${record%%$'\t'*}"
+}
+
+record_project_path() {
+  local record="$1"
+  printf '%s\n' "${record#*$'\t'}"
+}
+
+strip_trailing_slashes() {
+  local p="$1"
+  while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+  printf '%s\n' "$p"
+}
+
+realpath_existing_dir() {
+  local p="$1"
+  [ -d "$p" ] || return 1
+  (cd -P "$p" >/dev/null 2>&1 && pwd)
+}
+
+is_within_path() {
+  local parent child
+  parent="$(strip_trailing_slashes "$1")"
+  child="$(strip_trailing_slashes "$2")"
+  [ "$child" = "$parent" ] && return 0
+  case "$child" in
+    "$parent"/*) return 0 ;;
     *) return 1 ;;
   esac
-  p="$raw"
-  while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
-  [ "$p" = "/" ] && return 1
-  [ -n "${HOME:-}" ] && [ "$p" = "$HOME" ] && return 1
-  [ "$p" = "$REPO_ROOT" ] && return 1
-  depth="$(printf '%s\n' "${p#/}" | awk -F/ '{c=0; for (i=1;i<=NF;i++) if ($i != "") c++; print c}')"
-  [ "${depth:-0}" -ge 2 ] || return 1
+}
+
+is_protected_project_root() {
+  local target="$1" workspace_root projects_root protected real_protected
+  workspace_root="$(active_workspace_root)"
+  projects_root="$(workspace_projects_root)"
+  for protected in \
+    "$workspace_root" \
+    "$projects_root" \
+    "$(workspace_settings_value mcpsRoot)" \
+    "$(workspace_settings_value templatesRoot)" \
+    "$(workspace_settings_value localMemoryRoot)" \
+    "$(workspace_settings_value checkpointsRoot)" \
+    "$workspace_root/mcps" \
+    "$workspace_root/templates" \
+    "$workspace_root/memory" \
+    "$workspace_root/checkpoints"
+  do
+    [ -n "$protected" ] || continue
+    real_protected="$(realpath_existing_dir "$protected" 2>/dev/null || true)"
+    [ -n "$real_protected" ] || continue
+    [ "$target" = "$real_protected" ] && return 0
+  done
+  return 1
+}
+
+validate_project_delete_record() {
+  local record="$1" project_id raw dir projects_root real_projects_root real_target marker_id
+  project_id="$(record_project_id "$record")"
+  raw="$(record_project_path "$record")"
+  [ -n "$raw" ] || { printf '%s\n' "missing project path"; return 1; }
+  [ -n "$project_id" ] || { printf '%s\n' "missing Forge project id marker"; return 1; }
+  case "$raw" in
+    /*) ;;
+    *) printf '%s\n' "path is not absolute"; return 1 ;;
+  esac
+
+  dir="$(strip_trailing_slashes "$raw")"
+  [ "$dir" != "/" ] || { printf '%s\n' "path is filesystem root"; return 1; }
+  [ ! -L "$dir" ] || { printf '%s\n' "path is a symlink"; return 1; }
+  [ -d "$dir" ] || { printf '%s\n' "path is not an existing directory"; return 1; }
+
+  projects_root="$(workspace_projects_root)"
+  real_projects_root="$(realpath_existing_dir "$projects_root" 2>/dev/null || true)"
+  [ -n "$real_projects_root" ] || { printf '%s\n' "Forge projects root does not exist"; return 1; }
+  real_target="$(realpath_existing_dir "$dir" 2>/dev/null || true)"
+  [ -n "$real_target" ] || { printf '%s\n' "could not resolve project path"; return 1; }
+  [ "$real_target" != "$real_projects_root" ] || { printf '%s\n' "path is the shared projects root"; return 1; }
+  is_within_path "$real_projects_root" "$real_target" ||
+    { printf '%s\n' "path escapes the Forge projects root"; return 1; }
+  is_protected_project_root "$real_target" &&
+    { printf '%s\n' "path is a shared Forge workspace directory"; return 1; }
+
+  marker_id="$(project_marker_project_id "$dir")"
+  [ -n "$marker_id" ] || { printf '%s\n' "missing forge.project.json projectId"; return 1; }
+  [ "$marker_id" = "$project_id" ] ||
+    { printf '%s\n' "forge.project.json projectId does not match"; return 1; }
+
   return 0
 }
 
-# Project folders safe to delete, after applying the guard above.
+safe_project_records() {
+  local record
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    validate_project_delete_record "$record" >/dev/null && printf '%s\n' "$record"
+  done < <(all_project_records)
+}
+
 safe_project_paths() {
-  local dir
-  while IFS= read -r dir; do
-    is_safe_project_path "$dir" && printf '%s\n' "$dir"
-  done < <(all_project_paths)
+  local record
+  while IFS= read -r record; do
+    record_project_path "$record"
+  done < <(safe_project_records)
 }
 
 resolve_remove_projects() {
@@ -272,16 +414,19 @@ resolve_remove_projects() {
 
 remove_project_files() {
   [ "$REMOVE_PROJECTS" = "1" ] || return 0
-  [ -n "$(all_project_paths)" ] || return 0
+  [ -n "$(all_project_records)" ] || return 0
 
   step "Removing local project folders"
 
   # Surface anything we refuse to touch so an operator can clean it up by hand.
-  while IFS= read -r project_dir; do
-    [ -n "$project_dir" ] || continue
-    is_safe_project_path "$project_dir" && continue
-    warn "Skipped unsafe project path (not deleted): $project_dir"
-  done < <(all_project_paths)
+  local record project_dir reason
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    project_dir="$(record_project_path "$record")"
+    reason="$(validate_project_delete_record "$record" 2>/dev/null || true)"
+    [ -z "$reason" ] && continue
+    warn "Skipped unsafe project path (not deleted): $project_dir - $reason"
+  done < <(all_project_records)
 
   while IFS= read -r project_dir; do
     [ -n "$project_dir" ] || continue
@@ -483,6 +628,57 @@ remove_build_artifacts() {
   remove_path "$REPO_ROOT/web/playwright-report"
   remove_path "$REPO_ROOT/web/test-results"
   remove_path "$REPO_ROOT/web/coverage"
+}
+
+remove_cli_link_path() {
+  local link_path="$1" launcher target
+  [ -n "$link_path" ] || return 0
+  [ -L "$link_path" ] || return 0
+
+  launcher="$REPO_ROOT/bin/forge"
+  target="$(canonical_symlink_target "$link_path")" || target=""
+  [ "$target" = "$launcher" ] || return 0
+
+  if [ "$DRY_RUN" = "1" ]; then
+    info "[dry-run] Remove $link_path"
+    return 0
+  fi
+
+  rm -f "$link_path" && info "Removed $link_path"
+}
+
+canonical_symlink_target() {
+  local link_path="$1" raw_target target_dir target_name
+  raw_target="$(readlink "$link_path")"
+  case "$raw_target" in
+    /*) ;;
+    *) raw_target="$(dirname "$link_path")/$raw_target" ;;
+  esac
+
+  target_dir="$(cd -P "$(dirname "$raw_target")" 2>/dev/null && pwd)" || return 1
+  target_name="$(basename "$raw_target")"
+  printf '%s/%s\n' "$target_dir" "$target_name"
+}
+
+remove_cli_entrypoint() {
+  step "Removing Forge CLI entrypoint"
+
+  local link_path seen
+  seen=""
+
+  while IFS= read -r link_path; do
+    [ -n "$link_path" ] || continue
+    case "$seen" in
+      *"|$link_path|"*) continue ;;
+    esac
+    seen="${seen}|${link_path}|"
+    remove_cli_link_path "$link_path"
+  done < <(
+    {
+      manifest_values "cli_link"
+      printf '%s\n' "$HOME/.local/bin/forge" "$HOME/bin/forge" /opt/homebrew/bin/forge /usr/local/bin/forge
+    } 2>/dev/null
+  )
 }
 
 remove_env_files() {
@@ -898,6 +1094,7 @@ fi
 
 remove_project_files
 remove_build_artifacts
+remove_cli_entrypoint
 drop_app_database
 stop_docker_services
 remove_recorded_ollama_models

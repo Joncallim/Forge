@@ -334,8 +334,9 @@ token and never prompts.
 - Phase 1, Personal Access Token: implemented. When the CLI is not
   authenticated, Settings prompts for a PAT, validates it against GitHub, and
   stores it encrypted in `app_settings`. Token resolution order for repository
-  operations is stored PAT, then `gh` CLI token, then legacy per-project
-  `githubTokenEnvVar`.
+  operations is stored PAT, then `gh` CLI token, then an allowlisted legacy
+  per-project `githubTokenEnvVar` (`GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_PAT`, or
+  `FORGE_GITHUB_TOKEN`).
 - Phase 2, GitHub OAuth device flow: planned. Register a GitHub OAuth app and
   run device-code authorization in the web UI so the user authorizes Forge
   without creating a PAT by hand.
@@ -369,8 +370,9 @@ Future terminal installer goals:
 - Keep secrets out of terminal history.
 - Write a clear install summary and uninstall record.
 
-Future CLI command taxonomy is reserved in `docs/operator-guide.md`. A global
-`forge` launcher is not part of the current supported workflow.
+The starter CLI command taxonomy is documented in
+`docs/cli-command-architecture.md`. The global `forge` launcher is a thin
+wrapper over existing install, uninstall, web, and recovery scripts.
 
 ## Reference Material
 

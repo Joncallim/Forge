@@ -44,15 +44,14 @@ Useful variants:
 
 ```bash
 bash scripts/install.sh --check      # inspect readiness without changing the machine
-bash scripts/install.sh --upgrade    # sync dependencies and migrations after pulling updates
+forge upgrade                        # sync dependencies and migrations after pulling updates
 FORGE_SKIP_OLLAMA=1 bash scripts/install.sh
 ```
 
 Then start Forge:
 
 ```bash
-cd web
-npm run dev
+forge
 ```
 
 Open:
@@ -63,6 +62,16 @@ http://localhost:3000
 
 The first account creates a password and, by default, a passkey. To use password
 only, set `FORGE_PASSKEYS_ENABLED=0` in `.env` before creating the first account.
+
+If you kept settings during uninstall/reinstall, Forge keeps the existing
+single-user account. Registration will stay closed, so recover from the shell:
+
+```bash
+forge reset-credentials
+```
+
+Use `http://localhost:3000` for local passkeys unless you also update
+`WEBAUTHN_RP_ID` and `WEBAUTHN_ORIGIN` in `.env`.
 
 ## Try A Task
 
@@ -113,6 +122,7 @@ stored and displayed. Execution remains a later slice.
 ## Docs
 
 - [Operator guide](docs/operator-guide.md) - install, run, deploy, uninstall, and troubleshoot Forge.
+- [CLI architecture](docs/cli-command-architecture.md) - `forge` command taxonomy and routing.
 - [Developer guide](docs/developer-guide.md) - web app, worker, database, tests, prompts, and coding standards.
 - [Design guide](docs/design.md) - product model, UI principles, screenshot evidence, and visual QA notes.
 - [Roadmap](docs/roadmap.md) - current beta status, Workforce architecture, and upcoming slices.

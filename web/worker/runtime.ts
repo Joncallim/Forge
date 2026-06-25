@@ -267,6 +267,7 @@ async function startWorkerOnce(
         if (claimedAnswers !== null) {
           let ackedAnswers = false
           let answersAttemptId: string | null = null
+          const finalAttempt = claimedAnswers.job.attempt >= maxAttempts
           try {
             answersAttemptId = await startTaskAttempt({
               attemptNumber: claimedAnswers.job.attempt,
@@ -280,7 +281,7 @@ async function startWorkerOnce(
               taskId: claimedAnswers.job.taskId,
               workerId,
             })
-            await processAnsweredQuestions(claimedAnswers.job.taskId)
+            await processAnsweredQuestions(claimedAnswers.job.taskId, { finalAttempt })
             if (answersAttemptId) {
               await finishTaskAttempt({ attemptId: answersAttemptId, status: 'completed' })
             }
@@ -288,7 +289,6 @@ async function startWorkerOnce(
             ackedAnswers = true
           } catch (err) {
             const message = errorMessage(err)
-            const finalAttempt = claimedAnswers.job.attempt >= maxAttempts
             const nextRetryAt = finalAttempt
               ? null
               : new Date(Date.now() + backoffDelayMs(claimedAnswers.job.attempt))

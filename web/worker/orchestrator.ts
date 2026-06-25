@@ -351,6 +351,47 @@ async function persistOpenQuestions(taskId: string, questions: OpenQuestion[]): 
   return rows.length
 }
 
+async function restoreAnsweredQuestionsSnapshot(
+  taskId: string,
+  answeredQuestions: AnsweredQuestion[],
+): Promise<void> {
+  if (answeredQuestions.length === 0) return
+
+  await db.delete(taskQuestions).where(eq(taskQuestions.taskId, taskId))
+  const rows = await db
+    .insert(taskQuestions)
+    .values(
+      answeredQuestions.map((question) => ({
+        taskId,
+        question: question.question,
+        suggestions: [],
+        answer: question.answer,
+        status: 'answered' as const,
+        answeredAt: new Date(),
+      })),
+    )
+    .returning()
+
+  await publishTaskEvent(taskId, 'questions:created', {
+    questions: rows.map((row) => ({
+      id: row.id,
+      question: row.question,
+      suggestions: row.suggestions,
+      status: row.status,
+      answer: row.answer,
+    })),
+  })
+}
+
+function answeredQuestionSnapshot(
+  questions: Array<typeof taskQuestions.$inferSelect>,
+): AnsweredQuestion[] {
+  return questions.map((q) => ({
+    question: q.question,
+    answer: q.answer ?? '',
+  }))
+}
+
 async function runArchitect(
   task: TaskRow,
   project: ProjectRow,
@@ -617,7 +658,10 @@ export async function processTask(
  * answered. Idempotent: skips tasks that are not currently
  * `awaiting_answers`, or that still have unanswered questions.
  */
-export async function processAnsweredQuestions(taskId: string): Promise<void> {
+export async function processAnsweredQuestions(
+  taskId: string,
+  options: { finalAttempt?: boolean } = {},
+): Promise<void> {
   const context = await loadTaskContext(taskId)
   if (!context) {
     console.warn('[worker/orchestrator] Task not found', { taskId })
@@ -646,6 +690,16 @@ export async function processAnsweredQuestions(taskId: string): Promise<void> {
     })
     return
   }
+  if (existingQuestions.length === 0) {
+    const message = 'Cannot re-plan because no answered question rows were found'
+    console.warn('[worker/orchestrator] Refusing answered-question re-plan with no question rows', {
+      taskId,
+    })
+    await updateTaskStatus(taskId, 'failed', message)
+    return
+  }
+
+  const answeredQuestions = answeredQuestionSnapshot(existingQuestions)
 
   const claimed = await updateTaskStatusIfCurrent(taskId, 'awaiting_answers', 'running')
   if (!claimed) {
@@ -654,11 +708,6 @@ export async function processAnsweredQuestions(taskId: string): Promise<void> {
   }
 
   try {
-    const answeredQuestions: AnsweredQuestion[] = existingQuestions.map((q) => ({
-      question: q.question,
-      answer: q.answer ?? '',
-    }))
-
     const { openQuestionCount, checkpoint } = await runArchitect(task, project, answeredQuestions)
 
     if (await isTaskCancelled(taskId)) {
@@ -671,9 +720,17 @@ export async function processAnsweredQuestions(taskId: string): Promise<void> {
   } catch (err) {
     const message = errorMessage(err)
     const checkpoint = architectCheckpointFromError(err)
-    await updateTaskStatus(taskId, 'failed', message)
-    if (checkpoint) {
-      await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: 'failed' })
+    if (options.finalAttempt ?? true) {
+      await updateTaskStatus(taskId, 'failed', message)
+      if (checkpoint) {
+        await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: 'failed' })
+      }
+    } else if (!(await isTaskCancelled(taskId))) {
+      await restoreAnsweredQuestionsSnapshot(taskId, answeredQuestions)
+      await updateTaskStatus(taskId, 'awaiting_answers', `Retrying after error: ${message}`)
+      if (checkpoint) {
+        await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: 'awaiting_answers' })
+      }
     }
     throw err
   }

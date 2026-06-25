@@ -9,6 +9,11 @@ import { PROVIDER_TYPES, requiresProviderBaseUrl } from '@/lib/providers/types'
 import { toPublicProvider } from '@/lib/providers/serialize'
 import { encryptSecret } from '@/lib/crypto'
 import { isAcpAgentId } from '@/lib/providers/acp/catalog'
+import {
+  providerBaseUrlForStorage,
+  validateProviderApiKeyEnvVar,
+  validateProviderBaseUrl,
+} from '@/lib/providers/credentials'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -97,11 +102,19 @@ export async function POST(request: NextRequest) {
     }
 
     // Conditional validation: baseUrl is required for provider types with a custom endpoint.
-    if (requiresProviderBaseUrl(data.providerType) && !data.baseUrl) {
+    if (requiresProviderBaseUrl(data.providerType) && !data.baseUrl?.trim()) {
       return NextResponse.json(
         { error: `baseUrl is required for ${data.providerType} providers` },
         { status: 400 },
       )
+    }
+    const baseUrlError = validateProviderBaseUrl(data.providerType, data.baseUrl)
+    if (baseUrlError) {
+      return NextResponse.json({ error: baseUrlError }, { status: 400 })
+    }
+    const envVarError = validateProviderApiKeyEnvVar(data.providerType, data.apiKeyEnvVar)
+    if (envVarError) {
+      return NextResponse.json({ error: envVarError }, { status: 400 })
     }
 
     const apiKeyCiphertext =
@@ -113,8 +126,10 @@ export async function POST(request: NextRequest) {
         displayName: data.displayName,
         providerType: data.providerType,
         modelId: data.modelId,
-        baseUrl: data.providerType === 'acp' ? null : data.baseUrl ?? null,
-        apiKeyEnvVar: data.providerType === 'acp' ? null : data.apiKeyEnvVar ?? null,
+        baseUrl: data.providerType === 'acp'
+          ? null
+          : providerBaseUrlForStorage(data.providerType, data.baseUrl),
+        apiKeyEnvVar: data.providerType === 'acp' ? null : data.apiKeyEnvVar?.trim() || null,
         apiKeyCiphertext,
         isLocal: data.providerType === 'acp' ? true : data.isLocal,
       })

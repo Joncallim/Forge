@@ -10,6 +10,12 @@ const execFile = promisify(execFileCallback)
 export const GITHUB_PAT_SETTING_KEY = 'github_pat'
 const GITHUB_CLI_TIMEOUT_MS = 3000
 const GITHUB_STATUS_CACHE_MS = 30_000
+export const ALLOWED_GITHUB_TOKEN_ENV_VARS = [
+  'GITHUB_TOKEN',
+  'GH_TOKEN',
+  'GITHUB_PAT',
+  'FORGE_GITHUB_TOKEN',
+] as const
 
 export type GitHubTokenSource = 'cli' | 'pat' | 'env' | 'none'
 
@@ -213,6 +219,21 @@ export async function listRepos(
 // Token resolution + status
 // ---------------------------------------------------------------------------
 
+export function validateGitHubTokenEnvVar(rawEnvVar: string | null | undefined): string | null {
+  const envVar = rawEnvVar?.trim()
+  if (!envVar) return null
+
+  if ((ALLOWED_GITHUB_TOKEN_ENV_VARS as readonly string[]).includes(envVar)) return null
+
+  return `GitHub token env var must be one of: ${ALLOWED_GITHUB_TOKEN_ENV_VARS.join(', ')}`
+}
+
+function safeGitHubTokenEnvVar(rawEnvVar: string | null | undefined): string | null {
+  const envVar = rawEnvVar?.trim()
+  if (!envVar) return null
+  return validateGitHubTokenEnvVar(envVar) === null ? envVar : null
+}
+
 /**
  * Resolve a GitHub token for repo operations, in priority order:
  *   1. stored PAT (entered via the web UI),
@@ -228,7 +249,7 @@ export async function resolveGitHubToken(
   const cliToken = await getCliToken()
   if (cliToken) return { token: cliToken, source: 'cli' }
 
-  const envVar = opts.envVar?.trim()
+  const envVar = safeGitHubTokenEnvVar(opts.envVar)
   if (envVar) {
     const fromEnv = process.env[envVar]
     if (fromEnv && fromEnv.trim() !== '') return { token: fromEnv, source: 'env' }

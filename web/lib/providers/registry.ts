@@ -9,6 +9,7 @@ import { eq, asc } from 'drizzle-orm'
 import { requiresProviderBaseUrl } from './types'
 import { PROVIDER_CATALOG } from './catalog'
 import { decryptSecret } from '@/lib/crypto'
+import { providerApiKeyEnvVarError, safeProviderApiKeyEnvVar } from './credentials'
 import type { ProviderType } from './types'
 
 // ---------------------------------------------------------------------------
@@ -50,8 +51,8 @@ function normalizeOllamaBaseUrl(baseUrl: string | null): string | undefined {
 
 /**
  * Resolve the API key for a provider. A key entered via the UI (stored
- * encrypted in `apiKeyCiphertext`) takes precedence; otherwise we fall back to
- * the legacy `apiKeyEnvVar` env-var lookup for backward compatibility.
+ * encrypted in `apiKeyCiphertext`) takes precedence; otherwise we allow only
+ * fixed, provider-specific env-var names for cloud providers.
  */
 function resolveApiKey(config: ProviderConfig): string | undefined {
   if (config.apiKeyCiphertext) {
@@ -66,14 +67,22 @@ function resolveApiKey(config: ProviderConfig): string | undefined {
     }
   }
 
-  if (config.apiKeyEnvVar) {
-    const fromEnv = process.env[config.apiKeyEnvVar]
+  const safeEnvVar = safeProviderApiKeyEnvVar(config)
+  if (safeEnvVar) {
+    const fromEnv = process.env[safeEnvVar]
     if (fromEnv === undefined) {
       console.warn(
-        `[providers/registry] env var "${config.apiKeyEnvVar}" is not set for provider config ${config.id} (${config.displayName}). The provider will be instantiated but calls will likely fail.`,
+        `[providers/registry] env var "${safeEnvVar}" is not set for provider config ${config.id} (${config.displayName}). The provider will be instantiated but calls will likely fail.`,
       )
     }
     return fromEnv
+  }
+
+  const unsafeEnvVarError = providerApiKeyEnvVarError(config)
+  if (unsafeEnvVarError) {
+    console.warn(
+      `[providers/registry] ignored unsafe apiKeyEnvVar "${config.apiKeyEnvVar}" for provider config ${config.id} (${config.displayName}): ${unsafeEnvVarError}`,
+    )
   }
 
   return undefined
@@ -103,7 +112,7 @@ function buildProvider(config: ProviderConfig): ProviderFactory {
       // OpenAI-compatible cloud providers with a known, fixed base URL.
       return createOpenAI({
         apiKey,
-        baseURL: config.baseUrl ?? PROVIDER_CATALOG[config.providerType].defaultBaseUrl,
+        baseURL: PROVIDER_CATALOG[config.providerType].defaultBaseUrl,
       })
 
     case 'litellm':

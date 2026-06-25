@@ -642,8 +642,7 @@ function SecurityCard() {
             Removing a passkey here deletes it permanently — Forge will no longer accept it for
             sign-in. If you ever lose access to both your passkey and your password, an operator
             with shell access to this install can run{' '}
-            <code className="font-mono">npm run auth:reset-password -- &lt;new-password&gt;</code>{' '}
-            from the <code className="font-mono">web</code> directory to set a new password.
+            <code className="font-mono">forge reset-credentials</code> to set a new password.
           </p>
         </div>
       )}

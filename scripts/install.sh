@@ -16,8 +16,8 @@
 #
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd)"
 ENV_FILE="${FORGE_ENV_FILE:-$REPO_ROOT/.env}"
 INSTALL_STATE_DIR="${FORGE_INSTALL_STATE_DIR:-$REPO_ROOT/.forge}"
 INSTALL_MANIFEST="$INSTALL_STATE_DIR/install-manifest"
@@ -101,6 +101,7 @@ Environment:
   FORGE_OS_OVERRIDE=Darwin|Linux              # dry-run/testing helper
   FORGE_PACKAGE_MANAGER_OVERRIDE=apt|brew     # dry-run/testing helper
   FORGE_ENV_FILE=/path/to/.env                # testing/advanced helper
+  FORGE_CLI_LINK_DIR=/path/on/PATH            # testing/advanced helper
   FORGE_NPM_INSTALL_TIMEOUT_SECONDS=900       # npm install/ci timeout guard
 EOF
 }
@@ -1070,6 +1071,7 @@ write_env_file() {
   ensure_env_value FORGE_AGENT_WEB_SEARCH "1"
   ensure_env_value FORGE_WORKER_CLAIM_TIMEOUT_SECONDS "5"
   ensure_env_value FORGE_PASSKEYS_ENABLED "1"
+  ensure_env_value FORGE_TRUST_PROXY "0"
   ensure_env_value SESSION_SECRET "$SESSION_SECRET" placeholder
   ensure_env_value WEBAUTHN_RP_ID "localhost"
   ensure_env_value WEBAUTHN_RP_NAME "Forge"
@@ -1241,6 +1243,95 @@ run_doctor() {
   run "npm run doctor" bash -c 'cd "$1" && npm run doctor' _ "$REPO_ROOT/web"
 }
 
+path_contains_dir() {
+  local needle="$1" dir
+  local IFS=:
+  for dir in $PATH; do
+    [ "$dir" = "$needle" ] && return 0
+  done
+  return 1
+}
+
+canonical_symlink_target() {
+  local link_path="$1" raw_target target_dir target_name
+  raw_target="$(readlink "$link_path")"
+  case "$raw_target" in
+    /*) ;;
+    *) raw_target="$(dirname "$link_path")/$raw_target" ;;
+  esac
+
+  target_dir="$(cd -P "$(dirname "$raw_target")" 2>/dev/null && pwd)" || return 1
+  target_name="$(basename "$raw_target")"
+  printf '%s/%s\n' "$target_dir" "$target_name"
+}
+
+preferred_cli_link_dir() {
+  local configured="${FORGE_CLI_LINK_DIR:-}"
+  if [ -n "$configured" ]; then
+    printf '%s\n' "$configured"
+    return 0
+  fi
+
+  local dir
+  local IFS=:
+  for dir in $PATH; do
+    case "$dir" in
+      "$HOME/.local/bin"|"$HOME/bin"|/opt/homebrew/bin|/usr/local/bin)
+        if [ -d "$dir" ] && [ -w "$dir" ]; then
+          printf '%s\n' "$dir"
+          return 0
+        fi
+        ;;
+    esac
+  done
+
+  printf '%s\n' "$HOME/.local/bin"
+}
+
+install_cli_entrypoint() {
+  step "Installing Forge CLI entrypoint"
+
+  local launcher link_dir link_path existing_target
+  launcher="$REPO_ROOT/bin/forge"
+  link_dir="$(preferred_cli_link_dir)"
+  link_path="$link_dir/forge"
+
+  if [ ! -f "$launcher" ]; then
+    warn "Skipped CLI entrypoint because $launcher is missing."
+    return 0
+  fi
+
+  if [ "$DRY_RUN" = "1" ]; then
+    info "[dry-run] Link $link_path -> $launcher"
+    return 0
+  fi
+
+  chmod +x "$launcher" 2>/dev/null || true
+  mkdir -p "$link_dir"
+
+  if [ -e "$link_path" ] || [ -L "$link_path" ]; then
+    if [ -L "$link_path" ]; then
+      existing_target="$(canonical_symlink_target "$link_path")" || existing_target=""
+      if [ "$existing_target" = "$launcher" ]; then
+        info "Forge CLI already linked at $link_path."
+        record_manifest "cli_link" "$link_path"
+        return 0
+      fi
+    fi
+    warn "Skipped CLI entrypoint because $link_path already exists."
+    warn "Run $launcher directly, or set FORGE_CLI_LINK_DIR to another PATH directory."
+    return 0
+  fi
+
+  ln -s "$launcher" "$link_path"
+  record_manifest "cli_link" "$link_path"
+  info "Linked $link_path -> $launcher"
+
+  if ! path_contains_dir "$link_dir"; then
+    warn "$link_dir is not on PATH. Add it to your shell profile to run 'forge' globally."
+  fi
+}
+
 resolve_service_mode() {
   if [ "$SERVICE_MODE" = "auto" ]; then
     SERVICE_MODE="native"
@@ -1358,7 +1449,7 @@ print_summary() {
 
   Start the app:
 
-    cd web && npm run dev
+    forge
 
   Then open http://localhost:3000 and create the first account.
   For password-only first sign-in, set FORGE_PASSKEYS_ENABLED=0 in .env before
@@ -1368,8 +1459,10 @@ print_summary() {
   The first account creates a password and, when enabled, a passkey.
 
   Recovery:
+    - Upgrade after pulling changes with: forge upgrade
     - Check readiness any time with: bash scripts/install.sh --check
     - If setup was interrupted or failed, re-run: bash scripts/install.sh
+    - If you cannot sign in, reset the local account password with: forge reset-credentials
     - Detailed install log: $INSTALL_LOG
 
   For repository tooling, confirm GitHub CLI access with:
@@ -1455,6 +1548,7 @@ fi
 SESSION_SECRET="${SESSION_SECRET:-$(random_hex 32)}"
 
 write_env_file
+install_cli_entrypoint
 
 if [ "$SERVICE_MODE" = "docker" ]; then
   start_docker_services

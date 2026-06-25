@@ -4,7 +4,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { z } from 'zod'
 import { getSession } from '@/lib/session'
-import { getWorkspaceSettings } from '@/lib/workspace'
+import { getWorkspaceSettings, isWithinPath, type WorkspaceSettings } from '@/lib/workspace'
 
 export const runtime = 'nodejs'
 
@@ -33,17 +33,55 @@ async function hasGitSubdirectory(dirPath: string): Promise<boolean> {
   }
 }
 
-async function defaultStartPath(): Promise<string> {
-  const workspace = await getWorkspaceSettings()
-  return workspace.projectsRoot
-}
-
-async function resolveDirectoryPath(rawPath: string | null): Promise<string> {
-  const start = await defaultStartPath()
-  if (!rawPath || rawPath.trim() === '') return path.resolve(/*turbopackIgnore: true*/ start)
-  return path.isAbsolute(rawPath)
+function resolveDirectoryPath(rawPath: string | null, workspace: WorkspaceSettings): string {
+  const start = workspace.projectsRoot
+  const resolvedPath = !rawPath || rawPath.trim() === ''
+    ? path.resolve(/*turbopackIgnore: true*/ start)
+    : path.isAbsolute(rawPath)
     ? path.resolve(/*turbopackIgnore: true*/ rawPath)
     : path.resolve(/*turbopackIgnore: true*/ start, rawPath)
+
+  if (!isWithinPath(workspace.workspaceRoot, resolvedPath)) {
+    throw new Error('Path must stay inside the active workspace root')
+  }
+
+  return resolvedPath
+}
+
+async function assertRealPathWithinWorkspace(
+  candidatePath: string,
+  workspace: WorkspaceSettings,
+): Promise<void> {
+  const [realWorkspaceRoot, realCandidate] = await Promise.all([
+    fs.realpath(workspace.workspaceRoot),
+    fs.realpath(candidatePath),
+  ])
+
+  if (!isWithinPath(realWorkspaceRoot, realCandidate)) {
+    throw new Error('Path must stay inside the active workspace root')
+  }
+}
+
+async function assertNearestExistingAncestorWithinWorkspace(
+  candidatePath: string,
+  workspace: WorkspaceSettings,
+): Promise<void> {
+  let currentPath = path.resolve(/*turbopackIgnore: true*/ candidatePath)
+  const workspaceRoot = path.resolve(/*turbopackIgnore: true*/ workspace.workspaceRoot)
+
+  while (isWithinPath(workspaceRoot, currentPath)) {
+    try {
+      await assertRealPathWithinWorkspace(currentPath, workspace)
+      return
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+      const parentPath = path.dirname(currentPath)
+      if (parentPath === currentPath) break
+      currentPath = parentPath
+    }
+  }
+
+  throw new Error('Path must stay inside the active workspace root')
 }
 
 function isSafeDirectoryName(name: string): boolean {
@@ -65,7 +103,9 @@ export async function GET(request: NextRequest) {
 
     const requestedPath = request.nextUrl.searchParams.get('path')
     const showHidden = request.nextUrl.searchParams.get('showHidden') === '1'
-    const currentPath = await resolveDirectoryPath(requestedPath)
+    const workspace = await getWorkspaceSettings()
+    const currentPath = resolveDirectoryPath(requestedPath, workspace)
+    await assertRealPathWithinWorkspace(currentPath, workspace)
     const stat = await fs.stat(currentPath)
     if (!stat.isDirectory()) {
       return NextResponse.json({ error: 'Path is not a directory' }, { status: 400 })
@@ -97,8 +137,11 @@ export async function GET(request: NextRequest) {
       hasGitSubdirectory(currentPath),
     ])
 
-    const parsed = path.parse(currentPath)
-    const parentPath = currentPath === parsed.root ? null : path.dirname(currentPath)
+    const parentCandidate = path.dirname(currentPath)
+    const parentPath = currentPath === workspace.workspaceRoot ||
+      !isWithinPath(workspace.workspaceRoot, parentCandidate)
+      ? null
+      : parentCandidate
 
     return NextResponse.json({
       path: currentPath,
@@ -143,7 +186,8 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const parentPath = await resolveDirectoryPath(parsed.data.parentPath ?? null)
+    const workspace = await getWorkspaceSettings()
+    const parentPath = resolveDirectoryPath(parsed.data.parentPath ?? null, workspace)
     const directoryPath = path.join(/*turbopackIgnore: true*/ parentPath, directoryName)
 
     // Check the parent folder first so we can ask the user before creating it.
@@ -153,6 +197,7 @@ export async function POST(request: NextRequest) {
       if (!parentStat.isDirectory()) {
         return NextResponse.json({ error: 'Parent path is not a directory' }, { status: 400 })
       }
+      await assertRealPathWithinWorkspace(parentPath, workspace)
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
         parentExists = false
@@ -173,11 +218,14 @@ export async function POST(request: NextRequest) {
           { status: 409 },
         )
       }
+      await assertNearestExistingAncestorWithinWorkspace(parentPath, workspace)
       await fs.mkdir(parentPath, { recursive: true })
+      await assertRealPathWithinWorkspace(parentPath, workspace)
     }
 
     try {
       await fs.mkdir(directoryPath)
+      await assertRealPathWithinWorkspace(directoryPath, workspace)
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
         if (!parsed.data.allowExisting) {
@@ -201,6 +249,7 @@ export async function POST(request: NextRequest) {
             { status: 409 },
           )
         }
+        await assertRealPathWithinWorkspace(directoryPath, workspace)
         return NextResponse.json({ path: directoryPath, parentPath, existed: true }, { status: 200 })
       }
       throw err

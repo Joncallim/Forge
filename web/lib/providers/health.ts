@@ -3,6 +3,7 @@ import { and, eq, isNull, lt, or } from 'drizzle-orm'
 import { db } from '@/db'
 import { providerConfigs, providerHealthChecks, type ProviderConfig } from '@/db/schema'
 import { getModel } from './registry'
+import { providerApiKeyEnvVarError, safeProviderApiKeyEnvVar } from './credentials'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -38,17 +39,21 @@ export async function checkProviderHealth(
   // encrypted), or the configured env var is set, or none is configured
   // (local/keyless providers). `envVarPresent` is kept as the field name for
   // wire compatibility but now means "credential present".
+  const safeEnvVar = safeProviderApiKeyEnvVar(config)
+  const unsafeEnvVarError = providerApiKeyEnvVarError(config)
   const envVarPresent =
     !!config.apiKeyCiphertext ||
-    (config.apiKeyEnvVar ? !!process.env[config.apiKeyEnvVar] : true)
+    (safeEnvVar ? !!process.env[safeEnvVar] : unsafeEnvVarError === null)
 
   if (!envVarPresent) {
     return {
       reachable: false,
       envVarPresent,
       latencyMs: null,
-      error: config.apiKeyEnvVar
-        ? `No API key set (enter one in the UI, or set ${config.apiKeyEnvVar})`
+      error: unsafeEnvVarError
+        ? unsafeEnvVarError
+        : safeEnvVar
+        ? `No API key set (enter one in the UI, or set ${safeEnvVar})`
         : 'No API key set',
     }
   }

@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+#
+# Forge global CLI entrypoint.
+#
+# The installer links this file into a PATH directory. Keep command ownership in
+# the existing lifecycle scripts and npm scripts; this launcher only routes.
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  TARGET="$(readlink "$SOURCE")"
+  case "$TARGET" in
+    /*) SOURCE="$TARGET" ;;
+    *) SOURCE="$DIR/$TARGET" ;;
+  esac
+done
+
+BIN_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+REPO_ROOT="$(cd "$BIN_DIR/.." && pwd)"
+WEB_DIR="$REPO_ROOT/web"
+
+usage() {
+  cat <<'EOF'
+Forge CLI
+
+Usage:
+  forge                         Start the local Forge server
+  forge upgrade [options]        Sync dependencies, migrations, seeds, and checks
+  forge uninstall [options]      Remove Forge runtime pieces
+  forge reset-credentials        Prompt for a new local account password
+  forge doctor                   Run the Forge runtime doctor
+  forge help                     Show this help
+
+Examples:
+  forge
+  forge upgrade
+  forge uninstall --remove-data
+  forge reset-credentials
+EOF
+}
+
+die() {
+  printf 'forge: %s\n' "$1" >&2
+  exit 1
+}
+
+require_repo() {
+  [ -f "$WEB_DIR/package.json" ] || die "could not find web/package.json under $REPO_ROOT"
+}
+
+require_uninstaller() {
+  [ -f "$REPO_ROOT/scripts/uninstall.sh" ] || die "could not find scripts/uninstall.sh under $REPO_ROOT"
+}
+
+env_value() {
+  local key="$1" file="$REPO_ROOT/.env" value
+  [ -f "$file" ] || return 0
+  value="$(grep -E "^${key}=" "$file" 2>/dev/null | tail -n1)" || true
+  [ -n "$value" ] || return 0
+  value="${value#"${key}="}"
+  value="${value%\"}"; value="${value#\"}"
+  value="${value%\'}"; value="${value#\'}"
+  printf '%s' "$value"
+}
+
+local_url() {
+  env_value NEXT_PUBLIC_APP_URL || true
+}
+
+prompt_password() {
+  local first second
+  if [ ! -t 0 ]; then
+    die "reset-credentials requires an interactive terminal"
+  fi
+
+  trap 'stty echo; printf "\n" >&2; exit 130' INT TERM HUP
+  printf 'New Forge password: ' >&2
+  stty -echo
+  if ! read -r first; then
+    stty echo
+    trap - INT TERM HUP
+    die "failed to read password"
+  fi
+  stty echo
+  printf '\n' >&2
+
+  printf 'Confirm new Forge password: ' >&2
+  stty -echo
+  if ! read -r second; then
+    stty echo
+    trap - INT TERM HUP
+    die "failed to read password confirmation"
+  fi
+  stty echo
+  trap - INT TERM HUP
+  printf '\n' >&2
+
+  [ "$first" = "$second" ] || die "passwords do not match"
+  printf '%s\n' "$first"
+}
+
+command="${1:-server}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+
+case "$command" in
+  server|run|dev|start)
+    require_repo
+    url="$(local_url)"
+    url="${url:-http://localhost:3000}"
+    printf 'Starting Forge...\n\n'
+    printf 'Local: %s\n\n' "$url"
+    cd "$WEB_DIR"
+    exec npm run dev "$@"
+    ;;
+  upgrade|update)
+    require_repo
+    exec bash "$REPO_ROOT/scripts/install.sh" --upgrade "$@"
+    ;;
+  uninstall)
+    require_uninstaller
+    exec bash "$REPO_ROOT/scripts/uninstall.sh" "$@"
+    ;;
+  reset-credentials|reset-password)
+    require_repo
+    cd "$WEB_DIR"
+    if [ "$#" -gt 0 ]; then
+      die "reset-credentials does not accept password arguments; run it interactively"
+    fi
+    password="$(prompt_password)"
+    printf '%s\n' "$password" | exec npm run auth:reset-password -- --stdin
+    ;;
+  doctor|check)
+    require_repo
+    cd "$WEB_DIR"
+    exec npm run doctor "$@"
+    ;;
+  help|--help|-h)
+    usage
+    ;;
+  version|--version|-v)
+    require_repo
+    printf 'Forge CLI from %s\n' "$REPO_ROOT"
+    ;;
+  *)
+    usage >&2
+    die "unknown command: $command"
+    ;;
+esac

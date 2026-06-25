@@ -9,6 +9,12 @@ import { PROVIDER_TYPES, requiresProviderBaseUrl } from '@/lib/providers/types'
 import { toPublicProvider } from '@/lib/providers/serialize'
 import { encryptSecret } from '@/lib/crypto'
 import { isAcpAgentId } from '@/lib/providers/acp/catalog'
+import { providerSupportsUserBaseUrl } from '@/lib/providers/catalog'
+import {
+  providerBaseUrlForStorage,
+  validateProviderApiKeyEnvVar,
+  validateProviderBaseUrl,
+} from '@/lib/providers/credentials'
 
 // ---------------------------------------------------------------------------
 // Validation schema (all fields optional for PUT)
@@ -139,11 +145,24 @@ export async function PUT(
     // Conditional validation: if providerType requires baseUrl, baseUrl must be present.
     const effectiveType = data.providerType ?? existing.providerType
     const effectiveBaseUrl = 'baseUrl' in data ? data.baseUrl : existing.baseUrl
-    if (requiresProviderBaseUrl(effectiveType) && !effectiveBaseUrl) {
+    if (requiresProviderBaseUrl(effectiveType) && !effectiveBaseUrl?.trim()) {
       return NextResponse.json(
         { error: `baseUrl is required for ${effectiveType} providers` },
         { status: 400 },
       )
+    }
+    if ('baseUrl' in data) {
+      const baseUrlError = validateProviderBaseUrl(effectiveType, data.baseUrl)
+      if (baseUrlError) {
+        return NextResponse.json({ error: baseUrlError }, { status: 400 })
+      }
+    }
+    const switchingToAcp = existing.providerType !== 'acp' && data.providerType === 'acp'
+    if (!switchingToAcp && 'apiKeyEnvVar' in data) {
+      const envVarError = validateProviderApiKeyEnvVar(effectiveType, data.apiKeyEnvVar)
+      if (envVarError) {
+        return NextResponse.json({ error: envVarError }, { status: 400 })
+      }
     }
 
     // Build update set — only include keys that were provided
@@ -151,8 +170,21 @@ export async function PUT(
     if (data.displayName !== undefined) updateSet.displayName = data.displayName
     if (data.providerType !== undefined) updateSet.providerType = data.providerType
     if (data.modelId !== undefined) updateSet.modelId = data.modelId
-    if ('baseUrl' in data) updateSet.baseUrl = data.baseUrl ?? null
-    if ('apiKeyEnvVar' in data) updateSet.apiKeyEnvVar = data.apiKeyEnvVar ?? null
+    if ('baseUrl' in data || data.providerType !== undefined || !providerSupportsUserBaseUrl(effectiveType)) {
+      updateSet.baseUrl = providerBaseUrlForStorage(effectiveType, effectiveBaseUrl)
+    }
+    if ('apiKeyEnvVar' in data) {
+      updateSet.apiKeyEnvVar = data.apiKeyEnvVar?.trim() || null
+    } else if (
+      data.providerType !== undefined ||
+      validateProviderApiKeyEnvVar(effectiveType, existing.apiKeyEnvVar) !== null
+    ) {
+      const existingEnvVar = existing.apiKeyEnvVar?.trim() || null
+      updateSet.apiKeyEnvVar =
+        existingEnvVar && validateProviderApiKeyEnvVar(effectiveType, existingEnvVar) === null
+          ? existingEnvVar
+          : null
+    }
     if (data.isLocal !== undefined) updateSet.isLocal = data.isLocal
 
     if ((data.providerType ?? existing.providerType) === 'acp') {

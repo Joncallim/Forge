@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import fs from 'node:fs/promises'
-import os from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
 import { db } from '@/db'
@@ -9,7 +8,8 @@ import { projects } from '@/db/schema'
 import { eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { registerProjectPath, unregisterProjectPath } from '@/lib/project-registry'
-import { getWorkspaceSettings, isWithinPath } from '@/lib/workspace'
+import { validateGitHubTokenEnvVar } from '@/lib/github'
+import { getWorkspaceSettings, isWithinPath, type WorkspaceSettings } from '@/lib/workspace'
 
 // ---------------------------------------------------------------------------
 // Validation schema (all fields optional for PUT)
@@ -23,6 +23,42 @@ const updateProjectSchema = z.object({
   pmProviderConfigId: z.string().uuid().nullable().optional(),
   defaultBranch: z.string().optional(),
 })
+
+async function assertRealPathWithinWorkspace(
+  candidatePath: string,
+  workspace: WorkspaceSettings,
+): Promise<void> {
+  const [realWorkspaceRoot, realCandidate] = await Promise.all([
+    fs.realpath(workspace.workspaceRoot),
+    fs.realpath(candidatePath),
+  ])
+
+  if (!isWithinPath(realWorkspaceRoot, realCandidate)) {
+    throw new Error('localPath must be inside the active workspace root')
+  }
+}
+
+async function assertExistingLocalPathWithinWorkspace(
+  candidatePath: string,
+  workspace: WorkspaceSettings,
+): Promise<void> {
+  let currentPath = path.resolve(/*turbopackIgnore: true*/ candidatePath)
+  const workspaceRoot = path.resolve(/*turbopackIgnore: true*/ workspace.workspaceRoot)
+
+  while (isWithinPath(workspaceRoot, currentPath)) {
+    try {
+      await assertRealPathWithinWorkspace(currentPath, workspace)
+      return
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+      const parentPath = path.dirname(currentPath)
+      if (parentPath === currentPath) break
+      currentPath = parentPath
+    }
+  }
+
+  throw new Error('localPath must be inside the active workspace root')
+}
 
 // ---------------------------------------------------------------------------
 // GET /api/projects/:id
@@ -121,10 +157,23 @@ export async function PUT(
             { status: 400 },
           )
         }
+        try {
+          await assertExistingLocalPathWithinWorkspace(resolvedLocalPath, workspace)
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Invalid local path'
+          return NextResponse.json({ error: message }, { status: 400 })
+        }
         updateSet.localPath = resolvedLocalPath
       }
     }
-    if ('githubTokenEnvVar' in data) updateSet.githubTokenEnvVar = data.githubTokenEnvVar ?? null
+    if ('githubTokenEnvVar' in data) {
+      const githubTokenEnvVar = data.githubTokenEnvVar?.trim() || null
+      const githubTokenEnvVarError = validateGitHubTokenEnvVar(githubTokenEnvVar)
+      if (githubTokenEnvVarError) {
+        return NextResponse.json({ error: githubTokenEnvVarError }, { status: 400 })
+      }
+      updateSet.githubTokenEnvVar = githubTokenEnvVar
+    }
     if ('pmProviderConfigId' in data) updateSet.pmProviderConfigId = data.pmProviderConfigId ?? null
     if (data.defaultBranch !== undefined) updateSet.defaultBranch = data.defaultBranch
 
@@ -153,18 +202,55 @@ export async function PUT(
 // ?deleteFiles=true it also removes the local project folder from disk.
 // ---------------------------------------------------------------------------
 
-/**
- * Guard against deleting paths that are clearly not a project folder we created
- * (filesystem root, the user's home directory, very shallow paths).
- */
-function isSafeToDelete(target: string): boolean {
-  const resolved = path.resolve(target)
-  const root = path.parse(resolved).root
-  if (resolved === root) return false
-  if (resolved === path.resolve(os.homedir())) return false
-  // Require at least two path segments below root (e.g. /Users/alex/proj).
-  const relativeDepth = resolved.slice(root.length).split(path.sep).filter(Boolean).length
-  return relativeDepth >= 2
+async function validateProjectDeletePath(target: string, projectId: string): Promise<string | null> {
+  const workspace = await getWorkspaceSettings()
+  const resolved = path.resolve(/*turbopackIgnore: true*/ target)
+  const protectedRoots = [
+    workspace.workspaceRoot,
+    workspace.projectsRoot,
+    workspace.mcpsRoot,
+    workspace.templatesRoot,
+    workspace.localMemoryRoot,
+    workspace.checkpointsRoot,
+  ].map((root) => path.resolve(/*turbopackIgnore: true*/ root))
+
+  if (protectedRoots.includes(resolved)) {
+    return 'Refusing to delete files: the project path points at a shared Forge workspace directory.'
+  }
+
+  if (!isWithinPath(workspace.projectsRoot, resolved)) {
+    return 'Refusing to delete files: the project path is not inside the Forge projects directory.'
+  }
+
+  let stat
+  try {
+    stat = await fs.lstat(resolved)
+  } catch {
+    return 'Refusing to delete files: the project path does not exist.'
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    return 'Refusing to delete files: the project path must be a real directory.'
+  }
+
+  const [realProjectsRoot, realTarget] = await Promise.all([
+    fs.realpath(workspace.projectsRoot),
+    fs.realpath(resolved),
+  ])
+  if (realTarget === realProjectsRoot || !isWithinPath(realProjectsRoot, realTarget)) {
+    return 'Refusing to delete files: the project path escapes the real Forge projects directory.'
+  }
+
+  try {
+    const raw = await fs.readFile(path.join(/*turbopackIgnore: true*/ resolved, 'forge.project.json'), 'utf-8')
+    const marker = JSON.parse(raw) as { projectId?: unknown }
+    if (marker.projectId !== projectId) {
+      return 'Refusing to delete files: the Forge project marker does not match this project.'
+    }
+  } catch {
+    return 'Refusing to delete files: no matching Forge project marker was found.'
+  }
+
+  return null
 }
 
 export async function DELETE(
@@ -192,9 +278,10 @@ export async function DELETE(
 
     let filesDeleted = false
     if (deleteFiles && existing.localPath) {
-      if (!isSafeToDelete(existing.localPath)) {
+      const deletePathError = await validateProjectDeletePath(existing.localPath, id)
+      if (deletePathError) {
         return NextResponse.json(
-          { error: 'Refusing to delete files: the project path looks unsafe to remove.' },
+          { error: deletePathError },
           { status: 400 },
         )
       }

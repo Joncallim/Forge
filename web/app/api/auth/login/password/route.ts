@@ -5,46 +5,50 @@ import { users } from '@/db/schema'
 import { createSession, sessionCookieOptions } from '@/lib/session'
 import { verifyPassword } from '@/lib/password'
 import { redis } from '@/lib/redis'
+import {
+  PASSWORD_LOGIN_RATE_LIMIT_GLOBAL,
+  PASSWORD_LOGIN_RATE_LIMIT_PER_IP,
+  PASSWORD_LOGIN_RATE_LIMIT_WINDOW_SECONDS,
+  hitPasswordLoginRateLimit,
+  passwordLoginRateLimitKeys,
+} from '@/lib/auth-rate-limit'
 
 // Passwords can be guessed online, unlike passkeys. Keep a short fixed-window
 // throttle per client and globally so exposed installs are not unlimited.
-const RATE_LIMIT_WINDOW_SECONDS = 900
-const RATE_LIMIT_PER_IP = 10
-const RATE_LIMIT_GLOBAL = 50
-
 function clientIp(request: NextRequest): string {
-  return (
-    request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
-    request.headers.get('x-real-ip') ||
-    'unknown'
-  )
-}
-
-async function hitRateLimit(key: string): Promise<number> {
-  const count = await redis.incr(key)
-  if (count === 1) {
-    await redis.expire(key, RATE_LIMIT_WINDOW_SECONDS)
+  if (process.env.FORGE_TRUST_PROXY === '1') {
+    return (
+      request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
+      request.headers.get('x-real-ip') ||
+      'unknown'
+    )
   }
-  return count
+
+  // Next.js Request does not expose the direct socket address in this runtime.
+  // Without an explicit trusted proxy boundary, keep all direct attempts in one
+  // bucket so clients cannot choose arbitrary rate-limit keys via headers.
+  return 'direct'
 }
 
 export async function POST(request: NextRequest) {
   try {
     const ip = clientIp(request)
-    const ipKey = `ratelimit:login:password:ip:${ip}`
-    const globalKey = 'ratelimit:login:password:global'
+    const { ipKey, globalKey } = passwordLoginRateLimitKeys(ip)
 
     const [ipCount, globalCount] = await Promise.all([
-      hitRateLimit(ipKey),
-      hitRateLimit(globalKey),
+      hitPasswordLoginRateLimit(ipKey),
+      hitPasswordLoginRateLimit(globalKey),
     ])
 
-    if (ipCount > RATE_LIMIT_PER_IP || globalCount > RATE_LIMIT_GLOBAL) {
+    if (
+      ipCount > PASSWORD_LOGIN_RATE_LIMIT_PER_IP ||
+      globalCount > PASSWORD_LOGIN_RATE_LIMIT_GLOBAL
+    ) {
       return NextResponse.json(
         { error: 'Too many sign-in attempts. Please wait and try again.' },
         {
           status: 429,
-          headers: { 'Retry-After': String(RATE_LIMIT_WINDOW_SECONDS) },
+          headers: { 'Retry-After': String(PASSWORD_LOGIN_RATE_LIMIT_WINDOW_SECONDS) },
         },
       )
     }

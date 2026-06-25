@@ -75,6 +75,11 @@ vi.mock('@/lib/redis', () => ({
   },
 }))
 
+const mockExecFile = vi.fn()
+vi.mock('node:child_process', () => ({
+  execFile: mockExecFile,
+}))
+
 // Provider registry mock
 vi.mock('@/lib/providers/registry', () => ({
   listActiveProviders: vi.fn().mockResolvedValue([]),
@@ -84,9 +89,17 @@ vi.mock('@/lib/providers/registry', () => ({
 
 const mockGetGitHubStatus = vi.fn()
 const mockResolveGitHubToken = vi.fn()
+const mockValidateGitHubTokenEnvVar = vi.fn((rawEnvVar: string | null | undefined) => {
+  const envVar = rawEnvVar?.trim()
+  if (!envVar) return null
+  return ['GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_PAT', 'FORGE_GITHUB_TOKEN'].includes(envVar)
+    ? null
+    : 'GitHub token env var must be allowlisted'
+})
 vi.mock('@/lib/github', () => ({
   getGitHubStatus: mockGetGitHubStatus,
   resolveGitHubToken: mockResolveGitHubToken,
+  validateGitHubTokenEnvVar: mockValidateGitHubTokenEnvVar,
 }))
 
 // ---------------------------------------------------------------------------
@@ -264,6 +277,187 @@ describe('POST /api/projects — source handling', () => {
     }
   })
 
+  it('uses an allowlisted clone request githubTokenEnvVar and encodes the token in the clone URL', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-clone-env-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const expectedLocalPath = path.join(workspaceRoot, 'projects', 'private-repo')
+    const token = 'placeholder@clone:token/with-specials'
+    const createdProject = {
+      id: 'project-clone-env',
+      name: 'Private Repo',
+      githubRepo: 'owner/private-repo',
+      localPath: expectedLocalPath,
+      githubTokenEnvVar: 'GITHUB_TOKEN',
+      pmProviderConfigId: null,
+      defaultBranch: 'main',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      archivedAt: null,
+    }
+    mockResolveGitHubToken.mockResolvedValue({ token, source: 'env' })
+    mockExecFile.mockImplementation((_command, args: string[], _options, callback) => {
+      fs.mkdir(args[4], { recursive: true }).then(
+        () => callback(null, '', ''),
+        (err) => callback(err),
+      )
+      return undefined
+    })
+    mockDbInsert.mockReturnValue(chain([createdProject]))
+
+    try {
+      const { POST } = await import('@/app/api/projects/route')
+      const res = await POST(authRequest('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Private Repo',
+          source: 'clone',
+          githubRepo: 'owner/private-repo',
+          localPath: 'private-repo',
+          githubTokenEnvVar: 'GITHUB_TOKEN',
+          defaultBranch: 'main',
+        }),
+      }) as never)
+
+      expect(res.status).toBe(201)
+      expect(mockResolveGitHubToken).toHaveBeenCalledWith({ envVar: 'GITHUB_TOKEN' })
+      expect(mockExecFile).toHaveBeenCalledWith(
+        'git',
+        expect.arrayContaining([
+          `https://x-access-token:${encodeURIComponent(token)}@github.com/owner/private-repo.git`,
+          expectedLocalPath,
+        ]),
+        expect.any(Object),
+        expect.any(Function),
+      )
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects clone requests that try to read arbitrary server environment variables', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-clone-env-reject-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+
+    try {
+      const { POST } = await import('@/app/api/projects/route')
+      const res = await POST(authRequest('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Private Repo',
+          source: 'clone',
+          githubRepo: 'owner/private-repo',
+          localPath: 'private-repo',
+          githubTokenEnvVar: 'SESSION_SECRET',
+          defaultBranch: 'main',
+        }),
+      }) as never)
+
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error).toMatch(/allowlisted|GitHub token env var/i)
+      expect(mockResolveGitHubToken).not.toHaveBeenCalled()
+      expect(mockExecFile).not.toHaveBeenCalled()
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects local project creation through a symlink that escapes the active workspace', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-local-link-'))
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-local-link-outside-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const linkPath = path.join(workspaceRoot, 'projects', 'outside-link')
+    await fs.mkdir(path.dirname(linkPath), { recursive: true })
+    await fs.symlink(outsideRoot, linkPath, 'dir')
+
+    try {
+      const { POST } = await import('@/app/api/projects/route')
+      const res = await POST(authRequest('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Symlink Escape',
+          source: 'local',
+          localPath: path.join(linkPath, 'new-project'),
+          defaultBranch: 'main',
+        }),
+      }) as never)
+
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error).toMatch(/workspace root/i)
+      expect(mockDbInsert).not.toHaveBeenCalled()
+      await expect(fs.stat(path.join(outsideRoot, 'new-project'))).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+      await fs.rm(outsideRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects clone destinations through a symlink that escapes the active workspace', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-clone-link-'))
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-clone-link-outside-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const linkPath = path.join(workspaceRoot, 'projects', 'outside-link')
+    await fs.mkdir(path.dirname(linkPath), { recursive: true })
+    await fs.symlink(outsideRoot, linkPath, 'dir')
+
+    try {
+      const { POST } = await import('@/app/api/projects/route')
+      const res = await POST(authRequest('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Symlink Clone',
+          source: 'clone',
+          githubRepo: 'owner/private-repo',
+          localPath: path.join(linkPath, 'private-repo'),
+          githubTokenEnvVar: 'GITHUB_TOKEN',
+          defaultBranch: 'main',
+        }),
+      }) as never)
+
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error).toMatch(/workspace root/i)
+      expect(mockExecFile).not.toHaveBeenCalled()
+      await expect(fs.stat(path.join(outsideRoot, 'private-repo'))).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+      await fs.rm(outsideRoot, { recursive: true, force: true })
+    }
+  })
+
   it('defaults a local project path under the active workspace when localPath is omitted', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const previousRoot = process.env.FORGE_WORKSPACE_ROOT
@@ -311,6 +505,87 @@ describe('POST /api/projects — source handling', () => {
   })
 })
 
+describe('DELETE /api/projects/:id — file deletion boundary', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  function projectRow(localPath: string) {
+    return {
+      id: 'project-delete',
+      name: 'Delete Me',
+      githubRepo: null,
+      localPath,
+      githubTokenEnvVar: null,
+      pmProviderConfigId: null,
+      defaultBranch: 'main',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      archivedAt: null,
+    }
+  }
+
+  it('refuses to remove the shared workspace root', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-delete-root-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    mockDbSelect.mockReturnValue(chain([projectRow(workspaceRoot)]))
+
+    try {
+      const { DELETE } = await import('@/app/api/projects/[id]/route')
+      const res = await DELETE(nextAuthRequest('/api/projects/project-delete?deleteFiles=true') as never, {
+        params: Promise.resolve({ id: 'project-delete' }),
+      })
+
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error).toMatch(/shared Forge workspace directory/i)
+      expect(mockDbDelete).not.toHaveBeenCalled()
+      await expect(fs.stat(workspaceRoot)).resolves.toMatchObject({})
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('removes a Forge-owned project directory with a matching marker', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-delete-owned-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const localPath = path.join(workspaceRoot, 'projects', 'delete-me')
+    await fs.mkdir(localPath, { recursive: true })
+    await fs.writeFile(
+      path.join(localPath, 'forge.project.json'),
+      `${JSON.stringify({ projectId: 'project-delete' })}\n`,
+    )
+    mockDbSelect.mockReturnValue(chain([projectRow(localPath)]))
+    mockDbDelete.mockReturnValue(chain(undefined))
+
+    try {
+      const { DELETE } = await import('@/app/api/projects/[id]/route')
+      const res = await DELETE(nextAuthRequest('/api/projects/project-delete?deleteFiles=true') as never, {
+        params: Promise.resolve({ id: 'project-delete' }),
+      })
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.filesDeleted).toBe(true)
+      await expect(fs.stat(localPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Suite 3.1c — Folder browser lists local directories for authenticated users
 // ---------------------------------------------------------------------------
@@ -318,16 +593,86 @@ describe('POST /api/projects — source handling', () => {
 describe('GET /api/filesystem/directories — folder selector', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
-  it('returns the requested directory listing', async () => {
+  it('returns a requested workspace directory listing', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-folder-list-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const parentPath = path.join(workspaceRoot, 'projects')
+    const childPath = path.join(parentPath, 'demo-app')
+    await fs.mkdir(childPath, { recursive: true })
 
-    const { GET } = await import('@/app/api/filesystem/directories/route')
-    const res = await GET(nextAuthRequest('/api/filesystem/directories?path=/tmp') as never)
+    try {
+      const { GET } = await import('@/app/api/filesystem/directories/route')
+      const res = await GET(nextAuthRequest(`/api/filesystem/directories?path=${encodeURIComponent(parentPath)}`) as never)
 
-    expect(res.status).toBe(200)
-    const body = await res.json()
-    expect(body.path).toBe('/tmp')
-    expect(Array.isArray(body.directories)).toBe(true)
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.path).toBe(parentPath)
+      expect(body.directories).toEqual([
+        expect.objectContaining({ name: 'demo-app', path: childPath }),
+      ])
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects requested paths outside the active workspace', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-folder-boundary-'))
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-folder-outside-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+
+    try {
+      const { GET } = await import('@/app/api/filesystem/directories/route')
+      const res = await GET(nextAuthRequest(`/api/filesystem/directories?path=${encodeURIComponent(outsideRoot)}`) as never)
+
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error).toMatch(/workspace root/i)
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+      await fs.rm(outsideRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects symlinked workspace paths that resolve outside the active workspace', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-folder-link-'))
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-folder-link-outside-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const linkPath = path.join(workspaceRoot, 'projects', 'outside-link')
+    await fs.mkdir(path.dirname(linkPath), { recursive: true })
+    await fs.symlink(outsideRoot, linkPath, 'dir')
+
+    try {
+      const { GET } = await import('@/app/api/filesystem/directories/route')
+      const res = await GET(nextAuthRequest(`/api/filesystem/directories?path=${encodeURIComponent(linkPath)}`) as never)
+
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error).toMatch(/workspace root/i)
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+      await fs.rm(outsideRoot, { recursive: true, force: true })
+    }
   })
 
   it('defaults to the active workspace projects directory', async () => {
@@ -362,7 +707,11 @@ describe('POST /api/filesystem/directories — folder creation', () => {
 
   it('creates a child folder for authenticated users', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
-    const parentPath = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-folder-test-'))
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-folder-test-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const parentPath = path.join(workspaceRoot, 'projects')
+    await fs.mkdir(parentPath, { recursive: true })
 
     try {
       const { POST } = await import('@/app/api/filesystem/directories/route')
@@ -379,7 +728,74 @@ describe('POST /api/filesystem/directories — folder creation', () => {
       const stat = await fs.stat(createdPath)
       expect(stat.isDirectory()).toBe(true)
     } finally {
-      await fs.rm(parentPath, { recursive: true, force: true })
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects parent paths outside the active workspace', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-folder-post-boundary-'))
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-folder-post-outside-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+
+    try {
+      const { POST } = await import('@/app/api/filesystem/directories/route')
+      const res = await POST(nextAuthRequest('/api/filesystem/directories', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parentPath: outsideRoot, name: 'new-app' }),
+      }) as never)
+
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error).toMatch(/workspace root/i)
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+      await fs.rm(outsideRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects symlinked parent paths that resolve outside the active workspace', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-folder-post-link-'))
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-folder-post-link-outside-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const linkPath = path.join(workspaceRoot, 'projects', 'outside-link')
+    await fs.mkdir(path.dirname(linkPath), { recursive: true })
+    await fs.symlink(outsideRoot, linkPath, 'dir')
+
+    try {
+      const { POST } = await import('@/app/api/filesystem/directories/route')
+      const res = await POST(nextAuthRequest('/api/filesystem/directories', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parentPath: linkPath, name: 'new-app' }),
+      }) as never)
+
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error).toMatch(/workspace root/i)
+      await expect(fs.stat(path.join(outsideRoot, 'new-app'))).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+      await fs.rm(outsideRoot, { recursive: true, force: true })
     }
   })
 
@@ -1208,6 +1624,99 @@ describe('POST /api/providers/discover-local — auth guard', () => {
   })
 })
 
+describe('POST /api/providers/list-models — endpoint boundary', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('rejects custom base URLs for fixed cloud providers before making a fetch', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const { POST } = await import('@/app/api/providers/list-models/route')
+      const res = await POST(authRequest('/api/providers/list-models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          providerType: 'openrouter',
+          apiKey: 'placeholder-key',
+          baseUrl: 'https://attacker.example/v1',
+        }),
+      }) as never)
+
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error).toMatch(/fixed endpoint|custom baseUrl/i)
+      expect(fetchMock).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('lists fixed cloud models from the catalog endpoint when no custom base URL is supplied', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe('https://openrouter.ai/api/v1/models')
+      expect(init).toMatchObject({
+        headers: { Authorization: 'Bearer placeholder-key' },
+      })
+      return new Response(JSON.stringify({ data: [{ id: 'openai/gpt-4.1' }] }), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const { POST } = await import('@/app/api/providers/list-models/route')
+      const res = await POST(authRequest('/api/providers/list-models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          providerType: 'openrouter',
+          apiKey: 'placeholder-key',
+        }),
+      }) as never)
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.models).toEqual(['openai/gpt-4.1'])
+      expect(fetchMock).toHaveBeenCalledOnce()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('accepts a fixed cloud provider default base URL but still fetches the catalog endpoint', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe('https://openrouter.ai/api/v1/models')
+      expect(init).toMatchObject({
+        headers: { Authorization: 'Bearer placeholder-key' },
+      })
+      return new Response(JSON.stringify({ data: [{ id: 'anthropic/claude-4-opus' }] }), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const { POST } = await import('@/app/api/providers/list-models/route')
+      const res = await POST(authRequest('/api/providers/list-models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          providerType: 'openrouter',
+          apiKey: 'placeholder-key',
+          baseUrl: 'https://openrouter.ai/api/v1/',
+        }),
+      }) as never)
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.models).toEqual(['anthropic/claude-4-opus'])
+      expect(fetchMock).toHaveBeenCalledOnce()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Suite 3.4d — Open questions: POST /api/tasks/:id/questions
 // ---------------------------------------------------------------------------
@@ -1253,6 +1762,25 @@ describe('POST /api/tasks/:id/questions', () => {
 
 describe('PUT /api/agents/[type] — path traversal blocked', () => {
   beforeEach(() => { vi.clearAllMocks() })
+
+  it('resolves the default prompt sync directory under the repo root when cwd is web', async () => {
+    const previous = process.env.FORGE_AGENT_CONFIG_DIR
+    delete process.env.FORGE_AGENT_CONFIG_DIR
+
+    try {
+      const { resolveAgentConfigDir } = await import('@/app/api/agents/[type]/route')
+      const repoRoot = path.join(os.tmpdir(), 'Forge')
+      expect(resolveAgentConfigDir(path.join(repoRoot, 'web'))).toBe(
+        path.join(repoRoot, '.claude', 'agents'),
+      )
+    } finally {
+      if (previous === undefined) {
+        delete process.env.FORGE_AGENT_CONFIG_DIR
+      } else {
+        process.env.FORGE_AGENT_CONFIG_DIR = previous
+      }
+    }
+  })
 
   it('returns 400 for an unsafe agent slug path traversal attempt', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
@@ -1431,7 +1959,7 @@ describe('POST /api/providers — baseUrl requirement', () => {
       providerType: 'custom',
       modelId: 'provider/model-anything',
       baseUrl: 'https://models.example.com/v1',
-      apiKeyEnvVar: 'CUSTOM_API_KEY',
+      apiKeyEnvVar: null,
       isLocal: false,
       isActive: true,
       createdAt: new Date(),
@@ -1448,7 +1976,6 @@ describe('POST /api/providers — baseUrl requirement', () => {
         providerType: createdProvider.providerType,
         modelId: createdProvider.modelId,
         baseUrl: createdProvider.baseUrl,
-        apiKeyEnvVar: createdProvider.apiKeyEnvVar,
         isLocal: createdProvider.isLocal,
       }),
     })
@@ -1462,6 +1989,187 @@ describe('POST /api/providers — baseUrl requirement', () => {
       modelId: 'provider/model-anything',
       baseUrl: 'https://models.example.com/v1',
     })
+  })
+
+  it('rejects apiKeyEnvVar for custom providers with arbitrary endpoints', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+
+    const { POST } = await import('@/app/api/providers/route')
+    const req = authRequest('/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        displayName: 'Custom Orchestrator',
+        providerType: 'custom',
+        modelId: 'provider/model-anything',
+        baseUrl: 'https://models.example.com/v1',
+        apiKeyEnvVar: 'SESSION_SECRET',
+        isLocal: false,
+      }),
+    })
+
+    const res = await POST(req as never)
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error).toMatch(/cannot read API keys from server environment variables/i)
+    expect(mockDbInsert).not.toHaveBeenCalled()
+  })
+
+  it('allows a fixed cloud provider to use its allowlisted env var', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const createdProvider = {
+      id: 'provider-openai',
+      displayName: 'OpenAI',
+      providerType: 'openai',
+      modelId: 'gpt-4.1',
+      baseUrl: null,
+      apiKeyEnvVar: 'OPENAI_API_KEY',
+      apiKeyCiphertext: null,
+      isLocal: false,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }
+    mockDbInsert.mockReturnValue(chain([createdProvider]))
+
+    const { POST } = await import('@/app/api/providers/route')
+    const req = authRequest('/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        displayName: createdProvider.displayName,
+        providerType: 'openai',
+        modelId: createdProvider.modelId,
+        apiKeyEnvVar: 'OPENAI_API_KEY',
+        isLocal: false,
+      }),
+    })
+
+    const res = await POST(req as never)
+
+    expect(res.status).toBe(201)
+    const body = await res.json()
+    expect(body.provider).toMatchObject({
+      providerType: 'openai',
+      apiKeyEnvVar: 'OPENAI_API_KEY',
+    })
+  })
+
+  it('rejects fixed cloud providers with custom base URLs', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+
+    const { POST } = await import('@/app/api/providers/route')
+    const req = authRequest('/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        displayName: 'OpenRouter',
+        providerType: 'openrouter',
+        modelId: 'openai/gpt-4.1',
+        baseUrl: 'https://attacker.example/v1',
+        apiKeyEnvVar: 'OPENROUTER_API_KEY',
+        isLocal: false,
+      }),
+    })
+
+    const res = await POST(req as never)
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error).toMatch(/fixed endpoint|custom baseUrl/i)
+    expect(mockDbInsert).not.toHaveBeenCalled()
+  })
+
+  it('allows fixed cloud providers to submit their default base URL but stores no custom endpoint', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const createdProvider = {
+      id: 'provider-openrouter',
+      displayName: 'OpenRouter',
+      providerType: 'openrouter',
+      modelId: 'openai/gpt-4.1',
+      baseUrl: null,
+      apiKeyEnvVar: 'OPENROUTER_API_KEY',
+      apiKeyCiphertext: null,
+      isLocal: false,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }
+    const insertChain = chain([createdProvider]) as Record<string, unknown>
+    const valuesSpy = vi.fn(() => insertChain)
+    insertChain.values = valuesSpy
+    mockDbInsert.mockReturnValue(insertChain)
+
+    const { POST } = await import('@/app/api/providers/route')
+    const req = authRequest('/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        displayName: createdProvider.displayName,
+        providerType: 'openrouter',
+        modelId: createdProvider.modelId,
+        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKeyEnvVar: 'OPENROUTER_API_KEY',
+        isLocal: false,
+      }),
+    })
+
+    const res = await POST(req as never)
+
+    expect(res.status).toBe(201)
+    expect(valuesSpy).toHaveBeenCalledWith(expect.objectContaining({ baseUrl: null }))
+    const body = await res.json()
+    expect(body.provider).toMatchObject({
+      providerType: 'openrouter',
+      baseUrl: null,
+    })
+  })
+
+  it('clears unsafe legacy provider env vars during normal provider edits', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const existingProvider = {
+      id: 'provider-legacy-custom',
+      displayName: 'Legacy Custom',
+      providerType: 'custom',
+      modelId: 'provider/model',
+      baseUrl: 'https://models.example.com/v1',
+      apiKeyEnvVar: 'SESSION_SECRET',
+      apiKeyCiphertext: null,
+      isLocal: false,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }
+    const updatedProvider = {
+      ...existingProvider,
+      displayName: 'Legacy Custom Edited',
+      apiKeyEnvVar: null,
+      updatedAt: new Date(),
+    }
+    mockDbSelect.mockReturnValue(chain([existingProvider]))
+    const updateChain = chain([updatedProvider]) as Record<string, unknown>
+    const updateSetSpy = vi.fn(() => updateChain)
+    updateChain.set = updateSetSpy
+    mockDbUpdate.mockReturnValue(updateChain)
+
+    const { PUT } = await import('@/app/api/providers/[id]/route')
+    const req = authRequest('/api/providers/provider-legacy-custom', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        displayName: 'Legacy Custom Edited',
+      }),
+    })
+
+    const res = await PUT(req as never, {
+      params: Promise.resolve({ id: 'provider-legacy-custom' }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.provider.apiKeyEnvVar).toBeNull()
+    expect(updateSetSpy).toHaveBeenCalledWith(expect.objectContaining({ apiKeyEnvVar: null }))
   })
 
   it('creates an ACP provider with a known agent id and no credentials', async () => {

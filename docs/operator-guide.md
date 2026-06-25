@@ -12,8 +12,8 @@ Forge has four moving pieces:
 - Redis, where Forge queues background work.
 - The worker, which picks up queued tasks and calls AI models.
 
-For normal local use, `npm run dev` starts both the dashboard and the worker.
-For split deployments, the worker can run separately.
+For normal local use, `forge` starts both the dashboard and the worker. For
+split deployments, the worker can still run separately.
 
 ## Install
 
@@ -41,7 +41,7 @@ Readiness and update commands:
 
 ```bash
 bash scripts/install.sh --check
-bash scripts/install.sh --upgrade
+forge upgrade
 FORGE_SKIP_OLLAMA=1 bash scripts/install.sh
 ```
 
@@ -54,8 +54,7 @@ preserves existing settings and resumes idempotent steps. Logs are written to
 Normal local startup:
 
 ```bash
-cd web
-npm run dev
+forge
 ```
 
 Open `http://localhost:3000`.
@@ -86,9 +85,23 @@ only, set this before creating the first account:
 FORGE_PASSKEYS_ENABLED=0
 ```
 
+Forge is single-user by default. If an uninstall kept settings and credentials,
+the existing account remains in Postgres and registration stays closed after
+reinstall. Reset that account from the host shell:
+
+```bash
+forge reset-credentials
+```
+
+The reset command also clears password sign-in throttle keys left in Redis, so
+you do not need to wait for the retry window after repeated failed attempts.
+
 Provider keys are needed only for the providers you configure. Forge stores
-provider API keys encrypted in the database when entered through the UI. If you
-use an environment variable, Forge stores the variable name, not the secret.
+provider API keys encrypted in the database when entered through the UI. Fixed
+cloud providers can also use the allowlisted environment variables below.
+Custom, LiteLLM, and local endpoints do not read arbitrary Forge server
+environment variables as API keys; enter any required key in the UI or configure
+it inside the gateway.
 
 Common provider variables:
 
@@ -98,7 +111,12 @@ Common provider variables:
 | `OPENAI_API_KEY` | OpenAI |
 | `OPENROUTER_API_KEY` | OpenRouter |
 | `LITELLM_BASE_URL` | LiteLLM gateway |
-| `LITELLM_API_KEY` | LiteLLM gateway key |
+| `LITELLM_API_KEY` | Optional LiteLLM gateway key, for the gateway itself |
+
+GitHub repository operations prefer the encrypted PAT from Settings, then the
+authenticated `gh` CLI token. The legacy clone env-var fallback is limited to
+`GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_PAT`, or `FORGE_GITHUB_TOKEN`; arbitrary
+server env vars are rejected.
 
 ## Test The Orchestrator
 
@@ -151,6 +169,7 @@ Passkey deployments also need:
 | Variable | Purpose |
 |---|---|
 | `FORGE_PASSKEYS_ENABLED` | Set `0` to disable passkeys |
+| `FORGE_TRUST_PROXY` | Set `1` only behind a trusted proxy that controls forwarded IP headers |
 | `WEBAUTHN_RP_ID` | Passkey domain, usually the hostname |
 | `WEBAUTHN_RP_NAME` | Display name shown by passkey prompts |
 | `WEBAUTHN_ORIGIN` | Public app origin, such as `https://forge.example.com` |
@@ -217,25 +236,25 @@ Status meanings:
 Preview first:
 
 ```bash
-bash scripts/uninstall.sh --dry-run
+forge uninstall --dry-run
 ```
 
 Remove Forge while keeping settings for a future reinstall:
 
 ```bash
-bash scripts/uninstall.sh --keep-data
+forge uninstall --keep-data
 ```
 
 Remove local Forge data:
 
 ```bash
-bash scripts/uninstall.sh --remove-data
+forge uninstall --remove-data
 ```
 
 Also remove recorded local project folders:
 
 ```bash
-bash scripts/uninstall.sh --remove-data --remove-projects
+forge uninstall --remove-data --remove-projects
 ```
 
 The uninstall script removes only packages recorded as Forge-installed. It does
@@ -258,17 +277,21 @@ If provider health says an environment variable is missing, add the real key to
 If passkey registration fails, use `http://localhost:3000` locally and confirm
 `WEBAUTHN_RP_ID=localhost` and `WEBAUTHN_ORIGIN=http://localhost:3000`.
 
-## Future CLI Shape
+## CLI Shape
 
-Forge does not have a global `forge` launcher yet. Current supported commands
-remain the install scripts and `web/package.json` scripts.
+Forge installs a thin global `forge` launcher for normal operator workflows.
+The launcher delegates to the existing install, uninstall, web, and recovery
+scripts instead of duplicating their logic.
 
-Reserved future command areas:
+Supported starter commands:
 
-| Area | Example commands |
+| Command | Purpose |
 |---|---|
-| Start and open | `forge`, `forge dev`, `forge open` |
-| Readiness and repair | `forge doctor`, `forge logs`, `forge reset` |
-| Install lifecycle | `forge install`, `forge update`, `forge uninstall` |
-| Runtime control | `forge worker`, `forge status` |
-| Information | `forge version`, `forge help` |
+| `forge` | Start the local dashboard and embedded worker |
+| `forge upgrade` | Sync dependencies, migrations, seeds, and checks |
+| `forge uninstall` | Remove Forge runtime pieces, passing flags through |
+| `forge reset-credentials` | Prompt for a new local account password |
+| `forge doctor` | Run runtime readiness checks |
+
+See [`cli-command-architecture.md`](cli-command-architecture.md) for command
+ownership, routing, and non-goals.

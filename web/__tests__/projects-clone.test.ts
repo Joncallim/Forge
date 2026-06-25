@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { OWNER_REPO_RE, redactToken } from '@/app/api/projects/route'
+import { buildCloneUrl, OWNER_REPO_RE, redactToken } from '@/app/api/projects/route'
+import { validateGitHubTokenEnvVar } from '@/lib/github'
 
 describe('OWNER_REPO_RE', () => {
   it('accepts well-formed owner/repo strings', () => {
@@ -50,5 +51,25 @@ describe('redactToken', () => {
     const redacted = redactToken(message)
     expect(redacted).not.toContain(placeholderA)
     expect(redacted).not.toContain(placeholderB)
+  })
+})
+
+describe('buildCloneUrl', () => {
+  it('percent-encodes token characters that are meaningful inside URLs', () => {
+    const token = 'placeholder@token:with/slashes'
+    const cloneUrl = buildCloneUrl('owner/repo', token)
+
+    expect(cloneUrl).toBe(
+      `https://x-access-token:${encodeURIComponent(token)}@github.com/owner/repo.git`,
+    )
+    expect(cloneUrl).not.toContain(token)
+  })
+})
+
+describe('validateGitHubTokenEnvVar', () => {
+  it('allows only fixed GitHub token environment variable names', () => {
+    expect(validateGitHubTokenEnvVar('GITHUB_TOKEN')).toBeNull()
+    expect(validateGitHubTokenEnvVar('GH_TOKEN')).toBeNull()
+    expect(validateGitHubTokenEnvVar('SESSION_SECRET')).toMatch(/GitHub token env var/i)
   })
 })

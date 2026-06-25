@@ -12,21 +12,47 @@
  * password was forgotten too: resetting the password here restores access
  * without needing the old password or the old passkey.
  *
- * Run with: npx tsx scripts/reset-password.ts <new-password>
- * Or via:   npm run auth:reset-password -- <new-password>
+ * Preferred safe usage:
+ *   forge reset-credentials
+ *
+ * Script usage:
+ *   printf '%s\n' "$NEW_PASSWORD" | npm run auth:reset-password -- --stdin
  */
 
 import '../lib/load-env'
+import { readFileSync } from 'node:fs'
 import { eq } from 'drizzle-orm'
 import { db } from '../db'
 import { users } from '../db/schema'
 import { hashPassword, validatePassword } from '../lib/password'
+import { clearPasswordLoginRateLimits } from '../lib/auth-rate-limit'
+
+function passwordFromArgs(): string | undefined {
+  const arg = process.argv[2]
+  if (arg === '--stdin') {
+    if (process.argv.length > 3) {
+      console.error('[reset-password] Refusing extra arguments because they can leak through shell history and process argv.')
+      console.error('[reset-password] Use: forge reset-credentials')
+      console.error('[reset-password] Or:  npm run auth:reset-password -- --stdin')
+      process.exit(1)
+    }
+    return readFileSync(0, 'utf8').replace(/\r?\n$/, '')
+  }
+  if (arg) {
+    console.error('[reset-password] Refusing password arguments because they can leak through shell history and process argv.')
+    console.error('[reset-password] Use: forge reset-credentials')
+    console.error('[reset-password] Or:  npm run auth:reset-password -- --stdin')
+    process.exit(1)
+  }
+  return undefined
+}
 
 async function main() {
-  const newPassword = process.argv[2]
+  const newPassword = passwordFromArgs()
 
   if (!newPassword) {
-    console.error('[reset-password] Usage: npm run auth:reset-password -- <new-password>')
+    console.error('[reset-password] Usage: forge reset-credentials')
+    console.error('[reset-password] Or:    npm run auth:reset-password -- --stdin')
     process.exit(1)
   }
 
@@ -50,6 +76,15 @@ async function main() {
   await db.update(users).set({ passwordHash }).where(eq(users.id, user.id))
 
   console.log(`[reset-password] Password reset for "${user.displayName}". Sign in at /login.`)
+  try {
+    const clearedRateLimits = await clearPasswordLoginRateLimits()
+    if (clearedRateLimits > 0) {
+      console.log(`[reset-password] Cleared ${clearedRateLimits} password sign-in throttle key(s).`)
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    console.warn(`[reset-password] Password was reset, but throttle keys could not be cleared: ${message}`)
+  }
   process.exit(0)
 }
 

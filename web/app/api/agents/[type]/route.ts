@@ -13,8 +13,17 @@ import { redis } from '@/lib/redis'
 // Constants
 // ---------------------------------------------------------------------------
 
-const AGENT_CONFIG_DIR =
-  process.env.FORGE_AGENT_CONFIG_DIR?.trim() || path.resolve(process.cwd(), '../../.claude/agents')
+export function resolveAgentConfigDir(cwd = process.cwd()): string {
+  const configured = process.env.FORGE_AGENT_CONFIG_DIR?.trim()
+  if (configured) return path.resolve(configured)
+
+  const repoRoot = path.basename(cwd) === 'web'
+    ? path.resolve(cwd, '..')
+    : path.resolve(cwd)
+  return path.resolve(repoRoot, '.claude/agents')
+}
+
+const AGENT_CONFIG_DIR = resolveAgentConfigDir()
 
 function isValidAgentType(value: string): boolean {
   return /^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$/.test(value)

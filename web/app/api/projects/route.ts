@@ -10,9 +10,14 @@ import { DEFAULT_PROJECT_MCP_CONFIG, projects, type ProjectMcpConfig } from '@/d
 import { isNull, desc } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { registerProjectPath } from '@/lib/project-registry'
-import { resolveGitHubToken } from '@/lib/github'
+import { resolveGitHubToken, validateGitHubTokenEnvVar } from '@/lib/github'
 import { getCachedProjectMcpSummaries } from '@/lib/mcps/manager'
-import { collapseHomePath, getWorkspaceSettings, isWithinPath } from '@/lib/workspace'
+import {
+  collapseHomePath,
+  getWorkspaceSettings,
+  isWithinPath,
+  type WorkspaceSettings,
+} from '@/lib/workspace'
 
 const execFile = promisify(execFileCallback)
 
@@ -49,6 +54,11 @@ export function redactToken(message: string): string {
   return message.replace(CREDENTIAL_URL_RE, 'x-access-token:***@')
 }
 
+export function buildCloneUrl(ownerRepo: string, token: string | null | undefined): string {
+  if (!token) return `https://github.com/${ownerRepo}.git`
+  return `https://x-access-token:${encodeURIComponent(token)}@github.com/${ownerRepo}.git`
+}
+
 async function pathExistsNonEmpty(targetPath: string): Promise<boolean> {
   try {
     const stat = await fs.stat(targetPath)
@@ -69,17 +79,59 @@ function folderNameFromProjectName(name: string): string {
   return slug || 'forge-project'
 }
 
-async function ensureLocalProjectDirectory(localPath: string): Promise<void> {
+async function assertRealPathWithinWorkspace(
+  candidatePath: string,
+  workspace: WorkspaceSettings,
+): Promise<void> {
+  const [realWorkspaceRoot, realCandidate] = await Promise.all([
+    fs.realpath(workspace.workspaceRoot),
+    fs.realpath(candidatePath),
+  ])
+
+  if (!isWithinPath(realWorkspaceRoot, realCandidate)) {
+    throw new Error('localPath must be inside the active workspace root')
+  }
+}
+
+async function assertNearestExistingAncestorWithinWorkspace(
+  candidatePath: string,
+  workspace: WorkspaceSettings,
+): Promise<void> {
+  let currentPath = path.resolve(/*turbopackIgnore: true*/ candidatePath)
+  const workspaceRoot = path.resolve(/*turbopackIgnore: true*/ workspace.workspaceRoot)
+
+  while (isWithinPath(workspaceRoot, currentPath)) {
+    try {
+      await assertRealPathWithinWorkspace(currentPath, workspace)
+      return
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+      const parentPath = path.dirname(currentPath)
+      if (parentPath === currentPath) break
+      currentPath = parentPath
+    }
+  }
+
+  throw new Error('localPath must be inside the active workspace root')
+}
+
+async function prepareLocalProjectDirectory(
+  localPath: string,
+  workspace: WorkspaceSettings,
+): Promise<void> {
   try {
     const stat = await fs.stat(localPath)
     if (!stat.isDirectory()) {
       throw new Error('localPath exists but is not a directory')
     }
+    await assertRealPathWithinWorkspace(localPath, workspace)
     return
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
   }
+  await assertNearestExistingAncestorWithinWorkspace(localPath, workspace)
   await fs.mkdir(localPath, { recursive: true })
+  await assertRealPathWithinWorkspace(localPath, workspace)
 }
 
 async function writeProjectConfig(project: {
@@ -167,6 +219,12 @@ export async function POST(request: NextRequest) {
     }
 
     const data = parsed.data
+    const githubTokenEnvVar = data.githubTokenEnvVar?.trim() || null
+    const githubTokenEnvVarError = validateGitHubTokenEnvVar(githubTokenEnvVar)
+    if (githubTokenEnvVarError) {
+      return NextResponse.json({ error: githubTokenEnvVarError }, { status: 400 })
+    }
+
     const source = data.source ?? (data.githubRepo ? 'github' : 'local')
     const workspace = await getWorkspaceSettings()
     if (source === 'github' && !data.githubRepo) {
@@ -206,6 +264,12 @@ export async function POST(request: NextRequest) {
           { status: 400 },
         )
       }
+      try {
+        await assertNearestExistingAncestorWithinWorkspace(resolvedLocalPath, workspace)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Invalid local path'
+        return NextResponse.json({ error: message }, { status: 400 })
+      }
 
       if (await pathExistsNonEmpty(resolvedLocalPath)) {
         return NextResponse.json(
@@ -214,10 +278,8 @@ export async function POST(request: NextRequest) {
         )
       }
 
-      const resolvedToken = await resolveGitHubToken()
-      const cloneUrl = resolvedToken
-        ? `https://x-access-token:${resolvedToken.token}@github.com/${data.githubRepo}.git`
-        : `https://github.com/${data.githubRepo}.git`
+      const resolvedToken = await resolveGitHubToken({ envVar: githubTokenEnvVar })
+      const cloneUrl = buildCloneUrl(data.githubRepo, resolvedToken?.token)
 
       try {
         await execFile('git', ['clone', '--depth', '1', cloneUrl, resolvedLocalPath], {
@@ -236,7 +298,7 @@ export async function POST(request: NextRequest) {
           name: data.name,
           githubRepo: data.githubRepo,
           localPath: resolvedLocalPath,
-          githubTokenEnvVar: data.githubTokenEnvVar ?? null,
+          githubTokenEnvVar,
           pmProviderConfigId: data.pmProviderConfigId ?? null,
           defaultBranch: data.defaultBranch ?? 'main',
         })
@@ -268,7 +330,12 @@ export async function POST(request: NextRequest) {
           { status: 400 },
         )
       }
-      await ensureLocalProjectDirectory(resolvedLocalPath)
+      try {
+        await prepareLocalProjectDirectory(resolvedLocalPath, workspace)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Invalid local path'
+        return NextResponse.json({ error: message }, { status: 400 })
+      }
     }
 
     const [project] = await db
@@ -277,7 +344,7 @@ export async function POST(request: NextRequest) {
         name: data.name,
         githubRepo: source === 'github' ? data.githubRepo ?? null : null,
         localPath: resolvedLocalPath,
-        githubTokenEnvVar: data.githubTokenEnvVar ?? null,
+        githubTokenEnvVar,
         pmProviderConfigId: data.pmProviderConfigId ?? null,
         defaultBranch: data.defaultBranch ?? 'main',
       })

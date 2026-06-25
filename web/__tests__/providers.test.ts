@@ -4,7 +4,7 @@
  * Tests for lib/providers/registry.ts:
  *  - getProvider instantiates the right factory for each providerType
  *  - getProvider returns null for inactive rows
- *  - getProvider warns when apiKeyEnvVar is set but env var is missing
+ *  - getProvider allows only provider-specific apiKeyEnvVar values
  *  - getModel returns a LanguageModel (the factory's return value)
  *
  * vi.hoisted() is required because vi.mock() factories are hoisted before
@@ -118,17 +118,18 @@ describe('getProvider', () => {
     mockCreateAnthropic.mockReturnValue(mockAnthropicInstance)
     mockCreateOpenAI.mockReturnValue(mockOpenAIInstance)
     // Clear env vars
-    delete process.env.TEST_ANTHROPIC_KEY
-    delete process.env.TEST_OPENAI_KEY
+    delete process.env.ANTHROPIC_API_KEY
+    delete process.env.OPENAI_API_KEY
+    delete process.env.OPENROUTER_API_KEY
     delete process.env.TEST_OPENROUTER_KEY
     delete process.env.TEST_CUSTOM_KEY
     delete process.env.UNSET_KEY_VARIABLE
   })
 
   it('instantiates createAnthropic with the API key from the env var', async () => {
-    process.env.TEST_ANTHROPIC_KEY = 'sk-ant-test'
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-test'
     mockDbSelect.mockReturnValue(chain([
-      makeRow({ providerType: 'anthropic', apiKeyEnvVar: 'TEST_ANTHROPIC_KEY' }),
+      makeRow({ providerType: 'anthropic', apiKeyEnvVar: 'ANTHROPIC_API_KEY' }),
     ]))
 
     await getProvider('config-id')
@@ -139,15 +140,35 @@ describe('getProvider', () => {
   })
 
   it('instantiates createOpenAI with baseURL=https://openrouter.ai/api/v1 for openrouter', async () => {
-    process.env.TEST_OPENROUTER_KEY = 'sk-or-test'
+    process.env.OPENROUTER_API_KEY = 'sk-or-test'
     mockDbSelect.mockReturnValue(chain([
-      makeRow({ providerType: 'openrouter', apiKeyEnvVar: 'TEST_OPENROUTER_KEY' }),
+      makeRow({ providerType: 'openrouter', apiKeyEnvVar: 'OPENROUTER_API_KEY' }),
     ]))
 
     await getProvider('config-id')
 
     expect(mockCreateOpenAI).toHaveBeenCalledWith(
       expect.objectContaining({ baseURL: 'https://openrouter.ai/api/v1' }),
+    )
+  })
+
+  it('ignores legacy custom baseUrl values for fixed cloud OpenAI-compatible providers', async () => {
+    process.env.OPENROUTER_API_KEY = 'sk-or-test'
+    mockDbSelect.mockReturnValue(chain([
+      makeRow({
+        providerType: 'openrouter',
+        baseUrl: 'https://attacker.example/v1',
+        apiKeyEnvVar: 'OPENROUTER_API_KEY',
+      }),
+    ]))
+
+    await getProvider('config-id')
+
+    expect(mockCreateOpenAI).toHaveBeenCalledWith(
+      expect.objectContaining({ baseURL: 'https://openrouter.ai/api/v1' }),
+    )
+    expect(mockCreateOpenAI).not.toHaveBeenCalledWith(
+      expect.objectContaining({ baseURL: 'https://attacker.example/v1' }),
     )
   })
 
@@ -187,7 +208,7 @@ describe('getProvider', () => {
     )
   })
 
-  it('instantiates createOpenAI with baseURL from the DB row for custom providers', async () => {
+  it('instantiates createOpenAI with baseURL from the DB row for custom providers without reading env vars', async () => {
     process.env.TEST_CUSTOM_KEY = 'sk-custom-test'
     mockDbSelect.mockReturnValue(chain([
       makeRow({
@@ -201,7 +222,7 @@ describe('getProvider', () => {
 
     expect(mockCreateOpenAI).toHaveBeenCalledWith(
       expect.objectContaining({
-        apiKey: 'sk-custom-test',
+        apiKey: undefined,
         baseURL: 'https://models.example.com/v1',
       }),
     )
@@ -239,10 +260,10 @@ describe('getProvider', () => {
     expect(result).toBeNull()
   })
 
-  it('emits console.warn when apiKeyEnvVar is set but the env var is undefined', async () => {
-    // UNSET_KEY_VARIABLE is deliberately not set in the environment
+  it('emits console.warn when an allowed apiKeyEnvVar is undefined', async () => {
+    // ANTHROPIC_API_KEY is deliberately not set in the environment
     mockDbSelect.mockReturnValue(chain([
-      makeRow({ apiKeyEnvVar: 'UNSET_KEY_VARIABLE' }),
+      makeRow({ providerType: 'anthropic', apiKeyEnvVar: 'ANTHROPIC_API_KEY' }),
     ]))
 
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
@@ -250,7 +271,34 @@ describe('getProvider', () => {
     await getProvider('config-id')
 
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('UNSET_KEY_VARIABLE'),
+      expect.stringContaining('ANTHROPIC_API_KEY'),
+    )
+
+    warnSpy.mockRestore()
+  })
+
+  it('ignores unsafe legacy apiKeyEnvVar values instead of reading arbitrary env vars', async () => {
+    process.env.SESSION_SECRET = 'do-not-read'
+    mockDbSelect.mockReturnValue(chain([
+      makeRow({
+        providerType: 'custom',
+        baseUrl: 'https://models.example.com/v1',
+        apiKeyEnvVar: 'SESSION_SECRET',
+      }),
+    ]))
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    await getProvider('config-id')
+
+    expect(mockCreateOpenAI).toHaveBeenCalledWith(
+      expect.objectContaining({
+        apiKey: undefined,
+        baseURL: 'https://models.example.com/v1',
+      }),
+    )
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('ignored unsafe apiKeyEnvVar'),
     )
 
     warnSpy.mockRestore()
@@ -258,13 +306,13 @@ describe('getProvider', () => {
 
   it('prefers the encrypted stored key over the env var', async () => {
     process.env.SESSION_SECRET = 'a'.repeat(64)
-    process.env.TEST_ANTHROPIC_KEY = 'from-env'
+    process.env.ANTHROPIC_API_KEY = 'from-env'
     const apiKeyCiphertext = encryptSecret('from-db')
 
     mockDbSelect.mockReturnValue(chain([
       makeRow({
         providerType: 'anthropic',
-        apiKeyEnvVar: 'TEST_ANTHROPIC_KEY',
+        apiKeyEnvVar: 'ANTHROPIC_API_KEY',
         apiKeyCiphertext,
       }),
     ]))
@@ -294,11 +342,11 @@ describe('getModel', () => {
   })
 
   it('returns the LanguageModel by calling provider(modelId)', async () => {
-    process.env.TEST_ANTHROPIC_KEY = 'sk-ant-test'
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-test'
     mockDbSelect.mockReturnValue(chain([
       makeRow({
         providerType: 'anthropic',
-        apiKeyEnvVar: 'TEST_ANTHROPIC_KEY',
+        apiKeyEnvVar: 'ANTHROPIC_API_KEY',
         modelId: 'claude-opus-4-5',
       }),
     ]))

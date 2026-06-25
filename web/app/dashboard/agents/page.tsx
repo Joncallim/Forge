@@ -83,7 +83,7 @@ type CustomProviderFormState = {
   providerType: ProviderType
   modelId: string
   baseUrl: string
-  apiKeyEnvVar: string
+  apiKey: string
   isLocal: boolean
 }
 
@@ -121,7 +121,7 @@ const DEFAULT_CUSTOM_PROVIDER_FORM: CustomProviderFormState = {
   providerType: 'custom',
   modelId: '',
   baseUrl: '',
-  apiKeyEnvVar: '',
+  apiKey: '',
   isLocal: false,
 }
 
@@ -256,7 +256,7 @@ function AgentEditor({
     const displayName = customProviderForm.displayName.trim()
     const modelId = customProviderForm.modelId.trim()
     const baseUrl = customProviderForm.baseUrl.trim() || null
-    const apiKeyEnvVar = customProviderForm.isLocal ? null : customProviderForm.apiKeyEnvVar.trim() || null
+    const apiKey = customProviderForm.isLocal ? null : customProviderForm.apiKey.trim() || null
 
     if (!displayName) throw new Error('Display name is required for custom providers.')
     if (!modelId) throw new Error('Model ID is required for custom providers.')
@@ -272,7 +272,7 @@ function AgentEditor({
         providerType: customProviderForm.providerType,
         modelId,
         baseUrl,
-        apiKeyEnvVar,
+        apiKey,
         isLocal: customProviderForm.isLocal,
       }),
     })
@@ -490,10 +490,11 @@ function AgentEditor({
               )}
               {!customProviderForm.isLocal && (
                 <input
-                  aria-label="Custom provider API key environment variable"
-                  value={customProviderForm.apiKeyEnvVar}
-                  onChange={(e) => setCustomProviderValue('apiKeyEnvVar', e.target.value)}
-                  placeholder="API key environment variable"
+                  aria-label="Custom provider API key"
+                  type="password"
+                  value={customProviderForm.apiKey}
+                  onChange={(e) => setCustomProviderValue('apiKey', e.target.value)}
+                  placeholder="API key"
                   className="rounded-lg border border-input bg-background px-3 py-2 text-sm"
                 />
               )}

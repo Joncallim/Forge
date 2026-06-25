@@ -155,3 +155,9 @@ export function providerCategory(type: ProviderType, isLocal?: boolean): Provide
   if (isLocal) return 'local'
   return PROVIDER_CATALOG[type]?.category ?? 'cloud'
 }
+
+export function providerSupportsUserBaseUrl(type: ProviderType | string): boolean {
+  const entry = PROVIDER_CATALOG[type as ProviderType]
+  if (!entry) return false
+  return entry.requiresBaseUrl || entry.category === 'local'
+}
