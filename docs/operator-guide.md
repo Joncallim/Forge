@@ -33,9 +33,9 @@ The installer can prepare:
 - Redis 7 or newer.
 - GitHub CLI.
 - Optional Ollama local model support.
-- `.env` with generated local secrets.
+- `~/Documents/Forge/config/forge.env` with generated local secrets.
 - `web/node_modules`.
-- Database migrations and default agent prompts.
+- Database migrations, workspace agent prompts, and workspace workforce exports.
 
 Readiness and update commands:
 
@@ -46,8 +46,22 @@ FORGE_SKIP_OLLAMA=1 bash scripts/install.sh
 ```
 
 If an install is interrupted, run `bash scripts/install.sh` again. The installer
-preserves existing settings and resumes idempotent steps. Logs are written to
-`.forge/install.log`.
+preserves existing settings and resumes idempotent steps. Logs are written under
+`~/Documents/Forge/runtime/install/`.
+
+Repository files are source and defaults. Editable/runtime files are stored under
+the active Forge workspace, which defaults to `~/Documents/Forge`:
+
+```text
+config/forge.env
+prompts/agents/*.toml
+workforces/<slug>/{workforce.json,workflow.json,manager-prompt.md}
+projects/
+mcps/
+runtime/
+logs/
+backups/
+```
 
 ## Start And Stop
 
@@ -180,7 +194,8 @@ Worker and workspace options:
 |---|---|
 | `FORGE_EMBED_WORKER` | Set `0` when running a separate worker |
 | `FORGE_AGENT_WEB_SEARCH` | Set `0` to disable no-key web research context |
-| `FORGE_AGENT_CONFIG_DIR` | Directory for app-editable agent prompt files |
+| `FORGE_AGENT_CONFIG_DIR` | Optional override for app-editable agent prompt files; must stay inside the workspace |
+| `FORGE_PROMPT_UPGRADE_MODE` | `keep` or `overwrite` local workspace prompts during install/upgrade |
 | `FORGE_WORKSPACE_ROOT` | Fixed workspace root override |
 | `FORGE_MCPS_ROOT` | Fixed shared MCP root override |
 | `FORGE_WORKER_MAX_ATTEMPTS` | Retry ceiling per task or approval job |
@@ -263,8 +278,8 @@ before Forge.
 
 ## Common Problems
 
-If `npm run doctor` fails, check `.env`, PostgreSQL, Redis, and GitHub CLI
-readiness.
+If `npm run doctor` fails, check `~/Documents/Forge/config/forge.env`,
+PostgreSQL, Redis, and GitHub CLI readiness.
 
 If a task stays `Pending`, the worker is not running or cannot reach Redis.
 
@@ -272,7 +287,7 @@ If a task changes to `Failed`, read the task page error, check the terminal
 running Forge, and confirm the Architect agent has a provider assigned.
 
 If provider health says an environment variable is missing, add the real key to
-`.env` and restart the web app and worker.
+`~/Documents/Forge/config/forge.env` and restart the web app and worker.
 
 If passkey registration fails, use `http://localhost:3000` locally and confirm
 `WEBAUTHN_RP_ID=localhost` and `WEBAUTHN_ORIGIN=http://localhost:3000`.

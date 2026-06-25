@@ -47,6 +47,8 @@ automation remain out of scope for this slice.
 PostgreSQL is authoritative for:
 
 - task state,
+- editable agent records,
+- editable workforce records,
 - work package state,
 - run state,
 - approval gates,
@@ -61,6 +63,21 @@ Redis remains responsible for:
 - answered-question replan jobs,
 - retry scheduling,
 - dead-letter transport.
+
+The active Forge workspace, defaulting to `~/Documents/Forge`, owns the
+operator-editable and generated filesystem mirrors:
+
+- `prompts/agents/*.toml` for editable app agent prompts copied from repository
+  defaults on install,
+- `workforces/agents.json` and `workforces/index.json` for exported workforce
+  tables,
+- `workforces/<slug>/workforce.json` for ordered membership,
+- `workforces/<slug>/workflow.json` for the workforce workflow,
+- `workforces/<slug>/manager-prompt.md` for the workforce manager prompt.
+
+For this slice, workforce files are deterministic exports from PostgreSQL, not
+import sources. Prompt files are editable local copies; upgrades keep them unless
+the operator explicitly chooses overwrite.
 
 ## Rollout
 

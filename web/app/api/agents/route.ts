@@ -3,8 +3,9 @@ import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/db'
 import { agentConfigs } from '@/db/schema'
-import { asc } from 'drizzle-orm'
+import { asc, eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
+import { syncAgentPromptFileToWorkspace } from '@/lib/agent-prompts'
 
 const agentSlugSchema = z
   .string()
@@ -85,6 +86,24 @@ export async function POST(request: NextRequest) {
         updatedBy: session.userId,
       })
       .returning()
+
+    try {
+      await syncAgentPromptFileToWorkspace({
+        agentType: data.agentType,
+        displayName: data.displayName,
+        description: data.description ?? '',
+        systemPrompt: data.systemPrompt,
+      })
+    } catch (promptErr) {
+      await db.delete(agentConfigs).where(eq(agentConfigs.id, agent.id)).catch((cleanupErr) => {
+        console.error('[POST /api/agents] Failed to clean up agent after prompt sync failure', cleanupErr)
+      })
+      console.error('[POST /api/agents] Prompt sync failed', promptErr)
+      return NextResponse.json(
+        { error: 'Agent prompt file could not be written' },
+        { status: 500 },
+      )
+    }
 
     return NextResponse.json({ agent }, { status: 201 })
   } catch (err) {

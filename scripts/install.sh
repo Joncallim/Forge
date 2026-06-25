@@ -18,10 +18,32 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd)"
-ENV_FILE="${FORGE_ENV_FILE:-$REPO_ROOT/.env}"
-INSTALL_STATE_DIR="${FORGE_INSTALL_STATE_DIR:-$REPO_ROOT/.forge}"
+expand_home_path_early() {
+  case "${1:-}" in
+    "~") [ -n "${HOME:-}" ] && printf '%s\n' "$HOME" ;;
+    "~/"*) [ -n "${HOME:-}" ] && printf '%s/%s\n' "$HOME" "${1#\~/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+workspace_root_early() {
+  local root settings_file
+  root="${FORGE_WORKSPACE_ROOT:-}"
+  if [ -z "$root" ] && [ -n "${HOME:-}" ]; then
+    settings_file="$HOME/Documents/Forge/global-settings.json"
+    if [ -f "$settings_file" ]; then
+      root="$(sed -n 's/^[[:space:]]*"workspaceRoot"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$settings_file" | head -n1)"
+    fi
+  fi
+  [ -n "$root" ] || root="~/Documents/Forge"
+  expand_home_path_early "$root"
+}
+WORKSPACE_ROOT="$(workspace_root_early)"
+ENV_FILE="${FORGE_ENV_FILE:-$WORKSPACE_ROOT/config/forge.env}"
+INSTALL_STATE_DIR="${FORGE_INSTALL_STATE_DIR:-$WORKSPACE_ROOT/runtime/install}"
 INSTALL_MANIFEST="$INSTALL_STATE_DIR/install-manifest"
 INSTALL_LOG="$INSTALL_STATE_DIR/install.log"
+LOG_DIR="${FORGE_LOG_DIR:-$WORKSPACE_ROOT/logs}"
+OLLAMA_LOG="$LOG_DIR/ollama.log"
 
 OS_NAME="${FORGE_OS_OVERRIDE:-$(uname -s)}"
 DRY_RUN="${FORGE_DRY_RUN:-0}"
@@ -29,6 +51,7 @@ CHECK_ONLY="${FORGE_CHECK_ONLY:-0}"
 YES="${FORGE_ASSUME_YES:-0}"
 SKIP_OLLAMA="${FORGE_SKIP_OLLAMA:-0}"
 UPGRADE_MODE="${FORGE_UPGRADE:-0}"
+PROMPT_UPGRADE_MODE="${FORGE_PROMPT_UPGRADE_MODE:-keep}"
 WITH_OLLAMA=0
 ZERO_CONFIG_MODEL="${FORGE_ZERO_CONFIG_MODEL:-qwen2.5-coder:7b}"
 SERVICE_MODE="${FORGE_SERVICE_MODE:-auto}"
@@ -86,6 +109,12 @@ Options:
                          npm install/db:migrate/db:seed-agents, and runs the
                          doctor. Implies --yes. Skips the Ollama model pull
                          unless --with-ollama is also passed.
+  --prompt-mode MODE     keep or overwrite local workspace prompts on upgrade.
+                         Default: keep.
+  --keep-prompts         Preserve local workspace prompts. Same as
+                         --prompt-mode keep.
+  --overwrite-prompts    Replace local workspace prompts from repository
+                         defaults after backing them up.
   --yes, -y              Assume yes for package manager prompts where supported.
   --check                Inspect local readiness without changing the machine.
   --dry-run              Print the planned work without changing the machine.
@@ -95,12 +124,14 @@ Environment:
   FORGE_SKIP_OLLAMA=1
   FORGE_ZERO_CONFIG_MODEL=qwen2.5-coder:7b
   FORGE_SERVICE_MODE=auto|native|docker
+  FORGE_PROMPT_UPGRADE_MODE=keep|overwrite
   FORGE_CHECK_ONLY=1
   FORGE_DRY_RUN=1
   FORGE_UPGRADE=1
   FORGE_OS_OVERRIDE=Darwin|Linux              # dry-run/testing helper
   FORGE_PACKAGE_MANAGER_OVERRIDE=apt|brew     # dry-run/testing helper
   FORGE_ENV_FILE=/path/to/.env                # testing/advanced helper
+  FORGE_INSTALL_STATE_DIR=/path/to/state      # testing/advanced helper
   FORGE_CLI_LINK_DIR=/path/on/PATH            # testing/advanced helper
   FORGE_NPM_INSTALL_TIMEOUT_SECONDS=900       # npm install/ci timeout guard
 EOF
@@ -143,6 +174,17 @@ while [ "$#" -gt 0 ]; do
       UPGRADE_MODE=1
       YES=1
       ;;
+    --prompt-mode)
+      shift
+      [ "$#" -gt 0 ] || die "--prompt-mode requires keep or overwrite"
+      PROMPT_UPGRADE_MODE="$1"
+      ;;
+    --keep-prompts)
+      PROMPT_UPGRADE_MODE="keep"
+      ;;
+    --overwrite-prompts)
+      PROMPT_UPGRADE_MODE="overwrite"
+      ;;
     --service-mode)
       shift
       [ "$#" -gt 0 ] || die "--service-mode requires auto, native, or docker"
@@ -172,6 +214,11 @@ done
 case "$SERVICE_MODE" in
   auto|native|docker) ;;
   *) die "Unsupported service mode: $SERVICE_MODE" ;;
+esac
+
+case "$PROMPT_UPGRADE_MODE" in
+  keep|overwrite) ;;
+  *) die "Unsupported prompt mode: $PROMPT_UPGRADE_MODE" ;;
 esac
 
 case "$NPM_INSTALL_TIMEOUT_SECONDS" in
@@ -272,7 +319,9 @@ ensure_install_state() {
   fi
 
   mkdir -p "$INSTALL_STATE_DIR"
+  mkdir -p "$LOG_DIR"
   chmod 700 "$INSTALL_STATE_DIR" 2>/dev/null || true
+  chmod 700 "$LOG_DIR" 2>/dev/null || true
   if [ ! -f "$INSTALL_MANIFEST" ]; then
     {
       printf '# Forge install manifest\n'
@@ -314,6 +363,15 @@ env_value() {
   sed -n "s/^${key}=//p" "$file" | head -1
 }
 
+initial_env_value() {
+  local key="$1" value
+  value="$(env_value "$key")"
+  if [ -z "$value" ] && [ ! -f "$ENV_FILE" ] && [ -f "$REPO_ROOT/.env" ]; then
+    value="$(env_value "$key" "$REPO_ROOT/.env")"
+  fi
+  printf '%s' "$value"
+}
+
 placeholder_value() {
   case "${1:-}" in
     ''|change_me|change-me|password|your_password|paste_the_generated_value_here|change_me_generate_with_openssl_rand_hex_32)
@@ -342,7 +400,7 @@ set_env_line() {
   local tmp_file
 
   if [ "$DRY_RUN" = "1" ]; then
-    info "[dry-run] Set $key in .env"
+    info "[dry-run] Set $key in $ENV_FILE"
     return 0
   fi
 
@@ -868,7 +926,7 @@ compose_command() {
 start_docker_services() {
   step "Starting PostgreSQL and Redis with Docker Compose"
   if [ "$DRY_RUN" = "1" ]; then
-    info "[dry-run] docker compose up -d --wait postgres redis"
+    info "[dry-run] FORGE_WORKSPACE_ROOT=$WORKSPACE_ROOT docker compose --env-file $ENV_FILE up -d --wait postgres redis"
     return 0
   fi
 
@@ -879,7 +937,7 @@ start_docker_services() {
 
   local compose
   compose="$(compose_command)" || die "Docker Compose is required for --service-mode docker."
-  (cd "$REPO_ROOT" && $compose up -d --wait postgres redis)
+  (cd "$REPO_ROOT" && FORGE_WORKSPACE_ROOT="$WORKSPACE_ROOT" $compose --env-file "$ENV_FILE" up -d --wait postgres redis)
 }
 
 wait_for_postgres() {
@@ -1006,7 +1064,7 @@ ensure_env_line() {
     return 0
   fi
   if [ "$DRY_RUN" = "1" ]; then
-    info "[dry-run] Append $key to .env"
+    info "[dry-run] Append $key to $ENV_FILE"
   else
     printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
   fi
@@ -1048,11 +1106,21 @@ write_env_file() {
   step "Writing local environment"
 
   if [ -f "$ENV_FILE" ]; then
-    info ".env already exists; preserving existing values and appending missing defaults."
+    info "Environment file already exists; preserving existing values and appending missing defaults."
+  elif [ -f "$REPO_ROOT/.env" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+      info "[dry-run] Copy legacy repo .env to $ENV_FILE"
+    else
+      mkdir -p "$(dirname "$ENV_FILE")"
+      cp "$REPO_ROOT/.env" "$ENV_FILE"
+      chmod 600 "$ENV_FILE"
+    fi
+    info "Copied legacy repo .env to the workspace environment file."
   else
     if [ "$DRY_RUN" = "1" ]; then
       info "[dry-run] Create $ENV_FILE"
     else
+      mkdir -p "$(dirname "$ENV_FILE")"
       {
         printf '# Generated by scripts/install.sh. Provider API keys are entered in the Forge web UI.\n'
       } > "$ENV_FILE"
@@ -1086,9 +1154,9 @@ start_ollama_background() {
     info "[dry-run] Start ollama serve"
   else
     ensure_install_state
-    nohup ollama serve > "$INSTALL_STATE_DIR/ollama.log" 2>&1 &
+    nohup ollama serve > "$OLLAMA_LOG" 2>&1 &
     record_manifest "ollama_pid" "$!"
-    info "Started Ollama with nohup. Log: $INSTALL_STATE_DIR/ollama.log"
+    info "Started Ollama with nohup. Log: $OLLAMA_LOG"
   fi
 }
 
@@ -1234,13 +1302,13 @@ prepare_web_app() {
       bash -c 'cd "$1" && npm install --no-audit --no-fund --progress=true' _ "$REPO_ROOT/web"
     mark_web_node_modules_clean
   fi
-  run "npm run db:migrate" bash -c 'cd "$1" && FORGE_SUPPRESS_MIGRATION_NOTICES=1 npm run db:migrate --silent' _ "$REPO_ROOT/web"
-  run "npm run db:seed-agents" bash -c 'cd "$1" && npm run db:seed-agents' _ "$REPO_ROOT/web"
+  run "npm run db:migrate" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" FORGE_ENV_FILE="$3" FORGE_SUPPRESS_MIGRATION_NOTICES=1 npm run db:migrate --silent' _ "$REPO_ROOT/web" "$WORKSPACE_ROOT" "$ENV_FILE"
+  run "npm run db:seed-agents" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" FORGE_ENV_FILE="$3" FORGE_PROMPT_UPGRADE_MODE="$4" npm run db:seed-agents' _ "$REPO_ROOT/web" "$WORKSPACE_ROOT" "$ENV_FILE" "$PROMPT_UPGRADE_MODE"
 }
 
 run_doctor() {
   step "Running the doctor"
-  run "npm run doctor" bash -c 'cd "$1" && npm run doctor' _ "$REPO_ROOT/web"
+  run "npm run doctor" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" FORGE_ENV_FILE="$3" npm run doctor' _ "$REPO_ROOT/web" "$WORKSPACE_ROOT" "$ENV_FILE"
 }
 
 path_contains_dir() {
@@ -1342,9 +1410,11 @@ resolve_service_mode() {
 print_preflight_summary() {
   step "Preflight summary"
   info "Repository: $REPO_ROOT"
+  info "Workspace root: $WORKSPACE_ROOT"
   info "Environment file: $ENV_FILE"
   info "Install log: $INSTALL_LOG"
   info "Install manifest: $INSTALL_MANIFEST"
+  info "Prompt upgrade mode: $PROMPT_UPGRADE_MODE"
   info "Operating system: $OS_NAME"
   info "Package manager: $PACKAGE_MANAGER"
   info "Service mode: $SERVICE_MODE"
@@ -1452,7 +1522,7 @@ print_summary() {
     forge
 
   Then open http://localhost:3000 and create the first account.
-  For password-only first sign-in, set FORGE_PASSKEYS_ENABLED=0 in .env before
+  For password-only first sign-in, set FORGE_PASSKEYS_ENABLED=0 in $ENV_FILE before
   creating that account.
   The web app starts the task worker automatically. Set FORGE_EMBED_WORKER=0
   and run "cd web && npm run worker" separately if you want split processes.
@@ -1535,13 +1605,13 @@ fi
 
 install_base_dependencies
 
-DB_PASSWORD="$(env_value DATABASE_URL | sed -n 's#^postgres\(ql\)\?://forge:\(.*\)@localhost:5432/forge.*#\2#p' | head -1)"
-DB_PASSWORD="${DB_PASSWORD:-$(env_value POSTGRES_PASSWORD)}"
+DB_PASSWORD="$(initial_env_value DATABASE_URL | sed -n 's#^postgres\(ql\)\?://forge:\(.*\)@localhost:5432/forge.*#\2#p' | head -1)"
+DB_PASSWORD="${DB_PASSWORD:-$(initial_env_value POSTGRES_PASSWORD)}"
 if placeholder_value "$DB_PASSWORD"; then
   DB_PASSWORD=""
 fi
 DB_PASSWORD="${DB_PASSWORD:-$(random_hex 16)}"
-SESSION_SECRET="$(env_value SESSION_SECRET)"
+SESSION_SECRET="$(initial_env_value SESSION_SECRET)"
 if placeholder_value "$SESSION_SECRET"; then
   SESSION_SECRET=""
 fi

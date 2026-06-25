@@ -17,9 +17,17 @@ type GitHubStatus = {
 
 type WorkspaceSettings = {
   workspaceRoot: string
+  configRoot: string
   projectsRoot: string
   mcpsRoot: string
   templatesRoot: string
+  promptsRoot: string
+  agentPromptsRoot: string
+  workforcesRoot: string
+  runtimeRoot: string
+  logsRoot: string
+  backupsRoot: string
+  forgeEnvPath: string
   globalSettingsPath: string
   source: 'env' | 'setting' | 'default'
   envLocked: boolean
@@ -146,6 +154,22 @@ function WorkspaceCard() {
             <div>
               <dt className="font-medium text-foreground">Templates</dt>
               <dd className="break-all font-mono">{workspace.templatesRoot}</dd>
+            </div>
+            <div>
+              <dt className="font-medium text-foreground">Agent Prompts</dt>
+              <dd className="break-all font-mono">{workspace.agentPromptsRoot}</dd>
+            </div>
+            <div>
+              <dt className="font-medium text-foreground">Workforces</dt>
+              <dd className="break-all font-mono">{workspace.workforcesRoot}</dd>
+            </div>
+            <div>
+              <dt className="font-medium text-foreground">Runtime</dt>
+              <dd className="break-all font-mono">{workspace.runtimeRoot}</dd>
+            </div>
+            <div>
+              <dt className="font-medium text-foreground">Environment</dt>
+              <dd className="break-all font-mono">{workspace.forgeEnvPath}</dd>
             </div>
             <div>
               <dt className="font-medium text-foreground">Global Settings</dt>

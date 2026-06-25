@@ -11,11 +11,19 @@ export const DEFAULT_WORKSPACE_ROOT = '~/Documents/Forge'
 
 export type WorkspaceSettings = {
   workspaceRoot: string
+  configRoot: string
   projectsRoot: string
   mcpsRoot: string
   templatesRoot: string
   localMemoryRoot: string
   checkpointsRoot: string
+  promptsRoot: string
+  agentPromptsRoot: string
+  workforcesRoot: string
+  runtimeRoot: string
+  logsRoot: string
+  backupsRoot: string
+  forgeEnvPath: string
   globalSettingsPath: string
   source: 'env' | 'setting' | 'default'
   envLocked: boolean
@@ -61,11 +69,19 @@ function settingsForRoot(
 ): WorkspaceSettings {
   return {
     workspaceRoot,
+    configRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'config'),
     projectsRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'projects'),
     mcpsRoot,
     templatesRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'templates'),
     localMemoryRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'local-memory'),
     checkpointsRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'local-memory', 'checkpoints'),
+    promptsRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'prompts'),
+    agentPromptsRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'prompts', 'agents'),
+    workforcesRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'workforces'),
+    runtimeRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'runtime'),
+    logsRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'logs'),
+    backupsRoot: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'backups'),
+    forgeEnvPath: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'config', 'forge.env'),
     globalSettingsPath: path.join(/*turbopackIgnore: true*/ workspaceRoot, 'global-settings.json'),
     source,
     envLocked: source === 'env',
@@ -137,20 +153,35 @@ async function writeStoredSetting(key: string, value: string): Promise<void> {
 
 export async function ensureWorkspace(settings: WorkspaceSettings): Promise<void> {
   await Promise.all([
+    fs.mkdir(settings.configRoot, { recursive: true }),
     fs.mkdir(settings.projectsRoot, { recursive: true }),
     fs.mkdir(settings.mcpsRoot, { recursive: true }),
     fs.mkdir(settings.templatesRoot, { recursive: true }),
     fs.mkdir(settings.localMemoryRoot, { recursive: true }),
     fs.mkdir(settings.checkpointsRoot, { recursive: true }),
+    fs.mkdir(settings.promptsRoot, { recursive: true }),
+    fs.mkdir(settings.agentPromptsRoot, { recursive: true }),
+    fs.mkdir(settings.workforcesRoot, { recursive: true }),
+    fs.mkdir(settings.runtimeRoot, { recursive: true }),
+    fs.mkdir(settings.logsRoot, { recursive: true }),
+    fs.mkdir(settings.backupsRoot, { recursive: true }),
   ])
 
   const payload = {
     workspaceRoot: collapseHomePath(settings.workspaceRoot),
+    configRoot: collapseHomePath(settings.configRoot),
     projectsRoot: collapseHomePath(settings.projectsRoot),
     mcpsRoot: collapseHomePath(settings.mcpsRoot),
     templatesRoot: collapseHomePath(settings.templatesRoot),
     localMemoryRoot: collapseHomePath(settings.localMemoryRoot),
     checkpointsRoot: collapseHomePath(settings.checkpointsRoot),
+    promptsRoot: collapseHomePath(settings.promptsRoot),
+    agentPromptsRoot: collapseHomePath(settings.agentPromptsRoot),
+    workforcesRoot: collapseHomePath(settings.workforcesRoot),
+    runtimeRoot: collapseHomePath(settings.runtimeRoot),
+    logsRoot: collapseHomePath(settings.logsRoot),
+    backupsRoot: collapseHomePath(settings.backupsRoot),
+    forgeEnvPath: collapseHomePath(settings.forgeEnvPath),
   }
 
   await fs.writeFile(
@@ -166,7 +197,50 @@ export async function ensureWorkspace(settings: WorkspaceSettings): Promise<void
   )
 }
 
+export async function assertWorkspaceManagedPath(
+  workspaceRoot: string,
+  candidatePath: string,
+  label = 'Workspace path',
+): Promise<void> {
+  const workspace = path.resolve(/*turbopackIgnore: true*/ workspaceRoot)
+  const candidate = path.resolve(/*turbopackIgnore: true*/ candidatePath)
+  if (!isWithinPath(workspace, candidate)) {
+    throw new Error(`${label} must stay inside the active workspace root.`)
+  }
+
+  await fs.mkdir(workspace, { recursive: true })
+  const realWorkspace = await fs.realpath(workspace)
+  const relative = path.relative(workspace, candidate)
+  if (relative === '') return
+
+  let current = workspace
+  for (const segment of relative.split(path.sep)) {
+    if (!segment || segment === '.') continue
+    current = path.join(/*turbopackIgnore: true*/ current, segment)
+    let stat
+    try {
+      stat = await fs.lstat(current)
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') break
+      throw err
+    }
+
+    if (stat.isSymbolicLink()) {
+      throw new Error(`${label} must not pass through a symlink.`)
+    }
+
+    if (stat.isDirectory()) {
+      const realCurrent = await fs.realpath(current)
+      if (!isWithinPath(realWorkspace, realCurrent)) {
+        throw new Error(`${label} must stay inside the active workspace root.`)
+      }
+    }
+  }
+}
+
 async function writeDefaultWorkspacePointer(settings: WorkspaceSettings): Promise<void> {
+  if (process.env.NODE_ENV === 'test') return
+
   const defaultRoot = defaultWorkspaceRootAbsolute()
   if (settings.workspaceRoot === defaultRoot) return
 
@@ -174,11 +248,19 @@ async function writeDefaultWorkspacePointer(settings: WorkspaceSettings): Promis
   const pointerPath = path.join(/*turbopackIgnore: true*/ defaultRoot, 'global-settings.json')
   const payload = {
     workspaceRoot: collapseHomePath(settings.workspaceRoot),
+    configRoot: collapseHomePath(settings.configRoot),
     projectsRoot: collapseHomePath(settings.projectsRoot),
     mcpsRoot: collapseHomePath(settings.mcpsRoot),
     templatesRoot: collapseHomePath(settings.templatesRoot),
     localMemoryRoot: collapseHomePath(settings.localMemoryRoot),
     checkpointsRoot: collapseHomePath(settings.checkpointsRoot),
+    promptsRoot: collapseHomePath(settings.promptsRoot),
+    agentPromptsRoot: collapseHomePath(settings.agentPromptsRoot),
+    workforcesRoot: collapseHomePath(settings.workforcesRoot),
+    runtimeRoot: collapseHomePath(settings.runtimeRoot),
+    logsRoot: collapseHomePath(settings.logsRoot),
+    backupsRoot: collapseHomePath(settings.backupsRoot),
+    forgeEnvPath: collapseHomePath(settings.forgeEnvPath),
   }
   await fs.writeFile(pointerPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 })
 }
@@ -204,6 +286,7 @@ export async function getWorkspaceSettings(options: { ensure?: boolean } = {}): 
   const settings = settingsForRoot(workspaceRoot, source, mcpsRoot)
 
   if (options.ensure ?? true) {
+    await assertWorkspaceManagedPath(workspaceRoot, mcpsRoot, 'MCP root')
     await ensureWorkspace(settings)
   }
 
@@ -229,6 +312,7 @@ export async function saveWorkspaceSettings(input: {
   if (!isWithinPath(workspaceRoot, mcpsRoot)) {
     throw new Error('MCP root must stay inside the active workspace root.')
   }
+  await assertWorkspaceManagedPath(workspaceRoot, mcpsRoot, 'MCP root')
   const settings = settingsForRoot(workspaceRoot, 'setting', mcpsRoot)
   await ensureWorkspace(settings)
   await writeDefaultWorkspacePointer(settings)

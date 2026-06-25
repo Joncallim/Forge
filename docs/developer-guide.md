@@ -51,11 +51,28 @@ Important directories:
 | `web/db/migrations` | Generated SQL migrations and snapshots |
 | `web/worker` | Queue, worker runtime, Architect orchestration, Workforce materialization |
 | `web/lib/recommendations.ts` | Static model preset and role recommendation data |
-| `.codex/agents` | Manual Codex workforce prompts and default app seed source |
-| `.claude/agents` | Legacy Claude prompt compatibility files |
+| `.codex/agents` | Versioned seed defaults for manual Codex roles |
+| `.claude/agents` | Optional legacy Claude prompt import location when present locally |
 
-The web process and worker load the repository-root `.env` when run from
-`web/`, so local env behavior stays aligned with `.env.example`.
+Mutable Forge runtime and user-owned files live outside the checkout under the
+active workspace root, which defaults to `~/Documents/Forge`:
+
+```text
+~/Documents/Forge/
+  config/forge.env
+  prompts/agents/*.toml
+  workforces/<slug>/{workforce.json,workflow.json,manager-prompt.md}
+  projects/
+  mcps/
+  local-memory/checkpoints/
+  runtime/
+  logs/
+  backups/
+```
+
+The web process, worker, drizzle, seed scripts, and doctor load
+`config/forge.env` from that workspace. Repository `.env` files are legacy
+fallbacks only.
 
 ## Worker Runtime
 
@@ -138,15 +155,25 @@ execution routing consumes those templates.
 
 ## Agent Prompts
 
-Codex manual operation uses `.codex/agents/*.toml`.
+Codex manual operation uses `.codex/agents/*.toml` as versioned defaults.
 
-The web app seeds editable app agent prompts from `.codex/agents`. Users can add
-more agents from the dashboard, archive agents, and place agents into one or
-more workforces. Presets only assign providers to matching seeded agents; custom
-agents stay unchanged.
+On install, Forge copies those defaults to
+`~/Documents/Forge/prompts/agents/*.toml`. The web app edits the workspace copy,
+not the repository copy. Upgrades keep local workspace prompts unless the
+installer is run with `--overwrite-prompts` or
+`FORGE_PROMPT_UPGRADE_MODE=overwrite`; overwritten prompts are backed up under
+`~/Documents/Forge/backups/prompts/`.
 
-The hidden `.claude/agents` files remain legacy compatibility prompts. Do not
-make them the primary source of truth for new Forge behavior.
+If an operator has local `.claude/agents/*.md` files from an older checkout,
+the seed script can still import them as a fallback. The repository no longer
+ships those files; do not make that legacy format the primary source of truth
+for new Forge behavior.
+
+Workforces are stored in PostgreSQL for runtime and exported to
+`~/Documents/Forge/workforces/` after seed/create/update/archive operations.
+Those exports include the ordered agent table, workflow JSON, and workforce
+manager prompt. For this slice, the exports are mirrors; import/edit conflict
+handling is intentionally out of scope.
 
 ## Database Migrations
 

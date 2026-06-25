@@ -212,6 +212,13 @@ async function validateProjectDeletePath(target: string, projectId: string): Pro
     workspace.templatesRoot,
     workspace.localMemoryRoot,
     workspace.checkpointsRoot,
+    workspace.promptsRoot,
+    workspace.agentPromptsRoot,
+    workspace.workforcesRoot,
+    workspace.configRoot,
+    workspace.runtimeRoot,
+    workspace.logsRoot,
+    workspace.backupsRoot,
   ].map((root) => path.resolve(/*turbopackIgnore: true*/ root))
 
   if (protectedRoots.includes(resolved)) {

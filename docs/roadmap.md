@@ -29,9 +29,8 @@ Completed P0 scope:
 1. End-to-end smoke test for registration/login, setup wizard preset, provider
    health, project creation, task enqueue, worker Architect run, artifact
    display, approval, and completion.
-2. Deployment checklist for environment variables, database migrations, Redis,
-   worker startup, provider keys, passkey RP values, and
-   `FORGE_AGENT_CONFIG_DIR`.
+2. Deployment checklist for the workspace env file, database migrations, Redis,
+   worker startup, provider keys, passkey RP values, and workspace prompt paths.
 3. Startup/runtime validation for missing critical environment variables with
    clear operator-facing errors.
 4. Screenshot-backed UX audit using representative seeded projects, providers,

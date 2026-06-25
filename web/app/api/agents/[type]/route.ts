@@ -1,29 +1,18 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
-import path from 'path'
-import fs from 'fs/promises'
 import { db } from '@/db'
 import { agentConfigs, workforceAgents } from '@/db/schema'
 import { eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
+import { syncAgentPromptFileToWorkspace } from '@/lib/agent-prompts'
+
+export { resolveAgentConfigDir } from '@/lib/agent-prompts'
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-export function resolveAgentConfigDir(cwd = process.cwd()): string {
-  const configured = process.env.FORGE_AGENT_CONFIG_DIR?.trim()
-  if (configured) return path.resolve(configured)
-
-  const repoRoot = path.basename(cwd) === 'web'
-    ? path.resolve(cwd, '..')
-    : path.resolve(cwd)
-  return path.resolve(repoRoot, '.claude/agents')
-}
-
-const AGENT_CONFIG_DIR = resolveAgentConfigDir()
 
 function isValidAgentType(value: string): boolean {
   return /^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$/.test(value)
@@ -43,48 +32,11 @@ const updateAgentSchema = z.object({
 })
 
 // ---------------------------------------------------------------------------
-// Disk sync helper — preserves YAML frontmatter block
+// Disk sync helper — writes the editable workspace TOML prompt copy.
 // ---------------------------------------------------------------------------
 
 async function syncAgentFileToDisk(type: string, newSystemPrompt: string): Promise<void> {
-  const agentFilePath = path.resolve(AGENT_CONFIG_DIR, `${type}.md`)
-
-  let existing = ''
-  try {
-    existing = await fs.readFile(agentFilePath, 'utf8')
-  } catch (err: unknown) {
-    // File does not exist — write without frontmatter
-    const errCode = (err as NodeJS.ErrnoException).code
-    if (errCode !== 'ENOENT') throw err
-    await fs.mkdir(path.dirname(agentFilePath), { recursive: true })
-    await fs.writeFile(agentFilePath, `${newSystemPrompt}\n`, 'utf8')
-    console.info('[agents/sync] Created new agent file (no existing frontmatter)', {
-      type,
-      path: agentFilePath,
-    })
-    return
-  }
-
-  // Extract frontmatter: text between the first --- line and the second --- line
-  const lines = existing.split('\n')
-  let frontmatter = ''
-
-  if (lines[0]?.trim() === '---') {
-    const closingIndex = lines.findIndex((line, idx) => idx > 0 && line.trim() === '---')
-    if (closingIndex !== -1) {
-      // Include the lines between the delimiters (not the delimiters themselves)
-      frontmatter = lines.slice(1, closingIndex).join('\n')
-    }
-  }
-
-  let newContent: string
-  if (frontmatter) {
-    newContent = `---\n${frontmatter}\n---\n\n${newSystemPrompt}\n`
-  } else {
-    newContent = `${newSystemPrompt}\n`
-  }
-
-  await fs.writeFile(agentFilePath, newContent, 'utf8')
+  const agentFilePath = await syncAgentPromptFileToWorkspace({ agentType: type, systemPrompt: newSystemPrompt })
   console.info('[agents/sync] Synced agent system prompt to disk', {
     type,
     path: agentFilePath,
@@ -182,34 +134,47 @@ export async function PUT(
       return NextResponse.json({ error: 'Agent config not found' }, { status: 404 })
     }
 
-    const [agent] = await db
-      .update(agentConfigs)
-      .set({
-        ...(data.systemPrompt !== undefined && { systemPrompt: data.systemPrompt }),
-        ...(data.displayName !== undefined && { displayName: data.displayName }),
-        ...(data.description !== undefined && { description: data.description }),
-        ...(data.isActive !== undefined && { isActive: data.isActive }),
-        ...('providerConfigId' in data && { providerConfigId: data.providerConfigId ?? null }),
-        ...(data.frontmatterOverrides !== undefined && {
-          frontmatterOverrides: data.frontmatterOverrides,
-        }),
-        updatedAt: new Date(),
-        updatedBy: session.userId,
-      })
-      .where(eq(agentConfigs.agentType, type))
-      .returning()
-
-    // Auto-sync to disk if systemPrompt was provided
     if (data.systemPrompt !== undefined) {
       try {
         await syncAgentFileToDisk(type, data.systemPrompt)
       } catch (err) {
-        // Log but don't fail the request — DB is the source of truth
+        const message = err instanceof Error ? err.message : 'Failed to sync agent prompt file'
         console.error('[PUT /api/agents/:type] Failed to sync agent file to disk', {
           type,
           err,
         })
+        return NextResponse.json({ error: message }, { status: 409 })
       }
+    }
+
+    let agent: typeof existing
+    try {
+      [agent] = await db
+        .update(agentConfigs)
+        .set({
+          ...(data.systemPrompt !== undefined && { systemPrompt: data.systemPrompt }),
+          ...(data.displayName !== undefined && { displayName: data.displayName }),
+          ...(data.description !== undefined && { description: data.description }),
+          ...(data.isActive !== undefined && { isActive: data.isActive }),
+          ...('providerConfigId' in data && { providerConfigId: data.providerConfigId ?? null }),
+          ...(data.frontmatterOverrides !== undefined && {
+            frontmatterOverrides: data.frontmatterOverrides,
+          }),
+          updatedAt: new Date(),
+          updatedBy: session.userId,
+        })
+        .where(eq(agentConfigs.agentType, type))
+        .returning()
+    } catch (err) {
+      if (data.systemPrompt !== undefined) {
+        await syncAgentFileToDisk(type, existing.systemPrompt).catch((restoreErr) => {
+          console.error('[PUT /api/agents/:type] Failed to restore prompt after DB update failure', {
+            type,
+            restoreErr,
+          })
+        })
+      }
+      throw err
     }
 
     await redis.publish('forge:agent-config-changed', JSON.stringify({ agentType: type }))

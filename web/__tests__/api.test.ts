@@ -14,7 +14,7 @@
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { vi, describe, it, expect, beforeEach } from 'vitest'
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest'
 
 // ---------------------------------------------------------------------------
 // Module-level mocks
@@ -878,18 +878,38 @@ describe('GET/PUT /api/settings/workspace', () => {
         await fs.readFile(path.join(workspaceRoot, 'global-settings.json'), 'utf-8'),
       ) as {
         workspaceRoot: string
+        configRoot: string
         projectsRoot: string
         mcpsRoot: string
         templatesRoot: string
         localMemoryRoot: string
         checkpointsRoot: string
+        promptsRoot: string
+        agentPromptsRoot: string
+        workforcesRoot: string
+        runtimeRoot: string
+        logsRoot: string
+        backupsRoot: string
+        forgeEnvPath: string
       }
+      expect(globalSettings.configRoot).toMatch(/\/config$/)
       expect(globalSettings.projectsRoot).toMatch(/\/projects$/)
       expect(globalSettings.mcpsRoot).toMatch(/\/mcps$/)
       expect(globalSettings.templatesRoot).toMatch(/\/templates$/)
       expect(globalSettings.localMemoryRoot).toMatch(/\/local-memory$/)
       expect(globalSettings.checkpointsRoot).toMatch(/\/local-memory\/checkpoints$/)
+      expect(globalSettings.promptsRoot).toMatch(/\/prompts$/)
+      expect(globalSettings.agentPromptsRoot).toMatch(/\/prompts\/agents$/)
+      expect(globalSettings.workforcesRoot).toMatch(/\/workforces$/)
+      expect(globalSettings.runtimeRoot).toMatch(/\/runtime$/)
+      expect(globalSettings.logsRoot).toMatch(/\/logs$/)
+      expect(globalSettings.backupsRoot).toMatch(/\/backups$/)
+      expect(globalSettings.forgeEnvPath).toMatch(/\/config\/forge\.env$/)
       await expect(fs.stat(path.join(workspaceRoot, 'local-memory', 'checkpoints'))).resolves.toMatchObject({})
+      await expect(fs.stat(path.join(workspaceRoot, 'prompts', 'agents'))).resolves.toMatchObject({})
+      await expect(fs.stat(path.join(workspaceRoot, 'workforces'))).resolves.toMatchObject({})
+      await expect(fs.stat(path.join(workspaceRoot, 'runtime'))).resolves.toMatchObject({})
+      await expect(fs.stat(path.join(workspaceRoot, 'logs'))).resolves.toMatchObject({})
       await expect(fs.readFile(path.join(workspaceRoot, 'local-memory', '.gitignore'), 'utf-8')).resolves.toBe(
         '*\n!.gitignore\n',
       )
@@ -1763,15 +1783,19 @@ describe('POST /api/tasks/:id/questions', () => {
 describe('PUT /api/agents/[type] — path traversal blocked', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
-  it('resolves the default prompt sync directory under the repo root when cwd is web', async () => {
+  it('resolves the default prompt sync directory under the native workspace when cwd is web', async () => {
     const previous = process.env.FORGE_AGENT_CONFIG_DIR
     delete process.env.FORGE_AGENT_CONFIG_DIR
 
     try {
       const { resolveAgentConfigDir } = await import('@/app/api/agents/[type]/route')
       const repoRoot = path.join(os.tmpdir(), 'Forge')
+      const workspaceRoot = path.join(os.tmpdir(), 'Documents', 'Forge')
       expect(resolveAgentConfigDir(path.join(repoRoot, 'web'))).toBe(
-        path.join(repoRoot, '.claude', 'agents'),
+        path.join(os.homedir(), 'Documents', 'Forge', 'prompts', 'agents'),
+      )
+      expect(resolveAgentConfigDir(path.join(repoRoot, 'web'), workspaceRoot)).toBe(
+        path.join(workspaceRoot, 'prompts', 'agents'),
       )
     } finally {
       if (previous === undefined) {
@@ -1808,6 +1832,12 @@ describe('PUT /api/agents/[type] — path traversal blocked', () => {
 
 describe('dynamic agents and workforces', () => {
   beforeEach(() => { vi.clearAllMocks() })
+  afterEach(() => {
+    mockDbInsert.mockReset()
+    mockDbSelect.mockReset()
+    mockDbUpdate.mockReset()
+    mockDbDelete.mockReset()
+  })
 
   it('creates an arbitrary safe agent slug instead of requiring a fixed role', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
@@ -1824,24 +1854,158 @@ describe('dynamic agents and workforces', () => {
       updatedAt: new Date(),
       updatedBy: FAKE_SESSION.userId,
     }]))
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-agent-create-'))
 
-    const { POST } = await import('@/app/api/agents/route')
-    const req = authRequest('/api/agents', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        agentType: 'security-red-team',
-        displayName: 'Security Red Team',
-        description: 'Adversarial review specialist.',
-        systemPrompt: 'Review changes adversarially.',
-      }),
+    try {
+      process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+
+      const { POST } = await import('@/app/api/agents/route')
+      const req = authRequest('/api/agents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agentType: 'security-red-team',
+          displayName: 'Security Red Team',
+          description: 'Adversarial review specialist.',
+          systemPrompt: 'Review changes adversarially.',
+        }),
+      })
+
+      const res = await POST(req as never)
+      expect(res.status).toBe(201)
+      const body = await res.json()
+      expect(body.agent.agentType).toBe('security-red-team')
+      expect(mockDbInsert).toHaveBeenCalledOnce()
+      await expect(
+        fs.readFile(path.join(workspaceRoot, 'prompts', 'agents', 'security-red-team.toml'), 'utf-8'),
+      ).resolves.toContain('Review changes adversarially.')
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('removes the inserted agent row if prompt file creation fails', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert.mockReturnValue(chain([{
+      id: 'agent-rollback',
+      agentType: 'security-red-team',
+      displayName: 'Security Red Team',
+      description: 'Adversarial review specialist.',
+      isSystem: false,
+      isActive: true,
+      providerConfigId: null,
+      systemPrompt: 'Review changes adversarially.',
+      frontmatterOverrides: null,
+      updatedAt: new Date(),
+      updatedBy: FAKE_SESSION.userId,
+    }]))
+    mockDbDelete.mockReturnValue(chain([]))
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const previousPromptDir = process.env.FORGE_AGENT_CONFIG_DIR
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-agent-rollback-'))
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-agent-outside-'))
+
+    try {
+      process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+      process.env.FORGE_AGENT_CONFIG_DIR = outsideRoot
+
+      const { POST } = await import('@/app/api/agents/route')
+      const req = authRequest('/api/agents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agentType: 'security-red-team',
+          displayName: 'Security Red Team',
+          description: 'Adversarial review specialist.',
+          systemPrompt: 'Review changes adversarially.',
+        }),
+      })
+
+      const res = await POST(req as never)
+      expect(res.status).toBe(500)
+      const body = await res.json()
+      expect(body.error).toMatch(/prompt file/i)
+      expect(mockDbDelete).toHaveBeenCalledOnce()
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      if (previousPromptDir === undefined) {
+        delete process.env.FORGE_AGENT_CONFIG_DIR
+      } else {
+        process.env.FORGE_AGENT_CONFIG_DIR = previousPromptDir
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+      await fs.rm(outsideRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('restores the previous prompt file when an agent update fails after disk sync', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{
+      id: 'agent-rollback',
+      agentType: 'security-red-team',
+      displayName: 'Security Red Team',
+      description: 'Adversarial review specialist.',
+      isSystem: false,
+      isActive: true,
+      providerConfigId: null,
+      systemPrompt: 'Old prompt.',
+      frontmatterOverrides: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      updatedBy: FAKE_SESSION.userId,
+    }]))
+    mockDbUpdate.mockImplementation(() => {
+      throw new Error('database update failed')
     })
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-agent-update-rollback-'))
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
 
-    const res = await POST(req as never)
-    expect(res.status).toBe(201)
-    const body = await res.json()
-    expect(body.agent.agentType).toBe('security-red-team')
-    expect(mockDbInsert).toHaveBeenCalledOnce()
+    try {
+      process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+      const { syncAgentPromptFileToWorkspace } = await import('@/lib/agent-prompts')
+      await syncAgentPromptFileToWorkspace({
+        agentType: 'security-red-team',
+        systemPrompt: 'Old prompt.',
+      })
+
+      const { PUT } = await import('@/app/api/agents/[type]/route')
+      const req = authRequest('/api/agents/security-red-team', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          systemPrompt: 'New prompt that should roll back.',
+          providerConfigId: '00000000-0000-4000-8000-000000000001',
+        }),
+      })
+
+      const res = await PUT(req as never, { params: Promise.resolve({ type: 'security-red-team' }) })
+      expect(res.status).toBe(500)
+      const promptFile = await fs.readFile(
+        path.join(workspaceRoot, 'prompts', 'agents', 'security-red-team.toml'),
+        'utf-8',
+      )
+      expect(promptFile).toContain('Old prompt.')
+      expect(promptFile).not.toContain('New prompt that should roll back.')
+    } finally {
+      consoleError.mockRestore()
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
   })
 
   it('creates an editable workforce with selected agent memberships', async () => {
@@ -1861,28 +2025,109 @@ describe('dynamic agents and workforces', () => {
         createdAt: new Date(),
         updatedAt: new Date(),
       }]))
-      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{
+        id: 'member-1',
+        workforceId: 'workforce-1',
+        agentConfigId: '00000000-0000-4000-8000-000000000001',
+        roleLabel: 'Release reviewer',
+        sequence: 1,
+        isRequired: true,
+        metadata: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        agentType: 'reviewer',
+        displayName: 'Reviewer',
+        description: 'Review work.',
+        isActive: true,
+      }]))
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-workforce-create-'))
 
-    const { POST } = await import('@/app/api/workforces/route')
-    const req = authRequest('/api/workforces', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    try {
+      process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+
+      const { POST } = await import('@/app/api/workforces/route')
+      const req = authRequest('/api/workforces', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          slug: 'release-squad',
+          displayName: 'Release Squad',
+          members: [
+            {
+              agentConfigId: '00000000-0000-4000-8000-000000000001',
+              roleLabel: 'Release reviewer',
+            },
+          ],
+        }),
+      })
+
+      const res = await POST(req as never)
+      expect(res.status).toBe(201)
+      expect(mockDbTransaction).toHaveBeenCalledOnce()
+      expect(mockDbInsert).toHaveBeenCalledTimes(2)
+      await expect(
+        fs.readFile(path.join(workspaceRoot, 'workforces', 'release-squad', 'manager-prompt.md'), 'utf-8'),
+      ).resolves.toContain('Release Squad')
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('returns a warning instead of failing when workforce file export fails after commit', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert
+      .mockReturnValueOnce(chain([{ id: 'workforce-1' }]))
+    mockDbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'workforce-1',
         slug: 'release-squad',
         displayName: 'Release Squad',
-        members: [
-          {
-            agentConfigId: '00000000-0000-4000-8000-000000000001',
-            roleLabel: 'Release reviewer',
-          },
-        ],
-      }),
-    })
+        description: '',
+        isDefault: false,
+        isActive: true,
+        metadata: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }]))
+      .mockReturnValueOnce(chain([]))
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceFile = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'forge-workforce-export-fail-')), 'not-a-directory')
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
 
-    const res = await POST(req as never)
-    expect(res.status).toBe(201)
-    expect(mockDbTransaction).toHaveBeenCalledOnce()
-    expect(mockDbInsert).toHaveBeenCalledTimes(2)
+    try {
+      await fs.writeFile(workspaceFile, 'file blocks directory creation')
+      process.env.FORGE_WORKSPACE_ROOT = workspaceFile
+
+      const { POST } = await import('@/app/api/workforces/route')
+      const req = authRequest('/api/workforces', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          slug: 'release-squad',
+          displayName: 'Release Squad',
+        }),
+      })
+
+      const res = await POST(req as never)
+      expect(res.status).toBe(201)
+      const body = await res.json()
+      expect(body.workforces).toHaveLength(1)
+      expect(body.warnings[0]).toMatch(/could not be refreshed/i)
+    } finally {
+      consoleError.mockRestore()
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(path.dirname(workspaceFile), { recursive: true, force: true })
+    }
   })
 })
 

@@ -10,8 +10,9 @@ import {
   type Project,
   type ProjectMcpConfig,
 } from '@/db/schema'
+import { writeWorkspaceFileAtomically } from '@/lib/agent-prompts'
 import { getGitHubStatus } from '@/lib/github'
-import { getWorkspaceSettings, isWithinPath } from '@/lib/workspace'
+import { assertWorkspaceManagedPath, getWorkspaceSettings, isWithinPath } from '@/lib/workspace'
 import { MCP_CATALOG, RECOMMENDED_MCP_IDS, isKnownMcpId } from './catalog'
 import type {
   McpCatalogEntry,
@@ -51,9 +52,52 @@ function catalogEntries(): McpCatalogEntry[] {
   return Object.values(MCP_CATALOG)
 }
 
-async function readManifest(installPath: string): Promise<McpManifest | null> {
+async function readWorkspaceFileIfRegular(
+  filePath: string,
+  workspaceRoot: string,
+): Promise<string | null> {
+  const workspace = path.resolve(/*turbopackIgnore: true*/ workspaceRoot)
+  const candidate = path.resolve(/*turbopackIgnore: true*/ filePath)
+  if (!isWithinPath(workspace, candidate)) return null
+
+  let realWorkspace: string
   try {
-    const raw = await fs.readFile(manifestPath(installPath), 'utf-8')
+    realWorkspace = await fs.realpath(workspace)
+  } catch {
+    return null
+  }
+
+  let current = workspace
+  const relative = path.relative(workspace, candidate)
+  for (const segment of relative.split(path.sep)) {
+    if (!segment || segment === '.') continue
+    current = path.join(/*turbopackIgnore: true*/ current, segment)
+    let stat
+    try {
+      stat = await fs.lstat(current)
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null
+      throw err
+    }
+
+    if (stat.isSymbolicLink()) return null
+    if (current === candidate) {
+      if (!stat.isFile()) return null
+      return fs.readFile(candidate, 'utf-8')
+    }
+    if (!stat.isDirectory()) return null
+
+    const realCurrent = await fs.realpath(current)
+    if (!isWithinPath(realWorkspace, realCurrent)) return null
+  }
+
+  return null
+}
+
+export async function readManifest(installPath: string, workspaceRoot: string): Promise<McpManifest | null> {
+  try {
+    const raw = await readWorkspaceFileIfRegular(manifestPath(installPath), workspaceRoot)
+    if (raw === null) return null
     const parsed = JSON.parse(raw) as Partial<McpManifest>
     if (
       parsed.schemaVersion === 1 &&
@@ -69,7 +113,11 @@ async function readManifest(installPath: string): Promise<McpManifest | null> {
   }
 }
 
-async function writeManifest(mcpId: keyof typeof MCP_CATALOG, installPath: string): Promise<void> {
+async function writeManifest(
+  mcpId: keyof typeof MCP_CATALOG,
+  installPath: string,
+  workspaceRoot: string,
+): Promise<void> {
   const entry = MCP_CATALOG[mcpId]
   const manifest: McpManifest = {
     schemaVersion: 1,
@@ -78,8 +126,12 @@ async function writeManifest(mcpId: keyof typeof MCP_CATALOG, installPath: strin
     source: 'forge-catalog',
     createdAt: new Date().toISOString(),
   }
-  await fs.mkdir(installPath, { recursive: true })
-  await fs.writeFile(manifestPath(installPath), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 })
+  await assertWorkspaceManagedPath(workspaceRoot, installPath, 'MCP install path')
+  await writeWorkspaceFileAtomically(
+    manifestPath(installPath),
+    `${JSON.stringify(manifest, null, 2)}\n`,
+    workspaceRoot,
+  )
 }
 
 async function listInstallationRows(): Promise<Map<string, McpInstallationRow>> {
@@ -115,7 +167,7 @@ export async function installMcps(mcpIds: McpId[] = RECOMMENDED_MCP_IDS): Promis
 
   for (const mcpId of uniqueMcpIds) {
     const installPath = defaultInstallPath(workspace.mcpsRoot, mcpId)
-    await writeManifest(mcpId, installPath)
+    await writeManifest(mcpId, installPath, workspace.workspaceRoot)
     await upsertInstallation(mcpId, installPath)
   }
 
@@ -134,7 +186,9 @@ async function buildStandaloneStatus(
   const workspace = await getWorkspaceSettings()
   const entry = isKnownMcpId(mcpId) ? MCP_CATALOG[mcpId] : null
   const installPath = installation?.installPath ?? defaultInstallPath(workspace.mcpsRoot, mcpId)
-  const manifest = await readManifest(installPath)
+  const manifest = isWithinPath(workspace.workspaceRoot, installPath)
+    ? await readManifest(installPath, workspace.workspaceRoot)
+    : null
   const installed = installation !== undefined || manifest?.id === mcpId
   return {
     mcpId,
@@ -196,7 +250,7 @@ async function classifyProjectMcp(
     }
   }
 
-  const manifest = await readManifest(installPath)
+  const manifest = await readManifest(installPath, workspace.workspaceRoot)
   installState = installation || manifest ? 'installed' : 'missing'
   if (installState === 'missing') {
     status = 'unknown'

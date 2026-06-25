@@ -45,4 +45,9 @@ describe('crypto', () => {
     delete process.env.FORGE_ENCRYPTION_KEY
     expect(() => encryptSecret('x')).toThrow(/SESSION_SECRET/)
   })
+
+  it('rejects placeholder secret material', () => {
+    process.env.SESSION_SECRET = 'change_me_generate_with_openssl_rand_hex_32'
+    expect(() => encryptSecret('x')).toThrow(/placeholder/)
+  })
 })

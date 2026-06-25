@@ -16,9 +16,32 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd)"
-INSTALL_STATE_DIR="$REPO_ROOT/.forge"
+expand_home_path_early() {
+  case "${1:-}" in
+    "~") [ -n "${HOME:-}" ] && printf '%s\n' "$HOME" ;;
+    "~/"*) [ -n "${HOME:-}" ] && printf '%s/%s\n' "$HOME" "${1#\~/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+workspace_root_early() {
+  local root settings_file
+  root="${FORGE_WORKSPACE_ROOT:-}"
+  if [ -z "$root" ] && [ -n "${HOME:-}" ]; then
+    settings_file="$HOME/Documents/Forge/global-settings.json"
+    if [ -f "$settings_file" ]; then
+      root="$(sed -n 's/^[[:space:]]*"workspaceRoot"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$settings_file" | head -n1)"
+    fi
+  fi
+  [ -n "$root" ] || root="~/Documents/Forge"
+  expand_home_path_early "$root"
+}
+WORKSPACE_ROOT="$(workspace_root_early)"
+ENV_FILE="${FORGE_ENV_FILE:-$WORKSPACE_ROOT/config/forge.env}"
+INSTALL_STATE_DIR="${FORGE_INSTALL_STATE_DIR:-$WORKSPACE_ROOT/runtime/install}"
 INSTALL_MANIFEST="$INSTALL_STATE_DIR/install-manifest"
-LEGACY_PROJECT_PATHS_FILE="$INSTALL_STATE_DIR/project-paths"
+LEGACY_INSTALL_STATE_DIR="$REPO_ROOT/.forge"
+LEGACY_INSTALL_MANIFEST="$LEGACY_INSTALL_STATE_DIR/install-manifest"
+LEGACY_PROJECT_PATHS_FILE="$LEGACY_INSTALL_STATE_DIR/project-paths"
 
 YES=0
 DRY_RUN=0
@@ -40,8 +63,8 @@ usage() {
 Forge uninstall helper for macOS and Linux.
 
 Options:
-  --keep-data       Keep .env, database data, Redis data, and install state.
-  --remove-data     Remove .env, Forge database/role when recorded, Docker volumes,
+  --keep-data       Keep workspace env, database data, Redis data, and install state.
+  --remove-data     Remove workspace env, Forge database/role when recorded, Docker volumes,
                     Redis data, recorded local models, and install state.
   --remove-projects Delete every local project folder Forge created (listed in
                     the workspace runtime registry or legacy .forge/project-paths).
@@ -106,7 +129,7 @@ if [ -z "$KEEP_DATA" ]; then
     KEEP_DATA=1
   else
     bold "Forge uninstall"
-    info "Settings and credentials include .env, database rows, Redis data, and local install state."
+    info "Settings and credentials include $ENV_FILE, database rows, Redis data, and local install state."
     printf "    Keep settings and credentials for a future reinstall? [Y/n] "
     read -r answer || answer=""
     case "$answer" in
@@ -120,11 +143,11 @@ if [ -z "$KEEP_DATA" ]; then
   fi
 fi
 
-# Read a key from the first .env file that defines it. The .env files still
+# Read a key from the first environment file that defines it. These files still
 # exist at this point because remove_env_files runs near the end of uninstall.
 read_env_var() {
   local key="$1" file value
-  for file in "$REPO_ROOT/.env" "$REPO_ROOT/.env.local" "$REPO_ROOT/web/.env" "$REPO_ROOT/web/.env.local"; do
+  for file in "$ENV_FILE" "$REPO_ROOT/.env" "$REPO_ROOT/.env.local" "$REPO_ROOT/web/.env" "$REPO_ROOT/web/.env.local"; do
     [ -f "$file" ] || continue
     value="$(grep -E "^${key}=" "$file" 2>/dev/null | tail -n1)" || true
     if [ -n "$value" ]; then
@@ -165,7 +188,7 @@ expand_home_path() {
   local raw="$1"
   case "$raw" in
     "~") [ -n "${HOME:-}" ] && printf '%s\n' "$HOME" ;;
-    "~/"*) [ -n "${HOME:-}" ] && printf '%s/%s\n' "$HOME" "${raw#~/}" ;;
+    "~/"*) [ -n "${HOME:-}" ] && printf '%s/%s\n' "$HOME" "${raw#\~/}" ;;
     *) printf '%s\n' "$raw" ;;
   esac
 }
@@ -312,6 +335,82 @@ is_within_path() {
   esac
 }
 
+absolute_path() {
+  local raw expanded cursor suffix real_cursor
+  raw="$1"
+  expanded="$(expand_home_path "$raw")"
+  case "$expanded" in
+    /*) ;;
+    *) expanded="$PWD/$expanded" ;;
+  esac
+
+  cursor="$(strip_trailing_slashes "$expanded")"
+  suffix=""
+  while [ ! -e "$cursor" ] && [ "$cursor" != "/" ]; do
+    suffix="/$(basename "$cursor")$suffix"
+    cursor="$(dirname "$cursor")"
+  done
+
+  if [ -d "$cursor" ]; then
+    real_cursor="$(cd -P "$cursor" >/dev/null 2>&1 && pwd)" || return 1
+    printf '%s%s\n' "$real_cursor" "$suffix"
+  elif [ -e "$cursor" ] || [ -L "$cursor" ]; then
+    real_cursor="$(cd -P "$(dirname "$cursor")" >/dev/null 2>&1 && pwd)" || return 1
+    printf '%s/%s%s\n' "$real_cursor" "$(basename "$cursor")" "$suffix"
+  else
+    printf '%s\n' "$expanded"
+  fi
+}
+
+validate_remove_data_path() {
+  local label raw required_parent workspace_root candidate parent home_dir repo_root
+  label="$1"
+  raw="$2"
+  required_parent="$3"
+  [ -n "$raw" ] || die "$label is empty; refusing --remove-data."
+
+  workspace_root="$(absolute_path "$(active_workspace_root)")"
+  candidate="$(absolute_path "$raw")"
+  parent="$(absolute_path "$required_parent")"
+  repo_root="$(absolute_path "$REPO_ROOT")"
+  home_dir="${HOME:-}"
+  [ -z "$home_dir" ] || home_dir="$(absolute_path "$home_dir")"
+
+  candidate="$(strip_trailing_slashes "$candidate")"
+  workspace_root="$(strip_trailing_slashes "$workspace_root")"
+  parent="$(strip_trailing_slashes "$parent")"
+  repo_root="$(strip_trailing_slashes "$repo_root")"
+  [ -z "$home_dir" ] || home_dir="$(strip_trailing_slashes "$home_dir")"
+
+  case "$candidate" in
+    ''|/) die "$label points at an unsafe removal path: $raw" ;;
+  esac
+  [ "$candidate" != "$workspace_root" ] || die "$label points at the workspace root; refusing --remove-data."
+  [ "$candidate" != "$parent" ] || die "$label points at $parent; refusing to remove a broad workspace directory."
+  [ "$candidate" != "$repo_root" ] || die "$label points at the Forge checkout; refusing --remove-data."
+  if [ -n "$home_dir" ] && [ "$candidate" = "$home_dir" ]; then
+    die "$label points at HOME; refusing --remove-data."
+  fi
+  if ! is_within_path "$workspace_root" "$candidate"; then
+    die "$label must stay inside the active workspace root for --remove-data: $workspace_root"
+  fi
+  if ! is_within_path "$parent" "$candidate"; then
+    die "$label must stay under $parent for --remove-data."
+  fi
+}
+
+validate_remove_data_paths() {
+  [ "$KEEP_DATA" = "0" ] || return 0
+  local workspace_root config_root runtime_root
+  workspace_root="$(absolute_path "$(active_workspace_root)")"
+  config_root="$(workspace_settings_value configRoot)"
+  runtime_root="$(workspace_settings_value runtimeRoot)"
+  config_root="${config_root:-$workspace_root/config}"
+  runtime_root="${runtime_root:-$workspace_root/runtime}"
+  validate_remove_data_path "FORGE_ENV_FILE" "$ENV_FILE" "$config_root"
+  validate_remove_data_path "FORGE_INSTALL_STATE_DIR" "$INSTALL_STATE_DIR" "$runtime_root"
+}
+
 is_protected_project_root() {
   local target="$1" workspace_root projects_root protected real_protected
   workspace_root="$(active_workspace_root)"
@@ -321,12 +420,26 @@ is_protected_project_root() {
     "$projects_root" \
     "$(workspace_settings_value mcpsRoot)" \
     "$(workspace_settings_value templatesRoot)" \
-    "$(workspace_settings_value localMemoryRoot)" \
-    "$(workspace_settings_value checkpointsRoot)" \
-    "$workspace_root/mcps" \
-    "$workspace_root/templates" \
-    "$workspace_root/memory" \
-    "$workspace_root/checkpoints"
+	    "$(workspace_settings_value localMemoryRoot)" \
+	    "$(workspace_settings_value checkpointsRoot)" \
+	    "$(workspace_settings_value promptsRoot)" \
+	    "$(workspace_settings_value agentPromptsRoot)" \
+	    "$(workspace_settings_value workforcesRoot)" \
+	    "$(workspace_settings_value configRoot)" \
+	    "$(workspace_settings_value runtimeRoot)" \
+	    "$(workspace_settings_value logsRoot)" \
+	    "$(workspace_settings_value backupsRoot)" \
+	    "$workspace_root/mcps" \
+	    "$workspace_root/templates" \
+	    "$workspace_root/local-memory" \
+	    "$workspace_root/local-memory/checkpoints" \
+	    "$workspace_root/prompts" \
+	    "$workspace_root/prompts/agents" \
+	    "$workspace_root/workforces" \
+	    "$workspace_root/config" \
+	    "$workspace_root/runtime" \
+	    "$workspace_root/logs" \
+	    "$workspace_root/backups"
   do
     [ -n "$protected" ] || continue
     real_protected="$(realpath_existing_dir "$protected" 2>/dev/null || true)"
@@ -539,16 +652,18 @@ remove_path() {
 }
 
 manifest_values() {
-  local key="$1"
-  if [ -f "$INSTALL_MANIFEST" ]; then
-    sed -n "s/^${key}=//p" "$INSTALL_MANIFEST"
-  fi
+  local key="$1" manifest
+  for manifest in "$INSTALL_MANIFEST" "$LEGACY_INSTALL_MANIFEST"; do
+    [ -f "$manifest" ] || continue
+    sed -n "s/^${key}=//p" "$manifest"
+  done
 }
 
 manifest_has() {
   local key="$1"
   local value="$2"
-  [ -f "$INSTALL_MANIFEST" ] && grep -Fqx "$key=$value" "$INSTALL_MANIFEST"
+  { [ -f "$INSTALL_MANIFEST" ] && grep -Fqx "$key=$value" "$INSTALL_MANIFEST"; } ||
+    { [ -f "$LEGACY_INSTALL_MANIFEST" ] && grep -Fqx "$key=$value" "$LEGACY_INSTALL_MANIFEST"; }
 }
 
 detect_package_manager() {
@@ -685,6 +800,7 @@ remove_env_files() {
   [ "$KEEP_DATA" = "0" ] || return 0
 
   step "Removing settings and credential files"
+  remove_path "$ENV_FILE"
   remove_path "$REPO_ROOT/.env"
   remove_path "$REPO_ROOT/.env.local"
   remove_path "$REPO_ROOT/web/.env"
@@ -731,38 +847,11 @@ drop_recorded_postgres_data() {
   fi
 }
 
-# Drop the Forge application database named in DATABASE_URL (default: forge),
-# even when the installer did not record creating it (e.g. a reused database).
-# This is what actually removes saved logins, projects, and task history on
-# --remove-data. The recorded role/database cleanup still runs afterwards via
-# drop_recorded_postgres_data, which uses the local maintenance connection.
+# Remove only the local Forge database objects the installer recorded creating.
+# DATABASE_URL may point at a custom, shared, or production database, so it is
+# intentionally not used as an authority for destructive database cleanup.
 drop_app_database() {
   [ "$KEEP_DATA" = "0" ] || return 0
-
-  local url dbname admin_url
-  url="$(app_database_url)"
-  if [ -n "$url" ]; then
-    dbname="${url##*/}"
-    dbname="${dbname%%\?*}"
-    admin_url="${url%/*}/postgres"
-    if [ -n "$dbname" ]; then
-      step "Removing the Forge application database"
-      if [ "$DRY_RUN" = "1" ]; then
-        info "[dry-run] Drop database $dbname (removes saved logins, projects, and history)"
-      elif ! command -v psql >/dev/null 2>&1; then
-        info "psql is not installed, so database $dbname was left in place. Saved logins remain."
-      elif ! psql "$admin_url" -tAc 'SELECT 1' >/dev/null 2>&1; then
-        info "PostgreSQL is not reachable, so the database was left in place. Saved logins and projects remain."
-      elif psql "$admin_url" -c "DROP DATABASE IF EXISTS \"$dbname\" WITH (FORCE);" >/dev/null 2>&1; then
-        info "Dropped database $dbname (removed saved logins, projects, and task history)."
-      else
-        info "Database $dbname could not be dropped now, so it was left in place."
-      fi
-    fi
-  fi
-
-  # Recorded role/database cleanup via the local maintenance connection.
-  # Idempotent with the URL-based drop above.
   drop_recorded_postgres_data
 }
 
@@ -1038,7 +1127,7 @@ remove_official_linux_ollama_install() {
 remove_recorded_packages() {
   step "Removing packages installed by Forge"
 
-  if [ ! -f "$INSTALL_MANIFEST" ]; then
+  if [ ! -f "$INSTALL_MANIFEST" ] && [ ! -f "$LEGACY_INSTALL_MANIFEST" ]; then
     info "No Forge install manifest was found. System packages were left alone."
     return 0
   fi
@@ -1062,9 +1151,10 @@ remove_install_state() {
   if [ "$KEEP_DATA" = "0" ]; then
     step "Removing Forge install state"
     remove_path "$INSTALL_STATE_DIR"
+    remove_path "$LEGACY_INSTALL_STATE_DIR"
   else
     step "Keeping settings and credentials"
-    info "Kept .env, database/Redis data, Docker volumes, and $INSTALL_STATE_DIR."
+    info "Kept $ENV_FILE, database/Redis data, Docker volumes, and $INSTALL_STATE_DIR."
     info "Run again with --remove-data when you want those removed too."
   fi
 }
@@ -1092,6 +1182,7 @@ else
   info "Local projects: keep all project folders on disk."
 fi
 
+validate_remove_data_paths
 remove_project_files
 remove_build_artifacts
 remove_cli_entrypoint

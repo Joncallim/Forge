@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { getWorkspaceSettings } from '@/lib/workspace'
+import { getWorkspaceSettings, isWithinPath } from '@/lib/workspace'
 
 /**
  * Lightweight on-disk registry of local project folders Forge has created.
@@ -13,15 +13,18 @@ import { getWorkspaceSettings } from '@/lib/workspace'
  */
 
 async function registryFile(): Promise<string> {
+  const workspace = await getWorkspaceSettings()
   const stateDir = process.env.FORGE_INSTALL_STATE_DIR?.trim()
   if (stateDir) {
-    return path.join(path.resolve(/*turbopackIgnore: true*/ stateDir), 'project-paths')
+    const resolved = path.resolve(/*turbopackIgnore: true*/ stateDir)
+    if (!isWithinPath(workspace.workspaceRoot, resolved)) {
+      throw new Error('FORGE_INSTALL_STATE_DIR must stay inside the active workspace root.')
+    }
+    return path.join(resolved, 'project-paths')
   }
 
-  const workspace = await getWorkspaceSettings()
-  const stateRoot = path.join(/*turbopackIgnore: true*/ workspace.workspaceRoot, 'runtime')
-  await fs.mkdir(stateRoot, { recursive: true })
-  return path.join(stateRoot, 'project-paths')
+  await fs.mkdir(workspace.runtimeRoot, { recursive: true })
+  return path.join(workspace.runtimeRoot, 'project-paths')
 }
 
 async function readPaths(): Promise<string[]> {
