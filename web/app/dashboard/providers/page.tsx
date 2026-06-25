@@ -224,6 +224,7 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
   const showBaseUrl = !isAcp && (entry.requiresBaseUrl || entry.category === 'local')
   const baseUrlRequired = entry.requiresBaseUrl
   const category = providerCategory(form.providerType, form.isLocal)
+  const supportsModelFetch = category === 'cloud' || form.providerType === 'lmstudio'
   const selectedAcpAgent = isAcp ? getAcpAgent(form.modelId) : undefined
   const [availableModels, setAvailableModels] = useState<string[] | null>(null)
   const [modelsLoading, setModelsLoading] = useState(false)
@@ -387,7 +388,7 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
               className="min-w-0 flex-1 rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
               aria-required="true"
             />
-            {category === 'cloud' && (
+            {supportsModelFetch && (
               <Button
                 type="button"
                 variant="outline"

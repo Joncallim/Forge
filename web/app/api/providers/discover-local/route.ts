@@ -4,7 +4,11 @@ import { db } from '@/db'
 import { providerConfigs } from '@/db/schema'
 import { and, eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
-import { PROVIDER_CATALOG } from '@/lib/providers/catalog'
+import {
+  normalizeLmStudioNativeApiBaseUrl,
+  normalizeLmStudioRuntimeBaseUrl,
+  PROVIDER_CATALOG,
+} from '@/lib/providers/catalog'
 
 // ---------------------------------------------------------------------------
 // POST /api/providers/discover-local
@@ -16,7 +20,11 @@ import { PROVIDER_CATALOG } from '@/lib/providers/catalog'
 // ---------------------------------------------------------------------------
 
 const OLLAMA_BASE_URL = PROVIDER_CATALOG.ollama.defaultBaseUrl ?? 'http://localhost:11434'
-const LMSTUDIO_BASE_URL = PROVIDER_CATALOG.lmstudio.defaultBaseUrl ?? 'http://localhost:1234/v1'
+const LMSTUDIO_RUNTIME_BASE_URL =
+  normalizeLmStudioRuntimeBaseUrl(PROVIDER_CATALOG.lmstudio.defaultBaseUrl ?? 'http://localhost:1234') ??
+  'http://localhost:1234/v1'
+const LMSTUDIO_NATIVE_BASE_URL =
+  normalizeLmStudioNativeApiBaseUrl(LMSTUDIO_RUNTIME_BASE_URL) ?? 'http://localhost:1234/api/v1'
 const PROBE_TIMEOUT_MS = 1500
 
 type DiscoveredModel = {
@@ -48,13 +56,43 @@ async function discoverOllama(): Promise<DiscoveredModel[]> {
     .map((modelId) => ({ providerType: 'ollama' as const, modelId, baseUrl: OLLAMA_BASE_URL }))
 }
 
-async function discoverLmStudio(): Promise<DiscoveredModel[]> {
-  const data = await fetchJson(`${LMSTUDIO_BASE_URL}/models`)
+function extractLmStudioNativeModels(data: unknown | null): string[] | null {
+  const models = (data as { models?: unknown[] } | null)?.models
+  if (!Array.isArray(models)) return null
+
+  return models.flatMap((model) => {
+    const item = model as {
+      key?: unknown
+      type?: unknown
+      loaded_instances?: { id?: unknown }[]
+    }
+    if (item.type === 'embedding') return []
+
+    return [
+      item.key,
+      ...(Array.isArray(item.loaded_instances)
+        ? item.loaded_instances.map((instance) => instance.id)
+        : []),
+    ].filter((id): id is string => typeof id === 'string' && id.length > 0)
+  })
+}
+
+function extractOpenAiCompatibleModels(data: unknown | null): string[] {
   const models = (data as { data?: { id?: string }[] } | null)?.data ?? []
   return models
     .map((m) => m.id)
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
-    .map((modelId) => ({ providerType: 'lmstudio' as const, modelId, baseUrl: LMSTUDIO_BASE_URL }))
+}
+
+async function discoverLmStudio(): Promise<DiscoveredModel[]> {
+  const nativeData = await fetchJson(`${LMSTUDIO_NATIVE_BASE_URL}/models`)
+  const nativeModels = extractLmStudioNativeModels(nativeData)
+  const models = nativeModels ?? extractOpenAiCompatibleModels(
+    await fetchJson(`${LMSTUDIO_RUNTIME_BASE_URL}/models`),
+  )
+
+  return models
+    .map((modelId) => ({ providerType: 'lmstudio' as const, modelId, baseUrl: LMSTUDIO_RUNTIME_BASE_URL }))
 }
 
 export async function POST(request: NextRequest) {

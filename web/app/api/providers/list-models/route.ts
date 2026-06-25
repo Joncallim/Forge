@@ -2,7 +2,12 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { getSession } from '@/lib/session'
-import { PROVIDER_CATALOG, providerSupportsUserBaseUrl } from '@/lib/providers/catalog'
+import {
+  normalizeLmStudioNativeApiBaseUrl,
+  normalizeLmStudioRuntimeBaseUrl,
+  PROVIDER_CATALOG,
+  providerSupportsUserBaseUrl,
+} from '@/lib/providers/catalog'
 import { validateProviderBaseUrl } from '@/lib/providers/credentials'
 import type { ProviderType } from '@/lib/providers/types'
 
@@ -44,6 +49,31 @@ function extractOpenAiCompatibleIds(data: unknown): string[] {
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
 }
 
+function extractLmStudioNativeIds(data: unknown): string[] | null {
+  const list = (data as { models?: unknown[] } | null)?.models
+  if (!Array.isArray(list)) return null
+
+  return list.flatMap((model) => {
+    const item = model as {
+      key?: unknown
+      type?: unknown
+      loaded_instances?: { id?: unknown }[]
+    }
+    if (item.type === 'embedding') return []
+
+    return [
+      item.key,
+      ...(Array.isArray(item.loaded_instances)
+        ? item.loaded_instances.map((instance) => instance.id)
+        : []),
+    ].filter((id): id is string => typeof id === 'string' && id.length > 0)
+  })
+}
+
+function optionalBearerHeaders(apiKey: string): Record<string, string> {
+  return apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
+}
+
 function baseUrlForModelListing(providerType: ProviderType, baseUrl?: string | null): string {
   if (providerSupportsUserBaseUrl(providerType)) {
     return (baseUrl?.trim() || PROVIDER_CATALOG[providerType]?.defaultBaseUrl || '').replace(/\/+$/, '')
@@ -83,9 +113,29 @@ async function listModels(
         .map((m) => m.name?.replace(/^models\//, ''))
         .filter((name): name is string => typeof name === 'string' && name.length > 0)
     }
+    case 'lmstudio': {
+      const configuredBaseUrl = baseUrl?.trim() || PROVIDER_CATALOG.lmstudio.defaultBaseUrl || ''
+      const nativeBaseUrl = normalizeLmStudioNativeApiBaseUrl(configuredBaseUrl)
+      const runtimeBaseUrl = normalizeLmStudioRuntimeBaseUrl(configuredBaseUrl)
+      if (!nativeBaseUrl || !runtimeBaseUrl) {
+        throw new Error('A base URL is required to list models for this provider')
+      }
+
+      const headers = optionalBearerHeaders(apiKey)
+      try {
+        const data = await fetchJson(`${nativeBaseUrl}/models`, headers)
+        const nativeIds = extractLmStudioNativeIds(data)
+        if (nativeIds !== null) return nativeIds
+      } catch {
+        // Fall through to the OpenAI-compatible endpoint for older LM Studio servers.
+      }
+
+      const data = await fetchJson(`${runtimeBaseUrl}/models`, headers)
+      return extractOpenAiCompatibleIds(data)
+    }
     default: {
       // OpenAI-compatible providers: openai, openrouter, xai, deepseek, moonshot,
-      // zhipu, litellm, custom — all expose GET {baseUrl}/models.
+      // zhipu, litellm, custom, ollama — all expose GET {baseUrl}/models.
       const resolvedBaseUrl = baseUrlForModelListing(providerType, baseUrl)
       if (!resolvedBaseUrl) {
         throw new Error('A base URL is required to list models for this provider')

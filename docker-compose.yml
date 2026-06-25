@@ -47,6 +47,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
       FORGE_WORKSPACE_ROOT: /forge-workspace
+      FORGE_WORKSPACE_DISPLAY_ROOT: ${FORGE_WORKSPACE_DISPLAY_ROOT:-${FORGE_WORKSPACE_ROOT:-${HOME}/Documents/Forge}}
       FORGE_AGENT_CONFIG_DIR: /forge-workspace/prompts/agents
       FORGE_ENV_FILE: /forge-workspace/config/forge.env
     healthcheck:
@@ -74,6 +75,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       FORGE_WORKER_CLAIM_TIMEOUT_SECONDS: ${FORGE_WORKER_CLAIM_TIMEOUT_SECONDS:-5}
       FORGE_WORKSPACE_ROOT: /forge-workspace
+      FORGE_WORKSPACE_DISPLAY_ROOT: ${FORGE_WORKSPACE_DISPLAY_ROOT:-${FORGE_WORKSPACE_ROOT:-${HOME}/Documents/Forge}}
       FORGE_AGENT_CONFIG_DIR: /forge-workspace/prompts/agents
       FORGE_ENV_FILE: /forge-workspace/config/forge.env
 

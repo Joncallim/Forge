@@ -12,7 +12,12 @@ import {
 } from '@/db/schema'
 import { writeWorkspaceFileAtomically } from '@/lib/agent-prompts'
 import { getGitHubStatus } from '@/lib/github'
-import { assertWorkspaceManagedPath, getWorkspaceSettings, isWithinPath } from '@/lib/workspace'
+import {
+  assertWorkspaceManagedPath,
+  displayPathForWorkspacePath,
+  getWorkspaceSettings,
+  isWithinPath,
+} from '@/lib/workspace'
 import { MCP_CATALOG, RECOMMENDED_MCP_IDS, isKnownMcpId } from './catalog'
 import type {
   McpCatalogEntry,
@@ -195,6 +200,7 @@ async function buildStandaloneStatus(
     displayName: entry?.displayName ?? mcpId,
     description: entry?.description ?? 'Unknown MCP',
     installPath,
+    displayInstallPath: displayPathForWorkspacePath(workspace, installPath),
     installState: installed ? 'installed' : 'missing',
     status: installed ? 'unknown' : 'unknown',
     enabled: installation?.enabled ?? true,
@@ -228,6 +234,7 @@ async function classifyProjectMcp(
       displayName: mcpId,
       description: 'Unknown MCP',
       installPath,
+      displayInstallPath: displayPathForWorkspacePath(workspace, installPath),
       installState: 'missing',
       status: 'unhealthy',
       enabled,
@@ -242,6 +249,7 @@ async function classifyProjectMcp(
       displayName: entry.displayName,
       description: entry.description,
       installPath,
+      displayInstallPath: displayPathForWorkspacePath(workspace, installPath),
       installState: 'missing',
       status: 'unhealthy',
       enabled,
@@ -289,6 +297,7 @@ async function classifyProjectMcp(
     displayName: entry.displayName,
     description: entry.description,
     installPath,
+    displayInstallPath: displayPathForWorkspacePath(workspace, installPath),
     installState,
     status,
     enabled,
@@ -405,6 +414,7 @@ export async function getProjectMcpOverview(project: Project): Promise<ProjectMc
     config,
     catalog: catalogEntries(),
     mcpsRoot: workspace.mcpsRoot,
+    displayMcpsRoot: displayPathForWorkspacePath(workspace, workspace.mcpsRoot),
     statuses,
     summary: summarizeStatuses(statuses),
   }

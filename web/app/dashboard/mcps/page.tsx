@@ -9,13 +9,15 @@ import {
   SelectContent,
   SelectItem,
   SelectTrigger,
-  SelectValue,
 } from '@/components/ui/select'
 import { MCP_CATALOG } from '@/lib/mcps/catalog'
 
 type WorkspaceSettings = {
   workspaceRoot: string
   mcpsRoot: string
+  displayPaths?: {
+    mcpsRoot?: string
+  }
   source: 'env' | 'setting' | 'default'
   envLocked: boolean
 }
@@ -25,6 +27,7 @@ type Project = {
   name: string
   githubRepo: string | null
   localPath: string | null
+  displayLocalPath?: string | null
 }
 
 const catalogEntries = Object.values(MCP_CATALOG)
@@ -33,6 +36,10 @@ function sourceLabel(source: WorkspaceSettings['source']): string {
   if (source === 'env') return 'Environment'
   if (source === 'setting') return 'Custom'
   return 'Default'
+}
+
+function workspaceMcpRootLabel(workspace: WorkspaceSettings): string {
+  return workspace.displayPaths?.mcpsRoot ?? workspace.mcpsRoot
 }
 
 function installerPrompt(source: string): string {
@@ -148,7 +155,9 @@ export default function McpsPage() {
         <div>
           <h1 className="text-xl font-semibold text-foreground">MCPs</h1>
           {workspace && (
-            <p className="mt-1 font-mono text-sm text-muted-foreground break-all">{workspace.mcpsRoot}</p>
+            <p className="mt-1 font-mono text-sm text-muted-foreground break-all">
+              {workspaceMcpRootLabel(workspace)}
+            </p>
           )}
         </div>
         {workspace && (
@@ -236,7 +245,12 @@ export default function McpsPage() {
                   disabled={projects.length === 0 || submitting}
                 >
                   <SelectTrigger id="mcp-project" className="w-full">
-                    <SelectValue placeholder="Select project" />
+                    <span
+                      data-slot="select-value"
+                      className={selectedProject ? 'text-foreground' : 'text-muted-foreground'}
+                    >
+                      {selectedProject?.name ?? 'Select project'}
+                    </span>
                   </SelectTrigger>
                   <SelectContent>
                     {projects.map((project) => (

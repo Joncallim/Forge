@@ -2,7 +2,12 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { getSession } from '@/lib/session'
-import { getWorkspaceSettings, saveWorkspaceSettings } from '@/lib/workspace'
+import {
+  getWorkspaceSettings,
+  resolveWorkspaceInputPath,
+  saveWorkspaceSettings,
+  serializeWorkspaceSettings,
+} from '@/lib/workspace'
 
 const updateSchema = z.object({
   workspaceRoot: z.string().trim().min(1).max(1000),
@@ -17,7 +22,7 @@ export async function GET(request: NextRequest) {
     }
 
     const workspace = await getWorkspaceSettings()
-    return NextResponse.json({ workspace })
+    return NextResponse.json({ workspace: serializeWorkspaceSettings(workspace) })
   } catch (err) {
     console.error('[GET /api/settings/workspace] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
@@ -40,8 +45,17 @@ export async function PUT(request: NextRequest) {
     }
 
     try {
-      const workspace = await saveWorkspaceSettings(parsed.data)
-      return NextResponse.json({ workspace })
+      const currentWorkspace = await getWorkspaceSettings({ ensure: false })
+      const workspaceRoot = resolveWorkspaceInputPath(
+        parsed.data.workspaceRoot,
+        currentWorkspace,
+        currentWorkspace.workspaceRoot,
+      )
+      const mcpsRoot = parsed.data.mcpsRoot
+        ? resolveWorkspaceInputPath(parsed.data.mcpsRoot, currentWorkspace, currentWorkspace.mcpsRoot)
+        : undefined
+      const workspace = await saveWorkspaceSettings({ workspaceRoot, mcpsRoot })
+      return NextResponse.json({ workspace: serializeWorkspaceSettings(workspace) })
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to save workspace root'
       return NextResponse.json({ error: message }, { status: 409 })

@@ -25,6 +25,7 @@ interface Project {
   name: string
   githubRepo: string | null
   localPath: string | null
+  displayLocalPath?: string | null
   pmProviderConfigId: string | null
   defaultBranch: string
   createdAt: string
@@ -46,12 +47,15 @@ type McpSummary = {
 type DirectoryEntry = {
   name: string
   path: string
+  displayPath?: string
   isGitRepo: boolean
 }
 
 type DirectoryListing = {
   path: string
+  displayPath?: string
   parentPath: string | null
+  parentDisplayPath?: string | null
   directories: DirectoryEntry[]
   currentPathIsGitRepo: boolean
 }
@@ -100,6 +104,18 @@ function joinPathPreview(parentPath: string, folderName: string): string {
   if (!parent || !folder) return ''
   if (parent.endsWith('/') || parent.endsWith('\\')) return `${parent}${folder}`
   return `${parent}${parent.includes('\\') && !parent.includes('/') ? '\\' : '/'}${folder}`
+}
+
+function projectLocationLabel(project: Project): string {
+  return project.githubRepo ?? project.displayLocalPath ?? project.localPath ?? 'Local project'
+}
+
+function directoryListingPathLabel(listing: DirectoryListing | null): string {
+  return listing?.displayPath ?? listing?.path ?? 'Loading folders...'
+}
+
+function parentPathInputValue(listing: DirectoryListing | null, parentPath: string): string {
+  return listing?.path === parentPath ? listing.displayPath ?? parentPath : parentPath
 }
 
 export default function ProjectsPage() {
@@ -364,7 +380,8 @@ export default function ProjectsPage() {
     }
   }
 
-  const localPathPreview = joinPathPreview(formLocalParentPath, formLocalFolderName)
+  const formLocalParentDisplayPath = parentPathInputValue(folderListing, formLocalParentPath)
+  const localPathPreview = joinPathPreview(formLocalParentDisplayPath, formLocalFolderName)
   const currentFolderIsGitRepo = formSource === 'local' && folderListing?.currentPathIsGitRepo === true
   const filteredCloneRepos = (cloneRepos ?? []).filter((r) =>
     cloneRepoFilter.trim() === '' || r.nameWithOwner.toLowerCase().includes(cloneRepoFilter.trim().toLowerCase()),
@@ -507,9 +524,9 @@ export default function ProjectsPage() {
                       name="forge-local-parent-path"
                       type="text"
                       required
-                      value={formLocalParentPath}
+                      value={formLocalParentDisplayPath}
                       onChange={(e) => setFormLocalParentPath(e.target.value)}
-                      placeholder="/Users/alex/Projects"
+                      placeholder="~/Documents/Forge/projects"
                       autoComplete="off"
                       data-1p-ignore="true"
                       data-lpignore="true"
@@ -575,7 +592,7 @@ export default function ProjectsPage() {
                   <div className="min-w-0 rounded-lg border border-border bg-muted/30">
                     <div className="flex min-w-0 items-center justify-between gap-2 border-b border-border px-3 py-2">
                       <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
-                        {folderListing?.path ?? 'Loading folders...'}
+                        {directoryListingPathLabel(folderListing)}
                       </span>
                       <div className="flex shrink-0 items-center gap-2">
                         <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -725,9 +742,9 @@ export default function ProjectsPage() {
                       name="forge-clone-local-parent-path"
                       type="text"
                       required
-                      value={formLocalParentPath}
+                      value={formLocalParentDisplayPath}
                       onChange={(e) => setFormLocalParentPath(e.target.value)}
-                      placeholder="/Users/alex/Projects"
+                      placeholder="~/Documents/Forge/projects"
                       autoComplete="off"
                       data-1p-ignore="true"
                       data-lpignore="true"
@@ -781,7 +798,7 @@ export default function ProjectsPage() {
                   <div className="min-w-0 rounded-lg border border-border bg-muted/30">
                     <div className="flex min-w-0 items-center justify-between gap-2 border-b border-border px-3 py-2">
                       <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
-                        {folderListing?.path ?? 'Loading folders...'}
+                        {directoryListingPathLabel(folderListing)}
                       </span>
                       <div className="flex shrink-0 items-center gap-2">
                         <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -953,8 +970,8 @@ export default function ProjectsPage() {
                     </a>
                   )}
                 </div>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  {project.githubRepo ?? project.localPath ?? 'Local project'}
+                <p className="mt-1 break-all text-xs text-muted-foreground">
+                  {projectLocationLabel(project)}
                 </p>
                 <span className={mcpSummaryClassName(project.mcpSummary)}>
                   <span className="truncate">{project.mcpSummary?.label ?? 'MCPs: Not checked'}</span>

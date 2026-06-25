@@ -4,7 +4,13 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { z } from 'zod'
 import { getSession } from '@/lib/session'
-import { getWorkspaceSettings, isWithinPath, type WorkspaceSettings } from '@/lib/workspace'
+import {
+  displayPathForWorkspacePath,
+  getWorkspaceSettings,
+  isWithinPath,
+  resolveWorkspaceInputPath,
+  type WorkspaceSettings,
+} from '@/lib/workspace'
 
 export const runtime = 'nodejs'
 
@@ -37,9 +43,7 @@ function resolveDirectoryPath(rawPath: string | null, workspace: WorkspaceSettin
   const start = workspace.projectsRoot
   const resolvedPath = !rawPath || rawPath.trim() === ''
     ? path.resolve(/*turbopackIgnore: true*/ start)
-    : path.isAbsolute(rawPath)
-    ? path.resolve(/*turbopackIgnore: true*/ rawPath)
-    : path.resolve(/*turbopackIgnore: true*/ start, rawPath)
+    : resolveWorkspaceInputPath(rawPath, workspace, start)
 
   if (!isWithinPath(workspace.workspaceRoot, resolvedPath)) {
     throw new Error('Path must stay inside the active workspace root')
@@ -145,9 +149,14 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json({
       path: currentPath,
+      displayPath: displayPathForWorkspacePath(workspace, currentPath),
       parentPath,
+      parentDisplayPath: parentPath ? displayPathForWorkspacePath(workspace, parentPath) : null,
       currentPathIsGitRepo,
-      directories,
+      directories: directories.map((directory) => ({
+        ...directory,
+        displayPath: displayPathForWorkspacePath(workspace, directory.path),
+      })),
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unable to read directory'
@@ -213,7 +222,9 @@ export async function POST(request: NextRequest) {
             error: `Folder does not exist: ${parentPath}`,
             code: 'PARENT_MISSING',
             parentPath,
+            parentDisplayPath: displayPathForWorkspacePath(workspace, parentPath),
             path: directoryPath,
+            displayPath: displayPathForWorkspacePath(workspace, directoryPath),
           },
           { status: 409 },
         )
@@ -235,7 +246,9 @@ export async function POST(request: NextRequest) {
               error: 'Folder already exists',
               code: 'DIR_EXISTS',
               path: directoryPath,
+              displayPath: displayPathForWorkspacePath(workspace, directoryPath),
               parentPath,
+              parentDisplayPath: displayPathForWorkspacePath(workspace, parentPath),
               empty,
             },
             { status: 409 },
@@ -250,7 +263,13 @@ export async function POST(request: NextRequest) {
           )
         }
         await assertRealPathWithinWorkspace(directoryPath, workspace)
-        return NextResponse.json({ path: directoryPath, parentPath, existed: true }, { status: 200 })
+        return NextResponse.json({
+          path: directoryPath,
+          displayPath: displayPathForWorkspacePath(workspace, directoryPath),
+          parentPath,
+          parentDisplayPath: displayPathForWorkspacePath(workspace, parentPath),
+          existed: true,
+        }, { status: 200 })
       }
       throw err
     }
@@ -258,7 +277,9 @@ export async function POST(request: NextRequest) {
     return NextResponse.json(
       {
         path: directoryPath,
+        displayPath: displayPathForWorkspacePath(workspace, directoryPath),
         parentPath,
+        parentDisplayPath: displayPathForWorkspacePath(workspace, parentPath),
         existed: false,
       },
       { status: 201 },

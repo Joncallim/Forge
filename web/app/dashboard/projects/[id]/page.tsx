@@ -19,6 +19,7 @@ interface Project {
   name: string
   githubRepo: string | null
   localPath: string | null
+  displayLocalPath?: string | null
   pmProviderConfigId: string | null
   defaultBranch: string
   createdAt: string
@@ -32,6 +33,7 @@ type ProjectMcpStatus = {
   displayName: string
   description: string
   installPath: string
+  displayInstallPath?: string
   installState: 'installed' | 'missing'
   status: McpStatusName
   enabled: boolean
@@ -58,6 +60,7 @@ type ProjectMcpOverview = {
   config: ProjectMcpConfig
   catalog: McpCatalogEntry[]
   mcpsRoot: string
+  displayMcpsRoot?: string
   statuses: ProjectMcpStatus[]
   summary: {
     label: string
@@ -132,6 +135,35 @@ function mcpErrorClass(status: ProjectMcpStatus): string {
 
 function formatDate(iso: string): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(new Date(iso))
+}
+
+function projectLocalPathLabel(project: Project): string {
+  return project.displayLocalPath ?? project.localPath ?? 'Local project'
+}
+
+function projectLocalPathInputValue(project: Project | null): string {
+  return project?.displayLocalPath ?? project?.localPath ?? ''
+}
+
+function projectLocalPathSaveValue(input: string, project: Project | null): string | null {
+  const trimmedPath = input.trim()
+  if (!trimmedPath) return null
+  if (project?.displayLocalPath && project.localPath && trimmedPath === project.displayLocalPath.trim()) {
+    return project.localPath
+  }
+  return trimmedPath
+}
+
+function mcpRootLabel(overview: ProjectMcpOverview): string {
+  return overview.displayMcpsRoot ?? overview.mcpsRoot
+}
+
+function mcpInstallPathLabel(
+  status: ProjectMcpStatus | undefined,
+  overview: ProjectMcpOverview,
+  mcpId: string,
+): string {
+  return status?.displayInstallPath ?? status?.installPath ?? `${mcpRootLabel(overview)}/${mcpId}`
 }
 
 export default function ProjectDetailPage() {
@@ -329,21 +361,22 @@ export default function ProjectDetailPage() {
   }
 
   function openProjectPathDialog() {
-    setProjectPathInput(project?.localPath ?? '')
+    setProjectPathInput(projectLocalPathInputValue(project))
     setProjectPathError(null)
     setProjectPathDialogOpen(true)
   }
 
   async function saveProjectPath(e: React.FormEvent) {
     e.preventDefault()
+    if (!project) return
     setSavingProjectPath(true)
     setProjectPathError(null)
     try {
-      const trimmedPath = projectPathInput.trim()
+      const localPath = projectLocalPathSaveValue(projectPathInput, project)
       const res = await fetch(`/api/projects/${projectId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ localPath: trimmedPath || null }),
+        body: JSON.stringify({ localPath }),
       })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
@@ -370,8 +403,9 @@ export default function ProjectDetailPage() {
 
     let deleteFiles = false
     if (project.localPath) {
+      const localPathLabel = projectLocalPathLabel(project)
       deleteFiles = window.confirm(
-        `Also delete the project folder and everything inside it from disk?\n\n${project.localPath}\n\nClick Cancel to keep the files on disk.`,
+        `Also delete the project folder and everything inside it from disk?\n\n${localPathLabel}\n\nClick Cancel to keep the files on disk.`,
       )
     }
 
@@ -465,8 +499,8 @@ export default function ProjectDetailPage() {
             </a>
           )}
           {project.githubRepo === null && (
-            <p className="mt-1 font-mono text-sm text-muted-foreground">
-              {project.localPath ?? 'Local project'}
+            <p className="mt-1 break-all font-mono text-sm text-muted-foreground">
+              {projectLocalPathLabel(project)}
             </p>
           )}
         </div>
@@ -594,7 +628,7 @@ export default function ProjectDetailPage() {
             </h2>
             {mcpOverview && (
               <p className="mt-1 font-mono text-xs text-muted-foreground break-all">
-                {mcpOverview.mcpsRoot}
+                {mcpRootLabel(mcpOverview)}
               </p>
             )}
           </div>
@@ -700,7 +734,7 @@ export default function ProjectDetailPage() {
                       </Button>
                     )}
                     <code className="max-w-full truncate rounded-md bg-muted px-2 py-1 font-mono text-xs text-muted-foreground sm:max-w-xs">
-                      {status?.installPath ?? `${mcpOverview.mcpsRoot}/${entry.id}`}
+                      {mcpInstallPathLabel(status, mcpOverview, entry.id)}
                     </code>
                   </div>
                 </li>

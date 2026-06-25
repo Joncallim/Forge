@@ -157,6 +157,80 @@ describe('workspace-native storage safeguards', () => {
     }
   })
 
+  it('serializes workspace display paths without changing canonical paths', async () => {
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const previousHome = process.env.HOME
+    const fakeHome = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-display-home-'))
+    const workspaceRoot = path.join(fakeHome, 'Documents', 'Forge')
+
+    try {
+      process.env.HOME = fakeHome
+      process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+      const { getWorkspaceSettings, serializeWorkspaceSettings } = await import('@/lib/workspace')
+
+      const settings = await getWorkspaceSettings({ ensure: false })
+      const dto = serializeWorkspaceSettings(settings)
+
+      expect(dto.workspaceRoot).toBe(workspaceRoot)
+      expect(dto.projectsRoot).toBe(path.join(workspaceRoot, 'projects'))
+      expect(dto.displayPaths.workspaceRoot).toBe('~/Documents/Forge')
+      expect(dto.displayPaths.projectsRoot).toBe('~/Documents/Forge/projects')
+      expect(dto.displayPaths.mcpsRoot).toBe('~/Documents/Forge/mcps')
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      if (previousHome === undefined) {
+        delete process.env.HOME
+      } else {
+        process.env.HOME = previousHome
+      }
+      await fs.rm(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  it('maps configured display root paths back to canonical workspace paths', async () => {
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const previousDisplayRoot = process.env.FORGE_WORKSPACE_DISPLAY_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-display-root-'))
+
+    try {
+      process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+      process.env.FORGE_WORKSPACE_DISPLAY_ROOT = '/Forge Workspace'
+      const {
+        getWorkspaceSettings,
+        resolveWorkspaceInputPath,
+        serializeWorkspaceSettings,
+      } = await import('@/lib/workspace')
+
+      const settings = await getWorkspaceSettings({ ensure: false })
+      const dto = serializeWorkspaceSettings(settings)
+      const resolved = resolveWorkspaceInputPath(
+        '/Forge Workspace/projects/demo',
+        settings,
+        settings.projectsRoot,
+      )
+
+      expect(dto.displayPaths.workspaceRoot).toBe('/Forge Workspace')
+      expect(dto.displayPaths.projectsRoot).toBe('/Forge Workspace/projects')
+      expect(resolved).toBe(path.join(workspaceRoot, 'projects', 'demo'))
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      if (previousDisplayRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_DISPLAY_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_DISPLAY_ROOT = previousDisplayRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
   it('rejects MCP installs when the shared MCP root is a symlink escape', async () => {
     const previousRoot = process.env.FORGE_WORKSPACE_ROOT
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-mcp-symlink-'))
@@ -189,6 +263,7 @@ describe('workspace-native storage safeguards', () => {
 
     expect(compose).not.toMatch(/SESSION_SECRET:\s*\$\{SESSION_SECRET:-change_me/)
     expect(compose).not.toMatch(/OPENROUTER_API_KEY:\s*\$\{OPENROUTER_API_KEY:-}/)
+    expect(compose).toContain('FORGE_WORKSPACE_DISPLAY_ROOT: ${FORGE_WORKSPACE_DISPLAY_ROOT:-${FORGE_WORKSPACE_ROOT:-${HOME}/Documents/Forge}}')
     expect(install).toContain('--env-file "$ENV_FILE"')
     expect(install).toContain('FORGE_WORKSPACE_ROOT="$WORKSPACE_ROOT"')
   })

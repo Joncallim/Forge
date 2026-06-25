@@ -4,6 +4,8 @@ import { db } from '@/db'
 import { providerConfigs, providerHealthChecks, type ProviderConfig } from '@/db/schema'
 import { getModel } from './registry'
 import { providerApiKeyEnvVarError, safeProviderApiKeyEnvVar } from './credentials'
+import { decryptSecret } from '@/lib/crypto'
+import { normalizeLmStudioNativeApiBaseUrl, PROVIDER_CATALOG } from './catalog'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -18,6 +20,81 @@ export type ProviderHealthResult = {
 }
 
 const DEFAULT_STALE_AFTER_MS = 5 * 60 * 1000
+const HEALTH_TIMEOUT_MS = 3000
+
+function truncateProviderError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err)
+  return raw.slice(0, 200)
+}
+
+function optionalAuthorizationHeaders(config: ProviderConfig): Record<string, string> {
+  if (!config.apiKeyCiphertext) return {}
+  return { Authorization: `Bearer ${decryptSecret(config.apiKeyCiphertext)}` }
+}
+
+async function checkLmStudioHealth(
+  config: ProviderConfig,
+  envVarPresent: boolean,
+): Promise<ProviderHealthResult> {
+  const nativeBaseUrl = normalizeLmStudioNativeApiBaseUrl(
+    config.baseUrl ?? PROVIDER_CATALOG.lmstudio.defaultBaseUrl ?? null,
+  )
+  if (!nativeBaseUrl) {
+    return {
+      reachable: false,
+      envVarPresent,
+      latencyMs: null,
+      error: 'A base URL is required to check LM Studio health',
+    }
+  }
+
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let timedOut = false
+  const controller = new AbortController()
+  const start = Date.now()
+
+  try {
+    timer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, HEALTH_TIMEOUT_MS)
+
+    const res = await fetch(`${nativeBaseUrl}/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...optionalAuthorizationHeaders(config),
+      },
+      body: JSON.stringify({
+        model: config.modelId,
+        input: 'Reply with the single word: ok',
+        max_output_tokens: 1,
+        store: false,
+      }),
+      signal: controller.signal,
+    })
+
+    if (!res.ok) {
+      throw new Error(`LM Studio returned ${res.status}`)
+    }
+
+    return {
+      reachable: true,
+      envVarPresent,
+      latencyMs: Date.now() - start,
+      error: null,
+    }
+  } catch (err: unknown) {
+    return {
+      reachable: false,
+      envVarPresent,
+      latencyMs: null,
+      error: timedOut ? `Health check timed out after ${HEALTH_TIMEOUT_MS}ms` : truncateProviderError(err),
+    }
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
 
 // ---------------------------------------------------------------------------
 // checkProviderHealth
@@ -56,6 +133,10 @@ export async function checkProviderHealth(
         ? `No API key set (enter one in the UI, or set ${safeEnvVar})`
         : 'No API key set',
     }
+  }
+
+  if (config.providerType === 'lmstudio') {
+    return checkLmStudioHealth(config, envVarPresent)
   }
 
   let reachable = false
@@ -97,8 +178,7 @@ export async function checkProviderHealth(
     latencyMs = null
 
     // Truncate error to 200 chars. Never include resolved API key values.
-    const raw = err instanceof Error ? err.message : String(err)
-    error = raw.slice(0, 200)
+    error = truncateProviderError(err)
   }
 
   return { reachable, envVarPresent, latencyMs, error }

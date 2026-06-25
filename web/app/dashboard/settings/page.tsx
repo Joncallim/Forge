@@ -15,6 +15,21 @@ type GitHubStatus = {
   login: string | null
 }
 
+type WorkspacePathKey =
+  | 'workspaceRoot'
+  | 'configRoot'
+  | 'projectsRoot'
+  | 'mcpsRoot'
+  | 'templatesRoot'
+  | 'promptsRoot'
+  | 'agentPromptsRoot'
+  | 'workforcesRoot'
+  | 'runtimeRoot'
+  | 'logsRoot'
+  | 'backupsRoot'
+  | 'forgeEnvPath'
+  | 'globalSettingsPath'
+
 type WorkspaceSettings = {
   workspaceRoot: string
   configRoot: string
@@ -31,9 +46,14 @@ type WorkspaceSettings = {
   globalSettingsPath: string
   source: 'env' | 'setting' | 'default'
   envLocked: boolean
+  displayPaths?: Partial<Record<WorkspacePathKey, string>>
 }
 
 const PAT_CREATE_URL = 'https://github.com/settings/tokens/new?scopes=repo,workflow&description=Forge'
+
+function workspaceDisplayPath(workspace: WorkspaceSettings, key: WorkspacePathKey): string {
+  return workspace.displayPaths?.[key] ?? workspace[key]
+}
 
 // ---------------------------------------------------------------------------
 // Workspace card
@@ -59,7 +79,7 @@ function WorkspaceCard() {
       }
       const body = (await res.json()) as { workspace: WorkspaceSettings }
       setWorkspace(body.workspace)
-      setWorkspaceRoot(body.workspace.workspaceRoot)
+      setWorkspaceRoot(workspaceDisplayPath(body.workspace, 'workspaceRoot'))
     } catch (err) {
       setFetchError(err instanceof Error ? err.message : 'An unexpected error occurred')
     } finally {
@@ -88,7 +108,7 @@ function WorkspaceCard() {
       }
       const body = (await res.json()) as { workspace: WorkspaceSettings }
       setWorkspace(body.workspace)
-      setWorkspaceRoot(body.workspace.workspaceRoot)
+      setWorkspaceRoot(workspaceDisplayPath(body.workspace, 'workspaceRoot'))
       setSavedMsg('Workspace saved.')
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
@@ -145,35 +165,35 @@ function WorkspaceCard() {
           <dl className="grid gap-2 text-xs text-muted-foreground">
             <div>
               <dt className="font-medium text-foreground">Projects</dt>
-              <dd className="break-all font-mono">{workspace.projectsRoot}</dd>
+              <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'projectsRoot')}</dd>
             </div>
             <div>
               <dt className="font-medium text-foreground">MCPs</dt>
-              <dd className="break-all font-mono">{workspace.mcpsRoot}</dd>
+              <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'mcpsRoot')}</dd>
             </div>
             <div>
               <dt className="font-medium text-foreground">Templates</dt>
-              <dd className="break-all font-mono">{workspace.templatesRoot}</dd>
+              <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'templatesRoot')}</dd>
             </div>
             <div>
               <dt className="font-medium text-foreground">Agent Prompts</dt>
-              <dd className="break-all font-mono">{workspace.agentPromptsRoot}</dd>
+              <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'agentPromptsRoot')}</dd>
             </div>
             <div>
               <dt className="font-medium text-foreground">Workforces</dt>
-              <dd className="break-all font-mono">{workspace.workforcesRoot}</dd>
+              <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'workforcesRoot')}</dd>
             </div>
             <div>
               <dt className="font-medium text-foreground">Runtime</dt>
-              <dd className="break-all font-mono">{workspace.runtimeRoot}</dd>
+              <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'runtimeRoot')}</dd>
             </div>
             <div>
               <dt className="font-medium text-foreground">Environment</dt>
-              <dd className="break-all font-mono">{workspace.forgeEnvPath}</dd>
+              <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'forgeEnvPath')}</dd>
             </div>
             <div>
               <dt className="font-medium text-foreground">Global Settings</dt>
-              <dd className="break-all font-mono">{workspace.globalSettingsPath}</dd>
+              <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'globalSettingsPath')}</dd>
             </div>
           </dl>
 
@@ -225,7 +245,7 @@ function McpSettingsCard() {
       }
       const body = (await res.json()) as { workspace: WorkspaceSettings }
       setWorkspace(body.workspace)
-      setMcpsRoot(body.workspace.mcpsRoot)
+      setMcpsRoot(workspaceDisplayPath(body.workspace, 'mcpsRoot'))
     } catch (err) {
       setFetchError(err instanceof Error ? err.message : 'An unexpected error occurred')
     } finally {
@@ -258,7 +278,7 @@ function McpSettingsCard() {
       }
       const body = (await res.json()) as { workspace: WorkspaceSettings }
       setWorkspace(body.workspace)
-      setMcpsRoot(body.workspace.mcpsRoot)
+      setMcpsRoot(workspaceDisplayPath(body.workspace, 'mcpsRoot'))
       setSavedMsg('MCP settings saved.')
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'An unexpected error occurred')

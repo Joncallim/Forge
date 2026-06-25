@@ -151,6 +151,60 @@ describe('GET /api/projects — auth guard', () => {
     const body = await res.json()
     expect(body.error).toBe('Unauthorized')
   })
+
+  it('returns displayLocalPath for project list rows', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const previousHome = process.env.HOME
+    const fakeHome = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-project-list-display-home-'))
+    const workspaceRoot = path.join(fakeHome, 'Documents', 'Forge')
+    const project = {
+      id: 'project-list-display',
+      name: 'List Display',
+      githubRepo: null,
+      localPath: path.join(workspaceRoot, 'projects', 'list-display'),
+      githubTokenEnvVar: null,
+      pmProviderConfigId: null,
+      mcpConfig: {
+        profile: 'default',
+        requiredMcps: ['filesystem', 'github'],
+        overrides: {},
+      },
+      defaultBranch: 'main',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      archivedAt: null,
+    }
+    process.env.HOME = fakeHome
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    mockDbSelect
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([]))
+
+    try {
+      const { GET } = await import('@/app/api/projects/route')
+      const res = await GET(authRequest('/api/projects') as never)
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.projects[0]).toMatchObject({
+        localPath: project.localPath,
+        displayLocalPath: '~/Documents/Forge/projects/list-display',
+      })
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      if (previousHome === undefined) {
+        delete process.env.HOME
+      } else {
+        process.env.HOME = previousHome
+      }
+      await fs.rm(fakeHome, { recursive: true, force: true })
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -239,6 +293,63 @@ describe('POST /api/projects — source handling', () => {
         process.env.FORGE_WORKSPACE_ROOT = previousRoot
       }
       await fs.rm(parentPath, { recursive: true, force: true })
+    }
+  })
+
+  it('accepts a displayed local project path and returns displayLocalPath', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const previousHome = process.env.HOME
+    const fakeHome = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-project-display-home-'))
+    const workspaceRoot = path.join(fakeHome, 'Documents', 'Forge')
+    const displayLocalPath = '~/Documents/Forge/projects/display-project'
+    const expectedLocalPath = path.join(workspaceRoot, 'projects', 'display-project')
+    process.env.HOME = fakeHome
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const createdProject = {
+      id: 'project-display-local',
+      name: 'Display project',
+      githubRepo: null,
+      localPath: expectedLocalPath,
+      githubTokenEnvVar: null,
+      pmProviderConfigId: null,
+      defaultBranch: 'main',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      archivedAt: null,
+    }
+    mockDbInsert.mockReturnValue(chain([createdProject]))
+
+    try {
+      const { POST } = await import('@/app/api/projects/route')
+      const res = await POST(authRequest('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Display project',
+          source: 'local',
+          localPath: displayLocalPath,
+          defaultBranch: 'main',
+        }),
+      }) as never)
+
+      expect(res.status).toBe(201)
+      const body = await res.json()
+      expect(body.project.localPath).toBe(expectedLocalPath)
+      expect(body.project.displayLocalPath).toBe(displayLocalPath)
+      await expect(fs.stat(expectedLocalPath)).resolves.toMatchObject({})
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      if (previousHome === undefined) {
+        delete process.env.HOME
+      } else {
+        process.env.HOME = previousHome
+      }
+      await fs.rm(fakeHome, { recursive: true, force: true })
     }
   })
 
@@ -505,6 +616,69 @@ describe('POST /api/projects — source handling', () => {
   })
 })
 
+describe('PUT /api/projects/:id — local path display handling', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('accepts a displayed local path and keeps the stored path canonical', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const previousHome = process.env.HOME
+    const fakeHome = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-project-update-display-home-'))
+    const workspaceRoot = path.join(fakeHome, 'Documents', 'Forge')
+    const displayLocalPath = '~/Documents/Forge/projects/updated-project'
+    const expectedLocalPath = path.join(workspaceRoot, 'projects', 'updated-project')
+    process.env.HOME = fakeHome
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const existingProject = {
+      id: 'project-update-display',
+      name: 'Display update',
+      githubRepo: null,
+      localPath: null,
+      githubTokenEnvVar: null,
+      pmProviderConfigId: null,
+      defaultBranch: 'main',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      archivedAt: null,
+    }
+    const updatedProject = {
+      ...existingProject,
+      localPath: expectedLocalPath,
+      updatedAt: new Date(),
+    }
+    mockDbSelect.mockReturnValue(chain([existingProject]))
+    mockDbUpdate.mockReturnValue(chain([updatedProject]))
+
+    try {
+      const { PUT } = await import('@/app/api/projects/[id]/route')
+      const res = await PUT(authRequest('/api/projects/project-update-display', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ localPath: displayLocalPath }),
+      }) as never, {
+        params: Promise.resolve({ id: 'project-update-display' }),
+      })
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.project.localPath).toBe(expectedLocalPath)
+      expect(body.project.displayLocalPath).toBe(displayLocalPath)
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      if (previousHome === undefined) {
+        delete process.env.HOME
+      } else {
+        process.env.HOME = previousHome
+      }
+      await fs.rm(fakeHome, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('DELETE /api/projects/:id — file deletion boundary', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
@@ -596,27 +770,41 @@ describe('GET /api/filesystem/directories — folder selector', () => {
   it('returns a requested workspace directory listing', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const previousDisplayRoot = process.env.FORGE_WORKSPACE_DISPLAY_ROOT
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-folder-list-'))
     process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    process.env.FORGE_WORKSPACE_DISPLAY_ROOT = '/Forge Workspace'
     const parentPath = path.join(workspaceRoot, 'projects')
     const childPath = path.join(parentPath, 'demo-app')
     await fs.mkdir(childPath, { recursive: true })
 
     try {
       const { GET } = await import('@/app/api/filesystem/directories/route')
-      const res = await GET(nextAuthRequest(`/api/filesystem/directories?path=${encodeURIComponent(parentPath)}`) as never)
+      const res = await GET(nextAuthRequest(
+        `/api/filesystem/directories?path=${encodeURIComponent('/Forge Workspace/projects')}`,
+      ) as never)
 
       expect(res.status).toBe(200)
       const body = await res.json()
       expect(body.path).toBe(parentPath)
+      expect(body.displayPath).toBe('/Forge Workspace/projects')
       expect(body.directories).toEqual([
-        expect.objectContaining({ name: 'demo-app', path: childPath }),
+        expect.objectContaining({
+          name: 'demo-app',
+          path: childPath,
+          displayPath: '/Forge Workspace/projects/demo-app',
+        }),
       ])
     } finally {
       if (previousRoot === undefined) {
         delete process.env.FORGE_WORKSPACE_ROOT
       } else {
         process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      if (previousDisplayRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_DISPLAY_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_DISPLAY_ROOT = previousDisplayRoot
       }
       await fs.rm(workspaceRoot, { recursive: true, force: true })
     }
@@ -708,8 +896,10 @@ describe('POST /api/filesystem/directories — folder creation', () => {
   it('creates a child folder for authenticated users', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const previousDisplayRoot = process.env.FORGE_WORKSPACE_DISPLAY_ROOT
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-folder-test-'))
     process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    process.env.FORGE_WORKSPACE_DISPLAY_ROOT = '/Forge Workspace'
     const parentPath = path.join(workspaceRoot, 'projects')
     await fs.mkdir(parentPath, { recursive: true })
 
@@ -718,13 +908,16 @@ describe('POST /api/filesystem/directories — folder creation', () => {
       const res = await POST(nextAuthRequest('/api/filesystem/directories', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ parentPath, name: 'new-app' }),
+        body: JSON.stringify({ parentPath: '/Forge Workspace/projects', name: 'new-app' }),
       }) as never)
 
       expect(res.status).toBe(201)
       const body = await res.json()
       const createdPath = path.join(parentPath, 'new-app')
       expect(body.path).toBe(createdPath)
+      expect(body.displayPath).toBe('/Forge Workspace/projects/new-app')
+      expect(body.parentPath).toBe(parentPath)
+      expect(body.parentDisplayPath).toBe('/Forge Workspace/projects')
       const stat = await fs.stat(createdPath)
       expect(stat.isDirectory()).toBe(true)
     } finally {
@@ -732,6 +925,11 @@ describe('POST /api/filesystem/directories — folder creation', () => {
         delete process.env.FORGE_WORKSPACE_ROOT
       } else {
         process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      if (previousDisplayRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_DISPLAY_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_DISPLAY_ROOT = previousDisplayRoot
       }
       await fs.rm(workspaceRoot, { recursive: true, force: true })
     }
@@ -845,6 +1043,111 @@ describe('GET/PUT /api/settings/workspace', () => {
         delete process.env.FORGE_WORKSPACE_ROOT
       } else {
         process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      if (previousHome === undefined) {
+        delete process.env.HOME
+      } else {
+        process.env.HOME = previousHome
+      }
+      await fs.rm(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  it('returns workspace display paths from the settings API', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const previousMcpsRoot = process.env.FORGE_MCPS_ROOT
+    const previousHome = process.env.HOME
+    const fakeHome = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-settings-display-home-'))
+    delete process.env.FORGE_WORKSPACE_ROOT
+    delete process.env.FORGE_MCPS_ROOT
+    process.env.HOME = fakeHome
+    mockDbSelect.mockReturnValue(chain([]))
+
+    try {
+      const { GET } = await import('@/app/api/settings/workspace/route')
+      const res = await GET(authRequest('/api/settings/workspace') as never)
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.workspace.workspaceRoot).toBe(path.join(fakeHome, 'Documents', 'Forge'))
+      expect(body.workspace.displayPaths).toMatchObject({
+        workspaceRoot: '~/Documents/Forge',
+        projectsRoot: '~/Documents/Forge/projects',
+        mcpsRoot: '~/Documents/Forge/mcps',
+        globalSettingsPath: '~/Documents/Forge/global-settings.json',
+      })
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      if (previousMcpsRoot === undefined) {
+        delete process.env.FORGE_MCPS_ROOT
+      } else {
+        process.env.FORGE_MCPS_ROOT = previousMcpsRoot
+      }
+      if (previousHome === undefined) {
+        delete process.env.HOME
+      } else {
+        process.env.HOME = previousHome
+      }
+      await fs.rm(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  it('maps workspace display aliases back to canonical paths when saving settings', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([]))
+    mockDbInsert.mockReturnValue(chain(undefined))
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const previousMcpsRoot = process.env.FORGE_MCPS_ROOT
+    const previousDisplayRoot = process.env.FORGE_WORKSPACE_DISPLAY_ROOT
+    const previousHome = process.env.HOME
+    const fakeHome = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-settings-display-save-home-'))
+    const workspaceRoot = path.join(fakeHome, 'Documents', 'Forge')
+    const mcpsRoot = path.join(workspaceRoot, 'custom-mcps')
+    delete process.env.FORGE_WORKSPACE_ROOT
+    delete process.env.FORGE_MCPS_ROOT
+    process.env.HOME = fakeHome
+    process.env.FORGE_WORKSPACE_DISPLAY_ROOT = '/Forge Workspace'
+
+    try {
+      const { PUT } = await import('@/app/api/settings/workspace/route')
+      const res = await PUT(authRequest('/api/settings/workspace', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          workspaceRoot: '/Forge Workspace',
+          mcpsRoot: '/Forge Workspace/custom-mcps',
+        }),
+      }) as never)
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.workspace.workspaceRoot).toBe(workspaceRoot)
+      expect(body.workspace.mcpsRoot).toBe(mcpsRoot)
+      expect(body.workspace.displayPaths).toMatchObject({
+        workspaceRoot: '/Forge Workspace',
+        mcpsRoot: '/Forge Workspace/custom-mcps',
+      })
+      await expect(fs.stat(mcpsRoot)).resolves.toMatchObject({})
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      if (previousMcpsRoot === undefined) {
+        delete process.env.FORGE_MCPS_ROOT
+      } else {
+        process.env.FORGE_MCPS_ROOT = previousMcpsRoot
+      }
+      if (previousDisplayRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_DISPLAY_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_DISPLAY_ROOT = previousDisplayRoot
       }
       if (previousHome === undefined) {
         delete process.env.HOME
@@ -1118,26 +1421,41 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
   it('reports recommended MCPs as missing before installation', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbInsert.mockReturnValue(chain(undefined))
+    const previousDisplayRoot = process.env.FORGE_WORKSPACE_DISPLAY_ROOT
 
-    await withWorkspaceProject(async (project) => {
-      mockDbSelect
-        .mockReturnValueOnce(chain([project]))
-        .mockReturnValueOnce(chain([]))
+    try {
+      process.env.FORGE_WORKSPACE_DISPLAY_ROOT = '/Forge Workspace'
+      await withWorkspaceProject(async (project) => {
+        mockDbSelect
+          .mockReturnValueOnce(chain([project]))
+          .mockReturnValueOnce(chain([]))
 
-      const { GET } = await import('@/app/api/projects/[id]/mcps/route')
-      const res = await GET(authRequest('/api/projects/project-mcp/mcps') as never, {
-        params: Promise.resolve({ id: project.id }),
+        const { GET } = await import('@/app/api/projects/[id]/mcps/route')
+        const res = await GET(authRequest('/api/projects/project-mcp/mcps') as never, {
+          params: Promise.resolve({ id: project.id }),
+        })
+
+        expect(res.status).toBe(200)
+        const body = await res.json()
+        expect(body.overview.displayMcpsRoot).toBe('/Forge Workspace/mcps')
+        expect(body.overview.catalog.map((entry: { id: string }) => entry.id)).toEqual(['filesystem', 'github'])
+        expect(body.overview.summary.missing).toBe(2)
+        expect(body.overview.statuses.map((status: { installState: string }) => status.installState)).toEqual([
+          'missing',
+          'missing',
+        ])
+        expect(body.overview.statuses.map((status: { displayInstallPath: string }) => status.displayInstallPath)).toEqual([
+          '/Forge Workspace/mcps/filesystem',
+          '/Forge Workspace/mcps/github',
+        ])
       })
-
-      expect(res.status).toBe(200)
-      const body = await res.json()
-      expect(body.overview.catalog.map((entry: { id: string }) => entry.id)).toEqual(['filesystem', 'github'])
-      expect(body.overview.summary.missing).toBe(2)
-      expect(body.overview.statuses.map((status: { installState: string }) => status.installState)).toEqual([
-        'missing',
-        'missing',
-      ])
-    })
+    } finally {
+      if (previousDisplayRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_DISPLAY_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_DISPLAY_ROOT = previousDisplayRoot
+      }
+    }
   })
 
   it('installs recommended MCP manifests and returns cached health status', async () => {
@@ -1454,6 +1772,60 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
 describe('GET /api/projects/:id — 404 when project not found', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
+  it('returns displayLocalPath for a project detail row', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const previousHome = process.env.HOME
+    const fakeHome = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-project-detail-display-home-'))
+    const workspaceRoot = path.join(fakeHome, 'Documents', 'Forge')
+    const project = {
+      id: 'project-detail-display',
+      name: 'Detail Display',
+      githubRepo: null,
+      localPath: path.join(workspaceRoot, 'projects', 'detail-display'),
+      githubTokenEnvVar: null,
+      pmProviderConfigId: null,
+      mcpConfig: {
+        profile: 'default',
+        requiredMcps: ['filesystem', 'github'],
+        overrides: {},
+      },
+      defaultBranch: 'main',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      archivedAt: null,
+    }
+    process.env.HOME = fakeHome
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    mockDbSelect.mockReturnValue(chain([project]))
+
+    try {
+      const { GET } = await import('@/app/api/projects/[id]/route')
+      const res = await GET(authRequest('/api/projects/project-detail-display') as never, {
+        params: Promise.resolve({ id: 'project-detail-display' }),
+      })
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.project).toMatchObject({
+        localPath: project.localPath,
+        displayLocalPath: '~/Documents/Forge/projects/detail-display',
+      })
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      if (previousHome === undefined) {
+        delete process.env.HOME
+      } else {
+        process.env.HOME = previousHome
+      }
+      await fs.rm(fakeHome, { recursive: true, force: true })
+    }
+  })
+
   it('returns 404 when the project does not exist', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect.mockReturnValue(chain([]))  // empty result = not found
@@ -1609,7 +1981,7 @@ describe('POST /api/providers/discover-local — auth guard', () => {
     expect(res.status).toBe(401)
   })
 
-  it('adds LM Studio models discovered from the local OpenAI-compatible endpoint', async () => {
+  it('adds LM Studio models discovered from the local native endpoint', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect.mockReturnValue(chain([]))
     mockDbInsert.mockReturnValue(chain(undefined))
@@ -1618,8 +1990,13 @@ describe('POST /api/providers/discover-local — auth guard', () => {
       if (url === 'http://localhost:11434/api/tags') {
         return new Response(JSON.stringify({ models: [] }), { status: 200 })
       }
-      if (url === 'http://localhost:1234/v1/models') {
-        return new Response(JSON.stringify({ data: [{ id: 'gemma-local' }] }), { status: 200 })
+      if (url === 'http://localhost:1234/api/v1/models') {
+        return new Response(JSON.stringify({
+          models: [
+            { type: 'llm', key: 'gemma-local' },
+            { type: 'embedding', key: 'nomic-embed' },
+          ],
+        }), { status: 200 })
       }
       return new Response('{}', { status: 404 })
     })
@@ -1731,6 +2108,83 @@ describe('POST /api/providers/list-models — endpoint boundary', () => {
       const body = await res.json()
       expect(body.models).toEqual(['anthropic/claude-4-opus'])
       expect(fetchMock).toHaveBeenCalledOnce()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('lists LM Studio models from the native /api/v1/models endpoint', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe('http://localhost:1234/api/v1/models')
+      expect(init?.headers).toEqual({})
+      return new Response(JSON.stringify({
+        models: [
+          { type: 'llm', key: 'google/gemma-local' },
+          { type: 'embedding', key: 'nomic-embed' },
+        ],
+      }), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const { POST } = await import('@/app/api/providers/list-models/route')
+      const res = await POST(authRequest('/api/providers/list-models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          providerType: 'lmstudio',
+          baseUrl: 'http://localhost:1234',
+        }),
+      }) as never)
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.models).toEqual(['google/gemma-local'])
+      expect(fetchMock).toHaveBeenCalledOnce()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('falls back to LM Studio OpenAI-compatible model listing when native listing is unavailable', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === 'http://localhost:1234/api/v1/models') {
+        return new Response('{}', { status: 404 })
+      }
+      if (url === 'http://localhost:1234/v1/models') {
+        return new Response(JSON.stringify({ data: [{ id: 'fallback-local' }] }), { status: 200 })
+      }
+      return new Response('{}', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const { POST } = await import('@/app/api/providers/list-models/route')
+      const res = await POST(authRequest('/api/providers/list-models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          providerType: 'lmstudio',
+          baseUrl: 'http://localhost:1234',
+        }),
+      }) as never)
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.models).toEqual(['fallback-local'])
+      expect(fetchMock).toHaveBeenNthCalledWith(
+        1,
+        'http://localhost:1234/api/v1/models',
+        expect.any(Object),
+      )
+      expect(fetchMock).toHaveBeenNthCalledWith(
+        2,
+        'http://localhost:1234/v1/models',
+        expect.any(Object),
+      )
     } finally {
       vi.unstubAllGlobals()
     }

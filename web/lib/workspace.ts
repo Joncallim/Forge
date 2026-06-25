@@ -8,6 +8,7 @@ import { appSettings } from '@/db/schema'
 export const WORKSPACE_ROOT_SETTING_KEY = 'workspaceRoot'
 export const MCPS_ROOT_SETTING_KEY = 'mcpsRoot'
 export const DEFAULT_WORKSPACE_ROOT = '~/Documents/Forge'
+export const WORKSPACE_DISPLAY_ROOT_ENV_VAR = 'FORGE_WORKSPACE_DISPLAY_ROOT'
 
 export type WorkspaceSettings = {
   workspaceRoot: string
@@ -28,6 +29,46 @@ export type WorkspaceSettings = {
   source: 'env' | 'setting' | 'default'
   envLocked: boolean
 }
+
+export type WorkspaceDisplayPaths = {
+  workspaceRoot: string
+  configRoot: string
+  projectsRoot: string
+  mcpsRoot: string
+  templatesRoot: string
+  localMemoryRoot: string
+  checkpointsRoot: string
+  promptsRoot: string
+  agentPromptsRoot: string
+  workforcesRoot: string
+  runtimeRoot: string
+  logsRoot: string
+  backupsRoot: string
+  forgeEnvPath: string
+  globalSettingsPath: string
+}
+
+export type WorkspaceSettingsDto = WorkspaceSettings & {
+  displayPaths: WorkspaceDisplayPaths
+}
+
+const WORKSPACE_PATH_KEYS = [
+  'workspaceRoot',
+  'configRoot',
+  'projectsRoot',
+  'mcpsRoot',
+  'templatesRoot',
+  'localMemoryRoot',
+  'checkpointsRoot',
+  'promptsRoot',
+  'agentPromptsRoot',
+  'workforcesRoot',
+  'runtimeRoot',
+  'logsRoot',
+  'backupsRoot',
+  'forgeEnvPath',
+  'globalSettingsPath',
+] as const
 
 function homeDir(): string {
   return os.homedir() || '/'
@@ -56,6 +97,103 @@ export function collapseHomePath(resolvedPath: string): string {
     return `~/${relative.split(path.sep).join('/')}`
   }
   return absolute
+}
+
+function normalizeDisplayRoot(rawPath: string): string {
+  const normalized = rawPath.trim().replace(/\\/g, '/')
+  if (normalized === '/') return normalized
+  return normalized.replace(/\/+$/g, '') || normalized
+}
+
+function configuredWorkspaceDisplayRoot(): string | null {
+  const rawRoot = process.env[WORKSPACE_DISPLAY_ROOT_ENV_VAR]?.trim()
+  return rawRoot ? normalizeDisplayRoot(rawRoot) : null
+}
+
+function joinDisplayPath(displayRoot: string, relativePath: string): string {
+  if (!relativePath) return displayRoot
+  const normalizedRelative = relativePath.split(path.sep).join('/')
+  if (displayRoot === '/') return `/${normalizedRelative}`
+  return `${displayRoot}/${normalizedRelative}`
+}
+
+function relativeDisplayPath(displayRoot: string, rawPath: string): string | null {
+  const root = normalizeDisplayRoot(displayRoot)
+  const candidate = normalizeDisplayRoot(rawPath)
+  if (candidate === root) return ''
+  if (root === '/') {
+    return candidate.startsWith('/') ? candidate.slice(1) : null
+  }
+  return candidate.startsWith(`${root}/`) ? candidate.slice(root.length + 1) : null
+}
+
+function displayRelativeToWorkspace(workspaceRoot: string, candidatePath: string): string | null {
+  const workspace = path.resolve(/*turbopackIgnore: true*/ workspaceRoot)
+  const candidate = path.resolve(/*turbopackIgnore: true*/ candidatePath)
+  const relative = path.relative(workspace, candidate)
+  if (relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))) {
+    return relative
+  }
+  return null
+}
+
+export function displayPathForWorkspacePath(
+  settings: Pick<WorkspaceSettings, 'workspaceRoot'>,
+  resolvedPath: string,
+): string {
+  const displayRoot = configuredWorkspaceDisplayRoot()
+  if (displayRoot) {
+    const relative = displayRelativeToWorkspace(settings.workspaceRoot, resolvedPath)
+    if (relative !== null) return joinDisplayPath(displayRoot, relative)
+  }
+  return collapseHomePath(resolvedPath)
+}
+
+export function getWorkspaceDisplayPaths(settings: WorkspaceSettings): WorkspaceDisplayPaths {
+  return WORKSPACE_PATH_KEYS.reduce((displayPaths, key) => {
+    displayPaths[key] = displayPathForWorkspacePath(settings, settings[key])
+    return displayPaths
+  }, {} as WorkspaceDisplayPaths)
+}
+
+export function serializeWorkspaceSettings(settings: WorkspaceSettings): WorkspaceSettingsDto {
+  return {
+    ...settings,
+    displayPaths: getWorkspaceDisplayPaths(settings),
+  }
+}
+
+function mapDisplayPathToWorkspacePath(
+  rawPath: string,
+  workspace: Pick<WorkspaceSettings, 'workspaceRoot'>,
+): string {
+  const trimmed = rawPath.trim()
+  const displayRoots = [
+    configuredWorkspaceDisplayRoot(),
+    collapseHomePath(workspace.workspaceRoot),
+  ].filter((root): root is string => Boolean(root))
+
+  for (const displayRoot of displayRoots) {
+    const relative = relativeDisplayPath(displayRoot, trimmed)
+    if (relative === null) continue
+    return relative
+      ? path.join(/*turbopackIgnore: true*/ workspace.workspaceRoot, ...relative.split('/'))
+      : workspace.workspaceRoot
+  }
+
+  return trimmed
+}
+
+export function resolveWorkspaceInputPath(
+  rawPath: string,
+  workspace: Pick<WorkspaceSettings, 'workspaceRoot'>,
+  basePath: string,
+): string {
+  const mappedPath = mapDisplayPathToWorkspacePath(rawPath, workspace)
+  const expanded = expandHomePath(mappedPath)
+  return path.isAbsolute(expanded)
+    ? path.resolve(/*turbopackIgnore: true*/ expanded)
+    : path.resolve(/*turbopackIgnore: true*/ basePath, expanded)
 }
 
 function defaultMcpsRootForWorkspace(workspaceRoot: string): string {

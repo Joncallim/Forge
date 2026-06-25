@@ -14,8 +14,10 @@ import { resolveGitHubToken, validateGitHubTokenEnvVar } from '@/lib/github'
 import { getCachedProjectMcpSummaries } from '@/lib/mcps/manager'
 import {
   collapseHomePath,
+  displayPathForWorkspacePath,
   getWorkspaceSettings,
   isWithinPath,
+  resolveWorkspaceInputPath,
   type WorkspaceSettings,
 } from '@/lib/workspace'
 
@@ -162,6 +164,18 @@ async function writeProjectConfig(project: {
   await fs.writeFile(configPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 })
 }
 
+function projectResponse<T extends { localPath: string | null }>(
+  project: T,
+  workspace: WorkspaceSettings,
+): T & { displayLocalPath: string | null } {
+  return {
+    ...project,
+    displayLocalPath: project.localPath
+      ? displayPathForWorkspacePath(workspace, project.localPath)
+      : null,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/projects
 // ---------------------------------------------------------------------------
@@ -180,8 +194,9 @@ export async function GET(request: NextRequest) {
       .orderBy(desc(projects.createdAt))
 
     const summaries = await getCachedProjectMcpSummaries(rows.map((project) => project.id))
+    const workspace = await getWorkspaceSettings({ ensure: false })
     const projectsWithMcp = rows.map((project) => ({
-      ...project,
+      ...projectResponse(project, workspace),
       mcpSummary: summaries.get(project.id) ?? null,
     }))
 
@@ -255,9 +270,7 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: 'Invalid local path' }, { status: 400 })
       }
 
-      const resolvedLocalPath = path.isAbsolute(data.localPath)
-        ? path.resolve(/*turbopackIgnore: true*/ data.localPath)
-        : path.resolve(/*turbopackIgnore: true*/ workspace.projectsRoot, data.localPath)
+      const resolvedLocalPath = resolveWorkspaceInputPath(data.localPath, workspace, workspace.projectsRoot)
       if (!isWithinPath(workspace.workspaceRoot, resolvedLocalPath)) {
         return NextResponse.json(
           { error: 'localPath must be inside the active workspace root' },
@@ -308,7 +321,7 @@ export async function POST(request: NextRequest) {
       await writeProjectConfig(project)
 
       console.info('[POST /api/projects] Cloned project', { id: project.id, name: project.name })
-      return NextResponse.json({ project }, { status: 201 })
+      return NextResponse.json({ project: projectResponse(project, workspace) }, { status: 201 })
     }
 
     const localPathInput =
@@ -318,9 +331,7 @@ export async function POST(request: NextRequest) {
     }
     const resolvedLocalPath =
       localPathInput !== null
-        ? path.isAbsolute(localPathInput)
-          ? path.resolve(/*turbopackIgnore: true*/ localPathInput)
-          : path.resolve(/*turbopackIgnore: true*/ workspace.projectsRoot, localPathInput)
+        ? resolveWorkspaceInputPath(localPathInput, workspace, workspace.projectsRoot)
         : null
 
     if (resolvedLocalPath) {
@@ -356,7 +367,7 @@ export async function POST(request: NextRequest) {
     }
 
     console.info('[POST /api/projects] Created project', { id: project.id, name: project.name })
-    return NextResponse.json({ project }, { status: 201 })
+    return NextResponse.json({ project: projectResponse(project, workspace) }, { status: 201 })
   } catch (err) {
     console.error('[POST /api/projects] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
