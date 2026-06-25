@@ -5,10 +5,13 @@ import { providerConfigs } from '@/db/schema'
 import { and, eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import {
-  normalizeLmStudioNativeApiBaseUrl,
   normalizeLmStudioRuntimeBaseUrl,
   PROVIDER_CATALOG,
 } from '@/lib/providers/catalog'
+import {
+  extractOpenAiCompatibleModelIds,
+  listLmStudioModelIds,
+} from '@/lib/providers/model-listing'
 
 // ---------------------------------------------------------------------------
 // POST /api/providers/discover-local
@@ -23,14 +26,28 @@ const OLLAMA_BASE_URL = PROVIDER_CATALOG.ollama.defaultBaseUrl ?? 'http://localh
 const LMSTUDIO_RUNTIME_BASE_URL =
   normalizeLmStudioRuntimeBaseUrl(PROVIDER_CATALOG.lmstudio.defaultBaseUrl ?? 'http://localhost:1234') ??
   'http://localhost:1234/v1'
-const LMSTUDIO_NATIVE_BASE_URL =
-  normalizeLmStudioNativeApiBaseUrl(LMSTUDIO_RUNTIME_BASE_URL) ?? 'http://localhost:1234/api/v1'
 const PROBE_TIMEOUT_MS = 1500
 
 type DiscoveredModel = {
   providerType: 'ollama' | 'lmstudio'
   modelId: string
   baseUrl: string
+}
+
+type DiscoveryChange = {
+  providerType: string
+  modelId: string
+}
+
+type DiscoverySkip = DiscoveryChange & {
+  reason: 'provider_disabled' | 'base_url_conflict' | 'nonlocal_existing_provider'
+}
+
+function normalizeComparableBaseUrl(providerType: DiscoveredModel['providerType'], baseUrl: string | null): string | null {
+  const trimmed = baseUrl?.trim()
+  if (!trimmed) return null
+  if (providerType === 'lmstudio') return normalizeLmStudioRuntimeBaseUrl(trimmed) ?? null
+  return trimmed.replace(/\/+$/g, '')
 }
 
 async function fetchJson(url: string): Promise<unknown | null> {
@@ -56,40 +73,21 @@ async function discoverOllama(): Promise<DiscoveredModel[]> {
     .map((modelId) => ({ providerType: 'ollama' as const, modelId, baseUrl: OLLAMA_BASE_URL }))
 }
 
-function extractLmStudioNativeModels(data: unknown | null): string[] | null {
-  const models = (data as { models?: unknown[] } | null)?.models
-  if (!Array.isArray(models)) return null
-
-  return models.flatMap((model) => {
-    const item = model as {
-      key?: unknown
-      type?: unknown
-      loaded_instances?: { id?: unknown }[]
-    }
-    if (item.type === 'embedding') return []
-
-    return [
-      item.key,
-      ...(Array.isArray(item.loaded_instances)
-        ? item.loaded_instances.map((instance) => instance.id)
-        : []),
-    ].filter((id): id is string => typeof id === 'string' && id.length > 0)
-  })
-}
-
 function extractOpenAiCompatibleModels(data: unknown | null): string[] {
-  const models = (data as { data?: { id?: string }[] } | null)?.data ?? []
-  return models
-    .map((m) => m.id)
-    .filter((id): id is string => typeof id === 'string' && id.length > 0)
+  return extractOpenAiCompatibleModelIds(data)
 }
 
 async function discoverLmStudio(): Promise<DiscoveredModel[]> {
-  const nativeData = await fetchJson(`${LMSTUDIO_NATIVE_BASE_URL}/models`)
-  const nativeModels = extractLmStudioNativeModels(nativeData)
-  const models = nativeModels ?? extractOpenAiCompatibleModels(
-    await fetchJson(`${LMSTUDIO_RUNTIME_BASE_URL}/models`),
-  )
+  let models: string[]
+  try {
+    const listing = await listLmStudioModelIds({
+      baseUrl: LMSTUDIO_RUNTIME_BASE_URL,
+      timeoutMs: PROBE_TIMEOUT_MS,
+    })
+    models = listing.models
+  } catch {
+    models = extractOpenAiCompatibleModels(await fetchJson(`${LMSTUDIO_RUNTIME_BASE_URL}/models`))
+  }
 
   return models
     .map((modelId) => ({ providerType: 'lmstudio' as const, modelId, baseUrl: LMSTUDIO_RUNTIME_BASE_URL }))
@@ -105,11 +103,18 @@ export async function POST(request: NextRequest) {
     const [ollama, lmstudio] = await Promise.all([discoverOllama(), discoverLmStudio()])
     const discovered = [...ollama, ...lmstudio]
 
-    const added: { providerType: string; modelId: string }[] = []
+    const added: DiscoveryChange[] = []
+    const updated: DiscoveryChange[] = []
+    const skipped: DiscoverySkip[] = []
     for (const model of discovered) {
-      // Skip if a provider of the same type already serves this exact model id.
-      const existing = await db
-        .select({ id: providerConfigs.id })
+      const [existing] = await db
+        .select({
+          id: providerConfigs.id,
+          displayName: providerConfigs.displayName,
+          baseUrl: providerConfigs.baseUrl,
+          isLocal: providerConfigs.isLocal,
+          isActive: providerConfigs.isActive,
+        })
         .from(providerConfigs)
         .where(
           and(
@@ -119,7 +124,48 @@ export async function POST(request: NextRequest) {
         )
         .limit(1)
 
-      if (existing.length > 0) continue
+      if (existing) {
+        if (!existing.isActive) {
+          skipped.push({
+            providerType: model.providerType,
+            modelId: model.modelId,
+            reason: 'provider_disabled',
+          })
+          continue
+        }
+        if (!existing.isLocal) {
+          skipped.push({
+            providerType: model.providerType,
+            modelId: model.modelId,
+            reason: 'nonlocal_existing_provider',
+          })
+          continue
+        }
+
+        const existingBaseUrl = normalizeComparableBaseUrl(model.providerType, existing.baseUrl)
+        const discoveredBaseUrl = normalizeComparableBaseUrl(model.providerType, model.baseUrl)
+        if (existingBaseUrl !== null && existingBaseUrl !== discoveredBaseUrl) {
+          skipped.push({
+            providerType: model.providerType,
+            modelId: model.modelId,
+            reason: 'base_url_conflict',
+          })
+          continue
+        }
+
+        if (existing.baseUrl !== model.baseUrl || !existing.isLocal) {
+          await db
+            .update(providerConfigs)
+            .set({
+              baseUrl: model.baseUrl,
+              isLocal: true,
+              updatedAt: new Date(),
+            })
+            .where(eq(providerConfigs.id, existing.id))
+          updated.push({ providerType: model.providerType, modelId: model.modelId })
+        }
+        continue
+      }
 
       await db.insert(providerConfigs).values({
         displayName: `${model.providerType === 'ollama' ? 'Ollama' : 'LM Studio'}: ${model.modelId}`,
@@ -134,6 +180,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       found: discovered.length,
       added,
+      updated,
+      skipped,
       ollamaReachable: ollama.length > 0,
       lmstudioReachable: lmstudio.length > 0,
     })

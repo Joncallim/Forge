@@ -5,7 +5,8 @@ import { providerConfigs, providerHealthChecks, type ProviderConfig } from '@/db
 import { getModel } from './registry'
 import { providerApiKeyEnvVarError, safeProviderApiKeyEnvVar } from './credentials'
 import { decryptSecret } from '@/lib/crypto'
-import { normalizeLmStudioNativeApiBaseUrl, PROVIDER_CATALOG } from './catalog'
+import { PROVIDER_CATALOG } from './catalog'
+import { listLmStudioModelIds } from './model-listing'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -27,55 +28,26 @@ function truncateProviderError(err: unknown): string {
   return raw.slice(0, 200)
 }
 
-function optionalAuthorizationHeaders(config: ProviderConfig): Record<string, string> {
-  if (!config.apiKeyCiphertext) return {}
-  return { Authorization: `Bearer ${decryptSecret(config.apiKeyCiphertext)}` }
-}
-
 async function checkLmStudioHealth(
   config: ProviderConfig,
   envVarPresent: boolean,
 ): Promise<ProviderHealthResult> {
-  const nativeBaseUrl = normalizeLmStudioNativeApiBaseUrl(
-    config.baseUrl ?? PROVIDER_CATALOG.lmstudio.defaultBaseUrl ?? null,
-  )
-  if (!nativeBaseUrl) {
-    return {
-      reachable: false,
-      envVarPresent,
-      latencyMs: null,
-      error: 'A base URL is required to check LM Studio health',
-    }
-  }
-
-  let timer: ReturnType<typeof setTimeout> | undefined
-  let timedOut = false
-  const controller = new AbortController()
   const start = Date.now()
 
   try {
-    timer = setTimeout(() => {
-      timedOut = true
-      controller.abort()
-    }, HEALTH_TIMEOUT_MS)
-
-    const res = await fetch(`${nativeBaseUrl}/chat`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...optionalAuthorizationHeaders(config),
-      },
-      body: JSON.stringify({
-        model: config.modelId,
-        input: 'Reply with the single word: ok',
-        max_output_tokens: 1,
-        store: false,
-      }),
-      signal: controller.signal,
+    const listing = await listLmStudioModelIds({
+      baseUrl: config.baseUrl ?? PROVIDER_CATALOG.lmstudio.defaultBaseUrl ?? null,
+      apiKey: config.apiKeyCiphertext ? decryptSecret(config.apiKeyCiphertext) : '',
+      timeoutMs: HEALTH_TIMEOUT_MS,
     })
 
-    if (!res.ok) {
-      throw new Error(`LM Studio returned ${res.status}`)
+    if (!listing.models.includes(config.modelId)) {
+      return {
+        reachable: false,
+        envVarPresent,
+        latencyMs: Date.now() - start,
+        error: `LM Studio is reachable, but model "${config.modelId}" was not returned by the ${listing.source} model list.`,
+      }
     }
 
     return {
@@ -89,10 +61,8 @@ async function checkLmStudioHealth(
       reachable: false,
       envVarPresent,
       latencyMs: null,
-      error: timedOut ? `Health check timed out after ${HEALTH_TIMEOUT_MS}ms` : truncateProviderError(err),
+      error: truncateProviderError(err),
     }
-  } finally {
-    if (timer) clearTimeout(timer)
   }
 }
 

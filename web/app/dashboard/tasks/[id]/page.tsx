@@ -222,6 +222,42 @@ function previewList(items: string[], limit = 4): string {
   return remaining > 0 ? `${visible.join(', ')} +${remaining} more` : visible.join(', ')
 }
 
+function jsonArrayField(record: WorkforceRecord, keys: string[]): WorkforceRecord[] {
+  for (const key of keys) {
+    const value = record[key]
+    if (!Array.isArray(value)) continue
+    const records = value.filter((item): item is WorkforceRecord => isRecord(item))
+    if (records.length > 0) return records
+  }
+  return []
+}
+
+function workPackageBrief(pkg: WorkPackage): string {
+  const owner = stringField(pkg, ['assignedRole', 'agentType', 'agent', 'role', 'assignee', 'harnessSlug'])
+  const harnessName = stringField(pkg, ['harnessDisplayName', 'harnessRole'])
+  const harnessDescription = stringField(pkg, ['harnessDescription'])
+  const title = stringField(pkg, ['title', 'name', 'summary']) || 'Work package'
+  const summary = stringField(pkg, ['summary', 'description', 'objective'])
+  const steps = stringArrayField(pkg, ['steps'])
+  const criteria = stringArrayField(pkg, ['acceptanceCriteria', 'criteria'])
+  const prompt = stringField(pkg, ['promptOverlay'])
+  const capabilities = isRecord(pkg.requiredCapabilities) ? pkg.requiredCapabilities : null
+
+  return [
+    owner ? `Role: ${owner}` : null,
+    harnessName ? `Harness: ${harnessName}` : null,
+    harnessDescription ? `Harness description: ${harnessDescription}` : null,
+    `Title: ${title}`,
+    summary ? `Summary: ${summary}` : null,
+    `Prompt overlay: ${prompt || 'No additional prompt overlay persisted for this package.'}`,
+    steps.length > 0 ? `Steps:\n${steps.map((step, index) => `${index + 1}. ${step}`).join('\n')}` : null,
+    criteria.length > 0
+      ? `Acceptance criteria:\n${criteria.map((criterion, index) => `${index + 1}. ${criterion}`).join('\n')}`
+      : null,
+    capabilities ? `Required capabilities:\n${JSON.stringify(capabilities, null, 2)}` : null,
+  ].filter((part): part is string => part !== null).join('\n\n')
+}
+
 // ---------------------------------------------------------------------------
 // AgentRunRow — expandable row showing a single agent run and its log output
 // ---------------------------------------------------------------------------
@@ -682,13 +718,18 @@ function WorkforcePanel({
                   const status = stringField(pkg, ['status', 'state'])
                   const summary = stringField(pkg, ['summary', 'description', 'objective'])
                   const criteria = stringArrayField(pkg, ['acceptanceCriteria', 'criteria', 'steps'])
+                  const steps = stringArrayField(pkg, ['steps'])
                   const files = stringArrayField(pkg, ['files', 'paths', 'targetFiles'])
+                  const prompt = stringField(pkg, ['promptOverlay'])
+                  const harnessName = stringField(pkg, ['harnessDisplayName', 'harnessRole'])
+                  const mcpRequirements = jsonArrayField(pkg, ['mcpRequirements'])
 
                   return (
                     <li key={recordKey(pkg, 'work-package', index)} className="border-t border-border pt-3 first:border-t-0 first:pt-0">
                       <div className="flex flex-wrap items-center gap-2">
                         <p className="text-sm font-medium text-foreground">{title}</p>
                         {owner !== '' && <Badge variant="outline">{owner}</Badge>}
+                        {harnessName !== '' && harnessName !== owner && <Badge variant="secondary">{harnessName}</Badge>}
                         {status !== '' && <Badge variant={statusBadgeVariant(status)}>{statusLabel(status)}</Badge>}
                       </div>
                       {summary !== '' && <p className="mt-1 text-sm text-muted-foreground">{summary}</p>}
@@ -698,6 +739,47 @@ function WorkforcePanel({
                       {files.length > 0 && (
                         <p className="mt-1 break-words font-mono text-xs text-muted-foreground">{previewList(files)}</p>
                       )}
+                      <details className="mt-2 rounded-md border border-border bg-muted/20 px-3 py-2">
+                        <summary className="cursor-pointer text-xs font-medium text-foreground">
+                          Assignment details
+                        </summary>
+                        <div className="mt-2 grid gap-3 text-xs">
+                          {steps.length > 0 && (
+                            <div>
+                              <p className="font-medium text-muted-foreground">Tasks</p>
+                              <ol className="mt-1 list-decimal space-y-1 pl-4 text-foreground">
+                                {steps.map((step, stepIndex) => <li key={stepIndex}>{step}</li>)}
+                              </ol>
+                            </div>
+                          )}
+                          <div>
+                            <p className="font-medium text-muted-foreground">Prompt overlay</p>
+                            {prompt !== '' ? (
+                              <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-background p-2 font-mono text-[11px] text-foreground ring-1 ring-border">
+                                {prompt}
+                              </pre>
+                            ) : (
+                              <p className="mt-1 text-muted-foreground">
+                                No additional prompt overlay persisted for this package.
+                              </p>
+                            )}
+                          </div>
+                          <div>
+                            <p className="font-medium text-muted-foreground">Assignment brief</p>
+                            <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap rounded-md bg-background p-2 font-mono text-[11px] text-foreground ring-1 ring-border">
+                              {workPackageBrief(pkg)}
+                            </pre>
+                          </div>
+                          {mcpRequirements.length > 0 && (
+                            <div>
+                              <p className="font-medium text-muted-foreground">MCP requirements</p>
+                              <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-background p-2 font-mono text-[11px] text-foreground ring-1 ring-border">
+                                {JSON.stringify(mcpRequirements, null, 2)}
+                              </pre>
+                            </div>
+                          )}
+                        </div>
+                      </details>
                     </li>
                   )
                 })}

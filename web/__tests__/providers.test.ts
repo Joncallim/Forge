@@ -442,18 +442,16 @@ describe('checkProviderHealth', () => {
     })
   })
 
-  it('checks LM Studio health through native /api/v1/chat', async () => {
+  it('checks LM Studio health through model listing without starting generation', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      expect(String(input)).toBe('http://localhost:1234/api/v1/chat')
-      expect(init?.method).toBe('POST')
-      expect(init?.headers).toMatchObject({ 'Content-Type': 'application/json' })
-      expect(JSON.parse(String(init?.body))).toMatchObject({
-        model: 'google/gemma-local',
-        input: 'Reply with the single word: ok',
-        max_output_tokens: 1,
-        store: false,
-      })
-      return new Response(JSON.stringify({ output: [{ type: 'message', content: 'ok' }] }), { status: 200 })
+      expect(String(input)).toBe('http://localhost:1234/api/v1/models')
+      expect(init?.method).toBeUndefined()
+      return new Response(JSON.stringify({
+        models: [
+          { type: 'llm', key: 'google/gemma-local' },
+          { type: 'embedding', key: 'nomic-embed' },
+        ],
+      }), { status: 200 })
     })
     vi.stubGlobal('fetch', fetchMock)
 

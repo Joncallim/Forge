@@ -1,4 +1,5 @@
 import { stripKnownFences } from '@/lib/plan-fences'
+import { normalizeMarkdownDisplayText } from '@/lib/display-text'
 
 export type DiffLine = { type: 'added' | 'removed' | 'unchanged'; text: string }
 
@@ -49,8 +50,8 @@ export function computeLineDiff(oldLines: string[], newLines: string[]): DiffLin
 }
 
 export function PlanDiffView({ oldContent, newContent }: { oldContent: string; newContent: string }) {
-  const oldLines = stripKnownFences(oldContent).split('\n')
-  const newLines = stripKnownFences(newContent).split('\n')
+  const oldLines = normalizeMarkdownDisplayText(stripKnownFences(oldContent)).split('\n')
+  const newLines = normalizeMarkdownDisplayText(stripKnownFences(newContent)).split('\n')
   const diffLines = computeLineDiff(oldLines, newLines)
 
   return (

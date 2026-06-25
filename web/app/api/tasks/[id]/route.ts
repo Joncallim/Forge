@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { db } from '@/db'
 import {
+  agentHarnesses,
   approvalGates,
   artifacts,
   agentRuns,
@@ -11,12 +12,22 @@ import {
   vcsChanges,
   workPackages,
 } from '@/db/schema'
-import { and, eq, asc, or } from 'drizzle-orm'
+import { and, eq, asc, inArray, or } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 
 // ---------------------------------------------------------------------------
 // GET /api/tasks/:id
 // ---------------------------------------------------------------------------
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function metadataString(metadata: unknown, key: string): string | null {
+  if (!isRecord(metadata)) return null
+  const value = metadata[key]
+  return typeof value === 'string' && value.trim().length > 0 ? value : null
+}
 
 export async function GET(
   request: NextRequest,
@@ -63,7 +74,6 @@ export async function GET(
     const runIds = runs.map((r) => r.id)
     let taskArtifacts: typeof artifacts.$inferSelect[] = []
     if (runIds.length > 0) {
-      const { inArray } = await import('drizzle-orm')
       taskArtifacts = await db
         .select()
         .from(artifacts)
@@ -88,6 +98,35 @@ export async function GET(
         .where(eq(vcsChanges.taskId, id))
         .orderBy(asc(vcsChanges.createdAt)),
     ])
+    const harnessIds = [
+      ...new Set(
+        taskWorkPackages
+          .map((pkg) => pkg.harnessId)
+          .filter((harnessId): harnessId is string => typeof harnessId === 'string' && harnessId.length > 0),
+      ),
+    ]
+    const taskHarnesses = harnessIds.length > 0
+      ? await db
+        .select({
+          id: agentHarnesses.id,
+          role: agentHarnesses.role,
+          displayName: agentHarnesses.displayName,
+          description: agentHarnesses.description,
+        })
+        .from(agentHarnesses)
+        .where(inArray(agentHarnesses.id, harnessIds))
+      : []
+    const harnessById = new Map(taskHarnesses.map((harness) => [harness.id, harness]))
+    const taskWorkPackagesWithPrompts = taskWorkPackages.map((pkg) => {
+      const harness = pkg.harnessId ? harnessById.get(pkg.harnessId) : undefined
+      return {
+        ...pkg,
+        harnessRole: harness?.role ?? null,
+        harnessDisplayName: harness?.displayName ?? null,
+        harnessDescription: harness?.description ?? null,
+        promptOverlay: metadataString(pkg.metadata, 'promptOverlay'),
+      }
+    })
 
     return NextResponse.json({
       task,
@@ -95,7 +134,7 @@ export async function GET(
       artifacts: taskArtifacts,
       attempts,
       questions,
-      workPackages: taskWorkPackages,
+      workPackages: taskWorkPackagesWithPrompts,
       approvalGates: taskApprovalGates,
       vcsChanges: taskVcsChanges,
     })

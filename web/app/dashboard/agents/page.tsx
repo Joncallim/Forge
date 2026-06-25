@@ -169,6 +169,10 @@ function groupByLayer(recs: RoleRecommendation[]): Map<RoleRecommendation['layer
   return map
 }
 
+function providerOptionLabel(provider: ProviderConfig): string {
+  return `${provider.displayName} (${provider.modelId})`
+}
+
 async function readJsonError(response: Response, fallback: string): Promise<Error> {
   const body = await response.json().catch(() => ({})) as { error?: string }
   return new Error(body.error ?? fallback)
@@ -222,6 +226,7 @@ function AgentEditor({
     acc.set(p.providerType, [...existing, p])
     return acc
   }, new Map())
+  const selectedProvider = providers.find((provider) => provider.id === draft.providerConfigId)
 
   function setDraftValue<K extends keyof AgentDraft>(key: K, value: AgentDraft[K]) {
     setDraft((current) => {
@@ -417,7 +422,13 @@ function AgentEditor({
               }}
             >
               <SelectTrigger id="agent-provider" className="w-full">
-                <SelectValue placeholder="None - use default" />
+                <SelectValue placeholder="None - use default">
+                  {isCustomProvider
+                    ? 'Custom'
+                    : selectedProvider
+                      ? providerOptionLabel(selectedProvider)
+                      : 'None - use default'}
+                </SelectValue>
               </SelectTrigger>
               <SelectContent>
                 <SelectGroup>
@@ -430,7 +441,7 @@ function AgentEditor({
                     <SelectLabel>{PROVIDER_TYPE_LABELS[type]}</SelectLabel>
                     {group.map((p) => (
                       <SelectItem key={p.id} value={p.id}>
-                        {p.displayName} ({p.modelId})
+                        {providerOptionLabel(p)}
                       </SelectItem>
                     ))}
                   </SelectGroup>
@@ -1098,18 +1109,29 @@ export default function AgentsPage() {
                       </Button>
                     </div>
 
-                    <div className="mt-4 flex flex-wrap gap-2">
+                    <div className="mt-4">
                       {workforce.members.length === 0 ? (
                         <span className="text-sm text-muted-foreground">No agents assigned</span>
                       ) : (
-                        workforce.members.map((member) => (
-                          <span
-                            key={member.id}
-                            className="rounded-full border border-border px-2.5 py-1 text-xs text-foreground"
-                          >
-                            {member.roleLabel || member.displayName || titleize(member.agentType)}
-                          </span>
-                        ))
+                        <ul className="grid gap-2" aria-label={`${workforce.displayName} assigned agents`}>
+                          {workforce.members.map((member) => {
+                            const roleName = member.roleLabel || member.displayName || titleize(member.agentType)
+                            return (
+                              <li key={member.id} className="rounded-md border border-border bg-muted/20 px-3 py-2">
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <span className="text-sm font-medium text-foreground">{roleName}</span>
+                                  <span className="font-mono text-xs text-muted-foreground">{member.agentType}</span>
+                                </div>
+                                {member.description && (
+                                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{member.description}</p>
+                                )}
+                                <p className="mt-2 text-xs text-muted-foreground">
+                                  Prompt is managed on the agent profile above.
+                                </p>
+                              </li>
+                            )
+                          })}
+                        </ul>
                       )}
                     </div>
                   </article>

@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { computeLineDiff } from '@/components/PlanDiffView'
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { computeLineDiff, PlanDiffView } from '@/components/PlanDiffView'
 
 describe('computeLineDiff', () => {
   it('marks everything unchanged for identical input', () => {
@@ -48,5 +50,16 @@ describe('computeLineDiff', () => {
       { type: 'removed', text: 'a' },
       { type: 'removed', text: 'b' },
     ])
+  })
+
+  it('renders normalized markdown arrow artifacts in plan diffs', () => {
+    const html = renderToStaticMarkup(createElement(PlanDiffView, {
+      oldContent: 'Frontend $\\rightarrow$ QA',
+      newContent: 'QA $\\rightarrow$ Reviewer',
+    }))
+
+    expect(html).toContain('Frontend → QA')
+    expect(html).toContain('QA → Reviewer')
+    expect(html).not.toContain('$\\rightarrow$')
   })
 })
