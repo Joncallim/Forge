@@ -33,6 +33,7 @@ export type ProjectMcpStatus = {
   displayName: string
   description: string
   installPath: string
+  displayInstallPath?: string
   installState: McpInstallState
   status: McpHealthStatus
   enabled: boolean
@@ -45,6 +46,7 @@ export type ProjectMcpOverview = {
   config: ProjectMcpConfig
   catalog: McpCatalogEntry[]
   mcpsRoot: string
+  displayMcpsRoot?: string
   statuses: ProjectMcpStatus[]
   summary: {
     label: string

@@ -25,6 +25,7 @@ const {
   mockCreateAnthropic,
   mockCreateOpenAI,
   mockCreateGoogleGenerativeAI,
+  mockGenerateText,
   mockAnthropicInstance,
   mockOpenAIInstance,
   mockOpenAIChat,
@@ -41,6 +42,7 @@ const {
     mockCreateAnthropic: vi.fn().mockReturnValue(mockAnthropicInstance),
     mockCreateOpenAI: vi.fn().mockReturnValue(mockOpenAIInstance),
     mockCreateGoogleGenerativeAI: vi.fn().mockReturnValue(mockGoogleInstance),
+    mockGenerateText: vi.fn().mockResolvedValue({ text: 'ok' }),
     mockAnthropicInstance,
     mockOpenAIInstance,
     mockOpenAIChat,
@@ -59,6 +61,7 @@ vi.mock('@/db', () => ({
 vi.mock('@ai-sdk/anthropic', () => ({ createAnthropic: mockCreateAnthropic }))
 vi.mock('@ai-sdk/openai', () => ({ createOpenAI: mockCreateOpenAI }))
 vi.mock('@ai-sdk/google', () => ({ createGoogleGenerativeAI: mockCreateGoogleGenerativeAI }))
+vi.mock('ai', () => ({ generateText: mockGenerateText }))
 
 // ---------------------------------------------------------------------------
 // Drizzle chain factory
@@ -193,6 +196,30 @@ describe('getProvider', () => {
 
     expect(mockCreateOpenAI).toHaveBeenCalledWith(
       expect.objectContaining({ apiKey: 'ollama', baseURL: 'http://localhost:11434/v1' }),
+    )
+  })
+
+  it('normalizes LM Studio host-only base URLs to the OpenAI-compatible /v1 runtime endpoint', async () => {
+    mockDbSelect.mockReturnValue(chain([
+      makeRow({ providerType: 'lmstudio', baseUrl: 'http://localhost:1234', apiKeyEnvVar: null }),
+    ]))
+
+    await getProvider('config-id')
+
+    expect(mockCreateOpenAI).toHaveBeenCalledWith(
+      expect.objectContaining({ apiKey: 'lm-studio', baseURL: 'http://localhost:1234/v1' }),
+    )
+  })
+
+  it('normalizes LM Studio native API base URLs back to the /v1 runtime endpoint', async () => {
+    mockDbSelect.mockReturnValue(chain([
+      makeRow({ providerType: 'lmstudio', baseUrl: 'http://localhost:1234/api/v1', apiKeyEnvVar: null }),
+    ]))
+
+    await getProvider('config-id')
+
+    expect(mockCreateOpenAI).toHaveBeenCalledWith(
+      expect.objectContaining({ apiKey: 'lm-studio', baseURL: 'http://localhost:1234/v1' }),
     )
   })
 
@@ -398,6 +425,10 @@ describe('ACP provider catalog', () => {
 })
 
 describe('checkProviderHealth', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
   it('reports ACP providers as configured but not executable', async () => {
     const result = await checkProviderHealth(
       makeRow({ providerType: 'acp', modelId: 'codex-cli', isLocal: true }),
@@ -409,6 +440,44 @@ describe('checkProviderHealth', () => {
       latencyMs: null,
       error: 'ACP provider execution is not implemented yet',
     })
+  })
+
+  it('checks LM Studio health through native /api/v1/chat', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe('http://localhost:1234/api/v1/chat')
+      expect(init?.method).toBe('POST')
+      expect(init?.headers).toMatchObject({ 'Content-Type': 'application/json' })
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        model: 'google/gemma-local',
+        input: 'Reply with the single word: ok',
+        max_output_tokens: 1,
+        store: false,
+      })
+      return new Response(JSON.stringify({ output: [{ type: 'message', content: 'ok' }] }), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const result = await checkProviderHealth(
+        makeRow({
+          providerType: 'lmstudio',
+          baseUrl: 'http://localhost:1234',
+          modelId: 'google/gemma-local',
+          isLocal: true,
+        }),
+      )
+
+      expect(result).toMatchObject({
+        reachable: true,
+        envVarPresent: true,
+        error: null,
+      })
+      expect(result.latencyMs).toEqual(expect.any(Number))
+      expect(fetchMock).toHaveBeenCalledOnce()
+      expect(mockGenerateText).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 })
 

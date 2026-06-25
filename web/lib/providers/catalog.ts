@@ -34,6 +34,36 @@ export interface ProviderCatalogEntry {
   helpText?: string
 }
 
+function normalizeBaseUrl(rawBaseUrl: string): string {
+  return rawBaseUrl.trim().replace(/\/+$/, '')
+}
+
+export function normalizeLmStudioRuntimeBaseUrl(
+  baseUrl: string | null | undefined,
+): string | undefined {
+  if (!baseUrl?.trim()) return undefined
+
+  const normalized = normalizeBaseUrl(baseUrl)
+  if (normalized.endsWith('/api/v1')) {
+    return `${normalized.slice(0, -'/api/v1'.length)}/v1`
+  }
+  if (normalized.endsWith('/v1')) return normalized
+  return `${normalized}/v1`
+}
+
+export function normalizeLmStudioNativeApiBaseUrl(
+  baseUrl: string | null | undefined,
+): string | undefined {
+  if (!baseUrl?.trim()) return undefined
+
+  const normalized = normalizeBaseUrl(baseUrl)
+  if (normalized.endsWith('/api/v1')) return normalized
+  if (normalized.endsWith('/v1')) {
+    return `${normalized.slice(0, -'/v1'.length)}/api/v1`
+  }
+  return `${normalized}/api/v1`
+}
+
 export const PROVIDER_CATALOG: Record<ProviderType, ProviderCatalogEntry> = {
   acp: {
     type: 'acp',

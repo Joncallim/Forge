@@ -9,7 +9,13 @@ import { eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { registerProjectPath, unregisterProjectPath } from '@/lib/project-registry'
 import { validateGitHubTokenEnvVar } from '@/lib/github'
-import { getWorkspaceSettings, isWithinPath, type WorkspaceSettings } from '@/lib/workspace'
+import {
+  displayPathForWorkspacePath,
+  getWorkspaceSettings,
+  isWithinPath,
+  resolveWorkspaceInputPath,
+  type WorkspaceSettings,
+} from '@/lib/workspace'
 
 // ---------------------------------------------------------------------------
 // Validation schema (all fields optional for PUT)
@@ -60,6 +66,18 @@ async function assertExistingLocalPathWithinWorkspace(
   throw new Error('localPath must be inside the active workspace root')
 }
 
+function projectResponse<T extends { localPath: string | null }>(
+  project: T,
+  workspace: WorkspaceSettings,
+): T & { displayLocalPath: string | null } {
+  return {
+    ...project,
+    displayLocalPath: project.localPath
+      ? displayPathForWorkspacePath(workspace, project.localPath)
+      : null,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/projects/:id
 // ---------------------------------------------------------------------------
@@ -86,7 +104,8 @@ export async function GET(
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
     }
 
-    return NextResponse.json({ project })
+    const workspace = await getWorkspaceSettings({ ensure: false })
+    return NextResponse.json({ project: projectResponse(project, workspace) })
   } catch (err) {
     console.error('[GET /api/projects/:id] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
@@ -148,9 +167,7 @@ export async function PUT(
         updateSet.localPath = null
       } else {
         const workspace = await getWorkspaceSettings()
-        const resolvedLocalPath = path.isAbsolute(rawLocalPath)
-          ? path.resolve(/*turbopackIgnore: true*/ rawLocalPath)
-          : path.resolve(/*turbopackIgnore: true*/ workspace.projectsRoot, rawLocalPath)
+        const resolvedLocalPath = resolveWorkspaceInputPath(rawLocalPath, workspace, workspace.projectsRoot)
         if (!isWithinPath(workspace.workspaceRoot, resolvedLocalPath)) {
           return NextResponse.json(
             { error: 'localPath must be inside the active workspace root' },
@@ -188,7 +205,8 @@ export async function PUT(
       if (existing.localPath) await unregisterProjectPath(existing.localPath)
       if (updated.localPath) await registerProjectPath(updated.localPath)
     }
-    return NextResponse.json({ project: updated })
+    const workspace = await getWorkspaceSettings({ ensure: false })
+    return NextResponse.json({ project: projectResponse(updated, workspace) })
   } catch (err) {
     console.error('[PUT /api/projects/:id] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

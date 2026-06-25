@@ -7,7 +7,7 @@ import { providerConfigs } from '@/db/schema'
 import type { ProviderConfig } from '@/db/schema'
 import { eq, asc } from 'drizzle-orm'
 import { requiresProviderBaseUrl } from './types'
-import { PROVIDER_CATALOG } from './catalog'
+import { normalizeLmStudioRuntimeBaseUrl, PROVIDER_CATALOG } from './catalog'
 import { decryptSecret } from '@/lib/crypto'
 import { providerApiKeyEnvVarError, safeProviderApiKeyEnvVar } from './credentials'
 import type { ProviderType } from './types'
@@ -138,7 +138,9 @@ function buildProvider(config: ProviderConfig): ProviderFactory {
       // OpenAI-compatible local server (LM Studio). No real key required.
       return createOpenAI({
         apiKey: apiKey ?? 'lm-studio',
-        baseURL: config.baseUrl ?? PROVIDER_CATALOG.lmstudio.defaultBaseUrl,
+        baseURL: normalizeLmStudioRuntimeBaseUrl(
+          config.baseUrl ?? PROVIDER_CATALOG.lmstudio.defaultBaseUrl ?? null,
+        ),
       })
 
     default:
