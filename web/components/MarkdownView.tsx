@@ -228,7 +228,7 @@ export function MarkdownView({ content, compact = false }: MarkdownViewProps) {
 
   return (
     <div className={`${compact ? 'space-y-2' : 'space-y-3'} text-sm text-foreground`}>
-      {blocks.length > 0 ? blocks : <p className="text-muted-foreground">Waiting for output...</p>}
+      {blocks.length > 0 ? blocks : <p className="text-muted-foreground">Waiting for output…</p>}
     </div>
   )
 }

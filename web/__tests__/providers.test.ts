@@ -477,6 +477,101 @@ describe('checkProviderHealth', () => {
       vi.unstubAllGlobals()
     }
   })
+
+  it('checks Ollama health through the lightweight model list endpoint', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe('http://localhost:11434/api/tags')
+      expect(init?.method).toBe('GET')
+      return new Response(
+        JSON.stringify({
+          models: [
+            { name: 'devstral-small:24b' },
+            { model: 'qwen2.5-coder:7b' },
+          ],
+        }),
+        { status: 200 },
+      )
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const result = await checkProviderHealth(
+        makeRow({
+          providerType: 'ollama',
+          baseUrl: 'http://localhost:11434/v1',
+          modelId: 'devstral-small:24b',
+          isLocal: true,
+        }),
+      )
+
+      expect(result).toMatchObject({
+        reachable: true,
+        envVarPresent: true,
+        error: null,
+      })
+      expect(result.latencyMs).toEqual(expect.any(Number))
+      expect(fetchMock).toHaveBeenCalledOnce()
+      expect(mockGenerateText).not.toHaveBeenCalled()
+      expect(mockCreateOpenAI).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('reports reachable Ollama servers that are missing the configured model', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify({ models: [{ name: 'llama3.2:3b' }] }), { status: 200 })),
+    )
+
+    try {
+      const result = await checkProviderHealth(
+        makeRow({
+          providerType: 'ollama',
+          baseUrl: 'http://localhost:11434',
+          modelId: 'devstral-small:24b',
+          isLocal: true,
+        }),
+      )
+
+      expect(result).toMatchObject({
+        reachable: false,
+        envVarPresent: true,
+        error: 'Ollama is reachable, but model "devstral-small:24b" is not installed',
+      })
+      expect(result.latencyMs).toEqual(expect.any(Number))
+      expect(mockGenerateText).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('accepts Ollama latest tags for tagless model ids', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify({ models: [{ name: 'llama3.2:latest' }] }), { status: 200 })),
+    )
+
+    try {
+      const result = await checkProviderHealth(
+        makeRow({
+          providerType: 'ollama',
+          baseUrl: 'http://localhost:11434',
+          modelId: 'llama3.2',
+          isLocal: true,
+        }),
+      )
+
+      expect(result).toMatchObject({
+        reachable: true,
+        envVarPresent: true,
+        error: null,
+      })
+      expect(mockGenerateText).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
 })
 
 describe('provider model construction call sites', () => {

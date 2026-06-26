@@ -100,6 +100,12 @@ function statusBadgeVariant(status: string): StatusVariant {
 }
 
 function statusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    awaiting_answers: 'Needs answers',
+    awaiting_approval: 'Needs approval',
+    dead_lettered: 'Stopped after retries',
+  }
+  if (labels[status]) return labels[status]
   return status.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
 }
 
@@ -232,7 +238,7 @@ export default function ProjectDetailPage() {
       } else {
         const body = await mcpRes.json().catch(() => ({}))
         applyMcpOverview(null)
-        setMcpActionError(body.error ?? 'Failed to load MCP status')
+        setMcpActionError(body.error ?? 'Failed to load MCP tool status')
       }
     } catch (err) {
       setFetchError(err instanceof Error ? err.message : 'An unexpected error occurred')
@@ -285,7 +291,7 @@ export default function ProjectDetailPage() {
       const res = await fetch(`/api/projects/${projectId}/mcps`)
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
-        throw new Error(body.error ?? 'Failed to refresh MCP status')
+        throw new Error(body.error ?? 'Failed to refresh MCP tool status')
       }
       const data = await res.json()
       applyMcpOverview(data.overview ?? null)
@@ -328,7 +334,7 @@ export default function ProjectDetailPage() {
       })
       if (!configRes.ok) {
         const body = await configRes.json().catch(() => ({}))
-        throw new Error(body.error ?? 'Failed to save MCP selection')
+        throw new Error(body.error ?? 'Failed to save MCP tool selection')
       }
 
       const configData = await configRes.json()
@@ -349,7 +355,7 @@ export default function ProjectDetailPage() {
       })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
-        throw new Error(body.error ?? 'Failed to install selected MCPs')
+        throw new Error(body.error ?? 'Failed to install selected MCP tools')
       }
       const data = await res.json()
       applyMcpOverview(data.overview ?? null)
@@ -529,7 +535,7 @@ export default function ProjectDetailPage() {
           />
           <DialogContent className="sm:max-w-lg" aria-labelledby="new-task-title">
             <DialogHeader>
-              <DialogTitle id="new-task-title">New Task</DialogTitle>
+          <DialogTitle id="new-task-title">New task</DialogTitle>
             </DialogHeader>
 
             <form onSubmit={handleCreateTask} className="flex flex-col gap-4">
@@ -571,7 +577,7 @@ export default function ProjectDetailPage() {
 
               <DialogFooter>
                 <Button type="submit" disabled={submitting} aria-busy={submitting}>
-                  {submitting ? 'Creating…' : 'Create Task'}
+                  {submitting ? 'Creating…' : 'Create task'}
                 </Button>
               </DialogFooter>
             </form>
@@ -583,13 +589,13 @@ export default function ProjectDetailPage() {
       <Dialog open={projectPathDialogOpen} onOpenChange={setProjectPathDialogOpen}>
         <DialogContent className="sm:max-w-lg" aria-labelledby="project-path-title">
           <DialogHeader>
-            <DialogTitle id="project-path-title">Project Path</DialogTitle>
+            <DialogTitle id="project-path-title">Project path</DialogTitle>
           </DialogHeader>
 
           <form onSubmit={saveProjectPath} className="flex flex-col gap-4">
             <div className="flex flex-col gap-1.5">
               <label htmlFor="project-local-path" className="text-sm font-medium text-foreground">
-                Local path
+                Local folder
               </label>
               <input
                 id="project-local-path"
@@ -601,7 +607,7 @@ export default function ProjectDetailPage() {
                 className="rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
               />
               <p className="text-xs text-muted-foreground">
-                Filesystem MCP health uses this folder when checking project access.
+                Forge checks project file access from this folder.
               </p>
             </div>
 
@@ -613,7 +619,7 @@ export default function ProjectDetailPage() {
 
             <DialogFooter>
               <Button type="submit" disabled={savingProjectPath} aria-busy={savingProjectPath}>
-                {savingProjectPath ? 'Saving…' : 'Save Path'}
+                {savingProjectPath ? 'Saving…' : 'Save path'}
               </Button>
             </DialogFooter>
           </form>
@@ -624,7 +630,7 @@ export default function ProjectDetailPage() {
         <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 id="project-mcps-heading" className="text-sm font-medium text-foreground">
-              MCPs
+              MCP tools
             </h2>
             {mcpOverview && (
               <p className="mt-1 font-mono text-xs text-muted-foreground break-all">
@@ -644,10 +650,10 @@ export default function ProjectDetailPage() {
               onClick={saveAndInstallSelectedMcps}
               disabled={!mcpOverview || savingMcpSelection || (!mcpSelectionChanged && selectedMissingCount === 0)}
               aria-busy={savingMcpSelection}
-              aria-label="Save MCP selection and install selected MCPs"
+              aria-label="Save MCP tool selection and install selected tools"
             >
               <DownloadIcon aria-hidden="true" />
-              {savingMcpSelection ? 'Saving…' : selectedMissingCount > 0 ? 'Save & Install' : 'Save Selection'}
+              {savingMcpSelection ? 'Saving…' : selectedMissingCount > 0 ? 'Save and install' : 'Save selection'}
             </Button>
             <Button
               variant="outline"
@@ -655,7 +661,7 @@ export default function ProjectDetailPage() {
               onClick={refreshMcpStatus}
               disabled={refreshingMcps}
               aria-busy={refreshingMcps}
-              aria-label="Refresh MCP status"
+              aria-label="Refresh MCP tool status"
             >
               <RefreshCwIcon aria-hidden="true" />
               Refresh
@@ -664,7 +670,7 @@ export default function ProjectDetailPage() {
               variant="ghost"
               size="sm"
               onClick={() => router.push('/dashboard/settings#mcps')}
-              aria-label="Open MCP settings"
+              aria-label="Open MCP tool settings"
             >
               <SettingsIcon aria-hidden="true" />
               Settings
@@ -679,7 +685,7 @@ export default function ProjectDetailPage() {
         )}
 
         {mcpOverview === null ? (
-          <p className="text-sm text-muted-foreground">MCP status has not been checked.</p>
+          <p className="text-sm text-muted-foreground">MCP tool status has not been checked.</p>
         ) : (
           <ul className="divide-y divide-border rounded-lg border border-border" role="list">
             {mcpOverview.catalog.map((entry) => {
@@ -704,7 +710,7 @@ export default function ProjectDetailPage() {
                           checked={selected}
                           onChange={() => toggleMcpSelection(entry.id)}
                           className="size-4 rounded border-input accent-foreground"
-                          aria-label={`${selected ? 'Reject' : 'Select'} ${entry.displayName} MCP`}
+                          aria-label={`${selected ? 'Remove' : 'Select'} ${entry.displayName} MCP tool`}
                         />
                         {entry.displayName}
                       </label>

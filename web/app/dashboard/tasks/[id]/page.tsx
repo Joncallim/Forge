@@ -96,6 +96,12 @@ function statusBadgeVariant(status: string): StatusVariant {
 }
 
 function statusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    awaiting_answers: 'Needs answers',
+    awaiting_approval: 'Needs approval',
+    dead_lettered: 'Stopped after retries',
+  }
+  if (labels[status]) return labels[status]
   return status.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
 }
 
@@ -803,16 +809,16 @@ function WorkforcePanel({
       <div className="mb-3 flex items-start gap-2 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
         <ShieldCheckIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
         <p>
-          Read-only workforce state. This slice only displays persisted planning records and does not write to the repository.
+          Planning view only. This panel shows saved assignments and approval checkpoints; it will not change repository files.
         </p>
       </div>
 
       {hasPersistedPlan ? (
         <div className="grid gap-4">
           <div>
-            <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">Work Packages</h3>
+            <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">Work packages</h3>
             {workPackages.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No work packages persisted yet.</p>
+              <p className="text-sm text-muted-foreground">No work packages saved yet.</p>
             ) : (
               <ul className="flex flex-col gap-3" aria-label="Persisted work packages">
                 {workPackages.map((pkg, index) => {
@@ -902,9 +908,9 @@ function WorkforcePanel({
           </div>
 
           <div>
-            <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">Approval Gates</h3>
+            <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">Approval checkpoints</h3>
             {approvalGates.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No approval gates persisted yet.</p>
+              <p className="text-sm text-muted-foreground">No approval checkpoints saved yet.</p>
             ) : (
               <ul className="flex flex-col gap-3" aria-label="Persisted approval gates">
                 {approvalGates.map((gate, index) => {
@@ -959,11 +965,11 @@ function WorkforcePanel({
       ) : (
         <div>
           <div className="mb-2 flex flex-wrap items-center gap-2">
-            <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Planner Fallback</h3>
-            <Badge variant="outline">planned metadata</Badge>
+            <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Plan summary</h3>
+            <Badge variant="outline">from plan</Badge>
           </div>
           <p className="mb-3 text-xs text-muted-foreground">
-            Persisted workforce records are not available for this task, so Forge is showing the Architect plan metadata.
+            Forge has not saved workforce records for this task, so this view is using the Architect plan.
           </p>
           <ul className="flex flex-col gap-3" aria-label="Planned workforce fallback">
             {fallbackAgents.map((agent) => (
@@ -988,9 +994,9 @@ function WorkforcePanel({
         <div className="mt-4 border-t border-border pt-3">
           <div className="mb-2 flex items-center gap-2">
             <GitBranchIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
-            <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wide">VCS Changes</h3>
+            <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Repository changes</h3>
           </div>
-          <ul className="flex flex-col gap-2" aria-label="Persisted VCS changes">
+          <ul className="flex flex-col gap-2" aria-label="Saved repository changes">
             {vcsChanges.map((change, index) => {
               const path = stringField(change, [
                 'path',
@@ -1037,13 +1043,13 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
     <section aria-labelledby="capability-classification-heading" className="rounded-lg border border-border p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
         <h2 id="capability-classification-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
-          Capability Classification
+          Required capabilities
         </h2>
         <Badge variant={statusVariant}>{statusLabel(validation.status)}</Badge>
       </div>
 
       <p className="mb-3 text-xs text-muted-foreground">
-        Read-only planning metadata. Agent routing and execution are still driven by the approved plan.
+        Planning view only. The approved plan still controls which agents run.
       </p>
 
       {validation.warnings.length > 0 && (
@@ -1059,7 +1065,7 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
 
       {total === 0 ? (
         <p className="text-sm text-muted-foreground">
-          The Architect did not classify any work capabilities for this plan.
+          No capabilities were listed for this plan.
         </p>
       ) : (
         <dl className="grid gap-3 text-sm">
@@ -1125,7 +1131,7 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
     <section aria-labelledby="mcp-access-plan-heading" className="rounded-lg border border-border p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
         <h2 id="mcp-access-plan-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
-          MCP Access Plan
+          MCP tool access
         </h2>
         <Badge variant={statusVariant}>{statusLabel(design.validation.status)}</Badge>
       </div>
@@ -1133,7 +1139,7 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
       <div className="mb-3 flex items-start gap-2 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
         <ShieldCheckIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
         <p>
-          Planning recommendation only. Runtime MCP tool issuance and enforcement are not implemented yet.
+          Planning view only. Forge does not grant MCP tools at runtime yet.
         </p>
       </div>
 
@@ -1162,7 +1168,7 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
       {grantPreview && grantPreview.decisions.length > 0 && (
         <div className="mb-3 rounded-lg border border-border px-3 py-2">
           <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Grant Decision Preview</p>
+            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Access decision preview</p>
             <div className="flex flex-wrap gap-1.5">
               <Badge variant="secondary">{grantPreview.summary.proposed} proposed</Badge>
               <Badge variant="outline">{grantPreview.summary.warning} warning</Badge>
@@ -1183,7 +1189,7 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
                 ? 'Do not assign MCP-backed work until this MCP issue is resolved.'
                 : decision.status === 'warning'
                   ? 'Optional MCP access is unavailable. Continue using the Architect fallback.'
-                  : 'Proposed only. MCP is currently healthy, but no runtime tools are granted.'
+                  : 'Proposed only. MCP is available, but Forge has not granted runtime tools.'
 
               return (
                 <li key={decision.decisionId} className="rounded-md border border-border bg-muted/20 px-2.5 py-2">
@@ -1201,7 +1207,7 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
                   )}
                   {decision.health.status !== 'healthy' && (
                     <p className="mt-1 text-muted-foreground">
-                      Health: {decision.health.installState}/{decision.health.status}
+                      Status: {decision.health.installState}/{decision.health.status}
                       {decision.health.error ? `: ${decision.health.error}` : ''}
                     </p>
                   )}
@@ -1272,11 +1278,11 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
       {(overlayCount > 0 || subtaskCount > 0) && (
         <dl className="mt-3 grid gap-1 border-t border-border pt-3 text-xs text-muted-foreground">
           <div>
-            <dt className="font-medium text-foreground">Prompt Overlays</dt>
+            <dt className="font-medium text-foreground">Prompt instructions</dt>
             <dd>{overlayCount}</dd>
           </div>
           <div>
-            <dt className="font-medium text-foreground">MCP-aware Subtasks</dt>
+            <dt className="font-medium text-foreground">MCP-aware subtasks</dt>
             <dd>{subtaskCount}</dd>
           </div>
         </dl>
@@ -1319,7 +1325,7 @@ function TaskAttemptRow({ attempt, runs }: { attempt: TaskAttempt; runs: AgentRu
           <dd>{formatDatetime(attempt.completedAt)}</dd>
         </div>
         <div>
-          <dt className="text-muted-foreground">Next Retry</dt>
+          <dt className="text-muted-foreground">Next retry</dt>
           <dd>{formatDatetime(attempt.nextRetryAt)}</dd>
         </div>
       </dl>
@@ -1625,8 +1631,7 @@ export default function TaskDetailPage() {
           {isAwaitingApproval && (
             <div className="mb-6 rounded-lg border border-border bg-card p-4">
               <p className="mb-3 text-sm font-medium text-foreground">
-                Review the generated plan. You can approve it, ask for a revised plan, or
-                restart the task.
+                Review the plan. You can approve it, request changes, or restart the task.
               </p>
 
               {actionError !== null && (
@@ -1651,9 +1656,9 @@ export default function TaskDetailPage() {
                     size="sm"
                     onClick={() => { setActionMode('replan'); setActionError(null) }}
                     disabled={actionLoading}
-                    aria-label="Change the plan"
+                    aria-label="Request changes to the plan"
                   >
-                    Change plan
+                    Request changes
                   </Button>
                   <Button
                     variant="destructive"
@@ -1678,11 +1683,11 @@ export default function TaskDetailPage() {
                       rows={3}
                       value={replanFeedback}
                       onChange={(e) => setReplanFeedback(e.target.value)}
-                      placeholder="Describe the adjustments the orchestrator should make to the plan…"
+                      placeholder="Describe what Forge should change in the plan…"
                       className="resize-y rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
                     />
                     <p className="text-xs text-muted-foreground">
-                      The orchestrator will revise the current plan and preserve unaffected sections.
+                      Forge will revise the current plan and keep unaffected sections.
                     </p>
                   </div>
                   <div className="flex gap-2">
@@ -1750,11 +1755,11 @@ export default function TaskDetailPage() {
           {/* Agent run timeline */}
           <section aria-labelledby="runs-heading" className="mb-6">
             <h2 id="runs-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
-              Agent Runs
+              Agent activity
             </h2>
             {mergedRuns.length === 0 ? (
               <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center">
-                <p className="text-sm text-muted-foreground">No agent runs yet.</p>
+                <p className="text-sm text-muted-foreground">No agent activity yet.</p>
               </div>
             ) : (
               <ul
@@ -1771,11 +1776,11 @@ export default function TaskDetailPage() {
           {/* Task attempt history */}
           <section aria-labelledby="attempts-heading" className="mb-6">
             <h2 id="attempts-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
-              Task Attempts
+              Retry history
             </h2>
             {attempts.length === 0 ? (
               <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center">
-                <p className="text-sm text-muted-foreground">No attempts recorded yet.</p>
+                <p className="text-sm text-muted-foreground">No retry history yet.</p>
               </div>
             ) : (
               <ul className="rounded-lg border border-border" aria-label="Task attempt history">

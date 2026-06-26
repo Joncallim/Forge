@@ -264,9 +264,9 @@ function AgentEditor({
     const apiKey = customProviderForm.isLocal ? null : customProviderForm.apiKey.trim() || null
 
     if (!displayName) throw new Error('Display name is required for custom providers.')
-    if (!modelId) throw new Error('Model ID is required for custom providers.')
+    if (!modelId) throw new Error('Model is required for custom providers.')
     if (requiresProviderBaseUrl(customProviderForm.providerType) && !baseUrl) {
-      throw new Error('Base URL is required for this provider type.')
+      throw new Error('Endpoint URL is required for this provider.')
     }
 
     const res = await fetch('/api/providers', {
@@ -422,17 +422,17 @@ function AgentEditor({
               }}
             >
               <SelectTrigger id="agent-provider" className="w-full">
-                <SelectValue placeholder="None - use default">
+                <SelectValue placeholder="Use default provider">
                   {isCustomProvider
                     ? 'Custom'
                     : selectedProvider
                       ? providerOptionLabel(selectedProvider)
-                      : 'None - use default'}
+                      : 'Use default provider'}
                 </SelectValue>
               </SelectTrigger>
               <SelectContent>
                 <SelectGroup>
-                  <SelectItem value="">None - use default</SelectItem>
+                  <SelectItem value="">Use default provider</SelectItem>
                   <SelectItem value={CUSTOM_PROVIDER_VALUE}>Custom</SelectItem>
                 </SelectGroup>
                 {providers.length > 0 && <SelectSeparator />}
@@ -484,18 +484,18 @@ function AgentEditor({
                 </SelectContent>
               </Select>
               <input
-                aria-label="Custom provider model id"
+                aria-label="Custom provider model"
                 value={customProviderForm.modelId}
                 onChange={(e) => setCustomProviderValue('modelId', e.target.value)}
-                placeholder="Model ID"
+                placeholder="Model"
                 className="rounded-lg border border-input bg-background px-3 py-2 font-mono text-sm"
               />
               {requiresProviderBaseUrl(customProviderForm.providerType) && (
                 <input
-                  aria-label="Custom provider base URL"
+                  aria-label="Custom provider endpoint URL"
                   value={customProviderForm.baseUrl}
                   onChange={(e) => setCustomProviderValue('baseUrl', e.target.value)}
-                  placeholder="Base URL"
+                  placeholder="Endpoint URL"
                   className="rounded-lg border border-input bg-background px-3 py-2 text-sm"
                 />
               )}
@@ -581,7 +581,7 @@ function AgentEditor({
             </Button>
           )}
           <Button onClick={handleSave} disabled={submitting}>
-            {submitting ? 'Saving...' : 'Save'}
+            {submitting ? 'Saving…' : 'Save'}
           </Button>
         </SheetFooter>
       </SheetContent>
@@ -714,7 +714,7 @@ function WorkforceEditor({
         <SheetHeader>
           <SheetTitle>{isNew ? 'Add Workforce' : 'Edit Workforce'}</SheetTitle>
           <SheetDescription>
-            Workforces are reusable teams of agents. Assign any active agent to any workforce.
+            Workforces are reusable teams. Add active agents here so Forge can use the same team again.
           </SheetDescription>
         </SheetHeader>
 
@@ -842,7 +842,7 @@ function WorkforceEditor({
             </Button>
           )}
           <Button onClick={handleSave} disabled={submitting}>
-            {submitting ? 'Saving...' : 'Save'}
+            {submitting ? 'Saving…' : 'Save'}
           </Button>
         </SheetFooter>
       </SheetContent>
@@ -924,9 +924,9 @@ export default function AgentsPage() {
     <div className="px-4 py-6 sm:px-6 lg:px-8">
       <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <h1 className="text-xl font-semibold text-foreground">Agents And Workforces</h1>
+          <h1 className="text-xl font-semibold text-foreground">Agents and Workforces</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            Add any specialist agent, assign providers and prompts, then group agents into editable workforces.
+            Manage each agent&apos;s model and instructions, then group agents into reusable teams.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -943,7 +943,7 @@ export default function AgentsPage() {
 
       {loading && (
         <div className="flex items-center justify-center py-16" role="status" aria-live="polite">
-          <span className="text-sm text-muted-foreground">Loading agents and workforces...</span>
+          <span className="text-sm text-muted-foreground">Loading agents and workforces…</span>
         </div>
       )}
 
@@ -971,7 +971,7 @@ export default function AgentsPage() {
                   Agents
                 </h2>
                 <p className="text-sm text-muted-foreground">
-                  These records drive provider assignment and prompt configuration.
+                  Agents define the model and instructions Forge uses for each role.
                 </p>
               </div>
             </div>
@@ -1067,7 +1067,7 @@ export default function AgentsPage() {
                 Workforces
               </h2>
               <p className="text-sm text-muted-foreground">
-                Workforces are reusable teams. Execution routing will use these templates in later workforce slices.
+                Workforces are reusable teams. Future task routing will use these templates automatically.
               </p>
             </div>
 
@@ -1142,10 +1142,10 @@ export default function AgentsPage() {
 
           <section aria-labelledby="presets-heading">
             <h2 id="presets-heading" className="mb-1 text-lg font-semibold text-foreground">
-              Recommended Configurations
+              Recommended configurations
             </h2>
             <p className="mb-4 text-sm text-muted-foreground">
-              Presets assign providers to matching seeded agents. Custom agents stay unchanged.
+              Presets assign providers to the built-in agents. Custom agents stay unchanged.
             </p>
             {presetError && (
               <div
@@ -1171,7 +1171,7 @@ export default function AgentsPage() {
                     onClick={() => handleApplyPreset(preset.id)}
                     aria-label={`Apply preset ${preset.label}`}
                   >
-                    {applyingPreset === preset.id ? 'Applying...' : 'Apply'}
+                    {applyingPreset === preset.id ? 'Applying…' : 'Apply'}
                   </Button>
                 </div>
               ))}

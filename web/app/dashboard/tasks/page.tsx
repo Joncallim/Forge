@@ -41,6 +41,12 @@ function statusBadgeVariant(status: string): StatusVariant {
 }
 
 function statusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    awaiting_answers: 'Needs answers',
+    awaiting_approval: 'Needs approval',
+    dead_lettered: 'Stopped after retries',
+  }
+  if (labels[status]) return labels[status]
   return status.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
 }
 
@@ -49,10 +55,10 @@ function formatDate(iso: string): string {
 }
 
 const STATUS_OPTIONS = [
-  { value: '', label: 'All Statuses' },
+  { value: '', label: 'All statuses' },
   { value: 'pending', label: 'Pending' },
   { value: 'running', label: 'Running' },
-  { value: 'awaiting_approval', label: 'Awaiting Approval' },
+  { value: 'awaiting_approval', label: 'Needs approval' },
   { value: 'approved', label: 'Approved' },
   { value: 'completed', label: 'Completed' },
   { value: 'failed', label: 'Failed' },
@@ -105,7 +111,7 @@ export default function TasksPage() {
             aria-label="Filter tasks by status"
             className="w-44"
           >
-            <SelectValue placeholder="All Statuses" />
+            <SelectValue placeholder="All statuses" />
           </SelectTrigger>
           <SelectContent>
             {STATUS_OPTIONS.map((opt) => (
@@ -147,7 +153,7 @@ export default function TasksPage() {
           <p className="text-sm text-muted-foreground">
             {statusFilter
               ? `No tasks with status "${statusLabel(statusFilter)}".`
-              : 'No tasks yet.'}
+              : 'No tasks yet. Create a task from a project page.'}
           </p>
         </div>
       )}

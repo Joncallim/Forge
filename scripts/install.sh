@@ -1153,6 +1153,10 @@ start_ollama_background() {
   if [ "$DRY_RUN" = "1" ]; then
     info "[dry-run] Start ollama serve"
   else
+    if ollama_ready; then
+      info "Ollama is already reachable."
+      return 0
+    fi
     ensure_install_state
     nohup ollama serve > "$OLLAMA_LOG" 2>&1 &
     record_manifest "ollama_pid" "$!"
@@ -1160,10 +1164,19 @@ start_ollama_background() {
   fi
 }
 
+ollama_ready() {
+  curl -fsS http://localhost:11434/api/tags >/dev/null 2>&1
+}
+
 start_ollama() {
   [ "$SKIP_OLLAMA" = "1" ] && return 0
 
   step "Starting Ollama"
+  if [ "$DRY_RUN" != "1" ] && ollama_ready; then
+    info "Ollama is already reachable."
+    return 0
+  fi
+
   if [ "$PACKAGE_MANAGER" = "brew" ]; then
     if ! run_quiet "Start Ollama" brew services start ollama; then
       warn "Homebrew could not start Ollama. Trying a local background process instead."
@@ -1182,7 +1195,7 @@ start_ollama() {
   info "Waiting for Ollama on localhost:11434..."
   local attempt
   for attempt in $(seq 1 45); do
-    if curl -fsS http://localhost:11434/api/tags >/dev/null 2>&1; then
+    if ollama_ready; then
       info "Ollama is ready."
       return 0
     fi
