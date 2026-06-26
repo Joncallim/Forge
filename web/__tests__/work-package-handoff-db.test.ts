@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
     }),
   ),
   dbUpdate: vi.fn(),
+  materializeReviewGatesForWorkPackageCompletion: vi.fn(),
   publishTaskEvent: vi.fn(),
 }))
 
@@ -24,6 +25,10 @@ vi.mock('@/db', () => ({
 
 vi.mock('@/worker/events', () => ({
   publishTaskEvent: mocks.publishTaskEvent,
+}))
+
+vi.mock('@/worker/review-gates', () => ({
+  materializeReviewGatesForWorkPackageCompletion: mocks.materializeReviewGatesForWorkPackageCompletion,
 }))
 
 import { handoffApprovedWorkPackages } from '@/worker/work-package-handoff'
@@ -57,6 +62,14 @@ function insertChain(returnValue: unknown = []) {
 describe('handoffApprovedWorkPackages', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mocks.materializeReviewGatesForWorkPackageCompletion.mockResolvedValue({
+      status: 'materialized',
+      packageStatus: 'awaiting_review',
+      createdGates: [
+        { id: 'gate-qa', gateType: 'qa_review', requiredRole: 'qa', title: 'QA review' },
+        { id: 'gate-reviewer', gateType: 'reviewer_review', requiredRole: 'reviewer', title: 'Reviewer review' },
+      ],
+    })
   })
 
   it('marks root packages ready, claims the first package, and records a no-op handoff run', async () => {
@@ -152,11 +165,17 @@ describe('handoffApprovedWorkPackages', () => {
       metadata: expect.objectContaining({ repositoryWrites: false }),
       workPackageId: 'pkg-1',
     }))
+    expect(mocks.materializeReviewGatesForWorkPackageCompletion).toHaveBeenCalledWith({
+      sourceAgentRunId: 'run-1',
+      sourceArtifactId: 'artifact-1',
+      taskId: 'task-1',
+      workPackageId: 'pkg-1',
+    })
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:handoff', expect.objectContaining({
       repositoryWrites: false,
       runId: 'run-1',
       stage: 'handoff',
-      status: 'running',
+      status: 'awaiting_review',
       workPackageId: 'pkg-1',
     }))
   })

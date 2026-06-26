@@ -37,7 +37,8 @@ describe('computeReadyWorkPackageIds', () => {
       { ...packageBase, id: 'ready', sequence: 2, status: 'ready' },
       { ...packageBase, id: 'running', sequence: 3, status: 'running' },
       { ...packageBase, id: 'completed', sequence: 4, status: 'completed' },
-    ], [])).toEqual(['pending'])
+      { ...packageBase, id: 'needs-rework', sequence: 5, status: 'needs_rework' },
+    ], [])).toEqual(['pending', 'needs-rework'])
   })
 })
 

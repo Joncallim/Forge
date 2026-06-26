@@ -2,6 +2,7 @@ import { and, asc, eq, inArray } from 'drizzle-orm'
 import { db } from '../db'
 import { agentRuns, artifacts, workPackageDependencies, workPackages } from '../db/schema'
 import { publishTaskEvent } from './events'
+import { materializeReviewGatesForWorkPackageCompletion } from './review-gates'
 
 type HandoffPackage = {
   id: string
@@ -73,7 +74,7 @@ export function computeReadyWorkPackageIds(
   }
 
   return packages
-    .filter((pkg) => pkg.status === 'pending')
+    .filter((pkg) => pkg.status === 'pending' || pkg.status === 'needs_rework')
     .filter((pkg) =>
       (dependenciesByPackageId.get(pkg.id) ?? []).every((dependencyId) =>
         completedPackageIds.has(dependencyId),
@@ -177,7 +178,7 @@ export async function handoffApprovedWorkPackages(
     const [updated] = await db
       .update(workPackages)
       .set({ status: 'ready', updatedAt: now })
-      .where(and(eq(workPackages.id, packageId), eq(workPackages.status, 'pending')))
+      .where(and(eq(workPackages.id, packageId), inArray(workPackages.status, ['pending', 'needs_rework'])))
       .returning({ id: workPackages.id })
 
     if (updated) {
@@ -281,6 +282,12 @@ export async function handoffApprovedWorkPackages(
     createdAt: handoff.artifact.createdAt,
     workPackageId: nextPackage.id,
   })
+  const reviewGates = await materializeReviewGatesForWorkPackageCompletion({
+    sourceAgentRunId: handoff.run.id,
+    sourceArtifactId: handoff.artifact.id,
+    taskId,
+    workPackageId: nextPackage.id,
+  })
   await publishTaskEvent(taskId, 'run:completed', {
     runId: handoff.run.id,
     stage: 'handoff',
@@ -294,7 +301,7 @@ export async function handoffApprovedWorkPackages(
     repositoryWrites: false,
     runId: handoff.run.id,
     stage: 'handoff',
-    status: 'running',
+    status: reviewGates.packageStatus ?? 'running',
     title: nextPackage.title,
     updatedAt: new Date().toISOString(),
     workPackageId: nextPackage.id,

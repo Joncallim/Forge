@@ -87,6 +87,11 @@ vi.mock('@/lib/providers/registry', () => ({
   getModel: vi.fn().mockResolvedValue(null),
 }))
 
+const mockDecideReviewGate = vi.fn()
+vi.mock('@/worker/review-gates', () => ({
+  decideReviewGate: mockDecideReviewGate,
+}))
+
 const mockGetGitHubStatus = vi.fn()
 const mockResolveGitHubToken = vi.fn()
 const mockValidateGitHubTokenEnvVar = vi.fn((rawEnvVar: string | null | undefined) => {
@@ -2135,6 +2140,82 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       'forge:task:task-approval',
       expect.stringContaining('"type":"approval_gate:decided"'),
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Suite 3.4a — Review gate decisions: POST /api/tasks/:id/approval-gates/:gateId
+// ---------------------------------------------------------------------------
+
+describe('POST /api/tasks/:id/approval-gates/:gateId', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('records a review gate decision through the review gate helper', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDecideReviewGate.mockResolvedValue({
+      status: 'decided',
+      gateId: 'gate-1',
+      gateType: 'qa_review',
+      decision: 'completed',
+      packageStatus: 'awaiting_review',
+      taskCompleted: false,
+      cancelledGateIds: [],
+    })
+
+    const { POST } = await import('@/app/api/tasks/[id]/approval-gates/[gateId]/route')
+    const res = await POST(authRequest('/api/tasks/task-1/approval-gates/gate-1', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'completed', reason: 'QA passed.' }),
+    }) as never, {
+      params: Promise.resolve({ id: 'task-1', gateId: 'gate-1' }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(mockDecideReviewGate).toHaveBeenCalledWith({
+      decision: 'completed',
+      gateId: 'gate-1',
+      reason: 'QA passed.',
+      taskId: 'task-1',
+      userId: FAKE_SESSION.userId,
+    })
+  })
+
+  it('maps review gate ordering blocks to 409', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDecideReviewGate.mockResolvedValue({
+      status: 'reviewer_blocked',
+      message: 'QA review must be completed before reviewer approval.',
+    })
+
+    const { POST } = await import('@/app/api/tasks/[id]/approval-gates/[gateId]/route')
+    const res = await POST(authRequest('/api/tasks/task-1/approval-gates/gate-reviewer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'completed', reason: 'Reviewer approves.' }),
+    }) as never, {
+      params: Promise.resolve({ id: 'task-1', gateId: 'gate-reviewer' }),
+    })
+
+    expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body.error).toMatch(/QA review/)
+  })
+
+  it('requires a decision reason', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+
+    const { POST } = await import('@/app/api/tasks/[id]/approval-gates/[gateId]/route')
+    const res = await POST(authRequest('/api/tasks/task-1/approval-gates/gate-1', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'completed', reason: '' }),
+    }) as never, {
+      params: Promise.resolve({ id: 'task-1', gateId: 'gate-1' }),
+    })
+
+    expect(res.status).toBe(400)
+    expect(mockDecideReviewGate).not.toHaveBeenCalled()
   })
 })
 
