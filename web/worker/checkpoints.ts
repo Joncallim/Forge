@@ -246,7 +246,7 @@ export async function readLatestArchitectCheckpointSafely(
     if (!stat.isFile() || stat.isSymbolicLink()) return null
 
     const noFollowFlag = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)
-    const handle = await fs.open(latestPath, noFollowFlag)
+    const handle = await fs.open(/*turbopackIgnore: true*/ latestPath, noFollowFlag)
     try {
       const openedStat = await handle.stat()
       if (!openedStat.isFile()) return null

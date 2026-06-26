@@ -78,7 +78,7 @@ export function expandHomePath(rawPath: string): string {
   const trimmed = rawPath.trim()
   if (trimmed === '~') return homeDir()
   if (trimmed.startsWith('~/') || trimmed.startsWith('~\\')) {
-    return path.join(homeDir(), trimmed.slice(2))
+    return path.join(/*turbopackIgnore: true*/ homeDir(), trimmed.slice(2))
   }
   return trimmed
 }

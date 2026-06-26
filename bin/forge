@@ -41,7 +41,12 @@ workspace_root() {
   expand_home_path "$root"
 }
 
-ENV_FILE="${FORGE_ENV_FILE:-$(workspace_root)/config/forge.env}"
+WORKSPACE_ROOT="$(workspace_root)"
+ENV_FILE="${FORGE_ENV_FILE:-$WORKSPACE_ROOT/config/forge.env}"
+export FORGE_ENV_FILE="$ENV_FILE"
+if [ -z "${FORGE_WORKSPACE_ROOT+x}" ]; then
+  export FORGE_WORKSPACE_ROOT="$WORKSPACE_ROOT"
+fi
 
 usage() {
   cat <<'EOF'
@@ -90,8 +95,117 @@ env_value() {
   done
 }
 
+env_key_allowed() {
+  case "$1" in
+    DATABASE_URL|REDIS_URL|SESSION_SECRET|FORGE_ENCRYPTION_KEY|\
+    NEXT_PUBLIC_APP_URL|NEXT_TELEMETRY_DISABLED|\
+    WEBAUTHN_RP_ID|WEBAUTHN_RP_NAME|WEBAUTHN_ORIGIN|\
+    FORGE_EMBED_WORKER|FORGE_AGENT_WEB_SEARCH|FORGE_WORKER_CLAIM_TIMEOUT_SECONDS|\
+    FORGE_WORKER_MAX_ATTEMPTS|FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS|\
+    FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS|FORGE_PASSKEYS_ENABLED|FORGE_DISABLE_PASSKEYS|\
+    FORGE_TRUST_PROXY|FORGE_REQUIRE_GITHUB_CLI|FORGE_WORKSPACE_DISPLAY_ROOT|\
+    FORGE_MCPS_ROOT|FORGE_AGENT_CONFIG_DIR|FORGE_ZERO_CONFIG_MODEL|FORGE_OLLAMA_BASE_URL|\
+    ANTHROPIC_API_KEY|OPENAI_API_KEY|GOOGLE_GENERATIVE_AI_API_KEY|GOOGLE_API_KEY|\
+    OPENROUTER_API_KEY|XAI_API_KEY|DEEPSEEK_API_KEY|MOONSHOT_API_KEY|ZHIPU_API_KEY|\
+    GITHUB_TOKEN|GH_TOKEN|GITHUB_PAT|FORGE_GITHUB_TOKEN)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+export_env_file() {
+  local file="$1" line key value
+  [ -f "$file" ] || return 0
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in
+      ''|\#*|*=*) ;;
+      *) continue ;;
+    esac
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    case "$key" in
+      ''|*[!A-Za-z0-9_]*|[0-9]*) continue ;;
+    esac
+    env_key_allowed "$key" || continue
+
+    if [ -z "${!key+x}" ]; then
+      value="${value%\"}"; value="${value#\"}"
+      value="${value%\'}"; value="${value#\'}"
+      export "$key=$value"
+    fi
+  done < "$file"
+}
+
 local_url() {
+  if [ -n "${NEXT_PUBLIC_APP_URL:-}" ]; then
+    printf '%s' "$NEXT_PUBLIC_APP_URL"
+    return 0
+  fi
   env_value NEXT_PUBLIC_APP_URL || true
+}
+
+health_url() {
+  local base="$1"
+  case "$base" in
+    */) printf '%sapi/health' "$base" ;;
+    *) printf '%s/api/health' "$base" ;;
+  esac
+}
+
+live_url() {
+  local base="$1"
+  case "$base" in
+    */) printf '%sapi/live' "$base" ;;
+    *) printf '%s/api/live' "$base" ;;
+  esac
+}
+
+liveness_status() {
+  local url="$1"
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -fsS -m 2 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true
+}
+
+monitor_startup() {
+  local url="$1" parent_pid="$2" live elapsed status
+  command -v curl >/dev/null 2>&1 || return 0
+  live="$(live_url "$url")"
+  elapsed=0
+
+  sleep 2
+  while kill -0 "$parent_pid" 2>/dev/null && [ "$elapsed" -lt 120 ]; do
+    status="$(liveness_status "$live")"
+    if [ "$status" = "200" ]; then
+      printf '\nForge server is reachable: %s\n' "$live"
+      printf 'Full health details: %s\n' "$(health_url "$url")"
+      printf 'If the browser is showing "Compiling", keep this terminal open while Next finishes the first page compile.\n\n'
+      return 0
+    fi
+
+    elapsed=$((elapsed + 2))
+    if [ "$elapsed" = "10" ] || [ "$elapsed" = "30" ] || [ "$elapsed" = "60" ]; then
+      printf 'Waiting for Forge to answer on %s (%ss elapsed)...\n' "$live" "$elapsed"
+    fi
+    sleep 2
+  done
+
+  if kill -0 "$parent_pid" 2>/dev/null; then
+    printf '\nForge has not answered on %s after %ss.\n' "$live" "$elapsed" >&2
+    printf 'Run "forge doctor" in another terminal and check this terminal for Next.js compile errors.\n\n' >&2
+  fi
 }
 
 prompt_password() {
@@ -134,10 +248,14 @@ fi
 case "$command" in
   server|run|dev|start)
     require_repo
+    export_env_file "$ENV_FILE"
     url="$(local_url)"
     url="${url:-http://localhost:3000}"
     printf 'Starting Forge...\n\n'
     printf 'Local: %s\n\n' "$url"
+    printf 'Live: %s\n' "$(live_url "$url")"
+    printf 'Health: %s\n\n' "$(health_url "$url")"
+    monitor_startup "$url" "$$" &
     cd "$WEB_DIR"
     exec npm run dev "$@"
     ;;
@@ -151,6 +269,7 @@ case "$command" in
     ;;
   reset-credentials|reset-password)
     require_repo
+    export_env_file "$ENV_FILE"
     cd "$WEB_DIR"
     if [ "$#" -gt 0 ]; then
       die "reset-credentials does not accept password arguments; run it interactively"
@@ -160,6 +279,8 @@ case "$command" in
     ;;
   doctor|check)
     require_repo
+    export_env_file "$ENV_FILE"
+    export FORGE_DOCTOR_CHECK_APP="${FORGE_DOCTOR_CHECK_APP:-1}"
     cd "$WEB_DIR"
     exec npm run doctor "$@"
     ;;
