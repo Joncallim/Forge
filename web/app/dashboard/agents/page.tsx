@@ -373,8 +373,16 @@ function AgentEditor({
               </label>
               <input
                 id="agent-display-name"
+                name="forge-agent-display-name"
                 value={draft.displayName}
                 onChange={(e) => setDraftValue('displayName', e.target.value)}
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="none"
+                spellCheck={false}
+                data-1p-ignore="true"
+                data-lpignore="true"
+                data-form-type="other"
                 className="rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
               />
             </div>
@@ -454,9 +462,17 @@ function AgentEditor({
             <div className="grid gap-3 rounded-lg border border-border bg-muted/30 p-3">
               <input
                 aria-label="Custom provider display name"
+                name="forge-custom-provider-display-name"
                 value={customProviderForm.displayName}
                 onChange={(e) => setCustomProviderValue('displayName', e.target.value)}
                 placeholder="Display name"
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="none"
+                spellCheck={false}
+                data-1p-ignore="true"
+                data-lpignore="true"
+                data-form-type="other"
                 className="rounded-lg border border-input bg-background px-3 py-2 text-sm"
               />
               <Select
@@ -726,8 +742,16 @@ function WorkforceEditor({
               </label>
               <input
                 id="workforce-display-name"
+                name="forge-workforce-display-name"
                 value={draft.displayName}
                 onChange={(e) => setDraftValue('displayName', e.target.value)}
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="none"
+                spellCheck={false}
+                data-1p-ignore="true"
+                data-lpignore="true"
+                data-form-type="other"
                 className="rounded-lg border border-input bg-background px-3 py-2 text-sm"
               />
             </div>

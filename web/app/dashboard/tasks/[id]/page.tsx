@@ -901,7 +901,7 @@ function WorkforcePanel({
   ), 0)
 
   return (
-    <section aria-labelledby="workforce-heading" className="rounded-lg border border-border p-4">
+    <section aria-labelledby="workforce-heading" className="min-w-0 rounded-lg border border-border p-4 overflow-x-hidden">
       <div className="mb-3 flex items-center justify-between gap-3">
         <h2 id="workforce-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
           Workforce
@@ -961,8 +961,12 @@ function WorkforcePanel({
                     <li key={recordKey(pkg, 'work-package', index)} className="min-w-0 border-t border-border pt-3 first:border-t-0 first:pt-0">
                       <div className="flex flex-wrap items-center gap-2">
                         <p className="min-w-0 break-words text-sm font-medium text-foreground">{title}</p>
-                        {owner !== '' && <Badge variant="outline">{owner}</Badge>}
-                        {harnessName !== '' && harnessName !== owner && <Badge variant="secondary">{harnessName}</Badge>}
+                        {owner !== '' && (
+                          <Badge variant="outline" className="max-w-[12rem] truncate" title={owner}>{owner}</Badge>
+                        )}
+                        {harnessName !== '' && harnessName !== owner && (
+                          <Badge variant="secondary" className="max-w-[12rem] truncate" title={harnessName}>{harnessName}</Badge>
+                        )}
                         {status !== '' && statusBadge(status)}
                         <Badge variant="outline">{pluralize(taskCount, 'task')}</Badge>
                       </div>
@@ -1106,23 +1110,25 @@ function WorkforcePanel({
                   const decidedAt = stringField(gate, ['decidedAt'])
 
                   return (
-                    <li key={recordKey(gate, 'approval-gate', index)} className="border-t border-border pt-3 first:border-t-0 first:pt-0">
+                    <li key={recordKey(gate, 'approval-gate', index)} className="min-w-0 border-t border-border pt-3 first:border-t-0 first:pt-0">
                       <div className="flex flex-wrap items-center gap-2">
-                        <p className="text-sm font-medium text-foreground">{title}</p>
+                        <p className="min-w-0 break-words text-sm font-medium text-foreground">{title}</p>
                         {status !== '' && <Badge variant={statusBadgeVariant(status)}>{statusLabel(status)}</Badge>}
                         {gateType !== '' && isReviewGateType(gateType) && (
                           <Badge variant="outline">{statusLabel(gateType)}</Badge>
                         )}
-                        {requiredRole !== '' && <Badge variant="secondary">{requiredRole}</Badge>}
+                        {requiredRole !== '' && (
+                          <Badge variant="secondary" className="max-w-[12rem] truncate" title={requiredRole}>{requiredRole}</Badge>
+                        )}
                         {required !== null && (
                           <Badge variant={required ? 'outline' : 'secondary'}>{required ? 'required' : 'optional'}</Badge>
                         )}
                       </div>
                       {packageId !== '' && (
-                        <p className="mt-1 font-mono text-xs text-muted-foreground">Package {packageId}</p>
+                        <p className="mt-1 break-all font-mono text-xs text-muted-foreground">Package {packageId}</p>
                       )}
                       {sourceRunId !== '' && (
-                        <p className="mt-1 font-mono text-xs text-muted-foreground">Run {sourceRunId}</p>
+                        <p className="mt-1 break-all font-mono text-xs text-muted-foreground">Run {sourceRunId}</p>
                       )}
                       {summary !== '' && <p className="mt-1 text-sm text-muted-foreground">{summary}</p>}
                       {decisionReason !== '' && (
