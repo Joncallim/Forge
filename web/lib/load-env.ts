@@ -27,25 +27,27 @@ import { loadEnvConfig } from '@next/env'
 let loaded = false
 
 function defaultWorkspaceRoot(): string {
-  return path.join(os.homedir() || '/', 'Documents', 'Forge')
+  return path.join(/*turbopackIgnore: true*/ os.homedir() || '/', 'Documents', 'Forge')
 }
 
 function expandHomePath(value: string): string {
   if (value === '~') return os.homedir() || '/'
   if (value.startsWith('~/') || value.startsWith('~\\')) {
-    return path.join(os.homedir() || '/', value.slice(2))
+    return path.join(/*turbopackIgnore: true*/ os.homedir() || '/', value.slice(2))
   }
   return value
 }
 
 function workspaceEnvPath(): string {
   if (process.env.FORGE_ENV_FILE?.trim()) {
-    return path.resolve(expandHomePath(process.env.FORGE_ENV_FILE))
+    return path.resolve(/*turbopackIgnore: true*/ expandHomePath(process.env.FORGE_ENV_FILE))
   }
 
   if (process.env.FORGE_WORKSPACE_ROOT?.trim()) {
     return path.join(
-      path.resolve(expandHomePath(process.env.FORGE_WORKSPACE_ROOT)),
+      /*turbopackIgnore: true*/ path.resolve(
+        /*turbopackIgnore: true*/ expandHomePath(process.env.FORGE_WORKSPACE_ROOT),
+      ),
       'config',
       'forge.env',
     )
@@ -59,16 +61,22 @@ function workspaceEnvPath(): string {
       workspaceRoot?: unknown
     }
     if (typeof parsed.forgeEnvPath === 'string' && parsed.forgeEnvPath.trim()) {
-      return path.resolve(expandHomePath(parsed.forgeEnvPath))
+      return path.resolve(/*turbopackIgnore: true*/ expandHomePath(parsed.forgeEnvPath))
     }
     if (typeof parsed.workspaceRoot === 'string' && parsed.workspaceRoot.trim()) {
-      return path.join(path.resolve(expandHomePath(parsed.workspaceRoot)), 'config', 'forge.env')
+      return path.join(
+        /*turbopackIgnore: true*/ path.resolve(
+          /*turbopackIgnore: true*/ expandHomePath(parsed.workspaceRoot),
+        ),
+        'config',
+        'forge.env',
+      )
     }
   } catch {
     // Fall back to the default workspace path.
   }
 
-  return path.join(defaultRoot, 'config', 'forge.env')
+  return path.join(/*turbopackIgnore: true*/ defaultRoot, 'config', 'forge.env')
 }
 
 function parseEnvLine(line: string): [string, string] | null {
@@ -107,7 +115,7 @@ export function loadForgeEnv(): void {
 
   const cwd = process.cwd()
   loadEnvFile(workspaceEnvPath())
-  loadEnvConfig(path.resolve(cwd, '..'))
+  loadEnvConfig(path.resolve(/*turbopackIgnore: true*/ cwd, '..'))
   loadEnvConfig(cwd)
 }
 

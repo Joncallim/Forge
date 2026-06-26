@@ -254,7 +254,41 @@ run_quiet() {
     printf ' %q' "$@"
     printf '\n'
   } >> "$INSTALL_LOG" 2>&1
+  chmod 600 "$INSTALL_LOG" 2>/dev/null || true
   "$@" >> "$INSTALL_LOG" 2>&1
+}
+
+run_quiet_redacted() {
+  local description="$1"
+  shift
+  if [ "$DRY_RUN" = "1" ]; then
+    info "[dry-run] $description"
+    return 0
+  fi
+  ensure_install_state
+  {
+    printf '\n[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$description"
+    printf 'Command: [redacted: contains generated secret]\n'
+  } >> "$INSTALL_LOG" 2>&1
+  chmod 600 "$INSTALL_LOG" 2>/dev/null || true
+  "$@" >> "$INSTALL_LOG" 2>&1
+}
+
+run_quiet_redacted_stdin() {
+  local description="$1"
+  local stdin_payload="$2"
+  shift 2
+  if [ "$DRY_RUN" = "1" ]; then
+    info "[dry-run] $description"
+    return 0
+  fi
+  ensure_install_state
+  {
+    printf '\n[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$description"
+    printf 'Command: [redacted: stdin contains generated secret]\n'
+  } >> "$INSTALL_LOG" 2>&1
+  chmod 600 "$INSTALL_LOG" 2>/dev/null || true
+  printf '%s\n' "$stdin_payload" | "$@" >> "$INSTALL_LOG" 2>&1
 }
 
 run_with_timeout() {
@@ -1039,10 +1073,10 @@ provision_database() {
 
   role_exists="$(psql_admin -tAc "SELECT 1 FROM pg_roles WHERE rolname='forge'" | tr -d '[:space:]' || true)"
   if [ "$role_exists" = "1" ]; then
-    run_quiet "Sync forge role password" psql_admin -c "ALTER ROLE forge PASSWORD '$db_password_escaped';"
+    run_quiet_redacted_stdin "Sync forge role password" "ALTER ROLE forge PASSWORD '$db_password_escaped';" psql_admin
     info "Role forge exists; password synced."
   else
-    run_quiet "Create forge role" psql_admin -c "CREATE ROLE forge LOGIN PASSWORD '$db_password_escaped';"
+    run_quiet_redacted_stdin "Create forge role" "CREATE ROLE forge LOGIN PASSWORD '$db_password_escaped';" psql_admin
     record_manifest "postgres_role" "forge"
     info "Created role forge."
   fi

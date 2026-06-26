@@ -6,6 +6,7 @@ import { promisify } from 'node:util'
 
 const execFile = promisify(execFileCallback)
 const GITHUB_CLI_TIMEOUT_MS = 5000
+const APP_SERVER_TIMEOUT_MS = 3000
 
 function truthy(value: string | undefined): boolean {
   return /^(1|true|yes|on)$/i.test(value ?? '')
@@ -37,6 +38,38 @@ async function checkGitHubCli(): Promise<boolean> {
   }
 
   return failed
+}
+
+function appHealthUrl(): string {
+  const baseUrl = process.env.NEXT_PUBLIC_APP_URL?.trim() || 'http://localhost:3000'
+  return `${baseUrl.replace(/\/$/, '')}/api/health`
+}
+
+async function checkAppServer(): Promise<void> {
+  if (!truthy(process.env.FORGE_DOCTOR_CHECK_APP)) {
+    return
+  }
+
+  const healthUrl = appHealthUrl()
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), APP_SERVER_TIMEOUT_MS)
+
+  try {
+    const response = await fetch(healthUrl, {
+      cache: 'no-store',
+      signal: controller.signal,
+    })
+    if (response.ok) {
+      console.info(`ok APP_SERVER reachable (${healthUrl})`)
+    } else {
+      console.info(`warn APP_SERVER reachable but unhealthy (${healthUrl}; HTTP ${response.status})`)
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    console.info(`warn APP_SERVER unreachable (${healthUrl}; ${message})`)
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
 async function main(): Promise<void> {
@@ -79,6 +112,8 @@ async function main(): Promise<void> {
     if (await checkGitHubCli()) {
       failed = true
     }
+
+    await checkAppServer()
   } finally {
     await closeDb().catch(() => {})
     redis.disconnect()

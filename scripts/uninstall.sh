@@ -587,27 +587,6 @@ remove_path() {
     return 0
   fi
 
-  # Rename out of the way first (near-instant on the same filesystem), then
-  # delete the renamed copy as a fully detached background job. This is what
-  # actually makes removal fast: the path is gone from the caller's
-  # perspective immediately, instead of the script blocking on an rm -rf that
-  # can take minutes for a large node_modules tree. The trash name is unique
-  # per invocation so repeated runs never collide with a still-draining one.
-  local trash="${path}.uninstall-trash.$$"
-  if mv "$path" "$trash" 2>/dev/null; then
-    if command -v setsid >/dev/null 2>&1; then
-      setsid rm -rf "$trash" >/dev/null 2>&1 </dev/null &
-    else
-      nohup rm -rf "$trash" >/dev/null 2>&1 </dev/null &
-    fi
-    disown 2>/dev/null || true
-    info "Removed $path"
-    return 0
-  fi
-
-  # mv failed (e.g. cross-device link, or a root-owned file blocking the
-  # rename) — fall back to a foreground removal with the old wait/timeout
-  # loop so we still report progress and respect REMOVE_TIMEOUT_SECONDS.
   case "$path" in
     */node_modules)
       info "Removing $path. This can take a while because node_modules contains many small files."

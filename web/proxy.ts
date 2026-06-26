@@ -21,5 +21,5 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ['/dashboard/:path*', '/api/((?!auth|health).*)'],
+  matcher: ['/dashboard/:path*', '/api/((?!auth|health|live).*)'],
 }
