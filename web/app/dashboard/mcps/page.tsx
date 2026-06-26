@@ -44,18 +44,19 @@ function workspaceMcpRootLabel(workspace: WorkspaceSettings): string {
 
 function installerPrompt(source: string): string {
   return [
-    'Act as the MCP Installer agent for this Forge project.',
+    'Act as the MCP Installer agent for the Forge workspace.',
     '',
     'MCP source or search request:',
     source,
     '',
     'Expected outcome:',
     '- Identify the MCP package, repository, or setup instructions from the supplied source.',
-    '- Inspect the existing Forge MCP manager, catalog, workspace settings, and project MCP config before changing code.',
+    '- Inspect the existing Forge MCP manager, catalog, and workspace settings before changing code.',
     '- Install or configure the MCP under the shared Forge MCP root when implementation is safe and in scope.',
-    '- Keep project-specific overrides explicit and scoped to this project.',
+    '- Do not ask for an application repository unless the MCP source itself is ambiguous.',
+    '- Do not expand the task into Backend, QA, or Documentation work unless installation requires a code change.',
     '- Do not execute unknown remote scripts, destructive commands, or credential-changing steps without explicit approval.',
-    '- Add or update tests and documentation for any supported install path.',
+    '- Verify the installed MCP and discard installation-only task state after completion when the runtime supports standalone MCP tasks.',
   ].join('\n')
 }
 

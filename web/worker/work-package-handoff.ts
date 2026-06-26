@@ -3,6 +3,10 @@ import { db } from '../db'
 import { agentRuns, artifacts, workPackageDependencies, workPackages } from '../db/schema'
 import { publishTaskEvent } from './events'
 import { materializeReviewGatesForWorkPackageCompletion } from './review-gates'
+import {
+  executeWorkPackage,
+  loadWorkPackageExecutionContext,
+} from './work-package-executor'
 
 type HandoffPackage = {
   id: string
@@ -54,6 +58,13 @@ export function isWorkPackageHandoffEnabled(
 ): boolean {
   const raw = env.FORGE_WORK_PACKAGE_HANDOFF?.trim().toLowerCase()
   return raw !== '0' && raw !== 'false'
+}
+
+export function isWorkPackageExecutionEnabled(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const raw = env.FORGE_WORK_PACKAGE_EXECUTION?.trim().toLowerCase()
+  return raw === '1' || raw === 'true'
 }
 
 export function computeReadyWorkPackageIds(
@@ -208,6 +219,10 @@ export async function handoffApprovedWorkPackages(
     return { status: 'no_ready_packages', readyPackageIds: state.readyPackageIds, claimedPackageId: null }
   }
 
+  if (isWorkPackageExecutionEnabled()) {
+    return executeReadyWorkPackage(taskId, nextPackage, state.readyPackageIds)
+  }
+
   const handoffStartedAt = new Date()
   const handoffCompletedAt = new Date()
   const handoffArtifactContent = [
@@ -311,5 +326,201 @@ export async function handoffApprovedWorkPackages(
     status: 'handed_off',
     readyPackageIds: state.readyPackageIds,
     claimedPackageId: nextPackage.id,
+  }
+}
+
+async function executeReadyWorkPackage(
+  taskId: string,
+  nextPackage: HandoffPackage,
+  readyPackageIds: string[],
+): Promise<WorkPackageHandoffResult> {
+  const [claimed] = await db
+    .update(workPackages)
+    .set({ status: 'running', blockedReason: null, updatedAt: new Date() })
+    .where(and(eq(workPackages.id, nextPackage.id), eq(workPackages.status, 'ready')))
+    .returning({ id: workPackages.id })
+
+  if (!claimed) {
+    return {
+      status: 'already_handed_off',
+      readyPackageIds,
+      claimedPackageId: nextPackage.id,
+    }
+  }
+
+  await publishTaskEvent(taskId, 'work_package:status', {
+    status: 'running',
+    updatedAt: new Date().toISOString(),
+    workPackageId: nextPackage.id,
+  })
+
+  let context: Awaited<ReturnType<typeof loadWorkPackageExecutionContext>>
+  try {
+    context = await loadWorkPackageExecutionContext(taskId, nextPackage.id)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    const failedAt = new Date()
+    await db
+      .update(workPackages)
+      .set({
+        blockedReason: message,
+        status: 'failed',
+        updatedAt: failedAt,
+      })
+      .where(eq(workPackages.id, nextPackage.id))
+    await publishTaskEvent(taskId, 'work_package:status', {
+      blockedReason: message,
+      status: 'failed',
+      updatedAt: failedAt.toISOString(),
+      workPackageId: nextPackage.id,
+    })
+    throw err
+  }
+  const startedAt = new Date()
+  const [run] = await db
+    .insert(agentRuns)
+    .values({
+      taskId,
+      workPackageId: nextPackage.id,
+      harnessId: nextPackage.harnessId,
+      agentType: nextPackage.assignedRole,
+      stage: 'implementation',
+      attemptNumber: 1,
+      modelIdUsed: context.modelIdUsed,
+      status: 'running',
+      startedAt,
+    })
+    .returning()
+
+  await publishTaskEvent(taskId, 'run:started', {
+    agentType: nextPackage.assignedRole,
+    runId: run.id,
+    stage: 'implementation',
+    workPackageId: nextPackage.id,
+  })
+
+  try {
+    const execution = await executeWorkPackage(context)
+    const completedAt = new Date()
+    await db
+      .update(agentRuns)
+      .set({ completedAt, status: 'completed' })
+      .where(eq(agentRuns.id, run.id))
+
+    const [artifact] = await db
+      .insert(artifacts)
+      .values({
+        agentRunId: run.id,
+        artifactType: 'log_output',
+        content: execution.artifactContent,
+        metadata: {
+          ...execution.artifactMetadata,
+          source: 'work-package-executor',
+          workPackageId: nextPackage.id,
+        },
+      })
+      .returning()
+
+    await publishTaskEvent(taskId, 'artifact:created', {
+      id: artifact.id,
+      artifactId: artifact.id,
+      agentRunId: artifact.agentRunId,
+      artifactType: artifact.artifactType,
+      content: artifact.content,
+      metadata: artifact.metadata,
+      createdAt: artifact.createdAt,
+      workPackageId: nextPackage.id,
+    })
+
+    const reviewGates = await materializeReviewGatesForWorkPackageCompletion({
+      sourceAgentRunId: run.id,
+      sourceArtifactId: artifact.id,
+      taskId,
+      workPackageId: nextPackage.id,
+    })
+
+    await publishTaskEvent(taskId, 'run:completed', {
+      runId: run.id,
+      stage: 'implementation',
+      status: 'completed',
+      workPackageId: nextPackage.id,
+    })
+
+    await publishTaskEvent(taskId, 'work_package:handoff', {
+      assignedRole: nextPackage.assignedRole,
+      harnessId: nextPackage.harnessId,
+      repositoryWrites: true,
+      runId: run.id,
+      sandboxPath: execution.sandboxPath,
+      stage: 'implementation',
+      status: reviewGates.packageStatus ?? 'running',
+      title: nextPackage.title,
+      updatedAt: new Date().toISOString(),
+      workPackageId: nextPackage.id,
+    })
+
+    return {
+      status: 'handed_off',
+      readyPackageIds,
+      claimedPackageId: nextPackage.id,
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    const failedAt = new Date()
+    await db
+      .update(agentRuns)
+      .set({
+        completedAt: failedAt,
+        errorMessage: message,
+        status: 'failed',
+      })
+      .where(eq(agentRuns.id, run.id))
+    await db
+      .update(workPackages)
+      .set({
+        blockedReason: message,
+        status: 'failed',
+        updatedAt: failedAt,
+      })
+      .where(eq(workPackages.id, nextPackage.id))
+
+    const [artifact] = await db
+      .insert(artifacts)
+      .values({
+        agentRunId: run.id,
+        artifactType: 'log_output',
+        content: `Work package execution failed.\n\n${message}`,
+        metadata: {
+          errorMessage: message,
+          repositoryWrites: false,
+          source: 'work-package-executor',
+          workPackageId: nextPackage.id,
+        },
+      })
+      .returning()
+
+    await publishTaskEvent(taskId, 'run:failed', {
+      errorMessage: message,
+      runId: run.id,
+      stage: 'implementation',
+      workPackageId: nextPackage.id,
+    })
+    await publishTaskEvent(taskId, 'artifact:created', {
+      id: artifact.id,
+      artifactId: artifact.id,
+      agentRunId: artifact.agentRunId,
+      artifactType: artifact.artifactType,
+      content: artifact.content,
+      metadata: artifact.metadata,
+      createdAt: artifact.createdAt,
+      workPackageId: nextPackage.id,
+    })
+    await publishTaskEvent(taskId, 'work_package:status', {
+      blockedReason: message,
+      status: 'failed',
+      updatedAt: failedAt.toISOString(),
+      workPackageId: nextPackage.id,
+    })
+    throw err
   }
 }

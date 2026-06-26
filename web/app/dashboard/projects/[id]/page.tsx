@@ -411,7 +411,7 @@ export default function ProjectDetailPage() {
     if (project.localPath) {
       const localPathLabel = projectLocalPathLabel(project)
       deleteFiles = window.confirm(
-        `Also delete the project folder and everything inside it from disk?\n\n${localPathLabel}\n\nClick Cancel to keep the files on disk.`,
+        `Also delete the project folder and everything inside it from disk?\n\n${localPathLabel}\n\nClick Cancel to remove only the Forge project record. Use Cancel when the folder is missing or was deleted outside Forge.`,
       )
     }
 
@@ -519,6 +519,7 @@ export default function ProjectDetailPage() {
           disabled={deleting}
           aria-busy={deleting}
           aria-label={`Delete project ${project.name}`}
+          title="Removes this project record. You can keep files on disk, which also works for orphaned projects whose folder is missing."
           className="text-destructive hover:bg-destructive/10 hover:text-destructive"
         >
           <Trash2Icon aria-hidden="true" />

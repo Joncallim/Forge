@@ -13,9 +13,16 @@ import {
   UsersIcon,
   ShieldCheckIcon,
   GitBranchIcon,
+  InfoIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+} from '@/components/ui/select'
 import { MarkdownView } from '@/components/MarkdownView'
 import { PlanDiffView } from '@/components/PlanDiffView'
 import { useTaskStream } from '@/hooks/useTaskStream'
@@ -42,10 +49,19 @@ interface Task {
   title: string
   prompt: string
   status: string
+  pmProviderConfigId: string | null
   githubPrUrl: string | null
   errorMessage: string | null
   createdAt: string
   updatedAt: string
+}
+
+type ProviderConfig = {
+  id: string
+  displayName: string
+  providerType: string
+  modelId: string
+  isActive: boolean
 }
 
 interface TaskAttempt {
@@ -115,6 +131,10 @@ function formatCost(usd: string | null): string {
   const num = parseFloat(usd)
   if (isNaN(num)) return '—'
   return `$${num.toFixed(4)}`
+}
+
+function pluralize(count: number, singular: string, plural = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : plural}`
 }
 
 const ARTIFACT_LABELS: Record<string, string> = {
@@ -217,6 +237,19 @@ function recordField(record: WorkforceRecord, keys: string[]): WorkforceRecord |
 function metadataStringField(record: WorkforceRecord, keys: string[]): string {
   const metadata = recordField(record, ['metadata'])
   return metadata ? stringField(metadata, keys) : ''
+}
+
+function numberField(record: WorkforceRecord, keys: string[]): number | null {
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+  return null
+}
+
+function metadataNumberField(record: WorkforceRecord, keys: string[]): number | null {
+  const metadata = recordField(record, ['metadata'])
+  return metadata ? numberField(metadata, keys) : null
 }
 
 function booleanField(record: WorkforceRecord, keys: string[]): boolean | null {
@@ -791,6 +824,9 @@ function WorkforcePanel({
   if (!hasPersistedPlan && !hasFallback && vcsChanges.length === 0) return null
 
   const fallbackTasks = fallbackAgents.reduce((sum, agent) => sum + agent.tasks, 0)
+  const persistedTaskCount = workPackages.reduce((sum, pkg) => (
+    sum + Math.max(1, Math.trunc(metadataNumberField(pkg, ['plannedTasks', 'taskCount', 'tasks']) ?? stringArrayField(pkg, ['steps']).length))
+  ), 0)
 
   return (
     <section aria-labelledby="workforce-heading" className="rounded-lg border border-border p-4">
@@ -801,8 +837,8 @@ function WorkforcePanel({
         <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
           <UsersIcon className="size-3.5" aria-hidden="true" />
           {hasPersistedPlan
-            ? `${workPackages.length} packages · ${approvalGates.length} gates`
-            : `${fallbackAgents.length} agents · ${fallbackTasks} tasks`}
+            ? `${pluralize(workPackages.length, 'package')} · ${pluralize(persistedTaskCount, 'task')} · ${pluralize(approvalGates.length, 'approval checkpoint')}`
+            : `${pluralize(fallbackAgents.length, 'agent')} · ${pluralize(fallbackTasks, 'task')}`}
         </span>
       </div>
 
@@ -833,6 +869,7 @@ function WorkforcePanel({
                   const harnessName = stringField(pkg, ['harnessDisplayName', 'harnessRole'])
                   const mcpRequirements = jsonArrayField(pkg, ['mcpRequirements'])
                   const packageArtifacts = artifactArrayField<Artifact>(pkg, ['artifacts', 'packageArtifacts'])
+                  const taskCount = Math.max(1, Math.trunc(metadataNumberField(pkg, ['plannedTasks', 'taskCount', 'tasks']) ?? steps.length))
 
                   return (
                     <li key={recordKey(pkg, 'work-package', index)} className="border-t border-border pt-3 first:border-t-0 first:pt-0">
@@ -841,6 +878,7 @@ function WorkforcePanel({
                         {owner !== '' && <Badge variant="outline">{owner}</Badge>}
                         {harnessName !== '' && harnessName !== owner && <Badge variant="secondary">{harnessName}</Badge>}
                         {status !== '' && <Badge variant={statusBadgeVariant(status)}>{statusLabel(status)}</Badge>}
+                        <Badge variant="outline">{pluralize(taskCount, 'task')}</Badge>
                       </div>
                       {summary !== '' && <p className="mt-1 text-sm text-muted-foreground">{summary}</p>}
                       {criteria.length > 0 && (
@@ -1037,7 +1075,11 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
     proposed.required.length +
     proposed.optional.length +
     proposed.excluded.length
-  const statusVariant: StatusVariant = validation.status === 'warnings' ? 'outline' : 'secondary'
+  const missingClassificationOnly =
+    validation.warnings.length === 1 &&
+    validation.warnings[0] === 'Architect did not provide a machine-readable capability classification.'
+  const statusVariant: StatusVariant = validation.status === 'warnings' && !missingClassificationOnly ? 'outline' : 'secondary'
+  const statusLabelText = missingClassificationOnly ? 'Not classified' : statusLabel(validation.status)
 
   return (
     <section aria-labelledby="capability-classification-heading" className="rounded-lg border border-border p-4">
@@ -1045,14 +1087,22 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
         <h2 id="capability-classification-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
           Required capabilities
         </h2>
-        <Badge variant={statusVariant}>{statusLabel(validation.status)}</Badge>
+        <span className="flex items-center gap-1.5">
+          <span
+            aria-label="Capability classification is machine-readable routing metadata. If it is missing, use the visible implementation plan as the source of truth."
+            title="Capability classification is machine-readable routing metadata. If it is missing, use the visible implementation plan as the source of truth."
+          >
+            <InfoIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
+          </span>
+          <Badge variant={statusVariant}>{statusLabelText}</Badge>
+        </span>
       </div>
 
       <p className="mb-3 text-xs text-muted-foreground">
         Planning view only. The approved plan still controls which agents run.
       </p>
 
-      {validation.warnings.length > 0 && (
+      {validation.warnings.length > 0 && !missingClassificationOnly && (
         <div className="mb-3 rounded-lg border border-amber-300/40 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-700/40 dark:bg-amber-950/30 dark:text-amber-200">
           <p className="font-medium">Warnings</p>
           <ul className="mt-1 list-disc pl-4">
@@ -1065,7 +1115,9 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
 
       {total === 0 ? (
         <p className="text-sm text-muted-foreground">
-          No capabilities were listed for this plan.
+          {missingClassificationOnly
+            ? 'No machine-readable capability list was provided. Use the implementation plan and visible assignments.'
+            : 'No capabilities were listed for this plan.'}
         </p>
       ) : (
         <dl className="grid gap-3 text-sm">
@@ -1120,12 +1172,18 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
   const overlayCount = proposed ? Object.keys(proposed.promptOverlays).length : 0
   const subtaskCount = proposed?.mcpAwareSubtasks.length ?? 0
   const grantPreview = design.grantDecisions
+  const missingDesignOnly =
+    requirements.length === 0 &&
+    design.validation.blocked.length === 0 &&
+    design.validation.warnings.length === 1 &&
+    design.validation.warnings[0] === 'Architect did not provide a machine-readable MCP execution design.'
   const statusVariant: StatusVariant =
     design.validation.status === 'blocked'
       ? 'destructive'
-      : design.validation.status === 'warnings'
+      : design.validation.status === 'warnings' && !missingDesignOnly
         ? 'outline'
         : 'secondary'
+  const statusText = missingDesignOnly ? 'Not requested' : statusLabel(design.validation.status)
 
   return (
     <section aria-labelledby="mcp-access-plan-heading" className="rounded-lg border border-border p-4">
@@ -1133,7 +1191,15 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
         <h2 id="mcp-access-plan-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
           MCP tool access
         </h2>
-        <Badge variant={statusVariant}>{statusLabel(design.validation.status)}</Badge>
+        <span className="flex items-center gap-1.5">
+          <span
+            aria-label="This panel only tracks machine-readable MCP requests. If the plan says no external services, no MCP execution design is required."
+            title="This panel only tracks machine-readable MCP requests. If the plan says no external services, no MCP execution design is required."
+          >
+            <InfoIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
+          </span>
+          <Badge variant={statusVariant}>{statusText}</Badge>
+        </span>
       </div>
 
       <div className="mb-3 flex items-start gap-2 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
@@ -1154,7 +1220,7 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
         </div>
       )}
 
-      {design.validation.warnings.length > 0 && (
+      {design.validation.warnings.length > 0 && !missingDesignOnly && (
         <div className="mb-3 rounded-lg border border-amber-300/40 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-700/40 dark:bg-amber-950/30 dark:text-amber-200">
           <p className="font-medium">Warnings</p>
           <ul className="mt-1 list-disc pl-4">
@@ -1220,7 +1286,7 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
 
       {requirements.length === 0 ? (
         <p className="text-sm text-muted-foreground">
-          The Architect did not request MCP-backed execution for this plan.
+          The plan does not request MCP-backed execution.
         </p>
       ) : (
         <ul className="flex flex-col gap-3" aria-label="MCP requirements">
@@ -1355,6 +1421,7 @@ export default function TaskDetailPage() {
   const [workPackages, setWorkPackages] = useState<WorkPackage[]>([])
   const [approvalGates, setApprovalGates] = useState<ApprovalGate[]>([])
   const [vcsChanges, setVcsChanges] = useState<VcsChange[]>([])
+  const [providers, setProviders] = useState<ProviderConfig[]>([])
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
 
@@ -1364,6 +1431,7 @@ export default function TaskDetailPage() {
   const [actionMode, setActionMode] = useState<'none' | 'restart' | 'replan'>('none')
   const [rejectReason, setRejectReason] = useState('')
   const [replanFeedback, setReplanFeedback] = useState('')
+  const [retryProviderId, setRetryProviderId] = useState<string | null>(null)
 
   // SSE stream
   const {
@@ -1396,6 +1464,7 @@ export default function TaskDetailPage() {
       }
       const data = await res.json() as TaskDetailResponse
       setTask(data.task ?? null)
+      setRetryProviderId(data.task?.pmProviderConfigId ?? null)
       setInitialRuns(data.runs ?? [])
       setInitialArtifacts(data.artifacts ?? [])
       setInitialQuestions(data.questions ?? [])
@@ -1410,9 +1479,21 @@ export default function TaskDetailPage() {
     }
   }, [taskId])
 
+  const loadProviders = useCallback(async () => {
+    try {
+      const res = await fetch('/api/providers')
+      if (!res.ok) return
+      const data = await res.json() as { providers?: ProviderConfig[] }
+      setProviders(data.providers ?? [])
+    } catch {
+      setProviders([])
+    }
+  }, [])
+
   useEffect(() => {
     loadTask()
-  }, [loadTask])
+    loadProviders()
+  }, [loadProviders, loadTask])
 
   // Refresh task when SSE reports a state where persisted side data may have changed.
   useEffect(() => {
@@ -1506,6 +1587,28 @@ export default function TaskDetailPage() {
     }
   }
 
+  async function handleRetry(e: React.FormEvent) {
+    e.preventDefault()
+    setActionLoading(true)
+    setActionError(null)
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/retry`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pmProviderConfigId: retryProviderId }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to retry task')
+      }
+      await loadTask()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center px-4 py-16" role="status" aria-live="polite">
@@ -1542,6 +1645,7 @@ export default function TaskDetailPage() {
   }
 
   const isAwaitingApproval = (currentStatus ?? task.status) === 'awaiting_approval'
+  const canRetryTask = ['failed', 'cancelled', 'rejected'].includes(currentStatus ?? task.status)
   const plannedAgents = plannedAgentsFromArtifacts(mergedArtifacts)
   const capabilityClassification = latestCapabilityClassificationFromArtifacts(mergedArtifacts)
   const mcpExecutionDesign = latestMcpExecutionDesignFromArtifacts(mergedArtifacts)
@@ -1750,6 +1854,53 @@ export default function TaskDetailPage() {
                 </form>
               )}
             </div>
+          )}
+
+          {canRetryTask && (
+            <form onSubmit={handleRetry} className="mb-6 rounded-lg border border-border bg-card p-4">
+              <div className="mb-3 flex items-start gap-2 text-sm text-muted-foreground">
+                <CircleAlertIcon className="mt-0.5 size-4 shrink-0 text-amber-600" aria-hidden="true" />
+                <p>
+                  Retry requeues this task from the beginning. Switching models can change the plan output; use it when the previous provider is offline or unsuitable.
+                </p>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
+                <div className="flex flex-col gap-1.5">
+                  <label htmlFor="retry-provider" className="text-sm font-medium text-foreground">
+                    Model
+                  </label>
+                  <Select
+                    value={retryProviderId ?? 'task-default'}
+                    onValueChange={(value) => setRetryProviderId(value === 'task-default' ? null : value)}
+                    disabled={actionLoading}
+                  >
+                    <SelectTrigger id="retry-provider" className="w-full">
+                      <span data-slot="select-value" className="truncate">
+                        {retryProviderId
+                          ? providers.find((provider) => provider.id === retryProviderId)?.displayName ?? 'Selected provider'
+                          : 'Task default'}
+                      </span>
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="task-default">Task default</SelectItem>
+                      {providers.map((provider) => (
+                        <SelectItem key={provider.id} value={provider.id}>
+                          {provider.displayName} · {provider.modelId}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <Button type="submit" size="sm" disabled={actionLoading} aria-busy={actionLoading}>
+                  {actionLoading ? 'Retrying…' : 'Retry task'}
+                </Button>
+              </div>
+              {actionError !== null && (
+                <p role="alert" aria-live="assertive" className="mt-3 text-sm text-destructive">
+                  {actionError}
+                </p>
+              )}
+            </form>
           )}
 
           {/* Agent run timeline */}

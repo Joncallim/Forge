@@ -7,6 +7,7 @@ import {
   Trash2Icon,
   RefreshCwIcon,
   ExternalLinkIcon,
+  InfoIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -86,6 +87,9 @@ const ACP_AUTH_LABELS: Record<AcpAuthMode, string> = {
   cli: 'CLI login',
   unknown: 'Agent-managed auth',
 }
+
+const LMSTUDIO_START_TITLE =
+  'LM Studio model must be loaded and started in LM Studio before Forge can reach it.'
 
 // ---------------------------------------------------------------------------
 // Form state
@@ -398,6 +402,17 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
                 aria-label="Fetch available models from this provider"
               >
                 {modelsLoading ? 'Fetching…' : 'Fetch models'}
+              </Button>
+            )}
+            {form.providerType === 'lmstudio' && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label={LMSTUDIO_START_TITLE}
+                title={LMSTUDIO_START_TITLE}
+              >
+                <InfoIcon className="size-4 text-muted-foreground" aria-hidden="true" />
               </Button>
             )}
           </div>
@@ -807,8 +822,13 @@ export default function ProvidersPage() {
         lmstudioReachable: boolean
       }
       const changed = data.added.length + (data.updated?.length ?? 0)
+      const lmStudioChanged = [...data.added, ...(data.updated ?? [])]
+        .some((model) => model.providerType === 'lmstudio')
       if (changed > 0) {
-        setDiscoverMsg(`Updated ${changed} local model${changed === 1 ? '' : 's'}.`)
+        setDiscoverMsg(
+          `Updated ${changed} local model${changed === 1 ? '' : 's'}.` +
+          (lmStudioChanged ? ' LM Studio models must be started in LM Studio before Forge can reach them.' : ''),
+        )
       } else if (data.found > 0) {
         setDiscoverMsg('Local models found are already configured.')
       } else if (!data.ollamaReachable && !data.lmstudioReachable) {
@@ -940,13 +960,26 @@ export default function ProvidersPage() {
                     </span>
                   </td>
                   <td className="px-4 py-3">
-                    <span
-                      className="max-w-[180px] truncate font-mono text-xs text-foreground block"
-                      title={provider.modelId}
-                    >
-                      {provider.providerType === 'acp'
-                        ? getAcpAgent(provider.modelId)?.label ?? provider.modelId
-                        : provider.modelId}
+                    <span className="flex max-w-[220px] items-center gap-1.5">
+                      <span
+                        className="min-w-0 truncate font-mono text-xs text-foreground"
+                        title={provider.modelId}
+                      >
+                        {provider.providerType === 'acp'
+                          ? getAcpAgent(provider.modelId)?.label ?? provider.modelId
+                          : provider.modelId}
+                      </span>
+                      {provider.providerType === 'lmstudio' && (
+                        <span
+                          aria-label={LMSTUDIO_START_TITLE}
+                          title={LMSTUDIO_START_TITLE}
+                        >
+                          <InfoIcon
+                            className="size-3.5 shrink-0 text-muted-foreground"
+                            aria-hidden="true"
+                          />
+                        </span>
+                      )}
                     </span>
                   </td>
                   <td className="px-4 py-3">
