@@ -28,6 +28,99 @@ function truncateProviderError(err: unknown): string {
   return raw.slice(0, 200)
 }
 
+function optionalAuthorizationHeaders(config: ProviderConfig): Record<string, string> {
+  if (!config.apiKeyCiphertext) return {}
+  return { Authorization: `Bearer ${decryptSecret(config.apiKeyCiphertext)}` }
+}
+
+function normalizeOllamaNativeApiBaseUrl(baseUrl: string | null | undefined): string | undefined {
+  const raw = baseUrl?.trim() || PROVIDER_CATALOG.ollama.defaultBaseUrl
+  if (!raw?.trim()) return undefined
+
+  const normalized = raw.trim().replace(/\/+$/, '')
+  if (normalized.endsWith('/v1')) return normalized.slice(0, -'/v1'.length)
+  return normalized
+}
+
+function ollamaModelNames(payload: unknown): string[] {
+  if (!payload || typeof payload !== 'object') return []
+  const models = (payload as { models?: unknown }).models
+  if (!Array.isArray(models)) return []
+
+  return models.flatMap((model) => {
+    if (!model || typeof model !== 'object') return []
+    const { name, model: modelId } = model as { name?: unknown; model?: unknown }
+    return [name, modelId].filter((value): value is string => typeof value === 'string')
+  })
+}
+
+function ollamaModelIsInstalled(modelNames: string[], modelId: string): boolean {
+  return modelNames.includes(modelId) || (!modelId.includes(':') && modelNames.includes(`${modelId}:latest`))
+}
+
+async function checkOllamaHealth(
+  config: ProviderConfig,
+  envVarPresent: boolean,
+): Promise<ProviderHealthResult> {
+  const nativeBaseUrl = normalizeOllamaNativeApiBaseUrl(config.baseUrl)
+  if (!nativeBaseUrl) {
+    return {
+      reachable: false,
+      envVarPresent,
+      latencyMs: null,
+      error: 'A base URL is required to check Ollama health',
+    }
+  }
+
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let timedOut = false
+  const controller = new AbortController()
+  const start = Date.now()
+
+  try {
+    timer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, HEALTH_TIMEOUT_MS)
+
+    const res = await fetch(`${nativeBaseUrl}/api/tags`, {
+      method: 'GET',
+      headers: optionalAuthorizationHeaders(config),
+      signal: controller.signal,
+    })
+
+    if (!res.ok) {
+      throw new Error(`Ollama returned ${res.status}`)
+    }
+
+    const modelNames = ollamaModelNames(await res.json())
+    if (!ollamaModelIsInstalled(modelNames, config.modelId)) {
+      return {
+        reachable: false,
+        envVarPresent,
+        latencyMs: Date.now() - start,
+        error: `Ollama is reachable, but model "${config.modelId}" is not installed`,
+      }
+    }
+
+    return {
+      reachable: true,
+      envVarPresent,
+      latencyMs: Date.now() - start,
+      error: null,
+    }
+  } catch (err: unknown) {
+    return {
+      reachable: false,
+      envVarPresent,
+      latencyMs: null,
+      error: timedOut ? `Health check timed out after ${HEALTH_TIMEOUT_MS}ms` : truncateProviderError(err),
+    }
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 async function checkLmStudioHealth(
   config: ProviderConfig,
   envVarPresent: boolean,
@@ -107,6 +200,10 @@ export async function checkProviderHealth(
 
   if (config.providerType === 'lmstudio') {
     return checkLmStudioHealth(config, envVarPresent)
+  }
+
+  if (config.providerType === 'ollama') {
+    return checkOllamaHealth(config, envVarPresent)
   }
 
   let reachable = false

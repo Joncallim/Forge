@@ -111,7 +111,7 @@ function projectLocationLabel(project: Project): string {
 }
 
 function directoryListingPathLabel(listing: DirectoryListing | null): string {
-  return listing?.displayPath ?? listing?.path ?? 'Loading folders...'
+  return listing?.displayPath ?? listing?.path ?? 'Loading folders…'
 }
 
 function parentPathInputValue(listing: DirectoryListing | null, parentPath: string): string {
@@ -214,7 +214,7 @@ export default function ProjectsPage() {
       const res = await fetch('/api/github/repos')
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
-        throw new Error(body.error ?? 'Failed to load GitHub repositories')
+          throw new Error(body.error ?? 'Failed to load GitHub repositories')
       }
       const data = await res.json()
       setCloneRepos(data.repos ?? [])
@@ -482,7 +482,7 @@ export default function ProjectsPage() {
               {formSource === 'github' && (
                 <div className="flex flex-col gap-1.5">
                   <label htmlFor="github-repository" className="text-sm font-medium text-foreground">
-                    GitHub Repo <span aria-hidden="true" className="text-destructive">*</span>
+                    GitHub repository <span aria-hidden="true" className="text-destructive">*</span>
                   </label>
                   <input
                     id="github-repository"
@@ -508,7 +508,7 @@ export default function ProjectsPage() {
                     id="github-repository-help"
                     className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
                   >
-                    Need repo permissions? Run <code className="font-mono text-foreground">gh auth login --scopes repo,workflow</code>.
+                    Need repository access? Run <code className="font-mono text-foreground">gh auth login --scopes repo,workflow</code>.
                   </div>
                 </div>
               )}
@@ -516,7 +516,7 @@ export default function ProjectsPage() {
               {formSource === 'local' && (
                 <div className="flex min-w-0 flex-col gap-2">
                   <label htmlFor="project-local-parent-path" className="text-sm font-medium text-foreground">
-                    Parent Folder <span aria-hidden="true" className="text-destructive">*</span>
+                    Parent folder <span aria-hidden="true" className="text-destructive">*</span>
                   </label>
                   <div className="flex gap-2">
                     <input
@@ -632,7 +632,7 @@ export default function ProjectsPage() {
 
                     {folderLoading ? (
                       <p className="px-3 py-4 text-center text-xs text-muted-foreground">
-                        Loading...
+                        Loading…
                       </p>
                     ) : folderListing !== null && folderListing.directories.length > 0 ? (
                       <div className="max-h-52 overflow-x-hidden overflow-y-auto p-1">
@@ -658,14 +658,14 @@ export default function ProjectsPage() {
                       </div>
                     ) : (
                       <p className="px-3 py-4 text-center text-xs text-muted-foreground">
-                        No child folders.
+                        No folders inside this folder.
                       </p>
                     )}
                   </div>
 
                   {!currentFolderIsGitRepo && localPathPreview !== '' && (
                     <div className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-                      New project path:{' '}
+                      New project folder:{' '}
                       <code className="break-all font-mono text-foreground">{localPathPreview}</code>
                     </div>
                   )}
@@ -675,11 +675,11 @@ export default function ProjectsPage() {
               {formSource === 'clone' && (
                 <div className="flex min-w-0 flex-col gap-2">
                   <label htmlFor="clone-repository" className="text-sm font-medium text-foreground">
-                    GitHub Repo <span aria-hidden="true" className="text-destructive">*</span>
+                    GitHub repository <span aria-hidden="true" className="text-destructive">*</span>
                   </label>
 
                   {cloneReposLoading && (
-                    <p className="px-1 py-1 text-xs text-muted-foreground">Loading your repositories...</p>
+                    <p className="px-1 py-1 text-xs text-muted-foreground">Loading your repositories…</p>
                   )}
 
                   {cloneReposError !== null && (
@@ -689,7 +689,7 @@ export default function ProjectsPage() {
                     >
                       {cloneReposError}
                       <div className="mt-1 text-muted-foreground">
-                        Need repo permissions? Run <code className="font-mono text-foreground">gh auth login --scopes repo,workflow</code>.
+                        Need repository access? Run <code className="font-mono text-foreground">gh auth login --scopes repo,workflow</code>.
                       </div>
                       <button
                         type="button"
@@ -734,7 +734,7 @@ export default function ProjectsPage() {
                   )}
 
                   <label htmlFor="clone-local-parent-path" className="mt-2 text-sm font-medium text-foreground">
-                    Destination Folder <span aria-hidden="true" className="text-destructive">*</span>
+                    Destination folder <span aria-hidden="true" className="text-destructive">*</span>
                   </label>
                   <div className="flex gap-2">
                     <input
@@ -838,7 +838,7 @@ export default function ProjectsPage() {
 
                     {folderLoading ? (
                       <p className="px-3 py-4 text-center text-xs text-muted-foreground">
-                        Loading...
+                        Loading…
                       </p>
                     ) : folderListing !== null && folderListing.directories.length > 0 ? (
                       <div className="max-h-52 overflow-x-hidden overflow-y-auto p-1">
@@ -864,14 +864,14 @@ export default function ProjectsPage() {
                       </div>
                     ) : (
                       <p className="px-3 py-4 text-center text-xs text-muted-foreground">
-                        No child folders.
+                        No folders inside this folder.
                       </p>
                     )}
                   </div>
 
                   {localPathPreview !== '' && (
                     <div className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-                      Repository will be cloned to:{' '}
+                      Clone destination:{' '}
                       <code className="break-all font-mono text-foreground">{localPathPreview}</code>
                     </div>
                   )}
@@ -880,7 +880,7 @@ export default function ProjectsPage() {
 
               <div className="flex flex-col gap-1.5">
                 <label htmlFor="project-branch" className="text-sm font-medium text-foreground">
-                  {formSource === 'local' ? 'Initial Branch' : 'Default Branch'}
+                  {formSource === 'local' ? 'Initial branch' : 'Default branch'}
                 </label>
                 <input
                   id="project-branch"
@@ -905,7 +905,7 @@ export default function ProjectsPage() {
 
               <DialogFooter>
                 <Button type="submit" disabled={submitting} aria-busy={submitting}>
-                  {submitting ? (formSource === 'clone' ? 'Cloning…' : 'Creating…') : 'Create Project'}
+                  {submitting ? (formSource === 'clone' ? 'Cloning…' : 'Creating…') : 'Create project'}
                 </Button>
               </DialogFooter>
             </form>
@@ -974,7 +974,7 @@ export default function ProjectsPage() {
                   {projectLocationLabel(project)}
                 </p>
                 <span className={mcpSummaryClassName(project.mcpSummary)}>
-                  <span className="truncate">{project.mcpSummary?.label ?? 'MCPs: Not checked'}</span>
+                  <span className="truncate">{project.mcpSummary?.label ?? 'MCP tools not checked'}</span>
                 </span>
                 <p className="mt-3 text-xs text-muted-foreground">
                   Created {formatDate(project.createdAt)}

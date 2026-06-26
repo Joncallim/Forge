@@ -153,7 +153,7 @@ export default function McpsPage() {
     <div className="px-4 py-6 sm:px-6 lg:px-8">
       <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h1 className="text-xl font-semibold text-foreground">MCPs</h1>
+          <h1 className="text-xl font-semibold text-foreground">MCP tools</h1>
           {workspace && (
             <p className="mt-1 font-mono text-sm text-muted-foreground break-all">
               {workspaceMcpRootLabel(workspace)}
@@ -169,7 +169,7 @@ export default function McpsPage() {
 
       {loading && (
         <div className="flex items-center justify-center py-16" role="status" aria-live="polite">
-          <span className="text-sm text-muted-foreground">Loading MCPs…</span>
+          <span className="text-sm text-muted-foreground">Loading MCP tools…</span>
         </div>
       )}
 
@@ -220,7 +220,7 @@ export default function McpsPage() {
                     disabled={!selectedProject}
                   >
                     <ExternalLinkIcon aria-hidden="true" />
-                    Project MCPs
+                    Project tools
                   </Button>
                 </li>
               ))}
@@ -231,7 +231,7 @@ export default function McpsPage() {
             <div className="mb-3 flex items-center gap-2">
               <HammerIcon className="size-4 text-muted-foreground" aria-hidden="true" />
               <h2 id="mcp-installer-heading" className="text-sm font-medium text-foreground">
-                Install From Source
+                Install from source
               </h2>
             </div>
             <form onSubmit={createInstallerTask} className="flex flex-col gap-4">
@@ -285,7 +285,7 @@ export default function McpsPage() {
               )}
 
               <Button type="submit" disabled={submitting || !selectedProjectId || source.trim().length === 0} aria-busy={submitting}>
-                {submitting ? 'Creating…' : 'Create Installer Task'}
+                {submitting ? 'Creating…' : 'Create installer task'}
               </Button>
             </form>
           </section>

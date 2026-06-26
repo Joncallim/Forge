@@ -149,7 +149,7 @@ function WorkspaceCard() {
         <form onSubmit={handleSave} className="flex flex-col gap-4">
           <div className="flex flex-col gap-1.5">
             <label htmlFor="workspace-root" className="text-sm font-medium text-foreground">
-              Workspace Root
+              Workspace folder
             </label>
             <input
               id="workspace-root"
@@ -168,7 +168,7 @@ function WorkspaceCard() {
               <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'projectsRoot')}</dd>
             </div>
             <div>
-              <dt className="font-medium text-foreground">MCPs</dt>
+              <dt className="font-medium text-foreground">MCP tools</dt>
               <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'mcpsRoot')}</dd>
             </div>
             <div>
@@ -176,7 +176,7 @@ function WorkspaceCard() {
               <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'templatesRoot')}</dd>
             </div>
             <div>
-              <dt className="font-medium text-foreground">Agent Prompts</dt>
+              <dt className="font-medium text-foreground">Agent prompts</dt>
               <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'agentPromptsRoot')}</dd>
             </div>
             <div>
@@ -192,14 +192,14 @@ function WorkspaceCard() {
               <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'forgeEnvPath')}</dd>
             </div>
             <div>
-              <dt className="font-medium text-foreground">Global Settings</dt>
+              <dt className="font-medium text-foreground">Global settings</dt>
               <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'globalSettingsPath')}</dd>
             </div>
           </dl>
 
           {workspace.envLocked && (
             <p className="text-xs text-muted-foreground">
-              <code className="font-mono">FORGE_WORKSPACE_ROOT</code> is set for this process.
+              Workspace location is locked by <code className="font-mono">FORGE_WORKSPACE_ROOT</code>.
             </p>
           )}
 
@@ -212,7 +212,7 @@ function WorkspaceCard() {
 
           <div>
             <Button type="submit" size="sm" disabled={saving || workspace.envLocked} aria-busy={saving}>
-              {saving ? 'Saving…' : 'Save Workspace'}
+              {saving ? 'Saving…' : 'Save workspace'}
             </Button>
           </div>
         </form>
@@ -291,7 +291,7 @@ function McpSettingsCard() {
     <section id="mcps" aria-labelledby="mcps-heading" className="rounded-xl border border-border bg-card p-5">
       <div className="mb-3 flex items-center justify-between gap-3">
         <h2 id="mcps-heading" className="text-lg font-semibold text-foreground">
-          MCPs
+          MCP tools
         </h2>
         <span className="inline-flex h-6 items-center rounded-full bg-gray-100 px-2.5 text-xs font-medium text-gray-700 dark:bg-gray-800 dark:text-gray-300">
           Shared
@@ -317,7 +317,7 @@ function McpSettingsCard() {
         <form onSubmit={handleSave} className="flex flex-col gap-4">
           <div className="flex flex-col gap-1.5">
             <label htmlFor="mcps-root" className="text-sm font-medium text-foreground">
-              MCP Root
+              MCP tools folder
             </label>
             <input
               id="mcps-root"
@@ -331,18 +331,18 @@ function McpSettingsCard() {
           </div>
           <dl className="grid gap-2 text-xs text-muted-foreground">
             <div>
-              <dt className="font-medium text-foreground">Managed Catalog</dt>
+              <dt className="font-medium text-foreground">Managed tools</dt>
               <dd>Filesystem, GitHub</dd>
             </div>
           </dl>
           <p className="text-xs text-muted-foreground">
-            Recommended MCP installation creates Forge-managed manifests under the shared root and checks project health from that state.
+            Recommended MCP tools are installed under this shared folder. Forge checks each project against that saved setup.
           </p>
 
           {workspace.envLocked && (
             <p className="text-xs text-muted-foreground">
-              <code className="font-mono">FORGE_WORKSPACE_ROOT</code> or{' '}
-              <code className="font-mono">FORGE_MCPS_ROOT</code> is set for this process.
+              MCP tool location is locked by <code className="font-mono">FORGE_WORKSPACE_ROOT</code> or{' '}
+              <code className="font-mono">FORGE_MCPS_ROOT</code>.
             </p>
           )}
 
@@ -355,7 +355,7 @@ function McpSettingsCard() {
 
           <div>
             <Button type="submit" size="sm" disabled={saving || workspace.envLocked} aria-busy={saving}>
-              {saving ? 'Saving…' : 'Save MCPs'}
+              {saving ? 'Saving…' : 'Save MCP tools'}
             </Button>
           </div>
         </form>
@@ -704,7 +704,7 @@ export default function SettingsPage() {
       <div className="mb-6">
         <h1 className="text-xl font-semibold text-foreground">Settings</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Connect external services Forge uses.
+          Manage workspace folders, MCP tools, GitHub, and sign-in security.
         </p>
       </div>
 

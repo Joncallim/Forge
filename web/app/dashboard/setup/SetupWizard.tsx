@@ -58,7 +58,7 @@ export function SetupWizard({ hasProviders }: SetupWizardProps) {
             <h1 className="text-xl font-semibold text-foreground">Setup</h1>
           </div>
           <p className="max-w-2xl text-sm leading-6 text-muted-foreground">
-            Select a provider preset to create model routes for the Forge agents.
+            Choose how Forge should connect its agents to models.
           </p>
         </div>
         {hasProviders && (
@@ -76,7 +76,7 @@ export function SetupWizard({ hasProviders }: SetupWizardProps) {
 
       {hasProviders && (
         <div className="mb-6 rounded-md border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
-          Providers are already configured. Applying a preset will update agent routing.
+          Providers are already configured. Applying a preset will update which models the built-in agents use.
         </div>
       )}
 
@@ -116,7 +116,7 @@ export function SetupWizard({ hasProviders }: SetupWizardProps) {
                 <dd className="mt-1 font-medium text-foreground">{preset.estimatedMonthlyCost}</dd>
               </div>
               <div>
-                <dt className="text-muted-foreground">Routes</dt>
+                <dt className="text-muted-foreground">Providers</dt>
                 <dd className="mt-1 font-medium text-foreground">{providerCount(preset.id)} providers</dd>
               </div>
             </dl>
@@ -138,7 +138,7 @@ export function SetupWizard({ hasProviders }: SetupWizardProps) {
               aria-label={`Apply ${preset.label} preset`}
             >
               {applyingPreset === preset.id ? (
-                'Applying...'
+                'Applying…'
               ) : (
                 <>
                   <CheckCircle2Icon className="size-4" aria-hidden="true" />

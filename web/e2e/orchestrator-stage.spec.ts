@@ -62,7 +62,7 @@ test.describe('Orchestrator-stage beta smoke', () => {
 
     await expect(page).toHaveURL(/\/dashboard\/tasks\/[0-9a-f-]+$/)
     await expect(page.getByRole('heading', { name: 'Draft smoke plan' })).toBeVisible()
-    await expect(page.getByText('Awaiting Approval', { exact: true })).toBeVisible()
+    await expect(page.getByText('Needs approval', { exact: true })).toBeVisible()
     await expect(page.getByText('Mock architect plan for Draft smoke plan')).toBeVisible()
     await expect(page.getByRole('button', { name: 'Approve generated plan' })).toBeVisible()
     await page.screenshot({

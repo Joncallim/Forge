@@ -134,8 +134,8 @@ function HealthDot({ health }: { health: ProviderHealth | 'loading' | 'error' | 
     return (
       <span
         className="inline-flex flex-col gap-0.5"
-        aria-label="Checking health"
-        title="Checking health"
+        aria-label="Checking connection"
+        title="Checking connection"
       >
         <span className="inline-flex items-center gap-1.5">
           <span className="size-2 rounded-full bg-gray-300 dark:bg-gray-600 animate-pulse" aria-hidden="true" />
@@ -146,7 +146,7 @@ function HealthDot({ health }: { health: ProviderHealth | 'loading' | 'error' | 
   }
   if (health === 'error') {
     return (
-      <span className="inline-flex flex-col gap-0.5" aria-label="Health check failed" title="Health check failed">
+      <span className="inline-flex flex-col gap-0.5" aria-label="Connection check failed" title="Connection check failed">
         <span className="inline-flex items-center gap-1.5">
           <span className="size-2 rounded-full bg-gray-400" aria-hidden="true" />
           <span className="text-xs text-muted-foreground">Unknown</span>
@@ -156,7 +156,7 @@ function HealthDot({ health }: { health: ProviderHealth | 'loading' | 'error' | 
   }
   if (health.checkedAt === null) {
     return (
-      <span className="inline-flex flex-col gap-0.5" aria-label="Provider health not checked" title={health.error ?? 'Not checked'}>
+      <span className="inline-flex flex-col gap-0.5" aria-label="Connection not checked" title={health.error ?? 'Not checked'}>
         <span className="inline-flex items-center gap-1.5">
           <span className="size-2 rounded-full bg-gray-400" aria-hidden="true" />
           <span className="text-xs text-muted-foreground">Not checked</span>
@@ -166,10 +166,10 @@ function HealthDot({ health }: { health: ProviderHealth | 'loading' | 'error' | 
   }
   if (!health.envVarPresent) {
     return (
-      <span className="inline-flex flex-col gap-0.5" aria-label="Environment variable missing" title="Environment variable missing">
+      <span className="inline-flex flex-col gap-0.5" aria-label="API key missing" title="API key missing">
         <span className="inline-flex items-center gap-1.5">
           <span className="size-2 rounded-full bg-yellow-400" aria-hidden="true" />
-          <span className="text-xs text-muted-foreground">Env var missing</span>
+          <span className="text-xs text-muted-foreground">Missing key</span>
         </span>
         <span className="text-[11px] text-muted-foreground">{lastChecked ?? 'Not checked'}</span>
       </span>
@@ -177,7 +177,7 @@ function HealthDot({ health }: { health: ProviderHealth | 'loading' | 'error' | 
   }
   if (!health.reachable) {
     return (
-      <span className="inline-flex flex-col gap-0.5" aria-label="Provider unreachable" title={health.error ?? 'Unreachable'}>
+      <span className="inline-flex flex-col gap-0.5" aria-label="Provider is unreachable" title={health.error ?? 'Unreachable'}>
         <span className="inline-flex items-center gap-1.5">
           <span className="size-2 rounded-full bg-red-500" aria-hidden="true" />
           <span className="text-xs text-muted-foreground">Unreachable</span>
@@ -280,7 +280,7 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
       {/* Display name */}
       <div className="flex flex-col gap-1.5">
         <label htmlFor="pf-displayName" className="text-sm font-medium text-foreground">
-          Display name <span aria-hidden="true" className="text-destructive">*</span>
+          Name <span aria-hidden="true" className="text-destructive">*</span>
         </label>
         <input
           id="pf-displayName"
@@ -288,7 +288,7 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
           required
           value={form.displayName}
           onChange={(e) => set('displayName', e.target.value)}
-          placeholder="My Anthropic Provider"
+          placeholder="Anthropic main model"
           className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
           aria-required="true"
         />
@@ -322,7 +322,7 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
       {/* Model ID / ACP agent */}
       <div className="flex flex-col gap-1.5">
         <label htmlFor="pf-modelId" className="text-sm font-medium text-foreground">
-          {isAcp ? 'ACP agent' : 'Model ID'} <span aria-hidden="true" className="text-destructive">*</span>
+          {isAcp ? 'ACP agent' : 'Model'} <span aria-hidden="true" className="text-destructive">*</span>
         </label>
         {isAcp ? (
           <>
@@ -341,7 +341,7 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
               </SelectContent>
             </Select>
             <div className="rounded-lg border border-yellow-200 bg-yellow-50 px-3 py-2 text-xs text-yellow-900 dark:border-yellow-900/40 dark:bg-yellow-950/20 dark:text-yellow-200">
-              ACP configs are saved for setup only. Task execution is not enabled yet.
+              ACP agents are saved for setup only. Forge cannot run tasks through them yet.
             </div>
             {selectedAcpAgent && (
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
@@ -395,7 +395,7 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
                 size="sm"
                 onClick={() => void handleFetchModels()}
                 disabled={modelsLoading || (needsApiKey && !form.apiKey.trim() && !keyAlreadySet)}
-                aria-label="Fetch available models from provider API"
+                aria-label="Fetch available models from this provider"
               >
                 {modelsLoading ? 'Fetching…' : 'Fetch models'}
               </Button>
@@ -425,7 +425,7 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
       {showBaseUrl && (
         <div className="flex flex-col gap-1.5">
           <label htmlFor="pf-baseUrl" className="text-sm font-medium text-foreground">
-            Base URL{' '}
+            Endpoint URL{' '}
             {baseUrlRequired
               ? <span aria-hidden="true" className="text-destructive">*</span>
               : <span className="text-muted-foreground font-normal">(optional)</span>}
@@ -459,7 +459,7 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
             className="rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
           />
           <p className="text-xs text-muted-foreground">
-            Stored encrypted in the database.
+            Stored encrypted.
             {entry.apiKeyUrl && (
               <>
                 {' '}
@@ -675,9 +675,9 @@ export default function ProvidersPage() {
     const apiKey = !isAcp && entry.requiresApiKey ? addForm.apiKey.trim() || null : null
 
     if (!displayName) { setAddError('Display name is required.'); return }
-    if (!modelId) { setAddError(isAcp ? 'ACP agent is required.' : 'Model ID is required.'); return }
+    if (!modelId) { setAddError(isAcp ? 'ACP agent is required.' : 'Model is required.'); return }
     if (entry.requiresBaseUrl && !baseUrl) {
-      setAddError('Base URL is required for this provider type.')
+      setAddError('Endpoint URL is required for this provider.')
       return
     }
 
@@ -732,9 +732,9 @@ export default function ProvidersPage() {
     const typedApiKey = !isAcp && entry.requiresApiKey ? editForm.apiKey.trim() : ''
 
     if (!displayName) { setEditError('Display name is required.'); return }
-    if (!modelId) { setEditError(isAcp ? 'ACP agent is required.' : 'Model ID is required.'); return }
+    if (!modelId) { setEditError(isAcp ? 'ACP agent is required.' : 'Model is required.'); return }
     if (entry.requiresBaseUrl && !baseUrl) {
-      setEditError('Base URL is required for this provider type.')
+      setEditError('Endpoint URL is required for this provider.')
       return
     }
 
@@ -843,22 +843,22 @@ export default function ProvidersPage() {
           onClick={handleDiscoverLocal}
           disabled={discovering}
           aria-busy={discovering}
-          aria-label="Detect local models from Ollama and LM Studio"
+          aria-label="Find local models from Ollama and LM Studio"
         >
-          {discovering ? 'Detecting…' : 'Detect local models'}
+          {discovering ? 'Searching…' : 'Find local models'}
         </Button>
         <Dialog open={addOpen} onOpenChange={setAddOpen}>
           <DialogTrigger
             render={
               <Button size="sm" aria-label="Add provider" onClick={openAdd}>
                 <PlusIcon aria-hidden="true" />
-                Add Provider
+                Add provider
               </Button>
             }
           />
           <DialogContent className="sm:max-w-md" aria-labelledby="add-provider-title">
             <DialogHeader>
-              <DialogTitle id="add-provider-title">Add Provider</DialogTitle>
+              <DialogTitle id="add-provider-title">Add provider</DialogTitle>
             </DialogHeader>
             <ProviderForm
               form={addForm}
@@ -866,7 +866,7 @@ export default function ProvidersPage() {
               error={addError}
               submitting={addSubmitting}
               onSubmit={handleAdd}
-              submitLabel="Add Provider"
+              submitLabel="Add provider"
             />
           </DialogContent>
         </Dialog>
@@ -907,8 +907,7 @@ export default function ProvidersPage() {
       {!loading && fetchError === null && providers.length === 0 && (
         <div className="mb-8 flex flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border py-12 text-center">
           <p className="text-sm text-muted-foreground">
-            No providers configured yet. Add one above, or apply a recommended
-            configuration from the Agents page.
+            No providers yet. Add one above, or apply a recommended setup from the Agents page.
           </p>
         </div>
       )}
@@ -916,14 +915,14 @@ export default function ProvidersPage() {
       {/* Provider table */}
       {!loading && providers.length > 0 && (
         <div className="mb-8 overflow-x-auto rounded-xl border border-border">
-          <table className="min-w-full text-sm" role="table" aria-label="Provider configurations">
+          <table className="min-w-full text-sm" role="table" aria-label="Provider list">
             <thead>
               <tr className="border-b border-border bg-muted/40">
-                <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Display name</th>
+                <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Name</th>
                 <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Provider</th>
-                <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Model / Agent</th>
+                <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Model or agent</th>
                 <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Category</th>
-                <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Health</th>
+                <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Connection</th>
                 <th scope="col" className="px-4 py-3 text-right font-medium text-muted-foreground">
                   <span className="sr-only">Actions</span>
                 </th>
@@ -987,7 +986,7 @@ export default function ProvidersPage() {
                         </DialogTrigger>
                         <DialogContent className="sm:max-w-md" aria-labelledby="edit-provider-title">
                           <DialogHeader>
-                            <DialogTitle id="edit-provider-title">Edit Provider</DialogTitle>
+                            <DialogTitle id="edit-provider-title">Edit provider</DialogTitle>
                           </DialogHeader>
                           <ProviderForm
                             form={editForm}
@@ -995,7 +994,7 @@ export default function ProvidersPage() {
                             error={editError}
                             submitting={editSubmitting}
                             onSubmit={handleEdit}
-                            submitLabel="Save Changes"
+                            submitLabel="Save changes"
                             keyAlreadySet={provider.hasApiKey}
                           />
                         </DialogContent>
@@ -1025,10 +1024,10 @@ export default function ProvidersPage() {
             onClick={handleRefreshHealth}
             disabled={refreshingHealth || providers.length === 0}
             aria-busy={refreshingHealth}
-            aria-label="Refresh provider health"
+            aria-label="Check provider connections"
           >
             <RefreshCwIcon className="size-4" aria-hidden="true" />
-            {refreshingHealth ? 'Checking…' : 'Refresh health'}
+            {refreshingHealth ? 'Checking…' : 'Check connections'}
           </Button>
           <Button
             variant="outline"
