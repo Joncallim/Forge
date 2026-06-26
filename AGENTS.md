@@ -34,6 +34,7 @@ subagent system. Each agent is defined in `.codex/agents/`:
 | QA | `qa.toml` | Test writing, coverage analysis, regression checks |
 | DevOps | `devops.toml` | Docker, CI/CD, infra, deployment config |
 | Documentation | `documentation.toml` | README/docs/wiki shaping and ADR polish |
+| MCP Installer | `mcp-installer.toml` | Standalone MCP discovery, installation, configuration, and health checks |
 
 The web app stores agents as editable database records. The repository ships
 seed prompts for these Codex roles, but users may add more app agents and assign

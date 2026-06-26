@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { computeReadyWorkPackageIds, isWorkPackageHandoffEnabled } from '@/worker/work-package-handoff'
+import {
+  computeReadyWorkPackageIds,
+  isWorkPackageExecutionEnabled,
+  isWorkPackageHandoffEnabled,
+} from '@/worker/work-package-handoff'
 
 const packageBase = {
   assignedRole: 'backend',
@@ -48,5 +52,14 @@ describe('isWorkPackageHandoffEnabled', () => {
     expect(isWorkPackageHandoffEnabled({ FORGE_WORK_PACKAGE_HANDOFF: '1' })).toBe(true)
     expect(isWorkPackageHandoffEnabled({ FORGE_WORK_PACKAGE_HANDOFF: '0' })).toBe(false)
     expect(isWorkPackageHandoffEnabled({ FORGE_WORK_PACKAGE_HANDOFF: 'false' })).toBe(false)
+  })
+})
+
+describe('isWorkPackageExecutionEnabled', () => {
+  it('defaults off and supports explicit enable values', () => {
+    expect(isWorkPackageExecutionEnabled({})).toBe(false)
+    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: '1' })).toBe(true)
+    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'true' })).toBe(true)
+    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: '0' })).toBe(false)
   })
 })

@@ -3506,6 +3506,93 @@ describe('POST /api/tasks — enqueues to Redis', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Suite 3.7a — Stopped task retry can requeue with a provider override
+// ---------------------------------------------------------------------------
+
+describe('POST /api/tasks/:id/retry', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('returns 409 when the task is not stopped', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{
+      id: 'task-running',
+      status: 'running',
+      pmProviderConfigId: null,
+    }]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/retry/route')
+    const res = await POST(authRequest('/api/tasks/task-running/retry', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }) as never, { params: Promise.resolve({ id: 'task-running' }) })
+
+    expect(res.status).toBe(409)
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('returns 400 when the selected provider is inactive or missing', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'task-failed',
+        status: 'failed',
+        pmProviderConfigId: null,
+      }]))
+      .mockReturnValueOnce(chain([]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/retry/route')
+    const res = await POST(authRequest('/api/tasks/task-failed/retry', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pmProviderConfigId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' }),
+    }) as never, { params: Promise.resolve({ id: 'task-failed' }) })
+
+    expect(res.status).toBe(400)
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('sets a stopped task back to pending and requeues it', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const providerId = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'
+    mockDbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'task-failed',
+        status: 'failed',
+        pmProviderConfigId: null,
+      }]))
+      .mockReturnValueOnce(chain([{ id: providerId }]))
+    mockDbUpdate.mockReturnValue(chain([{
+      id: 'task-failed',
+      status: 'pending',
+      pmProviderConfigId: providerId,
+      updatedAt: new Date(),
+    }]))
+    mockRedisLpush.mockResolvedValue(1)
+
+    const { POST } = await import('@/app/api/tasks/[id]/retry/route')
+    const res = await POST(authRequest('/api/tasks/task-failed/retry', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pmProviderConfigId: providerId }),
+    }) as never, { params: Promise.resolve({ id: 'task-failed' }) })
+
+    expect(res.status).toBe(200)
+    expect(mockDbUpdate).toHaveBeenCalled()
+    expect(mockRedisLpush).toHaveBeenCalledOnce()
+    const [queueKey, payload] = mockRedisLpush.mock.calls[0]
+    expect(queueKey).toBe('forge:tasks')
+    expect(JSON.parse(payload as string)).toMatchObject({ taskId: 'task-failed' })
+    expect(mockRedisPublish).toHaveBeenCalledWith(
+      'forge:task:task-failed',
+      expect.stringContaining('"status":"pending"'),
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Suite 3.8 — Task listing includes the project name from the joined project
 // ---------------------------------------------------------------------------
 

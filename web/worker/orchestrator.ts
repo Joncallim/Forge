@@ -416,7 +416,7 @@ async function runArchitect(
     throw new Error('Architect agent config is missing')
   }
 
-  const providerConfigId = config.providerConfigId ?? task.pmProviderConfigId
+  const providerConfigId = task.pmProviderConfigId ?? config.providerConfigId
   if (!providerConfigId) {
     throw new Error('Architect agent has no provider configured')
   }

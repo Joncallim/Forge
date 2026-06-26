@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
+import { InfoIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 
 // ---------------------------------------------------------------------------
@@ -50,6 +51,16 @@ type WorkspaceSettings = {
 }
 
 const PAT_CREATE_URL = 'https://github.com/settings/tokens/new?scopes=repo,workflow&description=Forge'
+const DERIVED_WORKSPACE_PATH_KEYS: Array<[WorkspacePathKey, string]> = [
+  ['projectsRoot', 'Projects'],
+  ['mcpsRoot', 'MCP tools'],
+  ['templatesRoot', 'Templates'],
+  ['agentPromptsRoot', 'Agent prompts'],
+  ['workforcesRoot', 'Workforces'],
+  ['runtimeRoot', 'Runtime'],
+  ['forgeEnvPath', 'Environment'],
+  ['globalSettingsPath', 'Global settings'],
+]
 
 function workspaceDisplayPath(workspace: WorkspaceSettings, key: WorkspacePathKey): string {
   return workspace.displayPaths?.[key] ?? workspace[key]
@@ -162,40 +173,17 @@ function WorkspaceCard() {
             />
           </div>
 
-          <dl className="grid gap-2 text-xs text-muted-foreground">
-            <div>
-              <dt className="font-medium text-foreground">Projects</dt>
-              <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'projectsRoot')}</dd>
-            </div>
-            <div>
-              <dt className="font-medium text-foreground">MCP tools</dt>
-              <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'mcpsRoot')}</dd>
-            </div>
-            <div>
-              <dt className="font-medium text-foreground">Templates</dt>
-              <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'templatesRoot')}</dd>
-            </div>
-            <div>
-              <dt className="font-medium text-foreground">Agent prompts</dt>
-              <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'agentPromptsRoot')}</dd>
-            </div>
-            <div>
-              <dt className="font-medium text-foreground">Workforces</dt>
-              <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'workforcesRoot')}</dd>
-            </div>
-            <div>
-              <dt className="font-medium text-foreground">Runtime</dt>
-              <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'runtimeRoot')}</dd>
-            </div>
-            <div>
-              <dt className="font-medium text-foreground">Environment</dt>
-              <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'forgeEnvPath')}</dd>
-            </div>
-            <div>
-              <dt className="font-medium text-foreground">Global settings</dt>
-              <dd className="break-all font-mono">{workspaceDisplayPath(workspace, 'globalSettingsPath')}</dd>
-            </div>
-          </dl>
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <span
+              aria-label="Derived workspace paths"
+              title={DERIVED_WORKSPACE_PATH_KEYS
+                .map(([key, label]) => `${label}: ${workspaceDisplayPath(workspace, key)}`)
+                .join('\n')}
+            >
+              <InfoIcon className="size-3.5" aria-hidden="true" />
+            </span>
+            <span>Projects, MCP tools, templates, prompts, workforces, runtime files, and settings are stored under the workspace folder.</span>
+          </div>
 
           {workspace.envLocked && (
             <p className="text-xs text-muted-foreground">
