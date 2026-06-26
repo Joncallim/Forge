@@ -2,8 +2,8 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/db'
-import { providerConfigs, tasks, agentRuns, agentConfigs, type ProviderConfig } from '@/db/schema'
-import { eq, and, isNotNull, count } from 'drizzle-orm'
+import { providerConfigs, tasks, agentConfigs, type ProviderConfig } from '@/db/schema'
+import { eq, and, ne, asc, inArray } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { PROVIDER_TYPES, requiresProviderBaseUrl } from '@/lib/providers/types'
 import { toPublicProvider } from '@/lib/providers/serialize'
@@ -32,6 +32,21 @@ const updateProviderSchema = z.object({
   isLocal: z.boolean().optional(),
 })
 
+const deleteProviderSchema = z.object({
+  confirm: z.boolean().optional(),
+  confirmed: z.boolean().optional(),
+  expectedAgentConfigIds: z.array(z.string()).optional(),
+  expectedTaskIds: z.array(z.string()).optional(),
+})
+
+const NON_TERMINAL_TASK_STATUSES = [
+  'pending',
+  'running',
+  'awaiting_answers',
+  'awaiting_approval',
+  'approved',
+] as const
+
 function validateAcpProviderUpdate(
   data: z.infer<typeof updateProviderSchema>,
   existing: ProviderConfig,
@@ -59,6 +74,49 @@ function validateAcpProviderUpdate(
   }
 
   return null
+}
+
+type ProviderDeleteConfirmation = {
+  confirmed: boolean
+  expectedAgentConfigIds: string[]
+  expectedTaskIds: string[]
+}
+
+async function providerDeleteConfirmation(request: NextRequest): Promise<ProviderDeleteConfirmation> {
+  const url = request.nextUrl ?? new URL(request.url)
+  const rawConfirm = url.searchParams.get('confirm') ?? url.searchParams.get('confirmed')
+  if (rawConfirm && ['1', 'true', 'yes'].includes(rawConfirm.toLowerCase())) {
+    return {
+      confirmed: true,
+      expectedAgentConfigIds: [],
+      expectedTaskIds: [],
+    }
+  }
+
+  const contentType = request.headers.get('content-type') ?? ''
+  if (!contentType.toLowerCase().includes('application/json')) {
+    return { confirmed: false, expectedAgentConfigIds: [], expectedTaskIds: [] }
+  }
+
+  try {
+    const parsed = deleteProviderSchema.safeParse(await request.json())
+    if (!parsed.success) return { confirmed: false, expectedAgentConfigIds: [], expectedTaskIds: [] }
+    return {
+      confirmed: parsed.data.confirm === true || parsed.data.confirmed === true,
+      expectedAgentConfigIds: parsed.data.expectedAgentConfigIds ?? [],
+      expectedTaskIds: parsed.data.expectedTaskIds ?? [],
+    }
+  } catch {
+    return { confirmed: false, expectedAgentConfigIds: [], expectedTaskIds: [] }
+  }
+}
+
+function sameIdSet(left: string[], right: string[]): boolean {
+  const leftSet = new Set(left)
+  const rightSet = new Set(right)
+  if (leftSet.size !== left.length || rightSet.size !== right.length) return false
+  if (leftSet.size !== rightSet.size) return false
+  return [...leftSet].every((id) => rightSet.has(id))
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +288,7 @@ export async function DELETE(
     }
 
     const { id } = await params
+    const confirmation = await providerDeleteConfirmation(request)
 
     const [existing] = await db
       .select()
@@ -241,72 +300,205 @@ export async function DELETE(
       return NextResponse.json({ error: 'Provider config not found' }, { status: 404 })
     }
 
-    // Guard: check if this is the only active provider of its type AND it is referenced
-    // by tasks, agentRuns, or agentConfigs.
-    const [activeOfTypeResult] = await db
-      .select({ total: count() })
-      .from(providerConfigs)
+    const affectedAgents = await db
+      .select({
+        id: agentConfigs.id,
+        agentType: agentConfigs.agentType,
+        displayName: agentConfigs.displayName,
+      })
+      .from(agentConfigs)
+      .where(eq(agentConfigs.providerConfigId, id))
+      .orderBy(asc(agentConfigs.agentType))
+    const affectedTasks = await db
+      .select({
+        id: tasks.id,
+        title: tasks.title,
+        status: tasks.status,
+      })
+      .from(tasks)
       .where(
         and(
-          eq(providerConfigs.providerType, existing.providerType),
-          eq(providerConfigs.isActive, true),
+          eq(tasks.pmProviderConfigId, id),
+          inArray(tasks.status, [...NON_TERMINAL_TASK_STATUSES]),
         ),
       )
+      .orderBy(asc(tasks.createdAt))
+    const hasAssignments = affectedAgents.length > 0 || affectedTasks.length > 0
 
-    const activeOfTypeCount = Number(activeOfTypeResult?.total ?? 0)
+    const [defaultCandidate] = hasAssignments
+      ? await db
+        .select()
+        .from(providerConfigs)
+        .where(
+          and(
+            eq(providerConfigs.isActive, true),
+            ne(providerConfigs.providerType, 'acp'),
+            ne(providerConfigs.id, id),
+          ),
+        )
+        .orderBy(asc(providerConfigs.createdAt))
+        .limit(1)
+      : []
 
-    if (activeOfTypeCount <= 1) {
-      // This is the only active provider of its type — check for references
-      const [taskRef] = await db
-        .select({ total: count() })
+    const setupPrompt = defaultCandidate
+      ? null
+      : 'Create or activate another provider before running more work.'
+    const buildImpact = (
+      agents: typeof affectedAgents,
+      providerTasks: typeof affectedTasks,
+    ) => ({
+      provider: toPublicProvider(existing),
+      affectedAssignments: {
+        agentConfigs: agents.map((agent) => ({
+          id: agent.id,
+          role: agent.agentType,
+          displayName: agent.displayName || agent.agentType,
+        })),
+        tasks: providerTasks.map((task) => ({
+          id: task.id,
+          title: task.title,
+          status: task.status,
+        })),
+      },
+      hasDefaultProviderFallback: Boolean(defaultCandidate),
+      fallbackProvider: null,
+      setupPrompt,
+      message: [
+        agents.length > 0
+          ? `${agents.length} agent default${agents.length === 1 ? '' : 's'} will use the default provider.`
+          : null,
+        providerTasks.length > 0
+          ? `${providerTasks.length} active task provider override${providerTasks.length === 1 ? '' : 's'} will be cleared.`
+          : null,
+        setupPrompt,
+      ].filter(Boolean).join(' '),
+    })
+    const impact = buildImpact(affectedAgents, affectedTasks)
+
+    if (hasAssignments && !confirmation.confirmed) {
+      return NextResponse.json(
+        {
+          error: 'Provider deactivation requires confirmation because it affects current assignments.',
+          code: 'provider_deactivation_requires_confirmation',
+          confirmationRequired: true,
+          impact,
+        },
+        { status: 409 },
+      )
+    }
+
+    if (
+      hasAssignments &&
+      (
+        !sameIdSet(confirmation.expectedAgentConfigIds, affectedAgents.map((agent) => agent.id)) ||
+        !sameIdSet(confirmation.expectedTaskIds, affectedTasks.map((task) => task.id))
+      )
+    ) {
+      return NextResponse.json(
+        {
+          error: 'Provider deactivation impact changed. Review the updated affected assignments before confirming.',
+          code: 'provider_deactivation_requires_confirmation',
+          confirmationRequired: true,
+          impact,
+        },
+        { status: 409 },
+      )
+    }
+
+    const updatedAt = new Date()
+    let transactionImpact: typeof impact | null = null
+    await db.transaction(async (tx) => {
+      const currentAgents = await tx
+        .select({
+          id: agentConfigs.id,
+          agentType: agentConfigs.agentType,
+          displayName: agentConfigs.displayName,
+        })
+        .from(agentConfigs)
+        .where(eq(agentConfigs.providerConfigId, id))
+        .orderBy(asc(agentConfigs.agentType))
+      const currentTasks = await tx
+        .select({
+          id: tasks.id,
+          title: tasks.title,
+          status: tasks.status,
+        })
         .from(tasks)
         .where(
           and(
             eq(tasks.pmProviderConfigId, id),
-            isNotNull(tasks.pmProviderConfigId),
+            inArray(tasks.status, [...NON_TERMINAL_TASK_STATUSES]),
           ),
         )
+        .orderBy(asc(tasks.createdAt))
 
-      const [agentRunRef] = await db
-        .select({ total: count() })
-        .from(agentRuns)
-        .where(
-          and(
-            eq(agentRuns.providerConfigId, id),
-            isNotNull(agentRuns.providerConfigId),
-          ),
-        )
-
-      const [agentConfigRef] = await db
-        .select({ total: count() })
-        .from(agentConfigs)
-        .where(
-          and(
-            eq(agentConfigs.providerConfigId, id),
-            isNotNull(agentConfigs.providerConfigId),
-          ),
-        )
-
-      const hasReferences =
-        Number(taskRef?.total ?? 0) > 0 ||
-        Number(agentRunRef?.total ?? 0) > 0 ||
-        Number(agentConfigRef?.total ?? 0) > 0
-
-      if (hasReferences) {
-        return NextResponse.json(
-          { error: 'Cannot deactivate the only active provider. Assign an alternative first.' },
-          { status: 409 },
-        )
+      if (
+        !sameIdSet(confirmation.expectedAgentConfigIds, currentAgents.map((agent) => agent.id)) ||
+        !sameIdSet(confirmation.expectedTaskIds, currentTasks.map((task) => task.id))
+      ) {
+        transactionImpact = buildImpact(currentAgents, currentTasks)
+        return
       }
+
+      if (affectedAgents.length > 0) {
+        await tx
+          .update(agentConfigs)
+          .set({ providerConfigId: null, updatedAt })
+          .where(
+            and(
+              eq(agentConfigs.providerConfigId, id),
+              inArray(agentConfigs.id, affectedAgents.map((agent) => agent.id)),
+            ),
+          )
+      }
+
+      if (affectedTasks.length > 0) {
+        await tx
+          .update(tasks)
+          .set({ pmProviderConfigId: null, updatedAt })
+          .where(
+            and(
+              eq(tasks.pmProviderConfigId, id),
+              inArray(tasks.status, [...NON_TERMINAL_TASK_STATUSES]),
+              inArray(tasks.id, affectedTasks.map((task) => task.id)),
+            ),
+          )
+      }
+
+      await tx
+        .update(providerConfigs)
+        .set({ isActive: false, updatedAt })
+        .where(eq(providerConfigs.id, id))
+    })
+
+    if (transactionImpact) {
+      return NextResponse.json(
+        {
+          error: 'Provider deactivation impact changed. Review the updated affected assignments before confirming.',
+          code: 'provider_deactivation_requires_confirmation',
+          confirmationRequired: true,
+          impact: transactionImpact,
+        },
+        { status: 409 },
+      )
     }
 
-    await db
-      .update(providerConfigs)
-      .set({ isActive: false, updatedAt: new Date() })
-      .where(eq(providerConfigs.id, id))
-
-    console.info('[DELETE /api/providers/:id] Soft-deleted provider config', { id })
-    return NextResponse.json({ ok: true })
+    console.info('[DELETE /api/providers/:id] Soft-deleted provider config', {
+      id,
+      clearedAgentDefaults: affectedAgents.length,
+      clearedTaskOverrides: affectedTasks.length,
+      setupRequired: !defaultCandidate,
+    })
+    return NextResponse.json({
+      ok: true,
+      deactivatedProviderId: id,
+      fallbackProvider: null,
+      setupPrompt,
+      reassigned: {
+        agentConfigs: affectedAgents.length,
+        tasks: affectedTasks.length,
+      },
+    })
   } catch (err) {
     console.error('[DELETE /api/providers/:id] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

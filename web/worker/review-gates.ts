@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray } from 'drizzle-orm'
 import { db } from '../db'
-import { approvalGates, workPackages } from '../db/schema'
+import { approvalGates, artifacts, workPackages } from '../db/schema'
 import { publishTaskEvent } from './events'
 import { updateTaskStatusIfCurrent } from './task-state'
 
@@ -49,7 +49,7 @@ export type ReviewGateDecisionResult =
       cancelledGateIds: string[]
     }
   | {
-      status: 'not_found' | 'not_review_gate' | 'already_decided' | 'missing_work_package' | 'reviewer_blocked'
+      status: 'not_found' | 'not_review_gate' | 'already_decided' | 'missing_work_package' | 'reviewer_blocked' | 'source_artifact_mismatch'
       message: string
     }
 
@@ -264,6 +264,7 @@ export async function decideReviewGate(input: {
   decision: ReviewGateDecision
   gateId: string
   reason: string
+  sourceArtifactId: string
   taskId: string
   userId: string
 }): Promise<ReviewGateDecisionResult> {
@@ -272,6 +273,8 @@ export async function decideReviewGate(input: {
       id: approvalGates.id,
       gateType: approvalGates.gateType,
       metadata: approvalGates.metadata,
+      sourceAgentRunId: approvalGates.sourceAgentRunId,
+      sourceArtifactId: approvalGates.sourceArtifactId,
       status: approvalGates.status,
       workPackageId: approvalGates.workPackageId,
     })
@@ -289,7 +292,38 @@ export async function decideReviewGate(input: {
   if (!gate.workPackageId) {
     return { status: 'missing_work_package', message: 'Review gate is not linked to a work package.' }
   }
+  if (!gate.sourceArtifactId || gate.sourceArtifactId !== input.sourceArtifactId) {
+    return {
+      status: 'source_artifact_mismatch',
+      message: 'Review gate source artifact changed. Reload the task before deciding this review.',
+    }
+  }
+  if (!gate.sourceAgentRunId) {
+    return {
+      status: 'source_artifact_mismatch',
+      message: 'Review gate source run is missing. Reload the task before deciding this review.',
+    }
+  }
   const workPackageId = gate.workPackageId
+  const sourceAgentRunId = gate.sourceAgentRunId
+
+  const [sourceArtifact] = await db
+    .select({ id: artifacts.id })
+    .from(artifacts)
+    .where(
+      and(
+        eq(artifacts.id, input.sourceArtifactId),
+        eq(artifacts.agentRunId, sourceAgentRunId),
+      ),
+    )
+    .limit(1)
+
+  if (!sourceArtifact) {
+    return {
+      status: 'source_artifact_mismatch',
+      message: 'Review gate source artifact is not available. Reload the task before deciding this review.',
+    }
+  }
 
   if (gate.gateType === 'reviewer_review' && input.decision === 'completed') {
     const [qaGate] = await db
@@ -321,7 +355,7 @@ export async function decideReviewGate(input: {
       source: 'review-gates',
     }
 
-    await tx
+    const [decidedGate] = await tx
       .update(approvalGates)
       .set({
         status: input.decision,
@@ -330,7 +364,23 @@ export async function decideReviewGate(input: {
         decidedBy: input.userId,
         updatedAt: now,
       })
-      .where(and(eq(approvalGates.id, gate.id), eq(approvalGates.status, 'pending')))
+      .where(
+        and(
+          eq(approvalGates.id, gate.id),
+          eq(approvalGates.status, 'pending'),
+          eq(approvalGates.sourceArtifactId, input.sourceArtifactId),
+          eq(approvalGates.sourceAgentRunId, sourceAgentRunId),
+        ),
+      )
+      .returning({ id: approvalGates.id })
+
+    if (!decidedGate) {
+      return {
+        cancelledGateIds: [] as string[],
+        packageStatus: null,
+        sourceArtifactChanged: true,
+      }
+    }
 
     if (input.decision === 'needs_rework') {
       await tx
@@ -366,6 +416,7 @@ export async function decideReviewGate(input: {
       return {
         cancelledGateIds: cancelledGates.map((cancelledGate) => cancelledGate.id),
         packageStatus: 'needs_rework' as const,
+        sourceArtifactChanged: false,
       }
     }
 
@@ -404,8 +455,16 @@ export async function decideReviewGate(input: {
     return {
       cancelledGateIds: [] as string[],
       packageStatus: packageComplete ? 'completed' as const : 'awaiting_review' as const,
+      sourceArtifactChanged: false,
     }
   })
+
+  if (decided.sourceArtifactChanged) {
+    return {
+      status: 'source_artifact_mismatch',
+      message: 'Review gate source artifact changed. Reload the task before deciding this review.',
+    }
+  }
 
   await publishTaskEvent(input.taskId, 'approval_gate:decided', {
     decision: input.decision,

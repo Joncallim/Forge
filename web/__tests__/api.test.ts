@@ -763,6 +763,43 @@ describe('DELETE /api/projects/:id — file deletion boundary', () => {
       await fs.rm(workspaceRoot, { recursive: true, force: true })
     }
   })
+
+  it('removes only the DB record when deleteFiles targets an external local path', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-delete-external-workspace-'))
+    const externalRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-delete-external-project-'))
+    const externalFile = path.join(externalRoot, 'keep.txt')
+    await fs.writeFile(externalFile, 'do not delete\n')
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    mockDbSelect.mockReturnValue(chain([projectRow(externalRoot)]))
+    mockDbDelete.mockReturnValue(chain(undefined))
+
+    try {
+      const { DELETE } = await import('@/app/api/projects/[id]/route')
+      const res = await DELETE(nextAuthRequest('/api/projects/project-delete?deleteFiles=true') as never, {
+        params: Promise.resolve({ id: 'project-delete' }),
+      })
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.filesDeleted).toBe(false)
+      expect(body.fileDeletionSkippedReason).toBe('outside_forge_managed_projects')
+      expect(body.fileDeletionMessage).toMatch(/outside Forge-managed projects/i)
+      expect(body.localPath).toBe(externalRoot)
+      expect(body.displayLocalPath).toBe(externalRoot)
+      expect(mockDbDelete).toHaveBeenCalled()
+      await expect(fs.readFile(externalFile, 'utf-8')).resolves.toBe('do not delete\n')
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+      await fs.rm(externalRoot, { recursive: true, force: true })
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -2166,7 +2203,11 @@ describe('POST /api/tasks/:id/approval-gates/:gateId', () => {
     const res = await POST(authRequest('/api/tasks/task-1/approval-gates/gate-1', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ decision: 'completed', reason: 'QA passed.' }),
+      body: JSON.stringify({
+        decision: 'completed',
+        reason: 'QA passed.',
+        sourceArtifactId: '11111111-1111-1111-1111-111111111111',
+      }),
     }) as never, {
       params: Promise.resolve({ id: 'task-1', gateId: 'gate-1' }),
     })
@@ -2176,6 +2217,7 @@ describe('POST /api/tasks/:id/approval-gates/:gateId', () => {
       decision: 'completed',
       gateId: 'gate-1',
       reason: 'QA passed.',
+      sourceArtifactId: '11111111-1111-1111-1111-111111111111',
       taskId: 'task-1',
       userId: FAKE_SESSION.userId,
     })
@@ -2192,7 +2234,11 @@ describe('POST /api/tasks/:id/approval-gates/:gateId', () => {
     const res = await POST(authRequest('/api/tasks/task-1/approval-gates/gate-reviewer', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ decision: 'completed', reason: 'Reviewer approves.' }),
+      body: JSON.stringify({
+        decision: 'completed',
+        reason: 'Reviewer approves.',
+        sourceArtifactId: '11111111-1111-1111-1111-111111111111',
+      }),
     }) as never, {
       params: Promise.resolve({ id: 'task-1', gateId: 'gate-reviewer' }),
     })
@@ -2326,6 +2372,30 @@ describe('POST /api/providers/discover-local — auth guard', () => {
         ollamaReachable: false,
         lmstudioReachable: true,
       })
+      expect(body.capabilityGroups).toEqual([
+        expect.objectContaining({
+          id: 'main-generation',
+          candidates: [
+            expect.objectContaining({
+              modelId: 'gemma-local',
+              providerType: 'lmstudio',
+              status: 'added',
+            }),
+          ],
+        }),
+      ])
+      expect(body.auxiliaryCapabilityGroups).toEqual([
+        expect.objectContaining({
+          id: 'auxiliary-local',
+          candidates: [
+            expect.objectContaining({
+              modelId: 'nomic-embed',
+              providerType: 'lmstudio',
+              status: 'reachable',
+            }),
+          ],
+        }),
+      ])
       expect(mockDbInsert).toHaveBeenCalledOnce()
     } finally {
       vi.unstubAllGlobals()
@@ -3427,6 +3497,259 @@ describe('POST /api/providers — baseUrl requirement', () => {
     const body = await res.json()
     expect(body.error).toMatch(/baseUrl|apiKey/i)
     expect(mockDbInsert).not.toHaveBeenCalled()
+  })
+
+  it('deactivates an unassigned provider without confirmation', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const existingProvider = {
+      id: 'provider-unused',
+      displayName: 'Unused Provider',
+      providerType: 'openrouter',
+      modelId: 'openai/gpt-4.1',
+      baseUrl: null,
+      apiKeyEnvVar: 'OPENROUTER_API_KEY',
+      apiKeyCiphertext: null,
+      isLocal: false,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }
+    const updateChain = chain(undefined) as Record<string, unknown>
+    const setSpy = vi.fn(() => updateChain)
+    updateChain.set = setSpy
+    mockDbSelect
+      .mockReturnValueOnce(chain([existingProvider]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+    mockDbUpdate.mockReturnValue(updateChain)
+
+    const { DELETE } = await import('@/app/api/providers/[id]/route')
+    const res = await DELETE(nextAuthRequest('/api/providers/provider-unused') as never, {
+      params: Promise.resolve({ id: 'provider-unused' }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toMatchObject({
+      ok: true,
+      deactivatedProviderId: 'provider-unused',
+      fallbackProvider: null,
+      reassigned: { agentConfigs: 0, tasks: 0 },
+    })
+    expect(setSpy).toHaveBeenCalledWith(expect.objectContaining({ isActive: false }))
+  })
+
+  it('returns provider deactivation impact without confirmation when assignments exist', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const existingProvider = {
+      id: 'provider-current',
+      displayName: 'Current Provider',
+      providerType: 'openrouter',
+      modelId: 'openai/gpt-4.1',
+      baseUrl: null,
+      apiKeyEnvVar: 'OPENROUTER_API_KEY',
+      apiKeyCiphertext: null,
+      isLocal: false,
+      isActive: true,
+      createdAt: new Date('2026-01-01T00:00:00Z'),
+      updatedAt: new Date(),
+    }
+    const fallbackProvider = {
+      ...existingProvider,
+      id: 'provider-fallback',
+      displayName: 'Fallback Provider',
+      createdAt: new Date('2026-01-02T00:00:00Z'),
+    }
+    mockDbSelect
+      .mockReturnValueOnce(chain([existingProvider]))
+      .mockReturnValueOnce(chain([
+        { id: 'agent-backend', agentType: 'backend', displayName: 'Backend' },
+      ]))
+      .mockReturnValueOnce(chain([
+        { id: 'task-pending', title: 'Pending work', status: 'pending' },
+      ]))
+      .mockReturnValueOnce(chain([fallbackProvider]))
+
+    const { DELETE } = await import('@/app/api/providers/[id]/route')
+    const res = await DELETE(nextAuthRequest('/api/providers/provider-current') as never, {
+      params: Promise.resolve({ id: 'provider-current' }),
+    })
+
+    expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body.code).toBe('provider_deactivation_requires_confirmation')
+    expect(body.confirmationRequired).toBe(true)
+    expect(body.impact.hasDefaultProviderFallback).toBe(true)
+    expect(body.impact.fallbackProvider).toBeNull()
+    expect(body.impact.affectedAssignments.agentConfigs).toEqual([
+      { id: 'agent-backend', role: 'backend', displayName: 'Backend' },
+    ])
+    expect(body.impact.affectedAssignments.tasks).toEqual([
+      { id: 'task-pending', title: 'Pending work', status: 'pending' },
+    ])
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+  })
+
+  it('deactivates a confirmed provider and clears affected agent defaults and task overrides', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const existingProvider = {
+      id: 'provider-current',
+      displayName: 'Current Provider',
+      providerType: 'openrouter',
+      modelId: 'openai/gpt-4.1',
+      baseUrl: null,
+      apiKeyEnvVar: 'OPENROUTER_API_KEY',
+      apiKeyCiphertext: null,
+      isLocal: false,
+      isActive: true,
+      createdAt: new Date('2026-01-01T00:00:00Z'),
+      updatedAt: new Date(),
+    }
+    const fallbackProvider = {
+      ...existingProvider,
+      id: 'provider-fallback',
+      displayName: 'Fallback Provider',
+      createdAt: new Date('2026-01-02T00:00:00Z'),
+    }
+    const updateChain = chain(undefined) as Record<string, unknown>
+    const setSpy = vi.fn(() => updateChain)
+    updateChain.set = setSpy
+    mockDbSelect
+      .mockReturnValueOnce(chain([existingProvider]))
+      .mockReturnValueOnce(chain([
+        { id: 'agent-backend', agentType: 'backend', displayName: 'Backend' },
+      ]))
+      .mockReturnValueOnce(chain([
+        { id: 'task-approved', title: 'Approved work', status: 'approved' },
+      ]))
+      .mockReturnValueOnce(chain([fallbackProvider]))
+      .mockReturnValueOnce(chain([
+        { id: 'agent-backend', agentType: 'backend', displayName: 'Backend' },
+      ]))
+      .mockReturnValueOnce(chain([
+        { id: 'task-approved', title: 'Approved work', status: 'approved' },
+      ]))
+    mockDbUpdate.mockReturnValue(updateChain)
+
+    const { DELETE } = await import('@/app/api/providers/[id]/route')
+    const res = await DELETE(nextAuthRequest('/api/providers/provider-current', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        confirm: true,
+        expectedAgentConfigIds: ['agent-backend'],
+        expectedTaskIds: ['task-approved'],
+      }),
+    }) as never, {
+      params: Promise.resolve({ id: 'provider-current' }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.fallbackProvider).toBeNull()
+    expect(body.reassigned).toEqual({ agentConfigs: 1, tasks: 1 })
+    expect(setSpy).toHaveBeenCalledWith(expect.objectContaining({ providerConfigId: null }))
+    expect(setSpy).toHaveBeenCalledWith(expect.objectContaining({ pmProviderConfigId: null }))
+    expect(setSpy).toHaveBeenCalledWith(expect.objectContaining({ isActive: false }))
+  })
+
+  it('deactivates and clears agent defaults when confirmed deactivation has no fallback', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const existingProvider = {
+      id: 'provider-current',
+      displayName: 'Current Provider',
+      providerType: 'openrouter',
+      modelId: 'openai/gpt-4.1',
+      baseUrl: null,
+      apiKeyEnvVar: 'OPENROUTER_API_KEY',
+      apiKeyCiphertext: null,
+      isLocal: false,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }
+    mockDbSelect
+      .mockReturnValueOnce(chain([existingProvider]))
+      .mockReturnValueOnce(chain([
+        { id: 'agent-reviewer', agentType: 'reviewer', displayName: '' },
+      ]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([
+        { id: 'agent-reviewer', agentType: 'reviewer', displayName: '' },
+      ]))
+      .mockReturnValueOnce(chain([]))
+    const updateChain = chain(undefined) as Record<string, unknown>
+    const setSpy = vi.fn(() => updateChain)
+    updateChain.set = setSpy
+    mockDbUpdate.mockReturnValue(updateChain)
+
+    const { DELETE } = await import('@/app/api/providers/[id]/route')
+    const res = await DELETE(nextAuthRequest('/api/providers/provider-current', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        confirm: true,
+        expectedAgentConfigIds: ['agent-reviewer'],
+        expectedTaskIds: [],
+      }),
+    }) as never, {
+      params: Promise.resolve({ id: 'provider-current' }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.setupPrompt).toMatch(/Create or activate another provider/i)
+    expect(body.fallbackProvider).toBeNull()
+    expect(body.reassigned).toEqual({ agentConfigs: 1, tasks: 0 })
+    expect(setSpy).toHaveBeenCalledWith(expect.objectContaining({ providerConfigId: null }))
+    expect(setSpy).toHaveBeenCalledWith(expect.objectContaining({ isActive: false }))
+  })
+
+  it('requires a fresh impact review when confirmed provider deactivation assignments changed', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const existingProvider = {
+      id: 'provider-current',
+      displayName: 'Current Provider',
+      providerType: 'openrouter',
+      modelId: 'openai/gpt-4.1',
+      baseUrl: null,
+      apiKeyEnvVar: 'OPENROUTER_API_KEY',
+      apiKeyCiphertext: null,
+      isLocal: false,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }
+    mockDbSelect
+      .mockReturnValueOnce(chain([existingProvider]))
+      .mockReturnValueOnce(chain([
+        { id: 'agent-reviewer', agentType: 'reviewer', displayName: 'Reviewer' },
+        { id: 'agent-backend', agentType: 'backend', displayName: 'Backend' },
+      ]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+
+    const { DELETE } = await import('@/app/api/providers/[id]/route')
+    const res = await DELETE(nextAuthRequest('/api/providers/provider-current', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        confirm: true,
+        expectedAgentConfigIds: ['agent-reviewer'],
+        expectedTaskIds: [],
+      }),
+    }) as never, {
+      params: Promise.resolve({ id: 'provider-current' }),
+    })
+
+    expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body.code).toBe('provider_deactivation_requires_confirmation')
+    expect(body.impact.affectedAssignments.agentConfigs).toHaveLength(2)
+    expect(mockDbUpdate).not.toHaveBeenCalled()
   })
 })
 

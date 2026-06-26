@@ -157,15 +157,19 @@ describe('review gate contract', () => {
         id: 'gate-reviewer',
         gateType: 'reviewer_review',
         metadata: {},
+        sourceAgentRunId: 'run-1',
+        sourceArtifactId: 'artifact-1',
         status: 'pending',
         workPackageId: 'pkg-1',
       }]))
+      .mockReturnValueOnce(chain([{ id: 'artifact-1' }]))
       .mockReturnValueOnce(chain([{ status: 'pending' }]))
 
     const result = await decideReviewGate({
       decision: 'completed',
       gateId: 'gate-reviewer',
       reason: 'Looks good.',
+      sourceArtifactId: 'artifact-1',
       taskId: 'task-1',
       userId: 'user-1',
     })
