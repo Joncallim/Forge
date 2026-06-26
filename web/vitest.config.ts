@@ -5,7 +5,7 @@ export default defineConfig({
     environment: 'node',
     globals: true,
     testTimeout: 10_000,
-    exclude: ['e2e/**', 'node_modules/**', '.next/**'],
+    exclude: ['e2e/**', 'node_modules/**', '.next/**', '**/*.uninstall-trash.*'],
   },
   resolve: { alias: { '@': path.resolve(__dirname, '.') } },
 })

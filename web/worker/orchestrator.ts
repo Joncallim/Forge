@@ -26,6 +26,7 @@ import {
   isWorkPackageHandoffEnabled,
   previewWorkPackageHandoff,
 } from './work-package-handoff'
+import { completeTaskIfReviewGatesSatisfied } from './review-gates'
 
 type TaskRow = typeof tasks.$inferSelect
 type ProjectRow = typeof projects.$inferSelect
@@ -790,10 +791,15 @@ export async function processApproval(
   }
 
   if (preview.status === 'no_ready_packages') {
+    const completion = await completeTaskIfReviewGatesSatisfied(taskId)
+    if (completion.status === 'completed') return
+
     await publishTaskEvent(taskId, 'task:handoff', {
       claimedPackageId: null,
       readyPackageIds: preview.readyPackageIds,
       status: 'no_ready_packages',
+      reviewStatus: completion.status,
+      reviewBlockReason: completion.reason,
     })
     return
   }

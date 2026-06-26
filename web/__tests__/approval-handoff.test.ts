@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   handoffApprovedWorkPackages: vi.fn(),
   isWorkPackageHandoffEnabled: vi.fn(),
   previewWorkPackageHandoff: vi.fn(),
+  completeTaskIfReviewGatesSatisfied: vi.fn(),
   publishTaskEvent: vi.fn(),
 }))
 
@@ -24,6 +25,10 @@ vi.mock('@/worker/work-package-handoff', () => ({
   handoffApprovedWorkPackages: mocks.handoffApprovedWorkPackages,
   isWorkPackageHandoffEnabled: mocks.isWorkPackageHandoffEnabled,
   previewWorkPackageHandoff: mocks.previewWorkPackageHandoff,
+}))
+
+vi.mock('@/worker/review-gates', () => ({
+  completeTaskIfReviewGatesSatisfied: mocks.completeTaskIfReviewGatesSatisfied,
 }))
 
 import { processApproval } from '@/worker/orchestrator'
@@ -52,6 +57,10 @@ describe('processApproval handoff', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.isWorkPackageHandoffEnabled.mockReturnValue(true)
+    mocks.completeTaskIfReviewGatesSatisfied.mockResolvedValue({
+      status: 'blocked',
+      reason: 'work packages are not complete',
+    })
   })
 
   it('keeps the legacy approval completion path when no work packages exist', async () => {
@@ -160,11 +169,29 @@ describe('processApproval handoff', () => {
 
     expect(mocks.dbUpdate).not.toHaveBeenCalled()
     expect(mocks.handoffApprovedWorkPackages).not.toHaveBeenCalled()
+    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1')
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', {
       claimedPackageId: null,
       readyPackageIds: [],
+      reviewBlockReason: 'work packages are not complete',
+      reviewStatus: 'blocked',
       status: 'no_ready_packages',
     })
+  })
+
+  it('completes the task when no packages are ready because all review gates are satisfied', async () => {
+    mocks.dbSelect.mockReturnValue(chain([{ status: 'approved' }]))
+    mocks.previewWorkPackageHandoff.mockResolvedValue({
+      status: 'no_ready_packages',
+      readyPackageIds: [],
+      claimedPackageId: null,
+    })
+    mocks.completeTaskIfReviewGatesSatisfied.mockResolvedValue({ status: 'completed' })
+
+    await processApproval('task-1')
+
+    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1')
+    expect(mocks.publishTaskEvent).not.toHaveBeenCalledWith('task-1', 'task:handoff', expect.anything())
   })
 
   it('marks packages ready without claiming when handoff execution is disabled', async () => {

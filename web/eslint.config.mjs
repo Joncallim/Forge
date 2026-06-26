@@ -16,6 +16,7 @@ const eslintConfig = defineConfig([
   globalIgnores([
     // Default ignores of eslint-config-next:
     ".next/**",
+    "**/*.uninstall-trash.*",
     "out/**",
     "build/**",
     "next-env.d.ts",

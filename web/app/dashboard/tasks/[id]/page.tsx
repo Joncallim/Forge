@@ -84,9 +84,11 @@ function statusBadgeVariant(status: string): StatusVariant {
   switch (status) {
     case 'running': return 'default'
     case 'awaiting_approval': return 'outline'
+    case 'awaiting_review': return 'outline'
     case 'approved':
     case 'completed': return 'secondary'
     case 'failed':
+    case 'needs_rework':
     case 'rejected':
     case 'cancelled': return 'destructive'
     default: return 'outline'
@@ -198,6 +200,19 @@ function stringField(record: WorkforceRecord, keys: string[]): string {
   return ''
 }
 
+function recordField(record: WorkforceRecord, keys: string[]): WorkforceRecord | null {
+  for (const key of keys) {
+    const value = record[key]
+    if (isRecord(value)) return value
+  }
+  return null
+}
+
+function metadataStringField(record: WorkforceRecord, keys: string[]): string {
+  const metadata = recordField(record, ['metadata'])
+  return metadata ? stringField(metadata, keys) : ''
+}
+
 function booleanField(record: WorkforceRecord, keys: string[]): boolean | null {
   for (const key of keys) {
     const value = record[key]
@@ -261,6 +276,85 @@ function workPackageBrief(pkg: WorkPackage): string {
       : null,
     capabilities ? `Required capabilities:\n${JSON.stringify(capabilities, null, 2)}` : null,
   ].filter((part): part is string => part !== null).join('\n\n')
+}
+
+function isReviewGateType(gateType: string): boolean {
+  return gateType === 'qa_review' || gateType === 'reviewer_review'
+}
+
+function GateDecisionControls({
+  gateId,
+  onDecided,
+  taskId,
+}: {
+  gateId: string
+  onDecided: () => Promise<void>
+  taskId: string
+}) {
+  const [reason, setReason] = useState('')
+  const [submitting, setSubmitting] = useState<'completed' | 'needs_rework' | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  async function submitDecision(decision: 'completed' | 'needs_rework') {
+    const trimmedReason = reason.trim()
+    if (trimmedReason === '') {
+      setError('Decision reason is required.')
+      return
+    }
+
+    setSubmitting(decision)
+    setError(null)
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/approval-gates/${gateId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision, reason: trimmedReason }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to update review gate')
+      }
+      setReason('')
+      await onDecided()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setSubmitting(null)
+    }
+  }
+
+  return (
+    <div className="mt-2 grid gap-2 rounded-md border border-border bg-muted/20 p-2">
+      <textarea
+        value={reason}
+        onChange={(event) => setReason(event.target.value)}
+        placeholder="Decision reason"
+        rows={2}
+        className="min-h-16 resize-y rounded-md border border-input bg-background px-2 py-1.5 text-xs text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      />
+      {error && <p className="text-xs text-destructive">{error}</p>}
+      <div className="flex flex-wrap gap-2">
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          disabled={submitting !== null}
+          onClick={() => void submitDecision('completed')}
+        >
+          {submitting === 'completed' ? 'Saving...' : 'Complete'}
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={submitting !== null}
+          onClick={() => void submitDecision('needs_rework')}
+        >
+          {submitting === 'needs_rework' ? 'Saving...' : 'Needs rework'}
+        </Button>
+      </div>
+    </div>
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -676,11 +770,15 @@ function WorkforcePanel({
   approvalGates,
   vcsChanges,
   fallbackAgents,
+  onGateDecided,
+  taskId,
 }: {
   workPackages: WorkPackage[]
   approvalGates: ApprovalGate[]
   vcsChanges: VcsChange[]
   fallbackAgents: PlannedAgent[]
+  onGateDecided: () => Promise<void>
+  taskId: string
 }) {
   const hasPersistedPlan = workPackages.length > 0 || approvalGates.length > 0
   const hasFallback = fallbackAgents.length > 0
@@ -810,17 +908,27 @@ function WorkforcePanel({
             ) : (
               <ul className="flex flex-col gap-3" aria-label="Persisted approval gates">
                 {approvalGates.map((gate, index) => {
+                  const gateId = stringField(gate, ['id'])
+                  const gateType = stringField(gate, ['gateType', 'type'])
                   const title = stringField(gate, ['title', 'name', 'gateType', 'type']) || `Gate ${index + 1}`
                   const status = stringField(gate, ['status', 'state'])
                   const summary = stringField(gate, ['summary', 'description', 'reason', 'instructions'])
                   const required = booleanField(gate, ['required', 'isRequired'])
-                  const packageId = stringField(gate, ['workPackageId'])
+                  const requiredRole = metadataStringField(gate, ['requiredRole'])
+                  const packageId = stringField(gate, ['workPackageId']) || metadataStringField(gate, ['sourcePackageId'])
+                  const sourceRunId = stringField(gate, ['sourceAgentRunId']) || metadataStringField(gate, ['sourceRunId'])
+                  const decisionReason = metadataStringField(gate, ['decisionReason'])
+                  const decidedAt = stringField(gate, ['decidedAt'])
 
                   return (
                     <li key={recordKey(gate, 'approval-gate', index)} className="border-t border-border pt-3 first:border-t-0 first:pt-0">
                       <div className="flex flex-wrap items-center gap-2">
                         <p className="text-sm font-medium text-foreground">{title}</p>
                         {status !== '' && <Badge variant={statusBadgeVariant(status)}>{statusLabel(status)}</Badge>}
+                        {gateType !== '' && isReviewGateType(gateType) && (
+                          <Badge variant="outline">{statusLabel(gateType)}</Badge>
+                        )}
+                        {requiredRole !== '' && <Badge variant="secondary">{requiredRole}</Badge>}
                         {required !== null && (
                           <Badge variant={required ? 'outline' : 'secondary'}>{required ? 'required' : 'optional'}</Badge>
                         )}
@@ -828,7 +936,19 @@ function WorkforcePanel({
                       {packageId !== '' && (
                         <p className="mt-1 font-mono text-xs text-muted-foreground">Package {packageId}</p>
                       )}
+                      {sourceRunId !== '' && (
+                        <p className="mt-1 font-mono text-xs text-muted-foreground">Run {sourceRunId}</p>
+                      )}
                       {summary !== '' && <p className="mt-1 text-sm text-muted-foreground">{summary}</p>}
+                      {decisionReason !== '' && (
+                        <p className="mt-1 text-sm text-muted-foreground">Decision: {decisionReason}</p>
+                      )}
+                      {decidedAt !== '' && (
+                        <p className="mt-1 text-xs text-muted-foreground">Decided {formatDatetime(decidedAt)}</p>
+                      )}
+                      {gateId !== '' && isReviewGateType(gateType) && status === 'pending' && (
+                        <GateDecisionControls gateId={gateId} taskId={taskId} onDecided={onGateDecided} />
+                      )}
                     </li>
                   )
                 })}
@@ -1673,6 +1793,8 @@ export default function TaskDetailPage() {
             approvalGates={approvalGates}
             vcsChanges={vcsChanges}
             fallbackAgents={plannedAgents}
+            taskId={taskId}
+            onGateDecided={loadTask}
           />
           <CapabilityClassificationPanel classification={capabilityClassification} />
           <McpAccessPlanPanel design={mcpExecutionDesign} />

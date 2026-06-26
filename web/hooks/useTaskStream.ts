@@ -226,6 +226,7 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
     })
 
     for (const eventType of [
+      'approval_gate:created',
       'approval_gate:decided',
       'task:handoff',
       'work_package:handoff',
