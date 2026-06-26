@@ -622,7 +622,7 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
   }
 
   return (
-    <form onSubmit={onSubmit} className="flex flex-col gap-4" noValidate>
+    <form onSubmit={onSubmit} className="flex flex-col gap-4" autoComplete="off" noValidate>
       {/* Display name */}
       <div className="flex flex-col gap-1.5">
         <label htmlFor="pf-displayName" className="text-sm font-medium text-foreground">
@@ -630,11 +630,19 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
         </label>
         <input
           id="pf-displayName"
+          name="forge-provider-name"
           type="text"
           required
           value={form.displayName}
           onChange={(e) => set('displayName', e.target.value)}
           placeholder="Anthropic main model"
+          autoComplete="off"
+          autoCorrect="off"
+          autoCapitalize="none"
+          spellCheck={false}
+          data-1p-ignore="true"
+          data-lpignore="true"
+          data-form-type="other"
           className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
           aria-required="true"
         />
