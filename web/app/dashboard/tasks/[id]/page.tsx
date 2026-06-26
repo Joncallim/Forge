@@ -281,6 +281,20 @@ function previewList(items: string[], limit = 4): string {
   return remaining > 0 ? `${visible.join(', ')} +${remaining} more` : visible.join(', ')
 }
 
+function uniqueArtifacts(artifacts: Artifact[]): Artifact[] {
+  const byId = new Map<string, Artifact>()
+  for (const artifact of artifacts) byId.set(artifact.id, artifact)
+  return [...byId.values()]
+}
+
+function packageArtifactsFor(pkg: WorkPackage, allArtifacts: Artifact[]): Artifact[] {
+  const packageId = stringField(pkg, ['id'])
+  return uniqueArtifacts([
+    ...artifactArrayField<Artifact>(pkg, ['artifacts', 'packageArtifacts']),
+    ...allArtifacts.filter((artifact) => artifact.workPackageId === packageId),
+  ])
+}
+
 function jsonArrayField(record: WorkforceRecord, keys: string[]): WorkforceRecord[] {
   for (const key of keys) {
     const value = record[key]
@@ -321,33 +335,80 @@ function isReviewGateType(gateType: string): boolean {
   return gateType === 'qa_review' || gateType === 'reviewer_review'
 }
 
+function statusBadgeClass(status: string): string {
+  switch (status) {
+    case 'ready':
+      return 'border-blue-200 bg-blue-50 text-blue-800 dark:border-blue-900/50 dark:bg-blue-950/30 dark:text-blue-300'
+    case 'running':
+      return 'border-sky-200 bg-sky-50 text-sky-800 dark:border-sky-900/50 dark:bg-sky-950/30 dark:text-sky-300'
+    case 'awaiting_review':
+    case 'pending':
+      return 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200'
+    case 'completed':
+    case 'approved':
+      return 'border-green-200 bg-green-50 text-green-800 dark:border-green-900/50 dark:bg-green-950/30 dark:text-green-300'
+    case 'needs_rework':
+    case 'failed':
+    case 'rejected':
+    case 'cancelled':
+      return 'border-destructive/30 bg-destructive/10 text-destructive'
+    default:
+      return ''
+  }
+}
+
+function statusBadge(status: string) {
+  return (
+    <Badge variant="outline" className={statusBadgeClass(status)}>
+      {statusLabel(status)}
+    </Badge>
+  )
+}
+
+function progressStatusLabel(status: string): string {
+  return `Status: ${statusLabel(status)}`
+}
+
+function reviewGateLabel(gateType: string): string {
+  if (gateType === 'qa_review') return 'QA review'
+  if (gateType === 'reviewer_review') return 'Reviewer review'
+  return statusLabel(gateType)
+}
+
 function GateDecisionControls({
   gateId,
   onDecided,
+  sourceArtifactId,
   taskId,
+  compact = false,
 }: {
   gateId: string
   onDecided: () => Promise<void>
+  sourceArtifactId: string
   taskId: string
+  compact?: boolean
 }) {
   const [reason, setReason] = useState('')
-  const [submitting, setSubmitting] = useState<'completed' | 'needs_rework' | null>(null)
+  const [submitting, setSubmitting] = useState<'approve' | 'changes' | 'reject' | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  async function submitDecision(decision: 'completed' | 'needs_rework') {
+  async function submitDecision(action: 'approve' | 'changes' | 'reject') {
     const trimmedReason = reason.trim()
     if (trimmedReason === '') {
       setError('Decision reason is required.')
       return
     }
 
-    setSubmitting(decision)
+    const decision = action === 'approve' ? 'completed' : 'needs_rework'
+    const reasonPrefix = action === 'reject' ? 'Rejected: ' : ''
+
+    setSubmitting(action)
     setError(null)
     try {
       const res = await fetch(`/api/tasks/${taskId}/approval-gates/${gateId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ decision, reason: trimmedReason }),
+        body: JSON.stringify({ decision, reason: `${reasonPrefix}${trimmedReason}`, sourceArtifactId }),
       })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
@@ -363,12 +424,12 @@ function GateDecisionControls({
   }
 
   return (
-    <div className="mt-2 grid gap-2 rounded-md border border-border bg-muted/20 p-2">
+    <div className={`${compact ? 'mt-3' : 'mt-2'} grid gap-2 rounded-md border border-border bg-muted/20 p-2`}>
       <textarea
         value={reason}
         onChange={(event) => setReason(event.target.value)}
         placeholder="Decision reason"
-        rows={2}
+        rows={compact ? 3 : 2}
         className="min-h-16 resize-y rounded-md border border-input bg-background px-2 py-1.5 text-xs text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       />
       {error && <p className="text-xs text-destructive">{error}</p>}
@@ -378,18 +439,27 @@ function GateDecisionControls({
           size="sm"
           variant="secondary"
           disabled={submitting !== null}
-          onClick={() => void submitDecision('completed')}
+          onClick={() => void submitDecision('approve')}
         >
-          {submitting === 'completed' ? 'Saving...' : 'Complete'}
+          {submitting === 'approve' ? 'Saving...' : 'Approve'}
         </Button>
         <Button
           type="button"
           size="sm"
           variant="outline"
           disabled={submitting !== null}
-          onClick={() => void submitDecision('needs_rework')}
+          onClick={() => void submitDecision('changes')}
         >
-          {submitting === 'needs_rework' ? 'Saving...' : 'Needs rework'}
+          {submitting === 'changes' ? 'Saving...' : 'Request changes'}
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          variant="destructive"
+          disabled={submitting !== null}
+          onClick={() => void submitDecision('reject')}
+        >
+          {submitting === 'reject' ? 'Saving...' : 'Reject'}
         </Button>
       </div>
     </div>
@@ -811,6 +881,7 @@ function WorkforcePanel({
   fallbackAgents,
   onGateDecided,
   taskId,
+  artifacts,
 }: {
   workPackages: WorkPackage[]
   approvalGates: ApprovalGate[]
@@ -818,6 +889,7 @@ function WorkforcePanel({
   fallbackAgents: PlannedAgent[]
   onGateDecided: () => Promise<void>
   taskId: string
+  artifacts: Artifact[]
 }) {
   const hasPersistedPlan = workPackages.length > 0 || approvalGates.length > 0
   const hasFallback = fallbackAgents.length > 0
@@ -858,6 +930,7 @@ function WorkforcePanel({
             ) : (
               <ul className="flex flex-col gap-3" aria-label="Persisted work packages">
                 {workPackages.map((pkg, index) => {
+                  const pkgId = stringField(pkg, ['id'])
                   const title = stringField(pkg, ['title', 'name', 'summary', 'agentType', 'role']) || `Work package ${index + 1}`
                   const owner = stringField(pkg, ['assignedRole', 'agentType', 'agent', 'role', 'assignee', 'harnessSlug'])
                   const status = stringField(pkg, ['status', 'state'])
@@ -868,42 +941,110 @@ function WorkforcePanel({
                   const prompt = stringField(pkg, ['promptOverlay'])
                   const harnessName = stringField(pkg, ['harnessDisplayName', 'harnessRole'])
                   const mcpRequirements = jsonArrayField(pkg, ['mcpRequirements'])
-                  const packageArtifacts = artifactArrayField<Artifact>(pkg, ['artifacts', 'packageArtifacts'])
+                  const packageArtifacts = packageArtifactsFor(pkg, artifacts)
+                  const latestPackageArtifact = packageArtifacts[packageArtifacts.length - 1] ?? null
+                  const packageReviewGates = approvalGates.filter((gate) => {
+                    const gatePackageId = stringField(gate, ['workPackageId']) || metadataStringField(gate, ['sourcePackageId'])
+                    const gateType = stringField(gate, ['gateType', 'type'])
+                    return gatePackageId === pkgId && isReviewGateType(gateType)
+                  })
+                  const pendingReviewGate = packageReviewGates.find((gate) => stringField(gate, ['status', 'state']) === 'pending') ?? null
+                  const pendingSourceArtifactId = pendingReviewGate
+                    ? stringField(pendingReviewGate, ['sourceArtifactId']) || metadataStringField(pendingReviewGate, ['sourceArtifactId'])
+                    : ''
+                  const reviewArtifact = pendingReviewGate
+                    ? packageArtifacts.find((artifact) => artifact.id === pendingSourceArtifactId) ?? null
+                    : latestPackageArtifact
                   const taskCount = Math.max(1, Math.trunc(metadataNumberField(pkg, ['plannedTasks', 'taskCount', 'tasks']) ?? steps.length))
 
                   return (
-                    <li key={recordKey(pkg, 'work-package', index)} className="border-t border-border pt-3 first:border-t-0 first:pt-0">
+                    <li key={recordKey(pkg, 'work-package', index)} className="min-w-0 border-t border-border pt-3 first:border-t-0 first:pt-0">
                       <div className="flex flex-wrap items-center gap-2">
-                        <p className="text-sm font-medium text-foreground">{title}</p>
+                        <p className="min-w-0 break-words text-sm font-medium text-foreground">{title}</p>
                         {owner !== '' && <Badge variant="outline">{owner}</Badge>}
                         {harnessName !== '' && harnessName !== owner && <Badge variant="secondary">{harnessName}</Badge>}
-                        {status !== '' && <Badge variant={statusBadgeVariant(status)}>{statusLabel(status)}</Badge>}
+                        {status !== '' && statusBadge(status)}
                         <Badge variant="outline">{pluralize(taskCount, 'task')}</Badge>
                       </div>
                       {summary !== '' && <p className="mt-1 text-sm text-muted-foreground">{summary}</p>}
+                      {packageReviewGates.length > 0 && (
+                        <div className="mt-2 flex flex-wrap gap-1.5" aria-label={`Review states for ${title}`}>
+                          {packageReviewGates.map((gate, gateIndex) => {
+                            const gateType = stringField(gate, ['gateType', 'type'])
+                            const gateStatus = stringField(gate, ['status', 'state']) || 'pending'
+                            return (
+                              <Badge
+                                key={recordKey(gate, 'package-review-gate', gateIndex)}
+                                variant="outline"
+                                className={statusBadgeClass(gateStatus)}
+                              >
+                                {reviewGateLabel(gateType)}: {statusLabel(gateStatus)}
+                              </Badge>
+                            )
+                          })}
+                        </div>
+                      )}
                       {criteria.length > 0 && (
                         <p className="mt-1 text-xs text-muted-foreground">Acceptance: {previewList(criteria)}</p>
                       )}
                       {files.length > 0 && (
                         <p className="mt-1 break-words font-mono text-xs text-muted-foreground">{previewList(files)}</p>
                       )}
+                      {status === 'awaiting_review' && (
+                        <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50/70 p-3 dark:border-amber-900/50 dark:bg-amber-950/20">
+                          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                            <p className="text-sm font-medium text-foreground">Package review</p>
+                            {pendingReviewGate
+                              ? statusBadge(stringField(pendingReviewGate, ['status', 'state']) || 'pending')
+                              : <Badge variant="outline">No pending gate</Badge>}
+                          </div>
+                          {reviewArtifact ? (
+                            <div className="max-h-[32rem] overflow-auto rounded-md bg-background/80 p-2 ring-1 ring-border">
+                              <ArtifactView artifact={reviewArtifact} />
+                            </div>
+                          ) : (
+                            <p className="rounded-md border border-dashed border-border bg-background/70 px-3 py-2 text-sm text-muted-foreground">
+                              {pendingReviewGate
+                                ? 'The review gate source artifact is not available in this view.'
+                                : 'No package output has been attached yet.'}
+                            </p>
+                          )}
+                          {pendingReviewGate && reviewArtifact ? (
+                            <GateDecisionControls
+                              gateId={stringField(pendingReviewGate, ['id'])}
+                              sourceArtifactId={reviewArtifact.id}
+                              taskId={taskId}
+                              onDecided={onGateDecided}
+                              compact
+                            />
+                          ) : pendingReviewGate ? (
+                            <p className="mt-2 text-xs text-muted-foreground">
+                              Review actions are disabled until the exact gate artifact is available.
+                            </p>
+                          ) : (
+                            <p className="mt-2 text-xs text-muted-foreground">
+                              Review actions appear when a pending QA or Reviewer gate exists for this package.
+                            </p>
+                          )}
+                        </div>
+                      )}
                       <details className="mt-2 rounded-md border border-border bg-muted/20 px-3 py-2">
                         <summary className="cursor-pointer text-xs font-medium text-foreground">
                           Assignment details
                         </summary>
-                        <div className="mt-2 grid gap-3 text-xs">
+                        <div className="mt-2 grid min-w-0 gap-3 text-xs">
                           {steps.length > 0 && (
                             <div>
                               <p className="font-medium text-muted-foreground">Tasks</p>
                               <ol className="mt-1 list-decimal space-y-1 pl-4 text-foreground">
-                                {steps.map((step, stepIndex) => <li key={stepIndex}>{step}</li>)}
+                                {steps.map((step, stepIndex) => <li key={stepIndex} className="break-words">{step}</li>)}
                               </ol>
                             </div>
                           )}
                           <div>
                             <p className="font-medium text-muted-foreground">Prompt overlay</p>
                             {prompt !== '' ? (
-                              <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-background p-2 font-mono text-[11px] text-foreground ring-1 ring-border">
+                              <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md bg-background p-2 font-mono text-[11px] text-foreground ring-1 ring-border">
                                 {prompt}
                               </pre>
                             ) : (
@@ -914,14 +1055,14 @@ function WorkforcePanel({
                           </div>
                           <div>
                             <p className="font-medium text-muted-foreground">Assignment brief</p>
-                            <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap rounded-md bg-background p-2 font-mono text-[11px] text-foreground ring-1 ring-border">
+                            <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md bg-background p-2 font-mono text-[11px] text-foreground ring-1 ring-border">
                               {workPackageBrief(pkg)}
                             </pre>
                           </div>
                           {mcpRequirements.length > 0 && (
                             <div>
                               <p className="font-medium text-muted-foreground">MCP requirements</p>
-                              <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-background p-2 font-mono text-[11px] text-foreground ring-1 ring-border">
+                              <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md bg-background p-2 font-mono text-[11px] text-foreground ring-1 ring-border">
                                 {JSON.stringify(mcpRequirements, null, 2)}
                               </pre>
                             </div>
@@ -991,7 +1132,9 @@ function WorkforcePanel({
                         <p className="mt-1 text-xs text-muted-foreground">Decided {formatDatetime(decidedAt)}</p>
                       )}
                       {gateId !== '' && isReviewGateType(gateType) && status === 'pending' && (
-                        <GateDecisionControls gateId={gateId} taskId={taskId} onDecided={onGateDecided} />
+                        <p className="mt-2 text-xs text-muted-foreground">
+                          Decide this gate from the matching package review box, where Forge shows the exact source artifact.
+                        </p>
                       )}
                     </li>
                   )
@@ -1405,6 +1548,204 @@ function TaskAttemptRow({ attempt, runs }: { attempt: TaskAttempt; runs: AgentRu
   )
 }
 
+function runStage(run: AgentRun): string {
+  const stage = (run as unknown as WorkforceRecord).stage
+  return typeof stage === 'string' && stage.trim() !== '' ? stage.trim() : ''
+}
+
+function hasExecutionDisabledEvidence(runs: AgentRun[], artifacts: Artifact[]): boolean {
+  for (const artifact of [...artifacts].reverse()) {
+    if (isRecord(artifact.metadata) && typeof artifact.metadata.repositoryWrites === 'boolean') {
+      return artifact.metadata.repositoryWrites === false
+    }
+  }
+
+  const latestHandoff = [...runs].reverse().find((run) => run.agentType === 'handoff')
+  if (latestHandoff) return latestHandoff.modelIdUsed === 'forge-handoff/no-op'
+
+  return [...artifacts].reverse().some((artifact) =>
+    artifact.content.includes('Repository writes and specialist model execution are disabled'),
+  )
+}
+
+function taskProgressSummary(input: {
+  status: string
+  workPackages: WorkPackage[]
+  approvalGates: ApprovalGate[]
+  runs: AgentRun[]
+  questions: TaskQuestion[]
+  artifacts: Artifact[]
+}): { stage: string; nextAction: string; detail: string } {
+  const openQuestions = input.questions.filter((question) => question.status !== 'answered').length
+  const runningPackage = input.workPackages.find((pkg) => stringField(pkg, ['status', 'state']) === 'running')
+  const awaitingReviewPackage = input.workPackages.find((pkg) => stringField(pkg, ['status', 'state']) === 'awaiting_review')
+  const needsReworkPackage = input.workPackages.find((pkg) => stringField(pkg, ['status', 'state']) === 'needs_rework')
+  const readyPackage = input.workPackages.find((pkg) => stringField(pkg, ['status', 'state']) === 'ready')
+  const latestRun = [...input.runs].reverse().find((run) => run.status === 'running') ?? input.runs[input.runs.length - 1] ?? null
+  const latestStage = latestRun ? runStage(latestRun) : ''
+  const executionDisabled = hasExecutionDisabledEvidence(input.runs, input.artifacts)
+
+  if (openQuestions > 0 || input.status === 'awaiting_answers') {
+    return {
+      stage: 'Architect questions',
+      nextAction: 'Answer the open questions.',
+      detail: `${pluralize(openQuestions, 'question')} blocking plan approval.`,
+    }
+  }
+
+  if (input.status === 'awaiting_approval') {
+    return {
+      stage: 'Plan approval',
+      nextAction: 'Approve the plan or request changes.',
+      detail: 'No specialist package execution starts until the plan is approved.',
+    }
+  }
+
+  if (awaitingReviewPackage) {
+    return {
+      stage: `Review: ${stringField(awaitingReviewPackage, ['title', 'name']) || 'work package'}`,
+      nextAction: 'Review package output, then approve, request changes, or reject it.',
+      detail: executionDisabled
+        ? 'Execution is disabled; this review covers handoff output and no repository files were changed.'
+        : 'Review gates must pass before the package is marked complete.',
+    }
+  }
+
+  if (needsReworkPackage) {
+    return {
+      stage: `Rework queued: ${stringField(needsReworkPackage, ['title', 'name']) || 'work package'}`,
+      nextAction: 'Wait for the package to be picked up again or inspect the review reason.',
+      detail: 'The previous review sent this package back for changes.',
+    }
+  }
+
+  if (runningPackage) {
+    return {
+      stage: `Implementation: ${stringField(runningPackage, ['title', 'name']) || 'work package'}`,
+      nextAction: 'Wait for output and review gates.',
+      detail: executionDisabled
+        ? 'Execution is disabled; Forge is creating reviewable handoff output without repository writes.'
+        : 'A specialist package is currently running.',
+    }
+  }
+
+  if (readyPackage) {
+    return {
+      stage: `Ready: ${stringField(readyPackage, ['title', 'name']) || 'work package'}`,
+      nextAction: 'Worker handoff is ready for the next package.',
+      detail: 'Dependencies are satisfied for this package.',
+    }
+  }
+
+  if (input.status === 'running') {
+    return {
+      stage: latestStage ? statusLabel(latestStage) : 'Worker running',
+      nextAction: input.workPackages.length > 0 ? 'Monitor package progress.' : 'Wait for the architect output.',
+      detail: executionDisabled
+        ? 'Execution is disabled for package handoff; status reflects orchestration progress, not direct file writes.'
+        : 'Forge is processing the task.',
+    }
+  }
+
+  if (input.status === 'completed') {
+    return { stage: 'Completed', nextAction: 'Review artifacts or pull request output.', detail: 'All required gates are complete.' }
+  }
+
+  if (input.status === 'failed') {
+    return { stage: 'Failed', nextAction: 'Read the error and retry when ready.', detail: 'The task stopped before completion.' }
+  }
+
+  if (input.status === 'rejected' || input.status === 'cancelled') {
+    return { stage: statusLabel(input.status), nextAction: 'Retry the task if this should run again.', detail: 'No active worker action is pending.' }
+  }
+
+  return {
+    stage: statusLabel(input.status),
+    nextAction: 'Wait for the next worker update.',
+    detail: 'No blocking operator action is visible yet.',
+  }
+}
+
+function TaskProgressPanel({
+  status,
+  workPackages,
+  approvalGates,
+  runs,
+  questions,
+  artifacts,
+}: {
+  status: string
+  workPackages: WorkPackage[]
+  approvalGates: ApprovalGate[]
+  runs: AgentRun[]
+  questions: TaskQuestion[]
+  artifacts: Artifact[]
+}) {
+  const summary = taskProgressSummary({ status, workPackages, approvalGates, runs, questions, artifacts })
+  const packageCounts = workPackages.reduce<Record<string, number>>((counts, pkg) => {
+    const packageStatus = stringField(pkg, ['status', 'state']) || 'unknown'
+    counts[packageStatus] = (counts[packageStatus] ?? 0) + 1
+    return counts
+  }, {})
+  const reviewCounts = approvalGates.reduce<Record<string, number>>((counts, gate) => {
+    const gateType = stringField(gate, ['gateType', 'type'])
+    if (!isReviewGateType(gateType)) return counts
+    const gateStatus = stringField(gate, ['status', 'state']) || 'pending'
+    counts[gateStatus] = (counts[gateStatus] ?? 0) + 1
+    return counts
+  }, {})
+
+  return (
+    <section aria-labelledby="task-progress-heading" className="mb-6 rounded-lg border border-border bg-card p-4">
+      <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_minmax(220px,0.45fr)]">
+        <div className="min-w-0">
+          <h2 id="task-progress-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
+            Progress
+          </h2>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <p className="break-words text-lg font-semibold text-foreground">{summary.stage}</p>
+            <Badge variant="outline" className={statusBadgeClass(status)}>
+              {progressStatusLabel(status)}
+            </Badge>
+          </div>
+          <p className="mt-2 text-sm text-foreground">{summary.nextAction}</p>
+          <p className="mt-1 text-xs text-muted-foreground">{summary.detail}</p>
+        </div>
+        <div className="grid gap-3 text-xs">
+          <div>
+            <p className="mb-1 font-medium text-muted-foreground uppercase tracking-wide">Packages</p>
+            {Object.keys(packageCounts).length === 0 ? (
+              <p className="text-muted-foreground">No packages yet.</p>
+            ) : (
+              <div className="flex flex-wrap gap-1.5">
+                {Object.entries(packageCounts).map(([packageStatus, count]) => (
+                  <Badge key={packageStatus} variant="outline" className={statusBadgeClass(packageStatus)}>
+                    {statusLabel(packageStatus)}: {count}
+                  </Badge>
+                ))}
+              </div>
+            )}
+          </div>
+          <div>
+            <p className="mb-1 font-medium text-muted-foreground uppercase tracking-wide">Reviews</p>
+            {Object.keys(reviewCounts).length === 0 ? (
+              <p className="text-muted-foreground">No review gates yet.</p>
+            ) : (
+              <div className="flex flex-wrap gap-1.5">
+                {Object.entries(reviewCounts).map(([reviewStatus, count]) => (
+                  <Badge key={reviewStatus} variant="outline" className={statusBadgeClass(reviewStatus)}>
+                    {statusLabel(reviewStatus)}: {count}
+                  </Badge>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </section>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // TaskDetailPage
 // ---------------------------------------------------------------------------
@@ -1719,6 +2060,15 @@ export default function TaskDetailPage() {
         )}
       </div>
 
+      <TaskProgressPanel
+        status={currentStatus ?? task.status}
+        workPackages={workPackages}
+        approvalGates={approvalGates}
+        runs={mergedRuns}
+        questions={mergedQuestions}
+        artifacts={mergedArtifacts}
+      />
+
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(320px,420px)] lg:items-start">
         <div className="min-w-0">
           {/* Task prompt — always shown, so the originating instruction is visible */}
@@ -1951,6 +2301,7 @@ export default function TaskDetailPage() {
             fallbackAgents={plannedAgents}
             taskId={taskId}
             onGateDecided={loadTask}
+            artifacts={mergedArtifacts}
           />
           <CapabilityClassificationPanel classification={capabilityClassification} />
           <McpAccessPlanPanel design={mcpExecutionDesign} />

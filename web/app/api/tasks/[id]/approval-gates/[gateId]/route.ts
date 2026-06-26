@@ -7,6 +7,7 @@ import { decideReviewGate } from '@/worker/review-gates'
 const DecisionSchema = z.object({
   decision: z.enum(['completed', 'needs_rework']),
   reason: z.string().trim().min(1).max(4000),
+  sourceArtifactId: z.string().uuid(),
 })
 
 export async function POST(
@@ -39,6 +40,7 @@ export async function POST(
       decision: parsed.data.decision,
       gateId,
       reason: parsed.data.reason,
+      sourceArtifactId: parsed.data.sourceArtifactId,
       taskId,
       userId: session.userId,
     })

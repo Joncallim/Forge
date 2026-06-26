@@ -8,6 +8,10 @@ import {
   RefreshCwIcon,
   ExternalLinkIcon,
   InfoIcon,
+  CheckCircle2Icon,
+  CircleAlertIcon,
+  XCircleIcon,
+  WrenchIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -62,6 +66,17 @@ type ProviderConfig = {
   updatedAt: string
 }
 
+type ProviderDeactivationImpact = {
+  affectedAssignments?: {
+    agentConfigs?: { id: string; role: string; displayName: string }[]
+    tasks?: { id: string; title: string; status: string }[]
+  }
+  hasDefaultProviderFallback?: boolean
+  fallbackProvider?: ProviderConfig | null
+  setupPrompt?: string | null
+  message?: string
+}
+
 type ProviderHealth = {
   reachable: boolean
   envVarPresent: boolean
@@ -71,6 +86,50 @@ type ProviderHealth = {
 }
 
 type HealthMap = Record<string, ProviderHealth | 'loading' | 'error'>
+
+type DiscoveryCandidateStatus = 'reachable' | 'not_reachable' | 'added' | 'updated' | 'configured' | 'skipped' | 'unknown'
+
+type DiscoveryCandidate = {
+  id: string
+  label: string
+  detail?: string
+  providerType?: string
+  modelId?: string
+  status: DiscoveryCandidateStatus
+  guidance?: string
+}
+
+type DiscoveryCapabilityGroup = {
+  id: string
+  title: string
+  description?: string
+  kind: 'generation' | 'auxiliary'
+  candidates: DiscoveryCandidate[]
+}
+
+type DiscoveryChange = {
+  providerType: string
+  modelId: string
+}
+
+type DiscoverySkip = DiscoveryChange & {
+  reason?: string
+}
+
+type LocalDiscoveryResponse = {
+  found: number
+  added: DiscoveryChange[]
+  updated?: DiscoveryChange[]
+  skipped?: DiscoverySkip[]
+  ollamaReachable: boolean
+  lmstudioReachable: boolean
+  capabilityGroups?: unknown
+  auxiliaryCapabilityGroups?: unknown
+}
+
+type LocalDiscoveryState =
+  | { status: 'error'; message: string }
+  | { status: 'success'; response: LocalDiscoveryResponse; groups: DiscoveryCapabilityGroup[] }
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -90,6 +149,170 @@ const ACP_AUTH_LABELS: Record<AcpAuthMode, string> = {
 
 const LMSTUDIO_START_TITLE =
   'LM Studio model must be loaded and started in LM Studio before Forge can reach it.'
+
+const LOCAL_RUNTIME_GUIDANCE: Record<'ollama' | 'lmstudio', string> = {
+  ollama: 'Start Ollama and pull a model, then run discovery again.',
+  lmstudio: 'Open LM Studio, load a chat model, start the local server, then run discovery again.',
+}
+
+const SKIP_REASON_LABELS: Record<string, string> = {
+  provider_disabled: 'Previously deactivated provider was left inactive.',
+  base_url_conflict: 'Existing provider uses a different endpoint.',
+  nonlocal_existing_provider: 'Existing non-local provider was not changed.',
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function discoveryProviderLabel(providerType: string): string {
+  return PROVIDER_TYPE_LABELS[providerType as ProviderType] ?? providerType
+}
+
+function candidateFromRuntime(
+  providerType: 'ollama' | 'lmstudio',
+  reachable: boolean,
+): DiscoveryCandidate {
+  return {
+    id: `${providerType}-runtime`,
+    label: discoveryProviderLabel(providerType),
+    providerType,
+    status: reachable ? 'reachable' : 'not_reachable',
+    detail: reachable ? 'Runtime responded to local discovery.' : 'No running local runtime detected.',
+    guidance: reachable ? undefined : LOCAL_RUNTIME_GUIDANCE[providerType],
+  }
+}
+
+function candidateFromChange(change: DiscoveryChange, status: 'added' | 'updated' | 'configured'): DiscoveryCandidate {
+  return {
+    id: `${status}-${change.providerType}-${change.modelId}`,
+    label: change.modelId,
+    detail: `${discoveryProviderLabel(change.providerType)} model`,
+    providerType: change.providerType,
+    modelId: change.modelId,
+    status,
+  }
+}
+
+function candidateFromSkip(skip: DiscoverySkip): DiscoveryCandidate {
+  return {
+    id: `skipped-${skip.providerType}-${skip.modelId}-${skip.reason ?? 'unknown'}`,
+    label: skip.modelId,
+    detail: `${discoveryProviderLabel(skip.providerType)} model`,
+    providerType: skip.providerType,
+    modelId: skip.modelId,
+    status: 'skipped',
+    guidance: skip.reason ? SKIP_REASON_LABELS[skip.reason] ?? skip.reason.replace(/_/g, ' ') : 'Skipped by discovery.',
+  }
+}
+
+function normalizeCandidate(raw: unknown, fallbackIndex: number): DiscoveryCandidate | null {
+  if (!isRecord(raw)) return null
+  const label =
+    stringValue(raw.label) ||
+    stringValue(raw.name) ||
+    stringValue(raw.modelId) ||
+    stringValue(raw.capability) ||
+    stringValue(raw.id)
+  if (!label) return null
+
+  const rawStatus = stringValue(raw.status) || stringValue(raw.state)
+  const status: DiscoveryCandidateStatus =
+    rawStatus === 'reachable' ||
+    rawStatus === 'not_reachable' ||
+    rawStatus === 'added' ||
+    rawStatus === 'updated' ||
+    rawStatus === 'configured' ||
+    rawStatus === 'skipped'
+      ? rawStatus
+      : typeof raw.reachable === 'boolean'
+        ? raw.reachable ? 'reachable' : 'not_reachable'
+        : 'unknown'
+
+  return {
+    id: stringValue(raw.id) || `${label}-${fallbackIndex}`,
+    label,
+    detail: stringValue(raw.detail) || stringValue(raw.description) || undefined,
+    providerType: stringValue(raw.providerType) || undefined,
+    modelId: stringValue(raw.modelId) || undefined,
+    status,
+    guidance: stringValue(raw.guidance) || stringValue(raw.setupGuidance) || undefined,
+  }
+}
+
+function normalizeDiscoveryGroups(raw: unknown, kind: 'generation' | 'auxiliary'): DiscoveryCapabilityGroup[] {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .map((item, index): DiscoveryCapabilityGroup | null => {
+      if (!isRecord(item)) return null
+      const title = stringValue(item.title) || stringValue(item.label) || stringValue(item.name)
+      const rawCandidates = Array.isArray(item.candidates)
+        ? item.candidates
+        : Array.isArray(item.capabilities)
+          ? item.capabilities
+          : Array.isArray(item.items)
+            ? item.items
+            : []
+      const candidates = rawCandidates
+        .map((candidate, candidateIndex) => normalizeCandidate(candidate, candidateIndex))
+        .filter((candidate): candidate is DiscoveryCandidate => candidate !== null)
+      if (!title && candidates.length === 0) return null
+      return {
+        id: stringValue(item.id) || `${kind}-group-${index}`,
+        title: title || (kind === 'generation' ? 'Generation capabilities' : 'Auxiliary capabilities'),
+        description: stringValue(item.description) || undefined,
+        kind,
+        candidates,
+      }
+    })
+    .filter((group): group is DiscoveryCapabilityGroup => group !== null)
+}
+
+function buildDiscoveryGroups(response: LocalDiscoveryResponse): DiscoveryCapabilityGroup[] {
+  const backendGenerationGroups = normalizeDiscoveryGroups(response.capabilityGroups, 'generation')
+  const backendAuxiliaryGroups = normalizeDiscoveryGroups(response.auxiliaryCapabilityGroups, 'auxiliary')
+
+  const changedCandidates = [
+    ...response.added.map((change) => candidateFromChange(change, 'added')),
+    ...(response.updated ?? []).map((change) => candidateFromChange(change, 'updated')),
+    ...(response.skipped ?? []).map(candidateFromSkip),
+  ]
+
+  const generationFallback: DiscoveryCapabilityGroup = {
+    id: 'main-generation',
+    title: 'Main generation capabilities',
+    description: 'Local chat models Forge can add as generation providers.',
+    kind: 'generation',
+    candidates: [
+      candidateFromRuntime('ollama', response.ollamaReachable),
+      candidateFromRuntime('lmstudio', response.lmstudioReachable),
+      ...changedCandidates,
+    ],
+  }
+
+  const auxiliaryFallback: DiscoveryCapabilityGroup = {
+    id: 'auxiliary-local',
+    title: 'Auxiliary local capabilities',
+    description: 'Non-generation local tools are reported separately so they do not change model provider setup.',
+    kind: 'auxiliary',
+    candidates: [],
+  }
+
+  const groups = [
+    ...(backendGenerationGroups.length > 0 ? backendGenerationGroups : [generationFallback]),
+    ...backendAuxiliaryGroups,
+  ]
+
+  if (!groups.some((group) => group.kind === 'auxiliary')) {
+    groups.push({ ...auxiliaryFallback, candidates: [] })
+  }
+
+  return groups
+}
 
 // ---------------------------------------------------------------------------
 // Form state
@@ -204,6 +427,125 @@ function HealthDot({ health }: { health: ProviderHealth | 'loading' | 'error' | 
       </span>
       <span className="text-[11px] text-muted-foreground">{lastChecked ?? 'Not checked'}</span>
     </span>
+  )
+}
+
+function DiscoveryCandidateStatusIcon({ status }: { status: DiscoveryCandidateStatus }) {
+  if (status === 'reachable' || status === 'added' || status === 'updated' || status === 'configured') {
+    return <CheckCircle2Icon className="size-4 text-green-600 dark:text-green-400" aria-hidden="true" />
+  }
+  if (status === 'not_reachable') {
+    return <XCircleIcon className="size-4 text-red-500" aria-hidden="true" />
+  }
+  if (status === 'skipped') {
+    return <CircleAlertIcon className="size-4 text-amber-600 dark:text-amber-400" aria-hidden="true" />
+  }
+  return <WrenchIcon className="size-4 text-muted-foreground" aria-hidden="true" />
+}
+
+function discoveryStatusLabel(status: DiscoveryCandidateStatus): string {
+  const labels: Record<DiscoveryCandidateStatus, string> = {
+    reachable: 'Reachable',
+    not_reachable: 'Not reachable',
+    added: 'Added',
+    updated: 'Updated',
+    configured: 'Already configured',
+    skipped: 'Skipped',
+    unknown: 'Unknown',
+  }
+  return labels[status]
+}
+
+function DiscoveryResultsPanel({ state }: { state: LocalDiscoveryState }) {
+  if (state.status === 'error') {
+    return (
+      <div role="alert" className="mb-4 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+        {state.message}
+      </div>
+    )
+  }
+
+  const { response, groups } = state
+  const changed = response.added.length + (response.updated?.length ?? 0)
+
+  return (
+    <section aria-labelledby="local-discovery-heading" className="mb-4 rounded-xl border border-border bg-card p-4">
+      <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 id="local-discovery-heading" className="text-sm font-medium text-foreground">
+            Local discovery results
+          </h2>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {changed > 0
+              ? `Updated ${changed} local provider${changed === 1 ? '' : 's'}.`
+              : response.found > 0
+                ? 'Reachable local models are already represented or were skipped.'
+                : 'No local generation models were added.'}
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          <span className="inline-flex h-5 items-center rounded-full border border-border px-2 text-xs text-muted-foreground">
+            {response.found} found
+          </span>
+          <span className="inline-flex h-5 items-center rounded-full border border-border px-2 text-xs text-muted-foreground">
+            {response.added.length} added
+          </span>
+          {(response.updated?.length ?? 0) > 0 && (
+            <span className="inline-flex h-5 items-center rounded-full border border-border px-2 text-xs text-muted-foreground">
+              {response.updated?.length ?? 0} updated
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="grid gap-3 lg:grid-cols-2">
+        {groups.map((group) => (
+          <div key={group.id} className="min-w-0 rounded-lg border border-border bg-muted/20 p-3">
+            <div className="mb-2 flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  {group.kind === 'generation' ? 'Generation' : 'Auxiliary'}
+                </p>
+                <h3 className="mt-0.5 text-sm font-medium text-foreground">{group.title}</h3>
+              </div>
+              <span className="shrink-0 rounded-full bg-background px-2 py-0.5 text-xs text-muted-foreground ring-1 ring-border">
+                {group.candidates.length}
+              </span>
+            </div>
+            {group.description && <p className="mb-2 text-xs text-muted-foreground">{group.description}</p>}
+            {group.candidates.length === 0 ? (
+              <p className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+                No auxiliary local capabilities were reported by discovery.
+              </p>
+            ) : (
+              <ul className="grid gap-2" aria-label={`${group.title} candidates`}>
+                {group.candidates.map((candidate) => (
+                  <li key={candidate.id} className="min-w-0 rounded-md border border-border bg-background px-3 py-2">
+                    <div className="flex min-w-0 items-start gap-2">
+                      <DiscoveryCandidateStatusIcon status={candidate.status} />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+                          <p className="min-w-0 break-words text-sm font-medium text-foreground">{candidate.label}</p>
+                          <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                            {discoveryStatusLabel(candidate.status)}
+                          </span>
+                        </div>
+                        {candidate.detail && <p className="mt-0.5 break-words text-xs text-muted-foreground">{candidate.detail}</p>}
+                        {candidate.guidance && (
+                          <p className="mt-1 break-words text-xs text-muted-foreground">
+                            Setup: {candidate.guidance}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
   )
 }
 
@@ -513,12 +855,17 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
 
 interface DeleteConfirmProps {
   provider: ProviderConfig
-  onConfirm: () => void
+  impact: ProviderDeactivationImpact | null
+  error: string | null
+  onConfirm: (confirmed: boolean) => Promise<boolean>
   deleting: boolean
 }
 
-function DeleteConfirm({ provider, onConfirm, deleting }: DeleteConfirmProps) {
+function DeleteConfirm({ provider, impact, error, onConfirm, deleting }: DeleteConfirmProps) {
   const [open, setOpen] = useState(false)
+  const agentAssignments = impact?.affectedAssignments?.agentConfigs ?? []
+  const taskAssignments = impact?.affectedAssignments?.tasks ?? []
+  const requiresConfirmation = impact !== null
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -538,17 +885,63 @@ function DeleteConfirm({ provider, onConfirm, deleting }: DeleteConfirmProps) {
         <DialogHeader>
           <DialogTitle id="delete-provider-title">Remove provider</DialogTitle>
         </DialogHeader>
-        <p className="text-sm text-muted-foreground">
-          Remove <strong className="text-foreground">{provider.displayName}</strong>? This will deactivate it and unlink it from any agent that references it. This action cannot be undone.
-        </p>
+        <div className="grid gap-3 text-sm text-muted-foreground">
+          <p>
+            Remove <strong className="text-foreground">{provider.displayName}</strong>? Forge will deactivate it so new tasks cannot select it.
+          </p>
+          {impact ? (
+            <div className="rounded-lg border border-border bg-muted/30 px-3 py-2">
+              <p className="font-medium text-foreground">Impact</p>
+              {impact.message && <p className="mt-1">{impact.message}</p>}
+              {agentAssignments.length > 0 && (
+                <div className="mt-2">
+                  <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Agent defaults</p>
+                  <ul className="mt-1 list-disc space-y-1 pl-4">
+                    {agentAssignments.map((agent) => (
+                      <li key={agent.id}>
+                        {agent.displayName} <span className="text-xs">({agent.role})</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {taskAssignments.length > 0 && (
+                <div className="mt-2">
+                  <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Active task overrides</p>
+                  <ul className="mt-1 list-disc space-y-1 pl-4">
+                    {taskAssignments.map((task) => (
+                      <li key={task.id}>
+                        {task.title} <span className="text-xs">({task.status})</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {impact.setupPrompt && (
+                <p className="mt-2 text-amber-700 dark:text-amber-300">
+                  {impact.setupPrompt}
+                </p>
+              )}
+            </div>
+          ) : (
+            <p>
+              Existing history remains readable. If this provider is assigned to agents or active tasks, Forge will show the affected records before deactivation.
+            </p>
+          )}
+          {error && <p role="alert" className="text-destructive">{error}</p>}
+        </div>
         <DialogFooter>
           <Button
             variant="destructive"
             disabled={deleting}
             aria-busy={deleting}
-            onClick={() => { onConfirm(); setOpen(false) }}
+            onClick={() => {
+              void onConfirm(requiresConfirmation).then((deleted) => {
+                if (deleted) setOpen(false)
+              })
+            }}
           >
-            {deleting ? 'Removing…' : 'Remove provider'}
+            {deleting ? 'Removing…' : requiresConfirmation ? 'Confirm deactivation' : 'Review deactivation'}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -567,8 +960,10 @@ export default function ProvidersPage() {
   const [healthMap, setHealthMap] = useState<HealthMap>({})
   const [refreshingHealth, setRefreshingHealth] = useState(false)
   const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [deleteImpacts, setDeleteImpacts] = useState<Record<string, ProviderDeactivationImpact | null>>({})
+  const [deleteErrors, setDeleteErrors] = useState<Record<string, string | null>>({})
   const [discovering, setDiscovering] = useState(false)
-  const [discoverMsg, setDiscoverMsg] = useState<string | null>(null)
+  const [discoveryState, setDiscoveryState] = useState<LocalDiscoveryState | null>(null)
 
   // Add dialog
   const [addOpen, setAddOpen] = useState(false)
@@ -784,18 +1179,39 @@ export default function ProvidersPage() {
   // Delete provider
   // ---------------------------------------------------------------------------
 
-  async function handleDelete(id: string) {
+  async function handleDelete(id: string, confirmed = false): Promise<boolean> {
     setDeletingId(id)
+    setDeleteErrors((prev) => ({ ...prev, [id]: null }))
+    const reviewedImpact = deleteImpacts[id]
     try {
-      const res = await fetch(`/api/providers/${id}`, { method: 'DELETE' })
+      const res = await fetch(`/api/providers/${id}`, {
+        method: 'DELETE',
+        ...(confirmed
+          ? {
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              confirm: true,
+              expectedAgentConfigIds: reviewedImpact?.affectedAssignments?.agentConfigs?.map((agent) => agent.id) ?? [],
+              expectedTaskIds: reviewedImpact?.affectedAssignments?.tasks?.map((task) => task.id) ?? [],
+            }),
+          }
+          : {}),
+      })
+      const body = await res.json().catch(() => ({}))
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}))
+        if (isRecord(body) && body.confirmationRequired === true && isRecord(body.impact)) {
+          setDeleteImpacts((prev) => ({ ...prev, [id]: body.impact as ProviderDeactivationImpact }))
+          return false
+        }
         throw new Error((body as { error?: string }).error ?? 'Failed to remove provider')
       }
+      setDeleteImpacts((prev) => ({ ...prev, [id]: null }))
       await loadProviders()
+      return true
     } catch (err) {
       // Surface error inline without crashing the table
-      setFetchError(err instanceof Error ? err.message : 'Failed to remove provider')
+      setDeleteErrors((prev) => ({ ...prev, [id]: err instanceof Error ? err.message : 'Failed to remove provider' }))
+      return false
     } finally {
       setDeletingId(null)
     }
@@ -807,41 +1223,22 @@ export default function ProvidersPage() {
 
   async function handleDiscoverLocal() {
     setDiscovering(true)
-    setDiscoverMsg(null)
+    setDiscoveryState(null)
     try {
       const res = await fetch('/api/providers/discover-local', { method: 'POST' })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
         throw new Error((body as { error?: string }).error ?? 'Local detection failed')
       }
-      const data = await res.json() as {
-        found: number
-        added: { providerType: string; modelId: string }[]
-        updated?: { providerType: string; modelId: string }[]
-        ollamaReachable: boolean
-        lmstudioReachable: boolean
-      }
+      const data = await res.json() as LocalDiscoveryResponse
       const changed = data.added.length + (data.updated?.length ?? 0)
-      const lmStudioChanged = [...data.added, ...(data.updated ?? [])]
-        .some((model) => model.providerType === 'lmstudio')
-      if (changed > 0) {
-        setDiscoverMsg(
-          `Updated ${changed} local model${changed === 1 ? '' : 's'}.` +
-          (lmStudioChanged ? ' LM Studio models must be started in LM Studio before Forge can reach them.' : ''),
-        )
-      } else if (data.found > 0) {
-        setDiscoverMsg('Local models found are already configured.')
-      } else if (!data.ollamaReachable && !data.lmstudioReachable) {
-        setDiscoverMsg('No running Ollama or LM Studio detected on localhost.')
-      } else {
-        setDiscoverMsg('No local models found.')
-      }
+      setDiscoveryState({ status: 'success', response: data, groups: buildDiscoveryGroups(data) })
       if (data.found > 0 || changed > 0) {
         const nextProviders = await loadProviders()
         await loadHealth(true, true, nextProviders)
       }
     } catch (err) {
-      setDiscoverMsg(err instanceof Error ? err.message : 'Local detection failed')
+      setDiscoveryState({ status: 'error', message: err instanceof Error ? err.message : 'Local detection failed' })
     } finally {
       setDiscovering(false)
     }
@@ -894,11 +1291,7 @@ export default function ProvidersPage() {
       </div>
 
       {/* Discovery feedback */}
-      {discoverMsg !== null && (
-        <p role="status" aria-live="polite" className="mb-4 text-sm text-muted-foreground">
-          {discoverMsg}
-        </p>
-      )}
+      {discoveryState !== null && <DiscoveryResultsPanel state={discoveryState} />}
 
       {/* Loading */}
       {loading && (
@@ -1036,7 +1429,9 @@ export default function ProvidersPage() {
                       {/* Delete */}
                       <DeleteConfirm
                         provider={provider}
-                        onConfirm={() => handleDelete(provider.id)}
+                        impact={deleteImpacts[provider.id] ?? null}
+                        error={deleteErrors[provider.id] ?? null}
+                        onConfirm={(confirmed) => handleDelete(provider.id, confirmed)}
                         deleting={deletingId === provider.id}
                       />
                     </div>

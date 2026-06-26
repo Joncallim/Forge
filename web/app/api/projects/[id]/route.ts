@@ -220,7 +220,12 @@ export async function PUT(
 // ?deleteFiles=true it also removes the local project folder from disk.
 // ---------------------------------------------------------------------------
 
-async function validateProjectDeletePath(target: string, projectId: string): Promise<string | null> {
+type ProjectDeletePathCheck =
+  | { action: 'delete' }
+  | { action: 'skip'; reason: string; message: string }
+  | { action: 'error'; message: string }
+
+async function checkProjectDeletePath(target: string, projectId: string): Promise<ProjectDeletePathCheck> {
   const workspace = await getWorkspaceSettings()
   const resolved = path.resolve(/*turbopackIgnore: true*/ target)
   const protectedRoots = [
@@ -240,21 +245,34 @@ async function validateProjectDeletePath(target: string, projectId: string): Pro
   ].map((root) => path.resolve(/*turbopackIgnore: true*/ root))
 
   if (protectedRoots.includes(resolved)) {
-    return 'Refusing to delete files: the project path points at a shared Forge workspace directory.'
+    return {
+      action: 'error',
+      message: 'Refusing to delete files: the project path points at a shared Forge workspace directory.',
+    }
   }
 
   if (!isWithinPath(workspace.projectsRoot, resolved)) {
-    return 'Refusing to delete files: the project path is not inside the Forge projects directory.'
+    return {
+      action: 'skip',
+      reason: 'outside_forge_managed_projects',
+      message: 'Files were not deleted because the project path is outside Forge-managed projects.',
+    }
   }
 
   let stat
   try {
     stat = await fs.lstat(resolved)
   } catch {
-    return 'Refusing to delete files: the project path does not exist.'
+    return {
+      action: 'error',
+      message: 'Refusing to delete files: the project path does not exist.',
+    }
   }
   if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    return 'Refusing to delete files: the project path must be a real directory.'
+    return {
+      action: 'error',
+      message: 'Refusing to delete files: the project path must be a real directory.',
+    }
   }
 
   const [realProjectsRoot, realTarget] = await Promise.all([
@@ -262,20 +280,29 @@ async function validateProjectDeletePath(target: string, projectId: string): Pro
     fs.realpath(resolved),
   ])
   if (realTarget === realProjectsRoot || !isWithinPath(realProjectsRoot, realTarget)) {
-    return 'Refusing to delete files: the project path escapes the real Forge projects directory.'
+    return {
+      action: 'error',
+      message: 'Refusing to delete files: the project path escapes the real Forge projects directory.',
+    }
   }
 
   try {
     const raw = await fs.readFile(path.join(/*turbopackIgnore: true*/ resolved, 'forge.project.json'), 'utf-8')
     const marker = JSON.parse(raw) as { projectId?: unknown }
     if (marker.projectId !== projectId) {
-      return 'Refusing to delete files: the Forge project marker does not match this project.'
+      return {
+        action: 'error',
+        message: 'Refusing to delete files: the Forge project marker does not match this project.',
+      }
     }
   } catch {
-    return 'Refusing to delete files: no matching Forge project marker was found.'
+    return {
+      action: 'error',
+      message: 'Refusing to delete files: no matching Forge project marker was found.',
+    }
   }
 
-  return null
+  return { action: 'delete' }
 }
 
 export async function DELETE(
@@ -301,24 +328,32 @@ export async function DELETE(
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
     }
 
+    const workspace = await getWorkspaceSettings({ ensure: false })
     let filesDeleted = false
+    let fileDeletionSkippedReason: string | null = null
+    let fileDeletionMessage: string | null = null
     if (deleteFiles && existing.localPath) {
-      const deletePathError = await validateProjectDeletePath(existing.localPath, id)
-      if (deletePathError) {
+      const deletePathCheck = await checkProjectDeletePath(existing.localPath, id)
+      if (deletePathCheck.action === 'error') {
         return NextResponse.json(
-          { error: deletePathError },
+          { error: deletePathCheck.message },
           { status: 400 },
         )
       }
-      try {
-        await fs.rm(existing.localPath, { recursive: true, force: true })
-        filesDeleted = true
-      } catch (err) {
-        console.error('[DELETE /api/projects/:id] Failed to remove project files', err)
-        return NextResponse.json(
-          { error: `Could not delete project files: ${err instanceof Error ? err.message : 'unknown error'}` },
-          { status: 500 },
-        )
+      if (deletePathCheck.action === 'skip') {
+        fileDeletionSkippedReason = deletePathCheck.reason
+        fileDeletionMessage = deletePathCheck.message
+      } else {
+        try {
+          await fs.rm(existing.localPath, { recursive: true, force: true })
+          filesDeleted = true
+        } catch (err) {
+          console.error('[DELETE /api/projects/:id] Failed to remove project files', err)
+          return NextResponse.json(
+            { error: `Could not delete project files: ${err instanceof Error ? err.message : 'unknown error'}` },
+            { status: 500 },
+          )
+        }
       }
     }
 
@@ -328,8 +363,21 @@ export async function DELETE(
 
     await db.delete(projects).where(eq(projects.id, id))
 
-    console.info('[DELETE /api/projects/:id] Deleted project', { id, filesDeleted })
-    return NextResponse.json({ ok: true, filesDeleted })
+    console.info('[DELETE /api/projects/:id] Deleted project', {
+      id,
+      filesDeleted,
+      fileDeletionSkippedReason,
+    })
+    return NextResponse.json({
+      ok: true,
+      filesDeleted,
+      fileDeletionSkippedReason,
+      fileDeletionMessage,
+      localPath: existing.localPath,
+      displayLocalPath: existing.localPath
+        ? displayPathForWorkspacePath(workspace, existing.localPath)
+        : null,
+    })
   } catch (err) {
     console.error('[DELETE /api/projects/:id] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

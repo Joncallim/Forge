@@ -696,7 +696,7 @@ export default function SettingsPage() {
         </p>
       </div>
 
-      <div className="max-w-2xl flex flex-col gap-6">
+      <div className="grid max-w-6xl gap-6 md:grid-cols-2 xl:grid-cols-3 [&>section]:w-full [&>section]:max-w-2xl">
         <WorkspaceCard />
         <McpSettingsCard />
         <GitHubCard />

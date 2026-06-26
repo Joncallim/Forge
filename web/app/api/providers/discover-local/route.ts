@@ -5,6 +5,7 @@ import { providerConfigs } from '@/db/schema'
 import { and, eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import {
+  normalizeLmStudioNativeApiBaseUrl,
   normalizeLmStudioRuntimeBaseUrl,
   PROVIDER_CATALOG,
 } from '@/lib/providers/catalog'
@@ -43,6 +44,32 @@ type DiscoverySkip = DiscoveryChange & {
   reason: 'provider_disabled' | 'base_url_conflict' | 'nonlocal_existing_provider'
 }
 
+type DiscoveryCandidate = {
+  id: string
+  label: string
+  providerType?: string
+  modelId?: string
+  status: 'reachable' | 'not_reachable' | 'added' | 'updated' | 'configured' | 'skipped'
+  detail?: string
+  guidance?: string
+}
+
+type DiscoveryCapabilityGroup = {
+  id: string
+  title: string
+  description: string
+  candidates: DiscoveryCandidate[]
+}
+
+type LmStudioDiscovery = {
+  models: DiscoveredModel[]
+  auxiliaryCandidates: DiscoveryCandidate[]
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter((value) => value !== ''))]
+}
+
 function normalizeComparableBaseUrl(providerType: DiscoveredModel['providerType'], baseUrl: string | null): string | null {
   const trimmed = baseUrl?.trim()
   if (!trimmed) return null
@@ -77,20 +104,129 @@ function extractOpenAiCompatibleModels(data: unknown | null): string[] {
   return extractOpenAiCompatibleModelIds(data)
 }
 
-async function discoverLmStudio(): Promise<DiscoveredModel[]> {
+function extractLmStudioNativeCapabilities(data: unknown | null): {
+  generationModelIds: string[]
+  auxiliaryCandidates: DiscoveryCandidate[]
+} | null {
+  const models = (data as { models?: unknown[] } | null)?.models
+  if (!Array.isArray(models)) return null
+
+  const generationModelIds: string[] = []
+  const auxiliaryCandidates: DiscoveryCandidate[] = []
+
+  for (const model of models) {
+    const item = model as {
+      id?: unknown
+      key?: unknown
+      type?: unknown
+      loaded_instances?: { id?: unknown; model?: unknown }[]
+    }
+    const ids = uniqueStrings([
+      typeof item.key === 'string' ? item.key : '',
+      typeof item.id === 'string' ? item.id : '',
+      ...(Array.isArray(item.loaded_instances)
+        ? item.loaded_instances.flatMap((instance) => [
+          typeof instance.id === 'string' ? instance.id : '',
+          typeof instance.model === 'string' ? instance.model : '',
+        ])
+        : []),
+    ])
+    if (ids.length === 0) continue
+
+    if (item.type === 'embedding') {
+      for (const modelId of ids) {
+        auxiliaryCandidates.push({
+          id: `lmstudio-embedding-${modelId}`,
+          label: modelId,
+          providerType: 'lmstudio',
+          modelId,
+          status: 'reachable',
+          detail: 'LM Studio embedding model',
+          guidance: 'Embeddings are detected separately and are not added as generation providers.',
+        })
+      }
+      continue
+    }
+
+    generationModelIds.push(...ids)
+  }
+
+  return {
+    generationModelIds: uniqueStrings(generationModelIds),
+    auxiliaryCandidates,
+  }
+}
+
+async function discoverLmStudio(): Promise<LmStudioDiscovery> {
   let models: string[]
+  let auxiliaryCandidates: DiscoveryCandidate[] = []
   try {
-    const listing = await listLmStudioModelIds({
-      baseUrl: LMSTUDIO_RUNTIME_BASE_URL,
-      timeoutMs: PROBE_TIMEOUT_MS,
-    })
-    models = listing.models
+    const nativeBaseUrl = normalizeLmStudioNativeApiBaseUrl(LMSTUDIO_RUNTIME_BASE_URL)
+    const nativeData = nativeBaseUrl ? await fetchJson(`${nativeBaseUrl}/models`) : null
+    const nativeCapabilities = extractLmStudioNativeCapabilities(nativeData)
+    if (nativeCapabilities !== null) {
+      models = nativeCapabilities.generationModelIds
+      auxiliaryCandidates = nativeCapabilities.auxiliaryCandidates
+    } else {
+      const listing = await listLmStudioModelIds({
+        baseUrl: LMSTUDIO_RUNTIME_BASE_URL,
+        timeoutMs: PROBE_TIMEOUT_MS,
+      })
+      models = listing.models
+    }
   } catch {
     models = extractOpenAiCompatibleModels(await fetchJson(`${LMSTUDIO_RUNTIME_BASE_URL}/models`))
   }
 
-  return models
-    .map((modelId) => ({ providerType: 'lmstudio' as const, modelId, baseUrl: LMSTUDIO_RUNTIME_BASE_URL }))
+  return {
+    models: models.map((modelId) => ({ providerType: 'lmstudio' as const, modelId, baseUrl: LMSTUDIO_RUNTIME_BASE_URL })),
+    auxiliaryCandidates,
+  }
+}
+
+function changeStatus(
+  model: DiscoveredModel,
+  added: DiscoveryChange[],
+  updated: DiscoveryChange[],
+  skipped: DiscoverySkip[],
+): DiscoveryCandidate['status'] {
+  if (added.some((change) => change.providerType === model.providerType && change.modelId === model.modelId)) return 'added'
+  if (updated.some((change) => change.providerType === model.providerType && change.modelId === model.modelId)) return 'updated'
+  if (skipped.some((change) => change.providerType === model.providerType && change.modelId === model.modelId)) return 'skipped'
+  return 'configured'
+}
+
+function capabilityGroupsFor(input: {
+  discovered: DiscoveredModel[]
+  added: DiscoveryChange[]
+  updated: DiscoveryChange[]
+  skipped: DiscoverySkip[]
+  lmstudioAuxiliary: DiscoveryCandidate[]
+}): {
+  capabilityGroups: DiscoveryCapabilityGroup[]
+  auxiliaryCapabilityGroups: DiscoveryCapabilityGroup[]
+} {
+  return {
+    capabilityGroups: [{
+      id: 'main-generation',
+      title: 'Main generation capabilities',
+      description: 'Local chat models Forge can add as generation providers.',
+      candidates: input.discovered.map((model) => ({
+        id: `${model.providerType}-${model.modelId}`,
+        label: model.modelId,
+        providerType: model.providerType,
+        modelId: model.modelId,
+        status: changeStatus(model, input.added, input.updated, input.skipped),
+        detail: `${model.providerType === 'ollama' ? 'Ollama' : 'LM Studio'} generation model`,
+      })),
+    }],
+    auxiliaryCapabilityGroups: [{
+      id: 'auxiliary-local',
+      title: 'Auxiliary local capabilities',
+      description: 'Local non-generation capabilities detected during discovery.',
+      candidates: input.lmstudioAuxiliary,
+    }],
+  }
 }
 
 export async function POST(request: NextRequest) {
@@ -101,7 +237,7 @@ export async function POST(request: NextRequest) {
     }
 
     const [ollama, lmstudio] = await Promise.all([discoverOllama(), discoverLmStudio()])
-    const discovered = [...ollama, ...lmstudio]
+    const discovered = [...ollama, ...lmstudio.models]
 
     const added: DiscoveryChange[] = []
     const updated: DiscoveryChange[] = []
@@ -177,13 +313,23 @@ export async function POST(request: NextRequest) {
       added.push({ providerType: model.providerType, modelId: model.modelId })
     }
 
+    const groups = capabilityGroupsFor({
+      discovered,
+      added,
+      updated,
+      skipped,
+      lmstudioAuxiliary: lmstudio.auxiliaryCandidates,
+    })
+
     return NextResponse.json({
       found: discovered.length,
       added,
       updated,
       skipped,
       ollamaReachable: ollama.length > 0,
-      lmstudioReachable: lmstudio.length > 0,
+      lmstudioReachable: lmstudio.models.length > 0 || lmstudio.auxiliaryCandidates.length > 0,
+      capabilityGroups: groups.capabilityGroups,
+      auxiliaryCapabilityGroups: groups.auxiliaryCapabilityGroups,
     })
   } catch (err) {
     console.error('[POST /api/providers/discover-local] Unexpected error', err)
