@@ -266,12 +266,13 @@ describe('getProvider', () => {
     await expect(getProvider('config-id')).rejects.toThrow(/baseUrl is required/i)
   })
 
-  it('throws a clear non-executable error for ACP providers', async () => {
+  it('returns a callable ACP provider factory instead of an SDK client', async () => {
     mockDbSelect.mockReturnValue(chain([
       makeRow({ providerType: 'acp', modelId: 'claude-agent', isLocal: true }),
     ]))
 
-    await expect(getProvider('config-id')).rejects.toThrow(/ACP provider execution is not implemented yet/i)
+    const result = await getProvider('config-id')
+    expect(typeof result?.provider).toBe('function')
     expect(mockCreateOpenAI).not.toHaveBeenCalled()
     expect(mockCreateAnthropic).not.toHaveBeenCalled()
   })

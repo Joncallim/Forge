@@ -47,13 +47,6 @@ export async function clearDefaultProviderConfigId(): Promise<void> {
 //      stale reference
 // ---------------------------------------------------------------------------
 
-// ACP configs are saved for setup only — Forge cannot execute tasks through
-// them yet (getProvider() throws for providerType === 'acp'), so they must
-// never be returned as an executable default, even when "ready".
-function isExecutable(config: ProviderConfig): boolean {
-  return config.providerType !== 'acp'
-}
-
 export async function resolveDefaultProvider(): Promise<ProviderConfig | null> {
   const defaultId = await getDefaultProviderConfigId()
   if (defaultId) {
@@ -62,7 +55,7 @@ export async function resolveDefaultProvider(): Promise<ProviderConfig | null> {
       .from(providerConfigs)
       .where(eq(providerConfigs.id, defaultId))
       .limit(1)
-    if (config && config.isActive && isExecutable(config)) return config
+    if (config && config.isActive) return config
   }
 
   const localCandidates = await db
@@ -71,9 +64,7 @@ export async function resolveDefaultProvider(): Promise<ProviderConfig | null> {
     .innerJoin(providerHealthChecks, eq(providerHealthChecks.providerConfigId, providerConfigs.id))
     .where(eq(providerConfigs.isActive, true))
 
-  const readyLocal = localCandidates.find(
-    (row) => row.config.isLocal && row.status === 'ready' && isExecutable(row.config),
-  )
+  const readyLocal = localCandidates.find((row) => row.config.isLocal && row.status === 'ready')
 
   return readyLocal?.config ?? null
 }

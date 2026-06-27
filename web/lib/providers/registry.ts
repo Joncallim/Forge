@@ -11,6 +11,7 @@ import { normalizeLmStudioRuntimeBaseUrl, PROVIDER_CATALOG } from './catalog'
 import { decryptSecret } from '@/lib/crypto'
 import { providerApiKeyEnvVarError, safeProviderApiKeyEnvVar } from './credentials'
 import type { ProviderType } from './types'
+import { AcpLanguageModel } from './acp/language-model'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -20,6 +21,7 @@ type ProviderFactory =
   | ReturnType<typeof createAnthropic>
   | ReturnType<typeof createOpenAI>
   | ReturnType<typeof createGoogleGenerativeAI>
+  | ((modelId: string) => AcpLanguageModel)
 
 const CHAT_COMPLETIONS_PROVIDER_TYPES = new Set<ProviderType>([
   'openrouter',
@@ -93,7 +95,10 @@ function buildProvider(config: ProviderConfig): ProviderFactory {
 
   switch (config.providerType) {
     case 'acp':
-      throw new Error('ACP provider execution is not implemented yet')
+      // ACP agents are spawned per-call (see lib/providers/acp/language-model.ts),
+      // not authenticated with an apiKey, so just return a callable factory
+      // matching the other 'local' provider types (ollama, lmstudio).
+      return (modelId: string) => new AcpLanguageModel(modelId)
 
     case 'anthropic':
       return createAnthropic({ apiKey })

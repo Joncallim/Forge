@@ -71,7 +71,7 @@ export const PROVIDER_CATALOG: Record<ProviderType, ProviderCatalogEntry> = {
     requiresApiKey: false,
     requiresBaseUrl: false,
     modelPlaceholder: 'claude-agent',
-    helpText: 'Configures an ACP agent. Task execution is not enabled yet.',
+    helpText: 'Configures an ACP agent. Spawns the adapter on demand for each task.',
   },
   anthropic: {
     type: 'anthropic',
