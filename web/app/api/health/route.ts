@@ -3,7 +3,7 @@ import { db } from '@/db'
 import { redis } from '@/lib/redis'
 import { sql } from 'drizzle-orm'
 import { listActiveProviders } from '@/lib/providers/registry'
-import { checkProviderHealth } from '@/lib/providers/health'
+import { checkProviderHealth, getCachedProviderHealth } from '@/lib/providers/health'
 import { checkRuntimeEnv } from '@/lib/env'
 import { execFile as execFileCallback } from 'node:child_process'
 import { promisify } from 'node:util'
@@ -63,8 +63,11 @@ export async function GET() {
     const activeProviders = await listActiveProviders()
     providers = await Promise.all(
       activeProviders.map(async (p) => {
-        const h = await checkProviderHealth(p)
-        return { id: p.id, displayName: p.displayName, reachable: h.reachable }
+        // ACP readiness spawns the adapter process via npx; never run that
+        // live from this public, unauthenticated route — fall back to the
+        // last cached result instead (issue: DoS via repeated adapter spawns).
+        const h = p.providerType === 'acp' ? await getCachedProviderHealth(p.id) : await checkProviderHealth(p)
+        return { id: p.id, displayName: p.displayName, reachable: h?.reachable ?? false }
       }),
     )
   } catch (err) {
