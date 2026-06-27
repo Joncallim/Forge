@@ -131,13 +131,68 @@ export function isCapabilityClassificationShape(parsed: unknown): boolean {
   )
 }
 
+// True for fence content that parses as JSON and carries no information a
+// reader would care about — `{}`, `[]`, or whitespace.
+function isTrivialJsonFenceContent(content: string): boolean {
+  const trimmed = content.trim()
+  if (trimmed === '') return true
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    return false
+  }
+  if (Array.isArray(parsed)) return parsed.length === 0
+  if (typeof parsed === 'object' && parsed !== null) return Object.keys(parsed).length === 0
+  return false
+}
+
+// Some models emit a stray empty JSON block (most often trailing one of the
+// structured fences above) that isn't shaped like any known block, so
+// stripKnownFences's exact and shape-matched passes leave it behind; it then
+// renders as a bare `{}` code block at the bottom of the Implementation
+// Plan. Only the trailing fence is considered, and only repeatedly peeled
+// while it's both trivial AND at the very end of the text — an empty-object
+// or empty-array example placed deliberately mid-document (e.g. "an empty
+// request body looks like ```json\n{}\n```") is real user-facing content and
+// must not be touched, even though its content is just as "trivial" by the
+// same JSON.parse check.
+// Scans by string index rather than regex backtracking on purpose: a lazy
+// `[\s\S]*?` fence-body pattern anchored with `$` doesn't stop at the
+// nearest closing ``` when more fences follow — it backtracks past them,
+// swallowing earlier fences into the "content" of a single match. Walking
+// from the end and matching one fence at a time avoids that.
+function stripTrailingTrivialJsonFences(text: string): string {
+  let result = text
+  for (;;) {
+    const trimmedEnd = result.replace(/[ \t\r\n]+$/, '')
+    if (!trimmedEnd.endsWith('```')) break
+
+    const closeIdx = trimmedEnd.length - 3
+    const openIdx = trimmedEnd.lastIndexOf('```', closeIdx - 1)
+    if (openIdx === -1) break
+
+    const tagLineEnd = trimmedEnd.indexOf('\n', openIdx)
+    if (tagLineEnd === -1 || tagLineEnd >= closeIdx) break
+
+    const content = trimmedEnd.slice(tagLineEnd + 1, closeIdx)
+    if (!isTrivialJsonFenceContent(content)) break
+
+    result = trimmedEnd.slice(0, openIdx)
+  }
+  return result
+}
+
 /**
  * Removes known machine-readable fenced code blocks from `text`, regardless
  * of order or whether every block is present.
  * Falls back to shape-matched generic json fences when the exact tag is
  * absent, mirroring the parsers in worker/agent-breakdown.ts and
- * worker/open-questions.ts. Pure function, no DB/IO — safe to call from both
- * server and client code.
+ * worker/open-questions.ts. Also peels off any trailing fenced block (any
+ * tag) that parses as an empty/trivial JSON value — but only at the very end
+ * of the text, so an intentional empty-object/array example placed earlier
+ * in the plan's prose is left untouched. Pure function, no DB/IO — safe to
+ * call from both server and client code.
  */
 export function stripKnownFences(text: string): string {
   let result = text
@@ -165,6 +220,8 @@ export function stripKnownFences(text: string): string {
   if (openQuestionsFallback) {
     result = result.replace(openQuestionsFallback.fullMatch, '')
   }
+
+  result = stripTrailingTrivialJsonFences(result)
 
   return result.trim()
 }

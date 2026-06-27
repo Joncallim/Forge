@@ -86,6 +86,15 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
 
   // Store streaming log chunks outside React state to avoid excessive re-renders.
   // Key: runId, Value: accumulated log string
+  //
+  // Live Output lag (issue #90): the worker publishes each model-stream delta
+  // to Redis immediately (see `result.textStream` loop in worker/orchestrator.ts)
+  // and this 500ms buffer is the only deliberate batching on the client side.
+  // Any remaining visible lag traces back to the upstream provider's own
+  // token-streaming cadence (how often the model SDK yields chunks), which
+  // Forge doesn't control and varies per provider/model. That's a
+  // non-deterministic, external constraint, not a bug here — left unchanged
+  // per the issue's own fallback acceptance criterion.
   const chunkBufferRef = useRef<Map<string, string>>(new Map())
   const flushTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const esRef = useRef<EventSource | null>(null)
