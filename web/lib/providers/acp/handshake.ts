@@ -81,19 +81,6 @@ export async function checkAcpReadiness(
 
   return new Promise<AcpReadinessResult>((resolve) => {
     let settled = false
-    let timer: ReturnType<typeof setTimeout>
-
-    const settle = (result: AcpReadinessResult) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      try {
-        child.kill()
-      } catch {
-        // Already exited.
-      }
-      resolve(result)
-    }
 
     let child: ReturnType<typeof spawn>
     try {
@@ -109,7 +96,19 @@ export async function checkAcpReadiness(
       return
     }
 
-    timer = setTimeout(() => {
+    const settle = (result: AcpReadinessResult) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try {
+        child.kill()
+      } catch {
+        // Already exited.
+      }
+      resolve(result)
+    }
+
+    const timer = setTimeout(() => {
       settle({
         status: 'handshake_failed',
         message: `Timed out after ${ACP_HANDSHAKE_TIMEOUT_MS}ms waiting for ${agent.label}'s ACP adapter to respond to the initialize handshake.`,
