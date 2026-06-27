@@ -2,7 +2,10 @@ import { and, asc, eq, inArray } from 'drizzle-orm'
 import { db } from '../db'
 import { agentRuns, artifacts, workPackageDependencies, workPackages } from '../db/schema'
 import { publishTaskEvent } from './events'
-import { materializeReviewGatesForWorkPackageCompletion } from './review-gates'
+import {
+  completeTaskIfReviewGatesSatisfied,
+  materializeReviewGatesForWorkPackageCompletion,
+} from './review-gates'
 import {
   executeWorkPackage,
   loadWorkPackageExecutionContext,
@@ -143,6 +146,26 @@ async function loadHandoffState(taskId: string): Promise<HandoffState> {
   }
 }
 
+export async function progressWorkforce(
+  taskId: string,
+  options: { claimEnabled?: boolean } = {},
+): Promise<WorkPackageHandoffResult> {
+  const result = await handoffApprovedWorkPackages(taskId, options)
+  if (result.status === 'no_ready_packages' || result.status === 'no_work_packages') {
+    await completeTaskIfReviewGatesSatisfied(taskId)
+  }
+  return result
+}
+
+async function continueWorkforceAfterPackageCompletion(
+  taskId: string,
+  packageStatus: string | null | undefined,
+  options: { claimEnabled?: boolean },
+): Promise<void> {
+  if (packageStatus !== 'completed') return
+  await progressWorkforce(taskId, options)
+}
+
 export async function previewWorkPackageHandoff(taskId: string): Promise<WorkPackageHandoffPreview> {
   const state = await loadHandoffState(taskId)
 
@@ -220,7 +243,7 @@ export async function handoffApprovedWorkPackages(
   }
 
   if (isWorkPackageExecutionEnabled()) {
-    return executeReadyWorkPackage(taskId, nextPackage, state.readyPackageIds)
+    return executeReadyWorkPackage(taskId, nextPackage, state.readyPackageIds, { claimEnabled })
   }
 
   const handoffStartedAt = new Date()
@@ -322,6 +345,10 @@ export async function handoffApprovedWorkPackages(
     workPackageId: nextPackage.id,
   })
 
+  await continueWorkforceAfterPackageCompletion(taskId, reviewGates.packageStatus, {
+    claimEnabled,
+  })
+
   return {
     status: 'handed_off',
     readyPackageIds: state.readyPackageIds,
@@ -333,6 +360,7 @@ async function executeReadyWorkPackage(
   taskId: string,
   nextPackage: HandoffPackage,
   readyPackageIds: string[],
+  options: { claimEnabled?: boolean } = {},
 ): Promise<WorkPackageHandoffResult> {
   const [claimed] = await db
     .update(workPackages)
@@ -458,6 +486,8 @@ async function executeReadyWorkPackage(
       updatedAt: new Date().toISOString(),
       workPackageId: nextPackage.id,
     })
+
+    await continueWorkforceAfterPackageCompletion(taskId, reviewGates.packageStatus, options)
 
     return {
       status: 'handed_off',

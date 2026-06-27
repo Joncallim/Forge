@@ -183,6 +183,8 @@ describe('workforce materializer', () => {
         dependsOnWorkPackageId: rows.workPackages[1].id,
       }),
     ])
+    expect(rows.workPackages.map((pkg) => pkg.reviewRequirement)).toEqual(['both', 'none', 'none'])
+
     expect(rows.approvalGate).toMatchObject({
       taskId: 'task-1',
       gateType: 'plan_approval',
@@ -190,6 +192,25 @@ describe('workforce materializer', () => {
       sourceAgentRunId: 'run-1',
       sourceArtifactId: 'artifact-1',
     })
+  })
+
+  it('honors an explicit per-agent reviewRequirement override from the Architect plan', () => {
+    const rows = buildWorkforceMaterializationRows(
+      {
+        taskId: 'task-1',
+        architectRunId: 'run-1',
+        artifactId: 'artifact-1',
+        prepared: {
+          ...prepared,
+          agents: prepared.agents.map((agent) =>
+            agent.role === 'Backend' ? { ...agent, reviewRequirement: 'qa_only' as const } : agent,
+          ),
+        },
+      },
+      { idFactory: deterministicIds() },
+    )
+
+    expect(rows.workPackages.find((pkg) => pkg.assignedRole === 'backend')?.reviewRequirement).toBe('qa_only')
   })
 
   it('keeps the materializer feature flag easy to disable', () => {

@@ -11,11 +11,15 @@ import { AGENT_BREAKDOWN_FENCE, findFence, isAgentBreakdownShape } from '@/lib/p
 
 export { AGENT_BREAKDOWN_FENCE }
 
+export const REVIEW_REQUIREMENTS = ['none', 'qa_only', 'reviewer_only', 'both'] as const
+export type ReviewRequirement = typeof REVIEW_REQUIREMENTS[number]
+
 export interface PlannedAgent {
   role: string
   tasks: number
   summary: string
   steps: string[]
+  reviewRequirement?: ReviewRequirement
 }
 
 export interface ParsedAgentBreakdown {
@@ -31,6 +35,14 @@ const FENCE_REGEX = new RegExp(
 function cleanText(value: unknown, maxLength: number): string {
   if (typeof value !== 'string') return ''
   return value.trim().replace(/\s+/g, ' ').slice(0, maxLength)
+}
+
+function normalizeReviewRequirement(raw: unknown): ReviewRequirement | undefined {
+  if (typeof raw !== 'string') return undefined
+  const normalized = raw.trim().toLowerCase().replace(/[\s-]+/g, '_')
+  return (REVIEW_REQUIREMENTS as readonly string[]).includes(normalized)
+    ? (normalized as ReviewRequirement)
+    : undefined
 }
 
 function normalizeSteps(raw: unknown): string[] {
@@ -63,16 +75,22 @@ function normalizeAgents(raw: unknown): PlannedAgent[] {
     const tasks = Number.isInteger(rawTasks) && rawTasks > 0 ? rawTasks : 1
     const summary = cleanText((item as { summary?: unknown }).summary, 180)
     const steps = normalizeSteps((item as { steps?: unknown }).steps)
+    const reviewRequirement = normalizeReviewRequirement(
+      (item as { reviewRequirement?: unknown }).reviewRequirement,
+    )
 
     const existing = byRole.get(role)
     if (existing) {
       existing.tasks += tasks
       if (existing.summary === '' && summary !== '') existing.summary = summary
       if (existing.steps.length === 0 && steps.length > 0) existing.steps = steps
+      if (existing.reviewRequirement === undefined && reviewRequirement !== undefined) {
+        existing.reviewRequirement = reviewRequirement
+      }
       continue
     }
 
-    byRole.set(role, { role, tasks, summary, steps })
+    byRole.set(role, { role, tasks, summary, steps, reviewRequirement })
   }
 
   return [...byRole.values()]

@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   ),
   dbUpdate: vi.fn(),
   materializeReviewGatesForWorkPackageCompletion: vi.fn(),
+  completeTaskIfReviewGatesSatisfied: vi.fn(),
   publishTaskEvent: vi.fn(),
 }))
 
@@ -29,6 +30,7 @@ vi.mock('@/worker/events', () => ({
 
 vi.mock('@/worker/review-gates', () => ({
   materializeReviewGatesForWorkPackageCompletion: mocks.materializeReviewGatesForWorkPackageCompletion,
+  completeTaskIfReviewGatesSatisfied: mocks.completeTaskIfReviewGatesSatisfied,
 }))
 
 import { handoffApprovedWorkPackages } from '@/worker/work-package-handoff'
@@ -178,5 +180,65 @@ describe('handoffApprovedWorkPackages', () => {
       status: 'awaiting_review',
       workPackageId: 'pkg-1',
     }))
+  })
+
+  it('auto-advances to the next ready package when no review is required for the completed one', async () => {
+    mocks.materializeReviewGatesForWorkPackageCompletion.mockResolvedValue({
+      status: 'not_required',
+      packageStatus: 'completed',
+      createdGates: [],
+    })
+    mocks.completeTaskIfReviewGatesSatisfied.mockResolvedValue({ status: 'completed' })
+
+    const firstPackages = [
+      { id: 'pkg-1', assignedRole: 'qa', harnessId: 'harness-1', sequence: 1, status: 'pending', title: 'QA package' },
+    ]
+    const secondPackages = [
+      { id: 'pkg-1', assignedRole: 'qa', harnessId: 'harness-1', sequence: 1, status: 'completed', title: 'QA package' },
+    ]
+
+    mocks.dbSelect
+      .mockReturnValueOnce(chain(firstPackages))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain(secondPackages))
+      .mockReturnValueOnce(chain([]))
+
+    const readyUpdate = updateChain([{ id: 'pkg-1' }])
+    const claimUpdate = updateChain([{ id: 'pkg-1' }])
+    mocks.dbUpdate.mockReturnValueOnce(readyUpdate)
+    const run = {
+      id: 'run-1',
+      agentType: 'handoff',
+      modelIdUsed: 'forge-handoff/no-op',
+      stage: 'handoff',
+      status: 'completed',
+    }
+    const artifact = {
+      id: 'artifact-1',
+      agentRunId: 'run-1',
+      artifactType: 'log_output',
+      content: 'handoff log',
+      metadata: {},
+      createdAt: new Date('2026-06-25T00:00:00.000Z'),
+    }
+    const runInsert = insertChain([run])
+    const artifactInsert = insertChain([artifact])
+    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
+      callback({
+        insert: vi.fn()
+          .mockReturnValueOnce(runInsert)
+          .mockReturnValueOnce(artifactInsert),
+        update: vi.fn().mockReturnValueOnce(claimUpdate),
+      }),
+    )
+
+    const result = await handoffApprovedWorkPackages('task-1')
+
+    expect(result).toEqual({
+      status: 'handed_off',
+      readyPackageIds: ['pkg-1'],
+      claimedPackageId: 'pkg-1',
+    })
+    expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1')
   })
 })

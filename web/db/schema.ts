@@ -396,6 +396,8 @@ export const workPackages = pgTable(
       .$type<Array<Record<string, unknown>>>()
       .notNull()
       .default(sql`'[]'::jsonb`),
+    // 'none'|'qa_only'|'reviewer_only'|'both' - set by the Architect plan, consumed by review-gates
+    reviewRequirement: text('review_requirement').notNull().default('both'),
     blockedReason: text('blocked_reason'),
     metadata: jsonb('metadata')
       .$type<Record<string, unknown>>()

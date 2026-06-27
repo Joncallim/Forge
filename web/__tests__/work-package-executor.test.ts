@@ -67,6 +67,7 @@ function context(overrides: Partial<WorkPackageExecutionContext> = {}): WorkPack
       requiredCapabilities: {},
       acceptanceCriteria: [],
       mcpRequirements: [],
+      reviewRequirement: 'both',
       blockedReason: null,
       metadata: {},
       createdAt: now,

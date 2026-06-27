@@ -3,6 +3,7 @@ import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { getSession } from '@/lib/session'
 import { decideReviewGate } from '@/worker/review-gates'
+import { progressWorkforce } from '@/worker/work-package-handoff'
 
 const DecisionSchema = z.object({
   decision: z.enum(['completed', 'needs_rework']),
@@ -51,6 +52,15 @@ export async function POST(
 
     if (result.status !== 'decided') {
       return NextResponse.json({ error: result.message }, { status: 409 })
+    }
+
+    try {
+      await progressWorkforce(taskId)
+    } catch (err) {
+      // The gate decision above already committed successfully; a failure here
+      // only means the next package wasn't auto-claimed yet, not that the
+      // decision failed, so don't surface it as a request error.
+      console.error('[POST /api/tasks/:id/approval-gates/:gateId] progressWorkforce failed', err)
     }
 
     return NextResponse.json({ result })

@@ -8,6 +8,8 @@ import {
   workPackages,
 } from '../db/schema'
 import type { PreparedArchitectArtifact } from './architect-artifact'
+import type { ReviewRequirement } from './agent-breakdown'
+import { isImplementationPackageRole } from './review-gates'
 
 type JsonObject = Record<string, unknown>
 type AgentHarnessInsert = typeof agentHarnesses.$inferInsert & { id: string; slug: string; role: string }
@@ -59,6 +61,10 @@ function displayNameForSlug(slug: string): string {
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(' ')
+}
+
+function defaultReviewRequirement(agentType: string): ReviewRequirement {
+  return isImplementationPackageRole(agentType) ? 'both' : 'none'
 }
 
 function titleForAgent(role: string): string {
@@ -214,6 +220,7 @@ export function buildWorkforceMaterializationRows(
       },
       acceptanceCriteria: agent.steps.length > 0 ? agent.steps : [agent.summary || titleForAgent(agent.role)],
       mcpRequirements,
+      reviewRequirement: agent.reviewRequirement ?? defaultReviewRequirement(agentType),
       metadata: {
         source: 'architect-artifact',
         architectRunId: input.architectRunId,
