@@ -243,7 +243,7 @@ export async function handoffApprovedWorkPackages(
   }
 
   if (isWorkPackageExecutionEnabled()) {
-    return executeReadyWorkPackage(taskId, nextPackage, state.readyPackageIds)
+    return executeReadyWorkPackage(taskId, nextPackage, state.readyPackageIds, { claimEnabled })
   }
 
   const handoffStartedAt = new Date()
@@ -360,6 +360,7 @@ async function executeReadyWorkPackage(
   taskId: string,
   nextPackage: HandoffPackage,
   readyPackageIds: string[],
+  options: { claimEnabled?: boolean } = {},
 ): Promise<WorkPackageHandoffResult> {
   const [claimed] = await db
     .update(workPackages)
@@ -486,7 +487,7 @@ async function executeReadyWorkPackage(
       workPackageId: nextPackage.id,
     })
 
-    await continueWorkforceAfterPackageCompletion(taskId, reviewGates.packageStatus, {})
+    await continueWorkforceAfterPackageCompletion(taskId, reviewGates.packageStatus, options)
 
     return {
       status: 'handed_off',

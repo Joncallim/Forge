@@ -54,7 +54,14 @@ export async function POST(
       return NextResponse.json({ error: result.message }, { status: 409 })
     }
 
-    await progressWorkforce(taskId)
+    try {
+      await progressWorkforce(taskId)
+    } catch (err) {
+      // The gate decision above already committed successfully; a failure here
+      // only means the next package wasn't auto-claimed yet, not that the
+      // decision failed, so don't surface it as a request error.
+      console.error('[POST /api/tasks/:id/approval-gates/:gateId] progressWorkforce failed', err)
+    }
 
     return NextResponse.json({ result })
   } catch (err) {

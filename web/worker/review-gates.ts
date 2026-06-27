@@ -166,6 +166,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
     const existingGates = await tx
       .select({
         gateType: approvalGates.gateType,
+        sourceArtifactId: approvalGates.sourceArtifactId,
         status: approvalGates.status,
       })
       .from(approvalGates)
@@ -178,10 +179,16 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
       )
 
     // Stale gates from a prior rework cycle (needs_rework/cancelled) must not
-    // block re-materialization of a fresh pending gate for the new attempt.
+    // block re-materialization of a fresh pending gate for the new attempt. A
+    // completed gate only still satisfies the requirement if it was decided
+    // against the artifact we're materializing for now — a completed gate tied
+    // to an older artifact is stale and must be replaced by a fresh pending one.
     const existingGateTypes = new Set(
       existingGates
-        .filter((gate) => gate.status === 'pending' || gate.status === 'completed')
+        .filter((gate) =>
+          gate.status === 'pending' ||
+          (gate.status === 'completed' && gate.sourceArtifactId === input.sourceArtifactId),
+        )
         .map((gate) => gate.gateType),
     )
     const missingGateTypes = requiredGateTypes.filter((gateType) => !existingGateTypes.has(gateType))
@@ -267,16 +274,35 @@ export async function completeTaskIfReviewGatesSatisfied(taskId: string): Promis
     return { status: 'blocked', reason: `work package ${unfinishedPackage.id} is ${unfinishedPackage.status}` }
   }
 
+  const completedPackageIds = new Set(
+    packages.filter((pkg) => pkg.status === 'completed').map((pkg) => pkg.id),
+  )
+
   const gates = await db
     .select({
       id: approvalGates.id,
+      createdAt: approvalGates.createdAt,
       gateType: approvalGates.gateType,
       status: approvalGates.status,
+      workPackageId: approvalGates.workPackageId,
     })
     .from(approvalGates)
     .where(and(eq(approvalGates.taskId, taskId), inArray(approvalGates.gateType, REVIEW_GATE_TYPE_VALUES)))
+    .orderBy(desc(approvalGates.createdAt))
 
-  const blockingGate = gates.find((gate) => gate.status !== 'completed')
+  // Only the latest gate per work package + gate type matters: a rework cycle
+  // leaves stale cancelled/completed gates from earlier attempts behind, and
+  // those must not block completion once a fresh attempt has been approved.
+  const latestGateByKey = new Map<string, { gateType: string; id: string; status: string }>()
+  for (const gate of gates) {
+    if (!gate.workPackageId || !completedPackageIds.has(gate.workPackageId)) continue
+    const key = `${gate.workPackageId}:${gate.gateType}`
+    if (!latestGateByKey.has(key)) {
+      latestGateByKey.set(key, gate)
+    }
+  }
+
+  const blockingGate = [...latestGateByKey.values()].find((gate) => gate.status !== 'completed')
   if (blockingGate) {
     return { status: 'blocked', reason: `${blockingGate.gateType} gate ${blockingGate.id} is ${blockingGate.status}` }
   }
