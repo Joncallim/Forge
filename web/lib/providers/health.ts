@@ -7,17 +7,38 @@ import { providerApiKeyEnvVarError, safeProviderApiKeyEnvVar } from './credentia
 import { decryptSecret } from '@/lib/crypto'
 import { PROVIDER_CATALOG } from './catalog'
 import { listLmStudioModelIds } from './model-listing'
+import { checkAcpReadiness } from './acp/handshake'
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * Fine-grained readiness state. `reachable` is derived from this (true only
+ * for `ready`) and kept for wire/back-compat with existing UI and tests.
+ */
+export type ProviderHealthStatus =
+  | 'not_configured'
+  | 'unreachable'
+  | 'handshake_failed'
+  | 'authenticated_unavailable'
+  | 'ready'
+
 export type ProviderHealthResult = {
+  status: ProviderHealthStatus
   reachable: boolean
   envVarPresent: boolean
   latencyMs: number | null
   error: string | null
   checkedAt?: string | null
+}
+
+function readyResult(envVarPresent: boolean, latencyMs: number | null): ProviderHealthResult {
+  return { status: 'ready', reachable: true, envVarPresent, latencyMs, error: null }
+}
+
+function unreachableResult(envVarPresent: boolean, error: string): ProviderHealthResult {
+  return { status: 'unreachable', reachable: false, envVarPresent, latencyMs: null, error }
 }
 
 const DEFAULT_STALE_AFTER_MS = 5 * 60 * 1000
@@ -64,12 +85,7 @@ async function checkOllamaHealth(
 ): Promise<ProviderHealthResult> {
   const nativeBaseUrl = normalizeOllamaNativeApiBaseUrl(config.baseUrl)
   if (!nativeBaseUrl) {
-    return {
-      reachable: false,
-      envVarPresent,
-      latencyMs: null,
-      error: 'A base URL is required to check Ollama health',
-    }
+    return unreachableResult(envVarPresent, 'A base URL is required to check Ollama health')
   }
 
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -96,6 +112,7 @@ async function checkOllamaHealth(
     const modelNames = ollamaModelNames(await res.json())
     if (!ollamaModelIsInstalled(modelNames, config.modelId)) {
       return {
+        status: 'unreachable',
         reachable: false,
         envVarPresent,
         latencyMs: Date.now() - start,
@@ -103,19 +120,12 @@ async function checkOllamaHealth(
       }
     }
 
-    return {
-      reachable: true,
-      envVarPresent,
-      latencyMs: Date.now() - start,
-      error: null,
-    }
+    return readyResult(envVarPresent, Date.now() - start)
   } catch (err: unknown) {
-    return {
-      reachable: false,
+    return unreachableResult(
       envVarPresent,
-      latencyMs: null,
-      error: timedOut ? `Health check timed out after ${HEALTH_TIMEOUT_MS}ms` : truncateProviderError(err),
-    }
+      timedOut ? `Health check timed out after ${HEALTH_TIMEOUT_MS}ms` : truncateProviderError(err),
+    )
   } finally {
     if (timer) clearTimeout(timer)
   }
@@ -136,6 +146,7 @@ async function checkLmStudioHealth(
 
     if (!listing.models.includes(config.modelId)) {
       return {
+        status: 'unreachable',
         reachable: false,
         envVarPresent,
         latencyMs: Date.now() - start,
@@ -143,19 +154,9 @@ async function checkLmStudioHealth(
       }
     }
 
-    return {
-      reachable: true,
-      envVarPresent,
-      latencyMs: Date.now() - start,
-      error: null,
-    }
+    return readyResult(envVarPresent, Date.now() - start)
   } catch (err: unknown) {
-    return {
-      reachable: false,
-      envVarPresent,
-      latencyMs: null,
-      error: truncateProviderError(err),
-    }
+    return unreachableResult(envVarPresent, truncateProviderError(err))
   }
 }
 
@@ -167,11 +168,13 @@ export async function checkProviderHealth(
   config: ProviderConfig,
 ): Promise<ProviderHealthResult> {
   if (config.providerType === 'acp') {
+    const readiness = await checkAcpReadiness(config.modelId)
     return {
-      reachable: false,
+      status: readiness.status,
+      reachable: readiness.status === 'ready',
       envVarPresent: true,
-      latencyMs: null,
-      error: 'ACP provider execution is not implemented yet',
+      latencyMs: readiness.latencyMs,
+      error: readiness.status === 'ready' ? null : readiness.message,
     }
   }
 
@@ -186,16 +189,14 @@ export async function checkProviderHealth(
     (safeEnvVar ? !!process.env[safeEnvVar] : unsafeEnvVarError === null)
 
   if (!envVarPresent) {
-    return {
-      reachable: false,
+    return unreachableResult(
       envVarPresent,
-      latencyMs: null,
-      error: unsafeEnvVarError
+      unsafeEnvVarError
         ? unsafeEnvVarError
         : safeEnvVar
         ? `No API key set (enter one in the UI, or set ${safeEnvVar})`
         : 'No API key set',
-    }
+    )
   }
 
   if (config.providerType === 'lmstudio') {
@@ -213,7 +214,7 @@ export async function checkProviderHealth(
   try {
     const model = await getModel(config.id)
     if (!model) {
-      return { reachable: false, envVarPresent, latencyMs: null, error: 'Provider config not found or inactive' }
+      return unreachableResult(envVarPresent, 'Provider config not found or inactive')
     }
 
     const start = Date.now()
@@ -248,7 +249,7 @@ export async function checkProviderHealth(
     error = truncateProviderError(err)
   }
 
-  return { reachable, envVarPresent, latencyMs, error }
+  return { status: reachable ? 'ready' : 'unreachable', reachable, envVarPresent, latencyMs, error }
 }
 
 export async function getCachedProviderHealth(
@@ -262,6 +263,7 @@ export async function getCachedProviderHealth(
 
   if (!row) return null
   return {
+    status: row.status as ProviderHealthStatus,
     reachable: row.reachable,
     envVarPresent: row.envVarPresent,
     latencyMs: row.latencyMs,
@@ -280,6 +282,7 @@ export async function refreshProviderHealth(
     .insert(providerHealthChecks)
     .values({
       providerConfigId: config.id,
+      status: health.status,
       reachable: health.reachable,
       envVarPresent: health.envVarPresent,
       latencyMs: health.latencyMs,
@@ -289,6 +292,7 @@ export async function refreshProviderHealth(
     .onConflictDoUpdate({
       target: providerHealthChecks.providerConfigId,
       set: {
+        status: health.status,
         reachable: health.reachable,
         envVarPresent: health.envVarPresent,
         latencyMs: health.latencyMs,

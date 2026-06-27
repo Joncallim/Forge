@@ -1,6 +1,6 @@
 {
-  "id": "7228da42-8521-40c9-b7e2-a6a158beb0e0",
-  "prevId": "0d525dd0-5d5f-403c-a823-2fd53274a3f3",
+  "id": "e797f277-5100-4f32-82bb-315d80958cad",
+  "prevId": "a709ec95-eff1-49a7-b50b-76f04220e0d7",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -1605,6 +1605,13 @@
           "notNull": true,
           "default": false
         },
+        "status": {
+          "name": "status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'unreachable'"
+        },
         "latency_ms": {
           "name": "latency_ms",
           "type": "integer",
@@ -2743,6 +2750,13 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'[]'::jsonb"
+        },
+        "review_requirement": {
+          "name": "review_requirement",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'both'"
         },
         "blocked_reason": {
           "name": "blocked_reason",

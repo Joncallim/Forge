@@ -2,6 +2,7 @@ import { streamText } from 'ai'
 import { db } from '../db'
 import { agentConfigs, agentRuns, artifacts, projects, taskQuestions, tasks } from '../db/schema'
 import { getModel, getProvider } from '../lib/providers/registry'
+import { resolveDefaultProvider } from '../lib/providers/default'
 import { and, asc, desc, eq } from 'drizzle-orm'
 import { publishTaskEvent } from './events'
 import { updateTaskStatus, updateTaskStatusIfCurrent, type TaskStatus } from './task-state'
@@ -417,7 +418,8 @@ async function runArchitect(
     throw new Error('Architect agent config is missing')
   }
 
-  const providerConfigId = task.pmProviderConfigId ?? config.providerConfigId
+  const providerConfigId =
+    task.pmProviderConfigId ?? config.providerConfigId ?? (await resolveDefaultProvider())?.id ?? null
   if (!providerConfigId) {
     throw new Error('Architect agent has no provider configured')
   }

@@ -139,6 +139,9 @@ export const providerHealthChecks = pgTable(
       .references(() => providerConfigs.id, { onDelete: 'cascade' }),
     reachable: boolean('reachable').notNull().default(false),
     envVarPresent: boolean('env_var_present').notNull().default(false),
+    // Fine-grained readiness state. See lib/providers/health.ts for the enum.
+    // `reachable` above is kept for wire/back-compat and is derived from this.
+    status: text('status').notNull().default('unreachable'),
     latencyMs: integer('latency_ms'),
     error: text('error'),
     checkedAt: timestamp('checked_at', tsOpts).defaultNow().notNull(),

@@ -7,6 +7,7 @@ import { and, eq } from 'drizzle-orm'
 import { db } from '../db'
 import { agentConfigs, projects, tasks, workPackages } from '../db/schema'
 import { getModel, getProvider } from '../lib/providers/registry'
+import { resolveDefaultProvider } from '../lib/providers/default'
 
 const execFile = promisify(execFileCallback)
 
@@ -510,10 +511,13 @@ export async function loadWorkPackageExecutionContext(
     .where(eq(agentConfigs.agentType, row.workPackage.assignedRole))
     .limit(1)
 
-  const providerConfigId = resolveExecutionProviderConfigId({
+  let providerConfigId = resolveExecutionProviderConfigId({
     agentProviderConfigId: agentConfig?.providerConfigId,
     taskProviderConfigId: row.task.pmProviderConfigId,
   })
+  if (!providerConfigId) {
+    providerConfigId = (await resolveDefaultProvider())?.id ?? null
+  }
   if (!providerConfigId) {
     throw new Error(`No provider configured for ${row.workPackage.assignedRole} execution.`)
   }

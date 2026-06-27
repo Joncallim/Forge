@@ -1,0 +1,1 @@
+ALTER TABLE "provider_health_checks" ADD COLUMN "status" text DEFAULT 'unreachable' NOT NULL;
