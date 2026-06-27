@@ -131,13 +131,47 @@ export function isCapabilityClassificationShape(parsed: unknown): boolean {
   )
 }
 
+// Matches any fenced code block regardless of language tag, so a leftover
+// machine artifact under an unrecognized tag (or no tag at all) can still be
+// caught by isTrivialJsonFenceContent below.
+const ANY_FENCE_REGEX = /```[^\n]*\n([\s\S]*?)[ \t]*\n?[ \t]*```/g
+
+// True for fence content that parses as JSON and carries no information a
+// reader would care about — `{}`, `[]`, or whitespace. Some models emit a
+// stray empty JSON block (most often trailing one of the structured fences
+// above) that isn't shaped like any known block, so stripKnownFences's exact
+// and shape-matched passes leave it behind; it then renders as a bare `{}`
+// code block in the Implementation Plan. A non-empty unrecognized JSON fence
+// is left alone — it might be intentional example content.
+function isTrivialJsonFenceContent(content: string): boolean {
+  const trimmed = content.trim()
+  if (trimmed === '') return true
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    return false
+  }
+  if (Array.isArray(parsed)) return parsed.length === 0
+  if (typeof parsed === 'object' && parsed !== null) return Object.keys(parsed).length === 0
+  return false
+}
+
+function stripTrivialJsonFences(text: string): string {
+  return text.replace(ANY_FENCE_REGEX, (fullMatch, content: string) =>
+    isTrivialJsonFenceContent(content) ? '' : fullMatch,
+  )
+}
+
 /**
  * Removes known machine-readable fenced code blocks from `text`, regardless
  * of order or whether every block is present.
  * Falls back to shape-matched generic json fences when the exact tag is
  * absent, mirroring the parsers in worker/agent-breakdown.ts and
- * worker/open-questions.ts. Pure function, no DB/IO — safe to call from both
- * server and client code.
+ * worker/open-questions.ts. Also strips any leftover fenced block (any tag)
+ * that parses as an empty/trivial JSON value, since those are never
+ * meaningful user-facing content. Pure function, no DB/IO — safe to call
+ * from both server and client code.
  */
 export function stripKnownFences(text: string): string {
   let result = text
@@ -165,6 +199,8 @@ export function stripKnownFences(text: string): string {
   if (openQuestionsFallback) {
     result = result.replace(openQuestionsFallback.fullMatch, '')
   }
+
+  result = stripTrivialJsonFences(result)
 
   return result.trim()
 }

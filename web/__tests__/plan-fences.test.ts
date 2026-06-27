@@ -108,4 +108,30 @@ describe('stripKnownFences', () => {
 
     expect(stripKnownFences(text)).toBe('# Plan\nClassify the work.')
   })
+
+  it('removes a trailing stray empty-object fence under an unrecognized tag', () => {
+    const text = ['# Plan', 'Do the thing.', '', '```json', '{}', '```'].join('\n')
+    expect(stripKnownFences(text)).toBe('# Plan\nDo the thing.')
+  })
+
+  it('removes a stray empty-array fence with no language tag', () => {
+    const text = ['# Plan', 'Do the thing.', '', '```', '[]', '```'].join('\n')
+    expect(stripKnownFences(text)).toBe('# Plan\nDo the thing.')
+  })
+
+  it('removes a whitespace-only fence', () => {
+    const text = ['# Plan', 'Do the thing.', '', '```', '   ', '```'].join('\n')
+    expect(stripKnownFences(text)).toBe('# Plan\nDo the thing.')
+  })
+
+  it('does not remove a non-empty unrecognized JSON fence', () => {
+    const text = ['# Plan', 'Do the thing.', '', '```json', '{"note": "keep me"}', '```'].join('\n')
+    const stripped = stripKnownFences(text)
+    expect(stripped).toContain('{"note": "keep me"}')
+  })
+
+  it('does not strip non-JSON fenced code blocks even if short', () => {
+    const text = ['# Plan', 'Run this:', '', '```bash', 'echo hi', '```'].join('\n')
+    expect(stripKnownFences(text)).toBe(text.trim())
+  })
 })
