@@ -102,4 +102,18 @@ describe('parseAgentBreakdown', () => {
     // Falls back to role-tag extraction since the structured block isn't present.
     expect(agents).toEqual([{ role: 'Frontend', tasks: 1, summary: 'Build UI', steps: ['Build UI'] }])
   })
+
+  it('normalizes the reviewRequirement field when present', () => {
+    const { agents } = parseAgentBreakdown(
+      withFence(
+        '{"agents":[{"role":"Frontend","tasks":1,"reviewRequirement":"QA Only"},{"role":"Docs","tasks":1,"reviewRequirement":"none"},{"role":"Backend","tasks":1,"reviewRequirement":"bogus"}]}',
+      ),
+    )
+
+    expect(agents).toEqual([
+      { role: 'Frontend', tasks: 1, summary: '', steps: [], reviewRequirement: 'qa_only' },
+      { role: 'Docs', tasks: 1, summary: '', steps: [], reviewRequirement: 'none' },
+      { role: 'Backend', tasks: 1, summary: '', steps: [] },
+    ])
+  })
 })

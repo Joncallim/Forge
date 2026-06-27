@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray } from 'drizzle-orm'
+import { and, asc, desc, eq, inArray } from 'drizzle-orm'
 import { db } from '../db'
 import { approvalGates, artifacts, workPackages } from '../db/schema'
 import { publishTaskEvent } from './events'
@@ -7,13 +7,27 @@ import { updateTaskStatusIfCurrent } from './task-state'
 export const REVIEW_GATE_TYPES = ['qa_review', 'reviewer_review'] as const
 export type ReviewGateType = typeof REVIEW_GATE_TYPES[number]
 export type ReviewGateDecision = 'completed' | 'needs_rework'
+export type ReviewRequirement = 'none' | 'qa_only' | 'reviewer_only' | 'both'
 
 const REVIEW_GATE_TYPE_VALUES = [...REVIEW_GATE_TYPES]
 const REVIEW_EXEMPT_ROLES = new Set(['architect', 'handoff', 'pm', 'qa', 'reviewer'])
 
+function isReviewRequirement(value: string): value is ReviewRequirement {
+  return value === 'none' || value === 'qa_only' || value === 'reviewer_only' || value === 'both'
+}
+
+export function requiredGateTypesForRequirement(requirement: string): ReviewGateType[] {
+  if (!isReviewRequirement(requirement)) return [...REVIEW_GATE_TYPES]
+  if (requirement === 'none') return []
+  if (requirement === 'qa_only') return ['qa_review']
+  if (requirement === 'reviewer_only') return ['reviewer_review']
+  return [...REVIEW_GATE_TYPES]
+}
+
 type ReviewGatePackage = {
   id: string
   assignedRole: string
+  reviewRequirement: string
   status: string
   taskId: string
   title: string
@@ -105,6 +119,7 @@ async function loadPackage(taskId: string, workPackageId: string): Promise<Revie
     .select({
       id: workPackages.id,
       assignedRole: workPackages.assignedRole,
+      reviewRequirement: workPackages.reviewRequirement,
       status: workPackages.status,
       taskId: workPackages.taskId,
       title: workPackages.title,
@@ -128,7 +143,10 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
   }
 
   const now = new Date()
-  const reviewRequired = isImplementationPackageRole(pkg.assignedRole)
+  const requiredGateTypes = isImplementationPackageRole(pkg.assignedRole)
+    ? requiredGateTypesForRequirement(pkg.reviewRequirement)
+    : []
+  const reviewRequired = requiredGateTypes.length > 0
   const packageStatus = reviewRequired ? 'awaiting_review' : 'completed'
 
   const createdGates = await db.transaction(async (tx) => {
@@ -148,6 +166,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
     const existingGates = await tx
       .select({
         gateType: approvalGates.gateType,
+        status: approvalGates.status,
       })
       .from(approvalGates)
       .where(
@@ -158,8 +177,14 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
         ),
       )
 
-    const existingGateTypes = new Set(existingGates.map((gate) => gate.gateType))
-    const missingGateTypes = REVIEW_GATE_TYPES.filter((gateType) => !existingGateTypes.has(gateType))
+    // Stale gates from a prior rework cycle (needs_rework/cancelled) must not
+    // block re-materialization of a fresh pending gate for the new attempt.
+    const existingGateTypes = new Set(
+      existingGates
+        .filter((gate) => gate.status === 'pending' || gate.status === 'completed')
+        .map((gate) => gate.gateType),
+    )
+    const missingGateTypes = requiredGateTypes.filter((gateType) => !existingGateTypes.has(gateType))
     const inserted: MaterializedGate[] = []
 
     for (const gateType of missingGateTypes) {
@@ -307,6 +332,13 @@ export async function decideReviewGate(input: {
   const workPackageId = gate.workPackageId
   const sourceAgentRunId = gate.sourceAgentRunId
 
+  const [workPackage] = await db
+    .select({ reviewRequirement: workPackages.reviewRequirement })
+    .from(workPackages)
+    .where(eq(workPackages.id, workPackageId))
+    .limit(1)
+  const requiredGateTypes = requiredGateTypesForRequirement(workPackage?.reviewRequirement ?? 'both')
+
   const [sourceArtifact] = await db
     .select({ id: artifacts.id })
     .from(artifacts)
@@ -325,7 +357,11 @@ export async function decideReviewGate(input: {
     }
   }
 
-  if (gate.gateType === 'reviewer_review' && input.decision === 'completed') {
+  if (
+    gate.gateType === 'reviewer_review' &&
+    input.decision === 'completed' &&
+    requiredGateTypes.includes('qa_review')
+  ) {
     const [qaGate] = await db
       .select({ status: approvalGates.status })
       .from(approvalGates)
@@ -336,9 +372,10 @@ export async function decideReviewGate(input: {
           eq(approvalGates.gateType, 'qa_review'),
         ),
       )
+      .orderBy(desc(approvalGates.createdAt))
       .limit(1)
 
-    if (!qaGate || qaGate.status !== 'completed') {
+    if (qaGate && qaGate.status !== 'completed') {
       return { status: 'reviewer_blocked', message: 'QA review must be completed before reviewer approval.' }
     }
   }
@@ -424,6 +461,7 @@ export async function decideReviewGate(input: {
       .select({
         gateType: approvalGates.gateType,
         status: approvalGates.status,
+        createdAt: approvalGates.createdAt,
       })
       .from(approvalGates)
       .where(
@@ -433,13 +471,18 @@ export async function decideReviewGate(input: {
           inArray(approvalGates.gateType, REVIEW_GATE_TYPE_VALUES),
         ),
       )
+      .orderBy(desc(approvalGates.createdAt))
 
-    const completedGateTypes = new Set(
-      reviewGates
-        .filter((reviewGate) => reviewGate.status === 'completed')
-        .map((reviewGate) => reviewGate.gateType),
+    const latestStatusByGateType = new Map<string, string>()
+    for (const reviewGate of reviewGates) {
+      if (!latestStatusByGateType.has(reviewGate.gateType)) {
+        latestStatusByGateType.set(reviewGate.gateType, reviewGate.status)
+      }
+    }
+
+    const packageComplete = requiredGateTypes.every(
+      (gateType) => latestStatusByGateType.get(gateType) === 'completed',
     )
-    const packageComplete = REVIEW_GATE_TYPES.every((gateType) => completedGateTypes.has(gateType))
 
     if (packageComplete) {
       await tx

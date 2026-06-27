@@ -85,6 +85,13 @@
       "when": 1782369932000,
       "tag": "0011_workforce_slug_check",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1782450000000,
+      "tag": "0012_work_package_review_requirement",
+      "breakpoints": true
     }
   ]
 }

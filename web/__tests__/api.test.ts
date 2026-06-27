@@ -92,6 +92,11 @@ vi.mock('@/worker/review-gates', () => ({
   decideReviewGate: mockDecideReviewGate,
 }))
 
+const mockProgressWorkforce = vi.fn().mockResolvedValue({ status: 'no_ready_packages', readyPackageIds: [], claimedPackageId: null })
+vi.mock('@/worker/work-package-handoff', () => ({
+  progressWorkforce: mockProgressWorkforce,
+}))
+
 const mockGetGitHubStatus = vi.fn()
 const mockResolveGitHubToken = vi.fn()
 const mockValidateGitHubTokenEnvVar = vi.fn((rawEnvVar: string | null | undefined) => {

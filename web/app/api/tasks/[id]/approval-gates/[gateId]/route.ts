@@ -3,6 +3,7 @@ import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { getSession } from '@/lib/session'
 import { decideReviewGate } from '@/worker/review-gates'
+import { progressWorkforce } from '@/worker/work-package-handoff'
 
 const DecisionSchema = z.object({
   decision: z.enum(['completed', 'needs_rework']),
@@ -52,6 +53,8 @@ export async function POST(
     if (result.status !== 'decided') {
       return NextResponse.json({ error: result.message }, { status: 409 })
     }
+
+    await progressWorkforce(taskId)
 
     return NextResponse.json({ result })
   } catch (err) {
