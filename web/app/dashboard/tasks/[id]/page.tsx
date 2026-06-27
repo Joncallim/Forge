@@ -1750,6 +1750,10 @@ export default function TaskDetailPage() {
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
 
+  // Implementation Plan — collapsed by default to save space; expands to
+  // show the full plan text or a revision diff when there are 2+ versions
+  const [planExpanded, setPlanExpanded] = useState(false)
+
   // Approve / change-plan / restart state
   const [actionLoading, setActionLoading] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
@@ -1841,6 +1845,14 @@ export default function TaskDetailPage() {
       loadTask()
     }
   }, [streamRefreshRevision, loadTask])
+
+  // Auto-expand the plan once it's awaiting approval, so reviewers see it
+  // without an extra click; stays expanded afterward unless collapsed manually.
+  useEffect(() => {
+    if (currentStatus === 'awaiting_approval') {
+      setPlanExpanded(true)
+    }
+  }, [currentStatus])
 
   async function handleApprove() {
     setActionLoading(true)
@@ -2050,6 +2062,43 @@ export default function TaskDetailPage() {
         questions={mergedQuestions}
         artifacts={mergedArtifacts}
       />
+
+      {/* Implementation Plan — full width, above the two-column layout below,
+          collapsed by default so it doesn't dominate the page */}
+      <section aria-labelledby="implementation-plan-heading" className="mb-6 rounded-lg border border-border bg-card p-4">
+        <button
+          type="button"
+          onClick={() => setPlanExpanded((value) => !value)}
+          className="flex w-full items-center justify-between gap-3 text-left focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+          aria-expanded={planExpanded}
+          aria-controls="implementation-plan-content"
+        >
+          <h2 id="implementation-plan-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
+            Implementation Plan
+          </h2>
+          {planExpanded ? (
+            <ChevronUpIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+          ) : (
+            <ChevronDownIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+          )}
+        </button>
+        {planExpanded && (
+          <div id="implementation-plan-content" className="mt-3 min-w-0">
+            {adrArtifacts.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No implementation plan has been generated for this task yet.</p>
+            ) : adrArtifacts.length >= 2 ? (
+              <PlanDiffView
+                oldContent={sortedAdrArtifacts[sortedAdrArtifacts.length - 2].content}
+                newContent={sortedAdrArtifacts[sortedAdrArtifacts.length - 1].content}
+              />
+            ) : (
+              <div className="min-w-0 rounded-lg bg-muted/40 px-4 py-3">
+                <MarkdownView content={stripKnownFences(sortedAdrArtifacts[0].content)} />
+              </div>
+            )}
+          </div>
+        )}
+      </section>
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] lg:items-start">
         <div className="min-w-0">
@@ -2302,9 +2351,10 @@ export default function TaskDetailPage() {
             artifacts={mergedArtifacts}
           />
 
-          {/* Artifacts — Implementation Plan text and revisions live here,
-              alongside Workforce, since both represent the execution plan */}
-          {taskLevelArtifacts.length > 0 && (
+          {/* Artifacts — Implementation Plan now lives in its own top-level
+              section above; this keeps only other artifact types (file
+              diffs, test reports, PR links, review findings) */}
+          {otherArtifacts.length > 0 && (
             <section aria-labelledby="artifacts-heading">
               <h2 id="artifacts-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
                 Artifacts
@@ -2313,21 +2363,6 @@ export default function TaskDetailPage() {
                 {otherArtifacts.map((artifact) => (
                   <ArtifactView key={artifact.id} artifact={artifact} />
                 ))}
-                {adrArtifacts.length >= 2 ? (
-                  <div className="rounded-lg border border-border p-4">
-                    <p className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">
-                      Plan Revision
-                    </p>
-                    <PlanDiffView
-                      oldContent={sortedAdrArtifacts[sortedAdrArtifacts.length - 2].content}
-                      newContent={sortedAdrArtifacts[sortedAdrArtifacts.length - 1].content}
-                    />
-                  </div>
-                ) : (
-                  adrArtifacts.map((artifact) => (
-                    <ArtifactView key={artifact.id} artifact={artifact} />
-                  ))
-                )}
               </div>
             </section>
           )}
