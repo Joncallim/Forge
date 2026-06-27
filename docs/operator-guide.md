@@ -223,6 +223,30 @@ npx playwright install chromium
 npm run e2e
 ```
 
+### Manual QA checklist: task detail layout and badge colors (#92)
+
+Visual changes to `web/app/dashboard/tasks/[id]/page.tsx` aren't covered by
+Vitest (no jsdom/render harness in this repo). Verify by hand after touching
+that file:
+
+1. `cd web && npm run dev`, open a task that has workforce packages, an
+   approval gate, required-capabilities classification, and an MCP execution
+   design (a task that's reached `awaiting_approval` or later usually has
+   all four).
+2. At desktop width (≥1024px): confirm the `Prompt` column (left) and
+   `Workforce`/`Implementation Plan` column (right) are approximately equal
+   width — neither should look cramped or dominate.
+3. Confirm `Required Capabilities`, `Open Questions` (if any), and `MCP tool
+   access` render in the left-hand column, stacked under `Prompt`, not in
+   the right-hand `Workforce` column.
+4. Check badge colors are consistent across the page for the same status
+   word — e.g. every `completed` badge (task header, agent runs, work
+   packages, approval gates, retry history) should be the same green, every
+   `failed`/`rejected`/`cancelled` badge the same red, every
+   `pending`/`awaiting_*` badge the same amber.
+5. Resize to mobile width (<768px): confirm both columns stack vertically
+   with no horizontal overflow or clipped content.
+
 ### Manual smoke test: workforce task accept → retry → navigate (#86)
 
 The dev-server build-manifest race this guards against (`next dev` evicting
