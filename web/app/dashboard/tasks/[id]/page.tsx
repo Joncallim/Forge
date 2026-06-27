@@ -1844,6 +1844,14 @@ export default function TaskDetailPage() {
     }
   }, [streamRefreshRevision, loadTask])
 
+  // Auto-expand the plan once it's awaiting approval, so reviewers see it
+  // without an extra click; stays expanded afterward unless collapsed manually.
+  useEffect(() => {
+    if (currentStatus === 'awaiting_approval') {
+      setPlanExpanded(true)
+    }
+  }, [currentStatus])
+
   async function handleApprove() {
     setActionLoading(true)
     setActionError(null)
