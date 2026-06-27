@@ -89,6 +89,10 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
   const chunkBufferRef = useRef<Map<string, string>>(new Map())
   const flushTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const esRef = useRef<EventSource | null>(null)
+  // Set when the server intentionally recycles the connection (see
+  // `stream:cycling` in the SSE route) so the next onerror — the browser
+  // closing and auto-reconnecting — isn't mistaken for a real drop.
+  const expectingCycleRef = useRef(false)
 
   const flushChunks = useCallback(() => {
     const buffer = chunkBufferRef.current
@@ -273,7 +277,15 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
       }
     })
 
+    es.addEventListener('stream:cycling', () => {
+      expectingCycleRef.current = true
+    })
+
     es.onerror = () => {
+      if (expectingCycleRef.current) {
+        expectingCycleRef.current = false
+        return
+      }
       // Only surface an error if the stream hasn't reached a terminal state
       setError((prev) => {
         if (prev) return prev
