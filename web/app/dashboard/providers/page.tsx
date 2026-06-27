@@ -47,6 +47,7 @@ import {
   getAcpAgent,
   type AcpAuthMode,
 } from '@/lib/providers/acp/catalog'
+import type { ProviderHealthStatus } from '@/lib/providers/health'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -78,6 +79,7 @@ type ProviderDeactivationImpact = {
 }
 
 type ProviderHealth = {
+  status: ProviderHealthStatus
   reachable: boolean
   envVarPresent: boolean
   latencyMs: number | null
@@ -86,6 +88,11 @@ type ProviderHealth = {
 }
 
 type HealthMap = Record<string, ProviderHealth | 'loading' | 'error'>
+
+type DefaultProviderState = {
+  defaultProviderConfigId: string | null
+  resolvedProviderId: string | null
+}
 
 type DiscoveryCandidateStatus = 'reachable' | 'not_reachable' | 'added' | 'updated' | 'configured' | 'skipped' | 'unknown'
 
@@ -388,6 +395,39 @@ function HealthDot({ health }: { health: ProviderHealth | 'loading' | 'error' | 
           <span className="size-2 rounded-full bg-gray-400" aria-hidden="true" />
           <span className="text-xs text-muted-foreground">Not checked</span>
         </span>
+      </span>
+    )
+  }
+  if (health.status === 'not_configured') {
+    return (
+      <span className="inline-flex flex-col gap-0.5" aria-label="Adapter not configured" title={health.error ?? 'Not configured'}>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="size-2 rounded-full bg-gray-400" aria-hidden="true" />
+          <span className="text-xs text-muted-foreground">Not set up</span>
+        </span>
+        <span className="text-[11px] text-muted-foreground">{lastChecked ?? 'Not checked'}</span>
+      </span>
+    )
+  }
+  if (health.status === 'authenticated_unavailable') {
+    return (
+      <span className="inline-flex flex-col gap-0.5" aria-label="Adapter reachable but not authenticated" title={health.error ?? 'Needs authentication'}>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="size-2 rounded-full bg-yellow-400" aria-hidden="true" />
+          <span className="text-xs text-muted-foreground">Needs login</span>
+        </span>
+        <span className="text-[11px] text-muted-foreground">{lastChecked ?? 'Not checked'}</span>
+      </span>
+    )
+  }
+  if (health.status === 'handshake_failed') {
+    return (
+      <span className="inline-flex flex-col gap-0.5" aria-label="Adapter handshake failed" title={health.error ?? 'Handshake failed'}>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="size-2 rounded-full bg-red-500" aria-hidden="true" />
+          <span className="text-xs text-muted-foreground">Handshake failed</span>
+        </span>
+        <span className="text-[11px] text-muted-foreground">{lastChecked ?? 'Not checked'}</span>
       </span>
     )
   }
@@ -972,6 +1012,13 @@ export default function ProvidersPage() {
   const [deleteErrors, setDeleteErrors] = useState<Record<string, string | null>>({})
   const [discovering, setDiscovering] = useState(false)
   const [discoveryState, setDiscoveryState] = useState<LocalDiscoveryState | null>(null)
+  const [recheckingId, setRecheckingId] = useState<string | null>(null)
+  const [defaultState, setDefaultState] = useState<DefaultProviderState>({
+    defaultProviderConfigId: null,
+    resolvedProviderId: null,
+  })
+  const [settingDefaultId, setSettingDefaultId] = useState<string | null>(null)
+  const [defaultError, setDefaultError] = useState<string | null>(null)
 
   // Add dialog
   const [addOpen, setAddOpen] = useState(false)
@@ -1068,6 +1115,80 @@ export default function ProvidersPage() {
       await loadHealth(true)
     } finally {
       setRefreshingHealth(false)
+    }
+  }
+
+  async function handleRecheckOne(providerId: string) {
+    setRecheckingId(providerId)
+    try {
+      const res = await fetch(`/api/providers/${providerId}/health?refresh=1`)
+      if (!res.ok) throw new Error('Health check failed')
+      const health = await res.json() as ProviderHealth
+      setHealthMap((prev) => ({ ...prev, [providerId]: health }))
+    } catch {
+      setHealthMap((prev) => ({ ...prev, [providerId]: 'error' }))
+    } finally {
+      setRecheckingId(null)
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Default provider
+  // ---------------------------------------------------------------------------
+
+  const loadDefaultProvider = useCallback(async () => {
+    try {
+      const res = await fetch('/api/providers/default')
+      if (!res.ok) return
+      const data = await res.json() as { defaultProviderConfigId: string | null; resolvedProvider: { id: string } | null }
+      setDefaultState({
+        defaultProviderConfigId: data.defaultProviderConfigId,
+        resolvedProviderId: data.resolvedProvider?.id ?? null,
+      })
+    } catch {
+      // Non-critical; leave default state as-is.
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadDefaultProvider()
+  }, [loadDefaultProvider])
+
+  async function handleSetDefault(providerId: string) {
+    setSettingDefaultId(providerId)
+    setDefaultError(null)
+    try {
+      const res = await fetch('/api/providers/default', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ providerConfigId: providerId }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error((body as { error?: string }).error ?? 'Failed to set default provider')
+      }
+      await loadDefaultProvider()
+    } catch (err) {
+      setDefaultError(err instanceof Error ? err.message : 'Failed to set default provider')
+    } finally {
+      setSettingDefaultId(null)
+    }
+  }
+
+  async function handleClearDefault() {
+    setSettingDefaultId('__clear__')
+    setDefaultError(null)
+    try {
+      const res = await fetch('/api/providers/default', { method: 'DELETE' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error((body as { error?: string }).error ?? 'Failed to clear default provider')
+      }
+      await loadDefaultProvider()
+    } catch (err) {
+      setDefaultError(err instanceof Error ? err.message : 'Failed to clear default provider')
+    } finally {
+      setSettingDefaultId(null)
     }
   }
 
@@ -1301,6 +1422,33 @@ export default function ProvidersPage() {
       {/* Discovery feedback */}
       {discoveryState !== null && <DiscoveryResultsPanel state={discoveryState} />}
 
+      {/* Default provider summary */}
+      {!loading && providers.length > 0 && (
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+          <span>
+            {defaultState.defaultProviderConfigId
+              ? 'A default provider is set. It is used whenever an agent or task has no provider assigned.'
+              : defaultState.resolvedProviderId
+                ? 'No default provider is set. Forge is falling back to a ready local provider for unassigned work.'
+                : 'No default provider is set, and no ready local provider was found to fall back to.'}
+          </span>
+          {defaultState.defaultProviderConfigId && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleClearDefault}
+              disabled={settingDefaultId === '__clear__'}
+              aria-busy={settingDefaultId === '__clear__'}
+            >
+              {settingDefaultId === '__clear__' ? 'Clearing…' : 'Clear default'}
+            </Button>
+          )}
+        </div>
+      )}
+      {defaultError !== null && (
+        <p role="alert" className="mb-4 text-sm text-destructive">{defaultError}</p>
+      )}
+
       {/* Loading */}
       {loading && (
         <div className="flex items-center justify-center py-16" role="status" aria-live="polite">
@@ -1344,6 +1492,7 @@ export default function ProvidersPage() {
                 <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Model or agent</th>
                 <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Category</th>
                 <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Connection</th>
+                <th scope="col" className="px-4 py-3 text-left font-medium text-muted-foreground">Default</th>
                 <th scope="col" className="px-4 py-3 text-right font-medium text-muted-foreground">
                   <span className="sr-only">Actions</span>
                 </th>
@@ -1396,7 +1545,41 @@ export default function ProvidersPage() {
                     })()}
                   </td>
                   <td className="px-4 py-3">
-                    <HealthDot health={healthMap[provider.id]} />
+                    <div className="flex items-center gap-1.5">
+                      <HealthDot health={healthMap[provider.id]} />
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        onClick={() => handleRecheckOne(provider.id)}
+                        disabled={recheckingId === provider.id}
+                        aria-busy={recheckingId === provider.id}
+                        aria-label={`Recheck connection for ${provider.displayName}`}
+                        title="Recheck connection"
+                      >
+                        <RefreshCwIcon
+                          className={`size-3.5 text-muted-foreground ${recheckingId === provider.id ? 'animate-spin' : ''}`}
+                          aria-hidden="true"
+                        />
+                      </Button>
+                    </div>
+                  </td>
+                  <td className="px-4 py-3">
+                    {defaultState.defaultProviderConfigId === provider.id ? (
+                      <span className="inline-flex h-5 items-center rounded-full bg-blue-100 px-2 text-xs font-medium text-blue-800 dark:bg-blue-900/30 dark:text-blue-300">
+                        Default
+                      </span>
+                    ) : (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleSetDefault(provider.id)}
+                        disabled={settingDefaultId === provider.id || !provider.isActive}
+                        aria-busy={settingDefaultId === provider.id}
+                        aria-label={`Set ${provider.displayName} as default provider`}
+                      >
+                        {settingDefaultId === provider.id ? 'Setting…' : 'Set as default'}
+                      </Button>
+                    )}
                   </td>
                   <td className="px-4 py-3">
                     <div className="flex items-center justify-end gap-1">
