@@ -94,23 +94,6 @@ interface TaskDetailResponse {
   vcsChanges?: VcsChange[]
 }
 
-type StatusVariant = 'default' | 'secondary' | 'destructive' | 'outline'
-
-function statusBadgeVariant(status: string): StatusVariant {
-  switch (status) {
-    case 'running': return 'default'
-    case 'awaiting_approval': return 'outline'
-    case 'awaiting_review': return 'outline'
-    case 'approved':
-    case 'completed': return 'secondary'
-    case 'failed':
-    case 'needs_rework':
-    case 'rejected':
-    case 'cancelled': return 'destructive'
-    default: return 'outline'
-  }
-}
-
 function statusLabel(status: string): string {
   const labels: Record<string, string> = {
     awaiting_answers: 'Needs answers',
@@ -335,23 +318,43 @@ function isReviewGateType(gateType: string): boolean {
   return gateType === 'qa_review' || gateType === 'reviewer_review'
 }
 
+// Semantic color buckets shared by every status badge on this page, so the
+// same color always means the same thing regardless of which entity
+// (task, run, work package, approval gate, vcs change) the status belongs
+// to: blue = ready to start, sky = actively running, amber = waiting on
+// someone, green = finished successfully, red = stopped/failed.
 function statusBadgeClass(status: string): string {
   switch (status) {
     case 'ready':
+    case 'planned':
+    case 'created':
+    case 'proposed':
       return 'border-blue-200 bg-blue-50 text-blue-800 dark:border-blue-900/50 dark:bg-blue-950/30 dark:text-blue-300'
     case 'running':
+    case 'updated':
       return 'border-sky-200 bg-sky-50 text-sky-800 dark:border-sky-900/50 dark:bg-sky-950/30 dark:text-sky-300'
     case 'awaiting_review':
+    case 'awaiting_approval':
+    case 'awaiting_answers':
+    case 'submitted':
     case 'pending':
+    case 'warning':
       return 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200'
     case 'completed':
     case 'approved':
+    case 'merged':
+    case 'valid':
       return 'border-green-200 bg-green-50 text-green-800 dark:border-green-900/50 dark:bg-green-950/30 dark:text-green-300'
     case 'needs_rework':
     case 'failed':
     case 'rejected':
     case 'cancelled':
+    case 'abandoned':
+    case 'dead_lettered':
+    case 'blocked':
       return 'border-destructive/30 bg-destructive/10 text-destructive'
+    case 'warnings':
+      return 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200'
     default:
       return ''
   }
@@ -490,15 +493,6 @@ function AgentRunRow({ run }: { run: AgentRun }) {
     pinnedToBottomRef.current = distanceFromBottom < 32
   }
 
-  const runStatusVariant = (): StatusVariant => {
-    switch (run.status) {
-      case 'running': return 'default'
-      case 'completed': return 'secondary'
-      case 'failed': return 'destructive'
-      default: return 'outline'
-    }
-  }
-
   return (
     <li className="border-b border-border last:border-0">
       <button
@@ -510,7 +504,7 @@ function AgentRunRow({ run }: { run: AgentRun }) {
       >
         <div className="flex flex-wrap items-center gap-3 text-sm">
           <span className="font-medium text-foreground capitalize">{run.agentType}</span>
-          <Badge variant={runStatusVariant()}>{statusLabel(run.status)}</Badge>
+          {statusBadge(run.status)}
         </div>
         <div className="flex items-center gap-4 text-xs text-muted-foreground">
           {run.inputTokens !== null && (
@@ -1113,7 +1107,7 @@ function WorkforcePanel({
                     <li key={recordKey(gate, 'approval-gate', index)} className="min-w-0 border-t border-border pt-3 first:border-t-0 first:pt-0">
                       <div className="flex flex-wrap items-center gap-2">
                         <p className="min-w-0 break-words text-sm font-medium text-foreground">{title}</p>
-                        {status !== '' && <Badge variant={statusBadgeVariant(status)}>{statusLabel(status)}</Badge>}
+                        {status !== '' && statusBadge(status)}
                         {gateType !== '' && isReviewGateType(gateType) && (
                           <Badge variant="outline">{statusLabel(gateType)}</Badge>
                         )}
@@ -1203,7 +1197,7 @@ function WorkforcePanel({
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="break-all font-mono text-xs text-foreground">{path}</span>
                     {type !== '' && <Badge variant="outline">{type}</Badge>}
-                    {status !== '' && <Badge variant={statusBadgeVariant(status)}>{statusLabel(status)}</Badge>}
+                    {status !== '' && statusBadge(status)}
                   </div>
                   {summary !== '' && <p className="mt-1 text-xs text-muted-foreground">{summary}</p>}
                 </li>
@@ -1227,7 +1221,7 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
   const missingClassificationOnly =
     validation.warnings.length === 1 &&
     validation.warnings[0] === 'Architect did not provide a machine-readable capability classification.'
-  const statusVariant: StatusVariant = validation.status === 'warnings' && !missingClassificationOnly ? 'outline' : 'secondary'
+  const effectiveStatus = missingClassificationOnly ? 'valid' : validation.status
   const statusLabelText = missingClassificationOnly ? 'Not classified' : statusLabel(validation.status)
 
   return (
@@ -1243,7 +1237,7 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
           >
             <InfoIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
           </span>
-          <Badge variant={statusVariant}>{statusLabelText}</Badge>
+          <Badge variant="outline" className={statusBadgeClass(effectiveStatus)}>{statusLabelText}</Badge>
         </span>
       </div>
 
@@ -1326,12 +1320,7 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
     design.validation.blocked.length === 0 &&
     design.validation.warnings.length === 1 &&
     design.validation.warnings[0] === 'Architect did not provide a machine-readable MCP execution design.'
-  const statusVariant: StatusVariant =
-    design.validation.status === 'blocked'
-      ? 'destructive'
-      : design.validation.status === 'warnings' && !missingDesignOnly
-        ? 'outline'
-        : 'secondary'
+  const effectiveDesignStatus = missingDesignOnly ? 'valid' : design.validation.status
   const statusText = missingDesignOnly ? 'Not requested' : statusLabel(design.validation.status)
 
   return (
@@ -1347,7 +1336,7 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
           >
             <InfoIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
           </span>
-          <Badge variant={statusVariant}>{statusText}</Badge>
+          <Badge variant="outline" className={statusBadgeClass(effectiveDesignStatus)}>{statusText}</Badge>
         </span>
       </div>
 
@@ -1385,21 +1374,15 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
           <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
             <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Access decision preview</p>
             <div className="flex flex-wrap gap-1.5">
-              <Badge variant="secondary">{grantPreview.summary.proposed} proposed</Badge>
-              <Badge variant="outline">{grantPreview.summary.warning} warning</Badge>
-              <Badge variant={grantPreview.summary.blocked > 0 ? 'destructive' : 'secondary'}>
+              <Badge variant="outline" className={statusBadgeClass('proposed')}>{grantPreview.summary.proposed} proposed</Badge>
+              <Badge variant="outline" className={statusBadgeClass('warning')}>{grantPreview.summary.warning} warning</Badge>
+              <Badge variant="outline" className={statusBadgeClass(grantPreview.summary.blocked > 0 ? 'blocked' : 'valid')}>
                 {grantPreview.summary.blocked} blocked
               </Badge>
             </div>
           </div>
           <ul className="grid gap-2 text-xs">
             {grantPreview.decisions.map((decision) => {
-              const variant: StatusVariant =
-                decision.status === 'blocked'
-                  ? 'destructive'
-                  : decision.status === 'warning'
-                    ? 'outline'
-                    : 'secondary'
               const statusText = decision.status === 'blocked'
                 ? 'Do not assign MCP-backed work until this MCP issue is resolved.'
                 : decision.status === 'warning'
@@ -1409,7 +1392,7 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
               return (
                 <li key={decision.decisionId} className="rounded-md border border-border bg-muted/20 px-2.5 py-2">
                   <div className="mb-1 flex flex-wrap items-center gap-2">
-                    <Badge variant={variant}>{decision.status}</Badge>
+                    <Badge variant="outline" className={statusBadgeClass(decision.status)}>{decision.status}</Badge>
                     <span className="font-medium text-foreground">{decision.agent}</span>
                     <span className="text-muted-foreground">{decision.mcpId}</span>
                     {decision.promptOverlayPresent && <Badge variant="outline">overlay</Badge>}
@@ -1507,13 +1490,6 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
 }
 
 function TaskAttemptRow({ attempt, runs }: { attempt: TaskAttempt; runs: AgentRun[] }) {
-  const variant: StatusVariant =
-    attempt.status === 'completed'
-      ? 'secondary'
-      : attempt.status === 'failed' || attempt.status === 'dead_lettered'
-        ? 'destructive'
-        : 'outline'
-
   const matchedRun = runs.find((run) => run.agentType === attempt.queueName)
   const modelLabel = matchedRun?.modelIdUsed || (attempt.workerId ? 'Model pending' : 'Worker pending')
 
@@ -1523,7 +1499,7 @@ function TaskAttemptRow({ attempt, runs }: { attempt: TaskAttempt; runs: AgentRu
         <div className="flex flex-wrap items-center gap-2 text-sm">
           <span className="font-medium text-foreground">{attempt.queueName}</span>
           <span className="text-muted-foreground">attempt {attempt.attemptNumber}</span>
-          <Badge variant={variant}>{statusLabel(attempt.status)}</Badge>
+          {statusBadge(attempt.status)}
         </div>
         <span className="font-mono text-xs text-muted-foreground" title={attempt.workerId ?? undefined}>
           {modelLabel}
@@ -2026,9 +2002,7 @@ export default function TaskDetailPage() {
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-3">
               <h1 className="text-xl font-semibold text-foreground">{task.title}</h1>
-              <Badge variant={statusBadgeVariant(currentStatus ?? task.status)}>
-                {statusLabel(currentStatus ?? task.status)}
-              </Badge>
+              {statusBadge(currentStatus ?? task.status)}
             </div>
 
             {/* GitHub PR link */}
@@ -2075,7 +2049,7 @@ export default function TaskDetailPage() {
         artifacts={mergedArtifacts}
       />
 
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(320px,420px)] lg:items-start">
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] lg:items-start">
         <div className="min-w-0">
           {/* Task prompt — always shown, so the originating instruction is visible */}
           <section aria-labelledby="prompt-heading" className="mb-6">
@@ -2086,6 +2060,14 @@ export default function TaskDetailPage() {
               <MarkdownView content={task.prompt} />
             </div>
           </section>
+
+          {/* Open questions — answer before the plan can be approved; placed
+              right under the prompt since it can block progress */}
+          {mergedQuestions.length > 0 && (
+            <div className="mb-6">
+              <QuestionsPanel taskId={taskId} questions={mergedQuestions} onAnswered={loadTask} />
+            </div>
+          )}
 
           {/* Approve / Change plan / Restart actions */}
           {isAwaitingApproval && (
@@ -2259,6 +2241,14 @@ export default function TaskDetailPage() {
             </form>
           )}
 
+          {/* Required capabilities and MCP tool access — reference/routing
+              metadata, grouped with the prompt rather than the workforce
+              execution column */}
+          <div className="mb-6 grid gap-6">
+            <CapabilityClassificationPanel classification={capabilityClassification} />
+            <McpAccessPlanPanel design={mcpExecutionDesign} />
+          </div>
+
           {/* Agent run timeline */}
           <section aria-labelledby="runs-heading" className="mb-6">
             <h2 id="runs-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
@@ -2309,15 +2299,9 @@ export default function TaskDetailPage() {
             onGateDecided={loadTask}
             artifacts={mergedArtifacts}
           />
-          <CapabilityClassificationPanel classification={capabilityClassification} />
-          <McpAccessPlanPanel design={mcpExecutionDesign} />
 
-          {/* Open questions — answer before the plan can be approved */}
-          {mergedQuestions.length > 0 && (
-            <QuestionsPanel taskId={taskId} questions={mergedQuestions} onAnswered={loadTask} />
-          )}
-
-          {/* Artifacts */}
+          {/* Artifacts — Implementation Plan text and revisions live here,
+              alongside Workforce, since both represent the execution plan */}
           {taskLevelArtifacts.length > 0 && (
             <section aria-labelledby="artifacts-heading">
               <h2 id="artifacts-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
