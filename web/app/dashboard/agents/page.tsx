@@ -220,12 +220,23 @@ function AgentEditor({
     setError(null)
   }, [agent])
 
-  const recsByLayer = groupByLayer(ROLE_RECOMMENDATIONS[draft.agentType] ?? [])
   const providersByType = providers.reduce<Map<ProviderType, ProviderConfig[]>>((acc, p) => {
     const existing = acc.get(p.providerType) ?? []
     acc.set(p.providerType, [...existing, p])
     return acc
   }, new Map())
+  const isRecAvailable = (rec: RoleRecommendation) =>
+    providersByType.get(rec.providerType as ProviderType)?.some((p) => p.isActive) ?? false
+  const sortedRecs = [...(ROLE_RECOMMENDATIONS[draft.agentType] ?? [])].sort(
+    (a, b) => Number(isRecAvailable(b)) - Number(isRecAvailable(a)),
+  )
+  const recsByLayer = groupByLayer(sortedRecs)
+  const [showAllRecLayers, setShowAllRecLayers] = useState(false)
+  const availableLayers = new Map(
+    Array.from(recsByLayer.entries()).filter(([, items]) => items.some(isRecAvailable)),
+  )
+  const visibleRecsByLayer = showAllRecLayers || availableLayers.size === 0 ? recsByLayer : availableLayers
+  const hiddenLayerCount = recsByLayer.size - visibleRecsByLayer.size
   const selectedProvider = providers.find((provider) => provider.id === draft.providerConfigId)
 
   function setDraftValue<K extends keyof AgentDraft>(key: K, value: AgentDraft[K]) {
@@ -534,28 +545,48 @@ function AgentEditor({
                 Recommended providers
               </p>
               <div className="flex flex-col gap-3">
-                {Array.from(recsByLayer.entries()).map(([layer, items]) => (
+                {Array.from(visibleRecsByLayer.entries()).map(([layer, items]) => (
                   <div key={layer}>
                     <p className="mb-1.5 text-xs font-medium text-foreground">{layer}</p>
                     <div className="flex flex-col gap-1.5">
-                      {items.map((rec) => (
-                        <div
-                          key={`${rec.providerType}:${rec.modelId}`}
-                          className="flex items-start justify-between gap-2 rounded-lg border border-border bg-background px-3 py-2"
-                        >
-                          <div className="min-w-0">
-                            <p className="truncate font-mono text-xs text-foreground">{rec.modelId}</p>
-                            <p className="text-[11px] leading-relaxed text-muted-foreground">{rec.note}</p>
+                      {items.map((rec) => {
+                        const available = isRecAvailable(rec)
+                        return (
+                          <div
+                            key={`${rec.providerType}:${rec.modelId}`}
+                            className="flex items-start justify-between gap-2 rounded-lg border border-border bg-background px-3 py-2"
+                          >
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <p className="truncate font-mono text-xs text-foreground">{rec.modelId}</p>
+                                {available && (
+                                  <span className="inline-flex h-4 items-center rounded-full bg-green-100 px-1.5 text-[10px] font-medium text-green-800 dark:bg-green-900/30 dark:text-green-300">
+                                    Available
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-[11px] leading-relaxed text-muted-foreground">{rec.note}</p>
+                            </div>
+                            <Button size="xs" variant="outline" onClick={() => handleUseRecommendation(rec)}>
+                              Use
+                            </Button>
                           </div>
-                          <Button size="xs" variant="outline" onClick={() => handleUseRecommendation(rec)}>
-                            Use
-                          </Button>
-                        </div>
-                      ))}
+                        )
+                      })}
                     </div>
                   </div>
                 ))}
               </div>
+              {hiddenLayerCount > 0 && (
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  className="mt-2"
+                  onClick={() => setShowAllRecLayers(true)}
+                >
+                  Show {hiddenLayerCount} more provider{hiddenLayerCount === 1 ? '' : 's'}
+                </Button>
+              )}
             </div>
           )}
 
@@ -988,6 +1019,7 @@ export default function AgentsPage() {
 
       {!loading && !fetchError && (
         <div className="grid gap-8">
+          <div className="grid gap-8 lg:grid-cols-2 lg:items-start">
           <section aria-labelledby="agents-heading">
             <div className="mb-3 flex items-center justify-between gap-3">
               <div>
@@ -1095,7 +1127,7 @@ export default function AgentsPage() {
               </p>
             </div>
 
-            <div className="grid gap-3 lg:grid-cols-2">
+            <div className="grid gap-3">
               {workforces.length === 0 ? (
                 <div className="rounded-lg border border-border p-4 text-sm text-muted-foreground">
                   No workforces configured.
@@ -1163,6 +1195,7 @@ export default function AgentsPage() {
               )}
             </div>
           </section>
+          </div>
 
           <section aria-labelledby="presets-heading">
             <h2 id="presets-heading" className="mb-1 text-lg font-semibold text-foreground">
