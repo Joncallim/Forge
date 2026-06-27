@@ -151,8 +151,11 @@ export async function evaluateAgentRoles(
   options: EvaluateAgentRolesOptions,
 ): Promise<AgentEvaluationResult> {
   const architectConfig = options.agentConfigs.find((c) => c.agentType === ARCHITECT_AGENT)
+  if (!architectConfig) {
+    throw new Error('No Architect agent configured. Assign a provider to the Architect agent first.')
+  }
   const architectProviderConfigId =
-    architectConfig?.providerConfigId ?? (await resolveDefaultProvider())?.id ?? null
+    architectConfig.providerConfigId ?? (await resolveDefaultProvider())?.id ?? null
   if (!architectProviderConfigId) {
     throw new Error('No orchestrator provider configured. Assign a provider to the Architect agent first.')
   }
@@ -189,11 +192,12 @@ export async function evaluateAgentRoles(
   }
 
   const prompt = buildEvaluationPrompt(options.agentConfigs, options.activeProviders, webResearchContext)
+  const architectSystemPrompt = architectConfig.systemPrompt
 
   async function attempt(attemptPrompt: string): Promise<{ recommendations: AgentRoleRecommendation[]; raw: string; usage: { inputTokens: number; outputTokens: number } }> {
     const result = await generateText({
       model: evaluationModel,
-      system: architectConfig!.systemPrompt,
+      system: architectSystemPrompt,
       prompt: attemptPrompt,
       temperature: 0.2,
     })
