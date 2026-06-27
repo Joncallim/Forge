@@ -41,6 +41,7 @@ export async function GET(
     const cached = await getCachedProviderHealth(config.id)
     return NextResponse.json(
       cached ?? {
+        status: 'unreachable',
         reachable: false,
         envVarPresent: true,
         latencyMs: null,
