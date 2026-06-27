@@ -226,7 +226,9 @@ function AgentEditor({
     return acc
   }, new Map())
   const isRecAvailable = (rec: RoleRecommendation) =>
-    providersByType.get(rec.providerType as ProviderType)?.some((p) => p.isActive) ?? false
+    providersByType
+      .get(rec.providerType as ProviderType)
+      ?.some((p) => p.isActive && p.modelId === rec.modelId) ?? false
   const sortedRecs = [...(ROLE_RECOMMENDATIONS[draft.agentType] ?? [])].sort(
     (a, b) => Number(isRecAvailable(b)) - Number(isRecAvailable(a)),
   )
