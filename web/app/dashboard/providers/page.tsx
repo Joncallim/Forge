@@ -358,11 +358,17 @@ function formFromProvider(p: ProviderConfig): ProviderFormState {
 // Health indicator
 // ---------------------------------------------------------------------------
 
+function isSameDay(a: Date, b: Date): boolean {
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate()
+}
+
 function HealthDot({ health }: { health: ProviderHealth | 'loading' | 'error' | undefined }) {
-  const lastChecked =
-    typeof health === 'object' && health.checkedAt
-      ? new Intl.DateTimeFormat(undefined, { dateStyle: 'short', timeStyle: 'short' }).format(new Date(health.checkedAt))
-      : null
+  const checkedDate = typeof health === 'object' && health.checkedAt ? new Date(health.checkedAt) : null
+  const lastChecked = checkedDate
+    ? isSameDay(checkedDate, new Date())
+      ? new Intl.DateTimeFormat(undefined, { timeStyle: 'short' }).format(checkedDate)
+      : new Intl.DateTimeFormat(undefined, { dateStyle: 'short', timeStyle: 'short' }).format(checkedDate)
+    : null
 
   if (health === undefined || health === 'loading') {
     return (

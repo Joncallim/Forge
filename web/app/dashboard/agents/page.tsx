@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { BotIcon, PencilIcon, PlusIcon, Trash2Icon, UsersIcon } from 'lucide-react'
+import { BotIcon, ChevronRightIcon, PencilIcon, PlusIcon, Trash2Icon, UsersIcon } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import {
@@ -950,7 +950,7 @@ export default function AgentsPage() {
     loadData()
   }, [loadData])
 
-  const assignableProviders = providers.filter((provider) => provider.providerType !== 'acp')
+  const assignableProviders = providers
   const activeAgents = useMemo(() => agents.filter((agent) => agent.isActive), [agents])
 
   const providerById = useCallback(
@@ -1034,88 +1034,63 @@ export default function AgentsPage() {
               </div>
             </div>
 
-            <div className="overflow-x-auto rounded-lg border border-border">
-              <table className="w-full min-w-[760px] table-fixed text-sm" aria-label="Agent configurations">
-                <thead>
-                  <tr className="border-b border-border bg-muted/40">
-                    <th scope="col" className="w-[52%] px-4 py-3 text-left font-medium text-muted-foreground">Agent</th>
-                    <th scope="col" className="w-[25%] px-4 py-3 text-left font-medium text-muted-foreground">Provider</th>
-                    <th scope="col" className="w-[15%] px-4 py-3 text-left font-medium text-muted-foreground">Status</th>
-                    <th scope="col" className="w-[8%] px-4 py-3 text-right font-medium text-muted-foreground">
-                      <span className="sr-only">Actions</span>
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {agents.length === 0 ? (
-                    <tr>
-                      <td colSpan={4} className="px-4 py-8 text-center text-muted-foreground">
-                        No agents configured.
-                      </td>
-                    </tr>
-                  ) : (
-                    agents.map((agent) => {
-                      const provider = providerById(agent.providerConfigId)
-                      return (
-                        <tr key={agent.id} className="border-b border-border last:border-0 hover:bg-muted/30">
-                          <td className="px-4 py-3">
-                            <div className="flex min-w-0 items-start gap-3">
-                              <BotIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-                              <div className="min-w-0">
-                                <p className="font-medium text-foreground">
-                                  {agent.displayName || titleize(agent.agentType)}
-                                </p>
-                                <p className="break-all font-mono text-xs text-muted-foreground">{agent.agentType}</p>
-                                {agent.description && (
-                                  <p className="mt-1 max-w-xl break-words text-xs text-muted-foreground">
-                                    {agent.description}
-                                  </p>
-                                )}
-                              </div>
-                            </div>
-                          </td>
-                          <td className="px-4 py-3">
-                            {provider ? (
-                              <div className="min-w-0">
-                                <p className="break-words leading-snug text-foreground">{provider.displayName}</p>
-                                <p className="break-all font-mono text-xs leading-snug text-muted-foreground">
-                                  {provider.modelId}
-                                </p>
-                              </div>
-                            ) : (
-                              <span className="text-muted-foreground">None</span>
+            <div className="grid gap-3" aria-label="Agent configurations">
+              {agents.length === 0 ? (
+                <div className="rounded-lg border border-border p-4 text-sm text-muted-foreground">
+                  No agents configured.
+                </div>
+              ) : (
+                agents.map((agent) => {
+                  const provider = providerById(agent.providerConfigId)
+                  return (
+                    <article key={agent.id} className="rounded-lg border border-border p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex min-w-0 items-start gap-3">
+                          <BotIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+                          <div className="min-w-0">
+                            <p className="font-medium text-foreground">
+                              {agent.displayName || titleize(agent.agentType)}
+                            </p>
+                            <p className="break-all font-mono text-xs text-muted-foreground">{agent.agentType}</p>
+                            {agent.description && (
+                              <p className="mt-1 max-w-xl break-words text-xs text-muted-foreground">
+                                {agent.description}
+                              </p>
                             )}
-                          </td>
-                          <td className="px-4 py-3">
-                            <div className="flex flex-wrap gap-1.5">
-                              <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
-                                {agent.isActive ? 'Active' : 'Archived'}
-                              </span>
-                              {agent.isSystem && (
-                                <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
-                                  Seeded
-                                </span>
-                              )}
-                            </div>
-                          </td>
-                          <td className="px-4 py-3">
-                            <div className="flex justify-end">
-                              <Button
-                                variant="ghost"
-                                size="icon-sm"
-                                aria-label={`Edit ${agent.displayName || agent.agentType}`}
-                                onClick={() => setEditingAgent(agent)}
-                              >
-                                <PencilIcon className="size-4 text-muted-foreground" aria-hidden="true" />
-                              </Button>
-                            </div>
-                          </td>
-                        </tr>
-                      )
-                    })
-                  )}
-                </tbody>
-              </table>
+                          </div>
+                        </div>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label={`Edit ${agent.displayName || agent.agentType}`}
+                          onClick={() => setEditingAgent(agent)}
+                        >
+                          <PencilIcon className="size-4 text-muted-foreground" aria-hidden="true" />
+                        </Button>
+                      </div>
+
+                      <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
+                        {provider ? (
+                          <span className="min-w-0 text-muted-foreground">
+                            <span className="text-foreground">{provider.displayName}</span>{' '}
+                            <span className="break-all font-mono text-xs">{provider.modelId}</span>
+                          </span>
+                        ) : (
+                          <span className="text-muted-foreground">No provider</span>
+                        )}
+                        <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                          {agent.isActive ? 'Active' : 'Archived'}
+                        </span>
+                        {agent.isSystem && (
+                          <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                            Seeded
+                          </span>
+                        )}
+                      </div>
+                    </article>
+                  )
+                })
+              )}
             </div>
           </section>
 
@@ -1136,36 +1111,45 @@ export default function AgentsPage() {
                 </div>
               ) : (
                 workforces.map((workforce) => (
-                  <article key={workforce.id} className="rounded-lg border border-border p-4">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <h3 className="break-words font-medium text-foreground">{workforce.displayName}</h3>
-                          {workforce.isDefault && (
-                            <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
-                              Default
-                            </span>
-                          )}
-                          {!workforce.isActive && (
-                            <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
-                              Archived
-                            </span>
+                  <details key={workforce.id} className="group rounded-lg border border-border p-4" open>
+                    <summary className="flex cursor-pointer list-none items-start justify-between gap-3 [&::-webkit-details-marker]:hidden">
+                      <div className="flex min-w-0 items-start gap-2">
+                        <ChevronRightIcon
+                          className="mt-1 size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-90"
+                          aria-hidden="true"
+                        />
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <h3 className="break-words font-medium text-foreground">{workforce.displayName}</h3>
+                            {workforce.isDefault && (
+                              <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                                Default
+                              </span>
+                            )}
+                            {!workforce.isActive && (
+                              <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                                Archived
+                              </span>
+                            )}
+                          </div>
+                          <p className="break-all font-mono text-xs text-muted-foreground">{workforce.slug}</p>
+                          {workforce.description && (
+                            <p className="mt-2 break-words text-sm text-muted-foreground">{workforce.description}</p>
                           )}
                         </div>
-                        <p className="break-all font-mono text-xs text-muted-foreground">{workforce.slug}</p>
-                        {workforce.description && (
-                          <p className="mt-2 break-words text-sm text-muted-foreground">{workforce.description}</p>
-                        )}
                       </div>
                       <Button
                         variant="ghost"
                         size="icon-sm"
                         aria-label={`Edit ${workforce.displayName}`}
-                        onClick={() => setEditingWorkforce(workforce)}
+                        onClick={(e) => {
+                          e.preventDefault()
+                          setEditingWorkforce(workforce)
+                        }}
                       >
                         <PencilIcon className="size-4 text-muted-foreground" aria-hidden="true" />
                       </Button>
-                    </div>
+                    </summary>
 
                     <div className="mt-4">
                       {workforce.members.length === 0 ? (
@@ -1192,7 +1176,7 @@ export default function AgentsPage() {
                         </ul>
                       )}
                     </div>
-                  </article>
+                  </details>
                 ))
               )}
             </div>

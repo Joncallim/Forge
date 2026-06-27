@@ -1,5 +1,5 @@
-import { spawn } from 'node:child_process'
 import { getAcpAgent } from './catalog'
+import { AcpTransport, defaultAcpSpawn, type AcpSpawn } from './transport'
 
 // ---------------------------------------------------------------------------
 // ACP adapter readiness check
@@ -26,7 +26,7 @@ export type AcpReadinessResult = {
 }
 
 const ACP_HANDSHAKE_TIMEOUT_MS = 8000
-const ACP_PROTOCOL_VERSION = 1
+export const ACP_PROTOCOL_VERSION = 1
 
 /**
  * Maps an ACP catalog agent id to the command that spawns its zed-industries
@@ -52,8 +52,6 @@ function looksLikeAuthFailure(message: string | undefined): boolean {
   return /\b(auth|login|credential|unauthoriz|api key|token)/i.test(message)
 }
 
-type AcpSpawn = (command: string, args: string[]) => ReturnType<typeof spawn>
-
 /**
  * Spawns the adapter for `agentId`, sends an ACP `initialize` request, and
  * classifies the outcome. `spawnFn` is injectable for tests so we never need
@@ -61,7 +59,7 @@ type AcpSpawn = (command: string, args: string[]) => ReturnType<typeof spawn>
  */
 export async function checkAcpReadiness(
   agentId: string,
-  spawnFn: AcpSpawn = (command, args) => spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] }),
+  spawnFn: AcpSpawn = defaultAcpSpawn,
 ): Promise<AcpReadinessResult> {
   const agent = getAcpAgent(agentId)
   if (!agent) {
@@ -79,115 +77,57 @@ export async function checkAcpReadiness(
 
   const start = Date.now()
 
-  return new Promise<AcpReadinessResult>((resolve) => {
-    let settled = false
-
-    let child: ReturnType<typeof spawn>
-    try {
-      child = spawnFn(command[0], command.slice(1))
-    } catch (err) {
-      resolve({
-        status: 'unreachable',
-        message: `Could not start the ${agent.label} ACP adapter: ${
-          err instanceof Error ? err.message : String(err)
-        }. Make sure Node/npx is on PATH.`,
-        latencyMs: null,
-      })
-      return
+  let transport: AcpTransport
+  try {
+    transport = new AcpTransport(command, spawnFn)
+  } catch (err) {
+    return {
+      status: 'unreachable',
+      message: `Could not start the ${agent.label} ACP adapter: ${
+        err instanceof Error ? err.message : String(err)
+      }. Make sure Node/npx is on PATH.`,
+      latencyMs: null,
     }
+  }
 
-    const settle = (result: AcpReadinessResult) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      try {
-        child.kill()
-      } catch {
-        // Already exited.
-      }
-      resolve(result)
+  try {
+    await transport.request(
+      'initialize',
+      { protocolVersion: ACP_PROTOCOL_VERSION, clientCapabilities: {} },
+      ACP_HANDSHAKE_TIMEOUT_MS,
+    )
+    return {
+      status: 'ready',
+      message: `${agent.label} is reachable and completed the ACP handshake.`,
+      latencyMs: Date.now() - start,
     }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
 
-    const timer = setTimeout(() => {
-      settle({
+    if (/timed out/i.test(message)) {
+      return {
         status: 'handshake_failed',
         message: `Timed out after ${ACP_HANDSHAKE_TIMEOUT_MS}ms waiting for ${agent.label}'s ACP adapter to respond to the initialize handshake.`,
         latencyMs: null,
-      })
-    }, ACP_HANDSHAKE_TIMEOUT_MS)
+      }
+    }
 
-    let stderr = ''
-    let stdoutBuffer = ''
-
-    child.stderr?.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString('utf8').slice(0, 2000)
-    })
-
-    child.on('error', (err) => {
-      settle({
+    if (/exited unexpectedly|process error/i.test(message)) {
+      return {
         status: 'unreachable',
-        message: `Could not reach the ${agent.label} ACP adapter process: ${err.message}`,
-        latencyMs: null,
-      })
-    })
-
-    child.on('exit', (code) => {
-      if (settled) return
-      settle({
-        status: 'unreachable',
-        message: `The ${agent.label} ACP adapter exited immediately (code ${code}).${
-          stderr.trim() ? ` ${stderr.trim().slice(0, 300)}` : ' Is the underlying CLI installed and on PATH?'
+        message: `The ${agent.label} ACP adapter exited immediately or could not be reached: ${message}${
+          transport.recentStderr ? '' : ' Is the underlying CLI installed and on PATH?'
         }`,
         latencyMs: null,
-      })
-    })
-
-    child.stdout?.on('data', (chunk: Buffer) => {
-      stdoutBuffer += chunk.toString('utf8')
-      const lines = stdoutBuffer.split('\n')
-      stdoutBuffer = lines.pop() ?? ''
-
-      for (const line of lines) {
-        const trimmed = line.trim()
-        if (!trimmed) continue
-
-        let parsed: unknown
-        try {
-          parsed = JSON.parse(trimmed)
-        } catch {
-          continue
-        }
-        if (!parsed || typeof parsed !== 'object') continue
-
-        const message = parsed as { id?: unknown; result?: unknown; error?: { message?: string } }
-        if (message.id !== 1) continue
-
-        if (message.error) {
-          settle({
-            status: looksLikeAuthFailure(message.error.message) ? 'authenticated_unavailable' : 'handshake_failed',
-            message: `${agent.label}'s ACP adapter rejected the initialize handshake: ${
-              message.error.message ?? 'unknown error'
-            }`,
-            latencyMs: Date.now() - start,
-          })
-          return
-        }
-
-        settle({
-          status: 'ready',
-          message: `${agent.label} is reachable and completed the ACP handshake.`,
-          latencyMs: Date.now() - start,
-        })
-        return
       }
-    })
-
-    const request = {
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'initialize',
-      params: { protocolVersion: ACP_PROTOCOL_VERSION, clientCapabilities: {} },
     }
-    child.stdin?.write(`${JSON.stringify(request)}\n`)
-  })
+
+    return {
+      status: looksLikeAuthFailure(message) ? 'authenticated_unavailable' : 'handshake_failed',
+      message: `${agent.label}'s ACP adapter rejected the initialize handshake: ${message}`,
+      latencyMs: Date.now() - start,
+    }
+  } finally {
+    transport.close()
+  }
 }
