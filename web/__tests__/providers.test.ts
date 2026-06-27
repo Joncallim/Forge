@@ -29,6 +29,7 @@ const {
   mockAnthropicInstance,
   mockOpenAIInstance,
   mockOpenAIChat,
+  mockCheckAcpReadiness,
 } = vi.hoisted(() => {
   const mockAnthropicInstance = vi.fn().mockReturnValue({ _tag: 'anthropic-model' })
   const mockOpenAIChat = vi.fn().mockReturnValue({ _tag: 'openai-chat-model' })
@@ -47,6 +48,7 @@ const {
     mockOpenAIInstance,
     mockOpenAIChat,
     mockGoogleInstance,
+    mockCheckAcpReadiness: vi.fn(),
   }
 })
 
@@ -62,6 +64,7 @@ vi.mock('@ai-sdk/anthropic', () => ({ createAnthropic: mockCreateAnthropic }))
 vi.mock('@ai-sdk/openai', () => ({ createOpenAI: mockCreateOpenAI }))
 vi.mock('@ai-sdk/google', () => ({ createGoogleGenerativeAI: mockCreateGoogleGenerativeAI }))
 vi.mock('ai', () => ({ generateText: mockGenerateText }))
+vi.mock('@/lib/providers/acp/handshake', () => ({ checkAcpReadiness: mockCheckAcpReadiness }))
 
 // ---------------------------------------------------------------------------
 // Drizzle chain factory
@@ -429,16 +432,44 @@ describe('checkProviderHealth', () => {
     vi.clearAllMocks()
   })
 
-  it('reports ACP providers as configured but not executable', async () => {
+  it('reports a ready ACP provider as reachable based on the adapter handshake', async () => {
+    mockCheckAcpReadiness.mockResolvedValueOnce({
+      status: 'ready',
+      message: 'Codex CLI is reachable and completed the ACP handshake.',
+      latencyMs: 42,
+    })
+
+    const result = await checkProviderHealth(
+      makeRow({ providerType: 'acp', modelId: 'codex-cli', isLocal: true }),
+    )
+
+    expect(mockCheckAcpReadiness).toHaveBeenCalledWith('codex-cli')
+    expect(result).toMatchObject({
+      status: 'ready',
+      reachable: true,
+      envVarPresent: true,
+      latencyMs: 42,
+      error: null,
+    })
+  })
+
+  it('surfaces a failed ACP handshake as an actionable, non-reachable status', async () => {
+    mockCheckAcpReadiness.mockResolvedValueOnce({
+      status: 'handshake_failed',
+      message: "Codex CLI's ACP adapter rejected the initialize handshake: boom",
+      latencyMs: 12,
+    })
+
     const result = await checkProviderHealth(
       makeRow({ providerType: 'acp', modelId: 'codex-cli', isLocal: true }),
     )
 
     expect(result).toMatchObject({
+      status: 'handshake_failed',
       reachable: false,
       envVarPresent: true,
-      latencyMs: null,
-      error: 'ACP provider execution is not implemented yet',
+      latencyMs: 12,
+      error: "Codex CLI's ACP adapter rejected the initialize handshake: boom",
     })
   })
 

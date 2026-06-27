@@ -2,6 +2,7 @@ import { generateText } from 'ai'
 import { z } from 'zod'
 import type { AgentConfig, ProviderConfig, tasks } from '@/db/schema'
 import { getModel, getProvider } from '@/lib/providers/registry'
+import { resolveDefaultProvider } from '@/lib/providers/default'
 import { buildWebResearchContext } from '@/worker/architect-context'
 
 // ---------------------------------------------------------------------------
@@ -150,18 +151,20 @@ export async function evaluateAgentRoles(
   options: EvaluateAgentRolesOptions,
 ): Promise<AgentEvaluationResult> {
   const architectConfig = options.agentConfigs.find((c) => c.agentType === ARCHITECT_AGENT)
-  if (!architectConfig || !architectConfig.providerConfigId) {
+  const architectProviderConfigId =
+    architectConfig?.providerConfigId ?? (await resolveDefaultProvider())?.id ?? null
+  if (!architectProviderConfigId) {
     throw new Error('No orchestrator provider configured. Assign a provider to the Architect agent first.')
   }
 
-  const providerResult = await getProvider(architectConfig.providerConfigId)
+  const providerResult = await getProvider(architectProviderConfigId)
   if (!providerResult) {
-    throw new Error(`Provider config ${architectConfig.providerConfigId} is missing or inactive`)
+    throw new Error(`Provider config ${architectProviderConfigId} is missing or inactive`)
   }
 
-  const model = await getModel(architectConfig.providerConfigId)
+  const model = await getModel(architectProviderConfigId)
   if (!model) {
-    throw new Error(`Provider config ${architectConfig.providerConfigId} is missing or inactive`)
+    throw new Error(`Provider config ${architectProviderConfigId} is missing or inactive`)
   }
   const evaluationModel = model
 
