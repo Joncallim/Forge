@@ -13,14 +13,6 @@ import {
   DialogFooter,
   DialogTrigger,
 } from '@/components/ui/dialog'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-} from '@/components/ui/select'
-import { MarkdownView } from '@/components/MarkdownView'
-import { stripKnownFences } from '@/lib/plan-fences'
 
 interface Project {
   id: string
@@ -194,13 +186,6 @@ export default function ProjectDetailPage() {
   const [refreshingMcps, setRefreshingMcps] = useState(false)
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
-
-  // Implementation Plan card — defaults to the most recently created task,
-  // but the operator can switch it via the dropdown
-  const [planTaskId, setPlanTaskId] = useState<string | null>(null)
-  const [planContent, setPlanContent] = useState<string | null>(null)
-  const [planLoading, setPlanLoading] = useState(false)
-  const [planError, setPlanError] = useState<string | null>(null)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [projectPathDialogOpen, setProjectPathDialogOpen] = useState(false)
   const [projectPathInput, setProjectPathInput] = useState('')
@@ -243,9 +228,7 @@ export default function ProjectDetailPage() {
       ])
 
       setProject(projectData.project ?? null)
-      const loadedTasks: Task[] = tasksData.tasks ?? []
-      setTasks(loadedTasks)
-      setPlanTaskId((prev) => prev ?? loadedTasks[0]?.id ?? null)
+      setTasks(tasksData.tasks ?? [])
 
       const mcpRes = await fetch(`/api/projects/${projectId}/mcps`)
       if (mcpRes.ok) {
@@ -267,41 +250,6 @@ export default function ProjectDetailPage() {
   useEffect(() => {
     loadData()
   }, [loadData])
-
-  useEffect(() => {
-    if (!planTaskId) {
-      setPlanContent(null)
-      return
-    }
-    let cancelled = false
-    setPlanLoading(true)
-    setPlanError(null)
-    fetch(`/api/tasks/${planTaskId}`)
-      .then(async (res) => {
-        if (!res.ok) {
-          const body = await res.json().catch(() => ({}))
-          throw new Error(body.error ?? 'Failed to load implementation plan')
-        }
-        return res.json()
-      })
-      .then((data) => {
-        if (cancelled) return
-        const planArtifacts = (data.artifacts ?? []).filter(
-          (artifact: { artifactType: string }) => artifact.artifactType === 'adr_text',
-        )
-        const latest = planArtifacts[planArtifacts.length - 1]
-        setPlanContent(latest?.content ?? null)
-      })
-      .catch((err) => {
-        if (cancelled) return
-        setPlanContent(null)
-        setPlanError(err instanceof Error ? err.message : 'Failed to load implementation plan')
-      })
-      .finally(() => {
-        if (!cancelled) setPlanLoading(false)
-      })
-    return () => { cancelled = true }
-  }, [planTaskId])
 
   async function handleCreateTask(e: React.FormEvent) {
     e.preventDefault()
@@ -539,47 +487,6 @@ export default function ProjectDetailPage() {
         <ArrowLeftIcon aria-hidden="true" />
         Projects
       </Button>
-
-      {/* Implementation Plan — wide card spanning the full page width,
-          showing the plan for whichever task is selected in the dropdown */}
-      {tasks.length > 0 && (
-        <section aria-labelledby="implementation-plan-heading" className="mb-6 w-full rounded-xl border border-border bg-card p-4">
-          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-            <h2 id="implementation-plan-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
-              Implementation Plan
-            </h2>
-            <Select
-              value={planTaskId ?? undefined}
-              onValueChange={(value) => setPlanTaskId(value)}
-            >
-              <SelectTrigger className="w-auto min-w-[14rem]" aria-label="Select task to show the implementation plan for">
-                <span data-slot="select-value" className="truncate">
-                  {tasks.find((task) => task.id === planTaskId)?.title ?? 'Select a task'}
-                </span>
-              </SelectTrigger>
-              <SelectContent>
-                {tasks.map((task) => (
-                  <SelectItem key={task.id} value={task.id}>
-                    {task.title}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          {planLoading ? (
-            <p className="text-sm text-muted-foreground">Loading plan…</p>
-          ) : planContent !== null ? (
-            <div className="rounded-lg bg-muted/30 px-4 py-3">
-              <MarkdownView content={stripKnownFences(planContent)} />
-            </div>
-          ) : (
-            <p className="text-sm text-muted-foreground">
-              {planError ?? 'No implementation plan has been generated for this task yet.'}
-            </p>
-          )}
-        </section>
-      )}
 
       {/* Project heading */}
       <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
