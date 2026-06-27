@@ -639,9 +639,9 @@ function ArtifactView({ artifact }: { artifact: Artifact }) {
   const typeLabel = artifactTypeLabel(artifact.artifactType)
 
   return (
-    <div className="rounded-lg border border-border p-4">
+    <div className="min-w-0 rounded-lg border border-border p-4">
       <p className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">{typeLabel}</p>
-      <div className={isLongArtifact && !expanded ? 'max-h-80 overflow-hidden' : 'max-h-[70vh] overflow-y-auto'}>
+      <div className={`min-w-0 ${isLongArtifact && !expanded ? 'max-h-80 overflow-hidden' : 'max-h-[70vh] overflow-y-auto'}`}>
         {renderContent()}
       </div>
       {isLongArtifact && (
@@ -896,15 +896,17 @@ function WorkforcePanel({
 
   return (
     <section aria-labelledby="workforce-heading" className="min-w-0 rounded-lg border border-border p-4 overflow-x-hidden">
-      <div className="mb-3 flex items-center justify-between gap-3">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
         <h2 id="workforce-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
           Workforce
         </h2>
-        <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
-          <UsersIcon className="size-3.5" aria-hidden="true" />
-          {hasPersistedPlan
-            ? `${pluralize(workPackages.length, 'package')} · ${pluralize(persistedTaskCount, 'task')} · ${pluralize(approvalGates.length, 'approval checkpoint')}`
-            : `${pluralize(fallbackAgents.length, 'agent')} · ${pluralize(fallbackTasks, 'task')}`}
+        <span className="inline-flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
+          <UsersIcon className="size-3.5 shrink-0" aria-hidden="true" />
+          <span className="min-w-0 break-words">
+            {hasPersistedPlan
+              ? `${pluralize(workPackages.length, 'package')} · ${pluralize(persistedTaskCount, 'task')} · ${pluralize(approvalGates.length, 'approval checkpoint')}`
+              : `${pluralize(fallbackAgents.length, 'agent')} · ${pluralize(fallbackTasks, 'task')}`}
+          </span>
         </span>
       </div>
 
@@ -916,8 +918,8 @@ function WorkforcePanel({
       </div>
 
       {hasPersistedPlan ? (
-        <div className="grid gap-4">
-          <div>
+        <div className="grid min-w-0 gap-4">
+          <div className="min-w-0">
             <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">Work packages</h3>
             {workPackages.length === 0 ? (
               <p className="text-sm text-muted-foreground">No work packages saved yet.</p>
@@ -989,7 +991,7 @@ function WorkforcePanel({
                         <p className="mt-1 break-words font-mono text-xs text-muted-foreground">{previewList(files)}</p>
                       )}
                       {status === 'awaiting_review' && (
-                        <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50/70 p-3 dark:border-amber-900/50 dark:bg-amber-950/20">
+                        <div className="mt-3 min-w-0 rounded-lg border border-amber-200 bg-amber-50/70 p-3 dark:border-amber-900/50 dark:bg-amber-950/20">
                           <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
                             <p className="text-sm font-medium text-foreground">Package review</p>
                             {pendingReviewGate
@@ -997,7 +999,7 @@ function WorkforcePanel({
                               : <Badge variant="outline">No pending gate</Badge>}
                           </div>
                           {reviewArtifact ? (
-                            <div className="max-h-[32rem] overflow-auto rounded-md bg-background/80 p-2 ring-1 ring-border">
+                            <div className="min-w-0 max-h-[32rem] overflow-auto rounded-md bg-background/80 p-2 ring-1 ring-border">
                               <ArtifactView artifact={reviewArtifact} />
                             </div>
                           ) : (
@@ -1084,7 +1086,7 @@ function WorkforcePanel({
             )}
           </div>
 
-          <div>
+          <div className="min-w-0">
             <h3 className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">Approval checkpoints</h3>
             {approvalGates.length === 0 ? (
               <p className="text-sm text-muted-foreground">No approval checkpoints saved yet.</p>
