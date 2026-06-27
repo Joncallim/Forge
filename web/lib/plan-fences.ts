@@ -131,18 +131,8 @@ export function isCapabilityClassificationShape(parsed: unknown): boolean {
   )
 }
 
-// Matches any fenced code block regardless of language tag, so a leftover
-// machine artifact under an unrecognized tag (or no tag at all) can still be
-// caught by isTrivialJsonFenceContent below.
-const ANY_FENCE_REGEX = /```[^\n]*\n([\s\S]*?)[ \t]*\n?[ \t]*```/g
-
 // True for fence content that parses as JSON and carries no information a
-// reader would care about — `{}`, `[]`, or whitespace. Some models emit a
-// stray empty JSON block (most often trailing one of the structured fences
-// above) that isn't shaped like any known block, so stripKnownFences's exact
-// and shape-matched passes leave it behind; it then renders as a bare `{}`
-// code block in the Implementation Plan. A non-empty unrecognized JSON fence
-// is left alone — it might be intentional example content.
+// reader would care about — `{}`, `[]`, or whitespace.
 function isTrivialJsonFenceContent(content: string): boolean {
   const trimmed = content.trim()
   if (trimmed === '') return true
@@ -157,10 +147,40 @@ function isTrivialJsonFenceContent(content: string): boolean {
   return false
 }
 
-function stripTrivialJsonFences(text: string): string {
-  return text.replace(ANY_FENCE_REGEX, (fullMatch, content: string) =>
-    isTrivialJsonFenceContent(content) ? '' : fullMatch,
-  )
+// Some models emit a stray empty JSON block (most often trailing one of the
+// structured fences above) that isn't shaped like any known block, so
+// stripKnownFences's exact and shape-matched passes leave it behind; it then
+// renders as a bare `{}` code block at the bottom of the Implementation
+// Plan. Only the trailing fence is considered, and only repeatedly peeled
+// while it's both trivial AND at the very end of the text — an empty-object
+// or empty-array example placed deliberately mid-document (e.g. "an empty
+// request body looks like ```json\n{}\n```") is real user-facing content and
+// must not be touched, even though its content is just as "trivial" by the
+// same JSON.parse check.
+// Scans by string index rather than regex backtracking on purpose: a lazy
+// `[\s\S]*?` fence-body pattern anchored with `$` doesn't stop at the
+// nearest closing ``` when more fences follow — it backtracks past them,
+// swallowing earlier fences into the "content" of a single match. Walking
+// from the end and matching one fence at a time avoids that.
+function stripTrailingTrivialJsonFences(text: string): string {
+  let result = text
+  for (;;) {
+    const trimmedEnd = result.replace(/[ \t\r\n]+$/, '')
+    if (!trimmedEnd.endsWith('```')) break
+
+    const closeIdx = trimmedEnd.length - 3
+    const openIdx = trimmedEnd.lastIndexOf('```', closeIdx - 1)
+    if (openIdx === -1) break
+
+    const tagLineEnd = trimmedEnd.indexOf('\n', openIdx)
+    if (tagLineEnd === -1 || tagLineEnd >= closeIdx) break
+
+    const content = trimmedEnd.slice(tagLineEnd + 1, closeIdx)
+    if (!isTrivialJsonFenceContent(content)) break
+
+    result = trimmedEnd.slice(0, openIdx)
+  }
+  return result
 }
 
 /**
@@ -168,10 +188,11 @@ function stripTrivialJsonFences(text: string): string {
  * of order or whether every block is present.
  * Falls back to shape-matched generic json fences when the exact tag is
  * absent, mirroring the parsers in worker/agent-breakdown.ts and
- * worker/open-questions.ts. Also strips any leftover fenced block (any tag)
- * that parses as an empty/trivial JSON value, since those are never
- * meaningful user-facing content. Pure function, no DB/IO — safe to call
- * from both server and client code.
+ * worker/open-questions.ts. Also peels off any trailing fenced block (any
+ * tag) that parses as an empty/trivial JSON value — but only at the very end
+ * of the text, so an intentional empty-object/array example placed earlier
+ * in the plan's prose is left untouched. Pure function, no DB/IO — safe to
+ * call from both server and client code.
  */
 export function stripKnownFences(text: string): string {
   let result = text
@@ -200,7 +221,7 @@ export function stripKnownFences(text: string): string {
     result = result.replace(openQuestionsFallback.fullMatch, '')
   }
 
-  result = stripTrivialJsonFences(result)
+  result = stripTrailingTrivialJsonFences(result)
 
   return result.trim()
 }
