@@ -223,6 +223,32 @@ npx playwright install chromium
 npm run e2e
 ```
 
+### Manual smoke test: workforce task accept → retry → navigate (#86)
+
+The dev-server build-manifest race this guards against (`next dev` evicting
+and recompiling inactive route chunks under a long-held SSE connection) is a
+timing-dependent Next.js internal behavior, not something that reproduces
+deterministically in Vitest. Verify by hand after touching
+`web/app/api/tasks/[id]/runs/route.ts`, `web/hooks/useTaskStream.ts`, or
+`web/app/dashboard/error.tsx`:
+
+1. `cd web && npm run dev`, sign in, open a project task with workforce
+   packages.
+2. Accept the first workforce task and leave the task detail page open for
+   at least 60 seconds (past the SSE connection's 55s recycle point) — watch
+   the Network tab: the `/api/tasks/:id/runs` request should close and a new
+   one open automatically, with no "Lost connection" banner shown in the UI.
+3. Retry the task, then immediately navigate to `/dashboard/projects` and
+   back.
+4. Confirm the page loads normally. If it doesn't, and the error overlay
+   reads "The dev server is still recompiling," click Retry — confirm it
+   recovers without a full `npm run dev` restart.
+
+If step 4's overlay never appears even when forcing the original failure
+(deleting `web/.next/dev` mid-request), check that
+`web/app/dashboard/error.tsx`'s `isDevManifestError` matcher still matches
+the current Next.js ENOENT message shape — it changes across Next versions.
+
 ## Database Updates
 
 After pulling new code:

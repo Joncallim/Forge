@@ -24,6 +24,16 @@ export async function GET(
 
   const encoder = new TextEncoder()
 
+  // Cap how long a single SSE connection stays open. Next.js dev mode evicts
+  // and recompiles inactive route chunks in the background (on-demand-entries
+  // GC); a request held open far longer than that window can race a
+  // concurrent recompile and surface a transient ENOENT on a dev build
+  // manifest for an unrelated route (see issue #86). EventSource already
+  // auto-reconnects using Last-Event-ID, so periodically closing and letting
+  // the client reopen is invisible to the user but keeps any single
+  // connection short-lived enough to avoid the race.
+  const MAX_CONNECTION_MS = 55_000
+
   const stream = new ReadableStream({
     async start(controller) {
       // persistAndSend: allocates a global monotonic sequence number, writes to the
@@ -175,12 +185,16 @@ export async function GET(
 
       let closed = false
       let heartbeat: ReturnType<typeof setInterval> | null = null
+      let maxAgeTimer: ReturnType<typeof setTimeout> | null = null
 
       const cleanup = () => {
         if (closed) return
         closed = true
         if (heartbeat !== null) {
           clearInterval(heartbeat)
+        }
+        if (maxAgeTimer !== null) {
+          clearTimeout(maxAgeTimer)
         }
         sub.disconnect()
         try {
@@ -238,6 +252,22 @@ export async function GET(
           cleanup()
         }
       }, 30_000)
+
+      // Close cleanly before the connection gets old enough to risk the dev
+      // build-manifest race above. No [DONE] sentinel here — that's reserved
+      // for genuine task completion. The `stream:cycling` event lets the
+      // client distinguish this planned recycle from a real dropped
+      // connection so it doesn't flash a "lost connection" message; the
+      // EventSource still auto-reconnects via Last-Event-ID either way.
+      maxAgeTimer = setTimeout(() => {
+        if (closed) return
+        try {
+          controller.enqueue(encoder.encode('event: stream:cycling\ndata: {}\n\n'))
+        } catch {
+          // controller may already be closed
+        }
+        cleanup()
+      }, MAX_CONNECTION_MS)
 
       request.signal.addEventListener('abort', cleanup)
     },
