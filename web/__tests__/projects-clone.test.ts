@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildCloneUrl, OWNER_REPO_RE, redactToken } from '@/app/api/projects/route'
+import { buildCloneUrl, OWNER_REPO_RE, redactToken } from '@/lib/projects/clone'
 import { validateGitHubTokenEnvVar } from '@/lib/github'
 
 describe('OWNER_REPO_RE', () => {

@@ -135,6 +135,94 @@ describe('repository execution context', () => {
     expect(context.blockedReason).toMatch(/dirty/i)
   })
 
+  it('ignores Forge task-run artifacts when checking dirty working trees', async () => {
+    await initRepo(tempRoot)
+    await fs.mkdir(path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1'), { recursive: true })
+    await fs.writeFile(path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'result.md'), 'artifact\n')
+
+    const context = await buildRepositoryExecutionContext({
+      project: project(tempRoot),
+      task: task(),
+      workPackage: workPackage(),
+    })
+
+    expect(context.status).toBe('ready')
+    expect(context.isDirty).toBe(false)
+    expect(context.blockedReason).toBeNull()
+  })
+
+  it('ignores tracked Forge task-run artifact updates when checking dirty working trees', async () => {
+    await initRepo(tempRoot)
+    const artifactPath = path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'result.md')
+    await fs.mkdir(path.dirname(artifactPath), { recursive: true })
+    await fs.writeFile(artifactPath, 'first artifact\n')
+    await execFile('git', ['add', '.forge/task-runs/task-1/pkg-1/result.md'], { cwd: tempRoot })
+    await execFile('git', ['commit', '-m', 'track forge artifact fixture'], { cwd: tempRoot })
+    await fs.writeFile(artifactPath, 'updated artifact\n')
+
+    const context = await buildRepositoryExecutionContext({
+      project: project(tempRoot),
+      task: task(),
+      workPackage: workPackage(),
+    })
+
+    expect(context.status).toBe('ready')
+    expect(context.isDirty).toBe(false)
+    expect(context.blockedReason).toBeNull()
+  })
+
+  it('blocks staged renames from Forge task-run artifacts into product paths', async () => {
+    await initRepo(tempRoot)
+    const artifactPath = path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'result.md')
+    await fs.mkdir(path.dirname(artifactPath), { recursive: true })
+    await fs.writeFile(artifactPath, 'first artifact\n')
+    await execFile('git', ['add', '.forge/task-runs/task-1/pkg-1/result.md'], { cwd: tempRoot })
+    await execFile('git', ['commit', '-m', 'track forge artifact fixture'], { cwd: tempRoot })
+    await fs.mkdir(path.join(tempRoot, 'src'), { recursive: true })
+    await execFile('git', ['mv', '.forge/task-runs/task-1/pkg-1/result.md', 'src/app.ts'], { cwd: tempRoot })
+
+    const context = await buildRepositoryExecutionContext({
+      project: project(tempRoot),
+      task: task(),
+      workPackage: workPackage(),
+    })
+
+    expect(context.status).toBe('blocked')
+    expect(context.isDirty).toBe(true)
+    expect(context.statusShort).toContain('src/app.ts')
+    expect(context.blockedReason).toMatch(/dirty/i)
+  })
+
+  it('blocks dirty product paths even after many ignored Forge task-run artifacts', async () => {
+    await initRepo(tempRoot)
+    await fs.mkdir(path.join(tempRoot, '.forge', 'task-runs', 'overflow'), { recursive: true })
+    for (let index = 0; index < 500; index += 1) {
+      await fs.writeFile(
+        path.join(
+          tempRoot,
+          '.forge',
+          'task-runs',
+          'overflow',
+          `artifact-${String(index).padStart(4, '0')}-${'x'.repeat(40)}.md`,
+        ),
+        'artifact\n',
+      )
+    }
+    await fs.mkdir(path.join(tempRoot, 'src'), { recursive: true })
+    await fs.writeFile(path.join(tempRoot, 'src', 'late-dirty.ts'), 'dirty\n')
+
+    const context = await buildRepositoryExecutionContext({
+      project: project(tempRoot),
+      task: task(),
+      workPackage: workPackage(),
+    })
+
+    expect(context.status).toBe('blocked')
+    expect(context.isDirty).toBe(true)
+    expect(context.statusShort).toContain('src/late-dirty.ts')
+    expect(context.statusShort).not.toContain('.forge/task-runs/overflow')
+  })
+
   it('blocks missing remotes', async () => {
     await initRepo(tempRoot)
     await execFile('git', ['remote', 'remove', 'origin'], { cwd: tempRoot })
@@ -198,6 +286,15 @@ describe('scoped repository command runner', () => {
     expect(result.riskClass).toBe('read_only')
     expect(result.exitCode).toBe(0)
     expect(result.outputSummary).toBe('')
+
+    const headDiffResult = await runScopedRepositoryCommand({
+      cwd: tempRoot,
+      command: 'git',
+      argv: ['diff', '--stat', 'HEAD', '--'],
+    })
+
+    expect(headDiffResult.riskClass).toBe('read_only')
+    expect(headDiffResult.exitCode).toBe(0)
   })
 
   it('runs detected local validation commands and records success or failure', async () => {

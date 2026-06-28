@@ -11,16 +11,17 @@ import {
 } from '@/lib/providers/catalog'
 import {
   extractOpenAiCompatibleModelIds,
+  extractLmStudioNativeModelListing,
   listLmStudioModelIds,
 } from '@/lib/providers/model-listing'
+import { ACP_AGENTS, acpProviderModelId } from '@/lib/providers/acp/catalog'
 
 // ---------------------------------------------------------------------------
 // POST /api/providers/discover-local
 //
-// Probes locally-running Ollama and LM Studio installations for installed models
-// and registers any that are not already configured as providers. Returns what
-// was discovered and what was added. Probes are best-effort with short timeouts
-// so a missing local runtime never blocks the request.
+// Probes locally-running Ollama, LM Studio, and ACP model-selection presets.
+// Discovery is read-only by default; callers can request explicit
+// auto-configuration for one or more discovered generation models.
 // ---------------------------------------------------------------------------
 
 const OLLAMA_BASE_URL = PROVIDER_CATALOG.ollama.defaultBaseUrl ?? 'http://localhost:11434'
@@ -30,9 +31,12 @@ const LMSTUDIO_RUNTIME_BASE_URL =
 const PROBE_TIMEOUT_MS = 1500
 
 type DiscoveredModel = {
-  providerType: 'ollama' | 'lmstudio'
+  providerType: 'ollama' | 'lmstudio' | 'acp'
   modelId: string
-  baseUrl: string
+  baseUrl: string | null
+  readiness: 'ready' | 'available'
+  detail?: string
+  guidance?: string
 }
 
 type DiscoveryChange = {
@@ -49,9 +53,10 @@ type DiscoveryCandidate = {
   label: string
   providerType?: string
   modelId?: string
-  status: 'reachable' | 'not_reachable' | 'added' | 'updated' | 'configured' | 'skipped'
+  status: 'reachable' | 'not_reachable' | 'available' | 'added' | 'updated' | 'configured' | 'skipped'
   detail?: string
   guidance?: string
+  canConfigure?: boolean
 }
 
 type DiscoveryCapabilityGroup = {
@@ -66,6 +71,68 @@ type LmStudioDiscovery = {
   auxiliaryCandidates: DiscoveryCandidate[]
 }
 
+type DiscoveryRequest = {
+  autoConfigure: boolean
+  candidates: { providerType: DiscoveredModel['providerType']; modelId: string }[]
+  candidateMode: 'all' | 'selected'
+  invalidReason: string | null
+}
+
+function discoveredKey(model: Pick<DiscoveredModel, 'providerType' | 'modelId'>): string {
+  return `${model.providerType}:${model.modelId}`
+}
+
+async function parseDiscoveryRequest(request: NextRequest): Promise<DiscoveryRequest> {
+  if (!request.headers.get('content-type')?.toLowerCase().includes('application/json')) {
+    return { autoConfigure: false, candidates: [], candidateMode: 'all', invalidReason: null }
+  }
+
+  try {
+    const body = await request.json() as {
+      autoConfigure?: unknown
+      configure?: unknown
+      candidates?: unknown
+      providerType?: unknown
+      modelId?: unknown
+    }
+    const candidatesProvided = Object.prototype.hasOwnProperty.call(body, 'candidates')
+    const singleCandidateProvided = Object.prototype.hasOwnProperty.call(body, 'providerType') ||
+      Object.prototype.hasOwnProperty.call(body, 'modelId')
+    const rawCandidateItems = Array.isArray(body.candidates) ? body.candidates : []
+    const candidateItems: DiscoveryRequest['candidates'] = Array.isArray(body.candidates)
+      ? rawCandidateItems.flatMap((candidate) => {
+        if (!candidate || typeof candidate !== 'object') return []
+        const item = candidate as { providerType?: unknown; modelId?: unknown }
+        if (
+          (item.providerType === 'ollama' || item.providerType === 'lmstudio' || item.providerType === 'acp') &&
+          typeof item.modelId === 'string' &&
+          item.modelId.trim() !== ''
+        ) {
+          return [{ providerType: item.providerType, modelId: item.modelId.trim() }]
+        }
+        return []
+      })
+      : !candidatesProvided &&
+        (body.providerType === 'ollama' || body.providerType === 'lmstudio' || body.providerType === 'acp') &&
+        typeof body.modelId === 'string' &&
+        body.modelId.trim() !== ''
+        ? [{ providerType: body.providerType, modelId: body.modelId.trim() } satisfies DiscoveryRequest['candidates'][number]]
+        : []
+    const hasInvalidCandidates =
+      (candidatesProvided && (!Array.isArray(body.candidates) || candidateItems.length !== rawCandidateItems.length || candidateItems.length === 0)) ||
+      (singleCandidateProvided && candidateItems.length === 0)
+
+    return {
+      autoConfigure: body.autoConfigure === true || body.configure === true,
+      candidates: candidateItems,
+      candidateMode: candidateItems.length > 0 ? 'selected' : 'all',
+      invalidReason: hasInvalidCandidates ? 'Auto-configure candidates must include providerType and modelId.' : null,
+    }
+  } catch {
+    return { autoConfigure: false, candidates: [], candidateMode: 'all', invalidReason: 'Invalid JSON body' }
+  }
+}
+
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter((value) => value !== ''))]
 }
@@ -74,6 +141,7 @@ function normalizeComparableBaseUrl(providerType: DiscoveredModel['providerType'
   const trimmed = baseUrl?.trim()
   if (!trimmed) return null
   if (providerType === 'lmstudio') return normalizeLmStudioRuntimeBaseUrl(trimmed) ?? null
+  if (providerType === 'acp') return null
   return trimmed.replace(/\/+$/g, '')
 }
 
@@ -97,7 +165,12 @@ async function discoverOllama(): Promise<DiscoveredModel[]> {
   return models
     .map((m) => m.name)
     .filter((name): name is string => typeof name === 'string' && name.length > 0)
-    .map((modelId) => ({ providerType: 'ollama' as const, modelId, baseUrl: OLLAMA_BASE_URL }))
+    .map((modelId) => ({
+      providerType: 'ollama' as const,
+      modelId,
+      baseUrl: OLLAMA_BASE_URL,
+      readiness: 'ready' as const,
+    }))
 }
 
 function extractOpenAiCompatibleModels(data: unknown | null): string[] {
@@ -105,13 +178,14 @@ function extractOpenAiCompatibleModels(data: unknown | null): string[] {
 }
 
 function extractLmStudioNativeCapabilities(data: unknown | null): {
-  generationModelIds: string[]
+  generationModels: { modelId: string; loaded: boolean }[]
   auxiliaryCandidates: DiscoveryCandidate[]
 } | null {
+  const listing = extractLmStudioNativeModelListing(data)
   const models = (data as { models?: unknown[] } | null)?.models
-  if (!Array.isArray(models)) return null
+  if (!listing || !Array.isArray(models)) return null
 
-  const generationModelIds: string[] = []
+  const loadedIds = new Set(listing.loadedModels)
   const auxiliaryCandidates: DiscoveryCandidate[] = []
 
   for (const model of models) {
@@ -148,58 +222,90 @@ function extractLmStudioNativeCapabilities(data: unknown | null): {
       continue
     }
 
-    generationModelIds.push(...ids)
+    // Generation models are returned from the normalized listing below; this
+    // loop only harvests auxiliary capabilities.
   }
 
   return {
-    generationModelIds: uniqueStrings(generationModelIds),
+    generationModels: listing.models.map((modelId) => ({ modelId, loaded: loadedIds.has(modelId) })),
     auxiliaryCandidates,
   }
 }
 
 async function discoverLmStudio(): Promise<LmStudioDiscovery> {
-  let models: string[]
+  let models: { modelId: string; loaded: boolean }[]
   let auxiliaryCandidates: DiscoveryCandidate[] = []
   try {
     const nativeBaseUrl = normalizeLmStudioNativeApiBaseUrl(LMSTUDIO_RUNTIME_BASE_URL)
     const nativeData = nativeBaseUrl ? await fetchJson(`${nativeBaseUrl}/models`) : null
     const nativeCapabilities = extractLmStudioNativeCapabilities(nativeData)
     if (nativeCapabilities !== null) {
-      models = nativeCapabilities.generationModelIds
+      models = nativeCapabilities.generationModels
       auxiliaryCandidates = nativeCapabilities.auxiliaryCandidates
     } else {
       const listing = await listLmStudioModelIds({
         baseUrl: LMSTUDIO_RUNTIME_BASE_URL,
         timeoutMs: PROBE_TIMEOUT_MS,
       })
-      models = listing.models
+      const loadedModels = new Set(listing.loadedModels)
+      models = listing.models.map((modelId) => ({
+        modelId,
+        loaded: listing.source === 'runtime' || loadedModels.has(modelId),
+      }))
     }
   } catch {
     models = extractOpenAiCompatibleModels(await fetchJson(`${LMSTUDIO_RUNTIME_BASE_URL}/models`))
+      .map((modelId) => ({ modelId, loaded: true }))
   }
 
   return {
-    models: models.map((modelId) => ({ providerType: 'lmstudio' as const, modelId, baseUrl: LMSTUDIO_RUNTIME_BASE_URL })),
+    models: models.map(({ modelId, loaded }) => ({
+      providerType: 'lmstudio' as const,
+      modelId,
+      baseUrl: LMSTUDIO_RUNTIME_BASE_URL,
+      readiness: loaded ? 'ready' as const : 'available' as const,
+      detail: loaded ? 'LM Studio loaded chat model' : 'LM Studio chat model is installed but not loaded',
+      guidance: loaded
+        ? undefined
+        : 'First use may take longer while LM Studio loads the model.',
+    })),
     auxiliaryCandidates,
   }
+}
+
+function discoverAcpModels(): DiscoveredModel[] {
+  return ACP_AGENTS.flatMap((agent) => {
+    if (!agent.modelSelection) return []
+    return agent.modelSelection.options.map((option) => ({
+      providerType: 'acp' as const,
+      modelId: acpProviderModelId(agent.id, option.id),
+      baseUrl: null,
+      readiness: 'available' as const,
+      detail: `${agent.label} ACP model preset`,
+      guidance: agent.modelSelection?.helpText,
+    }))
+  })
 }
 
 function changeStatus(
   model: DiscoveredModel,
   added: DiscoveryChange[],
   updated: DiscoveryChange[],
+  configured: DiscoveryChange[],
   skipped: DiscoverySkip[],
 ): DiscoveryCandidate['status'] {
   if (added.some((change) => change.providerType === model.providerType && change.modelId === model.modelId)) return 'added'
   if (updated.some((change) => change.providerType === model.providerType && change.modelId === model.modelId)) return 'updated'
+  if (configured.some((change) => change.providerType === model.providerType && change.modelId === model.modelId)) return 'configured'
   if (skipped.some((change) => change.providerType === model.providerType && change.modelId === model.modelId)) return 'skipped'
-  return 'configured'
+  return 'available'
 }
 
 function capabilityGroupsFor(input: {
   discovered: DiscoveredModel[]
   added: DiscoveryChange[]
   updated: DiscoveryChange[]
+  configured: DiscoveryChange[]
   skipped: DiscoverySkip[]
   lmstudioAuxiliary: DiscoveryCandidate[]
 }): {
@@ -216,8 +322,17 @@ function capabilityGroupsFor(input: {
         label: model.modelId,
         providerType: model.providerType,
         modelId: model.modelId,
-        status: changeStatus(model, input.added, input.updated, input.skipped),
-        detail: `${model.providerType === 'ollama' ? 'Ollama' : 'LM Studio'} generation model`,
+        status: changeStatus(model, input.added, input.updated, input.configured, input.skipped),
+        detail: model.detail ?? (
+          model.providerType === 'acp'
+            ? 'ACP model preset'
+            : `${model.providerType === 'ollama' ? 'Ollama' : 'LM Studio'} generation model`
+        ),
+        guidance: model.guidance,
+        canConfigure: !input.configured.some((change) => change.providerType === model.providerType && change.modelId === model.modelId) &&
+          !input.added.some((change) => change.providerType === model.providerType && change.modelId === model.modelId) &&
+          !input.updated.some((change) => change.providerType === model.providerType && change.modelId === model.modelId) &&
+          !input.skipped.some((change) => change.providerType === model.providerType && change.modelId === model.modelId),
       })),
     }],
     auxiliaryCapabilityGroups: [{
@@ -236,11 +351,22 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
+    const discoveryRequest = await parseDiscoveryRequest(request)
+    if (discoveryRequest.autoConfigure && discoveryRequest.invalidReason) {
+      return NextResponse.json({ error: discoveryRequest.invalidReason }, { status: 400 })
+    }
+
     const [ollama, lmstudio] = await Promise.all([discoverOllama(), discoverLmStudio()])
-    const discovered = [...ollama, ...lmstudio.models]
+    const acp = discoverAcpModels()
+    const discovered = [...ollama, ...lmstudio.models, ...acp]
+    const selectedForConfiguration = new Set(discoveryRequest.candidates.map(discoveredKey))
+    const shouldConfigure = (model: DiscoveredModel) =>
+      discoveryRequest.autoConfigure &&
+      (selectedForConfiguration.size === 0 || selectedForConfiguration.has(discoveredKey(model)))
 
     const added: DiscoveryChange[] = []
     const updated: DiscoveryChange[] = []
+    const configured: DiscoveryChange[] = []
     const skipped: DiscoverySkip[] = []
     for (const model of discovered) {
       const [existing] = await db
@@ -262,34 +388,22 @@ export async function POST(request: NextRequest) {
 
       if (existing) {
         if (!existing.isActive) {
-          skipped.push({
-            providerType: model.providerType,
-            modelId: model.modelId,
-            reason: 'provider_disabled',
-          })
+          skipped.push({ providerType: model.providerType, modelId: model.modelId, reason: 'provider_disabled' })
           continue
         }
         if (!existing.isLocal) {
-          skipped.push({
-            providerType: model.providerType,
-            modelId: model.modelId,
-            reason: 'nonlocal_existing_provider',
-          })
+          skipped.push({ providerType: model.providerType, modelId: model.modelId, reason: 'nonlocal_existing_provider' })
           continue
         }
 
         const existingBaseUrl = normalizeComparableBaseUrl(model.providerType, existing.baseUrl)
         const discoveredBaseUrl = normalizeComparableBaseUrl(model.providerType, model.baseUrl)
         if (existingBaseUrl !== null && existingBaseUrl !== discoveredBaseUrl) {
-          skipped.push({
-            providerType: model.providerType,
-            modelId: model.modelId,
-            reason: 'base_url_conflict',
-          })
+          skipped.push({ providerType: model.providerType, modelId: model.modelId, reason: 'base_url_conflict' })
           continue
         }
 
-        if (existing.baseUrl !== model.baseUrl || !existing.isLocal) {
+        if (shouldConfigure(model) && existing.baseUrl !== model.baseUrl) {
           await db
             .update(providerConfigs)
             .set({
@@ -299,24 +413,29 @@ export async function POST(request: NextRequest) {
             })
             .where(eq(providerConfigs.id, existing.id))
           updated.push({ providerType: model.providerType, modelId: model.modelId })
+        } else {
+          configured.push({ providerType: model.providerType, modelId: model.modelId })
         }
         continue
       }
 
-      await db.insert(providerConfigs).values({
-        displayName: `${model.providerType === 'ollama' ? 'Ollama' : 'LM Studio'}: ${model.modelId}`,
-        providerType: model.providerType,
-        modelId: model.modelId,
-        baseUrl: model.baseUrl,
-        isLocal: true,
-      })
-      added.push({ providerType: model.providerType, modelId: model.modelId })
+      if (shouldConfigure(model)) {
+        await db.insert(providerConfigs).values({
+          displayName: `${model.providerType === 'ollama' ? 'Ollama' : model.providerType === 'lmstudio' ? 'LM Studio' : 'ACP'}: ${model.modelId}`,
+          providerType: model.providerType,
+          modelId: model.modelId,
+          baseUrl: model.baseUrl,
+          isLocal: true,
+        })
+        added.push({ providerType: model.providerType, modelId: model.modelId })
+      }
     }
 
     const groups = capabilityGroupsFor({
       discovered,
       added,
       updated,
+      configured,
       skipped,
       lmstudioAuxiliary: lmstudio.auxiliaryCandidates,
     })
@@ -325,6 +444,7 @@ export async function POST(request: NextRequest) {
       found: discovered.length,
       added,
       updated,
+      configured,
       skipped,
       ollamaReachable: ollama.length > 0,
       lmstudioReachable: lmstudio.models.length > 0 || lmstudio.auxiliaryCandidates.length > 0,

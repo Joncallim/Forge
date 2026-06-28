@@ -563,6 +563,7 @@ async function executeReadyWorkPackage(
 
   let repositoryContext: RepositoryExecutionContext | null = null
   let repositoryAffecting = false
+  let validationStatusForPackage: string | null = null
 
   try {
     repositoryAffecting = isRepositoryAffectingWorkPackage(context.workPackage)
@@ -606,7 +607,7 @@ async function executeReadyWorkPackage(
       const diffResult = await runScopedRepositoryCommand({
         cwd: repositoryContext.projectLocalPath,
         command: 'git',
-        argv: ['diff', '--stat'],
+        argv: ['diff', '--stat', 'HEAD', '--'],
       })
       diffSummary = diffResult.outputSummary || 'No tracked-file diff detected.'
       const diffArtifact = await createPackageArtifact({
@@ -615,7 +616,7 @@ async function executeReadyWorkPackage(
         content: diffSummary,
         metadata: {
           artifactKind: 'repository_diff_summary',
-          command: ['git', 'diff', '--stat'],
+          command: ['git', 'diff', '--stat', 'HEAD', '--'],
           exitCode: diffResult.exitCode,
           riskClass: diffResult.riskClass,
           source: 'repository-evidence',
@@ -634,7 +635,16 @@ async function executeReadyWorkPackage(
     }
 
     if (repositoryAffecting && repositoryContext) {
-      const validationPassed = execution.commandResults.every((result) => result.exitCode === 0)
+      const validationStatus = execution.commandResults.length === 0
+        ? 'skipped'
+        : execution.commandResults.every((result) => result.exitCode === 0)
+          ? 'passed'
+          : 'failed'
+      const repositoryEvidenceStatus = validationStatus === 'passed'
+        ? 'complete'
+        : validationStatus === 'skipped'
+          ? 'validation_skipped'
+          : 'failed'
       await createPackageArtifact({
         agentRunId: run.id,
         artifactType: 'test_report',
@@ -642,7 +652,7 @@ async function executeReadyWorkPackage(
         metadata: {
           artifactKind: 'validation_output_summary',
           source: 'work-package-executor',
-          validationStatus: validationPassed ? 'passed' : 'failed',
+          validationStatus,
           workPackageId: nextPackage.id,
         },
         taskId,
@@ -651,25 +661,30 @@ async function executeReadyWorkPackage(
       await createPackageArtifact({
         agentRunId: run.id,
         artifactType: 'log_output',
-        content: `Final validation status: ${validationPassed ? 'passed' : 'failed'}`,
+        content: `Final validation status: ${validationStatus}`,
         metadata: {
           artifactKind: 'final_validation_status',
           source: 'repository-evidence',
-          validationStatus: validationPassed ? 'passed' : 'failed',
+          validationStatus,
           workPackageId: nextPackage.id,
         },
         taskId,
         workPackageId: nextPackage.id,
       })
+      validationStatusForPackage = validationStatus
       await upsertRepositoryEvidenceRecord({
         agentRunId: run.id,
-        context: { ...repositoryContext, status: validationPassed ? 'complete' : 'failed' },
+        context: { ...repositoryContext, status: repositoryEvidenceStatus },
         diffSummary,
-        status: validationPassed ? 'complete' : 'failed',
+        status: repositoryEvidenceStatus,
         taskId,
-        validationStatus: validationPassed ? 'passed' : 'failed',
+        validationStatus,
         workPackageId: nextPackage.id,
       })
+    }
+
+    if (repositoryAffecting && validationStatusForPackage === 'skipped') {
+      throw new Error('Repository-affecting package did not run validation commands; review or revise the execution plan before continuing.')
     }
 
     const completedAt = new Date()
@@ -740,13 +755,17 @@ async function executeReadyWorkPackage(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     const failedAt = new Date()
-    if (repositoryAffecting && repositoryContext) {
+    if (repositoryAffecting && repositoryContext && validationStatusForPackage !== 'skipped') {
+      const evidenceStatus = repositoryContext.status === 'blocked'
+        ? 'blocked'
+        : 'failed'
+      const validationStatus = validationStatusForPackage ?? 'failed'
       await upsertRepositoryEvidenceRecord({
         agentRunId: run.id,
-        context: { ...repositoryContext, blockedReason: message, status: repositoryContext.status === 'blocked' ? 'blocked' : 'failed' },
-        status: repositoryContext.status === 'blocked' ? 'blocked' : 'failed',
+        context: { ...repositoryContext, blockedReason: message, status: evidenceStatus },
+        status: evidenceStatus,
         taskId,
-        validationStatus: 'failed',
+        validationStatus,
         workPackageId: nextPackage.id,
       })
       await createPackageArtifact({
@@ -756,7 +775,7 @@ async function executeReadyWorkPackage(
         metadata: {
           artifactKind: 'repository_evidence_failure',
           source: 'repository-evidence',
-          validationStatus: 'failed',
+          validationStatus,
           workPackageId: nextPackage.id,
         },
         taskId,

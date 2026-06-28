@@ -10,6 +10,7 @@ import {
 } from '@/lib/providers/acp/catalog'
 import { AcpSessionClient } from '@/lib/providers/acp/client'
 import {
+  AcpLanguageModel,
   classifyAcpPromptResult,
   unsupportedAcpModelSelectionMessage,
 } from '@/lib/providers/acp/language-model'
@@ -35,6 +36,10 @@ function writtenRequests(child: FakeChildProcess) {
 }
 
 describe('ACP provider model selection config', () => {
+  it('uses the current AI SDK language model specification', () => {
+    expect(new AcpLanguageModel('codex-cli::gpt-5').specificationVersion).toBe('v3')
+  })
+
   it('stores ACP runtime and selected model in one provider row model id', () => {
     const modelId = acpProviderModelId('codex-cli', 'gpt-5')
 

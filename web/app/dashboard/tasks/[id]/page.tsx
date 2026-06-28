@@ -309,18 +309,76 @@ function workPackageBrief(pkg: WorkPackage): string {
   const capabilities = isRecord(pkg.requiredCapabilities) ? pkg.requiredCapabilities : null
 
   return [
-    owner ? `Role: ${owner}` : null,
-    harnessName ? `Harness: ${harnessName}` : null,
-    harnessDescription ? `Harness description: ${harnessDescription}` : null,
-    `Title: ${title}`,
-    summary ? `Summary: ${summary}` : null,
-    `Prompt overlay: ${prompt || 'No additional prompt overlay persisted for this package.'}`,
-    steps.length > 0 ? `Steps:\n${steps.map((step, index) => `${index + 1}. ${step}`).join('\n')}` : null,
+    `### ${title}`,
+    owner ? `**Role:** ${owner}` : null,
+    harnessName ? `**Harness:** ${harnessName}` : null,
+    harnessDescription ? `**Harness description:** ${harnessDescription}` : null,
+    summary ? `**Summary:** ${summary}` : null,
+    `**Prompt overlay:**\n\n${prompt || 'No additional prompt overlay persisted for this package.'}`,
+    steps.length > 0 ? `**Steps**\n\n${steps.map((step, index) => `${index + 1}. ${step}`).join('\n')}` : null,
     criteria.length > 0
-      ? `Acceptance criteria:\n${criteria.map((criterion, index) => `${index + 1}. ${criterion}`).join('\n')}`
+      ? `**Acceptance criteria**\n\n${criteria.map((criterion, index) => `${index + 1}. ${criterion}`).join('\n')}`
       : null,
-    capabilities ? `Required capabilities:\n${JSON.stringify(capabilities, null, 2)}` : null,
+    capabilities ? `**Required capabilities**\n\n\`\`\`json\n${JSON.stringify(capabilities, null, 2)}\n\`\`\`` : null,
   ].filter((part): part is string => part !== null).join('\n\n')
+}
+
+function mcpRequirementLabel(requirement: WorkforceRecord): string {
+  return stringField(requirement, ['mcpId', 'id', 'name', 'server', 'connectorId']) || 'MCP requirement'
+}
+
+function compactJson(value: unknown): string {
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return JSON.stringify(value, null, 2)
+}
+
+function McpRequirementCards({ requirements }: { requirements: WorkforceRecord[] }) {
+  if (requirements.length === 0) return null
+
+  return (
+    <div className="grid gap-2 sm:grid-cols-2">
+      {requirements.map((requirement, index) => {
+        const label = mcpRequirementLabel(requirement)
+        const requirementLevel = stringField(requirement, ['requirement', 'level', 'status'])
+        const reason = stringField(requirement, ['reason', 'rationale', 'description'])
+        const assignment = compactJson(requirement.assignment)
+        const permissions = compactJson(requirement.agentPermissions ?? requirement.permissions ?? requirement.capabilities)
+        const fallback = compactJson(requirement.fallback)
+
+        return (
+          <div key={`${label}-${index}`} className="min-w-0 rounded-md border border-border bg-background p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="min-w-0 break-words text-sm font-medium text-foreground">{label}</p>
+              {requirementLevel !== '' && <Badge variant="outline">{requirementLevel}</Badge>}
+            </div>
+            {reason !== '' && <p className="mt-1 break-words text-xs text-muted-foreground">{reason}</p>}
+            <dl className="mt-2 grid gap-2 text-xs">
+              {assignment !== '' && (
+                <div>
+                  <dt className="font-medium text-muted-foreground">Assignment</dt>
+                  <dd className="mt-0.5 whitespace-pre-wrap break-words text-foreground">{assignment}</dd>
+                </div>
+              )}
+              {permissions !== '' && (
+                <div>
+                  <dt className="font-medium text-muted-foreground">Permissions</dt>
+                  <dd className="mt-0.5 whitespace-pre-wrap break-words text-foreground">{permissions}</dd>
+                </div>
+              )}
+              {fallback !== '' && (
+                <div>
+                  <dt className="font-medium text-muted-foreground">Fallback</dt>
+                  <dd className="mt-0.5 whitespace-pre-wrap break-words text-foreground">{fallback}</dd>
+                </div>
+              )}
+            </dl>
+          </div>
+        )
+      })}
+    </div>
+  )
 }
 
 function isReviewGateType(gateType: string): boolean {
@@ -1055,9 +1113,9 @@ function WorkforcePanel({
                           <div>
                             <p className="font-medium text-muted-foreground">Prompt overlay</p>
                             {prompt !== '' ? (
-                              <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md bg-background p-2 font-mono text-[11px] text-foreground ring-1 ring-border">
-                                {prompt}
-                              </pre>
+                              <div className="mt-1 max-h-56 overflow-auto rounded-md bg-background p-2 ring-1 ring-border">
+                                <MarkdownView content={prompt} compact />
+                              </div>
                             ) : (
                               <p className="mt-1 text-muted-foreground">
                                 No additional prompt overlay persisted for this package.
@@ -1066,16 +1124,16 @@ function WorkforcePanel({
                           </div>
                           <div>
                             <p className="font-medium text-muted-foreground">Assignment brief</p>
-                            <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md bg-background p-2 font-mono text-[11px] text-foreground ring-1 ring-border">
-                              {workPackageBrief(pkg)}
-                            </pre>
+                            <div className="mt-1 max-h-72 overflow-auto rounded-md bg-background p-2 ring-1 ring-border">
+                              <MarkdownView content={workPackageBrief(pkg)} compact />
+                            </div>
                           </div>
                           {mcpRequirements.length > 0 && (
                             <div>
                               <p className="font-medium text-muted-foreground">MCP requirements</p>
-                              <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-md bg-background p-2 font-mono text-[11px] text-foreground ring-1 ring-border">
-                                {JSON.stringify(mcpRequirements, null, 2)}
-                              </pre>
+                              <div className="mt-2">
+                                <McpRequirementCards requirements={mcpRequirements} />
+                              </div>
                             </div>
                           )}
                           {packageArtifacts.length > 0 && (

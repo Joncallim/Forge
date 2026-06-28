@@ -1,29 +1,30 @@
 import type {
-  LanguageModelV2,
-  LanguageModelV2CallOptions,
-  LanguageModelV2FinishReason,
-  LanguageModelV2Prompt,
-  LanguageModelV2StreamPart,
+  LanguageModelV3,
+  LanguageModelV3CallOptions,
+  LanguageModelV3FinishReason,
+  LanguageModelV3Prompt,
+  LanguageModelV3StreamPart,
+  LanguageModelV3Usage,
 } from '@ai-sdk/provider'
 import { AcpSessionClient } from './client'
 import { getAcpModelSelection, parseAcpProviderModelId, type AcpModelSelectionSupport } from './catalog'
 
 // ---------------------------------------------------------------------------
-// ACP-backed LanguageModelV2
+// ACP-backed LanguageModelV3
 //
 // Forge's call sites (worker/orchestrator.ts, worker/work-package-executor.ts,
 // lib/agent-evaluation.ts, lib/task-title.ts) all build a single-turn prompt —
 // one `system` string plus one `prompt` string — and call streamText()/
-// generateText(). This adapter flattens the AI SDK's LanguageModelV2Prompt
+// generateText(). This adapter flattens the AI SDK's LanguageModelV3Prompt
 // back into that shape, runs it through an ACP session/prompt turn, and
-// reports the result back through the LanguageModelV2 interface so it can be
+// reports the result back through the LanguageModelV3 interface so it can be
 // used as a drop-in LanguageModel.
 //
 // ACP doesn't expose tool calls or token usage through the methods Forge
 // currently calls, so neither is implemented here.
 // ---------------------------------------------------------------------------
 
-function flattenPrompt(prompt: LanguageModelV2Prompt): string {
+function flattenPrompt(prompt: LanguageModelV3Prompt): string {
   const parts: string[] = []
 
   for (const message of prompt) {
@@ -41,20 +42,43 @@ function flattenPrompt(prompt: LanguageModelV2Prompt): string {
   return parts.join('\n\n')
 }
 
-function mapStopReason(stopReason: string): LanguageModelV2FinishReason {
+function mapStopReason(stopReason: string): LanguageModelV3FinishReason {
+  let unified: LanguageModelV3FinishReason['unified']
   switch (stopReason) {
     case 'end_turn':
-      return 'stop'
+      unified = 'stop'
+      break
     case 'max_tokens':
-      return 'length'
+      unified = 'length'
+      break
     case 'max_turn_requests':
-      return 'other'
+      unified = 'other'
+      break
     case 'refusal':
-      return 'content-filter'
+      unified = 'content-filter'
+      break
     case 'cancelled':
-      return 'other'
+      unified = 'other'
+      break
     default:
-      return 'unknown'
+      unified = 'other'
+  }
+  return { unified, raw: stopReason }
+}
+
+function unknownUsage(): LanguageModelV3Usage {
+  return {
+    inputTokens: {
+      total: undefined,
+      noCache: undefined,
+      cacheRead: undefined,
+      cacheWrite: undefined,
+    },
+    outputTokens: {
+      total: undefined,
+      text: undefined,
+      reasoning: undefined,
+    },
   }
 }
 
@@ -103,8 +127,8 @@ export function classifyAcpPromptResult(result: { text: string; stopReason: stri
   return text
 }
 
-export class AcpLanguageModel implements LanguageModelV2 {
-  readonly specificationVersion = 'v2' as const
+export class AcpLanguageModel implements LanguageModelV3 {
+  readonly specificationVersion = 'v3' as const
   readonly provider = 'acp'
   readonly modelId: string
   readonly supportedUrls: Record<string, RegExp[]> = {}
@@ -122,7 +146,7 @@ export class AcpLanguageModel implements LanguageModelV2 {
     this.modelId = modelId
   }
 
-  async doGenerate(options: LanguageModelV2CallOptions) {
+  async doGenerate(options: LanguageModelV3CallOptions) {
     const client = await AcpSessionClient.start(this.agentId, process.cwd(), {
       selectedModel: this.supportsModelSelection ? this.selectedModel : null,
       modelSelection: this.modelSelection,
@@ -135,7 +159,7 @@ export class AcpLanguageModel implements LanguageModelV2 {
       return {
         content: [{ type: 'text' as const, text: resultText }],
         finishReason: mapStopReason(result.stopReason),
-        usage: { inputTokens: undefined, outputTokens: undefined, totalTokens: undefined },
+        usage: unknownUsage(),
         warnings: this.selectedModel && !this.supportsModelSelection
           ? [{ type: 'other' as const, message: unsupportedAcpModelSelectionMessage(this.agentId, this.selectedModel) }]
           : [],
@@ -145,14 +169,14 @@ export class AcpLanguageModel implements LanguageModelV2 {
     }
   }
 
-  async doStream(options: LanguageModelV2CallOptions) {
+  async doStream(options: LanguageModelV3CallOptions) {
     const client = await AcpSessionClient.start(this.agentId, process.cwd(), {
       selectedModel: this.supportsModelSelection ? this.selectedModel : null,
       modelSelection: this.modelSelection,
     })
     const text = flattenPrompt(options.prompt)
 
-    const stream = new ReadableStream<LanguageModelV2StreamPart>({
+    const stream = new ReadableStream<LanguageModelV3StreamPart>({
       async start(controller) {
         controller.enqueue({ type: 'stream-start', warnings: [] })
         controller.enqueue({ type: 'text-start', id: '0' })
@@ -167,7 +191,7 @@ export class AcpLanguageModel implements LanguageModelV2 {
           controller.enqueue({
             type: 'finish',
             finishReason: mapStopReason(result.stopReason),
-            usage: { inputTokens: undefined, outputTokens: undefined, totalTokens: undefined },
+            usage: unknownUsage(),
           })
           controller.close()
         } catch (err) {

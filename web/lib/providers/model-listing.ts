@@ -10,6 +10,7 @@ type FetchJsonOptions = {
 
 export type LmStudioModelListing = {
   models: string[]
+  loadedModels: string[]
   source: 'native' | 'runtime'
 }
 
@@ -45,34 +46,61 @@ export function extractOpenAiCompatibleModelIds(data: unknown): string[] {
   )
 }
 
-export function extractLmStudioNativeModelIds(data: unknown): string[] | null {
+export function extractLmStudioNativeModelListing(data: unknown): { models: string[]; loadedModels: string[] } | null {
   const nativeModels = (data as { models?: unknown[] } | null)?.models
   if (Array.isArray(nativeModels)) {
-    return uniqueModelIds(
-      nativeModels.flatMap((model) => {
-        const item = model as {
-          id?: unknown
-          key?: unknown
-          type?: unknown
-          loaded_instances?: { id?: unknown; model?: unknown }[]
-        }
-        if (item.type === 'embedding') return []
+    const models: string[] = []
+    const loadedModels: string[] = []
 
-        return [
+    for (const model of nativeModels) {
+      const item = model as {
+        id?: unknown
+        key?: unknown
+        type?: unknown
+        loaded_instances?: { id?: unknown; model?: unknown }[]
+      }
+      if (item.type === 'embedding') continue
+
+      models.push(...[
+        item.key,
+        item.id,
+      ].filter((id): id is string => typeof id === 'string'))
+
+      if (Array.isArray(item.loaded_instances) && item.loaded_instances.length > 0) {
+        loadedModels.push(...[
           item.key,
           item.id,
-          ...(Array.isArray(item.loaded_instances)
-            ? item.loaded_instances.flatMap((instance) => [instance.id, instance.model])
-            : []),
-        ].filter((id): id is string => typeof id === 'string')
-      }),
-    )
+          ...item.loaded_instances.flatMap((instance) => [instance.id, instance.model]),
+        ].filter((id): id is string => typeof id === 'string'))
+      }
+    }
+
+    return {
+      models: uniqueModelIds(models),
+      loadedModels: uniqueModelIds(loadedModels),
+    }
   }
 
   const openAiData = (data as { data?: unknown[] } | null)?.data
-  if (Array.isArray(openAiData)) return extractOpenAiCompatibleModelIds(data)
+  if (Array.isArray(openAiData)) {
+    const models = extractOpenAiCompatibleModelIds(data)
+    return { models, loadedModels: models }
+  }
 
   return null
+}
+
+export function extractLmStudioNativeModelIds(data: unknown): string[] | null {
+  return extractLmStudioNativeModelListing(data)?.models ?? null
+}
+
+export function extractLmStudioNativeLoadedModelIds(data: unknown): string[] | null {
+  return extractLmStudioNativeModelListing(data)?.loadedModels ?? null
+}
+
+function normalizeRuntimeListing(data: unknown): { models: string[]; loadedModels: string[] } {
+  const models = extractOpenAiCompatibleModelIds(data)
+  return { models, loadedModels: models }
 }
 
 export async function listLmStudioModelIds({
@@ -94,14 +122,14 @@ export async function listLmStudioModelIds({
 
   try {
     const data = await fetchJsonWithTimeout(`${nativeBaseUrl}/models`, { headers, timeoutMs })
-    const nativeIds = extractLmStudioNativeModelIds(data)
-    if (nativeIds !== null) {
-      return { models: nativeIds, source: 'native' }
+    const nativeListing = extractLmStudioNativeModelListing(data)
+    if (nativeListing !== null) {
+      return { ...nativeListing, source: 'native' }
     }
   } catch {
     // Fall through to the OpenAI-compatible endpoint for older LM Studio servers.
   }
 
   const data = await fetchJsonWithTimeout(`${runtimeBaseUrl}/models`, { headers, timeoutMs })
-  return { models: extractOpenAiCompatibleModelIds(data), source: 'runtime' }
+  return { ...normalizeRuntimeListing(data), source: 'runtime' }
 }

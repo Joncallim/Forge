@@ -20,6 +20,7 @@ import { parseAcpProviderModelId } from './acp/catalog'
  */
 export type ProviderHealthStatus =
   | 'not_configured'
+  | 'available'
   | 'unreachable'
   | 'handshake_failed'
   | 'authenticated_unavailable'
@@ -40,6 +41,10 @@ function readyResult(envVarPresent: boolean, latencyMs: number | null): Provider
 
 function unreachableResult(envVarPresent: boolean, error: string): ProviderHealthResult {
   return { status: 'unreachable', reachable: false, envVarPresent, latencyMs: null, error }
+}
+
+function availableResult(envVarPresent: boolean, latencyMs: number | null, error: string): ProviderHealthResult {
+  return { status: 'available', reachable: false, envVarPresent, latencyMs, error }
 }
 
 const DEFAULT_STALE_AFTER_MS = 5 * 60 * 1000
@@ -145,7 +150,9 @@ async function checkLmStudioHealth(
       timeoutMs: HEALTH_TIMEOUT_MS,
     })
 
-    if (!listing.models.includes(config.modelId)) {
+    const modelListed = listing.models.includes(config.modelId)
+    const modelLoaded = listing.loadedModels.includes(config.modelId)
+    if (!modelListed && !modelLoaded) {
       return {
         status: 'unreachable',
         reachable: false,
@@ -153,6 +160,14 @@ async function checkLmStudioHealth(
         latencyMs: Date.now() - start,
         error: `LM Studio is reachable, but model "${config.modelId}" was not returned by the ${listing.source} model list.`,
       }
+    }
+
+    if (listing.source === 'native' && !modelLoaded) {
+      return availableResult(
+        envVarPresent,
+        Date.now() - start,
+        `LM Studio has model "${config.modelId}" available, but it is not loaded. First use may take longer while LM Studio loads it.`,
+      )
     }
 
     return readyResult(envVarPresent, Date.now() - start)
