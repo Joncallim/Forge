@@ -6,7 +6,7 @@ import type {
   LanguageModelV2StreamPart,
 } from '@ai-sdk/provider'
 import { AcpSessionClient } from './client'
-import { parseAcpProviderModelId } from './catalog'
+import { getAcpModelSelection, parseAcpProviderModelId, type AcpModelSelectionSupport } from './catalog'
 
 // ---------------------------------------------------------------------------
 // ACP-backed LanguageModelV2
@@ -111,18 +111,21 @@ export class AcpLanguageModel implements LanguageModelV2 {
   private readonly agentId: string
   private readonly selectedModel: string | null
   private readonly supportsModelSelection: boolean
+  private readonly modelSelection: AcpModelSelectionSupport | null
 
   constructor(modelId: string) {
     const parsed = parseAcpProviderModelId(modelId)
     this.agentId = parsed.agentId
     this.selectedModel = parsed.selectedModel
     this.supportsModelSelection = parsed.supportsModelSelection
+    this.modelSelection = getAcpModelSelection(modelId)
     this.modelId = modelId
   }
 
   async doGenerate(options: LanguageModelV2CallOptions) {
     const client = await AcpSessionClient.start(this.agentId, process.cwd(), {
       selectedModel: this.supportsModelSelection ? this.selectedModel : null,
+      modelSelection: this.modelSelection,
     })
     try {
       const text = flattenPrompt(options.prompt)
@@ -145,6 +148,7 @@ export class AcpLanguageModel implements LanguageModelV2 {
   async doStream(options: LanguageModelV2CallOptions) {
     const client = await AcpSessionClient.start(this.agentId, process.cwd(), {
       selectedModel: this.supportsModelSelection ? this.selectedModel : null,
+      modelSelection: this.modelSelection,
     })
     const text = flattenPrompt(options.prompt)
 

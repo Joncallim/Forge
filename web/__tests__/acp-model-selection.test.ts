@@ -1,14 +1,38 @@
+import { EventEmitter } from 'node:events'
 import { describe, expect, it } from 'vitest'
+import { vi } from 'vitest'
 
 import {
   acpProviderDisplay,
   acpProviderModelId,
+  getAcpModelSelection,
   parseAcpProviderModelId,
 } from '@/lib/providers/acp/catalog'
+import { AcpSessionClient } from '@/lib/providers/acp/client'
 import {
   classifyAcpPromptResult,
   unsupportedAcpModelSelectionMessage,
 } from '@/lib/providers/acp/language-model'
+
+class FakeChildProcess extends EventEmitter {
+  stdin = { write: vi.fn() }
+  stdout = new EventEmitter()
+  stderr = new EventEmitter()
+  kill = vi.fn()
+}
+
+function makeSpawnFn(child: FakeChildProcess) {
+  return vi.fn().mockReturnValue(child)
+}
+
+function writeJsonLine(emitter: EventEmitter, value: unknown) {
+  emitter.emit('data', Buffer.from(`${JSON.stringify(value)}\n`))
+}
+
+function writtenRequests(child: FakeChildProcess) {
+  return child.stdin.write.mock.calls
+    .map(([line]) => JSON.parse(String(line)) as { id: number; method: string; params: unknown })
+}
 
 describe('ACP provider model selection config', () => {
   it('stores ACP runtime and selected model in one provider row model id', () => {
@@ -18,7 +42,7 @@ describe('ACP provider model selection config', () => {
     expect(parseAcpProviderModelId(modelId)).toMatchObject({
       agentId: 'codex-cli',
       selectedModel: 'gpt-5',
-      supportsModelSelection: false,
+      supportsModelSelection: true,
     })
   })
 
@@ -32,9 +56,91 @@ describe('ACP provider model selection config', () => {
     expect(acpProviderDisplay('codex-cli::gpt-5')).toMatchObject({
       runtimeLabel: 'Codex CLI',
       selectedModel: 'gpt-5',
-      modelSelectionLabel: 'gpt-5 (not passed to this ACP runtime)',
+      modelSelectionLabel: 'gpt-5',
+      supportsModelSelection: true,
+    })
+  })
+
+  it('reports unsupported ACP model selection clearly for runtimes without a strategy', () => {
+    expect(acpProviderDisplay('cline::sonnet')).toMatchObject({
+      runtimeLabel: 'Cline',
+      selectedModel: 'sonnet',
+      modelSelectionLabel: 'sonnet (not passed to this ACP runtime)',
       supportsModelSelection: false,
     })
+    expect(unsupportedAcpModelSelectionMessage('cline', 'sonnet'))
+      .toMatch(/not passed/i)
+  })
+})
+
+describe('ACP session model selection', () => {
+  it('sets selected Codex CLI models through ACP session config, not session/new params', async () => {
+    const child = new FakeChildProcess()
+    const spawnFn = makeSpawnFn(child)
+    const modelSelection = getAcpModelSelection('codex-cli::gpt-5')
+
+    const promise = AcpSessionClient.start('codex-cli', '/repo', {
+      selectedModel: 'gpt-5',
+      modelSelection,
+      spawnFn,
+    })
+
+    expect(writtenRequests(child)[0]).toMatchObject({ method: 'initialize' })
+    writeJsonLine(child.stdout, { jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } })
+    await Promise.resolve()
+
+    expect(writtenRequests(child)[1]).toMatchObject({
+      method: 'session/new',
+      params: { cwd: '/repo', mcpServers: [] },
+    })
+    writeJsonLine(child.stdout, {
+      jsonrpc: '2.0',
+      id: 2,
+      result: {
+        sessionId: 'session-1',
+        configOptions: [
+          {
+            configId: 'model',
+            type: 'select',
+            category: 'model',
+            options: [{ value: 'gpt-5', label: 'GPT-5' }],
+          },
+        ],
+      },
+    })
+    await Promise.resolve()
+
+    expect(writtenRequests(child)[2]).toMatchObject({
+      method: 'session/set_config_option',
+      params: { sessionId: 'session-1', configId: 'model', value: 'gpt-5' },
+    })
+    writeJsonLine(child.stdout, { jsonrpc: '2.0', id: 3, result: {} })
+
+    const client = await promise
+    client.close()
+  })
+
+  it('fails clearly when the ACP runtime rejects selected model config', async () => {
+    const child = new FakeChildProcess()
+    const spawnFn = makeSpawnFn(child)
+
+    const promise = AcpSessionClient.start('claude-agent', '/repo', {
+      selectedModel: 'opus',
+      modelSelection: getAcpModelSelection('claude-agent::opus'),
+      spawnFn,
+    })
+
+    writeJsonLine(child.stdout, { jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } })
+    await Promise.resolve()
+    writeJsonLine(child.stdout, { jsonrpc: '2.0', id: 2, result: { sessionId: 'session-1' } })
+    await Promise.resolve()
+    writeJsonLine(child.stdout, {
+      jsonrpc: '2.0',
+      id: 3,
+      error: { message: 'Unknown config option model' },
+    })
+
+    await expect(promise).rejects.toThrow(/could not set selected model "opus"/i)
   })
 })
 
@@ -66,8 +172,4 @@ describe('ACP prompt result classification', () => {
     })).toBe('{"schemaVersion":1,"summary":"Implemented","files":[{"path":"index.js","content":"console.log(1)"}],"commands":[]}')
   })
 
-  it('reports unsupported ACP model selection clearly', () => {
-    expect(unsupportedAcpModelSelectionMessage('codex-cli', 'gpt-5'))
-      .toMatch(/not passed/i)
-  })
 })

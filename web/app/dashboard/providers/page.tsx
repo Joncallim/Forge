@@ -47,6 +47,7 @@ import {
   acpProviderDisplay,
   acpProviderModelId,
   getAcpAgent,
+  getAcpModelSelection,
   parseAcpProviderModelId,
   type AcpAuthMode,
 } from '@/lib/providers/acp/catalog'
@@ -622,6 +623,7 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
   const supportsModelFetch = category === 'cloud' || form.providerType === 'lmstudio'
   const parsedAcp = isAcp ? parseAcpProviderModelId(form.modelId) : null
   const selectedAcpAgent = isAcp ? getAcpAgent(form.modelId) : undefined
+  const acpModelSelection = isAcp ? getAcpModelSelection(form.modelId) : null
   const [availableModels, setAvailableModels] = useState<string[] | null>(null)
   const [modelsLoading, setModelsLoading] = useState(false)
   const [modelsError, setModelsError] = useState<string | null>(null)
@@ -751,17 +753,40 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
               <label htmlFor="pf-acp-selected-model" className="text-sm font-medium text-foreground">
                 Selected model <span className="text-muted-foreground font-normal">(optional)</span>
               </label>
+              {acpModelSelection && acpModelSelection.options.length > 0 && (
+                <Select
+                  value={
+                    parsedAcp?.selectedModel && acpModelSelection.options.some((option) => option.id === parsedAcp.selectedModel)
+                      ? parsedAcp.selectedModel
+                      : undefined
+                  }
+                  onValueChange={(v) => v && set('modelId', acpProviderModelId(parsedAcp?.agentId ?? '', v))}
+                >
+                  <SelectTrigger aria-label="ACP model preset" className="w-full">
+                    <SelectValue placeholder="Choose a model preset" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      {acpModelSelection.options.map((option) => (
+                        <SelectItem key={option.id} value={option.id}>
+                          {option.label}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              )}
               <input
                 id="pf-acp-selected-model"
                 type="text"
                 value={parsedAcp?.selectedModel ?? ''}
                 onChange={(e) => set('modelId', acpProviderModelId(parsedAcp?.agentId ?? '', e.target.value))}
-                placeholder="Runtime default"
+                placeholder={acpModelSelection ? 'Runtime default or custom model id' : 'Runtime default'}
                 className="rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
               />
               <p className="text-xs text-muted-foreground">
-                {parsedAcp?.supportsModelSelection
-                  ? 'Forge will pass this model to the ACP runtime.'
+                {acpModelSelection
+                  ? acpModelSelection.helpText
                   : 'This ACP runtime does not expose model selection through Forge yet; the value is stored for operator clarity but not passed.'}
               </p>
             </div>

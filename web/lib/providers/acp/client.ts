@@ -1,5 +1,7 @@
 import { getAcpAdapterCommand } from './handshake'
 import { ACP_PROTOCOL_VERSION } from './handshake'
+import type { AcpModelSelectionSupport } from './catalog'
+import { buildAcpModelConfigRequest } from './model-selection'
 import { AcpTransport, defaultAcpSpawn, type AcpSpawn } from './transport'
 
 // ---------------------------------------------------------------------------
@@ -22,6 +24,7 @@ export type AcpPromptResult = {
 
 export type AcpSessionStartOptions = {
   selectedModel?: string | null
+  modelSelection?: AcpModelSelectionSupport | null
   spawnFn?: AcpSpawn
 }
 
@@ -52,15 +55,29 @@ export class AcpSessionClient {
         30_000,
       )
 
-      const sessionParams = options.selectedModel
-        ? { cwd, mcpServers: [], model: options.selectedModel }
-        : { cwd, mcpServers: [] }
-      const sessionResult = (await transport.request('session/new', sessionParams, 30_000)) as {
+      const sessionResult = (await transport.request('session/new', { cwd, mcpServers: [] }, 30_000)) as {
         sessionId?: string
       }
       const sessionId = sessionResult?.sessionId
       if (!sessionId) {
         throw new Error('ACP adapter did not return a sessionId from session/new')
+      }
+
+      const selectedModel = options.selectedModel?.trim()
+      if (selectedModel) {
+        if (!options.modelSelection) {
+          throw new Error(`ACP model selection is not configured for agent "${agentId}".`)
+        }
+        try {
+          await transport.request(
+            'session/set_config_option',
+            buildAcpModelConfigRequest(sessionId, selectedModel, options.modelSelection, sessionResult),
+            30_000,
+          )
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          throw new Error(`ACP runtime "${agentId}" could not set selected model "${selectedModel}": ${message}`)
+        }
       }
 
       return new AcpSessionClient(transport, sessionId)

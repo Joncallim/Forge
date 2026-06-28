@@ -128,6 +128,18 @@ function chain(resolveValue: unknown) {
   return thenable
 }
 
+function rejectingChain(error: unknown) {
+  const thenable: Record<string, unknown> = {
+    then: (onFulfilled: (v: unknown) => unknown, onRejected?: (e: unknown) => unknown) =>
+      Promise.reject(error).then(onFulfilled, onRejected),
+    catch: (onRejected: (e: unknown) => unknown) =>
+      Promise.reject(error).catch(onRejected),
+  }
+  const methods = ['from', 'where', 'limit', 'orderBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'onConflictDoUpdate', 'onConflictDoNothing']
+  methods.forEach((m) => { thenable[m] = () => thenable })
+  return thenable
+}
+
 // ---------------------------------------------------------------------------
 // Fake sessions
 // ---------------------------------------------------------------------------
@@ -2066,6 +2078,47 @@ describe('GET /api/tasks/:id — task details', () => {
     expect(body.workPackages.flatMap(
       (pkg: { artifacts: Array<{ id: string }> }) => pkg.artifacts.map((artifact) => artifact.id),
     )).toEqual(['artifact-1', 'artifact-2'])
+  })
+
+  it('returns task details when the optional repository command audit table has not been migrated yet', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const task = {
+      id: 'task-missing-audit-table',
+      status: 'pending',
+      projectId: 'proj-1',
+      title: 'New task',
+      prompt: 'Do something.',
+      submittedBy: 'user-abc',
+      pmProviderConfigId: null,
+      githubBranch: null,
+      githubPrUrl: null,
+      errorMessage: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      completedAt: null,
+    }
+    const missingTableError = Object.assign(new Error('relation "repository_command_audits" does not exist'), {
+      cause: { code: '42P01' },
+    })
+    mockDbSelect
+      .mockReturnValueOnce(chain([task]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(rejectingChain(missingTableError))
+
+    const { GET } = await import('@/app/api/tasks/[id]/route')
+    const res = await GET(authRequest(`/api/tasks/${task.id}`) as never, {
+      params: Promise.resolve({ id: task.id }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.task.id).toBe(task.id)
+    expect(body.commandAudits).toEqual([])
   })
 })
 
