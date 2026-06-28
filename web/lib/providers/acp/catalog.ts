@@ -6,6 +6,7 @@ export type AcpAgentCatalogEntry = {
   sourceUrl: string
   adapterUrl?: string
   authMode: AcpAuthMode
+  supportsModelSelection?: boolean
   note?: string
 }
 
@@ -52,9 +53,55 @@ export const ACP_AGENTS: AcpAgentCatalogEntry[] = [
 export const ACP_AGENT_IDS = new Set(ACP_AGENTS.map((agent) => agent.id))
 
 export function isAcpAgentId(value: string): boolean {
-  return ACP_AGENT_IDS.has(value)
+  return ACP_AGENT_IDS.has(parseAcpProviderModelId(value).agentId)
 }
 
 export function getAcpAgent(value: string): AcpAgentCatalogEntry | undefined {
-  return ACP_AGENTS.find((agent) => agent.id === value)
+  return ACP_AGENTS.find((agent) => agent.id === parseAcpProviderModelId(value).agentId)
+}
+
+export type ParsedAcpProviderModelId = {
+  agentId: string
+  selectedModel: string | null
+  supportsModelSelection: boolean
+}
+
+export type AcpProviderDisplay = ParsedAcpProviderModelId & {
+  runtimeLabel: string
+  modelSelectionLabel: string
+}
+
+export function acpProviderModelId(agentId: string, selectedModel?: string | null): string {
+  const model = selectedModel?.trim()
+  return model ? `${agentId}::${model}` : agentId
+}
+
+export function parseAcpProviderModelId(value: string): ParsedAcpProviderModelId {
+  const [agentIdRaw, ...modelParts] = value.split('::')
+  const agentId = agentIdRaw.trim()
+  const selectedModel = modelParts.join('::').trim() || null
+  const agent = ACP_AGENTS.find((entry) => entry.id === agentId)
+  return {
+    agentId,
+    selectedModel,
+    supportsModelSelection: agent?.supportsModelSelection === true,
+  }
+}
+
+export function acpProviderDisplay(value: string): AcpProviderDisplay {
+  const parsed = parseAcpProviderModelId(value)
+  const agent = ACP_AGENTS.find((entry) => entry.id === parsed.agentId)
+  const runtimeLabel = agent?.label ?? parsed.agentId
+  const modelSelectionLabel = parsed.selectedModel
+    ? parsed.supportsModelSelection
+      ? parsed.selectedModel
+      : `${parsed.selectedModel} (not passed to this ACP runtime)`
+    : parsed.supportsModelSelection
+      ? 'Runtime default model'
+      : 'Runtime-managed model'
+  return {
+    ...parsed,
+    runtimeLabel,
+    modelSelectionLabel,
+  }
 }

@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray } from 'drizzle-orm'
 import { db } from '../db'
-import { agentRuns, artifacts, workPackageDependencies, workPackages } from '../db/schema'
+import { agentRuns, artifacts, vcsChanges, workPackageDependencies, workPackages } from '../db/schema'
 import { publishTaskEvent } from './events'
 import {
   completeTaskIfReviewGatesSatisfied,
@@ -10,6 +10,13 @@ import {
   executeWorkPackage,
   loadWorkPackageExecutionContext,
 } from './work-package-executor'
+import {
+  buildRepositoryExecutionContext,
+  isRepositoryAffectingWorkPackage,
+  recordScopedCommandAudit,
+  runScopedRepositoryCommand,
+  type RepositoryExecutionContext,
+} from './repository-evidence'
 
 type HandoffPackage = {
   id: string
@@ -30,6 +37,133 @@ type HandoffState = {
   nextPackage: HandoffPackage | null
   packages: HandoffPackage[]
   readyPackageIds: string[]
+}
+
+type CreatedArtifact = typeof artifacts.$inferSelect
+
+function repositoryContextMetadata(
+  context: RepositoryExecutionContext,
+  validationStatus: string | null = null,
+): Record<string, unknown> {
+  return {
+    baseBranch: context.baseBranch,
+    blockedReason: context.blockedReason,
+    branchCollision: context.branchCollision,
+    currentBranch: context.currentBranch,
+    evidenceStatus: context.status,
+    hasRemote: context.hasRemote,
+    intendedTaskBranch: context.intendedTaskBranch,
+    isDirty: context.isDirty,
+    isGitRepository: context.isGitRepository,
+    pathExists: context.pathExists,
+    projectLocalPath: context.projectLocalPath,
+    validationStatus,
+  }
+}
+
+function repositoryReadinessContent(context: RepositoryExecutionContext): string {
+  return [
+    `Repository evidence status: ${context.status}`,
+    `Project path: ${context.projectLocalPath ?? 'missing'}`,
+    `Git repository: ${context.isGitRepository ? 'yes' : 'no'}`,
+    `Current branch: ${context.currentBranch ?? 'unknown'}`,
+    `Base branch: ${context.baseBranch ?? 'unknown'}`,
+    `Intended task branch: ${context.intendedTaskBranch ?? 'unknown'}`,
+    `Working tree: ${context.isDirty === null ? 'unknown' : context.isDirty ? 'dirty' : 'clean'}`,
+    `Remote: ${context.hasRemote === null ? 'unknown' : context.hasRemote ? 'configured' : 'missing'}`,
+    `Branch collision: ${context.branchCollision === null ? 'unknown' : context.branchCollision ? 'yes' : 'no'}`,
+    context.blockedReason ? `Blocked reason: ${context.blockedReason}` : null,
+  ].filter((line): line is string => line !== null).join('\n')
+}
+
+function validationContent(commandResults: Array<{ command: string[]; exitCode: number; stdout: string; stderr: string }>): string {
+  const lines = commandResults.length > 0
+    ? commandResults.map((result) => [
+        `Command: ${result.command.join(' ')}`,
+        `Exit code: ${result.exitCode}`,
+        result.stdout ? `stdout:\n${result.stdout}` : null,
+        result.stderr ? `stderr:\n${result.stderr}` : null,
+      ].filter((line): line is string => line !== null).join('\n'))
+    : ['No package validation commands were run by the execution plan.']
+  return lines.join('\n\n')
+}
+
+async function createPackageArtifact(input: {
+  agentRunId: string
+  artifactType: string
+  content: string
+  metadata: Record<string, unknown>
+  taskId: string
+  workPackageId: string
+}): Promise<CreatedArtifact> {
+  const [artifact] = await db
+    .insert(artifacts)
+    .values({
+      agentRunId: input.agentRunId,
+      artifactType: input.artifactType,
+      content: input.content,
+      metadata: input.metadata,
+    })
+    .returning()
+
+  await publishTaskEvent(input.taskId, 'artifact:created', {
+    id: artifact.id,
+    artifactId: artifact.id,
+    agentRunId: artifact.agentRunId,
+    artifactType: artifact.artifactType,
+    content: artifact.content,
+    metadata: artifact.metadata,
+    createdAt: artifact.createdAt,
+    workPackageId: input.workPackageId,
+  })
+
+  return artifact
+}
+
+async function upsertRepositoryEvidenceRecord(input: {
+  agentRunId: string
+  context: RepositoryExecutionContext
+  diffSummary?: string | null
+  status?: string
+  taskId: string
+  validationStatus?: string | null
+  workPackageId: string
+}): Promise<string> {
+  const metadata = repositoryContextMetadata(input.context, input.validationStatus ?? null)
+  const values = {
+    agentRunId: input.agentRunId,
+    baseBranch: input.context.baseBranch,
+    branchName: input.context.intendedTaskBranch,
+    changeType: 'repository_evidence',
+    diffSummary: input.diffSummary ?? null,
+    metadata,
+    repository: input.context.projectLocalPath,
+    status: input.status ?? input.context.status,
+    taskId: input.taskId,
+    updatedAt: new Date(),
+    workPackageId: input.workPackageId,
+  }
+
+  const [existing] = await db
+    .select({ id: vcsChanges.id })
+    .from(vcsChanges)
+    .where(and(eq(vcsChanges.taskId, input.taskId), eq(vcsChanges.workPackageId, input.workPackageId)))
+    .limit(1)
+
+  if (existing) {
+    const [updated] = await db
+      .update(vcsChanges)
+      .set(values)
+      .where(eq(vcsChanges.id, existing.id))
+      .returning({ id: vcsChanges.id })
+    return updated.id
+  }
+
+  const [created] = await db
+    .insert(vcsChanges)
+    .values(values)
+    .returning({ id: vcsChanges.id })
+  return created.id
 }
 
 export type WorkPackageHandoffPreview =
@@ -427,8 +561,117 @@ async function executeReadyWorkPackage(
     workPackageId: nextPackage.id,
   })
 
+  let repositoryContext: RepositoryExecutionContext | null = null
+  let repositoryAffecting = false
+
   try {
+    repositoryAffecting = isRepositoryAffectingWorkPackage(context.workPackage)
+    if (repositoryAffecting) {
+      repositoryContext = await buildRepositoryExecutionContext({
+        project: context.project,
+        task: context.task,
+        workPackage: context.workPackage,
+      })
+
+      await upsertRepositoryEvidenceRecord({
+        agentRunId: run.id,
+        context: repositoryContext,
+        taskId,
+        workPackageId: nextPackage.id,
+      })
+
+      await createPackageArtifact({
+        agentRunId: run.id,
+        artifactType: 'log_output',
+        content: repositoryReadinessContent(repositoryContext),
+        metadata: {
+          ...repositoryContextMetadata(repositoryContext),
+          artifactKind: 'repository_readiness_summary',
+          source: 'repository-evidence',
+          workPackageId: nextPackage.id,
+        },
+        taskId,
+        workPackageId: nextPackage.id,
+      })
+
+      if (repositoryContext.status === 'blocked') {
+        throw new Error(`Repository evidence blocked: ${repositoryContext.blockedReason}`)
+      }
+    }
+
     const execution = await executeWorkPackage(context)
+    let diffSummary: string | null = null
+
+    if (repositoryAffecting && repositoryContext?.projectLocalPath) {
+      const diffResult = await runScopedRepositoryCommand({
+        cwd: repositoryContext.projectLocalPath,
+        command: 'git',
+        argv: ['diff', '--stat'],
+      })
+      diffSummary = diffResult.outputSummary || 'No tracked-file diff detected.'
+      const diffArtifact = await createPackageArtifact({
+        agentRunId: run.id,
+        artifactType: 'file_diff',
+        content: diffSummary,
+        metadata: {
+          artifactKind: 'repository_diff_summary',
+          command: ['git', 'diff', '--stat'],
+          exitCode: diffResult.exitCode,
+          riskClass: diffResult.riskClass,
+          source: 'repository-evidence',
+          workPackageId: nextPackage.id,
+        },
+        taskId,
+        workPackageId: nextPackage.id,
+      })
+      await recordScopedCommandAudit({
+        result: diffResult,
+        taskId,
+        workPackageId: nextPackage.id,
+        agentRunId: run.id,
+        artifactId: diffArtifact.id,
+      })
+    }
+
+    if (repositoryAffecting && repositoryContext) {
+      const validationPassed = execution.commandResults.every((result) => result.exitCode === 0)
+      await createPackageArtifact({
+        agentRunId: run.id,
+        artifactType: 'test_report',
+        content: validationContent(execution.commandResults),
+        metadata: {
+          artifactKind: 'validation_output_summary',
+          source: 'work-package-executor',
+          validationStatus: validationPassed ? 'passed' : 'failed',
+          workPackageId: nextPackage.id,
+        },
+        taskId,
+        workPackageId: nextPackage.id,
+      })
+      await createPackageArtifact({
+        agentRunId: run.id,
+        artifactType: 'log_output',
+        content: `Final validation status: ${validationPassed ? 'passed' : 'failed'}`,
+        metadata: {
+          artifactKind: 'final_validation_status',
+          source: 'repository-evidence',
+          validationStatus: validationPassed ? 'passed' : 'failed',
+          workPackageId: nextPackage.id,
+        },
+        taskId,
+        workPackageId: nextPackage.id,
+      })
+      await upsertRepositoryEvidenceRecord({
+        agentRunId: run.id,
+        context: { ...repositoryContext, status: validationPassed ? 'complete' : 'failed' },
+        diffSummary,
+        status: validationPassed ? 'complete' : 'failed',
+        taskId,
+        validationStatus: validationPassed ? 'passed' : 'failed',
+        workPackageId: nextPackage.id,
+      })
+    }
+
     const completedAt = new Date()
     await db
       .update(agentRuns)
@@ -497,6 +740,29 @@ async function executeReadyWorkPackage(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     const failedAt = new Date()
+    if (repositoryAffecting && repositoryContext) {
+      await upsertRepositoryEvidenceRecord({
+        agentRunId: run.id,
+        context: { ...repositoryContext, blockedReason: message, status: repositoryContext.status === 'blocked' ? 'blocked' : 'failed' },
+        status: repositoryContext.status === 'blocked' ? 'blocked' : 'failed',
+        taskId,
+        validationStatus: 'failed',
+        workPackageId: nextPackage.id,
+      })
+      await createPackageArtifact({
+        agentRunId: run.id,
+        artifactType: 'log_output',
+        content: `Repository evidence failed: ${message}`,
+        metadata: {
+          artifactKind: 'repository_evidence_failure',
+          source: 'repository-evidence',
+          validationStatus: 'failed',
+          workPackageId: nextPackage.id,
+        },
+        taskId,
+        workPackageId: nextPackage.id,
+      })
+    }
     await db
       .update(agentRuns)
       .set({

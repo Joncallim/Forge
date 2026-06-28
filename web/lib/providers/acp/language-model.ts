@@ -6,6 +6,7 @@ import type {
   LanguageModelV2StreamPart,
 } from '@ai-sdk/provider'
 import { AcpSessionClient } from './client'
+import { parseAcpProviderModelId } from './catalog'
 
 // ---------------------------------------------------------------------------
 // ACP-backed LanguageModelV2
@@ -57,27 +58,84 @@ function mapStopReason(stopReason: string): LanguageModelV2FinishReason {
   }
 }
 
+const ACP_FAILURE_PATTERNS = [
+  /\busage limit\b/i,
+  /\bquota\b/i,
+  /\brate limit\b/i,
+  /\btoo many requests\b/i,
+  /\binsufficient[_ -]?quota\b/i,
+  /\btoken limit\b/i,
+  /\bcontext length\b/i,
+  /\bmaximum context\b/i,
+  /\bout of (tokens|credits)\b/i,
+  /\bbilling\b/i,
+  /\b429\b/,
+]
+
+const ACP_NO_OP_PATTERNS = [
+  /\bno changes? (?:were )?(?:needed|required|made)\b/i,
+  /\bnothing (?:to do|changed|was changed)\b/i,
+  /\bno-op\b/i,
+  /\bplaceholder response\b/i,
+]
+
+export function unsupportedAcpModelSelectionMessage(agentId: string, selectedModel: string): string {
+  return `ACP runtime "${agentId}" does not expose explicit model selection through Forge yet; selected model "${selectedModel}" is stored on the provider config but not passed to this ACP runtime.`
+}
+
+export function classifyAcpPromptResult(result: { text: string; stopReason: string }): string {
+  const text = result.text.trim()
+  if (result.stopReason === 'max_tokens') {
+    throw new Error('ACP runtime stopped at a token limit before producing complete output.')
+  }
+  if (result.stopReason === 'cancelled') {
+    throw new Error('ACP runtime cancelled the request before producing output.')
+  }
+  if (text === '') {
+    throw new Error('ACP runtime returned empty output.')
+  }
+  if (ACP_FAILURE_PATTERNS.some((pattern) => pattern.test(text))) {
+    throw new Error(`ACP runtime reported usage, quota, rate-limit, or token exhaustion: ${text.slice(0, 300)}`)
+  }
+  if (ACP_NO_OP_PATTERNS.some((pattern) => pattern.test(text))) {
+    throw new Error(`ACP runtime returned no-op output instead of implementation output: ${text.slice(0, 300)}`)
+  }
+  return text
+}
+
 export class AcpLanguageModel implements LanguageModelV2 {
   readonly specificationVersion = 'v2' as const
   readonly provider = 'acp'
   readonly modelId: string
   readonly supportedUrls: Record<string, RegExp[]> = {}
+  private readonly agentId: string
+  private readonly selectedModel: string | null
+  private readonly supportsModelSelection: boolean
 
-  constructor(agentId: string) {
-    this.modelId = agentId
+  constructor(modelId: string) {
+    const parsed = parseAcpProviderModelId(modelId)
+    this.agentId = parsed.agentId
+    this.selectedModel = parsed.selectedModel
+    this.supportsModelSelection = parsed.supportsModelSelection
+    this.modelId = modelId
   }
 
   async doGenerate(options: LanguageModelV2CallOptions) {
-    const client = await AcpSessionClient.start(this.modelId, process.cwd())
+    const client = await AcpSessionClient.start(this.agentId, process.cwd(), {
+      selectedModel: this.supportsModelSelection ? this.selectedModel : null,
+    })
     try {
       const text = flattenPrompt(options.prompt)
-      const { text: resultText, stopReason } = await client.prompt(text)
+      const result = await client.prompt(text)
+      const resultText = classifyAcpPromptResult(result)
 
       return {
         content: [{ type: 'text' as const, text: resultText }],
-        finishReason: mapStopReason(stopReason),
+        finishReason: mapStopReason(result.stopReason),
         usage: { inputTokens: undefined, outputTokens: undefined, totalTokens: undefined },
-        warnings: [],
+        warnings: this.selectedModel && !this.supportsModelSelection
+          ? [{ type: 'other' as const, message: unsupportedAcpModelSelectionMessage(this.agentId, this.selectedModel) }]
+          : [],
       }
     } finally {
       client.close()
@@ -85,7 +143,9 @@ export class AcpLanguageModel implements LanguageModelV2 {
   }
 
   async doStream(options: LanguageModelV2CallOptions) {
-    const client = await AcpSessionClient.start(this.modelId, process.cwd())
+    const client = await AcpSessionClient.start(this.agentId, process.cwd(), {
+      selectedModel: this.supportsModelSelection ? this.selectedModel : null,
+    })
     const text = flattenPrompt(options.prompt)
 
     const stream = new ReadableStream<LanguageModelV2StreamPart>({
@@ -94,14 +154,15 @@ export class AcpLanguageModel implements LanguageModelV2 {
         controller.enqueue({ type: 'text-start', id: '0' })
 
         try {
-          const { stopReason } = await client.prompt(text, (delta) => {
+          const result = await client.prompt(text, (delta) => {
             controller.enqueue({ type: 'text-delta', id: '0', delta })
           })
+          classifyAcpPromptResult(result)
 
           controller.enqueue({ type: 'text-end', id: '0' })
           controller.enqueue({
             type: 'finish',
-            finishReason: mapStopReason(stopReason),
+            finishReason: mapStopReason(result.stopReason),
             usage: { inputTokens: undefined, outputTokens: undefined, totalTokens: undefined },
           })
           controller.close()

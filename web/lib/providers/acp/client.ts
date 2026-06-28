@@ -20,6 +20,11 @@ export type AcpPromptResult = {
   stopReason: string
 }
 
+export type AcpSessionStartOptions = {
+  selectedModel?: string | null
+  spawnFn?: AcpSpawn
+}
+
 export class AcpSessionClient {
   private readonly transport: AcpTransport
   private readonly sessionId: string
@@ -29,13 +34,17 @@ export class AcpSessionClient {
     this.sessionId = sessionId
   }
 
-  static async start(agentId: string, cwd: string, spawnFn: AcpSpawn = defaultAcpSpawn): Promise<AcpSessionClient> {
+  static async start(
+    agentId: string,
+    cwd: string,
+    options: AcpSessionStartOptions = {},
+  ): Promise<AcpSessionClient> {
     const command = getAcpAdapterCommand(agentId)
     if (!command) {
       throw new Error(`No ACP adapter is wired up for agent "${agentId}".`)
     }
 
-    const transport = new AcpTransport(command, spawnFn)
+    const transport = new AcpTransport(command, options.spawnFn ?? defaultAcpSpawn)
     try {
       await transport.request(
         'initialize',
@@ -43,7 +52,10 @@ export class AcpSessionClient {
         30_000,
       )
 
-      const sessionResult = (await transport.request('session/new', { cwd, mcpServers: [] }, 30_000)) as {
+      const sessionParams = options.selectedModel
+        ? { cwd, mcpServers: [], model: options.selectedModel }
+        : { cwd, mcpServers: [] }
+      const sessionResult = (await transport.request('session/new', sessionParams, 30_000)) as {
         sessionId?: string
       }
       const sessionId = sessionResult?.sessionId

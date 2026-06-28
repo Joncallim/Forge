@@ -6,6 +6,7 @@ import {
   approvalGates,
   artifacts,
   agentRuns,
+  repositoryCommandAudits,
   taskAttempts,
   taskQuestions,
   tasks,
@@ -94,7 +95,7 @@ export async function GET(
       artifactsByWorkPackageId.set(workPackageId, existing)
     }
 
-    const [taskWorkPackages, taskApprovalGates, taskVcsChanges] = await Promise.all([
+    const [taskWorkPackages, taskApprovalGates, taskVcsChanges, taskCommandAudits] = await Promise.all([
       db
         .select()
         .from(workPackages)
@@ -110,6 +111,11 @@ export async function GET(
         .from(vcsChanges)
         .where(eq(vcsChanges.taskId, id))
         .orderBy(asc(vcsChanges.createdAt)),
+      db
+        .select()
+        .from(repositoryCommandAudits)
+        .where(eq(repositoryCommandAudits.taskId, id))
+        .orderBy(asc(repositoryCommandAudits.startedAt)),
     ])
     const harnessIds = [
       ...new Set(
@@ -150,6 +156,7 @@ export async function GET(
       questions,
       workPackages: taskWorkPackagesWithPrompts,
       approvalGates: taskApprovalGates,
+      commandAudits: taskCommandAudits,
       vcsChanges: taskVcsChanges,
     })
   } catch (err) {

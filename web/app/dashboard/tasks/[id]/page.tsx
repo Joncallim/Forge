@@ -42,6 +42,7 @@ import {
   taskLevelArtifactsForWorkPackages,
   type WorkforceRecord,
 } from '@/lib/task-artifacts'
+import { acpProviderDisplay } from '@/lib/providers/acp/catalog'
 
 interface Task {
   id: string
@@ -64,6 +65,12 @@ type ProviderConfig = {
   isActive: boolean
 }
 
+function providerModelLabel(provider: ProviderConfig): string {
+  if (provider.providerType !== 'acp') return provider.modelId
+  const display = acpProviderDisplay(provider.modelId)
+  return `${display.runtimeLabel} · ${display.modelSelectionLabel}`
+}
+
 interface TaskAttempt {
   id: string
   taskId: string
@@ -82,6 +89,7 @@ interface TaskAttempt {
 type WorkPackage = WorkforceRecord
 type ApprovalGate = WorkforceRecord
 type VcsChange = WorkforceRecord
+type CommandAudit = WorkforceRecord
 
 interface TaskDetailResponse {
   task?: Task | null
@@ -91,6 +99,7 @@ interface TaskDetailResponse {
   attempts?: TaskAttempt[]
   workPackages?: WorkPackage[]
   approvalGates?: ApprovalGate[]
+  commandAudits?: CommandAudit[]
   vcsChanges?: VcsChange[]
 }
 
@@ -872,6 +881,7 @@ function WorkforcePanel({
   workPackages,
   approvalGates,
   vcsChanges,
+  commandAudits,
   fallbackAgents,
   onGateDecided,
   taskId,
@@ -880,6 +890,7 @@ function WorkforcePanel({
   workPackages: WorkPackage[]
   approvalGates: ApprovalGate[]
   vcsChanges: VcsChange[]
+  commandAudits: CommandAudit[]
   fallbackAgents: PlannedAgent[]
   onGateDecided: () => Promise<void>
   taskId: string
@@ -1193,6 +1204,16 @@ function WorkforcePanel({
               const status = stringField(change, ['status', 'state'])
               const type = stringField(change, ['changeType', 'type', 'operation'])
               const summary = stringField(change, ['summary', 'description', 'diffSummary'])
+              const metadata = recordField(change, ['metadata'])
+              const evidenceStatus = metadata ? stringField(metadata, ['evidenceStatus', 'status']) : ''
+              const currentBranch = stringField(change, ['currentBranch']) || (metadata ? stringField(metadata, ['currentBranch']) : '')
+              const baseBranch = stringField(change, ['baseBranch']) || (metadata ? stringField(metadata, ['baseBranch']) : '')
+              const intendedBranch = stringField(change, ['branchName']) || (metadata ? stringField(metadata, ['intendedTaskBranch']) : '')
+              const validationStatus = metadata ? stringField(metadata, ['validationStatus']) : ''
+              const blockedReason = metadata ? stringField(metadata, ['blockedReason']) : ''
+              const dirty = metadata ? booleanField(metadata, ['isDirty']) : null
+              const hasRemote = metadata ? booleanField(metadata, ['hasRemote']) : null
+              const collision = metadata ? booleanField(metadata, ['branchCollision']) : null
 
               return (
                 <li key={recordKey(change, 'vcs-change', index)} className="rounded-md border border-border bg-muted/20 px-2.5 py-2">
@@ -1200,12 +1221,75 @@ function WorkforcePanel({
                     <span className="break-all font-mono text-xs text-foreground">{path}</span>
                     {type !== '' && <Badge variant="outline">{type}</Badge>}
                     {status !== '' && statusBadge(status)}
+                    {evidenceStatus !== '' && evidenceStatus !== status && statusBadge(evidenceStatus)}
                   </div>
+                  <dl className="mt-2 grid gap-x-3 gap-y-1 text-xs text-muted-foreground sm:grid-cols-2 lg:grid-cols-3">
+                    {currentBranch !== '' && (
+                      <div><dt className="font-medium text-foreground">Current</dt><dd className="break-all font-mono">{currentBranch}</dd></div>
+                    )}
+                    {baseBranch !== '' && (
+                      <div><dt className="font-medium text-foreground">Base</dt><dd className="break-all font-mono">{baseBranch}</dd></div>
+                    )}
+                    {intendedBranch !== '' && (
+                      <div><dt className="font-medium text-foreground">Intended</dt><dd className="break-all font-mono">{intendedBranch}</dd></div>
+                    )}
+                    {dirty !== null && (
+                      <div><dt className="font-medium text-foreground">Working tree</dt><dd>{dirty ? 'Dirty' : 'Clean'}</dd></div>
+                    )}
+                    {hasRemote !== null && (
+                      <div><dt className="font-medium text-foreground">Remote</dt><dd>{hasRemote ? 'Configured' : 'Missing'}</dd></div>
+                    )}
+                    {collision !== null && (
+                      <div><dt className="font-medium text-foreground">Branch collision</dt><dd>{collision ? 'Yes' : 'No'}</dd></div>
+                    )}
+                    {validationStatus !== '' && (
+                      <div><dt className="font-medium text-foreground">Validation</dt><dd>{statusLabel(validationStatus)}</dd></div>
+                    )}
+                  </dl>
+                  {blockedReason !== '' && (
+                    <p className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1 text-xs text-destructive">
+                      {blockedReason}
+                    </p>
+                  )}
                   {summary !== '' && <p className="mt-1 text-xs text-muted-foreground">{summary}</p>}
                 </li>
               )
             })}
           </ul>
+          {commandAudits.length > 0 && (
+            <details className="mt-3 rounded-md border border-border bg-muted/20 px-3 py-2">
+              <summary className="cursor-pointer text-xs font-medium text-foreground">
+                Command audit summary
+              </summary>
+              <ul className="mt-2 grid gap-2" aria-label="Repository command audits">
+                {commandAudits.map((audit, index) => {
+                  const command = stringField(audit, ['command'])
+                  const argv = stringArrayField(audit, ['argv'])
+                  const riskClass = stringField(audit, ['riskClass'])
+                  const exitCode = numberField(audit, ['exitCode'])
+                  const output = stringField(audit, ['outputSummary'])
+                  const artifactId = stringField(audit, ['artifactId'])
+                  return (
+                    <li key={recordKey(audit, 'command-audit', index)} className="rounded-md bg-background px-2 py-1.5 ring-1 ring-border">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="break-all font-mono text-xs text-foreground">
+                          {[command, ...argv].filter(Boolean).join(' ')}
+                        </span>
+                        {riskClass !== '' && <Badge variant="outline">{riskClass.replace(/_/g, ' ')}</Badge>}
+                        {exitCode !== null && (
+                          <Badge variant="outline" className={exitCode === 0 ? statusBadgeClass('completed') : statusBadgeClass('failed')}>
+                            exit {exitCode}
+                          </Badge>
+                        )}
+                      </div>
+                      {artifactId !== '' && <p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">Artifact {artifactId}</p>}
+                      {output !== '' && <p className="mt-1 whitespace-pre-wrap break-words text-xs text-muted-foreground">{output}</p>}
+                    </li>
+                  )
+                })}
+              </ul>
+            </details>
+          )}
         </div>
       )}
     </section>
@@ -1746,6 +1830,7 @@ export default function TaskDetailPage() {
   const [workPackages, setWorkPackages] = useState<WorkPackage[]>([])
   const [approvalGates, setApprovalGates] = useState<ApprovalGate[]>([])
   const [vcsChanges, setVcsChanges] = useState<VcsChange[]>([])
+  const [commandAudits, setCommandAudits] = useState<CommandAudit[]>([])
   const [providers, setProviders] = useState<ProviderConfig[]>([])
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
@@ -1801,6 +1886,7 @@ export default function TaskDetailPage() {
       setWorkPackages(data.workPackages ?? [])
       setApprovalGates(data.approvalGates ?? [])
       setVcsChanges(data.vcsChanges ?? [])
+      setCommandAudits(data.commandAudits ?? [])
     } catch (err) {
       setFetchError(err instanceof Error ? err.message : 'An unexpected error occurred')
     } finally {
@@ -2274,7 +2360,7 @@ export default function TaskDetailPage() {
                       <SelectItem value="task-default">Task default</SelectItem>
                       {providers.map((provider) => (
                         <SelectItem key={provider.id} value={provider.id}>
-                          {provider.displayName} · {provider.modelId}
+                          {provider.displayName} · {providerModelLabel(provider)}
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -2345,6 +2431,7 @@ export default function TaskDetailPage() {
             workPackages={workPackages}
             approvalGates={approvalGates}
             vcsChanges={vcsChanges}
+            commandAudits={commandAudits}
             fallbackAgents={plannedAgents}
             taskId={taskId}
             onGateDecided={loadTask}

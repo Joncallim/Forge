@@ -2010,6 +2010,7 @@ describe('GET /api/tasks/:id — task details', () => {
       .mockReturnValueOnce(chain([workPackage, qaWorkPackage]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([
         {
           id: 'harness-1',
@@ -3435,13 +3436,65 @@ describe('POST /api/providers — baseUrl requirement', () => {
     expect(updateSetSpy).toHaveBeenCalledWith(expect.objectContaining({ apiKeyEnvVar: null }))
   })
 
-  it('creates an ACP provider with a known agent id and no credentials', async () => {
+  it('creates an ACP provider with a known agent id, selected model, and no credentials', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const createdProvider = {
       id: 'provider-acp',
       displayName: 'Claude Agent ACP',
       providerType: 'acp',
-      modelId: 'claude-agent',
+      modelId: 'claude-agent::claude-opus',
+      baseUrl: null,
+      apiKeyEnvVar: null,
+      apiKeyCiphertext: null,
+      isLocal: true,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }
+    const insertChain = chain([createdProvider]) as Record<string, unknown>
+    const valuesSpy = vi.fn(() => insertChain)
+    insertChain.values = valuesSpy
+    mockDbInsert.mockReturnValue(insertChain)
+
+    const { POST } = await import('@/app/api/providers/route')
+    const req = authRequest('/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        displayName: createdProvider.displayName,
+        providerType: 'acp',
+        modelId: 'claude-agent::claude-opus',
+        isLocal: false,
+      }),
+    })
+
+    const res = await POST(req as never)
+
+    expect(res.status).toBe(201)
+    expect(valuesSpy).toHaveBeenCalledWith(expect.objectContaining({
+      modelId: 'claude-agent::claude-opus',
+      baseUrl: null,
+      apiKeyEnvVar: null,
+      isLocal: true,
+    }))
+    const body = await res.json()
+    expect(body.provider).toMatchObject({
+      providerType: 'acp',
+      modelId: 'claude-agent::claude-opus',
+      baseUrl: null,
+      apiKeyEnvVar: null,
+      hasApiKey: false,
+      isLocal: true,
+    })
+  })
+
+  it('allows duplicate ACP runtime rows when selected models differ', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const createdProvider = {
+      id: 'provider-acp-gpt5',
+      displayName: 'Codex ACP GPT-5',
+      providerType: 'acp',
+      modelId: 'codex-cli::gpt-5',
       baseUrl: null,
       apiKeyEnvVar: null,
       apiKeyCiphertext: null,
@@ -3453,28 +3506,22 @@ describe('POST /api/providers — baseUrl requirement', () => {
     mockDbInsert.mockReturnValue(chain([createdProvider]))
 
     const { POST } = await import('@/app/api/providers/route')
-    const req = authRequest('/api/providers', {
+    const res = await POST(authRequest('/api/providers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         displayName: createdProvider.displayName,
         providerType: 'acp',
-        modelId: 'claude-agent',
-        isLocal: false,
+        modelId: 'codex-cli::gpt-5',
+        isLocal: true,
       }),
-    })
-
-    const res = await POST(req as never)
+    }) as never)
 
     expect(res.status).toBe(201)
     const body = await res.json()
     expect(body.provider).toMatchObject({
       providerType: 'acp',
-      modelId: 'claude-agent',
-      baseUrl: null,
-      apiKeyEnvVar: null,
-      hasApiKey: false,
-      isLocal: true,
+      modelId: 'codex-cli::gpt-5',
     })
   })
 
