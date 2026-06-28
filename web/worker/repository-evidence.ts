@@ -135,14 +135,20 @@ function blocked(
   }
 }
 
-async function git(cwd: string, argv: string[], maxBytes = MAX_OUTPUT_BYTES): Promise<string> {
+async function git(
+  cwd: string,
+  argv: string[],
+  maxBytes = MAX_OUTPUT_BYTES,
+  options: { trimOutput?: boolean } = {},
+): Promise<string> {
   const result = await execFile('git', argv, {
     cwd,
     env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
     maxBuffer: maxBytes * 2,
     timeout: 30_000,
   })
-  return truncate(result.stdout.trim(), maxBytes)
+  const output = options.trimOutput === false ? result.stdout : result.stdout.trim()
+  return truncate(output, maxBytes)
 }
 
 async function gitOk(cwd: string, argv: string[]): Promise<boolean> {
@@ -154,17 +160,34 @@ async function gitOk(cwd: string, argv: string[]): Promise<boolean> {
   }
 }
 
-function isForgeRunArtifactStatusLine(line: string): boolean {
-  const trimmed = line.trim()
-  const pathPart = trimmed.slice(2).trim()
-  return pathPart === '.forge/task-runs' || pathPart.startsWith('.forge/task-runs/')
+function isForgeRunArtifactPath(statusPath: string): boolean {
+  return statusPath === '.forge/task-runs' || statusPath.startsWith('.forge/task-runs/')
 }
 
-function repositoryDirtyStatus(statusShort: string): string {
-  return statusShort
-    .split(/\r?\n/)
-    .filter((line) => line.trim() !== '')
-    .filter((line) => !isForgeRunArtifactStatusLine(line))
+function parsePorcelainStatusEntries(statusZ: string): Array<{ code: string; paths: string[] }> {
+  const tokens = statusZ.split('\0').filter((token) => token !== '')
+  const entries: Array<{ code: string; paths: string[] }> = []
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]
+    const code = token.slice(0, 2)
+    const firstPath = token.slice(3)
+    const paths = [firstPath]
+    if (code[0] === 'R' || code[0] === 'C') {
+      const originalPath = tokens[index + 1]
+      if (originalPath !== undefined) {
+        paths.push(originalPath)
+        index += 1
+      }
+    }
+    entries.push({ code, paths })
+  }
+  return entries
+}
+
+function repositoryDirtyStatus(statusZ: string): string {
+  return parsePorcelainStatusEntries(statusZ)
+    .filter((entry) => !entry.paths.every(isForgeRunArtifactPath))
+    .map((entry) => `${entry.code} ${entry.paths.join(' -> ')}`)
     .join('\n')
 }
 
@@ -222,18 +245,18 @@ export async function buildRepositoryExecutionContext(input: {
 
   const [
     currentBranchRaw,
-    statusShort,
+    statusPorcelainZ,
     remoteSummary,
     remoteHead,
   ] = await Promise.all([
     git(resolvedPath, ['branch', '--show-current']).catch(() => ''),
-    git(resolvedPath, ['status', '--short', '--untracked-files=all']).catch(() => ''),
+    git(resolvedPath, ['status', '--porcelain=v1', '-z', '--untracked-files=all'], MAX_OUTPUT_BYTES, { trimOutput: false }).catch(() => ''),
     git(resolvedPath, ['remote', '-v']).catch(() => ''),
     remoteHeadBranch(resolvedPath),
   ])
 
   const currentBranch = currentBranchRaw.trim() || null
-  const dirtyStatus = repositoryDirtyStatus(statusShort)
+  const dirtyStatus = repositoryDirtyStatus(statusPorcelainZ)
   const isDirty = dirtyStatus.trim().length > 0
   const hasRemote = remoteSummary.trim().length > 0
   const baseBranch = remoteHead ?? (input.project.defaultBranch?.trim() || null)
@@ -259,7 +282,7 @@ export async function buildRepositoryExecutionContext(input: {
     intendedTaskBranch,
     branchCollision,
     blockedReason,
-    statusShort,
+    statusShort: dirtyStatus,
     remoteSummary: redactCommandOutput(remoteSummary),
   }
 }
@@ -289,6 +312,7 @@ function isAllowedGitReadOnly(argv: string[]): boolean {
     'remote -v',
     'diff --stat',
     'diff --stat --',
+    'diff --stat HEAD --',
     'diff --name-status',
   ].includes(normalized)
 }

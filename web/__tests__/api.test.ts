@@ -2545,15 +2545,85 @@ describe('POST /api/providers/discover-local — auth guard', () => {
     }
   })
 
+  it('keeps existing unselected providers marked configured after selected auto-configure', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    let selectCalls = 0
+    mockDbSelect.mockImplementation(() => {
+      selectCalls += 1
+      return chain(selectCalls === 2
+        ? [{
+            id: 'provider-qwen',
+            displayName: 'Qwen',
+            baseUrl: 'http://localhost:1234/v1',
+            isLocal: true,
+            isActive: true,
+          }]
+        : [])
+    })
+    mockDbInsert.mockReturnValue(chain(undefined))
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === 'http://localhost:11434/api/tags') {
+        return new Response(JSON.stringify({ models: [] }), { status: 200 })
+      }
+      if (url === 'http://localhost:1234/api/v1/models') {
+        return new Response(JSON.stringify({
+          models: [
+            { type: 'llm', key: 'gemma-local', loaded_instances: [{ model: 'gemma-local' }] },
+            { type: 'llm', key: 'qwen-local', loaded_instances: [{ model: 'qwen-local' }] },
+          ],
+        }), { status: 200 })
+      }
+      return new Response('{}', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const { POST } = await import('@/app/api/providers/discover-local/route')
+      const res = await POST(authRequest('/api/providers/discover-local', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          autoConfigure: true,
+          candidates: [{ providerType: 'lmstudio', modelId: 'gemma-local' }],
+        }),
+      }) as never)
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body).toMatchObject({
+        added: [{ providerType: 'lmstudio', modelId: 'gemma-local' }],
+        configured: [{ providerType: 'lmstudio', modelId: 'qwen-local' }],
+      })
+      expect(body.capabilityGroups[0].candidates).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          modelId: 'qwen-local',
+          providerType: 'lmstudio',
+          status: 'configured',
+          canConfigure: false,
+        }),
+      ]))
+      expect(mockDbInsert).toHaveBeenCalledOnce()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('does not reactivate a disabled provider discovered by model id', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
-    mockDbSelect.mockReturnValue(chain([{
-      id: 'provider-existing',
-      displayName: 'Old Gemma',
-      baseUrl: 'http://localhost:1234/old',
-      isLocal: true,
-      isActive: false,
-    }]))
+    let selectCalls = 0
+    mockDbSelect.mockImplementation(() => {
+      selectCalls += 1
+      return chain(selectCalls === 1
+        ? [{
+            id: 'provider-existing',
+            displayName: 'Old Gemma',
+            baseUrl: 'http://localhost:1234/old',
+            isLocal: true,
+            isActive: false,
+          }]
+        : [])
+    })
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url === 'http://localhost:11434/api/tags') {
@@ -2599,13 +2669,19 @@ describe('POST /api/providers/discover-local — auth guard', () => {
 
   it('normalizes the base URL for an active local LM Studio provider discovered by model id', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
-    mockDbSelect.mockReturnValue(chain([{
-      id: 'provider-existing',
-      displayName: 'Old Gemma',
-      baseUrl: 'http://localhost:1234',
-      isLocal: true,
-      isActive: true,
-    }]))
+    let selectCalls = 0
+    mockDbSelect.mockImplementation(() => {
+      selectCalls += 1
+      return chain(selectCalls === 1
+        ? [{
+            id: 'provider-existing',
+            displayName: 'Old Gemma',
+            baseUrl: 'http://localhost:1234',
+            isLocal: true,
+            isActive: true,
+          }]
+        : [])
+    })
     mockDbUpdate.mockReturnValue(chain(undefined))
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
@@ -2648,13 +2724,19 @@ describe('POST /api/providers/discover-local — auth guard', () => {
 
   it('does not overwrite an active local provider using a different base URL', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
-    mockDbSelect.mockReturnValue(chain([{
-      id: 'provider-existing',
-      displayName: 'Remote Gemma',
-      baseUrl: 'http://localhost:4321/v1',
-      isLocal: true,
-      isActive: true,
-    }]))
+    let selectCalls = 0
+    mockDbSelect.mockImplementation(() => {
+      selectCalls += 1
+      return chain(selectCalls === 1
+        ? [{
+            id: 'provider-existing',
+            displayName: 'Remote Gemma',
+            baseUrl: 'http://localhost:4321/v1',
+            isLocal: true,
+            isActive: true,
+          }]
+        : [])
+    })
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url === 'http://localhost:11434/api/tags') {

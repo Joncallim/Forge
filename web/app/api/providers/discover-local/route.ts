@@ -369,14 +369,6 @@ export async function POST(request: NextRequest) {
     const configured: DiscoveryChange[] = []
     const skipped: DiscoverySkip[] = []
     for (const model of discovered) {
-      if (
-        discoveryRequest.autoConfigure &&
-        discoveryRequest.candidateMode === 'selected' &&
-        !selectedForConfiguration.has(discoveredKey(model))
-      ) {
-        continue
-      }
-
       const [existing] = await db
         .select({
           id: providerConfigs.id,
