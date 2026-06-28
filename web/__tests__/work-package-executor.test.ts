@@ -13,6 +13,7 @@ vi.mock('ai', () => ({
 
 import {
   executeWorkPackage,
+  hasLocalConflictCopyPathSegment,
   parseWorkPackageExecutionPlan,
   resolveExecutionProviderConfigId,
   type WorkPackageExecutionContext,
@@ -104,6 +105,15 @@ describe('parseWorkPackageExecutionPlan', () => {
     }))).toThrow(/not allowed/i)
   })
 
+  it('rejects local conflict-copy file paths before writes', () => {
+    expect(() => parseWorkPackageExecutionPlan(JSON.stringify({
+      schemaVersion: 1,
+      summary: 'Bad path',
+      files: [{ path: 'web/lib/providers/acp/model-selection 2.ts', content: 'bad' }],
+      commands: [],
+    }))).toThrow(/conflict-copy/i)
+  })
+
   it('parses a balanced JSON object embedded in prose', () => {
     const parsed = parseWorkPackageExecutionPlan([
       'Here is the plan:',
@@ -118,6 +128,14 @@ describe('parseWorkPackageExecutionPlan', () => {
 
     expect(parsed.summary).toBe('Built tracker')
     expect(parsed.files).toHaveLength(1)
+  })
+})
+
+describe('hasLocalConflictCopyPathSegment', () => {
+  it('detects duplicated local conflict-copy names', () => {
+    expect(hasLocalConflictCopyPathSegment('web/__tests__/repository-evidence.test 2.ts')).toBe(true)
+    expect(hasLocalConflictCopyPathSegment('web/.next/server/chunks 2')).toBe(true)
+    expect(hasLocalConflictCopyPathSegment('docs/chapter-2.md')).toBe(false)
   })
 })
 
@@ -194,6 +212,21 @@ describe('executeWorkPackage', () => {
     await expect(fs.stat(path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'escape.txt'))).rejects.toMatchObject({
       code: 'ENOENT',
     })
+  })
+
+  it('does not write generated local conflict-copy paths', async () => {
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Attempt conflict copy.',
+        files: [{ path: 'src/app 2.ts', content: 'bad' }],
+        commands: [],
+      }),
+    })
+
+    await expect(executeWorkPackage(context())).rejects.toThrow(/conflict-copy/i)
+    await expect(fs.stat(path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'src', 'app 2.ts')))
+      .rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('rejects placeholder tests and build scripts when the task requires them', async () => {

@@ -4,9 +4,12 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "prebuild": "npm run clean:conflict-copies",
     "build": "next build",
+    "postbuild": "npm run clean:conflict-copies",
     "start": "next start",
     "lint": "eslint",
+    "clean:conflict-copies": "node scripts/clean-local-conflict-copies.mjs .next",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx db/migrate.ts",
     "db:migrate:kit": "drizzle-kit migrate",
