@@ -6,6 +6,7 @@ import {
   approvalGates,
   artifacts,
   agentRuns,
+  repositoryCommandAudits,
   taskAttempts,
   taskQuestions,
   tasks,
@@ -27,6 +28,31 @@ function metadataString(metadata: unknown, key: string): string | null {
   if (!isRecord(metadata)) return null
   const value = metadata[key]
   return typeof value === 'string' && value.trim().length > 0 ? value : null
+}
+
+function errorCode(err: unknown): string | null {
+  if (!isRecord(err)) return null
+  if (typeof err.code === 'string') return err.code
+  return errorCode(err.cause)
+}
+
+async function selectTaskCommandAudits(taskId: string): Promise<(typeof repositoryCommandAudits.$inferSelect)[]> {
+  try {
+    return await db
+      .select()
+      .from(repositoryCommandAudits)
+      .where(eq(repositoryCommandAudits.taskId, taskId))
+      .orderBy(asc(repositoryCommandAudits.startedAt))
+  } catch (err) {
+    if (errorCode(err) === '42P01') {
+      console.warn(
+        '[GET /api/tasks/:id] repository_command_audits table is missing; returning task detail without command audit rows.',
+        { taskId },
+      )
+      return []
+    }
+    throw err
+  }
 }
 
 export async function GET(
@@ -94,7 +120,7 @@ export async function GET(
       artifactsByWorkPackageId.set(workPackageId, existing)
     }
 
-    const [taskWorkPackages, taskApprovalGates, taskVcsChanges] = await Promise.all([
+    const [taskWorkPackages, taskApprovalGates, taskVcsChanges, taskCommandAudits] = await Promise.all([
       db
         .select()
         .from(workPackages)
@@ -110,6 +136,7 @@ export async function GET(
         .from(vcsChanges)
         .where(eq(vcsChanges.taskId, id))
         .orderBy(asc(vcsChanges.createdAt)),
+      selectTaskCommandAudits(id),
     ])
     const harnessIds = [
       ...new Set(
@@ -150,6 +177,7 @@ export async function GET(
       questions,
       workPackages: taskWorkPackagesWithPrompts,
       approvalGates: taskApprovalGates,
+      commandAudits: taskCommandAudits,
       vcsChanges: taskVcsChanges,
     })
   } catch (err) {

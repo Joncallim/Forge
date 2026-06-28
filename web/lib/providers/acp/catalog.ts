@@ -6,10 +6,48 @@ export type AcpAgentCatalogEntry = {
   sourceUrl: string
   adapterUrl?: string
   authMode: AcpAuthMode
+  modelSelection?: AcpModelSelectionSupport
   note?: string
 }
 
+export type AcpModelOption = {
+  id: string
+  label: string
+  description?: string
+}
+
+export type AcpModelSelectionSupport = {
+  type: 'session_config_option'
+  configIdCandidates: string[]
+  optionCategoryCandidates: string[]
+  options: AcpModelOption[]
+  helpText: string
+}
+
 export const ACP_AGENTS_SOURCE_URL = 'https://agentclientprotocol.com/get-started/agents'
+
+const CODEX_CLI_MODEL_SELECTION: AcpModelSelectionSupport = {
+  type: 'session_config_option',
+  configIdCandidates: ['model', 'model_id', 'codex_model'],
+  optionCategoryCandidates: ['model'],
+  options: [
+    { id: 'gpt-5.5', label: 'GPT-5.5' },
+    { id: 'gpt-5.3-codex-spark', label: 'GPT-5.3 Codex Spark' },
+  ],
+  helpText: 'Forge passes this via the ACP session model config option. Exact availability follows the local Codex CLI account/runtime.',
+}
+
+const CLAUDE_CODE_MODEL_SELECTION: AcpModelSelectionSupport = {
+  type: 'session_config_option',
+  configIdCandidates: ['model', 'model_id', 'claude_model'],
+  optionCategoryCandidates: ['model'],
+  options: [
+    { id: 'opus', label: 'Opus' },
+    { id: 'sonnet', label: 'Sonnet' },
+    { id: 'haiku', label: 'Haiku' },
+  ],
+  helpText: 'Forge passes this via the ACP session model config option. Claude Code aliases resolve inside the local Claude runtime.',
+}
 
 export const ACP_AGENTS: AcpAgentCatalogEntry[] = [
   { id: 'agentpool', label: 'AgentPool', sourceUrl: 'https://phil65.github.io/agentpool/advanced/acp-integration/', authMode: 'unknown' },
@@ -17,9 +55,9 @@ export const ACP_AGENTS: AcpAgentCatalogEntry[] = [
   { id: 'autodev', label: 'AutoDev', sourceUrl: 'https://github.com/phodal/auto-dev', authMode: 'unknown' },
   { id: 'blackbox-ai', label: 'Blackbox AI', sourceUrl: 'https://docs.blackbox.ai/features/blackbox-cli/introduction', authMode: 'web' },
   { id: 'bub', label: 'Bub', sourceUrl: 'https://github.com/bubbuild/bub', adapterUrl: 'https://github.com/bubbuild/bub-contrib/tree/main/packages/bub-acp-server', authMode: 'unknown' },
-  { id: 'claude-agent', label: 'Claude Agent', sourceUrl: 'https://platform.claude.com/docs/en/agent-sdk/overview', adapterUrl: 'https://github.com/zed-industries/claude-agent-acp', authMode: 'web', note: 'Via Zed SDK adapter.' },
+  { id: 'claude-agent', label: 'Claude Code', sourceUrl: 'https://docs.anthropic.com/en/docs/claude-code/model-config', adapterUrl: 'https://github.com/zed-industries/claude-agent-acp', authMode: 'web', modelSelection: CLAUDE_CODE_MODEL_SELECTION, note: 'Via Zed SDK adapter.' },
   { id: 'cline', label: 'Cline', sourceUrl: 'https://cline.bot/', authMode: 'web' },
-  { id: 'codex-cli', label: 'Codex CLI', sourceUrl: 'https://developers.openai.com/codex/cli', adapterUrl: 'https://github.com/zed-industries/codex-acp', authMode: 'web', note: 'Via Zed adapter.' },
+  { id: 'codex-cli', label: 'Codex CLI', sourceUrl: 'https://developers.openai.com/codex/cli', adapterUrl: 'https://github.com/zed-industries/codex-acp', authMode: 'web', modelSelection: CODEX_CLI_MODEL_SELECTION, note: 'Via Zed adapter.' },
   { id: 'code-assistant', label: 'Code Assistant', sourceUrl: 'https://github.com/stippi/code-assistant?tab=readme-ov-file#configuration', authMode: 'unknown' },
   { id: 'crow-cli', label: 'crow-cli', sourceUrl: 'https://crow-ai.dev', authMode: 'unknown' },
   { id: 'cursor', label: 'Cursor', sourceUrl: 'https://cursor.com/docs/cli/acp', authMode: 'web' },
@@ -52,9 +90,59 @@ export const ACP_AGENTS: AcpAgentCatalogEntry[] = [
 export const ACP_AGENT_IDS = new Set(ACP_AGENTS.map((agent) => agent.id))
 
 export function isAcpAgentId(value: string): boolean {
-  return ACP_AGENT_IDS.has(value)
+  return ACP_AGENT_IDS.has(parseAcpProviderModelId(value).agentId)
 }
 
 export function getAcpAgent(value: string): AcpAgentCatalogEntry | undefined {
-  return ACP_AGENTS.find((agent) => agent.id === value)
+  return ACP_AGENTS.find((agent) => agent.id === parseAcpProviderModelId(value).agentId)
+}
+
+export function getAcpModelSelection(value: string): AcpModelSelectionSupport | null {
+  return getAcpAgent(value)?.modelSelection ?? null
+}
+
+export type ParsedAcpProviderModelId = {
+  agentId: string
+  selectedModel: string | null
+  supportsModelSelection: boolean
+}
+
+export type AcpProviderDisplay = ParsedAcpProviderModelId & {
+  runtimeLabel: string
+  modelSelectionLabel: string
+}
+
+export function acpProviderModelId(agentId: string, selectedModel?: string | null): string {
+  const model = selectedModel?.trim()
+  return model ? `${agentId}::${model}` : agentId
+}
+
+export function parseAcpProviderModelId(value: string): ParsedAcpProviderModelId {
+  const [agentIdRaw, ...modelParts] = value.split('::')
+  const agentId = agentIdRaw.trim()
+  const selectedModel = modelParts.join('::').trim() || null
+  const agent = ACP_AGENTS.find((entry) => entry.id === agentId)
+  return {
+    agentId,
+    selectedModel,
+    supportsModelSelection: agent?.modelSelection !== undefined,
+  }
+}
+
+export function acpProviderDisplay(value: string): AcpProviderDisplay {
+  const parsed = parseAcpProviderModelId(value)
+  const agent = ACP_AGENTS.find((entry) => entry.id === parsed.agentId)
+  const runtimeLabel = agent?.label ?? parsed.agentId
+  const modelSelectionLabel = parsed.selectedModel
+    ? parsed.supportsModelSelection
+      ? parsed.selectedModel
+      : `${parsed.selectedModel} (not passed to this ACP runtime)`
+    : parsed.supportsModelSelection
+      ? 'Runtime default model'
+      : 'Runtime-managed model'
+  return {
+    ...parsed,
+    runtimeLabel,
+    modelSelectionLabel,
+  }
 }

@@ -30,6 +30,7 @@ import {
   requiresProviderBaseUrl,
   type ProviderType,
 } from '@/lib/providers/types'
+import { acpProviderDisplay } from '@/lib/providers/acp/catalog'
 
 type ProviderConfig = {
   id: string
@@ -170,6 +171,10 @@ function groupByLayer(recs: RoleRecommendation[]): Map<RoleRecommendation['layer
 }
 
 function providerOptionLabel(provider: ProviderConfig): string {
+  if (provider.providerType === 'acp') {
+    const display = acpProviderDisplay(provider.modelId)
+    return `${provider.displayName} (${display.runtimeLabel} · ${display.modelSelectionLabel})`
+  }
   return `${provider.displayName} (${provider.modelId})`
 }
 
@@ -1073,7 +1078,7 @@ export default function AgentsPage() {
                         {provider ? (
                           <span className="min-w-0 text-muted-foreground">
                             <span className="text-foreground">{provider.displayName}</span>{' '}
-                            <span className="break-all font-mono text-xs">{provider.modelId}</span>
+                            <span className="break-all font-mono text-xs">{provider.providerType === 'acp' ? acpProviderDisplay(provider.modelId).modelSelectionLabel : provider.modelId}</span>
                           </span>
                         ) : (
                           <span className="text-muted-foreground">No provider</span>

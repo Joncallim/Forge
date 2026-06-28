@@ -619,6 +619,48 @@ export type VcsChange = InferSelectModel<typeof vcsChanges>
 export type NewVcsChange = InferInsertModel<typeof vcsChanges>
 
 // ---------------------------------------------------------------------------
+// repositoryCommandAudits
+// ---------------------------------------------------------------------------
+export const repositoryCommandAudits = pgTable(
+  'repository_command_audits',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id')
+      .notNull()
+      .references(() => tasks.id, { onDelete: 'cascade' }),
+    workPackageId: uuid('work_package_id').references(() => workPackages.id, {
+      onDelete: 'set null',
+    }),
+    agentRunId: uuid('agent_run_id').references(() => agentRuns.id, {
+      onDelete: 'set null',
+    }),
+    artifactId: uuid('artifact_id').references(() => artifacts.id, {
+      onDelete: 'set null',
+    }),
+    cwd: text('cwd').notNull(),
+    command: text('command').notNull(),
+    argv: jsonb('argv').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    // 'read_only'|'local_validation'
+    riskClass: text('risk_class').notNull(),
+    startedAt: timestamp('started_at', tsOpts).notNull(),
+    finishedAt: timestamp('finished_at', tsOpts).notNull(),
+    exitCode: integer('exit_code').notNull(),
+    outputSummary: text('output_summary').notNull().default(''),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    index('repository_command_audits_task_id_idx').on(t.taskId),
+    index('repository_command_audits_work_package_id_idx').on(t.workPackageId),
+    index('repository_command_audits_agent_run_id_idx').on(t.agentRunId),
+    index('repository_command_audits_artifact_id_idx').on(t.artifactId),
+    index('repository_command_audits_started_at_idx').on(t.startedAt),
+  ],
+)
+
+export type RepositoryCommandAudit = InferSelectModel<typeof repositoryCommandAudits>
+export type NewRepositoryCommandAudit = InferInsertModel<typeof repositoryCommandAudits>
+
+// ---------------------------------------------------------------------------
 // agentConfigs
 // ---------------------------------------------------------------------------
 export const agentConfigs = pgTable(

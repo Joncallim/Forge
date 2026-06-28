@@ -8,6 +8,7 @@ import { decryptSecret } from '@/lib/crypto'
 import { PROVIDER_CATALOG } from './catalog'
 import { listLmStudioModelIds } from './model-listing'
 import { checkAcpReadiness } from './acp/handshake'
+import { parseAcpProviderModelId } from './acp/catalog'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -168,7 +169,7 @@ export async function checkProviderHealth(
   config: ProviderConfig,
 ): Promise<ProviderHealthResult> {
   if (config.providerType === 'acp') {
-    const readiness = await checkAcpReadiness(config.modelId)
+    const readiness = await checkAcpReadiness(parseAcpProviderModelId(config.modelId).agentId)
     return {
       status: readiness.status,
       reachable: readiness.status === 'ready',

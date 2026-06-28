@@ -44,7 +44,11 @@ import {
 import {
   ACP_AGENTS,
   ACP_AGENTS_SOURCE_URL,
+  acpProviderDisplay,
+  acpProviderModelId,
   getAcpAgent,
+  getAcpModelSelection,
+  parseAcpProviderModelId,
   type AcpAuthMode,
 } from '@/lib/providers/acp/catalog'
 import type { ProviderHealthStatus } from '@/lib/providers/health'
@@ -617,7 +621,9 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
   const baseUrlRequired = entry.requiresBaseUrl
   const category = providerCategory(form.providerType, form.isLocal)
   const supportsModelFetch = category === 'cloud' || form.providerType === 'lmstudio'
+  const parsedAcp = isAcp ? parseAcpProviderModelId(form.modelId) : null
   const selectedAcpAgent = isAcp ? getAcpAgent(form.modelId) : undefined
+  const acpModelSelection = isAcp ? getAcpModelSelection(form.modelId) : null
   const [availableModels, setAvailableModels] = useState<string[] | null>(null)
   const [modelsLoading, setModelsLoading] = useState(false)
   const [modelsError, setModelsError] = useState<string | null>(null)
@@ -659,7 +665,7 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
     onChange({
       ...form,
       providerType: pt,
-      modelId: pt === 'acp' ? ACP_AGENTS[0]?.id ?? '' : '',
+      modelId: pt === 'acp' ? acpProviderModelId(ACP_AGENTS[0]?.id ?? '') : '',
       apiKey: pt === 'acp' ? '' : form.apiKey,
       isLocal: pt === 'acp' ? true : next.category === 'local',
       // Suggest the known base URL for the newly chosen provider.
@@ -726,7 +732,10 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
         </label>
         {isAcp ? (
           <>
-            <Select value={form.modelId || undefined} onValueChange={(v) => v && set('modelId', v)}>
+            <Select
+              value={parsedAcp?.agentId || undefined}
+              onValueChange={(v) => v && set('modelId', acpProviderModelId(v, parsedAcp?.selectedModel))}
+            >
               <SelectTrigger id="pf-modelId" className="w-full" aria-required="true">
                 <SelectValue placeholder="Select ACP agent" />
               </SelectTrigger>
@@ -740,8 +749,46 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
                 </SelectGroup>
               </SelectContent>
             </Select>
-            <div className="rounded-lg border border-yellow-200 bg-yellow-50 px-3 py-2 text-xs text-yellow-900 dark:border-yellow-900/40 dark:bg-yellow-950/20 dark:text-yellow-200">
-              ACP agents are saved for setup only. Forge cannot run tasks through them yet.
+            <div className="flex flex-col gap-1.5">
+              <label htmlFor="pf-acp-selected-model" className="text-sm font-medium text-foreground">
+                Selected model <span className="text-muted-foreground font-normal">(optional)</span>
+              </label>
+              {acpModelSelection && acpModelSelection.options.length > 0 && (
+                <Select
+                  value={
+                    parsedAcp?.selectedModel && acpModelSelection.options.some((option) => option.id === parsedAcp.selectedModel)
+                      ? parsedAcp.selectedModel
+                      : undefined
+                  }
+                  onValueChange={(v) => v && set('modelId', acpProviderModelId(parsedAcp?.agentId ?? '', v))}
+                >
+                  <SelectTrigger aria-label="ACP model preset" className="w-full">
+                    <SelectValue placeholder="Choose a model preset" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      {acpModelSelection.options.map((option) => (
+                        <SelectItem key={option.id} value={option.id}>
+                          {option.label}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              )}
+              <input
+                id="pf-acp-selected-model"
+                type="text"
+                value={parsedAcp?.selectedModel ?? ''}
+                onChange={(e) => set('modelId', acpProviderModelId(parsedAcp?.agentId ?? '', e.target.value))}
+                placeholder={acpModelSelection ? 'Runtime default or custom model id' : 'Runtime default'}
+                className="rounded-lg border border-input bg-transparent px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+              />
+              <p className="text-xs text-muted-foreground">
+                {acpModelSelection
+                  ? acpModelSelection.helpText
+                  : 'This ACP runtime does not expose model selection through Forge yet; the value is stored for operator clarity but not passed.'}
+              </p>
             </div>
             {selectedAcpAgent && (
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
@@ -1522,7 +1569,7 @@ export default function ProvidersPage() {
                         title={provider.modelId}
                       >
                         {provider.providerType === 'acp'
-                          ? getAcpAgent(provider.modelId)?.label ?? provider.modelId
+                          ? acpProviderDisplay(provider.modelId).runtimeLabel
                           : provider.modelId}
                       </span>
                       {provider.providerType === 'lmstudio' && (
@@ -1537,6 +1584,11 @@ export default function ProvidersPage() {
                         </span>
                       )}
                     </span>
+                    {provider.providerType === 'acp' && (
+                      <span className="mt-1 block max-w-[220px] truncate text-xs text-muted-foreground" title={acpProviderDisplay(provider.modelId).modelSelectionLabel}>
+                        {acpProviderDisplay(provider.modelId).modelSelectionLabel}
+                      </span>
+                    )}
                   </td>
                   <td className="px-4 py-3">
                     {(() => {
