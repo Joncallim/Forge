@@ -75,7 +75,6 @@ type LmStudioDiscovery = {
 type DiscoveryRequest = {
   autoConfigure: boolean
   candidates: { providerType: DiscoveredModel['providerType']; modelId: string }[]
-  candidateMode: 'all' | 'selected'
   invalidReason: string | null
 }
 
@@ -85,7 +84,7 @@ function discoveredKey(model: Pick<DiscoveredModel, 'providerType' | 'modelId'>)
 
 async function parseDiscoveryRequest(request: NextRequest): Promise<DiscoveryRequest> {
   if (!request.headers.get('content-type')?.toLowerCase().includes('application/json')) {
-    return { autoConfigure: false, candidates: [], candidateMode: 'all', invalidReason: null }
+    return { autoConfigure: false, candidates: [], invalidReason: null }
   }
 
   try {
@@ -126,11 +125,10 @@ async function parseDiscoveryRequest(request: NextRequest): Promise<DiscoveryReq
     return {
       autoConfigure: body.autoConfigure === true || body.configure === true,
       candidates: candidateItems,
-      candidateMode: candidateItems.length > 0 ? 'selected' : 'all',
       invalidReason: hasInvalidCandidates ? 'Auto-configure candidates must include providerType and modelId.' : null,
     }
   } catch {
-    return { autoConfigure: false, candidates: [], candidateMode: 'all', invalidReason: 'Invalid JSON body' }
+    return { autoConfigure: false, candidates: [], invalidReason: 'Invalid JSON body' }
   }
 }
 
