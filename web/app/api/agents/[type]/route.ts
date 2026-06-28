@@ -8,8 +8,6 @@ import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 import { syncAgentPromptFileToWorkspace } from '@/lib/agent-prompts'
 
-export { resolveAgentConfigDir } from '@/lib/agent-prompts'
-
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------

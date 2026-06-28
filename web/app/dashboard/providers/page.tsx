@@ -98,7 +98,7 @@ type DefaultProviderState = {
   resolvedProviderId: string | null
 }
 
-type DiscoveryCandidateStatus = 'reachable' | 'not_reachable' | 'added' | 'updated' | 'configured' | 'skipped' | 'unknown'
+type DiscoveryCandidateStatus = 'reachable' | 'not_reachable' | 'available' | 'added' | 'updated' | 'configured' | 'skipped' | 'unknown'
 
 type DiscoveryCandidate = {
   id: string
@@ -108,6 +108,7 @@ type DiscoveryCandidate = {
   modelId?: string
   status: DiscoveryCandidateStatus
   guidance?: string
+  canConfigure?: boolean
 }
 
 type DiscoveryCapabilityGroup = {
@@ -131,6 +132,7 @@ type LocalDiscoveryResponse = {
   found: number
   added: DiscoveryChange[]
   updated?: DiscoveryChange[]
+  configured?: DiscoveryChange[]
   skipped?: DiscoverySkip[]
   ollamaReachable: boolean
   lmstudioReachable: boolean
@@ -171,6 +173,8 @@ const SKIP_REASON_LABELS: Record<string, string> = {
   base_url_conflict: 'Existing provider uses a different endpoint.',
   nonlocal_existing_provider: 'Existing non-local provider was not changed.',
 }
+
+const ACP_MODEL_SELECT_CUSTOM = '__forge_acp_custom_or_runtime_default__'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -235,6 +239,7 @@ function normalizeCandidate(raw: unknown, fallbackIndex: number): DiscoveryCandi
   const status: DiscoveryCandidateStatus =
     rawStatus === 'reachable' ||
     rawStatus === 'not_reachable' ||
+    rawStatus === 'available' ||
     rawStatus === 'added' ||
     rawStatus === 'updated' ||
     rawStatus === 'configured' ||
@@ -252,6 +257,7 @@ function normalizeCandidate(raw: unknown, fallbackIndex: number): DiscoveryCandi
     modelId: stringValue(raw.modelId) || undefined,
     status,
     guidance: stringValue(raw.guidance) || stringValue(raw.setupGuidance) || undefined,
+    canConfigure: raw.canConfigure === true,
   }
 }
 
@@ -430,6 +436,17 @@ function HealthDot({ health }: { health: ProviderHealth | 'loading' | 'error' | 
       </span>
     )
   }
+  if (health.status === 'available') {
+    return (
+      <span className="inline-flex flex-col gap-0.5" aria-label="Provider available but not loaded" title={health.error ?? 'Available but not loaded'}>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="size-2 rounded-full bg-amber-500" aria-hidden="true" />
+          <span className="text-xs text-muted-foreground">Available</span>
+        </span>
+        <span className="text-[11px] text-muted-foreground">{lastChecked ?? 'Not checked'}</span>
+      </span>
+    )
+  }
   if (health.status === 'handshake_failed') {
     return (
       <span className="inline-flex flex-col gap-0.5" aria-label="Adapter handshake failed" title={health.error ?? 'Handshake failed'}>
@@ -484,6 +501,9 @@ function DiscoveryCandidateStatusIcon({ status }: { status: DiscoveryCandidateSt
   if (status === 'reachable' || status === 'added' || status === 'updated' || status === 'configured') {
     return <CheckCircle2Icon className="size-4 text-green-600 dark:text-green-400" aria-hidden="true" />
   }
+  if (status === 'available') {
+    return <CircleAlertIcon className="size-4 text-amber-600 dark:text-amber-400" aria-hidden="true" />
+  }
   if (status === 'not_reachable') {
     return <XCircleIcon className="size-4 text-red-500" aria-hidden="true" />
   }
@@ -497,6 +517,7 @@ function discoveryStatusLabel(status: DiscoveryCandidateStatus): string {
   const labels: Record<DiscoveryCandidateStatus, string> = {
     reachable: 'Reachable',
     not_reachable: 'Not reachable',
+    available: 'Available',
     added: 'Added',
     updated: 'Updated',
     configured: 'Already configured',
@@ -506,7 +527,15 @@ function discoveryStatusLabel(status: DiscoveryCandidateStatus): string {
   return labels[status]
 }
 
-function DiscoveryResultsPanel({ state }: { state: LocalDiscoveryState }) {
+function DiscoveryResultsPanel({
+  state,
+  onConfigure,
+  configuringKey,
+}: {
+  state: LocalDiscoveryState
+  onConfigure: (candidate?: DiscoveryCandidate) => void
+  configuringKey: string | null
+}) {
   if (state.status === 'error') {
     return (
       <div role="alert" className="mb-4 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
@@ -528,8 +557,10 @@ function DiscoveryResultsPanel({ state }: { state: LocalDiscoveryState }) {
           <p className="mt-1 text-xs text-muted-foreground">
             {changed > 0
               ? `Updated ${changed} local provider${changed === 1 ? '' : 's'}.`
-              : response.found > 0
-                ? 'Reachable local models are already represented or were skipped.'
+              : groups.some((group) => group.candidates.some((candidate) => candidate.canConfigure))
+                ? 'Available models were found. Configure the ones Forge should use.'
+                : response.found > 0
+                  ? 'Available models are already configured or were skipped.'
                 : 'No local generation models were added.'}
           </p>
         </div>
@@ -538,7 +569,7 @@ function DiscoveryResultsPanel({ state }: { state: LocalDiscoveryState }) {
             {response.found} found
           </span>
           <span className="inline-flex h-5 items-center rounded-full border border-border px-2 text-xs text-muted-foreground">
-            {response.added.length} added
+            {(response.configured?.length ?? 0) + response.added.length} configured
           </span>
           {(response.updated?.length ?? 0) > 0 && (
             <span className="inline-flex h-5 items-center rounded-full border border-border px-2 text-xs text-muted-foreground">
@@ -586,6 +617,19 @@ function DiscoveryResultsPanel({ state }: { state: LocalDiscoveryState }) {
                             Setup: {candidate.guidance}
                           </p>
                         )}
+                        {candidate.canConfigure && candidate.providerType && candidate.modelId && (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="mt-2"
+                            onClick={() => onConfigure(candidate)}
+                            disabled={configuringKey === `${candidate.providerType}:${candidate.modelId}` || configuringKey === '__all__'}
+                            aria-busy={configuringKey === `${candidate.providerType}:${candidate.modelId}`}
+                          >
+                            {configuringKey === `${candidate.providerType}:${candidate.modelId}` ? 'Configuring…' : 'Auto-configure'}
+                          </Button>
+                        )}
                       </div>
                     </div>
                   </li>
@@ -595,6 +639,20 @@ function DiscoveryResultsPanel({ state }: { state: LocalDiscoveryState }) {
           </div>
         ))}
       </div>
+      {groups.some((group) => group.candidates.some((candidate) => candidate.canConfigure)) && (
+        <div className="mt-3 flex justify-end">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => onConfigure()}
+            disabled={configuringKey !== null}
+            aria-busy={configuringKey === '__all__'}
+          >
+            {configuringKey === '__all__' ? 'Configuring…' : 'Auto-configure all'}
+          </Button>
+        </div>
+      )}
     </section>
   )
 }
@@ -758,15 +816,25 @@ function ProviderForm({ form, onChange, error, submitting, onSubmit, submitLabel
                   value={
                     parsedAcp?.selectedModel && acpModelSelection.options.some((option) => option.id === parsedAcp.selectedModel)
                       ? parsedAcp.selectedModel
-                      : undefined
+                      : ACP_MODEL_SELECT_CUSTOM
                   }
-                  onValueChange={(v) => v && set('modelId', acpProviderModelId(parsedAcp?.agentId ?? '', v))}
+                  onValueChange={(v) => {
+                    if (!v) return
+                    if (v === ACP_MODEL_SELECT_CUSTOM) {
+                      set('modelId', acpProviderModelId(parsedAcp?.agentId ?? '', ''))
+                      return
+                    }
+                    set('modelId', acpProviderModelId(parsedAcp?.agentId ?? '', v))
+                  }}
                 >
                   <SelectTrigger aria-label="ACP model preset" className="w-full">
                     <SelectValue placeholder="Choose a model preset" />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectGroup>
+                      <SelectItem value={ACP_MODEL_SELECT_CUSTOM}>
+                        Runtime default or custom
+                      </SelectItem>
                       {acpModelSelection.options.map((option) => (
                         <SelectItem key={option.id} value={option.id}>
                           {option.label}
@@ -1064,6 +1132,7 @@ export default function ProvidersPage() {
   const [deleteImpacts, setDeleteImpacts] = useState<Record<string, ProviderDeactivationImpact | null>>({})
   const [deleteErrors, setDeleteErrors] = useState<Record<string, string | null>>({})
   const [discovering, setDiscovering] = useState(false)
+  const [configuringDiscoveryKey, setConfiguringDiscoveryKey] = useState<string | null>(null)
   const [discoveryState, setDiscoveryState] = useState<LocalDiscoveryState | null>(null)
   const [recheckingId, setRecheckingId] = useState<string | null>(null)
   const [defaultState, setDefaultState] = useState<DefaultProviderState>({
@@ -1426,6 +1495,37 @@ export default function ProvidersPage() {
     }
   }
 
+  async function handleConfigureDiscovered(candidate?: DiscoveryCandidate) {
+    const configuringKey = candidate?.providerType && candidate.modelId
+      ? `${candidate.providerType}:${candidate.modelId}`
+      : '__all__'
+    setConfiguringDiscoveryKey(configuringKey)
+    try {
+      const res = await fetch('/api/providers/discover-local', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          autoConfigure: true,
+          ...(candidate?.providerType && candidate.modelId
+            ? { candidates: [{ providerType: candidate.providerType, modelId: candidate.modelId }] }
+            : {}),
+        }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error((body as { error?: string }).error ?? 'Auto-configuration failed')
+      }
+      const data = await res.json() as LocalDiscoveryResponse
+      setDiscoveryState({ status: 'success', response: data, groups: buildDiscoveryGroups(data) })
+      const nextProviders = await loadProviders()
+      await loadHealth(true, true, nextProviders)
+    } catch (err) {
+      setDiscoveryState({ status: 'error', message: err instanceof Error ? err.message : 'Auto-configuration failed' })
+    } finally {
+      setConfiguringDiscoveryKey(null)
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Render
   // ---------------------------------------------------------------------------
@@ -1442,9 +1542,9 @@ export default function ProvidersPage() {
           onClick={handleDiscoverLocal}
           disabled={discovering}
           aria-busy={discovering}
-          aria-label="Find local models from Ollama and LM Studio"
+          aria-label="Find available models from ACP connectors, Ollama, and LM Studio"
         >
-          {discovering ? 'Searching…' : 'Find local models'}
+          {discovering ? 'Searching…' : 'Find available models'}
         </Button>
         <Dialog open={addOpen} onOpenChange={setAddOpen}>
           <DialogTrigger
@@ -1473,7 +1573,13 @@ export default function ProvidersPage() {
       </div>
 
       {/* Discovery feedback */}
-      {discoveryState !== null && <DiscoveryResultsPanel state={discoveryState} />}
+      {discoveryState !== null && (
+        <DiscoveryResultsPanel
+          state={discoveryState}
+          onConfigure={handleConfigureDiscovered}
+          configuringKey={configuringDiscoveryKey}
+        />
+      )}
 
       {/* Default provider summary */}
       {!loading && providers.length > 0 && (

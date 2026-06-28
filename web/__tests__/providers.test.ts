@@ -390,6 +390,19 @@ describe('getModel', () => {
   })
 
   it('uses chat completions for LM Studio models instead of the Responses API', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe('http://localhost:1234/api/v1/models')
+      return new Response(JSON.stringify({
+        models: [
+          {
+            type: 'llm',
+            key: 'google/gemma-4-e4b',
+            loaded_instances: [{ model: 'google/gemma-4-e4b' }],
+          },
+        ],
+      }), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
     mockDbSelect.mockReturnValue(chain([
       makeRow({
         providerType: 'lmstudio',
@@ -399,11 +412,121 @@ describe('getModel', () => {
       }),
     ]))
 
-    const model = await getModel('config-id')
+    try {
+      const model = await getModel('config-id')
 
-    expect(mockOpenAIChat).toHaveBeenCalledWith('google/gemma-4-e4b')
-    expect(mockOpenAIInstance).not.toHaveBeenCalledWith('google/gemma-4-e4b')
-    expect(model).toEqual({ _tag: 'openai-chat-model' })
+      expect(mockOpenAIChat).toHaveBeenCalledWith('google/gemma-4-e4b')
+      expect(mockOpenAIInstance).not.toHaveBeenCalledWith('google/gemma-4-e4b')
+      expect(model).toEqual({ _tag: 'openai-chat-model' })
+      expect(fetchMock).toHaveBeenCalledOnce()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('loads an available LM Studio model before returning the chat model', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === 'http://localhost:1234/api/v1/models') {
+        return new Response(JSON.stringify({
+          models: [{ type: 'llm', key: 'google/gemma-4-e4b', loaded_instances: [] }],
+        }), { status: 200 })
+      }
+      expect(url).toBe('http://localhost:1234/api/v1/models/load')
+      expect(init?.method).toBe('POST')
+      expect(init?.body).toBe(JSON.stringify({ model: 'google/gemma-4-e4b' }))
+      return new Response(JSON.stringify({}), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    mockDbSelect.mockReturnValue(chain([
+      makeRow({
+        providerType: 'lmstudio',
+        baseUrl: 'http://localhost:1234/v1',
+        modelId: 'google/gemma-4-e4b',
+        isLocal: true,
+      }),
+    ]))
+
+    try {
+      await getModel('config-id')
+
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(mockOpenAIChat).toHaveBeenCalledWith('google/gemma-4-e4b')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('does not preload LM Studio models for non-loopback endpoints', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    mockDbSelect.mockReturnValue(chain([
+      makeRow({
+        providerType: 'lmstudio',
+        baseUrl: 'https://example.com/v1',
+        modelId: 'google/gemma-4-e4b',
+        isLocal: true,
+      }),
+    ]))
+
+    try {
+      await getModel('config-id')
+
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(mockOpenAIChat).toHaveBeenCalledWith('google/gemma-4-e4b')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('does not preload LM Studio models for non-local configs', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    mockDbSelect.mockReturnValue(chain([
+      makeRow({
+        providerType: 'lmstudio',
+        baseUrl: 'http://localhost:1234/v1',
+        modelId: 'google/gemma-4-e4b',
+        isLocal: false,
+      }),
+    ]))
+
+    try {
+      await getModel('config-id')
+
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(mockOpenAIChat).toHaveBeenCalledWith('google/gemma-4-e4b')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('surfaces LM Studio preload failures before returning the model', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === 'http://localhost:1234/api/v1/models') {
+        return new Response(JSON.stringify({
+          models: [{ type: 'llm', key: 'google/gemma-4-e4b', loaded_instances: [] }],
+        }), { status: 200 })
+      }
+      return new Response('out of memory', { status: 500 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    mockDbSelect.mockReturnValue(chain([
+      makeRow({
+        providerType: 'lmstudio',
+        baseUrl: 'http://localhost:1234/v1',
+        modelId: 'google/gemma-4-e4b',
+        isLocal: true,
+      }),
+    ]))
+
+    try {
+      await expect(getModel('config-id')).rejects.toThrow(/could not load.*out of memory/i)
+      expect(mockOpenAIChat).not.toHaveBeenCalledWith('google/gemma-4-e4b')
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 })
 
@@ -482,7 +605,7 @@ describe('checkProviderHealth', () => {
       expect(init?.method).toBeUndefined()
       return new Response(JSON.stringify({
         models: [
-          { type: 'llm', key: 'google/gemma-local' },
+          { type: 'llm', key: 'google/gemma-local', loaded_instances: [{ model: 'google/gemma-local' }] },
           { type: 'embedding', key: 'nomic-embed' },
         ],
       }), { status: 200 })
@@ -506,6 +629,36 @@ describe('checkProviderHealth', () => {
       })
       expect(result.latencyMs).toEqual(expect.any(Number))
       expect(fetchMock).toHaveBeenCalledOnce()
+      expect(mockGenerateText).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('reports available LM Studio models as unloaded instead of ready', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      models: [
+        { type: 'llm', key: 'google/gemma-local', loaded_instances: [] },
+      ],
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const result = await checkProviderHealth(
+        makeRow({
+          providerType: 'lmstudio',
+          baseUrl: 'http://localhost:1234',
+          modelId: 'google/gemma-local',
+          isLocal: true,
+        }),
+      )
+
+      expect(result).toMatchObject({
+        status: 'available',
+        reachable: false,
+        envVarPresent: true,
+      })
+      expect(result.error).toMatch(/not loaded/i)
       expect(mockGenerateText).not.toHaveBeenCalled()
     } finally {
       vi.unstubAllGlobals()

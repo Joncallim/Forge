@@ -12,7 +12,7 @@ const MAX_OUTPUT_BYTES = 12 * 1024
 const MAX_DIFF_BYTES = 24 * 1024
 
 export type CommandRiskClass = 'read_only' | 'local_validation'
-export type RepositoryEvidenceStatus = 'ready' | 'blocked' | 'failed' | 'complete'
+export type RepositoryEvidenceStatus = 'ready' | 'blocked' | 'failed' | 'complete' | 'validation_skipped'
 
 export type RepositoryEvidenceProject = {
   id: string
@@ -154,6 +154,20 @@ async function gitOk(cwd: string, argv: string[]): Promise<boolean> {
   }
 }
 
+function isForgeRunArtifactStatusLine(line: string): boolean {
+  const trimmed = line.trim()
+  const pathPart = trimmed.slice(2).trim()
+  return pathPart === '.forge/task-runs' || pathPart.startsWith('.forge/task-runs/')
+}
+
+function repositoryDirtyStatus(statusShort: string): string {
+  return statusShort
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== '')
+    .filter((line) => !isForgeRunArtifactStatusLine(line))
+    .join('\n')
+}
+
 function taskBranchName(task: RepositoryEvidenceTask, workPackage: RepositoryEvidenceWorkPackage): string {
   if (task.githubBranch?.trim()) return task.githubBranch.trim()
   return `forge/${task.id.slice(0, 13)}-${slug(workPackage.title || workPackage.assignedRole)}`
@@ -213,13 +227,14 @@ export async function buildRepositoryExecutionContext(input: {
     remoteHead,
   ] = await Promise.all([
     git(resolvedPath, ['branch', '--show-current']).catch(() => ''),
-    git(resolvedPath, ['status', '--short']).catch(() => ''),
+    git(resolvedPath, ['status', '--short', '--untracked-files=all']).catch(() => ''),
     git(resolvedPath, ['remote', '-v']).catch(() => ''),
     remoteHeadBranch(resolvedPath),
   ])
 
   const currentBranch = currentBranchRaw.trim() || null
-  const isDirty = statusShort.trim().length > 0
+  const dirtyStatus = repositoryDirtyStatus(statusShort)
+  const isDirty = dirtyStatus.trim().length > 0
   const hasRemote = remoteSummary.trim().length > 0
   const baseBranch = remoteHead ?? (input.project.defaultBranch?.trim() || null)
   const intendedTaskBranch = taskBranchName(input.task, input.workPackage)

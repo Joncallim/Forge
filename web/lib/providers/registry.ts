@@ -7,11 +7,12 @@ import { providerConfigs } from '@/db/schema'
 import type { ProviderConfig } from '@/db/schema'
 import { eq, asc } from 'drizzle-orm'
 import { requiresProviderBaseUrl } from './types'
-import { normalizeLmStudioRuntimeBaseUrl, PROVIDER_CATALOG } from './catalog'
+import { normalizeLmStudioNativeApiBaseUrl, normalizeLmStudioRuntimeBaseUrl, PROVIDER_CATALOG } from './catalog'
 import { decryptSecret } from '@/lib/crypto'
 import { providerApiKeyEnvVarError, safeProviderApiKeyEnvVar } from './credentials'
 import type { ProviderType } from './types'
 import { AcpLanguageModel } from './acp/language-model'
+import { listLmStudioModelIds } from './model-listing'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -155,6 +156,54 @@ function buildProvider(config: ProviderConfig): ProviderFactory {
   }
 }
 
+function isLoopbackHttpUrl(rawUrl: string | undefined): boolean {
+  if (!rawUrl) return false
+  try {
+    const url = new URL(rawUrl)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+    return ['localhost', '127.0.0.1', '::1', '[::1]'].includes(url.hostname)
+  } catch {
+    return false
+  }
+}
+
+async function ensureLmStudioModelLoaded(config: ProviderConfig): Promise<void> {
+  if (!config.isLocal) return
+  const nativeBaseUrl = normalizeLmStudioNativeApiBaseUrl(
+    config.baseUrl ?? PROVIDER_CATALOG.lmstudio.defaultBaseUrl ?? null,
+  )
+  if (!isLoopbackHttpUrl(nativeBaseUrl)) return
+
+  const apiKey = resolveApiKey(config)
+  const listing = await listLmStudioModelIds({
+    baseUrl: config.baseUrl ?? PROVIDER_CATALOG.lmstudio.defaultBaseUrl ?? null,
+    apiKey,
+    timeoutMs: 3000,
+  })
+
+  if (listing.source !== 'native' || listing.loadedModels.includes(config.modelId)) return
+  if (!listing.models.includes(config.modelId)) return
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 120_000)
+  try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`
+    const res = await fetch(`${nativeBaseUrl}/models/load`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ model: config.modelId }),
+      signal: controller.signal,
+    })
+    if (!res.ok) {
+      const message = await res.text().catch(() => '')
+      throw new Error(`LM Studio could not load "${config.modelId}" (${res.status})${message ? `: ${message.slice(0, 200)}` : ''}`)
+    }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // getProvider
 // ---------------------------------------------------------------------------
@@ -183,6 +232,9 @@ export async function getModel(configId: string): Promise<LanguageModel | null> 
   if (!result) return null
 
   const { provider, config } = result
+  if (config.providerType === 'lmstudio') {
+    await ensureLmStudioModelLoaded(config)
+  }
   if (CHAT_COMPLETIONS_PROVIDER_TYPES.has(config.providerType as ProviderType)) {
     return (provider as { chat: (modelId: string) => LanguageModel }).chat(config.modelId)
   }

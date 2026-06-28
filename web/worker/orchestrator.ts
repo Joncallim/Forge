@@ -458,7 +458,10 @@ async function runArchitect(
   let text = ''
 
   try {
-    let usage = { inputTokens: 0, outputTokens: 0 }
+    let usage: { inputTokens: number | null; outputTokens: number | null } = {
+      inputTokens: null,
+      outputTokens: null,
+    }
 
     if (process.env.FORGE_WORKER_MOCK_ARCHITECT === '1') {
       text = mockArchitectPlan(task, project)
@@ -504,8 +507,8 @@ async function runArchitect(
 
       const streamUsage = await result.usage
       usage = {
-        inputTokens: streamUsage.inputTokens ?? 0,
-        outputTokens: streamUsage.outputTokens ?? 0,
+        inputTokens: typeof streamUsage.inputTokens === 'number' ? streamUsage.inputTokens : null,
+        outputTokens: typeof streamUsage.outputTokens === 'number' ? streamUsage.outputTokens : null,
       }
     }
 

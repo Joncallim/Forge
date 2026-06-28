@@ -135,6 +135,42 @@ describe('repository execution context', () => {
     expect(context.blockedReason).toMatch(/dirty/i)
   })
 
+  it('ignores Forge task-run artifacts when checking dirty working trees', async () => {
+    await initRepo(tempRoot)
+    await fs.mkdir(path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1'), { recursive: true })
+    await fs.writeFile(path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'result.md'), 'artifact\n')
+
+    const context = await buildRepositoryExecutionContext({
+      project: project(tempRoot),
+      task: task(),
+      workPackage: workPackage(),
+    })
+
+    expect(context.status).toBe('ready')
+    expect(context.isDirty).toBe(false)
+    expect(context.blockedReason).toBeNull()
+  })
+
+  it('ignores tracked Forge task-run artifact updates when checking dirty working trees', async () => {
+    await initRepo(tempRoot)
+    const artifactPath = path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'result.md')
+    await fs.mkdir(path.dirname(artifactPath), { recursive: true })
+    await fs.writeFile(artifactPath, 'first artifact\n')
+    await execFile('git', ['add', '.forge/task-runs/task-1/pkg-1/result.md'], { cwd: tempRoot })
+    await execFile('git', ['commit', '-m', 'track forge artifact fixture'], { cwd: tempRoot })
+    await fs.writeFile(artifactPath, 'updated artifact\n')
+
+    const context = await buildRepositoryExecutionContext({
+      project: project(tempRoot),
+      task: task(),
+      workPackage: workPackage(),
+    })
+
+    expect(context.status).toBe('ready')
+    expect(context.isDirty).toBe(false)
+    expect(context.blockedReason).toBeNull()
+  })
+
   it('blocks missing remotes', async () => {
     await initRepo(tempRoot)
     await execFile('git', ['remote', 'remove', 'origin'], { cwd: tempRoot })

@@ -601,6 +601,7 @@ async function executeReadyWorkPackage(
 
     const execution = await executeWorkPackage(context)
     let diffSummary: string | null = null
+    let validationStatusForPackage: string | null = null
 
     if (repositoryAffecting && repositoryContext?.projectLocalPath) {
       const diffResult = await runScopedRepositoryCommand({
@@ -634,7 +635,16 @@ async function executeReadyWorkPackage(
     }
 
     if (repositoryAffecting && repositoryContext) {
-      const validationPassed = execution.commandResults.every((result) => result.exitCode === 0)
+      const validationStatus = execution.commandResults.length === 0
+        ? 'skipped'
+        : execution.commandResults.every((result) => result.exitCode === 0)
+          ? 'passed'
+          : 'failed'
+      const repositoryEvidenceStatus = validationStatus === 'passed'
+        ? 'complete'
+        : validationStatus === 'skipped'
+          ? 'validation_skipped'
+          : 'failed'
       await createPackageArtifact({
         agentRunId: run.id,
         artifactType: 'test_report',
@@ -642,7 +652,7 @@ async function executeReadyWorkPackage(
         metadata: {
           artifactKind: 'validation_output_summary',
           source: 'work-package-executor',
-          validationStatus: validationPassed ? 'passed' : 'failed',
+          validationStatus,
           workPackageId: nextPackage.id,
         },
         taskId,
@@ -651,25 +661,30 @@ async function executeReadyWorkPackage(
       await createPackageArtifact({
         agentRunId: run.id,
         artifactType: 'log_output',
-        content: `Final validation status: ${validationPassed ? 'passed' : 'failed'}`,
+        content: `Final validation status: ${validationStatus}`,
         metadata: {
           artifactKind: 'final_validation_status',
           source: 'repository-evidence',
-          validationStatus: validationPassed ? 'passed' : 'failed',
+          validationStatus,
           workPackageId: nextPackage.id,
         },
         taskId,
         workPackageId: nextPackage.id,
       })
+      validationStatusForPackage = validationStatus
       await upsertRepositoryEvidenceRecord({
         agentRunId: run.id,
-        context: { ...repositoryContext, status: validationPassed ? 'complete' : 'failed' },
+        context: { ...repositoryContext, status: repositoryEvidenceStatus },
         diffSummary,
-        status: validationPassed ? 'complete' : 'failed',
+        status: repositoryEvidenceStatus,
         taskId,
-        validationStatus: validationPassed ? 'passed' : 'failed',
+        validationStatus,
         workPackageId: nextPackage.id,
       })
+    }
+
+    if (repositoryAffecting && validationStatusForPackage === 'skipped') {
+      throw new Error('Repository-affecting package did not run validation commands; review or revise the execution plan before continuing.')
     }
 
     const completedAt = new Date()

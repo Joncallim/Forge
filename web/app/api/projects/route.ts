@@ -12,6 +12,7 @@ import { getSession } from '@/lib/session'
 import { registerProjectPath } from '@/lib/project-registry'
 import { resolveGitHubToken, validateGitHubTokenEnvVar } from '@/lib/github'
 import { getCachedProjectMcpSummaries } from '@/lib/mcps/manager'
+import { buildCloneUrl, OWNER_REPO_RE, redactToken } from '@/lib/projects/clone'
 import {
   collapseHomePath,
   displayPathForWorkspacePath,
@@ -36,30 +37,6 @@ const createProjectSchema = z.object({
   pmProviderConfigId: z.string().uuid().optional(),
   defaultBranch: z.string().optional(),
 })
-
-// ---------------------------------------------------------------------------
-// Clone helpers
-// ---------------------------------------------------------------------------
-
-// Strict 'owner/repo' shape — validated BEFORE the value touches any URL or
-// process argument, since this is the one user-controlled string that ends
-// up in a command invocation.
-export const OWNER_REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
-
-// Matches the embedded-credential portion of an authenticated clone URL
-// (`https://x-access-token:<token>@github.com/...`) so it can be redacted
-// from any error text before it reaches a log line or HTTP response. git's
-// own stderr can otherwise echo the URL — including the token — verbatim.
-const CREDENTIAL_URL_RE = /x-access-token:[^@]*@/g
-
-export function redactToken(message: string): string {
-  return message.replace(CREDENTIAL_URL_RE, 'x-access-token:***@')
-}
-
-export function buildCloneUrl(ownerRepo: string, token: string | null | undefined): string {
-  if (!token) return `https://github.com/${ownerRepo}.git`
-  return `https://x-access-token:${encodeURIComponent(token)}@github.com/${ownerRepo}.git`
-}
 
 async function pathExistsNonEmpty(targetPath: string): Promise<boolean> {
   try {
