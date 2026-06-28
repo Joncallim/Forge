@@ -163,6 +163,7 @@ function normalizeExecutionPlan(parsed: unknown): WorkPackageExecutionPlan {
     const content = typeof file.content === 'string' ? file.content : null
     if (filePath === '') throw new Error(`File ${index + 1} is missing path.`)
     if (content === null) throw new Error(`File ${filePath} is missing content.`)
+    assertRelativeWritePath(filePath)
     if (Buffer.byteLength(content) > MAX_FILE_BYTES) {
       throw new Error(`File ${filePath} exceeds the ${MAX_FILE_BYTES} byte limit.`)
     }
@@ -338,6 +339,13 @@ export function parseWorkPackageExecutionPlan(rawText: string): WorkPackageExecu
   return normalizeExecutionPlan(parsed)
 }
 
+export function hasLocalConflictCopyPathSegment(filePath: string): boolean {
+  return filePath
+    .split(/[\\/]+/)
+    .filter(Boolean)
+    .some((part) => / 2(?:\.[^./\\]+)?$/.test(part))
+}
+
 function assertRelativeWritePath(filePath: string): void {
   if (path.isAbsolute(filePath)) throw new Error(`File path must be relative: ${filePath}`)
   const parts = filePath.split(/[\\/]+/).filter(Boolean)
@@ -346,6 +354,9 @@ function assertRelativeWritePath(filePath: string): void {
   }
   if (parts.includes('.git') || parts.includes('node_modules')) {
     throw new Error(`File path is not writable by Forge: ${filePath}`)
+  }
+  if (hasLocalConflictCopyPathSegment(filePath)) {
+    throw new Error(`File path looks like a local conflict-copy artifact and cannot be written by Forge: ${filePath}`)
   }
 }
 
@@ -419,6 +430,7 @@ async function listProjectFiles(projectRoot: string): Promise<string[]> {
     }
     for (const entry of entries) {
       if (files.length >= 80 || ignored.has(entry.name)) continue
+      if (hasLocalConflictCopyPathSegment(entry.name)) continue
       const absolute = path.join(current, entry.name)
       const relative = path.relative(projectRoot, absolute).split(path.sep).join('/')
       if (entry.isDirectory()) {
@@ -470,6 +482,7 @@ function buildExecutionPrompt(input: {
     '- Return one fenced `work_package_execution_json` block and nothing else.',
     '- Write all files needed for this package. Use relative paths only; Forge will place them under the execution sandbox root.',
     '- Do not write outside the execution sandbox, `.git`, or `node_modules`.',
+    '- Do not create local conflict-copy names such as `file 2.ts`, `config 2.json`, or directories ending in ` 2`.',
     '- Do not rely on external services in the generated app.',
     '- For tiny new web apps, prefer dependency-free HTML/CSS/JavaScript plus Node built-in tests so `npm test` and `npm run build` can run without `npm install`.',
     '- For dependency-free web apps, separate behavior into a testable JavaScript module and use `node:test` to verify requested actions and persistence behavior.',
