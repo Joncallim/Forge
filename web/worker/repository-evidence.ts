@@ -10,6 +10,8 @@ const execFile = promisify(execFileCallback)
 const COMMAND_TIMEOUT_MS = 120_000
 const MAX_OUTPUT_BYTES = 12 * 1024
 const MAX_DIFF_BYTES = 24 * 1024
+const MAX_STATUS_BUFFER_BYTES = 8 * 1024 * 1024
+const STATUS_UNAVAILABLE_MARKER = '?? .forge-status-unavailable\0'
 
 export type CommandRiskClass = 'read_only' | 'local_validation'
 export type RepositoryEvidenceStatus = 'ready' | 'blocked' | 'failed' | 'complete' | 'validation_skipped'
@@ -151,6 +153,16 @@ async function git(
   return truncate(output, maxBytes)
 }
 
+async function gitRaw(cwd: string, argv: string[], maxBuffer = MAX_STATUS_BUFFER_BYTES): Promise<string> {
+  const result = await execFile('git', argv, {
+    cwd,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    maxBuffer,
+    timeout: 30_000,
+  })
+  return result.stdout
+}
+
 async function gitOk(cwd: string, argv: string[]): Promise<boolean> {
   try {
     await git(cwd, argv)
@@ -250,7 +262,8 @@ export async function buildRepositoryExecutionContext(input: {
     remoteHead,
   ] = await Promise.all([
     git(resolvedPath, ['branch', '--show-current']).catch(() => ''),
-    git(resolvedPath, ['status', '--porcelain=v1', '-z', '--untracked-files=all'], MAX_OUTPUT_BYTES, { trimOutput: false }).catch(() => ''),
+    gitRaw(resolvedPath, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])
+      .catch(() => STATUS_UNAVAILABLE_MARKER),
     git(resolvedPath, ['remote', '-v']).catch(() => ''),
     remoteHeadBranch(resolvedPath),
   ])
@@ -282,7 +295,7 @@ export async function buildRepositoryExecutionContext(input: {
     intendedTaskBranch,
     branchCollision,
     blockedReason,
-    statusShort: dirtyStatus,
+    statusShort: truncate(dirtyStatus),
     remoteSummary: redactCommandOutput(remoteSummary),
   }
 }

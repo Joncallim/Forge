@@ -665,6 +665,40 @@ describe('checkProviderHealth', () => {
     }
   })
 
+  it('treats LM Studio loaded-instance-only model ids as ready', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      models: [
+        {
+          type: 'llm',
+          key: 'catalog-gemma',
+          loaded_instances: [{ model: 'google/gemma-local-runtime' }],
+        },
+      ],
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    try {
+      const result = await checkProviderHealth(
+        makeRow({
+          providerType: 'lmstudio',
+          baseUrl: 'http://localhost:1234',
+          modelId: 'google/gemma-local-runtime',
+          isLocal: true,
+        }),
+      )
+
+      expect(result).toMatchObject({
+        status: 'ready',
+        reachable: true,
+        envVarPresent: true,
+        error: null,
+      })
+      expect(mockGenerateText).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('checks Ollama health through the lightweight model list endpoint', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       expect(String(input)).toBe('http://localhost:11434/api/tags')

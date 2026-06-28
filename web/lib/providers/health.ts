@@ -150,8 +150,9 @@ async function checkLmStudioHealth(
       timeoutMs: HEALTH_TIMEOUT_MS,
     })
 
-    const modelAvailable = listing.models.includes(config.modelId)
-    if (!modelAvailable) {
+    const modelListed = listing.models.includes(config.modelId)
+    const modelLoaded = listing.loadedModels.includes(config.modelId)
+    if (!modelListed && !modelLoaded) {
       return {
         status: 'unreachable',
         reachable: false,
@@ -161,7 +162,7 @@ async function checkLmStudioHealth(
       }
     }
 
-    if (listing.source === 'native' && !listing.loadedModels.includes(config.modelId)) {
+    if (listing.source === 'native' && !modelLoaded) {
       return availableResult(
         envVarPresent,
         Date.now() - start,

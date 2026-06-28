@@ -193,6 +193,36 @@ describe('repository execution context', () => {
     expect(context.blockedReason).toMatch(/dirty/i)
   })
 
+  it('blocks dirty product paths even after many ignored Forge task-run artifacts', async () => {
+    await initRepo(tempRoot)
+    await fs.mkdir(path.join(tempRoot, '.forge', 'task-runs', 'overflow'), { recursive: true })
+    for (let index = 0; index < 500; index += 1) {
+      await fs.writeFile(
+        path.join(
+          tempRoot,
+          '.forge',
+          'task-runs',
+          'overflow',
+          `artifact-${String(index).padStart(4, '0')}-${'x'.repeat(40)}.md`,
+        ),
+        'artifact\n',
+      )
+    }
+    await fs.mkdir(path.join(tempRoot, 'src'), { recursive: true })
+    await fs.writeFile(path.join(tempRoot, 'src', 'late-dirty.ts'), 'dirty\n')
+
+    const context = await buildRepositoryExecutionContext({
+      project: project(tempRoot),
+      task: task(),
+      workPackage: workPackage(),
+    })
+
+    expect(context.status).toBe('blocked')
+    expect(context.isDirty).toBe(true)
+    expect(context.statusShort).toContain('src/late-dirty.ts')
+    expect(context.statusShort).not.toContain('.forge/task-runs/overflow')
+  })
+
   it('blocks missing remotes', async () => {
     await initRepo(tempRoot)
     await execFile('git', ['remote', 'remove', 'origin'], { cwd: tempRoot })

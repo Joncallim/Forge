@@ -755,12 +755,10 @@ async function executeReadyWorkPackage(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     const failedAt = new Date()
-    if (repositoryAffecting && repositoryContext) {
+    if (repositoryAffecting && repositoryContext && validationStatusForPackage !== 'skipped') {
       const evidenceStatus = repositoryContext.status === 'blocked'
         ? 'blocked'
-        : validationStatusForPackage === 'skipped'
-          ? 'validation_skipped'
-          : 'failed'
+        : 'failed'
       const validationStatus = validationStatusForPackage ?? 'failed'
       await upsertRepositoryEvidenceRecord({
         agentRunId: run.id,
