@@ -1,5 +1,6 @@
 import { stripKnownFences } from '@/lib/plan-fences'
 import { normalizeMarkdownDisplayText } from '@/lib/display-text'
+import { MarkdownView } from '@/components/MarkdownView'
 
 export type DiffLine = { type: 'added' | 'removed' | 'unchanged'; text: string }
 
@@ -53,33 +54,50 @@ export function PlanDiffView({ oldContent, newContent }: { oldContent: string; n
   const oldLines = normalizeMarkdownDisplayText(stripKnownFences(oldContent)).split('\n')
   const newLines = normalizeMarkdownDisplayText(stripKnownFences(newContent)).split('\n')
   const diffLines = computeLineDiff(oldLines, newLines)
+  const deltaLines = diffLines.filter((line) => line.type !== 'unchanged')
+  const chunks = deltaLines.reduce<{ type: 'added' | 'removed'; lines: string[] }[]>((acc, line) => {
+    if (line.type === 'unchanged') return acc
+    const previous = acc[acc.length - 1]
+    if (previous?.type === line.type) {
+      previous.lines.push(line.text)
+    } else {
+      acc.push({ type: line.type, lines: [line.text] })
+    }
+    return acc
+  }, [])
 
   return (
     <div
-      className="max-h-[70vh] overflow-y-auto rounded-lg bg-background/80 p-3 font-mono text-xs ring-1 ring-border"
+      className="max-h-[70vh] overflow-y-auto rounded-lg bg-background/80 p-3 ring-1 ring-border"
       aria-label="Plan revision diff"
     >
-      {diffLines.map((line, idx) => {
-        if (line.type === 'removed') {
-          return (
-            <div key={idx} className="bg-muted/60 text-muted-foreground">
-              <span className="line-through">{line.text === '' ? ' ' : line.text}</span>
-            </div>
-          )
-        }
-        if (line.type === 'added') {
-          return (
-            <div key={idx} className="bg-blue-500/10 text-foreground">
-              <span>{line.text === '' ? ' ' : line.text}</span>
-            </div>
-          )
-        }
-        return (
-          <div key={idx} className="text-foreground">
-            <span>{line.text === '' ? ' ' : line.text}</span>
-          </div>
-        )
-      })}
+      {chunks.length === 0 ? (
+        <p className="text-sm text-muted-foreground">No content changes.</p>
+      ) : (
+        <div className="space-y-4">
+          {chunks.map((chunk, index) => {
+            const content = chunk.lines.join('\n')
+            if (chunk.type === 'removed') {
+              return (
+                <div
+                  key={`${chunk.type}-${index}`}
+                  className="text-red-700 line-through decoration-red-700 dark:text-red-300 [&_*]:text-inherit [&_code]:bg-transparent [&_pre]:bg-transparent"
+                >
+                  <MarkdownView content={content} compact />
+                </div>
+              )
+            }
+            return (
+              <div
+                key={`${chunk.type}-${index}`}
+                className="text-blue-700 dark:text-blue-300 [&_*]:text-inherit [&_code]:bg-transparent [&_pre]:bg-transparent"
+              >
+                <MarkdownView content={content} compact />
+              </div>
+            )
+          })}
+        </div>
+      )}
     </div>
   )
 }

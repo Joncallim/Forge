@@ -6,6 +6,12 @@ import { db } from '@/db'
 import { agentConfigs, workforceAgents, workforces } from '@/db/schema'
 import { getSession } from '@/lib/session'
 import { exportWorkforcesToWorkspace } from '@/lib/workforce-exports'
+import {
+  normalizeDisplayName,
+  normalizeDisplayNameForUniqueness,
+  slugifyDisplayName,
+  uniqueSlug,
+} from '@/lib/naming'
 
 const slugSchema = z
   .string()
@@ -23,21 +29,16 @@ const memberSchema = z.object({
 
 const createWorkforceSchema = z.object({
   slug: slugSchema.optional(),
-  displayName: z.string().trim().min(1).max(120),
+  name: z.string().trim().min(1).max(120).optional(),
+  displayName: z.string().trim().min(1).max(120).optional(),
   description: z.string().trim().max(500).optional(),
   isDefault: z.boolean().optional(),
   isActive: z.boolean().optional(),
   members: z.array(memberSchema).optional(),
+}).refine((data) => data.name !== undefined || data.displayName !== undefined, {
+  message: 'name is required',
+  path: ['name'],
 })
-
-function slugify(value: string): string {
-  return value
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 64)
-}
 
 async function exportWorkforceMirror(workforceRows: Awaited<ReturnType<typeof listWorkforces>>): Promise<string | null> {
   try {
@@ -47,6 +48,13 @@ async function exportWorkforceMirror(workforceRows: Awaited<ReturnType<typeof li
     console.error('[api/workforces] Workspace export failed after DB commit', err)
     return 'Workspace workforce files could not be refreshed; database changes were saved.'
   }
+}
+
+async function listWorkforceNameRecords(): Promise<Array<{ slug: string; displayName: string }>> {
+  return db.select({
+    slug: workforces.slug,
+    displayName: workforces.displayName,
+  }).from(workforces)
 }
 
 async function listWorkforces() {
@@ -123,7 +131,18 @@ export async function POST(request: NextRequest) {
     }
 
     const data = parsed.data
-    const slug = data.slug ?? slugify(data.displayName)
+    const displayName = normalizeDisplayName(data.name ?? data.displayName ?? '')
+    const existingWorkforces = await listWorkforceNameRecords()
+    const normalizedName = normalizeDisplayNameForUniqueness(displayName)
+    if (existingWorkforces.some((workforce) => normalizeDisplayNameForUniqueness(workforce.displayName) === normalizedName)) {
+      return NextResponse.json({ error: 'Workforce name already exists' }, { status: 409 })
+    }
+
+    const slug = data.slug ?? uniqueSlug(
+      slugifyDisplayName(displayName),
+      existingWorkforces.map((workforce) => workforce.slug),
+      'workforce',
+    )
     const parsedSlug = slugSchema.safeParse(slug)
     if (!parsedSlug.success) {
       return NextResponse.json(
@@ -141,7 +160,7 @@ export async function POST(request: NextRequest) {
         .insert(workforces)
         .values({
           slug: parsedSlug.data,
-          displayName: data.displayName,
+          displayName,
           description: data.description ?? '',
           isDefault: data.isDefault ?? false,
           isActive: data.isActive ?? true,
@@ -181,6 +200,9 @@ export async function POST(request: NextRequest) {
       'code' in err &&
       (err as { code?: string }).code === '23505'
     ) {
+      if ('constraint' in err && (err as { constraint?: string }).constraint === 'workforces_display_name_normalized_idx') {
+        return NextResponse.json({ error: 'Workforce name already exists' }, { status: 409 })
+      }
       return NextResponse.json({ error: 'Workforce slug or membership already exists' }, { status: 409 })
     }
 

@@ -56,6 +56,13 @@ export async function POST(request: NextRequest) {
         { status: 400 },
       )
     }
+    const architectProvider = activeProviders.find((provider) => provider.id === architectConfig.providerConfigId)
+    if (architectProvider?.providerType === 'acp') {
+      return NextResponse.json(
+        { error: 'Agent role evaluation is a workspace-level workflow and cannot use an ACP provider without a project folder. Choose a non-ACP Architect provider for role evaluation.' },
+        { status: 400 },
+      )
+    }
 
     try {
       const { recommendations, usage } = await evaluateAgentRoles({

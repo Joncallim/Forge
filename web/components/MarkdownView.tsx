@@ -6,6 +6,18 @@ type MarkdownViewProps = {
   compact?: boolean
 }
 
+function safeLinkHref(rawHref: string): string | null {
+  const href = rawHref.trim()
+  if (!href) return null
+  if (href.startsWith('/') || href.startsWith('#') || href.startsWith('./') || href.startsWith('../')) return href
+  try {
+    const url = new URL(href)
+    return url.protocol === 'http:' || url.protocol === 'https:' ? href : null
+  } catch {
+    return null
+  }
+}
+
 function parseInline(text: string): ReactNode[] {
   const nodes: ReactNode[] = []
   const pattern = /(`[^`]+`|\[[^\]]+\]\([^)]+\)|\*\*[^*]+\*\*|\*[^*]+\*)/g
@@ -27,16 +39,20 @@ function parseInline(text: string): ReactNode[] {
     } else if (token.startsWith('[')) {
       const closeLabel = token.indexOf(']')
       const href = token.slice(closeLabel + 2, -1)
-      nodes.push(
-        <a
-          key={`${match.index}-link`}
-          href={href}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-primary underline underline-offset-4"
-        >
-          {token.slice(1, closeLabel)}
-        </a>,
+      const safeHref = safeLinkHref(href)
+      nodes.push(safeHref ? (
+          <a
+            key={`${match.index}-link`}
+            href={safeHref}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-primary underline underline-offset-4"
+          >
+            {token.slice(1, closeLabel)}
+          </a>
+        ) : (
+          <span key={`${match.index}-unsafe-link`}>{token.slice(1, closeLabel)}</span>
+        ),
       )
     } else if (token.startsWith('**')) {
       nodes.push(<strong key={`${match.index}-strong`}>{token.slice(2, -2)}</strong>)

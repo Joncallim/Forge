@@ -79,6 +79,14 @@ describe('ACP provider model selection config', () => {
 })
 
 describe('ACP session model selection', () => {
+  it('requires an explicit project cwd before spawning an ACP session', async () => {
+    const spawnFn = vi.fn()
+
+    await expect(AcpSessionClient.start('codex-cli', '   ', { spawnFn }))
+      .rejects.toThrow(/localPath/i)
+    expect(spawnFn).not.toHaveBeenCalled()
+  })
+
   it('sets selected Codex CLI models through ACP session config, not session/new params', async () => {
     const child = new FakeChildProcess()
     const spawnFn = makeSpawnFn(child)
@@ -146,6 +154,61 @@ describe('ACP session model selection', () => {
     })
 
     await expect(promise).rejects.toThrow(/could not set selected model "opus"/i)
+  })
+
+  it('redacts adapter secrets from selected model config failures', async () => {
+    const child = new FakeChildProcess()
+    const spawnFn = makeSpawnFn(child)
+    const leakedToken = 'sk-proj-abcdefghijklmnopqrstuvwxyz'
+    const leakedEmail = 'operator@example.com'
+
+    const promise = AcpSessionClient.start('claude-agent', '/repo', {
+      selectedModel: 'opus',
+      modelSelection: getAcpModelSelection('claude-agent::opus'),
+      spawnFn,
+    })
+
+    writeJsonLine(child.stdout, { jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } })
+    await Promise.resolve()
+    writeJsonLine(child.stdout, { jsonrpc: '2.0', id: 2, result: { sessionId: 'session-1' } })
+    await Promise.resolve()
+    writeJsonLine(child.stdout, {
+      jsonrpc: '2.0',
+      id: 3,
+      error: { message: `Failed with ${leakedToken} for ${leakedEmail}` },
+    })
+
+    await expect(promise).rejects.toThrow(/could not set selected model "opus".*\[redacted-token\].*\[redacted-email\]/i)
+    await expect(promise).rejects.not.toThrow(leakedToken)
+    await expect(promise).rejects.not.toThrow(leakedEmail)
+  })
+
+  it('redacts adapter secrets from prompt transport failures', async () => {
+    const child = new FakeChildProcess()
+    const spawnFn = makeSpawnFn(child)
+    const leakedToken = 'ghp_abcdefghijklmnopqrstuvwxyz'
+    const leakedFineGrainedPat = 'github_pat_11ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz'
+    const leakedUserToken = 'ghu_abcdefghijklmnopqrstuvwxyz'
+
+    const promise = AcpSessionClient.start('codex-cli', '/repo', { spawnFn })
+    writeJsonLine(child.stdout, { jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } })
+    await Promise.resolve()
+    writeJsonLine(child.stdout, { jsonrpc: '2.0', id: 2, result: { sessionId: 'session-1' } })
+
+    const client = await promise
+    const promptPromise = client.prompt('hello')
+    await Promise.resolve()
+    writeJsonLine(child.stdout, {
+      jsonrpc: '2.0',
+      id: 3,
+      error: { message: `adapter failed with ${leakedToken} ${leakedFineGrainedPat} ${leakedUserToken}` },
+    })
+
+    await expect(promptPromise).rejects.toThrow(/\[redacted-token\]/)
+    await expect(promptPromise).rejects.not.toThrow(leakedToken)
+    await expect(promptPromise).rejects.not.toThrow(leakedFineGrainedPat)
+    await expect(promptPromise).rejects.not.toThrow(leakedUserToken)
+    client.close()
   })
 })
 

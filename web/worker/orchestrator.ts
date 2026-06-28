@@ -13,6 +13,8 @@ import {
 } from './architect-context'
 import type { OpenQuestion } from './open-questions'
 import { getProjectMcpOverview } from '../lib/mcps/manager'
+import type { ProjectMcpOverview } from '../lib/mcps/types'
+import { assertProjectLocalPathForExecution } from '../lib/projects/local-path'
 import { prepareArchitectArtifact } from './architect-artifact'
 import { materializeWorkforceFromArchitectArtifact } from './workforce-materializer'
 import { displayPathForWorkspacePath, getWorkspaceSettings } from '../lib/workspace'
@@ -75,13 +77,13 @@ async function loadAgentConfig(agentType: string): Promise<AgentConfigRow | null
   const [config] = await db
     .select()
     .from(agentConfigs)
-    .where(eq(agentConfigs.agentType, agentType))
+    .where(and(eq(agentConfigs.agentType, agentType), eq(agentConfigs.isActive, true)))
     .limit(1)
 
   return config ?? null
 }
 
-async function loadActiveAgentCatalog(): Promise<AgentConfigRow[]> {
+async function loadAgentCatalog(): Promise<AgentConfigRow[]> {
   return db
     .select()
     .from(agentConfigs)
@@ -114,6 +116,7 @@ export function buildArchitectPrompt(
   resumeCheckpoint: ArchitectResumeCheckpoint | null = null,
   configuredAgents: AgentConfigRow[] = [],
   displayLocalPath: string | null = null,
+  mcpOverview: ProjectMcpOverview | null = null,
 ): string {
   const answeredSection =
     answeredQuestions.length === 0
@@ -170,6 +173,52 @@ export function buildArchitectPrompt(
             return `- [${name}] slug: ${agent.agentType}${description}`
           }),
         ]
+  const agentCatalogJsonSection = [
+    '',
+    'Configured agent catalog JSON:',
+    '```json',
+    JSON.stringify({
+      agents: configuredAgents.map((agent) => ({
+        slug: agent.agentType,
+        name: agent.displayName || agent.agentType,
+        description: agent.description,
+        active: agent.isActive,
+        system: agent.isSystem,
+      })),
+    }),
+    '```',
+  ]
+  const mcpResourceSection = mcpOverview
+    ? [
+        '',
+        'Available MCPs and project resources:',
+        '```json',
+        JSON.stringify({
+          projectId: mcpOverview.projectId,
+          projectLocalPath: project.localPath,
+          githubRepo: project.githubRepo,
+          config: mcpOverview.config,
+          catalog: mcpOverview.catalog.map((entry) => ({
+            id: entry.id,
+            displayName: entry.displayName,
+            description: entry.description,
+            recommended: entry.recommended,
+            requiresAuth: entry.requiresAuth,
+          })),
+          statuses: mcpOverview.statuses.map((status) => ({
+            mcpId: status.mcpId,
+            displayName: status.displayName,
+            enabled: status.enabled,
+            installState: status.installState,
+            status: status.status,
+            error: status.error,
+          })),
+          summary: mcpOverview.summary,
+        }),
+        '```',
+        'Use this resource inventory when proposing MCP execution design. Do not invent connected resources that are absent or unhealthy here.',
+      ]
+    : []
   const localFolder = project.localPath ?? 'not configured'
   const displayFolderSection =
     displayLocalPath && displayLocalPath !== localFolder
@@ -200,6 +249,7 @@ export function buildArchitectPrompt(
     '',
     'Task breakdown rules:',
     ...agentCatalogSection,
+    ...agentCatalogJsonSection,
     '- Assign every implementation step to a configured agent using its [Display Name] tag when a suitable agent exists. If no configured agent fits, use a concise new specialist tag and make clear why a new agent should be added.',
     '- Prefer concrete, repository-specific guidance: name the actual files, directories, or modules the implementer should create or change. If the repository or canonical local folder above is configured, base actionable file references on it; if it is not, say so and keep paths illustrative. Treat any display folder as UI-only.',
     '- After the Markdown plan, append a fenced code block tagged exactly `agent_breakdown_json` containing a single JSON object of the shape `{"agents":[{"role":"Frontend","tasks":2,"summary":"Build task page UI and state handling","steps":["Build the task list component","Wire up state handling"],"reviewRequirement":"both"}]}`. Derive this from the [Role] assignments in the task breakdown. Each agent\'s `steps` should be a short array of 1-2 sentence imperative strings, one per individual task assigned to that agent — specific enough to stand alone, not just a restatement of `summary`. Use an empty array only if the plan truly assigns no worker tasks.',
@@ -216,6 +266,7 @@ export function buildArchitectPrompt(
     '- Use empty arrays when a bucket does not apply.',
     '',
     'MCP execution design:',
+    ...mcpResourceSection,
     '- If the task would benefit from project MCP access, recommend the minimum MCP capabilities for the affected agents or workforce.',
     '- Treat MCP access as a proposal only: Forge validates it and does not currently issue runtime MCP tools from this plan.',
     '- Use only known MCP ids unless the task explicitly requires a future MCP: `filesystem`, `github`.',
@@ -415,7 +466,7 @@ async function runArchitect(
 ): Promise<{ openQuestionCount: number; checkpoint: PendingArchitectCheckpoint }> {
   const config = await loadAgentConfig(ARCHITECT_AGENT)
   if (!config) {
-    throw new Error('Architect agent config is missing')
+    throw new Error('Architect agent config is missing or archived')
   }
 
   const providerConfigId =
@@ -429,7 +480,10 @@ async function runArchitect(
     throw new Error(`Provider config ${providerConfigId} is missing or inactive`)
   }
 
-  const model = await getModel(providerConfigId)
+  const executionCwd = providerResult.config.providerType === 'acp'
+    ? await assertProjectLocalPathForExecution(project)
+    : project.localPath
+  const model = await getModel(providerConfigId, { cwd: executionCwd })
   if (!model) {
     throw new Error(`Provider config ${providerConfigId} is missing or inactive`)
   }
@@ -458,6 +512,7 @@ async function runArchitect(
   let text = ''
 
   try {
+    const mcpOverview = await getProjectMcpOverview(project)
     let usage: { inputTokens: number | null; outputTokens: number | null } = {
       inputTokens: null,
       outputTokens: null,
@@ -474,7 +529,7 @@ async function runArchitect(
       const [specialistContext, webResearchContext, configuredAgents, workspace] = await Promise.all([
         Promise.resolve(buildSpecialistContext(profile)),
         buildWebResearchContext(profile, task),
-        loadActiveAgentCatalog(),
+        loadAgentCatalog(),
         getWorkspaceSettings({ ensure: false }),
       ])
       const displayLocalPath = project.localPath
@@ -493,6 +548,7 @@ async function runArchitect(
           resumeCheckpoint,
           configuredAgents,
           displayLocalPath,
+          mcpOverview,
         ),
         temperature: 0.2,
       })
@@ -512,7 +568,6 @@ async function runArchitect(
       }
     }
 
-    const mcpOverview = await getProjectMcpOverview(project)
     const prepared = prepareArchitectArtifact(text, mcpOverview)
     const artifact = await createArtifact(task.id, run.id, prepared.planText, {
       openQuestionCount: prepared.questions.length,

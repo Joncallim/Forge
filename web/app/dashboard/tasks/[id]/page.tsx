@@ -108,6 +108,7 @@ function statusLabel(status: string): string {
     awaiting_answers: 'Needs answers',
     awaiting_approval: 'Needs approval',
     dead_lettered: 'Stopped after retries',
+    pending: 'Pending execution',
   }
   if (labels[status]) return labels[status]
   return status.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
@@ -1372,12 +1373,12 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
     <section aria-labelledby="capability-classification-heading" className="rounded-lg border border-border p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
         <h2 id="capability-classification-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
-          Required capabilities
+          Architect-selected agents and resources
         </h2>
         <span className="flex items-center gap-1.5">
           <span
-            aria-label="Capability classification is machine-readable routing metadata. If it is missing, use the visible implementation plan as the source of truth."
-            title="Capability classification is machine-readable routing metadata. If it is missing, use the visible implementation plan as the source of truth."
+            aria-label="This panel summarizes which agents and resources the architect selected for the plan."
+            title="This panel summarizes which agents and resources the architect selected for the plan."
           >
             <InfoIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
           </span>
@@ -1386,7 +1387,7 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
       </div>
 
       <p className="mb-3 text-xs text-muted-foreground">
-        Planning view only. The approved plan still controls which agents run.
+        Planning view only. These are the architect&apos;s selected agent/resource needs for routing the work.
       </p>
 
       {validation.warnings.length > 0 && !missingClassificationOnly && (
@@ -1403,13 +1404,13 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
       {total === 0 ? (
         <p className="text-sm text-muted-foreground">
           {missingClassificationOnly
-            ? 'No machine-readable capability list was provided. Use the implementation plan and visible assignments.'
-            : 'No capabilities were listed for this plan.'}
+            ? 'No structured agent/resource list was provided. Use the implementation plan and visible assignments.'
+            : 'No agent/resource needs were listed for this plan.'}
         </p>
       ) : (
         <dl className="grid gap-3 text-sm">
           <div>
-            <dt className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Required</dt>
+            <dt className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Required by architect</dt>
             <dd className="flex flex-wrap gap-1.5">
               {proposed.required.length > 0
                 ? proposed.required.map((capability) => (
@@ -1419,7 +1420,7 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
             </dd>
           </div>
           <div>
-            <dt className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Optional</dt>
+            <dt className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Optional support</dt>
             <dd className="flex flex-wrap gap-1.5">
               {proposed.optional.length > 0
                 ? proposed.optional.map((capability) => (
@@ -1429,7 +1430,7 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
             </dd>
           </div>
           <div>
-            <dt className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Excluded</dt>
+            <dt className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Not selected</dt>
             <dd>
               {proposed.excluded.length > 0 ? (
                 <ul className="grid gap-2">
@@ -1904,6 +1905,7 @@ export default function TaskDetailPage() {
   const [rejectReason, setRejectReason] = useState('')
   const [replanFeedback, setReplanFeedback] = useState('')
   const [retryProviderId, setRetryProviderId] = useState<string | null>(null)
+  const [optimisticTaskStatus, setOptimisticTaskStatus] = useState<string | null>(null)
 
   // SSE stream
   const {
@@ -1923,7 +1925,7 @@ export default function TaskDetailPage() {
   // initialQuestions while that hasn't happened yet, so an explicitly-empty
   // stream result isn't overridden by stale data from a prior plan round.
   const mergedQuestions: TaskQuestion[] = streamQuestions ?? initialQuestions
-  const currentStatus = taskStatus ?? task?.status ?? null
+  const currentStatus = optimisticTaskStatus ?? taskStatus ?? task?.status ?? null
 
   const loadTask = useCallback(async () => {
     setLoading(true)
@@ -1997,6 +1999,13 @@ export default function TaskDetailPage() {
       setPlanExpanded(true)
     }
   }, [currentStatus])
+
+  useEffect(() => {
+    const actualStatus = taskStatus ?? task?.status ?? null
+    if (optimisticTaskStatus !== null && actualStatus !== null && actualStatus !== 'rejected') {
+      setOptimisticTaskStatus(null)
+    }
+  }, [optimisticTaskStatus, taskStatus, task?.status])
 
   async function handleApprove() {
     setActionLoading(true)
@@ -2082,6 +2091,7 @@ export default function TaskDetailPage() {
         const body = await res.json().catch(() => ({}))
         throw new Error(body.error ?? 'Failed to retry task')
       }
+      setOptimisticTaskStatus('pending')
       await loadTask()
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
@@ -2180,7 +2190,7 @@ export default function TaskDetailPage() {
         </div>
 
         {/* Error message */}
-        {task.errorMessage !== null && (
+        {task.errorMessage !== null && optimisticTaskStatus === null && (
           <div
             role="alert"
             className="mt-4 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive"
@@ -2425,7 +2435,7 @@ export default function TaskDetailPage() {
                   </Select>
                 </div>
                 <Button type="submit" size="sm" disabled={actionLoading} aria-busy={actionLoading}>
-                  {actionLoading ? 'Retrying…' : 'Retry task'}
+                  {actionLoading ? 'Requeueing…' : 'Retry task'}
                 </Button>
               </div>
               {actionError !== null && (
@@ -2436,9 +2446,14 @@ export default function TaskDetailPage() {
             </form>
           )}
 
-          {/* Required capabilities and MCP tool access — reference/routing
-              metadata, grouped with the prompt rather than the workforce
-              execution column */}
+          {optimisticTaskStatus !== null && (
+            <div className="mb-6 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200" role="status" aria-live="polite">
+              Retry submitted. Forge is waiting for a worker to pick up the task.
+            </div>
+          )}
+
+          {/* Architect-selected agents/resources and MCP access, grouped with
+              the prompt rather than the workforce execution column. */}
           <div className="mb-6 grid gap-6">
             <CapabilityClassificationPanel classification={capabilityClassification} />
             <McpAccessPlanPanel design={mcpExecutionDesign} />

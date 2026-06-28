@@ -106,6 +106,7 @@ type DiscoveryCandidate = {
   detail?: string
   providerType?: string
   modelId?: string
+  versionLabel?: string
   status: DiscoveryCandidateStatus
   guidance?: string
   canConfigure?: boolean
@@ -255,6 +256,12 @@ function normalizeCandidate(raw: unknown, fallbackIndex: number): DiscoveryCandi
     detail: stringValue(raw.detail) || stringValue(raw.description) || undefined,
     providerType: stringValue(raw.providerType) || undefined,
     modelId: stringValue(raw.modelId) || undefined,
+    versionLabel:
+      stringValue(raw.versionLabel) ||
+      stringValue(raw.version) ||
+      stringValue(raw.modelVersion) ||
+      stringValue(raw.selectedModel) ||
+      undefined,
     status,
     guidance: stringValue(raw.guidance) || stringValue(raw.setupGuidance) || undefined,
     canConfigure: raw.canConfigure === true,
@@ -527,6 +534,162 @@ function discoveryStatusLabel(status: DiscoveryCandidateStatus): string {
   return labels[status]
 }
 
+function discoveryCandidateKey(candidate: DiscoveryCandidate): string {
+  return candidate.providerType && candidate.modelId
+    ? `${candidate.providerType}:${candidate.modelId}`
+    : candidate.id
+}
+
+function acpVersionLabel(candidate: DiscoveryCandidate): string | null {
+  if (candidate.providerType !== 'acp') return null
+  if (candidate.versionLabel) return candidate.versionLabel
+  const modelId = candidate.modelId ?? candidate.label
+  const display = acpProviderDisplay(modelId)
+  return display.selectedModel ?? null
+}
+
+function discoveryCandidateDisplay(candidate: DiscoveryCandidate): {
+  label: string
+  detail?: string
+  versionLabel: string | null
+} {
+  if (candidate.providerType !== 'acp') {
+    return {
+      label: candidate.label,
+      detail: candidate.detail,
+      versionLabel: candidate.versionLabel ?? null,
+    }
+  }
+
+  const display = acpProviderDisplay(candidate.modelId ?? candidate.label)
+  return {
+    label: display.runtimeLabel,
+    detail: candidate.detail ?? 'ACP-connected model preset',
+    versionLabel: acpVersionLabel(candidate) ?? display.modelSelectionLabel,
+  }
+}
+
+function DiscoveryCandidateCard({
+  candidate,
+  onConfigure,
+  configuringKey,
+}: {
+  candidate: DiscoveryCandidate
+  onConfigure: (candidate?: DiscoveryCandidate) => void
+  configuringKey: string | null
+}) {
+  const display = discoveryCandidateDisplay(candidate)
+  const candidateKey = candidate.providerType && candidate.modelId
+    ? `${candidate.providerType}:${candidate.modelId}`
+    : candidate.id
+
+  return (
+    <li className="min-w-0 rounded-md border border-border bg-background px-3 py-2">
+      <div className="flex min-w-0 items-start gap-2">
+        <DiscoveryCandidateStatusIcon status={candidate.status} />
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+            <p className="min-w-0 break-words text-sm font-medium text-foreground">{display.label}</p>
+            {display.versionLabel && (
+              <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                {display.versionLabel}
+              </span>
+            )}
+            <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+              {discoveryStatusLabel(candidate.status)}
+            </span>
+          </div>
+          {display.detail && <p className="mt-0.5 break-words text-xs text-muted-foreground">{display.detail}</p>}
+          {candidate.providerType === 'acp' && (
+            <p className="mt-1 break-words text-xs text-muted-foreground">
+              ACP-connected. Availability and exact model behavior depend on the local runtime session.
+            </p>
+          )}
+          {candidate.guidance && (
+            <p className="mt-1 break-words text-xs text-muted-foreground">
+              Setup: {candidate.guidance}
+            </p>
+          )}
+          {candidate.canConfigure && candidate.providerType && candidate.modelId && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="mt-2"
+              onClick={() => onConfigure(candidate)}
+              disabled={configuringKey === candidateKey || configuringKey === '__all__'}
+              aria-busy={configuringKey === candidateKey}
+            >
+              {configuringKey === candidateKey ? 'Configuring…' : 'Auto-configure'}
+            </Button>
+          )}
+        </div>
+      </div>
+    </li>
+  )
+}
+
+function DiscoverySection({
+  title,
+  description,
+  groups,
+  emptyLabel,
+  onConfigure,
+  configuringKey,
+}: {
+  title: string
+  description: string
+  groups: DiscoveryCapabilityGroup[]
+  emptyLabel: string
+  onConfigure: (candidate?: DiscoveryCandidate) => void
+  configuringKey: string | null
+}) {
+  const total = groups.reduce((sum, group) => sum + group.candidates.length, 0)
+
+  return (
+    <section className="min-w-0 rounded-lg border border-border bg-muted/20 p-3" aria-label={title}>
+      <div className="mb-2 flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-sm font-medium text-foreground">{title}</h3>
+          <p className="mt-0.5 text-xs text-muted-foreground">{description}</p>
+        </div>
+        <span className="shrink-0 rounded-full bg-background px-2 py-0.5 text-xs text-muted-foreground ring-1 ring-border">
+          {total}
+        </span>
+      </div>
+
+      {total === 0 ? (
+        <p className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+          {emptyLabel}
+        </p>
+      ) : (
+        <div className="grid gap-3">
+          {groups.map((group) => (
+            <div key={group.id} className="min-w-0">
+              {group.title !== title && (
+                <div className="mb-1.5">
+                  <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{group.title}</p>
+                  {group.description && <p className="text-xs text-muted-foreground">{group.description}</p>}
+                </div>
+              )}
+              <ul className="grid gap-2" aria-label={`${title} candidates`}>
+                {group.candidates.map((candidate) => (
+                  <DiscoveryCandidateCard
+                    key={discoveryCandidateKey(candidate)}
+                    candidate={candidate}
+                    onConfigure={onConfigure}
+                    configuringKey={configuringKey}
+                  />
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  )
+}
+
 function DiscoveryResultsPanel({
   state,
   onConfigure,
@@ -546,18 +709,32 @@ function DiscoveryResultsPanel({
 
   const { response, groups } = state
   const changed = response.added.length + (response.updated?.length ?? 0)
+  const groupsWithCandidates = groups.filter((group) => group.candidates.length > 0)
+  const localGroups = groupsWithCandidates
+    .map((group) => ({
+      ...group,
+      candidates: group.candidates.filter((candidate) => candidate.providerType !== 'acp'),
+    }))
+    .filter((group) => group.candidates.length > 0)
+  const acpGroups = groupsWithCandidates
+    .map((group) => ({
+      ...group,
+      candidates: group.candidates.filter((candidate) => candidate.providerType === 'acp'),
+    }))
+    .filter((group) => group.candidates.length > 0)
+  const canConfigureAny = groups.some((group) => group.candidates.some((candidate) => candidate.canConfigure))
 
   return (
     <section aria-labelledby="local-discovery-heading" className="mb-4 rounded-xl border border-border bg-card p-4">
       <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
         <div>
           <h2 id="local-discovery-heading" className="text-sm font-medium text-foreground">
-            Local discovery results
+            Available model discovery
           </h2>
           <p className="mt-1 text-xs text-muted-foreground">
             {changed > 0
               ? `Updated ${changed} local provider${changed === 1 ? '' : 's'}.`
-              : groups.some((group) => group.candidates.some((candidate) => candidate.canConfigure))
+              : canConfigureAny
                 ? 'Available models were found. Configure the ones Forge should use.'
                 : response.found > 0
                   ? 'Available models are already configured or were skipped.'
@@ -580,66 +757,24 @@ function DiscoveryResultsPanel({
       </div>
 
       <div className="grid gap-3 lg:grid-cols-2">
-        {groups.map((group) => (
-          <div key={group.id} className="min-w-0 rounded-lg border border-border bg-muted/20 p-3">
-            <div className="mb-2 flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  {group.kind === 'generation' ? 'Generation' : 'Auxiliary'}
-                </p>
-                <h3 className="mt-0.5 text-sm font-medium text-foreground">{group.title}</h3>
-              </div>
-              <span className="shrink-0 rounded-full bg-background px-2 py-0.5 text-xs text-muted-foreground ring-1 ring-border">
-                {group.candidates.length}
-              </span>
-            </div>
-            {group.description && <p className="mb-2 text-xs text-muted-foreground">{group.description}</p>}
-            {group.candidates.length === 0 ? (
-              <p className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
-                No auxiliary local capabilities were reported by discovery.
-              </p>
-            ) : (
-              <ul className="grid gap-2" aria-label={`${group.title} candidates`}>
-                {group.candidates.map((candidate) => (
-                  <li key={candidate.id} className="min-w-0 rounded-md border border-border bg-background px-3 py-2">
-                    <div className="flex min-w-0 items-start gap-2">
-                      <DiscoveryCandidateStatusIcon status={candidate.status} />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-                          <p className="min-w-0 break-words text-sm font-medium text-foreground">{candidate.label}</p>
-                          <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
-                            {discoveryStatusLabel(candidate.status)}
-                          </span>
-                        </div>
-                        {candidate.detail && <p className="mt-0.5 break-words text-xs text-muted-foreground">{candidate.detail}</p>}
-                        {candidate.guidance && (
-                          <p className="mt-1 break-words text-xs text-muted-foreground">
-                            Setup: {candidate.guidance}
-                          </p>
-                        )}
-                        {candidate.canConfigure && candidate.providerType && candidate.modelId && (
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            className="mt-2"
-                            onClick={() => onConfigure(candidate)}
-                            disabled={configuringKey === `${candidate.providerType}:${candidate.modelId}` || configuringKey === '__all__'}
-                            aria-busy={configuringKey === `${candidate.providerType}:${candidate.modelId}`}
-                          >
-                            {configuringKey === `${candidate.providerType}:${candidate.modelId}` ? 'Configuring…' : 'Auto-configure'}
-                          </Button>
-                        )}
-                      </div>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        ))}
+        <DiscoverySection
+          title="Local Chat Models"
+          description="Ollama and LM Studio chat models discovered on this workstation."
+          groups={localGroups}
+          emptyLabel="No local chat models were reported by discovery."
+          onConfigure={onConfigure}
+          configuringKey={configuringKey}
+        />
+        <DiscoverySection
+          title="ACP Models"
+          description="ACP-connected model presets. These are runtime-specific and depend on the local agent session."
+          groups={acpGroups}
+          emptyLabel="No ACP model presets were reported by discovery."
+          onConfigure={onConfigure}
+          configuringKey={configuringKey}
+        />
       </div>
-      {groups.some((group) => group.candidates.some((candidate) => candidate.canConfigure)) && (
+      {canConfigureAny && (
         <div className="mt-3 flex justify-end">
           <Button
             type="button"

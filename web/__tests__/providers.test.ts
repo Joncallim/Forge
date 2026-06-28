@@ -15,6 +15,7 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest'
 import fs from 'node:fs'
 import path from 'node:path'
+import { AcpLanguageModel } from '@/lib/providers/acp/language-model'
 
 // ---------------------------------------------------------------------------
 // Hoisted mock functions
@@ -275,6 +276,17 @@ describe('getProvider', () => {
     expect(typeof result?.provider).toBe('function')
     expect(mockCreateOpenAI).not.toHaveBeenCalled()
     expect(mockCreateAnthropic).not.toHaveBeenCalled()
+  })
+
+  it('constructs ACP models with an explicit project cwd', async () => {
+    mockDbSelect.mockReturnValue(chain([
+      makeRow({ providerType: 'acp', modelId: 'codex-cli::gpt-5.5', isLocal: true }),
+    ]))
+
+    const model = await getModel('config-id', { cwd: '/workspace/project' })
+
+    expect(model).toBeInstanceOf(AcpLanguageModel)
+    expect((model as { cwd?: string }).cwd).toBe('/workspace/project')
   })
 
   it('returns null for an isActive=false row', async () => {
@@ -800,6 +812,7 @@ describe('provider model construction call sites', () => {
     const repoRoot = path.resolve(__dirname, '..')
     const files = [
       'worker/orchestrator.ts',
+      'worker/work-package-executor.ts',
       'lib/agent-evaluation.ts',
       'lib/task-title.ts',
     ]

@@ -686,6 +686,7 @@ export const agentConfigs = pgTable(
   },
   (t) => [
     uniqueIndex('agent_configs_agent_type_idx').on(t.agentType),
+    uniqueIndex('agent_configs_display_name_normalized_idx').on(sql`lower(regexp_replace(btrim(${t.displayName}), '\\s+', ' ', 'g'))`),
     index('agent_configs_is_active_idx').on(t.isActive),
   ],
 )
@@ -714,6 +715,7 @@ export const workforces = pgTable(
   },
   (t) => [
     uniqueIndex('workforces_slug_idx').on(t.slug),
+    uniqueIndex('workforces_display_name_normalized_idx').on(sql`lower(regexp_replace(btrim(${t.displayName}), '\\s+', ' ', 'g'))`),
     index('workforces_is_active_idx').on(t.isActive),
     index('workforces_is_default_idx').on(t.isDefault),
     check('workforces_slug_safe_chk', sql`${t.slug} ~ '^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$'`),

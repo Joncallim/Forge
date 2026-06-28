@@ -90,6 +90,20 @@ describe('repository execution context', () => {
     expect(context.intendedTaskBranch).toMatch(/^forge\/task-12345678-backend-package/)
   })
 
+  it('uses the prevalidated project root instead of a stale stored local path', async () => {
+    await initRepo(tempRoot)
+
+    const context = await buildRepositoryExecutionContext({
+      project: project(path.join(tempRoot, 'stale-link')),
+      task: task(),
+      validatedProjectRoot: tempRoot,
+      workPackage: workPackage(),
+    })
+
+    expect(context.status).toBe('ready')
+    expect(context.projectLocalPath).toBe(path.resolve(tempRoot))
+  })
+
   it('blocks missing local paths', async () => {
     const context = await buildRepositoryExecutionContext({
       project: project(path.join(tempRoot, 'missing')),

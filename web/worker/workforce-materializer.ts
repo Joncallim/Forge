@@ -1,7 +1,9 @@
 import { randomUUID } from 'crypto'
 import { and, eq, inArray } from 'drizzle-orm'
+import { sql } from 'drizzle-orm'
 import { db } from '../db'
 import {
+  agentConfigs,
   agentHarnesses,
   approvalGates,
   workPackageDependencies,
@@ -14,6 +16,7 @@ import { isImplementationPackageRole } from './review-gates'
 type JsonObject = Record<string, unknown>
 type AgentHarnessInsert = typeof agentHarnesses.$inferInsert & { id: string; slug: string; role: string }
 type WorkPackageInsert = typeof workPackages.$inferInsert & { id: string; assignedRole: string }
+type MaterializerAgentCatalogRow = Pick<typeof agentConfigs.$inferSelect, 'agentType' | 'displayName'>
 
 type MaterializerRowSet = {
   harnesses: AgentHarnessInsert[]
@@ -38,6 +41,7 @@ export type WorkforceMaterializationResult = {
 }
 
 type BuildOptions = {
+  activeAgents?: MaterializerAgentCatalogRow[]
   idFactory?: () => string
 }
 
@@ -53,6 +57,10 @@ export function isWorkforceMaterializationEnabled(
 
 function normalizeAgentType(role: string): string {
   return role.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '')
+}
+
+function normalizeRoleLookup(value: string): string {
+  return normalizeAgentType(value).replace(/_/g, '-')
 }
 
 function displayNameForSlug(slug: string): string {
@@ -72,9 +80,44 @@ function titleForAgent(role: string): string {
   return trimmed === '' ? 'Specialist work package' : `${trimmed} work package`
 }
 
-function mcpGrantsForAgent(prepared: PreparedArchitectArtifact, agentType: string): JsonObject[] {
+function resolveCanonicalAgentType(
+  role: string,
+  activeAgents: MaterializerAgentCatalogRow[] | undefined,
+): string | null {
+  const fallback = normalizeAgentType(role)
+  if (!activeAgents) return fallback
+
+  const requested = normalizeRoleLookup(role)
+  const match = activeAgents.find((agent) =>
+    normalizeRoleLookup(agent.displayName) === requested ||
+    normalizeRoleLookup(agent.agentType) === requested
+  )
+  return match?.agentType ?? null
+}
+
+function roleAliases(role: string, agentType: string): string[] {
+  return Array.from(new Set([normalizeAgentType(role), agentType].filter(Boolean)))
+}
+
+function roleMatches(value: string, agentType: string, aliases: string[]): boolean {
+  const normalized = normalizeAgentType(value)
+  return normalized === agentType || aliases.includes(normalized)
+}
+
+function firstMatchingObjectValue<T>(
+  object: Record<string, T>,
+  agentType: string,
+  aliases: string[],
+): T | undefined {
+  for (const [key, value] of Object.entries(object)) {
+    if (roleMatches(key, agentType, aliases)) return value
+  }
+  return undefined
+}
+
+function mcpGrantsForAgent(prepared: PreparedArchitectArtifact, agentType: string, aliases: string[]): JsonObject[] {
   return prepared.mcpExecutionDesign.grantDecisions.decisions
-    .filter((decision) => normalizeAgentType(decision.agent) === agentType)
+    .filter((decision) => roleMatches(decision.agent, agentType, aliases))
     .map((decision) => ({
       decisionId: decision.decisionId,
       mcpId: decision.mcpId,
@@ -87,7 +130,7 @@ function mcpGrantsForAgent(prepared: PreparedArchitectArtifact, agentType: strin
     }))
 }
 
-function mcpRequirementsForAgent(prepared: PreparedArchitectArtifact, agentType: string): JsonObject[] {
+function mcpRequirementsForAgent(prepared: PreparedArchitectArtifact, agentType: string, aliases: string[]): JsonObject[] {
   const design = prepared.mcpExecutionDesign.proposed
   if (!design) return []
 
@@ -95,25 +138,27 @@ function mcpRequirementsForAgent(prepared: PreparedArchitectArtifact, agentType:
     .filter((requirement) => {
       const targetAgents = requirement.assignment.targetAgents.map(normalizeAgentType)
       const permissionAgents = Object.keys(requirement.agentPermissions).map(normalizeAgentType)
-      return targetAgents.includes(agentType) || permissionAgents.includes(agentType)
+      return targetAgents.includes(agentType) ||
+        permissionAgents.includes(agentType) ||
+        aliases.some((alias) => targetAgents.includes(alias) || permissionAgents.includes(alias))
     })
     .map((requirement) => ({
       mcpId: requirement.mcpId,
       requirement: requirement.requirement,
       reason: requirement.reason,
       assignment: requirement.assignment,
-      permissions: requirement.agentPermissions[agentType] ?? [],
+      permissions: firstMatchingObjectValue(requirement.agentPermissions, agentType, aliases) ?? [],
       prohibitedCapabilities: requirement.prohibitedCapabilities,
       fallback: requirement.fallback,
     }))
 }
 
-function mcpSubtasksForAgent(prepared: PreparedArchitectArtifact, agentType: string): JsonObject[] {
+function mcpSubtasksForAgent(prepared: PreparedArchitectArtifact, agentType: string, aliases: string[]): JsonObject[] {
   const design = prepared.mcpExecutionDesign.proposed
   if (!design) return []
 
   return design.mcpAwareSubtasks
-    .filter((subtask) => normalizeAgentType(subtask.agent) === agentType)
+    .filter((subtask) => roleMatches(subtask.agent, agentType, aliases))
     .map((subtask) => ({
       id: subtask.id,
       dependsOn: subtask.dependsOn,
@@ -174,14 +219,51 @@ export function buildWorkforceMaterializationRows(
   const packages: WorkPackageInsert[] = []
 
   input.prepared.agents.forEach((agent, index) => {
-    const agentType = normalizeAgentType(agent.role)
-    if (agentType === '' || agentType === 'architect') return
+    const agentType = resolveCanonicalAgentType(agent.role, options.activeAgents)
+    const fallbackAgentType = normalizeAgentType(agent.role)
+    if (agentType === 'architect' || fallbackAgentType === 'architect') return
+
+    if (!agentType) {
+      const workPackageId = idFactory()
+      packages.push({
+        id: workPackageId,
+        taskId: input.taskId,
+        harnessId: null,
+        assignedRole: fallbackAgentType || 'unconfigured-agent',
+        title: titleForAgent(agent.role),
+        summary: agent.summary || titleForAgent(agent.role),
+        status: 'failed',
+        sequence: index + 1,
+        steps: agent.steps,
+        requiredCapabilities: {
+          schemaVersion: input.prepared.capabilityClassification.proposed.schemaVersion,
+          required: input.prepared.capabilityClassification.proposed.required,
+          optional: input.prepared.capabilityClassification.proposed.optional,
+          excluded: input.prepared.capabilityClassification.proposed.excluded,
+        },
+        acceptanceCriteria: agent.steps.length > 0 ? agent.steps : [agent.summary || titleForAgent(agent.role)],
+        mcpRequirements: [],
+        reviewRequirement: 'none',
+        blockedReason: `Architect assigned "${agent.role}", but no active configured agent matches that display name or slug. Create or reactivate an agent before execution.`,
+        metadata: {
+          source: 'architect-artifact',
+          architectRunId: input.architectRunId,
+          artifactId: input.artifactId,
+          unresolvedAgentRole: agent.role,
+          requiresAgentConfiguration: true,
+        },
+      })
+      return
+    }
 
     const harnessId = idFactory()
     const workPackageId = idFactory()
-    const mcpRequirements = mcpRequirementsForAgent(input.prepared, agentType)
-    const mcpSubtasks = mcpSubtasksForAgent(input.prepared, agentType)
-    const promptOverlay = input.prepared.mcpExecutionDesign.proposed?.promptOverlays[agentType] ?? null
+    const aliases = roleAliases(agent.role, agentType)
+    const mcpRequirements = mcpRequirementsForAgent(input.prepared, agentType, aliases)
+    const mcpSubtasks = mcpSubtasksForAgent(input.prepared, agentType, aliases)
+    const promptOverlay = input.prepared.mcpExecutionDesign.proposed
+      ? firstMatchingObjectValue(input.prepared.mcpExecutionDesign.proposed.promptOverlays, agentType, aliases) ?? null
+      : null
 
     harnesses.push({
       id: harnessId,
@@ -192,7 +274,7 @@ export function buildWorkforceMaterializationRows(
       description: `${agent.role || displayNameForSlug(agentType)} harness seeded from Architect workforce planning.`,
       systemPrompt: '',
       toolPolicy: {
-        mcpGrants: mcpGrantsForAgent(input.prepared, agentType),
+        mcpGrants: mcpGrantsForAgent(input.prepared, agentType, aliases),
       },
       referencePaths: [],
       outputSchema: {},
@@ -215,8 +297,10 @@ export function buildWorkforceMaterializationRows(
       sequence: index + 1,
       steps: agent.steps,
       requiredCapabilities: {
+        schemaVersion: input.prepared.capabilityClassification.proposed.schemaVersion,
         required: input.prepared.capabilityClassification.proposed.required,
         optional: input.prepared.capabilityClassification.proposed.optional,
+        excluded: input.prepared.capabilityClassification.proposed.excluded,
       },
       acceptanceCriteria: agent.steps.length > 0 ? agent.steps : [agent.summary || titleForAgent(agent.role)],
       mcpRequirements,
@@ -270,7 +354,14 @@ export async function materializeWorkforceFromArchitectArtifact(
     }
   }
 
-  const rows = buildWorkforceMaterializationRows(input)
+  const activeAgents = await db
+    .select({
+      agentType: agentConfigs.agentType,
+      displayName: agentConfigs.displayName,
+    })
+    .from(agentConfigs)
+    .where(eq(agentConfigs.isActive, true))
+  const rows = buildWorkforceMaterializationRows(input, { activeAgents })
 
   await db.transaction(async (tx) => {
     await tx
@@ -290,7 +381,19 @@ export async function materializeWorkforceFromArchitectArtifact(
       await tx
         .insert(agentHarnesses)
         .values(rows.harnesses)
-        .onConflictDoNothing({ target: agentHarnesses.slug })
+        .onConflictDoUpdate({
+          target: agentHarnesses.slug,
+          set: {
+            category: sql`excluded.category`,
+            description: sql`excluded.description`,
+            displayName: sql`excluded.display_name`,
+            isActive: true,
+            metadata: sql`excluded.metadata`,
+            role: sql`excluded.role`,
+            toolPolicy: sql`excluded.tool_policy`,
+            updatedAt: new Date(),
+          },
+        })
 
       const harnessRows = await tx
         .select({ id: agentHarnesses.id, slug: agentHarnesses.slug })

@@ -6,6 +6,7 @@ import { db } from '@/db'
 import { workforceAgents, workforces } from '@/db/schema'
 import { getSession } from '@/lib/session'
 import { exportWorkforcesToWorkspace } from '@/lib/workforce-exports'
+import { normalizeDisplayName, normalizeDisplayNameForUniqueness } from '@/lib/naming'
 
 const idSchema = z.string().uuid()
 const slugSchema = z
@@ -24,12 +25,24 @@ const memberSchema = z.object({
 
 const updateWorkforceSchema = z.object({
   slug: slugSchema.optional(),
+  name: z.string().trim().min(1).max(120).optional(),
   displayName: z.string().trim().min(1).max(120).optional(),
   description: z.string().trim().max(500).optional(),
   isDefault: z.boolean().optional(),
   isActive: z.boolean().optional(),
   members: z.array(memberSchema).optional(),
 })
+
+async function hasDuplicateDisplayName(displayName: string, currentWorkforceId: string): Promise<boolean> {
+  const normalized = normalizeDisplayNameForUniqueness(displayName)
+  const rows = await db
+    .select({ id: workforces.id, displayName: workforces.displayName })
+    .from(workforces)
+  return rows.some((row) =>
+    row.id !== currentWorkforceId &&
+    normalizeDisplayNameForUniqueness(row.displayName) === normalized
+  )
+}
 
 async function exportWorkforceMirror(): Promise<string | null> {
   try {
@@ -77,6 +90,12 @@ export async function PUT(
     if (!existing) {
       return NextResponse.json({ error: 'Workforce not found' }, { status: 404 })
     }
+    const displayName = data.name !== undefined || data.displayName !== undefined
+      ? normalizeDisplayName(data.name ?? data.displayName ?? '')
+      : undefined
+    if (displayName !== undefined && await hasDuplicateDisplayName(displayName, id)) {
+      return NextResponse.json({ error: 'Workforce name already exists' }, { status: 409 })
+    }
 
     await db.transaction(async (tx) => {
       if (data.isDefault === true) {
@@ -87,7 +106,7 @@ export async function PUT(
         .update(workforces)
         .set({
           ...(data.slug !== undefined && { slug: data.slug }),
-          ...(data.displayName !== undefined && { displayName: data.displayName }),
+          ...(displayName !== undefined && { displayName }),
           ...(data.description !== undefined && { description: data.description }),
           ...(data.isDefault !== undefined && { isDefault: data.isDefault }),
           ...(data.isActive !== undefined && { isActive: data.isActive }),
@@ -125,6 +144,9 @@ export async function PUT(
       'code' in err &&
       (err as { code?: string }).code === '23505'
     ) {
+      if ('constraint' in err && (err as { constraint?: string }).constraint === 'workforces_display_name_normalized_idx') {
+        return NextResponse.json({ error: 'Workforce name already exists' }, { status: 409 })
+      }
       return NextResponse.json({ error: 'Workforce slug or membership already exists' }, { status: 409 })
     }
 

@@ -25,6 +25,7 @@ let tempRoot = ''
 function context(overrides: Partial<WorkPackageExecutionContext> = {}): WorkPackageExecutionContext {
   return {
     agentConfig: null,
+    validatedProjectRoot: tempRoot,
     model: { provider: 'test', modelId: 'test-model' } as never,
     modelIdUsed: 'test-model',
     project: {
@@ -172,10 +173,14 @@ describe('executeWorkPackage', () => {
             path: 'package.json',
             content: JSON.stringify({
               scripts: {
-                build: 'node -e "console.log(\\"build ok\\")"',
+                build: 'node build-check.js',
                 test: 'node --test',
               },
             }),
+          },
+          {
+            path: 'build-check.js',
+            content: 'console.log("build ok");\n',
           },
           {
             path: 'index.test.js',
@@ -196,6 +201,58 @@ describe('executeWorkPackage', () => {
       repositoryWrites: true,
       sandboxPath: sandbox,
     })
+  })
+
+  it('does not execute model-generated npm scripts while validating commands', async () => {
+    const outsideFile = path.join(tempRoot, 'outside.txt')
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Attempted script execution.',
+        files: [
+          {
+            path: 'package.json',
+            content: JSON.stringify({
+              scripts: {
+                test: `node -e "require('fs').writeFileSync('${outsideFile}', 'pwned')"`,
+              },
+            }),
+          },
+          {
+            path: 'index.test.js',
+            content: 'import test from "node:test"; import assert from "node:assert/strict"; test("ok", () => assert.equal(1, 1));\n',
+          },
+        ],
+        commands: [['npm', 'test']],
+      }),
+    })
+
+    await expect(executeWorkPackage(context({
+      task: {
+        ...context().task,
+        prompt: 'Build a tiny task tracker web app with tests.',
+      },
+    }))).rejects.toThrow(/unsafe shell behavior/i)
+    await expect(fs.stat(outsideFile)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('rejects symlinked execution sandbox roots before writing generated files', async () => {
+    const outsideRoot = path.join(tempRoot, 'outside-sandbox')
+    const sandboxParent = path.join(tempRoot, '.forge', 'task-runs', 'task-1')
+    await fs.mkdir(outsideRoot, { recursive: true })
+    await fs.mkdir(sandboxParent, { recursive: true })
+    await fs.symlink(outsideRoot, path.join(sandboxParent, 'pkg-1'))
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Attempt symlink write.',
+        files: [{ path: 'package.json', content: '{}' }],
+        commands: [],
+      }),
+    })
+
+    await expect(executeWorkPackage(context())).rejects.toThrow(/sandbox root is a symlink/i)
+    await expect(fs.readdir(outsideRoot)).resolves.toEqual([])
   })
 
   it('rejects file paths that escape the sandbox', async () => {

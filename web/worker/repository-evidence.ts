@@ -227,9 +227,10 @@ export function isRepositoryAffectingWorkPackage(workPackage: RepositoryEvidence
 export async function buildRepositoryExecutionContext(input: {
   project: RepositoryEvidenceProject
   task: RepositoryEvidenceTask
+  validatedProjectRoot?: string | null
   workPackage: RepositoryEvidenceWorkPackage
 }): Promise<RepositoryExecutionContext> {
-  const localPath = input.project.localPath?.trim() || null
+  const localPath = input.validatedProjectRoot?.trim() || input.project.localPath?.trim() || null
   if (!localPath) {
     return blocked(null, 'Project local path is required before repository evidence can be collected.')
   }

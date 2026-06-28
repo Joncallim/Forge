@@ -27,6 +27,7 @@ import {
   writeWorkspaceFileAtomically,
 } from '../lib/agent-prompts'
 import { exportWorkforcesToWorkspace } from '../lib/workforce-exports'
+import { displayNameForSlug } from '../lib/naming'
 
 const REPO_ROOT = path.resolve(__dirname, '../..')
 const CODEX_AGENTS_DIR = path.join(REPO_ROOT, '.codex/agents')
@@ -246,14 +247,6 @@ export function parseCodexAgentFile(filePath: string): ParsedAgent | null {
   }
 }
 
-function displayNameForSlug(slug: string): string {
-  return slug
-    .split(/[-_]/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(' ')
-}
-
 function repoDefaultPromptFiles(): string[] {
   if (!fs.existsSync(CODEX_AGENTS_DIR)) return []
   return fs
@@ -395,7 +388,7 @@ export async function seedAgentConfigs(): Promise<void> {
       })
       .returning({ id: agentConfigs.id })
 
-    if (row?.id && isRepositoryDefault) seededAgentIds.push(row.id)
+    if (row?.id && isRepositoryDefault && agent.agentType !== 'mcp-installer') seededAgentIds.push(row.id)
 
     const modelInfo = agent.model ? ` (model: ${agent.model})` : ''
     const seedType = isRepositoryDefault ? 'system' : 'workspace'
