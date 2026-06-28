@@ -137,20 +137,14 @@ function blocked(
   }
 }
 
-async function git(
-  cwd: string,
-  argv: string[],
-  maxBytes = MAX_OUTPUT_BYTES,
-  options: { trimOutput?: boolean } = {},
-): Promise<string> {
+async function git(cwd: string, argv: string[], maxBytes = MAX_OUTPUT_BYTES): Promise<string> {
   const result = await execFile('git', argv, {
     cwd,
     env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
     maxBuffer: maxBytes * 2,
     timeout: 30_000,
   })
-  const output = options.trimOutput === false ? result.stdout : result.stdout.trim()
-  return truncate(output, maxBytes)
+  return truncate(result.stdout.trim(), maxBytes)
 }
 
 async function gitRaw(cwd: string, argv: string[], maxBuffer = MAX_STATUS_BUFFER_BYTES): Promise<string> {
