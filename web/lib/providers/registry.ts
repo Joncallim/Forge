@@ -41,6 +41,10 @@ export type ProviderResult = {
   config: ProviderConfig
 }
 
+export type GetModelOptions = {
+  cwd?: string | null
+}
+
 // ---------------------------------------------------------------------------
 // Internal: build a provider factory from a DB row
 // ---------------------------------------------------------------------------
@@ -227,11 +231,14 @@ export async function getProvider(configId: string): Promise<ProviderResult | nu
 // getModel
 // ---------------------------------------------------------------------------
 
-export async function getModel(configId: string): Promise<LanguageModel | null> {
+export async function getModel(configId: string, options: GetModelOptions = {}): Promise<LanguageModel | null> {
   const result = await getProvider(configId)
   if (!result) return null
 
   const { provider, config } = result
+  if (config.providerType === 'acp') {
+    return new AcpLanguageModel(config.modelId, { cwd: options.cwd })
+  }
   if (config.providerType === 'lmstudio') {
     await ensureLmStudioModelLoaded(config)
   }

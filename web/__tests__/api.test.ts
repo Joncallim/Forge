@@ -2433,7 +2433,7 @@ describe('POST /api/providers/discover-local — auth guard', () => {
       expect(body.found).toBeGreaterThanOrEqual(1)
       expect(body.capabilityGroups).toEqual(expect.arrayContaining([
         expect.objectContaining({
-          id: 'main-generation',
+          id: 'local-chat-models',
           candidates: expect.arrayContaining([
             expect.objectContaining({
               modelId: 'gemma-local',
@@ -3048,6 +3048,7 @@ describe('dynamic agents and workforces', () => {
 
   it('creates an arbitrary safe agent slug instead of requiring a fixed role', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([]))
     mockDbInsert.mockReturnValue(chain([{
       id: 'agent-1',
       agentType: 'security-red-team',
@@ -3097,6 +3098,74 @@ describe('dynamic agents and workforces', () => {
     }
   })
 
+  it('creates a new agent from name only and generates the slug and prompt internally', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([]))
+    mockDbInsert.mockReturnValue(chain([{
+      id: 'agent-name-only',
+      agentType: 'security-red-team',
+      displayName: 'Security Red Team',
+      description: '',
+      isSystem: false,
+      isActive: true,
+      providerConfigId: null,
+      systemPrompt: 'You are the Security Red Team specialist agent for Forge.',
+      frontmatterOverrides: null,
+      updatedAt: new Date(),
+      updatedBy: FAKE_SESSION.userId,
+    }]))
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-agent-name-only-'))
+
+    try {
+      process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+
+      const { POST } = await import('@/app/api/agents/route')
+      const res = await POST(authRequest('/api/agents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Security Red Team' }),
+      }) as never)
+
+      expect(res.status).toBe(201)
+      const body = await res.json()
+      expect(body.agent.agentType).toBe('security-red-team')
+      await expect(
+        fs.readFile(path.join(workspaceRoot, 'prompts', 'agents', 'security-red-team.toml'), 'utf-8'),
+      ).resolves.toContain('Security Red Team specialist')
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects duplicate agent names after trimming, whitespace collapse, and case folding', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{
+      agentType: 'security-red-team',
+      displayName: ' Security   Red Team ',
+    }]))
+
+    const { POST } = await import('@/app/api/agents/route')
+    const req = authRequest('/api/agents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'security red team',
+        systemPrompt: 'Review changes adversarially.',
+      }),
+    })
+
+    const res = await POST(req as never)
+    expect(res.status).toBe(409)
+    expect((await res.json()).error).toMatch(/agent name/i)
+    expect(mockDbInsert).not.toHaveBeenCalled()
+  })
+
   it('returns workforce member assignment details without exposing system prompts', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect
@@ -3141,6 +3210,7 @@ describe('dynamic agents and workforces', () => {
 
   it('removes the inserted agent row if prompt file creation fails', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([]))
     mockDbInsert.mockReturnValue(chain([{
       id: 'agent-rollback',
       agentType: 'security-red-team',
@@ -3263,6 +3333,7 @@ describe('dynamic agents and workforces', () => {
       .mockReturnValueOnce(chain([{ id: 'workforce-1' }]))
       .mockReturnValueOnce(chain([]))
     mockDbSelect
+      .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([{
         id: 'workforce-1',
         slug: 'release-squad',
@@ -3328,11 +3399,34 @@ describe('dynamic agents and workforces', () => {
     }
   })
 
+  it('rejects duplicate workforce names after trimming, whitespace collapse, and case folding', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{
+      slug: 'release-squad',
+      displayName: ' Release   Squad ',
+    }]))
+
+    const { POST } = await import('@/app/api/workforces/route')
+    const req = authRequest('/api/workforces', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'release squad',
+      }),
+    })
+
+    const res = await POST(req as never)
+    expect(res.status).toBe(409)
+    expect((await res.json()).error).toMatch(/workforce name/i)
+    expect(mockDbTransaction).not.toHaveBeenCalled()
+  })
+
   it('returns a warning instead of failing when workforce file export fails after commit', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbInsert
       .mockReturnValueOnce(chain([{ id: 'workforce-1' }]))
     mockDbSelect
+      .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([{
         id: 'workforce-1',
         slug: 'release-squad',

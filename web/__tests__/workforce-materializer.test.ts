@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
 import type { PreparedArchitectArtifact } from '@/worker/architect-artifact'
 import {
   buildWorkforceMaterializationRows,
@@ -173,6 +175,12 @@ describe('workforce materializer', () => {
         }),
       ],
     })
+    expect(rows.workPackages[0].requiredCapabilities).toEqual({
+      schemaVersion: 1,
+      required: ['database-migration', 'business-logic'],
+      optional: ['unit-testing'],
+      excluded: [],
+    })
     expect(rows.dependencies).toEqual([
       expect.objectContaining({
         workPackageId: rows.workPackages[1].id,
@@ -211,6 +219,148 @@ describe('workforce materializer', () => {
     )
 
     expect(rows.workPackages.find((pkg) => pkg.assignedRole === 'backend')?.reviewRequirement).toBe('qa_only')
+  })
+
+  it('resolves Architect display-name roles to active canonical agent slugs', () => {
+    const rows = buildWorkforceMaterializationRows(
+      {
+        taskId: 'task-1',
+        architectRunId: 'run-1',
+        artifactId: 'artifact-1',
+        prepared: {
+          ...prepared,
+          agents: [
+            {
+              role: 'Server Team',
+              tasks: 1,
+              summary: 'Implement APIs',
+              steps: ['Add database tables'],
+            },
+          ],
+          mcpExecutionDesign: {
+            ...prepared.mcpExecutionDesign,
+            proposed: {
+              ...prepared.mcpExecutionDesign.proposed!,
+              promptOverlays: {
+                'Server Team': 'Use GitHub read tools only.',
+              },
+              requirements: [
+                {
+                  ...prepared.mcpExecutionDesign.proposed!.requirements[0],
+                  assignment: {
+                    type: 'agent',
+                    targetAgents: ['Server Team'],
+                    targetId: null,
+                  },
+                  agentPermissions: {
+                    'Server Team': ['github.issues.read'],
+                  },
+                },
+              ],
+              mcpAwareSubtasks: [
+                {
+                  ...prepared.mcpExecutionDesign.proposed!.mcpAwareSubtasks[0],
+                  agent: 'Server Team',
+                },
+              ],
+            },
+            grantDecisions: {
+              ...prepared.mcpExecutionDesign.grantDecisions,
+              decisions: [
+                {
+                  ...prepared.mcpExecutionDesign.grantDecisions.decisions[0],
+                  agent: 'Server Team',
+                },
+              ],
+            },
+          },
+        },
+      },
+      {
+        activeAgents: [
+          { agentType: 'backend', displayName: 'Server Team' },
+          { agentType: 'qa', displayName: 'QA' },
+        ],
+        idFactory: deterministicIds(),
+      },
+    )
+
+    expect(rows.workPackages).toHaveLength(1)
+    expect(rows.workPackages[0].assignedRole).toBe('backend')
+    expect(rows.harnesses[0].slug).toBe('backend')
+    expect(rows.harnesses[0].toolPolicy).toMatchObject({
+      mcpGrants: [expect.objectContaining({ mcpId: 'github' })],
+    })
+    expect(rows.workPackages[0].metadata).toMatchObject({
+      promptOverlay: 'Use GitHub read tools only.',
+      mcpAwareSubtasks: [expect.objectContaining({ id: 'inspect-issue' })],
+    })
+    expect(rows.workPackages[0].mcpRequirements).toEqual([
+      expect.objectContaining({
+        mcpId: 'github',
+        permissions: ['github.issues.read'],
+      }),
+    ])
+  })
+
+  it('keeps unknown Architect roles visible as blocked packages', () => {
+    const rows = buildWorkforceMaterializationRows(
+      {
+        taskId: 'task-1',
+        architectRunId: 'run-1',
+        artifactId: 'artifact-1',
+        prepared: {
+          ...prepared,
+          agents: [
+            {
+              role: 'New Specialist',
+              tasks: 1,
+              summary: 'Do specialized work',
+              steps: ['Investigate the edge case'],
+            },
+          ],
+        },
+      },
+      {
+        activeAgents: [{ agentType: 'backend', displayName: 'Backend' }],
+        idFactory: deterministicIds(),
+      },
+    )
+
+    expect(rows.harnesses).toHaveLength(0)
+    expect(rows.workPackages).toEqual([
+      expect.objectContaining({
+        assignedRole: 'new-specialist',
+        blockedReason: expect.stringMatching(/no active configured agent/i),
+        status: 'failed',
+        metadata: expect.objectContaining({
+          requiresAgentConfiguration: true,
+          unresolvedAgentRole: 'New Specialist',
+        }),
+      }),
+    ])
+  })
+
+  it('updates materializer-owned harness fields when a canonical harness already exists', () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), 'worker', 'workforce-materializer.ts'),
+      'utf8',
+    )
+
+    expect(source).toContain('.onConflictDoUpdate({')
+    expect(source).toContain('target: agentHarnesses.slug')
+    expect(source).toContain('toolPolicy: sql`excluded.tool_policy`')
+    expect(source).toContain('metadata: sql`excluded.metadata`')
+  })
+
+  it('clears stale unresolved-role packages when a plan is materialized again', () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), 'worker', 'workforce-materializer.ts'),
+      'utf8',
+    )
+
+    expect(source).toContain("metadata}->>'requiresAgentConfiguration' = 'true'")
+    expect(source).toContain("eq(workPackages.status, 'failed')")
   })
 
   it('keeps the materializer feature flag easy to disable', () => {

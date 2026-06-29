@@ -486,16 +486,17 @@ export default function ProjectsPage() {
                   </label>
                   <input
                     id="github-repository"
-                    name="github-repository"
+                    name="forge-project-repository"
                     type="text"
                     required
                     inputMode="text"
-                    autoComplete="off"
+                    autoComplete="new-password"
                     autoCorrect="off"
                     autoCapitalize="none"
                     spellCheck={false}
                     data-1p-ignore="true"
                     data-lpignore="true"
+                    data-bwignore="true"
                     data-form-type="other"
                     value={formRepo}
                     onChange={(e) => setFormRepo(e.target.value)}
@@ -718,7 +719,7 @@ export default function ProjectsPage() {
                           aria-label="Filter repositories"
                         />
                       )}
-                      <Select value={cloneRepo || undefined} onValueChange={(v) => v && setCloneRepo(v)}>
+                      <Select value={cloneRepo} onValueChange={(v) => setCloneRepo(v ?? '')}>
                         <SelectTrigger id="clone-repository" className="w-full" aria-required="true">
                           <SelectValue placeholder={cloneRepos.length > 0 ? 'Choose a repository' : 'No repositories found'} />
                         </SelectTrigger>

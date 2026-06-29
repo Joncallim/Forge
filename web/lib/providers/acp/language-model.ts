@@ -94,6 +94,8 @@ const ACP_FAILURE_PATTERNS = [
   /\bout of (tokens|credits)\b/i,
   /\bbilling\b/i,
   /\b429\b/,
+  /falling back from websockets to https transport/i,
+  /request timed out/i,
 ]
 
 const ACP_NO_OP_PATTERNS = [
@@ -136,18 +138,27 @@ export class AcpLanguageModel implements LanguageModelV3 {
   private readonly selectedModel: string | null
   private readonly supportsModelSelection: boolean
   private readonly modelSelection: AcpModelSelectionSupport | null
+  private readonly cwd: string | null
 
-  constructor(modelId: string) {
+  constructor(modelId: string, options: { cwd?: string | null } = {}) {
     const parsed = parseAcpProviderModelId(modelId)
     this.agentId = parsed.agentId
     this.selectedModel = parsed.selectedModel
     this.supportsModelSelection = parsed.supportsModelSelection
     this.modelSelection = getAcpModelSelection(modelId)
     this.modelId = modelId
+    this.cwd = options.cwd?.trim() || null
+  }
+
+  private sessionCwd(): string {
+    if (!this.cwd) {
+      throw new Error('ACP providers require a configured project local folder. Link or clone the GitHub repository locally before running this task with ACP.')
+    }
+    return this.cwd
   }
 
   async doGenerate(options: LanguageModelV3CallOptions) {
-    const client = await AcpSessionClient.start(this.agentId, process.cwd(), {
+    const client = await AcpSessionClient.start(this.agentId, this.sessionCwd(), {
       selectedModel: this.supportsModelSelection ? this.selectedModel : null,
       modelSelection: this.modelSelection,
     })
@@ -170,7 +181,7 @@ export class AcpLanguageModel implements LanguageModelV3 {
   }
 
   async doStream(options: LanguageModelV3CallOptions) {
-    const client = await AcpSessionClient.start(this.agentId, process.cwd(), {
+    const client = await AcpSessionClient.start(this.agentId, this.sessionCwd(), {
       selectedModel: this.supportsModelSelection ? this.selectedModel : null,
       modelSelection: this.modelSelection,
     })

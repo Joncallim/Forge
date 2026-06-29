@@ -7,6 +7,7 @@ import { eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 import { syncAgentPromptFileToWorkspace } from '@/lib/agent-prompts'
+import { normalizeDisplayNameForUniqueness } from '@/lib/naming'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -28,6 +29,17 @@ const updateAgentSchema = z.object({
   systemPrompt: z.string().min(1).optional(),
   frontmatterOverrides: z.record(z.unknown()).optional(),
 })
+
+async function hasDuplicateDisplayName(displayName: string, currentAgentType: string): Promise<boolean> {
+  const normalized = normalizeDisplayNameForUniqueness(displayName)
+  const rows = await db
+    .select({ agentType: agentConfigs.agentType, displayName: agentConfigs.displayName })
+    .from(agentConfigs)
+  return rows.some((row) =>
+    row.agentType !== currentAgentType &&
+    normalizeDisplayNameForUniqueness(row.displayName) === normalized
+  )
+}
 
 // ---------------------------------------------------------------------------
 // Disk sync helper — writes the editable workspace TOML prompt copy.
@@ -132,6 +144,10 @@ export async function PUT(
       return NextResponse.json({ error: 'Agent config not found' }, { status: 404 })
     }
 
+    if (data.displayName !== undefined && await hasDuplicateDisplayName(data.displayName, type)) {
+      return NextResponse.json({ error: 'Agent name already exists' }, { status: 409 })
+    }
+
     if (data.systemPrompt !== undefined) {
       try {
         await syncAgentFileToDisk(type, data.systemPrompt)
@@ -171,6 +187,16 @@ export async function PUT(
             restoreErr,
           })
         })
+      }
+      if (
+        typeof err === 'object' &&
+        err !== null &&
+        'code' in err &&
+        (err as { code?: string }).code === '23505' &&
+        'constraint' in err &&
+        (err as { constraint?: string }).constraint === 'agent_configs_display_name_normalized_idx'
+      ) {
+        return NextResponse.json({ error: 'Agent name already exists' }, { status: 409 })
       }
       throw err
     }

@@ -32,6 +32,8 @@ const CODEX_CLI_MODEL_SELECTION: AcpModelSelectionSupport = {
   optionCategoryCandidates: ['model'],
   options: [
     { id: 'gpt-5.5', label: 'GPT-5.5' },
+    { id: 'gpt-5.4', label: 'GPT-5.4' },
+    { id: 'gpt-5.4-mini', label: 'GPT-5.4 mini' },
     { id: 'gpt-5.3-codex-spark', label: 'GPT-5.3 Codex Spark' },
   ],
   helpText: 'Forge passes this via the ACP session model config option. Exact availability follows the local Codex CLI account/runtime.',
@@ -42,11 +44,11 @@ const CLAUDE_CODE_MODEL_SELECTION: AcpModelSelectionSupport = {
   configIdCandidates: ['model', 'model_id', 'claude_model'],
   optionCategoryCandidates: ['model'],
   options: [
-    { id: 'opus', label: 'Opus' },
-    { id: 'sonnet', label: 'Sonnet' },
-    { id: 'haiku', label: 'Haiku' },
+    { id: 'opus', label: 'Opus alias' },
+    { id: 'sonnet', label: 'Sonnet alias' },
+    { id: 'haiku', label: 'Haiku alias' },
   ],
-  helpText: 'Forge passes this via the ACP session model config option. Claude Code aliases resolve inside the local Claude runtime.',
+  helpText: 'Forge passes this via the ACP session model config option. Claude Code aliases resolve inside the local Claude runtime; pin exact versions in Claude Code when your runtime supports it.',
 }
 
 export const ACP_AGENTS: AcpAgentCatalogEntry[] = [

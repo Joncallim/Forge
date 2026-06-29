@@ -13,4 +13,14 @@ describe('MarkdownView', () => {
     expect(html).toContain('QA → Reviewer')
     expect(html).not.toContain('$\\rightarrow$')
   })
+
+  it('renders unsafe markdown links as inert text', () => {
+    const html = renderToStaticMarkup(createElement(MarkdownView, {
+      content: '[review](javascript:alert(1)) [ok](https://example.com)',
+    }))
+
+    expect(html).toContain('review')
+    expect(html).not.toContain('javascript:alert')
+    expect(html).toContain('href="https://example.com"')
+  })
 })

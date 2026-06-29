@@ -306,20 +306,20 @@ function AgentEditor({
   }
 
   async function handleSave() {
-    const agentType = draft.agentType.trim()
     const displayName = draft.displayName.trim()
+    const agentType = isNew ? slugify(displayName) : draft.agentType.trim()
     const systemPrompt = draft.systemPrompt.trim()
 
     setError(null)
-    if (!agentType) {
-      setError('Agent slug is required.')
-      return
-    }
     if (!displayName) {
       setError('Display name is required.')
       return
     }
-    if (!systemPrompt) {
+    if (!agentType) {
+      setError('Enter a name that includes at least one letter or number.')
+      return
+    }
+    if (!isNew && !systemPrompt) {
       setError('System prompt cannot be empty.')
       return
     }
@@ -331,11 +331,11 @@ function AgentEditor({
         : draft.providerConfigId || null
 
       const payload = {
-        agentType,
+        ...(isNew ? {} : { agentType }),
         displayName,
         description: draft.description.trim(),
         providerConfigId,
-        systemPrompt,
+        ...(systemPrompt ? { systemPrompt } : {}),
         isActive: draft.isActive,
       }
 
@@ -384,38 +384,25 @@ function AgentEditor({
         </SheetHeader>
 
         <div className="flex flex-1 flex-col gap-5 overflow-y-auto px-4 py-2">
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="flex flex-col gap-1.5">
-              <label htmlFor="agent-display-name" className="text-sm font-medium text-foreground">
-                Display name
-              </label>
-              <input
-                id="agent-display-name"
-                name="forge-agent-display-name"
-                value={draft.displayName}
-                onChange={(e) => setDraftValue('displayName', e.target.value)}
-                autoComplete="off"
-                autoCorrect="off"
-                autoCapitalize="none"
-                spellCheck={false}
-                data-1p-ignore="true"
-                data-lpignore="true"
-                data-form-type="other"
-                className="rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-              />
-            </div>
-            <div className="flex flex-col gap-1.5">
-              <label htmlFor="agent-slug" className="text-sm font-medium text-foreground">
-                Agent slug
-              </label>
-              <input
-                id="agent-slug"
-                value={draft.agentType}
-                disabled={!isNew}
-                onChange={(e) => setDraftValue('agentType', slugify(e.target.value))}
-                className="rounded-lg border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-60"
-              />
-            </div>
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="agent-display-name" className="text-sm font-medium text-foreground">
+              Name
+            </label>
+            <input
+              id="agent-display-name"
+              name="forge-agent-name"
+              value={draft.displayName}
+              onChange={(e) => setDraftValue('displayName', e.target.value)}
+              autoComplete="new-password"
+              autoCorrect="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              data-1p-ignore="true"
+              data-lpignore="true"
+              data-bwignore="true"
+              data-form-type="other"
+              className="rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+            />
           </div>
 
           <div className="flex flex-col gap-1.5">
@@ -701,14 +688,14 @@ function WorkforceEditor({
 
   async function handleSave() {
     const displayName = draft.displayName.trim()
-    const slug = draft.slug.trim()
+    const slug = draft.slug.trim() || slugify(displayName)
     setError(null)
     if (!displayName) {
       setError('Display name is required.')
       return
     }
     if (!slug) {
-      setError('Slug is required.')
+      setError('Enter a name that includes at least one letter or number.')
       return
     }
 
@@ -725,7 +712,7 @@ function WorkforceEditor({
         method: isNew ? 'POST' : 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          slug,
+          ...(isNew ? {} : { slug }),
           displayName,
           description: draft.description.trim(),
           isDefault: draft.isDefault,
@@ -773,37 +760,24 @@ function WorkforceEditor({
         </SheetHeader>
 
         <div className="flex flex-1 flex-col gap-5 overflow-y-auto px-4 py-2">
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="flex flex-col gap-1.5">
-              <label htmlFor="workforce-display-name" className="text-sm font-medium text-foreground">
-                Display name
-              </label>
-              <input
-                id="workforce-display-name"
-                name="forge-workforce-display-name"
-                value={draft.displayName}
-                onChange={(e) => setDraftValue('displayName', e.target.value)}
-                autoComplete="off"
-                autoCorrect="off"
-                autoCapitalize="none"
-                spellCheck={false}
-                data-1p-ignore="true"
-                data-lpignore="true"
-                data-form-type="other"
-                className="rounded-lg border border-input bg-background px-3 py-2 text-sm"
-              />
-            </div>
-            <div className="flex flex-col gap-1.5">
-              <label htmlFor="workforce-slug" className="text-sm font-medium text-foreground">
-                Slug
-              </label>
-              <input
-                id="workforce-slug"
-                value={draft.slug}
-                onChange={(e) => setDraftValue('slug', slugify(e.target.value))}
-                className="rounded-lg border border-input bg-background px-3 py-2 font-mono text-sm"
-              />
-            </div>
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="workforce-display-name" className="text-sm font-medium text-foreground">
+              Name
+            </label>
+            <input
+              id="workforce-display-name"
+              name="forge-workforce-name"
+              value={draft.displayName}
+              onChange={(e) => setDraftValue('displayName', e.target.value)}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              data-1p-ignore="true"
+              data-lpignore="true"
+              data-form-type="other"
+              className="rounded-lg border border-input bg-background px-3 py-2 text-sm"
+            />
           </div>
 
           <div className="flex flex-col gap-1.5">
@@ -862,9 +836,6 @@ function WorkforceEditor({
                         <span className="min-w-0 flex-1">
                           <span className="block font-medium text-foreground">
                             {agent.displayName || titleize(agent.agentType)}
-                          </span>
-                          <span className="block truncate font-mono text-xs text-muted-foreground">
-                            {agent.agentType}
                           </span>
                         </span>
                       </label>
@@ -1056,7 +1027,6 @@ export default function AgentsPage() {
                             <p className="font-medium text-foreground">
                               {agent.displayName || titleize(agent.agentType)}
                             </p>
-                            <p className="break-all font-mono text-xs text-muted-foreground">{agent.agentType}</p>
                             {agent.description && (
                               <p className="mt-1 max-w-xl break-words text-xs text-muted-foreground">
                                 {agent.description}
@@ -1137,7 +1107,6 @@ export default function AgentsPage() {
                               </span>
                             )}
                           </div>
-                          <p className="break-all font-mono text-xs text-muted-foreground">{workforce.slug}</p>
                           {workforce.description && (
                             <p className="mt-2 break-words text-sm text-muted-foreground">{workforce.description}</p>
                           )}
@@ -1167,7 +1136,6 @@ export default function AgentsPage() {
                               <li key={member.id} className="rounded-md border border-border bg-muted/20 px-3 py-2">
                                 <div className="flex flex-wrap items-center justify-between gap-2">
                                   <span className="text-sm font-medium text-foreground">{roleName}</span>
-                                  <span className="font-mono text-xs text-muted-foreground">{member.agentType}</span>
                                 </div>
                                 {member.description && (
                                   <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{member.description}</p>

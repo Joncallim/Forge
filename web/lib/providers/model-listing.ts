@@ -94,10 +94,6 @@ export function extractLmStudioNativeModelIds(data: unknown): string[] | null {
   return extractLmStudioNativeModelListing(data)?.models ?? null
 }
 
-export function extractLmStudioNativeLoadedModelIds(data: unknown): string[] | null {
-  return extractLmStudioNativeModelListing(data)?.loadedModels ?? null
-}
-
 function normalizeRuntimeListing(data: unknown): { models: string[]; loadedModels: string[] } {
   const models = extractOpenAiCompatibleModelIds(data)
   return { models, loadedModels: models }

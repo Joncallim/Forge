@@ -16,6 +16,7 @@ vi.mock('@/lib/mcps/manager', () => ({ getProjectMcpOverview: vi.fn() }))
 
 import { buildArchitectPrompt } from '@/worker/orchestrator'
 import type { ArchitectResumeCheckpoint } from '@/worker/checkpoints'
+import type { ProjectMcpOverview } from '@/lib/mcps/types'
 
 const task = {
   id: 'task-1',
@@ -55,6 +56,49 @@ const checkpoint: ArchitectResumeCheckpoint = {
   maxBytes: 120,
   truncated: true,
   loadedAt: new Date('2026-06-24T00:05:00.000Z'),
+}
+
+const mcpOverview: ProjectMcpOverview = {
+  projectId: 'project-1',
+  config: { profile: 'default', requiredMcps: ['filesystem', 'github'], overrides: {} },
+  catalog: [
+    {
+      id: 'filesystem',
+      displayName: 'Filesystem',
+      description: 'Project file access',
+      recommended: true,
+      requiresAuth: false,
+    },
+    {
+      id: 'github',
+      displayName: 'GitHub',
+      description: 'Issue and repository access',
+      recommended: true,
+      requiresAuth: true,
+    },
+  ],
+  mcpsRoot: '/tmp/Forge/mcps',
+  statuses: [
+    {
+      mcpId: 'filesystem',
+      displayName: 'Filesystem',
+      description: 'Project file access',
+      installPath: '/tmp/Forge/mcps/filesystem',
+      installState: 'installed',
+      status: 'healthy',
+      enabled: true,
+      error: null,
+      checkedAt: '2026-06-24T00:00:00.000Z',
+    },
+  ],
+  summary: {
+    label: 'MCPs: ready',
+    status: 'healthy',
+    missing: 0,
+    authRequired: 0,
+    unhealthy: 0,
+    disabled: 0,
+  },
 }
 
 describe('buildArchitectPrompt checkpoint resume context', () => {
@@ -110,5 +154,54 @@ describe('buildArchitectPrompt checkpoint resume context', () => {
     expect(prompt).toContain('"truncated":true')
     expect(prompt).toContain('"originalBytes":200')
     expect(prompt).toContain('"markdown":"# Forge Checkpoint\\n\\n## Failure\\nPrevious run failed."')
+  })
+
+  it('includes structured available agents and MCP resources for Architect routing', () => {
+    const prompt = buildArchitectPrompt(
+      task,
+      project,
+      'Specialist context',
+      'Web context',
+      [],
+      null,
+      null,
+      [
+        {
+          id: 'agent-backend',
+          agentType: 'backend',
+          displayName: 'Backend',
+          description: 'Server work',
+          isSystem: true,
+          isActive: true,
+          providerConfigId: null,
+          systemPrompt: 'Implement backend work.',
+          frontmatterOverrides: null,
+          updatedAt: new Date('2026-06-24T00:00:00.000Z'),
+          updatedBy: null,
+        },
+        {
+          id: 'agent-mcp',
+          agentType: 'mcp-installer',
+          displayName: 'MCP Installer',
+          description: 'Install MCPs',
+          isSystem: true,
+          isActive: true,
+          providerConfigId: null,
+          systemPrompt: 'Install MCPs.',
+          frontmatterOverrides: null,
+          updatedAt: new Date('2026-06-24T00:00:00.000Z'),
+          updatedBy: null,
+        },
+      ],
+      null,
+      mcpOverview,
+    )
+
+    expect(prompt).toContain('Configured agent catalog JSON:')
+    expect(prompt).toContain('"slug":"backend"')
+    expect(prompt).toContain('"slug":"mcp-installer"')
+    expect(prompt).toContain('Available MCPs and project resources:')
+    expect(prompt).toContain('"mcpId":"filesystem"')
+    expect(prompt).toContain('Do not invent connected resources')
   })
 })

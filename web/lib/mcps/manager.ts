@@ -12,6 +12,7 @@ import {
 } from '@/db/schema'
 import { writeWorkspaceFileAtomically } from '@/lib/agent-prompts'
 import { getGitHubStatus } from '@/lib/github'
+import { assertProjectLocalPathForExecution } from '@/lib/projects/local-path'
 import {
   assertWorkspaceManagedPath,
   displayPathForWorkspacePath,
@@ -275,12 +276,12 @@ async function classifyProjectMcp(
       error = 'Project has no local path for filesystem access.'
     } else {
       try {
-        const stat = await fs.stat(project.localPath)
-        status = stat.isDirectory() ? 'healthy' : 'configuration_required'
-        error = stat.isDirectory() ? null : 'Project local path is not a directory.'
-      } catch {
+        await assertProjectLocalPathForExecution(project)
+        status = 'healthy'
+        error = null
+      } catch (err) {
         status = 'configuration_required'
-        error = 'Project local path is missing.'
+        error = err instanceof Error ? err.message : 'Project local path is not available.'
       }
     }
   } else if (mcpId === 'github') {

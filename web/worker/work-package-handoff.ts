@@ -571,6 +571,7 @@ async function executeReadyWorkPackage(
       repositoryContext = await buildRepositoryExecutionContext({
         project: context.project,
         task: context.task,
+        validatedProjectRoot: context.validatedProjectRoot,
         workPackage: context.workPackage,
       })
 

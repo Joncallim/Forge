@@ -8,6 +8,7 @@ import { db } from '../db'
 import { agentConfigs, projects, tasks, workPackages } from '../db/schema'
 import { getModel, getProvider } from '../lib/providers/registry'
 import { resolveDefaultProvider } from '../lib/providers/default'
+import { assertProjectLocalPathForExecution } from '../lib/projects/local-path'
 
 const execFile = promisify(execFileCallback)
 
@@ -52,6 +53,7 @@ export type WorkPackageExecutionPlan = {
 
 export type WorkPackageExecutionContext = {
   agentConfig: AgentConfigRow | null
+  validatedProjectRoot: string
   model: LanguageModel
   modelIdUsed: string
   project: ProjectRow
@@ -83,6 +85,15 @@ function truncate(value: string, maxBytes = MAX_COMMAND_OUTPUT_BYTES): string {
   const buffer = Buffer.from(value)
   if (buffer.byteLength <= maxBytes) return value
   return `${buffer.subarray(0, maxBytes).toString('utf8')}\n...[truncated]`
+}
+
+function redactExecutionOutput(value: string): string {
+  return value
+    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[REDACTED_PRIVATE_KEY]')
+    .replace(/\b(authorization:\s*bearer\s+)[^\s]+/gi, '$1[REDACTED_TOKEN]')
+    .replace(/\b(token|api[_-]?key|password|secret)=([^\s&]+)/gi, '$1=[REDACTED_TOKEN]')
+    .replace(/\b(?:ghp|gho|ghu|ghs|github_pat|sk|xox[baprs])_[A-Za-z0-9_=-]{10,}\b/g, '[REDACTED_TOKEN]')
+    .replace(/\b(?:glpat|sk|sk-proj|sk-ant|xox[baprs])-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED_TOKEN]')
 }
 
 function normalizeCommand(command: string[]): string {
@@ -157,6 +168,7 @@ function normalizeExecutionPlan(parsed: unknown): WorkPackageExecutionPlan {
     throw new Error(`Execution response included too many files; maximum is ${MAX_FILES}.`)
   }
 
+  const seenPaths = new Set<string>()
   const files = parsed.files.map((file, index): WorkPackageExecutionFile => {
     if (!isRecord(file)) throw new Error(`File ${index + 1} must be an object.`)
     const filePath = typeof file.path === 'string' ? file.path.trim() : ''
@@ -164,6 +176,9 @@ function normalizeExecutionPlan(parsed: unknown): WorkPackageExecutionPlan {
     if (filePath === '') throw new Error(`File ${index + 1} is missing path.`)
     if (content === null) throw new Error(`File ${filePath} is missing content.`)
     assertRelativeWritePath(filePath)
+    const normalizedPath = filePath.split(/[\\/]+/).join('/')
+    if (seenPaths.has(normalizedPath)) throw new Error(`Execution response included duplicate file path: ${filePath}`)
+    seenPaths.add(normalizedPath)
     if (Buffer.byteLength(content) > MAX_FILE_BYTES) {
       throw new Error(`File ${filePath} exceeds the ${MAX_FILE_BYTES} byte limit.`)
     }
@@ -240,6 +255,13 @@ function isInvalidNodeTestScript(script: string): boolean {
   return /^\s*node:test(\s|$)/i.test(script)
 }
 
+function isUnsafePackageScript(script: string): boolean {
+  return /[;&|`$<>]/.test(script) ||
+    /\bnode\s+-e\b/i.test(script) ||
+    /\brequire\s*\(\s*['"](?:node:)?(?:fs|child_process|process|os)['"]\s*\)/i.test(script) ||
+    /\b(?:curl|wget|nc|ssh|scp|bash|sh|python|perl|ruby|env|printenv|cat)\b/i.test(script)
+}
+
 function validatePlanAgainstPrompt(plan: WorkPackageExecutionPlan, prompt: string): void {
   const packageJson = readGeneratedPackageJson(plan.files)
 
@@ -262,6 +284,9 @@ function validatePlanAgainstPrompt(plan: WorkPackageExecutionPlan, prompt: strin
     if (isInvalidNodeTestScript(testScript)) {
       throw new Error('The generated test script is invalid; use `node --test` or a runnable test command.')
     }
+    if (isUnsafePackageScript(testScript)) {
+      throw new Error('The generated test script includes unsafe shell behavior.')
+    }
   }
 
   if (promptRequestsBuild(prompt)) {
@@ -272,6 +297,9 @@ function validatePlanAgainstPrompt(plan: WorkPackageExecutionPlan, prompt: strin
     const buildScript = packageScript(packageJson, 'build')
     if (isNoOpScript(buildScript)) {
       throw new Error('The generated build script appears to be a placeholder.')
+    }
+    if (isUnsafePackageScript(buildScript)) {
+      throw new Error('The generated build script includes unsafe shell behavior.')
     }
   }
 }
@@ -383,23 +411,133 @@ async function writeExecutionFile(projectRoot: string, file: WorkPackageExecutio
     throw new Error(`File path escapes the real project directory: ${file.path}`)
   }
 
-  await fs.writeFile(target, file.content)
+  const targetStat = await fs.lstat(target).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === 'ENOENT') return null
+    throw err
+  })
+  if (targetStat?.isSymbolicLink()) {
+    throw new Error(`File path targets a symlink and cannot be written by Forge: ${file.path}`)
+  }
+  if (targetStat) {
+    throw new Error(`File path already exists in the fresh execution sandbox: ${file.path}`)
+  }
+
+  const handle = await fs.open(target, 'wx')
+  try {
+    await handle.writeFile(file.content)
+  } finally {
+    await handle.close()
+  }
+}
+
+async function safeSyntaxCheck(filePath: string): Promise<string> {
+  const result = await execFile(process.execPath, ['--check', filePath], {
+    env: { CI: '1', NODE_ENV: 'test', PATH: process.env.PATH ?? '' },
+    maxBuffer: MAX_COMMAND_OUTPUT_BYTES * 2,
+    timeout: COMMAND_TIMEOUT_MS,
+  })
+  return [result.stdout, result.stderr].filter(Boolean).join('\n')
+}
+
+async function listSandboxFiles(projectRoot: string): Promise<string[]> {
+  const files: string[] = []
+
+  async function walk(current: string): Promise<void> {
+    const entries = await fs.readdir(current, { withFileTypes: true })
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) throw new Error(`Execution sandbox contains a symlink: ${entry.name}`)
+      const absolute = path.join(current, entry.name)
+      if (entry.isDirectory()) {
+        await walk(absolute)
+      } else if (entry.isFile()) {
+        files.push(path.relative(projectRoot, absolute).split(path.sep).join('/'))
+      }
+    }
+  }
+
+  await walk(projectRoot)
+  return files.sort()
+}
+
+function isJavaScriptFile(filePath: string): boolean {
+  return /\.(?:mjs|cjs|js)$/.test(filePath)
+}
+
+function isTestFile(filePath: string): boolean {
+  return /(^|\/)(__tests__\/|.*(?:\.test|\.spec)\.[cm]?js$|test\.[cm]?js$)/i.test(filePath)
+}
+
+async function validateGeneratedCommand(projectRoot: string, command: string[]): Promise<string> {
+  const normalized = normalizeCommand(command)
+  const files = await listSandboxFiles(projectRoot)
+  const jsFiles = files.filter(isJavaScriptFile)
+  const testFiles = files.filter((file) => isJavaScriptFile(file) && isTestFile(file))
+
+  if (normalized === 'npm test') {
+    if (testFiles.length === 0) throw new Error('No JavaScript test files were generated.')
+    const packageJsonPath = path.join(projectRoot, 'package.json')
+    const packageJson = JSON.parse(await fs.readFile(packageJsonPath, 'utf8')) as unknown
+    if (!isRecord(packageJson)) throw new Error('Generated package.json is invalid.')
+    if (isUnsafePackageScript(packageScript(packageJson, 'test'))) {
+      throw new Error('Generated test script includes unsafe shell behavior.')
+    }
+    for (const file of testFiles) {
+      const absolute = path.join(projectRoot, file)
+      const content = await fs.readFile(absolute, 'utf8')
+      if (!/\bnode:test\b/.test(content) || !/\bassert\b/.test(content) || isPlaceholderContent(content)) {
+        throw new Error(`Generated test file is not a focused node:test assertion: ${file}`)
+      }
+      await safeSyntaxCheck(absolute)
+    }
+    return `Static test validation passed for ${testFiles.length} test file(s).`
+  }
+
+  if (normalized === 'npm run build') {
+    const packageJsonPath = path.join(projectRoot, 'package.json')
+    const packageJson = JSON.parse(await fs.readFile(packageJsonPath, 'utf8')) as unknown
+    if (!isRecord(packageJson)) throw new Error('Generated package.json is invalid.')
+    if (isNoOpScript(packageScript(packageJson, 'build'))) {
+      throw new Error('Generated build script is a placeholder.')
+    }
+    if (isUnsafePackageScript(packageScript(packageJson, 'build'))) {
+      throw new Error('Generated build script includes unsafe shell behavior.')
+    }
+    if (jsFiles.length === 0) {
+      throw new Error('Static build validation requires at least one checkable JavaScript source file.')
+    }
+    for (const file of jsFiles) await safeSyntaxCheck(path.join(projectRoot, file))
+    return `Static build validation passed for ${jsFiles.length} JavaScript file(s).`
+  }
+
+  if (normalized === 'npm run lint') {
+    const packageJsonPath = path.join(projectRoot, 'package.json')
+    const packageJson = JSON.parse(await fs.readFile(packageJsonPath, 'utf8')) as unknown
+    if (!isRecord(packageJson)) throw new Error('Generated package.json is invalid.')
+    if (isNoOpScript(packageScript(packageJson, 'lint'))) {
+      throw new Error('Generated lint script is a placeholder.')
+    }
+    if (isUnsafePackageScript(packageScript(packageJson, 'lint'))) {
+      throw new Error('Generated lint script includes unsafe shell behavior.')
+    }
+    if (jsFiles.length === 0) {
+      throw new Error('Static lint validation requires at least one checkable JavaScript source file.')
+    }
+    for (const file of jsFiles) await safeSyntaxCheck(path.join(projectRoot, file))
+    return `Static lint validation passed for ${jsFiles.length} JavaScript file(s).`
+  }
+
+  throw new Error(`Command is not allowed: ${normalized}`)
 }
 
 async function runCommand(projectRoot: string, command: string[]): Promise<WorkPackageExecutionCommandResult> {
   assertAllowedCommand(command)
   try {
-    const result = await execFile(command[0], command.slice(1), {
-      cwd: projectRoot,
-      env: { ...process.env, CI: '1' },
-      maxBuffer: MAX_COMMAND_OUTPUT_BYTES * 2,
-      timeout: COMMAND_TIMEOUT_MS,
-    })
+    const stdout = await validateGeneratedCommand(projectRoot, command)
     return {
       command,
       exitCode: 0,
-      stdout: truncate(result.stdout),
-      stderr: truncate(result.stderr),
+      stdout: truncate(redactExecutionOutput(stdout)),
+      stderr: '',
     }
   } catch (err) {
     const error = err as NodeJS.ErrnoException & {
@@ -410,10 +548,43 @@ async function runCommand(projectRoot: string, command: string[]): Promise<WorkP
     return {
       command,
       exitCode: typeof error.code === 'number' ? error.code : 1,
-      stdout: truncate(String(error.stdout ?? '')),
-      stderr: truncate(String(error.stderr ?? error.message)),
+      stdout: truncate(redactExecutionOutput(String(error.stdout ?? ''))),
+      stderr: truncate(redactExecutionOutput(String(error.stderr ?? error.message))),
     }
   }
+}
+
+async function ensureDirectoryNoSymlink(root: string, segments: string[]): Promise<string> {
+  let current = path.resolve(root)
+  for (const segment of segments) {
+    current = path.join(current, segment)
+    const stat = await fs.lstat(current).catch((err: NodeJS.ErrnoException) => {
+      if (err.code === 'ENOENT') return null
+      throw err
+    })
+    if (stat?.isSymbolicLink()) {
+      throw new Error(`Execution sandbox path contains a symlink: ${segment}`)
+    }
+    if (stat && !stat.isDirectory()) {
+      throw new Error(`Execution sandbox path is not a directory: ${segment}`)
+    }
+    if (!stat) await fs.mkdir(current, { mode: 0o700 })
+  }
+  return current
+}
+
+async function prepareSandboxRoot(hostProjectRoot: string, taskId: string, workPackageId: string): Promise<string> {
+  const sandboxParent = await ensureDirectoryNoSymlink(hostProjectRoot, ['.forge', 'task-runs', taskId])
+  const sandboxRoot = path.join(sandboxParent, workPackageId)
+  const stat = await fs.lstat(sandboxRoot).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === 'ENOENT') return null
+    throw err
+  })
+  if (stat?.isSymbolicLink()) throw new Error('Execution sandbox root is a symlink.')
+  if (stat && !stat.isDirectory()) throw new Error('Execution sandbox root is not a directory.')
+  if (stat) await fs.rm(sandboxRoot, { recursive: true, force: true })
+  await fs.mkdir(sandboxRoot, { mode: 0o700 })
+  return sandboxRoot
 }
 
 async function listProjectFiles(projectRoot: string): Promise<string[]> {
@@ -521,8 +692,19 @@ export async function loadWorkPackageExecutionContext(
   const [agentConfig] = await db
     .select()
     .from(agentConfigs)
-    .where(eq(agentConfigs.agentType, row.workPackage.assignedRole))
+    .where(and(eq(agentConfigs.agentType, row.workPackage.assignedRole), eq(agentConfigs.isActive, true)))
     .limit(1)
+  if (!agentConfig) {
+    const [inactiveConfig] = await db
+      .select({ id: agentConfigs.id })
+      .from(agentConfigs)
+      .where(and(eq(agentConfigs.agentType, row.workPackage.assignedRole), eq(agentConfigs.isActive, false)))
+      .limit(1)
+    if (inactiveConfig) {
+      throw new Error(`Agent "${row.workPackage.assignedRole}" is archived and cannot execute work packages.`)
+    }
+    throw new Error(`Agent "${row.workPackage.assignedRole}" is not configured or active and cannot execute work packages.`)
+  }
 
   let providerConfigId = resolveExecutionProviderConfigId({
     agentProviderConfigId: agentConfig?.providerConfigId,
@@ -538,11 +720,13 @@ export async function loadWorkPackageExecutionContext(
   const provider = await getProvider(providerConfigId)
   if (!provider) throw new Error(`Provider config ${providerConfigId} is missing or inactive.`)
 
-  const model = await getModel(providerConfigId)
+  const validatedProjectRoot = await assertProjectLocalPathForExecution(row.project)
+  const model = await getModel(providerConfigId, { cwd: validatedProjectRoot })
   if (!model) throw new Error(`Provider config ${providerConfigId} is missing or inactive.`)
 
   return {
     agentConfig: agentConfig ?? null,
+    validatedProjectRoot,
     model,
     modelIdUsed: provider.config.modelId,
     project: row.project,
@@ -552,11 +736,9 @@ export async function loadWorkPackageExecutionContext(
 }
 
 export async function executeWorkPackage(context: WorkPackageExecutionContext): Promise<WorkPackageExecutionResult> {
-  const hostProjectRoot = context.project.localPath
-  if (!hostProjectRoot) throw new Error('Project localPath is required before Forge can execute work packages.')
+  const hostProjectRoot = context.validatedProjectRoot
 
-  const sandboxRoot = path.join(hostProjectRoot, '.forge', 'task-runs', context.task.id, context.workPackage.id)
-  await fs.mkdir(sandboxRoot, { recursive: true })
+  const sandboxRoot = await prepareSandboxRoot(hostProjectRoot, context.task.id, context.workPackage.id)
   const projectFiles = await listProjectFiles(sandboxRoot)
   const system = context.agentConfig?.systemPrompt || defaultSystemPrompt(context.workPackage.assignedRole)
   const prompt = buildExecutionPrompt({

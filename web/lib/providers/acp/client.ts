@@ -17,6 +17,20 @@ import { AcpTransport, defaultAcpSpawn, type AcpSpawn } from './transport'
 
 const ACP_SESSION_TIMEOUT_MS = 5 * 60_000
 
+export class AcpStartupError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'AcpStartupError'
+  }
+}
+
+export class AcpTransportError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'AcpTransportError'
+  }
+}
+
 export type AcpPromptResult = {
   text: string
   stopReason: string
@@ -26,6 +40,26 @@ export type AcpSessionStartOptions = {
   selectedModel?: string | null
   modelSelection?: AcpModelSelectionSupport | null
   spawnFn?: AcpSpawn
+}
+
+function redactAdapterMessage(message: string): string {
+  return message
+    .replace(/\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[oprsu]_[A-Za-z0-9_=-]{8,}|glpat-[A-Za-z0-9_-]{8,}|sk-(?:proj-)?[A-Za-z0-9_-]{8,}|sk-ant-[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})\b/g, '[redacted-token]')
+    .replace(/\b(gho|ghp|glpat|sk|sk-ant|xox[baprs])_[A-Za-z0-9_-]{8,}\b/g, '[redacted-token]')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]{12,}=*\b/gi, 'Bearer [redacted-token]')
+    .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '[redacted-email]')
+    .slice(0, 240)
+}
+
+function startupError(agentId: string, method: string, err: unknown): Error {
+  const message = redactAdapterMessage(err instanceof Error ? err.message : String(err))
+  if (/timed out/i.test(message)) {
+    return new AcpStartupError(`ACP runtime "${agentId}" did not respond to ${method}. Make sure the underlying CLI is installed, authenticated, and able to start in the configured project folder.`)
+  }
+  if (/exited unexpectedly|process error/i.test(message)) {
+    return new AcpStartupError(`ACP runtime "${agentId}" could not start. Make sure the underlying CLI is installed, authenticated, and on PATH.`)
+  }
+  return new AcpStartupError(`ACP runtime "${agentId}" failed during ${method}: ${message}`)
 }
 
 export class AcpSessionClient {
@@ -42,31 +76,45 @@ export class AcpSessionClient {
     cwd: string,
     options: AcpSessionStartOptions = {},
   ): Promise<AcpSessionClient> {
+    const sessionCwd = cwd.trim()
+    if (!sessionCwd) {
+      throw new AcpStartupError('Project localPath is required before Forge can start an ACP session.')
+    }
+
     const command = getAcpAdapterCommand(agentId)
     if (!command) {
-      throw new Error(`No ACP adapter is wired up for agent "${agentId}".`)
+      throw new AcpStartupError(`No ACP adapter is wired up for agent "${agentId}".`)
     }
 
     const transport = new AcpTransport(command, options.spawnFn ?? defaultAcpSpawn)
     try {
-      await transport.request(
-        'initialize',
-        { protocolVersion: ACP_PROTOCOL_VERSION, clientCapabilities: {} },
-        30_000,
-      )
+      try {
+        await transport.request(
+          'initialize',
+          { protocolVersion: ACP_PROTOCOL_VERSION, clientCapabilities: {} },
+          30_000,
+        )
+      } catch (err) {
+        throw startupError(agentId, 'initialize', err)
+      }
 
-      const sessionResult = (await transport.request('session/new', { cwd, mcpServers: [] }, 30_000)) as {
-        sessionId?: string
+      let sessionResult: { sessionId?: string }
+      try {
+        sessionResult = (await transport.request('session/new', { cwd: sessionCwd, mcpServers: [] }, 30_000)) as {
+          sessionId?: string
+        }
+      } catch (err) {
+        throw startupError(agentId, 'session/new', err)
       }
       const sessionId = sessionResult?.sessionId
       if (!sessionId) {
-        throw new Error('ACP adapter did not return a sessionId from session/new')
+        throw new AcpStartupError('ACP adapter did not return a sessionId from session/new')
       }
 
       const selectedModel = options.selectedModel?.trim()
       if (selectedModel) {
         if (!options.modelSelection) {
-          throw new Error(`ACP model selection is not configured for agent "${agentId}".`)
+          throw new AcpStartupError(`ACP model selection is not configured for agent "${agentId}".`)
         }
         try {
           await transport.request(
@@ -75,8 +123,8 @@ export class AcpSessionClient {
             30_000,
           )
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err)
-          throw new Error(`ACP runtime "${agentId}" could not set selected model "${selectedModel}": ${message}`)
+          const message = redactAdapterMessage(err instanceof Error ? err.message : String(err))
+          throw new AcpStartupError(`ACP runtime "${agentId}" could not set selected model "${selectedModel}": ${message}`)
         }
       }
 
@@ -104,11 +152,17 @@ export class AcpSessionClient {
       onChunk?.(delta)
     })
 
-    const result = (await this.transport.request(
-      'session/prompt',
-      { sessionId: this.sessionId, prompt: [{ type: 'text', text }] },
-      ACP_SESSION_TIMEOUT_MS,
-    )) as { stopReason?: string }
+    let result: { stopReason?: string }
+    try {
+      result = (await this.transport.request(
+        'session/prompt',
+        { sessionId: this.sessionId, prompt: [{ type: 'text', text }] },
+        ACP_SESSION_TIMEOUT_MS,
+      )) as { stopReason?: string }
+    } catch (err) {
+      const message = redactAdapterMessage(err instanceof Error ? err.message : String(err))
+      throw new AcpTransportError(`ACP session transport failed while waiting for agent output: ${message}`)
+    }
 
     return { text: accumulated, stopReason: result?.stopReason ?? 'end_turn' }
   }

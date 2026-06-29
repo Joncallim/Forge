@@ -14,7 +14,7 @@ import {
   extractLmStudioNativeModelListing,
   listLmStudioModelIds,
 } from '@/lib/providers/model-listing'
-import { ACP_AGENTS, acpProviderModelId } from '@/lib/providers/acp/catalog'
+import { ACP_AGENTS, acpProviderModelId, getAcpModelSelection, parseAcpProviderModelId } from '@/lib/providers/acp/catalog'
 
 // ---------------------------------------------------------------------------
 // POST /api/providers/discover-local
@@ -53,6 +53,7 @@ type DiscoveryCandidate = {
   label: string
   providerType?: string
   modelId?: string
+  versionLabel?: string
   status: 'reachable' | 'not_reachable' | 'available' | 'added' | 'updated' | 'configured' | 'skipped'
   detail?: string
   guidance?: string
@@ -74,7 +75,6 @@ type LmStudioDiscovery = {
 type DiscoveryRequest = {
   autoConfigure: boolean
   candidates: { providerType: DiscoveredModel['providerType']; modelId: string }[]
-  candidateMode: 'all' | 'selected'
   invalidReason: string | null
 }
 
@@ -84,7 +84,7 @@ function discoveredKey(model: Pick<DiscoveredModel, 'providerType' | 'modelId'>)
 
 async function parseDiscoveryRequest(request: NextRequest): Promise<DiscoveryRequest> {
   if (!request.headers.get('content-type')?.toLowerCase().includes('application/json')) {
-    return { autoConfigure: false, candidates: [], candidateMode: 'all', invalidReason: null }
+    return { autoConfigure: false, candidates: [], invalidReason: null }
   }
 
   try {
@@ -125,11 +125,10 @@ async function parseDiscoveryRequest(request: NextRequest): Promise<DiscoveryReq
     return {
       autoConfigure: body.autoConfigure === true || body.configure === true,
       candidates: candidateItems,
-      candidateMode: candidateItems.length > 0 ? 'selected' : 'all',
       invalidReason: hasInvalidCandidates ? 'Auto-configure candidates must include providerType and modelId.' : null,
     }
   } catch {
-    return { autoConfigure: false, candidates: [], candidateMode: 'all', invalidReason: 'Invalid JSON body' }
+    return { autoConfigure: false, candidates: [], invalidReason: 'Invalid JSON body' }
   }
 }
 
@@ -281,7 +280,7 @@ function discoverAcpModels(): DiscoveredModel[] {
       modelId: acpProviderModelId(agent.id, option.id),
       baseUrl: null,
       readiness: 'available' as const,
-      detail: `${agent.label} ACP model preset`,
+      detail: `${agent.label} ACP model preset: ${option.label}`,
       guidance: agent.modelSelection?.helpText,
     }))
   })
@@ -312,29 +311,49 @@ function capabilityGroupsFor(input: {
   capabilityGroups: DiscoveryCapabilityGroup[]
   auxiliaryCapabilityGroups: DiscoveryCapabilityGroup[]
 } {
+  const candidateFor = (model: DiscoveredModel): DiscoveryCandidate => {
+    const parsedAcp = model.providerType === 'acp' ? parseAcpProviderModelId(model.modelId) : null
+    const selectedModel = parsedAcp?.selectedModel ?? ''
+    const optionLabel = selectedModel
+      ? getAcpModelSelection(model.modelId)?.options.find((option) => option.id === selectedModel)?.label
+      : null
+    return {
+      id: `${model.providerType}-${model.modelId}`,
+      label: model.providerType === 'acp' ? model.detail?.replace(/ ACP model preset:.*/, '') ?? model.modelId : model.modelId,
+      providerType: model.providerType,
+      modelId: model.modelId,
+      versionLabel: optionLabel ?? (selectedModel || undefined),
+      status: changeStatus(model, input.added, input.updated, input.configured, input.skipped),
+      detail: model.detail ?? (
+        model.providerType === 'acp'
+          ? 'ACP model preset'
+          : `${model.providerType === 'ollama' ? 'Ollama' : 'LM Studio'} generation model`
+      ),
+      guidance: model.guidance,
+      canConfigure: !input.configured.some((change) => change.providerType === model.providerType && change.modelId === model.modelId) &&
+        !input.added.some((change) => change.providerType === model.providerType && change.modelId === model.modelId) &&
+        !input.updated.some((change) => change.providerType === model.providerType && change.modelId === model.modelId) &&
+        !input.skipped.some((change) => change.providerType === model.providerType && change.modelId === model.modelId),
+    }
+  }
+  const localModels = input.discovered.filter((model) => model.providerType !== 'acp')
+  const acpModels = input.discovered.filter((model) => model.providerType === 'acp')
+
   return {
-    capabilityGroups: [{
-      id: 'main-generation',
-      title: 'Main generation capabilities',
-      description: 'Local chat models Forge can add as generation providers.',
-      candidates: input.discovered.map((model) => ({
-        id: `${model.providerType}-${model.modelId}`,
-        label: model.modelId,
-        providerType: model.providerType,
-        modelId: model.modelId,
-        status: changeStatus(model, input.added, input.updated, input.configured, input.skipped),
-        detail: model.detail ?? (
-          model.providerType === 'acp'
-            ? 'ACP model preset'
-            : `${model.providerType === 'ollama' ? 'Ollama' : 'LM Studio'} generation model`
-        ),
-        guidance: model.guidance,
-        canConfigure: !input.configured.some((change) => change.providerType === model.providerType && change.modelId === model.modelId) &&
-          !input.added.some((change) => change.providerType === model.providerType && change.modelId === model.modelId) &&
-          !input.updated.some((change) => change.providerType === model.providerType && change.modelId === model.modelId) &&
-          !input.skipped.some((change) => change.providerType === model.providerType && change.modelId === model.modelId),
-      })),
-    }],
+    capabilityGroups: [
+      {
+        id: 'local-chat-models',
+        title: 'Local Chat Models',
+        description: 'Models served by local chat runtimes such as Ollama and LM Studio.',
+        candidates: localModels.map(candidateFor),
+      },
+      {
+        id: 'acp-models',
+        title: 'ACP Models',
+        description: 'ACP-connected coding runtimes. Forge starts these in the configured project repository folder.',
+        candidates: acpModels.map(candidateFor),
+      },
+    ],
     auxiliaryCapabilityGroups: [{
       id: 'auxiliary-local',
       title: 'Auxiliary local capabilities',
