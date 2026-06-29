@@ -16,6 +16,8 @@ const SAFE_BETA_CAPABILITY_PATTERNS: Record<string, RegExp[]> = {
     /^github\.(?:repository|contents)\.search$/,
   ],
 }
+const NON_RETRYABLE_BROKER_BLOCK_PATTERN = /Unknown MCP|outside the allowed beta scope|no approved capabilities|does not name a known MCP|not covered by an explicit approved grant|Run-scoped MCP prompt overlays/i
+const RETRYABLE_BROKER_BLOCK_PATTERN = /not configured|auth_required|missing|unhealthy|disabled|not installed|install_required/i
 
 export const MCP_EXECUTION_DESIGN_RUNTIME_ENFORCEMENT = 'not_implemented' as const
 
@@ -83,6 +85,11 @@ export type WorkPackageMcpBrokerCheck = {
   blocked: string[]
   warnings: string[]
   blockedReason: string | null
+}
+
+export function isRetryableMcpBrokerBlock(blocked: string[]): boolean {
+  if (blocked.some((message) => NON_RETRYABLE_BROKER_BLOCK_PATTERN.test(message))) return false
+  return blocked.some((message) => RETRYABLE_BROKER_BLOCK_PATTERN.test(message))
 }
 
 export type McpGrantDecisions = {
@@ -293,6 +300,14 @@ function unknownMcpMessage(mcpId: string): string {
   return `Unknown MCP '${mcpId}' was requested.`
 }
 
+function requirementCapabilities(requirement: McpExecutionRequirement): string[] {
+  return [...new Set(Object.values(requirement.agentPermissions).flat())]
+}
+
+function requirementCapabilitiesForAgent(requirement: McpExecutionRequirement, agent: string): string[] {
+  return requirement.agentPermissions[agent] ?? []
+}
+
 export function validateMcpExecutionDesign(
   design: McpExecutionDesign | null,
   mcpOverview: ProjectMcpOverview,
@@ -311,6 +326,13 @@ export function validateMcpExecutionDesign(
         continue
       }
 
+      for (const capability of requirementCapabilities(requirement)) {
+        const unsafe = unsafeCapability(requirement.mcpId, capability, requirement.prohibitedCapabilities)
+        if (unsafe) {
+          blocked.push(`MCP '${requirement.mcpId}' capability '${unsafe}' is outside the allowed beta scope.`)
+        }
+      }
+
       const status = healthFor(mcpOverview, requirement.mcpId)
       if (!status) {
         const message = statusMessage(requirement.mcpId, null)
@@ -323,6 +345,43 @@ export function validateMcpExecutionDesign(
         const message = statusMessage(requirement.mcpId, status)
         if (requirement.requirement === 'required') blocked.push(message)
         else warnings.push(message)
+      }
+    }
+
+    const approvedCapabilitiesByAgent = new Map<string, Set<string>>()
+    for (const requirement of design.requirements) {
+      if (!isKnownMcpId(requirement.mcpId)) continue
+      for (const agent of agentsForRequirement(requirement)) {
+        const current = approvedCapabilitiesByAgent.get(agent) ?? new Set<string>()
+        for (const capability of requirementCapabilitiesForAgent(requirement, agent)) {
+          if (unsafeCapability(requirement.mcpId, capability, requirement.prohibitedCapabilities) === null) {
+            current.add(normalizeCapability(capability))
+          }
+        }
+        approvedCapabilitiesByAgent.set(agent, current)
+      }
+    }
+    const prohibitedCapabilities = new Set(
+      design.requirements.flatMap((requirement) => requirement.prohibitedCapabilities.map(normalizeCapability)),
+    )
+
+    for (const subtask of design.mcpAwareSubtasks) {
+      const approvedCapabilities = approvedCapabilitiesByAgent.get(subtask.agent) ?? new Set<string>()
+      for (const capability of subtask.mcpCapabilities) {
+        const normalizedCapability = normalizeCapability(capability)
+        const mcpId = capabilityMcpId(normalizedCapability)
+        if (!mcpId) {
+          blocked.push(`MCP-aware subtask capability '${normalizedCapability}' does not name a known MCP.`)
+          continue
+        }
+        const unsafe = unsafeCapability(mcpId, normalizedCapability, [...prohibitedCapabilities])
+        if (unsafe) {
+          blocked.push(`MCP-aware subtask capability '${unsafe}' is outside the allowed beta scope.`)
+          continue
+        }
+        if (!approvedCapabilities.has(normalizedCapability)) {
+          blocked.push(`MCP-aware subtask capability '${normalizedCapability}' is not covered by an explicit approved grant.`)
+        }
       }
     }
   }
@@ -370,11 +429,6 @@ function metadataMcpAwareSubtasks(metadata: unknown): Record<string, unknown>[] 
   return objectArrayFrom(metadata.mcpAwareSubtasks)
 }
 
-function harnessMcpGrants(harnessToolPolicy: unknown): Record<string, unknown>[] {
-  if (!isRecord(harnessToolPolicy)) return []
-  return objectArrayFrom(harnessToolPolicy.mcpGrants)
-}
-
 function capabilityArray(entry: Record<string, unknown>): {
   capabilities: string[]
   present: boolean
@@ -403,7 +457,6 @@ function brokerEntries(input: {
   return [
     ...objectArrayFrom(input.mcpRequirements),
     ...metadataMcpGrants(input.metadata),
-    ...harnessMcpGrants(input.harnessToolPolicy),
   ]
 }
 
@@ -472,7 +525,7 @@ export function evaluateWorkPackageMcpBroker(input: {
     }
 
     if (!isKnownMcpId(mcpId)) {
-      shouldBlock(unknownMcpMessage(mcpId))
+      blocked.push(unknownMcpMessage(mcpId))
       continue
     }
 

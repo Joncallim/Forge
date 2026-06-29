@@ -62,6 +62,7 @@ vi.mock('@/db', () => ({
 
 // Redis mock
 const mockRedisLpush = vi.fn()
+const mockRedisSet = vi.fn()
 const mockRedisZadd = vi.fn()
 const mockRedisExpire = vi.fn()
 const mockRedisPublish = vi.fn()
@@ -69,6 +70,7 @@ const mockRedisPublish = vi.fn()
 vi.mock('@/lib/redis', () => ({
   redis: {
     lpush: mockRedisLpush,
+    set: mockRedisSet,
     zadd: mockRedisZadd,
     expire: mockRedisExpire,
     publish: mockRedisPublish,
@@ -2237,6 +2239,83 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       expect.stringContaining('"type":"approval_gate:decided"'),
     )
   })
+
+  it('keeps approval intact when the approval worker job enqueue result is uncertain', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const awaitingTask = {
+      id: 'task-approval',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-06-25T00:00:00.000Z'),
+    }
+    const approvedTask = {
+      ...awaitingTask,
+      status: 'approved',
+      updatedAt: new Date('2026-06-25T00:01:00.000Z'),
+    }
+    const taskUpdate = chain([approvedTask])
+    taskUpdate.set = vi.fn(() => taskUpdate)
+    const gateUpdate = chain([{ id: 'gate-1' }])
+    gateUpdate.set = vi.fn(() => gateUpdate)
+    mockDbSelect.mockReturnValue(chain([awaitingTask]))
+    mockDbUpdate
+      .mockReturnValueOnce(taskUpdate)
+      .mockReturnValueOnce(gateUpdate)
+    mockRedisLpush.mockRejectedValueOnce(new Error('redis unavailable'))
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest('/api/tasks/task-approval/approve', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: 'task-approval' }),
+    })
+
+    expect(res.status).toBe(202)
+    const body = await res.json()
+    expect(body.error).toMatch(/could not be confirmed/i)
+    expect(body.task).toMatchObject({ id: 'task-approval', status: 'approved' })
+    expect(taskUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      errorMessage: null,
+      status: 'approved',
+    }))
+    expect(mockDbUpdate).toHaveBeenCalledTimes(2)
+    expect(mockRedisPublish).not.toHaveBeenCalled()
+  })
+
+  it('treats approval progress publish failures as best-effort after the worker job is queued', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const awaitingTask = {
+      id: 'task-approval',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-06-25T00:00:00.000Z'),
+    }
+    const approvedTask = {
+      ...awaitingTask,
+      status: 'approved',
+      updatedAt: new Date('2026-06-25T00:01:00.000Z'),
+    }
+    const taskUpdate = chain([approvedTask])
+    taskUpdate.set = vi.fn(() => taskUpdate)
+    const gateUpdate = chain([{ id: 'gate-1' }])
+    gateUpdate.set = vi.fn(() => gateUpdate)
+    mockDbSelect.mockReturnValue(chain([awaitingTask]))
+    mockDbUpdate
+      .mockReturnValueOnce(taskUpdate)
+      .mockReturnValueOnce(gateUpdate)
+    mockRedisLpush.mockResolvedValue(1)
+    mockRedisPublish.mockRejectedValueOnce(new Error('subscriber unavailable'))
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest('/api/tasks/task-approval/approve', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: 'task-approval' }),
+    })
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({
+      task: expect.objectContaining({ id: 'task-approval', status: 'approved' }),
+    })
+    expect(mockRedisLpush).toHaveBeenCalledWith(
+      'forge:approvals',
+      JSON.stringify({ taskId: 'task-approval', action: 'approve' }),
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -2259,26 +2338,10 @@ describe('POST /api/tasks/:id/retry-handoff', () => {
     expect(mockRedisLpush).not.toHaveBeenCalled()
   })
 
-  it('returns 409 when there are no blocked packages to retry', async () => {
+  it('re-enqueues approval handoff for an approved task even when no package is blocked', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
-    mockDbSelect
-      .mockReturnValueOnce(chain([{ status: 'approved' }]))
-      .mockReturnValueOnce(chain([]))
-
-    const { POST } = await import('@/app/api/tasks/[id]/retry-handoff/route')
-    const res = await POST(authRequest('/api/tasks/task-1/retry-handoff', { method: 'POST' }) as never, {
-      params: Promise.resolve({ id: 'task-1' }),
-    })
-
-    expect(res.status).toBe(409)
-    expect(mockRedisLpush).not.toHaveBeenCalled()
-  })
-
-  it('re-enqueues an approval job for an approved task with a blocked package', async () => {
-    mockGetSession.mockResolvedValue(FAKE_SESSION)
-    mockDbSelect
-      .mockReturnValueOnce(chain([{ status: 'approved' }]))
-      .mockReturnValueOnce(chain([{ id: 'pkg-1' }]))
+    mockDbSelect.mockReturnValueOnce(chain([{ status: 'approved' }]))
+    mockRedisSet.mockResolvedValue('OK')
     mockRedisLpush.mockResolvedValue(1)
 
     const { POST } = await import('@/app/api/tasks/[id]/retry-handoff/route')
@@ -2287,10 +2350,52 @@ describe('POST /api/tasks/:id/retry-handoff', () => {
     })
 
     expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ result: { status: 'retry_enqueued' } })
     expect(mockRedisLpush).toHaveBeenCalledWith(
       'forge:approvals',
       JSON.stringify({ taskId: 'task-1', action: 'approve' }),
     )
+  })
+
+  it('sets a retry dedupe marker before re-enqueuing approved handoff', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValueOnce(chain([{ status: 'approved' }]))
+    mockRedisSet.mockResolvedValue('OK')
+    mockRedisLpush.mockResolvedValue(1)
+
+    const { POST } = await import('@/app/api/tasks/[id]/retry-handoff/route')
+    const res = await POST(authRequest('/api/tasks/task-1/retry-handoff', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: 'task-1' }),
+    })
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ result: { status: 'retry_enqueued' } })
+    expect(mockRedisSet).toHaveBeenCalledWith(
+      'forge:blocked-handoff-retry:task-1',
+      expect.stringContaining('"source":"operator"'),
+      'EX',
+      60,
+      'NX',
+    )
+    expect(mockRedisLpush).toHaveBeenCalledWith(
+      'forge:approvals',
+      JSON.stringify({ taskId: 'task-1', action: 'approve' }),
+    )
+  })
+
+  it('does not enqueue duplicate approval jobs while a retry is already queued', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValueOnce(chain([{ status: 'approved' }]))
+    mockRedisSet.mockResolvedValue(null)
+
+    const { POST } = await import('@/app/api/tasks/[id]/retry-handoff/route')
+    const res = await POST(authRequest('/api/tasks/task-1/retry-handoff', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: 'task-1' }),
+    })
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ result: { status: 'retry_already_queued' } })
+    expect(mockRedisLpush).not.toHaveBeenCalled()
   })
 })
 

@@ -90,6 +90,7 @@ type WorkPackage = WorkforceRecord
 type ApprovalGate = WorkforceRecord
 type VcsChange = WorkforceRecord
 type CommandAudit = WorkforceRecord
+type RetryHandoffResultStatus = 'retry_already_queued' | 'retry_enqueued'
 
 interface TaskDetailResponse {
   task?: Task | null
@@ -538,6 +539,12 @@ function GateDecisionControls({
   )
 }
 
+export function retryHandoffMessage(status: RetryHandoffResultStatus): string {
+  return status === 'retry_already_queued'
+    ? 'Retry already queued. The worker will re-evaluate this handoff.'
+    : 'Retry queued. The worker will re-evaluate this handoff.'
+}
+
 // ---------------------------------------------------------------------------
 // RetryHandoffControls — re-enqueues a handoff for a package the MCP/capability
 // broker blocked (e.g. a temporarily-unhealthy MCP). Available to the operator
@@ -548,14 +555,16 @@ function RetryHandoffControls({
   blockedReason,
   onRetried,
   taskId,
+  title = 'Handoff blocked',
 }: {
   blockedReason: string
   onRetried: () => Promise<void>
   taskId: string
+  title?: string
 }) {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [retried, setRetried] = useState(false)
+  const [retryStatus, setRetryStatus] = useState<RetryHandoffResultStatus | null>(null)
 
   async function retry() {
     setSubmitting(true)
@@ -566,7 +575,9 @@ function RetryHandoffControls({
         const body = await res.json().catch(() => ({}))
         throw new Error(body.error ?? 'Failed to retry handoff')
       }
-      setRetried(true)
+      const body = await res.json().catch(() => ({}))
+      const status = body?.result?.status === 'retry_already_queued' ? 'retry_already_queued' : 'retry_enqueued'
+      setRetryStatus(status)
       await onRetried()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An unexpected error occurred')
@@ -577,7 +588,7 @@ function RetryHandoffControls({
 
   return (
     <div className="mt-3 min-w-0 rounded-lg border border-destructive/30 bg-destructive/10 p-3">
-      <p className="text-sm font-medium text-foreground">Handoff blocked</p>
+      <p className="text-sm font-medium text-foreground">{title}</p>
       {blockedReason !== '' && (
         <p className="mt-1 text-xs text-destructive">{blockedReason}</p>
       )}
@@ -592,8 +603,8 @@ function RetryHandoffControls({
         >
           {submitting ? 'Retrying...' : 'Retry handoff'}
         </Button>
-        {retried && !error && (
-          <span className="text-xs text-muted-foreground">Retry queued. The broker will re-evaluate this package.</span>
+        {retryStatus && !error && (
+          <span className="text-xs text-muted-foreground">{retryHandoffMessage(retryStatus)}</span>
         )}
       </div>
     </div>
@@ -2206,6 +2217,8 @@ export default function TaskDetailPage() {
   }
 
   const isAwaitingApproval = (currentStatus ?? task.status) === 'awaiting_approval'
+  const isApproved = (currentStatus ?? task.status) === 'approved'
+  const hasBlockedPackage = workPackages.some((pkg) => stringField(pkg, ['status', 'state']) === 'blocked')
   const canRetryTask = ['failed', 'cancelled', 'rejected'].includes(currentStatus ?? task.status)
   const plannedAgents = plannedAgentsFromArtifacts(mergedArtifacts)
   const capabilityClassification = latestCapabilityClassificationFromArtifacts(mergedArtifacts)
@@ -2286,6 +2299,17 @@ export default function TaskDetailPage() {
         questions={mergedQuestions}
         artifacts={mergedArtifacts}
       />
+
+      {isApproved && !hasBlockedPackage && (
+        <section aria-label="Retry approved handoff" className="mb-6">
+          <RetryHandoffControls
+            blockedReason="The task is approved. If the handoff worker did not pick it up, retry will safely re-enqueue the approval job."
+            taskId={taskId}
+            onRetried={loadTask}
+            title="Retry approved handoff"
+          />
+        </section>
+      )}
 
       {/* Implementation Plan — full width, above the two-column layout below,
           collapsed by default so it doesn't dominate the page */}

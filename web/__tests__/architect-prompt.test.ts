@@ -204,4 +204,25 @@ describe('buildArchitectPrompt checkpoint resume context', () => {
     expect(prompt).toContain('"mcpId":"filesystem"')
     expect(prompt).toContain('Do not invent connected resources')
   })
+
+  it('teaches only safe beta MCP read/list/search capabilities', () => {
+    const prompt = buildArchitectPrompt(
+      task,
+      project,
+      'Specialist context',
+      'Web context',
+      [],
+      null,
+      null,
+      [],
+      null,
+      mcpOverview,
+    )
+
+    expect(prompt).toContain('safe beta read/list/search capability strings')
+    expect(prompt).toContain('github.contents.read')
+    expect(prompt).toContain('github.repository.search')
+    expect(prompt).not.toContain('github.contents.write')
+    expect(prompt).not.toContain('filesystem.project.write')
+  })
 })

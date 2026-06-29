@@ -666,6 +666,10 @@ function promptRecordArray(value: unknown): Record<string, unknown>[] {
     : []
 }
 
+export function isArchitectReservedExecutionRole(role: string): boolean {
+  return ['architect', 'qa', 'reviewer', 'security', 'security-review', 'security_review'].includes(role.trim().toLowerCase())
+}
+
 function mcpCapabilityList(requirement: Record<string, unknown>): string[] {
   // Surface the union of both fields so the prompt mirrors exactly what the
   // capability broker validated (see capabilityArray in mcp-execution-design.ts).
@@ -808,6 +812,13 @@ export async function loadWorkPackageExecutionContext(
 
   if (!row) throw new Error('Work package execution context not found.')
   if (!row.project.localPath) throw new Error('Project localPath is required before Forge can execute work packages.')
+  if (
+    isArchitectReservedExecutionRole(row.workPackage.assignedRole) &&
+    isRecord(row.workPackage.metadata) &&
+    row.workPackage.metadata.source === 'architect-artifact'
+  ) {
+    throw new Error(`Architect-assigned "${row.workPackage.assignedRole}" work packages are reserved for review gates and cannot execute.`)
+  }
 
   const [agentConfig] = await db
     .select()

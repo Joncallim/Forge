@@ -661,6 +661,99 @@ describe('review gate contract', () => {
     expect(packageCompleteUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'completed' }))
   })
 
+  it('rejects review decisions when a newer package run has produced artifacts', async () => {
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'gate-reviewer',
+        gateType: 'reviewer_review',
+        metadata: {},
+        sourceAgentRunId: 'run-1',
+        sourceArtifactId: 'artifact-1',
+        status: 'pending',
+        workPackageId: 'pkg-1',
+      }]))
+      .mockReturnValueOnce(chain([{ reviewRequirement: 'both' }]))
+      .mockReturnValueOnce(chain([{ id: 'artifact-1' }]))
+      .mockReturnValueOnce(chain([{ id: 'artifact-new', agentRunId: 'run-2' }]))
+
+    const result = await decideReviewGate({
+      decision: 'completed',
+      gateId: 'gate-reviewer',
+      reason: 'Looks good.',
+      sourceArtifactId: 'artifact-1',
+      taskId: 'task-1',
+      userId: 'user-1',
+    })
+
+    expect(result).toMatchObject({
+      status: 'source_artifact_mismatch',
+      message: expect.stringMatching(/stale/i),
+    })
+    expect(mocks.dbTransaction).not.toHaveBeenCalled()
+  })
+
+  it('completes a security-review-only high-risk package after security approval', async () => {
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'gate-security',
+        gateType: 'security_review',
+        metadata: {},
+        sourceAgentRunId: 'run-1',
+        sourceArtifactId: 'artifact-1',
+        status: 'pending',
+        workPackageId: 'pkg-1',
+      }]))
+      .mockReturnValueOnce(chain([{
+        assignedRole: 'backend',
+        id: 'pkg-1',
+        mcpRequirements: [{ mcpId: 'github', requirement: 'required' }],
+        metadata: {},
+        requiredCapabilities: {},
+        reviewRequirement: 'none',
+        status: 'awaiting_review',
+        steps: ['Inspect GitHub issue context.'],
+        taskId: 'task-1',
+        title: 'Backend package',
+      }]))
+      .mockReturnValueOnce(chain([{ id: 'artifact-1' }]))
+      .mockReturnValueOnce(chain([{ id: 'artifact-1', agentRunId: 'run-1' }]))
+      .mockReturnValueOnce(chain([{ id: 'pkg-1', status: 'completed' }]))
+      .mockReturnValueOnce(chain([
+        { id: 'gate-security', gateType: 'security_review', status: 'completed', workPackageId: 'pkg-1', createdAt: new Date() },
+      ]))
+    const securityGateUpdate = updateChain([{ id: 'gate-security' }])
+    const packageCompleteUpdate = updateChain([{ id: 'pkg-1' }])
+    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
+      callback({
+        select: vi.fn().mockReturnValue(chain([
+          { gateType: 'security_review', status: 'completed', createdAt: new Date() },
+        ])),
+        update: vi.fn()
+          .mockReturnValueOnce(securityGateUpdate)
+          .mockReturnValueOnce(packageCompleteUpdate),
+      }),
+    )
+    mocks.updateTaskStatusIfCurrent.mockResolvedValue(true)
+
+    const result = await decideReviewGate({
+      decision: 'completed',
+      gateId: 'gate-security',
+      reason: 'Security review passed.',
+      sourceArtifactId: 'artifact-1',
+      taskId: 'task-1',
+      userId: 'user-1',
+    })
+
+    expect(result).toMatchObject({
+      decision: 'completed',
+      gateType: 'security_review',
+      packageStatus: 'completed',
+      status: 'decided',
+      taskCompleted: true,
+    })
+    expect(packageCompleteUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'completed' }))
+  })
+
   it('defaults to requiring both gates when the work package row cannot be found', async () => {
     mocks.dbSelect
       .mockReturnValueOnce(chain([{

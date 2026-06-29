@@ -145,23 +145,29 @@ async function startWorkerOnce(
     if (blockedHandoffSweepIntervalSeconds === 0 || blockedHandoffSweepRunning) return
     blockedHandoffSweepRunning = true
     try {
-      const [{ db }, { tasks, workPackages }, { redis }, { and, eq }] = await Promise.all([
+      const [
+        { db },
+        { tasks, workPackages },
+        { enqueueDueBlockedHandoffRetries },
+        { and, eq },
+      ] = await Promise.all([
         import('../db'),
         import('../db/schema'),
-        import('../lib/redis'),
+        import('./blocked-handoff-retry'),
         import('drizzle-orm'),
       ])
       const stuck = await db
-        .selectDistinct({ taskId: workPackages.taskId })
+        .select({
+          metadata: workPackages.metadata,
+          taskId: workPackages.taskId,
+        })
         .from(workPackages)
         .innerJoin(tasks, eq(tasks.id, workPackages.taskId))
         .where(and(eq(workPackages.status, 'blocked'), eq(tasks.status, 'approved')))
 
-      for (const row of stuck) {
-        await redis.lpush('forge:approvals', JSON.stringify({ taskId: row.taskId, action: 'approve' }))
-      }
-      if (stuck.length > 0) {
-        console.info('[worker] Re-enqueued blocked handoffs for retry', { count: stuck.length, workerId })
+      const enqueued = await enqueueDueBlockedHandoffRetries(stuck)
+      if (enqueued > 0) {
+        console.info('[worker] Re-enqueued blocked handoffs for retry', { count: enqueued, workerId })
       }
     } catch (err) {
       console.warn('[worker] Blocked-handoff sweep failed', { err: errorMessage(err), workerId })

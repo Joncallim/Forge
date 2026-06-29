@@ -1,21 +1,19 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
-import { and, eq } from 'drizzle-orm'
+import { eq } from 'drizzle-orm'
 import { db } from '@/db'
-import { tasks, workPackages } from '@/db/schema'
+import { tasks } from '@/db/schema'
 import { getSession } from '@/lib/session'
-import { redis } from '@/lib/redis'
+import { enqueueBlockedHandoffRetry } from '@/worker/blocked-handoff-retry'
 
 // ---------------------------------------------------------------------------
 // POST /api/tasks/:id/retry-handoff
 //
-// Re-enqueues an approval job for a task that is parked at `approved` with one
-// or more work packages blocked by the MCP/capability broker (e.g. an MCP was
-// temporarily unhealthy). The normal approve route only accepts
-// `awaiting_approval`, so this is the operator's path to retry a blocked
-// handoff once the underlying issue is resolved. processApproval re-runs the
-// broker, so a still-unresolved block simply re-blocks — it never bypasses the
-// gate.
+// Re-enqueues an approval job for a task parked at `approved`. This is the
+// operator recovery path for broker-blocked packages and for ambiguous approval
+// enqueue outcomes where the task was approved but the caller could not confirm
+// the worker job. processApproval re-runs all handoff gates, so retries never
+// bypass broker or review checks.
 // ---------------------------------------------------------------------------
 
 export async function POST(
@@ -47,22 +45,9 @@ export async function POST(
       )
     }
 
-    const [blockedPackage] = await db
-      .select({ id: workPackages.id })
-      .from(workPackages)
-      .where(and(eq(workPackages.taskId, taskId), eq(workPackages.status, 'blocked')))
-      .limit(1)
+    const retry = await enqueueBlockedHandoffRetry(taskId, { source: 'operator' })
 
-    if (!blockedPackage) {
-      return NextResponse.json(
-        { error: 'No blocked work packages to retry for this task.' },
-        { status: 409 },
-      )
-    }
-
-    await redis.lpush('forge:approvals', JSON.stringify({ taskId, action: 'approve' }))
-
-    return NextResponse.json({ result: { status: 'retry_enqueued' } })
+    return NextResponse.json({ result: { status: retry.status === 'enqueued' ? 'retry_enqueued' : 'retry_already_queued' } })
   } catch (err) {
     console.error('[POST /api/tasks/:id/retry-handoff] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

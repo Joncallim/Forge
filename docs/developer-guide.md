@@ -86,7 +86,7 @@ fallbacks only.
 
 ## Worker Runtime
 
-Current task path:
+Current task path without Workforce packages:
 
 ```text
 POST /api/tasks
@@ -96,11 +96,25 @@ POST /api/tasks
   -> task becomes running
   -> Architect model produces Markdown
   -> artifact is saved
-  -> Workforce planning records are materialized when possible
-  -> ready work packages may be handed off behind feature flags
-  -> execution, when enabled, writes only to a per-task sandbox
   -> task becomes awaiting_approval
-  -> approval job marks it completed
+  -> operator approves or rejects the plan
+  -> approval job marks the task completed
+```
+
+Current task path with Workforce materialization enabled:
+
+```text
+POST /api/tasks
+  -> insert task in PostgreSQL and push { taskId } to forge:tasks
+  -> worker runs Architect planning and saves the plan artifact
+  -> Workforce planning records and the plan approval gate are materialized
+  -> task becomes awaiting_approval
+  -> operator approves the plan
+  -> approval job releases ready work packages
+  -> MCP/capability broker validates the next handoff before ready/claim
+  -> execution, when enabled, writes only to a per-task sandbox
+  -> package QA/Reviewer/Security review gates complete when required
+  -> task completes after all work packages and review gates are complete
 ```
 
 Implemented worker files:

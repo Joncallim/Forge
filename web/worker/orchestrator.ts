@@ -270,11 +270,11 @@ export function buildArchitectPrompt(
     '- If the task would benefit from project MCP access, recommend the minimum MCP capabilities for the affected agents or workforce.',
     '- Treat MCP access as a proposal only: Forge validates it and does not currently issue runtime MCP tools from this plan.',
     '- Use only known MCP ids unless the task explicitly requires a future MCP: `filesystem`, `github`.',
-    '- Prefer static capability strings such as `filesystem.project.read`, `filesystem.project.write`, `github.issues.read`, `github.pull_requests.read`, and `github.contents.write`.',
+    '- Prefer only safe beta read/list/search capability strings such as `filesystem.project.read`, `filesystem.project.list`, `filesystem.project.search`, `github.issues.read`, `github.pull_requests.read`, `github.contents.read`, and `github.repository.search`. Do not request write, merge, secret, action-write, or repository mutation capabilities in this beta path.',
     '- Required unavailable MCPs should declare a fallback with action `block` or `ask_user`; optional unavailable MCPs should declare `continue_without_mcp` where reasonable.',
     '- After the agent breakdown block, append a fenced code block tagged exactly `mcp_execution_design_json` containing a single JSON object of this shape:',
     '```json',
-    '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Inspect issue context and repository state.","assignment":{"type":"agent","targetAgents":["backend"],"targetId":null},"agentPermissions":{"backend":["github.issues.read","github.contents.write"]},"prohibitedCapabilities":["github.pull_requests.merge"],"fallback":{"action":"ask_user","message":"Connect GitHub before implementation."}}],"promptOverlays":{"backend":"Use GitHub MCP only for the approved repository and issue context. Do not merge pull requests."},"mcpAwareSubtasks":[{"id":"inspect-repository","agent":"backend","dependsOn":[],"mcpCapabilities":["github.issues.read"],"inputs":["Task prompt"],"outputs":["Repository context"],"verification":["Relevant files identified"],"stoppingCondition":"Repository context is captured.","fallback":"Ask user for repository context manually."}]}',
+    '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Inspect issue context and repository state.","assignment":{"type":"agent","targetAgents":["backend"],"targetId":null},"agentPermissions":{"backend":["github.issues.read","github.contents.read"]},"prohibitedCapabilities":["github.pull_requests.merge"],"fallback":{"action":"ask_user","message":"Connect GitHub before implementation."}}],"promptOverlays":{"backend":"Use GitHub MCP only for the approved repository and issue context. Do not merge pull requests."},"mcpAwareSubtasks":[{"id":"inspect-repository","agent":"backend","dependsOn":[],"mcpCapabilities":["github.issues.read"],"inputs":["Task prompt"],"outputs":["Repository context"],"verification":["Relevant files identified"],"stoppingCondition":"Repository context is captured.","fallback":"Ask user for repository context manually."}]}',
     '```',
     '- Use empty arrays/objects when no MCP access is needed.',
     '',
@@ -868,10 +868,20 @@ export async function processApproval(
   const claimEnabled = isWorkPackageHandoffEnabled()
   if (!claimEnabled) {
     const handoff = await handoffApprovedWorkPackages(taskId, { claimEnabled: false })
+    if (handoff.status === 'blocked' && handoff.terminalBlock) {
+      await updateTaskStatusIfCurrent(
+        taskId,
+        'approved',
+        'failed',
+        handoff.blockedReason ?? 'Work package failed a terminal handoff safety check.',
+      )
+    }
     await publishTaskEvent(taskId, 'task:handoff', {
+      blockedReason: handoff.status === 'blocked' ? handoff.blockedReason : undefined,
       claimedPackageId: null,
       readyPackageIds: handoff.readyPackageIds,
       status: handoff.status,
+      terminalBlock: handoff.status === 'blocked' ? handoff.terminalBlock : undefined,
     })
     return
   }
@@ -904,12 +914,21 @@ export async function processApproval(
   }
 
   if (handoff.claimedPackageId === null && handoff.status === 'blocked') {
-    await updateTaskStatusIfCurrent(
-      taskId,
-      'running',
-      'approved',
-      handoff.blockedReason ?? 'Work package is blocked by MCP/capability broker.',
-    )
+    if (handoff.terminalBlock) {
+      await updateTaskStatusIfCurrent(
+        taskId,
+        'running',
+        'failed',
+        handoff.blockedReason ?? 'Work package failed a terminal handoff safety check.',
+      )
+    } else {
+      await updateTaskStatusIfCurrent(
+        taskId,
+        'running',
+        'approved',
+        handoff.blockedReason ?? 'Work package is blocked by MCP/capability broker.',
+      )
+    }
   }
 
   await publishTaskEvent(taskId, 'task:handoff', {
@@ -917,5 +936,6 @@ export async function processApproval(
     readyPackageIds: handoff.readyPackageIds,
     blockedReason: handoff.status === 'blocked' ? handoff.blockedReason : undefined,
     status: handoff.status,
+    terminalBlock: handoff.status === 'blocked' ? handoff.terminalBlock : undefined,
   })
 }
