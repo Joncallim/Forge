@@ -263,6 +263,28 @@ describe('executeWorkPackage', () => {
     }))).rejects.toThrow(/at least one checkable JavaScript source file/i)
   })
 
+  it('fails lint validation when no JavaScript source files can be checked', async () => {
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Generated unchecked lint input.',
+        files: [
+          {
+            path: 'package.json',
+            content: JSON.stringify({ scripts: { lint: 'eslint .' } }),
+          },
+          {
+            path: 'src/app.tsx',
+            content: 'export const App = () => <div />\n',
+          },
+        ],
+        commands: [['npm', 'run', 'lint']],
+      }),
+    })
+
+    await expect(executeWorkPackage(context())).rejects.toThrow(/at least one checkable JavaScript source file/i)
+  })
+
   it('rejects symlinked execution sandbox roots before writing generated files', async () => {
     const outsideRoot = path.join(tempRoot, 'outside-sandbox')
     const sandboxParent = path.join(tempRoot, '.forge', 'task-runs', 'task-1')

@@ -510,6 +510,18 @@ async function validateGeneratedCommand(projectRoot: string, command: string[]):
   }
 
   if (normalized === 'npm run lint') {
+    const packageJsonPath = path.join(projectRoot, 'package.json')
+    const packageJson = JSON.parse(await fs.readFile(packageJsonPath, 'utf8')) as unknown
+    if (!isRecord(packageJson)) throw new Error('Generated package.json is invalid.')
+    if (isNoOpScript(packageScript(packageJson, 'lint'))) {
+      throw new Error('Generated lint script is a placeholder.')
+    }
+    if (isUnsafePackageScript(packageScript(packageJson, 'lint'))) {
+      throw new Error('Generated lint script includes unsafe shell behavior.')
+    }
+    if (jsFiles.length === 0) {
+      throw new Error('Static lint validation requires at least one checkable JavaScript source file.')
+    }
     for (const file of jsFiles) await safeSyntaxCheck(path.join(projectRoot, file))
     return `Static lint validation passed for ${jsFiles.length} JavaScript file(s).`
   }
