@@ -903,9 +903,19 @@ export async function processApproval(
     return
   }
 
+  if (handoff.claimedPackageId === null && handoff.status === 'blocked') {
+    await updateTaskStatusIfCurrent(
+      taskId,
+      'running',
+      'approved',
+      handoff.blockedReason ?? 'Work package is blocked by MCP/capability broker.',
+    )
+  }
+
   await publishTaskEvent(taskId, 'task:handoff', {
     claimedPackageId: handoff.claimedPackageId,
     readyPackageIds: handoff.readyPackageIds,
+    blockedReason: handoff.status === 'blocked' ? handoff.blockedReason : undefined,
     status: handoff.status,
   })
 }

@@ -8,10 +8,13 @@ prompt, command, and documentation notes into one developer reference.
 Forge is a Next.js app with a background worker. The dashboard records what the
 operator wants. The worker does the queued work and saves evidence for review.
 
-The current worker runs only the Architect planning stage. Workforce data
+The current worker starts with the Architect planning stage. Workforce data
 structures now exist for work packages, harnesses, approval gates, and VCS
-summaries, but specialist execution and repository writes are still future
-slices.
+summaries. Work-package handoff and sequential specialist execution exist behind
+feature flags, and generated files are written only to per-task sandboxes. Forge
+still does not apply generated edits to the host repository, grant MCP runtime
+access to specialists, create commits, open pull requests, merge work, or run
+specialists in parallel.
 
 ## Local Development
 
@@ -87,6 +90,8 @@ POST /api/tasks
   -> Architect model produces Markdown
   -> artifact is saved
   -> Workforce planning records are materialized when possible
+  -> ready work packages may be handed off behind feature flags
+  -> execution, when enabled, writes only to a per-task sandbox
   -> task becomes awaiting_approval
   -> approval job marks it completed
 ```

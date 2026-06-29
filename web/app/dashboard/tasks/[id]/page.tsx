@@ -383,7 +383,7 @@ function McpRequirementCards({ requirements }: { requirements: WorkforceRecord[]
 }
 
 function isReviewGateType(gateType: string): boolean {
-  return gateType === 'qa_review' || gateType === 'reviewer_review'
+  return gateType === 'qa_review' || gateType === 'reviewer_review' || gateType === 'security_review'
 }
 
 // Semantic color buckets shared by every status badge on this page, so the
@@ -443,6 +443,7 @@ function progressStatusLabel(status: string): string {
 function reviewGateLabel(gateType: string): string {
   if (gateType === 'qa_review') return 'QA review'
   if (gateType === 'reviewer_review') return 'Reviewer review'
+  if (gateType === 'security_review') return 'Security review'
   return statusLabel(gateType)
 }
 
@@ -1093,7 +1094,7 @@ function WorkforcePanel({
                             </p>
                           ) : (
                             <p className="mt-2 text-xs text-muted-foreground">
-                              Review actions appear when a pending QA or Reviewer gate exists for this package.
+                              Review actions appear when a pending QA, Reviewer, or Security gate exists for this package.
                             </p>
                           )}
                         </div>

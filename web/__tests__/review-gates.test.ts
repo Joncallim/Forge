@@ -31,6 +31,7 @@ vi.mock('@/worker/task-state', () => ({
 import {
   completeTaskIfReviewGatesSatisfied,
   decideReviewGate,
+  isHighRiskImplementationPackage,
   isImplementationPackageRole,
   materializeReviewGatesForWorkPackageCompletion,
 } from '@/worker/review-gates'
@@ -42,7 +43,7 @@ function chain(resolveValue: unknown) {
     catch: (onRejected: (e: unknown) => unknown) =>
       Promise.resolve(resolveValue).catch(onRejected),
   }
-  const methods = ['from', 'where', 'limit', 'orderBy', 'values', 'returning', 'set']
+  const methods = ['from', 'where', 'innerJoin', 'limit', 'orderBy', 'values', 'returning', 'set']
   methods.forEach((method) => {
     thenable[method] = () => thenable
   })
@@ -73,13 +74,39 @@ describe('review gate contract', () => {
     expect(isImplementationPackageRole('qa')).toBe(false)
     expect(isImplementationPackageRole('reviewer')).toBe(false)
     expect(isImplementationPackageRole('architect')).toBe(false)
+    expect(isImplementationPackageRole('security')).toBe(false)
   })
 
   it('treats unknown roles as implementation roles, but exempt roles stay exempt regardless of casing', () => {
-    expect(isImplementationPackageRole('security')).toBe(true)
+    expect(isImplementationPackageRole('specialist')).toBe(true)
     expect(isImplementationPackageRole('QA')).toBe(false)
     expect(isImplementationPackageRole('  Reviewer  ')).toBe(false)
+    expect(isImplementationPackageRole('Security-Review')).toBe(false)
     expect(isImplementationPackageRole('')).toBe(false)
+  })
+
+  it('detects high-risk implementation packages but exempts security and normal low-risk packages', () => {
+    expect(isHighRiskImplementationPackage({
+      assignedRole: 'backend',
+      mcpRequirements: [{ mcpId: 'github', requirement: 'required' }],
+      title: 'Backend package',
+    })).toBe(true)
+    expect(isHighRiskImplementationPackage({
+      assignedRole: 'backend',
+      requiredCapabilities: { required: ['security-review'] },
+      title: 'Backend package',
+    })).toBe(true)
+    expect(isHighRiskImplementationPackage({
+      assignedRole: 'frontend',
+      steps: ['Render the task list and empty state.'],
+      summary: 'Build presentational task list UI.',
+      title: 'Frontend package',
+    })).toBe(false)
+    expect(isHighRiskImplementationPackage({
+      assignedRole: 'security',
+      steps: ['Review auth tokens and secrets handling.'],
+      title: 'Security package',
+    })).toBe(false)
   })
 
   it('materializes QA and Reviewer gates when an implementation package finishes', async () => {
@@ -229,6 +256,50 @@ describe('review gate contract', () => {
     })
   })
 
+  it('materializes a security review gate for high-risk implementation packages', async () => {
+    mocks.dbSelect.mockReturnValueOnce(chain([{
+      id: 'pkg-1',
+      assignedRole: 'backend',
+      mcpRequirements: [{ mcpId: 'github', requirement: 'required' }],
+      metadata: {},
+      requiredCapabilities: {},
+      reviewRequirement: 'none',
+      status: 'running',
+      steps: ['Inspect GitHub issue context.'],
+      taskId: 'task-1',
+      title: 'Backend package',
+    }]))
+    const packageUpdate = updateChain([{ id: 'pkg-1' }])
+    const securityGateInsert = insertChain([
+      { id: 'gate-security', gateType: 'security_review', title: 'Security review: Backend package' },
+    ])
+    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
+      callback({
+        update: vi.fn().mockReturnValue(packageUpdate),
+        select: vi.fn().mockReturnValue(chain([])),
+        insert: vi.fn().mockReturnValueOnce(securityGateInsert),
+      }),
+    )
+
+    const result = await materializeReviewGatesForWorkPackageCompletion({
+      sourceAgentRunId: 'run-1',
+      sourceArtifactId: 'artifact-1',
+      taskId: 'task-1',
+      workPackageId: 'pkg-1',
+    })
+
+    expect(result).toMatchObject({
+      status: 'materialized',
+      packageStatus: 'awaiting_review',
+      createdGates: [{ id: 'gate-security', gateType: 'security_review', requiredRole: 'reviewer' }],
+    })
+    expect(securityGateInsert.values).toHaveBeenCalledWith(expect.objectContaining({
+      gateType: 'security_review',
+      instructions: expect.stringMatching(/security review/i),
+      metadata: expect.objectContaining({ requiredRole: 'reviewer' }),
+    }))
+  })
+
   it('re-creates a fresh pending gate after a prior rework cycle', async () => {
     mocks.dbSelect.mockReturnValueOnce(chain([{
       id: 'pkg-1',
@@ -365,6 +436,7 @@ describe('review gate contract', () => {
       }]))
       .mockReturnValueOnce(chain([{ reviewRequirement: 'both' }]))
       .mockReturnValueOnce(chain([{ id: 'artifact-1' }]))
+      .mockReturnValueOnce(chain([{ id: 'artifact-1', agentRunId: 'run-1' }]))
       .mockReturnValueOnce(chain([{ status: 'pending' }]))
 
     const result = await decideReviewGate({
@@ -395,6 +467,7 @@ describe('review gate contract', () => {
       }]))
       .mockReturnValueOnce(chain([{ reviewRequirement: 'qa_only' }]))
       .mockReturnValueOnce(chain([{ id: 'artifact-1' }]))
+      .mockReturnValueOnce(chain([{ id: 'artifact-1', agentRunId: 'run-1' }]))
       .mockReturnValueOnce(chain([{ id: 'pkg-1', status: 'completed' }]))
       .mockReturnValueOnce(chain([
         { id: 'gate-qa', gateType: 'qa_review', status: 'completed', workPackageId: 'pkg-1', createdAt: new Date() },
@@ -438,6 +511,7 @@ describe('review gate contract', () => {
       }]))
       .mockReturnValueOnce(chain([{ reviewRequirement: 'reviewer_only' }]))
       .mockReturnValueOnce(chain([{ id: 'artifact-1' }]))
+      .mockReturnValueOnce(chain([{ id: 'artifact-1', agentRunId: 'run-1' }]))
       .mockReturnValueOnce(chain([{ id: 'pkg-1', status: 'completed' }]))
       .mockReturnValueOnce(chain([
         { id: 'gate-reviewer', gateType: 'reviewer_review', status: 'completed', workPackageId: 'pkg-1', createdAt: new Date() },
@@ -466,10 +540,11 @@ describe('review gate contract', () => {
     })
 
     expect(result).toMatchObject({ status: 'decided', decision: 'completed' })
-    // dbSelect is called 5 times: gate, reviewRequirement, sourceArtifact, then
+    // dbSelect is called 6 times: gate, reviewRequirement, sourceArtifact,
+    // latest package artifact, then
     // completeTaskIfReviewGatesSatisfied's package list + gate list. No QA-blocks-
     // reviewer lookup happens for reviewer_only.
-    expect(mocks.dbSelect).toHaveBeenCalledTimes(5)
+    expect(mocks.dbSelect).toHaveBeenCalledTimes(6)
   })
 
   it('completes a both-review package only after QA approves first and then Reviewer approves', async () => {
@@ -485,6 +560,7 @@ describe('review gate contract', () => {
       }]))
       .mockReturnValueOnce(chain([{ reviewRequirement: 'both' }]))
       .mockReturnValueOnce(chain([{ id: 'artifact-1' }]))
+      .mockReturnValueOnce(chain([{ id: 'artifact-1', agentRunId: 'run-1' }]))
     const qaGateUpdate = updateChain([{ id: 'gate-qa' }])
     const qaPackageUpdateAttempt = updateChain([{ id: 'pkg-1' }])
     mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
@@ -524,6 +600,7 @@ describe('review gate contract', () => {
       }]))
       .mockReturnValueOnce(chain([{ reviewRequirement: 'both' }]))
       .mockReturnValueOnce(chain([{ id: 'artifact-1' }]))
+      .mockReturnValueOnce(chain([{ id: 'artifact-1', agentRunId: 'run-1' }]))
       .mockReturnValueOnce(chain([{ status: 'completed' }]))
       .mockReturnValueOnce(chain([{ id: 'pkg-1', status: 'completed' }]))
       .mockReturnValueOnce(chain([
@@ -571,6 +648,7 @@ describe('review gate contract', () => {
       }]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([{ id: 'artifact-1' }]))
+      .mockReturnValueOnce(chain([{ id: 'artifact-1', agentRunId: 'run-1' }]))
       .mockReturnValueOnce(chain([{ status: 'pending' }]))
 
     const result = await decideReviewGate({
@@ -598,6 +676,7 @@ describe('review gate contract', () => {
       }]))
       .mockReturnValueOnce(chain([{ reviewRequirement: 'both' }]))
       .mockReturnValueOnce(chain([{ id: 'artifact-1' }]))
+      .mockReturnValueOnce(chain([{ id: 'artifact-1', agentRunId: 'run-1' }]))
     const gateUpdate = updateChain([{ id: 'gate-qa' }])
     const packageUpdate = updateChain([{ id: 'pkg-1' }])
     const cancelledUpdate = updateChain([{ id: 'gate-reviewer' }])

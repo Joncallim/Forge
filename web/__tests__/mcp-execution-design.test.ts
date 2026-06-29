@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   deriveMcpGrantDecisions,
+  evaluateWorkPackageMcpBroker,
   parseMcpExecutionDesign,
   validateMcpExecutionDesign,
 } from '@/worker/mcp-execution-design'
@@ -284,6 +285,125 @@ describe('deriveMcpGrantDecisions', () => {
       capabilities: [],
       status: 'blocked',
     })
+  })
+
+  it('blocks overlay-only MCP instructions that have no explicit grant decision', () => {
+    const result = evaluateWorkPackageMcpBroker({
+      assignedRole: 'backend',
+      metadata: {
+        promptOverlay: 'GitHub MCP is granted; inspect the repository.',
+      },
+      title: 'Backend package',
+    })
+
+    expect(result.status).toBe('blocked')
+    expect(result.blocked.join('\n')).toMatch(/require at least one explicit/)
+  })
+
+  it('blocks denied or prohibited capabilities even for healthy MCPs', () => {
+    const result = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        capabilities: ['github.pull_requests.merge'],
+        prohibitedCapabilities: ['github.pull_requests.merge'],
+        fallback: { action: 'block' },
+      }],
+      title: 'Backend package',
+    })
+
+    expect(result.status).toBe('blocked')
+    expect(result.blocked.join('\n')).toMatch(/outside the allowed beta scope/)
+  })
+
+  it('allows only explicit safe read/list/search beta capabilities', () => {
+    const allowed = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        capabilities: ['github.issues.read', 'github.repository.search'],
+        fallback: { action: 'block' },
+      }],
+      title: 'Backend package',
+    })
+    expect(allowed.status).toBe('allowed')
+
+    const blocked = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        capabilities: ['GitHub.Repository.Write', 'github.actions.write', 'github.secrets.write'],
+        fallback: { action: 'block' },
+      }],
+      title: 'Backend package',
+    })
+    expect(blocked.status).toBe('blocked')
+    expect(blocked.blocked.join('\n')).toMatch(/github\.repository\.write/)
+    expect(blocked.blocked.join('\n')).toMatch(/github\.actions\.write/)
+    expect(blocked.blocked.join('\n')).toMatch(/github\.secrets\.write/)
+  })
+
+  it('re-evaluates stale blocked grant snapshots against current MCP health', () => {
+    const result = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      harnessToolPolicy: {
+        mcpGrants: [{
+          mcpId: 'github',
+          requirement: 'required',
+          status: 'blocked',
+          capabilities: ['github.issues.read'],
+          fallback: { action: 'block' },
+        }],
+      },
+      title: 'Backend package',
+    })
+
+    expect(result.status).toBe('warnings')
+    expect(result.blocked).toEqual([])
+    expect(result.warnings.join('\n')).toMatch(/previously blocked/)
+  })
+
+  it('blocks unsafe or uncovered MCP-aware subtask capabilities', () => {
+    const unsafe = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        capabilities: ['github.issues.read'],
+        fallback: { action: 'block' },
+      }],
+      metadata: {
+        mcpAwareSubtasks: [{
+          id: 'merge-pr',
+          mcpCapabilities: ['github.pull_requests.merge'],
+        }],
+      },
+      title: 'Backend package',
+    })
+    expect(unsafe.status).toBe('blocked')
+    expect(unsafe.blocked.join('\n')).toMatch(/outside the allowed beta scope/)
+
+    const uncovered = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        capabilities: ['github.issues.read'],
+        fallback: { action: 'block' },
+      }],
+      metadata: {
+        mcpAwareSubtasks: [{
+          id: 'read-repo',
+          mcpCapabilities: ['github.repository.read'],
+        }],
+      },
+      title: 'Backend package',
+    })
+    expect(uncovered.status).toBe('blocked')
+    expect(uncovered.blocked.join('\n')).toMatch(/not covered by an explicit approved grant/)
   })
 
   it('returns an empty preview when the Architect omitted the design block', () => {

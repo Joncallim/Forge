@@ -1,34 +1,53 @@
 import { and, asc, desc, eq, inArray } from 'drizzle-orm'
 import { db } from '../db'
-import { approvalGates, artifacts, workPackages } from '../db/schema'
+import { agentRuns, approvalGates, artifacts, workPackages } from '../db/schema'
 import { publishTaskEvent } from './events'
 import { updateTaskStatusIfCurrent } from './task-state'
 
-export const REVIEW_GATE_TYPES = ['qa_review', 'reviewer_review'] as const
+export const REVIEW_GATE_TYPES = ['qa_review', 'reviewer_review', 'security_review'] as const
 export type ReviewGateType = typeof REVIEW_GATE_TYPES[number]
 export type ReviewGateDecision = 'completed' | 'needs_rework'
 export type ReviewRequirement = 'none' | 'qa_only' | 'reviewer_only' | 'both'
 
 const REVIEW_GATE_TYPE_VALUES = [...REVIEW_GATE_TYPES]
-const REVIEW_EXEMPT_ROLES = new Set(['architect', 'handoff', 'pm', 'qa', 'reviewer'])
+const STANDARD_REVIEW_GATE_TYPES: ReviewGateType[] = ['qa_review', 'reviewer_review']
+const REVIEW_EXEMPT_ROLES = new Set([
+  'architect',
+  'handoff',
+  'pm',
+  'qa',
+  'reviewer',
+  'security',
+  'security-review',
+  'security_review',
+])
+const HIGH_RISK_TEXT_PATTERN =
+  /\b(auth|authorization|authenticate|oauth|login|session|cookie|csrf|jwt|token|secret|password|api\s*key|credential|filesystem|file\s*system|fs|shell|command|exec|spawn|child_process|terminal|repository|repo|git|github|pull\s*request|pr|branch|commit|merge|diff|checkout)\b/i
+const SECURITY_REVIEW_CAPABILITY_PATTERN = /\bsecurity[-_\s]?review\b/i
 
 function isReviewRequirement(value: string): value is ReviewRequirement {
   return value === 'none' || value === 'qa_only' || value === 'reviewer_only' || value === 'both'
 }
 
 export function requiredGateTypesForRequirement(requirement: string): ReviewGateType[] {
-  if (!isReviewRequirement(requirement)) return [...REVIEW_GATE_TYPES]
+  if (!isReviewRequirement(requirement)) return [...STANDARD_REVIEW_GATE_TYPES]
   if (requirement === 'none') return []
   if (requirement === 'qa_only') return ['qa_review']
   if (requirement === 'reviewer_only') return ['reviewer_review']
-  return [...REVIEW_GATE_TYPES]
+  return [...STANDARD_REVIEW_GATE_TYPES]
 }
 
 type ReviewGatePackage = {
+  acceptanceCriteria?: unknown
   id: string
   assignedRole: string
+  mcpRequirements?: unknown
+  metadata?: unknown
+  requiredCapabilities?: unknown
   reviewRequirement: string
+  steps?: unknown
   status: string
+  summary?: string | null
   taskId: string
   title: string
 }
@@ -75,8 +94,32 @@ function metadataRecord(value: unknown): Record<string, unknown> {
   return isRecord(value) ? value : {}
 }
 
+function recordArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => isRecord(item))
+    : []
+}
+
+function flattenStrings(value: unknown, result: string[] = []): string[] {
+  if (typeof value === 'string') {
+    result.push(value)
+    return result
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) flattenStrings(item, result)
+    return result
+  }
+
+  if (isRecord(value)) {
+    for (const item of Object.values(value)) flattenStrings(item, result)
+  }
+
+  return result
+}
+
 export function isReviewGateType(value: string | null | undefined): value is ReviewGateType {
-  return value === 'qa_review' || value === 'reviewer_review'
+  return value === 'qa_review' || value === 'reviewer_review' || value === 'security_review'
 }
 
 export function requiredRoleForGate(gateType: ReviewGateType): 'qa' | 'reviewer' {
@@ -88,7 +131,65 @@ export function isImplementationPackageRole(role: string): boolean {
   return normalized !== '' && !REVIEW_EXEMPT_ROLES.has(normalized)
 }
 
+export function isHighRiskImplementationPackage(pkg: {
+  acceptanceCriteria?: unknown
+  assignedRole: string
+  mcpRequirements?: unknown
+  metadata?: unknown
+  requiredCapabilities?: unknown
+  steps?: unknown
+  summary?: string | null
+  title?: string | null
+}): boolean {
+  if (!isImplementationPackageRole(pkg.assignedRole)) return false
+
+  const metadata = metadataRecord(pkg.metadata)
+  if (
+    recordArray(pkg.mcpRequirements).length > 0 ||
+    recordArray(metadata.mcpGrants).length > 0 ||
+    recordArray(metadata.mcpAwareSubtasks).length > 0 ||
+    typeof metadata.promptOverlay === 'string'
+  ) {
+    return true
+  }
+
+  const searchable = flattenStrings([
+    pkg.acceptanceCriteria,
+    pkg.requiredCapabilities,
+    pkg.steps,
+    pkg.summary,
+    pkg.title,
+    metadata.promptOverlay,
+    metadata.mcpAwareSubtasks,
+    metadata.plannedTasks,
+  ]).join('\n')
+
+  return SECURITY_REVIEW_CAPABILITY_PATTERN.test(searchable) || HIGH_RISK_TEXT_PATTERN.test(searchable)
+}
+
+function requiredGateTypesForPackage(pkg: ReviewGatePackage | null): ReviewGateType[] {
+  if (!pkg) return requiredGateTypesForRequirement('both')
+  const gateTypes = requiredGateTypesForRequirement(pkg.reviewRequirement ?? 'both')
+  const assignedRole = typeof pkg.assignedRole === 'string' ? pkg.assignedRole : ''
+  if (assignedRole !== '' && !isImplementationPackageRole(assignedRole)) return []
+
+  if (assignedRole !== '' && isHighRiskImplementationPackage({
+    acceptanceCriteria: pkg.acceptanceCriteria,
+    assignedRole,
+    mcpRequirements: pkg.mcpRequirements,
+    metadata: pkg.metadata,
+    requiredCapabilities: pkg.requiredCapabilities,
+    steps: pkg.steps,
+    summary: pkg.summary,
+    title: pkg.title,
+  }) && !gateTypes.includes('security_review')) {
+    gateTypes.push('security_review')
+  }
+  return gateTypes
+}
+
 function reviewGateTitle(gateType: ReviewGateType, pkg: ReviewGatePackage): string {
+  if (gateType === 'security_review') return `Security review: ${pkg.title}`
   const role = requiredRoleForGate(gateType)
   return `${role === 'qa' ? 'QA' : 'Reviewer'} review: ${pkg.title}`
 }
@@ -96,6 +197,9 @@ function reviewGateTitle(gateType: ReviewGateType, pkg: ReviewGatePackage): stri
 function reviewGateInstructions(gateType: ReviewGateType, pkg: ReviewGatePackage): string {
   if (gateType === 'qa_review') {
     return `QA must verify the output for "${pkg.title}" before reviewer approval.`
+  }
+  if (gateType === 'security_review') {
+    return `Reviewer must perform a security review for high-risk implementation output from "${pkg.title}".`
   }
   return `Reviewer must approve the output for "${pkg.title}" after QA completion.`
 }
@@ -117,10 +221,16 @@ function reviewGateMetadata(
 async function loadPackage(taskId: string, workPackageId: string): Promise<ReviewGatePackage | null> {
   const [pkg] = await db
     .select({
+      acceptanceCriteria: workPackages.acceptanceCriteria,
       id: workPackages.id,
       assignedRole: workPackages.assignedRole,
+      mcpRequirements: workPackages.mcpRequirements,
+      metadata: workPackages.metadata,
+      requiredCapabilities: workPackages.requiredCapabilities,
       reviewRequirement: workPackages.reviewRequirement,
+      steps: workPackages.steps,
       status: workPackages.status,
+      summary: workPackages.summary,
       taskId: workPackages.taskId,
       title: workPackages.title,
     })
@@ -143,9 +253,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
   }
 
   const now = new Date()
-  const requiredGateTypes = isImplementationPackageRole(pkg.assignedRole)
-    ? requiredGateTypesForRequirement(pkg.reviewRequirement)
-    : []
+  const requiredGateTypes = requiredGateTypesForPackage(pkg)
   const reviewRequired = requiredGateTypes.length > 0
   const packageStatus = reviewRequired ? 'awaiting_review' : 'completed'
 
@@ -166,6 +274,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
     const existingGates = await tx
       .select({
         gateType: approvalGates.gateType,
+        sourceAgentRunId: approvalGates.sourceAgentRunId,
         sourceArtifactId: approvalGates.sourceArtifactId,
         status: approvalGates.status,
       })
@@ -183,11 +292,40 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
     // completed gate only still satisfies the requirement if it was decided
     // against the artifact we're materializing for now — a completed gate tied
     // to an older artifact is stale and must be replaced by a fresh pending one.
+    const stalePendingGateTypes = existingGates
+      .filter((gate) =>
+        gate.status === 'pending' &&
+        (gate.sourceArtifactId !== input.sourceArtifactId || gate.sourceAgentRunId !== input.sourceAgentRunId)
+      )
+      .map((gate) => gate.gateType)
+
+    if (stalePendingGateTypes.length > 0) {
+      await tx
+        .update(approvalGates)
+        .set({
+          status: 'cancelled',
+          updatedAt: now,
+          metadata: {
+            cancelledReason: 'Stale pending gate replaced for a newer package artifact.',
+            source: 'review-gates',
+          },
+        })
+        .where(
+          and(
+            eq(approvalGates.taskId, input.taskId),
+            eq(approvalGates.workPackageId, pkg.id),
+            eq(approvalGates.status, 'pending'),
+            inArray(approvalGates.gateType, stalePendingGateTypes),
+          ),
+        )
+    }
+
     const existingGateTypes = new Set(
       existingGates
         .filter((gate) =>
-          gate.status === 'pending' ||
-          (gate.status === 'completed' && gate.sourceArtifactId === input.sourceArtifactId),
+          (gate.status === 'pending' || gate.status === 'completed') &&
+          gate.sourceArtifactId === input.sourceArtifactId &&
+          gate.sourceAgentRunId === input.sourceAgentRunId,
         )
         .map((gate) => gate.gateType),
     )
@@ -335,7 +473,7 @@ export async function decideReviewGate(input: {
 
   if (!gate) return { status: 'not_found', message: 'Approval gate not found.' }
   if (!isReviewGateType(gate.gateType)) {
-    return { status: 'not_review_gate', message: 'Only QA and Reviewer gates can be decided here.' }
+    return { status: 'not_review_gate', message: 'Only QA, Reviewer, and Security gates can be decided here.' }
   }
   if (gate.status !== 'pending') {
     return { status: 'already_decided', message: `Approval gate is already ${gate.status}.` }
@@ -359,11 +497,24 @@ export async function decideReviewGate(input: {
   const sourceAgentRunId = gate.sourceAgentRunId
 
   const [workPackage] = await db
-    .select({ reviewRequirement: workPackages.reviewRequirement })
+    .select({
+      acceptanceCriteria: workPackages.acceptanceCriteria,
+      assignedRole: workPackages.assignedRole,
+      id: workPackages.id,
+      mcpRequirements: workPackages.mcpRequirements,
+      metadata: workPackages.metadata,
+      requiredCapabilities: workPackages.requiredCapabilities,
+      reviewRequirement: workPackages.reviewRequirement,
+      status: workPackages.status,
+      steps: workPackages.steps,
+      summary: workPackages.summary,
+      taskId: workPackages.taskId,
+      title: workPackages.title,
+    })
     .from(workPackages)
     .where(eq(workPackages.id, workPackageId))
     .limit(1)
-  const requiredGateTypes = requiredGateTypesForRequirement(workPackage?.reviewRequirement ?? 'both')
+  const requiredGateTypes = requiredGateTypesForPackage(workPackage ?? null)
 
   const [sourceArtifact] = await db
     .select({ id: artifacts.id })
@@ -380,6 +531,27 @@ export async function decideReviewGate(input: {
     return {
       status: 'source_artifact_mismatch',
       message: 'Review gate source artifact is not available. Reload the task before deciding this review.',
+    }
+  }
+
+  const [latestPackageArtifact] = await db
+    .select({
+      id: artifacts.id,
+      agentRunId: artifacts.agentRunId,
+    })
+    .from(artifacts)
+    .innerJoin(agentRuns, eq(artifacts.agentRunId, agentRuns.id))
+    .where(and(eq(agentRuns.taskId, input.taskId), eq(agentRuns.workPackageId, workPackageId)))
+    .orderBy(desc(artifacts.createdAt))
+    .limit(1)
+
+  if (
+    latestPackageArtifact &&
+    (latestPackageArtifact.id !== input.sourceArtifactId || latestPackageArtifact.agentRunId !== sourceAgentRunId)
+  ) {
+    return {
+      status: 'source_artifact_mismatch',
+      message: 'Review gate source artifact is stale. Reload the task before deciding this review.',
     }
   }
 

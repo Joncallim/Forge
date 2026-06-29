@@ -1,7 +1,21 @@
 import { and, asc, eq, inArray } from 'drizzle-orm'
 import { db } from '../db'
-import { agentRuns, artifacts, vcsChanges, workPackageDependencies, workPackages } from '../db/schema'
+import {
+  agentHarnesses,
+  agentRuns,
+  artifacts,
+  projects,
+  tasks,
+  vcsChanges,
+  workPackageDependencies,
+  workPackages,
+} from '../db/schema'
+import { getProjectMcpOverview } from '../lib/mcps/manager'
 import { publishTaskEvent } from './events'
+import {
+  evaluateWorkPackageMcpBroker,
+  hasWorkPackageMcpRuntimeInputs,
+} from './mcp-execution-design'
 import {
   completeTaskIfReviewGatesSatisfied,
   materializeReviewGatesForWorkPackageCompletion,
@@ -22,6 +36,9 @@ type HandoffPackage = {
   id: string
   assignedRole: string
   harnessId: string | null
+  harnessToolPolicy?: unknown
+  mcpRequirements?: unknown
+  metadata?: unknown
   sequence: number
   status: string
   title: string
@@ -185,9 +202,10 @@ export type WorkPackageHandoffResult =
       claimedPackageId: null
     }
   | {
-      status: 'handed_off' | 'already_handed_off' | 'no_ready_packages' | 'ready_only'
+      status: 'blocked' | 'handed_off' | 'already_handed_off' | 'no_ready_packages' | 'ready_only'
       readyPackageIds: string[]
       claimedPackageId: string | null
+      blockedReason?: string
     }
 
 export function isWorkPackageHandoffEnabled(
@@ -222,7 +240,7 @@ export function computeReadyWorkPackageIds(
   }
 
   return packages
-    .filter((pkg) => pkg.status === 'pending' || pkg.status === 'needs_rework')
+    .filter((pkg) => pkg.status === 'pending' || pkg.status === 'needs_rework' || pkg.status === 'blocked')
     .filter((pkg) =>
       (dependenciesByPackageId.get(pkg.id) ?? []).every((dependencyId) =>
         completedPackageIds.has(dependencyId),
@@ -238,11 +256,15 @@ async function loadHandoffState(taskId: string): Promise<HandoffState> {
       id: workPackages.id,
       assignedRole: workPackages.assignedRole,
       harnessId: workPackages.harnessId,
+      harnessToolPolicy: agentHarnesses.toolPolicy,
+      mcpRequirements: workPackages.mcpRequirements,
+      metadata: workPackages.metadata,
       sequence: workPackages.sequence,
       status: workPackages.status,
       title: workPackages.title,
     })
     .from(workPackages)
+    .leftJoin(agentHarnesses, eq(agentHarnesses.id, workPackages.harnessId))
     .where(eq(workPackages.taskId, taskId))
     .orderBy(asc(workPackages.sequence), asc(workPackages.createdAt))
 
@@ -278,6 +300,89 @@ async function loadHandoffState(taskId: string): Promise<HandoffState> {
     packages: packageRows,
     readyPackageIds,
   }
+}
+
+async function loadTaskProjectForMcpBroker(taskId: string) {
+  const [row] = await db
+    .select({ project: projects })
+    .from(tasks)
+    .innerJoin(projects, eq(tasks.projectId, projects.id))
+    .where(eq(tasks.id, taskId))
+    .limit(1)
+
+  return row?.project ?? null
+}
+
+async function failWorkPackageForMcpBroker(input: {
+  blocked: string[]
+  blockedReason: string
+  pkg: HandoffPackage
+  taskId: string
+  warnings: string[]
+}): Promise<{ blockedReason: string; status: 'blocked' }> {
+  const blockedAt = new Date()
+  await db
+    .update(workPackages)
+    .set({
+      blockedReason: input.blockedReason,
+      status: 'blocked',
+      updatedAt: blockedAt,
+    })
+    .where(and(eq(workPackages.id, input.pkg.id), inArray(workPackages.status, ['pending', 'ready', 'needs_rework', 'blocked'])))
+
+  await publishTaskEvent(input.taskId, 'work_package:status', {
+    blockedReason: input.blockedReason,
+    mcpBroker: {
+      blocked: input.blocked,
+      status: 'blocked',
+      warnings: input.warnings,
+    },
+    status: 'blocked',
+    updatedAt: blockedAt.toISOString(),
+    workPackageId: input.pkg.id,
+  })
+
+  return { blockedReason: input.blockedReason, status: 'blocked' }
+}
+
+async function assertWorkPackageMcpBrokerAllowsHandoff(
+  taskId: string,
+  pkg: HandoffPackage,
+): Promise<{ blockedReason: string; status: 'blocked' } | { status: 'allowed' }> {
+  if (!hasWorkPackageMcpRuntimeInputs(pkg)) return { status: 'allowed' }
+
+  const project = await loadTaskProjectForMcpBroker(taskId)
+  if (!project) {
+    const blockedReason = `MCP/capability broker blocked "${pkg.title}": project MCP overview could not be loaded.`
+    return failWorkPackageForMcpBroker({
+      blocked: ['Project MCP overview could not be loaded.'],
+      blockedReason,
+      pkg,
+      taskId,
+      warnings: [],
+    })
+  }
+
+  const mcpOverview = await getProjectMcpOverview(project)
+  const check = evaluateWorkPackageMcpBroker({
+    assignedRole: pkg.assignedRole,
+    harnessToolPolicy: pkg.harnessToolPolicy,
+    mcpOverview,
+    mcpRequirements: pkg.mcpRequirements,
+    metadata: pkg.metadata,
+    title: pkg.title,
+  })
+
+  if (check.status !== 'blocked') return { status: 'allowed' }
+
+  const blockedReason = check.blockedReason ?? 'MCP/capability broker blocked this work package.'
+  return failWorkPackageForMcpBroker({
+    blocked: check.blocked,
+    blockedReason,
+    pkg,
+    taskId,
+    warnings: check.warnings,
+  })
 }
 
 export async function progressWorkforce(
@@ -345,8 +450,8 @@ export async function handoffApprovedWorkPackages(
   for (const packageId of state.readyPackageIds) {
     const [updated] = await db
       .update(workPackages)
-      .set({ status: 'ready', updatedAt: now })
-      .where(and(eq(workPackages.id, packageId), inArray(workPackages.status, ['pending', 'needs_rework'])))
+      .set({ blockedReason: null, status: 'ready', updatedAt: now })
+      .where(and(eq(workPackages.id, packageId), inArray(workPackages.status, ['pending', 'needs_rework', 'blocked'])))
       .returning({ id: workPackages.id })
 
     if (updated) {
@@ -374,6 +479,16 @@ export async function handoffApprovedWorkPackages(
   const nextPackage = state.nextPackage
   if (!nextPackage) {
     return { status: 'no_ready_packages', readyPackageIds: state.readyPackageIds, claimedPackageId: null }
+  }
+
+  const broker = await assertWorkPackageMcpBrokerAllowsHandoff(taskId, nextPackage)
+  if (broker.status === 'blocked') {
+    return {
+      status: 'blocked',
+      readyPackageIds: state.readyPackageIds,
+      claimedPackageId: null,
+      blockedReason: broker.blockedReason,
+    }
   }
 
   if (isWorkPackageExecutionEnabled()) {

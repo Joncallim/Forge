@@ -157,6 +157,40 @@ describe('processApproval handoff', () => {
     }))
   })
 
+  it('keeps broker-blocked handoff recoverable instead of failing the task', async () => {
+    mocks.dbSelect.mockReturnValue(chain([{ status: 'approved' }]))
+    const runningUpdate = updateChain([{ id: 'task-1' }])
+    const restoreUpdate = updateChain([{ id: 'task-1' }])
+    mocks.dbUpdate
+      .mockReturnValueOnce(runningUpdate)
+      .mockReturnValueOnce(restoreUpdate)
+    mocks.previewWorkPackageHandoff.mockResolvedValue({
+      status: 'claimable',
+      readyPackageIds: ['pkg-1'],
+      claimedPackageId: 'pkg-1',
+    })
+    mocks.handoffApprovedWorkPackages.mockResolvedValue({
+      status: 'blocked',
+      readyPackageIds: ['pkg-1'],
+      claimedPackageId: null,
+      blockedReason: 'MCP/capability broker blocked "Backend package": Connect GitHub.',
+    })
+
+    await processApproval('task-1', { finalAttempt: true })
+
+    expect(runningUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
+    expect(restoreUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      errorMessage: 'MCP/capability broker blocked "Backend package": Connect GitHub.',
+      status: 'approved',
+    }))
+    expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', {
+      blockedReason: 'MCP/capability broker blocked "Backend package": Connect GitHub.',
+      claimedPackageId: null,
+      readyPackageIds: ['pkg-1'],
+      status: 'blocked',
+    })
+  })
+
   it('does not move the task to running when no package can be claimed', async () => {
     mocks.dbSelect.mockReturnValue(chain([{ status: 'approved' }]))
     mocks.previewWorkPackageHandoff.mockResolvedValue({

@@ -203,6 +203,66 @@ describe('executeWorkPackage', () => {
     })
   })
 
+  it('includes package MCP overlay, requirements, and subtasks in the execution prompt only as run-scoped instructions', async () => {
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Captured scoped instructions.',
+        files: [{ path: 'package.json', content: '{}' }],
+        commands: [],
+      }),
+    })
+
+    await executeWorkPackage(context({
+      agentConfig: {
+        id: 'agent-1',
+        agentType: 'backend',
+        displayName: 'Backend',
+        description: '',
+        frontmatterOverrides: null,
+        isActive: true,
+        isSystem: true,
+        providerConfigId: null,
+        systemPrompt: 'Permanent backend system prompt.',
+        updatedAt: now,
+        updatedBy: null,
+      },
+      workPackage: {
+        ...context().workPackage,
+        assignedRole: 'backend',
+        mcpRequirements: [{
+          mcpId: 'github',
+          requirement: 'required',
+          permissions: ['github.issues.read'],
+          reason: 'Inspect the approved issue context.',
+          fallback: { action: 'block' },
+        }],
+        metadata: {
+          promptOverlay: 'Use GitHub read tools only for this approved run.',
+          mcpAwareSubtasks: [{
+            id: 'inspect-issue',
+            mcpCapabilities: ['github.issues.read'],
+            inputs: ['Task prompt'],
+            outputs: ['Issue context'],
+            verification: ['Issue context captured'],
+            fallback: 'Use local task context if MCP is unavailable.',
+          }],
+        },
+      },
+    }))
+
+    const call = mocks.generateText.mock.calls[0][0]
+    expect(call.system).toBe('Permanent backend system prompt.')
+    expect(call.system).not.toContain('Use GitHub read tools only')
+    expect(call.prompt).toContain('Run-scoped MCP/capability instructions:')
+    expect(call.prompt).toContain('They do not modify the permanent agent system prompt')
+    expect(call.prompt).toContain('Use GitHub read tools only for this approved run.')
+    expect(call.prompt).toContain('MCP requirements for this run:')
+    expect(call.prompt).toContain('github.issues.read')
+    expect(call.prompt).toContain('MCP-aware subtasks for this run:')
+    expect(call.prompt).toContain('inspect-issue')
+  })
+
   it('does not execute model-generated npm scripts while validating commands', async () => {
     const outsideFile = path.join(tempRoot, 'outside.txt')
     mocks.generateText.mockResolvedValue({

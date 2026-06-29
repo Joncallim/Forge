@@ -624,13 +624,108 @@ function defaultSystemPrompt(role: string): string {
   ].join('\n')
 }
 
-function buildExecutionPrompt(input: {
+function cleanPromptText(value: unknown, maxLength: number): string {
+  if (typeof value !== 'string') return ''
+  return value.trim().replace(/\s+/g, ' ').slice(0, maxLength)
+}
+
+function cleanPromptTextArray(value: unknown, maxItems: number, maxLength: number): string[] {
+  if (!Array.isArray(value)) return []
+  const result: string[] = []
+  for (const item of value) {
+    const text = cleanPromptText(item, maxLength)
+    if (text === '') continue
+    result.push(text)
+    if (result.length >= maxItems) break
+  }
+  return result
+}
+
+function promptRecordArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => isRecord(item))
+    : []
+}
+
+function mcpCapabilityList(requirement: Record<string, unknown>): string[] {
+  const permissions = cleanPromptTextArray(requirement.permissions, 20, 100)
+  if (permissions.length > 0) return permissions
+  return cleanPromptTextArray(requirement.capabilities, 20, 100)
+}
+
+function formatMcpRequirement(requirement: Record<string, unknown>): string {
+  const mcpId = cleanPromptText(requirement.mcpId, 80) || 'unknown-mcp'
+  const requirementLevel = requirement.requirement === 'optional' ? 'optional' : 'required'
+  const reason = cleanPromptText(requirement.reason, 240)
+  const capabilities = mcpCapabilityList(requirement)
+  const fallback = isRecord(requirement.fallback)
+    ? cleanPromptText(requirement.fallback.action, 80) || 'ask_user'
+    : 'ask_user'
+  return [
+    `- ${mcpId} (${requirementLevel})`,
+    capabilities.length > 0 ? `capabilities: ${capabilities.join(', ')}` : 'capabilities: none listed',
+    `fallback: ${fallback}`,
+    reason ? `reason: ${reason}` : null,
+  ].filter((part): part is string => part !== null).join('; ')
+}
+
+function formatMcpAwareSubtask(subtask: Record<string, unknown>): string {
+  const id = cleanPromptText(subtask.id, 80) || 'unnamed-subtask'
+  const capabilities = cleanPromptTextArray(subtask.mcpCapabilities, 20, 100)
+  const inputs = cleanPromptTextArray(subtask.inputs, 10, 120)
+  const outputs = cleanPromptTextArray(subtask.outputs, 10, 120)
+  const verification = cleanPromptTextArray(subtask.verification, 10, 160)
+  const fallback = cleanPromptText(subtask.fallback, 240)
+  return [
+    `- ${id}`,
+    capabilities.length > 0 ? `capabilities: ${capabilities.join(', ')}` : null,
+    inputs.length > 0 ? `inputs: ${inputs.join(', ')}` : null,
+    outputs.length > 0 ? `outputs: ${outputs.join(', ')}` : null,
+    verification.length > 0 ? `verification: ${verification.join(', ')}` : null,
+    fallback ? `fallback: ${fallback}` : null,
+  ].filter((part): part is string => part !== null).join('; ')
+}
+
+function buildRunScopedMcpPromptLines(workPackage: WorkPackageRow): string[] {
+  const metadata = isRecord(workPackage.metadata) ? workPackage.metadata : {}
+  const promptOverlay = cleanPromptText(metadata.promptOverlay, 2_000)
+  const requirements = promptRecordArray(workPackage.mcpRequirements)
+  const subtasks = promptRecordArray(metadata.mcpAwareSubtasks)
+
+  if (promptOverlay === '' && requirements.length === 0 && subtasks.length === 0) return []
+
+  const lines = [
+    'Run-scoped MCP/capability instructions:',
+    '- These instructions apply only to this work-package run. They do not modify the permanent agent system prompt or future runs.',
+    '- Forge execution remains sandbox-only; do not assume real MCP tools, credentials, repository writes, or external services are available unless this run explicitly provides them.',
+  ]
+
+  if (promptOverlay !== '') {
+    lines.push('', 'Prompt overlay for this run:', promptOverlay)
+  }
+
+  if (requirements.length > 0) {
+    lines.push('', 'MCP requirements for this run:')
+    lines.push(...requirements.map(formatMcpRequirement))
+  }
+
+  if (subtasks.length > 0) {
+    lines.push('', 'MCP-aware subtasks for this run:')
+    lines.push(...subtasks.map(formatMcpAwareSubtask))
+  }
+
+  return lines
+}
+
+export function buildExecutionPrompt(input: {
   hostProjectRoot: string
   projectFiles: string[]
   sandboxRoot: string
   task: TaskRow
   workPackage: WorkPackageRow
 }): string {
+  const runScopedMcpLines = buildRunScopedMcpPromptLines(input.workPackage)
+
   return [
     `Host project root: ${input.hostProjectRoot}`,
     `Execution sandbox root: ${input.sandboxRoot}`,
@@ -646,6 +741,8 @@ function buildExecutionPrompt(input: {
     'Work package steps:',
     ...(input.workPackage.steps.length > 0 ? input.workPackage.steps.map((step) => `- ${step}`) : ['- Complete the assigned work package.']),
     '',
+    ...runScopedMcpLines,
+    ...(runScopedMcpLines.length > 0 ? [''] : []),
     'Existing project files:',
     ...(input.projectFiles.length > 0 ? input.projectFiles.map((file) => `- ${file}`) : ['- (empty project folder)']),
     '',

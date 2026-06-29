@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
     }),
   ),
   dbUpdate: vi.fn(),
+  getProjectMcpOverview: vi.fn(),
   materializeReviewGatesForWorkPackageCompletion: vi.fn(),
   completeTaskIfReviewGatesSatisfied: vi.fn(),
   publishTaskEvent: vi.fn(),
@@ -28,6 +29,10 @@ vi.mock('@/worker/events', () => ({
   publishTaskEvent: mocks.publishTaskEvent,
 }))
 
+vi.mock('@/lib/mcps/manager', () => ({
+  getProjectMcpOverview: mocks.getProjectMcpOverview,
+}))
+
 vi.mock('@/worker/review-gates', () => ({
   materializeReviewGatesForWorkPackageCompletion: mocks.materializeReviewGatesForWorkPackageCompletion,
   completeTaskIfReviewGatesSatisfied: mocks.completeTaskIfReviewGatesSatisfied,
@@ -42,7 +47,7 @@ function chain(resolveValue: unknown) {
     catch: (onRejected: (e: unknown) => unknown) =>
       Promise.resolve(resolveValue).catch(onRejected),
   }
-  const methods = ['from', 'where', 'limit', 'orderBy', 'values', 'returning', 'set', 'offset', 'innerJoin']
+  const methods = ['from', 'where', 'limit', 'orderBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'leftJoin']
   methods.forEach((method) => {
     thenable[method] = () => thenable
   })
@@ -64,6 +69,21 @@ function insertChain(returnValue: unknown = []) {
 describe('handoffApprovedWorkPackages', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mocks.getProjectMcpOverview.mockResolvedValue({
+      projectId: 'project-1',
+      config: { profile: 'default', requiredMcps: [], overrides: {} },
+      catalog: [],
+      mcpsRoot: '/tmp/forge/mcps',
+      statuses: [],
+      summary: {
+        label: 'No MCPs configured',
+        status: 'missing',
+        missing: 0,
+        authRequired: 0,
+        unhealthy: 0,
+        disabled: 0,
+      },
+    })
     mocks.materializeReviewGatesForWorkPackageCompletion.mockResolvedValue({
       status: 'materialized',
       packageStatus: 'awaiting_review',
@@ -240,5 +260,237 @@ describe('handoffApprovedWorkPackages', () => {
       claimedPackageId: 'pkg-1',
     })
     expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1')
+  })
+
+  it('blocks a required unavailable MCP before claiming the package', async () => {
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([
+        {
+          id: 'pkg-1',
+          assignedRole: 'backend',
+          harnessId: 'harness-1',
+          harnessToolPolicy: {
+            mcpGrants: [{
+              mcpId: 'github',
+              requirement: 'required',
+              status: 'blocked',
+              capabilities: ['github.issues.read'],
+              fallback: { action: 'block', message: 'Connect GitHub first.' },
+            }],
+          },
+          mcpRequirements: [{
+            mcpId: 'github',
+            requirement: 'required',
+            permissions: ['github.issues.read'],
+            fallback: { action: 'block', message: 'Connect GitHub first.' },
+          }],
+          metadata: {},
+          sequence: 1,
+          status: 'pending',
+          title: 'Backend package',
+        },
+      ]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+    mocks.getProjectMcpOverview.mockResolvedValue({
+      projectId: 'project-1',
+      config: { profile: 'default', requiredMcps: [], overrides: {} },
+      catalog: [],
+      mcpsRoot: '/tmp/forge/mcps',
+      statuses: [],
+      summary: {
+        label: 'No MCPs configured',
+        status: 'missing',
+        missing: 1,
+        authRequired: 0,
+        unhealthy: 0,
+        disabled: 0,
+      },
+    })
+
+    const readyUpdate = updateChain([{ id: 'pkg-1' }])
+    const blockUpdate = updateChain([{ id: 'pkg-1' }])
+    mocks.dbUpdate
+      .mockReturnValueOnce(readyUpdate)
+      .mockReturnValueOnce(blockUpdate)
+
+    const result = await handoffApprovedWorkPackages('task-1')
+
+    expect(result).toMatchObject({
+      status: 'blocked',
+      claimedPackageId: null,
+      blockedReason: expect.stringContaining("MCP 'github' is not configured"),
+    })
+
+    expect(blockUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      blockedReason: expect.stringContaining("MCP 'github' is not configured"),
+      status: 'blocked',
+    }))
+    expect(mocks.dbTransaction).not.toHaveBeenCalled()
+    expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
+      blockedReason: expect.stringContaining("MCP 'github' is not configured"),
+      status: 'blocked',
+      workPackageId: 'pkg-1',
+    }))
+  })
+
+  it('continues handoff for an optional unavailable MCP with continue_without_mcp fallback', async () => {
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([
+        {
+          id: 'pkg-1',
+          assignedRole: 'backend',
+          harnessId: 'harness-1',
+          harnessToolPolicy: null,
+          mcpRequirements: [{
+            mcpId: 'github',
+            requirement: 'optional',
+            permissions: ['github.issues.read'],
+            fallback: { action: 'continue_without_mcp', message: 'Use local context.' },
+          }],
+          metadata: {},
+          sequence: 1,
+          status: 'pending',
+          title: 'Backend package',
+        },
+      ]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+
+    const readyUpdate = updateChain([{ id: 'pkg-1' }])
+    const claimUpdate = updateChain([{ id: 'pkg-1' }])
+    mocks.dbUpdate.mockReturnValueOnce(readyUpdate)
+    const run = {
+      id: 'run-1',
+      agentType: 'handoff',
+      modelIdUsed: 'forge-handoff/no-op',
+      stage: 'handoff',
+      status: 'completed',
+    }
+    const artifact = {
+      id: 'artifact-1',
+      agentRunId: 'run-1',
+      artifactType: 'log_output',
+      content: 'handoff log',
+      metadata: {},
+      createdAt: new Date('2026-06-25T00:00:00.000Z'),
+    }
+    const runInsert = insertChain([run])
+    const artifactInsert = insertChain([artifact])
+    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
+      callback({
+        insert: vi.fn()
+          .mockReturnValueOnce(runInsert)
+          .mockReturnValueOnce(artifactInsert),
+        update: vi.fn().mockReturnValueOnce(claimUpdate),
+      }),
+    )
+
+    const result = await handoffApprovedWorkPackages('task-1')
+
+    expect(result).toMatchObject({
+      status: 'handed_off',
+      claimedPackageId: 'pkg-1',
+    })
+    expect(claimUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      blockedReason: null,
+      status: 'running',
+    }))
+    expect(mocks.publishTaskEvent).not.toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
+      status: 'blocked',
+      workPackageId: 'pkg-1',
+    }))
+  })
+
+  it('recovers a previously broker-blocked package once MCP access is available', async () => {
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([
+        {
+          id: 'pkg-1',
+          assignedRole: 'backend',
+          harnessId: 'harness-1',
+          harnessToolPolicy: null,
+          mcpRequirements: [{
+            mcpId: 'github',
+            requirement: 'required',
+            permissions: ['github.issues.read'],
+            fallback: { action: 'block', message: 'Connect GitHub first.' },
+          }],
+          metadata: {},
+          sequence: 1,
+          status: 'blocked',
+          title: 'Backend package',
+        },
+      ]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+    mocks.getProjectMcpOverview.mockResolvedValue({
+      projectId: 'project-1',
+      config: { profile: 'default', requiredMcps: ['github'], overrides: {} },
+      catalog: [],
+      mcpsRoot: '/tmp/forge/mcps',
+      statuses: [{
+        mcpId: 'github',
+        displayName: 'GitHub',
+        description: 'GitHub MCP',
+        enabled: true,
+        error: null,
+        installPath: '/tmp/forge/mcps/github',
+        installState: 'installed',
+        status: 'healthy',
+      }],
+      summary: {
+        label: 'MCPs healthy',
+        status: 'healthy',
+        missing: 0,
+        authRequired: 0,
+        unhealthy: 0,
+        disabled: 0,
+      },
+    })
+
+    const readyUpdate = updateChain([{ id: 'pkg-1' }])
+    const claimUpdate = updateChain([{ id: 'pkg-1' }])
+    mocks.dbUpdate.mockReturnValueOnce(readyUpdate)
+    const run = {
+      id: 'run-1',
+      agentType: 'handoff',
+      modelIdUsed: 'forge-handoff/no-op',
+      stage: 'handoff',
+      status: 'completed',
+    }
+    const artifact = {
+      id: 'artifact-1',
+      agentRunId: 'run-1',
+      artifactType: 'log_output',
+      content: 'handoff log',
+      metadata: {},
+      createdAt: new Date('2026-06-25T00:00:00.000Z'),
+    }
+    const runInsert = insertChain([run])
+    const artifactInsert = insertChain([artifact])
+    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
+      callback({
+        insert: vi.fn()
+          .mockReturnValueOnce(runInsert)
+          .mockReturnValueOnce(artifactInsert),
+        update: vi.fn().mockReturnValueOnce(claimUpdate),
+      }),
+    )
+
+    const result = await handoffApprovedWorkPackages('task-1')
+
+    expect(result).toMatchObject({
+      status: 'handed_off',
+      claimedPackageId: 'pkg-1',
+    })
+    expect(readyUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      blockedReason: null,
+      status: 'ready',
+    }))
+    expect(claimUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      blockedReason: null,
+      status: 'running',
+    }))
   })
 })
