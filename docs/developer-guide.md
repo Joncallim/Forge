@@ -16,6 +16,13 @@ still does not apply generated edits to the host repository, grant MCP runtime
 access to specialists, create commits, open pull requests, merge work, or run
 specialists in parallel.
 
+The MCP/capability broker is an admission-time gate: it decides whether a work
+package may be claimed and handed off based on the requested MCP capabilities,
+their safe-beta allowlist, and MCP health. It does not enforce capabilities at
+runtime (`runtimeEnforcement` is `not_implemented`) — specialists run sandboxed
+with no real MCP tools — so "brokered" here means gated admission, not a runtime
+sandbox over live tools.
+
 ## Local Development
 
 From `web/`:

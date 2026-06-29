@@ -2240,6 +2240,61 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Suite 3.4z — Retry handoff: POST /api/tasks/:id/retry-handoff
+// ---------------------------------------------------------------------------
+
+describe('POST /api/tasks/:id/retry-handoff', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('returns 409 when the task is not approved', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValueOnce(chain([{ status: 'running' }]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/retry-handoff/route')
+    const res = await POST(authRequest('/api/tasks/task-1/retry-handoff', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: 'task-1' }),
+    })
+
+    expect(res.status).toBe(409)
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('returns 409 when there are no blocked packages to retry', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ status: 'approved' }]))
+      .mockReturnValueOnce(chain([]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/retry-handoff/route')
+    const res = await POST(authRequest('/api/tasks/task-1/retry-handoff', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: 'task-1' }),
+    })
+
+    expect(res.status).toBe(409)
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('re-enqueues an approval job for an approved task with a blocked package', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ status: 'approved' }]))
+      .mockReturnValueOnce(chain([{ id: 'pkg-1' }]))
+    mockRedisLpush.mockResolvedValue(1)
+
+    const { POST } = await import('@/app/api/tasks/[id]/retry-handoff/route')
+    const res = await POST(authRequest('/api/tasks/task-1/retry-handoff', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: 'task-1' }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(mockRedisLpush).toHaveBeenCalledWith(
+      'forge:approvals',
+      JSON.stringify({ taskId: 'task-1', action: 'approve' }),
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Suite 3.4a — Review gate decisions: POST /api/tasks/:id/approval-gates/:gateId
 // ---------------------------------------------------------------------------
 

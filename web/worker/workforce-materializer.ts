@@ -75,6 +75,18 @@ function defaultReviewRequirement(agentType: string): ReviewRequirement {
   return isImplementationPackageRole(agentType) ? 'both' : 'none'
 }
 
+// Implementation packages always get full QA + Reviewer review; the Architect /
+// planning model is not allowed to downgrade it (e.g. to 'none' or 'qa_only').
+// Non-implementation roles keep whatever the plan requested, since review gates
+// are never materialized for them anyway.
+function resolveReviewRequirement(
+  agentType: string,
+  requested: ReviewRequirement | undefined,
+): ReviewRequirement {
+  if (isImplementationPackageRole(agentType)) return 'both'
+  return requested ?? defaultReviewRequirement(agentType)
+}
+
 function titleForAgent(role: string): string {
   const trimmed = role.trim()
   return trimmed === '' ? 'Specialist work package' : `${trimmed} work package`
@@ -304,7 +316,7 @@ export function buildWorkforceMaterializationRows(
       },
       acceptanceCriteria: agent.steps.length > 0 ? agent.steps : [agent.summary || titleForAgent(agent.role)],
       mcpRequirements,
-      reviewRequirement: agent.reviewRequirement ?? defaultReviewRequirement(agentType),
+      reviewRequirement: resolveReviewRequirement(agentType, agent.reviewRequirement),
       metadata: {
         source: 'architect-artifact',
         architectRunId: input.architectRunId,

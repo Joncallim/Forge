@@ -37,6 +37,10 @@ export async function POST(
     }
 
     const { id: taskId, gateId } = await params
+    // Review gates (QA / Reviewer / Security) carry an agent `requiredRole`, but
+    // Forge has no human-role model — it is a single-operator app, so any
+    // authenticated operator may decide any gate. The role on the gate describes
+    // which agent persona it represents, not an access-control restriction.
     const result = await decideReviewGate({
       decision: parsed.data.decision,
       gateId,

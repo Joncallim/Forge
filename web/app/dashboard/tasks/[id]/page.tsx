@@ -539,6 +539,68 @@ function GateDecisionControls({
 }
 
 // ---------------------------------------------------------------------------
+// RetryHandoffControls — re-enqueues a handoff for a package the MCP/capability
+// broker blocked (e.g. a temporarily-unhealthy MCP). Available to the operator
+// once the underlying issue is resolved; the worker re-runs the broker, so a
+// still-unresolved block simply re-blocks.
+// ---------------------------------------------------------------------------
+function RetryHandoffControls({
+  blockedReason,
+  onRetried,
+  taskId,
+}: {
+  blockedReason: string
+  onRetried: () => Promise<void>
+  taskId: string
+}) {
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [retried, setRetried] = useState(false)
+
+  async function retry() {
+    setSubmitting(true)
+    setError(null)
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/retry-handoff`, { method: 'POST' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to retry handoff')
+      }
+      setRetried(true)
+      await onRetried()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="mt-3 min-w-0 rounded-lg border border-destructive/30 bg-destructive/10 p-3">
+      <p className="text-sm font-medium text-foreground">Handoff blocked</p>
+      {blockedReason !== '' && (
+        <p className="mt-1 text-xs text-destructive">{blockedReason}</p>
+      )}
+      {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          disabled={submitting}
+          onClick={() => void retry()}
+        >
+          {submitting ? 'Retrying...' : 'Retry handoff'}
+        </Button>
+        {retried && !error && (
+          <span className="text-xs text-muted-foreground">Retry queued. The broker will re-evaluate this package.</span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // AgentRunRow — expandable row showing a single agent run and its log output
 // ---------------------------------------------------------------------------
 function AgentRunRow({ run }: { run: AgentRun }) {
@@ -1098,6 +1160,13 @@ function WorkforcePanel({
                             </p>
                           )}
                         </div>
+                      )}
+                      {status === 'blocked' && (
+                        <RetryHandoffControls
+                          blockedReason={stringField(pkg, ['blockedReason'])}
+                          taskId={taskId}
+                          onRetried={onGateDecided}
+                        />
                       )}
                       <details className="mt-2 rounded-md border border-border bg-muted/20 px-3 py-2">
                         <summary className="cursor-pointer text-xs font-medium text-foreground">

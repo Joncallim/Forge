@@ -3,6 +3,7 @@ const APPROVAL_CLAIM_TIMEOUT_SECONDS = 1
 const DEFAULT_MAX_ATTEMPTS = 3
 const DEFAULT_STUCK_JOB_RECOVERY_SECONDS = 15 * 60
 const DEFAULT_PROVIDER_HEALTH_INTERVAL_SECONDS = 5 * 60
+const DEFAULT_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS = 5 * 60
 
 type WorkerSource = 'standalone' | 'embedded'
 
@@ -106,10 +107,16 @@ async function startWorkerOnce(
     'FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS',
     DEFAULT_PROVIDER_HEALTH_INTERVAL_SECONDS,
   )
+  const blockedHandoffSweepIntervalSeconds = getNonNegativeIntegerEnv(
+    'FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS',
+    DEFAULT_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS,
+  )
   const workerId = `${source}-${process.pid}-${Date.now().toString(36)}`
   let shuttingDown = false
   let providerHealthTimer: ReturnType<typeof setInterval> | null = null
   let providerHealthRunning = false
+  let blockedHandoffSweepTimer: ReturnType<typeof setInterval> | null = null
+  let blockedHandoffSweepRunning = false
 
   const refreshProviderHealth = async (): Promise<void> => {
     if (providerHealthIntervalSeconds === 0 || providerHealthRunning) return
@@ -130,6 +137,39 @@ async function startWorkerOnce(
     }
   }
 
+  // Auto-recovery for packages parked at `blocked` by the MCP/capability broker
+  // (e.g. a transiently-unhealthy MCP). The task is left at `approved`, so we
+  // re-enqueue an approval job and let processApproval re-run the broker — if the
+  // block still applies it simply re-blocks, so this never bypasses the gate.
+  const sweepBlockedHandoffs = async (): Promise<void> => {
+    if (blockedHandoffSweepIntervalSeconds === 0 || blockedHandoffSweepRunning) return
+    blockedHandoffSweepRunning = true
+    try {
+      const [{ db }, { tasks, workPackages }, { redis }, { and, eq }] = await Promise.all([
+        import('../db'),
+        import('../db/schema'),
+        import('../lib/redis'),
+        import('drizzle-orm'),
+      ])
+      const stuck = await db
+        .selectDistinct({ taskId: workPackages.taskId })
+        .from(workPackages)
+        .innerJoin(tasks, eq(tasks.id, workPackages.taskId))
+        .where(and(eq(workPackages.status, 'blocked'), eq(tasks.status, 'approved')))
+
+      for (const row of stuck) {
+        await redis.lpush('forge:approvals', JSON.stringify({ taskId: row.taskId, action: 'approve' }))
+      }
+      if (stuck.length > 0) {
+        console.info('[worker] Re-enqueued blocked handoffs for retry', { count: stuck.length, workerId })
+      }
+    } catch (err) {
+      console.warn('[worker] Blocked-handoff sweep failed', { err: errorMessage(err), workerId })
+    } finally {
+      blockedHandoffSweepRunning = false
+    }
+  }
+
   const run = async (): Promise<void> => {
     console.info('[worker] Started', {
       claimTimeoutSeconds,
@@ -146,6 +186,13 @@ async function startWorkerOnce(
         providerHealthTimer = setInterval(
           () => void refreshProviderHealth(),
           providerHealthIntervalSeconds * 1000,
+        )
+      }
+
+      if (blockedHandoffSweepIntervalSeconds > 0) {
+        blockedHandoffSweepTimer = setInterval(
+          () => void sweepBlockedHandoffs(),
+          blockedHandoffSweepIntervalSeconds * 1000,
         )
       }
 
@@ -416,6 +463,10 @@ async function startWorkerOnce(
       if (providerHealthTimer !== null) {
         clearInterval(providerHealthTimer)
         providerHealthTimer = null
+      }
+      if (blockedHandoffSweepTimer !== null) {
+        clearInterval(blockedHandoffSweepTimer)
+        blockedHandoffSweepTimer = null
       }
       taskQueue.disconnect()
       approvalQueue.disconnect()

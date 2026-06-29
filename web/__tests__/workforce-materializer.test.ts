@@ -202,7 +202,7 @@ describe('workforce materializer', () => {
     })
   })
 
-  it('honors an explicit per-agent reviewRequirement override from the Architect plan', () => {
+  it('clamps implementation-role review to both even when the Architect requests less', () => {
     const rows = buildWorkforceMaterializationRows(
       {
         taskId: 'task-1',
@@ -211,14 +211,15 @@ describe('workforce materializer', () => {
         prepared: {
           ...prepared,
           agents: prepared.agents.map((agent) =>
-            agent.role === 'Backend' ? { ...agent, reviewRequirement: 'qa_only' as const } : agent,
+            agent.role === 'Backend' ? { ...agent, reviewRequirement: 'none' as const } : agent,
           ),
         },
       },
       { idFactory: deterministicIds() },
     )
 
-    expect(rows.workPackages.find((pkg) => pkg.assignedRole === 'backend')?.reviewRequirement).toBe('qa_only')
+    // The planning model cannot downgrade review for an implementation package.
+    expect(rows.workPackages.find((pkg) => pkg.assignedRole === 'backend')?.reviewRequirement).toBe('both')
   })
 
   it('resolves Architect display-name roles to active canonical agent slugs', () => {
