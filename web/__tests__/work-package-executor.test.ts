@@ -236,6 +236,33 @@ describe('executeWorkPackage', () => {
     await expect(fs.stat(outsideFile)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
+  it('fails build validation when no JavaScript source files can be checked', async () => {
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Generated unchecked TypeScript.',
+        files: [
+          {
+            path: 'package.json',
+            content: JSON.stringify({ scripts: { build: 'tsc --noEmit' } }),
+          },
+          {
+            path: 'src/app.tsx',
+            content: 'export const App = () => <div />\n',
+          },
+        ],
+        commands: [['npm', 'run', 'build']],
+      }),
+    })
+
+    await expect(executeWorkPackage(context({
+      task: {
+        ...context().task,
+        prompt: 'Build a tiny task tracker web app. Make sure it builds.',
+      },
+    }))).rejects.toThrow(/at least one checkable JavaScript source file/i)
+  })
+
   it('rejects symlinked execution sandbox roots before writing generated files', async () => {
     const outsideRoot = path.join(tempRoot, 'outside-sandbox')
     const sandboxParent = path.join(tempRoot, '.forge', 'task-runs', 'task-1')

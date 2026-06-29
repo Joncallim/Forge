@@ -502,6 +502,9 @@ async function validateGeneratedCommand(projectRoot: string, command: string[]):
     if (isUnsafePackageScript(packageScript(packageJson, 'build'))) {
       throw new Error('Generated build script includes unsafe shell behavior.')
     }
+    if (jsFiles.length === 0) {
+      throw new Error('Static build validation requires at least one checkable JavaScript source file.')
+    }
     for (const file of jsFiles) await safeSyntaxCheck(path.join(projectRoot, file))
     return `Static build validation passed for ${jsFiles.length} JavaScript file(s).`
   }

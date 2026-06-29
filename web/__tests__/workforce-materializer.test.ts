@@ -353,6 +353,16 @@ describe('workforce materializer', () => {
     expect(source).toContain('metadata: sql`excluded.metadata`')
   })
 
+  it('clears stale unresolved-role packages when a plan is materialized again', () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), 'worker', 'workforce-materializer.ts'),
+      'utf8',
+    )
+
+    expect(source).toContain("metadata}->>'requiresAgentConfiguration' = 'true'")
+    expect(source).toContain("eq(workPackages.status, 'failed')")
+  })
+
   it('keeps the materializer feature flag easy to disable', () => {
     expect(isWorkforceMaterializationEnabled({ FORGE_WORKFORCE_MATERIALIZATION: '0' })).toBe(false)
     expect(isWorkforceMaterializationEnabled({ FORGE_WORKFORCE_MATERIALIZATION: 'false' })).toBe(false)

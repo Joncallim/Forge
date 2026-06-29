@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto'
-import { and, eq, inArray } from 'drizzle-orm'
+import { and, eq, inArray, or } from 'drizzle-orm'
 import { sql } from 'drizzle-orm'
 import { db } from '../db'
 import {
@@ -375,7 +375,16 @@ export async function materializeWorkforceFromArchitectArtifact(
       )
     await tx
       .delete(workPackages)
-      .where(and(eq(workPackages.taskId, input.taskId), eq(workPackages.status, 'pending')))
+      .where(and(
+        eq(workPackages.taskId, input.taskId),
+        or(
+          eq(workPackages.status, 'pending'),
+          and(
+            eq(workPackages.status, 'failed'),
+            sql`${workPackages.metadata}->>'requiresAgentConfiguration' = 'true'`,
+          ),
+        ),
+      ))
 
     if (rows.harnesses.length > 0) {
       await tx
