@@ -212,7 +212,7 @@ describe('deriveMcpGrantDecisions', () => {
   it('creates one decision per permitted agent', () => {
     const { design } = parseMcpExecutionDesign([
       '```mcp_execution_design_json',
-      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"workforce","targetAgents":["architect","backend"]},"agentPermissions":{"architect":["github.issues.read"],"backend":["github.contents.write"]},"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"workforce","targetAgents":["architect","backend"]},"agentPermissions":{"architect":["github.issues.read"],"backend":["github.contents.read"]},"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
       '```',
     ].join('\n'))
 
@@ -283,6 +283,23 @@ describe('deriveMcpGrantDecisions', () => {
     expect(result.decisions[0]).toMatchObject({
       agent: 'backend',
       capabilities: [],
+      status: 'blocked',
+    })
+  })
+
+  it('blocks grant decisions for capabilities outside the safe beta allowlist', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{"backend":["github.contents.write"]},"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const result = deriveMcpGrantDecisions(design, overview([healthyGithub]))
+
+    expect(result.summary).toEqual({ proposed: 0, warning: 0, blocked: 1 })
+    expect(result.decisions[0]).toMatchObject({
+      agent: 'backend',
+      mcpId: 'github',
       status: 'blocked',
     })
   })
@@ -404,6 +421,37 @@ describe('deriveMcpGrantDecisions', () => {
     })
     expect(uncovered.status).toBe('blocked')
     expect(uncovered.blocked.join('\n')).toMatch(/not covered by an explicit approved grant/)
+  })
+
+  it('blocks (does not throw on) prototype-polluting capability ids', () => {
+    const viaSubtask = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        capabilities: ['github.issues.read'],
+        fallback: { action: 'block' },
+      }],
+      metadata: {
+        mcpAwareSubtasks: [{ id: 'evil', mcpCapabilities: ['constructor.read'] }],
+      },
+      title: 'Backend package',
+    })
+    expect(viaSubtask.status).toBe('blocked')
+    expect(viaSubtask.blocked.join('\n')).toMatch(/does not name a known MCP/)
+
+    const viaRequirement = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      mcpRequirements: [{
+        mcpId: '__proto__',
+        requirement: 'required',
+        capabilities: ['__proto__.read'],
+        fallback: { action: 'block' },
+      }],
+      title: 'Backend package',
+    })
+    expect(viaRequirement.status).toBe('blocked')
+    expect(viaRequirement.blocked.join('\n')).toMatch(/Unknown MCP/)
   })
 
   it('returns an empty preview when the Architect omitted the design block', () => {

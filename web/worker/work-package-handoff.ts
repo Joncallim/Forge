@@ -319,9 +319,9 @@ async function failWorkPackageForMcpBroker(input: {
   pkg: HandoffPackage
   taskId: string
   warnings: string[]
-}): Promise<{ blockedReason: string; status: 'blocked' }> {
+}): Promise<{ blockedReason: string; status: 'blocked' } | { status: 'allowed' }> {
   const blockedAt = new Date()
-  await db
+  const [blockedRow] = await db
     .update(workPackages)
     .set({
       blockedReason: input.blockedReason,
@@ -329,6 +329,12 @@ async function failWorkPackageForMcpBroker(input: {
       updatedAt: blockedAt,
     })
     .where(and(eq(workPackages.id, input.pkg.id), inArray(workPackages.status, ['pending', 'ready', 'needs_rework', 'blocked'])))
+    .returning({ id: workPackages.id })
+
+  // A concurrent actor moved the package out of a blockable state (e.g. it was
+  // already claimed and is running). Don't emit a spurious blocked event or
+  // revert the task — the later ready→running claim guards correctness anyway.
+  if (!blockedRow) return { status: 'allowed' }
 
   await publishTaskEvent(input.taskId, 'work_package:status', {
     blockedReason: input.blockedReason,
@@ -363,15 +369,30 @@ async function assertWorkPackageMcpBrokerAllowsHandoff(
     })
   }
 
-  const mcpOverview = await getProjectMcpOverview(project)
-  const check = evaluateWorkPackageMcpBroker({
-    assignedRole: pkg.assignedRole,
-    harnessToolPolicy: pkg.harnessToolPolicy,
-    mcpOverview,
-    mcpRequirements: pkg.mcpRequirements,
-    metadata: pkg.metadata,
-    title: pkg.title,
-  })
+  let check: ReturnType<typeof evaluateWorkPackageMcpBroker>
+  try {
+    const mcpOverview = await getProjectMcpOverview(project)
+    check = evaluateWorkPackageMcpBroker({
+      assignedRole: pkg.assignedRole,
+      harnessToolPolicy: pkg.harnessToolPolicy,
+      mcpOverview,
+      mcpRequirements: pkg.mcpRequirements,
+      metadata: pkg.metadata,
+      title: pkg.title,
+    })
+  } catch (err) {
+    // The broker is the safety gate; an unexpected failure here must block the
+    // package, never crash the handoff (which would terminally fail the task).
+    const message = err instanceof Error ? err.message : String(err)
+    const blockedReason = `MCP/capability broker blocked "${pkg.title}": evaluation failed (${message}).`
+    return failWorkPackageForMcpBroker({
+      blocked: [`Broker evaluation failed: ${message}`],
+      blockedReason,
+      pkg,
+      taskId,
+      warnings: [],
+    })
+  }
 
   if (check.status !== 'blocked') return { status: 'allowed' }
 

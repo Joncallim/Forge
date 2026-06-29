@@ -21,8 +21,41 @@ const REVIEW_EXEMPT_ROLES = new Set([
   'security-review',
   'security_review',
 ])
-const HIGH_RISK_TEXT_PATTERN =
-  /\b(auth|authorization|authenticate|oauth|login|session|cookie|csrf|jwt|token|secret|password|api\s*key|credential|filesystem|file\s*system|fs|shell|command|exec|spawn|child_process|terminal|repository|repo|git|github|pull\s*request|pr|branch|commit|merge|diff|checkout)\b/i
+// Free-text fallback signal for security-sensitive work. This is a secondary,
+// best-effort heuristic — the primary high-risk signals are structural (MCP
+// grants, prompt overlays, requiredCapabilities). The patterns below favour
+// stem tolerance (so plurals/derivatives like "tokens", "credentials",
+// "authentication" match) while deliberately avoiding short ambiguous words
+// (`pr`, `fs`, `diff`, bare `merge`/`branch`/`commit`/`command`/`repo`) that
+// flood benign UI packages with spurious security gates. Ambiguous words are
+// only treated as risky when they co-occur with an action that implies real
+// repository/command/credential handling.
+const HIGH_RISK_TEXT_PATTERN = new RegExp(
+  [
+    'auth(?:n|z|entication|enticate|enticated|orization|orize|orized)?\\b',
+    'oauth',
+    'sign[-\\s]?(?:in|on)\\b',
+    'log(?:in|out)\\b',
+    'session\\b|sessions\\b',
+    'cookie',
+    'csrf|xsrf|\\bxss\\b|jwt',
+    'token',
+    'secret',
+    'pass(?:word|phrase)',
+    'api[-\\s]?key',
+    'credential',
+    'file[-\\s]?system|filesystem',
+    'child_process|subprocess|\\bspawn\\b|execve|\\bexec\\b',
+    'shell\\b|terminal\\b',
+    'command[-\\s]?(?:execution|injection)',
+    'pull[-\\s]?request',
+    'force[-\\s]?push|git\\s+(?:push|commit|merge|clone|checkout|reset)',
+    'merge[-\\s]?conflict',
+    'encrypt|decrypt|\\bcipher\\b',
+    'privilege|escalat|\\brce\\b|remote\\s+code',
+  ].join('|'),
+  'i',
+)
 const SECURITY_REVIEW_CAPABILITY_PATTERN = /\bsecurity[-_\s]?review\b/i
 
 function isReviewRequirement(value: string): value is ReviewRequirement {
@@ -100,19 +133,32 @@ function recordArray(value: unknown): Record<string, unknown>[] {
     : []
 }
 
-function flattenStrings(value: unknown, result: string[] = []): string[] {
+// Caps so a pathologically deep/large JSONB metadata value can't blow the stack
+// or build an unbounded string for the high-risk regex scan.
+const FLATTEN_MAX_DEPTH = 8
+const FLATTEN_MAX_ITEMS = 2000
+
+function flattenStrings(value: unknown, result: string[] = [], depth = 0): string[] {
+  if (depth > FLATTEN_MAX_DEPTH || result.length >= FLATTEN_MAX_ITEMS) return result
+
   if (typeof value === 'string') {
     result.push(value)
     return result
   }
 
   if (Array.isArray(value)) {
-    for (const item of value) flattenStrings(item, result)
+    for (const item of value) {
+      if (result.length >= FLATTEN_MAX_ITEMS) break
+      flattenStrings(item, result, depth + 1)
+    }
     return result
   }
 
   if (isRecord(value)) {
-    for (const item of Object.values(value)) flattenStrings(item, result)
+    for (const item of Object.values(value)) {
+      if (result.length >= FLATTEN_MAX_ITEMS) break
+      flattenStrings(item, result, depth + 1)
+    }
   }
 
   return result
@@ -545,10 +591,13 @@ export async function decideReviewGate(input: {
     .orderBy(desc(artifacts.createdAt))
     .limit(1)
 
-  if (
-    latestPackageArtifact &&
-    (latestPackageArtifact.id !== input.sourceArtifactId || latestPackageArtifact.agentRunId !== sourceAgentRunId)
-  ) {
+  // A gate is stale only when a *newer run* has produced artifacts for this
+  // package (a fresh execution attempt supersedes the one under review). Compare
+  // by run rather than artifact id: a single execution run emits several
+  // artifacts (repository readiness, diff, validation, final log) that all share
+  // the source run, and createdAt ties between them must not be misread as a
+  // superseding attempt.
+  if (latestPackageArtifact && latestPackageArtifact.agentRunId !== sourceAgentRunId) {
     return {
       status: 'source_artifact_mismatch',
       message: 'Review gate source artifact is stale. Reload the task before deciding this review.',

@@ -22,5 +22,9 @@ export const RECOMMENDED_MCP_IDS = Object.values(MCP_CATALOG)
   .map((entry) => entry.id)
 
 export function isKnownMcpId(value: string): value is McpId {
-  return value in MCP_CATALOG
+  // Use an own-property check rather than `in` so inherited Object.prototype
+  // members (constructor, __proto__, toString, …) are never treated as known
+  // MCP ids. The `in` operator walks the prototype chain, which would let a
+  // capability id like `constructor.read` slip past as a "known" MCP.
+  return Object.prototype.hasOwnProperty.call(MCP_CATALOG, value)
 }

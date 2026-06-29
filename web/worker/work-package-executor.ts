@@ -91,9 +91,17 @@ function redactExecutionOutput(value: string): string {
   return value
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[REDACTED_PRIVATE_KEY]')
     .replace(/\b(authorization:\s*bearer\s+)[^\s]+/gi, '$1[REDACTED_TOKEN]')
-    .replace(/\b(token|api[_-]?key|password|secret)=([^\s&]+)/gi, '$1=[REDACTED_TOKEN]')
+    // key=value / key: value for any token/secret/password/*_KEY/*_SECRET-style name.
+    .replace(
+      /\b((?:[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API[_-]?KEY|ACCESS[_-]?KEY|CREDENTIAL)[A-Z0-9_]*|token|api[_-]?key|password|secret)\s*[=:]\s*)([^\s&]+)/gi,
+      '$1[REDACTED_TOKEN]',
+    )
     .replace(/\b(?:ghp|gho|ghu|ghs|github_pat|sk|xox[baprs])_[A-Za-z0-9_=-]{10,}\b/g, '[REDACTED_TOKEN]')
     .replace(/\b(?:glpat|sk|sk-proj|sk-ant|xox[baprs])-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED_TOKEN]')
+    // AWS access key ids, Google API keys, and JWTs.
+    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, '[REDACTED_TOKEN]')
+    .replace(/\bAIza[A-Za-z0-9_-]{20,}\b/g, '[REDACTED_TOKEN]')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[REDACTED_TOKEN]')
 }
 
 function normalizeCommand(command: string[]): string {
@@ -116,11 +124,19 @@ function assertAllowedCommand(command: string[]): void {
   }
 }
 
+// Bounds the brace-scan fallback below. Restarting a full inner scan from every
+// `{` is O(n²) on adversarial model output (e.g. thousands of unclosed braces),
+// which can stall the shared worker. Real responses put the object first, so a
+// small number of candidate start positions is more than enough.
+const MAX_JSON_SCAN_ATTEMPTS = 64
+
 function extractJson(rawText: string): string {
   const fenced = /```(?:work_package_execution_json|json)?\s*\n([\s\S]*?)\n?```/i.exec(rawText)
   if (fenced) return fenced[1]
 
+  let attempts = 0
   for (let start = rawText.indexOf('{'); start >= 0; start = rawText.indexOf('{', start + 1)) {
+    if (++attempts > MAX_JSON_SCAN_ATTEMPTS) break
     let depth = 0
     let inString = false
     let escaped = false
@@ -257,9 +273,12 @@ function isInvalidNodeTestScript(script: string): boolean {
 
 function isUnsafePackageScript(script: string): boolean {
   return /[;&|`$<>]/.test(script) ||
-    /\bnode\s+-e\b/i.test(script) ||
+    // node/nodejs invoked with an eval or module-preload flag executes arbitrary
+    // code regardless of the script body (--eval/-e, --print/-p, --require/-r,
+    // --import).
+    /\bnode(?:js)?\b[^\n]*?(?:^|\s|=)(?:-e|--eval|-p|--print|-r|--require|--import)(?=\s|=|$)/i.test(script) ||
     /\brequire\s*\(\s*['"](?:node:)?(?:fs|child_process|process|os)['"]\s*\)/i.test(script) ||
-    /\b(?:curl|wget|nc|ssh|scp|bash|sh|python|perl|ruby|env|printenv|cat)\b/i.test(script)
+    /\b(?:curl|wget|nc|ssh|scp|bash|sh|zsh|ksh|python\d*|perl|ruby|php|env|printenv|cat|make|npx|eval)\b/i.test(script)
 }
 
 function validatePlanAgainstPrompt(plan: WorkPackageExecutionPlan, prompt: string): void {
@@ -648,9 +667,13 @@ function promptRecordArray(value: unknown): Record<string, unknown>[] {
 }
 
 function mcpCapabilityList(requirement: Record<string, unknown>): string[] {
-  const permissions = cleanPromptTextArray(requirement.permissions, 20, 100)
-  if (permissions.length > 0) return permissions
-  return cleanPromptTextArray(requirement.capabilities, 20, 100)
+  // Surface the union of both fields so the prompt mirrors exactly what the
+  // capability broker validated (see capabilityArray in mcp-execution-design.ts).
+  const merged = [
+    ...cleanPromptTextArray(requirement.permissions, 20, 100),
+    ...cleanPromptTextArray(requirement.capabilities, 20, 100),
+  ]
+  return [...new Set(merged)]
 }
 
 function formatMcpRequirement(requirement: Record<string, unknown>): string {

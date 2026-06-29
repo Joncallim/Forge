@@ -109,6 +109,32 @@ describe('review gate contract', () => {
     })).toBe(false)
   })
 
+  it('flags security-sensitive wording including plurals and derivatives', () => {
+    for (const text of [
+      'Store user credentials securely',
+      'Rotate API secrets',
+      'Validate JWT tokens',
+      'Implement OAuth authentication',
+      'Read filesystem files',
+      'Guard against command injection',
+    ]) {
+      expect(isHighRiskImplementationPackage({ assignedRole: 'backend', title: text })).toBe(true)
+    }
+  })
+
+  it('does not flag benign packages that merely mention git/UI vocabulary', () => {
+    for (const text of [
+      'Implement merge sort',
+      'Render diff view of changes',
+      'Add a command to the CLI',
+      'Create a PR template',
+      'Commit message preview component',
+      'Render the task list and empty state',
+    ]) {
+      expect(isHighRiskImplementationPackage({ assignedRole: 'frontend', title: text })).toBe(false)
+    }
+  })
+
   it('materializes QA and Reviewer gates when an implementation package finishes', async () => {
     mocks.dbSelect.mockReturnValueOnce(chain([{
       id: 'pkg-1',

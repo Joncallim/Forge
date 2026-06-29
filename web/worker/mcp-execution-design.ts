@@ -379,21 +379,19 @@ function capabilityArray(entry: Record<string, unknown>): {
   capabilities: string[]
   present: boolean
 } {
-  if (Array.isArray(entry.capabilities)) {
-    return {
-      capabilities: cleanTextArray(entry.capabilities, 40, 100),
-      present: true,
-    }
-  }
-  if (Array.isArray(entry.permissions)) {
-    return {
-      capabilities: cleanTextArray(entry.permissions, 40, 100),
-      present: true,
-    }
-  }
+  // Read the union of both `capabilities` and `permissions` so the broker
+  // validates exactly what the executor surfaces to the model. The executor's
+  // mcpCapabilityList() and this helper historically read these two fields with
+  // opposite precedence; merging both removes any chance the gate approves one
+  // list while the run is instructed on the other.
+  const present = Array.isArray(entry.capabilities) || Array.isArray(entry.permissions)
+  const merged = [
+    ...cleanTextArray(entry.capabilities, 40, 100),
+    ...cleanTextArray(entry.permissions, 40, 100),
+  ]
   return {
-    capabilities: [],
-    present: false,
+    capabilities: [...new Set(merged)],
+    present,
   }
 }
 
@@ -426,7 +424,9 @@ function unsafeCapability(mcpId: string, capability: string, prohibitedCapabilit
   const prohibited = new Set(prohibitedCapabilities.map(normalizeCapability))
   if (prohibited.has(normalized)) return normalized
 
-  const safePatterns = SAFE_BETA_CAPABILITY_PATTERNS[mcpId] ?? []
+  const safePatterns = Object.prototype.hasOwnProperty.call(SAFE_BETA_CAPABILITY_PATTERNS, mcpId)
+    ? SAFE_BETA_CAPABILITY_PATTERNS[mcpId]
+    : []
   return safePatterns.some((pattern) => pattern.test(normalized)) ? null : normalized
 }
 
@@ -449,6 +449,10 @@ export function evaluateWorkPackageMcpBroker(input: {
   const entries = brokerEntries(input)
   const hasRunScopedMcpInstructions = metadataHasRunScopedMcpInstructions(input.metadata)
   const approvedCapabilities = new Set<string>()
+  // A capability prohibited by any grant entry is prohibited for the whole
+  // package — collect them globally so it can't be "approved" by a different
+  // entry and then satisfy a subtask coverage check.
+  const prohibitedAll = new Set<string>()
 
   for (const entry of entries) {
     const mcpId = cleanText(entry.mcpId, 80)
@@ -458,6 +462,7 @@ export function evaluateWorkPackageMcpBroker(input: {
     const fallback = fallbackAction(entry.fallback)
     const grantStatus = cleanText(entry.status, 40)
     const prohibitedCapabilities = cleanTextArray(entry.prohibitedCapabilities, 40, 120)
+    for (const prohibited of prohibitedCapabilities) prohibitedAll.add(normalizeCapability(prohibited))
     const { capabilities, present: capabilitiesPresent } = capabilityArray(entry)
 
     const canContinueWithoutMcp = requirement === 'optional' && fallback === 'continue_without_mcp'
@@ -505,6 +510,8 @@ export function evaluateWorkPackageMcpBroker(input: {
 
   }
 
+  for (const prohibited of prohibitedAll) approvedCapabilities.delete(prohibited)
+
   for (const subtask of metadataMcpAwareSubtasks(input.metadata)) {
     for (const capability of cleanTextArray(subtask.mcpCapabilities, 40, 120)) {
       const normalizedCapability = normalizeCapability(capability)
@@ -513,7 +520,7 @@ export function evaluateWorkPackageMcpBroker(input: {
         blocked.push(`MCP-aware subtask capability '${normalizedCapability}' does not name a known MCP.`)
         continue
       }
-      const unsafe = unsafeCapability(mcpId, normalizedCapability, [])
+      const unsafe = unsafeCapability(mcpId, normalizedCapability, [...prohibitedAll])
       if (unsafe) {
         blocked.push(`MCP-aware subtask capability '${unsafe}' is outside the allowed beta scope.`)
         continue
@@ -560,6 +567,14 @@ function decisionStatus(
 ): McpGrantDecisionStatus {
   if (!isKnownMcpId(requirement.mcpId)) return 'blocked'
   if (capabilities.length === 0) return requirement.requirement === 'optional' ? 'warning' : 'blocked'
+  // A capability outside the safe beta allowlist (or explicitly prohibited) is
+  // blocked at handoff by evaluateWorkPackageMcpBroker. Apply the same allowlist
+  // here so the grant-decision preview never advertises an unsafe capability as
+  // "proposed" (i.e. ready to approve) while the broker would block it.
+  const hasUnsafeCapability = capabilities.some(
+    (capability) => unsafeCapability(requirement.mcpId, capability, requirement.prohibitedCapabilities) !== null,
+  )
+  if (hasUnsafeCapability) return 'blocked'
   const healthy = status?.installState === 'installed' && status.enabled && status.status === 'healthy'
   if (healthy) return 'proposed'
   if (requirement.requirement === 'optional' && requirement.fallback.action !== 'block') return 'warning'
