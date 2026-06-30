@@ -14,6 +14,7 @@ import {
   ShieldCheckIcon,
   GitBranchIcon,
   InfoIcon,
+  LoaderCircleIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -267,6 +268,27 @@ function stringArrayField(record: WorkforceRecord, keys: string[]): string[] {
 
 function recordKey(record: WorkforceRecord, prefix: string, index: number): string {
   return stringField(record, ['id']) || `${prefix}-${index}`
+}
+
+function duplicateSafeKey(prefix: string, value: string, index: number): string {
+  return `${prefix}-${index}-${value.slice(0, 80)}`
+}
+
+function isActiveExecutionStatus(status: string): boolean {
+  return status === 'running' || status === 'approved'
+}
+
+function ExecutionIndicator({ label = 'Execution in progress' }: { label?: string }) {
+  return (
+    <span
+      role="status"
+      aria-live="polite"
+      className="inline-flex items-center gap-1.5 text-xs font-medium text-sky-700 dark:text-sky-300"
+    >
+      <LoaderCircleIcon className="size-3.5 animate-spin" aria-hidden="true" />
+      {label}
+    </span>
+  )
 }
 
 function previewList(items: string[], limit = 4): string {
@@ -711,6 +733,7 @@ function AgentRunRow({ run }: { run: AgentRun }) {
       >
         <div className="flex flex-wrap items-center gap-3 text-sm">
           <span className="font-medium text-foreground capitalize">{run.agentType}</span>
+          {run.status === 'running' && <LoaderCircleIcon className="size-3.5 animate-spin text-sky-600" aria-hidden="true" />}
           {statusBadge(run.status)}
         </div>
         <div className="flex items-center gap-4 text-xs text-muted-foreground">
@@ -780,7 +803,12 @@ function AgentRunRow({ run }: { run: AgentRun }) {
           )}
 
           {run.status === 'running' && (run.logOutput === undefined || run.logOutput === '') && (
-            <p className="text-xs text-muted-foreground italic">Waiting for output…</p>
+            <div className="rounded-lg border border-sky-200 bg-sky-50/70 px-3 py-2 dark:border-sky-900/50 dark:bg-sky-950/20">
+              <ExecutionIndicator label="Runtime is working; waiting for output" />
+              <p className="mt-1 text-xs text-muted-foreground">
+                Some ACP runtimes stay quiet until a turn completes.
+              </p>
+            </div>
           )}
         </div>
       )}
@@ -1172,9 +1200,15 @@ function WorkforcePanel({
                         {harnessName !== '' && harnessName !== owner && (
                           <Badge variant="secondary" className="max-w-[12rem] truncate" title={harnessName}>{harnessName}</Badge>
                         )}
+                        {status === 'running' && <LoaderCircleIcon className="size-3.5 animate-spin text-sky-600" aria-hidden="true" />}
                         {status !== '' && statusBadge(status)}
                         <Badge variant="outline">{pluralize(taskCount, 'task')}</Badge>
                       </div>
+                      {status === 'running' && (
+                        <div className="mt-2">
+                          <ExecutionIndicator label="Work package is executing" />
+                        </div>
+                      )}
                       {summary !== '' && <p className="mt-1 text-sm text-muted-foreground">{summary}</p>}
                       {packageReviewGates.length > 0 && (
                         <div className="mt-2 flex flex-wrap gap-1.5" aria-label={`Review states for ${title}`}>
@@ -1540,8 +1574,8 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
         <div className="mb-3 rounded-lg border border-amber-300/40 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-700/40 dark:bg-amber-950/30 dark:text-amber-200">
           <p className="font-medium">Warnings</p>
           <ul className="mt-1 list-disc pl-4">
-            {validation.warnings.map((item) => (
-              <li key={item}>{item}</li>
+            {validation.warnings.map((item, index) => (
+              <li key={duplicateSafeKey('capability-warning', item, index)}>{item}</li>
             ))}
           </ul>
         </div>
@@ -1559,39 +1593,53 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
             <dt className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Required by architect</dt>
             <dd className="flex flex-wrap gap-1.5">
               {proposed.required.length > 0
-                ? proposed.required.map((capability) => (
-                    <Badge key={capability} variant="default">{capability}</Badge>
+                ? proposed.required.map((capability, index) => (
+                    <Badge key={duplicateSafeKey('required-capability', capability, index)} variant="default">{capability}</Badge>
                   ))
                 : <span className="text-muted-foreground">None</span>}
             </dd>
           </div>
-          <div>
-            <dt className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Optional support</dt>
-            <dd className="flex flex-wrap gap-1.5">
-              {proposed.optional.length > 0
-                ? proposed.optional.map((capability) => (
-                    <Badge key={capability} variant="outline">{capability}</Badge>
-                  ))
-                : <span className="text-muted-foreground">None</span>}
-            </dd>
-          </div>
-          <div>
-            <dt className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Not selected</dt>
-            <dd>
-              {proposed.excluded.length > 0 ? (
-                <ul className="grid gap-2">
-                  {proposed.excluded.map((item) => (
-                    <li key={item.capability}>
-                      <Badge variant="secondary">{item.capability}</Badge>
-                      <p className="mt-1 text-xs text-muted-foreground">{item.reason}</p>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <span className="text-muted-foreground">None</span>
-              )}
-            </dd>
-          </div>
+          {(proposed.optional.length > 0 || proposed.excluded.length > 0) && (
+            <div>
+              <dt className="sr-only">Recommended additions and exclusions</dt>
+              <dd>
+                <details className="rounded-md border border-border bg-muted/20 px-3 py-2">
+                  <summary className="cursor-pointer text-xs font-medium text-foreground">
+                    Recommended additional capabilities
+                  </summary>
+                  <div className="mt-3 grid gap-3">
+                    <div>
+                      <p className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        Could be created or added later
+                      </p>
+                      <div className="flex flex-wrap gap-1.5">
+                        {proposed.optional.length > 0
+                          ? proposed.optional.map((capability, index) => (
+                              <Badge key={duplicateSafeKey('optional-capability', capability, index)} variant="outline">{capability}</Badge>
+                            ))
+                          : <span className="text-muted-foreground">None</span>}
+                      </div>
+                    </div>
+                    {proposed.excluded.length > 0 && (
+                      <div>
+                        <p className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                          Not selected for this plan
+                        </p>
+                        <ul className="grid gap-2">
+                          {proposed.excluded.map((item, index) => (
+                            <li key={duplicateSafeKey('excluded-capability', item.capability, index)}>
+                              <Badge variant="secondary">{item.capability}</Badge>
+                              <p className="mt-1 text-xs text-muted-foreground">{item.reason}</p>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                </details>
+              </dd>
+            </div>
+          )}
         </dl>
       )}
     </section>
@@ -1642,8 +1690,8 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
         <div role="alert" className="mb-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
           <p className="font-medium">Blocked recommendations</p>
           <ul className="mt-1 list-disc pl-4">
-            {design.validation.blocked.map((item) => (
-              <li key={item}>{item}</li>
+            {design.validation.blocked.map((item, index) => (
+              <li key={duplicateSafeKey('mcp-blocked', item, index)}>{item}</li>
             ))}
           </ul>
         </div>
@@ -1653,8 +1701,8 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
         <div className="mb-3 rounded-lg border border-amber-300/40 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-700/40 dark:bg-amber-950/30 dark:text-amber-200">
           <p className="font-medium">Warnings</p>
           <ul className="mt-1 list-disc pl-4">
-            {design.validation.warnings.map((item) => (
-              <li key={item}>{item}</li>
+            {design.validation.warnings.map((item, index) => (
+              <li key={duplicateSafeKey('mcp-warning', item, index)}>{item}</li>
             ))}
           </ul>
         </div>
@@ -1967,6 +2015,16 @@ function TaskProgressPanel({
     counts[gateStatus] = (counts[gateStatus] ?? 0) + 1
     return counts
   }, {})
+  const runningPackage = workPackages.find((pkg) => stringField(pkg, ['status', 'state']) === 'running')
+  const runningRun = [...runs].reverse().find((run) => run.status === 'running')
+  const executionActive = isActiveExecutionStatus(status) || runningPackage !== undefined || runningRun !== undefined
+  const executionLabel = runningPackage
+    ? `Running ${stringField(runningPackage, ['title', 'name']) || 'work package'}`
+    : runningRun
+      ? `Running ${statusLabel(runningRun.agentType)}`
+      : status === 'approved'
+        ? 'Handoff in progress'
+        : 'Execution in progress'
 
   return (
     <section aria-labelledby="task-progress-heading" className="mb-6 rounded-lg border border-border bg-card p-4">
@@ -1981,6 +2039,11 @@ function TaskProgressPanel({
               {progressStatusLabel(status)}
             </Badge>
           </div>
+          {executionActive && (
+            <div className="mt-2">
+              <ExecutionIndicator label={executionLabel} />
+            </div>
+          )}
           <p className="mt-2 text-sm text-foreground">{summary.nextAction}</p>
           <p className="mt-1 text-xs text-muted-foreground">{summary.detail}</p>
         </div>

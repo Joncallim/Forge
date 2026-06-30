@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { ActivityIcon, AlertTriangleIcon, CheckCircle2Icon } from 'lucide-react'
 import { TooltipContent, TooltipRoot, TooltipTrigger } from '@/components/ui/tooltip'
+import { TASK_STATUS_REFRESH_EVENT } from '@/lib/task-events'
 import { cn } from '@/lib/utils'
 
 type TaskSummary = {
@@ -36,6 +37,7 @@ export function SidebarTaskStatus() {
 
   useEffect(() => {
     let cancelled = false
+    let events: EventSource | null = null
 
     async function load() {
       try {
@@ -51,16 +53,32 @@ export function SidebarTaskStatus() {
       }
     }
 
+    function handleRefresh() {
+      void load()
+    }
+
     void load()
     const timer = setInterval(load, POLL_INTERVAL_MS)
+    if (typeof EventSource !== 'undefined') {
+      events = new EventSource('/api/tasks/events')
+      events.addEventListener('task:status', handleRefresh)
+    }
+    window.addEventListener(TASK_STATUS_REFRESH_EVENT, handleRefresh)
+    window.addEventListener('focus', handleRefresh)
     return () => {
       cancelled = true
       clearInterval(timer)
+      events?.close()
+      window.removeEventListener(TASK_STATUS_REFRESH_EVENT, handleRefresh)
+      window.removeEventListener('focus', handleRefresh)
     }
   }, [])
 
   const active = summary?.active ?? 0
   const attention = summary?.attention ?? 0
+  const awaitingApproval = summary?.byStatus.awaiting_approval ?? 0
+  const awaitingAnswers = summary?.byStatus.awaiting_answers ?? 0
+  const failed = summary?.byStatus.failed ?? 0
   const idle = !errored && active === 0 && attention === 0
 
   const tone = errored
@@ -79,16 +97,22 @@ export function SidebarTaskStatus() {
         ? CheckCircle2Icon
         : ActivityIcon
 
+  const primaryAttention = awaitingApproval > 0
+    ? `Needs Approval${awaitingApproval > 1 ? ` (${awaitingApproval})` : ''}`
+    : awaitingAnswers > 0
+      ? `Needs Answers${awaitingAnswers > 1 ? ` (${awaitingAnswers})` : ''}`
+      : failed > 0
+        ? `Failed${failed > 1 ? ` (${failed})` : ''}`
+        : null
   const summaryLine = errored
     ? 'Status unavailable'
-    : idle
-      ? 'No active tasks'
-      : [
-          active > 0 ? `${active} active` : null,
-          attention > 0 ? `${attention} need${attention === 1 ? 's' : ''} you` : null,
-        ]
-          .filter(Boolean)
-          .join(' · ')
+    : primaryAttention
+      ? active > 0
+        ? `${primaryAttention} · ${active} active`
+        : primaryAttention
+      : idle
+        ? 'No active tasks'
+        : `${active} active`
   const visibleStatusEntries = Object.entries(summary?.byStatus ?? {})
     .filter(([status]) => status !== 'completed' && status !== 'cancelled')
     .sort((a, b) => b[1] - a[1])

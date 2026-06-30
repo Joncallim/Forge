@@ -51,8 +51,9 @@ describe('assertProjectLocalPathForExecution', () => {
   })
 
   it('returns the real project directory when it is inside the active workspace', async () => {
+    const realProjectRoot = await fs.realpath(projectRoot)
     await expect(assertProjectLocalPathForExecution({ id: 'project-1', localPath: projectRoot }))
-      .resolves.toBe(projectRoot)
+      .resolves.toBe(realProjectRoot)
   })
 
   it('rejects symlinks that resolve outside the active workspace', async () => {

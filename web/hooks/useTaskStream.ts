@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback } from 'react'
+import { TASK_STATUS_REFRESH_EVENT } from '@/lib/task-events'
 
 export interface AgentRun {
   id: string
@@ -124,6 +125,11 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
     setRefreshRevision((revision) => revision + 1)
   }, [])
 
+  const requestGlobalTaskStatusRefresh = useCallback(() => {
+    if (typeof window === 'undefined') return
+    window.dispatchEvent(new Event(TASK_STATUS_REFRESH_EVENT))
+  }, [])
+
   useEffect(() => {
     if (!taskId) return
 
@@ -155,6 +161,7 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
           if (prev.some((r) => r.id === run.id)) return prev
           return [...prev, run]
         })
+        requestGlobalTaskStatusRefresh()
       } catch {
         // Ignore malformed event
       }
@@ -276,6 +283,7 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
         const data = JSON.parse((e as MessageEvent).data)
         const status: string = data.status ?? data
         setTaskStatus(status)
+        requestGlobalTaskStatusRefresh()
         if (TERMINAL_STATUSES.has(status)) {
           // Flush any remaining chunks before closing
           flushChunks()
@@ -311,7 +319,7 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
       es.close()
       esRef.current = null
     }
-  }, [taskId, flushChunks, requestDetailRefresh])
+  }, [taskId, flushChunks, requestDetailRefresh, requestGlobalTaskStatusRefresh])
 
   return { runs, artifacts, taskStatus, error, questions, refreshRevision }
 }

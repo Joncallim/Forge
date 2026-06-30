@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
 
 vi.mock('@/db', () => ({ db: {} }))
 vi.mock('@/lib/providers/registry', () => ({ getProvider: vi.fn() }))
@@ -14,7 +16,7 @@ vi.mock('@/worker/architect-context', () => ({
 }))
 vi.mock('@/lib/mcps/manager', () => ({ getProjectMcpOverview: vi.fn() }))
 
-import { buildArchitectPrompt } from '@/worker/orchestrator'
+import { buildArchitectPrompt, stableJson } from '@/worker/orchestrator'
 import type { ArchitectResumeCheckpoint } from '@/worker/checkpoints'
 import type { ProjectMcpOverview } from '@/lib/mcps/types'
 
@@ -100,6 +102,8 @@ const mcpOverview: ProjectMcpOverview = {
     disabled: 0,
   },
 }
+
+const repoRoot = path.resolve(__dirname, '..')
 
 describe('buildArchitectPrompt checkpoint resume context', () => {
   it('omits local resume checkpoint context when none is available', () => {
@@ -224,5 +228,76 @@ describe('buildArchitectPrompt checkpoint resume context', () => {
     expect(prompt).toContain('github.repository.search')
     expect(prompt).not.toContain('github.contents.write')
     expect(prompt).not.toContain('filesystem.project.write')
+  })
+
+  it('tells replans to preserve original wording and make targeted edits only', () => {
+    const prompt = buildArchitectPrompt(
+      task,
+      project,
+      'Specialist context',
+      'Web context',
+      [],
+      '# Previous plan\n\nKeep this line unchanged.',
+      null,
+      [],
+      null,
+      mcpOverview,
+    )
+
+    expect(prompt).toContain('Preserve the original wording for every unaffected section.')
+    expect(prompt).toContain('Change only the exact paragraphs, bullets, or handoff lines')
+    expect(prompt).toContain('Do not rewrite, rename, reorder, summarize, or restyle unchanged material.')
+  })
+
+  it('preserves the previous plan artifact for any clarification-only replan', () => {
+    const source = fs.readFileSync(path.join(repoRoot, 'worker/orchestrator.ts'), 'utf8')
+
+    // A clarification round (questions without a fenced plan) preserves the
+    // previous plan even when it includes explanatory prose, and is excluded
+    // from the revision guard.
+    expect(source).toContain("prepared.questions.length > 0 && prepared.agentBreakdownSource !== 'fence'")
+    expect(source).toContain('preservePreviousPlan ? previousPlan : prepared.planText')
+    expect(source).toContain("previousPlan !== null && prepared.questions.length === 0 && prepared.planText.trim() === ''")
+    expect(source).toContain('!isClarificationRound && prepared.planText.trim()')
+  })
+
+  it('validates routing metadata and visible plan text independently', () => {
+    const source = fs.readFileSync(path.join(repoRoot, 'worker/orchestrator.ts'), 'utf8')
+
+    // Routing metadata is compared on its own...
+    expect(source).toContain('stableJson(hiddenRoutingComparable(previousComparableMetadata)) !== stableJson(hiddenRoutingComparable(preparedComparableMetadata))')
+    expect(source).toContain('The revised plan changed machine-readable routing metadata.')
+    // ...and the text-retention guard takes the visible plan text only (no
+    // appended metadata that would pad the retained-line ratio).
+    expect(source).toContain('assertTargetedPlanRevision(previousPlan, prepared.planText)')
+    expect(source).not.toContain('canonicalPlanRevisionText')
+    // The revision guard keys on a 'fence' breakdown so question-only rounds
+    // keep it active and clarify-then-plan does not falsely trip it.
+    expect(source).toContain("previousComparableMetadata.agentBreakdownSource === 'fence'")
+    expect(source).toContain('planRevisionComparableFromPrepared(prepared)')
+    expect(source).toContain('planRevisionComparableFromMetadata(previousPlanArtifact.metadata)')
+    expect(source).toContain("agentBreakdownSource: prepared.agentBreakdownSource")
+    expect(source).toContain("comparable.agentBreakdownSource === 'fence'")
+  })
+})
+
+describe('stableJson', () => {
+  it('produces stable output regardless of key order', () => {
+    expect(stableJson({ b: 1, a: 2 })).toBe(stableJson({ a: 2, b: 1 }))
+  })
+
+  it('treats an undefined-valued key the same as an absent key (jsonb round-trip safe)', () => {
+    // A fresh PlannedAgent carries reviewRequirement: undefined; the jsonb-stored
+    // copy drops it. Both forms must compare equal or a no-change replan would
+    // falsely trip the routing-metadata guard.
+    const fresh = { role: 'Backend', tasks: 1, steps: ['a'], reviewRequirement: undefined }
+    const stored = JSON.parse(JSON.stringify(fresh))
+    expect(stableJson(fresh)).toBe(stableJson(stored))
+  })
+
+  it('still distinguishes genuinely different routing metadata', () => {
+    const a = { agentBreakdown: [{ role: 'Backend', tasks: 1 }] }
+    const b = { agentBreakdown: [{ role: 'Frontend', tasks: 1 }] }
+    expect(stableJson(a)).not.toBe(stableJson(b))
   })
 })

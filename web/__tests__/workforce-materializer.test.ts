@@ -36,6 +36,7 @@ const prepared: PreparedArchitectArtifact = {
       steps: ['Write the plan'],
     },
   ],
+  agentBreakdownSource: 'fence',
   capabilityClassification: {
     proposed: {
       schemaVersion: 1,
