@@ -25,6 +25,7 @@ export interface PlannedAgent {
 export interface ParsedAgentBreakdown {
   planText: string
   agents: PlannedAgent[]
+  source: 'fence' | 'fallback'
 }
 
 const FENCE_REGEX = new RegExp(
@@ -130,7 +131,7 @@ export function parseAgentBreakdown(rawText: string): ParsedAgentBreakdown {
   const match = findFence(rawText, FENCE_REGEX, isAgentBreakdownShape)
   if (!match) {
     const planText = rawText.trim()
-    return { planText, agents: fallbackAgentsFromRoleTags(planText) }
+    return { planText, agents: fallbackAgentsFromRoleTags(planText), source: 'fallback' }
   }
 
   const jsonBlock = match.jsonBlock
@@ -145,5 +146,6 @@ export function parseAgentBreakdown(rawText: string): ParsedAgentBreakdown {
   return {
     planText,
     agents: agents.length > 0 ? agents : fallbackAgentsFromRoleTags(planText),
+    source: agents.length > 0 ? 'fence' : 'fallback',
   }
 }

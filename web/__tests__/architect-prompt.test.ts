@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
 
 vi.mock('@/db', () => ({ db: {} }))
 vi.mock('@/lib/providers/registry', () => ({ getProvider: vi.fn() }))
@@ -100,6 +102,8 @@ const mcpOverview: ProjectMcpOverview = {
     disabled: 0,
   },
 }
+
+const repoRoot = path.resolve(__dirname, '..')
 
 describe('buildArchitectPrompt checkpoint resume context', () => {
   it('omits local resume checkpoint context when none is available', () => {
@@ -224,5 +228,45 @@ describe('buildArchitectPrompt checkpoint resume context', () => {
     expect(prompt).toContain('github.repository.search')
     expect(prompt).not.toContain('github.contents.write')
     expect(prompt).not.toContain('filesystem.project.write')
+  })
+
+  it('tells replans to preserve original wording and make targeted edits only', () => {
+    const prompt = buildArchitectPrompt(
+      task,
+      project,
+      'Specialist context',
+      'Web context',
+      [],
+      '# Previous plan\n\nKeep this line unchanged.',
+      null,
+      [],
+      null,
+      mcpOverview,
+    )
+
+    expect(prompt).toContain('Preserve the original wording for every unaffected section.')
+    expect(prompt).toContain('Change only the exact paragraphs, bullets, or handoff lines')
+    expect(prompt).toContain('Do not rewrite, rename, reorder, summarize, or restyle unchanged material.')
+  })
+
+  it('preserves the previous plan artifact when a replan only asks follow-up questions', () => {
+    const source = fs.readFileSync(path.join(repoRoot, 'worker/orchestrator.ts'), 'utf8')
+
+    expect(source).toContain("previousPlan !== null && prepared.questions.length > 0 && prepared.planText.trim() === ''")
+    expect(source).toContain("previousPlan !== null && prepared.questions.length === 0 && prepared.planText.trim() === ''")
+    expect(source).toContain("previousPlan !== null && previousComparableMetadata !== null && prepared.planText.trim() !== ''")
+  })
+
+  it('validates replans against visible text plus routing metadata', () => {
+    const source = fs.readFileSync(path.join(repoRoot, 'worker/orchestrator.ts'), 'utf8')
+
+    expect(source).toContain('canonicalPlanRevisionText(previousPlan, previousComparableMetadata)')
+    expect(source).toContain('canonicalPlanRevisionText(prepared.planText, preparedComparableMetadata)')
+    expect(source).toContain('stableJson(hiddenRoutingComparable(previousComparableMetadata)) !== stableJson(hiddenRoutingComparable(preparedComparableMetadata))')
+    expect(source).toContain('The revised plan changed machine-readable routing metadata.')
+    expect(source).toContain('planRevisionComparableFromPrepared(prepared)')
+    expect(source).toContain('planRevisionComparableFromMetadata(previousPlanArtifact.metadata)')
+    expect(source).toContain("agentBreakdownSource: prepared.agentBreakdownSource")
+    expect(source).toContain("comparable.agentBreakdownSource === 'fence'")
   })
 })

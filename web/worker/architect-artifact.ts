@@ -15,6 +15,7 @@ export type PreparedArchitectArtifact = {
   planText: string
   questions: OpenQuestion[]
   agents: PlannedAgent[]
+  agentBreakdownSource: 'fence' | 'fallback'
   capabilityClassification: CapabilityClassificationMetadata
   mcpExecutionDesign: {
     proposed: McpExecutionDesign | null
@@ -60,6 +61,52 @@ const ARCHITECT_UNSTRUCTURED_FAILURE_PATTERNS: RegExp[] = [
 ]
 
 const MIN_PLAN_TEXT_LENGTH = 80
+const MIN_REVISION_LINES_FOR_GUARD = 6
+const MIN_RETAINED_LINE_RATIO = 0.55
+const MAX_LINE_COUNT_GROWTH = 2.4
+const MIN_SHORT_PLAN_WORDS_FOR_GUARD = 20
+const REFERENCE_APPENDIX_HEADING_PATTERN =
+  /^\s{0,3}(?:#{1,6}\s+)?(?:(?:original|old|previous|prior)\s+(?:implementation\s+)?plan(?:\s+(?:excerpt|reference))?|(?:implementation\s+)?plan\s+(?:for\s+)?(?:reference|comparison))\b/i
+
+function normalizePlanLine(line: string): string {
+  return line
+    .replace(/[`*_>#-]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+}
+
+function meaningfulPlanLines(plan: string): string[] {
+  return plan
+    .split('\n')
+    .map(normalizePlanLine)
+    .filter((line) => line.length >= 8)
+}
+
+function uniqueLines(lines: string[]): string[] {
+  return [...new Set(lines)]
+}
+
+function planWords(plan: string): string[] {
+  return plan
+    .toLowerCase()
+    .match(/[a-z0-9][a-z0-9_-]{2,}/g) ?? []
+}
+
+function retainedWordRatio(previousPlan: string, revisedPlan: string): number {
+  const previousWords = uniqueLines(planWords(previousPlan))
+  if (previousWords.length < MIN_SHORT_PLAN_WORDS_FOR_GUARD) return 0
+  const revisedWords = new Set(planWords(revisedPlan))
+  const retained = previousWords.filter((word) => revisedWords.has(word)).length
+  return retained / previousWords.length
+}
+
+function hasReferenceAppendixHeading(plan: string): boolean {
+  return plan
+    .split('\n')
+    .some((line, index) => index > 1 && REFERENCE_APPENDIX_HEADING_PATTERN.test(line))
+}
+
 
 /**
  * Validates that the architect actually produced a plan. Throws
@@ -103,6 +150,75 @@ export function assertUsableArchitectPlan(
   }
 }
 
+/**
+ * Replans are operator edits to an existing approval artifact, not permission
+ * to replace the whole plan. This catches provider/model outputs that ignore
+ * the previous plan and generate a mostly-new document.
+ */
+export function assertTargetedPlanRevision(
+  previousPlan: string,
+  revisedPlan: string,
+): void {
+  const previousLines = uniqueLines(meaningfulPlanLines(previousPlan))
+  const referenceAppendixHeading = hasReferenceAppendixHeading(revisedPlan)
+  if (previousLines.length < MIN_REVISION_LINES_FOR_GUARD) {
+    const previousWordCount = uniqueLines(planWords(previousPlan)).length
+    const revisedWordCount = uniqueLines(planWords(revisedPlan)).length
+    const wordGrowth = previousWordCount > 0 ? revisedWordCount / previousWordCount : Number.POSITIVE_INFINITY
+    if (previousWordCount < MIN_SHORT_PLAN_WORDS_FOR_GUARD) {
+      throw new UnusableArchitectPlanError(
+        'The previous implementation plan is too short to verify targeted revisions. Restart the task instead of replacing this approval artifact.',
+      )
+    }
+    if (referenceAppendixHeading || retainedWordRatio(previousPlan, revisedPlan) < MIN_RETAINED_LINE_RATIO || wordGrowth > MAX_LINE_COUNT_GROWTH) {
+      throw new UnusableArchitectPlanError(
+        'The revised plan replaced too much of the original implementation plan. Request smaller, targeted changes or restart the task for a new plan.',
+      )
+    }
+    return
+  }
+
+  const revisedLines = uniqueLines(meaningfulPlanLines(revisedPlan))
+  if (revisedLines.length === 0) {
+    throw new UnusableArchitectPlanError('The revised plan removed the original implementation plan instead of making targeted changes.')
+  }
+
+  const revisedSet = new Set(revisedLines)
+  const retained = previousLines.filter((line) => revisedSet.has(line)).length
+  const retainedRatio = retained / previousLines.length
+  const lineCountGrowth = revisedLines.length / previousLines.length
+  const retainedIndices = previousLines
+    .map((line) => revisedLines.findIndex((candidate) => candidate === line))
+    .filter((index) => index >= 0)
+  let orderedRetained = 0
+  let searchFrom = 0
+  for (const line of previousLines) {
+    const index = revisedLines.findIndex((candidate, candidateIndex) => candidateIndex >= searchFrom && candidate === line)
+    if (index === -1) continue
+    orderedRetained += 1
+    searchFrom = index + 1
+  }
+  const orderedRetainedRatio = orderedRetained / previousLines.length
+  const firstRetainedIndex = retainedIndices.length > 0 ? Math.min(...retainedIndices) : -1
+  const retainedIndicesByPosition = [...new Set(retainedIndices)].sort((a, b) => a - b)
+  const retainedNeededForMajority = Math.ceil(previousLines.length * MIN_RETAINED_LINE_RATIO)
+  const earlyRetainedGaps = retainedIndicesByPosition
+    .slice(0, retainedNeededForMajority)
+    .some((index, retainedIndex, indices) => retainedIndex > 0 && index - indices[retainedIndex - 1] > 3)
+  const lateReferenceThreshold = Math.max(2, Math.floor(revisedLines.length * 0.25))
+  const appendedReferenceLikely =
+    referenceAppendixHeading ||
+    firstRetainedIndex > lateReferenceThreshold ||
+    orderedRetainedRatio < MIN_RETAINED_LINE_RATIO ||
+    earlyRetainedGaps
+
+  if (retainedRatio < MIN_RETAINED_LINE_RATIO || lineCountGrowth > MAX_LINE_COUNT_GROWTH || appendedReferenceLikely) {
+    throw new UnusableArchitectPlanError(
+      'The revised plan replaced too much of the original implementation plan. Request smaller, targeted changes or restart the task for a new plan.',
+    )
+  }
+}
+
 export function prepareArchitectArtifact(
   rawText: string,
   mcpOverview: ProjectMcpOverview,
@@ -110,12 +226,13 @@ export function prepareArchitectArtifact(
   const { planText: planWithoutQuestions, questions } = parseOpenQuestions(rawText)
   const { planText: planWithoutMcpDesign, design } = parseMcpExecutionDesign(planWithoutQuestions)
   const { planText: planWithoutCapabilities, capabilityClassification } = parseCapabilityClassification(planWithoutMcpDesign)
-  const { planText, agents } = parseAgentBreakdown(planWithoutCapabilities)
+  const { planText, agents, source } = parseAgentBreakdown(planWithoutCapabilities)
 
   return {
     planText,
     questions,
     agents,
+    agentBreakdownSource: source,
     capabilityClassification,
     mcpExecutionDesign: {
       proposed: design,

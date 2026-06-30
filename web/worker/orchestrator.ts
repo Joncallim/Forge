@@ -15,7 +15,13 @@ import type { OpenQuestion } from './open-questions'
 import { getProjectMcpOverview } from '../lib/mcps/manager'
 import type { ProjectMcpOverview } from '../lib/mcps/types'
 import { assertProjectLocalPathForExecution } from '../lib/projects/local-path'
-import { assertUsableArchitectPlan, prepareArchitectArtifact } from './architect-artifact'
+import {
+  assertTargetedPlanRevision,
+  assertUsableArchitectPlan,
+  prepareArchitectArtifact,
+  UnusableArchitectPlanError,
+  type PreparedArchitectArtifact,
+} from './architect-artifact'
 import { materializeWorkforceFromArchitectArtifact } from './workforce-materializer'
 import { displayPathForWorkspacePath, getWorkspaceSettings } from '../lib/workspace'
 import {
@@ -136,7 +142,10 @@ export function buildArchitectPrompt(
           previousPlan,
           '```',
           '',
-          'Revise the previous implementation plan in place. Preserve the same structure and any unaffected sections. Change only what the task revision, answered questions, or new context requires. The output should be the full revised plan, not a diff and not a brand-new unrelated plan.',
+          'Revise the previous implementation plan in place. Preserve the original wording for every unaffected section.',
+          'Change only the exact paragraphs, bullets, or handoff lines required by the task revision, answered questions, or new context.',
+          'Do not rewrite, rename, reorder, summarize, or restyle unchanged material. Keep original text visible unless the requested change directly targets it.',
+          'The output should be the full plan with targeted edits applied, not a diff and not a brand-new plan.',
         ]
   const resumeCheckpointSection =
     resumeCheckpoint === null
@@ -330,16 +339,90 @@ function mockArchitectPlan(task: TaskRow, project: ProjectRow): string {
   ].join('\n')
 }
 
-async function loadLatestPlanArtifact(taskId: string): Promise<string | null> {
+type LatestPlanArtifact = {
+  content: string
+  metadata: Record<string, unknown>
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableJson(item)).join(',')}]`
+  }
+  if (isRecord(value)) {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+function planRevisionComparableFromPrepared(prepared: PreparedArchitectArtifact) {
+  return {
+    agentBreakdown: prepared.agents,
+    agentBreakdownSource: prepared.agentBreakdownSource,
+    capabilityClassification: prepared.capabilityClassification.proposed,
+    mcpExecutionDesign: prepared.mcpExecutionDesign.proposed,
+  }
+}
+
+function planRevisionComparableFromMetadata(metadata: Record<string, unknown>) {
+  const capabilityClassification = isRecord(metadata.capabilityClassification)
+    ? metadata.capabilityClassification.proposed ?? metadata.capabilityClassification
+    : null
+  const mcpExecutionDesign = isRecord(metadata.mcpExecutionDesign)
+    ? metadata.mcpExecutionDesign.proposed ?? null
+    : null
+
+  return {
+    agentBreakdown: Array.isArray(metadata.agentBreakdown) ? metadata.agentBreakdown : [],
+    agentBreakdownSource: typeof metadata.agentBreakdownSource === 'string' ? metadata.agentBreakdownSource : 'unknown',
+    capabilityClassification,
+    mcpExecutionDesign,
+  }
+}
+
+function hiddenRoutingComparable(comparable: ReturnType<typeof planRevisionComparableFromPrepared> | ReturnType<typeof planRevisionComparableFromMetadata>) {
+  return {
+    agentBreakdown: comparable.agentBreakdownSource === 'fence' ? comparable.agentBreakdown : null,
+    capabilityClassification: comparable.capabilityClassification,
+    mcpExecutionDesign: comparable.mcpExecutionDesign,
+  }
+}
+
+function canonicalPlanRevisionText(planText: string, comparableMetadata: unknown): string {
+  return [
+    planText,
+    '',
+    'Machine-readable routing metadata:',
+    canonicalMetadataRevisionText(comparableMetadata),
+  ].join('\n')
+}
+
+function canonicalMetadataRevisionText(comparableMetadata: unknown): string {
+  return stableJson(comparableMetadata)
+    .replace(/[{}[\],]/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .join('\n')
+}
+
+async function loadLatestPlanArtifact(taskId: string): Promise<LatestPlanArtifact | null> {
   const [artifact] = await db
-    .select({ content: artifacts.content })
+    .select({ content: artifacts.content, metadata: artifacts.metadata })
     .from(artifacts)
     .innerJoin(agentRuns, eq(artifacts.agentRunId, agentRuns.id))
     .where(and(eq(agentRuns.taskId, taskId), eq(artifacts.artifactType, 'adr_text')))
     .orderBy(desc(artifacts.createdAt))
     .limit(1)
 
-  return artifact?.content ?? null
+  if (!artifact) return null
+  return {
+    content: artifact.content,
+    metadata: isRecord(artifact.metadata) ? artifact.metadata : {},
+  }
 }
 
 async function createArtifact(
@@ -487,7 +570,8 @@ async function runArchitect(
   if (!model) {
     throw new Error(`Provider config ${providerConfigId} is missing or inactive`)
   }
-  const previousPlan = await loadLatestPlanArtifact(task.id)
+  const previousPlanArtifact = await loadLatestPlanArtifact(task.id)
+  const previousPlan = previousPlanArtifact?.content ?? null
   const resumeCheckpoint = await readLatestArchitectCheckpointSafely(task.id)
   const startedAt = new Date()
   const [run] = await db
@@ -570,13 +654,44 @@ async function runArchitect(
 
     const prepared = prepareArchitectArtifact(text, mcpOverview)
     assertUsableArchitectPlan(text, prepared)
-    const artifact = await createArtifact(task.id, run.id, prepared.planText, {
+    const artifactPlanText = previousPlan !== null && prepared.questions.length > 0 && prepared.planText.trim() === ''
+      ? previousPlan
+      : prepared.planText
+    const previousComparableMetadata = previousPlanArtifact
+      ? planRevisionComparableFromMetadata(previousPlanArtifact.metadata)
+      : null
+    const preparedComparableMetadata = planRevisionComparableFromPrepared(prepared)
+    const artifactComparableMetadata = previousPlan !== null && prepared.questions.length > 0 && prepared.planText.trim() === '' && previousComparableMetadata !== null
+      ? previousComparableMetadata
+      : preparedComparableMetadata
+    if (previousPlan !== null && prepared.questions.length === 0 && prepared.planText.trim() === '') {
+      throw new UnusableArchitectPlanError(
+        'The revised plan did not include visible plan text. Request visible targeted plan changes only, or restart the task for a new plan.',
+      )
+    }
+    if (previousPlan !== null && previousComparableMetadata !== null && prepared.planText.trim() !== '') {
+      if (stableJson(hiddenRoutingComparable(previousComparableMetadata)) !== stableJson(hiddenRoutingComparable(preparedComparableMetadata))) {
+        throw new UnusableArchitectPlanError(
+          'The revised plan changed machine-readable routing metadata. Request visible targeted plan changes only, or restart the task for a new plan.',
+        )
+      }
+      assertTargetedPlanRevision(
+        canonicalPlanRevisionText(previousPlan, previousComparableMetadata),
+        canonicalPlanRevisionText(prepared.planText, preparedComparableMetadata),
+      )
+    }
+    const artifact = await createArtifact(task.id, run.id, artifactPlanText, {
       openQuestionCount: prepared.questions.length,
       revisedFromAnswers: answeredQuestions.length > 0,
       revisedFromPlan: previousPlan !== null,
-      agentBreakdown: prepared.agents,
-      capabilityClassification: prepared.capabilityClassification,
-      mcpExecutionDesign: prepared.mcpExecutionDesign,
+      agentBreakdown: artifactComparableMetadata.agentBreakdown,
+      agentBreakdownSource: artifactComparableMetadata.agentBreakdownSource,
+      capabilityClassification: previousPlan !== null && artifactComparableMetadata === previousComparableMetadata && isRecord(previousPlanArtifact?.metadata.capabilityClassification)
+        ? previousPlanArtifact.metadata.capabilityClassification
+        : prepared.capabilityClassification,
+      mcpExecutionDesign: previousPlan !== null && artifactComparableMetadata === previousComparableMetadata && isRecord(previousPlanArtifact?.metadata.mcpExecutionDesign)
+        ? previousPlanArtifact.metadata.mcpExecutionDesign
+        : prepared.mcpExecutionDesign,
     })
     const openQuestionCount = await persistOpenQuestions(task.id, prepared.questions)
 
@@ -627,7 +742,7 @@ async function runArchitect(
       openQuestions: prepared.questions.map((question) => question.question),
       revisedFromAnswers: answeredQuestions.length > 0,
       revisedFromPlan: previousPlan !== null,
-      planText: prepared.planText,
+      planText: artifactPlanText,
     }
 
     return { openQuestionCount, checkpoint }
