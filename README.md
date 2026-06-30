@@ -7,11 +7,13 @@ task, and review the plan Forge produces. The long-term goal is a managed AI
 workforce that can plan, build, test, review, and prepare pull requests while a
 human stays in control of the important decisions.
 
-Today, Forge is an Orchestrator-stage beta. The normal flow plans work and
-waits for your approval. Feature-flagged Workforce execution can hand off
-sequential specialist packages and run generated output in a per-task sandbox,
-but Forge does not yet apply those edits to your repository, make commits, or
-open pull requests by itself.
+Today, Forge is an Orchestrator-stage beta. In the default path, Forge plans
+work and waits for your approval. Workforce materialization and handoff records
+are enabled unless explicitly disabled, so approved plans can flow into durable
+work-package and gate state. Actual generated package execution is still
+opt-in, writes only inside a per-task sandbox, and does not yet apply those
+edits to your host repository, make commits, open pull requests, merge code, or
+run specialists in parallel.
 
 ## What Forge Does Today
 
@@ -29,6 +31,19 @@ the dashboard and the task loop together.
 ```text
 Browser -> Forge dashboard -> Redis queue -> Forge worker -> AI model -> review in browser
 ```
+
+## Vocabulary
+
+| Term | Plain-English meaning |
+|---|---|
+| Dashboard | The browser UI where you configure Forge and review work. |
+| Project | A local or GitHub-backed repository Forge can reason about. |
+| Task | A request you give Forge, such as "add login" or "review this bug." |
+| Architect | The planning agent that writes the first implementation plan. |
+| Artifact | A saved output, usually the Architect plan Markdown. |
+| Approval | The human checkpoint before Forge marks the current stage complete. |
+| Workforce | The future/sandboxed specialist-agent system: Backend, Frontend, QA, Reviewer, DevOps, and custom agents. |
+| ACP provider | A local command-line coding agent connected through the Agent Client Protocol. See [ACP and Zed connector](docs/acp-zed-connector.md). |
 
 ## Fast Setup
 
@@ -103,9 +118,10 @@ FORGE_WORKER_MOCK_ARCHITECT=1 npm run dev
 
 The first Workforce build slice is present as durable planning records:
 work packages, harness metadata, approval gates, and VCS summaries can now be
-stored and displayed. Experimental work-package handoff and sandbox execution
-are available behind `FORGE_WORK_PACKAGE_HANDOFF` and
-`FORGE_WORK_PACKAGE_EXECUTION`.
+stored and displayed. Workforce materialization and handoff are default-on and
+can be disabled with `FORGE_WORKFORCE_MATERIALIZATION=0` or
+`FORGE_WORK_PACKAGE_HANDOFF=0`. Sandbox package execution remains opt-in with
+`FORGE_WORK_PACKAGE_EXECUTION=1`.
 
 ## Screenshots
 
@@ -127,9 +143,11 @@ are available behind `FORGE_WORK_PACKAGE_HANDOFF` and
 
 ## Docs
 
+- [Wiki overview](docs/wiki.md) - layman-readable overview mirrored into the Notion wiki.
 - [Operator guide](docs/operator-guide.md) - install, run, deploy, uninstall, and troubleshoot Forge.
 - [CLI architecture](docs/cli-command-architecture.md) - `forge` command taxonomy and routing.
 - [Developer guide](docs/developer-guide.md) - web app, worker, database, tests, prompts, and coding standards.
 - [Design guide](docs/design.md) - product model, UI principles, screenshot evidence, and visual QA notes.
+- [ACP and Zed connector](docs/acp-zed-connector.md) - how Forge talks to local ACP agents such as Codex CLI and Claude Code.
 - [Roadmap](docs/roadmap.md) - current beta status, Workforce architecture, and upcoming slices.
 - [Architecture decisions](docs/adr/) - durable ADRs for major technical decisions.

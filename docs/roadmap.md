@@ -10,15 +10,21 @@ worker is the execution plane for queued tasks.
 
 Today, the worker runs the Architect planning stage, saves a Markdown plan,
 asks follow-up questions when needed, and pauses for human approval.
-Feature-flagged Workforce handoff can move ready work packages into sequential
-specialist execution, and generated output is written only inside per-task
-sandboxes. This path does not apply edits to the host repository, grant MCP
-runtime access to specialists, create commits, open pull requests, merge work,
-or run specialists in parallel.
+Workforce materialization and handoff are enabled unless explicitly disabled, so
+approved plans can move into durable work-package and gate state. Generated
+package execution is still opt-in with `FORGE_WORK_PACKAGE_EXECUTION=1`, and
+generated output is written only inside per-task sandboxes. This path does not
+apply edits to the host repository, grant MCP runtime access to specialists,
+create commits, open pull requests, merge work, or run specialists in parallel.
 
 The next approved epic is #119, "Executable Workforce Beta:
 capability-brokered sequential specialist execution." It sits under #30 and
 treats #43 and #60 as core scope.
+
+Short version: Forge is useful today as a local planning and approval control
+room. The next big milestone is making sequential specialist execution reliable
+inside sandboxes before Forge is trusted with host-repository writes or pull
+request automation.
 
 ## Operational Understanding
 
@@ -381,6 +387,33 @@ The starter CLI command taxonomy is documented in
 `docs/cli-command-architecture.md`. The global `forge` launcher is a thin
 wrapper over existing install, uninstall, web, and recovery scripts.
 
+### ACP Provider Direction
+
+ACP support makes Forge a client for local coding agents rather than only a
+client for direct model APIs. The current path uses Zed adapter packages for
+Codex CLI and Claude Code:
+
+```text
+Forge -> Zed ACP adapter -> local CLI -> logged-in model account
+```
+
+This is useful because it lets Forge call tools that already have their own CLI
+auth, runtime behavior, and model routing. The cautious boundary is that ACP
+currently returns text through Forge's provider interface; it does not yet grant
+Forge-managed MCP tools, expose detailed token usage, or make repository writes
+safe by itself.
+
+Near-term ACP work:
+
+1. Keep readiness errors actionable for missing `npx`, missing CLI installs,
+   missing auth, and missing project folders.
+2. Expand runtime strategies only after the current Codex CLI and Claude Code
+   paths are reliable.
+3. Keep ACP execution behind the same Workforce and sandbox safety gates as
+   other specialist execution.
+4. Document runtime-specific model-selection behavior instead of promising a
+   universal model picker.
+
 ## Reference Material
 
 Primary source docs:
@@ -390,6 +423,8 @@ Primary source docs:
 - `web/README.md`
 - `docs/operator-guide.md`
 - `docs/developer-guide.md`
+- `docs/wiki.md`
+- `docs/acp-zed-connector.md`
 - `docs/design.md`
 - `docs/adr/0004-cross-agent-checkpointing.md`
 - `docs/adr/0005-workforce-orchestration-graph.md`

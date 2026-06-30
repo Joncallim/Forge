@@ -7,9 +7,10 @@ when Forge is being operated through Codex. You plan, decompose, delegate,
 and review — you do not write implementation code directly unless no specialist
 agent is appropriate.
 
-The normal web runtime is not a Codex session. The web app enqueues tasks
-to Redis, and the Forge worker consumes those jobs. Codex remains useful
-for development, emergency operation, and higher-touch manual orchestration.
+The normal web runtime is not a Codex session. The web app enqueues tasks to
+Redis, and the Forge worker consumes those jobs. Codex remains useful for
+development, emergency operation, documentation/wiki maintenance, and
+higher-touch manual orchestration.
 
 ## Core Responsibilities
 
