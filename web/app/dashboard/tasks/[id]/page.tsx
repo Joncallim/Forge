@@ -321,19 +321,73 @@ function workPackageBrief(pkg: WorkPackage): string {
     criteria.length > 0
       ? `**Acceptance criteria**\n\n${criteria.map((criterion, index) => `${index + 1}. ${criterion}`).join('\n')}`
       : null,
-    capabilities ? `**Required capabilities**\n\n\`\`\`json\n${JSON.stringify(capabilities, null, 2)}\n\`\`\`` : null,
+    capabilities ? formatRequiredCapabilitiesMarkdown(capabilities) : null,
   ].filter((part): part is string => part !== null).join('\n\n')
+}
+
+function asStringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
+// Renders the requiredCapabilities object as a readable list rather than a raw
+// JSON block. Falls back to nothing if there is no meaningful content.
+function formatRequiredCapabilitiesMarkdown(capabilities: Record<string, unknown>): string | null {
+  const required = asStringList(capabilities.required)
+  const optional = asStringList(capabilities.optional)
+  const excluded = Array.isArray(capabilities.excluded)
+    ? capabilities.excluded
+        .map((entry) => {
+          if (typeof entry === 'string') return entry
+          if (isRecord(entry)) {
+            const cap = typeof entry.capability === 'string' ? entry.capability : ''
+            const reason = typeof entry.reason === 'string' ? entry.reason : ''
+            return cap ? (reason ? `${cap} (${reason})` : cap) : ''
+          }
+          return ''
+        })
+        .filter((entry) => entry !== '')
+    : []
+
+  const lines = [
+    required.length > 0 ? `- **Required:** ${required.join(', ')}` : null,
+    optional.length > 0 ? `- **Optional:** ${optional.join(', ')}` : null,
+    excluded.length > 0 ? `- **Excluded:** ${excluded.join('; ')}` : null,
+  ].filter((line): line is string => line !== null)
+
+  if (lines.length === 0) return null
+  return ['**Required capabilities**', '', ...lines].join('\n')
+}
+
+function describeMcpAssignment(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (!isRecord(value)) return ''
+  const type = typeof value.type === 'string' ? value.type.replace(/_/g, ' ') : ''
+  const targets = asStringList(value.targetAgents)
+  const targetId = typeof value.targetId === 'string' ? value.targetId : ''
+  const destination = targets.length > 0 ? targets.join(', ') : targetId
+  return [type, destination ? `→ ${destination}` : ''].filter(Boolean).join(' ')
+}
+
+function describeMcpFallback(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (!isRecord(value)) return ''
+  const action = typeof value.action === 'string' ? value.action.replace(/_/g, ' ') : ''
+  const message = typeof value.message === 'string' ? value.message : ''
+  return [action, message].filter(Boolean).join(' — ')
+}
+
+function mcpPermissionChips(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === 'string')
+  if (isRecord(value)) {
+    return Object.entries(value).flatMap(([agent, caps]) =>
+      asStringList(caps).map((cap) => `${agent}: ${cap}`),
+    )
+  }
+  return []
 }
 
 function mcpRequirementLabel(requirement: WorkforceRecord): string {
   return stringField(requirement, ['mcpId', 'id', 'name', 'server', 'connectorId']) || 'MCP requirement'
-}
-
-function compactJson(value: unknown): string {
-  if (value === null || value === undefined) return ''
-  if (typeof value === 'string') return value
-  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
-  return JSON.stringify(value, null, 2)
 }
 
 function McpRequirementCards({ requirements }: { requirements: WorkforceRecord[] }) {
@@ -345,34 +399,45 @@ function McpRequirementCards({ requirements }: { requirements: WorkforceRecord[]
         const label = mcpRequirementLabel(requirement)
         const requirementLevel = stringField(requirement, ['requirement', 'level', 'status'])
         const reason = stringField(requirement, ['reason', 'rationale', 'description'])
-        const assignment = compactJson(requirement.assignment)
-        const permissions = compactJson(requirement.agentPermissions ?? requirement.permissions ?? requirement.capabilities)
-        const fallback = compactJson(requirement.fallback)
+        const assignment = describeMcpAssignment(requirement.assignment)
+        const permissions = mcpPermissionChips(
+          requirement.agentPermissions ?? requirement.permissions ?? requirement.capabilities,
+        )
+        const fallback = describeMcpFallback(requirement.fallback)
 
         return (
           <div key={`${label}-${index}`} className="min-w-0 rounded-md border border-border bg-background p-3">
             <div className="flex flex-wrap items-center gap-2">
-              <p className="min-w-0 break-words text-sm font-medium text-foreground">{label}</p>
+              <p className="min-w-0 break-words font-mono text-sm font-medium text-foreground">{label}</p>
               {requirementLevel !== '' && <Badge variant="outline">{requirementLevel}</Badge>}
             </div>
             {reason !== '' && <p className="mt-1 break-words text-xs text-muted-foreground">{reason}</p>}
             <dl className="mt-2 grid gap-2 text-xs">
               {assignment !== '' && (
-                <div>
+                <div className="flex flex-wrap items-baseline gap-1.5">
                   <dt className="font-medium text-muted-foreground">Assignment</dt>
-                  <dd className="mt-0.5 whitespace-pre-wrap break-words text-foreground">{assignment}</dd>
+                  <dd className="break-words text-foreground">{assignment}</dd>
                 </div>
               )}
-              {permissions !== '' && (
+              {permissions.length > 0 && (
                 <div>
                   <dt className="font-medium text-muted-foreground">Permissions</dt>
-                  <dd className="mt-0.5 whitespace-pre-wrap break-words text-foreground">{permissions}</dd>
+                  <dd className="mt-1 flex flex-wrap gap-1">
+                    {permissions.map((permission, permissionIndex) => (
+                      <span
+                        key={`${permission}-${permissionIndex}`}
+                        className="rounded-full bg-muted px-2 py-0.5 font-mono text-[11px] text-muted-foreground"
+                      >
+                        {permission}
+                      </span>
+                    ))}
+                  </dd>
                 </div>
               )}
               {fallback !== '' && (
-                <div>
+                <div className="flex flex-wrap items-baseline gap-1.5">
                   <dt className="font-medium text-muted-foreground">Fallback</dt>
-                  <dd className="mt-0.5 whitespace-pre-wrap break-words text-foreground">{fallback}</dd>
+                  <dd className="break-words text-foreground">{fallback}</dd>
                 </div>
               )}
             </dl>

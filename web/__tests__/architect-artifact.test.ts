@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { prepareArchitectArtifact } from '@/worker/architect-artifact'
+import {
+  assertUsableArchitectPlan,
+  prepareArchitectArtifact,
+  UnusableArchitectPlanError,
+} from '@/worker/architect-artifact'
 import type { ProjectMcpOverview } from '@/lib/mcps/types'
 
 const emptyOverview: ProjectMcpOverview = {
@@ -79,5 +83,41 @@ describe('prepareArchitectArtifact', () => {
       status: 'blocked',
     })
     expect(prepared.agents[0]).toMatchObject({ role: 'Backend', tasks: 1 })
+  })
+})
+
+describe('assertUsableArchitectPlan', () => {
+  const prepare = (raw: string) => prepareArchitectArtifact(raw, emptyOverview)
+
+  it('accepts a normal plan body', () => {
+    const raw = '# Plan\n\nImplement the requested change across the backend service and add focused tests covering it.'
+    expect(() => assertUsableArchitectPlan(raw, prepare(raw))).not.toThrow()
+  })
+
+  it('accepts an output that only asks open questions', () => {
+    const raw = [
+      'Short.',
+      '```open_questions_json',
+      '{"questions":[{"id":"q1","question":"Which database should this use?"}]}',
+      '```',
+    ].join('\n')
+    const prepared = prepare(raw)
+    expect(prepared.questions.length).toBe(1)
+    expect(() => assertUsableArchitectPlan(raw, prepared)).not.toThrow()
+  })
+
+  it('rejects empty output', () => {
+    expect(() => assertUsableArchitectPlan('   ', prepare('   '))).toThrow(UnusableArchitectPlanError)
+  })
+
+  it('rejects a transport/timeout failure leaking in as the plan', () => {
+    const raw =
+      'Falling back from WebSockets to HTTPS transport. request timed out. I\'ll quickly inspect the repo to anchor this to existing patterns.'
+    expect(() => assertUsableArchitectPlan(raw, prepare(raw))).toThrow(/transport, timeout, or quota/i)
+  })
+
+  it('rejects a trivially short non-plan with no questions or agents', () => {
+    const raw = 'ok'
+    expect(() => assertUsableArchitectPlan(raw, prepare(raw))).toThrow(UnusableArchitectPlanError)
   })
 })

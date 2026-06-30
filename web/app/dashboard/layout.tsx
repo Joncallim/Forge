@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
 import { DesktopSidebar, BottomTabBar } from './Sidebar'
 import { MobileHeader } from './MobileHeader'
+import { TooltipProvider } from '@/components/ui/tooltip'
 
 interface DashboardLayoutProps {
   children: ReactNode
@@ -8,20 +9,22 @@ interface DashboardLayoutProps {
 
 export default function DashboardLayout({ children }: DashboardLayoutProps) {
   return (
-    <div className="flex h-full min-h-screen flex-col md:flex-row">
-      {/* Desktop sidebar */}
-      <DesktopSidebar />
+    <TooltipProvider>
+      <div className="flex h-full min-h-screen flex-col md:flex-row">
+        {/* Desktop sidebar */}
+        <DesktopSidebar />
 
-      {/* Mobile top bar (hamburger + branding) */}
-      <MobileHeader />
+        {/* Mobile top bar (hamburger + branding) */}
+        <MobileHeader />
 
-      {/* Main content */}
-      <main className="flex-1 overflow-y-auto pb-16 md:pb-0">
-        {children}
-      </main>
+        {/* Main content */}
+        <main className="min-w-0 flex-1 overflow-y-auto pb-16 md:pb-0">
+          {children}
+        </main>
 
-      {/* Mobile bottom tab bar */}
-      <BottomTabBar />
-    </div>
+        {/* Mobile bottom tab bar */}
+        <BottomTabBar />
+      </div>
+    </TooltipProvider>
   )
 }

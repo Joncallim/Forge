@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import { useSession } from '@/hooks/useSession'
 import { Button } from '@/components/ui/button'
+import { SidebarTaskStatus } from './SidebarTaskStatus'
 import { cn } from '@/lib/utils'
 
 const NAV_ITEMS = [
@@ -57,24 +58,30 @@ export function DesktopSidebar() {
 
   return (
     <aside
-      className="hidden w-60 shrink-0 flex-col gap-2 border-r border-sidebar-border bg-sidebar px-3 py-4 md:flex"
+      className="sticky top-0 hidden h-screen w-60 shrink-0 flex-col gap-2 border-r border-sidebar-border bg-sidebar px-3 py-4 md:flex"
       aria-label="Main navigation"
     >
       {/* Branding */}
-      <div className="mb-2 flex items-center gap-2 px-3 py-2">
+      <div className="mb-2 flex shrink-0 items-center gap-2 px-3 py-2">
         <HammerIcon className="size-5 text-sidebar-primary" aria-hidden="true" />
         <span className="text-base font-semibold text-sidebar-foreground">Forge</span>
       </div>
 
-      {/* Nav links */}
-      <nav className="flex flex-1 flex-col gap-1">
+      {/* Nav links — scroll internally if they ever exceed the viewport so the
+          status strip and logout below always stay visible. */}
+      <nav className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto">
         {NAV_ITEMS.map((item) => (
           <NavLink key={item.href} {...item} />
         ))}
       </nav>
 
+      {/* Ongoing-task status strip */}
+      <div className="mt-auto shrink-0 pt-3">
+        <SidebarTaskStatus />
+      </div>
+
       {/* User + logout */}
-      <div className="mt-auto flex items-center justify-between gap-2 border-t border-sidebar-border pt-4">
+      <div className="mt-2 flex shrink-0 items-center justify-between gap-2 border-t border-sidebar-border pt-3">
         <span className="truncate text-sm text-sidebar-foreground" title={user?.displayName}>
           {user?.displayName ?? '—'}
         </span>
@@ -108,14 +115,19 @@ export function MobileNav({ onClose }: MobileNavProps) {
       </div>
 
       {/* Nav links */}
-      <nav className="flex flex-1 flex-col gap-1">
+      <nav className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto">
         {NAV_ITEMS.map((item) => (
           <NavLink key={item.href} {...item} onClick={onClose} />
         ))}
       </nav>
 
+      {/* Ongoing-task status strip */}
+      <div className="mt-auto shrink-0 pt-3">
+        <SidebarTaskStatus />
+      </div>
+
       {/* User + logout */}
-      <div className="mt-auto flex items-center justify-between gap-2 border-t border-sidebar-border pt-4">
+      <div className="mt-2 flex shrink-0 items-center justify-between gap-2 border-t border-sidebar-border pt-3">
         <span className="truncate text-sm text-sidebar-foreground" title={user?.displayName}>
           {user?.displayName ?? '—'}
         </span>
