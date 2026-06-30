@@ -257,13 +257,19 @@ describe('buildArchitectPrompt checkpoint resume context', () => {
     expect(source).toContain("previousPlan !== null && previousComparableMetadata !== null && prepared.planText.trim() !== ''")
   })
 
-  it('validates replans against visible text plus routing metadata', () => {
+  it('validates routing metadata and visible plan text independently', () => {
     const source = fs.readFileSync(path.join(repoRoot, 'worker/orchestrator.ts'), 'utf8')
 
-    expect(source).toContain('canonicalPlanRevisionText(previousPlan, previousComparableMetadata)')
-    expect(source).toContain('canonicalPlanRevisionText(prepared.planText, preparedComparableMetadata)')
+    // Routing metadata is compared on its own...
     expect(source).toContain('stableJson(hiddenRoutingComparable(previousComparableMetadata)) !== stableJson(hiddenRoutingComparable(preparedComparableMetadata))')
     expect(source).toContain('The revised plan changed machine-readable routing metadata.')
+    // ...and the text-retention guard takes the visible plan text only (no
+    // appended metadata that would pad the retained-line ratio).
+    expect(source).toContain('assertTargetedPlanRevision(previousPlan, prepared.planText)')
+    expect(source).not.toContain('canonicalPlanRevisionText')
+    // The revision guard keys on a 'fence' breakdown so question-only rounds
+    // keep it active and clarify-then-plan does not falsely trip it.
+    expect(source).toContain("previousComparableMetadata.agentBreakdownSource === 'fence'")
     expect(source).toContain('planRevisionComparableFromPrepared(prepared)')
     expect(source).toContain('planRevisionComparableFromMetadata(previousPlanArtifact.metadata)')
     expect(source).toContain("agentBreakdownSource: prepared.agentBreakdownSource")

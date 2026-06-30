@@ -400,24 +400,6 @@ function hiddenRoutingComparable(comparable: ReturnType<typeof planRevisionCompa
   }
 }
 
-function canonicalPlanRevisionText(planText: string, comparableMetadata: unknown): string {
-  return [
-    planText,
-    '',
-    'Machine-readable routing metadata:',
-    canonicalMetadataRevisionText(comparableMetadata),
-  ].join('\n')
-}
-
-function canonicalMetadataRevisionText(comparableMetadata: unknown): string {
-  return stableJson(comparableMetadata)
-    .replace(/[{}[\],]/g, '\n')
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .join('\n')
-}
-
 async function loadLatestPlanArtifact(taskId: string): Promise<LatestPlanArtifact | null> {
   const [artifact] = await db
     .select({ content: artifacts.content, metadata: artifacts.metadata })
@@ -679,26 +661,25 @@ async function runArchitect(
       )
     }
     if (previousPlan !== null && previousComparableMetadata !== null && prepared.planText.trim() !== '') {
-      // Only guard genuine revisions of an approvable plan. A prior artifact that
-      // was still awaiting answers (open questions) — or that predates the
-      // agentBreakdownSource field ('unknown') — is not a plan to preserve:
-      // producing the first real plan after clarification must not be rejected as
-      // a disallowed rewrite or routing change.
-      const previousOpenQuestionCount = typeof previousPlanArtifact?.metadata.openQuestionCount === 'number'
-        ? previousPlanArtifact.metadata.openQuestionCount
-        : 0
-      const previousWasApprovablePlan =
-        previousOpenQuestionCount === 0 && previousComparableMetadata.agentBreakdownSource !== 'unknown'
+      // Only guard genuine revisions of an approvable structured plan, keyed on a
+      // 'fence' agent breakdown. A questions-only round produces a 'fallback'
+      // breakdown (or none), so producing the first real plan after clarification
+      // is not rejected. Crucially, a question-only revision of an approved plan
+      // carries the previous 'fence' source forward onto the preserved artifact,
+      // so the guard stays active across the answer round and the plan cannot be
+      // rewritten. Pre-field artifacts report 'unknown' and are skipped.
+      const previousWasApprovablePlan = previousComparableMetadata.agentBreakdownSource === 'fence'
       if (previousWasApprovablePlan) {
         if (stableJson(hiddenRoutingComparable(previousComparableMetadata)) !== stableJson(hiddenRoutingComparable(preparedComparableMetadata))) {
           throw new UnusableArchitectPlanError(
             'The revised plan changed machine-readable routing metadata. Request visible targeted plan changes only, or restart the task for a new plan.',
           )
         }
-        assertTargetedPlanRevision(
-          canonicalPlanRevisionText(previousPlan, previousComparableMetadata),
-          canonicalPlanRevisionText(prepared.planText, preparedComparableMetadata),
-        )
+        // Routing metadata is covered by the equality check above, so the
+        // text-retention guard compares the visible plan text on its own.
+        // Mixing the (unchanged) metadata lines in would pad the retained-line
+        // ratio and let a short unrelated plan slip through.
+        assertTargetedPlanRevision(previousPlan, prepared.planText)
       }
     }
     const artifact = await createArtifact(task.id, run.id, artifactPlanText, {
