@@ -249,12 +249,16 @@ describe('buildArchitectPrompt checkpoint resume context', () => {
     expect(prompt).toContain('Do not rewrite, rename, reorder, summarize, or restyle unchanged material.')
   })
 
-  it('preserves the previous plan artifact when a replan only asks follow-up questions', () => {
+  it('preserves the previous plan artifact for any clarification-only replan', () => {
     const source = fs.readFileSync(path.join(repoRoot, 'worker/orchestrator.ts'), 'utf8')
 
-    expect(source).toContain("previousPlan !== null && prepared.questions.length > 0 && prepared.planText.trim() === ''")
+    // A clarification round (questions without a fenced plan) preserves the
+    // previous plan even when it includes explanatory prose, and is excluded
+    // from the revision guard.
+    expect(source).toContain("prepared.questions.length > 0 && prepared.agentBreakdownSource !== 'fence'")
+    expect(source).toContain('preservePreviousPlan ? previousPlan : prepared.planText')
     expect(source).toContain("previousPlan !== null && prepared.questions.length === 0 && prepared.planText.trim() === ''")
-    expect(source).toContain("previousPlan !== null && previousComparableMetadata !== null && prepared.planText.trim() !== ''")
+    expect(source).toContain('!isClarificationRound && prepared.planText.trim()')
   })
 
   it('validates routing metadata and visible plan text independently', () => {

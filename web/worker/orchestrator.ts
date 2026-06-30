@@ -645,29 +645,31 @@ async function runArchitect(
 
     const prepared = prepareArchitectArtifact(text, mcpOverview)
     assertUsableArchitectPlan(text, prepared)
-    const artifactPlanText = previousPlan !== null && prepared.questions.length > 0 && prepared.planText.trim() === ''
-      ? previousPlan
-      : prepared.planText
     const previousComparableMetadata = previousPlanArtifact
       ? planRevisionComparableFromMetadata(previousPlanArtifact.metadata)
       : null
     const preparedComparableMetadata = planRevisionComparableFromPrepared(prepared)
-    const artifactComparableMetadata = previousPlan !== null && prepared.questions.length > 0 && prepared.planText.trim() === '' && previousComparableMetadata !== null
-      ? previousComparableMetadata
-      : preparedComparableMetadata
+    // A clarification round = the architect asked follow-up questions without
+    // producing a structured (fenced) plan revision. Such a round — with or
+    // without explanatory prose outside the questions fence — must preserve the
+    // prior approved plan/metadata and route to awaiting_answers, not be treated
+    // as a revision and tripped by the routing guard.
+    const isClarificationRound = prepared.questions.length > 0 && prepared.agentBreakdownSource !== 'fence'
+    const preservePreviousPlan = previousPlan !== null && previousComparableMetadata !== null && isClarificationRound
+    const artifactPlanText = preservePreviousPlan ? previousPlan : prepared.planText
+    const artifactComparableMetadata = preservePreviousPlan ? previousComparableMetadata : preparedComparableMetadata
     if (previousPlan !== null && prepared.questions.length === 0 && prepared.planText.trim() === '') {
       throw new UnusableArchitectPlanError(
         'The revised plan did not include visible plan text. Request visible targeted plan changes only, or restart the task for a new plan.',
       )
     }
-    if (previousPlan !== null && previousComparableMetadata !== null && prepared.planText.trim() !== '') {
+    if (previousPlan !== null && previousComparableMetadata !== null && !isClarificationRound && prepared.planText.trim() !== '') {
       // Only guard genuine revisions of an approvable structured plan, keyed on a
-      // 'fence' agent breakdown. A questions-only round produces a 'fallback'
-      // breakdown (or none), so producing the first real plan after clarification
-      // is not rejected. Crucially, a question-only revision of an approved plan
-      // carries the previous 'fence' source forward onto the preserved artifact,
-      // so the guard stays active across the answer round and the plan cannot be
-      // rewritten. Pre-field artifacts report 'unknown' and are skipped.
+      // 'fence' agent breakdown. Clarification rounds are preserved above; a
+      // question-only revision of an approved plan carries the previous 'fence'
+      // source forward onto the preserved artifact, so the guard stays active
+      // across the answer round and the plan cannot be rewritten. Pre-field
+      // artifacts report 'unknown' and are skipped.
       const previousWasApprovablePlan = previousComparableMetadata.agentBreakdownSource === 'fence'
       if (previousWasApprovablePlan) {
         if (stableJson(hiddenRoutingComparable(previousComparableMetadata)) !== stableJson(hiddenRoutingComparable(preparedComparableMetadata))) {
