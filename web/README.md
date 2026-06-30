@@ -41,8 +41,9 @@ Forge Web expects:
 - A worker loop, embedded by default or run separately for split deployments.
 - At least one AI provider, unless you only run mock tests.
 
-When running from `web/`, both Next.js and the worker load the repository-root
-`.env` file.
+When running from `web/`, both Next.js and the worker load the active Forge
+workspace env file, which defaults to `~/Documents/Forge/config/forge.env`.
+Repository `.env` files are legacy fallbacks only.
 
 ## Common Commands
 
@@ -108,7 +109,15 @@ docker compose --profile worker up worker
 
 ## Current Worker Scope
 
-The worker currently runs only the Architect planning stage. It does not yet edit
-repositories, run implementation agents, create commits, or open pull requests.
+By default, the worker runs the Architect planning stage and waits for explicit
+plan approval. Workforce materialization and handoff are default-on unless set
+to `0` or `false`, so approved tasks can be materialized into work packages and
+handoff/review-gate state. Generated package execution is opt-in with
+`FORGE_WORK_PACKAGE_EXECUTION=1` and sandbox-only. Host-repository edits,
+branches, commits, pull requests, merges, live specialist MCP grants, and
+parallel specialist execution remain future work.
 
 See [../docs/developer-guide.md](../docs/developer-guide.md).
+
+For local command-line-agent providers, see
+[../docs/acp-zed-connector.md](../docs/acp-zed-connector.md).

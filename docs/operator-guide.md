@@ -15,6 +15,14 @@ Forge has four moving pieces:
 For normal local use, `forge` starts both the dashboard and the worker. For
 split deployments, the worker can still run separately.
 
+The most important beta boundary: Forge may write plans, approval records,
+work-package records, and handoff/review-gate state, but not repository
+commits. Workforce materialization and handoff are enabled unless explicitly
+disabled. Generated package execution is the opt-in piece and writes only into a
+per-task sandbox. Host-repository edits, branches, commits, pull requests,
+merges, live specialist MCP grants, and parallel specialists are still future
+work.
+
 ## Install
 
 From the repository root:
@@ -127,6 +135,25 @@ Common provider variables:
 | `LITELLM_BASE_URL` | LiteLLM gateway |
 | `LITELLM_API_KEY` | Optional LiteLLM gateway key, for the gateway itself |
 
+### ACP Providers
+
+ACP providers connect Forge to local coding CLIs through the Agent Client
+Protocol. In plain terms, Forge starts a small adapter process, sends it a
+prompt, and reads the agent's streamed text response.
+
+For the currently wired Zed adapters:
+
+- Forge starts the adapter with `npx`.
+- The adapter wraps the local `codex` or `claude` CLI.
+- The local CLI must already be installed and logged in.
+- The Forge project must have a local folder, because the ACP session starts
+  inside that folder.
+- Installing the Zed editor is not required; Forge uses Zed's adapter package,
+  not the editor itself.
+
+See [ACP and the Zed connector](acp-zed-connector.md) for the full simple
+explanation and troubleshooting checklist.
+
 GitHub repository operations prefer the encrypted PAT from Settings, then the
 authenticated `gh` CLI token. The legacy clone env-var fallback is limited to
 `GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_PAT`, or `FORGE_GITHUB_TOKEN`; arbitrary
@@ -196,6 +223,9 @@ Worker and workspace options:
 | `FORGE_AGENT_WEB_SEARCH` | Set `0` to disable no-key web research context |
 | `FORGE_AGENT_CONFIG_DIR` | Optional override for app-editable agent prompt files; must stay inside the workspace |
 | `FORGE_PROMPT_UPGRADE_MODE` | `keep` or `overwrite` local workspace prompts during install/upgrade |
+| `FORGE_WORKFORCE_MATERIALIZATION` | Set `0` or `false` to disable default Workforce record materialization |
+| `FORGE_WORK_PACKAGE_HANDOFF` | Set `0` or `false` to disable default work-package handoff claims |
+| `FORGE_WORK_PACKAGE_EXECUTION` | Set `1` or `true` to enable opt-in sandbox package execution |
 | `FORGE_WORKSPACE_ROOT` | Fixed workspace root override |
 | `FORGE_MCPS_ROOT` | Fixed shared MCP root override |
 | `FORGE_WORKER_MAX_ATTEMPTS` | Retry ceiling per task or approval job |
@@ -338,6 +368,9 @@ running Forge, and confirm the Architect agent has a provider assigned.
 
 If provider health says an environment variable is missing, add the real key to
 `~/Documents/Forge/config/forge.env` and restart the web app and worker.
+
+If an ACP provider is not ready, confirm Node/`npx`, the underlying CLI, CLI
+login, and the project's local folder. Then rerun the provider health check.
 
 If passkey registration fails, use `http://localhost:3000` locally and confirm
 `WEBAUTHN_RP_ID=localhost` and `WEBAUTHN_ORIGIN=http://localhost:3000`.

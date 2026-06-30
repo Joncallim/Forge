@@ -35,6 +35,10 @@ The launcher may add more commands later, but broad reset commands remain out of
 scope until each destructive or credential-affecting action has an explicit
 contract.
 
+The CLI is an operator convenience layer, not a second runtime. If behavior
+differs between `forge` and the underlying scripts, treat that as a bug and fix
+the wrapper or docs so there is one clear path.
+
 ## Install And Link Model
 
 The repository-owned launcher lives at:

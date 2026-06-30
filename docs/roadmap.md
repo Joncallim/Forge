@@ -1,6 +1,6 @@
 # Forge Roadmap
 
-Last updated: 2026-06-25
+Last updated: 2026-06-29
 
 ## Plain-English Summary
 
@@ -9,13 +9,22 @@ projects, providers, agents, tasks, run logs, artifacts, and approvals. The
 worker is the execution plane for queued tasks.
 
 Today, the worker runs the Architect planning stage, saves a Markdown plan,
-asks follow-up questions when needed, and pauses for human approval. It does
-not yet edit repositories, run implementation specialists, execute tests,
-create commits, open pull requests, or merge work.
+asks follow-up questions when needed, and pauses for human approval.
+Workforce materialization and handoff are enabled unless explicitly disabled, so
+approved plans can move into durable work-package and gate state. Generated
+package execution is still opt-in with `FORGE_WORK_PACKAGE_EXECUTION=1`, and
+generated output is written only inside per-task sandboxes. This path does not
+apply edits to the host repository, grant MCP runtime access to specialists,
+create commits, open pull requests, merge work, or run specialists in parallel.
 
-The next product stage is the Workforce architecture: durable work packages,
-specialist harnesses, explicit approval gates, and eventually safe repository
-execution.
+The next approved epic is #119, "Executable Workforce Beta:
+capability-brokered sequential specialist execution." It sits under #30 and
+treats #43 and #60 as core scope.
+
+Short version: Forge is useful today as a local planning and approval control
+room. The next big milestone is making sequential specialist execution reliable
+inside sandboxes before Forge is trusted with host-repository writes or pull
+request automation.
 
 ## Operational Understanding
 
@@ -279,7 +288,7 @@ from these templates instead of a hardcoded role list.
 
 ### Workforce Rollout
 
-First build slice:
+Current build slice:
 
 1. Add an ADR for two-tier roles, harness overlays, state machine, approval
    gates, and Redis/Postgres ownership boundaries.
@@ -288,24 +297,29 @@ First build slice:
 3. Materialize the latest Architect artifact metadata into read-only
    `work_packages`, behind a feature flag where execution behavior is involved.
 4. Show work packages, gates, and VCS summary on the task detail page.
-5. Keep specialist execution, repository writes, commits, PRs, and merges out of
-   this slice.
+5. Keep host repository writes, commits, PRs, and merges out of this slice.
+   Work-package handoff and execution remain feature-flagged and sandbox-only.
 
-Next execution slices:
+Next approved epic: #119 Executable Workforce Beta:
 
-1. Add a dispatcher that maps Architect work packages to harnesses by
-   capability, not only fixed stage names.
-2. Run one safe specialist after Architect, initially sequentially and behind a
-   feature flag.
-3. Store specialist artifacts and show them on the task page.
-4. Add QA and Reviewer gates before generated code can be accepted.
-5. Add repository checkout and branch management.
-6. Persist diffs, test output, review comments, routing decisions, and final
-   decision logs.
-7. Create commits and GitHub pull requests.
-8. Add merge/rework gates driven by Reviewer and QA outcomes.
-9. Move from static harnesses to editable harnesses after the fixed path is
-   reliable.
+1. Route Architect work packages through capability brokerage instead of only
+   fixed stage names (#43).
+2. Run specialist packages sequentially through the sandbox execution path
+   (#60).
+3. Store handoff, execution, command, QA, and Reviewer artifacts on the task.
+4. Add QA and Reviewer gates before generated output can be accepted.
+5. Require security review for auth, secrets, filesystem, command execution,
+   repository-write, tool-permission, prompt-injection, and merge-automation
+   work.
+6. Keep MCP runtime grants, host repository writes, commits, PR creation, merge
+   automation, and parallel execution out of the beta.
+
+Deferred:
+
+- #69 PR/merge automation waits until sandboxed sequential execution,
+  capability brokerage, QA/Reviewer gates, and security review are reliable.
+- Repository checkout, branch management, commits, PR creation, and merge/rework
+  gates remain future slices after #119.
 
 Risks:
 
@@ -373,6 +387,33 @@ The starter CLI command taxonomy is documented in
 `docs/cli-command-architecture.md`. The global `forge` launcher is a thin
 wrapper over existing install, uninstall, web, and recovery scripts.
 
+### ACP Provider Direction
+
+ACP support makes Forge a client for local coding agents rather than only a
+client for direct model APIs. The current path uses Zed adapter packages for
+Codex CLI and Claude Code:
+
+```text
+Forge -> Zed ACP adapter -> local CLI -> logged-in model account
+```
+
+This is useful because it lets Forge call tools that already have their own CLI
+auth, runtime behavior, and model routing. The cautious boundary is that ACP
+currently returns text through Forge's provider interface; it does not yet grant
+Forge-managed MCP tools, expose detailed token usage, or make repository writes
+safe by itself.
+
+Near-term ACP work:
+
+1. Keep readiness errors actionable for missing `npx`, missing CLI installs,
+   missing auth, and missing project folders.
+2. Expand runtime strategies only after the current Codex CLI and Claude Code
+   paths are reliable.
+3. Keep ACP execution behind the same Workforce and sandbox safety gates as
+   other specialist execution.
+4. Document runtime-specific model-selection behavior instead of promising a
+   universal model picker.
+
 ## Reference Material
 
 Primary source docs:
@@ -382,6 +423,8 @@ Primary source docs:
 - `web/README.md`
 - `docs/operator-guide.md`
 - `docs/developer-guide.md`
+- `docs/wiki.md`
+- `docs/acp-zed-connector.md`
 - `docs/design.md`
 - `docs/adr/0004-cross-agent-checkpointing.md`
 - `docs/adr/0005-workforce-orchestration-graph.md`

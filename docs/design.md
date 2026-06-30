@@ -9,6 +9,12 @@ Forge should feel like managing a small AI software team, not chatting with one
 assistant. Every screen should make it clear what is happening, why it is
 happening, what needs attention, and what decision the human should make next.
 
+The UI must also be honest about the current beta boundary. Planning,
+approvals, provider health, artifacts, and sandboxed Workforce records can be
+shown as present capability. Host-repository writes, PR automation, merge
+automation, live specialist MCP grants, and parallel execution should be framed
+as future or gated behavior unless the implementation changes.
+
 ## Product Model
 
 Primary workflow:
@@ -64,6 +70,19 @@ Avoid:
 | Task Workspace | Show brief, requirements, plan, files touched, diffs, tests, logs, reviewer notes, and approval actions |
 | Agent Workspace | Show identity, model/provider, state, workspace/branch, token/cost/time, logs, output, retry/fork/stop controls |
 | Skill And Persona Library | Show available skills, personas, commands, source, project fit, and update status |
+
+## Screenshot Use
+
+Use screenshots when they help a reader understand a workflow state faster than
+prose:
+
+- Setup wizard: first-run provider choice.
+- Provider review: configured provider health and local discovery.
+- Task awaiting approval: the human checkpoint after Architect planning.
+- Completed Orchestrator task: the approved beta-stage endpoint.
+
+Keep screenshots grounded in real UI states. Do not use decorative mockups for
+operator or developer docs.
 
 ## Screenshot Evidence
 

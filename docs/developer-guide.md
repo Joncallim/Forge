@@ -8,10 +8,29 @@ prompt, command, and documentation notes into one developer reference.
 Forge is a Next.js app with a background worker. The dashboard records what the
 operator wants. The worker does the queued work and saves evidence for review.
 
-The current worker runs only the Architect planning stage. Workforce data
+The current worker starts with the Architect planning stage. Workforce data
 structures now exist for work packages, harnesses, approval gates, and VCS
-summaries, but specialist execution and repository writes are still future
-slices.
+summaries. Work-package handoff and sequential specialist execution exist behind
+flags with different defaults: materialization and handoff are default-on unless
+explicitly disabled, while generated package execution is opt-in with
+`FORGE_WORK_PACKAGE_EXECUTION=1`. Generated files are written only to per-task
+sandboxes. Forge still does not apply generated edits to the host repository,
+grant MCP runtime access to specialists, create commits, open pull requests,
+merge work, or run specialists in parallel.
+
+The MCP/capability broker is an admission-time gate: it decides whether a work
+package may be claimed and handed off based on the requested MCP capabilities,
+their safe-beta allowlist, and MCP health. It does not enforce capabilities at
+runtime (`runtimeEnforcement` is `not_implemented`) — specialists run sandboxed
+with no real MCP tools — so "brokered" here means gated admission, not a runtime
+sandbox over live tools.
+
+ACP providers are local command-line-agent providers. Forge starts the
+configured ACP adapter on demand, speaks JSON-RPC over stdio, and receives text
+back through the same provider interface used by the worker. The currently wired
+Zed adapters wrap local tools such as Codex CLI and Claude Code; the underlying
+CLI must already be installed, authenticated, and runnable in the project
+folder. See [ACP and the Zed connector](acp-zed-connector.md).
 
 ## Local Development
 
@@ -51,6 +70,7 @@ Important directories:
 | `web/db/migrations` | Generated SQL migrations and snapshots |
 | `web/worker` | Queue, worker runtime, Architect orchestration, Workforce materialization |
 | `web/lib/recommendations.ts` | Static model preset and role recommendation data |
+| `web/lib/providers/acp` | ACP catalog, readiness handshake, stdio transport, and AI SDK adapter |
 | `.codex/agents` | Versioned seed defaults for manual Codex roles |
 | `.claude/agents` | Optional legacy Claude prompt import location when present locally |
 
@@ -76,7 +96,7 @@ fallbacks only.
 
 ## Worker Runtime
 
-Current task path:
+Current task path without Workforce packages:
 
 ```text
 POST /api/tasks
@@ -86,10 +106,34 @@ POST /api/tasks
   -> task becomes running
   -> Architect model produces Markdown
   -> artifact is saved
-  -> Workforce planning records are materialized when possible
   -> task becomes awaiting_approval
-  -> approval job marks it completed
+  -> operator approves or rejects the plan
+  -> approval job marks the task completed
 ```
+
+Current task path with Workforce materialization enabled:
+
+```text
+POST /api/tasks
+  -> insert task in PostgreSQL and push { taskId } to forge:tasks
+  -> worker runs Architect planning and saves the plan artifact
+  -> Workforce planning records and the plan approval gate are materialized
+  -> task becomes awaiting_approval
+  -> operator approves the plan
+  -> approval job releases ready work packages
+  -> MCP/capability broker validates the next handoff before ready/claim
+  -> execution, only when `FORGE_WORK_PACKAGE_EXECUTION=1`, writes to a per-task sandbox
+  -> package QA/Reviewer/Security review gates complete when required
+  -> task completes after all work packages and review gates are complete
+```
+
+Feature flag defaults:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `FORGE_WORKFORCE_MATERIALIZATION` | enabled | Set `0` or `false` to skip durable work-package/gate records. |
+| `FORGE_WORK_PACKAGE_HANDOFF` | enabled | Set `0` or `false` to stop package handoff claims. |
+| `FORGE_WORK_PACKAGE_EXECUTION` | disabled | Set `1` or `true` to run sandbox package execution. |
 
 Implemented worker files:
 
@@ -120,6 +164,40 @@ forge:approvals:dead
 
 The worker uses PostgreSQL as the source of truth. Redis carries wake-up jobs,
 retry timing, and dead-letter transport.
+
+## ACP Provider Path
+
+ACP is the Agent Client Protocol. Forge uses it to call local coding agents
+through adapter processes instead of direct cloud API calls.
+
+Current ACP flow:
+
+```text
+getModel(providerConfigId, { cwd })
+  -> AcpLanguageModel
+  -> AcpSessionClient.start(agentId, cwd)
+  -> npx Zed adapter package
+  -> initialize
+  -> session/new with project cwd
+  -> optional session/set_config_option for model selection
+  -> session/prompt
+  -> streamed agent_message_chunk text
+```
+
+Important implementation constraints:
+
+- `web/lib/providers/acp/transport.ts` owns the line-delimited JSON-RPC stdio
+  framing.
+- `web/lib/providers/acp/handshake.ts` owns readiness checks and actionable
+  health states.
+- `web/lib/providers/acp/client.ts` owns one prompt turn and closes the adapter
+  process afterward.
+- `web/lib/providers/acp/language-model.ts` adapts ACP text output into the
+  Vercel AI SDK `LanguageModelV3` interface.
+- ACP does not currently provide Forge with token usage, structured tool calls,
+  or runtime MCP grants.
+- ACP model selection is passed only when the runtime exposes a compatible
+  session config option.
 
 ## Workforce Architecture
 
