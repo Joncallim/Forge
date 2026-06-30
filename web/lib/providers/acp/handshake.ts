@@ -1,5 +1,9 @@
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { getAcpAgent } from './catalog'
 import { AcpTransport, defaultAcpSpawn, type AcpSpawn } from './transport'
+import { redactAdapterMessage } from './redaction'
 
 // ---------------------------------------------------------------------------
 // ACP adapter readiness check
@@ -26,6 +30,7 @@ export type AcpReadinessResult = {
 }
 
 const ACP_HANDSHAKE_TIMEOUT_MS = 8000
+const ACP_SESSION_PROBE_TIMEOUT_MS = 12_000
 export const ACP_PROTOCOL_VERSION = 1
 
 /**
@@ -90,44 +95,72 @@ export async function checkAcpReadiness(
     }
   }
 
+  // A bare `initialize` only proves the zed adapter process can speak ACP — it
+  // never invokes the underlying CLI (`codex`/`claude`), so it returns "ready"
+  // even when that CLI is not installed or not authenticated. We additionally
+  // open a throwaway session, which forces the adapter to actually start the
+  // underlying CLI in a working directory. That is what makes a green indicator
+  // mean "Forge can really use this runtime" rather than "an npx package booted".
+  let phase = 'initialize handshake'
+  let probeDir: string | null = null
   try {
     await transport.request(
       'initialize',
       { protocolVersion: ACP_PROTOCOL_VERSION, clientCapabilities: {} },
       ACP_HANDSHAKE_TIMEOUT_MS,
     )
+
+    phase = 'session probe'
+    probeDir = await mkdtemp(join(tmpdir(), 'forge-acp-probe-'))
+    await transport.request(
+      'session/new',
+      { cwd: probeDir, mcpServers: [] },
+      ACP_SESSION_PROBE_TIMEOUT_MS,
+    )
     return {
       status: 'ready',
-      message: `${agent.label} is reachable and completed the ACP handshake.`,
+      message: `${agent.label} is installed, authenticated, and started an ACP session successfully.`,
       latencyMs: Date.now() - start,
     }
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
-
-    if (/timed out/i.test(message)) {
-      return {
-        status: 'handshake_failed',
-        message: `Timed out after ${ACP_HANDSHAKE_TIMEOUT_MS}ms waiting for ${agent.label}'s ACP adapter to respond to the initialize handshake.`,
-        latencyMs: null,
-      }
-    }
-
-    if (/exited unexpectedly|process error/i.test(message)) {
-      return {
-        status: 'unreachable',
-        message: `The ${agent.label} ACP adapter exited immediately or could not be reached: ${message}${
-          transport.recentStderr ? '' : ' Is the underlying CLI installed and on PATH?'
-        }`,
-        latencyMs: null,
-      }
-    }
-
-    return {
-      status: looksLikeAuthFailure(message) ? 'authenticated_unavailable' : 'handshake_failed',
-      message: `${agent.label}'s ACP adapter rejected the initialize handshake: ${message}`,
-      latencyMs: Date.now() - start,
-    }
+    return classifyAcpReadinessError(agent.label, err, start, phase)
   } finally {
     transport.close()
+    if (probeDir) {
+      await rm(probeDir, { recursive: true, force: true }).catch(() => {})
+    }
+  }
+}
+
+function classifyAcpReadinessError(
+  label: string,
+  err: unknown,
+  start: number,
+  phase: string,
+): AcpReadinessResult {
+  const message = redactAdapterMessage(err instanceof Error ? err.message : String(err))
+
+  if (/timed out/i.test(message)) {
+    return {
+      status: 'handshake_failed',
+      message: `Timed out waiting for ${label}'s ACP adapter during the ${phase}. The underlying CLI may not be installed or signed in.`,
+      latencyMs: null,
+    }
+  }
+
+  if (/exited unexpectedly|process error/i.test(message)) {
+    return {
+      status: 'unreachable',
+      message: `The ${label} ACP adapter exited or could not be reached during the ${phase}. Make sure the underlying CLI is installed, authenticated, and on PATH.`,
+      latencyMs: null,
+    }
+  }
+
+  return {
+    status: looksLikeAuthFailure(message) ? 'authenticated_unavailable' : 'handshake_failed',
+    message: looksLikeAuthFailure(message)
+      ? `${label} is reachable but not authenticated: ${message}. Sign in to the underlying CLI first.`
+      : `${label}'s ACP adapter failed the ${phase}: ${message}`,
+    latencyMs: Date.now() - start,
   }
 }

@@ -125,7 +125,7 @@ function chain(resolveValue: unknown) {
     catch: (onRejected: (e: unknown) => unknown) =>
       Promise.resolve(resolveValue).catch(onRejected),
   }
-  const methods = ['from', 'where', 'limit', 'orderBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'onConflictDoUpdate', 'onConflictDoNothing']
+  const methods = ['from', 'where', 'limit', 'orderBy', 'groupBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'onConflictDoUpdate', 'onConflictDoNothing']
   methods.forEach((m) => { thenable[m] = () => thenable })
   return thenable
 }
@@ -137,7 +137,7 @@ function rejectingChain(error: unknown) {
     catch: (onRejected: (e: unknown) => unknown) =>
       Promise.reject(error).catch(onRejected),
   }
-  const methods = ['from', 'where', 'limit', 'orderBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'onConflictDoUpdate', 'onConflictDoNothing']
+  const methods = ['from', 'where', 'limit', 'orderBy', 'groupBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'onConflictDoUpdate', 'onConflictDoNothing']
   methods.forEach((m) => { thenable[m] = () => thenable })
   return thenable
 }
@@ -4529,5 +4529,78 @@ describe('GET /api/tasks — includes project name', () => {
       projectName: 'Forge Web',
     })
     expect(body.total).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Suite 3.9 — Sidebar task summary
+// ---------------------------------------------------------------------------
+
+describe('GET /api/tasks/summary', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('returns 401 when not authenticated', async () => {
+    mockGetSession.mockResolvedValue(null)
+
+    const { GET } = await import('@/app/api/tasks/summary/route')
+    const res = await GET(nextAuthRequest('/api/tasks/summary') as never)
+
+    expect(res.status).toBe(401)
+    expect(mockDbSelect).not.toHaveBeenCalled()
+  })
+
+  it('aggregates task statuses and returns the latest attention tasks', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect
+      .mockReturnValueOnce(chain([
+        { status: 'pending', total: 2 },
+        { status: 'running', total: 1 },
+        { status: 'approved', total: 1 },
+        { status: 'awaiting_approval', total: 3 },
+        { status: 'awaiting_answers', total: 1 },
+        { status: 'failed', total: 1 },
+        { status: 'completed', total: 10 },
+        { status: 'cancelled', total: 4 },
+      ]))
+      .mockReturnValueOnce(chain([
+        { id: 'task-newest', title: 'Needs approval', status: 'awaiting_approval' },
+        { id: 'task-failed', title: 'Investigate failure', status: 'failed' },
+      ]))
+
+    const { GET } = await import('@/app/api/tasks/summary/route')
+    const res = await GET(nextAuthRequest('/api/tasks/summary') as never)
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual({
+      active: 4,
+      attention: 5,
+      byStatus: {
+        pending: 2,
+        running: 1,
+        approved: 1,
+        awaiting_approval: 3,
+        awaiting_answers: 1,
+        failed: 1,
+        completed: 10,
+        cancelled: 4,
+      },
+      attentionTasks: [
+        { id: 'task-newest', title: 'Needs approval', status: 'awaiting_approval' },
+        { id: 'task-failed', title: 'Investigate failure', status: 'failed' },
+      ],
+    })
+    expect(mockDbSelect).toHaveBeenCalledTimes(2)
+  })
+
+  it('returns 500 when the summary query fails', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValueOnce(rejectingChain(new Error('database unavailable')))
+
+    const { GET } = await import('@/app/api/tasks/summary/route')
+    const res = await GET(nextAuthRequest('/api/tasks/summary') as never)
+
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Internal server error' })
   })
 })

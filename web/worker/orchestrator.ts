@@ -15,7 +15,7 @@ import type { OpenQuestion } from './open-questions'
 import { getProjectMcpOverview } from '../lib/mcps/manager'
 import type { ProjectMcpOverview } from '../lib/mcps/types'
 import { assertProjectLocalPathForExecution } from '../lib/projects/local-path'
-import { prepareArchitectArtifact } from './architect-artifact'
+import { assertUsableArchitectPlan, prepareArchitectArtifact } from './architect-artifact'
 import { materializeWorkforceFromArchitectArtifact } from './workforce-materializer'
 import { displayPathForWorkspacePath, getWorkspaceSettings } from '../lib/workspace'
 import {
@@ -569,6 +569,7 @@ async function runArchitect(
     }
 
     const prepared = prepareArchitectArtifact(text, mcpOverview)
+    assertUsableArchitectPlan(text, prepared)
     const artifact = await createArtifact(task.id, run.id, prepared.planText, {
       openQuestionCount: prepared.questions.length,
       revisedFromAnswers: answeredQuestions.length > 0,

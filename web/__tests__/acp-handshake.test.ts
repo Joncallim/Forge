@@ -10,11 +10,26 @@ import { EventEmitter } from 'node:events'
 import { describe, it, expect, vi } from 'vitest'
 import { checkAcpReadiness, getAcpAdapterCommand, isAcpAdapterSupported } from '@/lib/providers/acp/handshake'
 
+type AcpResponder = (method: string, id: number) => Record<string, unknown> | null
+
 class FakeChildProcess extends EventEmitter {
-  stdin = { write: vi.fn() }
   stdout = new EventEmitter()
   stderr = new EventEmitter()
   kill = vi.fn()
+  // Auto-respond to each JSON-RPC request the transport writes, so multi-step
+  // handshakes (initialize -> session/new) can be driven by a single responder.
+  responder: AcpResponder = (_method, id) => ({ jsonrpc: '2.0', id, result: {} })
+  stdin = {
+    write: vi.fn((raw: string) => {
+      const request = JSON.parse(raw.trim()) as { id: number; method: string }
+      const response = this.responder(request.method, request.id)
+      if (response) {
+        // Defer so the transport has registered the pending request first.
+        setTimeout(() => writeJsonLine(this.stdout, response), 0)
+      }
+      return true
+    }),
+  }
 }
 
 function makeSpawnFn(child: FakeChildProcess) {
@@ -49,39 +64,80 @@ describe('checkAcpReadiness', () => {
     expect(result.status).toBe('not_configured')
   })
 
-  it('returns ready when the adapter responds successfully to initialize', async () => {
+  it('returns ready only after both initialize and a session probe succeed', async () => {
     const child = new FakeChildProcess()
+    child.responder = (method, id) => {
+      if (method === 'initialize') return { jsonrpc: '2.0', id, result: { protocolVersion: 1 } }
+      if (method === 'session/new') return { jsonrpc: '2.0', id, result: { sessionId: 'sess-1' } }
+      return null
+    }
     const spawnFn = makeSpawnFn(child)
 
-    const promise = checkAcpReadiness('codex-cli', spawnFn)
-    writeJsonLine(child.stdout, { jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } })
-    const result = await promise
+    const result = await checkAcpReadiness('codex-cli', spawnFn)
 
     expect(result.status).toBe('ready')
     expect(result.latencyMs).not.toBeNull()
     expect(spawnFn).toHaveBeenCalledWith('npx', ['-y', '@zed-industries/codex-acp'])
+    expect(child.stdin.write).toHaveBeenCalledTimes(2)
+    expect(child.kill).toHaveBeenCalled()
   })
 
-  it('classifies an auth-related handshake error as authenticated_unavailable', async () => {
+  it('reports authenticated_unavailable when the session probe needs login', async () => {
     const child = new FakeChildProcess()
+    child.responder = (method, id) => {
+      if (method === 'initialize') return { jsonrpc: '2.0', id, result: { protocolVersion: 1 } }
+      // initialize succeeds, but starting a session requires authentication.
+      return { jsonrpc: '2.0', id, error: { message: 'Not authenticated, please login' } }
+    }
     const spawnFn = makeSpawnFn(child)
 
-    const promise = checkAcpReadiness('codex-cli', spawnFn)
-    writeJsonLine(child.stdout, { jsonrpc: '2.0', id: 1, error: { message: 'Not authenticated, please login' } })
-    const result = await promise
+    const result = await checkAcpReadiness('codex-cli', spawnFn)
 
     expect(result.status).toBe('authenticated_unavailable')
+    expect(child.kill).toHaveBeenCalled()
+  })
+
+  it('classifies an auth-related initialize error as authenticated_unavailable', async () => {
+    const child = new FakeChildProcess()
+    child.responder = (_method, id) => ({ jsonrpc: '2.0', id, error: { message: 'Not authenticated, please login' } })
+    const spawnFn = makeSpawnFn(child)
+
+    const result = await checkAcpReadiness('codex-cli', spawnFn)
+
+    expect(result.status).toBe('authenticated_unavailable')
+    expect(child.kill).toHaveBeenCalled()
+  })
+
+  it('redacts sensitive adapter messages before returning auth failures', async () => {
+    const child = new FakeChildProcess()
+    child.responder = (_method, id) => ({
+      jsonrpc: '2.0',
+      id,
+      error: {
+        message: 'Not authenticated as dev@example.com with Bearer ghp_1234567890abcdef',
+      },
+    })
+    const spawnFn = makeSpawnFn(child)
+
+    const result = await checkAcpReadiness('codex-cli', spawnFn)
+
+    expect(result.status).toBe('authenticated_unavailable')
+    expect(result.message).toContain('[redacted-email]')
+    expect(result.message).toContain('Bearer [redacted-token]')
+    expect(result.message).not.toContain('dev@example.com')
+    expect(result.message).not.toContain('ghp_1234567890abcdef')
+    expect(child.kill).toHaveBeenCalled()
   })
 
   it('classifies a non-auth handshake error as handshake_failed', async () => {
     const child = new FakeChildProcess()
+    child.responder = (_method, id) => ({ jsonrpc: '2.0', id, error: { message: 'Unsupported protocol version' } })
     const spawnFn = makeSpawnFn(child)
 
-    const promise = checkAcpReadiness('codex-cli', spawnFn)
-    writeJsonLine(child.stdout, { jsonrpc: '2.0', id: 1, error: { message: 'Unsupported protocol version' } })
-    const result = await promise
+    const result = await checkAcpReadiness('codex-cli', spawnFn)
 
     expect(result.status).toBe('handshake_failed')
+    expect(child.kill).toHaveBeenCalled()
   })
 
   it('classifies an early process exit as unreachable', async () => {
@@ -89,10 +145,13 @@ describe('checkAcpReadiness', () => {
     const spawnFn = makeSpawnFn(child)
 
     const promise = checkAcpReadiness('codex-cli', spawnFn)
+    child.stderr.emit('data', Buffer.from('token ghp_1234567890abcdef for dev@example.com'))
     child.emit('exit', 1)
     const result = await promise
 
     expect(result.status).toBe('unreachable')
+    expect(result.message).not.toContain('ghp_1234567890abcdef')
+    expect(result.message).not.toContain('dev@example.com')
   })
 
   it('classifies a synchronous spawn failure as unreachable', async () => {

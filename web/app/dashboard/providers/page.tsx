@@ -14,6 +14,7 @@ import {
   WrenchIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Tooltip } from '@/components/ui/tooltip'
 import {
   Dialog,
   DialogContent,
@@ -552,20 +553,28 @@ function discoveryCandidateDisplay(candidate: DiscoveryCandidate): {
   label: string
   detail?: string
   versionLabel: string | null
+  runtimeLabel: string | null
 } {
   if (candidate.providerType !== 'acp') {
     return {
       label: candidate.label,
       detail: candidate.detail,
       versionLabel: candidate.versionLabel ?? null,
+      runtimeLabel: null,
     }
   }
 
+  // For ACP runtimes, lead with the model the operator is choosing and keep the
+  // runtime ("Claude Code" / "Codex CLI") as a secondary grey chip.
   const display = acpProviderDisplay(candidate.modelId ?? candidate.label)
+  const modelName = acpVersionLabel(candidate) ?? display.selectedModel
   return {
-    label: display.runtimeLabel,
+    label: modelName ?? display.runtimeLabel,
     detail: candidate.detail ?? 'ACP-connected model preset',
-    versionLabel: acpVersionLabel(candidate) ?? display.modelSelectionLabel,
+    versionLabel: null,
+    // Only show the runtime chip when the title is the model itself, so a
+    // runtime-default preset doesn't render the same text twice.
+    runtimeLabel: modelName ? display.runtimeLabel : null,
   }
 }
 
@@ -590,6 +599,11 @@ function DiscoveryCandidateCard({
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
             <p className="min-w-0 break-words text-sm font-medium text-foreground">{display.label}</p>
+            {display.runtimeLabel && (
+              <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+                {display.runtimeLabel}
+              </span>
+            )}
             {display.versionLabel && (
               <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
                 {display.versionLabel}
@@ -598,18 +612,33 @@ function DiscoveryCandidateCard({
             <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
               {discoveryStatusLabel(candidate.status)}
             </span>
+            {(candidate.guidance || candidate.providerType === 'acp') && (
+              <Tooltip
+                side="top"
+                content={
+                  <div className="space-y-1.5">
+                    {candidate.providerType === 'acp' && (
+                      <p>
+                        ACP-connected. Forge starts this runtime in the project repository folder; availability and exact
+                        model behavior depend on the local runtime session.
+                      </p>
+                    )}
+                    {candidate.guidance && (
+                      <p>
+                        <span className="font-medium text-popover-foreground">Setup:</span> {candidate.guidance}
+                      </p>
+                    )}
+                  </div>
+                }
+              >
+                <InfoIcon
+                  className="size-3.5 text-muted-foreground transition-colors hover:text-foreground"
+                  aria-label="Setup details"
+                />
+              </Tooltip>
+            )}
           </div>
           {display.detail && <p className="mt-0.5 break-words text-xs text-muted-foreground">{display.detail}</p>}
-          {candidate.providerType === 'acp' && (
-            <p className="mt-1 break-words text-xs text-muted-foreground">
-              ACP-connected. Availability and exact model behavior depend on the local runtime session.
-            </p>
-          )}
-          {candidate.guidance && (
-            <p className="mt-1 break-words text-xs text-muted-foreground">
-              Setup: {candidate.guidance}
-            </p>
-          )}
           {candidate.canConfigure && candidate.providerType && candidate.modelId && (
             <Button
               type="button"
