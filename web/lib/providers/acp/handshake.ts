@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getAcpAgent } from './catalog'
 import { AcpTransport, defaultAcpSpawn, type AcpSpawn } from './transport'
+import { redactAdapterMessage } from './redaction'
 
 // ---------------------------------------------------------------------------
 // ACP adapter readiness check
@@ -100,6 +101,7 @@ export async function checkAcpReadiness(
   // open a throwaway session, which forces the adapter to actually start the
   // underlying CLI in a working directory. That is what makes a green indicator
   // mean "Forge can really use this runtime" rather than "an npx package booted".
+  let phase = 'initialize handshake'
   let probeDir: string | null = null
   try {
     await transport.request(
@@ -107,11 +109,8 @@ export async function checkAcpReadiness(
       { protocolVersion: ACP_PROTOCOL_VERSION, clientCapabilities: {} },
       ACP_HANDSHAKE_TIMEOUT_MS,
     )
-  } catch (err) {
-    return classifyAcpReadinessError(agent.label, transport, err, start, 'initialize handshake')
-  }
 
-  try {
+    phase = 'session probe'
     probeDir = await mkdtemp(join(tmpdir(), 'forge-acp-probe-'))
     await transport.request(
       'session/new',
@@ -124,7 +123,7 @@ export async function checkAcpReadiness(
       latencyMs: Date.now() - start,
     }
   } catch (err) {
-    return classifyAcpReadinessError(agent.label, transport, err, start, 'session probe')
+    return classifyAcpReadinessError(agent.label, err, start, phase)
   } finally {
     transport.close()
     if (probeDir) {
@@ -135,12 +134,11 @@ export async function checkAcpReadiness(
 
 function classifyAcpReadinessError(
   label: string,
-  transport: AcpTransport,
   err: unknown,
   start: number,
   phase: string,
 ): AcpReadinessResult {
-  const message = err instanceof Error ? err.message : String(err)
+  const message = redactAdapterMessage(err instanceof Error ? err.message : String(err))
 
   if (/timed out/i.test(message)) {
     return {
@@ -153,9 +151,7 @@ function classifyAcpReadinessError(
   if (/exited unexpectedly|process error/i.test(message)) {
     return {
       status: 'unreachable',
-      message: `The ${label} ACP adapter exited or could not be reached during the ${phase}: ${message}${
-        transport.recentStderr ? '' : ' Is the underlying CLI installed and on PATH?'
-      }`,
+      message: `The ${label} ACP adapter exited or could not be reached during the ${phase}. Make sure the underlying CLI is installed, authenticated, and on PATH.`,
       latencyMs: null,
     }
   }

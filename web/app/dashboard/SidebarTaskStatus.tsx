@@ -89,6 +89,9 @@ export function SidebarTaskStatus() {
         ]
           .filter(Boolean)
           .join(' · ')
+  const visibleStatusEntries = Object.entries(summary?.byStatus ?? {})
+    .filter(([status]) => status !== 'completed' && status !== 'cancelled')
+    .sort((a, b) => b[1] - a[1])
 
   const tooltipBody = (
     <div className="space-y-2">
@@ -98,17 +101,16 @@ export function SidebarTaskStatus() {
       ) : (
         <>
           <ul className="space-y-0.5">
-            {Object.entries(summary?.byStatus ?? {})
-              .filter(([status]) => status !== 'completed' && status !== 'cancelled')
-              .sort((a, b) => b[1] - a[1])
-              .map(([status, total]) => (
-                <li key={status} className="flex items-center justify-between gap-4">
-                  <span className="text-muted-foreground">{statusLabel(status)}</span>
-                  <span className="tabular-nums text-popover-foreground">{total}</span>
-                </li>
-              ))}
-            {Object.keys(summary?.byStatus ?? {}).length === 0 && (
-              <li className="text-muted-foreground">No tasks yet.</li>
+            {visibleStatusEntries.map(([status, total]) => (
+              <li key={status} className="flex items-center justify-between gap-4">
+                <span className="text-muted-foreground">{statusLabel(status)}</span>
+                <span className="tabular-nums text-popover-foreground">{total}</span>
+              </li>
+            ))}
+            {visibleStatusEntries.length === 0 && (
+              <li className="text-muted-foreground">
+                {Object.keys(summary?.byStatus ?? {}).length === 0 ? 'No tasks yet.' : 'No active tasks.'}
+              </li>
             )}
           </ul>
           {(summary?.attentionTasks.length ?? 0) > 0 && (

@@ -113,6 +113,43 @@ describe('assertUsableArchitectPlan', () => {
   it('rejects a transport/timeout failure leaking in as the plan', () => {
     const raw =
       'Falling back from WebSockets to HTTPS transport. request timed out. I\'ll quickly inspect the repo to anchor this to existing patterns.'
+    expect(() => assertUsableArchitectPlan(raw, prepare(raw))).toThrow(/transport failure/i)
+  })
+
+  it('rejects a transport dump even if structured agent metadata leaked through', () => {
+    const raw = [
+      'Falling back from WebSockets to HTTPS transport. request timed out.',
+      '```agent_breakdown_json',
+      '{"agents":[{"role":"Backend","tasks":1}]}',
+      '```',
+    ].join('\n')
+    expect(() => assertUsableArchitectPlan(raw, prepare(raw))).toThrow(/transport failure/i)
+  })
+
+  it('accepts a structured plan that discusses timeout handling', () => {
+    const raw = [
+      '# Plan',
+      '',
+      'Handle request timed out responses in the API and explain recovery steps to operators.',
+      '```agent_breakdown_json',
+      '{"agents":[{"role":"Backend","tasks":1}]}',
+      '```',
+    ].join('\n')
+    expect(() => assertUsableArchitectPlan(raw, prepare(raw))).not.toThrow()
+  })
+
+  it('accepts an unstructured plan that discusses rate limiting and HTTP 429 behavior', () => {
+    const raw = [
+      '# Plan',
+      '',
+      'Implement API rate limiting for repository actions and add explicit handling for HTTP 429 Too Many Requests responses.',
+      'Document retry behavior, expose a clear UI message, and add regression tests for the quota edge cases.',
+    ].join('\n')
+    expect(() => assertUsableArchitectPlan(raw, prepare(raw))).not.toThrow()
+  })
+
+  it('rejects an explicit quota failure leaking in as the plan', () => {
+    const raw = 'Request failed with 429 because the provider rate limit was exceeded. Please try again later.'
     expect(() => assertUsableArchitectPlan(raw, prepare(raw))).toThrow(/transport, timeout, or quota/i)
   })
 

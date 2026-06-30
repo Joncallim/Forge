@@ -276,6 +276,7 @@ export const tasks = pgTable(
     index('tasks_project_id_status_idx').on(t.projectId, t.status),
     index('tasks_submitted_by_idx').on(t.submittedBy),
     index('tasks_created_at_desc_idx').on(t.createdAt),
+    index('tasks_status_updated_at_idx').on(t.status, t.updatedAt),
   ],
 )
 
