@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   deriveMcpGrantDecisions,
+  evaluateWorkPackageMcpBroker,
+  isRetryableMcpBrokerBlock,
   parseMcpExecutionDesign,
   validateMcpExecutionDesign,
 } from '@/worker/mcp-execution-design'
@@ -124,7 +126,7 @@ describe('validateMcpExecutionDesign', () => {
   it('accepts a required healthy MCP assignment', () => {
     const { design } = parseMcpExecutionDesign([
       '```mcp_execution_design_json',
-      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Need issue context","assignment":{"type":"workforce","targetAgents":["architect","backend"]},"agentPermissions":{"architect":["github.issues.read"],"backend":["github.contents.write"]},"prohibitedCapabilities":["github.pull_requests.merge"],"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{"backend":"Use scoped GitHub tools."},"mcpAwareSubtasks":[]}',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Need issue context","assignment":{"type":"workforce","targetAgents":["architect","backend"]},"agentPermissions":{"architect":["github.issues.read"],"backend":["github.contents.read"]},"prohibitedCapabilities":["github.pull_requests.merge"],"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{"backend":"Use scoped GitHub tools."},"mcpAwareSubtasks":[]}',
       '```',
     ].join('\n'))
 
@@ -132,6 +134,51 @@ describe('validateMcpExecutionDesign', () => {
     expect(result.status).toBe('valid')
     expect(result.runtimeEnforcement).toBe('not_implemented')
     expect(result.blocked).toEqual([])
+  })
+
+  it('blocks capabilities outside the safe beta allowlist during validation', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Need issue context","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{"backend":["github.contents.write"]},"prohibitedCapabilities":[],"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const result = validateMcpExecutionDesign(design, overview([healthyGithub]))
+
+    expect(result.status).toBe('blocked')
+    expect(result.blocked.join('\n')).toMatch(/outside the allowed beta scope/)
+  })
+
+  it('blocks unsafe or uncovered MCP-aware subtask capabilities during validation', () => {
+    const { design: unsafeDesign } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Need issue context","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{"backend":["github.issues.read"]},"prohibitedCapabilities":[],"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{},"mcpAwareSubtasks":[{"id":"write-repo","agent":"backend","mcpCapabilities":["github.contents.write"],"inputs":[],"outputs":[],"verification":[],"stoppingCondition":"Done.","fallback":"Ask user."}]}',
+      '```',
+    ].join('\n'))
+    const unsafe = validateMcpExecutionDesign(unsafeDesign, overview([healthyGithub]))
+
+    expect(unsafe.status).toBe('blocked')
+    expect(unsafe.blocked.join('\n')).toMatch(/outside the allowed beta scope/)
+
+    const { design: uncoveredDesign } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Need issue context","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{"backend":["github.issues.read"]},"prohibitedCapabilities":[],"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{},"mcpAwareSubtasks":[{"id":"read-repo","agent":"backend","mcpCapabilities":["github.repository.read"],"inputs":[],"outputs":[],"verification":[],"stoppingCondition":"Done.","fallback":"Ask user."}]}',
+      '```',
+    ].join('\n'))
+    const uncovered = validateMcpExecutionDesign(uncoveredDesign, overview([healthyGithub]))
+
+    expect(uncovered.status).toBe('blocked')
+    expect(uncovered.blocked.join('\n')).toMatch(/not covered by an explicit approved grant/)
+
+    const { design: crossAgentDesign } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Need issue context","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{"backend":["github.issues.read"]},"prohibitedCapabilities":[],"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{},"mcpAwareSubtasks":[{"id":"frontend-read","agent":"frontend","mcpCapabilities":["github.issues.read"],"inputs":[],"outputs":[],"verification":[],"stoppingCondition":"Done.","fallback":"Ask user."}]}',
+      '```',
+    ].join('\n'))
+    const crossAgent = validateMcpExecutionDesign(crossAgentDesign, overview([healthyGithub]))
+
+    expect(crossAgent.status).toBe('blocked')
+    expect(crossAgent.blocked.join('\n')).toMatch(/not covered by an explicit approved grant/)
   })
 
   it('blocks unknown or unhealthy required MCPs', () => {
@@ -211,7 +258,7 @@ describe('deriveMcpGrantDecisions', () => {
   it('creates one decision per permitted agent', () => {
     const { design } = parseMcpExecutionDesign([
       '```mcp_execution_design_json',
-      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"workforce","targetAgents":["architect","backend"]},"agentPermissions":{"architect":["github.issues.read"],"backend":["github.contents.write"]},"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"workforce","targetAgents":["architect","backend"]},"agentPermissions":{"architect":["github.issues.read"],"backend":["github.contents.read"]},"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
       '```',
     ].join('\n'))
 
@@ -286,10 +333,222 @@ describe('deriveMcpGrantDecisions', () => {
     })
   })
 
+  it('blocks grant decisions for capabilities outside the safe beta allowlist', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{"backend":["github.contents.write"]},"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const result = deriveMcpGrantDecisions(design, overview([healthyGithub]))
+
+    expect(result.summary).toEqual({ proposed: 0, warning: 0, blocked: 1 })
+    expect(result.decisions[0]).toMatchObject({
+      agent: 'backend',
+      mcpId: 'github',
+      status: 'blocked',
+    })
+  })
+
+  it('blocks overlay-only MCP instructions that have no explicit grant decision', () => {
+    const result = evaluateWorkPackageMcpBroker({
+      assignedRole: 'backend',
+      metadata: {
+        promptOverlay: 'GitHub MCP is granted; inspect the repository.',
+      },
+      title: 'Backend package',
+    })
+
+    expect(result.status).toBe('blocked')
+    expect(result.blocked.join('\n')).toMatch(/require at least one explicit/)
+  })
+
+  it('blocks optional unknown MCP ids even when fallback says continue without MCP', () => {
+    const result = evaluateWorkPackageMcpBroker({
+      mcpRequirements: [{
+        mcpId: 'slack',
+        requirement: 'optional',
+        permissions: ['slack.messages.read'],
+        fallback: { action: 'continue_without_mcp' },
+      }],
+      title: 'Backend package',
+    })
+
+    expect(result.status).toBe('blocked')
+    expect(result.blocked.join('\n')).toMatch(/Unknown MCP 'slack'/)
+  })
+
+  it('blocks denied or prohibited capabilities even for healthy MCPs', () => {
+    const result = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        capabilities: ['github.pull_requests.merge'],
+        prohibitedCapabilities: ['github.pull_requests.merge'],
+        fallback: { action: 'block' },
+      }],
+      title: 'Backend package',
+    })
+
+    expect(result.status).toBe('blocked')
+    expect(result.blocked.join('\n')).toMatch(/outside the allowed beta scope/)
+  })
+
+  it('allows only explicit safe read/list/search beta capabilities', () => {
+    const allowed = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        capabilities: ['github.issues.read', 'github.repository.search'],
+        fallback: { action: 'block' },
+      }],
+      title: 'Backend package',
+    })
+    expect(allowed.status).toBe('allowed')
+
+    const blocked = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        capabilities: ['GitHub.Repository.Write', 'github.actions.write', 'github.secrets.write'],
+        fallback: { action: 'block' },
+      }],
+      title: 'Backend package',
+    })
+    expect(blocked.status).toBe('blocked')
+    expect(blocked.blocked.join('\n')).toMatch(/github\.repository\.write/)
+    expect(blocked.blocked.join('\n')).toMatch(/github\.actions\.write/)
+    expect(blocked.blocked.join('\n')).toMatch(/github\.secrets\.write/)
+  })
+
+  it('re-evaluates stale blocked grant snapshots against current MCP health', () => {
+    const result = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      metadata: {
+        mcpGrants: [{
+          mcpId: 'github',
+          requirement: 'required',
+          status: 'blocked',
+          capabilities: ['github.issues.read'],
+          fallback: { action: 'block' },
+        }],
+      },
+      title: 'Backend package',
+    })
+
+    expect(result.status).toBe('warnings')
+    expect(result.blocked).toEqual([])
+    expect(result.warnings.join('\n')).toMatch(/previously blocked/)
+  })
+
+  it('does not let stale global harness grants satisfy package-local MCP instructions', () => {
+    const result = evaluateWorkPackageMcpBroker({
+      harnessToolPolicy: {
+        mcpGrants: [{
+          mcpId: 'github',
+          requirement: 'required',
+          capabilities: ['github.issues.read'],
+          fallback: { action: 'block' },
+        }],
+      },
+      metadata: {
+        promptOverlay: 'Use GitHub MCP for issue context.',
+      },
+      title: 'Backend package',
+    })
+
+    expect(result.status).toBe('blocked')
+    expect(result.blocked.join('\n')).toMatch(/require at least one explicit/)
+  })
+
+  it('blocks unsafe or uncovered MCP-aware subtask capabilities', () => {
+    const unsafe = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        capabilities: ['github.issues.read'],
+        fallback: { action: 'block' },
+      }],
+      metadata: {
+        mcpAwareSubtasks: [{
+          id: 'merge-pr',
+          mcpCapabilities: ['github.pull_requests.merge'],
+        }],
+      },
+      title: 'Backend package',
+    })
+    expect(unsafe.status).toBe('blocked')
+    expect(unsafe.blocked.join('\n')).toMatch(/outside the allowed beta scope/)
+
+    const uncovered = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        capabilities: ['github.issues.read'],
+        fallback: { action: 'block' },
+      }],
+      metadata: {
+        mcpAwareSubtasks: [{
+          id: 'read-repo',
+          mcpCapabilities: ['github.repository.read'],
+        }],
+      },
+      title: 'Backend package',
+    })
+    expect(uncovered.status).toBe('blocked')
+    expect(uncovered.blocked.join('\n')).toMatch(/not covered by an explicit approved grant/)
+  })
+
+  it('blocks (does not throw on) prototype-polluting capability ids', () => {
+    const viaSubtask = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        capabilities: ['github.issues.read'],
+        fallback: { action: 'block' },
+      }],
+      metadata: {
+        mcpAwareSubtasks: [{ id: 'evil', mcpCapabilities: ['constructor.read'] }],
+      },
+      title: 'Backend package',
+    })
+    expect(viaSubtask.status).toBe('blocked')
+    expect(viaSubtask.blocked.join('\n')).toMatch(/does not name a known MCP/)
+
+    const viaRequirement = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      mcpRequirements: [{
+        mcpId: '__proto__',
+        requirement: 'required',
+        capabilities: ['__proto__.read'],
+        fallback: { action: 'block' },
+      }],
+      title: 'Backend package',
+    })
+    expect(viaRequirement.status).toBe('blocked')
+    expect(viaRequirement.blocked.join('\n')).toMatch(/Unknown MCP/)
+  })
+
   it('returns an empty preview when the Architect omitted the design block', () => {
     const result = deriveMcpGrantDecisions(null, overview([]))
 
     expect(result.summary).toEqual({ proposed: 0, warning: 0, blocked: 0 })
     expect(result.decisions).toEqual([])
+  })
+
+  it('classifies only transient MCP health/configuration blocks as auto-retryable', () => {
+    expect(isRetryableMcpBrokerBlock(["MCP 'github' is not configured for this project."])).toBe(true)
+    expect(isRetryableMcpBrokerBlock(["MCP 'github' capability 'github.contents.write' is outside the allowed beta scope."])).toBe(false)
+    expect(isRetryableMcpBrokerBlock(["Unknown MCP 'slack' was requested."])).toBe(false)
+    expect(isRetryableMcpBrokerBlock([
+      "MCP 'github' is not configured for this project.",
+      "MCP-aware subtask capability 'github.contents.write' is outside the allowed beta scope.",
+    ])).toBe(false)
   })
 })

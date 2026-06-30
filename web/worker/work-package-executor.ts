@@ -91,9 +91,17 @@ function redactExecutionOutput(value: string): string {
   return value
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[REDACTED_PRIVATE_KEY]')
     .replace(/\b(authorization:\s*bearer\s+)[^\s]+/gi, '$1[REDACTED_TOKEN]')
-    .replace(/\b(token|api[_-]?key|password|secret)=([^\s&]+)/gi, '$1=[REDACTED_TOKEN]')
+    // key=value / key: value for any token/secret/password/*_KEY/*_SECRET-style name.
+    .replace(
+      /\b((?:[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API[_-]?KEY|ACCESS[_-]?KEY|CREDENTIAL)[A-Z0-9_]*|token|api[_-]?key|password|secret)\s*[=:]\s*)([^\s&]+)/gi,
+      '$1[REDACTED_TOKEN]',
+    )
     .replace(/\b(?:ghp|gho|ghu|ghs|github_pat|sk|xox[baprs])_[A-Za-z0-9_=-]{10,}\b/g, '[REDACTED_TOKEN]')
     .replace(/\b(?:glpat|sk|sk-proj|sk-ant|xox[baprs])-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED_TOKEN]')
+    // AWS access key ids, Google API keys, and JWTs.
+    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, '[REDACTED_TOKEN]')
+    .replace(/\bAIza[A-Za-z0-9_-]{20,}\b/g, '[REDACTED_TOKEN]')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[REDACTED_TOKEN]')
 }
 
 function normalizeCommand(command: string[]): string {
@@ -116,11 +124,19 @@ function assertAllowedCommand(command: string[]): void {
   }
 }
 
+// Bounds the brace-scan fallback below. Restarting a full inner scan from every
+// `{` is O(n²) on adversarial model output (e.g. thousands of unclosed braces),
+// which can stall the shared worker. Real responses put the object first, so a
+// small number of candidate start positions is more than enough.
+const MAX_JSON_SCAN_ATTEMPTS = 64
+
 function extractJson(rawText: string): string {
   const fenced = /```(?:work_package_execution_json|json)?\s*\n([\s\S]*?)\n?```/i.exec(rawText)
   if (fenced) return fenced[1]
 
+  let attempts = 0
   for (let start = rawText.indexOf('{'); start >= 0; start = rawText.indexOf('{', start + 1)) {
+    if (++attempts > MAX_JSON_SCAN_ATTEMPTS) break
     let depth = 0
     let inString = false
     let escaped = false
@@ -257,9 +273,12 @@ function isInvalidNodeTestScript(script: string): boolean {
 
 function isUnsafePackageScript(script: string): boolean {
   return /[;&|`$<>]/.test(script) ||
-    /\bnode\s+-e\b/i.test(script) ||
+    // node/nodejs invoked with an eval or module-preload flag executes arbitrary
+    // code regardless of the script body (--eval/-e, --print/-p, --require/-r,
+    // --import).
+    /\bnode(?:js)?\b[^\n]*?(?:^|\s|=)(?:-e|--eval|-p|--print|-r|--require|--import)(?=\s|=|$)/i.test(script) ||
     /\brequire\s*\(\s*['"](?:node:)?(?:fs|child_process|process|os)['"]\s*\)/i.test(script) ||
-    /\b(?:curl|wget|nc|ssh|scp|bash|sh|python|perl|ruby|env|printenv|cat)\b/i.test(script)
+    /\b(?:curl|wget|nc|ssh|scp|bash|sh|zsh|ksh|python\d*|perl|ruby|php|env|printenv|cat|make|npx|eval)\b/i.test(script)
 }
 
 function validatePlanAgainstPrompt(plan: WorkPackageExecutionPlan, prompt: string): void {
@@ -624,13 +643,116 @@ function defaultSystemPrompt(role: string): string {
   ].join('\n')
 }
 
-function buildExecutionPrompt(input: {
+function cleanPromptText(value: unknown, maxLength: number): string {
+  if (typeof value !== 'string') return ''
+  return value.trim().replace(/\s+/g, ' ').slice(0, maxLength)
+}
+
+function cleanPromptTextArray(value: unknown, maxItems: number, maxLength: number): string[] {
+  if (!Array.isArray(value)) return []
+  const result: string[] = []
+  for (const item of value) {
+    const text = cleanPromptText(item, maxLength)
+    if (text === '') continue
+    result.push(text)
+    if (result.length >= maxItems) break
+  }
+  return result
+}
+
+function promptRecordArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => isRecord(item))
+    : []
+}
+
+export function isArchitectReservedExecutionRole(role: string): boolean {
+  return ['architect', 'qa', 'reviewer', 'security', 'security-review', 'security_review'].includes(role.trim().toLowerCase())
+}
+
+function mcpCapabilityList(requirement: Record<string, unknown>): string[] {
+  // Surface the union of both fields so the prompt mirrors exactly what the
+  // capability broker validated (see capabilityArray in mcp-execution-design.ts).
+  const merged = [
+    ...cleanPromptTextArray(requirement.permissions, 20, 100),
+    ...cleanPromptTextArray(requirement.capabilities, 20, 100),
+  ]
+  return [...new Set(merged)]
+}
+
+function formatMcpRequirement(requirement: Record<string, unknown>): string {
+  const mcpId = cleanPromptText(requirement.mcpId, 80) || 'unknown-mcp'
+  const requirementLevel = requirement.requirement === 'optional' ? 'optional' : 'required'
+  const reason = cleanPromptText(requirement.reason, 240)
+  const capabilities = mcpCapabilityList(requirement)
+  const fallback = isRecord(requirement.fallback)
+    ? cleanPromptText(requirement.fallback.action, 80) || 'ask_user'
+    : 'ask_user'
+  return [
+    `- ${mcpId} (${requirementLevel})`,
+    capabilities.length > 0 ? `capabilities: ${capabilities.join(', ')}` : 'capabilities: none listed',
+    `fallback: ${fallback}`,
+    reason ? `reason: ${reason}` : null,
+  ].filter((part): part is string => part !== null).join('; ')
+}
+
+function formatMcpAwareSubtask(subtask: Record<string, unknown>): string {
+  const id = cleanPromptText(subtask.id, 80) || 'unnamed-subtask'
+  const capabilities = cleanPromptTextArray(subtask.mcpCapabilities, 20, 100)
+  const inputs = cleanPromptTextArray(subtask.inputs, 10, 120)
+  const outputs = cleanPromptTextArray(subtask.outputs, 10, 120)
+  const verification = cleanPromptTextArray(subtask.verification, 10, 160)
+  const fallback = cleanPromptText(subtask.fallback, 240)
+  return [
+    `- ${id}`,
+    capabilities.length > 0 ? `capabilities: ${capabilities.join(', ')}` : null,
+    inputs.length > 0 ? `inputs: ${inputs.join(', ')}` : null,
+    outputs.length > 0 ? `outputs: ${outputs.join(', ')}` : null,
+    verification.length > 0 ? `verification: ${verification.join(', ')}` : null,
+    fallback ? `fallback: ${fallback}` : null,
+  ].filter((part): part is string => part !== null).join('; ')
+}
+
+function buildRunScopedMcpPromptLines(workPackage: WorkPackageRow): string[] {
+  const metadata = isRecord(workPackage.metadata) ? workPackage.metadata : {}
+  const promptOverlay = cleanPromptText(metadata.promptOverlay, 2_000)
+  const requirements = promptRecordArray(workPackage.mcpRequirements)
+  const subtasks = promptRecordArray(metadata.mcpAwareSubtasks)
+
+  if (promptOverlay === '' && requirements.length === 0 && subtasks.length === 0) return []
+
+  const lines = [
+    'Run-scoped MCP/capability instructions:',
+    '- These instructions apply only to this work-package run. They do not modify the permanent agent system prompt or future runs.',
+    '- Forge execution remains sandbox-only; do not assume real MCP tools, credentials, repository writes, or external services are available unless this run explicitly provides them.',
+  ]
+
+  if (promptOverlay !== '') {
+    lines.push('', 'Prompt overlay for this run:', promptOverlay)
+  }
+
+  if (requirements.length > 0) {
+    lines.push('', 'MCP requirements for this run:')
+    lines.push(...requirements.map(formatMcpRequirement))
+  }
+
+  if (subtasks.length > 0) {
+    lines.push('', 'MCP-aware subtasks for this run:')
+    lines.push(...subtasks.map(formatMcpAwareSubtask))
+  }
+
+  return lines
+}
+
+export function buildExecutionPrompt(input: {
   hostProjectRoot: string
   projectFiles: string[]
   sandboxRoot: string
   task: TaskRow
   workPackage: WorkPackageRow
 }): string {
+  const runScopedMcpLines = buildRunScopedMcpPromptLines(input.workPackage)
+
   return [
     `Host project root: ${input.hostProjectRoot}`,
     `Execution sandbox root: ${input.sandboxRoot}`,
@@ -646,6 +768,8 @@ function buildExecutionPrompt(input: {
     'Work package steps:',
     ...(input.workPackage.steps.length > 0 ? input.workPackage.steps.map((step) => `- ${step}`) : ['- Complete the assigned work package.']),
     '',
+    ...runScopedMcpLines,
+    ...(runScopedMcpLines.length > 0 ? [''] : []),
     'Existing project files:',
     ...(input.projectFiles.length > 0 ? input.projectFiles.map((file) => `- ${file}`) : ['- (empty project folder)']),
     '',
@@ -688,6 +812,13 @@ export async function loadWorkPackageExecutionContext(
 
   if (!row) throw new Error('Work package execution context not found.')
   if (!row.project.localPath) throw new Error('Project localPath is required before Forge can execute work packages.')
+  if (
+    isArchitectReservedExecutionRole(row.workPackage.assignedRole) &&
+    isRecord(row.workPackage.metadata) &&
+    row.workPackage.metadata.source === 'architect-artifact'
+  ) {
+    throw new Error(`Architect-assigned "${row.workPackage.assignedRole}" work packages are reserved for review gates and cannot execute.`)
+  }
 
   const [agentConfig] = await db
     .select()

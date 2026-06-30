@@ -383,7 +383,7 @@ export const workPackages = pgTable(
     assignedRole: text('assigned_role').notNull(),
     title: text('title').notNull(),
     summary: text('summary').notNull(),
-    // 'pending'|'ready'|'running'|'awaiting_approval'|'completed'|'failed'|'cancelled'
+    // 'pending'|'ready'|'running'|'awaiting_review'|'needs_rework'|'blocked'|'completed'|'failed'|'cancelled'
     status: text('status').notNull().default('pending'),
     sequence: integer('sequence').notNull(),
     steps: jsonb('steps').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
@@ -539,7 +539,8 @@ export const approvalGates = pgTable(
       onDelete: 'set null',
     }),
     gateType: text('gate_type').notNull(),
-    // 'pending'|'approved'|'rejected'|'cancelled'
+    // gate_type: 'plan_approval'|'qa_review'|'reviewer_review'|'security_review'
+    // status: 'pending'|'approved'|'rejected'|'completed'|'needs_rework'|'cancelled'
     status: text('status').notNull().default('pending'),
     sourceAgentRunId: uuid('source_agent_run_id').references(() => agentRuns.id, {
       onDelete: 'set null',

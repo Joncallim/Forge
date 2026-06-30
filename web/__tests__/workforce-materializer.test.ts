@@ -147,25 +147,24 @@ describe('workforce materializer', () => {
       { idFactory: deterministicIds() },
     )
 
-    expect(rows.harnesses).toHaveLength(3)
-    expect(rows.workPackages).toHaveLength(3)
-    expect(rows.workPackages.map((pkg) => pkg.assignedRole)).toEqual(['backend', 'qa', 'reviewer'])
+    expect(rows.harnesses).toHaveLength(1)
+    expect(rows.workPackages).toHaveLength(1)
+    expect(rows.workPackages.map((pkg) => pkg.assignedRole)).toEqual(['backend'])
     expect(rows.workPackages.every((pkg) => pkg.status === 'pending')).toBe(true)
     expect(rows.harnesses[0]).toMatchObject({
       slug: 'backend',
       role: 'backend',
       systemPrompt: '',
-      toolPolicy: {
-        mcpGrants: [
-          expect.objectContaining({
-            decisionId: 'grant-1',
-            mcpId: 'github',
-            status: 'proposed',
-          }),
-        ],
-      },
+      toolPolicy: {},
     })
     expect(rows.workPackages[0].metadata).toMatchObject({
+      mcpGrants: [
+        expect.objectContaining({
+          decisionId: 'grant-1',
+          mcpId: 'github',
+          status: 'proposed',
+        }),
+      ],
       source: 'architect-artifact',
       promptOverlay: 'Use GitHub read tools only.',
       mcpAwareSubtasks: [
@@ -181,17 +180,8 @@ describe('workforce materializer', () => {
       optional: ['unit-testing'],
       excluded: [],
     })
-    expect(rows.dependencies).toEqual([
-      expect.objectContaining({
-        workPackageId: rows.workPackages[1].id,
-        dependsOnWorkPackageId: rows.workPackages[0].id,
-      }),
-      expect.objectContaining({
-        workPackageId: rows.workPackages[2].id,
-        dependsOnWorkPackageId: rows.workPackages[1].id,
-      }),
-    ])
-    expect(rows.workPackages.map((pkg) => pkg.reviewRequirement)).toEqual(['both', 'none', 'none'])
+    expect(rows.dependencies).toEqual([])
+    expect(rows.workPackages.map((pkg) => pkg.reviewRequirement)).toEqual(['both'])
 
     expect(rows.approvalGate).toMatchObject({
       taskId: 'task-1',
@@ -202,7 +192,7 @@ describe('workforce materializer', () => {
     })
   })
 
-  it('honors an explicit per-agent reviewRequirement override from the Architect plan', () => {
+  it('clamps implementation-role review to both even when the Architect requests less', () => {
     const rows = buildWorkforceMaterializationRows(
       {
         taskId: 'task-1',
@@ -211,14 +201,60 @@ describe('workforce materializer', () => {
         prepared: {
           ...prepared,
           agents: prepared.agents.map((agent) =>
-            agent.role === 'Backend' ? { ...agent, reviewRequirement: 'qa_only' as const } : agent,
+            agent.role === 'Backend' ? { ...agent, reviewRequirement: 'none' as const } : agent,
           ),
         },
       },
       { idFactory: deterministicIds() },
     )
 
-    expect(rows.workPackages.find((pkg) => pkg.assignedRole === 'backend')?.reviewRequirement).toBe('qa_only')
+    // The planning model cannot downgrade review for an implementation package.
+    expect(rows.workPackages.find((pkg) => pkg.assignedRole === 'backend')?.reviewRequirement).toBe('both')
+  })
+
+  it('does not materialize Architect-assigned review roles as executable packages', () => {
+    const rows = buildWorkforceMaterializationRows(
+      {
+        taskId: 'task-1',
+        architectRunId: 'run-1',
+        artifactId: 'artifact-1',
+        prepared: {
+          ...prepared,
+          agents: [
+            {
+              role: 'Reviewer',
+              tasks: 1,
+              summary: 'Implement auth/session changes',
+              steps: ['Change the session middleware'],
+            },
+            {
+              role: 'QA',
+              tasks: 1,
+              summary: 'Patch production code before testing',
+              steps: ['Edit the API route'],
+            },
+            {
+              role: 'Security',
+              tasks: 1,
+              summary: 'Change token storage',
+              steps: ['Modify credential handling'],
+            },
+          ],
+        },
+      },
+      {
+        activeAgents: [
+          { agentType: 'reviewer', displayName: 'Reviewer' },
+          { agentType: 'qa', displayName: 'QA' },
+          { agentType: 'security', displayName: 'Security' },
+        ],
+        idFactory: deterministicIds(),
+      },
+    )
+
+    expect(rows.harnesses).toEqual([])
+    expect(rows.workPackages).toEqual([])
+    expect(rows.dependencies).toEqual([])
   })
 
   it('resolves Architect display-name roles to active canonical agent slugs', () => {
@@ -288,10 +324,9 @@ describe('workforce materializer', () => {
     expect(rows.workPackages).toHaveLength(1)
     expect(rows.workPackages[0].assignedRole).toBe('backend')
     expect(rows.harnesses[0].slug).toBe('backend')
-    expect(rows.harnesses[0].toolPolicy).toMatchObject({
-      mcpGrants: [expect.objectContaining({ mcpId: 'github' })],
-    })
+    expect(rows.harnesses[0].toolPolicy).toEqual({})
     expect(rows.workPackages[0].metadata).toMatchObject({
+      mcpGrants: [expect.objectContaining({ mcpId: 'github' })],
       promptOverlay: 'Use GitHub read tools only.',
       mcpAwareSubtasks: [expect.objectContaining({ id: 'inspect-issue' })],
     })
@@ -341,7 +376,7 @@ describe('workforce materializer', () => {
     ])
   })
 
-  it('updates materializer-owned harness fields when a canonical harness already exists', () => {
+  it('updates materializer-owned harness fields and clears stale harness tool policy when a canonical harness already exists', () => {
     const source = fs.readFileSync(
       path.join(process.cwd(), 'worker', 'workforce-materializer.ts'),
       'utf8',

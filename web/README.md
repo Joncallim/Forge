@@ -108,7 +108,10 @@ docker compose --profile worker up worker
 
 ## Current Worker Scope
 
-The worker currently runs only the Architect planning stage. It does not yet edit
-repositories, run implementation agents, create commits, or open pull requests.
+By default, the worker runs the Architect planning stage and waits for explicit
+plan approval. When Workforce feature flags are enabled, approved tasks can be
+materialized into sequential work packages, gated by review checks, and handed to
+specialist execution. Repository writes and package execution remain behind
+their separate feature flags and safety gates.
 
 See [../docs/developer-guide.md](../docs/developer-guide.md).

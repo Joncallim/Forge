@@ -104,11 +104,11 @@ describe('processApproval handoff', () => {
     expect(mocks.previewWorkPackageHandoff).toHaveBeenCalledWith('task-1')
     expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith('task-1', { claimEnabled: true })
     expect(update.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
-    expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', {
+    expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
       claimedPackageId: 'pkg-1',
       readyPackageIds: ['pkg-1'],
       status: 'handed_off',
-    })
+    }))
   })
 
   it('restores approved status when package handoff fails after claiming the task', async () => {
@@ -157,6 +157,76 @@ describe('processApproval handoff', () => {
     }))
   })
 
+  it('keeps broker-blocked handoff recoverable instead of failing the task', async () => {
+    mocks.dbSelect.mockReturnValue(chain([{ status: 'approved' }]))
+    const runningUpdate = updateChain([{ id: 'task-1' }])
+    const restoreUpdate = updateChain([{ id: 'task-1' }])
+    mocks.dbUpdate
+      .mockReturnValueOnce(runningUpdate)
+      .mockReturnValueOnce(restoreUpdate)
+    mocks.previewWorkPackageHandoff.mockResolvedValue({
+      status: 'claimable',
+      readyPackageIds: ['pkg-1'],
+      claimedPackageId: 'pkg-1',
+    })
+    mocks.handoffApprovedWorkPackages.mockResolvedValue({
+      status: 'blocked',
+      readyPackageIds: ['pkg-1'],
+      claimedPackageId: null,
+      blockedReason: 'MCP/capability broker blocked "Backend package": Connect GitHub.',
+    })
+
+    await processApproval('task-1', { finalAttempt: true })
+
+    expect(runningUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
+    expect(restoreUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      errorMessage: 'MCP/capability broker blocked "Backend package": Connect GitHub.',
+      status: 'approved',
+    }))
+    expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
+      blockedReason: 'MCP/capability broker blocked "Backend package": Connect GitHub.',
+      claimedPackageId: null,
+      readyPackageIds: ['pkg-1'],
+      status: 'blocked',
+    }))
+  })
+
+  it('fails the task for terminal handoff safety blocks after claiming the task', async () => {
+    mocks.dbSelect.mockReturnValue(chain([{ status: 'approved' }]))
+    const runningUpdate = updateChain([{ id: 'task-1' }])
+    const failUpdate = updateChain([{ id: 'task-1' }])
+    mocks.dbUpdate
+      .mockReturnValueOnce(runningUpdate)
+      .mockReturnValueOnce(failUpdate)
+    mocks.previewWorkPackageHandoff.mockResolvedValue({
+      status: 'claimable',
+      readyPackageIds: ['pkg-review'],
+      claimedPackageId: 'pkg-review',
+    })
+    mocks.handoffApprovedWorkPackages.mockResolvedValue({
+      status: 'blocked',
+      readyPackageIds: [],
+      claimedPackageId: null,
+      blockedReason: 'Architect-assigned "reviewer" work packages are reserved for review gates and cannot execute.',
+      terminalBlock: true,
+    })
+
+    await processApproval('task-1', { finalAttempt: true })
+
+    expect(runningUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
+    expect(failUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      errorMessage: 'Architect-assigned "reviewer" work packages are reserved for review gates and cannot execute.',
+      status: 'failed',
+    }))
+    expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
+      blockedReason: 'Architect-assigned "reviewer" work packages are reserved for review gates and cannot execute.',
+      claimedPackageId: null,
+      readyPackageIds: [],
+      status: 'blocked',
+      terminalBlock: true,
+    }))
+  })
+
   it('does not move the task to running when no package can be claimed', async () => {
     mocks.dbSelect.mockReturnValue(chain([{ status: 'approved' }]))
     mocks.previewWorkPackageHandoff.mockResolvedValue({
@@ -170,13 +240,13 @@ describe('processApproval handoff', () => {
     expect(mocks.dbUpdate).not.toHaveBeenCalled()
     expect(mocks.handoffApprovedWorkPackages).not.toHaveBeenCalled()
     expect(mocks.completeTaskIfReviewGatesSatisfied).toHaveBeenCalledWith('task-1')
-    expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', {
+    expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
       claimedPackageId: null,
       readyPackageIds: [],
       reviewBlockReason: 'work packages are not complete',
       reviewStatus: 'blocked',
       status: 'no_ready_packages',
-    })
+    }))
   })
 
   it('completes the task when no packages are ready because all review gates are satisfied', async () => {
@@ -212,10 +282,44 @@ describe('processApproval handoff', () => {
 
     expect(mocks.dbUpdate).not.toHaveBeenCalled()
     expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith('task-1', { claimEnabled: false })
-    expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', {
+    expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
       claimedPackageId: null,
       readyPackageIds: ['pkg-1'],
       status: 'ready_only',
+    }))
+  })
+
+  it('fails the task for terminal handoff safety blocks when handoff execution is disabled', async () => {
+    mocks.dbSelect.mockReturnValue(chain([{ status: 'approved' }]))
+    mocks.isWorkPackageHandoffEnabled.mockReturnValue(false)
+    const failUpdate = updateChain([{ id: 'task-1' }])
+    mocks.dbUpdate.mockReturnValueOnce(failUpdate)
+    mocks.previewWorkPackageHandoff.mockResolvedValue({
+      status: 'claimable',
+      readyPackageIds: ['pkg-review'],
+      claimedPackageId: 'pkg-review',
     })
+    mocks.handoffApprovedWorkPackages.mockResolvedValue({
+      status: 'blocked',
+      readyPackageIds: [],
+      claimedPackageId: null,
+      blockedReason: 'Architect-assigned "reviewer" work packages are reserved for review gates and cannot execute.',
+      terminalBlock: true,
+    })
+
+    await processApproval('task-1')
+
+    expect(failUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      errorMessage: 'Architect-assigned "reviewer" work packages are reserved for review gates and cannot execute.',
+      status: 'failed',
+    }))
+    expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith('task-1', { claimEnabled: false })
+    expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
+      blockedReason: 'Architect-assigned "reviewer" work packages are reserved for review gates and cannot execute.',
+      claimedPackageId: null,
+      readyPackageIds: [],
+      status: 'blocked',
+      terminalBlock: true,
+    }))
   })
 })

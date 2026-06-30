@@ -75,6 +75,23 @@ function defaultReviewRequirement(agentType: string): ReviewRequirement {
   return isImplementationPackageRole(agentType) ? 'both' : 'none'
 }
 
+function isReservedArchitectAssignedRole(role: string): boolean {
+  const normalized = normalizeAgentType(role)
+  return ['architect', 'qa', 'reviewer', 'security', 'security-review', 'security_review'].includes(normalized)
+}
+
+// Implementation packages always get full QA + Reviewer review; the Architect /
+// planning model is not allowed to downgrade it (e.g. to 'none' or 'qa_only').
+// Non-implementation roles keep whatever the plan requested, since review gates
+// are never materialized for them anyway.
+function resolveReviewRequirement(
+  agentType: string,
+  requested: ReviewRequirement | undefined,
+): ReviewRequirement {
+  if (isImplementationPackageRole(agentType)) return 'both'
+  return requested ?? defaultReviewRequirement(agentType)
+}
+
 function titleForAgent(role: string): string {
   const trimmed = role.trim()
   return trimmed === '' ? 'Specialist work package' : `${trimmed} work package`
@@ -221,7 +238,9 @@ export function buildWorkforceMaterializationRows(
   input.prepared.agents.forEach((agent, index) => {
     const agentType = resolveCanonicalAgentType(agent.role, options.activeAgents)
     const fallbackAgentType = normalizeAgentType(agent.role)
-    if (agentType === 'architect' || fallbackAgentType === 'architect') return
+    if (isReservedArchitectAssignedRole(agentType ?? fallbackAgentType) || isReservedArchitectAssignedRole(fallbackAgentType)) {
+      return
+    }
 
     if (!agentType) {
       const workPackageId = idFactory()
@@ -259,6 +278,7 @@ export function buildWorkforceMaterializationRows(
     const harnessId = idFactory()
     const workPackageId = idFactory()
     const aliases = roleAliases(agent.role, agentType)
+    const mcpGrants = mcpGrantsForAgent(input.prepared, agentType, aliases)
     const mcpRequirements = mcpRequirementsForAgent(input.prepared, agentType, aliases)
     const mcpSubtasks = mcpSubtasksForAgent(input.prepared, agentType, aliases)
     const promptOverlay = input.prepared.mcpExecutionDesign.proposed
@@ -273,9 +293,7 @@ export function buildWorkforceMaterializationRows(
       category: agentType,
       description: `${agent.role || displayNameForSlug(agentType)} harness seeded from Architect workforce planning.`,
       systemPrompt: '',
-      toolPolicy: {
-        mcpGrants: mcpGrantsForAgent(input.prepared, agentType, aliases),
-      },
+      toolPolicy: {},
       referencePaths: [],
       outputSchema: {},
       validationChecks: [],
@@ -304,11 +322,12 @@ export function buildWorkforceMaterializationRows(
       },
       acceptanceCriteria: agent.steps.length > 0 ? agent.steps : [agent.summary || titleForAgent(agent.role)],
       mcpRequirements,
-      reviewRequirement: agent.reviewRequirement ?? defaultReviewRequirement(agentType),
+      reviewRequirement: resolveReviewRequirement(agentType, agent.reviewRequirement),
       metadata: {
         source: 'architect-artifact',
         architectRunId: input.architectRunId,
         artifactId: input.artifactId,
+        mcpGrants,
         promptOverlay,
         plannedTasks: agent.tasks,
         mcpAwareSubtasks: mcpSubtasks,

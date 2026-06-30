@@ -4,6 +4,20 @@ import type { ProjectMcpOverview, ProjectMcpStatus } from '@/lib/mcps/types'
 
 const ASSIGNMENT_TYPES = new Set(['agent', 'multiple_agents', 'workforce', 'architect_only', 'reviewer_only'])
 const FALLBACK_ACTIONS = new Set(['block', 'continue_without_mcp', 'ask_user'])
+const SAFE_BETA_CAPABILITY_PATTERNS: Record<string, RegExp[]> = {
+  filesystem: [
+    /^filesystem\.(?:project\.)?read$/,
+    /^filesystem\.(?:project\.)?list$/,
+    /^filesystem\.(?:project\.)?search$/,
+  ],
+  github: [
+    /^github\.(?:issues|pull_requests|contents|repository|actions)\.read$/,
+    /^github\.(?:repository|contents)\.list$/,
+    /^github\.(?:repository|contents)\.search$/,
+  ],
+}
+const NON_RETRYABLE_BROKER_BLOCK_PATTERN = /Unknown MCP|outside the allowed beta scope|no approved capabilities|does not name a known MCP|not covered by an explicit approved grant|Run-scoped MCP prompt overlays/i
+const RETRYABLE_BROKER_BLOCK_PATTERN = /not configured|auth_required|missing|unhealthy|disabled|not installed|install_required/i
 
 export const MCP_EXECUTION_DESIGN_RUNTIME_ENFORCEMENT = 'not_implemented' as const
 
@@ -64,6 +78,20 @@ export type McpExecutionValidation = {
 
 export type McpGrantDecisionStatus = 'proposed' | 'warning' | 'blocked'
 
+export type WorkPackageMcpBrokerStatus = 'allowed' | 'blocked' | 'warnings'
+
+export type WorkPackageMcpBrokerCheck = {
+  status: WorkPackageMcpBrokerStatus
+  blocked: string[]
+  warnings: string[]
+  blockedReason: string | null
+}
+
+export function isRetryableMcpBrokerBlock(blocked: string[]): boolean {
+  if (blocked.some((message) => NON_RETRYABLE_BROKER_BLOCK_PATTERN.test(message))) return false
+  return blocked.some((message) => RETRYABLE_BROKER_BLOCK_PATTERN.test(message))
+}
+
 export type McpGrantDecisions = {
   schemaVersion: 1
   runtimeEnforcement: typeof MCP_EXECUTION_DESIGN_RUNTIME_ENFORCEMENT
@@ -122,6 +150,10 @@ function cleanTextArray(value: unknown, maxItems: number, maxLength: number): st
   return result
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
 function cleanAgent(value: unknown): string | null {
   const agent = cleanText(value, 40).toLowerCase()
   return /^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$/.test(agent) ? agent : null
@@ -164,6 +196,12 @@ function normalizeFallback(raw: unknown): McpExecutionRequirement['fallback'] {
     action,
     message: message || 'Ask the user how to proceed before issuing MCP-backed work.',
   }
+}
+
+function fallbackAction(raw: unknown): McpFallbackAction {
+  if (!isRecord(raw)) return 'ask_user'
+  const action = cleanText(raw.action, 40)
+  return FALLBACK_ACTIONS.has(action) ? action as McpFallbackAction : 'ask_user'
 }
 
 function normalizeRequirement(raw: unknown): McpExecutionRequirement | null {
@@ -249,6 +287,27 @@ function healthFor(mcpOverview: ProjectMcpOverview, mcpId: string) {
   return mcpOverview.statuses.find((status) => status.mcpId === mcpId) ?? null
 }
 
+function healthyStatus(status: ProjectMcpStatus | null): boolean {
+  return status?.installState === 'installed' && status.enabled && status.status === 'healthy'
+}
+
+function statusMessage(mcpId: string, status: ProjectMcpStatus | null): string {
+  if (!status) return `MCP '${mcpId}' is not configured for this project.`
+  return `MCP '${mcpId}' is ${status.installState}/${status.status}${status.error ? `: ${status.error}` : ''}`
+}
+
+function unknownMcpMessage(mcpId: string): string {
+  return `Unknown MCP '${mcpId}' was requested.`
+}
+
+function requirementCapabilities(requirement: McpExecutionRequirement): string[] {
+  return [...new Set(Object.values(requirement.agentPermissions).flat())]
+}
+
+function requirementCapabilitiesForAgent(requirement: McpExecutionRequirement, agent: string): string[] {
+  return requirement.agentPermissions[agent] ?? []
+}
+
 export function validateMcpExecutionDesign(
   design: McpExecutionDesign | null,
   mcpOverview: ProjectMcpOverview,
@@ -267,19 +326,62 @@ export function validateMcpExecutionDesign(
         continue
       }
 
+      for (const capability of requirementCapabilities(requirement)) {
+        const unsafe = unsafeCapability(requirement.mcpId, capability, requirement.prohibitedCapabilities)
+        if (unsafe) {
+          blocked.push(`MCP '${requirement.mcpId}' capability '${unsafe}' is outside the allowed beta scope.`)
+        }
+      }
+
       const status = healthFor(mcpOverview, requirement.mcpId)
       if (!status) {
-        const message = `MCP '${requirement.mcpId}' is not configured for this project.`
+        const message = statusMessage(requirement.mcpId, null)
         if (requirement.requirement === 'required') blocked.push(message)
         else warnings.push(message)
         continue
       }
 
-      const healthy = status.installState === 'installed' && status.enabled && status.status === 'healthy'
-      if (!healthy) {
-        const message = `MCP '${requirement.mcpId}' is ${status.installState}/${status.status}${status.error ? `: ${status.error}` : ''}`
+      if (!healthyStatus(status)) {
+        const message = statusMessage(requirement.mcpId, status)
         if (requirement.requirement === 'required') blocked.push(message)
         else warnings.push(message)
+      }
+    }
+
+    const approvedCapabilitiesByAgent = new Map<string, Set<string>>()
+    for (const requirement of design.requirements) {
+      if (!isKnownMcpId(requirement.mcpId)) continue
+      for (const agent of agentsForRequirement(requirement)) {
+        const current = approvedCapabilitiesByAgent.get(agent) ?? new Set<string>()
+        for (const capability of requirementCapabilitiesForAgent(requirement, agent)) {
+          if (unsafeCapability(requirement.mcpId, capability, requirement.prohibitedCapabilities) === null) {
+            current.add(normalizeCapability(capability))
+          }
+        }
+        approvedCapabilitiesByAgent.set(agent, current)
+      }
+    }
+    const prohibitedCapabilities = new Set(
+      design.requirements.flatMap((requirement) => requirement.prohibitedCapabilities.map(normalizeCapability)),
+    )
+
+    for (const subtask of design.mcpAwareSubtasks) {
+      const approvedCapabilities = approvedCapabilitiesByAgent.get(subtask.agent) ?? new Set<string>()
+      for (const capability of subtask.mcpCapabilities) {
+        const normalizedCapability = normalizeCapability(capability)
+        const mcpId = capabilityMcpId(normalizedCapability)
+        if (!mcpId) {
+          blocked.push(`MCP-aware subtask capability '${normalizedCapability}' does not name a known MCP.`)
+          continue
+        }
+        const unsafe = unsafeCapability(mcpId, normalizedCapability, [...prohibitedCapabilities])
+        if (unsafe) {
+          blocked.push(`MCP-aware subtask capability '${unsafe}' is outside the allowed beta scope.`)
+          continue
+        }
+        if (!approvedCapabilities.has(normalizedCapability)) {
+          blocked.push(`MCP-aware subtask capability '${normalizedCapability}' is not covered by an explicit approved grant.`)
+        }
       }
     }
   }
@@ -304,6 +406,201 @@ export function validateMcpExecutionDesign(
   }
 }
 
+function arrayFromUnknown(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : []
+}
+
+function objectArrayFrom(value: unknown): Record<string, unknown>[] {
+  return arrayFromUnknown(value).filter(isRecord)
+}
+
+function metadataMcpGrants(metadata: unknown): Record<string, unknown>[] {
+  if (!isRecord(metadata)) return []
+  return objectArrayFrom(metadata.mcpGrants)
+}
+
+function metadataHasRunScopedMcpInstructions(metadata: unknown): boolean {
+  if (!isRecord(metadata)) return false
+  return cleanText(metadata.promptOverlay, 200) !== '' || objectArrayFrom(metadata.mcpAwareSubtasks).length > 0
+}
+
+function metadataMcpAwareSubtasks(metadata: unknown): Record<string, unknown>[] {
+  if (!isRecord(metadata)) return []
+  return objectArrayFrom(metadata.mcpAwareSubtasks)
+}
+
+function capabilityArray(entry: Record<string, unknown>): {
+  capabilities: string[]
+  present: boolean
+} {
+  // Read the union of both `capabilities` and `permissions` so the broker
+  // validates exactly what the executor surfaces to the model. The executor's
+  // mcpCapabilityList() and this helper historically read these two fields with
+  // opposite precedence; merging both removes any chance the gate approves one
+  // list while the run is instructed on the other.
+  const present = Array.isArray(entry.capabilities) || Array.isArray(entry.permissions)
+  const merged = [
+    ...cleanTextArray(entry.capabilities, 40, 100),
+    ...cleanTextArray(entry.permissions, 40, 100),
+  ]
+  return {
+    capabilities: [...new Set(merged)],
+    present,
+  }
+}
+
+function brokerEntries(input: {
+  harnessToolPolicy?: unknown
+  mcpRequirements?: unknown
+  metadata?: unknown
+}): Record<string, unknown>[] {
+  return [
+    ...objectArrayFrom(input.mcpRequirements),
+    ...metadataMcpGrants(input.metadata),
+  ]
+}
+
+export function hasWorkPackageMcpRuntimeInputs(input: {
+  harnessToolPolicy?: unknown
+  mcpRequirements?: unknown
+  metadata?: unknown
+}): boolean {
+  return brokerEntries(input).length > 0 || metadataHasRunScopedMcpInstructions(input.metadata)
+}
+
+function normalizeCapability(capability: string): string {
+  return capability.trim().toLowerCase().replace(/\s+/g, '_')
+}
+
+function unsafeCapability(mcpId: string, capability: string, prohibitedCapabilities: string[]): string | null {
+  const normalized = normalizeCapability(capability)
+  const prohibited = new Set(prohibitedCapabilities.map(normalizeCapability))
+  if (prohibited.has(normalized)) return normalized
+
+  const safePatterns = Object.prototype.hasOwnProperty.call(SAFE_BETA_CAPABILITY_PATTERNS, mcpId)
+    ? SAFE_BETA_CAPABILITY_PATTERNS[mcpId]
+    : []
+  return safePatterns.some((pattern) => pattern.test(normalized)) ? null : normalized
+}
+
+function capabilityMcpId(capability: string): string | null {
+  const normalized = normalizeCapability(capability)
+  const [mcpId] = normalized.split('.', 1)
+  return mcpId && isKnownMcpId(mcpId) ? mcpId : null
+}
+
+export function evaluateWorkPackageMcpBroker(input: {
+  assignedRole?: string
+  harnessToolPolicy?: unknown
+  mcpOverview?: ProjectMcpOverview | null
+  mcpRequirements?: unknown
+  metadata?: unknown
+  title?: string
+}): WorkPackageMcpBrokerCheck {
+  const blocked: string[] = []
+  const warnings: string[] = []
+  const entries = brokerEntries(input)
+  const hasRunScopedMcpInstructions = metadataHasRunScopedMcpInstructions(input.metadata)
+  const approvedCapabilities = new Set<string>()
+  // A capability prohibited by any grant entry is prohibited for the whole
+  // package — collect them globally so it can't be "approved" by a different
+  // entry and then satisfy a subtask coverage check.
+  const prohibitedAll = new Set<string>()
+
+  for (const entry of entries) {
+    const mcpId = cleanText(entry.mcpId, 80)
+    if (mcpId === '') continue
+
+    const requirement = entry.requirement === 'optional' ? 'optional' : 'required'
+    const fallback = fallbackAction(entry.fallback)
+    const grantStatus = cleanText(entry.status, 40)
+    const prohibitedCapabilities = cleanTextArray(entry.prohibitedCapabilities, 40, 120)
+    for (const prohibited of prohibitedCapabilities) prohibitedAll.add(normalizeCapability(prohibited))
+    const { capabilities, present: capabilitiesPresent } = capabilityArray(entry)
+
+    const canContinueWithoutMcp = requirement === 'optional' && fallback === 'continue_without_mcp'
+    const shouldBlock = (message: string) => {
+      if (canContinueWithoutMcp) warnings.push(message)
+      else blocked.push(message)
+    }
+
+    if (!isKnownMcpId(mcpId)) {
+      blocked.push(unknownMcpMessage(mcpId))
+      continue
+    }
+
+    if (grantStatus === 'blocked') {
+      warnings.push(`MCP '${mcpId}' grant was previously blocked; current MCP health and capability policy will be re-evaluated.`)
+    } else if (grantStatus === 'warning') {
+      warnings.push(`MCP '${mcpId}' grant is warning-only.`)
+    }
+
+    if (requirement === 'required' && (!capabilitiesPresent || capabilities.length === 0)) {
+      blocked.push(`MCP '${mcpId}' has no approved capabilities for required access.`)
+    }
+
+    for (const capability of capabilities) {
+      const normalizedCapability = normalizeCapability(capability)
+      const unsafe = unsafeCapability(mcpId, capability, prohibitedCapabilities)
+      if (unsafe) {
+        blocked.push(`MCP '${mcpId}' capability '${unsafe}' is outside the allowed beta scope.`)
+      } else {
+        approvedCapabilities.add(normalizedCapability)
+      }
+    }
+
+    if (input.mcpOverview) {
+      const status = healthFor(input.mcpOverview, mcpId)
+      if (!healthyStatus(status)) {
+        const message = statusMessage(mcpId, status)
+        if (requirement === 'required' || fallback === 'block') {
+          shouldBlock(message)
+        } else {
+          warnings.push(message)
+        }
+      }
+    }
+
+  }
+
+  for (const prohibited of prohibitedAll) approvedCapabilities.delete(prohibited)
+
+  for (const subtask of metadataMcpAwareSubtasks(input.metadata)) {
+    for (const capability of cleanTextArray(subtask.mcpCapabilities, 40, 120)) {
+      const normalizedCapability = normalizeCapability(capability)
+      const mcpId = capabilityMcpId(normalizedCapability)
+      if (!mcpId) {
+        blocked.push(`MCP-aware subtask capability '${normalizedCapability}' does not name a known MCP.`)
+        continue
+      }
+      const unsafe = unsafeCapability(mcpId, normalizedCapability, [...prohibitedAll])
+      if (unsafe) {
+        blocked.push(`MCP-aware subtask capability '${unsafe}' is outside the allowed beta scope.`)
+        continue
+      }
+      if (!approvedCapabilities.has(normalizedCapability)) {
+        blocked.push(`MCP-aware subtask capability '${normalizedCapability}' is not covered by an explicit approved grant.`)
+      }
+    }
+  }
+
+  if (hasRunScopedMcpInstructions && approvedCapabilities.size === 0) {
+    blocked.push('Run-scoped MCP prompt overlays or subtasks require at least one explicit non-blocked MCP grant decision.')
+  }
+
+  const packageLabel = cleanText(input.title, 120) || cleanText(input.assignedRole, 80) || 'work package'
+  const blockedReason = blocked.length > 0
+    ? `MCP/capability broker blocked "${packageLabel}": ${blocked.join('; ')}`
+    : null
+
+  return {
+    status: blocked.length > 0 ? 'blocked' : warnings.length > 0 ? 'warnings' : 'allowed',
+    blocked,
+    warnings,
+    blockedReason,
+  }
+}
+
 function agentsForRequirement(requirement: McpExecutionRequirement): string[] {
   const agents = new Set<string>([
     ...requirement.assignment.targetAgents,
@@ -323,6 +620,14 @@ function decisionStatus(
 ): McpGrantDecisionStatus {
   if (!isKnownMcpId(requirement.mcpId)) return 'blocked'
   if (capabilities.length === 0) return requirement.requirement === 'optional' ? 'warning' : 'blocked'
+  // A capability outside the safe beta allowlist (or explicitly prohibited) is
+  // blocked at handoff by evaluateWorkPackageMcpBroker. Apply the same allowlist
+  // here so the grant-decision preview never advertises an unsafe capability as
+  // "proposed" (i.e. ready to approve) while the broker would block it.
+  const hasUnsafeCapability = capabilities.some(
+    (capability) => unsafeCapability(requirement.mcpId, capability, requirement.prohibitedCapabilities) !== null,
+  )
+  if (hasUnsafeCapability) return 'blocked'
   const healthy = status?.installState === 'installed' && status.enabled && status.status === 'healthy'
   if (healthy) return 'proposed'
   if (requirement.requirement === 'optional' && requirement.fallback.action !== 'block') return 'warning'

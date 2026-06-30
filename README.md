@@ -7,9 +7,11 @@ task, and review the plan Forge produces. The long-term goal is a managed AI
 workforce that can plan, build, test, review, and prepare pull requests while a
 human stays in control of the important decisions.
 
-Today, Forge is an Orchestrator-stage beta. It plans work and waits for your
-approval. It does not yet edit your repository, make commits, or open pull
-requests by itself.
+Today, Forge is an Orchestrator-stage beta. The normal flow plans work and
+waits for your approval. Feature-flagged Workforce execution can hand off
+sequential specialist packages and run generated output in a per-task sandbox,
+but Forge does not yet apply those edits to your repository, make commits, or
+open pull requests by itself.
 
 ## What Forge Does Today
 
@@ -93,15 +95,17 @@ FORGE_WORKER_MOCK_ARCHITECT=1 npm run dev
 
 ## What Is Not Built Yet
 
-- Automatic repository edits.
-- Multi-agent implementation runs.
-- Test execution by agents.
+- Applying generated edits to the project repository.
+- MCP runtime grants for specialists.
 - Branch, commit, pull request, and merge automation.
-- Full specialist harness execution from the Workforce roadmap.
+- Parallel specialist execution.
+- Production-ready QA/Reviewer gates for generated code.
 
 The first Workforce build slice is present as durable planning records:
 work packages, harness metadata, approval gates, and VCS summaries can now be
-stored and displayed. Execution remains a later slice.
+stored and displayed. Experimental work-package handoff and sandbox execution
+are available behind `FORGE_WORK_PACKAGE_HANDOFF` and
+`FORGE_WORK_PACKAGE_EXECUTION`.
 
 ## Screenshots
 

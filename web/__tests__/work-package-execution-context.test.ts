@@ -57,6 +57,31 @@ describe('loadWorkPackageExecutionContext', () => {
     expect(mocks.assertProjectLocalPathForExecution).not.toHaveBeenCalled()
   })
 
+  it.each(['architect', 'reviewer'])(
+    'rejects stale Architect-created reserved %s packages before provider/model execution',
+    async (assignedRole) => {
+      vi.clearAllMocks()
+      mocks.dbSelect.mockReturnValueOnce(chain([{
+        task: { id: 'task-1', projectId: 'project-1', pmProviderConfigId: 'provider-task' },
+        project: { id: 'project-1', localPath: '/workspace/project' },
+        workPackage: {
+          id: 'pkg-1',
+          assignedRole,
+          metadata: { source: 'architect-artifact' },
+        },
+      }]))
+
+      await expect(loadWorkPackageExecutionContext('task-1', 'pkg-1'))
+        .rejects.toThrow(/reserved for review gates/i)
+
+      expect(mocks.dbSelect).toHaveBeenCalledTimes(1)
+      expect(mocks.resolveDefaultProvider).not.toHaveBeenCalled()
+      expect(mocks.getProvider).not.toHaveBeenCalled()
+      expect(mocks.getModel).not.toHaveBeenCalled()
+      expect(mocks.assertProjectLocalPathForExecution).not.toHaveBeenCalled()
+    },
+  )
+
   it('validates the project path before non-ACP model execution and stores the real root', async () => {
     vi.clearAllMocks()
     const project = { id: 'project-1', localPath: '/workspace/link' }

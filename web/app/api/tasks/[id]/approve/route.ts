@@ -43,7 +43,7 @@ export async function POST(
     const { task, approvedGates } = await db.transaction(async (tx) => {
       const [approvedTask] = await tx
         .update(tasks)
-        .set({ status: 'approved', updatedAt: approvedAt })
+        .set({ errorMessage: null, status: 'approved', updatedAt: approvedAt })
         .where(and(eq(tasks.id, taskId), eq(tasks.status, 'awaiting_approval')))
         .returning()
 
@@ -78,20 +78,35 @@ export async function POST(
       )
     }
 
-    await redis.lpush('forge:approvals', JSON.stringify({ taskId, action: 'approve' }))
-    await redis.publish('forge:task:' + taskId, JSON.stringify({
-      type: 'task:status',
-      status: 'approved',
-      updatedAt: task.updatedAt.toISOString(),
-    }))
-    for (const gate of approvedGates) {
+    try {
+      await redis.lpush('forge:approvals', JSON.stringify({ taskId, action: 'approve' }))
+    } catch (err) {
+      console.error('[POST /api/tasks/:id/approve] Failed to enqueue approval worker job', err)
+      return NextResponse.json(
+        {
+          error: 'Approval worker queue result could not be confirmed; approval was saved and can be retried from the task.',
+          task,
+        },
+        { status: 202 },
+      )
+    }
+    try {
       await redis.publish('forge:task:' + taskId, JSON.stringify({
-        type: 'approval_gate:decided',
-        gateId: gate.id,
-        gateType: 'plan_approval',
+        type: 'task:status',
         status: 'approved',
-        updatedAt: approvedAt.toISOString(),
+        updatedAt: task.updatedAt.toISOString(),
       }))
+      for (const gate of approvedGates) {
+        await redis.publish('forge:task:' + taskId, JSON.stringify({
+          type: 'approval_gate:decided',
+          gateId: gate.id,
+          gateType: 'plan_approval',
+          status: 'approved',
+          updatedAt: approvedAt.toISOString(),
+        }))
+      }
+    } catch (err) {
+      console.error('[POST /api/tasks/:id/approve] Failed to publish approval progress event', err)
     }
 
     console.info('[POST /api/tasks/:id/approve] Approved task', { id: taskId })

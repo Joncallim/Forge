@@ -8,10 +8,20 @@ prompt, command, and documentation notes into one developer reference.
 Forge is a Next.js app with a background worker. The dashboard records what the
 operator wants. The worker does the queued work and saves evidence for review.
 
-The current worker runs only the Architect planning stage. Workforce data
+The current worker starts with the Architect planning stage. Workforce data
 structures now exist for work packages, harnesses, approval gates, and VCS
-summaries, but specialist execution and repository writes are still future
-slices.
+summaries. Work-package handoff and sequential specialist execution exist behind
+feature flags, and generated files are written only to per-task sandboxes. Forge
+still does not apply generated edits to the host repository, grant MCP runtime
+access to specialists, create commits, open pull requests, merge work, or run
+specialists in parallel.
+
+The MCP/capability broker is an admission-time gate: it decides whether a work
+package may be claimed and handed off based on the requested MCP capabilities,
+their safe-beta allowlist, and MCP health. It does not enforce capabilities at
+runtime (`runtimeEnforcement` is `not_implemented`) — specialists run sandboxed
+with no real MCP tools — so "brokered" here means gated admission, not a runtime
+sandbox over live tools.
 
 ## Local Development
 
@@ -76,7 +86,7 @@ fallbacks only.
 
 ## Worker Runtime
 
-Current task path:
+Current task path without Workforce packages:
 
 ```text
 POST /api/tasks
@@ -86,9 +96,25 @@ POST /api/tasks
   -> task becomes running
   -> Architect model produces Markdown
   -> artifact is saved
-  -> Workforce planning records are materialized when possible
   -> task becomes awaiting_approval
-  -> approval job marks it completed
+  -> operator approves or rejects the plan
+  -> approval job marks the task completed
+```
+
+Current task path with Workforce materialization enabled:
+
+```text
+POST /api/tasks
+  -> insert task in PostgreSQL and push { taskId } to forge:tasks
+  -> worker runs Architect planning and saves the plan artifact
+  -> Workforce planning records and the plan approval gate are materialized
+  -> task becomes awaiting_approval
+  -> operator approves the plan
+  -> approval job releases ready work packages
+  -> MCP/capability broker validates the next handoff before ready/claim
+  -> execution, when enabled, writes only to a per-task sandbox
+  -> package QA/Reviewer/Security review gates complete when required
+  -> task completes after all work packages and review gates are complete
 ```
 
 Implemented worker files:

@@ -90,6 +90,7 @@ type WorkPackage = WorkforceRecord
 type ApprovalGate = WorkforceRecord
 type VcsChange = WorkforceRecord
 type CommandAudit = WorkforceRecord
+type RetryHandoffResultStatus = 'retry_already_queued' | 'retry_enqueued'
 
 interface TaskDetailResponse {
   task?: Task | null
@@ -383,7 +384,7 @@ function McpRequirementCards({ requirements }: { requirements: WorkforceRecord[]
 }
 
 function isReviewGateType(gateType: string): boolean {
-  return gateType === 'qa_review' || gateType === 'reviewer_review'
+  return gateType === 'qa_review' || gateType === 'reviewer_review' || gateType === 'security_review'
 }
 
 // Semantic color buckets shared by every status badge on this page, so the
@@ -443,6 +444,7 @@ function progressStatusLabel(status: string): string {
 function reviewGateLabel(gateType: string): string {
   if (gateType === 'qa_review') return 'QA review'
   if (gateType === 'reviewer_review') return 'Reviewer review'
+  if (gateType === 'security_review') return 'Security review'
   return statusLabel(gateType)
 }
 
@@ -532,6 +534,78 @@ function GateDecisionControls({
         >
           {submitting === 'reject' ? 'Saving...' : 'Reject'}
         </Button>
+      </div>
+    </div>
+  )
+}
+
+export function retryHandoffMessage(status: RetryHandoffResultStatus): string {
+  return status === 'retry_already_queued'
+    ? 'Retry already queued. The worker will re-evaluate this handoff.'
+    : 'Retry queued. The worker will re-evaluate this handoff.'
+}
+
+// ---------------------------------------------------------------------------
+// RetryHandoffControls — re-enqueues a handoff for a package the MCP/capability
+// broker blocked (e.g. a temporarily-unhealthy MCP). Available to the operator
+// once the underlying issue is resolved; the worker re-runs the broker, so a
+// still-unresolved block simply re-blocks.
+// ---------------------------------------------------------------------------
+function RetryHandoffControls({
+  blockedReason,
+  onRetried,
+  taskId,
+  title = 'Handoff blocked',
+}: {
+  blockedReason: string
+  onRetried: () => Promise<void>
+  taskId: string
+  title?: string
+}) {
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [retryStatus, setRetryStatus] = useState<RetryHandoffResultStatus | null>(null)
+
+  async function retry() {
+    setSubmitting(true)
+    setError(null)
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/retry-handoff`, { method: 'POST' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to retry handoff')
+      }
+      const body = await res.json().catch(() => ({}))
+      const status = body?.result?.status === 'retry_already_queued' ? 'retry_already_queued' : 'retry_enqueued'
+      setRetryStatus(status)
+      await onRetried()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="mt-3 min-w-0 rounded-lg border border-destructive/30 bg-destructive/10 p-3">
+      <p className="text-sm font-medium text-foreground">{title}</p>
+      {blockedReason !== '' && (
+        <p className="mt-1 text-xs text-destructive">{blockedReason}</p>
+      )}
+      {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          disabled={submitting}
+          onClick={() => void retry()}
+        >
+          {submitting ? 'Retrying...' : 'Retry handoff'}
+        </Button>
+        {retryStatus && !error && (
+          <span className="text-xs text-muted-foreground">{retryHandoffMessage(retryStatus)}</span>
+        )}
       </div>
     </div>
   )
@@ -1093,10 +1167,17 @@ function WorkforcePanel({
                             </p>
                           ) : (
                             <p className="mt-2 text-xs text-muted-foreground">
-                              Review actions appear when a pending QA or Reviewer gate exists for this package.
+                              Review actions appear when a pending QA, Reviewer, or Security gate exists for this package.
                             </p>
                           )}
                         </div>
+                      )}
+                      {status === 'blocked' && (
+                        <RetryHandoffControls
+                          blockedReason={stringField(pkg, ['blockedReason'])}
+                          taskId={taskId}
+                          onRetried={onGateDecided}
+                        />
                       )}
                       <details className="mt-2 rounded-md border border-border bg-muted/20 px-3 py-2">
                         <summary className="cursor-pointer text-xs font-medium text-foreground">
@@ -2136,6 +2217,8 @@ export default function TaskDetailPage() {
   }
 
   const isAwaitingApproval = (currentStatus ?? task.status) === 'awaiting_approval'
+  const isApproved = (currentStatus ?? task.status) === 'approved'
+  const hasBlockedPackage = workPackages.some((pkg) => stringField(pkg, ['status', 'state']) === 'blocked')
   const canRetryTask = ['failed', 'cancelled', 'rejected'].includes(currentStatus ?? task.status)
   const plannedAgents = plannedAgentsFromArtifacts(mergedArtifacts)
   const capabilityClassification = latestCapabilityClassificationFromArtifacts(mergedArtifacts)
@@ -2216,6 +2299,17 @@ export default function TaskDetailPage() {
         questions={mergedQuestions}
         artifacts={mergedArtifacts}
       />
+
+      {isApproved && !hasBlockedPackage && (
+        <section aria-label="Retry approved handoff" className="mb-6">
+          <RetryHandoffControls
+            blockedReason="The task is approved. If the handoff worker did not pick it up, retry will safely re-enqueue the approval job."
+            taskId={taskId}
+            onRetried={loadTask}
+            title="Retry approved handoff"
+          />
+        </section>
+      )}
 
       {/* Implementation Plan — full width, above the two-column layout below,
           collapsed by default so it doesn't dominate the page */}
