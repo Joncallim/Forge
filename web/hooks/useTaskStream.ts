@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback } from 'react'
+import { TASK_STATUS_REFRESH_EVENT } from '@/lib/task-events'
 
 export interface AgentRun {
   id: string
@@ -49,7 +50,6 @@ interface UseTaskStreamResult {
 }
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'rejected'])
-const TASK_STATUS_REFRESH_EVENT = 'forge:task-status-refresh'
 
 export function artifactFromStreamEventData(data: unknown): Artifact {
   const value = data as Record<string, unknown>

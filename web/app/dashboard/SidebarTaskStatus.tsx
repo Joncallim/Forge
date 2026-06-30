@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { ActivityIcon, AlertTriangleIcon, CheckCircle2Icon } from 'lucide-react'
 import { TooltipContent, TooltipRoot, TooltipTrigger } from '@/components/ui/tooltip'
+import { TASK_STATUS_REFRESH_EVENT } from '@/lib/task-events'
 import { cn } from '@/lib/utils'
 
 type TaskSummary = {
@@ -29,7 +30,6 @@ function statusLabel(status: string): string {
 }
 
 const POLL_INTERVAL_MS = 15_000
-export const TASK_STATUS_REFRESH_EVENT = 'forge:task-status-refresh'
 
 export function SidebarTaskStatus() {
   const [summary, setSummary] = useState<TaskSummary | null>(null)

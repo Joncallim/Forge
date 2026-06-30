@@ -16,7 +16,7 @@ vi.mock('@/worker/architect-context', () => ({
 }))
 vi.mock('@/lib/mcps/manager', () => ({ getProjectMcpOverview: vi.fn() }))
 
-import { buildArchitectPrompt } from '@/worker/orchestrator'
+import { buildArchitectPrompt, stableJson } from '@/worker/orchestrator'
 import type { ArchitectResumeCheckpoint } from '@/worker/checkpoints'
 import type { ProjectMcpOverview } from '@/lib/mcps/types'
 
@@ -268,5 +268,26 @@ describe('buildArchitectPrompt checkpoint resume context', () => {
     expect(source).toContain('planRevisionComparableFromMetadata(previousPlanArtifact.metadata)')
     expect(source).toContain("agentBreakdownSource: prepared.agentBreakdownSource")
     expect(source).toContain("comparable.agentBreakdownSource === 'fence'")
+  })
+})
+
+describe('stableJson', () => {
+  it('produces stable output regardless of key order', () => {
+    expect(stableJson({ b: 1, a: 2 })).toBe(stableJson({ a: 2, b: 1 }))
+  })
+
+  it('treats an undefined-valued key the same as an absent key (jsonb round-trip safe)', () => {
+    // A fresh PlannedAgent carries reviewRequirement: undefined; the jsonb-stored
+    // copy drops it. Both forms must compare equal or a no-change replan would
+    // falsely trip the routing-metadata guard.
+    const fresh = { role: 'Backend', tasks: 1, steps: ['a'], reviewRequirement: undefined }
+    const stored = JSON.parse(JSON.stringify(fresh))
+    expect(stableJson(fresh)).toBe(stableJson(stored))
+  })
+
+  it('still distinguishes genuinely different routing metadata', () => {
+    const a = { agentBreakdown: [{ role: 'Backend', tasks: 1 }] }
+    const b = { agentBreakdown: [{ role: 'Frontend', tasks: 1 }] }
+    expect(stableJson(a)).not.toBe(stableJson(b))
   })
 })

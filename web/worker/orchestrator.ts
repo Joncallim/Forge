@@ -348,12 +348,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function stableJson(value: unknown): string {
+export function stableJson(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map((item) => stableJson(item)).join(',')}]`
   }
   if (isRecord(value)) {
-    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`
+    // Skip undefined-valued keys to match JSON serialization semantics. Fresh
+    // in-memory plan objects can carry optional fields set to `undefined` (e.g.
+    // PlannedAgent.reviewRequirement), but the jsonb-stored copy drops them on
+    // round-trip. Including them here would make an unchanged replan compare
+    // unequal and falsely trip the routing-metadata guard.
+    return `{${Object.keys(value)
+      .filter((key) => value[key] !== undefined)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`)
+      .join(',')}}`
   }
   return JSON.stringify(value)
 }
@@ -670,15 +679,27 @@ async function runArchitect(
       )
     }
     if (previousPlan !== null && previousComparableMetadata !== null && prepared.planText.trim() !== '') {
-      if (stableJson(hiddenRoutingComparable(previousComparableMetadata)) !== stableJson(hiddenRoutingComparable(preparedComparableMetadata))) {
-        throw new UnusableArchitectPlanError(
-          'The revised plan changed machine-readable routing metadata. Request visible targeted plan changes only, or restart the task for a new plan.',
+      // Only guard genuine revisions of an approvable plan. A prior artifact that
+      // was still awaiting answers (open questions) — or that predates the
+      // agentBreakdownSource field ('unknown') — is not a plan to preserve:
+      // producing the first real plan after clarification must not be rejected as
+      // a disallowed rewrite or routing change.
+      const previousOpenQuestionCount = typeof previousPlanArtifact?.metadata.openQuestionCount === 'number'
+        ? previousPlanArtifact.metadata.openQuestionCount
+        : 0
+      const previousWasApprovablePlan =
+        previousOpenQuestionCount === 0 && previousComparableMetadata.agentBreakdownSource !== 'unknown'
+      if (previousWasApprovablePlan) {
+        if (stableJson(hiddenRoutingComparable(previousComparableMetadata)) !== stableJson(hiddenRoutingComparable(preparedComparableMetadata))) {
+          throw new UnusableArchitectPlanError(
+            'The revised plan changed machine-readable routing metadata. Request visible targeted plan changes only, or restart the task for a new plan.',
+          )
+        }
+        assertTargetedPlanRevision(
+          canonicalPlanRevisionText(previousPlan, previousComparableMetadata),
+          canonicalPlanRevisionText(prepared.planText, preparedComparableMetadata),
         )
       }
-      assertTargetedPlanRevision(
-        canonicalPlanRevisionText(previousPlan, previousComparableMetadata),
-        canonicalPlanRevisionText(prepared.planText, preparedComparableMetadata),
-      )
     }
     const artifact = await createArtifact(task.id, run.id, artifactPlanText, {
       openQuestionCount: prepared.questions.length,
