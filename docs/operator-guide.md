@@ -244,7 +244,10 @@ Operators can review:
 Operators can intervene from the task detail page:
 
 - Stop cancels a non-terminal task, marks active package/run state cancelled,
-  and leaves package metadata available for diagnosis.
+  and leaves package metadata available for diagnosis. Stopping is safe at any
+  stage, including while the Architect is still planning: the worker will not
+  publish plan results, materialize work packages, or complete its run for a
+  task that was cancelled during the run.
 - Delete removes one terminal task and its run history without deleting the
   project. Stop active tasks first.
 - Retry task requeues the task from the beginning and can use the original or a
