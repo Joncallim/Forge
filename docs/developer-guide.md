@@ -135,6 +135,16 @@ POST /api/tasks
   -> task completes after all work packages and review gates are complete
 ```
 
+Cancellation is enforced worker-side, not just at the API. The operator Stop
+route cancels the task, its active work packages, pending gates, and running
+runs inside one transaction; the worker complements this by refusing to write
+results for a cancelled task. Workforce materialization takes a `FOR UPDATE`
+lock on the task row and skips its inserts unless the task is still `running`,
+and the Architect run is only marked `completed` while it is still `running`,
+so a Stop that lands mid-plan cannot leave a cancelled task with fresh work
+packages, an actionable approval gate, or a completed run. Post-execution
+package writes are similarly guarded by the per-run execution lease.
+
 Feature flag defaults:
 
 | Variable | Default | Effect |
