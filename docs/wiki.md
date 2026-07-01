@@ -3,7 +3,7 @@
 This is the layman-readable Forge overview. It is written so it can be mirrored
 into Notion without requiring a reader to know the codebase first.
 
-Last synced from the repository: 2026-06-29.
+Last synced from the repository: 2026-07-01.
 
 ## What Forge Is
 
@@ -16,6 +16,12 @@ beta is more cautious: Forge plans work, stores evidence, and asks for approval.
 Workforce materialization and handoff records are enabled unless explicitly
 disabled, while generated package execution remains opt-in and sandbox-only.
 Forge is not yet a fully autonomous pull-request machine.
+
+The next larger product direction is Forge Workspace: a dockable, AI-assisted
+workbench that can bring browser, repo, notes, docs, Playwright, Notion, GitHub,
+logs, terminals, and task artifacts into one saved context. This should feel
+OS-like over time, but the first implementation should stay a workspace shell
+rather than a full operating system.
 
 ## What Forge Does Today
 
@@ -48,6 +54,8 @@ Still future work:
 - Granting live MCP tools to specialist agents at runtime.
 - Running specialists in parallel.
 - Treating QA and Reviewer gates as production-ready merge gates.
+- Providing the Forge Workspace pane system for browser, Playwright, notes,
+  Markdown, coding, logs, Notion, GitHub, and linked task context.
 
 ## The Simple Analogy
 
@@ -63,18 +71,23 @@ room, queue, project records, provider records, Architect planning, artifacts,
 and approval loop. The full specialist team is being added carefully behind
 safety gates.
 
+Forge Workspace adds the room where that team works: panes for the repo, docs,
+browser, Playwright runs, task notes, GitHub objects, Notion pages, logs, and
+review artifacts, all linked back to the current task.
+
 ## The Moving Parts
 
 | Part | What it means |
 |---|---|
 | Dashboard | The web app you use in the browser. |
-| PostgreSQL | The durable database for users, providers, projects, tasks, artifacts, agents, workforces, and approvals. |
+| PostgreSQL | The durable database for users, providers, projects, tasks, artifacts, agents, workforces, approvals, workspaces, pane state, and link records. |
 | Redis | The fast queue that wakes the worker and carries retry/dead-letter jobs. |
 | Worker | The background process that claims queued tasks and calls model providers. |
 | Provider | A model connection, such as OpenAI, Anthropic, OpenRouter, Ollama, LM Studio, LiteLLM, or ACP. |
 | Architect | The planning agent that writes the first implementation plan. |
 | Workforce | Editable agent teams plus task-scoped work packages for specialist execution. |
-| Artifact | Saved evidence, such as a plan, run output, or future review result. |
+| Forge Workspace | Planned dockable shell for browser, Playwright, repo, notes, docs, Notion, GitHub, logs, terminal, and task context. |
+| Artifact | Saved evidence, such as a plan, run output, browser screenshot, trace, note, or future review result. |
 
 ## Screenshots
 
@@ -131,6 +144,31 @@ underlying CLI installed and authenticated.
 
 For more detail, see [ACP And The Zed Connector](acp-zed-connector.md).
 
+## Forge Workspace, In Simple Terms
+
+Forge Workspace is the planned next shell around Forge. Instead of opening one
+screen for tasks, one app for notes, one browser for testing, one GitHub tab for
+issues, and one Notion page for planning, the workspace should let you keep those
+surfaces together.
+
+The first version should use dockable panes rather than unrestricted desktop
+windows. Likely panes include:
+
+- Human browser for docs, previews, local apps, and manual auth flows.
+- Separate Playwright browser for agent-controlled testing and screenshots.
+- Notepad for task scratch.
+- Markdown reader/editor for README files, ADRs, plans, and artifacts.
+- Coding pane for focused file edits and diff review.
+- Terminal/log drawer for commands, tests, workers, and traces.
+- Repo explorer for files, branches, commits, and local diffs.
+- Notion explorer for planning pages and project docs.
+- GitHub explorer for issues, PRs, checks, and comments.
+
+The Notion and GitHub integration should use link records rather than a blind
+sync mirror. A Notion page can document the intent, a GitHub issue can track the
+work, repo files can hold the implementation, and Forge can link them all to one
+task.
+
 ## How To Start Locally
 
 From the repository root:
@@ -158,6 +196,9 @@ and can optionally set up a small local Ollama path.
   database tables, prompts, and tests.
 - [ACP And The Zed Connector](acp-zed-connector.md) for local ACP provider
   behavior.
-- [Roadmap](roadmap.md) for the current beta boundary and upcoming Workforce
-  work.
+- [Roadmap](roadmap.md) for the current beta boundary, Workforce work, and Forge
+  Workspace direction.
+- [Forge Workspace roadmap](workspace-roadmap.md) for the proposed implementation
+  plan for dockable panes, browsers, Notion/GitHub linking, and permissioned
+  agent operations.
 - [Design guide](design.md) for UI principles and screenshot evidence.
