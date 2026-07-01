@@ -65,11 +65,11 @@ else
 fi
 
 if ! command -v node >/dev/null 2>&1; then
-  die "Node.js is not installed. Install Node 20 or newer, then run this again."
+  die "Node.js is not installed. Install Node 22 or newer, then run this again."
 fi
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
-if [ "$NODE_MAJOR" -lt 20 ]; then
-  die "Node $(node -v) is too old. Forge needs Node 20 or newer."
+if [ "$NODE_MAJOR" -lt 22 ]; then
+  die "Node $(node -v) is too old. Forge needs Node 22 or newer."
 fi
 
 # Create the env file if it does not exist. We do NOT exit afterwards: the rest

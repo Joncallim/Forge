@@ -20,7 +20,10 @@ vi.mock('@/lib/workspace', async () => {
   }
 })
 
-import { assertProjectLocalPathForExecution } from '@/lib/projects/local-path'
+import {
+  assertProjectLocalPathForExecution,
+  assertProjectLocalPathPreflightAllowed,
+} from '@/lib/projects/local-path'
 
 function chain(resolveValue: unknown) {
   const t: Record<string, unknown> = {
@@ -42,7 +45,19 @@ describe('assertProjectLocalPathForExecution', () => {
     workspaceRoot = path.join(root, 'workspace')
     projectRoot = path.join(workspaceRoot, 'projects', 'app')
     await fs.mkdir(projectRoot, { recursive: true })
-    mocks.getWorkspaceSettings.mockResolvedValue({ workspaceRoot })
+    mocks.getWorkspaceSettings.mockResolvedValue({
+      workspaceRoot,
+      configRoot: path.join(workspaceRoot, 'config'),
+      projectsRoot: path.join(workspaceRoot, 'projects'),
+      mcpsRoot: path.join(workspaceRoot, 'mcps'),
+      templatesRoot: path.join(workspaceRoot, 'templates'),
+      localMemoryRoot: path.join(workspaceRoot, 'local-memory'),
+      promptsRoot: path.join(workspaceRoot, 'prompts'),
+      workforcesRoot: path.join(workspaceRoot, 'workforces'),
+      runtimeRoot: path.join(workspaceRoot, 'runtime'),
+      logsRoot: path.join(workspaceRoot, 'logs'),
+      backupsRoot: path.join(workspaceRoot, 'backups'),
+    })
     mocks.dbSelect.mockReturnValue(chain([]))
   })
 
@@ -81,5 +96,22 @@ describe('assertProjectLocalPathForExecution', () => {
 
     await expect(assertProjectLocalPathForExecution({ id: 'project-1', localPath: projectRoot }))
       .rejects.toThrow(/overlaps another registered Forge project/i)
+  })
+
+  it('preflights non-existing paths that would overlap another registered project', async () => {
+    const nestedRoot = path.join(projectRoot, 'future-child')
+    mocks.dbSelect.mockReturnValue(chain([{ id: 'project-2', localPath: projectRoot }]))
+
+    await expect(assertProjectLocalPathPreflightAllowed({ localPath: nestedRoot, projectId: 'project-1' }))
+      .rejects.toThrow(/overlaps another registered Forge project/i)
+    await expect(fs.stat(nestedRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('rejects protected Forge workspace directories', async () => {
+    const configRoot = path.join(workspaceRoot, 'config')
+    await fs.mkdir(configRoot, { recursive: true })
+
+    await expect(assertProjectLocalPathForExecution({ id: 'project-1', localPath: configRoot }))
+      .rejects.toThrow(/workspace config directory/i)
   })
 })

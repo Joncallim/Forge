@@ -2,12 +2,13 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { getSession } from '@/lib/session'
+import { redis } from '@/lib/redis'
 import { decideReviewGate } from '@/worker/review-gates'
-import { progressWorkforce } from '@/worker/work-package-handoff'
 
 const DecisionSchema = z.object({
   decision: z.enum(['completed', 'needs_rework']),
   reason: z.string().trim().min(1).max(4000),
+  securityReview: z.unknown().optional(),
   sourceArtifactId: z.string().uuid(),
 })
 
@@ -45,6 +46,7 @@ export async function POST(
       decision: parsed.data.decision,
       gateId,
       reason: parsed.data.reason,
+      securityReview: parsed.data.securityReview,
       sourceArtifactId: parsed.data.sourceArtifactId,
       taskId,
       userId: session.userId,
@@ -55,16 +57,24 @@ export async function POST(
     }
 
     if (result.status !== 'decided') {
-      return NextResponse.json({ error: result.message }, { status: 409 })
+      const status = result.status === 'invalid_security_review_payload' ? 400 : 409
+      return NextResponse.json({ error: result.message }, { status })
     }
 
     try {
-      await progressWorkforce(taskId)
+      await redis.lpush('forge:approvals', JSON.stringify({ taskId, action: 'approve' }))
     } catch (err) {
       // The gate decision above already committed successfully; a failure here
-      // only means the next package wasn't auto-claimed yet, not that the
-      // decision failed, so don't surface it as a request error.
-      console.error('[POST /api/tasks/:id/approval-gates/:gateId] progressWorkforce failed', err)
+      // only means the worker continuation wasn't queued yet, not that the
+      // decision failed, so return an accepted response the operator can retry.
+      console.error('[POST /api/tasks/:id/approval-gates/:gateId] Failed to enqueue worker continuation', err)
+      return NextResponse.json(
+        {
+          error: 'Review gate decision was saved, but the worker continuation could not be queued.',
+          result,
+        },
+        { status: 202 },
+      )
     }
 
     return NextResponse.json({ result })

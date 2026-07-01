@@ -9,6 +9,8 @@
 import { EventEmitter } from 'node:events'
 import { describe, it, expect, vi } from 'vitest'
 import { checkAcpReadiness, getAcpAdapterCommand, isAcpAdapterSupported } from '@/lib/providers/acp/handshake'
+import { AcpSessionClient } from '@/lib/providers/acp/client'
+import { buildAcpAdapterEnv } from '@/lib/providers/acp/transport'
 
 type AcpResponder = (method: string, id: number) => Record<string, unknown> | null
 
@@ -40,16 +42,48 @@ function writeJsonLine(emitter: EventEmitter, value: unknown) {
   emitter.emit('data', Buffer.from(`${JSON.stringify(value)}\n`))
 }
 
+function fixtureSecret(...parts: string[]) {
+  return parts.join('')
+}
+
 describe('getAcpAdapterCommand / isAcpAdapterSupported', () => {
-  it('maps known catalog agent ids to their zed-industries adapter command', () => {
-    expect(getAcpAdapterCommand('claude-agent')).toEqual(['npx', '-y', '@zed-industries/claude-agent-acp'])
-    expect(getAcpAdapterCommand('codex-cli')).toEqual(['npx', '-y', '@zed-industries/codex-acp'])
+  it('maps known catalog agent ids to pinned local adapter commands', () => {
+    expect(getAcpAdapterCommand('claude-agent')).toEqual(['npx', '--no-install', 'claude-agent-acp'])
+    expect(getAcpAdapterCommand('codex-cli')).toEqual(['npx', '--no-install', 'codex-acp'])
     expect(isAcpAdapterSupported('claude-agent')).toBe(true)
   })
 
   it('returns null for agents without a wired-up adapter', () => {
     expect(getAcpAdapterCommand('some-other-agent')).toBeNull()
     expect(isAcpAdapterSupported('some-other-agent')).toBe(false)
+  })
+})
+
+describe('buildAcpAdapterEnv', () => {
+  it('passes only deny-by-default adapter environment variables', () => {
+    const env = buildAcpAdapterEnv({
+      AWS_SECRET_ACCESS_KEY: 'aws-secret',
+      DATABASE_URL: 'postgres://user:pass@db/app',
+      ENCRYPTION_KEY: 'encryption-secret',
+      GITHUB_TOKEN: 'github-token',
+      HOME: '/home/forge',
+      OPENAI_API_KEY: 'openai-secret',
+      PATH: '/usr/bin',
+      REDIS_URL: 'redis://localhost:6379',
+      XDG_CONFIG_HOME: '/home/forge/.config',
+    })
+
+    expect(env).toMatchObject({
+      HOME: '/home/forge',
+      PATH: '/usr/bin',
+      XDG_CONFIG_HOME: '/home/forge/.config',
+    })
+    expect(env).not.toHaveProperty('AWS_SECRET_ACCESS_KEY')
+    expect(env).not.toHaveProperty('DATABASE_URL')
+    expect(env).not.toHaveProperty('ENCRYPTION_KEY')
+    expect(env).not.toHaveProperty('GITHUB_TOKEN')
+    expect(env).not.toHaveProperty('OPENAI_API_KEY')
+    expect(env).not.toHaveProperty('REDIS_URL')
   })
 })
 
@@ -77,7 +111,21 @@ describe('checkAcpReadiness', () => {
 
     expect(result.status).toBe('ready')
     expect(result.latencyMs).not.toBeNull()
-    expect(spawnFn).toHaveBeenCalledWith('npx', ['-y', '@zed-industries/codex-acp'])
+    expect(spawnFn).toHaveBeenCalledWith('npx', ['--no-install', 'codex-acp'], expect.objectContaining({
+      cwd: process.cwd(),
+      env: expect.objectContaining({
+        PATH: expect.stringContaining('node_modules/.bin'),
+      }),
+      shell: false,
+      windowsHide: true,
+    }))
+    const spawnOptions = spawnFn.mock.calls[0][2] as { env?: Record<string, string> }
+    expect(spawnOptions.env).not.toEqual(expect.objectContaining({
+      DATABASE_URL: expect.any(String),
+      GITHUB_TOKEN: expect.any(String),
+      OPENAI_API_KEY: expect.any(String),
+      REDIS_URL: expect.any(String),
+    }))
     expect(child.stdin.write).toHaveBeenCalledTimes(2)
     expect(child.kill).toHaveBeenCalled()
   })
@@ -110,11 +158,12 @@ describe('checkAcpReadiness', () => {
 
   it('redacts sensitive adapter messages before returning auth failures', async () => {
     const child = new FakeChildProcess()
+    const leakedToken = fixtureSecret('ghp', '_', '1234567890', 'abcdef')
     child.responder = (_method, id) => ({
       jsonrpc: '2.0',
       id,
       error: {
-        message: 'Not authenticated as dev@example.com with Bearer ghp_1234567890abcdef',
+        message: `Not authenticated as dev@example.com with Bearer ${leakedToken}`,
       },
     })
     const spawnFn = makeSpawnFn(child)
@@ -125,7 +174,7 @@ describe('checkAcpReadiness', () => {
     expect(result.message).toContain('[redacted-email]')
     expect(result.message).toContain('Bearer [redacted-token]')
     expect(result.message).not.toContain('dev@example.com')
-    expect(result.message).not.toContain('ghp_1234567890abcdef')
+    expect(result.message).not.toContain(leakedToken)
     expect(child.kill).toHaveBeenCalled()
   })
 
@@ -142,15 +191,16 @@ describe('checkAcpReadiness', () => {
 
   it('classifies an early process exit as unreachable', async () => {
     const child = new FakeChildProcess()
+    const leakedToken = fixtureSecret('ghp', '_', '1234567890', 'abcdef')
     const spawnFn = makeSpawnFn(child)
 
     const promise = checkAcpReadiness('codex-cli', spawnFn)
-    child.stderr.emit('data', Buffer.from('token ghp_1234567890abcdef for dev@example.com'))
+    child.stderr.emit('data', Buffer.from(`token ${leakedToken} for dev@example.com`))
     child.emit('exit', 1)
     const result = await promise
 
     expect(result.status).toBe('unreachable')
-    expect(result.message).not.toContain('ghp_1234567890abcdef')
+    expect(result.message).not.toContain(leakedToken)
     expect(result.message).not.toContain('dev@example.com')
   })
 
@@ -163,5 +213,29 @@ describe('checkAcpReadiness', () => {
 
     expect(result.status).toBe('unreachable')
     expect(result.message).toContain('ENOENT')
+  })
+})
+
+describe('AcpSessionClient', () => {
+  it('spawns the ACP adapter from the requested session cwd', async () => {
+    const child = new FakeChildProcess()
+    child.responder = (method, id) => {
+      if (method === 'initialize') return { jsonrpc: '2.0', id, result: { protocolVersion: 1 } }
+      if (method === 'session/new') return { jsonrpc: '2.0', id, result: { sessionId: 'sess-1' } }
+      return null
+    }
+    const spawnFn = makeSpawnFn(child)
+
+    const client = await AcpSessionClient.start('codex-cli', '/tmp/forge-package-sandbox', { spawnFn })
+
+    expect(spawnFn).toHaveBeenCalledWith('npx', ['--no-install', 'codex-acp'], expect.objectContaining({
+      cwd: '/tmp/forge-package-sandbox',
+      env: expect.objectContaining({
+        PATH: expect.stringContaining('node_modules/.bin'),
+      }),
+      shell: false,
+      windowsHide: true,
+    }))
+    client.close()
   })
 })

@@ -223,7 +223,7 @@ describe('answered-question retry contract', () => {
     updateResults.push(
       [{ id: task.id }],
       undefined,
-      undefined,
+      [{ id: task.id }],
     )
     insertResults.push(
       [{

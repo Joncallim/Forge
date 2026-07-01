@@ -188,6 +188,40 @@ function mcpSubtasksForAgent(prepared: PreparedArchitectArtifact, agentType: str
     }))
 }
 
+function planningOnlyHarnessMetadata(): JsonObject {
+  return {
+    schemaVersion: 1,
+    status: 'planning_only',
+    runtimePolicyApplied: false,
+    note: 'Harness records shape planning for beta handoff only; it is not wired as a runtime tool or MCP policy.',
+  }
+}
+
+function mcpGrantPhaseMetadata(input: {
+  grants: JsonObject[]
+  validationStatus: string
+}): JsonObject {
+  return {
+    schemaVersion: 1,
+    proposed: input.grants,
+    broker: {
+      schemaVersion: 1,
+      runtimeEnforcement: 'not_implemented',
+      validationStatus: input.validationStatus,
+      status: input.validationStatus,
+    },
+    approved: null,
+    effective: {
+      schemaVersion: 1,
+      phase: 'effective',
+      runtimeIssued: false,
+      runtimeEnforcement: 'not_implemented',
+      status: 'not_issued',
+      note: 'Effective run instructions are prompt/context metadata only in this beta; no live MCP runtime tools are issued.',
+    },
+  }
+}
+
 function buildDependencyRows(
   packages: WorkPackageInsert[],
   idFactory: () => string,
@@ -300,6 +334,7 @@ export function buildWorkforceMaterializationRows(
       isActive: true,
       metadata: {
         source: 'workforce-materializer',
+        harnessSemantics: planningOnlyHarnessMetadata(),
         seededFromTaskId: input.taskId,
       },
     })
@@ -328,6 +363,11 @@ export function buildWorkforceMaterializationRows(
         architectRunId: input.architectRunId,
         artifactId: input.artifactId,
         mcpGrants,
+        mcpGrantPhases: mcpGrantPhaseMetadata({
+          grants: mcpGrants,
+          validationStatus: input.prepared.mcpExecutionDesign.validation.status,
+        }),
+        harnessSemantics: planningOnlyHarnessMetadata(),
         promptOverlay,
         plannedTasks: agent.tasks,
         mcpAwareSubtasks: mcpSubtasks,
@@ -352,6 +392,7 @@ export function buildWorkforceMaterializationRows(
         source: 'workforce-materializer',
         artifactId: input.artifactId,
         architectRunId: input.architectRunId,
+        harnessSemantics: planningOnlyHarnessMetadata(),
         workPackageIds: packages.map((pkg) => pkg.id),
         harnessIds: harnesses.map((harness) => harness.id),
         mcpExecutionStatus: input.prepared.mcpExecutionDesign.validation.status,

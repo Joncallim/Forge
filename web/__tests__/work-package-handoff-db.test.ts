@@ -13,7 +13,18 @@ const mocks = vi.hoisted(() => ({
   getProjectMcpOverview: vi.fn(),
   materializeReviewGatesForWorkPackageCompletion: vi.fn(),
   completeTaskIfReviewGatesSatisfied: vi.fn(),
+  executeWorkPackage: vi.fn(),
+  loadWorkPackageExecutionContext: vi.fn(),
   publishTaskEvent: vi.fn(),
+  WorkPackageExecutionError: class WorkPackageExecutionError extends Error {
+    failureDetails: unknown
+
+    constructor(message: string, failureDetails: unknown) {
+      super(message)
+      this.name = 'WorkPackageExecutionError'
+      this.failureDetails = failureDetails
+    }
+  },
 }))
 
 vi.mock('@/db', () => ({
@@ -34,9 +45,23 @@ vi.mock('@/lib/mcps/manager', () => ({
 }))
 
 vi.mock('@/worker/review-gates', () => ({
+  REVIEW_GATE_TYPES: ['qa_review', 'reviewer_review', 'security_review'],
   materializeReviewGatesForWorkPackageCompletion: mocks.materializeReviewGatesForWorkPackageCompletion,
   completeTaskIfReviewGatesSatisfied: mocks.completeTaskIfReviewGatesSatisfied,
 }))
+
+vi.mock('@/worker/work-package-executor', () => ({
+  executeWorkPackage: mocks.executeWorkPackage,
+  loadWorkPackageExecutionContext: mocks.loadWorkPackageExecutionContext,
+  MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS: 3,
+  WorkPackageExecutionError: mocks.WorkPackageExecutionError,
+  isArchitectReservedExecutionRole: (role: string) =>
+    ['architect', 'qa', 'reviewer', 'security', 'security-review', 'security_review'].includes(role.trim().toLowerCase()),
+}))
+
+function fixtureSecret(...parts: string[]) {
+  return parts.join('')
+}
 
 import { handoffApprovedWorkPackages, progressWorkforce } from '@/worker/work-package-handoff'
 
@@ -54,6 +79,12 @@ function chain(resolveValue: unknown) {
   return thenable
 }
 
+function chainWithLimit<T>(resolveValue: T[]) {
+  const thenable = chain(resolveValue) as Record<string, unknown>
+  thenable.limit = (count: number) => chain(resolveValue.slice(0, count))
+  return thenable
+}
+
 function updateChain(returnValue: unknown) {
   const update = chain(returnValue)
   update.set = vi.fn(() => update)
@@ -64,6 +95,54 @@ function insertChain(returnValue: unknown = []) {
   const insert = chain(returnValue)
   insert.values = vi.fn(() => insert)
   return insert
+}
+
+function defaultSourceArtifact(input: {
+  content?: string
+  id?: string
+  metadata?: Record<string, unknown>
+  runId?: string
+} = {}) {
+  return {
+    id: input.id ?? 'artifact-1',
+    agentRunId: input.runId ?? 'run-1',
+    artifactType: 'log_output',
+    content: input.content ?? 'handoff log',
+    metadata: input.metadata ?? {
+      hostRepositoryWrites: false,
+      repositoryWrites: false,
+      sandboxWrites: false,
+      source: 'work-package-handoff',
+      workPackageId: 'pkg-1',
+    },
+    createdAt: new Date('2026-06-25T00:00:00.000Z'),
+  }
+}
+
+function mockNoOpHandoffTransaction(input: {
+  packageId?: string
+  runId?: string
+} = {}) {
+  const packageId = input.packageId ?? 'pkg-1'
+  const runId = input.runId ?? 'run-1'
+  const claimUpdate = updateChain([{ id: packageId }])
+  const leaseUpdate = updateChain([{ id: packageId }])
+  const runInsert = insertChain([{
+    id: runId,
+    agentType: 'handoff',
+    modelIdUsed: 'forge-handoff/no-op',
+    stage: 'handoff',
+    status: 'running',
+  }])
+  mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
+    callback({
+      insert: vi.fn().mockReturnValueOnce(runInsert),
+      update: vi.fn()
+        .mockReturnValueOnce(claimUpdate)
+        .mockReturnValueOnce(leaseUpdate),
+    }),
+  )
+  return { claimUpdate, leaseUpdate, runInsert }
 }
 
 describe('handoffApprovedWorkPackages', () => {
@@ -91,6 +170,7 @@ describe('handoffApprovedWorkPackages', () => {
         { id: 'gate-qa', gateType: 'qa_review', requiredRole: 'qa', title: 'QA review' },
         { id: 'gate-reviewer', gateType: 'reviewer_review', requiredRole: 'reviewer', title: 'Reviewer review' },
       ],
+      sourceArtifact: defaultSourceArtifact(),
     })
   })
 
@@ -118,37 +198,8 @@ describe('handoffApprovedWorkPackages', () => {
         { workPackageId: 'pkg-2', dependsOnWorkPackageId: 'pkg-1' },
       ]))
     const readyUpdate = updateChain([{ id: 'pkg-1' }])
-    const claimUpdate = updateChain([{ id: 'pkg-1' }])
     mocks.dbUpdate.mockReturnValueOnce(readyUpdate)
-    const run = {
-      id: 'run-1',
-      agentType: 'handoff',
-      modelIdUsed: 'forge-handoff/no-op',
-      stage: 'handoff',
-      status: 'completed',
-    }
-    const artifact = {
-      id: 'artifact-1',
-      agentRunId: 'run-1',
-      artifactType: 'log_output',
-      content: 'handoff log',
-      metadata: {
-        repositoryWrites: false,
-        source: 'work-package-handoff',
-        workPackageId: 'pkg-1',
-      },
-      createdAt: new Date('2026-06-25T00:00:00.000Z'),
-    }
-    const runInsert = insertChain([run])
-    const artifactInsert = insertChain([artifact])
-    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
-      callback({
-        insert: vi.fn()
-          .mockReturnValueOnce(runInsert)
-          .mockReturnValueOnce(artifactInsert),
-        update: vi.fn().mockReturnValueOnce(claimUpdate),
-      }),
-    )
+    const { claimUpdate, leaseUpdate, runInsert } = mockNoOpHandoffTransaction()
 
     const result = await handoffApprovedWorkPackages('task-1')
 
@@ -167,17 +218,17 @@ describe('handoffApprovedWorkPackages', () => {
       harnessId: 'harness-1',
       modelIdUsed: 'forge-handoff/no-op',
       stage: 'handoff',
-      status: 'completed',
+      status: 'running',
       taskId: 'task-1',
       workPackageId: 'pkg-1',
     }))
-    expect(artifactInsert.values).toHaveBeenCalledWith(expect.objectContaining({
-      agentRunId: 'run-1',
-      artifactType: 'log_output',
+    expect(leaseUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
       metadata: expect.objectContaining({
-        repositoryWrites: false,
-        source: 'work-package-handoff',
-        workPackageId: 'pkg-1',
+        executionLease: expect.objectContaining({
+          attemptNumber: 1,
+          runId: 'run-1',
+          source: 'work-package-handoff',
+        }),
       }),
     }))
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'artifact:created', expect.objectContaining({
@@ -187,12 +238,24 @@ describe('handoffApprovedWorkPackages', () => {
       metadata: expect.objectContaining({ repositoryWrites: false }),
       workPackageId: 'pkg-1',
     }))
-    expect(mocks.materializeReviewGatesForWorkPackageCompletion).toHaveBeenCalledWith({
+    expect(mocks.materializeReviewGatesForWorkPackageCompletion).toHaveBeenCalledWith(expect.objectContaining({
+      completeSourceRun: expect.objectContaining({
+        artifactType: 'log_output',
+        content: expect.stringContaining('Forge handed off work package "Backend package" to backend.'),
+        metadata: expect.objectContaining({
+          hostRepositoryWrites: false,
+          repositoryWrites: false,
+          sandboxWrites: false,
+          source: 'work-package-handoff',
+          workPackageId: 'pkg-1',
+        }),
+      }),
+      requireExecutionLease: true,
       sourceAgentRunId: 'run-1',
-      sourceArtifactId: 'artifact-1',
+      sourceArtifactId: null,
       taskId: 'task-1',
       workPackageId: 'pkg-1',
-    })
+    }))
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:handoff', expect.objectContaining({
       repositoryWrites: false,
       runId: 'run-1',
@@ -207,6 +270,7 @@ describe('handoffApprovedWorkPackages', () => {
       status: 'not_required',
       packageStatus: 'completed',
       createdGates: [],
+      sourceArtifact: defaultSourceArtifact(),
     })
     mocks.completeTaskIfReviewGatesSatisfied.mockResolvedValue({ status: 'completed' })
 
@@ -224,33 +288,8 @@ describe('handoffApprovedWorkPackages', () => {
       .mockReturnValueOnce(chain([]))
 
     const readyUpdate = updateChain([{ id: 'pkg-1' }])
-    const claimUpdate = updateChain([{ id: 'pkg-1' }])
     mocks.dbUpdate.mockReturnValueOnce(readyUpdate)
-    const run = {
-      id: 'run-1',
-      agentType: 'handoff',
-      modelIdUsed: 'forge-handoff/no-op',
-      stage: 'handoff',
-      status: 'completed',
-    }
-    const artifact = {
-      id: 'artifact-1',
-      agentRunId: 'run-1',
-      artifactType: 'log_output',
-      content: 'handoff log',
-      metadata: {},
-      createdAt: new Date('2026-06-25T00:00:00.000Z'),
-    }
-    const runInsert = insertChain([run])
-    const artifactInsert = insertChain([artifact])
-    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
-      callback({
-        insert: vi.fn()
-          .mockReturnValueOnce(runInsert)
-          .mockReturnValueOnce(artifactInsert),
-        update: vi.fn().mockReturnValueOnce(claimUpdate),
-      }),
-    )
+    mockNoOpHandoffTransaction()
 
     const result = await handoffApprovedWorkPackages('task-1')
 
@@ -514,33 +553,8 @@ describe('handoffApprovedWorkPackages', () => {
       .mockReturnValueOnce(chain([]))
 
     const readyUpdate = updateChain([{ id: 'pkg-1' }])
-    const claimUpdate = updateChain([{ id: 'pkg-1' }])
     mocks.dbUpdate.mockReturnValueOnce(readyUpdate)
-    const run = {
-      id: 'run-1',
-      agentType: 'handoff',
-      modelIdUsed: 'forge-handoff/no-op',
-      stage: 'handoff',
-      status: 'completed',
-    }
-    const artifact = {
-      id: 'artifact-1',
-      agentRunId: 'run-1',
-      artifactType: 'log_output',
-      content: 'handoff log',
-      metadata: {},
-      createdAt: new Date('2026-06-25T00:00:00.000Z'),
-    }
-    const runInsert = insertChain([run])
-    const artifactInsert = insertChain([artifact])
-    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
-      callback({
-        insert: vi.fn()
-          .mockReturnValueOnce(runInsert)
-          .mockReturnValueOnce(artifactInsert),
-        update: vi.fn().mockReturnValueOnce(claimUpdate),
-      }),
-    )
+    const { claimUpdate } = mockNoOpHandoffTransaction()
 
     const result = await handoffApprovedWorkPackages('task-1')
 
@@ -654,33 +668,8 @@ describe('handoffApprovedWorkPackages', () => {
       .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
 
     const readyUpdate = updateChain([{ id: 'pkg-1' }])
-    const claimUpdate = updateChain([{ id: 'pkg-1' }])
     mocks.dbUpdate.mockReturnValueOnce(readyUpdate)
-    const run = {
-      id: 'run-1',
-      agentType: 'handoff',
-      modelIdUsed: 'forge-handoff/no-op',
-      stage: 'handoff',
-      status: 'completed',
-    }
-    const artifact = {
-      id: 'artifact-1',
-      agentRunId: 'run-1',
-      artifactType: 'log_output',
-      content: 'handoff log',
-      metadata: {},
-      createdAt: new Date('2026-06-25T00:00:00.000Z'),
-    }
-    const runInsert = insertChain([run])
-    const artifactInsert = insertChain([artifact])
-    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
-      callback({
-        insert: vi.fn()
-          .mockReturnValueOnce(runInsert)
-          .mockReturnValueOnce(artifactInsert),
-        update: vi.fn().mockReturnValueOnce(claimUpdate),
-      }),
-    )
+    const { claimUpdate } = mockNoOpHandoffTransaction()
 
     const result = await handoffApprovedWorkPackages('task-1')
 
@@ -696,6 +685,765 @@ describe('handoffApprovedWorkPackages', () => {
       status: 'blocked',
       workPackageId: 'pkg-1',
     }))
+  })
+
+  it('blocks an optional unavailable MCP with ask_user fallback before claiming the package', async () => {
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([
+        {
+          id: 'pkg-1',
+          assignedRole: 'backend',
+          harnessId: 'harness-1',
+          harnessToolPolicy: null,
+          mcpRequirements: [{
+            mcpId: 'github',
+            requirement: 'optional',
+            permissions: ['github.issues.read'],
+            fallback: { action: 'ask_user', message: 'Connect GitHub or choose a local-only plan.' },
+          }],
+          metadata: {},
+          sequence: 1,
+          status: 'pending',
+          title: 'Backend package',
+        },
+      ]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+
+    const blockUpdate = updateChain([{ id: 'pkg-1' }])
+    mocks.dbUpdate.mockReturnValueOnce(blockUpdate)
+
+    const result = await handoffApprovedWorkPackages('task-1')
+
+    expect(result).toMatchObject({
+      blockedReason: expect.stringContaining("MCP 'github' is not configured"),
+      claimedPackageId: null,
+      readyPackageIds: [],
+      status: 'blocked',
+    })
+    expect(blockUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      blockedReason: expect.stringContaining("MCP 'github' is not configured"),
+      metadata: expect.objectContaining({
+        mcpBroker: expect.objectContaining({
+          retryable: true,
+          status: 'blocked',
+        }),
+      }),
+      status: 'blocked',
+    }))
+    expect(mocks.dbTransaction).not.toHaveBeenCalled()
+  })
+
+  it('returns blocked when auto-advancing into a broker-blocked follow-on package', async () => {
+    mocks.materializeReviewGatesForWorkPackageCompletion.mockResolvedValueOnce({
+      status: 'not_required',
+      packageStatus: 'completed',
+      createdGates: [],
+      sourceArtifact: defaultSourceArtifact(),
+    })
+
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([
+        {
+          id: 'pkg-1',
+          assignedRole: 'backend',
+          harnessId: 'harness-1',
+          harnessToolPolicy: null,
+          mcpRequirements: [],
+          metadata: {},
+          sequence: 1,
+          status: 'pending',
+          title: 'Backend package',
+        },
+        {
+          id: 'pkg-2',
+          assignedRole: 'frontend',
+          harnessId: 'harness-2',
+          harnessToolPolicy: null,
+          mcpRequirements: [{
+            mcpId: 'github',
+            requirement: 'optional',
+            permissions: ['github.issues.read'],
+            fallback: { action: 'ask_user', message: 'Connect GitHub before frontend handoff.' },
+          }],
+          metadata: {},
+          sequence: 2,
+          status: 'pending',
+          title: 'Frontend package',
+        },
+      ]))
+      .mockReturnValueOnce(chain([
+        { workPackageId: 'pkg-2', dependsOnWorkPackageId: 'pkg-1' },
+      ]))
+      .mockReturnValueOnce(chain([
+        {
+          id: 'pkg-1',
+          assignedRole: 'backend',
+          harnessId: 'harness-1',
+          harnessToolPolicy: null,
+          mcpRequirements: [],
+          metadata: {},
+          sequence: 1,
+          status: 'completed',
+          title: 'Backend package',
+        },
+        {
+          id: 'pkg-2',
+          assignedRole: 'frontend',
+          harnessId: 'harness-2',
+          harnessToolPolicy: null,
+          mcpRequirements: [{
+            mcpId: 'github',
+            requirement: 'optional',
+            permissions: ['github.issues.read'],
+            fallback: { action: 'ask_user', message: 'Connect GitHub before frontend handoff.' },
+          }],
+          metadata: {},
+          sequence: 2,
+          status: 'pending',
+          title: 'Frontend package',
+        },
+      ]))
+      .mockReturnValueOnce(chain([
+        { workPackageId: 'pkg-2', dependsOnWorkPackageId: 'pkg-1' },
+      ]))
+      .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+
+    const readyUpdate = updateChain([{ id: 'pkg-1' }])
+    const blockUpdate = updateChain([{ id: 'pkg-2' }])
+    mocks.dbUpdate
+      .mockReturnValueOnce(readyUpdate)
+      .mockReturnValueOnce(blockUpdate)
+    mockNoOpHandoffTransaction()
+
+    const result = await handoffApprovedWorkPackages('task-1')
+
+    expect(result).toMatchObject({
+      blockedReason: expect.stringContaining("MCP 'github' is not configured"),
+      claimedPackageId: null,
+      readyPackageIds: [],
+      status: 'blocked',
+    })
+    expect(blockUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      blockedReason: expect.stringContaining("MCP 'github' is not configured"),
+      status: 'blocked',
+    }))
+    expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
+      blockedReason: expect.stringContaining("MCP 'github' is not configured"),
+      status: 'blocked',
+      workPackageId: 'pkg-2',
+    }))
+  })
+
+  it('uses prior implementation runs for attempt number and passes rework context into sandbox execution', async () => {
+    const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
+    process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    const workPackage = {
+      id: 'pkg-1',
+      assignedRole: 'backend',
+      blockedReason: 'Needs rework from QA.',
+      harnessId: 'harness-1',
+      mcpRequirements: [],
+      metadata: {},
+      sequence: 1,
+      status: 'needs_rework',
+      title: 'Backend package',
+    }
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([workPackage]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chainWithLimit([{ attemptNumber: null }, { attemptNumber: 1 }]))
+      .mockReturnValueOnce(chain([{
+        id: 'gate-qa',
+        gateType: 'qa_review',
+        metadata: { decisionReason: 'Add regression tests.' },
+        sourceArtifactId: 'artifact-old',
+        status: 'needs_rework',
+      }]))
+      .mockReturnValueOnce(chain([{
+        id: 'artifact-old',
+        content: 'Prior implementation output:\n- Added API route but skipped regression tests.',
+      }]))
+      .mockReturnValueOnce(chain([{
+        metadata: {
+          executionLease: {
+            acquiredAt: '2026-06-25T00:00:00.000Z',
+            attemptNumber: 2,
+            heartbeatAt: '2026-06-25T00:00:00.000Z',
+            runId: 'run-2',
+          },
+        },
+        status: 'running',
+      }]))
+    const readyUpdate = updateChain([{ id: 'pkg-1' }])
+    const claimUpdate = updateChain([{ id: 'pkg-1' }])
+    const leaseUpdate = updateChain([{ id: 'pkg-1' }])
+    const runModelUpdate = updateChain([{ id: 'run-2' }])
+    const contextArtifactLeaseUpdate = updateChain([{ id: 'pkg-1' }])
+    mocks.dbUpdate
+      .mockReturnValueOnce(readyUpdate)
+      .mockReturnValueOnce(runModelUpdate)
+      .mockReturnValueOnce(contextArtifactLeaseUpdate)
+
+    const runInsert = insertChain([{ id: 'run-2', agentRunId: 'run-2' }])
+    const contextArtifactInsert = insertChain([{
+      id: 'artifact-context',
+      agentRunId: 'run-2',
+      artifactType: 'log_output',
+      content: 'context packet',
+      metadata: {},
+      createdAt: new Date('2026-06-25T00:00:00.000Z'),
+    }])
+    mocks.dbTransaction
+      .mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
+        callback({
+          insert: vi.fn().mockReturnValueOnce(runInsert),
+          update: vi.fn()
+            .mockReturnValueOnce(claimUpdate)
+            .mockReturnValueOnce(leaseUpdate),
+        }),
+      )
+      .mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
+        callback({
+          insert: mocks.dbInsert,
+          update: mocks.dbUpdate,
+        }),
+      )
+    mocks.dbInsert.mockReturnValueOnce(contextArtifactInsert)
+    mocks.materializeReviewGatesForWorkPackageCompletion.mockResolvedValueOnce({
+      status: 'materialized',
+      packageStatus: 'awaiting_review',
+      createdGates: [
+        { id: 'gate-qa', gateType: 'qa_review', requiredRole: 'qa', title: 'QA review' },
+        { id: 'gate-reviewer', gateType: 'reviewer_review', requiredRole: 'reviewer', title: 'Reviewer review' },
+      ],
+      sourceArtifact: defaultSourceArtifact({
+        content: 'final output',
+        id: 'artifact-final',
+        metadata: {
+          attemptNumber: 2,
+          hostRepositoryWrites: false,
+          repositoryWrites: false,
+          sandboxPath: '/workspace/project/.forge/task-runs/task-1/pkg-1/attempt-2',
+          sandboxWrites: true,
+          source: 'work-package-executor',
+          workPackageId: 'pkg-1',
+        },
+        runId: 'run-2',
+      }),
+    })
+    mocks.loadWorkPackageExecutionContext.mockResolvedValueOnce({
+      agentConfig: null,
+      modelIdUsed: 'test-model',
+      project: { id: 'project-1' },
+      task: { id: 'task-1' },
+      validatedProjectRoot: '/workspace/project',
+      workPackage: {
+        id: 'pkg-1',
+        metadata: { repositoryWrites: false },
+        requiredCapabilities: {},
+        title: 'Backend package',
+        assignedRole: 'backend',
+      },
+    })
+    mocks.executeWorkPackage.mockResolvedValue({
+      artifactContent: 'final output',
+      artifactMetadata: {
+        hostRepositoryWrites: false,
+        repositoryWrites: false,
+        sandboxPath: '/workspace/project/.forge/task-runs/task-1/pkg-1/attempt-2',
+        sandboxWrites: true,
+      },
+      commandResults: [],
+      executionContextArtifactContent: 'context packet',
+      executionContextArtifactMetadata: {
+        artifactKind: 'host_readonly_execution_context',
+        hostRepositoryWrites: false,
+        sandboxWrites: false,
+      },
+      executionContextPacket: {},
+      fileCount: 1,
+      sandboxPath: '/workspace/project/.forge/task-runs/task-1/pkg-1/attempt-2',
+      summary: 'Implemented rework.',
+    })
+
+    try {
+      const result = await handoffApprovedWorkPackages('task-1')
+
+      expect(result).toMatchObject({
+        status: 'handed_off',
+        claimedPackageId: 'pkg-1',
+      })
+      expect(runInsert.values).toHaveBeenCalledWith(expect.objectContaining({
+        attemptNumber: 2,
+        modelIdUsed: 'pending',
+        stage: 'implementation',
+        workPackageId: 'pkg-1',
+      }))
+      expect(leaseUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+        metadata: expect.objectContaining({
+          executionLease: expect.objectContaining({
+            attemptNumber: 2,
+            runId: 'run-2',
+            source: 'work-package-handoff',
+          }),
+        }),
+      }))
+      expect(runModelUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ modelIdUsed: 'test-model' }))
+      expect(mocks.executeWorkPackage).toHaveBeenCalledWith(expect.objectContaining({
+        attemptNumber: 2,
+        priorReviewContext: expect.objectContaining({
+          packageBlockedReason: 'Needs rework from QA.',
+          notes: [expect.objectContaining({
+            gateId: 'gate-qa',
+            reason: expect.stringContaining('Add regression tests.'),
+            sourceArtifactId: 'artifact-old',
+          })],
+        }),
+      }))
+      expect(mocks.executeWorkPackage.mock.calls[0][0].priorReviewContext.notes[0].reason)
+        .toContain('Prior implementation output')
+      expect(contextArtifactInsert.values).toHaveBeenCalledWith(expect.objectContaining({
+        metadata: expect.objectContaining({
+          artifactKind: 'host_readonly_execution_context',
+          attemptNumber: 2,
+          hostRepositoryWrites: false,
+          sandboxWrites: false,
+          source: 'execution-context-packet',
+        }),
+      }))
+      expect(mocks.materializeReviewGatesForWorkPackageCompletion).toHaveBeenCalledWith(expect.objectContaining({
+        completeSourceRun: expect.objectContaining({
+          artifactType: 'log_output',
+          content: 'final output',
+          metadata: expect.objectContaining({
+            attemptNumber: 2,
+            hostRepositoryWrites: false,
+            repositoryWrites: false,
+            sandboxWrites: true,
+            source: 'work-package-executor',
+          }),
+        }),
+        requireExecutionLease: true,
+        sourceAgentRunId: 'run-2',
+        sourceArtifactId: null,
+        taskId: 'task-1',
+        workPackageId: 'pkg-1',
+      }))
+      expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'artifact:created', expect.objectContaining({
+        agentRunId: 'run-2',
+        artifactId: 'artifact-final',
+        content: 'final output',
+        metadata: expect.objectContaining({
+          attemptNumber: 2,
+          source: 'work-package-executor',
+        }),
+      }))
+      expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:handoff', expect.objectContaining({
+        hostRepositoryWrites: false,
+        repositoryWrites: false,
+        sandboxWrites: true,
+        sandboxPath: '/workspace/project/.forge/task-runs/task-1/pkg-1/attempt-2',
+      }))
+    } finally {
+      if (previousExecutionFlag === undefined) {
+        delete process.env.FORGE_WORK_PACKAGE_EXECUTION
+      } else {
+        process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
+      }
+    }
+  })
+
+  it('does not write stale package artifacts after execution if the lease was cancelled', async () => {
+    const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
+    process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    const workPackage = {
+      id: 'pkg-1',
+      assignedRole: 'backend',
+      harnessId: 'harness-1',
+      mcpRequirements: [],
+      metadata: {},
+      sequence: 1,
+      status: 'pending',
+      title: 'Backend package',
+    }
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([workPackage]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+
+    const readyUpdate = updateChain([{ id: 'pkg-1' }])
+    const claimUpdate = updateChain([{ id: 'pkg-1' }])
+    const leaseUpdate = updateChain([{ id: 'pkg-1' }])
+    const runModelUpdate = updateChain([{ id: 'run-1' }])
+    const lostLeaseUpdate = updateChain([])
+    const staleRunUpdate = updateChain([{ id: 'run-1' }])
+    mocks.dbUpdate
+      .mockReturnValueOnce(readyUpdate)
+      .mockReturnValueOnce(runModelUpdate)
+      .mockReturnValueOnce(lostLeaseUpdate)
+      .mockReturnValueOnce(staleRunUpdate)
+
+    const runInsert = insertChain([{ id: 'run-1', agentRunId: 'run-1' }])
+    mocks.dbTransaction
+      .mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
+        callback({
+          insert: vi.fn().mockReturnValueOnce(runInsert),
+          update: vi.fn()
+            .mockReturnValueOnce(claimUpdate)
+            .mockReturnValueOnce(leaseUpdate),
+        }),
+      )
+      .mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
+        callback({
+          insert: mocks.dbInsert,
+          update: mocks.dbUpdate,
+        }),
+      )
+    mocks.loadWorkPackageExecutionContext.mockResolvedValueOnce({
+      agentConfig: null,
+      modelIdUsed: 'test-model',
+      project: { id: 'project-1' },
+      task: { id: 'task-1' },
+      validatedProjectRoot: '/workspace/project',
+      workPackage: {
+        id: 'pkg-1',
+        metadata: { repositoryWrites: false },
+        requiredCapabilities: { repository: false },
+        title: 'Backend package',
+        assignedRole: 'backend',
+      },
+    })
+    mocks.executeWorkPackage.mockResolvedValueOnce({
+      artifactContent: 'final output after cancel',
+      artifactMetadata: {
+        hostRepositoryWrites: false,
+        repositoryWrites: false,
+        sandboxPath: '/workspace/project/.forge/task-runs/task-1/pkg-1/attempt-1',
+        sandboxWrites: true,
+      },
+      commandResults: [],
+      executionContextArtifactContent: 'context packet after cancel',
+      executionContextArtifactMetadata: {
+        artifactKind: 'host_readonly_execution_context',
+        hostRepositoryWrites: false,
+        sandboxWrites: false,
+      },
+      executionContextPacket: {},
+      fileCount: 1,
+      sandboxPath: '/workspace/project/.forge/task-runs/task-1/pkg-1/attempt-1',
+      summary: 'Completed after cancellation.',
+    })
+
+    try {
+      const result = await handoffApprovedWorkPackages('task-1')
+
+      expect(result).toMatchObject({
+        status: 'already_handed_off',
+        claimedPackageId: 'pkg-1',
+      })
+      expect(mocks.executeWorkPackage).toHaveBeenCalled()
+      expect(mocks.dbInsert).not.toHaveBeenCalled()
+      expect(mocks.materializeReviewGatesForWorkPackageCompletion).not.toHaveBeenCalled()
+      expect(staleRunUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+        errorMessage: expect.stringContaining('no longer active'),
+        status: 'failed',
+      }))
+      expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'run:failed', expect.objectContaining({
+        errorMessage: expect.stringContaining('ignoring stale completion'),
+        runId: 'run-1',
+      }))
+    } finally {
+      if (previousExecutionFlag === undefined) {
+        delete process.env.FORGE_WORK_PACKAGE_EXECUTION
+      } else {
+        process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
+      }
+    }
+  })
+
+  it('fails the package and task instead of starting a fourth implementation attempt', async () => {
+    const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
+    process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'pkg-1',
+        assignedRole: 'backend',
+        harnessId: 'harness-1',
+        mcpRequirements: [],
+        metadata: {},
+        sequence: 1,
+        status: 'needs_rework',
+        title: 'Backend package',
+      }]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ attemptNumber: 3 }]))
+
+    const readyUpdate = updateChain([{ id: 'pkg-1' }])
+    const claimUpdate = updateChain([{ id: 'pkg-1' }])
+    const failedPackageUpdate = updateChain([{ id: 'pkg-1' }])
+    const runningTaskUpdate = updateChain([])
+    const approvedTaskUpdate = updateChain([{ id: 'task-1' }])
+    mocks.dbUpdate
+      .mockReturnValueOnce(readyUpdate)
+      .mockReturnValueOnce(runningTaskUpdate)
+      .mockReturnValueOnce(approvedTaskUpdate)
+    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
+      callback({
+        insert: vi.fn(),
+        update: vi.fn()
+          .mockReturnValueOnce(claimUpdate)
+          .mockReturnValueOnce(failedPackageUpdate),
+      }),
+    )
+
+    try {
+      const result = await handoffApprovedWorkPackages('task-1')
+
+      expect(result).toMatchObject({
+        status: 'blocked',
+        terminalBlock: true,
+        blockedReason: expect.stringContaining('maximum of 3 implementation attempts'),
+      })
+      expect(failedPackageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+        blockedReason: expect.stringContaining('maximum of 3 implementation attempts'),
+        metadata: expect.objectContaining({
+          executionAttempts: expect.objectContaining({
+            maxAttempts: 3,
+            nextAttemptNumber: 4,
+            status: 'failed',
+          }),
+        }),
+        status: 'failed',
+      }))
+      expect(claimUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+        blockedReason: null,
+        status: 'running',
+      }))
+      expect(approvedTaskUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+        errorMessage: expect.stringContaining('maximum of 3 implementation attempts'),
+        status: 'failed',
+      }))
+      expect(mocks.loadWorkPackageExecutionContext).not.toHaveBeenCalled()
+      expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
+    } finally {
+      if (previousExecutionFlag === undefined) {
+        delete process.env.FORGE_WORK_PACKAGE_EXECUTION
+      } else {
+        process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
+      }
+    }
+  })
+
+  it('keeps package execution failures retryable before the final approval attempt', async () => {
+    const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
+    process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'pkg-1',
+        assignedRole: 'backend',
+        harnessId: 'harness-1',
+        mcpRequirements: [],
+        metadata: {},
+        sequence: 1,
+        status: 'pending',
+        title: 'Backend package',
+      }]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{
+        metadata: {
+          executionLease: {
+            acquiredAt: '2026-06-25T00:00:00.000Z',
+            attemptNumber: 1,
+            heartbeatAt: '2026-06-25T00:00:00.000Z',
+            runId: 'run-1',
+          },
+        },
+        status: 'running',
+      }]))
+
+    const readyUpdate = updateChain([{ id: 'pkg-1' }])
+    const claimUpdate = updateChain([{ id: 'pkg-1' }])
+    const leaseUpdate = updateChain([{ id: 'pkg-1' }])
+    const runModelUpdate = updateChain([{ id: 'run-1' }])
+    const runFailedUpdate = updateChain([{ id: 'run-1' }])
+    const packageBlockedUpdate = updateChain([{ id: 'pkg-1' }])
+    mocks.dbUpdate
+      .mockReturnValueOnce(readyUpdate)
+      .mockReturnValueOnce(runModelUpdate)
+      .mockReturnValueOnce(packageBlockedUpdate)
+      .mockReturnValueOnce(runFailedUpdate)
+    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
+      callback({
+        insert: vi.fn().mockReturnValueOnce(insertChain([{ id: 'run-1', agentRunId: 'run-1' }])),
+        update: vi.fn()
+          .mockReturnValueOnce(claimUpdate)
+          .mockReturnValueOnce(leaseUpdate),
+      }),
+    )
+    const failedArtifactInsert = insertChain([{
+      id: 'artifact-failed',
+      agentRunId: 'run-1',
+      artifactType: 'log_output',
+      content: 'Generated files before failure.',
+      metadata: {},
+      createdAt: new Date('2026-06-25T00:00:00.000Z'),
+    }])
+    mocks.dbInsert.mockReturnValueOnce(failedArtifactInsert)
+    mocks.loadWorkPackageExecutionContext.mockResolvedValue({
+      agentConfig: null,
+      modelIdUsed: 'test-model',
+      project: { id: 'project-1' },
+      task: { id: 'task-1' },
+      validatedProjectRoot: '/workspace/project',
+      workPackage: {
+        id: 'pkg-1',
+        metadata: { repositoryWrites: false },
+        requiredCapabilities: {},
+        title: 'Backend package',
+        assignedRole: 'backend',
+      },
+    })
+    const leakedBearerToken = fixtureSecret('sk', '-live', '-secret')
+    mocks.executeWorkPackage.mockRejectedValueOnce(new mocks.WorkPackageExecutionError(
+      `model unavailable Authorization: Bearer ${leakedBearerToken} https://user:remote-secret@example.com/repo.git`,
+      {
+        artifactContent: 'Generated files before failure.',
+        artifactMetadata: {
+          commandResults: [{ command: ['npm', 'test'], exitCode: 1, stdout: '', stderr: 'failed' }],
+          files: ['package.json'],
+          generatedBy: 'work-package-executor',
+          repositoryWrites: false,
+          sandboxPath: '/workspace/project/.forge/task-runs/task-1/pkg-1/attempt-1',
+          sandboxWrites: true,
+          validationStatus: 'failed',
+        },
+        commandResults: [{ command: ['npm', 'test'], exitCode: 1, stdout: '', stderr: 'failed' }],
+        fileCount: 1,
+        sandboxPath: '/workspace/project/.forge/task-runs/task-1/pkg-1/attempt-1',
+      },
+    ))
+
+    try {
+      await expect(handoffApprovedWorkPackages('task-1', { finalAttempt: false }))
+        .rejects.toThrow('model unavailable')
+
+      expect(packageBlockedUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+        blockedReason: 'Retrying package execution after error: model unavailable Authorization: Bearer [REDACTED_TOKEN] https://[REDACTED_USERINFO]@example.com/repo.git',
+        status: 'blocked',
+      }))
+      expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
+        blockedReason: 'Retrying package execution after error: model unavailable Authorization: Bearer [REDACTED_TOKEN] https://[REDACTED_USERINFO]@example.com/repo.git',
+        status: 'blocked',
+        workPackageId: 'pkg-1',
+      }))
+      expect(mocks.publishTaskEvent).not.toHaveBeenCalledWith('task-1', 'run:failed', expect.objectContaining({
+        errorMessage: expect.stringContaining(leakedBearerToken),
+      }))
+      expect(mocks.publishTaskEvent).not.toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
+        status: 'failed',
+        workPackageId: 'pkg-1',
+      }))
+      expect(failedArtifactInsert.values).toHaveBeenCalledWith(expect.objectContaining({
+        content: expect.stringContaining('Generated files before failure.'),
+        metadata: expect.objectContaining({
+          errorMessage: 'model unavailable Authorization: Bearer [REDACTED_TOKEN] https://[REDACTED_USERINFO]@example.com/repo.git',
+          failure: true,
+          files: ['package.json'],
+          generatedBy: 'work-package-executor',
+          sandboxPath: '/workspace/project/.forge/task-runs/task-1/pkg-1/attempt-1',
+          sandboxWrites: true,
+          validationStatus: 'failed',
+        }),
+      }))
+    } finally {
+      if (previousExecutionFlag === undefined) {
+        delete process.env.FORGE_WORK_PACKAGE_EXECUTION
+      } else {
+        process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
+      }
+    }
+  })
+
+  it('recovers a stale running package before retrying the next implementation attempt', async () => {
+    const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
+    process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    const staleUpdatedAt = new Date(Date.now() - 60 * 60 * 1000)
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'pkg-1',
+        assignedRole: 'backend',
+        blockedReason: null,
+        harnessId: 'harness-1',
+        mcpRequirements: [],
+        metadata: {},
+        sequence: 1,
+        status: 'running',
+        title: 'Backend package',
+        updatedAt: staleUpdatedAt,
+      }]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{
+        id: 'run-stale',
+        attemptNumber: 1,
+        stage: 'implementation',
+      }]))
+      .mockReturnValueOnce(chain([{
+        id: 'pkg-1',
+        assignedRole: 'backend',
+        blockedReason: 'Recovered stale running work package.',
+        harnessId: 'harness-1',
+        mcpRequirements: [],
+        metadata: {},
+        sequence: 1,
+        status: 'blocked',
+        title: 'Backend package',
+        updatedAt: new Date(),
+      }]))
+      .mockReturnValueOnce(chain([]))
+
+    const recoveredPackageUpdate = updateChain([{ id: 'pkg-1' }])
+    const recoveredRunUpdate = updateChain([{ id: 'run-stale' }])
+    const readyUpdate = updateChain([{ id: 'pkg-1' }])
+    mocks.dbUpdate
+      .mockReturnValueOnce(recoveredPackageUpdate)
+      .mockReturnValueOnce(recoveredRunUpdate)
+      .mockReturnValueOnce(readyUpdate)
+
+    try {
+      const result = await handoffApprovedWorkPackages('task-1', { claimEnabled: false })
+
+      expect(result).toMatchObject({
+        status: 'ready_only',
+        readyPackageIds: ['pkg-1'],
+        claimedPackageId: null,
+      })
+      expect(recoveredPackageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+        status: 'blocked',
+        blockedReason: expect.stringContaining('Recovered stale running work package'),
+      }))
+      expect(recoveredRunUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+        status: 'failed',
+        errorMessage: expect.stringContaining('Recovered stale running work package'),
+      }))
+      expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'run:failed', expect.objectContaining({
+        runId: 'run-stale',
+        workPackageId: 'pkg-1',
+      }))
+      expect(readyUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+        blockedReason: null,
+        status: 'ready',
+      }))
+    } finally {
+      if (previousExecutionFlag === undefined) {
+        delete process.env.FORGE_WORK_PACKAGE_EXECUTION
+      } else {
+        process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
+      }
+    }
   })
 
   it('recovers a previously broker-blocked package once MCP access is available', async () => {
@@ -746,33 +1494,8 @@ describe('handoffApprovedWorkPackages', () => {
     })
 
     const readyUpdate = updateChain([{ id: 'pkg-1' }])
-    const claimUpdate = updateChain([{ id: 'pkg-1' }])
     mocks.dbUpdate.mockReturnValueOnce(readyUpdate)
-    const run = {
-      id: 'run-1',
-      agentType: 'handoff',
-      modelIdUsed: 'forge-handoff/no-op',
-      stage: 'handoff',
-      status: 'completed',
-    }
-    const artifact = {
-      id: 'artifact-1',
-      agentRunId: 'run-1',
-      artifactType: 'log_output',
-      content: 'handoff log',
-      metadata: {},
-      createdAt: new Date('2026-06-25T00:00:00.000Z'),
-    }
-    const runInsert = insertChain([run])
-    const artifactInsert = insertChain([artifact])
-    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
-      callback({
-        insert: vi.fn()
-          .mockReturnValueOnce(runInsert)
-          .mockReturnValueOnce(artifactInsert),
-        update: vi.fn().mockReturnValueOnce(claimUpdate),
-      }),
-    )
+    const { claimUpdate } = mockNoOpHandoffTransaction()
 
     const result = await handoffApprovedWorkPackages('task-1')
 

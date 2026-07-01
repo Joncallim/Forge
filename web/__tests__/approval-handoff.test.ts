@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   handoffApprovedWorkPackages: vi.fn(),
   isWorkPackageHandoffEnabled: vi.fn(),
   previewWorkPackageHandoff: vi.fn(),
+  progressWorkforce: vi.fn(),
   completeTaskIfReviewGatesSatisfied: vi.fn(),
   publishTaskEvent: vi.fn(),
 }))
@@ -25,6 +26,7 @@ vi.mock('@/worker/work-package-handoff', () => ({
   handoffApprovedWorkPackages: mocks.handoffApprovedWorkPackages,
   isWorkPackageHandoffEnabled: mocks.isWorkPackageHandoffEnabled,
   previewWorkPackageHandoff: mocks.previewWorkPackageHandoff,
+  progressWorkforce: mocks.progressWorkforce,
 }))
 
 vi.mock('@/worker/review-gates', () => ({
@@ -60,6 +62,11 @@ describe('processApproval handoff', () => {
     mocks.completeTaskIfReviewGatesSatisfied.mockResolvedValue({
       status: 'blocked',
       reason: 'work packages are not complete',
+    })
+    mocks.progressWorkforce.mockResolvedValue({
+      status: 'no_ready_packages',
+      readyPackageIds: [],
+      claimedPackageId: null,
     })
   })
 
@@ -102,7 +109,7 @@ describe('processApproval handoff', () => {
     await processApproval('task-1')
 
     expect(mocks.previewWorkPackageHandoff).toHaveBeenCalledWith('task-1')
-    expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith('task-1', { claimEnabled: true })
+    expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith('task-1', { claimEnabled: true, finalAttempt: true })
     expect(update.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
       claimedPackageId: 'pkg-1',
@@ -132,6 +139,7 @@ describe('processApproval handoff', () => {
       errorMessage: 'Retrying handoff after error: handoff insert failed',
       status: 'approved',
     }))
+    expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith('task-1', { claimEnabled: true, finalAttempt: false })
   })
 
   it('fails the task when package handoff fails on the final approval attempt', async () => {
@@ -155,6 +163,7 @@ describe('processApproval handoff', () => {
       errorMessage: 'handoff insert failed',
       status: 'failed',
     }))
+    expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith('task-1', { claimEnabled: true, finalAttempt: true })
   })
 
   it('keeps broker-blocked handoff recoverable instead of failing the task', async () => {
@@ -287,6 +296,77 @@ describe('processApproval handoff', () => {
       readyPackageIds: ['pkg-1'],
       status: 'ready_only',
     }))
+  })
+
+  it('continues an already-running task after review gates without resetting approval state', async () => {
+    mocks.dbSelect.mockReturnValue(chain([{ status: 'running' }]))
+    mocks.progressWorkforce.mockResolvedValue({
+      status: 'handed_off',
+      readyPackageIds: ['pkg-2'],
+      claimedPackageId: 'pkg-2',
+    })
+
+    await processApproval('task-1')
+
+    expect(mocks.previewWorkPackageHandoff).not.toHaveBeenCalled()
+    expect(mocks.handoffApprovedWorkPackages).not.toHaveBeenCalled()
+    expect(mocks.dbUpdate).not.toHaveBeenCalled()
+    expect(mocks.progressWorkforce).toHaveBeenCalledWith('task-1', { claimEnabled: true, finalAttempt: true })
+    expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
+      claimedPackageId: 'pkg-2',
+      readyPackageIds: ['pkg-2'],
+      status: 'handed_off',
+    }))
+  })
+
+  it('leaves an already-running task running when continuation fails before the final retry', async () => {
+    mocks.dbSelect.mockReturnValue(chain([{ status: 'running' }]))
+    mocks.progressWorkforce.mockRejectedValue(new Error('handoff insert failed'))
+
+    await expect(processApproval('task-1', { finalAttempt: false })).rejects.toThrow('handoff insert failed')
+
+    expect(mocks.dbUpdate).not.toHaveBeenCalled()
+    expect(mocks.progressWorkforce).toHaveBeenCalledWith('task-1', { claimEnabled: true, finalAttempt: false })
+  })
+
+  it('parks a running task back at approved when continuation hits a recoverable broker block', async () => {
+    mocks.dbSelect.mockReturnValue(chain([{ status: 'running' }]))
+    const restoreUpdate = updateChain([{ id: 'task-1' }])
+    mocks.dbUpdate.mockReturnValueOnce(restoreUpdate)
+    mocks.progressWorkforce.mockResolvedValue({
+      status: 'blocked',
+      readyPackageIds: [],
+      claimedPackageId: null,
+      blockedReason: 'MCP/capability broker blocked this work package.',
+      terminalBlock: false,
+    })
+
+    await processApproval('task-1')
+
+    expect(restoreUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      errorMessage: 'MCP/capability broker blocked this work package.',
+      status: 'approved',
+    }))
+    expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
+      blockedReason: 'MCP/capability broker blocked this work package.',
+      status: 'blocked',
+      terminalBlock: false,
+    }))
+  })
+
+  it('fails an already-running task when continuation fails on the final retry', async () => {
+    mocks.dbSelect.mockReturnValue(chain([{ status: 'running' }]))
+    mocks.progressWorkforce.mockRejectedValue(new Error('handoff insert failed'))
+    const failUpdate = updateChain([{ id: 'task-1' }])
+    mocks.dbUpdate.mockReturnValueOnce(failUpdate)
+
+    await expect(processApproval('task-1', { finalAttempt: true })).rejects.toThrow('handoff insert failed')
+
+    expect(failUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      errorMessage: 'handoff insert failed',
+      status: 'failed',
+    }))
+    expect(mocks.progressWorkforce).toHaveBeenCalledWith('task-1', { claimEnabled: true, finalAttempt: true })
   })
 
   it('fails the task for terminal handoff safety blocks when handoff execution is disabled', async () => {

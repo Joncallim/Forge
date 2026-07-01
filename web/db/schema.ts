@@ -642,7 +642,7 @@ export const repositoryCommandAudits = pgTable(
     cwd: text('cwd').notNull(),
     command: text('command').notNull(),
     argv: jsonb('argv').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
-    // 'read_only'|'local_validation'
+    // 'read_only'
     riskClass: text('risk_class').notNull(),
     startedAt: timestamp('started_at', tsOpts).notNull(),
     finishedAt: timestamp('finished_at', tsOpts).notNull(),

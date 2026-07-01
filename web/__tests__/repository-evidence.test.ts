@@ -21,6 +21,10 @@ import {
 const execFile = promisify(execFileCallback)
 let tempRoot = ''
 
+function fixtureSecret(...parts: string[]) {
+  return parts.join('')
+}
+
 const project = (localPath: string | null, overrides: Partial<RepositoryEvidenceProject> = {}): RepositoryEvidenceProject => ({
   id: 'project-1',
   name: 'Forge Fixture',
@@ -311,10 +315,10 @@ describe('scoped repository command runner', () => {
     expect(headDiffResult.exitCode).toBe(0)
   })
 
-  it('runs detected local validation commands and records success or failure', async () => {
+  it('detects local validation commands but blocks host package-manager execution', async () => {
     await fs.writeFile(path.join(tempRoot, 'package.json'), JSON.stringify({
       scripts: {
-        test: 'node -e "process.exit(0)"',
+        test: 'node -e "require(\\"fs\\").writeFileSync(\\"host-validation-ran\\", \\"yes\\")"',
         lint: 'node -e "process.exit(1)"',
       },
     }))
@@ -324,14 +328,11 @@ describe('scoped repository command runner', () => {
       ['npm', 'run', 'lint'],
     ])
     await expect(scopedCommandRisk({ cwd: tempRoot, command: 'npm', argv: ['test'] }))
-      .resolves.toBe('local_validation')
+      .rejects.toThrow(/host package manager validation/i)
+    await expect(runScopedRepositoryCommand({ cwd: tempRoot, command: 'npm', argv: ['test'] }))
+      .rejects.toThrow(/host package manager validation/i)
 
-    const success = await runScopedRepositoryCommand({ cwd: tempRoot, command: 'npm', argv: ['test'] })
-    const failure = await runScopedRepositoryCommand({ cwd: tempRoot, command: 'npm', argv: ['run', 'lint'] })
-
-    expect(success.exitCode).toBe(0)
-    expect(failure.exitCode).toBe(1)
-    expect(failure.riskClass).toBe('local_validation')
+    await expect(fs.stat(path.join(tempRoot, 'host-validation-ran'))).rejects.toThrow()
   })
 
   it('blocks unsupported and dangerous commands', async () => {
@@ -350,18 +351,29 @@ describe('scoped repository command runner', () => {
   })
 
   it('redacts secrets from command output summaries', () => {
+    const bearerToken = fixtureSecret('sk', '-live', '-secret')
+    const githubToken = fixtureSecret('ghp', '_example', 'value1234567890')
+    const privateKeyBegin = fixtureSecret('-----BEGIN ', 'OPENSSH PRIVATE KEY-----')
+    const privateKeyEnd = fixtureSecret('-----END ', 'OPENSSH PRIVATE KEY-----')
     const redacted = redactCommandOutput([
-      'Authorization: Bearer sk-live-secret',
-      'token=ghp_examplevalue1234567890',
-      '-----BEGIN OPENSSH PRIVATE KEY-----',
+      `Authorization: Bearer ${bearerToken}`,
+      `token=${githubToken}`,
+      'OPENAI_API_KEY=plain-openai-key',
+      'AWS_SECRET_ACCESS_KEY: "plain-aws-secret"',
+      'origin\thttps://user:remote-secret@example.com/owner/repo.git (fetch)',
+      privateKeyBegin,
       'abc',
-      '-----END OPENSSH PRIVATE KEY-----',
+      privateKeyEnd,
     ].join('\n'))
 
-    expect(redacted).not.toContain('sk-live-secret')
-    expect(redacted).not.toContain('ghp_examplevalue')
+    expect(redacted).not.toContain(bearerToken)
+    expect(redacted).not.toContain(githubToken)
+    expect(redacted).not.toContain('plain-openai-key')
+    expect(redacted).not.toContain('plain-aws-secret')
+    expect(redacted).not.toContain('remote-secret')
     expect(redacted).not.toContain('abc')
     expect(redacted).toContain('[REDACTED_TOKEN]')
+    expect(redacted).toContain('https://[REDACTED_USERINFO]@example.com/owner/repo.git')
     expect(redacted).toContain('[REDACTED_PRIVATE_KEY]')
   })
 

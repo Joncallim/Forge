@@ -1,9 +1,11 @@
-import { and, asc, eq, inArray } from 'drizzle-orm'
+import { and, asc, desc, eq, inArray, isNotNull, lte, sql } from 'drizzle-orm'
 import { db } from '../db'
 import {
   agentRuns,
+  approvalGates,
   artifacts,
   projects,
+  repositoryCommandAudits,
   tasks,
   vcsChanges,
   workPackageDependencies,
@@ -21,29 +23,36 @@ import { updateTaskStatusIfCurrent } from './task-state'
 import {
   completeTaskIfReviewGatesSatisfied,
   materializeReviewGatesForWorkPackageCompletion,
+  REVIEW_GATE_TYPES,
 } from './review-gates'
 import {
   executeWorkPackage,
   isArchitectReservedExecutionRole,
   loadWorkPackageExecutionContext,
+  MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS,
+  WorkPackageExecutionError,
+  type WorkPackagePriorReviewContext,
 } from './work-package-executor'
 import {
   buildRepositoryExecutionContext,
   isRepositoryAffectingWorkPackage,
-  recordScopedCommandAudit,
   runScopedRepositoryCommand,
   type RepositoryExecutionContext,
+  type ScopedCommandResult,
 } from './repository-evidence'
+import { sanitizeWorkerMessage } from './redaction'
 
 type HandoffPackage = {
   id: string
   assignedRole: string
+  blockedReason?: string | null
   harnessId: string | null
   mcpRequirements?: unknown
   metadata?: unknown
   sequence: number
   status: string
   title: string
+  updatedAt?: Date | null
 }
 
 type HandoffDependency = {
@@ -59,6 +68,55 @@ type HandoffState = {
 }
 
 type CreatedArtifact = typeof artifacts.$inferSelect
+type WorkPackageLeaseTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0]
+
+const MAX_PRIOR_REVIEW_SOURCE_ARTIFACTS = 10
+const MAX_PRIOR_REVIEW_SOURCE_ARTIFACT_BYTES = 2 * 1024
+const DEFAULT_STALE_RUNNING_PACKAGE_SECONDS = 15 * 60
+const DEFAULT_EXECUTION_LEASE_HEARTBEAT_SECONDS = 60
+
+class ExecutionLeaseLostError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ExecutionLeaseLostError'
+  }
+}
+
+type ExecutionLease = {
+  acquiredAt: string
+  attemptNumber: number
+  heartbeatAt: string
+  runId: string
+  source: 'work-package-handoff'
+  staleAfterSeconds: number
+}
+
+type HandoffOptions = {
+  claimEnabled?: boolean
+  finalAttempt?: boolean
+  staleRecoveryAttempted?: boolean
+}
+
+async function publishTaskEventBestEffort(
+  taskId: string,
+  type: Parameters<typeof publishTaskEvent>[1],
+  payload: Parameters<typeof publishTaskEvent>[2],
+): Promise<void> {
+  try {
+    await publishTaskEvent(taskId, type, payload)
+  } catch (err) {
+    const message = sanitizeWorkerMessage(err instanceof Error ? err.message : String(err))
+    console.warn(`Failed to publish task event ${type} for ${taskId}: ${message}`)
+  }
+}
+
+async function continueWorkforceAfterPackageCompletionOrThrow(
+  taskId: string,
+  packageStatus: 'awaiting_review' | 'completed' | null,
+  options: HandoffOptions,
+): Promise<WorkPackageHandoffResult | null> {
+  return continueWorkforceAfterPackageCompletion(taskId, packageStatus, options)
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -111,23 +169,55 @@ function validationContent(commandResults: Array<{ command: string[]; exitCode: 
   return lines.join('\n\n')
 }
 
+async function withExecutionLease<T>(
+  workPackageId: string,
+  runId: string,
+  write: (tx: WorkPackageLeaseTransaction) => Promise<T>,
+): Promise<T> {
+  return db.transaction(async (tx) => {
+    const [owned] = await tx
+      .update(workPackages)
+      .set({ updatedAt: new Date() })
+      .where(and(
+        eq(workPackages.id, workPackageId),
+        eq(workPackages.status, 'running'),
+        sql`${workPackages.metadata}->'executionLease'->>'runId' = ${runId}`,
+      ))
+      .returning({ id: workPackages.id })
+
+    if (!owned) {
+      throw new ExecutionLeaseLostError(`Work package execution lease for run ${runId} is no longer active.`)
+    }
+
+    return write(tx)
+  })
+}
+
 async function createPackageArtifact(input: {
   agentRunId: string
   artifactType: string
   content: string
+  executionLease?: { runId: string }
   metadata: Record<string, unknown>
   taskId: string
   workPackageId: string
 }): Promise<CreatedArtifact> {
-  const [artifact] = await db
-    .insert(artifacts)
-    .values({
+  const values = {
       agentRunId: input.agentRunId,
       artifactType: input.artifactType,
       content: input.content,
       metadata: input.metadata,
-    })
-    .returning()
+  }
+  const insertArtifact = async (tx: Pick<WorkPackageLeaseTransaction, 'insert'>) => {
+    const [artifact] = await tx
+      .insert(artifacts)
+      .values(values)
+      .returning()
+    return artifact
+  }
+  const artifact = input.executionLease
+    ? await withExecutionLease(input.workPackageId, input.executionLease.runId, insertArtifact)
+    : await insertArtifact(db)
 
   await publishTaskEvent(input.taskId, 'artifact:created', {
     id: artifact.id,
@@ -149,6 +239,7 @@ async function upsertRepositoryEvidenceRecord(input: {
   diffSummary?: string | null
   status?: string
   taskId: string
+  executionLease?: { runId: string }
   validationStatus?: string | null
   workPackageId: string
 }): Promise<string> {
@@ -167,26 +258,62 @@ async function upsertRepositoryEvidenceRecord(input: {
     workPackageId: input.workPackageId,
   }
 
-  const [existing] = await db
-    .select({ id: vcsChanges.id })
-    .from(vcsChanges)
-    .where(and(eq(vcsChanges.taskId, input.taskId), eq(vcsChanges.workPackageId, input.workPackageId)))
-    .limit(1)
+  const writeEvidence = async (tx: WorkPackageLeaseTransaction | typeof db) => {
+    const [existing] = await tx
+      .select({ id: vcsChanges.id })
+      .from(vcsChanges)
+      .where(and(eq(vcsChanges.taskId, input.taskId), eq(vcsChanges.workPackageId, input.workPackageId)))
+      .limit(1)
 
-  if (existing) {
-    const [updated] = await db
-      .update(vcsChanges)
-      .set(values)
-      .where(eq(vcsChanges.id, existing.id))
+    if (existing) {
+      const [updated] = await tx
+        .update(vcsChanges)
+        .set(values)
+        .where(eq(vcsChanges.id, existing.id))
+        .returning({ id: vcsChanges.id })
+      return updated.id
+    }
+
+    const [created] = await tx
+      .insert(vcsChanges)
+      .values(values)
       .returning({ id: vcsChanges.id })
-    return updated.id
+    return created.id
   }
 
-  const [created] = await db
-    .insert(vcsChanges)
-    .values(values)
-    .returning({ id: vcsChanges.id })
-  return created.id
+  return input.executionLease
+    ? withExecutionLease(input.workPackageId, input.executionLease.runId, writeEvidence)
+    : writeEvidence(db)
+}
+
+async function recordScopedCommandAuditWithLease(input: {
+  agentRunId: string
+  artifactId: string
+  result: ScopedCommandResult
+  runId: string
+  taskId: string
+  workPackageId: string
+}): Promise<{ id: string }> {
+  return withExecutionLease(input.workPackageId, input.runId, async (tx) => {
+    const [row] = await tx
+      .insert(repositoryCommandAudits)
+      .values({
+        agentRunId: input.agentRunId,
+        artifactId: input.artifactId,
+        argv: input.result.argv,
+        command: input.result.command,
+        cwd: input.result.cwd,
+        exitCode: input.result.exitCode,
+        finishedAt: input.result.finishedAt,
+        outputSummary: input.result.outputSummary,
+        riskClass: input.result.riskClass,
+        startedAt: input.result.startedAt,
+        taskId: input.taskId,
+        workPackageId: input.workPackageId,
+      })
+      .returning({ id: repositoryCommandAudits.id })
+    return row
+  })
 }
 
 export type WorkPackageHandoffPreview =
@@ -229,6 +356,85 @@ export function isWorkPackageExecutionEnabled(
   return raw === '1' || raw === 'true'
 }
 
+function staleRunningPackageSeconds(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = env.FORGE_RUNNING_WORK_PACKAGE_STALE_SECONDS?.trim()
+  if (!raw) return DEFAULT_STALE_RUNNING_PACKAGE_SECONDS
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_STALE_RUNNING_PACKAGE_SECONDS
+}
+
+function executionLeaseHeartbeatSeconds(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = env.FORGE_EXECUTION_LEASE_HEARTBEAT_SECONDS?.trim()
+  if (!raw) return DEFAULT_EXECUTION_LEASE_HEARTBEAT_SECONDS
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_EXECUTION_LEASE_HEARTBEAT_SECONDS
+}
+
+function staleRunningPackageCutoff(now = new Date()): Date {
+  return new Date(now.getTime() - staleRunningPackageSeconds() * 1000)
+}
+
+function executionLeaseFromMetadata(metadata: unknown): ExecutionLease | null {
+  if (!isRecord(metadata) || !isRecord(metadata.executionLease)) return null
+  const lease = metadata.executionLease
+  if (
+    typeof lease.runId !== 'string' ||
+    typeof lease.attemptNumber !== 'number' ||
+    typeof lease.acquiredAt !== 'string' ||
+    typeof lease.heartbeatAt !== 'string'
+  ) {
+    return null
+  }
+  return {
+    acquiredAt: lease.acquiredAt,
+    attemptNumber: lease.attemptNumber,
+    heartbeatAt: lease.heartbeatAt,
+    runId: lease.runId,
+    source: 'work-package-handoff',
+    staleAfterSeconds: typeof lease.staleAfterSeconds === 'number'
+      ? lease.staleAfterSeconds
+      : staleRunningPackageSeconds(),
+  }
+}
+
+function metadataWithoutExecutionLease(metadata: unknown): Record<string, unknown> {
+  const clean = { ...(isRecord(metadata) ? metadata : {}) }
+  delete clean.executionLease
+  return clean
+}
+
+function executionLeaseMetadata(input: {
+  attemptNumber: number
+  metadata: unknown
+  now: Date
+  runId: string
+}): Record<string, unknown> {
+  return {
+    ...metadataWithoutExecutionLease(input.metadata),
+    executionLease: {
+      acquiredAt: input.now.toISOString(),
+      attemptNumber: input.attemptNumber,
+      heartbeatAt: input.now.toISOString(),
+      runId: input.runId,
+      source: 'work-package-handoff',
+      staleAfterSeconds: staleRunningPackageSeconds(),
+    } satisfies ExecutionLease,
+  }
+}
+
+function isStaleRunningPackage(pkg: HandoffPackage, now = new Date()): boolean {
+  if (pkg.status !== 'running') return false
+  const lease = executionLeaseFromMetadata(pkg.metadata)
+  const heartbeatAt = lease ? new Date(lease.heartbeatAt) : pkg.updatedAt
+  return heartbeatAt instanceof Date &&
+    Number.isFinite(heartbeatAt.getTime()) &&
+    heartbeatAt.getTime() <= staleRunningPackageCutoff(now).getTime()
+}
+
 export function computeReadyWorkPackageIds(
   packages: HandoffPackage[],
   dependencies: HandoffDependency[],
@@ -262,12 +468,14 @@ async function loadHandoffState(taskId: string): Promise<HandoffState> {
     .select({
       id: workPackages.id,
       assignedRole: workPackages.assignedRole,
+      blockedReason: workPackages.blockedReason,
       harnessId: workPackages.harnessId,
       mcpRequirements: workPackages.mcpRequirements,
       metadata: workPackages.metadata,
       sequence: workPackages.sequence,
       status: workPackages.status,
       title: workPackages.title,
+      updatedAt: workPackages.updatedAt,
     })
     .from(workPackages)
     .where(eq(workPackages.taskId, taskId))
@@ -316,6 +524,174 @@ async function loadTaskProjectForMcpBroker(taskId: string) {
     .limit(1)
 
   return row?.project ?? null
+}
+
+async function recoverStaleRunningPackage(taskId: string, pkg: HandoffPackage): Promise<boolean> {
+  if (!isStaleRunningPackage(pkg)) return false
+
+  const recoveredAt = new Date()
+  const cutoff = staleRunningPackageCutoff(recoveredAt)
+  const blockedReason = `Recovered stale running work package "${pkg.title}" after the worker lost its execution lease. The next handoff retry will start a new attempt.`
+  const metadata = {
+    ...metadataWithoutExecutionLease(pkg.metadata),
+    staleRunningRecovery: {
+      recoveredAt: recoveredAt.toISOString(),
+      reason: blockedReason,
+      source: 'work-package-handoff',
+      staleAfterSeconds: staleRunningPackageSeconds(),
+      status: 'blocked',
+    },
+  }
+  const lease = executionLeaseFromMetadata(pkg.metadata)
+  const [run] = await db
+    .select({
+      attemptNumber: agentRuns.attemptNumber,
+      id: agentRuns.id,
+      stage: agentRuns.stage,
+    })
+    .from(agentRuns)
+    .where(
+      and(
+        eq(agentRuns.taskId, taskId),
+        eq(agentRuns.workPackageId, pkg.id),
+        eq(agentRuns.status, 'running'),
+        ...(lease ? [eq(agentRuns.id, lease.runId)] : []),
+      ),
+    )
+    .orderBy(desc(agentRuns.startedAt), desc(agentRuns.createdAt))
+    .limit(1)
+
+  const [recovered] = await db
+    .update(workPackages)
+    .set({
+      blockedReason,
+      metadata,
+      status: 'blocked',
+      updatedAt: recoveredAt,
+    })
+    .where(and(
+      eq(workPackages.id, pkg.id),
+      eq(workPackages.status, 'running'),
+      lte(workPackages.updatedAt, cutoff),
+      ...(lease ? [sql`${workPackages.metadata}->'executionLease'->>'runId' = ${lease.runId}`] : []),
+    ))
+    .returning({ id: workPackages.id })
+
+  if (!recovered) return false
+
+  if (run) {
+    await db
+      .update(agentRuns)
+      .set({
+        completedAt: recoveredAt,
+        errorMessage: blockedReason,
+        status: 'failed',
+      })
+      .where(and(eq(agentRuns.id, run.id), eq(agentRuns.status, 'running')))
+
+    await publishTaskEvent(taskId, 'run:failed', {
+      attemptNumber: run.attemptNumber,
+      errorMessage: blockedReason,
+      runId: run.id,
+      stage: run.stage,
+      workPackageId: pkg.id,
+    })
+  }
+
+  await publishTaskEvent(taskId, 'work_package:status', {
+    blockedReason,
+    staleRunningRecovery: metadata.staleRunningRecovery,
+    status: 'blocked',
+    updatedAt: recoveredAt.toISOString(),
+    workPackageId: pkg.id,
+  })
+
+  return true
+}
+
+async function executionLeaseOwned(workPackageId: string, runId: string): Promise<boolean> {
+  const [pkg] = await db
+    .select({
+      metadata: workPackages.metadata,
+      status: workPackages.status,
+    })
+    .from(workPackages)
+    .where(eq(workPackages.id, workPackageId))
+    .limit(1)
+
+  return pkg?.status === 'running' && executionLeaseFromMetadata(pkg.metadata)?.runId === runId
+}
+
+async function assertExecutionLeaseOwned(workPackageId: string, runId: string): Promise<void> {
+  if (await executionLeaseOwned(workPackageId, runId)) return
+  throw new ExecutionLeaseLostError(`Work package execution lease for run ${runId} is no longer active.`)
+}
+
+function startExecutionLeaseHeartbeat(input: {
+  attemptNumber: number
+  runId: string
+  taskId: string
+  workPackageId: string
+}): { stop: () => void } {
+  const heartbeatMs = executionLeaseHeartbeatSeconds() * 1000
+  const beat = async () => {
+    const heartbeatAt = new Date()
+    await db
+      .update(workPackages)
+      .set({
+        metadata: sql`jsonb_set(${workPackages.metadata}, '{executionLease,heartbeatAt}', to_jsonb(${heartbeatAt.toISOString()}::text), true)`,
+        updatedAt: heartbeatAt,
+      })
+      .where(and(
+        eq(workPackages.id, input.workPackageId),
+        eq(workPackages.status, 'running'),
+        sql`${workPackages.metadata}->'executionLease'->>'runId' = ${input.runId}`,
+      ))
+  }
+  const timer = setInterval(() => {
+    beat().catch((err) => {
+      const message = sanitizeWorkerMessage(err instanceof Error ? err.message : String(err))
+      console.warn(`Failed to heartbeat work package lease ${input.workPackageId}: ${message}`)
+    })
+  }, heartbeatMs)
+  timer.unref?.()
+  return {
+    stop: () => clearInterval(timer),
+  }
+}
+
+async function abandonLostExecutionLease(input: {
+  attemptNumber: number
+  readyPackageIds: string[]
+  runId: string
+  taskId: string
+  workPackageId: string
+}): Promise<WorkPackageHandoffResult> {
+  const failedAt = new Date()
+  const message = `Work package execution lease for run ${input.runId} is no longer active; ignoring stale completion.`
+  const [updatedRun] = await db
+    .update(agentRuns)
+    .set({
+      completedAt: failedAt,
+      errorMessage: message,
+      status: 'failed',
+    })
+    .where(and(eq(agentRuns.id, input.runId), eq(agentRuns.status, 'running')))
+    .returning({ id: agentRuns.id })
+  if (updatedRun) {
+    await publishTaskEvent(input.taskId, 'run:failed', {
+      attemptNumber: input.attemptNumber,
+      errorMessage: message,
+      runId: input.runId,
+      stage: 'implementation',
+      workPackageId: input.workPackageId,
+    })
+  }
+  return {
+    status: 'already_handed_off',
+    readyPackageIds: input.readyPackageIds,
+    claimedPackageId: input.workPackageId,
+  }
 }
 
 async function failWorkPackageForMcpBroker(input: {
@@ -414,6 +790,140 @@ async function failWorkPackageForReservedRole(input: {
   return { blockedReason: input.blockedReason, status: 'blocked', terminalBlock: true }
 }
 
+function numericAttemptNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : 0
+}
+
+async function nextImplementationAttemptNumber(taskId: string, workPackageId: string): Promise<number> {
+  const priorRuns = await db
+    .select({ attemptNumber: agentRuns.attemptNumber })
+    .from(agentRuns)
+    .where(
+      and(
+        eq(agentRuns.taskId, taskId),
+        eq(agentRuns.workPackageId, workPackageId),
+        eq(agentRuns.stage, 'implementation'),
+        isNotNull(agentRuns.attemptNumber),
+      ),
+    )
+    .orderBy(desc(agentRuns.attemptNumber))
+
+  const maxPriorAttempt = priorRuns.reduce(
+    (max, run) => Math.max(max, numericAttemptNumber(run.attemptNumber)),
+    0,
+  )
+  return maxPriorAttempt + 1
+}
+
+function attemptLimitFailureDetails(input: {
+  attemptNumber: number
+  pkg: HandoffPackage
+}): {
+  blockedReason: string
+  failedAt: Date
+  metadata: Record<string, unknown>
+} {
+  const failedAt = new Date()
+  const blockedReason = `Work package "${input.pkg.title}" exceeded the maximum of ${MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS} implementation attempts.`
+  const metadata = {
+    ...(isRecord(input.pkg.metadata) ? input.pkg.metadata : {}),
+    executionAttempts: {
+      attemptedAt: failedAt.toISOString(),
+      maxAttempts: MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS,
+      nextAttemptNumber: input.attemptNumber,
+      reason: blockedReason,
+      source: 'work-package-handoff',
+      status: 'failed',
+    },
+  }
+
+  return { blockedReason, failedAt, metadata }
+}
+
+function cleanReviewReason(value: unknown): string {
+  if (typeof value !== 'string') return ''
+  return value.trim().replace(/\s+/g, ' ').slice(0, 1000)
+}
+
+function cleanPriorReviewSourceArtifactContent(value: unknown): string {
+  if (typeof value !== 'string') return ''
+  const normalized = value
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim()
+  if (normalized === '') return ''
+  return normalized.slice(0, MAX_PRIOR_REVIEW_SOURCE_ARTIFACT_BYTES)
+}
+
+async function loadPriorReviewContext(
+  taskId: string,
+  pkg: HandoffPackage,
+): Promise<WorkPackagePriorReviewContext> {
+  const rows = await db
+    .select({
+      id: approvalGates.id,
+      gateType: approvalGates.gateType,
+      metadata: approvalGates.metadata,
+      sourceArtifactId: approvalGates.sourceArtifactId,
+      status: approvalGates.status,
+    })
+    .from(approvalGates)
+    .where(
+      and(
+        eq(approvalGates.taskId, taskId),
+        eq(approvalGates.workPackageId, pkg.id),
+        inArray(approvalGates.gateType, [...REVIEW_GATE_TYPES]),
+      ),
+    )
+    .orderBy(desc(approvalGates.createdAt))
+    .limit(10)
+
+  const sourceArtifactIds = [...new Set(rows
+    .map((row) => row.sourceArtifactId)
+    .filter((id): id is string => typeof id === 'string' && id.trim() !== '')
+  )].slice(0, MAX_PRIOR_REVIEW_SOURCE_ARTIFACTS)
+  const sourceArtifactRows = sourceArtifactIds.length === 0
+    ? []
+    : await db
+      .select({
+        content: artifacts.content,
+        id: artifacts.id,
+      })
+      .from(artifacts)
+      .where(inArray(artifacts.id, sourceArtifactIds))
+  const sourceArtifactContentById = new Map(
+    sourceArtifactRows.map((artifact) => [
+      artifact.id,
+      cleanPriorReviewSourceArtifactContent(artifact.content),
+    ]),
+  )
+
+  return {
+    packageBlockedReason: pkg.blockedReason ?? null,
+    notes: rows
+      .map((row) => {
+        const metadata = isRecord(row.metadata) ? row.metadata : {}
+        const reason = cleanReviewReason(metadata.decisionReason ?? metadata.cancelledReason)
+        const sourceArtifactContent = row.sourceArtifactId
+          ? sourceArtifactContentById.get(row.sourceArtifactId) ?? ''
+          : ''
+        return {
+          gateId: row.id,
+          gateType: row.gateType,
+          reason: [
+            reason,
+            sourceArtifactContent
+              ? `Reviewed source artifact excerpt:\n${sourceArtifactContent}`
+              : '',
+          ].filter((line) => line !== '').join('\n'),
+          sourceArtifactId: row.sourceArtifactId,
+          status: row.status,
+        }
+      })
+      .filter((note) => note.reason !== '' || note.status === 'needs_rework'),
+  }
+}
+
 async function assertWorkPackageMcpBrokerAllowsHandoff(
   taskId: string,
   pkg: HandoffPackage,
@@ -486,7 +996,7 @@ async function assertWorkPackageAllowsHandoff(
 
 export async function progressWorkforce(
   taskId: string,
-  options: { claimEnabled?: boolean } = {},
+  options: HandoffOptions = {},
 ): Promise<WorkPackageHandoffResult> {
   const result = await handoffApprovedWorkPackages(taskId, options)
   if (result.status === 'blocked' && result.terminalBlock) {
@@ -505,10 +1015,13 @@ export async function progressWorkforce(
 async function continueWorkforceAfterPackageCompletion(
   taskId: string,
   packageStatus: string | null | undefined,
-  options: { claimEnabled?: boolean },
-): Promise<void> {
-  if (packageStatus !== 'completed') return
-  await progressWorkforce(taskId, options)
+  options: HandoffOptions,
+): Promise<WorkPackageHandoffResult | null> {
+  if (packageStatus !== 'completed') return null
+  const result = await progressWorkforce(taskId, options)
+  return result.status === 'no_ready_packages' || result.status === 'no_work_packages'
+    ? null
+    : result
 }
 
 export async function previewWorkPackageHandoff(taskId: string): Promise<WorkPackageHandoffPreview> {
@@ -543,9 +1056,18 @@ export async function previewWorkPackageHandoff(taskId: string): Promise<WorkPac
 
 export async function handoffApprovedWorkPackages(
   taskId: string,
-  options: { claimEnabled?: boolean } = {},
+  options: HandoffOptions = {},
 ): Promise<WorkPackageHandoffResult> {
   const state = await loadHandoffState(taskId)
+  if (state.alreadyRunningPackage && !options.staleRecoveryAttempted) {
+    const recovered = await recoverStaleRunningPackage(taskId, state.alreadyRunningPackage)
+    if (recovered) {
+      return handoffApprovedWorkPackages(taskId, {
+        ...options,
+        staleRecoveryAttempted: true,
+      })
+    }
+  }
 
   if (state.packages.length === 0) {
     return { status: 'no_work_packages', readyPackageIds: [], claimedPackageId: null }
@@ -629,7 +1151,10 @@ export async function handoffApprovedWorkPackages(
   )
 
   if (isWorkPackageExecutionEnabled()) {
-    return executeReadyWorkPackage(taskId, nextPackage, allowedReadyPackageIds, { claimEnabled })
+    return executeReadyWorkPackage(taskId, nextPackage, allowedReadyPackageIds, {
+      claimEnabled,
+      finalAttempt: options.finalAttempt,
+    })
   }
 
   const handoffStartedAt = new Date()
@@ -640,14 +1165,21 @@ export async function handoffApprovedWorkPackages(
     'Repository writes and specialist model execution are disabled for this handoff slice.',
   ].join('\n')
   const handoffArtifactMetadata = {
+    hostRepositoryWrites: false,
     repositoryWrites: false,
+    sandboxWrites: false,
     source: 'work-package-handoff',
     workPackageId: nextPackage.id,
   }
   const handoff = await db.transaction(async (tx) => {
     const [claimed] = await tx
       .update(workPackages)
-      .set({ status: 'running', blockedReason: null, updatedAt: new Date() })
+      .set({
+        status: 'running',
+        blockedReason: null,
+        metadata: metadataWithoutExecutionLease(nextPackage.metadata),
+        updatedAt: handoffStartedAt,
+      })
       .where(and(eq(workPackages.id, nextPackage.id), eq(workPackages.status, 'ready')))
       .returning({ id: workPackages.id })
 
@@ -663,23 +1195,25 @@ export async function handoffApprovedWorkPackages(
         stage: 'handoff',
         attemptNumber: 1,
         modelIdUsed: 'forge-handoff/no-op',
-        status: 'completed',
+        status: 'running',
         startedAt: handoffStartedAt,
-        completedAt: handoffCompletedAt,
       })
       .returning()
 
-    const [artifact] = await tx
-      .insert(artifacts)
-      .values({
-        agentRunId: run.id,
-        artifactType: 'log_output',
-        content: handoffArtifactContent,
-        metadata: handoffArtifactMetadata,
+    await tx
+      .update(workPackages)
+      .set({
+        metadata: executionLeaseMetadata({
+          attemptNumber: 1,
+          metadata: nextPackage.metadata,
+          now: handoffStartedAt,
+          runId: run.id,
+        }),
+        updatedAt: handoffStartedAt,
       })
-      .returning()
+      .where(and(eq(workPackages.id, nextPackage.id), eq(workPackages.status, 'running')))
 
-    return { artifact, run }
+    return { run }
   })
 
   if (!handoff) {
@@ -691,28 +1225,48 @@ export async function handoffApprovedWorkPackages(
   }
 
   await publishTaskEvent(taskId, 'run:started', {
+    attemptNumber: 1,
     agentType: 'handoff',
     runId: handoff.run.id,
     stage: 'handoff',
     workPackageId: nextPackage.id,
   })
-  await publishTaskEvent(taskId, 'artifact:created', {
-    id: handoff.artifact.id,
-    artifactId: handoff.artifact.id,
-    agentRunId: handoff.artifact.agentRunId,
-    artifactType: handoff.artifact.artifactType,
-    content: handoff.artifact.content,
-    metadata: handoff.artifact.metadata,
-    createdAt: handoff.artifact.createdAt,
-    workPackageId: nextPackage.id,
-  })
   const reviewGates = await materializeReviewGatesForWorkPackageCompletion({
+    completeSourceRun: {
+      artifactType: 'log_output',
+      completedAt: handoffCompletedAt,
+      content: handoffArtifactContent,
+      metadata: handoffArtifactMetadata,
+    },
+    requireExecutionLease: true,
     sourceAgentRunId: handoff.run.id,
-    sourceArtifactId: handoff.artifact.id,
+    sourceArtifactId: null,
     taskId,
     workPackageId: nextPackage.id,
   })
+  if (reviewGates.status === 'not_owned') {
+    return abandonLostExecutionLease({
+      attemptNumber: 1,
+      readyPackageIds: allowedReadyPackageIds,
+      runId: handoff.run.id,
+      taskId,
+      workPackageId: nextPackage.id,
+    })
+  }
+  const handoffArtifact = reviewGates.sourceArtifact
+  if (!handoffArtifact) throw new Error('No-op handoff completion did not create a source artifact.')
+  await publishTaskEvent(taskId, 'artifact:created', {
+    id: handoffArtifact.id,
+    artifactId: handoffArtifact.id,
+    agentRunId: handoffArtifact.agentRunId,
+    artifactType: handoffArtifact.artifactType,
+    content: handoffArtifact.content,
+    metadata: handoffArtifact.metadata,
+    createdAt: handoffArtifact.createdAt,
+    workPackageId: nextPackage.id,
+  })
   await publishTaskEvent(taskId, 'run:completed', {
+    attemptNumber: 1,
     runId: handoff.run.id,
     stage: 'handoff',
     status: 'completed',
@@ -721,9 +1275,11 @@ export async function handoffApprovedWorkPackages(
 
   await publishTaskEvent(taskId, 'work_package:handoff', {
     assignedRole: nextPackage.assignedRole,
+    hostRepositoryWrites: false,
     harnessId: nextPackage.harnessId,
     repositoryWrites: false,
     runId: handoff.run.id,
+    sandboxWrites: false,
     stage: 'handoff',
     status: reviewGates.packageStatus ?? 'running',
     title: nextPackage.title,
@@ -731,9 +1287,11 @@ export async function handoffApprovedWorkPackages(
     workPackageId: nextPackage.id,
   })
 
-  await continueWorkforceAfterPackageCompletion(taskId, reviewGates.packageStatus, {
+  const continuation = await continueWorkforceAfterPackageCompletion(taskId, reviewGates.packageStatus, {
     claimEnabled,
+    finalAttempt: options.finalAttempt,
   })
+  if (continuation) return continuation
 
   return {
     status: 'handed_off',
@@ -764,15 +1322,76 @@ async function executeReadyWorkPackage(
   taskId: string,
   nextPackage: HandoffPackage,
   readyPackageIds: string[],
-  options: { claimEnabled?: boolean } = {},
+  options: HandoffOptions = {},
 ): Promise<WorkPackageHandoffResult> {
-  const [claimed] = await db
-    .update(workPackages)
-    .set({ status: 'running', blockedReason: null, updatedAt: new Date() })
-    .where(and(eq(workPackages.id, nextPackage.id), eq(workPackages.status, 'ready')))
-    .returning({ id: workPackages.id })
+  const attemptNumber = await nextImplementationAttemptNumber(taskId, nextPackage.id)
+  const claimedAt = new Date()
+  const claim = await db.transaction(async (tx) => {
+    const [claimed] = await tx
+      .update(workPackages)
+      .set({
+        status: 'running',
+        blockedReason: null,
+        metadata: metadataWithoutExecutionLease(nextPackage.metadata),
+        updatedAt: claimedAt,
+      })
+      .where(and(eq(workPackages.id, nextPackage.id), eq(workPackages.status, 'ready')))
+      .returning({ id: workPackages.id })
 
-  if (!claimed) {
+    if (!claimed) return { status: 'already_handed_off' as const }
+
+    if (attemptNumber > MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS) {
+      const attemptLimit = attemptLimitFailureDetails({ attemptNumber, pkg: nextPackage })
+      const [failedPackage] = await tx
+        .update(workPackages)
+        .set({
+          blockedReason: attemptLimit.blockedReason,
+          metadata: attemptLimit.metadata,
+          status: 'failed',
+          updatedAt: attemptLimit.failedAt,
+        })
+        .where(and(eq(workPackages.id, nextPackage.id), eq(workPackages.status, 'running')))
+        .returning({ id: workPackages.id })
+
+      return {
+        ...attemptLimit,
+        failedPackageId: failedPackage?.id ?? null,
+        status: 'attempt_limit' as const,
+      }
+    }
+
+    const [run] = await tx
+      .insert(agentRuns)
+      .values({
+        taskId,
+        workPackageId: nextPackage.id,
+        harnessId: nextPackage.harnessId,
+        agentType: nextPackage.assignedRole,
+        stage: 'implementation',
+        attemptNumber,
+        modelIdUsed: 'pending',
+        status: 'running',
+        startedAt: claimedAt,
+      })
+      .returning()
+
+    await tx
+      .update(workPackages)
+      .set({
+        metadata: executionLeaseMetadata({
+          attemptNumber,
+          metadata: nextPackage.metadata,
+          now: claimedAt,
+          runId: run.id,
+        }),
+        updatedAt: claimedAt,
+      })
+      .where(and(eq(workPackages.id, nextPackage.id), eq(workPackages.status, 'running')))
+
+    return { run, status: 'claimed' as const }
+  })
+
+  if (claim.status === 'already_handed_off') {
     return {
       status: 'already_handed_off',
       readyPackageIds,
@@ -780,7 +1399,41 @@ async function executeReadyWorkPackage(
     }
   }
 
-  await publishTaskEvent(taskId, 'work_package:status', {
+  if (claim.status === 'attempt_limit') {
+    if (claim.failedPackageId) {
+      await publishTaskEvent(taskId, 'work_package:status', {
+        blockedReason: claim.blockedReason,
+        executionAttempts: {
+          maxAttempts: MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS,
+          nextAttemptNumber: attemptNumber,
+          status: 'failed',
+        },
+        status: 'failed',
+        updatedAt: claim.failedAt.toISOString(),
+        workPackageId: nextPackage.id,
+      })
+    }
+    await updateTaskStatusIfCurrent(taskId, 'running', 'failed', claim.blockedReason)
+    await updateTaskStatusIfCurrent(taskId, 'approved', 'failed', claim.blockedReason)
+    return {
+      blockedReason: claim.blockedReason,
+      claimedPackageId: null,
+      readyPackageIds: [],
+      status: 'blocked',
+      terminalBlock: true,
+    }
+  }
+
+  const run = claim.run
+  const heartbeat = startExecutionLeaseHeartbeat({
+    attemptNumber,
+    runId: run.id,
+    taskId,
+    workPackageId: nextPackage.id,
+  })
+
+  try {
+  await publishTaskEventBestEffort(taskId, 'work_package:status', {
     status: 'running',
     updatedAt: new Date().toISOString(),
     workPackageId: nextPackage.id,
@@ -790,41 +1443,84 @@ async function executeReadyWorkPackage(
   try {
     context = await loadWorkPackageExecutionContext(taskId, nextPackage.id)
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
+    if (!(await executionLeaseOwned(nextPackage.id, run.id))) {
+      heartbeat.stop()
+      return abandonLostExecutionLease({
+        attemptNumber,
+        readyPackageIds,
+        runId: run.id,
+        taskId,
+        workPackageId: nextPackage.id,
+      })
+    }
+    const message = sanitizeWorkerMessage(err instanceof Error ? err.message : String(err))
     const failedAt = new Date()
-    await db
+    const finalAttempt = options.finalAttempt ?? true
+    const packageStatus = finalAttempt ? 'failed' : 'blocked'
+    const blockedReason = finalAttempt
+      ? message
+      : `Retrying package execution after error: ${message}`
+    const [failedPackage] = await db
       .update(workPackages)
       .set({
-        blockedReason: message,
-        status: 'failed',
+        blockedReason,
+        metadata: metadataWithoutExecutionLease(nextPackage.metadata),
+        status: packageStatus,
         updatedAt: failedAt,
       })
-      .where(eq(workPackages.id, nextPackage.id))
-    await publishTaskEvent(taskId, 'work_package:status', {
-      blockedReason: message,
-      status: 'failed',
+      .where(and(
+        eq(workPackages.id, nextPackage.id),
+        eq(workPackages.status, 'running'),
+        sql`${workPackages.metadata}->'executionLease'->>'runId' = ${run.id}`,
+      ))
+      .returning({ id: workPackages.id })
+    if (!failedPackage) {
+      heartbeat.stop()
+      return abandonLostExecutionLease({
+        attemptNumber,
+        readyPackageIds,
+        runId: run.id,
+        taskId,
+        workPackageId: nextPackage.id,
+      })
+    }
+    await publishTaskEventBestEffort(taskId, 'work_package:status', {
+      blockedReason,
+      status: packageStatus,
       updatedAt: failedAt.toISOString(),
       workPackageId: nextPackage.id,
     })
+    await db
+      .update(agentRuns)
+      .set({
+        completedAt: failedAt,
+        errorMessage: message,
+        status: 'failed',
+      })
+      .where(eq(agentRuns.id, run.id))
+    await publishTaskEventBestEffort(taskId, 'run:failed', {
+      attemptNumber,
+      errorMessage: message,
+      runId: run.id,
+      stage: 'implementation',
+      workPackageId: nextPackage.id,
+    })
+    heartbeat.stop()
     throw err
   }
-  const startedAt = new Date()
-  const [run] = await db
-    .insert(agentRuns)
-    .values({
-      taskId,
-      workPackageId: nextPackage.id,
-      harnessId: nextPackage.harnessId,
-      agentType: nextPackage.assignedRole,
-      stage: 'implementation',
-      attemptNumber: 1,
-      modelIdUsed: context.modelIdUsed,
-      status: 'running',
-      startedAt,
-    })
-    .returning()
 
-  await publishTaskEvent(taskId, 'run:started', {
+  try {
+    await db
+      .update(agentRuns)
+      .set({ modelIdUsed: context.modelIdUsed })
+      .where(eq(agentRuns.id, run.id))
+  } catch (err) {
+    heartbeat.stop()
+    throw err
+  }
+
+  await publishTaskEventBestEffort(taskId, 'run:started', {
+    attemptNumber,
     agentType: nextPackage.assignedRole,
     runId: run.id,
     stage: 'implementation',
@@ -833,7 +1529,9 @@ async function executeReadyWorkPackage(
 
   let repositoryContext: RepositoryExecutionContext | null = null
   let repositoryAffecting = false
+  let executionLeaseReleased = false
   let validationStatusForPackage: string | null = null
+  const assertActiveExecutionLease = () => assertExecutionLeaseOwned(nextPackage.id, run.id)
 
   try {
     repositoryAffecting = isRepositoryAffectingWorkPackage(context.workPackage)
@@ -845,9 +1543,11 @@ async function executeReadyWorkPackage(
         workPackage: context.workPackage,
       })
 
+      await assertActiveExecutionLease()
       await upsertRepositoryEvidenceRecord({
         agentRunId: run.id,
         context: repositoryContext,
+        executionLease: { runId: run.id },
         taskId,
         workPackageId: nextPackage.id,
       })
@@ -856,6 +1556,7 @@ async function executeReadyWorkPackage(
         agentRunId: run.id,
         artifactType: 'log_output',
         content: repositoryReadinessContent(repositoryContext),
+        executionLease: { runId: run.id },
         metadata: {
           ...repositoryContextMetadata(repositoryContext),
           artifactKind: 'repository_readiness_summary',
@@ -871,10 +1572,31 @@ async function executeReadyWorkPackage(
       }
     }
 
-    const execution = await executeWorkPackage(context)
+    const priorReviewContext = await loadPriorReviewContext(taskId, nextPackage)
+    const execution = await executeWorkPackage({
+      ...context,
+      attemptNumber,
+      priorReviewContext,
+    })
     let diffSummary: string | null = null
 
+    await createPackageArtifact({
+      agentRunId: run.id,
+      artifactType: 'log_output',
+      content: execution.executionContextArtifactContent,
+      executionLease: { runId: run.id },
+      metadata: {
+        ...execution.executionContextArtifactMetadata,
+        attemptNumber,
+        source: 'execution-context-packet',
+        workPackageId: nextPackage.id,
+      },
+      taskId,
+      workPackageId: nextPackage.id,
+    })
+
     if (repositoryAffecting && repositoryContext?.projectLocalPath) {
+      await assertActiveExecutionLease()
       const diffResult = await runScopedRepositoryCommand({
         cwd: repositoryContext.projectLocalPath,
         command: 'git',
@@ -885,6 +1607,7 @@ async function executeReadyWorkPackage(
         agentRunId: run.id,
         artifactType: 'file_diff',
         content: diffSummary,
+        executionLease: { runId: run.id },
         metadata: {
           artifactKind: 'repository_diff_summary',
           command: ['git', 'diff', '--stat', 'HEAD', '--'],
@@ -896,12 +1619,13 @@ async function executeReadyWorkPackage(
         taskId,
         workPackageId: nextPackage.id,
       })
-      await recordScopedCommandAudit({
+      await recordScopedCommandAuditWithLease({
         result: diffResult,
         taskId,
         workPackageId: nextPackage.id,
         agentRunId: run.id,
         artifactId: diffArtifact.id,
+        runId: run.id,
       })
     }
 
@@ -920,6 +1644,7 @@ async function executeReadyWorkPackage(
         agentRunId: run.id,
         artifactType: 'test_report',
         content: validationContent(execution.commandResults),
+        executionLease: { runId: run.id },
         metadata: {
           artifactKind: 'validation_output_summary',
           source: 'work-package-executor',
@@ -933,6 +1658,7 @@ async function executeReadyWorkPackage(
         agentRunId: run.id,
         artifactType: 'log_output',
         content: `Final validation status: ${validationStatus}`,
+        executionLease: { runId: run.id },
         metadata: {
           artifactKind: 'final_validation_status',
           source: 'repository-evidence',
@@ -947,6 +1673,7 @@ async function executeReadyWorkPackage(
         agentRunId: run.id,
         context: { ...repositoryContext, status: repositoryEvidenceStatus },
         diffSummary,
+        executionLease: { runId: run.id },
         status: repositoryEvidenceStatus,
         taskId,
         validationStatus,
@@ -958,27 +1685,44 @@ async function executeReadyWorkPackage(
       throw new Error('Repository-affecting package did not run validation commands; review or revise the execution plan before continuing.')
     }
 
-    const completedAt = new Date()
-    await db
-      .update(agentRuns)
-      .set({ completedAt, status: 'completed' })
-      .where(eq(agentRuns.id, run.id))
+    await assertActiveExecutionLease()
 
-    const [artifact] = await db
-      .insert(artifacts)
-      .values({
-        agentRunId: run.id,
+    const completedAt = new Date()
+    const reviewGates = await materializeReviewGatesForWorkPackageCompletion({
+      completeSourceRun: {
         artifactType: 'log_output',
+        completedAt,
         content: execution.artifactContent,
         metadata: {
           ...execution.artifactMetadata,
+          attemptNumber,
           source: 'work-package-executor',
           workPackageId: nextPackage.id,
         },
-      })
-      .returning()
+      },
+      requireExecutionLease: true,
+      sourceAgentRunId: run.id,
+      sourceArtifactId: null,
+      taskId,
+      workPackageId: nextPackage.id,
+    })
 
-    await publishTaskEvent(taskId, 'artifact:created', {
+    if (reviewGates.status === 'not_owned') {
+      heartbeat.stop()
+      return abandonLostExecutionLease({
+        attemptNumber,
+        readyPackageIds,
+        runId: run.id,
+        taskId,
+        workPackageId: nextPackage.id,
+      })
+    }
+    const artifact = reviewGates.sourceArtifact
+    if (!artifact) throw new Error('Work package completion did not create a source artifact.')
+    executionLeaseReleased = true
+    heartbeat.stop()
+
+    await publishTaskEventBestEffort(taskId, 'artifact:created', {
       id: artifact.id,
       artifactId: artifact.id,
       agentRunId: artifact.agentRunId,
@@ -989,26 +1733,22 @@ async function executeReadyWorkPackage(
       workPackageId: nextPackage.id,
     })
 
-    const reviewGates = await materializeReviewGatesForWorkPackageCompletion({
-      sourceAgentRunId: run.id,
-      sourceArtifactId: artifact.id,
-      taskId,
-      workPackageId: nextPackage.id,
-    })
-
-    await publishTaskEvent(taskId, 'run:completed', {
+    await publishTaskEventBestEffort(taskId, 'run:completed', {
+      attemptNumber,
       runId: run.id,
       stage: 'implementation',
       status: 'completed',
       workPackageId: nextPackage.id,
     })
 
-    await publishTaskEvent(taskId, 'work_package:handoff', {
+    await publishTaskEventBestEffort(taskId, 'work_package:handoff', {
       assignedRole: nextPackage.assignedRole,
+      hostRepositoryWrites: false,
       harnessId: nextPackage.harnessId,
-      repositoryWrites: true,
+      repositoryWrites: false,
       runId: run.id,
       sandboxPath: execution.sandboxPath,
+      sandboxWrites: execution.fileCount > 0,
       stage: 'implementation',
       status: reviewGates.packageStatus ?? 'running',
       title: nextPackage.title,
@@ -1016,7 +1756,8 @@ async function executeReadyWorkPackage(
       workPackageId: nextPackage.id,
     })
 
-    await continueWorkforceAfterPackageCompletion(taskId, reviewGates.packageStatus, options)
+    const continuation = await continueWorkforceAfterPackageCompletionOrThrow(taskId, reviewGates.packageStatus, options)
+    if (continuation) return continuation
 
     return {
       status: 'handed_off',
@@ -1024,8 +1765,54 @@ async function executeReadyWorkPackage(
       claimedPackageId: nextPackage.id,
     }
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
+    if (!executionLeaseReleased && (err instanceof ExecutionLeaseLostError || !(await executionLeaseOwned(nextPackage.id, run.id)))) {
+      heartbeat.stop()
+      return abandonLostExecutionLease({
+        attemptNumber,
+        readyPackageIds,
+        runId: run.id,
+        taskId,
+        workPackageId: nextPackage.id,
+      })
+    }
+    if (executionLeaseReleased) {
+      heartbeat.stop()
+      throw err
+    }
+    const message = sanitizeWorkerMessage(err instanceof Error ? err.message : String(err))
+    const executionFailureDetails = err instanceof WorkPackageExecutionError
+      ? err.failureDetails
+      : null
     const failedAt = new Date()
+    const finalAttempt = options.finalAttempt ?? true
+    const packageStatus = finalAttempt ? 'failed' : 'blocked'
+    const blockedReason = finalAttempt
+      ? message
+      : `Retrying package execution after error: ${message}`
+    const [failedPackage] = await db
+      .update(workPackages)
+      .set({
+        blockedReason,
+        metadata: metadataWithoutExecutionLease(nextPackage.metadata),
+        status: packageStatus,
+        updatedAt: failedAt,
+      })
+      .where(and(
+        eq(workPackages.id, nextPackage.id),
+        eq(workPackages.status, 'running'),
+        sql`${workPackages.metadata}->'executionLease'->>'runId' = ${run.id}`,
+      ))
+      .returning({ id: workPackages.id })
+    if (!failedPackage) {
+      heartbeat.stop()
+      return abandonLostExecutionLease({
+        attemptNumber,
+        readyPackageIds,
+        runId: run.id,
+        taskId,
+        workPackageId: nextPackage.id,
+      })
+    }
     if (repositoryAffecting && repositoryContext && validationStatusForPackage !== 'skipped') {
       const evidenceStatus = repositoryContext.status === 'blocked'
         ? 'blocked'
@@ -1061,23 +1848,19 @@ async function executeReadyWorkPackage(
         status: 'failed',
       })
       .where(eq(agentRuns.id, run.id))
-    await db
-      .update(workPackages)
-      .set({
-        blockedReason: message,
-        status: 'failed',
-        updatedAt: failedAt,
-      })
-      .where(eq(workPackages.id, nextPackage.id))
 
     const [artifact] = await db
       .insert(artifacts)
       .values({
         agentRunId: run.id,
         artifactType: 'log_output',
-        content: `Work package execution failed.\n\n${message}`,
+        content: executionFailureDetails
+          ? `${executionFailureDetails.artifactContent}\n\nFailure:\n${message}`
+          : `Work package execution failed.\n\n${message}`,
         metadata: {
+          ...(executionFailureDetails?.artifactMetadata ?? {}),
           errorMessage: message,
+          failure: true,
           repositoryWrites: false,
           source: 'work-package-executor',
           workPackageId: nextPackage.id,
@@ -1085,13 +1868,14 @@ async function executeReadyWorkPackage(
       })
       .returning()
 
-    await publishTaskEvent(taskId, 'run:failed', {
+    await publishTaskEventBestEffort(taskId, 'run:failed', {
+      attemptNumber,
       errorMessage: message,
       runId: run.id,
       stage: 'implementation',
       workPackageId: nextPackage.id,
     })
-    await publishTaskEvent(taskId, 'artifact:created', {
+    await publishTaskEventBestEffort(taskId, 'artifact:created', {
       id: artifact.id,
       artifactId: artifact.id,
       agentRunId: artifact.agentRunId,
@@ -1101,12 +1885,16 @@ async function executeReadyWorkPackage(
       createdAt: artifact.createdAt,
       workPackageId: nextPackage.id,
     })
-    await publishTaskEvent(taskId, 'work_package:status', {
-      blockedReason: message,
-      status: 'failed',
+    await publishTaskEventBestEffort(taskId, 'work_package:status', {
+      blockedReason,
+      status: packageStatus,
       updatedAt: failedAt.toISOString(),
       workPackageId: nextPackage.id,
     })
+    heartbeat.stop()
     throw err
+  }
+  } finally {
+    heartbeat.stop()
   }
 }

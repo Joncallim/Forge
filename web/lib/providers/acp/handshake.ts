@@ -9,8 +9,9 @@ import { redactAdapterMessage } from './redaction'
 // ACP adapter readiness check
 //
 // Forge does not implement ACP agents itself. Instead it spawns the
-// zed-industries adapter package for the selected agent (a thin stdio bridge
-// that wraps the real CLI — `claude` or `codex` — and speaks ACP JSON-RPC).
+// pinned Agent Client Protocol adapter package for the selected agent (a thin
+// stdio bridge that wraps the real CLI — `claude` or `codex` — and speaks ACP
+// JSON-RPC).
 // This module's job is purely to answer "can Forge reach and handshake with
 // that adapter right now", broken into actionable failure states instead of
 // a single boolean.
@@ -34,14 +35,15 @@ const ACP_SESSION_PROBE_TIMEOUT_MS = 12_000
 export const ACP_PROTOCOL_VERSION = 1
 
 /**
- * Maps an ACP catalog agent id to the command that spawns its zed-industries
- * adapter. The adapter is fetched on demand via `npx` rather than bundled, so
- * no separate "install Zed" step is needed — but the underlying CLI (`claude`
- * or `codex`) must already be installed and authenticated on the host.
+ * Maps an ACP catalog agent id to the command that spawns its ACP adapter.
+ * Adapters are pinned package dependencies and launched with
+ * `npx --no-install` so runtime checks do not fetch arbitrary package versions.
+ * The underlying CLI (`claude` or `codex`) must already be installed and
+ * authenticated on the host.
  */
 const ACP_ADAPTER_COMMANDS: Record<string, string[]> = {
-  'claude-agent': ['npx', '-y', '@zed-industries/claude-agent-acp'],
-  'codex-cli': ['npx', '-y', '@zed-industries/codex-acp'],
+  'claude-agent': ['npx', '--no-install', 'claude-agent-acp'],
+  'codex-cli': ['npx', '--no-install', 'codex-acp'],
 }
 
 export function getAcpAdapterCommand(agentId: string): string[] | null {
@@ -75,7 +77,7 @@ export async function checkAcpReadiness(
   if (!command) {
     return {
       status: 'not_configured',
-      message: `No Zed ACP adapter is wired up for ${agent.label} yet. See ${agent.adapterUrl ?? agent.sourceUrl}.`,
+      message: `No pinned ACP adapter package is wired up for ${agent.label} yet. See ${agent.adapterUrl ?? agent.sourceUrl}.`,
       latencyMs: null,
     }
   }
@@ -95,7 +97,7 @@ export async function checkAcpReadiness(
     }
   }
 
-  // A bare `initialize` only proves the zed adapter process can speak ACP — it
+  // A bare `initialize` only proves the adapter process can speak ACP — it
   // never invokes the underlying CLI (`codex`/`claude`), so it returns "ready"
   // even when that CLI is not installed or not authenticated. We additionally
   // open a throwaway session, which forces the adapter to actually start the

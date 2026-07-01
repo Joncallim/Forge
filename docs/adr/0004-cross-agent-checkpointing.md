@@ -116,8 +116,9 @@ non-authoritative. They may be missing, stale, or deleted without changing the
 true task state. Any automation that needs correctness must read PostgreSQL
 first.
 
-Avoiding `.forge` keeps generated execution notes out of project repository
-metadata and avoids changing Git behavior in this slice.
+Avoiding `.forge` keeps checkpoint notes out of project repository metadata and
+avoids changing Git behavior in this slice. Executable package output has a
+separate, intentional sandbox path under `.forge/task-runs`.
 
 ## Deferred Work
 

@@ -13,24 +13,31 @@ structures now exist for work packages, harnesses, approval gates, and VCS
 summaries. Work-package handoff and sequential specialist execution exist behind
 flags with different defaults: materialization and handoff are default-on unless
 explicitly disabled, while generated package execution is opt-in with
-`FORGE_WORK_PACKAGE_EXECUTION=1`. Generated files are written only to per-task
-sandboxes. Forge still does not apply generated edits to the host repository,
-grant MCP runtime access to specialists, create commits, open pull requests,
-merge work, or run specialists in parallel.
+`FORGE_WORK_PACKAGE_EXECUTION=1`. Executable packages may receive bounded
+read-only host-repository context, but generated files are written only to
+per-package sandboxes under
+`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`.
+Forge still does not apply generated edits to the host repository, grant MCP
+runtime access to specialists, create branches or commits, open pull requests,
+merge work, run autonomous reviewer agents, or run specialists in parallel.
 
 The MCP/capability broker is an admission-time gate: it decides whether a work
 package may be claimed and handed off based on the requested MCP capabilities,
-their safe-beta allowlist, and MCP health. It does not enforce capabilities at
-runtime (`runtimeEnforcement` is `not_implemented`) — specialists run sandboxed
-with no real MCP tools — so "brokered" here means gated admission, not a runtime
-sandbox over live tools.
+their safe-beta allowlist, fallback policy, package-local prompt overlays, and
+MCP health. It does not enforce capabilities at runtime (`runtimeEnforcement`
+is `not_implemented`) -- specialists run sandboxed with no real MCP tools -- so
+"brokered" here means gated admission, not a runtime sandbox over live tools.
+Use precise grant terms: Architect-proposed grants, Forge broker decisions,
+operator-approved grant snapshots, and effective run-scoped instructions.
 
 ACP providers are local command-line-agent providers. Forge starts the
 configured ACP adapter on demand, speaks JSON-RPC over stdio, and receives text
 back through the same provider interface used by the worker. The currently wired
-Zed adapters wrap local tools such as Codex CLI and Claude Code; the underlying
-CLI must already be installed, authenticated, and runnable in the project
-folder. See [ACP and the Zed connector](acp-zed-connector.md).
+Agent Client Protocol adapters wrap local tools such as Codex CLI and Claude
+Code; the underlying CLI must already be installed, authenticated, and runnable
+on the worker host. Architect ACP calls run in an isolated runtime directory;
+executable work-package ACP calls are blocked until Forge has a hard filesystem
+and tool sandbox for local coding CLIs. See [ACP and the Zed connector](acp-zed-connector.md).
 
 ## Local Development
 
@@ -122,8 +129,9 @@ POST /api/tasks
   -> operator approves the plan
   -> approval job releases ready work packages
   -> MCP/capability broker validates the next handoff before ready/claim
-  -> execution, only when `FORGE_WORK_PACKAGE_EXECUTION=1`, writes to a per-task sandbox
-  -> package QA/Reviewer/Security review gates complete when required
+  -> execution, only when `FORGE_WORK_PACKAGE_EXECUTION=1`, reads bounded host context
+     and writes generated output to `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`
+  -> manual package QA/Reviewer/Security review gates complete when required
   -> task completes after all work packages and review gates are complete
 ```
 
@@ -133,7 +141,67 @@ Feature flag defaults:
 |---|---|---|
 | `FORGE_WORKFORCE_MATERIALIZATION` | enabled | Set `0` or `false` to skip durable work-package/gate records. |
 | `FORGE_WORK_PACKAGE_HANDOFF` | enabled | Set `0` or `false` to stop package handoff claims. |
-| `FORGE_WORK_PACKAGE_EXECUTION` | disabled | Set `1` or `true` to run sandbox package execution. |
+| `FORGE_WORK_PACKAGE_EXECUTION` | disabled | Set `1` or `true` to run package execution under `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`. |
+| `FORGE_RUNNING_WORK_PACKAGE_STALE_SECONDS` | `900` | Recovery window before a retry marks an interrupted running work package blocked and starts the next eligible attempt. |
+
+### Executable Workforce Beta
+
+`FORGE_WORK_PACKAGE_EXECUTION=1` changes only the final package execution step.
+It does not change the repository safety boundary.
+
+When execution is enabled:
+
+1. Forge claims at most one eligible non-review specialist package at a time
+   after plan approval and broker admission.
+2. The project local path is validated before execution.
+3. The specialist may receive bounded read-only host context: package summary,
+   acceptance criteria, previous artifacts, rework reasons, prompt overlays,
+   MCP-aware subtasks, repository evidence, and a bounded file/context packet.
+4. The model must return one `work_package_execution_json` block with relative
+   file paths and optional validation commands.
+5. Forge creates a fresh package sandbox at
+   `<validated-project-root>/.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`.
+6. Generated files are written only inside that sandbox. Forge rejects absolute
+   paths, `..`, `.git`, `node_modules`, symlinks, and local conflict-copy names.
+7. Package validation requests are limited to `npm test`, `npm run build`, and
+   `npm run lint`. In the beta, Forge performs static validation of the
+   generated sandbox output for those command labels, including script safety,
+   placeholder checks, and JavaScript syntax checks; it does not run arbitrary
+   package scripts.
+8. Package artifacts record the generated file list, sandbox path, command
+   results, model/provider snapshot, and review source artifact.
+
+Operators and reviewers can inspect:
+
+- work-package status, assigned role, dependencies, acceptance criteria, and
+  blocked reason;
+- proposed MCP/tool grants, broker decisions, operator-approved grant snapshots,
+  and effective run-scoped instructions;
+- prompt overlays and MCP-aware subtasks for the package run;
+- sandbox file lists and static validation results;
+- repository evidence and command audits;
+- QA, Reviewer, and Security gates tied to the source run and source artifact;
+- rework reasons and stale-gate replacement metadata;
+- structured security findings for high-risk packages.
+
+Important non-goals for the beta:
+
+- no live MCP grants, credentials, or runtime tool handles are issued to
+  specialists;
+- no host-repository writes happen outside `.forge/task-runs`;
+- no generated sandbox output is applied back into the project tree;
+- no branches, commits, check polling, PRs, merges, or issue auto-closure are
+  created;
+- no parallel specialist execution runs;
+- no user-edited grant scopes are supported;
+- no autonomous QA, Reviewer, or Security agent-run gates are required;
+- no harness-enforced tool policy, reference-path policy, output schema, or
+  validation policy is active.
+
+`agent_harnesses` remain planning and routing metadata for this beta. A harness
+can describe intended prompts, references, tool policy, output schema, and
+validation checks, but those fields do not grant tools or enforce execution
+policy until a later slice wires them in.
 
 Implemented worker files:
 
@@ -176,9 +244,9 @@ Current ACP flow:
 getModel(providerConfigId, { cwd })
   -> AcpLanguageModel
   -> AcpSessionClient.start(agentId, cwd)
-  -> npx Zed adapter package
+  -> npx --no-install pinned ACP adapter package
   -> initialize
-  -> session/new with project cwd
+  -> session/new with caller-provided cwd
   -> optional session/set_config_option for model selection
   -> session/prompt
   -> streamed agent_message_chunk text
@@ -187,7 +255,10 @@ getModel(providerConfigId, { cwd })
 Important implementation constraints:
 
 - `web/lib/providers/acp/transport.ts` owns the line-delimited JSON-RPC stdio
-  framing.
+  framing and starts adapter subprocesses with a deny-by-default environment
+  allowlist. Session callers choose the adapter process cwd; executable package
+  calls pass the package attempt sandbox, and Architect planning uses an
+  isolated runtime directory instead of the host repository root.
 - `web/lib/providers/acp/handshake.ts` owns readiness checks and actionable
   health states.
 - `web/lib/providers/acp/client.ts` owns one prompt turn and closes the adapter
@@ -210,8 +281,8 @@ records:
    in `workforce_agents`.
 3. Work packages remain task-scoped execution records produced from Architect
    plans.
-4. Specialist harnesses in `agent_harnesses` can still describe how a specific
-   agent or package should run.
+4. Specialist harnesses in `agent_harnesses` describe planning and routing
+   intent for this beta; they are not execution-policy objects yet.
 
 Core tables:
 
@@ -227,9 +298,10 @@ Core tables:
 | `vcs_changes` | Branch, PR, diff, and merge summary records |
 | `agent_runs` | Execution attempts, now linkable to work packages and harnesses |
 
-ADR 0005 records the first Workforce persistence slice. The current app extends
-that direction by making agent and workforce configuration editable before
-execution routing consumes those templates.
+ADR 0005 records the first Workforce persistence slice. ADR 0006 records the
+executable Workforce beta boundary. The current app extends that direction by
+making agent and workforce configuration editable before execution routing
+consumes those templates.
 
 ## Agent Prompts
 
@@ -285,8 +357,9 @@ Validation stack:
 
 ```bash
 cd web
-npx tsc --noEmit
 npm run lint
+git diff --check
+npx tsc --noEmit --pretty false
 npm test
 npm run build
 npm run e2e

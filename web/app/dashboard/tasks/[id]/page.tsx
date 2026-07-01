@@ -14,6 +14,8 @@ import {
   ShieldCheckIcon,
   GitBranchIcon,
   InfoIcon,
+  SquareIcon,
+  Trash2Icon,
   LoaderCircleIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -26,7 +28,7 @@ import {
 } from '@/components/ui/select'
 import { MarkdownView } from '@/components/MarkdownView'
 import { PlanDiffView } from '@/components/PlanDiffView'
-import { useTaskStream } from '@/hooks/useTaskStream'
+import { mergeAgentRun, useTaskStream } from '@/hooks/useTaskStream'
 import type { AgentRun, Artifact, TaskQuestion } from '@/hooks/useTaskStream'
 import {
   latestCapabilityClassificationFromArtifacts,
@@ -92,6 +94,15 @@ type ApprovalGate = WorkforceRecord
 type VcsChange = WorkforceRecord
 type CommandAudit = WorkforceRecord
 type RetryHandoffResultStatus = 'retry_already_queued' | 'retry_enqueued'
+type GateDecisionResponseWarning = {
+  error?: unknown
+}
+type WorkforceExecutionMode =
+  | 'disabled_handoff'
+  | 'opt_in_sandbox'
+  | 'running_package'
+  | 'sandbox_output'
+  | 'fallback_plan'
 
 interface TaskDetailResponse {
   task?: Task | null
@@ -153,7 +164,7 @@ interface PlannedAgent {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function normalizeStepsField(value: unknown): string[] {
@@ -227,6 +238,15 @@ function recordField(record: WorkforceRecord, keys: string[]): WorkforceRecord |
     if (isRecord(value)) return value
   }
   return null
+}
+
+function parseJsonRecord(value: string): WorkforceRecord | null {
+  try {
+    const parsed: unknown = JSON.parse(value)
+    return isRecord(parsed) ? parsed : null
+  } catch {
+    return null
+  }
 }
 
 function metadataStringField(record: WorkforceRecord, keys: string[]): string {
@@ -321,6 +341,495 @@ function jsonArrayField(record: WorkforceRecord, keys: string[]): WorkforceRecor
   return []
 }
 
+function mcpGrantPhasesFromGate(gate: ApprovalGate): WorkforceRecord | null {
+  const metadata = recordField(gate, ['metadata'])
+  if (!metadata) return null
+  const direct = recordField(metadata, ['mcpGrantPhases'])
+  if (direct) return direct
+
+  const chunks = metadata.queryChunks
+  if (!Array.isArray(chunks)) return null
+  for (const chunk of chunks) {
+    if (typeof chunk !== 'string' || !chunk.includes('mcpGrantPhases')) continue
+    const parsed = parseJsonRecord(chunk)
+    if (!parsed) continue
+    const phases = recordField(parsed, ['mcpGrantPhases'])
+    if (phases) return phases
+  }
+  return null
+}
+
+export function approvedGrantPackagesFromGate(gate: ApprovalGate): WorkforceRecord[] {
+  const phases = mcpGrantPhasesFromGate(gate)
+  if (!phases) return []
+  const approved = recordField(phases, ['approved'])
+  return approved ? jsonArrayField(approved, ['packages']) : []
+}
+
+function hasOwn(record: WorkforceRecord, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key)
+}
+
+function artifactMetadata(artifact: Artifact): WorkforceRecord | null {
+  return isRecord(artifact.metadata) ? artifact.metadata : null
+}
+
+function artifactShowsDisabledHandoff(artifact: Artifact): boolean {
+  const metadata = artifactMetadata(artifact)
+  const source = metadata ? stringField(metadata, ['source']) : ''
+  return (
+    (metadata !== null && booleanField(metadata, ['repositoryWrites']) === false && source === 'work-package-handoff') ||
+    artifact.content.includes('Repository writes and specialist model execution are disabled')
+  )
+}
+
+type SandboxOutputSummary = {
+  artifactId: string
+  commandCount: number
+  fileCount: number
+  files: string[]
+  sandboxPath: string
+  validationStatus: string
+}
+
+function sandboxOutputFromArtifact(artifact: Artifact): SandboxOutputSummary | null {
+  const metadata = artifactMetadata(artifact)
+  if (!metadata) return null
+
+  const sandboxPath = stringField(metadata, ['sandboxPath', 'sandboxRoot', 'outputPath'])
+  const files = stringArrayField(metadata, ['files', 'generatedFiles', 'paths'])
+  const generatedBy = stringField(metadata, ['generatedBy'])
+  const commandResults = jsonArrayField(metadata, ['commandResults', 'commands'])
+  const fileCount = Math.max(0, numberField(metadata, ['fileCount']) ?? files.length)
+  const validationStatus = stringField(metadata, ['validationStatus'])
+
+  if (sandboxPath === '' && files.length === 0 && generatedBy !== 'work-package-executor') return null
+
+  return {
+    artifactId: artifact.id,
+    commandCount: commandResults.length,
+    fileCount,
+    files,
+    sandboxPath,
+    validationStatus,
+  }
+}
+
+export function sandboxOutputsForPackage(pkg: WorkPackage, allArtifacts: Artifact[]): SandboxOutputSummary[] {
+  return packageArtifactsFor(pkg, allArtifacts)
+    .map(sandboxOutputFromArtifact)
+    .filter((output): output is SandboxOutputSummary => output !== null)
+}
+
+function runWorkPackageId(run: AgentRun): string {
+  return stringField(run as unknown as WorkforceRecord, ['workPackageId'])
+}
+
+function runAttemptNumber(run: AgentRun): number | null {
+  return numberField(run as unknown as WorkforceRecord, ['attemptNumber'])
+}
+
+function runsForPackage(pkg: WorkPackage, runs: AgentRun[]): AgentRun[] {
+  const pkgId = stringField(pkg, ['id'])
+  if (pkgId === '') return []
+  return runs.filter((run) => runWorkPackageId(run) === pkgId)
+}
+
+export function mergeTaskRuns(initialRuns: AgentRun[], streamRuns: AgentRun[]): AgentRun[] {
+  const byId = new Map<string, AgentRun>()
+  const order: string[] = []
+
+  for (const run of initialRuns) {
+    if (!byId.has(run.id)) order.push(run.id)
+    byId.set(run.id, run)
+  }
+
+  for (const run of streamRuns) {
+    const existing = byId.get(run.id)
+    if (!existing) {
+      order.push(run.id)
+      byId.set(run.id, run)
+      continue
+    }
+    byId.set(run.id, mergeAgentRun(existing, run))
+  }
+
+  return order
+    .map((id) => byId.get(id))
+    .filter((run): run is AgentRun => run !== undefined)
+}
+
+export function workforceExecutionSummary(input: {
+  artifacts: Artifact[]
+  runs: AgentRun[]
+  workPackages: WorkPackage[]
+}): { detail: string; label: string; mode: WorkforceExecutionMode; status: string } {
+  if (input.workPackages.length === 0) {
+    return {
+      detail: 'No persisted work packages exist yet; this view is showing the Architect plan only.',
+      label: 'Planning only',
+      mode: 'fallback_plan',
+      status: 'planned',
+    }
+  }
+
+  const disabledHandoff = input.artifacts.some(artifactShowsDisabledHandoff) ||
+    [...input.runs].reverse().some((run) => run.agentType === 'handoff' && run.modelIdUsed === 'forge-handoff/no-op')
+  if (disabledHandoff) {
+    return {
+      detail: 'Package handoff is disabled in this run. Forge produced reviewable handoff artifacts only; no specialist package model ran and no sandbox files were generated.',
+      label: 'Disabled handoff',
+      mode: 'disabled_handoff',
+      status: 'warning',
+    }
+  }
+
+  const runningPackage = input.workPackages.some((pkg) => stringField(pkg, ['status', 'state']) === 'running')
+  const runningImplementationRun = input.runs.some((run) => {
+    const runRecord = run as unknown as WorkforceRecord
+    return run.status === 'running' && (stringField(runRecord, ['stage']) === 'implementation' || runWorkPackageId(run) !== '')
+  })
+  if (runningPackage || runningImplementationRun) {
+    return {
+      detail: 'A package execution run is active. Generated files are sandbox output under .forge/task-runs, not host repository branch, commit, or PR output.',
+      label: 'Running sandbox package',
+      mode: 'running_package',
+      status: 'running',
+    }
+  }
+
+  const sandboxOutputCount = input.workPackages.reduce(
+    (count, pkg) => count + sandboxOutputsForPackage(pkg, input.artifacts).length,
+    0,
+  )
+  if (sandboxOutputCount > 0) {
+    return {
+      detail: `${pluralize(sandboxOutputCount, 'sandbox output')} generated under .forge/task-runs. Review those files and validation artifacts before approving gates.`,
+      label: 'Sandbox output generated',
+      mode: 'sandbox_output',
+      status: 'completed',
+    }
+  }
+
+  return {
+    detail: 'When FORGE_WORK_PACKAGE_EXECUTION=1 is enabled for the worker, ready packages run in an isolated .forge/task-runs sandbox. Without that opt-in, approval creates disabled handoff artifacts.',
+    label: 'Opt-in sandbox execution',
+    mode: 'opt_in_sandbox',
+    status: 'ready',
+  }
+}
+
+function mcpBrokerMetadata(pkg: WorkPackage): WorkforceRecord | null {
+  const metadata = recordField(pkg, ['metadata'])
+  return metadata ? recordField(metadata, ['mcpBroker']) : null
+}
+
+type SecurityFinding = {
+  confidence: string
+  description: string
+  key: string
+  location: string
+  recommendation: string
+  severity: string
+  status: string
+  title: string
+}
+
+export type SecurityReviewPayload = {
+  findings: SecurityFinding[]
+  state: 'findings' | 'no_findings'
+  summary: string
+}
+
+type SecurityFindingSubmission = {
+  reviewSurface: string
+  asset: string
+  trustBoundary: string
+  exploitPath: string
+  impact: string
+  requiredFix: string
+  evidenceRefs: string[]
+  severity: string
+  confidence: string
+  verificationState: string
+}
+
+type SecurityReviewSubmissionPayload = {
+  schemaVersion: 1
+  findings: SecurityFindingSubmission[]
+  noFindings?: {
+    reviewSurface: string
+    evidenceRefs: string[]
+    verificationState: string
+  }
+  summary?: string
+  verdict: 'findings' | 'no_findings'
+}
+
+type SecurityReviewFormState = {
+  asset: string
+  confidence: string
+  evidenceRefs: string
+  exploitPath: string
+  impact: string
+  mode: 'no_findings' | 'finding'
+  requiredFix: string
+  reviewSurface: string
+  severity: string
+  trustBoundary: string
+  verificationState: string
+}
+
+type GateDecisionAction = 'approve' | 'changes' | 'reject'
+
+type ReviewGateDecisionRequestBody = {
+  decision: 'completed' | 'needs_rework'
+  reason: string
+  securityReview?: SecurityReviewSubmissionPayload
+  sourceArtifactId: string
+}
+
+const DEFAULT_SECURITY_REVIEW_SURFACE = 'Security review gate'
+const DEFAULT_SECURITY_REVIEW_VERIFICATION = 'Reviewed the source artifact and found no security findings.'
+
+function defaultSecurityReviewForm(sourceArtifactId: string): SecurityReviewFormState {
+  return {
+    asset: '',
+    confidence: 'medium',
+    evidenceRefs: sourceArtifactId,
+    exploitPath: '',
+    impact: '',
+    mode: 'no_findings',
+    requiredFix: '',
+    reviewSurface: DEFAULT_SECURITY_REVIEW_SURFACE,
+    severity: 'medium',
+    trustBoundary: '',
+    verificationState: '',
+  }
+}
+
+function securityEvidenceRefs(value: string, fallbackRef: string): string[] {
+  const fallback = fallbackRef.trim()
+  const refs = value
+    .split(/[\n,]/u)
+    .map((item) => item.trim())
+    .filter((item) => item !== '')
+  const deduped = new Set<string>()
+  const orderedRefs = [
+    ...(fallback !== '' ? [fallback] : []),
+    ...refs,
+  ].filter((item) => {
+    if (deduped.has(item)) return false
+    deduped.add(item)
+    return true
+  })
+  return orderedRefs.slice(0, 20)
+}
+
+function securityReviewSurface(value: string): string {
+  return value.trim() || DEFAULT_SECURITY_REVIEW_SURFACE
+}
+
+export function securityReviewSubmissionPayloadFromForm({
+  fallbackVerification,
+  form,
+  sourceArtifactId,
+}: {
+  fallbackVerification: string
+  form: SecurityReviewFormState
+  sourceArtifactId: string
+}): { error: string | null; payload: SecurityReviewSubmissionPayload | null } {
+  const reviewSurface = securityReviewSurface(form.reviewSurface)
+  const evidenceRefs = securityEvidenceRefs(form.evidenceRefs, sourceArtifactId)
+  const verificationState = form.verificationState.trim() || fallbackVerification.trim() || DEFAULT_SECURITY_REVIEW_VERIFICATION
+
+  if (evidenceRefs.length === 0) {
+    return { error: 'Security review evidence is required.', payload: null }
+  }
+
+  if (form.mode === 'no_findings') {
+    return {
+      error: null,
+      payload: {
+        schemaVersion: 1,
+        findings: [],
+        noFindings: {
+          reviewSurface,
+          evidenceRefs,
+          verificationState,
+        },
+        summary: verificationState,
+        verdict: 'no_findings',
+      },
+    }
+  }
+
+  const asset = form.asset.trim()
+  const trustBoundary = form.trustBoundary.trim()
+  const exploitPath = form.exploitPath.trim()
+  const impact = form.impact.trim()
+  const requiredFix = form.requiredFix.trim()
+  const missing = [
+    asset === '' ? 'asset' : null,
+    trustBoundary === '' ? 'trust boundary' : null,
+    exploitPath === '' ? 'exploit path' : null,
+    impact === '' ? 'impact' : null,
+    requiredFix === '' ? 'required fix' : null,
+  ].filter((item): item is string => item !== null)
+  if (missing.length > 0) {
+    return { error: `Security finding requires ${missing.join(', ')}.`, payload: null }
+  }
+
+  return {
+    error: null,
+    payload: {
+      schemaVersion: 1,
+      findings: [{
+        reviewSurface,
+        asset,
+        trustBoundary,
+        exploitPath,
+        impact,
+        requiredFix,
+        evidenceRefs,
+        severity: form.severity.trim().toLowerCase() || 'medium',
+        confidence: form.confidence.trim().toLowerCase() || 'medium',
+        verificationState,
+      }],
+      summary: '1 structured security finding recorded.',
+      verdict: 'findings',
+    },
+  }
+}
+
+export function buildReviewGateDecisionRequestBody({
+  action,
+  gateType,
+  reason,
+  securityReviewForm,
+  sourceArtifactId,
+}: {
+  action: GateDecisionAction
+  gateType: string
+  reason: string
+  securityReviewForm?: SecurityReviewFormState
+  sourceArtifactId: string
+}): { body: ReviewGateDecisionRequestBody | null; error: string | null } {
+  const trimmedReason = reason.trim()
+  if (trimmedReason === '') {
+    return { body: null, error: 'Decision reason is required.' }
+  }
+
+  const decision = action === 'approve' ? 'completed' : 'needs_rework'
+  const reasonPrefix = action === 'reject' ? 'Rejected: ' : ''
+  const body: ReviewGateDecisionRequestBody = {
+    decision,
+    reason: `${reasonPrefix}${trimmedReason}`,
+    sourceArtifactId,
+  }
+
+  if (gateType === 'security_review') {
+    if (action === 'approve' && securityReviewForm?.mode === 'finding') {
+      return { body: null, error: 'Security findings require requesting changes, not approval.' }
+    }
+    if (action !== 'approve' && securityReviewForm?.mode !== 'finding') {
+      return { body: null, error: 'Security rework requires a structured finding.' }
+    }
+    const securityReview = securityReviewSubmissionPayloadFromForm({
+      fallbackVerification: trimmedReason,
+      form: securityReviewForm ?? defaultSecurityReviewForm(sourceArtifactId),
+      sourceArtifactId,
+    })
+    if (!securityReview.payload) {
+      return { body: null, error: securityReview.error ?? 'Security review payload is invalid.' }
+    }
+    body.securityReview = securityReview.payload
+  }
+
+  return { body, error: null }
+}
+
+function securityReviewRecords(record: WorkforceRecord): WorkforceRecord[] {
+  return [
+    record,
+    recordField(record, ['securityReview', 'security', 'review']),
+  ].filter((item): item is WorkforceRecord => item !== null)
+}
+
+function normalizeSecurityFinding(value: unknown, index: number): SecurityFinding | null {
+  if (typeof value === 'string' && value.trim() !== '') {
+    return {
+      confidence: '',
+      description: value.trim(),
+      key: `security-finding-${index + 1}`,
+      location: '',
+      recommendation: '',
+      severity: 'info',
+      status: '',
+      title: `Finding ${index + 1}`,
+    }
+  }
+  if (!isRecord(value)) return null
+
+  const title = stringField(value, ['title', 'summary', 'name', 'ruleId', 'reviewSurface', 'asset']) || `Finding ${index + 1}`
+  const evidenceRefs = stringArrayField(value, ['evidenceRefs'])
+  const path = stringField(value, ['path', 'file', 'filePath', 'location']) || stringField(value, ['asset'])
+  const line = numberField(value, ['line', 'startLine'])
+  const impact = stringField(value, ['impact'])
+  const exploitPath = stringField(value, ['exploitPath'])
+  const trustBoundary = stringField(value, ['trustBoundary'])
+  const description = stringField(value, ['description', 'detail', 'message', 'evidence']) || [
+    impact !== '' ? `Impact: ${impact}` : null,
+    exploitPath !== '' ? `Exploit path: ${exploitPath}` : null,
+    trustBoundary !== '' ? `Trust boundary: ${trustBoundary}` : null,
+  ].filter((part): part is string => part !== null).join(' ')
+  return {
+    confidence: stringField(value, ['confidence']),
+    description,
+    key: stringField(value, ['id', 'ruleId', 'key']) || `security-finding-${index + 1}`,
+    location: line !== null && path !== '' ? `${path}:${line}` : path || previewList(evidenceRefs, 3),
+    recommendation: stringField(value, ['recommendation', 'remediation', 'fix', 'mitigation', 'requiredFix']),
+    severity: stringField(value, ['severity', 'level', 'risk']) || 'info',
+    status: stringField(value, ['status', 'state', 'disposition', 'verificationState']),
+    title,
+  }
+}
+
+function findingArray(record: WorkforceRecord): { explicitEmpty: boolean; findings: SecurityFinding[] } {
+  const keys = ['securityFindings', 'findings', 'vulnerabilities', 'issues']
+  for (const key of keys) {
+    if (!hasOwn(record, key) || !Array.isArray(record[key])) continue
+    const findings = (record[key] as unknown[])
+      .map(normalizeSecurityFinding)
+      .filter((finding): finding is SecurityFinding => finding !== null)
+    return { explicitEmpty: findings.length === 0, findings }
+  }
+  return { explicitEmpty: false, findings: [] }
+}
+
+function explicitNoSecurityFindings(record: WorkforceRecord): boolean {
+  if (booleanField(record, ['noFindings', 'noSecurityFindings']) === true) return true
+  const verdict = stringField(record, ['verdict', 'result', 'status', 'state']).toLowerCase()
+  return ['no_findings', 'no findings', 'clean', 'passed'].includes(verdict)
+}
+
+export function securityReviewPayloadFromMetadata(...sources: unknown[]): SecurityReviewPayload | null {
+  for (const source of sources) {
+    if (!isRecord(source)) continue
+    for (const record of securityReviewRecords(source)) {
+      const summary = stringField(record, ['summary', 'conclusion', 'message', 'notes'])
+      const findings = findingArray(record)
+      if (findings.findings.length > 0) {
+        return { findings: findings.findings, state: 'findings', summary }
+      }
+      if (findings.explicitEmpty || explicitNoSecurityFindings(record)) {
+        return { findings: [], state: 'no_findings', summary }
+      }
+    }
+  }
+  return null
+}
+
 function workPackageBrief(pkg: WorkPackage): string {
   const owner = stringField(pkg, ['assignedRole', 'agentType', 'agent', 'role', 'assignee', 'harnessSlug'])
   const harnessName = stringField(pkg, ['harnessDisplayName', 'harnessRole'])
@@ -335,8 +844,8 @@ function workPackageBrief(pkg: WorkPackage): string {
   return [
     `### ${title}`,
     owner ? `**Role:** ${owner}` : null,
-    harnessName ? `**Harness:** ${harnessName}` : null,
-    harnessDescription ? `**Harness description:** ${harnessDescription}` : null,
+    harnessName ? `**Planning harness:** ${harnessName}` : null,
+    harnessDescription ? `**Planning harness description:** ${harnessDescription}` : null,
     summary ? `**Summary:** ${summary}` : null,
     `**Prompt overlay:**\n\n${prompt || 'No additional prompt overlay persisted for this package.'}`,
     steps.length > 0 ? `**Steps**\n\n${steps.map((step, index) => `${index + 1}. ${step}`).join('\n')}` : null,
@@ -494,11 +1003,15 @@ function statusBadgeClass(status: string): string {
     case 'awaiting_answers':
     case 'submitted':
     case 'pending':
+    case 'skipped':
+    case 'validation_skipped':
     case 'warning':
       return 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200'
     case 'completed':
     case 'approved':
+    case 'complete':
     case 'merged':
+    case 'passed':
     case 'valid':
       return 'border-green-200 bg-green-50 text-green-800 dark:border-green-900/50 dark:bg-green-950/30 dark:text-green-300'
     case 'needs_rework':
@@ -536,12 +1049,14 @@ function reviewGateLabel(gateType: string): string {
 }
 
 function GateDecisionControls({
+  gateType,
   gateId,
   onDecided,
   sourceArtifactId,
   taskId,
   compact = false,
 }: {
+  gateType: string
   gateId: string
   onDecided: () => Promise<void>
   sourceArtifactId: string
@@ -549,30 +1064,59 @@ function GateDecisionControls({
   compact?: boolean
 }) {
   const [reason, setReason] = useState('')
+  const [securityReviewForm, setSecurityReviewForm] = useState<SecurityReviewFormState>(() =>
+    defaultSecurityReviewForm(sourceArtifactId),
+  )
   const [submitting, setSubmitting] = useState<'approve' | 'changes' | 'reject' | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [warning, setWarning] = useState<string | null>(null)
+  const isSecurityGate = gateType === 'security_review'
 
-  async function submitDecision(action: 'approve' | 'changes' | 'reject') {
-    const trimmedReason = reason.trim()
-    if (trimmedReason === '') {
-      setError('Decision reason is required.')
+  useEffect(() => {
+    setSecurityReviewForm((current) => {
+      const nextEvidenceRefs = securityEvidenceRefs(current.evidenceRefs, sourceArtifactId).join(', ')
+      if (nextEvidenceRefs === current.evidenceRefs) return current
+      return { ...current, evidenceRefs: nextEvidenceRefs }
+    })
+  }, [sourceArtifactId])
+
+  function updateSecurityReviewForm<K extends keyof SecurityReviewFormState>(
+    key: K,
+    value: SecurityReviewFormState[K],
+  ) {
+    setSecurityReviewForm((current) => ({ ...current, [key]: value }))
+  }
+
+  async function submitDecision(action: GateDecisionAction) {
+    const requestBody = buildReviewGateDecisionRequestBody({
+      action,
+      gateType,
+      reason,
+      securityReviewForm,
+      sourceArtifactId,
+    })
+    if (!requestBody.body) {
+      setError(requestBody.error ?? 'Decision payload is invalid.')
       return
     }
 
-    const decision = action === 'approve' ? 'completed' : 'needs_rework'
-    const reasonPrefix = action === 'reject' ? 'Rejected: ' : ''
-
     setSubmitting(action)
     setError(null)
+    setWarning(null)
     try {
       const res = await fetch(`/api/tasks/${taskId}/approval-gates/${gateId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ decision, reason: `${reasonPrefix}${trimmedReason}`, sourceArtifactId }),
+        body: JSON.stringify(requestBody.body),
       })
+      const body = await res.json().catch(() => ({})) as GateDecisionResponseWarning
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}))
-        throw new Error(body.error ?? 'Failed to update review gate')
+        throw new Error(typeof body.error === 'string' ? body.error : 'Failed to update review gate')
+      }
+      if (res.status === 202 && typeof body.error === 'string' && body.error.trim() !== '') {
+        setWarning(body.error)
+        await onDecided()
+        return
       }
       setReason('')
       await onDecided()
@@ -592,7 +1136,142 @@ function GateDecisionControls({
         rows={compact ? 3 : 2}
         className="min-h-16 resize-y rounded-md border border-input bg-background px-2 py-1.5 text-xs text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       />
+      {isSecurityGate && (
+        <fieldset className="grid gap-2 rounded-md border border-border bg-background/80 p-2 text-xs">
+          <legend className="px-1 font-medium text-foreground">Security review</legend>
+          <div className="flex flex-wrap gap-2" role="radiogroup" aria-label="Security review result">
+            <label className="flex items-center gap-1.5 rounded-md border border-border px-2 py-1">
+              <input
+                type="radio"
+                name={`security-review-mode-${gateId}`}
+                value="no_findings"
+                checked={securityReviewForm.mode === 'no_findings'}
+                onChange={() => updateSecurityReviewForm('mode', 'no_findings')}
+              />
+              No findings
+            </label>
+            <label className="flex items-center gap-1.5 rounded-md border border-border px-2 py-1">
+              <input
+                type="radio"
+                name={`security-review-mode-${gateId}`}
+                value="finding"
+                checked={securityReviewForm.mode === 'finding'}
+                onChange={() => updateSecurityReviewForm('mode', 'finding')}
+              />
+              Structured finding
+            </label>
+          </div>
+          <label className="grid gap-1">
+            <span className="font-medium text-muted-foreground">Review surface</span>
+            <input
+              type="text"
+              value={securityReviewForm.reviewSurface}
+              onChange={(event) => updateSecurityReviewForm('reviewSurface', event.target.value)}
+              className="rounded-md border border-input bg-background px-2 py-1.5 text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            />
+          </label>
+          <label className="grid gap-1">
+            <span className="font-medium text-muted-foreground">Evidence refs</span>
+            <input
+              type="text"
+              value={securityReviewForm.evidenceRefs}
+              onChange={(event) => updateSecurityReviewForm('evidenceRefs', event.target.value)}
+              placeholder="artifact id, file path, test name"
+              className="rounded-md border border-input bg-background px-2 py-1.5 font-mono text-[11px] text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            />
+          </label>
+          <label className="grid gap-1">
+            <span className="font-medium text-muted-foreground">Verification</span>
+            <textarea
+              value={securityReviewForm.verificationState}
+              onChange={(event) => updateSecurityReviewForm('verificationState', event.target.value)}
+              placeholder="Defaults to the decision reason"
+              rows={2}
+              className="min-h-14 resize-y rounded-md border border-input bg-background px-2 py-1.5 text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            />
+          </label>
+          {securityReviewForm.mode === 'finding' && (
+            <div className="grid gap-2">
+              <label className="grid gap-1">
+                <span className="font-medium text-muted-foreground">Asset</span>
+                <input
+                  type="text"
+                  value={securityReviewForm.asset}
+                  onChange={(event) => updateSecurityReviewForm('asset', event.target.value)}
+                  placeholder="file, route, workflow, or integration"
+                  className="rounded-md border border-input bg-background px-2 py-1.5 text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                />
+              </label>
+              <label className="grid gap-1">
+                <span className="font-medium text-muted-foreground">Trust boundary</span>
+                <input
+                  type="text"
+                  value={securityReviewForm.trustBoundary}
+                  onChange={(event) => updateSecurityReviewForm('trustBoundary', event.target.value)}
+                  placeholder="input to privileged operation"
+                  className="rounded-md border border-input bg-background px-2 py-1.5 text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                />
+              </label>
+              <label className="grid gap-1">
+                <span className="font-medium text-muted-foreground">Exploit path</span>
+                <textarea
+                  value={securityReviewForm.exploitPath}
+                  onChange={(event) => updateSecurityReviewForm('exploitPath', event.target.value)}
+                  rows={2}
+                  className="min-h-14 resize-y rounded-md border border-input bg-background px-2 py-1.5 text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                />
+              </label>
+              <label className="grid gap-1">
+                <span className="font-medium text-muted-foreground">Impact</span>
+                <textarea
+                  value={securityReviewForm.impact}
+                  onChange={(event) => updateSecurityReviewForm('impact', event.target.value)}
+                  rows={2}
+                  className="min-h-14 resize-y rounded-md border border-input bg-background px-2 py-1.5 text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                />
+              </label>
+              <label className="grid gap-1">
+                <span className="font-medium text-muted-foreground">Required fix</span>
+                <textarea
+                  value={securityReviewForm.requiredFix}
+                  onChange={(event) => updateSecurityReviewForm('requiredFix', event.target.value)}
+                  rows={2}
+                  className="min-h-14 resize-y rounded-md border border-input bg-background px-2 py-1.5 text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                />
+              </label>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <label className="grid gap-1">
+                  <span className="font-medium text-muted-foreground">Severity</span>
+                  <select
+                    value={securityReviewForm.severity}
+                    onChange={(event) => updateSecurityReviewForm('severity', event.target.value)}
+                    className="rounded-md border border-input bg-background px-2 py-1.5 text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                    <option value="critical">Critical</option>
+                  </select>
+                </label>
+                <label className="grid gap-1">
+                  <span className="font-medium text-muted-foreground">Confidence</span>
+                  <select
+                    value={securityReviewForm.confidence}
+                    onChange={(event) => updateSecurityReviewForm('confidence', event.target.value)}
+                    className="rounded-md border border-input bg-background px-2 py-1.5 text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+          )}
+        </fieldset>
+      )}
       {error && <p className="text-xs text-destructive">{error}</p>}
+      {warning && <p className="text-xs text-amber-600 dark:text-amber-400">{warning}</p>}
       <div className="flex flex-wrap gap-2">
         <Button
           type="button"
@@ -630,6 +1309,20 @@ export function retryHandoffMessage(status: RetryHandoffResultStatus): string {
   return status === 'retry_already_queued'
     ? 'Retry already queued. The worker will re-evaluate this handoff.'
     : 'Retry queued. The worker will re-evaluate this handoff.'
+}
+
+export function canRetryHandoffForTaskStatus(status: string, hasBlockedPackage: boolean): boolean {
+  return (status === 'approved' || status === 'running') && !hasBlockedPackage
+}
+
+const TERMINAL_TASK_STATUSES = new Set(['completed', 'failed', 'cancelled', 'rejected'])
+
+export function canStopTaskStatus(status: string): boolean {
+  return !TERMINAL_TASK_STATUSES.has(status)
+}
+
+export function canDeleteTaskStatus(status: string): boolean {
+  return TERMINAL_TASK_STATUSES.has(status)
 }
 
 // ---------------------------------------------------------------------------
@@ -694,6 +1387,225 @@ function RetryHandoffControls({
           <span className="text-xs text-muted-foreground">{retryHandoffMessage(retryStatus)}</span>
         )}
       </div>
+    </div>
+  )
+}
+
+function SandboxOutputList({ outputs }: { outputs: SandboxOutputSummary[] }) {
+  if (outputs.length === 0) return null
+
+  return (
+    <div className="mt-3 rounded-md border border-border bg-muted/20 px-3 py-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Generated sandbox files</p>
+        <Badge variant="outline" className={statusBadgeClass('completed')}>{outputs.length}</Badge>
+      </div>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Files listed here are package sandbox output under <span className="font-mono">.forge/task-runs</span>. They are not host repository branch, commit, or PR output.
+      </p>
+      <ul className="mt-2 grid gap-2">
+        {outputs.map((output) => (
+          <li key={output.artifactId} className="rounded-md bg-background px-2 py-1.5 ring-1 ring-border">
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="font-medium text-foreground">{pluralize(output.fileCount, 'file')}</span>
+              <span className="text-muted-foreground">{pluralize(output.commandCount, 'command')}</span>
+              {output.validationStatus !== '' && (
+                <Badge variant="outline" className={statusBadgeClass(output.validationStatus)}>
+                  Validation: {statusLabel(output.validationStatus)}
+                </Badge>
+              )}
+            </div>
+            {output.sandboxPath !== '' && (
+              <p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{output.sandboxPath}</p>
+            )}
+            {output.files.length > 0 && (
+              <p className="mt-1 break-words font-mono text-[11px] text-muted-foreground">
+                {previewList(output.files, 5)}
+              </p>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+function BrokerRetrySummary({ broker }: { broker: WorkforceRecord | null }) {
+  if (!broker) return null
+
+  const retryable = booleanField(broker, ['retryable'])
+  const attempts = numberField(broker, ['autoRetryAttempts'])
+  const nextAutoRetryAt = stringField(broker, ['nextAutoRetryAt'])
+  const blocked = stringArrayField(broker, ['blocked'])
+  const warnings = stringArrayField(broker, ['warnings'])
+
+  return (
+    <div className="mt-2 rounded-md border border-border bg-background/70 px-2.5 py-2 text-xs">
+      <div className="flex flex-wrap gap-x-4 gap-y-1">
+        {retryable !== null && (
+          <span><span className="font-medium text-foreground">Retryable:</span> {retryable ? 'yes' : 'no'}</span>
+        )}
+        {attempts !== null && (
+          <span><span className="font-medium text-foreground">Auto retries:</span> {attempts}</span>
+        )}
+        {nextAutoRetryAt !== '' && (
+          <span><span className="font-medium text-foreground">Next auto retry:</span> {formatDatetime(nextAutoRetryAt)}</span>
+        )}
+      </div>
+      {blocked.length > 0 && (
+        <p className="mt-1 break-words text-destructive">{previewList(blocked, 3)}</p>
+      )}
+      {warnings.length > 0 && (
+        <p className="mt-1 break-words text-muted-foreground">Warnings: {previewList(warnings, 3)}</p>
+      )}
+    </div>
+  )
+}
+
+function McpGrantCards({ grants }: { grants: WorkforceRecord[] }) {
+  if (grants.length === 0) return null
+
+  return (
+    <div>
+      <p className="font-medium text-muted-foreground">Brokered MCP grant decisions</p>
+      <p className="mt-1 text-muted-foreground">
+        No live MCP tool handles are issued in beta. These brokered decisions only shape run-scoped package instructions.
+      </p>
+      <div className="mt-2 grid gap-2">
+        {grants.map((grant, index) => {
+          const mcpId = stringField(grant, ['mcpId', 'id']) || 'MCP'
+          const status = stringField(grant, ['status', 'state']) || 'proposed'
+          const requirement = stringField(grant, ['requirement'])
+          const reason = stringField(grant, ['reason'])
+          const capabilities = stringArrayField(grant, ['capabilities', 'permissions'])
+          const fallback = describeMcpFallback(grant.fallback)
+          return (
+            <div key={recordKey(grant, 'mcp-grant', index)} className="rounded-md border border-border bg-background px-2 py-1.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-mono text-xs font-medium text-foreground">{mcpId}</span>
+                <Badge variant="outline" className={statusBadgeClass(status)}>{statusLabel(status)}</Badge>
+                {requirement !== '' && <Badge variant="secondary">{requirement}</Badge>}
+              </div>
+              {reason !== '' && <p className="mt-1 text-muted-foreground">{reason}</p>}
+              {capabilities.length > 0 && (
+                <p className="mt-1 break-words font-mono text-[11px] text-muted-foreground">{capabilities.join(', ')}</p>
+              )}
+              {fallback !== '' && <p className="mt-1 text-muted-foreground">Fallback: {fallback}</p>}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function ApprovedGrantSnapshot({ packages }: { packages: WorkforceRecord[] }) {
+  if (packages.length === 0) return null
+
+  return (
+    <div className="mt-2 rounded-md border border-border bg-background/70 px-2.5 py-2 text-xs">
+      <p className="font-medium text-muted-foreground">Operator-approved capability snapshot</p>
+      <p className="mt-1 text-muted-foreground">
+        This records approval-time grants only. No live MCP tool handles are issued in beta.
+      </p>
+      <div className="mt-2 grid gap-2">
+        {packages.map((pkg, index) => {
+          const packageId = stringField(pkg, ['workPackageId', 'id']) || `Package ${index + 1}`
+          const assignedRole = stringField(pkg, ['assignedRole', 'role'])
+          const proposedGrants = jsonArrayField(pkg, ['proposedGrants', 'grants'])
+          const proposedRequirements = jsonArrayField(pkg, ['proposedRequirements', 'requirements'])
+          const promptOverlayPresent = booleanField(pkg, ['promptOverlayPresent'])
+          return (
+            <div key={recordKey(pkg, 'approved-grant-package', index)} className="rounded-md border border-border bg-background px-2 py-1.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="break-all font-mono text-[11px] text-foreground">{packageId}</span>
+                {assignedRole !== '' && <Badge variant="secondary">{assignedRole}</Badge>}
+                {promptOverlayPresent !== null && (
+                  <Badge variant={promptOverlayPresent ? 'outline' : 'secondary'}>
+                    overlay {promptOverlayPresent ? 'approved' : 'absent'}
+                  </Badge>
+                )}
+              </div>
+              {proposedGrants.length > 0 && (
+                <p className="mt-1 text-muted-foreground">
+                  Grants: {proposedGrants.map((grant) => stringField(grant, ['mcpId', 'id']) || 'MCP').join(', ')}
+                </p>
+              )}
+              {proposedRequirements.length > 0 && (
+                <p className="mt-1 text-muted-foreground">
+                  Requirements: {proposedRequirements.map((requirement) => stringField(requirement, ['mcpId', 'id']) || 'MCP').join(', ')}
+                </p>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function McpSubtaskCards({ subtasks }: { subtasks: WorkforceRecord[] }) {
+  if (subtasks.length === 0) return null
+
+  return (
+    <div>
+      <p className="font-medium text-muted-foreground">Effective MCP-aware run instructions</p>
+      <p className="mt-1 text-muted-foreground">
+        These subtasks are prompt instructions for the sandbox package run; they are not proof that live MCP tools were attached.
+      </p>
+      <ul className="mt-2 grid gap-2">
+        {subtasks.map((subtask, index) => {
+          const id = stringField(subtask, ['id', 'title', 'name']) || `Subtask ${index + 1}`
+          const capabilities = stringArrayField(subtask, ['mcpCapabilities', 'capabilities'])
+          const verification = stringArrayField(subtask, ['verification'])
+          const fallback = stringField(subtask, ['fallback'])
+          return (
+            <li key={recordKey(subtask, 'mcp-subtask', index)} className="rounded-md border border-border bg-background px-2 py-1.5">
+              <p className="font-medium text-foreground">{id}</p>
+              {capabilities.length > 0 && (
+                <p className="mt-1 break-words font-mono text-[11px] text-muted-foreground">{capabilities.join(', ')}</p>
+              )}
+              {verification.length > 0 && <p className="mt-1 text-muted-foreground">Verify: {previewList(verification, 3)}</p>}
+              {fallback !== '' && <p className="mt-1 text-muted-foreground">Fallback: {fallback}</p>}
+            </li>
+          )
+        })}
+      </ul>
+    </div>
+  )
+}
+
+function SecurityFindingsPanel({ payload }: { payload: SecurityReviewPayload | null }) {
+  if (!payload) return null
+
+  if (payload.state === 'no_findings') {
+    return (
+      <div className="mt-3 rounded-md border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-900 dark:border-green-900/50 dark:bg-green-950/30 dark:text-green-200">
+        <p className="font-medium">Security findings: none reported</p>
+        {payload.summary !== '' && <p className="mt-1">{payload.summary}</p>}
+      </div>
+    )
+  }
+
+  return (
+    <div className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs">
+      <p className="font-medium text-foreground">Structured security findings</p>
+      {payload.summary !== '' && <p className="mt-1 text-muted-foreground">{payload.summary}</p>}
+      <ul className="mt-2 grid gap-2">
+        {payload.findings.map((finding) => (
+          <li key={finding.key} className="rounded-md bg-background px-2 py-1.5 ring-1 ring-border">
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="font-medium text-foreground">{finding.title}</p>
+              <Badge variant="outline">{finding.severity}</Badge>
+              {finding.confidence !== '' && <Badge variant="outline">Confidence: {finding.confidence}</Badge>}
+              {finding.status !== '' && <Badge variant="secondary">{finding.status}</Badge>}
+            </div>
+            {finding.location !== '' && <p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{finding.location}</p>}
+            {finding.description !== '' && <p className="mt-1 text-muted-foreground">{finding.description}</p>}
+            {finding.recommendation !== '' && <p className="mt-1 text-muted-foreground">Fix: {finding.recommendation}</p>}
+          </li>
+        ))}
+      </ul>
     </div>
   )
 }
@@ -1112,6 +2024,7 @@ function WorkforcePanel({
   onGateDecided,
   taskId,
   artifacts,
+  runs,
 }: {
   workPackages: WorkPackage[]
   approvalGates: ApprovalGate[]
@@ -1121,6 +2034,7 @@ function WorkforcePanel({
   onGateDecided: () => Promise<void>
   taskId: string
   artifacts: Artifact[]
+  runs: AgentRun[]
 }) {
   const hasPersistedPlan = workPackages.length > 0 || approvalGates.length > 0
   const hasFallback = fallbackAgents.length > 0
@@ -1130,6 +2044,7 @@ function WorkforcePanel({
   const persistedTaskCount = workPackages.reduce((sum, pkg) => (
     sum + Math.max(1, Math.trunc(metadataNumberField(pkg, ['plannedTasks', 'taskCount', 'tasks']) ?? stringArrayField(pkg, ['steps']).length))
   ), 0)
+  const executionSummary = workforceExecutionSummary({ artifacts, runs, workPackages })
 
   return (
     <section aria-labelledby="workforce-heading" className="min-w-0 rounded-lg border border-border p-4 overflow-x-hidden">
@@ -1149,9 +2064,15 @@ function WorkforcePanel({
 
       <div className="mb-3 flex items-start gap-2 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
         <ShieldCheckIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-        <p>
-          Planning view only. This panel shows saved assignments and approval checkpoints; it will not change repository files.
-        </p>
+        <div className="min-w-0">
+          <div className="mb-1 flex flex-wrap items-center gap-2">
+            <p className="font-medium text-foreground">{executionSummary.label}</p>
+            <Badge variant="outline" className={statusBadgeClass(executionSummary.status)}>
+              {statusLabel(executionSummary.status)}
+            </Badge>
+          </div>
+          <p>{executionSummary.detail}</p>
+        </div>
       </div>
 
       {hasPersistedPlan ? (
@@ -1174,8 +2095,18 @@ function WorkforcePanel({
                   const prompt = stringField(pkg, ['promptOverlay'])
                   const harnessName = stringField(pkg, ['harnessDisplayName', 'harnessRole'])
                   const mcpRequirements = jsonArrayField(pkg, ['mcpRequirements'])
+                  const pkgMetadata = recordField(pkg, ['metadata'])
+                  const mcpGrants = pkgMetadata ? jsonArrayField(pkgMetadata, ['mcpGrants', 'grants']) : []
+                  const mcpSubtasks = pkgMetadata ? jsonArrayField(pkgMetadata, ['mcpAwareSubtasks', 'mcpSubtasks']) : []
+                  const broker = mcpBrokerMetadata(pkg)
                   const packageArtifacts = packageArtifactsFor(pkg, artifacts)
+                  const sandboxOutputs = sandboxOutputsForPackage(pkg, artifacts)
                   const latestPackageArtifact = packageArtifacts[packageArtifacts.length - 1] ?? null
+                  const pkgRuns = runsForPackage(pkg, runs)
+                  const attemptNumbers = pkgRuns
+                    .map(runAttemptNumber)
+                    .filter((attempt): attempt is number => attempt !== null)
+                  const latestAttempt = attemptNumbers.length > 0 ? Math.max(...attemptNumbers) : pkgRuns.length
                   const packageReviewGates = approvalGates.filter((gate) => {
                     const gatePackageId = stringField(gate, ['workPackageId']) || metadataStringField(gate, ['sourcePackageId'])
                     const gateType = stringField(gate, ['gateType', 'type'])
@@ -1188,6 +2119,9 @@ function WorkforcePanel({
                   const reviewArtifact = pendingReviewGate
                     ? packageArtifacts.find((artifact) => artifact.id === pendingSourceArtifactId) ?? null
                     : latestPackageArtifact
+                  const securityPayload = pendingReviewGate && stringField(pendingReviewGate, ['gateType', 'type']) === 'security_review'
+                    ? securityReviewPayloadFromMetadata(recordField(pendingReviewGate, ['metadata']), reviewArtifact?.metadata ?? null)
+                    : null
                   const taskCount = Math.max(1, Math.trunc(metadataNumberField(pkg, ['plannedTasks', 'taskCount', 'tasks']) ?? steps.length))
 
                   return (
@@ -1203,6 +2137,7 @@ function WorkforcePanel({
                         {status === 'running' && <LoaderCircleIcon className="size-3.5 animate-spin text-sky-600" aria-hidden="true" />}
                         {status !== '' && statusBadge(status)}
                         <Badge variant="outline">{pluralize(taskCount, 'task')}</Badge>
+                        {latestAttempt > 0 && <Badge variant="outline">attempt {latestAttempt}</Badge>}
                       </div>
                       {status === 'running' && (
                         <div className="mt-2">
@@ -1233,6 +2168,15 @@ function WorkforcePanel({
                       {files.length > 0 && (
                         <p className="mt-1 break-words font-mono text-xs text-muted-foreground">{previewList(files)}</p>
                       )}
+                      <SandboxOutputList outputs={sandboxOutputs} />
+                      {status === 'needs_rework' && (
+                        <div className="mt-3 rounded-md border border-amber-200 bg-amber-50/70 px-3 py-2 text-xs text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/20 dark:text-amber-200">
+                          <p className="font-medium">Rework requested</p>
+                          <p className="mt-1">
+                            The next worker pass should create a fresh package attempt. Previous sandbox output remains visible for review history.
+                          </p>
+                        </div>
+                      )}
                       {status === 'awaiting_review' && (
                         <div className="mt-3 min-w-0 rounded-lg border border-amber-200 bg-amber-50/70 p-3 dark:border-amber-900/50 dark:bg-amber-950/20">
                           <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
@@ -1252,8 +2196,10 @@ function WorkforcePanel({
                                 : 'No package output has been attached yet.'}
                             </p>
                           )}
+                          <SecurityFindingsPanel payload={securityPayload} />
                           {pendingReviewGate && reviewArtifact ? (
                             <GateDecisionControls
+                              gateType={stringField(pendingReviewGate, ['gateType', 'type'])}
                               gateId={stringField(pendingReviewGate, ['id'])}
                               sourceArtifactId={reviewArtifact.id}
                               taskId={taskId}
@@ -1272,11 +2218,14 @@ function WorkforcePanel({
                         </div>
                       )}
                       {status === 'blocked' && (
-                        <RetryHandoffControls
-                          blockedReason={stringField(pkg, ['blockedReason'])}
-                          taskId={taskId}
-                          onRetried={onGateDecided}
-                        />
+                        <>
+                          <BrokerRetrySummary broker={broker} />
+                          <RetryHandoffControls
+                            blockedReason={stringField(pkg, ['blockedReason'])}
+                            taskId={taskId}
+                            onRetried={onGateDecided}
+                          />
+                        </>
                       )}
                       <details className="mt-2 rounded-md border border-border bg-muted/20 px-3 py-2">
                         <summary className="cursor-pointer text-xs font-medium text-foreground">
@@ -1291,17 +2240,28 @@ function WorkforcePanel({
                               </ol>
                             </div>
                           )}
+                          {harnessName !== '' && (
+                            <div>
+                              <p className="font-medium text-muted-foreground">Planning harness</p>
+                              <p className="mt-1 text-muted-foreground">
+                                {harnessName} identifies the planned role and package prompt context. It does not imply live tool grants.
+                              </p>
+                            </div>
+                          )}
                           <div>
-                            <p className="font-medium text-muted-foreground">Prompt overlay</p>
+                            <p className="font-medium text-muted-foreground">Effective run instructions</p>
                             {prompt !== '' ? (
                               <div className="mt-1 max-h-56 overflow-auto rounded-md bg-background p-2 ring-1 ring-border">
                                 <MarkdownView content={prompt} compact />
                               </div>
                             ) : (
                               <p className="mt-1 text-muted-foreground">
-                                No additional prompt overlay persisted for this package.
+                                No additional run-scoped prompt overlay persisted for this package.
                               </p>
                             )}
+                            <p className="mt-1 text-muted-foreground">
+                              Run instructions are scoped to this package attempt and do not change the permanent harness prompt.
+                            </p>
                           </div>
                           <div>
                             <p className="font-medium text-muted-foreground">Assignment brief</p>
@@ -1317,6 +2277,8 @@ function WorkforcePanel({
                               </div>
                             </div>
                           )}
+                          <McpGrantCards grants={mcpGrants} />
+                          <McpSubtaskCards subtasks={mcpSubtasks} />
                           {packageArtifacts.length > 0 && (
                             <div>
                               <p className="font-medium text-muted-foreground">Package artifacts</p>
@@ -1352,8 +2314,16 @@ function WorkforcePanel({
                   const requiredRole = metadataStringField(gate, ['requiredRole'])
                   const packageId = stringField(gate, ['workPackageId']) || metadataStringField(gate, ['sourcePackageId'])
                   const sourceRunId = stringField(gate, ['sourceAgentRunId']) || metadataStringField(gate, ['sourceRunId'])
+                  const sourceArtifactId = stringField(gate, ['sourceArtifactId']) || metadataStringField(gate, ['sourceArtifactId'])
+                  const sourceArtifact = sourceArtifactId !== ''
+                    ? artifacts.find((artifact) => artifact.id === sourceArtifactId) ?? null
+                    : null
                   const decisionReason = metadataStringField(gate, ['decisionReason'])
                   const decidedAt = stringField(gate, ['decidedAt'])
+                  const approvedGrantPackages = approvedGrantPackagesFromGate(gate)
+                  const securityPayload = gateType === 'security_review'
+                    ? securityReviewPayloadFromMetadata(recordField(gate, ['metadata']), sourceArtifact?.metadata ?? null)
+                    : null
 
                   return (
                     <li key={recordKey(gate, 'approval-gate', index)} className="min-w-0 border-t border-border pt-3 first:border-t-0 first:pt-0">
@@ -1376,7 +2346,12 @@ function WorkforcePanel({
                       {sourceRunId !== '' && (
                         <p className="mt-1 break-all font-mono text-xs text-muted-foreground">Run {sourceRunId}</p>
                       )}
+                      {sourceArtifactId !== '' && (
+                        <p className="mt-1 break-all font-mono text-xs text-muted-foreground">Artifact {sourceArtifactId}</p>
+                      )}
                       {summary !== '' && <p className="mt-1 text-sm text-muted-foreground">{summary}</p>}
+                      <ApprovedGrantSnapshot packages={approvedGrantPackages} />
+                      <SecurityFindingsPanel payload={securityPayload} />
                       {decisionReason !== '' && (
                         <p className="mt-1 text-sm text-muted-foreground">Decision: {decisionReason}</p>
                       )}
@@ -1427,24 +2402,19 @@ function WorkforcePanel({
         <div className="mt-4 border-t border-border pt-3">
           <div className="mb-2 flex items-center gap-2">
             <GitBranchIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
-            <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Repository changes</h3>
+            <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Repository readiness evidence</h3>
           </div>
-          <ul className="flex flex-col gap-2" aria-label="Saved repository changes">
+          <p className="mb-2 text-xs text-muted-foreground">
+            Host repository evidence is a readiness/status check for sandbox execution. It is not branch, commit, or pull request output from this beta flow.
+          </p>
+          <ul className="flex flex-col gap-2" aria-label="Repository readiness evidence">
             {vcsChanges.map((change, index) => {
-              const path = stringField(change, [
-                'path',
-                'filePath',
-                'file',
-                'branchName',
-                'pullRequestUrl',
-                'repository',
-                'commitSha',
-              ]) || `Change ${index + 1}`
               const status = stringField(change, ['status', 'state'])
               const type = stringField(change, ['changeType', 'type', 'operation'])
               const summary = stringField(change, ['summary', 'description', 'diffSummary'])
               const metadata = recordField(change, ['metadata'])
               const evidenceStatus = metadata ? stringField(metadata, ['evidenceStatus', 'status']) : ''
+              const repositoryPath = stringField(change, ['repository']) || (metadata ? stringField(metadata, ['projectLocalPath']) : '') || `Evidence ${index + 1}`
               const currentBranch = stringField(change, ['currentBranch']) || (metadata ? stringField(metadata, ['currentBranch']) : '')
               const baseBranch = stringField(change, ['baseBranch']) || (metadata ? stringField(metadata, ['baseBranch']) : '')
               const intendedBranch = stringField(change, ['branchName']) || (metadata ? stringField(metadata, ['intendedTaskBranch']) : '')
@@ -1457,7 +2427,7 @@ function WorkforcePanel({
               return (
                 <li key={recordKey(change, 'vcs-change', index)} className="rounded-md border border-border bg-muted/20 px-2.5 py-2">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="break-all font-mono text-xs text-foreground">{path}</span>
+                    <span className="break-all font-mono text-xs text-foreground">{repositoryPath}</span>
                     {type !== '' && <Badge variant="outline">{type}</Badge>}
                     {status !== '' && statusBadge(status)}
                     {evidenceStatus !== '' && evidenceStatus !== status && statusBadge(evidenceStatus)}
@@ -1470,7 +2440,7 @@ function WorkforcePanel({
                       <div><dt className="font-medium text-foreground">Base</dt><dd className="break-all font-mono">{baseBranch}</dd></div>
                     )}
                     {intendedBranch !== '' && (
-                      <div><dt className="font-medium text-foreground">Intended</dt><dd className="break-all font-mono">{intendedBranch}</dd></div>
+                      <div><dt className="font-medium text-foreground">Intended branch check</dt><dd className="break-all font-mono">{intendedBranch}</dd></div>
                     )}
                     {dirty !== null && (
                       <div><dt className="font-medium text-foreground">Working tree</dt><dd>{dirty ? 'Dirty' : 'Clean'}</dd></div>
@@ -1498,9 +2468,9 @@ function WorkforcePanel({
           {commandAudits.length > 0 && (
             <details className="mt-3 rounded-md border border-border bg-muted/20 px-3 py-2">
               <summary className="cursor-pointer text-xs font-medium text-foreground">
-                Command audit summary
+                Readiness command audit
               </summary>
-              <ul className="mt-2 grid gap-2" aria-label="Repository command audits">
+              <ul className="mt-2 grid gap-2" aria-label="Repository readiness command audits">
                 {commandAudits.map((audit, index) => {
                   const command = stringField(audit, ['command'])
                   const argv = stringArrayField(audit, ['argv'])
@@ -1682,7 +2652,7 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
       <div className="mb-3 flex items-start gap-2 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
         <ShieldCheckIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
         <p>
-          Planning view only. Forge does not grant MCP tools at runtime yet.
+          MCP access is beta-planned only. Forge records proposed requirements and brokered decisions, but no live MCP tool handles are issued to package runs; approved inputs become run-scoped prompt instructions.
         </p>
       </div>
 
@@ -1711,7 +2681,7 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
       {grantPreview && grantPreview.decisions.length > 0 && (
         <div className="mb-3 rounded-lg border border-border px-3 py-2">
           <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Access decision preview</p>
+            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Brokered grant preview</p>
             <div className="flex flex-wrap gap-1.5">
               <Badge variant="outline" className={statusBadgeClass('proposed')}>{grantPreview.summary.proposed} proposed</Badge>
               <Badge variant="outline" className={statusBadgeClass('warning')}>{grantPreview.summary.warning} warning</Badge>
@@ -1726,7 +2696,7 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
                 ? 'Do not assign MCP-backed work until this MCP issue is resolved.'
                 : decision.status === 'warning'
                   ? 'Optional MCP access is unavailable. Continue using the Architect fallback.'
-                  : 'Proposed only. MCP is available, but Forge has not granted runtime tools.'
+                  : 'Plan-approved for prompt context only. Forge does not attach live MCP tools in beta.'
 
               return (
                 <li key={decision.decisionId} className="rounded-md border border-border bg-muted/20 px-2.5 py-2">
@@ -1739,7 +2709,7 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
                   <p className="text-muted-foreground">{statusText}</p>
                   {decision.capabilities.length > 0 && (
                     <p className="mt-1 break-words text-muted-foreground">
-                      Capabilities: {decision.capabilities.join(', ')}
+                      Proposed capabilities: {decision.capabilities.join(', ')}
                     </p>
                   )}
                   {decision.health.status !== 'healthy' && (
@@ -1785,7 +2755,7 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
                   </div>
                   {permissionEntries.length > 0 && (
                     <div>
-                      <dt className="font-medium text-foreground">Planned Capabilities</dt>
+                      <dt className="font-medium text-foreground">Proposed capabilities</dt>
                       <dd>
                         {permissionEntries.map(([agent, permissions]) => (
                           <span key={agent} className="block">
@@ -1815,11 +2785,11 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
       {(overlayCount > 0 || subtaskCount > 0) && (
         <dl className="mt-3 grid gap-1 border-t border-border pt-3 text-xs text-muted-foreground">
           <div>
-            <dt className="font-medium text-foreground">Prompt instructions</dt>
+            <dt className="font-medium text-foreground">Run instruction overlays</dt>
             <dd>{overlayCount}</dd>
           </div>
           <div>
-            <dt className="font-medium text-foreground">MCP-aware subtasks</dt>
+            <dt className="font-medium text-foreground">Plan-approved MCP-aware subtasks</dt>
             <dd>{subtaskCount}</dd>
           </div>
         </dl>
@@ -1875,21 +2845,13 @@ function runStage(run: AgentRun): string {
 }
 
 function hasExecutionDisabledEvidence(runs: AgentRun[], artifacts: Artifact[]): boolean {
-  for (const artifact of [...artifacts].reverse()) {
-    if (isRecord(artifact.metadata) && typeof artifact.metadata.repositoryWrites === 'boolean') {
-      return artifact.metadata.repositoryWrites === false
-    }
-  }
-
   const latestHandoff = [...runs].reverse().find((run) => run.agentType === 'handoff')
   if (latestHandoff) return latestHandoff.modelIdUsed === 'forge-handoff/no-op'
 
-  return [...artifacts].reverse().some((artifact) =>
-    artifact.content.includes('Repository writes and specialist model execution are disabled'),
-  )
+  return [...artifacts].reverse().some(artifactShowsDisabledHandoff)
 }
 
-function taskProgressSummary(input: {
+export function taskProgressSummary(input: {
   status: string
   workPackages: WorkPackage[]
   approvalGates: ApprovalGate[]
@@ -1899,6 +2861,7 @@ function taskProgressSummary(input: {
 }): { stage: string; nextAction: string; detail: string } {
   const openQuestions = input.questions.filter((question) => question.status !== 'answered').length
   const runningPackage = input.workPackages.find((pkg) => stringField(pkg, ['status', 'state']) === 'running')
+  const blockedPackage = input.workPackages.find((pkg) => stringField(pkg, ['status', 'state']) === 'blocked')
   const awaitingReviewPackage = input.workPackages.find((pkg) => stringField(pkg, ['status', 'state']) === 'awaiting_review')
   const needsReworkPackage = input.workPackages.find((pkg) => stringField(pkg, ['status', 'state']) === 'needs_rework')
   const readyPackage = input.workPackages.find((pkg) => stringField(pkg, ['status', 'state']) === 'ready')
@@ -1922,13 +2885,23 @@ function taskProgressSummary(input: {
     }
   }
 
+  if (blockedPackage) {
+    const title = stringField(blockedPackage, ['title', 'name']) || 'work package'
+    const reason = stringField(blockedPackage, ['blockedReason'])
+    return {
+      stage: `Blocked: ${title}`,
+      nextAction: 'Resolve the block, then retry handoff from the blocked package.',
+      detail: reason || 'A package is blocked before execution can continue.',
+    }
+  }
+
   if (awaitingReviewPackage) {
     return {
       stage: `Review: ${stringField(awaitingReviewPackage, ['title', 'name']) || 'work package'}`,
       nextAction: 'Review package output, then approve, request changes, or reject it.',
       detail: executionDisabled
         ? 'Execution is disabled; this review covers handoff output and no repository files were changed.'
-        : 'Review gates must pass before the package is marked complete.',
+        : 'Review gates cover sandbox output under .forge/task-runs; host repository evidence is readiness/status only.',
     }
   }
 
@@ -1945,8 +2918,8 @@ function taskProgressSummary(input: {
       stage: `Implementation: ${stringField(runningPackage, ['title', 'name']) || 'work package'}`,
       nextAction: 'Wait for output and review gates.',
       detail: executionDisabled
-        ? 'Execution is disabled; Forge is creating reviewable handoff output without repository writes.'
-        : 'A specialist package is currently running.',
+        ? 'Execution is disabled; Forge is creating reviewable handoff output without sandbox files or host repository writes.'
+        : 'A specialist package is running in the .forge/task-runs sandbox.',
     }
   }
 
@@ -1954,7 +2927,7 @@ function taskProgressSummary(input: {
     return {
       stage: `Ready: ${stringField(readyPackage, ['title', 'name']) || 'work package'}`,
       nextAction: 'Worker handoff is ready for the next package.',
-      detail: 'Dependencies are satisfied for this package.',
+      detail: 'Dependencies are satisfied. With FORGE_WORK_PACKAGE_EXECUTION=1, the worker can run this package in the sandbox.',
     }
   }
 
@@ -1969,7 +2942,7 @@ function taskProgressSummary(input: {
   }
 
   if (input.status === 'completed') {
-    return { stage: 'Completed', nextAction: 'Review artifacts or pull request output.', detail: 'All required gates are complete.' }
+    return { stage: 'Completed', nextAction: 'Review artifacts and sandbox output.', detail: 'All required gates are complete.' }
   }
 
   if (input.status === 'failed') {
@@ -2115,6 +3088,8 @@ export default function TaskDetailPage() {
   const [replanFeedback, setReplanFeedback] = useState('')
   const [retryProviderId, setRetryProviderId] = useState<string | null>(null)
   const [optimisticTaskStatus, setOptimisticTaskStatus] = useState<string | null>(null)
+  const [retryCardCollapsing, setRetryCardCollapsing] = useState(false)
+  const [retrySubmitted, setRetrySubmitted] = useState(false)
 
   // SSE stream
   const {
@@ -2127,7 +3102,7 @@ export default function TaskDetailPage() {
   } = useTaskStream(taskId)
 
   // Merge initial data with live stream data
-  const mergedRuns: AgentRun[] = streamRuns.length > 0 ? streamRuns : initialRuns
+  const mergedRuns: AgentRun[] = mergeTaskRuns(initialRuns, streamRuns)
   const mergedArtifacts: Artifact[] = mergeArtifacts(initialArtifacts, streamArtifacts)
   // streamQuestions is null until the SSE layer has reported a definitive
   // question set (even an empty one); only fall back to the once-fetched
@@ -2300,8 +3275,52 @@ export default function TaskDetailPage() {
         const body = await res.json().catch(() => ({}))
         throw new Error(body.error ?? 'Failed to retry task')
       }
+      setRetrySubmitted(true)
+      setRetryCardCollapsing(true)
       setOptimisticTaskStatus('pending')
+      window.setTimeout(() => {
+        void loadTask().finally(() => {
+          setRetryCardCollapsing(false)
+          setRetrySubmitted(false)
+        })
+      }, 900)
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
+  async function handleStopTask() {
+    if (!window.confirm('Stop this task now? Running package work will be marked cancelled.')) return
+    setActionLoading(true)
+    setActionError(null)
+    try {
+      const res = await fetch(`/api/tasks/${taskId}`, { method: 'DELETE' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to stop task')
+      }
+      setOptimisticTaskStatus('cancelled')
       await loadTask()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
+  async function handleDeleteTask() {
+    if (!window.confirm('Delete this task and its run history? This cannot be undone.')) return
+    setActionLoading(true)
+    setActionError(null)
+    try {
+      const res = await fetch(`/api/tasks/${taskId}?mode=delete`, { method: 'DELETE' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to delete task')
+      }
+      router.push('/dashboard/tasks')
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
     } finally {
@@ -2344,10 +3363,14 @@ export default function TaskDetailPage() {
     )
   }
 
-  const isAwaitingApproval = (currentStatus ?? task.status) === 'awaiting_approval'
-  const isApproved = (currentStatus ?? task.status) === 'approved'
+  const effectiveTaskStatus = currentStatus ?? task.status
+  const isAwaitingApproval = effectiveTaskStatus === 'awaiting_approval'
   const hasBlockedPackage = workPackages.some((pkg) => stringField(pkg, ['status', 'state']) === 'blocked')
-  const canRetryTask = ['failed', 'cancelled', 'rejected'].includes(currentStatus ?? task.status)
+  const canRetryHandoff = canRetryHandoffForTaskStatus(effectiveTaskStatus, hasBlockedPackage)
+  const canRetryTask = ['failed', 'cancelled', 'rejected'].includes(effectiveTaskStatus)
+  const canShowRetryTask = canRetryTask || retryCardCollapsing
+  const canStopTask = canStopTaskStatus(effectiveTaskStatus)
+  const canDeleteTask = canDeleteTaskStatus(effectiveTaskStatus)
   const plannedAgents = plannedAgentsFromArtifacts(mergedArtifacts)
   const capabilityClassification = latestCapabilityClassificationFromArtifacts(mergedArtifacts)
   const mcpExecutionDesign = latestMcpExecutionDesignFromArtifacts(mergedArtifacts)
@@ -2381,7 +3404,7 @@ export default function TaskDetailPage() {
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-3">
               <h1 className="text-xl font-semibold text-foreground">{task.title}</h1>
-              {statusBadge(currentStatus ?? task.status)}
+              {statusBadge(effectiveTaskStatus)}
             </div>
 
             {/* GitHub PR link */}
@@ -2396,6 +3419,32 @@ export default function TaskDetailPage() {
                 View Pull Request
                 <ExternalLinkIcon className="size-3.5" aria-hidden="true" />
               </a>
+            )}
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {canStopTask && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void handleStopTask()}
+                disabled={actionLoading}
+                aria-busy={actionLoading}
+              >
+                <SquareIcon aria-hidden="true" />
+                Stop
+              </Button>
+            )}
+            {canDeleteTask && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void handleDeleteTask()}
+                disabled={actionLoading}
+                aria-busy={actionLoading}
+              >
+                <Trash2Icon aria-hidden="true" />
+                Delete
+              </Button>
             )}
           </div>
         </div>
@@ -2428,13 +3477,15 @@ export default function TaskDetailPage() {
         artifacts={mergedArtifacts}
       />
 
-      {isApproved && !hasBlockedPackage && (
-        <section aria-label="Retry approved handoff" className="mb-6">
+      {canRetryHandoff && (
+        <section aria-label={effectiveTaskStatus === 'running' ? 'Retry running handoff' : 'Retry approved handoff'} className="mb-6">
           <RetryHandoffControls
-            blockedReason="The task is approved. If the handoff worker did not pick it up, retry will safely re-enqueue the approval job."
+            blockedReason={effectiveTaskStatus === 'running'
+              ? 'The task is running. If a handoff worker was interrupted, retry will safely re-enqueue recovery and continue eligible packages.'
+              : 'The task is approved. If the handoff worker did not pick it up, retry will safely re-enqueue the approval job.'}
             taskId={taskId}
             onRetried={loadTask}
-            title="Retry approved handoff"
+            title={effectiveTaskStatus === 'running' ? 'Retry running handoff' : 'Retry approved handoff'}
           />
         </section>
       )}
@@ -2621,57 +3672,66 @@ export default function TaskDetailPage() {
             </div>
           )}
 
-          {canRetryTask && (
-            <form onSubmit={handleRetry} className="mb-6 rounded-lg border border-border bg-card p-4">
-              <div className="mb-3 flex items-start gap-2 text-sm text-muted-foreground">
-                <CircleAlertIcon className="mt-0.5 size-4 shrink-0 text-amber-600" aria-hidden="true" />
-                <p>
-                  Retry requeues this task from the beginning. Switching models can change the plan output; use it when the previous provider is offline or unsuitable.
-                </p>
-              </div>
-              <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
-                <div className="flex flex-col gap-1.5">
-                  <label htmlFor="retry-provider" className="text-sm font-medium text-foreground">
-                    Model
-                  </label>
-                  <Select
-                    value={retryProviderId ?? 'task-default'}
-                    onValueChange={(value) => setRetryProviderId(value === 'task-default' ? null : value)}
-                    disabled={actionLoading}
-                  >
-                    <SelectTrigger id="retry-provider" className="w-full">
-                      <span data-slot="select-value" className="truncate">
-                        {retryProviderId
-                          ? providers.find((provider) => provider.id === retryProviderId)?.displayName ?? 'Selected provider'
-                          : 'Task default'}
-                      </span>
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="task-default">Task default</SelectItem>
-                      {providers.map((provider) => (
-                        <SelectItem key={provider.id} value={provider.id}>
-                          {provider.displayName} · {providerModelLabel(provider)}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <Button type="submit" size="sm" disabled={actionLoading} aria-busy={actionLoading}>
-                  {actionLoading ? 'Requeueing…' : 'Retry task'}
-                </Button>
-              </div>
-              {actionError !== null && (
-                <p role="alert" aria-live="assertive" className="mt-3 text-sm text-destructive">
-                  {actionError}
+          {canShowRetryTask && (
+            <>
+              {retrySubmitted && actionError === null && (
+                <p role="status" aria-live="polite" className="mb-3 text-sm text-muted-foreground">
+                  Retry submitted. Forge is waiting for a worker to pick up the task.
                 </p>
               )}
-            </form>
-          )}
-
-          {optimisticTaskStatus !== null && (
-            <div className="mb-6 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200" role="status" aria-live="polite">
-              Retry submitted. Forge is waiting for a worker to pick up the task.
-            </div>
+              <form
+                onSubmit={handleRetry}
+                aria-label="Retry task"
+                className={[
+                  'mb-6 overflow-hidden rounded-lg border border-border bg-card transition-all duration-300 ease-out',
+                  retryCardCollapsing ? 'max-h-0 border-transparent p-0 opacity-0' : 'max-h-[18rem] p-4 opacity-100',
+                ].join(' ')}
+                aria-hidden={retryCardCollapsing}
+              >
+                <div className="mb-3 flex items-start gap-2 text-sm text-muted-foreground">
+                  <CircleAlertIcon className="mt-0.5 size-4 shrink-0 text-amber-600" aria-hidden="true" />
+                  <p>
+                    Retry requeues this task from the beginning. Switching models can change the plan output; use it when the previous provider is offline or unsuitable.
+                  </p>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
+                  <div className="flex flex-col gap-1.5">
+                    <label htmlFor="retry-provider" className="text-sm font-medium text-foreground">
+                      Model
+                    </label>
+                    <Select
+                      value={retryProviderId ?? 'task-default'}
+                      onValueChange={(value) => setRetryProviderId(value === 'task-default' ? null : value)}
+                      disabled={actionLoading}
+                    >
+                      <SelectTrigger id="retry-provider" className="w-full">
+                        <span data-slot="select-value" className="truncate">
+                          {retryProviderId
+                            ? providers.find((provider) => provider.id === retryProviderId)?.displayName ?? 'Selected provider'
+                            : 'Task default'}
+                        </span>
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="task-default">Task default</SelectItem>
+                        {providers.map((provider) => (
+                          <SelectItem key={provider.id} value={provider.id}>
+                            {provider.displayName} · {providerModelLabel(provider)}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <Button type="submit" size="sm" disabled={actionLoading || retryCardCollapsing} aria-busy={actionLoading}>
+                    {actionLoading ? 'Requeueing…' : 'Retry task'}
+                  </Button>
+                </div>
+                {actionError !== null && (
+                  <p role="alert" aria-live="assertive" className="mt-3 text-sm text-destructive">
+                    {actionError}
+                  </p>
+                )}
+              </form>
+            </>
           )}
 
           {/* Architect-selected agents/resources and MCP access, grouped with
@@ -2684,11 +3744,11 @@ export default function TaskDetailPage() {
           {/* Agent run timeline */}
           <section aria-labelledby="runs-heading" className="mb-6">
             <h2 id="runs-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
-              Agent activity
+              Agent history
             </h2>
             {mergedRuns.length === 0 ? (
               <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center">
-                <p className="text-sm text-muted-foreground">No agent activity yet.</p>
+                <p className="text-sm text-muted-foreground">No agent history yet.</p>
               </div>
             ) : (
               <ul
@@ -2700,23 +3760,17 @@ export default function TaskDetailPage() {
                 ))}
               </ul>
             )}
-          </section>
-
-          {/* Task attempt history */}
-          <section aria-labelledby="attempts-heading" className="mb-6">
-            <h2 id="attempts-heading" className="mb-3 text-sm font-medium text-muted-foreground uppercase tracking-wide">
-              Retry history
-            </h2>
-            {attempts.length === 0 ? (
-              <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center">
-                <p className="text-sm text-muted-foreground">No retry history yet.</p>
-              </div>
-            ) : (
-              <ul className="rounded-lg border border-border" aria-label="Task attempt history">
-                {attempts.map((attempt) => (
-                  <TaskAttemptRow key={attempt.id} attempt={attempt} runs={mergedRuns} />
-                ))}
-              </ul>
+            {attempts.length > 0 && (
+              <details className="mt-3 rounded-lg border border-border bg-muted/20 px-3 py-2">
+                <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
+                  Queue attempts
+                </summary>
+                <ul className="mt-2 rounded-lg border border-border bg-background" aria-label="Queue attempt history">
+                  {attempts.map((attempt) => (
+                    <TaskAttemptRow key={attempt.id} attempt={attempt} runs={mergedRuns} />
+                  ))}
+                </ul>
+              </details>
             )}
           </section>
         </div>
@@ -2731,6 +3785,7 @@ export default function TaskDetailPage() {
             taskId={taskId}
             onGateDecided={loadTask}
             artifacts={mergedArtifacts}
+            runs={mergedRuns}
           />
 
           {/* Artifacts — Implementation Plan now lives in its own top-level

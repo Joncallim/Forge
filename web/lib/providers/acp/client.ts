@@ -2,7 +2,7 @@ import { getAcpAdapterCommand } from './handshake'
 import { ACP_PROTOCOL_VERSION } from './handshake'
 import type { AcpModelSelectionSupport } from './catalog'
 import { buildAcpModelConfigRequest } from './model-selection'
-import { AcpTransport, defaultAcpSpawn, type AcpSpawn } from './transport'
+import { AcpTransport, buildAcpSpawnOptions, defaultAcpSpawn, type AcpSpawn } from './transport'
 import { redactAdapterMessage } from './redaction'
 
 // ---------------------------------------------------------------------------
@@ -78,7 +78,11 @@ export class AcpSessionClient {
       throw new AcpStartupError(`No ACP adapter is wired up for agent "${agentId}".`)
     }
 
-    const transport = new AcpTransport(command, options.spawnFn ?? defaultAcpSpawn)
+    const transport = new AcpTransport(
+      command,
+      options.spawnFn ?? defaultAcpSpawn,
+      buildAcpSpawnOptions({ cwd: sessionCwd }),
+    )
     try {
       try {
         await transport.request(

@@ -2,6 +2,7 @@ import { execFile as execFileCallback } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
+import { sanitizeWorkerMessage } from './redaction'
 import { db } from '@/db'
 import { repositoryCommandAudits } from '@/db/schema'
 
@@ -12,8 +13,9 @@ const MAX_OUTPUT_BYTES = 12 * 1024
 const MAX_DIFF_BYTES = 24 * 1024
 const MAX_STATUS_BUFFER_BYTES = 8 * 1024 * 1024
 const STATUS_UNAVAILABLE_MARKER = '?? .forge-status-unavailable\0'
+const SAFE_ENV_KEYS = ['PATH', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR'] as const
 
-export type CommandRiskClass = 'read_only' | 'local_validation'
+export type CommandRiskClass = 'read_only'
 export type RepositoryEvidenceStatus = 'ready' | 'blocked' | 'failed' | 'complete' | 'validation_skipped'
 
 export type RepositoryEvidenceProject = {
@@ -137,10 +139,48 @@ function blocked(
   }
 }
 
+function scopedCommandEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    NODE_ENV: process.env.NODE_ENV ?? 'production',
+  }
+  for (const key of SAFE_ENV_KEYS) {
+    if (process.env[key]) env[key] = process.env[key]
+  }
+
+  return {
+    ...env,
+    CI: '1',
+    GIT_ASKPASS: 'true',
+    GIT_CONFIG_COUNT: '7',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_KEY_0: 'core.fsmonitor',
+    GIT_CONFIG_KEY_1: 'core.untrackedCache',
+    GIT_CONFIG_KEY_2: 'diff.external',
+    GIT_CONFIG_KEY_3: 'core.askPass',
+    GIT_CONFIG_KEY_4: 'credential.helper',
+    GIT_CONFIG_KEY_5: 'interactive.diffFilter',
+    GIT_CONFIG_KEY_6: 'filter.lfs.process',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_VALUE_0: 'false',
+    GIT_CONFIG_VALUE_1: 'false',
+    GIT_CONFIG_VALUE_2: '',
+    GIT_CONFIG_VALUE_3: 'true',
+    GIT_CONFIG_VALUE_4: '',
+    GIT_CONFIG_VALUE_5: '',
+    GIT_CONFIG_VALUE_6: '',
+    GIT_EDITOR: 'true',
+    GIT_OPTIONAL_LOCKS: '0',
+    GIT_PAGER: 'cat',
+    GIT_TERMINAL_PROMPT: '0',
+    PAGER: 'cat',
+    SSH_ASKPASS: 'true',
+  }
+}
+
 async function git(cwd: string, argv: string[], maxBytes = MAX_OUTPUT_BYTES): Promise<string> {
   const result = await execFile('git', argv, {
     cwd,
-    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    env: scopedCommandEnv(),
     maxBuffer: maxBytes * 2,
     timeout: 30_000,
   })
@@ -150,7 +190,7 @@ async function git(cwd: string, argv: string[], maxBytes = MAX_OUTPUT_BYTES): Pr
 async function gitRaw(cwd: string, argv: string[], maxBuffer = MAX_STATUS_BUFFER_BYTES): Promise<string> {
   const result = await execFile('git', argv, {
     cwd,
-    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    env: scopedCommandEnv(),
     maxBuffer,
     timeout: 30_000,
   })
@@ -384,14 +424,6 @@ export async function detectProjectValidationCommands(cwd: string): Promise<stri
   return commands
 }
 
-async function isDetectedValidationCommand(cwd: string, command: string, argv: string[]): Promise<boolean> {
-  if (command !== 'npm') return false
-  const normalized = [command, ...argv].join(' ')
-  return (await detectProjectValidationCommands(cwd))
-    .map((parts) => parts.join(' '))
-    .includes(normalized)
-}
-
 export async function scopedCommandRisk(input: ScopedCommandInput): Promise<CommandRiskClass> {
   assertNoShellForm(input)
 
@@ -407,19 +439,16 @@ export async function scopedCommandRisk(input: ScopedCommandInput): Promise<Comm
   if (isPackageInstall(input.command, input.argv)) {
     throw new Error('Blocked package install command.')
   }
+  if (['npm', 'pnpm', 'yarn'].includes(input.command)) {
+    throw new Error('Blocked host package manager validation command for repository evidence.')
+  }
   if (input.command === 'git' && isAllowedGitReadOnly(input.argv)) return 'read_only'
-  if (await isDetectedValidationCommand(input.cwd, input.command, input.argv)) return 'local_validation'
 
   throw new Error(`Command is not allowed for repository evidence: ${commandLabel(input)}`)
 }
 
 export function redactCommandOutput(value: string): string {
-  return value
-    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[REDACTED_PRIVATE_KEY]')
-    .replace(/\b(authorization:\s*bearer\s+)[^\s]+/gi, '$1[REDACTED_TOKEN]')
-    .replace(/\b(token|api[_-]?key|password|secret)=([^\s&]+)/gi, '$1=[REDACTED_TOKEN]')
-    .replace(/\b(?:ghp|gho|ghu|ghs|github_pat|sk|xox[baprs])_[A-Za-z0-9_=-]{10,}\b/g, '[REDACTED_TOKEN]')
-    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED_TOKEN]')
+  return sanitizeWorkerMessage(value)
 }
 
 export async function runScopedRepositoryCommand(input: ScopedCommandInput): Promise<ScopedCommandResult> {
@@ -433,7 +462,7 @@ export async function runScopedRepositoryCommand(input: ScopedCommandInput): Pro
   try {
     const result = await execFile(input.command, input.argv, {
       cwd,
-      env: { ...process.env, CI: '1', GIT_TERMINAL_PROMPT: '0' },
+      env: scopedCommandEnv(),
       maxBuffer: Math.max(MAX_OUTPUT_BYTES, MAX_DIFF_BYTES) * 2,
       timeout: COMMAND_TIMEOUT_MS,
     })

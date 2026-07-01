@@ -11,15 +11,20 @@ worker is the execution plane for queued tasks.
 Today, the worker runs the Architect planning stage, saves a Markdown plan,
 asks follow-up questions when needed, and pauses for human approval.
 Workforce materialization and handoff are enabled unless explicitly disabled, so
-approved plans can move into durable work-package and gate state. Generated
-package execution is still opt-in with `FORGE_WORK_PACKAGE_EXECUTION=1`, and
-generated output is written only inside per-task sandboxes. This path does not
-apply edits to the host repository, grant MCP runtime access to specialists,
-create commits, open pull requests, merge work, or run specialists in parallel.
+Architect completion materializes durable work-package and gate state before
+`awaiting_approval`; approval releases ready packages. Generated package
+execution is opt-in with `FORGE_WORK_PACKAGE_EXECUTION=1`, and generated
+output is written only inside per-package attempt sandboxes at
+`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`.
 
-The next approved epic is #119, "Executable Workforce Beta:
-capability-brokered sequential specialist execution." It sits under #30 and
-treats #43 and #60 as core scope.
+Issue #119, "Executable Workforce Beta: capability-brokered sequential
+specialist execution," is the exact beta boundary for executable packages. It
+adds bounded read-only host-repository context, sandbox-only output, capability
+brokerage, manual QA/Reviewer/Security gates, structured security findings for
+high-risk work, and precise grant terminology. It does not apply edits to the
+host repository, grant live MCP runtime access, create commits, open pull
+requests, merge work, run autonomous reviewer agents, or run specialists in
+parallel.
 
 After sequential sandboxed Workforce execution is reliable, the next major
 product direction is **Forge Workspace**: a dockable, AI-assisted workbench that
@@ -29,9 +34,9 @@ but the product should be framed and implemented as a workspace shell rather
 than a full operating system.
 
 Short version: Forge is useful today as a local planning and approval control
-room. The next big milestone is making sequential specialist execution reliable
-inside sandboxes before Forge is trusted with host-repository writes or pull
-request automation. The following major direction is the Forge Workspace shell
+room. The current executable milestone is making sequential specialist execution
+reliable inside sandboxes before Forge is trusted with host-repository writes or
+pull request automation. The following major direction is the Forge Workspace shell
 and link graph that preserve context between tools.
 
 ## Operational Understanding
@@ -84,20 +89,73 @@ Current UX follow-up:
 Run from `web/` before release:
 
 ```bash
+git diff --check
 npm run lint
-npx tsc --noEmit
+npx tsc --noEmit --pretty false
 npm test
 npm run build
 ```
 
-Latest recorded local gate result, from 2026-06-24:
+Latest recorded local validation snapshot, from 2026-07-01. This records gate
+command status only; it does not mean final review is complete.
 
 ```bash
-npm run lint              # pass
-npx tsc --noEmit          # pass
-npm test                  # pass, 187 tests
-npm run build             # pass, with existing Turbopack NFT trace warning
+git diff --check                      # pass
+npm run lint                         # pass
+npx tsc --noEmit --pretty false      # pass
+npm test                             # pass, 48 files, 581 tests
+npm run build                        # pass, with known non-fatal Turbopack NFT trace warning
 ```
+
+The build warning traces through `next.config.ts`,
+`worker/repository-evidence.ts`, `worker/work-package-handoff.ts`, and
+`worker/orchestrator.ts`, then `worker/runtime.ts` from `instrumentation.ts`.
+
+### Executable Workforce Beta Boundary (#119)
+
+The #119 beta is deliberately narrower than autonomous coding. It proves that
+Forge can hand one approved specialist package to a model, collect bounded
+read-only host context, write generated output to a package sandbox, and hold
+that output behind human review.
+
+In scope:
+
+1. Execute one eligible specialist package at a time after Architect plan
+   approval and capability-broker admission.
+2. Provide specialists with bounded, inspectable host-repository context. This
+   can include a limited file list, selected source/context artifacts, repository
+   evidence, previous artifacts, package inputs, acceptance criteria, and rework
+   feedback. It is not an unbounded filesystem grant.
+3. Write generated files only under
+   `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`.
+4. Keep sandbox artifacts visibly separate from host-repository changes,
+   branches, commits, and PR output.
+5. Store package run artifacts, generated file lists, validation command
+   results, repository evidence, blocked reasons, review source artifacts, and
+   rework decisions.
+6. Require manual QA and Reviewer gates before implementation output is
+   accepted. High-risk packages also require a manual Security gate.
+7. Require structured security findings for high-risk output, with review
+   surface, asset, trust boundary, exploit path, impact, required fix, evidence
+   refs, severity, confidence, and verification state.
+8. Distinguish grant stages: Architect-proposed grants, Forge broker decisions,
+   operator-approved grant snapshots, and effective run-scoped instructions.
+9. Treat `agent_harnesses` as planning/routing metadata, not execution policy.
+
+Still out of scope:
+
+- Live MCP runtime grants or credentials for specialists.
+- Host-repository writes outside `.forge/task-runs`.
+- Applying generated sandbox files back into the project tree.
+- Branch creation, commits, check polling, pull requests, merges, issue
+  auto-closure, or release automation.
+- Parallel specialist execution.
+- User-edited grant scopes.
+- Autonomous QA, Reviewer, or Security agent runs as gates.
+- Harness-enforced tool policy, reference-path policy, output schema validation,
+  or execution policy.
+- Default-on package execution before the release gate, documentation, QA,
+  Reviewer, Adversarial review, and manual/operator smoke path all pass.
 
 ## Technical Details
 
@@ -308,19 +366,33 @@ Current build slice:
 5. Keep host repository writes, commits, PRs, and merges out of this slice.
    Work-package handoff and execution remain feature-flagged and sandbox-only.
 
-Next approved epic: #119 Executable Workforce Beta:
+Executable beta epic: #119 Executable Workforce Beta:
 
 1. Route Architect work packages through capability brokerage instead of only
    fixed stage names (#43).
 2. Run specialist packages sequentially through the sandbox execution path
-   (#60).
-3. Store handoff, execution, command, QA, and Reviewer artifacts on the task.
-4. Add QA and Reviewer gates before generated output can be accepted.
-5. Require security review for auth, secrets, filesystem, command execution,
-   repository-write, tool-permission, prompt-injection, and merge-automation
-   work.
-6. Keep MCP runtime grants, host repository writes, commits, PR creation, merge
-   automation, and parallel execution out of the beta.
+   (#60), with bounded read-only host-repository context and sandbox-only
+   output.
+3. Store handoff, execution, command, QA, Reviewer, Security, repository
+   evidence, rework, and blocked-state artifacts on the task.
+4. Add manual QA and Reviewer gates before generated implementation output can
+   be accepted. These labels do not imply autonomous reviewer agent execution
+   in this beta.
+5. Require manual Security gates and structured security findings for auth,
+   secrets, filesystem, command execution, MCP/tool grants, GitHub writes,
+   repository-write, prompt-injection, data/privacy, and merge-automation work.
+6. Preserve rework context: review reasons, source artifacts, attempt numbers,
+   stale-gate replacement, and terminal failure handling for repeated package
+   failure or rejection.
+7. Keep grant states distinct: Architect-proposed grants, Forge broker
+   decisions, operator-approved grant snapshots, and effective run-scoped
+   instructions.
+8. Keep `agent_harnesses` planning-only for this beta. Harness prompts, tool
+   policies, reference paths, output schemas, and validation checks are not
+   execution policy until a later slice wires them in.
+9. Keep MCP runtime grants, host repository writes, commits, PR creation, merge
+   automation, user-edited grants, agent-run review gates, harness execution
+   policy, default-on execution, and parallel execution out of the beta.
 
 Deferred:
 
@@ -328,6 +400,8 @@ Deferred:
   capability brokerage, QA/Reviewer gates, and security review are reliable.
 - Repository checkout, branch management, commits, PR creation, and merge/rework
   gates remain future slices after #119.
+- Live MCP grant issuance, editable grant scopes, autonomous reviewer agents,
+  and harness-enforced execution policy remain future slices after #119.
 
 Risks:
 
@@ -480,11 +554,11 @@ wrapper over existing install, uninstall, web, and recovery scripts.
 ### ACP Provider Direction
 
 ACP support makes Forge a client for local coding agents rather than only a
-client for direct model APIs. The current path uses Zed adapter packages for
-Codex CLI and Claude Code:
+client for direct model APIs. The current path uses pinned Agent Client
+Protocol adapter packages for Codex CLI and Claude Code:
 
 ```text
-Forge -> Zed ACP adapter -> local CLI -> logged-in model account
+Forge -> pinned ACP adapter -> local CLI -> logged-in model account
 ```
 
 This is useful because it lets Forge call tools that already have their own CLI
@@ -499,8 +573,8 @@ Near-term ACP work:
    missing auth, and missing project folders.
 2. Expand runtime strategies only after the current Codex CLI and Claude Code
    paths are reliable.
-3. Keep ACP execution behind the same Workforce and sandbox safety gates as
-   other specialist execution.
+3. Keep ACP-backed package execution disabled until local coding CLIs can run
+   behind a hard filesystem and tool sandbox.
 4. Document runtime-specific model-selection behavior instead of promising a
    universal model picker.
 
@@ -519,6 +593,7 @@ Primary source docs:
 - `docs/design.md`
 - `docs/adr/0004-cross-agent-checkpointing.md`
 - `docs/adr/0005-workforce-orchestration-graph.md`
+- `docs/adr/0006-executable-workforce-beta-boundary.md`
 
 Current implementation anchors:
 
