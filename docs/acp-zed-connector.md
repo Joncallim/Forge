@@ -2,7 +2,7 @@
 
 This page explains Forge's Agent Client Protocol support in plain English.
 
-## Plain-English Summary
+## Introduction
 
 ACP is a small protocol for talking to coding agents over standard input and
 standard output. Think of it as a shared plug shape. Forge can send a prompt to
