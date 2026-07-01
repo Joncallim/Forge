@@ -28,6 +28,8 @@ describe('execution context packet', () => {
     const rawJsonSecret = 'raw-json-secret'
     const fakeGithubPat = fixtureSecret('github', '_pat_', '1234567890', 'abcdefghijklmnop')
     const fakeOpenAiProjectToken = fixtureSecret('sk', '-proj-', 'rawtokensuffix', '1234567890')
+    const fakeStripeSecret = fixtureSecret('sk', '_live_', 'rawstripesecret', '1234567890')
+    const spacedPasswordSecret = 'raw-spaced-password-secret'
     const privateKeyBegin = fixtureSecret('-----BEGIN ', 'PRIVATE KEY-----')
     const privateKeyEnd = fixtureSecret('-----END ', 'PRIVATE KEY-----')
     const fakeJwt = fixtureSecret(
@@ -53,6 +55,8 @@ describe('execution context packet', () => {
       `FORGE_ENCRYPTION_KEY=${rawEncryptionKey}`,
       `{"clientSecret":"${rawJsonSecret}","database_url":"postgres://json_user:json_pass@example.com/app"}`,
       'yaml_password: "raw yaml password"',
+      `password = ${spacedPasswordSecret}`,
+      fakeStripeSecret,
       "toml_secret = 'raw toml secret'",
       'DATABASE_URL=postgres://db_user:db_pass@localhost:5432/app',
       'remote=https://url_user:url_pass@example.com/repo.git',
@@ -132,6 +136,7 @@ describe('execution context packet', () => {
       expect(formatted).toContain('FORGE_ENCRYPTION_KEY=[REDACTED_TOKEN]')
       expect(formatted).toContain('"clientSecret":"[REDACTED_TOKEN]"')
       expect(formatted).toContain('yaml_password: "[REDACTED_TOKEN]"')
+      expect(formatted).toContain('password = [REDACTED_TOKEN]')
       expect(formatted).toContain("toml_secret = '[REDACTED_TOKEN]'")
       expect(formatted).toContain('DATABASE_URL=[REDACTED_TOKEN]')
       expect(formatted).toContain('remote=https://[REDACTED_USERINFO]@example.com/repo.git')
@@ -149,6 +154,8 @@ describe('execution context packet', () => {
       expect(formatted).not.toContain(rawJsonSecret)
       expect(formatted).not.toContain('json_pass')
       expect(formatted).not.toContain('raw yaml password')
+      expect(formatted).not.toContain(spacedPasswordSecret)
+      expect(formatted).not.toContain(fakeStripeSecret)
       expect(formatted).not.toContain('raw toml secret')
       expect(formatted).not.toContain('db_pass')
       expect(formatted).not.toContain('url_pass')

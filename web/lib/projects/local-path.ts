@@ -42,8 +42,11 @@ export function assertProjectPathNotProtected(
   if (samePath(candidate, workspace.workspaceRoot)) {
     throw new Error('Project localPath cannot be the active Forge workspace root.')
   }
-  if (typeof workspace.projectsRoot === 'string' && samePath(candidate, workspace.projectsRoot)) {
-    throw new Error('Project localPath must be a child directory under the workspace projects root, not the projects root itself.')
+  // Reject the projects root itself and any ancestor that would enclose it: a
+  // project rooted above the projects root could reach every other project's
+  // files. Children under the projects root remain allowed.
+  if (typeof workspace.projectsRoot === 'string' && isWithinPath(candidate, workspace.projectsRoot)) {
+    throw new Error('Project localPath must be a child directory under the workspace projects root, not the projects root itself or an ancestor of it.')
   }
 
   for (const protectedDirectory of protectedWorkspaceDirectories(workspace)) {

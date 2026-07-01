@@ -184,7 +184,11 @@ function redactContextContent(value: string): { content: string; redactions: str
     redactions.add('netrc_credentials')
     return `${prefix}[REDACTED_TOKEN]`
   })
-  content = content.replace(/\b(password\s+)([^\s]+)/gi, (_match, prefix: string) => {
+  // The negative lookahead keeps this netrc-style rule from swallowing a lone
+  // `=`/`:` delimiter as the "value" when the input is really a spaced
+  // `password = <secret>` assignment; those are handled by the
+  // secret_like_assignments rules below.
+  content = content.replace(/\b(password\s+)(?![=:])([^\s]+)/gi, (_match, prefix: string) => {
     redactions.add('netrc_credentials')
     return `${prefix}[REDACTED_TOKEN]`
   })
@@ -231,11 +235,11 @@ function redactContextContent(value: string): { content: string; redactions: str
     redactions.add('database_urls')
     return '[REDACTED_DATABASE_URL]'
   })
-  content = content.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^@\s/]+@/gi, (_match, prefix: string) => {
+  content = content.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^\s/]+@/gi, (_match, prefix: string) => {
     redactions.add('url_userinfo')
     return `${prefix}[REDACTED_USERINFO]@`
   })
-  content = content.replace(/\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_=-]{10,}|xox[baprs]-[A-Za-z0-9-]{10,}|xox[baprs]_[A-Za-z0-9_=-]{10,})\b/g, () => {
+  content = content.replace(/\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_=-]{10,}|sk_[A-Za-z0-9_=-]{10,}|xox[baprs]-[A-Za-z0-9-]{10,}|xox[baprs]_[A-Za-z0-9_=-]{10,})\b/g, () => {
     redactions.add('well_known_token_prefixes')
     return '[REDACTED_TOKEN]'
   })

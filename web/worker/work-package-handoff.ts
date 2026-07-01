@@ -1432,6 +1432,13 @@ async function executeReadyWorkPackage(
     workPackageId: nextPackage.id,
   })
 
+  // Set when an inner catch has already recorded the package/run failure and is
+  // re-throwing. The outer catch decides "lease lost" by re-reading the package
+  // status, which the inner handler has already moved out of 'running'; without
+  // this flag a genuine failure would be misclassified as a lost lease and
+  // swallowed into a benign already_handed_off result.
+  let packageFailureHandled = false
+
   try {
   await publishTaskEventBestEffort(taskId, 'work_package:status', {
     status: 'running',
@@ -1506,6 +1513,7 @@ async function executeReadyWorkPackage(
       workPackageId: nextPackage.id,
     })
     heartbeat.stop()
+    packageFailureHandled = true
     throw err
   }
 
@@ -1765,6 +1773,13 @@ async function executeReadyWorkPackage(
       claimedPackageId: nextPackage.id,
     }
   } catch (err) {
+    if (packageFailureHandled) {
+      // An inner catch already recorded the failure and moved the package out of
+      // 'running'; propagate the error instead of misreading the status change
+      // as a lost lease.
+      heartbeat.stop()
+      throw err
+    }
     if (!executionLeaseReleased && (err instanceof ExecutionLeaseLostError || !(await executionLeaseOwned(nextPackage.id, run.id)))) {
       heartbeat.stop()
       return abandonLostExecutionLease({

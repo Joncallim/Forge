@@ -201,6 +201,10 @@ export class AcpTransport {
 
   close(): void {
     if (this.closed) return
+    // Reject any in-flight requests before flipping `closed`, otherwise the
+    // exit-driven rejectAllPending short-circuits on `this.closed` and the
+    // pending promises hang until their individual timeouts fire.
+    this.rejectAllPending(new Error('ACP transport was closed before the request completed.'))
     this.closed = true
     try {
       this.child.kill()

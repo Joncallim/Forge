@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  type AgentRun,
   agentRunFromStartedStreamEventData,
   artifactFromStreamEventData,
   mergeStreamAgentRun,
@@ -127,6 +128,35 @@ describe('streamed agent run helpers', () => {
       stage: 'implementation',
       status: 'completed',
       workPackageId: 'pkg-1',
+    }])
+  })
+
+  it('does not revert a terminal run to running when run:started replays', () => {
+    const completed: AgentRun = {
+      ...agentRunFromStartedStreamEventData({
+        runId: 'run-1',
+        agentType: 'frontend',
+        attemptNumber: 2,
+        modelIdUsed: 'model',
+        stage: 'implementation',
+        workPackageId: 'pkg-1',
+      }, 'task-1', '2026-06-30T09:59:00.000Z')!,
+      status: 'completed',
+      completedAt: '2026-06-30T10:05:00.000Z',
+    }
+    const replayedStart = agentRunFromStartedStreamEventData({
+      runId: 'run-1',
+      // Replayed start payloads may omit agentType/modelIdUsed.
+      startedAt: '2026-06-30T10:00:00.000Z',
+    }, 'task-1', '2026-06-30T10:00:00.000Z')
+
+    expect(replayedStart).not.toBeNull()
+    expect(mergeStreamAgentRun([completed], replayedStart!)).toMatchObject([{
+      id: 'run-1',
+      status: 'completed',
+      agentType: 'frontend',
+      modelIdUsed: 'model',
+      completedAt: '2026-06-30T10:05:00.000Z',
     }])
   })
 })

@@ -10,7 +10,7 @@ import { EventEmitter } from 'node:events'
 import { describe, it, expect, vi } from 'vitest'
 import { checkAcpReadiness, getAcpAdapterCommand, isAcpAdapterSupported } from '@/lib/providers/acp/handshake'
 import { AcpSessionClient } from '@/lib/providers/acp/client'
-import { buildAcpAdapterEnv } from '@/lib/providers/acp/transport'
+import { AcpTransport, buildAcpAdapterEnv } from '@/lib/providers/acp/transport'
 
 type AcpResponder = (method: string, id: number) => Record<string, unknown> | null
 
@@ -237,5 +237,20 @@ describe('AcpSessionClient', () => {
       windowsHide: true,
     }))
     client.close()
+  })
+})
+
+describe('AcpTransport.close', () => {
+  it('rejects in-flight requests instead of leaving them pending until timeout', async () => {
+    const child = new FakeChildProcess()
+    // Never respond, so the request stays pending until close() settles it.
+    child.responder = () => null
+    const transport = new AcpTransport(['adapter'], makeSpawnFn(child))
+
+    const pending = transport.request('initialize', {}, 30_000)
+    transport.close()
+
+    await expect(pending).rejects.toThrow(/closed before the request completed/i)
+    expect(child.kill).toHaveBeenCalled()
   })
 })

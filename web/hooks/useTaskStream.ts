@@ -113,10 +113,18 @@ export function agentRunFromStartedStreamEventData(
   }
 }
 
+const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled'])
+
 export function mergeAgentRun(existing: AgentRun, incoming: AgentRun): AgentRun {
   return {
     ...existing,
     ...incoming,
+    // Run lifecycle only moves forward. A replayed run:started (expected on SSE
+    // reconnect) must not revert an already terminal run back to 'running' or
+    // blank out its agentType/modelIdUsed.
+    status: TERMINAL_RUN_STATUSES.has(existing.status) ? existing.status : incoming.status,
+    agentType: incoming.agentType || existing.agentType,
+    modelIdUsed: incoming.modelIdUsed || existing.modelIdUsed,
     workPackageId: incoming.workPackageId ?? existing.workPackageId ?? null,
     stage: incoming.stage ?? existing.stage ?? null,
     attemptNumber: incoming.attemptNumber ?? existing.attemptNumber ?? null,

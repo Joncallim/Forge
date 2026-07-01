@@ -6,6 +6,7 @@ import {
   agentConfigs,
   agentHarnesses,
   approvalGates,
+  tasks,
   workPackageDependencies,
   workPackages,
 } from '../db/schema'
@@ -33,7 +34,7 @@ export type WorkforceMaterializationInput = {
 }
 
 export type WorkforceMaterializationResult = {
-  status: 'materialized' | 'disabled'
+  status: 'materialized' | 'disabled' | 'cancelled'
   harnessCount: number
   workPackageCount: number
   dependencyCount: number
@@ -423,7 +424,25 @@ export async function materializeWorkforceFromArchitectArtifact(
     .where(eq(agentConfigs.isActive, true))
   const rows = buildWorkforceMaterializationRows(input, { activeAgents })
 
+  // Guard against a concurrent operator stop (DELETE /api/tasks/:id). That route
+  // updates the task row inside a transaction; taking a FOR UPDATE lock here
+  // serializes the two so we either observe the pre-stop 'running' status (and
+  // any rows we insert are cancelled by the route's own workPackages/gate
+  // updates) or the committed 'cancelled' status (and we skip materialization
+  // entirely). Without this, a stop landing mid-plan would leave a cancelled
+  // task with freshly materialized pending work packages and an actionable
+  // plan_approval gate.
+  let cancelledDuringMaterialization = false
   await db.transaction(async (tx) => {
+    const [taskRow] = await tx
+      .select({ status: tasks.status })
+      .from(tasks)
+      .where(eq(tasks.id, input.taskId))
+      .for('update')
+    if (!taskRow || taskRow.status !== 'running') {
+      cancelledDuringMaterialization = true
+      return
+    }
     await tx
       .delete(approvalGates)
       .where(
@@ -485,6 +504,16 @@ export async function materializeWorkforceFromArchitectArtifact(
 
     await tx.insert(approvalGates).values(rows.approvalGate)
   })
+
+  if (cancelledDuringMaterialization) {
+    return {
+      status: 'cancelled',
+      harnessCount: 0,
+      workPackageCount: 0,
+      dependencyCount: 0,
+      approvalGateCount: 0,
+    }
+  }
 
   return {
     status: 'materialized',

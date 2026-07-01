@@ -3186,7 +3186,16 @@ export default function TaskDetailPage() {
 
   useEffect(() => {
     const actualStatus = taskStatus ?? task?.status ?? null
-    if (optimisticTaskStatus !== null && actualStatus !== null && actualStatus !== 'rejected') {
+    if (optimisticTaskStatus === null || actualStatus === null) return
+    // Clear the optimistic status once the server has caught up. The optimistic
+    // value can move the task either toward a terminal state (Stop → cancelled)
+    // or away from one (Retry → pending), so we keep it until the real status
+    // either matches it or lands on the same side of the terminal boundary;
+    // clearing on any non-matching status wipes the optimistic feedback before
+    // it can render.
+    const settled = actualStatus === optimisticTaskStatus ||
+      TERMINAL_TASK_STATUSES.has(actualStatus) === TERMINAL_TASK_STATUSES.has(optimisticTaskStatus)
+    if (settled) {
       setOptimisticTaskStatus(null)
     }
   }, [optimisticTaskStatus, taskStatus, task?.status])

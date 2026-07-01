@@ -721,7 +721,11 @@ async function runArchitect(
     }
 
     const completedAt = new Date()
-    await db
+    // Guard against a concurrent operator stop: the DELETE /api/tasks/:id route
+    // flips this run to 'cancelled'. Only complete the run if it is still
+    // 'running' so we do not resurrect a cancelled run (or publish a
+    // run:completed event contradicting the cancelled task).
+    const [completedRun] = await db
       .update(agentRuns)
       .set({
         status: 'completed',
@@ -729,15 +733,18 @@ async function runArchitect(
         outputTokens: usage.outputTokens,
         completedAt,
       })
-      .where(eq(agentRuns.id, run.id))
+      .where(and(eq(agentRuns.id, run.id), eq(agentRuns.status, 'running')))
+      .returning({ id: agentRuns.id })
 
-    await publishTaskEvent(task.id, 'run:completed', {
-      runId: run.id,
-      inputTokens: usage.inputTokens,
-      outputTokens: usage.outputTokens,
-      costUsd: null,
-      completedAt: completedAt.toISOString(),
-    })
+    if (completedRun) {
+      await publishTaskEvent(task.id, 'run:completed', {
+        runId: run.id,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        costUsd: null,
+        completedAt: completedAt.toISOString(),
+      })
+    }
 
     const checkpoint: PendingArchitectCheckpoint = {
       task,

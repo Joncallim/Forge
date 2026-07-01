@@ -20,9 +20,11 @@ vi.mock('@/lib/workspace', async () => {
   }
 })
 
+import type { WorkspaceSettings } from '@/lib/workspace'
 import {
   assertProjectLocalPathForExecution,
   assertProjectLocalPathPreflightAllowed,
+  assertProjectPathNotProtected,
 } from '@/lib/projects/local-path'
 
 function chain(resolveValue: unknown) {
@@ -113,5 +115,35 @@ describe('assertProjectLocalPathForExecution', () => {
 
     await expect(assertProjectLocalPathForExecution({ id: 'project-1', localPath: configRoot }))
       .rejects.toThrow(/workspace config directory/i)
+  })
+})
+
+describe('assertProjectPathNotProtected', () => {
+  const workspace = {
+    workspaceRoot: '/ws',
+    projectsRoot: '/ws/nested/projects',
+    configRoot: '/ws/config',
+    mcpsRoot: '/ws/mcps',
+    templatesRoot: '/ws/templates',
+    localMemoryRoot: '/ws/local-memory',
+    promptsRoot: '/ws/prompts',
+    workforcesRoot: '/ws/workforces',
+    runtimeRoot: '/ws/runtime',
+    logsRoot: '/ws/logs',
+    backupsRoot: '/ws/backups',
+  } as unknown as WorkspaceSettings
+
+  it('allows a normal child directory under the projects root', () => {
+    expect(() => assertProjectPathNotProtected('/ws/nested/projects/app', workspace)).not.toThrow()
+  })
+
+  it('rejects the projects root itself', () => {
+    expect(() => assertProjectPathNotProtected('/ws/nested/projects', workspace))
+      .toThrow(/projects root itself or an ancestor/i)
+  })
+
+  it('rejects an ancestor directory that encloses the projects root', () => {
+    expect(() => assertProjectPathNotProtected('/ws/nested', workspace))
+      .toThrow(/projects root itself or an ancestor/i)
   })
 })
