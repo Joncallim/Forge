@@ -1,6 +1,6 @@
 # Forge Roadmap
 
-Last updated: 2026-06-29
+Last updated: 2026-07-01
 
 ## Plain-English Summary
 
@@ -21,10 +21,18 @@ The next approved epic is #119, "Executable Workforce Beta:
 capability-brokered sequential specialist execution." It sits under #30 and
 treats #43 and #60 as core scope.
 
+After sequential sandboxed Workforce execution is reliable, the next major
+product direction is **Forge Workspace**: a dockable, AI-assisted workbench that
+brings browser, repo, notes, docs, Playwright, Notion, GitHub, terminals, logs,
+and task artifacts into one saved context. This should feel OS-like over time,
+but the product should be framed and implemented as a workspace shell rather
+than a full operating system.
+
 Short version: Forge is useful today as a local planning and approval control
 room. The next big milestone is making sequential specialist execution reliable
 inside sandboxes before Forge is trusted with host-repository writes or pull
-request automation.
+request automation. The following major direction is the Forge Workspace shell
+and link graph that preserve context between tools.
 
 ## Operational Understanding
 
@@ -338,6 +346,88 @@ Guardrails:
 - Require reviewer sign-off before merge or user approval.
 - Track cost, duration, and failure rate per harness.
 
+### P3 Forge Workspace And Tool Surfaces
+
+Forge Workspace is the next major product direction after the Workforce beta is
+reliable. It should make Forge feel like an AI-assisted workbench without taking
+on the scope of a full operating system.
+
+The product frame:
+
+```text
+Forge Workspace
+  -> dockable panes and saved layouts
+  -> browser, Playwright, repo, notes, docs, terminal/logs, Notion, and GitHub
+  -> task-scoped link graph
+  -> permissioned agent operations
+```
+
+The main product principle is context preservation. A Notion spec, GitHub issue,
+repo file, Forge task, Playwright run, Markdown plan, terminal log, and review
+artifact should be linkable as parts of the same task.
+
+Initial workspace surfaces:
+
+| Surface | Purpose | Boundary |
+|---|---|---|
+| Human Chromium | User browsing, docs, local previews, auth flows, manual review. | Human-controlled profile. Agents do not silently operate it. |
+| Playwright Chromium | Agent automation, screenshots, E2E checks, UI inspection, traces. | Separate task-scoped browser context. |
+| Notepad | Task scratchpad, decision notes, temporary checklists. | Local-first Forge record. |
+| Markdown reader/editor | README, ADRs, plans, handoff records, review notes. | Repo files and Forge artifacts first. |
+| Coding pane | Focused file edits, diffs, and review. | Monaco-based pane first; do not clone a full IDE immediately. |
+| Terminal/log drawer | Commands, tests, worker events, browser traces, provider logs. | Bounded execution and artifact capture. |
+| Repo explorer | Local and GitHub-backed files, branches, diffs, commits, docs. | Repository remains implementation truth. |
+| Notion explorer | Planning pages, project docs, decisions, wiki pages. | Notion remains planning and intent truth. |
+| GitHub explorer | Issues, PRs, checks, comments, files, releases. | API-backed pane, linked to tasks/artifacts. |
+
+Implementation sequence:
+
+1. **Workspace shell**: left rail, docked panes, tabs/splits, bottom drawer,
+   right inspector, command palette, and saved layouts.
+2. **Core panes**: repo explorer, Markdown reader/editor, task notepad, diff
+   viewer, terminal/log drawer, and artifact viewer.
+3. **Playwright service**: task-scoped Chromium contexts, screenshots, traces,
+   page summaries, and run evidence linked to tasks.
+4. **Notion/GitHub link graph**: manual links first, then refresh, then
+   webhook-backed freshness, then reviewed write-back.
+5. **Permissioned agent operations**: agents can read workspace context and
+   request capabilities for browser automation, terminal commands, repo writes,
+   Notion updates, GitHub comments, branches, and PRs.
+
+Proposed workspace data model additions:
+
+- `workspaces`
+- `workspace_layouts`
+- `workspace_panes`
+- `workspace_links`
+- `external_accounts`
+- `browser_sessions`
+- `browser_runs`
+- `sync_events`
+
+`workspace_links` should be the core abstraction. It should link Notion pages,
+GitHub repos/issues/PRs/files, local files, Forge tasks, Forge artifacts, and
+browser runs with explicit relationship types such as `documents`, `implements`,
+`references`, `generated_from`, `evidence_for`, `blocks`, and `closes`.
+
+Sync stance:
+
+- Do not build naive bidirectional Notion/GitHub mirroring.
+- Treat Notion as planning, memory, intent, and project rationale.
+- Treat repositories as implementation truth.
+- Use links, summaries, freshness checks, and explicit write-back approvals.
+- Show stale or conflicting linked sources instead of silently overwriting them.
+
+Safety boundaries:
+
+- The human browser profile and Playwright browser profile must stay separate.
+- Third-party apps should not depend on iframe embedding as the primary path.
+- Agent browser use, terminal commands, repo writes, GitHub mutations, and Notion
+  write-back require explicit capabilities and audit records.
+- Free-floating desktop-style windows can wait. Start with saved docked layouts.
+
+The detailed implementation plan is in `docs/workspace-roadmap.md`.
+
 ### GitHub Authentication
 
 GitHub authentication must happen in the web UI, and only when the `gh` CLI is
@@ -424,6 +514,7 @@ Primary source docs:
 - `docs/operator-guide.md`
 - `docs/developer-guide.md`
 - `docs/wiki.md`
+- `docs/workspace-roadmap.md`
 - `docs/acp-zed-connector.md`
 - `docs/design.md`
 - `docs/adr/0004-cross-agent-checkpointing.md`
