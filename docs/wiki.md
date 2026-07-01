@@ -14,8 +14,10 @@ the plan Forge produces.
 The product goal is an AI software team with a human in charge. The current
 beta is more cautious: Forge plans work, stores evidence, and asks for approval.
 Workforce materialization and handoff records are enabled unless explicitly
-disabled, while generated package execution remains opt-in and sandbox-only.
-Forge is not yet a fully autonomous pull-request machine.
+disabled, while generated package execution remains opt-in and sandbox-only
+under `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`.
+Executable packages may use bounded read-only project context, but Forge is not
+yet a fully autonomous pull-request machine.
 
 The next larger product direction is Forge Workspace: a dockable, AI-assisted
 workbench that can bring browser, repo, notes, docs, Playwright, Notion, GitHub,
@@ -39,13 +41,25 @@ You write a task
 Workforce materialization and handoff flow:
 
 ```text
-Approved plan
-  -> work packages
+Architect plan saved
+  -> work packages and plan approval gate
+  -> approved plan
   -> capability/MCP admission check
   -> ready package / review-gate state
-  -> optional sandbox execution only when enabled
-  -> QA/Reviewer gates where required
+  -> optional bounded-context sandbox execution only when enabled
+  -> manual QA/Reviewer/Security gates where required
 ```
+
+Task detail controls now cover the common operator interventions:
+
+- Stop cancels a non-terminal task and any active package/run state.
+- Delete removes a terminal individual task and its run history without
+  deleting the whole project. Stop active tasks first.
+- Retry task requeues the task from the beginning and can switch providers.
+- Retry handoff is available for retryable blocked package handoffs after the
+  operator fixes the cause.
+- Agent history is the primary activity timeline; queue attempts are collapsed
+  underneath it for lower-level retry evidence.
 
 Still future work:
 
@@ -53,7 +67,8 @@ Still future work:
 - Creating branches, commits, pull requests, or merges.
 - Granting live MCP tools to specialist agents at runtime.
 - Running specialists in parallel.
-- Treating QA and Reviewer gates as production-ready merge gates.
+- Treating QA, Reviewer, and Security gates as autonomous production-ready merge
+  gates.
 - Providing the Forge Workspace pane system for browser, Playwright, notes,
   Markdown, coding, logs, Notion, GitHub, and linked task context.
 
@@ -131,16 +146,22 @@ Forge's current ACP support works like this:
 
 ```text
 Forge
-  -> starts a Zed Industries adapter with npx
+  -> starts a pinned ACP adapter with npx --no-install
   -> adapter speaks ACP over JSON-RPC
   -> adapter wraps a real local CLI such as codex or claude
   -> the local CLI uses the account already logged in on your machine
   -> text streams back into Forge
 ```
 
+ACP is currently for provider calls such as Architect planning. Forge blocks
+ACP-backed executable Workforce packages until local coding CLIs can run behind
+a hard filesystem and tool sandbox.
+
 You do not need the Zed editor installed for this path. "Zed connector" means
-Forge uses Zed's small adapter package as a translator. You still need the
-underlying CLI installed and authenticated.
+Forge uses an Agent Client Protocol adapter package as a translator. The
+adapter process receives a minimal environment instead of Forge's provider,
+database, Redis, GitHub, or encryption secrets. You still need the underlying
+CLI installed and authenticated.
 
 For more detail, see [ACP And The Zed Connector](acp-zed-connector.md).
 

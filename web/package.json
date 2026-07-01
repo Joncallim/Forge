@@ -2,6 +2,9 @@
   "name": "web",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "next dev",
     "prebuild": "npm run clean:conflict-copies",
@@ -27,6 +30,8 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.54.1",
+    "@agentclientprotocol/codex-acp": "1.0.2",
     "@ai-sdk/anthropic": "^3.0.85",
     "@ai-sdk/google": "^3.0.83",
     "@ai-sdk/openai": "^3.0.73",

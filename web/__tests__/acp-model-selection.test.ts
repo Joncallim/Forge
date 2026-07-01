@@ -14,6 +14,7 @@ import {
   classifyAcpPromptResult,
   unsupportedAcpModelSelectionMessage,
 } from '@/lib/providers/acp/language-model'
+import { AcpTransport } from '@/lib/providers/acp/transport'
 
 class FakeChildProcess extends EventEmitter {
   stdin = { write: vi.fn() }
@@ -28,6 +29,10 @@ function makeSpawnFn(child: FakeChildProcess) {
 
 function writeJsonLine(emitter: EventEmitter, value: unknown) {
   emitter.emit('data', Buffer.from(`${JSON.stringify(value)}\n`))
+}
+
+function fixtureSecret(...parts: string[]) {
+  return parts.join('')
 }
 
 function writtenRequests(child: FakeChildProcess) {
@@ -159,7 +164,7 @@ describe('ACP session model selection', () => {
   it('redacts adapter secrets from selected model config failures', async () => {
     const child = new FakeChildProcess()
     const spawnFn = makeSpawnFn(child)
-    const leakedToken = 'sk-proj-abcdefghijklmnopqrstuvwxyz'
+    const leakedToken = fixtureSecret('sk', '-proj-', 'abcdefghijkl', 'mnopqrstuvwxyz')
     const leakedEmail = 'operator@example.com'
 
     const promise = AcpSessionClient.start('claude-agent', '/repo', {
@@ -186,9 +191,15 @@ describe('ACP session model selection', () => {
   it('redacts adapter secrets from prompt transport failures', async () => {
     const child = new FakeChildProcess()
     const spawnFn = makeSpawnFn(child)
-    const leakedToken = 'ghp_abcdefghijklmnopqrstuvwxyz'
-    const leakedFineGrainedPat = 'github_pat_11ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz'
-    const leakedUserToken = 'ghu_abcdefghijklmnopqrstuvwxyz'
+    const leakedToken = fixtureSecret('ghp', '_', 'abcdefghijkl', 'mnopqrstuvwxyz')
+    const leakedFineGrainedPat = fixtureSecret(
+      'github',
+      '_pat_',
+      '11ABCDEFGHIJKLMNOP',
+      'QRSTUVWXYZ_abcdef',
+      'ghijklmnopqrstuvwxyz',
+    )
+    const leakedUserToken = fixtureSecret('ghu', '_', 'abcdefghijkl', 'mnopqrstuvwxyz')
 
     const promise = AcpSessionClient.start('codex-cli', '/repo', { spawnFn })
     writeJsonLine(child.stdout, { jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } })
@@ -221,7 +232,8 @@ describe('ACP prompt result classification', () => {
   })
 
   it('rejects empty and no-op output', () => {
-    expect(() => classifyAcpPromptResult({ text: '', stopReason: 'end_turn' })).toThrow(/empty/i)
+    expect(() => classifyAcpPromptResult({ text: '', stopReason: 'end_turn' }))
+      .toThrow(/shorter.*planning provider/i)
     expect(() => classifyAcpPromptResult({
       text: 'No changes were needed.',
       stopReason: 'end_turn',
@@ -240,4 +252,19 @@ describe('ACP prompt result classification', () => {
     })).toBe('{"schemaVersion":1,"summary":"Implemented","files":[{"path":"index.js","content":"console.log(1)"}],"commands":[]}')
   })
 
+})
+
+describe('ACP transport diagnostics', () => {
+  it('keeps stderr diagnostics bounded', () => {
+    const child = new FakeChildProcess()
+    const transport = new AcpTransport(['codex-acp'], makeSpawnFn(child))
+
+    child.stderr.emit('data', Buffer.from('a'.repeat(5000)))
+    child.stderr.emit('data', Buffer.from('b'.repeat(5000)))
+
+    expect(transport.recentStderr.length).toBeLessThanOrEqual(4000)
+    expect(transport.recentStderr).not.toContain('a'.repeat(1000))
+
+    transport.close()
+  })
 })

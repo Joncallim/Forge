@@ -9,7 +9,6 @@ export function redactToken(message: string): string {
   return message.replace(CREDENTIAL_URL_RE, 'x-access-token:***@')
 }
 
-export function buildCloneUrl(ownerRepo: string, token: string | null | undefined): string {
-  if (!token) return `https://github.com/${ownerRepo}.git`
-  return `https://x-access-token:${encodeURIComponent(token)}@github.com/${ownerRepo}.git`
+export function buildCloneUrl(ownerRepo: string): string {
+  return `https://github.com/${ownerRepo}.git`
 }

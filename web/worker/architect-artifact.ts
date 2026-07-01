@@ -120,7 +120,9 @@ export function assertUsableArchitectPlan(
 ): void {
   const raw = rawText.trim()
   if (raw === '') {
-    throw new UnusableArchitectPlanError('The architect runtime returned no output.')
+    throw new UnusableArchitectPlanError(
+      'The architect runtime returned no plan text. Retry the plan change with a shorter instruction or select another planning provider.',
+    )
   }
 
   if (ARCHITECT_FATAL_FAILURE_PATTERNS.some((pattern) => pattern.test(raw))) {

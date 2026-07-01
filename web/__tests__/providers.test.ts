@@ -554,12 +554,12 @@ describe('ACP provider catalog', () => {
     expect(ACP_AGENTS.length).toBeGreaterThan(10)
     expect(getAcpAgent('claude-agent')).toMatchObject({
       label: 'Claude Code',
-      adapterUrl: 'https://github.com/zed-industries/claude-agent-acp',
+      adapterUrl: 'https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp',
       modelSelection: expect.objectContaining({ type: 'session_config_option' }),
     })
     expect(getAcpAgent('codex-cli')).toMatchObject({
       label: 'Codex CLI',
-      adapterUrl: 'https://github.com/zed-industries/codex-acp',
+      adapterUrl: 'https://www.npmjs.com/package/@agentclientprotocol/codex-acp',
       modelSelection: expect.objectContaining({ type: 'session_config_option' }),
     })
   })

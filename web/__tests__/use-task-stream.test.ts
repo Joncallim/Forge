@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
+  type AgentRun,
+  agentRunFromStartedStreamEventData,
   artifactFromStreamEventData,
+  mergeStreamAgentRun,
   shouldRefreshTaskDetailsForArtifact,
 } from '@/hooks/useTaskStream'
 
@@ -75,5 +78,85 @@ describe('artifactFromStreamEventData', () => {
       artifactType: 'adr_text',
       content: 'Task plan',
     }))).toBe(false)
+  })
+})
+
+describe('streamed agent run helpers', () => {
+  it('preserves package execution metadata from run:started payloads', () => {
+    expect(agentRunFromStartedStreamEventData({
+      runId: 'run-1',
+      agentType: 'frontend',
+      attemptNumber: 3,
+      modelIdUsed: 'model',
+      stage: 'implementation',
+      startedAt: '2026-06-30T10:00:00.000Z',
+      workPackageId: 'pkg-1',
+    }, 'task-1', '2026-06-30T09:59:00.000Z')).toMatchObject({
+      id: 'run-1',
+      taskId: 'task-1',
+      agentType: 'frontend',
+      attemptNumber: 3,
+      modelIdUsed: 'model',
+      stage: 'implementation',
+      startedAt: '2026-06-30T10:00:00.000Z',
+      status: 'running',
+      workPackageId: 'pkg-1',
+    })
+  })
+
+  it('merges duplicate streamed run snapshots without dropping package metadata', () => {
+    const existing = agentRunFromStartedStreamEventData({
+      runId: 'run-1',
+      agentType: 'frontend',
+      attemptNumber: 2,
+      modelIdUsed: 'model',
+      stage: 'implementation',
+      workPackageId: 'pkg-1',
+    }, 'task-1', '2026-06-30T09:59:00.000Z')
+    const incoming = agentRunFromStartedStreamEventData({
+      runId: 'run-1',
+      agentType: 'frontend',
+      modelIdUsed: 'model',
+      status: 'completed',
+    }, 'task-1', '2026-06-30T10:00:00.000Z')
+
+    expect(existing).not.toBeNull()
+    expect(incoming).not.toBeNull()
+    expect(mergeStreamAgentRun([existing!], incoming!)).toMatchObject([{
+      id: 'run-1',
+      attemptNumber: 2,
+      stage: 'implementation',
+      status: 'completed',
+      workPackageId: 'pkg-1',
+    }])
+  })
+
+  it('does not revert a terminal run to running when run:started replays', () => {
+    const completed: AgentRun = {
+      ...agentRunFromStartedStreamEventData({
+        runId: 'run-1',
+        agentType: 'frontend',
+        attemptNumber: 2,
+        modelIdUsed: 'model',
+        stage: 'implementation',
+        workPackageId: 'pkg-1',
+      }, 'task-1', '2026-06-30T09:59:00.000Z')!,
+      status: 'completed',
+      completedAt: '2026-06-30T10:05:00.000Z',
+    }
+    const replayedStart = agentRunFromStartedStreamEventData({
+      runId: 'run-1',
+      // Replayed start payloads may omit agentType/modelIdUsed.
+      startedAt: '2026-06-30T10:00:00.000Z',
+    }, 'task-1', '2026-06-30T10:00:00.000Z')
+
+    expect(replayedStart).not.toBeNull()
+    expect(mergeStreamAgentRun([completed], replayedStart!)).toMatchObject([{
+      id: 'run-1',
+      status: 'completed',
+      agentType: 'frontend',
+      modelIdUsed: 'model',
+      completedAt: '2026-06-30T10:05:00.000Z',
+    }])
   })
 })

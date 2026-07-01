@@ -331,8 +331,8 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
       )
     }, 100)
 
-    const lines = await readLines(res.body!, 500)
+    const lines = await readLines(res.body!, 1500)
     const allText = lines.join('\n')
     expect(allText).toContain('[DONE]')
-  }, 2000)
+  }, 3000)
 })

@@ -10,6 +10,11 @@ import { getSession } from '@/lib/session'
 import { registerProjectPath, unregisterProjectPath } from '@/lib/project-registry'
 import { validateGitHubTokenEnvVar } from '@/lib/github'
 import {
+  assertProjectLocalPathAllowed,
+  assertProjectLocalPathPreflightAllowed,
+  assertProjectPathNotProtected,
+} from '@/lib/projects/local-path'
+import {
   displayPathForWorkspacePath,
   getWorkspaceSettings,
   isWithinPath,
@@ -175,7 +180,18 @@ export async function PUT(
           )
         }
         try {
+          assertProjectPathNotProtected(resolvedLocalPath, workspace)
+          await assertProjectLocalPathPreflightAllowed({
+            localPath: resolvedLocalPath,
+            projectId: id,
+            workspace,
+          })
           await assertExistingLocalPathWithinWorkspace(resolvedLocalPath, workspace)
+          await assertProjectLocalPathAllowed({
+            localPath: resolvedLocalPath,
+            projectId: id,
+            workspace,
+          })
         } catch (err) {
           const message = err instanceof Error ? err.message : 'Invalid local path'
           return NextResponse.json({ error: message }, { status: 400 })

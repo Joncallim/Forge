@@ -82,7 +82,7 @@ describe('loadWorkPackageExecutionContext', () => {
     },
   )
 
-  it('validates the project path before non-ACP model execution and stores the real root', async () => {
+  it('validates the project path and defers model construction until the sandbox cwd exists', async () => {
     vi.clearAllMocks()
     const project = { id: 'project-1', localPath: '/workspace/link' }
     const task = { id: 'task-1', projectId: 'project-1', pmProviderConfigId: 'provider-task' }
@@ -94,13 +94,33 @@ describe('loadWorkPackageExecutionContext', () => {
       config: { providerType: 'anthropic', modelId: 'claude-opus-4-5' },
     })
     mocks.assertProjectLocalPathForExecution.mockResolvedValue('/workspace/real-project')
-    mocks.getModel.mockResolvedValue({ provider: 'anthropic', modelId: 'claude-opus-4-5' })
 
     const context = await loadWorkPackageExecutionContext('task-1', 'pkg-1')
 
     expect(mocks.assertProjectLocalPathForExecution).toHaveBeenCalledWith(project)
-    expect(mocks.getModel).toHaveBeenCalledWith('provider-task', { cwd: '/workspace/real-project' })
+    expect(mocks.getProvider).toHaveBeenCalledWith('provider-task')
+    expect(mocks.getModel).not.toHaveBeenCalled()
+    expect(context.providerConfigId).toBe('provider-task')
     expect(context.validatedProjectRoot).toBe('/workspace/real-project')
+  })
+
+  it('rejects ACP-backed executable work packages until a hard sandbox exists', async () => {
+    vi.clearAllMocks()
+    const project = { id: 'project-1', localPath: '/workspace/project' }
+    const task = { id: 'task-1', projectId: 'project-1', pmProviderConfigId: 'provider-task' }
+    const workPackage = { id: 'pkg-1', assignedRole: 'backend' }
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{ task, project, workPackage }]))
+      .mockReturnValueOnce(chain([{ id: 'agent-backend', providerConfigId: null }]))
+    mocks.getProvider.mockResolvedValue({
+      config: { providerType: 'acp', modelId: 'codex-cli::gpt-5.3-codex-spark' },
+    })
+
+    await expect(loadWorkPackageExecutionContext('task-1', 'pkg-1'))
+      .rejects.toThrow(/does not execute work packages through ACP/i)
+
+    expect(mocks.assertProjectLocalPathForExecution).not.toHaveBeenCalled()
+    expect(mocks.getModel).not.toHaveBeenCalled()
   })
 
   it('rejects invented roles that do not resolve to an active configured agent', async () => {

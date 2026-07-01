@@ -85,8 +85,11 @@ export async function GET(
               runId: run.id,
               taskId,
               agentType: run.agentType,
+              attemptNumber: run.attemptNumber,
               modelIdUsed: run.modelIdUsed,
+              stage: run.stage,
               startedAt: run.startedAt,
+              workPackageId: run.workPackageId,
             })
           }
 
@@ -98,6 +101,9 @@ export async function GET(
               outputTokens: run.outputTokens,
               costUsd: run.costUsd,
               completedAt: run.completedAt,
+              attemptNumber: run.attemptNumber,
+              stage: run.stage,
+              workPackageId: run.workPackageId,
             })
           } else if (run.status === 'failed') {
             sendSnapshotEvent('run:failed', {
@@ -105,6 +111,9 @@ export async function GET(
               runId: run.id,
               completedAt: run.completedAt,
               errorMessage: run.errorMessage,
+              attemptNumber: run.attemptNumber,
+              stage: run.stage,
+              workPackageId: run.workPackageId,
             })
           }
         }

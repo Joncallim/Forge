@@ -1,3 +1,5 @@
+import { sanitizeWorkerMessage } from './redaction'
+
 const DEFAULT_CLAIM_TIMEOUT_SECONDS = 5
 const APPROVAL_CLAIM_TIMEOUT_SECONDS = 1
 const DEFAULT_MAX_ATTEMPTS = 3
@@ -67,7 +69,7 @@ function backoffDelayMs(attempt: number): number {
 }
 
 function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
+  return sanitizeWorkerMessage(err instanceof Error ? err.message : String(err))
 }
 
 export async function startWorker(source: WorkerSource = 'standalone'): Promise<WorkerHandle> {
@@ -237,7 +239,7 @@ async function startWorkerOnce(
           claimedApproval = await approvalQueue.claim(APPROVAL_CLAIM_TIMEOUT_SECONDS)
         } catch (err) {
           if (shuttingDown) break
-          console.error('[worker] Failed to claim approval', err)
+          console.error('[worker] Failed to claim approval', { err: errorMessage(err), workerId })
         }
 
         if (claimedApproval !== null) {
@@ -290,7 +292,7 @@ async function startWorkerOnce(
               attempt: claimedApproval.job.attempt,
               finalAttempt,
               taskId: claimedApproval.job.taskId,
-              err,
+              err: message,
               workerId,
             })
           } finally {
@@ -300,7 +302,7 @@ async function startWorkerOnce(
               } catch (err) {
                 console.error('[worker] Failed to acknowledge approval', {
                   taskId: claimedApproval.job.taskId,
-                  err,
+                  err: errorMessage(err),
                   workerId,
                 })
               }
@@ -314,7 +316,7 @@ async function startWorkerOnce(
           claimedAnswers = await answersQueue.claim(APPROVAL_CLAIM_TIMEOUT_SECONDS)
         } catch (err) {
           if (shuttingDown) break
-          console.error('[worker] Failed to claim answers job', err)
+          console.error('[worker] Failed to claim answers job', { err: errorMessage(err), workerId })
         }
 
         if (claimedAnswers !== null) {
@@ -367,7 +369,7 @@ async function startWorkerOnce(
               attempt: claimedAnswers.job.attempt,
               finalAttempt,
               taskId: claimedAnswers.job.taskId,
-              err,
+              err: message,
               workerId,
             })
           } finally {
@@ -377,7 +379,7 @@ async function startWorkerOnce(
               } catch (err) {
                 console.error('[worker] Failed to acknowledge answers job', {
                   taskId: claimedAnswers.job.taskId,
-                  err,
+                  err: errorMessage(err),
                   workerId,
                 })
               }
@@ -391,7 +393,7 @@ async function startWorkerOnce(
           claimedTask = await taskQueue.claim(claimTimeoutSeconds)
         } catch (err) {
           if (shuttingDown) break
-          console.error('[worker] Failed to claim task', err)
+          console.error('[worker] Failed to claim task', { err: errorMessage(err), workerId })
           continue
         }
 
@@ -448,7 +450,7 @@ async function startWorkerOnce(
             attempt: claimedTask.job.attempt,
             finalAttempt,
             taskId: claimedTask.job.taskId,
-            err,
+            err: message,
             workerId,
           })
         } finally {
@@ -458,7 +460,7 @@ async function startWorkerOnce(
             } catch (err) {
               console.error('[worker] Failed to acknowledge task', {
                 taskId: claimedTask.job.taskId,
-                err,
+                err: errorMessage(err),
                 workerId,
               })
             }
@@ -484,7 +486,7 @@ async function startWorkerOnce(
 
   const done = run()
   done.catch((err) => {
-    console.error('[worker] Fatal error', err)
+    console.error('[worker] Fatal error', { err: errorMessage(err), workerId })
   })
 
   const handle: WorkerHandle = {

@@ -105,6 +105,8 @@ const ACP_NO_OP_PATTERNS = [
   /\bplaceholder response\b/i,
 ]
 
+const ACP_EMPTY_OUTPUT_MESSAGE = 'ACP runtime returned empty output. Retry with a shorter, more targeted prompt or select another planning provider.'
+
 export function unsupportedAcpModelSelectionMessage(agentId: string, selectedModel: string): string {
   return `ACP runtime "${agentId}" does not expose explicit model selection through Forge yet; selected model "${selectedModel}" is stored on the provider config but not passed to this ACP runtime.`
 }
@@ -118,7 +120,7 @@ export function classifyAcpPromptResult(result: { text: string; stopReason: stri
     throw new Error('ACP runtime cancelled the request before producing output.')
   }
   if (text === '') {
-    throw new Error('ACP runtime returned empty output.')
+    throw new Error(ACP_EMPTY_OUTPUT_MESSAGE)
   }
   if (ACP_FAILURE_PATTERNS.some((pattern) => pattern.test(text))) {
     throw new Error(`ACP runtime reported usage, quota, rate-limit, or token exhaustion: ${text.slice(0, 300)}`)

@@ -3,6 +3,7 @@ import type { NextRequest } from 'next/server'
 import { execFile as execFileCallback } from 'node:child_process'
 import { promisify } from 'node:util'
 import fs from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
 import { db } from '@/db'
@@ -13,6 +14,11 @@ import { registerProjectPath } from '@/lib/project-registry'
 import { resolveGitHubToken, validateGitHubTokenEnvVar } from '@/lib/github'
 import { getCachedProjectMcpSummaries } from '@/lib/mcps/manager'
 import { buildCloneUrl, OWNER_REPO_RE, redactToken } from '@/lib/projects/clone'
+import {
+  assertProjectLocalPathAllowed,
+  assertProjectLocalPathPreflightAllowed,
+  assertProjectPathNotProtected,
+} from '@/lib/projects/local-path'
 import {
   collapseHomePath,
   displayPathForWorkspacePath,
@@ -38,14 +44,46 @@ const createProjectSchema = z.object({
   defaultBranch: z.string().optional(),
 })
 
-async function pathExistsNonEmpty(targetPath: string): Promise<boolean> {
+async function pathExists(targetPath: string): Promise<boolean> {
   try {
-    const stat = await fs.stat(targetPath)
-    if (!stat.isDirectory()) return true // a file is there — treat as occupied
-    const entries = await fs.readdir(targetPath)
-    return entries.length > 0
-  } catch {
+    await fs.lstat(targetPath)
+    return true
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
     return false
+  }
+}
+
+async function withGitAskPassEnv<T>(
+  token: string | null | undefined,
+  callback: (options: { env?: NodeJS.ProcessEnv }) => Promise<T>,
+): Promise<T> {
+  if (!token) return callback({})
+
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-git-askpass-'))
+  const askPassPath = path.join(tmpDir, 'askpass.js')
+  await fs.writeFile(
+    askPassPath,
+    [
+      '#!/usr/bin/env node',
+      'const prompt = process.argv[2] || "";',
+      'if (/username/i.test(prompt)) process.stdout.write("x-access-token\\n");',
+      `else if (/password/i.test(prompt)) process.stdout.write(${JSON.stringify(`${token}\n`)});`,
+      'else process.stdout.write("\\n");',
+    ].join('\n'),
+    { mode: 0o700 },
+  )
+
+  try {
+    return await callback({
+      env: {
+        ...process.env,
+        GIT_ASKPASS: askPassPath,
+        GIT_TERMINAL_PROMPT: '0',
+      },
+    })
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true })
   }
 }
 
@@ -126,6 +164,7 @@ async function writeProjectConfig(project: {
   if (!project.localPath) return
 
   const configPath = path.join(/*turbopackIgnore: true*/ project.localPath, 'forge.project.json')
+  await assertProjectConfigPathSafe(project.localPath)
   const payload = {
     projectId: project.id,
     name: project.name,
@@ -138,7 +177,38 @@ async function writeProjectConfig(project: {
     createdAt: project.createdAt.toISOString(),
     updatedAt: project.updatedAt.toISOString(),
   }
-  await fs.writeFile(configPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 })
+  const tmpPath = path.join(
+    /*turbopackIgnore: true*/ project.localPath,
+    `.forge.project.json.${process.pid}.${Date.now()}.tmp`,
+  )
+  try {
+    await fs.writeFile(tmpPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600, flag: 'wx' })
+    await fs.rename(tmpPath, configPath)
+  } catch (err) {
+    await fs.rm(tmpPath, { force: true })
+    throw err
+  }
+}
+
+async function assertProjectConfigPathSafe(localPath: string): Promise<void> {
+  const realProjectRoot = await fs.realpath(localPath)
+  const configPath = path.join(/*turbopackIgnore: true*/ localPath, 'forge.project.json')
+  const realParent = await fs.realpath(path.dirname(configPath))
+  if (realParent !== realProjectRoot) {
+    throw new Error('Project config path must remain inside the project root.')
+  }
+
+  try {
+    const stat = await fs.lstat(configPath)
+    if (stat.isSymbolicLink()) {
+      throw new Error('Project config path cannot be a symlink.')
+    }
+    if (!stat.isFile()) {
+      throw new Error('Project config path exists but is not a file.')
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+  }
 }
 
 function projectResponse<T extends { localPath: string | null }>(
@@ -255,31 +325,48 @@ export async function POST(request: NextRequest) {
         )
       }
       try {
+        assertProjectPathNotProtected(resolvedLocalPath, workspace)
         await assertNearestExistingAncestorWithinWorkspace(resolvedLocalPath, workspace)
+        await assertProjectLocalPathPreflightAllowed({ localPath: resolvedLocalPath, workspace })
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Invalid local path'
         return NextResponse.json({ error: message }, { status: 400 })
       }
 
-      if (await pathExistsNonEmpty(resolvedLocalPath)) {
+      if (await pathExists(resolvedLocalPath)) {
         return NextResponse.json(
-          { error: 'Destination folder already exists and is not empty' },
+          { error: 'Destination folder already exists' },
           { status: 409 },
         )
       }
 
       const resolvedToken = await resolveGitHubToken({ envVar: githubTokenEnvVar })
-      const cloneUrl = buildCloneUrl(data.githubRepo, resolvedToken?.token)
+      const cloneUrl = buildCloneUrl(data.githubRepo)
 
       try {
-        await execFile('git', ['clone', '--depth', '1', cloneUrl, resolvedLocalPath], {
-          timeout: 60_000,
-        })
+        await withGitAskPassEnv(resolvedToken?.token, ({ env }) =>
+          execFile('git', ['clone', '--depth', '1', cloneUrl, resolvedLocalPath], {
+            timeout: 60_000,
+            ...(env ? { env } : {}),
+          }),
+        )
       } catch (err) {
+        await fs.rm(resolvedLocalPath, { recursive: true, force: true })
         const rawMessage = err instanceof Error ? err.message : 'git clone failed'
         const sanitized = redactToken(rawMessage)
         console.error('[POST /api/projects] git clone failed', sanitized)
         return NextResponse.json({ error: sanitized }, { status: 400 })
+      }
+      try {
+        await execFile('git', ['-C', resolvedLocalPath, 'remote', 'set-url', 'origin', cloneUrl], {
+          timeout: 10_000,
+        })
+        await assertProjectLocalPathAllowed({ localPath: resolvedLocalPath, workspace })
+        await assertProjectConfigPathSafe(resolvedLocalPath)
+      } catch (err) {
+        await fs.rm(resolvedLocalPath, { recursive: true, force: true })
+        const message = err instanceof Error ? err.message : 'Invalid local path'
+        return NextResponse.json({ error: message }, { status: 400 })
       }
 
       const [project] = await db
@@ -319,7 +406,11 @@ export async function POST(request: NextRequest) {
         )
       }
       try {
+        assertProjectPathNotProtected(resolvedLocalPath, workspace)
+        await assertProjectLocalPathPreflightAllowed({ localPath: resolvedLocalPath, workspace })
         await prepareLocalProjectDirectory(resolvedLocalPath, workspace)
+        await assertProjectLocalPathAllowed({ localPath: resolvedLocalPath, workspace })
+        await assertProjectConfigPathSafe(resolvedLocalPath)
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Invalid local path'
         return NextResponse.json({ error: message }, { status: 400 })

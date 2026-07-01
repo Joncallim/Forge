@@ -55,14 +55,11 @@ describe('redactToken', () => {
 })
 
 describe('buildCloneUrl', () => {
-  it('percent-encodes token characters that are meaningful inside URLs', () => {
-    const token = 'placeholder@token:with/slashes'
-    const cloneUrl = buildCloneUrl('owner/repo', token)
+  it('returns a clean repository URL without embedding credentials', () => {
+    const cloneUrl = buildCloneUrl('owner/repo')
 
-    expect(cloneUrl).toBe(
-      `https://x-access-token:${encodeURIComponent(token)}@github.com/owner/repo.git`,
-    )
-    expect(cloneUrl).not.toContain(token)
+    expect(cloneUrl).toBe('https://github.com/owner/repo.git')
+    expect(cloneUrl).not.toContain('x-access-token')
   })
 })
 
