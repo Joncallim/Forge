@@ -43,6 +43,7 @@ Browser -> Forge dashboard -> Redis queue -> Forge worker -> AI model -> review 
 | Artifact | A saved output, usually the Architect plan Markdown. |
 | Approval | The human checkpoint before Forge marks the current stage complete. |
 | Workforce | The future/sandboxed specialist-agent system: Backend, Frontend, QA, Reviewer, DevOps, and custom agents. |
+| Forge Workspace | The planned dockable workspace that links browser, repo, notes, docs, Playwright, Notion, GitHub, logs, and AI task context. |
 | ACP provider | A local command-line coding agent connected through the Agent Client Protocol. See [ACP and Zed connector](docs/acp-zed-connector.md). |
 
 ## Fast Setup
@@ -115,6 +116,9 @@ FORGE_WORKER_MOCK_ARCHITECT=1 npm run dev
 - Branch, commit, pull request, and merge automation.
 - Parallel specialist execution.
 - Production-ready QA/Reviewer gates for generated code.
+- Forge Workspace panes for built-in Chromium, Playwright, notepad, Markdown,
+  coding, terminal/logs, Notion, and GitHub.
+- Notion/GitHub link graph sync and write-back approvals.
 
 The first Workforce build slice is present as durable planning records:
 work packages, harness metadata, approval gates, and VCS summaries can now be
@@ -122,6 +126,23 @@ stored and displayed. Workforce materialization and handoff are default-on and
 can be disabled with `FORGE_WORKFORCE_MATERIALIZATION=0` or
 `FORGE_WORK_PACKAGE_HANDOFF=0`. Sandbox package execution remains opt-in with
 `FORGE_WORK_PACKAGE_EXECUTION=1`.
+
+## Forge Workspace Direction
+
+After sequential sandboxed Workforce execution is reliable, the next major
+product direction is **Forge Workspace**: a dockable, AI-assisted workbench that
+brings browser, repo, notes, docs, Playwright, GitHub, Notion, terminals, logs,
+and task artifacts into one saved context.
+
+The product should feel OS-like without becoming a full operating system. The
+first implementation should be a workspace shell with dockable panes, a command
+palette, a right-side context inspector, and explicit permission gates for agent
+operations. The Notion/GitHub integration should use a link graph rather than a
+naive bidirectional mirror: Notion remains the planning and intent surface, while
+repositories remain the implementation source of truth.
+
+See [Forge Workspace roadmap](docs/workspace-roadmap.md) for the proposed
+implementation plan.
 
 ## Screenshots
 
@@ -149,5 +170,6 @@ can be disabled with `FORGE_WORKFORCE_MATERIALIZATION=0` or
 - [Developer guide](docs/developer-guide.md) - web app, worker, database, tests, prompts, and coding standards.
 - [Design guide](docs/design.md) - product model, UI principles, screenshot evidence, and visual QA notes.
 - [ACP and Zed connector](docs/acp-zed-connector.md) - how Forge talks to local ACP agents such as Codex CLI and Claude Code.
-- [Roadmap](docs/roadmap.md) - current beta status, Workforce architecture, and upcoming slices.
+- [Roadmap](docs/roadmap.md) - current beta status, Workforce architecture, Forge Workspace direction, and upcoming slices.
+- [Forge Workspace roadmap](docs/workspace-roadmap.md) - proposed implementation plan for dockable panes, browsers, Notion/GitHub linking, and permissioned agent operations.
 - [Architecture decisions](docs/adr/) - durable ADRs for major technical decisions.
