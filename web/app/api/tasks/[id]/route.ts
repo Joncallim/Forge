@@ -16,6 +16,8 @@ import {
 import { and, eq, asc, inArray, or, sql } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { publishTaskEvent } from '@/worker/events'
+import { recordTaskLogBestEffort } from '@/worker/task-logs'
+import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
 
 // ---------------------------------------------------------------------------
 // GET /api/tasks/:id
@@ -70,11 +72,7 @@ export async function GET(
 
     const { id } = await params
 
-    const [task] = await db
-      .select()
-      .from(tasks)
-      .where(eq(tasks.id, id))
-      .limit(1)
+    const task = await getAccessibleTask(id, session.userId)
 
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })
@@ -206,11 +204,7 @@ export async function DELETE(
     const { id } = await params
     const mode = new URL(request.url).searchParams.get('mode') === 'delete' ? 'delete' : 'cancel'
 
-    const [existing] = await db
-      .select()
-      .from(tasks)
-      .where(eq(tasks.id, id))
-      .limit(1)
+    const existing = await getAccessibleTask(id, session.userId)
 
     if (!existing) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })
@@ -226,7 +220,7 @@ export async function DELETE(
 
       const [deleted] = await db
         .delete(tasks)
-        .where(and(eq(tasks.id, id), inArray(tasks.status, [...TERMINAL_TASK_STATUSES])))
+        .where(and(accessibleTaskCondition(id, session.userId), inArray(tasks.status, [...TERMINAL_TASK_STATUSES])))
         .returning({ id: tasks.id })
 
       if (!deleted) {
@@ -264,6 +258,7 @@ export async function DELETE(
         })
         .where(and(
           eq(tasks.id, id),
+          accessibleTaskCondition(id, session.userId),
           or(
             eq(tasks.status, 'pending'),
             eq(tasks.status, 'running'),
@@ -319,6 +314,16 @@ export async function DELETE(
         { status: 409 },
       )
     }
+
+    await recordTaskLogBestEffort({
+      eventType: 'task.cancelled',
+      level: 'warning',
+      message: 'Task was stopped by an operator.',
+      metadata: { cancelledAt: now.toISOString(), previousStatus: existing.status },
+      source: 'api',
+      taskId: id,
+      title: 'Task cancelled',
+    })
 
     await publishTaskEvent(id, 'task:status', {
       errorMessage: 'Task stopped by operator.',

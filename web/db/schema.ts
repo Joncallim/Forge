@@ -578,6 +578,64 @@ export type ApprovalGate = InferSelectModel<typeof approvalGates>
 export type NewApprovalGate = InferInsertModel<typeof approvalGates>
 
 // ---------------------------------------------------------------------------
+// taskLogs
+// ---------------------------------------------------------------------------
+export const taskLogs = pgTable(
+  'task_logs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    sequence: bigint('sequence', { mode: 'number' }).generatedAlwaysAsIdentity(),
+    taskId: uuid('task_id')
+      .notNull()
+      .references(() => tasks.id, { onDelete: 'cascade' }),
+    taskAttemptId: uuid('task_attempt_id').references(() => taskAttempts.id, {
+      onDelete: 'set null',
+    }),
+    agentRunId: uuid('agent_run_id').references(() => agentRuns.id, {
+      onDelete: 'set null',
+    }),
+    workPackageId: uuid('work_package_id').references(() => workPackages.id, {
+      onDelete: 'set null',
+    }),
+    artifactId: uuid('artifact_id').references(() => artifacts.id, {
+      onDelete: 'set null',
+    }),
+    approvalGateId: uuid('approval_gate_id').references(() => approvalGates.id, {
+      onDelete: 'set null',
+    }),
+    // 'info'|'success'|'warning'|'error'
+    level: text('level').notNull().default('info'),
+    eventType: text('event_type').notNull(),
+    source: text('source').notNull().default('system'),
+    title: text('title').notNull(),
+    message: text('message').notNull(),
+    frontMatter: jsonb('front_matter')
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    metadata: jsonb('metadata')
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    occurredAt: timestamp('occurred_at', tsOpts).defaultNow().notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    index('task_logs_task_id_occurred_at_idx').on(t.taskId, t.occurredAt, t.sequence),
+    index('task_logs_task_id_level_idx').on(t.taskId, t.level),
+    index('task_logs_task_id_event_type_idx').on(t.taskId, t.eventType),
+    index('task_logs_level_idx').on(t.level),
+    index('task_logs_event_type_idx').on(t.eventType),
+    index('task_logs_agent_run_id_idx').on(t.agentRunId),
+    index('task_logs_task_attempt_id_idx').on(t.taskAttemptId),
+    index('task_logs_work_package_id_idx').on(t.workPackageId),
+  ],
+)
+
+export type TaskLog = InferSelectModel<typeof taskLogs>
+export type NewTaskLog = InferInsertModel<typeof taskLogs>
+
+// ---------------------------------------------------------------------------
 // vcsChanges
 // ---------------------------------------------------------------------------
 export const vcsChanges = pgTable(

@@ -127,6 +127,13 @@
       "when": 1782793555591,
       "tag": "0017_great_marvel_zombies",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1782954337498,
+      "tag": "0018_smiling_paibok",
+      "breakpoints": true
     }
   ]
 }

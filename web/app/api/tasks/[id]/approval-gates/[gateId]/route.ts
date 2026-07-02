@@ -3,6 +3,7 @@ import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
+import { getAccessibleTask } from '@/lib/task-access'
 import { decideReviewGate } from '@/worker/review-gates'
 
 const DecisionSchema = z.object({
@@ -38,6 +39,11 @@ export async function POST(
     }
 
     const { id: taskId, gateId } = await params
+    const task = await getAccessibleTask(taskId, session.userId)
+    if (!task) {
+      return NextResponse.json({ error: 'Task not found' }, { status: 404 })
+    }
+
     // Review gates (QA / Reviewer / Security) carry an agent `requiredRole`, but
     // Forge has no human-role model — it is a single-operator app, so any
     // authenticated operator may decide any gate. The role on the gate describes

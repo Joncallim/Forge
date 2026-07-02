@@ -8,6 +8,8 @@ import { resolveDefaultProvider } from '../lib/providers/default'
 import { and, asc, desc, eq } from 'drizzle-orm'
 import { publishTaskEvent } from './events'
 import { updateTaskStatus, updateTaskStatusIfCurrent, type TaskStatus } from './task-state'
+import { recordTaskLogBestEffort } from './task-logs'
+import { sanitizePromptSnapshot } from '../lib/task-log-sanitization'
 import {
   buildSpecialistContext,
   buildWebResearchContext,
@@ -65,6 +67,13 @@ class ArchitectRunFailedError extends Error {
 
 function errorMessage(err: unknown): string {
   return sanitizeWorkerMessage(err instanceof Error ? err.message : String(err))
+}
+
+function safeTaskFailureMessage(err: unknown): string {
+  if (err instanceof ArchitectRunFailedError) {
+    return 'Architect run failed. Review the run log and checkpoint for sanitized failure details.'
+  }
+  return errorMessage(err)
 }
 
 function positiveIntegerEnv(name: string, defaultValue: number): number {
@@ -483,6 +492,21 @@ async function createArtifact(
     createdAt: artifact.createdAt,
   })
 
+  await recordTaskLogBestEffort({
+    agentRunId,
+    artifactId: artifact.id,
+    eventType: 'artifact.created',
+    level: 'success',
+    message: `Created ${artifact.artifactType} artifact ${artifact.id}.`,
+    metadata: {
+      artifactType: artifact.artifactType,
+      metadata: artifact.metadata,
+    },
+    source: 'worker',
+    taskId,
+    title: 'Artifact created',
+  })
+
   return artifact
 }
 
@@ -632,6 +656,21 @@ async function runArchitect(
 
     if (process.env.FORGE_WORKER_MOCK_ARCHITECT === '1') {
       text = mockArchitectPlan(task, project)
+      await recordTaskLogBestEffort({
+        agentRunId: run.id,
+        eventType: 'run.started',
+        frontMatter: {
+          connector: `${providerResult.config.displayName} (${providerResult.config.providerType})`,
+          model: providerResult.config.modelId,
+          prompt: task.prompt,
+        },
+        level: 'info',
+        message: 'Architect mock run started.',
+        metadata: { agentType: ARCHITECT_AGENT, mock: true },
+        source: 'worker',
+        taskId: task.id,
+        title: 'Architect run started',
+      })
       await publishTaskEvent(task.id, 'run:chunk', {
         runId: run.id,
         delta: text,
@@ -647,6 +686,37 @@ async function runArchitect(
       const displayLocalPath = project.localPath
         ? displayPathForWorkspacePath(workspace, project.localPath)
         : null
+      const prompt = buildArchitectPrompt(
+        task,
+        project,
+        specialistContext,
+        webResearchContext,
+        answeredQuestions,
+        previousPlan,
+        resumeCheckpoint,
+        configuredAgents,
+        displayLocalPath,
+        mcpOverview,
+      )
+      await recordTaskLogBestEffort({
+        agentRunId: run.id,
+        eventType: 'run.started',
+        frontMatter: {
+          connector: `${providerResult.config.displayName} (${providerResult.config.providerType})`,
+          model: providerResult.config.modelId,
+          prompt,
+        },
+        level: 'info',
+        message: 'Architect model run started.',
+        metadata: {
+          agentType: ARCHITECT_AGENT,
+          providerConfigId,
+          providerType: providerResult.config.providerType,
+        },
+        source: 'worker',
+        taskId: task.id,
+        title: 'Architect run started',
+      })
       const controller = new AbortController()
       const timeoutMs = architectGenerationTimeoutMs()
       const timeout = setTimeout(() => controller.abort(), timeoutMs)
@@ -656,18 +726,7 @@ async function runArchitect(
           maxOutputTokens: architectMaxOutputTokens(),
           model,
           system: config.systemPrompt,
-          prompt: buildArchitectPrompt(
-            task,
-            project,
-            specialistContext,
-            webResearchContext,
-            answeredQuestions,
-            previousPlan,
-            resumeCheckpoint,
-            configuredAgents,
-            displayLocalPath,
-            mcpOverview,
-          ),
+          prompt,
           temperature: 0.2,
         })
 
@@ -794,6 +853,25 @@ async function runArchitect(
         costUsd: null,
         completedAt: completedAt.toISOString(),
       })
+      await recordTaskLogBestEffort({
+        agentRunId: run.id,
+        eventType: 'run.completed',
+        frontMatter: {
+          connector: `${providerResult.config.displayName} (${providerResult.config.providerType})`,
+          model: providerResult.config.modelId,
+          prompt: task.prompt,
+        },
+        level: 'success',
+        message: `Architect run completed with ${openQuestionCount} open question${openQuestionCount === 1 ? '' : 's'}.`,
+        metadata: {
+          inputTokens: usage.inputTokens,
+          openQuestionCount,
+          outputTokens: usage.outputTokens,
+        },
+        source: 'worker',
+        taskId: task.id,
+        title: 'Architect run completed',
+      })
     }
 
     const checkpoint: PendingArchitectCheckpoint = {
@@ -836,6 +914,27 @@ async function runArchitect(
       runId: run.id,
       errorMessage: message,
       completedAt: completedAt.toISOString(),
+    })
+
+    await recordTaskLogBestEffort({
+      agentRunId: run.id,
+      eventType: 'run.failed',
+      frontMatter: {
+        connector: `${providerResult.config.displayName} (${providerResult.config.providerType})`,
+        model: providerResult.config.modelId,
+        prompt: task.prompt,
+      },
+      level: 'error',
+      message: 'Architect run failed.',
+      metadata: {
+        errorMessage: sanitizePromptSnapshot(message),
+        partialOutput: sanitizePromptSnapshot(text),
+        revisedFromAnswers: answeredQuestions.length > 0,
+        revisedFromPlan: previousPlan !== null,
+      },
+      source: 'worker',
+      taskId: task.id,
+      title: 'Architect run failed',
     })
 
     const checkpoint: PendingArchitectCheckpoint = {
@@ -900,7 +999,7 @@ export async function processTask(
     await updateTaskStatus(task.id, nextStatus)
     await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: nextStatus })
   } catch (err) {
-    const message = errorMessage(err)
+    const message = safeTaskFailureMessage(err)
     const checkpoint = architectCheckpointFromError(err)
     if (options.finalAttempt ?? true) {
       await updateTaskStatus(task.id, 'failed', message)
@@ -987,7 +1086,7 @@ export async function processAnsweredQuestions(
     await updateTaskStatus(taskId, nextStatus)
     await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: nextStatus })
   } catch (err) {
-    const message = errorMessage(err)
+    const message = safeTaskFailureMessage(err)
     const checkpoint = architectCheckpointFromError(err)
     if (options.finalAttempt ?? true) {
       await updateTaskStatus(taskId, 'failed', message)

@@ -6,6 +6,9 @@ import { tasks } from '@/db/schema'
 import { and, eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
+import { recordTaskLogBestEffort } from '@/worker/task-logs'
+import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
+import { sanitizePromptSnapshot } from '@/lib/task-log-sanitization'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -36,11 +39,7 @@ export async function POST(
 
     const { id: taskId } = await params
 
-    const [existing] = await db
-      .select()
-      .from(tasks)
-      .where(eq(tasks.id, taskId))
-      .limit(1)
+    const existing = await getAccessibleTask(taskId, session.userId)
 
     if (!existing) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })
@@ -85,7 +84,7 @@ export async function POST(
         errorMessage: null,
         updatedAt: new Date(),
       })
-      .where(and(eq(tasks.id, taskId), eq(tasks.status, 'awaiting_approval')))
+      .where(and(accessibleTaskCondition(taskId, session.userId), eq(tasks.status, 'awaiting_approval')))
       .returning()
 
     if (!task) {
@@ -102,6 +101,21 @@ export async function POST(
       status: 'pending',
       updatedAt: task.updatedAt.toISOString(),
     }))
+
+    await recordTaskLogBestEffort({
+      eventType: 'task.replan_requested',
+      frontMatter: {
+        model: task.pmProviderConfigId ?? null,
+        connector: 'task-default',
+        prompt: task.prompt,
+      },
+      level: 'warning',
+      message: 'Plan revision was requested.',
+      metadata: { feedback: sanitizePromptSnapshot(feedback), requestedBy: session.userId },
+      source: 'api',
+      taskId,
+      title: 'Plan revision requested',
+    })
 
     console.info('[POST /api/tasks/:id/replan] Re-queued task for revised plan', { id: taskId })
     return NextResponse.json({ task })

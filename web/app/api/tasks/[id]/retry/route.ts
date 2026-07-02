@@ -6,6 +6,8 @@ import { providerConfigs, tasks } from '@/db/schema'
 import { and, eq, inArray } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
+import { recordTaskLogBestEffort } from '@/worker/task-logs'
+import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
 
 const retrySchema = z.object({
   pmProviderConfigId: z.string().uuid().nullable().optional(),
@@ -24,11 +26,7 @@ export async function POST(
     }
 
     const { id: taskId } = await params
-    const [existing] = await db
-      .select()
-      .from(tasks)
-      .where(eq(tasks.id, taskId))
-      .limit(1)
+    const existing = await getAccessibleTask(taskId, session.userId)
 
     if (!existing) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })
@@ -76,7 +74,7 @@ export async function POST(
         errorMessage: null,
         updatedAt: new Date(),
       })
-      .where(and(eq(tasks.id, taskId), inArray(tasks.status, RETRYABLE_STATUSES)))
+      .where(and(accessibleTaskCondition(taskId, session.userId), inArray(tasks.status, RETRYABLE_STATUSES)))
       .returning()
 
     if (!task) {
@@ -93,6 +91,21 @@ export async function POST(
       errorMessage: null,
       updatedAt: task.updatedAt.toISOString(),
     }))
+
+    await recordTaskLogBestEffort({
+      eventType: 'task.retried',
+      frontMatter: {
+        model: providerId ?? null,
+        connector: providerId ? 'provider-override' : 'task-default',
+        prompt: task.prompt,
+      },
+      level: 'info',
+      message: `Task was requeued from ${existing.status}.`,
+      metadata: { previousStatus: existing.status, providerConfigId: providerId ?? null },
+      source: 'api',
+      taskId,
+      title: 'Task retried',
+    })
 
     return NextResponse.json({ task })
   } catch (err) {

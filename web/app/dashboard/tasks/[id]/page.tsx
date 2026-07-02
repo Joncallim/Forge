@@ -14,6 +14,7 @@ import {
   ShieldCheckIcon,
   GitBranchIcon,
   InfoIcon,
+  DownloadIcon,
   SquareIcon,
   Trash2Icon,
   LoaderCircleIcon,
@@ -86,6 +87,26 @@ interface TaskAttempt {
   startedAt: string | null
   completedAt: string | null
   nextRetryAt: string | null
+  createdAt: string
+}
+
+interface TaskLog {
+  id: string
+  sequence: number
+  taskId: string
+  taskAttemptId: string | null
+  agentRunId: string | null
+  workPackageId: string | null
+  artifactId: string | null
+  approvalGateId: string | null
+  level: string
+  eventType: string
+  source: string
+  title: string
+  message: string
+  frontMatter: Record<string, unknown>
+  metadata: Record<string, unknown>
+  occurredAt: string
   createdAt: string
 }
 
@@ -996,6 +1017,7 @@ function statusBadgeClass(status: string): string {
     case 'proposed':
       return 'border-blue-200 bg-blue-50 text-blue-800 dark:border-blue-900/50 dark:bg-blue-950/30 dark:text-blue-300'
     case 'running':
+    case 'info':
     case 'updated':
       return 'border-sky-200 bg-sky-50 text-sky-800 dark:border-sky-900/50 dark:bg-sky-950/30 dark:text-sky-300'
     case 'awaiting_review':
@@ -1008,6 +1030,7 @@ function statusBadgeClass(status: string): string {
     case 'warning':
       return 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200'
     case 'completed':
+    case 'success':
     case 'approved':
     case 'complete':
     case 'merged':
@@ -1015,6 +1038,7 @@ function statusBadgeClass(status: string): string {
     case 'valid':
       return 'border-green-200 bg-green-50 text-green-800 dark:border-green-900/50 dark:bg-green-950/30 dark:text-green-300'
     case 'needs_rework':
+    case 'error':
     case 'failed':
     case 'rejected':
     case 'cancelled':
@@ -2839,6 +2863,91 @@ function TaskAttemptRow({ attempt, runs }: { attempt: TaskAttempt; runs: AgentRu
   )
 }
 
+function frontMatterText(frontMatter: Record<string, unknown>, key: string): string {
+  const value = frontMatter[key]
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : ''
+}
+
+function TaskLogsPanel({
+  error,
+  loading,
+  logs,
+  taskId,
+}: {
+  error: string | null
+  loading: boolean
+  logs: TaskLog[]
+  taskId: string
+}) {
+  const exportBase = `/api/tasks/${taskId}/logs/export`
+
+  return (
+    <section aria-labelledby="task-logs-heading" className="mb-6">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+        <h2 id="task-logs-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
+          Task logs
+        </h2>
+        <div className="flex flex-wrap gap-2">
+          <a
+            href={`${exportBase}?format=markdown`}
+            className="inline-flex h-7 items-center gap-1 rounded-md border border-border bg-background px-2.5 text-[0.8rem] font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+          >
+            <DownloadIcon className="size-3.5" aria-hidden="true" />
+            Markdown
+          </a>
+          <a
+            href={`${exportBase}?format=jsonl`}
+            className="inline-flex h-7 items-center gap-1 rounded-md border border-border bg-background px-2.5 text-[0.8rem] font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+          >
+            <DownloadIcon className="size-3.5" aria-hidden="true" />
+            JSONL
+          </a>
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="rounded-lg border border-dashed border-border px-4 py-6 text-center">
+          <span className="text-sm text-muted-foreground">Loading logs...</span>
+        </div>
+      ) : error !== null ? (
+        <div role="alert" className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          {error}
+        </div>
+      ) : logs.length === 0 ? (
+        <div className="rounded-lg border border-dashed border-border px-4 py-6 text-center">
+          <p className="text-sm text-muted-foreground">No task logs recorded yet.</p>
+        </div>
+      ) : (
+        <ol className="max-h-[32rem] overflow-auto rounded-lg border border-border" aria-label="Task log entries">
+          {logs.map((log) => {
+            const model = frontMatterText(log.frontMatter, 'model')
+            const connector = frontMatterText(log.frontMatter, 'connector')
+            return (
+              <li key={log.id} className="border-b border-border px-4 py-3 last:border-0">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                    <Badge variant="outline" className={statusBadgeClass(log.level)}>{statusLabel(log.level)}</Badge>
+                    <span className="font-medium text-foreground">{log.title}</span>
+                    <span className="font-mono text-[11px] text-muted-foreground">{log.eventType}</span>
+                  </div>
+                  <span className="shrink-0 text-xs text-muted-foreground">{formatDatetime(log.occurredAt)}</span>
+                </div>
+                <p className="mt-2 whitespace-pre-wrap break-words text-sm text-muted-foreground">{log.message}</p>
+                {(model !== '' || connector !== '') && (
+                  <dl className="mt-2 grid gap-x-4 gap-y-1 text-xs text-muted-foreground sm:grid-cols-2">
+                    {model !== '' && <div><dt className="font-medium text-foreground">Model</dt><dd className="break-all font-mono">{model}</dd></div>}
+                    {connector !== '' && <div><dt className="font-medium text-foreground">Connector</dt><dd className="break-all font-mono">{connector}</dd></div>}
+                  </dl>
+                )}
+              </li>
+            )
+          })}
+        </ol>
+      )}
+    </section>
+  )
+}
+
 function runStage(run: AgentRun): string {
   const stage = (run as unknown as WorkforceRecord).stage
   return typeof stage === 'string' && stage.trim() !== '' ? stage.trim() : ''
@@ -3072,9 +3181,12 @@ export default function TaskDetailPage() {
   const [approvalGates, setApprovalGates] = useState<ApprovalGate[]>([])
   const [vcsChanges, setVcsChanges] = useState<VcsChange[]>([])
   const [commandAudits, setCommandAudits] = useState<CommandAudit[]>([])
+  const [taskLogs, setTaskLogs] = useState<TaskLog[]>([])
   const [providers, setProviders] = useState<ProviderConfig[]>([])
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
+  const [logsLoading, setLogsLoading] = useState(true)
+  const [logsError, setLogsError] = useState<string | null>(null)
 
   // Implementation Plan — collapsed by default to save space; expands to
   // show the full plan text or a revision diff when there are 2+ versions
@@ -3149,10 +3261,29 @@ export default function TaskDetailPage() {
     }
   }, [])
 
+  const loadLogs = useCallback(async () => {
+    setLogsLoading(true)
+    setLogsError(null)
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/logs?limit=100`)
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to load task logs')
+      }
+      const data = await res.json() as { logs?: TaskLog[] }
+      setTaskLogs(data.logs ?? [])
+    } catch (err) {
+      setLogsError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setLogsLoading(false)
+    }
+  }, [taskId])
+
   useEffect(() => {
     loadTask()
+    loadLogs()
     loadProviders()
-  }, [loadProviders, loadTask])
+  }, [loadLogs, loadProviders, loadTask])
 
   // Refresh task when SSE reports a state where persisted side data may have changed.
   useEffect(() => {
@@ -3167,14 +3298,16 @@ export default function TaskDetailPage() {
     ])
     if (taskStatus && REFRESH_STATUSES.has(taskStatus)) {
       loadTask()
+      loadLogs()
     }
-  }, [taskStatus, loadTask])
+  }, [taskStatus, loadLogs, loadTask])
 
   useEffect(() => {
     if (streamRefreshRevision > 0) {
       loadTask()
+      loadLogs()
     }
-  }, [streamRefreshRevision, loadTask])
+  }, [streamRefreshRevision, loadLogs, loadTask])
 
   // Auto-expand the plan once it's awaiting approval, so reviewers see it
   // without an extra click; stays expanded afterward unless collapsed manually.
@@ -3749,6 +3882,13 @@ export default function TaskDetailPage() {
             <CapabilityClassificationPanel classification={capabilityClassification} />
             <McpAccessPlanPanel design={mcpExecutionDesign} />
           </div>
+
+          <TaskLogsPanel
+            error={logsError}
+            loading={logsLoading}
+            logs={taskLogs}
+            taskId={taskId}
+          />
 
           {/* Agent run timeline */}
           <section aria-labelledby="runs-heading" className="mb-6">

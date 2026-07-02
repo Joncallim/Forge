@@ -1,9 +1,17 @@
 import { db } from '../db'
 import { taskAttempts } from '../db/schema'
 import { eq } from 'drizzle-orm'
+import { recordTaskLogBestEffort } from './task-logs'
 
 type QueueName = 'tasks' | 'approvals' | 'answers'
 type AttemptStatus = 'running' | 'completed' | 'failed' | 'dead_lettered'
+
+function statusLevel(status: AttemptStatus): 'info' | 'success' | 'warning' | 'error' {
+  if (status === 'completed') return 'success'
+  if (status === 'failed') return 'warning'
+  if (status === 'dead_lettered') return 'error'
+  return 'info'
+}
 
 export async function startTaskAttempt({
   attemptNumber,
@@ -33,6 +41,17 @@ export async function startTaskAttempt({
     })
     .returning({ id: taskAttempts.id })
 
+  await recordTaskLogBestEffort({
+    eventType: 'queue.attempt.started',
+    level: 'info',
+    message: `Worker ${workerId} claimed ${queueName} attempt ${attemptNumber}.`,
+    metadata: { attemptNumber, jobPayload, queueName, workerId },
+    source: 'queue',
+    taskAttemptId: attempt.id,
+    taskId,
+    title: 'Queue attempt started',
+  })
+
   return attempt.id
 }
 
@@ -47,7 +66,7 @@ export async function finishTaskAttempt({
   nextRetryAt?: Date | null
   status: AttemptStatus
 }): Promise<void> {
-  await db
+  const [attempt] = await db
     .update(taskAttempts)
     .set({
       status,
@@ -56,4 +75,35 @@ export async function finishTaskAttempt({
       completedAt: new Date(),
     })
     .where(eq(taskAttempts.id, attemptId))
+    .returning({
+      attemptNumber: taskAttempts.attemptNumber,
+      queueName: taskAttempts.queueName,
+      taskId: taskAttempts.taskId,
+      workerId: taskAttempts.workerId,
+    })
+
+  if (attempt) {
+    await recordTaskLogBestEffort({
+      eventType: status === 'dead_lettered' ? 'queue.attempt.dead_lettered' : `queue.attempt.${status}`,
+      level: statusLevel(status),
+      message: errorMessage
+        ? `${attempt.queueName} attempt ${attempt.attemptNumber} finished as ${status}: ${errorMessage}`
+        : `${attempt.queueName} attempt ${attempt.attemptNumber} finished as ${status}.`,
+      metadata: {
+        attemptNumber: attempt.attemptNumber,
+        nextRetryAt: nextRetryAt?.toISOString() ?? null,
+        queueName: attempt.queueName,
+        status,
+        workerId: attempt.workerId,
+      },
+      source: 'queue',
+      taskAttemptId: attemptId,
+      taskId: attempt.taskId,
+      title: status === 'completed'
+        ? 'Queue attempt completed'
+        : status === 'dead_lettered'
+          ? 'Queue attempt dead-lettered'
+          : 'Queue attempt warning',
+    })
+  }
 }

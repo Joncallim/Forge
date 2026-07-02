@@ -338,6 +338,7 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
       'approval_gate:created',
       'approval_gate:decided',
       'task:handoff',
+      'task:log',
       'work_package:handoff',
       'work_package:status',
     ]) {

@@ -41,6 +41,7 @@ import {
   type ScopedCommandResult,
 } from './repository-evidence'
 import { sanitizeWorkerMessage } from './redaction'
+import { recordTaskLogBestEffort } from './task-logs'
 
 type HandoffPackage = {
   id: string
@@ -227,6 +228,22 @@ async function createPackageArtifact(input: {
     content: artifact.content,
     metadata: artifact.metadata,
     createdAt: artifact.createdAt,
+    workPackageId: input.workPackageId,
+  })
+
+  await recordTaskLogBestEffort({
+    agentRunId: input.agentRunId,
+    artifactId: artifact.id,
+    eventType: 'artifact.created',
+    level: 'success',
+    message: `Created ${artifact.artifactType} artifact ${artifact.id}.`,
+    metadata: {
+      artifactType: artifact.artifactType,
+      metadata: artifact.metadata,
+    },
+    source: 'worker',
+    taskId: input.taskId,
+    title: 'Artifact created',
     workPackageId: input.workPackageId,
   })
 
@@ -739,6 +756,22 @@ async function failWorkPackageForMcpBroker(input: {
     workPackageId: input.pkg.id,
   })
 
+  if (input.warnings.length > 0) {
+    await recordTaskLogBestEffort({
+      eventType: 'mcp.warning',
+      level: 'warning',
+      message: `MCP broker warnings for "${input.pkg.title}": ${input.warnings.join('; ')}`,
+      metadata: {
+        blocked: input.blocked,
+        warnings: input.warnings,
+      },
+      source: 'mcp',
+      taskId: input.taskId,
+      title: 'MCP broker warning',
+      workPackageId: input.pkg.id,
+    })
+  }
+
   return { blockedReason: input.blockedReason, status: 'blocked' }
 }
 
@@ -1232,6 +1265,22 @@ export async function handoffApprovedWorkPackages(
     stage: 'handoff',
     workPackageId: nextPackage.id,
   })
+  await recordTaskLogBestEffort({
+    agentRunId: handoff.run.id,
+    eventType: 'run.started',
+    frontMatter: {
+      connector: 'forge-handoff/no-op',
+      model: 'forge-handoff/no-op',
+      prompt: `No-op handoff for ${nextPackage.assignedRole}: ${nextPackage.title}`,
+    },
+    level: 'info',
+    message: `No-op handoff run started for "${nextPackage.title}".`,
+    metadata: { attemptNumber: 1, assignedRole: nextPackage.assignedRole, stage: 'handoff' },
+    source: 'worker',
+    taskId,
+    title: 'Handoff run started',
+    workPackageId: nextPackage.id,
+  })
   const reviewGates = await materializeReviewGatesForWorkPackageCompletion({
     completeSourceRun: {
       artifactType: 'log_output',
@@ -1271,6 +1320,22 @@ export async function handoffApprovedWorkPackages(
     runId: handoff.run.id,
     stage: 'handoff',
     status: 'completed',
+    workPackageId: nextPackage.id,
+  })
+  await recordTaskLogBestEffort({
+    agentRunId: handoff.run.id,
+    eventType: 'run.completed',
+    frontMatter: {
+      connector: 'forge-handoff/no-op',
+      model: 'forge-handoff/no-op',
+      prompt: `No-op handoff for ${nextPackage.assignedRole}: ${nextPackage.title}`,
+    },
+    level: 'success',
+    message: `No-op handoff completed for "${nextPackage.title}".`,
+    metadata: { attemptNumber: 1, stage: 'handoff' },
+    source: 'worker',
+    taskId,
+    title: 'Handoff run completed',
     workPackageId: nextPackage.id,
   })
 
@@ -1535,6 +1600,17 @@ async function executeReadyWorkPackage(
     stage: 'implementation',
     workPackageId: nextPackage.id,
   })
+  await recordTaskLogBestEffort({
+    agentRunId: run.id,
+    eventType: 'run.started',
+    level: 'info',
+    message: `Implementation run started for "${nextPackage.title}".`,
+    metadata: { attemptNumber, assignedRole: nextPackage.assignedRole, stage: 'implementation' },
+    source: 'worker',
+    taskId,
+    title: 'Implementation run started',
+    workPackageId: nextPackage.id,
+  })
 
   let repositoryContext: RepositoryExecutionContext | null = null
   let repositoryAffecting = false
@@ -1584,6 +1660,7 @@ async function executeReadyWorkPackage(
     const priorReviewContext = await loadPriorReviewContext(taskId, nextPackage)
     const execution = await executeWorkPackage({
       ...context,
+      agentRunId: run.id,
       attemptNumber,
       priorReviewContext,
     })
@@ -1691,6 +1768,17 @@ async function executeReadyWorkPackage(
     }
 
     if (repositoryAffecting && validationStatusForPackage === 'skipped') {
+      await recordTaskLogBestEffort({
+        agentRunId: run.id,
+        eventType: 'validation.warning',
+        level: 'warning',
+        message: 'Repository-affecting package did not run validation commands.',
+        metadata: { validationStatus: 'skipped' },
+        source: 'worker',
+        taskId,
+        title: 'Validation skipped',
+        workPackageId: nextPackage.id,
+      })
       throw new Error('Repository-affecting package did not run validation commands; review or revise the execution plan before continuing.')
     }
 
@@ -1747,6 +1835,23 @@ async function executeReadyWorkPackage(
       runId: run.id,
       stage: 'implementation',
       status: 'completed',
+      workPackageId: nextPackage.id,
+    })
+    await recordTaskLogBestEffort({
+      agentRunId: run.id,
+      eventType: 'run.completed',
+      level: 'success',
+      message: `Implementation run completed for "${nextPackage.title}".`,
+      metadata: {
+        attemptNumber,
+        commandCount: execution.commandResults.length,
+        fileCount: execution.fileCount,
+        sandboxPath: execution.sandboxPath,
+        validationStatus: validationStatusForPackage,
+      },
+      source: 'worker',
+      taskId,
+      title: 'Implementation run completed',
       workPackageId: nextPackage.id,
     })
 
@@ -1899,6 +2004,36 @@ async function executeReadyWorkPackage(
       content: artifact.content,
       metadata: artifact.metadata,
       createdAt: artifact.createdAt,
+      workPackageId: nextPackage.id,
+    })
+    await recordTaskLogBestEffort({
+      agentRunId: run.id,
+      artifactId: artifact.id,
+      eventType: 'artifact.created',
+      level: 'error',
+      message: `Created failure artifact ${artifact.id}: ${message}`,
+      metadata: {
+        artifactType: artifact.artifactType,
+        failure: true,
+      },
+      source: 'worker',
+      taskId,
+      title: 'Failure artifact created',
+      workPackageId: nextPackage.id,
+    })
+    await recordTaskLogBestEffort({
+      agentRunId: run.id,
+      eventType: 'run.failed',
+      level: finalAttempt ? 'error' : 'warning',
+      message: `Implementation run failed for "${nextPackage.title}": ${message}`,
+      metadata: {
+        attemptNumber,
+        finalAttempt,
+        packageStatus,
+      },
+      source: 'worker',
+      taskId,
+      title: 'Implementation run failed',
       workPackageId: nextPackage.id,
     })
     await publishTaskEventBestEffort(taskId, 'work_package:status', {
