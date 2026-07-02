@@ -1538,17 +1538,11 @@ function ApprovedGrantSnapshot({ packages }: { packages: WorkforceRecord[] }) {
           const assignedRole = stringField(pkg, ['assignedRole', 'role'])
           const proposedGrants = jsonArrayField(pkg, ['proposedGrants', 'grants'])
           const proposedRequirements = jsonArrayField(pkg, ['proposedRequirements', 'requirements'])
-          const promptOverlayPresent = booleanField(pkg, ['promptOverlayPresent'])
           return (
             <div key={recordKey(pkg, 'approved-grant-package', index)} className="rounded-md border border-border bg-background px-2 py-1.5">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="break-all font-mono text-[11px] text-foreground">{packageId}</span>
                 {assignedRole !== '' && <Badge variant="secondary">{assignedRole}</Badge>}
-                {promptOverlayPresent !== null && (
-                  <Badge variant={promptOverlayPresent ? 'outline' : 'secondary'}>
-                    overlay {promptOverlayPresent ? 'approved' : 'absent'}
-                  </Badge>
-                )}
               </div>
               {proposedGrants.length > 0 && (
                 <p className="mt-1 text-muted-foreground">
@@ -2728,7 +2722,6 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
                     <Badge variant="outline" className={statusBadgeClass(decision.status)}>{decision.status}</Badge>
                     <span className="font-medium text-foreground">{decision.agent}</span>
                     <span className="text-muted-foreground">{decision.mcpId}</span>
-                    {decision.promptOverlayPresent && <Badge variant="outline">overlay</Badge>}
                   </div>
                   <p className="text-muted-foreground">{statusText}</p>
                   {decision.capabilities.length > 0 && (

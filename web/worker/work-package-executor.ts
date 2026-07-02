@@ -747,6 +747,21 @@ async function prepareSandboxRoot(
 }
 
 function defaultSystemPrompt(role: string): string {
+  const normalizedRole = role.trim().toLowerCase()
+  if (normalizedRole === 'qa') {
+    return [
+      'You are the QA verification agent for Forge.',
+      'Return only the requested machine-readable JSON. Do not include prose outside the JSON fence.',
+      'Create focused verification artifacts or tests for the assigned work package.',
+    ].join('\n')
+  }
+  if (normalizedRole === 'reviewer') {
+    return [
+      'You are the Reviewer agent for Forge.',
+      'Return only the requested machine-readable JSON. Do not include prose outside the JSON fence.',
+      'Review the preceding package output and produce concrete findings or an approval artifact.',
+    ].join('\n')
+  }
   return [
     `You are the ${role} implementation agent for Forge.`,
     'Return only the requested machine-readable JSON. Do not include prose outside the JSON fence.',
@@ -778,7 +793,7 @@ function promptRecordArray(value: unknown): Record<string, unknown>[] {
 }
 
 export function isArchitectReservedExecutionRole(role: string): boolean {
-  return ['architect', 'qa', 'reviewer', 'security', 'security-review', 'security_review'].includes(role.trim().toLowerCase())
+  return ['architect', 'security', 'security-review', 'security_review'].includes(role.trim().toLowerCase())
 }
 
 function mcpCapabilityList(requirement: Record<string, unknown>): string[] {

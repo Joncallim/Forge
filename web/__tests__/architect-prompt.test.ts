@@ -284,7 +284,9 @@ describe('buildArchitectPrompt checkpoint resume context', () => {
     )
 
     expect(prompt).toContain('Include at least one executable handoff agent')
-    expect(prompt).toContain('Do not put only Architect, QA, or Reviewer')
+    expect(prompt).toContain('Do not put only Architect or Security')
+    expect(prompt).toContain('prefer explicit QA and/or Reviewer agents')
+    expect(prompt).toContain('Implementation agents still keep durable manual review gates')
   })
 
   it('bounds Architect streaming so local models cannot loop forever', () => {

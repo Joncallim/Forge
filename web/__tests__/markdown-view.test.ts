@@ -23,4 +23,24 @@ describe('MarkdownView', () => {
     expect(html).not.toContain('javascript:alert')
     expect(html).toContain('href="https://example.com"')
   })
+
+  it('preserves nested ordered and unordered list structure', () => {
+    const html = renderToStaticMarkup(createElement(MarkdownView, {
+      content: [
+        '1. First',
+        '   1. Child one',
+        '   1. Child two',
+        '2. Second',
+        '   - Sub bullet',
+        '     - Deeper bullet',
+      ].join('\n'),
+    }))
+
+    expect(html).toContain('<li>First<ol')
+    expect(html).toContain('<li>Child one</li><li>Child two</li>')
+    expect(html).toContain('<li>Second<ul')
+    expect(html).toContain('<li>Sub bullet<ul')
+    expect(html).not.toContain('1. Child one')
+    expect(html).not.toContain('- Sub bullet')
+  })
 })

@@ -78,13 +78,12 @@ function defaultReviewRequirement(agentType: string): ReviewRequirement {
 
 function isReservedArchitectAssignedRole(role: string): boolean {
   const normalized = normalizeAgentType(role)
-  return ['architect', 'qa', 'reviewer', 'security', 'security-review', 'security_review'].includes(normalized)
+  return ['architect', 'security', 'security-review', 'security_review'].includes(normalized)
 }
 
-// Implementation packages always get full QA + Reviewer review; the Architect /
-// planning model is not allowed to downgrade it (e.g. to 'none' or 'qa_only').
-// Non-implementation roles keep whatever the plan requested, since review gates
-// are never materialized for them anyway.
+// Implementation packages keep full QA + Reviewer gates until executable
+// QA/Reviewer work packages can produce durable gate decisions tied to the
+// implementation artifact. The planning model is not allowed to downgrade them.
 function resolveReviewRequirement(
   agentType: string,
   requested: ReviewRequirement | undefined,
@@ -435,7 +434,7 @@ export async function materializeWorkforceFromArchitectArtifact(
   const rows = buildWorkforceMaterializationRows(input, { activeAgents })
   if (rows.workPackages.length === 0) {
     throw new Error(
-      'Architect plan did not produce any executable work packages. Assign at least one configured implementation, documentation, DevOps, Backend, Frontend, or other specialist handoff agent; Architect, QA, and Reviewer are planning/review gates, not executable handoff packages.' +
+      'Architect plan did not produce any executable work packages. Assign at least one configured implementation, documentation, DevOps, Backend, Frontend, QA, Reviewer, or other specialist handoff agent; Architect and Security are planning/review gates, not executable handoff packages.' +
       plannedRoleSummary(input),
     )
   }

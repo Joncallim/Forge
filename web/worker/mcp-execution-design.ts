@@ -362,14 +362,16 @@ export function validateMcpExecutionDesign(
         const current = approvedCapabilitiesByAgent.get(agent) ?? new Set<string>()
         for (const capability of requirementCapabilitiesForAgent(requirement, agent)) {
           if (unsafeCapability(requirement.mcpId, capability, requirement.prohibitedCapabilities) === null) {
-            current.add(normalizeCapability(capability))
+            for (const key of approvedCoverageCapabilityKeys(capability)) current.add(key)
           }
         }
         approvedCapabilitiesByAgent.set(agent, current)
       }
     }
     const prohibitedCapabilities = new Set(
-      design.requirements.flatMap((requirement) => requirement.prohibitedCapabilities.map(normalizeCapability)),
+      design.requirements.flatMap((requirement) =>
+        requirement.prohibitedCapabilities.flatMap(prohibitedCoverageCapabilityKeys),
+      ),
     )
 
     for (const subtask of design.mcpAwareSubtasks) {
@@ -386,7 +388,7 @@ export function validateMcpExecutionDesign(
           blocked.push(`MCP-aware subtask capability '${unsafe}' is outside the allowed beta scope.`)
           continue
         }
-        if (!approvedCapabilities.has(normalizedCapability)) {
+        if (!approvedCapabilities.has(coverageCapabilityKey(normalizedCapability))) {
           blocked.push(`MCP-aware subtask capability '${normalizedCapability}' is not covered by an explicit approved grant.`)
         }
       }
@@ -479,10 +481,36 @@ function normalizeCapability(capability: string): string {
   return capability.trim().toLowerCase().replace(/\s+/g, '_')
 }
 
+function coverageCapabilityKey(capability: string): string {
+  return normalizeCapability(capability)
+}
+
+function filesystemProjectAlias(capability: string): string | null {
+  const normalized = normalizeCapability(capability)
+  const filesystemAlias = normalized.match(/^filesystem\.(read|list|search)$/)
+  return filesystemAlias ? `filesystem.project.${filesystemAlias[1]}` : null
+}
+
+function approvedCoverageCapabilityKeys(capability: string): string[] {
+  const normalized = normalizeCapability(capability)
+  const projectAlias = filesystemProjectAlias(normalized)
+  // Unqualified filesystem read/list/search grants are project-root scoped in
+  // this beta path, so they also satisfy the explicit filesystem.project.*
+  // spelling. A filesystem.project.* grant does not widen back to unqualified
+  // filesystem access.
+  return projectAlias ? [normalized, projectAlias] : [normalized]
+}
+
+function prohibitedCoverageCapabilityKeys(capability: string): string[] {
+  const normalized = normalizeCapability(capability)
+  const projectAlias = filesystemProjectAlias(normalized)
+  return projectAlias ? [normalized, projectAlias] : [normalized]
+}
+
 function unsafeCapability(mcpId: string, capability: string, prohibitedCapabilities: string[]): string | null {
   const normalized = normalizeCapability(capability)
-  const prohibited = new Set(prohibitedCapabilities.map(normalizeCapability))
-  if (prohibited.has(normalized)) return normalized
+  const prohibited = new Set(prohibitedCapabilities.flatMap(prohibitedCoverageCapabilityKeys))
+  if (prohibited.has(coverageCapabilityKey(normalized))) return normalized
 
   const safePatterns = Object.prototype.hasOwnProperty.call(SAFE_BETA_CAPABILITY_PATTERNS, mcpId)
     ? SAFE_BETA_CAPABILITY_PATTERNS[mcpId]
@@ -522,7 +550,9 @@ export function evaluateWorkPackageMcpBroker(input: {
     const fallback = fallbackAction(entry.fallback)
     const grantStatus = cleanText(entry.status, 40)
     const prohibitedCapabilities = cleanTextArray(entry.prohibitedCapabilities, 40, 120)
-    for (const prohibited of prohibitedCapabilities) prohibitedAll.add(normalizeCapability(prohibited))
+    for (const prohibited of prohibitedCapabilities) {
+      for (const key of prohibitedCoverageCapabilityKeys(prohibited)) prohibitedAll.add(key)
+    }
     const { capabilities, present: capabilitiesPresent } = capabilityArray(entry)
 
     const canContinueWithoutMcp = requirement === 'optional' && fallback === 'continue_without_mcp'
@@ -552,7 +582,7 @@ export function evaluateWorkPackageMcpBroker(input: {
       if (unsafe) {
         blocked.push(`MCP '${mcpId}' capability '${unsafe}' is outside the allowed beta scope.`)
       } else {
-        approvedCapabilities.add(normalizedCapability)
+        for (const key of approvedCoverageCapabilityKeys(normalizedCapability)) approvedCapabilities.add(key)
       }
     }
 
@@ -581,7 +611,7 @@ export function evaluateWorkPackageMcpBroker(input: {
         blocked.push(`MCP-aware subtask capability '${unsafe}' is outside the allowed beta scope.`)
         continue
       }
-      if (!approvedCapabilities.has(normalizedCapability)) {
+      if (!approvedCapabilities.has(coverageCapabilityKey(normalizedCapability))) {
         blocked.push(`MCP-aware subtask capability '${normalizedCapability}' is not covered by an explicit approved grant.`)
       }
     }

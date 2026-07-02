@@ -187,6 +187,7 @@ export default function ProjectDetailPage() {
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
   const [dialogOpen, setDialogOpen] = useState(false)
+  const [taskComposerMinimized, setTaskComposerMinimized] = useState(false)
   const [projectPathDialogOpen, setProjectPathDialogOpen] = useState(false)
   const [projectPathInput, setProjectPathInput] = useState('')
   const [projectPathError, setProjectPathError] = useState<string | null>(null)
@@ -251,6 +252,25 @@ export default function ProjectDetailPage() {
     loadData()
   }, [loadData])
 
+  function handleTaskDialogOpenChange(open: boolean) {
+    if (open) {
+      setTaskComposerMinimized(false)
+      setDialogOpen(true)
+      return
+    }
+
+    setDialogOpen(false)
+    setTaskComposerMinimized(!submitting)
+  }
+
+  function handleTaskComposerKeyDown(e: React.KeyboardEvent<HTMLFormElement>) {
+    if (e.key !== 'Enter' || (!e.metaKey && !e.ctrlKey)) return
+    e.preventDefault()
+    if (!submitting) {
+      e.currentTarget.requestSubmit()
+    }
+  }
+
   async function handleCreateTask(e: React.FormEvent) {
     e.preventDefault()
     setFormError(null)
@@ -271,6 +291,7 @@ export default function ProjectDetailPage() {
       }
       const data = await res.json()
       const newTaskId = data.task?.id
+      setTaskComposerMinimized(false)
       setDialogOpen(false)
       setFormTitle('')
       setFormPrompt('')
@@ -512,80 +533,101 @@ export default function ProjectDetailPage() {
         </div>
 
         <div className="flex items-center gap-2">
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={handleDeleteProject}
-          disabled={deleting}
-          aria-busy={deleting}
-          aria-label={`Delete project ${project.name}`}
-          title="Removes this project record. You can keep files on disk, which also works for orphaned projects whose folder is missing."
-          className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-        >
-          <Trash2Icon aria-hidden="true" />
-          {deleting ? 'Deleting…' : 'Delete'}
-        </Button>
-        <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-          <DialogTrigger
-            render={
-              <Button size="sm" aria-label="Create new task">
-                <PlusIcon aria-hidden="true" />
-                New Task
-              </Button>
-            }
-          />
-          <DialogContent className="sm:max-w-lg" aria-labelledby="new-task-title">
-            <DialogHeader>
-          <DialogTitle id="new-task-title">New task</DialogTitle>
-            </DialogHeader>
-
-            <form onSubmit={handleCreateTask} className="flex flex-col gap-4">
-              <div className="flex flex-col gap-1.5">
-                <label htmlFor="task-title" className="text-sm font-medium text-foreground">
-                  Title <span className="text-muted-foreground">(optional)</span>
-                </label>
-                <input
-                  id="task-title"
-                  type="text"
-                  value={formTitle}
-                  onChange={(e) => setFormTitle(e.target.value)}
-                  placeholder="Leave blank to auto-generate from the prompt"
-                  className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                />
-              </div>
-
-              <div className="flex flex-col gap-1.5">
-                <label htmlFor="task-prompt" className="text-sm font-medium text-foreground">
-                  Prompt <span aria-hidden="true" className="text-destructive">*</span>
-                </label>
-                <textarea
-                  id="task-prompt"
-                  required
-                  rows={6}
-                  value={formPrompt}
-                  onChange={(e) => setFormPrompt(e.target.value)}
-                  placeholder="Describe what you want the agents to build or change…"
-                  className="resize-y rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-                  aria-required="true"
-                />
-              </div>
-
-              {formError !== null && (
-                <p role="alert" aria-live="assertive" className="text-sm text-destructive">
-                  {formError}
-                </p>
-              )}
-
-              <DialogFooter>
-                <Button type="submit" disabled={submitting} aria-busy={submitting}>
-                  {submitting ? 'Creating…' : 'Create task'}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleDeleteProject}
+            disabled={deleting}
+            aria-busy={deleting}
+            aria-label={`Delete project ${project.name}`}
+            title="Removes this project record. You can keep files on disk, which also works for orphaned projects whose folder is missing."
+            className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+          >
+            <Trash2Icon aria-hidden="true" />
+            {deleting ? 'Deleting…' : 'Delete'}
+          </Button>
+          <Dialog open={dialogOpen} onOpenChange={handleTaskDialogOpenChange}>
+            <DialogTrigger
+              render={
+                <Button size="sm" aria-label="Create new task">
+                  <PlusIcon aria-hidden="true" />
+                  New Task
                 </Button>
-              </DialogFooter>
-            </form>
-          </DialogContent>
-        </Dialog>
+              }
+            />
+            <DialogContent className="sm:max-w-lg" aria-labelledby="new-task-title">
+              <DialogHeader>
+                <DialogTitle id="new-task-title">New task</DialogTitle>
+              </DialogHeader>
+
+              <form onSubmit={handleCreateTask} onKeyDown={handleTaskComposerKeyDown} className="flex flex-col gap-4">
+                <div className="flex flex-col gap-1.5">
+                  <label htmlFor="task-title" className="text-sm font-medium text-foreground">
+                    Title <span className="text-muted-foreground">(optional)</span>
+                  </label>
+                  <input
+                    id="task-title"
+                    type="text"
+                    value={formTitle}
+                    onChange={(e) => setFormTitle(e.target.value)}
+                    placeholder="Leave blank to auto-generate from the prompt"
+                    className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                  />
+                </div>
+
+                <div className="flex flex-col gap-1.5">
+                  <label htmlFor="task-prompt" className="text-sm font-medium text-foreground">
+                    Prompt <span aria-hidden="true" className="text-destructive">*</span>
+                  </label>
+                  <textarea
+                    id="task-prompt"
+                    required
+                    rows={6}
+                    value={formPrompt}
+                    onChange={(e) => setFormPrompt(e.target.value)}
+                    placeholder="Describe what you want the agents to build or change…"
+                    className="resize-y rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                    aria-required="true"
+                  />
+                </div>
+
+                {formError !== null && (
+                  <p role="alert" aria-live="assertive" className="text-sm text-destructive">
+                    {formError}
+                  </p>
+                )}
+
+                <DialogFooter>
+                  <Button type="submit" disabled={submitting} aria-busy={submitting}>
+                    {submitting ? 'Creating…' : 'Create task'}
+                  </Button>
+                </DialogFooter>
+              </form>
+            </DialogContent>
+          </Dialog>
         </div>
       </div>
+
+      {taskComposerMinimized && (
+        <div className="fixed inset-x-4 bottom-4 z-40 flex justify-end sm:inset-x-auto sm:right-4">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              setTaskComposerMinimized(false)
+              setDialogOpen(true)
+            }}
+            className="max-w-full border-border bg-popover text-popover-foreground shadow-lg"
+            aria-label="Restore draft task"
+          >
+            <PlusIcon aria-hidden="true" />
+            <span className="truncate">
+              Draft task{formTitle.trim() !== '' ? `: ${formTitle.trim()}` : ''}
+            </span>
+          </Button>
+        </div>
+      )}
 
       <Dialog open={projectPathDialogOpen} onOpenChange={setProjectPathDialogOpen}>
         <DialogContent className="sm:max-w-lg" aria-labelledby="project-path-title">

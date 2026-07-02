@@ -20,6 +20,10 @@ export type SeededTask = {
   taskId: string
 }
 
+export type SeededProject = {
+  projectId: string
+}
+
 export function getBaseUrl(): string {
   return process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
 }
@@ -201,6 +205,31 @@ export async function seedProjectTask(input: {
   }
 
   return { projectId, taskId }
+}
+
+export async function seedProject(input: {
+  defaultBranch?: string
+  githubRepo?: string | null
+  name: string
+}): Promise<SeededProject> {
+  const sql = sqlClient()
+  const projectId = crypto.randomUUID()
+
+  try {
+    await sql`
+      insert into projects (id, name, github_repo, default_branch)
+      values (
+        ${projectId},
+        ${input.name},
+        ${input.githubRepo ?? 'owner/forge-composer'},
+        ${input.defaultBranch ?? 'main'}
+      )
+    `
+  } finally {
+    await sql.end()
+  }
+
+  return { projectId }
 }
 
 export async function installSessionCookie(
