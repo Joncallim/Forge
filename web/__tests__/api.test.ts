@@ -125,7 +125,7 @@ function chain(resolveValue: unknown) {
     catch: (onRejected: (e: unknown) => unknown) =>
       Promise.resolve(resolveValue).catch(onRejected),
   }
-  const methods = ['from', 'where', 'limit', 'orderBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'onConflictDoUpdate', 'onConflictDoNothing']
+  const methods = ['from', 'where', 'limit', 'orderBy', 'groupBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'onConflictDoUpdate', 'onConflictDoNothing']
   methods.forEach((m) => { thenable[m] = () => thenable })
   return thenable
 }
@@ -137,7 +137,7 @@ function rejectingChain(error: unknown) {
     catch: (onRejected: (e: unknown) => unknown) =>
       Promise.reject(error).catch(onRejected),
   }
-  const methods = ['from', 'where', 'limit', 'orderBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'onConflictDoUpdate', 'onConflictDoNothing']
+  const methods = ['from', 'where', 'limit', 'orderBy', 'groupBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'onConflictDoUpdate', 'onConflictDoNothing']
   methods.forEach((m) => { thenable[m] = () => thenable })
   return thenable
 }
@@ -236,7 +236,10 @@ describe('GET /api/projects — auth guard', () => {
 // ---------------------------------------------------------------------------
 
 describe('POST /api/projects — source handling', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockDbSelect.mockReturnValue(chain([]))
+  })
 
   it('returns 400 when a GitHub project is missing githubRepo', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
@@ -399,7 +402,7 @@ describe('POST /api/projects — source handling', () => {
 
       expect(res.status).toBe(400)
       const body = await res.json()
-      expect(body.error).toMatch(/workspace root/i)
+      expect(body.error).toMatch(/active Forge workspace|workspace root/i)
       expect(mockDbInsert).not.toHaveBeenCalled()
     } finally {
       if (previousRoot === undefined) {
@@ -412,7 +415,7 @@ describe('POST /api/projects — source handling', () => {
     }
   })
 
-  it('uses an allowlisted clone request githubTokenEnvVar and encodes the token in the clone URL', async () => {
+  it('uses an allowlisted clone request githubTokenEnvVar through askpass without persisting the token', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const previousRoot = process.env.FORGE_WORKSPACE_ROOT
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-clone-env-'))
@@ -433,7 +436,30 @@ describe('POST /api/projects — source handling', () => {
     }
     mockResolveGitHubToken.mockResolvedValue({ token, source: 'env' })
     mockExecFile.mockImplementation((_command, args: string[], _options, callback) => {
-      fs.mkdir(args[4], { recursive: true }).then(
+      const run = async () => {
+        if (args[0] === 'clone') {
+          const cloneUrl = args[3]
+          const destination = args[4]
+          await fs.mkdir(path.join(destination, '.git'), { recursive: true })
+          await fs.writeFile(
+            path.join(destination, '.git', 'config'),
+            `[remote "origin"]\n\turl = ${cloneUrl}\n`,
+          )
+          return
+        }
+        if (args[0] === '-C' && args[2] === 'remote' && args[3] === 'set-url') {
+          const destination = args[1]
+          const cloneUrl = args[5]
+          await fs.mkdir(path.join(destination, '.git'), { recursive: true })
+          await fs.writeFile(
+            path.join(destination, '.git', 'config'),
+            `[remote "origin"]\n\turl = ${cloneUrl}\n`,
+          )
+          return
+        }
+        throw new Error(`Unexpected git command: ${args.join(' ')}`)
+      }
+      run().then(
         () => callback(null, '', ''),
         (err) => callback(err),
       )
@@ -458,15 +484,78 @@ describe('POST /api/projects — source handling', () => {
 
       expect(res.status).toBe(201)
       expect(mockResolveGitHubToken).toHaveBeenCalledWith({ envVar: 'GITHUB_TOKEN' })
-      expect(mockExecFile).toHaveBeenCalledWith(
-        'git',
-        expect.arrayContaining([
-          `https://x-access-token:${encodeURIComponent(token)}@github.com/owner/private-repo.git`,
-          expectedLocalPath,
-        ]),
-        expect.any(Object),
-        expect.any(Function),
-      )
+      const cloneCall = mockExecFile.mock.calls.find((call) => (call[1] as string[])[0] === 'clone')
+      expect(cloneCall).toBeTruthy()
+      expect(cloneCall?.[1]).toEqual([
+        'clone',
+        '--depth',
+        '1',
+        'https://github.com/owner/private-repo.git',
+        expectedLocalPath,
+      ])
+      expect(cloneCall?.[2]).toEqual(expect.objectContaining({
+        env: expect.objectContaining({
+          GIT_ASKPASS: expect.stringContaining('forge-git-askpass-'),
+          GIT_TERMINAL_PROMPT: '0',
+        }),
+      }))
+      const askpassPath = (cloneCall?.[2] as { env?: NodeJS.ProcessEnv } | undefined)?.env?.GIT_ASKPASS
+      expect(askpassPath).toBeTruthy()
+      await expect(fs.stat(path.dirname(askpassPath as string))).rejects.toMatchObject({ code: 'ENOENT' })
+      const setUrlCall = mockExecFile.mock.calls.find((call) => (call[1] as string[])[2] === 'remote')
+      expect(setUrlCall?.[1]).toEqual([
+        '-C',
+        expectedLocalPath,
+        'remote',
+        'set-url',
+        'origin',
+        'https://github.com/owner/private-repo.git',
+      ])
+      const serializedExecCalls = JSON.stringify(mockExecFile.mock.calls)
+      expect(serializedExecCalls).not.toContain(token)
+      expect(serializedExecCalls).not.toContain(encodeURIComponent(token))
+      const gitConfig = await fs.readFile(path.join(expectedLocalPath, '.git', 'config'), 'utf-8')
+      expect(gitConfig).toContain('url = https://github.com/owner/private-repo.git')
+      expect(gitConfig).not.toContain(token)
+      expect(gitConfig).not.toContain(encodeURIComponent(token))
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects existing clone destinations without deleting a pre-existing empty directory', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-clone-existing-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const existingDestination = path.join(workspaceRoot, 'projects', 'private-repo')
+    await fs.mkdir(existingDestination, { recursive: true })
+
+    try {
+      const { POST } = await import('@/app/api/projects/route')
+      const res = await POST(authRequest('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Private Repo',
+          source: 'clone',
+          githubRepo: 'owner/private-repo',
+          localPath: 'private-repo',
+          githubTokenEnvVar: 'GITHUB_TOKEN',
+        }),
+      }) as never)
+
+      expect(res.status).toBe(409)
+      const body = await res.json()
+      expect(body.error).toMatch(/already exists/i)
+      expect(mockResolveGitHubToken).not.toHaveBeenCalled()
+      expect(mockExecFile).not.toHaveBeenCalled()
+      await expect(fs.stat(existingDestination)).resolves.toMatchObject({})
     } finally {
       if (previousRoot === undefined) {
         delete process.env.FORGE_WORKSPACE_ROOT
@@ -538,9 +627,49 @@ describe('POST /api/projects — source handling', () => {
 
       expect(res.status).toBe(400)
       const body = await res.json()
-      expect(body.error).toMatch(/workspace root/i)
+      expect(body.error).toMatch(/active Forge workspace|workspace root/i)
       expect(mockDbInsert).not.toHaveBeenCalled()
       await expect(fs.stat(path.join(outsideRoot, 'new-project'))).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+      await fs.rm(outsideRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects local project creation when forge.project.json is a symlink', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-local-marker-link-'))
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-local-marker-outside-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const localPath = path.join(workspaceRoot, 'projects', 'marker-link')
+    const outsideFile = path.join(outsideRoot, 'outside.json')
+    await fs.mkdir(localPath, { recursive: true })
+    await fs.writeFile(outsideFile, 'outside\n')
+    await fs.symlink(outsideFile, path.join(localPath, 'forge.project.json'))
+
+    try {
+      const { POST } = await import('@/app/api/projects/route')
+      const res = await POST(authRequest('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Marker Link',
+          source: 'local',
+          localPath,
+        }),
+      }) as never)
+
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error).toMatch(/symlink/i)
+      expect(mockDbInsert).not.toHaveBeenCalled()
+      await expect(fs.readFile(outsideFile, 'utf-8')).resolves.toBe('outside\n')
     } finally {
       if (previousRoot === undefined) {
         delete process.env.FORGE_WORKSPACE_ROOT
@@ -582,6 +711,65 @@ describe('POST /api/projects — source handling', () => {
       expect(body.error).toMatch(/workspace root/i)
       expect(mockExecFile).not.toHaveBeenCalled()
       await expect(fs.stat(path.join(outsideRoot, 'private-repo'))).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+      await fs.rm(outsideRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects cloned projects that contain a symlinked forge.project.json marker', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-clone-marker-link-'))
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-clone-marker-outside-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const expectedLocalPath = path.join(workspaceRoot, 'projects', 'private-repo')
+    const outsideFile = path.join(outsideRoot, 'outside.json')
+    await fs.writeFile(outsideFile, 'outside\n')
+    mockResolveGitHubToken.mockResolvedValue({ token: 'placeholder-token', source: 'env' })
+    mockExecFile.mockImplementation((_command, args: string[], _options, callback) => {
+      const run = async () => {
+        if (args[0] === 'clone') {
+          const destination = args[4]
+          await fs.mkdir(destination, { recursive: true })
+          await fs.symlink(outsideFile, path.join(destination, 'forge.project.json'))
+          return
+        }
+        if (args[0] === '-C' && args[2] === 'remote') return
+        throw new Error(`Unexpected git command: ${args.join(' ')}`)
+      }
+      run().then(
+        () => callback(null, '', ''),
+        (err) => callback(err),
+      )
+      return undefined
+    })
+
+    try {
+      const { POST } = await import('@/app/api/projects/route')
+      const res = await POST(authRequest('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Private Repo',
+          source: 'clone',
+          githubRepo: 'owner/private-repo',
+          localPath: 'private-repo',
+          githubTokenEnvVar: 'GITHUB_TOKEN',
+        }),
+      }) as never)
+
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error).toMatch(/symlink/i)
+      expect(mockDbInsert).not.toHaveBeenCalled()
+      await expect(fs.stat(expectedLocalPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(fs.readFile(outsideFile, 'utf-8')).resolves.toBe('outside\n')
     } finally {
       if (previousRoot === undefined) {
         delete process.env.FORGE_WORKSPACE_ROOT
@@ -638,6 +826,115 @@ describe('POST /api/projects — source handling', () => {
       await fs.rm(workspaceRoot, { recursive: true, force: true })
     }
   })
+
+  it('rejects local project paths inside protected Forge workspace directories', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-protected-project-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+
+    try {
+      const { POST } = await import('@/app/api/projects/route')
+      const res = await POST(authRequest('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Bad project',
+          source: 'local',
+          localPath: path.join(workspaceRoot, 'config'),
+        }),
+      }) as never)
+
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error).toMatch(/workspace config directory/i)
+      expect(mockDbInsert).not.toHaveBeenCalled()
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects local project paths overlapping another project before creating directories', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-local-overlap-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const existingProjectRoot = path.join(workspaceRoot, 'projects', 'existing')
+    const nestedProjectRoot = path.join(existingProjectRoot, 'nested')
+    await fs.mkdir(existingProjectRoot, { recursive: true })
+    mockDbSelect.mockReturnValue(chain([{ id: 'project-existing', localPath: existingProjectRoot }]))
+
+    try {
+      const { POST } = await import('@/app/api/projects/route')
+      const res = await POST(authRequest('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Nested project',
+          source: 'local',
+          localPath: nestedProjectRoot,
+        }),
+      }) as never)
+
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error).toMatch(/overlaps another registered Forge project/i)
+      expect(mockDbInsert).not.toHaveBeenCalled()
+      await expect(fs.stat(nestedProjectRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects clone destinations overlapping another project before running git clone', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-clone-overlap-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const existingProjectRoot = path.join(workspaceRoot, 'projects', 'existing')
+    const nestedProjectRoot = path.join(existingProjectRoot, 'nested-clone')
+    await fs.mkdir(existingProjectRoot, { recursive: true })
+    mockDbSelect.mockReturnValue(chain([{ id: 'project-existing', localPath: existingProjectRoot }]))
+
+    try {
+      const { POST } = await import('@/app/api/projects/route')
+      const res = await POST(authRequest('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Nested clone',
+          source: 'clone',
+          githubRepo: 'owner/private-repo',
+          localPath: nestedProjectRoot,
+          githubTokenEnvVar: 'GITHUB_TOKEN',
+          defaultBranch: 'main',
+        }),
+      }) as never)
+
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error).toMatch(/overlaps another registered Forge project/i)
+      expect(mockExecFile).not.toHaveBeenCalled()
+      await expect(fs.stat(nestedProjectRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('PUT /api/projects/:id — local path display handling', () => {
@@ -653,6 +950,7 @@ describe('PUT /api/projects/:id — local path display handling', () => {
     const expectedLocalPath = path.join(workspaceRoot, 'projects', 'updated-project')
     process.env.HOME = fakeHome
     process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    await fs.mkdir(expectedLocalPath, { recursive: true })
     const existingProject = {
       id: 'project-update-display',
       name: 'Display update',
@@ -699,6 +997,49 @@ describe('PUT /api/projects/:id — local path display handling', () => {
         process.env.HOME = previousHome
       }
       await fs.rm(fakeHome, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects updates that point at protected Forge workspace directories', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-project-update-protected-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const existingProject = {
+      id: 'project-update-protected',
+      name: 'Protected update',
+      githubRepo: null,
+      localPath: null,
+      githubTokenEnvVar: null,
+      pmProviderConfigId: null,
+      defaultBranch: 'main',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      archivedAt: null,
+    }
+    mockDbSelect.mockReturnValue(chain([existingProject]))
+
+    try {
+      const { PUT } = await import('@/app/api/projects/[id]/route')
+      const res = await PUT(authRequest('/api/projects/project-update-protected', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ localPath: path.join(workspaceRoot, 'config') }),
+      }) as never, {
+        params: Promise.resolve({ id: 'project-update-protected' }),
+      })
+
+      expect(res.status).toBe(400)
+      const body = await res.json()
+      expect(body.error).toMatch(/workspace config directory/i)
+      expect(mockDbUpdate).not.toHaveBeenCalled()
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
     }
   })
 })
@@ -2125,13 +2466,13 @@ describe('GET /api/tasks/:id — task details', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Suite 3.4 — Task status guard: DELETE /api/tasks/:id returns 409 when status is 'running'
+// Suite 3.4 — Task deletion and cancellation
 // ---------------------------------------------------------------------------
 
-describe('DELETE /api/tasks/:id — 409 when status is running', () => {
+describe('DELETE /api/tasks/:id — stop or delete a task', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
-  it('returns 409 when task status is running', async () => {
+  it('cancels a running task and non-terminal package state', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const runningTask = {
       id: 'task-1',
@@ -2149,6 +2490,11 @@ describe('DELETE /api/tasks/:id — 409 when status is running', () => {
       completedAt: null,
     }
     mockDbSelect.mockReturnValue(chain([runningTask]))
+    mockDbUpdate
+      .mockReturnValueOnce(chain([{ id: 'task-1' }]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
 
     const { DELETE } = await import('@/app/api/tasks/[id]/route')
     const req = authRequest('/api/tasks/task-1', { method: 'DELETE' })
@@ -2156,9 +2502,73 @@ describe('DELETE /api/tasks/:id — 409 when status is running', () => {
 
     const res = await DELETE(req as never, { params })
 
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual({ ok: true, mode: 'cancel' })
+    expect(mockDbUpdate).toHaveBeenCalledTimes(4)
+    expect(mockRedisPublish).toHaveBeenCalledWith(
+      'forge:task:task-1',
+      expect.stringContaining('"status":"cancelled"'),
+    )
+  })
+
+  it('hard-deletes an individual task when mode=delete is requested', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{
+      id: 'task-delete',
+      status: 'completed',
+    }]))
+    mockDbDelete.mockReturnValue(chain([{ id: 'task-delete' }]))
+
+    const { DELETE } = await import('@/app/api/tasks/[id]/route')
+    const req = authRequest('/api/tasks/task-delete?mode=delete', { method: 'DELETE' })
+    const params = Promise.resolve({ id: 'task-delete' })
+
+    const res = await DELETE(req as never, { params })
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual({ ok: true, mode: 'delete' })
+    expect(mockDbDelete).toHaveBeenCalled()
+  })
+
+  it('rejects hard-delete for active tasks so operators must stop them first', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{
+      id: 'task-running-delete',
+      status: 'running',
+    }]))
+
+    const { DELETE } = await import('@/app/api/tasks/[id]/route')
+    const req = authRequest('/api/tasks/task-running-delete?mode=delete', { method: 'DELETE' })
+    const params = Promise.resolve({ id: 'task-running-delete' })
+
+    const res = await DELETE(req as never, { params })
+
     expect(res.status).toBe(409)
     const body = await res.json()
-    expect(body.error).toMatch(/running/i)
+    expect(body.error).toMatch(/Stop it first/i)
+    expect(mockDbDelete).not.toHaveBeenCalled()
+  })
+
+  it('rejects hard-delete when the task stops being terminal before delete commits', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValue(chain([{
+      id: 'task-raced-delete',
+      status: 'failed',
+    }]))
+    mockDbDelete.mockReturnValue(chain([]))
+
+    const { DELETE } = await import('@/app/api/tasks/[id]/route')
+    const req = authRequest('/api/tasks/task-raced-delete?mode=delete', { method: 'DELETE' })
+    const params = Promise.resolve({ id: 'task-raced-delete' })
+
+    const res = await DELETE(req as never, { params })
+
+    expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body.error).toMatch(/no longer terminal/i)
+    expect(mockDbDelete).toHaveBeenCalled()
   })
 })
 
@@ -2195,6 +2605,20 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       status: 'awaiting_approval',
       updatedAt: new Date('2026-06-25T00:00:00.000Z'),
     }
+    const workPackageRow = {
+      id: 'pkg-1',
+      assignedRole: 'backend',
+      title: 'Backend package',
+      mcpRequirements: [{ mcpId: 'github', capability: 'issues.read' }],
+      metadata: {
+        mcpGrants: [{
+          decisionId: 'grant-1',
+          mcpId: 'github',
+          status: 'proposed',
+        }],
+        promptOverlay: 'Use GitHub read tools only.',
+      },
+    }
     const approvedTask = {
       ...awaitingTask,
       status: 'approved',
@@ -2204,7 +2628,9 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     taskUpdate.set = vi.fn(() => taskUpdate)
     const gateUpdate = chain([{ id: 'gate-1' }])
     gateUpdate.set = vi.fn(() => gateUpdate)
-    mockDbSelect.mockReturnValue(chain([awaitingTask]))
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([workPackageRow]))
     mockDbUpdate
       .mockReturnValueOnce(taskUpdate)
       .mockReturnValueOnce(gateUpdate)
@@ -2222,6 +2648,41 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       decidedBy: FAKE_SESSION.userId,
       status: 'approved',
     }))
+    const gateSetMock = gateUpdate.set as unknown as { mock: { calls: Array<[{ metadata?: { queryChunks?: unknown[] } }]> } }
+    const gateSetPayload = gateSetMock.mock.calls[0][0]
+    const grantSnapshotJson = gateSetPayload.metadata?.queryChunks
+      ?.find((chunk): chunk is string => typeof chunk === 'string' && chunk.includes('mcpGrantPhases'))
+    expect(grantSnapshotJson).toBeDefined()
+    expect(JSON.parse(grantSnapshotJson as string)).toMatchObject({
+      approval: {
+        approvedBy: FAKE_SESSION.userId,
+        source: 'task-approval',
+      },
+      mcpGrantPhases: {
+        approved: {
+          phase: 'approved',
+          runtimeIssued: false,
+          runtimeEnforcement: 'not_implemented',
+          packages: [{
+            workPackageId: 'pkg-1',
+            assignedRole: 'backend',
+            proposedGrants: [{
+              decisionId: 'grant-1',
+              mcpId: 'github',
+              status: 'proposed',
+            }],
+            proposedRequirements: [{ mcpId: 'github', capability: 'issues.read' }],
+            promptOverlayPresent: true,
+          }],
+        },
+        effective: {
+          phase: 'effective',
+          runtimeIssued: false,
+          runtimeEnforcement: 'not_implemented',
+          status: 'not_issued',
+        },
+      },
+    })
     expect(mockRedisLpush).toHaveBeenCalledWith(
       'forge:approvals',
       JSON.stringify({ taskId: 'task-approval', action: 'approve' }),
@@ -2327,7 +2788,7 @@ describe('POST /api/tasks/:id/retry-handoff', () => {
 
   it('returns 409 when the task is not approved', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
-    mockDbSelect.mockReturnValueOnce(chain([{ status: 'running' }]))
+    mockDbSelect.mockReturnValueOnce(chain([{ status: 'awaiting_approval' }]))
 
     const { POST } = await import('@/app/api/tasks/[id]/retry-handoff/route')
     const res = await POST(authRequest('/api/tasks/task-1/retry-handoff', { method: 'POST' }) as never, {
@@ -2336,6 +2797,25 @@ describe('POST /api/tasks/:id/retry-handoff', () => {
 
     expect(res.status).toBe(409)
     expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('re-enqueues approval continuation for a running task', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValueOnce(chain([{ status: 'running' }]))
+    mockRedisSet.mockResolvedValue('OK')
+    mockRedisLpush.mockResolvedValue(1)
+
+    const { POST } = await import('@/app/api/tasks/[id]/retry-handoff/route')
+    const res = await POST(authRequest('/api/tasks/task-1/retry-handoff', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: 'task-1' }),
+    })
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ result: { status: 'retry_enqueued' } })
+    expect(mockRedisLpush).toHaveBeenCalledWith(
+      'forge:approvals',
+      JSON.stringify({ taskId: 'task-1', action: 'approve' }),
+    )
   })
 
   it('re-enqueues approval handoff for an approved task even when no package is blocked', async () => {
@@ -2436,10 +2916,51 @@ describe('POST /api/tasks/:id/approval-gates/:gateId', () => {
       decision: 'completed',
       gateId: 'gate-1',
       reason: 'QA passed.',
+      securityReview: undefined,
       sourceArtifactId: '11111111-1111-1111-1111-111111111111',
       taskId: 'task-1',
       userId: FAKE_SESSION.userId,
     })
+    expect(mockRedisLpush).toHaveBeenCalledWith(
+      'forge:approvals',
+      JSON.stringify({ taskId: 'task-1', action: 'approve' }),
+    )
+    expect(mockProgressWorkforce).not.toHaveBeenCalled()
+  })
+
+  it('keeps the committed gate decision when worker continuation enqueue fails', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDecideReviewGate.mockResolvedValue({
+      status: 'decided',
+      gateId: 'gate-1',
+      gateType: 'qa_review',
+      decision: 'completed',
+      packageStatus: 'completed',
+      taskCompleted: false,
+      cancelledGateIds: [],
+    })
+    mockRedisLpush.mockRejectedValueOnce(new Error('redis unavailable'))
+
+    const { POST } = await import('@/app/api/tasks/[id]/approval-gates/[gateId]/route')
+    const res = await POST(authRequest('/api/tasks/task-1/approval-gates/gate-1', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        decision: 'completed',
+        reason: 'QA passed.',
+        sourceArtifactId: '11111111-1111-1111-1111-111111111111',
+      }),
+    }) as never, {
+      params: Promise.resolve({ id: 'task-1', gateId: 'gate-1' }),
+    })
+
+    expect(res.status).toBe(202)
+    await expect(res.json()).resolves.toMatchObject({
+      error: expect.stringMatching(/continuation/i),
+      result: { status: 'decided', gateId: 'gate-1' },
+    })
+    expect(mockDecideReviewGate).toHaveBeenCalled()
+    expect(mockProgressWorkforce).not.toHaveBeenCalled()
   })
 
   it('maps review gate ordering blocks to 409', async () => {
@@ -2465,6 +2986,73 @@ describe('POST /api/tasks/:id/approval-gates/:gateId', () => {
     expect(res.status).toBe(409)
     const body = await res.json()
     expect(body.error).toMatch(/QA review/)
+  })
+
+  it('maps invalid security review payloads to 400', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDecideReviewGate.mockResolvedValue({
+      status: 'invalid_security_review_payload',
+      message: 'Security review completion requires SecurityFindingV1 findings or an explicit structured no-findings payload.',
+    })
+
+    const { POST } = await import('@/app/api/tasks/[id]/approval-gates/[gateId]/route')
+    const res = await POST(authRequest('/api/tasks/task-1/approval-gates/gate-security', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        decision: 'completed',
+        reason: 'Security review passed.',
+        sourceArtifactId: '11111111-1111-1111-1111-111111111111',
+      }),
+    }) as never, {
+      params: Promise.resolve({ id: 'task-1', gateId: 'gate-security' }),
+    })
+
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error).toMatch(/SecurityFindingV1/)
+  })
+
+  it('forwards structured security review payloads to the review gate helper', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDecideReviewGate.mockResolvedValue({
+      status: 'decided',
+      gateId: 'gate-security',
+      gateType: 'security_review',
+      decision: 'completed',
+      packageStatus: 'completed',
+      taskCompleted: true,
+      cancelledGateIds: [],
+    })
+    const securityReview = {
+      schemaVersion: 1,
+      findings: [],
+      noFindings: {
+        reviewSurface: 'Sandbox execution',
+        evidenceRefs: ['artifact-1'],
+        verificationState: 'Reviewed sandbox metadata; no host repository writes found.',
+      },
+    }
+
+    const { POST } = await import('@/app/api/tasks/[id]/approval-gates/[gateId]/route')
+    const res = await POST(authRequest('/api/tasks/task-1/approval-gates/gate-security', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        decision: 'completed',
+        reason: 'Security review passed.',
+        securityReview,
+        sourceArtifactId: '11111111-1111-1111-1111-111111111111',
+      }),
+    }) as never, {
+      params: Promise.resolve({ id: 'task-1', gateId: 'gate-security' }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(mockDecideReviewGate).toHaveBeenCalledWith(expect.objectContaining({
+      gateId: 'gate-security',
+      securityReview,
+    }))
   })
 
   it('requires a decision reason', async () => {
@@ -4529,5 +5117,78 @@ describe('GET /api/tasks — includes project name', () => {
       projectName: 'Forge Web',
     })
     expect(body.total).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Suite 3.9 — Sidebar task summary
+// ---------------------------------------------------------------------------
+
+describe('GET /api/tasks/summary', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  it('returns 401 when not authenticated', async () => {
+    mockGetSession.mockResolvedValue(null)
+
+    const { GET } = await import('@/app/api/tasks/summary/route')
+    const res = await GET(nextAuthRequest('/api/tasks/summary') as never)
+
+    expect(res.status).toBe(401)
+    expect(mockDbSelect).not.toHaveBeenCalled()
+  })
+
+  it('aggregates task statuses and returns the latest attention tasks', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect
+      .mockReturnValueOnce(chain([
+        { status: 'pending', total: 2 },
+        { status: 'running', total: 1 },
+        { status: 'approved', total: 1 },
+        { status: 'awaiting_approval', total: 3 },
+        { status: 'awaiting_answers', total: 1 },
+        { status: 'failed', total: 1 },
+        { status: 'completed', total: 10 },
+        { status: 'cancelled', total: 4 },
+      ]))
+      .mockReturnValueOnce(chain([
+        { id: 'task-newest', title: 'Needs approval', status: 'awaiting_approval' },
+        { id: 'task-failed', title: 'Investigate failure', status: 'failed' },
+      ]))
+
+    const { GET } = await import('@/app/api/tasks/summary/route')
+    const res = await GET(nextAuthRequest('/api/tasks/summary') as never)
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual({
+      active: 4,
+      attention: 5,
+      byStatus: {
+        pending: 2,
+        running: 1,
+        approved: 1,
+        awaiting_approval: 3,
+        awaiting_answers: 1,
+        failed: 1,
+        completed: 10,
+        cancelled: 4,
+      },
+      attentionTasks: [
+        { id: 'task-newest', title: 'Needs approval', status: 'awaiting_approval' },
+        { id: 'task-failed', title: 'Investigate failure', status: 'failed' },
+      ],
+    })
+    expect(mockDbSelect).toHaveBeenCalledTimes(2)
+  })
+
+  it('returns 500 when the summary query fails', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValueOnce(rejectingChain(new Error('database unavailable')))
+
+    const { GET } = await import('@/app/api/tasks/summary/route')
+    const res = await GET(nextAuthRequest('/api/tasks/summary') as never)
+
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Internal server error' })
   })
 })

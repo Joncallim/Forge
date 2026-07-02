@@ -9,11 +9,15 @@ human stays in control of the important decisions.
 
 Today, Forge is an Orchestrator-stage beta. In the default path, Forge plans
 work and waits for your approval. Workforce materialization and handoff records
-are enabled unless explicitly disabled, so approved plans can flow into durable
-work-package and gate state. Actual generated package execution is still
-opt-in, writes only inside a per-task sandbox, and does not yet apply those
-edits to your host repository, make commits, open pull requests, merge code, or
-run specialists in parallel.
+are enabled unless explicitly disabled, so Architect completion can create
+durable work packages and review gates before the task reaches
+`awaiting_approval`; approval releases ready packages for handoff. Actual
+generated package execution is still opt-in, receives bounded read-only project
+context, writes only inside
+per-package attempt sandboxes under `.forge/task-runs`, and stays behind manual
+QA, Reviewer, and Security gates. It does not yet apply those edits to your host
+repository, make commits, open pull requests, merge code, or run specialists in
+parallel.
 
 ## What Forge Does Today
 
@@ -23,6 +27,8 @@ run specialists in parallel.
 4. A background worker asks the Architect agent to write a plan.
 5. Forge saves the plan and shows it in the dashboard.
 6. You approve, reject, or revise the plan.
+7. If Workforce records exist, approval releases ready work packages for
+   handoff, broker checks, optional sandbox execution, and manual review gates.
 
 Under the hood, Forge runs a web app, PostgreSQL, Redis, and a worker process.
 For normal local use, the worker starts inside the web app, so one command starts
@@ -43,6 +49,7 @@ Browser -> Forge dashboard -> Redis queue -> Forge worker -> AI model -> review 
 | Artifact | A saved output, usually the Architect plan Markdown. |
 | Approval | The human checkpoint before Forge marks the current stage complete. |
 | Workforce | The future/sandboxed specialist-agent system: Backend, Frontend, QA, Reviewer, DevOps, and custom agents. |
+| Forge Workspace | The planned dockable workspace that links browser, repo, notes, docs, Playwright, Notion, GitHub, logs, and AI task context. |
 | ACP provider | A local command-line coding agent connected through the Agent Client Protocol. See [ACP and Zed connector](docs/acp-zed-connector.md). |
 
 ## Fast Setup
@@ -101,6 +108,11 @@ Use `http://localhost:3000` for local passkeys unless you also update
 5. Wait for the task to reach `Awaiting Approval`.
 6. Read the Architect plan and approve or reject it.
 
+On the task detail page, you can also stop a non-terminal task, delete a
+terminal individual task and its run history, retry the task with the same or
+another provider, retry a blocked handoff after fixing the cause, and inspect
+Agent history with queue attempts collapsed under it.
+
 For a no-cost plumbing test, run with the mock Architect:
 
 ```bash
@@ -114,14 +126,36 @@ FORGE_WORKER_MOCK_ARCHITECT=1 npm run dev
 - MCP runtime grants for specialists.
 - Branch, commit, pull request, and merge automation.
 - Parallel specialist execution.
-- Production-ready QA/Reviewer gates for generated code.
+- Autonomous reviewer agents for generated code. The current beta uses manual
+  QA, Reviewer, and Security approval gates.
+- Forge Workspace panes for built-in Chromium, Playwright, notepad, Markdown,
+  coding, terminal/logs, Notion, and GitHub.
+- Notion/GitHub link graph sync and write-back approvals.
 
 The first Workforce build slice is present as durable planning records:
 work packages, harness metadata, approval gates, and VCS summaries can now be
-stored and displayed. Workforce materialization and handoff are default-on and
-can be disabled with `FORGE_WORKFORCE_MATERIALIZATION=0` or
+stored and displayed. Architect completion materializes those records before
+plan approval; approval releases ready packages. Workforce materialization and
+handoff are default-on and can be disabled with `FORGE_WORKFORCE_MATERIALIZATION=0` or
 `FORGE_WORK_PACKAGE_HANDOFF=0`. Sandbox package execution remains opt-in with
 `FORGE_WORK_PACKAGE_EXECUTION=1`.
+
+## Forge Workspace Direction
+
+After sequential sandboxed Workforce execution is reliable, the next major
+product direction is **Forge Workspace**: a dockable, AI-assisted workbench that
+brings browser, repo, notes, docs, Playwright, GitHub, Notion, terminals, logs,
+and task artifacts into one saved context.
+
+The product should feel OS-like without becoming a full operating system. The
+first implementation should be a workspace shell with dockable panes, a command
+palette, a right-side context inspector, and explicit permission gates for agent
+operations. The Notion/GitHub integration should use a link graph rather than a
+naive bidirectional mirror: Notion remains the planning and intent surface, while
+repositories remain the implementation source of truth.
+
+See [Forge Workspace roadmap](docs/workspace-roadmap.md) for the proposed
+implementation plan.
 
 ## Screenshots
 
@@ -149,5 +183,6 @@ can be disabled with `FORGE_WORKFORCE_MATERIALIZATION=0` or
 - [Developer guide](docs/developer-guide.md) - web app, worker, database, tests, prompts, and coding standards.
 - [Design guide](docs/design.md) - product model, UI principles, screenshot evidence, and visual QA notes.
 - [ACP and Zed connector](docs/acp-zed-connector.md) - how Forge talks to local ACP agents such as Codex CLI and Claude Code.
-- [Roadmap](docs/roadmap.md) - current beta status, Workforce architecture, and upcoming slices.
+- [Roadmap](docs/roadmap.md) - current beta status, Workforce architecture, Forge Workspace direction, and upcoming slices.
+- [Forge Workspace roadmap](docs/workspace-roadmap.md) - proposed implementation plan for dockable panes, browsers, Notion/GitHub linking, and permissioned agent operations.
 - [Architecture decisions](docs/adr/) - durable ADRs for major technical decisions.

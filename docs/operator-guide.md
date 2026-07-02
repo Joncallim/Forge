@@ -18,10 +18,13 @@ split deployments, the worker can still run separately.
 The most important beta boundary: Forge may write plans, approval records,
 work-package records, and handoff/review-gate state, but not repository
 commits. Workforce materialization and handoff are enabled unless explicitly
-disabled. Generated package execution is the opt-in piece and writes only into a
-per-task sandbox. Host-repository edits, branches, commits, pull requests,
-merges, live specialist MCP grants, and parallel specialists are still future
-work.
+disabled. Generated package execution is the opt-in piece. When enabled, Forge
+may give a specialist bounded read-only host-repository context, but generated
+files are written only into a package sandbox at
+`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`.
+Host-repository edits, branches, commits, pull requests, merges, live specialist
+MCP grants, autonomous reviewer agents, and parallel specialists are still
+future work.
 
 ## Install
 
@@ -36,7 +39,7 @@ manager: `apt`, `dnf`, `yum`, `zypper`, or `pacman`.
 
 The installer can prepare:
 
-- Node.js.
+- Node.js 22 or newer.
 - PostgreSQL 16 or newer.
 - Redis 7 or newer.
 - GitHub CLI.
@@ -141,15 +144,20 @@ ACP providers connect Forge to local coding CLIs through the Agent Client
 Protocol. In plain terms, Forge starts a small adapter process, sends it a
 prompt, and reads the agent's streamed text response.
 
-For the currently wired Zed adapters:
+For the currently wired ACP adapters:
 
-- Forge starts the adapter with `npx`.
+- Forge starts a pinned local adapter dependency with `npx --no-install`.
+- The adapter subprocess receives a deny-by-default environment allowlist; Forge
+  provider keys, GitHub tokens, database URLs, Redis URLs, and encryption
+  secrets are not forwarded.
 - The adapter wraps the local `codex` or `claude` CLI.
 - The local CLI must already be installed and logged in.
-- The Forge project must have a local folder, because the ACP session starts
-  inside that folder.
-- Installing the Zed editor is not required; Forge uses Zed's adapter package,
-  not the editor itself.
+- The Forge project must have a local folder so Forge can validate and bound
+  repository context. Architect planning uses an isolated runtime directory;
+  executable work-package ACP sessions are blocked until Forge has a hard
+  filesystem and tool sandbox for local coding CLIs.
+- Installing the Zed editor is not required; Forge uses Agent Client Protocol
+  adapter packages, not the editor itself.
 
 See [ACP and the Zed connector](acp-zed-connector.md) for the full simple
 explanation and troubleshooting checklist.
@@ -194,6 +202,79 @@ npm run test:providers
 npm run test:providers -- --provider "Provider Name"
 ```
 
+## Executable Workforce Beta
+
+Workforce materialization and handoff can create work-package and approval-gate
+state without running package models. To opt into generated package execution,
+set this in the worker environment. If `FORGE_EMBED_WORKER` is enabled, that is
+the web process because it hosts the worker loop; in split deployments, do not
+set it on the web-only process.
+
+```bash
+FORGE_WORK_PACKAGE_EXECUTION=1
+```
+
+With execution enabled:
+
+1. The operator approves the Architect plan.
+2. Forge releases ready work packages and runs the MCP/capability broker.
+3. Required blocked MCP/tool grants stop the package before execution. Optional
+   grants can continue only when the approved fallback is non-blocking.
+4. Forge executes one eligible specialist package at a time.
+5. The specialist receives bounded read-only project context and run-scoped
+   instructions. This is not a live MCP grant or an unbounded filesystem view.
+6. Generated output is written under the project folder at
+   `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`.
+7. QA, Reviewer, and Security gates appear when required. In this beta, those
+   are manual operator decisions, not proof that separate reviewer agents ran.
+
+Operators can review:
+
+- package status, assigned role, dependencies, acceptance criteria, and blocked
+  reasons;
+- proposed MCP/tool grants, broker decisions, operator-approved grant snapshots,
+  and effective run-scoped instructions;
+- prompt overlays and MCP-aware subtasks;
+- sandbox file lists and static validation results;
+- repository evidence and command audits;
+- QA, Reviewer, and Security gates tied to the source run and source artifact;
+- rework reasons, stale-gate replacement, and attempt history;
+- structured security findings for high-risk packages.
+
+Operators can intervene from the task detail page:
+
+- Stop cancels a non-terminal task, marks active package/run state cancelled,
+  and leaves package metadata available for diagnosis. Stopping is safe at any
+  stage, including while the Architect is still planning: the worker will not
+  publish plan results, materialize work packages, or complete its run for a
+  task that was cancelled during the run.
+- Delete removes one terminal task and its run history without deleting the
+  project. Stop active tasks first.
+- Retry task requeues the task from the beginning and can use the original or a
+  different provider.
+- Retry handoff retries a retryable blocked package after the operator fixes
+  the broker, repository, or execution blocker.
+- Agent history is the primary activity timeline; queue attempts are collapsed
+  under it for lower-level retry evidence.
+
+High-risk packages should not be accepted with only a checkbox. Security review
+findings should name the review surface, asset, trust boundary, exploit path,
+impact, required fix, evidence refs, severity, confidence, and verification
+state.
+
+What this beta does not do:
+
+- no live MCP grants, credentials, or runtime tool handles for specialists;
+- no writes to the host repository outside `.forge/task-runs`;
+- no applying sandbox output back into the project tree;
+- no branch creation, commits, check polling, pull requests, merges, issue
+  closure, or release automation;
+- no parallel specialists;
+- no user-edited grant scopes;
+- no autonomous QA, Reviewer, or Security agent-run gates;
+- no harness-enforced execution policy for tools, reference paths, output
+  schemas, or validation checks.
+
 ## Deployment Checklist
 
 Set these for both the web process and worker:
@@ -225,7 +306,8 @@ Worker and workspace options:
 | `FORGE_PROMPT_UPGRADE_MODE` | `keep` or `overwrite` local workspace prompts during install/upgrade |
 | `FORGE_WORKFORCE_MATERIALIZATION` | Set `0` or `false` to disable default Workforce record materialization |
 | `FORGE_WORK_PACKAGE_HANDOFF` | Set `0` or `false` to disable default work-package handoff claims |
-| `FORGE_WORK_PACKAGE_EXECUTION` | Set `1` or `true` to enable opt-in sandbox package execution |
+| `FORGE_WORK_PACKAGE_EXECUTION` | Set `1` or `true` to enable opt-in package execution under `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/` |
+| `FORGE_RUNNING_WORK_PACKAGE_STALE_SECONDS` | Defaults to `900`; retry handoff treats older running package rows as interrupted and recovers them before continuing |
 | `FORGE_WORKSPACE_ROOT` | Fixed workspace root override |
 | `FORGE_MCPS_ROOT` | Fixed shared MCP root override |
 | `FORGE_WORKER_MAX_ATTEMPTS` | Retry ceiling per task or approval job |
@@ -240,7 +322,8 @@ npm run db:migrate
 npm run db:seed-agents
 npm run doctor
 npm run lint
-npx tsc --noEmit
+git diff --check
+npx tsc --noEmit --pretty false
 npm test
 npm run build
 ```

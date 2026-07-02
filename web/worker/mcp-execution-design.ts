@@ -204,6 +204,13 @@ function fallbackAction(raw: unknown): McpFallbackAction {
   return FALLBACK_ACTIONS.has(action) ? action as McpFallbackAction : 'ask_user'
 }
 
+function canProceedWithoutMcp(requirement: McpExecutionRequirement | {
+  requirement: McpRequirementLevel
+  fallback: { action: McpFallbackAction }
+}): boolean {
+  return requirement.requirement === 'optional' && requirement.fallback.action === 'continue_without_mcp'
+}
+
 function normalizeRequirement(raw: unknown): McpExecutionRequirement | null {
   if (typeof raw !== 'object' || raw === null) return null
   const value = raw as Record<string, unknown>
@@ -336,14 +343,14 @@ export function validateMcpExecutionDesign(
       const status = healthFor(mcpOverview, requirement.mcpId)
       if (!status) {
         const message = statusMessage(requirement.mcpId, null)
-        if (requirement.requirement === 'required') blocked.push(message)
+        if (!canProceedWithoutMcp(requirement)) blocked.push(message)
         else warnings.push(message)
         continue
       }
 
       if (!healthyStatus(status)) {
         const message = statusMessage(requirement.mcpId, status)
-        if (requirement.requirement === 'required') blocked.push(message)
+        if (!canProceedWithoutMcp(requirement)) blocked.push(message)
         else warnings.push(message)
       }
     }
@@ -553,11 +560,7 @@ export function evaluateWorkPackageMcpBroker(input: {
       const status = healthFor(input.mcpOverview, mcpId)
       if (!healthyStatus(status)) {
         const message = statusMessage(mcpId, status)
-        if (requirement === 'required' || fallback === 'block') {
-          shouldBlock(message)
-        } else {
-          warnings.push(message)
-        }
+        shouldBlock(message)
       }
     }
 
@@ -630,7 +633,7 @@ function decisionStatus(
   if (hasUnsafeCapability) return 'blocked'
   const healthy = status?.installState === 'installed' && status.enabled && status.status === 'healthy'
   if (healthy) return 'proposed'
-  if (requirement.requirement === 'optional' && requirement.fallback.action !== 'block') return 'warning'
+  if (canProceedWithoutMcp(requirement)) return 'warning'
   return 'blocked'
 }
 

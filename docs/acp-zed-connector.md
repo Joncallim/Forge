@@ -2,21 +2,21 @@
 
 This page explains Forge's Agent Client Protocol support in plain English.
 
-## Plain-English Summary
+## Introduction
 
 ACP is a small protocol for talking to coding agents over standard input and
 standard output. Think of it as a shared plug shape. Forge can send a prompt to
 a local coding agent without needing to know that agent's private internals.
 
 Forge does not bundle Zed, and it does not become Zed. For the currently wired
-ACP providers, Forge starts a small adapter package published by Zed Industries.
+ACP providers, Forge starts a pinned Agent Client Protocol adapter dependency.
 That adapter translates between Forge's ACP messages and the real local command
 line tool, such as Codex CLI or Claude Code.
 
 ```text
 Forge task
   -> Forge provider adapter
-  -> npx @zed-industries/codex-acp or @zed-industries/claude-agent-acp
+  -> npx --no-install codex-acp or claude-agent-acp
   -> local codex or claude command
   -> model account already logged in on this machine
   -> streamed text back to Forge
@@ -28,20 +28,21 @@ ACP providers are local providers. They depend on tools installed on the host:
 
 | Need | Why |
 |---|---|
-| Node.js and `npx` | Forge uses `npx` to start the Zed ACP adapter package on demand. |
+| Node.js 22 or newer and `npx` | Forge uses `npx --no-install` to start pinned ACP adapter dependencies. |
 | The underlying CLI | `codex` for Codex CLI or `claude` for Claude Code. |
 | CLI login/auth | The local CLI must already be authenticated. Forge does not collect those account credentials. |
-| A project local folder | ACP sessions start inside the project's local checkout. |
+| A project local folder | Forge uses the folder to validate and bound repository context. Architect ACP calls still run in an isolated runtime directory. |
 
 There is no separate "install Zed editor" requirement for Forge's current ACP
-path. The Zed piece is the adapter package, not the desktop editor.
+path. The connector piece is the pinned ACP adapter package, not the desktop
+editor.
 
 ## What Happens During A Health Check
 
 When Forge checks an ACP provider, it:
 
 1. Looks up the selected ACP agent, such as `codex-cli` or `claude-agent`.
-2. Starts the matching adapter command with `npx`.
+2. Starts the matching adapter command with `npx --no-install`.
 3. Sends an ACP `initialize` JSON-RPC request.
 4. Waits up to a short timeout for the adapter to answer.
 5. Shows a clear status: ready, not configured, unreachable, handshake failed,
@@ -54,19 +55,26 @@ run a full task.
 
 When a task uses an ACP provider, Forge:
 
-1. Starts a fresh adapter process for that provider call.
+1. Starts a fresh adapter process for that provider call, using a
+   deny-by-default environment allowlist that does not forward Forge provider
+   keys, GitHub tokens, database URLs, Redis URLs, or encryption secrets.
 2. Sends `initialize`.
-3. Opens a new ACP session with the project folder as `cwd`.
+3. Opens a new ACP session in an isolated Architect runtime directory.
 4. If the runtime supports model selection, sends the selected model as a
    session config option.
 5. Flattens Forge's system prompt and user prompt into one text prompt.
 6. Sends `session/prompt`.
 7. Collects streamed `agent_message_chunk` text from the adapter.
-8. Saves the resulting text as the Forge artifact or package output.
+8. Saves the resulting text as the Forge artifact.
 9. Closes the adapter process.
 
 Forge uses one adapter process per call. It does not keep a long-lived pool of
 ACP agents.
+
+Executable Workforce packages cannot currently use ACP providers. Forge blocks
+ACP-backed package execution until local coding CLIs can be run behind a hard
+filesystem and tool sandbox; select a non-ACP provider for executable Workforce
+packages in the meantime.
 
 ## Current Limits
 
@@ -74,8 +82,8 @@ ACP agents.
 - Forge does not receive detailed token usage from ACP.
 - Tool calls from the underlying coding agent are not exposed as Forge runtime
   MCP grants.
-- ACP package execution remains subject to Forge's current Workforce feature
-  flags and sandbox-only execution path.
+- ACP package execution is blocked until Forge has a hard filesystem and tool
+  sandbox for local coding CLIs.
 - If a runtime does not expose model selection through ACP, Forge stores the
   selected model on the provider record but cannot force the local runtime to
   use it.
@@ -84,7 +92,7 @@ ACP agents.
 
 If an ACP provider is not ready:
 
-- Confirm `node` and `npx` are on `PATH`.
+- Confirm Node.js 22 or newer and `npx` are on `PATH`.
 - Confirm the underlying CLI starts from the terminal.
 - Log in with the CLI's own auth command.
 - Confirm the Forge project has a local folder.

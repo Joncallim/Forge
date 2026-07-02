@@ -1,4 +1,6 @@
-import { spawn } from 'node:child_process'
+import { spawn, type SpawnOptionsWithoutStdio } from 'node:child_process'
+import path from 'node:path'
+import { redactAdapterMessage } from './redaction'
 
 // ---------------------------------------------------------------------------
 // ACP JSON-RPC transport
@@ -8,10 +10,68 @@ import { spawn } from 'node:child_process'
 // (client.ts) so the wire protocol is implemented exactly once.
 // ---------------------------------------------------------------------------
 
-export type AcpSpawn = (command: string, args: string[]) => ReturnType<typeof spawn>
+export type AcpSpawn = (
+  command: string,
+  args: string[],
+  options?: SpawnOptionsWithoutStdio,
+) => ReturnType<typeof spawn>
 
-export const defaultAcpSpawn: AcpSpawn = (command, args) =>
-  spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] })
+const ACP_ADAPTER_ENV_ALLOWLIST = new Set([
+  'APPDATA',
+  'CI',
+  'CODEX_HOME',
+  'ComSpec',
+  'HOME',
+  'LANG',
+  'LC_ALL',
+  'LOCALAPPDATA',
+  'LOGNAME',
+  'NO_COLOR',
+  'PATH',
+  'PATHEXT',
+  'ProgramFiles',
+  'SHELL',
+  'SystemRoot',
+  'TEMP',
+  'TERM',
+  'TMP',
+  'TMPDIR',
+  'USER',
+  'WINDIR',
+  'XDG_CACHE_HOME',
+  'XDG_CONFIG_HOME',
+  'XDG_DATA_HOME',
+])
+const MAX_RECENT_STDERR_CHARS = 4000
+
+export function buildAcpAdapterEnv(
+  env: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+  const adapterEnv: Record<string, string> = {}
+  for (const key of ACP_ADAPTER_ENV_ALLOWLIST) {
+    const value = env[key]
+    if (value !== undefined) adapterEnv[key] = value
+  }
+  return adapterEnv
+}
+
+export function buildAcpSpawnOptions(input: { cwd?: string | null } = {}): SpawnOptionsWithoutStdio {
+  const packageRoot = process.cwd()
+  const spawnCwd = input.cwd?.trim() || packageRoot
+  const localBin = path.join(/*turbopackIgnore: true*/ packageRoot, 'node_modules', '.bin')
+  const env = buildAcpAdapterEnv()
+  env.PATH = env.PATH ? `${localBin}${path.delimiter}${env.PATH}` : localBin
+  return {
+    cwd: spawnCwd,
+    env: env as NodeJS.ProcessEnv,
+    shell: false,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  }
+}
+
+export const defaultAcpSpawn: AcpSpawn = (command, args, options = buildAcpSpawnOptions()) =>
+  spawn(command, args, options)
 
 type PendingRequest = {
   resolve: (result: unknown) => void
@@ -27,11 +87,15 @@ export class AcpTransport {
   private readonly notificationHandlers = new Map<string, (params: unknown) => void>()
   private closed = false
 
-  constructor(command: string[], spawnFn: AcpSpawn = defaultAcpSpawn) {
-    this.child = spawnFn(command[0], command.slice(1))
+  constructor(
+    command: string[],
+    spawnFn: AcpSpawn = defaultAcpSpawn,
+    spawnOptions: SpawnOptionsWithoutStdio = buildAcpSpawnOptions(),
+  ) {
+    this.child = spawnFn(command[0], command.slice(1), spawnOptions)
 
     this.child.stderr?.on('data', (chunk: Buffer) => {
-      this.stderrBuffer += chunk.toString('utf8').slice(0, 2000)
+      this.stderrBuffer = (this.stderrBuffer + chunk.toString('utf8')).slice(-MAX_RECENT_STDERR_CHARS)
     })
 
     this.child.on('error', (err) => {
@@ -42,7 +106,7 @@ export class AcpTransport {
       this.rejectAllPending(
         new Error(
           `ACP adapter exited unexpectedly (code ${code}).${
-            this.stderrBuffer.trim() ? ` ${this.stderrBuffer.trim().slice(0, 300)}` : ''
+            this.stderrBuffer.trim() ? ` ${redactAdapterMessage(this.stderrBuffer.trim())}` : ''
           }`,
         ),
       )
@@ -56,9 +120,9 @@ export class AcpTransport {
     })
   }
 
-  /** Last 300 chars of stderr captured so far, for error messages. */
+  /** Bounded recent stderr captured so far, for error messages. */
   get recentStderr(): string {
-    return this.stderrBuffer.trim().slice(0, 300)
+    return redactAdapterMessage(this.stderrBuffer.trim())
   }
 
   private handleLine(line: string): void {
@@ -137,6 +201,10 @@ export class AcpTransport {
 
   close(): void {
     if (this.closed) return
+    // Reject any in-flight requests before flipping `closed`, otherwise the
+    // exit-driven rejectAllPending short-circuits on `this.closed` and the
+    // pending promises hang until their individual timeouts fire.
+    this.rejectAllPending(new Error('ACP transport was closed before the request completed.'))
     this.closed = true
     try {
       this.child.kill()

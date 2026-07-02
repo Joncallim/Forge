@@ -1,11 +1,15 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback } from 'react'
+import { TASK_STATUS_REFRESH_EVENT } from '@/lib/task-events'
 
 export interface AgentRun {
   id: string
   taskId: string
+  workPackageId?: string | null
   agentType: string
+  stage?: string | null
+  attemptNumber?: number | null
   modelIdUsed: string
   status: string
   inputTokens: number | null
@@ -49,6 +53,100 @@ interface UseTaskStreamResult {
 }
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'rejected'])
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined
+}
+
+function nullableStringValue(value: unknown): string | null | undefined {
+  if (value === null) return null
+  return stringValue(value)
+}
+
+function nullableNumberValue(value: unknown): number | null | undefined {
+  if (value === null) return null
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value !== 'string' || value.trim() === '') return undefined
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+function runIdFromStreamEventData(data: Record<string, unknown>): string {
+  return stringValue(data.runId) ?? stringValue(data.id) ?? ''
+}
+
+function runLifecycleMetadataFromStreamEventData(data: unknown): Pick<AgentRun, 'attemptNumber' | 'stage' | 'workPackageId'> {
+  if (!isRecord(data)) return {}
+  return {
+    attemptNumber: nullableNumberValue(data.attemptNumber),
+    stage: nullableStringValue(data.stage),
+    workPackageId: nullableStringValue(data.workPackageId),
+  }
+}
+
+export function agentRunFromStartedStreamEventData(
+  data: unknown,
+  taskId: string,
+  fallbackStartedAt: string,
+): AgentRun | null {
+  if (!isRecord(data)) return null
+  const runId = runIdFromStreamEventData(data)
+  if (runId === '') return null
+  return {
+    id: runId,
+    taskId,
+    ...runLifecycleMetadataFromStreamEventData(data),
+    agentType: stringValue(data.agentType) ?? '',
+    modelIdUsed: stringValue(data.modelIdUsed) ?? '',
+    status: stringValue(data.status) ?? 'running',
+    inputTokens: null,
+    outputTokens: null,
+    costUsd: null,
+    startedAt: stringValue(data.startedAt) ?? fallbackStartedAt,
+    completedAt: null,
+    errorMessage: null,
+    logOutput: '',
+  }
+}
+
+const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled'])
+
+export function mergeAgentRun(existing: AgentRun, incoming: AgentRun): AgentRun {
+  return {
+    ...existing,
+    ...incoming,
+    // Run lifecycle only moves forward. A replayed run:started (expected on SSE
+    // reconnect) must not revert an already terminal run back to 'running' or
+    // blank out its agentType/modelIdUsed.
+    status: TERMINAL_RUN_STATUSES.has(existing.status) ? existing.status : incoming.status,
+    agentType: incoming.agentType || existing.agentType,
+    modelIdUsed: incoming.modelIdUsed || existing.modelIdUsed,
+    workPackageId: incoming.workPackageId ?? existing.workPackageId ?? null,
+    stage: incoming.stage ?? existing.stage ?? null,
+    attemptNumber: incoming.attemptNumber ?? existing.attemptNumber ?? null,
+    inputTokens: incoming.inputTokens ?? existing.inputTokens,
+    outputTokens: incoming.outputTokens ?? existing.outputTokens,
+    costUsd: incoming.costUsd ?? existing.costUsd,
+    startedAt: incoming.startedAt ?? existing.startedAt,
+    completedAt: incoming.completedAt ?? existing.completedAt,
+    errorMessage: incoming.errorMessage ?? existing.errorMessage,
+    logOutput: incoming.logOutput && incoming.logOutput !== ''
+      ? incoming.logOutput
+      : existing.logOutput ?? incoming.logOutput,
+  }
+}
+
+export function mergeStreamAgentRun(runs: AgentRun[], incoming: AgentRun): AgentRun[] {
+  const index = runs.findIndex((run) => run.id === incoming.id)
+  if (index === -1) return [...runs, incoming]
+  const next = [...runs]
+  next[index] = mergeAgentRun(next[index], incoming)
+  return next
+}
 
 export function artifactFromStreamEventData(data: unknown): Artifact {
   const value = data as Record<string, unknown>
@@ -124,6 +222,11 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
     setRefreshRevision((revision) => revision + 1)
   }, [])
 
+  const requestGlobalTaskStatusRefresh = useCallback(() => {
+    if (typeof window === 'undefined') return
+    window.dispatchEvent(new Event(TASK_STATUS_REFRESH_EVENT))
+  }, [])
+
   useEffect(() => {
     if (!taskId) return
 
@@ -136,25 +239,10 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
     es.addEventListener('run:started', (e) => {
       try {
         const data = JSON.parse((e as MessageEvent).data)
-        const run: AgentRun = {
-          id: data.runId ?? data.id,
-          taskId,
-          agentType: data.agentType ?? '',
-          modelIdUsed: data.modelIdUsed ?? '',
-          status: 'running',
-          inputTokens: null,
-          outputTokens: null,
-          costUsd: null,
-          startedAt: data.startedAt ?? new Date().toISOString(),
-          completedAt: null,
-          errorMessage: null,
-          logOutput: '',
-        }
-        setRuns((prev) => {
-          // Avoid duplicates if event replays
-          if (prev.some((r) => r.id === run.id)) return prev
-          return [...prev, run]
-        })
+        const run = agentRunFromStartedStreamEventData(data, taskId, new Date().toISOString())
+        if (!run) return
+        setRuns((prev) => mergeStreamAgentRun(prev, run))
+        requestGlobalTaskStatusRefresh()
       } catch {
         // Ignore malformed event
       }
@@ -181,11 +269,15 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
         flushChunks()
         const data = JSON.parse((e as MessageEvent).data)
         const runId: string = data.runId ?? data.id
+        const lifecycleMetadata = runLifecycleMetadataFromStreamEventData(data)
         setRuns((prev) =>
           prev.map((r) =>
             r.id === runId
               ? {
                   ...r,
+                  workPackageId: lifecycleMetadata.workPackageId ?? r.workPackageId ?? null,
+                  stage: lifecycleMetadata.stage ?? r.stage ?? null,
+                  attemptNumber: lifecycleMetadata.attemptNumber ?? r.attemptNumber ?? null,
                   status: 'completed',
                   inputTokens: data.inputTokens ?? r.inputTokens,
                   outputTokens: data.outputTokens ?? r.outputTokens,
@@ -205,11 +297,15 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
         flushChunks()
         const data = JSON.parse((e as MessageEvent).data)
         const runId: string = data.runId ?? data.id
+        const lifecycleMetadata = runLifecycleMetadataFromStreamEventData(data)
         setRuns((prev) =>
           prev.map((r) =>
             r.id === runId
               ? {
                   ...r,
+                  workPackageId: lifecycleMetadata.workPackageId ?? r.workPackageId ?? null,
+                  stage: lifecycleMetadata.stage ?? r.stage ?? null,
+                  attemptNumber: lifecycleMetadata.attemptNumber ?? r.attemptNumber ?? null,
                   status: 'failed',
                   completedAt: data.completedAt ?? new Date().toISOString(),
                   errorMessage: data.errorMessage ?? data.error ?? null,
@@ -276,6 +372,7 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
         const data = JSON.parse((e as MessageEvent).data)
         const status: string = data.status ?? data
         setTaskStatus(status)
+        requestGlobalTaskStatusRefresh()
         if (TERMINAL_STATUSES.has(status)) {
           // Flush any remaining chunks before closing
           flushChunks()
@@ -311,7 +408,7 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
       es.close()
       esRef.current = null
     }
-  }, [taskId, flushChunks, requestDetailRefresh])
+  }, [taskId, flushChunks, requestDetailRefresh, requestGlobalTaskStatusRefresh])
 
   return { runs, artifacts, taskStatus, error, questions, refreshRevision }
 }

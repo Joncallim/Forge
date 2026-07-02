@@ -15,6 +15,11 @@ export type SeededSession = {
   sessionId: string
 }
 
+export type SeededTask = {
+  projectId: string
+  taskId: string
+}
+
 export function getBaseUrl(): string {
   return process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
 }
@@ -163,6 +168,39 @@ export async function seedSession(displayName = 'E2E Operator'): Promise<SeededS
   }
 
   return { userId, sessionId }
+}
+
+export async function seedProjectTask(input: {
+  prompt?: string
+  status: string
+  title: string
+  userId: string
+}): Promise<SeededTask> {
+  const sql = sqlClient()
+  const projectId = crypto.randomUUID()
+  const taskId = crypto.randomUUID()
+
+  try {
+    await sql`
+      insert into projects (id, name, github_repo, default_branch)
+      values (${projectId}, ${`${input.title} Project`}, ${'owner/forge-controls'}, ${'main'})
+    `
+    await sql`
+      insert into tasks (id, project_id, submitted_by, title, prompt, status)
+      values (
+        ${taskId},
+        ${projectId},
+        ${input.userId},
+        ${input.title},
+        ${input.prompt ?? 'Seeded task detail controls prompt.'},
+        ${input.status}
+      )
+    `
+  } finally {
+    await sql.end()
+  }
+
+  return { projectId, taskId }
 }
 
 export async function installSessionCookie(

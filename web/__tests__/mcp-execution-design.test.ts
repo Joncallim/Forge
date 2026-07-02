@@ -300,6 +300,26 @@ describe('deriveMcpGrantDecisions', () => {
     })
   })
 
+  it('blocks optional unavailable MCP access with ask_user fallback', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"optional","assignment":{"type":"agent","targetAgents":["reviewer"]},"agentPermissions":{"reviewer":["github.pull_requests.read"]},"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const validation = validateMcpExecutionDesign(design, overview([]))
+    const decisions = deriveMcpGrantDecisions(design, overview([]))
+
+    expect(validation.status).toBe('blocked')
+    expect(validation.blocked).toEqual(["MCP 'github' is not configured for this project."])
+    expect(decisions.summary).toEqual({ proposed: 0, warning: 0, blocked: 1 })
+    expect(decisions.decisions[0]).toMatchObject({
+      agent: 'reviewer',
+      status: 'blocked',
+      fallback: { action: 'ask_user' },
+    })
+  })
+
   it('blocks unknown MCPs even when they are optional with a non-blocking fallback', () => {
     const { design } = parseMcpExecutionDesign([
       '```mcp_execution_design_json',
@@ -361,6 +381,24 @@ describe('deriveMcpGrantDecisions', () => {
 
     expect(result.status).toBe('blocked')
     expect(result.blocked.join('\n')).toMatch(/require at least one explicit/)
+  })
+
+  it('blocks work-package optional unavailable MCP access unless fallback is non-blocking', () => {
+    const result = evaluateWorkPackageMcpBroker({
+      assignedRole: 'reviewer',
+      mcpOverview: overview([]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'optional',
+        permissions: ['github.pull_requests.read'],
+        fallback: { action: 'ask_user' },
+      }],
+      metadata: {},
+      title: 'Reviewer package',
+    })
+
+    expect(result.status).toBe('blocked')
+    expect(result.blockedReason).toMatch(/not configured/i)
   })
 
   it('blocks optional unknown MCP ids even when fallback says continue without MCP', () => {

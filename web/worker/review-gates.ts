@@ -1,16 +1,46 @@
-import { and, asc, desc, eq, inArray } from 'drizzle-orm'
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm'
 import { db } from '../db'
 import { agentRuns, approvalGates, artifacts, workPackages } from '../db/schema'
-import { publishTaskEvent } from './events'
+import { publishTaskEvent, type TaskEventPayload } from './events'
+import { sanitizeWorkerMessage } from './redaction'
 import { updateTaskStatusIfCurrent } from './task-state'
 
 export const REVIEW_GATE_TYPES = ['qa_review', 'reviewer_review', 'security_review'] as const
 export type ReviewGateType = typeof REVIEW_GATE_TYPES[number]
 export type ReviewGateDecision = 'completed' | 'needs_rework'
 export type ReviewRequirement = 'none' | 'qa_only' | 'reviewer_only' | 'both'
+export type ReviewGateRequiredRole = 'qa' | 'reviewer' | 'security'
+
+export type SecurityFindingV1 = {
+  reviewSurface: string
+  asset: string
+  trustBoundary: string
+  exploitPath: string
+  impact: string
+  requiredFix: string
+  evidenceRefs: string[]
+  severity: string
+  confidence: string
+  verificationState: string
+}
+
+export type SecurityReviewNoFindingsV1 = {
+  reviewSurface: string
+  evidenceRefs: string[]
+  verificationState: string
+}
+
+export type SecurityReviewPayloadV1 = {
+  schemaVersion: 1
+  findings: SecurityFindingV1[]
+  noFindings?: SecurityReviewNoFindingsV1
+  summary?: string
+  verdict?: 'findings' | 'no_findings'
+}
 
 const REVIEW_GATE_TYPE_VALUES = [...REVIEW_GATE_TYPES]
 const STANDARD_REVIEW_GATE_TYPES: ReviewGateType[] = ['qa_review', 'reviewer_review']
+const MAX_SECURITY_FINDINGS = 50
 const REVIEW_EXEMPT_ROLES = new Set([
   'architect',
   'handoff',
@@ -48,6 +78,12 @@ const HIGH_RISK_TEXT_PATTERN = new RegExp(
     'child_process|subprocess|\\bspawn\\b|execve|\\bexec\\b',
     'shell\\b|terminal\\b',
     'command[-\\s]?(?:execution|injection)',
+    'prompt[-\\s]?injection|instruction[-\\s]?injection|jailbreak',
+    '(?:repository|repo)[-\\s]?(?:write|writes|mutation|mutations|permission|permissions)',
+    '(?:tool|mcp)[-\\s]?(?:grant|grants|permission|permissions|access|scope|scopes|capabilit)',
+    'grant[-\\s]?(?:tool|mcp|permission|access)',
+    'data[-\\s]?(?:privacy|access|exfiltration|exfiltrate)|\\bprivacy\\b',
+    '\\bpii\\b|personally\\s+identifiable|personal\\s+data|sensitive\\s+data',
     'pull[-\\s]?request',
     'force[-\\s]?push|git\\s+(?:push|commit|merge|clone|checkout|reset)',
     'merge[-\\s]?conflict',
@@ -57,6 +93,26 @@ const HIGH_RISK_TEXT_PATTERN = new RegExp(
   'i',
 )
 const SECURITY_REVIEW_CAPABILITY_PATTERN = /\bsecurity[-_\s]?review\b/i
+
+class ReviewGateMaterializationOwnershipLost extends Error {
+  constructor() {
+    super('Review gate materialization ownership was lost.')
+    this.name = 'ReviewGateMaterializationOwnershipLost'
+  }
+}
+
+async function publishTaskEventBestEffort(
+  taskId: string,
+  type: string,
+  payload: TaskEventPayload = {},
+): Promise<void> {
+  try {
+    await publishTaskEvent(taskId, type, payload)
+  } catch (err) {
+    const message = sanitizeWorkerMessage(err instanceof Error ? err.message : String(err))
+    console.warn('[review-gates] Failed to publish task event after DB commit', { taskId, type, message })
+  }
+}
 
 function isReviewRequirement(value: string): value is ReviewRequirement {
   return value === 'none' || value === 'qa_only' || value === 'reviewer_only' || value === 'both'
@@ -88,8 +144,17 @@ type ReviewGatePackage = {
 type MaterializedGate = {
   id: string
   gateType: ReviewGateType
-  requiredRole: 'qa' | 'reviewer'
+  requiredRole: ReviewGateRequiredRole
   title: string
+}
+
+type MaterializedSourceArtifact = typeof artifacts.$inferSelect
+
+type SourceRunCompletion = {
+  artifactType: string
+  completedAt: Date
+  content: string
+  metadata: Record<string, unknown> | null
 }
 
 export type ReviewGateMaterializationResult =
@@ -97,11 +162,19 @@ export type ReviewGateMaterializationResult =
       status: 'not_found'
       packageStatus: null
       createdGates: []
+      sourceArtifact?: null
+    }
+  | {
+      status: 'not_owned'
+      packageStatus: null
+      createdGates: []
+      sourceArtifact?: null
     }
   | {
       status: 'materialized' | 'already_materialized' | 'not_required'
       packageStatus: 'awaiting_review' | 'completed'
       createdGates: MaterializedGate[]
+      sourceArtifact?: MaterializedSourceArtifact | null
     }
 
 export type ReviewGateDecisionResult =
@@ -118,6 +191,10 @@ export type ReviewGateDecisionResult =
       status: 'not_found' | 'not_review_gate' | 'already_decided' | 'missing_work_package' | 'reviewer_blocked' | 'source_artifact_mismatch'
       message: string
     }
+  | {
+      status: 'invalid_security_review_payload'
+      message: string
+    }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -131,6 +208,121 @@ function recordArray(value: unknown): Record<string, unknown>[] {
   return Array.isArray(value)
     ? value.filter((item): item is Record<string, unknown> => isRecord(item))
     : []
+}
+
+function cleanSecurityText(value: unknown, maxLength = 1000): string {
+  return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ').slice(0, maxLength) : ''
+}
+
+function cleanEvidenceRefs(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  const refs: string[] = []
+  for (const item of value) {
+    const ref = cleanSecurityText(item, 500)
+    if (ref === '') continue
+    refs.push(ref)
+    if (refs.length >= 20) break
+  }
+  return refs
+}
+
+function normalizeSecurityFinding(value: unknown): SecurityFindingV1 | null {
+  if (!isRecord(value)) return null
+  const finding: SecurityFindingV1 = {
+    reviewSurface: cleanSecurityText(value.reviewSurface),
+    asset: cleanSecurityText(value.asset),
+    trustBoundary: cleanSecurityText(value.trustBoundary),
+    exploitPath: cleanSecurityText(value.exploitPath),
+    impact: cleanSecurityText(value.impact),
+    requiredFix: cleanSecurityText(value.requiredFix),
+    evidenceRefs: cleanEvidenceRefs(value.evidenceRefs),
+    severity: cleanSecurityText(value.severity, 80).toLowerCase(),
+    confidence: cleanSecurityText(value.confidence, 80).toLowerCase(),
+    verificationState: cleanSecurityText(value.verificationState),
+  }
+  const requiredText = [
+    finding.reviewSurface,
+    finding.asset,
+    finding.trustBoundary,
+    finding.exploitPath,
+    finding.impact,
+    finding.requiredFix,
+    finding.severity,
+    finding.confidence,
+    finding.verificationState,
+  ]
+  if (requiredText.some((field) => field === '') || finding.evidenceRefs.length === 0) return null
+  return finding
+}
+
+function isSecurityReviewVerdict(value: unknown): value is 'findings' | 'no_findings' {
+  return value === 'findings' || value === 'no_findings'
+}
+
+function normalizeNoFindings(value: unknown): SecurityReviewNoFindingsV1 | null {
+  if (!isRecord(value)) return null
+  const noFindings: SecurityReviewNoFindingsV1 = {
+    reviewSurface: cleanSecurityText(value.reviewSurface),
+    evidenceRefs: cleanEvidenceRefs(value.evidenceRefs),
+    verificationState: cleanSecurityText(value.verificationState),
+  }
+  if (noFindings.reviewSurface === '' || noFindings.evidenceRefs.length === 0 || noFindings.verificationState === '') {
+    return null
+  }
+  return noFindings
+}
+
+export function normalizeSecurityReviewPayload(value: unknown): SecurityReviewPayloadV1 | null {
+  if (!isRecord(value) || value.schemaVersion !== 1) return null
+  if (Array.isArray(value.findings) && value.findings.length > MAX_SECURITY_FINDINGS) return null
+  const rawFindings = Array.isArray(value.findings) ? value.findings : []
+  const findings: SecurityFindingV1[] = []
+  for (const rawFinding of rawFindings) {
+    const finding = normalizeSecurityFinding(rawFinding)
+    if (!finding) return null
+    findings.push(finding)
+  }
+  const noFindings = normalizeNoFindings(value.noFindings)
+  if (findings.length > 0 && noFindings) return null
+  if (findings.length === 0 && !noFindings) return null
+  const verdict = findings.length > 0 ? 'findings' : 'no_findings'
+  if (isSecurityReviewVerdict(value.verdict) && value.verdict !== verdict) return null
+  return {
+    schemaVersion: 1,
+    findings,
+    ...(noFindings ? { noFindings } : {}),
+    summary: verdict === 'findings'
+      ? `${findings.length} structured security finding${findings.length === 1 ? '' : 's'} recorded.`
+      : noFindings?.verificationState,
+    verdict,
+  }
+}
+
+function securityReviewIncludesSourceArtifact(
+  payload: SecurityReviewPayloadV1,
+  sourceArtifactId: string,
+): boolean {
+  const evidenceGroups = payload.findings.length > 0
+    ? payload.findings.map((finding) => finding.evidenceRefs)
+    : payload.noFindings ? [payload.noFindings.evidenceRefs] : []
+  return evidenceGroups.length > 0 &&
+    evidenceGroups.every((refs) => refs.includes(sourceArtifactId))
+}
+
+function stampSecurityReviewPayload(input: {
+  payload: SecurityReviewPayloadV1
+  sourceAgentRunId: string
+  sourceArtifactId: string
+  workPackageId: string
+}): Record<string, unknown> {
+  return {
+    ...input.payload,
+    reviewedSource: {
+      agentRunId: input.sourceAgentRunId,
+      artifactId: input.sourceArtifactId,
+      workPackageId: input.workPackageId,
+    },
+  }
 }
 
 // Caps so a pathologically deep/large JSONB metadata value can't blow the stack
@@ -168,8 +360,10 @@ export function isReviewGateType(value: string | null | undefined): value is Rev
   return value === 'qa_review' || value === 'reviewer_review' || value === 'security_review'
 }
 
-export function requiredRoleForGate(gateType: ReviewGateType): 'qa' | 'reviewer' {
-  return gateType === 'qa_review' ? 'qa' : 'reviewer'
+export function requiredRoleForGate(gateType: ReviewGateType): ReviewGateRequiredRole {
+  if (gateType === 'qa_review') return 'qa'
+  if (gateType === 'security_review') return 'security'
+  return 'reviewer'
 }
 
 export function isImplementationPackageRole(role: string): boolean {
@@ -245,7 +439,7 @@ function reviewGateInstructions(gateType: ReviewGateType, pkg: ReviewGatePackage
     return `QA must verify the output for "${pkg.title}" before reviewer approval.`
   }
   if (gateType === 'security_review') {
-    return `Reviewer must perform a security review for high-risk implementation output from "${pkg.title}".`
+    return `Security review must inspect high-risk implementation output from "${pkg.title}" and record structured findings or explicit no-findings evidence.`
   }
   return `Reviewer must approve the output for "${pkg.title}" after QA completion.`
 }
@@ -288,6 +482,8 @@ async function loadPackage(taskId: string, workPackageId: string): Promise<Revie
 }
 
 export async function materializeReviewGatesForWorkPackageCompletion(input: {
+  completeSourceRun?: SourceRunCompletion
+  requireExecutionLease?: boolean
   sourceAgentRunId: string
   sourceArtifactId: string | null
   taskId: string
@@ -303,18 +499,60 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
   const reviewRequired = requiredGateTypes.length > 0
   const packageStatus = reviewRequired ? 'awaiting_review' : 'completed'
 
-  const createdGates = await db.transaction(async (tx) => {
-    await tx
+  let materialized: { createdGates: MaterializedGate[]; sourceArtifact: MaterializedSourceArtifact | null }
+  try {
+    materialized = await db.transaction(async (tx) => {
+    const ownershipGuard = input.requireExecutionLease
+      ? [
+          eq(workPackages.status, 'running'),
+          sql`${workPackages.metadata}->'executionLease'->>'runId' = ${input.sourceAgentRunId}`,
+        ]
+      : []
+    const [updatedPackage] = await tx
       .update(workPackages)
       .set({
         blockedReason: null,
+        metadata: sql`${workPackages.metadata} - 'executionLease'`,
         status: packageStatus,
         updatedAt: now,
       })
-      .where(eq(workPackages.id, pkg.id))
+      .where(and(eq(workPackages.id, pkg.id), ...ownershipGuard))
+      .returning({ id: workPackages.id })
+
+    if (!updatedPackage) {
+      throw new ReviewGateMaterializationOwnershipLost()
+    }
+
+    let sourceArtifactId = input.sourceArtifactId
+    let sourceArtifact: MaterializedSourceArtifact | null = null
+    if (input.completeSourceRun) {
+      const [completedRun] = await tx
+        .update(agentRuns)
+        .set({
+          completedAt: input.completeSourceRun.completedAt,
+          status: 'completed',
+        })
+        .where(and(eq(agentRuns.id, input.sourceAgentRunId), eq(agentRuns.status, 'running')))
+        .returning({ id: agentRuns.id })
+
+      if (!completedRun) throw new ReviewGateMaterializationOwnershipLost()
+
+      const [artifact] = await tx
+        .insert(artifacts)
+        .values({
+          agentRunId: input.sourceAgentRunId,
+          artifactType: input.completeSourceRun.artifactType,
+          content: input.completeSourceRun.content,
+          metadata: input.completeSourceRun.metadata,
+        })
+        .returning()
+      if (!artifact) throw new ReviewGateMaterializationOwnershipLost()
+      sourceArtifact = artifact ?? null
+      sourceArtifactId = sourceArtifact?.id ?? null
+    }
 
     if (!reviewRequired) {
-      return [] as MaterializedGate[]
+      return { createdGates: [] as MaterializedGate[], sourceArtifact }
     }
 
     const existingGates = await tx
@@ -341,7 +579,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
     const stalePendingGateTypes = existingGates
       .filter((gate) =>
         gate.status === 'pending' &&
-        (gate.sourceArtifactId !== input.sourceArtifactId || gate.sourceAgentRunId !== input.sourceAgentRunId)
+        (gate.sourceArtifactId !== sourceArtifactId || gate.sourceAgentRunId !== input.sourceAgentRunId)
       )
       .map((gate) => gate.gateType)
 
@@ -370,7 +608,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
       existingGates
         .filter((gate) =>
           (gate.status === 'pending' || gate.status === 'completed') &&
-          gate.sourceArtifactId === input.sourceArtifactId &&
+          gate.sourceArtifactId === sourceArtifactId &&
           gate.sourceAgentRunId === input.sourceAgentRunId,
         )
         .map((gate) => gate.gateType),
@@ -387,7 +625,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
           gateType,
           status: 'pending',
           sourceAgentRunId: input.sourceAgentRunId,
-          sourceArtifactId: input.sourceArtifactId,
+          sourceArtifactId,
           title: reviewGateTitle(gateType, pkg),
           instructions: reviewGateInstructions(gateType, pkg),
           metadata: reviewGateMetadata(gateType, pkg, input.sourceAgentRunId),
@@ -408,17 +646,22 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
       }
     }
 
-    return inserted
+    return { createdGates: inserted, sourceArtifact }
   })
+  } catch (err) {
+    if (!(err instanceof ReviewGateMaterializationOwnershipLost)) throw err
+    return { status: 'not_owned', packageStatus: null, createdGates: [] }
+  }
+  const { createdGates, sourceArtifact } = materialized
 
-  await publishTaskEvent(input.taskId, 'work_package:status', {
+  await publishTaskEventBestEffort(input.taskId, 'work_package:status', {
     status: packageStatus,
     updatedAt: now.toISOString(),
     workPackageId: pkg.id,
   })
 
   for (const gate of createdGates) {
-    await publishTaskEvent(input.taskId, 'approval_gate:created', {
+    await publishTaskEventBestEffort(input.taskId, 'approval_gate:created', {
       gateId: gate.id,
       gateType: gate.gateType,
       requiredRole: gate.requiredRole,
@@ -435,6 +678,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
       : 'not_required',
     packageStatus,
     createdGates,
+    sourceArtifact,
   }
 }
 
@@ -499,6 +743,7 @@ export async function decideReviewGate(input: {
   decision: ReviewGateDecision
   gateId: string
   reason: string
+  securityReview?: unknown
   sourceArtifactId: string
   taskId: string
   userId: string
@@ -539,8 +784,55 @@ export async function decideReviewGate(input: {
       message: 'Review gate source run is missing. Reload the task before deciding this review.',
     }
   }
+  const securityReviewPayload = gate.gateType === 'security_review'
+    ? normalizeSecurityReviewPayload(input.securityReview)
+    : null
+  if (gate.gateType === 'security_review' && !securityReviewPayload) {
+    return {
+      status: 'invalid_security_review_payload',
+      message: 'Security review decisions require SecurityFindingV1 findings or an explicit structured no-findings payload.',
+    }
+  }
+  if (
+    gate.gateType === 'security_review' &&
+    securityReviewPayload &&
+    !securityReviewIncludesSourceArtifact(securityReviewPayload, gate.sourceArtifactId)
+  ) {
+    return {
+      status: 'invalid_security_review_payload',
+      message: 'Security review evidenceRefs must include the reviewed source artifact.',
+    }
+  }
+  if (
+    gate.gateType === 'security_review' &&
+    input.decision === 'completed' &&
+    securityReviewPayload?.verdict === 'findings'
+  ) {
+    return {
+      status: 'invalid_security_review_payload',
+      message: 'Security review findings require requesting changes; approvals must submit an explicit no-findings payload.',
+    }
+  }
+  if (
+    gate.gateType === 'security_review' &&
+    input.decision === 'needs_rework' &&
+    securityReviewPayload?.verdict !== 'findings'
+  ) {
+    return {
+      status: 'invalid_security_review_payload',
+      message: 'Security review rework requires at least one structured SecurityFindingV1 finding.',
+    }
+  }
   const workPackageId = gate.workPackageId
   const sourceAgentRunId = gate.sourceAgentRunId
+  const stampedSecurityReviewPayload = securityReviewPayload
+    ? stampSecurityReviewPayload({
+      payload: securityReviewPayload,
+      sourceAgentRunId,
+      sourceArtifactId: gate.sourceArtifactId,
+      workPackageId,
+    })
+    : null
 
   const [workPackage] = await db
     .select({
@@ -636,6 +928,7 @@ export async function decideReviewGate(input: {
       decisionReason: reason,
       decidedAt: now.toISOString(),
       decidedBy: input.userId,
+      ...(stampedSecurityReviewPayload ? { securityReview: stampedSecurityReviewPayload } : {}),
       source: 'review-gates',
     }
 
@@ -756,7 +1049,7 @@ export async function decideReviewGate(input: {
     }
   }
 
-  await publishTaskEvent(input.taskId, 'approval_gate:decided', {
+  await publishTaskEventBestEffort(input.taskId, 'approval_gate:decided', {
     decision: input.decision,
     gateId: gate.id,
     gateType: gate.gateType,
@@ -768,7 +1061,7 @@ export async function decideReviewGate(input: {
   })
 
   for (const cancelledGateId of decided.cancelledGateIds) {
-    await publishTaskEvent(input.taskId, 'approval_gate:decided', {
+    await publishTaskEventBestEffort(input.taskId, 'approval_gate:decided', {
       gateId: cancelledGateId,
       reason: 'Package sent back for rework.',
       status: 'cancelled',
@@ -778,7 +1071,7 @@ export async function decideReviewGate(input: {
   }
 
   if (decided.packageStatus) {
-    await publishTaskEvent(input.taskId, 'work_package:status', {
+    await publishTaskEventBestEffort(input.taskId, 'work_package:status', {
       blockedReason: input.decision === 'needs_rework' ? reason : null,
       status: decided.packageStatus,
       updatedAt: now.toISOString(),

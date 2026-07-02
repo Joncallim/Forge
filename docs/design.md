@@ -23,6 +23,11 @@ Primary workflow:
 Brief -> Plan -> Architecture -> Work Package -> Agent Run -> Review -> Ship
 ```
 
+In the current executable beta, the workflow stops at reviewed sandbox output.
+The `Ship` step is a future/gated target that may later commit, open a PR,
+merge, deploy, or export after separate repository-write and PR-automation
+work lands.
+
 Core objects:
 
 | Object | Meaning |
@@ -34,7 +39,7 @@ Core objects:
 | Work package | A scoped unit that can be assigned to an agent or harness |
 | Agent run | One execution attempt by a worker |
 | Review | The human decision point with evidence |
-| Ship | Commit, PR, merge, deploy, or export |
+| Ship | Future/gated step for commit, PR, merge, deploy, or export |
 
 ## UI Direction
 
@@ -65,8 +70,8 @@ Avoid:
 
 | Screen | Purpose |
 |---|---|
-| Command Center | Show active projects, running agents, queue status, blocked tasks, review items, recent shipped work, and provider health |
-| Project Workspace | Show repository, objective, docs, tasks, agent runs, decisions, risks, and recent PRs |
+| Command Center | Show active projects, running agents, queue status, blocked tasks, review items, future shipped-work status, and provider health |
+| Project Workspace | Show repository, objective, docs, tasks, agent runs, decisions, risks, and future/gated PR status |
 | Task Workspace | Show brief, requirements, plan, files touched, diffs, tests, logs, reviewer notes, and approval actions |
 | Agent Workspace | Show identity, model/provider, state, workspace/branch, token/cost/time, logs, output, retry/fork/stop controls |
 | Skill And Persona Library | Show available skills, personas, commands, source, project fit, and update status |
@@ -86,7 +91,8 @@ operator or developer docs.
 
 ## Screenshot Evidence
 
-Last refreshed: 2026-06-24.
+Last refreshed: 2026-06-25 for the checked-in screenshot evidence. Issue #119
+adds task-page workforce states after this refresh.
 
 The checked-in screenshots under `docs/assets/gui/` are documentation evidence.
 The release gate remains the automated Playwright smoke test, which starts the

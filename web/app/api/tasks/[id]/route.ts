@@ -13,12 +13,15 @@ import {
   vcsChanges,
   workPackages,
 } from '@/db/schema'
-import { and, eq, asc, inArray, or } from 'drizzle-orm'
+import { and, eq, asc, inArray, or, sql } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
+import { publishTaskEvent } from '@/worker/events'
 
 // ---------------------------------------------------------------------------
 // GET /api/tasks/:id
 // ---------------------------------------------------------------------------
+
+const TERMINAL_TASK_STATUSES = ['completed', 'failed', 'cancelled', 'rejected'] as const
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -201,6 +204,7 @@ export async function DELETE(
     }
 
     const { id } = await params
+    const mode = new URL(request.url).searchParams.get('mode') === 'delete' ? 'delete' : 'cancel'
 
     const [existing] = await db
       .select()
@@ -212,28 +216,118 @@ export async function DELETE(
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })
     }
 
-    if (existing.status !== 'pending' && existing.status !== 'failed') {
+    if (mode === 'delete') {
+      if (!TERMINAL_TASK_STATUSES.includes(existing.status as typeof TERMINAL_TASK_STATUSES[number])) {
+        return NextResponse.json(
+          { error: `Cannot delete active task with status '${existing.status}'. Stop it first, then delete it after cancellation completes.` },
+          { status: 409 },
+        )
+      }
+
+      const [deleted] = await db
+        .delete(tasks)
+        .where(and(eq(tasks.id, id), inArray(tasks.status, [...TERMINAL_TASK_STATUSES])))
+        .returning({ id: tasks.id })
+
+      if (!deleted) {
+        return NextResponse.json(
+          { error: 'Cannot delete task because it is no longer terminal. Stop it first, then delete it after cancellation completes.' },
+          { status: 409 },
+        )
+      }
+
+      await publishTaskEvent(id, 'task:deleted', {
+        taskId: id,
+        deletedAt: new Date().toISOString(),
+      }).catch(() => undefined)
+
+      console.info('[DELETE /api/tasks/:id] Deleted task', { id })
+      return NextResponse.json({ ok: true, mode: 'delete' })
+    }
+
+    if (TERMINAL_TASK_STATUSES.includes(existing.status as typeof TERMINAL_TASK_STATUSES[number])) {
       return NextResponse.json(
-        { error: `Cannot cancel task with status '${existing.status}'. Only 'pending' or 'failed' tasks can be cancelled.` },
+        { error: `Cannot stop task with status '${existing.status}'. Delete it instead if it is no longer needed.` },
         { status: 409 },
       )
     }
 
-    const [cancelled] = await db
-      .update(tasks)
-      .set({ status: 'cancelled', updatedAt: new Date() })
-      .where(and(eq(tasks.id, id), or(eq(tasks.status, 'pending'), eq(tasks.status, 'failed'))!))
-      .returning({ id: tasks.id })
+    const now = new Date()
+    const cancelled = await db.transaction(async (tx) => {
+      const [task] = await tx
+        .update(tasks)
+        .set({
+          completedAt: now,
+          errorMessage: 'Task stopped by operator.',
+          status: 'cancelled',
+          updatedAt: now,
+        })
+        .where(and(
+          eq(tasks.id, id),
+          or(
+            eq(tasks.status, 'pending'),
+            eq(tasks.status, 'running'),
+            eq(tasks.status, 'awaiting_answers'),
+            eq(tasks.status, 'awaiting_approval'),
+            eq(tasks.status, 'approved'),
+            eq(tasks.status, 'failed'),
+          )!,
+        ))
+        .returning({ id: tasks.id })
+
+      if (!task) return null
+
+      await tx
+        .update(workPackages)
+        .set({
+          blockedReason: 'Task stopped by operator.',
+          status: 'cancelled',
+          updatedAt: now,
+        })
+        .where(and(
+          eq(workPackages.taskId, id),
+          inArray(workPackages.status, ['pending', 'ready', 'running', 'awaiting_review', 'needs_rework', 'blocked']),
+        ))
+
+      await tx
+        .update(approvalGates)
+        .set({
+          metadata: sql`coalesce(${approvalGates.metadata}, '{}'::jsonb) || ${JSON.stringify({
+            cancelledReason: 'Task stopped by operator.',
+            source: 'task-delete-route',
+          })}::jsonb`,
+          status: 'cancelled',
+          updatedAt: now,
+        })
+        .where(and(eq(approvalGates.taskId, id), eq(approvalGates.status, 'pending')))
+
+      await tx
+        .update(agentRuns)
+        .set({
+          completedAt: now,
+          errorMessage: 'Task stopped by operator.',
+          status: 'cancelled',
+        })
+        .where(and(eq(agentRuns.taskId, id), eq(agentRuns.status, 'running')))
+
+      return task
+    })
 
     if (!cancelled) {
       return NextResponse.json(
-        { error: `Cannot cancel task with status '${existing.status}'. Only 'pending' or 'failed' tasks can be cancelled.` },
+        { error: `Cannot stop task with status '${existing.status}'.` },
         { status: 409 },
       )
     }
 
+    await publishTaskEvent(id, 'task:status', {
+      errorMessage: 'Task stopped by operator.',
+      status: 'cancelled',
+      updatedAt: now.toISOString(),
+    }).catch(() => undefined)
+
     console.info('[DELETE /api/tasks/:id] Cancelled task', { id })
-    return NextResponse.json({ ok: true })
+    return NextResponse.json({ ok: true, mode: 'cancel' })
   } catch (err) {
     console.error('[DELETE /api/tasks/:id] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

@@ -1,7 +1,8 @@
 import { db } from '../db'
 import { tasks } from '../db/schema'
-import { and, eq } from 'drizzle-orm'
+import { and, eq, notInArray } from 'drizzle-orm'
 import { publishTaskEvent } from './events'
+import { sanitizeWorkerMessage } from './redaction'
 
 export type TaskStatus =
   | 'pending'
@@ -14,30 +15,37 @@ export type TaskStatus =
   | 'failed'
   | 'cancelled'
 
-const TERMINAL_STATUSES = new Set<TaskStatus>(['completed', 'failed', 'cancelled', 'rejected'])
+const TERMINAL_STATUS_LIST: TaskStatus[] = ['completed', 'failed', 'cancelled', 'rejected']
+const TERMINAL_STATUSES = new Set<TaskStatus>(TERMINAL_STATUS_LIST)
 
 export async function updateTaskStatus(
   taskId: string,
   status: TaskStatus,
   errorMessage: string | null = null,
-): Promise<void> {
+): Promise<boolean> {
   const now = new Date()
+  const sanitizedErrorMessage = errorMessage === null ? null : sanitizeWorkerMessage(errorMessage)
 
-  await db
+  const [updated] = await db
     .update(tasks)
     .set({
       status,
-      errorMessage,
+      errorMessage: sanitizedErrorMessage,
       updatedAt: now,
       completedAt: TERMINAL_STATUSES.has(status) ? now : null,
     })
-    .where(eq(tasks.id, taskId))
+    .where(and(eq(tasks.id, taskId), notInArray(tasks.status, TERMINAL_STATUS_LIST)))
+    .returning({ id: tasks.id })
+
+  if (!updated) return false
 
   await publishTaskEvent(taskId, 'task:status', {
     status,
-    errorMessage,
+    errorMessage: sanitizedErrorMessage,
     updatedAt: now.toISOString(),
   })
+
+  return true
 }
 
 export async function updateTaskStatusIfCurrent(
@@ -47,12 +55,13 @@ export async function updateTaskStatusIfCurrent(
   errorMessage: string | null = null,
 ): Promise<boolean> {
   const now = new Date()
+  const sanitizedErrorMessage = errorMessage === null ? null : sanitizeWorkerMessage(errorMessage)
 
   const [updated] = await db
     .update(tasks)
     .set({
       status: nextStatus,
-      errorMessage,
+      errorMessage: sanitizedErrorMessage,
       updatedAt: now,
       completedAt: TERMINAL_STATUSES.has(nextStatus) ? now : null,
     })
@@ -63,7 +72,7 @@ export async function updateTaskStatusIfCurrent(
 
   await publishTaskEvent(taskId, 'task:status', {
     status: nextStatus,
-    errorMessage,
+    errorMessage: sanitizedErrorMessage,
     updatedAt: now.toISOString(),
   })
 

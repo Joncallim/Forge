@@ -73,9 +73,18 @@ the source of truth for development and split-process workflows. See
 4. The worker claims the job and marks the task `running`.
 5. The worker calls the configured Architect provider.
 6. The worker stores the generated plan as an artifact.
-7. The task becomes `awaiting_approval`.
-8. The user approves or rejects the plan.
-9. Approved Orchestrator-stage tasks become `completed`.
+7. With Workforce materialization enabled, Forge materializes durable work
+   packages, capability-broker decisions, and the plan approval checkpoint.
+8. The task becomes `awaiting_approval`.
+9. The user approves or rejects the plan.
+10. Approval releases ready work packages for handoff.
+11. With package execution disabled, Forge records no-op handoff artifacts for
+    manual specialist work. With `FORGE_WORK_PACKAGE_EXECUTION=1`, Forge runs
+    one eligible package at a time in a per-package attempt sandbox.
+12. Implementation package output remains pending until manual QA and Reviewer
+    gates pass. High-risk packages also require a manual Security gate.
+13. Only tasks without materialized Workforce packages follow the older
+    Orchestrator-only path directly to `completed` after approval.
 
 ## Database Migrations
 
@@ -111,9 +120,12 @@ docker compose --profile worker up worker
 
 By default, the worker runs the Architect planning stage and waits for explicit
 plan approval. Workforce materialization and handoff are default-on unless set
-to `0` or `false`, so approved tasks can be materialized into work packages and
-handoff/review-gate state. Generated package execution is opt-in with
-`FORGE_WORK_PACKAGE_EXECUTION=1` and sandbox-only. Host-repository edits,
+to `0` or `false`, so Architect completion can materialize work packages,
+capability-broker decisions, and review-gate state before the task reaches
+`awaiting_approval`. Approval releases ready packages for handoff. Generated
+package execution is opt-in with `FORGE_WORK_PACKAGE_EXECUTION=1` and
+sandbox-only; ACP-backed executable work packages are blocked until Forge has a
+hard filesystem and tool sandbox for local coding CLIs. Host-repository edits,
 branches, commits, pull requests, merges, live specialist MCP grants, and
 parallel specialist execution remain future work.
 

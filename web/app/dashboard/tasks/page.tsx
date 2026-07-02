@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
-import { ListTodoIcon } from 'lucide-react'
+import { ListTodoIcon, LoaderCircleIcon } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import {
   Select,
@@ -48,6 +48,19 @@ function statusLabel(status: string): string {
   }
   if (labels[status]) return labels[status]
   return status.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+}
+
+function RunningStatusBadge({ status }: { status: string }) {
+  const isRunning = status === 'running' || status === 'approved'
+
+  return (
+    <Badge variant={statusBadgeVariant(status)} className="inline-flex items-center gap-1.5">
+      {isRunning && (
+        <LoaderCircleIcon className="size-3 animate-spin" aria-hidden="true" />
+      )}
+      {statusLabel(status)}
+    </Badge>
+  )
 }
 
 function formatDate(iso: string): string {
@@ -193,9 +206,7 @@ export default function TasksPage() {
                     </span>
                   </td>
                   <td className="px-4 py-3">
-                    <Badge variant={statusBadgeVariant(task.status)}>
-                      {statusLabel(task.status)}
-                    </Badge>
+                    <RunningStatusBadge status={task.status} />
                   </td>
                   <td className="hidden px-4 py-3 text-xs text-muted-foreground md:table-cell">
                     {formatDate(task.createdAt)}

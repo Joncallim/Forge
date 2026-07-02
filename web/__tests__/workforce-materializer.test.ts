@@ -36,6 +36,7 @@ const prepared: PreparedArchitectArtifact = {
       steps: ['Write the plan'],
     },
   ],
+  agentBreakdownSource: 'fence',
   capabilityClassification: {
     proposed: {
       schemaVersion: 1,
@@ -158,6 +159,10 @@ describe('workforce materializer', () => {
       toolPolicy: {},
     })
     expect(rows.workPackages[0].metadata).toMatchObject({
+      harnessSemantics: expect.objectContaining({
+        runtimePolicyApplied: false,
+        status: 'planning_only',
+      }),
       mcpGrants: [
         expect.objectContaining({
           decisionId: 'grant-1',
@@ -165,6 +170,17 @@ describe('workforce materializer', () => {
           status: 'proposed',
         }),
       ],
+      mcpGrantPhases: expect.objectContaining({
+        approved: null,
+        broker: expect.objectContaining({
+          runtimeEnforcement: 'not_implemented',
+          validationStatus: 'valid',
+        }),
+        effective: expect.objectContaining({
+          runtimeIssued: false,
+          status: 'not_issued',
+        }),
+      }),
       source: 'architect-artifact',
       promptOverlay: 'Use GitHub read tools only.',
       mcpAwareSubtasks: [

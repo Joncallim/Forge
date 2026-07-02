@@ -20,7 +20,12 @@ vi.mock('@/lib/workspace', async () => {
   }
 })
 
-import { assertProjectLocalPathForExecution } from '@/lib/projects/local-path'
+import type { WorkspaceSettings } from '@/lib/workspace'
+import {
+  assertProjectLocalPathForExecution,
+  assertProjectLocalPathPreflightAllowed,
+  assertProjectPathNotProtected,
+} from '@/lib/projects/local-path'
 
 function chain(resolveValue: unknown) {
   const t: Record<string, unknown> = {
@@ -42,7 +47,19 @@ describe('assertProjectLocalPathForExecution', () => {
     workspaceRoot = path.join(root, 'workspace')
     projectRoot = path.join(workspaceRoot, 'projects', 'app')
     await fs.mkdir(projectRoot, { recursive: true })
-    mocks.getWorkspaceSettings.mockResolvedValue({ workspaceRoot })
+    mocks.getWorkspaceSettings.mockResolvedValue({
+      workspaceRoot,
+      configRoot: path.join(workspaceRoot, 'config'),
+      projectsRoot: path.join(workspaceRoot, 'projects'),
+      mcpsRoot: path.join(workspaceRoot, 'mcps'),
+      templatesRoot: path.join(workspaceRoot, 'templates'),
+      localMemoryRoot: path.join(workspaceRoot, 'local-memory'),
+      promptsRoot: path.join(workspaceRoot, 'prompts'),
+      workforcesRoot: path.join(workspaceRoot, 'workforces'),
+      runtimeRoot: path.join(workspaceRoot, 'runtime'),
+      logsRoot: path.join(workspaceRoot, 'logs'),
+      backupsRoot: path.join(workspaceRoot, 'backups'),
+    })
     mocks.dbSelect.mockReturnValue(chain([]))
   })
 
@@ -51,8 +68,9 @@ describe('assertProjectLocalPathForExecution', () => {
   })
 
   it('returns the real project directory when it is inside the active workspace', async () => {
+    const realProjectRoot = await fs.realpath(projectRoot)
     await expect(assertProjectLocalPathForExecution({ id: 'project-1', localPath: projectRoot }))
-      .resolves.toBe(projectRoot)
+      .resolves.toBe(realProjectRoot)
   })
 
   it('rejects symlinks that resolve outside the active workspace', async () => {
@@ -80,5 +98,52 @@ describe('assertProjectLocalPathForExecution', () => {
 
     await expect(assertProjectLocalPathForExecution({ id: 'project-1', localPath: projectRoot }))
       .rejects.toThrow(/overlaps another registered Forge project/i)
+  })
+
+  it('preflights non-existing paths that would overlap another registered project', async () => {
+    const nestedRoot = path.join(projectRoot, 'future-child')
+    mocks.dbSelect.mockReturnValue(chain([{ id: 'project-2', localPath: projectRoot }]))
+
+    await expect(assertProjectLocalPathPreflightAllowed({ localPath: nestedRoot, projectId: 'project-1' }))
+      .rejects.toThrow(/overlaps another registered Forge project/i)
+    await expect(fs.stat(nestedRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('rejects protected Forge workspace directories', async () => {
+    const configRoot = path.join(workspaceRoot, 'config')
+    await fs.mkdir(configRoot, { recursive: true })
+
+    await expect(assertProjectLocalPathForExecution({ id: 'project-1', localPath: configRoot }))
+      .rejects.toThrow(/workspace config directory/i)
+  })
+})
+
+describe('assertProjectPathNotProtected', () => {
+  const workspace = {
+    workspaceRoot: '/ws',
+    projectsRoot: '/ws/nested/projects',
+    configRoot: '/ws/config',
+    mcpsRoot: '/ws/mcps',
+    templatesRoot: '/ws/templates',
+    localMemoryRoot: '/ws/local-memory',
+    promptsRoot: '/ws/prompts',
+    workforcesRoot: '/ws/workforces',
+    runtimeRoot: '/ws/runtime',
+    logsRoot: '/ws/logs',
+    backupsRoot: '/ws/backups',
+  } as unknown as WorkspaceSettings
+
+  it('allows a normal child directory under the projects root', () => {
+    expect(() => assertProjectPathNotProtected('/ws/nested/projects/app', workspace)).not.toThrow()
+  })
+
+  it('rejects the projects root itself', () => {
+    expect(() => assertProjectPathNotProtected('/ws/nested/projects', workspace))
+      .toThrow(/projects root itself or an ancestor/i)
+  })
+
+  it('rejects an ancestor directory that encloses the projects root', () => {
+    expect(() => assertProjectPathNotProtected('/ws/nested', workspace))
+      .toThrow(/projects root itself or an ancestor/i)
   })
 })

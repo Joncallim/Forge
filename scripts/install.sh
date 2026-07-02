@@ -727,7 +727,7 @@ NODE
 ensure_node() {
   local major
   major="$(node_major)"
-  if [ "$major" -ge 20 ]; then
+  if [ "$major" -ge 22 ]; then
     info "Node $(node -v) is ready."
     return 0
   fi
@@ -736,7 +736,7 @@ ensure_node() {
     install_packages node
   elif [ "$PACKAGE_MANAGER" = "apt" ]; then
     install_packages curl ca-certificates gnupg
-    info "Installing Node.js 22 from NodeSource because Forge needs Node 20 or newer."
+    info "Installing Node.js 22 from NodeSource because Forge needs Node 22 or newer."
     if [ "$DRY_RUN" = "1" ]; then
       info "[dry-run] curl -fsSL https://deb.nodesource.com/setup_22.x | sudo bash -"
     else
@@ -755,7 +755,7 @@ ensure_node() {
   if [ "$DRY_RUN" = "1" ]; then
     return 0
   fi
-  [ "$major" -ge 20 ] || die "Node $(node -v 2>/dev/null || echo missing) is too old. Install Node 20+ and re-run."
+  [ "$major" -ge 22 ] || die "Node $(node -v 2>/dev/null || echo missing) is too old. Install Node 22+ and re-run."
   command -v npm >/dev/null 2>&1 || die "npm is missing after Node install."
   info "Node $(node -v) is ready."
 }
@@ -1500,10 +1500,10 @@ run_check_only() {
   local major
 
   major="$(node_major)"
-  if [ "$major" -ge 20 ]; then
+  if [ "$major" -ge 22 ]; then
     info "ok      Node.js version: $(node -v)"
   else
-    warn "Node.js 20 or newer is required."
+    warn "Node.js 22 or newer is required."
     failed=1
   fi
 

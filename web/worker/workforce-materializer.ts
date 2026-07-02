@@ -6,6 +6,7 @@ import {
   agentConfigs,
   agentHarnesses,
   approvalGates,
+  tasks,
   workPackageDependencies,
   workPackages,
 } from '../db/schema'
@@ -33,7 +34,7 @@ export type WorkforceMaterializationInput = {
 }
 
 export type WorkforceMaterializationResult = {
-  status: 'materialized' | 'disabled'
+  status: 'materialized' | 'disabled' | 'cancelled'
   harnessCount: number
   workPackageCount: number
   dependencyCount: number
@@ -198,6 +199,40 @@ function mcpSubtasksForAgent(prepared: PreparedArchitectArtifact, agentType: str
     }))
 }
 
+function planningOnlyHarnessMetadata(): JsonObject {
+  return {
+    schemaVersion: 1,
+    status: 'planning_only',
+    runtimePolicyApplied: false,
+    note: 'Harness records shape planning for beta handoff only; it is not wired as a runtime tool or MCP policy.',
+  }
+}
+
+function mcpGrantPhaseMetadata(input: {
+  grants: JsonObject[]
+  validationStatus: string
+}): JsonObject {
+  return {
+    schemaVersion: 1,
+    proposed: input.grants,
+    broker: {
+      schemaVersion: 1,
+      runtimeEnforcement: 'not_implemented',
+      validationStatus: input.validationStatus,
+      status: input.validationStatus,
+    },
+    approved: null,
+    effective: {
+      schemaVersion: 1,
+      phase: 'effective',
+      runtimeIssued: false,
+      runtimeEnforcement: 'not_implemented',
+      status: 'not_issued',
+      note: 'Effective run instructions are prompt/context metadata only in this beta; no live MCP runtime tools are issued.',
+    },
+  }
+}
+
 function buildDependencyRows(
   packages: WorkPackageInsert[],
   idFactory: () => string,
@@ -310,6 +345,7 @@ export function buildWorkforceMaterializationRows(
       isActive: true,
       metadata: {
         source: 'workforce-materializer',
+        harnessSemantics: planningOnlyHarnessMetadata(),
         seededFromTaskId: input.taskId,
       },
     })
@@ -338,6 +374,11 @@ export function buildWorkforceMaterializationRows(
         architectRunId: input.architectRunId,
         artifactId: input.artifactId,
         mcpGrants,
+        mcpGrantPhases: mcpGrantPhaseMetadata({
+          grants: mcpGrants,
+          validationStatus: input.prepared.mcpExecutionDesign.validation.status,
+        }),
+        harnessSemantics: planningOnlyHarnessMetadata(),
         promptOverlay,
         plannedTasks: agent.tasks,
         mcpAwareSubtasks: mcpSubtasks,
@@ -362,6 +403,7 @@ export function buildWorkforceMaterializationRows(
         source: 'workforce-materializer',
         artifactId: input.artifactId,
         architectRunId: input.architectRunId,
+        harnessSemantics: planningOnlyHarnessMetadata(),
         workPackageIds: packages.map((pkg) => pkg.id),
         harnessIds: harnesses.map((harness) => harness.id),
         mcpExecutionStatus: input.prepared.mcpExecutionDesign.validation.status,
@@ -398,7 +440,25 @@ export async function materializeWorkforceFromArchitectArtifact(
     )
   }
 
+  // Guard against a concurrent operator stop (DELETE /api/tasks/:id). That route
+  // updates the task row inside a transaction; taking a FOR UPDATE lock here
+  // serializes the two so we either observe the pre-stop 'running' status (and
+  // any rows we insert are cancelled by the route's own workPackages/gate
+  // updates) or the committed 'cancelled' status (and we skip materialization
+  // entirely). Without this, a stop landing mid-plan would leave a cancelled
+  // task with freshly materialized pending work packages and an actionable
+  // plan_approval gate.
+  let cancelledDuringMaterialization = false
   await db.transaction(async (tx) => {
+    const [taskRow] = await tx
+      .select({ status: tasks.status })
+      .from(tasks)
+      .where(eq(tasks.id, input.taskId))
+      .for('update')
+    if (!taskRow || taskRow.status !== 'running') {
+      cancelledDuringMaterialization = true
+      return
+    }
     await tx
       .delete(approvalGates)
       .where(
@@ -460,6 +520,16 @@ export async function materializeWorkforceFromArchitectArtifact(
 
     await tx.insert(approvalGates).values(rows.approvalGate)
   })
+
+  if (cancelledDuringMaterialization) {
+    return {
+      status: 'cancelled',
+      harnessCount: 0,
+      workPackageCount: 0,
+      dependencyCount: 0,
+      approvalGateCount: 0,
+    }
+  }
 
   return {
     status: 'materialized',
