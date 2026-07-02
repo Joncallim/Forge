@@ -207,7 +207,7 @@ describe('workforce materializer', () => {
         dependsOnWorkPackageId: rows.workPackages[1].id,
       }),
     ])
-    expect(rows.workPackages.map((pkg) => pkg.reviewRequirement)).toEqual(['none', 'none', 'none'])
+    expect(rows.workPackages.map((pkg) => pkg.reviewRequirement)).toEqual(['both', 'none', 'none'])
 
     expect(rows.approvalGate).toMatchObject({
       taskId: 'task-1',
@@ -218,7 +218,7 @@ describe('workforce materializer', () => {
     })
   })
 
-  it('lets executable QA and Reviewer packages replace manual review gates', () => {
+  it('keeps manual review gates even when executable QA and Reviewer packages exist', () => {
     const rows = buildWorkforceMaterializationRows(
       {
         taskId: 'task-1',
@@ -234,7 +234,7 @@ describe('workforce materializer', () => {
       { idFactory: deterministicIds() },
     )
 
-    expect(rows.workPackages.find((pkg) => pkg.assignedRole === 'backend')?.reviewRequirement).toBe('none')
+    expect(rows.workPackages.find((pkg) => pkg.assignedRole === 'backend')?.reviewRequirement).toBe('both')
   })
 
   it('clamps implementation-role review to both when no executable review package exists', () => {

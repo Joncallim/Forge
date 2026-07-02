@@ -81,20 +81,13 @@ function isReservedArchitectAssignedRole(role: string): boolean {
   return ['architect', 'security', 'security-review', 'security_review'].includes(normalized)
 }
 
-function isExecutableReviewRole(role: string): boolean {
-  const normalized = normalizeAgentType(role)
-  return normalized === 'qa' || normalized === 'reviewer'
-}
-
-// Implementation packages get full QA + Reviewer review unless the Architect
-// supplied executable QA/Reviewer packages in the workforce. In that case review
-// is represented by dependent sub-agent packages instead of manual gates.
+// Implementation packages keep full QA + Reviewer gates until executable
+// QA/Reviewer work packages can produce durable gate decisions tied to the
+// implementation artifact. The planning model is not allowed to downgrade them.
 function resolveReviewRequirement(
   agentType: string,
   requested: ReviewRequirement | undefined,
-  hasExecutableReviewPackage: boolean,
 ): ReviewRequirement {
-  if (hasExecutableReviewPackage && isImplementationPackageRole(agentType)) return 'none'
   if (isImplementationPackageRole(agentType)) return 'both'
   return requested ?? defaultReviewRequirement(agentType)
 }
@@ -285,7 +278,6 @@ export function buildWorkforceMaterializationRows(
   const idFactory = options.idFactory ?? randomUUID
   const harnesses: AgentHarnessInsert[] = []
   const packages: WorkPackageInsert[] = []
-  const hasExecutableReviewPackage = input.prepared.agents.some((agent) => isExecutableReviewRole(agent.role))
 
   input.prepared.agents.forEach((agent, index) => {
     const agentType = resolveCanonicalAgentType(agent.role, options.activeAgents)
@@ -375,7 +367,7 @@ export function buildWorkforceMaterializationRows(
       },
       acceptanceCriteria: agent.steps.length > 0 ? agent.steps : [agent.summary || titleForAgent(agent.role)],
       mcpRequirements,
-      reviewRequirement: resolveReviewRequirement(agentType, agent.reviewRequirement, hasExecutableReviewPackage),
+      reviewRequirement: resolveReviewRequirement(agentType, agent.reviewRequirement),
       metadata: {
         source: 'architect-artifact',
         architectRunId: input.architectRunId,
