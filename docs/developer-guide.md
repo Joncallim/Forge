@@ -254,7 +254,7 @@ Current ACP flow:
 getModel(providerConfigId, { cwd })
   -> AcpLanguageModel
   -> AcpSessionClient.start(agentId, cwd)
-  -> npx --no-install pinned ACP adapter package
+  -> pinned local ACP adapter binary
   -> initialize
   -> session/new with caller-provided cwd
   -> optional session/set_config_option for model selection

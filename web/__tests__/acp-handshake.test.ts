@@ -3,10 +3,11 @@
  * check used by ACP provider health checks.
  *
  * A fake EventEmitter-based child process stands in for `spawn()` so these
- * tests never shell out to `npx`/`claude`/`codex`.
+ * tests never shell out to ACP adapters or underlying `claude`/`codex` CLIs.
  */
 
 import { EventEmitter } from 'node:events'
+import path from 'node:path'
 import { describe, it, expect, vi } from 'vitest'
 import { checkAcpReadiness, getAcpAdapterCommand, isAcpAdapterSupported } from '@/lib/providers/acp/handshake'
 import { AcpSessionClient } from '@/lib/providers/acp/client'
@@ -46,10 +47,16 @@ function fixtureSecret(...parts: string[]) {
   return parts.join('')
 }
 
+function executableName(command: string[] | null) {
+  expect(command).not.toBeNull()
+  expect(command).toHaveLength(1)
+  return path.basename(command![0])
+}
+
 describe('getAcpAdapterCommand / isAcpAdapterSupported', () => {
   it('maps known catalog agent ids to pinned local adapter commands', () => {
-    expect(getAcpAdapterCommand('claude-agent')).toEqual(['npx', '--no-install', 'claude-agent-acp'])
-    expect(getAcpAdapterCommand('codex-cli')).toEqual(['npx', '--no-install', 'codex-acp'])
+    expect(executableName(getAcpAdapterCommand('claude-agent'))).toMatch(/^claude-agent-acp(?:\.cmd)?$/)
+    expect(executableName(getAcpAdapterCommand('codex-cli'))).toMatch(/^codex-acp(?:\.cmd)?$/)
     expect(isAcpAdapterSupported('claude-agent')).toBe(true)
   })
 
@@ -106,12 +113,13 @@ describe('checkAcpReadiness', () => {
       return null
     }
     const spawnFn = makeSpawnFn(child)
+    const command = getAcpAdapterCommand('codex-cli')!
 
     const result = await checkAcpReadiness('codex-cli', spawnFn)
 
     expect(result.status).toBe('ready')
     expect(result.latencyMs).not.toBeNull()
-    expect(spawnFn).toHaveBeenCalledWith('npx', ['--no-install', 'codex-acp'], expect.objectContaining({
+    expect(spawnFn).toHaveBeenCalledWith(command[0], [], expect.objectContaining({
       cwd: process.cwd(),
       env: expect.objectContaining({
         PATH: expect.stringContaining('node_modules/.bin'),
@@ -206,7 +214,7 @@ describe('checkAcpReadiness', () => {
 
   it('classifies a synchronous spawn failure as unreachable', async () => {
     const spawnFn = vi.fn().mockImplementation(() => {
-      throw new Error('spawn npx ENOENT')
+      throw new Error('spawn codex-acp ENOENT')
     })
 
     const result = await checkAcpReadiness('codex-cli', spawnFn)
@@ -225,10 +233,11 @@ describe('AcpSessionClient', () => {
       return null
     }
     const spawnFn = makeSpawnFn(child)
+    const command = getAcpAdapterCommand('codex-cli')!
 
     const client = await AcpSessionClient.start('codex-cli', '/tmp/forge-package-sandbox', { spawnFn })
 
-    expect(spawnFn).toHaveBeenCalledWith('npx', ['--no-install', 'codex-acp'], expect.objectContaining({
+    expect(spawnFn).toHaveBeenCalledWith(command[0], [], expect.objectContaining({
       cwd: '/tmp/forge-package-sandbox',
       env: expect.objectContaining({
         PATH: expect.stringContaining('node_modules/.bin'),

@@ -146,7 +146,7 @@ Forge's current ACP support works like this:
 
 ```text
 Forge
-  -> starts a pinned ACP adapter with npx --no-install
+  -> starts a pinned local ACP adapter binary
   -> adapter speaks ACP over JSON-RPC
   -> adapter wraps a real local CLI such as codex or claude
   -> the local CLI uses the account already logged in on your machine

@@ -146,7 +146,7 @@ prompt, and reads the agent's streamed text response.
 
 For the currently wired ACP adapters:
 
-- Forge starts a pinned local adapter dependency with `npx --no-install`.
+- Forge starts a pinned local adapter binary from `node_modules/.bin`.
 - The adapter subprocess receives a deny-by-default environment allowlist; Forge
   provider keys, GitHub tokens, database URLs, Redis URLs, and encryption
   secrets are not forwarded.
@@ -452,8 +452,9 @@ running Forge, and confirm the Architect agent has a provider assigned.
 If provider health says an environment variable is missing, add the real key to
 `~/Documents/Forge/config/forge.env` and restart the web app and worker.
 
-If an ACP provider is not ready, confirm Node/`npx`, the underlying CLI, CLI
-login, and the project's local folder. Then rerun the provider health check.
+If an ACP provider is not ready, confirm Node, the local adapter dependency,
+the underlying CLI, CLI login, and the project's local folder. Then rerun the
+provider health check.
 
 If passkey registration fails, use `http://localhost:3000` locally and confirm
 `WEBAUTHN_RP_ID=localhost` and `WEBAUTHN_ORIGIN=http://localhost:3000`.

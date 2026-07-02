@@ -55,12 +55,21 @@ export function buildAcpAdapterEnv(
   return adapterEnv
 }
 
+function localBinPaths(packageRoot = process.cwd()): string[] {
+  return [
+    path.join(/*turbopackIgnore: true*/ packageRoot, 'node_modules', '.bin'),
+    path.join(/*turbopackIgnore: true*/ packageRoot, 'web', 'node_modules', '.bin'),
+  ]
+}
+
 export function buildAcpSpawnOptions(input: { cwd?: string | null } = {}): SpawnOptionsWithoutStdio {
   const packageRoot = process.cwd()
   const spawnCwd = input.cwd?.trim() || packageRoot
-  const localBin = path.join(/*turbopackIgnore: true*/ packageRoot, 'node_modules', '.bin')
   const env = buildAcpAdapterEnv()
-  env.PATH = env.PATH ? `${localBin}${path.delimiter}${env.PATH}` : localBin
+  const pathEntries = [...localBinPaths(packageRoot), env.PATH].filter(
+    (value): value is string => typeof value === 'string' && value.length > 0,
+  )
+  env.PATH = pathEntries.join(path.delimiter)
   return {
     cwd: spawnCwd,
     env: env as NodeJS.ProcessEnv,

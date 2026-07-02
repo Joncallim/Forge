@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -35,19 +36,35 @@ const ACP_SESSION_PROBE_TIMEOUT_MS = 12_000
 export const ACP_PROTOCOL_VERSION = 1
 
 /**
- * Maps an ACP catalog agent id to the command that spawns its ACP adapter.
- * Adapters are pinned package dependencies and launched with
- * `npx --no-install` so runtime checks do not fetch arbitrary package versions.
+ * Maps an ACP catalog agent id to the local bin that spawns its ACP adapter.
+ * Adapters are pinned package dependencies and launched directly from
+ * node_modules/.bin so runtime checks do not fetch arbitrary package versions.
  * The underlying CLI (`claude` or `codex`) must already be installed and
  * authenticated on the host.
  */
-const ACP_ADAPTER_COMMANDS: Record<string, string[]> = {
-  'claude-agent': ['npx', '--no-install', 'claude-agent-acp'],
-  'codex-cli': ['npx', '--no-install', 'codex-acp'],
+const ACP_ADAPTER_BINS: Record<string, string> = {
+  'claude-agent': 'claude-agent-acp',
+  'codex-cli': 'codex-acp',
+}
+
+function binName(value: string): string {
+  return process.platform === 'win32' ? `${value}.cmd` : value
+}
+
+function localAdapterBinPath(value: string): string | null {
+  const executable = binName(value)
+  const candidates = [
+    join(process.cwd(), 'node_modules', '.bin', executable),
+    join(process.cwd(), 'web', 'node_modules', '.bin', executable),
+  ]
+
+  return candidates.find((candidate) => existsSync(candidate)) ?? null
 }
 
 export function getAcpAdapterCommand(agentId: string): string[] | null {
-  return ACP_ADAPTER_COMMANDS[agentId] ?? null
+  const adapterBin = ACP_ADAPTER_BINS[agentId]
+  if (!adapterBin) return null
+  return [localAdapterBinPath(adapterBin) ?? adapterBin]
 }
 
 export function isAcpAdapterSupported(agentId: string): boolean {
@@ -62,7 +79,8 @@ function looksLikeAuthFailure(message: string | undefined): boolean {
 /**
  * Spawns the adapter for `agentId`, sends an ACP `initialize` request, and
  * classifies the outcome. `spawnFn` is injectable for tests so we never need
- * to actually shell out to `npx`/`claude`/`codex` in CI.
+ * to actually shell out to ACP adapters or underlying `claude`/`codex` CLIs in
+ * CI.
  */
 export async function checkAcpReadiness(
   agentId: string,
@@ -92,7 +110,7 @@ export async function checkAcpReadiness(
       status: 'unreachable',
       message: `Could not start the ${agent.label} ACP adapter: ${
         err instanceof Error ? err.message : String(err)
-      }. Make sure Node/npx is on PATH.`,
+      }. Make sure Node is on PATH and the pinned local ACP adapter dependency is installed.`,
       latencyMs: null,
     }
   }
@@ -102,7 +120,7 @@ export async function checkAcpReadiness(
   // even when that CLI is not installed or not authenticated. We additionally
   // open a throwaway session, which forces the adapter to actually start the
   // underlying CLI in a working directory. That is what makes a green indicator
-  // mean "Forge can really use this runtime" rather than "an npx package booted".
+  // mean "Forge can really use this runtime" rather than "an ACP adapter booted".
   let phase = 'initialize handshake'
   let probeDir: string | null = null
   try {

@@ -569,8 +569,8 @@ safe by itself.
 
 Near-term ACP work:
 
-1. Keep readiness errors actionable for missing `npx`, missing CLI installs,
-   missing auth, and missing project folders.
+1. Keep readiness errors actionable for missing local adapter binaries, missing
+   CLI installs, missing auth, and missing project folders.
 2. Expand runtime strategies only after the current Codex CLI and Claude Code
    paths are reliable.
 3. Keep ACP-backed package execution disabled until local coding CLIs can run

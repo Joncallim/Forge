@@ -16,7 +16,7 @@ line tool, such as Codex CLI or Claude Code.
 ```text
 Forge task
   -> Forge provider adapter
-  -> npx --no-install codex-acp or claude-agent-acp
+  -> pinned local codex-acp or claude-agent-acp adapter
   -> local codex or claude command
   -> model account already logged in on this machine
   -> streamed text back to Forge
@@ -28,7 +28,7 @@ ACP providers are local providers. They depend on tools installed on the host:
 
 | Need | Why |
 |---|---|
-| Node.js 22 or newer and `npx` | Forge uses `npx --no-install` to start pinned ACP adapter dependencies. |
+| Node.js 22 or newer | Forge starts pinned ACP adapter dependencies from local `node_modules/.bin`. |
 | The underlying CLI | `codex` for Codex CLI or `claude` for Claude Code. |
 | CLI login/auth | The local CLI must already be authenticated. Forge does not collect those account credentials. |
 | A project local folder | Forge uses the folder to validate and bound repository context. Architect ACP calls still run in an isolated runtime directory. |
@@ -42,7 +42,7 @@ editor.
 When Forge checks an ACP provider, it:
 
 1. Looks up the selected ACP agent, such as `codex-cli` or `claude-agent`.
-2. Starts the matching adapter command with `npx --no-install`.
+2. Starts the matching pinned adapter binary from local dependencies.
 3. Sends an ACP `initialize` JSON-RPC request.
 4. Waits up to a short timeout for the adapter to answer.
 5. Shows a clear status: ready, not configured, unreachable, handshake failed,
@@ -92,7 +92,7 @@ packages in the meantime.
 
 If an ACP provider is not ready:
 
-- Confirm Node.js 22 or newer and `npx` are on `PATH`.
+- Confirm Node.js 22 or newer is available where Forge runs.
 - Confirm the underlying CLI starts from the terminal.
 - Log in with the CLI's own auth command.
 - Confirm the Forge project has a local folder.
