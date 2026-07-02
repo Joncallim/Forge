@@ -30,8 +30,8 @@ import {
 
 describe('task page retry handoff controls', () => {
   it('distinguishes newly queued and already queued retry responses', () => {
-    expect(retryHandoffMessage('retry_enqueued')).toBe('Retry queued. The worker will re-evaluate this handoff.')
-    expect(retryHandoffMessage('retry_already_queued')).toBe('Retry already queued. The worker will re-evaluate this handoff.')
+    expect(retryHandoffMessage('retry_enqueued')).toBe('Recovery queued. The worker will re-evaluate this handoff.')
+    expect(retryHandoffMessage('retry_already_queued')).toBe('Recovery is already queued. The worker will re-evaluate this handoff.')
   })
 
   it('allows task-level handoff retry for approved and running tasks without blocked packages', () => {
@@ -68,7 +68,7 @@ describe('task page retry handoff controls', () => {
       artifacts: [],
     })).toEqual({
       stage: 'Blocked: Frontend work package',
-      nextAction: 'Resolve the block, then retry handoff from the blocked package.',
+      nextAction: 'Resolve the block, then queue handoff recovery from the blocked package.',
       detail: "MCP 'filesystem' has no approved capabilities for required access.",
     })
   })

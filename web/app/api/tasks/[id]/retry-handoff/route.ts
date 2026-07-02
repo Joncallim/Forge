@@ -33,7 +33,7 @@ export async function POST(
 
     if (task.status !== 'approved' && task.status !== 'running') {
       return NextResponse.json(
-        { error: `Cannot retry handoff for a task with status '${task.status}'. The task must be 'approved' or 'running'.` },
+        { error: `Cannot queue handoff recovery for a task with status '${task.status}'. The task must be 'approved' or 'running'.` },
         { status: 409 },
       )
     }

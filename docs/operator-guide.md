@@ -452,6 +452,19 @@ running Forge, and confirm the Architect agent has a provider assigned.
 If provider health says an environment variable is missing, add the real key to
 `~/Documents/Forge/config/forge.env` and restart the web app and worker.
 
+If `next dev` starts and then crashes with missing internal Next.js modules
+such as `flight-data-helpers`, `use-merged-ref`, or
+`app-next-turbopack.js`, stop Forge and run:
+
+```bash
+forge repair
+```
+
+Repair clears generated Next.js caches, verifies the pinned Next dependency,
+reinstalls web dependencies if package files are missing, applies database
+migrations when `DATABASE_URL` is available, and runs the doctor. It does not
+delete Forge data or project files.
+
 If an ACP provider is not ready, confirm Node, the local adapter dependency,
 the underlying CLI, CLI login, and the project's local folder. Then rerun the
 provider health check.
@@ -471,6 +484,7 @@ Supported starter commands:
 |---|---|
 | `forge` | Start the local dashboard and embedded worker |
 | `forge upgrade` | Sync dependencies, migrations, seeds, and checks |
+| `forge repair` | Repair local caches, dependencies, migrations, and checks |
 | `forge uninstall` | Remove Forge runtime pieces, passing flags through |
 | `forge reset-credentials` | Prompt for a new local account password |
 | `forge doctor` | Run runtime readiness checks |

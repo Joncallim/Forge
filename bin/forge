@@ -55,6 +55,7 @@ Forge CLI
 Usage:
   forge                         Start the local Forge server
   forge upgrade [options]        Sync dependencies, migrations, seeds, and checks
+  forge repair [options]         Repair local caches, dependencies, migrations, and checks
   forge uninstall [options]      Remove Forge runtime pieces
   forge reset-credentials        Prompt for a new local account password
   forge doctor                   Run the Forge runtime doctor
@@ -63,6 +64,7 @@ Usage:
 Examples:
   forge
   forge upgrade
+  forge repair
   forge uninstall --remove-data
   forge reset-credentials
 EOF
@@ -262,6 +264,10 @@ case "$command" in
   upgrade|update)
     require_repo
     exec bash "$REPO_ROOT/scripts/install.sh" --upgrade "$@"
+    ;;
+  repair|fix)
+    require_repo
+    exec bash "$REPO_ROOT/scripts/repair.sh" "$@"
     ;;
   uninstall)
     require_uninstaller

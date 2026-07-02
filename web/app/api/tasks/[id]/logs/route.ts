@@ -6,6 +6,7 @@ import { taskLogs } from '@/db/schema'
 import { getSession } from '@/lib/session'
 import { sanitizeLogRecordForOutput } from '@/lib/task-log-sanitization'
 import { getAccessibleTask } from '@/lib/task-access'
+import { taskLogsUnavailableMessage } from '@/lib/task-log-db-errors'
 
 const MAX_LIMIT = 250
 
@@ -58,6 +59,10 @@ export async function GET(
       nextAfterSequence: logs.length > 0 ? logs[logs.length - 1].sequence : afterSequence,
     })
   } catch (err) {
+    const unavailableMessage = taskLogsUnavailableMessage(err)
+    if (unavailableMessage) {
+      return NextResponse.json({ error: unavailableMessage }, { status: 503 })
+    }
     console.error('[GET /api/tasks/:id/logs] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }

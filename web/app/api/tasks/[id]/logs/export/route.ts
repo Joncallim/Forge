@@ -6,6 +6,7 @@ import { taskLogs, type TaskLog } from '@/db/schema'
 import { formatTaskLogsJsonl, formatTaskLogsMarkdown, taskLogExportFilename } from '@/lib/task-log-export'
 import { getSession } from '@/lib/session'
 import { getAccessibleTask } from '@/lib/task-access'
+import { taskLogsUnavailableMessage } from '@/lib/task-log-db-errors'
 
 const MAX_EXPORT_LOGS = 1000
 const MAX_EXPORT_BYTES = 2 * 1024 * 1024
@@ -85,6 +86,10 @@ export async function GET(
       },
     })
   } catch (err) {
+    const unavailableMessage = taskLogsUnavailableMessage(err)
+    if (unavailableMessage) {
+      return NextResponse.json({ error: unavailableMessage }, { status: 503 })
+    }
     console.error('[GET /api/tasks/:id/logs/export] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
