@@ -56,7 +56,7 @@ vi.mock('@/worker/work-package-executor', () => ({
   MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS: 3,
   WorkPackageExecutionError: mocks.WorkPackageExecutionError,
   isArchitectReservedExecutionRole: (role: string) =>
-    ['architect', 'qa', 'reviewer', 'security', 'security-review', 'security_review'].includes(role.trim().toLowerCase()),
+    ['architect', 'security', 'security-review', 'security_review'].includes(role.trim().toLowerCase()),
 }))
 
 function fixtureSecret(...parts: string[]) {
@@ -378,7 +378,7 @@ describe('handoffApprovedWorkPackages', () => {
 
   it.each([
     ['architect', 'harness-architect', 'Architect package'],
-    ['reviewer', 'harness-reviewer', 'Reviewer package'],
+    ['security', 'harness-security', 'Security package'],
   ])('fails stale Architect-created reserved %s packages before no-op handoff', async (assignedRole, harnessId, title) => {
     mocks.dbSelect
       .mockReturnValueOnce(chain([
@@ -429,18 +429,18 @@ describe('handoffApprovedWorkPackages', () => {
     }))
   })
 
-  it('fails the task when review-gate auto-progress reaches a terminal reserved-role handoff block', async () => {
+  it('fails the task when auto-progress reaches a terminal reserved-role handoff block', async () => {
     mocks.dbSelect
       .mockReturnValueOnce(chain([
         {
           id: 'pkg-review',
-          assignedRole: 'reviewer',
-          harnessId: 'harness-reviewer',
+          assignedRole: 'security',
+          harnessId: 'harness-security',
           mcpRequirements: [],
           metadata: { source: 'architect-artifact' },
           sequence: 1,
           status: 'pending',
-          title: 'Reviewer package',
+          title: 'Security package',
         },
       ]))
       .mockReturnValueOnce(chain([]))

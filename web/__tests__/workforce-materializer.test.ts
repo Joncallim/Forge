@@ -148,10 +148,11 @@ describe('workforce materializer', () => {
       { idFactory: deterministicIds() },
     )
 
-    expect(rows.harnesses).toHaveLength(1)
-    expect(rows.workPackages).toHaveLength(1)
-    expect(rows.workPackages.map((pkg) => pkg.assignedRole)).toEqual(['backend'])
+    expect(rows.harnesses).toHaveLength(3)
+    expect(rows.workPackages).toHaveLength(3)
+    expect(rows.workPackages.map((pkg) => pkg.assignedRole)).toEqual(['backend', 'qa', 'reviewer'])
     expect(rows.workPackages.every((pkg) => pkg.status === 'pending')).toBe(true)
+    expect(rows.harnesses.map((harness) => harness.slug)).toEqual(['backend', 'qa', 'reviewer'])
     expect(rows.harnesses[0]).toMatchObject({
       slug: 'backend',
       role: 'backend',
@@ -196,8 +197,17 @@ describe('workforce materializer', () => {
       optional: ['unit-testing'],
       excluded: [],
     })
-    expect(rows.dependencies).toEqual([])
-    expect(rows.workPackages.map((pkg) => pkg.reviewRequirement)).toEqual(['both'])
+    expect(rows.dependencies).toEqual([
+      expect.objectContaining({
+        workPackageId: rows.workPackages[1].id,
+        dependsOnWorkPackageId: rows.workPackages[0].id,
+      }),
+      expect.objectContaining({
+        workPackageId: rows.workPackages[2].id,
+        dependsOnWorkPackageId: rows.workPackages[1].id,
+      }),
+    ])
+    expect(rows.workPackages.map((pkg) => pkg.reviewRequirement)).toEqual(['none', 'none', 'none'])
 
     expect(rows.approvalGate).toMatchObject({
       taskId: 'task-1',
@@ -208,7 +218,7 @@ describe('workforce materializer', () => {
     })
   })
 
-  it('clamps implementation-role review to both even when the Architect requests less', () => {
+  it('lets executable QA and Reviewer packages replace manual review gates', () => {
     const rows = buildWorkforceMaterializationRows(
       {
         taskId: 'task-1',
@@ -224,11 +234,37 @@ describe('workforce materializer', () => {
       { idFactory: deterministicIds() },
     )
 
-    // The planning model cannot downgrade review for an implementation package.
-    expect(rows.workPackages.find((pkg) => pkg.assignedRole === 'backend')?.reviewRequirement).toBe('both')
+    expect(rows.workPackages.find((pkg) => pkg.assignedRole === 'backend')?.reviewRequirement).toBe('none')
   })
 
-  it('does not materialize Architect-assigned review roles as executable packages', () => {
+  it('clamps implementation-role review to both when no executable review package exists', () => {
+    const rows = buildWorkforceMaterializationRows(
+      {
+        taskId: 'task-1',
+        architectRunId: 'run-1',
+        artifactId: 'artifact-1',
+        prepared: {
+          ...prepared,
+          agents: [
+            {
+              role: 'Backend',
+              tasks: 1,
+              summary: 'Implement APIs',
+              steps: ['Add database tables'],
+              reviewRequirement: 'none',
+            },
+          ],
+        },
+      },
+      { idFactory: deterministicIds() },
+    )
+
+    expect(rows.workPackages).toHaveLength(1)
+    expect(rows.workPackages[0].assignedRole).toBe('backend')
+    expect(rows.workPackages[0].reviewRequirement).toBe('both')
+  })
+
+  it('materializes QA and Reviewer packages but keeps Architect gate roles non-executable', () => {
     const rows = buildWorkforceMaterializationRows(
       {
         taskId: 'task-1',
@@ -268,9 +304,15 @@ describe('workforce materializer', () => {
       },
     )
 
-    expect(rows.harnesses).toEqual([])
-    expect(rows.workPackages).toEqual([])
-    expect(rows.dependencies).toEqual([])
+    expect(rows.harnesses.map((harness) => harness.slug)).toEqual(['reviewer', 'qa'])
+    expect(rows.workPackages.map((pkg) => pkg.assignedRole)).toEqual(['reviewer', 'qa'])
+    expect(rows.workPackages.map((pkg) => pkg.reviewRequirement)).toEqual(['none', 'none'])
+    expect(rows.dependencies).toEqual([
+      expect.objectContaining({
+        workPackageId: rows.workPackages[0].id,
+        dependsOnWorkPackageId: rows.workPackages[1].id,
+      }),
+    ])
   })
 
   it('resolves Architect display-name roles to active canonical agent slugs', () => {
@@ -421,7 +463,7 @@ describe('workforce materializer', () => {
     )
 
     expect(source).toContain('Architect plan did not produce any executable work packages')
-    expect(source).toContain('Architect, QA, and Reviewer are planning/review gates')
+    expect(source).toContain('Architect and Security are planning/review gates')
   })
 
   it('keeps the materializer feature flag easy to disable', () => {

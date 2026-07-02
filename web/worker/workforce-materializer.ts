@@ -78,17 +78,23 @@ function defaultReviewRequirement(agentType: string): ReviewRequirement {
 
 function isReservedArchitectAssignedRole(role: string): boolean {
   const normalized = normalizeAgentType(role)
-  return ['architect', 'qa', 'reviewer', 'security', 'security-review', 'security_review'].includes(normalized)
+  return ['architect', 'security', 'security-review', 'security_review'].includes(normalized)
 }
 
-// Implementation packages always get full QA + Reviewer review; the Architect /
-// planning model is not allowed to downgrade it (e.g. to 'none' or 'qa_only').
-// Non-implementation roles keep whatever the plan requested, since review gates
-// are never materialized for them anyway.
+function isExecutableReviewRole(role: string): boolean {
+  const normalized = normalizeAgentType(role)
+  return normalized === 'qa' || normalized === 'reviewer'
+}
+
+// Implementation packages get full QA + Reviewer review unless the Architect
+// supplied executable QA/Reviewer packages in the workforce. In that case review
+// is represented by dependent sub-agent packages instead of manual gates.
 function resolveReviewRequirement(
   agentType: string,
   requested: ReviewRequirement | undefined,
+  hasExecutableReviewPackage: boolean,
 ): ReviewRequirement {
+  if (hasExecutableReviewPackage && isImplementationPackageRole(agentType)) return 'none'
   if (isImplementationPackageRole(agentType)) return 'both'
   return requested ?? defaultReviewRequirement(agentType)
 }
@@ -279,6 +285,7 @@ export function buildWorkforceMaterializationRows(
   const idFactory = options.idFactory ?? randomUUID
   const harnesses: AgentHarnessInsert[] = []
   const packages: WorkPackageInsert[] = []
+  const hasExecutableReviewPackage = input.prepared.agents.some((agent) => isExecutableReviewRole(agent.role))
 
   input.prepared.agents.forEach((agent, index) => {
     const agentType = resolveCanonicalAgentType(agent.role, options.activeAgents)
@@ -368,7 +375,7 @@ export function buildWorkforceMaterializationRows(
       },
       acceptanceCriteria: agent.steps.length > 0 ? agent.steps : [agent.summary || titleForAgent(agent.role)],
       mcpRequirements,
-      reviewRequirement: resolveReviewRequirement(agentType, agent.reviewRequirement),
+      reviewRequirement: resolveReviewRequirement(agentType, agent.reviewRequirement, hasExecutableReviewPackage),
       metadata: {
         source: 'architect-artifact',
         architectRunId: input.architectRunId,
@@ -435,7 +442,7 @@ export async function materializeWorkforceFromArchitectArtifact(
   const rows = buildWorkforceMaterializationRows(input, { activeAgents })
   if (rows.workPackages.length === 0) {
     throw new Error(
-      'Architect plan did not produce any executable work packages. Assign at least one configured implementation, documentation, DevOps, Backend, Frontend, or other specialist handoff agent; Architect, QA, and Reviewer are planning/review gates, not executable handoff packages.' +
+      'Architect plan did not produce any executable work packages. Assign at least one configured implementation, documentation, DevOps, Backend, Frontend, QA, Reviewer, or other specialist handoff agent; Architect and Security are planning/review gates, not executable handoff packages.' +
       plannedRoleSummary(input),
     )
   }

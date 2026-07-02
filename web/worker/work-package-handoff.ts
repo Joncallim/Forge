@@ -1305,6 +1305,7 @@ export async function handoffApprovedWorkPackages(
   }
   const handoffArtifact = reviewGates.sourceArtifact
   if (!handoffArtifact) throw new Error('No-op handoff completion did not create a source artifact.')
+  const packageStatus = reviewGates.packageStatus
   await publishTaskEvent(taskId, 'artifact:created', {
     id: handoffArtifact.id,
     artifactId: handoffArtifact.id,
@@ -1347,13 +1348,13 @@ export async function handoffApprovedWorkPackages(
     runId: handoff.run.id,
     sandboxWrites: false,
     stage: 'handoff',
-    status: reviewGates.packageStatus ?? 'running',
+    status: packageStatus ?? 'running',
     title: nextPackage.title,
     updatedAt: new Date().toISOString(),
     workPackageId: nextPackage.id,
   })
 
-  const continuation = await continueWorkforceAfterPackageCompletion(taskId, reviewGates.packageStatus, {
+  const continuation = await continueWorkforceAfterPackageCompletion(taskId, packageStatus, {
     claimEnabled,
     finalAttempt: options.finalAttempt,
   })
@@ -1816,6 +1817,7 @@ async function executeReadyWorkPackage(
     }
     const artifact = reviewGates.sourceArtifact
     if (!artifact) throw new Error('Work package completion did not create a source artifact.')
+    const packageStatus = reviewGates.packageStatus
     executionLeaseReleased = true
     heartbeat.stop()
 
@@ -1864,13 +1866,13 @@ async function executeReadyWorkPackage(
       sandboxPath: execution.sandboxPath,
       sandboxWrites: execution.fileCount > 0,
       stage: 'implementation',
-      status: reviewGates.packageStatus ?? 'running',
+      status: packageStatus ?? 'running',
       title: nextPackage.title,
       updatedAt: new Date().toISOString(),
       workPackageId: nextPackage.id,
     })
 
-    const continuation = await continueWorkforceAfterPackageCompletionOrThrow(taskId, reviewGates.packageStatus, options)
+    const continuation = await continueWorkforceAfterPackageCompletionOrThrow(taskId, packageStatus, options)
     if (continuation) return continuation
 
     return {

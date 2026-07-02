@@ -83,6 +83,92 @@ function tableCells(line: string): string[] {
     .map((cell) => cell.trim())
 }
 
+type MarkdownListLine = {
+  content: string
+  indent: number
+  ordered: boolean
+}
+
+const listMarkerPattern = /^(\s*)([-*]|\d+[.)])\s+(.+)$/
+
+function parseListLine(line: string): MarkdownListLine | null {
+  const match = line.match(listMarkerPattern)
+  if (!match) return null
+
+  return {
+    content: match[3],
+    indent: match[1].replace(/\t/g, '    ').length,
+    ordered: /\d/.test(match[2][0]),
+  }
+}
+
+function listClassName(ordered: boolean, depth: number): string {
+  return `${depth > 0 ? 'mt-1 ' : ''}${ordered ? 'list-decimal' : 'list-disc'} space-y-1 pl-5`
+}
+
+function renderListTree(lines: string[], keyPrefix: string): ReactNode[] {
+  const items = lines.map(parseListLine).filter((item): item is MarkdownListLine => item !== null)
+
+  function renderList(startIndex: number, indent: number, ordered: boolean, depth: number): {
+    nextIndex: number
+    node: ReactNode
+  } {
+    const children: ReactNode[] = []
+    let currentIndex = startIndex
+
+    while (currentIndex < items.length) {
+      const item = items[currentIndex]
+      if (item.indent < indent || item.indent > indent || item.ordered !== ordered) break
+
+      currentIndex += 1
+      const nestedLists: ReactNode[] = []
+
+      while (currentIndex < items.length && items[currentIndex].indent > indent) {
+        const nested = renderList(
+          currentIndex,
+          items[currentIndex].indent,
+          items[currentIndex].ordered,
+          depth + 1,
+        )
+        nestedLists.push(nested.node)
+        currentIndex = nested.nextIndex
+      }
+
+      children.push(
+        <li key={`${keyPrefix}-item-${depth}-${currentIndex}-${children.length}`}>
+          {parseInline(item.content)}
+          {nestedLists}
+        </li>,
+      )
+    }
+
+    const className = listClassName(ordered, depth)
+    return {
+      nextIndex: currentIndex,
+      node: ordered ? (
+        <ol key={`${keyPrefix}-ol-${depth}-${startIndex}`} className={className}>
+          {children}
+        </ol>
+      ) : (
+        <ul key={`${keyPrefix}-ul-${depth}-${startIndex}`} className={className}>
+          {children}
+        </ul>
+      ),
+    }
+  }
+
+  const roots: ReactNode[] = []
+  let index = 0
+  while (index < items.length) {
+    const item = items[index]
+    const rendered = renderList(index, item.indent, item.ordered, 0)
+    roots.push(rendered.node)
+    index = rendered.nextIndex > index ? rendered.nextIndex : index + 1
+  }
+
+  return roots
+}
+
 export function MarkdownView({ content, compact = false }: MarkdownViewProps) {
   const lines = normalizeMarkdownDisplayText(content).replace(/\r\n/g, '\n').split('\n')
   const blocks: ReactNode[] = []
@@ -173,35 +259,13 @@ export function MarkdownView({ content, compact = false }: MarkdownViewProps) {
       continue
     }
 
-    if (/^\s*[-*]\s+/.test(line)) {
-      const items: string[] = []
-      while (index < lines.length && /^\s*[-*]\s+/.test(lines[index])) {
-        items.push(lines[index].replace(/^\s*[-*]\s+/, ''))
+    if (listMarkerPattern.test(line)) {
+      const listLines: string[] = []
+      while (index < lines.length && listMarkerPattern.test(lines[index])) {
+        listLines.push(lines[index])
         index += 1
       }
-      blocks.push(
-        <ul key={`ul-${index}`} className="list-disc space-y-1 pl-5">
-          {items.map((item, itemIndex) => (
-            <li key={itemIndex}>{parseInline(item)}</li>
-          ))}
-        </ul>,
-      )
-      continue
-    }
-
-    if (/^\s*\d+[.)]\s+/.test(line)) {
-      const items: string[] = []
-      while (index < lines.length && /^\s*\d+[.)]\s+/.test(lines[index])) {
-        items.push(lines[index].replace(/^\s*\d+[.)]\s+/, ''))
-        index += 1
-      }
-      blocks.push(
-        <ol key={`ol-${index}`} className="list-decimal space-y-1 pl-5">
-          {items.map((item, itemIndex) => (
-            <li key={itemIndex}>{parseInline(item)}</li>
-          ))}
-        </ol>,
-      )
+      blocks.push(...renderListTree(listLines, `list-${index}`))
       continue
     }
 
@@ -227,8 +291,7 @@ export function MarkdownView({ content, compact = false }: MarkdownViewProps) {
       lines[index].trim() !== '' &&
       !/^```/.test(lines[index]) &&
       !/^(#{1,6})\s+/.test(lines[index]) &&
-      !/^\s*[-*]\s+/.test(lines[index]) &&
-      !/^\s*\d+[.)]\s+/.test(lines[index]) &&
+      !listMarkerPattern.test(lines[index]) &&
       !/^\s*>\s?/.test(lines[index])
     ) {
       paragraph.push(lines[index])

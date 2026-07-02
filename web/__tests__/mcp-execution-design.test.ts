@@ -59,6 +59,18 @@ const unhealthyGithub = {
   error: 'Connect GitHub in Settings before using this MCP.',
 }
 
+const healthyFilesystem = {
+  mcpId: 'filesystem',
+  displayName: 'Filesystem',
+  description: 'Filesystem MCP',
+  installPath: '/tmp/forge/mcps/filesystem',
+  installState: 'installed' as const,
+  status: 'healthy' as const,
+  enabled: true,
+  error: null,
+  checkedAt: new Date().toISOString(),
+}
+
 describe('parseMcpExecutionDesign', () => {
   it('parses and removes a tagged MCP execution design fence', () => {
     const text = [
@@ -179,6 +191,28 @@ describe('validateMcpExecutionDesign', () => {
 
     expect(crossAgent.status).toBe('blocked')
     expect(crossAgent.blocked.join('\n')).toMatch(/not covered by an explicit approved grant/)
+  })
+
+  it('lets broad filesystem grants cover explicit project filesystem subtasks during validation', () => {
+    const { design: projectSubtaskDesign } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"filesystem","requirement":"required","reason":"Search project files.","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{"backend":["filesystem.search"]},"prohibitedCapabilities":[],"fallback":{"action":"ask_user","message":"Enable filesystem MCP."}}],"promptOverlays":{},"mcpAwareSubtasks":[{"id":"search-project","agent":"backend","mcpCapabilities":["filesystem.project.search"],"inputs":[],"outputs":[],"verification":[],"stoppingCondition":"Done.","fallback":"Ask user."}]}',
+      '```',
+    ].join('\n'))
+    const projectSubtask = validateMcpExecutionDesign(projectSubtaskDesign, overview([healthyFilesystem]))
+
+    expect(projectSubtask.status).toBe('valid')
+    expect(projectSubtask.blocked).toEqual([])
+
+    const { design: projectGrantDesign } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"filesystem","requirement":"required","reason":"Search project files.","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{"backend":["filesystem.project.search"]},"prohibitedCapabilities":[],"fallback":{"action":"ask_user","message":"Enable filesystem MCP."}}],"promptOverlays":{},"mcpAwareSubtasks":[{"id":"search-files","agent":"backend","mcpCapabilities":["filesystem.search"],"inputs":[],"outputs":[],"verification":[],"stoppingCondition":"Done.","fallback":"Ask user."}]}',
+      '```',
+    ].join('\n'))
+    const projectGrant = validateMcpExecutionDesign(projectGrantDesign, overview([healthyFilesystem]))
+
+    expect(projectGrant.status).toBe('blocked')
+    expect(projectGrant.blocked.join('\n')).toMatch(/not covered by an explicit approved grant/)
   })
 
   it('blocks unknown or unhealthy required MCPs', () => {
@@ -540,6 +574,63 @@ describe('deriveMcpGrantDecisions', () => {
     })
     expect(uncovered.status).toBe('blocked')
     expect(uncovered.blocked.join('\n')).toMatch(/not covered by an explicit approved grant/)
+  })
+
+  it('allows package MCP-aware subtasks covered by broad project-root filesystem grants', () => {
+    const projectSubtask = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyFilesystem]),
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        requirement: 'required',
+        capabilities: ['filesystem.search'],
+        fallback: { action: 'block' },
+      }],
+      metadata: {
+        mcpAwareSubtasks: [{
+          id: 'search-project',
+          mcpCapabilities: ['filesystem.project.search'],
+        }],
+      },
+      title: 'Backend package',
+    })
+    expect(projectSubtask.status).toBe('allowed')
+    expect(projectSubtask.blocked).toEqual([])
+
+    const projectGrant = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyFilesystem]),
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read'],
+        fallback: { action: 'block' },
+      }],
+      metadata: {
+        mcpAwareSubtasks: [{
+          id: 'read-files',
+          mcpCapabilities: ['filesystem.read'],
+        }],
+      },
+      title: 'Backend package',
+    })
+    expect(projectGrant.status).toBe('blocked')
+    expect(projectGrant.blocked.join('\n')).toMatch(/not covered by an explicit approved grant/)
+  })
+
+  it('applies filesystem project/non-project aliases to prohibited capabilities', () => {
+    const result = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyFilesystem]),
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        requirement: 'required',
+        capabilities: ['filesystem.project.search'],
+        prohibitedCapabilities: ['filesystem.search'],
+        fallback: { action: 'block' },
+      }],
+      title: 'Backend package',
+    })
+
+    expect(result.status).toBe('blocked')
+    expect(result.blocked.join('\n')).toMatch(/filesystem\.project\.search/)
   })
 
   it('blocks (does not throw on) prototype-polluting capability ids', () => {

@@ -57,7 +57,7 @@ describe('loadWorkPackageExecutionContext', () => {
     expect(mocks.assertProjectLocalPathForExecution).not.toHaveBeenCalled()
   })
 
-  it.each(['architect', 'reviewer'])(
+  it.each(['architect', 'security'])(
     'rejects stale Architect-created reserved %s packages before provider/model execution',
     async (assignedRole) => {
       vi.clearAllMocks()

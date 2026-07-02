@@ -209,14 +209,14 @@ describe('processApproval handoff', () => {
       .mockReturnValueOnce(failUpdate)
     mocks.previewWorkPackageHandoff.mockResolvedValue({
       status: 'claimable',
-      readyPackageIds: ['pkg-review'],
-      claimedPackageId: 'pkg-review',
+      readyPackageIds: ['pkg-security'],
+      claimedPackageId: 'pkg-security',
     })
     mocks.handoffApprovedWorkPackages.mockResolvedValue({
       status: 'blocked',
       readyPackageIds: [],
       claimedPackageId: null,
-      blockedReason: 'Architect-assigned "reviewer" work packages are reserved for review gates and cannot execute.',
+      blockedReason: 'Architect-assigned "security" work packages are reserved for review gates and cannot execute.',
       terminalBlock: true,
     })
 
@@ -224,11 +224,11 @@ describe('processApproval handoff', () => {
 
     expect(runningUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
     expect(failUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      errorMessage: 'Architect-assigned "reviewer" work packages are reserved for review gates and cannot execute.',
+      errorMessage: 'Architect-assigned "security" work packages are reserved for review gates and cannot execute.',
       status: 'failed',
     }))
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
-      blockedReason: 'Architect-assigned "reviewer" work packages are reserved for review gates and cannot execute.',
+      blockedReason: 'Architect-assigned "security" work packages are reserved for review gates and cannot execute.',
       claimedPackageId: null,
       readyPackageIds: [],
       status: 'blocked',
@@ -376,26 +376,26 @@ describe('processApproval handoff', () => {
     mocks.dbUpdate.mockReturnValueOnce(failUpdate)
     mocks.previewWorkPackageHandoff.mockResolvedValue({
       status: 'claimable',
-      readyPackageIds: ['pkg-review'],
-      claimedPackageId: 'pkg-review',
+      readyPackageIds: ['pkg-security'],
+      claimedPackageId: 'pkg-security',
     })
     mocks.handoffApprovedWorkPackages.mockResolvedValue({
       status: 'blocked',
       readyPackageIds: [],
       claimedPackageId: null,
-      blockedReason: 'Architect-assigned "reviewer" work packages are reserved for review gates and cannot execute.',
+      blockedReason: 'Architect-assigned "security" work packages are reserved for review gates and cannot execute.',
       terminalBlock: true,
     })
 
     await processApproval('task-1')
 
     expect(failUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      errorMessage: 'Architect-assigned "reviewer" work packages are reserved for review gates and cannot execute.',
+      errorMessage: 'Architect-assigned "security" work packages are reserved for review gates and cannot execute.',
       status: 'failed',
     }))
     expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith('task-1', { claimEnabled: false })
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
-      blockedReason: 'Architect-assigned "reviewer" work packages are reserved for review gates and cannot execute.',
+      blockedReason: 'Architect-assigned "security" work packages are reserved for review gates and cannot execute.',
       claimedPackageId: null,
       readyPackageIds: [],
       status: 'blocked',
