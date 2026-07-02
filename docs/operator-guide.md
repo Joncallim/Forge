@@ -462,8 +462,9 @@ forge repair
 
 Repair clears generated Next.js caches, verifies the pinned Next dependency,
 reinstalls web dependencies if package files are missing, applies database
-migrations when `DATABASE_URL` is available, and runs the doctor. It does not
-delete Forge data or project files.
+migrations when `DATABASE_URL` is available from the workspace env or local/dev
+repo/web `.env` fallbacks, and runs the doctor. Production dotenv fallbacks are
+not used by repair. It does not delete Forge data or project files.
 
 If an ACP provider is not ready, confirm Node, the local adapter dependency,
 the underlying CLI, CLI login, and the project's local folder. Then rerun the

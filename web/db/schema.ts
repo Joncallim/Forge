@@ -622,6 +622,7 @@ export const taskLogs = pgTable(
   },
   (t) => [
     index('task_logs_task_id_occurred_at_idx').on(t.taskId, t.occurredAt, t.sequence),
+    index('task_logs_task_id_sequence_idx').on(t.taskId, t.sequence),
     index('task_logs_task_id_level_idx').on(t.taskId, t.level),
     index('task_logs_task_id_event_type_idx').on(t.taskId, t.eventType),
     index('task_logs_level_idx').on(t.level),

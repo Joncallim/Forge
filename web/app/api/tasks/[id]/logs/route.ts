@@ -51,7 +51,7 @@ export async function GET(
       .select()
       .from(taskLogs)
       .where(and(...conditions) ?? sql`true`)
-      .orderBy(asc(taskLogs.occurredAt), asc(taskLogs.sequence))
+      .orderBy(asc(taskLogs.sequence))
       .limit(limit)
 
     return NextResponse.json({
