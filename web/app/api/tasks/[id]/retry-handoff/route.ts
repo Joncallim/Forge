@@ -1,9 +1,7 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
-import { eq } from 'drizzle-orm'
-import { db } from '@/db'
-import { tasks } from '@/db/schema'
 import { getSession } from '@/lib/session'
+import { getAccessibleTask } from '@/lib/task-access'
 import { enqueueBlockedHandoffRetry } from '@/worker/blocked-handoff-retry'
 
 // ---------------------------------------------------------------------------
@@ -27,11 +25,7 @@ export async function POST(
 
     const { id: taskId } = await params
 
-    const [task] = await db
-      .select({ status: tasks.status })
-      .from(tasks)
-      .where(eq(tasks.id, taskId))
-      .limit(1)
+    const task = await getAccessibleTask(taskId, session.userId)
 
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })

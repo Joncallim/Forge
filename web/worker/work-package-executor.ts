@@ -17,6 +17,7 @@ import {
   type ExecutionContextPacket,
 } from './execution-context-packet'
 import { sanitizeWorkerMessage } from './redaction'
+import { recordTaskLogBestEffort } from './task-logs'
 
 const execFile = promisify(execFileCallback)
 
@@ -63,11 +64,13 @@ export type WorkPackageExecutionPlan = {
 
 export type WorkPackageExecutionContext = {
   agentConfig: AgentConfigRow | null
+  agentRunId?: string | null
   attemptNumber?: number
   hostExecutionContext?: ExecutionContextPacket
   validatedProjectRoot: string
   model?: LanguageModel
   modelIdUsed: string
+  providerConnector?: string
   providerConfigId?: string | null
   project: ProjectRow
   priorReviewContext?: WorkPackagePriorReviewContext
@@ -141,6 +144,15 @@ function redactExecutionOutput(value: string): string {
 
 function normalizeCommand(command: string[]): string {
   return command.join(' ').replace(/\s+/g, ' ').trim()
+}
+
+function safeCommandFailureMessage(command: string[], result: WorkPackageExecutionCommandResult): string {
+  const normalized = normalizeCommand(command)
+  const diagnostic = result.stderr.trim()
+  if (/^(?:Static (?:build|lint|test) validation requires|No JavaScript test files were generated\.|Generated (?:package\.json|build script|lint script|test script|test file))/i.test(diagnostic)) {
+    return `Command failed: ${normalized}\n${diagnostic}`
+  }
+  return `Command failed: ${normalized}`
 }
 
 function executionArtifactContent(input: {
@@ -988,6 +1000,7 @@ export async function loadWorkPackageExecutionContext(
     agentConfig: agentConfig ?? null,
     validatedProjectRoot,
     modelIdUsed: provider.config.modelId,
+    providerConnector: `${provider.config.displayName} (${provider.config.providerType})`,
     providerConfigId,
     project: row.project,
     task: row.task,
@@ -1015,6 +1028,7 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
     )
     if (!model) throw new Error(`Provider config ${providerConfigId ?? '(unknown)'} is missing or inactive.`)
     const system = context.agentConfig?.systemPrompt || defaultSystemPrompt(context.workPackage.assignedRole)
+    const providerConnector = context.providerConnector ?? context.providerConfigId ?? 'unknown-provider'
     const prompt = buildExecutionPrompt({
       attemptNumber,
       hostExecutionContext,
@@ -1023,6 +1037,26 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
       sandboxRoot,
       task: context.task,
       workPackage: context.workPackage,
+    })
+    await recordTaskLogBestEffort({
+      agentRunId: context.agentRunId ?? null,
+      eventType: 'model.prompt',
+      frontMatter: {
+        connector: providerConnector,
+        model: context.modelIdUsed,
+        prompt,
+      },
+      level: 'info',
+      message: `Prepared execution prompt for "${context.workPackage.title}".`,
+      metadata: {
+        attemptNumber,
+        providerConfigId,
+        workPackageId: context.workPackage.id,
+      },
+      source: 'model',
+      taskId: context.task.id,
+      title: 'Execution prompt prepared',
+      workPackageId: context.workPackage.id,
     })
 
     const plan = await generateValidatedExecutionPlan({
@@ -1039,12 +1073,54 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
     }
 
     const commandResults: WorkPackageExecutionCommandResult[] = []
+    if (plan.commands.length === 0) {
+      await recordTaskLogBestEffort({
+        agentRunId: context.agentRunId ?? null,
+        eventType: 'validation.warning',
+        frontMatter: {
+          connector: providerConnector,
+          model: context.modelIdUsed,
+          prompt,
+        },
+        level: 'warning',
+        message: `Execution plan for "${context.workPackage.title}" did not include validation commands.`,
+        metadata: {
+          attemptNumber,
+          fileCount: plan.files.length,
+        },
+        source: 'worker',
+        taskId: context.task.id,
+        title: 'Validation commands missing',
+        workPackageId: context.workPackage.id,
+      })
+    }
     for (const command of plan.commands) {
       const result = await runCommand(sandboxRoot, command)
       commandResults.push(result)
+      if (result.exitCode === 0 && result.stderr.trim() !== '') {
+        await recordTaskLogBestEffort({
+          agentRunId: context.agentRunId ?? null,
+          eventType: 'validation.warning',
+          frontMatter: {
+            connector: providerConnector,
+            model: context.modelIdUsed,
+            prompt,
+          },
+          level: 'warning',
+          message: `Validation command emitted stderr: ${normalizeCommand(command)}`,
+          metadata: {
+            attemptNumber,
+            stderr: result.stderr,
+          },
+          source: 'worker',
+          taskId: context.task.id,
+          title: 'Validation warning',
+          workPackageId: context.workPackage.id,
+        })
+      }
       if (result.exitCode !== 0) {
         throw new WorkPackageExecutionError(
-          `Command failed: ${normalizeCommand(command)}\n${result.stderr || result.stdout}`,
+          safeCommandFailureMessage(command, result),
           executionFailureDetails({
             attemptNumber,
             commandResults,

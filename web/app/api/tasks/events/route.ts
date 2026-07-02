@@ -1,5 +1,6 @@
 import type { NextRequest } from 'next/server'
 import { getSession } from '@/lib/session'
+import { getAccessibleTask } from '@/lib/task-access'
 
 // ---------------------------------------------------------------------------
 // SSE stream — GET /api/tasks/events
@@ -54,18 +55,21 @@ export async function GET(request: NextRequest) {
 
       sub.on('pmessage', (_pattern: string, channel: string, message: string) => {
         if (closed) return
-        try {
+        void (async () => {
+          try {
           const event = JSON.parse(message) as { type?: string; status?: string; updatedAt?: string }
           if (event.type !== 'task:status') return
           const taskId = channel.startsWith('forge:task:') ? channel.slice('forge:task:'.length) : null
+          if (!taskId || !(await getAccessibleTask(taskId, session.userId))) return
           send('task:status', {
             taskId,
             status: event.status ?? null,
             updatedAt: event.updatedAt ?? null,
           })
-        } catch (err) {
-          console.error('[SSE /api/tasks/events] Error processing task event', err)
-        }
+          } catch (err) {
+            console.error('[SSE /api/tasks/events] Error processing task event', err)
+          }
+        })()
       })
 
       sub.on('error', (err) => {

@@ -3,10 +3,12 @@ import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/db'
 import { projects, tasks } from '@/db/schema'
-import { eq, desc, count, getTableColumns, and, isNull } from 'drizzle-orm'
+import { eq, desc, count, getTableColumns, and, isNull, type SQL } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 import { generateTaskTitle } from '@/lib/task-title'
+import { recordTaskLogBestEffort } from '@/worker/task-logs'
+import { accessibleTaskOwnerCondition } from '@/lib/task-access'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -42,7 +44,9 @@ export async function GET(request: NextRequest) {
     const offset = (page - 1) * limit
 
     // Build dynamic where conditions
-    const conditions: ReturnType<typeof eq>[] = []
+    const conditions: SQL[] = []
+    const access = accessibleTaskOwnerCondition(session.userId)
+    if (access) conditions.push(access)
     if (projectId) conditions.push(eq(tasks.projectId, projectId))
     if (status) conditions.push(eq(tasks.status, status))
 
@@ -143,6 +147,24 @@ export async function POST(request: NextRequest) {
       .returning()
 
     await redis.lpush('forge:tasks', JSON.stringify({ taskId: task.id }))
+
+    await recordTaskLogBestEffort({
+      eventType: 'task.created',
+      frontMatter: {
+        model: data.pmProviderConfigId ?? null,
+        connector: 'task-default',
+        prompt: data.prompt,
+      },
+      level: 'info',
+      message: `Task "${task.title}" was created and queued for planning.`,
+      metadata: {
+        projectId: task.projectId,
+        submittedBy: session.userId,
+      },
+      source: 'api',
+      taskId: task.id,
+      title: 'Task created',
+    })
 
     console.info('[POST /api/tasks] Created task', { id: task.id, projectId: task.projectId })
     return NextResponse.json({ task }, { status: 201 })

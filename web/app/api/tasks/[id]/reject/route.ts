@@ -6,6 +6,8 @@ import { tasks } from '@/db/schema'
 import { and, eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
+import { recordTaskLogBestEffort } from '@/worker/task-logs'
+import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -31,11 +33,7 @@ export async function POST(
 
     const { id: taskId } = await params
 
-    const [existing] = await db
-      .select()
-      .from(tasks)
-      .where(eq(tasks.id, taskId))
-      .limit(1)
+    const existing = await getAccessibleTask(taskId, session.userId)
 
     if (!existing) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })
@@ -73,7 +71,7 @@ export async function POST(
         errorMessage: reason ?? null,
         updatedAt: new Date(),
       })
-      .where(and(eq(tasks.id, taskId), eq(tasks.status, 'awaiting_approval')))
+      .where(and(accessibleTaskCondition(taskId, session.userId), eq(tasks.status, 'awaiting_approval')))
       .returning()
 
     if (!task) {
@@ -82,6 +80,16 @@ export async function POST(
         { status: 409 },
       )
     }
+
+    await recordTaskLogBestEffort({
+      eventType: 'task.rejected',
+      level: 'error',
+      message: reason ? `Task was rejected: ${reason}` : 'Task was rejected.',
+      metadata: { rejectedBy: session.userId, updatedAt: task.updatedAt.toISOString() },
+      source: 'api',
+      taskId,
+      title: 'Task rejected',
+    })
 
     await redis.publish('forge:task:' + taskId, JSON.stringify({
       type: 'task:status',

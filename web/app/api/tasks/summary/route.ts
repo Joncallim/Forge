@@ -1,9 +1,10 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
-import { count, desc, inArray } from 'drizzle-orm'
+import { and, count, desc, inArray } from 'drizzle-orm'
 import { db } from '@/db'
 import { tasks } from '@/db/schema'
 import { getSession } from '@/lib/session'
+import { accessibleTaskOwnerCondition } from '@/lib/task-access'
 
 // ---------------------------------------------------------------------------
 // GET /api/tasks/summary
@@ -27,6 +28,7 @@ export async function GET(request: NextRequest) {
     const grouped = await db
       .select({ status: tasks.status, total: count() })
       .from(tasks)
+      .where(accessibleTaskOwnerCondition(session.userId))
       .groupBy(tasks.status)
 
     const byStatus: Record<string, number> = {}
@@ -38,7 +40,7 @@ export async function GET(request: NextRequest) {
     const attentionTasks = await db
       .select({ id: tasks.id, title: tasks.title, status: tasks.status })
       .from(tasks)
-      .where(inArray(tasks.status, [...ATTENTION_STATUSES]))
+      .where(and(accessibleTaskOwnerCondition(session.userId), inArray(tasks.status, [...ATTENTION_STATUSES])))
       .orderBy(desc(tasks.updatedAt))
       .limit(5)
 

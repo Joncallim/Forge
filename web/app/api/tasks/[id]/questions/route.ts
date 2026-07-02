@@ -2,10 +2,11 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/db'
-import { taskQuestions, tasks } from '@/db/schema'
+import { taskQuestions } from '@/db/schema'
 import { and, asc, eq, inArray } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
+import { getAccessibleTask } from '@/lib/task-access'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -38,11 +39,7 @@ export async function GET(
 
     const { id: taskId } = await params
 
-    const [task] = await db
-      .select({ id: tasks.id })
-      .from(tasks)
-      .where(eq(tasks.id, taskId))
-      .limit(1)
+    const task = await getAccessibleTask(taskId, session.userId)
 
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })
@@ -77,11 +74,7 @@ export async function POST(
 
     const { id: taskId } = await params
 
-    const [task] = await db
-      .select()
-      .from(tasks)
-      .where(eq(tasks.id, taskId))
-      .limit(1)
+    const task = await getAccessibleTask(taskId, session.userId)
 
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })

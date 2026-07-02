@@ -5,6 +5,8 @@ import { approvalGates, tasks, workPackages } from '@/db/schema'
 import { and, eq, sql } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
+import { recordTaskLogBestEffort } from '@/worker/task-logs'
+import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -59,11 +61,7 @@ export async function POST(
 
     const { id: taskId } = await params
 
-    const [existing] = await db
-      .select()
-      .from(tasks)
-      .where(eq(tasks.id, taskId))
-      .limit(1)
+    const existing = await getAccessibleTask(taskId, session.userId)
 
     if (!existing) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })
@@ -81,7 +79,7 @@ export async function POST(
       const [approvedTask] = await tx
         .update(tasks)
         .set({ errorMessage: null, status: 'approved', updatedAt: approvedAt })
-        .where(and(eq(tasks.id, taskId), eq(tasks.status, 'awaiting_approval')))
+        .where(and(accessibleTaskCondition(taskId, session.userId), eq(tasks.status, 'awaiting_approval')))
         .returning()
 
       if (!approvedTask) {
@@ -148,6 +146,16 @@ export async function POST(
         { status: 409 },
       )
     }
+
+    await recordTaskLogBestEffort({
+      eventType: 'task.approved',
+      level: 'success',
+      message: `Task plan was approved by ${session.userId}.`,
+      metadata: { approvedAt: approvedAt.toISOString(), approvedGateIds: approvedGates.map((gate) => gate.id) },
+      source: 'api',
+      taskId,
+      title: 'Task approved',
+    })
 
     try {
       await redis.lpush('forge:approvals', JSON.stringify({ taskId, action: 'approve' }))

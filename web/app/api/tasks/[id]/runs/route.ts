@@ -5,6 +5,7 @@ import { asc, eq, inArray } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 import type RedisClient from 'ioredis'
+import { getAccessibleTask } from '@/lib/task-access'
 
 // ---------------------------------------------------------------------------
 // SSE stream — GET /api/tasks/:id/runs
@@ -19,8 +20,9 @@ export async function GET(
 
   const { id: taskId } = await params
 
-  // Verify task exists
-  const [task] = await db.select().from(tasks).where(eq(tasks.id, taskId)).limit(1)
+  // Verify task exists and belongs to this operator. Legacy null-owner tasks
+  // remain readable so older local installs do not orphan history.
+  const task = await getAccessibleTask(taskId, session.userId)
   if (!task) return new Response('Task not found', { status: 404 })
 
   const encoder = new TextEncoder()

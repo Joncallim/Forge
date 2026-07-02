@@ -3,6 +3,7 @@ import { tasks } from '../db/schema'
 import { and, eq, notInArray } from 'drizzle-orm'
 import { publishTaskEvent } from './events'
 import { sanitizeWorkerMessage } from './redaction'
+import { recordTaskLogBestEffort, type TaskLogLevel } from './task-logs'
 
 export type TaskStatus =
   | 'pending'
@@ -17,6 +18,17 @@ export type TaskStatus =
 
 const TERMINAL_STATUS_LIST: TaskStatus[] = ['completed', 'failed', 'cancelled', 'rejected']
 const TERMINAL_STATUSES = new Set<TaskStatus>(TERMINAL_STATUS_LIST)
+
+function taskStatusLogLevel(status: TaskStatus): TaskLogLevel {
+  if (status === 'completed' || status === 'awaiting_approval') return 'success'
+  if (status === 'failed' || status === 'rejected') return 'error'
+  if (status === 'cancelled' || status === 'awaiting_answers') return 'warning'
+  return 'info'
+}
+
+function taskStatusLogTitle(status: TaskStatus): string {
+  return `Task ${status.replace(/_/g, ' ')}`
+}
 
 export async function updateTaskStatus(
   taskId: string,
@@ -38,6 +50,18 @@ export async function updateTaskStatus(
     .returning({ id: tasks.id })
 
   if (!updated) return false
+
+  await recordTaskLogBestEffort({
+    eventType: 'task.status_changed',
+    level: taskStatusLogLevel(status),
+    message: sanitizedErrorMessage
+      ? `Task status changed to ${status}: ${sanitizedErrorMessage}`
+      : `Task status changed to ${status}.`,
+    metadata: { status, updatedAt: now.toISOString() },
+    source: 'worker',
+    taskId,
+    title: taskStatusLogTitle(status),
+  })
 
   await publishTaskEvent(taskId, 'task:status', {
     status,
@@ -69,6 +93,18 @@ export async function updateTaskStatusIfCurrent(
     .returning({ id: tasks.id })
 
   if (!updated) return false
+
+  await recordTaskLogBestEffort({
+    eventType: 'task.status_changed',
+    level: taskStatusLogLevel(nextStatus),
+    message: sanitizedErrorMessage
+      ? `Task status changed from ${currentStatus} to ${nextStatus}: ${sanitizedErrorMessage}`
+      : `Task status changed from ${currentStatus} to ${nextStatus}.`,
+    metadata: { currentStatus, nextStatus, updatedAt: now.toISOString() },
+    source: 'worker',
+    taskId,
+    title: taskStatusLogTitle(nextStatus),
+  })
 
   await publishTaskEvent(taskId, 'task:status', {
     status: nextStatus,
