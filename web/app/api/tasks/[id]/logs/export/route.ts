@@ -67,7 +67,7 @@ export async function GET(
       .select()
       .from(taskLogs)
       .where(eq(taskLogs.taskId, taskId))
-      .orderBy(asc(taskLogs.occurredAt), asc(taskLogs.sequence))
+      .orderBy(asc(taskLogs.sequence))
       .limit(MAX_EXPORT_LOGS + 1)
 
     const exportedAt = new Date()

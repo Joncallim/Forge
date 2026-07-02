@@ -1,0 +1,1 @@
+CREATE INDEX "task_logs_task_id_sequence_idx" ON "task_logs" USING btree ("task_id","sequence");

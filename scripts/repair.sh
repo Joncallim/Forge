@@ -34,7 +34,8 @@ Options:
 
 Repair removes generated Next.js caches, verifies the pinned Next.js package,
 repairs missing web dependencies when needed, applies migrations when
-DATABASE_URL is available, and runs the Forge doctor.
+DATABASE_URL is available from the workspace env or local/dev repo/web dotenv
+fallbacks, and runs the Forge doctor.
 EOF
 }
 
@@ -177,6 +178,53 @@ install_dependencies() {
   run "Installing web dependencies" bash -c 'cd "$1" && npm install' _ "$WEB_DIR"
 }
 
+load_database_url_from_env_file() {
+  local file="$1" line key value
+  [ -z "${DATABASE_URL:-}" ] || return 0
+  [ -f "$file" ] || return 0
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in
+      ''|\#*) continue ;;
+      *=*) ;;
+      *) continue ;;
+    esac
+
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    [ "$key" = "DATABASE_URL" ] || continue
+
+    value="${value%\"}"; value="${value#\"}"
+    value="${value%\'}"; value="${value#\'}"
+    [ -n "$value" ] || continue
+    export DATABASE_URL="$value"
+    info "Loaded DATABASE_URL from ${file#$REPO_ROOT/}."
+    return 0
+  done < "$file"
+}
+
+load_database_url_from_local_fallbacks() {
+  local file
+  for file in \
+    "$REPO_ROOT/.env.development.local" \
+    "$REPO_ROOT/.env.local" \
+    "$REPO_ROOT/.env.development" \
+    "$REPO_ROOT/.env" \
+    "$WEB_DIR/.env.development.local" \
+    "$WEB_DIR/.env.local" \
+    "$WEB_DIR/.env.development" \
+    "$WEB_DIR/.env"
+  do
+    load_database_url_from_env_file "$file"
+    [ -z "${DATABASE_URL:-}" ] || return 0
+  done
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
@@ -236,6 +284,8 @@ else
 fi
 
 run "Cleaning local conflict-copy artifacts" bash -c 'cd "$1" && npm run clean:conflict-copies' _ "$WEB_DIR"
+
+load_database_url_from_local_fallbacks
 
 if [ "$SKIP_MIGRATE" = "1" ]; then
   warn "Skipping database migrations by request."

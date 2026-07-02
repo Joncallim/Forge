@@ -134,6 +134,13 @@
       "when": 1782954337498,
       "tag": "0018_smiling_paibok",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1782961997571,
+      "tag": "0019_task_logs_sequence_idx",
+      "breakpoints": true
     }
   ]
 }
