@@ -12,6 +12,7 @@ The first implemented command set is:
 ```bash
 forge
 forge upgrade
+forge repair
 forge uninstall
 forge reset-credentials
 ```
@@ -26,6 +27,7 @@ for `forge`.
 | `forge` | Starts the local dashboard and embedded worker. | `web/package.json` -> `npm run dev` |
 | `forge dev` | Alias for `forge`. | `web/package.json` -> `npm run dev` |
 | `forge upgrade` | Syncs dependencies, migrations, agent seeds, and checks after pulling changes. | `scripts/install.sh --upgrade` |
+| `forge repair` | Repairs common local runtime breakage: generated Next caches, missing pinned Next package files, migrations when env is available, and doctor checks. | `scripts/repair.sh` |
 | `forge uninstall` | Removes Forge runtime pieces and passes uninstall flags through unchanged. | `scripts/uninstall.sh` |
 | `forge reset-credentials` | Prompts for a new local account password and clears password-login throttles. | `web/scripts/reset-password.ts --stdin` |
 | `forge doctor` | Runs runtime readiness checks. | `web/scripts/doctor.ts` |
@@ -67,7 +69,7 @@ The CLI routes to existing workflows rather than replacing them.
 | Area | Primary owner | Current source of truth |
 |---|---|---|
 | CLI taxonomy and command contracts | Architect | This document and future ADRs |
-| Install, upgrade, uninstall, machine checks | DevOps | `scripts/install.sh`, `scripts/uninstall.sh` |
+| Install, upgrade, repair, uninstall, machine checks | DevOps | `scripts/install.sh`, `scripts/repair.sh`, `scripts/uninstall.sh` |
 | Web app runtime | Frontend / Backend | `web/package.json` scripts |
 | Worker runtime | Backend | `web/package.json`, `web/worker/` |
 | Credential recovery | Backend | `web/scripts/reset-password.ts` |
@@ -93,6 +95,7 @@ Minimum checks for CLI changes:
 
 ```bash
 bin/forge help
+bin/forge repair --dry-run --skip-doctor
 FORGE_CLI_LINK_DIR="$(mktemp -d)" bash scripts/install.sh --dry-run
 bash scripts/uninstall.sh --dry-run
 cd /tmp && /path/to/Forge/bin/forge help

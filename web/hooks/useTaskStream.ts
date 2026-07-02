@@ -45,6 +45,7 @@ interface UseTaskStreamResult {
   taskStatus: string | null
   error: string | null
   refreshRevision: number
+  taskLogRevision: number
   // null means no questions:created/questions:answered event has been
   // received yet this session — callers should fall back to initial data
   // fetched on mount. Once an event arrives (even with an empty array), this
@@ -181,6 +182,7 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
   const [error, setError] = useState<string | null>(null)
   const [questions, setQuestions] = useState<TaskQuestion[] | null>(null)
   const [refreshRevision, setRefreshRevision] = useState(0)
+  const [taskLogRevision, setTaskLogRevision] = useState(0)
 
   // Store streaming log chunks outside React state to avoid excessive re-renders.
   // Key: runId, Value: accumulated log string
@@ -338,12 +340,15 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
       'approval_gate:created',
       'approval_gate:decided',
       'task:handoff',
-      'task:log',
       'work_package:handoff',
       'work_package:status',
     ]) {
       es.addEventListener(eventType, requestDetailRefresh)
     }
+
+    es.addEventListener('task:log', () => {
+      setTaskLogRevision((revision) => revision + 1)
+    })
 
     es.addEventListener('questions:created', (e) => {
       try {
@@ -411,5 +416,5 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
     }
   }, [taskId, flushChunks, requestDetailRefresh, requestGlobalTaskStatusRefresh])
 
-  return { runs, artifacts, taskStatus, error, questions, refreshRevision }
+  return { runs, artifacts, taskStatus, error, questions, refreshRevision, taskLogRevision }
 }

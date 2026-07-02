@@ -1331,8 +1331,8 @@ function GateDecisionControls({
 
 export function retryHandoffMessage(status: RetryHandoffResultStatus): string {
   return status === 'retry_already_queued'
-    ? 'Retry already queued. The worker will re-evaluate this handoff.'
-    : 'Retry queued. The worker will re-evaluate this handoff.'
+    ? 'Recovery is already queued. The worker will re-evaluate this handoff.'
+    : 'Recovery queued. The worker will re-evaluate this handoff.'
 }
 
 export function canRetryHandoffForTaskStatus(status: string, hasBlockedPackage: boolean): boolean {
@@ -1377,7 +1377,7 @@ function RetryHandoffControls({
       const res = await fetch(`/api/tasks/${taskId}/retry-handoff`, { method: 'POST' })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
-        throw new Error(body.error ?? 'Failed to retry handoff')
+        throw new Error(body.error ?? 'Failed to queue handoff recovery')
       }
       const body = await res.json().catch(() => ({}))
       const status = body?.result?.status === 'retry_already_queued' ? 'retry_already_queued' : 'retry_enqueued'
@@ -1391,10 +1391,10 @@ function RetryHandoffControls({
   }
 
   return (
-    <div className="mt-3 min-w-0 rounded-lg border border-destructive/30 bg-destructive/10 p-3">
+    <div className="mt-3 min-w-0 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
       <p className="text-sm font-medium text-foreground">{title}</p>
       {blockedReason !== '' && (
-        <p className="mt-1 text-xs text-destructive">{blockedReason}</p>
+        <p className="mt-1 text-xs text-muted-foreground">{blockedReason}</p>
       )}
       {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
       <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -1405,7 +1405,7 @@ function RetryHandoffControls({
           disabled={submitting}
           onClick={() => void retry()}
         >
-          {submitting ? 'Retrying...' : 'Retry handoff'}
+          {submitting ? 'Queueing...' : 'Recover handoff'}
         </Button>
         {retryStatus && !error && (
           <span className="text-xs text-muted-foreground">{retryHandoffMessage(retryStatus)}</span>
@@ -2868,18 +2868,75 @@ function frontMatterText(frontMatter: Record<string, unknown>, key: string): str
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : ''
 }
 
+function logSequence(log: TaskLog): number {
+  return Number.isFinite(log.sequence) ? log.sequence : 0
+}
+
+function mergeTaskLogs(existing: TaskLog[], incoming: TaskLog[]): TaskLog[] {
+  const byId = new Map(existing.map((log) => [log.id, log]))
+  for (const log of incoming) byId.set(log.id, log)
+  return [...byId.values()].sort((a, b) => {
+    const sequenceDelta = logSequence(a) - logSequence(b)
+    if (sequenceDelta !== 0) return sequenceDelta
+    return new Date(a.occurredAt).getTime() - new Date(b.occurredAt).getTime()
+  })
+}
+
+function TypingLogMessage({ active, message }: { active: boolean; message: string }) {
+  const [displayed, setDisplayed] = useState(active ? '' : message)
+
+  useEffect(() => {
+    if (!active) {
+      setDisplayed(message)
+      return
+    }
+
+    setDisplayed('')
+    if (message.length === 0) return
+
+    const step = Math.max(6, Math.ceil(message.length / 18))
+    let index = 0
+    const timer = window.setInterval(() => {
+      index = Math.min(message.length, index + step)
+      setDisplayed(message.slice(0, index))
+      if (index >= message.length) window.clearInterval(timer)
+    }, 18)
+
+    return () => window.clearInterval(timer)
+  }, [active, message])
+
+  return (
+    <p className="mt-2 whitespace-pre-wrap break-words text-sm text-muted-foreground">
+      {displayed}
+      {active && displayed.length < message.length && (
+        <span aria-hidden="true" className="ml-0.5 inline-block h-4 w-px translate-y-0.5 animate-pulse bg-current" />
+      )}
+    </p>
+  )
+}
+
 function TaskLogsPanel({
   error,
+  liveLogIds,
   loading,
   logs,
   taskId,
 }: {
   error: string | null
+  liveLogIds: Set<string>
   loading: boolean
   logs: TaskLog[]
   taskId: string
 }) {
   const exportBase = `/api/tasks/${taskId}/logs/export`
+  const listRef = useRef<HTMLOListElement | null>(null)
+
+  useEffect(() => {
+    if (liveLogIds.size === 0) return
+    const list = listRef.current
+    if (!list) return
+    list.scrollTo({ top: list.scrollHeight, behavior: 'smooth' })
+  }, [liveLogIds, logs.length])
 
   return (
     <section aria-labelledby="task-logs-heading" className="mb-6">
@@ -2887,7 +2944,14 @@ function TaskLogsPanel({
         <h2 id="task-logs-heading" className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
           Task logs
         </h2>
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="inline-flex h-7 items-center gap-1.5 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 text-[0.75rem] font-medium text-emerald-700 dark:text-emerald-300">
+            <span className="relative flex size-2">
+              <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-50" />
+              <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+            </span>
+            Live
+          </span>
           <a
             href={`${exportBase}?format=markdown`}
             className="inline-flex h-7 items-center gap-1 rounded-md border border-border bg-background px-2.5 text-[0.8rem] font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
@@ -2918,12 +2982,19 @@ function TaskLogsPanel({
           <p className="text-sm text-muted-foreground">No task logs recorded yet.</p>
         </div>
       ) : (
-        <ol className="max-h-[32rem] overflow-auto rounded-lg border border-border" aria-label="Task log entries">
+        <ol ref={listRef} className="max-h-[32rem] overflow-auto rounded-lg border border-border" aria-label="Task log entries" aria-live="polite">
           {logs.map((log) => {
             const model = frontMatterText(log.frontMatter, 'model')
             const connector = frontMatterText(log.frontMatter, 'connector')
+            const live = liveLogIds.has(log.id)
             return (
-              <li key={log.id} className="border-b border-border px-4 py-3 last:border-0">
+              <li
+                key={log.id}
+                className={[
+                  'border-b border-border px-4 py-3 transition-colors duration-300 last:border-0',
+                  live ? 'bg-emerald-500/5' : '',
+                ].filter(Boolean).join(' ')}
+              >
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="flex min-w-0 flex-wrap items-center gap-2">
                     <Badge variant="outline" className={statusBadgeClass(log.level)}>{statusLabel(log.level)}</Badge>
@@ -2932,7 +3003,7 @@ function TaskLogsPanel({
                   </div>
                   <span className="shrink-0 text-xs text-muted-foreground">{formatDatetime(log.occurredAt)}</span>
                 </div>
-                <p className="mt-2 whitespace-pre-wrap break-words text-sm text-muted-foreground">{log.message}</p>
+                <TypingLogMessage active={live} message={log.message} />
                 {(model !== '' || connector !== '') && (
                   <dl className="mt-2 grid gap-x-4 gap-y-1 text-xs text-muted-foreground sm:grid-cols-2">
                     {model !== '' && <div><dt className="font-medium text-foreground">Model</dt><dd className="break-all font-mono">{model}</dd></div>}
@@ -2999,7 +3070,7 @@ export function taskProgressSummary(input: {
     const reason = stringField(blockedPackage, ['blockedReason'])
     return {
       stage: `Blocked: ${title}`,
-      nextAction: 'Resolve the block, then retry handoff from the blocked package.',
+      nextAction: 'Resolve the block, then queue handoff recovery from the blocked package.',
       detail: reason || 'A package is blocked before execution can continue.',
     }
   }
@@ -3182,6 +3253,7 @@ export default function TaskDetailPage() {
   const [vcsChanges, setVcsChanges] = useState<VcsChange[]>([])
   const [commandAudits, setCommandAudits] = useState<CommandAudit[]>([])
   const [taskLogs, setTaskLogs] = useState<TaskLog[]>([])
+  const [liveLogIds, setLiveLogIds] = useState<Set<string>>(new Set())
   const [providers, setProviders] = useState<ProviderConfig[]>([])
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
@@ -3202,6 +3274,8 @@ export default function TaskDetailPage() {
   const [optimisticTaskStatus, setOptimisticTaskStatus] = useState<string | null>(null)
   const [retryCardCollapsing, setRetryCardCollapsing] = useState(false)
   const [retrySubmitted, setRetrySubmitted] = useState(false)
+  const liveLogTimersRef = useRef<Map<string, number>>(new Map())
+  const lastLogSequenceRef = useRef(0)
 
   // SSE stream
   const {
@@ -3211,6 +3285,7 @@ export default function TaskDetailPage() {
     error: streamError,
     questions: streamQuestions,
     refreshRevision: streamRefreshRevision,
+    taskLogRevision,
   } = useTaskStream(taskId)
 
   // Merge initial data with live stream data
@@ -3261,23 +3336,70 @@ export default function TaskDetailPage() {
     }
   }, [])
 
-  const loadLogs = useCallback(async () => {
-    setLogsLoading(true)
+  const markLogsLive = useCallback((ids: string[]) => {
+    if (ids.length === 0) return
+
+    setLiveLogIds((prev) => {
+      const next = new Set(prev)
+      for (const id of ids) next.add(id)
+      return next
+    })
+
+    for (const id of ids) {
+      const existingTimer = liveLogTimersRef.current.get(id)
+      if (existingTimer) window.clearTimeout(existingTimer)
+      const timer = window.setTimeout(() => {
+        setLiveLogIds((prev) => {
+          if (!prev.has(id)) return prev
+          const next = new Set(prev)
+          next.delete(id)
+          return next
+        })
+        liveLogTimersRef.current.delete(id)
+      }, 1200)
+      liveLogTimersRef.current.set(id, timer)
+    }
+  }, [])
+
+  useEffect(() => () => {
+    for (const timer of liveLogTimersRef.current.values()) window.clearTimeout(timer)
+    liveLogTimersRef.current.clear()
+  }, [])
+
+  const loadLogs = useCallback(async (options: { append?: boolean } = {}) => {
+    const append = options.append === true
+    if (!append) setLogsLoading(true)
     setLogsError(null)
     try {
-      const res = await fetch(`/api/tasks/${taskId}/logs?limit=100`)
+      const search = new URLSearchParams({ limit: append ? '250' : '100' })
+      if (append && lastLogSequenceRef.current > 0) {
+        search.set('afterSequence', String(lastLogSequenceRef.current))
+      }
+      const res = await fetch(`/api/tasks/${taskId}/logs?${search.toString()}`)
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
         throw new Error(body.error ?? 'Failed to load task logs')
       }
       const data = await res.json() as { logs?: TaskLog[] }
-      setTaskLogs(data.logs ?? [])
+      const incoming = data.logs ?? []
+      setTaskLogs((prev) => {
+        const existingIds = new Set(prev.map((log) => log.id))
+        const next = append ? mergeTaskLogs(prev, incoming) : incoming
+        lastLogSequenceRef.current = next.reduce((max, log) => Math.max(max, logSequence(log)), 0)
+        if (append) {
+          const newIds = incoming
+            .filter((log) => !existingIds.has(log.id))
+            .map((log) => log.id)
+          if (newIds.length > 0) window.setTimeout(() => markLogsLive(newIds), 0)
+        }
+        return next
+      })
     } catch (err) {
       setLogsError(err instanceof Error ? err.message : 'An unexpected error occurred')
     } finally {
-      setLogsLoading(false)
+      if (!append) setLogsLoading(false)
     }
-  }, [taskId])
+  }, [markLogsLive, taskId])
 
   useEffect(() => {
     loadTask()
@@ -3305,9 +3427,14 @@ export default function TaskDetailPage() {
   useEffect(() => {
     if (streamRefreshRevision > 0) {
       loadTask()
-      loadLogs()
     }
-  }, [streamRefreshRevision, loadLogs, loadTask])
+  }, [streamRefreshRevision, loadTask])
+
+  useEffect(() => {
+    if (taskLogRevision > 0) {
+      loadLogs({ append: true })
+    }
+  }, [taskLogRevision, loadLogs])
 
   // Auto-expand the plan once it's awaiting approval, so reviewers see it
   // without an extra click; stays expanded afterward unless collapsed manually.
@@ -3620,14 +3747,14 @@ export default function TaskDetailPage() {
       />
 
       {canRetryHandoff && (
-        <section aria-label={effectiveTaskStatus === 'running' ? 'Retry running handoff' : 'Retry approved handoff'} className="mb-6">
+        <section aria-label={effectiveTaskStatus === 'running' ? 'Handoff recovery' : 'Start handoff recovery'} className="mb-6">
           <RetryHandoffControls
             blockedReason={effectiveTaskStatus === 'running'
-              ? 'The task is running. If a handoff worker was interrupted, retry will safely re-enqueue recovery and continue eligible packages.'
-              : 'The task is approved. If the handoff worker did not pick it up, retry will safely re-enqueue the approval job.'}
+              ? 'The task is running. If a handoff worker stalled or disconnected, recovery will safely continue eligible packages.'
+              : 'The task is approved. If the handoff worker has not picked it up, recovery will safely re-enqueue the approval job.'}
             taskId={taskId}
             onRetried={loadTask}
-            title={effectiveTaskStatus === 'running' ? 'Retry running handoff' : 'Retry approved handoff'}
+            title={effectiveTaskStatus === 'running' ? 'Recover handoff' : 'Start handoff recovery'}
           />
         </section>
       )}
@@ -3885,6 +4012,7 @@ export default function TaskDetailPage() {
 
           <TaskLogsPanel
             error={logsError}
+            liveLogIds={liveLogIds}
             loading={logsLoading}
             logs={taskLogs}
             taskId={taskId}

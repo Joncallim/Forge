@@ -40,6 +40,49 @@ function frontMatterWithTimestamp(frontMatter: Record<string, unknown>, createdA
   })
 }
 
+function errorField(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== ''
+    ? sanitizeWorkerMessage(value).slice(0, 2000)
+    : undefined
+}
+
+function taskLogErrorDiagnostic(err: unknown): Record<string, unknown> {
+  const diagnostic: Record<string, unknown> = {}
+  const seen = new Set<unknown>()
+  let current: unknown = err
+  let depth = 0
+
+  while (current && depth < 4 && !seen.has(current)) {
+    seen.add(current)
+    const label = depth === 0 ? 'error' : `cause${depth}`
+    if (current instanceof Error) {
+      diagnostic[`${label}Name`] = current.name
+      diagnostic[`${label}Message`] = errorField(current.message)
+    } else {
+      diagnostic[`${label}Message`] = errorField(current)
+    }
+
+    if (typeof current === 'object' && current !== null) {
+      const record = current as Record<string, unknown>
+      for (const key of ['code', 'constraint', 'detail', 'schema', 'table']) {
+        const value = errorField(record[key])
+        if (value) diagnostic[`${label}${key[0].toUpperCase()}${key.slice(1)}`] = value
+      }
+      current = record.cause
+    } else {
+      current = null
+    }
+    depth += 1
+  }
+
+  const serialized = JSON.stringify(diagnostic)
+  if (/relation "task_logs" does not exist/i.test(serialized)) {
+    diagnostic.remediation = 'Run `npm run db:migrate` from the web directory so the task_logs table exists.'
+  }
+
+  return diagnostic
+}
+
 export async function recordTaskLog(input: RecordTaskLogInput): Promise<typeof taskLogs.$inferSelect> {
   const createdAt = new Date()
   const [log] = await db
@@ -84,9 +127,8 @@ export async function recordTaskLogBestEffort(input: RecordTaskLogInput): Promis
   try {
     await recordTaskLog(input)
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
     console.warn('[task-logs] Failed to record task log', {
-      err: sanitizeWorkerMessage(message),
+      ...taskLogErrorDiagnostic(err),
       eventType: input.eventType,
       taskId: input.taskId,
     })
