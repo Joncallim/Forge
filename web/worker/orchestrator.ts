@@ -36,6 +36,8 @@ type ProjectRow = typeof projects.$inferSelect
 type AgentConfigRow = typeof agentConfigs.$inferSelect
 
 const ARCHITECT_AGENT = 'architect'
+const DEFAULT_ARCHITECT_GENERATION_TIMEOUT_MS = 180_000
+const DEFAULT_ARCHITECT_MAX_OUTPUT_TOKENS = 6000
 
 type PendingArchitectCheckpoint = Omit<ArchitectCheckpointInput, 'taskStatus'>
 
@@ -53,6 +55,28 @@ class ArchitectRunFailedError extends Error {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
+}
+
+function positiveIntegerEnv(name: string, defaultValue: number): number {
+  const raw = process.env[name]
+  if (!raw) return defaultValue
+
+  const parsed = Number(raw)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : defaultValue
+}
+
+function architectGenerationTimeoutMs(): number {
+  return positiveIntegerEnv(
+    'FORGE_ARCHITECT_GENERATION_TIMEOUT_MS',
+    DEFAULT_ARCHITECT_GENERATION_TIMEOUT_MS,
+  )
+}
+
+function architectMaxOutputTokens(): number {
+  return positiveIntegerEnv(
+    'FORGE_ARCHITECT_MAX_OUTPUT_TOKENS',
+    DEFAULT_ARCHITECT_MAX_OUTPUT_TOKENS,
+  )
 }
 
 function architectCheckpointFromError(err: unknown): PendingArchitectCheckpoint | null {
@@ -253,6 +277,7 @@ export function buildArchitectPrompt(
     '- Assign every implementation step to a configured agent using its [Display Name] tag when a suitable agent exists. If no configured agent fits, use a concise new specialist tag and make clear why a new agent should be added.',
     '- Prefer concrete, repository-specific guidance: name the actual files, directories, or modules the implementer should create or change. If the repository or canonical local folder above is configured, base actionable file references on it; if it is not, say so and keep paths illustrative. Treat any display folder as UI-only.',
     '- After the Markdown plan, append a fenced code block tagged exactly `agent_breakdown_json` containing a single JSON object of the shape `{"agents":[{"role":"Frontend","tasks":2,"summary":"Build task page UI and state handling","steps":["Build the task list component","Wire up state handling"],"reviewRequirement":"both"}]}`. Derive this from the [Role] assignments in the task breakdown. Each agent\'s `steps` should be a short array of 1-2 sentence imperative strings, one per individual task assigned to that agent — specific enough to stand alone, not just a restatement of `summary`. Use an empty array only if the plan truly assigns no worker tasks.',
+    '- Include at least one executable handoff agent in `agent_breakdown_json` for implementation, documentation, DevOps, Backend, Frontend, or another configured specialist when the task requires any follow-on work. Do not put only Architect, QA, or Reviewer in this block: those roles are planning/review gates and are not executable handoff packages.',
     '- For each implementation agent (not QA or Reviewer themselves), set `reviewRequirement` to the minimum review that work genuinely needs: `none` for trivial/low-risk changes (docs typos, config value tweaks), `qa_only` when functional verification matters but a human code review adds little, `reviewer_only` when code quality/design review matters but dedicated QA testing does not, or `both` for anything risky, security-sensitive, or touching shared/critical paths. Default to `both` when unsure.',
     '',
     'Capability classification:',
@@ -535,37 +560,62 @@ async function runArchitect(
       const displayLocalPath = project.localPath
         ? displayPathForWorkspacePath(workspace, project.localPath)
         : null
-      const result = streamText({
-        model,
-        system: config.systemPrompt,
-        prompt: buildArchitectPrompt(
-          task,
-          project,
-          specialistContext,
-          webResearchContext,
-          answeredQuestions,
-          previousPlan,
-          resumeCheckpoint,
-          configuredAgents,
-          displayLocalPath,
-          mcpOverview,
-        ),
-        temperature: 0.2,
-      })
-
-      for await (const delta of result.textStream) {
-        text += delta
-        await publishTaskEvent(task.id, 'run:chunk', {
-          runId: run.id,
-          delta,
+      const controller = new AbortController()
+      const timeoutMs = architectGenerationTimeoutMs()
+      const timeout = setTimeout(() => controller.abort(), timeoutMs)
+      try {
+        const result = streamText({
+          abortSignal: controller.signal,
+          maxOutputTokens: architectMaxOutputTokens(),
+          model,
+          system: config.systemPrompt,
+          prompt: buildArchitectPrompt(
+            task,
+            project,
+            specialistContext,
+            webResearchContext,
+            answeredQuestions,
+            previousPlan,
+            resumeCheckpoint,
+            configuredAgents,
+            displayLocalPath,
+            mcpOverview,
+          ),
+          temperature: 0.2,
         })
-      }
 
-      const streamUsage = await result.usage
-      usage = {
-        inputTokens: typeof streamUsage.inputTokens === 'number' ? streamUsage.inputTokens : null,
-        outputTokens: typeof streamUsage.outputTokens === 'number' ? streamUsage.outputTokens : null,
+        for await (const delta of result.textStream) {
+          text += delta
+          await publishTaskEvent(task.id, 'run:chunk', {
+            runId: run.id,
+            delta,
+          })
+        }
+
+        const finishReason = await result.finishReason
+        if (finishReason === 'length') {
+          throw new Error(
+            `Architect model stopped at the configured output limit (${architectMaxOutputTokens()} tokens) before producing a complete plan.`,
+          )
+        }
+
+        const streamUsage = await result.usage
+        usage = {
+          inputTokens: typeof streamUsage.inputTokens === 'number' ? streamUsage.inputTokens : null,
+          outputTokens: typeof streamUsage.outputTokens === 'number' ? streamUsage.outputTokens : null,
+        }
+      } catch (err) {
+        if (controller.signal.aborted) {
+          throw new Error(`Architect model generation timed out after ${timeoutMs}ms.`)
+        }
+        throw err
+      } finally {
+        clearTimeout(timeout)
       }
+    }
+
+    if (text.trim() === '') {
+      throw new Error('Architect model produced no output.')
     }
 
     const prepared = prepareArchitectArtifact(text, mcpOverview)

@@ -4,6 +4,7 @@ import { agentRuns, artifacts, taskQuestions, tasks } from '@/db/schema'
 import { asc, eq, inArray } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
+import type RedisClient from 'ioredis'
 
 // ---------------------------------------------------------------------------
 // SSE stream — GET /api/tasks/:id/runs
@@ -36,29 +37,63 @@ export async function GET(
 
   const stream = new ReadableStream({
     async start(controller) {
+      let closed = false
+      let heartbeat: ReturnType<typeof setInterval> | null = null
+      let maxAgeTimer: ReturnType<typeof setTimeout> | null = null
+      let sub: RedisClient | null = null
+
+      const cleanup = () => {
+        if (closed) return
+        closed = true
+        if (heartbeat !== null) {
+          clearInterval(heartbeat)
+        }
+        if (maxAgeTimer !== null) {
+          clearTimeout(maxAgeTimer)
+        }
+        sub?.disconnect()
+        try {
+          controller.close()
+        } catch {
+          // controller may already be closed
+        }
+      }
+
+      const enqueue = (line: string): boolean => {
+        if (closed) return false
+        try {
+          controller.enqueue(encoder.encode(line))
+          return true
+        } catch {
+          cleanup()
+          return false
+        }
+      }
+
       // persistAndSend: allocates a global monotonic sequence number, writes to the
       // sorted set using that number as the score, then enqueues the SSE line.
       // The score is the canonical event ID — Last-Event-ID from the client maps
       // directly to the sorted set score, so replay is exact.
       const persistAndSend = async (type: string, data: unknown) => {
+        if (closed) return
         const seq = await redis.incr(`forge:task:${taskId}:seq`)
         const line = `id: ${seq}\nevent: ${type}\ndata: ${JSON.stringify(data)}\n\n`
         redis
           .zadd(`forge:task:${taskId}:history`, seq, JSON.stringify({ type, data }))
           .then(() => redis.expire(`forge:task:${taskId}:history`, 86400))
           .catch((err) => console.error('SSE history write failed:', err))
-        controller.enqueue(encoder.encode(line))
+        enqueue(line)
       }
 
       // replaySend: enqueues the SSE line directly WITHOUT writing to the sorted set.
       // Used only during the replay loop to avoid re-persisting already-stored events.
       const replaySend = (seqId: number, type: string, data: unknown) => {
         const line = `id: ${seqId}\nevent: ${type}\ndata: ${JSON.stringify(data)}\n\n`
-        controller.enqueue(encoder.encode(line))
+        enqueue(line)
       }
 
       const sendSnapshotEvent = (type: string, data: unknown) => {
-        controller.enqueue(encoder.encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`))
+        enqueue(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`)
       }
 
       const sendCurrentSnapshot = async () => {
@@ -155,7 +190,7 @@ export async function GET(
         }
       }
 
-      controller.enqueue(encoder.encode('retry: 5000\n\n'))
+      enqueue('retry: 5000\n\n')
 
       // Replay missed events if Last-Event-ID was provided
       const lastId = parseInt(request.headers.get('last-event-id') ?? '0', 10)
@@ -181,28 +216,7 @@ export async function GET(
 
       // Create a DEDICATED subscriber client (cannot reuse the singleton for pub/sub)
       const { default: Redis } = await import('ioredis')
-      const sub = new Redis(process.env.REDIS_URL!)
-
-      let closed = false
-      let heartbeat: ReturnType<typeof setInterval> | null = null
-      let maxAgeTimer: ReturnType<typeof setTimeout> | null = null
-
-      const cleanup = () => {
-        if (closed) return
-        closed = true
-        if (heartbeat !== null) {
-          clearInterval(heartbeat)
-        }
-        if (maxAgeTimer !== null) {
-          clearTimeout(maxAgeTimer)
-        }
-        sub.disconnect()
-        try {
-          controller.close()
-        } catch {
-          // controller may already be closed
-        }
-      }
+      sub = new Redis(process.env.REDIS_URL!)
 
       try {
         await sub.subscribe(`forge:task:${taskId}`)
@@ -215,8 +229,11 @@ export async function GET(
       try {
         await sendCurrentSnapshot()
       } catch (err) {
-        console.error('[SSE /api/tasks/:id/runs] Error sending current snapshot', err)
+        if (!closed) {
+          console.error('[SSE /api/tasks/:id/runs] Error sending current snapshot', err)
+        }
       }
+      if (closed) return
 
       const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'rejected'])
 
@@ -227,7 +244,7 @@ export async function GET(
           const event = JSON.parse(message) as { type: string; status?: string }
           void persistAndSend(event.type, event).then(() => {
             if (event.type === 'task:status' && TERMINAL.has(event.status ?? '')) {
-              controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+              enqueue('data: [DONE]\n\n')
               cleanup()
             }
           }).catch((err) => {
@@ -245,12 +262,8 @@ export async function GET(
 
       heartbeat = setInterval(() => {
         if (closed) return
-        try {
-          // Heartbeats are ephemeral — enqueue directly without persisting
-          controller.enqueue(encoder.encode(`event: heartbeat\ndata: ${JSON.stringify({ ts: new Date().toISOString() })}\n\n`))
-        } catch {
-          cleanup()
-        }
+        // Heartbeats are ephemeral — enqueue directly without persisting
+        enqueue(`event: heartbeat\ndata: ${JSON.stringify({ ts: new Date().toISOString() })}\n\n`)
       }, 30_000)
 
       // Close cleanly before the connection gets old enough to risk the dev
@@ -261,11 +274,7 @@ export async function GET(
       // EventSource still auto-reconnects via Last-Event-ID either way.
       maxAgeTimer = setTimeout(() => {
         if (closed) return
-        try {
-          controller.enqueue(encoder.encode('event: stream:cycling\ndata: {}\n\n'))
-        } catch {
-          // controller may already be closed
-        }
+        enqueue('event: stream:cycling\ndata: {}\n\n')
         cleanup()
       }, MAX_CONNECTION_MS)
 

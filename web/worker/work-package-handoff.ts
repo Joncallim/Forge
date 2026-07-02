@@ -638,6 +638,7 @@ export async function handoffApprovedWorkPackages(
     `Forge handed off work package "${nextPackage.title}" to ${nextPackage.assignedRole}.`,
     '',
     'Repository writes and specialist model execution are disabled for this handoff slice.',
+    'Set FORGE_WORK_PACKAGE_EXECUTION=1 to run sandboxed specialist package execution after approval.',
   ].join('\n')
   const handoffArtifactMetadata = {
     repositoryWrites: false,

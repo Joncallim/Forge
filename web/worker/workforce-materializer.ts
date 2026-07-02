@@ -97,6 +97,16 @@ function titleForAgent(role: string): string {
   return trimmed === '' ? 'Specialist work package' : `${trimmed} work package`
 }
 
+function plannedRoleSummary(input: WorkforceMaterializationInput): string {
+  const roles = input.prepared.agents
+    .map((agent) => agent.role.trim())
+    .filter(Boolean)
+
+  return roles.length > 0
+    ? ` Planned roles: ${roles.join(', ')}.`
+    : ' The plan did not include any parsed agent_breakdown_json agents or [Role] handoff tags.'
+}
+
 function resolveCanonicalAgentType(
   role: string,
   activeAgents: MaterializerAgentCatalogRow[] | undefined,
@@ -381,6 +391,12 @@ export async function materializeWorkforceFromArchitectArtifact(
     .from(agentConfigs)
     .where(eq(agentConfigs.isActive, true))
   const rows = buildWorkforceMaterializationRows(input, { activeAgents })
+  if (rows.workPackages.length === 0) {
+    throw new Error(
+      'Architect plan did not produce any executable work packages. Assign at least one configured implementation, documentation, DevOps, Backend, Frontend, or other specialist handoff agent; Architect, QA, and Reviewer are planning/review gates, not executable handoff packages.' +
+      plannedRoleSummary(input),
+    )
+  }
 
   await db.transaction(async (tx) => {
     await tx

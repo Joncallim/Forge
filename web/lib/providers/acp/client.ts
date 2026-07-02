@@ -57,7 +57,7 @@ function startupError(agentId: string, method: string, err: unknown): Error {
     return new AcpStartupError(`ACP runtime "${agentId}" did not respond to ${method}. Make sure the underlying CLI is installed, authenticated, and able to start in the configured project folder.`)
   }
   if (/exited unexpectedly|process error/i.test(message)) {
-    return new AcpStartupError(`ACP runtime "${agentId}" could not start. Make sure the underlying CLI is installed, authenticated, and on PATH.`)
+    return new AcpStartupError(`ACP runtime "${agentId}" could not start. Make sure the underlying CLI is installed, authenticated, and on PATH. Details: ${message}`)
   }
   return new AcpStartupError(`ACP runtime "${agentId}" failed during ${method}: ${message}`)
 }

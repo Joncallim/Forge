@@ -20,6 +20,7 @@ const MAX_COMMAND_OUTPUT_BYTES = 16 * 1024
 const COMMAND_TIMEOUT_MS = 120_000
 const MAX_GENERATION_ATTEMPTS = 2
 const DEFAULT_GENERATION_TIMEOUT_MS = 120_000
+const DEFAULT_GENERATION_MAX_OUTPUT_TOKENS = 8000
 
 const ALLOWED_COMMANDS = new Set([
   'npm test',
@@ -113,6 +114,13 @@ function generationTimeoutMs(): number {
   if (!raw) return DEFAULT_GENERATION_TIMEOUT_MS
   const parsed = Number(raw)
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_GENERATION_TIMEOUT_MS
+}
+
+function generationMaxOutputTokens(): number {
+  const raw = process.env.FORGE_WORK_PACKAGE_MAX_OUTPUT_TOKENS
+  if (!raw) return DEFAULT_GENERATION_MAX_OUTPUT_TOKENS
+  const parsed = Number(raw)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_GENERATION_MAX_OUTPUT_TOKENS
 }
 
 function assertAllowedCommand(command: string[]): void {
@@ -339,11 +347,17 @@ async function generateValidatedExecutionPlan(input: {
     try {
       const generated = await generateText({
         abortSignal: controller.signal,
+        maxOutputTokens: generationMaxOutputTokens(),
         model: input.model,
         system: input.system,
         prompt,
         temperature: 0.1,
       })
+      if (generated.finishReason === 'length') {
+        throw new Error(
+          `Model generation stopped at the configured output limit (${generationMaxOutputTokens()} tokens) before producing a complete execution plan.`,
+        )
+      }
       text = generated.text
     } catch (err) {
       if (controller.signal.aborted) {

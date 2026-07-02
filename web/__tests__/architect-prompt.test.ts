@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
 
 vi.mock('@/db', () => ({ db: {} }))
 vi.mock('@/lib/providers/registry', () => ({ getProvider: vi.fn() }))
@@ -224,5 +226,43 @@ describe('buildArchitectPrompt checkpoint resume context', () => {
     expect(prompt).toContain('github.repository.search')
     expect(prompt).not.toContain('github.contents.write')
     expect(prompt).not.toContain('filesystem.project.write')
+  })
+
+  it('teaches Architect to include at least one executable handoff agent', () => {
+    const prompt = buildArchitectPrompt(
+      task,
+      project,
+      'Specialist context',
+      'Web context',
+      [],
+      null,
+      null,
+      [
+        {
+          id: 'agent-backend',
+          agentType: 'backend',
+          displayName: 'Backend',
+          description: 'Server work',
+          isSystem: true,
+          isActive: true,
+          providerConfigId: null,
+          systemPrompt: 'Implement backend work.',
+          frontmatterOverrides: null,
+          updatedAt: new Date('2026-06-24T00:00:00.000Z'),
+          updatedBy: null,
+        },
+      ],
+    )
+
+    expect(prompt).toContain('Include at least one executable handoff agent')
+    expect(prompt).toContain('Do not put only Architect, QA, or Reviewer')
+  })
+
+  it('bounds Architect streaming so local models cannot loop forever', () => {
+    const source = fs.readFileSync(path.join(process.cwd(), 'worker', 'orchestrator.ts'), 'utf8')
+
+    expect(source).toContain('FORGE_ARCHITECT_GENERATION_TIMEOUT_MS')
+    expect(source).toContain('FORGE_ARCHITECT_MAX_OUTPUT_TOKENS')
+    expect(source).toContain('maxOutputTokens: architectMaxOutputTokens()')
   })
 })

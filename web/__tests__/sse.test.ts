@@ -335,4 +335,29 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     const allText = lines.join('\n')
     expect(allText).toContain('[DONE]')
   }, 2000)
+
+  it('drops pub/sub messages after the client stream closes without logging controller errors', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const { GET } = await import('@/app/api/tasks/[id]/runs/route')
+      const params = Promise.resolve({ id: 'task-sse-1' })
+      const res = await GET(sseRequest() as never, { params })
+
+      const reader = res.body!.getReader()
+      await reader.read()
+      await reader.cancel()
+
+      state.mockSub?.emit(
+        'message',
+        'forge:task:task-sse-1',
+        JSON.stringify({ type: 'run:chunk', delta: 'late chunk' }),
+      )
+      await new Promise((resolve) => setTimeout(resolve, 20))
+
+      expect(errorSpy.mock.calls.flat().join('\n')).not.toContain('Error processing message')
+      expect(errorSpy.mock.calls.flat().join('\n')).not.toContain('Controller is already closed')
+    } finally {
+      errorSpy.mockRestore()
+    }
+  }, 2000)
 })

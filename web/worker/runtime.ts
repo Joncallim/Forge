@@ -94,6 +94,11 @@ async function startWorkerOnce(
     import('./orchestrator'),
   ])
   const { finishTaskAttempt, startTaskAttempt } = await import('./task-attempts')
+  const [{ db }, { tasks }, { eq }] = await Promise.all([
+    import('../db'),
+    import('../db/schema'),
+    import('drizzle-orm'),
+  ])
 
   const taskQueue = new TaskQueue()
   const approvalQueue = new ApprovalQueue()
@@ -117,6 +122,31 @@ async function startWorkerOnce(
   let providerHealthRunning = false
   let blockedHandoffSweepTimer: ReturnType<typeof setInterval> | null = null
   let blockedHandoffSweepRunning = false
+
+  const taskExists = async (taskId: string): Promise<boolean> => {
+    const [row] = await db
+      .select({ id: tasks.id })
+      .from(tasks)
+      .where(eq(tasks.id, taskId))
+      .limit(1)
+    return row !== undefined
+  }
+
+  const acknowledgeMissingTaskJob = async (
+    queueName: 'approval' | 'answers' | 'task',
+    taskId: string,
+    ack: () => Promise<void>,
+  ): Promise<boolean> => {
+    if (await taskExists(taskId)) return false
+
+    await ack()
+    console.info('[worker] Dropped job for deleted task', {
+      queueName,
+      taskId,
+      workerId,
+    })
+    return true
+  }
 
   const refreshProviderHealth = async (): Promise<void> => {
     if (providerHealthIntervalSeconds === 0 || providerHealthRunning) return
@@ -245,24 +275,32 @@ async function startWorkerOnce(
           let approvalAttemptId: string | null = null
           const finalAttempt = claimedApproval.job.attempt >= maxAttempts
           try {
-            approvalAttemptId = await startTaskAttempt({
-              attemptNumber: claimedApproval.job.attempt,
-              jobPayload: claimedApproval.job,
-              queueName: 'approvals',
-              taskId: claimedApproval.job.taskId,
-              workerId,
-            })
-            console.info('[worker] Processing approval', {
-              attempt: claimedApproval.job.attempt,
-              taskId: claimedApproval.job.taskId,
-              workerId,
-            })
-            await processApproval(claimedApproval.job.taskId, { finalAttempt })
-            if (approvalAttemptId) {
-              await finishTaskAttempt({ attemptId: approvalAttemptId, status: 'completed' })
+            if (await acknowledgeMissingTaskJob(
+              'approval',
+              claimedApproval.job.taskId,
+              () => approvalQueue.ack(claimedApproval.raw),
+            )) {
+              ackedApproval = true
+            } else {
+              approvalAttemptId = await startTaskAttempt({
+                attemptNumber: claimedApproval.job.attempt,
+                jobPayload: claimedApproval.job,
+                queueName: 'approvals',
+                taskId: claimedApproval.job.taskId,
+                workerId,
+              })
+              console.info('[worker] Processing approval', {
+                attempt: claimedApproval.job.attempt,
+                taskId: claimedApproval.job.taskId,
+                workerId,
+              })
+              await processApproval(claimedApproval.job.taskId, { finalAttempt })
+              if (approvalAttemptId) {
+                await finishTaskAttempt({ attemptId: approvalAttemptId, status: 'completed' })
+              }
+              await approvalQueue.ack(claimedApproval.raw)
+              ackedApproval = true
             }
-            await approvalQueue.ack(claimedApproval.raw)
-            ackedApproval = true
           } catch (err) {
             const message = errorMessage(err)
             const nextRetryAt = finalAttempt
@@ -322,24 +360,32 @@ async function startWorkerOnce(
           let answersAttemptId: string | null = null
           const finalAttempt = claimedAnswers.job.attempt >= maxAttempts
           try {
-            answersAttemptId = await startTaskAttempt({
-              attemptNumber: claimedAnswers.job.attempt,
-              jobPayload: claimedAnswers.job,
-              queueName: 'answers',
-              taskId: claimedAnswers.job.taskId,
-              workerId,
-            })
-            console.info('[worker] Processing answered questions', {
-              attempt: claimedAnswers.job.attempt,
-              taskId: claimedAnswers.job.taskId,
-              workerId,
-            })
-            await processAnsweredQuestions(claimedAnswers.job.taskId, { finalAttempt })
-            if (answersAttemptId) {
-              await finishTaskAttempt({ attemptId: answersAttemptId, status: 'completed' })
+            if (await acknowledgeMissingTaskJob(
+              'answers',
+              claimedAnswers.job.taskId,
+              () => answersQueue.ack(claimedAnswers.raw),
+            )) {
+              ackedAnswers = true
+            } else {
+              answersAttemptId = await startTaskAttempt({
+                attemptNumber: claimedAnswers.job.attempt,
+                jobPayload: claimedAnswers.job,
+                queueName: 'answers',
+                taskId: claimedAnswers.job.taskId,
+                workerId,
+              })
+              console.info('[worker] Processing answered questions', {
+                attempt: claimedAnswers.job.attempt,
+                taskId: claimedAnswers.job.taskId,
+                workerId,
+              })
+              await processAnsweredQuestions(claimedAnswers.job.taskId, { finalAttempt })
+              if (answersAttemptId) {
+                await finishTaskAttempt({ attemptId: answersAttemptId, status: 'completed' })
+              }
+              await answersQueue.ack(claimedAnswers.raw)
+              ackedAnswers = true
             }
-            await answersQueue.ack(claimedAnswers.raw)
-            ackedAnswers = true
           } catch (err) {
             const message = errorMessage(err)
             const nextRetryAt = finalAttempt
@@ -401,25 +447,33 @@ async function startWorkerOnce(
         let taskAttemptId: string | null = null
         try {
           const finalAttempt = claimedTask.job.attempt >= maxAttempts
-          taskAttemptId = await startTaskAttempt({
-            attemptNumber: claimedTask.job.attempt,
-            jobPayload: claimedTask.job,
-            queueName: 'tasks',
-            taskId: claimedTask.job.taskId,
-            workerId,
-          })
-          console.info('[worker] Processing task', {
-            attempt: claimedTask.job.attempt,
-            finalAttempt,
-            taskId: claimedTask.job.taskId,
-            workerId,
-          })
-          await processTask(claimedTask.job.taskId, { finalAttempt })
-          if (taskAttemptId) {
-            await finishTaskAttempt({ attemptId: taskAttemptId, status: 'completed' })
+          if (await acknowledgeMissingTaskJob(
+            'task',
+            claimedTask.job.taskId,
+            () => taskQueue.ack(claimedTask.raw),
+          )) {
+            ackedTask = true
+          } else {
+            taskAttemptId = await startTaskAttempt({
+              attemptNumber: claimedTask.job.attempt,
+              jobPayload: claimedTask.job,
+              queueName: 'tasks',
+              taskId: claimedTask.job.taskId,
+              workerId,
+            })
+            console.info('[worker] Processing task', {
+              attempt: claimedTask.job.attempt,
+              finalAttempt,
+              taskId: claimedTask.job.taskId,
+              workerId,
+            })
+            await processTask(claimedTask.job.taskId, { finalAttempt })
+            if (taskAttemptId) {
+              await finishTaskAttempt({ attemptId: taskAttemptId, status: 'completed' })
+            }
+            await taskQueue.ack(claimedTask.raw)
+            ackedTask = true
           }
-          await taskQueue.ack(claimedTask.raw)
-          ackedTask = true
         } catch (err) {
           const message = errorMessage(err)
           const finalAttempt = claimedTask.job.attempt >= maxAttempts

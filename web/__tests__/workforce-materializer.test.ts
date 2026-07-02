@@ -398,6 +398,16 @@ describe('workforce materializer', () => {
     expect(source).toContain("eq(workPackages.status, 'failed')")
   })
 
+  it('fails materialization instead of approving a plan with no executable packages', () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), 'worker', 'workforce-materializer.ts'),
+      'utf8',
+    )
+
+    expect(source).toContain('Architect plan did not produce any executable work packages')
+    expect(source).toContain('Architect, QA, and Reviewer are planning/review gates')
+  })
+
   it('keeps the materializer feature flag easy to disable', () => {
     expect(isWorkforceMaterializationEnabled({ FORGE_WORKFORCE_MATERIALIZATION: '0' })).toBe(false)
     expect(isWorkforceMaterializationEnabled({ FORGE_WORKFORCE_MATERIALIZATION: 'false' })).toBe(false)

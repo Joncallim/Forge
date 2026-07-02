@@ -164,6 +164,16 @@ describe('answered-question retry contract', () => {
     )
   })
 
+  it('acknowledges retry jobs for deleted tasks before writing attempt rows', () => {
+    const runtimeSource = fs.readFileSync(path.join(repoRoot, 'worker/runtime.ts'), 'utf8')
+
+    expect(runtimeSource).toContain('Dropped job for deleted task')
+    expect(runtimeSource).toContain('acknowledgeMissingTaskJob(')
+    expect(runtimeSource.indexOf('acknowledgeMissingTaskJob(')).toBeLessThan(
+      runtimeSource.indexOf('startTaskAttempt({'),
+    )
+  })
+
   it('restores answered rows and awaiting_answers status on retryable re-plan failure', async () => {
     const task = {
       id: 'task-answers',
