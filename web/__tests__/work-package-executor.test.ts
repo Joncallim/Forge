@@ -709,6 +709,51 @@ describe('executeWorkPackage', () => {
     expect(mocks.generateText).not.toHaveBeenCalled()
   })
 
+  it('preserves denied filesystem grant approval ids in blocked runtime audits', async () => {
+    const deniedGrantApprovalId = '00000000-0000-4000-8000-000000000777'
+
+    await expect(executeWorkPackage(context({
+      workPackage: {
+        ...context().workPackage,
+        assignedRole: 'backend',
+        mcpRequirements: [{
+          mcpId: 'filesystem',
+          requirement: 'required',
+          permissions: ['filesystem.project.read'],
+          reason: 'Read project files.',
+          fallback: { action: 'block' },
+        }],
+        metadata: {
+          mcpGrantPhases: {
+            effective: {
+              schemaVersion: 1,
+              phase: 'effective',
+              runtimeEnforcement: 'bounded_context_packet',
+              source: 'explicit-grant-approval',
+              status: 'denied',
+              grantApprovalId: deniedGrantApprovalId,
+              deniedCapabilities: ['filesystem.project.read'],
+            },
+          },
+        },
+      },
+    }))).rejects.toThrow(/Filesystem MCP context blocked/)
+
+    expect(mocks.generateText).not.toHaveBeenCalled()
+    expect(mocks.dbInsertValues).toHaveBeenCalledWith(expect.objectContaining({
+      grantApprovalId: deniedGrantApprovalId,
+      status: 'blocked',
+    }))
+    expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({
+        filesystemMcpRuntime: expect.objectContaining({
+          grantApprovalId: deniedGrantApprovalId,
+          status: 'blocked',
+        }),
+      }),
+    }))
+  })
+
   it('blocks filesystem runtime when approved grants do not cover all required capabilities', async () => {
     await fs.writeFile(path.join(tempRoot, 'README.md'), 'project context\n')
 

@@ -806,13 +806,14 @@ function effectiveFilesystemGrant(workPackage: WorkPackageRow): { capabilities: 
   const metadata = isRecord(workPackage.metadata) ? workPackage.metadata : {}
   const phases = metadataRecord(metadata, 'mcpGrantPhases')
   const effective = metadataRecord(phases, 'effective')
+  const grantApprovalId = filesystemEffectiveGrantApprovalId(effective)
   if (
     effective.schemaVersion !== 1 ||
     effective.phase !== 'effective' ||
     effective.runtimeEnforcement !== 'bounded_context_packet' ||
     effective.status !== 'approved'
   ) {
-    return { capabilities: [], grantApprovalId: null }
+    return { capabilities: [], grantApprovalId }
   }
   const capabilities = new Set<string>()
   for (const grant of promptRecordArray(effective.grants)) {
@@ -825,7 +826,7 @@ function effectiveFilesystemGrant(workPackage: WorkPackageRow): { capabilities: 
   }
   return {
     capabilities: [...capabilities].sort(),
-    grantApprovalId: filesystemEffectiveGrantApprovalId(effective),
+    grantApprovalId,
   }
 }
 

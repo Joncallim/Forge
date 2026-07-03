@@ -3,7 +3,7 @@ import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { and, eq, inArray, sql } from 'drizzle-orm'
 import { db } from '@/db'
-import { filesystemMcpGrantApprovals, projects, workPackages } from '@/db/schema'
+import { filesystemMcpGrantApprovals, projects, tasks, workPackages } from '@/db/schema'
 import { getSession } from '@/lib/session'
 import { getAccessibleTask } from '@/lib/task-access'
 import { getProjectMcpOverview } from '@/lib/mcps/manager'
@@ -102,6 +102,43 @@ function buildGrantPhases(input: {
     approved: isRecord(phases.approved) ? phases.approved : undefined,
     effective: input.effective,
   }
+}
+
+const EDITABLE_TASK_STATUSES = ['awaiting_approval', 'approved', 'failed'] as const
+const STANDARD_EDITABLE_PACKAGE_STATUSES = ['pending', 'ready', 'blocked', 'needs_rework'] as const
+
+function hasFilesystemGrantSurface(pkg: typeof workPackages.$inferSelect): boolean {
+  const summary = summarizeFilesystemCapabilities({
+    mcpRequirements: pkg.mcpRequirements,
+    metadata: pkg.metadata,
+  })
+  const phases = existingPhases(pkg.metadata)
+  const effective = isRecord(phases.effective) ? phases.effective : {}
+  return summary.requestedCapabilities.length > 0 || filesystemEffectiveGrantApprovalId(effective) !== null
+}
+
+function canEditPackageGrant(input: {
+  pkg: typeof workPackages.$inferSelect
+  taskStatus: string
+}): boolean {
+  if (
+    (input.taskStatus === 'awaiting_approval' || input.taskStatus === 'approved') &&
+    STANDARD_EDITABLE_PACKAGE_STATUSES.includes(input.pkg.status as typeof STANDARD_EDITABLE_PACKAGE_STATUSES[number])
+  ) {
+    return true
+  }
+  return input.taskStatus === 'failed' && input.pkg.status === 'failed' && hasFilesystemGrantSurface(input.pkg)
+}
+
+function packageUpdateStatus(input: {
+  decision: 'approved' | 'denied'
+  pkg: typeof workPackages.$inferSelect
+  taskStatus: string
+}): { blockedReason?: string | null; status?: string } {
+  if (input.taskStatus !== 'failed' || input.pkg.status !== 'failed') return {}
+  return input.decision === 'approved'
+    ? { blockedReason: null, status: 'ready' }
+    : { blockedReason: 'Filesystem grant denied by operator; execution remains blocked.', status: 'blocked' }
 }
 
 function filesystemStatusError(overview: Awaited<ReturnType<typeof getProjectMcpOverview>>): string | null {
@@ -205,9 +242,9 @@ export async function PUT(
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })
     }
-    if (task.status !== 'awaiting_approval' && task.status !== 'approved') {
+    if (!EDITABLE_TASK_STATUSES.includes(task.status as typeof EDITABLE_TASK_STATUSES[number])) {
       return NextResponse.json(
-        { error: `Cannot edit filesystem grants while task status is '${task.status}'. Edit grants before execution starts.` },
+        { error: `Cannot edit filesystem grants while task status is '${task.status}'. Edit grants before execution starts or from a failed filesystem-grant recovery state.` },
         { status: 409 },
       )
     }
@@ -245,7 +282,7 @@ export async function PUT(
     if (packageRows.length !== requestedPackageIds.length) {
       return NextResponse.json({ error: 'One or more work packages do not belong to this task.' }, { status: 404 })
     }
-    const lockedPackages = packageRows.filter((pkg) => !['pending', 'ready', 'blocked', 'needs_rework'].includes(pkg.status))
+    const lockedPackages = packageRows.filter((pkg) => !canEditPackageGrant({ pkg, taskStatus: task.status }))
     if (lockedPackages.length > 0) {
       return NextResponse.json(
         { error: `Cannot edit filesystem grants for packages already in ${lockedPackages.map((pkg) => `'${pkg.status}'`).join(', ')} status.` },
@@ -331,16 +368,21 @@ export async function PUT(
           .where(eq(filesystemMcpGrantApprovals.id, approval.id))
           .returning()
 
+        const recoveryStatus = packageUpdateStatus({ decision: grant.decision, pkg, taskStatus: task.status })
+        const updateableStatuses = recoveryStatus.status
+          ? ['failed']
+          : [...STANDARD_EDITABLE_PACKAGE_STATUSES]
         const [updatedPackage] = await tx
           .update(workPackages)
           .set({
+            ...recoveryStatus,
             metadata: sql`jsonb_set(${workPackages.metadata}, '{mcpGrantPhases}', ${JSON.stringify(phases)}::jsonb, true)`,
             updatedAt: now,
           })
           .where(and(
             eq(workPackages.id, pkg.id),
             eq(workPackages.taskId, taskId),
-            inArray(workPackages.status, ['pending', 'ready', 'blocked', 'needs_rework']),
+            inArray(workPackages.status, updateableStatuses),
           ))
           .returning()
         if (!updatedPackage) {
@@ -348,6 +390,12 @@ export async function PUT(
         }
 
         states.push(grantStateForPackage({ approval: updatedApproval, pkg: updatedPackage }))
+      }
+      if (task.status === 'failed') {
+        await tx
+          .update(tasks)
+          .set({ errorMessage: null, status: 'approved', updatedAt: now })
+          .where(and(eq(tasks.id, taskId), eq(tasks.status, 'failed')))
       }
       return states
     })
