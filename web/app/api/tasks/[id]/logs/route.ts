@@ -10,7 +10,7 @@ import { taskLogsUnavailableMessage } from '@/lib/task-log-db-errors'
 
 const MAX_LIMIT = 250
 
-export function parseLimit(value: string | null): number {
+function parseLimit(value: string | null): number {
   // An absent/empty param must fall back to the default; `Number(null)` and
   // `Number('')` are 0 (a valid integer), which would otherwise clamp to 1.
   if (value === null || value.trim() === '') return 100
