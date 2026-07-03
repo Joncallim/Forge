@@ -12,6 +12,60 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+function recordArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => isRecord(item))
+    : []
+}
+
+function approvedStatusForGrant(status: unknown): string {
+  return typeof status === 'string' ? status : 'unknown'
+}
+
+function buildApprovedPackageGrantPhases(input: {
+  approvedAt: Date
+  approvedBy: string
+  metadata: unknown
+}): Record<string, unknown> {
+  const metadata = isRecord(input.metadata) ? input.metadata : {}
+  const existingPhases = isRecord(metadata.mcpGrantPhases) ? metadata.mcpGrantPhases : {}
+  const proposedGrants = recordArray(metadata.mcpGrants)
+  const approvedGrants = proposedGrants.map((grant) => ({
+    ...grant,
+    approvedAt: input.approvedAt.toISOString(),
+    approvedBy: input.approvedBy,
+    sourceStatus: typeof grant.status === 'string' ? grant.status : null,
+    status: approvedStatusForGrant(grant.status),
+  }))
+  const effectiveGrants: Record<string, unknown>[] = []
+
+  return {
+    ...existingPhases,
+    schemaVersion: 1,
+    proposed: Array.isArray(existingPhases.proposed) ? existingPhases.proposed : proposedGrants,
+    approved: {
+      schemaVersion: 1,
+      phase: 'approved',
+      approvedAt: input.approvedAt.toISOString(),
+      approvedBy: input.approvedBy,
+      grants: approvedGrants,
+      runtimeIssued: false,
+      runtimeEnforcement: 'approved_snapshot',
+      note: 'Plan approval converted proposed MCP grant decisions into package-local approved grants. Runtime context is issued later by the work-package executor from the effective grant phase.',
+    },
+    effective: {
+      schemaVersion: 1,
+      phase: 'effective',
+      source: 'task-approval',
+      grants: effectiveGrants,
+      runtimeIssued: false,
+      runtimeEnforcement: 'approved_snapshot',
+      status: effectiveGrants.length > 0 ? 'ready' : 'not_issued',
+      note: 'Task plan approval does not convert Architect-proposed MCP grants into runtime-effective grants. Effective grants must come from an explicit grant approval path before bounded runtime context can be issued.',
+    },
+  }
+}
+
 function buildApprovedGrantSnapshot(input: {
   approvedAt: Date
   approvedBy: string
@@ -29,15 +83,24 @@ function buildApprovedGrantSnapshot(input: {
     approvedAt: input.approvedAt.toISOString(),
     approvedBy: input.approvedBy,
     runtimeIssued: false,
-    runtimeEnforcement: 'not_implemented',
-    note: 'Plan approval records a non-runtime MCP/capability grant snapshot only; Forge beta does not issue live MCP tools from this approval.',
+    runtimeEnforcement: 'approved_snapshot',
+    note: 'Plan approval records package-local approved/effective MCP grant snapshots. Forge beta may issue bounded read-only filesystem context packets during package execution, but does not issue live MCP tool handles from this approval.',
     packages: input.packages.map((pkg) => {
       const metadata = isRecord(pkg.metadata) ? pkg.metadata : {}
+      const mcpGrantPhases = buildApprovedPackageGrantPhases({
+        approvedAt: input.approvedAt,
+        approvedBy: input.approvedBy,
+        metadata,
+      })
+      const approved = isRecord(mcpGrantPhases.approved) ? mcpGrantPhases.approved : {}
+      const effective = isRecord(mcpGrantPhases.effective) ? mcpGrantPhases.effective : {}
       return {
         workPackageId: pkg.id,
         title: pkg.title,
         assignedRole: pkg.assignedRole,
         proposedGrants: Array.isArray(metadata.mcpGrants) ? metadata.mcpGrants : [],
+        approvedGrants: Array.isArray(approved.grants) ? approved.grants : [],
+        effectiveGrants: Array.isArray(effective.grants) ? effective.grants : [],
         proposedRequirements: Array.isArray(pkg.mcpRequirements) ? pkg.mcpRequirements : [],
         promptOverlayPresent: typeof metadata.promptOverlay === 'string' && metadata.promptOverlay.trim() !== '',
       }
@@ -102,6 +165,21 @@ export async function POST(
         packages: packageRows,
       })
 
+      for (const pkg of packageRows) {
+        const phases = buildApprovedPackageGrantPhases({
+          approvedAt,
+          approvedBy: session.userId,
+          metadata: pkg.metadata,
+        })
+        await tx
+          .update(workPackages)
+          .set({
+            metadata: sql`jsonb_set(${workPackages.metadata}, '{mcpGrantPhases}', ${JSON.stringify(phases)}::jsonb, true)`,
+            updatedAt: approvedAt,
+          })
+          .where(eq(workPackages.id, pkg.id))
+      }
+
       const gates = await tx
         .update(approvalGates)
         .set({
@@ -118,9 +196,9 @@ export async function POST(
                 schemaVersion: 1,
                 phase: 'effective',
                 runtimeIssued: false,
-                runtimeEnforcement: 'not_implemented',
-                status: 'not_issued',
-                note: 'Effective run instructions remain prompt/context metadata only; Forge beta does not issue live MCP runtime tools.',
+                runtimeEnforcement: 'approved_snapshot',
+                status: 'package_scoped',
+                note: 'Effective MCP grants are persisted on each work package. The executor may issue bounded read-only filesystem context packets from those package snapshots; live MCP tools remain disabled.',
               },
             },
           })}::jsonb`,

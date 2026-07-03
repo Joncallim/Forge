@@ -6,28 +6,14 @@ import {
   parseMcpExecutionDesign,
   validateMcpExecutionDesign,
 } from '@/worker/mcp-execution-design'
+import { MCP_CATALOG } from '@/lib/mcps/catalog'
 import type { ProjectMcpOverview } from '@/lib/mcps/types'
 
 function overview(statuses: ProjectMcpOverview['statuses']): ProjectMcpOverview {
   return {
     projectId: 'project-1',
     config: { profile: 'default', requiredMcps: ['filesystem', 'github'], overrides: {} },
-    catalog: [
-      {
-        id: 'filesystem',
-        displayName: 'Filesystem',
-        description: 'Filesystem MCP',
-        recommended: true,
-        requiresAuth: false,
-      },
-      {
-        id: 'github',
-        displayName: 'GitHub',
-        description: 'GitHub MCP',
-        recommended: true,
-        requiresAuth: true,
-      },
-    ],
+    catalog: Object.values(MCP_CATALOG),
     mcpsRoot: '/tmp/forge/mcps',
     statuses,
     summary: {

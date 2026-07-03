@@ -10,6 +10,7 @@ import { getModel, getProvider } from '../lib/providers/registry'
 import { resolveDefaultProvider } from '../lib/providers/default'
 import { assertProjectLocalPathForExecution } from '../lib/projects/local-path'
 import {
+  buildEmptyExecutionContextPacket,
   buildExecutionContextPacket,
   executionContextPacketMetadata,
   formatExecutionContextPacket,
@@ -792,6 +793,173 @@ function promptRecordArray(value: unknown): Record<string, unknown>[] {
     : []
 }
 
+function normalizeCapability(capability: string): string {
+  return capability.trim().toLowerCase().replace(/\s+/g, '_')
+}
+
+function filesystemCapabilityAlias(capability: string): string | null {
+  const normalized = normalizeCapability(capability)
+  const match = normalized.match(/^filesystem\.(?:project\.)?(read|list|search)$/)
+  return match ? `filesystem.project.${match[1]}` : null
+}
+
+function metadataRecord(value: unknown, key: string): Record<string, unknown> {
+  return isRecord(value) && isRecord(value[key]) ? value[key] : {}
+}
+
+function requestedFilesystemCapabilities(workPackage: WorkPackageRow): string[] {
+  const capabilities = new Set<string>()
+  for (const requirement of promptRecordArray(workPackage.mcpRequirements)) {
+    if (cleanPromptText(requirement.mcpId, 80) !== 'filesystem') continue
+    for (const capability of mcpCapabilityList(requirement)) {
+      const alias = filesystemCapabilityAlias(capability)
+      if (alias) capabilities.add(alias)
+    }
+  }
+  const metadata = isRecord(workPackage.metadata) ? workPackage.metadata : {}
+  for (const subtask of promptRecordArray(metadata.mcpAwareSubtasks)) {
+    for (const capability of cleanPromptTextArray(subtask.mcpCapabilities, 20, 100)) {
+      const alias = filesystemCapabilityAlias(capability)
+      if (alias) capabilities.add(alias)
+    }
+  }
+  return [...capabilities].sort()
+}
+
+function fallbackAction(value: unknown): string {
+  return isRecord(value) ? cleanPromptText(value.action, 80) : ''
+}
+
+function blockingFilesystemCapabilities(workPackage: WorkPackageRow): string[] {
+  const capabilities = new Set<string>()
+  for (const requirement of promptRecordArray(workPackage.mcpRequirements)) {
+    if (cleanPromptText(requirement.mcpId, 80) !== 'filesystem') continue
+    if (requirement.requirement === 'optional' && fallbackAction(requirement.fallback) === 'continue_without_mcp') {
+      continue
+    }
+    for (const capability of mcpCapabilityList(requirement)) {
+      const alias = filesystemCapabilityAlias(capability)
+      if (alias) capabilities.add(alias)
+    }
+  }
+  return [...capabilities].sort()
+}
+
+function effectiveFilesystemCapabilities(workPackage: WorkPackageRow): string[] {
+  const metadata = isRecord(workPackage.metadata) ? workPackage.metadata : {}
+  const phases = metadataRecord(metadata, 'mcpGrantPhases')
+  const effective = metadataRecord(phases, 'effective')
+  if (
+    effective.schemaVersion !== 1 ||
+    effective.phase !== 'effective' ||
+    effective.runtimeEnforcement !== 'bounded_context_packet' ||
+    effective.status !== 'approved'
+  ) {
+    return []
+  }
+  const capabilities = new Set<string>()
+  for (const grant of promptRecordArray(effective.grants)) {
+    if (cleanPromptText(grant.mcpId, 80) !== 'filesystem') continue
+    if (cleanPromptText(grant.status, 80) !== 'approved') continue
+    for (const capability of mcpCapabilityList(grant)) {
+      const alias = filesystemCapabilityAlias(capability)
+      if (alias) capabilities.add(alias)
+    }
+  }
+  return [...capabilities].sort()
+}
+
+function filesystemRuntimeMetadata(workPackage: WorkPackageRow): Record<string, unknown> {
+  const capabilities = effectiveFilesystemCapabilities(workPackage)
+  const requestedCapabilities = requestedFilesystemCapabilities(workPackage)
+  const blockingCapabilities = blockingFilesystemCapabilities(workPackage)
+  const missingRequestedCapabilities = capabilities.length > 0
+    ? requestedCapabilities.filter((capability) => !capabilities.includes(capability))
+    : []
+  const missingBlockingCapabilities = blockingCapabilities.filter((capability) => !capabilities.includes(capability))
+  if (missingRequestedCapabilities.length > 0) {
+    return {
+      schemaVersion: 1,
+      capabilitySource: 'approved-work-package-mcp-grant-phases',
+      blockingCapabilities,
+      capabilities,
+      missingRequestedCapabilities,
+      requestedCapabilities,
+      reason: `Filesystem capabilities were requested by the plan but not covered by approved effective grants: ${missingRequestedCapabilities.join(', ')}.`,
+      runtimeIssued: false,
+      runtimeEnforcement: 'bounded_context_packet',
+      status: 'blocked',
+    }
+  }
+  if (missingBlockingCapabilities.length > 0) {
+    return {
+      schemaVersion: 1,
+      capabilitySource: 'approved-work-package-mcp-grant-phases',
+      blockingCapabilities,
+      capabilities,
+      missingBlockingCapabilities,
+      requestedCapabilities,
+      reason: `Filesystem capabilities were required by the plan but not covered by approved effective grants: ${missingBlockingCapabilities.join(', ')}.`,
+      runtimeIssued: false,
+      runtimeEnforcement: 'bounded_context_packet',
+      status: 'blocked',
+    }
+  }
+  if (capabilities.length > 0 && !capabilities.includes('filesystem.project.read')) {
+    return {
+      schemaVersion: 1,
+      capabilitySource: 'approved-work-package-mcp-grant-phases',
+      blockingCapabilities,
+      capabilities,
+      requestedCapabilities,
+      reason: 'Bounded filesystem context packets include file contents and require an approved filesystem.project.read grant.',
+      runtimeIssued: false,
+      runtimeEnforcement: 'bounded_context_packet',
+      status: 'blocked',
+    }
+  }
+  if (capabilities.length === 0 && blockingCapabilities.length > 0) {
+    return {
+      schemaVersion: 1,
+      capabilitySource: 'approved-work-package-mcp-grant-phases',
+      blockingCapabilities,
+      requestedCapabilities,
+      reason: 'Filesystem capabilities were requested by the plan, but no non-blocked package-local effective grant was approved.',
+      runtimeIssued: false,
+      runtimeEnforcement: 'bounded_context_packet',
+      status: 'blocked',
+    }
+  }
+  if (capabilities.length === 0 && requestedCapabilities.length > 0) {
+    return {
+      schemaVersion: 1,
+      capabilitySource: 'approved-work-package-mcp-grant-phases',
+      requestedCapabilities,
+      reason: 'Filesystem capabilities were requested as optional continue-without-MCP access; no approved effective filesystem grant was issued.',
+      runtimeIssued: false,
+      runtimeEnforcement: 'bounded_context_packet',
+      status: 'not_issued_optional',
+    }
+  }
+  if (capabilities.length === 0) {
+    return {
+      schemaVersion: 1,
+      runtimeIssued: false,
+      runtimeEnforcement: 'not_requested',
+      status: 'not_requested',
+    }
+  }
+  return {
+    schemaVersion: 1,
+    capabilitySource: 'approved-work-package-mcp-grant-phases',
+    capabilities,
+    mode: 'read_only_context_packet',
+    runtimeIssued: true,
+    runtimeEnforcement: 'bounded_context_packet',
+    status: 'issued',
+  }
+}
+
 export function isArchitectReservedExecutionRole(role: string): boolean {
   return ['architect', 'security', 'security-review', 'security_review'].includes(role.trim().toLowerCase())
 }
@@ -844,13 +1012,16 @@ function buildRunScopedMcpPromptLines(workPackage: WorkPackageRow): string[] {
   const promptOverlay = cleanPromptText(metadata.promptOverlay, 2_000)
   const requirements = promptRecordArray(workPackage.mcpRequirements)
   const subtasks = promptRecordArray(metadata.mcpAwareSubtasks)
+  const filesystemCapabilities = effectiveFilesystemCapabilities(workPackage)
 
   if (promptOverlay === '' && requirements.length === 0 && subtasks.length === 0) return []
 
   const lines = [
     'Run-scoped MCP/capability instructions:',
     '- These instructions are the effective planning snapshot for this work-package run. They do not modify the permanent agent system prompt or future runs.',
-    '- Forge beta execution does not issue live MCP runtime tools from this snapshot; treat MCP grants and overlays as planning-only context.',
+    filesystemCapabilities.length > 0
+      ? `- Forge issued a bounded read-only filesystem context packet for approved capabilities: ${filesystemCapabilities.join(', ')}. This is not a live tool handle and cannot write files.`
+      : '- Forge beta execution does not issue live MCP runtime tools from this snapshot; treat MCP grants and overlays as planning-only context.',
     '- Forge execution remains sandbox-only; do not assume credentials, host repository writes, or external services are available.',
   ]
 
@@ -1030,9 +1201,33 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
     throw new Error('Execution attempt number must be a positive integer.')
   }
 
-  const hostExecutionContext = context.hostExecutionContext ?? await buildExecutionContextPacket(hostProjectRoot)
+  const filesystemRuntime = filesystemRuntimeMetadata(context.workPackage)
+  if (filesystemRuntime.status === 'blocked') {
+    await recordTaskLogBestEffort({
+      agentRunId: context.agentRunId ?? null,
+      eventType: 'mcp.filesystem.context_blocked',
+      level: 'warning',
+      message: `Filesystem context was blocked for "${context.workPackage.title}": ${cleanPromptText(filesystemRuntime.reason, 600) || 'no approved effective filesystem grant.'}`,
+      metadata: {
+        attemptNumber,
+        filesystemMcpRuntime: filesystemRuntime,
+        workPackageId: context.workPackage.id,
+      },
+      source: 'mcp',
+      taskId: context.task.id,
+      title: 'Filesystem context blocked',
+      workPackageId: context.workPackage.id,
+    })
+    throw new Error(`Filesystem MCP context blocked for "${context.workPackage.title}": ${cleanPromptText(filesystemRuntime.reason, 600) || 'no approved effective filesystem grant.'}`)
+  }
+  const hostExecutionContext = filesystemRuntime.runtimeIssued === true
+    ? context.hostExecutionContext ?? await buildExecutionContextPacket(hostProjectRoot)
+    : buildEmptyExecutionContextPacket(hostProjectRoot)
   const executionContextArtifactContent = formatExecutionContextPacketSummary(hostExecutionContext)
-  const executionContextArtifactMetadata = executionContextPacketMetadata(hostExecutionContext)
+  const executionContextArtifactMetadata = {
+    ...executionContextPacketMetadata(hostExecutionContext),
+    filesystemMcpRuntime: filesystemRuntime,
+  }
   const sandboxRoot = await prepareSandboxRoot(hostProjectRoot, context.task.id, context.workPackage.id, attemptNumber)
   try {
     const providerConfigId = context.providerConfigId ?? null
@@ -1044,6 +1239,24 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
     if (!model) throw new Error(`Provider config ${providerConfigId ?? '(unknown)'} is missing or inactive.`)
     const system = context.agentConfig?.systemPrompt || defaultSystemPrompt(context.workPackage.assignedRole)
     const providerConnector = context.providerConnector ?? context.providerConfigId ?? 'unknown-provider'
+    if (filesystemRuntime.runtimeIssued === true) {
+      await recordTaskLogBestEffort({
+        agentRunId: context.agentRunId ?? null,
+        eventType: 'mcp.filesystem.context_issued',
+        level: 'info',
+        message: `Issued bounded read-only filesystem context for "${context.workPackage.title}".`,
+        metadata: {
+          attemptNumber,
+          filesystemMcpRuntime: filesystemRuntime,
+          totals: hostExecutionContext.totals,
+          workPackageId: context.workPackage.id,
+        },
+        source: 'mcp',
+        taskId: context.task.id,
+        title: 'Filesystem context issued',
+        workPackageId: context.workPackage.id,
+      })
+    }
     const prompt = buildExecutionPrompt({
       attemptNumber,
       hostExecutionContext,

@@ -301,6 +301,10 @@ function emptyPacket(root: string): ExecutionContextPacket {
   }
 }
 
+export function buildEmptyExecutionContextPacket(projectRoot: string): ExecutionContextPacket {
+  return emptyPacket(path.resolve(projectRoot))
+}
+
 function recordOmission(
   packet: ExecutionContextPacket,
   bucket: OmittedBucketKey,

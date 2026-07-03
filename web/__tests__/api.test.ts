@@ -66,9 +66,11 @@ const mockRedisSet = vi.fn()
 const mockRedisZadd = vi.fn()
 const mockRedisExpire = vi.fn()
 const mockRedisPublish = vi.fn()
+const mockRedisDel = vi.fn()
 
 vi.mock('@/lib/redis', () => ({
   redis: {
+    del: mockRedisDel,
     lpush: mockRedisLpush,
     set: mockRedisSet,
     zadd: mockRedisZadd,
@@ -1886,11 +1888,17 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
       const body = await res.json()
       const statuses = body.overview.statuses as Array<{ mcpId: string; installState: string; status: string }>
       expect(statuses.find((status) => status.mcpId === 'filesystem')).toMatchObject({
+        installerAgentType: 'mcp-installer',
         installState: 'installed',
         status: 'healthy',
       })
       expect(statuses.find((status) => status.mcpId === 'github')).toMatchObject({
+        installerAgentType: 'mcp-installer',
         installState: 'installed',
+        remediation: expect.objectContaining({
+          agentType: 'mcp-installer',
+          action: expect.stringMatching(/Connect GitHub/),
+        }),
         status: 'auth_required',
       })
       await expect(fs.stat(path.join(workspaceRoot, 'mcps', 'filesystem', 'forge.mcp.json'))).resolves.toMatchObject({})
@@ -1927,6 +1935,10 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
       })
       expect(body.overview.statuses.find((status: { mcpId: string }) => status.mcpId === 'github')).toMatchObject({
         installState: 'missing',
+        remediation: expect.objectContaining({
+          agentType: 'mcp-installer',
+          action: expect.stringMatching(/install the GitHub catalog manifest/),
+        }),
       })
       await expect(fs.stat(path.join(workspaceRoot, 'mcps', 'filesystem', 'forge.mcp.json'))).resolves.toMatchObject({})
       await expect(fs.stat(path.join(workspaceRoot, 'mcps', 'github', 'forge.mcp.json'))).rejects.toMatchObject({
@@ -2006,6 +2018,10 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
       expect(disabledRes.status).toBe(200)
       expect((await disabledRes.json()).overview.statuses[0]).toMatchObject({
         installState: 'installed',
+        remediation: expect.objectContaining({
+          agentType: 'mcp-installer',
+          action: expect.stringMatching(/Enable the filesystem MCP/),
+        }),
         status: 'disabled',
       })
 
@@ -2029,6 +2045,10 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
       expect(unhealthyRes.status).toBe(200)
       expect((await unhealthyRes.json()).overview.statuses[0]).toMatchObject({
         installState: 'installed',
+        remediation: expect.objectContaining({
+          agentType: 'mcp-installer',
+          action: expect.stringMatching(/verify the GitHub manifest/),
+        }),
         status: 'unhealthy',
       })
 
@@ -2048,6 +2068,10 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
       expect(configRes.status).toBe(200)
       expect((await configRes.json()).overview.statuses[0]).toMatchObject({
         installState: 'installed',
+        remediation: expect.objectContaining({
+          agentType: 'mcp-installer',
+          action: expect.stringMatching(/Set a valid project local path/),
+        }),
         status: 'configuration_required',
       })
     })
@@ -2615,6 +2639,21 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
           decisionId: 'grant-1',
           mcpId: 'github',
           status: 'proposed',
+        }, {
+          decisionId: 'grant-warning',
+          mcpId: 'filesystem',
+          status: 'warning',
+          capabilities: ['filesystem.project.read'],
+        }, {
+          decisionId: 'grant-blocked',
+          mcpId: 'filesystem',
+          status: 'blocked',
+          capabilities: ['filesystem.project.search'],
+        }, {
+          decisionId: 'grant-malformed-approved',
+          mcpId: 'filesystem',
+          status: 'approved',
+          capabilities: ['filesystem.project.read'],
         }],
         promptOverlay: 'Use GitHub read tools only.',
       },
@@ -2626,6 +2665,8 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     }
     const taskUpdate = chain([approvedTask])
     taskUpdate.set = vi.fn(() => taskUpdate)
+    const packageUpdate = chain([{ id: 'pkg-1' }])
+    packageUpdate.set = vi.fn(() => packageUpdate)
     const gateUpdate = chain([{ id: 'gate-1' }])
     gateUpdate.set = vi.fn(() => gateUpdate)
     mockDbSelect
@@ -2633,6 +2674,7 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       .mockReturnValueOnce(chain([workPackageRow]))
     mockDbUpdate
       .mockReturnValueOnce(taskUpdate)
+      .mockReturnValueOnce(packageUpdate)
       .mockReturnValueOnce(gateUpdate)
     mockRedisLpush.mockResolvedValue(1)
     mockRedisPublish.mockResolvedValue(1)
@@ -2643,7 +2685,47 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     })
 
     expect(res.status).toBe(200)
-    expect(mockDbUpdate).toHaveBeenCalledTimes(2)
+    expect(mockDbUpdate).toHaveBeenCalledTimes(3)
+    const packageSetMock = packageUpdate.set as unknown as { mock: { calls: Array<[{ metadata?: { queryChunks?: unknown[] } }]> } }
+    const packageSetPayload = packageSetMock.mock.calls[0][0]
+    const packageGrantPhasesJson = packageSetPayload.metadata?.queryChunks
+      ?.find((chunk): chunk is string => typeof chunk === 'string' && chunk.includes('"phase":"approved"'))
+    expect(packageGrantPhasesJson).toBeDefined()
+    expect(JSON.parse(packageGrantPhasesJson as string)).toMatchObject({
+      schemaVersion: 1,
+      approved: {
+        phase: 'approved',
+        runtimeEnforcement: 'approved_snapshot',
+        grants: expect.arrayContaining([expect.objectContaining({
+          decisionId: 'grant-1',
+          mcpId: 'github',
+          sourceStatus: 'proposed',
+          status: 'proposed',
+        }), expect.objectContaining({
+          decisionId: 'grant-warning',
+          mcpId: 'filesystem',
+          sourceStatus: 'warning',
+          status: 'warning',
+        }), expect.objectContaining({
+          decisionId: 'grant-blocked',
+          mcpId: 'filesystem',
+          sourceStatus: 'blocked',
+          status: 'blocked',
+        }), expect.objectContaining({
+          decisionId: 'grant-malformed-approved',
+          mcpId: 'filesystem',
+          sourceStatus: 'approved',
+          status: 'approved',
+        })]),
+      },
+      effective: {
+        phase: 'effective',
+        runtimeEnforcement: 'approved_snapshot',
+        source: 'task-approval',
+        status: 'not_issued',
+        grants: [],
+      },
+    })
     expect(gateUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
       decidedBy: FAKE_SESSION.userId,
       status: 'approved',
@@ -2662,7 +2744,7 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
         approved: {
           phase: 'approved',
           runtimeIssued: false,
-          runtimeEnforcement: 'not_implemented',
+          runtimeEnforcement: 'approved_snapshot',
           packages: [{
             workPackageId: 'pkg-1',
             assignedRole: 'backend',
@@ -2670,7 +2752,41 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
               decisionId: 'grant-1',
               mcpId: 'github',
               status: 'proposed',
+            }, {
+              decisionId: 'grant-warning',
+              mcpId: 'filesystem',
+              status: 'warning',
+            }, {
+              decisionId: 'grant-blocked',
+              mcpId: 'filesystem',
+              status: 'blocked',
+            }, {
+              decisionId: 'grant-malformed-approved',
+              mcpId: 'filesystem',
+              status: 'approved',
             }],
+            approvedGrants: expect.arrayContaining([expect.objectContaining({
+              decisionId: 'grant-1',
+              mcpId: 'github',
+              sourceStatus: 'proposed',
+              status: 'proposed',
+            }), expect.objectContaining({
+              decisionId: 'grant-warning',
+              mcpId: 'filesystem',
+              sourceStatus: 'warning',
+              status: 'warning',
+            }), expect.objectContaining({
+              decisionId: 'grant-blocked',
+              mcpId: 'filesystem',
+              sourceStatus: 'blocked',
+              status: 'blocked',
+            }), expect.objectContaining({
+              decisionId: 'grant-malformed-approved',
+              mcpId: 'filesystem',
+              sourceStatus: 'approved',
+              status: 'approved',
+            })]),
+            effectiveGrants: [],
             proposedRequirements: [{ mcpId: 'github', capability: 'issues.read' }],
             promptOverlayPresent: true,
           }],
@@ -2678,8 +2794,8 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
         effective: {
           phase: 'effective',
           runtimeIssued: false,
-          runtimeEnforcement: 'not_implemented',
-          status: 'not_issued',
+          runtimeEnforcement: 'approved_snapshot',
+          status: 'package_scoped',
         },
       },
     })
@@ -2717,7 +2833,9 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     taskUpdate.set = vi.fn(() => taskUpdate)
     const gateUpdate = chain([{ id: 'gate-1' }])
     gateUpdate.set = vi.fn(() => gateUpdate)
-    mockDbSelect.mockReturnValue(chain([awaitingTask]))
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([]))
     mockDbUpdate
       .mockReturnValueOnce(taskUpdate)
       .mockReturnValueOnce(gateUpdate)
@@ -2756,7 +2874,9 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     taskUpdate.set = vi.fn(() => taskUpdate)
     const gateUpdate = chain([{ id: 'gate-1' }])
     gateUpdate.set = vi.fn(() => gateUpdate)
-    mockDbSelect.mockReturnValue(chain([awaitingTask]))
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([]))
     mockDbUpdate
       .mockReturnValueOnce(taskUpdate)
       .mockReturnValueOnce(gateUpdate)

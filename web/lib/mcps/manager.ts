@@ -58,6 +58,33 @@ function catalogEntries(): McpCatalogEntry[] {
   return Object.values(MCP_CATALOG)
 }
 
+function remediationForStatus(
+  entry: McpCatalogEntry | null,
+  installState: McpInstallState,
+  status: McpHealthStatus,
+): ProjectMcpStatus['remediation'] {
+  if (!entry) return undefined
+  let action: string | undefined
+  if (status === 'disabled') {
+    action = entry.remediation.disabled
+  } else if (status === 'auth_required') {
+    action = entry.remediation.authRequired
+  } else if (status === 'configuration_required') {
+    action = entry.remediation.configurationRequired
+  } else if (status === 'unhealthy') {
+    action = entry.remediation.unhealthy
+  } else if (installState === 'missing') {
+    action = entry.remediation.install
+  }
+  return action
+    ? {
+      action,
+      agentType: entry.installerAgentType,
+      detail: `Use ${entry.installerAgentType} for ${entry.displayName} MCP remediation.`,
+    }
+    : undefined
+}
+
 async function readWorkspaceFileIfRegular(
   filePath: string,
   workspaceRoot: string,
@@ -206,6 +233,8 @@ async function buildStandaloneStatus(
     status: installed ? 'unknown' : 'unknown',
     enabled: installation?.enabled ?? true,
     error: installed ? null : 'MCP is not installed.',
+    installerAgentType: entry?.installerAgentType,
+    remediation: remediationForStatus(entry, installed ? 'installed' : 'missing', 'unknown'),
     checkedAt: new Date().toISOString(),
   }
 }
@@ -255,6 +284,8 @@ async function classifyProjectMcp(
       status: 'unhealthy',
       enabled,
       error: 'MCP install path must stay inside the active workspace root.',
+      installerAgentType: entry.installerAgentType,
+      remediation: remediationForStatus(entry, 'missing', 'unhealthy'),
       checkedAt,
     }
   }
@@ -303,6 +334,8 @@ async function classifyProjectMcp(
     status,
     enabled,
     error,
+    installerAgentType: entry.installerAgentType,
+    remediation: remediationForStatus(entry, installState, status),
     checkedAt,
   }
 }
@@ -320,6 +353,8 @@ async function cacheProjectStatus(projectId: string, status: ProjectMcpStatus): 
         displayName: status.displayName,
         installPath: status.installPath,
         enabled: status.enabled,
+        installerAgentType: status.installerAgentType,
+        remediation: status.remediation,
       },
       checkedAt: new Date(status.checkedAt),
     })
@@ -333,6 +368,8 @@ async function cacheProjectStatus(projectId: string, status: ProjectMcpStatus): 
           displayName: status.displayName,
           installPath: status.installPath,
           enabled: status.enabled,
+          installerAgentType: status.installerAgentType,
+          remediation: status.remediation,
         },
         checkedAt: new Date(status.checkedAt),
       },

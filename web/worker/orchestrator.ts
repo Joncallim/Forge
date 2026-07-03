@@ -50,6 +50,10 @@ type AgentConfigRow = typeof agentConfigs.$inferSelect
 const ARCHITECT_AGENT = 'architect'
 const DEFAULT_ARCHITECT_GENERATION_TIMEOUT_MS = 180_000
 const DEFAULT_ARCHITECT_MAX_OUTPUT_TOKENS = 6000
+const REGENERATED_PLAN_NOTICE = [
+  '> Regenerated plan: this revision could not be constrained to a targeted edit.',
+  '> Review the entire plan before approving; unchanged sections may have been rewritten.',
+].join('\n')
 
 type PendingArchitectCheckpoint = Omit<ArchitectCheckpointInput, 'taskStatus'>
 
@@ -446,6 +450,12 @@ function hiddenRoutingComparable(comparable: ReturnType<typeof planRevisionCompa
   }
 }
 
+function regeneratedPlanText(planText: string): string {
+  const trimmed = planText.trim()
+  if (trimmed.startsWith(REGENERATED_PLAN_NOTICE)) return trimmed
+  return `${REGENERATED_PLAN_NOTICE}\n\n${trimmed}`
+}
+
 async function loadLatestPlanArtifact(taskId: string): Promise<LatestPlanArtifact | null> {
   const [artifact] = await db
     .select({ content: artifacts.content, metadata: artifacts.metadata })
@@ -777,8 +787,9 @@ async function runArchitect(
     // as a revision and tripped by the routing guard.
     const isClarificationRound = prepared.questions.length > 0 && prepared.agentBreakdownSource !== 'fence'
     const preservePreviousPlan = previousPlan !== null && previousComparableMetadata !== null && isClarificationRound
-    const artifactPlanText = preservePreviousPlan ? previousPlan : prepared.planText
-    const artifactComparableMetadata = preservePreviousPlan ? previousComparableMetadata : preparedComparableMetadata
+    let artifactPlanText = preservePreviousPlan ? previousPlan : prepared.planText
+    let artifactComparableMetadata = preservePreviousPlan ? previousComparableMetadata : preparedComparableMetadata
+    let regeneratedPlanReason: string | null = null
     if (previousPlan !== null && prepared.questions.length === 0 && prepared.planText.trim() === '') {
       throw new UnusableArchitectPlanError(
         'The revised plan did not include visible plan text. Request visible targeted plan changes only, or restart the task for a new plan.',
@@ -794,19 +805,43 @@ async function runArchitect(
       const previousWasApprovablePlan = previousComparableMetadata.agentBreakdownSource === 'fence'
       if (previousWasApprovablePlan) {
         if (stableJson(hiddenRoutingComparable(previousComparableMetadata)) !== stableJson(hiddenRoutingComparable(preparedComparableMetadata))) {
-          throw new UnusableArchitectPlanError(
-            'The revised plan changed machine-readable routing metadata. Request visible targeted plan changes only, or restart the task for a new plan.',
-          )
+          regeneratedPlanReason =
+            'The revised plan changed machine-readable routing metadata. Request visible targeted plan changes only, or restart the task for a new plan.'
+        } else {
+          // Routing metadata is covered by the equality check above, so the
+          // text-retention guard compares the visible plan text on its own.
+          // Mixing the (unchanged) metadata lines in would pad the retained-line
+          // ratio and let a short unrelated plan slip through.
+          try {
+            assertTargetedPlanRevision(previousPlan, prepared.planText)
+          } catch (err) {
+            if (!(err instanceof UnusableArchitectPlanError)) throw err
+            regeneratedPlanReason = errorMessage(err)
+          }
         }
-        // Routing metadata is covered by the equality check above, so the
-        // text-retention guard compares the visible plan text on its own.
-        // Mixing the (unchanged) metadata lines in would pad the retained-line
-        // ratio and let a short unrelated plan slip through.
-        assertTargetedPlanRevision(previousPlan, prepared.planText)
       }
+    }
+    if (regeneratedPlanReason) {
+      artifactPlanText = regeneratedPlanText(prepared.planText)
+      artifactComparableMetadata = preparedComparableMetadata
+      await recordTaskLogBestEffort({
+        agentRunId: run.id,
+        eventType: 'architect.replan.regenerated',
+        level: 'warning',
+        message: `The requested changes produced a regenerated plan instead of a targeted edit: ${regeneratedPlanReason}`,
+        metadata: {
+          regeneratedFromPlan: true,
+          reason: regeneratedPlanReason,
+        },
+        source: 'worker',
+        taskId: task.id,
+        title: 'Plan regenerated',
+      })
     }
     const artifact = await createArtifact(task.id, run.id, artifactPlanText, {
       openQuestionCount: prepared.questions.length,
+      regeneratedFromPlan: regeneratedPlanReason !== null,
+      regeneratedPlanReason,
       revisedFromAnswers: answeredQuestions.length > 0,
       revisedFromPlan: previousPlan !== null,
       agentBreakdown: artifactComparableMetadata.agentBreakdown,

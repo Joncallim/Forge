@@ -17,6 +17,7 @@ vi.mock('@/worker/architect-context', () => ({
 vi.mock('@/lib/mcps/manager', () => ({ getProjectMcpOverview: vi.fn() }))
 
 import { buildArchitectPrompt, stableJson } from '@/worker/orchestrator'
+import { MCP_CATALOG } from '@/lib/mcps/catalog'
 import type { ArchitectResumeCheckpoint } from '@/worker/checkpoints'
 import type { ProjectMcpOverview } from '@/lib/mcps/types'
 
@@ -63,22 +64,7 @@ const checkpoint: ArchitectResumeCheckpoint = {
 const mcpOverview: ProjectMcpOverview = {
   projectId: 'project-1',
   config: { profile: 'default', requiredMcps: ['filesystem', 'github'], overrides: {} },
-  catalog: [
-    {
-      id: 'filesystem',
-      displayName: 'Filesystem',
-      description: 'Project file access',
-      recommended: true,
-      requiresAuth: false,
-    },
-    {
-      id: 'github',
-      displayName: 'GitHub',
-      description: 'Issue and repository access',
-      recommended: true,
-      requiresAuth: true,
-    },
-  ],
+  catalog: Object.values(MCP_CATALOG),
   mcpsRoot: '/tmp/Forge/mcps',
   statuses: [
     {
@@ -328,13 +314,18 @@ describe('buildArchitectPrompt checkpoint resume context', () => {
     expect(source).toContain('!isClarificationRound && prepared.planText.trim()')
   })
 
-  it('validates routing metadata and visible plan text independently', () => {
+  it('regenerates unsafe request-changes revisions with an explicit warning', () => {
     const source = fs.readFileSync(path.join(repoRoot, 'worker/orchestrator.ts'), 'utf8')
 
-    // Routing metadata is compared on its own...
+    // Routing metadata is still compared on its own...
     expect(source).toContain('stableJson(hiddenRoutingComparable(previousComparableMetadata)) !== stableJson(hiddenRoutingComparable(preparedComparableMetadata))')
     expect(source).toContain('The revised plan changed machine-readable routing metadata.')
-    // ...and the text-retention guard takes the visible plan text only (no
+    // ...but request-changes should not dead-letter just because a model
+    // regenerated the plan; operators get a visible warning and full review.
+    expect(source).toContain('REGENERATED_PLAN_NOTICE')
+    expect(source).toContain('architect.replan.regenerated')
+    expect(source).toContain('regeneratedFromPlan: regeneratedPlanReason !== null')
+    // The text-retention guard still takes the visible plan text only (no
     // appended metadata that would pad the retained-line ratio).
     expect(source).toContain('assertTargetedPlanRevision(previousPlan, prepared.planText)')
     expect(source).not.toContain('canonicalPlanRevisionText')
