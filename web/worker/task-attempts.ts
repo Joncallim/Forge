@@ -6,6 +6,25 @@ import { recordTaskLogBestEffort } from './task-logs'
 type QueueName = 'tasks' | 'approvals' | 'answers'
 type AttemptStatus = 'running' | 'completed' | 'failed' | 'dead_lettered'
 
+export function describeQueueWorker(queueName: string): { name: string; role: string } {
+  if (queueName === 'approvals') {
+    return {
+      name: 'Forge Approval Worker',
+      role: 'continues approved tasks, advances ready work packages, and records handoff or review-gate progress',
+    }
+  }
+  if (queueName === 'answers') {
+    return {
+      name: 'Forge Answers Worker',
+      role: 'incorporates answered follow-up questions and reruns Architect planning',
+    }
+  }
+  return {
+    name: 'Forge Task Worker',
+    role: 'runs Architect planning and task replanning jobs from the task queue',
+  }
+}
+
 function statusLevel(status: AttemptStatus): 'info' | 'success' | 'warning' | 'error' {
   if (status === 'completed') return 'success'
   if (status === 'failed') return 'warning'
@@ -27,6 +46,7 @@ export async function startTaskAttempt({
   workerId: string
 }): Promise<string> {
   const now = new Date()
+  const worker = describeQueueWorker(queueName)
   const [attempt] = await db
     .insert(taskAttempts)
     .values({
@@ -44,8 +64,15 @@ export async function startTaskAttempt({
   await recordTaskLogBestEffort({
     eventType: 'queue.attempt.started',
     level: 'info',
-    message: `Worker ${workerId} claimed ${queueName} attempt ${attemptNumber}.`,
-    metadata: { attemptNumber, jobPayload, queueName, workerId },
+    message: `${worker.name} claimed ${queueName} attempt ${attemptNumber}. Role: ${worker.role}.`,
+    metadata: {
+      attemptNumber,
+      jobPayload,
+      queueName,
+      workerId,
+      workerName: worker.name,
+      workerRole: worker.role,
+    },
     source: 'queue',
     taskAttemptId: attempt.id,
     taskId,
@@ -83,18 +110,21 @@ export async function finishTaskAttempt({
     })
 
   if (attempt) {
+    const worker = describeQueueWorker(attempt.queueName)
     await recordTaskLogBestEffort({
       eventType: status === 'dead_lettered' ? 'queue.attempt.dead_lettered' : `queue.attempt.${status}`,
       level: statusLevel(status),
       message: errorMessage
-        ? `${attempt.queueName} attempt ${attempt.attemptNumber} finished as ${status}: ${errorMessage}`
-        : `${attempt.queueName} attempt ${attempt.attemptNumber} finished as ${status}.`,
+        ? `${worker.name} finished ${attempt.queueName} attempt ${attempt.attemptNumber} as ${status}: ${errorMessage}`
+        : `${worker.name} finished ${attempt.queueName} attempt ${attempt.attemptNumber} as ${status}.`,
       metadata: {
         attemptNumber: attempt.attemptNumber,
         nextRetryAt: nextRetryAt?.toISOString() ?? null,
         queueName: attempt.queueName,
         status,
         workerId: attempt.workerId,
+        workerName: worker.name,
+        workerRole: worker.role,
       },
       source: 'queue',
       taskAttemptId: attemptId,

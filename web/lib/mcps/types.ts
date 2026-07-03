@@ -18,6 +18,19 @@ export type McpCatalogEntry = {
   description: string
   recommended: boolean
   requiresAuth: boolean
+  installerAgentType: 'mcp-installer'
+  remediation: {
+    install: string
+    unhealthy: string
+    disabled: string
+    authRequired?: string
+    configurationRequired?: string
+  }
+  runtime: {
+    capabilities: string[]
+    mode: 'bounded_context_packet' | 'external_service'
+    liveTools: boolean
+  }
 }
 
 export type McpManifest = {
@@ -38,6 +51,12 @@ export type ProjectMcpStatus = {
   status: McpHealthStatus
   enabled: boolean
   error: string | null
+  installerAgentType?: string
+  remediation?: {
+    action: string
+    agentType: string
+    detail: string
+  }
   checkedAt: string
 }
 

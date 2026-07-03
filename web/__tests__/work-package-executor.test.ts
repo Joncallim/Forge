@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   generateText: vi.fn(),
   getModel: vi.fn(),
+  recordTaskLogBestEffort: vi.fn(),
 }))
 
 vi.mock('ai', () => ({
@@ -15,6 +16,10 @@ vi.mock('ai', () => ({
 vi.mock('@/lib/providers/registry', () => ({
   getModel: mocks.getModel,
   getProvider: vi.fn(),
+}))
+
+vi.mock('@/worker/task-logs', () => ({
+  recordTaskLogBestEffort: mocks.recordTaskLogBestEffort,
 }))
 
 import {
@@ -294,6 +299,39 @@ describe('executeWorkPackage', () => {
     })
   })
 
+  it('does not include host file contents when filesystem runtime was not approved', async () => {
+    await fs.writeFile(path.join(tempRoot, 'README.md'), 'project context should stay private\n')
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'No filesystem grant.',
+        files: [{ path: 'package.json', content: '{}' }],
+        commands: [],
+      }),
+    })
+
+    const result = await executeWorkPackage(context())
+    const call = mocks.generateText.mock.calls[0][0]
+
+    expect(call.prompt).toContain('Host read-only execution context packet')
+    expect(call.prompt).toContain('Included files: 0')
+    expect(call.prompt).not.toContain('File: README.md')
+    expect(call.prompt).not.toContain('project context should stay private')
+    expect(result.executionContextArtifactMetadata).toMatchObject({
+      files: [],
+      filesystemMcpRuntime: expect.objectContaining({
+        runtimeIssued: false,
+        status: 'not_requested',
+      }),
+      totals: expect.objectContaining({
+        includedFiles: 0,
+      }),
+    })
+    expect(mocks.recordTaskLogBestEffort).not.toHaveBeenCalledWith(expect.objectContaining({
+      eventType: 'mcp.filesystem.context_issued',
+    }))
+  })
+
   it('includes package MCP overlay, requirements, and subtasks in the execution prompt only as run-scoped instructions', async () => {
     mocks.generateText.mockResolvedValue({
       text: JSON.stringify({
@@ -353,6 +391,412 @@ describe('executeWorkPackage', () => {
     expect(call.prompt).toContain('github.issues.read')
     expect(call.prompt).toContain('MCP-aware subtasks for this run:')
     expect(call.prompt).toContain('inspect-issue')
+  })
+
+  it('marks approved filesystem read/list/search as a bounded read-only runtime context packet', async () => {
+    await fs.writeFile(path.join(tempRoot, 'README.md'), 'project context\n')
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Used filesystem context.',
+        files: [{ path: 'package.json', content: '{}' }],
+        commands: [],
+      }),
+    })
+
+    const result = await executeWorkPackage(context({
+      workPackage: {
+        ...context().workPackage,
+        assignedRole: 'backend',
+        mcpRequirements: [{
+          mcpId: 'filesystem',
+          requirement: 'required',
+          permissions: ['filesystem.read', 'filesystem.project.search'],
+          reason: 'Inspect project files.',
+          fallback: { action: 'block' },
+        }],
+        metadata: {
+          mcpGrantPhases: {
+            effective: {
+              schemaVersion: 1,
+              phase: 'effective',
+              runtimeEnforcement: 'bounded_context_packet',
+              source: 'task-approval',
+              status: 'approved',
+              grants: [{
+                mcpId: 'filesystem',
+                status: 'approved',
+                capabilities: ['filesystem.read', 'filesystem.project.search'],
+              }],
+            },
+          },
+          mcpAwareSubtasks: [{
+            id: 'inspect-project',
+            mcpCapabilities: ['filesystem.project.search'],
+          }],
+        },
+      },
+    }))
+
+    const call = mocks.generateText.mock.calls[0][0]
+    expect(call.prompt).toContain('bounded read-only filesystem context packet')
+    expect(call.prompt).toContain('filesystem.project.read, filesystem.project.search')
+    expect(call.prompt).not.toContain('does not issue live MCP runtime tools')
+    expect(call.prompt).toContain('File: README.md')
+    expect(result.executionContextArtifactMetadata).toMatchObject({
+      filesystemMcpRuntime: {
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        mode: 'read_only_context_packet',
+        runtimeEnforcement: 'bounded_context_packet',
+        runtimeIssued: true,
+        status: 'issued',
+      },
+    })
+  })
+
+  it('blocks filesystem runtime when requirements were not approved into effective grants', async () => {
+    await fs.writeFile(path.join(tempRoot, 'README.md'), 'project context\n')
+
+    await expect(executeWorkPackage(context({
+      workPackage: {
+        ...context().workPackage,
+        assignedRole: 'backend',
+        mcpRequirements: [{
+          mcpId: 'filesystem',
+          requirement: 'required',
+          permissions: ['filesystem.project.read'],
+          reason: 'Inspect project files.',
+          fallback: { action: 'block' },
+        }],
+        metadata: {},
+      },
+    }))).rejects.toThrow(/Filesystem MCP context blocked/)
+
+    expect(mocks.generateText).not.toHaveBeenCalled()
+    expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
+      eventType: 'mcp.filesystem.context_blocked',
+      level: 'warning',
+      metadata: expect.objectContaining({
+        filesystemMcpRuntime: expect.objectContaining({
+          requestedCapabilities: ['filesystem.project.read'],
+          runtimeIssued: false,
+          status: 'blocked',
+        }),
+      }),
+      title: 'Filesystem context blocked',
+    }))
+  })
+
+  it('continues optional filesystem requests without context when no effective grant is approved', async () => {
+    await fs.writeFile(path.join(tempRoot, 'README.md'), 'project context should stay private\n')
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Continued without optional filesystem context.',
+        files: [{ path: 'package.json', content: '{}' }],
+        commands: [],
+      }),
+    })
+
+    const result = await executeWorkPackage(context({
+      workPackage: {
+        ...context().workPackage,
+        assignedRole: 'backend',
+        mcpRequirements: [{
+          mcpId: 'filesystem',
+          requirement: 'optional',
+          permissions: ['filesystem.project.read'],
+          reason: 'Inspect project files if available.',
+          fallback: { action: 'continue_without_mcp' },
+        }],
+        metadata: {
+          mcpGrantPhases: {
+            effective: {
+              schemaVersion: 1,
+              phase: 'effective',
+              runtimeEnforcement: 'bounded_context_packet',
+              source: 'task-approval',
+              status: 'approved',
+              grants: [{
+                mcpId: 'filesystem',
+                status: 'warning',
+                capabilities: ['filesystem.project.read'],
+              }],
+            },
+          },
+        },
+      },
+    }))
+
+    const call = mocks.generateText.mock.calls[0][0]
+    expect(call.prompt).toContain('Included files: 0')
+    expect(call.prompt).not.toContain('File: README.md')
+    expect(call.prompt).not.toContain('project context should stay private')
+    expect(result.executionContextArtifactMetadata).toMatchObject({
+      filesystemMcpRuntime: expect.objectContaining({
+        requestedCapabilities: ['filesystem.project.read'],
+        runtimeIssued: false,
+        status: 'not_issued_optional',
+      }),
+      totals: expect.objectContaining({
+        includedFiles: 0,
+      }),
+    })
+  })
+
+  it('blocks optional filesystem runtime when effective grants partially cover requested capabilities', async () => {
+    await fs.writeFile(path.join(tempRoot, 'README.md'), 'project context\n')
+
+    await expect(executeWorkPackage(context({
+      workPackage: {
+        ...context().workPackage,
+        assignedRole: 'backend',
+        mcpRequirements: [{
+          mcpId: 'filesystem',
+          requirement: 'optional',
+          permissions: ['filesystem.project.read', 'filesystem.project.search'],
+          reason: 'Inspect project files if available.',
+          fallback: { action: 'continue_without_mcp' },
+        }],
+        metadata: {
+          mcpGrantPhases: {
+            effective: {
+              schemaVersion: 1,
+              phase: 'effective',
+              runtimeEnforcement: 'bounded_context_packet',
+              source: 'explicit-grant-approval',
+              status: 'approved',
+              grants: [{
+                mcpId: 'filesystem',
+                status: 'approved',
+                capabilities: ['filesystem.project.read'],
+              }],
+            },
+          },
+        },
+      },
+    }))).rejects.toThrow(/Filesystem MCP context blocked/)
+
+    expect(mocks.generateText).not.toHaveBeenCalled()
+    expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({
+        filesystemMcpRuntime: expect.objectContaining({
+          missingRequestedCapabilities: ['filesystem.project.search'],
+          status: 'blocked',
+        }),
+      }),
+    }))
+  })
+
+  it('blocks filesystem runtime when MCP-aware subtasks request uncovered capabilities', async () => {
+    await fs.writeFile(path.join(tempRoot, 'README.md'), 'project context\n')
+
+    await expect(executeWorkPackage(context({
+      workPackage: {
+        ...context().workPackage,
+        assignedRole: 'backend',
+        mcpRequirements: [{
+          mcpId: 'filesystem',
+          requirement: 'required',
+          permissions: ['filesystem.project.read'],
+          reason: 'Read project files.',
+          fallback: { action: 'block' },
+        }],
+        metadata: {
+          mcpAwareSubtasks: [{
+            id: 'search-project',
+            mcpCapabilities: ['filesystem.project.search'],
+          }],
+          mcpGrantPhases: {
+            effective: {
+              schemaVersion: 1,
+              phase: 'effective',
+              runtimeEnforcement: 'bounded_context_packet',
+              source: 'explicit-grant-approval',
+              status: 'approved',
+              grants: [{
+                mcpId: 'filesystem',
+                status: 'approved',
+                capabilities: ['filesystem.project.read'],
+              }],
+            },
+          },
+        },
+      },
+    }))).rejects.toThrow(/Filesystem MCP context blocked/)
+
+    expect(mocks.generateText).not.toHaveBeenCalled()
+    expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({
+        filesystemMcpRuntime: expect.objectContaining({
+          missingRequestedCapabilities: ['filesystem.project.search'],
+          requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+          status: 'blocked',
+        }),
+      }),
+    }))
+  })
+
+  it('blocks proposed-only filesystem grant snapshots without approved effective grants', async () => {
+    await fs.writeFile(path.join(tempRoot, 'README.md'), 'project context\n')
+
+    await expect(executeWorkPackage(context({
+      workPackage: {
+        ...context().workPackage,
+        assignedRole: 'backend',
+        mcpRequirements: [{
+          mcpId: 'filesystem',
+          requirement: 'required',
+          permissions: ['filesystem.project.search'],
+          reason: 'Search project files.',
+          fallback: { action: 'block' },
+        }],
+        metadata: {
+          mcpGrantPhases: {
+            proposed: [{
+              mcpId: 'filesystem',
+              status: 'proposed',
+              capabilities: ['filesystem.project.search'],
+            }],
+            effective: {
+              schemaVersion: 1,
+              phase: 'effective',
+              runtimeEnforcement: 'bounded_context_packet',
+              source: 'task-approval',
+              status: 'approved',
+              grants: [],
+            },
+          },
+        },
+      },
+    }))).rejects.toThrow(/Filesystem MCP context blocked/)
+
+    expect(mocks.generateText).not.toHaveBeenCalled()
+  })
+
+  it('blocks filesystem runtime when approved grants do not cover all required capabilities', async () => {
+    await fs.writeFile(path.join(tempRoot, 'README.md'), 'project context\n')
+
+    await expect(executeWorkPackage(context({
+      workPackage: {
+        ...context().workPackage,
+        assignedRole: 'backend',
+        mcpRequirements: [{
+          mcpId: 'filesystem',
+          requirement: 'required',
+          permissions: ['filesystem.project.read', 'filesystem.project.search'],
+          reason: 'Read and search project files.',
+          fallback: { action: 'block' },
+        }],
+        metadata: {
+          mcpGrantPhases: {
+            effective: {
+              schemaVersion: 1,
+              phase: 'effective',
+              runtimeEnforcement: 'bounded_context_packet',
+              source: 'explicit-grant-approval',
+              status: 'approved',
+              grants: [{
+                mcpId: 'filesystem',
+                status: 'approved',
+                capabilities: ['filesystem.project.read'],
+              }],
+            },
+          },
+        },
+      },
+    }))).rejects.toThrow(/Filesystem MCP context blocked/)
+
+    expect(mocks.generateText).not.toHaveBeenCalled()
+    expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({
+        filesystemMcpRuntime: expect.objectContaining({
+          missingRequestedCapabilities: ['filesystem.project.search'],
+          status: 'blocked',
+        }),
+      }),
+    }))
+  })
+
+  it('blocks list/search-only approved filesystem grants because content packets require read', async () => {
+    await fs.writeFile(path.join(tempRoot, 'README.md'), 'project context\n')
+
+    await expect(executeWorkPackage(context({
+      workPackage: {
+        ...context().workPackage,
+        assignedRole: 'backend',
+        mcpRequirements: [{
+          mcpId: 'filesystem',
+          requirement: 'required',
+          permissions: ['filesystem.project.search'],
+          reason: 'Search project files.',
+          fallback: { action: 'block' },
+        }],
+        metadata: {
+          mcpGrantPhases: {
+            effective: {
+              schemaVersion: 1,
+              phase: 'effective',
+              runtimeEnforcement: 'bounded_context_packet',
+              source: 'explicit-grant-approval',
+              status: 'approved',
+              grants: [{
+                mcpId: 'filesystem',
+                status: 'approved',
+                capabilities: ['filesystem.project.search'],
+              }],
+            },
+          },
+        },
+      },
+    }))).rejects.toThrow(/Filesystem MCP context blocked/)
+
+    expect(mocks.generateText).not.toHaveBeenCalled()
+    expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({
+        filesystemMcpRuntime: expect.objectContaining({
+          capabilities: ['filesystem.project.search'],
+          reason: expect.stringMatching(/require an approved filesystem\.project\.read grant/),
+          status: 'blocked',
+        }),
+      }),
+    }))
+  })
+
+  it('ignores malformed approved effective filesystem grant envelopes', async () => {
+    await fs.writeFile(path.join(tempRoot, 'README.md'), 'project context\n')
+
+    await expect(executeWorkPackage(context({
+      workPackage: {
+        ...context().workPackage,
+        assignedRole: 'backend',
+        mcpRequirements: [{
+          mcpId: 'filesystem',
+          requirement: 'required',
+          permissions: ['filesystem.project.read'],
+          reason: 'Read project files.',
+          fallback: { action: 'block' },
+        }],
+        metadata: {
+          mcpGrantPhases: {
+            effective: {
+              schemaVersion: 1,
+              phase: 'effective',
+              runtimeEnforcement: 'approved_snapshot',
+              source: 'task-approval',
+              status: 'approved',
+              grants: [{
+                mcpId: 'filesystem',
+                status: 'approved',
+                capabilities: ['filesystem.project.read'],
+              }],
+            },
+          },
+        },
+      },
+    }))).rejects.toThrow(/Filesystem MCP context blocked/)
+
+    expect(mocks.generateText).not.toHaveBeenCalled()
   })
 
   it('does not execute model-generated npm scripts while validating commands', async () => {
@@ -575,6 +1019,32 @@ describe('executeWorkPackage', () => {
 
     const result = await executeWorkPackage(context({
       attemptNumber: 2,
+      workPackage: {
+        ...context().workPackage,
+        mcpRequirements: [{
+          mcpId: 'filesystem',
+          requirement: 'required',
+          permissions: ['filesystem.project.read'],
+          reason: 'Inspect project context.',
+          fallback: { action: 'block' },
+        }],
+        metadata: {
+          mcpGrantPhases: {
+            effective: {
+              schemaVersion: 1,
+              phase: 'effective',
+              runtimeEnforcement: 'bounded_context_packet',
+              source: 'task-approval',
+              status: 'approved',
+              grants: [{
+                mcpId: 'filesystem',
+                status: 'approved',
+                capabilities: ['filesystem.project.read'],
+              }],
+            },
+          },
+        },
+      },
       priorReviewContext: {
         packageBlockedReason: 'Needs rework.',
         notes: [{
