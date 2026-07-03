@@ -179,7 +179,7 @@ function scopedCommandEnv(): NodeJS.ProcessEnv {
 
 async function git(cwd: string, argv: string[], maxBytes = MAX_OUTPUT_BYTES): Promise<string> {
   const result = await execFile('git', argv, {
-    cwd,
+    cwd: /*turbopackIgnore: true*/ cwd,
     env: scopedCommandEnv(),
     maxBuffer: maxBytes * 2,
     timeout: 30_000,
@@ -189,7 +189,7 @@ async function git(cwd: string, argv: string[], maxBytes = MAX_OUTPUT_BYTES): Pr
 
 async function gitRaw(cwd: string, argv: string[], maxBuffer = MAX_STATUS_BUFFER_BYTES): Promise<string> {
   const result = await execFile('git', argv, {
-    cwd,
+    cwd: /*turbopackIgnore: true*/ cwd,
     env: scopedCommandEnv(),
     maxBuffer,
     timeout: 30_000,
@@ -269,10 +269,10 @@ export async function buildRepositoryExecutionContext(input: {
     return blocked(null, 'Project local path is required before repository evidence can be collected.')
   }
 
-  const resolvedPath = path.resolve(localPath)
+  const resolvedPath = path.resolve(/*turbopackIgnore: true*/ localPath)
   let stat
   try {
-    stat = await fs.stat(resolvedPath)
+    stat = await fs.stat(/*turbopackIgnore: true*/ resolvedPath)
   } catch {
     return blocked(resolvedPath, `Project local path does not exist: ${resolvedPath}`)
   }
@@ -403,7 +403,7 @@ function isPackageInstall(command: string, argv: string[]): boolean {
 
 async function packageScripts(cwd: string): Promise<Record<string, string>> {
   try {
-    const raw = await fs.readFile(path.join(cwd, 'package.json'), 'utf8')
+    const raw = await fs.readFile(/*turbopackIgnore: true*/ path.join(/*turbopackIgnore: true*/ cwd, 'package.json'), 'utf8')
     const parsed: unknown = JSON.parse(raw)
     if (!isRecord(parsed) || !isRecord(parsed.scripts)) return {}
     return Object.fromEntries(
@@ -453,15 +453,15 @@ export function redactCommandOutput(value: string): string {
 
 export async function runScopedRepositoryCommand(input: ScopedCommandInput): Promise<ScopedCommandResult> {
   if (!input.cwd.trim()) throw new Error('An explicit project cwd is required.')
-  const cwd = path.resolve(input.cwd)
-  const stat = await fs.stat(cwd).catch(() => null)
+  const cwd = path.resolve(/*turbopackIgnore: true*/ input.cwd)
+  const stat = await fs.stat(/*turbopackIgnore: true*/ cwd).catch(() => null)
   if (!stat?.isDirectory()) throw new Error(`Project cwd does not exist or is not a directory: ${cwd}`)
 
   const riskClass = await scopedCommandRisk({ ...input, cwd })
   const startedAt = new Date()
   try {
     const result = await execFile(input.command, input.argv, {
-      cwd,
+      cwd: /*turbopackIgnore: true*/ cwd,
       env: scopedCommandEnv(),
       maxBuffer: Math.max(MAX_OUTPUT_BYTES, MAX_DIFF_BYTES) * 2,
       timeout: COMMAND_TIMEOUT_MS,

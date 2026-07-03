@@ -1631,8 +1631,10 @@ function FilesystemGrantControls({
 
   if (summary.requestedCapabilities.length === 0 || packageId === '') return null
 
-  const canEdit = (taskStatus === 'awaiting_approval' || taskStatus === 'approved') &&
+  const canEdit = (
+    (taskStatus === 'awaiting_approval' || taskStatus === 'approved') &&
     ['pending', 'ready', 'blocked', 'needs_rework'].includes(packageStatus)
+  ) || (taskStatus === 'failed' && packageStatus === 'failed')
   const approveDisabled = selected.length === 0 || !selected.includes('filesystem.project.read')
   const deniedRequired = effective.status === 'denied' && summary.blockingCapabilities.length > 0
 
