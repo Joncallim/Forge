@@ -2,9 +2,10 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { useRouter, useParams } from 'next/navigation'
-import { PlusIcon, ExternalLinkIcon, ArrowLeftIcon, Trash2Icon, RefreshCwIcon, DownloadIcon, SettingsIcon } from 'lucide-react'
+import { PlusIcon, ExternalLinkIcon, ArrowLeftIcon, Trash2Icon, RefreshCwIcon, DownloadIcon, SettingsIcon, ChevronRightIcon, ChevronDownIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { MarkdownView } from '@/components/MarkdownView'
 import {
   Dialog,
   DialogContent,
@@ -160,16 +161,274 @@ function projectLocalPathSaveValue(input: string, project: Project | null): stri
   return trimmedPath
 }
 
-function mcpRootLabel(overview: ProjectMcpOverview): string {
-  return overview.displayMcpsRoot ?? overview.mcpsRoot
+// ---------------------------------------------------------------------------
+// Roadmap section (issue #109)
+// ---------------------------------------------------------------------------
+
+type ProjectRoadmap = { path: string; format: 'markdown' | 'json'; content: string }
+
+function ProjectRoadmapSection({ projectId }: { projectId: string }) {
+  const [roadmap, setRoadmap] = useState<ProjectRoadmap | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    let active = true
+    setLoading(true)
+    fetch(`/api/projects/${projectId}/roadmap`)
+      .then((res) => (res.ok ? res.json() : { roadmap: null }))
+      .then((data) => { if (active) setRoadmap(data.roadmap ?? null) })
+      .catch(() => { if (active) setRoadmap(null) })
+      .finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [projectId])
+
+  // Per #109, hide the panel entirely when no supported roadmap file exists.
+  if (loading || !roadmap) return null
+
+  return (
+    <section aria-labelledby="project-roadmap-heading" className="mb-6 rounded-xl border border-border bg-card p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <h2 id="project-roadmap-heading" className="text-sm font-medium text-foreground">Roadmap</h2>
+        <span className="font-mono text-xs text-muted-foreground">{roadmap.path}</span>
+      </div>
+      {roadmap.format === 'markdown' ? (
+        <MarkdownView content={roadmap.content} />
+      ) : (
+        <pre className="max-h-96 overflow-auto rounded-lg border border-border bg-muted/30 p-3 font-mono text-xs text-foreground">
+          {roadmap.content}
+        </pre>
+      )}
+    </section>
+  )
 }
 
-function mcpInstallPathLabel(
-  status: ProjectMcpStatus | undefined,
-  overview: ProjectMcpOverview,
-  mcpId: string,
-): string {
-  return status?.displayInstallPath ?? status?.installPath ?? `${mcpRootLabel(overview)}/${mcpId}`
+// ---------------------------------------------------------------------------
+// GitHub issues section (issue #109)
+// ---------------------------------------------------------------------------
+
+type ProjectIssue = {
+  number: number
+  title: string
+  state: string
+  labels: { name: string; color: string | null }[]
+  updatedAt: string
+  htmlUrl: string
+  body: string | null
+}
+
+function formatIssueTimestamp(value: string): string {
+  if (!value) return ''
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleDateString()
+}
+
+function ProjectIssuesSection({ projectId }: { projectId: string }) {
+  const [issues, setIssues] = useState<ProjectIssue[]>([])
+  const [repo, setRepo] = useState<string | null>(null)
+  const [reason, setReason] = useState<'no-repo' | 'no-auth' | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [fetchError, setFetchError] = useState<string | null>(null)
+  const [expanded, setExpanded] = useState<Set<number>>(new Set())
+
+  const [createOpen, setCreateOpen] = useState(false)
+  const [newTitle, setNewTitle] = useState('')
+  const [newBody, setNewBody] = useState('')
+  const [creating, setCreating] = useState(false)
+  const [createError, setCreateError] = useState<string | null>(null)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    setFetchError(null)
+    try {
+      const res = await fetch(`/api/projects/${projectId}/issues`)
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error ?? 'Failed to load issues')
+      setIssues(data.issues ?? [])
+      setRepo(data.repo ?? null)
+      setReason(data.reason ?? null)
+    } catch (err) {
+      setFetchError(err instanceof Error ? err.message : 'Failed to load issues')
+    } finally {
+      setLoading(false)
+    }
+  }, [projectId])
+
+  useEffect(() => { load() }, [load])
+
+  function toggle(number: number) {
+    setExpanded((current) => {
+      const next = new Set(current)
+      if (next.has(number)) next.delete(number)
+      else next.add(number)
+      return next
+    })
+  }
+
+  async function handleCreate(e: React.FormEvent) {
+    e.preventDefault()
+    if (newTitle.trim() === '') return
+    setCreating(true)
+    setCreateError(null)
+    try {
+      const res = await fetch(`/api/projects/${projectId}/issues`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: newTitle.trim(), body: newBody.trim() || undefined }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error ?? 'Failed to create issue')
+      setCreateOpen(false)
+      setNewTitle('')
+      setNewBody('')
+      await load()
+    } catch (err) {
+      setCreateError(err instanceof Error ? err.message : 'Failed to create issue')
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  const canCreate = reason !== 'no-repo' && reason !== 'no-auth'
+
+  return (
+    <section aria-labelledby="project-issues-heading" className="mb-6 rounded-xl border border-border bg-card p-4">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 id="project-issues-heading" className="text-sm font-medium text-foreground">Issues</h2>
+          {repo && <span className="font-mono text-xs text-muted-foreground">{repo}</span>}
+        </div>
+        {canCreate && (
+          <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+            <DialogTrigger
+              render={
+                <Button variant="outline" size="sm">
+                  <PlusIcon aria-hidden="true" />
+                  New issue
+                </Button>
+              }
+            />
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>New GitHub issue</DialogTitle>
+              </DialogHeader>
+              <form onSubmit={handleCreate} className="flex flex-col gap-3">
+                <div className="flex flex-col gap-1.5">
+                  <label htmlFor="new-issue-title" className="text-sm font-medium text-foreground">Title</label>
+                  <input
+                    id="new-issue-title"
+                    value={newTitle}
+                    onChange={(e) => setNewTitle(e.target.value)}
+                    required
+                    maxLength={256}
+                    className="rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <label htmlFor="new-issue-body" className="text-sm font-medium text-foreground">Description</label>
+                  <textarea
+                    id="new-issue-body"
+                    value={newBody}
+                    onChange={(e) => setNewBody(e.target.value)}
+                    rows={6}
+                    className="resize-y rounded-lg border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                  />
+                </div>
+                {createError !== null && <p role="alert" className="text-sm text-destructive">{createError}</p>}
+                <DialogFooter>
+                  <Button type="submit" size="sm" disabled={creating || newTitle.trim() === ''} aria-busy={creating}>
+                    {creating ? 'Creating…' : 'Create issue'}
+                  </Button>
+                </DialogFooter>
+              </form>
+            </DialogContent>
+          </Dialog>
+        )}
+      </div>
+
+      {loading ? (
+        <p className="text-sm text-muted-foreground" role="status" aria-live="polite">Loading issues…</p>
+      ) : reason === 'no-repo' ? (
+        <p className="text-sm text-muted-foreground">
+          Add a GitHub repository to this project to see and create issues.
+        </p>
+      ) : reason === 'no-auth' ? (
+        <p className="text-sm text-muted-foreground">
+          Connect GitHub in{' '}
+          <a href="/dashboard/settings#github" className="underline underline-offset-2">Settings</a>{' '}
+          to see and create issues for <span className="font-mono">{repo}</span>.
+        </p>
+      ) : fetchError !== null ? (
+        <div role="alert" className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          {fetchError}
+          <button onClick={load} className="ml-2 underline underline-offset-2 hover:no-underline">Retry</button>
+        </div>
+      ) : issues.length === 0 ? (
+        <p className="text-sm text-muted-foreground">No issues</p>
+      ) : (
+        <ul className="divide-y divide-border rounded-lg border border-border" role="list">
+          {issues.map((issue) => {
+            const isOpen = expanded.has(issue.number)
+            return (
+              <li key={issue.number} className="px-3 py-2.5">
+                <div className="flex items-start gap-2">
+                  <button
+                    type="button"
+                    onClick={() => toggle(issue.number)}
+                    aria-expanded={isOpen}
+                    aria-label={`${isOpen ? 'Collapse' : 'Expand'} issue #${issue.number}`}
+                    className="mt-0.5 text-muted-foreground hover:text-foreground"
+                  >
+                    {isOpen ? <ChevronDownIcon className="size-4" /> : <ChevronRightIcon className="size-4" />}
+                  </button>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-medium text-muted-foreground">#{issue.number}</span>
+                      <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">{issue.title}</span>
+                      <Badge variant="outline" className="capitalize">{issue.state}</Badge>
+                    </div>
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                      {issue.labels.map((label) => (
+                        <span
+                          key={label.name}
+                          className="inline-flex h-5 items-center rounded-full border border-border px-2 text-[10px] font-medium text-muted-foreground"
+                          style={label.color ? { borderColor: `#${label.color}` } : undefined}
+                        >
+                          {label.name}
+                        </span>
+                      ))}
+                      {issue.updatedAt && (
+                        <span className="text-[11px] text-muted-foreground">Updated {formatIssueTimestamp(issue.updatedAt)}</span>
+                      )}
+                      {issue.htmlUrl && (
+                        <a
+                          href={issue.htmlUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+                        >
+                          <ExternalLinkIcon className="size-3" aria-hidden="true" />
+                          GitHub
+                        </a>
+                      )}
+                    </div>
+                    {isOpen && (
+                      <div className="mt-2 border-t border-border pt-2">
+                        {issue.body && issue.body.trim() !== '' ? (
+                          <MarkdownView content={issue.body} compact />
+                        ) : (
+                          <p className="text-xs text-muted-foreground">No description provided.</p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </section>
+  )
 }
 
 export default function ProjectDetailPage() {
@@ -669,17 +928,18 @@ export default function ProjectDetailPage() {
         </DialogContent>
       </Dialog>
 
+      <ProjectRoadmapSection projectId={projectId} />
+      <ProjectIssuesSection projectId={projectId} />
+
       <section aria-labelledby="project-mcps-heading" className="mb-6 rounded-xl border border-border bg-card p-4">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 id="project-mcps-heading" className="text-sm font-medium text-foreground">
               MCP tools
             </h2>
-            {mcpOverview && (
-              <p className="mt-1 font-mono text-xs text-muted-foreground break-all">
-                {mcpRootLabel(mcpOverview)}
-              </p>
-            )}
+            <p className="mt-1 text-xs text-muted-foreground">
+              Shared across projects. Manage install locations in Settings.
+            </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             {mcpOverview && (
@@ -782,9 +1042,6 @@ export default function ProjectDetailPage() {
                         Connect
                       </Button>
                     )}
-                    <code className="max-w-full truncate rounded-md bg-muted px-2 py-1 font-mono text-xs text-muted-foreground sm:max-w-xs">
-                      {mcpInstallPathLabel(status, mcpOverview, entry.id)}
-                    </code>
                   </div>
                 </li>
               )
