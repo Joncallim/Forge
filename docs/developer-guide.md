@@ -315,7 +315,12 @@ consumes those templates.
 
 ## Agent Prompts
 
-Codex manual operation uses `.codex/agents/*.toml` as versioned defaults.
+Agents are runtime-neutral Forge roles (see `AGENTS.md` and
+`docs/adr/0007-forge-agent-workforce-model.md`); Claude Code and Codex are
+runtimes, not separate catalogues. The seed defaults currently ship as
+`.codex/agents/*.toml` versioned files, which double as an optional manual Codex
+helper surface; a later #124 phase moves the product source of truth to a
+runtime-neutral catalogue.
 
 On install, Forge copies those defaults to
 `~/Documents/Forge/prompts/agents/*.toml`. The web app edits the workspace copy,

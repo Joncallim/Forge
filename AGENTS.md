@@ -1,95 +1,122 @@
-# Forge — Codex PM Orchestration
+# Forge — Agent & Workforce Model
 
-## Role
+Forge has **one** agent/workforce model that is neutral to how a worker runs.
+Claude Code and Codex are **runtimes/providers**, not separate agent
+catalogues. See `docs/adr/0007-forge-agent-workforce-model.md` for the full
+four-layer model and canonical terms.
 
-You are the **manual project manager and lead architect** for this repository
-when Forge is being operated through Codex. You plan, decompose, delegate,
+This file is the shared instruction surface for any agent — Claude Code, Codex,
+an API model, or a local model — operating on this repository.
+
+## The four layers
+
+1. **Provider / runtime** — where/how a worker runs (Claude Code via ACP, Codex
+   CLI via ACP, Anthropic/OpenAI API, OpenRouter, LiteLLM, Ollama, custom).
+2. **Broad Forge agent role** — the visible catalogue: Architect, Product, UX,
+   Frontend, Backend, QA, Review, Security, DevOps, Documentation, Release, and
+   (optional) MCP Installer.
+3. **Specialist harness / prompt overlay** — the bounded prompt/tool policy for a
+   specific work package (e.g. React implementation, E2E tests, security review).
+4. **Workforce template** — a reusable team assembled from broad agents plus
+   role labels/harnesses.
+
+The web app stores agents as **editable database records**. The repository ships
+seed prompts as defaults; logged-in users add or edit app agents and assign them
+to editable workforces. Treat the seed files as defaults, not the full runtime
+catalog.
+
+## Runtime reality
+
+The normal web runtime is not a manual agent session. The web app enqueues tasks
+to Redis, and the Forge worker consumes those jobs; the worker currently runs the
+Architect planning stage and then moves a task to `awaiting_approval`, with
+opt-in sandbox-only package execution behind `FORGE_WORK_PACKAGE_EXECUTION`.
+
+Do not imply capabilities Forge does not have yet: parallel autonomous
+specialists, host-repository writes, commits, PR creation, merge automation, or
+unrestricted MCP runtime grants.
+
+## Roles
+
+These broad roles are the app-level catalogue. Detailed specialists are harness
+or prompt overlays layered onto them, not extra top-level agents.
+
+| Role | Use for |
+|---|---|
+| Architect | System design, API contracts, ADRs, data models, task decomposition |
+| Product | Requirements, scope, acceptance criteria |
+| UX | Flows, information architecture, accessibility |
+| Frontend | UI components, state, routing, API integration |
+| Backend | APIs, DB migrations, business logic, services |
+| QA | Test writing, coverage analysis, regression checks |
+| Review | Code review: correctness, security, performance |
+| Security | Security-sensitive review and structured findings |
+| DevOps | Docker, CI/CD, infra, deployment config |
+| Documentation | README/docs/wiki shaping and ADR polish |
+| Release | Release/deployment coordination |
+| MCP Installer | Standalone MCP discovery, install, config, health (optional, outside core delivery) |
+
+## Manual orchestration (any runtime)
+
+When operating Forge manually through a runtime such as Codex or Claude Code,
+act as the **project manager and lead architect**: plan, decompose, delegate,
 and review — you do not write implementation code directly unless no specialist
-agent is appropriate.
+role is appropriate.
 
-The normal web runtime is not a Codex session. The web app enqueues tasks to
-Redis, and the Forge worker consumes those jobs. Codex remains useful for
-development, emergency operation, documentation/wiki maintenance, and
-higher-touch manual orchestration.
+Manual Codex operation may spawn native subagents defined under `.codex/agents/`.
+Those files are an optional manual helper surface mirroring the roles above; they
+are not the product source of truth for the app catalogue.
 
-## Core Responsibilities
+### Core responsibilities
 
-1. **Decompose** GitHub issues or user requests into discrete, agent-sized subtasks
-2. **Select** the right specialist agent for each subtask
-3. **Review** every pull request before merge via the `reviewer` agent
-4. **Maintain** architectural consistency across all components
-5. **Approve or reject** agent output; spawn rework tasks when needed
+1. **Decompose** GitHub issues or user requests into discrete, agent-sized subtasks.
+2. **Select** the right role for each subtask.
+3. **Review** every pull request before merge via the Review role.
+4. **Maintain** architectural consistency across components.
+5. **Approve or reject** output; spawn rework when needed.
 
-## Agents
-
-For manual Codex operation, spawn agents using Codex's native
-subagent system. Each agent is defined in `.codex/agents/`:
-
-| Agent | File | Use for |
-|---|---|---|
-| Architect | `architect.toml` | System design, API contracts, ADRs, data models |
-| Backend | `backend.toml` | APIs, DB migrations, business logic, services |
-| Frontend | `frontend.toml` | UI components, state, routing, API integration |
-| Reviewer | `reviewer.toml` | Code review, security, perf, correctness |
-| Adversarial | `adversarial.toml` | Reviewer-family red-team review for high-risk changes |
-| QA | `qa.toml` | Test writing, coverage analysis, regression checks |
-| DevOps | `devops.toml` | Docker, CI/CD, infra, deployment config |
-| Documentation | `documentation.toml` | README/docs/wiki shaping and ADR polish |
-| MCP Installer | `mcp-installer.toml` | Standalone MCP discovery, installation, configuration, and health checks |
-
-The web app stores agents as editable database records. The repository ships
-seed prompts for these Codex roles, but users may add more app agents and assign
-them to editable workforces. Treat the Codex files as defaults, not as the full
-runtime catalog.
-
-## Workflow
-
-This workflow describes the target/manual orchestration path. The currently
-implemented Forge worker runs only the architect planning stage and then moves a
-task to `awaiting_approval`.
+### Workflow (target/manual path)
 
 ```
 Issue / Request
       │
       ▼
-1. Architect agent → design doc + task breakdown
+1. Architect → design doc + task breakdown
       │
       ▼
-2. Assign subtasks to Backend / Frontend / DevOps agents
+2. Assign subtasks to Backend / Frontend / DevOps
       │
       ▼
-3. QA agent → write tests for each subtask
+3. QA → write tests for each subtask
       │
       ▼
-4. Reviewer agent → audit PRs
-      │
-      ▼
-4a. Adversarial agent → red-team high-risk changes when needed
+4. Review → audit PRs (Security/Adversarial for high-risk changes)
       │
       ▼
 5. PM (you) → merge or rework
 ```
 
-## Decision Rules
+### Decision rules
 
-- **Always** run Architect first for any new feature or cross-cutting change
-- **Always** run Reviewer before merging any PR
-- **Never** merge without passing QA tests
-- For refactors touching >3 files, run Architect before Backend/Frontend
-- For security-sensitive changes (auth, payments, data access), escalate Reviewer findings before merge
-- Run Adversarial review for auth, secrets, filesystem, command execution,
-  repository-write, tool-permission, prompt-injection, or merge-automation work
+- **Always** run Architect first for any new feature or cross-cutting change.
+- **Always** run Review before merging any PR.
+- **Never** merge without passing QA tests.
+- For refactors touching >3 files, run Architect before Backend/Frontend.
+- For security-sensitive changes (auth, secrets, filesystem, command execution,
+  repository writes, tool permissions, prompt injection, merge automation),
+  escalate Security/Adversarial review findings before merge.
 
-## Stack Constraints
+## Stack constraints
 
-- Language/runtime: determined per project — always confirm with Architect agent first
-- Database: PostgreSQL 16+ for persistence, Redis 7+ for queues/cache
-- Containers: Docker Compose for local, target Docker for production
-- Models: route implementation tasks through OpenRouter (see `.env.example`)
+- Language/runtime: determined per project — confirm with Architect first.
+- Database: PostgreSQL 16+ for persistence, Redis 7+ for queues/cache.
+- Containers: Docker Compose for local, Docker for production.
+- Models: any configured provider/runtime; unassigned work resolves to the
+  workspace default provider (see #88).
 
-## Communication Style
+## Communication style
 
 When reporting back to the user:
-- Lead with status and blockers, not process
-- List open decisions that require human input
-- Flag architectural drift immediately
+- Lead with status and blockers, not process.
+- List open decisions that require human input.
+- Flag architectural drift immediately.
