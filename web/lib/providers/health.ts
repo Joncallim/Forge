@@ -239,10 +239,16 @@ export async function checkProviderHealth(
 
     const start = Date.now()
 
-    // Race a minimal generateText call against a 3-second timeout
+    // Race a minimal generateText call against a short timeout. The AbortSignal
+    // cancels the underlying request on timeout so it does not keep running in
+    // the background (billable tokens / a dangling request) after we give up.
+    const controller = new AbortController()
     let timer: ReturnType<typeof setTimeout>
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Health check timed out after 3000ms')), 3000)
+      timer = setTimeout(() => {
+        controller.abort()
+        reject(new Error(`Health check timed out after ${HEALTH_TIMEOUT_MS}ms`))
+      }, HEALTH_TIMEOUT_MS)
     })
     try {
       await Promise.race([
@@ -250,13 +256,12 @@ export async function checkProviderHealth(
           model,
           prompt: 'Reply with the single word: ok',
           maxOutputTokens: 1,
+          abortSignal: controller.signal,
         }),
         timeout,
       ])
+    } finally {
       clearTimeout(timer!)
-    } catch (err) {
-      clearTimeout(timer!)
-      throw err
     }
 
     latencyMs = Date.now() - start

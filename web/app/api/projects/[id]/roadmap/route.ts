@@ -1,16 +1,9 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
-import { db } from '@/db'
-import { projects } from '@/db/schema'
-import { eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
+import { getAccessibleProject } from '@/lib/project-access'
 import { resolveGitHubToken } from '@/lib/github'
 import { fetchProjectRoadmap, isValidGitHubRepo } from '@/lib/github-project'
-
-async function findProject(id: string) {
-  const [project] = await db.select().from(projects).where(eq(projects.id, id)).limit(1)
-  return project ?? null
-}
 
 // ---------------------------------------------------------------------------
 // GET /api/projects/:id/roadmap
@@ -26,7 +19,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
     const { id } = await params
-    const project = await findProject(id)
+    const project = await getAccessibleProject(id, session.userId)
     if (!project) return NextResponse.json({ error: 'Project not found' }, { status: 404 })
 
     if (!isValidGitHubRepo(project.githubRepo)) {

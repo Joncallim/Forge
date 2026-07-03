@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises'
+import { constants as fsConstants } from 'node:fs'
 import path from 'node:path'
 import { eq, inArray } from 'drizzle-orm'
 import { db } from '@/db'
@@ -116,7 +117,23 @@ async function readWorkspaceFileIfRegular(
     if (stat.isSymbolicLink()) return null
     if (current === candidate) {
       if (!stat.isFile()) return null
-      return fs.readFile(candidate, 'utf-8')
+      // Open with O_NOFOLLOW and read via the handle so the terminal component
+      // cannot be swapped for a symlink (pointing outside the workspace) in the
+      // window between the lstat above and the read.
+      const noFollow = typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0
+      let handle: Awaited<ReturnType<typeof fs.open>>
+      try {
+        handle = await fs.open(candidate, fsConstants.O_RDONLY | noFollow)
+      } catch {
+        return null
+      }
+      try {
+        const opened = await handle.stat()
+        if (!opened.isFile()) return null
+        return await handle.readFile('utf-8')
+      } finally {
+        await handle.close()
+      }
     }
     if (!stat.isDirectory()) return null
 

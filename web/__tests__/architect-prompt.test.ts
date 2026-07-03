@@ -40,6 +40,7 @@ const task = {
 const project = {
   id: 'project-1',
   name: 'Forge',
+  submittedBy: null,
   githubRepo: 'Joncallim/Forge',
   localPath: '/tmp/forge',
   githubTokenEnvVar: null,

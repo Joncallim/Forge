@@ -5,8 +5,9 @@ import path from 'node:path'
 import { z } from 'zod'
 import { db } from '@/db'
 import { projects } from '@/db/schema'
-import { eq } from 'drizzle-orm'
+import { and, eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
+import { accessibleProjectCondition, accessibleProjectOwnerCondition } from '@/lib/project-access'
 import { registerProjectPath, unregisterProjectPath } from '@/lib/project-registry'
 import { validateGitHubTokenEnvVar } from '@/lib/github'
 import {
@@ -102,7 +103,7 @@ export async function GET(
     const [project] = await db
       .select()
       .from(projects)
-      .where(eq(projects.id, id))
+      .where(accessibleProjectCondition(id, session.userId))
       .limit(1)
 
     if (!project) {
@@ -136,7 +137,7 @@ export async function PUT(
     const [existing] = await db
       .select()
       .from(projects)
-      .where(eq(projects.id, id))
+      .where(accessibleProjectCondition(id, session.userId))
       .limit(1)
 
     if (!existing) {
@@ -213,7 +214,7 @@ export async function PUT(
     const [updated] = await db
       .update(projects)
       .set(updateSet)
-      .where(eq(projects.id, id))
+      .where(and(eq(projects.id, id), accessibleProjectOwnerCondition(session.userId)))
       .returning()
 
     console.info('[PUT /api/projects/:id] Updated project', { id: updated.id })
@@ -337,7 +338,7 @@ export async function DELETE(
     const [existing] = await db
       .select()
       .from(projects)
-      .where(eq(projects.id, id))
+      .where(accessibleProjectCondition(id, session.userId))
       .limit(1)
 
     if (!existing) {
@@ -377,7 +378,7 @@ export async function DELETE(
       await unregisterProjectPath(existing.localPath)
     }
 
-    await db.delete(projects).where(eq(projects.id, id))
+    await db.delete(projects).where(and(eq(projects.id, id), accessibleProjectOwnerCondition(session.userId)))
 
     console.info('[DELETE /api/projects/:id] Deleted project', {
       id,

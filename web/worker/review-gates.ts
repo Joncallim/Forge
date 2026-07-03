@@ -683,7 +683,7 @@ export async function materializeReviewGatesForWorkPackageCompletion(input: {
 }
 
 export async function completeTaskIfReviewGatesSatisfied(taskId: string): Promise<{
-  status: 'completed' | 'blocked' | 'no_work_packages'
+  status: 'completed' | 'blocked' | 'failed' | 'no_work_packages'
   reason?: string
 }> {
   const packages = await db
@@ -696,6 +696,20 @@ export async function completeTaskIfReviewGatesSatisfied(taskId: string): Promis
     .orderBy(asc(workPackages.sequence), asc(workPackages.createdAt))
 
   if (packages.length === 0) return { status: 'no_work_packages' }
+
+  // A 'failed' package is terminal: it will never become 'completed', and QA/
+  // Reviewer packages that depend on it can never become ready. Left as a plain
+  // "unfinished" block the task would loop between blocked and approved forever,
+  // so fail the task with an actionable reason (e.g. create the missing agent
+  // and retry) instead of hanging.
+  const failedPackage = packages.find((pkg) => pkg.status === 'failed')
+  if (failedPackage) {
+    const reason = `Work package ${failedPackage.id} failed and cannot be completed. Resolve the cause and retry the task.`
+    const failed =
+      (await updateTaskStatusIfCurrent(taskId, 'running', 'failed', reason)) ||
+      (await updateTaskStatusIfCurrent(taskId, 'approved', 'failed', reason))
+    return { status: failed ? 'failed' : 'blocked', reason }
+  }
 
   const unfinishedPackage = packages.find((pkg) => pkg.status !== 'completed' && pkg.status !== 'cancelled')
   if (unfinishedPackage) {

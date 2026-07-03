@@ -38,6 +38,17 @@ function isSnapshotOnlyKey(key: string): boolean {
     /^message$/i.test(key)
 }
 
+// Redact by key name too, not just by value shape: a shapeless secret stored
+// under an obviously-secret key (apiKey, token, password, credential, ...) would
+// otherwise survive verbatim into the logs API and exports.
+function isSecretNamedKey(key: string): boolean {
+  // Token *counts* (inputTokens/outputTokens/tokenCount) are not secrets.
+  if (/tokens?/i.test(key) && /(?:count|input|output|total|used|prompt|completion|remaining)/i.test(key)) {
+    return false
+  }
+  return /(?:password|passwd|secret|credential|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|(?:access|refresh|auth|api|bearer|npm|session)[_-]?token|\btoken\b|\bdsn\b)/i.test(key)
+}
+
 export function sanitizeLogStructuredValue(
   value: unknown,
   options: SanitizeOptions = {},
@@ -70,6 +81,13 @@ export function sanitizeLogStructuredValue(
   const entries = Object.entries(value).slice(0, maxObjectKeys)
   for (const [key, item] of entries) {
     const safeKey = sanitizeString(key, 256)
+    if (isSecretNamedKey(key)) {
+      // Redact the whole value regardless of shape — a shapeless secret under a
+      // secret-named key would otherwise survive value-shape redaction. Use the
+      // existing token placeholder for consistency.
+      result[safeKey] = item === null || item === undefined ? item : '[REDACTED_TOKEN]'
+      continue
+    }
     if (isSnapshotOnlyKey(key)) {
       result[safeKey] = sanitizePromptSnapshot(item)
       continue

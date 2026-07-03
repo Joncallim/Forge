@@ -172,6 +172,12 @@ export const DEFAULT_PROJECT_MCP_CONFIG: ProjectMcpConfig = {
 export const projects = pgTable('projects', {
   id: uuid('id').primaryKey().defaultRandom(),
   name: text('name').notNull(),
+  // The user who created the project. Nullable so pre-existing rows (created
+  // before ownership scoping) remain accessible to everyone, matching the
+  // tasks.submittedBy pattern; new projects are scoped to their creator.
+  submittedBy: uuid('submitted_by').references(() => users.id, {
+    onDelete: 'set null',
+  }),
   githubRepo: text('github_repo'), // 'owner/repo'
   localPath: text('local_path'),
   githubTokenEnvVar: text('github_token_env_var'),

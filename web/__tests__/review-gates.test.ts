@@ -714,6 +714,24 @@ describe('review gate contract', () => {
     expect(mocks.updateTaskStatusIfCurrent).not.toHaveBeenCalled()
   })
 
+  it('fails the task when a work package is terminally failed instead of hanging', async () => {
+    mocks.dbSelect.mockReturnValueOnce(chain([
+      { id: 'pkg-1', status: 'completed' },
+      { id: 'pkg-2', status: 'failed' },
+    ]))
+    mocks.updateTaskStatusIfCurrent.mockResolvedValueOnce(true)
+
+    const result = await completeTaskIfReviewGatesSatisfied('task-1')
+
+    expect(result).toMatchObject({ status: 'failed' })
+    expect(mocks.updateTaskStatusIfCurrent).toHaveBeenCalledWith(
+      'task-1',
+      'running',
+      'failed',
+      expect.stringContaining('failed'),
+    )
+  })
+
   it('completes the task only after all packages and review gates are completed', async () => {
     mocks.dbSelect
       .mockReturnValueOnce(chain([{ id: 'pkg-1', status: 'completed' }]))

@@ -9,6 +9,7 @@ import { redis } from '@/lib/redis'
 import { generateTaskTitle } from '@/lib/task-title'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import { accessibleTaskOwnerCondition } from '@/lib/task-access'
+import { accessibleProjectOwnerCondition } from '@/lib/project-access'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -125,7 +126,11 @@ export async function POST(request: NextRequest) {
     const [project] = await db
       .select({ id: projects.id })
       .from(projects)
-      .where(and(eq(projects.id, data.projectId), isNull(projects.archivedAt)))
+      .where(and(
+        eq(projects.id, data.projectId),
+        isNull(projects.archivedAt),
+        accessibleProjectOwnerCondition(session.userId),
+      ))
       .limit(1)
 
     if (!project) {

@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm'
+import { and, desc, eq } from 'drizzle-orm'
 import { db } from '@/db'
 import { appSettings, providerConfigs, providerHealthChecks, type ProviderConfig } from '@/db/schema'
 
@@ -58,13 +58,23 @@ export async function resolveDefaultProvider(): Promise<ProviderConfig | null> {
     if (config && config.isActive) return config
   }
 
+  // Fall back to the local (zero-config) provider whose most recent health check
+  // is `ready`. Health checks are appended over time, so we sort newest-first and
+  // consider only each provider's latest row — a provider that was ready hours
+  // ago but whose latest check is now unreachable must not be returned.
   const localCandidates = await db
     .select({ config: providerConfigs, status: providerHealthChecks.status })
     .from(providerConfigs)
     .innerJoin(providerHealthChecks, eq(providerHealthChecks.providerConfigId, providerConfigs.id))
-    .where(eq(providerConfigs.isActive, true))
+    .where(and(eq(providerConfigs.isActive, true), eq(providerConfigs.isLocal, true)))
+    .orderBy(desc(providerHealthChecks.checkedAt))
 
-  const readyLocal = localCandidates.find((row) => row.config.isLocal && row.status === 'ready')
+  const seen = new Set<string>()
+  for (const row of localCandidates) {
+    if (seen.has(row.config.id)) continue
+    seen.add(row.config.id)
+    if (row.status === 'ready') return row.config
+  }
 
-  return readyLocal?.config ?? null
+  return null
 }
