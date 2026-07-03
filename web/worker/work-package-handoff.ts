@@ -220,7 +220,10 @@ async function createPackageArtifact(input: {
     ? await withExecutionLease(input.workPackageId, input.executionLease.runId, insertArtifact)
     : await insertArtifact(db)
 
-  await publishTaskEvent(input.taskId, 'artifact:created', {
+  // Best-effort: the artifact is already committed (under the lease). A transient
+  // event-bus failure here must not propagate and be misread as an execution
+  // failure that fails/retries an otherwise successful package.
+  await publishTaskEventBestEffort(input.taskId, 'artifact:created', {
     id: artifact.id,
     artifactId: artifact.id,
     agentRunId: artifact.agentRunId,

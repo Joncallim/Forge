@@ -201,6 +201,22 @@ describe('validateMcpExecutionDesign', () => {
     expect(projectGrant.blocked.join('\n')).toMatch(/not covered by an explicit approved grant/)
   })
 
+  it('blocks the unqualified filesystem alias of a prohibited project capability', () => {
+    // Grants unqualified filesystem.list but prohibits filesystem.project.list.
+    // Because unqualified list is project-scoped and covers the project spelling,
+    // the prohibition must strike the unqualified grant too, so a subtask using
+    // filesystem.list is blocked rather than silently admitted.
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"filesystem","requirement":"required","reason":"List project files.","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{"backend":["filesystem.list"]},"prohibitedCapabilities":["filesystem.project.list"],"fallback":{"action":"ask_user","message":"Enable filesystem MCP."}}],"promptOverlays":{},"mcpAwareSubtasks":[{"id":"list-project","agent":"backend","mcpCapabilities":["filesystem.list"],"inputs":[],"outputs":[],"verification":[],"stoppingCondition":"Done.","fallback":"Ask user."}]}',
+      '```',
+    ].join('\n'))
+    const result = validateMcpExecutionDesign(design, overview([healthyFilesystem]))
+
+    expect(result.status).toBe('blocked')
+    expect(result.blocked.join('\n')).toMatch(/outside the allowed beta scope/)
+  })
+
   it('blocks unknown or unhealthy required MCPs', () => {
     const { design } = parseMcpExecutionDesign([
       '```mcp_execution_design_json',

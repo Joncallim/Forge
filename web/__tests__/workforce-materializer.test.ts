@@ -137,6 +137,31 @@ function deterministicIds(): () => string {
 }
 
 describe('workforce materializer', () => {
+  it('attaches MCP grants/requirements when the design spells the agent with a different separator', () => {
+    // Canonical agentType is `backend-dev`; the MCP execution design spells the
+    // same agent `backend_dev`. Matching must be separator-insensitive, or the
+    // package's MCP requirements/grants are dropped and the broker is bypassed.
+    const separatorPrepared = structuredClone(prepared)
+    separatorPrepared.agents = [{ role: 'backend-dev', tasks: 1, summary: 'APIs', steps: ['Add tables'] }]
+    const design = separatorPrepared.mcpExecutionDesign.proposed!
+    design.requirements[0].assignment.targetAgents = ['backend_dev']
+    design.requirements[0].agentPermissions = { backend_dev: ['github.issues.read'] }
+    design.mcpAwareSubtasks[0].agent = 'backend_dev'
+    separatorPrepared.mcpExecutionDesign.grantDecisions.decisions[0].agent = 'backend_dev'
+
+    const rows = buildWorkforceMaterializationRows(
+      { taskId: 'task-1', architectRunId: 'run-1', artifactId: 'artifact-1', prepared: separatorPrepared },
+      { idFactory: deterministicIds(), activeAgents: [{ agentType: 'backend-dev', displayName: 'Backend Dev' }] },
+    )
+
+    const pkg = rows.workPackages.find((p) => p.assignedRole === 'backend-dev')
+    expect(pkg).toBeDefined()
+    expect(pkg!.metadata).toMatchObject({
+      mcpGrants: [expect.objectContaining({ decisionId: 'grant-1', mcpId: 'github' })],
+    })
+    expect(pkg!.mcpRequirements).toEqual([expect.objectContaining({ mcpId: 'github' })])
+  })
+
   it('builds pending harnesses, work packages, dependencies, and a plan approval gate', () => {
     const rows = buildWorkforceMaterializationRows(
       {

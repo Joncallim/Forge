@@ -8,6 +8,7 @@ import { decryptSecret } from '@/lib/crypto'
 import { PROVIDER_CATALOG } from './catalog'
 import { listLmStudioModelIds } from './model-listing'
 import { checkAcpReadiness } from './acp/handshake'
+import { redactAdapterMessage } from './acp/redaction'
 import { parseAcpProviderModelId } from './acp/catalog'
 
 // ---------------------------------------------------------------------------
@@ -52,7 +53,10 @@ const HEALTH_TIMEOUT_MS = 3000
 
 function truncateProviderError(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err)
-  return raw.slice(0, 200)
+  // Redact before truncating: SDK errors for cloud/OpenAI-compatible providers
+  // can echo the request URL or Authorization header, and this string is
+  // persisted to provider_health_checks.error and surfaced through the UI.
+  return redactAdapterMessage(raw).slice(0, 200)
 }
 
 function optionalAuthorizationHeaders(config: ProviderConfig): Record<string, string> {

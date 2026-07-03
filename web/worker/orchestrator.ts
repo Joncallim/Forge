@@ -1031,7 +1031,10 @@ export async function processTask(
     }
 
     const nextStatus: TaskStatus = openQuestionCount > 0 ? 'awaiting_answers' : 'awaiting_approval'
-    await updateTaskStatus(task.id, nextStatus)
+    // CAS from 'running' so a cancel landing between the isTaskCancelled read
+    // and this write cannot resurrect a cancelled task.
+    const advanced = await updateTaskStatusIfCurrent(task.id, 'running', nextStatus)
+    if (!advanced) return
     await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: nextStatus })
   } catch (err) {
     const message = safeTaskFailureMessage(err)
@@ -1118,7 +1121,10 @@ export async function processAnsweredQuestions(
     }
 
     const nextStatus: TaskStatus = openQuestionCount > 0 ? 'awaiting_answers' : 'awaiting_approval'
-    await updateTaskStatus(taskId, nextStatus)
+    // CAS from 'running' so a cancel landing between the isTaskCancelled read
+    // and this write cannot resurrect a cancelled task.
+    const advanced = await updateTaskStatusIfCurrent(taskId, 'running', nextStatus)
+    if (!advanced) return
     await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: nextStatus })
   } catch (err) {
     const message = safeTaskFailureMessage(err)

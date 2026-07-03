@@ -501,10 +501,25 @@ function approvedCoverageCapabilityKeys(capability: string): string[] {
   return projectAlias ? [normalized, projectAlias] : [normalized]
 }
 
+function filesystemUnqualifiedAlias(capability: string): string | null {
+  const normalized = normalizeCapability(capability)
+  const match = normalized.match(/^filesystem\.project\.(read|list|search)$/)
+  return match ? `filesystem.${match[1]}` : null
+}
+
 function prohibitedCoverageCapabilityKeys(capability: string): string[] {
   const normalized = normalizeCapability(capability)
+  const keys = new Set<string>([normalized])
+  // A prohibition must strike every spelling that would satisfy it. Unqualified
+  // filesystem read/list/search grants are project-root scoped and cover the
+  // explicit filesystem.project.* spelling, so prohibiting either spelling has
+  // to remove both — otherwise prohibiting `filesystem.project.list` leaves an
+  // approved `filesystem.list` that still grants the prohibited capability.
   const projectAlias = filesystemProjectAlias(normalized)
-  return projectAlias ? [normalized, projectAlias] : [normalized]
+  if (projectAlias) keys.add(projectAlias)
+  const unqualifiedAlias = filesystemUnqualifiedAlias(normalized)
+  if (unqualifiedAlias) keys.add(unqualifiedAlias)
+  return [...keys]
 }
 
 function unsafeCapability(mcpId: string, capability: string, prohibitedCapabilities: string[]): string | null {

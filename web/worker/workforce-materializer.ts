@@ -126,9 +126,15 @@ function roleAliases(role: string, agentType: string): string[] {
   return Array.from(new Set([normalizeAgentType(role), agentType].filter(Boolean)))
 }
 
+// Match roles separator-insensitively (`_` vs `-`). resolveCanonicalAgentType
+// resolves via normalizeRoleLookup, so the MCP execution design may spell an
+// agent as `backend_dev` while the canonical agentType is `backend-dev`;
+// matching on normalizeAgentType alone would silently drop that package's MCP
+// requirements/grants and bypass the broker entirely.
 function roleMatches(value: string, agentType: string, aliases: string[]): boolean {
-  const normalized = normalizeAgentType(value)
-  return normalized === agentType || aliases.includes(normalized)
+  const normalized = normalizeRoleLookup(value)
+  return normalized === normalizeRoleLookup(agentType) ||
+    aliases.some((alias) => normalizeRoleLookup(alias) === normalized)
 }
 
 function firstMatchingObjectValue<T>(
@@ -161,13 +167,13 @@ function mcpRequirementsForAgent(prepared: PreparedArchitectArtifact, agentType:
   const design = prepared.mcpExecutionDesign.proposed
   if (!design) return []
 
+  const candidates = new Set([agentType, ...aliases].map(normalizeRoleLookup))
   return design.requirements
     .filter((requirement) => {
-      const targetAgents = requirement.assignment.targetAgents.map(normalizeAgentType)
-      const permissionAgents = Object.keys(requirement.agentPermissions).map(normalizeAgentType)
-      return targetAgents.includes(agentType) ||
-        permissionAgents.includes(agentType) ||
-        aliases.some((alias) => targetAgents.includes(alias) || permissionAgents.includes(alias))
+      const targetAgents = requirement.assignment.targetAgents.map(normalizeRoleLookup)
+      const permissionAgents = Object.keys(requirement.agentPermissions).map(normalizeRoleLookup)
+      return targetAgents.some((agent) => candidates.has(agent)) ||
+        permissionAgents.some((agent) => candidates.has(agent))
     })
     .map((requirement) => ({
       mcpId: requirement.mcpId,
