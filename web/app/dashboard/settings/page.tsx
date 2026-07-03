@@ -3,6 +3,8 @@
 import { useState, useEffect, useCallback } from 'react'
 import { InfoIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/utils'
+import { useTheme, THEME_MODES, THEME_ACCENTS } from '@/hooks/useTheme'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -683,6 +685,88 @@ function SecurityCard() {
 }
 
 // ---------------------------------------------------------------------------
+// Appearance card
+// ---------------------------------------------------------------------------
+
+function AppearanceCard() {
+  const { mode, accent, setMode, setAccent } = useTheme()
+
+  return (
+    <section aria-labelledby="appearance-heading" className="rounded-xl border border-border bg-card p-5">
+      <div className="mb-4">
+        <h2 id="appearance-heading" className="text-lg font-semibold text-foreground">
+          Appearance
+        </h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Choose how Forge looks. This preference is saved in this browser and does not affect
+          project data, provider config, or task execution.
+        </p>
+      </div>
+
+      <div className="flex flex-col gap-6">
+        <div>
+          <span className="text-sm font-medium text-foreground">Theme mode</span>
+          <div
+            role="radiogroup"
+            aria-label="Theme mode"
+            className="mt-2 inline-flex rounded-lg border border-border bg-muted/40 p-0.5"
+          >
+            {THEME_MODES.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                role="radio"
+                aria-checked={mode === option.value}
+                onClick={() => setMode(option.value)}
+                className={cn(
+                  'rounded-md px-3 py-1.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                  mode === option.value
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-1.5 text-xs text-muted-foreground">
+            System follows your operating system or browser light/dark preference.
+          </p>
+        </div>
+
+        <div>
+          <span className="text-sm font-medium text-foreground">Accent color</span>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {THEME_ACCENTS.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                aria-pressed={accent === option.value}
+                onClick={() => setAccent(option.value)}
+                className={cn(
+                  'inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                  accent === option.value
+                    ? 'border-foreground/40 bg-muted text-foreground'
+                    : 'border-border text-muted-foreground hover:text-foreground',
+                )}
+              >
+                <span
+                  data-accent={option.value}
+                  aria-hidden="true"
+                  className="size-4 rounded-full border border-border"
+                  style={{ backgroundColor: 'var(--primary)' }}
+                />
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </section>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Settings page
 // ---------------------------------------------------------------------------
 
@@ -692,11 +776,12 @@ export default function SettingsPage() {
       <div className="mb-6">
         <h1 className="text-xl font-semibold text-foreground">Settings</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Manage workspace folders, MCP tools, GitHub, and sign-in security.
+          Manage appearance, workspace folders, MCP tools, GitHub, and sign-in security.
         </p>
       </div>
 
       <div className="grid max-w-6xl gap-6 md:grid-cols-2 xl:grid-cols-3 [&>section]:w-full [&>section]:max-w-2xl">
+        <AppearanceCard />
         <WorkspaceCard />
         <McpSettingsCard />
         <GitHubCard />
