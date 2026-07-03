@@ -1,0 +1,61 @@
+import { describe, expect, it } from 'vitest'
+import { DEFAULT_WORKFORCES, resolveWorkforceMembers } from '@/db/default-workforces'
+
+// Agent types shipped as .codex/agents/*.toml seed defaults.
+const KNOWN_ROLES = new Set([
+  'architect', 'product', 'ux', 'frontend', 'backend', 'qa',
+  'reviewer', 'security', 'devops', 'documentation', 'release', 'mcp-installer',
+])
+
+describe('DEFAULT_WORKFORCES', () => {
+  it('declares exactly one default workforce', () => {
+    expect(DEFAULT_WORKFORCES.filter((w) => w.isDefault)).toHaveLength(1)
+    expect(DEFAULT_WORKFORCES.find((w) => w.isDefault)?.slug).toBe('core-delivery')
+  })
+
+  it('has unique slugs and multiple discipline teams', () => {
+    const slugs = DEFAULT_WORKFORCES.map((w) => w.slug)
+    expect(new Set(slugs).size).toBe(slugs.length)
+    expect(slugs.length).toBeGreaterThanOrEqual(5)
+  })
+
+  it('only references known seed roles and never leaves a workforce empty', () => {
+    for (const workforce of DEFAULT_WORKFORCES) {
+      expect(workforce.roles.length).toBeGreaterThan(0)
+      for (const role of workforce.roles) {
+        expect(KNOWN_ROLES.has(role)).toBe(true)
+      }
+    }
+  })
+})
+
+describe('resolveWorkforceMembers', () => {
+  it('resolves roles to ids in declared order with 1-based sequences', () => {
+    const byType = new Map([
+      ['architect', 'a1'],
+      ['backend', 'b1'],
+      ['qa', 'q1'],
+    ])
+    expect(resolveWorkforceMembers(['architect', 'backend', 'qa'], byType)).toEqual([
+      { agentConfigId: 'a1', sequence: 1, isRequired: true },
+      { agentConfigId: 'b1', sequence: 2, isRequired: true },
+      { agentConfigId: 'q1', sequence: 3, isRequired: true },
+    ])
+  })
+
+  it('skips roles that were not seeded and keeps sequences contiguous', () => {
+    const byType = new Map([
+      ['product', 'p1'],
+      ['reviewer', 'r1'],
+    ])
+    // 'ux' and 'documentation' absent -> skipped; sequence stays 1..n.
+    expect(resolveWorkforceMembers(['product', 'ux', 'documentation', 'reviewer'], byType)).toEqual([
+      { agentConfigId: 'p1', sequence: 1, isRequired: true },
+      { agentConfigId: 'r1', sequence: 2, isRequired: true },
+    ])
+  })
+
+  it('returns an empty list when no role is seeded', () => {
+    expect(resolveWorkforceMembers(['product', 'ux'], new Map())).toEqual([])
+  })
+})

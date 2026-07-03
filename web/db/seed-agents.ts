@@ -28,6 +28,7 @@ import {
 } from '../lib/agent-prompts'
 import { exportWorkforcesToWorkspace } from '../lib/workforce-exports'
 import { displayNameForSlug } from '../lib/naming'
+import { DEFAULT_WORKFORCES, resolveWorkforceMembers } from './default-workforces'
 
 const REPO_ROOT = path.resolve(__dirname, '../..')
 const CODEX_AGENTS_DIR = path.join(REPO_ROOT, '.codex/agents')
@@ -358,7 +359,7 @@ export async function seedAgentConfigs(): Promise<void> {
 
   console.log(`[seed-agents] Seeding ${parsed.length} agent(s)...`)
 
-  const seededAgentIds: string[] = []
+  const seededIdByType = new Map<string, string>()
 
   for (const agent of parsed) {
     const isRepositoryDefault = repositoryDefaults.has(agent.agentType)
@@ -388,30 +389,33 @@ export async function seedAgentConfigs(): Promise<void> {
       })
       .returning({ id: agentConfigs.id })
 
-    if (row?.id && isRepositoryDefault && agent.agentType !== 'mcp-installer') seededAgentIds.push(row.id)
+    if (row?.id && isRepositoryDefault) seededIdByType.set(agent.agentType, row.id)
 
     const modelInfo = agent.model ? ` (model: ${agent.model})` : ''
     const seedType = isRepositoryDefault ? 'system' : 'workspace'
     console.log(`[seed-agents]   ✓ ${agent.agentType}${modelInfo}  [${seedType}:${agent.source}:${agent.fileName}]`)
   }
 
-  if (seededAgentIds.length > 0) {
+  for (const definition of DEFAULT_WORKFORCES) {
+    const members = resolveWorkforceMembers(definition.roles, seededIdByType)
+    if (members.length === 0) continue
+
     const [workforce] = await db
       .insert(workforces)
       .values({
-        slug: 'core-delivery',
-        displayName: 'Core delivery',
-        description: 'Default workforce seeded from the repository agent prompts.',
-        isDefault: true,
+        slug: definition.slug,
+        displayName: definition.displayName,
+        description: definition.description,
+        isDefault: definition.isDefault,
         isActive: true,
         updatedAt: new Date(),
       })
       .onConflictDoUpdate({
         target: workforces.slug,
         set: {
-          displayName: 'Core delivery',
-          description: 'Default workforce seeded from the repository agent prompts.',
-          isDefault: true,
+          displayName: definition.displayName,
+          description: definition.description,
+          isDefault: definition.isDefault,
           isActive: true,
           updatedAt: new Date(),
         },
@@ -421,15 +425,15 @@ export async function seedAgentConfigs(): Promise<void> {
     if (workforce?.id) {
       await db.delete(workforceAgents).where(eq(workforceAgents.workforceId, workforce.id))
       await db.insert(workforceAgents).values(
-        seededAgentIds.map((agentConfigId, index) => ({
+        members.map((member) => ({
           workforceId: workforce.id,
-          agentConfigId,
-          sequence: index + 1,
-          isRequired: true,
+          agentConfigId: member.agentConfigId,
+          sequence: member.sequence,
+          isRequired: member.isRequired,
           updatedAt: new Date(),
         })),
       )
-      console.log(`[seed-agents]   ✓ core-delivery workforce (${seededAgentIds.length} agent(s))`)
+      console.log(`[seed-agents]   ✓ ${definition.slug} workforce (${members.length} agent(s))`)
     }
   }
 
