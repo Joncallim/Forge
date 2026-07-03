@@ -263,3 +263,22 @@ describe('AcpTransport.close', () => {
     expect(child.kill).toHaveBeenCalled()
   })
 })
+
+describe('AcpTransport stdout decoding', () => {
+  it('reassembles a multi-byte UTF-8 sequence split across two stdout chunks', async () => {
+    const child = new FakeChildProcess()
+    const transport = new AcpTransport(['adapter'], makeSpawnFn(child))
+
+    let received: unknown = null
+    transport.onNotification('test/echo', (params) => { received = params })
+
+    const message = `${JSON.stringify({ jsonrpc: '2.0', method: 'test/echo', params: { text: 'café-☃' } })}\n`
+    const buf = Buffer.from(message, 'utf8')
+    // Split one byte into the 3-byte snowman so the sequence straddles chunks.
+    const splitAt = buf.indexOf(Buffer.from('☃', 'utf8')) + 1
+    child.stdout.emit('data', buf.subarray(0, splitAt))
+    child.stdout.emit('data', buf.subarray(splitAt))
+
+    expect(received).toEqual({ text: 'café-☃' })
+  })
+})

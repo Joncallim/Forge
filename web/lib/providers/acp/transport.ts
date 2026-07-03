@@ -1,5 +1,6 @@
 import { spawn, type SpawnOptionsWithoutStdio } from 'node:child_process'
 import path from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import { redactAdapterMessage } from './redaction'
 
 // ---------------------------------------------------------------------------
@@ -91,6 +92,9 @@ export class AcpTransport {
   private readonly child: ReturnType<typeof spawn>
   private nextId = 1
   private stdoutBuffer = ''
+  // Decode stdout across chunk boundaries so a multi-byte UTF-8 sequence split
+  // between two 'data' events is not corrupted into replacement characters.
+  private readonly stdoutDecoder = new StringDecoder('utf8')
   private stderrBuffer = ''
   private readonly pending = new Map<number, PendingRequest>()
   private readonly notificationHandlers = new Map<string, (params: unknown) => void>()
@@ -122,7 +126,7 @@ export class AcpTransport {
     })
 
     this.child.stdout?.on('data', (chunk: Buffer) => {
-      this.stdoutBuffer += chunk.toString('utf8')
+      this.stdoutBuffer += this.stdoutDecoder.write(chunk)
       const lines = this.stdoutBuffer.split('\n')
       this.stdoutBuffer = lines.pop() ?? ''
       for (const line of lines) this.handleLine(line)
