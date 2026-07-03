@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import {
   ExternalLinkIcon,
@@ -114,6 +114,7 @@ type WorkPackage = WorkforceRecord
 type ApprovalGate = WorkforceRecord
 type VcsChange = WorkforceRecord
 type CommandAudit = WorkforceRecord
+type FilesystemAudit = WorkforceRecord
 type RetryHandoffResultStatus = 'retry_already_queued' | 'retry_enqueued'
 type GateDecisionResponseWarning = {
   error?: unknown
@@ -134,6 +135,7 @@ interface TaskDetailResponse {
   workPackages?: WorkPackage[]
   approvalGates?: ApprovalGate[]
   commandAudits?: CommandAudit[]
+  filesystemAudits?: FilesystemAudit[]
   vcsChanges?: VcsChange[]
 }
 
@@ -336,6 +338,64 @@ function previewList(items: string[], limit = 4): string {
   const visible = items.slice(0, limit)
   const remaining = items.length - visible.length
   return remaining > 0 ? `${visible.join(', ')} +${remaining} more` : visible.join(', ')
+}
+
+const FILESYSTEM_CAPABILITY_OPTIONS = [
+  'filesystem.project.read',
+  'filesystem.project.list',
+  'filesystem.project.search',
+] as const
+
+function canonicalFilesystemCapability(value: string): string | null {
+  const normalized = value.trim().toLowerCase().replace(/\s+/g, '_')
+  const match = normalized.match(/^filesystem\.(?:project\.)?(read|list|search)$/)
+  return match ? `filesystem.project.${match[1]}` : null
+}
+
+function filesystemCapabilitiesFromValues(values: string[]): string[] {
+  const capabilities = new Set<string>()
+  for (const value of values) {
+    const capability = canonicalFilesystemCapability(value)
+    if (capability) capabilities.add(capability)
+  }
+  return [...capabilities].sort()
+}
+
+function filesystemPackageCapabilitySummary(pkg: WorkPackage): {
+  blockingCapabilities: string[]
+  requestedCapabilities: string[]
+} {
+  const requested = new Set<string>()
+  const blocking = new Set<string>()
+  for (const requirement of jsonArrayField(pkg, ['mcpRequirements'])) {
+    if (stringField(requirement, ['mcpId', 'id']) !== 'filesystem') continue
+    const capabilities = filesystemCapabilitiesFromValues([
+      ...stringArrayField(requirement, ['capabilities']),
+      ...stringArrayField(requirement, ['permissions']),
+      ...stringArrayField(requirement, ['mcpCapabilities']),
+    ])
+    for (const capability of capabilities) requested.add(capability)
+    const fallback = recordField(requirement, ['fallback'])
+    const fallbackAction = fallback ? stringField(fallback, ['action']) : ''
+    if (stringField(requirement, ['requirement']) === 'optional' && fallbackAction === 'continue_without_mcp') {
+      continue
+    }
+    for (const capability of capabilities) blocking.add(capability)
+  }
+
+  const metadata = recordField(pkg, ['metadata'])
+  for (const subtask of metadata ? jsonArrayField(metadata, ['mcpAwareSubtasks', 'mcpSubtasks']) : []) {
+    for (const capability of filesystemCapabilitiesFromValues(stringArrayField(subtask, ['mcpCapabilities', 'capabilities']))) {
+      requested.add(capability)
+    }
+  }
+  if (requested.size > 0) requested.add('filesystem.project.read')
+  if (blocking.size > 0) blocking.add('filesystem.project.read')
+
+  return {
+    blockingCapabilities: [...blocking].sort(),
+    requestedCapabilities: [...requested].sort(),
+  }
 }
 
 function uniqueArtifacts(artifacts: Artifact[]): Artifact[] {
@@ -1523,6 +1583,155 @@ function McpGrantCards({ grants }: { grants: WorkforceRecord[] }) {
   )
 }
 
+function filesystemEffectiveState(pkg: WorkPackage): {
+  capabilities: string[]
+  grantApprovalId: string
+  reason: string
+  status: string
+} {
+  const metadata = recordField(pkg, ['metadata'])
+  const phases = metadata ? recordField(metadata, ['mcpGrantPhases']) : null
+  const effective = phases ? recordField(phases, ['effective']) : null
+  if (!effective) {
+    return { capabilities: [], grantApprovalId: '', reason: '', status: 'not_issued' }
+  }
+  const grants = jsonArrayField(effective, ['grants'])
+  return {
+    capabilities: filesystemCapabilitiesFromValues(grants.flatMap((grant) => stringArrayField(grant, ['capabilities', 'permissions']))),
+    grantApprovalId: stringField(effective, ['grantApprovalId']),
+    reason: stringField(effective, ['reason']),
+    status: stringField(effective, ['status']) || 'not_issued',
+  }
+}
+
+function FilesystemGrantControls({
+  onUpdated,
+  pkg,
+  taskId,
+  taskStatus,
+}: {
+  onUpdated: () => Promise<void>
+  pkg: WorkPackage
+  taskId: string
+  taskStatus: string | null
+}) {
+  const summary = useMemo(() => filesystemPackageCapabilitySummary(pkg), [pkg])
+  const effective = useMemo(() => filesystemEffectiveState(pkg), [pkg])
+  const [selected, setSelected] = useState<string[]>(effective.capabilities.length > 0 ? effective.capabilities : summary.requestedCapabilities)
+  const [reason, setReason] = useState(effective.reason)
+  const [saving, setSaving] = useState<'approved' | 'denied' | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const packageId = stringField(pkg, ['id'])
+  const packageStatus = stringField(pkg, ['status'])
+
+  useEffect(() => {
+    setSelected(effective.capabilities.length > 0 ? effective.capabilities : summary.requestedCapabilities)
+    setReason(effective.reason)
+  }, [effective, summary])
+
+  if (summary.requestedCapabilities.length === 0 || packageId === '') return null
+
+  const canEdit = (taskStatus === 'awaiting_approval' || taskStatus === 'approved') &&
+    ['pending', 'ready', 'blocked', 'needs_rework'].includes(packageStatus)
+  const approveDisabled = selected.length === 0 || !selected.includes('filesystem.project.read')
+  const deniedRequired = effective.status === 'denied' && summary.blockingCapabilities.length > 0
+
+  async function submit(decision: 'approved' | 'denied') {
+    setSaving(decision)
+    setError(null)
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/filesystem-grants`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          schemaVersion: 1,
+          grants: [{
+            workPackageId: packageId,
+            decision,
+            capabilities: decision === 'approved' ? selected : [],
+            reason: reason.trim() || undefined,
+          }],
+        }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to save filesystem grant')
+      }
+      await onUpdated()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setSaving(null)
+    }
+  }
+
+  return (
+    <div className="rounded-md border border-border bg-background px-2.5 py-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <p className="font-medium text-muted-foreground">Filesystem context grant</p>
+        <Badge variant="outline" className={statusBadgeClass(effective.status)}>{statusLabel(effective.status)}</Badge>
+        {summary.blockingCapabilities.length > 0 && <Badge variant="secondary">required</Badge>}
+      </div>
+      <div className="mt-2 flex flex-wrap gap-2">
+        {FILESYSTEM_CAPABILITY_OPTIONS.filter((capability) => summary.requestedCapabilities.includes(capability)).map((capability) => (
+          <label key={capability} className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 font-mono text-[11px] text-foreground">
+            <input
+              checked={selected.includes(capability)}
+              disabled={!canEdit}
+              onChange={(event) => {
+                setSelected((current) => event.target.checked
+                  ? [...new Set([...current, capability])].sort()
+                  : current.filter((item) => item !== capability))
+              }}
+              type="checkbox"
+            />
+            {capability.replace('filesystem.project.', '')}
+          </label>
+        ))}
+      </div>
+      {deniedRequired && (
+        <p className="mt-2 text-xs text-destructive">
+          Required filesystem access is denied; this package will block at execution.
+        </p>
+      )}
+      {canEdit && (
+        <div className="mt-2 grid gap-2">
+          <textarea
+            className="min-h-16 w-full rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground"
+            onChange={(event) => setReason(event.target.value)}
+            placeholder="Reason"
+            value={reason}
+          />
+          <div className="flex flex-wrap gap-2">
+            <Button
+              disabled={saving !== null || approveDisabled}
+              onClick={() => void submit('approved')}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              {saving === 'approved' ? 'Saving...' : 'Approve'}
+            </Button>
+            <Button
+              disabled={saving !== null}
+              onClick={() => void submit('denied')}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              {saving === 'denied' ? 'Saving...' : 'Deny'}
+            </Button>
+          </div>
+        </div>
+      )}
+      {effective.grantApprovalId !== '' && (
+        <p className="mt-2 break-all font-mono text-[11px] text-muted-foreground">Grant {effective.grantApprovalId}</p>
+      )}
+      {error !== null && <p role="alert" className="mt-2 text-xs text-destructive">{error}</p>}
+    </div>
+  )
+}
+
 function ApprovedGrantSnapshot({ packages }: { packages: WorkforceRecord[] }) {
   if (packages.length === 0) return null
 
@@ -2038,9 +2247,11 @@ function WorkforcePanel({
   approvalGates,
   vcsChanges,
   commandAudits,
+  filesystemAudits,
   fallbackAgents,
   onGateDecided,
   taskId,
+  taskStatus,
   artifacts,
   runs,
 }: {
@@ -2048,9 +2259,11 @@ function WorkforcePanel({
   approvalGates: ApprovalGate[]
   vcsChanges: VcsChange[]
   commandAudits: CommandAudit[]
+  filesystemAudits: FilesystemAudit[]
   fallbackAgents: PlannedAgent[]
   onGateDecided: () => Promise<void>
   taskId: string
+  taskStatus: string | null
   artifacts: Artifact[]
   runs: AgentRun[]
 }) {
@@ -2295,6 +2508,12 @@ function WorkforcePanel({
                               </div>
                             </div>
                           )}
+                          <FilesystemGrantControls
+                            onUpdated={onGateDecided}
+                            pkg={pkg}
+                            taskId={taskId}
+                            taskStatus={taskStatus}
+                          />
                           <McpGrantCards grants={mcpGrants} />
                           <McpSubtaskCards subtasks={mcpSubtasks} />
                           {packageArtifacts.length > 0 && (
@@ -2511,6 +2730,43 @@ function WorkforcePanel({
                       </div>
                       {artifactId !== '' && <p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">Artifact {artifactId}</p>}
                       {output !== '' && <p className="mt-1 whitespace-pre-wrap break-words text-xs text-muted-foreground">{output}</p>}
+                    </li>
+                  )
+                })}
+              </ul>
+            </details>
+          )}
+          {filesystemAudits.length > 0 && (
+            <details className="mt-3 rounded-md border border-border bg-muted/20 px-3 py-2">
+              <summary className="cursor-pointer text-xs font-medium text-foreground">
+                Filesystem MCP audit
+              </summary>
+              <ul className="mt-2 grid gap-2" aria-label="Filesystem MCP runtime audits">
+                {filesystemAudits.map((audit, index) => {
+                  const status = stringField(audit, ['status'])
+                  const operation = stringField(audit, ['operation'])
+                  const packageId = stringField(audit, ['workPackageId'])
+                  const capabilities = stringArrayField(audit, ['capabilities'])
+                  const requested = stringArrayField(audit, ['requestedCapabilities'])
+                  const fileCount = numberField(audit, ['fileCount'])
+                  const byteCount = numberField(audit, ['byteCount'])
+                  const omittedCount = numberField(audit, ['omittedCount'])
+                  const reason = stringField(audit, ['reason'])
+                  const root = stringField(audit, ['root'])
+                  return (
+                    <li key={recordKey(audit, 'filesystem-audit', index)} className="rounded-md bg-background px-2 py-1.5 ring-1 ring-border">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono text-xs text-foreground">{operation || 'context_packet'}</span>
+                        {status !== '' && <Badge variant="outline" className={statusBadgeClass(status)}>{statusLabel(status)}</Badge>}
+                        {fileCount !== null && <Badge variant="outline">{pluralize(fileCount, 'file')}</Badge>}
+                        {byteCount !== null && <Badge variant="outline">{byteCount} bytes</Badge>}
+                        {omittedCount !== null && omittedCount > 0 && <Badge variant="outline">{omittedCount} omitted</Badge>}
+                      </div>
+                      {packageId !== '' && <p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">Package {packageId}</p>}
+                      {capabilities.length > 0 && <p className="mt-1 break-words font-mono text-[11px] text-muted-foreground">Approved: {capabilities.join(', ')}</p>}
+                      {requested.length > 0 && <p className="mt-1 break-words font-mono text-[11px] text-muted-foreground">Requested: {requested.join(', ')}</p>}
+                      {root !== '' && <p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">Root {root}</p>}
+                      {reason !== '' && <p className="mt-1 whitespace-pre-wrap break-words text-xs text-muted-foreground">{reason}</p>}
                     </li>
                   )
                 })}
@@ -3245,6 +3501,7 @@ export default function TaskDetailPage() {
   const [approvalGates, setApprovalGates] = useState<ApprovalGate[]>([])
   const [vcsChanges, setVcsChanges] = useState<VcsChange[]>([])
   const [commandAudits, setCommandAudits] = useState<CommandAudit[]>([])
+  const [filesystemAudits, setFilesystemAudits] = useState<FilesystemAudit[]>([])
   const [taskLogs, setTaskLogs] = useState<TaskLog[]>([])
   const [liveLogIds, setLiveLogIds] = useState<Set<string>>(new Set())
   const [providers, setProviders] = useState<ProviderConfig[]>([])
@@ -3311,6 +3568,7 @@ export default function TaskDetailPage() {
       setApprovalGates(data.approvalGates ?? [])
       setVcsChanges(data.vcsChanges ?? [])
       setCommandAudits(data.commandAudits ?? [])
+      setFilesystemAudits(data.filesystemAudits ?? [])
     } catch (err) {
       setFetchError(err instanceof Error ? err.message : 'An unexpected error occurred')
     } finally {
@@ -4051,8 +4309,10 @@ export default function TaskDetailPage() {
             approvalGates={approvalGates}
             vcsChanges={vcsChanges}
             commandAudits={commandAudits}
+            filesystemAudits={filesystemAudits}
             fallbackAgents={plannedAgents}
             taskId={taskId}
+            taskStatus={currentStatus}
             onGateDecided={loadTask}
             artifacts={mergedArtifacts}
             runs={mergedRuns}

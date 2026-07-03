@@ -422,6 +422,43 @@ export type WorkPackage = InferSelectModel<typeof workPackages>
 export type NewWorkPackage = InferInsertModel<typeof workPackages>
 
 // ---------------------------------------------------------------------------
+// filesystemMcpGrantApprovals
+// ---------------------------------------------------------------------------
+export const filesystemMcpGrantApprovals = pgTable(
+  'filesystem_mcp_grant_approvals',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id')
+      .notNull()
+      .references(() => tasks.id, { onDelete: 'cascade' }),
+    workPackageId: uuid('work_package_id')
+      .notNull()
+      .references(() => workPackages.id, { onDelete: 'cascade' }),
+    decidedBy: uuid('decided_by').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    // 'approved'|'denied'
+    decision: text('decision').notNull().default('denied'),
+    capabilities: jsonb('capabilities').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    reason: text('reason').notNull().default(''),
+    effectiveGrant: jsonb('effective_grant')
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('filesystem_mcp_grant_approvals_work_package_id_idx').on(t.workPackageId),
+    index('filesystem_mcp_grant_approvals_task_id_idx').on(t.taskId),
+    index('filesystem_mcp_grant_approvals_decision_idx').on(t.decision),
+  ],
+)
+
+export type FilesystemMcpGrantApproval = InferSelectModel<typeof filesystemMcpGrantApprovals>
+export type NewFilesystemMcpGrantApproval = InferInsertModel<typeof filesystemMcpGrantApprovals>
+
+// ---------------------------------------------------------------------------
 // workPackageDependencies
 // ---------------------------------------------------------------------------
 export const workPackageDependencies = pgTable(
@@ -525,6 +562,63 @@ export const artifacts = pgTable(
 
 export type Artifact = InferSelectModel<typeof artifacts>
 export type NewArtifact = InferInsertModel<typeof artifacts>
+
+// ---------------------------------------------------------------------------
+// filesystemMcpRuntimeAudits
+// ---------------------------------------------------------------------------
+export const filesystemMcpRuntimeAudits = pgTable(
+  'filesystem_mcp_runtime_audits',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id')
+      .notNull()
+      .references(() => tasks.id, { onDelete: 'cascade' }),
+    workPackageId: uuid('work_package_id').references(() => workPackages.id, {
+      onDelete: 'set null',
+    }),
+    agentRunId: uuid('agent_run_id').references(() => agentRuns.id, {
+      onDelete: 'set null',
+    }),
+    grantApprovalId: uuid('grant_approval_id').references(() => filesystemMcpGrantApprovals.id, {
+      onDelete: 'set null',
+    }),
+    operation: text('operation').notNull().default('context_packet'),
+    // 'issued'|'blocked'|'not_issued_optional'|'failed'
+    status: text('status').notNull(),
+    capabilities: jsonb('capabilities').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    requestedCapabilities: jsonb('requested_capabilities').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    root: text('root').notNull().default(''),
+    fileCount: integer('file_count').notNull().default(0),
+    byteCount: integer('byte_count').notNull().default(0),
+    omittedCount: integer('omitted_count').notNull().default(0),
+    redactionApplied: boolean('redaction_applied').notNull().default(false),
+    redactionSummary: jsonb('redaction_summary')
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    omittedSummary: jsonb('omitted_summary')
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    reason: text('reason').notNull().default(''),
+    metadata: jsonb('metadata')
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    index('filesystem_mcp_runtime_audits_task_id_idx').on(t.taskId),
+    index('filesystem_mcp_runtime_audits_work_package_id_idx').on(t.workPackageId),
+    index('filesystem_mcp_runtime_audits_agent_run_id_idx').on(t.agentRunId),
+    index('filesystem_mcp_runtime_audits_grant_approval_id_idx').on(t.grantApprovalId),
+    index('filesystem_mcp_runtime_audits_status_idx').on(t.status),
+    index('filesystem_mcp_runtime_audits_created_at_idx').on(t.createdAt),
+  ],
+)
+
+export type FilesystemMcpRuntimeAudit = InferSelectModel<typeof filesystemMcpRuntimeAudits>
+export type NewFilesystemMcpRuntimeAudit = InferInsertModel<typeof filesystemMcpRuntimeAudits>
 
 // ---------------------------------------------------------------------------
 // approvalGates

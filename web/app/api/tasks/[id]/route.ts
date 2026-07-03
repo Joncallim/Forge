@@ -6,6 +6,7 @@ import {
   approvalGates,
   artifacts,
   agentRuns,
+  filesystemMcpRuntimeAudits,
   repositoryCommandAudits,
   taskAttempts,
   taskQuestions,
@@ -52,6 +53,25 @@ async function selectTaskCommandAudits(taskId: string): Promise<(typeof reposito
     if (errorCode(err) === '42P01') {
       console.warn(
         '[GET /api/tasks/:id] repository_command_audits table is missing; returning task detail without command audit rows.',
+        { taskId },
+      )
+      return []
+    }
+    throw err
+  }
+}
+
+async function selectTaskFilesystemAudits(taskId: string): Promise<(typeof filesystemMcpRuntimeAudits.$inferSelect)[]> {
+  try {
+    return await db
+      .select()
+      .from(filesystemMcpRuntimeAudits)
+      .where(eq(filesystemMcpRuntimeAudits.taskId, taskId))
+      .orderBy(asc(filesystemMcpRuntimeAudits.createdAt))
+  } catch (err) {
+    if (errorCode(err) === '42P01') {
+      console.warn(
+        '[GET /api/tasks/:id] filesystem_mcp_runtime_audits table is missing; returning task detail without filesystem MCP audit rows.',
         { taskId },
       )
       return []
@@ -121,7 +141,7 @@ export async function GET(
       artifactsByWorkPackageId.set(workPackageId, existing)
     }
 
-    const [taskWorkPackages, taskApprovalGates, taskVcsChanges, taskCommandAudits] = await Promise.all([
+    const [taskWorkPackages, taskApprovalGates, taskVcsChanges, taskCommandAudits, taskFilesystemAudits] = await Promise.all([
       db
         .select()
         .from(workPackages)
@@ -138,6 +158,7 @@ export async function GET(
         .where(eq(vcsChanges.taskId, id))
         .orderBy(asc(vcsChanges.createdAt)),
       selectTaskCommandAudits(id),
+      selectTaskFilesystemAudits(id),
     ])
     const harnessIds = [
       ...new Set(
@@ -179,6 +200,7 @@ export async function GET(
       workPackages: taskWorkPackagesWithPrompts,
       approvalGates: taskApprovalGates,
       commandAudits: taskCommandAudits,
+      filesystemAudits: taskFilesystemAudits,
       vcsChanges: taskVcsChanges,
     })
   } catch (err) {

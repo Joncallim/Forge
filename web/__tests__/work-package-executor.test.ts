@@ -4,6 +4,8 @@ import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
+  dbInsert: vi.fn(),
+  dbInsertValues: vi.fn(),
   generateText: vi.fn(),
   getModel: vi.fn(),
   recordTaskLogBestEffort: vi.fn(),
@@ -16,6 +18,12 @@ vi.mock('ai', () => ({
 vi.mock('@/lib/providers/registry', () => ({
   getModel: mocks.getModel,
   getProvider: vi.fn(),
+}))
+
+vi.mock('@/db', () => ({
+  db: {
+    insert: mocks.dbInsert,
+  },
 }))
 
 vi.mock('@/worker/task-logs', () => ({
@@ -245,6 +253,8 @@ describe('sanitizeWorkerMessage', () => {
 describe('executeWorkPackage', () => {
   beforeEach(async () => {
     vi.clearAllMocks()
+    mocks.dbInsert.mockReturnValue({ values: mocks.dbInsertValues })
+    mocks.dbInsertValues.mockResolvedValue(undefined)
     tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-executor-test-'))
   })
 
@@ -544,10 +554,19 @@ describe('executeWorkPackage', () => {
     })
   })
 
-  it('blocks optional filesystem runtime when effective grants partially cover requested capabilities', async () => {
+  it('issues context for partial optional filesystem grants and records omitted capabilities', async () => {
     await fs.writeFile(path.join(tempRoot, 'README.md'), 'project context\n')
 
-    await expect(executeWorkPackage(context({
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Continued with approved read context.',
+        files: [{ path: 'package.json', content: '{}' }],
+        commands: [],
+      }),
+    })
+
+    const result = await executeWorkPackage(context({
       workPackage: {
         ...context().workPackage,
         assignedRole: 'backend',
@@ -575,23 +594,41 @@ describe('executeWorkPackage', () => {
           },
         },
       },
-    }))).rejects.toThrow(/Filesystem MCP context blocked/)
-
-    expect(mocks.generateText).not.toHaveBeenCalled()
-    expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
-      metadata: expect.objectContaining({
-        filesystemMcpRuntime: expect.objectContaining({
-          missingRequestedCapabilities: ['filesystem.project.search'],
-          status: 'blocked',
-        }),
-      }),
     }))
+
+    expect(result.executionContextArtifactMetadata).toMatchObject({
+      filesystemMcpRuntime: expect.objectContaining({
+        capabilities: ['filesystem.project.read'],
+        missingRequestedCapabilities: ['filesystem.project.search'],
+        omittedOptionalCapabilities: ['filesystem.project.search'],
+        status: 'issued',
+      }),
+    })
+    const auditPayload = mocks.dbInsertValues.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((payload) => payload.status === 'issued')
+    expect(auditPayload).toMatchObject({
+      requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      status: 'issued',
+    })
+    expect(auditPayload?.metadata).toMatchObject({
+      omittedOptionalCapabilities: ['filesystem.project.search'],
+    })
   })
 
-  it('blocks filesystem runtime when MCP-aware subtasks request uncovered capabilities', async () => {
+  it('issues context and audits omitted MCP-aware subtask capabilities', async () => {
     await fs.writeFile(path.join(tempRoot, 'README.md'), 'project context\n')
 
-    await expect(executeWorkPackage(context({
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Continued with approved read context.',
+        files: [{ path: 'package.json', content: '{}' }],
+        commands: [],
+      }),
+    })
+
+    const result = await executeWorkPackage(context({
       workPackage: {
         ...context().workPackage,
         assignedRole: 'backend',
@@ -623,18 +660,16 @@ describe('executeWorkPackage', () => {
           },
         },
       },
-    }))).rejects.toThrow(/Filesystem MCP context blocked/)
-
-    expect(mocks.generateText).not.toHaveBeenCalled()
-    expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
-      metadata: expect.objectContaining({
-        filesystemMcpRuntime: expect.objectContaining({
-          missingRequestedCapabilities: ['filesystem.project.search'],
-          requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-          status: 'blocked',
-        }),
-      }),
     }))
+
+    expect(result.executionContextArtifactMetadata).toMatchObject({
+      filesystemMcpRuntime: expect.objectContaining({
+        missingRequestedCapabilities: ['filesystem.project.search'],
+        omittedOptionalCapabilities: ['filesystem.project.search'],
+        requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        status: 'issued',
+      }),
+    })
   })
 
   it('blocks proposed-only filesystem grant snapshots without approved effective grants', async () => {
@@ -711,7 +746,7 @@ describe('executeWorkPackage', () => {
     expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
       metadata: expect.objectContaining({
         filesystemMcpRuntime: expect.objectContaining({
-          missingRequestedCapabilities: ['filesystem.project.search'],
+          missingBlockingCapabilities: ['filesystem.project.search'],
           status: 'blocked',
         }),
       }),
@@ -756,7 +791,45 @@ describe('executeWorkPackage', () => {
       metadata: expect.objectContaining({
         filesystemMcpRuntime: expect.objectContaining({
           capabilities: ['filesystem.project.search'],
-          reason: expect.stringMatching(/require an approved filesystem\.project\.read grant/),
+          missingBlockingCapabilities: ['filesystem.project.read'],
+          reason: expect.stringMatching(/not covered by approved effective grants: filesystem\.project\.read/),
+          status: 'blocked',
+        }),
+      }),
+    }))
+  })
+
+  it('blocks effective filesystem grants when the package never requested filesystem access', async () => {
+    await expect(executeWorkPackage(context({
+      workPackage: {
+        ...context().workPackage,
+        assignedRole: 'backend',
+        mcpRequirements: [],
+        metadata: {
+          mcpGrantPhases: {
+            effective: {
+              schemaVersion: 1,
+              phase: 'effective',
+              runtimeEnforcement: 'bounded_context_packet',
+              source: 'explicit-grant-approval',
+              status: 'approved',
+              grants: [{
+                mcpId: 'filesystem',
+                status: 'approved',
+                capabilities: ['filesystem.project.read'],
+              }],
+            },
+          },
+        },
+      },
+    }))).rejects.toThrow(/Filesystem MCP context blocked/)
+
+    expect(mocks.generateText).not.toHaveBeenCalled()
+    expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({
+        filesystemMcpRuntime: expect.objectContaining({
+          capabilities: ['filesystem.project.read'],
+          reason: expect.stringMatching(/did not request filesystem capabilities/i),
           status: 'blocked',
         }),
       }),
@@ -1078,6 +1151,48 @@ describe('executeWorkPackage', () => {
       }),
       redaction: expect.objectContaining({ applied: true }),
     })
+    const auditPayload = mocks.dbInsertValues.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((payload) => payload.status === 'issued')
+    expect(auditPayload).toMatchObject({
+      capabilities: ['filesystem.project.read'],
+      fileCount: 1,
+      omittedCount: expect.any(Number),
+      redactionApplied: true,
+      requestedCapabilities: ['filesystem.project.read'],
+      root: tempRoot,
+      status: 'issued',
+      taskId: 'task-1',
+      workPackageId: 'pkg-1',
+    })
+    expect(JSON.stringify(auditPayload)).not.toContain('should-not-leak')
+  })
+
+  it('audits blocked filesystem context when required grants are missing', async () => {
+    await expect(executeWorkPackage(context({
+      workPackage: {
+        ...context().workPackage,
+        mcpRequirements: [{
+          mcpId: 'filesystem',
+          requirement: 'required',
+          permissions: ['filesystem.project.read'],
+          reason: 'Inspect project context.',
+          fallback: { action: 'block' },
+        }],
+        metadata: {},
+      },
+    }))).rejects.toThrow(/Filesystem MCP context blocked/i)
+
+    const auditPayload = mocks.dbInsertValues.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((payload) => payload.status === 'blocked')
+    expect(auditPayload).toMatchObject({
+      requestedCapabilities: ['filesystem.project.read'],
+      status: 'blocked',
+      taskId: 'task-1',
+      workPackageId: 'pkg-1',
+    })
+    expect(String(auditPayload?.reason)).toMatch(/not covered by approved effective grants/i)
   })
 
   it('rejects placeholder tests and build scripts when the task requires them', async () => {
