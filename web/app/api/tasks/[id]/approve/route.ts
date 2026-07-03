@@ -7,6 +7,7 @@ import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
+import { isExplicitFilesystemEffectivePhase } from '@/lib/mcps/filesystem-grants'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -37,7 +38,9 @@ function buildApprovedPackageGrantPhases(input: {
     sourceStatus: typeof grant.status === 'string' ? grant.status : null,
     status: approvedStatusForGrant(grant.status),
   }))
-  const effectiveGrants: Record<string, unknown>[] = []
+  const existingEffective = isExplicitFilesystemEffectivePhase(existingPhases.effective)
+    ? existingPhases.effective
+    : null
 
   return {
     ...existingPhases,
@@ -53,14 +56,14 @@ function buildApprovedPackageGrantPhases(input: {
       runtimeEnforcement: 'approved_snapshot',
       note: 'Plan approval converted proposed MCP grant decisions into package-local approved grants. Runtime context is issued later by the work-package executor from the effective grant phase.',
     },
-    effective: {
+    effective: existingEffective ?? {
       schemaVersion: 1,
       phase: 'effective',
       source: 'task-approval',
-      grants: effectiveGrants,
+      grants: [],
       runtimeIssued: false,
       runtimeEnforcement: 'approved_snapshot',
-      status: effectiveGrants.length > 0 ? 'ready' : 'not_issued',
+      status: 'not_issued',
       note: 'Task plan approval does not convert Architect-proposed MCP grants into runtime-effective grants. Effective grants must come from an explicit grant approval path before bounded runtime context can be issued.',
     },
   }

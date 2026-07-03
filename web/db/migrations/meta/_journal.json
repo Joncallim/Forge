@@ -141,6 +141,13 @@
       "when": 1782961997571,
       "tag": "0019_task_logs_sequence_idx",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1782969000000,
+      "tag": "0020_filesystem_mcp_runtime_audits",
+      "breakpoints": true
     }
   ]
 }
