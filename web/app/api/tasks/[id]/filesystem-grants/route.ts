@@ -222,6 +222,9 @@ export async function GET(
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })
     }
+    if (task.submittedBy !== session.userId) {
+      return NextResponse.json({ error: 'Task not found' }, { status: 404 })
+    }
 
     const [packages, approvals] = await Promise.all([
       db.select().from(workPackages).where(eq(workPackages.taskId, taskId)),
@@ -463,26 +466,16 @@ export async function PUT(
     // approval job and publish the status change so the worker picks the task up
     // again; otherwise the recovered task sits idle until a manual handoff retry.
     if (recoveredTask) {
-      const queueFailureMessage = 'Filesystem grants were updated, but Forge could not requeue the recovered task. The task was returned to failed status; retry once Redis is healthy.'
+      const queueFailureMessage = 'Filesystem grants were updated and the task is approved, but Forge could not enqueue the recovery job. Retry handoff once Redis is healthy.'
       try {
         await redis.lpush('forge:approvals', JSON.stringify({ taskId, action: 'approve' }))
       } catch (err) {
         console.error('[tasks/filesystem-grants PUT] Failed to enqueue approval worker job', err)
-        const failedAt = new Date()
-        await db
-          .update(tasks)
-          .set({ errorMessage: queueFailureMessage, status: 'failed', updatedAt: failedAt })
-          .where(eq(tasks.id, taskId))
-        try {
-          await redis.publish('forge:task:' + taskId, JSON.stringify({
-            type: 'task:status',
-            status: 'failed',
-            updatedAt: failedAt.toISOString(),
-          }))
-        } catch (publishErr) {
-          console.error('[tasks/filesystem-grants PUT] Failed to publish rollback status event', publishErr)
-        }
-        return NextResponse.json({ error: queueFailureMessage }, { status: 503 })
+        return NextResponse.json({
+          error: queueFailureMessage,
+          grants: results,
+          taskStatus: 'approved',
+        }, { status: 202 })
       }
       try {
         await redis.publish('forge:task:' + taskId, JSON.stringify({

@@ -4731,7 +4731,22 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     expect(mockDbUpdate).not.toHaveBeenCalled()
   })
 
-  it('returns 503 and restores failed status when the recovered task cannot be requeued', async () => {
+  it('returns 404 for privileged filesystem grant reads on a legacy null-owned task', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect
+      .mockReturnValueOnce(chain([grantTask('project-fs-grant', 'failed', null)]))
+
+    const { GET } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
+    const res = await GET(authRequest('/api/tasks/task-fs-grant/filesystem-grants') as never, {
+      params: Promise.resolve({ id: 'task-fs-grant' }),
+    })
+
+    expect(res.status).toBe(404)
+    expect(mockDbInsert).not.toHaveBeenCalled()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+  })
+
+  it('returns 202 and leaves the task approved when the recovered task cannot be requeued', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbInsert.mockReturnValue(chain([{
       id: FS_GRANT_APPROVAL_ID,
@@ -4774,8 +4789,6 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       packageUpdate.set = vi.fn(() => packageUpdate)
       const taskApproveUpdate = chain([{ ...grantTask(project.id as string, 'approved'), updatedAt: new Date('2026-07-03T00:02:00.000Z') }])
       taskApproveUpdate.set = vi.fn(() => taskApproveUpdate)
-      const taskRollbackUpdate = chain([{ ...grantTask(project.id as string, 'failed'), errorMessage: 'queue failed', updatedAt: new Date('2026-07-03T00:03:00.000Z') }])
-      taskRollbackUpdate.set = vi.fn(() => taskRollbackUpdate)
       mockDbSelect
         .mockReturnValueOnce(chain([grantTask(project.id as string, 'failed')]))
         .mockReturnValueOnce(chain([project]))
@@ -4787,7 +4800,6 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)
         .mockReturnValueOnce(taskApproveUpdate)
-        .mockReturnValueOnce(taskRollbackUpdate)
 
       const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
       const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
@@ -4806,10 +4818,8 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         params: Promise.resolve({ id: 'task-fs-grant' }),
       })
 
-      expect(res.status).toBe(503)
-      expect(taskRollbackUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-        status: 'failed',
-      }))
+      expect(res.status).toBe(202)
+      expect(mockDbUpdate).toHaveBeenCalledTimes(3)
     })
   })
 
