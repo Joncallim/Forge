@@ -1634,7 +1634,7 @@ function FilesystemGrantControls({
   const canEdit = (
     (taskStatus === 'awaiting_approval' || taskStatus === 'approved') &&
     ['pending', 'ready', 'blocked', 'needs_rework'].includes(packageStatus)
-  ) || (taskStatus === 'failed' && packageStatus === 'failed')
+  ) || (taskStatus === 'failed' && ['failed', 'blocked'].includes(packageStatus))
   const approveDisabled = selected.length === 0 || !selected.includes('filesystem.project.read')
   const deniedRequired = effective.status === 'denied' && summary.blockingCapabilities.length > 0
 
@@ -1655,11 +1655,14 @@ function FilesystemGrantControls({
           }],
         }),
       })
+      const body = await res.json().catch(() => ({}))
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}))
         throw new Error(body.error ?? 'Failed to save filesystem grant')
       }
       await onUpdated()
+      if (res.status === 202) {
+        setError(body.error ?? 'Filesystem grant saved, but Forge could not requeue the recovered task. Retry handoff manually.')
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An unexpected error occurred')
     } finally {
