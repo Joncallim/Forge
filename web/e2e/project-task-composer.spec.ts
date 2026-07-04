@@ -14,7 +14,10 @@ test.describe('project task composer', () => {
   test('minimizes draft on outside interaction, restores it, and submits with Control+Enter', async ({ page, context }) => {
     const session = await seedSession('Composer Operator')
     await installSessionCookie(context, session)
-    const { projectId } = await seedProject({ name: 'Composer Controls Project' })
+    const { projectId } = await seedProject({
+      name: 'Composer Controls Project',
+      userId: session.userId,
+    })
 
     await page.goto(`/dashboard/projects/${projectId}`)
     await expect(page.getByRole('heading', { name: 'Composer Controls Project' })).toBeVisible()

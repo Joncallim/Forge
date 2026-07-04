@@ -3,6 +3,7 @@ import {
   ROADMAP_FILE_CANDIDATES,
   createProjectIssue,
   fetchProjectRoadmap,
+  GitHubRepoUnavailableError,
   isValidGitHubRepo,
   listProjectIssues,
 } from '@/lib/github-project'
@@ -103,6 +104,11 @@ describe('listProjectIssues', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(403, {})))
     await expect(listProjectIssues('token', 'owner/repo')).rejects.toThrow(/403/)
   })
+
+  it('throws a typed repo-unavailable error on 404', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(404, {})))
+    await expect(listProjectIssues('token', 'owner/repo')).rejects.toBeInstanceOf(GitHubRepoUnavailableError)
+  })
 })
 
 describe('createProjectIssue', () => {
@@ -129,5 +135,10 @@ describe('createProjectIssue', () => {
     vi.stubGlobal('fetch', fetchMock)
     await expect(createProjectIssue('token', 'owner/repo', { title: '   ' })).rejects.toThrow(/title is required/i)
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('throws a typed repo-unavailable error on 404 while creating', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(404, {})))
+    await expect(createProjectIssue('token', 'owner/repo', { title: 'New one' })).rejects.toBeInstanceOf(GitHubRepoUnavailableError)
   })
 })

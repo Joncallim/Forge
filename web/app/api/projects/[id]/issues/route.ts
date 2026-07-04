@@ -4,13 +4,19 @@ import { z } from 'zod'
 import { getSession } from '@/lib/session'
 import { getAccessibleProject } from '@/lib/project-access'
 import { resolveGitHubToken } from '@/lib/github'
-import { createProjectIssue, isValidGitHubRepo, listProjectIssues } from '@/lib/github-project'
+import {
+  createProjectIssue,
+  GitHubRepoUnavailableError,
+  isValidGitHubRepo,
+  listProjectIssues,
+} from '@/lib/github-project'
 
 // ---------------------------------------------------------------------------
 // GET /api/projects/:id/issues
 //
 // Returns the project repo's GitHub issues. `reason` distinguishes the disabled
-// states the UI renders: no configured repo vs. no available GitHub auth.
+// states the UI renders: no configured repo, no available GitHub auth, or a
+// configured repo that GitHub reported as unavailable/inaccessible.
 // ---------------------------------------------------------------------------
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -31,7 +37,15 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       return NextResponse.json({ repo: project.githubRepo, reason: 'no-auth', issues: [] })
     }
 
-    const issues = await listProjectIssues(resolved.token, project.githubRepo)
+    let issues
+    try {
+      issues = await listProjectIssues(resolved.token, project.githubRepo)
+    } catch (err) {
+      if (err instanceof GitHubRepoUnavailableError) {
+        return NextResponse.json({ repo: project.githubRepo, reason: 'repo-unavailable', issues: [] })
+      }
+      throw err
+    }
     return NextResponse.json({ repo: project.githubRepo, reason: null, issues })
   } catch (err) {
     console.error('[GET /api/projects/:id/issues] Unexpected error', err)
@@ -80,7 +94,18 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       return NextResponse.json({ error: 'No GitHub authentication available' }, { status: 400 })
     }
 
-    const issue = await createProjectIssue(resolved.token, project.githubRepo, parsed.data)
+    let issue
+    try {
+      issue = await createProjectIssue(resolved.token, project.githubRepo, parsed.data)
+    } catch (err) {
+      if (err instanceof GitHubRepoUnavailableError) {
+        return NextResponse.json(
+          { error: 'Configured GitHub repository was not found or is not accessible with the current token' },
+          { status: 404 },
+        )
+      }
+      throw err
+    }
     return NextResponse.json({ issue }, { status: 201 })
   } catch (err) {
     console.error('[POST /api/projects/:id/issues] Unexpected error', err)

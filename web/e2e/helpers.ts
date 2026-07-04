@@ -186,8 +186,14 @@ export async function seedProjectTask(input: {
 
   try {
     await sql`
-      insert into projects (id, name, github_repo, default_branch)
-      values (${projectId}, ${`${input.title} Project`}, ${'owner/forge-controls'}, ${'main'})
+      insert into projects (id, name, github_repo, default_branch, submitted_by)
+      values (
+        ${projectId},
+        ${`${input.title} Project`},
+        ${'owner/forge-controls'},
+        ${'main'},
+        ${input.userId}
+      )
     `
     await sql`
       insert into tasks (id, project_id, submitted_by, title, prompt, status)
@@ -211,18 +217,20 @@ export async function seedProject(input: {
   defaultBranch?: string
   githubRepo?: string | null
   name: string
+  userId: string
 }): Promise<SeededProject> {
   const sql = sqlClient()
   const projectId = crypto.randomUUID()
 
   try {
     await sql`
-      insert into projects (id, name, github_repo, default_branch)
+      insert into projects (id, name, github_repo, default_branch, submitted_by)
       values (
         ${projectId},
         ${input.name},
         ${input.githubRepo ?? 'owner/forge-composer'},
-        ${input.defaultBranch ?? 'main'}
+        ${input.defaultBranch ?? 'main'},
+        ${input.userId}
       )
     `
   } finally {

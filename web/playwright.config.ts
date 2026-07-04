@@ -24,7 +24,9 @@ export default defineConfig({
   webServer: {
     command: 'npm run dev -- --hostname 127.0.0.1',
     url: baseURL,
-    reuseExistingServer: !process.env.CI,
+    // Reusing an arbitrary local dev server can bypass the E2E env below
+    // (notably FORGE_EMBED_WORKER=0) and make the suite nondeterministic.
+    reuseExistingServer: process.env.PLAYWRIGHT_REUSE_EXISTING_SERVER === '1',
     timeout: 120_000,
     env: {
       DATABASE_URL: process.env.DATABASE_URL ?? '',
