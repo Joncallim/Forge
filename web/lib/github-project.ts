@@ -98,6 +98,16 @@ export type ProjectIssue = {
 
 const LIST_ISSUES_PAGE_SIZE = 30
 
+export class GitHubRepoUnavailableError extends Error {
+  readonly status: number
+
+  constructor(repo: string, status: number) {
+    super(`GitHub repository "${repo}" is not available (HTTP ${status}).`)
+    this.name = 'GitHubRepoUnavailableError'
+    this.status = status
+  }
+}
+
 /**
  * List issues for `repo`, newest-updated first, excluding pull requests (the
  * REST issues endpoint returns PRs too; they carry a `pull_request` field).
@@ -112,6 +122,9 @@ export async function listProjectIssues(
   const state = options.state ?? 'open'
   const url = `https://api.github.com/repos/${repo}/issues?state=${state}&per_page=${LIST_ISSUES_PAGE_SIZE}&sort=updated&direction=desc`
   const res = await githubFetch(url, token)
+  if (res.status === 404) {
+    throw new GitHubRepoUnavailableError(repo, res.status)
+  }
   if (!res.ok) {
     throw new Error(`GitHub API returned ${res.status} while listing issues`)
   }
@@ -152,6 +165,9 @@ export async function createProjectIssue(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ title, body: input.body?.trim() || undefined }),
   })
+  if (res.status === 404) {
+    throw new GitHubRepoUnavailableError(repo, res.status)
+  }
   if (!res.ok) {
     throw new Error(`GitHub API returned ${res.status} while creating an issue`)
   }

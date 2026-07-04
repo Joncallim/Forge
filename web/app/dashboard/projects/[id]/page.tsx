@@ -225,7 +225,7 @@ function formatIssueTimestamp(value: string): string {
 function ProjectIssuesSection({ projectId }: { projectId: string }) {
   const [issues, setIssues] = useState<ProjectIssue[]>([])
   const [repo, setRepo] = useState<string | null>(null)
-  const [reason, setReason] = useState<'no-repo' | 'no-auth' | null>(null)
+  const [reason, setReason] = useState<'no-repo' | 'no-auth' | 'repo-unavailable' | null>(null)
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
@@ -288,7 +288,7 @@ function ProjectIssuesSection({ projectId }: { projectId: string }) {
     }
   }
 
-  const canCreate = reason !== 'no-repo' && reason !== 'no-auth'
+  const canCreate = reason !== 'no-repo' && reason !== 'no-auth' && reason !== 'repo-unavailable'
 
   return (
     <section aria-labelledby="project-issues-heading" className="mb-6 rounded-xl border border-border bg-card p-4">
@@ -356,6 +356,12 @@ function ProjectIssuesSection({ projectId }: { projectId: string }) {
           Connect GitHub in{' '}
           <a href="/dashboard/settings#github" className="underline underline-offset-2">Settings</a>{' '}
           to see and create issues for <span className="font-mono">{repo}</span>.
+        </p>
+      ) : reason === 'repo-unavailable' ? (
+        <p className="text-sm text-muted-foreground">
+          The configured GitHub repository
+          {repo ? <> <span className="font-mono">{repo}</span></> : null}
+          {' '}was not found or is not accessible with the current token.
         </p>
       ) : fetchError !== null ? (
         <div role="alert" className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
