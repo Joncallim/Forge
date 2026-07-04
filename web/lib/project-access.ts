@@ -1,21 +1,20 @@
-import { and, eq, isNull, or } from 'drizzle-orm'
+import { and, eq } from 'drizzle-orm'
 import { db } from '@/db'
 import { projects } from '@/db/schema'
 
-// Project ownership scoping (mirrors lib/task-access.ts). A project is
-// accessible to the user who created it, or to anyone when submittedBy is null
-// (pre-ownership rows), so existing single-operator installs are unaffected
-// while new projects are scoped to their creator.
+// Project ownership scoping. Legacy rows are backfilled during the migration
+// when the install has exactly one user; otherwise unclaimed rows remain
+// inaccessible until ownership is explicitly assigned.
 
 export function accessibleProjectCondition(projectId: string, userId: string) {
   return and(
     eq(projects.id, projectId),
-    or(eq(projects.submittedBy, userId), isNull(projects.submittedBy)),
+    eq(projects.submittedBy, userId),
   )
 }
 
 export function accessibleProjectOwnerCondition(userId: string) {
-  return or(eq(projects.submittedBy, userId), isNull(projects.submittedBy))
+  return eq(projects.submittedBy, userId)
 }
 
 export async function getAccessibleProject(projectId: string, userId: string) {

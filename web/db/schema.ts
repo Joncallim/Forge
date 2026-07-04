@@ -172,9 +172,9 @@ export const DEFAULT_PROJECT_MCP_CONFIG: ProjectMcpConfig = {
 export const projects = pgTable('projects', {
   id: uuid('id').primaryKey().defaultRandom(),
   name: text('name').notNull(),
-  // The user who created the project. Nullable so pre-existing rows (created
-  // before ownership scoping) remain accessible to everyone, matching the
-  // tasks.submittedBy pattern; new projects are scoped to their creator.
+  // The user who created the project. Nullable only so the migration can add
+  // the column safely; pre-existing rows are backfilled to the sole user on
+  // single-user installs, and unclaimed rows stay inaccessible until claimed.
   submittedBy: uuid('submitted_by').references(() => users.id, {
     onDelete: 'set null',
   }),
