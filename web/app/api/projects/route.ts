@@ -9,7 +9,7 @@ import { z } from 'zod'
 import { db } from '@/db'
 import { DEFAULT_PROJECT_MCP_CONFIG, projects, type ProjectMcpConfig } from '@/db/schema'
 import { and, isNull, desc } from 'drizzle-orm'
-import { accessibleProjectOwnerCondition } from '@/lib/project-access'
+import { accessibleProjectOwnerCondition, claimUnownedProjects } from '@/lib/project-access'
 import { getSession } from '@/lib/session'
 import { registerProjectPath } from '@/lib/project-registry'
 import { resolveGitHubToken, validateGitHubTokenEnvVar } from '@/lib/github'
@@ -235,6 +235,7 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
+    await claimUnownedProjects(session.userId)
     const rows = await db
       .select()
       .from(projects)

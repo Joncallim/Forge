@@ -1,4 +1,4 @@
-import { and, eq } from 'drizzle-orm'
+import { and, eq, isNull } from 'drizzle-orm'
 import { db } from '@/db'
 import { projects } from '@/db/schema'
 
@@ -17,6 +17,14 @@ export function accessibleProjectOwnerCondition(userId: string) {
   return eq(projects.submittedBy, userId)
 }
 
+export async function claimUnownedProjects(userId: string) {
+  return db
+    .update(projects)
+    .set({ submittedBy: userId })
+    .where(isNull(projects.submittedBy))
+    .returning({ id: projects.id })
+}
+
 export async function getAccessibleProject(projectId: string, userId: string) {
   const [project] = await db
     .select()
@@ -24,5 +32,13 @@ export async function getAccessibleProject(projectId: string, userId: string) {
     .where(accessibleProjectCondition(projectId, userId))
     .limit(1)
 
-  return project ?? null
+  if (project) return project
+
+  const [claimedProject] = await db
+    .update(projects)
+    .set({ submittedBy: userId })
+    .where(and(eq(projects.id, projectId), isNull(projects.submittedBy)))
+    .returning()
+
+  return claimedProject ?? null
 }
