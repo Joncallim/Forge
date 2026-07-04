@@ -222,6 +222,20 @@ describe('checkAcpReadiness', () => {
     expect(result.status).toBe('unreachable')
     expect(result.message).toContain('ENOENT')
   })
+
+  it('treats a filesystem "permission denied" process error as unreachable, not an auth failure', async () => {
+    const child = new FakeChildProcess()
+    const spawnFn = makeSpawnFn(child)
+
+    const promise = checkAcpReadiness('codex-cli', spawnFn)
+    child.stderr.emit('data', Buffer.from('EACCES: permission denied, open /home/user/.codex/config.toml'))
+    child.emit('exit', 1)
+    const result = await promise
+
+    // A filesystem/install permission problem must surface as the real
+    // unreachable/permissions failure rather than telling the operator to sign in.
+    expect(result.status).toBe('unreachable')
+  })
 })
 
 describe('AcpSessionClient', () => {

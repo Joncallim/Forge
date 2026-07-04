@@ -76,7 +76,15 @@ function looksLikeAuthFailure(message: string | undefined): boolean {
   // Require a genuine auth-failure phrase rather than a bare word like "token"
   // or "auth", which routinely appear as noise in unrelated crash output and
   // would otherwise misclassify a plain process crash as an auth problem.
-  return /(?:not\s+(?:authenticated|logged\s*in|signed\s*in)|unauthenticated|unauthoriz|please\s+(?:log\s*in|login|sign\s*in|authenticate)|require[sd]?\s+(?:authentication|login|sign\s*in|an?\s+api\s*key)|authentication\s+(?:required|failed)|login\s+required|sign\s*in\s+(?:required|to)|(?:invalid|missing|expired)\s+(?:api\s*key|token|credentials?)|api\s*key\s+(?:required|missing|invalid|not\s+set)|permission\s+denied|\bforbidden\b|\b40[13]\b)/i.test(message)
+  //
+  // Note: "permission denied" is deliberately NOT treated as an auth signal.
+  // Because this check runs before the process-exit/transport branch, a
+  // filesystem or install failure (an unreadable CLI/config path, spawn EACCES)
+  // that says "permission denied" would otherwise be misreported as "Needs
+  // login" instead of the real unreachable/permissions problem. Genuine HTTP
+  // auth denials are still caught by the 401/403 and "forbidden"/"unauthorized"
+  // alternatives below.
+  return /(?:not\s+(?:authenticated|logged\s*in|signed\s*in)|unauthenticated|unauthoriz|please\s+(?:log\s*in|login|sign\s*in|authenticate)|require[sd]?\s+(?:authentication|login|sign\s*in|an?\s+api\s*key)|authentication\s+(?:required|failed)|login\s+required|sign\s*in\s+(?:required|to)|(?:invalid|missing|expired)\s+(?:api\s*key|token|credentials?)|api\s*key\s+(?:required|missing|invalid|not\s+set)|\bforbidden\b|\b40[13]\b)/i.test(message)
 }
 
 /**
