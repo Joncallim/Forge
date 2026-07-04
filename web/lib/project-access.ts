@@ -2,9 +2,9 @@ import { and, eq } from 'drizzle-orm'
 import { db } from '@/db'
 import { projects } from '@/db/schema'
 
-// Project ownership scoping. Legacy rows are backfilled during the migration
-// when the install has exactly one user; otherwise unclaimed rows remain
-// inaccessible until ownership is explicitly assigned.
+// Project ownership scoping. Legacy rows are backfilled during the migration to
+// the oldest existing user so upgraded installs keep a deterministic owner
+// without leaving `submitted_by IS NULL` rows globally accessible.
 
 export function accessibleProjectCondition(projectId: string, userId: string) {
   return and(

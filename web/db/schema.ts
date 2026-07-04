@@ -173,8 +173,8 @@ export const projects = pgTable('projects', {
   id: uuid('id').primaryKey().defaultRandom(),
   name: text('name').notNull(),
   // The user who created the project. Nullable only so the migration can add
-  // the column safely; pre-existing rows are backfilled to the sole user on
-  // single-user installs, and unclaimed rows stay inaccessible until claimed.
+  // the column safely; pre-existing rows are backfilled to the oldest user so
+  // upgraded installs keep deterministic ownership without shared null access.
   submittedBy: uuid('submitted_by').references(() => users.id, {
     onDelete: 'set null',
   }),
