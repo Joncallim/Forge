@@ -86,7 +86,7 @@ function dbChain(value: unknown) {
     catch: (onRejected: (e: unknown) => unknown) =>
       Promise.resolve(value).catch(onRejected),
   }
-  ;['from', 'where', 'limit', 'orderBy', 'select'].forEach((m) => { t[m] = () => t })
+  ;['from', 'where', 'limit', 'orderBy', 'select', 'innerJoin'].forEach((m) => { t[m] = () => t })
   return t
 }
 
