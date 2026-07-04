@@ -19,6 +19,10 @@ import {
   isRetryableMcpBrokerBlock,
 } from './mcp-execution-design'
 import { buildMcpBrokerBlockMetadata } from './blocked-handoff-retry'
+import {
+  FILESYSTEM_GRANT_BLOCK_METADATA_KEY,
+  requiresFilesystemGrantApproval,
+} from '../lib/mcps/filesystem-grants'
 import { updateTaskStatusIfCurrent } from './task-state'
 import {
   completeTaskIfReviewGatesSatisfied,
@@ -784,6 +788,93 @@ function architectReservedHandoffBlockedReason(pkg: HandoffPackage): string | nu
   return `Architect-assigned "${pkg.assignedRole}" work packages are reserved for review gates and cannot execute.`
 }
 
+// Hold a package that still needs explicit filesystem grant approval BEFORE it is
+// claimed for execution. Without this, plan approval (which never issues an
+// effective filesystem grant) would let the package be claimed and run, and the
+// executor would throw a guaranteed "context blocked" error on every attempt —
+// burning the whole implementation attempt budget on failed runs and leaving no
+// budget for the corrected run after the operator approves the grant. Failing
+// here creates no agent run and consumes no attempt, so the recovery run starts
+// fresh at attempt 1 once the grant is approved.
+async function failWorkPackageForFilesystemGrant(input: {
+  blockedReason: string
+  missingCapabilities: string[]
+  pkg: HandoffPackage
+  requestedCapabilities: string[]
+  taskId: string
+}): Promise<{ blockedReason: string; status: 'blocked'; terminalBlock: true } | { status: 'allowed' }> {
+  const failedAt = new Date()
+  const metadata = {
+    ...(isRecord(input.pkg.metadata) ? input.pkg.metadata : {}),
+    [FILESYSTEM_GRANT_BLOCK_METADATA_KEY]: {
+      blockedAt: failedAt.toISOString(),
+      missingCapabilities: input.missingCapabilities,
+      reason: input.blockedReason,
+      requestedCapabilities: input.requestedCapabilities,
+      source: 'filesystem-grant-approval',
+      status: 'failed',
+    },
+  }
+  const [failedRow] = await db
+    .update(workPackages)
+    .set({
+      blockedReason: input.blockedReason,
+      metadata,
+      status: 'failed',
+      updatedAt: failedAt,
+    })
+    .where(and(eq(workPackages.id, input.pkg.id), inArray(workPackages.status, ['pending', 'ready', 'needs_rework', 'blocked'])))
+    .returning({ id: workPackages.id })
+
+  if (!failedRow) return { status: 'allowed' }
+
+  await publishTaskEvent(input.taskId, 'work_package:status', {
+    blockedReason: input.blockedReason,
+    mcpGrantBlock: {
+      missingCapabilities: input.missingCapabilities,
+      requestedCapabilities: input.requestedCapabilities,
+      source: 'filesystem-grant-approval',
+      status: 'failed',
+    },
+    status: 'failed',
+    updatedAt: failedAt.toISOString(),
+    workPackageId: input.pkg.id,
+  })
+  await recordTaskLogBestEffort({
+    eventType: 'mcp.filesystem.grant_required',
+    level: 'warning',
+    message: `"${input.pkg.title}" needs filesystem grant approval before it can run: ${input.blockedReason}`,
+    metadata: {
+      missingCapabilities: input.missingCapabilities,
+      requestedCapabilities: input.requestedCapabilities,
+      workPackageId: input.pkg.id,
+    },
+    source: 'mcp',
+    taskId: input.taskId,
+    title: 'Filesystem grant required',
+    workPackageId: input.pkg.id,
+  })
+
+  return { blockedReason: input.blockedReason, status: 'blocked', terminalBlock: true }
+}
+
+function filesystemGrantHandoffBlock(pkg: HandoffPackage): {
+  blockedReason: string
+  missingCapabilities: string[]
+  requestedCapabilities: string[]
+} | null {
+  const check = requiresFilesystemGrantApproval({
+    mcpRequirements: pkg.mcpRequirements,
+    metadata: pkg.metadata,
+  })
+  if (!check.blocked) return null
+  return {
+    blockedReason: `Work package "${pkg.title}" requires filesystem grant approval for ${check.missingCapabilities.join(', ')} before execution. Approve filesystem context for this package, then re-run the task.`,
+    missingCapabilities: check.missingCapabilities,
+    requestedCapabilities: check.requestedCapabilities,
+  }
+}
+
 async function failWorkPackageForReservedRole(input: {
   blockedReason: string
   pkg: HandoffPackage
@@ -1023,6 +1114,17 @@ async function assertWorkPackageAllowsHandoff(
     return failWorkPackageForReservedRole({
       blockedReason: reservedRoleBlock,
       pkg,
+      taskId,
+    })
+  }
+
+  const filesystemGrantBlock = filesystemGrantHandoffBlock(pkg)
+  if (filesystemGrantBlock) {
+    return failWorkPackageForFilesystemGrant({
+      blockedReason: filesystemGrantBlock.blockedReason,
+      missingCapabilities: filesystemGrantBlock.missingCapabilities,
+      pkg,
+      requestedCapabilities: filesystemGrantBlock.requestedCapabilities,
       taskId,
     })
   }

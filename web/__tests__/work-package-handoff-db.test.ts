@@ -472,6 +472,59 @@ describe('handoffApprovedWorkPackages', () => {
     }))
   })
 
+  it('holds a required filesystem package for grant approval before claiming or running it', async () => {
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([
+        {
+          id: 'pkg-fs',
+          assignedRole: 'backend',
+          harnessId: 'harness-1',
+          mcpRequirements: [{
+            mcpId: 'filesystem',
+            requirement: 'required',
+            capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+          }],
+          // Plan-approved, but no approved effective filesystem grant issued yet.
+          metadata: {},
+          sequence: 1,
+          status: 'pending',
+          title: 'Read project files',
+        },
+      ]))
+      .mockReturnValueOnce(chain([]))
+
+    const failedPackageUpdate = updateChain([{ id: 'pkg-fs' }])
+    const failedTaskUpdate = updateChain([{ id: 'task-1' }])
+    mocks.dbUpdate
+      .mockReturnValueOnce(failedPackageUpdate)
+      .mockReturnValueOnce(failedTaskUpdate)
+
+    const result = await progressWorkforce('task-1')
+
+    expect(result).toMatchObject({
+      blockedReason: expect.stringContaining('requires filesystem grant approval'),
+      claimedPackageId: null,
+      status: 'blocked',
+      terminalBlock: true,
+    })
+    // Failed at the gate: the package carries the grant-block marker and no
+    // implementation run/transaction was ever started, so no attempt is spent.
+    expect(failedPackageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'failed',
+      metadata: expect.objectContaining({
+        mcpGrantBlock: expect.objectContaining({
+          source: 'filesystem-grant-approval',
+          status: 'failed',
+        }),
+      }),
+    }))
+    expect(failedTaskUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      errorMessage: expect.stringContaining('requires filesystem grant approval'),
+      status: 'failed',
+    }))
+    expect(mocks.dbTransaction).not.toHaveBeenCalled()
+  })
+
   it('runs the broker before ready promotion when handoff claiming is disabled', async () => {
     mocks.dbSelect
       .mockReturnValueOnce(chain([

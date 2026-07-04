@@ -94,8 +94,19 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   // Hydrate from localStorage on mount (client only). The inline script already
   // applied the visual theme; this syncs React state to the same values.
   useEffect(() => {
-    const storedMode = normalizeThemeMode(localStorage.getItem(THEME_MODE_STORAGE_KEY))
-    const storedAccent = normalizeThemeAccent(localStorage.getItem(THEME_ACCENT_STORAGE_KEY))
+    // Reading storage can throw a SecurityError when Web Storage is blocked
+    // (private mode, "block cookies" settings). This effect wraps the whole app,
+    // so an uncaught throw here would take the dashboard down. Fall back to the
+    // defaults — the same tolerance the setters and the inline pre-paint script
+    // already have.
+    let storedMode = DEFAULT_THEME_MODE
+    let storedAccent = DEFAULT_THEME_ACCENT
+    try {
+      storedMode = normalizeThemeMode(localStorage.getItem(THEME_MODE_STORAGE_KEY))
+      storedAccent = normalizeThemeAccent(localStorage.getItem(THEME_ACCENT_STORAGE_KEY))
+    } catch {
+      // Storage unavailable; keep the default session theme.
+    }
     setModeState(storedMode)
     setAccentState(storedAccent)
     setSystemDark(prefersDark())

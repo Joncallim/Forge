@@ -114,6 +114,25 @@ Issue / Request
 - Models: any configured provider/runtime; unassigned work resolves to the
   workspace default provider (see #88).
 
+## Documentation style
+
+**Always write documentation to be layman-readable.** Any human-facing prose —
+`README`s, files under `docs/`, the wiki, ADRs, developer/operator guides, PR
+descriptions, and comments meant for people rather than the compiler — must be
+understandable by a smart non-expert who does not already know this codebase.
+
+- Prefer plain language. Say what something does and *why* it matters before how.
+- Expand an acronym or term the first time it appears (e.g. "work package", ACP,
+  MCP, "execution lease"), or link to where it's defined.
+- Lead with the point; keep sentences short. Avoid unexplained jargon and
+  insider shorthand.
+- Show a concrete example when a concept is easier to grasp than to define.
+- Deep implementation detail is welcome, but it should follow a plain-language
+  summary a newcomer can follow — not replace it.
+
+This applies to documentation you write directly and to docs produced by the
+Documentation role.
+
 ## Communication style
 
 When reporting back to the user:
