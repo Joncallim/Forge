@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/db'
-import { providerConfigs, tasks, agentConfigs, type ProviderConfig } from '@/db/schema'
+import { providerConfigs, tasks, agentConfigs, users, type ProviderConfig } from '@/db/schema'
 import { eq, and, ne, asc, inArray } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { PROVIDER_TYPES, requiresProviderBaseUrl } from '@/lib/providers/types'
@@ -285,6 +285,15 @@ export async function DELETE(
     const session = await getSession(request)
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const [primaryUser] = await db
+      .select({ id: users.id })
+      .from(users)
+      .orderBy(asc(users.createdAt), asc(users.id))
+      .limit(1)
+    if (primaryUser && primaryUser.id !== session.userId) {
+      return NextResponse.json({ error: 'Only the bootstrap owner can deactivate providers.' }, { status: 403 })
     }
 
     const { id } = await params

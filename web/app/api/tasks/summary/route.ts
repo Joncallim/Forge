@@ -1,10 +1,10 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
-import { and, count, desc, inArray } from 'drizzle-orm'
+import { and, count, desc, eq, inArray } from 'drizzle-orm'
 import { db } from '@/db'
-import { tasks } from '@/db/schema'
+import { projects, tasks } from '@/db/schema'
 import { getSession } from '@/lib/session'
-import { accessibleTaskOwnerCondition } from '@/lib/task-access'
+import { accessibleProjectOwnerCondition, claimAccessibleLegacyProjects } from '@/lib/project-access'
 
 // ---------------------------------------------------------------------------
 // GET /api/tasks/summary
@@ -25,10 +25,13 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
+    await claimAccessibleLegacyProjects(session.userId)
+
     const grouped = await db
       .select({ status: tasks.status, total: count() })
       .from(tasks)
-      .where(accessibleTaskOwnerCondition(session.userId))
+      .innerJoin(projects, eq(tasks.projectId, projects.id))
+      .where(accessibleProjectOwnerCondition(session.userId))
       .groupBy(tasks.status)
 
     const byStatus: Record<string, number> = {}
@@ -40,7 +43,8 @@ export async function GET(request: NextRequest) {
     const attentionTasks = await db
       .select({ id: tasks.id, title: tasks.title, status: tasks.status })
       .from(tasks)
-      .where(and(accessibleTaskOwnerCondition(session.userId), inArray(tasks.status, [...ATTENTION_STATUSES])))
+      .innerJoin(projects, eq(tasks.projectId, projects.id))
+      .where(and(accessibleProjectOwnerCondition(session.userId), inArray(tasks.status, [...ATTENTION_STATUSES])))
       .orderBy(desc(tasks.updatedAt))
       .limit(5)
 

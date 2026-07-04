@@ -3,13 +3,16 @@ import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/db'
 import { projects, tasks } from '@/db/schema'
-import { eq, desc, count, getTableColumns, and, isNull, type SQL } from 'drizzle-orm'
+import { eq, desc, count, getTableColumns, type SQL } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 import { generateTaskTitle } from '@/lib/task-title'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
-import { accessibleTaskOwnerCondition } from '@/lib/task-access'
-import { accessibleProjectOwnerCondition } from '@/lib/project-access'
+import {
+  accessibleProjectOwnerCondition,
+  claimAccessibleLegacyProjects,
+  getAccessibleProject,
+} from '@/lib/project-access'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -37,6 +40,8 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
+    await claimAccessibleLegacyProjects(session.userId)
+
     const { searchParams } = request.nextUrl
     const projectId = searchParams.get('projectId') ?? undefined
     const status = searchParams.get('status') ?? undefined
@@ -46,7 +51,7 @@ export async function GET(request: NextRequest) {
 
     // Build dynamic where conditions
     const conditions: SQL[] = []
-    const access = accessibleTaskOwnerCondition(session.userId)
+    const access = accessibleProjectOwnerCondition(session.userId)
     if (access) conditions.push(access)
     if (projectId) conditions.push(eq(tasks.projectId, projectId))
     if (status) conditions.push(eq(tasks.status, status))
@@ -59,7 +64,10 @@ export async function GET(request: NextRequest) {
       })
       .from(tasks)
       .innerJoin(projects, eq(tasks.projectId, projects.id))
-    const countQuery = db.select({ total: count() }).from(tasks)
+    const countQuery = db
+      .select({ total: count() })
+      .from(tasks)
+      .innerJoin(projects, eq(tasks.projectId, projects.id))
 
     let rows: TaskListRow[]
     let totalResult: { total: number }[]
@@ -123,17 +131,9 @@ export async function POST(request: NextRequest) {
 
     const data = parsed.data
 
-    const [project] = await db
-      .select({ id: projects.id })
-      .from(projects)
-      .where(and(
-        eq(projects.id, data.projectId),
-        isNull(projects.archivedAt),
-        accessibleProjectOwnerCondition(session.userId),
-      ))
-      .limit(1)
+    const project = await getAccessibleProject(data.projectId, session.userId)
 
-    if (!project) {
+    if (!project || project.archivedAt) {
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
     }
 

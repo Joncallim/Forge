@@ -7,7 +7,7 @@ describe('claimLegacyOwnership', () => {
     const set = vi.fn(() => ({ where }))
     const update = vi.fn(() => ({ set }))
 
-    await claimLegacyOwnership({ update }, 'user-abc')
+    await claimLegacyOwnership({ update } as never, 'user-abc')
 
     expect(update).toHaveBeenCalledTimes(2)
     expect(set).toHaveBeenNthCalledWith(1, { submittedBy: 'user-abc' })

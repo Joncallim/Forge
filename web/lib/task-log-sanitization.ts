@@ -46,7 +46,7 @@ function isSecretNamedKey(key: string): boolean {
   if (/tokens?/i.test(key) && /(?:count|input|output|total|used|prompt|completion|remaining)/i.test(key)) {
     return false
   }
-  return /(?:password|passwd|secret|credential|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|(?:access|refresh|auth|api|bearer|npm|session)[_-]?token|\btoken\b|\bdsn\b)/i.test(key)
+  return /(?:password|passwd|secret|credential|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|(?:access|refresh|auth|api|bearer|npm|session)[_-]?token|token$|\btoken\b|\bdsn\b)/i.test(key)
 }
 
 export function sanitizeLogStructuredValue(

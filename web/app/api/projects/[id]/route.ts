@@ -7,7 +7,7 @@ import { db } from '@/db'
 import { projects } from '@/db/schema'
 import { and, eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
-import { accessibleProjectCondition, accessibleProjectOwnerCondition } from '@/lib/project-access'
+import { accessibleProjectOwnerCondition, getAccessibleProject } from '@/lib/project-access'
 import { registerProjectPath, unregisterProjectPath } from '@/lib/project-registry'
 import { validateGitHubTokenEnvVar } from '@/lib/github'
 import {
@@ -100,11 +100,7 @@ export async function GET(
 
     const { id } = await params
 
-    const [project] = await db
-      .select()
-      .from(projects)
-      .where(accessibleProjectCondition(id, session.userId))
-      .limit(1)
+    const project = await getAccessibleProject(id, session.userId)
 
     if (!project) {
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
@@ -134,11 +130,7 @@ export async function PUT(
 
     const { id } = await params
 
-    const [existing] = await db
-      .select()
-      .from(projects)
-      .where(accessibleProjectCondition(id, session.userId))
-      .limit(1)
+    const existing = await getAccessibleProject(id, session.userId)
 
     if (!existing) {
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
@@ -335,11 +327,7 @@ export async function DELETE(
     const { id } = await params
     const deleteFiles = request.nextUrl.searchParams.get('deleteFiles') === 'true'
 
-    const [existing] = await db
-      .select()
-      .from(projects)
-      .where(accessibleProjectCondition(id, session.userId))
-      .limit(1)
+    const existing = await getAccessibleProject(id, session.userId)
 
     if (!existing) {
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
