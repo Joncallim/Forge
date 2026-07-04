@@ -144,6 +144,18 @@ function rejectingChain(error: unknown) {
   return thenable
 }
 
+function flattenSqlChunks(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (!value || typeof value !== 'object') return ''
+  if (Array.isArray((value as { value?: unknown }).value)) {
+    return ((value as { value: unknown[] }).value).filter((chunk): chunk is string => typeof chunk === 'string').join('')
+  }
+  if (Array.isArray((value as { queryChunks?: unknown[] }).queryChunks)) {
+    return (value as { queryChunks: unknown[] }).queryChunks.map(flattenSqlChunks).join('')
+  }
+  return ''
+}
+
 // ---------------------------------------------------------------------------
 // Fake sessions
 // ---------------------------------------------------------------------------
@@ -4356,6 +4368,8 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         blockedReason: null,
         status: 'ready',
       }))
+      const packageSetMock = packageUpdate.set as unknown as { mock: { calls: Array<[{ metadata?: unknown }]> } }
+      expect(flattenSqlChunks(packageSetMock.mock.calls[0][0].metadata)).toContain(`- 'mcpGrantBlock'`)
       expect(taskUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
         errorMessage: null,
         status: 'approved',

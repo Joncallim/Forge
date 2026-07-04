@@ -142,6 +142,16 @@ function packageUpdateStatus(input: {
     : { blockedReason: 'Filesystem grant denied by operator; execution remains blocked.', status: 'blocked' }
 }
 
+function grantMetadataUpdateSql(input: {
+  clearGrantBlock: boolean
+  phases: Record<string, unknown>
+}) {
+  const baseMetadata = input.clearGrantBlock
+    ? sql`coalesce(${workPackages.metadata}, '{}'::jsonb) - 'mcpGrantBlock'`
+    : workPackages.metadata
+  return sql`jsonb_set(${baseMetadata}, '{mcpGrantPhases}', ${JSON.stringify(input.phases)}::jsonb, true)`
+}
+
 function filesystemStatusError(overview: Awaited<ReturnType<typeof getProjectMcpOverview>>): string | null {
   const filesystem = overview.statuses.find((status) => status.mcpId === FILESYSTEM_MCP_ID)
   if (!filesystem) {
@@ -377,7 +387,10 @@ export async function PUT(
           .update(workPackages)
           .set({
             ...recoveryStatus,
-            metadata: sql`jsonb_set(${workPackages.metadata}, '{mcpGrantPhases}', ${JSON.stringify(phases)}::jsonb, true)`,
+            metadata: grantMetadataUpdateSql({
+              clearGrantBlock: recoveryStatus.status === 'ready',
+              phases,
+            }),
             updatedAt: now,
           })
           .where(and(
