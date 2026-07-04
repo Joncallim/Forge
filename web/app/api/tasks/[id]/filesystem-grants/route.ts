@@ -259,6 +259,9 @@ export async function PUT(
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })
     }
+    if (task.submittedBy !== session.userId) {
+      return NextResponse.json({ error: 'Task not found' }, { status: 404 })
+    }
     if (!EDITABLE_TASK_STATUSES.includes(task.status as typeof EDITABLE_TASK_STATUSES[number])) {
       return NextResponse.json(
         { error: `Cannot edit filesystem grants while task status is '${task.status}'. Edit grants before execution starts or from a failed filesystem-grant recovery state.` },
@@ -417,12 +420,13 @@ export async function PUT(
       }
       let recoveredTask: typeof tasks.$inferSelect | null = null
       if (task.status === 'failed' && shouldRecoverTask) {
-        const remainingFailedPackages = await tx
-          .select({ id: workPackages.id })
+        const remainingBlockedPackages = await tx
+          .select({ metadata: workPackages.metadata, status: workPackages.status })
           .from(workPackages)
-          .where(and(eq(workPackages.taskId, taskId), eq(workPackages.status, 'failed')))
-          .limit(1)
-        if (remainingFailedPackages.length > 0) {
+          .where(and(eq(workPackages.taskId, taskId), inArray(workPackages.status, ['failed', 'blocked'])))
+        if (remainingBlockedPackages.some((pkg) => (
+          pkg.status === 'failed' || isFilesystemGrantBlockedPackageMetadata(pkg.metadata)
+        ))) {
           return { states, recoveredTask }
         }
         const [updatedTask] = await tx
@@ -459,10 +463,26 @@ export async function PUT(
     // approval job and publish the status change so the worker picks the task up
     // again; otherwise the recovered task sits idle until a manual handoff retry.
     if (recoveredTask) {
+      const queueFailureMessage = 'Filesystem grants were updated, but Forge could not requeue the recovered task. The task was returned to failed status; retry once Redis is healthy.'
       try {
         await redis.lpush('forge:approvals', JSON.stringify({ taskId, action: 'approve' }))
       } catch (err) {
         console.error('[tasks/filesystem-grants PUT] Failed to enqueue approval worker job', err)
+        const failedAt = new Date()
+        await db
+          .update(tasks)
+          .set({ errorMessage: queueFailureMessage, status: 'failed', updatedAt: failedAt })
+          .where(eq(tasks.id, taskId))
+        try {
+          await redis.publish('forge:task:' + taskId, JSON.stringify({
+            type: 'task:status',
+            status: 'failed',
+            updatedAt: failedAt.toISOString(),
+          }))
+        } catch (publishErr) {
+          console.error('[tasks/filesystem-grants PUT] Failed to publish rollback status event', publishErr)
+        }
+        return NextResponse.json({ error: queueFailureMessage }, { status: 503 })
       }
       try {
         await redis.publish('forge:task:' + taskId, JSON.stringify({
