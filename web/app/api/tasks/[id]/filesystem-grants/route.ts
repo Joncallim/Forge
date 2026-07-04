@@ -304,6 +304,7 @@ export async function PUT(
     const now = new Date()
     const { states: results, recoveredTask } = await db.transaction(async (tx) => {
       const states: Array<ReturnType<typeof grantStateForPackage>> = []
+      let shouldRecoverTask = false
       for (const grant of parsed.data.grants) {
         if (hasUnsafeFilesystemCapability(grant.capabilities)) {
           throw Object.assign(new Error('Only read-only project-scoped filesystem capabilities may be approved. filesystem.project.write is not supported.'), { status: 400 })
@@ -403,10 +404,13 @@ export async function PUT(
           throw Object.assign(new Error(`Cannot edit filesystem grants for package '${pkg.title}' because execution has already started or the package is no longer editable.`), { status: 409 })
         }
 
+        if (recoveryStatus.status === 'ready') {
+          shouldRecoverTask = true
+        }
         states.push(grantStateForPackage({ approval: updatedApproval, pkg: updatedPackage }))
       }
       let recoveredTask: typeof tasks.$inferSelect | null = null
-      if (task.status === 'failed') {
+      if (task.status === 'failed' && shouldRecoverTask) {
         const [updatedTask] = await tx
           .update(tasks)
           .set({ errorMessage: null, status: 'approved', updatedAt: now })
