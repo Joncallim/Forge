@@ -12,10 +12,12 @@ import {
   FILESYSTEM_MCP_ID,
   filesystemEffectiveGrantApprovalId,
   hasUnsafeFilesystemCapability,
+  isFilesystemGrantBlockedPackageMetadata,
   isRecord,
   summarizeFilesystemCapabilities,
 } from '@/lib/mcps/filesystem-grants'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
+import { redis } from '@/lib/redis'
 
 const grantRequestSchema = z.object({
   schemaVersion: z.literal(1),
@@ -106,16 +108,7 @@ function buildGrantPhases(input: {
 
 const EDITABLE_TASK_STATUSES = ['awaiting_approval', 'approved', 'failed'] as const
 const STANDARD_EDITABLE_PACKAGE_STATUSES = ['pending', 'ready', 'blocked', 'needs_rework'] as const
-
-function hasFilesystemGrantSurface(pkg: typeof workPackages.$inferSelect): boolean {
-  const summary = summarizeFilesystemCapabilities({
-    mcpRequirements: pkg.mcpRequirements,
-    metadata: pkg.metadata,
-  })
-  const phases = existingPhases(pkg.metadata)
-  const effective = isRecord(phases.effective) ? phases.effective : {}
-  return summary.requestedCapabilities.length > 0 || filesystemEffectiveGrantApprovalId(effective) !== null
-}
+const FAILED_GRANT_RECOVERY_PACKAGE_STATUSES = ['failed', 'blocked'] as const
 
 function canEditPackageGrant(input: {
   pkg: typeof workPackages.$inferSelect
@@ -127,7 +120,16 @@ function canEditPackageGrant(input: {
   ) {
     return true
   }
-  return input.taskStatus === 'failed' && input.pkg.status === 'failed' && hasFilesystemGrantSurface(input.pkg)
+  // Failed-package recovery is only offered when the failure was caused by a
+  // filesystem grant block (the handoff gate leaves an explicit marker). A
+  // package that merely requested filesystem access but failed for an unrelated
+  // reason (model execution, validation) must stay on the normal retry path so
+  // its real failure reason is not silently discarded by a grant edit.
+  return (
+    input.taskStatus === 'failed' &&
+    FAILED_GRANT_RECOVERY_PACKAGE_STATUSES.includes(input.pkg.status as typeof FAILED_GRANT_RECOVERY_PACKAGE_STATUSES[number]) &&
+    isFilesystemGrantBlockedPackageMetadata(input.pkg.metadata)
+  )
 }
 
 function packageUpdateStatus(input: {
@@ -135,10 +137,25 @@ function packageUpdateStatus(input: {
   pkg: typeof workPackages.$inferSelect
   taskStatus: string
 }): { blockedReason?: string | null; status?: string } {
-  if (input.taskStatus !== 'failed' || input.pkg.status !== 'failed') return {}
+  if (
+    input.taskStatus !== 'failed' ||
+    !FAILED_GRANT_RECOVERY_PACKAGE_STATUSES.includes(input.pkg.status as typeof FAILED_GRANT_RECOVERY_PACKAGE_STATUSES[number])
+  ) {
+    return {}
+  }
   return input.decision === 'approved'
     ? { blockedReason: null, status: 'ready' }
     : { blockedReason: 'Filesystem grant denied by operator; execution remains blocked.', status: 'blocked' }
+}
+
+function grantMetadataUpdateSql(input: {
+  clearGrantBlock: boolean
+  phases: Record<string, unknown>
+}) {
+  const baseMetadata = input.clearGrantBlock
+    ? sql`coalesce(${workPackages.metadata}, '{}'::jsonb) - 'mcpGrantBlock'`
+    : workPackages.metadata
+  return sql`jsonb_set(${baseMetadata}, '{mcpGrantPhases}', ${JSON.stringify(input.phases)}::jsonb, true)`
 }
 
 function filesystemStatusError(overview: Awaited<ReturnType<typeof getProjectMcpOverview>>): string | null {
@@ -205,6 +222,9 @@ export async function GET(
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })
     }
+    if (task.submittedBy !== session.userId) {
+      return NextResponse.json({ error: 'Task not found' }, { status: 404 })
+    }
 
     const [packages, approvals] = await Promise.all([
       db.select().from(workPackages).where(eq(workPackages.taskId, taskId)),
@@ -240,6 +260,9 @@ export async function PUT(
     const { id: taskId } = await params
     const task = await getAccessibleTask(taskId, session.userId)
     if (!task) {
+      return NextResponse.json({ error: 'Task not found' }, { status: 404 })
+    }
+    if (task.submittedBy !== session.userId) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 })
     }
     if (!EDITABLE_TASK_STATUSES.includes(task.status as typeof EDITABLE_TASK_STATUSES[number])) {
@@ -291,8 +314,9 @@ export async function PUT(
     }
 
     const now = new Date()
-    const results = await db.transaction(async (tx) => {
+    const { states: results, recoveredTask } = await db.transaction(async (tx) => {
       const states: Array<ReturnType<typeof grantStateForPackage>> = []
+      let shouldRecoverTask = false
       for (const grant of parsed.data.grants) {
         if (hasUnsafeFilesystemCapability(grant.capabilities)) {
           throw Object.assign(new Error('Only read-only project-scoped filesystem capabilities may be approved. filesystem.project.write is not supported.'), { status: 400 })
@@ -370,13 +394,16 @@ export async function PUT(
 
         const recoveryStatus = packageUpdateStatus({ decision: grant.decision, pkg, taskStatus: task.status })
         const updateableStatuses = recoveryStatus.status
-          ? ['failed']
+          ? [...FAILED_GRANT_RECOVERY_PACKAGE_STATUSES]
           : [...STANDARD_EDITABLE_PACKAGE_STATUSES]
         const [updatedPackage] = await tx
           .update(workPackages)
           .set({
             ...recoveryStatus,
-            metadata: sql`jsonb_set(${workPackages.metadata}, '{mcpGrantPhases}', ${JSON.stringify(phases)}::jsonb, true)`,
+            metadata: grantMetadataUpdateSql({
+              clearGrantBlock: recoveryStatus.status === 'ready',
+              phases,
+            }),
             updatedAt: now,
           })
           .where(and(
@@ -389,15 +416,30 @@ export async function PUT(
           throw Object.assign(new Error(`Cannot edit filesystem grants for package '${pkg.title}' because execution has already started or the package is no longer editable.`), { status: 409 })
         }
 
+        if (recoveryStatus.status === 'ready') {
+          shouldRecoverTask = true
+        }
         states.push(grantStateForPackage({ approval: updatedApproval, pkg: updatedPackage }))
       }
-      if (task.status === 'failed') {
-        await tx
+      let recoveredTask: typeof tasks.$inferSelect | null = null
+      if (task.status === 'failed' && shouldRecoverTask) {
+        const remainingBlockedPackages = await tx
+          .select({ metadata: workPackages.metadata, status: workPackages.status })
+          .from(workPackages)
+          .where(and(eq(workPackages.taskId, taskId), inArray(workPackages.status, ['failed', 'blocked'])))
+        if (remainingBlockedPackages.some((pkg) => (
+          pkg.status === 'failed' || isFilesystemGrantBlockedPackageMetadata(pkg.metadata)
+        ))) {
+          return { states, recoveredTask }
+        }
+        const [updatedTask] = await tx
           .update(tasks)
           .set({ errorMessage: null, status: 'approved', updatedAt: now })
           .where(and(eq(tasks.id, taskId), eq(tasks.status, 'failed')))
+          .returning()
+        recoveredTask = updatedTask ?? null
       }
-      return states
+      return { states, recoveredTask }
     })
 
     await Promise.all(results.map((state) => recordTaskLogBestEffort({
@@ -418,6 +460,33 @@ export async function PUT(
       title: state.approval?.decision === 'approved' ? 'Filesystem grant approved' : 'Filesystem grant denied',
       workPackageId: state.workPackageId,
     })))
+
+    // Recovering a failed task flips it back to 'approved', but — unlike the plan
+    // approve and retry-handoff routes — nothing else re-drives it. Enqueue an
+    // approval job and publish the status change so the worker picks the task up
+    // again; otherwise the recovered task sits idle until a manual handoff retry.
+    if (recoveredTask) {
+      const queueFailureMessage = 'Filesystem grants were updated and the task is approved, but Forge could not enqueue the recovery job. Retry handoff once Redis is healthy.'
+      try {
+        await redis.lpush('forge:approvals', JSON.stringify({ taskId, action: 'approve' }))
+      } catch (err) {
+        console.error('[tasks/filesystem-grants PUT] Failed to enqueue approval worker job', err)
+        return NextResponse.json({
+          error: queueFailureMessage,
+          grants: results,
+          taskStatus: 'approved',
+        }, { status: 202 })
+      }
+      try {
+        await redis.publish('forge:task:' + taskId, JSON.stringify({
+          type: 'task:status',
+          status: 'approved',
+          updatedAt: recoveredTask.updatedAt.toISOString(),
+        }))
+      } catch (err) {
+        console.error('[tasks/filesystem-grants PUT] Failed to publish recovery status event', err)
+      }
+    }
 
     return NextResponse.json({ schemaVersion: 1, grants: results })
   } catch (err) {

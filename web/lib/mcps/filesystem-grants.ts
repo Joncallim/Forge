@@ -131,3 +131,68 @@ export function filesystemEffectiveGrantApprovalId(value: unknown): string | nul
   }
   return null
 }
+
+// ---------------------------------------------------------------------------
+// Handoff gate: does a package still need explicit filesystem grant approval?
+//
+// Plan approval does NOT convert Architect-proposed filesystem requirements into
+// runtime-effective grants (it records a `not_issued` effective phase). Only the
+// explicit grant-approval endpoint issues an approved effective phase. These
+// helpers let the handoff gate hold such a package for explicit approval instead
+// of running it and burning execution attempts on a guaranteed context block.
+// ---------------------------------------------------------------------------
+
+/** Filesystem capabilities carried by an *approved* effective grant phase. */
+export function approvedEffectiveFilesystemCapabilities(metadata: unknown): FilesystemProjectCapability[] {
+  const meta = isRecord(metadata) ? metadata : {}
+  const phases = isRecord(meta.mcpGrantPhases) ? meta.mcpGrantPhases : {}
+  const effective = isRecord(phases.effective) ? phases.effective : {}
+  if (
+    effective.schemaVersion !== 1 ||
+    effective.phase !== 'effective' ||
+    effective.runtimeEnforcement !== 'bounded_context_packet' ||
+    effective.status !== 'approved'
+  ) {
+    return []
+  }
+  const capabilities = new Set<FilesystemProjectCapability>()
+  for (const grant of recordArray(effective.grants)) {
+    if (grant.mcpId !== FILESYSTEM_MCP_ID) continue
+    if (grant.status !== 'approved') continue
+    for (const capability of canonicalFilesystemProjectCapabilities(grant.capabilities)) {
+      capabilities.add(capability)
+    }
+  }
+  return [...capabilities].sort()
+}
+
+/**
+ * A package requires explicit filesystem grant approval when it has *required*
+ * (blocking) filesystem capabilities that an approved effective grant does not
+ * yet cover. Optional `continue_without_mcp` requirements never block.
+ */
+export function requiresFilesystemGrantApproval(input: {
+  mcpRequirements: unknown
+  metadata: unknown
+}): { blocked: boolean; missingCapabilities: FilesystemProjectCapability[]; requestedCapabilities: FilesystemProjectCapability[] } {
+  const { blockingCapabilities, requestedCapabilities } = summarizeFilesystemCapabilities(input)
+  if (blockingCapabilities.length === 0) {
+    return { blocked: false, missingCapabilities: [], requestedCapabilities }
+  }
+  const approved = approvedEffectiveFilesystemCapabilities(input.metadata)
+  const missingCapabilities = blockingCapabilities.filter((capability) => !approved.includes(capability))
+  return { blocked: missingCapabilities.length > 0, missingCapabilities, requestedCapabilities }
+}
+
+/**
+ * Marker written on a package that the handoff gate failed for missing
+ * filesystem grants. It is the evidence the grant-recovery endpoint keys off to
+ * distinguish a grant block from an unrelated execution/validation failure.
+ */
+export const FILESYSTEM_GRANT_BLOCK_METADATA_KEY = 'mcpGrantBlock'
+
+export function isFilesystemGrantBlockedPackageMetadata(metadata: unknown): boolean {
+  if (!isRecord(metadata)) return false
+  const marker = metadata[FILESYSTEM_GRANT_BLOCK_METADATA_KEY]
+  return isRecord(marker) && marker.source === 'filesystem-grant-approval'
+}

@@ -144,6 +144,18 @@ function rejectingChain(error: unknown) {
   return thenable
 }
 
+function flattenSqlChunks(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (!value || typeof value !== 'object') return ''
+  if (Array.isArray((value as { value?: unknown }).value)) {
+    return ((value as { value: unknown[] }).value).filter((chunk): chunk is string => typeof chunk === 'string').join('')
+  }
+  if (Array.isArray((value as { queryChunks?: unknown[] }).queryChunks)) {
+    return (value as { queryChunks: unknown[] }).queryChunks.map(flattenSqlChunks).join('')
+  }
+  return ''
+}
+
 // ---------------------------------------------------------------------------
 // Fake sessions
 // ---------------------------------------------------------------------------
@@ -3997,11 +4009,16 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     }
   }
 
-  function grantTask(projectId = 'project-fs-grant', status = 'awaiting_approval') {
+  function grantTask(
+    projectId = 'project-fs-grant',
+    status = 'awaiting_approval',
+    submittedBy: string | null = 'user-abc',
+  ) {
     return {
       id: 'task-fs-grant',
       projectId,
       status,
+      submittedBy,
       updatedAt: new Date('2026-07-03T00:00:00.000Z'),
     }
   }
@@ -4337,7 +4354,20 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     }]))
 
     await withFilesystemProject(async (project, filesystemPath) => {
-      const failedPkg = { ...grantPackage(), status: 'failed', blockedReason: 'Filesystem MCP context blocked for "Read project files".' }
+      const failedPkg = {
+        ...grantPackage({
+          mcpGrantBlock: {
+            blockedAt: '2026-07-03T00:00:30.000Z',
+            missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            reason: 'Work package "Read project files" requires filesystem grant approval.',
+            requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            source: 'filesystem-grant-approval',
+            status: 'failed',
+          },
+        }),
+        status: 'failed',
+        blockedReason: 'Work package "Read project files" requires filesystem grant approval.',
+      }
       const recoveredPkg = { ...failedPkg, blockedReason: null, status: 'ready' }
       const approvalUpdate = chain([{
         id: FS_GRANT_APPROVAL_ID,
@@ -4351,7 +4381,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       approvalUpdate.set = vi.fn(() => approvalUpdate)
       const packageUpdate = chain([recoveredPkg])
       packageUpdate.set = vi.fn(() => packageUpdate)
-      const taskUpdate = chain([])
+      const taskUpdate = chain([{ ...grantTask(project.id as string, 'approved'), updatedAt: new Date('2026-07-03T00:02:00.000Z') }])
       taskUpdate.set = vi.fn(() => taskUpdate)
       mockDbSelect
         .mockReturnValueOnce(chain([grantTask(project.id as string, 'failed')]))
@@ -4359,6 +4389,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([{ mcpId: 'filesystem', installPath: filesystemPath, enabled: true }]))
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([failedPkg]))
+        .mockReturnValueOnce(chain([]))
       mockDbUpdate
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)
@@ -4386,10 +4417,452 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         blockedReason: null,
         status: 'ready',
       }))
+      const packageSetMock = packageUpdate.set as unknown as { mock: { calls: Array<[{ metadata?: unknown }]> } }
+      expect(flattenSqlChunks(packageSetMock.mock.calls[0][0].metadata)).toContain(`- 'mcpGrantBlock'`)
       expect(taskUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
         errorMessage: null,
         status: 'approved',
       }))
+      // The recovered task must be re-enqueued so the worker picks it up again.
+      expect(mockRedisLpush).toHaveBeenCalledWith(
+        'forge:approvals',
+        JSON.stringify({ taskId: 'task-fs-grant', action: 'approve' }),
+      )
+    })
+  })
+
+  it('does not recover or requeue a failed task when the operator denies the filesystem grant', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert.mockReturnValue(chain([{
+      id: FS_GRANT_DENIED_ID,
+      taskId: 'task-fs-grant',
+      workPackageId: FS_GRANT_PACKAGE_ID,
+      decision: 'denied',
+      capabilities: [],
+      reason: 'Still too broad',
+      updatedAt: new Date('2026-07-03T00:01:00.000Z'),
+    }]))
+
+    const failedPkg = {
+      ...grantPackage({
+        mcpGrantBlock: {
+          blockedAt: '2026-07-03T00:00:30.000Z',
+          missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+          reason: 'Work package "Read project files" requires filesystem grant approval.',
+          requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+          source: 'filesystem-grant-approval',
+          status: 'failed',
+        },
+      }),
+      status: 'failed',
+      blockedReason: 'Work package "Read project files" requires filesystem grant approval.',
+    }
+    const deniedPkg = {
+      ...failedPkg,
+      status: 'blocked',
+      blockedReason: 'Filesystem grant denied by operator; execution remains blocked.',
+    }
+    const approvalUpdate = chain([{
+      id: FS_GRANT_DENIED_ID,
+      taskId: 'task-fs-grant',
+      workPackageId: FS_GRANT_PACKAGE_ID,
+      decision: 'denied',
+      capabilities: [],
+      reason: 'Still too broad',
+      updatedAt: new Date('2026-07-03T00:01:00.000Z'),
+    }])
+    approvalUpdate.set = vi.fn(() => approvalUpdate)
+    const packageUpdate = chain([deniedPkg])
+    packageUpdate.set = vi.fn(() => packageUpdate)
+    mockDbSelect
+      .mockReturnValueOnce(chain([grantTask('project-fs-grant', 'failed')]))
+      .mockReturnValueOnce(chain([{ id: 'project-fs-grant' }]))
+      .mockReturnValueOnce(chain([failedPkg]))
+    mockDbUpdate
+      .mockReturnValueOnce(approvalUpdate)
+      .mockReturnValueOnce(packageUpdate)
+
+    const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
+    const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        schemaVersion: 1,
+        grants: [{
+          workPackageId: FS_GRANT_PACKAGE_ID,
+          decision: 'denied',
+          capabilities: [],
+          reason: 'Still too broad',
+        }],
+      }),
+    }) as never, {
+      params: Promise.resolve({ id: 'task-fs-grant' }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(packageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      blockedReason: 'Filesystem grant denied by operator; execution remains blocked.',
+      status: 'blocked',
+    }))
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+    expect(mockRedisPublish).not.toHaveBeenCalled()
+    expect(mockDbUpdate).toHaveBeenCalledTimes(2)
+  })
+
+  it('allows a corrected approval after a failed-task grant denial left the package blocked', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert.mockReturnValue(chain([{
+      id: FS_GRANT_APPROVAL_ID,
+      taskId: 'task-fs-grant',
+      workPackageId: FS_GRANT_PACKAGE_ID,
+      decision: 'approved',
+      capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      reason: 'Approved after review',
+      updatedAt: new Date('2026-07-03T00:03:00.000Z'),
+    }]))
+
+    await withFilesystemProject(async (project, filesystemPath) => {
+      const blockedPkg = {
+        ...grantPackage({
+          mcpGrantBlock: {
+            blockedAt: '2026-07-03T00:00:30.000Z',
+            missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            reason: 'Work package "Read project files" requires filesystem grant approval.',
+            requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            source: 'filesystem-grant-approval',
+            status: 'failed',
+          },
+        }),
+        status: 'blocked',
+        blockedReason: 'Filesystem grant denied by operator; execution remains blocked.',
+      }
+      const recoveredPkg = { ...blockedPkg, blockedReason: null, status: 'ready' }
+      const approvalUpdate = chain([{
+        id: FS_GRANT_APPROVAL_ID,
+        taskId: 'task-fs-grant',
+        workPackageId: FS_GRANT_PACKAGE_ID,
+        decision: 'approved',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        reason: 'Approved after review',
+        updatedAt: new Date('2026-07-03T00:03:00.000Z'),
+      }])
+      approvalUpdate.set = vi.fn(() => approvalUpdate)
+      const packageUpdate = chain([recoveredPkg])
+      packageUpdate.set = vi.fn(() => packageUpdate)
+      const taskUpdate = chain([{ ...grantTask(project.id as string, 'approved'), updatedAt: new Date('2026-07-03T00:04:00.000Z') }])
+      taskUpdate.set = vi.fn(() => taskUpdate)
+      mockDbSelect
+        .mockReturnValueOnce(chain([grantTask(project.id as string, 'failed')]))
+        .mockReturnValueOnce(chain([project]))
+        .mockReturnValueOnce(chain([{ mcpId: 'filesystem', installPath: filesystemPath, enabled: true }]))
+        .mockReturnValueOnce(chain([]))
+        .mockReturnValueOnce(chain([blockedPkg]))
+        .mockReturnValueOnce(chain([]))
+      mockDbUpdate
+        .mockReturnValueOnce(approvalUpdate)
+        .mockReturnValueOnce(packageUpdate)
+        .mockReturnValueOnce(taskUpdate)
+
+      const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
+      const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          schemaVersion: 1,
+          grants: [{
+            workPackageId: FS_GRANT_PACKAGE_ID,
+            decision: 'approved',
+            capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            reason: 'Approved after review',
+          }],
+        }),
+      }) as never, {
+        params: Promise.resolve({ id: 'task-fs-grant' }),
+      })
+
+      expect(res.status).toBe(200)
+      expect(packageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+        blockedReason: null,
+        status: 'ready',
+      }))
+      expect(taskUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+        errorMessage: null,
+        status: 'approved',
+      }))
+      expect(mockRedisLpush).toHaveBeenCalledWith(
+        'forge:approvals',
+        JSON.stringify({ taskId: 'task-fs-grant', action: 'approve' }),
+      )
+    })
+  })
+
+  it('does not recover or requeue the task while another failed package still exists', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert.mockReturnValue(chain([{
+      id: FS_GRANT_APPROVAL_ID,
+      taskId: 'task-fs-grant',
+      workPackageId: FS_GRANT_PACKAGE_ID,
+      decision: 'approved',
+      capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      reason: 'Partial recovery',
+      updatedAt: new Date('2026-07-03T00:03:00.000Z'),
+    }]))
+
+    await withFilesystemProject(async (project, filesystemPath) => {
+      const failedPkg = {
+        ...grantPackage({
+          mcpGrantBlock: {
+            blockedAt: '2026-07-03T00:00:30.000Z',
+            missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            reason: 'Work package "Read project files" requires filesystem grant approval.',
+            requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            source: 'filesystem-grant-approval',
+            status: 'failed',
+          },
+        }),
+        status: 'failed',
+        blockedReason: 'Work package "Read project files" requires filesystem grant approval.',
+      }
+      const recoveredPkg = { ...failedPkg, blockedReason: null, status: 'ready' }
+      const approvalUpdate = chain([{
+        id: FS_GRANT_APPROVAL_ID,
+        taskId: 'task-fs-grant',
+        workPackageId: FS_GRANT_PACKAGE_ID,
+        decision: 'approved',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        reason: 'Partial recovery',
+        updatedAt: new Date('2026-07-03T00:03:00.000Z'),
+      }])
+      approvalUpdate.set = vi.fn(() => approvalUpdate)
+      const packageUpdate = chain([recoveredPkg])
+      packageUpdate.set = vi.fn(() => packageUpdate)
+      mockDbSelect
+        .mockReturnValueOnce(chain([grantTask(project.id as string, 'failed')]))
+        .mockReturnValueOnce(chain([project]))
+        .mockReturnValueOnce(chain([{ mcpId: 'filesystem', installPath: filesystemPath, enabled: true }]))
+        .mockReturnValueOnce(chain([]))
+        .mockReturnValueOnce(chain([failedPkg]))
+        .mockReturnValueOnce(chain([{
+          status: 'failed',
+          metadata: { mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' } },
+        }]))
+      mockDbUpdate
+        .mockReturnValueOnce(approvalUpdate)
+        .mockReturnValueOnce(packageUpdate)
+
+      const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
+      const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          schemaVersion: 1,
+          grants: [{
+            workPackageId: FS_GRANT_PACKAGE_ID,
+            decision: 'approved',
+            capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            reason: 'Partial recovery',
+          }],
+        }),
+      }) as never, {
+        params: Promise.resolve({ id: 'task-fs-grant' }),
+      })
+
+      expect(res.status).toBe(200)
+      expect(mockDbUpdate).toHaveBeenCalledTimes(2)
+      expect(mockRedisLpush).not.toHaveBeenCalled()
+      expect(mockRedisPublish).not.toHaveBeenCalled()
+    })
+  })
+
+  it('does not recover or requeue the task while another grant-blocked package remains blocked', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert.mockReturnValue(chain([{
+      id: FS_GRANT_APPROVAL_ID,
+      taskId: 'task-fs-grant',
+      workPackageId: FS_GRANT_PACKAGE_ID,
+      decision: 'approved',
+      capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      reason: 'Partial recovery',
+      updatedAt: new Date('2026-07-03T00:03:00.000Z'),
+    }]))
+
+    await withFilesystemProject(async (project, filesystemPath) => {
+      const failedPkg = {
+        ...grantPackage({
+          mcpGrantBlock: {
+            blockedAt: '2026-07-03T00:00:30.000Z',
+            missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            reason: 'Work package "Read project files" requires filesystem grant approval.',
+            requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            source: 'filesystem-grant-approval',
+            status: 'failed',
+          },
+        }),
+        status: 'failed',
+        blockedReason: 'Work package "Read project files" requires filesystem grant approval.',
+      }
+      const recoveredPkg = { ...failedPkg, blockedReason: null, status: 'ready' }
+      const approvalUpdate = chain([{
+        id: FS_GRANT_APPROVAL_ID,
+        taskId: 'task-fs-grant',
+        workPackageId: FS_GRANT_PACKAGE_ID,
+        decision: 'approved',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        reason: 'Partial recovery',
+        updatedAt: new Date('2026-07-03T00:03:00.000Z'),
+      }])
+      approvalUpdate.set = vi.fn(() => approvalUpdate)
+      const packageUpdate = chain([recoveredPkg])
+      packageUpdate.set = vi.fn(() => packageUpdate)
+      mockDbSelect
+        .mockReturnValueOnce(chain([grantTask(project.id as string, 'failed')]))
+        .mockReturnValueOnce(chain([project]))
+        .mockReturnValueOnce(chain([{ mcpId: 'filesystem', installPath: filesystemPath, enabled: true }]))
+        .mockReturnValueOnce(chain([]))
+        .mockReturnValueOnce(chain([failedPkg]))
+        .mockReturnValueOnce(chain([{
+          status: 'blocked',
+          metadata: { mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' } },
+        }]))
+      mockDbUpdate
+        .mockReturnValueOnce(approvalUpdate)
+        .mockReturnValueOnce(packageUpdate)
+
+      const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
+      const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          schemaVersion: 1,
+          grants: [{
+            workPackageId: FS_GRANT_PACKAGE_ID,
+            decision: 'approved',
+            capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            reason: 'Partial recovery',
+          }],
+        }),
+      }) as never, {
+        params: Promise.resolve({ id: 'task-fs-grant' }),
+      })
+
+      expect(res.status).toBe(200)
+      expect(mockDbUpdate).toHaveBeenCalledTimes(2)
+      expect(mockRedisLpush).not.toHaveBeenCalled()
+      expect(mockRedisPublish).not.toHaveBeenCalled()
+    })
+  })
+
+  it('returns 404 for privileged grant edits on a legacy null-owned task', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect
+      .mockReturnValueOnce(chain([grantTask('project-fs-grant', 'failed', null)]))
+
+    const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
+    const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        schemaVersion: 1,
+        grants: [{ workPackageId: FS_GRANT_PACKAGE_ID, decision: 'denied', capabilities: [] }],
+      }),
+    }) as never, {
+      params: Promise.resolve({ id: 'task-fs-grant' }),
+    })
+
+    expect(res.status).toBe(404)
+    expect(mockDbInsert).not.toHaveBeenCalled()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+  })
+
+  it('returns 404 for privileged filesystem grant reads on a legacy null-owned task', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect
+      .mockReturnValueOnce(chain([grantTask('project-fs-grant', 'failed', null)]))
+
+    const { GET } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
+    const res = await GET(authRequest('/api/tasks/task-fs-grant/filesystem-grants') as never, {
+      params: Promise.resolve({ id: 'task-fs-grant' }),
+    })
+
+    expect(res.status).toBe(404)
+    expect(mockDbInsert).not.toHaveBeenCalled()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+  })
+
+  it('returns 202 and leaves the task approved when the recovered task cannot be requeued', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert.mockReturnValue(chain([{
+      id: FS_GRANT_APPROVAL_ID,
+      taskId: 'task-fs-grant',
+      workPackageId: FS_GRANT_PACKAGE_ID,
+      decision: 'approved',
+      capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      reason: 'Grant fixed',
+      updatedAt: new Date('2026-07-03T00:01:00.000Z'),
+    }]))
+    mockRedisLpush.mockRejectedValueOnce(new Error('redis down'))
+
+    await withFilesystemProject(async (project, filesystemPath) => {
+      const failedPkg = {
+        ...grantPackage({
+          mcpGrantBlock: {
+            blockedAt: '2026-07-03T00:00:30.000Z',
+            missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            reason: 'Work package "Read project files" requires filesystem grant approval.',
+            requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            source: 'filesystem-grant-approval',
+            status: 'failed',
+          },
+        }),
+        status: 'failed',
+        blockedReason: 'Work package "Read project files" requires filesystem grant approval.',
+      }
+      const recoveredPkg = { ...failedPkg, blockedReason: null, status: 'ready' }
+      const approvalUpdate = chain([{
+        id: FS_GRANT_APPROVAL_ID,
+        taskId: 'task-fs-grant',
+        workPackageId: FS_GRANT_PACKAGE_ID,
+        decision: 'approved',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        reason: 'Grant fixed',
+        updatedAt: new Date('2026-07-03T00:01:00.000Z'),
+      }])
+      approvalUpdate.set = vi.fn(() => approvalUpdate)
+      const packageUpdate = chain([recoveredPkg])
+      packageUpdate.set = vi.fn(() => packageUpdate)
+      const taskApproveUpdate = chain([{ ...grantTask(project.id as string, 'approved'), updatedAt: new Date('2026-07-03T00:02:00.000Z') }])
+      taskApproveUpdate.set = vi.fn(() => taskApproveUpdate)
+      mockDbSelect
+        .mockReturnValueOnce(chain([grantTask(project.id as string, 'failed')]))
+        .mockReturnValueOnce(chain([project]))
+        .mockReturnValueOnce(chain([{ mcpId: 'filesystem', installPath: filesystemPath, enabled: true }]))
+        .mockReturnValueOnce(chain([]))
+        .mockReturnValueOnce(chain([failedPkg]))
+        .mockReturnValueOnce(chain([]))
+      mockDbUpdate
+        .mockReturnValueOnce(approvalUpdate)
+        .mockReturnValueOnce(packageUpdate)
+        .mockReturnValueOnce(taskApproveUpdate)
+
+      const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
+      const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          schemaVersion: 1,
+          grants: [{
+            workPackageId: FS_GRANT_PACKAGE_ID,
+            decision: 'approved',
+            capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            reason: 'Grant fixed',
+          }],
+        }),
+      }) as never, {
+        params: Promise.resolve({ id: 'task-fs-grant' }),
+      })
+
+      expect(res.status).toBe(202)
+      expect(mockDbUpdate).toHaveBeenCalledTimes(3)
     })
   })
 
@@ -4413,6 +4886,38 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       body: JSON.stringify({
         schemaVersion: 1,
         grants: [{ workPackageId: FS_GRANT_PACKAGE_ID, decision: 'denied', capabilities: [], reason: 'Still blocked' }],
+      }),
+    }) as never, {
+      params: Promise.resolve({ id: 'task-fs-grant' }),
+    })
+
+    expect(res.status).toBe(409)
+    expect(mockDbInsert).not.toHaveBeenCalled()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+  })
+
+  it('does not open failed grant recovery for a filesystem package that failed for an unrelated reason', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    // Filesystem surface is present (it requested filesystem access), but the
+    // failure was not a grant block — there is no mcpGrantBlock marker — so a
+    // grant edit must not silently clear the real failure via recovery.
+    const failedPkg = {
+      ...grantPackage(),
+      status: 'failed',
+      blockedReason: 'Model execution failed during implementation.',
+    }
+    mockDbSelect
+      .mockReturnValueOnce(chain([grantTask('project-fs-grant', 'failed')]))
+      .mockReturnValueOnce(chain([{ id: 'project-fs-grant' }]))
+      .mockReturnValueOnce(chain([failedPkg]))
+
+    const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
+    const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        schemaVersion: 1,
+        grants: [{ workPackageId: FS_GRANT_PACKAGE_ID, decision: 'denied', capabilities: [], reason: 'Try again' }],
       }),
     }) as never, {
       params: Promise.resolve({ id: 'task-fs-grant' }),

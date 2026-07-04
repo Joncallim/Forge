@@ -156,10 +156,13 @@
 }
 .dark[data-accent="violet"] {
   --primary: oklch(0.62 0.22 292);
-  --primary-foreground: oklch(0.985 0 0);
+  /* Dark foreground on the bright violet, matching the blue/green/rose dark
+     accents. A near-white foreground on this lightness is only ~3.8:1, below
+     the WCAG AA 4.5:1 minimum for normal text on primary controls. */
+  --primary-foreground: oklch(0.145 0 0);
   --ring: oklch(0.62 0.22 292);
   --sidebar-primary: oklch(0.62 0.22 292);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-primary-foreground: oklch(0.145 0 0);
   --sidebar-ring: oklch(0.62 0.22 292);
 }
 
