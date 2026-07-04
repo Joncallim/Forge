@@ -108,6 +108,7 @@ function buildGrantPhases(input: {
 
 const EDITABLE_TASK_STATUSES = ['awaiting_approval', 'approved', 'failed'] as const
 const STANDARD_EDITABLE_PACKAGE_STATUSES = ['pending', 'ready', 'blocked', 'needs_rework'] as const
+const FAILED_GRANT_RECOVERY_PACKAGE_STATUSES = ['failed', 'blocked'] as const
 
 function canEditPackageGrant(input: {
   pkg: typeof workPackages.$inferSelect
@@ -126,7 +127,7 @@ function canEditPackageGrant(input: {
   // its real failure reason is not silently discarded by a grant edit.
   return (
     input.taskStatus === 'failed' &&
-    input.pkg.status === 'failed' &&
+    FAILED_GRANT_RECOVERY_PACKAGE_STATUSES.includes(input.pkg.status as typeof FAILED_GRANT_RECOVERY_PACKAGE_STATUSES[number]) &&
     isFilesystemGrantBlockedPackageMetadata(input.pkg.metadata)
   )
 }
@@ -136,7 +137,12 @@ function packageUpdateStatus(input: {
   pkg: typeof workPackages.$inferSelect
   taskStatus: string
 }): { blockedReason?: string | null; status?: string } {
-  if (input.taskStatus !== 'failed' || input.pkg.status !== 'failed') return {}
+  if (
+    input.taskStatus !== 'failed' ||
+    !FAILED_GRANT_RECOVERY_PACKAGE_STATUSES.includes(input.pkg.status as typeof FAILED_GRANT_RECOVERY_PACKAGE_STATUSES[number])
+  ) {
+    return {}
+  }
   return input.decision === 'approved'
     ? { blockedReason: null, status: 'ready' }
     : { blockedReason: 'Filesystem grant denied by operator; execution remains blocked.', status: 'blocked' }
@@ -382,7 +388,7 @@ export async function PUT(
 
         const recoveryStatus = packageUpdateStatus({ decision: grant.decision, pkg, taskStatus: task.status })
         const updateableStatuses = recoveryStatus.status
-          ? ['failed']
+          ? [...FAILED_GRANT_RECOVERY_PACKAGE_STATUSES]
           : [...STANDARD_EDITABLE_PACKAGE_STATUSES]
         const [updatedPackage] = await tx
           .update(workPackages)
@@ -411,6 +417,14 @@ export async function PUT(
       }
       let recoveredTask: typeof tasks.$inferSelect | null = null
       if (task.status === 'failed' && shouldRecoverTask) {
+        const remainingFailedPackages = await tx
+          .select({ id: workPackages.id })
+          .from(workPackages)
+          .where(and(eq(workPackages.taskId, taskId), eq(workPackages.status, 'failed')))
+          .limit(1)
+        if (remainingFailedPackages.length > 0) {
+          return { states, recoveredTask }
+        }
         const [updatedTask] = await tx
           .update(tasks)
           .set({ errorMessage: null, status: 'approved', updatedAt: now })
