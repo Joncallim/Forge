@@ -1,16 +1,16 @@
-import { and, eq, isNull, or } from 'drizzle-orm'
+import { and, eq } from 'drizzle-orm'
 import { db } from '@/db'
 import { tasks } from '@/db/schema'
 
 export function accessibleTaskCondition(taskId: string, userId: string) {
   return and(
     eq(tasks.id, taskId),
-    or(eq(tasks.submittedBy, userId), isNull(tasks.submittedBy)),
+    eq(tasks.submittedBy, userId),
   )
 }
 
 export function accessibleTaskOwnerCondition(userId: string) {
-  return or(eq(tasks.submittedBy, userId), isNull(tasks.submittedBy))
+  return eq(tasks.submittedBy, userId)
 }
 
 export async function getAccessibleTask(taskId: string, userId: string) {

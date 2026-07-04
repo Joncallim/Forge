@@ -9,6 +9,7 @@ import { createSession, sessionCookieOptions } from '@/lib/session'
 import { hashPassword, validatePassword } from '@/lib/password'
 import { count } from 'drizzle-orm'
 import { passkeysEnabled } from '@/lib/auth-options'
+import { claimLegacyOwnership } from '@/lib/bootstrap-ownership'
 
 export async function POST(request: NextRequest) {
   let registrationLock: { key: string; token: string } | null = null
@@ -141,6 +142,7 @@ export async function POST(request: NextRequest) {
         .values({ displayName: stored.displayName, passwordHash })
         .returning({ id: users.id })
       userId = newUser.id
+      await claimLegacyOwnership(tx, userId)
 
       // Insert credential — credentialId is already a Base64URL string in v13
       const [newCred] = await tx

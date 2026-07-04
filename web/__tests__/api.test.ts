@@ -165,7 +165,10 @@ function nextAuthRequest(path: string, init: RequestInit = {}) {
 // ---------------------------------------------------------------------------
 
 describe('GET /api/projects — auth guard', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockDbUpdate.mockReturnValue(chain([]))
+  })
 
   it('returns 401 when getSession returns null', async () => {
     mockGetSession.mockResolvedValue(null)
@@ -5768,7 +5771,10 @@ describe('POST /api/tasks/:id/retry', () => {
 // ---------------------------------------------------------------------------
 
 describe('GET /api/tasks — includes project name', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockDbUpdate.mockReturnValue(chain([]))
+  })
 
   it('returns task rows with projectName', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
@@ -5814,7 +5820,10 @@ describe('GET /api/tasks — includes project name', () => {
 // ---------------------------------------------------------------------------
 
 describe('GET /api/tasks/summary', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockDbUpdate.mockReturnValue(chain([]))
+  })
 
   it('returns 401 when not authenticated', async () => {
     mockGetSession.mockResolvedValue(null)
