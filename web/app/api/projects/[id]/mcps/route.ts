@@ -4,8 +4,8 @@ import path from 'node:path'
 import { z } from 'zod'
 import { db } from '@/db'
 import { projects, type ProjectMcpConfig } from '@/db/schema'
-import { eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
+import { accessibleProjectCondition } from '@/lib/project-access'
 import { isKnownMcpId } from '@/lib/mcps/catalog'
 import { getProjectMcpOverview, setProjectMcpConfig } from '@/lib/mcps/manager'
 import { getWorkspaceSettings, isWithinPath } from '@/lib/workspace'
@@ -19,11 +19,11 @@ const mcpConfigSchema = z.object({
   })).default({}),
 })
 
-async function findProject(id: string) {
+async function findProject(id: string, userId: string) {
   const [project] = await db
     .select()
     .from(projects)
-    .where(eq(projects.id, id))
+    .where(accessibleProjectCondition(id, userId))
     .limit(1)
 
   return project ?? null
@@ -62,7 +62,7 @@ export async function GET(
     }
 
     const { id } = await params
-    const project = await findProject(id)
+    const project = await findProject(id, session.userId)
     if (!project) {
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
     }
@@ -86,7 +86,7 @@ export async function PUT(
     }
 
     const { id } = await params
-    const project = await findProject(id)
+    const project = await findProject(id, session.userId)
     if (!project) {
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
     }

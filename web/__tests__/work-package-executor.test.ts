@@ -56,6 +56,7 @@ function context(overrides: Partial<WorkPackageExecutionContext> = {}): WorkPack
     project: {
       id: 'project-1',
       name: 'Tracker Smoke',
+      submittedBy: null,
       githubRepo: null,
       localPath: tempRoot,
       githubTokenEnvVar: null,

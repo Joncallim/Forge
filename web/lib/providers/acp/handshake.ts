@@ -73,7 +73,18 @@ export function isAcpAdapterSupported(agentId: string): boolean {
 
 function looksLikeAuthFailure(message: string | undefined): boolean {
   if (!message) return false
-  return /\b(auth|login|credential|unauthoriz|api key|token)/i.test(message)
+  // Require a genuine auth-failure phrase rather than a bare word like "token"
+  // or "auth", which routinely appear as noise in unrelated crash output and
+  // would otherwise misclassify a plain process crash as an auth problem.
+  //
+  // Note: "permission denied" is deliberately NOT treated as an auth signal.
+  // Because this check runs before the process-exit/transport branch, a
+  // filesystem or install failure (an unreadable CLI/config path, spawn EACCES)
+  // that says "permission denied" would otherwise be misreported as "Needs
+  // login" instead of the real unreachable/permissions problem. Genuine HTTP
+  // auth denials are still caught by the 401/403 and "forbidden"/"unauthorized"
+  // alternatives below.
+  return /(?:not\s+(?:authenticated|logged\s*in|signed\s*in)|unauthenticated|unauthoriz|please\s+(?:log\s*in|login|sign\s*in|authenticate)|require[sd]?\s+(?:authentication|login|sign\s*in|an?\s+api\s*key)|authentication\s+(?:required|failed)|login\s+required|sign\s*in\s+(?:required|to)|(?:invalid|missing|expired)\s+(?:api\s*key|token|credentials?)|api\s*key\s+(?:required|missing|invalid|not\s+set)|\bforbidden\b|\b40[13]\b)/i.test(message)
 }
 
 /**
@@ -160,6 +171,18 @@ function classifyAcpReadinessError(
 ): AcpReadinessResult {
   const message = redactAdapterMessage(err instanceof Error ? err.message : String(err))
 
+  // Check for an auth signal first: an unauthenticated CLI often surfaces its
+  // "please log in" prompt via a non-zero process exit, so the exit/process
+  // branch below would otherwise misreport an actionable auth problem as an
+  // "unreachable / not installed" transport error.
+  if (looksLikeAuthFailure(message)) {
+    return {
+      status: 'authenticated_unavailable',
+      message: `${label} is reachable but not authenticated: ${message}. Sign in to the underlying CLI first.`,
+      latencyMs: Date.now() - start,
+    }
+  }
+
   if (/timed out/i.test(message)) {
     return {
       status: 'handshake_failed',
@@ -177,10 +200,8 @@ function classifyAcpReadinessError(
   }
 
   return {
-    status: looksLikeAuthFailure(message) ? 'authenticated_unavailable' : 'handshake_failed',
-    message: looksLikeAuthFailure(message)
-      ? `${label} is reachable but not authenticated: ${message}. Sign in to the underlying CLI first.`
-      : `${label}'s ACP adapter failed the ${phase}: ${message}`,
+    status: 'handshake_failed',
+    message: `${label}'s ACP adapter failed the ${phase}: ${message}`,
     latencyMs: Date.now() - start,
   }
 }

@@ -8,7 +8,8 @@ import path from 'node:path'
 import { z } from 'zod'
 import { db } from '@/db'
 import { DEFAULT_PROJECT_MCP_CONFIG, projects, type ProjectMcpConfig } from '@/db/schema'
-import { isNull, desc } from 'drizzle-orm'
+import { and, isNull, desc } from 'drizzle-orm'
+import { accessibleProjectOwnerCondition, claimAccessibleLegacyProjects } from '@/lib/project-access'
 import { getSession } from '@/lib/session'
 import { registerProjectPath } from '@/lib/project-registry'
 import { resolveGitHubToken, validateGitHubTokenEnvVar } from '@/lib/github'
@@ -234,10 +235,12 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
+    await claimAccessibleLegacyProjects(session.userId)
+
     const rows = await db
       .select()
       .from(projects)
-      .where(isNull(projects.archivedAt))
+      .where(and(isNull(projects.archivedAt), accessibleProjectOwnerCondition(session.userId)))
       .orderBy(desc(projects.createdAt))
 
     const summaries = await getCachedProjectMcpSummaries(rows.map((project) => project.id))
@@ -373,6 +376,7 @@ export async function POST(request: NextRequest) {
         .insert(projects)
         .values({
           name: data.name,
+          submittedBy: session.userId,
           githubRepo: data.githubRepo,
           localPath: resolvedLocalPath,
           githubTokenEnvVar,
@@ -421,6 +425,7 @@ export async function POST(request: NextRequest) {
       .insert(projects)
       .values({
         name: data.name,
+        submittedBy: session.userId,
         githubRepo: source === 'github' ? data.githubRepo ?? null : null,
         localPath: resolvedLocalPath,
         githubTokenEnvVar,

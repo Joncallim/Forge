@@ -165,7 +165,10 @@ function nextAuthRequest(path: string, init: RequestInit = {}) {
 // ---------------------------------------------------------------------------
 
 describe('GET /api/projects — auth guard', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockDbUpdate.mockReturnValue(chain([]))
+  })
 
   it('returns 401 when getSession returns null', async () => {
     mockGetSession.mockResolvedValue(null)
@@ -204,6 +207,7 @@ describe('GET /api/projects — auth guard', () => {
     process.env.HOME = fakeHome
     process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
     mockDbSelect
+      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([project]))
       .mockReturnValueOnce(chain([]))
 
@@ -1953,6 +1957,7 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
 
     await withWorkspaceProject(async (project) => {
       mockDbSelect
+        .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
         .mockReturnValueOnce(chain([project]))
         .mockReturnValueOnce(chain([
           {
@@ -2265,6 +2270,44 @@ describe('GET /api/projects/:id — 404 when project not found', () => {
     expect(res.status).toBe(404)
     const body = await res.json()
     expect(body.error).toMatch(/not found/i)
+  })
+
+  it('claims a legacy null-owned project for bootstrap-owner direct lookups', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const claimedProject = {
+      id: 'project-legacy',
+      name: 'Legacy Project',
+      submittedBy: 'user-abc',
+      githubRepo: null,
+      localPath: null,
+      githubTokenEnvVar: null,
+      pmProviderConfigId: null,
+      mcpConfig: {
+        profile: 'default',
+        requiredMcps: ['filesystem', 'github'],
+        overrides: {},
+      },
+      defaultBranch: 'main',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      archivedAt: null,
+    }
+    mockDbSelect
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
+    mockDbUpdate.mockReturnValue(chain([claimedProject]))
+
+    const { GET } = await import('@/app/api/projects/[id]/route')
+    const res = await GET(authRequest('/api/projects/project-legacy') as never, {
+      params: Promise.resolve({ id: 'project-legacy' }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.project).toMatchObject({
+      id: 'project-legacy',
+      submittedBy: 'user-abc',
+    })
   })
 })
 
@@ -4918,7 +4961,16 @@ describe('dynamic agents and workforces', () => {
 // ---------------------------------------------------------------------------
 
 describe('POST /api/providers — baseUrl requirement', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockGetSession.mockReset()
+    mockDbSelect.mockReset()
+    mockDbInsert.mockReset()
+    mockDbUpdate.mockReset()
+    mockDbDelete.mockReset()
+    mockRedisLpush.mockReset()
+    mockRedisPublish.mockReset()
+  })
 
   it('allows ollama without baseUrl (defaults to the local endpoint)', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
@@ -5331,6 +5383,7 @@ describe('POST /api/providers — baseUrl requirement', () => {
     const setSpy = vi.fn(() => updateChain)
     updateChain.set = setSpy
     mockDbSelect
+      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([existingProvider]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([]))
@@ -5376,6 +5429,7 @@ describe('POST /api/providers — baseUrl requirement', () => {
       createdAt: new Date('2026-01-02T00:00:00Z'),
     }
     mockDbSelect
+      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([existingProvider]))
       .mockReturnValueOnce(chain([
         { id: 'agent-backend', agentType: 'backend', displayName: 'Backend' },
@@ -5405,6 +5459,19 @@ describe('POST /api/providers — baseUrl requirement', () => {
     expect(mockDbUpdate).not.toHaveBeenCalled()
   })
 
+  it('rejects provider deactivation for non-bootstrap users', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValueOnce(chain([{ id: 'user-owner' }]))
+
+    const { DELETE } = await import('@/app/api/providers/[id]/route')
+    const res = await DELETE(nextAuthRequest('/api/providers/provider-current') as never, {
+      params: Promise.resolve({ id: 'provider-current' }),
+    })
+
+    expect(res.status).toBe(403)
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+  })
+
   it('deactivates a confirmed provider and clears affected agent defaults and task overrides', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const existingProvider = {
@@ -5430,6 +5497,7 @@ describe('POST /api/providers — baseUrl requirement', () => {
     const setSpy = vi.fn(() => updateChain)
     updateChain.set = setSpy
     mockDbSelect
+      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([existingProvider]))
       .mockReturnValueOnce(chain([
         { id: 'agent-backend', agentType: 'backend', displayName: 'Backend' },
@@ -5484,6 +5552,7 @@ describe('POST /api/providers — baseUrl requirement', () => {
       updatedAt: new Date(),
     }
     mockDbSelect
+      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([existingProvider]))
       .mockReturnValueOnce(chain([
         { id: 'agent-reviewer', agentType: 'reviewer', displayName: '' },
@@ -5537,6 +5606,7 @@ describe('POST /api/providers — baseUrl requirement', () => {
       updatedAt: new Date(),
     }
     mockDbSelect
+      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([existingProvider]))
       .mockReturnValueOnce(chain([
         { id: 'agent-reviewer', agentType: 'reviewer', displayName: 'Reviewer' },
@@ -5571,7 +5641,15 @@ describe('POST /api/providers — baseUrl requirement', () => {
 // ---------------------------------------------------------------------------
 
 describe('POST /api/tasks — enqueues to Redis', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockGetSession.mockReset()
+    mockDbSelect.mockReset()
+    mockDbInsert.mockReset()
+    mockDbUpdate.mockReset()
+    mockRedisLpush.mockReset()
+    mockRedisPublish.mockReset()
+  })
 
   it('calls redis.lpush("forge:tasks", ...) when task is created', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
@@ -5646,7 +5724,14 @@ describe('POST /api/tasks — enqueues to Redis', () => {
 // ---------------------------------------------------------------------------
 
 describe('POST /api/tasks/:id/retry', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockGetSession.mockReset()
+    mockDbSelect.mockReset()
+    mockDbUpdate.mockReset()
+    mockRedisLpush.mockReset()
+    mockRedisPublish.mockReset()
+  })
 
   it('returns 409 when the task is not stopped', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
@@ -5768,7 +5853,12 @@ describe('POST /api/tasks/:id/retry', () => {
 // ---------------------------------------------------------------------------
 
 describe('GET /api/tasks — includes project name', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockGetSession.mockReset()
+    mockDbSelect.mockReset()
+    mockDbUpdate.mockReturnValue(chain([]))
+  })
 
   it('returns task rows with projectName', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
@@ -5791,6 +5881,7 @@ describe('GET /api/tasks — includes project name', () => {
     }
 
     mockDbSelect
+      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([listedTask]))
       .mockReturnValueOnce(chain([{ total: 1 }]))
 
@@ -5814,7 +5905,12 @@ describe('GET /api/tasks — includes project name', () => {
 // ---------------------------------------------------------------------------
 
 describe('GET /api/tasks/summary', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockGetSession.mockReset()
+    mockDbSelect.mockReset()
+    mockDbUpdate.mockReturnValue(chain([]))
+  })
 
   it('returns 401 when not authenticated', async () => {
     mockGetSession.mockResolvedValue(null)
@@ -5829,6 +5925,7 @@ describe('GET /api/tasks/summary', () => {
   it('aggregates task statuses and returns the latest attention tasks', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect
+      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([
         { status: 'pending', total: 2 },
         { status: 'running', total: 1 },
@@ -5867,12 +5964,14 @@ describe('GET /api/tasks/summary', () => {
         { id: 'task-failed', title: 'Investigate failure', status: 'failed' },
       ],
     })
-    expect(mockDbSelect).toHaveBeenCalledTimes(2)
+    expect(mockDbSelect).toHaveBeenCalledTimes(3)
   })
 
   it('returns 500 when the summary query fails', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
-    mockDbSelect.mockReturnValueOnce(rejectingChain(new Error('database unavailable')))
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
+      .mockReturnValueOnce(rejectingChain(new Error('database unavailable')))
 
     const { GET } = await import('@/app/api/tasks/summary/route')
     const res = await GET(nextAuthRequest('/api/tasks/summary') as never)

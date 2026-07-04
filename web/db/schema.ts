@@ -172,6 +172,12 @@ export const DEFAULT_PROJECT_MCP_CONFIG: ProjectMcpConfig = {
 export const projects = pgTable('projects', {
   id: uuid('id').primaryKey().defaultRandom(),
   name: text('name').notNull(),
+  // The user who created the project. Nullable only so the migration can add
+  // the column safely; pre-existing rows are backfilled to the oldest user so
+  // upgraded installs keep deterministic ownership without shared null access.
+  submittedBy: uuid('submitted_by').references(() => users.id, {
+    onDelete: 'set null',
+  }),
   githubRepo: text('github_repo'), // 'owner/repo'
   localPath: text('local_path'),
   githubTokenEnvVar: text('github_token_env_var'),

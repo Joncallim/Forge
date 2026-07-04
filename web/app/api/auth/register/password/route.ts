@@ -7,6 +7,7 @@ import { redis } from '@/lib/redis'
 import { createSession, sessionCookieOptions } from '@/lib/session'
 import { hashPassword, validatePassword } from '@/lib/password'
 import { passkeysEnabled } from '@/lib/auth-options'
+import { claimLegacyOwnership } from '@/lib/bootstrap-ownership'
 
 function displayNameError(displayName: unknown): string | null {
   if (typeof displayName !== 'string') return 'displayName must be a non-empty string'
@@ -68,10 +69,14 @@ export async function POST(request: NextRequest) {
 
     const displayName = String(data.displayName).trim()
     const passwordHash = await hashPassword(data.password)
-    const [newUser] = await db
-      .insert(users)
-      .values({ displayName, passwordHash })
-      .returning({ id: users.id })
+    const [newUser] = await db.transaction(async (tx) => {
+      const [insertedUser] = await tx
+        .insert(users)
+        .values({ displayName, passwordHash })
+        .returning({ id: users.id })
+      await claimLegacyOwnership(tx, insertedUser.id)
+      return [insertedUser]
+    })
 
     const userAgent = request.headers.get('user-agent')
     const ip =

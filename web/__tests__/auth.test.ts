@@ -23,6 +23,7 @@ import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest'
 const {
   mockDbSelect,
   mockDbInsert,
+  mockDbTransaction,
   mockDbUpdate,
   mockRedisGet,
   mockRedisGetdel,
@@ -39,6 +40,11 @@ const {
 } = vi.hoisted(() => ({
   mockDbSelect: vi.fn(),
   mockDbInsert: vi.fn(),
+  mockDbTransaction: vi.fn(async (callback: (tx: unknown) => unknown) => callback({
+    select: mockDbSelect,
+    insert: mockDbInsert,
+    update: mockDbUpdate,
+  })),
   mockDbUpdate: vi.fn(),
   mockRedisGet: vi.fn(),
   mockRedisGetdel: vi.fn(),
@@ -62,6 +68,7 @@ vi.mock('@/db', () => ({
   db: {
     select: mockDbSelect,
     insert: mockDbInsert,
+    transaction: mockDbTransaction,
     update: mockDbUpdate,
   },
 }))
@@ -684,9 +691,8 @@ describe('register/password — passkeys disabled', () => {
     mockRedisGet.mockResolvedValue('lock-token')
     mockRedisDel.mockResolvedValue(1)
     mockHashPassword.mockResolvedValue('hashed-password')
-    mockDbInsert
-      .mockReturnValueOnce(chain([{ id: 'user-1' }]))
-      .mockReturnValueOnce(chain(undefined))
+    mockDbInsert.mockReturnValueOnce(chain([{ id: 'user-1' }]))
+    mockDbUpdate.mockReturnValue(chain(undefined))
   })
 
   it('creates the first user without a passkey when passkeys are disabled', async () => {
@@ -706,6 +712,7 @@ describe('register/password — passkeys disabled', () => {
     expect(res.status).toBe(200)
     expect(mockHashPassword).toHaveBeenCalledWith('correct-password')
     expect(mockDbInsert).toHaveBeenCalledTimes(2)
+    expect(mockDbUpdate).toHaveBeenCalledTimes(2)
     expect(mockRedisSet).toHaveBeenCalledWith(
       'webauthn:registration:first-user-lock',
       expect.any(String),

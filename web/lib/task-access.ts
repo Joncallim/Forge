@@ -1,16 +1,16 @@
-import { and, eq, isNull, or } from 'drizzle-orm'
+import { and, eq, isNull } from 'drizzle-orm'
 import { db } from '@/db'
-import { tasks } from '@/db/schema'
+import { projects, tasks } from '@/db/schema'
 
 export function accessibleTaskCondition(taskId: string, userId: string) {
   return and(
     eq(tasks.id, taskId),
-    or(eq(tasks.submittedBy, userId), isNull(tasks.submittedBy)),
+    eq(tasks.submittedBy, userId),
   )
 }
 
 export function accessibleTaskOwnerCondition(userId: string) {
-  return or(eq(tasks.submittedBy, userId), isNull(tasks.submittedBy))
+  return eq(tasks.submittedBy, userId)
 }
 
 export async function getAccessibleTask(taskId: string, userId: string) {
@@ -20,5 +20,26 @@ export async function getAccessibleTask(taskId: string, userId: string) {
     .where(accessibleTaskCondition(taskId, userId))
     .limit(1)
 
-  return task ?? null
+  if (task) return task
+
+  const [legacyTask] = await db
+    .select({ id: tasks.id })
+    .from(tasks)
+    .innerJoin(projects, eq(tasks.projectId, projects.id))
+    .where(and(
+      eq(tasks.id, taskId),
+      isNull(tasks.submittedBy),
+      eq(projects.submittedBy, userId),
+    ))
+    .limit(1)
+
+  if (!legacyTask) return null
+
+  const [claimedTask] = await db
+    .update(tasks)
+    .set({ submittedBy: userId })
+    .where(and(eq(tasks.id, taskId), isNull(tasks.submittedBy)))
+    .returning()
+
+  return claimedTask ?? null
 }

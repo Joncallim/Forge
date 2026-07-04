@@ -3,8 +3,8 @@ import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/db'
 import { projects } from '@/db/schema'
-import { eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
+import { accessibleProjectCondition } from '@/lib/project-access'
 import { isKnownMcpId } from '@/lib/mcps/catalog'
 import { getProjectMcpOverview, installMcps, installRecommendedMcps } from '@/lib/mcps/manager'
 import type { McpId } from '@/lib/mcps/types'
@@ -64,7 +64,7 @@ export async function POST(
     const [project] = await db
       .select()
       .from(projects)
-      .where(eq(projects.id, id))
+      .where(accessibleProjectCondition(id, session.userId))
       .limit(1)
 
     if (!project) {
