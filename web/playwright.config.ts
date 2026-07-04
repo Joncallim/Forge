@@ -4,6 +4,7 @@ const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
 
 export default defineConfig({
   testDir: './e2e',
+  globalTeardown: './e2e/global-teardown.ts',
   timeout: 60_000,
   // Tests share one dev Postgres/Redis instance and each does a global
   // truncate in beforeEach, so concurrent workers race on each other's data.

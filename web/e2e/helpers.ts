@@ -116,19 +116,16 @@ export async function resetState(): Promise<void> {
   const redis = redisClient()
 
   try {
-    await sql`
-      truncate table
-        artifacts,
-        agent_runs,
-        tasks,
-        projects,
-        agent_configs,
-        provider_configs,
-        sessions,
-        credentials,
-        users
-      restart identity cascade
-    `
+    // The local Forge role does not necessarily own every table reached by a
+    // blanket TRUNCATE ... CASCADE anymore. Delete the mutable top-level rows
+    // that E2E touches and let foreign keys cascade from there instead.
+    await sql.begin(async (tx) => {
+      await tx`delete from projects`
+      await tx`delete from provider_configs`
+      await tx`delete from sessions`
+      await tx`delete from credentials`
+      await tx`delete from users`
+    })
     await redis.flushdb()
   } finally {
     await sql.end()
