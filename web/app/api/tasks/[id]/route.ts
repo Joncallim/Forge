@@ -42,6 +42,13 @@ function errorCode(err: unknown): string | null {
   return errorCode(err.cause)
 }
 
+function optionalAuditUnavailableReason(err: unknown): 'missing' | 'permission' | null {
+  const code = errorCode(err)
+  if (code === '42P01') return 'missing'
+  if (code === '42501') return 'permission'
+  return null
+}
+
 async function selectTaskCommandAudits(taskId: string): Promise<(typeof repositoryCommandAudits.$inferSelect)[]> {
   try {
     return await db
@@ -50,10 +57,11 @@ async function selectTaskCommandAudits(taskId: string): Promise<(typeof reposito
       .where(eq(repositoryCommandAudits.taskId, taskId))
       .orderBy(asc(repositoryCommandAudits.startedAt))
   } catch (err) {
-    if (errorCode(err) === '42P01') {
+    const reason = optionalAuditUnavailableReason(err)
+    if (reason) {
       console.warn(
-        '[GET /api/tasks/:id] repository_command_audits table is missing; returning task detail without command audit rows.',
-        { taskId },
+        `[GET /api/tasks/:id] repository_command_audits table is ${reason === 'missing' ? 'missing' : 'not readable'}; returning task detail without command audit rows.`,
+        { taskId, reason },
       )
       return []
     }
@@ -69,10 +77,11 @@ async function selectTaskFilesystemAudits(taskId: string): Promise<(typeof files
       .where(eq(filesystemMcpRuntimeAudits.taskId, taskId))
       .orderBy(asc(filesystemMcpRuntimeAudits.createdAt))
   } catch (err) {
-    if (errorCode(err) === '42P01') {
+    const reason = optionalAuditUnavailableReason(err)
+    if (reason) {
       console.warn(
-        '[GET /api/tasks/:id] filesystem_mcp_runtime_audits table is missing; returning task detail without filesystem MCP audit rows.',
-        { taskId },
+        `[GET /api/tasks/:id] filesystem_mcp_runtime_audits table is ${reason === 'missing' ? 'missing' : 'not readable'}; returning task detail without filesystem MCP audit rows.`,
+        { taskId, reason },
       )
       return []
     }

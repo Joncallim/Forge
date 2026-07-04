@@ -2543,6 +2543,48 @@ describe('GET /api/tasks/:id — task details', () => {
     expect(body.task.id).toBe(task.id)
     expect(body.commandAudits).toEqual([])
   })
+
+  it('returns task details when optional filesystem audit rows are not readable', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const task = {
+      id: 'task-unreadable-filesystem-audits',
+      status: 'running',
+      projectId: 'proj-1',
+      title: 'Running task',
+      prompt: 'Do something.',
+      submittedBy: 'user-abc',
+      pmProviderConfigId: null,
+      githubBranch: null,
+      githubPrUrl: null,
+      errorMessage: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      completedAt: null,
+    }
+    const permissionError = Object.assign(new Error('permission denied for table filesystem_mcp_runtime_audits'), {
+      cause: { code: '42501' },
+    })
+    mockDbSelect
+      .mockReturnValueOnce(chain([task]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(rejectingChain(permissionError))
+
+    const { GET } = await import('@/app/api/tasks/[id]/route')
+    const res = await GET(authRequest(`/api/tasks/${task.id}`) as never, {
+      params: Promise.resolve({ id: task.id }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.task.id).toBe(task.id)
+    expect(body.filesystemAudits).toEqual([])
+  })
 })
 
 // ---------------------------------------------------------------------------
