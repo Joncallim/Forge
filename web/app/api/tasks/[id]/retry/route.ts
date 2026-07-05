@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/db'
-import { providerConfigs, tasks } from '@/db/schema'
+import { providerConfigs, tasks, workPackages } from '@/db/schema'
 import { and, eq, inArray } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
@@ -14,6 +14,16 @@ const retrySchema = z.object({
 })
 
 const RETRYABLE_STATUSES = ['failed', 'cancelled', 'rejected'] as const
+
+async function hasRetryableHandoffPackages(taskId: string): Promise<boolean> {
+  const [workPackage] = await db
+    .select({ id: workPackages.id })
+    .from(workPackages)
+    .where(and(eq(workPackages.taskId, taskId), inArray(workPackages.status, ['failed', 'blocked'])))
+    .limit(1)
+
+  return workPackage !== undefined
+}
 
 export async function POST(
   request: NextRequest,
@@ -66,10 +76,15 @@ export async function POST(
       }
     }
 
+    const retryHandoff = existing.status === 'failed' && await hasRetryableHandoffPackages(taskId)
+    const nextStatus = retryHandoff ? 'approved' : 'pending'
+    const queueName = retryHandoff ? 'forge:approvals' : 'forge:tasks'
+    const queuePayload = retryHandoff ? { taskId, action: 'approve' } : { taskId }
+
     const [task] = await db
       .update(tasks)
       .set({
-        status: 'pending',
+        status: nextStatus,
         pmProviderConfigId: providerId ?? null,
         errorMessage: null,
         updatedAt: new Date(),
@@ -84,10 +99,10 @@ export async function POST(
       )
     }
 
-    await redis.lpush('forge:tasks', JSON.stringify({ taskId: task.id }))
+    await redis.lpush(queueName, JSON.stringify(queuePayload))
     await redis.publish('forge:task:' + taskId, JSON.stringify({
       type: 'task:status',
-      status: 'pending',
+      status: nextStatus,
       errorMessage: null,
       updatedAt: task.updatedAt.toISOString(),
     }))
@@ -100,8 +115,14 @@ export async function POST(
         prompt: task.prompt,
       },
       level: 'info',
-      message: `Task was requeued from ${existing.status}.`,
-      metadata: { previousStatus: existing.status, providerConfigId: providerId ?? null },
+      message: retryHandoff
+        ? `Task handoff was requeued from ${existing.status}.`
+        : `Task was requeued from ${existing.status}.`,
+      metadata: {
+        previousStatus: existing.status,
+        providerConfigId: providerId ?? null,
+        retryQueue: retryHandoff ? 'approvals' : 'tasks',
+      },
       source: 'api',
       taskId,
       title: 'Task retried',

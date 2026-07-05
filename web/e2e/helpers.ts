@@ -20,6 +20,10 @@ export type SeededTask = {
   taskId: string
 }
 
+export type SeededWorkPackage = {
+  packageId: string
+}
+
 export type SeededProject = {
   projectId: string
 }
@@ -208,6 +212,75 @@ export async function seedProjectTask(input: {
   }
 
   return { projectId, taskId }
+}
+
+export async function seedRequiredFilesystemPackage(input: {
+  taskId: string
+  title?: string
+}): Promise<SeededWorkPackage> {
+  const sql = sqlClient()
+  const packageId = crypto.randomUUID()
+  const title = input.title ?? 'Filesystem context package'
+  const mcpRequirements = [{
+    mcpId: 'filesystem',
+    requirement: 'required',
+    capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+    reason: 'Read and search project files for implementation context.',
+  }]
+  const metadata = {
+    mcpGrantPhases: {
+      proposed: {
+        schemaVersion: 1,
+        phase: 'proposed',
+        status: 'proposed',
+        grants: mcpRequirements,
+      },
+      effective: {
+        schemaVersion: 1,
+        phase: 'effective',
+        status: 'not_issued',
+      },
+    },
+  }
+
+  try {
+    await sql`
+      insert into work_packages (
+        id,
+        task_id,
+        assigned_role,
+        title,
+        summary,
+        status,
+        sequence,
+        steps,
+        required_capabilities,
+        acceptance_criteria,
+        mcp_requirements,
+        review_requirement,
+        metadata
+      )
+      values (
+        ${packageId},
+        ${input.taskId},
+        ${'frontend'},
+        ${title},
+        ${'Needs bounded project filesystem context before execution.'},
+        ${'pending'},
+        ${1},
+        ${JSON.stringify(['Review the project files.'])}::jsonb,
+        ${JSON.stringify({ frontend: true })}::jsonb,
+        ${JSON.stringify(['Context is available to the package.'])}::jsonb,
+        ${JSON.stringify(mcpRequirements)}::jsonb,
+        ${'qa_only'},
+        ${JSON.stringify(metadata)}::jsonb
+      )
+    `
+  } finally {
+    await sql.end()
+  }
+
+  return { packageId }
 }
 
 export async function seedProject(input: {

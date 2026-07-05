@@ -398,6 +398,30 @@ function filesystemPackageCapabilitySummary(pkg: WorkPackage): {
   }
 }
 
+export function unresolvedRequiredFilesystemGrants(workPackages: WorkPackage[]): Array<{
+  missingCapabilities: string[]
+  packageId: string
+  title: string
+}> {
+  return workPackages.flatMap((pkg, index) => {
+    const summary = filesystemPackageCapabilitySummary(pkg)
+    if (summary.blockingCapabilities.length === 0) return []
+
+    const effective = filesystemEffectiveState(pkg)
+    if (effective.status === 'denied') return []
+    const missingCapabilities = summary.blockingCapabilities.filter((capability) => (
+      effective.status !== 'approved' || !effective.capabilities.includes(capability)
+    ))
+    if (missingCapabilities.length === 0) return []
+
+    return [{
+      missingCapabilities,
+      packageId: stringField(pkg, ['id']),
+      title: stringField(pkg, ['title', 'name', 'summary', 'agentType', 'role']) || `Work package ${index + 1}`,
+    }]
+  })
+}
+
 function uniqueArtifacts(artifacts: Artifact[]): Artifact[] {
   const byId = new Map<string, Artifact>()
   for (const artifact of artifacts) byId.set(artifact.id, artifact)
@@ -1585,6 +1609,7 @@ function McpGrantCards({ grants }: { grants: WorkforceRecord[] }) {
 
 function filesystemEffectiveState(pkg: WorkPackage): {
   capabilities: string[]
+  grantMode: string
   grantApprovalId: string
   reason: string
   status: string
@@ -1593,11 +1618,12 @@ function filesystemEffectiveState(pkg: WorkPackage): {
   const phases = metadata ? recordField(metadata, ['mcpGrantPhases']) : null
   const effective = phases ? recordField(phases, ['effective']) : null
   if (!effective) {
-    return { capabilities: [], grantApprovalId: '', reason: '', status: 'not_issued' }
+    return { capabilities: [], grantApprovalId: '', grantMode: '', reason: '', status: 'not_issued' }
   }
   const grants = jsonArrayField(effective, ['grants'])
   return {
     capabilities: filesystemCapabilitiesFromValues(grants.flatMap((grant) => stringArrayField(grant, ['capabilities', 'permissions']))),
+    grantMode: stringField(effective, ['grantMode', 'mode', 'scope']),
     grantApprovalId: stringField(effective, ['grantApprovalId']),
     reason: stringField(effective, ['reason']),
     status: stringField(effective, ['status']) || 'not_issued',
@@ -1619,7 +1645,7 @@ function FilesystemGrantControls({
   const effective = useMemo(() => filesystemEffectiveState(pkg), [pkg])
   const [selected, setSelected] = useState<string[]>(effective.capabilities.length > 0 ? effective.capabilities : summary.requestedCapabilities)
   const [reason, setReason] = useState(effective.reason)
-  const [saving, setSaving] = useState<'approved' | 'denied' | null>(null)
+  const [saving, setSaving] = useState<'allow_once' | 'always_allow' | 'denied' | null>(null)
   const [error, setError] = useState<string | null>(null)
   const packageId = stringField(pkg, ['id'])
   const packageStatus = stringField(pkg, ['status'])
@@ -1638,8 +1664,8 @@ function FilesystemGrantControls({
   const approveDisabled = selected.length === 0 || !selected.includes('filesystem.project.read')
   const deniedRequired = effective.status === 'denied' && summary.blockingCapabilities.length > 0
 
-  async function submit(decision: 'approved' | 'denied') {
-    setSaving(decision)
+  async function submit(decision: 'approved' | 'denied', grantMode: 'allow_once' | 'always_allow' = 'always_allow') {
+    setSaving(decision === 'approved' ? grantMode : 'denied')
     setError(null)
     try {
       const res = await fetch(`/api/tasks/${taskId}/filesystem-grants`, {
@@ -1651,6 +1677,7 @@ function FilesystemGrantControls({
             workPackageId: packageId,
             decision,
             capabilities: decision === 'approved' ? selected : [],
+            grantMode,
             reason: reason.trim() || undefined,
           }],
         }),
@@ -1675,6 +1702,7 @@ function FilesystemGrantControls({
       <div className="flex flex-wrap items-center gap-2">
         <p className="font-medium text-muted-foreground">Filesystem context grant</p>
         <Badge variant="outline" className={statusBadgeClass(effective.status)}>{statusLabel(effective.status)}</Badge>
+        {effective.grantMode !== '' && <Badge variant="secondary">{statusLabel(effective.grantMode)}</Badge>}
         {summary.blockingCapabilities.length > 0 && <Badge variant="secondary">required</Badge>}
       </div>
       <div className="mt-2 flex flex-wrap gap-2">
@@ -1701,6 +1729,14 @@ function FilesystemGrantControls({
       )}
       {canEdit && (
         <div className="mt-2 grid gap-2">
+          <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs text-muted-foreground">
+            <p>
+              Always allow saves this filesystem approval for the project, so future packages with the same or narrower filesystem needs can run without asking again.
+            </p>
+            <p className="mt-1">
+              Forge still sends only a bounded read-only context packet. It does not issue live filesystem tools or write access.
+            </p>
+          </div>
           <textarea
             className="min-h-16 w-full rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground"
             onChange={(event) => setReason(event.target.value)}
@@ -1710,12 +1746,21 @@ function FilesystemGrantControls({
           <div className="flex flex-wrap gap-2">
             <Button
               disabled={saving !== null || approveDisabled}
-              onClick={() => void submit('approved')}
+              onClick={() => void submit('approved', 'allow_once')}
               size="sm"
               type="button"
               variant="outline"
             >
-              {saving === 'approved' ? 'Saving...' : 'Approve'}
+              {saving === 'allow_once' ? 'Saving...' : 'Allow once'}
+            </Button>
+            <Button
+              disabled={saving !== null || approveDisabled}
+              onClick={() => void submit('approved', 'always_allow')}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              {saving === 'always_allow' ? 'Saving...' : 'Always allow'}
             </Button>
             <Button
               disabled={saving !== null}
@@ -3891,6 +3936,8 @@ export default function TaskDetailPage() {
   const effectiveTaskStatus = currentStatus ?? task.status
   const isAwaitingApproval = effectiveTaskStatus === 'awaiting_approval'
   const hasBlockedPackage = workPackages.some((pkg) => stringField(pkg, ['status', 'state']) === 'blocked')
+  const unresolvedFilesystemGrants = unresolvedRequiredFilesystemGrants(workPackages)
+  const hasUnresolvedFilesystemGrants = unresolvedFilesystemGrants.length > 0
   const canRetryHandoff = canRetryHandoffForTaskStatus(effectiveTaskStatus, hasBlockedPackage)
   const canRetryTask = ['failed', 'cancelled', 'rejected'].includes(effectiveTaskStatus)
   const canShowRetryTask = canRetryTask || retryCardCollapsing
@@ -4079,6 +4126,38 @@ export default function TaskDetailPage() {
                 Review the plan. You can approve it, request changes, or restart the task.
               </p>
 
+              {hasUnresolvedFilesystemGrants && (
+                <div className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+                  <p className="text-sm font-medium text-foreground">Filesystem grants required</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Approve required filesystem context before approving the plan.
+                  </p>
+                  <div className="mt-3 grid gap-2">
+                    {unresolvedFilesystemGrants.map((grant) => {
+                      const pkg = workPackages.find((item) => stringField(item, ['id']) === grant.packageId)
+                      if (!pkg) return null
+                      return (
+                        <div key={grant.packageId || grant.title} className="rounded-md border border-border bg-background/80 p-2">
+                          <div className="mb-2 flex flex-wrap items-center gap-2">
+                            <span className="text-xs font-medium text-foreground">{grant.title}</span>
+                            <Badge variant="outline" className={statusBadgeClass('blocked')}>missing grant</Badge>
+                          </div>
+                          <p className="mb-2 break-words font-mono text-[11px] text-muted-foreground">
+                            {grant.missingCapabilities.join(', ')}
+                          </p>
+                          <FilesystemGrantControls
+                            onUpdated={loadTask}
+                            pkg={pkg}
+                            taskId={taskId}
+                            taskStatus={effectiveTaskStatus}
+                          />
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+
               {actionError !== null && (
                 <p role="alert" aria-live="assertive" className="mb-3 text-sm text-destructive">
                   {actionError}
@@ -4090,7 +4169,7 @@ export default function TaskDetailPage() {
                   <Button
                     size="sm"
                     onClick={handleApprove}
-                    disabled={actionLoading}
+                    disabled={actionLoading || hasUnresolvedFilesystemGrants}
                     aria-busy={actionLoading}
                     aria-label="Approve generated plan"
                   >

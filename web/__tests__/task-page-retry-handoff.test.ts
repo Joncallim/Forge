@@ -25,6 +25,7 @@ import {
   securityReviewPayloadFromMetadata,
   securityReviewSubmissionPayloadFromForm,
   taskProgressSummary,
+  unresolvedRequiredFilesystemGrants,
   workforceExecutionSummary,
 } from '@/app/dashboard/tasks/[id]/page'
 
@@ -51,6 +52,109 @@ describe('task page retry handoff controls', () => {
     expect(canDeleteTaskStatus('approved')).toBe(false)
     expect(canDeleteTaskStatus('failed')).toBe(true)
     expect(canDeleteTaskStatus('cancelled')).toBe(true)
+  })
+
+  it('finds required filesystem grants that still need explicit approval', () => {
+    expect(unresolvedRequiredFilesystemGrants([{
+      id: 'pkg-fs',
+      status: 'pending',
+      title: 'Frontend work package',
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      }],
+      metadata: {
+        mcpGrantPhases: {
+          effective: {
+            schemaVersion: 1,
+            phase: 'effective',
+            status: 'not_issued',
+          },
+        },
+      },
+    }])).toEqual([{
+      missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      packageId: 'pkg-fs',
+      title: 'Frontend work package',
+    }])
+
+    expect(unresolvedRequiredFilesystemGrants([{
+      id: 'pkg-approved',
+      status: 'pending',
+      title: 'Approved package',
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      }],
+      metadata: {
+        mcpGrantPhases: {
+          effective: {
+            schemaVersion: 1,
+            phase: 'effective',
+            runtimeEnforcement: 'bounded_context_packet',
+            status: 'approved',
+            grants: [{
+              mcpId: 'filesystem',
+              status: 'approved',
+              capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            }],
+          },
+        },
+      },
+    }])).toEqual([])
+
+    expect(unresolvedRequiredFilesystemGrants([{
+      id: 'pkg-project-approved',
+      status: 'pending',
+      title: 'Project approved package',
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      }],
+      metadata: {
+        mcpGrantPhases: {
+          effective: {
+            schemaVersion: 1,
+            phase: 'effective',
+            source: 'project-filesystem-approval',
+            runtimeEnforcement: 'bounded_context_packet',
+            grantMode: 'always_allow',
+            status: 'approved',
+            grants: [{
+              mcpId: 'filesystem',
+              status: 'approved',
+              capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            }],
+          },
+        },
+      },
+    }])).toEqual([])
+
+    expect(unresolvedRequiredFilesystemGrants([{
+      id: 'pkg-denied',
+      status: 'pending',
+      title: 'Denied package',
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      }],
+      metadata: {
+        mcpGrantPhases: {
+          effective: {
+            schemaVersion: 1,
+            phase: 'effective',
+            source: 'explicit-grant-approval',
+            runtimeEnforcement: 'bounded_context_packet',
+            status: 'denied',
+            deniedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+          },
+        },
+      },
+    }])).toEqual([])
   })
 
   it('surfaces blocked package progress instead of showing active handoff progress', () => {

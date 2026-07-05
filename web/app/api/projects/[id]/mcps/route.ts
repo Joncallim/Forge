@@ -99,7 +99,10 @@ export async function PUT(
       )
     }
 
-    const config = parsed.data
+    const config = {
+      ...parsed.data,
+      grants: project.mcpConfig.grants,
+    }
     const knownError = validateKnownMcps(config)
     if (knownError) {
       return NextResponse.json({ error: knownError }, { status: 400 })

@@ -21,6 +21,7 @@ import {
   isWithinPath,
 } from '@/lib/workspace'
 import { MCP_CATALOG, RECOMMENDED_MCP_IDS, isKnownMcpId } from './catalog'
+import { projectFilesystemGrantFromConfig } from './filesystem-grants'
 import type {
   McpCatalogEntry,
   McpHealthStatus,
@@ -47,11 +48,14 @@ function normalizeProjectMcpConfig(rawConfig: Project['mcpConfig'] | null | unde
   const requiredMcps = Array.isArray(raw.requiredMcps)
     ? Array.from(new Set(raw.requiredMcps.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)))
     : DEFAULT_PROJECT_MCP_CONFIG.requiredMcps
+  const filesystemGrant = projectFilesystemGrantFromConfig(raw)
+  const grants = filesystemGrant ? { filesystem: filesystemGrant } : undefined
 
   return {
     profile: raw.profile === 'custom' ? 'custom' : 'default',
     requiredMcps,
     overrides: raw.overrides && typeof raw.overrides === 'object' ? raw.overrides : {},
+    ...(grants ? { grants } : {}),
   }
 }
 

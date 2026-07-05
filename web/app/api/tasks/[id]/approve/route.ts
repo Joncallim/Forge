@@ -1,13 +1,19 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { db } from '@/db'
-import { approvalGates, tasks, workPackages } from '@/db/schema'
+import { approvalGates, projects, tasks, workPackages } from '@/db/schema'
 import { and, eq, sql } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
-import { isExplicitFilesystemEffectivePhase } from '@/lib/mcps/filesystem-grants'
+import {
+  isExplicitFilesystemEffectivePhase,
+  isRecord as isFilesystemGrantRecord,
+  projectFilesystemEffectivePhase,
+  projectFilesystemGrantCovers,
+  requiresFilesystemGrantApproval,
+} from '@/lib/mcps/filesystem-grants'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -141,18 +147,8 @@ export async function POST(
     }
 
     const approvedAt = new Date()
-    const { task, approvedGates } = await db.transaction(async (tx) => {
-      const [approvedTask] = await tx
-        .update(tasks)
-        .set({ errorMessage: null, status: 'approved', updatedAt: approvedAt })
-        .where(and(accessibleTaskCondition(taskId, session.userId), eq(tasks.status, 'awaiting_approval')))
-        .returning()
-
-      if (!approvedTask) {
-        return { task: null, approvedGates: [] as { id: string }[] }
-      }
-
-      const packageRows = await tx
+    const { task, approvedGates, missingFilesystemGrant } = await db.transaction(async (tx) => {
+      const rawPackageRows = await tx
         .select({
           id: workPackages.id,
           assignedRole: workPackages.assignedRole,
@@ -162,6 +158,66 @@ export async function POST(
         })
         .from(workPackages)
         .where(eq(workPackages.taskId, taskId))
+      const [projectGrantRow] = await tx
+        .select({ mcpConfig: projects.mcpConfig })
+        .from(projects)
+        .where(eq(projects.id, existing.projectId))
+        .limit(1)
+
+      const packageRows = rawPackageRows.map((pkg) => {
+        const grant = projectFilesystemGrantCovers({
+          mcpConfig: projectGrantRow?.mcpConfig,
+          mcpRequirements: pkg.mcpRequirements,
+          metadata: pkg.metadata,
+        })
+        if (!grant) return pkg
+        const metadata = isFilesystemGrantRecord(pkg.metadata) ? pkg.metadata : {}
+        const phases = isFilesystemGrantRecord(metadata.mcpGrantPhases) ? metadata.mcpGrantPhases : {}
+        return {
+          ...pkg,
+          metadata: {
+            ...metadata,
+            mcpGrantPhases: {
+              ...phases,
+              schemaVersion: 1,
+              effective: projectFilesystemEffectivePhase(grant),
+            },
+          },
+        }
+      })
+
+      const missingGrant = packageRows
+        .map((pkg) => ({
+          pkg,
+          grant: requiresFilesystemGrantApproval({
+            mcpRequirements: pkg.mcpRequirements,
+            metadata: pkg.metadata,
+          }),
+        }))
+        .find(({ grant }) => grant.blocked)
+
+      if (missingGrant) {
+        return {
+          task: null,
+          approvedGates: [] as { id: string }[],
+          missingFilesystemGrant: {
+            error: `Approve or deny required filesystem context for "${missingGrant.pkg.title}" before approving the plan.`,
+            missingCapabilities: missingGrant.grant.missingCapabilities,
+            workPackageId: missingGrant.pkg.id,
+          },
+        }
+      }
+
+      const [approvedTask] = await tx
+        .update(tasks)
+        .set({ errorMessage: null, status: 'approved', updatedAt: approvedAt })
+        .where(and(accessibleTaskCondition(taskId, session.userId), eq(tasks.status, 'awaiting_approval')))
+        .returning()
+
+      if (!approvedTask) {
+        return { task: null, approvedGates: [] as { id: string }[], missingFilesystemGrant: null }
+      }
+
       const approvedGrantSnapshot = buildApprovedGrantSnapshot({
         approvedAt,
         approvedBy: session.userId,
@@ -218,8 +274,12 @@ export async function POST(
         )
         .returning({ id: approvalGates.id })
 
-      return { task: approvedTask, approvedGates: gates }
+      return { task: approvedTask, approvedGates: gates, missingFilesystemGrant: null }
     })
+
+    if (missingFilesystemGrant) {
+      return NextResponse.json(missingFilesystemGrant, { status: 409 })
+    }
 
     if (!task) {
       return NextResponse.json(
