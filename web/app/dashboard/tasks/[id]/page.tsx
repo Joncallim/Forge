@@ -139,6 +139,11 @@ interface TaskDetailResponse {
   vcsChanges?: VcsChange[]
 }
 
+type ProjectFilesystemGrantState = {
+  capabilities: string[]
+  enabled: boolean
+}
+
 function statusLabel(status: string): string {
   const labels: Record<string, string> = {
     awaiting_answers: 'Needs answers',
@@ -398,7 +403,24 @@ function filesystemPackageCapabilitySummary(pkg: WorkPackage): {
   }
 }
 
-export function unresolvedRequiredFilesystemGrants(workPackages: WorkPackage[]): Array<{
+function projectFilesystemGrantCoversPackage(
+  projectFilesystemGrant: ProjectFilesystemGrantState | null,
+  pkg: WorkPackage,
+): boolean {
+  if (!projectFilesystemGrant?.enabled) return false
+  const summary = filesystemPackageCapabilitySummary(pkg)
+  const requiredCapabilities = summary.blockingCapabilities.length > 0
+    ? summary.blockingCapabilities
+    : summary.requestedCapabilities
+  return requiredCapabilities.length > 0 && requiredCapabilities.every((capability) => (
+    projectFilesystemGrant.capabilities.includes(capability)
+  ))
+}
+
+export function unresolvedRequiredFilesystemGrants(
+  workPackages: WorkPackage[],
+  projectFilesystemGrant: ProjectFilesystemGrantState | null = null,
+): Array<{
   missingCapabilities: string[]
   packageId: string
   title: string
@@ -406,6 +428,7 @@ export function unresolvedRequiredFilesystemGrants(workPackages: WorkPackage[]):
   return workPackages.flatMap((pkg, index) => {
     const summary = filesystemPackageCapabilitySummary(pkg)
     if (summary.blockingCapabilities.length === 0) return []
+    if (projectFilesystemGrantCoversPackage(projectFilesystemGrant, pkg)) return []
 
     const effective = filesystemEffectiveState(pkg)
     if (effective.status === 'denied') return []
@@ -3560,6 +3583,7 @@ export default function TaskDetailPage() {
   const [filesystemAudits, setFilesystemAudits] = useState<FilesystemAudit[]>([])
   const [taskLogs, setTaskLogs] = useState<TaskLog[]>([])
   const [liveLogIds, setLiveLogIds] = useState<Set<string>>(new Set())
+  const [projectFilesystemGrant, setProjectFilesystemGrant] = useState<ProjectFilesystemGrantState | null>(null)
   const [providers, setProviders] = useState<ProviderConfig[]>([])
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
@@ -3604,6 +3628,28 @@ export default function TaskDetailPage() {
   const mergedQuestions: TaskQuestion[] = streamQuestions ?? initialQuestions
   const currentStatus = optimisticTaskStatus ?? taskStatus ?? task?.status ?? null
 
+  const loadProjectFilesystemGrant = useCallback(async (projectId: string | null | undefined) => {
+    const normalizedProjectId = typeof projectId === 'string' ? projectId.trim() : ''
+    if (normalizedProjectId === '') {
+      setProjectFilesystemGrant(null)
+      return
+    }
+
+    try {
+      const res = await fetch(`/api/projects/${normalizedProjectId}/filesystem-grant`)
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok || !isRecord(body.grant)) {
+        throw new Error('Failed to load project filesystem grant')
+      }
+      setProjectFilesystemGrant({
+        enabled: body.grant.enabled === true,
+        capabilities: filesystemCapabilitiesFromValues(Array.isArray(body.grant.capabilities) ? body.grant.capabilities : []),
+      })
+    } catch {
+      setProjectFilesystemGrant(null)
+    }
+  }, [])
+
   const loadTask = useCallback(async () => {
     setLoading(true)
     setFetchError(null)
@@ -3615,6 +3661,7 @@ export default function TaskDetailPage() {
       }
       const data = await res.json() as TaskDetailResponse
       setTask(data.task ?? null)
+      void loadProjectFilesystemGrant(data.task?.projectId)
       setRetryProviderId(data.task?.pmProviderConfigId ?? null)
       setInitialRuns(data.runs ?? [])
       setInitialArtifacts(data.artifacts ?? [])
@@ -3630,7 +3677,7 @@ export default function TaskDetailPage() {
     } finally {
       setLoading(false)
     }
-  }, [taskId])
+  }, [loadProjectFilesystemGrant, taskId])
 
   const loadProviders = useCallback(async () => {
     try {
@@ -3942,7 +3989,7 @@ export default function TaskDetailPage() {
   const effectiveTaskStatus = currentStatus ?? task.status
   const isAwaitingApproval = effectiveTaskStatus === 'awaiting_approval'
   const hasBlockedPackage = workPackages.some((pkg) => stringField(pkg, ['status', 'state']) === 'blocked')
-  const unresolvedFilesystemGrants = unresolvedRequiredFilesystemGrants(workPackages)
+  const unresolvedFilesystemGrants = unresolvedRequiredFilesystemGrants(workPackages, projectFilesystemGrant)
   const hasUnresolvedFilesystemGrants = unresolvedFilesystemGrants.length > 0
   const canRetryHandoff = canRetryHandoffForTaskStatus(effectiveTaskStatus, hasBlockedPackage)
   const canRetryTask = ['failed', 'cancelled', 'rejected'].includes(effectiveTaskStatus)

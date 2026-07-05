@@ -3,6 +3,7 @@ import { GITHUB_REPO_PATTERN, nonEmptyTrimmedStringSchema, positiveIntSchema } f
 const GITHUB_TIMEOUT_MS = 8000
 const DEFAULT_GITHUB_API_URL = 'https://api.github.com'
 const GITHUB_API_VERSION = '2022-11-28'
+const LIST_COMMENTS_PAGE_SIZE = 100
 
 export type GitHubIssue = Readonly<{
   number: number
@@ -172,9 +173,13 @@ export class RestGitHubClient implements GitHubClient {
   }
 
   async listComments(issueNumber: number): Promise<GitHubComment[]> {
-    const response = await this.request(`/repos/${this.repo}/issues/${normalizeIssueNumber(issueNumber)}/comments?per_page=100`)
-    const body = await this.readJson<Array<Record<string, unknown>>>(response)
-    return body.map(mapComment)
+    const comments: GitHubComment[] = []
+    for (let page = 1; ; page += 1) {
+      const pageComments = await this.listCommentsPage(issueNumber, page)
+      comments.push(...pageComments)
+      if (pageComments.length < LIST_COMMENTS_PAGE_SIZE) break
+    }
+    return comments
   }
 
   async addLabel(issueNumber: number, label: string): Promise<void> {
@@ -198,10 +203,7 @@ export class RestGitHubClient implements GitHubClient {
     input: { markerPrefix: string; botLogin: string; body: string },
   ): Promise<GitHubComment> {
     const normalized = normalizeCommentSearch(input)
-    const existing = (await this.listComments(issueNumber)).find((comment) => (
-      comment.authorLogin.trim().toLowerCase() === normalized.botLogin
-      && comment.body.startsWith(normalized.markerPrefix)
-    ))
+    const existing = await this.findCommentByMarker(issueNumber, normalized)
 
     if (existing) {
       const response = await this.request(`/repos/${this.repo}/issues/comments/${existing.id}`, {
@@ -243,6 +245,29 @@ export class RestGitHubClient implements GitHubClient {
         return body.permission
       default:
         throw new Error(`Unexpected collaborator permission response for ${username}.`)
+    }
+  }
+
+  private async listCommentsPage(issueNumber: number, page: number): Promise<GitHubComment[]> {
+    const response = await this.request(
+      `/repos/${this.repo}/issues/${normalizeIssueNumber(issueNumber)}/comments?per_page=${LIST_COMMENTS_PAGE_SIZE}&page=${page}`,
+    )
+    const body = await this.readJson<Array<Record<string, unknown>>>(response)
+    return body.map(mapComment)
+  }
+
+  private async findCommentByMarker(
+    issueNumber: number,
+    normalized: { markerPrefix: string; botLogin: string; body: string },
+  ): Promise<GitHubComment | null> {
+    for (let page = 1; ; page += 1) {
+      const pageComments = await this.listCommentsPage(issueNumber, page)
+      const existing = pageComments.find((comment) => (
+        comment.authorLogin.trim().toLowerCase() === normalized.botLogin &&
+        comment.body.startsWith(normalized.markerPrefix)
+      ))
+      if (existing) return existing
+      if (pageComments.length < LIST_COMMENTS_PAGE_SIZE) return null
     }
   }
 
