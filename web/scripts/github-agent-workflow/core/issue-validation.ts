@@ -19,7 +19,7 @@ type IssueTemplateDefinition = Readonly<{
 const ISSUE_TEMPLATE_DEFINITIONS: Readonly<Record<'feature' | 'bug' | 'other' | 'epic', IssueTemplateDefinition>> = {
   feature: {
     displayName: 'Feature',
-    requiredSections: ['problem statement', 'desired outcome', 'user story', 'requirements', 'acceptance criteria'],
+    requiredSections: ['problem statement', 'desired outcome', 'user story', 'requirements', 'acceptance criteria', 'implementation scope'],
     titlePrefix: '[FEATURE]',
   },
   bug: {

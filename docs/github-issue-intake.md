@@ -21,7 +21,7 @@ Supported issue types:
 Required sections:
 
 - Feature: `Problem Statement`, `Desired Outcome`, `User Story`,
-  `Requirements`, `Acceptance Criteria`
+  `Requirements`, `Acceptance Criteria`, `Implementation Scope`
 - Bug: `Bug Summary`, `Current Behaviour`, `Expected Behaviour`,
   `Reproduction Steps`, `Impact`, `Severity`, `Acceptance Criteria`
 - Other and Epic: `Issue Type`, `Context`, `Desired Outcome`, `Tasks`,

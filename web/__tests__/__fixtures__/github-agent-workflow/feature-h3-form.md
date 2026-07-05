@@ -24,3 +24,7 @@ So that agents do not invent missing requirements.
 - [ ] Opening a complete Feature issue applies `ready-for-agent`.
 - [ ] Opening an incomplete Feature issue applies `needs-clarification`.
 - [ ] Tests or validation steps are included.
+
+### Implementation Scope
+
+Medium - multiple files or components

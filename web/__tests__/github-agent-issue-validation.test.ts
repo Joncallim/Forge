@@ -42,7 +42,7 @@ describe('GitHub issue validation', () => {
 
   it('flags incomplete Feature, Bug, Other, and Epic issues deterministically', async () => {
     const cases = [
-      { file: 'feature-no-response.md', missing: ['desired outcome', 'requirements', 'acceptance criteria'], issueType: 'feature' as const },
+      { file: 'feature-no-response.md', missing: ['desired outcome', 'requirements', 'acceptance criteria', 'implementation scope'], issueType: 'feature' as const },
       { file: 'bug-invalid.md', missing: ['expected behaviour', 'acceptance criteria'], issueType: 'bug' as const },
       { file: 'other-invalid.md', missing: ['desired outcome', 'acceptance criteria'], issueType: 'other' as const },
       { file: 'epic-invalid.md', missing: ['tasks', 'acceptance criteria'], issueType: 'epic' as const },
