@@ -2170,6 +2170,63 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
     })
   })
 
+  it('preserves project-level grants when saving MCP settings', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert.mockReturnValue(chain(undefined))
+    const update = chain(undefined)
+    update.set = vi.fn(() => update)
+    mockDbUpdate.mockReturnValue(update)
+
+    await withWorkspaceProject(async (project) => {
+      const projectWithGrant = {
+        ...project,
+        mcpConfig: {
+          ...project.mcpConfig,
+          grants: {
+            filesystem: {
+              schemaVersion: 1,
+              mcpId: 'filesystem',
+              status: 'approved',
+              grantMode: 'always_allow',
+              capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+              approvedAt: '2026-07-05T00:00:00.000Z',
+              approvedBy: 'user-abc',
+              reason: 'Trusted project',
+            },
+          },
+        },
+      }
+      mockDbSelect
+        .mockReturnValueOnce(chain([projectWithGrant]))
+        .mockReturnValueOnce(chain([]))
+
+      const { PUT } = await import('@/app/api/projects/[id]/mcps/route')
+      const res = await PUT(authRequest('/api/projects/project-mcp/mcps', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          profile: 'custom',
+          requiredMcps: ['filesystem'],
+          overrides: {},
+        }),
+      }) as never, {
+        params: Promise.resolve({ id: project.id }),
+      })
+
+      expect(res.status).toBe(200)
+      expect(update.set).toHaveBeenCalledWith(expect.objectContaining({
+        mcpConfig: expect.objectContaining({
+          grants: expect.objectContaining({
+            filesystem: expect.objectContaining({
+              grantMode: 'always_allow',
+              capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            }),
+          }),
+        }),
+      }))
+    })
+  })
+
   it('persists an empty custom MCP selection as an explicit rejection of all catalog MCPs', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbUpdate.mockReturnValue(chain(undefined))
@@ -4248,6 +4305,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([{ mcpId: 'filesystem', installPath: filesystemPath, enabled: true }]))
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([pkg]))
+        .mockReturnValue(chain([pkg]))
       mockDbUpdate
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)
@@ -4325,6 +4383,8 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([{ mcpId: 'filesystem', installPath: filesystemPath, enabled: true }]))
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([pkg]))
+        .mockReturnValueOnce(chain([pkg]))
+        .mockReturnValue(chain([pkg]))
       mockDbUpdate
         .mockReturnValueOnce(projectUpdate)
         .mockReturnValueOnce(approvalUpdate)
@@ -6561,7 +6621,7 @@ describe('POST /api/tasks/:id/retry', () => {
     )
   })
 
-  it('requeues failed handoff tasks through the approval worker when packages already exist', async () => {
+  it('requeues failed handoff tasks through the approval worker when a package is failed or blocked', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect
       .mockReturnValueOnce(chain([{
@@ -6569,7 +6629,7 @@ describe('POST /api/tasks/:id/retry', () => {
         status: 'failed',
         pmProviderConfigId: null,
       }]))
-      .mockReturnValueOnce(chain([{ id: 'pkg-1' }]))
+      .mockReturnValueOnce(chain([{ id: 'pkg-1', status: 'failed' }]))
     const update = chain([{
       id: 'task-failed',
       status: 'approved',
@@ -6599,6 +6659,42 @@ describe('POST /api/tasks/:id/retry', () => {
       'forge:task:task-failed',
       expect.stringContaining('"status":"approved"'),
     )
+  })
+
+  it('keeps failed replans with stale pending packages on the architect retry path', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'task-failed-replan',
+        status: 'failed',
+        pmProviderConfigId: null,
+      }]))
+      .mockReturnValueOnce(chain([]))
+    const update = chain([{
+      id: 'task-failed-replan',
+      status: 'pending',
+      pmProviderConfigId: null,
+      updatedAt: new Date(),
+    }])
+    update.set = vi.fn(() => update)
+    mockDbUpdate.mockReturnValue(update)
+    mockRedisLpush.mockResolvedValue(1)
+
+    const { POST } = await import('@/app/api/tasks/[id]/retry/route')
+    const res = await POST(authRequest('/api/tasks/task-failed-replan/retry', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }) as never, { params: Promise.resolve({ id: 'task-failed-replan' }) })
+
+    expect(res.status).toBe(200)
+    expect(update.set).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'pending',
+    }))
+    expect(mockRedisLpush).toHaveBeenCalledOnce()
+    const [queueKey, payload] = mockRedisLpush.mock.calls[0]
+    expect(queueKey).toBe('forge:tasks')
+    expect(JSON.parse(payload as string)).toMatchObject({ taskId: 'task-failed-replan' })
   })
 
   it('preserves the failed task provider when retry is submitted without an override', async () => {

@@ -15,11 +15,11 @@ const retrySchema = z.object({
 
 const RETRYABLE_STATUSES = ['failed', 'cancelled', 'rejected'] as const
 
-async function hasMaterializedWorkPackages(taskId: string): Promise<boolean> {
+async function hasRetryableHandoffPackages(taskId: string): Promise<boolean> {
   const [workPackage] = await db
     .select({ id: workPackages.id })
     .from(workPackages)
-    .where(eq(workPackages.taskId, taskId))
+    .where(and(eq(workPackages.taskId, taskId), inArray(workPackages.status, ['failed', 'blocked'])))
     .limit(1)
 
   return workPackage !== undefined
@@ -76,7 +76,7 @@ export async function POST(
       }
     }
 
-    const retryHandoff = existing.status === 'failed' && await hasMaterializedWorkPackages(taskId)
+    const retryHandoff = existing.status === 'failed' && await hasRetryableHandoffPackages(taskId)
     const nextStatus = retryHandoff ? 'approved' : 'pending'
     const queueName = retryHandoff ? 'forge:approvals' : 'forge:tasks'
     const queuePayload = retryHandoff ? { taskId, action: 'approve' } : { taskId }

@@ -14,6 +14,8 @@ import {
   hasUnsafeFilesystemCapability,
   isFilesystemGrantBlockedPackageMetadata,
   isRecord,
+  projectFilesystemEffectivePhase,
+  projectFilesystemGrantCovers,
   summarizeFilesystemCapabilities,
 } from '@/lib/mcps/filesystem-grants'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
@@ -422,6 +424,43 @@ export async function PUT(
             .update(projects)
             .set({ mcpConfig: nextMcpConfig, updatedAt: now })
             .where(eq(projects.id, project.id))
+
+          const projectGrant = projectFilesystemGrantCovers({
+            mcpConfig: nextMcpConfig,
+            mcpRequirements: pkg.mcpRequirements,
+            metadata: pkg.metadata,
+          })
+          const projectEffective = projectGrant ? projectFilesystemEffectivePhase(projectGrant) : null
+          if (projectEffective) {
+            const siblingPackages = await tx
+              .select()
+              .from(workPackages)
+              .where(and(eq(workPackages.taskId, taskId), inArray(workPackages.status, [...STANDARD_EDITABLE_PACKAGE_STATUSES])))
+            for (const sibling of siblingPackages) {
+              if (sibling.id === pkg.id) continue
+              if (!projectFilesystemGrantCovers({
+                mcpConfig: nextMcpConfig,
+                mcpRequirements: sibling.mcpRequirements,
+                metadata: sibling.metadata,
+              })) {
+                continue
+              }
+              await tx
+                .update(workPackages)
+                .set({
+                  metadata: grantMetadataUpdateSql({
+                    clearGrantBlock: false,
+                    phases: buildGrantPhases({
+                      effective: projectEffective,
+                      metadata: sibling.metadata,
+                    }),
+                  }),
+                  updatedAt: now,
+                })
+                .where(and(eq(workPackages.id, sibling.id), eq(workPackages.taskId, taskId)))
+                .returning()
+            }
+          }
         }
 
         const [updatedApproval] = await tx
