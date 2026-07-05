@@ -183,6 +183,7 @@ implementation plan.
 - [Developer guide](docs/developer-guide.md) - web app, worker, database, tests, prompts, and coding standards.
 - [Design guide](docs/design.md) - product model, UI principles, screenshot evidence, and visual QA notes.
 - [ACP and Zed connector](docs/acp-zed-connector.md) - how Forge talks to local ACP agents such as Codex CLI and Claude Code.
+- [GitHub issue intake](docs/github-issue-intake.md) - how Forge validates GitHub Issues before marking them ready for agent work.
 - [Roadmap](docs/roadmap.md) - current beta status, Workforce architecture, Forge Workspace direction, and upcoming slices.
 - [Forge Workspace roadmap](docs/workspace-roadmap.md) - proposed implementation plan for dockable panes, browsers, Notion/GitHub linking, and permissioned agent operations.
 - [Architecture decisions](docs/adr/) - durable ADRs for major technical decisions.
