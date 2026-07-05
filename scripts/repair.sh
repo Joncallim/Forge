@@ -295,6 +295,18 @@ else
   warn "DATABASE_URL is not set; skipping database migrations."
 fi
 
+# If a migration was ever applied by a non-forge role, newer tables (e.g. the
+# filesystem MCP audit tables) become unreadable to the forge app role, which the
+# app logs as "table is not readable". When a local admin psql connection is
+# reachable, re-grant table privileges to forge so those tables are readable
+# again. Best-effort: no admin connection means we leave the database untouched.
+if [ "$SKIP_MIGRATE" != "1" ] && command -v psql >/dev/null 2>&1 \
+  && psql -d postgres -tAc 'SELECT 1' >/dev/null 2>&1; then
+  if psql -d postgres -d forge -c 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge; GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO forge;' >/dev/null 2>&1; then
+    info "Ensured the forge role can read all forge tables."
+  fi
+fi
+
 if [ "$SKIP_DOCTOR" = "1" ]; then
   warn "Skipping doctor by request."
 else

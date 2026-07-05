@@ -79,6 +79,21 @@ function cleanText(value: unknown, maxLength: number): string {
   return value.trim().replace(/\s+/g, ' ').slice(0, maxLength)
 }
 
+/**
+ * Canonicalize a capability slug before taxonomy lookup. Architect models often
+ * emit snake_case or spaced variants (e.g. `ci_cd_config`, `ci cd config`,
+ * `CI-CD-Config`) for a taxonomy that is kebab-case (`ci-cd-config`). Normalizing
+ * separators and case stops a cosmetic slug difference from being reported as an
+ * "unknown capability" and silently dropped.
+ */
+function normalizeCapabilitySlug(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[\s_]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '')
+}
+
 function normalizeCapabilityArray(
   raw: unknown,
   bucket: string,
@@ -91,7 +106,7 @@ function normalizeCapabilityArray(
 
   const result: Capability[] = []
   for (const item of raw) {
-    const capability = cleanText(item, 80)
+    const capability = normalizeCapabilitySlug(cleanText(item, 80))
     if (capability === '') continue
     if (!TAXONOMY.has(capability)) {
       warnings.push(`Unknown ${bucket} capability '${capability}' was ignored.`)
@@ -112,7 +127,7 @@ function normalizeExcluded(raw: unknown, warnings: string[]): ExcludedCapability
   for (const item of raw) {
     if (typeof item !== 'object' || item === null) continue
     const value = item as Record<string, unknown>
-    const capability = cleanText(value.capability, 80)
+    const capability = normalizeCapabilitySlug(cleanText(value.capability, 80))
     const reason = cleanText(value.reason, 240)
     if (capability === '') continue
     if (!TAXONOMY.has(capability)) {

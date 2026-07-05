@@ -68,6 +68,24 @@ describe('parseCapabilityClassification', () => {
     expect(parsed.capabilityClassification.validation.warnings.join('\n')).toMatch(/did not include a reason/)
   })
 
+  it('normalizes snake_case / spaced / mixed-case capability slugs to the kebab-case taxonomy', () => {
+    // Architect models routinely emit `ci_cd_config` (underscore) for the
+    // taxonomy's `ci-cd-config`. Without normalization the exclusion is dropped
+    // and a spurious "Unknown excluded capability" warning is surfaced.
+    const parsed = parseCapabilityClassification([
+      '```capability_classification_json',
+      '{"schemaVersion":1,"required":["API_Implementation"],"optional":["integration testing"],"excluded":[{"capability":"ci_cd_config","reason":"No pipeline changes."}]}',
+      '```',
+    ].join('\n'))
+
+    expect(parsed.capabilityClassification.proposed).toMatchObject({
+      required: ['api-implementation'],
+      optional: ['integration-testing'],
+      excluded: [{ capability: 'ci-cd-config', reason: 'No pipeline changes.' }],
+    })
+    expect(parsed.capabilityClassification.validation).toEqual({ status: 'valid', warnings: [] })
+  })
+
   it('deduplicates with required before optional before excluded precedence', () => {
     const parsed = parseCapabilityClassification([
       '```capability_classification_json',

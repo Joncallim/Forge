@@ -134,6 +134,29 @@ describe('task page retry handoff controls', () => {
     }])).toEqual([])
 
     expect(unresolvedRequiredFilesystemGrants([{
+      id: 'pkg-covered-by-project-grant',
+      status: 'pending',
+      title: 'Covered by saved project grant',
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      }],
+      metadata: {
+        mcpGrantPhases: {
+          effective: {
+            schemaVersion: 1,
+            phase: 'effective',
+            status: 'not_issued',
+          },
+        },
+      },
+    }], {
+      enabled: true,
+      capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+    })).toEqual([])
+
+    expect(unresolvedRequiredFilesystemGrants([{
       id: 'pkg-denied',
       status: 'pending',
       title: 'Denied package',

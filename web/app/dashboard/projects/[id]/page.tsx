@@ -6,6 +6,7 @@ import { PlusIcon, ExternalLinkIcon, ArrowLeftIcon, Trash2Icon, RefreshCwIcon, D
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { MarkdownView } from '@/components/MarkdownView'
+import { FilesystemAccessControl } from './FilesystemAccessControl'
 import {
   Dialog,
   DialogContent,
@@ -1054,6 +1055,8 @@ export default function ProjectDetailPage() {
             })}
           </ul>
         )}
+
+        <FilesystemAccessControl projectId={projectId} />
       </section>
 
       {/* Tasks section */}

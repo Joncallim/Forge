@@ -32,7 +32,13 @@ export type AcpReadinessResult = {
 }
 
 const ACP_HANDSHAKE_TIMEOUT_MS = 8000
-const ACP_SESSION_PROBE_TIMEOUT_MS = 12_000
+// The session probe must allow the same budget a real run does, otherwise the
+// readiness check reports a false "handshake failed" on a slow cold start (the
+// adapter spawning the underlying `codex`/`claude` CLI, loading auth, and
+// opening a session) that an actual task — which allows 30s in
+// `acp/client.ts` (`session/new`) — would complete fine. Keep this in sync with
+// that client timeout.
+const ACP_SESSION_PROBE_TIMEOUT_MS = 30_000
 export const ACP_PROTOCOL_VERSION = 1
 
 /**

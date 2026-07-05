@@ -139,6 +139,11 @@ interface TaskDetailResponse {
   vcsChanges?: VcsChange[]
 }
 
+type ProjectFilesystemGrantState = {
+  capabilities: string[]
+  enabled: boolean
+}
+
 function statusLabel(status: string): string {
   const labels: Record<string, string> = {
     awaiting_answers: 'Needs answers',
@@ -398,7 +403,24 @@ function filesystemPackageCapabilitySummary(pkg: WorkPackage): {
   }
 }
 
-export function unresolvedRequiredFilesystemGrants(workPackages: WorkPackage[]): Array<{
+function projectFilesystemGrantCoversPackage(
+  projectFilesystemGrant: ProjectFilesystemGrantState | null,
+  pkg: WorkPackage,
+): boolean {
+  if (!projectFilesystemGrant?.enabled) return false
+  const summary = filesystemPackageCapabilitySummary(pkg)
+  const requiredCapabilities = summary.blockingCapabilities.length > 0
+    ? summary.blockingCapabilities
+    : summary.requestedCapabilities
+  return requiredCapabilities.length > 0 && requiredCapabilities.every((capability) => (
+    projectFilesystemGrant.capabilities.includes(capability)
+  ))
+}
+
+export function unresolvedRequiredFilesystemGrants(
+  workPackages: WorkPackage[],
+  projectFilesystemGrant: ProjectFilesystemGrantState | null = null,
+): Array<{
   missingCapabilities: string[]
   packageId: string
   title: string
@@ -406,6 +428,7 @@ export function unresolvedRequiredFilesystemGrants(workPackages: WorkPackage[]):
   return workPackages.flatMap((pkg, index) => {
     const summary = filesystemPackageCapabilitySummary(pkg)
     if (summary.blockingCapabilities.length === 0) return []
+    if (projectFilesystemGrantCoversPackage(projectFilesystemGrant, pkg)) return []
 
     const effective = filesystemEffectiveState(pkg)
     if (effective.status === 'denied') return []
@@ -1480,6 +1503,11 @@ function RetryHandoffControls({
       {blockedReason !== '' && (
         <p className="mt-1 text-xs text-muted-foreground">{blockedReason}</p>
       )}
+      <p className="mt-1 text-[11px] text-muted-foreground">
+        Use this only if the handoff worker stalled or disconnected. It re-checks the task and
+        continues any packages that are ready — it does not approve pending filesystem access or
+        skip review gates, so it will not unblock a package that is waiting on your approval.
+      </p>
       {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
       <div className="mt-2 flex flex-wrap items-center gap-2">
         <Button
@@ -1488,8 +1516,9 @@ function RetryHandoffControls({
           variant="secondary"
           disabled={submitting}
           onClick={() => void retry()}
+          title="Re-run a handoff that stalled because the worker stopped — not for approving access."
         >
-          {submitting ? 'Queueing...' : 'Recover handoff'}
+          {submitting ? 'Queueing…' : 'Re-run stalled handoff'}
         </Button>
         {retryStatus && !error && (
           <span className="text-xs text-muted-foreground">{retryHandoffMessage(retryStatus)}</span>
@@ -3554,6 +3583,7 @@ export default function TaskDetailPage() {
   const [filesystemAudits, setFilesystemAudits] = useState<FilesystemAudit[]>([])
   const [taskLogs, setTaskLogs] = useState<TaskLog[]>([])
   const [liveLogIds, setLiveLogIds] = useState<Set<string>>(new Set())
+  const [projectFilesystemGrant, setProjectFilesystemGrant] = useState<ProjectFilesystemGrantState | null>(null)
   const [providers, setProviders] = useState<ProviderConfig[]>([])
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
@@ -3598,6 +3628,28 @@ export default function TaskDetailPage() {
   const mergedQuestions: TaskQuestion[] = streamQuestions ?? initialQuestions
   const currentStatus = optimisticTaskStatus ?? taskStatus ?? task?.status ?? null
 
+  const loadProjectFilesystemGrant = useCallback(async (projectId: string | null | undefined) => {
+    const normalizedProjectId = typeof projectId === 'string' ? projectId.trim() : ''
+    if (normalizedProjectId === '') {
+      setProjectFilesystemGrant(null)
+      return
+    }
+
+    try {
+      const res = await fetch(`/api/projects/${normalizedProjectId}/filesystem-grant`)
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok || !isRecord(body.grant)) {
+        throw new Error('Failed to load project filesystem grant')
+      }
+      setProjectFilesystemGrant({
+        enabled: body.grant.enabled === true,
+        capabilities: filesystemCapabilitiesFromValues(Array.isArray(body.grant.capabilities) ? body.grant.capabilities : []),
+      })
+    } catch {
+      setProjectFilesystemGrant(null)
+    }
+  }, [])
+
   const loadTask = useCallback(async () => {
     setLoading(true)
     setFetchError(null)
@@ -3609,6 +3661,7 @@ export default function TaskDetailPage() {
       }
       const data = await res.json() as TaskDetailResponse
       setTask(data.task ?? null)
+      void loadProjectFilesystemGrant(data.task?.projectId)
       setRetryProviderId(data.task?.pmProviderConfigId ?? null)
       setInitialRuns(data.runs ?? [])
       setInitialArtifacts(data.artifacts ?? [])
@@ -3624,7 +3677,7 @@ export default function TaskDetailPage() {
     } finally {
       setLoading(false)
     }
-  }, [taskId])
+  }, [loadProjectFilesystemGrant, taskId])
 
   const loadProviders = useCallback(async () => {
     try {
@@ -3936,7 +3989,7 @@ export default function TaskDetailPage() {
   const effectiveTaskStatus = currentStatus ?? task.status
   const isAwaitingApproval = effectiveTaskStatus === 'awaiting_approval'
   const hasBlockedPackage = workPackages.some((pkg) => stringField(pkg, ['status', 'state']) === 'blocked')
-  const unresolvedFilesystemGrants = unresolvedRequiredFilesystemGrants(workPackages)
+  const unresolvedFilesystemGrants = unresolvedRequiredFilesystemGrants(workPackages, projectFilesystemGrant)
   const hasUnresolvedFilesystemGrants = unresolvedFilesystemGrants.length > 0
   const canRetryHandoff = canRetryHandoffForTaskStatus(effectiveTaskStatus, hasBlockedPackage)
   const canRetryTask = ['failed', 'cancelled', 'rejected'].includes(effectiveTaskStatus)
@@ -4049,15 +4102,59 @@ export default function TaskDetailPage() {
         artifacts={mergedArtifacts}
       />
 
-      {canRetryHandoff && (
+      {/* Filesystem access approval — surfaced prominently OUTSIDE the awaiting-
+          approval flow too. A grant block happens at handoff time and lands the
+          task in `failed`/`blocked`, where the approval controls would otherwise
+          only live inside a collapsed per-package section. Without this the
+          operator is told to "approve filesystem context" with nowhere obvious to
+          do it, and "Re-run stalled handoff" just re-blocks on the same gate. */}
+      {hasUnresolvedFilesystemGrants && !isAwaitingApproval && (
+        <section aria-label="Filesystem access approval" className="mb-6 rounded-lg border border-amber-500/40 bg-amber-500/10 p-4">
+          <p className="text-sm font-medium text-foreground">Filesystem access needs your approval</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {unresolvedFilesystemGrants.length === 1
+              ? 'A work package needs read-only project filesystem access before it can run.'
+              : `${unresolvedFilesystemGrants.length} work packages need read-only project filesystem access before they can run.`}
+            {' '}Approve it here and Forge continues the task automatically — you do not need to re-run the handoff.
+          </p>
+          <div className="mt-3 grid gap-2">
+            {unresolvedFilesystemGrants.map((grant) => {
+              const pkg = workPackages.find((item) => stringField(item, ['id']) === grant.packageId)
+              if (!pkg) return null
+              return (
+                <div key={grant.packageId || grant.title} className="rounded-md border border-border bg-background/80 p-2">
+                  <div className="mb-2 flex flex-wrap items-center gap-2">
+                    <span className="text-xs font-medium text-foreground">{grant.title}</span>
+                    <Badge variant="outline" className={statusBadgeClass('blocked')}>missing grant</Badge>
+                  </div>
+                  <p className="mb-2 break-words font-mono text-[11px] text-muted-foreground">
+                    {grant.missingCapabilities.join(', ')}
+                  </p>
+                  <FilesystemGrantControls
+                    onUpdated={loadTask}
+                    pkg={pkg}
+                    taskId={taskId}
+                    taskStatus={effectiveTaskStatus}
+                  />
+                </div>
+              )
+            })}
+          </div>
+          <p className="mt-2 text-[11px] text-muted-foreground">
+            Access is issued as a bounded, read-only project context packet — no files are written and no live filesystem tools are exposed.
+          </p>
+        </section>
+      )}
+
+      {canRetryHandoff && !hasUnresolvedFilesystemGrants && (
         <section aria-label={effectiveTaskStatus === 'running' ? 'Handoff recovery' : 'Start handoff recovery'} className="mb-6">
           <RetryHandoffControls
             blockedReason={effectiveTaskStatus === 'running'
-              ? 'The task is running. If a handoff worker stalled or disconnected, recovery will safely continue eligible packages.'
-              : 'The task is approved. If the handoff worker has not picked it up, recovery will safely re-enqueue the approval job.'}
+              ? 'The task is running. If the handoff worker stalled or disconnected, this safely continues eligible packages.'
+              : 'The task is approved. If the handoff worker has not picked it up, this safely re-enqueues the approval job.'}
             taskId={taskId}
             onRetried={loadTask}
-            title={effectiveTaskStatus === 'running' ? 'Recover handoff' : 'Start handoff recovery'}
+            title={effectiveTaskStatus === 'running' ? 'Handoff worker stalled?' : 'Start handoff'}
           />
         </section>
       )}
