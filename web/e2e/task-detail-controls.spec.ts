@@ -3,6 +3,7 @@ import {
   installSessionCookie,
   resetState,
   seedProjectTask,
+  seedRequiredFilesystemPackage,
   seedSession,
 } from './helpers'
 
@@ -53,5 +54,27 @@ test.describe('task detail operator controls', () => {
 
     await expect(page.getByText('Retry submitted. Forge is waiting for a worker to pick up the task.')).toBeVisible()
     await expect(retryForm).toBeHidden()
+  })
+
+  test('warns before saving project-wide filesystem approval', async ({ page, context }) => {
+    const session = await seedSession('Filesystem Grant Operator')
+    await installSessionCookie(context, session)
+    const { taskId } = await seedProjectTask({
+      status: 'awaiting_approval',
+      title: 'Filesystem approval control task',
+      userId: session.userId,
+    })
+    await seedRequiredFilesystemPackage({ taskId })
+
+    await page.goto(`/dashboard/tasks/${taskId}`)
+
+    await expect(page.getByText('Filesystem grants required')).toBeVisible()
+    await expect(page.getByText('missing grant')).toBeVisible()
+    await expect(page.getByText('future packages with the same or narrower filesystem needs')).toBeVisible()
+    await expect(page.getByText('bounded read-only context packet')).toBeVisible()
+    await expect(page.getByText('does not issue live filesystem tools or write access')).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Allow once' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Always allow' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Approve' })).toBeDisabled()
   })
 })

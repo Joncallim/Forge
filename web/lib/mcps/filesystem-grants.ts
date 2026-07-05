@@ -15,6 +15,17 @@ export type FilesystemCapabilitySummary = {
   requestedCapabilities: FilesystemProjectCapability[]
 }
 
+export type ProjectFilesystemGrant = {
+  schemaVersion: 1
+  mcpId: typeof FILESYSTEM_MCP_ID
+  status: 'approved'
+  grantMode: 'always_allow'
+  capabilities: FilesystemProjectCapability[]
+  approvedAt: string
+  approvedBy: string
+  reason: string
+}
+
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -108,12 +119,80 @@ export function summarizeFilesystemCapabilities(input: {
   }
 }
 
+export function projectFilesystemGrantFromConfig(mcpConfig: unknown): ProjectFilesystemGrant | null {
+  const config = isRecord(mcpConfig) ? mcpConfig : {}
+  const grants = isRecord(config.grants) ? config.grants : {}
+  const filesystem = isRecord(grants.filesystem) ? grants.filesystem : null
+  if (!filesystem) return null
+  if (
+    filesystem.schemaVersion !== 1 ||
+    filesystem.mcpId !== FILESYSTEM_MCP_ID ||
+    filesystem.status !== 'approved' ||
+    filesystem.grantMode !== 'always_allow'
+  ) {
+    return null
+  }
+  const capabilities = canonicalFilesystemProjectCapabilities(filesystem.capabilities)
+  if (capabilities.length === 0 || !capabilities.includes('filesystem.project.read')) return null
+  return {
+    schemaVersion: 1,
+    mcpId: FILESYSTEM_MCP_ID,
+    status: 'approved',
+    grantMode: 'always_allow',
+    capabilities,
+    approvedAt: typeof filesystem.approvedAt === 'string' ? filesystem.approvedAt : '',
+    approvedBy: typeof filesystem.approvedBy === 'string' ? filesystem.approvedBy : '',
+    reason: typeof filesystem.reason === 'string' ? filesystem.reason : '',
+  }
+}
+
+export function projectFilesystemGrantCovers(input: {
+  mcpConfig: unknown
+  mcpRequirements: unknown
+  metadata: unknown
+}): ProjectFilesystemGrant | null {
+  const grant = projectFilesystemGrantFromConfig(input.mcpConfig)
+  if (!grant) return null
+  const summary = summarizeFilesystemCapabilities({
+    mcpRequirements: input.mcpRequirements,
+    metadata: input.metadata,
+  })
+  if (summary.blockingCapabilities.length === 0 && summary.requestedCapabilities.length === 0) return null
+  const required = summary.blockingCapabilities.length > 0 ? summary.blockingCapabilities : summary.requestedCapabilities
+  return required.every((capability) => grant.capabilities.includes(capability)) ? grant : null
+}
+
+export function projectFilesystemEffectivePhase(grant: ProjectFilesystemGrant): Record<string, unknown> {
+  return {
+    schemaVersion: 1,
+    phase: 'effective',
+    source: 'project-filesystem-approval',
+    grantMode: 'always_allow',
+    scope: 'project',
+    mcpId: FILESYSTEM_MCP_ID,
+    approvedAt: grant.approvedAt,
+    approvedBy: grant.approvedBy,
+    grants: [{
+      mcpId: FILESYSTEM_MCP_ID,
+      status: 'approved',
+      capabilities: grant.capabilities,
+      grantMode: 'always_allow',
+      reason: grant.reason,
+    }],
+    reason: grant.reason,
+    runtimeIssued: false,
+    runtimeEnforcement: 'bounded_context_packet',
+    status: 'approved',
+    note: 'Project-level filesystem approval allows bounded read-only context packets for this project until changed. Live MCP filesystem tool handles and filesystem writes are not issued.',
+  }
+}
+
 export function isExplicitFilesystemEffectivePhase(value: unknown): value is Record<string, unknown> {
   if (!isRecord(value)) return false
   return (
     value.schemaVersion === 1 &&
     value.phase === 'effective' &&
-    value.source === 'explicit-grant-approval' &&
+    (value.source === 'explicit-grant-approval' || value.source === 'project-filesystem-approval') &&
     value.runtimeEnforcement === 'bounded_context_packet' &&
     (value.status === 'approved' || value.status === 'denied')
   )

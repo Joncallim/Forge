@@ -158,6 +158,7 @@ export type ProjectMcpConfig = {
   profile: 'default' | 'custom'
   requiredMcps: string[]
   overrides: Record<string, { enabled?: boolean; installPath?: string }>
+  grants?: Record<string, unknown>
 }
 
 export const DEFAULT_PROJECT_MCP_CONFIG: ProjectMcpConfig = {

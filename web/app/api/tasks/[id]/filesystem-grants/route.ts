@@ -25,6 +25,7 @@ const grantRequestSchema = z.object({
     workPackageId: z.string().uuid(),
     decision: z.enum(['approved', 'denied']),
     capabilities: z.array(z.string()).default([]),
+    grantMode: z.enum(['allow_once', 'always_allow']).default('allow_once'),
     reason: z.string().max(4000).optional(),
   })).min(1).max(50),
 })
@@ -48,6 +49,7 @@ function buildEffectivePhase(input: {
   decidedAt: Date
   decidedBy: string
   grantApprovalId: string
+  grantMode: 'allow_once' | 'always_allow'
   reason: string
   requestedCapabilities: string[]
 }): Record<string, unknown> {
@@ -82,12 +84,17 @@ function buildEffectivePhase(input: {
       mcpId: FILESYSTEM_MCP_ID,
       status: 'approved',
       capabilities: input.capabilities,
+      grantMode: input.grantMode,
       reason: input.reason,
     }],
+    grantMode: input.grantMode,
+    scope: input.grantMode === 'allow_once' ? 'next_context_issue' : 'work_package',
     runtimeIssued: false,
     runtimeEnforcement: 'bounded_context_packet',
     status: 'approved',
-    note: 'Approved filesystem access is issued only as a bounded read-only project context packet. Live MCP filesystem tool handles and filesystem writes are not issued.',
+    note: input.grantMode === 'allow_once'
+      ? 'Approved filesystem access is issued once as a bounded read-only project context packet, then the grant is consumed. Live MCP filesystem tool handles and filesystem writes are not issued.'
+      : 'Approved filesystem access is issued as a bounded read-only project context packet for this work package until changed. Live MCP filesystem tool handles and filesystem writes are not issued.',
   }
 }
 
@@ -203,6 +210,7 @@ function grantStateForPackage(input: {
       }
       : null,
     effectiveStatus: typeof effective.status === 'string' ? effective.status : 'not_issued',
+    grantMode: typeof effective.grantMode === 'string' ? effective.grantMode : null,
     grantApprovalId: filesystemEffectiveGrantApprovalId(effective),
   }
 }
@@ -381,10 +389,40 @@ export async function PUT(
           decidedBy: session.userId,
           decision: grant.decision,
           grantApprovalId: approval.id,
+          grantMode: grant.grantMode,
           reason,
           requestedCapabilities: summary.requestedCapabilities,
         })
         const phases = buildGrantPhases({ effective, metadata: pkg.metadata })
+        if (grant.decision === 'approved' && grant.grantMode === 'always_allow') {
+          const existingGrants = isRecord(project.mcpConfig.grants) ? project.mcpConfig.grants : {}
+          const existingFilesystemGrant = isRecord(existingGrants.filesystem) ? existingGrants.filesystem : {}
+          const mergedCapabilities = canonicalFilesystemProjectCapabilities([
+            ...canonicalFilesystemProjectCapabilities(existingFilesystemGrant.capabilities),
+            ...capabilities,
+          ])
+          const nextMcpConfig = {
+            ...project.mcpConfig,
+            grants: {
+              ...existingGrants,
+              filesystem: {
+                schemaVersion: 1,
+                mcpId: FILESYSTEM_MCP_ID,
+                status: 'approved',
+                grantMode: 'always_allow',
+                capabilities: mergedCapabilities,
+                approvedAt: now.toISOString(),
+                approvedBy: session.userId,
+                reason,
+              },
+            },
+          }
+          project.mcpConfig = nextMcpConfig
+          await tx
+            .update(projects)
+            .set({ mcpConfig: nextMcpConfig, updatedAt: now })
+            .where(eq(projects.id, project.id))
+        }
 
         const [updatedApproval] = await tx
           .update(filesystemMcpGrantApprovals)

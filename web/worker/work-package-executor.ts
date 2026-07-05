@@ -23,6 +23,7 @@ import {
   type ExecutionContextPacket,
 } from './execution-context-packet'
 import { sanitizeWorkerMessage } from './redaction'
+import { publishTaskEvent } from './events'
 import { recordTaskLogBestEffort } from './task-logs'
 
 const execFile = promisify(execFileCallback)
@@ -802,18 +803,19 @@ function metadataRecord(value: unknown, key: string): Record<string, unknown> {
   return isRecord(value) && isRecord(value[key]) ? value[key] : {}
 }
 
-function effectiveFilesystemGrant(workPackage: WorkPackageRow): { capabilities: string[]; grantApprovalId: string | null } {
+function effectiveFilesystemGrant(workPackage: WorkPackageRow): { capabilities: string[]; grantApprovalId: string | null; grantMode: string } {
   const metadata = isRecord(workPackage.metadata) ? workPackage.metadata : {}
   const phases = metadataRecord(metadata, 'mcpGrantPhases')
   const effective = metadataRecord(phases, 'effective')
   const grantApprovalId = filesystemEffectiveGrantApprovalId(effective)
+  const grantMode = cleanPromptText(effective.grantMode, 80)
   if (
     effective.schemaVersion !== 1 ||
     effective.phase !== 'effective' ||
     effective.runtimeEnforcement !== 'bounded_context_packet' ||
     effective.status !== 'approved'
   ) {
-    return { capabilities: [], grantApprovalId }
+    return { capabilities: [], grantApprovalId, grantMode }
   }
   const capabilities = new Set<string>()
   for (const grant of promptRecordArray(effective.grants)) {
@@ -827,6 +829,7 @@ function effectiveFilesystemGrant(workPackage: WorkPackageRow): { capabilities: 
   return {
     capabilities: [...capabilities].sort(),
     grantApprovalId,
+    grantMode,
   }
 }
 
@@ -847,6 +850,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow): Record<string, 
       capabilitySource: 'approved-work-package-mcp-grant-phases',
       capabilities,
       grantApprovalId: effectiveGrant.grantApprovalId,
+      grantMode: effectiveGrant.grantMode,
       reason: 'A filesystem effective grant was present, but this work package did not request filesystem capabilities. Refusing to issue filesystem context.',
       runtimeIssued: false,
       runtimeEnforcement: 'bounded_context_packet',
@@ -860,6 +864,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow): Record<string, 
       blockingCapabilities,
       capabilities,
       grantApprovalId: effectiveGrant.grantApprovalId,
+      grantMode: effectiveGrant.grantMode,
       missingBlockingCapabilities,
       requestedCapabilities,
       reason: `Filesystem capabilities were required by the plan but not covered by approved effective grants: ${missingBlockingCapabilities.join(', ')}.`,
@@ -875,6 +880,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow): Record<string, 
       blockingCapabilities,
       capabilities,
       grantApprovalId: effectiveGrant.grantApprovalId,
+      grantMode: effectiveGrant.grantMode,
       requestedCapabilities,
       reason: 'Bounded filesystem context packets include file contents and require an approved filesystem.project.read grant.',
       runtimeIssued: false,
@@ -888,6 +894,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow): Record<string, 
       capabilitySource: 'approved-work-package-mcp-grant-phases',
       blockingCapabilities,
       grantApprovalId: effectiveGrant.grantApprovalId,
+      grantMode: effectiveGrant.grantMode,
       requestedCapabilities,
       reason: 'Filesystem capabilities were requested by the plan, but no non-blocked package-local effective grant was approved.',
       runtimeIssued: false,
@@ -900,6 +907,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow): Record<string, 
       schemaVersion: 1,
       capabilitySource: 'approved-work-package-mcp-grant-phases',
       grantApprovalId: effectiveGrant.grantApprovalId,
+      grantMode: effectiveGrant.grantMode,
       requestedCapabilities,
       reason: 'Filesystem capabilities were requested as optional continue-without-MCP access; no approved effective filesystem grant was issued.',
       runtimeIssued: false,
@@ -920,6 +928,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow): Record<string, 
     capabilitySource: 'approved-work-package-mcp-grant-phases',
     capabilities,
     grantApprovalId: effectiveGrant.grantApprovalId,
+    grantMode: effectiveGrant.grantMode,
     missingRequestedCapabilities,
     mode: 'read_only_context_packet',
     omittedOptionalCapabilities: missingRequestedCapabilities,
@@ -928,6 +937,64 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow): Record<string, 
     runtimeEnforcement: 'bounded_context_packet',
     status: 'issued',
   }
+}
+
+async function consumeOneTimeFilesystemGrant(input: {
+  agentRunId: string | null
+  attemptNumber: number
+  grantMode: unknown
+  taskId: string
+  workPackage: WorkPackageRow
+}): Promise<void> {
+  if (input.grantMode !== 'allow_once') return
+  const metadata = isRecord(input.workPackage.metadata) ? input.workPackage.metadata : {}
+  const phases = metadataRecord(metadata, 'mcpGrantPhases')
+  const effective = metadataRecord(phases, 'effective')
+  if (effective.status !== 'approved') return
+
+  const consumedAt = new Date()
+  const nextMetadata = {
+    ...metadata,
+    mcpGrantPhases: {
+      ...phases,
+      effective: {
+        ...effective,
+        consumedAt: consumedAt.toISOString(),
+        consumedByAgentRunId: input.agentRunId,
+        consumedOnAttempt: input.attemptNumber,
+        runtimeIssued: true,
+        status: 'consumed',
+        note: 'This one-time filesystem grant was consumed when Forge issued the bounded read-only context packet. Approve filesystem context again before rerunning this package.',
+      },
+    },
+  }
+
+  await db
+    .update(workPackages)
+    .set({ metadata: nextMetadata, updatedAt: consumedAt })
+    .where(eq(workPackages.id, input.workPackage.id))
+
+  await publishTaskEvent(input.taskId, 'work_package:status', {
+    filesystemGrantStatus: 'consumed',
+    status: input.workPackage.status,
+    updatedAt: consumedAt.toISOString(),
+    workPackageId: input.workPackage.id,
+  })
+
+  await recordTaskLogBestEffort({
+    agentRunId: input.agentRunId,
+    eventType: 'mcp.filesystem.grant_consumed',
+    level: 'info',
+    message: `Consumed one-time filesystem grant for "${input.workPackage.title}".`,
+    metadata: {
+      attemptNumber: input.attemptNumber,
+      workPackageId: input.workPackage.id,
+    },
+    source: 'mcp',
+    taskId: input.taskId,
+    title: 'Filesystem grant consumed',
+    workPackageId: input.workPackage.id,
+  })
 }
 
 function runtimeStringArray(value: unknown): string[] {
@@ -1357,6 +1424,13 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
         taskId: context.task.id,
         title: 'Filesystem context issued',
         workPackageId: context.workPackage.id,
+      })
+      await consumeOneTimeFilesystemGrant({
+        agentRunId: context.agentRunId ?? null,
+        attemptNumber,
+        grantMode: filesystemRuntime.grantMode,
+        taskId: context.task.id,
+        workPackage: context.workPackage,
       })
     }
     const prompt = buildExecutionPrompt({

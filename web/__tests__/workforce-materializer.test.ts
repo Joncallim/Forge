@@ -162,6 +162,66 @@ describe('workforce materializer', () => {
     expect(pkg!.mcpRequirements).toEqual([expect.objectContaining({ mcpId: 'github' })])
   })
 
+  it('inherits project-level filesystem approval for new packages', () => {
+    const filesystemPrepared = structuredClone(prepared)
+    const design = filesystemPrepared.mcpExecutionDesign.proposed!
+    design.requirements = [{
+      mcpId: 'filesystem',
+      requirement: 'required',
+      reason: 'Read project files.',
+      assignment: { type: 'agent', targetAgents: ['backend'], targetId: null },
+      agentPermissions: { backend: ['filesystem.project.read', 'filesystem.project.search'] },
+      prohibitedCapabilities: ['filesystem.project.write'],
+      fallback: { action: 'ask_user', message: 'Approve filesystem context.' },
+    }]
+    design.mcpAwareSubtasks = [{
+      id: 'inspect-project',
+      agent: 'backend',
+      dependsOn: [],
+      mcpCapabilities: ['filesystem.project.search'],
+      inputs: ['Project files'],
+      outputs: ['File map'],
+      verification: ['Project inspected'],
+      stoppingCondition: 'Context captured.',
+      fallback: '',
+    }]
+
+    const rows = buildWorkforceMaterializationRows(
+      { taskId: 'task-1', architectRunId: 'run-1', artifactId: 'artifact-1', prepared: filesystemPrepared },
+      {
+        idFactory: deterministicIds(),
+        projectMcpConfig: {
+          grants: {
+            filesystem: {
+              schemaVersion: 1,
+              mcpId: 'filesystem',
+              status: 'approved',
+              grantMode: 'always_allow',
+              capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+              approvedAt: '2026-07-05T00:00:00.000Z',
+              approvedBy: 'user-1',
+              reason: 'Trusted project.',
+            },
+          },
+        },
+      },
+    )
+
+    expect(rows.workPackages[0].metadata).toMatchObject({
+      mcpGrantPhases: {
+        effective: {
+          source: 'project-filesystem-approval',
+          grantMode: 'always_allow',
+          scope: 'project',
+          status: 'approved',
+          grants: [expect.objectContaining({
+            capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+          })],
+        },
+      },
+    })
+  })
+
   it('builds pending harnesses, work packages, dependencies, and a plan approval gate', () => {
     const rows = buildWorkforceMaterializationRows(
       {

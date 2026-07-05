@@ -6,10 +6,15 @@ import {
   agentConfigs,
   agentHarnesses,
   approvalGates,
+  projects,
   tasks,
   workPackageDependencies,
   workPackages,
 } from '../db/schema'
+import {
+  projectFilesystemEffectivePhase,
+  projectFilesystemGrantCovers,
+} from '../lib/mcps/filesystem-grants'
 import type { PreparedArchitectArtifact } from './architect-artifact'
 import type { ReviewRequirement } from './agent-breakdown'
 import { isImplementationPackageRole } from './review-gates'
@@ -44,6 +49,7 @@ export type WorkforceMaterializationResult = {
 type BuildOptions = {
   activeAgents?: MaterializerAgentCatalogRow[]
   idFactory?: () => string
+  projectMcpConfig?: unknown
 }
 
 function featureFlagDisabled(value: string | undefined): boolean {
@@ -355,6 +361,34 @@ export function buildWorkforceMaterializationRows(
       },
     })
 
+    const packageMetadata: JsonObject = {
+      source: 'architect-artifact',
+      architectRunId: input.architectRunId,
+      artifactId: input.artifactId,
+      mcpGrants,
+      mcpGrantPhases: mcpGrantPhaseMetadata({
+        grants: mcpGrants,
+        validationStatus: input.prepared.mcpExecutionDesign.validation.status,
+      }),
+      harnessSemantics: planningOnlyHarnessMetadata(),
+      promptOverlay,
+      plannedTasks: agent.tasks,
+      mcpAwareSubtasks: mcpSubtasks,
+    }
+    const projectGrant = projectFilesystemGrantCovers({
+      mcpConfig: options.projectMcpConfig,
+      mcpRequirements,
+      metadata: packageMetadata,
+    })
+    if (projectGrant) {
+      const phases = packageMetadata.mcpGrantPhases
+      packageMetadata.mcpGrantPhases = {
+        ...(typeof phases === 'object' && phases !== null && !Array.isArray(phases) ? phases : {}),
+        schemaVersion: 1,
+        effective: projectFilesystemEffectivePhase(projectGrant),
+      }
+    }
+
     packages.push({
       id: workPackageId,
       taskId: input.taskId,
@@ -374,20 +408,7 @@ export function buildWorkforceMaterializationRows(
       acceptanceCriteria: agent.steps.length > 0 ? agent.steps : [agent.summary || titleForAgent(agent.role)],
       mcpRequirements,
       reviewRequirement: resolveReviewRequirement(agentType, agent.reviewRequirement),
-      metadata: {
-        source: 'architect-artifact',
-        architectRunId: input.architectRunId,
-        artifactId: input.artifactId,
-        mcpGrants,
-        mcpGrantPhases: mcpGrantPhaseMetadata({
-          grants: mcpGrants,
-          validationStatus: input.prepared.mcpExecutionDesign.validation.status,
-        }),
-        harnessSemantics: planningOnlyHarnessMetadata(),
-        promptOverlay,
-        plannedTasks: agent.tasks,
-        mcpAwareSubtasks: mcpSubtasks,
-      },
+      metadata: packageMetadata,
     })
   })
 
@@ -430,14 +451,26 @@ export async function materializeWorkforceFromArchitectArtifact(
     }
   }
 
-  const activeAgents = await db
-    .select({
-      agentType: agentConfigs.agentType,
-      displayName: agentConfigs.displayName,
-    })
-    .from(agentConfigs)
-    .where(eq(agentConfigs.isActive, true))
-  const rows = buildWorkforceMaterializationRows(input, { activeAgents })
+  const [activeAgents, taskProject] = await Promise.all([
+    db
+      .select({
+        agentType: agentConfigs.agentType,
+        displayName: agentConfigs.displayName,
+      })
+      .from(agentConfigs)
+      .where(eq(agentConfigs.isActive, true)),
+    db
+      .select({ mcpConfig: projects.mcpConfig })
+      .from(tasks)
+      .innerJoin(projects, eq(tasks.projectId, projects.id))
+      .where(eq(tasks.id, input.taskId))
+      .limit(1)
+      .then((rows) => rows[0] ?? null),
+  ])
+  const rows = buildWorkforceMaterializationRows(input, {
+    activeAgents,
+    projectMcpConfig: taskProject?.mcpConfig,
+  })
   if (rows.workPackages.length === 0) {
     throw new Error(
       'Architect plan did not produce any executable work packages. Assign at least one configured implementation, documentation, DevOps, Backend, Frontend, QA, Reviewer, or other specialist handoff agent; Architect and Security are planning/review gates, not executable handoff packages.' +

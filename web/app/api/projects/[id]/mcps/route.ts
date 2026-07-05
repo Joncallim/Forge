@@ -17,6 +17,7 @@ const mcpConfigSchema = z.object({
     enabled: z.boolean().optional(),
     installPath: z.string().trim().min(1).max(1000).optional(),
   })).default({}),
+  grants: z.record(z.unknown()).optional(),
 })
 
 async function findProject(id: string, userId: string) {
@@ -99,7 +100,10 @@ export async function PUT(
       )
     }
 
-    const config = parsed.data
+    const config = {
+      ...parsed.data,
+      grants: parsed.data.grants ?? project.mcpConfig.grants,
+    }
     const knownError = validateKnownMcps(config)
     if (knownError) {
       return NextResponse.json({ error: knownError }, { status: 400 })
