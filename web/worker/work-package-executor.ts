@@ -807,19 +807,35 @@ function metadataRecord(value: unknown, key: string): Record<string, unknown> {
 function effectiveFilesystemGrant(
   workPackage: WorkPackageRow,
   projectMcpConfig: unknown = null,
-): { capabilities: string[]; grantApprovalId: string | null; grantMode: string; projectGrantRevoked: boolean } {
+): {
+  capabilities: string[]
+  grantApprovalId: string | null
+  grantMode: string
+  projectGrant: Record<string, unknown> | null
+  projectGrantRevoked: boolean
+} {
   const metadata = isRecord(workPackage.metadata) ? workPackage.metadata : {}
   const phases = metadataRecord(metadata, 'mcpGrantPhases')
   const effective = metadataRecord(phases, 'effective')
   const grantApprovalId = filesystemEffectiveGrantApprovalId(effective)
   const grantMode = cleanPromptText(effective.grantMode, 80)
+  const projectGrant = effective.source === 'project-filesystem-approval'
+    ? {
+      approvedAt: cleanPromptText(effective.approvedAt, 120),
+      approvedBy: cleanPromptText(effective.approvedBy, 120),
+      grantApprovalId,
+      grantMode,
+      reason: cleanPromptText(effective.reason, 1000),
+      source: 'project-filesystem-approval',
+    }
+    : null
   if (
     effective.schemaVersion !== 1 ||
     effective.phase !== 'effective' ||
     effective.runtimeEnforcement !== 'bounded_context_packet' ||
     effective.status !== 'approved'
   ) {
-    return { capabilities: [], grantApprovalId, grantMode, projectGrantRevoked: false }
+    return { capabilities: [], grantApprovalId, grantMode, projectGrant, projectGrantRevoked: false }
   }
   if (
     effective.source === 'project-filesystem-approval' &&
@@ -829,7 +845,7 @@ function effectiveFilesystemGrant(
       metadata: workPackage.metadata,
     })
   ) {
-    return { capabilities: [], grantApprovalId, grantMode, projectGrantRevoked: true }
+    return { capabilities: [], grantApprovalId: null, grantMode, projectGrant, projectGrantRevoked: true }
   }
   const capabilities = new Set<string>()
   for (const grant of promptRecordArray(effective.grants)) {
@@ -842,8 +858,9 @@ function effectiveFilesystemGrant(
   }
   return {
     capabilities: [...capabilities].sort(),
-    grantApprovalId,
+    grantApprovalId: effective.source === 'project-filesystem-approval' ? null : grantApprovalId,
     grantMode,
+    projectGrant,
     projectGrantRevoked: false,
   }
 }
@@ -868,6 +885,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig
       grantApprovalId: effectiveGrant.grantApprovalId,
       grantMode: effectiveGrant.grantMode,
       missingBlockingCapabilities,
+      projectGrant: effectiveGrant.projectGrant,
       requestedCapabilities,
       reason: 'Project-level filesystem approval was removed or no longer covers this package. Approve filesystem context again before execution.',
       runtimeIssued: false,
@@ -882,6 +900,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig
       capabilities,
       grantApprovalId: effectiveGrant.grantApprovalId,
       grantMode: effectiveGrant.grantMode,
+      projectGrant: effectiveGrant.projectGrant,
       reason: 'A filesystem effective grant was present, but this work package did not request filesystem capabilities. Refusing to issue filesystem context.',
       runtimeIssued: false,
       runtimeEnforcement: 'bounded_context_packet',
@@ -897,6 +916,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig
       grantApprovalId: effectiveGrant.grantApprovalId,
       grantMode: effectiveGrant.grantMode,
       missingBlockingCapabilities,
+      projectGrant: effectiveGrant.projectGrant,
       requestedCapabilities,
       reason: `Filesystem capabilities were required by the plan but not covered by approved effective grants: ${missingBlockingCapabilities.join(', ')}.`,
       runtimeIssued: false,
@@ -912,6 +932,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig
       capabilities,
       grantApprovalId: effectiveGrant.grantApprovalId,
       grantMode: effectiveGrant.grantMode,
+      projectGrant: effectiveGrant.projectGrant,
       requestedCapabilities,
       reason: 'Bounded filesystem context packets include file contents and require an approved filesystem.project.read grant.',
       runtimeIssued: false,
@@ -926,6 +947,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig
       blockingCapabilities,
       grantApprovalId: effectiveGrant.grantApprovalId,
       grantMode: effectiveGrant.grantMode,
+      projectGrant: effectiveGrant.projectGrant,
       requestedCapabilities,
       reason: 'Filesystem capabilities were requested by the plan, but no non-blocked package-local effective grant was approved.',
       runtimeIssued: false,
@@ -939,6 +961,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig
       capabilitySource: 'approved-work-package-mcp-grant-phases',
       grantApprovalId: effectiveGrant.grantApprovalId,
       grantMode: effectiveGrant.grantMode,
+      projectGrant: effectiveGrant.projectGrant,
       requestedCapabilities,
       reason: 'Filesystem capabilities were requested as optional continue-without-MCP access; no approved effective filesystem grant was issued.',
       runtimeIssued: false,
@@ -963,6 +986,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig
     missingRequestedCapabilities,
     mode: 'read_only_context_packet',
     omittedOptionalCapabilities: missingRequestedCapabilities,
+    projectGrant: effectiveGrant.projectGrant,
     requestedCapabilities,
     runtimeIssued: true,
     runtimeEnforcement: 'bounded_context_packet',
@@ -1086,6 +1110,7 @@ async function recordFilesystemRuntimeAuditBestEffort(input: {
         attemptNumber: input.attemptNumber,
         missingRequestedCapabilities: input.runtime.missingRequestedCapabilities,
         omittedOptionalCapabilities: input.runtime.omittedOptionalCapabilities,
+        projectGrant: input.runtime.projectGrant,
         runtimeEnforcement: input.runtime.runtimeEnforcement,
         runtimeIssued: input.runtime.runtimeIssued,
       },

@@ -54,6 +54,54 @@ describe('requiresFilesystemGrantApproval', () => {
     expect(result.missingCapabilities).toEqual([])
   })
 
+  it('allows a package covered by the current project-level grant', () => {
+    const result = requiresFilesystemGrantApproval({
+      mcpRequirements: REQUIRED_FILESYSTEM_REQUIREMENT,
+      metadata: {},
+      projectMcpConfig: {
+        grants: {
+          filesystem: {
+            schemaVersion: 1,
+            mcpId: 'filesystem',
+            status: 'approved',
+            grantMode: 'always_allow',
+            capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            grantApprovalId: 'grant-approval-1',
+          },
+        },
+      },
+    })
+
+    expect(result.blocked).toBe(false)
+    expect(result.missingCapabilities).toEqual([])
+  })
+
+  it('blocks a stale project-derived effective phase after the project grant is removed', () => {
+    const result = requiresFilesystemGrantApproval({
+      mcpRequirements: REQUIRED_FILESYSTEM_REQUIREMENT,
+      metadata: {
+        mcpGrantPhases: {
+          effective: {
+            schemaVersion: 1,
+            phase: 'effective',
+            source: 'project-filesystem-approval',
+            runtimeEnforcement: 'bounded_context_packet',
+            status: 'approved',
+            grants: [{
+              mcpId: 'filesystem',
+              status: 'approved',
+              capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            }],
+          },
+        },
+      },
+      projectMcpConfig: { profile: 'default', requiredMcps: [], overrides: {} },
+    })
+
+    expect(result.blocked).toBe(true)
+    expect(result.missingCapabilities).toEqual(['filesystem.project.read', 'filesystem.project.search'])
+  })
+
   it('never blocks optional continue-without-mcp filesystem requirements', () => {
     const result = requiresFilesystemGrantApproval({
       mcpRequirements: [{
