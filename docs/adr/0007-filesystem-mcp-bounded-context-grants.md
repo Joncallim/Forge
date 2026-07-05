@@ -29,6 +29,10 @@ same project when they ask for the same or narrower capabilities.
   MCP config with `grantMode: "always_allow"`. Future work packages in that
   project can inherit this grant automatically if their required filesystem
   capabilities are covered by the project grant.
+- Before issuing runtime context from a project-level grant, the executor checks
+  the current project MCP config again. Removing or narrowing the project grant
+  stops later context packets, including for packages that were materialized
+  while the project grant still existed.
 - Approved package-local and project-inherited grants become an `effective`
   package grant phase with `runtimeEnforcement: "bounded_context_packet"`.
 - The executor receives only a bounded, read-only project context packet.

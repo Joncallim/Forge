@@ -198,6 +198,7 @@ describe('workforce materializer', () => {
               status: 'approved',
               grantMode: 'always_allow',
               capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+              grantApprovalId: 'grant-approval-1',
               approvedAt: '2026-07-05T00:00:00.000Z',
               approvedBy: 'user-1',
               reason: 'Trusted project.',
@@ -212,9 +213,11 @@ describe('workforce materializer', () => {
         effective: {
           source: 'project-filesystem-approval',
           grantMode: 'always_allow',
+          grantApprovalId: 'grant-approval-1',
           scope: 'project',
           status: 'approved',
           grants: [expect.objectContaining({
+            grantApprovalId: 'grant-approval-1',
             capabilities: ['filesystem.project.read', 'filesystem.project.search'],
           })],
         },

@@ -146,67 +146,68 @@ export async function POST(
       )
     }
 
-    const rawPackageRows = await db
-      .select({
-        id: workPackages.id,
-        assignedRole: workPackages.assignedRole,
-        title: workPackages.title,
-        mcpRequirements: workPackages.mcpRequirements,
-        metadata: workPackages.metadata,
-      })
-      .from(workPackages)
-      .where(eq(workPackages.taskId, taskId))
-    const [projectGrantRow] = await db
-      .select({ mcpConfig: projects.mcpConfig })
-      .from(projects)
-      .where(eq(projects.id, existing.projectId))
-      .limit(1)
+    const approvedAt = new Date()
+    const { task, approvedGates, missingFilesystemGrant } = await db.transaction(async (tx) => {
+      const rawPackageRows = await tx
+        .select({
+          id: workPackages.id,
+          assignedRole: workPackages.assignedRole,
+          title: workPackages.title,
+          mcpRequirements: workPackages.mcpRequirements,
+          metadata: workPackages.metadata,
+        })
+        .from(workPackages)
+        .where(eq(workPackages.taskId, taskId))
+      const [projectGrantRow] = await tx
+        .select({ mcpConfig: projects.mcpConfig })
+        .from(projects)
+        .where(eq(projects.id, existing.projectId))
+        .limit(1)
 
-    const packageRows = rawPackageRows.map((pkg) => {
-      const grant = projectFilesystemGrantCovers({
-        mcpConfig: projectGrantRow?.mcpConfig,
-        mcpRequirements: pkg.mcpRequirements,
-        metadata: pkg.metadata,
-      })
-      if (!grant) return pkg
-      const metadata = isFilesystemGrantRecord(pkg.metadata) ? pkg.metadata : {}
-      const phases = isFilesystemGrantRecord(metadata.mcpGrantPhases) ? metadata.mcpGrantPhases : {}
-      return {
-        ...pkg,
-        metadata: {
-          ...metadata,
-          mcpGrantPhases: {
-            ...phases,
-            schemaVersion: 1,
-            effective: projectFilesystemEffectivePhase(grant),
-          },
-        },
-      }
-    })
-
-    const missingFilesystemGrant = packageRows
-      .map((pkg) => ({
-        pkg,
-        grant: requiresFilesystemGrantApproval({
+      const packageRows = rawPackageRows.map((pkg) => {
+        const grant = projectFilesystemGrantCovers({
+          mcpConfig: projectGrantRow?.mcpConfig,
           mcpRequirements: pkg.mcpRequirements,
           metadata: pkg.metadata,
-        }),
-      }))
-      .find(({ grant }) => grant.blocked)
+        })
+        if (!grant) return pkg
+        const metadata = isFilesystemGrantRecord(pkg.metadata) ? pkg.metadata : {}
+        const phases = isFilesystemGrantRecord(metadata.mcpGrantPhases) ? metadata.mcpGrantPhases : {}
+        return {
+          ...pkg,
+          metadata: {
+            ...metadata,
+            mcpGrantPhases: {
+              ...phases,
+              schemaVersion: 1,
+              effective: projectFilesystemEffectivePhase(grant),
+            },
+          },
+        }
+      })
 
-    if (missingFilesystemGrant) {
-      return NextResponse.json(
-        {
-          error: `Approve required filesystem context for "${missingFilesystemGrant.pkg.title}" before approving the plan.`,
-          missingCapabilities: missingFilesystemGrant.grant.missingCapabilities,
-          workPackageId: missingFilesystemGrant.pkg.id,
-        },
-        { status: 409 },
-      )
-    }
+      const missingGrant = packageRows
+        .map((pkg) => ({
+          pkg,
+          grant: requiresFilesystemGrantApproval({
+            mcpRequirements: pkg.mcpRequirements,
+            metadata: pkg.metadata,
+          }),
+        }))
+        .find(({ grant }) => grant.blocked)
 
-    const approvedAt = new Date()
-    const { task, approvedGates } = await db.transaction(async (tx) => {
+      if (missingGrant) {
+        return {
+          task: null,
+          approvedGates: [] as { id: string }[],
+          missingFilesystemGrant: {
+            error: `Approve or deny required filesystem context for "${missingGrant.pkg.title}" before approving the plan.`,
+            missingCapabilities: missingGrant.grant.missingCapabilities,
+            workPackageId: missingGrant.pkg.id,
+          },
+        }
+      }
+
       const [approvedTask] = await tx
         .update(tasks)
         .set({ errorMessage: null, status: 'approved', updatedAt: approvedAt })
@@ -214,7 +215,7 @@ export async function POST(
         .returning()
 
       if (!approvedTask) {
-        return { task: null, approvedGates: [] as { id: string }[] }
+        return { task: null, approvedGates: [] as { id: string }[], missingFilesystemGrant: null }
       }
 
       const approvedGrantSnapshot = buildApprovedGrantSnapshot({
@@ -273,8 +274,12 @@ export async function POST(
         )
         .returning({ id: approvalGates.id })
 
-      return { task: approvedTask, approvedGates: gates }
+      return { task: approvedTask, approvedGates: gates, missingFilesystemGrant: null }
     })
+
+    if (missingFilesystemGrant) {
+      return NextResponse.json(missingFilesystemGrant, { status: 409 })
+    }
 
     if (!task) {
       return NextResponse.json(

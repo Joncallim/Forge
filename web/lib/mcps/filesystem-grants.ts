@@ -21,6 +21,7 @@ export type ProjectFilesystemGrant = {
   status: 'approved'
   grantMode: 'always_allow'
   capabilities: FilesystemProjectCapability[]
+  grantApprovalId: string
   approvedAt: string
   approvedBy: string
   reason: string
@@ -140,6 +141,7 @@ export function projectFilesystemGrantFromConfig(mcpConfig: unknown): ProjectFil
     status: 'approved',
     grantMode: 'always_allow',
     capabilities,
+    grantApprovalId: typeof filesystem.grantApprovalId === 'string' ? filesystem.grantApprovalId : '',
     approvedAt: typeof filesystem.approvedAt === 'string' ? filesystem.approvedAt : '',
     approvedBy: typeof filesystem.approvedBy === 'string' ? filesystem.approvedBy : '',
     reason: typeof filesystem.reason === 'string' ? filesystem.reason : '',
@@ -167,6 +169,7 @@ export function projectFilesystemEffectivePhase(grant: ProjectFilesystemGrant): 
     schemaVersion: 1,
     phase: 'effective',
     source: 'project-filesystem-approval',
+    grantApprovalId: grant.grantApprovalId,
     grantMode: 'always_allow',
     scope: 'project',
     mcpId: FILESYSTEM_MCP_ID,
@@ -176,6 +179,7 @@ export function projectFilesystemEffectivePhase(grant: ProjectFilesystemGrant): 
       mcpId: FILESYSTEM_MCP_ID,
       status: 'approved',
       capabilities: grant.capabilities,
+      grantApprovalId: grant.grantApprovalId,
       grantMode: 'always_allow',
       reason: grant.reason,
     }],
@@ -256,6 +260,17 @@ export function requiresFilesystemGrantApproval(input: {
 }): { blocked: boolean; missingCapabilities: FilesystemProjectCapability[]; requestedCapabilities: FilesystemProjectCapability[] } {
   const { blockingCapabilities, requestedCapabilities } = summarizeFilesystemCapabilities(input)
   if (blockingCapabilities.length === 0) {
+    return { blocked: false, missingCapabilities: [], requestedCapabilities }
+  }
+  const metadata = isRecord(input.metadata) ? input.metadata : {}
+  const phases = isRecord(metadata.mcpGrantPhases) ? metadata.mcpGrantPhases : {}
+  const effective = isRecord(phases.effective) ? phases.effective : {}
+  if (
+    effective.schemaVersion === 1 &&
+    effective.phase === 'effective' &&
+    effective.runtimeEnforcement === 'bounded_context_packet' &&
+    effective.status === 'denied'
+  ) {
     return { blocked: false, missingCapabilities: [], requestedCapabilities }
   }
   const approved = approvedEffectiveFilesystemCapabilities(input.metadata)

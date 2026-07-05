@@ -520,18 +520,17 @@ describe('executeWorkPackage', () => {
       },
     }))
 
-    expect(mocks.dbUpdateSet).toHaveBeenCalledWith(expect.objectContaining({
-      metadata: expect.objectContaining({
-        mcpGrantPhases: expect.objectContaining({
-          effective: expect.objectContaining({
-            consumedByAgentRunId: 'run-1',
-            consumedOnAttempt: 2,
-            grantMode: 'allow_once',
-            status: 'consumed',
-          }),
-        }),
-      }),
-    }))
+    const consumedUpdate = mocks.dbUpdateSet.mock.calls
+      .map(([value]) => value as { metadata?: { queryChunks?: unknown[] } })
+      .find((value) => value.metadata?.queryChunks?.some((chunk) => (
+        typeof chunk === 'string' && chunk.includes('"status":"consumed"')
+      )))
+    expect(consumedUpdate).toBeDefined()
+    const consumedSql = consumedUpdate?.metadata?.queryChunks?.find((chunk) => (
+      typeof chunk === 'string' && chunk.includes('"status":"consumed"')
+    ))
+    expect(consumedSql).toContain('"consumedByAgentRunId":"run-1"')
+    expect(consumedSql).toContain('"consumedOnAttempt":2')
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith(
       'task-1',
       'work_package:status',
@@ -576,6 +575,60 @@ describe('executeWorkPackage', () => {
         }),
       }),
       title: 'Filesystem context blocked',
+    }))
+  })
+
+  it('blocks project filesystem grants after project approval is revoked', async () => {
+    await fs.writeFile(path.join(tempRoot, 'README.md'), 'project context\n')
+
+    await expect(executeWorkPackage(context({
+      project: {
+        ...context().project,
+        mcpConfig: { profile: 'default', requiredMcps: [], overrides: {} },
+      },
+      workPackage: {
+        ...context().workPackage,
+        assignedRole: 'backend',
+        mcpRequirements: [{
+          mcpId: 'filesystem',
+          requirement: 'required',
+          permissions: ['filesystem.project.read'],
+          reason: 'Inspect project files.',
+          fallback: { action: 'block' },
+        }],
+        metadata: {
+          mcpGrantPhases: {
+            effective: {
+              schemaVersion: 1,
+              phase: 'effective',
+              source: 'project-filesystem-approval',
+              grantMode: 'always_allow',
+              grantApprovalId: 'grant-approval-1',
+              runtimeEnforcement: 'bounded_context_packet',
+              status: 'approved',
+              grants: [{
+                mcpId: 'filesystem',
+                status: 'approved',
+                capabilities: ['filesystem.project.read'],
+                grantApprovalId: 'grant-approval-1',
+                grantMode: 'always_allow',
+              }],
+            },
+          },
+        },
+      },
+    }))).rejects.toThrow(/Filesystem MCP context blocked/)
+
+    expect(mocks.generateText).not.toHaveBeenCalled()
+    expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
+      eventType: 'mcp.filesystem.context_blocked',
+      metadata: expect.objectContaining({
+        filesystemMcpRuntime: expect.objectContaining({
+          grantApprovalId: 'grant-approval-1',
+          reason: expect.stringContaining('Project-level filesystem approval was removed'),
+          status: 'blocked',
+        }),
+      }),
     }))
   })
 

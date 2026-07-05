@@ -132,6 +132,29 @@ describe('task page retry handoff controls', () => {
         },
       },
     }])).toEqual([])
+
+    expect(unresolvedRequiredFilesystemGrants([{
+      id: 'pkg-denied',
+      status: 'pending',
+      title: 'Denied package',
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      }],
+      metadata: {
+        mcpGrantPhases: {
+          effective: {
+            schemaVersion: 1,
+            phase: 'effective',
+            source: 'explicit-grant-approval',
+            runtimeEnforcement: 'bounded_context_packet',
+            status: 'denied',
+            deniedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+          },
+        },
+      },
+    }])).toEqual([])
   })
 
   it('surfaces blocked package progress instead of showing active handoff progress', () => {

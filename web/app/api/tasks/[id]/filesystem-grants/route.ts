@@ -413,6 +413,7 @@ export async function PUT(
                 status: 'approved',
                 grantMode: 'always_allow',
                 capabilities: mergedCapabilities,
+                grantApprovalId: approval.id,
                 approvedAt: now.toISOString(),
                 approvedBy: session.userId,
                 reason,

@@ -2189,6 +2189,7 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
               status: 'approved',
               grantMode: 'always_allow',
               capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+              grantApprovalId: 'grant-approval-1',
               approvedAt: '2026-07-05T00:00:00.000Z',
               approvedBy: 'user-abc',
               reason: 'Trusted project',
@@ -2219,9 +2220,57 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
           grants: expect.objectContaining({
             filesystem: expect.objectContaining({
               grantMode: 'always_allow',
+              grantApprovalId: 'grant-approval-1',
               capabilities: ['filesystem.project.read', 'filesystem.project.search'],
             }),
           }),
+        }),
+      }))
+    })
+  })
+
+  it('does not accept client-supplied project grants through MCP settings', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert.mockReturnValue(chain(undefined))
+    const update = chain(undefined)
+    update.set = vi.fn(() => update)
+    mockDbUpdate.mockReturnValue(update)
+
+    await withWorkspaceProject(async (project) => {
+      mockDbSelect
+        .mockReturnValueOnce(chain([project]))
+        .mockReturnValueOnce(chain([]))
+
+      const { PUT } = await import('@/app/api/projects/[id]/mcps/route')
+      const res = await PUT(authRequest('/api/projects/project-mcp/mcps', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          profile: 'custom',
+          requiredMcps: ['filesystem'],
+          overrides: {},
+          grants: {
+            filesystem: {
+              schemaVersion: 1,
+              mcpId: 'filesystem',
+              status: 'approved',
+              grantMode: 'always_allow',
+              capabilities: ['filesystem.project.read'],
+              grantApprovalId: 'spoofed',
+              approvedAt: '2026-07-05T00:00:00.000Z',
+              approvedBy: 'attacker',
+              reason: 'spoofed',
+            },
+          },
+        }),
+      }) as never, {
+        params: Promise.resolve({ id: project.id }),
+      })
+
+      expect(res.status).toBe(200)
+      expect(update.set).toHaveBeenCalledWith(expect.objectContaining({
+        mcpConfig: expect.not.objectContaining({
+          grants: expect.anything(),
         }),
       }))
     })
@@ -2813,12 +2862,71 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
 
     expect(res.status).toBe(409)
     await expect(res.json()).resolves.toMatchObject({
-      error: expect.stringContaining('Approve required filesystem context'),
+      error: expect.stringContaining('Approve or deny required filesystem context'),
       missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
       workPackageId: 'pkg-fs',
     })
     expect(mockDbUpdate).not.toHaveBeenCalled()
     expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('allows plan approval after a required filesystem grant is explicitly denied', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const awaitingTask = {
+      id: 'task-approval',
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-06-25T00:00:00.000Z'),
+    }
+    const workPackageRow = {
+      id: 'pkg-fs',
+      assignedRole: 'frontend',
+      title: 'Frontend work package',
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      }],
+      metadata: {
+        mcpGrantPhases: {
+          effective: {
+            schemaVersion: 1,
+            phase: 'effective',
+            source: 'explicit-grant-approval',
+            runtimeEnforcement: 'bounded_context_packet',
+            status: 'denied',
+            deniedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+          },
+        },
+      },
+    }
+    const taskUpdate = chain([{ ...awaitingTask, status: 'approved', updatedAt: new Date('2026-06-25T00:01:00.000Z') }])
+    taskUpdate.set = vi.fn(() => taskUpdate)
+    const packageUpdate = chain([{ id: 'pkg-fs' }])
+    packageUpdate.set = vi.fn(() => packageUpdate)
+    const gateUpdate = chain([{ id: 'gate-1' }])
+    gateUpdate.set = vi.fn(() => gateUpdate)
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([workPackageRow]))
+      .mockReturnValueOnce(chain([{ mcpConfig: {} }]))
+    mockDbUpdate
+      .mockReturnValueOnce(taskUpdate)
+      .mockReturnValueOnce(packageUpdate)
+      .mockReturnValueOnce(gateUpdate)
+    mockRedisLpush.mockResolvedValue(1)
+    mockRedisPublish.mockResolvedValue(1)
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest('/api/tasks/task-approval/approve', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: 'task-approval' }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(mockRedisLpush).toHaveBeenCalledWith(
+      'forge:approvals',
+      JSON.stringify({ taskId: 'task-approval', action: 'approve' }),
+    )
   })
 
   it('uses project-level filesystem approval when approving a plan', async () => {
@@ -2858,6 +2966,7 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
               status: 'approved',
               grantMode: 'always_allow',
               capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+              grantApprovalId: 'grant-approval-1',
               approvedAt: '2026-07-05T00:00:00.000Z',
               approvedBy: FAKE_SESSION.userId,
               reason: 'Trusted project.',
@@ -2886,8 +2995,10 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       effective: {
         source: 'project-filesystem-approval',
         grantMode: 'always_allow',
+        grantApprovalId: 'grant-approval-1',
         status: 'approved',
         grants: [expect.objectContaining({
+          grantApprovalId: 'grant-approval-1',
           capabilities: ['filesystem.project.read', 'filesystem.project.search'],
         })],
       },
@@ -4414,6 +4525,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
           grants: expect.objectContaining({
             filesystem: expect.objectContaining({
               capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+              grantApprovalId: FS_GRANT_APPROVAL_ID,
               grantMode: 'always_allow',
               status: 'approved',
             }),

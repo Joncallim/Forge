@@ -408,6 +408,7 @@ export function unresolvedRequiredFilesystemGrants(workPackages: WorkPackage[]):
     if (summary.blockingCapabilities.length === 0) return []
 
     const effective = filesystemEffectiveState(pkg)
+    if (effective.status === 'denied') return []
     const missingCapabilities = summary.blockingCapabilities.filter((capability) => (
       effective.status !== 'approved' || !effective.capabilities.includes(capability)
     ))
