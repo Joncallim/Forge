@@ -525,6 +525,73 @@ describe('handoffApprovedWorkPackages', () => {
     expect(mocks.dbTransaction).not.toHaveBeenCalled()
   })
 
+  it('holds a stale project-level filesystem grant when the project grant was revoked', async () => {
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([
+        {
+          id: 'pkg-fs-project',
+          assignedRole: 'backend',
+          harnessId: 'harness-1',
+          mcpRequirements: [{
+            mcpId: 'filesystem',
+            requirement: 'required',
+            capabilities: ['filesystem.project.read'],
+          }],
+          metadata: {
+            mcpGrantPhases: {
+              effective: {
+                schemaVersion: 1,
+                phase: 'effective',
+                source: 'project-filesystem-approval',
+                runtimeEnforcement: 'bounded_context_packet',
+                status: 'approved',
+                grants: [{
+                  mcpId: 'filesystem',
+                  status: 'approved',
+                  capabilities: ['filesystem.project.read'],
+                }],
+              },
+            },
+          },
+          sequence: 1,
+          status: 'pending',
+          title: 'Read project files',
+        },
+      ]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{
+        project: {
+          id: 'project-1',
+          mcpConfig: { profile: 'default', requiredMcps: [], overrides: {} },
+        },
+      }]))
+
+    const failedPackageUpdate = updateChain([{ id: 'pkg-fs-project' }])
+    const failedTaskUpdate = updateChain([{ id: 'task-1' }])
+    mocks.dbUpdate
+      .mockReturnValueOnce(failedPackageUpdate)
+      .mockReturnValueOnce(failedTaskUpdate)
+
+    const result = await progressWorkforce('task-1')
+
+    expect(result).toMatchObject({
+      blockedReason: expect.stringContaining('project-level filesystem grant'),
+      claimedPackageId: null,
+      status: 'blocked',
+      terminalBlock: true,
+    })
+    expect(failedPackageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'failed',
+      metadata: expect.objectContaining({
+        mcpGrantBlock: expect.objectContaining({
+          source: 'filesystem-grant-approval',
+          status: 'failed',
+        }),
+      }),
+    }))
+    expect(mocks.dbTransaction).not.toHaveBeenCalled()
+  })
+
   it('runs the broker before ready promotion when handoff claiming is disabled', async () => {
     mocks.dbSelect
       .mockReturnValueOnce(chain([

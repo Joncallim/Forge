@@ -624,7 +624,11 @@ describe('executeWorkPackage', () => {
       eventType: 'mcp.filesystem.context_blocked',
       metadata: expect.objectContaining({
         filesystemMcpRuntime: expect.objectContaining({
-          grantApprovalId: 'grant-approval-1',
+          grantApprovalId: null,
+          projectGrant: expect.objectContaining({
+            grantApprovalId: 'grant-approval-1',
+            source: 'project-filesystem-approval',
+          }),
           reason: expect.stringContaining('Project-level filesystem approval was removed'),
           status: 'blocked',
         }),

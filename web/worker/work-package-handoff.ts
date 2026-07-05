@@ -21,6 +21,7 @@ import {
 import { buildMcpBrokerBlockMetadata } from './blocked-handoff-retry'
 import {
   FILESYSTEM_GRANT_BLOCK_METADATA_KEY,
+  isProjectFilesystemEffectivePhase,
   requiresFilesystemGrantApproval,
 } from '../lib/mcps/filesystem-grants'
 import { updateTaskStatusIfCurrent } from './task-state'
@@ -858,11 +859,33 @@ async function failWorkPackageForFilesystemGrant(input: {
   return { blockedReason: input.blockedReason, status: 'blocked', terminalBlock: true }
 }
 
-function filesystemGrantHandoffBlock(pkg: HandoffPackage): {
+function packageProjectFilesystemEffectivePhase(pkg: HandoffPackage): Record<string, unknown> | null {
+  const metadata = isRecord(pkg.metadata) ? pkg.metadata : {}
+  const phases = isRecord(metadata.mcpGrantPhases) ? metadata.mcpGrantPhases : {}
+  const effective = isRecord(phases.effective) ? phases.effective : null
+  return isProjectFilesystemEffectivePhase(effective) ? effective : null
+}
+
+async function filesystemGrantHandoffBlock(taskId: string, pkg: HandoffPackage): Promise<{
   blockedReason: string
   missingCapabilities: string[]
   requestedCapabilities: string[]
-} | null {
+} | null> {
+  if (packageProjectFilesystemEffectivePhase(pkg)) {
+    const project = await loadTaskProjectForMcpBroker(taskId)
+    const check = requiresFilesystemGrantApproval({
+      mcpRequirements: pkg.mcpRequirements,
+      metadata: pkg.metadata,
+      projectMcpConfig: project?.mcpConfig ?? null,
+    })
+    if (!check.blocked) return null
+    return {
+      blockedReason: `Work package "${pkg.title}" was covered by a project-level filesystem grant, but that project grant was removed or no longer covers ${check.missingCapabilities.join(', ')}. Approve filesystem context again before execution.`,
+      missingCapabilities: check.missingCapabilities,
+      requestedCapabilities: check.requestedCapabilities,
+    }
+  }
+
   const check = requiresFilesystemGrantApproval({
     mcpRequirements: pkg.mcpRequirements,
     metadata: pkg.metadata,
@@ -1118,7 +1141,7 @@ async function assertWorkPackageAllowsHandoff(
     })
   }
 
-  const filesystemGrantBlock = filesystemGrantHandoffBlock(pkg)
+  const filesystemGrantBlock = await filesystemGrantHandoffBlock(taskId, pkg)
   if (filesystemGrantBlock) {
     return failWorkPackageForFilesystemGrant({
       blockedReason: filesystemGrantBlock.blockedReason,

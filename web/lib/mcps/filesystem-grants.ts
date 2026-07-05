@@ -226,6 +226,17 @@ export function projectFilesystemEffectivePhase(grant: ProjectFilesystemGrant): 
   }
 }
 
+export function isProjectFilesystemEffectivePhase(value: unknown): value is Record<string, unknown> {
+  return (
+    isRecord(value) &&
+    value.schemaVersion === 1 &&
+    value.phase === 'effective' &&
+    value.source === 'project-filesystem-approval' &&
+    value.runtimeEnforcement === 'bounded_context_packet' &&
+    value.status === 'approved'
+  )
+}
+
 export function isExplicitFilesystemEffectivePhase(value: unknown): value is Record<string, unknown> {
   if (!isRecord(value)) return false
   return (
@@ -292,6 +303,7 @@ export function approvedEffectiveFilesystemCapabilities(metadata: unknown): File
 export function requiresFilesystemGrantApproval(input: {
   mcpRequirements: unknown
   metadata: unknown
+  projectMcpConfig?: unknown
 }): { blocked: boolean; missingCapabilities: FilesystemProjectCapability[]; requestedCapabilities: FilesystemProjectCapability[] } {
   const { blockingCapabilities, requestedCapabilities } = summarizeFilesystemCapabilities(input)
   if (blockingCapabilities.length === 0) {
@@ -307,6 +319,19 @@ export function requiresFilesystemGrantApproval(input: {
     effective.status === 'denied'
   ) {
     return { blocked: false, missingCapabilities: [], requestedCapabilities }
+  }
+  if (Object.hasOwn(input, 'projectMcpConfig')) {
+    const projectGrant = projectFilesystemGrantCovers({
+      mcpConfig: input.projectMcpConfig,
+      mcpRequirements: input.mcpRequirements,
+      metadata: input.metadata,
+    })
+    if (projectGrant) {
+      return { blocked: false, missingCapabilities: [], requestedCapabilities }
+    }
+    if (isProjectFilesystemEffectivePhase(effective)) {
+      return { blocked: true, missingCapabilities: blockingCapabilities, requestedCapabilities }
+    }
   }
   const approved = approvedEffectiveFilesystemCapabilities(input.metadata)
   const missingCapabilities = blockingCapabilities.filter((capability) => !approved.includes(capability))
