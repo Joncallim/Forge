@@ -91,6 +91,48 @@ async function realProjectPathCandidate(rawPath: string): Promise<string> {
   throw new Error('Project localPath must have an existing directory ancestor.')
 }
 
+async function canonicalizeExistingPath(rawPath: string): Promise<string> {
+  const resolved = path.resolve(/*turbopackIgnore: true*/ rawPath)
+  try {
+    return await fs.realpath(resolved)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return resolved
+    throw err
+  }
+}
+
+// Workspace path fields the protected-directory guard compares against.
+const WORKSPACE_PROTECTED_PATH_KEYS = [
+  'workspaceRoot',
+  'projectsRoot',
+  'configRoot',
+  'mcpsRoot',
+  'templatesRoot',
+  'localMemoryRoot',
+  'promptsRoot',
+  'workforcesRoot',
+  'runtimeRoot',
+  'logsRoot',
+  'backupsRoot',
+] as const
+
+// Resolve symlinks on every workspace root before the protected-directory check
+// so the comparison is consistent with the realpath-canonicalized project
+// candidate. Without this, a symlinked workspace root (e.g. macOS temp dirs where
+// /var -> /private/var) lets protected workspace directories slip past the guard,
+// because one side is realpath-resolved and the other is not. Non-existent roots
+// fall back to a plain resolve.
+async function canonicalizeWorkspacePaths(workspace: WorkspaceSettings): Promise<WorkspaceSettings> {
+  const overrides: Record<string, string> = {}
+  for (const key of WORKSPACE_PROTECTED_PATH_KEYS) {
+    const value = (workspace as Record<string, unknown>)[key]
+    if (typeof value === 'string' && value.trim() !== '') {
+      overrides[key] = await canonicalizeExistingPath(value)
+    }
+  }
+  return { ...workspace, ...overrides }
+}
+
 export async function assertProjectLocalPathPreflightAllowed(input: {
   localPath: string
   projectId?: string | null
@@ -105,7 +147,7 @@ export async function assertProjectLocalPathPreflightAllowed(input: {
   if (!isWithinPath(workspaceRoot, projectRoot)) {
     throw new Error('Project localPath resolved outside the active Forge workspace.')
   }
-  assertProjectPathNotProtected(projectRoot, workspace)
+  assertProjectPathNotProtected(projectRoot, await canonicalizeWorkspacePaths(workspace))
 
   const rows = await db
     .select({ id: projects.id, localPath: projects.localPath })
