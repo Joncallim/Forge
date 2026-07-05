@@ -457,15 +457,15 @@ function HealthDot({ health }: { health: ProviderHealth | 'loading' | 'error' | 
   }
   if (health.status === 'handshake_failed') {
     const message = health.error
-      ? `${health.error} Provider health is a readiness probe; task generation opens a separate project session and may fail or succeed independently.`
-      : 'Provider health readiness probe failed. Task generation opens a separate project session and may fail or succeed independently.'
+      ? `${health.error} This is a background readiness check run from the web app; it does not block starting tasks, which spawn the runtime in a separate worker session and can still succeed.`
+      : 'This background readiness check could not handshake with the runtime adapter. It does not block starting tasks, which spawn the runtime in a separate worker session and can still succeed.'
     return (
-      <span className="inline-flex flex-col gap-0.5" aria-label="Adapter readiness probe failed" title={message}>
+      <span className="inline-flex flex-col gap-0.5" aria-label="Adapter readiness check failed (does not block tasks)" title={message}>
         <span className="inline-flex items-center gap-1.5">
-          <span className="size-2 rounded-full bg-red-500" aria-hidden="true" />
-          <span className="text-xs text-muted-foreground">Probe failed</span>
+          <span className="size-2 rounded-full bg-amber-500" aria-hidden="true" />
+          <span className="text-xs text-muted-foreground">Readiness check failed</span>
         </span>
-        <span className="text-[11px] text-muted-foreground">{lastChecked ?? 'Not checked'}</span>
+        <span className="text-[11px] text-muted-foreground">Tasks can still run · {lastChecked ?? 'Not checked'}</span>
       </span>
     )
   }

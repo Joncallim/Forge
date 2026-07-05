@@ -11,6 +11,7 @@ import {
   canonicalFilesystemProjectCapabilities,
   FILESYSTEM_MCP_ID,
   filesystemEffectiveGrantApprovalId,
+  filesystemGrantHealthError,
   hasUnsafeFilesystemCapability,
   isFilesystemGrantBlockedPackageMetadata,
   isRecord,
@@ -167,25 +168,6 @@ function grantMetadataUpdateSql(input: {
   return sql`jsonb_set(${baseMetadata}, '{mcpGrantPhases}', ${JSON.stringify(input.phases)}::jsonb, true)`
 }
 
-function filesystemStatusError(overview: Awaited<ReturnType<typeof getProjectMcpOverview>>): string | null {
-  const filesystem = overview.statuses.find((status) => status.mcpId === FILESYSTEM_MCP_ID)
-  if (!filesystem) {
-    return 'Project filesystem MCP is not configured. Add filesystem to the project MCP requirements and run the MCP installer before approving filesystem grants.'
-  }
-  if (!filesystem.enabled) {
-    return 'Project filesystem MCP is disabled. Enable it before approving filesystem grants.'
-  }
-  if (filesystem.installState !== 'installed') {
-    return `Project filesystem MCP is not installed (${filesystem.installState}). Run the MCP installer before approving filesystem grants.`
-  }
-  if (filesystem.status !== 'healthy') {
-    return filesystem.error
-      ? `Project filesystem MCP is ${filesystem.status}: ${filesystem.error}`
-      : `Project filesystem MCP is ${filesystem.status}. Resolve its status before approving filesystem grants.`
-  }
-  return null
-}
-
 function grantStateForPackage(input: {
   approval?: typeof filesystemMcpGrantApprovals.$inferSelect
   pkg: typeof workPackages.$inferSelect
@@ -301,7 +283,7 @@ export async function PUT(
     ))
     if (approvingFilesystem) {
       const overview = await getProjectMcpOverview(project)
-      const healthError = filesystemStatusError(overview)
+      const healthError = filesystemGrantHealthError(overview.statuses)
       if (healthError) {
         return NextResponse.json({ error: healthError }, { status: 409 })
       }

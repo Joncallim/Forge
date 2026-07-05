@@ -120,6 +120,41 @@ export function summarizeFilesystemCapabilities(input: {
   }
 }
 
+export type FilesystemMcpStatusLike = {
+  mcpId: string
+  enabled?: boolean
+  installState?: string
+  status?: string
+  error?: string | null
+}
+
+/**
+ * Returns a human-readable reason the project's filesystem MCP cannot back a
+ * filesystem grant yet (not configured / disabled / not installed / unhealthy),
+ * or null when it is installed and healthy. Shared by the per-task grant route
+ * and the project-level always-allow control so both gate on the same checks.
+ */
+export function filesystemGrantHealthError(
+  statuses: ReadonlyArray<FilesystemMcpStatusLike>,
+): string | null {
+  const filesystem = statuses.find((status) => status.mcpId === FILESYSTEM_MCP_ID)
+  if (!filesystem) {
+    return 'Project filesystem MCP is not configured. Add filesystem to the project MCP requirements and run the MCP installer before approving filesystem access.'
+  }
+  if (filesystem.enabled === false) {
+    return 'Project filesystem MCP is disabled. Enable it before approving filesystem access.'
+  }
+  if (filesystem.installState !== 'installed') {
+    return `Project filesystem MCP is not installed (${filesystem.installState ?? 'missing'}). Run the MCP installer before approving filesystem access.`
+  }
+  if (filesystem.status !== 'healthy') {
+    return filesystem.error
+      ? `Project filesystem MCP is ${filesystem.status}: ${filesystem.error}`
+      : `Project filesystem MCP is ${filesystem.status ?? 'unknown'}. Resolve its status before approving filesystem access.`
+  }
+  return null
+}
+
 export function projectFilesystemGrantFromConfig(mcpConfig: unknown): ProjectFilesystemGrant | null {
   const config = isRecord(mcpConfig) ? mcpConfig : {}
   const grants = isRecord(config.grants) ? config.grants : {}

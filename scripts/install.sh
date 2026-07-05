@@ -1091,6 +1091,34 @@ provision_database() {
   fi
 }
 
+# Ensure the forge app role can read and write every table in the forge database.
+#
+# Migrations normally run as the forge role (the database owner), so forge already
+# owns every table and this is a no-op. But if a migration was ever applied by a
+# different role (e.g. a superuser), the newer tables end up owned by that role
+# and the forge app role gets "permission denied" (SQLSTATE 42501) when reading
+# them — which is how the optional audit tables (filesystem MCP runtime audits,
+# repository command audits) silently become unreadable and spam the task-detail
+# logs. Running these grants as the admin fixes existing tables regardless of
+# owner; ALTER DEFAULT PRIVILEGES keeps future admin-created tables readable too.
+# Best-effort and idempotent: a failure here never aborts the install.
+grant_forge_privileges() {
+  [ "$SERVICE_MODE" = "docker" ] && return 0
+  [ "${MANAGE_LOCAL_DB:-0}" = "1" ] || return 0
+
+  if [ "$DRY_RUN" = "1" ]; then
+    info "[dry-run] Grant forge role privileges on all forge database tables"
+    return 0
+  fi
+
+  if run_quiet "Grant forge role database privileges" psql_admin -d forge -c "GRANT USAGE, CREATE ON SCHEMA public TO forge; GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge; GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO forge; ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO forge; ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO forge;"; then
+    info "Ensured the forge role can read and write all forge tables."
+  else
+    warn "Could not re-grant table privileges to the forge role (non-fatal). If task-detail logs report a 'not readable' audit table, run as a DB admin: psql -d forge -c 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO forge;'"
+  fi
+  return 0
+}
+
 ensure_env_line() {
   local key="$1"
   local value="$2"
@@ -1350,6 +1378,7 @@ prepare_web_app() {
     mark_web_node_modules_clean
   fi
   run "npm run db:migrate" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" FORGE_ENV_FILE="$3" FORGE_SUPPRESS_MIGRATION_NOTICES=1 npm run db:migrate --silent' _ "$REPO_ROOT/web" "$WORKSPACE_ROOT" "$ENV_FILE"
+  grant_forge_privileges
   run "npm run db:seed-agents" bash -c 'cd "$1" && FORGE_WORKSPACE_ROOT="$2" FORGE_ENV_FILE="$3" FORGE_PROMPT_UPGRADE_MODE="$4" npm run db:seed-agents' _ "$REPO_ROOT/web" "$WORKSPACE_ROOT" "$ENV_FILE" "$PROMPT_UPGRADE_MODE"
 }
 

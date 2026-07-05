@@ -49,6 +49,29 @@ function optionalAuditUnavailableReason(err: unknown): 'missing' | 'permission' 
   return null
 }
 
+// A missing GRANT or an un-applied migration on an optional audit table is a
+// persistent condition, so warning on every task-detail request just floods the
+// logs. Warn once per (table, reason) per process, then degrade quietly — the
+// task detail still returns without the audit rows regardless.
+const warnedAuditGaps = new Set<string>()
+function warnAuditGapOnce(
+  table: string,
+  reason: 'missing' | 'permission',
+  taskId: string,
+  rowLabel: string,
+): void {
+  const key = `${table}:${reason}`
+  if (warnedAuditGaps.has(key)) return
+  warnedAuditGaps.add(key)
+  const remedy = reason === 'permission'
+    ? `Grant SELECT on "${table}" to the database role in DATABASE_URL.`
+    : 'Run `npm run db:migrate` to create it.'
+  console.warn(
+    `[GET /api/tasks/:id] "${table}" is ${reason === 'missing' ? 'missing' : 'not readable'}; returning task detail without ${rowLabel} audit rows. ${remedy} (logged once per process)`,
+    { taskId, reason },
+  )
+}
+
 async function selectTaskCommandAudits(taskId: string): Promise<(typeof repositoryCommandAudits.$inferSelect)[]> {
   try {
     return await db
@@ -59,10 +82,7 @@ async function selectTaskCommandAudits(taskId: string): Promise<(typeof reposito
   } catch (err) {
     const reason = optionalAuditUnavailableReason(err)
     if (reason) {
-      console.warn(
-        `[GET /api/tasks/:id] repository_command_audits table is ${reason === 'missing' ? 'missing' : 'not readable'}; returning task detail without command audit rows.`,
-        { taskId, reason },
-      )
+      warnAuditGapOnce('repository_command_audits', reason, taskId, 'command')
       return []
     }
     throw err
@@ -79,10 +99,7 @@ async function selectTaskFilesystemAudits(taskId: string): Promise<(typeof files
   } catch (err) {
     const reason = optionalAuditUnavailableReason(err)
     if (reason) {
-      console.warn(
-        `[GET /api/tasks/:id] filesystem_mcp_runtime_audits table is ${reason === 'missing' ? 'missing' : 'not readable'}; returning task detail without filesystem MCP audit rows.`,
-        { taskId, reason },
-      )
+      warnAuditGapOnce('filesystem_mcp_runtime_audits', reason, taskId, 'filesystem MCP')
       return []
     }
     throw err
