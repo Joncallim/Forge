@@ -1588,6 +1588,7 @@ describe('handoffApprovedWorkPackages', () => {
     const leaseUpdate = updateChain([{ id: 'pkg-1' }])
     const firstEvidenceLeaseUpdate = updateChain([{ id: 'pkg-1' }])
     const firstEvidenceInsert = insertChain([{ id: 'vcs-1' }])
+    const firstEvidenceLookup = vi.fn().mockReturnValueOnce(chain([]))
     const readinessArtifactLeaseUpdate = updateChain([{ id: 'pkg-1' }])
     const readinessArtifactInsert = insertChain([{
       id: 'artifact-readiness',
@@ -1609,7 +1610,7 @@ describe('handoffApprovedWorkPackages', () => {
       .mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
         callback({
           insert: vi.fn().mockReturnValueOnce(firstEvidenceInsert),
-          select: vi.fn().mockReturnValueOnce(chain([])),
+          select: firstEvidenceLookup,
           update: vi.fn().mockReturnValueOnce(firstEvidenceLeaseUpdate),
         }),
       )
@@ -1674,6 +1675,7 @@ describe('handoffApprovedWorkPackages', () => {
         status: 'failed',
       }))
       expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
+      expect(firstEvidenceLookup).toHaveBeenCalledOnce()
       expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
         blockedReason: expect.stringContaining('Project local path is not a Git repository'),
         status: 'blocked',
