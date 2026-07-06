@@ -1,5 +1,8 @@
 .DS_Store
-.forge/
+.forge/*
+!.forge/runs/
+!.forge/runs/**/
+!.forge/runs/**/*.json
 local-memory/
 
 # Local agent worktrees (scratch checkouts created during development)

@@ -1,11 +1,11 @@
 import { runMain } from './cli/entrypoint'
 import {
   type AgentCommandResult,
-  type AgentCommandRunRecordInput,
   type AgentCommandRunRecorder,
   runAgentCommand,
 } from './core/agent-command'
 import { readGitHubEvent } from './io/event'
+import { FileAgentRunRecorder } from './io/agent-run-log'
 import { RestGitHubClient, type GitHubClient } from './io/github-client'
 
 type GitHubIssueCommentEvent = {
@@ -25,16 +25,6 @@ type GitHubIssueCommentEvent = {
 type AgentCommandEventResult =
   | { ignored: true; reason: string }
   | ({ ignored: false } & AgentCommandResult)
-
-class BoundaryAgentRunRecorder implements AgentCommandRunRecorder {
-  async recordRequested(input: AgentCommandRunRecordInput): Promise<void> {
-    console.info(JSON.stringify({
-      boundary: '#146',
-      message: 'Agent run persistence is not implemented yet; request was recorded through the #146 boundary stub.',
-      request: input,
-    }, null, 2))
-  }
-}
 
 function issueNumberFromEvent(event: GitHubIssueCommentEvent): number {
   const issueNumber = event.issue?.number
@@ -119,7 +109,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
     client,
     event,
     botLogin: botLoginFromEnv(env),
-    recorder: new BoundaryAgentRunRecorder(),
+    recorder: new FileAgentRunRecorder(),
     githubRunId: env.GITHUB_RUN_ID,
     githubRunAttempt: env.GITHUB_RUN_ATTEMPT,
     shortSha: shortShaFromEnv(env),
