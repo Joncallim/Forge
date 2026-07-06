@@ -365,11 +365,12 @@ describe('agent run log storage', () => {
     expect(await client.listComments(146)).toEqual([])
   })
 
-  it('rebases before pushing a run record from a stale checkout', async () => {
+  it('rebases before pushing a run record to the dedicated run-log branch', async () => {
     const root = await tempRepositoryRoot()
     const origin = path.join(root, 'origin.git')
     const seed = path.join(root, 'seed')
     const stale = path.join(root, 'stale')
+    const runLogBranch = 'forge/agent-run-log'
 
     await git(root, ['init', '--bare', origin])
     await mkdir(seed)
@@ -387,7 +388,7 @@ describe('agent run log storage', () => {
     await writeFile(path.join(seed, '.forge', 'runs', '200', 'issue-200-1234567890-1.json'), '{}\n', 'utf8')
     await git(seed, ['add', '.forge/runs/200/issue-200-1234567890-1.json'])
     await git(seed, ['commit', '-m', 'Record earlier run'])
-    await git(seed, ['push'])
+    await git(seed, ['push', 'origin', `HEAD:${runLogBranch}`])
 
     await recordRequested({
       runId: 'issue-146-1234567892-1',
@@ -400,6 +401,7 @@ describe('agent run log storage', () => {
     }, {
       repositoryRoot: stale,
       persistRecord: persistRunRecordToGit,
+      targetBranch: runLogBranch,
       now: new Date('2026-07-06T01:00:00.000Z'),
     })
 
@@ -407,13 +409,13 @@ describe('agent run log storage', () => {
       '--git-dir',
       origin,
       'show',
-      'main:.forge/runs/200/issue-200-1234567890-1.json',
+      `${runLogBranch}:.forge/runs/200/issue-200-1234567890-1.json`,
     ])
     const persistedRun = await git(root, [
       '--git-dir',
       origin,
       'show',
-      'main:.forge/runs/146/issue-146-1234567892-1.json',
+      `${runLogBranch}:.forge/runs/146/issue-146-1234567892-1.json`,
     ])
 
     expect(earlierRun).toBe('{}\n')
@@ -421,6 +423,12 @@ describe('agent run log storage', () => {
       runId: 'issue-146-1234567892-1',
       status: 'requested',
     })
+    expect(await gitExitCode(root, [
+      '--git-dir',
+      origin,
+      'show',
+      'main:.forge/runs/146/issue-146-1234567892-1.json',
+    ])).toBe(128)
   })
 
   it('redacts secret-shaped values and truncates transcript-shaped event messages', async () => {
@@ -448,6 +456,27 @@ describe('agent run log storage', () => {
     expect(record.events.at(-1)?.message).toContain('[redacted]')
     expect(record.events.at(-1)?.message).toContain('[truncated]')
     expect(record.events.at(-1)?.message.length).toBeLessThanOrEqual(500)
+  })
+
+  it('redacts and bounds issue titles before committing them to the run log', async () => {
+    const root = await tempRepositoryRoot()
+    const secretToken = `ghp_${'a'.repeat(40)}`
+    await recordRequested({
+      runId: 'issue-146-1234567890-1',
+      issueNumber: 146,
+      issueTitle: `Implement ${secretToken} ${'very long title '.repeat(80)}`,
+      runtime: 'codex',
+      action: 'implement',
+      requestedBy: 'Joncallim',
+      source: { type: 'issue_comment', commentId: 108 },
+    }, { repositoryRoot: root, now: new Date('2026-07-06T01:00:00.000Z') })
+
+    const raw = await readFile(runPath(root), 'utf8')
+    const record = agentRunRecordSchema.parse(JSON.parse(raw))
+    expect(raw).not.toContain(secretToken)
+    expect(record.issueTitle).toContain('[redacted]')
+    expect(record.issueTitle).toContain('[truncated]')
+    expect(record.issueTitle.length).toBeLessThanOrEqual(500)
   })
 
   it('finds the latest run for an issue by updated timestamp', async () => {

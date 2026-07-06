@@ -9,6 +9,7 @@ import type { AgentCommandRunRecordInput, AgentCommandRunRecorder } from '../cor
 const RUN_LOG_RELATIVE_DIR = path.join('.forge', 'runs')
 const MAX_EVENT_MESSAGE_LENGTH = 500
 const execFile = promisify(execFileCallback)
+// Best-effort redaction only. Do not route secrets or transcripts into run-log text.
 const SECRET_PATTERNS: readonly RegExp[] = Object.freeze([
   /\bghp_[A-Za-z0-9_]{20,}\b/g,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
@@ -22,12 +23,14 @@ export type PersistRunRecordInput = Readonly<{
   filePath: string
   record: AgentRunRecord
   repositoryRoot: string
+  targetBranch?: string | null
 }>
 
 type RunLogOptions = Readonly<{
   repositoryRoot?: string
   now?: Date
   persistRecord?: (input: PersistRunRecordInput) => Promise<void>
+  targetBranch?: string | null
 }>
 
 export type CreateRunRecordInput = AgentCommandRunRecordInput & Readonly<{
@@ -134,6 +137,7 @@ async function writeAndPersistRecord(
     filePath,
     record,
     repositoryRoot: repositoryRootPath,
+    targetBranch: options.targetBranch,
   })
 }
 
@@ -148,6 +152,8 @@ async function updateRecord(
   options: RunLogOptions,
   updater: (record: AgentRunRecord, at: string) => AgentRunRecord,
 ): Promise<AgentRunRecord> {
+  // Read-modify-write updates are not concurrency-safe. Callers must serialize
+  // updates for a run until #144 defines a cross-workflow locking contract.
   const root = await repositoryRoot(options)
   const current = await readRecord(root, issueNumber, runId)
   const updated = agentRunRecordSchema.parse(updater(current, nowIso(options)))
@@ -169,7 +175,7 @@ export async function createRunRecord(input: CreateRunRecordInput, options: RunL
   const record = agentRunRecordSchema.parse({
     runId: input.runId,
     issueNumber: input.issueNumber,
-    issueTitle: input.issueTitle,
+    issueTitle: sanitizeLogText(input.issueTitle),
     runtime: input.runtime,
     action: input.action,
     requestedBy: input.requestedBy,
@@ -317,6 +323,38 @@ async function git(repositoryRootPath: string, args: readonly string[]): Promise
   return { stdout: stdout.toString() }
 }
 
+async function tryGit(repositoryRootPath: string, args: readonly string[]): Promise<boolean> {
+  try {
+    await git(repositoryRootPath, args)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function targetBranchName(input: PersistRunRecordInput, currentBranch: string): string {
+  return (input.targetBranch ?? process.env.FORGE_AGENT_RUN_LOG_BRANCH)?.trim() || currentBranch
+}
+
+async function fetchRemoteBranch(root: string, branchName: string): Promise<boolean> {
+  return await tryGit(root, [
+    'fetch',
+    '--no-tags',
+    'origin',
+    `+refs/heads/${branchName}:refs/remotes/origin/${branchName}`,
+  ])
+}
+
+async function rebaseOnRemoteBranchIfPresent(root: string, branchName: string): Promise<void> {
+  if (await fetchRemoteBranch(root, branchName)) {
+    await git(root, ['rebase', `origin/${branchName}`])
+  }
+}
+
+async function pushHeadToBranch(root: string, branchName: string): Promise<void> {
+  await git(root, ['push', 'origin', `HEAD:refs/heads/${branchName}`])
+}
+
 export async function persistRunRecordToGit(input: PersistRunRecordInput): Promise<void> {
   const root = path.resolve(input.repositoryRoot)
   const relativePath = path.relative(root, input.filePath)
@@ -330,7 +368,14 @@ export async function persistRunRecordToGit(input: PersistRunRecordInput): Promi
   if (branchName === '') {
     throw new Error('Run log git persistence requires a checked-out branch.')
   }
+  const targetBranch = targetBranchName(input, branchName)
+  await git(root, ['check-ref-format', '--branch', targetBranch])
   await git(root, ['add', '--', relativePath])
+  try {
+    await git(root, ['ls-files', '--error-unmatch', '--', relativePath])
+  } catch {
+    throw new Error(`Run record path ${relativePath} is ignored by git. Check the .forge/runs .gitignore rules.`)
+  }
 
   try {
     await git(root, ['diff', '--cached', '--quiet', '--', relativePath])
@@ -340,6 +385,11 @@ export async function persistRunRecordToGit(input: PersistRunRecordInput): Promi
   }
 
   await git(root, ['commit', '-m', `Record Forge agent run ${input.record.runId}`, '--', relativePath])
-  await git(root, ['pull', '--rebase', 'origin', branchName])
-  await git(root, ['push', 'origin', `HEAD:${branchName}`])
+  await rebaseOnRemoteBranchIfPresent(root, targetBranch)
+  try {
+    await pushHeadToBranch(root, targetBranch)
+  } catch {
+    await rebaseOnRemoteBranchIfPresent(root, targetBranch)
+    await pushHeadToBranch(root, targetBranch)
+  }
 }

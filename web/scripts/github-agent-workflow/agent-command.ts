@@ -67,6 +67,10 @@ function runLogPersisterFromEnv(env: NodeJS.ProcessEnv): ((input: PersistRunReco
   return env.FORGE_AGENT_RUN_LOG_GIT_COMMIT === '1' ? persistRunRecordToGit : undefined
 }
 
+function runLogTargetBranchFromEnv(env: NodeJS.ProcessEnv): string | undefined {
+  return env.FORGE_AGENT_RUN_LOG_BRANCH?.trim() || undefined
+}
+
 export async function runAgentCommandForEvent(input: {
   client: GitHubClient
   event: GitHubIssueCommentEvent
@@ -115,6 +119,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
     botLogin: botLoginFromEnv(env),
     recorder: new FileAgentRunRecorder({
       persistRecord: runLogPersisterFromEnv(env),
+      targetBranch: runLogTargetBranchFromEnv(env),
     }),
     githubRunId: env.GITHUB_RUN_ID,
     githubRunAttempt: env.GITHUB_RUN_ATTEMPT,

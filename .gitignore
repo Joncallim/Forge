@@ -1,4 +1,5 @@
 .DS_Store
+# Track only .forge/runs/<issue>/<runId>.json; keep other .forge output ignored.
 .forge/*
 !.forge/runs/
 .forge/runs/**

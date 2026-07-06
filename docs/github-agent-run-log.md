@@ -58,3 +58,14 @@ The GitHub Actions command router writes and commits the run JSON before it mark
 the issue with `agent-requested` or posts the accepted-request comment. If the
 file cannot be written or pushed, the router stops instead of making the issue
 look ready for dispatch without a durable run record.
+
+The workflow checks out trusted default-branch code, then pushes only the run-log
+JSON to the dedicated `forge/agent-run-log` branch. It must not check out or run
+fork, pull request, or comment-supplied code while holding `contents: write`.
+Keeping the run log on its own branch avoids direct commits to protected default
+branches while still making the record visible in the repository.
+
+Run-log persistence intentionally fails closed. If Forge cannot write and push
+the durable record, it does not apply `agent-requested` and does not post the
+accepted-request comment. That keeps later dispatch from seeing an issue as
+queued without a durable run record.
