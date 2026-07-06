@@ -5,8 +5,15 @@ on:
     types: [created]
 
 permissions:
-  contents: read
+  # This issue_comment workflow has write access only for the durable run log.
+  # It must keep checking out trusted default-branch code and must never execute
+  # fork, pull request, or comment-supplied code while holding this token.
+  contents: write
   issues: write
+
+concurrency:
+  group: forge-agent-command-run-log-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   route:
@@ -28,6 +35,8 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
 
       - uses: actions/setup-node@v6.4.0
         with:
@@ -39,6 +48,8 @@ jobs:
 
       - run: npm run forge:agent-command
         env:
+          FORGE_AGENT_RUN_LOG_BRANCH: forge/agent-run-log
+          FORGE_AGENT_RUN_LOG_GIT_COMMIT: "1"
           GITHUB_BOT_LOGIN: github-actions[bot]
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_TOKEN: ${{ github.token }}

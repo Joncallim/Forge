@@ -1,11 +1,11 @@
 import { runMain } from './cli/entrypoint'
 import {
   type AgentCommandResult,
-  type AgentCommandRunRecordInput,
   type AgentCommandRunRecorder,
   runAgentCommand,
 } from './core/agent-command'
 import { readGitHubEvent } from './io/event'
+import { FileAgentRunRecorder, persistRunRecordToGit, type PersistRunRecordInput } from './io/agent-run-log'
 import { RestGitHubClient, type GitHubClient } from './io/github-client'
 
 type GitHubIssueCommentEvent = {
@@ -25,16 +25,6 @@ type GitHubIssueCommentEvent = {
 type AgentCommandEventResult =
   | { ignored: true; reason: string }
   | ({ ignored: false } & AgentCommandResult)
-
-class BoundaryAgentRunRecorder implements AgentCommandRunRecorder {
-  async recordRequested(input: AgentCommandRunRecordInput): Promise<void> {
-    console.info(JSON.stringify({
-      boundary: '#146',
-      message: 'Agent run persistence is not implemented yet; request was recorded through the #146 boundary stub.',
-      request: input,
-    }, null, 2))
-  }
-}
 
 function issueNumberFromEvent(event: GitHubIssueCommentEvent): number {
   const issueNumber = event.issue?.number
@@ -71,6 +61,14 @@ function sameLogin(left: string, right: string): boolean {
 function shortShaFromEnv(env: NodeJS.ProcessEnv): string | null {
   const sha = env.GITHUB_SHA?.trim() ?? ''
   return /^[0-9a-f]{7,40}$/i.test(sha) ? sha.slice(0, 12).toLowerCase() : null
+}
+
+function runLogPersisterFromEnv(env: NodeJS.ProcessEnv): ((input: PersistRunRecordInput) => Promise<void>) | undefined {
+  return env.FORGE_AGENT_RUN_LOG_GIT_COMMIT === '1' ? persistRunRecordToGit : undefined
+}
+
+function runLogTargetBranchFromEnv(env: NodeJS.ProcessEnv): string | undefined {
+  return env.FORGE_AGENT_RUN_LOG_BRANCH?.trim() || undefined
 }
 
 export async function runAgentCommandForEvent(input: {
@@ -119,7 +117,10 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
     client,
     event,
     botLogin: botLoginFromEnv(env),
-    recorder: new BoundaryAgentRunRecorder(),
+    recorder: new FileAgentRunRecorder({
+      persistRecord: runLogPersisterFromEnv(env),
+      targetBranch: runLogTargetBranchFromEnv(env),
+    }),
     githubRunId: env.GITHUB_RUN_ID,
     githubRunAttempt: env.GITHUB_RUN_ATTEMPT,
     shortSha: shortShaFromEnv(env),

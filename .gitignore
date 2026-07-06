@@ -1,5 +1,10 @@
 .DS_Store
-.forge/
+# Track only .forge/runs/<issue>/<runId>.json; keep other .forge output ignored.
+.forge/*
+!.forge/runs/
+.forge/runs/**
+!.forge/runs/**/
+!.forge/runs/*/*.json
 local-memory/
 
 # Local agent worktrees (scratch checkouts created during development)
