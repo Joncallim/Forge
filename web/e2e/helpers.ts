@@ -332,6 +332,7 @@ export async function startMockWorker(testInfo: TestInfo): Promise<ChildProcessW
     env: {
       ...process.env,
       FORGE_WORKER_MOCK_ARCHITECT: '1',
+      FORGE_WORK_PACKAGE_EXECUTION: '0',
       FORGE_WORKER_CLAIM_TIMEOUT_SECONDS: '1',
     },
   })

@@ -20,7 +20,7 @@ Two failure modes follow from that framing:
 1. **Taxonomy confusion.** Claude Code and Codex read like separate product
    catalogues instead of interchangeable runtimes for the same Forge roles.
 2. **Overpromising.** Copy that leans on a specific runtime's autonomy can imply
-   parallel agents, host-repository writes, commits, PRs, or merge automation
+   parallel agents, commits, PRs, merge automation, or unrestricted tool access
    that Forge does not actually perform yet.
 
 ## Decision
@@ -87,9 +87,9 @@ concepts but never expose a user's configured catalogue or private prompts.
 ### Honesty about current limits
 
 Docs and app copy must not imply capabilities Forge does not yet have:
-parallel autonomous specialists, host-repository writes, commits, PR creation,
-merge automation, or unrestricted MCP runtime grants. These stay out of scope
-until a future issue implements them safely.
+parallel autonomous specialists, commits, PR creation, merge automation, or
+unrestricted MCP runtime grants. These stay out of scope until a future issue
+implements them safely.
 
 ## Consequences
 

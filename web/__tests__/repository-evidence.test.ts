@@ -17,6 +17,10 @@ import {
   type RepositoryEvidenceTask,
   type RepositoryEvidenceWorkPackage,
 } from '@/worker/repository-evidence'
+import {
+  isHostRepositoryWritesEnabled,
+  isRepositoryWritePackage,
+} from '@/worker/repository-edit-policy'
 
 const execFile = promisify(execFileCallback)
 let tempRoot = ''
@@ -138,19 +142,62 @@ describe('repository execution context', () => {
     })
   })
 
-  it('blocks dirty working trees', async () => {
+  it('blocks dirty working trees before local repository edits while ignoring no-remote and branch collision in host-write mode', async () => {
     await initRepo(tempRoot)
+    await execFile('git', ['remote', 'remove', 'origin'], { cwd: tempRoot })
     await fs.writeFile(path.join(tempRoot, 'dirty.txt'), 'dirty\n')
+    const pkg = workPackage({ title: 'Colliding Branch' })
+    const expected = 'forge/task-12345678-colliding-branch'
+    await execFile('git', ['branch', expected], { cwd: tempRoot })
 
     const context = await buildRepositoryExecutionContext({
       project: project(tempRoot),
       task: task(),
-      workPackage: workPackage(),
+      workPackage: pkg,
     })
 
     expect(context.status).toBe('blocked')
     expect(context.isDirty).toBe(true)
+    expect(context.hasRemote).toBe(false)
+    expect(context.branchCollision).toBe(true)
     expect(context.blockedReason).toMatch(/dirty/i)
+
+    await execFile('git', ['add', 'dirty.txt'], { cwd: tempRoot })
+    await execFile('git', ['commit', '-m', 'clean dirty fixture'], { cwd: tempRoot })
+
+    const cleanContext = await buildRepositoryExecutionContext({
+      project: project(tempRoot),
+      task: task(),
+      workPackage: pkg,
+    })
+
+    expect(cleanContext.status).toBe('ready')
+    expect(cleanContext.isDirty).toBe(false)
+    expect(cleanContext.hasRemote).toBe(false)
+    expect(cleanContext.branchCollision).toBe(true)
+    expect(cleanContext.blockedReason).toBeNull()
+  })
+
+  it('blocks dirty working trees when host repository writes are disabled', async () => {
+    const previous = process.env.FORGE_HOST_REPOSITORY_WRITES
+    process.env.FORGE_HOST_REPOSITORY_WRITES = '0'
+    await initRepo(tempRoot)
+    await fs.writeFile(path.join(tempRoot, 'dirty.txt'), 'dirty\n')
+
+    try {
+      const context = await buildRepositoryExecutionContext({
+        project: project(tempRoot),
+        task: task(),
+        workPackage: workPackage(),
+      })
+
+      expect(context.status).toBe('blocked')
+      expect(context.isDirty).toBe(true)
+      expect(context.blockedReason).toMatch(/dirty/i)
+    } finally {
+      if (previous === undefined) delete process.env.FORGE_HOST_REPOSITORY_WRITES
+      else process.env.FORGE_HOST_REPOSITORY_WRITES = previous
+    }
   })
 
   it('ignores Forge task-run artifacts when checking dirty working trees', async () => {
@@ -189,7 +236,9 @@ describe('repository execution context', () => {
     expect(context.blockedReason).toBeNull()
   })
 
-  it('blocks staged renames from Forge task-run artifacts into product paths', async () => {
+  it('blocks staged renames from Forge task-run artifacts into product paths when host repository writes are disabled', async () => {
+    const previous = process.env.FORGE_HOST_REPOSITORY_WRITES
+    process.env.FORGE_HOST_REPOSITORY_WRITES = '0'
     await initRepo(tempRoot)
     const artifactPath = path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'result.md')
     await fs.mkdir(path.dirname(artifactPath), { recursive: true })
@@ -199,19 +248,26 @@ describe('repository execution context', () => {
     await fs.mkdir(path.join(tempRoot, 'src'), { recursive: true })
     await execFile('git', ['mv', '.forge/task-runs/task-1/pkg-1/result.md', 'src/app.ts'], { cwd: tempRoot })
 
-    const context = await buildRepositoryExecutionContext({
-      project: project(tempRoot),
-      task: task(),
-      workPackage: workPackage(),
-    })
+    try {
+      const context = await buildRepositoryExecutionContext({
+        project: project(tempRoot),
+        task: task(),
+        workPackage: workPackage(),
+      })
 
-    expect(context.status).toBe('blocked')
-    expect(context.isDirty).toBe(true)
-    expect(context.statusShort).toContain('src/app.ts')
-    expect(context.blockedReason).toMatch(/dirty/i)
+      expect(context.status).toBe('blocked')
+      expect(context.isDirty).toBe(true)
+      expect(context.statusShort).toContain('src/app.ts')
+      expect(context.blockedReason).toMatch(/dirty/i)
+    } finally {
+      if (previous === undefined) delete process.env.FORGE_HOST_REPOSITORY_WRITES
+      else process.env.FORGE_HOST_REPOSITORY_WRITES = previous
+    }
   })
 
-  it('blocks dirty product paths even after many ignored Forge task-run artifacts', async () => {
+  it('blocks dirty product paths even after many ignored Forge task-run artifacts when host repository writes are disabled', async () => {
+    const previous = process.env.FORGE_HOST_REPOSITORY_WRITES
+    process.env.FORGE_HOST_REPOSITORY_WRITES = '0'
     await initRepo(tempRoot)
     await fs.mkdir(path.join(tempRoot, '.forge', 'task-runs', 'overflow'), { recursive: true })
     for (let index = 0; index < 500; index += 1) {
@@ -229,53 +285,95 @@ describe('repository execution context', () => {
     await fs.mkdir(path.join(tempRoot, 'src'), { recursive: true })
     await fs.writeFile(path.join(tempRoot, 'src', 'late-dirty.ts'), 'dirty\n')
 
-    const context = await buildRepositoryExecutionContext({
-      project: project(tempRoot),
-      task: task(),
-      workPackage: workPackage(),
-    })
+    try {
+      const context = await buildRepositoryExecutionContext({
+        project: project(tempRoot),
+        task: task(),
+        workPackage: workPackage(),
+      })
 
-    expect(context.status).toBe('blocked')
-    expect(context.isDirty).toBe(true)
-    expect(context.statusShort).toContain('src/late-dirty.ts')
-    expect(context.statusShort).not.toContain('.forge/task-runs/overflow')
+      expect(context.status).toBe('blocked')
+      expect(context.isDirty).toBe(true)
+      expect(context.statusShort).toContain('src/late-dirty.ts')
+      expect(context.statusShort).not.toContain('.forge/task-runs/overflow')
+    } finally {
+      if (previous === undefined) delete process.env.FORGE_HOST_REPOSITORY_WRITES
+      else process.env.FORGE_HOST_REPOSITORY_WRITES = previous
+    }
   })
 
-  it('blocks missing remotes', async () => {
+  it('blocks missing remotes when host repository writes are disabled', async () => {
+    const previous = process.env.FORGE_HOST_REPOSITORY_WRITES
+    process.env.FORGE_HOST_REPOSITORY_WRITES = '0'
     await initRepo(tempRoot)
     await execFile('git', ['remote', 'remove', 'origin'], { cwd: tempRoot })
 
-    const context = await buildRepositoryExecutionContext({
-      project: project(tempRoot),
-      task: task(),
-      workPackage: workPackage(),
-    })
+    try {
+      const context = await buildRepositoryExecutionContext({
+        project: project(tempRoot),
+        task: task(),
+        workPackage: workPackage(),
+      })
 
-    expect(context.status).toBe('blocked')
-    expect(context.hasRemote).toBe(false)
-    expect(context.blockedReason).toMatch(/remote/i)
+      expect(context.status).toBe('blocked')
+      expect(context.hasRemote).toBe(false)
+      expect(context.blockedReason).toMatch(/remote/i)
+    } finally {
+      if (previous === undefined) delete process.env.FORGE_HOST_REPOSITORY_WRITES
+      else process.env.FORGE_HOST_REPOSITORY_WRITES = previous
+    }
   })
 
-  it('blocks intended branch collisions', async () => {
+  it('blocks intended branch collisions when host repository writes are disabled', async () => {
+    const previous = process.env.FORGE_HOST_REPOSITORY_WRITES
+    process.env.FORGE_HOST_REPOSITORY_WRITES = '0'
     await initRepo(tempRoot)
     const pkg = workPackage({ title: 'Colliding Branch' })
     const expected = 'forge/task-12345678-colliding-branch'
     await execFile('git', ['branch', expected], { cwd: tempRoot })
 
-    const context = await buildRepositoryExecutionContext({
-      project: project(tempRoot),
-      task: task(),
-      workPackage: pkg,
-    })
+    try {
+      const context = await buildRepositoryExecutionContext({
+        project: project(tempRoot),
+        task: task(),
+        workPackage: pkg,
+      })
 
-    expect(context.status).toBe('blocked')
-    expect(context.branchCollision).toBe(true)
-    expect(context.intendedTaskBranch).toBe(expected)
+      expect(context.status).toBe('blocked')
+      expect(context.branchCollision).toBe(true)
+      expect(context.intendedTaskBranch).toBe(expected)
+    } finally {
+      if (previous === undefined) delete process.env.FORGE_HOST_REPOSITORY_WRITES
+      else process.env.FORGE_HOST_REPOSITORY_WRITES = previous
+    }
   })
 
   it('allows work packages to opt out of repository evidence', () => {
     expect(isRepositoryAffectingWorkPackage(workPackage())).toBe(true)
     expect(isRepositoryAffectingWorkPackage(workPackage({ metadata: { repositoryWrites: false } }))).toBe(false)
+    expect(isRepositoryAffectingWorkPackage(workPackage({ assignedRole: 'reviewer' }))).toBe(false)
+    expect(isRepositoryAffectingWorkPackage(workPackage({ assignedRole: 'security-review' }))).toBe(false)
+  })
+})
+
+describe('repository edit policy', () => {
+  it('recognizes expanded default-on disable values for host repository writes', () => {
+    expect(isHostRepositoryWritesEnabled({})).toBe(true)
+    expect(isHostRepositoryWritesEnabled({ FORGE_HOST_REPOSITORY_WRITES: '1' })).toBe(true)
+    expect(isHostRepositoryWritesEnabled({ FORGE_HOST_REPOSITORY_WRITES: 'true' })).toBe(true)
+    expect(isHostRepositoryWritesEnabled({ FORGE_HOST_REPOSITORY_WRITES: 'off' })).toBe(false)
+    expect(isHostRepositoryWritesEnabled({ FORGE_HOST_REPOSITORY_WRITES: 'no' })).toBe(false)
+    expect(isHostRepositoryWritesEnabled({ FORGE_HOST_REPOSITORY_WRITES: 'disabled' })).toBe(false)
+  })
+
+  it('normalizes display-style review and security roles as non-writing packages', () => {
+    for (const assignedRole of ['Security Reviewer', 'security_review', 'Code Reviewer', 'Review']) {
+      expect(isRepositoryWritePackage({
+        assignedRole,
+        metadata: {},
+        requiredCapabilities: {},
+      })).toBe(false)
+    }
   })
 })
 

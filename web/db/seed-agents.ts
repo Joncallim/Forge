@@ -16,7 +16,7 @@ import '../lib/load-env'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
-import { eq } from 'drizzle-orm'
+import { eq, sql } from 'drizzle-orm'
 import { db } from './index'
 import { agentConfigs, workforceAgents, workforces } from './schema'
 import { getWorkspaceSettings } from '../lib/workspace'
@@ -36,6 +36,8 @@ const LEGACY_CLAUDE_AGENTS_DIR = path.join(REPO_ROOT, '.claude/agents')
 const PROMPT_UPGRADE_MODE = process.env.FORGE_PROMPT_UPGRADE_MODE?.trim() || 'keep'
 
 type PromptUpgradeMode = 'keep' | 'overwrite'
+
+const DEFAULT_WORKFORCE_MEMBERS_SEEDED_METADATA_KEY = 'defaultMembersSeededByForge'
 
 interface ParsedAgent {
   agentType: string
@@ -402,6 +404,23 @@ export async function seedAgentConfigs(): Promise<void> {
   // upgrades preserve operator edits. Only the explicit reset path
   // (FORGE_PROMPT_UPGRADE_MODE=overwrite) restores repository defaults.
   const workforceUpgradeMode = promptUpgradeMode()
+  const workforceHasMembers = async (workforceId: string): Promise<boolean> => {
+    const [member] = await db
+      .select({ id: workforceAgents.id })
+      .from(workforceAgents)
+      .where(eq(workforceAgents.workforceId, workforceId))
+      .limit(1)
+    return Boolean(member)
+  }
+  const markDefaultMembersSeeded = async (workforceId: string) => {
+    await db
+      .update(workforces)
+      .set({
+        metadata: sql`${workforces.metadata} || ${JSON.stringify({ [DEFAULT_WORKFORCE_MEMBERS_SEEDED_METADATA_KEY]: true })}::jsonb`,
+        updatedAt: new Date(),
+      })
+      .where(eq(workforces.id, workforceId))
+  }
   for (const definition of DEFAULT_WORKFORCES) {
     const members = resolveWorkforceMembers(definition.roles, seededIdByType)
     if (members.length === 0) continue
@@ -412,11 +431,14 @@ export async function seedAgentConfigs(): Promise<void> {
         members.map((member) => ({
           workforceId,
           agentConfigId: member.agentConfigId,
+          roleLabel: member.roleLabel,
           sequence: member.sequence,
           isRequired: member.isRequired,
+          metadata: member.metadata,
           updatedAt: new Date(),
         })),
       )
+      await markDefaultMembersSeeded(workforceId)
     }
 
     const values = {
@@ -451,7 +473,24 @@ export async function seedAgentConfigs(): Promise<void> {
       await setMembers(created.id)
       console.log(`[seed-agents]   ✓ ${definition.slug} workforce (${members.length} agent(s))`)
     } else {
-      console.log(`[seed-agents]   • ${definition.slug} workforce exists — preserved`)
+      const [existing] = await db
+        .select({ id: workforces.id, metadata: workforces.metadata })
+        .from(workforces)
+        .where(eq(workforces.slug, definition.slug))
+        .limit(1)
+      const metadata = existing?.metadata && typeof existing.metadata === 'object' && !Array.isArray(existing.metadata)
+        ? existing.metadata as Record<string, unknown>
+        : {}
+      if (
+        existing?.id &&
+        metadata[DEFAULT_WORKFORCE_MEMBERS_SEEDED_METADATA_KEY] !== true &&
+        !await workforceHasMembers(existing.id)
+      ) {
+        await setMembers(existing.id)
+        console.log(`[seed-agents]   ✓ ${definition.slug} workforce backfilled (${members.length} agent(s))`)
+      } else {
+        console.log(`[seed-agents]   • ${definition.slug} workforce exists — preserved`)
+      }
     }
   }
 

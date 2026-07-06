@@ -26,6 +26,7 @@ import {
 import { sanitizeWorkerMessage } from './redaction'
 import { publishTaskEvent } from './events'
 import { recordTaskLogBestEffort } from './task-logs'
+import { shouldApplyHostRepositoryWrites } from './repository-edit-policy'
 
 const execFile = promisify(execFileCallback)
 
@@ -45,6 +46,8 @@ const ALLOWED_COMMANDS = new Set([
   'npm run build',
   'npm run lint',
 ])
+
+const ACP_EXECUTION_ENABLED_VALUES = new Set(['1', 'true', 'on', 'yes', 'enabled'])
 
 type TaskRow = typeof tasks.$inferSelect
 type ProjectRow = typeof projects.$inferSelect
@@ -107,6 +110,9 @@ export type WorkPackageExecutionResult = {
   executionContextArtifactMetadata: Record<string, unknown>
   executionContextPacket: ExecutionContextPacket
   fileCount: number
+  hostRepositoryWritePaths: string[]
+  hostRepositoryWrites: boolean
+  repositoryWrites: boolean
   sandboxPath: string
   summary: string
 }
@@ -166,13 +172,22 @@ function safeCommandFailureMessage(command: string[], result: WorkPackageExecuti
 function executionArtifactContent(input: {
   commandResults: WorkPackageExecutionCommandResult[]
   files: WorkPackageExecutionFile[]
+  hostRepositoryWritePaths?: string[]
   summary: string
 }): string {
+  const hostRepositoryWritePaths = input.hostRepositoryWritePaths ?? []
   return [
     input.summary,
     '',
     `Files written: ${input.files.length}`,
     ...input.files.map((file) => `- ${file.path}`),
+    ...(hostRepositoryWritePaths.length > 0
+      ? [
+          '',
+          `Host repository files written: ${hostRepositoryWritePaths.length}`,
+          ...hostRepositoryWritePaths.map((filePath) => `- ${filePath}`),
+        ]
+      : []),
     '',
     'Commands:',
     ...(input.commandResults.length > 0
@@ -185,16 +200,19 @@ function executionArtifactMetadata(input: {
   attemptNumber: number
   commandResults: WorkPackageExecutionCommandResult[]
   files: WorkPackageExecutionFile[]
+  hostRepositoryWritePaths?: string[]
   sandboxRoot: string
   validationStatus?: 'failed' | 'passed' | 'skipped'
 }): Record<string, unknown> {
+  const hostRepositoryWritePaths = input.hostRepositoryWritePaths ?? []
   return {
     attemptNumber: input.attemptNumber,
     commandResults: input.commandResults,
     files: input.files.map((file) => file.path),
     generatedBy: 'work-package-executor',
-    hostRepositoryWrites: false,
-    repositoryWrites: false,
+    hostRepositoryWritePaths,
+    hostRepositoryWrites: hostRepositoryWritePaths.length > 0,
+    repositoryWrites: hostRepositoryWritePaths.length > 0,
     sandboxPath: input.sandboxRoot,
     sandboxWrites: input.files.length > 0,
     schemaVersion: EXECUTION_SCHEMA_VERSION,
@@ -235,6 +253,11 @@ function isAcpModel(model: LanguageModel): boolean {
     model !== null &&
     'provider' in model &&
     (model as { provider?: unknown }).provider === 'acp'
+}
+
+function isAcpWorkPackageExecutionEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = env.FORGE_ACP_WORK_PACKAGE_EXECUTION?.trim().toLowerCase()
+  return raw !== undefined && ACP_EXECUTION_ENABLED_VALUES.has(raw)
 }
 
 function generationTimeoutMs(): number {
@@ -549,17 +572,24 @@ function assertRelativeWritePath(filePath: string): void {
   }
 }
 
+function assertHostRepositoryWritePath(filePath: string): void {
+  assertRelativeWritePath(filePath)
+  const [topLevel] = path.normalize(filePath).split(/[\\/]+/).filter((part) => part && part !== '.')
+  if (topLevel === '.forge') {
+    throw new Error(`File path is reserved for Forge runtime state and cannot be written to the host repository: ${filePath}`)
+  }
+}
+
 function isWithinPath(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate)
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
 }
 
-async function writeExecutionFile(projectRoot: string, file: WorkPackageExecutionFile): Promise<void> {
-  assertRelativeWritePath(file.path)
+async function assertWritableParent(projectRoot: string, filePath: string): Promise<string> {
   const resolvedRoot = path.resolve(projectRoot)
-  const target = path.resolve(resolvedRoot, file.path)
+  const target = path.resolve(resolvedRoot, filePath)
   if (!isWithinPath(resolvedRoot, target)) {
-    throw new Error(`File path escapes the project: ${file.path}`)
+    throw new Error(`File path escapes the project: ${filePath}`)
   }
 
   const parent = path.dirname(target)
@@ -569,8 +599,14 @@ async function writeExecutionFile(projectRoot: string, file: WorkPackageExecutio
     fs.realpath(parent),
   ])
   if (!isWithinPath(realRoot, realParent)) {
-    throw new Error(`File path escapes the real project directory: ${file.path}`)
+    throw new Error(`File path escapes the real project directory: ${filePath}`)
   }
+  return target
+}
+
+async function writeExecutionFile(projectRoot: string, file: WorkPackageExecutionFile): Promise<void> {
+  assertRelativeWritePath(file.path)
+  const target = await assertWritableParent(projectRoot, file.path)
 
   const targetStat = await fs.lstat(target).catch((err: NodeJS.ErrnoException) => {
     if (err.code === 'ENOENT') return null
@@ -588,6 +624,45 @@ async function writeExecutionFile(projectRoot: string, file: WorkPackageExecutio
     await handle.writeFile(file.content)
   } finally {
     await handle.close()
+  }
+}
+
+async function hostRepositoryWriteTarget(projectRoot: string, file: WorkPackageExecutionFile): Promise<string> {
+  assertHostRepositoryWritePath(file.path)
+  const target = await assertWritableParent(projectRoot, file.path)
+  const targetStat = await fs.lstat(target).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === 'ENOENT') return null
+    throw err
+  })
+  if (targetStat?.isSymbolicLink()) {
+    throw new Error(`File path targets a symlink and cannot be written by Forge: ${file.path}`)
+  }
+  if (targetStat && !targetStat.isFile()) {
+    throw new Error(`File path is not a regular file and cannot be written by Forge: ${file.path}`)
+  }
+  return target
+}
+
+async function writeHostRepositoryFiles(projectRoot: string, files: WorkPackageExecutionFile[]): Promise<void> {
+  const targets = await Promise.all(files.map(async (file) => ({
+    file,
+    target: await hostRepositoryWriteTarget(projectRoot, file),
+  })))
+  const written: string[] = []
+  for (const { file, target } of targets) {
+    const tempTarget = `${target}.forge-write-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`
+    try {
+      await fs.writeFile(tempTarget, file.content, { flag: 'wx' })
+      await fs.rename(tempTarget, target)
+      written.push(file.path)
+    } catch (err) {
+      await fs.rm(tempTarget, { force: true }).catch(() => {})
+      const message = err instanceof Error ? err.message : String(err)
+      const detail = written.length > 0
+        ? ` ${written.length} file(s) were already written: ${written.join(', ')}.`
+        : ''
+      throw new Error(`Failed to apply generated file to host repository: ${file.path}. ${message}.${detail}`)
+    }
   }
 }
 
@@ -1201,7 +1276,7 @@ function buildRunScopedMcpPromptLines(workPackage: WorkPackageRow): string[] {
     filesystemCapabilities.length > 0
       ? `- Forge issued a bounded read-only filesystem context packet for approved capabilities: ${filesystemCapabilities.join(', ')}. This is not a live tool handle and cannot write files.`
       : '- Forge beta execution does not issue live MCP runtime tools from this snapshot; treat MCP grants and overlays as planning-only context.',
-    '- Forge execution remains sandbox-only; do not assume credentials, host repository writes, or external services are available.',
+    '- Forge applies generated files to the host repository only through the returned execution JSON and its path guards. Do not assume credentials, live MCP tools, branch creation, commits, pull requests, or external services are available.',
   ]
 
   if (promptOverlay !== '') {
@@ -1278,8 +1353,8 @@ export function buildExecutionPrompt(input: {
     '',
     'Implementation contract:',
     '- Return one fenced `work_package_execution_json` block and nothing else.',
-    '- Write all files needed for this package. Use relative paths only; Forge will place them under the execution sandbox root.',
-    '- Do not write outside the execution sandbox, `.git`, or `node_modules`.',
+    '- Write all files needed for this package. Use relative paths only; Forge writes them to the execution sandbox first, then applies successful repository-affecting output to the host project when host repository writes are enabled.',
+    '- Do not target `.git`, `.forge`, `node_modules`, symlinks, or files outside the project.',
     '- Do not create local conflict-copy names such as `file 2.ts`, `config 2.json`, or directories ending in ` 2`.',
     '- Do not rely on external services in the generated app.',
     '- For tiny new web apps, prefer dependency-free HTML/CSS/JavaScript plus Node built-in tests so `npm test` and `npm run build` can run without `npm install`.',
@@ -1353,9 +1428,9 @@ export async function loadWorkPackageExecutionContext(
 
   const provider = await getProvider(providerConfigId)
   if (!provider) throw new Error(`Provider config ${providerConfigId} is missing or inactive.`)
-  if (provider.config.providerType === 'acp') {
+  if (provider.config.providerType === 'acp' && !isAcpWorkPackageExecutionEnabled()) {
     throw new Error(
-      'ACP providers can create and revise Architect plans, but Forge does not execute work packages through ACP until a hard filesystem and tool sandbox is available. Select a non-ACP provider for executable Workforce packages.',
+      'ACP work-package execution is disabled. Set FORGE_ACP_WORK_PACKAGE_EXECUTION=1 only after accepting that ACP adapters are local processes and are not OS-confined by Forge.',
     )
   }
 
@@ -1533,6 +1608,7 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
     }
 
     const commandResults: WorkPackageExecutionCommandResult[] = []
+    const hostRepositoryWrites = shouldApplyHostRepositoryWrites(context.workPackage)
     if (plan.commands.length === 0) {
       await recordTaskLogBestEffort({
         agentRunId: context.agentRunId ?? null,
@@ -1553,6 +1629,18 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
         title: 'Validation commands missing',
         workPackageId: context.workPackage.id,
       })
+      if (hostRepositoryWrites) {
+        throw new WorkPackageExecutionError(
+          `Execution plan for "${context.workPackage.title}" did not include validation commands, so Forge did not apply generated files to the host repository.`,
+          executionFailureDetails({
+            attemptNumber,
+            commandResults,
+            files: plan.files,
+            sandboxRoot,
+            summary: plan.summary,
+          }),
+        )
+      }
     }
     for (const command of plan.commands) {
       const result = await runCommand(sandboxRoot, command)
@@ -1592,9 +1680,34 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
       }
     }
 
+    const hostRepositoryWritePaths = hostRepositoryWrites
+      ? plan.files.map((file) => file.path.split(/[\\/]+/).filter(Boolean).join('/'))
+      : []
+    if (hostRepositoryWrites) {
+      await writeHostRepositoryFiles(hostProjectRoot, plan.files)
+      await recordTaskLogBestEffort({
+        agentRunId: context.agentRunId ?? null,
+        eventType: 'repository.files_written',
+        level: 'success',
+        message: `Applied ${plan.files.length} generated file(s) to the host repository for "${context.workPackage.title}".`,
+        metadata: {
+          attemptNumber,
+          files: hostRepositoryWritePaths,
+          hostProjectRoot,
+          repositoryWrites: true,
+          workPackageId: context.workPackage.id,
+        },
+        source: 'worker',
+        taskId: context.task.id,
+        title: 'Host repository files written',
+        workPackageId: context.workPackage.id,
+      })
+    }
+
     const artifactContent = executionArtifactContent({
       commandResults,
       files: plan.files,
+      hostRepositoryWritePaths,
       summary: plan.summary,
     })
 
@@ -1604,6 +1717,7 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
         attemptNumber,
         commandResults,
         files: plan.files,
+        hostRepositoryWritePaths,
         sandboxRoot,
       }),
       commandResults,
@@ -1611,6 +1725,9 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
       executionContextArtifactMetadata,
       executionContextPacket: hostExecutionContext,
       fileCount: plan.files.length,
+      hostRepositoryWritePaths,
+      hostRepositoryWrites,
+      repositoryWrites: hostRepositoryWrites,
       sandboxPath: sandboxRoot,
       summary: plan.summary,
     }

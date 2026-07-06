@@ -11,9 +11,10 @@ happening, what needs attention, and what decision the human should make next.
 
 The UI must also be honest about the current beta boundary. Planning,
 approvals, provider health, artifacts, and sandboxed Workforce records can be
-shown as present capability. Host-repository writes, PR automation, merge
-automation, live specialist MCP grants, and parallel execution should be framed
-as future or gated behavior unless the implementation changes.
+shown as present capability. Local repository file edits can be shown as present
+capability when package execution succeeds. PR automation, merge automation,
+live specialist MCP grants, and parallel execution should be framed as future or
+gated behavior unless the implementation changes.
 
 ## Product Model
 
@@ -23,9 +24,9 @@ Primary workflow:
 Brief -> Plan -> Architecture -> Work Package -> Agent Run -> Review -> Ship
 ```
 
-In the current executable beta, the workflow stops at reviewed sandbox output.
-The `Ship` step is a future/gated target that may later commit, open a PR,
-merge, deploy, or export after separate repository-write and PR-automation
+In the current executable beta, the workflow stops at reviewed local edits and
+sandbox artifacts. The `Ship` step is a future/gated target that may later
+commit, open a PR, merge, deploy, or export after separate PR-automation
 work lands.
 
 Core objects:

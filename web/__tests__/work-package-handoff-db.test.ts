@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   dbInsert: vi.fn(),
@@ -64,6 +64,8 @@ function fixtureSecret(...parts: string[]) {
 }
 
 import { handoffApprovedWorkPackages, progressWorkforce } from '@/worker/work-package-handoff'
+
+const originalExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
 
 function chain(resolveValue: unknown) {
   const thenable: Record<string, unknown> = {
@@ -147,6 +149,7 @@ function mockNoOpHandoffTransaction(input: {
 
 describe('handoffApprovedWorkPackages', () => {
   beforeEach(() => {
+    process.env.FORGE_WORK_PACKAGE_EXECUTION = '0'
     vi.clearAllMocks()
     mocks.getProjectMcpOverview.mockResolvedValue({
       projectId: 'project-1',
@@ -172,6 +175,14 @@ describe('handoffApprovedWorkPackages', () => {
       ],
       sourceArtifact: defaultSourceArtifact(),
     })
+  })
+
+  afterEach(() => {
+    if (originalExecutionFlag === undefined) {
+      delete process.env.FORGE_WORK_PACKAGE_EXECUTION
+    } else {
+      process.env.FORGE_WORK_PACKAGE_EXECUTION = originalExecutionFlag
+    }
   })
 
   it('marks root packages ready, claims the first package, and records a no-op handoff run', async () => {
@@ -1083,6 +1094,9 @@ describe('handoffApprovedWorkPackages', () => {
       },
       executionContextPacket: {},
       fileCount: 1,
+      hostRepositoryWritePaths: [],
+      hostRepositoryWrites: false,
+      repositoryWrites: false,
       sandboxPath: '/workspace/project/.forge/task-runs/task-1/pkg-1/attempt-2',
       summary: 'Implemented rework.',
     })
@@ -1252,6 +1266,9 @@ describe('handoffApprovedWorkPackages', () => {
       },
       executionContextPacket: {},
       fileCount: 1,
+      hostRepositoryWritePaths: [],
+      hostRepositoryWrites: false,
+      repositoryWrites: false,
       sandboxPath: '/workspace/project/.forge/task-runs/task-1/pkg-1/attempt-1',
       summary: 'Completed after cancellation.',
     })

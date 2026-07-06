@@ -1,4 +1,5 @@
 import { sanitizeWorkerMessage } from './redaction'
+import { defaultOnFeatureFlagState } from './feature-flags'
 
 const DEFAULT_CLAIM_TIMEOUT_SECONDS = 5
 const APPROVAL_CLAIM_TIMEOUT_SECONDS = 1
@@ -209,12 +210,20 @@ async function startWorkerOnce(
   }
 
   const run = async (): Promise<void> => {
+    const executionMode = defaultOnFeatureFlagState(process.env.FORGE_WORK_PACKAGE_EXECUTION)
+    const hostWriteMode = defaultOnFeatureFlagState(
+      process.env.FORGE_HOST_REPOSITORY_WRITES ?? process.env.FORGE_REPOSITORY_EDITS,
+    )
     console.info('[worker] Started', {
       claimTimeoutSeconds,
+      hostRepositoryWritesEnabled: hostWriteMode.enabled,
+      hostRepositoryWritesFlagRecognized: hostWriteMode.recognized,
       maxAttempts,
       providerHealthIntervalSeconds,
       source,
       stuckJobRecoveryMs,
+      workPackageExecutionEnabled: executionMode.enabled,
+      workPackageExecutionFlagRecognized: executionMode.recognized,
       workerId,
     })
 

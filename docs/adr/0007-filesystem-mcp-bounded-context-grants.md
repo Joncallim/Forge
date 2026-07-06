@@ -37,8 +37,9 @@ same project when they ask for the same or narrower capabilities.
   package grant phase with `runtimeEnforcement: "bounded_context_packet"`.
 - The executor receives only a bounded, read-only project context packet.
 - Live MCP filesystem tool handles are not issued in this beta boundary.
-- `filesystem.project.write` is not supported; package writes remain confined to
-  `.forge/task-runs/...` sandbox output.
+- `filesystem.project.write` is not supported. Local project edits are applied
+  by Forge from the specialist's returned execution JSON, not by granting a
+  live filesystem write tool.
 - Required denied or missing filesystem grants block execution with task logs and
   runtime audit rows.
 - The task page warns before project-level approval is saved. This warning must
@@ -52,8 +53,9 @@ summary. Audit rows must not persist raw file contents.
 
 Project-level approval does not widen the beta security boundary. It only saves
 the operator's decision for the same project and covered capabilities. It still
-does not grant live MCP handles, write access, credentials, access to another
-project, or any capability outside the safe filesystem allowlist.
+does not grant live MCP handles, filesystem tool write access, credentials,
+access to another project, or any capability outside the safe filesystem
+allowlist.
 
 ## Consequences
 

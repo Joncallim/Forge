@@ -28,13 +28,15 @@ catalog.
 ## Runtime reality
 
 The normal web runtime is not a manual agent session. The web app enqueues tasks
-to Redis, and the Forge worker consumes those jobs; the worker currently runs the
-Architect planning stage and then moves a task to `awaiting_approval`, with
-opt-in sandbox-only package execution behind `FORGE_WORK_PACKAGE_EXECUTION`.
+to Redis, and the Forge worker consumes those jobs. The worker runs Architect
+planning, moves a task to `awaiting_approval`, and after approval can execute
+specialist packages and apply local repository file edits by default. Set
+`FORGE_WORK_PACKAGE_EXECUTION=0` for handoff artifacts only, or
+`FORGE_HOST_REPOSITORY_WRITES=0` to keep generated files sandbox-only.
 
 Do not imply capabilities Forge does not have yet: parallel autonomous
-specialists, host-repository writes, commits, PR creation, merge automation, or
-unrestricted MCP runtime grants.
+specialists, commits, PR creation, merge automation, or unrestricted MCP runtime
+grants.
 
 ## Roles
 

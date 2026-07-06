@@ -104,7 +104,7 @@ describe('loadWorkPackageExecutionContext', () => {
     expect(context.validatedProjectRoot).toBe('/workspace/real-project')
   })
 
-  it('rejects ACP-backed executable work packages until a hard sandbox exists', async () => {
+  it('blocks ACP-backed executable work packages unless explicitly enabled', async () => {
     vi.clearAllMocks()
     const project = { id: 'project-1', localPath: '/workspace/project' }
     const task = { id: 'task-1', projectId: 'project-1', pmProviderConfigId: 'provider-task' }
@@ -117,9 +117,37 @@ describe('loadWorkPackageExecutionContext', () => {
     })
 
     await expect(loadWorkPackageExecutionContext('task-1', 'pkg-1'))
-      .rejects.toThrow(/does not execute work packages through ACP/i)
+      .rejects.toThrow(/ACP work-package execution is disabled/i)
 
     expect(mocks.assertProjectLocalPathForExecution).not.toHaveBeenCalled()
+    expect(mocks.getModel).not.toHaveBeenCalled()
+  })
+
+  it('allows ACP-backed executable work packages when ACP execution is explicitly enabled', async () => {
+    vi.clearAllMocks()
+    const previous = process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION
+    process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION = '1'
+    const project = { id: 'project-1', localPath: '/workspace/project' }
+    const task = { id: 'task-1', projectId: 'project-1', pmProviderConfigId: 'provider-task' }
+    const workPackage = { id: 'pkg-1', assignedRole: 'backend' }
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{ task, project, workPackage }]))
+      .mockReturnValueOnce(chain([{ id: 'agent-backend', providerConfigId: null }]))
+    mocks.getProvider.mockResolvedValue({
+      config: { providerType: 'acp', modelId: 'codex-cli::gpt-5.3-codex-spark' },
+    })
+    mocks.assertProjectLocalPathForExecution.mockResolvedValue('/workspace/project')
+
+    try {
+      const context = await loadWorkPackageExecutionContext('task-1', 'pkg-1')
+
+      expect(context.providerConfigId).toBe('provider-task')
+      expect(context.modelIdUsed).toBe('codex-cli::gpt-5.3-codex-spark')
+      expect(mocks.assertProjectLocalPathForExecution).toHaveBeenCalledWith(project)
+    } finally {
+      if (previous === undefined) delete process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION
+      else process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION = previous
+    }
     expect(mocks.getModel).not.toHaveBeenCalled()
   })
 

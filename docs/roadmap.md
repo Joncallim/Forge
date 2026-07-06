@@ -13,18 +13,19 @@ asks follow-up questions when needed, and pauses for human approval.
 Workforce materialization and handoff are enabled unless explicitly disabled, so
 Architect completion materializes durable work-package and gate state before
 `awaiting_approval`; approval releases ready packages. Generated package
-execution is opt-in with `FORGE_WORK_PACKAGE_EXECUTION=1`, and generated
-output is written only inside per-package attempt sandboxes at
-`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`.
+execution and local repository writes are default-on. Generated output is kept
+inside per-package attempt sandboxes at
+`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`, then
+repository-affecting files are applied to the local project after the package execution step.
 
 Issue #119, "Executable Workforce Beta: capability-brokered sequential
 specialist execution," is the exact beta boundary for executable packages. It
-adds bounded read-only host-repository context, sandbox-only output, capability
-brokerage, manual QA/Reviewer/Security gates, structured security findings for
-high-risk work, and precise grant terminology. It does not apply edits to the
-host repository, grant live MCP runtime access, create commits, open pull
-requests, merge work, run autonomous reviewer agents, or run specialists in
-parallel.
+adds bounded read-only host-repository context, sandbox artifacts, local project
+file edits, capability brokerage, manual QA/Reviewer/Security gates, structured
+security findings for high-risk work, and precise grant terminology. It applies
+local file edits but does not create commits, grant live MCP runtime access,
+open pull requests, merge work, run autonomous reviewer agents, or run
+specialists in parallel.
 
 After sequential sandboxed Workforce execution is reliable, the next major
 product direction is **Forge Workspace**: a dockable, AI-assisted workbench that
@@ -35,9 +36,9 @@ than a full operating system.
 
 Short version: Forge is useful today as a local planning and approval control
 room. The current executable milestone is making sequential specialist execution
-reliable inside sandboxes before Forge is trusted with host-repository writes or
-pull request automation. The following major direction is the Forge Workspace shell
-and link graph that preserve context between tools.
+reliable with sandbox artifacts and local project edits before Forge is trusted
+with pull request automation. The following major direction is the Forge
+Workspace shell and link graph that preserve context between tools.
 
 ## Operational Understanding
 
@@ -145,8 +146,6 @@ In scope:
 Still out of scope:
 
 - Live MCP runtime grants or credentials for specialists.
-- Host-repository writes outside `.forge/task-runs`.
-- Applying generated sandbox files back into the project tree.
 - Branch creation, commits, check polling, pull requests, merges, issue
   auto-closure, or release automation.
 - Parallel specialist execution.
@@ -363,16 +362,17 @@ Current build slice:
 3. Materialize the latest Architect artifact metadata into read-only
    `work_packages`, behind a feature flag where execution behavior is involved.
 4. Show work packages, gates, and VCS summary on the task detail page.
-5. Keep host repository writes, commits, PRs, and merges out of this slice.
-   Work-package handoff and execution remain feature-flagged and sandbox-only.
+5. Keep commits, PRs, and merges out of this slice. Work-package handoff,
+   execution, and local repository writes are default-on with explicit disable
+   flags.
 
 Executable beta epic: #119 Executable Workforce Beta:
 
 1. Route Architect work packages through capability brokerage instead of only
    fixed stage names (#43).
-2. Run specialist packages sequentially through the sandbox execution path
-   (#60), with bounded read-only host-repository context and sandbox-only
-   output.
+2. Run specialist packages sequentially through the execution path (#60), with
+   bounded read-only host-repository context, sandbox artifacts, and local
+   project file edits.
 3. Store handoff, execution, command, QA, Reviewer, Security, repository
    evidence, rework, and blocked-state artifacts on the task.
 4. Add manual QA and Reviewer gates before generated implementation output can
@@ -390,9 +390,9 @@ Executable beta epic: #119 Executable Workforce Beta:
 8. Keep `agent_harnesses` planning-only for this beta. Harness prompts, tool
    policies, reference paths, output schemas, and validation checks are not
    execution policy until a later slice wires them in.
-9. Keep MCP runtime grants, host repository writes, commits, PR creation, merge
-   automation, user-edited grants, agent-run review gates, harness execution
-   policy, default-on execution, and parallel execution out of the beta.
+9. Keep MCP runtime grants, commits, PR creation, merge automation,
+   user-edited grants, agent-run review gates, harness execution policy, and
+   parallel execution out of the beta.
 
 Deferred:
 
@@ -564,8 +564,8 @@ Forge -> pinned ACP adapter -> local CLI -> logged-in model account
 This is useful because it lets Forge call tools that already have their own CLI
 auth, runtime behavior, and model routing. The cautious boundary is that ACP
 currently returns text through Forge's provider interface; it does not yet grant
-Forge-managed MCP tools, expose detailed token usage, or make repository writes
-safe by itself.
+Forge-managed MCP tools, expose detailed token usage, or make remote repository
+automation safe by itself.
 
 Near-term ACP work:
 
@@ -573,8 +573,8 @@ Near-term ACP work:
    CLI installs, missing auth, and missing project folders.
 2. Expand runtime strategies only after the current Codex CLI and Claude Code
    paths are reliable.
-3. Keep ACP-backed package execution disabled until local coding CLIs can run
-   behind a hard filesystem and tool sandbox.
+3. Keep ACP-backed package execution tied to the package attempt sandbox and
+   Forge-applied execution JSON path guards.
 4. Document runtime-specific model-selection behavior instead of promising a
    universal model picker.
 

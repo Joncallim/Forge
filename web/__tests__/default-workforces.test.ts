@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_WORKFORCES, resolveWorkforceMembers } from '@/db/default-workforces'
+import {
+  DEFAULT_WORKFORCES,
+  WORKFORCE_SUPERVISOR_AGENT_TYPE,
+  WORKFORCE_SUPERVISOR_ROLE_LABEL,
+  resolveWorkforceMembers,
+} from '@/db/default-workforces'
 
 // Agent types shipped as .codex/agents/*.toml seed defaults.
 const KNOWN_ROLES = new Set([
@@ -23,8 +28,20 @@ describe('DEFAULT_WORKFORCES', () => {
     for (const workforce of DEFAULT_WORKFORCES) {
       expect(workforce.roles.length).toBeGreaterThan(0)
       for (const role of workforce.roles) {
-        expect(KNOWN_ROLES.has(role)).toBe(true)
+        const agentType = typeof role === 'string' ? role : role.agentType
+        expect(KNOWN_ROLES.has(agentType)).toBe(true)
       }
+    }
+  })
+
+  it('assigns an architect supervisor to every default workforce', () => {
+    for (const workforce of DEFAULT_WORKFORCES) {
+      const [supervisor] = workforce.roles
+      expect(supervisor).toMatchObject({
+        agentType: WORKFORCE_SUPERVISOR_AGENT_TYPE,
+        roleLabel: WORKFORCE_SUPERVISOR_ROLE_LABEL,
+        metadata: { workforceSupervisor: true },
+      })
     }
   })
 })
@@ -37,9 +54,33 @@ describe('resolveWorkforceMembers', () => {
       ['qa', 'q1'],
     ])
     expect(resolveWorkforceMembers(['architect', 'backend', 'qa'], byType)).toEqual([
-      { agentConfigId: 'a1', sequence: 1, isRequired: true },
-      { agentConfigId: 'b1', sequence: 2, isRequired: true },
-      { agentConfigId: 'q1', sequence: 3, isRequired: true },
+      { agentConfigId: 'a1', roleLabel: null, sequence: 1, isRequired: true, metadata: {} },
+      { agentConfigId: 'b1', roleLabel: null, sequence: 2, isRequired: true, metadata: {} },
+      { agentConfigId: 'q1', roleLabel: null, sequence: 3, isRequired: true, metadata: {} },
+    ])
+  })
+
+  it('preserves workforce role labels and metadata', () => {
+    const byType = new Map([
+      ['architect', 'a1'],
+      ['backend', 'b1'],
+    ])
+    expect(resolveWorkforceMembers([
+      {
+        agentType: 'architect',
+        roleLabel: WORKFORCE_SUPERVISOR_ROLE_LABEL,
+        metadata: { workforceSupervisor: true },
+      },
+      'backend',
+    ], byType)).toEqual([
+      {
+        agentConfigId: 'a1',
+        roleLabel: WORKFORCE_SUPERVISOR_ROLE_LABEL,
+        sequence: 1,
+        isRequired: true,
+        metadata: { workforceSupervisor: true },
+      },
+      { agentConfigId: 'b1', roleLabel: null, sequence: 2, isRequired: true, metadata: {} },
     ])
   })
 
@@ -50,8 +91,8 @@ describe('resolveWorkforceMembers', () => {
     ])
     // 'ux' and 'documentation' absent -> skipped; sequence stays 1..n.
     expect(resolveWorkforceMembers(['product', 'ux', 'documentation', 'reviewer'], byType)).toEqual([
-      { agentConfigId: 'p1', sequence: 1, isRequired: true },
-      { agentConfigId: 'r1', sequence: 2, isRequired: true },
+      { agentConfigId: 'p1', roleLabel: null, sequence: 1, isRequired: true, metadata: {} },
+      { agentConfigId: 'r1', roleLabel: null, sequence: 2, isRequired: true, metadata: {} },
     ])
   })
 

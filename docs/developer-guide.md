@@ -10,16 +10,15 @@ operator wants. The worker does the queued work and saves evidence for review.
 
 The current worker starts with the Architect planning stage. Workforce data
 structures now exist for work packages, harnesses, approval gates, and VCS
-summaries. Work-package handoff and sequential specialist execution exist behind
-flags with different defaults: materialization and handoff are default-on unless
-explicitly disabled, while generated package execution is opt-in with
-`FORGE_WORK_PACKAGE_EXECUTION=1`. Executable packages may receive bounded
-read-only host-repository context, but generated files are written only to
-per-package sandboxes under
-`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`.
-Forge still does not apply generated edits to the host repository, grant MCP
-runtime access to specialists, create branches or commits, open pull requests,
-merge work, run autonomous reviewer agents, or run specialists in parallel.
+summaries. Work-package handoff, sequential specialist execution, and local
+repository edits are default-on unless explicitly disabled. Executable packages
+may receive bounded read-only host-repository context. Generated files are first
+written to per-package sandboxes under
+`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`, then
+repository-affecting files are applied to the local project after the package execution step.
+Forge still does not grant MCP runtime access to specialists, create branches or
+commits, open pull requests, merge work, run autonomous reviewer agents, or run
+specialists in parallel.
 
 The MCP/capability broker is an admission-time gate: it decides whether a work
 package may be claimed and handed off based on the requested MCP capabilities,
@@ -35,9 +34,11 @@ configured ACP adapter on demand, speaks JSON-RPC over stdio, and receives text
 back through the same provider interface used by the worker. The currently wired
 Agent Client Protocol adapters wrap local tools such as Codex CLI and Claude
 Code; the underlying CLI must already be installed, authenticated, and runnable
-on the worker host. Architect ACP calls run in an isolated runtime directory;
-executable work-package ACP calls are blocked until Forge has a hard filesystem
-and tool sandbox for local coding CLIs. See [ACP and the Zed connector](acp-zed-connector.md).
+on the worker host. Architect ACP calls run in an isolated runtime directory.
+Executable work-package ACP calls are disabled by default because ACP adapters
+are local processes, not OS-confined sandboxes. Operators can opt in with
+`FORGE_ACP_WORK_PACKAGE_EXECUTION=1` after accepting that risk. See [ACP and the
+Zed connector](acp-zed-connector.md).
 
 ## Local Development
 
@@ -129,8 +130,9 @@ POST /api/tasks
   -> operator approves the plan
   -> approval job releases ready work packages
   -> MCP/capability broker validates the next handoff before ready/claim
-  -> execution, only when `FORGE_WORK_PACKAGE_EXECUTION=1`, reads bounded host context
-     and writes generated output to `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`
+  -> execution reads bounded host context, writes generated output to
+     `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`,
+     and applies local repository edits unless `FORGE_HOST_REPOSITORY_WRITES=0`
   -> manual package QA/Reviewer/Security review gates complete when required
   -> task completes after all work packages and review gates are complete
 ```
@@ -151,13 +153,18 @@ Feature flag defaults:
 |---|---|---|
 | `FORGE_WORKFORCE_MATERIALIZATION` | enabled | Set `0` or `false` to skip durable work-package/gate records. |
 | `FORGE_WORK_PACKAGE_HANDOFF` | enabled | Set `0` or `false` to stop package handoff claims. |
-| `FORGE_WORK_PACKAGE_EXECUTION` | disabled | Set `1` or `true` to run package execution under `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`. |
+| `FORGE_WORK_PACKAGE_EXECUTION` | enabled | Set `0`, `false`, `off`, `no`, or `disabled` to stop specialist package execution and create handoff artifacts only. |
+| `FORGE_HOST_REPOSITORY_WRITES` | enabled | Set `0`, `false`, `off`, `no`, or `disabled` to keep generated files sandbox-only and skip local project edits. |
+| `FORGE_ACP_WORK_PACKAGE_EXECUTION` | disabled | Set `1`, `true`, `on`, `yes`, or `enabled` only when local ACP package execution is an accepted operator risk. |
 | `FORGE_RUNNING_WORK_PACKAGE_STALE_SECONDS` | `900` | Recovery window before a retry marks an interrupted running work package blocked and starts the next eligible attempt. |
 
 ### Executable Workforce Beta
 
-`FORGE_WORK_PACKAGE_EXECUTION=1` changes only the final package execution step.
-It does not change the repository safety boundary.
+`FORGE_WORK_PACKAGE_EXECUTION=0` changes only the final package execution step:
+approval records reviewable handoff artifacts but does not call a specialist
+package model. `FORGE_HOST_REPOSITORY_WRITES=0` still lets package models run,
+but keeps generated files under `.forge/task-runs` instead of applying them to
+the local project.
 
 When execution is enabled:
 
@@ -177,8 +184,14 @@ When execution is enabled:
    `npm run lint`. In the beta, Forge performs static validation of the
    generated sandbox output for those command labels, including script safety,
    placeholder checks, and JavaScript syntax checks; it does not run arbitrary
-   package scripts.
-8. Package artifacts record the generated file list, sandbox path, command
+   package scripts. Repository-affecting packages must include at least one
+   validation command before Forge applies generated files to the host
+   repository.
+8. If host repository writes are enabled, Forge applies generated files only
+   after sandbox validation passes and the host working tree is clean. Forge
+   writes each file through a temporary sibling file and atomic rename; a
+   mid-batch failure records which paths were already written in the error.
+9. Package artifacts record the generated file list, sandbox path, command
    results, model/provider snapshot, and review source artifact.
 
 Operators and reviewers can inspect:
@@ -198,8 +211,6 @@ Important non-goals for the beta:
 
 - no live MCP grants, credentials, or runtime tool handles are issued to
   specialists;
-- no host-repository writes happen outside `.forge/task-runs`;
-- no generated sandbox output is applied back into the project tree;
 - no branches, commits, check polling, PRs, merges, or issue auto-closure are
   created;
 - no parallel specialist execution runs;
@@ -337,8 +348,12 @@ for new Forge behavior.
 Workforces are stored in PostgreSQL for runtime and exported to
 `~/Documents/Forge/workforces/` after seed/create/update/archive operations.
 Those exports include the ordered agent table, workflow JSON, and workforce
-manager prompt. For this slice, the exports are mirrors; import/edit conflict
-handling is intentionally out of scope.
+manager prompt. Seeded default workforces start with the Architect agent labeled
+as the **Workforce supervisor**. That label makes workflow ownership explicit
+without adding a new broad agent role. In normal keep mode, the seed script
+backfills memberships only for default workforces that have no members; overwrite
+mode resets those teams to the shipped defaults. For this slice, the exports are
+mirrors; import/edit conflict handling is intentionally out of scope.
 
 ## Database Migrations
 
