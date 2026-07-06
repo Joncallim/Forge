@@ -5,7 +5,7 @@ import {
   runAgentCommand,
 } from './core/agent-command'
 import { readGitHubEvent } from './io/event'
-import { FileAgentRunRecorder } from './io/agent-run-log'
+import { FileAgentRunRecorder, persistRunRecordToGit, type PersistRunRecordInput } from './io/agent-run-log'
 import { RestGitHubClient, type GitHubClient } from './io/github-client'
 
 type GitHubIssueCommentEvent = {
@@ -63,6 +63,10 @@ function shortShaFromEnv(env: NodeJS.ProcessEnv): string | null {
   return /^[0-9a-f]{7,40}$/i.test(sha) ? sha.slice(0, 12).toLowerCase() : null
 }
 
+function runLogPersisterFromEnv(env: NodeJS.ProcessEnv): ((input: PersistRunRecordInput) => Promise<void>) | undefined {
+  return env.FORGE_AGENT_RUN_LOG_GIT_COMMIT === '1' ? persistRunRecordToGit : undefined
+}
+
 export async function runAgentCommandForEvent(input: {
   client: GitHubClient
   event: GitHubIssueCommentEvent
@@ -109,7 +113,9 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
     client,
     event,
     botLogin: botLoginFromEnv(env),
-    recorder: new FileAgentRunRecorder(),
+    recorder: new FileAgentRunRecorder({
+      persistRecord: runLogPersisterFromEnv(env),
+    }),
     githubRunId: env.GITHUB_RUN_ID,
     githubRunAttempt: env.GITHUB_RUN_ATTEMPT,
     shortSha: shortShaFromEnv(env),

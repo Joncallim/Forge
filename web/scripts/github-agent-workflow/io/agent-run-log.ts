@@ -1,11 +1,14 @@
+import { execFile as execFileCallback } from 'node:child_process'
 import { mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { promisify } from 'node:util'
 import { agentRunRecordSchema, type AgentRunEvent, type AgentRunRecord, type RunValidationSummary } from '../contracts/agent-run-record'
 import { positiveIntSchema, runIdSchema, type RunId, type RunStatus } from '../contracts/common'
 import type { AgentCommandRunRecordInput, AgentCommandRunRecorder } from '../core/agent-command'
 
 const RUN_LOG_RELATIVE_DIR = path.join('.forge', 'runs')
 const MAX_EVENT_MESSAGE_LENGTH = 500
+const execFile = promisify(execFileCallback)
 const SECRET_PATTERNS: readonly RegExp[] = Object.freeze([
   /\bghp_[A-Za-z0-9_]{20,}\b/g,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
@@ -15,9 +18,16 @@ const SECRET_PATTERNS: readonly RegExp[] = Object.freeze([
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
 ])
 
+export type PersistRunRecordInput = Readonly<{
+  filePath: string
+  record: AgentRunRecord
+  repositoryRoot: string
+}>
+
 type RunLogOptions = Readonly<{
   repositoryRoot?: string
   now?: Date
+  persistRecord?: (input: PersistRunRecordInput) => Promise<void>
 }>
 
 export type CreateRunRecordInput = AgentCommandRunRecordInput & Readonly<{
@@ -113,6 +123,20 @@ async function writeRecord(filePath: string, record: AgentRunRecord): Promise<vo
   await rename(temporaryPath, filePath)
 }
 
+async function writeAndPersistRecord(
+  filePath: string,
+  record: AgentRunRecord,
+  repositoryRootPath: string,
+  options: RunLogOptions,
+): Promise<void> {
+  await writeRecord(filePath, record)
+  await options.persistRecord?.({
+    filePath,
+    record,
+    repositoryRoot: repositoryRootPath,
+  })
+}
+
 async function readRecord(repositoryRootPath: string, issueNumber: number, runId: RunId): Promise<AgentRunRecord> {
   const filePath = await runRecordPath({ repositoryRoot: repositoryRootPath, issueNumber, runId })
   return agentRunRecordSchema.parse(JSON.parse(await readFile(filePath, 'utf8')))
@@ -128,7 +152,7 @@ async function updateRecord(
   const current = await readRecord(root, issueNumber, runId)
   const updated = agentRunRecordSchema.parse(updater(current, nowIso(options)))
   const filePath = await runRecordPath({ repositoryRoot: root, issueNumber, runId })
-  await writeRecord(filePath, updated)
+  await writeAndPersistRecord(filePath, updated, root, options)
   return updated
 }
 
@@ -170,7 +194,7 @@ export async function createRunRecord(input: CreateRunRecordInput, options: RunL
   })
   const root = await repositoryRoot(options)
   const filePath = await runRecordPath({ repositoryRoot: root, issueNumber: record.issueNumber, runId: record.runId })
-  await writeRecord(filePath, record)
+  await writeAndPersistRecord(filePath, record, root, options)
   return record
 }
 
@@ -283,4 +307,33 @@ export class FileAgentRunRecorder implements AgentCommandRunRecorder {
 export function runLogPathForDisplay(issueNumber: number, runId: RunId): string {
   const record = agentRunRecordSchema.pick({ issueNumber: true, runId: true }).parse({ issueNumber, runId })
   return path.posix.join('.forge', 'runs', String(record.issueNumber), `${record.runId}.json`)
+}
+
+async function git(repositoryRootPath: string, args: readonly string[]): Promise<void> {
+  await execFile('git', args, {
+    cwd: repositoryRootPath,
+    timeout: 120_000,
+  })
+}
+
+export async function persistRunRecordToGit(input: PersistRunRecordInput): Promise<void> {
+  const root = path.resolve(input.repositoryRoot)
+  const relativePath = path.relative(root, input.filePath)
+  if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+    throw new Error('Refusing to persist a run record outside the repository root.')
+  }
+
+  await git(root, ['config', 'user.name', 'github-actions[bot]'])
+  await git(root, ['config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'])
+  await git(root, ['add', '--', relativePath])
+
+  try {
+    await git(root, ['diff', '--cached', '--quiet', '--', relativePath])
+    return
+  } catch {
+    // git diff --quiet exits non-zero when the run record has staged changes.
+  }
+
+  await git(root, ['commit', '-m', `Record Forge agent run ${input.record.runId}`, '--', relativePath])
+  await git(root, ['push'])
 }

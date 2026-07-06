@@ -292,6 +292,36 @@ describe('agent run log storage', () => {
     expect(await client.listComments(146)).toEqual([])
   })
 
+  it('prevents agent-requested and accepted comments when durable git persistence fails', async () => {
+    const root = await tempRepositoryRoot()
+    const client = new FakeGitHubClient({ issues: [READY_ISSUE], collaboratorPermissions: { Joncallim: 'write' } })
+    const persistedPaths: string[] = []
+
+    await expect(runAgentCommand({
+      client,
+      issue: READY_ISSUE,
+      comment: { id: 105, body: 'codex implement', authorLogin: 'Joncallim' },
+      botLogin: 'github-actions[bot]',
+      recorder: new FileAgentRunRecorder({
+        repositoryRoot: root,
+        persistRecord: async ({ filePath }) => {
+          persistedPaths.push(filePath)
+          throw new Error('run record git persist failed')
+        },
+      }),
+      githubRunId: 1234567892,
+      githubRunAttempt: 1,
+    })).rejects.toThrow('run record git persist failed')
+
+    expect(persistedPaths).toEqual([runPath(root, 146, 'issue-146-1234567892-1')])
+    expect(await readRun(root, 146, 'issue-146-1234567892-1')).toMatchObject({
+      runId: 'issue-146-1234567892-1',
+      status: 'requested',
+    })
+    expect((await client.getIssue(146)).labels).not.toContain('agent-requested')
+    expect(await client.listComments(146)).toEqual([])
+  })
+
   it('redacts secret-shaped values and truncates transcript-shaped event messages', async () => {
     const root = await tempRepositoryRoot()
     await recordRequested({

@@ -1,6 +1,7 @@
 .DS_Store
 .forge/*
 !.forge/runs/
+.forge/runs/**
 !.forge/runs/**/
 !.forge/runs/**/*.json
 local-memory/

@@ -53,3 +53,8 @@ Forge still ignores most `.forge` output because task sandboxes can be large.
 Only `.forge/runs/**/*.json` is unignored so run records can be reviewed and
 committed deliberately. Do not put prompts, transcripts, secrets, or generated
 task output in this run log.
+
+The GitHub Actions command router writes and commits the run JSON before it marks
+the issue with `agent-requested` or posts the accepted-request comment. If the
+file cannot be written or pushed, the router stops instead of making the issue
+look ready for dispatch without a durable run record.

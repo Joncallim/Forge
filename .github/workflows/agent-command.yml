@@ -5,8 +5,12 @@ on:
     types: [created]
 
 permissions:
-  contents: read
+  contents: write
   issues: write
+
+concurrency:
+  group: forge-agent-command-${{ github.event.issue.number }}
+  cancel-in-progress: false
 
 jobs:
   route:
@@ -39,6 +43,7 @@ jobs:
 
       - run: npm run forge:agent-command
         env:
+          FORGE_AGENT_RUN_LOG_GIT_COMMIT: "1"
           GITHUB_BOT_LOGIN: github-actions[bot]
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_TOKEN: ${{ github.token }}
