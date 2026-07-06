@@ -443,22 +443,22 @@ describe('task page Workforce beta presentation helpers', () => {
     })
   })
 
-  it('requires a human-written comment for critical security trade-offs', () => {
+  it.each(['high', 'critical'])('requires a human-written comment for %s security trade-offs', (severity) => {
     expect(reviewDecisionSuggestionFromArtifact({
       gateType: 'security_review',
       securityPayload: {
         findings: [{
           confidence: 'high',
-          description: 'Critical command injection path.',
-          key: 'critical-1',
+          description: `${severity} command injection path.`,
+          key: `${severity}-1`,
           location: 'web/api.ts',
           recommendation: 'Block untrusted shell input.',
-          severity: 'critical',
+          severity,
           status: '',
           title: 'Command injection',
         }],
         state: 'findings',
-        summary: 'Critical issue.',
+        summary: `${severity} issue.`,
       },
       sourceArtifact: null,
     })).toEqual({

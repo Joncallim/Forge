@@ -17,6 +17,10 @@ import {
   type RepositoryEvidenceTask,
   type RepositoryEvidenceWorkPackage,
 } from '@/worker/repository-evidence'
+import {
+  isHostRepositoryWritesEnabled,
+  isRepositoryWritePackage,
+} from '@/worker/repository-edit-policy'
 
 const execFile = promisify(execFileCallback)
 let tempRoot = ''
@@ -138,7 +142,7 @@ describe('repository execution context', () => {
     })
   })
 
-  it('allows local repository edits by default even when the tree is dirty and has no remote', async () => {
+  it('blocks dirty working trees before local repository edits while ignoring no-remote and branch collision in host-write mode', async () => {
     await initRepo(tempRoot)
     await execFile('git', ['remote', 'remove', 'origin'], { cwd: tempRoot })
     await fs.writeFile(path.join(tempRoot, 'dirty.txt'), 'dirty\n')
@@ -152,11 +156,26 @@ describe('repository execution context', () => {
       workPackage: pkg,
     })
 
-    expect(context.status).toBe('ready')
+    expect(context.status).toBe('blocked')
     expect(context.isDirty).toBe(true)
     expect(context.hasRemote).toBe(false)
     expect(context.branchCollision).toBe(true)
-    expect(context.blockedReason).toBeNull()
+    expect(context.blockedReason).toMatch(/dirty/i)
+
+    await execFile('git', ['add', 'dirty.txt'], { cwd: tempRoot })
+    await execFile('git', ['commit', '-m', 'clean dirty fixture'], { cwd: tempRoot })
+
+    const cleanContext = await buildRepositoryExecutionContext({
+      project: project(tempRoot),
+      task: task(),
+      workPackage: pkg,
+    })
+
+    expect(cleanContext.status).toBe('ready')
+    expect(cleanContext.isDirty).toBe(false)
+    expect(cleanContext.hasRemote).toBe(false)
+    expect(cleanContext.branchCollision).toBe(true)
+    expect(cleanContext.blockedReason).toBeNull()
   })
 
   it('blocks dirty working trees when host repository writes are disabled', async () => {
@@ -334,6 +353,27 @@ describe('repository execution context', () => {
     expect(isRepositoryAffectingWorkPackage(workPackage({ metadata: { repositoryWrites: false } }))).toBe(false)
     expect(isRepositoryAffectingWorkPackage(workPackage({ assignedRole: 'reviewer' }))).toBe(false)
     expect(isRepositoryAffectingWorkPackage(workPackage({ assignedRole: 'security-review' }))).toBe(false)
+  })
+})
+
+describe('repository edit policy', () => {
+  it('recognizes expanded default-on disable values for host repository writes', () => {
+    expect(isHostRepositoryWritesEnabled({})).toBe(true)
+    expect(isHostRepositoryWritesEnabled({ FORGE_HOST_REPOSITORY_WRITES: '1' })).toBe(true)
+    expect(isHostRepositoryWritesEnabled({ FORGE_HOST_REPOSITORY_WRITES: 'true' })).toBe(true)
+    expect(isHostRepositoryWritesEnabled({ FORGE_HOST_REPOSITORY_WRITES: 'off' })).toBe(false)
+    expect(isHostRepositoryWritesEnabled({ FORGE_HOST_REPOSITORY_WRITES: 'no' })).toBe(false)
+    expect(isHostRepositoryWritesEnabled({ FORGE_HOST_REPOSITORY_WRITES: 'disabled' })).toBe(false)
+  })
+
+  it('normalizes display-style review and security roles as non-writing packages', () => {
+    for (const assignedRole of ['Security Reviewer', 'security_review', 'Code Reviewer', 'Review']) {
+      expect(isRepositoryWritePackage({
+        assignedRole,
+        metadata: {},
+        requiredCapabilities: {},
+      })).toBe(false)
+    }
   })
 })
 

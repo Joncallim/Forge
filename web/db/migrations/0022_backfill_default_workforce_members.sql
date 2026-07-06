@@ -1,3 +1,6 @@
+-- Frozen copy of the default teams from web/db/default-workforces.ts at the
+-- time this migration was written. Keep future default-team edits in that
+-- TypeScript source; do not edit this historical migration.
 WITH default_member_roles(slug, agent_type, role_label, preferred_sequence, metadata) AS (
   VALUES
     ('core-delivery', 'architect', 'Workforce supervisor', 1, '{"workforceSupervisor":true,"responsibility":"Manage workflow inside this workforce."}'::jsonb),
@@ -84,3 +87,16 @@ SELECT
   now()
 FROM ordered_members
 ON CONFLICT (workforce_id, agent_config_id) DO NOTHING;
+
+UPDATE workforces
+SET
+  metadata = metadata || '{"defaultMembersSeededByForge":true}'::jsonb,
+  updated_at = now()
+WHERE slug IN (
+  'core-delivery',
+  'product-discovery',
+  'ux-ui-delivery',
+  'backend-api-delivery',
+  'release-deployment',
+  'mcp-setup'
+);

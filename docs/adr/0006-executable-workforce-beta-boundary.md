@@ -24,10 +24,13 @@ edits and a reviewable sandbox copy of every generated file.
 
 - Work-package materialization, handoff, model execution, and local repository
   writes are enabled by default.
-- `FORGE_WORK_PACKAGE_EXECUTION=0` or `false` disables model execution and keeps
-  the handoff-artifact-only path.
-- `FORGE_HOST_REPOSITORY_WRITES=0` or `false` lets package models run but keeps
-  generated files sandbox-only.
+- `FORGE_WORK_PACKAGE_EXECUTION=0`, `false`, `off`, `no`, or `disabled`
+  disables model execution and keeps the handoff-artifact-only path.
+- `FORGE_HOST_REPOSITORY_WRITES=0`, `false`, `off`, `no`, or `disabled` lets
+  package models run but keeps generated files sandbox-only.
+- ACP-backed work-package execution is separately disabled by default. Set
+  `FORGE_ACP_WORK_PACKAGE_EXECUTION=1` only when the operator accepts that ACP
+  adapters are local processes and are not OS-confined by Forge.
 - After Architect plan approval, Forge may execute one eligible specialist work
   package at a time. Parallel specialist execution remains out of scope.
 - Forge may collect bounded read-only host-repository context before a package
@@ -37,16 +40,20 @@ edits and a reviewable sandbox copy of every generated file.
   not give the specialist an unbounded filesystem view.
 - Generated output is first written under the validated project root at
   `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`.
-- After the package execution step, repository-affecting package output is applied to the local
-  project unless host repository writes are explicitly disabled. This is a local
-  file edit, not a branch, commit, pull request, merge, or issue update.
+- After the package execution step, repository-affecting package output is
+  applied to the local project unless host repository writes are explicitly
+  disabled. This is a local file edit, not a branch, commit, pull request,
+  merge, or issue update. Forge blocks this path when the working tree is dirty
+  so generated output does not interleave with operator edits.
 - File writes must use relative paths. Absolute paths, path traversal, `.git`,
   `.forge`, `node_modules`, symlink targets, and local conflict-copy names are
   outside the beta boundary.
 - Package validation requests are limited to the approved validation surface,
   currently `npm test`, `npm run build`, and `npm run lint`. In the beta,
   Forge performs static validation for those command labels against generated
-  sandbox output; it does not run arbitrary package scripts.
+  sandbox output; it does not run arbitrary package scripts. Repository-
+  affecting packages that provide no validation commands fail before host files
+  are applied.
 - Repository evidence commands are limited to read-only Git status/diff
   evidence, redacted, bounded, and audited. Host package-manager validation is
   blocked in repository evidence; package validation remains inside the sandbox.

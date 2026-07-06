@@ -974,8 +974,10 @@ export function reviewDecisionSuggestionFromArtifact(input: {
   securityPayload: SecurityReviewPayload | null
   sourceArtifact: Artifact | null
 }): { reason: string; requiresHumanTradeoff: boolean } {
-  const criticalFinding = input.securityPayload?.findings.some((finding) => finding.severity.toLowerCase() === 'critical') ?? false
-  if (criticalFinding) {
+  const requiresHumanSecurityDecision = input.securityPayload?.findings.some((finding) =>
+    ['critical', 'high'].includes(finding.severity.toLowerCase())
+  ) ?? false
+  if (requiresHumanSecurityDecision) {
     return { reason: '', requiresHumanTradeoff: true }
   }
 
@@ -1258,6 +1260,7 @@ function GateDecisionControls({
   compact?: boolean
 }) {
   const [reason, setReason] = useState(suggestedReason)
+  const [reasonTouched, setReasonTouched] = useState(false)
   const [securityReviewForm, setSecurityReviewForm] = useState<SecurityReviewFormState>(() =>
     defaultSecurityReviewForm(sourceArtifactId),
   )
@@ -1275,8 +1278,9 @@ function GateDecisionControls({
   }, [sourceArtifactId])
 
   useEffect(() => {
-    setReason((current) => current.trim() === '' ? suggestedReason : current)
-  }, [suggestedReason])
+    if (reasonTouched) return
+    setReason(suggestedReason)
+  }, [reasonTouched, suggestedReason])
 
   function updateSecurityReviewForm<K extends keyof SecurityReviewFormState>(
     key: K,
@@ -1317,6 +1321,7 @@ function GateDecisionControls({
         return
       }
       setReason('')
+      setReasonTouched(false)
       await onDecided()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An unexpected error occurred')
@@ -1329,15 +1334,18 @@ function GateDecisionControls({
     <div className={`${compact ? 'mt-3' : 'mt-2'} grid gap-2 rounded-md border border-border bg-muted/20 p-2`}>
       <textarea
         value={reason}
-        onChange={(event) => setReason(event.target.value)}
-        placeholder={requiresHumanTradeoff ? 'Critical issue: write the trade-off decision here' : 'Decision reason'}
+        onChange={(event) => {
+          setReasonTouched(true)
+          setReason(event.target.value)
+        }}
+        placeholder={requiresHumanTradeoff ? 'High or critical issue: write the trade-off decision here' : 'Decision reason'}
         rows={compact ? 3 : 2}
         className="min-h-16 resize-y rounded-md border border-input bg-background px-2 py-1.5 text-xs text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       />
       <p className="text-xs text-muted-foreground">
         {requiresHumanTradeoff
-          ? 'Critical findings need a human-written decision reason because accepting or deferring them means choosing a trade-off.'
-          : 'Forge prefills this from reviewer output when available. Edit it only when the review missed context or needs sharper wording.'}
+          ? 'High and critical findings need a human-written decision reason because accepting or deferring them means choosing a trade-off.'
+          : 'Forge may prefill this from reviewer output when available. Treat it as suggested wording and edit it before deciding.'}
       </p>
       {isSecurityGate && (
         <fieldset className="grid gap-2 rounded-md border border-border bg-background/80 p-2 text-xs">

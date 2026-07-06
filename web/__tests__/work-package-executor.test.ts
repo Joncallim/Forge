@@ -57,6 +57,36 @@ function fixtureSecret(...parts: string[]) {
 }
 
 function context(overrides: Partial<WorkPackageExecutionContext> = {}): WorkPackageExecutionContext {
+  const defaultWorkPackage: WorkPackageExecutionContext['workPackage'] = {
+    id: 'pkg-1',
+    taskId: 'task-1',
+    harnessId: null,
+    assignedRole: 'frontend',
+    title: 'Frontend work package',
+    summary: 'Build the tiny tracker app.',
+    status: 'running',
+    sequence: 1,
+    steps: ['Create app files', 'Add tests and build script'],
+    requiredCapabilities: {},
+    acceptanceCriteria: [],
+    mcpRequirements: [],
+    reviewRequirement: 'both',
+    blockedReason: null,
+    metadata: { repositoryWrites: false },
+    createdAt: now,
+    updatedAt: now,
+  }
+  const workPackage = overrides.workPackage
+    ? {
+      ...defaultWorkPackage,
+      ...overrides.workPackage,
+      metadata: {
+        ...defaultWorkPackage.metadata,
+        ...(overrides.workPackage.metadata ?? {}),
+      },
+    }
+    : defaultWorkPackage
+
   return {
     agentConfig: null,
     validatedProjectRoot: tempRoot,
@@ -91,26 +121,19 @@ function context(overrides: Partial<WorkPackageExecutionContext> = {}): WorkPack
       updatedAt: now,
       completedAt: null,
     },
-    workPackage: {
-      id: 'pkg-1',
-      taskId: 'task-1',
-      harnessId: null,
-      assignedRole: 'frontend',
-      title: 'Frontend work package',
-      summary: 'Build the tiny tracker app.',
-      status: 'running',
-      sequence: 1,
-      steps: ['Create app files', 'Add tests and build script'],
-      requiredCapabilities: {},
-      acceptanceCriteria: [],
-      mcpRequirements: [],
-      reviewRequirement: 'both',
-      blockedReason: null,
-      metadata: {},
-      createdAt: now,
-      updatedAt: now,
-    },
     ...overrides,
+    workPackage,
+  }
+}
+
+function hostWriteContext(overrides: Partial<WorkPackageExecutionContext> = {}): WorkPackageExecutionContext {
+  const base = context(overrides)
+  return {
+    ...base,
+    workPackage: {
+      ...base.workPackage,
+      metadata: { repositoryWrites: true },
+    },
   }
 }
 
@@ -303,7 +326,7 @@ describe('executeWorkPackage', () => {
       }),
     })
 
-    const result = await executeWorkPackage(context())
+    const result = await executeWorkPackage(hostWriteContext())
     const sandbox = path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'attempt-1')
 
     await expect(fs.stat(path.join(sandbox, 'package.json'))).resolves.toBeTruthy()
@@ -1293,13 +1316,53 @@ describe('executeWorkPackage', () => {
       text: JSON.stringify({
         schemaVersion: 1,
         summary: 'Attempt Forge runtime write.',
-        files: [{ path: '.forge/state.json', content: '{}' }],
+        files: [
+          { path: 'package.json', content: '{"scripts":{"build":"node --check src/app.js"}}' },
+          { path: 'src/app.js', content: 'const ok = true\n' },
+          { path: '.forge/state.json', content: '{}' },
+        ],
+        commands: [['npm', 'run', 'build']],
+      }),
+    })
+
+    await expect(executeWorkPackage(hostWriteContext())).rejects.toThrow(/reserved for Forge runtime state/i)
+    await expect(fs.stat(path.join(tempRoot, '.forge', 'state.json'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+  })
+
+  it('normalizes leading dot segments before rejecting Forge runtime host paths', async () => {
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Attempt Forge runtime write with dot segment.',
+        files: [
+          { path: 'package.json', content: '{"scripts":{"build":"node --check src/app.js"}}' },
+          { path: 'src/app.js', content: 'const ok = true\n' },
+          { path: './.forge/state.json', content: '{}' },
+        ],
+        commands: [['npm', 'run', 'build']],
+      }),
+    })
+
+    await expect(executeWorkPackage(hostWriteContext())).rejects.toThrow(/reserved for Forge runtime state/i)
+    await expect(fs.stat(path.join(tempRoot, '.forge', 'state.json'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+  })
+
+  it('does not apply repository-affecting files to the host when validation commands are missing', async () => {
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Missing validation command.',
+        files: [{ path: 'src/app.js', content: 'const changed = true\n' }],
         commands: [],
       }),
     })
 
-    await expect(executeWorkPackage(context())).rejects.toThrow(/reserved for Forge runtime state/i)
-    await expect(fs.stat(path.join(tempRoot, '.forge', 'state.json'))).rejects.toMatchObject({
+    await expect(executeWorkPackage(hostWriteContext())).rejects.toThrow(/did not include validation commands/i)
+    await expect(fs.stat(path.join(tempRoot, 'src', 'app.js'))).rejects.toMatchObject({
       code: 'ENOENT',
     })
   })

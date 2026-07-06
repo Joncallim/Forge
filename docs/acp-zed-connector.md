@@ -71,10 +71,10 @@ When a task uses an ACP provider, Forge:
 Forge uses one adapter process per call. It does not keep a long-lived pool of
 ACP agents.
 
-Executable Workforce packages can use ACP providers. Forge starts the local CLI
-from the package attempt sandbox and applies only the returned execution JSON
-through its own path guards. Keep local CLI accounts and project folders scoped
-to repositories where you are comfortable allowing generated local edits.
+Executable Workforce packages do not use ACP providers by default. ACP adapters
+are local processes and Forge does not OS-confine them to the package attempt
+sandbox. Set `FORGE_ACP_WORK_PACKAGE_EXECUTION=1` only after accepting that
+local process risk for the repositories where Forge runs.
 
 ## Current Limits
 
@@ -82,8 +82,9 @@ to repositories where you are comfortable allowing generated local edits.
 - Forge does not receive detailed token usage from ACP.
 - Tool calls from the underlying coding agent are not exposed as Forge runtime
   MCP grants.
-- ACP package execution relies on the package attempt working directory and
-  Forge's execution JSON path guards; it is not a general live tool grant.
+- ACP package execution is separately opt-in. When enabled, it relies on the
+  package attempt working directory and Forge's execution JSON path guards; it is
+  not an OS sandbox or a general live tool grant.
 - If a runtime does not expose model selection through ACP, Forge stores the
   selected model on the provider record but cannot force the local runtime to
   use it.

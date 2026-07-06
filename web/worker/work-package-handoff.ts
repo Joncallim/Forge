@@ -44,6 +44,7 @@ import {
   type RepositoryExecutionContext,
   type ScopedCommandResult,
 } from './repository-evidence'
+import { defaultOnFeatureFlagEnabled } from './feature-flags'
 import { sanitizeWorkerMessage } from './redaction'
 import { recordTaskLogBestEffort } from './task-logs'
 
@@ -376,8 +377,7 @@ export function isWorkPackageHandoffEnabled(
 export function isWorkPackageExecutionEnabled(
   env: Record<string, string | undefined> = process.env,
 ): boolean {
-  const raw = env.FORGE_WORK_PACKAGE_EXECUTION?.trim().toLowerCase()
-  return raw !== '0' && raw !== 'false'
+  return defaultOnFeatureFlagEnabled(env.FORGE_WORK_PACKAGE_EXECUTION)
 }
 
 function staleRunningPackageSeconds(

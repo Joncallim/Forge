@@ -35,9 +35,10 @@ back through the same provider interface used by the worker. The currently wired
 Agent Client Protocol adapters wrap local tools such as Codex CLI and Claude
 Code; the underlying CLI must already be installed, authenticated, and runnable
 on the worker host. Architect ACP calls run in an isolated runtime directory.
-Executable work-package ACP calls run from the package attempt sandbox, and
-Forge applies only the returned execution JSON through its own path guards. See
-[ACP and the Zed connector](acp-zed-connector.md).
+Executable work-package ACP calls are disabled by default because ACP adapters
+are local processes, not OS-confined sandboxes. Operators can opt in with
+`FORGE_ACP_WORK_PACKAGE_EXECUTION=1` after accepting that risk. See [ACP and the
+Zed connector](acp-zed-connector.md).
 
 ## Local Development
 
@@ -152,8 +153,9 @@ Feature flag defaults:
 |---|---|---|
 | `FORGE_WORKFORCE_MATERIALIZATION` | enabled | Set `0` or `false` to skip durable work-package/gate records. |
 | `FORGE_WORK_PACKAGE_HANDOFF` | enabled | Set `0` or `false` to stop package handoff claims. |
-| `FORGE_WORK_PACKAGE_EXECUTION` | enabled | Set `0` or `false` to stop specialist package execution and create handoff artifacts only. |
-| `FORGE_HOST_REPOSITORY_WRITES` | enabled | Set `0` or `false` to keep generated files sandbox-only and skip local project edits. |
+| `FORGE_WORK_PACKAGE_EXECUTION` | enabled | Set `0`, `false`, `off`, `no`, or `disabled` to stop specialist package execution and create handoff artifacts only. |
+| `FORGE_HOST_REPOSITORY_WRITES` | enabled | Set `0`, `false`, `off`, `no`, or `disabled` to keep generated files sandbox-only and skip local project edits. |
+| `FORGE_ACP_WORK_PACKAGE_EXECUTION` | disabled | Set `1`, `true`, `on`, `yes`, or `enabled` only when local ACP package execution is an accepted operator risk. |
 | `FORGE_RUNNING_WORK_PACKAGE_STALE_SECONDS` | `900` | Recovery window before a retry marks an interrupted running work package blocked and starts the next eligible attempt. |
 
 ### Executable Workforce Beta
@@ -182,8 +184,14 @@ When execution is enabled:
    `npm run lint`. In the beta, Forge performs static validation of the
    generated sandbox output for those command labels, including script safety,
    placeholder checks, and JavaScript syntax checks; it does not run arbitrary
-   package scripts.
-8. Package artifacts record the generated file list, sandbox path, command
+   package scripts. Repository-affecting packages must include at least one
+   validation command before Forge applies generated files to the host
+   repository.
+8. If host repository writes are enabled, Forge applies generated files only
+   after sandbox validation passes and the host working tree is clean. Forge
+   writes each file through a temporary sibling file and atomic rename; a
+   mid-batch failure records which paths were already written in the error.
+9. Package artifacts record the generated file list, sandbox path, command
    results, model/provider snapshot, and review source artifact.
 
 Operators and reviewers can inspect:

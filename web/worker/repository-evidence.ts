@@ -313,10 +313,14 @@ export async function buildRepositoryExecutionContext(input: {
 
   const hostRepositoryWritesEnabled = isHostRepositoryWritesEnabled()
   let blockedReason: string | null = null
-  if (!hostRepositoryWritesEnabled) {
-    if (isDirty) blockedReason = 'Repository working tree is dirty; review or clean local changes before execution.'
-    else if (!hasRemote) blockedReason = 'Repository has no configured Git remote.'
-    else if (branchCollision) blockedReason = `Intended task branch already exists: ${intendedTaskBranch}`
+  if (isDirty) {
+    blockedReason = hostRepositoryWritesEnabled
+      ? 'Repository working tree is dirty; clean or commit local changes before Forge applies generated files to the host repository.'
+      : 'Repository working tree is dirty; review or clean local changes before execution.'
+  } else if (!hostRepositoryWritesEnabled && !hasRemote) {
+    blockedReason = 'Repository has no configured Git remote.'
+  } else if (!hostRepositoryWritesEnabled && branchCollision) {
+    blockedReason = `Intended task branch already exists: ${intendedTaskBranch}`
   }
 
   return {

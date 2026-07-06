@@ -1,3 +1,5 @@
+import { defaultOnFeatureFlagEnabled } from './feature-flags'
+
 export type RepositoryWritePolicyWorkPackage = {
   assignedRole: string
   metadata: Record<string, unknown>
@@ -11,26 +13,28 @@ const HOST_REPOSITORY_WRITE_EXEMPT_ROLES = new Set([
   'reviewer',
   'security',
   'security-review',
-  'security_review',
+  'security-reviewer',
+  'code-reviewer',
 ])
 
-function featureFlagDisabled(value: string | undefined): boolean {
-  const normalized = value?.trim().toLowerCase()
-  return normalized === '0' || normalized === 'false'
+function canonicalRoleSlug(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s_]+/g, '-')
 }
 
 export function isHostRepositoryWritesEnabled(
   env: Record<string, string | undefined> = process.env,
 ): boolean {
-  return !featureFlagDisabled(env.FORGE_HOST_REPOSITORY_WRITES ?? env.FORGE_REPOSITORY_EDITS)
+  return defaultOnFeatureFlagEnabled(env.FORGE_HOST_REPOSITORY_WRITES ?? env.FORGE_REPOSITORY_EDITS)
 }
 
 export function isRepositoryWritePackage(workPackage: RepositoryWritePolicyWorkPackage): boolean {
-  const assignedRole = workPackage.assignedRole.trim().toLowerCase()
+  const assignedRole = canonicalRoleSlug(workPackage.assignedRole)
   if (HOST_REPOSITORY_WRITE_EXEMPT_ROLES.has(assignedRole)) return false
   if (workPackage.metadata.repositoryWrites === false) return false
   if (workPackage.metadata.repositoryAffecting === false) return false
   if (workPackage.requiredCapabilities.repository === false) return false
+  // Delivery and user-defined roles write by default; review/security/planning
+  // roles must be explicitly exempt above or opt out through package metadata.
   return true
 }
 

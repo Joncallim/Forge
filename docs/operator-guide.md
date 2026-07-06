@@ -154,8 +154,10 @@ For the currently wired ACP adapters:
 - The local CLI must already be installed and logged in.
 - The Forge project must have a local folder so Forge can validate and bound
   repository context. Architect planning uses an isolated runtime directory;
-  executable work-package ACP sessions run from the package attempt sandbox.
-  Forge applies only the returned execution JSON through its own path guards.
+  executable work-package ACP sessions are disabled by default because local ACP
+  adapters are not OS-confined by Forge. Set
+  `FORGE_ACP_WORK_PACKAGE_EXECUTION=1` only for repositories where that local
+  process access is acceptable.
 - Installing the Zed editor is not required; Forge uses Agent Client Protocol
   adapter packages, not the editor itself.
 
@@ -206,9 +208,10 @@ npm run test:providers -- --provider "Provider Name"
 
 Workforce materialization, handoff, package execution, and local repository
 writes are default-on. To keep the older handoff-artifact-only behavior, set
-this in the worker environment. If `FORGE_EMBED_WORKER` is enabled, that is the
-web process because it hosts the worker loop; in split deployments, do not set
-it on the web-only process.
+one of the disable values (`0`, `false`, `off`, `no`, or `disabled`) in the
+worker environment. If `FORGE_EMBED_WORKER` is enabled, that is the web process
+because it hosts the worker loop; in split deployments, do not set it on the
+web-only process.
 
 ```bash
 FORGE_WORK_PACKAGE_EXECUTION=0
@@ -312,8 +315,9 @@ Worker and workspace options:
 | `FORGE_PROMPT_UPGRADE_MODE` | `keep` or `overwrite` local workspace prompts during install/upgrade |
 | `FORGE_WORKFORCE_MATERIALIZATION` | Set `0` or `false` to disable default Workforce record materialization |
 | `FORGE_WORK_PACKAGE_HANDOFF` | Set `0` or `false` to disable default work-package handoff claims |
-| `FORGE_WORK_PACKAGE_EXECUTION` | Set `0` or `false` to disable default package execution and create handoff artifacts only |
-| `FORGE_HOST_REPOSITORY_WRITES` | Set `0` or `false` to keep generated files sandbox-only and skip local project edits |
+| `FORGE_WORK_PACKAGE_EXECUTION` | Set `0`, `false`, `off`, `no`, or `disabled` to disable default package execution and create handoff artifacts only |
+| `FORGE_HOST_REPOSITORY_WRITES` | Set `0`, `false`, `off`, `no`, or `disabled` to keep generated files sandbox-only and skip local project edits |
+| `FORGE_ACP_WORK_PACKAGE_EXECUTION` | Set `1`, `true`, `on`, `yes`, or `enabled` only when local ACP package execution is an accepted operator risk |
 | `FORGE_RUNNING_WORK_PACKAGE_STALE_SECONDS` | Defaults to `900`; retry handoff treats older running package rows as interrupted and recovers them before continuing |
 | `FORGE_WORKSPACE_ROOT` | Fixed workspace root override |
 | `FORGE_MCPS_ROOT` | Fixed shared MCP root override |
