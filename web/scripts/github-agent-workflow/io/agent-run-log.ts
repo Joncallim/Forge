@@ -309,11 +309,12 @@ export function runLogPathForDisplay(issueNumber: number, runId: RunId): string 
   return path.posix.join('.forge', 'runs', String(record.issueNumber), `${record.runId}.json`)
 }
 
-async function git(repositoryRootPath: string, args: readonly string[]): Promise<void> {
-  await execFile('git', args, {
+async function git(repositoryRootPath: string, args: readonly string[]): Promise<{ stdout: string }> {
+  const { stdout } = await execFile('git', args, {
     cwd: repositoryRootPath,
     timeout: 120_000,
   })
+  return { stdout: stdout.toString() }
 }
 
 export async function persistRunRecordToGit(input: PersistRunRecordInput): Promise<void> {
@@ -325,6 +326,10 @@ export async function persistRunRecordToGit(input: PersistRunRecordInput): Promi
 
   await git(root, ['config', 'user.name', 'github-actions[bot]'])
   await git(root, ['config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'])
+  const branchName = (await git(root, ['branch', '--show-current'])).stdout.trim()
+  if (branchName === '') {
+    throw new Error('Run log git persistence requires a checked-out branch.')
+  }
   await git(root, ['add', '--', relativePath])
 
   try {
@@ -335,5 +340,6 @@ export async function persistRunRecordToGit(input: PersistRunRecordInput): Promi
   }
 
   await git(root, ['commit', '-m', `Record Forge agent run ${input.record.runId}`, '--', relativePath])
-  await git(root, ['push'])
+  await git(root, ['pull', '--rebase', 'origin', branchName])
+  await git(root, ['push', 'origin', `HEAD:${branchName}`])
 }

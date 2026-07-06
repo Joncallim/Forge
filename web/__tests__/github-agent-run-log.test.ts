@@ -1,6 +1,8 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { execFile as execFileCallback } from 'node:child_process'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { promisify } from 'node:util'
 import { afterEach, describe, expect, it } from 'vitest'
 import { agentRunRecordSchema } from '@/scripts/github-agent-workflow/contracts/agent-run-record'
 import { runIdSchema } from '@/scripts/github-agent-workflow/contracts/common'
@@ -10,6 +12,7 @@ import {
   FileAgentRunRecorder,
   findLatestRunForIssue,
   linkPullRequest,
+  persistRunRecordToGit,
   recordBlockedReason,
   recordRequested,
   updateRunStatus,
@@ -29,6 +32,7 @@ const READY_ISSUE: GitHubIssue = {
 }
 
 const tempRoots: string[] = []
+const execFile = promisify(execFileCallback)
 
 async function tempRepositoryRoot(): Promise<string> {
   const root = await mkdtemp(path.join(os.tmpdir(), 'forge-run-log-'))
@@ -42,6 +46,26 @@ function runPath(root: string, issueNumber = 146, runId = 'issue-146-1234567890-
 
 async function readRun(root: string, issueNumber = 146, runId = 'issue-146-1234567890-1') {
   return agentRunRecordSchema.parse(JSON.parse(await readFile(runPath(root, issueNumber, runId), 'utf8')))
+}
+
+async function git(cwd: string, args: readonly string[]): Promise<string> {
+  const { stdout } = await execFile('git', args, { cwd })
+  return stdout.toString()
+}
+
+async function gitExitCode(cwd: string, args: readonly string[]): Promise<number> {
+  try {
+    await execFile('git', args, { cwd })
+    return 0
+  } catch (error) {
+    const code = (error as { code?: unknown }).code
+    return typeof code === 'number' ? code : 1
+  }
+}
+
+async function configureGitUser(cwd: string): Promise<void> {
+  await git(cwd, ['config', 'user.name', 'Forge Test'])
+  await git(cwd, ['config', 'user.email', 'forge-test@example.com'])
 }
 
 afterEach(async () => {
@@ -129,6 +153,25 @@ describe('agent run log contracts', () => {
     })
 
     expect(withTokenUsage.success).toBe(false)
+  })
+})
+
+describe('agent run log git visibility', () => {
+  it('keeps nested handoff JSON ignored while run records remain visible', async () => {
+    const root = path.resolve(process.cwd(), '..')
+
+    expect(await gitExitCode(
+      root,
+      ['check-ignore', '--quiet', '--no-index', '.forge/runs/146/issue-146-1234567890-1.json'],
+    )).toBe(1)
+    expect(await gitExitCode(
+      root,
+      ['check-ignore', '--quiet', '--no-index', '.forge/runs/146/issue-146-1234567890-1/metadata.json'],
+    )).toBe(0)
+    expect(await gitExitCode(
+      root,
+      ['check-ignore', '--quiet', '--no-index', '.forge/runs/146/prompt.md'],
+    )).toBe(0)
   })
 })
 
@@ -320,6 +363,64 @@ describe('agent run log storage', () => {
     })
     expect((await client.getIssue(146)).labels).not.toContain('agent-requested')
     expect(await client.listComments(146)).toEqual([])
+  })
+
+  it('rebases before pushing a run record from a stale checkout', async () => {
+    const root = await tempRepositoryRoot()
+    const origin = path.join(root, 'origin.git')
+    const seed = path.join(root, 'seed')
+    const stale = path.join(root, 'stale')
+
+    await git(root, ['init', '--bare', origin])
+    await mkdir(seed)
+    await git(seed, ['init', '-b', 'main'])
+    await configureGitUser(seed)
+    await writeFile(path.join(seed, 'README.md'), '# Forge run log test\n', 'utf8')
+    await git(seed, ['add', 'README.md'])
+    await git(seed, ['commit', '-m', 'Initial commit'])
+    await git(seed, ['remote', 'add', 'origin', origin])
+    await git(seed, ['push', '-u', 'origin', 'main'])
+
+    await git(root, ['clone', origin, stale])
+
+    await mkdir(path.join(seed, '.forge', 'runs', '200'), { recursive: true })
+    await writeFile(path.join(seed, '.forge', 'runs', '200', 'issue-200-1234567890-1.json'), '{}\n', 'utf8')
+    await git(seed, ['add', '.forge/runs/200/issue-200-1234567890-1.json'])
+    await git(seed, ['commit', '-m', 'Record earlier run'])
+    await git(seed, ['push'])
+
+    await recordRequested({
+      runId: 'issue-146-1234567892-1',
+      issueNumber: 146,
+      issueTitle: READY_ISSUE.title,
+      runtime: 'codex',
+      action: 'implement',
+      requestedBy: 'Joncallim',
+      source: { type: 'issue_comment', commentId: 106 },
+    }, {
+      repositoryRoot: stale,
+      persistRecord: persistRunRecordToGit,
+      now: new Date('2026-07-06T01:00:00.000Z'),
+    })
+
+    const earlierRun = await git(root, [
+      '--git-dir',
+      origin,
+      'show',
+      'main:.forge/runs/200/issue-200-1234567890-1.json',
+    ])
+    const persistedRun = await git(root, [
+      '--git-dir',
+      origin,
+      'show',
+      'main:.forge/runs/146/issue-146-1234567892-1.json',
+    ])
+
+    expect(earlierRun).toBe('{}\n')
+    expect(JSON.parse(persistedRun)).toMatchObject({
+      runId: 'issue-146-1234567892-1',
+      status: 'requested',
+    })
   })
 
   it('redacts secret-shaped values and truncates transcript-shaped event messages', async () => {

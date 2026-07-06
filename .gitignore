@@ -3,7 +3,7 @@
 !.forge/runs/
 .forge/runs/**
 !.forge/runs/**/
-!.forge/runs/**/*.json
+!.forge/runs/*/*.json
 local-memory/
 
 # Local agent worktrees (scratch checkouts created during development)
