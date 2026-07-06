@@ -100,9 +100,8 @@ function hasLabel(issue: GitHubIssue, label: string): boolean {
   return issue.labels.some((issueLabel) => issueLabel.trim().toLowerCase() === normalized)
 }
 
-function isPlausibleCommandAttempt(normalizedText: string, commandText: string, recognized: boolean): boolean {
+function isPlausibleCommandAttempt(commandText: string, recognized: boolean): boolean {
   if (recognized) return true
-  if (normalizedText.startsWith('/') || normalizedText.startsWith('@')) return true
   const firstToken = commandText.split(/\s+/)[0] ?? ''
   return PLAUSIBLE_COMMAND_PREFIXES.includes(firstToken)
 }
@@ -143,7 +142,13 @@ async function rejectionFor(command: AgentCommand, issue: GitHubIssue, client: G
     return 'Implementation requests require the `ready-for-agent` label. Complete issue intake validation before asking an agent to implement.'
   }
 
-  const permission = await client.getCollaboratorPermission(command.requestedBy)
+  let permission: Awaited<ReturnType<GitHubClient['getCollaboratorPermission']>>
+  try {
+    permission = await client.getCollaboratorPermission(command.requestedBy)
+  } catch {
+    return 'Implementation requests require repository write access, but Forge could not verify this commenter\'s repository permission. Ask a maintainer to check the workflow token permissions or request agent work.'
+  }
+
   if (!WRITE_LEVEL_PERMISSIONS.has(permission)) {
     return 'Implementation requests require repository write access. Ask a maintainer with write, maintain, or admin permission to request agent work.'
   }
@@ -219,7 +224,7 @@ export async function runAgentCommand(input: {
     requestedBy: input.comment.authorLogin,
   })
   const lookupText = commandLookupText(parsed.normalizedText)
-  if (!isPlausibleCommandAttempt(parsed.normalizedText, lookupText, parsed.recognized)) {
+  if (!isPlausibleCommandAttempt(lookupText, parsed.recognized)) {
     return {
       command: parsed,
       ignored: true,

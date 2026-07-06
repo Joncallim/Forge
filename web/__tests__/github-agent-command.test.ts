@@ -29,6 +29,12 @@ class CollectingRunRecorder implements AgentCommandRunRecorder {
   }
 }
 
+class PermissionFailureClient extends FakeGitHubClient {
+  async getCollaboratorPermission(): Promise<GitHubCollaboratorPermission> {
+    throw new Error('GitHub API returned 403 for collaborator permission.')
+  }
+}
+
 function seedClient(
   issue: GitHubIssue,
   collaboratorPermissions: Record<string, GitHubCollaboratorPermission> = { Joncallim: 'write' },
@@ -166,6 +172,27 @@ describe('GitHub agent command routing', () => {
     expect(recorder.records).toEqual([])
   })
 
+  it('rejects cleanly when repository permission lookup fails', async () => {
+    const client = new PermissionFailureClient({ issues: [READY_ISSUE] })
+    const recorder = new CollectingRunRecorder()
+
+    const result = await runAgentCommand({
+      client,
+      issue: READY_ISSUE,
+      comment: { id: 116, body: 'codex implement', authorLogin: 'Joncallim' },
+      botLogin: 'github-actions[bot]',
+      recorder,
+      githubRunId: 1234567895,
+      githubRunAttempt: 1,
+    })
+
+    expect(result.command.accepted).toBe(false)
+    expect(result.command.rejectionReason).toContain('could not verify')
+    expect((await client.getIssue(143)).labels).not.toContain('agent-requested')
+    expect((await client.listComments(143))[0]?.body).toContain('could not verify')
+    expect(recorder.records).toEqual([])
+  })
+
   it('ignores pull request comments using the GitHub event shape', async () => {
     const client = seedClient(READY_ISSUE)
     const recorder = new CollectingRunRecorder()
@@ -174,11 +201,11 @@ describe('GitHub agent command routing', () => {
       client,
       event: {
         issue: { number: 143, pull_request: { url: 'https://api.github.com/repos/Joncallim/Forge/pulls/143' } },
-        comment: { id: 116, body: 'codex implement', user: { login: 'Joncallim' } },
+        comment: { id: 117, body: 'codex implement', user: { login: 'Joncallim' } },
       },
       botLogin: 'github-actions[bot]',
       recorder,
-      githubRunId: 1234567895,
+      githubRunId: 1234567896,
       githubRunAttempt: 1,
     })
 
@@ -199,11 +226,11 @@ describe('GitHub agent command routing', () => {
       client,
       event: {
         issue: { number: 143 },
-        comment: { id: 117, body: '<!-- forge-agent-command -->\n\nAgent request accepted.', user: { login: 'github-actions[bot]' } },
+        comment: { id: 118, body: '<!-- forge-agent-command -->\n\nAgent request accepted.', user: { login: 'github-actions[bot]' } },
       },
       botLogin: 'github-actions[bot]',
       recorder,
-      githubRunId: 1234567896,
+      githubRunId: 1234567897,
       githubRunAttempt: 1,
     })
 
@@ -222,9 +249,9 @@ describe('GitHub agent command routing', () => {
     const result = await runAgentCommand({
       client,
       issue: READY_ISSUE,
-      comment: { id: 118, body: 'codex implement now', authorLogin: 'Joncallim' },
+      comment: { id: 119, body: 'codex implement now', authorLogin: 'Joncallim' },
       botLogin: 'github-actions[bot]',
-      githubRunId: 1234567897,
+      githubRunId: 1234567898,
       githubRunAttempt: 1,
     })
 
@@ -248,7 +275,7 @@ describe('GitHub agent command routing', () => {
   ] as const)('recognizes the MVP command phrase "%s"', (body, commandName, runtime, action) => {
     const command = parseAgentCommand({
       issueNumber: 143,
-      commentId: 119,
+      commentId: 120,
       commentBody: body,
       requestedBy: 'Joncallim',
     })
@@ -283,13 +310,41 @@ describe('GitHub agent command routing', () => {
       issue: READY_ISSUE,
       comment: { id: 121, body: 'not a command', authorLogin: 'Joncallim' },
       botLogin: 'github-actions[bot]',
-      githubRunId: 1234567898,
+      githubRunId: 1234567899,
       githubRunAttempt: 1,
     })
 
     expect(result).toEqual({
       command: expect.objectContaining({
         normalizedText: 'not a command',
+        command: 'unknown',
+      }),
+      ignored: true,
+      reason: 'Skipping issue comment because it is not addressed to the agent command router.',
+      commentBody: null,
+      runId: null,
+    })
+    expect(await client.listComments(143)).toEqual([])
+  })
+
+  it.each([
+    '@joncallim please review this',
+    '/cc reviewers',
+  ])('ignores mention or slash-prefixed prose without posting a router comment: %s', async (body) => {
+    const client = seedClient(READY_ISSUE)
+
+    const result = await runAgentCommand({
+      client,
+      issue: READY_ISSUE,
+      comment: { id: 122, body, authorLogin: 'Joncallim' },
+      botLogin: 'github-actions[bot]',
+      githubRunId: 1234567900,
+      githubRunAttempt: 1,
+    })
+
+    expect(result).toEqual({
+      command: expect.objectContaining({
+        normalizedText: body,
         command: 'unknown',
       }),
       ignored: true,
@@ -308,10 +363,10 @@ describe('GitHub agent command routing', () => {
     const result = await runAgentCommand({
       client,
       issue,
-      comment: { id: 122, body: 'claude implement', authorLogin: 'Joncallim' },
+      comment: { id: 123, body: 'claude implement', authorLogin: 'Joncallim' },
       botLogin: 'github-actions[bot]',
       recorder,
-      githubRunId: 1234567899,
+      githubRunId: 1234567901,
       githubRunAttempt: 1,
     })
 
