@@ -10,7 +10,18 @@ permissions:
 
 jobs:
   route:
-    if: ${{ github.event.issue.pull_request == null }}
+    if: >
+      github.event.issue.pull_request == null &&
+      (
+        contains(github.event.comment.body, 'implement') ||
+        contains(github.event.comment.body, 'Implement') ||
+        contains(github.event.comment.body, 'review') ||
+        contains(github.event.comment.body, 'Review') ||
+        contains(github.event.comment.body, 'checkpoint') ||
+        contains(github.event.comment.body, 'Checkpoint') ||
+        contains(github.event.comment.body, 'handoff') ||
+        contains(github.event.comment.body, 'Handoff')
+      )
     runs-on: ubuntu-latest
     defaults:
       run:

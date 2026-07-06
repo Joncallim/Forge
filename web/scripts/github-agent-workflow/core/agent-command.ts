@@ -38,6 +38,12 @@ export type AgentCommandResult = Readonly<{
   ignored: false
   commentBody: string | null
   runId: RunId | null
+}> | Readonly<{
+  command: AgentCommand
+  ignored: true
+  reason: string
+  commentBody: null
+  runId: null
 }>
 
 const RECOGNIZED_COMMANDS: Record<string, ParsedCommandShape> = Object.freeze({
@@ -68,6 +74,9 @@ const RECOGNIZED_COMMANDS: Record<string, ParsedCommandShape> = Object.freeze({
   },
 })
 
+const WRITE_LEVEL_PERMISSIONS = new Set(['admin', 'maintain', 'write'])
+const PLAUSIBLE_COMMAND_PREFIXES = ['claude', 'codex', 'review', 'checkpoint', 'handoff']
+
 function firstNonEmptyLine(text: string): { rawLine: string; normalizedText: string } {
   const rawLine = text.split(/\r?\n/).find((line) => line.trim() !== '') ?? ''
   return {
@@ -76,9 +85,26 @@ function firstNonEmptyLine(text: string): { rawLine: string; normalizedText: str
   }
 }
 
+function commandLookupText(normalizedText: string): string {
+  return normalizedText
+    .replace(/^@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[[A-Za-z]+\])?\s+/, '')
+    .replace(/^\//, '')
+    .trim()
+    .toLowerCase()
+    .replace(/[.!?]$/, '')
+    .trim()
+}
+
 function hasLabel(issue: GitHubIssue, label: string): boolean {
   const normalized = label.trim().toLowerCase()
   return issue.labels.some((issueLabel) => issueLabel.trim().toLowerCase() === normalized)
+}
+
+function isPlausibleCommandAttempt(normalizedText: string, commandText: string, recognized: boolean): boolean {
+  if (recognized) return true
+  if (normalizedText.startsWith('/') || normalizedText.startsWith('@')) return true
+  const firstToken = commandText.split(/\s+/)[0] ?? ''
+  return PLAUSIBLE_COMMAND_PREFIXES.includes(firstToken)
 }
 
 function isImplementationRequest(command: AgentCommand): boolean {
@@ -96,13 +122,17 @@ function intendedAgent(command: AgentCommand): string {
   }
 }
 
-function rejectionFor(command: AgentCommand, issue: GitHubIssue): string | null {
+async function rejectionFor(command: AgentCommand, issue: GitHubIssue, client: GitHubClient): Promise<string | null> {
   if (!command.recognized) {
-    return 'Unknown request phrase. Use one of: `claude implement`, `codex implement`, `review`, `checkpoint`, or `handoff`.'
+    return 'Unknown request phrase. Put one supported command on the first non-empty line: `claude implement`, `codex implement`, `review`, `checkpoint`, or `handoff`. A leading `/` or `@bot` mention is allowed.'
   }
 
   if (!isImplementationRequest(command)) {
     return `The \`${command.command}\` command is recognized, but #143 only records implementation requests. This command will be wired by a later workflow issue.`
+  }
+
+  if (hasLabel(issue, 'agent-requested') || hasLabel(issue, 'agent-running')) {
+    return 'An agent request is already pending or running for this issue, so this router did not create another run record.'
   }
 
   if (hasLabel(issue, 'needs-clarification')) {
@@ -111,6 +141,11 @@ function rejectionFor(command: AgentCommand, issue: GitHubIssue): string | null 
 
   if (!hasLabel(issue, 'ready-for-agent')) {
     return 'Implementation requests require the `ready-for-agent` label. Complete issue intake validation before asking an agent to implement.'
+  }
+
+  const permission = await client.getCollaboratorPermission(command.requestedBy)
+  if (!WRITE_LEVEL_PERMISSIONS.has(permission)) {
+    return 'Implementation requests require repository write access. Ask a maintainer with write, maintain, or admin permission to request agent work.'
   }
 
   return null
@@ -149,7 +184,8 @@ export function parseAgentCommand(input: {
   requestedBy: string
 }): AgentCommand {
   const { rawLine, normalizedText } = firstNonEmptyLine(input.commentBody)
-  const recognized = RECOGNIZED_COMMANDS[normalizedText] ?? null
+  const lookupText = commandLookupText(normalizedText)
+  const recognized = RECOGNIZED_COMMANDS[lookupText] ?? null
 
   return agentCommandSchema.parse({
     issueNumber: input.issueNumber,
@@ -182,7 +218,18 @@ export async function runAgentCommand(input: {
     commentBody: input.comment.body,
     requestedBy: input.comment.authorLogin,
   })
-  const rejectionReason = rejectionFor(parsed, input.issue)
+  const lookupText = commandLookupText(parsed.normalizedText)
+  if (!isPlausibleCommandAttempt(parsed.normalizedText, lookupText, parsed.recognized)) {
+    return {
+      command: parsed,
+      ignored: true,
+      reason: 'Skipping issue comment because it is not addressed to the agent command router.',
+      commentBody: null,
+      runId: null,
+    }
+  }
+
+  const rejectionReason = await rejectionFor(parsed, input.issue, input.client)
   const runId = rejectionReason === null
     ? buildRunId({
         issueNumber: input.issue.number,

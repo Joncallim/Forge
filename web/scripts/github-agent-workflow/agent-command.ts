@@ -64,6 +64,10 @@ function botLoginFromEnv(env: NodeJS.ProcessEnv): string {
   return env.GITHUB_BOT_LOGIN?.trim() || 'github-actions[bot]'
 }
 
+function sameLogin(left: string, right: string): boolean {
+  return left.trim().toLowerCase() === right.trim().toLowerCase()
+}
+
 function shortShaFromEnv(env: NodeJS.ProcessEnv): string | null {
   const sha = env.GITHUB_SHA?.trim() ?? ''
   return /^[0-9a-f]{7,40}$/i.test(sha) ? sha.slice(0, 12).toLowerCase() : null
@@ -87,6 +91,13 @@ export async function runAgentCommandForEvent(input: {
 
   const issueNumber = issueNumberFromEvent(input.event)
   const comment = commentFromEvent(input.event)
+  if (sameLogin(comment.authorLogin, input.botLogin)) {
+    return {
+      ignored: true,
+      reason: 'Skipping self-authored agent command comment.',
+    }
+  }
+
   const issue = await input.client.getIssue(issueNumber)
 
   return await runAgentCommand({
