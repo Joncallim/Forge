@@ -381,7 +381,7 @@ describe('agent run log storage', () => {
     await git(seed, ['remote', 'add', 'origin', origin])
     await git(seed, ['push', '-u', 'origin', 'main'])
 
-    await git(root, ['clone', origin, stale])
+    await git(root, ['clone', '--branch', 'main', origin, stale])
 
     await mkdir(path.join(seed, '.forge', 'runs', '200'), { recursive: true })
     await writeFile(path.join(seed, '.forge', 'runs', '200', 'issue-200-1234567890-1.json'), '{}\n', 'utf8')
