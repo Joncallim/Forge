@@ -29,6 +29,12 @@ class CollectingRunRecorder implements AgentCommandRunRecorder {
   }
 }
 
+class FailingRunRecorder implements AgentCommandRunRecorder {
+  async recordRequested(): Promise<void> {
+    throw new Error('run record write failed')
+  }
+}
+
 class PermissionFailureClient extends FakeGitHubClient {
   async getCollaboratorPermission(): Promise<GitHubCollaboratorPermission> {
     throw new Error('GitHub API returned 403 for collaborator permission.')
@@ -264,20 +270,22 @@ describe('GitHub agent command routing', () => {
   })
 
   it.each([
-    ['claude implement', 'claude implement', 'claude-code', 'implement'],
-    ['Claude implement', 'claude implement', 'claude-code', 'implement'],
-    ['/codex implement.', 'codex implement', 'codex', 'implement'],
-    ['@forge codex implement', 'codex implement', 'codex', 'implement'],
-    ['codex implement', 'codex implement', 'codex', 'implement'],
-    ['review', 'review', null, 'review'],
-    ['checkpoint', 'checkpoint', null, 'checkpoint'],
-    ['handoff', 'handoff', null, 'handoff'],
-  ] as const)('recognizes the MVP command phrase "%s"', (body, commandName, runtime, action) => {
+    ['claude implement', 'claude implement', 'claude-code', 'implement', undefined],
+    ['Claude implement', 'claude implement', 'claude-code', 'implement', undefined],
+    ['/codex implement.', 'codex implement', 'codex', 'implement', undefined],
+    ['@forge codex implement', 'codex implement', 'codex', 'implement', 'forge'],
+    ['@github-actions codex implement', 'codex implement', 'codex', 'implement', 'github-actions[bot]'],
+    ['codex implement', 'codex implement', 'codex', 'implement', undefined],
+    ['review', 'review', null, 'review', undefined],
+    ['checkpoint', 'checkpoint', null, 'checkpoint', undefined],
+    ['handoff', 'handoff', null, 'handoff', undefined],
+  ] as const)('recognizes the MVP command phrase "%s"', (body, commandName, runtime, action, botLogin) => {
     const command = parseAgentCommand({
       issueNumber: 143,
       commentId: 120,
       commentBody: body,
       requestedBy: 'Joncallim',
+      botLogin,
     })
 
     expect(command).toMatchObject({
@@ -327,6 +335,35 @@ describe('GitHub agent command routing', () => {
     expect(await client.listComments(143)).toEqual([])
   })
 
+  it('ignores a command phrase addressed to another GitHub user', async () => {
+    const client = seedClient(READY_ISSUE)
+    const recorder = new CollectingRunRecorder()
+
+    const result = await runAgentCommand({
+      client,
+      issue: READY_ISSUE,
+      comment: { id: 122, body: '@alice codex implement', authorLogin: 'Joncallim' },
+      botLogin: 'github-actions[bot]',
+      recorder,
+      githubRunId: 1234567900,
+      githubRunAttempt: 1,
+    })
+
+    expect(result).toEqual({
+      command: expect.objectContaining({
+        normalizedText: '@alice codex implement',
+        command: 'unknown',
+      }),
+      ignored: true,
+      reason: 'Skipping issue comment because it is not addressed to the agent command router.',
+      commentBody: null,
+      runId: null,
+    })
+    expect((await client.getIssue(143)).labels).not.toContain('agent-requested')
+    expect(await client.listComments(143)).toEqual([])
+    expect(recorder.records).toEqual([])
+  })
+
   it.each([
     '@joncallim please review this',
     '/cc reviewers',
@@ -374,5 +411,22 @@ describe('GitHub agent command routing', () => {
     expect(result.command.rejectionReason).toContain('already pending or running')
     expect((await client.listComments(143))[0]?.body.startsWith(AGENT_COMMAND_MARKER_PREFIX)).toBe(true)
     expect(recorder.records).toEqual([])
+  })
+
+  it('does not mark the issue pending when the run recorder fails', async () => {
+    const client = seedClient(READY_ISSUE)
+
+    await expect(runAgentCommand({
+      client,
+      issue: READY_ISSUE,
+      comment: { id: 124, body: 'codex implement', authorLogin: 'Joncallim' },
+      botLogin: 'github-actions[bot]',
+      recorder: new FailingRunRecorder(),
+      githubRunId: 1234567902,
+      githubRunAttempt: 1,
+    })).rejects.toThrow('run record write failed')
+
+    expect((await client.getIssue(143)).labels).not.toContain('agent-requested')
+    expect(await client.listComments(143)).toEqual([])
   })
 })

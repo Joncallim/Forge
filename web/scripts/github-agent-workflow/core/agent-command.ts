@@ -85,9 +85,26 @@ function firstNonEmptyLine(text: string): { rawLine: string; normalizedText: str
   }
 }
 
-function commandLookupText(normalizedText: string): string {
-  return normalizedText
-    .replace(/^@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[[A-Za-z]+\])?\s+/, '')
+function normalizedMentionAliases(login: string): Set<string> {
+  const normalized = login.trim().toLowerCase()
+  const aliases = new Set<string>()
+  if (normalized !== '') aliases.add(normalized)
+  const withoutBotSuffix = normalized.replace(/\[bot\]$/, '')
+  if (withoutBotSuffix !== '') aliases.add(withoutBotSuffix)
+  return aliases
+}
+
+function stripRouterMention(text: string, botLogin: string | undefined): string {
+  if (!botLogin) return text
+  const mention = text.match(/^@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[[A-Za-z]+\])?)\s+/)
+  if (!mention) return text
+  return normalizedMentionAliases(botLogin).has(mention[1].toLowerCase())
+    ? text.slice(mention[0].length)
+    : text
+}
+
+function commandLookupText(normalizedText: string, botLogin?: string): string {
+  return stripRouterMention(normalizedText, botLogin)
     .replace(/^\//, '')
     .trim()
     .toLowerCase()
@@ -187,9 +204,10 @@ export function parseAgentCommand(input: {
   commentId: number
   commentBody: string
   requestedBy: string
+  botLogin?: string
 }): AgentCommand {
   const { rawLine, normalizedText } = firstNonEmptyLine(input.commentBody)
-  const lookupText = commandLookupText(normalizedText)
+  const lookupText = commandLookupText(normalizedText, input.botLogin)
   const recognized = RECOGNIZED_COMMANDS[lookupText] ?? null
 
   return agentCommandSchema.parse({
@@ -222,8 +240,9 @@ export async function runAgentCommand(input: {
     commentId: input.comment.id,
     commentBody: input.comment.body,
     requestedBy: input.comment.authorLogin,
+    botLogin: input.botLogin,
   })
-  const lookupText = commandLookupText(parsed.normalizedText)
+  const lookupText = commandLookupText(parsed.normalizedText, input.botLogin)
   if (!isPlausibleCommandAttempt(lookupText, parsed.recognized)) {
     return {
       command: parsed,
@@ -253,7 +272,6 @@ export async function runAgentCommand(input: {
     : rejectedComment(command)
 
   if (command.accepted && command.runtime !== null && command.action !== null && runId !== null) {
-    await input.client.addLabel(input.issue.number, 'agent-requested')
     await input.recorder?.recordRequested({
       runId,
       issueNumber: input.issue.number,
@@ -266,6 +284,7 @@ export async function runAgentCommand(input: {
         commentId: command.commentId,
       },
     })
+    await input.client.addLabel(input.issue.number, 'agent-requested')
   }
 
   await input.client.upsertComment(input.issue.number, {
