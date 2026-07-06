@@ -114,6 +114,77 @@ describe('workspace-native storage safeguards', () => {
     }
   })
 
+  it('exports workforce supervisor details to workflow and manager prompt files', async () => {
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-workforce-supervisor-'))
+
+    try {
+      process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+      const { exportWorkforcesToWorkspace } = await import('@/lib/workforce-exports')
+
+      await exportWorkforcesToWorkspace([{
+        id: 'workforce-1',
+        slug: 'core-delivery',
+        displayName: 'Core delivery',
+        description: 'Default delivery team.',
+        isDefault: true,
+        isActive: true,
+        metadata: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        members: [
+          {
+            id: 'member-1',
+            workforceId: 'workforce-1',
+            agentConfigId: 'agent-architect',
+            roleLabel: 'Workforce supervisor',
+            sequence: 1,
+            isRequired: true,
+            metadata: { workforceSupervisor: true },
+            agentType: 'architect',
+            displayName: 'Architect',
+            description: 'Plan and coordinate work.',
+            isActive: true,
+          },
+          {
+            id: 'member-2',
+            workforceId: 'workforce-1',
+            agentConfigId: 'agent-backend',
+            roleLabel: null,
+            sequence: 2,
+            isRequired: true,
+            metadata: {},
+            agentType: 'backend',
+            displayName: 'Backend',
+            description: 'Build server-side changes.',
+            isActive: true,
+          },
+        ],
+      } as never])
+
+      const workflow = JSON.parse(await fs.readFile(
+        path.join(workspaceRoot, 'workforces', 'core-delivery', 'workflow.json'),
+        'utf-8',
+      ))
+      expect(workflow.supervisor).toMatchObject({
+        agentType: 'architect',
+        roleLabel: 'Workforce supervisor',
+        stepId: '1-architect',
+      })
+
+      await expect(
+        fs.readFile(path.join(workspaceRoot, 'workforces', 'core-delivery', 'manager-prompt.md'), 'utf-8'),
+      ).resolves.toContain('Workflow supervisor: Workforce supervisor (architect).')
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
+  })
+
   it('parses escaped TOML strings emitted for workspace agent prompts', async () => {
     const promptRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-toml-parse-'))
 

@@ -5,6 +5,7 @@ import { promisify } from 'node:util'
 import { sanitizeWorkerMessage } from './redaction'
 import { db } from '@/db'
 import { repositoryCommandAudits } from '@/db/schema'
+import { isHostRepositoryWritesEnabled, isRepositoryWritePackage } from './repository-edit-policy'
 
 const execFile = promisify(execFileCallback)
 
@@ -252,10 +253,7 @@ async function remoteHeadBranch(cwd: string): Promise<string | null> {
 }
 
 export function isRepositoryAffectingWorkPackage(workPackage: RepositoryEvidenceWorkPackage): boolean {
-  if (workPackage.metadata.repositoryWrites === false) return false
-  if (workPackage.metadata.repositoryAffecting === false) return false
-  if (workPackage.requiredCapabilities.repository === false) return false
-  return true
+  return isRepositoryWritePackage(workPackage)
 }
 
 export async function buildRepositoryExecutionContext(input: {
@@ -313,10 +311,13 @@ export async function buildRepositoryExecutionContext(input: {
   const remoteCollision = await gitOk(resolvedPath, ['show-ref', '--verify', `refs/remotes/origin/${intendedTaskBranch}`])
   const branchCollision = localCollision || remoteCollision
 
+  const hostRepositoryWritesEnabled = isHostRepositoryWritesEnabled()
   let blockedReason: string | null = null
-  if (isDirty) blockedReason = 'Repository working tree is dirty; review or clean local changes before execution.'
-  else if (!hasRemote) blockedReason = 'Repository has no configured Git remote.'
-  else if (branchCollision) blockedReason = `Intended task branch already exists: ${intendedTaskBranch}`
+  if (!hostRepositoryWritesEnabled) {
+    if (isDirty) blockedReason = 'Repository working tree is dirty; review or clean local changes before execution.'
+    else if (!hasRemote) blockedReason = 'Repository has no configured Git remote.'
+    else if (branchCollision) blockedReason = `Intended task branch already exists: ${intendedTaskBranch}`
+  }
 
   return {
     status: blockedReason ? 'blocked' : 'ready',

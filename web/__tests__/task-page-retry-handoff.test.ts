@@ -20,6 +20,7 @@ import {
   canRetryHandoffForTaskStatus,
   canStopTaskStatus,
   mergeTaskRuns,
+  reviewDecisionSuggestionFromArtifact,
   retryHandoffMessage,
   sandboxOutputsForPackage,
   securityReviewPayloadFromMetadata,
@@ -255,6 +256,8 @@ describe('task page Workforce beta presentation helpers', () => {
       commandCount: 1,
       fileCount: 1,
       files: ['src/app.tsx'],
+      hostRepositoryWritePaths: [],
+      hostRepositoryWrites: false,
       sandboxPath: '/repo/.forge/task-runs/task-1/pkg-1',
       validationStatus: 'passed',
     }])
@@ -419,6 +422,48 @@ describe('task page Workforce beta presentation helpers', () => {
       }],
       state: 'findings',
       summary: 'One critical issue.',
+    })
+  })
+
+  it('prefills review gate comments from reviewer metadata when available', () => {
+    expect(reviewDecisionSuggestionFromArtifact({
+      gateType: 'reviewer_review',
+      securityPayload: null,
+      sourceArtifact: {
+        id: 'artifact-review',
+        agentRunId: 'run-review',
+        artifactType: 'log_output',
+        content: 'Fallback content',
+        metadata: { reviewerComment: 'Use the reviewer finding as the decision reason.' },
+        workPackageId: 'pkg-1',
+      },
+    })).toEqual({
+      reason: 'Use the reviewer finding as the decision reason.',
+      requiresHumanTradeoff: false,
+    })
+  })
+
+  it('requires a human-written comment for critical security trade-offs', () => {
+    expect(reviewDecisionSuggestionFromArtifact({
+      gateType: 'security_review',
+      securityPayload: {
+        findings: [{
+          confidence: 'high',
+          description: 'Critical command injection path.',
+          key: 'critical-1',
+          location: 'web/api.ts',
+          recommendation: 'Block untrusted shell input.',
+          severity: 'critical',
+          status: '',
+          title: 'Command injection',
+        }],
+        state: 'findings',
+        summary: 'Critical issue.',
+      },
+      sourceArtifact: null,
+    })).toEqual({
+      reason: '',
+      requiresHumanTradeoff: true,
     })
   })
 

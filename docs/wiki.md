@@ -13,9 +13,11 @@ the plan Forge produces.
 
 The product goal is an AI software team with a human in charge. The current
 beta is more cautious: Forge plans work, stores evidence, and asks for approval.
-Workforce materialization and handoff records are enabled unless explicitly
-disabled, while generated package execution remains opt-in and sandbox-only
-under `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`.
+Workforce materialization, handoff records, package execution, and local
+repository edits are enabled unless explicitly disabled. Generated package
+output is kept under
+`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`, then
+repository-affecting files are applied to the local project after the package execution step.
 Executable packages may use bounded read-only project context, but Forge is not
 yet a fully autonomous pull-request machine.
 
@@ -63,7 +65,6 @@ Task detail controls now cover the common operator interventions:
 
 Still future work:
 
-- Applying generated edits to the host repository.
 - Creating branches, commits, pull requests, or merges.
 - Granting live MCP tools to specialist agents at runtime.
 - Running specialists in parallel.
@@ -153,9 +154,9 @@ Forge
   -> text streams back into Forge
 ```
 
-ACP is currently for provider calls such as Architect planning. Forge blocks
-ACP-backed executable Workforce packages until local coding CLIs can run behind
-a hard filesystem and tool sandbox.
+ACP is used for provider calls such as Architect planning and executable
+work-package runs. Executable ACP packages run from the package attempt sandbox,
+and Forge applies only the returned execution JSON through its path guards.
 
 You do not need the Zed editor installed for this path. "Zed connector" means
 Forge uses an Agent Client Protocol adapter package as a translator. The

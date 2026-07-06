@@ -377,7 +377,7 @@ export function isWorkPackageExecutionEnabled(
   env: Record<string, string | undefined> = process.env,
 ): boolean {
   const raw = env.FORGE_WORK_PACKAGE_EXECUTION?.trim().toLowerCase()
-  return raw === '1' || raw === 'true'
+  return raw !== '0' && raw !== 'false'
 }
 
 function staleRunningPackageSeconds(
@@ -1300,8 +1300,8 @@ export async function handoffApprovedWorkPackages(
   const handoffArtifactContent = [
     `Forge handed off work package "${nextPackage.title}" to ${nextPackage.assignedRole}.`,
     '',
-    'Repository writes and specialist model execution are disabled for this handoff slice.',
-    'Set FORGE_WORK_PACKAGE_EXECUTION=1 to run sandboxed specialist package execution after approval.',
+    'Specialist model execution is disabled for this handoff slice.',
+    'Unset FORGE_WORK_PACKAGE_EXECUTION=0 or set it to 1/true to run specialist package execution after approval.',
   ].join('\n')
   const handoffArtifactMetadata = {
     hostRepositoryWrites: false,
@@ -1885,7 +1885,6 @@ async function executeReadyWorkPackage(
         title: 'Validation skipped',
         workPackageId: nextPackage.id,
       })
-      throw new Error('Repository-affecting package did not run validation commands; review or revise the execution plan before continuing.')
     }
 
     await assertActiveExecutionLease()
@@ -1964,9 +1963,9 @@ async function executeReadyWorkPackage(
 
     await publishTaskEventBestEffort(taskId, 'work_package:handoff', {
       assignedRole: nextPackage.assignedRole,
-      hostRepositoryWrites: false,
+      hostRepositoryWrites: execution.hostRepositoryWrites,
       harnessId: nextPackage.harnessId,
-      repositoryWrites: false,
+      repositoryWrites: execution.repositoryWrites,
       runId: run.id,
       sandboxPath: execution.sandboxPath,
       sandboxWrites: execution.fileCount > 0,

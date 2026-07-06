@@ -412,11 +412,22 @@ export async function seedAgentConfigs(): Promise<void> {
         members.map((member) => ({
           workforceId,
           agentConfigId: member.agentConfigId,
+          roleLabel: member.roleLabel,
           sequence: member.sequence,
           isRequired: member.isRequired,
+          metadata: member.metadata,
           updatedAt: new Date(),
         })),
       )
+    }
+
+    const workforceHasMembers = async (workforceId: string): Promise<boolean> => {
+      const [member] = await db
+        .select({ id: workforceAgents.id })
+        .from(workforceAgents)
+        .where(eq(workforceAgents.workforceId, workforceId))
+        .limit(1)
+      return Boolean(member)
     }
 
     const values = {
@@ -451,7 +462,17 @@ export async function seedAgentConfigs(): Promise<void> {
       await setMembers(created.id)
       console.log(`[seed-agents]   ✓ ${definition.slug} workforce (${members.length} agent(s))`)
     } else {
-      console.log(`[seed-agents]   • ${definition.slug} workforce exists — preserved`)
+      const [existing] = await db
+        .select({ id: workforces.id })
+        .from(workforces)
+        .where(eq(workforces.slug, definition.slug))
+        .limit(1)
+      if (existing?.id && !await workforceHasMembers(existing.id)) {
+        await setMembers(existing.id)
+        console.log(`[seed-agents]   ✓ ${definition.slug} workforce backfilled (${members.length} agent(s))`)
+      } else {
+        console.log(`[seed-agents]   • ${definition.slug} workforce exists — preserved`)
+      }
     }
   }
 

@@ -8,16 +8,14 @@ workforce that can plan, build, test, review, and prepare pull requests while a
 human stays in control of the important decisions.
 
 Today, Forge is an Orchestrator-stage beta. In the default path, Forge plans
-work and waits for your approval. Workforce materialization and handoff records
-are enabled unless explicitly disabled, so Architect completion can create
-durable work packages and review gates before the task reaches
-`awaiting_approval`; approval releases ready packages for handoff. Actual
-generated package execution is still opt-in, receives bounded read-only project
-context, writes only inside
-per-package attempt sandboxes under `.forge/task-runs`, and stays behind manual
-QA, Reviewer, and Security gates. It does not yet apply those edits to your host
-repository, make commits, open pull requests, merge code, or run specialists in
-parallel.
+work and waits for your approval. Workforce materialization, handoff, specialist
+package execution, and local repository edits are enabled unless explicitly
+disabled. Architect completion can create durable work packages and review
+gates before the task reaches `awaiting_approval`; approval releases ready
+packages for execution. Forge keeps generated files in per-package attempt
+sandboxes under `.forge/task-runs` and, after the package execution step, applies
+repository-affecting output to the local project. It still does not make
+commits, open pull requests, merge code, or run specialists in parallel.
 
 ## What Forge Does Today
 
@@ -28,7 +26,8 @@ parallel.
 5. Forge saves the plan and shows it in the dashboard.
 6. You approve, reject, or revise the plan.
 7. If Workforce records exist, approval releases ready work packages for
-   handoff, broker checks, optional sandbox execution, and manual review gates.
+   handoff, broker checks, package execution, local file edits, and manual
+   review gates.
 
 Under the hood, Forge runs a web app, PostgreSQL, Redis, and a worker process.
 For normal local use, the worker starts inside the web app, so one command starts
@@ -122,7 +121,6 @@ FORGE_WORKER_MOCK_ARCHITECT=1 npm run dev
 
 ## What Is Not Built Yet
 
-- Applying generated edits to the project repository.
 - MCP runtime grants for specialists.
 - Branch, commit, pull request, and merge automation.
 - Parallel specialist execution.
@@ -135,10 +133,11 @@ FORGE_WORKER_MOCK_ARCHITECT=1 npm run dev
 The first Workforce build slice is present as durable planning records:
 work packages, harness metadata, approval gates, and VCS summaries can now be
 stored and displayed. Architect completion materializes those records before
-plan approval; approval releases ready packages. Workforce materialization and
-handoff are default-on and can be disabled with `FORGE_WORKFORCE_MATERIALIZATION=0` or
-`FORGE_WORK_PACKAGE_HANDOFF=0`. Sandbox package execution remains opt-in with
-`FORGE_WORK_PACKAGE_EXECUTION=1`.
+plan approval; approval releases ready packages. Workforce materialization,
+handoff, package execution, and local repository writes are default-on. Disable
+them with `FORGE_WORKFORCE_MATERIALIZATION=0`,
+`FORGE_WORK_PACKAGE_HANDOFF=0`, `FORGE_WORK_PACKAGE_EXECUTION=0`, or
+`FORGE_HOST_REPOSITORY_WRITES=0`.
 
 ## Forge Workspace Direction
 

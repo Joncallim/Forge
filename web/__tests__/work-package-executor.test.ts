@@ -307,11 +307,16 @@ describe('executeWorkPackage', () => {
     const sandbox = path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'attempt-1')
 
     await expect(fs.stat(path.join(sandbox, 'package.json'))).resolves.toBeTruthy()
+    await expect(fs.readFile(path.join(tempRoot, 'package.json'), 'utf8')).resolves.toContain('node --test')
     expect(result.sandboxPath).toBe(sandbox)
+    expect(result.hostRepositoryWrites).toBe(true)
+    expect(result.repositoryWrites).toBe(true)
+    expect(result.hostRepositoryWritePaths).toEqual(['package.json', 'build-check.js', 'index.test.js'])
     expect(result.commandResults.map((item) => item.exitCode)).toEqual([0, 0])
     expect(result.artifactMetadata).toMatchObject({
-      hostRepositoryWrites: false,
-      repositoryWrites: false,
+      hostRepositoryWritePaths: ['package.json', 'build-check.js', 'index.test.js'],
+      hostRepositoryWrites: true,
+      repositoryWrites: true,
       sandboxPath: sandbox,
       sandboxWrites: true,
     })
@@ -353,6 +358,36 @@ describe('executeWorkPackage', () => {
     expect(mocks.recordTaskLogBestEffort).not.toHaveBeenCalledWith(expect.objectContaining({
       eventType: 'mcp.filesystem.context_issued',
     }))
+  })
+
+  it('keeps generated files sandbox-only when host repository writes are disabled', async () => {
+    const previous = process.env.FORGE_HOST_REPOSITORY_WRITES
+    process.env.FORGE_HOST_REPOSITORY_WRITES = '0'
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Sandbox only.',
+        files: [{ path: 'package.json', content: '{}' }],
+        commands: [],
+      }),
+    })
+
+    try {
+      const result = await executeWorkPackage(context())
+      const sandbox = path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'attempt-1')
+
+      await expect(fs.stat(path.join(sandbox, 'package.json'))).resolves.toBeTruthy()
+      await expect(fs.stat(path.join(tempRoot, 'package.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(result.artifactMetadata).toMatchObject({
+        hostRepositoryWritePaths: [],
+        hostRepositoryWrites: false,
+        repositoryWrites: false,
+        sandboxWrites: true,
+      })
+    } finally {
+      if (previous === undefined) delete process.env.FORGE_HOST_REPOSITORY_WRITES
+      else process.env.FORGE_HOST_REPOSITORY_WRITES = previous
+    }
   })
 
   it('includes package MCP overlay, requirements, and subtasks in the execution prompt only as run-scoped instructions', async () => {
@@ -1251,6 +1286,22 @@ describe('executeWorkPackage', () => {
     await expect(executeWorkPackage(context())).rejects.toThrow(/conflict-copy/i)
     await expect(fs.stat(path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'attempt-1', 'src', 'app 2.ts')))
       .rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('refuses to apply generated files into Forge runtime paths on the host repository', async () => {
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Attempt Forge runtime write.',
+        files: [{ path: '.forge/state.json', content: '{}' }],
+        commands: [],
+      }),
+    })
+
+    await expect(executeWorkPackage(context())).rejects.toThrow(/reserved for Forge runtime state/i)
+    await expect(fs.stat(path.join(tempRoot, '.forge', 'state.json'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
   })
 
   it('includes a bounded redacted host context packet and excludes task-run artifacts from the prompt', async () => {

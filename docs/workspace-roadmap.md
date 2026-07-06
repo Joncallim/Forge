@@ -416,5 +416,5 @@ The recommended sequencing is:
 2. Add the Workspace shell for human context management.
 3. Add Playwright and Notion/GitHub panes.
 4. Let agents request permissioned operations from the workspace context.
-5. Only then expand toward host repository writes, PR automation, and richer
+5. Only then expand toward PR automation, remote repository writes, and richer
    OS-like behavior.

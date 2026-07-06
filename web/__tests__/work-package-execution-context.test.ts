@@ -104,7 +104,7 @@ describe('loadWorkPackageExecutionContext', () => {
     expect(context.validatedProjectRoot).toBe('/workspace/real-project')
   })
 
-  it('rejects ACP-backed executable work packages until a hard sandbox exists', async () => {
+  it('allows ACP-backed executable work packages and defers model construction until the sandbox cwd exists', async () => {
     vi.clearAllMocks()
     const project = { id: 'project-1', localPath: '/workspace/project' }
     const task = { id: 'task-1', projectId: 'project-1', pmProviderConfigId: 'provider-task' }
@@ -115,11 +115,13 @@ describe('loadWorkPackageExecutionContext', () => {
     mocks.getProvider.mockResolvedValue({
       config: { providerType: 'acp', modelId: 'codex-cli::gpt-5.3-codex-spark' },
     })
+    mocks.assertProjectLocalPathForExecution.mockResolvedValue('/workspace/project')
 
-    await expect(loadWorkPackageExecutionContext('task-1', 'pkg-1'))
-      .rejects.toThrow(/does not execute work packages through ACP/i)
+    const context = await loadWorkPackageExecutionContext('task-1', 'pkg-1')
 
-    expect(mocks.assertProjectLocalPathForExecution).not.toHaveBeenCalled()
+    expect(context.providerConfigId).toBe('provider-task')
+    expect(context.modelIdUsed).toBe('codex-cli::gpt-5.3-codex-spark')
+    expect(mocks.assertProjectLocalPathForExecution).toHaveBeenCalledWith(project)
     expect(mocks.getModel).not.toHaveBeenCalled()
   })
 

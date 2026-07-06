@@ -484,7 +484,8 @@ function artifactShowsDisabledHandoff(artifact: Artifact): boolean {
   const source = metadata ? stringField(metadata, ['source']) : ''
   return (
     (metadata !== null && booleanField(metadata, ['repositoryWrites']) === false && source === 'work-package-handoff') ||
-    artifact.content.includes('Repository writes and specialist model execution are disabled')
+    artifact.content.includes('Repository writes and specialist model execution are disabled') ||
+    artifact.content.includes('Specialist model execution is disabled')
   )
 }
 
@@ -493,6 +494,8 @@ type SandboxOutputSummary = {
   commandCount: number
   fileCount: number
   files: string[]
+  hostRepositoryWritePaths: string[]
+  hostRepositoryWrites: boolean
   sandboxPath: string
   validationStatus: string
 }
@@ -504,6 +507,8 @@ function sandboxOutputFromArtifact(artifact: Artifact): SandboxOutputSummary | n
   const sandboxPath = stringField(metadata, ['sandboxPath', 'sandboxRoot', 'outputPath'])
   const files = stringArrayField(metadata, ['files', 'generatedFiles', 'paths'])
   const generatedBy = stringField(metadata, ['generatedBy'])
+  const hostRepositoryWritePaths = stringArrayField(metadata, ['hostRepositoryWritePaths'])
+  const hostRepositoryWrites = booleanField(metadata, ['hostRepositoryWrites', 'repositoryWrites']) === true
   const commandResults = jsonArrayField(metadata, ['commandResults', 'commands'])
   const fileCount = Math.max(0, numberField(metadata, ['fileCount']) ?? files.length)
   const validationStatus = stringField(metadata, ['validationStatus'])
@@ -515,6 +520,8 @@ function sandboxOutputFromArtifact(artifact: Artifact): SandboxOutputSummary | n
     commandCount: commandResults.length,
     fileCount,
     files,
+    hostRepositoryWritePaths,
+    hostRepositoryWrites,
     sandboxPath,
     validationStatus,
   }
@@ -596,7 +603,7 @@ export function workforceExecutionSummary(input: {
   })
   if (runningPackage || runningImplementationRun) {
     return {
-      detail: 'A package execution run is active. Generated files are sandbox output under .forge/task-runs, not host repository branch, commit, or PR output.',
+      detail: 'A package execution run is active. Forge writes sandbox artifacts first and may apply successful output to the local project.',
       label: 'Running sandbox package',
       mode: 'running_package',
       status: 'running',
@@ -609,7 +616,7 @@ export function workforceExecutionSummary(input: {
   )
   if (sandboxOutputCount > 0) {
     return {
-      detail: `${pluralize(sandboxOutputCount, 'sandbox output')} generated under .forge/task-runs. Review those files and validation artifacts before approving gates.`,
+      detail: `${pluralize(sandboxOutputCount, 'sandbox output')} generated under .forge/task-runs. Review generated files, host-write metadata, and validation artifacts before approving gates.`,
       label: 'Sandbox output generated',
       mode: 'sandbox_output',
       status: 'completed',
@@ -617,8 +624,8 @@ export function workforceExecutionSummary(input: {
   }
 
   return {
-    detail: 'When FORGE_WORK_PACKAGE_EXECUTION=1 is enabled for the worker, ready packages run in an isolated .forge/task-runs sandbox. Without that opt-in, approval creates disabled handoff artifacts.',
-    label: 'Opt-in sandbox execution',
+    detail: 'Ready packages execute by default. Forge keeps generated files under .forge/task-runs and applies successful repository-affecting output to the local project unless host repository writes are disabled.',
+    label: 'Executable packages',
     mode: 'opt_in_sandbox',
     status: 'ready',
   }
@@ -935,6 +942,81 @@ export function securityReviewPayloadFromMetadata(...sources: unknown[]): Securi
   return null
 }
 
+function firstMetadataText(record: WorkforceRecord | null, keys: string[]): string {
+  if (!record) return ''
+  for (const key of keys) {
+    const value = stringField(record, [key])
+    if (value !== '') return value
+  }
+  return ''
+}
+
+function compactReviewText(value: string, maxLength = 900): string {
+  return value.trim().replace(/\s+/g, ' ').slice(0, maxLength)
+}
+
+function reviewFindingsText(record: WorkforceRecord | null): string {
+  if (!record) return ''
+  const findings = jsonArrayField(record, ['findings', 'reviewFindings', 'issues'])
+    .map((finding, index) => {
+      if (typeof finding === 'string') return compactReviewText(finding, 240)
+      if (!isRecord(finding)) return ''
+      const title = stringField(finding, ['title', 'summary', 'message', 'description']) || `Finding ${index + 1}`
+      const recommendation = stringField(finding, ['recommendation', 'requiredFix', 'fix'])
+      return compactReviewText([title, recommendation].filter(Boolean).join(': '), 320)
+    })
+    .filter(Boolean)
+  return findings.length > 0 ? findings.join('\n') : ''
+}
+
+export function reviewDecisionSuggestionFromArtifact(input: {
+  gateType: string
+  securityPayload: SecurityReviewPayload | null
+  sourceArtifact: Artifact | null
+}): { reason: string; requiresHumanTradeoff: boolean } {
+  const criticalFinding = input.securityPayload?.findings.some((finding) => finding.severity.toLowerCase() === 'critical') ?? false
+  if (criticalFinding) {
+    return { reason: '', requiresHumanTradeoff: true }
+  }
+
+  if (input.securityPayload?.findings.length) {
+    const reason = input.securityPayload.findings
+      .map((finding) => compactReviewText(`${finding.title}: ${finding.recommendation || finding.description}`))
+      .filter(Boolean)
+      .join('\n')
+    return { reason, requiresHumanTradeoff: false }
+  }
+
+  if (input.securityPayload?.state === 'no_findings' && input.securityPayload.summary !== '') {
+    return { reason: compactReviewText(input.securityPayload.summary), requiresHumanTradeoff: false }
+  }
+
+  const artifact = input.sourceArtifact
+  const metadata = artifact ? artifactMetadata(artifact) : null
+  const explicit = firstMetadataText(metadata, [
+    'reviewComment',
+    'reviewComments',
+    'reviewerComment',
+    'reviewerComments',
+    'decisionReason',
+    'recommendation',
+    'conclusion',
+    'summary',
+    'notes',
+  ])
+  if (explicit !== '') return { reason: compactReviewText(explicit), requiresHumanTradeoff: false }
+
+  const findings = reviewFindingsText(metadata)
+  if (findings !== '') return { reason: findings, requiresHumanTradeoff: false }
+
+  if (artifact && input.gateType === 'reviewer_review') {
+    const content = compactReviewText(artifact.content)
+    if (content !== '') return { reason: content, requiresHumanTradeoff: false }
+  }
+
+  return { reason: '', requiresHumanTradeoff: false }
+}
+
 function workPackageBrief(pkg: WorkPackage): string {
   const owner = stringField(pkg, ['assignedRole', 'agentType', 'agent', 'role', 'assignee', 'harnessSlug'])
   const harnessName = stringField(pkg, ['harnessDisplayName', 'harnessRole'])
@@ -1160,18 +1242,22 @@ function GateDecisionControls({
   gateType,
   gateId,
   onDecided,
+  requiresHumanTradeoff = false,
   sourceArtifactId,
+  suggestedReason = '',
   taskId,
   compact = false,
 }: {
   gateType: string
   gateId: string
   onDecided: () => Promise<void>
+  requiresHumanTradeoff?: boolean
   sourceArtifactId: string
+  suggestedReason?: string
   taskId: string
   compact?: boolean
 }) {
-  const [reason, setReason] = useState('')
+  const [reason, setReason] = useState(suggestedReason)
   const [securityReviewForm, setSecurityReviewForm] = useState<SecurityReviewFormState>(() =>
     defaultSecurityReviewForm(sourceArtifactId),
   )
@@ -1187,6 +1273,10 @@ function GateDecisionControls({
       return { ...current, evidenceRefs: nextEvidenceRefs }
     })
   }, [sourceArtifactId])
+
+  useEffect(() => {
+    setReason((current) => current.trim() === '' ? suggestedReason : current)
+  }, [suggestedReason])
 
   function updateSecurityReviewForm<K extends keyof SecurityReviewFormState>(
     key: K,
@@ -1240,10 +1330,15 @@ function GateDecisionControls({
       <textarea
         value={reason}
         onChange={(event) => setReason(event.target.value)}
-        placeholder="Decision reason"
+        placeholder={requiresHumanTradeoff ? 'Critical issue: write the trade-off decision here' : 'Decision reason'}
         rows={compact ? 3 : 2}
         className="min-h-16 resize-y rounded-md border border-input bg-background px-2 py-1.5 text-xs text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       />
+      <p className="text-xs text-muted-foreground">
+        {requiresHumanTradeoff
+          ? 'Critical findings need a human-written decision reason because accepting or deferring them means choosing a trade-off.'
+          : 'Forge prefills this from reviewer output when available. Edit it only when the review missed context or needs sharper wording.'}
+      </p>
       {isSecurityGate && (
         <fieldset className="grid gap-2 rounded-md border border-border bg-background/80 p-2 text-xs">
           <legend className="px-1 font-medium text-foreground">Security review</legend>
@@ -1501,15 +1596,19 @@ function RetryHandoffControls({
 
 function SandboxOutputList({ outputs }: { outputs: SandboxOutputSummary[] }) {
   if (outputs.length === 0) return null
+  const hostWriteCount = outputs.reduce((count, output) => count + output.hostRepositoryWritePaths.length, 0)
 
   return (
     <div className="mt-3 rounded-md border border-border bg-muted/20 px-3 py-2">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Generated sandbox files</p>
+        <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Generated files</p>
         <Badge variant="outline" className={statusBadgeClass('completed')}>{outputs.length}</Badge>
       </div>
       <p className="mt-1 text-xs text-muted-foreground">
-        Files listed here are package sandbox output under <span className="font-mono">.forge/task-runs</span>. They are not host repository branch, commit, or PR output.
+        Forge keeps package output under <span className="font-mono">.forge/task-runs</span>
+        {hostWriteCount > 0
+          ? ' and applied the listed host repository files to the local project.'
+          : '. No host repository files were recorded for these artifacts.'}
       </p>
       <ul className="mt-2 grid gap-2">
         {outputs.map((output) => (
@@ -1522,6 +1621,9 @@ function SandboxOutputList({ outputs }: { outputs: SandboxOutputSummary[] }) {
                   Validation: {statusLabel(output.validationStatus)}
                 </Badge>
               )}
+              {output.hostRepositoryWrites && (
+                <Badge variant="outline" className={statusBadgeClass('completed')}>host writes</Badge>
+              )}
             </div>
             {output.sandboxPath !== '' && (
               <p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{output.sandboxPath}</p>
@@ -1529,6 +1631,11 @@ function SandboxOutputList({ outputs }: { outputs: SandboxOutputSummary[] }) {
             {output.files.length > 0 && (
               <p className="mt-1 break-words font-mono text-[11px] text-muted-foreground">
                 {previewList(output.files, 5)}
+              </p>
+            )}
+            {output.hostRepositoryWritePaths.length > 0 && (
+              <p className="mt-1 break-words font-mono text-[11px] text-foreground">
+                Host: {previewList(output.hostRepositoryWritePaths, 5)}
               </p>
             )}
           </li>
@@ -2403,6 +2510,12 @@ function WorkforcePanel({
                   const securityPayload = pendingReviewGate && stringField(pendingReviewGate, ['gateType', 'type']) === 'security_review'
                     ? securityReviewPayloadFromMetadata(recordField(pendingReviewGate, ['metadata']), reviewArtifact?.metadata ?? null)
                     : null
+                  const pendingGateType = pendingReviewGate ? stringField(pendingReviewGate, ['gateType', 'type']) : ''
+                  const reviewDecisionSuggestion = reviewDecisionSuggestionFromArtifact({
+                    gateType: pendingGateType,
+                    securityPayload,
+                    sourceArtifact: reviewArtifact,
+                  })
                   const taskCount = Math.max(1, Math.trunc(metadataNumberField(pkg, ['plannedTasks', 'taskCount', 'tasks']) ?? steps.length))
 
                   return (
@@ -2480,9 +2593,11 @@ function WorkforcePanel({
                           <SecurityFindingsPanel payload={securityPayload} />
                           {pendingReviewGate && reviewArtifact ? (
                             <GateDecisionControls
-                              gateType={stringField(pendingReviewGate, ['gateType', 'type'])}
+                              gateType={pendingGateType}
                               gateId={stringField(pendingReviewGate, ['id'])}
+                              requiresHumanTradeoff={reviewDecisionSuggestion.requiresHumanTradeoff}
                               sourceArtifactId={reviewArtifact.id}
+                              suggestedReason={reviewDecisionSuggestion.reason}
                               taskId={taskId}
                               onDecided={onGateDecided}
                               compact
@@ -3380,7 +3495,7 @@ export function taskProgressSummary(input: {
       nextAction: 'Review package output, then approve, request changes, or reject it.',
       detail: executionDisabled
         ? 'Execution is disabled; this review covers handoff output and no repository files were changed.'
-        : 'Review gates cover sandbox output under .forge/task-runs; host repository evidence is readiness/status only.',
+        : 'Review gates cover generated output, host-write metadata, and validation evidence.',
     }
   }
 
@@ -3398,7 +3513,7 @@ export function taskProgressSummary(input: {
       nextAction: 'Wait for output and review gates.',
       detail: executionDisabled
         ? 'Execution is disabled; Forge is creating reviewable handoff output without sandbox files or host repository writes.'
-        : 'A specialist package is running in the .forge/task-runs sandbox.',
+        : 'A specialist package is running. Forge will keep sandbox artifacts and apply successful local repository edits when enabled.',
     }
   }
 
@@ -3406,7 +3521,7 @@ export function taskProgressSummary(input: {
     return {
       stage: `Ready: ${stringField(readyPackage, ['title', 'name']) || 'work package'}`,
       nextAction: 'Worker handoff is ready for the next package.',
-      detail: 'Dependencies are satisfied. With FORGE_WORK_PACKAGE_EXECUTION=1, the worker can run this package in the sandbox.',
+      detail: 'Dependencies are satisfied. The worker can run this package unless execution is explicitly disabled.',
     }
   }
 
@@ -3421,7 +3536,7 @@ export function taskProgressSummary(input: {
   }
 
   if (input.status === 'completed') {
-    return { stage: 'Completed', nextAction: 'Review artifacts and sandbox output.', detail: 'All required gates are complete.' }
+    return { stage: 'Completed', nextAction: 'Review artifacts and generated output.', detail: 'All required gates are complete.' }
   }
 
   if (input.status === 'failed') {

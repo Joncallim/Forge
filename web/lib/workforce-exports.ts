@@ -2,6 +2,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { asc, eq } from 'drizzle-orm'
 import { db } from '@/db'
+import { WORKFORCE_SUPERVISOR_ROLE_LABEL } from '@/db/default-workforces'
 import { agentConfigs, workforceAgents, workforces } from '@/db/schema'
 import { writeWorkspaceFileAtomically } from '@/lib/agent-prompts'
 import { getWorkspaceSettings, isWithinPath } from '@/lib/workspace'
@@ -42,6 +43,18 @@ function promptPathForAgent(agentType: string): string {
   return `../prompts/agents/${agentType}.toml`
 }
 
+function isWorkforceSupervisor(member: WorkforceMemberExport): boolean {
+  const metadata = safeMetadata(member.metadata)
+  return metadata.workforceSupervisor === true || member.roleLabel === WORKFORCE_SUPERVISOR_ROLE_LABEL
+}
+
+function findWorkforceSupervisor(members: WorkforceMemberExport[]): WorkforceMemberExport | null {
+  return members
+    .slice()
+    .sort((a, b) => a.sequence - b.sequence || a.agentType.localeCompare(b.agentType))
+    .find(isWorkforceSupervisor) ?? null
+}
+
 function assertSafeWorkforceSlug(slug: string): void {
   if (!WORKFORCE_SLUG_PATTERN.test(slug)) {
     throw new Error(`Unsafe workforce slug for filesystem export: ${slug}`)
@@ -68,9 +81,14 @@ function managerPrompt(workforce: WorkforceExport): string {
     .sort((a, b) => a.sequence - b.sequence || a.agentType.localeCompare(b.agentType))
     .map((member) => `- ${member.roleLabel || member.displayName}: ${member.agentType}`)
     .join('\n')
+  const supervisor = findWorkforceSupervisor(workforce.members)
 
   return [
     `You are the workforce manager for ${workforce.displayName}.`,
+    '',
+    supervisor
+      ? `Workflow supervisor: ${supervisor.roleLabel || supervisor.displayName} (${supervisor.agentType}). This member manages sequencing, handoffs, blockers, and escalation inside the workforce.`
+      : 'Workflow supervisor: not assigned.',
     '',
     'Route work to the listed agents in sequence, collect their outputs, and escalate blockers, failed checks, and security-sensitive decisions to the project manager.',
     '',
@@ -97,10 +115,19 @@ function workflow(workforce: WorkforceExport): Record<string, unknown> {
       required: member.isRequired,
       dependsOn: index === 0 ? [] : [`${index}-${orderedMembers[index - 1].agentType}`],
     }))
+  const supervisorIndex = orderedMembers.findIndex(isWorkforceSupervisor)
+  const supervisor = supervisorIndex >= 0 ? orderedMembers[supervisorIndex] : null
 
   return {
     schemaVersion: 1,
     mode: 'sequential',
+    ...(supervisor ? {
+      supervisor: {
+        agentType: supervisor.agentType,
+        roleLabel: supervisor.roleLabel,
+        stepId: steps[supervisorIndex]?.id,
+      },
+    } : {}),
     approvalGates: ['pm-final-review'],
     steps,
   }
