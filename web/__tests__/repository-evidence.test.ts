@@ -200,6 +200,29 @@ describe('repository execution context', () => {
     }
   })
 
+  it('allows sandbox-only execution for existing non-Git project directories', async () => {
+    const previous = process.env.FORGE_HOST_REPOSITORY_WRITES
+    process.env.FORGE_HOST_REPOSITORY_WRITES = '0'
+
+    try {
+      const context = await buildRepositoryExecutionContext({
+        project: project(tempRoot),
+        task: task(),
+        workPackage: workPackage(),
+      })
+
+      expect(context.status).toBe('ready')
+      expect(context.projectLocalPath).toBe(tempRoot)
+      expect(context.pathExists).toBe(true)
+      expect(context.isGitRepository).toBe(false)
+      expect(context.hasRemote).toBe(false)
+      expect(context.blockedReason).toBeNull()
+    } finally {
+      if (previous === undefined) delete process.env.FORGE_HOST_REPOSITORY_WRITES
+      else process.env.FORGE_HOST_REPOSITORY_WRITES = previous
+    }
+  })
+
   it('ignores Forge task-run artifacts when checking dirty working trees', async () => {
     await initRepo(tempRoot)
     await fs.mkdir(path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1'), { recursive: true })

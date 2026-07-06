@@ -283,6 +283,23 @@ export async function buildRepositoryExecutionContext(input: {
 
   const isGitRepository = await gitOk(resolvedPath, ['rev-parse', '--is-inside-work-tree'])
   if (!isGitRepository) {
+    if (!isHostRepositoryWritesEnabled()) {
+      return {
+        status: 'ready',
+        projectLocalPath: resolvedPath,
+        pathExists: true,
+        isGitRepository: false,
+        currentBranch: null,
+        baseBranch: input.project.defaultBranch?.trim() || null,
+        isDirty: null,
+        hasRemote: false,
+        intendedTaskBranch: null,
+        branchCollision: null,
+        blockedReason: null,
+        statusShort: '',
+        remoteSummary: '',
+      }
+    }
     return blocked(resolvedPath, `Project local path is not a Git repository: ${resolvedPath}`, {
       pathExists: true,
     })
