@@ -9,7 +9,7 @@ permissions:
   issues: write
 
 concurrency:
-  group: forge-agent-command-${{ github.event.issue.number }}
+  group: forge-agent-command-run-log-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
