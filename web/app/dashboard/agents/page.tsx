@@ -153,6 +153,10 @@ function titleize(value: string): string {
     .join(' ')
 }
 
+function pluralize(count: number, singular: string, plural = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : plural}`
+}
+
 function slugify(value: string): string {
   return value
     .trim()
@@ -1086,7 +1090,7 @@ export default function AgentsPage() {
                 </div>
               ) : (
                 workforces.map((workforce) => (
-                  <details key={workforce.id} className="group rounded-lg border border-border p-4" open>
+                  <details key={workforce.id} className="group rounded-lg border border-border p-4">
                     <summary className="flex cursor-pointer list-none items-start justify-between gap-3 [&::-webkit-details-marker]:hidden">
                       <div className="flex min-w-0 items-start gap-2">
                         <ChevronRightIcon
@@ -1101,6 +1105,9 @@ export default function AgentsPage() {
                                 Default
                               </span>
                             )}
+                            <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                              {pluralize(workforce.members.length, 'agent')}
+                            </span>
                             {!workforce.isActive && (
                               <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
                                 Archived

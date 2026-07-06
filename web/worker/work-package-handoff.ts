@@ -89,6 +89,13 @@ class ExecutionLeaseLostError extends Error {
   }
 }
 
+class RepositoryEvidenceBlockedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'RepositoryEvidenceBlockedError'
+  }
+}
+
 type ExecutionLease = {
   acquiredAt: string
   attemptNumber: number
@@ -1782,7 +1789,7 @@ async function executeReadyWorkPackage(
       })
 
       if (repositoryContext.status === 'blocked') {
-        throw new Error(`Repository evidence blocked: ${repositoryContext.blockedReason}`)
+        throw new RepositoryEvidenceBlockedError(`Repository evidence blocked: ${repositoryContext.blockedReason}`)
       }
     }
 
@@ -2033,12 +2040,15 @@ async function executeReadyWorkPackage(
     const executionFailureDetails = err instanceof WorkPackageExecutionError
       ? err.failureDetails
       : null
+    const repositoryEvidenceBlocked = err instanceof RepositoryEvidenceBlockedError
     const failedAt = new Date()
     const finalAttempt = options.finalAttempt ?? true
-    const packageStatus = finalAttempt ? 'failed' : 'blocked'
-    const blockedReason = finalAttempt
+    const packageStatus = repositoryEvidenceBlocked || !finalAttempt ? 'blocked' : 'failed'
+    const blockedReason = repositoryEvidenceBlocked
       ? message
-      : `Retrying package execution after error: ${message}`
+      : finalAttempt
+        ? message
+        : `Retrying package execution after error: ${message}`
     const [failedPackage] = await db
       .update(workPackages)
       .set({
@@ -2153,11 +2163,11 @@ async function executeReadyWorkPackage(
     await recordTaskLogBestEffort({
       agentRunId: run.id,
       eventType: 'run.failed',
-      level: finalAttempt ? 'error' : 'warning',
+      level: finalAttempt && !repositoryEvidenceBlocked ? 'error' : 'warning',
       message: `Implementation run failed for "${nextPackage.title}": ${message}`,
       metadata: {
         attemptNumber,
-        finalAttempt,
+        finalAttempt: repositoryEvidenceBlocked ? false : finalAttempt,
         packageStatus,
       },
       source: 'worker',
@@ -2172,6 +2182,14 @@ async function executeReadyWorkPackage(
       workPackageId: nextPackage.id,
     })
     heartbeat.stop()
+    if (repositoryEvidenceBlocked) {
+      return {
+        blockedReason,
+        claimedPackageId: null,
+        readyPackageIds,
+        status: 'blocked',
+      }
+    }
     throw err
   }
   } finally {
