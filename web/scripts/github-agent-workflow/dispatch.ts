@@ -1,8 +1,11 @@
 import { runMain } from './cli/entrypoint'
-import { failUntilIssueLands } from './foundation-only'
+import { DISPATCH_PLACEHOLDER, failWithArchitecturePointer } from './core/workflow-architecture'
 
-export async function main(): Promise<void> {
-  await failUntilIssueLands(144, 'Dispatch behavior')
+// Placeholder CLI. #144 owns dispatch: it should turn an accepted request into a
+// bounded work order using the shared dispatch/branch-name/work-order contracts
+// and update the durable run log — without executing Claude Code or Codex.
+export function main(): void {
+  failWithArchitecturePointer(DISPATCH_PLACEHOLDER)
 }
 
 runMain(import.meta.url, () => main())

@@ -56,6 +56,19 @@ export const PR_CRITERION_STATUS_VALUES = Object.freeze(['claimed', 'missing', '
 export const prCriterionStatusSchema = freezeSchema(z.enum(PR_CRITERION_STATUS_VALUES))
 export type PrCriterionStatus = z.infer<typeof prCriterionStatusSchema>
 
+// The durable run log (#146) is the single source of truth for workflow state.
+// Every remaining feature (#144/#145/#152/#153) maps its own language onto these
+// values instead of inventing a parallel status enum.
+//
+//   requested   command router accepted a request and wrote a run record.
+//   handed-off  dispatcher produced a bounded work order / handoff package,
+//               but no agent runtime has started (this is #144's `accepted`).
+//   running     a real runtime adapter has started work.
+//   blocked     the workflow refused to proceed (records a blockedReason).
+//   pr-opened   a pull request was linked to the run.
+//   completed   the work is done.
+//   failed      the workflow failed.
+//   cancelled   the workflow was explicitly stopped.
 export const RUN_STATUS_VALUES = Object.freeze([
   'requested',
   'handed-off',
@@ -68,6 +81,32 @@ export const RUN_STATUS_VALUES = Object.freeze([
 ] as const)
 export const runStatusSchema = freezeSchema(z.enum(RUN_STATUS_VALUES))
 export type RunStatus = z.infer<typeof runStatusSchema>
+
+// #144's issue text describes the dispatch state machine with an `accepted`
+// state where the run-log contract uses `handed-off`. Rather than adding a
+// duplicate status, dispatch code maps its vocabulary onto RUN_STATUS_VALUES
+// through this table so the run log stays the one status model.
+export const DISPATCH_STATE_VALUES = Object.freeze([
+  'requested',
+  'accepted',
+  'running',
+  'blocked',
+  'pr-opened',
+  'completed',
+  'failed',
+] as const)
+export const dispatchStateSchema = freezeSchema(z.enum(DISPATCH_STATE_VALUES))
+export type DispatchState = z.infer<typeof dispatchStateSchema>
+
+export const DISPATCH_STATE_TO_RUN_STATUS: Readonly<Record<DispatchState, RunStatus>> = Object.freeze({
+  requested: 'requested',
+  accepted: 'handed-off',
+  running: 'running',
+  blocked: 'blocked',
+  'pr-opened': 'pr-opened',
+  completed: 'completed',
+  failed: 'failed',
+})
 
 export const RUN_ID_PATTERN = /^issue-\d+-(?:[1-9]\d{9,}-[1-9]\d*|local-[0-9a-f]{7,12})$/
 export const runIdSchema = freezeSchema(

@@ -1,5 +1,9 @@
 # GitHub Agent Run Log
 
+> Part of the GitHub-native agent workflow. For how the run log fits the rest of
+> the workflow (states, module ownership, remaining features), see
+> [`github-native-agent-workflow-architecture.md`](./github-native-agent-workflow-architecture.md).
+
 The GitHub-native workflow keeps a small run log in the project repository so an
 accepted agent request is still visible after a chat session or GitHub Actions
 job ends.

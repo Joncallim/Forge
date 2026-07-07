@@ -1,8 +1,12 @@
 import { runMain } from './cli/entrypoint'
-import { failUntilIssueLands } from './foundation-only'
+import { PR_CONTRACT_PLACEHOLDER, failWithArchitecturePointer } from './core/workflow-architecture'
 
-export async function main(): Promise<void> {
-  await failUntilIssueLands(145, 'PR contract checking behavior')
+// Placeholder CLI. #145 owns PR contract checking: it should use the shared PR
+// contract section constants and source-issue/acceptance-criteria parsers to
+// report each criterion as claimed/missing/needs-review. It must not block
+// merges by default.
+export function main(): void {
+  failWithArchitecturePointer(PR_CONTRACT_PLACEHOLDER)
 }
 
 runMain(import.meta.url, () => main())
