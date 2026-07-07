@@ -11,6 +11,8 @@ import {
   handoffArtifactsSchema,
 } from '@/scripts/github-agent-workflow/contracts/common'
 import { agentBranchNameSchema, AGENT_BRANCH_NAME_PATTERN } from '@/scripts/github-agent-workflow/contracts/branch-name'
+import { dispatchRequestSchema } from '@/scripts/github-agent-workflow/contracts/dispatch-request'
+import { runtimeHandoffSchema } from '@/scripts/github-agent-workflow/contracts/runtime-handoff'
 import { WORK_ORDER_SECTION_TITLES, workOrderSchema } from '@/scripts/github-agent-workflow/contracts/work-order'
 import { PR_CONTRACT_SECTION_TITLES } from '@/scripts/github-agent-workflow/contracts/pr-contract-sections'
 import { buildAgentBranchName, slugifyIssueTitle } from '@/scripts/github-agent-workflow/core/branch-names'
@@ -24,9 +26,6 @@ import {
   PR_CONTRACT_PLACEHOLDER,
   architecturePlaceholderMessage,
 } from '@/scripts/github-agent-workflow/core/workflow-architecture'
-import { main as dispatchMain } from '@/scripts/github-agent-workflow/dispatch'
-import { main as prContractMain } from '@/scripts/github-agent-workflow/pr-contract'
-import { main as handoffMain } from '@/scripts/github-agent-workflow/handoff'
 import {
   linkPullRequest,
   recordBlockedReason,
@@ -147,6 +146,14 @@ describe('deterministic agent branch names', () => {
     expect(slugifyIssueTitle('[FEATURE] Añadir soporte!!!')).toBe('a-adir-soporte')
   })
 
+  it('redacts secret-shaped title text before building a branch slug', () => {
+    const secret = `ghp_${'a'.repeat(40)}`
+    const branch = buildAgentBranchName({ issueNumber: 8, issueTitle: `[FEATURE] Use ${secret}` })
+
+    expect(branch).toBe('agent/issue-8-use-redacted')
+    expect(branch).not.toContain('ghp')
+  })
+
   it('bounds long slugs', () => {
     const branch = buildAgentBranchName({
       issueNumber: 12,
@@ -154,6 +161,42 @@ describe('deterministic agent branch names', () => {
     })
     expect(branch).toMatch(AGENT_BRANCH_NAME_PATTERN)
     expect(branch.length).toBeLessThanOrEqual('agent/issue-12-'.length + 40)
+  })
+
+  it('rejects invalid branch names across dispatch, work-order, and handoff contracts', () => {
+    const invalidBranchName = 'Agent/Issue 144 unsafe'
+    const base = {
+      runId: 'issue-144-1234567890-1',
+      issueNumber: 144,
+      runtime: 'codex',
+      branchName: invalidBranchName,
+    }
+
+    expect(dispatchRequestSchema.safeParse({
+      ...base,
+      issueTitle: 'Safe dispatch',
+      action: 'implement',
+      requestedBy: 'Joncallim',
+      dryRun: false,
+      source: { type: 'issue_comment', commentId: 1 },
+      requestedAt: '2026-07-06T01:00:00.000Z',
+    }).success).toBe(false)
+
+    expect(workOrderSchema.safeParse({
+      title: 'FORGE Agent Work Order',
+      issueNumber: 144,
+      issueTitle: 'Safe dispatch',
+      branchName: invalidBranchName,
+      sections: WORK_ORDER_SECTION_TITLES.map((title) => ({ title, body: 'x' })),
+    }).success).toBe(false)
+
+    expect(runtimeHandoffSchema.safeParse({
+      ...base,
+      handoffPath: '.forge/runs/144/issue-144-1234567890-1/handoff.md',
+      promptPath: '.forge/runs/144/issue-144-1234567890-1/prompt.md',
+      metadataPath: '.forge/runs/144/issue-144-1234567890-1/metadata.json',
+      generatedAt: '2026-07-06T01:00:00.000Z',
+    }).success).toBe(false)
   })
 })
 
@@ -268,11 +311,5 @@ describe('fail-closed placeholder CLIs', () => {
       expect(message).toContain('docs/github-native-agent-workflow-architecture.md')
       expect(placeholder.sharedContracts.length).toBeGreaterThan(0)
     }
-  })
-
-  it('throw instead of pretending a feature ran', () => {
-    expect(() => dispatchMain()).toThrow(/#144/)
-    expect(() => prContractMain()).toThrow(/#145/)
-    expect(() => handoffMain()).toThrow(/#153/)
   })
 })

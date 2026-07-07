@@ -21,7 +21,8 @@ export const DISPATCH_PLACEHOLDER: WorkflowPlaceholder = Object.freeze({
     'core/branch-names.ts (buildAgentBranchName)',
     'core/work-order.ts (buildWorkOrder / WORK_ORDER_SECTION_TITLES)',
     'core/acceptance-criteria.ts (extractAcceptanceCriteria)',
-    'io/agent-run-log.ts (recordRequested / updateRunStatus / recordBlockedReason)',
+    'io/agent-run-log.ts (findLatestRunForIssue / updateRunStatus / recordBlockedReason / appendRunEvent)',
+    'io/agent-run-log.ts (withRunLogBranchWorktree / persistRunRecordToGit for run-log branch sync)',
     'contracts/common.ts (DISPATCH_STATE_TO_RUN_STATUS — map accepted → handed-off)',
   ]),
 })

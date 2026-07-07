@@ -1,5 +1,6 @@
 import { agentBranchNameSchema, type AgentBranchName } from '../contracts/branch-name'
 import { positiveIntSchema } from '../contracts/common'
+import { redactSecretLikeText } from './redaction'
 
 // Slugs are bounded so long issue titles cannot produce unwieldy branch names.
 const MAX_SLUG_LENGTH = 40
@@ -7,7 +8,7 @@ const MAX_SLUG_LENGTH = 40
 const ISSUE_TYPE_PREFIX = /^\s*\[[a-z]+\]\s*/i
 
 export function slugifyIssueTitle(title: string): string {
-  return title
+  return redactSecretLikeText(title)
     .replace(ISSUE_TYPE_PREFIX, '')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')

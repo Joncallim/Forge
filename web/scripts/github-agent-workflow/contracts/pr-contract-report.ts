@@ -16,6 +16,7 @@ export const prContractCriterionSchema = freezeSchema(z.object({
 export const prContractReportSchema = freezeSchema(z.object({
   pullRequestNumber: positiveIntSchema,
   pullRequestTitle: nonEmptyTrimmedStringSchema,
+  draft: z.boolean(),
   linkedIssueNumber: positiveIntSchema.nullable(),
   linkedIssueTitle: nonEmptyTrimmedStringSchema.nullable(),
   criteria: z.array(prContractCriterionSchema),

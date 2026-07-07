@@ -24,19 +24,20 @@ The run log at `.forge/runs/<issue-number>/<run-id>.json` is the **source of
 truth for workflow state**. Everything below reads and writes that record; it
 does not add a second status store.
 
-## What remains
+## What this PR completes
 
-| Issue | Feature | CLI (placeholder today) |
+| Issue | Feature | Where |
 | --- | --- | --- |
-| #152 | Agent PR creation contract + PR body template | — (template + docs) |
-| #144 | Safe agent dispatch / bounded work-order generation | `dispatch.ts` (`forge:dispatch`) |
-| #153 | Controlled Claude Code / Codex handoff adapter | `handoff.ts` (`forge:handoff`) |
-| #145 | PR acceptance-criteria contract checker | `pr-contract.ts` (`forge:pr-contract`) |
-| #147 | Plain-English workflow documentation | `docs/` |
+| #152 | Agent PR creation contract + PR body template | `.github/pull_request_template.md`, [`docs/github-agent-pr-contract.md`](./github-agent-pr-contract.md) |
+| #144 | Safe agent dispatch / bounded work-order generation | `dispatch.ts` (`forge:dispatch`), `.github/workflows/agent-dispatch.yml` |
+| #153 | Controlled Claude Code / Codex handoff adapter | `handoff.ts` (`forge:handoff`), `.github/workflows/agent-handoff.yml` |
+| #145 | PR acceptance-criteria contract checker | `pr-contract.ts` (`forge:pr-contract`), `.github/workflows/pr-contract-check.yml` |
+| #147 | Plain-English workflow documentation | [`docs/workflows/github-native-agent-workflow.md`](./workflows/github-native-agent-workflow.md) |
 
-The three remaining CLIs are **fail-closed placeholders**: they throw a
-contract-aware message naming the owning issue and the shared modules to use,
-rather than pretending a feature ran.
+The CLIs stay thin. They parse GitHub Actions input, call shared contract
+helpers, update GitHub comments or labels, and write the durable run log. They
+do not execute Claude Code, Codex, pull request code, issue comments, or code
+from the run-log branch.
 
 ## Workflow states
 
@@ -109,7 +110,7 @@ execution** — those side effects belong to the feature CLIs.
 | `acceptance-criteria.ts` | `extractAcceptanceCriteria` — one checklist parser, reusing `core/sections.ts`. | #144, #145 |
 | `pr-contract.ts` | `extractSourceIssueReference` + PR section titles. | #145, #152 |
 | `handoff.ts` | `buildHandoffArtifacts` — predictable artifact paths in the existing `handoffArtifacts` shape. | #153 |
-| `workflow-architecture.ts` | Ownership map + fail-closed placeholder messages. | placeholders, docs |
+| `workflow-architecture.ts` | Ownership map + contract pointers for workflow docs and tests. | docs |
 | `agent-command.ts`, `issue-validation.ts`, `sections.ts`, `labels.ts` | Landed behaviour. | #142/#143 |
 
 ## I/O and CLI
@@ -121,6 +122,50 @@ execution** — those side effects belong to the feature CLIs.
 - `cli/entrypoint.ts` — `runMain` (only executes when run directly).
 - `cli/bootstrap-labels.ts` — creates the six workflow labels + `needs-triage`.
 - Root CLIs (`agent-command.ts`, `dispatch.ts`, `pr-contract.ts`, `handoff.ts`) — thin wiring; `forge:*` npm scripts point here.
+
+## Run-log branch sync strategy
+
+Run records are committed to the dedicated `forge/agent-run-log` branch, but
+GitHub Actions must keep executing trusted default-branch code. The workflow
+must not check out `forge/agent-run-log` as the job code directory and then run
+scripts from it.
+
+The safe pattern is:
+
+1. Check out the repository default branch in the normal workspace.
+2. Install dependencies and run Forge scripts from that trusted checkout.
+3. Use `withRunLogBranchWorktree` from `io/agent-run-log.ts` to create a
+   temporary worktree for `forge/agent-run-log`.
+4. Read or update `.forge/runs/<issue>/<run-id>.json` inside that temporary
+   worktree.
+5. Persist only the JSON run record with `persistRunRecordToGit`.
+6. Remove the temporary worktree.
+
+This means the job can read and update the run-log branch while the executable
+code path still comes from the default branch. The temporary worktree is data
+access only; workflows must not run package scripts, shell commands from the
+run-log checkout, or generated prompt files from it.
+
+## Handoff artifact persistence
+
+Handoff artifacts are generated under:
+
+```text
+.forge/runs/<issue-number>/<run-id>/handoff.md
+.forge/runs/<issue-number>/<run-id>/prompt.md
+.forge/runs/<issue-number>/<run-id>/metadata.json
+```
+
+That nested directory is intentionally git-ignored. Only the sibling run record
+`.forge/runs/<issue-number>/<run-id>.json` is committed to the run-log branch.
+
+When handoff runs in GitHub Actions, `.github/workflows/agent-handoff.yml`
+uploads the nested directory as a workflow artifact. When handoff runs locally,
+the CLI prints the local paths. In both cases Forge records only the artifact
+paths in the durable run log.
+
+Do not commit `handoff.md`, `prompt.md`, `metadata.json`, secrets, credentials,
+model transcripts, or local auth material to the repository.
 
 ## Why dispatch is explicit, not automatic
 
@@ -138,7 +183,8 @@ unconstrained always-on bot and keeps every step traceable in the run log.
 There is also a hard operational reason automatic PR creation stays out of scope:
 GitHub's default `GITHUB_TOKEN` does not trigger downstream workflows, so an
 auto-created PR would silently skip `pr-contract-check` and the label-transition
-chain. Any future automation needs a PAT or GitHub App token, documented in #147.
+chain. Any future automation needs a PAT or GitHub App token and a separate
+security review.
 
 ## How #152, #144, #153, and #145 fit together
 
@@ -186,10 +232,10 @@ durable, repository-visible run log — only the artifact **paths** are recorded
 The prompt/metadata files themselves live in the git-ignored
 `.forge/runs/<issue>/<run-id>/` directory.
 
-## Recommended implementation sequence
+## Implemented sequence
 
 1. **#152** — PR creation contract + PR body template (defines the shape #144/#153 emit and #145 parses).
 2. **#144** — safe dispatch / bounded work-order generation.
 3. **#153** — controlled local Claude Code / Codex handoff adapter.
 4. **#145** — PR acceptance-criteria contract checker.
-5. **#147** — plain-English operating guide, written once the contracts are stable.
+5. **#147** — plain-English operating guide.

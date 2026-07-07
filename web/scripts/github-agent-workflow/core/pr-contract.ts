@@ -1,9 +1,11 @@
 import {
   ISSUE_LINK_KEYWORDS,
   PR_CONTRACT_SECTION_TITLES,
+  type PrContractSectionTitle,
   type IssueLinkKeyword,
 } from '../contracts/pr-contract-sections'
 import { sourceIssueReferenceSchema, type SourceIssueReference } from '../contracts/source-issue-reference'
+import { normalizeSectionHeading, parseSections } from './sections'
 
 // One regex, built from the shared keyword list, so #145 (PR checker) and #152
 // (PR template) recognise exactly the same link phrases. Rebuilt per call so the
@@ -30,6 +32,49 @@ export function extractSourceIssueReference(prBody: string | null): SourceIssueR
     keyword: match[1].toLowerCase() as IssueLinkKeyword,
     raw: match[0].trim(),
   })
+}
+
+export function extractPrContractSection(prBody: string | null, title: PrContractSectionTitle): string {
+  return parseSections(prBody ?? '')[normalizeSectionHeading(title)] ?? ''
+}
+
+export function renderAcceptanceCriteriaValidation(criteria: readonly string[] = []): string {
+  if (criteria.length === 0) return '- [ ] <criterion> — evidence / notes'
+  return criteria.map((criterion) => `- [ ] ${criterion} — evidence / notes`).join('\n')
+}
+
+export function renderPrContractTemplate(input: {
+  issueNumber?: number | null
+  runtime?: string | null
+  runId?: string | null
+  acceptanceCriteria?: readonly string[]
+} = {}): string {
+  const issueReference = input.issueNumber ? `Closes #${input.issueNumber}` : 'Closes #<issue-number>'
+  const runtime = input.runtime?.trim() || 'claude-code | codex | dry-run | manual'
+  const runId = input.runId?.trim() || '<run-id or n/a>'
+  const validation = renderAcceptanceCriteriaValidation(input.acceptanceCriteria ?? [])
+
+  return [
+    `## ${PR_CONTRACT_SECTION_TITLES[0]}`,
+    '',
+    issueReference,
+    '',
+    `## ${PR_CONTRACT_SECTION_TITLES[1]}`,
+    '',
+    `Runtime: ${runtime}`,
+    `Run ID: ${runId}`,
+    '',
+    `## ${PR_CONTRACT_SECTION_TITLES[2]}`,
+    '',
+    `## ${PR_CONTRACT_SECTION_TITLES[3]}`,
+    '',
+    validation,
+    '',
+    `## ${PR_CONTRACT_SECTION_TITLES[4]}`,
+    '',
+    `## ${PR_CONTRACT_SECTION_TITLES[5]}`,
+    '',
+  ].join('\n')
 }
 
 export { PR_CONTRACT_SECTION_TITLES }

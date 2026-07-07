@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { agentBranchNameSchema } from './branch-name'
 import { freezeSchema, nonEmptyTrimmedStringSchema, positiveIntSchema } from './common'
 
 // The bounded implementation prompt #144 generates from a ready issue. The
@@ -31,7 +32,7 @@ export const workOrderSchema = freezeSchema(z.object({
   title: z.literal(WORK_ORDER_TITLE),
   issueNumber: positiveIntSchema,
   issueTitle: nonEmptyTrimmedStringSchema,
-  branchName: nonEmptyTrimmedStringSchema,
+  branchName: agentBranchNameSchema,
   sections: z.array(workOrderSectionSchema).length(WORK_ORDER_SECTION_TITLES.length),
 }).strict())
 

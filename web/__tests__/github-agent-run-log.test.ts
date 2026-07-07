@@ -16,6 +16,7 @@ import {
   recordBlockedReason,
   recordRequested,
   updateRunStatus,
+  withRunLogBranchWorktree,
 } from '@/scripts/github-agent-workflow/io/agent-run-log'
 import { FakeGitHubClient } from '@/scripts/github-agent-workflow/io/fake-github-client'
 import type { GitHubIssue } from '@/scripts/github-agent-workflow/io/github-client'
@@ -429,6 +430,76 @@ describe('agent run log storage', () => {
       'show',
       'main:.forge/runs/146/issue-146-1234567892-1.json',
     ])).toBe(128)
+  })
+
+  it('reads and updates the dedicated run-log branch through a separate worktree', async () => {
+    const root = await tempRepositoryRoot()
+    const origin = path.join(root, 'origin.git')
+    const seed = path.join(root, 'seed')
+    const trusted = path.join(root, 'trusted')
+    const runLogBranch = 'forge/agent-run-log'
+
+    await git(root, ['init', '--bare', origin])
+    await mkdir(seed)
+    await git(seed, ['init', '-b', 'main'])
+    await configureGitUser(seed)
+    await writeFile(path.join(seed, 'README.md'), '# Forge run log worktree test\n', 'utf8')
+    await git(seed, ['add', 'README.md'])
+    await git(seed, ['commit', '-m', 'Initial commit'])
+    await git(seed, ['remote', 'add', 'origin', origin])
+    await git(seed, ['push', '-u', 'origin', 'main'])
+
+    await recordRequested({
+      runId: 'issue-200-1234567890-1',
+      issueNumber: 200,
+      issueTitle: 'Run log branch sync',
+      runtime: 'codex',
+      action: 'implement',
+      requestedBy: 'Joncallim',
+      source: { type: 'issue_comment', commentId: 2001 },
+    }, {
+      repositoryRoot: seed,
+      persistRecord: persistRunRecordToGit,
+      targetBranch: runLogBranch,
+      now: new Date('2026-07-06T01:00:00.000Z'),
+    })
+
+    await git(root, ['clone', '--branch', 'main', origin, trusted])
+
+    expect(await findLatestRunForIssue(200, { repositoryRoot: trusted })).toBeNull()
+
+    await withRunLogBranchWorktree({ repositoryRoot: trusted, targetBranch: runLogBranch }, async (runLogRoot) => {
+      expect(runLogRoot).not.toBe(trusted)
+      const latest = await findLatestRunForIssue(200, { repositoryRoot: runLogRoot })
+      expect(latest?.status).toBe('requested')
+
+      await updateRunStatus({
+        issueNumber: 200,
+        runId: 'issue-200-1234567890-1',
+        status: 'blocked',
+        message: 'Worktree sync test updated the run log.',
+      }, {
+        repositoryRoot: runLogRoot,
+        persistRecord: persistRunRecordToGit,
+        targetBranch: runLogBranch,
+        now: new Date('2026-07-06T01:05:00.000Z'),
+      })
+    })
+
+    const trustedBranch = (await git(trusted, ['branch', '--show-current'])).trim()
+    expect(trustedBranch).toBe('main')
+    expect(await findLatestRunForIssue(200, { repositoryRoot: trusted })).toBeNull()
+
+    const persistedRun = await git(root, [
+      '--git-dir',
+      origin,
+      'show',
+      `${runLogBranch}:.forge/runs/200/issue-200-1234567890-1.json`,
+    ])
+    expect(JSON.parse(persistedRun)).toMatchObject({
+      runId: 'issue-200-1234567890-1',
+      status: 'blocked',
+    })
   })
 
   it('redacts secret-shaped values and truncates transcript-shaped event messages', async () => {
