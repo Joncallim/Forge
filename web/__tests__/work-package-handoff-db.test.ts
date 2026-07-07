@@ -1,6 +1,8 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { execFile as execFileCallback } from 'node:child_process'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -70,6 +72,17 @@ import { handoffApprovedWorkPackages, progressWorkforce } from '@/worker/work-pa
 
 const originalExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
 const tempRoots: string[] = []
+const execFile = promisify(execFileCallback)
+
+async function initDirtyGitRepo(dir: string) {
+  await execFile('git', ['init', '-b', 'main'], { cwd: dir })
+  await execFile('git', ['config', 'user.email', 'forge@example.com'], { cwd: dir })
+  await execFile('git', ['config', 'user.name', 'Forge Test'], { cwd: dir })
+  await writeFile(path.join(dir, 'README.md'), 'ready\n')
+  await execFile('git', ['add', 'README.md'], { cwd: dir })
+  await execFile('git', ['commit', '-m', 'initial'], { cwd: dir })
+  await writeFile(path.join(dir, 'README.md'), 'ready\ndirty before handoff\n')
+}
 
 function chain(resolveValue: unknown) {
   const thenable: Record<string, unknown> = {
@@ -1686,6 +1699,440 @@ describe('handoffApprovedWorkPackages', () => {
         delete process.env.FORGE_WORK_PACKAGE_EXECUTION
       } else {
         process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
+      }
+    }
+  })
+
+  it('skips Git-only diff evidence for sandbox-only non-Git project paths', async () => {
+    const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
+    const previousHostRepositoryWrites = process.env.FORGE_HOST_REPOSITORY_WRITES
+    process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    process.env.FORGE_HOST_REPOSITORY_WRITES = '0'
+    const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'forge-sandbox-non-git-project-'))
+    tempRoots.push(projectRoot)
+
+    const artifactWrites: Array<{
+      artifactType: string
+      content: string
+      metadata: Record<string, unknown>
+    }> = []
+    const commandAuditWrites: Array<Record<string, unknown>> = []
+    const evidenceWrites: Array<Record<string, unknown>> = []
+    let artifactIndex = 0
+    let evidenceIndex = 0
+
+    const insertForValues = (values: Record<string, unknown>) => ({
+      returning: vi.fn(async () => {
+        if (typeof values.artifactType === 'string') {
+          artifactIndex += 1
+          const artifact = {
+            id: `artifact-${artifactIndex}`,
+            agentRunId: values.agentRunId as string,
+            artifactType: values.artifactType,
+            content: values.content as string,
+            metadata: values.metadata as Record<string, unknown>,
+            createdAt: new Date('2026-06-25T00:00:00.000Z'),
+          }
+          artifactWrites.push({
+            artifactType: artifact.artifactType,
+            content: artifact.content,
+            metadata: artifact.metadata,
+          })
+          return [artifact]
+        }
+
+        if (values.command === 'git' && Array.isArray(values.argv)) {
+          commandAuditWrites.push(values)
+          return [{ id: 'audit-1' }]
+        }
+
+        if (typeof values.agentType === 'string') {
+          return [{
+            id: 'run-1',
+            ...values,
+          }]
+        }
+
+        evidenceIndex += 1
+        evidenceWrites.push(values)
+        return [{ id: `vcs-${evidenceIndex}` }]
+      }),
+    })
+    const makeTransaction = () => ({
+      insert: vi.fn(() => ({
+        values: vi.fn((values: Record<string, unknown>) => insertForValues(values)),
+      })),
+      select: vi.fn(() => chain([])),
+      update: vi.fn(() => updateChain([{ id: 'pkg-1' }])),
+    })
+
+    let selectCall = 0
+    mocks.dbSelect.mockImplementation(() => {
+      selectCall += 1
+      if (selectCall === 1) {
+        return chain([{
+          id: 'pkg-1',
+          assignedRole: 'backend',
+          harnessId: 'harness-1',
+          mcpRequirements: [],
+          metadata: { repositoryWrites: true },
+          sequence: 1,
+          status: 'pending',
+          title: 'Backend package',
+        }])
+      }
+      if (selectCall === 2) return chain([])
+      if (selectCall === 3) return chain([])
+      if (selectCall === 4 || selectCall === 6) {
+        return chain([{
+          metadata: {
+            executionLease: {
+              acquiredAt: '2026-06-25T00:00:00.000Z',
+              attemptNumber: 1,
+              heartbeatAt: '2026-06-25T00:00:00.000Z',
+              runId: 'run-1',
+            },
+          },
+          status: 'running',
+        }])
+      }
+      if (selectCall === 5) return chain([])
+      return chain([])
+    })
+
+    const readyUpdate = updateChain([{ id: 'pkg-1' }])
+    const runModelUpdate = updateChain([{ id: 'run-1' }])
+    mocks.dbUpdate
+      .mockReturnValueOnce(readyUpdate)
+      .mockReturnValueOnce(runModelUpdate)
+    mocks.dbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) =>
+      callback(makeTransaction()),
+    )
+    mocks.materializeReviewGatesForWorkPackageCompletion.mockResolvedValueOnce({
+      status: 'materialized',
+      packageStatus: 'awaiting_review',
+      createdGates: [
+        { id: 'gate-qa', gateType: 'qa_review', requiredRole: 'qa', title: 'QA review' },
+      ],
+      sourceArtifact: defaultSourceArtifact({
+        content: 'final output',
+        id: 'artifact-final',
+        metadata: {
+          attemptNumber: 1,
+          hostRepositoryWrites: false,
+          repositoryWrites: false,
+          sandboxPath: `${projectRoot}/.forge/task-runs/task-1/pkg-1/attempt-1`,
+          sandboxWrites: true,
+          source: 'work-package-executor',
+          workPackageId: 'pkg-1',
+        },
+        runId: 'run-1',
+      }),
+    })
+    mocks.loadWorkPackageExecutionContext.mockResolvedValue({
+      agentConfig: null,
+      modelIdUsed: 'test-model',
+      project: { id: 'project-1', localPath: projectRoot, defaultBranch: 'main', githubRepo: null, name: 'Test' },
+      task: { id: 'task-1', githubBranch: null, title: 'Tiny task tracker' },
+      validatedProjectRoot: projectRoot,
+      workPackage: {
+        id: 'pkg-1',
+        metadata: { repositoryWrites: true },
+        requiredCapabilities: {},
+        title: 'Backend package',
+        assignedRole: 'backend',
+      },
+    })
+    mocks.executeWorkPackage.mockResolvedValue({
+      artifactContent: 'final output',
+      artifactMetadata: {
+        hostRepositoryWrites: false,
+        repositoryWrites: false,
+        sandboxPath: `${projectRoot}/.forge/task-runs/task-1/pkg-1/attempt-1`,
+        sandboxWrites: true,
+      },
+      commandResults: [{ command: ['npm', 'test'], exitCode: 0, stdout: 'passed', stderr: '' }],
+      executionContextArtifactContent: 'context packet',
+      executionContextArtifactMetadata: {
+        artifactKind: 'host_readonly_execution_context',
+        hostRepositoryWrites: false,
+        sandboxWrites: false,
+      },
+      executionContextPacket: {},
+      fileCount: 1,
+      hostRepositoryWritePaths: [],
+      hostRepositoryWrites: false,
+      repositoryWrites: false,
+      sandboxPath: `${projectRoot}/.forge/task-runs/task-1/pkg-1/attempt-1`,
+      summary: 'Implemented in sandbox.',
+    })
+
+    try {
+      const result = await handoffApprovedWorkPackages('task-1')
+
+      expect(result).toMatchObject({
+        status: 'handed_off',
+        claimedPackageId: 'pkg-1',
+      })
+      expect(mocks.executeWorkPackage).toHaveBeenCalled()
+      expect(artifactWrites).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          artifactType: 'test_report',
+          content: expect.stringContaining('Command: npm test'),
+          metadata: expect.objectContaining({
+            artifactKind: 'validation_output_summary',
+            validationStatus: 'passed',
+          }),
+        }),
+      ]))
+      expect(artifactWrites).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          metadata: expect.objectContaining({ artifactKind: 'repository_diff_summary' }),
+        }),
+      ]))
+      expect(commandAuditWrites).toHaveLength(0)
+      expect(evidenceWrites).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          diffSummary: null,
+          metadata: expect.objectContaining({
+            isGitRepository: false,
+            validationStatus: 'passed',
+          }),
+          status: 'complete',
+        }),
+      ]))
+      expect([
+        ...artifactWrites.map((artifact) => artifact.content),
+        ...evidenceWrites.map((evidence) => String(evidence.diffSummary ?? '')),
+      ].join('\n')).not.toMatch(/not a git repository/i)
+    } finally {
+      if (previousExecutionFlag === undefined) {
+        delete process.env.FORGE_WORK_PACKAGE_EXECUTION
+      } else {
+        process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
+      }
+      if (previousHostRepositoryWrites === undefined) {
+        delete process.env.FORGE_HOST_REPOSITORY_WRITES
+      } else {
+        process.env.FORGE_HOST_REPOSITORY_WRITES = previousHostRepositoryWrites
+      }
+    }
+  })
+
+  it('skips dirty Git diff evidence for sandbox-only project paths without host writes', async () => {
+    const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
+    const previousHostRepositoryWrites = process.env.FORGE_HOST_REPOSITORY_WRITES
+    process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    process.env.FORGE_HOST_REPOSITORY_WRITES = '0'
+    const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'forge-sandbox-dirty-git-project-'))
+    tempRoots.push(projectRoot)
+    await initDirtyGitRepo(projectRoot)
+
+    const artifactWrites: Array<{
+      artifactType: string
+      content: string
+      metadata: Record<string, unknown>
+    }> = []
+    const commandAuditWrites: Array<Record<string, unknown>> = []
+    const evidenceWrites: Array<Record<string, unknown>> = []
+    let artifactIndex = 0
+    let evidenceIndex = 0
+
+    const insertForValues = (values: Record<string, unknown>) => ({
+      returning: vi.fn(async () => {
+        if (typeof values.artifactType === 'string') {
+          artifactIndex += 1
+          const artifact = {
+            id: `artifact-${artifactIndex}`,
+            agentRunId: values.agentRunId as string,
+            artifactType: values.artifactType,
+            content: values.content as string,
+            metadata: values.metadata as Record<string, unknown>,
+            createdAt: new Date('2026-06-25T00:00:00.000Z'),
+          }
+          artifactWrites.push({
+            artifactType: artifact.artifactType,
+            content: artifact.content,
+            metadata: artifact.metadata,
+          })
+          return [artifact]
+        }
+
+        if (values.command === 'git' && Array.isArray(values.argv)) {
+          commandAuditWrites.push(values)
+          return [{ id: 'audit-1' }]
+        }
+
+        if (typeof values.agentType === 'string') {
+          return [{
+            id: 'run-1',
+            ...values,
+          }]
+        }
+
+        evidenceIndex += 1
+        evidenceWrites.push(values)
+        return [{ id: `vcs-${evidenceIndex}` }]
+      }),
+    })
+    const makeTransaction = () => ({
+      insert: vi.fn(() => ({
+        values: vi.fn((values: Record<string, unknown>) => insertForValues(values)),
+      })),
+      select: vi.fn(() => chain([])),
+      update: vi.fn(() => updateChain([{ id: 'pkg-1' }])),
+    })
+
+    let selectCall = 0
+    mocks.dbSelect.mockImplementation(() => {
+      selectCall += 1
+      if (selectCall === 1) {
+        return chain([{
+          id: 'pkg-1',
+          assignedRole: 'backend',
+          harnessId: 'harness-1',
+          mcpRequirements: [],
+          metadata: { repositoryWrites: true },
+          sequence: 1,
+          status: 'pending',
+          title: 'Backend package',
+        }])
+      }
+      if (selectCall === 2) return chain([])
+      if (selectCall === 3) return chain([])
+      if (selectCall === 4 || selectCall === 6) {
+        return chain([{
+          metadata: {
+            executionLease: {
+              acquiredAt: '2026-06-25T00:00:00.000Z',
+              attemptNumber: 1,
+              heartbeatAt: '2026-06-25T00:00:00.000Z',
+              runId: 'run-1',
+            },
+          },
+          status: 'running',
+        }])
+      }
+      if (selectCall === 5) return chain([])
+      return chain([])
+    })
+
+    const readyUpdate = updateChain([{ id: 'pkg-1' }])
+    const runModelUpdate = updateChain([{ id: 'run-1' }])
+    mocks.dbUpdate
+      .mockReturnValueOnce(readyUpdate)
+      .mockReturnValueOnce(runModelUpdate)
+    mocks.dbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) =>
+      callback(makeTransaction()),
+    )
+    mocks.materializeReviewGatesForWorkPackageCompletion.mockResolvedValueOnce({
+      status: 'materialized',
+      packageStatus: 'awaiting_review',
+      createdGates: [
+        { id: 'gate-qa', gateType: 'qa_review', requiredRole: 'qa', title: 'QA review' },
+      ],
+      sourceArtifact: defaultSourceArtifact({
+        content: 'final output',
+        id: 'artifact-final',
+        metadata: {
+          attemptNumber: 1,
+          hostRepositoryWrites: false,
+          repositoryWrites: false,
+          sandboxPath: `${projectRoot}/.forge/task-runs/task-1/pkg-1/attempt-1`,
+          sandboxWrites: true,
+          source: 'work-package-executor',
+          workPackageId: 'pkg-1',
+        },
+        runId: 'run-1',
+      }),
+    })
+    mocks.loadWorkPackageExecutionContext.mockResolvedValue({
+      agentConfig: null,
+      modelIdUsed: 'test-model',
+      project: { id: 'project-1', localPath: projectRoot, defaultBranch: 'main', githubRepo: null, name: 'Test' },
+      task: { id: 'task-1', githubBranch: null, title: 'Tiny task tracker' },
+      validatedProjectRoot: projectRoot,
+      workPackage: {
+        id: 'pkg-1',
+        metadata: { repositoryWrites: true },
+        requiredCapabilities: {},
+        title: 'Backend package',
+        assignedRole: 'backend',
+      },
+    })
+    mocks.executeWorkPackage.mockResolvedValue({
+      artifactContent: 'final output',
+      artifactMetadata: {
+        hostRepositoryWrites: false,
+        repositoryWrites: false,
+        sandboxPath: `${projectRoot}/.forge/task-runs/task-1/pkg-1/attempt-1`,
+        sandboxWrites: true,
+      },
+      commandResults: [{ command: ['npm', 'test'], exitCode: 0, stdout: 'passed', stderr: '' }],
+      executionContextArtifactContent: 'context packet',
+      executionContextArtifactMetadata: {
+        artifactKind: 'host_readonly_execution_context',
+        hostRepositoryWrites: false,
+        sandboxWrites: false,
+      },
+      executionContextPacket: {},
+      fileCount: 1,
+      hostRepositoryWritePaths: [],
+      hostRepositoryWrites: false,
+      repositoryWrites: false,
+      sandboxPath: `${projectRoot}/.forge/task-runs/task-1/pkg-1/attempt-1`,
+      summary: 'Implemented in sandbox.',
+    })
+
+    try {
+      const result = await handoffApprovedWorkPackages('task-1')
+
+      expect(result).toMatchObject({
+        status: 'handed_off',
+        claimedPackageId: 'pkg-1',
+      })
+      expect(mocks.executeWorkPackage).toHaveBeenCalled()
+      expect(artifactWrites).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          artifactType: 'test_report',
+          content: expect.stringContaining('Command: npm test'),
+          metadata: expect.objectContaining({
+            artifactKind: 'validation_output_summary',
+            validationStatus: 'passed',
+          }),
+        }),
+      ]))
+      expect(artifactWrites).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          metadata: expect.objectContaining({ artifactKind: 'repository_diff_summary' }),
+        }),
+      ]))
+      expect(commandAuditWrites).toHaveLength(0)
+      expect(evidenceWrites).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          diffSummary: null,
+          metadata: expect.objectContaining({
+            isDirty: true,
+            isGitRepository: true,
+            validationStatus: 'passed',
+          }),
+          status: 'complete',
+        }),
+      ]))
+      expect([
+        ...artifactWrites.map((artifact) => artifact.content),
+        ...evidenceWrites.map((evidence) => String(evidence.diffSummary ?? '')),
+      ].join('\n')).not.toContain('README.md')
+    } finally {
+      if (previousExecutionFlag === undefined) {
+        delete process.env.FORGE_WORK_PACKAGE_EXECUTION
+      } else {
+        process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
+      }
+      if (previousHostRepositoryWrites === undefined) {
+        delete process.env.FORGE_HOST_REPOSITORY_WRITES
+      } else {
+        process.env.FORGE_HOST_REPOSITORY_WRITES = previousHostRepositoryWrites
       }
     }
   })
