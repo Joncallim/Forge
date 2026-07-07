@@ -32,10 +32,14 @@ jobs:
 
       - run: npm ci
 
-      - run: npm run forge:pr-contract
+      - run: |
+          if ! grep -q "runPrContractCheck" scripts/github-agent-workflow/pr-contract.ts; then
+            echo "Default branch does not contain the PR contract checker yet; skipping bootstrap PR."
+            exit 0
+          fi
+          npm run forge:pr-contract
         env:
           GITHUB_BOT_LOGIN: github-actions[bot]
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-
