@@ -140,6 +140,28 @@ function blocked(
   }
 }
 
+function ready(
+  projectLocalPath: string,
+  extras: Partial<RepositoryExecutionContext> = {},
+): RepositoryExecutionContext {
+  return {
+    status: 'ready',
+    projectLocalPath,
+    pathExists: true,
+    isGitRepository: false,
+    currentBranch: null,
+    baseBranch: null,
+    isDirty: null,
+    hasRemote: null,
+    intendedTaskBranch: null,
+    branchCollision: null,
+    blockedReason: null,
+    statusShort: '',
+    remoteSummary: '',
+    ...extras,
+  }
+}
+
 function scopedCommandEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     NODE_ENV: process.env.NODE_ENV ?? 'production',
@@ -284,21 +306,11 @@ export async function buildRepositoryExecutionContext(input: {
   const isGitRepository = await gitOk(resolvedPath, ['rev-parse', '--is-inside-work-tree'])
   if (!isGitRepository) {
     if (!isHostRepositoryWritesEnabled()) {
-      return {
-        status: 'ready',
-        projectLocalPath: resolvedPath,
-        pathExists: true,
+      return ready(resolvedPath, {
         isGitRepository: false,
-        currentBranch: null,
         baseBranch: input.project.defaultBranch?.trim() || null,
-        isDirty: null,
         hasRemote: false,
-        intendedTaskBranch: null,
-        branchCollision: null,
-        blockedReason: null,
-        statusShort: '',
-        remoteSummary: '',
-      }
+      })
     }
     return blocked(resolvedPath, `Project local path is not a Git repository: ${resolvedPath}`, {
       pathExists: true,
@@ -330,14 +342,8 @@ export async function buildRepositoryExecutionContext(input: {
 
   const hostRepositoryWritesEnabled = isHostRepositoryWritesEnabled()
   let blockedReason: string | null = null
-  if (isDirty) {
-    blockedReason = hostRepositoryWritesEnabled
-      ? 'Repository working tree is dirty; clean or commit local changes before Forge applies generated files to the host repository.'
-      : 'Repository working tree is dirty; review or clean local changes before execution.'
-  } else if (!hostRepositoryWritesEnabled && !hasRemote) {
-    blockedReason = 'Repository has no configured Git remote.'
-  } else if (!hostRepositoryWritesEnabled && branchCollision) {
-    blockedReason = `Intended task branch already exists: ${intendedTaskBranch}`
+  if (hostRepositoryWritesEnabled && isDirty) {
+    blockedReason = 'Repository working tree is dirty; clean or commit local changes before Forge applies generated files to the host repository.'
   }
 
   return {

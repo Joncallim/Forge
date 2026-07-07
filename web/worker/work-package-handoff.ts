@@ -1817,7 +1817,7 @@ async function executeReadyWorkPackage(
       workPackageId: nextPackage.id,
     })
 
-    if (repositoryAffecting && repositoryContext?.projectLocalPath) {
+    if (repositoryAffecting && repositoryContext?.projectLocalPath && repositoryContext.isGitRepository) {
       await assertActiveExecutionLease()
       const diffResult = await runScopedRepositoryCommand({
         cwd: repositoryContext.projectLocalPath,
