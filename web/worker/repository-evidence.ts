@@ -305,7 +305,8 @@ export async function buildRepositoryExecutionContext(input: {
 
   const isGitRepository = await gitOk(resolvedPath, ['rev-parse', '--is-inside-work-tree'])
   if (!isGitRepository) {
-    if (!isHostRepositoryWritesEnabled()) {
+    const isGitBackedProject = Boolean(input.project.githubRepo?.trim())
+    if (!isGitBackedProject || !isHostRepositoryWritesEnabled()) {
       return ready(resolvedPath, {
         isGitRepository: false,
         baseBranch: input.project.defaultBranch?.trim() || null,
