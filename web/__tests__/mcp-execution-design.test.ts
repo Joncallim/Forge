@@ -388,10 +388,27 @@ describe('deriveMcpGrantDecisions', () => {
     })
   })
 
-  it('warns for healthy MCP access without explicit agent capabilities', () => {
+  it('blocks required healthy MCP access without capabilities or prompt-only context', () => {
     const { design } = parseMcpExecutionDesign([
       '```mcp_execution_design_json',
       '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{},"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const result = deriveMcpGrantDecisions(design, overview([healthyGithub]))
+
+    expect(result.summary).toEqual({ proposed: 0, warning: 0, blocked: 1 })
+    expect(result.decisions[0]).toMatchObject({
+      agent: 'backend',
+      capabilities: [],
+      status: 'blocked',
+    })
+  })
+
+  it('warns for required healthy MCP access without capabilities when prompt-only context exists', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{},"fallback":{"action":"ask_user","message":"Use prompt context only."}}],"promptOverlays":{"backend":"Use GitHub issue context if available, otherwise continue from the prompt."},"mcpAwareSubtasks":[]}',
       '```',
     ].join('\n'))
 
@@ -401,6 +418,7 @@ describe('deriveMcpGrantDecisions', () => {
     expect(result.decisions[0]).toMatchObject({
       agent: 'backend',
       capabilities: [],
+      promptOverlayPresent: true,
       status: 'warning',
     })
   })
