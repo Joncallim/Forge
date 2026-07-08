@@ -5,7 +5,13 @@ import {
   runAgentCommand,
 } from './core/agent-command'
 import { readGitHubEvent } from './io/event'
-import { FileAgentRunRecorder, persistRunRecordToGit, type PersistRunRecordInput } from './io/agent-run-log'
+import {
+  FileAgentRunRecorder,
+  persistRunRecordToGit,
+  resolveRepositoryRoot,
+  withRunLogBranchWorktree,
+  type PersistRunRecordInput,
+} from './io/agent-run-log'
 import { RestGitHubClient, type GitHubClient } from './io/github-client'
 
 type GitHubIssueCommentEvent = {
@@ -113,18 +119,27 @@ export async function runAgentCommandForEvent(input: {
 export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const event = await readGitHubEvent<GitHubIssueCommentEvent>(env)
   const client = RestGitHubClient.fromEnv(env)
-  const result = await runAgentCommandForEvent({
+  const persistRecord = runLogPersisterFromEnv(env)
+  const targetBranch = runLogTargetBranchFromEnv(env)
+  const run = async (repositoryRoot?: string) => await runAgentCommandForEvent({
     client,
     event,
     botLogin: botLoginFromEnv(env),
     recorder: new FileAgentRunRecorder({
-      persistRecord: runLogPersisterFromEnv(env),
-      targetBranch: runLogTargetBranchFromEnv(env),
+      repositoryRoot,
+      persistRecord,
+      targetBranch,
     }),
     githubRunId: env.GITHUB_RUN_ID,
     githubRunAttempt: env.GITHUB_RUN_ATTEMPT,
     shortSha: shortShaFromEnv(env),
   })
+  const result = persistRecord
+    ? await withRunLogBranchWorktree({
+        repositoryRoot: await resolveRepositoryRoot(env.GITHUB_WORKSPACE),
+        targetBranch,
+      }, async (runLogRepositoryRoot) => await run(runLogRepositoryRoot))
+    : await run()
 
   console.info(JSON.stringify(result, null, 2))
 }

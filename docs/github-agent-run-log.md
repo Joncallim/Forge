@@ -1,5 +1,9 @@
 # GitHub Agent Run Log
 
+> Part of the GitHub-native agent workflow. For how the run log fits the rest of
+> the workflow (states, module ownership, remaining features), see
+> [`github-native-agent-workflow-architecture.md`](./github-native-agent-workflow-architecture.md).
+
 The GitHub-native workflow keeps a small run log in the project repository so an
 accepted agent request is still visible after a chat session or GitHub Actions
 job ends.
@@ -28,10 +32,10 @@ Issue comments and chat threads are not a durable workflow database. The run log
 gives later steps a simple handoff point:
 
 - #143 command routing records that a maintainer requested implementation.
-- #144 dispatch can later move that record from `requested` to `running` or
+- #144 dispatch can later move that record from `requested` to `handed-off` or
   `blocked`.
-- Later handoff and pull request steps can add a branch name and pull request
-  number.
+- Later handoff can add artifact paths. Pull request linking is reserved for a
+  future slice.
 - The epic review pass can inspect what happened without relying on a lost chat
   session.
 
@@ -60,12 +64,37 @@ file cannot be written or pushed, the router stops instead of making the issue
 look ready for dispatch without a durable run record.
 
 The workflow checks out trusted default-branch code, then pushes only the run-log
-JSON to the dedicated `forge/agent-run-log` branch. It must not check out or run
-fork, pull request, or comment-supplied code while holding `contents: write`.
+JSON to the dedicated `forge/agent-run-log` branch. It must not run fork, pull
+request, issue-comment, or run-log-branch code while holding `contents: write`.
 Keeping the run log on its own branch avoids direct commits to protected default
 branches while still making the record visible in the repository.
+
+When a workflow needs to read or update an existing run record, it uses a
+temporary Git worktree for `forge/agent-run-log`. The job still runs Forge's
+scripts from the default-branch checkout. The temporary worktree is only a data
+view of `.forge/runs/<issue-number>/<run-id>.json`; workflows must not run code
+from it.
 
 Run-log persistence intentionally fails closed. If Forge cannot write and push
 the durable record, it does not apply `agent-requested` and does not post the
 accepted-request comment. That keeps later dispatch from seeing an issue as
 queued without a durable run record.
+
+## Handoff Artifacts
+
+Handoff files are not durable run-log records. They live under a nested,
+git-ignored directory:
+
+```text
+.forge/runs/<issue-number>/<run-id>/handoff.md
+.forge/runs/<issue-number>/<run-id>/prompt.md
+.forge/runs/<issue-number>/<run-id>/metadata.json
+```
+
+GitHub Actions uploads that directory as a workflow artifact when handoff is
+generated in Actions. Local handoff generation prints the paths. The repository
+must not commit those prompt or metadata files, and they must not contain
+secrets, credentials, model transcripts, or local auth material.
+
+Because the artifact directory starts with `.forge`, the GitHub Actions upload
+step must explicitly include hidden files.

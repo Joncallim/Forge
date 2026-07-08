@@ -1,24 +1,25 @@
 import { execFile as execFileCallback } from 'node:child_process'
-import { mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { agentRunRecordSchema, type AgentRunEvent, type AgentRunRecord, type RunValidationSummary } from '../contracts/agent-run-record'
-import { positiveIntSchema, runIdSchema, type RunId, type RunStatus } from '../contracts/common'
+import {
+  handoffArtifactsSchema,
+  nonEmptyTrimmedStringSchema,
+  positiveIntSchema,
+  runIdSchema,
+  type HandoffArtifacts,
+  type RunId,
+  type RunStatus,
+} from '../contracts/common'
 import type { AgentCommandRunRecordInput, AgentCommandRunRecorder } from '../core/agent-command'
+import { redactSecretLikeText } from '../core/redaction'
 
 const RUN_LOG_RELATIVE_DIR = path.join('.forge', 'runs')
+export const DEFAULT_RUN_LOG_BRANCH = 'forge/agent-run-log'
 const MAX_EVENT_MESSAGE_LENGTH = 500
 const execFile = promisify(execFileCallback)
-// Best-effort redaction only. Do not route secrets or transcripts into run-log text.
-const SECRET_PATTERNS: readonly RegExp[] = Object.freeze([
-  /\bghp_[A-Za-z0-9_]{20,}\b/g,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
-  /\bsk-[A-Za-z0-9_-]{20,}\b/g,
-  /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/gi,
-  /\b(token|password|secret|api[_-]?key)\s*[:=]\s*['"]?[^'"\s,;]+/gi,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
-])
-
 export type PersistRunRecordInput = Readonly<{
   filePath: string
   record: AgentRunRecord
@@ -31,6 +32,13 @@ type RunLogOptions = Readonly<{
   now?: Date
   persistRecord?: (input: PersistRunRecordInput) => Promise<void>
   targetBranch?: string | null
+}>
+
+export type RunLogBranchWorktreeOptions = Readonly<{
+  repositoryRoot?: string
+  targetBranch?: string | null
+  worktreeParent?: string | null
+  requireExistingBranch?: boolean
 }>
 
 export type CreateRunRecordInput = AgentCommandRunRecordInput & Readonly<{
@@ -52,6 +60,9 @@ export type UpdateRunStatusInput = Readonly<{
   runId: RunId
   status: RunStatus
   message?: string
+  branchName?: string | null
+  blockedReason?: string | null
+  handoffArtifacts?: HandoffArtifacts | null
 }>
 
 export type LinkPullRequestInput = Readonly<{
@@ -96,11 +107,12 @@ async function repositoryRoot(options: RunLogOptions = {}): Promise<string> {
   return await findRepositoryRoot(process.cwd())
 }
 
+export async function resolveRepositoryRoot(startDirectory?: string): Promise<string> {
+  return await repositoryRoot({ repositoryRoot: startDirectory })
+}
+
 function sanitizeLogText(value: string): string {
-  let sanitized = value.trim()
-  for (const pattern of SECRET_PATTERNS) {
-    sanitized = sanitized.replace(pattern, '[redacted]')
-  }
+  let sanitized = redactSecretLikeText(value).trim()
   sanitized = sanitized.replace(/\s+/g, ' ').trim()
   if (sanitized.length > MAX_EVENT_MESSAGE_LENGTH) {
     sanitized = `${sanitized.slice(0, MAX_EVENT_MESSAGE_LENGTH - 16).trimEnd()} [truncated]`
@@ -227,6 +239,17 @@ export async function updateRunStatus(input: UpdateRunStatusInput, options: RunL
   return await updateRecord(input.issueNumber, input.runId, options, (record, at) => ({
     ...record,
     status: input.status,
+    branchName: input.branchName === undefined ? record.branchName : input.branchName,
+    blockedReason: input.blockedReason === undefined
+      ? record.blockedReason
+      : input.blockedReason === null
+        ? null
+        : sanitizeLogText(input.blockedReason),
+    handoffArtifacts: input.handoffArtifacts === undefined
+      ? record.handoffArtifacts
+      : input.handoffArtifacts === null
+        ? null
+        : handoffArtifactsSchema.parse(input.handoffArtifacts),
     updatedAt: at,
     events: [
       ...record.events,
@@ -283,8 +306,9 @@ export async function findLatestRunForIssue(
   let entries: string[]
   try {
     entries = await readdir(directory)
-  } catch {
-    return null
+  } catch (error) {
+    if (filesystemErrorCode(error) === 'ENOENT') return null
+    throw error
   }
 
   const records: AgentRunRecord[] = []
@@ -315,12 +339,48 @@ export function runLogPathForDisplay(issueNumber: number, runId: RunId): string 
   return path.posix.join('.forge', 'runs', String(record.issueNumber), `${record.runId}.json`)
 }
 
+class GitCommandError extends Error {
+  constructor(
+    message: string,
+    readonly code: number | null,
+    readonly stderr: string,
+  ) {
+    super(message)
+    this.name = 'GitCommandError'
+  }
+}
+
+function errorCode(error: unknown): number | null {
+  const code = (error as { code?: unknown }).code
+  return typeof code === 'number' ? code : null
+}
+
+function filesystemErrorCode(error: unknown): string | null {
+  const code = (error as { code?: unknown }).code
+  return typeof code === 'string' ? code : null
+}
+
+function errorText(error: unknown, key: 'stderr' | 'stdout'): string {
+  const value = (error as Record<string, unknown>)[key]
+  return typeof value === 'string' || Buffer.isBuffer(value) ? value.toString() : ''
+}
+
 async function git(repositoryRootPath: string, args: readonly string[]): Promise<{ stdout: string }> {
-  const { stdout } = await execFile('git', args, {
-    cwd: repositoryRootPath,
-    timeout: 120_000,
-  })
-  return { stdout: stdout.toString() }
+  try {
+    const { stdout } = await execFile('git', args, {
+      cwd: repositoryRootPath,
+      timeout: 120_000,
+    })
+    return { stdout: stdout.toString() }
+  } catch (error) {
+    const stderr = errorText(error, 'stderr')
+    const stdout = errorText(error, 'stdout')
+    throw new GitCommandError(
+      `git ${args.join(' ')} failed${stderr || stdout ? `: ${(stderr || stdout).trim()}` : '.'}`,
+      errorCode(error),
+      stderr,
+    )
+  }
 }
 
 async function tryGit(repositoryRootPath: string, args: readonly string[]): Promise<boolean> {
@@ -333,16 +393,24 @@ async function tryGit(repositoryRootPath: string, args: readonly string[]): Prom
 }
 
 function targetBranchName(input: PersistRunRecordInput, currentBranch: string): string {
-  return (input.targetBranch ?? process.env.FORGE_AGENT_RUN_LOG_BRANCH)?.trim() || currentBranch
+  return (input.targetBranch ?? process.env.FORGE_AGENT_RUN_LOG_BRANCH)?.trim() || currentBranch || DEFAULT_RUN_LOG_BRANCH
 }
 
 async function fetchRemoteBranch(root: string, branchName: string): Promise<boolean> {
-  return await tryGit(root, [
+  try {
+    await git(root, ['ls-remote', '--exit-code', '--heads', 'origin', branchName])
+  } catch (error) {
+    if (error instanceof GitCommandError && error.code === 2) return false
+    throw error
+  }
+
+  await git(root, [
     'fetch',
     '--no-tags',
     'origin',
     `+refs/heads/${branchName}:refs/remotes/origin/${branchName}`,
   ])
+  return true
 }
 
 async function rebaseOnRemoteBranchIfPresent(root: string, branchName: string): Promise<void> {
@@ -365,9 +433,6 @@ export async function persistRunRecordToGit(input: PersistRunRecordInput): Promi
   await git(root, ['config', 'user.name', 'github-actions[bot]'])
   await git(root, ['config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'])
   const branchName = (await git(root, ['branch', '--show-current'])).stdout.trim()
-  if (branchName === '') {
-    throw new Error('Run log git persistence requires a checked-out branch.')
-  }
   const targetBranch = targetBranchName(input, branchName)
   await git(root, ['check-ref-format', '--branch', targetBranch])
   await git(root, ['add', '--', relativePath])
@@ -380,7 +445,8 @@ export async function persistRunRecordToGit(input: PersistRunRecordInput): Promi
   try {
     await git(root, ['diff', '--cached', '--quiet', '--', relativePath])
     return
-  } catch {
+  } catch (error) {
+    if (!(error instanceof GitCommandError) || error.code !== 1) throw error
     // git diff --quiet exits non-zero when the run record has staged changes.
   }
 
@@ -391,5 +457,40 @@ export async function persistRunRecordToGit(input: PersistRunRecordInput): Promi
   } catch {
     await rebaseOnRemoteBranchIfPresent(root, targetBranch)
     await pushHeadToBranch(root, targetBranch)
+  }
+}
+
+function normalizeRunLogBranchName(branchName: string | null | undefined): string {
+  const targetBranch = nonEmptyTrimmedStringSchema.parse(branchName?.trim() || DEFAULT_RUN_LOG_BRANCH)
+  if (targetBranch === 'HEAD') throw new Error('Run-log branch cannot be HEAD.')
+  return targetBranch
+}
+
+export async function withRunLogBranchWorktree<T>(
+  options: RunLogBranchWorktreeOptions,
+  callback: (runLogRepositoryRoot: string) => Promise<T>,
+): Promise<T> {
+  const trustedRoot = await repositoryRoot({ repositoryRoot: options.repositoryRoot })
+  const targetBranch = normalizeRunLogBranchName(options.targetBranch ?? process.env.FORGE_AGENT_RUN_LOG_BRANCH)
+  await git(trustedRoot, ['check-ref-format', '--branch', targetBranch])
+
+  const parent = options.worktreeParent ? path.resolve(options.worktreeParent) : os.tmpdir()
+  const scratchRoot = await mkdtemp(path.join(parent, 'forge-run-log-worktree-'))
+  const worktreeRoot = path.join(scratchRoot, 'repo')
+  let worktreeAdded = false
+
+  try {
+    const remoteBranchExists = await fetchRemoteBranch(trustedRoot, targetBranch)
+    if (!remoteBranchExists && options.requireExistingBranch === true) {
+      throw new Error(`Run-log branch ${targetBranch} does not exist on origin.`)
+    }
+    const startPoint = remoteBranchExists ? `origin/${targetBranch}` : 'HEAD'
+
+    await git(trustedRoot, ['worktree', 'add', '--detach', worktreeRoot, startPoint])
+    worktreeAdded = true
+    return await callback(worktreeRoot)
+  } finally {
+    if (worktreeAdded) await tryGit(trustedRoot, ['worktree', 'remove', '--force', worktreeRoot])
+    await rm(scratchRoot, { recursive: true, force: true })
   }
 }

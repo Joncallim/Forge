@@ -183,6 +183,9 @@ implementation plan.
 - [Design guide](docs/design.md) - product model, UI principles, screenshot evidence, and visual QA notes.
 - [ACP and Zed connector](docs/acp-zed-connector.md) - how Forge talks to local ACP agents such as Codex CLI and Claude Code.
 - [GitHub issue intake](docs/github-issue-intake.md) - how Forge validates GitHub Issues before marking them ready for agent work.
+- [GitHub-native agent workflow](docs/workflows/github-native-agent-workflow.md) - issue-to-handoff-to-PR workflow for controlled agent work on GitHub.
+- [GitHub agent PR contract](docs/github-agent-pr-contract.md) - pull request body format used by generated agent work and the PR checker.
+- [GitHub agent run log](docs/github-agent-run-log.md) - durable run state stored on the dedicated run-log branch.
 - [Roadmap](docs/roadmap.md) - current beta status, Workforce architecture, Forge Workspace direction, and upcoming slices.
 - [Forge Workspace roadmap](docs/workspace-roadmap.md) - proposed implementation plan for dockable panes, browsers, Notion/GitHub linking, and permissioned agent operations.
 - [Architecture decisions](docs/adr/) - durable ADRs for major technical decisions.

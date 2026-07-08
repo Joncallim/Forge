@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -16,6 +16,7 @@ import {
   recordBlockedReason,
   recordRequested,
   updateRunStatus,
+  withRunLogBranchWorktree,
 } from '@/scripts/github-agent-workflow/io/agent-run-log'
 import { FakeGitHubClient } from '@/scripts/github-agent-workflow/io/fake-github-client'
 import type { GitHubIssue } from '@/scripts/github-agent-workflow/io/github-client'
@@ -154,6 +155,36 @@ describe('agent run log contracts', () => {
 
     expect(withTokenUsage.success).toBe(false)
   })
+
+  it('rejects invalid branch names in durable run records', async () => {
+    expect(agentRunRecordSchema.safeParse({
+      runId: 'issue-141-1234567890-1',
+      issueNumber: 141,
+      issueTitle: '[EPIC] GitHub-native agent workflow',
+      runtime: 'codex',
+      action: 'implement',
+      requestedBy: 'Joncallim',
+      status: 'handed-off',
+      branchName: 'issue-141-foundation',
+      blockedReason: null,
+      handoffArtifacts: null,
+      source: {
+        type: 'issue_comment',
+        commentId: 99887766,
+      },
+      prNumber: null,
+      validationSummary: null,
+      createdAt: '2026-07-05T10:00:00.000Z',
+      updatedAt: '2026-07-05T10:00:00.000Z',
+      events: [
+        {
+          at: '2026-07-05T10:00:00.000Z',
+          status: 'handed-off',
+          message: 'Run record updated.',
+        },
+      ],
+    }).success).toBe(false)
+  })
 })
 
 describe('agent run log git visibility', () => {
@@ -278,16 +309,36 @@ describe('agent run log storage', () => {
     const updated = await linkPullRequest({
       issueNumber: 146,
       runId: 'issue-146-1234567890-1',
-      branchName: 'issue-146-durable-agent-run-log',
+      branchName: 'agent/issue-146-durable-agent-run-log',
       prNumber: 162,
     }, { repositoryRoot: root, now: new Date('2026-07-06T02:00:00.000Z') })
 
     expect(updated).toMatchObject({
       status: 'pr-opened',
-      branchName: 'issue-146-durable-agent-run-log',
+      branchName: 'agent/issue-146-durable-agent-run-log',
       prNumber: 162,
       updatedAt: '2026-07-06T02:00:00.000Z',
     })
+  })
+
+  it('rejects invalid branch names during status updates', async () => {
+    const root = await tempRepositoryRoot()
+    await recordRequested({
+      runId: 'issue-146-1234567890-1',
+      issueNumber: 146,
+      issueTitle: READY_ISSUE.title,
+      runtime: 'codex',
+      action: 'implement',
+      requestedBy: 'Joncallim',
+      source: { type: 'issue_comment', commentId: 102 },
+    }, { repositoryRoot: root, now: new Date('2026-07-06T01:00:00.000Z') })
+
+    await expect(updateRunStatus({
+      issueNumber: 146,
+      runId: 'issue-146-1234567890-1',
+      status: 'handed-off',
+      branchName: 'issue-146-durable-agent-run-log',
+    }, { repositoryRoot: root })).rejects.toThrow()
   })
 
   it('records blocked runs with a blocked reason', async () => {
@@ -314,6 +365,30 @@ describe('agent run log storage', () => {
       status: 'blocked',
       message: 'No eligible runtime is configured.',
     })
+  })
+
+  it('redacts blocked reasons passed through status updates', async () => {
+    const root = await tempRepositoryRoot()
+    const secretToken = `ghs_${'a'.repeat(40)}`
+    await recordRequested({
+      runId: 'issue-146-1234567890-1',
+      issueNumber: 146,
+      issueTitle: READY_ISSUE.title,
+      runtime: 'codex',
+      action: 'implement',
+      requestedBy: 'Joncallim',
+      source: { type: 'issue_comment', commentId: 103 },
+    }, { repositoryRoot: root, now: new Date('2026-07-06T01:00:00.000Z') })
+
+    const blocked = await updateRunStatus({
+      issueNumber: 146,
+      runId: 'issue-146-1234567890-1',
+      status: 'blocked',
+      blockedReason: `token=${secretToken}`,
+    }, { repositoryRoot: root, now: new Date('2026-07-06T03:00:00.000Z') })
+
+    expect(blocked.blockedReason).toBe('[redacted]')
+    expect(await readFile(runPath(root), 'utf8')).not.toContain(secretToken)
   })
 
   it('prevents agent-requested and accepted comments when persistence fails', async () => {
@@ -431,6 +506,122 @@ describe('agent run log storage', () => {
     ])).toBe(128)
   })
 
+  it('reads and updates the dedicated run-log branch through a separate worktree', async () => {
+    const root = await tempRepositoryRoot()
+    const origin = path.join(root, 'origin.git')
+    const seed = path.join(root, 'seed')
+    const trusted = path.join(root, 'trusted')
+    const runLogBranch = 'forge/agent-run-log'
+
+    await git(root, ['init', '--bare', origin])
+    await mkdir(seed)
+    await git(seed, ['init', '-b', 'main'])
+    await configureGitUser(seed)
+    await writeFile(path.join(seed, 'README.md'), '# Forge run log worktree test\n', 'utf8')
+    await git(seed, ['add', 'README.md'])
+    await git(seed, ['commit', '-m', 'Initial commit'])
+    await git(seed, ['remote', 'add', 'origin', origin])
+    await git(seed, ['push', '-u', 'origin', 'main'])
+
+    await recordRequested({
+      runId: 'issue-200-1234567890-1',
+      issueNumber: 200,
+      issueTitle: 'Run log branch sync',
+      runtime: 'codex',
+      action: 'implement',
+      requestedBy: 'Joncallim',
+      source: { type: 'issue_comment', commentId: 2001 },
+    }, {
+      repositoryRoot: seed,
+      persistRecord: persistRunRecordToGit,
+      targetBranch: runLogBranch,
+      now: new Date('2026-07-06T01:00:00.000Z'),
+    })
+
+    await git(root, ['clone', '--branch', 'main', origin, trusted])
+
+    expect(await findLatestRunForIssue(200, { repositoryRoot: trusted })).toBeNull()
+
+    await withRunLogBranchWorktree({ repositoryRoot: trusted, targetBranch: runLogBranch }, async (runLogRoot) => {
+      expect(runLogRoot).not.toBe(trusted)
+      const latest = await findLatestRunForIssue(200, { repositoryRoot: runLogRoot })
+      expect(latest?.status).toBe('requested')
+
+      await updateRunStatus({
+        issueNumber: 200,
+        runId: 'issue-200-1234567890-1',
+        status: 'blocked',
+        message: 'Worktree sync test updated the run log.',
+      }, {
+        repositoryRoot: runLogRoot,
+        persistRecord: persistRunRecordToGit,
+        targetBranch: runLogBranch,
+        now: new Date('2026-07-06T01:05:00.000Z'),
+      })
+    })
+
+    const trustedBranch = (await git(trusted, ['branch', '--show-current'])).trim()
+    expect(trustedBranch).toBe('main')
+    expect(await findLatestRunForIssue(200, { repositoryRoot: trusted })).toBeNull()
+
+    const persistedRun = await git(root, [
+      '--git-dir',
+      origin,
+      'show',
+      `${runLogBranch}:.forge/runs/200/issue-200-1234567890-1.json`,
+    ])
+    expect(JSON.parse(persistedRun)).toMatchObject({
+      runId: 'issue-200-1234567890-1',
+      status: 'blocked',
+    })
+  })
+
+  it('fails closed when a required run-log branch is missing', async () => {
+    const root = await tempRepositoryRoot()
+    const origin = path.join(root, 'origin.git')
+    const trusted = path.join(root, 'trusted')
+    const scratchParent = path.join(root, 'scratch')
+
+    await git(root, ['init', '--bare', origin])
+    await git(root, ['clone', origin, trusted])
+    await mkdir(scratchParent)
+    await configureGitUser(trusted)
+    await writeFile(path.join(trusted, 'README.md'), '# Forge run log missing branch test\n', 'utf8')
+    await git(trusted, ['add', 'README.md'])
+    await git(trusted, ['commit', '-m', 'Initial commit'])
+    await git(trusted, ['push', '-u', 'origin', 'HEAD:main'])
+
+    await expect(withRunLogBranchWorktree({
+      repositoryRoot: trusted,
+      targetBranch: 'forge/agent-run-log',
+      worktreeParent: scratchParent,
+      requireExistingBranch: true,
+    }, async () => undefined)).rejects.toThrow('does not exist on origin')
+    expect(await readdir(scratchParent)).toEqual([])
+  })
+
+  it('does not treat git fetch infrastructure failures as a missing run-log branch', async () => {
+    const root = await tempRepositoryRoot()
+    const trusted = path.join(root, 'trusted')
+    const scratchParent = path.join(root, 'scratch')
+
+    await mkdir(trusted)
+    await mkdir(scratchParent)
+    await git(trusted, ['init', '-b', 'main'])
+    await configureGitUser(trusted)
+    await writeFile(path.join(trusted, 'README.md'), '# Forge run log fetch failure test\n', 'utf8')
+    await git(trusted, ['add', 'README.md'])
+    await git(trusted, ['commit', '-m', 'Initial commit'])
+    await git(trusted, ['remote', 'add', 'origin', path.join(root, 'missing-origin.git')])
+
+    await expect(withRunLogBranchWorktree({
+      repositoryRoot: trusted,
+      targetBranch: 'forge/agent-run-log',
+      worktreeParent: scratchParent,
+    }, async () => undefined)).rejects.toThrow('ls-remote')
+    expect(await readdir(scratchParent)).toEqual([])
+  })
+
   it('redacts secret-shaped values and truncates transcript-shaped event messages', async () => {
     const root = await tempRepositoryRoot()
     await recordRequested({
@@ -446,12 +637,12 @@ describe('agent run log storage', () => {
     await appendRunEvent({
       issueNumber: 146,
       runId: 'issue-146-1234567890-1',
-      message: `token=ghp_${'a'.repeat(40)} ${'model transcript line '.repeat(80)}`,
+      message: `token=ghr_${'a'.repeat(40)} ${'model transcript line '.repeat(80)}`,
     }, { repositoryRoot: root, now: new Date('2026-07-06T01:01:00.000Z') })
 
     const raw = await readFile(runPath(root), 'utf8')
     const record = agentRunRecordSchema.parse(JSON.parse(raw))
-    expect(raw).not.toContain('ghp_')
+    expect(raw).not.toContain('ghr_')
     expect(raw).not.toContain('model transcript line '.repeat(40))
     expect(record.events.at(-1)?.message).toContain('[redacted]')
     expect(record.events.at(-1)?.message).toContain('[truncated]')
@@ -509,5 +700,14 @@ describe('agent run log storage', () => {
 
     expect(latest?.runId).toBe('issue-146-1234567890-1')
     expect(await findLatestRunForIssue(999, { repositoryRoot: root })).toBeNull()
+  })
+
+  it('does not report corrupt run-log paths as a missing run', async () => {
+    const root = await tempRepositoryRoot()
+    await mkdir(path.join(root, '.forge', 'runs'), { recursive: true })
+    await writeFile(path.join(root, '.forge', 'runs', '146'), 'not a directory', 'utf8')
+
+    await expect(findLatestRunForIssue(146, { repositoryRoot: root })).rejects.toThrow()
+    await expect(findLatestRunForIssue(999, { repositoryRoot: root })).resolves.toBeNull()
   })
 })

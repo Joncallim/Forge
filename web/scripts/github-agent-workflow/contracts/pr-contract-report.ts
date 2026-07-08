@@ -13,9 +13,13 @@ export const prContractCriterionSchema = freezeSchema(z.object({
   evidence: nonEmptyTrimmedStringSchema.nullable(),
 }).strict())
 
+export const prContractLinkedIssueStatusSchema = freezeSchema(z.enum(['found', 'missing', 'not-found', 'not-issue']))
+
 export const prContractReportSchema = freezeSchema(z.object({
   pullRequestNumber: positiveIntSchema,
   pullRequestTitle: nonEmptyTrimmedStringSchema,
+  draft: z.boolean(),
+  linkedIssueStatus: prContractLinkedIssueStatusSchema,
   linkedIssueNumber: positiveIntSchema.nullable(),
   linkedIssueTitle: nonEmptyTrimmedStringSchema.nullable(),
   criteria: z.array(prContractCriterionSchema),
@@ -29,4 +33,5 @@ export const prContractReportSchema = freezeSchema(z.object({
 }).strict())
 
 export type PrContractCriterion = z.infer<typeof prContractCriterionSchema>
+export type PrContractLinkedIssueStatus = z.infer<typeof prContractLinkedIssueStatusSchema>
 export type PRContractReport = z.infer<typeof prContractReportSchema>

@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { agentBranchNameSchema } from './branch-name'
 import {
   agentActionSchema,
   agentRuntimeSchema,
@@ -17,7 +18,7 @@ export const dispatchRequestSchema = freezeSchema(z.object({
   runtime: agentRuntimeSchema,
   action: agentActionSchema,
   requestedBy: nonEmptyTrimmedStringSchema,
-  branchName: nonEmptyTrimmedStringSchema,
+  branchName: agentBranchNameSchema,
   dryRun: z.boolean(),
   source: sourceRefSchema,
   requestedAt: isoTimestampSchema,

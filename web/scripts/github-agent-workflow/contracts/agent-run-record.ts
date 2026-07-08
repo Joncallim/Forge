@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { agentBranchNameSchema } from './branch-name'
 import {
   agentActionSchema,
   agentRuntimeSchema,
@@ -33,7 +34,7 @@ export const agentRunRecordSchema = freezeSchema(z.object({
   action: agentActionSchema,
   requestedBy: nonEmptyTrimmedStringSchema,
   status: runStatusSchema,
-  branchName: nonEmptyTrimmedStringSchema.nullable(),
+  branchName: agentBranchNameSchema.nullable(),
   blockedReason: nonEmptyTrimmedStringSchema.nullable(),
   handoffArtifacts: handoffArtifactsSchema.nullable(),
   checkpointIssueRef: positiveIntSchema.default(32),
