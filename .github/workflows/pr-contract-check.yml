@@ -37,7 +37,7 @@ jobs:
       - run: npm ci
 
       - run: |
-          if grep -q "PR-0 foundation only" scripts/github-agent-workflow/pr-contract.ts; then
+          if grep -q "failUntilIssueLands(145" scripts/github-agent-workflow/pr-contract.ts; then
             echo "Default branch does not contain the PR contract checker yet; skipping bootstrap PR."
             exit 0
           fi
