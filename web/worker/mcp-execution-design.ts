@@ -702,9 +702,12 @@ function decisionStatus(
   requirement: McpExecutionRequirement,
   status: ProjectMcpStatus | null,
   capabilities: string[],
+  hasRunScopedMcpInstructions: boolean,
 ): McpGrantDecisionStatus {
   if (!isKnownMcpId(requirement.mcpId)) return 'blocked'
-  if (capabilities.length === 0) return 'warning'
+  if (capabilities.length === 0) {
+    return requirement.requirement === 'optional' || hasRunScopedMcpInstructions ? 'warning' : 'blocked'
+  }
   // A capability outside the safe beta allowlist (or explicitly prohibited) is
   // blocked at handoff by evaluateWorkPackageMcpBroker. Apply the same allowlist
   // here so the grant-decision preview never advertises an unsafe capability as
@@ -721,6 +724,11 @@ function decisionStatus(
   if (healthy) return 'proposed'
   if (canProceedWithoutMcp(requirement)) return 'warning'
   return 'blocked'
+}
+
+function designHasRunScopedMcpInstructionsForAgent(design: McpExecutionDesign, agent: string): boolean {
+  return typeof design.promptOverlays[agent] === 'string' ||
+    design.mcpAwareSubtasks.some((subtask) => subtask.agent === agent)
 }
 
 export function deriveMcpGrantDecisions(
@@ -749,7 +757,12 @@ export function deriveMcpGrantDecisions(
 
     for (const agent of agents) {
       const capabilities = requirement.agentPermissions[agent] ?? []
-      const grantStatus = decisionStatus(requirement, status, capabilities)
+      const grantStatus = decisionStatus(
+        requirement,
+        status,
+        capabilities,
+        designHasRunScopedMcpInstructionsForAgent(design, agent),
+      )
       summary[grantStatus] += 1
       decisions.push({
         decisionId: `req-${index}:${agent}:${requirement.mcpId}`,
