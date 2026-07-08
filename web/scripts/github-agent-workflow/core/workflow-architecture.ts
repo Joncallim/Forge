@@ -1,19 +1,17 @@
-// Shared map of which remaining Epic #141 issue owns which GitHub-native workflow
-// behaviour, plus the fail-closed placeholder message the not-yet-implemented
-// CLIs print. Encoding the ownership here (rather than as free text in each
-// placeholder) keeps dispatch.ts / pr-contract.ts / handoff.ts pointing at the
-// same shared contracts and the same architecture doc.
+// Shared map of which Epic #141 issue owns each GitHub-native workflow
+// behaviour. Keeping the ownership here makes dispatch.ts / pr-contract.ts /
+// handoff.ts and the architecture docs point at the same shared contracts.
 
 export const ARCHITECTURE_DOC_PATH = 'docs/github-native-agent-workflow-architecture.md'
 
-export type WorkflowPlaceholder = Readonly<{
+export type WorkflowFeatureOwnership = Readonly<{
   issue: number
   behaviour: string
   // Shared modules this feature must build on instead of inventing its own.
   sharedContracts: readonly string[]
 }>
 
-export const DISPATCH_PLACEHOLDER: WorkflowPlaceholder = Object.freeze({
+export const DISPATCH_FEATURE_OWNERSHIP: WorkflowFeatureOwnership = Object.freeze({
   issue: 144,
   behaviour: 'safe agent dispatch — turn an accepted request into a bounded work order',
   sharedContracts: Object.freeze([
@@ -27,7 +25,7 @@ export const DISPATCH_PLACEHOLDER: WorkflowPlaceholder = Object.freeze({
   ]),
 })
 
-export const PR_CONTRACT_PLACEHOLDER: WorkflowPlaceholder = Object.freeze({
+export const PR_CONTRACT_FEATURE_OWNERSHIP: WorkflowFeatureOwnership = Object.freeze({
   issue: 145,
   behaviour: 'PR acceptance-criteria contract checker — report each criterion, do not block merges',
   sharedContracts: Object.freeze([
@@ -38,7 +36,7 @@ export const PR_CONTRACT_PLACEHOLDER: WorkflowPlaceholder = Object.freeze({
   ]),
 })
 
-export const HANDOFF_PLACEHOLDER: WorkflowPlaceholder = Object.freeze({
+export const HANDOFF_FEATURE_OWNERSHIP: WorkflowFeatureOwnership = Object.freeze({
   issue: 153,
   behaviour: 'controlled Claude Code / Codex handoff adapter — generate artifacts, never auto-execute',
   sharedContracts: Object.freeze([
@@ -49,19 +47,13 @@ export const HANDOFF_PLACEHOLDER: WorkflowPlaceholder = Object.freeze({
   ]),
 })
 
-export function architecturePlaceholderMessage(placeholder: WorkflowPlaceholder): string {
+export function architectureOwnershipMessage(ownership: WorkflowFeatureOwnership): string {
   return [
-    `Not implemented yet. Issue #${placeholder.issue} owns this behaviour: ${placeholder.behaviour}.`,
+    `Issue #${ownership.issue} owns this behaviour: ${ownership.behaviour}.`,
     '',
-    'Build it on the shared workflow contracts instead of inventing new ones:',
-    ...placeholder.sharedContracts.map((entry) => `  - ${entry}`),
+    'The implementation uses these shared workflow contracts:',
+    ...ownership.sharedContracts.map((entry) => `  - ${entry}`),
     '',
     `Architecture map: ${ARCHITECTURE_DOC_PATH}`,
   ].join('\n')
-}
-
-// Fail closed. The GitHub-native workflow must not look like a feature ran when
-// it has not, so the placeholder CLIs throw with a contract-aware pointer.
-export function failWithArchitecturePointer(placeholder: WorkflowPlaceholder): never {
-  throw new Error(architecturePlaceholderMessage(placeholder))
 }

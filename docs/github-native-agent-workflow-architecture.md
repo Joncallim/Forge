@@ -5,7 +5,7 @@ This is the **implementation architecture map** for Epic
 guide. The plain-English workflow guide is owned by
 [#147](https://github.com/Joncallim/Forge/issues/147).
 
-Its job is to make sure the remaining features
+Its job is to show how the implemented features
 (#144, #145, #147, #152, #153) build on **one** set of contracts, one status
 model, one prompt shape, and one file layout — instead of each feature inventing
 its own.

@@ -1,7 +1,7 @@
 # GitHub Agent Run Log
 
 > Part of the GitHub-native agent workflow. For how the run log fits the rest of
-> the workflow (states, module ownership, remaining features), see
+> the workflow (states, module ownership, implemented features), see
 > [`github-native-agent-workflow-architecture.md`](./github-native-agent-workflow-architecture.md).
 
 The GitHub-native workflow keeps a small run log in the project repository so an
@@ -32,10 +32,9 @@ Issue comments and chat threads are not a durable workflow database. The run log
 gives later steps a simple handoff point:
 
 - #143 command routing records that a maintainer requested implementation.
-- #144 dispatch can later move that record from `requested` to `handed-off` or
-  `blocked`.
-- Later handoff can add artifact paths. Pull request linking is reserved for a
-  future slice.
+- #144 dispatch moves that record from `requested` to `handed-off` or `blocked`.
+- #153 handoff can add artifact paths. Pull request linking is reserved for a
+  future slice after the current no-auto-agent workflow.
 - The epic review pass can inspect what happened without relying on a lost chat
   session.
 

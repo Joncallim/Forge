@@ -21,10 +21,10 @@ import { extractAcceptanceCriteria } from '@/scripts/github-agent-workflow/core/
 import { extractSourceIssueReference } from '@/scripts/github-agent-workflow/core/pr-contract'
 import { buildHandoffArtifacts, handoffArtifactDirectory } from '@/scripts/github-agent-workflow/core/handoff'
 import {
-  DISPATCH_PLACEHOLDER,
-  HANDOFF_PLACEHOLDER,
-  PR_CONTRACT_PLACEHOLDER,
-  architecturePlaceholderMessage,
+  DISPATCH_FEATURE_OWNERSHIP,
+  HANDOFF_FEATURE_OWNERSHIP,
+  PR_CONTRACT_FEATURE_OWNERSHIP,
+  architectureOwnershipMessage,
 } from '@/scripts/github-agent-workflow/core/workflow-architecture'
 import {
   linkPullRequest,
@@ -309,13 +309,14 @@ describe('shared source-issue and acceptance-criteria parsers', () => {
   })
 })
 
-describe('fail-closed placeholder CLIs', () => {
-  it('name their owning issue and the architecture doc', () => {
-    for (const placeholder of [DISPATCH_PLACEHOLDER, PR_CONTRACT_PLACEHOLDER, HANDOFF_PLACEHOLDER]) {
-      const message = architecturePlaceholderMessage(placeholder)
-      expect(message).toContain(`#${placeholder.issue}`)
+describe('workflow feature ownership map', () => {
+  it('names each owning issue and the architecture doc', () => {
+    for (const ownership of [DISPATCH_FEATURE_OWNERSHIP, PR_CONTRACT_FEATURE_OWNERSHIP, HANDOFF_FEATURE_OWNERSHIP]) {
+      const message = architectureOwnershipMessage(ownership)
+      expect(message).toContain(`#${ownership.issue}`)
       expect(message).toContain('docs/github-native-agent-workflow-architecture.md')
-      expect(placeholder.sharedContracts.length).toBeGreaterThan(0)
+      expect(message).not.toMatch(/not implemented/i)
+      expect(ownership.sharedContracts.length).toBeGreaterThan(0)
     }
   })
 })

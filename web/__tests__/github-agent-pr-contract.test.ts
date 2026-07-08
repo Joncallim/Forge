@@ -248,6 +248,42 @@ describe('PR contract checker', () => {
     expect(await client.listComments(166)).toEqual([])
   })
 
+  it('does not fail the non-blocking checker when GitHub denies marker-comment writes', async () => {
+    const client = new FakeGitHubClient({
+      issues: [PR_AS_ISSUE, SOURCE_ISSUE],
+      pullRequests: [pullRequest('## Source Issue\n\nCloses #145')],
+    })
+    client.upsertComment = async () => {
+      throw new GitHubApiError('forbidden', 403, '/repos/Joncallim/Forge/issues/166/comments')
+    }
+
+    const report = await runPrContractCheck({
+      client,
+      pullRequestNumber: 166,
+      botLogin: 'github-actions[bot]',
+    })
+
+    expect(report.linkedIssueStatus).toBe('found')
+    expect(report.commentBody).toContain('PR contract check.')
+    expect(await client.listComments(166)).toEqual([])
+  })
+
+  it('still surfaces unexpected marker-comment write failures', async () => {
+    const client = new FakeGitHubClient({
+      issues: [PR_AS_ISSUE, SOURCE_ISSUE],
+      pullRequests: [pullRequest('## Source Issue\n\nCloses #145')],
+    })
+    client.upsertComment = async () => {
+      throw new GitHubApiError('server error', 500, '/repos/Joncallim/Forge/issues/166/comments')
+    }
+
+    await expect(runPrContractCheck({
+      client,
+      pullRequestNumber: 166,
+      botLogin: 'github-actions[bot]',
+    })).rejects.toThrow('server error')
+  })
+
   it('only extracts the source issue from the Source Issue section', async () => {
     const client = new FakeGitHubClient({
       issues: [PR_AS_ISSUE, SOURCE_ISSUE],

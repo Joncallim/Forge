@@ -61,6 +61,10 @@ function shouldWriteCommentFromEnv(env: NodeJS.ProcessEnv): boolean {
   return env.PR_CONTRACT_COMMENT_MODE?.trim().toLowerCase() !== 'log-only'
 }
 
+function isCommentWritePermissionError(error: unknown): boolean {
+  return error instanceof GitHubApiError && error.status === 403
+}
+
 async function readOptionalEvent(env: NodeJS.ProcessEnv): Promise<PullRequestEvent> {
   if (!env.GITHUB_EVENT_PATH?.trim()) return {}
   return await readGitHubEvent<PullRequestEvent>(env)
@@ -400,11 +404,16 @@ export async function runPrContractCheck(input: {
   })
 
   if (input.writeComment !== false) {
-    await input.client.upsertComment(pullRequest.number, {
-      markerPrefix: PR_CONTRACT_MARKER_PREFIX,
-      botLogin: input.botLogin,
-      body: report.commentBody,
-    })
+    try {
+      await input.client.upsertComment(pullRequest.number, {
+        markerPrefix: PR_CONTRACT_MARKER_PREFIX,
+        botLogin: input.botLogin,
+        body: report.commentBody,
+      })
+    } catch (error) {
+      if (!isCommentWritePermissionError(error)) throw error
+      console.warn('PR contract report generated, but GitHub denied marker-comment write access. Continuing because this check is review support and must not block merge by default.')
+    }
   }
 
   return report
