@@ -1,5 +1,10 @@
 import { runMain } from './cli/entrypoint'
-import { prContractReportSchema, type PRContractReport, type PrContractCriterion } from './contracts/pr-contract-report'
+import {
+  prContractReportSchema,
+  type PRContractReport,
+  type PrContractCriterion,
+  type PrContractLinkedIssueStatus,
+} from './contracts/pr-contract-report'
 import { extractAcceptanceCriteria } from './core/acceptance-criteria'
 import {
   extractPrContractSection,
@@ -8,6 +13,7 @@ import {
 } from './core/pr-contract'
 import { readGitHubEvent } from './io/event'
 import { RestGitHubClient, type GitHubClient, type GitHubIssue, type GitHubPullRequest } from './io/github-client'
+import type { SourceIssueReference } from './contracts/source-issue-reference'
 
 export const PR_CONTRACT_MARKER_PREFIX = '<!-- forge-pr-contract-check -->'
 
@@ -61,6 +67,35 @@ function normalizeForMatch(text: string): string {
     .trim()
 }
 
+const TOKEN_STOPWORDS = new Set([
+  'a',
+  'an',
+  'and',
+  'are',
+  'as',
+  'be',
+  'by',
+  'for',
+  'from',
+  'in',
+  'is',
+  'it',
+  'of',
+  'on',
+  'or',
+  'that',
+  'the',
+  'this',
+  'to',
+  'with',
+])
+
+function matchTokens(text: string): Set<string> {
+  return new Set(normalizeForMatch(text)
+    .split(' ')
+    .filter((token) => token.length > 1 && !TOKEN_STOPWORDS.has(token)))
+}
+
 function stripBullet(line: string): string {
   return line
     .replace(/^\s*[-*]\s*/, '')
@@ -92,6 +127,12 @@ function validationEntries(sectionBody: string): ValidationEntry[] {
     }))
 }
 
+function extractPrSourceIssueReference(prBody: string | null): SourceIssueReference | null {
+  const sourceIssueSection = extractPrContractSection(prBody, 'Source Issue')
+  if (sourceIssueSection.trim() === '') return null
+  return extractSourceIssueReference(sourceIssueSection)
+}
+
 function isWeakEvidence(evidence: string | null): boolean {
   if (evidence === null) return true
   const normalized = normalizeForMatch(evidence)
@@ -115,12 +156,53 @@ function isWeakEvidence(evidence: string | null): boolean {
   ].includes(normalized)
 }
 
-export function classifyAcceptanceCriterion(criterion: string, entries: readonly ValidationEntry[]): PrContractCriterion {
+function tokenOverlapScore(criterion: string, entry: ValidationEntry): number {
   const normalizedCriterion = normalizeForMatch(criterion)
-  const entry = entries.find((candidate) => (
-    candidate.normalized.includes(normalizedCriterion)
-    || normalizedCriterion.includes(candidate.normalized)
-  ))
+  if (normalizedCriterion === '' || entry.normalized === '') return 0
+  if (entry.normalized === normalizedCriterion) return 1
+  if (
+    normalizedCriterion.length >= 20
+    && entry.normalized.length >= 20
+    && (entry.normalized.includes(normalizedCriterion) || normalizedCriterion.includes(entry.normalized))
+  ) {
+    return 0.95
+  }
+
+  const criterionTokens = matchTokens(criterion)
+  const entryTokens = matchTokens(entry.raw)
+  if (criterionTokens.size === 0 || entryTokens.size === 0) return 0
+  const shared = Array.from(criterionTokens).filter((token) => entryTokens.has(token)).length
+  return shared / criterionTokens.size
+}
+
+function bestCriterionEntry(input: {
+  criterion: string
+  entries: readonly ValidationEntry[]
+  criterionIndex: number
+  criteriaCount: number
+}): ValidationEntry | null {
+  const positional = input.entries.length === input.criteriaCount ? input.entries[input.criterionIndex] : undefined
+  if (positional && tokenOverlapScore(input.criterion, positional) >= 0.35) return positional
+
+  const candidates = input.entries
+    .map((entry) => ({ entry, score: tokenOverlapScore(input.criterion, entry) }))
+    .filter((candidate) => candidate.score >= 0.6)
+    .sort((left, right) => right.score - left.score)
+
+  return candidates[0]?.entry ?? null
+}
+
+export function classifyAcceptanceCriterion(
+  criterion: string,
+  entries: readonly ValidationEntry[],
+  options: { criterionIndex?: number; criteriaCount?: number } = {},
+): PrContractCriterion {
+  const entry = bestCriterionEntry({
+    criterion,
+    entries,
+    criterionIndex: options.criterionIndex ?? 0,
+    criteriaCount: options.criteriaCount ?? entries.length,
+  })
 
   if (!entry) {
     return {
@@ -161,7 +243,7 @@ export function renderPrContractReport(report: Omit<PRContractReport, 'commentBo
     `- Draft: ${report.draft ? 'yes' : 'no'}`,
   ]
 
-  if (report.linkedIssueNumber === null) {
+  if (report.linkedIssueStatus === 'missing') {
     lines.push(
       '- Linked issue: missing',
       '',
@@ -170,6 +252,17 @@ export function renderPrContractReport(report: Omit<PRContractReport, 'commentBo
       'Use this contract:',
       '',
       renderPrContractTemplate().trim(),
+      '',
+      'This is review support, not proof of correctness.',
+    )
+    return lines.join('\n')
+  }
+
+  if (report.linkedIssueStatus === 'not-found') {
+    lines.push(
+      `- Linked issue: #${report.linkedIssueNumber ?? 'unknown'} could not be loaded`,
+      '',
+      'Check the `Source Issue` section. The checker found a link, but GitHub could not load that issue. This can happen when the issue number is mistyped, deleted, private to another repository, or cross-repository.',
       '',
       'This is review support, not proof of correctness.',
     )
@@ -202,18 +295,26 @@ export function renderPrContractReport(report: Omit<PRContractReport, 'commentBo
 export function buildPrContractReport(input: {
   pullRequest: GitHubPullRequest
   linkedIssue: GitHubIssue | null
+  linkedIssueStatus?: PrContractLinkedIssueStatus
+  sourceIssueReference?: SourceIssueReference | null
   now?: Date
 }): PRContractReport {
-  const reference = extractSourceIssueReference(input.pullRequest.body)
+  const reference = input.sourceIssueReference ?? extractPrSourceIssueReference(input.pullRequest.body)
+  const linkedIssueStatus = input.linkedIssueStatus
+    ?? (input.linkedIssue ? 'found' : reference ? 'not-found' : 'missing')
   const acceptanceCriteria = input.linkedIssue ? extractAcceptanceCriteria(input.linkedIssue.body) : []
   const entries = validationEntries(extractPrContractSection(input.pullRequest.body, 'Acceptance Criteria Validation'))
-  const criteria = acceptanceCriteria.map((criterion) => classifyAcceptanceCriterion(criterion, entries))
+  const criteria = acceptanceCriteria.map((criterion, criterionIndex) => classifyAcceptanceCriterion(criterion, entries, {
+    criterionIndex,
+    criteriaCount: acceptanceCriteria.length,
+  }))
   const summary = summaryFor(criteria)
   const generatedAt = (input.now ?? new Date()).toISOString()
   const withoutComment = {
     pullRequestNumber: input.pullRequest.number,
     pullRequestTitle: input.pullRequest.title,
     draft: input.pullRequest.draft,
+    linkedIssueStatus,
     linkedIssueNumber: reference?.issueNumber ?? null,
     linkedIssueTitle: input.linkedIssue?.title ?? null,
     criteria,
@@ -235,9 +336,27 @@ export async function runPrContractCheck(input: {
   now?: Date
 }): Promise<PRContractReport> {
   const pullRequest = await input.client.getPullRequest(input.pullRequestNumber)
-  const reference = extractSourceIssueReference(pullRequest.body)
-  const linkedIssue = reference ? await input.client.getIssue(reference.issueNumber) : null
-  const report = buildPrContractReport({ pullRequest, linkedIssue, now: input.now })
+  const reference = extractPrSourceIssueReference(pullRequest.body)
+  let linkedIssue: GitHubIssue | null = null
+  let linkedIssueStatus: PrContractLinkedIssueStatus = reference ? 'not-found' : 'missing'
+
+  if (reference) {
+    try {
+      linkedIssue = await input.client.getIssue(reference.issueNumber)
+      linkedIssueStatus = 'found'
+    } catch {
+      linkedIssue = null
+      linkedIssueStatus = 'not-found'
+    }
+  }
+
+  const report = buildPrContractReport({
+    pullRequest,
+    linkedIssue,
+    linkedIssueStatus,
+    sourceIssueReference: reference,
+    now: input.now,
+  })
 
   await input.client.upsertComment(pullRequest.number, {
     markerPrefix: PR_CONTRACT_MARKER_PREFIX,

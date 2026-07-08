@@ -10,8 +10,12 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: write
   issues: write
+
+concurrency:
+  group: pr-contract-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   check:
@@ -33,7 +37,7 @@ jobs:
       - run: npm ci
 
       - run: |
-          if ! grep -q "runPrContractCheck" scripts/github-agent-workflow/pr-contract.ts; then
+          if grep -q "PR-0 foundation only" scripts/github-agent-workflow/pr-contract.ts; then
             echo "Default branch does not contain the PR contract checker yet; skipping bootstrap PR."
             exit 0
           fi

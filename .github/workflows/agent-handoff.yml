@@ -47,11 +47,11 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.1
         if: ${{ steps.handoff.outputs.artifact_directory != '' }}
         with:
           name: ${{ steps.handoff.outputs.artifact_name }}
           path: ${{ steps.handoff.outputs.artifact_directory }}
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
-

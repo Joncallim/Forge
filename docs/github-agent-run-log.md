@@ -32,10 +32,10 @@ Issue comments and chat threads are not a durable workflow database. The run log
 gives later steps a simple handoff point:
 
 - #143 command routing records that a maintainer requested implementation.
-- #144 dispatch can later move that record from `requested` to `running` or
+- #144 dispatch can later move that record from `requested` to `handed-off` or
   `blocked`.
-- Later handoff and pull request steps can add a branch name and pull request
-  number.
+- Later handoff can add artifact paths. Pull request linking is reserved for a
+  future slice.
 - The epic review pass can inspect what happened without relying on a lost chat
   session.
 
@@ -95,3 +95,6 @@ GitHub Actions uploads that directory as a workflow artifact when handoff is
 generated in Actions. Local handoff generation prints the paths. The repository
 must not commit those prompt or metadata files, and they must not contain
 secrets, credentials, model transcripts, or local auth material.
+
+Because the artifact directory starts with `.forge`, the GitHub Actions upload
+step must explicitly include hidden files.

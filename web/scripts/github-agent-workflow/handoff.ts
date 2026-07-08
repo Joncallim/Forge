@@ -389,23 +389,24 @@ export async function runHandoff(input: {
   const generatedAt = (input.now ?? new Date()).toISOString()
   const artifacts = buildHandoffArtifacts({ issueNumber: issue.number, runId: run.runId })
   const criteria = extractAcceptanceCriteria(issue.body)
+  const redactedCriteria = criteria.map(redactSecretLikeText)
   const prContract = renderPrContractTemplate({
     issueNumber: issue.number,
     runtime: run.runtime,
     runId: run.runId,
-    acceptanceCriteria: criteria,
+    acceptanceCriteria: redactedCriteria,
   }).trim()
   const workOrder = buildDispatchWorkOrder({
     issue,
     branchName,
     runId: run.runId,
     runtime: run.runtime,
-    acceptanceCriteria: criteria,
+    acceptanceCriteria: redactedCriteria,
   })
   const workOrderMarkdown = renderWorkOrder(workOrder)
   const metadata = renderMetadata({ issue, run, branchName, generatedAt, artifacts })
   const handoffMarkdown = renderHandoffMarkdown({ issue, run, branchName, artifacts, prContract })
-  const promptMarkdown = renderPromptMarkdown({ issue, run, branchName, workOrderMarkdown, acceptanceCriteria: criteria, prContract })
+  const promptMarkdown = renderPromptMarkdown({ issue, run, branchName, workOrderMarkdown, acceptanceCriteria: redactedCriteria, prContract })
 
   await writeHandoffPackage({
     repositoryRoot: input.artifactRepositoryRoot,

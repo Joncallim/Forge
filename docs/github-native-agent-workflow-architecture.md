@@ -35,7 +35,9 @@ does not add a second status store.
 | #147 | Plain-English workflow documentation | [`docs/workflows/github-native-agent-workflow.md`](./workflows/github-native-agent-workflow.md) |
 
 The CLIs stay thin. They parse GitHub Actions input, call shared contract
-helpers, update GitHub comments or labels, and write the durable run log. They
+helpers, update GitHub comments or labels, and write the durable run log. Dispatch
+is started manually with `workflow_dispatch`; labels applied by `GITHUB_TOKEN`
+do not trigger follow-up workflow runs. The CLIs
 do not execute Claude Code, Codex, pull request code, issue comments, or code
 from the run-log branch.
 
@@ -49,7 +51,7 @@ There is exactly one status enum: `RUN_STATUS_VALUES` in `contracts/common.ts`.
 | `handed-off` | Dispatcher (#144) produced a bounded work order / handoff package, but **no runtime has started**. |
 | `running` | A real runtime adapter has started work. |
 | `blocked` | The workflow refused to proceed; a `blockedReason` is recorded. |
-| `pr-opened` | A pull request was linked to the run. |
+| `pr-opened` | Reserved for a future step that links a pull request to the run. |
 | `completed` | The work is done. |
 | `failed` | The workflow failed. |
 | `cancelled` | The workflow was explicitly stopped. |
@@ -180,6 +182,12 @@ Dispatch (#144) then only produces a **bounded work order** and moves the run to
 `handed-off`. It does not execute Claude Code or Codex. This avoids an
 unconstrained always-on bot and keeps every step traceable in the run log.
 
+Dispatch is manual in GitHub Actions. The command router applies
+`agent-requested` with the default `GITHUB_TOKEN`, and GitHub does not start new
+workflow runs from events created by that token. A future GitHub App or personal
+access token integration could make label-driven dispatch possible, but that is
+outside this slice.
+
 There is also a hard operational reason automatic PR creation stays out of scope:
 GitHub's default `GITHUB_TOKEN` does not trigger downstream workflows, so an
 auto-created PR would silently skip `pr-contract-check` and the label-transition
@@ -213,7 +221,8 @@ security review.
   prompt.
 - **#145** consumes the #152 PR sections and the source issue's acceptance
   criteria (via the shared parsers) to produce a review aid — **not** proof of
-  correctness, and it does not block merges by default.
+  correctness, and it does not block merges by default. It does not yet transition
+  a run to `pr-opened`.
 
 ## Where future runtime execution plugs in
 

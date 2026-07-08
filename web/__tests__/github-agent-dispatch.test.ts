@@ -173,6 +173,31 @@ describe('agent dispatch', () => {
     expect((await findLatestRunForIssue(144, { repositoryRoot: root }))?.status).toBe('blocked')
   })
 
+  it('treats already-handed-off runs as idempotent instead of blocked', async () => {
+    const root = await tempRepositoryRoot()
+    await seedRequestedRun(root)
+    await updateRunStatus({
+      issueNumber: 144,
+      runId: 'issue-144-1234567890-1',
+      status: 'handed-off',
+      branchName: 'agent/issue-144-safe-agent-dispatch-bounded-work',
+    }, { repositoryRoot: root })
+    const client = new FakeGitHubClient({ issues: [{ ...READY_ISSUE, labels: [...READY_ISSUE.labels, 'agent-blocked'] }] })
+
+    const result = await runDispatch({
+      client,
+      issueNumber: READY_ISSUE.number,
+      runLogRepositoryRoot: root,
+      botLogin: 'github-actions[bot]',
+    })
+
+    expect(result.status).toBe('ignored')
+    expect(result.blockedReason).toBeNull()
+    expect(result.commentBody).toContain('already prepared')
+    expect((await client.getIssue(144)).labels).not.toContain('agent-blocked')
+    expect((await findLatestRunForIssue(144, { repositoryRoot: root }))?.status).toBe('handed-off')
+  })
+
   it('keeps generated work-order sections bounded', async () => {
     const root = await tempRepositoryRoot()
     const issue = {
@@ -197,6 +222,32 @@ describe('agent dispatch', () => {
     for (const section of result.workOrder?.sections ?? []) {
       expect(section.body.length).toBeLessThanOrEqual(WORK_ORDER_SECTION_MAX_LENGTH)
     }
+    expect(result.workOrder?.sections.find((section) => section.title === 'Required Constraints')?.body).not.toContain('A very long criterion')
+  })
+
+  it('redacts secret-shaped criteria before rendering the embedded PR contract', async () => {
+    const root = await tempRepositoryRoot()
+    const secret = `ghp_${'a'.repeat(40)}`
+    const issue = {
+      ...READY_ISSUE,
+      body: [
+        '## Acceptance Criteria',
+        '',
+        `- [ ] Do not leak token=${secret}.`,
+      ].join('\n'),
+    }
+    await seedRequestedRun(root, issue)
+    const client = new FakeGitHubClient({ issues: [issue] })
+
+    const result = await runDispatch({
+      client,
+      issueNumber: issue.number,
+      runLogRepositoryRoot: root,
+      botLogin: 'github-actions[bot]',
+    })
+
+    const rendered = result.workOrder?.sections.map((section) => section.body).join('\n') ?? ''
+    expect(rendered).not.toContain(secret)
+    expect(rendered).toContain('[redacted]')
   })
 })
-

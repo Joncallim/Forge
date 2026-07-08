@@ -1,8 +1,6 @@
 name: Agent Dispatch
 
 on:
-  issues:
-    types: [labeled]
   workflow_dispatch:
     inputs:
       issue_number:
@@ -16,7 +14,8 @@ on:
         type: boolean
 
 permissions:
-  # Dispatch writes only issue comments/labels and durable run-log JSON.
+  # Dispatch is manual because labels applied by GITHUB_TOKEN do not trigger
+  # follow-up workflow runs. It writes only issue comments/labels and durable run-log JSON.
   # It checks out trusted default-branch code and must never execute issue,
   # comment, pull request, or run-log branch code.
   contents: write
@@ -28,12 +27,6 @@ concurrency:
 
 jobs:
   dispatch:
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      (
-        github.event.issue.pull_request == null &&
-        github.event.label.name == 'agent-requested'
-      )
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -60,4 +53,3 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ inputs.issue_number }}
-

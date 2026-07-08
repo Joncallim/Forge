@@ -85,7 +85,8 @@ pull request should say that plainly in `Tests / Verification`.
 Issue #145 adds a non-blocking pull request checker. The checker does three
 things:
 
-1. Reads the pull request body and finds the linked source issue.
+1. Reads the pull request body's `Source Issue` section and finds the linked
+   source issue.
 2. Reads the source issue's `Acceptance Criteria` section.
 3. Compares each criterion with the pull request's `Acceptance Criteria
    Validation` section.
@@ -100,3 +101,5 @@ The checker reports each criterion as:
 The checker does not block merge by default. It posts one marker-based comment
 so the result updates in place instead of creating duplicate comments.
 
+If the `Source Issue` section points at an issue that GitHub cannot load, the
+checker reports that in the marker comment instead of failing the workflow.

@@ -27,6 +27,7 @@ const READY_ISSUE: GitHubIssue = {
     '',
     '- [ ] Claude handoff can be generated.',
     '- [ ] Codex handoff can be generated.',
+    `- [ ] Do not leak token=${SECRET_TOKEN}.`,
     '',
     `Do not leak token=${SECRET_TOKEN}`,
   ].join('\n'),

@@ -19,7 +19,9 @@ selected tool locally or in another controlled environment.
    `needs-clarification` when required information is missing.
 4. A maintainer comments `claude implement` or `codex implement` on the issue.
 5. The command router creates a run record and applies `agent-requested`.
-6. Dispatch checks the issue and run record, then prepares a bounded work order.
+6. A maintainer starts the `Agent Dispatch` workflow manually with the issue
+   number. Dispatch checks the issue and run record, then prepares a bounded
+   work order.
 7. Handoff generates `handoff.md`, `prompt.md`, and `metadata.json`.
 8. The user runs Claude Code or Codex locally, or in another controlled
    environment, using the generated `prompt.md`.
@@ -39,7 +41,8 @@ Forge uses these labels to show workflow state:
 - `agent-running` is reserved for a future runtime adapter that actually starts
   work.
 - `agent-blocked` means Forge could not continue and posted the reason.
-- `agent-pr-opened` means an agent-created pull request is open for the issue.
+- `agent-pr-opened` is reserved for a future step that links a pull request back
+  to the run log. The PR checker does not set it in this slice.
 
 ## Supported Request Phrases
 
@@ -141,6 +144,10 @@ Use `Issue: #123` when the PR should link the issue but should not close it.
 The checker reads the pull request body, finds the linked source issue, extracts
 the issue acceptance criteria, and posts one marker-based comment.
 
+It reads the issue link from the `Source Issue` section only. That avoids
+accidentally treating a casual phrase elsewhere in the pull request body as the
+source issue.
+
 Each criterion is reported as:
 
 - `claimed` when the PR mentions the criterion and includes useful evidence.
@@ -177,6 +184,10 @@ git-ignored by design and should not appear in the repository diff.
 If the PR checker cannot find a source issue, add a `Source Issue` section with
 `Closes #123`, `Fixes #123`, `Resolves #123`, or `Issue: #123`.
 
+If the PR checker says the linked issue could not be loaded, check for a typo or
+for a cross-repository issue link. The current checker expects a same-repository
+issue.
+
 If the PR checker marks a criterion `needs-review`, replace generic text like
 "done" with a concrete file, test, screenshot, or manual verification note.
 
@@ -186,4 +197,3 @@ If the PR checker marks a criterion `needs-review`, replace generic text like
 - [GitHub agent run log](../github-agent-run-log.md)
 - [GitHub agent PR contract](../github-agent-pr-contract.md)
 - [GitHub-native workflow architecture](../github-native-agent-workflow-architecture.md)
-

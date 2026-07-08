@@ -1,6 +1,7 @@
 import { runMain } from './cli/entrypoint'
 import { dispatchRequestSchema, type DispatchRequest } from './contracts/dispatch-request'
 import { DISPATCH_STATE_TO_RUN_STATUS, type RunId } from './contracts/common'
+import type { AgentRunRecord } from './contracts/agent-run-record'
 import type { WorkOrder } from './contracts/work-order'
 import { extractAcceptanceCriteria } from './core/acceptance-criteria'
 import { buildAgentBranchName } from './core/branch-names'
@@ -144,6 +145,25 @@ function dispatchSuccessComment(input: {
   ].join('\n')
 }
 
+function dispatchAlreadyHandedOffComment(input: {
+  issueNumber: number
+  runId: RunId
+  branchName: string | null
+}): string {
+  return [
+    DISPATCH_MARKER_PREFIX,
+    '',
+    'Agent dispatch already prepared a bounded work order.',
+    '',
+    `- Issue: #${input.issueNumber}`,
+    `- Run ID: \`${input.runId}\``,
+    `- Branch: ${input.branchName ? `\`${input.branchName}\`` : 'not recorded'}`,
+    '- Status: `handed-off`',
+    '- Next step: generate or inspect the handoff package.',
+    '- Note: this was an idempotent re-dispatch check. No Claude Code or Codex execution has started.',
+  ].join('\n')
+}
+
 function renderCriteria(criteria: readonly string[]): string {
   return criteria.length === 0
     ? 'No explicit acceptance criteria were found on the source issue. Stop and ask for clarification before broadening scope.'
@@ -158,11 +178,11 @@ export function buildDispatchWorkOrder(input: {
   acceptanceCriteria?: readonly string[]
 }): WorkOrder {
   const criteria = input.acceptanceCriteria ?? extractAcceptanceCriteria(input.issue.body)
+  const redactedCriteria = criteria.map(redactSecretLikeText)
   const prContract = renderPrContractTemplate({
     issueNumber: input.issue.number,
     runtime: input.runtime,
     runId: input.runId,
-    acceptanceCriteria: criteria,
   }).trim()
 
   return buildWorkOrder({
@@ -176,12 +196,12 @@ export function buildDispatchWorkOrder(input: {
         `URL: ${input.issue.htmlUrl}`,
       ].join('\n'),
       Objective: 'Implement only the ready source issue. Keep the change bounded to the issue text and acceptance criteria.',
-      'Acceptance Criteria': renderCriteria(criteria),
+      'Acceptance Criteria': renderCriteria(redactedCriteria),
       'Required Constraints': [
         'Do not run Claude Code or Codex automatically from dispatch.',
         'Do not execute issue, comment, or pull request supplied code in GitHub Actions.',
         'Do not store secrets, credentials, model transcripts, local auth material, or raw prompts in the durable run log.',
-        'Use the pull request contract below when opening or updating the PR.',
+        'Use the pull request contract below when opening or updating the PR. Copy the criteria from the work-order acceptance-criteria section into the PR validation checklist with evidence.',
         '',
         prContract,
       ].join('\n'),
@@ -215,6 +235,19 @@ function eligibilityFailure(issue: GitHubIssue, run: Awaited<ReturnType<typeof f
   return null
 }
 
+function isIdempotentHandedOffRun(
+  issue: GitHubIssue,
+  run: Awaited<ReturnType<typeof findLatestRunForIssue>>,
+): run is AgentRunRecord & { status: 'handed-off' } {
+  return issue.state === 'open'
+    && hasLabel(issue, 'ready-for-agent')
+    && !hasLabel(issue, 'needs-clarification')
+    && run !== null
+    && run.status === 'handed-off'
+    && ['claude-code', 'codex', 'dry-run'].includes(run.runtime)
+    && run.action === 'implement'
+}
+
 export async function runDispatch(input: {
   client: GitHubClient
   issueNumber: number
@@ -227,6 +260,33 @@ export async function runDispatch(input: {
 }): Promise<DispatchResult> {
   const issue = await input.client.getIssue(input.issueNumber)
   const latestRun = await findLatestRunForIssue(input.issueNumber, { repositoryRoot: input.runLogRepositoryRoot })
+
+  if (isIdempotentHandedOffRun(issue, latestRun)) {
+    const commentBody = dispatchAlreadyHandedOffComment({
+      issueNumber: input.issueNumber,
+      runId: latestRun.runId,
+      branchName: latestRun.branchName,
+    })
+    if (!input.dryRun) {
+      await input.client.removeLabel(issue.number, 'agent-blocked')
+      await input.client.upsertComment(issue.number, {
+        markerPrefix: DISPATCH_MARKER_PREFIX,
+        botLogin: input.botLogin,
+        body: commentBody,
+      })
+    }
+    return {
+      status: 'ignored',
+      issueNumber: input.issueNumber,
+      runId: latestRun.runId,
+      branchName: latestRun.branchName,
+      blockedReason: null,
+      workOrder: null,
+      request: null,
+      commentBody,
+    }
+  }
+
   const blockedReason = eligibilityFailure(issue, latestRun)
 
   if (blockedReason !== null) {

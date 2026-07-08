@@ -76,9 +76,58 @@ describe('PR contract checker', () => {
     })
 
     expect(report.linkedIssueNumber).toBeNull()
+    expect(report.linkedIssueStatus).toBe('missing')
     expect(report.criteria).toEqual([])
     expect(report.commentBody).toContain('Add a `Source Issue` section')
     expect((await client.listComments(166))[0]?.body.startsWith(PR_CONTRACT_MARKER_PREFIX)).toBe(true)
+  })
+
+  it('reports a linked source issue that cannot be loaded without throwing', async () => {
+    const client = new FakeGitHubClient({
+      issues: [PR_AS_ISSUE],
+      pullRequests: [pullRequest([
+        '## Source Issue',
+        '',
+        'Closes #999',
+      ].join('\n'))],
+    })
+
+    const report = await runPrContractCheck({
+      client,
+      pullRequestNumber: 166,
+      botLogin: 'github-actions[bot]',
+      now: new Date('2026-07-06T01:00:00.000Z'),
+    })
+
+    expect(report.linkedIssueStatus).toBe('not-found')
+    expect(report.linkedIssueNumber).toBe(999)
+    expect(report.criteria).toEqual([])
+    expect(report.commentBody).toContain('could not be loaded')
+  })
+
+  it('only extracts the source issue from the Source Issue section', async () => {
+    const client = new FakeGitHubClient({
+      issues: [PR_AS_ISSUE, SOURCE_ISSUE],
+      pullRequests: [pullRequest([
+        '## Summary',
+        '',
+        'Related to the issue #999 thread, but this is not the source issue.',
+        '',
+        '## Source Issue',
+        '',
+        'Closes #145',
+      ].join('\n'))],
+    })
+
+    const report = await runPrContractCheck({
+      client,
+      pullRequestNumber: 166,
+      botLogin: 'github-actions[bot]',
+    })
+
+    expect(report.linkedIssueStatus).toBe('found')
+    expect(report.linkedIssueNumber).toBe(145)
+    expect(report.linkedIssueTitle).toBe(SOURCE_ISSUE.title)
   })
 
   it('extracts acceptance criteria from linked issues', () => {
@@ -102,6 +151,7 @@ describe('PR contract checker', () => {
         '- [x] Weak evidence needs review. — done.',
       ].join('\n')),
       linkedIssue: SOURCE_ISSUE,
+      linkedIssueStatus: 'found',
       now: new Date('2026-07-06T01:00:00.000Z'),
     })
 
@@ -117,6 +167,7 @@ describe('PR contract checker', () => {
     const report = buildPrContractReport({
       pullRequest: pullRequest('## Source Issue\n\nIssue: #145'),
       linkedIssue: SOURCE_ISSUE,
+      linkedIssueStatus: 'found',
       now: new Date('2026-07-06T01:00:00.000Z'),
     })
 
@@ -124,6 +175,39 @@ describe('PR contract checker', () => {
     expect(rendered.startsWith(PR_CONTRACT_MARKER_PREFIX)).toBe(true)
     expect(rendered).toContain('| Criterion | Status | Evidence / notes |')
     expect(rendered).toContain('This is review support, not proof of correctness.')
+  })
+
+  it('uses positional matching for same-length validation lists and avoids short substring overmatching', () => {
+    const issue = {
+      ...SOURCE_ISSUE,
+      body: [
+        '## Acceptance Criteria',
+        '',
+        '- [ ] Alpha export creates the expected file.',
+        '- [ ] Alpha import reads the expected file.',
+      ].join('\n'),
+    }
+    const report = buildPrContractReport({
+      pullRequest: pullRequest([
+        '## Source Issue',
+        '',
+        'Closes #145',
+        '',
+        '## Acceptance Criteria Validation',
+        '',
+        '- [x] Export creates expected file — covered by export.test.ts.',
+        '- [x] Import reads expected file — covered by import.test.ts.',
+      ].join('\n')),
+      linkedIssue: issue,
+      linkedIssueStatus: 'found',
+      now: new Date('2026-07-06T01:00:00.000Z'),
+    })
+
+    expect(report.summary).toEqual({ claimed: 2, missing: 0, needsReview: 0 })
+    expect(report.criteria).toEqual([
+      expect.objectContaining({ text: 'Alpha export creates the expected file.', status: 'claimed' }),
+      expect.objectContaining({ text: 'Alpha import reads the expected file.', status: 'claimed' }),
+    ])
   })
 
   it('updates one marker comment instead of creating duplicates', async () => {
@@ -185,4 +269,3 @@ describe('PR contract checker', () => {
     expect(report.commentBody).toContain('Draft: yes')
   })
 })
-
