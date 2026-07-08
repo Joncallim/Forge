@@ -153,6 +153,26 @@ describe('repository execution context', () => {
     })
   })
 
+  it('allows local-only non-Git project directories without requiring sandbox-only mode', async () => {
+    await withHostRepositoryWrites('1', async () => {
+      const context = await buildRepositoryExecutionContext({
+        project: project(tempRoot, { githubRepo: null }),
+        task: task(),
+        workPackage: workPackage(),
+      })
+
+      expect(context).toMatchObject({
+        status: 'ready',
+        pathExists: true,
+        isGitRepository: false,
+        hasRemote: false,
+        blockedReason: null,
+      })
+      expect(context.projectLocalPath).toBe(tempRoot)
+      expect(context.baseBranch).toBe('main')
+    })
+  })
+
   it('blocks dirty working trees before local repository edits while ignoring no-remote and branch collision in host-write mode', async () => {
     await initRepo(tempRoot)
     await execFile('git', ['remote', 'remove', 'origin'], { cwd: tempRoot })

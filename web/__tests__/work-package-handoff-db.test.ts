@@ -1658,7 +1658,7 @@ describe('handoffApprovedWorkPackages', () => {
     mocks.loadWorkPackageExecutionContext.mockResolvedValue({
       agentConfig: null,
       modelIdUsed: 'test-model',
-      project: { id: 'project-1', localPath: projectRoot, defaultBranch: 'main', githubRepo: null, name: 'Test' },
+      project: { id: 'project-1', localPath: projectRoot, defaultBranch: 'main', githubRepo: 'owner/repo', name: 'Test' },
       task: { id: 'task-1', githubBranch: null, title: 'Tiny task tracker' },
       validatedProjectRoot: projectRoot,
       workPackage: {
@@ -1703,11 +1703,11 @@ describe('handoffApprovedWorkPackages', () => {
     }
   })
 
-  it('skips Git-only diff evidence for sandbox-only non-Git project paths', async () => {
+  it('advances local-only non-Git project paths without Git-only evidence', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     const previousHostRepositoryWrites = process.env.FORGE_HOST_REPOSITORY_WRITES
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
-    process.env.FORGE_HOST_REPOSITORY_WRITES = '0'
+    process.env.FORGE_HOST_REPOSITORY_WRITES = '1'
     const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'forge-sandbox-non-git-project-'))
     tempRoots.push(projectRoot)
 
@@ -1819,8 +1819,8 @@ describe('handoffApprovedWorkPackages', () => {
         id: 'artifact-final',
         metadata: {
           attemptNumber: 1,
-          hostRepositoryWrites: false,
-          repositoryWrites: false,
+          hostRepositoryWrites: true,
+          repositoryWrites: true,
           sandboxPath: `${projectRoot}/.forge/task-runs/task-1/pkg-1/attempt-1`,
           sandboxWrites: true,
           source: 'work-package-executor',
@@ -1846,8 +1846,9 @@ describe('handoffApprovedWorkPackages', () => {
     mocks.executeWorkPackage.mockResolvedValue({
       artifactContent: 'final output',
       artifactMetadata: {
-        hostRepositoryWrites: false,
-        repositoryWrites: false,
+        hostRepositoryWritePaths: ['package.json'],
+        hostRepositoryWrites: true,
+        repositoryWrites: true,
         sandboxPath: `${projectRoot}/.forge/task-runs/task-1/pkg-1/attempt-1`,
         sandboxWrites: true,
       },
@@ -1860,9 +1861,9 @@ describe('handoffApprovedWorkPackages', () => {
       },
       executionContextPacket: {},
       fileCount: 1,
-      hostRepositoryWritePaths: [],
-      hostRepositoryWrites: false,
-      repositoryWrites: false,
+      hostRepositoryWritePaths: ['package.json'],
+      hostRepositoryWrites: true,
+      repositoryWrites: true,
       sandboxPath: `${projectRoot}/.forge/task-runs/task-1/pkg-1/attempt-1`,
       summary: 'Implemented in sandbox.',
     })
