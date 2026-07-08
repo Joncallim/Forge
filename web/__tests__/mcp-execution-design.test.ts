@@ -175,8 +175,24 @@ describe('validateMcpExecutionDesign', () => {
     ].join('\n'))
     const crossAgent = validateMcpExecutionDesign(crossAgentDesign, overview([healthyGithub]))
 
-    expect(crossAgent.status).toBe('blocked')
-    expect(crossAgent.blocked.join('\n')).toMatch(/not covered by an explicit approved grant/)
+    expect(crossAgent.status).toBe('warnings')
+    expect(crossAgent.warnings.join('\n')).toMatch(/not covered by an explicit approved grant/)
+  })
+
+  it('warns instead of blocking filesystem.project.write planning requests', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"filesystem","requirement":"required","reason":"Write generated files.","assignment":{"type":"agent","targetAgents":["frontend"]},"agentPermissions":{"frontend":["filesystem.project.read","filesystem.project.write"]},"prohibitedCapabilities":[],"fallback":{"action":"ask_user","message":"Use local project files."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const validation = validateMcpExecutionDesign(design, overview([healthyFilesystem]))
+    const decisions = deriveMcpGrantDecisions(design, overview([healthyFilesystem]))
+
+    expect(validation.status).toBe('warnings')
+    expect(validation.blocked).toEqual([])
+    expect(validation.warnings.join('\n')).toMatch(/filesystem\.project\.write/)
+    expect(decisions.summary).toEqual({ proposed: 1, warning: 0, blocked: 0 })
   })
 
   it('lets broad filesystem grants cover explicit project filesystem subtasks during validation', () => {
@@ -372,7 +388,7 @@ describe('deriveMcpGrantDecisions', () => {
     })
   })
 
-  it('does not propose healthy MCP access without explicit agent capabilities', () => {
+  it('warns for healthy MCP access without explicit agent capabilities', () => {
     const { design } = parseMcpExecutionDesign([
       '```mcp_execution_design_json',
       '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{},"fallback":{"action":"ask_user","message":"Connect GitHub first."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
@@ -381,11 +397,11 @@ describe('deriveMcpGrantDecisions', () => {
 
     const result = deriveMcpGrantDecisions(design, overview([healthyGithub]))
 
-    expect(result.summary).toEqual({ proposed: 0, warning: 0, blocked: 1 })
+    expect(result.summary).toEqual({ proposed: 0, warning: 1, blocked: 0 })
     expect(result.decisions[0]).toMatchObject({
       agent: 'backend',
       capabilities: [],
-      status: 'blocked',
+      status: 'warning',
     })
   })
 
@@ -406,7 +422,7 @@ describe('deriveMcpGrantDecisions', () => {
     })
   })
 
-  it('blocks overlay-only MCP instructions that have no explicit grant decision', () => {
+  it('warns for overlay-only MCP instructions that have no explicit grant decision', () => {
     const result = evaluateWorkPackageMcpBroker({
       assignedRole: 'backend',
       metadata: {
@@ -415,8 +431,34 @@ describe('deriveMcpGrantDecisions', () => {
       title: 'Backend package',
     })
 
-    expect(result.status).toBe('blocked')
-    expect(result.blocked.join('\n')).toMatch(/require at least one explicit/)
+    expect(result.status).toBe('warnings')
+    expect(result.blocked).toEqual([])
+    expect(result.warnings.join('\n')).toMatch(/planning-only prompt context/)
+  })
+
+  it('allows prompt-only filesystem subtasks when no live MCP grant capabilities were proposed', () => {
+    const result = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyFilesystem]),
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        requirement: 'required',
+        permissions: [],
+        fallback: { action: 'ask_user', message: 'Use project defaults if MCP context is unavailable.' },
+      }],
+      metadata: {
+        promptOverlay: 'Use the project context if available, otherwise continue with the greenfield scaffold.',
+        mcpAwareSubtasks: [{
+          id: 'inspect-repository',
+          mcpCapabilities: ['filesystem.project.list', 'filesystem.project.read', 'filesystem.project.search'],
+        }],
+      },
+      title: 'Frontend work package',
+    })
+
+    expect(result.status).toBe('warnings')
+    expect(result.blocked).toEqual([])
+    expect(result.warnings.join('\n')).toMatch(/no approved capabilities/)
+    expect(result.warnings.join('\n')).toMatch(/planning-only prompt context/)
   })
 
   it('blocks work-package optional unavailable MCP access unless fallback is non-blocking', () => {
@@ -518,7 +560,7 @@ describe('deriveMcpGrantDecisions', () => {
     expect(result.warnings.join('\n')).toMatch(/previously blocked/)
   })
 
-  it('does not let stale global harness grants satisfy package-local MCP instructions', () => {
+  it('treats stale global harness grants as prompt-only package-local MCP context', () => {
     const result = evaluateWorkPackageMcpBroker({
       harnessToolPolicy: {
         mcpGrants: [{
@@ -534,8 +576,9 @@ describe('deriveMcpGrantDecisions', () => {
       title: 'Backend package',
     })
 
-    expect(result.status).toBe('blocked')
-    expect(result.blocked.join('\n')).toMatch(/require at least one explicit/)
+    expect(result.status).toBe('warnings')
+    expect(result.blocked).toEqual([])
+    expect(result.warnings.join('\n')).toMatch(/planning-only prompt context/)
   })
 
   it('blocks unsafe or uncovered MCP-aware subtask capabilities', () => {

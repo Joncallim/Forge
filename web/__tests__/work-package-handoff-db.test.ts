@@ -682,6 +682,80 @@ describe('handoffApprovedWorkPackages', () => {
     }))
   })
 
+  it('promotes prompt-only MCP filesystem packages when handoff claiming is disabled', async () => {
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([
+        {
+          id: 'pkg-1',
+          assignedRole: 'frontend',
+          harnessId: 'harness-1',
+          harnessToolPolicy: null,
+          mcpRequirements: [{
+            mcpId: 'filesystem',
+            requirement: 'required',
+            permissions: [],
+            fallback: { action: 'ask_user', message: 'Use project defaults if MCP context is unavailable.' },
+          }],
+          metadata: {
+            promptOverlay: 'Use the project context if available, otherwise continue with the greenfield scaffold.',
+            mcpAwareSubtasks: [{
+              id: 'inspect-repository',
+              mcpCapabilities: ['filesystem.project.list', 'filesystem.project.read', 'filesystem.project.search'],
+            }],
+          },
+          sequence: 1,
+          status: 'pending',
+          title: 'Frontend work package',
+        },
+      ]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+
+    mocks.getProjectMcpOverview.mockResolvedValue({
+      projectId: 'project-1',
+      config: { profile: 'default', requiredMcps: ['filesystem'], overrides: {} },
+      catalog: [],
+      mcpsRoot: '/tmp/forge/mcps',
+      statuses: [{
+        mcpId: 'filesystem',
+        displayName: 'Filesystem',
+        description: 'Filesystem MCP',
+        enabled: true,
+        error: null,
+        installPath: '/tmp/forge/mcps/filesystem',
+        installState: 'installed',
+        status: 'healthy',
+      }],
+      summary: {
+        label: 'MCPs healthy',
+        status: 'healthy',
+        missing: 0,
+        authRequired: 0,
+        unhealthy: 0,
+        disabled: 0,
+      },
+    })
+
+    const readyUpdate = updateChain([{ id: 'pkg-1' }])
+    mocks.dbUpdate.mockReturnValueOnce(readyUpdate)
+
+    const result = await handoffApprovedWorkPackages('task-1', { claimEnabled: false })
+
+    expect(result).toEqual({
+      status: 'ready_only',
+      readyPackageIds: ['pkg-1'],
+      claimedPackageId: null,
+    })
+    expect(readyUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      blockedReason: null,
+      status: 'ready',
+    }))
+    expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
+      status: 'ready',
+      workPackageId: 'pkg-1',
+    }))
+  })
+
   it('claims the next sequential package instead of letting a later ready package block the wave', async () => {
     mocks.dbSelect
       .mockReturnValueOnce(chain([
