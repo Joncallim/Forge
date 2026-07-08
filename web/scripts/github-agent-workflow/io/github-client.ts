@@ -53,6 +53,17 @@ type RestGitHubClientOptions = {
   apiUrl?: string
 }
 
+export class GitHubApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly path: string,
+  ) {
+    super(message)
+    this.name = 'GitHubApiError'
+  }
+}
+
 function normalizeRepo(repo: string): string {
   const trimmed = repo.trim()
   if (!GITHUB_REPO_PATTERN.test(trimmed)) throw new Error(`Invalid GitHub repository reference: ${repo}`)
@@ -286,7 +297,7 @@ export class RestGitHubClient implements GitHubClient {
       })
 
       if (!response.ok && !(init?.allow404 && response.status === 404)) {
-        throw new Error(`GitHub API returned ${response.status} for ${path}.`)
+        throw new GitHubApiError(`GitHub API returned ${response.status} for ${path}.`, response.status, path)
       }
 
       return response

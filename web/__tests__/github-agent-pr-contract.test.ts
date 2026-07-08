@@ -9,7 +9,7 @@ import {
   runPrContractCheck,
 } from '@/scripts/github-agent-workflow/pr-contract'
 import { FakeGitHubClient } from '@/scripts/github-agent-workflow/io/fake-github-client'
-import type { GitHubIssue, GitHubPullRequest } from '@/scripts/github-agent-workflow/io/github-client'
+import { GitHubApiError, type GitHubIssue, type GitHubPullRequest } from '@/scripts/github-agent-workflow/io/github-client'
 
 const SOURCE_ISSUE: GitHubIssue = {
   number: 145,
@@ -103,6 +103,40 @@ describe('PR contract checker', () => {
     expect(report.linkedIssueNumber).toBe(999)
     expect(report.criteria).toEqual([])
     expect(report.commentBody).toContain('could not be loaded')
+  })
+
+  it('does not swallow non-404 linked issue lookup failures', async () => {
+    const client = new FakeGitHubClient({
+      issues: [PR_AS_ISSUE],
+      pullRequests: [pullRequest('## Source Issue\n\nCloses #145')],
+    })
+    client.getIssue = async (issueNumber: number) => {
+      if (issueNumber === 145) throw new GitHubApiError('rate limited', 403, '/repos/Joncallim/Forge/issues/145')
+      return PR_AS_ISSUE
+    }
+
+    await expect(runPrContractCheck({
+      client,
+      pullRequestNumber: 166,
+      botLogin: 'github-actions[bot]',
+    })).rejects.toThrow('rate limited')
+  })
+
+  it('can build the report without writing a marker comment', async () => {
+    const client = new FakeGitHubClient({
+      issues: [PR_AS_ISSUE, SOURCE_ISSUE],
+      pullRequests: [pullRequest('## Source Issue\n\nCloses #145')],
+    })
+
+    const report = await runPrContractCheck({
+      client,
+      pullRequestNumber: 166,
+      botLogin: 'github-actions[bot]',
+      writeComment: false,
+    })
+
+    expect(report.linkedIssueStatus).toBe('found')
+    expect(await client.listComments(166)).toEqual([])
   })
 
   it('only extracts the source issue from the Source Issue section', async () => {
@@ -208,6 +242,35 @@ describe('PR contract checker', () => {
       expect.objectContaining({ text: 'Alpha export creates the expected file.', status: 'claimed' }),
       expect.objectContaining({ text: 'Alpha import reads the expected file.', status: 'claimed' }),
     ])
+  })
+
+  it('does not reuse one validation row for multiple acceptance criteria', () => {
+    const issue = {
+      ...SOURCE_ISSUE,
+      body: [
+        '## Acceptance Criteria',
+        '',
+        '- [ ] Alpha export creates the expected file.',
+        '- [ ] Alpha import reads the expected file.',
+      ].join('\n'),
+    }
+    const report = buildPrContractReport({
+      pullRequest: pullRequest([
+        '## Source Issue',
+        '',
+        'Closes #145',
+        '',
+        '## Acceptance Criteria Validation',
+        '',
+        '- [x] Alpha export creates expected file and Alpha import reads expected file — see workflow tests.',
+      ].join('\n')),
+      linkedIssue: issue,
+      linkedIssueStatus: 'found',
+      now: new Date('2026-07-06T01:00:00.000Z'),
+    })
+
+    expect(report.summary.claimed).toBe(1)
+    expect(report.summary.missing).toBe(1)
   })
 
   it('updates one marker comment instead of creating duplicates', async () => {

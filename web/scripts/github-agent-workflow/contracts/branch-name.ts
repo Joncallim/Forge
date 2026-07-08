@@ -5,7 +5,7 @@ import { freezeSchema } from './common'
 // lowercase, dash-separated slug. The pattern rejects uppercase, spaces, double
 // dashes, and other git-ref-unsafe shapes so every remaining feature can rely on
 // one branch-name contract (see core/branch-names.ts for the generator).
-export const AGENT_BRANCH_NAME_PATTERN = /^agent\/issue-\d+(?:-[a-z0-9]+)*$/
+export const AGENT_BRANCH_NAME_PATTERN = /^agent\/issue-[1-9]\d*(?:-[a-z0-9]+)*$/
 
 export const agentBranchNameSchema = freezeSchema(
   z.string().regex(

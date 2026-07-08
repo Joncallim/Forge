@@ -502,6 +502,44 @@ describe('agent run log storage', () => {
     })
   })
 
+  it('fails closed when a required run-log branch is missing', async () => {
+    const root = await tempRepositoryRoot()
+    const origin = path.join(root, 'origin.git')
+    const trusted = path.join(root, 'trusted')
+
+    await git(root, ['init', '--bare', origin])
+    await git(root, ['clone', origin, trusted])
+    await configureGitUser(trusted)
+    await writeFile(path.join(trusted, 'README.md'), '# Forge run log missing branch test\n', 'utf8')
+    await git(trusted, ['add', 'README.md'])
+    await git(trusted, ['commit', '-m', 'Initial commit'])
+    await git(trusted, ['push', '-u', 'origin', 'HEAD:main'])
+
+    await expect(withRunLogBranchWorktree({
+      repositoryRoot: trusted,
+      targetBranch: 'forge/agent-run-log',
+      requireExistingBranch: true,
+    }, async () => undefined)).rejects.toThrow('does not exist on origin')
+  })
+
+  it('does not treat git fetch infrastructure failures as a missing run-log branch', async () => {
+    const root = await tempRepositoryRoot()
+    const trusted = path.join(root, 'trusted')
+
+    await mkdir(trusted)
+    await git(trusted, ['init', '-b', 'main'])
+    await configureGitUser(trusted)
+    await writeFile(path.join(trusted, 'README.md'), '# Forge run log fetch failure test\n', 'utf8')
+    await git(trusted, ['add', 'README.md'])
+    await git(trusted, ['commit', '-m', 'Initial commit'])
+    await git(trusted, ['remote', 'add', 'origin', path.join(root, 'missing-origin.git')])
+
+    await expect(withRunLogBranchWorktree({
+      repositoryRoot: trusted,
+      targetBranch: 'forge/agent-run-log',
+    }, async () => undefined)).rejects.toThrow('ls-remote')
+  })
+
   it('redacts secret-shaped values and truncates transcript-shaped event messages', async () => {
     const root = await tempRepositoryRoot()
     await recordRequested({

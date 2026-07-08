@@ -12,7 +12,7 @@ import {
   renderPrContractTemplate,
 } from './core/pr-contract'
 import { readGitHubEvent } from './io/event'
-import { RestGitHubClient, type GitHubClient, type GitHubIssue, type GitHubPullRequest } from './io/github-client'
+import { GitHubApiError, RestGitHubClient, type GitHubClient, type GitHubIssue, type GitHubPullRequest } from './io/github-client'
 import type { SourceIssueReference } from './contracts/source-issue-reference'
 
 export const PR_CONTRACT_MARKER_PREFIX = '<!-- forge-pr-contract-check -->'
@@ -27,6 +27,11 @@ type ValidationEntry = Readonly<{
   raw: string
   normalized: string
   evidence: string | null
+}>
+
+type IndexedValidationEntry = Readonly<{
+  entry: ValidationEntry
+  index: number
 }>
 
 function parsePositivePullRequestNumber(value: unknown): number | null {
@@ -50,6 +55,10 @@ function pullRequestNumberFromEventOrEnv(event: PullRequestEvent, env: NodeJS.Pr
 
 function botLoginFromEnv(env: NodeJS.ProcessEnv): string {
   return env.GITHUB_BOT_LOGIN?.trim() || 'github-actions[bot]'
+}
+
+function shouldWriteCommentFromEnv(env: NodeJS.ProcessEnv): boolean {
+  return env.PR_CONTRACT_COMMENT_MODE?.trim().toLowerCase() !== 'log-only'
 }
 
 async function readOptionalEvent(env: NodeJS.ProcessEnv): Promise<PullRequestEvent> {
@@ -180,37 +189,50 @@ function bestCriterionEntry(input: {
   entries: readonly ValidationEntry[]
   criterionIndex: number
   criteriaCount: number
-}): ValidationEntry | null {
+  usedEntryIndexes?: ReadonlySet<number>
+}): IndexedValidationEntry | null {
   const positional = input.entries.length === input.criteriaCount ? input.entries[input.criterionIndex] : undefined
-  if (positional && tokenOverlapScore(input.criterion, positional) >= 0.35) return positional
+  if (
+    positional
+    && !input.usedEntryIndexes?.has(input.criterionIndex)
+    && tokenOverlapScore(input.criterion, positional) >= 0.35
+  ) {
+    return { entry: positional, index: input.criterionIndex }
+  }
 
   const candidates = input.entries
-    .map((entry) => ({ entry, score: tokenOverlapScore(input.criterion, entry) }))
+    .map((entry, index) => ({ entry, index, score: tokenOverlapScore(input.criterion, entry) }))
+    .filter((candidate) => !input.usedEntryIndexes?.has(candidate.index))
     .filter((candidate) => candidate.score >= 0.6)
     .sort((left, right) => right.score - left.score)
 
-  return candidates[0]?.entry ?? null
+  const best = candidates[0]
+  return best ? { entry: best.entry, index: best.index } : null
 }
 
 export function classifyAcceptanceCriterion(
   criterion: string,
   entries: readonly ValidationEntry[],
-  options: { criterionIndex?: number; criteriaCount?: number } = {},
+  options: { criterionIndex?: number; criteriaCount?: number; usedEntryIndexes?: Set<number> } = {},
 ): PrContractCriterion {
-  const entry = bestCriterionEntry({
+  const match = bestCriterionEntry({
     criterion,
     entries,
     criterionIndex: options.criterionIndex ?? 0,
     criteriaCount: options.criteriaCount ?? entries.length,
+    usedEntryIndexes: options.usedEntryIndexes,
   })
 
-  if (!entry) {
+  if (!match) {
     return {
       text: criterion,
       status: 'missing',
       evidence: null,
     }
   }
+
+  options.usedEntryIndexes?.add(match.index)
+  const entry = match.entry
 
   return {
     text: criterion,
@@ -304,9 +326,11 @@ export function buildPrContractReport(input: {
     ?? (input.linkedIssue ? 'found' : reference ? 'not-found' : 'missing')
   const acceptanceCriteria = input.linkedIssue ? extractAcceptanceCriteria(input.linkedIssue.body) : []
   const entries = validationEntries(extractPrContractSection(input.pullRequest.body, 'Acceptance Criteria Validation'))
+  const usedEntryIndexes = new Set<number>()
   const criteria = acceptanceCriteria.map((criterion, criterionIndex) => classifyAcceptanceCriterion(criterion, entries, {
     criterionIndex,
     criteriaCount: acceptanceCriteria.length,
+    usedEntryIndexes,
   }))
   const summary = summaryFor(criteria)
   const generatedAt = (input.now ?? new Date()).toISOString()
@@ -334,6 +358,7 @@ export async function runPrContractCheck(input: {
   pullRequestNumber: number
   botLogin: string
   now?: Date
+  writeComment?: boolean
 }): Promise<PRContractReport> {
   const pullRequest = await input.client.getPullRequest(input.pullRequestNumber)
   const reference = extractPrSourceIssueReference(pullRequest.body)
@@ -344,7 +369,8 @@ export async function runPrContractCheck(input: {
     try {
       linkedIssue = await input.client.getIssue(reference.issueNumber)
       linkedIssueStatus = 'found'
-    } catch {
+    } catch (error) {
+      if (error instanceof GitHubApiError && error.status !== 404) throw error
       linkedIssue = null
       linkedIssueStatus = 'not-found'
     }
@@ -358,11 +384,13 @@ export async function runPrContractCheck(input: {
     now: input.now,
   })
 
-  await input.client.upsertComment(pullRequest.number, {
-    markerPrefix: PR_CONTRACT_MARKER_PREFIX,
-    botLogin: input.botLogin,
-    body: report.commentBody,
-  })
+  if (input.writeComment !== false) {
+    await input.client.upsertComment(pullRequest.number, {
+      markerPrefix: PR_CONTRACT_MARKER_PREFIX,
+      botLogin: input.botLogin,
+      body: report.commentBody,
+    })
+  }
 
   return report
 }
@@ -374,6 +402,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
     client,
     pullRequestNumber: pullRequestNumberFromEventOrEnv(event, env),
     botLogin: botLoginFromEnv(env),
+    writeComment: shouldWriteCommentFromEnv(env),
   })
 
   console.info(JSON.stringify(report, null, 2))

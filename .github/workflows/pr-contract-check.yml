@@ -47,3 +47,4 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_CONTRACT_COMMENT_MODE: ${{ github.event.pull_request.head.repo.full_name == github.repository && 'write' || 'log-only' }}

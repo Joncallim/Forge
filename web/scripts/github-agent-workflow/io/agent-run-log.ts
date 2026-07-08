@@ -47,6 +47,7 @@ export type RunLogBranchWorktreeOptions = Readonly<{
   repositoryRoot?: string
   targetBranch?: string | null
   worktreeParent?: string | null
+  requireExistingBranch?: boolean
 }>
 
 export type CreateRunRecordInput = AgentCommandRunRecordInput & Readonly<{
@@ -345,12 +346,43 @@ export function runLogPathForDisplay(issueNumber: number, runId: RunId): string 
   return path.posix.join('.forge', 'runs', String(record.issueNumber), `${record.runId}.json`)
 }
 
+class GitCommandError extends Error {
+  constructor(
+    message: string,
+    readonly code: number | null,
+    readonly stderr: string,
+  ) {
+    super(message)
+    this.name = 'GitCommandError'
+  }
+}
+
+function errorCode(error: unknown): number | null {
+  const code = (error as { code?: unknown }).code
+  return typeof code === 'number' ? code : null
+}
+
+function errorText(error: unknown, key: 'stderr' | 'stdout'): string {
+  const value = (error as Record<string, unknown>)[key]
+  return typeof value === 'string' || Buffer.isBuffer(value) ? value.toString() : ''
+}
+
 async function git(repositoryRootPath: string, args: readonly string[]): Promise<{ stdout: string }> {
-  const { stdout } = await execFile('git', args, {
-    cwd: repositoryRootPath,
-    timeout: 120_000,
-  })
-  return { stdout: stdout.toString() }
+  try {
+    const { stdout } = await execFile('git', args, {
+      cwd: repositoryRootPath,
+      timeout: 120_000,
+    })
+    return { stdout: stdout.toString() }
+  } catch (error) {
+    const stderr = errorText(error, 'stderr')
+    const stdout = errorText(error, 'stdout')
+    throw new GitCommandError(
+      `git ${args.join(' ')} failed${stderr || stdout ? `: ${(stderr || stdout).trim()}` : '.'}`,
+      errorCode(error),
+      stderr,
+    )
+  }
 }
 
 async function tryGit(repositoryRootPath: string, args: readonly string[]): Promise<boolean> {
@@ -367,12 +399,20 @@ function targetBranchName(input: PersistRunRecordInput, currentBranch: string): 
 }
 
 async function fetchRemoteBranch(root: string, branchName: string): Promise<boolean> {
-  return await tryGit(root, [
+  try {
+    await git(root, ['ls-remote', '--exit-code', '--heads', 'origin', branchName])
+  } catch (error) {
+    if (error instanceof GitCommandError && error.code === 2) return false
+    throw error
+  }
+
+  await git(root, [
     'fetch',
     '--no-tags',
     'origin',
     `+refs/heads/${branchName}:refs/remotes/origin/${branchName}`,
   ])
+  return true
 }
 
 async function rebaseOnRemoteBranchIfPresent(root: string, branchName: string): Promise<void> {
@@ -439,6 +479,9 @@ export async function withRunLogBranchWorktree<T>(
   const scratchRoot = await mkdtemp(path.join(parent, 'forge-run-log-worktree-'))
   const worktreeRoot = path.join(scratchRoot, 'repo')
   const remoteBranchExists = await fetchRemoteBranch(trustedRoot, targetBranch)
+  if (!remoteBranchExists && options.requireExistingBranch === true) {
+    throw new Error(`Run-log branch ${targetBranch} does not exist on origin.`)
+  }
   const startPoint = remoteBranchExists ? `origin/${targetBranch}` : 'HEAD'
 
   try {

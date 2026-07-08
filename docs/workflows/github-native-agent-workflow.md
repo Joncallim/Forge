@@ -67,7 +67,7 @@ The durable run log uses one status field:
   started.
 - `running` is reserved for a future controlled runtime adapter.
 - `blocked` means Forge refused to continue and recorded a reason.
-- `pr-opened` means a pull request has been linked.
+- `pr-opened` is reserved for a future step that links a pull request to the run.
 - `completed`, `failed`, and `cancelled` are terminal or administrative states.
 
 Issue #144 used the word `accepted` for dispatch. Forge maps that to

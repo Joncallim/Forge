@@ -22,7 +22,7 @@ permissions:
   issues: write
 
 concurrency:
-  group: forge-agent-dispatch-run-log-${{ github.repository }}
+  group: forge-agent-run-log-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:

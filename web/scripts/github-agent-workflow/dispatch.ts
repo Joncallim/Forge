@@ -439,6 +439,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
   const result = await withRunLogBranchWorktree({
     repositoryRoot: trustedRoot,
     targetBranch,
+    requireExistingBranch: true,
   }, async (runLogRepositoryRoot) => await runDispatchForEvent({
     client,
     event,

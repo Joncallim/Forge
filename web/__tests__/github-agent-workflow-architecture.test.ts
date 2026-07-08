@@ -198,6 +198,12 @@ describe('deterministic agent branch names', () => {
       generatedAt: '2026-07-06T01:00:00.000Z',
     }).success).toBe(false)
   })
+
+  it('rejects impossible issue numbers in branch names', () => {
+    expect(agentBranchNameSchema.safeParse('agent/issue-0').success).toBe(false)
+    expect(agentBranchNameSchema.safeParse('agent/issue-0001-safe-dispatch').success).toBe(false)
+    expect(agentBranchNameSchema.safeParse('agent/issue-1-safe-dispatch').success).toBe(true)
+  })
 })
 
 describe('work-order prompt sections', () => {
