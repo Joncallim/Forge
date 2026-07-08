@@ -152,6 +152,33 @@ describe('agent handoff', () => {
     expect((await findLatestRunForIssue(153, { repositoryRoot: root }))?.status).toBe('blocked')
   })
 
+  it('refuses handoff for pull request numbers before writing artifacts', async () => {
+    const root = await tempRepositoryRoot()
+    await seedRun(root, 'codex', 'requested')
+    const issue = {
+      ...READY_ISSUE,
+      htmlUrl: 'https://github.com/Joncallim/Forge/pull/153',
+      isPullRequest: true,
+    }
+    const client = new FakeGitHubClient({ issues: [issue] })
+
+    const result = await runHandoff({
+      client,
+      issueNumber: 153,
+      runLogRepositoryRoot: root,
+      artifactRepositoryRoot: root,
+      botLogin: 'github-actions[bot]',
+    })
+
+    const run = await findLatestRunForIssue(153, { repositoryRoot: root })
+    expect(result.status).toBe('blocked')
+    expect(result.blockedReason).toContain('pull request, not an issue')
+    expect(result.artifacts).toBeNull()
+    expect(run?.status).toBe('blocked')
+    expect(run?.handoffArtifacts).toBeNull()
+    expect((await client.getIssue(153)).labels).toContain('agent-blocked')
+  })
+
   it('refuses handoff when the latest run is not valid for handoff', async () => {
     const root = await tempRepositoryRoot()
     await seedRun(root, 'codex', 'requested')

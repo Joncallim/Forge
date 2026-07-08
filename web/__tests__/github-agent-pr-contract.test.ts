@@ -129,6 +129,27 @@ describe('PR contract checker', () => {
     expect(report.commentBody).toContain('is a pull request, not an issue')
   })
 
+  it('treats pull request shaped linked issues as not-issue when building reports directly', () => {
+    const report = buildPrContractReport({
+      pullRequest: pullRequest('## Source Issue\n\nCloses #166'),
+      linkedIssue: {
+        ...PR_AS_ISSUE,
+        body: [
+          '## Acceptance Criteria',
+          '',
+          '- [ ] This PR body must not be parsed as source issue criteria.',
+        ].join('\n'),
+      },
+      linkedIssueStatus: 'found',
+      now: new Date('2026-07-06T01:00:00.000Z'),
+    })
+
+    expect(report.linkedIssueStatus).toBe('not-issue')
+    expect(report.linkedIssueNumber).toBe(166)
+    expect(report.linkedIssueTitle).toBeNull()
+    expect(report.criteria).toEqual([])
+  })
+
   it('does not swallow non-404 linked issue lookup failures', async () => {
     const client = new FakeGitHubClient({
       issues: [PR_AS_ISSUE],

@@ -225,6 +225,7 @@ export function buildDispatchWorkOrder(input: {
 }
 
 function eligibilityFailure(issue: GitHubIssue, run: Awaited<ReturnType<typeof findLatestRunForIssue>>): string | null {
+  if (issue.isPullRequest) return 'Source reference is a pull request, not an issue.'
   if (issue.state !== 'open') return 'Source issue is not open.'
   if (!hasLabel(issue, 'ready-for-agent')) return 'Source issue does not have `ready-for-agent`.'
   if (hasLabel(issue, 'needs-clarification')) return 'Source issue has `needs-clarification`.'
@@ -240,6 +241,7 @@ function isIdempotentHandedOffRun(
   run: Awaited<ReturnType<typeof findLatestRunForIssue>>,
 ): run is AgentRunRecord & { status: 'handed-off' } {
   return issue.state === 'open'
+    && !issue.isPullRequest
     && hasLabel(issue, 'ready-for-agent')
     && !hasLabel(issue, 'needs-clarification')
     && run !== null

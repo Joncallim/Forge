@@ -333,9 +333,12 @@ export function buildPrContractReport(input: {
   now?: Date
 }): PRContractReport {
   const reference = input.sourceIssueReference ?? extractPrSourceIssueReference(input.pullRequest.body)
-  const linkedIssueStatus = input.linkedIssueStatus
-    ?? (input.linkedIssue ? 'found' : reference ? 'not-found' : 'missing')
-  const acceptanceCriteria = input.linkedIssue ? extractAcceptanceCriteria(input.linkedIssue.body) : []
+  const linkedIssueIsPullRequest = input.linkedIssue?.isPullRequest === true
+  const linkedIssue = linkedIssueIsPullRequest ? null : input.linkedIssue
+  const linkedIssueStatus = linkedIssueIsPullRequest
+    ? 'not-issue'
+    : input.linkedIssueStatus ?? (linkedIssue ? 'found' : reference ? 'not-found' : 'missing')
+  const acceptanceCriteria = linkedIssue ? extractAcceptanceCriteria(linkedIssue.body) : []
   const entries = validationEntries(extractPrContractSection(input.pullRequest.body, 'Acceptance Criteria Validation'))
   const usedEntryIndexes = new Set<number>()
   const criteria = acceptanceCriteria.map((criterion, criterionIndex) => classifyAcceptanceCriterion(criterion, entries, {
@@ -351,7 +354,7 @@ export function buildPrContractReport(input: {
     draft: input.pullRequest.draft,
     linkedIssueStatus,
     linkedIssueNumber: reference?.issueNumber ?? null,
-    linkedIssueTitle: input.linkedIssue?.title ?? null,
+    linkedIssueTitle: linkedIssue?.title ?? null,
     criteria,
     summary,
     generatedAt,

@@ -114,6 +114,7 @@ function ignoredResult(reason: string): HandoffResult {
 }
 
 function eligibilityFailure(issue: GitHubIssue, run: AgentRunRecord | null): string | null {
+  if (issue.isPullRequest) return 'Source reference is a pull request, not an issue.'
   if (issue.state !== 'open') return 'Source issue is not open.'
   if (!hasLabel(issue, 'ready-for-agent')) return 'Source issue does not have `ready-for-agent`.'
   if (hasLabel(issue, 'needs-clarification')) return 'Source issue has `needs-clarification`.'

@@ -115,6 +115,31 @@ describe('agent dispatch', () => {
     expect((await client.listComments(144))[0]?.body).toContain('No run record exists')
   })
 
+  it('blocks pull request numbers before dispatching or marking them handed off', async () => {
+    const root = await tempRepositoryRoot()
+    const issue = {
+      ...READY_ISSUE,
+      htmlUrl: 'https://github.com/Joncallim/Forge/pull/144',
+      isPullRequest: true,
+    }
+    await seedRequestedRun(root, issue)
+    const client = new FakeGitHubClient({ issues: [issue] })
+
+    const result = await runDispatch({
+      client,
+      issueNumber: issue.number,
+      runLogRepositoryRoot: root,
+      botLogin: 'github-actions[bot]',
+    })
+
+    const run = await findLatestRunForIssue(issue.number, { repositoryRoot: root })
+    expect(result.status).toBe('blocked')
+    expect(result.blockedReason).toContain('pull request, not an issue')
+    expect(run?.status).toBe('blocked')
+    expect(run?.branchName).toBeNull()
+    expect((await client.getIssue(issue.number)).labels).toContain('agent-blocked')
+  })
+
   it('blocks closed issues and records the blocked run state', async () => {
     const root = await tempRepositoryRoot()
     const issue = { ...READY_ISSUE, state: 'closed' }
