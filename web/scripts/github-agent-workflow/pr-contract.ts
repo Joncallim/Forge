@@ -334,10 +334,14 @@ export function buildPrContractReport(input: {
 }): PRContractReport {
   const reference = input.sourceIssueReference ?? extractPrSourceIssueReference(input.pullRequest.body)
   const linkedIssueIsPullRequest = input.linkedIssue?.isPullRequest === true
-  const linkedIssue = linkedIssueIsPullRequest ? null : input.linkedIssue
-  const linkedIssueStatus = linkedIssueIsPullRequest
+  const linkedIssue = reference && !linkedIssueIsPullRequest ? input.linkedIssue : null
+  const linkedIssueStatus: PrContractLinkedIssueStatus = !reference
+    ? 'missing'
+    : linkedIssueIsPullRequest
     ? 'not-issue'
-    : input.linkedIssueStatus ?? (linkedIssue ? 'found' : reference ? 'not-found' : 'missing')
+    : linkedIssue
+      ? 'found'
+      : 'not-found'
   const acceptanceCriteria = linkedIssue ? extractAcceptanceCriteria(linkedIssue.body) : []
   const entries = validationEntries(extractPrContractSection(input.pullRequest.body, 'Acceptance Criteria Validation'))
   const usedEntryIndexes = new Set<number>()
@@ -383,7 +387,6 @@ export async function runPrContractCheck(input: {
     try {
       linkedIssue = await input.client.getIssue(reference.issueNumber)
       linkedIssueStatus = linkedIssue.isPullRequest ? 'not-issue' : 'found'
-      if (linkedIssue.isPullRequest) linkedIssue = null
     } catch (error) {
       if (!(error instanceof GitHubApiError)) throw error
       if (error.status !== 404) throw error

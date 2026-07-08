@@ -207,10 +207,15 @@ describe('agent handoff', () => {
     const contract = handoff.split('## Expected PR Contract')[1] ?? ''
     const promptCriteriaSections = prompt.split('## Acceptance Criteria')
     const promptCriteria = promptCriteriaSections[promptCriteriaSections.length - 1]?.split('## Repo Constraints')[0] ?? ''
+    const omittedNotice = 'Some acceptance criteria were omitted from this bounded handoff. Inspect the source issue before claiming validation.'
 
     expect(contract.length).toBeLessThan(3_000)
     expect(promptCriteria.length).toBeLessThan(2_200)
     expect(prompt).toContain('…')
+    expect(prompt).toContain(omittedNotice)
+    expect(contract).toContain(omittedNotice)
+    expect(contract).not.toContain(`- [ ] ${omittedNotice}`)
+    expect(promptCriteria).not.toContain(`- ${omittedNotice}`)
     expect(prompt).not.toContain('Criterion 120')
   })
 

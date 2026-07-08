@@ -150,6 +150,35 @@ describe('PR contract checker', () => {
     expect(report.criteria).toEqual([])
   })
 
+  it('derives linked issue status from the reference and loaded issue when building reports directly', () => {
+    const missingReport = buildPrContractReport({
+      pullRequest: pullRequest('## Source Issue\n\nCloses #145'),
+      linkedIssue: null,
+      linkedIssueStatus: 'found',
+      now: new Date('2026-07-06T01:00:00.000Z'),
+    })
+    const foundReport = buildPrContractReport({
+      pullRequest: pullRequest('## Source Issue\n\nCloses #145'),
+      linkedIssue: SOURCE_ISSUE,
+      linkedIssueStatus: 'not-found',
+      now: new Date('2026-07-06T01:00:00.000Z'),
+    })
+    const noReferenceReport = buildPrContractReport({
+      pullRequest: pullRequest('## Summary\n\nNo source issue.'),
+      linkedIssue: SOURCE_ISSUE,
+      linkedIssueStatus: 'found',
+      now: new Date('2026-07-06T01:00:00.000Z'),
+    })
+
+    expect(missingReport.linkedIssueStatus).toBe('not-found')
+    expect(missingReport.criteria).toEqual([])
+    expect(foundReport.linkedIssueStatus).toBe('found')
+    expect(foundReport.criteria).not.toEqual([])
+    expect(noReferenceReport.linkedIssueStatus).toBe('missing')
+    expect(noReferenceReport.linkedIssueNumber).toBeNull()
+    expect(noReferenceReport.criteria).toEqual([])
+  })
+
   it('does not swallow non-404 linked issue lookup failures', async () => {
     const client = new FakeGitHubClient({
       issues: [PR_AS_ISSUE],

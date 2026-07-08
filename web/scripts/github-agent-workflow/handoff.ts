@@ -27,7 +27,7 @@ import type { HandoffArtifacts, RunId } from './contracts/common'
 
 export const HANDOFF_MARKER_PREFIX = '<!-- forge-agent-handoff -->'
 const HANDOFF_CRITERIA_TRUNCATION_MARKER = ' […]'
-const HANDOFF_OMITTED_CRITERIA_NOTICE = 'Additional acceptance criteria omitted by bounded handoff; inspect the source issue before claiming validation.'
+const HANDOFF_OMITTED_CRITERIA_NOTICE = 'Some acceptance criteria were omitted from this bounded handoff. Inspect the source issue before claiming validation.'
 
 type HandoffGitHubEvent = {
   issue?: {
@@ -50,6 +50,11 @@ export type HandoffResult = Readonly<{
   metadata: RuntimeHandoff | null
   blockedReason: string | null
   commentBody: string | null
+}>
+
+type BoundedHandoffAcceptanceCriteria = Readonly<{
+  criteria: string[]
+  omitted: boolean
 }>
 
 function hasLabel(issue: GitHubIssue, label: string): boolean {
@@ -130,11 +135,12 @@ function renderedPrCriterionLength(criterion: string): number {
   return `- [ ] ${criterion} — evidence / notes`.length
 }
 
-function boundHandoffAcceptanceCriteria(criteria: readonly string[]): string[] {
+function boundHandoffAcceptanceCriteria(criteria: readonly string[]): BoundedHandoffAcceptanceCriteria {
+  const normalizedCriteria = criteria.map((entry) => entry.trim()).filter((entry) => entry !== '')
   const bounded: string[] = []
   let used = 0
 
-  for (const criterion of criteria.map((entry) => entry.trim()).filter((entry) => entry !== '')) {
+  for (const criterion of normalizedCriteria) {
     const separatorLength = bounded.length === 0 ? 0 : 1
     const availableLineLength = WORK_ORDER_SECTION_MAX_LENGTH - used - separatorLength
     if (availableLineLength <= 0) break
@@ -154,15 +160,10 @@ function boundHandoffAcceptanceCriteria(criteria: readonly string[]): string[] {
     break
   }
 
-  if (bounded.length < criteria.length) {
-    const separatorLength = bounded.length === 0 ? 0 : 1
-    const noticeLineLength = renderedPrCriterionLength(HANDOFF_OMITTED_CRITERIA_NOTICE)
-    if (used + separatorLength + noticeLineLength <= WORK_ORDER_SECTION_MAX_LENGTH) {
-      bounded.push(HANDOFF_OMITTED_CRITERIA_NOTICE)
-    }
+  return {
+    criteria: bounded,
+    omitted: bounded.length < normalizedCriteria.length,
   }
-
-  return bounded
 }
 
 function eligibilityFailure(issue: GitHubIssue, run: AgentRunRecord | null): string | null {
@@ -211,6 +212,7 @@ function renderHandoffMarkdown(input: {
   branchName: string
   artifacts: HandoffArtifacts
   prContract: string
+  criteriaOmitted: boolean
 }): string {
   return [
     '# Forge Agent Handoff',
@@ -244,6 +246,7 @@ function renderHandoffMarkdown(input: {
     '',
     '## Validation Expectations',
     '',
+    ...(input.criteriaOmitted ? [HANDOFF_OMITTED_CRITERIA_NOTICE, ''] : []),
     '- Run the relevant tests before claiming a criterion is satisfied.',
     '- Put skipped or unavailable checks in `Tests / Verification`.',
     '- Treat the PR contract checker as review support, not proof of correctness.',
@@ -257,6 +260,7 @@ function renderPromptMarkdown(input: {
   workOrderMarkdown: string
   acceptanceCriteria: readonly string[]
   prContract: string
+  criteriaOmitted: boolean
 }): string {
   const body = redactSecretLikeText(input.issue.body ?? '').slice(0, 3000).trim()
   const criteria = input.acceptanceCriteria.length === 0
@@ -282,6 +286,7 @@ function renderPromptMarkdown(input: {
     '## Acceptance Criteria',
     '',
     criteria,
+    ...(input.criteriaOmitted ? ['', HANDOFF_OMITTED_CRITERIA_NOTICE] : []),
     '',
     '## Repo Constraints',
     '',
@@ -452,24 +457,39 @@ export async function runHandoff(input: {
   const generatedAt = (input.now ?? new Date()).toISOString()
   const artifacts = buildHandoffArtifacts({ issueNumber: issue.number, runId: run.runId })
   const criteria = extractAcceptanceCriteria(issue.body)
-  const redactedCriteria = boundHandoffAcceptanceCriteria(criteria.map(redactSecretLikeText))
+  const boundedCriteria = boundHandoffAcceptanceCriteria(criteria.map(redactSecretLikeText))
   const prContract = renderPrContractTemplate({
     issueNumber: issue.number,
     runtime: run.runtime,
     runId: run.runId,
-    acceptanceCriteria: redactedCriteria,
+    acceptanceCriteria: boundedCriteria.criteria,
   }).trim()
   const workOrder = buildDispatchWorkOrder({
     issue,
     branchName,
     runId: run.runId,
     runtime: run.runtime,
-    acceptanceCriteria: redactedCriteria,
+    acceptanceCriteria: boundedCriteria.criteria,
   })
   const workOrderMarkdown = renderWorkOrder(workOrder)
   const metadata = renderMetadata({ issue, run, branchName, generatedAt, artifacts })
-  const handoffMarkdown = renderHandoffMarkdown({ issue, run, branchName, artifacts, prContract })
-  const promptMarkdown = renderPromptMarkdown({ issue, run, branchName, workOrderMarkdown, acceptanceCriteria: redactedCriteria, prContract })
+  const handoffMarkdown = renderHandoffMarkdown({
+    issue,
+    run,
+    branchName,
+    artifacts,
+    prContract,
+    criteriaOmitted: boundedCriteria.omitted,
+  })
+  const promptMarkdown = renderPromptMarkdown({
+    issue,
+    run,
+    branchName,
+    workOrderMarkdown,
+    acceptanceCriteria: boundedCriteria.criteria,
+    prContract,
+    criteriaOmitted: boundedCriteria.omitted,
+  })
   const artifactName = artifactNameFor(issue.number, run.runId, input.env)
 
   await writeHandoffPackage({
