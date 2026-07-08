@@ -183,7 +183,8 @@ function acceptedComment(command: AgentCommand, issue: GitHubIssue, runId: RunId
     `- Issue: #${issue.number}`,
     `- Intended agent: ${intendedAgent(command)}`,
     `- Run record: \`${runId}\` through the #146 run-log boundary`,
-    '- Next step: the dispatcher can pick up this recorded request when #144 lands. No agent implementation was started by this router.',
+    '- Next step: a maintainer should run the `Agent Dispatch` workflow manually with this issue number.',
+    '- Note: no Claude Code or Codex execution was started by this router.',
   ].join('\n')
 }
 

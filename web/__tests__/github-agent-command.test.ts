@@ -72,7 +72,11 @@ describe('GitHub agent command routing', () => {
       rejectionReason: null,
     })
     expect((await client.getIssue(143)).labels).toContain('agent-requested')
-    expect((await client.listComments(143))[0]?.body).toContain('Intended agent: Claude Code')
+    const [comment] = await client.listComments(143)
+    expect(comment?.body).toContain('Intended agent: Claude Code')
+    expect(comment?.body).toContain('run the `Agent Dispatch` workflow manually with this issue number')
+    expect(comment?.body).toContain('no Claude Code or Codex execution was started by this router')
+    expect(comment?.body).not.toMatch(/#144 lands/)
     expect(recorder.records).toEqual([expect.objectContaining({
       runId: 'issue-143-1234567890-1',
       runtime: 'claude-code',
