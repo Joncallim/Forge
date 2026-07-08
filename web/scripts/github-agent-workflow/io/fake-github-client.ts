@@ -5,6 +5,7 @@ import type {
   GitHubIssue,
   GitHubPullRequest,
 } from './github-client'
+import { GitHubApiError } from './github-client'
 
 type MutableGitHubIssue = {
   number: number
@@ -77,7 +78,7 @@ export class FakeGitHubClient implements GitHubClient {
 
   async getIssue(issueNumber: number): Promise<GitHubIssue> {
     const issue = this.issues.get(issueNumber)
-    if (!issue) throw new Error(`Issue #${issueNumber} not found.`)
+    if (!issue) throw new GitHubApiError(`Issue #${issueNumber} not found.`, 404, `/issues/${issueNumber}`)
     return cloneIssue(issue)
   }
 
@@ -127,7 +128,7 @@ export class FakeGitHubClient implements GitHubClient {
 
   async getPullRequest(pullRequestNumber: number): Promise<GitHubPullRequest> {
     const pullRequest = this.pullRequests.get(pullRequestNumber)
-    if (!pullRequest) throw new Error(`Pull request #${pullRequestNumber} not found.`)
+    if (!pullRequest) throw new GitHubApiError(`Pull request #${pullRequestNumber} not found.`, 404, `/pulls/${pullRequestNumber}`)
     return clonePullRequest(pullRequest)
   }
 
@@ -137,7 +138,7 @@ export class FakeGitHubClient implements GitHubClient {
 
   private mustGetIssue(issueNumber: number): MutableGitHubIssue {
     const issue = this.issues.get(issueNumber)
-    if (!issue) throw new Error(`Issue #${issueNumber} not found.`)
+    if (!issue) throw new GitHubApiError(`Issue #${issueNumber} not found.`, 404, `/issues/${issueNumber}`)
     return issue
   }
 }

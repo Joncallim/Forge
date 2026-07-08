@@ -184,4 +184,32 @@ describe('agent handoff', () => {
       '.forge/runs/153/issue-153-1234567890-1/handoff.md',
     ], { cwd: repositoryRoot })).resolves.toBeDefined()
   })
+
+  it('writes artifact outputs before later GitHub side effects can fail', async () => {
+    const root = await tempRepositoryRoot()
+    await seedRun(root, 'codex')
+    const outputPath = path.join(root, 'github-output.txt')
+    const client = new FakeGitHubClient({ issues: [READY_ISSUE] })
+    client.upsertComment = async () => {
+      throw new Error('comment failed')
+    }
+
+    await expect(runHandoff({
+      client,
+      issueNumber: 153,
+      runLogRepositoryRoot: root,
+      artifactRepositoryRoot: root,
+      botLogin: 'github-actions[bot]',
+      now: new Date('2026-07-06T01:05:00.000Z'),
+      env: {
+        GITHUB_ACTIONS: 'true',
+        GITHUB_OUTPUT: outputPath,
+      } as unknown as NodeJS.ProcessEnv,
+    })).rejects.toThrow('comment failed')
+
+    const outputs = await readFile(outputPath, 'utf8')
+    expect(outputs).toContain('artifact_name=forge-agent-handoff-issue-153-issue-153-1234567890-1')
+    expect(outputs).toContain('artifact_directory=.forge/runs/153/issue-153-1234567890-1')
+    await expect(readFile(path.join(root, '.forge/runs/153/issue-153-1234567890-1/prompt.md'), 'utf8')).resolves.toContain('Closes #153')
+  })
 })

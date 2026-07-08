@@ -122,6 +122,23 @@ describe('PR contract checker', () => {
     })).rejects.toThrow('rate limited')
   })
 
+  it('does not report transport failures as a missing linked issue', async () => {
+    const client = new FakeGitHubClient({
+      issues: [PR_AS_ISSUE],
+      pullRequests: [pullRequest('## Source Issue\n\nCloses #145')],
+    })
+    client.getIssue = async (issueNumber: number) => {
+      if (issueNumber === 145) throw new TypeError('fetch failed')
+      return PR_AS_ISSUE
+    }
+
+    await expect(runPrContractCheck({
+      client,
+      pullRequestNumber: 166,
+      botLogin: 'github-actions[bot]',
+    })).rejects.toThrow('fetch failed')
+  })
+
   it('can build the report without writing a marker comment', async () => {
     const client = new FakeGitHubClient({
       issues: [PR_AS_ISSUE, SOURCE_ISSUE],

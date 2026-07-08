@@ -478,17 +478,20 @@ export async function withRunLogBranchWorktree<T>(
   const parent = options.worktreeParent ? path.resolve(options.worktreeParent) : os.tmpdir()
   const scratchRoot = await mkdtemp(path.join(parent, 'forge-run-log-worktree-'))
   const worktreeRoot = path.join(scratchRoot, 'repo')
-  const remoteBranchExists = await fetchRemoteBranch(trustedRoot, targetBranch)
-  if (!remoteBranchExists && options.requireExistingBranch === true) {
-    throw new Error(`Run-log branch ${targetBranch} does not exist on origin.`)
-  }
-  const startPoint = remoteBranchExists ? `origin/${targetBranch}` : 'HEAD'
+  let worktreeAdded = false
 
   try {
+    const remoteBranchExists = await fetchRemoteBranch(trustedRoot, targetBranch)
+    if (!remoteBranchExists && options.requireExistingBranch === true) {
+      throw new Error(`Run-log branch ${targetBranch} does not exist on origin.`)
+    }
+    const startPoint = remoteBranchExists ? `origin/${targetBranch}` : 'HEAD'
+
     await git(trustedRoot, ['worktree', 'add', '--detach', worktreeRoot, startPoint])
+    worktreeAdded = true
     return await callback(worktreeRoot)
   } finally {
-    await tryGit(trustedRoot, ['worktree', 'remove', '--force', worktreeRoot])
+    if (worktreeAdded) await tryGit(trustedRoot, ['worktree', 'remove', '--force', worktreeRoot])
     await rm(scratchRoot, { recursive: true, force: true })
   }
 }

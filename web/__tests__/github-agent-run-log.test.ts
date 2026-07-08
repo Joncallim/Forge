@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -155,6 +155,36 @@ describe('agent run log contracts', () => {
 
     expect(withTokenUsage.success).toBe(false)
   })
+
+  it('rejects invalid branch names in durable run records', async () => {
+    expect(agentRunRecordSchema.safeParse({
+      runId: 'issue-141-1234567890-1',
+      issueNumber: 141,
+      issueTitle: '[EPIC] GitHub-native agent workflow',
+      runtime: 'codex',
+      action: 'implement',
+      requestedBy: 'Joncallim',
+      status: 'handed-off',
+      branchName: 'issue-141-foundation',
+      blockedReason: null,
+      handoffArtifacts: null,
+      source: {
+        type: 'issue_comment',
+        commentId: 99887766,
+      },
+      prNumber: null,
+      validationSummary: null,
+      createdAt: '2026-07-05T10:00:00.000Z',
+      updatedAt: '2026-07-05T10:00:00.000Z',
+      events: [
+        {
+          at: '2026-07-05T10:00:00.000Z',
+          status: 'handed-off',
+          message: 'Run record updated.',
+        },
+      ],
+    }).success).toBe(false)
+  })
 })
 
 describe('agent run log git visibility', () => {
@@ -279,16 +309,36 @@ describe('agent run log storage', () => {
     const updated = await linkPullRequest({
       issueNumber: 146,
       runId: 'issue-146-1234567890-1',
-      branchName: 'issue-146-durable-agent-run-log',
+      branchName: 'agent/issue-146-durable-agent-run-log',
       prNumber: 162,
     }, { repositoryRoot: root, now: new Date('2026-07-06T02:00:00.000Z') })
 
     expect(updated).toMatchObject({
       status: 'pr-opened',
-      branchName: 'issue-146-durable-agent-run-log',
+      branchName: 'agent/issue-146-durable-agent-run-log',
       prNumber: 162,
       updatedAt: '2026-07-06T02:00:00.000Z',
     })
+  })
+
+  it('rejects invalid branch names during status updates', async () => {
+    const root = await tempRepositoryRoot()
+    await recordRequested({
+      runId: 'issue-146-1234567890-1',
+      issueNumber: 146,
+      issueTitle: READY_ISSUE.title,
+      runtime: 'codex',
+      action: 'implement',
+      requestedBy: 'Joncallim',
+      source: { type: 'issue_comment', commentId: 102 },
+    }, { repositoryRoot: root, now: new Date('2026-07-06T01:00:00.000Z') })
+
+    await expect(updateRunStatus({
+      issueNumber: 146,
+      runId: 'issue-146-1234567890-1',
+      status: 'handed-off',
+      branchName: 'issue-146-durable-agent-run-log',
+    }, { repositoryRoot: root })).rejects.toThrow()
   })
 
   it('records blocked runs with a blocked reason', async () => {
@@ -506,9 +556,11 @@ describe('agent run log storage', () => {
     const root = await tempRepositoryRoot()
     const origin = path.join(root, 'origin.git')
     const trusted = path.join(root, 'trusted')
+    const scratchParent = path.join(root, 'scratch')
 
     await git(root, ['init', '--bare', origin])
     await git(root, ['clone', origin, trusted])
+    await mkdir(scratchParent)
     await configureGitUser(trusted)
     await writeFile(path.join(trusted, 'README.md'), '# Forge run log missing branch test\n', 'utf8')
     await git(trusted, ['add', 'README.md'])
@@ -518,15 +570,19 @@ describe('agent run log storage', () => {
     await expect(withRunLogBranchWorktree({
       repositoryRoot: trusted,
       targetBranch: 'forge/agent-run-log',
+      worktreeParent: scratchParent,
       requireExistingBranch: true,
     }, async () => undefined)).rejects.toThrow('does not exist on origin')
+    expect(await readdir(scratchParent)).toEqual([])
   })
 
   it('does not treat git fetch infrastructure failures as a missing run-log branch', async () => {
     const root = await tempRepositoryRoot()
     const trusted = path.join(root, 'trusted')
+    const scratchParent = path.join(root, 'scratch')
 
     await mkdir(trusted)
+    await mkdir(scratchParent)
     await git(trusted, ['init', '-b', 'main'])
     await configureGitUser(trusted)
     await writeFile(path.join(trusted, 'README.md'), '# Forge run log fetch failure test\n', 'utf8')
@@ -537,7 +593,9 @@ describe('agent run log storage', () => {
     await expect(withRunLogBranchWorktree({
       repositoryRoot: trusted,
       targetBranch: 'forge/agent-run-log',
+      worktreeParent: scratchParent,
     }, async () => undefined)).rejects.toThrow('ls-remote')
+    expect(await readdir(scratchParent)).toEqual([])
   })
 
   it('redacts secret-shaped values and truncates transcript-shaped event messages', async () => {

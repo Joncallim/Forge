@@ -370,7 +370,8 @@ export async function runPrContractCheck(input: {
       linkedIssue = await input.client.getIssue(reference.issueNumber)
       linkedIssueStatus = 'found'
     } catch (error) {
-      if (error instanceof GitHubApiError && error.status !== 404) throw error
+      if (!(error instanceof GitHubApiError)) throw error
+      if (error.status !== 404) throw error
       linkedIssue = null
       linkedIssueStatus = 'not-found'
     }

@@ -407,6 +407,7 @@ export async function runHandoff(input: {
   const metadata = renderMetadata({ issue, run, branchName, generatedAt, artifacts })
   const handoffMarkdown = renderHandoffMarkdown({ issue, run, branchName, artifacts, prContract })
   const promptMarkdown = renderPromptMarkdown({ issue, run, branchName, workOrderMarkdown, acceptanceCriteria: redactedCriteria, prContract })
+  const artifactName = artifactNameFor(issue.number, run.runId, input.env)
 
   await writeHandoffPackage({
     repositoryRoot: input.artifactRepositoryRoot,
@@ -415,6 +416,7 @@ export async function runHandoff(input: {
     promptMarkdown,
     metadata,
   })
+  await writeArtifactOutputs(input.env ?? process.env, artifacts, artifactName)
 
   await updateRunStatus({
     issueNumber: issue.number,
@@ -433,7 +435,6 @@ export async function runHandoff(input: {
   }, runLogOptions)
   await input.client.removeLabel(issue.number, 'agent-blocked')
 
-  const artifactName = artifactNameFor(issue.number, run.runId, input.env)
   const commentBody = successComment({
     issueNumber: issue.number,
     runId: run.runId,
@@ -491,14 +492,18 @@ export async function runHandoffForEvent(input: {
   })
 }
 
-async function writeOutputs(env: NodeJS.ProcessEnv, result: HandoffResult): Promise<void> {
-  if (!env.GITHUB_OUTPUT || result.artifacts === null || result.artifactName === null) return
+async function writeArtifactOutputs(
+  env: NodeJS.ProcessEnv,
+  artifacts: HandoffArtifacts,
+  artifactName: string,
+): Promise<void> {
+  if (!env.GITHUB_OUTPUT) return
   const lines = [
-    `artifact_name=${result.artifactName}`,
-    `artifact_directory=${relativeArtifactDirectory(result.artifacts)}`,
-    `handoff_path=${result.artifacts.handoffPath}`,
-    `prompt_path=${result.artifacts.promptPath}`,
-    `metadata_path=${result.artifacts.metadataPath}`,
+    `artifact_name=${artifactName}`,
+    `artifact_directory=${relativeArtifactDirectory(artifacts)}`,
+    `handoff_path=${artifacts.handoffPath}`,
+    `prompt_path=${artifacts.promptPath}`,
+    `metadata_path=${artifacts.metadataPath}`,
   ]
   await appendFile(env.GITHUB_OUTPUT, `${lines.join('\n')}\n`, 'utf8')
 }
@@ -524,7 +529,6 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
     targetBranch,
   }))
 
-  await writeOutputs(env, result)
   console.info(JSON.stringify(result, null, 2))
 }
 
