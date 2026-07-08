@@ -14,21 +14,12 @@ import {
   type RunStatus,
 } from '../contracts/common'
 import type { AgentCommandRunRecordInput, AgentCommandRunRecorder } from '../core/agent-command'
+import { redactSecretLikeText } from '../core/redaction'
 
 const RUN_LOG_RELATIVE_DIR = path.join('.forge', 'runs')
 export const DEFAULT_RUN_LOG_BRANCH = 'forge/agent-run-log'
 const MAX_EVENT_MESSAGE_LENGTH = 500
 const execFile = promisify(execFileCallback)
-// Best-effort redaction only. Do not route secrets or transcripts into run-log text.
-const SECRET_PATTERNS: readonly RegExp[] = Object.freeze([
-  /\bghp_[A-Za-z0-9_]{20,}\b/g,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
-  /\bsk-[A-Za-z0-9_-]{20,}\b/g,
-  /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/gi,
-  /\b(token|password|secret|api[_-]?key)\s*[:=]\s*['"]?[^'"\s,;]+/gi,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
-])
-
 export type PersistRunRecordInput = Readonly<{
   filePath: string
   record: AgentRunRecord
@@ -121,10 +112,7 @@ export async function resolveRepositoryRoot(startDirectory?: string): Promise<st
 }
 
 function sanitizeLogText(value: string): string {
-  let sanitized = value.trim()
-  for (const pattern of SECRET_PATTERNS) {
-    sanitized = sanitized.replace(pattern, '[redacted]')
-  }
+  let sanitized = redactSecretLikeText(value).trim()
   sanitized = sanitized.replace(/\s+/g, ' ').trim()
   if (sanitized.length > MAX_EVENT_MESSAGE_LENGTH) {
     sanitized = `${sanitized.slice(0, MAX_EVENT_MESSAGE_LENGTH - 16).trimEnd()} [truncated]`

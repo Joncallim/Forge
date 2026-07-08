@@ -369,7 +369,7 @@ describe('agent run log storage', () => {
 
   it('redacts blocked reasons passed through status updates', async () => {
     const root = await tempRepositoryRoot()
-    const secretToken = `ghp_${'a'.repeat(40)}`
+    const secretToken = `ghs_${'a'.repeat(40)}`
     await recordRequested({
       runId: 'issue-146-1234567890-1',
       issueNumber: 146,
@@ -637,12 +637,12 @@ describe('agent run log storage', () => {
     await appendRunEvent({
       issueNumber: 146,
       runId: 'issue-146-1234567890-1',
-      message: `token=ghp_${'a'.repeat(40)} ${'model transcript line '.repeat(80)}`,
+      message: `token=ghr_${'a'.repeat(40)} ${'model transcript line '.repeat(80)}`,
     }, { repositoryRoot: root, now: new Date('2026-07-06T01:01:00.000Z') })
 
     const raw = await readFile(runPath(root), 'utf8')
     const record = agentRunRecordSchema.parse(JSON.parse(raw))
-    expect(raw).not.toContain('ghp_')
+    expect(raw).not.toContain('ghr_')
     expect(raw).not.toContain('model transcript line '.repeat(40))
     expect(record.events.at(-1)?.message).toContain('[redacted]')
     expect(record.events.at(-1)?.message).toContain('[truncated]')

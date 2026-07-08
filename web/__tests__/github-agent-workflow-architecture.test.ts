@@ -147,7 +147,7 @@ describe('deterministic agent branch names', () => {
   })
 
   it('redacts secret-shaped title text before building a branch slug', () => {
-    const secret = `ghp_${'a'.repeat(40)}`
+    const secret = `ghu_${'a'.repeat(40)}`
     const branch = buildAgentBranchName({ issueNumber: 8, issueTitle: `[FEATURE] Use ${secret}` })
 
     expect(branch).toBe('agent/issue-8-use-redacted')

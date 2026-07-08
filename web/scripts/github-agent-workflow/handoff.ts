@@ -2,6 +2,7 @@ import { appendFile, mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { runMain } from './cli/entrypoint'
 import { runtimeHandoffSchema, type RuntimeHandoff } from './contracts/runtime-handoff'
+import { WORK_ORDER_SECTION_MAX_LENGTH } from './contracts/work-order'
 import { extractAcceptanceCriteria } from './core/acceptance-criteria'
 import { buildAgentBranchName } from './core/branch-names'
 import { buildHandoffArtifacts } from './core/handoff'
@@ -25,6 +26,8 @@ import type { AgentRunRecord } from './contracts/agent-run-record'
 import type { HandoffArtifacts, RunId } from './contracts/common'
 
 export const HANDOFF_MARKER_PREFIX = '<!-- forge-agent-handoff -->'
+const HANDOFF_CRITERIA_TRUNCATION_MARKER = ' […]'
+const HANDOFF_OMITTED_CRITERIA_NOTICE = 'Additional acceptance criteria omitted by bounded handoff; inspect the source issue before claiming validation.'
 
 type HandoffGitHubEvent = {
   issue?: {
@@ -111,6 +114,55 @@ function ignoredResult(reason: string): HandoffResult {
     blockedReason: reason,
     commentBody: null,
   }
+}
+
+function ignoredIssueResult(input: {
+  issueNumber: number
+  reason: string
+}): HandoffResult {
+  return {
+    ...ignoredResult(input.reason),
+    issueNumber: input.issueNumber,
+  }
+}
+
+function renderedPrCriterionLength(criterion: string): number {
+  return `- [ ] ${criterion} — evidence / notes`.length
+}
+
+function boundHandoffAcceptanceCriteria(criteria: readonly string[]): string[] {
+  const bounded: string[] = []
+  let used = 0
+
+  for (const criterion of criteria.map((entry) => entry.trim()).filter((entry) => entry !== '')) {
+    const separatorLength = bounded.length === 0 ? 0 : 1
+    const availableLineLength = WORK_ORDER_SECTION_MAX_LENGTH - used - separatorLength
+    if (availableLineLength <= 0) break
+
+    const fullLineLength = renderedPrCriterionLength(criterion)
+    if (fullLineLength <= availableLineLength) {
+      bounded.push(criterion)
+      used += separatorLength + fullLineLength
+      continue
+    }
+
+    const availableCriterionLength = availableLineLength - renderedPrCriterionLength('')
+    if (availableCriterionLength > HANDOFF_CRITERIA_TRUNCATION_MARKER.length) {
+      bounded.push(`${criterion.slice(0, availableCriterionLength - HANDOFF_CRITERIA_TRUNCATION_MARKER.length).trimEnd()}${HANDOFF_CRITERIA_TRUNCATION_MARKER}`)
+      used = WORK_ORDER_SECTION_MAX_LENGTH
+    }
+    break
+  }
+
+  if (bounded.length < criteria.length) {
+    const separatorLength = bounded.length === 0 ? 0 : 1
+    const noticeLineLength = renderedPrCriterionLength(HANDOFF_OMITTED_CRITERIA_NOTICE)
+    if (used + separatorLength + noticeLineLength <= WORK_ORDER_SECTION_MAX_LENGTH) {
+      bounded.push(HANDOFF_OMITTED_CRITERIA_NOTICE)
+    }
+  }
+
+  return bounded
 }
 
 function eligibilityFailure(issue: GitHubIssue, run: AgentRunRecord | null): string | null {
@@ -350,6 +402,12 @@ export async function runHandoff(input: {
   env?: NodeJS.ProcessEnv
 }): Promise<HandoffResult> {
   const issue = await input.client.getIssue(input.issueNumber)
+  if (issue.isPullRequest) {
+    return ignoredIssueResult({
+      issueNumber: issue.number,
+      reason: 'Skipping agent handoff because the source reference is a pull request, not an issue.',
+    })
+  }
   const latestRun = await findLatestRunForIssue(input.issueNumber, { repositoryRoot: input.runLogRepositoryRoot })
   const failure = eligibilityFailure(issue, latestRun)
   const runLogOptions = {
@@ -394,7 +452,7 @@ export async function runHandoff(input: {
   const generatedAt = (input.now ?? new Date()).toISOString()
   const artifacts = buildHandoffArtifacts({ issueNumber: issue.number, runId: run.runId })
   const criteria = extractAcceptanceCriteria(issue.body)
-  const redactedCriteria = criteria.map(redactSecretLikeText)
+  const redactedCriteria = boundHandoffAcceptanceCriteria(criteria.map(redactSecretLikeText))
   const prContract = renderPrContractTemplate({
     issueNumber: issue.number,
     runtime: run.runtime,

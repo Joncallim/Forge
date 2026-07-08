@@ -18,7 +18,7 @@ import type { GitHubIssue } from '@/scripts/github-agent-workflow/io/github-clie
 const tempRoots: string[] = []
 const execFile = promisify(execFileCallback)
 
-const SECRET_TOKEN = `ghp_${'a'.repeat(40)}`
+const SECRET_TOKEN = `gho_${'a'.repeat(40)}`
 const READY_ISSUE: GitHubIssue = {
   number: 153,
   title: `[FEATURE] Controlled handoff ${SECRET_TOKEN}`,
@@ -152,7 +152,7 @@ describe('agent handoff', () => {
     expect((await findLatestRunForIssue(153, { repositoryRoot: root }))?.status).toBe('blocked')
   })
 
-  it('refuses handoff for pull request numbers before writing artifacts', async () => {
+  it('ignores pull request numbers without mutating artifacts, labels, comments, or run logs', async () => {
     const root = await tempRepositoryRoot()
     await seedRun(root, 'codex', 'requested')
     const issue = {
@@ -171,12 +171,47 @@ describe('agent handoff', () => {
     })
 
     const run = await findLatestRunForIssue(153, { repositoryRoot: root })
-    expect(result.status).toBe('blocked')
+    expect(result.status).toBe('ignored')
     expect(result.blockedReason).toContain('pull request, not an issue')
     expect(result.artifacts).toBeNull()
-    expect(run?.status).toBe('blocked')
+    expect(run?.status).toBe('requested')
     expect(run?.handoffArtifacts).toBeNull()
-    expect((await client.getIssue(153)).labels).toContain('agent-blocked')
+    expect((await client.getIssue(153)).labels).not.toContain('agent-blocked')
+    expect(await client.listComments(153)).toEqual([])
+  })
+
+  it('bounds acceptance criteria in handoff artifacts outside the work-order section', async () => {
+    const root = await tempRepositoryRoot()
+    const issue = {
+      ...READY_ISSUE,
+      body: [
+        '## Acceptance Criteria',
+        '',
+        ...Array.from({ length: 120 }, (_, index) => `- [ ] Criterion ${index + 1}: ${'long implementation detail '.repeat(25)}`),
+      ].join('\n'),
+    }
+    await seedRun(root, 'codex')
+    const client = new FakeGitHubClient({ issues: [issue] })
+
+    const result = await runHandoff({
+      client,
+      issueNumber: 153,
+      runLogRepositoryRoot: root,
+      artifactRepositoryRoot: root,
+      botLogin: 'github-actions[bot]',
+      now: new Date('2026-07-06T01:05:00.000Z'),
+    })
+
+    const handoff = await readFile(localPath(root, result.artifacts!.handoffPath), 'utf8')
+    const prompt = await readFile(localPath(root, result.artifacts!.promptPath), 'utf8')
+    const contract = handoff.split('## Expected PR Contract')[1] ?? ''
+    const promptCriteriaSections = prompt.split('## Acceptance Criteria')
+    const promptCriteria = promptCriteriaSections[promptCriteriaSections.length - 1]?.split('## Repo Constraints')[0] ?? ''
+
+    expect(contract.length).toBeLessThan(3_000)
+    expect(promptCriteria.length).toBeLessThan(2_200)
+    expect(prompt).toContain('…')
+    expect(prompt).not.toContain('Criterion 120')
   })
 
   it('refuses handoff when the latest run is not valid for handoff', async () => {

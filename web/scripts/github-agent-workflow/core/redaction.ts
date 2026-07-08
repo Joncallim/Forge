@@ -1,7 +1,7 @@
 // Best-effort redaction only. Callers must still avoid routing secrets,
 // credentials, model transcripts, or local auth material into workflow text.
 const SECRET_PATTERNS: readonly RegExp[] = Object.freeze([
-  /\bghp_[A-Za-z0-9_]{20,}\b/g,
+  /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
   /\bsk-[A-Za-z0-9_-]{20,}\b/g,
   /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/gi,
@@ -20,4 +20,3 @@ export function redactSecretLikeText(text: string): string {
 export function compactRedactedText(text: string): string {
   return redactSecretLikeText(text).replace(/\s+/g, ' ').trim()
 }
-

@@ -106,6 +106,16 @@ function ignoredResult(reason: string): DispatchResult {
   }
 }
 
+function ignoredIssueResult(input: {
+  issueNumber: number
+  reason: string
+}): DispatchResult {
+  return {
+    ...ignoredResult(input.reason),
+    issueNumber: input.issueNumber,
+  }
+}
+
 function dispatchBlockedComment(input: {
   issueNumber: number
   runId: RunId | null
@@ -261,6 +271,12 @@ export async function runDispatch(input: {
   targetBranch?: string | null
 }): Promise<DispatchResult> {
   const issue = await input.client.getIssue(input.issueNumber)
+  if (issue.isPullRequest) {
+    return ignoredIssueResult({
+      issueNumber: issue.number,
+      reason: 'Skipping agent dispatch because the source reference is a pull request, not an issue.',
+    })
+  }
   const latestRun = await findLatestRunForIssue(input.issueNumber, { repositoryRoot: input.runLogRepositoryRoot })
 
   if (isIdempotentHandedOffRun(issue, latestRun)) {
