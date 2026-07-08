@@ -175,6 +175,28 @@ describe('PR contract checker', () => {
     expect(noReferenceReport.criteria).toEqual([])
   })
 
+  it('does not mix a source reference with a different loaded issue', () => {
+    const report = buildPrContractReport({
+      pullRequest: pullRequest('## Source Issue\n\nCloses #145'),
+      linkedIssue: {
+        ...SOURCE_ISSUE,
+        number: 999,
+        title: 'Wrong issue',
+        body: [
+          '## Acceptance Criteria',
+          '',
+          '- [ ] Wrong issue criteria must not be parsed.',
+        ].join('\n'),
+      },
+      now: new Date('2026-07-06T01:00:00.000Z'),
+    })
+
+    expect(report.linkedIssueStatus).toBe('not-found')
+    expect(report.linkedIssueNumber).toBe(145)
+    expect(report.linkedIssueTitle).toBeNull()
+    expect(report.criteria).toEqual([])
+  })
+
   it('does not swallow non-404 linked issue lookup failures', async () => {
     const client = new FakeGitHubClient({
       issues: [PR_AS_ISSUE],

@@ -333,10 +333,11 @@ export function buildPrContractReport(input: {
 }): PRContractReport {
   const reference = input.sourceIssueReference ?? extractPrSourceIssueReference(input.pullRequest.body)
   const linkedIssueIsPullRequest = input.linkedIssue?.isPullRequest === true
-  const linkedIssue = reference && !linkedIssueIsPullRequest ? input.linkedIssue : null
+  const linkedIssueMatchesReference = reference !== null && input.linkedIssue?.number === reference.issueNumber
+  const linkedIssue = linkedIssueMatchesReference && !linkedIssueIsPullRequest ? input.linkedIssue : null
   const linkedIssueStatus: PrContractLinkedIssueStatus = !reference
     ? 'missing'
-    : linkedIssueIsPullRequest
+    : linkedIssueMatchesReference && linkedIssueIsPullRequest
     ? 'not-issue'
     : linkedIssue
       ? 'found'
