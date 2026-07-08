@@ -328,7 +328,6 @@ export function renderPrContractReport(report: Omit<PRContractReport, 'commentBo
 export function buildPrContractReport(input: {
   pullRequest: GitHubPullRequest
   linkedIssue: GitHubIssue | null
-  linkedIssueStatus?: PrContractLinkedIssueStatus
   sourceIssueReference?: SourceIssueReference | null
   now?: Date
 }): PRContractReport {
@@ -381,24 +380,20 @@ export async function runPrContractCheck(input: {
   const pullRequest = await input.client.getPullRequest(input.pullRequestNumber)
   const reference = extractPrSourceIssueReference(pullRequest.body)
   let linkedIssue: GitHubIssue | null = null
-  let linkedIssueStatus: PrContractLinkedIssueStatus = reference ? 'not-found' : 'missing'
 
   if (reference) {
     try {
       linkedIssue = await input.client.getIssue(reference.issueNumber)
-      linkedIssueStatus = linkedIssue.isPullRequest ? 'not-issue' : 'found'
     } catch (error) {
       if (!(error instanceof GitHubApiError)) throw error
       if (error.status !== 404) throw error
       linkedIssue = null
-      linkedIssueStatus = 'not-found'
     }
   }
 
   const report = buildPrContractReport({
     pullRequest,
     linkedIssue,
-    linkedIssueStatus,
     sourceIssueReference: reference,
     now: input.now,
   })

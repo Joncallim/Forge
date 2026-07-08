@@ -140,7 +140,6 @@ describe('PR contract checker', () => {
           '- [ ] This PR body must not be parsed as source issue criteria.',
         ].join('\n'),
       },
-      linkedIssueStatus: 'found',
       now: new Date('2026-07-06T01:00:00.000Z'),
     })
 
@@ -154,19 +153,16 @@ describe('PR contract checker', () => {
     const missingReport = buildPrContractReport({
       pullRequest: pullRequest('## Source Issue\n\nCloses #145'),
       linkedIssue: null,
-      linkedIssueStatus: 'found',
       now: new Date('2026-07-06T01:00:00.000Z'),
     })
     const foundReport = buildPrContractReport({
       pullRequest: pullRequest('## Source Issue\n\nCloses #145'),
       linkedIssue: SOURCE_ISSUE,
-      linkedIssueStatus: 'not-found',
       now: new Date('2026-07-06T01:00:00.000Z'),
     })
     const noReferenceReport = buildPrContractReport({
       pullRequest: pullRequest('## Summary\n\nNo source issue.'),
       linkedIssue: SOURCE_ISSUE,
-      linkedIssueStatus: 'found',
       now: new Date('2026-07-06T01:00:00.000Z'),
     })
 
@@ -276,7 +272,6 @@ describe('PR contract checker', () => {
         '- [x] Weak evidence needs review. — done.',
       ].join('\n')),
       linkedIssue: SOURCE_ISSUE,
-      linkedIssueStatus: 'found',
       now: new Date('2026-07-06T01:00:00.000Z'),
     })
 
@@ -292,7 +287,6 @@ describe('PR contract checker', () => {
     const report = buildPrContractReport({
       pullRequest: pullRequest('## Source Issue\n\nIssue: #145'),
       linkedIssue: SOURCE_ISSUE,
-      linkedIssueStatus: 'found',
       now: new Date('2026-07-06T01:00:00.000Z'),
     })
 
@@ -324,7 +318,6 @@ describe('PR contract checker', () => {
         '- [x] Import reads expected file — covered by import.test.ts.',
       ].join('\n')),
       linkedIssue: issue,
-      linkedIssueStatus: 'found',
       now: new Date('2026-07-06T01:00:00.000Z'),
     })
 
@@ -356,7 +349,6 @@ describe('PR contract checker', () => {
         '- [x] Alpha export creates expected file and Alpha import reads expected file — see workflow tests.',
       ].join('\n')),
       linkedIssue: issue,
-      linkedIssueStatus: 'found',
       now: new Date('2026-07-06T01:00:00.000Z'),
     })
 

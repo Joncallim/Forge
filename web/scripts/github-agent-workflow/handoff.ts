@@ -139,6 +139,7 @@ function boundHandoffAcceptanceCriteria(criteria: readonly string[]): BoundedHan
   const normalizedCriteria = criteria.map((entry) => entry.trim()).filter((entry) => entry !== '')
   const bounded: string[] = []
   let used = 0
+  let truncated = false
 
   for (const criterion of normalizedCriteria) {
     const separatorLength = bounded.length === 0 ? 0 : 1
@@ -156,13 +157,14 @@ function boundHandoffAcceptanceCriteria(criteria: readonly string[]): BoundedHan
     if (availableCriterionLength > HANDOFF_CRITERIA_TRUNCATION_MARKER.length) {
       bounded.push(`${criterion.slice(0, availableCriterionLength - HANDOFF_CRITERIA_TRUNCATION_MARKER.length).trimEnd()}${HANDOFF_CRITERIA_TRUNCATION_MARKER}`)
       used = WORK_ORDER_SECTION_MAX_LENGTH
+      truncated = true
     }
     break
   }
 
   return {
     criteria: bounded,
-    omitted: bounded.length < normalizedCriteria.length,
+    omitted: truncated || bounded.length < normalizedCriteria.length,
   }
 }
 

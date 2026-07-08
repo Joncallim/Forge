@@ -219,6 +219,35 @@ describe('agent handoff', () => {
     expect(prompt).not.toContain('Criterion 120')
   })
 
+  it('warns when a single long acceptance criterion is truncated', async () => {
+    const root = await tempRepositoryRoot()
+    const omittedNotice = 'Some acceptance criteria were omitted from this bounded handoff. Inspect the source issue before claiming validation.'
+    const issue = {
+      ...READY_ISSUE,
+      body: [
+        '## Acceptance Criteria',
+        '',
+        `- [ ] ${'Keep this criterion bounded '.repeat(120)}tail-marker`,
+      ].join('\n'),
+    }
+    await seedRun(root, 'codex')
+    const client = new FakeGitHubClient({ issues: [issue] })
+
+    const result = await runHandoff({
+      client,
+      issueNumber: 153,
+      runLogRepositoryRoot: root,
+      artifactRepositoryRoot: root,
+      botLogin: 'github-actions[bot]',
+      now: new Date('2026-07-06T01:05:00.000Z'),
+    })
+
+    const prompt = await readFile(localPath(root, result.artifacts!.promptPath), 'utf8')
+    expect(prompt).toContain('…')
+    expect(prompt).toContain(omittedNotice)
+    expect(prompt).not.toContain('tail-marker')
+  })
+
   it('refuses handoff when the latest run is not valid for handoff', async () => {
     const root = await tempRepositoryRoot()
     await seedRun(root, 'codex', 'requested')
