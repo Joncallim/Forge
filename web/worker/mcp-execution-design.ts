@@ -315,6 +315,14 @@ function requirementCapabilitiesForAgent(requirement: McpExecutionRequirement, a
   return requirement.agentPermissions[agent] ?? []
 }
 
+function isPlanningOnlyFilesystemWrite(mcpId: string, capability: string): boolean {
+  return mcpId === 'filesystem' && normalizeCapability(capability) === 'filesystem.project.write'
+}
+
+function planningOnlyFilesystemWriteWarning(source: string): string {
+  return `${source} requested filesystem.project.write; Forge ignores this as a live MCP capability because generated file writes are handled by the sandbox execution JSON path.`
+}
+
 export function validateMcpExecutionDesign(
   design: McpExecutionDesign | null,
   mcpOverview: ProjectMcpOverview,
@@ -334,6 +342,10 @@ export function validateMcpExecutionDesign(
       }
 
       for (const capability of requirementCapabilities(requirement)) {
+        if (isPlanningOnlyFilesystemWrite(requirement.mcpId, capability)) {
+          warnings.push(planningOnlyFilesystemWriteWarning(`MCP '${requirement.mcpId}'`))
+          continue
+        }
         const unsafe = unsafeCapability(requirement.mcpId, capability, requirement.prohibitedCapabilities)
         if (unsafe) {
           blocked.push(`MCP '${requirement.mcpId}' capability '${unsafe}' is outside the allowed beta scope.`)
@@ -361,6 +373,7 @@ export function validateMcpExecutionDesign(
       for (const agent of agentsForRequirement(requirement)) {
         const current = approvedCapabilitiesByAgent.get(agent) ?? new Set<string>()
         for (const capability of requirementCapabilitiesForAgent(requirement, agent)) {
+          if (isPlanningOnlyFilesystemWrite(requirement.mcpId, capability)) continue
           if (unsafeCapability(requirement.mcpId, capability, requirement.prohibitedCapabilities) === null) {
             for (const key of approvedCoverageCapabilityKeys(capability)) current.add(key)
           }
@@ -383,13 +396,19 @@ export function validateMcpExecutionDesign(
           blocked.push(`MCP-aware subtask capability '${normalizedCapability}' does not name a known MCP.`)
           continue
         }
+        if (isPlanningOnlyFilesystemWrite(mcpId, normalizedCapability)) {
+          warnings.push(planningOnlyFilesystemWriteWarning('MCP-aware subtask'))
+          continue
+        }
         const unsafe = unsafeCapability(mcpId, normalizedCapability, [...prohibitedCapabilities])
         if (unsafe) {
           blocked.push(`MCP-aware subtask capability '${unsafe}' is outside the allowed beta scope.`)
           continue
         }
         if (!approvedCapabilities.has(coverageCapabilityKey(normalizedCapability))) {
-          blocked.push(`MCP-aware subtask capability '${normalizedCapability}' is not covered by an explicit approved grant.`)
+          const message = `MCP-aware subtask capability '${normalizedCapability}' is not covered by an explicit approved grant.`
+          if (approvedCapabilities.size === 0) warnings.push(message)
+          else blocked.push(message)
         }
       }
     }
@@ -588,11 +607,19 @@ export function evaluateWorkPackageMcpBroker(input: {
     }
 
     if (requirement === 'required' && (!capabilitiesPresent || capabilities.length === 0)) {
-      blocked.push(`MCP '${mcpId}' has no approved capabilities for required access.`)
+      const message = `MCP '${mcpId}' has no approved capabilities for required access.`
+      if (hasRunScopedMcpInstructions) warnings.push(message)
+      else blocked.push(message)
     }
 
+    let actionableCapabilityCount = 0
     for (const capability of capabilities) {
       const normalizedCapability = normalizeCapability(capability)
+      if (isPlanningOnlyFilesystemWrite(mcpId, normalizedCapability)) {
+        warnings.push(planningOnlyFilesystemWriteWarning(`MCP '${mcpId}'`))
+        continue
+      }
+      actionableCapabilityCount += 1
       const unsafe = unsafeCapability(mcpId, capability, prohibitedCapabilities)
       if (unsafe) {
         blocked.push(`MCP '${mcpId}' capability '${unsafe}' is outside the allowed beta scope.`)
@@ -609,6 +636,10 @@ export function evaluateWorkPackageMcpBroker(input: {
       }
     }
 
+    if (requirement === 'required' && capabilities.length > 0 && actionableCapabilityCount === 0) {
+      warnings.push(`MCP '${mcpId}' has no live MCP capabilities to approve after planning-only capabilities were ignored.`)
+    }
+
   }
 
   for (const prohibited of prohibitedAll) approvedCapabilities.delete(prohibited)
@@ -621,19 +652,25 @@ export function evaluateWorkPackageMcpBroker(input: {
         blocked.push(`MCP-aware subtask capability '${normalizedCapability}' does not name a known MCP.`)
         continue
       }
+      if (isPlanningOnlyFilesystemWrite(mcpId, normalizedCapability)) {
+        warnings.push(planningOnlyFilesystemWriteWarning('MCP-aware subtask'))
+        continue
+      }
       const unsafe = unsafeCapability(mcpId, normalizedCapability, [...prohibitedAll])
       if (unsafe) {
         blocked.push(`MCP-aware subtask capability '${unsafe}' is outside the allowed beta scope.`)
         continue
       }
       if (!approvedCapabilities.has(coverageCapabilityKey(normalizedCapability))) {
-        blocked.push(`MCP-aware subtask capability '${normalizedCapability}' is not covered by an explicit approved grant.`)
+        const message = `MCP-aware subtask capability '${normalizedCapability}' is not covered by an explicit approved grant.`
+        if (approvedCapabilities.size === 0) warnings.push(message)
+        else blocked.push(message)
       }
     }
   }
 
   if (hasRunScopedMcpInstructions && approvedCapabilities.size === 0) {
-    blocked.push('Run-scoped MCP prompt overlays or subtasks require at least one explicit non-blocked MCP grant decision.')
+    warnings.push('Run-scoped MCP prompt overlays or subtasks have no explicit non-blocked MCP grant decision; Forge will pass them as planning-only prompt context without live MCP tools.')
   }
 
   const packageLabel = cleanText(input.title, 120) || cleanText(input.assignedRole, 80) || 'work package'
@@ -667,12 +704,16 @@ function decisionStatus(
   capabilities: string[],
 ): McpGrantDecisionStatus {
   if (!isKnownMcpId(requirement.mcpId)) return 'blocked'
-  if (capabilities.length === 0) return requirement.requirement === 'optional' ? 'warning' : 'blocked'
+  if (capabilities.length === 0) return 'warning'
   // A capability outside the safe beta allowlist (or explicitly prohibited) is
   // blocked at handoff by evaluateWorkPackageMcpBroker. Apply the same allowlist
   // here so the grant-decision preview never advertises an unsafe capability as
   // "proposed" (i.e. ready to approve) while the broker would block it.
-  const hasUnsafeCapability = capabilities.some(
+  const actionableCapabilities = capabilities.filter(
+    (capability) => !isPlanningOnlyFilesystemWrite(requirement.mcpId, capability),
+  )
+  if (actionableCapabilities.length === 0) return 'warning'
+  const hasUnsafeCapability = actionableCapabilities.some(
     (capability) => unsafeCapability(requirement.mcpId, capability, requirement.prohibitedCapabilities) !== null,
   )
   if (hasUnsafeCapability) return 'blocked'
