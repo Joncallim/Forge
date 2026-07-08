@@ -252,7 +252,11 @@ export async function updateRunStatus(input: UpdateRunStatusInput, options: RunL
     ...record,
     status: input.status,
     branchName: input.branchName === undefined ? record.branchName : input.branchName,
-    blockedReason: input.blockedReason === undefined ? record.blockedReason : input.blockedReason,
+    blockedReason: input.blockedReason === undefined
+      ? record.blockedReason
+      : input.blockedReason === null
+        ? null
+        : sanitizeLogText(input.blockedReason),
     handoffArtifacts: input.handoffArtifacts === undefined
       ? record.handoffArtifacts
       : input.handoffArtifacts === null
@@ -314,8 +318,9 @@ export async function findLatestRunForIssue(
   let entries: string[]
   try {
     entries = await readdir(directory)
-  } catch {
-    return null
+  } catch (error) {
+    if (filesystemErrorCode(error) === 'ENOENT') return null
+    throw error
   }
 
   const records: AgentRunRecord[] = []
@@ -360,6 +365,11 @@ class GitCommandError extends Error {
 function errorCode(error: unknown): number | null {
   const code = (error as { code?: unknown }).code
   return typeof code === 'number' ? code : null
+}
+
+function filesystemErrorCode(error: unknown): string | null {
+  const code = (error as { code?: unknown }).code
+  return typeof code === 'string' ? code : null
 }
 
 function errorText(error: unknown, key: 'stderr' | 'stdout'): string {
@@ -447,7 +457,8 @@ export async function persistRunRecordToGit(input: PersistRunRecordInput): Promi
   try {
     await git(root, ['diff', '--cached', '--quiet', '--', relativePath])
     return
-  } catch {
+  } catch (error) {
+    if (!(error instanceof GitCommandError) || error.code !== 1) throw error
     // git diff --quiet exits non-zero when the run record has staged changes.
   }
 

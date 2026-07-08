@@ -291,6 +291,17 @@ export function renderPrContractReport(report: Omit<PRContractReport, 'commentBo
     return lines.join('\n')
   }
 
+  if (report.linkedIssueStatus === 'not-issue') {
+    lines.push(
+      `- Linked issue: #${report.linkedIssueNumber ?? 'unknown'} is a pull request, not an issue`,
+      '',
+      'Check the `Source Issue` section. The checker needs a GitHub Issue so it can read the source acceptance criteria.',
+      '',
+      'This is review support, not proof of correctness.',
+    )
+    return lines.join('\n')
+  }
+
   lines.push(
     `- Linked issue: #${report.linkedIssueNumber} — ${report.linkedIssueTitle ?? 'untitled'}`,
     `- Summary: ${report.summary.claimed} claimed, ${report.summary.missing} missing, ${report.summary.needsReview} needs review`,
@@ -368,7 +379,8 @@ export async function runPrContractCheck(input: {
   if (reference) {
     try {
       linkedIssue = await input.client.getIssue(reference.issueNumber)
-      linkedIssueStatus = 'found'
+      linkedIssueStatus = linkedIssue.isPullRequest ? 'not-issue' : 'found'
+      if (linkedIssue.isPullRequest) linkedIssue = null
     } catch (error) {
       if (!(error instanceof GitHubApiError)) throw error
       if (error.status !== 404) throw error

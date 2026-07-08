@@ -367,6 +367,30 @@ describe('agent run log storage', () => {
     })
   })
 
+  it('redacts blocked reasons passed through status updates', async () => {
+    const root = await tempRepositoryRoot()
+    const secretToken = `ghp_${'a'.repeat(40)}`
+    await recordRequested({
+      runId: 'issue-146-1234567890-1',
+      issueNumber: 146,
+      issueTitle: READY_ISSUE.title,
+      runtime: 'codex',
+      action: 'implement',
+      requestedBy: 'Joncallim',
+      source: { type: 'issue_comment', commentId: 103 },
+    }, { repositoryRoot: root, now: new Date('2026-07-06T01:00:00.000Z') })
+
+    const blocked = await updateRunStatus({
+      issueNumber: 146,
+      runId: 'issue-146-1234567890-1',
+      status: 'blocked',
+      blockedReason: `token=${secretToken}`,
+    }, { repositoryRoot: root, now: new Date('2026-07-06T03:00:00.000Z') })
+
+    expect(blocked.blockedReason).toBe('[redacted]')
+    expect(await readFile(runPath(root), 'utf8')).not.toContain(secretToken)
+  })
+
   it('prevents agent-requested and accepted comments when persistence fails', async () => {
     const root = await tempRepositoryRoot()
     await writeFile(path.join(root, '.forge'), 'not a directory', 'utf8')
@@ -676,5 +700,14 @@ describe('agent run log storage', () => {
 
     expect(latest?.runId).toBe('issue-146-1234567890-1')
     expect(await findLatestRunForIssue(999, { repositoryRoot: root })).toBeNull()
+  })
+
+  it('does not report corrupt run-log paths as a missing run', async () => {
+    const root = await tempRepositoryRoot()
+    await mkdir(path.join(root, '.forge', 'runs'), { recursive: true })
+    await writeFile(path.join(root, '.forge', 'runs', '146'), 'not a directory', 'utf8')
+
+    await expect(findLatestRunForIssue(146, { repositoryRoot: root })).rejects.toThrow()
+    await expect(findLatestRunForIssue(999, { repositoryRoot: root })).resolves.toBeNull()
   })
 })

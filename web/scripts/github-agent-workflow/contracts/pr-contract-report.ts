@@ -13,7 +13,7 @@ export const prContractCriterionSchema = freezeSchema(z.object({
   evidence: nonEmptyTrimmedStringSchema.nullable(),
 }).strict())
 
-export const prContractLinkedIssueStatusSchema = freezeSchema(z.enum(['found', 'missing', 'not-found']))
+export const prContractLinkedIssueStatusSchema = freezeSchema(z.enum(['found', 'missing', 'not-found', 'not-issue']))
 
 export const prContractReportSchema = freezeSchema(z.object({
   pullRequestNumber: positiveIntSchema,

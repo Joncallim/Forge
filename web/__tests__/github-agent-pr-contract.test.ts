@@ -105,6 +105,30 @@ describe('PR contract checker', () => {
     expect(report.commentBody).toContain('could not be loaded')
   })
 
+  it('reports when the source reference points to a pull request instead of an issue', async () => {
+    const client = new FakeGitHubClient({
+      issues: [PR_AS_ISSUE],
+      pullRequests: [pullRequest([
+        '## Source Issue',
+        '',
+        'Closes #166',
+      ].join('\n'))],
+    })
+
+    const report = await runPrContractCheck({
+      client,
+      pullRequestNumber: 166,
+      botLogin: 'github-actions[bot]',
+      now: new Date('2026-07-06T01:00:00.000Z'),
+    })
+
+    expect(report.linkedIssueStatus).toBe('not-issue')
+    expect(report.linkedIssueNumber).toBe(166)
+    expect(report.linkedIssueTitle).toBeNull()
+    expect(report.criteria).toEqual([])
+    expect(report.commentBody).toContain('is a pull request, not an issue')
+  })
+
   it('does not swallow non-404 linked issue lookup failures', async () => {
     const client = new FakeGitHubClient({
       issues: [PR_AS_ISSUE],

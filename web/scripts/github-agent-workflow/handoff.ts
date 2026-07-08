@@ -91,7 +91,11 @@ function localArtifactPath(repositoryRoot: string, artifactPath: string): string
 }
 
 function artifactNameFor(issueNumber: number, runId: RunId, env: NodeJS.ProcessEnv = process.env): string {
-  return env.FORGE_HANDOFF_ARTIFACT_NAME?.trim() || `forge-agent-handoff-issue-${issueNumber}-${runId}`
+  const artifactName = env.FORGE_HANDOFF_ARTIFACT_NAME?.trim() || `forge-agent-handoff-issue-${issueNumber}-${runId}`
+  if (/[\x00-\x1f\x7f]/.test(artifactName)) {
+    throw new Error('Handoff artifact name must not contain control characters or newlines.')
+  }
+  return artifactName
 }
 
 function ignoredResult(reason: string): HandoffResult {
@@ -326,7 +330,7 @@ function successComment(input: {
     `- Run ID: \`${input.runId}\``,
     `- Runtime: \`${input.runtime}\``,
     `- Branch: \`${input.branchName}\``,
-    `- Artifact: \`${input.artifactName}\`${input.inGitHubActions ? ' (uploaded by this workflow run)' : ''}`,
+    `- Artifact: \`${input.artifactName}\`${input.inGitHubActions ? ' (will be uploaded by this workflow run)' : ''}`,
     `- Local paths: \`${relativeArtifactDirectory(input.artifacts)}/\``,
     '- Next step: download or open the handoff package, then run the selected runtime manually or in a controlled environment with `prompt.md`.',
     '- Note: no Claude Code or Codex execution has started.',

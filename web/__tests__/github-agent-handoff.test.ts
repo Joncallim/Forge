@@ -129,7 +129,7 @@ describe('agent handoff', () => {
       handoffArtifacts: result.artifacts,
     })
     expect(run?.events.at(-1)?.message).toContain('No runtime execution was started')
-    expect((await client.listComments(153))[0]?.body).toContain('uploaded by this workflow run')
+    expect((await client.listComments(153))[0]?.body).toContain('will be uploaded by this workflow run')
   })
 
   it('refuses handoff when the issue is not ready', async () => {
@@ -211,5 +211,24 @@ describe('agent handoff', () => {
     expect(outputs).toContain('artifact_name=forge-agent-handoff-issue-153-issue-153-1234567890-1')
     expect(outputs).toContain('artifact_directory=.forge/runs/153/issue-153-1234567890-1')
     await expect(readFile(path.join(root, '.forge/runs/153/issue-153-1234567890-1/prompt.md'), 'utf8')).resolves.toContain('Closes #153')
+  })
+
+  it('rejects artifact output names with control characters', async () => {
+    const root = await tempRepositoryRoot()
+    await seedRun(root, 'codex')
+    const outputPath = path.join(root, 'github-output.txt')
+    const client = new FakeGitHubClient({ issues: [READY_ISSUE] })
+
+    await expect(runHandoff({
+      client,
+      issueNumber: 153,
+      runLogRepositoryRoot: root,
+      artifactRepositoryRoot: root,
+      botLogin: 'github-actions[bot]',
+      env: {
+        GITHUB_OUTPUT: outputPath,
+        FORGE_HANDOFF_ARTIFACT_NAME: 'safe-name\ninjected=true',
+      } as unknown as NodeJS.ProcessEnv,
+    })).rejects.toThrow('must not contain control characters')
   })
 })
