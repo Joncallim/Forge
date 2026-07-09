@@ -352,17 +352,36 @@ export function validateMcpExecutionDesign(
         }
       }
 
+      const agents = agentsForRequirement(requirement)
+      if (agents.length === 0) {
+        blocked.push(`MCP '${requirement.mcpId}' requirement does not target any valid agent.`)
+        continue
+      }
+
       const status = healthFor(mcpOverview, requirement.mcpId)
+      const agentDecisionStatuses = agents.map((agent) =>
+        decisionStatus(
+          requirement,
+          status,
+          requirementCapabilitiesForAgent(requirement, agent),
+          designHasRunScopedMcpInstructionsForAgentRequirement(design, agent, requirement.mcpId),
+        ),
+      )
+      const hasBlockedAgentDecision = agentDecisionStatuses.includes('blocked')
+      if (requirement.requirement === 'required' && healthyStatus(status) && hasBlockedAgentDecision) {
+        blocked.push(`MCP '${requirement.mcpId}' has no approved capabilities or prompt-only context for required access.`)
+        continue
+      }
       if (!status) {
         const message = statusMessage(requirement.mcpId, null)
-        if (!canProceedWithoutMcp(requirement)) blocked.push(message)
+        if (hasBlockedAgentDecision) blocked.push(message)
         else warnings.push(message)
         continue
       }
 
       if (!healthyStatus(status)) {
         const message = statusMessage(requirement.mcpId, status)
-        if (!canProceedWithoutMcp(requirement)) blocked.push(message)
+        if (hasBlockedAgentDecision) blocked.push(message)
         else warnings.push(message)
       }
     }
@@ -455,6 +474,25 @@ function metadataHasRunScopedMcpInstructions(metadata: unknown): boolean {
 function metadataMcpAwareSubtasks(metadata: unknown): Record<string, unknown>[] {
   if (!isRecord(metadata)) return []
   return objectArrayFrom(metadata.mcpAwareSubtasks)
+}
+
+function capabilityBelongsToMcp(capability: string, mcpId: string): boolean {
+  return capabilityMcpId(capability) === mcpId
+}
+
+function subtaskHasMcpContext(subtask: Record<string, unknown>, mcpId: string): boolean {
+  return cleanTextArray(subtask.mcpCapabilities, 40, 120)
+    .some((capability) => capabilityBelongsToMcp(capability, mcpId))
+}
+
+function metadataHasRunScopedMcpInstructionsForMcp(
+  metadata: unknown,
+  mcpId: string,
+  packageMcpIds: Set<string>,
+): boolean {
+  if (!isRecord(metadata)) return false
+  return (packageMcpIds.size === 1 && cleanText(metadata.promptOverlay, 2_000) !== '') ||
+    metadataMcpAwareSubtasks(metadata).some((subtask) => subtaskHasMcpContext(subtask, mcpId))
 }
 
 function capabilityArray(entry: Record<string, unknown>): {
@@ -569,6 +607,11 @@ export function evaluateWorkPackageMcpBroker(input: {
   const blocked: string[] = []
   const warnings: string[] = []
   const entries = brokerEntries(input)
+  const packageMcpIds = new Set(
+    entries
+      .map((entry) => cleanText(entry.mcpId, 80))
+      .filter((mcpId) => mcpId !== ''),
+  )
   const hasRunScopedMcpInstructions = metadataHasRunScopedMcpInstructions(input.metadata)
   const approvedCapabilities = new Set<string>()
   // A capability prohibited by any grant entry is prohibited for the whole
@@ -606,9 +649,10 @@ export function evaluateWorkPackageMcpBroker(input: {
       warnings.push(`MCP '${mcpId}' grant is warning-only.`)
     }
 
+    const hasPromptOnlyContextForMcp = metadataHasRunScopedMcpInstructionsForMcp(input.metadata, mcpId, packageMcpIds)
     if (requirement === 'required' && (!capabilitiesPresent || capabilities.length === 0)) {
       const message = `MCP '${mcpId}' has no approved capabilities for required access.`
-      if (hasRunScopedMcpInstructions) warnings.push(message)
+      if (hasPromptOnlyContextForMcp) warnings.push(message)
       else blocked.push(message)
     }
 
@@ -632,7 +676,15 @@ export function evaluateWorkPackageMcpBroker(input: {
       const status = healthFor(input.mcpOverview, mcpId)
       if (!healthyStatus(status)) {
         const message = statusMessage(mcpId, status)
-        shouldBlock(message)
+        const hasOnlyPlanningOnlyCapabilities = capabilities.length > 0 && actionableCapabilityCount === 0
+        if (
+          hasOnlyPlanningOnlyCapabilities ||
+          (requirement === 'required' && capabilities.length === 0 && hasPromptOnlyContextForMcp)
+        ) {
+          warnings.push(message)
+        } else {
+          shouldBlock(message)
+        }
       }
     }
 
@@ -706,7 +758,11 @@ function decisionStatus(
 ): McpGrantDecisionStatus {
   if (!isKnownMcpId(requirement.mcpId)) return 'blocked'
   if (capabilities.length === 0) {
-    return requirement.requirement === 'optional' || hasRunScopedMcpInstructions ? 'warning' : 'blocked'
+    return canProceedWithoutMcp(requirement) ||
+      (requirement.requirement === 'optional' && healthyStatus(status)) ||
+      (requirement.requirement === 'required' && hasRunScopedMcpInstructions)
+      ? 'warning'
+      : 'blocked'
   }
   // A capability outside the safe beta allowlist (or explicitly prohibited) is
   // blocked at handoff by evaluateWorkPackageMcpBroker. Apply the same allowlist
@@ -726,9 +782,22 @@ function decisionStatus(
   return 'blocked'
 }
 
-function designHasRunScopedMcpInstructionsForAgent(design: McpExecutionDesign, agent: string): boolean {
-  return typeof design.promptOverlays[agent] === 'string' ||
-    design.mcpAwareSubtasks.some((subtask) => subtask.agent === agent)
+function designHasRunScopedMcpInstructionsForAgentRequirement(
+  design: McpExecutionDesign,
+  agent: string,
+  mcpId: string,
+): boolean {
+  const hasSameMcpSubtask = design.mcpAwareSubtasks.some((subtask) =>
+    subtask.agent === agent &&
+    subtask.mcpCapabilities.some((capability) => capabilityBelongsToMcp(capability, mcpId)),
+  )
+  if (hasSameMcpSubtask) return true
+
+  const agentMcpIds = new Set<string>()
+  for (const requirement of design.requirements) {
+    if (agentsForRequirement(requirement).includes(agent)) agentMcpIds.add(requirement.mcpId)
+  }
+  return typeof design.promptOverlays[agent] === 'string' && agentMcpIds.size === 1
 }
 
 export function deriveMcpGrantDecisions(
@@ -761,7 +830,7 @@ export function deriveMcpGrantDecisions(
         requirement,
         status,
         capabilities,
-        designHasRunScopedMcpInstructionsForAgent(design, agent),
+        designHasRunScopedMcpInstructionsForAgentRequirement(design, agent, requirement.mcpId),
       )
       summary[grantStatus] += 1
       decisions.push({
