@@ -408,7 +408,7 @@ describe('deriveMcpGrantDecisions', () => {
   it('warns for required healthy MCP access without capabilities when prompt-only context exists', () => {
     const { design } = parseMcpExecutionDesign([
       '```mcp_execution_design_json',
-      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{},"fallback":{"action":"ask_user","message":"Use prompt context only."}}],"promptOverlays":{"backend":"Use GitHub issue context if available, otherwise continue from the prompt."},"mcpAwareSubtasks":[]}',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{},"fallback":{"action":"ask_user","message":"Use prompt context only."}}],"promptOverlays":{"backend":"Use issue context if available, otherwise continue from the prompt."},"mcpAwareSubtasks":[]}',
       '```',
     ].join('\n'))
 
@@ -443,12 +443,16 @@ describe('deriveMcpGrantDecisions', () => {
   it('keeps prompt-only missing MCP grant decisions warning-only', () => {
     const { design } = parseMcpExecutionDesign([
       '```mcp_execution_design_json',
-      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{},"fallback":{"action":"ask_user","message":"Use GitHub issue context from the prompt."}}],"promptOverlays":{"backend":"Use GitHub issue context if available, otherwise continue from the prompt."},"mcpAwareSubtasks":[]}',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{},"fallback":{"action":"ask_user","message":"Use issue context from the prompt."}}],"promptOverlays":{"backend":"Use issue context if available, otherwise continue from the prompt."},"mcpAwareSubtasks":[]}',
       '```',
     ].join('\n'))
 
+    const validation = validateMcpExecutionDesign(design, overview([]))
     const result = deriveMcpGrantDecisions(design, overview([]))
 
+    expect(validation.status).toBe('warnings')
+    expect(validation.blocked).toEqual([])
+    expect(validation.warnings.join('\n')).toMatch(/not configured/)
     expect(result.summary).toEqual({ proposed: 0, warning: 1, blocked: 0 })
     expect(result.decisions[0]).toMatchObject({
       agent: 'backend',
@@ -527,7 +531,6 @@ describe('deriveMcpGrantDecisions', () => {
         fallback: { action: 'ask_user', message: 'Use GitHub issue context.' },
       }],
       metadata: {
-        promptOverlay: 'Use the project context if available.',
         mcpAwareSubtasks: [{
           id: 'inspect-repository',
           mcpCapabilities: ['filesystem.project.read'],
@@ -547,10 +550,10 @@ describe('deriveMcpGrantDecisions', () => {
         mcpId: 'github',
         requirement: 'required',
         permissions: [],
-        fallback: { action: 'ask_user', message: 'Use GitHub issue context from the prompt.' },
+        fallback: { action: 'ask_user', message: 'Use issue context from the prompt.' },
       }],
       metadata: {
-        promptOverlay: 'Use GitHub issue context if available, otherwise continue from the prompt.',
+        promptOverlay: 'Use issue context if available, otherwise continue from the prompt.',
       },
       title: 'Backend work package',
     })

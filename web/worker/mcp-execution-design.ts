@@ -352,17 +352,20 @@ export function validateMcpExecutionDesign(
         }
       }
 
+      const hasPromptOnlyContext = designHasRunScopedMcpInstructionsForRequirement(design, requirement)
       const status = healthFor(mcpOverview, requirement.mcpId)
       if (!status) {
         const message = statusMessage(requirement.mcpId, null)
-        if (!canProceedWithoutMcp(requirement)) blocked.push(message)
+        if (hasPromptOnlyContext) warnings.push(message)
+        else if (!canProceedWithoutMcp(requirement)) blocked.push(message)
         else warnings.push(message)
         continue
       }
 
       if (!healthyStatus(status)) {
         const message = statusMessage(requirement.mcpId, status)
-        if (!canProceedWithoutMcp(requirement)) blocked.push(message)
+        if (hasPromptOnlyContext) warnings.push(message)
+        else if (!canProceedWithoutMcp(requirement)) blocked.push(message)
         else warnings.push(message)
       }
     }
@@ -457,16 +460,6 @@ function metadataMcpAwareSubtasks(metadata: unknown): Record<string, unknown>[] 
   return objectArrayFrom(metadata.mcpAwareSubtasks)
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
-function promptTextMentionsMcp(value: unknown, mcpId: string): boolean {
-  const text = cleanText(value, 2_000)
-  if (text === '') return false
-  return new RegExp(`\\b${escapeRegExp(mcpId)}\\b`, 'i').test(text)
-}
-
 function capabilityBelongsToMcp(capability: string, mcpId: string): boolean {
   return capabilityMcpId(capability) === mcpId
 }
@@ -478,7 +471,7 @@ function subtaskHasMcpContext(subtask: Record<string, unknown>, mcpId: string): 
 
 function metadataHasRunScopedMcpInstructionsForMcp(metadata: unknown, mcpId: string): boolean {
   if (!isRecord(metadata)) return false
-  return promptTextMentionsMcp(metadata.promptOverlay, mcpId) ||
+  return cleanText(metadata.promptOverlay, 2_000) !== '' ||
     metadataMcpAwareSubtasks(metadata).some((subtask) => subtaskHasMcpContext(subtask, mcpId))
 }
 
@@ -756,16 +749,25 @@ function decisionStatus(
   return 'blocked'
 }
 
-function designHasRunScopedMcpInstructionsForRequirement(
+function designHasRunScopedMcpInstructionsForAgentRequirement(
   design: McpExecutionDesign,
   agent: string,
   mcpId: string,
 ): boolean {
-  return promptTextMentionsMcp(design.promptOverlays[agent], mcpId) ||
+  return typeof design.promptOverlays[agent] === 'string' ||
     design.mcpAwareSubtasks.some((subtask) =>
       subtask.agent === agent &&
       subtask.mcpCapabilities.some((capability) => capabilityBelongsToMcp(capability, mcpId)),
     )
+}
+
+function designHasRunScopedMcpInstructionsForRequirement(
+  design: McpExecutionDesign,
+  requirement: McpExecutionRequirement,
+): boolean {
+  return agentsForRequirement(requirement).some((agent) =>
+    designHasRunScopedMcpInstructionsForAgentRequirement(design, agent, requirement.mcpId),
+  )
 }
 
 export function deriveMcpGrantDecisions(
@@ -798,7 +800,7 @@ export function deriveMcpGrantDecisions(
         requirement,
         status,
         capabilities,
-        designHasRunScopedMcpInstructionsForRequirement(design, agent, requirement.mcpId),
+        designHasRunScopedMcpInstructionsForAgentRequirement(design, agent, requirement.mcpId),
       )
       summary[grantStatus] += 1
       decisions.push({
