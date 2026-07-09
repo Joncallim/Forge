@@ -775,11 +775,17 @@ function designHasRunScopedMcpInstructionsForAgentRequirement(
   agent: string,
   mcpId: string,
 ): boolean {
-  return typeof design.promptOverlays[agent] === 'string' ||
-    design.mcpAwareSubtasks.some((subtask) =>
-      subtask.agent === agent &&
-      subtask.mcpCapabilities.some((capability) => capabilityBelongsToMcp(capability, mcpId)),
-    )
+  const hasSameMcpSubtask = design.mcpAwareSubtasks.some((subtask) =>
+    subtask.agent === agent &&
+    subtask.mcpCapabilities.some((capability) => capabilityBelongsToMcp(capability, mcpId)),
+  )
+  if (hasSameMcpSubtask) return true
+
+  const agentMcpIds = new Set<string>()
+  for (const requirement of design.requirements) {
+    if (agentsForRequirement(requirement).includes(agent)) agentMcpIds.add(requirement.mcpId)
+  }
+  return typeof design.promptOverlays[agent] === 'string' && agentMcpIds.size === 1
 }
 
 export function deriveMcpGrantDecisions(

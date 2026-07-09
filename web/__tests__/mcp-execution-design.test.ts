@@ -322,6 +322,26 @@ describe('validateMcpExecutionDesign', () => {
     ])
   })
 
+  it('blocks ambiguous prompt-only overlays across multiple MCP requirements', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{},"fallback":{"action":"ask_user","message":"Use issue context from the prompt."}},{"mcpId":"filesystem","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{},"fallback":{"action":"ask_user","message":"Use project context from the prompt."}}],"promptOverlays":{"backend":"Use issue and project context from the prompt."},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const validation = validateMcpExecutionDesign(design, overview([]))
+    const decisions = deriveMcpGrantDecisions(design, overview([]))
+
+    expect(validation.status).toBe('blocked')
+    expect(validation.blocked.join('\n')).toMatch(/github.*not configured/)
+    expect(validation.blocked.join('\n')).toMatch(/filesystem.*not configured/)
+    expect(decisions.summary).toEqual({ proposed: 0, warning: 0, blocked: 2 })
+    expect(decisions.decisions.map((decision) => [decision.mcpId, decision.status])).toEqual([
+      ['github', 'blocked'],
+      ['filesystem', 'blocked'],
+    ])
+  })
+
   it('warns for optional known MCPs that are absent from the project overview', () => {
     const { design } = parseMcpExecutionDesign([
       '```mcp_execution_design_json',
