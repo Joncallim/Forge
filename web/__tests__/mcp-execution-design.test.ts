@@ -423,6 +423,44 @@ describe('deriveMcpGrantDecisions', () => {
     })
   })
 
+  it('blocks empty grant decisions when only unrelated MCP subtasks exist', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{},"fallback":{"action":"ask_user","message":"Use GitHub issue context."}}],"promptOverlays":{},"mcpAwareSubtasks":[{"id":"inspect-files","agent":"backend","mcpCapabilities":["filesystem.project.read"],"inputs":[],"outputs":[],"verification":[],"dependsOn":[],"stoppingCondition":"Project context is available.","fallback":"Continue from prompt."}]}',
+      '```',
+    ].join('\n'))
+
+    const result = deriveMcpGrantDecisions(design, overview([healthyGithub, healthyFilesystem]))
+
+    expect(result.summary).toEqual({ proposed: 0, warning: 0, blocked: 1 })
+    expect(result.decisions[0]).toMatchObject({
+      agent: 'backend',
+      mcpId: 'github',
+      status: 'blocked',
+    })
+  })
+
+  it('keeps prompt-only missing MCP grant decisions warning-only', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{},"fallback":{"action":"ask_user","message":"Use GitHub issue context from the prompt."}}],"promptOverlays":{"backend":"Use GitHub issue context if available, otherwise continue from the prompt."},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const result = deriveMcpGrantDecisions(design, overview([]))
+
+    expect(result.summary).toEqual({ proposed: 0, warning: 1, blocked: 0 })
+    expect(result.decisions[0]).toMatchObject({
+      agent: 'backend',
+      health: {
+        installState: 'unknown',
+        status: 'unknown',
+      },
+      mcpId: 'github',
+      status: 'warning',
+    })
+  })
+
   it('blocks grant decisions for capabilities outside the safe beta allowlist', () => {
     const { design } = parseMcpExecutionDesign([
       '```mcp_execution_design_json',
@@ -476,6 +514,50 @@ describe('deriveMcpGrantDecisions', () => {
     expect(result.status).toBe('warnings')
     expect(result.blocked).toEqual([])
     expect(result.warnings.join('\n')).toMatch(/no approved capabilities/)
+    expect(result.warnings.join('\n')).toMatch(/planning-only prompt context/)
+  })
+
+  it('blocks empty work-package grants when prompt context belongs to another MCP', () => {
+    const result = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub, healthyFilesystem]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        permissions: [],
+        fallback: { action: 'ask_user', message: 'Use GitHub issue context.' },
+      }],
+      metadata: {
+        promptOverlay: 'Use the project context if available.',
+        mcpAwareSubtasks: [{
+          id: 'inspect-repository',
+          mcpCapabilities: ['filesystem.project.read'],
+        }],
+      },
+      title: 'Backend work package',
+    })
+
+    expect(result.status).toBe('blocked')
+    expect(result.blocked.join('\n')).toMatch(/no approved capabilities/)
+  })
+
+  it('keeps same-MCP prompt-only work packages warning-only when the MCP is unavailable', () => {
+    const result = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        permissions: [],
+        fallback: { action: 'ask_user', message: 'Use GitHub issue context from the prompt.' },
+      }],
+      metadata: {
+        promptOverlay: 'Use GitHub issue context if available, otherwise continue from the prompt.',
+      },
+      title: 'Backend work package',
+    })
+
+    expect(result.status).toBe('warnings')
+    expect(result.blocked).toEqual([])
+    expect(result.warnings.join('\n')).toMatch(/not configured/)
     expect(result.warnings.join('\n')).toMatch(/planning-only prompt context/)
   })
 
