@@ -522,6 +522,33 @@ describe('deriveMcpGrantDecisions', () => {
     expect(broker.blocked).toEqual(["MCP 'github' is not configured for this project."])
   })
 
+  it('warns for optional healthy empty MCP access with ask_user fallback', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"optional","assignment":{"type":"agent","targetAgents":["reviewer"]},"agentPermissions":{},"fallback":{"action":"ask_user","message":"Ask before proceeding without GitHub."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const validation = validateMcpExecutionDesign(design, overview([healthyGithub]))
+    const decisions = deriveMcpGrantDecisions(design, overview([healthyGithub]))
+    const broker = evaluateWorkPackageMcpBroker({
+      assignedRole: 'reviewer',
+      mcpOverview: overview([healthyGithub]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'optional',
+        permissions: [],
+        fallback: { action: 'ask_user' },
+      }],
+      metadata: {},
+      title: 'Reviewer package',
+    })
+
+    expect(validation.status).toBe('valid')
+    expect(decisions.summary).toEqual({ proposed: 0, warning: 1, blocked: 0 })
+    expect(broker.status).toBe('allowed')
+  })
+
   it('blocks unknown MCPs even when they are optional with a non-blocking fallback', () => {
     const { design } = parseMcpExecutionDesign([
       '```mcp_execution_design_json',
@@ -756,6 +783,37 @@ describe('deriveMcpGrantDecisions', () => {
       mcpRequirements: [{
         mcpId: 'filesystem',
         requirement: 'required',
+        permissions: ['filesystem.project.write'],
+        fallback: { action: 'ask_user' },
+      }],
+      metadata: {},
+      title: 'Frontend package',
+    })
+
+    expect(validation.status).toBe('warnings')
+    expect(validation.blocked).toEqual([])
+    expect(validation.warnings.join('\n')).toMatch(/filesystem\.project\.write/)
+    expect(validation.warnings.join('\n')).toMatch(/not configured/)
+    expect(decisions.summary).toEqual({ proposed: 0, warning: 1, blocked: 0 })
+    expect(broker.status).toBe('warnings')
+    expect(broker.blocked).toEqual([])
+    expect(broker.warnings.join('\n')).toMatch(/filesystem\.project\.write/)
+    expect(broker.warnings.join('\n')).toMatch(/not configured/)
+  })
+
+  it('keeps optional planning-only filesystem write packages warning-only when filesystem MCP is unavailable', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"filesystem","requirement":"optional","assignment":{"type":"agent","targetAgents":["frontend"]},"agentPermissions":{"frontend":["filesystem.project.write"]},"fallback":{"action":"ask_user","message":"Use sandbox output writes."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+    const validation = validateMcpExecutionDesign(design, overview([]))
+    const decisions = deriveMcpGrantDecisions(design, overview([]))
+    const broker = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([]),
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        requirement: 'optional',
         permissions: ['filesystem.project.write'],
         fallback: { action: 'ask_user' },
       }],

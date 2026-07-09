@@ -678,8 +678,8 @@ export function evaluateWorkPackageMcpBroker(input: {
         const message = statusMessage(mcpId, status)
         const hasOnlyPlanningOnlyCapabilities = capabilities.length > 0 && actionableCapabilityCount === 0
         if (
-          requirement === 'required' &&
-          ((capabilities.length === 0 && hasPromptOnlyContextForMcp) || hasOnlyPlanningOnlyCapabilities)
+          hasOnlyPlanningOnlyCapabilities ||
+          (requirement === 'required' && capabilities.length === 0 && hasPromptOnlyContextForMcp)
         ) {
           warnings.push(message)
         } else {
@@ -759,6 +759,7 @@ function decisionStatus(
   if (!isKnownMcpId(requirement.mcpId)) return 'blocked'
   if (capabilities.length === 0) {
     return canProceedWithoutMcp(requirement) ||
+      (requirement.requirement === 'optional' && healthyStatus(status)) ||
       (requirement.requirement === 'required' && hasRunScopedMcpInstructions)
       ? 'warning'
       : 'blocked'
