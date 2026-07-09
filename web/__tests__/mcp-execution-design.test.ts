@@ -272,6 +272,22 @@ describe('validateMcpExecutionDesign', () => {
     expect(result.blocked.join('\n')).toMatch(/not configured/)
   })
 
+  it('blocks required MCP requirements without any effective target agent', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":[]},"agentPermissions":{},"fallback":{"action":"block","message":"GitHub required."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const validation = validateMcpExecutionDesign(design, overview([]))
+    const decisions = deriveMcpGrantDecisions(design, overview([]))
+
+    expect(validation.status).toBe('blocked')
+    expect(validation.blocked.join('\n')).toMatch(/does not target any valid agent/)
+    expect(decisions.summary).toEqual({ proposed: 0, warning: 0, blocked: 0 })
+    expect(decisions.decisions).toEqual([])
+  })
+
   it('blocks unavailable required MCPs with live capabilities even when prompt overlay exists', () => {
     const { design } = parseMcpExecutionDesign([
       '```mcp_execution_design_json',
@@ -575,6 +591,35 @@ describe('deriveMcpGrantDecisions', () => {
 
     expect(result.status).toBe('blocked')
     expect(result.blocked.join('\n')).toMatch(/no approved capabilities/)
+  })
+
+  it('blocks unrelated required MCPs when a package prompt overlay is ambiguous across MCPs', () => {
+    const result = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyFilesystem]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        permissions: [],
+        fallback: { action: 'ask_user', message: 'Use issue context if available.' },
+      }, {
+        mcpId: 'filesystem',
+        requirement: 'required',
+        permissions: [],
+        fallback: { action: 'ask_user', message: 'Use project context if available.' },
+      }],
+      metadata: {
+        promptOverlay: 'Use project file context from the prompt.',
+        mcpAwareSubtasks: [{
+          id: 'inspect-files',
+          mcpCapabilities: ['filesystem.project.read'],
+        }],
+      },
+      title: 'Backend work package',
+    })
+
+    expect(result.status).toBe('blocked')
+    expect(result.blocked.join('\n')).toMatch(/MCP 'github' has no approved capabilities/)
+    expect(result.blocked.join('\n')).toMatch(/MCP 'github' is not configured/)
   })
 
   it('keeps same-MCP prompt-only work packages warning-only when the MCP is unavailable', () => {

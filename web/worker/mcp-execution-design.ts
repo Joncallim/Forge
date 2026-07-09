@@ -352,8 +352,14 @@ export function validateMcpExecutionDesign(
         }
       }
 
+      const agents = agentsForRequirement(requirement)
+      if (agents.length === 0) {
+        blocked.push(`MCP '${requirement.mcpId}' requirement does not target any valid agent.`)
+        continue
+      }
+
       const status = healthFor(mcpOverview, requirement.mcpId)
-      const agentDecisionStatuses = agentsForRequirement(requirement).map((agent) =>
+      const agentDecisionStatuses = agents.map((agent) =>
         decisionStatus(
           requirement,
           status,
@@ -475,9 +481,13 @@ function subtaskHasMcpContext(subtask: Record<string, unknown>, mcpId: string): 
     .some((capability) => capabilityBelongsToMcp(capability, mcpId))
 }
 
-function metadataHasRunScopedMcpInstructionsForMcp(metadata: unknown, mcpId: string): boolean {
+function metadataHasRunScopedMcpInstructionsForMcp(
+  metadata: unknown,
+  mcpId: string,
+  packageMcpIds: Set<string>,
+): boolean {
   if (!isRecord(metadata)) return false
-  return cleanText(metadata.promptOverlay, 2_000) !== '' ||
+  return (packageMcpIds.size === 1 && cleanText(metadata.promptOverlay, 2_000) !== '') ||
     metadataMcpAwareSubtasks(metadata).some((subtask) => subtaskHasMcpContext(subtask, mcpId))
 }
 
@@ -593,6 +603,11 @@ export function evaluateWorkPackageMcpBroker(input: {
   const blocked: string[] = []
   const warnings: string[] = []
   const entries = brokerEntries(input)
+  const packageMcpIds = new Set(
+    entries
+      .map((entry) => cleanText(entry.mcpId, 80))
+      .filter((mcpId) => mcpId !== ''),
+  )
   const hasRunScopedMcpInstructions = metadataHasRunScopedMcpInstructions(input.metadata)
   const approvedCapabilities = new Set<string>()
   // A capability prohibited by any grant entry is prohibited for the whole
@@ -630,7 +645,7 @@ export function evaluateWorkPackageMcpBroker(input: {
       warnings.push(`MCP '${mcpId}' grant is warning-only.`)
     }
 
-    const hasPromptOnlyContextForMcp = metadataHasRunScopedMcpInstructionsForMcp(input.metadata, mcpId)
+    const hasPromptOnlyContextForMcp = metadataHasRunScopedMcpInstructionsForMcp(input.metadata, mcpId, packageMcpIds)
     if (requirement === 'required' && (!capabilitiesPresent || capabilities.length === 0)) {
       const message = `MCP '${mcpId}' has no approved capabilities for required access.`
       if (hasPromptOnlyContextForMcp) warnings.push(message)
