@@ -750,7 +750,7 @@ function decisionStatus(
 ): McpGrantDecisionStatus {
   if (!isKnownMcpId(requirement.mcpId)) return 'blocked'
   if (capabilities.length === 0) {
-    return requirement.requirement === 'optional' || hasRunScopedMcpInstructions ? 'warning' : 'blocked'
+    return canProceedWithoutMcp(requirement) || hasRunScopedMcpInstructions ? 'warning' : 'blocked'
   }
   // A capability outside the safe beta allowlist (or explicitly prohibited) is
   // blocked at handoff by evaluateWorkPackageMcpBroker. Apply the same allowlist
