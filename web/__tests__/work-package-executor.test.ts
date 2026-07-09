@@ -188,6 +188,34 @@ describe('parseWorkPackageExecutionPlan', () => {
     expect(parsed.summary).toBe('Built tracker')
     expect(parsed.files).toHaveLength(1)
   })
+
+  it('parses a one-line fenced execution JSON block', () => {
+    const payload = JSON.stringify({
+      schemaVersion: 1,
+      summary: 'Built tracker',
+      files: [{ path: 'package.json', content: '{"scripts":{}}' }],
+      commands: [],
+    })
+
+    const parsed = parseWorkPackageExecutionPlan(`\`\`\`work_package_execution_json ${payload}\`\`\``)
+
+    expect(parsed.summary).toBe('Built tracker')
+    expect(parsed.files).toHaveLength(1)
+  })
+
+  it('parses a JSON-encoded execution response string', () => {
+    const payload = JSON.stringify({
+      schemaVersion: 1,
+      summary: 'Built tracker',
+      files: [{ path: 'package.json', content: '{"scripts":{}}' }],
+      commands: [],
+    })
+
+    const parsed = parseWorkPackageExecutionPlan(JSON.stringify(payload))
+
+    expect(parsed.summary).toBe('Built tracker')
+    expect(parsed.files).toHaveLength(1)
+  })
 })
 
 describe('hasLocalConflictCopyPathSegment', () => {
@@ -319,7 +347,7 @@ describe('executeWorkPackage', () => {
           },
           {
             path: 'index.test.js',
-            content: 'import test from "node:test"; import assert from "node:assert/strict"; test("ok", () => assert.equal(1, 1));\n',
+            content: 'const test = require("node:test"); const assert = require("node:assert/strict"); test("ok", () => assert.equal(1, 1));\n',
           },
         ],
         commands: [['npm', 'test'], ['npm', 'run', 'build']],
@@ -1131,7 +1159,7 @@ describe('executeWorkPackage', () => {
           },
           {
             path: 'index.test.js',
-            content: 'import test from "node:test"; import assert from "node:assert/strict"; test("ok", () => assert.equal(1, 1));\n',
+            content: 'const test = require("node:test"); const assert = require("node:assert/strict"); test("ok", () => assert.equal(1, 1));\n',
           },
         ],
         commands: [['npm', 'test']],
@@ -1261,7 +1289,7 @@ describe('executeWorkPackage', () => {
         validationStatus: 'failed',
       })
       await expect(fs.stat(sandbox)).resolves.toMatchObject({})
-      expect(mocks.generateText).toHaveBeenCalledTimes(2)
+      expect(mocks.generateText).toHaveBeenCalledTimes(3)
     }
   })
 
@@ -1523,7 +1551,7 @@ describe('executeWorkPackage', () => {
         prompt: 'Build a tiny task tracker web app. Add focused tests and make sure the app builds.',
       },
     }))).rejects.toThrow(/placeholder tests/i)
-    expect(mocks.generateText).toHaveBeenCalledTimes(2)
+    expect(mocks.generateText).toHaveBeenCalledTimes(3)
   })
 
   it('rejects invalid node:test shell scripts before command execution', async () => {
@@ -1543,7 +1571,7 @@ describe('executeWorkPackage', () => {
           },
           {
             path: 'tracker.test.js',
-            content: 'import test from "node:test"; import assert from "node:assert/strict"; test("adds item", () => assert.equal(1, 1));\n',
+            content: 'const test = require("node:test"); const assert = require("node:assert/strict"); test("adds item", () => assert.equal(1, 1));\n',
           },
           { path: 'build-check.js', content: 'console.log("build ok");\n' },
         ],
@@ -1596,7 +1624,7 @@ describe('executeWorkPackage', () => {
             },
             {
               path: 'tracker.test.js',
-              content: 'import test from "node:test"; import assert from "node:assert/strict"; test("adds item", () => assert.equal(["a"].length, 1));\n',
+              content: 'const test = require("node:test"); const assert = require("node:assert/strict"); test("adds item", () => assert.equal(["a"].length, 1));\n',
             },
             {
               path: 'build-check.js',
@@ -1616,6 +1644,130 @@ describe('executeWorkPackage', () => {
 
     expect(mocks.generateText).toHaveBeenCalledTimes(2)
     expect(result.summary).toBe('Built and tested the tracker.')
+    expect(result.commandResults.map((item) => item.exitCode)).toEqual([0, 0])
+  })
+
+  it('reprompts through invalid JSON and bad generated tests for a tiny task tracker', async () => {
+    mocks.generateText
+      .mockResolvedValueOnce({
+        text: '```work_package_execution_json\n{"schemaVersion":1,"summary":"Cut off"',
+      })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated weak tracker tests.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({
+                scripts: {
+                  build: 'node build-check.js',
+                  test: 'node test.js',
+                },
+              }),
+            },
+            {
+              path: 'tracker.test.js',
+              content: 'const test = require("node:test"); test("adds item", () => console.log("ok"));\n',
+            },
+            {
+              path: 'build-check.js',
+              content: 'console.log("build validated");\n',
+            },
+          ],
+          commands: [['npm', 'test'], ['npm', 'run', 'build']],
+        }),
+      })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Built a dependency-free tiny task tracker.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({
+                scripts: {
+                  build: 'node build-check.js',
+                  test: 'node --test',
+                },
+              }),
+            },
+            {
+              path: 'taskStore.js',
+              content: [
+                'function createState() { return { tasks: [] }; }',
+                'function addTask(state, title) {',
+                '  const task = { id: String(state.tasks.length + 1), title, completed: false };',
+                '  return { tasks: [...state.tasks, task] };',
+                '}',
+                'function toggleTask(state, id) {',
+                '  return { tasks: state.tasks.map((task) => task.id === id ? { ...task, completed: !task.completed } : task) };',
+                '}',
+                'function deleteTask(state, id) { return { tasks: state.tasks.filter((task) => task.id !== id) }; }',
+                'function filterTasks(state, filter) {',
+                '  if (filter === "active") return state.tasks.filter((task) => !task.completed);',
+                '  if (filter === "completed") return state.tasks.filter((task) => task.completed);',
+                '  return state.tasks;',
+                '}',
+                'function hydrate(raw) {',
+                '  try {',
+                '    const parsed = JSON.parse(raw);',
+                '    return Array.isArray(parsed.tasks) ? parsed : createState();',
+                '  } catch {',
+                '    return createState();',
+                '  }',
+                '}',
+                'module.exports = { createState, addTask, toggleTask, deleteTask, filterTasks, hydrate };',
+                '',
+              ].join('\n'),
+            },
+            {
+              path: 'tracker.test.js',
+              content: [
+                'const test = require("node:test");',
+                'const assert = require("node:assert/strict");',
+                'const { createState, addTask, toggleTask, deleteTask, filterTasks, hydrate } = require("./taskStore.js");',
+                '',
+                'test("add, complete, filter, delete, and malformed storage fallback", () => {',
+                '  let state = createState();',
+                '  state = addTask(state, "Ship the tracker");',
+                '  assert.equal(state.tasks.length, 1);',
+                '  state = toggleTask(state, state.tasks[0].id);',
+                '  assert.deepEqual(filterTasks(state, "completed").map((task) => task.title), ["Ship the tracker"]);',
+                '  assert.equal(filterTasks(state, "active").length, 0);',
+                '  state = deleteTask(state, state.tasks[0].id);',
+                '  assert.equal(filterTasks(state, "all").length, 0);',
+                '  assert.deepEqual(hydrate("{bad json"), createState());',
+                '});',
+                '',
+              ].join('\n'),
+            },
+            {
+              path: 'build-check.js',
+              content: [
+                'const fs = require("node:fs");',
+                'for (const file of ["taskStore.js", "tracker.test.js"]) {',
+                '  if (!fs.existsSync(file)) throw new Error(`${file} is missing`);',
+                '}',
+                '',
+              ].join('\n'),
+            },
+          ],
+          commands: [['npm', 'test'], ['npm', 'run', 'build']],
+        }),
+      })
+
+    const result = await executeWorkPackage(context({
+      task: {
+        ...context().task,
+        prompt: 'Build a tiny task tracker web app. Add focused tests and make sure the app builds.',
+      },
+    }))
+
+    expect(mocks.generateText).toHaveBeenCalledTimes(3)
+    expect(mocks.generateText.mock.calls[1][0].prompt).toContain('Execution response was not valid JSON.')
+    expect(mocks.generateText.mock.calls[2][0].prompt).toContain('Generated test file is not a focused node:test assertion: tracker.test.js')
+    expect(result.summary).toBe('Built a dependency-free tiny task tracker.')
     expect(result.commandResults.map((item) => item.exitCode)).toEqual([0, 0])
   })
 })

@@ -36,7 +36,7 @@ const MAX_FILE_BYTES = 512 * 1024
 const MAX_COMMANDS = 5
 const MAX_COMMAND_OUTPUT_BYTES = 16 * 1024
 const COMMAND_TIMEOUT_MS = 120_000
-const MAX_GENERATION_ATTEMPTS = 2
+const MAX_GENERATION_ATTEMPTS = 3
 const DEFAULT_GENERATION_TIMEOUT_MS = 120_000
 const DEFAULT_GENERATION_MAX_OUTPUT_TOKENS = 8000
 export const MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS = 3
@@ -289,9 +289,26 @@ function assertAllowedCommand(command: string[]): void {
 // small number of candidate start positions is more than enough.
 const MAX_JSON_SCAN_ATTEMPTS = 64
 
-function extractJson(rawText: string): string {
-  const fenced = /```(?:work_package_execution_json|json)?\s*\n([\s\S]*?)\n?```/i.exec(rawText)
-  if (fenced) return fenced[1]
+function uniqueNonEmpty(values: string[]): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const value of values) {
+    const trimmed = value.trim()
+    if (trimmed === '' || seen.has(trimmed)) continue
+    seen.add(trimmed)
+    result.push(trimmed)
+  }
+  return result
+}
+
+function extractJsonCandidates(rawText: string): string[] {
+  const candidates: string[] = []
+  const fencedPattern = /```([a-zA-Z0-9_-]+)?[^\S\r\n]*(?:\r?\n)?([\s\S]*?)```/g
+  for (const match of rawText.matchAll(fencedPattern)) {
+    const language = match[1]?.toLowerCase() ?? ''
+    if (language !== '' && language !== 'json' && language !== 'work_package_execution_json') continue
+    candidates.push(match[2])
+  }
 
   let attempts = 0
   for (let start = rawText.indexOf('{'); start >= 0; start = rawText.indexOf('{', start + 1)) {
@@ -320,13 +337,23 @@ function extractJson(rawText: string): string {
       } else if (char === '}') {
         depth -= 1
         if (depth === 0) {
-          return rawText.slice(start, index + 1)
+          candidates.push(rawText.slice(start, index + 1))
+          break
         }
       }
     }
   }
 
-  return rawText
+  candidates.push(rawText)
+  return uniqueNonEmpty(candidates)
+}
+
+function parseJsonCandidate(candidate: string): unknown {
+  let parsed = JSON.parse(candidate) as unknown
+  if (typeof parsed === 'string' && parsed.trim().startsWith('{')) {
+    parsed = JSON.parse(parsed) as unknown
+  }
+  return parsed
 }
 
 function normalizeExecutionPlan(parsed: unknown): WorkPackageExecutionPlan {
@@ -448,10 +475,8 @@ function validatePlanAgainstPrompt(plan: WorkPackageExecutionPlan, prompt: strin
       throw new Error('The user requested tests, but the execution plan did not run npm test.')
     }
 
-    const hasTestFile = plan.files.some((file) =>
-      /(^|\/)(__tests__\/|.*(\.test|\.spec)\.[cm]?[jt]sx?$|test\.[cm]?js$)/i.test(file.path),
-    )
-    if (!hasTestFile) {
+    const testFiles = plan.files.filter((file) => isJavaScriptFile(file.path) && isTestFile(file.path))
+    if (testFiles.length === 0) {
       throw new Error('The user requested focused tests, but the execution plan did not include a test file.')
     }
 
@@ -464,6 +489,11 @@ function validatePlanAgainstPrompt(plan: WorkPackageExecutionPlan, prompt: strin
     }
     if (isUnsafePackageScript(testScript)) {
       throw new Error('The generated test script includes unsafe shell behavior.')
+    }
+    for (const file of testFiles) {
+      if (!/\bnode:test\b/.test(file.content) || !/\bassert\b/.test(file.content) || isPlaceholderContent(file.content)) {
+        throw new Error(`Generated test file is not a focused node:test assertion: ${file.path}`)
+      }
     }
   }
 
@@ -533,6 +563,9 @@ async function generateValidatedExecutionPlan(input: {
         '',
         'Return a corrected full `work_package_execution_json` response.',
         'Do not reuse placeholder tests or echo-only build scripts.',
+        'For dependency-free JavaScript tests, set package.json scripts.test to `node --test`.',
+        'Name test files `*.test.js` and import or require `node:test` plus `node:assert/strict`; assert real requested behavior.',
+        'Do not return `node:test` as a shell command, console-only tests, placeholder tests, or prose outside the JSON fence.',
       ].join('\n')
     }
   }
@@ -541,14 +574,23 @@ async function generateValidatedExecutionPlan(input: {
 }
 
 export function parseWorkPackageExecutionPlan(rawText: string): WorkPackageExecutionPlan {
-  const jsonText = extractJson(rawText)
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(jsonText)
-  } catch {
-    throw new Error('Execution response was not valid JSON.')
+  let parseError: Error | null = null
+  let shapeError: Error | null = null
+  for (const jsonText of extractJsonCandidates(rawText)) {
+    let parsed: unknown
+    try {
+      parsed = parseJsonCandidate(jsonText)
+    } catch {
+      parseError ??= new Error('Execution response was not valid JSON.')
+      continue
+    }
+    try {
+      return normalizeExecutionPlan(parsed)
+    } catch (err) {
+      shapeError ??= err instanceof Error ? err : new Error(String(err))
+    }
   }
-  return normalizeExecutionPlan(parsed)
+  throw shapeError ?? parseError ?? new Error('Execution response was not valid JSON.')
 }
 
 export function hasLocalConflictCopyPathSegment(filePath: string): boolean {
