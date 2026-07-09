@@ -352,20 +352,26 @@ export function validateMcpExecutionDesign(
         }
       }
 
-      const hasPromptOnlyContext = designHasRunScopedMcpInstructionsForRequirement(design, requirement)
       const status = healthFor(mcpOverview, requirement.mcpId)
+      const agentDecisionStatuses = agentsForRequirement(requirement).map((agent) =>
+        decisionStatus(
+          requirement,
+          status,
+          requirementCapabilitiesForAgent(requirement, agent),
+          designHasRunScopedMcpInstructionsForAgentRequirement(design, agent, requirement.mcpId),
+        ),
+      )
+      const hasBlockedAgentDecision = agentDecisionStatuses.includes('blocked')
       if (!status) {
         const message = statusMessage(requirement.mcpId, null)
-        if (hasPromptOnlyContext) warnings.push(message)
-        else if (!canProceedWithoutMcp(requirement)) blocked.push(message)
+        if (hasBlockedAgentDecision) blocked.push(message)
         else warnings.push(message)
         continue
       }
 
       if (!healthyStatus(status)) {
         const message = statusMessage(requirement.mcpId, status)
-        if (hasPromptOnlyContext) warnings.push(message)
-        else if (!canProceedWithoutMcp(requirement)) blocked.push(message)
+        if (hasBlockedAgentDecision) blocked.push(message)
         else warnings.push(message)
       }
     }
@@ -759,15 +765,6 @@ function designHasRunScopedMcpInstructionsForAgentRequirement(
       subtask.agent === agent &&
       subtask.mcpCapabilities.some((capability) => capabilityBelongsToMcp(capability, mcpId)),
     )
-}
-
-function designHasRunScopedMcpInstructionsForRequirement(
-  design: McpExecutionDesign,
-  requirement: McpExecutionRequirement,
-): boolean {
-  return agentsForRequirement(requirement).some((agent) =>
-    designHasRunScopedMcpInstructionsForAgentRequirement(design, agent, requirement.mcpId),
-  )
 }
 
 export function deriveMcpGrantDecisions(

@@ -272,6 +272,40 @@ describe('validateMcpExecutionDesign', () => {
     expect(result.blocked.join('\n')).toMatch(/not configured/)
   })
 
+  it('blocks unavailable required MCPs with live capabilities even when prompt overlay exists', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{"backend":["github.issues.read"]},"fallback":{"action":"ask_user","message":"Connect GitHub."}}],"promptOverlays":{"backend":"Use issue context if available."},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const validation = validateMcpExecutionDesign(design, overview([]))
+    const decisions = deriveMcpGrantDecisions(design, overview([]))
+
+    expect(validation.status).toBe('blocked')
+    expect(validation.blocked.join('\n')).toMatch(/not configured/)
+    expect(decisions.summary).toEqual({ proposed: 0, warning: 0, blocked: 1 })
+  })
+
+  it('blocks unavailable prompt-only requirements when any assigned agent lacks prompt context', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"multiple_agents","targetAgents":["backend","qa"]},"agentPermissions":{},"fallback":{"action":"ask_user","message":"Use prompt context."}}],"promptOverlays":{"backend":"Use issue context if available."},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const validation = validateMcpExecutionDesign(design, overview([]))
+    const decisions = deriveMcpGrantDecisions(design, overview([]))
+
+    expect(validation.status).toBe('blocked')
+    expect(validation.blocked.join('\n')).toMatch(/not configured/)
+    expect(decisions.summary).toEqual({ proposed: 0, warning: 1, blocked: 1 })
+    expect(decisions.decisions.map((decision) => [decision.agent, decision.status])).toEqual([
+      ['backend', 'warning'],
+      ['qa', 'blocked'],
+    ])
+  })
+
   it('warns for optional known MCPs that are absent from the project overview', () => {
     const { design } = parseMcpExecutionDesign([
       '```mcp_execution_design_json',
