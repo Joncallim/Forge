@@ -272,6 +272,34 @@ describe('validateMcpExecutionDesign', () => {
     expect(result.blocked.join('\n')).toMatch(/not configured/)
   })
 
+  it('blocks required healthy MCP requirements with no capabilities or prompt-only context', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","assignment":{"type":"agent","targetAgents":["backend"]},"agentPermissions":{},"fallback":{"action":"ask_user","message":"Use GitHub issue context."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const validation = validateMcpExecutionDesign(design, overview([healthyGithub]))
+    const decisions = deriveMcpGrantDecisions(design, overview([healthyGithub]))
+    const broker = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([healthyGithub]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        permissions: [],
+        fallback: { action: 'ask_user' },
+      }],
+      metadata: {},
+      title: 'Backend package',
+    })
+
+    expect(validation.status).toBe('blocked')
+    expect(validation.blocked.join('\n')).toMatch(/no approved capabilities/)
+    expect(decisions.summary).toEqual({ proposed: 0, warning: 0, blocked: 1 })
+    expect(broker.status).toBe('blocked')
+    expect(broker.blocked.join('\n')).toMatch(/no approved capabilities/)
+  })
+
   it('blocks required MCP requirements without any effective target agent', () => {
     const { design } = parseMcpExecutionDesign([
       '```mcp_execution_design_json',
@@ -461,6 +489,37 @@ describe('deriveMcpGrantDecisions', () => {
       status: 'blocked',
       fallback: { action: 'ask_user' },
     })
+  })
+
+  it('blocks optional empty MCP access with ask_user fallback even when prompt-only context exists', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"optional","assignment":{"type":"agent","targetAgents":["reviewer"]},"agentPermissions":{},"fallback":{"action":"ask_user","message":"Ask before proceeding without GitHub."}}],"promptOverlays":{"reviewer":"Use issue context from the prompt."},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+
+    const validation = validateMcpExecutionDesign(design, overview([]))
+    const decisions = deriveMcpGrantDecisions(design, overview([]))
+    const broker = evaluateWorkPackageMcpBroker({
+      assignedRole: 'reviewer',
+      mcpOverview: overview([]),
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'optional',
+        permissions: [],
+        fallback: { action: 'ask_user' },
+      }],
+      metadata: {
+        promptOverlay: 'Use issue context from the prompt.',
+      },
+      title: 'Reviewer package',
+    })
+
+    expect(validation.status).toBe('blocked')
+    expect(validation.blocked).toEqual(["MCP 'github' is not configured for this project."])
+    expect(decisions.summary).toEqual({ proposed: 0, warning: 0, blocked: 1 })
+    expect(broker.status).toBe('blocked')
+    expect(broker.blocked).toEqual(["MCP 'github' is not configured for this project."])
   })
 
   it('blocks unknown MCPs even when they are optional with a non-blocking fallback', () => {
@@ -682,6 +741,37 @@ describe('deriveMcpGrantDecisions', () => {
     expect(result.blocked).toEqual([])
     expect(result.warnings.join('\n')).toMatch(/not configured/)
     expect(result.warnings.join('\n')).toMatch(/planning-only prompt context/)
+  })
+
+  it('keeps planning-only filesystem write packages warning-only when filesystem MCP is unavailable', () => {
+    const { design } = parseMcpExecutionDesign([
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":[{"mcpId":"filesystem","requirement":"required","assignment":{"type":"agent","targetAgents":["frontend"]},"agentPermissions":{"frontend":["filesystem.project.write"]},"fallback":{"action":"ask_user","message":"Use sandbox output writes."}}],"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'))
+    const validation = validateMcpExecutionDesign(design, overview([]))
+    const decisions = deriveMcpGrantDecisions(design, overview([]))
+    const broker = evaluateWorkPackageMcpBroker({
+      mcpOverview: overview([]),
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        requirement: 'required',
+        permissions: ['filesystem.project.write'],
+        fallback: { action: 'ask_user' },
+      }],
+      metadata: {},
+      title: 'Frontend package',
+    })
+
+    expect(validation.status).toBe('warnings')
+    expect(validation.blocked).toEqual([])
+    expect(validation.warnings.join('\n')).toMatch(/filesystem\.project\.write/)
+    expect(validation.warnings.join('\n')).toMatch(/not configured/)
+    expect(decisions.summary).toEqual({ proposed: 0, warning: 1, blocked: 0 })
+    expect(broker.status).toBe('warnings')
+    expect(broker.blocked).toEqual([])
+    expect(broker.warnings.join('\n')).toMatch(/filesystem\.project\.write/)
+    expect(broker.warnings.join('\n')).toMatch(/not configured/)
   })
 
   it('blocks work-package optional unavailable MCP access unless fallback is non-blocking', () => {

@@ -368,6 +368,10 @@ export function validateMcpExecutionDesign(
         ),
       )
       const hasBlockedAgentDecision = agentDecisionStatuses.includes('blocked')
+      if (requirement.requirement === 'required' && healthyStatus(status) && hasBlockedAgentDecision) {
+        blocked.push(`MCP '${requirement.mcpId}' has no approved capabilities or prompt-only context for required access.`)
+        continue
+      }
       if (!status) {
         const message = statusMessage(requirement.mcpId, null)
         if (hasBlockedAgentDecision) blocked.push(message)
@@ -672,7 +676,11 @@ export function evaluateWorkPackageMcpBroker(input: {
       const status = healthFor(input.mcpOverview, mcpId)
       if (!healthyStatus(status)) {
         const message = statusMessage(mcpId, status)
-        if (requirement === 'required' && capabilities.length === 0 && hasPromptOnlyContextForMcp) {
+        const hasOnlyPlanningOnlyCapabilities = capabilities.length > 0 && actionableCapabilityCount === 0
+        if (
+          requirement === 'required' &&
+          ((capabilities.length === 0 && hasPromptOnlyContextForMcp) || hasOnlyPlanningOnlyCapabilities)
+        ) {
           warnings.push(message)
         } else {
           shouldBlock(message)
@@ -750,7 +758,10 @@ function decisionStatus(
 ): McpGrantDecisionStatus {
   if (!isKnownMcpId(requirement.mcpId)) return 'blocked'
   if (capabilities.length === 0) {
-    return canProceedWithoutMcp(requirement) || hasRunScopedMcpInstructions ? 'warning' : 'blocked'
+    return canProceedWithoutMcp(requirement) ||
+      (requirement.requirement === 'required' && hasRunScopedMcpInstructions)
+      ? 'warning'
+      : 'blocked'
   }
   // A capability outside the safe beta allowlist (or explicitly prohibited) is
   // blocked at handoff by evaluateWorkPackageMcpBroker. Apply the same allowlist
