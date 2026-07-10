@@ -646,7 +646,7 @@ function splitTopLevelArguments(content: string): string[] {
 
 function hasAssertionInRegisteredTest(executable: string): boolean {
   const assertionPattern = /\b(?:assert(?:\.[A-Za-z_$][\w$]*)?|ok|equal|strictEqual|deepEqual|deepStrictEqual|throws|rejects)\s*\(/
-  for (const match of executable.matchAll(/\b(?:test|it)(?:\.only)?\s*\(/g)) {
+  for (const match of executable.matchAll(/(?:^|[^\w$.])(?:test|it)(?:\.only)?\s*\(/g)) {
     const openingIndex = (match.index ?? 0) + match[0].lastIndexOf('(')
     const closingIndex = findClosingParenthesis(executable, openingIndex)
     if (closingIndex < 0) continue

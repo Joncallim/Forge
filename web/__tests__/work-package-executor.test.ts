@@ -2019,7 +2019,15 @@ describe('executeWorkPackage', () => {
             },
             {
               path: 'tracker.test.js',
-              content: 'const test = require("node:test"); const assert = require("node:assert/strict"); assert.equal(1, 1); test("adds item", () => {});\n',
+              content: [
+                'const test = require("node:test");',
+                'const assert = require("node:assert/strict");',
+                'const runner = { test: (callback) => callback() };',
+                'assert.equal(1, 1);',
+                'runner.test(() => assert.equal(1, 1));',
+                'test("adds item", () => {});',
+                '',
+              ].join('\n'),
             },
             {
               path: 'build-check.js',
