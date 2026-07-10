@@ -153,11 +153,11 @@ For the currently wired ACP adapters:
 - The adapter wraps the local `codex` or `claude` CLI.
 - The local CLI must already be installed and logged in.
 - The Forge project must have a local folder so Forge can validate and bound
-  repository context. Architect planning uses an isolated runtime directory;
-  executable work-package ACP sessions are disabled by default because local ACP
-  adapters are not OS-confined by Forge. Set
-  `FORGE_ACP_WORK_PACKAGE_EXECUTION=1` only for repositories where that local
-  process access is acceptable.
+  repository context. Architect planning uses an isolated runtime directory.
+  Executable work-package ACP sessions are enabled after task approval, but the
+  local adapter is not OS-confined by Forge. Set
+  `FORGE_ACP_WORK_PACKAGE_EXECUTION=0` where that local process access is not
+  acceptable.
 - Installing the Zed editor is not required; Forge uses Agent Client Protocol
   adapter packages, not the editor itself.
 
@@ -317,7 +317,7 @@ Worker and workspace options:
 | `FORGE_WORK_PACKAGE_HANDOFF` | Set `0` or `false` to disable default work-package handoff claims |
 | `FORGE_WORK_PACKAGE_EXECUTION` | Set `0`, `false`, `off`, `no`, or `disabled` to disable default package execution and create handoff artifacts only |
 | `FORGE_HOST_REPOSITORY_WRITES` | Set `0`, `false`, `off`, `no`, or `disabled` to keep generated files sandbox-only and skip local project edits |
-| `FORGE_ACP_WORK_PACKAGE_EXECUTION` | Set `1`, `true`, `on`, `yes`, or `enabled` only when local ACP package execution is an accepted operator risk |
+| `FORGE_ACP_WORK_PACKAGE_EXECUTION` | Set `0`, `false`, `off`, `no`, or `disabled` to block ACP package execution when local adapter process access is not acceptable |
 | `FORGE_RUNNING_WORK_PACKAGE_STALE_SECONDS` | Defaults to `900`; retry handoff treats older running package rows as interrupted and recovers them before continuing |
 | `FORGE_WORKSPACE_ROOT` | Fixed workspace root override |
 | `FORGE_MCPS_ROOT` | Fixed shared MCP root override |

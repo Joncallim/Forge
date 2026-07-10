@@ -245,6 +245,24 @@ describe('parseWorkPackageExecutionPlan', () => {
     expect(parsed.summary).toBe('Built tracker')
     expect(parsed.files).toHaveLength(1)
   })
+
+  it('parses a JSON-encoded fenced execution response string', () => {
+    const payload = [
+      '```work_package_execution_json',
+      JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Built tracker',
+        files: [{ path: 'package.json', content: '{"scripts":{}}' }],
+        commands: [],
+      }),
+      '```',
+    ].join('\n')
+
+    const parsed = parseWorkPackageExecutionPlan(JSON.stringify(payload))
+
+    expect(parsed.summary).toBe('Built tracker')
+    expect(parsed.files).toHaveLength(1)
+  })
 })
 
 describe('hasLocalConflictCopyPathSegment', () => {
@@ -1253,7 +1271,7 @@ describe('executeWorkPackage', () => {
     await expect(executeWorkPackage(context())).rejects.toThrow(/at least one checkable JavaScript source file/i)
   })
 
-  it('throws validation failures with durable sandbox output metadata', async () => {
+  it('wraps command-selected generation validation failures with durable empty sandbox metadata', async () => {
     mocks.generateText.mockResolvedValue({
       text: JSON.stringify({
         schemaVersion: 1,
@@ -1279,16 +1297,15 @@ describe('executeWorkPackage', () => {
       expect(err).toBeInstanceOf(WorkPackageExecutionError)
       const failure = (err as WorkPackageExecutionError).failureDetails
       expect(failure.sandboxPath).toBe(path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'attempt-1'))
-      expect(failure.fileCount).toBe(1)
+      expect(failure.fileCount).toBe(0)
       expect(failure.artifactMetadata).toMatchObject({
-        files: ['package.json'],
+        files: [],
         generatedBy: 'work-package-executor',
         repositoryWrites: false,
-        sandboxWrites: true,
+        sandboxWrites: false,
         validationStatus: 'failed',
       })
-      expect(failure.commandResults).toHaveLength(1)
-      expect(failure.commandResults[0].exitCode).not.toBe(0)
+      expect(failure.commandResults).toHaveLength(0)
     }
   })
 
@@ -1642,7 +1659,9 @@ describe('executeWorkPackage', () => {
               'const assert = require("node:assert/strict");',
               'test("persists with a localStorage stub", () => {',
               '  const localStorageStub = new Map([["tasks", "[]"]]);',
+              '  const input = { placeholder: "Add task" };',
               '  assert.equal(localStorageStub.get("tasks"), "[]");',
+              '  assert.equal(input.placeholder, "Add task");',
               '});',
               '',
             ].join('\n'),
@@ -1691,6 +1710,89 @@ describe('executeWorkPackage', () => {
     expect(mocks.generateText.mock.calls[1][0].prompt).toContain('configured output limit')
     expect(mocks.generateText.mock.calls[1][0].prompt).toContain('Keep the response concise')
     expect(result.summary).toBe('Returned a concise complete plan.')
+  })
+
+  it('repairs selected test validation when the task prompt does not mention tests', async () => {
+    mocks.generateText
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated weak tests.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { test: 'node --test' } }),
+            },
+            {
+              path: 'tracker.test.js',
+              content: 'const test = require("node:test"); test("adds", () => console.log("ok"));\n',
+            },
+          ],
+          commands: [['npm', 'test']],
+        }),
+      })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated focused tests.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { test: 'node --test' } }),
+            },
+            {
+              path: 'tracker.test.js',
+              content: 'const test = require("node:test"); const assert = require("node:assert/strict"); test("adds", () => assert.equal(1, 1));\n',
+            },
+          ],
+          commands: [['npm', 'test']],
+        }),
+      })
+
+    const result = await executeWorkPackage(context())
+
+    expect(mocks.generateText).toHaveBeenCalledTimes(2)
+    expect(mocks.generateText.mock.calls[1][0].prompt).toContain('not a focused node:test assertion')
+    expect(result.summary).toBe('Generated focused tests.')
+  })
+
+  it('repairs a selected placeholder build when the task prompt does not mention builds', async () => {
+    mocks.generateText
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated a placeholder build.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { build: 'echo "build passed"' } }),
+            },
+            { path: 'app.js', content: 'export const ready = true;\n' },
+          ],
+          commands: [['npm', 'run', 'build']],
+        }),
+      })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated a meaningful build check.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { build: 'node build-check.js --strict true' } }),
+            },
+            { path: 'app.js', content: 'export const ready = true;\n' },
+            { path: 'build-check.js', content: 'console.log("build validated");\n' },
+          ],
+          commands: [['npm', 'run', 'build']],
+        }),
+      })
+
+    const result = await executeWorkPackage(context())
+
+    expect(mocks.generateText).toHaveBeenCalledTimes(2)
+    expect(mocks.generateText.mock.calls[1][0].prompt).toContain('build script appears to be a placeholder')
+    expect(result.summary).toBe('Generated a meaningful build check.')
   })
 
   it('reprompts once when validation rejects the first generated plan', async () => {
@@ -1774,7 +1876,7 @@ describe('executeWorkPackage', () => {
             },
             {
               path: 'tracker.test.js',
-              content: 'const test = require("node:test"); test("adds item", () => console.log("ok"));\n',
+              content: 'const test = require("node:test"); const assert = require("node:assert/strict"); test("adds item", () => console.log("ok"));\n',
             },
             {
               path: 'build-check.js',

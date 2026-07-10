@@ -27,6 +27,7 @@ import { sanitizeWorkerMessage } from './redaction'
 import { publishTaskEvent } from './events'
 import { recordTaskLogBestEffort } from './task-logs'
 import { shouldApplyHostRepositoryWrites } from './repository-edit-policy'
+import { defaultOnFeatureFlagEnabled } from './feature-flags'
 
 const execFile = promisify(execFileCallback)
 
@@ -46,8 +47,6 @@ const ALLOWED_COMMANDS = new Set([
   'npm run build',
   'npm run lint',
 ])
-
-const ACP_EXECUTION_ENABLED_VALUES = new Set(['1', 'true', 'on', 'yes', 'enabled'])
 
 type TaskRow = typeof tasks.$inferSelect
 type ProjectRow = typeof projects.$inferSelect
@@ -256,8 +255,7 @@ function isAcpModel(model: LanguageModel): boolean {
 }
 
 function isAcpWorkPackageExecutionEnabled(env: Record<string, string | undefined> = process.env): boolean {
-  const raw = env.FORGE_ACP_WORK_PACKAGE_EXECUTION?.trim().toLowerCase()
-  return raw !== undefined && ACP_EXECUTION_ENABLED_VALUES.has(raw)
+  return defaultOnFeatureFlagEnabled(env.FORGE_ACP_WORK_PACKAGE_EXECUTION)
 }
 
 function generationTimeoutMs(): number {
@@ -325,6 +323,7 @@ function normalizeValidationCommand(command: unknown, packageJson: Record<string
 // which can stall the shared worker. Real responses put the object first, so a
 // small number of candidate start positions is more than enough.
 const MAX_JSON_SCAN_ATTEMPTS = 64
+const MAX_JSON_STRING_DECODE_DEPTH = 2
 
 function uniqueNonEmpty(values: string[]): string[] {
   const seen = new Set<string>()
@@ -389,11 +388,7 @@ function extractJsonCandidates(rawText: string): string[] {
 }
 
 function parseJsonCandidate(candidate: string): unknown {
-  let parsed = JSON.parse(candidate) as unknown
-  if (typeof parsed === 'string' && parsed.trim().startsWith('{')) {
-    parsed = JSON.parse(parsed) as unknown
-  }
-  return parsed
+  return JSON.parse(candidate) as unknown
 }
 
 function normalizeExecutionPlan(parsed: unknown): WorkPackageExecutionPlan {
@@ -456,7 +451,7 @@ function hasCommand(commands: string[][], expected: string): boolean {
 }
 
 function isPlaceholderContent(content: string): boolean {
-  return /\b(no tests? needed|not needed for this example|placeholder|todo only)\b/i.test(content)
+  return /\b(no tests? needed|not needed for this example|todo only)\b/i.test(content)
 }
 
 function readGeneratedPackageJson(files: WorkPackageExecutionFile[]): Record<string, unknown> | null {
@@ -481,9 +476,15 @@ function packageScript(packageJson: Record<string, unknown> | null, name: string
 function isNoOpScript(script: string): boolean {
   return (
     script === '' ||
-    /(^|\s)(true|exit 0)(\s|$)/i.test(script) ||
-    /^\s*echo\s+['"]?(build script not needed|no tests? needed|not needed for this example|ok|done)/i.test(script)
+    /^\s*(?:true|exit\s+0)\s*$/i.test(script) ||
+    /^\s*echo(?:\s|$)/i.test(script)
   )
+}
+
+function isFocusedNodeTestAssertion(content: string): boolean {
+  const hasTestCall = /\b(?:test|it)(?:\.(?:only|skip|todo))?\s*\(/.test(content)
+  const hasAssertionCall = /\b(?:assert(?:\.[A-Za-z_$][\w$]*)?|ok|equal|strictEqual|deepEqual|deepStrictEqual|throws|rejects)\s*\(/.test(content)
+  return /\bnode:test\b/.test(content) && /\bnode:assert\/strict\b/.test(content) && hasTestCall && hasAssertionCall
 }
 
 function isInvalidNodeTestScript(script: string): boolean {
@@ -502,15 +503,17 @@ function isUnsafePackageScript(script: string): boolean {
 
 function validatePlanAgainstPrompt(plan: WorkPackageExecutionPlan, prompt: string): void {
   const packageJson = readGeneratedPackageJson(plan.files)
+  const testsRequested = promptRequestsTests(prompt)
+  const testCommandSelected = hasCommand(plan.commands, 'npm test')
 
-  if (promptRequestsTests(prompt)) {
-    if (!hasCommand(plan.commands, 'npm test')) {
-      throw new Error('The user requested tests, but the execution plan did not run npm test.')
-    }
+  if (testsRequested && !testCommandSelected) {
+    throw new Error('The user requested tests, but the execution plan did not run npm test.')
+  }
 
+  if (testsRequested || testCommandSelected) {
     const testFiles = plan.files.filter((file) => isJavaScriptFile(file.path) && isTestFile(file.path))
     if (testFiles.length === 0) {
-      throw new Error('The user requested focused tests, but the execution plan did not include a test file.')
+      throw new Error('The execution plan selected focused tests but did not include a test file.')
     }
 
     const testScript = packageScript(packageJson, 'test')
@@ -528,17 +531,19 @@ function validatePlanAgainstPrompt(plan: WorkPackageExecutionPlan, prompt: strin
       throw new Error('The generated test script includes unsafe shell behavior.')
     }
     for (const file of testFiles) {
-      if (!/\bnode:test\b/.test(file.content) || !/\bassert\b/.test(file.content) || isPlaceholderContent(file.content)) {
+      if (!isFocusedNodeTestAssertion(file.content) || isPlaceholderContent(file.content)) {
         throw new Error(`Generated test file is not a focused node:test assertion: ${file.path}`)
       }
     }
   }
 
-  if (promptRequestsBuild(prompt)) {
-    if (!hasCommand(plan.commands, 'npm run build')) {
-      throw new Error('The user requested a build check, but the execution plan did not run npm run build.')
-    }
+  const buildRequested = promptRequestsBuild(prompt)
+  const buildCommandSelected = hasCommand(plan.commands, 'npm run build')
+  if (buildRequested && !buildCommandSelected) {
+    throw new Error('The user requested a build check, but the execution plan did not run npm run build.')
+  }
 
+  if (buildRequested || buildCommandSelected) {
     const buildScript = packageScript(packageJson, 'build')
     if (isNoOpScript(buildScript)) {
       throw new Error('The generated build script appears to be a placeholder.')
@@ -615,12 +620,19 @@ async function generateValidatedExecutionPlan(input: {
 
 export function parseWorkPackageExecutionPlan(rawText: string): WorkPackageExecutionPlan {
   let firstError: Error | null = null
-  for (const jsonText of extractJsonCandidates(rawText)) {
+  const candidates = extractJsonCandidates(rawText).map((text) => ({ depth: 0, text }))
+  for (let index = 0; index < candidates.length; index += 1) {
+    const { depth, text: jsonText } = candidates[index]
     let parsed: unknown
     try {
       parsed = parseJsonCandidate(jsonText)
     } catch {
       firstError ??= new Error('Execution response was not valid JSON.')
+      continue
+    }
+    if (typeof parsed === 'string' && depth < MAX_JSON_STRING_DECODE_DEPTH) {
+      const decoded = extractJsonCandidates(parsed).map((text) => ({ depth: depth + 1, text }))
+      candidates.splice(index + 1, 0, ...decoded)
       continue
     }
     try {
@@ -801,7 +813,7 @@ async function validateGeneratedCommand(projectRoot: string, command: string[]):
     for (const file of testFiles) {
       const absolute = path.join(projectRoot, file)
       const content = await fs.readFile(absolute, 'utf8')
-      if (!/\bnode:test\b/.test(content) || !/\bassert\b/.test(content) || isPlaceholderContent(content)) {
+      if (!isFocusedNodeTestAssertion(content) || isPlaceholderContent(content)) {
         throw new Error(`Generated test file is not a focused node:test assertion: ${file}`)
       }
       await safeSyntaxCheck(absolute)
@@ -1511,7 +1523,7 @@ export async function loadWorkPackageExecutionContext(
   if (!provider) throw new Error(`Provider config ${providerConfigId} is missing or inactive.`)
   if (provider.config.providerType === 'acp' && !isAcpWorkPackageExecutionEnabled()) {
     throw new Error(
-      'ACP work-package execution is disabled. Set FORGE_ACP_WORK_PACKAGE_EXECUTION=1 only after accepting that ACP adapters are local processes and are not OS-confined by Forge.',
+      'ACP work-package execution is disabled by FORGE_ACP_WORK_PACKAGE_EXECUTION. Remove the setting or set it to 1 after accepting that ACP adapters are local processes and are not OS-confined by Forge.',
     )
   }
 

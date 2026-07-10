@@ -28,9 +28,10 @@ edits and a reviewable sandbox copy of every generated file.
   disables model execution and keeps the handoff-artifact-only path.
 - `FORGE_HOST_REPOSITORY_WRITES=0`, `false`, `off`, `no`, or `disabled` lets
   package models run but keeps generated files sandbox-only.
-- ACP-backed work-package execution is separately disabled by default. Set
-  `FORGE_ACP_WORK_PACKAGE_EXECUTION=1` only when the operator accepts that ACP
-  adapters are local processes and are not OS-confined by Forge.
+- ACP-backed work-package execution is enabled after an operator configures an
+  ACP provider and approves the task. ACP adapters are local processes and are
+  not OS-confined by Forge. Set `FORGE_ACP_WORK_PACKAGE_EXECUTION=0`, `false`,
+  `off`, `no`, or `disabled` to prevent ACP package execution.
 - After Architect plan approval, Forge may execute one eligible specialist work
   package at a time. Parallel specialist execution remains out of scope.
 - Forge may collect bounded read-only host-repository context before a package
