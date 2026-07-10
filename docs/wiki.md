@@ -52,6 +52,13 @@ Architect plan saved
   -> manual QA/Reviewer/Security gates where required
 ```
 
+The MCP admission check is one shared contract across grant preview, plan
+approval, and handoff (EPIC #172, ADR
+[0009](adr/0009-mcp-admission-contract.md)). Each MCP request resolves to a
+single mode -- planning-only context, bounded read-only context (approve/deny),
+an MCP that needs setup, or a deferred live-MCP feature -- so a plan that approves
+will not silently stall at handoff.
+
 Task detail controls now cover the common operator interventions:
 
 - Stop cancels a non-terminal task and any active package/run state.

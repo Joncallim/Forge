@@ -1,6 +1,6 @@
 # Forge Roadmap
 
-Last updated: 2026-07-01
+Last updated: 2026-07-10
 
 ## Plain-English Summary
 
@@ -155,6 +155,32 @@ Still out of scope:
   or execution policy.
 - Default-on package execution before the release gate, documentation, QA,
   Reviewer, Adversarial review, and manual/operator smoke path all pass.
+
+### MCP Execution Readiness and Bounded Context Grants (#172)
+
+The next architecture epic after the #119 beta. MCP ambiguity is now the main
+reason an approved task can still stall at handoff, because the same beta
+capability policy is re-derived by four divergent code paths (planning
+validation, grant preview, handoff broker, and the filesystem grant gate) that do
+not agree -- most importantly, plan approval never runs the handoff broker, so a
+package can pass approval and then block at handoff.
+
+The epic makes planning, approval, UI state, filesystem grants, and handoff follow
+**one admission contract**: a normalized `McpAdmissionDecision` (ADR
+[0009](adr/0009-mcp-admission-contract.md)) with a capability `mode`
+(`planning_only`, `bounded_context_required`, `bounded_context_approved`,
+`blocked`, `deferred_live_mcp`) and a `recoveryAction`, sourced from
+`MCP_CATALOG.runtime.capabilities`. Capabilities resolve to three classes:
+planning-only (warn, never block, including `filesystem.project.write`), bounded
+read-only (`filesystem.project.read|list|search`, may need an operator grant), and
+deferred live MCP (live tool handles and write/merge/admin -- a product boundary,
+not a broken install). Live MCP tool handles remain out of scope.
+
+Delivered as six sweeping child slices plus #43: #176 (S1 contract/taxonomy),
+#177 (S2 consolidation + approval enforcement), #178 (S3 deterministic filesystem
+grant/denial recovery), #179 (S4 prompt/context packet evidence), #180 (S5 unified
+operator UI copy/recovery-action contract), #181 (S6 end-to-end regression +
+preview==handoff invariant), and #43 (Architect-driven MCP assignment/overlays).
 
 ## Technical Details
 

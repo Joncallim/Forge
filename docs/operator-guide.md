@@ -225,7 +225,10 @@ FORGE_HOST_REPOSITORY_WRITES=0
 
 With the default execution path:
 
-1. The operator approves the Architect plan.
+1. The operator approves the Architect plan. Approval runs the same MCP admission
+   check as handoff, so a plan that approves will not silently stall later on MCP
+   grant semantics (EPIC #172, ADR
+   [0009](adr/0009-mcp-admission-contract.md)).
 2. Forge releases ready work packages and runs the MCP/capability broker.
 3. Required blocked MCP/tool grants stop the package before execution. Optional
    grants can continue only when the approved fallback is non-blocking.
@@ -238,6 +241,21 @@ With the default execution path:
    `FORGE_HOST_REPOSITORY_WRITES=0` is set.
 8. QA, Reviewer, and Security gates appear when required. In this beta, those
    are manual operator decisions, not proof that separate reviewer agents ran.
+
+On the task detail page, each MCP request resolves to one of four states so you
+can act without reading logs (EPIC #172):
+
+- **Planning context** -- the Architect only suggested an MCP; it is recorded as
+  prompt instructions and never blocks handoff. Generated file writes go through
+  the Forge sandbox/host-apply path, not a live MCP write tool.
+- **Needs project context** -- the package needs bounded read-only filesystem
+  context (`filesystem.project.read|list|search`). Approve or deny the exact
+  grant shown; denial is recorded and the package is held, not crashed.
+- **MCP needs setup** -- an MCP is missing/unhealthy/unauthenticated. Use the
+  linked setup/retry action on the project MCP panel.
+- **Deferred -- beta boundary** -- the request needs a live MCP tool handle (or a
+  write/merge/admin capability). This is a product boundary, not a broken
+  install; it is deferred to a later security-reviewed slice.
 
 Operators can review:
 

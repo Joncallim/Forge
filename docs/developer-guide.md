@@ -29,6 +29,23 @@ is `not_implemented`) -- specialists run sandboxed with no real MCP tools -- so
 Use precise grant terms: Architect-proposed grants, Forge broker decisions,
 operator-approved grant snapshots, and effective run-scoped instructions.
 
+Admission is being consolidated onto **one contract** (EPIC #172, ADR
+[0009](adr/0009-mcp-admission-contract.md)). The same normalized
+`McpAdmissionDecision` object -- with a capability `mode` of `planning_only`,
+`bounded_context_required`, `bounded_context_approved`, `blocked`, or
+`deferred_live_mcp`, plus a `recoveryAction` -- drives grant preview, plan
+approval, handoff blocking, and operator recovery copy, so those surfaces cannot
+disagree. Capabilities fall into three classes: **planning-only** (prompt
+overlays, MCP-aware subtasks, `filesystem.project.write`; warn, never block),
+**bounded read-only** (`filesystem.project.read|list|search`; may need an
+explicit operator grant), and **deferred live MCP** (live tool handles, GitHub
+write/branch/PR/merge/settings/secret, filesystem write/delete/admin; a product
+boundary, not a broken install). The classifier is sourced from
+`MCP_CATALOG.runtime.capabilities`. Historically the same policy was re-derived
+by four divergent paths (`validateMcpExecutionDesign`, `deriveMcpGrantDecisions`,
+`evaluateWorkPackageMcpBroker`, and `requiresFilesystemGrantApproval`); they are
+becoming thin adapters over the shared core in `web/lib/mcps/admission.ts`.
+
 ACP providers are local command-line-agent providers. Forge starts the
 configured ACP adapter on demand, speaks JSON-RPC over stdio, and receives text
 back through the same provider interface used by the worker. The currently wired
