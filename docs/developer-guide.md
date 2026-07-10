@@ -40,8 +40,12 @@ overlays, MCP-aware subtasks, `filesystem.project.write`; warn, never block),
 **bounded read-only** (`filesystem.project.read|list|search`; may need an
 explicit operator grant), and **deferred live MCP** (live tool handles, GitHub
 write/branch/PR/merge/settings/secret, filesystem write/delete/admin; a product
-boundary, not a broken install). The classifier is sourced from
-`MCP_CATALOG.runtime.capabilities`. Historically the same policy was re-derived
+boundary, not a broken install). The classifier is catalog-sourced
+(`MCP_CATALOG.runtime.capabilities` plus a documented safe-read supplement
+carrying today's allowlist), and a safe read is delivered as a bounded packet
+only where a context producer exists for that MCP -- filesystem today; GitHub
+reads have no producer yet, so they are honest planning context, not an
+approvable bounded grant. Historically the same policy was re-derived
 by four divergent paths (`validateMcpExecutionDesign`, `deriveMcpGrantDecisions`,
 `evaluateWorkPackageMcpBroker`, and `requiresFilesystemGrantApproval`); they are
 becoming thin adapters over the shared core in `web/lib/mcps/admission.ts`.

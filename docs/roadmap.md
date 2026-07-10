@@ -169,12 +169,14 @@ The epic makes planning, approval, UI state, filesystem grants, and handoff foll
 **one admission contract**: a normalized `McpAdmissionDecision` (ADR
 [0009](adr/0009-mcp-admission-contract.md)) with a capability `mode`
 (`planning_only`, `bounded_context_required`, `bounded_context_approved`,
-`blocked`, `deferred_live_mcp`) and a `recoveryAction`, sourced from
-`MCP_CATALOG.runtime.capabilities`. Capabilities resolve to three classes:
-planning-only (warn, never block, including `filesystem.project.write`), bounded
-read-only (`filesystem.project.read|list|search`, may need an operator grant), and
-deferred live MCP (live tool handles and write/merge/admin -- a product boundary,
-not a broken install). Live MCP tool handles remain out of scope.
+`blocked`, `deferred_live_mcp`) and a `recoveryAction`, classified from
+`MCP_CATALOG` reads plus a documented safe-read supplement. Capabilities resolve
+to three classes: planning-only (warn, never block, including
+`filesystem.project.write`), bounded read-only
+(`filesystem.project.read|list|search`, may need an operator grant -- and only
+delivered as a bounded packet where a context producer exists, filesystem today),
+and deferred live MCP (live tool handles and write/merge/admin -- a product
+boundary, not a broken install). Live MCP tool handles remain out of scope.
 
 Delivered as six sweeping child slices plus #43: #176 (S1 contract/taxonomy),
 #177 (S2 consolidation + approval enforcement), #178 (S3 deterministic filesystem
