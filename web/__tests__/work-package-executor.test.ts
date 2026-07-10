@@ -189,6 +189,16 @@ describe('parseWorkPackageExecutionPlan', () => {
     expect(parsed.files).toHaveLength(1)
   })
 
+  it('reports malformed execution JSON instead of an incidental object shape error', () => {
+    const raw = [
+      'Diagnostic metadata: {"provider":"local"}',
+      '```work_package_execution_json',
+      '{"schemaVersion":1,"summary":"Cut off"',
+    ].join('\n')
+
+    expect(() => parseWorkPackageExecutionPlan(raw)).toThrow(/not valid JSON/i)
+  })
+
   it('parses a one-line fenced execution JSON block', () => {
     const payload = JSON.stringify({
       schemaVersion: 1,

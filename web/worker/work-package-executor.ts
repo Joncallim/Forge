@@ -310,6 +310,10 @@ function extractJsonCandidates(rawText: string): string[] {
     candidates.push(match[2])
   }
 
+  // The full response is a stronger error signal than brace-scan fallbacks:
+  // those scans may find unrelated JSON in prose surrounding a malformed plan.
+  candidates.push(rawText)
+
   let attempts = 0
   for (let start = rawText.indexOf('{'); start >= 0; start = rawText.indexOf('{', start + 1)) {
     if (++attempts > MAX_JSON_SCAN_ATTEMPTS) break
@@ -344,7 +348,6 @@ function extractJsonCandidates(rawText: string): string[] {
     }
   }
 
-  candidates.push(rawText)
   return uniqueNonEmpty(candidates)
 }
 
@@ -574,23 +577,22 @@ async function generateValidatedExecutionPlan(input: {
 }
 
 export function parseWorkPackageExecutionPlan(rawText: string): WorkPackageExecutionPlan {
-  let parseError: Error | null = null
-  let shapeError: Error | null = null
+  let firstError: Error | null = null
   for (const jsonText of extractJsonCandidates(rawText)) {
     let parsed: unknown
     try {
       parsed = parseJsonCandidate(jsonText)
     } catch {
-      parseError ??= new Error('Execution response was not valid JSON.')
+      firstError ??= new Error('Execution response was not valid JSON.')
       continue
     }
     try {
       return normalizeExecutionPlan(parsed)
     } catch (err) {
-      shapeError ??= err instanceof Error ? err : new Error(String(err))
+      firstError ??= err instanceof Error ? err : new Error(String(err))
     }
   }
-  throw shapeError ?? parseError ?? new Error('Execution response was not valid JSON.')
+  throw firstError ?? new Error('Execution response was not valid JSON.')
 }
 
 export function hasLocalConflictCopyPathSegment(filePath: string): boolean {
