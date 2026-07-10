@@ -104,29 +104,39 @@ describe('loadWorkPackageExecutionContext', () => {
     expect(context.validatedProjectRoot).toBe('/workspace/real-project')
   })
 
-  it('blocks ACP-backed executable work packages unless explicitly enabled', async () => {
-    vi.clearAllMocks()
-    const project = { id: 'project-1', localPath: '/workspace/project' }
-    const task = { id: 'task-1', projectId: 'project-1', pmProviderConfigId: 'provider-task' }
-    const workPackage = { id: 'pkg-1', assignedRole: 'backend' }
-    mocks.dbSelect
-      .mockReturnValueOnce(chain([{ task, project, workPackage }]))
-      .mockReturnValueOnce(chain([{ id: 'agent-backend', providerConfigId: null }]))
-    mocks.getProvider.mockResolvedValue({
-      config: { providerType: 'acp', modelId: 'codex-cli::gpt-5.3-codex-spark' },
-    })
+  it.each(['0', 'flase'])(
+    'blocks ACP-backed executable work packages when the setting is %s',
+    async (setting) => {
+      vi.clearAllMocks()
+      const previous = process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION
+      process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION = setting
+      const project = { id: 'project-1', localPath: '/workspace/project' }
+      const task = { id: 'task-1', projectId: 'project-1', pmProviderConfigId: 'provider-task' }
+      const workPackage = { id: 'pkg-1', assignedRole: 'backend' }
+      mocks.dbSelect
+        .mockReturnValueOnce(chain([{ task, project, workPackage }]))
+        .mockReturnValueOnce(chain([{ id: 'agent-backend', providerConfigId: null }]))
+      mocks.getProvider.mockResolvedValue({
+        config: { providerType: 'acp', modelId: 'codex-cli::gpt-5.3-codex-spark' },
+      })
 
-    await expect(loadWorkPackageExecutionContext('task-1', 'pkg-1'))
-      .rejects.toThrow(/ACP work-package execution is disabled/i)
+      try {
+        await expect(loadWorkPackageExecutionContext('task-1', 'pkg-1'))
+          .rejects.toThrow(/ACP work-package execution is disabled/i)
+      } finally {
+        if (previous === undefined) delete process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION
+        else process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION = previous
+      }
 
-    expect(mocks.assertProjectLocalPathForExecution).not.toHaveBeenCalled()
-    expect(mocks.getModel).not.toHaveBeenCalled()
-  })
+      expect(mocks.assertProjectLocalPathForExecution).not.toHaveBeenCalled()
+      expect(mocks.getModel).not.toHaveBeenCalled()
+    },
+  )
 
-  it('allows ACP-backed executable work packages when ACP execution is explicitly enabled', async () => {
+  it('allows ACP-backed executable work packages by default', async () => {
     vi.clearAllMocks()
     const previous = process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION
-    process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION = '1'
+    delete process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION
     const project = { id: 'project-1', localPath: '/workspace/project' }
     const task = { id: 'task-1', projectId: 'project-1', pmProviderConfigId: 'provider-task' }
     const workPackage = { id: 'pkg-1', assignedRole: 'backend' }

@@ -155,6 +155,26 @@ describe('parseWorkPackageExecutionPlan', () => {
     expect(parsed.commands).toEqual([['npm', 'test']])
   })
 
+  it('normalizes package-script validation command aliases', () => {
+    const parsed = parseWorkPackageExecutionPlan(JSON.stringify({
+      schemaVersion: 1,
+      summary: 'Built tracker',
+      files: [{
+        path: 'package.json',
+        content: JSON.stringify({
+          scripts: {
+            build: 'node build-check.js',
+            lint: 'node lint-check.js',
+            test: 'node tracker.test.js',
+          },
+        }),
+      }],
+      commands: [['node', 'tracker.test.js'], ['node', 'build-check.js'], ['node', 'lint-check.js']],
+    }))
+
+    expect(parsed.commands).toEqual([['npm', 'test'], ['npm', 'run', 'build'], ['npm', 'run', 'lint']])
+  })
+
   it('rejects unsupported commands', () => {
     expect(() => parseWorkPackageExecutionPlan(JSON.stringify({
       schemaVersion: 1,
@@ -184,6 +204,62 @@ describe('parseWorkPackageExecutionPlan', () => {
       }),
       'Done.',
     ].join('\n'))
+
+    expect(parsed.summary).toBe('Built tracker')
+    expect(parsed.files).toHaveLength(1)
+  })
+
+  it('reports malformed execution JSON instead of an incidental object shape error', () => {
+    const raw = [
+      'Diagnostic metadata: {"provider":"local"}',
+      '```work_package_execution_json',
+      '{"schemaVersion":1,"summary":"Cut off"',
+    ].join('\n')
+
+    expect(() => parseWorkPackageExecutionPlan(raw)).toThrow(/not valid JSON/i)
+  })
+
+  it('parses a one-line fenced execution JSON block', () => {
+    const payload = JSON.stringify({
+      schemaVersion: 1,
+      summary: 'Built tracker',
+      files: [{ path: 'package.json', content: '{"scripts":{}}' }],
+      commands: [],
+    })
+
+    const parsed = parseWorkPackageExecutionPlan(`\`\`\`work_package_execution_json ${payload}\`\`\``)
+
+    expect(parsed.summary).toBe('Built tracker')
+    expect(parsed.files).toHaveLength(1)
+  })
+
+  it('parses a JSON-encoded execution response string', () => {
+    const payload = JSON.stringify({
+      schemaVersion: 1,
+      summary: 'Built tracker',
+      files: [{ path: 'package.json', content: '{"scripts":{}}' }],
+      commands: [],
+    })
+
+    const parsed = parseWorkPackageExecutionPlan(JSON.stringify(payload))
+
+    expect(parsed.summary).toBe('Built tracker')
+    expect(parsed.files).toHaveLength(1)
+  })
+
+  it('parses a JSON-encoded fenced execution response string', () => {
+    const payload = [
+      '```work_package_execution_json',
+      JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Built tracker',
+        files: [{ path: 'package.json', content: '{"scripts":{}}' }],
+        commands: [],
+      }),
+      '```',
+    ].join('\n')
+
+    const parsed = parseWorkPackageExecutionPlan(JSON.stringify(payload))
 
     expect(parsed.summary).toBe('Built tracker')
     expect(parsed.files).toHaveLength(1)
@@ -319,7 +395,7 @@ describe('executeWorkPackage', () => {
           },
           {
             path: 'index.test.js',
-            content: 'import test from "node:test"; import assert from "node:assert/strict"; test("ok", () => assert.equal(1, 1));\n',
+            content: 'const test = require("node:test"); const assert = require("node:assert/strict"); test("ok", () => assert.equal(1, 1));\n',
           },
         ],
         commands: [['npm', 'test'], ['npm', 'run', 'build']],
@@ -1131,7 +1207,7 @@ describe('executeWorkPackage', () => {
           },
           {
             path: 'index.test.js',
-            content: 'import test from "node:test"; import assert from "node:assert/strict"; test("ok", () => assert.equal(1, 1));\n',
+            content: 'const test = require("node:test"); const assert = require("node:assert/strict"); test("ok", () => assert.equal(1, 1));\n',
           },
         ],
         commands: [['npm', 'test']],
@@ -1147,31 +1223,117 @@ describe('executeWorkPackage', () => {
     await expect(fs.stat(outsideFile)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('fails build validation when no JavaScript source files can be checked', async () => {
+  it('repairs build validation when no JavaScript source files can be checked', async () => {
+    mocks.generateText
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated unchecked TypeScript.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { build: 'tsc --noEmit' } }),
+            },
+            {
+              path: 'src/app.tsx',
+              content: 'export const App = () => <div />\n',
+            },
+          ],
+          commands: [['npm', 'run', 'build']],
+        }),
+      })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated checkable JavaScript.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { build: 'node build-check.js' } }),
+            },
+            { path: 'app.js', content: 'module.exports = { ready: true };\n' },
+            { path: 'build-check.js', content: 'console.log("build validated");\n' },
+          ],
+          commands: [['npm', 'run', 'build']],
+        }),
+      })
+
+    const result = await executeWorkPackage(context({
+      task: {
+        ...context().task,
+        prompt: 'Build a tiny task tracker web app. Make sure it builds.',
+      },
+    }))
+
+    expect(mocks.generateText).toHaveBeenCalledTimes(2)
+    expect(mocks.generateText.mock.calls[1][0].prompt).toContain('at least one checkable JavaScript source file')
+    expect(result.summary).toBe('Generated checkable JavaScript.')
+  })
+
+  it.each([
+    [
+      'comment-only calls',
+      [
+        'const test = require("node:test");',
+        'const assert = require("node:assert/strict");',
+        '// test("fake", () => assert.equal(1, 1));',
+        '',
+      ].join('\n'),
+    ],
+    [
+      'skipped and TODO tests',
+      [
+        'const test = require("node:test");',
+        'const assert = require("node:assert/strict");',
+        'test.skip("skipped", () => assert.equal(1, 1));',
+        'test.todo("todo");',
+        '',
+      ].join('\n'),
+    ],
+    [
+      'string-only calls',
+      [
+        'const test = require("node:test");',
+        'const assert = require("node:assert/strict");',
+        'const example = "test(\\"fake\\", () => assert.equal(1, 1))";',
+        'void example;',
+        '',
+      ].join('\n'),
+    ],
+    [
+      'string-only module references',
+      [
+        'const modules = `require("node:test") require("node:assert/strict")`;',
+        'const test = (_name, callback) => callback();',
+        'const assert = { equal: () => undefined };',
+        'test("fake", () => assert.equal(1, 1));',
+        'void modules;',
+        '',
+      ].join('\n'),
+    ],
+  ])('rejects %s as focused test coverage', async (_label, content) => {
     mocks.generateText.mockResolvedValue({
       text: JSON.stringify({
         schemaVersion: 1,
-        summary: 'Generated unchecked TypeScript.',
+        summary: 'Generated non-running tests.',
         files: [
           {
             path: 'package.json',
-            content: JSON.stringify({ scripts: { build: 'tsc --noEmit' } }),
+            content: JSON.stringify({ scripts: { test: 'node --test' } }),
           },
-          {
-            path: 'src/app.tsx',
-            content: 'export const App = () => <div />\n',
-          },
+          { path: 'tracker.test.js', content },
         ],
-        commands: [['npm', 'run', 'build']],
+        commands: [['npm', 'test']],
       }),
     })
 
     await expect(executeWorkPackage(context({
       task: {
         ...context().task,
-        prompt: 'Build a tiny task tracker web app. Make sure it builds.',
+        prompt: 'Build a tiny task tracker web app with focused tests.',
       },
-    }))).rejects.toThrow(/at least one checkable JavaScript source file/i)
+    }))).rejects.toThrow(/not a focused node:test assertion/i)
+    expect(mocks.generateText).toHaveBeenCalledTimes(3)
   })
 
   it('fails lint validation when no JavaScript source files can be checked', async () => {
@@ -1196,7 +1358,7 @@ describe('executeWorkPackage', () => {
     await expect(executeWorkPackage(context())).rejects.toThrow(/at least one checkable JavaScript source file/i)
   })
 
-  it('throws validation failures with durable sandbox output metadata', async () => {
+  it('wraps command-selected generation validation failures with durable empty sandbox metadata', async () => {
     mocks.generateText.mockResolvedValue({
       text: JSON.stringify({
         schemaVersion: 1,
@@ -1222,16 +1384,15 @@ describe('executeWorkPackage', () => {
       expect(err).toBeInstanceOf(WorkPackageExecutionError)
       const failure = (err as WorkPackageExecutionError).failureDetails
       expect(failure.sandboxPath).toBe(path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'attempt-1'))
-      expect(failure.fileCount).toBe(1)
+      expect(failure.fileCount).toBe(0)
       expect(failure.artifactMetadata).toMatchObject({
-        files: ['package.json'],
+        files: [],
         generatedBy: 'work-package-executor',
         repositoryWrites: false,
-        sandboxWrites: true,
+        sandboxWrites: false,
         validationStatus: 'failed',
       })
-      expect(failure.commandResults).toHaveLength(1)
-      expect(failure.commandResults[0].exitCode).not.toBe(0)
+      expect(failure.commandResults).toHaveLength(0)
     }
   })
 
@@ -1261,7 +1422,7 @@ describe('executeWorkPackage', () => {
         validationStatus: 'failed',
       })
       await expect(fs.stat(sandbox)).resolves.toMatchObject({})
-      expect(mocks.generateText).toHaveBeenCalledTimes(2)
+      expect(mocks.generateText).toHaveBeenCalledTimes(3)
     }
   })
 
@@ -1523,7 +1684,7 @@ describe('executeWorkPackage', () => {
         prompt: 'Build a tiny task tracker web app. Add focused tests and make sure the app builds.',
       },
     }))).rejects.toThrow(/placeholder tests/i)
-    expect(mocks.generateText).toHaveBeenCalledTimes(2)
+    expect(mocks.generateText).toHaveBeenCalledTimes(3)
   })
 
   it('rejects invalid node:test shell scripts before command execution', async () => {
@@ -1543,7 +1704,7 @@ describe('executeWorkPackage', () => {
           },
           {
             path: 'tracker.test.js',
-            content: 'import test from "node:test"; import assert from "node:assert/strict"; test("adds item", () => assert.equal(1, 1));\n',
+            content: 'const test = require("node:test"); const assert = require("node:assert/strict"); test("adds item", () => assert.equal(1, 1));\n',
           },
           { path: 'build-check.js', content: 'console.log("build ok");\n' },
         ],
@@ -1557,6 +1718,224 @@ describe('executeWorkPackage', () => {
         prompt: 'Build a tiny task tracker web app. Add focused tests and make sure the app builds.',
       },
     }))).rejects.toThrow(/test script is invalid/i)
+  })
+
+  it('accepts focused tests that use a localStorage stub and implementation placeholder text', async () => {
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Built and tested the tracker.',
+        files: [
+          {
+            path: 'package.json',
+            content: JSON.stringify({
+              scripts: {
+                build: 'node build-check.js',
+                test: 'node --test',
+              },
+            }),
+          },
+          {
+            path: 'tracker.js',
+            content: 'export function configure(input) { input.placeholder = "Add task"; }\n',
+          },
+          {
+            path: 'tracker.test.js',
+            content: [
+              'const test = require("node:test");',
+              'const assert = require("node:assert/strict");',
+              "const quotePattern = /['\"]/;",
+              'test("persists with a localStorage stub", () => {',
+              '  const localStorageStub = new Map([["tasks", "[]"]]);',
+              '  const input = { placeholder: "Add task" };',
+              '  assert.equal(quotePattern.test("\\\""), true);',
+              '  assert.equal(localStorageStub.get("tasks"), "[]");',
+              '  assert.equal(input.placeholder, "Add task");',
+              '});',
+              '',
+            ].join('\n'),
+          },
+          {
+            path: 'build-check.js',
+            content: 'console.log("build validated");\n',
+          },
+        ],
+        commands: [['node', '--test'], ['node', 'build-check.js']],
+      }),
+    })
+
+    const result = await executeWorkPackage(context({
+      task: {
+        ...context().task,
+        prompt: 'Build a tiny task tracker web app. Add focused tests and make sure the app builds.',
+      },
+    }))
+
+    expect(result.summary).toBe('Built and tested the tracker.')
+    expect(result.commandResults.map((item) => item.command)).toEqual([
+      ['npm', 'test'],
+      ['npm', 'run', 'build'],
+    ])
+  })
+
+  it('repairs a response truncated at the output limit', async () => {
+    mocks.generateText
+      .mockResolvedValueOnce({
+        finishReason: 'length',
+        text: '{"schemaVersion":1,"summary":"Cut off"',
+      })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Returned a concise complete plan.',
+          files: [{ path: 'package.json', content: '{}' }],
+          commands: [],
+        }),
+      })
+
+    const result = await executeWorkPackage(context())
+
+    expect(mocks.generateText).toHaveBeenCalledTimes(2)
+    expect(mocks.generateText.mock.calls[1][0].prompt).toContain('configured output limit')
+    expect(mocks.generateText.mock.calls[1][0].prompt).toContain('Keep the response concise')
+    expect(result.summary).toBe('Returned a concise complete plan.')
+  })
+
+  it('repairs selected test validation when the task prompt does not mention tests', async () => {
+    mocks.generateText
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated weak tests.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { test: 'node --test' } }),
+            },
+            {
+              path: 'tracker.test.js',
+              content: 'const test = require("node:test"); test("adds", () => console.log("ok"));\n',
+            },
+          ],
+          commands: [['npm', 'test']],
+        }),
+      })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated focused tests.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { test: 'node --test' } }),
+            },
+            {
+              path: 'tracker.test.js',
+              content: 'const test = require("node:test"); const assert = require("node:assert/strict"); test("adds", () => assert.equal(1, 1));\n',
+            },
+          ],
+          commands: [['npm', 'test']],
+        }),
+      })
+
+    const result = await executeWorkPackage(context())
+
+    expect(mocks.generateText).toHaveBeenCalledTimes(2)
+    expect(mocks.generateText.mock.calls[1][0].prompt).toContain('not a focused node:test assertion')
+    expect(result.summary).toBe('Generated focused tests.')
+  })
+
+  it('repairs a selected placeholder build when the task prompt does not mention builds', async () => {
+    mocks.generateText
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated a placeholder build.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { build: 'echo "build passed"' } }),
+            },
+            { path: 'app.js', content: 'export const ready = true;\n' },
+          ],
+          commands: [['npm', 'run', 'build']],
+        }),
+      })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated a meaningful build check.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { build: 'node build-check.js --strict true' } }),
+            },
+            { path: 'app.js', content: 'export const ready = true;\n' },
+            { path: 'build-check.js', content: 'console.log("build validated");\n' },
+          ],
+          commands: [['npm', 'run', 'build']],
+        }),
+      })
+
+    const result = await executeWorkPackage(context())
+
+    expect(mocks.generateText).toHaveBeenCalledTimes(2)
+    expect(mocks.generateText.mock.calls[1][0].prompt).toContain('build script appears to be a placeholder')
+    expect(result.summary).toBe('Generated a meaningful build check.')
+  })
+
+  it('repairs selected lint validation before writing sandbox files', async () => {
+    mocks.generateText
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated a placeholder lint command.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { lint: 'echo "lint passed"' } }),
+            },
+            { path: 'app.js', content: 'module.exports = { ready: true };\n' },
+          ],
+          commands: [['npm', 'run', 'lint']],
+        }),
+      })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated unchecked TypeScript lint input.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { lint: 'node lint-check.js' } }),
+            },
+            { path: 'app.tsx', content: 'export const App = () => <div />;\n' },
+          ],
+          commands: [['npm', 'run', 'lint']],
+        }),
+      })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated checkable lint input.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { lint: 'node lint-check.js' } }),
+            },
+            { path: 'app.js', content: 'module.exports = { ready: true };\n' },
+            { path: 'lint-check.js', content: 'console.log("lint validated");\n' },
+          ],
+          commands: [['npm', 'run', 'lint']],
+        }),
+      })
+
+    const result = await executeWorkPackage(context())
+
+    expect(mocks.generateText).toHaveBeenCalledTimes(3)
+    expect(mocks.generateText.mock.calls[1][0].prompt).toContain('lint script appears to be a placeholder')
+    expect(mocks.generateText.mock.calls[2][0].prompt).toContain('at least one checkable JavaScript source file')
+    expect(result.summary).toBe('Generated checkable lint input.')
   })
 
   it('reprompts once when validation rejects the first generated plan', async () => {
@@ -1596,7 +1975,7 @@ describe('executeWorkPackage', () => {
             },
             {
               path: 'tracker.test.js',
-              content: 'import test from "node:test"; import assert from "node:assert/strict"; test("adds item", () => assert.equal(["a"].length, 1));\n',
+              content: 'const test = require("node:test"); const assert = require("node:assert/strict"); test("adds item", () => assert.equal(["a"].length, 1));\n',
             },
             {
               path: 'build-check.js',
@@ -1616,6 +1995,138 @@ describe('executeWorkPackage', () => {
 
     expect(mocks.generateText).toHaveBeenCalledTimes(2)
     expect(result.summary).toBe('Built and tested the tracker.')
+    expect(result.commandResults.map((item) => item.exitCode)).toEqual([0, 0])
+  })
+
+  it('reprompts through invalid JSON and bad generated tests for a tiny task tracker', async () => {
+    mocks.generateText
+      .mockResolvedValueOnce({
+        text: '```work_package_execution_json\n{"schemaVersion":1,"summary":"Cut off"',
+      })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated weak tracker tests.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({
+                scripts: {
+                  build: 'node build-check.js',
+                  test: 'node test.js',
+                },
+              }),
+            },
+            {
+              path: 'tracker.test.js',
+              content: [
+                'const test = require("node:test");',
+                'const assert = require("node:assert/strict");',
+                'const runner = { test: (callback) => callback() };',
+                'assert.equal(1, 1);',
+                'runner.test(() => assert.equal(1, 1));',
+                'test("adds item", () => {});',
+                '',
+              ].join('\n'),
+            },
+            {
+              path: 'build-check.js',
+              content: 'console.log("build validated");\n',
+            },
+          ],
+          commands: [['npm', 'test'], ['npm', 'run', 'build']],
+        }),
+      })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Built a dependency-free tiny task tracker.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({
+                scripts: {
+                  build: 'node build-check.js',
+                  test: 'node --test',
+                },
+              }),
+            },
+            {
+              path: 'taskStore.js',
+              content: [
+                'function createState() { return { tasks: [] }; }',
+                'function addTask(state, title) {',
+                '  const task = { id: String(state.tasks.length + 1), title, completed: false };',
+                '  return { tasks: [...state.tasks, task] };',
+                '}',
+                'function toggleTask(state, id) {',
+                '  return { tasks: state.tasks.map((task) => task.id === id ? { ...task, completed: !task.completed } : task) };',
+                '}',
+                'function deleteTask(state, id) { return { tasks: state.tasks.filter((task) => task.id !== id) }; }',
+                'function filterTasks(state, filter) {',
+                '  if (filter === "active") return state.tasks.filter((task) => !task.completed);',
+                '  if (filter === "completed") return state.tasks.filter((task) => task.completed);',
+                '  return state.tasks;',
+                '}',
+                'function hydrate(raw) {',
+                '  try {',
+                '    const parsed = JSON.parse(raw);',
+                '    return Array.isArray(parsed.tasks) ? parsed : createState();',
+                '  } catch {',
+                '    return createState();',
+                '  }',
+                '}',
+                'module.exports = { createState, addTask, toggleTask, deleteTask, filterTasks, hydrate };',
+                '',
+              ].join('\n'),
+            },
+            {
+              path: 'tracker.test.js',
+              content: [
+                'const test = require("node:test");',
+                'const assert = require("node:assert/strict");',
+                'const { createState, addTask, toggleTask, deleteTask, filterTasks, hydrate } = require("./taskStore.js");',
+                '',
+                'test("add, complete, filter, delete, and malformed storage fallback", () => {',
+                '  let state = createState();',
+                '  state = addTask(state, "Ship the tracker");',
+                '  assert.equal(state.tasks.length, 1);',
+                '  state = toggleTask(state, state.tasks[0].id);',
+                '  assert.deepEqual(filterTasks(state, "completed").map((task) => task.title), ["Ship the tracker"]);',
+                '  assert.equal(filterTasks(state, "active").length, 0);',
+                '  state = deleteTask(state, state.tasks[0].id);',
+                '  assert.equal(filterTasks(state, "all").length, 0);',
+                '  assert.deepEqual(hydrate("{bad json"), createState());',
+                '});',
+                '',
+              ].join('\n'),
+            },
+            {
+              path: 'build-check.js',
+              content: [
+                'const fs = require("node:fs");',
+                'for (const file of ["taskStore.js", "tracker.test.js"]) {',
+                '  if (!fs.existsSync(file)) throw new Error(`${file} is missing`);',
+                '}',
+                '',
+              ].join('\n'),
+            },
+          ],
+          commands: [['npm', 'test'], ['npm', 'run', 'build']],
+        }),
+      })
+
+    const result = await executeWorkPackage(context({
+      task: {
+        ...context().task,
+        prompt: 'Build a tiny task tracker web app. Add focused tests and make sure the app builds.',
+      },
+    }))
+
+    expect(mocks.generateText).toHaveBeenCalledTimes(3)
+    expect(mocks.generateText.mock.calls[1][0].prompt).toContain('Execution response was not valid JSON.')
+    expect(mocks.generateText.mock.calls[2][0].prompt).toContain('Generated test file is not a focused node:test assertion: tracker.test.js')
+    expect(result.summary).toBe('Built a dependency-free tiny task tracker.')
     expect(result.commandResults.map((item) => item.exitCode)).toEqual([0, 0])
   })
 })

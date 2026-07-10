@@ -27,6 +27,7 @@ import { sanitizeWorkerMessage } from './redaction'
 import { publishTaskEvent } from './events'
 import { recordTaskLogBestEffort } from './task-logs'
 import { shouldApplyHostRepositoryWrites } from './repository-edit-policy'
+import { defaultOnFeatureFlagState } from './feature-flags'
 
 const execFile = promisify(execFileCallback)
 
@@ -36,7 +37,7 @@ const MAX_FILE_BYTES = 512 * 1024
 const MAX_COMMANDS = 5
 const MAX_COMMAND_OUTPUT_BYTES = 16 * 1024
 const COMMAND_TIMEOUT_MS = 120_000
-const MAX_GENERATION_ATTEMPTS = 2
+const MAX_GENERATION_ATTEMPTS = 3
 const DEFAULT_GENERATION_TIMEOUT_MS = 120_000
 const DEFAULT_GENERATION_MAX_OUTPUT_TOKENS = 8000
 export const MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS = 3
@@ -46,8 +47,6 @@ const ALLOWED_COMMANDS = new Set([
   'npm run build',
   'npm run lint',
 ])
-
-const ACP_EXECUTION_ENABLED_VALUES = new Set(['1', 'true', 'on', 'yes', 'enabled'])
 
 type TaskRow = typeof tasks.$inferSelect
 type ProjectRow = typeof projects.$inferSelect
@@ -256,8 +255,8 @@ function isAcpModel(model: LanguageModel): boolean {
 }
 
 function isAcpWorkPackageExecutionEnabled(env: Record<string, string | undefined> = process.env): boolean {
-  const raw = env.FORGE_ACP_WORK_PACKAGE_EXECUTION?.trim().toLowerCase()
-  return raw !== undefined && ACP_EXECUTION_ENABLED_VALUES.has(raw)
+  const state = defaultOnFeatureFlagState(env.FORGE_ACP_WORK_PACKAGE_EXECUTION)
+  return state.recognized && state.enabled
 }
 
 function generationTimeoutMs(): number {
@@ -283,15 +282,74 @@ function assertAllowedCommand(command: string[]): void {
   }
 }
 
+function normalizeCommandParts(command: unknown): string[] {
+  if (!Array.isArray(command)) throw new Error('Each command must be a string array.')
+  const normalized = command.map((part) => {
+    if (typeof part !== 'string') throw new Error('Each command part must be a string.')
+    return part.trim()
+  }).filter(Boolean)
+  if (normalized.length === 0) throw new Error('Execution command must be a non-empty string array.')
+  return normalized
+}
+
+function scriptCommandMatches(
+  packageJson: Record<string, unknown> | null,
+  scriptName: string,
+  normalizedCommand: string,
+): boolean {
+  const script = packageScript(packageJson, scriptName)
+  return script !== '' && normalizeCommand(script.split(/\s+/)) === normalizedCommand
+}
+
+function normalizeValidationCommand(command: unknown, packageJson: Record<string, unknown> | null): string[] {
+  const normalized = normalizeCommandParts(command)
+  const normalizedCommand = normalizeCommand(normalized)
+  if (ALLOWED_COMMANDS.has(normalizedCommand)) return normalized
+
+  if (normalizedCommand === 'npm run test') return ['npm', 'test']
+  if (normalizedCommand === 'npm build') return ['npm', 'run', 'build']
+
+  const scriptMatches = [
+    { canonical: ['npm', 'test'], name: 'test' },
+    { canonical: ['npm', 'run', 'build'], name: 'build' },
+    { canonical: ['npm', 'run', 'lint'], name: 'lint' },
+  ].filter(({ name }) => scriptCommandMatches(packageJson, name, normalizedCommand))
+
+  if (scriptMatches.length === 1) return scriptMatches[0].canonical
+  throw new Error(`Command is not allowed: ${normalizedCommand}`)
+}
+
 // Bounds the brace-scan fallback below. Restarting a full inner scan from every
 // `{` is O(n²) on adversarial model output (e.g. thousands of unclosed braces),
 // which can stall the shared worker. Real responses put the object first, so a
 // small number of candidate start positions is more than enough.
 const MAX_JSON_SCAN_ATTEMPTS = 64
+const MAX_JSON_STRING_DECODE_DEPTH = 2
 
-function extractJson(rawText: string): string {
-  const fenced = /```(?:work_package_execution_json|json)?\s*\n([\s\S]*?)\n?```/i.exec(rawText)
-  if (fenced) return fenced[1]
+function uniqueNonEmpty(values: string[]): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const value of values) {
+    const trimmed = value.trim()
+    if (trimmed === '' || seen.has(trimmed)) continue
+    seen.add(trimmed)
+    result.push(trimmed)
+  }
+  return result
+}
+
+function extractJsonCandidates(rawText: string): string[] {
+  const candidates: string[] = []
+  const fencedPattern = /```([a-zA-Z0-9_-]+)?[^\S\r\n]*(?:\r?\n)?([\s\S]*?)```/g
+  for (const match of rawText.matchAll(fencedPattern)) {
+    const language = match[1]?.toLowerCase() ?? ''
+    if (language !== '' && language !== 'json' && language !== 'work_package_execution_json') continue
+    candidates.push(match[2])
+  }
+
+  // The full response is a stronger error signal than brace-scan fallbacks:
+  // those scans may find unrelated JSON in prose surrounding a malformed plan.
+  candidates.push(rawText)
 
   let attempts = 0
   for (let start = rawText.indexOf('{'); start >= 0; start = rawText.indexOf('{', start + 1)) {
@@ -320,13 +378,18 @@ function extractJson(rawText: string): string {
       } else if (char === '}') {
         depth -= 1
         if (depth === 0) {
-          return rawText.slice(start, index + 1)
+          candidates.push(rawText.slice(start, index + 1))
+          break
         }
       }
     }
   }
 
-  return rawText
+  return uniqueNonEmpty(candidates)
+}
+
+function parseJsonCandidate(candidate: string): unknown {
+  return JSON.parse(candidate) as unknown
 }
 
 function normalizeExecutionPlan(parsed: unknown): WorkPackageExecutionPlan {
@@ -360,16 +423,9 @@ function normalizeExecutionPlan(parsed: unknown): WorkPackageExecutionPlan {
     return { path: filePath, content }
   })
 
+  const packageJson = readGeneratedPackageJson(files)
   const commands = Array.isArray(parsed.commands)
-    ? parsed.commands.map((command) => {
-        if (!Array.isArray(command)) throw new Error('Each command must be a string array.')
-        const normalized = command.map((part) => {
-          if (typeof part !== 'string') throw new Error('Each command part must be a string.')
-          return part.trim()
-        }).filter(Boolean)
-        assertAllowedCommand(normalized)
-        return normalized
-      })
+    ? parsed.commands.map((command) => normalizeValidationCommand(command, packageJson))
     : []
   if (commands.length > MAX_COMMANDS) {
     throw new Error(`Execution response included too many commands; maximum is ${MAX_COMMANDS}.`)
@@ -396,7 +452,7 @@ function hasCommand(commands: string[][], expected: string): boolean {
 }
 
 function isPlaceholderContent(content: string): boolean {
-  return /\b(no tests? needed|not needed for this example|placeholder|todo only|stub)\b/i.test(content)
+  return /\b(no tests? needed|not needed for this example|todo only)\b/i.test(content)
 }
 
 function readGeneratedPackageJson(files: WorkPackageExecutionFile[]): Record<string, unknown> | null {
@@ -421,9 +477,211 @@ function packageScript(packageJson: Record<string, unknown> | null, name: string
 function isNoOpScript(script: string): boolean {
   return (
     script === '' ||
-    /(^|\s)(true|exit 0)(\s|$)/i.test(script) ||
-    /^\s*echo\s+['"]?(build script not needed|no tests? needed|not needed for this example|ok|done)/i.test(script)
+    /^\s*(?:true|exit\s+0)\s*$/i.test(script) ||
+    /^\s*echo(?:\s|$)/i.test(script)
   )
+}
+
+function scannedJavaScriptText(content: string, stripStrings: boolean): string {
+  const output = content.split('')
+  let state: 'code' | 'single' | 'double' | 'template' | 'regex' | 'line-comment' | 'block-comment' = 'code'
+  let escaped = false
+  let regexAllowed = true
+  let regexCharacterClass = false
+
+  const blank = (index: number) => {
+    if (output[index] !== '\n' && output[index] !== '\r') output[index] = ' '
+  }
+
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index]
+    const next = content[index + 1]
+
+    if (state === 'code') {
+      if (char === '/' && next === '/') {
+        blank(index)
+        blank(index + 1)
+        index += 1
+        state = 'line-comment'
+      } else if (char === '/' && next === '*') {
+        blank(index)
+        blank(index + 1)
+        index += 1
+        state = 'block-comment'
+      } else if (char === "'") {
+        if (stripStrings) blank(index)
+        escaped = false
+        state = 'single'
+      } else if (char === '"') {
+        if (stripStrings) blank(index)
+        escaped = false
+        state = 'double'
+      } else if (char === '`') {
+        if (stripStrings) blank(index)
+        escaped = false
+        state = 'template'
+      } else if (char === '/' && regexAllowed) {
+        blank(index)
+        escaped = false
+        regexCharacterClass = false
+        state = 'regex'
+      } else if (/\s/.test(char)) {
+        continue
+      } else if (/[A-Za-z_$]/.test(char)) {
+        let end = index + 1
+        while (end < content.length && /[\w$]/.test(content[end])) end += 1
+        const word = content.slice(index, end)
+        regexAllowed = /^(?:await|case|delete|else|in|instanceof|of|return|throw|typeof|void|yield)$/.test(word)
+        index = end - 1
+      } else if (/\d/.test(char)) {
+        regexAllowed = false
+      } else if (char === ')' || char === ']' || char === '}') {
+        regexAllowed = false
+      } else if (char === '.' || (char === '+' && next === '+') || (char === '-' && next === '-')) {
+        regexAllowed = false
+      } else {
+        regexAllowed = true
+      }
+      continue
+    }
+
+    if (state === 'line-comment') {
+      if (char === '\n' || char === '\r') state = 'code'
+      else blank(index)
+      continue
+    }
+
+    if (state === 'block-comment') {
+      if (char === '*' && next === '/') {
+        blank(index)
+        blank(index + 1)
+        index += 1
+        state = 'code'
+      } else {
+        blank(index)
+      }
+      continue
+    }
+
+    if (state === 'regex') {
+      blank(index)
+      if (char === '\n' || char === '\r') {
+        state = 'code'
+        regexAllowed = true
+      } else if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === '[') {
+        regexCharacterClass = true
+      } else if (char === ']') {
+        regexCharacterClass = false
+      } else if (char === '/' && !regexCharacterClass) {
+        state = 'code'
+        regexAllowed = false
+      }
+      continue
+    }
+
+    if (stripStrings) blank(index)
+    if (escaped) {
+      escaped = false
+    } else if (char === '\\') {
+      escaped = true
+    } else if (
+      (state === 'single' && char === "'") ||
+      (state === 'double' && char === '"') ||
+      (state === 'template' && char === '`')
+    ) {
+      state = 'code'
+      regexAllowed = false
+    }
+  }
+
+  return output.join('')
+}
+
+function hasExecutableModuleReference(commentFree: string, executable: string, pattern: RegExp): boolean {
+  return [...commentFree.matchAll(pattern)].some((match) => {
+    const start = match.index ?? 0
+    const executableMatch = executable.slice(start, start + match[0].length)
+    return /\b(?:require|from|import)\b/.test(executableMatch)
+  })
+}
+
+function findClosingParenthesis(content: string, openingIndex: number): number {
+  let depth = 0
+  for (let index = openingIndex; index < content.length; index += 1) {
+    if (content[index] === '(') depth += 1
+    if (content[index] !== ')') continue
+    depth -= 1
+    if (depth === 0) return index
+  }
+  return -1
+}
+
+function splitTopLevelArguments(content: string): string[] {
+  const argumentsList: string[] = []
+  let parentheses = 0
+  let brackets = 0
+  let braces = 0
+  let start = 0
+
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index]
+    if (char === '(') parentheses += 1
+    else if (char === ')') parentheses -= 1
+    else if (char === '[') brackets += 1
+    else if (char === ']') brackets -= 1
+    else if (char === '{') braces += 1
+    else if (char === '}') braces -= 1
+    else if (char === ',' && parentheses === 0 && brackets === 0 && braces === 0) {
+      argumentsList.push(content.slice(start, index))
+      start = index + 1
+    }
+  }
+  argumentsList.push(content.slice(start))
+  return argumentsList
+}
+
+function hasAssertionInRegisteredTest(executable: string): boolean {
+  const assertionPattern = /\b(?:assert(?:\.[A-Za-z_$][\w$]*)?|ok|equal|strictEqual|deepEqual|deepStrictEqual|throws|rejects)\s*\(/
+  for (const match of executable.matchAll(/(?:^|[^\w$.])(?:test|it)(?:\.only)?\s*\(/g)) {
+    const openingIndex = (match.index ?? 0) + match[0].lastIndexOf('(')
+    const closingIndex = findClosingParenthesis(executable, openingIndex)
+    if (closingIndex < 0) continue
+
+    const callArguments = splitTopLevelArguments(executable.slice(openingIndex + 1, closingIndex))
+      .filter((argument) => argument.trim() !== '')
+    const callback = callArguments.at(-1) ?? ''
+    const arrowIndex = callback.indexOf('=>')
+    const functionIndex = callback.search(/\bfunction\b/)
+    const callbackBodyIndex = [
+      arrowIndex >= 0 ? arrowIndex + 2 : -1,
+      functionIndex >= 0 ? functionIndex + 'function'.length : -1,
+    ].filter((index) => index >= 0).sort((left, right) => left - right)[0]
+
+    if (callbackBodyIndex !== undefined && assertionPattern.test(callback.slice(callbackBodyIndex))) {
+      return true
+    }
+  }
+  return false
+}
+
+function isFocusedNodeTestAssertion(content: string): boolean {
+  const commentFree = scannedJavaScriptText(content, false)
+  const executable = scannedJavaScriptText(content, true)
+  const hasNodeTestImport = hasExecutableModuleReference(
+    commentFree,
+    executable,
+    /\brequire\s*\(\s*['"]node:test['"]\s*\)|\bfrom\s*['"]node:test['"]|\bimport\s*['"]node:test['"]/g,
+  )
+  const hasNodeAssertImport = hasExecutableModuleReference(
+    commentFree,
+    executable,
+    /\brequire\s*\(\s*['"]node:assert\/strict['"]\s*\)|\bfrom\s*['"]node:assert\/strict['"]|\bimport\s*['"]node:assert\/strict['"]/g,
+  )
+  return hasNodeTestImport && hasNodeAssertImport && hasAssertionInRegisteredTest(executable)
 }
 
 function isInvalidNodeTestScript(script: string): boolean {
@@ -442,21 +700,25 @@ function isUnsafePackageScript(script: string): boolean {
 
 function validatePlanAgainstPrompt(plan: WorkPackageExecutionPlan, prompt: string): void {
   const packageJson = readGeneratedPackageJson(plan.files)
+  const testsRequested = promptRequestsTests(prompt)
+  const testCommandSelected = hasCommand(plan.commands, 'npm test')
 
-  if (promptRequestsTests(prompt)) {
-    if (!hasCommand(plan.commands, 'npm test')) {
-      throw new Error('The user requested tests, but the execution plan did not run npm test.')
-    }
+  if (testsRequested && !testCommandSelected) {
+    throw new Error('The user requested tests, but the execution plan did not run npm test.')
+  }
 
-    const hasTestFile = plan.files.some((file) =>
-      /(^|\/)(__tests__\/|.*(\.test|\.spec)\.[cm]?[jt]sx?$|test\.[cm]?js$)/i.test(file.path),
-    )
-    if (!hasTestFile) {
-      throw new Error('The user requested focused tests, but the execution plan did not include a test file.')
+  if (testsRequested || testCommandSelected) {
+    const testFiles = plan.files.filter((file) => isJavaScriptFile(file.path) && isTestFile(file.path))
+    if (testFiles.length === 0) {
+      throw new Error('The execution plan selected focused tests but did not include a test file.')
     }
 
     const testScript = packageScript(packageJson, 'test')
-    if (isNoOpScript(testScript) || plan.files.some((file) => isPlaceholderContent(file.content))) {
+    if (
+      isNoOpScript(testScript) ||
+      isPlaceholderContent(testScript) ||
+      testFiles.some((file) => isPlaceholderContent(file.content))
+    ) {
       throw new Error('The generated test plan appears to contain placeholder tests.')
     }
     if (isInvalidNodeTestScript(testScript)) {
@@ -465,19 +727,42 @@ function validatePlanAgainstPrompt(plan: WorkPackageExecutionPlan, prompt: strin
     if (isUnsafePackageScript(testScript)) {
       throw new Error('The generated test script includes unsafe shell behavior.')
     }
+    for (const file of testFiles) {
+      if (!isFocusedNodeTestAssertion(file.content) || isPlaceholderContent(file.content)) {
+        throw new Error(`Generated test file is not a focused node:test assertion: ${file.path}`)
+      }
+    }
   }
 
-  if (promptRequestsBuild(prompt)) {
-    if (!hasCommand(plan.commands, 'npm run build')) {
-      throw new Error('The user requested a build check, but the execution plan did not run npm run build.')
-    }
+  const buildRequested = promptRequestsBuild(prompt)
+  const buildCommandSelected = hasCommand(plan.commands, 'npm run build')
+  if (buildRequested && !buildCommandSelected) {
+    throw new Error('The user requested a build check, but the execution plan did not run npm run build.')
+  }
 
+  if (buildRequested || buildCommandSelected) {
     const buildScript = packageScript(packageJson, 'build')
     if (isNoOpScript(buildScript)) {
       throw new Error('The generated build script appears to be a placeholder.')
     }
     if (isUnsafePackageScript(buildScript)) {
       throw new Error('The generated build script includes unsafe shell behavior.')
+    }
+    if (!plan.files.some((file) => isJavaScriptFile(file.path))) {
+      throw new Error('Static build validation requires at least one checkable JavaScript source file.')
+    }
+  }
+
+  if (hasCommand(plan.commands, 'npm run lint')) {
+    const lintScript = packageScript(packageJson, 'lint')
+    if (isNoOpScript(lintScript)) {
+      throw new Error('The generated lint script appears to be a placeholder.')
+    }
+    if (isUnsafePackageScript(lintScript)) {
+      throw new Error('The generated lint script includes unsafe shell behavior.')
+    }
+    if (!plan.files.some((file) => isJavaScriptFile(file.path))) {
+      throw new Error('Static lint validation requires at least one checkable JavaScript source file.')
     }
   }
 }
@@ -495,6 +780,7 @@ async function generateValidatedExecutionPlan(input: {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), generationTimeoutMs())
     let text: string
+    let responseError: Error | null = null
     try {
       const generated = await generateText({
         abortSignal: controller.signal,
@@ -505,7 +791,7 @@ async function generateValidatedExecutionPlan(input: {
         temperature: 0.1,
       })
       if (generated.finishReason === 'length') {
-        throw new Error(
+        responseError = new Error(
           `Model generation stopped at the configured output limit (${generationMaxOutputTokens()} tokens) before producing a complete execution plan.`,
         )
       }
@@ -520,6 +806,7 @@ async function generateValidatedExecutionPlan(input: {
     }
 
     try {
+      if (responseError) throw responseError
       const plan = parseWorkPackageExecutionPlan(text)
       validatePlanAgainstPrompt(plan, input.taskPrompt)
       return plan
@@ -532,7 +819,11 @@ async function generateValidatedExecutionPlan(input: {
         `Validation error: ${lastError.message}`,
         '',
         'Return a corrected full `work_package_execution_json` response.',
+        'Keep the response concise enough to finish within the configured output limit.',
         'Do not reuse placeholder tests or echo-only build scripts.',
+        'For dependency-free JavaScript tests, set package.json scripts.test to `node --test`.',
+        'Name test files `*.test.js` and import or require `node:test` plus `node:assert/strict`; assert real requested behavior.',
+        'Do not return `node:test` as a shell command, console-only tests, placeholder tests, or prose outside the JSON fence.',
       ].join('\n')
     }
   }
@@ -541,14 +832,29 @@ async function generateValidatedExecutionPlan(input: {
 }
 
 export function parseWorkPackageExecutionPlan(rawText: string): WorkPackageExecutionPlan {
-  const jsonText = extractJson(rawText)
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(jsonText)
-  } catch {
-    throw new Error('Execution response was not valid JSON.')
+  let firstError: Error | null = null
+  const candidates = extractJsonCandidates(rawText).map((text) => ({ depth: 0, text }))
+  for (let index = 0; index < candidates.length; index += 1) {
+    const { depth, text: jsonText } = candidates[index]
+    let parsed: unknown
+    try {
+      parsed = parseJsonCandidate(jsonText)
+    } catch {
+      firstError ??= new Error('Execution response was not valid JSON.')
+      continue
+    }
+    if (typeof parsed === 'string' && depth < MAX_JSON_STRING_DECODE_DEPTH) {
+      const decoded = extractJsonCandidates(parsed).map((text) => ({ depth: depth + 1, text }))
+      candidates.splice(index + 1, 0, ...decoded)
+      continue
+    }
+    try {
+      return normalizeExecutionPlan(parsed)
+    } catch (err) {
+      firstError ??= err instanceof Error ? err : new Error(String(err))
+    }
   }
-  return normalizeExecutionPlan(parsed)
+  throw firstError ?? new Error('Execution response was not valid JSON.')
 }
 
 export function hasLocalConflictCopyPathSegment(filePath: string): boolean {
@@ -720,7 +1026,7 @@ async function validateGeneratedCommand(projectRoot: string, command: string[]):
     for (const file of testFiles) {
       const absolute = path.join(projectRoot, file)
       const content = await fs.readFile(absolute, 'utf8')
-      if (!/\bnode:test\b/.test(content) || !/\bassert\b/.test(content) || isPlaceholderContent(content)) {
+      if (!isFocusedNodeTestAssertion(content) || isPlaceholderContent(content)) {
         throw new Error(`Generated test file is not a focused node:test assertion: ${file}`)
       }
       await safeSyntaxCheck(absolute)
@@ -1430,7 +1736,7 @@ export async function loadWorkPackageExecutionContext(
   if (!provider) throw new Error(`Provider config ${providerConfigId} is missing or inactive.`)
   if (provider.config.providerType === 'acp' && !isAcpWorkPackageExecutionEnabled()) {
     throw new Error(
-      'ACP work-package execution is disabled. Set FORGE_ACP_WORK_PACKAGE_EXECUTION=1 only after accepting that ACP adapters are local processes and are not OS-confined by Forge.',
+      'ACP work-package execution is disabled by FORGE_ACP_WORK_PACKAGE_EXECUTION. Remove the setting or set it to 1 after accepting that ACP adapters are local processes and are not OS-confined by Forge.',
     )
   }
 
