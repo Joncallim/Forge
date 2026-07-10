@@ -1744,9 +1744,11 @@ describe('executeWorkPackage', () => {
             content: [
               'const test = require("node:test");',
               'const assert = require("node:assert/strict");',
+              "const quotePattern = /['\"]/;",
               'test("persists with a localStorage stub", () => {',
               '  const localStorageStub = new Map([["tasks", "[]"]]);',
               '  const input = { placeholder: "Add task" };',
+              '  assert.equal(quotePattern.test("\\\""), true);',
               '  assert.equal(localStorageStub.get("tasks"), "[]");',
               '  assert.equal(input.placeholder, "Add task");',
               '});',

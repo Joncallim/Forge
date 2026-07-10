@@ -484,8 +484,10 @@ function isNoOpScript(script: string): boolean {
 
 function scannedJavaScriptText(content: string, stripStrings: boolean): string {
   const output = content.split('')
-  let state: 'code' | 'single' | 'double' | 'template' | 'line-comment' | 'block-comment' = 'code'
+  let state: 'code' | 'single' | 'double' | 'template' | 'regex' | 'line-comment' | 'block-comment' = 'code'
   let escaped = false
+  let regexAllowed = true
+  let regexCharacterClass = false
 
   const blank = (index: number) => {
     if (output[index] !== '\n' && output[index] !== '\r') output[index] = ' '
@@ -508,13 +510,37 @@ function scannedJavaScriptText(content: string, stripStrings: boolean): string {
         state = 'block-comment'
       } else if (char === "'") {
         if (stripStrings) blank(index)
+        escaped = false
         state = 'single'
       } else if (char === '"') {
         if (stripStrings) blank(index)
+        escaped = false
         state = 'double'
       } else if (char === '`') {
         if (stripStrings) blank(index)
+        escaped = false
         state = 'template'
+      } else if (char === '/' && regexAllowed) {
+        blank(index)
+        escaped = false
+        regexCharacterClass = false
+        state = 'regex'
+      } else if (/\s/.test(char)) {
+        continue
+      } else if (/[A-Za-z_$]/.test(char)) {
+        let end = index + 1
+        while (end < content.length && /[\w$]/.test(content[end])) end += 1
+        const word = content.slice(index, end)
+        regexAllowed = /^(?:await|case|delete|else|in|instanceof|of|return|throw|typeof|void|yield)$/.test(word)
+        index = end - 1
+      } else if (/\d/.test(char)) {
+        regexAllowed = false
+      } else if (char === ')' || char === ']' || char === '}') {
+        regexAllowed = false
+      } else if (char === '.' || (char === '+' && next === '+') || (char === '-' && next === '-')) {
+        regexAllowed = false
+      } else {
+        regexAllowed = true
       }
       continue
     }
@@ -537,6 +563,26 @@ function scannedJavaScriptText(content: string, stripStrings: boolean): string {
       continue
     }
 
+    if (state === 'regex') {
+      blank(index)
+      if (char === '\n' || char === '\r') {
+        state = 'code'
+        regexAllowed = true
+      } else if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === '[') {
+        regexCharacterClass = true
+      } else if (char === ']') {
+        regexCharacterClass = false
+      } else if (char === '/' && !regexCharacterClass) {
+        state = 'code'
+        regexAllowed = false
+      }
+      continue
+    }
+
     if (stripStrings) blank(index)
     if (escaped) {
       escaped = false
@@ -548,6 +594,7 @@ function scannedJavaScriptText(content: string, stripStrings: boolean): string {
       (state === 'template' && char === '`')
     ) {
       state = 'code'
+      regexAllowed = false
     }
   }
 
