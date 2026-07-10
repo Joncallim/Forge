@@ -1223,31 +1223,117 @@ describe('executeWorkPackage', () => {
     await expect(fs.stat(outsideFile)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('fails build validation when no JavaScript source files can be checked', async () => {
+  it('repairs build validation when no JavaScript source files can be checked', async () => {
+    mocks.generateText
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated unchecked TypeScript.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { build: 'tsc --noEmit' } }),
+            },
+            {
+              path: 'src/app.tsx',
+              content: 'export const App = () => <div />\n',
+            },
+          ],
+          commands: [['npm', 'run', 'build']],
+        }),
+      })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated checkable JavaScript.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { build: 'node build-check.js' } }),
+            },
+            { path: 'app.js', content: 'module.exports = { ready: true };\n' },
+            { path: 'build-check.js', content: 'console.log("build validated");\n' },
+          ],
+          commands: [['npm', 'run', 'build']],
+        }),
+      })
+
+    const result = await executeWorkPackage(context({
+      task: {
+        ...context().task,
+        prompt: 'Build a tiny task tracker web app. Make sure it builds.',
+      },
+    }))
+
+    expect(mocks.generateText).toHaveBeenCalledTimes(2)
+    expect(mocks.generateText.mock.calls[1][0].prompt).toContain('at least one checkable JavaScript source file')
+    expect(result.summary).toBe('Generated checkable JavaScript.')
+  })
+
+  it.each([
+    [
+      'comment-only calls',
+      [
+        'const test = require("node:test");',
+        'const assert = require("node:assert/strict");',
+        '// test("fake", () => assert.equal(1, 1));',
+        '',
+      ].join('\n'),
+    ],
+    [
+      'skipped and TODO tests',
+      [
+        'const test = require("node:test");',
+        'const assert = require("node:assert/strict");',
+        'test.skip("skipped", () => assert.equal(1, 1));',
+        'test.todo("todo");',
+        '',
+      ].join('\n'),
+    ],
+    [
+      'string-only calls',
+      [
+        'const test = require("node:test");',
+        'const assert = require("node:assert/strict");',
+        'const example = "test(\\"fake\\", () => assert.equal(1, 1))";',
+        'void example;',
+        '',
+      ].join('\n'),
+    ],
+    [
+      'string-only module references',
+      [
+        'const modules = `require("node:test") require("node:assert/strict")`;',
+        'const test = (_name, callback) => callback();',
+        'const assert = { equal: () => undefined };',
+        'test("fake", () => assert.equal(1, 1));',
+        'void modules;',
+        '',
+      ].join('\n'),
+    ],
+  ])('rejects %s as focused test coverage', async (_label, content) => {
     mocks.generateText.mockResolvedValue({
       text: JSON.stringify({
         schemaVersion: 1,
-        summary: 'Generated unchecked TypeScript.',
+        summary: 'Generated non-running tests.',
         files: [
           {
             path: 'package.json',
-            content: JSON.stringify({ scripts: { build: 'tsc --noEmit' } }),
+            content: JSON.stringify({ scripts: { test: 'node --test' } }),
           },
-          {
-            path: 'src/app.tsx',
-            content: 'export const App = () => <div />\n',
-          },
+          { path: 'tracker.test.js', content },
         ],
-        commands: [['npm', 'run', 'build']],
+        commands: [['npm', 'test']],
       }),
     })
 
     await expect(executeWorkPackage(context({
       task: {
         ...context().task,
-        prompt: 'Build a tiny task tracker web app. Make sure it builds.',
+        prompt: 'Build a tiny task tracker web app with focused tests.',
       },
-    }))).rejects.toThrow(/at least one checkable JavaScript source file/i)
+    }))).rejects.toThrow(/not a focused node:test assertion/i)
+    expect(mocks.generateText).toHaveBeenCalledTimes(3)
   })
 
   it('fails lint validation when no JavaScript source files can be checked', async () => {

@@ -27,7 +27,7 @@ import { sanitizeWorkerMessage } from './redaction'
 import { publishTaskEvent } from './events'
 import { recordTaskLogBestEffort } from './task-logs'
 import { shouldApplyHostRepositoryWrites } from './repository-edit-policy'
-import { defaultOnFeatureFlagEnabled } from './feature-flags'
+import { defaultOnFeatureFlagState } from './feature-flags'
 
 const execFile = promisify(execFileCallback)
 
@@ -255,7 +255,8 @@ function isAcpModel(model: LanguageModel): boolean {
 }
 
 function isAcpWorkPackageExecutionEnabled(env: Record<string, string | undefined> = process.env): boolean {
-  return defaultOnFeatureFlagEnabled(env.FORGE_ACP_WORK_PACKAGE_EXECUTION)
+  const state = defaultOnFeatureFlagState(env.FORGE_ACP_WORK_PACKAGE_EXECUTION)
+  return state.recognized && state.enabled
 }
 
 function generationTimeoutMs(): number {
@@ -481,10 +482,102 @@ function isNoOpScript(script: string): boolean {
   )
 }
 
+function scannedJavaScriptText(content: string, stripStrings: boolean): string {
+  const output = content.split('')
+  let state: 'code' | 'single' | 'double' | 'template' | 'line-comment' | 'block-comment' = 'code'
+  let escaped = false
+
+  const blank = (index: number) => {
+    if (output[index] !== '\n' && output[index] !== '\r') output[index] = ' '
+  }
+
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index]
+    const next = content[index + 1]
+
+    if (state === 'code') {
+      if (char === '/' && next === '/') {
+        blank(index)
+        blank(index + 1)
+        index += 1
+        state = 'line-comment'
+      } else if (char === '/' && next === '*') {
+        blank(index)
+        blank(index + 1)
+        index += 1
+        state = 'block-comment'
+      } else if (char === "'") {
+        if (stripStrings) blank(index)
+        state = 'single'
+      } else if (char === '"') {
+        if (stripStrings) blank(index)
+        state = 'double'
+      } else if (char === '`') {
+        if (stripStrings) blank(index)
+        state = 'template'
+      }
+      continue
+    }
+
+    if (state === 'line-comment') {
+      if (char === '\n' || char === '\r') state = 'code'
+      else blank(index)
+      continue
+    }
+
+    if (state === 'block-comment') {
+      if (char === '*' && next === '/') {
+        blank(index)
+        blank(index + 1)
+        index += 1
+        state = 'code'
+      } else {
+        blank(index)
+      }
+      continue
+    }
+
+    if (stripStrings) blank(index)
+    if (escaped) {
+      escaped = false
+    } else if (char === '\\') {
+      escaped = true
+    } else if (
+      (state === 'single' && char === "'") ||
+      (state === 'double' && char === '"') ||
+      (state === 'template' && char === '`')
+    ) {
+      state = 'code'
+    }
+  }
+
+  return output.join('')
+}
+
+function hasExecutableModuleReference(commentFree: string, executable: string, pattern: RegExp): boolean {
+  return [...commentFree.matchAll(pattern)].some((match) => {
+    const start = match.index ?? 0
+    const executableMatch = executable.slice(start, start + match[0].length)
+    return /\b(?:require|from|import)\b/.test(executableMatch)
+  })
+}
+
 function isFocusedNodeTestAssertion(content: string): boolean {
-  const hasTestCall = /\b(?:test|it)(?:\.(?:only|skip|todo))?\s*\(/.test(content)
-  const hasAssertionCall = /\b(?:assert(?:\.[A-Za-z_$][\w$]*)?|ok|equal|strictEqual|deepEqual|deepStrictEqual|throws|rejects)\s*\(/.test(content)
-  return /\bnode:test\b/.test(content) && /\bnode:assert\/strict\b/.test(content) && hasTestCall && hasAssertionCall
+  const commentFree = scannedJavaScriptText(content, false)
+  const executable = scannedJavaScriptText(content, true)
+  const hasNodeTestImport = hasExecutableModuleReference(
+    commentFree,
+    executable,
+    /\brequire\s*\(\s*['"]node:test['"]\s*\)|\bfrom\s*['"]node:test['"]|\bimport\s*['"]node:test['"]/g,
+  )
+  const hasNodeAssertImport = hasExecutableModuleReference(
+    commentFree,
+    executable,
+    /\brequire\s*\(\s*['"]node:assert\/strict['"]\s*\)|\bfrom\s*['"]node:assert\/strict['"]|\bimport\s*['"]node:assert\/strict['"]/g,
+  )
+  const hasTestCall = /\b(?:test|it)(?:\.only)?\s*\(/.test(executable)
+  const hasAssertionCall = /\b(?:assert(?:\.[A-Za-z_$][\w$]*)?|ok|equal|strictEqual|deepEqual|deepStrictEqual|throws|rejects)\s*\(/.test(executable)
+  return hasNodeTestImport && hasNodeAssertImport && hasTestCall && hasAssertionCall
 }
 
 function isInvalidNodeTestScript(script: string): boolean {
@@ -550,6 +643,9 @@ function validatePlanAgainstPrompt(plan: WorkPackageExecutionPlan, prompt: strin
     }
     if (isUnsafePackageScript(buildScript)) {
       throw new Error('The generated build script includes unsafe shell behavior.')
+    }
+    if (!plan.files.some((file) => isJavaScriptFile(file.path))) {
+      throw new Error('Static build validation requires at least one checkable JavaScript source file.')
     }
   }
 
