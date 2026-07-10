@@ -552,6 +552,19 @@ function validatePlanAgainstPrompt(plan: WorkPackageExecutionPlan, prompt: strin
       throw new Error('The generated build script includes unsafe shell behavior.')
     }
   }
+
+  if (hasCommand(plan.commands, 'npm run lint')) {
+    const lintScript = packageScript(packageJson, 'lint')
+    if (isNoOpScript(lintScript)) {
+      throw new Error('The generated lint script appears to be a placeholder.')
+    }
+    if (isUnsafePackageScript(lintScript)) {
+      throw new Error('The generated lint script includes unsafe shell behavior.')
+    }
+    if (!plan.files.some((file) => isJavaScriptFile(file.path))) {
+      throw new Error('Static lint validation requires at least one checkable JavaScript source file.')
+    }
+  }
 }
 
 async function generateValidatedExecutionPlan(input: {

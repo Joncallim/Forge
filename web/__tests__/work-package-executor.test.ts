@@ -164,14 +164,15 @@ describe('parseWorkPackageExecutionPlan', () => {
         content: JSON.stringify({
           scripts: {
             build: 'node build-check.js',
+            lint: 'node lint-check.js',
             test: 'node tracker.test.js',
           },
         }),
       }],
-      commands: [['node', 'tracker.test.js'], ['node', 'build-check.js']],
+      commands: [['node', 'tracker.test.js'], ['node', 'build-check.js'], ['node', 'lint-check.js']],
     }))
 
-    expect(parsed.commands).toEqual([['npm', 'test'], ['npm', 'run', 'build']])
+    expect(parsed.commands).toEqual([['npm', 'test'], ['npm', 'run', 'build'], ['npm', 'run', 'lint']])
   })
 
   it('rejects unsupported commands', () => {
@@ -1793,6 +1794,60 @@ describe('executeWorkPackage', () => {
     expect(mocks.generateText).toHaveBeenCalledTimes(2)
     expect(mocks.generateText.mock.calls[1][0].prompt).toContain('build script appears to be a placeholder')
     expect(result.summary).toBe('Generated a meaningful build check.')
+  })
+
+  it('repairs selected lint validation before writing sandbox files', async () => {
+    mocks.generateText
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated a placeholder lint command.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { lint: 'echo "lint passed"' } }),
+            },
+            { path: 'app.js', content: 'module.exports = { ready: true };\n' },
+          ],
+          commands: [['npm', 'run', 'lint']],
+        }),
+      })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated unchecked TypeScript lint input.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { lint: 'node lint-check.js' } }),
+            },
+            { path: 'app.tsx', content: 'export const App = () => <div />;\n' },
+          ],
+          commands: [['npm', 'run', 'lint']],
+        }),
+      })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Generated checkable lint input.',
+          files: [
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { lint: 'node lint-check.js' } }),
+            },
+            { path: 'app.js', content: 'module.exports = { ready: true };\n' },
+            { path: 'lint-check.js', content: 'console.log("lint validated");\n' },
+          ],
+          commands: [['npm', 'run', 'lint']],
+        }),
+      })
+
+    const result = await executeWorkPackage(context())
+
+    expect(mocks.generateText).toHaveBeenCalledTimes(3)
+    expect(mocks.generateText.mock.calls[1][0].prompt).toContain('lint script appears to be a placeholder')
+    expect(mocks.generateText.mock.calls[2][0].prompt).toContain('at least one checkable JavaScript source file')
+    expect(result.summary).toBe('Generated checkable lint input.')
   })
 
   it('reprompts once when validation rejects the first generated plan', async () => {
