@@ -283,6 +283,43 @@ function assertAllowedCommand(command: string[]): void {
   }
 }
 
+function normalizeCommandParts(command: unknown): string[] {
+  if (!Array.isArray(command)) throw new Error('Each command must be a string array.')
+  const normalized = command.map((part) => {
+    if (typeof part !== 'string') throw new Error('Each command part must be a string.')
+    return part.trim()
+  }).filter(Boolean)
+  if (normalized.length === 0) throw new Error('Execution command must be a non-empty string array.')
+  return normalized
+}
+
+function scriptCommandMatches(
+  packageJson: Record<string, unknown> | null,
+  scriptName: string,
+  normalizedCommand: string,
+): boolean {
+  const script = packageScript(packageJson, scriptName)
+  return script !== '' && normalizeCommand(script.split(/\s+/)) === normalizedCommand
+}
+
+function normalizeValidationCommand(command: unknown, packageJson: Record<string, unknown> | null): string[] {
+  const normalized = normalizeCommandParts(command)
+  const normalizedCommand = normalizeCommand(normalized)
+  if (ALLOWED_COMMANDS.has(normalizedCommand)) return normalized
+
+  if (normalizedCommand === 'npm run test') return ['npm', 'test']
+  if (normalizedCommand === 'npm build') return ['npm', 'run', 'build']
+
+  const scriptMatches = [
+    { canonical: ['npm', 'test'], name: 'test' },
+    { canonical: ['npm', 'run', 'build'], name: 'build' },
+    { canonical: ['npm', 'run', 'lint'], name: 'lint' },
+  ].filter(({ name }) => scriptCommandMatches(packageJson, name, normalizedCommand))
+
+  if (scriptMatches.length === 1) return scriptMatches[0].canonical
+  throw new Error(`Command is not allowed: ${normalizedCommand}`)
+}
+
 // Bounds the brace-scan fallback below. Restarting a full inner scan from every
 // `{` is O(n²) on adversarial model output (e.g. thousands of unclosed braces),
 // which can stall the shared worker. Real responses put the object first, so a
@@ -390,16 +427,9 @@ function normalizeExecutionPlan(parsed: unknown): WorkPackageExecutionPlan {
     return { path: filePath, content }
   })
 
+  const packageJson = readGeneratedPackageJson(files)
   const commands = Array.isArray(parsed.commands)
-    ? parsed.commands.map((command) => {
-        if (!Array.isArray(command)) throw new Error('Each command must be a string array.')
-        const normalized = command.map((part) => {
-          if (typeof part !== 'string') throw new Error('Each command part must be a string.')
-          return part.trim()
-        }).filter(Boolean)
-        assertAllowedCommand(normalized)
-        return normalized
-      })
+    ? parsed.commands.map((command) => normalizeValidationCommand(command, packageJson))
     : []
   if (commands.length > MAX_COMMANDS) {
     throw new Error(`Execution response included too many commands; maximum is ${MAX_COMMANDS}.`)
@@ -426,7 +456,7 @@ function hasCommand(commands: string[][], expected: string): boolean {
 }
 
 function isPlaceholderContent(content: string): boolean {
-  return /\b(no tests? needed|not needed for this example|placeholder|todo only|stub)\b/i.test(content)
+  return /\b(no tests? needed|not needed for this example|placeholder|todo only)\b/i.test(content)
 }
 
 function readGeneratedPackageJson(files: WorkPackageExecutionFile[]): Record<string, unknown> | null {
@@ -484,7 +514,11 @@ function validatePlanAgainstPrompt(plan: WorkPackageExecutionPlan, prompt: strin
     }
 
     const testScript = packageScript(packageJson, 'test')
-    if (isNoOpScript(testScript) || plan.files.some((file) => isPlaceholderContent(file.content))) {
+    if (
+      isNoOpScript(testScript) ||
+      isPlaceholderContent(testScript) ||
+      testFiles.some((file) => isPlaceholderContent(file.content))
+    ) {
       throw new Error('The generated test plan appears to contain placeholder tests.')
     }
     if (isInvalidNodeTestScript(testScript)) {
@@ -528,6 +562,7 @@ async function generateValidatedExecutionPlan(input: {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), generationTimeoutMs())
     let text: string
+    let responseError: Error | null = null
     try {
       const generated = await generateText({
         abortSignal: controller.signal,
@@ -538,7 +573,7 @@ async function generateValidatedExecutionPlan(input: {
         temperature: 0.1,
       })
       if (generated.finishReason === 'length') {
-        throw new Error(
+        responseError = new Error(
           `Model generation stopped at the configured output limit (${generationMaxOutputTokens()} tokens) before producing a complete execution plan.`,
         )
       }
@@ -553,6 +588,7 @@ async function generateValidatedExecutionPlan(input: {
     }
 
     try {
+      if (responseError) throw responseError
       const plan = parseWorkPackageExecutionPlan(text)
       validatePlanAgainstPrompt(plan, input.taskPrompt)
       return plan
@@ -565,6 +601,7 @@ async function generateValidatedExecutionPlan(input: {
         `Validation error: ${lastError.message}`,
         '',
         'Return a corrected full `work_package_execution_json` response.',
+        'Keep the response concise enough to finish within the configured output limit.',
         'Do not reuse placeholder tests or echo-only build scripts.',
         'For dependency-free JavaScript tests, set package.json scripts.test to `node --test`.',
         'Name test files `*.test.js` and import or require `node:test` plus `node:assert/strict`; assert real requested behavior.',

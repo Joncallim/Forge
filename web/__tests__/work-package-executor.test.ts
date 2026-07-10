@@ -155,6 +155,25 @@ describe('parseWorkPackageExecutionPlan', () => {
     expect(parsed.commands).toEqual([['npm', 'test']])
   })
 
+  it('normalizes package-script validation command aliases', () => {
+    const parsed = parseWorkPackageExecutionPlan(JSON.stringify({
+      schemaVersion: 1,
+      summary: 'Built tracker',
+      files: [{
+        path: 'package.json',
+        content: JSON.stringify({
+          scripts: {
+            build: 'node build-check.js',
+            test: 'node tracker.test.js',
+          },
+        }),
+      }],
+      commands: [['node', 'tracker.test.js'], ['node', 'build-check.js']],
+    }))
+
+    expect(parsed.commands).toEqual([['npm', 'test'], ['npm', 'run', 'build']])
+  })
+
   it('rejects unsupported commands', () => {
     expect(() => parseWorkPackageExecutionPlan(JSON.stringify({
       schemaVersion: 1,
@@ -1595,6 +1614,83 @@ describe('executeWorkPackage', () => {
         prompt: 'Build a tiny task tracker web app. Add focused tests and make sure the app builds.',
       },
     }))).rejects.toThrow(/test script is invalid/i)
+  })
+
+  it('accepts focused tests that use a localStorage stub and implementation placeholder text', async () => {
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Built and tested the tracker.',
+        files: [
+          {
+            path: 'package.json',
+            content: JSON.stringify({
+              scripts: {
+                build: 'node build-check.js',
+                test: 'node --test',
+              },
+            }),
+          },
+          {
+            path: 'tracker.js',
+            content: 'export function configure(input) { input.placeholder = "Add task"; }\n',
+          },
+          {
+            path: 'tracker.test.js',
+            content: [
+              'const test = require("node:test");',
+              'const assert = require("node:assert/strict");',
+              'test("persists with a localStorage stub", () => {',
+              '  const localStorageStub = new Map([["tasks", "[]"]]);',
+              '  assert.equal(localStorageStub.get("tasks"), "[]");',
+              '});',
+              '',
+            ].join('\n'),
+          },
+          {
+            path: 'build-check.js',
+            content: 'console.log("build validated");\n',
+          },
+        ],
+        commands: [['node', '--test'], ['node', 'build-check.js']],
+      }),
+    })
+
+    const result = await executeWorkPackage(context({
+      task: {
+        ...context().task,
+        prompt: 'Build a tiny task tracker web app. Add focused tests and make sure the app builds.',
+      },
+    }))
+
+    expect(result.summary).toBe('Built and tested the tracker.')
+    expect(result.commandResults.map((item) => item.command)).toEqual([
+      ['npm', 'test'],
+      ['npm', 'run', 'build'],
+    ])
+  })
+
+  it('repairs a response truncated at the output limit', async () => {
+    mocks.generateText
+      .mockResolvedValueOnce({
+        finishReason: 'length',
+        text: '{"schemaVersion":1,"summary":"Cut off"',
+      })
+      .mockResolvedValueOnce({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Returned a concise complete plan.',
+          files: [{ path: 'package.json', content: '{}' }],
+          commands: [],
+        }),
+      })
+
+    const result = await executeWorkPackage(context())
+
+    expect(mocks.generateText).toHaveBeenCalledTimes(2)
+    expect(mocks.generateText.mock.calls[1][0].prompt).toContain('configured output limit')
+    expect(mocks.generateText.mock.calls[1][0].prompt).toContain('Keep the response concise')
+    expect(result.summary).toBe('Returned a concise complete plan.')
   })
 
   it('reprompts once when validation rejects the first generated plan', async () => {
