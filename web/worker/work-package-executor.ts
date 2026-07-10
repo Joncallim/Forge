@@ -609,6 +609,65 @@ function hasExecutableModuleReference(commentFree: string, executable: string, p
   })
 }
 
+function findClosingParenthesis(content: string, openingIndex: number): number {
+  let depth = 0
+  for (let index = openingIndex; index < content.length; index += 1) {
+    if (content[index] === '(') depth += 1
+    if (content[index] !== ')') continue
+    depth -= 1
+    if (depth === 0) return index
+  }
+  return -1
+}
+
+function splitTopLevelArguments(content: string): string[] {
+  const argumentsList: string[] = []
+  let parentheses = 0
+  let brackets = 0
+  let braces = 0
+  let start = 0
+
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index]
+    if (char === '(') parentheses += 1
+    else if (char === ')') parentheses -= 1
+    else if (char === '[') brackets += 1
+    else if (char === ']') brackets -= 1
+    else if (char === '{') braces += 1
+    else if (char === '}') braces -= 1
+    else if (char === ',' && parentheses === 0 && brackets === 0 && braces === 0) {
+      argumentsList.push(content.slice(start, index))
+      start = index + 1
+    }
+  }
+  argumentsList.push(content.slice(start))
+  return argumentsList
+}
+
+function hasAssertionInRegisteredTest(executable: string): boolean {
+  const assertionPattern = /\b(?:assert(?:\.[A-Za-z_$][\w$]*)?|ok|equal|strictEqual|deepEqual|deepStrictEqual|throws|rejects)\s*\(/
+  for (const match of executable.matchAll(/\b(?:test|it)(?:\.only)?\s*\(/g)) {
+    const openingIndex = (match.index ?? 0) + match[0].lastIndexOf('(')
+    const closingIndex = findClosingParenthesis(executable, openingIndex)
+    if (closingIndex < 0) continue
+
+    const callArguments = splitTopLevelArguments(executable.slice(openingIndex + 1, closingIndex))
+      .filter((argument) => argument.trim() !== '')
+    const callback = callArguments.at(-1) ?? ''
+    const arrowIndex = callback.indexOf('=>')
+    const functionIndex = callback.search(/\bfunction\b/)
+    const callbackBodyIndex = [
+      arrowIndex >= 0 ? arrowIndex + 2 : -1,
+      functionIndex >= 0 ? functionIndex + 'function'.length : -1,
+    ].filter((index) => index >= 0).sort((left, right) => left - right)[0]
+
+    if (callbackBodyIndex !== undefined && assertionPattern.test(callback.slice(callbackBodyIndex))) {
+      return true
+    }
+  }
+  return false
+}
+
 function isFocusedNodeTestAssertion(content: string): boolean {
   const commentFree = scannedJavaScriptText(content, false)
   const executable = scannedJavaScriptText(content, true)
@@ -622,9 +681,7 @@ function isFocusedNodeTestAssertion(content: string): boolean {
     executable,
     /\brequire\s*\(\s*['"]node:assert\/strict['"]\s*\)|\bfrom\s*['"]node:assert\/strict['"]|\bimport\s*['"]node:assert\/strict['"]/g,
   )
-  const hasTestCall = /\b(?:test|it)(?:\.only)?\s*\(/.test(executable)
-  const hasAssertionCall = /\b(?:assert(?:\.[A-Za-z_$][\w$]*)?|ok|equal|strictEqual|deepEqual|deepStrictEqual|throws|rejects)\s*\(/.test(executable)
-  return hasNodeTestImport && hasNodeAssertImport && hasTestCall && hasAssertionCall
+  return hasNodeTestImport && hasNodeAssertImport && hasAssertionInRegisteredTest(executable)
 }
 
 function isInvalidNodeTestScript(script: string): boolean {
