@@ -141,26 +141,64 @@ export type McpDeliveryKind =
 export function mcpDeliveryKind(mcpId: string): McpDeliveryKind
 
 export function normalizeCapability(cap: string): string   // trim().toLowerCase().replace(/\s+/g,'_')
+
+// Enumerated, recognized live-tool families. A capability that matches one of
+// these on a known MCP is a *known but deferred* capability. A capability that
+// matches NOTHING (safe-read, planning-only, or a deferred family) on a known MCP
+// is a typo / unrecognized value and classifies as `unknown` (blocks revise_plan).
+export const DEFERRED_CAPABILITY_FAMILIES: RegExp[] = [
+  /^github\.[a-z_]+\.(write|create|update|delete|merge)$/,
+  /^github\.(branches|pull_requests|settings|secrets|workflows)\./,
+  /^filesystem\.[a-z._]*\.(write|delete|admin|move|create)$/,
+]
+
 export function classifyCapability(mcpId: string, cap: string): McpCapabilityClass
 ```
 
-`classifyCapability`'s safe-read set is `MCP_CATALOG[mcpId].runtime.capabilities`
-**∪ `SAFE_READ_SUPPLEMENT`**, where `SAFE_READ_SUPPLEMENT` is migrated *verbatim*
-from `SAFE_BETA_CAPABILITY_PATTERNS` so no capability that is allowed today
-becomes newly `unknown` (specifically `github.actions.read`,
-`github.repository.list|search`, `github.contents.list|search`). Deleting
-`SAFE_BETA_CAPABILITY_PATTERNS` therefore moves the exact same patterns into a
-single documented data set — **not a behavior change**. `filesystem.project.write`
-classifies as `planning_only`. Anything not in the safe-read set and not
-planning-only classifies as `deferred_live_mcp` (known MCP) or `unknown`.
+`classifyCapability` applies a **total, ordered** rule set (first match wins), so
+every capability lands in exactly one class and a typo can never be silently
+admitted:
+
+1. `mcpId` is not a known MCP → `unknown`.
+2. `normalizeCapability(cap) === 'filesystem.project.write'` (Forge writes it via
+   the sandbox JSON path, never a live tool) → `planning_only`.
+3. `cap` ∈ safe-read set = `MCP_CATALOG[mcpId].runtime.capabilities` **∪
+   `SAFE_READ_SUPPLEMENT`** → `bounded_read_only`.
+4. `cap` matches a `DEFERRED_CAPABILITY_FAMILIES` pattern → `deferred_live_mcp`.
+5. known MCP, matched nothing above (unrecognized / typo) → `unknown`.
+
+`SAFE_READ_SUPPLEMENT` is migrated *verbatim* from `SAFE_BETA_CAPABILITY_PATTERNS`
+so no capability allowed today becomes newly `unknown` (specifically
+`github.actions.read`, `github.repository.list|search`,
+`github.contents.list|search`). Deleting `SAFE_BETA_CAPABILITY_PATTERNS` therefore
+moves the exact same patterns into a single documented data set — **not a behavior
+change**.
+
+**Classifier matrix (illustrative — every row is a required test case):**
+
+| mcpId | capability | class | why |
+|---|---|---|---|
+| `filesystem` | `filesystem.project.read` | `bounded_read_only` | catalog safe-read (rule 3) |
+| `filesystem` | `filesystem.project.write` | `planning_only` | rule 2 (sandbox JSON path) |
+| `filesystem` | `filesystem.project.delete` | `deferred_live_mcp` | deferred family (rule 4) |
+| `github` | `github.issues.read` | `bounded_read_only` | catalog safe-read |
+| `github` | `github.actions.read` | `bounded_read_only` | `SAFE_READ_SUPPLEMENT` |
+| `github` | `github.pull_requests.write` | `deferred_live_mcp` | deferred family |
+| `github` | `github.branches.create` | `deferred_live_mcp` | deferred family |
+| `github` | `github.issues.reed` (typo) | `unknown` | rule 5 → block `revise_plan` |
+| `slack` | `slack.messages.read` | `unknown` | rule 1 (unknown MCP) |
 
 **Risk ≠ delivery.** A `bounded_read_only` github read is *safe* but not
 *deliverable as a bounded packet* — `mcpDeliveryKind('github') ===
 'planning_context_only'`, so it is admitted as planning/prompt context (recovery
-`continue_as_prompt_context`) and stays health-gated exactly as today; it is never
-offered `approve_project_filesystem_context` and never marked
-`bounded_context_approved`. Only `filesystem` bounded reads flow through the
-approve/deny bounded-context path.
+`continue_as_prompt_context`); it is never offered
+`approve_project_filesystem_context` and never marked `bounded_context_approved`.
+Because that path consumes **no** MCP runtime (the specialist receives prose
+instructions, not a live tool), it is **not health-gated** — it is instead gated on
+whether prompt context was actually materialized for that MCP
+(`hasPromptOnlyContext`; see decision-table step 6). A *required* github read with
+no materialized prompt context is a plan defect and blocks with `revise_plan`. Only
+`filesystem` bounded reads flow through the approve/deny bounded-context path.
 
 Shared primitives (single copy each, all in `capability-normalization.ts`):
 `coverageKeysForGrant(cap)` / `coverageKeysForProhibition(cap)` (one documented
@@ -181,25 +219,34 @@ policy:
 
 ```ts
 export type EffectiveGrantState = {
-  phase: 'none' | 'proposed' | 'approved' | 'denied' | 'not_issued'
+  phase: 'none' | 'proposed' | 'approved' | 'denied' | 'revoked' | 'not_issued'
   source: 'none' | 'package-local' | 'project-level'
   status: 'not_issued' | 'approved' | 'denied'
   grantMode?: 'allow_once' | 'always_allow'
   consumed?: boolean            // allow_once already issued -> treat as none for a retry
   coveredCapabilities: string[] // canonical filesystem.project.*
   grantApprovalId?: string
+  revocationReason?: string      // set only when phase === 'revoked'
 }
 export function readEffectiveGrantState(pkg: { metadata: unknown }, project: { mcpConfig: unknown }): EffectiveGrantState
 ```
 
 `readEffectiveGrantState` distinguishes never-approved (`phase:'none'|'proposed'`),
-explicitly denied (`status:'denied'`), consumed allow-once (`consumed:true`),
-revoked project grant (was `project-level` but coverage no longer holds →
-collapses to `none`), insufficient coverage (`coveredCapabilities` lacks a
+explicitly denied (`phase:'denied'`), consumed allow-once (`consumed:true`),
+**revoked project grant** and insufficient coverage (`coveredCapabilities` lacks a
 required capability), package-local approval (`source:'package-local'`), and
-project-level approval (`source:'project-level'`). It reads the same package
+project-level approval (`source:'project-level'`). A **revoked** grant is a
+`project-level` grant that previously covered the package but whose coverage was
+later removed or narrowed: it returns `phase:'revoked'`, `source:'project-level'`,
+with `revocationReason` set — it is **not** collapsed to `none`, so the producer
+and the UI can say "project filesystem context was removed, approve it again" and
+keep it distinct from a first-time request. It reads the same package
 `metadata.mcpGrantPhases.effective` and `project.mcpConfig.grants.filesystem` the
-current routes write.
+current routes write; the revoked case is exactly the effective phase whose
+`source === 'project-filesystem-approval'` while the current
+`project.mcpConfig.grants.filesystem` no longer covers the required capabilities
+(the case `packageProjectFilesystemEffectivePhase` + `requiresFilesystemGrantApproval`
+handle today at `work-package-handoff.ts:869-893`).
 
 ### Layer 2 — the per-requirement producer
 
@@ -246,39 +293,65 @@ lose information and a `class:'unknown'` capability is representable. The aggreg
 `mode`/`status` is chosen by a **total, precedence-ordered decision table** (first
 match wins; every branch is defined):
 
+Let `canProceed = canProceedWithoutMcp(requirement, fallback)` — i.e. `optional`
+**and** `fallback.action === 'continue_without_mcp'`. `ask_user` and `block` are
+**blocking** fallbacks, so `canProceed` is `false` for them. Every "non-blocking"
+branch below keys off `canProceed`, never off `requirement === 'optional'` alone,
+so the fallback matrix is total across all three fallback actions.
+
 1. **Unknown MCP** → `mode:'blocked'`, `status:'blocked'`, `recoveryAction:'revise_plan'`.
 2. **Any capability class `unknown`** (known MCP, unrecognized/typo capability) →
    `mode:'blocked'`, `status:'blocked'`, `recoveryAction:'revise_plan'`.
 3. **Any capability prohibited package-wide** (`normalizeCapability(cap)` ∈
-   `packageProhibitedKeys`) → treated as `deferred_live_mcp`; go to (4).
-4. **Any capability class `deferred_live_mcp`** → `mode:'deferred_live_mcp'`. If
-   `requirement==='required'` → `status:'blocked'`, `recoveryAction:'revise_plan'`.
-   If `optional` → `status:'warning'`, `recoveryAction:'defer_live_mcp_feature'`
-   (approvable, non-blocking). "Product boundary, not broken install" copy applies.
+   `packageProhibitedKeys`) → `mode:'blocked'`, `status:'blocked'`,
+   `recoveryAction:'revise_plan'`, **unconditionally**. This is its own terminal
+   outcome evaluated *before* any fallback handling: an explicit package prohibition
+   is deny-wins and can **never** be downgraded to a warning by `optional` /
+   `continue_without_mcp`. (Matches the current broker, where an unsafe/prohibited
+   capability blocks regardless of `optional`.)
+4. **Any capability class `deferred_live_mcp`** → `mode:'deferred_live_mcp'`.
+   `status:'warning'` **iff `canProceed`**, else `status:'blocked'`. `recoveryAction`
+   is `defer_live_mcp_feature` when warning (approvable, non-blocking) and
+   `revise_plan` when blocking (so the operator can remove/regenerate the offending
+   requirement rather than be stuck). "Product boundary, not broken install" copy
+   applies to the `mode` either way.
 5. **Any capability class `bounded_read_only` with `deliveryKind ===
    'bounded_context_packet'`** (filesystem):
-   - covered by `effectiveGrant` (`status:'approved'` & not `consumed` & covers the
-     required capabilities) → `mode:'bounded_context_approved'`, `status:'allowed'`.
-   - `effectiveGrant.status === 'denied'` & required → `mode:'bounded_context_required'`,
-     `status:'blocked'`, `recoveryAction:'approve_project_filesystem_context'`
-     (**deniedRequired** — the handoff gate must HOLD, see S3).
-   - otherwise not covered → `mode:'bounded_context_required'`; `status:'blocked'`
-     unless `optional`+`continue_without_mcp` (`status:'warning'`);
+   - covered by `effectiveGrant` (`phase:'approved'` & not `consumed` & covers the
+     required capabilities) → `mode:'bounded_context_approved'`, `status:'allowed'`
+     (subject to the health overlay, step 8).
+   - `effectiveGrant.phase === 'denied'` & blocking (`!canProceed`) →
+     `mode:'bounded_context_required'`, `status:'blocked'`,
+     `recoveryAction:'approve_project_filesystem_context'` (**deniedRequired** — the
+     handoff gate must HOLD, see S3).
+   - `effectiveGrant.phase === 'revoked'` & blocking → `mode:'bounded_context_required'`,
+     `status:'blocked'`, `recoveryAction:'approve_project_filesystem_context'`, and
+     the `reason` carries `revocationReason` (distinct "context removed" copy, S5).
+   - otherwise not covered → `mode:'bounded_context_required'`; `status:'warning'`
+     iff `canProceed`, else `status:'blocked'`;
      `recoveryAction:'approve_project_filesystem_context'`.
 6. **Any capability class `bounded_read_only` with `deliveryKind ===
-   'planning_context_only'`** (github reads): delivered as planning context.
-   Health overlay (7) may block; otherwise `mode:'planning_only'`,
-   `status:'allowed'`, `recoveryAction:'continue_as_prompt_context'`.
+   'planning_context_only'`** (github reads): delivered as planning context; it
+   consumes no MCP runtime, so it is **not** health-gated. Gate on materialization:
+   - `hasPromptOnlyContext` → `mode:'planning_only'`, `status:'allowed'`,
+     `recoveryAction:'continue_as_prompt_context'`.
+   - not materialized & blocking (`!canProceed`) → `mode:'blocked'`,
+     `status:'blocked'`, `recoveryAction:'revise_plan'` (a required read with neither
+     a producer nor prompt context is a plan defect — do not admit it).
+   - not materialized & `canProceed` → `mode:'planning_only'`, `status:'warning'`,
+     `recoveryAction:'continue_as_prompt_context'`.
 7. **All capabilities `planning_only`, OR zero actionable capabilities:**
    - `required` with zero capabilities and **no** prompt-only context →
      `mode:'blocked'`, `status:'blocked'`, `recoveryAction:'revise_plan'`
      (the plan under-specified a required MCP).
    - otherwise → `mode:'planning_only'`, `status:'warning'`,
      `recoveryAction:'continue_as_prompt_context'`.
-8. **Health overlay** (applied to the mode chosen above when it is `allowed`):
-   if `!isMcpHealthy(status)` and `required` and not `canProceedWithoutMcp` →
+8. **Health overlay** (applies only to modes whose delivery consumes MCP runtime —
+   `bounded_context_approved` and any future live path — and only when the mode
+   chosen above is `allowed`; **planning-context and planning-only modes are never
+   health-gated**): if `!isMcpHealthy(status)` and `!canProceed` →
    `status:'blocked'`, `recoveryAction:'install_or_fix_mcp'` (retryable). If
-   `optional`+`continue_without_mcp` → `status:'warning'`.
+   `canProceed` → `status:'warning'`.
 
 `recoveryAction` replaces the fragile `isRetryableMcpBrokerBlock` string-matching:
 a block is **retryable iff its `recoveryAction === 'install_or_fix_mcp'`**.
@@ -291,7 +364,55 @@ MCP-aware subtasks against the normalized approved coverage — preserving the
 current broker's package-wide prohibition removal and subtask checks
 (`evaluateWorkPackageMcpBroker`, `mcp-execution-design.ts:617-631,697-721`).
 
+#### Layer 3a — canonical entry join (one evaluation per logical requirement)
+
+`brokerEntries()` concatenates two representations of the *same* logical
+requirement: raw `work_packages.mcpRequirements` (Architect-requested policy:
+`requirement`, capability fields, `fallback`, `prohibitedCapabilities`) and derived
+`metadata.mcpGrants` (the persisted preview decision: `decisionId`,
+`sourceRequirementIndex`, `assignment`, `health`, `promptOverlayPresent`, status).
+Admitting both independently would double-count decisions, warnings, and summary
+counts, and could not populate the `source` envelope reliably.
+
+Before admission, `admitWorkPackageMcp` **joins** entries on the stable key
+`(sourceRequirementIndex, agent, mcpId)` (falling back to `(agent, mcpId)` when a
+raw requirement predates `sourceRequirementIndex`) and merges with fixed
+precedence:
+
+- **requested policy** (`requirement`, merged capability fields via
+  `mergeCapabilityFields`, `fallback`, `prohibitedCapabilities`) comes from
+  `mcpRequirements`;
+- **source envelope + persisted health** (`decisionId`, `sourceRequirementIndex`,
+  `assignment`, `promptOverlayPresent`, `health`) comes from `metadata.mcpGrants`;
+- if only one side is present, its own fields are used and the missing envelope is
+  synthesized deterministically (`decisionId = 'req-{index}:{agent}:{mcpId}'`).
+
+The result is **exactly one `admitMcpRequirement` call per logical
+`(sourceRequirementIndex, agent, mcpId)`**, asserted by test.
+
+**Preview parity of deny-wins scope.** The design-stage adapter
+(`deriveMcpGrantDecisions` / `validateMcpExecutionDesign`) must partition the
+`McpExecutionDesign` requirements into the **same per-agent package units** that
+materialization later persists (`agentsForRequirement`, one package per agent)
+*before* computing `packageProhibitedKeys`. Otherwise preview would union
+prohibitions across all agents while handoff unions them per package, and the two
+would disagree. Each agent-package is admitted independently in both preview and
+handoff.
+
 ```ts
+// Versioned per-MCP health snapshot. checkedAt is REQUIRED: persisting only an
+// ambiguous approval timestamp cannot replay a decision after cached
+// ProjectMcpStatus rows change. Sourced verbatim from ProjectMcpStatus.
+export type McpHealthSnapshot = {
+  schemaVersion: 1
+  mcpId: string
+  installState: string
+  status: string
+  enabled: boolean
+  error: string | null
+  checkedAt: string
+}
+
 export type McpAdmissionEvaluation = {
   decision: McpAdmissionDecision
   source: {                                   // retained so adapters are shape-preserving
@@ -301,7 +422,7 @@ export type McpAdmissionEvaluation = {
     fallback: { action: McpFallbackAction; message: string }
     promptOverlayPresent: boolean
   }
-  health: { installState: string; status: string; enabled: boolean; error: string | null }
+  health: McpHealthSnapshot
 }
 
 export type McpWorkPackageAdmission = {
@@ -330,12 +451,24 @@ export function admitWorkPackageMcp(input: {
 }): McpWorkPackageAdmission
 ```
 
-`admitWorkPackageMcp`: (1) build `packageProhibitedKeys` = union of
-`coverageKeysForProhibition` over every entry; (2) `admitMcpRequirement` per entry
-with that set (a capability prohibited anywhere is `deferred_live_mcp`, never
-approved); (3) accumulate approved coverage keys minus the prohibition set;
-(4) classify each subtask capability and check known MCP + safe scope + covered by
-approved coverage, matching the current subtask loop; (5) fold everything into
+`admitWorkPackageMcp`: (1) **join** raw entries per Layer 3a into one canonical
+entry per `(sourceRequirementIndex, agent, mcpId)`; (2) build
+`packageProhibitedKeys` = union of `coverageKeysForProhibition` over every joined
+entry; (3) `admitMcpRequirement` per joined entry with that set — a capability
+prohibited anywhere is a package-wide policy denial and blocks unconditionally
+(deny-wins, decision-table step 3), never approved; (4) accumulate **two** coverage
+sets, both minus the prohibition set:
+  - `boundedCoverageKeys` — canonical capability keys from decisions admitted
+    `bounded_context_approved` (filesystem bounded packet);
+  - `planningContextCoverageKeys` — canonical `(agent, capability)` keys from
+    decisions admitted as planning context (`planning_only` /
+    `planning_context_only`, e.g. a materialized `github.*.read` requirement);
+(5) classify each subtask capability and admit it as covered when: unknown MCP or
+class `unknown`/`deferred_live_mcp` → blocked; a `bounded_context_packet` read →
+must be in `boundedCoverageKeys`; a `planning_context_only` read → must be in
+`planningContextCoverageKeys` **for the same agent** (so a safe `github.*.read`
+subtask is accepted when its matching requirement was admitted as planning context,
+instead of being rejected for lacking a bounded grant); (6) fold everything into
 `aggregate`. This is the canonical evaluation consumed by preview, approval, and
 handoff.
 
@@ -350,7 +483,15 @@ and existing readers do not change shape — they are only *extended*:
 - `admissionToGrantPreview(admission): McpGrantDecisions` — keeps `decisionId`,
   `sourceRequirementIndex`, assignment, fallback, raw `health`,
   `promptOverlayPresent`; **adds** `mode`, `recoveryAction`,
-  `normalizedCapabilities`, `capabilityClasses`, `evidenceRefs`.
+  `normalizedCapabilities`, `capabilityClasses`, `evidenceRefs`, and a canonical
+  `admissionStatus: McpAdmissionStatus` (`allowed | warning | blocked`).
+  **Status compatibility.** The legacy `McpGrantDecisions.status`
+  (`proposed | warning | blocked`) is preserved by the total map
+  `allowed → proposed`, `warning → warning`, `blocked → blocked`, so existing
+  readers and persisted JSON keep their shape. Literal cross-surface parity is
+  asserted on the canonical pair (`mode`, `admissionStatus`) — **not** on the legacy
+  `status` string, which stays `proposed`-spelled for the preview surface only.
+  `summary` counts are computed from the legacy `status` exactly as today.
 - `admissionToBrokerCheck(admission): WorkPackageMcpBrokerCheck` — plus
   `retryable`, `primaryRecoveryAction`.
 
@@ -375,7 +516,7 @@ keep a **transitional re-export** until their callers migrate in the owning slic
 | `evaluateWorkPackageMcpBroker` (`:599`) + helpers `capabilityArray:498`, `approvedCoverageCapabilityKeys:551`, `isPlanningOnlyFilesystemWrite:318` | calls `admitWorkPackageMcp` with `mergeCapabilityFields`; returns `admissionToBrokerCheck`; local normalization/allowlist deleted, imported from shared modules | S2 |
 | `SAFE_BETA_CAPABILITY_PATTERNS` (`:7-18`) | migrated verbatim into `SAFE_READ_SUPPLEMENT`; **kept as a transitional re-export in S1**, deleted in S2 after callers move | S1 create / S2 delete |
 | `requiresFilesystemGrantApproval` / `summarizeFilesystemCapabilities` (`filesystem-grants.ts:303/90`) | filesystem-specific **projection** of `admitWorkPackageMcp` (filesystem decisions only); imports normalization; keeps `FilesystemProjectCapability` nominal type + `ProjectFilesystemGrant` persistence + `EffectiveGrantState` reader | S3 |
-| `isRetryableMcpBrokerBlock` (`:90`) + `buildMcpBrokerBlockMetadata` (`blocked-handoff-retry.ts:32`) | consume `aggregate.retryable`/`primaryRecoveryAction`; persist `mode`+`recoveryAction` under `metadata.mcpBroker` | S2 (broker), S5 (persist for UI) |
+| `isRetryableMcpBrokerBlock` (`:90`) + `buildMcpBrokerBlockMetadata` (`blocked-handoff-retry.ts:32`) | consume `aggregate.retryable`/`primaryRecoveryAction`; **persist the full versioned `metadata.mcpBroker` here**; S5 reads it only | S2 |
 | `mcpGrantsForAgent` (`workforce-materializer.ts:157`) | persists `mode`, `recoveryAction`, `normalizedCapabilities`, `evidenceRefs` on each grant (schema bump), not just id/mcp/caps/requirement/status/reason/fallback/health | S2 |
 | `mcpCapabilityList` (`work-package-executor.ts:1527`) | imports `mergeCapabilityFields`; executor filesystem gating uses shared `coverageKeysForGrant`/`classifyCapability` | S4 |
 | client helpers (`tasks/[id]/page.tsx:348-444`) | import shared helpers OR consume a server-computed grant-state payload; render `mode`+`recoveryAction` via `admission-copy.ts` | S5 |
@@ -408,24 +549,48 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   that flips the task to `approved`). Run `admitWorkPackageMcp` over every package
   using that snapshot; if any `aggregate.status === 'blocked'`, return the same
   409 shape as the existing `missingFilesystemGrant` early return (`:199-209,280`)
-  with the normalized `reason` + `primaryRecoveryAction`. **Persist the
-  `checkedAt` health snapshot** the approval decision used on the plan-approval
-  gate metadata (next to the existing `approvedGrantSnapshot`, `:221-263`).
+  with the normalized `reason` + `primaryRecoveryAction`. **Persist the exact
+  health snapshot** the approval decision consumed — a versioned
+  `approvalHealthSnapshot: McpHealthSnapshot[]` (each `{schemaVersion, mcpId,
+  installState, status, enabled, error, checkedAt}`) on the plan-approval gate
+  metadata, next to the existing `approvedGrantSnapshot` (`:221-263`). A single
+  ambiguous timestamp cannot replay the decision after cached `ProjectMcpStatus`
+  rows change; the per-MCP `checkedAt` is required. Add an assertion that the
+  persisted snapshot equals the health inputs passed to `admitWorkPackageMcp`.
+- **Broker-block persistence is owned entirely by S2.** The complete, versioned
+  `metadata.mcpBroker` producer lives here: `buildMcpBrokerBlockMetadata`
+  (`blocked-handoff-retry.ts:32`) persists `{schemaVersion, status:'blocked',
+  blocked, warnings, blockedReason, mode, recoveryAction, retryable,
+  primaryRecoveryAction, autoRetryAttempts, nextAutoRetryAt}` from `aggregate`
+  (`retryable = aggregate.retryable`, `recoveryAction =
+  aggregate.primaryRecoveryAction`). This makes retry/recovery
+  (`shouldAutoRetryBlockedHandoff` and the sweep) fully deployable **before** the UI
+  slice; S5 only *reads* `metadata.mcpBroker`.
 - **Parity guarantee (narrowed).** For a fixed package and a *fixed health
   snapshot*, `deriveMcpGrantDecisions` (preview), the approval check, and
-  `evaluateWorkPackageMcpBroker` (handoff) return the same `mode`/`status` because
-  they call one producer. MCP health/config can change between approval and
+  `evaluateWorkPackageMcpBroker` (handoff) return the same `mode`/`admissionStatus`
+  (the canonical pair; the preview's legacy `status` maps `allowed → proposed`)
+  because they call one producer. MCP health/config can change between approval and
   handoff, so the promise is: **a block already visible in the approval-time
   snapshot is surfaced at approval, not missed until handoff** — not that an
   approved task can never block later.
 - **Invariant tests** (`web/__tests__/mcp-admission-invariant.test.ts`): preview,
-  approval, and handoff agree for required no-capability grants, prompt-only
-  context, filesystem read/list/search, `filesystem.project.write`, an
-  unsafe/deferred GitHub write, a healthy GitHub read (planning-context, not
-  bounded), an unknown MCP, a package-wide prohibition that must beat a
-  per-entry approval, an MCP-aware subtask capability, and a requirement expressed
-  via each of the four capability fields. `requiresFilesystemGrantApproval` is
-  tested only as the *filesystem projection* of the same evaluation.
+  approval, and handoff agree on the canonical (`mode`, `admissionStatus`) pair for
+  required no-capability grants, prompt-only context, filesystem read/list/search,
+  `filesystem.project.write`, an unsafe/deferred GitHub write, a **package-wide
+  prohibition on an `optional`+`continue_without_mcp` requirement (must stay
+  `blocked`, never downgraded to a warning)**, a healthy GitHub read
+  (planning-context, not bounded), a **required GitHub read with no materialized
+  prompt context (blocks `revise_plan`)**, an unknown MCP, a **known-MCP typo
+  capability (blocks `revise_plan`)**, a package-wide prohibition that must beat a
+  per-entry approval, MCP-aware subtasks (both a bounded filesystem subtask and a
+  planning-context `github.*.read` subtask), a requirement expressed via each of the
+  four capability fields, and **all three fallback actions (`continue_without_mcp`,
+  `ask_user`, `block`) across deferred, unhealthy bounded-context, and missing
+  bounded-context cases** (asserting `ask_user`/`block` never become non-blocking).
+  Also assert **one `admitMcpRequirement` call per `(sourceRequirementIndex, agent,
+  mcpId)`** after the Layer 3a join. `requiresFilesystemGrantApproval` is tested
+  only as the *filesystem projection* of the same evaluation.
 
 ### S3 — Filesystem grant recovery (deterministic, recoverable)
 
@@ -455,6 +620,13 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   supersedes an earlier package-local `denied` effective phase for that capability
   (operator's later, broader decision wins). Document and test this precedence in
   `readEffectiveGrantState`.
+- **Revoked project grant is distinct from never-approved.** When
+  `readEffectiveGrantState` returns `phase:'revoked'` (a project grant that
+  previously covered the package no longer does), the held-block `reason` and the S5
+  copy say "project filesystem context was removed — approve it again", carrying
+  `revocationReason`, separate from the first-time "needs project context" copy.
+  Test the two recovery messages separately; a revoked grant must not read as a
+  brand-new request.
 - **Acceptance tests assert exact transitions** (package `pending/ready →
   blocked`, task not `failed`, zero new `agentRuns`; then grant approval →
   package `ready`, task re-driven), not just attempt counts.
@@ -512,14 +684,18 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   packet metadata inline (from S4's schema), and add remediation CTAs +
   bounded-context note on the projects page and the MCPs catalog page
   (`mcps/page.tsx`).
-- **Persisted schema is versioned.** The worker persists `mode`+`recoveryAction`
-  on BOTH the `grantDecisions` preview decisions AND the per-package block metadata
-  (`metadata.mcpBroker`, a JSON object — `work_packages.blocked_reason` stays the
-  human text). When multiple decisions block, `aggregate.retryable` is true iff
-  every blocking decision is `install_or_fix_mcp`, and
-  `primaryRecoveryAction` is the highest-precedence block
-  (`revise_plan > approve_project_filesystem_context > install_or_fix_mcp >
-  defer_live_mcp_feature`), which drives the single UI CTA.
+- **Reads the versioned persisted schema (produced by S2) — S5 persists nothing.**
+  S5 does not compute or persist admission state. It reads the `grantDecisions`
+  preview (`mode`, `recoveryAction`, `admissionStatus`, `normalizedCapabilities`,
+  `capabilityClasses`, `evidenceRefs`) and the per-package `metadata.mcpBroker`
+  block (`{mode, recoveryAction, retryable, primaryRecoveryAction, blocked,
+  warnings}`; `work_packages.blocked_reason` stays the human text) that S2 wrote,
+  and renders them. `RetryHandoffControls` is gated on the persisted
+  `metadata.mcpBroker.retryable`; the single CTA is driven by
+  `primaryRecoveryAction` (precedence `revise_plan >
+  approve_project_filesystem_context > install_or_fix_mcp > defer_live_mcp_feature`).
+  Because the producer/persistence contract lives in S2, retry/recovery is
+  deployable before this UI slice ships.
 
 ### S6 — End-to-end regression
 
