@@ -173,14 +173,18 @@ export function classifyCapability(mcpId: string, cap: string): McpCapabilityCla
 
 `classifyCapability` applies a **total, ordered** rule set (first match wins), so
 every capability lands in exactly one class and a typo can never be silently
-admitted:
+admitted. It **normalizes once at the top** — `c = normalizeCapability(cap)` — and
+every rule below matches `c`, not the raw `cap`, so casing/whitespace variants
+(`GitHub.Issues.Read`, `filesystem.project. read`) classify identically and never
+fall through to `unknown` on formatting alone (the `DEFERRED_CAPABILITY_FAMILIES`
+regexes and the safe-read set are all lowercase/underscore):
 
 1. `mcpId` is not a known MCP → `unknown`.
-2. `normalizeCapability(cap) === 'filesystem.project.write'` (Forge writes it via
-   the sandbox JSON path, never a live tool) → `planning_only`.
-3. `cap` ∈ safe-read set = `MCP_CATALOG[mcpId].runtime.capabilities` **∪
+2. `c === 'filesystem.project.write'` (Forge writes it via the sandbox JSON path,
+   never a live tool) → `planning_only`.
+3. `c` ∈ safe-read set = `MCP_CATALOG[mcpId].runtime.capabilities` **∪
    `SAFE_READ_SUPPLEMENT`** → `bounded_read_only`.
-4. `cap` matches a `DEFERRED_CAPABILITY_FAMILIES` pattern → `deferred_live_mcp`.
+4. `c` matches a `DEFERRED_CAPABILITY_FAMILIES` pattern → `deferred_live_mcp`.
 5. known MCP, matched nothing above (unrecognized / typo) → `unknown`.
 
 `SAFE_READ_SUPPLEMENT` is migrated *verbatim* from `SAFE_BETA_CAPABILITY_PATTERNS`
@@ -474,6 +478,7 @@ export type McpHealthSnapshot =
 export type McpAdmissionEvaluation = {
   decision: McpAdmissionDecision
   source: {                                   // retained so adapters are shape-preserving
+    requirementKey: string                    // the immutable join key (Layer 3a); makes the evaluation self-describing and the one-per-requirement join testable
     decisionId: string
     sourceRequirementIndex: number
     assignment: { type: McpAssignmentType; targetId: string | null }
@@ -486,7 +491,7 @@ export type McpAdmissionEvaluation = {
 export type McpWorkPackageAdmission = {
   schemaVersion: 2
   evaluations: McpAdmissionEvaluation[]
-  subtaskDecisions: Array<{ subtaskId: string; agent: string; capability: string;
+  subtaskDecisions: Array<{ subtaskId: string; agent: string; mcpId: string; capability: string;
     class: McpCapabilityClass; status: McpAdmissionStatus; reason: string; recoveryAction?: McpRecoveryAction }>
   referencedHealth: McpExecutionValidation['health']   // aggregate health array validation needs
   aggregate: {
@@ -506,7 +511,7 @@ export type McpWorkPackageAdmission = {
 
 export function admitWorkPackageMcp(input: {
   entries: Array<Record<string, unknown>>       // brokerEntries(): mcpRequirements ∪ metadata.mcpGrants
-  subtasks: Array<Record<string, unknown>>      // metadata.mcpAwareSubtasks; each MUST carry `subtaskId` + `agent` (retained by mcpSubtasksForAgent — it currently strips `agent`)
+  subtasks: Array<Record<string, unknown>>      // metadata.mcpAwareSubtasks; each MUST carry `subtaskId` + `agent` + `mcpId` (retained by mcpSubtasksForAgent — it currently strips `agent`; `mcpId` is needed to classify the subtask capability and resolve its deliveryKind)
   label: string
   statusFor: (mcpId: string) => ProjectMcpStatus | null   // may return null (unconfigured/unknown MCP)
   effectiveGrantFor: (mcpId: string) => EffectiveGrantState   // closes over readEffectiveGrantState(pkg, project, requiredCapabilities(mcpId))
@@ -527,10 +532,12 @@ sets, both minus the prohibition set:
     decisions admitted as planning context (`planning_only` /
     `planning_context_only`, e.g. a materialized `github.*.read` requirement);
 (5) produce a **total** per-subtask decision, keyed by the subtask's own **`agent`**
-(the package agent comes from the persisted `mcpAwareSubtask.agent`; `admitWorkPackageMcp`
+and **`mcpId`** (both come from the persisted `mcpAwareSubtask`; `admitWorkPackageMcp`
 has no separate package-agent input, and `mcpSubtasksForAgent` must therefore stop
-stripping `agent` — see S4 / the consolidation map). Every capability class has a
-defined outcome (no branch falls through):
+stripping `agent`/`mcpId` — see S4 / the consolidation map). `classifyCapability(mcpId,
+capability)` and `mcpDeliveryKind(mcpId)` both use that `mcpId`; a subtask capability
+whose namespace disagrees with its declared `mcpId` classifies `unknown`. Every
+capability class has a defined outcome (no branch falls through):
   - unknown MCP or class `unknown` → `blocked`, `revise_plan`;
   - class `deferred_live_mcp` → `blocked`, `revise_plan`;
   - class `planning_only` (e.g. a `filesystem.project.write` subtask hint) →
@@ -544,7 +551,7 @@ defined outcome (no branch falls through):
     context, instead of being rejected for lacking a bounded grant), else `blocked`,
     `revise_plan`.
 
-  Each result is recorded in `subtaskDecisions` (which retains `agent`), so a
+  Each result is recorded in `subtaskDecisions` (which retains `agent` + `mcpId`), so a
   planning-only subtask and a same-agent planning-context subtask are both tested.
   (6) fold everything into `aggregate`. This is the canonical evaluation consumed by
 preview, approval, and handoff.
@@ -557,8 +564,8 @@ and existing readers do not change shape — they are only *extended*:
 
 - `admissionToValidation(admission): McpExecutionValidation` — uses
   `referencedHealth` for the aggregate health array.
-- `admissionToGrantPreview(admission): McpGrantDecisions` — keeps `decisionId`,
-  `sourceRequirementIndex`, assignment, fallback, raw `health`,
+- `admissionToGrantPreview(admission): McpGrantDecisions` — keeps `requirementKey`,
+  `decisionId`, `sourceRequirementIndex`, assignment, fallback, raw `health`,
   `promptOverlayPresent`; **adds** `mode`, `recoveryAction`,
   `normalizedCapabilities`, `capabilityClasses`, `evidenceRefs`, and a canonical
   `admissionStatus: McpAdmissionStatus` (`allowed | warning | blocked`).
@@ -604,7 +611,7 @@ keep a **transitional re-export** until their callers migrate in the owning slic
 | `isRetryableMcpBrokerBlock` (`:90`) + `buildMcpBrokerBlockMetadata` (`blocked-handoff-retry.ts:32`) | consume `aggregate.retryable`/`primaryRecoveryAction`; **persist the full versioned `metadata.mcpBroker` here**; S5 reads it only | S2 |
 | `mcpRequirementsForAgent` (`workforce-materializer.ts`) | persists an immutable `requirementKey` (from the Architect requirement ordinal) + retains the original requirement index and `agent` on each `work_packages.mcpRequirements` entry, so Layer 3a can join collision-safely | S2 |
 | `mcpGrantsForAgent` (`workforce-materializer.ts:157`) | persists the matching `requirementKey`, `sourceRequirementIndex`, `agent`, `assignment`, `promptOverlayPresent`, plus `mode`, `recoveryAction`, `normalizedCapabilities`, `evidenceRefs` on each grant (schema bump) — not just id/mcp/caps/requirement/status/reason/fallback/health | S2 |
-| `mcpSubtasksForAgent` (`workforce-materializer.ts`) | **retains `agent`** (and `subtaskId`) on each persisted `metadata.mcpAwareSubtasks` entry — currently stripped — so `admitWorkPackageMcp` can match a planning-context subtask against `planningContextCoverageKeys` for the same agent | S2 |
+| `mcpSubtasksForAgent` (`workforce-materializer.ts`) | **retains `agent`, `mcpId`** (and `subtaskId`) on each persisted `metadata.mcpAwareSubtasks` entry — currently stripped — so `admitWorkPackageMcp` can classify each subtask capability (`classifyCapability(mcpId, cap)` / `mcpDeliveryKind(mcpId)`) and match a planning-context subtask against `planningContextCoverageKeys` for the same agent | S2 |
 | `mcpCapabilityList` (`work-package-executor.ts:1527`) | imports `mergeCapabilityFields`; executor filesystem gating uses shared `coverageKeysForGrant`/`classifyCapability` | S4 |
 | client helpers (`tasks/[id]/page.tsx:348-444`) | import shared helpers OR consume a server-computed grant-state payload; render `mode`+`recoveryAction` via `admission-copy.ts` | S5 |
 
