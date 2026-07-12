@@ -226,12 +226,23 @@ normalizes to `_`; it is not silently removed around separators, so malformed
    `classifyCapability('github','filesystem.project.write')` → `unknown`.
 3. `mcpId === 'filesystem' && c === 'filesystem.project.write'` (Forge writes it via the sandbox JSON path,
    never a live tool) → `planning_only`.
-4. `c` is in `MCP_CATALOG[mcpId].runtime.capabilities` or matches an exact pattern
-   in `SAFE_READ_SUPPLEMENT[mcpId]` → `bounded_read_only`.
-5. `isDeferredCapability(mcpId,c)` returns true using an **own-property** resource
+4. `isDeferredCapability(mcpId,c)` returns true using an **own-property** resource
    lookup and exact allowed-operation membership → `deferred_live_mcp`.
+5. `c` is in `MCP_CATALOG[mcpId].runtime.capabilities` or matches an exact pattern
+   in `SAFE_READ_SUPPLEMENT[mcpId]` → `bounded_read_only`, but only after the
+   startup/test invariant below has proved that the catalog safe-read set and the
+   deferred registry are disjoint.
 6. known MCP, matched nothing above (unrecognized resource, operation, or typo) →
    `unknown`.
+
+`runtime.capabilities` is a **safe-read allow-list**, not a generic list of what an
+MCP may eventually do. Add `assertSafeCatalogCapabilities()` beside the classifier.
+It canonicalizes every catalog capability, rejects any value that matches a
+deferred resource/operation pair, and rejects operations outside the closed
+`read|list|search|get` vocabulary. Run it when the catalog module is loaded and in
+the classifier invariant suite. This is defense in depth: deferred matching also
+precedes catalog membership, so accidentally adding `github.pull_requests.write`
+to the untyped catalog array cannot turn it into `bounded_read_only`.
 
 `SAFE_READ_SUPPLEMENT` is the exact set accepted by
 `SAFE_BETA_CAPABILITY_PATTERNS` but missing from the catalog, so no capability
@@ -498,6 +509,29 @@ sides must carry a stable per-requirement identity:
   `sourceRequirementIndex`, `agent`, `assignment`, and `promptOverlayPresent` on each
   `metadata.mcpGrants` entry (see the schema-bump rows in the consolidation map).
 
+Prompt context needs the same identity. The Architect fence therefore adds
+`requirementContexts: Array<{ sourceRequirementIndex: number; agent: string;
+promptOverlay: string }>`; the index addresses the raw requirement in that fence
+only. During `normalizeDesign`, Forge validates the index and agent assignment,
+then replaces the positional reference with the generated `requirementKey` before
+the design is persisted or materialized. The persisted normalized entry is
+`{requirementKey, agent, mcpId, promptOverlay}`. `metadata.promptOverlay` remains a
+package-level rendering assembled from those entries for executor compatibility,
+but it is **not** evidence that every same-agent requirement has context.
+`promptOverlayPresent` is computed separately for each grant by exact
+`requirementKey` membership. `mcpAwareSubtasks` likewise persists the matching
+`requirementKey` for every capability-bearing subtask; an ambiguous subtask that
+could match more than one same-agent/same-MCP requirement fails closed with
+`revise_plan` until the Architect supplies `sourceRequirementIndex`.
+
+For a legacy fence that has only `promptOverlays: Record<agent,string>`, the
+adapter may associate that overlay only when the agent has exactly one
+planning-context requirement. With zero or multiple candidates it records a
+compatibility warning and materializes none; it must never mark all candidates
+present. This makes the required “two same-agent/same-MCP requirements, only one
+has context” fixture representable and prevents a generic agent overlay from
+authorizing an unrelated requirement.
+
 The join therefore keys on `requirementKey`, and merges with fixed precedence:
 
 - **requested policy** (`requirement`, merged capability fields via
@@ -720,9 +754,9 @@ keep a **transitional re-export** until their callers migrate in the owning slic
 | `requiresFilesystemGrantApproval` / `summarizeFilesystemCapabilities` (`filesystem-grants.ts:303/90`) | S2 makes both the filesystem-specific **projection** of `admitWorkPackageMcp`, imports shared normalization/reader policy, and keeps the nominal/persistence types. S3 owns only the new denied/revoked held-state and reconciliation behavior after that projection exists | S2 projection / S3 recovery behavior |
 | `readEffectiveGrantState` (`EffectiveGrantState` reader) | **canonical home is `web/lib/mcps/admission.ts` (Layer 1), created and owned by S1.** S3's `filesystem-grants.ts` imports it (or transitional-re-exports it for existing callers); there is exactly one implementation of this policy | S1 own / S3 import |
 | `isRetryableMcpBrokerBlock` (`:90`) + `buildMcpBrokerBlockMetadata` (`blocked-handoff-retry.ts:32`) | consume `aggregate.retryable`/`primaryRecoveryAction`; **persist the full versioned `metadata.mcpBroker` here**; S5 reads it only | S2 |
-| `normalizeDesign` + `mcpRequirementsForAgent` | `normalizeDesign` assigns/persists a versioned canonical-payload digest `requirementKey` (with duplicate occurrence suffix; not an Architect-supplied key or bare array index). The materializer preserves it plus source index and `agent`, so Layer 3a can join collision-safely across reorderings | S2 |
+| `normalizeDesign` + `mcpRequirementsForAgent` | `normalizeDesign` assigns/persists a versioned canonical-payload digest `requirementKey` (with duplicate occurrence suffix; not an Architect-supplied key or bare array index), converts validated `requirementContexts[].sourceRequirementIndex` references to that key, and fails closed on ambiguous legacy agent overlays. The materializer preserves the key plus source index and `agent`, so Layer 3a can join collision-safely across reorderings | S2 |
 | `mcpGrantsForAgent` (`workforce-materializer.ts:157`) | persists the matching `requirementKey`, `sourceRequirementIndex`, `agent`, `assignment`, `promptOverlayPresent`, plus `mode`, `recoveryAction`, `normalizedCapabilities`, `evidenceRefs` on each grant (schema bump) — not just id/mcp/caps/requirement/status/reason/fallback/health | S2 |
-| `mcpSubtasksForAgent` (`workforce-materializer.ts`) | retains the existing `id`, `agent`, and flat `mcpCapabilities[]` on each persisted `metadata.mcpAwareSubtasks` entry (currently `agent` is stripped). Shared `capabilityMcpId` derives the MCP independently for each capability, so one subtask can safely span several MCPs without a synthetic singleton `mcpId` | S2 |
+| `mcpSubtasksForAgent` (`workforce-materializer.ts`) | retains the existing `id`, `agent`, and flat `mcpCapabilities[]`, plus the normalized `requirementKey`, on each persisted `metadata.mcpAwareSubtasks` entry (currently `agent` is stripped). Shared `capabilityMcpId` derives the MCP independently for each capability, so one subtask can safely span several MCPs without a synthetic singleton `mcpId`; ambiguous same-MCP association blocks | S2 |
 | `mcpCapabilityList` (`work-package-executor.ts:1527`) | imports `mergeCapabilityFields`; executor filesystem gating uses shared `coverageKeysForGrant`/`classifyCapability` | S4 |
 | client helpers (`tasks/[id]/page.tsx:348-444`) | import shared helpers OR consume a server-computed grant-state payload; render `mode`+`recoveryAction` via `admission-copy.ts` | S5 |
 
@@ -816,6 +850,9 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   `github.toString.write`) as both requests and prohibitions (unknown/block without
   throwing),
   all qualified/unqualified filesystem `read|list|search` alias pairs, a
+  catalog-safety invariant (catalog operations are closed safe-read verbs and
+  cannot overlap the deferred registry; an injected
+  `github.pull_requests.write` catalog entry is rejected rather than admitted), a
   package-wide prohibition that must beat a
   per-entry approval, MCP-aware subtasks (a bounded filesystem subtask, a
   planning-context `github.*.read` subtask matched to its same-agent requirement, and
@@ -833,8 +870,9 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   fields intact (no synthesized timestamp). Use today's raw + derived package JSON
   as a legacy join fixture and assert no duplicate decisions/warnings/blocks.
   Add a grant-only legacy fixture (must block `unknown_legacy`), two same-agent /
-  same-MCP requirements where only one has materialized prompt context (the other
-  must block), and mixed filesystem requirements where covered required `read`
+  same-MCP requirements where only one has a normalized, requirement-indexed
+  context entry (the other must block), an ambiguous legacy agent-only overlay
+  (materializes neither requirement), and mixed filesystem requirements where covered required `read`
   remains approved while uncovered optional `list` warns. A typoed/cross-MCP
   prohibition must block. Also assert that optional missing-prompt and optional
   unhealthy-bounded warnings create **no** subtask coverage.
@@ -865,6 +903,19 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   which currently reconciles only current-task standard-status siblings) and the
   project route (`projects/[id]/filesystem-grant/route.ts:166-244`). Both endpoints
   recover the identical package set for identical grant state.
+- **One lock order and no whole-JSON lost updates.** Both grant endpoints begin the
+  transaction by selecting the project row `FOR UPDATE`, then derive `nextMcpConfig`
+  from that locked, freshly read value. They must not compute a full replacement
+  from the project object fetched for authorization before the transaction. The
+  reconciliation routine then selects candidate work packages `FOR UPDATE` in
+  ascending `work_packages.id` order. All callers use the same project-then-package
+  lock order. Package updates use `jsonb_set`/`#-` only for the owned
+  `mcpGrantPhases` and `mcpGrantBlock` paths (or an `updatedAt` compare-and-set and
+  retry); they never replace `metadata` from a stale JavaScript spread. This
+  preserves concurrent broker, lease, audit, and evidence fields. Add two
+  concurrency tests: disjoint simultaneous `always_allow` grants retain the union
+  plus unrelated `mcpConfig` keys, and a simultaneous broker metadata update
+  survives reconciliation.
 - **Reuse the S1 reader — do not re-implement.** `filesystem-grants.ts` **imports**
   `readEffectiveGrantState` from `admission.ts` (S1 owns it); S3 adds no second
   copy. S3's job is to pass the required-capability set and the recovery/precedence
@@ -890,16 +941,39 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
 
 ### S4 — Prompt/context assembly and bounded-context packet evidence (builds on #43)
 
-- Specialist prompts receive `promptOverlay` + `mcpAwareSubtasks` +
-  `mcpRequirements` as **instructions**, never as tool grants (executor prompt
+- Specialist prompts receive the admitted `promptOverlay` + `mcpAwareSubtasks` +
+  safe/planning `mcpRequirements` subset as **instructions**, never as tool grants (executor prompt
   assembly around `work-package-executor.ts:1527-1583`). No live MCP handle is
   ever issued.
+- **Security boundary: MCP-channel admission is not an ACP sandbox.** An Agent
+  Client Protocol (ACP) adapter is a local process and Forge explicitly does not
+  OS-confine it (`FORGE_ACP_WORK_PACKAGE_EXECUTION=1` is operator acceptance of
+  that risk). It may inherit `HOME`, `CODEX_HOME`, `PATH`, and XDG configuration,
+  and prompt instructions cannot prevent shell, network, or credential access.
+  Therefore `deferred_live_mcp`, “no live MCP handle”, and the S5 badges describe
+  only capabilities issued through Forge's MCP channel; they must not claim that
+  the worker is unable to perform an equivalent operation by another runtime
+  tool. S4 strips deferred/unknown capability details from the executable MCP
+  instruction block (retaining only a plain boundary warning), and S5 displays
+  “MCP access deferred — ACP runtimes are not a security sandbox” wherever ACP
+  execution is enabled. Real process/network/credential/filesystem isolation is a
+  prerequisite of any later security-bound capability guarantee and remains in
+  the #40/#60 security epic. Tests prove that no deferred tool is issued or
+  rendered as an allowed MCP instruction; they do not mislabel prompt compliance
+  as OS-level enforcement.
 - **Evidence lifecycle — planned scope vs issued evidence.** Pre-run,
   `McpAdmissionDecision.evidenceRefs` carries only *planned scope* (root path +
   capability set), never file contents. The bounded read-only context packet is
   assembled during execution and requires an `agentRunId`; after the run (including
-  **failed** runs) a run-level record is updated with stable artifact refs to the
-  packet **metadata** artifact (root, selected file names, included/omitted counts,
+  **failed** runs) insert exactly one idempotent `artifacts` row for the attempt:
+  `artifactType:'mcp_bounded_context_packet_metadata'`, linked by
+  `artifacts.agentRunId`, with `content` containing the versioned, human-readable
+  metadata summary and `metadata` containing `{schemaVersion:1, workPackageId,
+  root, selectedFileNames, includedCount, omittedCount, redactionSummary}`.
+  `(agentRunId, artifactType)` is the stable lookup contract; retry/upsert behavior
+  must not create duplicates for one run. S5 queries this artifact relationship
+  directly—no `agent_runs` metadata column or migration is introduced. The artifact
+  contains packet **metadata** only (root, selected file names, included/omitted counts,
   redaction summary — per ADR 0008, which forbids persisting raw file contents).
   **File contents stay prompt-only and are not persisted**; "selected excerpts" are
   not written to an inspectable artifact. `mcpCapabilityList` imports
@@ -920,9 +994,10 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   - `blocked`+`install_or_fix_mcp` → red, CTA deep-link
     `/dashboard/projects/{projectId}#project-mcps-heading`.
   - `blocked`+`revise_plan` → red, CTA "Request changes / regenerate plan".
-  - `deferred_live_mcp` → **neutral slate** "Deferred — beta boundary", body "Live
-    MCP tool handles are not part of this beta. This is a product boundary, not a
-    broken install." **When it is a *required* (blocking) deferred requirement, it
+  - `deferred_live_mcp` → **neutral slate** "Deferred — MCP boundary", body "Forge
+    did not issue this MCP capability. This is not a broken install. ACP workers
+    are local processes and are not security-sandboxed by this MCP decision."
+    **When it is a *required* (blocking) deferred requirement, it
     still carries the `revise_plan` CTA** so the operator can remove/regenerate the
     offending requirement instead of being stuck with an unapprovable plan and no
     action; an *optional* deferred requirement is warning-only and approvable.
@@ -964,7 +1039,13 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   approved legacy fixture) and is held `blocked` pre-claim with zero attempts, task
   not failed. Restoring coverage re-drives it. A deferred GitHub-write capability
   is reported as `deferred_live_mcp`, not an install error; a healthy GitHub read
-  is planning context, not an approvable bounded packet.
+  is planning context, not an approvable bounded packet. The regression also
+  verifies requirement-indexed context (two same-agent/same-MCP requirements,
+  exactly one materialized), catalog/deferred disjointness, lock-safe concurrent
+  grant union, preservation of concurrent package metadata, one packet-metadata
+  artifact per run on success/failure, and that deferred/unknown capabilities are
+  absent from the executable MCP instruction block. ACP copy explicitly preserves
+  the non-sandbox warning.
 - Plus the S2 preview==approval==handoff invariant suite.
 
 ## <a id="43-re-scope"></a>#43 re-scope
@@ -996,9 +1077,9 @@ no MCP. #43's body carries the same qualification.
   incapable of disagreeing for a fixed health snapshot, because they consume one
   evaluation built by one producer over one set of primitives sourced from one
   catalog. The filesystem gate is a tested projection of that evaluation.
-- `deferred_live_mcp` is a first-class, named mode with an operator action, so
-  blocks say "deferred live MCP feature" and the UI shows a product boundary with a
-  path forward instead of a broken install.
+- `deferred_live_mcp` is a first-class, named MCP-channel mode with an operator
+  action, so blocks show a path forward instead of a broken install without
+  misrepresenting an ACP local process as security-confined.
 - Denying or withholding a required filesystem grant no longer burns an execution
   attempt or dead-ends; it holds the package in a recoverable state, and recovery
   is deterministic across both endpoints via one project-wide reconciliation.
