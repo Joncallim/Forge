@@ -522,10 +522,17 @@ handoff.
 //     these cases depends on the *absence*, not on an invented time.
 // Approval persists only what it actually observed (each entry keeps its own
 // `observed` discriminant); it never fabricates a snapshot for an absent row.
+// BOTH arms carry the legacy `installState/status/enabled/error` fields the
+// existing `McpGrantDecisions.health` + metadata reader require, so the shape is
+// always fully populated: the `observed:false` arm fills them with explicit
+// unknown sentinels and sets `checkedAt:null`. The `observed` discriminant +
+// `checkedAt` (never a synthesized timestamp) are what distinguish a real
+// observation from an absent one — not the presence/absence of fields.
 export type McpHealthSnapshot =
   | { schemaVersion: 1; observed: true; mcpId: string; installState: string;
       status: string; enabled: boolean; error: string | null; checkedAt: string }
-  | { schemaVersion: 1; observed: false; mcpId: string; checkedAt: null }
+  | { schemaVersion: 1; observed: false; mcpId: string; installState: 'unknown';
+      status: 'unknown'; enabled: false; error: null; checkedAt: null }
 
 export type McpAdmissionEvaluation = {
   decision: McpAdmissionDecision
@@ -632,19 +639,16 @@ and existing readers do not change shape — they are only *extended*:
   `promptOverlayPresent`; **adds** `mode`, `recoveryAction`,
   `normalizedCapabilities`, `capabilityClasses`, `evidenceRefs`, and a canonical
   `admissionStatus: McpAdmissionStatus` (`allowed | warning | blocked`).
-  **Health-shape compatibility.** The legacy `McpGrantDecisions.health` and its
-  metadata reader require `installState`, `status`, `enabled`, `error` — but the
-  versioned `McpHealthSnapshot`'s `observed:false` arm has none of them. So the
-  adapter does **not** copy the observation object into `health` verbatim; it
-  **projects** it into the legacy shape: `observed:true` → the four fields
-  verbatim; `observed:false` → explicit unknown sentinels
-  (`{installState:'unknown', status:'unknown', enabled:false, error:null}`). The
-  versioned `McpHealthSnapshot` (with its `observed` discriminant + `checkedAt`)
-  is retained separately on the evaluation envelope / `approvalHealthSnapshot`, so
-  the legacy preview shape is always fully populated **and** the honest
-  observed/absent distinction is preserved for replay. A test asserts an
-  absent-row decision yields the unknown-sentinel legacy `health` while its
-  `McpHealthSnapshot` stays `observed:false`.
+  **Health-shape compatibility.** Because **both** arms of `McpHealthSnapshot`
+  carry the legacy `installState/status/enabled/error` the existing
+  `McpGrantDecisions.health` + metadata reader require (the `observed:false` arm
+  fills them with unknown sentinels), the adapter copies those four fields into the
+  legacy `health` verbatim — no lossy projection — while the versioned `observed`
+  discriminant + `checkedAt` ride alongside for replay. So the legacy preview shape
+  is always fully populated **and** the honest observed/absent distinction is
+  preserved. A test asserts an absent-row decision yields the unknown-sentinel
+  legacy `health` while its `McpHealthSnapshot` stays `observed:false`,
+  `checkedAt:null`.
   **Status compatibility.** The legacy `McpGrantDecisions.status`
   (`proposed | warning | blocked`) is preserved by the total map
   `allowed → proposed`, `warning → warning`, `blocked → blocked`, so existing
@@ -728,7 +732,9 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   next to the existing `approvedGrantSnapshot` (`:221-263`). Persist **only actual
   observations**: an MCP whose `statusFor` returned a row is stored `observed:true`
   with that row's `checkedAt`; an MCP with no row is stored `observed:false`,
-  `checkedAt:null` — an explicit unavailable, never a synthesized `now()`. A single
+  `checkedAt:null` with the legacy `installState:'unknown'`/`status:'unknown'`/
+  `enabled:false`/`error:null` sentinels — an explicit unavailable, never a
+  synthesized `now()`. A single
   ambiguous timestamp cannot replay the decision after cached `ProjectMcpStatus`
   rows change; the per-MCP `checkedAt` (or explicit `null`) is required. Add an
   assertion that the persisted snapshot equals the health inputs passed to
