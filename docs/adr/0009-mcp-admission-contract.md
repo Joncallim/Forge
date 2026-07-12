@@ -137,8 +137,11 @@ export type McpDeliveryKind =
 
 // deliveryKind is sourced from the catalog, not re-declared:
 //   MCP_CATALOG[id].runtime.mode === 'bounded_context_packet' -> 'bounded_context_packet'
-//   otherwise ('external_service') -> 'planning_context_only'
-export function mcpDeliveryKind(mcpId: string): McpDeliveryKind
+//   known external_service                                    -> 'planning_context_only'
+//   unknown/malformed mcpId                                   -> null
+// (null is only reachable for an unknown MCP, which the decision table already
+//  blocks at step 1 before any delivery-specific branch is consulted.)
+export function mcpDeliveryKind(mcpId: string): McpDeliveryKind | null
 
 // Collapses whitespace around the dot separators BEFORE underscoring any
 // remaining internal spaces, so `filesystem.project. read` → `filesystem.project.read`
@@ -201,11 +204,11 @@ classify identically and never fall through to `unknown` on formatting alone (th
 lowercase/underscore). Then, first match wins:
 
 1. `mcpId` is not a known MCP → `unknown`.
-2. **Namespace-owner (fail-closed).** The capability's namespace — `c` up to its
-   first `.` — must equal `mcpId`. `classifyCapability('github',
-   'filesystem.project.write')` and every other cross-MCP mismatch → `unknown`, so
-   no later planning-only/deferred rule can admit a capability the declared MCP does
-   not own. Evaluated **before** rules 3–5.
+2. **Namespace-owner (fail-closed).** `capabilityMcpId(c)` (the capability's owning
+   namespace, validated against known MCPs) must be non-null **and** equal `mcpId`.
+   `classifyCapability('github', 'filesystem.project.write')` and every other
+   cross-MCP mismatch → `unknown`, so no later planning-only/deferred rule can admit
+   a capability the declared MCP does not own. Evaluated **before** rules 3–5.
    *(Then canonicalize documented aliases: `c = canonicalizeCapability(mcpId, c)` —
    for `filesystem`, maps `filesystem.read|list|search` → `filesystem.project.*`.)*
 3. `c === 'filesystem.project.write'` (Forge writes it via the sandbox JSON path,
@@ -263,10 +266,17 @@ no materialized prompt context is a plan defect and blocks with `revise_plan`. O
 `filesystem` bounded reads flow through the approve/deny bounded-context path.
 
 Shared primitives (single copy each, all in `capability-normalization.ts`):
-`coverageKeysForGrant(cap)` / `coverageKeysForProhibition(cap)` (one documented
-alias direction for `filesystem.read` ↔ `filesystem.project.read`, per ADR 0008;
-replaces `approvedCoverageCapabilityKeys`, `filesystemProjectAlias`,
-`filesystemUnqualifiedAlias`, `prohibitedCoverageCapabilityKeys`);
+`capabilityMcpId(cap)` — derives **and validates** the owning MCP from a
+capability's namespace (`c` up to its first `.`); returns `null` when that
+namespace is not a known MCP. This is the single owner-derivation primitive used by
+the classifier's namespace-owner rule and by per-capability subtask classification
+(the issues call it `capabilityMcpId`; do not re-spell it `namespaceOf`).
+`coverageKeysForGrant(cap)` / `coverageKeysForProhibition(cap)` return the **full
+alias-equivalence set** for a capability (e.g. both `filesystem.read` **and**
+`filesystem.project.read`, per ADR 0008), so membership tests are symmetric
+regardless of which alias form the caller holds; replaces
+`approvedCoverageCapabilityKeys`, `filesystemProjectAlias`,
+`filesystemUnqualifiedAlias`, `prohibitedCoverageCapabilityKeys`;
 `mergeCapabilityFields(entry)` reading exactly
 `REQUIREMENT_CAPABILITY_FIELDS = ['permissions','capabilities','requiredCapabilities','mcpCapabilities']`;
 `isMcpHealthy(status)` / `mcpHealthReason(mcpId,status)`;
@@ -380,13 +390,18 @@ so the fallback matrix is total across all three fallback actions.
 1. **Unknown MCP** → `mode:'blocked'`, `status:'blocked'`, `recoveryAction:'revise_plan'`.
 2. **Any capability class `unknown`** (known MCP, unrecognized/typo capability) →
    `mode:'blocked'`, `status:'blocked'`, `recoveryAction:'revise_plan'`.
-3. **Any capability prohibited package-wide** (`normalizeCapability(cap)` ∈
-   `packageProhibitedKeys`) → `mode:'blocked'`, `status:'blocked'`,
-   `recoveryAction:'revise_plan'`, **unconditionally**. This is its own terminal
-   outcome evaluated *before* any fallback handling: an explicit package prohibition
-   is deny-wins and can **never** be downgraded to a warning by `optional` /
-   `continue_without_mcp`. (Matches the current broker, where an unsafe/prohibited
-   capability blocks regardless of `optional`.)
+3. **Any capability prohibited package-wide** — `coverageKeysForProhibition(cap)`
+   intersects `packageProhibitedKeys` (the **same** alias-aware comparison the
+   subtask deny-wins uses in Layer 3, **not** a plain `normalizeCapability(cap) ∈`
+   membership; a plain membership could miss an aliased prohibition — e.g.
+   `filesystem.read` vs `filesystem.project.read` — that the subtask path catches,
+   so requirement-level and subtask-level deny-wins must use the identical test) →
+   `mode:'blocked'`, `status:'blocked'`, `recoveryAction:'revise_plan'`,
+   **unconditionally**. This is its own terminal outcome evaluated *before* any
+   fallback handling: an explicit package prohibition is deny-wins and can **never**
+   be downgraded to a warning by `optional` / `continue_without_mcp`. (Matches the
+   current broker, where an unsafe/prohibited capability blocks regardless of
+   `optional`.)
 4. **Any capability class `deferred_live_mcp`** → `mode:'deferred_live_mcp'`.
    `status:'warning'` **iff `canProceed`**, else `status:'blocked'`. `recoveryAction`
    is `defer_live_mcp_feature` when warning (approvable, non-blocking) and
@@ -594,8 +609,9 @@ sets, both minus the prohibition set:
 `mcpAwareSubtask` carries a **flat `mcpCapabilities[]` that can span more than one
 MCP**, so there is no single subtask `mcpId`: for each capability the owning MCP is
 **derived from the capability's own namespace and validated** (as the current broker
-does at `mcp-execution-design.ts:697-721`) — `mcpId = namespaceOf(capability)`; if
-that namespace is not a known MCP the capability is `unknown`. `mcpSubtasksForAgent`
+does at `mcp-execution-design.ts:697-721`) — `mcpId = capabilityMcpId(capability)`;
+if that returns `null` (namespace is not a known MCP) the capability is `unknown`.
+`mcpSubtasksForAgent`
 therefore only needs to retain `agent` (currently stripped) alongside the existing
 `subtaskId` + `mcpCapabilities[]`; no producer/parser/reader (`McpAwareSubtask`,
 `normalizeSubtask`, the Architect fence, the metadata reader) schema change is
@@ -691,7 +707,7 @@ keep a **transitional re-export** until their callers migrate in the owning slic
 | `isRetryableMcpBrokerBlock` (`:90`) + `buildMcpBrokerBlockMetadata` (`blocked-handoff-retry.ts:32`) | consume `aggregate.retryable`/`primaryRecoveryAction`; **persist the full versioned `metadata.mcpBroker` here**; S5 reads it only | S2 |
 | `mcpRequirementsForAgent` (`workforce-materializer.ts`) | persists an immutable `requirementKey` (from the Architect requirement ordinal) + retains the original requirement index and `agent` on each `work_packages.mcpRequirements` entry, so Layer 3a can join collision-safely | S2 |
 | `mcpGrantsForAgent` (`workforce-materializer.ts:157`) | persists the matching `requirementKey`, `sourceRequirementIndex`, `agent`, `assignment`, `promptOverlayPresent`, plus `mode`, `recoveryAction`, `normalizedCapabilities`, `evidenceRefs` on each grant (schema bump) — not just id/mcp/caps/requirement/status/reason/fallback/health | S2 |
-| `mcpSubtasksForAgent` (`workforce-materializer.ts`) | **retains `agent`** (and the existing `subtaskId` + flat `mcpCapabilities[]`) on each persisted `metadata.mcpAwareSubtasks` entry — `agent` is currently stripped. No new singleton `mcpId`: `admitWorkPackageMcp` derives+validates the owning MCP **per capability** from its namespace (`namespaceOf(cap)`), so no `McpAwareSubtask`/`normalizeSubtask`/reader schema change is needed — only the retained `agent` lets it match `planningContextCoverageKeys` for the same agent | S2 |
+| `mcpSubtasksForAgent` (`workforce-materializer.ts`) | **retains `agent`** (and the existing `subtaskId` + flat `mcpCapabilities[]`) on each persisted `metadata.mcpAwareSubtasks` entry — `agent` is currently stripped. No new singleton `mcpId`: `admitWorkPackageMcp` derives+validates the owning MCP **per capability** from its namespace (`capabilityMcpId(cap)`), so no `McpAwareSubtask`/`normalizeSubtask`/reader schema change is needed — only the retained `agent` lets it match `planningContextCoverageKeys` for the same agent | S2 |
 | `mcpCapabilityList` (`work-package-executor.ts:1527`) | imports `mergeCapabilityFields`; executor filesystem gating uses shared `coverageKeysForGrant`/`classifyCapability` | S4 |
 | client helpers (`tasks/[id]/page.tsx:348-444`) | import shared helpers OR consume a server-computed grant-state payload; render `mode`+`recoveryAction` via `admission-copy.ts` | S5 |
 
