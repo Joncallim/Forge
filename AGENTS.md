@@ -51,7 +51,7 @@ or prompt overlays layered onto them, not extra top-level agents.
 | Frontend | UI components, state, routing, API integration |
 | Backend | APIs, DB migrations, business logic, services |
 | QA | Test writing, coverage analysis, regression checks |
-| Review | Code review: correctness, security, performance |
+| Review | Code review through the orthogonal review protocol in `.ai/skills/orthogonal-review.md` |
 | Security | Security-sensitive review and structured findings |
 | DevOps | Docker, CI/CD, infra, deployment config |
 | Documentation | README/docs/wiki shaping and ADR polish |
@@ -77,6 +77,20 @@ are not the product source of truth for the app catalogue.
 4. **Maintain** architectural consistency across components.
 5. **Approve or reject** output; spawn rework when needed.
 
+### Default review behaviour
+
+When Jonathan or a task asks to "review", "check this", "review implementation",
+"review PR", "verify a fix", or "do another review pass", use
+`.ai/skills/orthogonal-review.md` by default.
+
+Do not perform a single generic review pass. Run orthogonal passes and report:
+findings, inspected scope, and unchecked areas. Never claim that no issues exist.
+Use the scoped verdict language from the skill, especially "No blockers found in
+the inspected scope".
+
+After fixes, first check whether prior findings were resolved, then run fresh
+orthogonal passes so the review also catches regressions introduced by the fix.
+
 ### Workflow (target/manual path)
 
 ```
@@ -92,7 +106,7 @@ Issue / Request
 3. QA → write tests for each subtask
       │
       ▼
-4. Review → audit PRs (Security/Adversarial for high-risk changes)
+4. Review → orthogonal review protocol (Security/Adversarial for high-risk changes)
       │
       ▼
 5. PM (you) → merge or rework
