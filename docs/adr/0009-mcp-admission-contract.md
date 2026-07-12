@@ -140,32 +140,53 @@ export type McpDeliveryKind =
 //   otherwise ('external_service') -> 'planning_context_only'
 export function mcpDeliveryKind(mcpId: string): McpDeliveryKind
 
-export function normalizeCapability(cap: string): string   // trim().toLowerCase().replace(/\s+/g,'_')
+// Collapses whitespace around the dot separators BEFORE underscoring any
+// remaining internal spaces, so `filesystem.project. read` → `filesystem.project.read`
+// (NOT `filesystem.project._read`, which would spuriously classify `unknown`):
+export function normalizeCapability(cap: string): string
+//   = cap.trim().toLowerCase().replace(/\s*\.\s*/g, '.').replace(/\s+/g, '_')
 
-// Enumerated, recognized live-tool families. A capability that matches one of
-// these on a known MCP is a *known but deferred* capability. A capability that
-// matches NOTHING (safe-read, planning-only, or a deferred family) on a known MCP
-// is a typo / unrecognized value and classifies as `unknown` (blocks revise_plan).
-//
-// **Fail-closed rule: every family is end-anchored (`$`) on an enumerated
-// operation.** No family uses a bare namespace *prefix* (`github.secrets.`) that
-// would accept an arbitrary suffix. This is deliberate: an unrecognized operation
-// under an otherwise-deferred namespace — `github.pull_requests.reed`,
-// `github.secrets.banana`, `github.workflows.frobnicate` — matches nothing here,
-// falls through to classifier rule 5, and fails closed to `unknown` (block
-// `revise_plan`) instead of being silently admitted as a beta-boundary warning.
+// Documented unqualified→qualified filesystem read aliases (ADR 0008). Applied
+// before the safe-read check so the capabilities `SAFE_BETA_CAPABILITY_PATTERNS`
+// accepts today (`filesystem.read|list|search`) keep classifying as safe reads
+// instead of regressing to `unknown`. (Writes/deletes are intentionally NOT
+// aliased — an unqualified `filesystem.delete` stays unknown, fail-closed.)
+export const FILESYSTEM_READ_ALIASES: Record<string, string> = {
+  'filesystem.read':   'filesystem.project.read',
+  'filesystem.list':   'filesystem.project.list',
+  'filesystem.search': 'filesystem.project.search',
+}
+// canonicalizeCapability(mcpId, c) applies the alias table only for mcpId==='filesystem'.
+export function canonicalizeCapability(mcpId: string, c: string): string
+
+// Recognized GitHub resources. The RESOURCE half of every github capability must
+// be a member, or the capability is `unknown` — fail-closed on a typo RESOURCE
+// (`github.secerts.write`, `github.isssues.delete`), not only a typo verb. This is
+// the union of the resources that already appear in
+// `MCP_CATALOG.github.runtime.capabilities`, `SAFE_READ_SUPPLEMENT`, and the
+// sensitive-namespace list below — a derived set, not an independently maintained
+// one, so it cannot drift from the catalog:
+export const KNOWN_GITHUB_RESOURCES =
+  'issues|pull_requests|repository|contents|branches|actions|workflows|releases|commits|tags|settings|secrets'
+
+// Enumerated, recognized live-tool families. Every family is end-anchored (`$`) on
+// BOTH an enumerated resource AND an enumerated operation — no bare namespace
+// prefix, no `[a-z_]+` resource wildcard. So an unrecognized RESOURCE
+// (`github.secerts.write`) OR an unrecognized OPERATION (`github.pull_requests.reed`,
+// `github.secrets.banana`) matches nothing here, falls through to classifier
+// rule 6, and fails closed to `unknown` (block `revise_plan`) — never silently a
+// beta-boundary warning.
 const DEFERRED_WRITE_OPS = 'write|create|update|delete|merge|close|dispatch|cancel|rotate|approve'
 export const DEFERRED_CAPABILITY_FAMILIES: RegExp[] = [
-  // Write-class operation on ANY github resource (end-anchored verb).
-  new RegExp(`^github\\.[a-z_]+\\.(${DEFERRED_WRITE_OPS})$`),
-  // Sensitive github namespaces where even reads are live-tool only — the
-  // recognized operations are enumerated and end-anchored, reads included, so a
-  // typo suffix still falls through to `unknown`.
+  // Write-class operation on a RECOGNIZED github resource (resource AND verb enumerated).
+  new RegExp(`^github\\.(${KNOWN_GITHUB_RESOURCES})\\.(${DEFERRED_WRITE_OPS})$`),
+  // Sensitive github namespaces where even reads are live-tool only — enumerated ops.
   /^github\.(branches|pull_requests)\.(read|list|get)$/,
   /^github\.(settings|secrets)\.(read|list|get)$/,
   /^github\.workflows\.(read|list|get|run)$/,
-  // Filesystem mutation operations, end-anchored.
-  /^filesystem\.[a-z._]*\.(write|delete|admin|move|create)$/,
+  // Filesystem mutation operations on the project scope, end-anchored
+  // (`filesystem.project.write` is planning_only via rule 3, matched before this).
+  /^filesystem\.project\.(delete|admin|move|create)$/,
 ]
 
 export function classifyCapability(mcpId: string, cap: string): McpCapabilityClass
@@ -173,43 +194,60 @@ export function classifyCapability(mcpId: string, cap: string): McpCapabilityCla
 
 `classifyCapability` applies a **total, ordered** rule set (first match wins), so
 every capability lands in exactly one class and a typo can never be silently
-admitted. It **normalizes once at the top** — `c = normalizeCapability(cap)` — and
-every rule below matches `c`, not the raw `cap`, so casing/whitespace variants
-(`GitHub.Issues.Read`, `filesystem.project. read`) classify identically and never
-fall through to `unknown` on formatting alone (the `DEFERRED_CAPABILITY_FAMILIES`
-regexes and the safe-read set are all lowercase/underscore):
+admitted. As a **prep step it normalizes once** — `c = normalizeCapability(cap)` —
+so casing/whitespace variants (`GitHub.Issues.Read`, `filesystem.project. read`)
+classify identically and never fall through to `unknown` on formatting alone (the
+`DEFERRED_CAPABILITY_FAMILIES` regexes and the safe-read set are all
+lowercase/underscore). Then, first match wins:
 
 1. `mcpId` is not a known MCP → `unknown`.
-2. `c === 'filesystem.project.write'` (Forge writes it via the sandbox JSON path,
+2. **Namespace-owner (fail-closed).** The capability's namespace — `c` up to its
+   first `.` — must equal `mcpId`. `classifyCapability('github',
+   'filesystem.project.write')` and every other cross-MCP mismatch → `unknown`, so
+   no later planning-only/deferred rule can admit a capability the declared MCP does
+   not own. Evaluated **before** rules 3–5.
+   *(Then canonicalize documented aliases: `c = canonicalizeCapability(mcpId, c)` —
+   for `filesystem`, maps `filesystem.read|list|search` → `filesystem.project.*`.)*
+3. `c === 'filesystem.project.write'` (Forge writes it via the sandbox JSON path,
    never a live tool) → `planning_only`.
-3. `c` ∈ safe-read set = `MCP_CATALOG[mcpId].runtime.capabilities` **∪
+4. `c` ∈ safe-read set = `MCP_CATALOG[mcpId].runtime.capabilities` **∪
    `SAFE_READ_SUPPLEMENT`** → `bounded_read_only`.
-4. `c` matches a `DEFERRED_CAPABILITY_FAMILIES` pattern → `deferred_live_mcp`.
-5. known MCP, matched nothing above (unrecognized / typo) → `unknown`.
+5. `c` matches a `DEFERRED_CAPABILITY_FAMILIES` pattern → `deferred_live_mcp`.
+6. known MCP, matched nothing above (unrecognized resource / operation / typo) →
+   `unknown`.
 
 `SAFE_READ_SUPPLEMENT` is migrated *verbatim* from `SAFE_BETA_CAPABILITY_PATTERNS`
 so no capability allowed today becomes newly `unknown` (specifically
 `github.actions.read`, `github.repository.list|search`,
-`github.contents.list|search`). Deleting `SAFE_BETA_CAPABILITY_PATTERNS` therefore
-moves the exact same patterns into a single documented data set — **not a behavior
-change**.
+`github.contents.list|search`). The **unqualified filesystem reads**
+`SAFE_BETA_CAPABILITY_PATTERNS` also accepts today (`filesystem.read|list|search`)
+are preserved by `FILESYSTEM_READ_ALIASES` (canonicalized to `filesystem.project.*`
+before the safe-read check), so they too keep classifying `bounded_read_only`.
+Deleting `SAFE_BETA_CAPABILITY_PATTERNS` therefore moves the exact same accepted
+set into a single documented data set — **not a behavior change**. A required
+migration test asserts all three qualified/unqualified filesystem read pairs and
+the full github allow-list still classify `bounded_read_only`.
 
 **Classifier matrix (illustrative — every row is a required test case):**
 
 | mcpId | capability | class | why |
 |---|---|---|---|
-| `filesystem` | `filesystem.project.read` | `bounded_read_only` | catalog safe-read (rule 3) |
-| `filesystem` | `filesystem.project.write` | `planning_only` | rule 2 (sandbox JSON path) |
-| `filesystem` | `filesystem.project.delete` | `deferred_live_mcp` | deferred family (rule 4) |
-| `github` | `github.issues.read` | `bounded_read_only` | catalog safe-read |
-| `github` | `github.actions.read` | `bounded_read_only` | `SAFE_READ_SUPPLEMENT` |
-| `github` | `github.pull_requests.write` | `deferred_live_mcp` | deferred family |
-| `github` | `github.branches.create` | `deferred_live_mcp` | deferred family |
-| `github` | `github.secrets.read` | `deferred_live_mcp` | sensitive-namespace read (enumerated) |
-| `github` | `github.issues.reed` (typo) | `unknown` | rule 5 → block `revise_plan` |
-| `github` | `github.pull_requests.reed` (typo) | `unknown` | end-anchored family misses → rule 5 |
-| `github` | `github.secrets.banana` (typo) | `unknown` | end-anchored family misses → rule 5 |
-| `github` | `github.workflows.frobnicate` (typo) | `unknown` | end-anchored family misses → rule 5 |
+| `filesystem` | `filesystem.project.read` | `bounded_read_only` | catalog safe-read (rule 4) |
+| `filesystem` | `filesystem.read` (unqualified alias) | `bounded_read_only` | canonicalized → `filesystem.project.read` (rule 4) |
+| `filesystem` | `filesystem.list` / `filesystem.search` | `bounded_read_only` | canonicalized alias (rule 4) — no regression from `SAFE_BETA_CAPABILITY_PATTERNS` |
+| `filesystem` | `filesystem.project.write` | `planning_only` | rule 3 (sandbox JSON path) |
+| `filesystem` | `filesystem.project.delete` | `deferred_live_mcp` | deferred family (rule 5) |
+| `github` | `github.issues.read` | `bounded_read_only` | catalog safe-read (rule 4) |
+| `github` | `github.actions.read` | `bounded_read_only` | `SAFE_READ_SUPPLEMENT` (rule 4) |
+| `github` | `github.pull_requests.write` | `deferred_live_mcp` | deferred family (rule 5) |
+| `github` | `github.branches.create` | `deferred_live_mcp` | deferred family (rule 5) |
+| `github` | `github.secrets.read` | `deferred_live_mcp` | sensitive-namespace read (enumerated, rule 5) |
+| `github` | `github.issues.reed` (typo verb) | `unknown` | rule 6 → block `revise_plan` |
+| `github` | `github.secerts.write` (typo **resource**) | `unknown` | resource ∉ `KNOWN_GITHUB_RESOURCES` → rule 6 |
+| `github` | `github.isssues.delete` (typo **resource**) | `unknown` | resource ∉ `KNOWN_GITHUB_RESOURCES` → rule 6 |
+| `github` | `github.workflows.frobnicate` (typo verb) | `unknown` | end-anchored family misses → rule 6 |
+| `github` | `filesystem.project.write` (**cross-MCP**) | `unknown` | namespace ≠ mcpId → rule 2 (fail-closed) |
+| `filesystem` | `github.issues.read` (**cross-MCP**) | `unknown` | namespace ≠ mcpId → rule 2 |
 | `slack` | `slack.messages.read` | `unknown` | rule 1 (unknown MCP) |
 
 **Risk ≠ delivery.** A `bounded_read_only` github read is *safe* but not
@@ -439,14 +477,28 @@ The join therefore keys on `requirementKey`, and merges with fixed precedence:
 - if only one side is present, its own fields are used and the missing envelope is
   synthesized deterministically (`decisionId = 'req-{requirementKey}'`).
 
-For **pre-migration legacy artifacts** that lack `requirementKey`, fall back to the
-positional `(sourceRequirementIndex, agent, mcpId)` — which is unique per
-requirement — and, only if `sourceRequirementIndex` is also absent, treat each entry
-as its **own singleton** (no join) rather than collapsing on the non-unique
-`(agent, mcpId)`. The result is **exactly one `admitMcpRequirement` call per logical
-requirement**, asserted by test — including a test with **two same-agent /
-same-MCP requirements carrying different prohibitions and fallbacks**, which must
-produce two distinct decisions with neither prohibition nor fallback lost.
+**Legacy / current-shape data (no `requirementKey`).** Today's persisted rows have
+neither `requirementKey` nor `sourceRequirementIndex`/`agent` on raw
+`mcpRequirements`, and `mcpGrantsForAgent` currently drops the join fields too — so a
+naive "each entry is its own singleton" fallback would evaluate the raw requirement
+**and** its derived grant as two decisions and **double-count** blocks/warnings.
+That is explicitly disallowed. The join instead reuses the **deterministic current
+materialization pairing**: `mcpGrantsForAgent` produces grants from `mcpRequirements`
+in array order within each `(agent, mcpId)` group, so raw requirement *i* and the
+grant derived from it are the same logical requirement. Two supported paths:
+- **Backfill (preferred).** A one-time migration stamps a `requirementKey` onto
+  existing `mcpRequirements` and `mcpGrants` rows using that same positional pairing;
+  afterwards the join keys on `requirementKey` normally.
+- **Read-time pairing (no backfill).** When keys are absent, reconstruct the pairing
+  from the materialization order (position within the per-`(agent, mcpId)` sequence)
+  so the two representations of one requirement **join** rather than double-count.
+
+The result is **exactly one `admitMcpRequirement` call per logical requirement** for
+both keyed and current-shape data, asserted by **a fixture matching today's persisted
+JSON** (raw `mcpRequirements` with no key/index + derived `mcpGrants` with no key →
+one decision each, no doubling) and by a test with **two same-agent/same-MCP
+requirements carrying different prohibitions and fallbacks**, which must produce two
+distinct decisions with neither prohibition nor fallback lost.
 
 **Preview parity of deny-wins scope.** The design-stage adapter
 (`deriveMcpGrantDecisions` / `validateMcpExecutionDesign`) must partition the
@@ -511,7 +563,7 @@ export type McpWorkPackageAdmission = {
 
 export function admitWorkPackageMcp(input: {
   entries: Array<Record<string, unknown>>       // brokerEntries(): mcpRequirements ∪ metadata.mcpGrants
-  subtasks: Array<Record<string, unknown>>      // metadata.mcpAwareSubtasks; each MUST carry `subtaskId` + `agent` + `mcpId` (retained by mcpSubtasksForAgent — it currently strips `agent`; `mcpId` is needed to classify the subtask capability and resolve its deliveryKind)
+  subtasks: Array<Record<string, unknown>>      // metadata.mcpAwareSubtasks; each carries `subtaskId` + `agent` + the EXISTING flat `mcpCapabilities[]` (retained by mcpSubtasksForAgent — it currently strips `agent`). No singleton `mcpId`: `mcpCapabilities[]` can span multiple MCPs, so the owning MCP is derived+validated PER capability from its namespace (see step 5)
   label: string
   statusFor: (mcpId: string) => ProjectMcpStatus | null   // may return null (unconfigured/unknown MCP)
   effectiveGrantFor: (mcpId: string) => EffectiveGrantState   // closes over readEffectiveGrantState(pkg, project, requiredCapabilities(mcpId))
@@ -531,27 +583,38 @@ sets, both minus the prohibition set:
   - `planningContextCoverageKeys` — canonical `(agent, capability)` keys from
     decisions admitted as planning context (`planning_only` /
     `planning_context_only`, e.g. a materialized `github.*.read` requirement);
-(5) produce a **total** per-subtask decision, keyed by the subtask's own **`agent`**
-and **`mcpId`** (both come from the persisted `mcpAwareSubtask`; `admitWorkPackageMcp`
-has no separate package-agent input, and `mcpSubtasksForAgent` must therefore stop
-stripping `agent`/`mcpId` — see S4 / the consolidation map). `classifyCapability(mcpId,
-capability)` and `mcpDeliveryKind(mcpId)` both use that `mcpId`; a subtask capability
-whose namespace disagrees with its declared `mcpId` classifies `unknown`. Every
-capability class has a defined outcome (no branch falls through):
-  - unknown MCP or class `unknown` → `blocked`, `revise_plan`;
-  - class `deferred_live_mcp` → `blocked`, `revise_plan`;
-  - class `planning_only` (e.g. a `filesystem.project.write` subtask hint) →
-    `allowed`, **no coverage required** — it is a planning-only instruction, never a
-    grant, so it is admitted without appearing in either coverage set;
-  - class `bounded_read_only`, `deliveryKind === 'bounded_context_packet'` → must be
-    in `boundedCoverageKeys`, else `blocked`, `approve_project_filesystem_context`;
-  - class `bounded_read_only`, `deliveryKind === 'planning_context_only'` → must be
-    in `planningContextCoverageKeys` **for the same agent** (so a safe `github.*.read`
-    subtask is accepted when its matching requirement was admitted as planning
-    context, instead of being rejected for lacking a bounded grant), else `blocked`,
-    `revise_plan`.
+(5) produce a **total** per-subtask-**capability** decision. A subtask's persisted
+`mcpAwareSubtask` carries a **flat `mcpCapabilities[]` that can span more than one
+MCP**, so there is no single subtask `mcpId`: for each capability the owning MCP is
+**derived from the capability's own namespace and validated** (as the current broker
+does at `mcp-execution-design.ts:697-721`) — `mcpId = namespaceOf(capability)`; if
+that namespace is not a known MCP the capability is `unknown`. `mcpSubtasksForAgent`
+therefore only needs to retain `agent` (currently stripped) alongside the existing
+`subtaskId` + `mcpCapabilities[]`; no producer/parser/reader (`McpAwareSubtask`,
+`normalizeSubtask`, the Architect fence, the metadata reader) schema change is
+required. Each `(subtaskId, agent, mcpId, capability)` row is decided in this order —
+**deny-wins is checked first, before any class-specific branch**:
+  - **`coverageKeysForProhibition(capability)` intersects `packageProhibitedKeys`
+    → `blocked`, `revise_plan`, unconditionally** (a package that prohibits
+    `filesystem.project.write` must block a subtask requesting it — the planning-only
+    shortcut below can never re-admit a package-prohibited capability);
+  - else classify with `classifyCapability(mcpId, capability)` and
+    `mcpDeliveryKind(mcpId)`:
+    - unknown MCP or class `unknown` → `blocked`, `revise_plan`;
+    - class `deferred_live_mcp` → `blocked`, `revise_plan`;
+    - class `planning_only` (e.g. a `filesystem.project.write` subtask hint that is
+      **not** package-prohibited) → `allowed`, **no coverage required** — a
+      planning-only instruction, never a grant, admitted without appearing in either
+      coverage set;
+    - class `bounded_read_only`, `deliveryKind === 'bounded_context_packet'` → must be
+      in `boundedCoverageKeys`, else `blocked`, `approve_project_filesystem_context`;
+    - class `bounded_read_only`, `deliveryKind === 'planning_context_only'` → must be
+      in `planningContextCoverageKeys` **for the same agent** (so a safe `github.*.read`
+      subtask is accepted when its matching requirement was admitted as planning
+      context, instead of being rejected for lacking a bounded grant), else `blocked`,
+      `revise_plan`.
 
-  Each result is recorded in `subtaskDecisions` (which retains `agent` + `mcpId`), so a
+  Each result is recorded in `subtaskDecisions` (which retains `agent` + the derived `mcpId`), so a
   planning-only subtask and a same-agent planning-context subtask are both tested.
   (6) fold everything into `aggregate`. This is the canonical evaluation consumed by
 preview, approval, and handoff.
@@ -565,10 +628,23 @@ and existing readers do not change shape — they are only *extended*:
 - `admissionToValidation(admission): McpExecutionValidation` — uses
   `referencedHealth` for the aggregate health array.
 - `admissionToGrantPreview(admission): McpGrantDecisions` — keeps `requirementKey`,
-  `decisionId`, `sourceRequirementIndex`, assignment, fallback, raw `health`,
+  `decisionId`, `sourceRequirementIndex`, assignment, fallback,
   `promptOverlayPresent`; **adds** `mode`, `recoveryAction`,
   `normalizedCapabilities`, `capabilityClasses`, `evidenceRefs`, and a canonical
   `admissionStatus: McpAdmissionStatus` (`allowed | warning | blocked`).
+  **Health-shape compatibility.** The legacy `McpGrantDecisions.health` and its
+  metadata reader require `installState`, `status`, `enabled`, `error` — but the
+  versioned `McpHealthSnapshot`'s `observed:false` arm has none of them. So the
+  adapter does **not** copy the observation object into `health` verbatim; it
+  **projects** it into the legacy shape: `observed:true` → the four fields
+  verbatim; `observed:false` → explicit unknown sentinels
+  (`{installState:'unknown', status:'unknown', enabled:false, error:null}`). The
+  versioned `McpHealthSnapshot` (with its `observed` discriminant + `checkedAt`)
+  is retained separately on the evaluation envelope / `approvalHealthSnapshot`, so
+  the legacy preview shape is always fully populated **and** the honest
+  observed/absent distinction is preserved for replay. A test asserts an
+  absent-row decision yields the unknown-sentinel legacy `health` while its
+  `McpHealthSnapshot` stays `observed:false`.
   **Status compatibility.** The legacy `McpGrantDecisions.status`
   (`proposed | warning | blocked`) is preserved by the total map
   `allowed → proposed`, `warning → warning`, `blocked → blocked`, so existing
@@ -611,7 +687,7 @@ keep a **transitional re-export** until their callers migrate in the owning slic
 | `isRetryableMcpBrokerBlock` (`:90`) + `buildMcpBrokerBlockMetadata` (`blocked-handoff-retry.ts:32`) | consume `aggregate.retryable`/`primaryRecoveryAction`; **persist the full versioned `metadata.mcpBroker` here**; S5 reads it only | S2 |
 | `mcpRequirementsForAgent` (`workforce-materializer.ts`) | persists an immutable `requirementKey` (from the Architect requirement ordinal) + retains the original requirement index and `agent` on each `work_packages.mcpRequirements` entry, so Layer 3a can join collision-safely | S2 |
 | `mcpGrantsForAgent` (`workforce-materializer.ts:157`) | persists the matching `requirementKey`, `sourceRequirementIndex`, `agent`, `assignment`, `promptOverlayPresent`, plus `mode`, `recoveryAction`, `normalizedCapabilities`, `evidenceRefs` on each grant (schema bump) — not just id/mcp/caps/requirement/status/reason/fallback/health | S2 |
-| `mcpSubtasksForAgent` (`workforce-materializer.ts`) | **retains `agent`, `mcpId`** (and `subtaskId`) on each persisted `metadata.mcpAwareSubtasks` entry — currently stripped — so `admitWorkPackageMcp` can classify each subtask capability (`classifyCapability(mcpId, cap)` / `mcpDeliveryKind(mcpId)`) and match a planning-context subtask against `planningContextCoverageKeys` for the same agent | S2 |
+| `mcpSubtasksForAgent` (`workforce-materializer.ts`) | **retains `agent`** (and the existing `subtaskId` + flat `mcpCapabilities[]`) on each persisted `metadata.mcpAwareSubtasks` entry — `agent` is currently stripped. No new singleton `mcpId`: `admitWorkPackageMcp` derives+validates the owning MCP **per capability** from its namespace (`namespaceOf(cap)`), so no `McpAwareSubtask`/`normalizeSubtask`/reader schema change is needed — only the retained `agent` lets it match `planningContextCoverageKeys` for the same agent | S2 |
 | `mcpCapabilityList` (`work-package-executor.ts:1527`) | imports `mergeCapabilityFields`; executor filesystem gating uses shared `coverageKeysForGrant`/`classifyCapability` | S4 |
 | client helpers (`tasks/[id]/page.tsx:348-444`) | import shared helpers OR consume a server-computed grant-state payload; render `mode`+`recoveryAction` via `admission-copy.ts` | S5 |
 
@@ -689,19 +765,30 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   capability under each broad deferred namespace (`github.issues.reed`,
   `github.pull_requests.reed`, `github.secrets.banana`, `github.workflows.frobnicate`
   — every one must classify `unknown` and block `revise_plan`, never
-  `deferred_live_mcp`)**, a package-wide prohibition that must beat a
-  per-entry approval, MCP-aware subtasks (a bounded filesystem subtask, a
-  planning-context `github.*.read` subtask matched to its same-agent requirement, and
-  a **`planning_only` subtask (`filesystem.project.write`) admitted without
-  coverage**), a requirement expressed via each of the
+  `deferred_live_mcp`)**, a **typo-resource capability** (`github.secerts.write`,
+  `github.isssues.delete` — resource ∉ `KNOWN_GITHUB_RESOURCES`, must be `unknown`),
+  a **cross-MCP capability** (`classifyCapability('github', 'filesystem.project.write')`
+  and the mirror — namespace ≠ mcpId → `unknown`), the **three qualified/unqualified
+  filesystem read pairs** (`filesystem.read|list|search` canonicalize to
+  `filesystem.project.*` and stay `bounded_read_only` — no regression), a package-wide
+  prohibition that must beat a per-entry approval, MCP-aware subtasks (a bounded
+  filesystem subtask, a planning-context `github.*.read` subtask matched to its
+  same-agent requirement, a **`planning_only` subtask (`filesystem.project.write`)
+  admitted without coverage**, and a **package-prohibited `filesystem.project.write`
+  subtask that must stay `blocked` despite being planning-only** — deny-wins is checked
+  before the planning-only shortcut), a requirement expressed via each of the
   four capability fields, and **all three fallback actions (`continue_without_mcp`,
   `ask_user`, `block`) across deferred, unhealthy bounded-context, and missing
   bounded-context cases** (asserting `ask_user`/`block` never become non-blocking).
   Also assert **one `admitMcpRequirement` call per logical requirement** after the
   Layer 3a join, including **two same-agent/same-MCP requirements with different
   prohibitions and fallbacks** (they must stay two decisions, neither collapsed nor
-  losing its prohibition/fallback), and that an **absent-row MCP** round-trips
-  through `approvalHealthSnapshot` as `observed:false` (no synthesized timestamp).
+  losing its prohibition/fallback), a **current-shape fixture matching today's
+  persisted JSON** (keyless raw `mcpRequirements` + keyless derived `mcpGrants` → one
+  decision each, no double-count), that an **absent-row MCP** round-trips
+  through `approvalHealthSnapshot` as `observed:false` (no synthesized timestamp)
+  while its **legacy `McpGrantDecisions.health` projects the unknown sentinels**, and
+  that the whitespace normalizer maps `filesystem.project. read` → `filesystem.project.read`.
   `requiresFilesystemGrantApproval` is tested only as the *filesystem projection* of
   the same evaluation.
 
