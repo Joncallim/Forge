@@ -51,7 +51,7 @@ or prompt overlays layered onto them, not extra top-level agents.
 | Frontend | UI components, state, routing, API integration |
 | Backend | APIs, DB migrations, business logic, services |
 | QA | Test writing, coverage analysis, regression checks |
-| Review | Code review: correctness, security, performance |
+| Review | Code review through the orthogonal review protocol in `.ai/skills/orthogonal-review.md` |
 | Security | Security-sensitive review and structured findings |
 | DevOps | Docker, CI/CD, infra, deployment config |
 | Documentation | README/docs/wiki shaping and ADR polish |
@@ -77,6 +77,40 @@ are not the product source of truth for the app catalogue.
 4. **Maintain** architectural consistency across components.
 5. **Approve or reject** output; spawn rework when needed.
 
+### Default review behaviour
+
+When Jonathan or a task asks to "review", "check this", "review implementation",
+"review PR", "verify a fix", or "do another review pass", use
+`.ai/skills/orthogonal-review.md` by default.
+
+Do not perform a single generic review pass. Use full review for PR, implementation,
+merge, security, and release-readiness work. A trivial or explicitly narrow check
+may use quick review with at least two relevant independent angles and all omitted
+passes disclosed. Report evidence-backed findings with severity and
+blocking/advisory disposition, inspected scope, confidence, and unchecked areas.
+Never claim that no issues exist. Use the scoped verdict language from the skill,
+especially "No blockers found in the inspected scope" and the explicit
+"not proof of correctness" caveat.
+
+Review is read-only unless fixes are explicitly requested. Report findings before
+editing, and never use a review recommendation to bypass tests, CI, MCP/tool or
+security policy, repository-write controls, human approval, or merge authority.
+The current web executor's sole exception is persistence of an
+Architect-designated review-report artifact; that is evidence, not authorization
+to edit implementation files. A missing safe artifact path is a blocked work
+package, never a reason to invent a repository path.
+
+After fixes, first check whether prior findings were resolved, then run fresh
+orthogonal passes so the review also catches regressions introduced by the fix.
+
+The web runtime does not load `.ai/skills` into a Reviewer run. Its concise,
+self-contained default is embedded in `.codex/agents/reviewer.toml`, seeded into
+`agent_configs.systemPrompt`, and sent by the work-package executor. Repository
+defaults apply to fresh installs and explicit overwrite/reset upgrades; the normal
+`FORGE_PROMPT_UPGRADE_MODE=keep` path intentionally preserves an operator-edited
+Reviewer prompt. Existing operators must opt in by updating/resetting that prompt;
+never overwrite their customization silently.
+
 ### Workflow (target/manual path)
 
 ```
@@ -92,7 +126,7 @@ Issue / Request
 3. QA → write tests for each subtask
       │
       ▼
-4. Review → audit PRs (Security/Adversarial for high-risk changes)
+4. Review → orthogonal review protocol (Security/Adversarial for high-risk changes)
       │
       ▼
 5. PM (you) → merge or rework
