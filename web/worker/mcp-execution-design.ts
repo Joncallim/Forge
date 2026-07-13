@@ -11,7 +11,8 @@ export const SAFE_BETA_CAPABILITY_PATTERNS: Record<string, RegExp[]> = Object.fr
     mcpId,
     [
       ...entry.runtime.capabilities.map((capability) => new RegExp(`^${capability.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`)),
-      ...(SAFE_READ_SUPPLEMENT[mcpId as keyof typeof SAFE_READ_SUPPLEMENT] ?? []),
+      ...(SAFE_READ_SUPPLEMENT[mcpId as keyof typeof SAFE_READ_SUPPLEMENT] ?? [])
+        .map((pattern) => new RegExp(pattern.source, pattern.flags)),
       ...(mcpId === 'filesystem'
         ? [/^filesystem\.read$/, /^filesystem\.list$/, /^filesystem\.search$/]
         : []),

@@ -9,34 +9,45 @@ export type McpCapabilityClass =
 
 export type McpDeliveryKind = 'bounded_context_packet' | 'planning_context_only'
 
-export const SAFE_READ_SUPPLEMENT: Readonly<Record<'github' | 'filesystem', readonly RegExp[]>> = {
-  filesystem: [],
-  github: [
-    /^github\.actions\.read$/,
-    /^github\.repository\.(read|list)$/,
-    /^github\.contents\.(list|search)$/,
-  ],
-}
+const SAFE_READ_SUPPLEMENT_CAPABILITIES = Object.freeze({
+  filesystem: Object.freeze([] as string[]),
+  github: Object.freeze([
+    'github.actions.read',
+    'github.repository.read',
+    'github.repository.list',
+    'github.contents.list',
+    'github.contents.search',
+  ]),
+})
+
+export const SAFE_READ_SUPPLEMENT: Readonly<Record<'github' | 'filesystem', readonly RegExp[]>> = Object.freeze({
+  filesystem: Object.freeze([]),
+  github: Object.freeze([
+    Object.freeze(/^github\.actions\.read$/),
+    Object.freeze(/^github\.repository\.(read|list)$/),
+    Object.freeze(/^github\.contents\.(list|search)$/),
+  ]),
+})
 
 export const DEFERRED_CAPABILITY_FAMILIES: Readonly<
   Record<'github' | 'filesystem', Readonly<Record<string, readonly string[]>>>
-> = {
-  github: {
-    issues: ['write', 'create', 'update', 'delete', 'close'],
-    pull_requests: ['write', 'create', 'update', 'delete', 'merge', 'close', 'approve', 'list', 'get'],
-    contents: ['write', 'create', 'update', 'delete'],
-    repository: ['write', 'update', 'delete'],
-    actions: ['write', 'dispatch', 'cancel'],
-    branches: ['read', 'list', 'get', 'create', 'update', 'delete', 'merge'],
-    settings: ['read', 'list', 'get', 'write', 'update'],
-    secrets: ['read', 'list', 'get', 'write', 'create', 'update', 'delete', 'rotate'],
-    workflows: ['read', 'list', 'get', 'run', 'write', 'create', 'update', 'delete', 'dispatch', 'cancel'],
-  },
-  filesystem: {
-    root: ['write', 'delete', 'admin', 'move', 'create'],
-    project: ['write', 'delete', 'admin', 'move', 'create'],
-  },
-}
+> = Object.freeze({
+  github: Object.freeze({
+    issues: Object.freeze(['write', 'create', 'update', 'delete', 'close']),
+    pull_requests: Object.freeze(['write', 'create', 'update', 'delete', 'merge', 'close', 'approve', 'list', 'get']),
+    contents: Object.freeze(['write', 'create', 'update', 'delete']),
+    repository: Object.freeze(['write', 'update', 'delete']),
+    actions: Object.freeze(['write', 'dispatch', 'cancel']),
+    branches: Object.freeze(['read', 'list', 'get', 'create', 'update', 'delete', 'merge']),
+    settings: Object.freeze(['read', 'list', 'get', 'write', 'update']),
+    secrets: Object.freeze(['read', 'list', 'get', 'write', 'create', 'update', 'delete', 'rotate']),
+    workflows: Object.freeze(['read', 'list', 'get', 'run', 'write', 'create', 'update', 'delete', 'dispatch', 'cancel']),
+  }),
+  filesystem: Object.freeze({
+    root: Object.freeze(['write', 'delete', 'admin', 'move', 'create']),
+    project: Object.freeze(['write', 'delete', 'admin', 'move', 'create']),
+  }),
+})
 
 export const REQUIREMENT_CAPABILITY_FIELDS = [
   'permissions',
@@ -49,6 +60,23 @@ export function normalizeCapability(capability: string): string {
   return capability.trim().toLowerCase().replace(/\s+/g, '_')
 }
 
+const UNSAFE_CAPABILITY_TEXT = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u
+const GITHUB_CREDENTIAL_TEXT = /(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_=-]{10,})/u
+
+export function isSafeCapabilityText(value: unknown): value is string {
+  if (
+    typeof value !== 'string' ||
+    value.trim() === '' ||
+    value.length > 240 ||
+    UNSAFE_CAPABILITY_TEXT.test(value) ||
+    GITHUB_CREDENTIAL_TEXT.test(value)
+  ) {
+    return false
+  }
+  const whitespaceNormalized = value.replace(/\s+/g, ' ').trim()
+  return sanitizeMcpError(value, 240) === whitespaceNormalized
+}
+
 export function canonicalCapabilityForMcp(mcpId: string, capability: string): string {
   const normalized = normalizeCapability(capability)
   if (mcpId === 'filesystem') {
@@ -57,6 +85,21 @@ export function canonicalCapabilityForMcp(mcpId: string, capability: string): st
   }
   return normalized
 }
+
+const CLASSIFIER_SAFE_READS: Readonly<Record<'github' | 'filesystem', ReadonlySet<string>>> = Object.freeze({
+  filesystem: new Set([
+    ...MCP_CATALOG.filesystem.runtime.capabilities.map((capability) =>
+      canonicalCapabilityForMcp('filesystem', capability),
+    ),
+    ...SAFE_READ_SUPPLEMENT_CAPABILITIES.filesystem,
+  ]),
+  github: new Set([
+    ...MCP_CATALOG.github.runtime.capabilities.map((capability) =>
+      canonicalCapabilityForMcp('github', capability),
+    ),
+    ...SAFE_READ_SUPPLEMENT_CAPABILITIES.github,
+  ]),
+})
 
 export function capabilityMcpId(capability: string): string | null {
   const normalized = normalizeCapability(capability)
@@ -84,7 +127,7 @@ export function capabilityAddress(
   return null
 }
 
-function isDeferredCapability(mcpId: string, capability: string): boolean {
+export function isDeferredCapability(mcpId: string, capability: string): boolean {
   if (!isKnownMcpId(mcpId)) return false
   const address = capabilityAddress(mcpId, capability)
   if (!address) return false
@@ -95,9 +138,7 @@ function isDeferredCapability(mcpId: string, capability: string): boolean {
 
 function isCatalogSafeRead(mcpId: string, capability: string): boolean {
   if (!isKnownMcpId(mcpId)) return false
-  const catalogCapabilities = MCP_CATALOG[mcpId].runtime.capabilities
-  if (catalogCapabilities.some((candidate) => canonicalCapabilityForMcp(mcpId, candidate) === capability)) return true
-  return SAFE_READ_SUPPLEMENT[mcpId].some((pattern) => pattern.test(capability))
+  return CLASSIFIER_SAFE_READS[mcpId].has(capability)
 }
 
 export function classifyCapability(mcpId: string, capability: string): McpCapabilityClass {
@@ -148,10 +189,11 @@ export function coverageKeysForProhibition(capability: string): string[] {
 export function mergeCapabilityFields(entry: Record<string, unknown>): string[] {
   const merged = new Set<string>()
   for (const field of REQUIREMENT_CAPABILITY_FIELDS) {
+    if (!Object.hasOwn(entry, field)) continue
     const values = entry[field]
     if (!Array.isArray(values)) continue
     for (const value of values) {
-      if (typeof value !== 'string') continue
+      if (!isSafeCapabilityText(value)) continue
       const normalized = normalizeCapability(value)
       if (normalized) merged.add(normalized)
     }
@@ -186,6 +228,7 @@ export function sanitizeMcpError(value: unknown, maxLength = 240): string {
     .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, ' ')
     .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/:@]+:[^\s/@]+@/gi, '$1[redacted]@')
     .replace(/\b(?:basic|bearer)\s+[^\s,;]+/gi, '[redacted]')
+    .replace(/\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_=-]{10,})\b/g, '[redacted]')
     .replace(/\bsk-[a-z0-9_-]{8,}\b/gi, '[redacted]')
     .replace(
       /\b(api[ _-]?key|access[ _-]?token|auth(?:entication|orization)?[ _-]?token|authorization|client[ _-]?secret|password|passwd|pwd|secret|private[ _-]?key)\b(["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/gi,

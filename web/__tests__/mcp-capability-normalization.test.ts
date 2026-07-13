@@ -3,6 +3,7 @@ import { MCP_CATALOG } from '@/lib/mcps/catalog'
 import { SAFE_BETA_CAPABILITY_PATTERNS } from '@/worker/mcp-execution-design'
 import {
   DEFERRED_CAPABILITY_FAMILIES,
+  SAFE_READ_SUPPLEMENT,
   assertSafeCatalogCapabilities,
   canonicalCapabilityForMcp,
   capabilityAddress,
@@ -10,9 +11,11 @@ import {
   classifyCapability,
   coverageKeysForGrant,
   coverageKeysForProhibition,
+  isDeferredCapability,
   mcpDeliveryKind,
   mergeCapabilityFields,
   normalizeCapability,
+  sanitizeMcpError,
 } from '@/lib/mcps/capability-normalization'
 
 describe('MCP capability normalization', () => {
@@ -68,6 +71,15 @@ describe('MCP capability normalization', () => {
     ['github', 'filesystem.project.write', 'unknown'],
     ['slack', 'slack.messages.read', 'unknown'],
     ['github', 'github.issues. read', 'unknown'],
+    ['github', 'github..read', 'unknown'],
+    ['github', 'github.pull_requests. read', 'unknown'],
+    ['github', 'github.pull requests.read', 'bounded_read_only'],
+    ['github', 'github.prototype.write', 'unknown'],
+    ['github', 'github.hasOwnProperty.write', 'unknown'],
+    ['github', ' unknown.read ', 'unknown'],
+    ['github', 'github.filesystem.read', 'unknown'],
+    ['github', 'filesystem.project.read', 'unknown'],
+    ['filesystem', ' FILESYSTEM.READ ', 'bounded_read_only'],
     ['github', '', 'unknown'],
   ] as const)('classifies %s / %s as %s', (mcpId, capability, expected) => {
     expect(classifyCapability(mcpId, capability)).toBe(expected)
@@ -87,7 +99,7 @@ describe('MCP capability normalization', () => {
     }
   })
 
-  it.each(['constructor', '__proto__', 'toString'])('fails closed for prototype resource %s without throwing', (resource) => {
+  it.each(['constructor', '__proto__', 'prototype', 'hasOwnProperty', 'toString'])('fails closed for prototype resource %s without throwing', (resource) => {
     expect(() => classifyCapability('github', `github.${resource}.write`)).not.toThrow()
     expect(classifyCapability('github', `github.${resource}.write`)).toBe('unknown')
   })
@@ -124,8 +136,47 @@ describe('MCP capability normalization', () => {
     ])
   })
 
+  it('does not merge inherited capability policy fields', () => {
+    const inherited = Object.create({ capabilities: ['github.issues.read'] }) as Record<string, unknown>
+    expect(mergeCapabilityFields(inherited)).toEqual([])
+  })
+
   it('accepts the checked-in safe catalog', () => {
     expect(() => assertSafeCatalogCapabilities()).not.toThrow()
+  })
+
+  it('exports deferred classification and freezes the policy registries at runtime', () => {
+    expect(isDeferredCapability('github', 'github.pull_requests.merge')).toBe(true)
+    expect(isDeferredCapability('github', 'github.issues.read')).toBe(false)
+    expect(Object.isFrozen(DEFERRED_CAPABILITY_FAMILIES)).toBe(true)
+    expect(Object.isFrozen(DEFERRED_CAPABILITY_FAMILIES.github)).toBe(true)
+    expect(Object.isFrozen(DEFERRED_CAPABILITY_FAMILIES.github.issues)).toBe(true)
+    expect(Object.isFrozen(SAFE_READ_SUPPLEMENT)).toBe(true)
+    expect(Object.isFrozen(SAFE_READ_SUPPLEMENT.github)).toBe(true)
+    expect(() => (DEFERRED_CAPABILITY_FAMILIES.github.issues as unknown as string[]).push('execute')).toThrow()
+    expect(() => (SAFE_READ_SUPPLEMENT.github as unknown as RegExp[]).push(/^github\.issues\.write$/)).toThrow()
+  })
+
+  it('keeps safe-read compatibility negative for deferred and malformed capabilities', () => {
+    for (const capability of [
+      'github.pull_requests.write',
+      'github.pull_requests.merge',
+      'github.issues.execute',
+      'github.constructor.read',
+      'github.pull requests.read',
+    ]) {
+      expect(SAFE_BETA_CAPABILITY_PATTERNS.github.some((pattern) => pattern.test(capability)), capability).toBe(false)
+    }
+  })
+
+  it('redacts known GitHub token forms', () => {
+    const sanitized = sanitizeMcpError(
+      `probe ghp_${'a'.repeat(40)} github_pat_${'b'.repeat(82)} failed`,
+      500,
+    )
+    expect(sanitized).not.toContain('ghp_')
+    expect(sanitized).not.toContain('github_pat_')
+    expect(sanitized.match(/\[redacted\]/g)).toHaveLength(2)
   })
 
   it('rejects unsafe catalog verbs and deferred overlap', () => {
@@ -142,6 +193,31 @@ describe('MCP capability normalization', () => {
       expect(classifyCapability('github', 'github.pull_requests.write')).toBe('deferred_live_mcp')
     } finally {
       MCP_CATALOG.github.runtime.capabilities.pop()
+    }
+  })
+
+  it('keeps classifier authority private from catalog and compatibility-regex mutation', () => {
+    MCP_CATALOG.github.runtime.capabilities.push('github.widgets.read')
+    try {
+      expect(classifyCapability('github', 'github.widgets.read')).toBe('unknown')
+    } finally {
+      MCP_CATALOG.github.runtime.capabilities.pop()
+    }
+
+    const compatibilityPattern = SAFE_BETA_CAPABILITY_PATTERNS.github.find(
+      (pattern) => pattern.source === '^github\\.actions\\.read$',
+    )
+    expect(compatibilityPattern).toBeDefined()
+    const originalSource = compatibilityPattern?.source ?? ''
+    const originalFlags = compatibilityPattern?.flags ?? ''
+    try {
+      compatibilityPattern?.compile('^github\\.widgets\\.read$')
+      expect(SAFE_BETA_CAPABILITY_PATTERNS.github.some((pattern) => pattern.test('github.widgets.read'))).toBe(true)
+      expect(classifyCapability('github', 'github.widgets.read')).toBe('unknown')
+      expect(classifyCapability('github', 'github.pull_requests.read')).toBe('bounded_read_only')
+      expect(isDeferredCapability('github', 'github.pull_requests.read')).toBe(false)
+    } finally {
+      compatibilityPattern?.compile(originalSource, originalFlags)
     }
   })
 
