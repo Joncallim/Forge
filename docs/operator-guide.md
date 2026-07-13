@@ -225,7 +225,16 @@ FORGE_HOST_REPOSITORY_WRITES=0
 
 With the default execution path:
 
-1. The operator approves the Architect plan.
+1. The operator approves the Architect plan. Today, approval enforces only the
+   required *filesystem* context grants; it does not yet run the full
+   MCP/capability broker, so a plan can still block later at handoff for a
+   non-filesystem MCP reason. EPIC #172 slice S2 (ADR
+   [0009](adr/0009-mcp-admission-contract.md)) makes approval run the same
+   admission check as handoff over a captured MCP health snapshot. Note that even
+   after S2, MCP health and configuration can change between approval and handoff;
+   the guarantee is only that a block already visible in the approval-time
+   snapshot is surfaced at approval instead of being missed until handoff — not
+   that an approved task can never block later.
 2. Forge releases ready work packages and runs the MCP/capability broker.
 3. Required blocked MCP/tool grants stop the package before execution. Optional
    grants can continue only when the approved fallback is non-blocking.
@@ -238,6 +247,25 @@ With the default execution path:
    `FORGE_HOST_REPOSITORY_WRITES=0` is set.
 8. QA, Reviewer, and Security gates appear when required. In this beta, those
    are manual operator decisions, not proof that separate reviewer agents ran.
+
+EPIC #172 slice S5 hardens the task detail page so each MCP request resolves to
+one of four states you can act on without reading logs (target-state UI; the
+copy/badge contract lands with S5):
+
+- **Planning context** -- the Architect only suggested an MCP; it is recorded as
+  prompt instructions and never blocks handoff. Generated file writes go through
+  the Forge sandbox/host-apply path, not a live MCP write tool.
+- **Needs project context** -- the package needs bounded read-only filesystem
+  context (`filesystem.project.read|list|search`). Approve or deny the exact
+  grant shown. Approval today holds a never-approved required grant before the
+  package runs; slice S3 extends the same held, zero-attempt treatment to an
+  explicit denial so it is recorded and held rather than burning an execution
+  attempt.
+- **MCP needs setup** -- an MCP is missing/unhealthy/unauthenticated. Use the
+  linked setup/retry action on the project MCP panel.
+- **Deferred -- beta boundary** -- the request needs a live MCP tool handle (or a
+  write/merge/admin capability). This is a product boundary, not a broken
+  install; it is deferred to a later security-reviewed slice.
 
 Operators can review:
 

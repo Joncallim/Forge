@@ -1,8 +1,13 @@
-# ADR 0007: Filesystem MCP Bounded Context Grants
+# ADR 0008: Filesystem MCP Bounded Context Grants
 
 ## Status
 
-Accepted
+Accepted. The bounded read-only filesystem grant defined here becomes one branch
+of the unified MCP admission contract in ADR
+[0009](0009-mcp-admission-contract.md) (EPIC #172): filesystem
+read/list/search map to the `bounded_read_only` capability class and the
+`bounded_context_required` / `bounded_context_approved` admission modes, and
+`filesystem.project.write` is classified `planning_only` (warn, never block).
 
 ## Context
 
