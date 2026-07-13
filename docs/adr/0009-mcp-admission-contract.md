@@ -380,6 +380,11 @@ export type McpAdmissionDecision = {
   status: McpAdmissionStatus
   reason: string
   recoveryAction?: McpRecoveryAction
+  grantState?: {
+    phase: EffectiveGrantState['phase']
+    consumed?: boolean
+    revocationReason?: string
+  }                         // present for bounded filesystem decisions; structured UI discriminator
   evidenceRefs: string[]   // PLANNED scope only pre-run (root + capability set); run evidence added later, see S4
 }
 
@@ -411,8 +416,9 @@ so the fallback matrix is total across all three fallback actions.
 1. **Unknown MCP** → `mode:'blocked'`, `status:'blocked'`, `recoveryAction:'revise_plan'`.
 2. **Any capability class `unknown`** (known MCP, unrecognized/typo capability) →
    `mode:'blocked'`, `status:'blocked'`, `recoveryAction:'revise_plan'`.
-3. **Any capability prohibited package-wide** (`normalizeCapability(cap)` ∈
-   `packageProhibitedKeys`) → `mode:'blocked'`, `status:'blocked'`,
+3. **Any capability prohibited package-wide** (`coverageKeysForProhibition(cap)`
+   intersects `packageProhibitedKeys`, the same alias-aware test used for subtasks)
+   → `mode:'blocked'`, `status:'blocked'`,
    `recoveryAction:'revise_plan'`, **unconditionally**. This is its own terminal
    outcome evaluated *before* any fallback handling: an explicit package prohibition
    is deny-wins and can **never** be downgraded to a warning by `optional` /
@@ -435,7 +441,11 @@ so the fallback matrix is total across all three fallback actions.
      handoff gate must HOLD, see S3).
    - `effectiveGrant.phase === 'revoked'` & blocking → `mode:'bounded_context_required'`,
      `status:'blocked'`, `recoveryAction:'approve_project_filesystem_context'`, and
-     the `reason` carries `revocationReason` (distinct "context removed" copy, S5).
+     `grantState:{phase:'revoked',revocationReason}` is persisted (distinct
+     "context removed" copy, S5). First-time and denied branches likewise persist
+     `grantState.phase`; an approved but consumed one-time grant persists
+     `{phase:'approved',consumed:true}` and follows the uncovered branch. Human
+     `reason` remains explanatory text, not a UI discriminator.
    - otherwise not covered → `mode:'bounded_context_required'`; `status:'warning'`
      iff `canProceed`, else `status:'blocked'`;
      `recoveryAction:'approve_project_filesystem_context'`.
@@ -519,10 +529,15 @@ the design is persisted or materialized. The persisted normalized entry is
 package-level rendering assembled from those entries for executor compatibility,
 but it is **not** evidence that every same-agent requirement has context.
 `promptOverlayPresent` is computed separately for each grant by exact
-`requirementKey` membership. `mcpAwareSubtasks` likewise persists the matching
-`requirementKey` for every capability-bearing subtask; an ambiguous subtask that
-could match more than one same-agent/same-MCP requirement fails closed with
-`revise_plan` until the Architect supplies `sourceRequirementIndex`.
+`requirementKey` membership. Raw `mcpAwareSubtasks` keep their flat
+`mcpCapabilities[]` for compatibility and add parallel
+`capabilityRequirements: Array<{capability:string; sourceRequirementIndex:number}>`.
+Normalization validates every pair and persists
+`capabilityBindings: Array<{capability:string; requirementKey:string}>`, so one
+multi-MCP subtask can bind each capability to a different requirement. A legacy
+subtask may infer a binding only when exactly one same-agent/same-MCP requirement
+matches that capability; any missing, duplicate, or conflicting binding fails
+closed with `revise_plan`.
 
 For a legacy fence that has only `promptOverlays: Record<agent,string>`, the
 adapter may associate that overlay only when the agent has exactly one
@@ -595,12 +610,14 @@ export type McpHealthSnapshot =
       status: string; enabled: boolean; error: string | null; checkedAt: string }
   | { schemaVersion: 1; observed: false; mcpId: string; installState: 'unknown';
       status: 'unknown'; enabled: false; error: null; checkedAt: null }
+```
 
 The unavailable arm deliberately retains the four legacy preview-health fields.
 `admissionToGrantPreview` therefore extends the existing JSON with
 `schemaVersion`/`observed`/`mcpId`/`checkedAt`; it never removes fields that
 `McpGrantDecisions.health` and `execution-design-metadata.ts` already require.
 
+```ts
 export type McpAdmissionEvaluation = {
   decision: McpAdmissionDecision
   source: {                                   // retained so adapters are shape-preserving
@@ -617,8 +634,10 @@ export type McpAdmissionEvaluation = {
 export type McpWorkPackageAdmission = {
   schemaVersion: 2
   evaluations: McpAdmissionEvaluation[]
-  subtaskDecisions: Array<{ subtaskId: string; agent: string; mcpId: string; capability: string;
-    class: McpCapabilityClass; status: McpAdmissionStatus; reason: string; recoveryAction?: McpRecoveryAction }>
+  subtaskDecisions: Array<{ subtaskId: string; agent: string; requirementKey: string;
+    mcpId: string; capability: string; class: McpCapabilityClass;
+    deliveryKind: McpDeliveryKind | null; status: McpAdmissionStatus; reason: string;
+    recoveryAction?: McpRecoveryAction }>
   referencedHealth: McpExecutionValidation['health']   // aggregate health array validation needs
   aggregate: {
     status: 'allowed' | 'warning' | 'blocked'   // singular `warning`; the broker adapter maps it to plural `warnings`
@@ -665,7 +684,7 @@ sets, both minus the prohibition set:
     `mode:'bounded_context_approved'` **and `status:'allowed'` after the health
     overlay** (an unhealthy optional warning did not deliver a packet and grants no
     subtask coverage);
-  - `planningContextCoverageKeys` — canonical `(agent, capability)` keys from
+  - `planningContextCoverageKeys` — canonical `(requirementKey, agent, capability)` keys from
     planning-context decisions only when `status:'allowed'` and the matching
     requirement's prompt context was actually materialized (a missing-context
     optional warning grants no subtask coverage);
@@ -689,7 +708,9 @@ remaining capability class has a defined outcome (no branch falls through):
   - class `bounded_read_only`, `deliveryKind === 'bounded_context_packet'` → must be
     in `boundedCoverageKeys`, else `blocked`, `approve_project_filesystem_context`;
   - class `bounded_read_only`, `deliveryKind === 'planning_context_only'` → must be
-    in `planningContextCoverageKeys` **for the same agent** (so a safe `github.*.read`
+    in `planningContextCoverageKeys` **for the bound requirementKey and same agent**
+    (so context from one same-agent/same-capability requirement cannot authorize a
+    subtask explicitly bound to another context-missing requirement; a safe `github.*.read`
     subtask is accepted when its matching requirement was admitted as planning
     context, instead of being rejected for lacking a bounded grant), else `blocked`,
     `revise_plan`.
@@ -755,8 +776,8 @@ keep a **transitional re-export** until their callers migrate in the owning slic
 | `readEffectiveGrantState` (`EffectiveGrantState` reader) | **canonical home is `web/lib/mcps/admission.ts` (Layer 1), created and owned by S1.** S3's `filesystem-grants.ts` imports it (or transitional-re-exports it for existing callers); there is exactly one implementation of this policy | S1 own / S3 import |
 | `isRetryableMcpBrokerBlock` (`:90`) + `buildMcpBrokerBlockMetadata` (`blocked-handoff-retry.ts:32`) | consume `aggregate.retryable`/`primaryRecoveryAction`; **persist the full versioned `metadata.mcpBroker` here**; S5 reads it only | S2 |
 | `normalizeDesign` + `mcpRequirementsForAgent` | `normalizeDesign` assigns/persists a versioned canonical-payload digest `requirementKey` (with duplicate occurrence suffix; not an Architect-supplied key or bare array index), converts validated `requirementContexts[].sourceRequirementIndex` references to that key, and fails closed on ambiguous legacy agent overlays. The materializer preserves the key plus source index and `agent`, so Layer 3a can join collision-safely across reorderings | S2 |
-| `mcpGrantsForAgent` (`workforce-materializer.ts:157`) | persists the matching `requirementKey`, `sourceRequirementIndex`, `agent`, `assignment`, `promptOverlayPresent`, plus `mode`, `recoveryAction`, `normalizedCapabilities`, `evidenceRefs` on each grant (schema bump) — not just id/mcp/caps/requirement/status/reason/fallback/health | S2 |
-| `mcpSubtasksForAgent` (`workforce-materializer.ts`) | retains the existing `id`, `agent`, and flat `mcpCapabilities[]`, plus the normalized `requirementKey`, on each persisted `metadata.mcpAwareSubtasks` entry (currently `agent` is stripped). Shared `capabilityMcpId` derives the MCP independently for each capability, so one subtask can safely span several MCPs without a synthetic singleton `mcpId`; ambiguous same-MCP association blocks | S2 |
+| `mcpGrantsForAgent` (`workforce-materializer.ts:157`) | persists the matching `requirementKey`, `sourceRequirementIndex`, `agent`, `assignment`, `promptOverlayPresent`, plus `mode`, `recoveryAction`, structured `grantState`, `normalizedCapabilities`, `evidenceRefs` on each grant (schema bump) — not just id/mcp/caps/requirement/status/reason/fallback/health | S2 |
+| `mcpSubtasksForAgent` (`workforce-materializer.ts`) | retains the existing `id`, `agent`, and flat `mcpCapabilities[]`, plus normalized per-capability `capabilityBindings[{capability,requirementKey}]`, on each persisted `metadata.mcpAwareSubtasks` entry (currently `agent` is stripped). Shared `capabilityMcpId` derives the MCP independently for each capability, so one subtask can safely span several MCPs without a synthetic singleton `mcpId`; missing/ambiguous/conflicting bindings block | S2 |
 | `mcpCapabilityList` (`work-package-executor.ts:1527`) | imports `mergeCapabilityFields`; executor filesystem gating uses shared `coverageKeysForGrant`/`classifyCapability` | S4 |
 | client helpers (`tasks/[id]/page.tsx:348-444`) | import shared helpers OR consume a server-computed grant-state payload; render `mode`+`recoveryAction` via `admission-copy.ts` | S5 |
 
@@ -796,8 +817,12 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   acquire the MCP health snapshot via `getProjectMcpOverview(project)` **before**
   and **outside** the status-flip `db.transaction` (it performs live checks and
   writes cached `ProjectMcpStatus` rows — it must not run inside the transaction
-  that flips the task to `approved`). Run `admitWorkPackageMcp` over every package
-  using that snapshot; if any `aggregate.status === 'blocked'`, return the same
+  that flips the task to `approved`). Inside the transaction, lock and freshly read
+  the project first (`FOR UPDATE`, freshly reading `mcpConfig`), then the task
+  (`FOR UPDATE`, requiring `awaiting_approval`), then its work
+  packages `FOR UPDATE` in ascending ID order. Run `admitWorkPackageMcp` **inside
+  that transaction** over those locked rows using the captured health snapshot;
+  do not evaluate an earlier package object. If any `aggregate.status === 'blocked'`, return the same
   409 shape as the existing `missingFilesystemGrant` early return (`:199-209,280`)
   with the normalized `reason` + `primaryRecoveryAction`. **Persist the exact
   health snapshot** the approval decision consumed — a versioned
@@ -811,7 +836,11 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   rows change; the per-MCP `checkedAt` (or explicit `null`) is required. Add an
   assertion that the persisted snapshot equals the health inputs passed to
   `admitWorkPackageMcp` — including that absent-row MCPs round-trip as
-  `observed:false`, not as an invented snapshot.
+  `observed:false`, not as an invented snapshot. A concurrency test pauses after
+  health capture, commits a requirements/metadata or project-grant rewrite, then proves approval
+  locks/re-reads and evaluates the new policy (or loses a version compare-and-set)
+  rather than approving stale policy. Health or grant drift after approval remains
+  the separately documented handoff case.
 - **Broker-block persistence is owned entirely by S2.** The complete, versioned
   `metadata.mcpBroker` producer lives here: `buildMcpBrokerBlockMetadata`
   (`blocked-handoff-retry.ts:32`) persists `{schemaVersion, status:'blocked',
@@ -907,9 +936,9 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   transaction by selecting the project row `FOR UPDATE`, then derive `nextMcpConfig`
   from that locked, freshly read value. They must not compute a full replacement
   from the project object fetched for authorization before the transaction. The
-  reconciliation routine then selects candidate work packages `FOR UPDATE` in
-  ascending `work_packages.id` order. All callers use the same project-then-package
-  lock order. Package updates use `jsonb_set`/`#-` only for the owned
+  reconciliation routine then locks affected tasks `FOR UPDATE` in ascending ID
+  order and candidate work packages `FOR UPDATE` in ascending ID order. All callers
+  use the same global project-then-task-then-package lock order. Package updates use `jsonb_set`/`#-` only for the owned
   `mcpGrantPhases` and `mcpGrantBlock` paths (or an `updatedAt` compare-and-set and
   retry); they never replace `metadata` from a stale JavaScript spread. This
   preserves concurrent broker, lease, audit, and evidence fields. Add two
@@ -941,10 +970,20 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
 
 ### S4 — Prompt/context assembly and bounded-context packet evidence (builds on #43)
 
-- Specialist prompts receive the admitted `promptOverlay` + `mcpAwareSubtasks` +
-  safe/planning `mcpRequirements` subset as **instructions**, never as tool grants (executor prompt
+- Specialist prompts receive only context whose owning decision either has
+  `status:'allowed'` and mode `planning_only|bounded_context_approved`, or is the
+  explicit pure-planning exception: `status:'warning'`, mode `planning_only`,
+  `capabilityClasses.length > 0`, and **every** capability class `planning_only` (for example
+  `filesystem.project.write`, which is an instruction for Forge's sandbox JSON
+  path, not permission). No missing-context, unhealthy, deferred, unknown, or mixed
+  warning qualifies:
+  requirement-scoped `promptOverlay` entries, admitted `mcpAwareSubtasks`, and the
+  matching safe/planning `mcpRequirements` subset as **instructions**, never as tool grants (executor prompt
   assembly around `work-package-executor.ts:1527-1583`). No live MCP handle is
-  ever issued.
+  ever issued. A subtask is emitted only when **every** per-capability binding is
+  eligible; if one binding is deferred, unknown, blocked, or otherwise
+  non-deliverable, omit the entire Architect-authored subtask text so a mixed
+  subtask cannot smuggle the disallowed instruction through an allowed binding.
 - **Security boundary: MCP-channel admission is not an ACP sandbox.** An Agent
   Client Protocol (ACP) adapter is a local process and Forge explicitly does not
   OS-confine it (`FORGE_ACP_WORK_PACKAGE_EXECUTION=1` is operator acceptance of
@@ -953,14 +992,85 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   Therefore `deferred_live_mcp`, “no live MCP handle”, and the S5 badges describe
   only capabilities issued through Forge's MCP channel; they must not claim that
   the worker is unable to perform an equivalent operation by another runtime
-  tool. S4 strips deferred/unknown capability details from the executable MCP
-  instruction block (retaining only a plain boundary warning), and S5 displays
+  tool. S4 omits the complete Architect-authored overlay, subtask, and requirement
+  text for every deferred, unknown, blocked, or non-deliverable warning decision—not only its
+  structured capability name—from the executable prompt (retaining only a static,
+  Forge-authored boundary warning), and S5 displays
   “MCP access deferred — ACP runtimes are not a security sandbox” wherever ACP
   execution is enabled. Real process/network/credential/filesystem isolation is a
   prerequisite of any later security-bound capability guarantee and remains in
   the #40/#60 security epic. Tests prove that no deferred tool is issued or
-  rendered as an allowed MCP instruction; they do not mislabel prompt compliance
+  rendered as an allowed MCP instruction. A positive fixture proves a pure
+  `filesystem.project.write` planning hint still reaches the prompt. An adversarial fixture uses optional
+  `github.pull_requests.merge` + `continue_without_mcp` with an overlay that says to
+  merge through `gh`; the executable prompt contains the static warning but none
+  of that overlay/subtask/requirement text. Tests do not mislabel prompt compliance
   as OS-level enforcement.
+- **Prompt-injection boundary.** Forge's immutable system message states that
+  bounded packet contents are untrusted data and that requirement overlays are
+  subordinate run instructions; neither can override tool, credential, repository,
+  or admission policy. Serialize each section as length-bounded JSON with explicit
+  `{kind, requirementKey, content}` fields rather than concatenating raw delimiter
+  text; reject/escape invalid encoding and truncate only at documented boundaries.
+  Re-assert the immutable policy after the serialized context. Adversarial tests
+  include a repository file and an allowed overlay containing fake system markers,
+  closing fences, and instructions to use `gh`/read credentials; the bytes remain
+  quoted data and do not alter the issued tool surface or policy section.
+- **Atomic one-time issuance claim.** Every operator approval generates a new
+  immutable `grantDecisionNonce` (UUID) even though the existing
+  `filesystem_mcp_grant_approvals` row is upserted by `work_package_id`; persist the
+  nonce in the approval row and effective-grant snapshot. Reapproval must replace
+  the nonce, so it represents a new issuable decision without reusing the burned
+  issuance key. Before assembling or exposing a packet for an `allow_once` grant,
+  S4 follows the global lock order—project, task, work package, grant approval,
+  then audit claim—verifies the effective grant and nonce are still
+  approved/unconsumed, inserts a `filesystem_mcp_runtime_audits` claim keyed
+  uniquely by `(grantApprovalId, grantDecisionNonce)` for
+  `operation:'context_packet'`, and marks the grant consumed with an approved-state
+  compare-and-set. Add the matching partial unique index in the SQL migration and
+  `web/db/schema.ts`. Grant/reapproval endpoints use the identical lock order before
+  rotating the nonce. Only the winning claim may assemble/deliver the packet;
+  duplicate cooperative workers block before reading packet contents. The hard
+  guarantee is one winning claim per decision nonce: a crash after the claim burns
+  that nonce, records the audit as failed on recovery, and requires explicit
+  reapproval. Claims persist `{status:'claiming', claimToken,
+  claimedByAgentRunId, leaseExpiresAt}`. S4 owns
+  `reconcileStaleFilesystemIssuanceClaims(now)`, invoked at worker startup and by
+  the periodic recovery sweep; it locks expired `claiming` rows with `FOR UPDATE
+  SKIP LOCKED`, marks them `failed` with a crash/lease-expired reason, and never
+  reopens the same nonce. `claimToken` is a fencing token, not audit decoration:
+  the owner heartbeats/renews the lease with an ownership compare-and-set during
+  assembly; immediately before every packet-content read, prompt exposure/submission,
+  and finalization it must atomically verify
+  `(status='claiming', claimToken, claimedByAgentRunId, leaseExpiresAt > now)`.
+  Finalization also compares that tuple. The reconciler's `claiming → failed`
+  transition invalidates the token, so an expired/stale worker cannot begin a new
+  Forge-governed read or persist/finalize after recovery. This is database/audit
+  fencing, not revocation of bytes already in process memory or cancellation of an
+  in-flight ACP submission: a lease can expire after the final check and external
+  I/O is not atomic with PostgreSQL. The beta therefore promises one winning claim
+  and best-effort at-most-once delivery by cooperative workers, not cryptographic
+  exactly-once disclosure. Hard revocation/idempotent external submission requires
+  a cancellable fenced delivery broker in the later #40/#60 security epic, and UI/
+  operator copy must preserve this boundary. Immediately after assembly and **before any exposure**,
+  the owner CAS-persists the immutable packet metadata snapshot on the audit claim
+  under the fencing token. That snapshot is a discriminated union:
+  `{packetAssembled:true, root, includedCount, byteCount, omittedCount,
+  redactionSummary}` or, when assembly never completed,
+  `{packetAssembled:false, failureStage, reason}`. Recovery/finalization upserts the
+  run artifact from this durable snapshot; it never re-reads or reassembles a burned
+  one-time packet and never invents zero counts. A crash after assembly but before
+  artifact creation therefore still produces truthful failed-run evidence, while a
+  pre-assembly crash is explicitly represented as no packet assembled. A later explicit approval rotates the nonce and creates a
+  new claim. The packet-metadata artifact upsert is tied to the winning
+  `agentRunId`; success and failure finalization are idempotent. Tests race two
+  workers, race claim versus reapproval, race a delayed live worker against lease
+  expiry/reconciliation, restart after an expired claim, and inject failures before assembly, after
+  assembly, and after prompt submission, proving one claim/packet per decision nonce
+  at most, successful explicit reapproval with a fresh nonce, no deadlock, and an
+  auditable recovery state. The delayed-worker test asserts that a stale token
+  cannot start a subsequent governed read or write/finalize state; it does not make
+  the unrealizable claim that PostgreSQL can recall an already-started ACP request.
 - **Evidence lifecycle — planned scope vs issued evidence.** Pre-run,
   `McpAdmissionDecision.evidenceRefs` carries only *planned scope* (root path +
   capability set), never file contents. The bounded read-only context packet is
@@ -968,13 +1078,24 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   **failed** runs) insert exactly one idempotent `artifacts` row for the attempt:
   `artifactType:'mcp_bounded_context_packet_metadata'`, linked by
   `artifacts.agentRunId`, with `content` containing the versioned, human-readable
-  metadata summary and `metadata` containing `{schemaVersion:1, workPackageId,
-  root, selectedFileNames, includedCount, omittedCount, redactionSummary}`.
+  metadata summary and `metadata` containing the staged discriminated union plus
+  `{schemaVersion:1, workPackageId}`: assembled runs carry
+  `{packetAssembled:true,root,includedCount,byteCount,omittedCount,redactionSummary}`;
+  pre-assembly failures carry `{packetAssembled:false,failureStage,reason}`.
   `(agentRunId, artifactType)` is the stable lookup contract; retry/upsert behavior
-  must not create duplicates for one run. S5 queries this artifact relationship
-  directly—no `agent_runs` metadata column or migration is introduced. The artifact
-  contains packet **metadata** only (root, selected file names, included/omitted counts,
-  redaction summary — per ADR 0008, which forbids persisting raw file contents).
+  must not create duplicates for one run. S4 owns a database migration adding a
+  partial unique index on `(agent_run_id, artifact_type)` where
+  `artifact_type = 'mcp_bounded_context_packet_metadata'`; this preserves existing
+  artifact types that legitimately have multiple rows per run. The writer uses a
+  conflict-safe insert/upsert whose PostgreSQL/Drizzle conflict target repeats the
+  matching partial-index predicate (`targetWhere` or equivalent), and
+  `web/db/schema.ts` declares the same partial unique index. A concurrent-finalizer
+  test proves one row survives. S5 queries this artifact relationship directly—no
+  `agent_runs` metadata column or migration is introduced. The artifact
+  contains packet **metadata** only (root, included file count, byte count, omitted
+  count, and redaction summary—the exact ADR 0008 audit vocabulary). File names and
+  relative/absolute paths are not persisted because they can disclose sensitive
+  structure even without contents.
   **File contents stay prompt-only and are not persisted**; "selected excerpts" are
   not written to an inspectable artifact. `mcpCapabilityList` imports
   `mergeCapabilityFields`; executor filesystem gating uses shared
@@ -985,11 +1106,16 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
 ### S5 — UI and copy hardening
 
 - New `web/lib/mcps/admission-copy.ts`: pure map from `mode`+`recoveryAction`+
-  `status` → `{ statusKey, badgeText, headline, body, cta? }`. Every surface reads
+  `status`+structured `grantState` → `{ statusKey, badgeText, headline, body, cta? }`. Every surface reads
   it. Mapping:
   - `planning_only` → neutral "Planning context", no CTA.
-  - `bounded_context_required` → amber "Needs project context", CTA to the
-    package's filesystem grant control.
+  - `bounded_context_required` with `grantState.phase:'none'|'proposed'|'not_issued'`
+    → amber "Needs project context"; `phase:'denied'` → amber "Context was denied";
+    `phase:'revoked'` → amber "Project context was removed" and includes the
+    persisted `revocationReason`. All link to the package's filesystem grant control.
+    `phase:'approved'` with `consumed:true` → amber "One-time context approval was
+    already used" and the same re-approval control; an unconsumed approved grant
+    cannot reach `bounded_context_required` and is treated as invalid persisted state.
   - `bounded_context_approved` → green "Context approved".
   - `blocked`+`install_or_fix_mcp` → red, CTA deep-link
     `/dashboard/projects/{projectId}#project-mcps-heading`.
@@ -1006,7 +1132,7 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
 - Add `deferred`/`planning`/`legacy` neutral buckets to `statusBadgeClass`
   (`tasks/[id]/page.tsx:1203`).
 - Extend `execution-design-metadata.ts` decision type/normalizer to carry `mode`,
-  `recoveryAction`, `normalizedCapabilities`, `capabilityClasses`, `evidenceRefs`
+  `recoveryAction`, structured `grantState`, `normalizedCapabilities`, `capabilityClasses`, `evidenceRefs`
   (`unknown_legacy` for old artifacts).
 - Replace the status-only ternary, split planning-only warnings from degradation
   warnings, stop rendering deferred capabilities as destructive alerts, gate
