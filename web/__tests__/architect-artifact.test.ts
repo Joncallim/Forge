@@ -62,12 +62,12 @@ describe('prepareArchitectArtifact', () => {
       mcpId: 'github',
       requirement: 'required',
     })
-    expect(prepared.mcpExecutionDesign.validation.status).toBe('blocked')
-    expect(prepared.mcpExecutionDesign.grantDecisions.summary.blocked).toBe(1)
+    expect(prepared.mcpExecutionDesign.validation.status).toBe('valid')
+    expect(prepared.mcpExecutionDesign.grantDecisions.summary.proposed).toBe(1)
     expect(prepared.mcpExecutionDesign.grantDecisions.decisions[0]).toMatchObject({
       agent: 'backend',
       mcpId: 'github',
-      status: 'blocked',
+      status: 'proposed',
     })
     expect(prepared.agents[0]).toMatchObject({ role: 'Backend', tasks: 1 })
     expect(prepared.agentBreakdownSource).toBe('fence')

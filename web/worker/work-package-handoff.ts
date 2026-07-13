@@ -16,8 +16,8 @@ import { publishTaskEvent } from './events'
 import {
   evaluateWorkPackageMcpBroker,
   hasWorkPackageMcpRuntimeInputs,
-  isRetryableMcpBrokerBlock,
 } from './mcp-execution-design'
+import type { McpBrokerAdmissionCheck } from '../lib/mcps/admission'
 import { buildMcpBrokerBlockMetadata } from './blocked-handoff-retry'
 import {
   FILESYSTEM_GRANT_BLOCK_METADATA_KEY,
@@ -729,19 +729,27 @@ async function abandonLostExecutionLease(input: {
 async function failWorkPackageForMcpBroker(input: {
   blocked: string[]
   blockedReason: string
+  check?: McpBrokerAdmissionCheck
   pkg: HandoffPackage
   taskId: string
   warnings: string[]
 }): Promise<{ blockedReason: string; status: 'blocked' } | { status: 'allowed' }> {
   const blockedAt = new Date()
-  const retryable = isRetryableMcpBrokerBlock(input.blocked)
-  const metadata = buildMcpBrokerBlockMetadata({
+  const check: McpBrokerAdmissionCheck = input.check ?? {
+    status: 'blocked',
     blocked: input.blocked,
-    blockedAt,
-    blockedReason: input.blockedReason,
-    existingMetadata: input.pkg.metadata,
-    retryable,
     warnings: input.warnings,
+    blockedReason: input.blockedReason,
+    retryable: false,
+    primaryMode: 'blocked',
+    primaryRecoveryAction: 'revise_plan',
+    evaluations: [],
+    subtaskDecisions: [],
+  }
+  const metadata = buildMcpBrokerBlockMetadata({
+    blockedAt,
+    check,
+    existingMetadata: input.pkg.metadata,
   })
   const [blockedRow] = await db
     .update(workPackages)
@@ -1107,6 +1115,7 @@ async function assertWorkPackageMcpBrokerAllowsHandoff(
       mcpOverview,
       mcpRequirements: pkg.mcpRequirements,
       metadata: pkg.metadata,
+      projectMcpConfig: project.mcpConfig,
       title: pkg.title,
     })
   } catch (err) {
@@ -1129,6 +1138,7 @@ async function assertWorkPackageMcpBrokerAllowsHandoff(
   return failWorkPackageForMcpBroker({
     blocked: check.blocked,
     blockedReason,
+    check,
     pkg,
     taskId,
     warnings: check.warnings,

@@ -1566,6 +1566,14 @@ export function admitWorkPackageMcp(input: {
         declarationErrors.push(`capabilityBindings item ${index} does not match a declared subtask capability.`)
       }
     })
+    if (Object.hasOwn(subtask, 'capabilityBindings') && Array.isArray(subtask.capabilityBindings)) {
+      for (const capability of declaredCapabilities) {
+        const count = bindings.filter((binding) => binding.capability === capability).length
+        if (count !== 1) {
+          declarationErrors.push(`Subtask capability '${capability}' must have exactly one explicit requirement binding.`)
+        }
+      }
+    }
 
     for (const rawCapability of agentError || invalidSubtaskId || duplicateSubtaskId
       ? []

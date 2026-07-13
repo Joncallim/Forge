@@ -6,6 +6,7 @@ import {
   buildWorkforceMaterializationRows,
   isWorkforceMaterializationEnabled,
 } from '@/worker/workforce-materializer'
+import { evaluateWorkPackageMcpBroker } from '@/worker/mcp-execution-design'
 
 const prepared: PreparedArchitectArtifact = {
   planText: '# Plan',
@@ -54,6 +55,8 @@ const prepared: PreparedArchitectArtifact = {
       schemaVersion: 1,
       requirements: [
         {
+          requirementKey: 'mcp-requirement-v1-test-1',
+          sourceRequirementIndex: 0,
           mcpId: 'github',
           requirement: 'required',
           reason: 'Read issue context.',
@@ -75,12 +78,20 @@ const prepared: PreparedArchitectArtifact = {
       promptOverlays: {
         backend: 'Use GitHub read tools only.',
       },
+      requirementContexts: [{
+        requirementKey: 'mcp-requirement-v1-test-1',
+        sourceRequirementIndex: 0,
+        agent: 'backend',
+        mcpId: 'github',
+        promptOverlay: 'Use GitHub read tools only.',
+      }],
       mcpAwareSubtasks: [
         {
           id: 'inspect-issue',
           agent: 'backend',
           dependsOn: [],
           mcpCapabilities: ['github.issues.read'],
+          capabilityBindings: [{ capability: 'github.issues.read', requirementKey: 'mcp-requirement-v1-test-1' }],
           inputs: ['Task prompt'],
           outputs: ['Issue notes'],
           verification: ['Issue context captured'],
@@ -102,6 +113,7 @@ const prepared: PreparedArchitectArtifact = {
       summary: { proposed: 1, warning: 0, blocked: 0 },
       decisions: [
         {
+          requirementKey: 'mcp-requirement-v1-test-1',
           decisionId: 'grant-1',
           sourceRequirementIndex: 0,
           agent: 'backend',
@@ -119,12 +131,22 @@ const prepared: PreparedArchitectArtifact = {
             message: 'Connect GitHub.',
           },
           health: {
+            schemaVersion: 1,
+            observed: true,
+            mcpId: 'github',
             installState: 'installed',
             status: 'healthy',
             enabled: true,
             error: null,
+            checkedAt: '2026-07-14T00:00:00.000Z',
           },
           promptOverlayPresent: true,
+          admissionStatus: 'allowed',
+          mode: 'planning_only',
+          grantState: { phase: 'not_issued' },
+          normalizedCapabilities: ['github.issues.read'],
+          capabilityClasses: [{ capability: 'github.issues.read', class: 'bounded_read_only', deliveryKind: 'planning_context_only' }],
+          evidenceRefs: [],
         },
       ],
     },
@@ -254,8 +276,11 @@ describe('workforce materializer', () => {
       }),
       mcpGrants: [
         expect.objectContaining({
+          requirementKey: 'mcp-requirement-v1-test-1',
           decisionId: 'grant-1',
           mcpId: 'github',
+          mode: 'planning_only',
+          grantState: { phase: 'not_issued' },
           status: 'proposed',
         }),
       ],
@@ -272,10 +297,13 @@ describe('workforce materializer', () => {
       }),
       source: 'architect-artifact',
       promptOverlay: 'Use GitHub read tools only.',
+      requirementContexts: [expect.objectContaining({ requirementKey: 'mcp-requirement-v1-test-1', agent: 'backend' })],
       mcpAwareSubtasks: [
         expect.objectContaining({
           id: 'inspect-issue',
+          agent: 'backend',
           mcpCapabilities: ['github.issues.read'],
+          capabilityBindings: [{ capability: 'github.issues.read', requirementKey: 'mcp-requirement-v1-test-1' }],
         }),
       ],
     })
@@ -304,6 +332,135 @@ describe('workforce materializer', () => {
       sourceAgentRunId: 'run-1',
       sourceArtifactId: 'artifact-1',
     })
+  })
+
+  it('does not materialize an unscoped legacy prompt overlay after context normalization rejects it', () => {
+    const firstRequirement = prepared.mcpExecutionDesign.proposed!.requirements[0]
+    const rows = buildWorkforceMaterializationRows(
+      {
+        taskId: 'task-1',
+        architectRunId: 'run-1',
+        artifactId: 'artifact-1',
+        prepared: {
+          ...prepared,
+          mcpExecutionDesign: {
+            ...prepared.mcpExecutionDesign,
+            proposed: {
+              ...prepared.mcpExecutionDesign.proposed!,
+              requirements: [
+                firstRequirement,
+                {
+                  ...firstRequirement,
+                  requirementKey: 'mcp-requirement-v1-test-2',
+                  sourceRequirementIndex: 1,
+                },
+              ],
+              requirementContexts: [],
+              promptOverlays: { backend: 'This ambiguous overlay must not reach a worker.' },
+              mcpAwareSubtasks: [],
+              normalizationErrors: ['Legacy MCP prompt overlay is ambiguous.'],
+            },
+            validation: {
+              ...prepared.mcpExecutionDesign.validation,
+              status: 'blocked',
+              blocked: ['Legacy MCP prompt overlay is ambiguous.'],
+            },
+          },
+        },
+      },
+      { idFactory: deterministicIds() },
+    )
+
+    expect(rows.workPackages[0].metadata).toMatchObject({
+      mcpNormalizationErrors: ['Legacy MCP prompt overlay is ambiguous.'],
+      promptOverlay: null,
+      requirementContexts: [],
+    })
+  })
+
+  it('materializes reviewer-only raw policy and derived envelope with the same identity', () => {
+    const reviewerPrepared = structuredClone(prepared)
+    reviewerPrepared.agents = [{
+      role: 'Reviewer',
+      tasks: 1,
+      summary: 'Review the plan',
+      steps: ['Inspect the supplied issue context'],
+    }]
+    const requirementKey = 'mcp-requirement-v1-reviewer-1'
+    reviewerPrepared.mcpExecutionDesign.proposed = {
+      schemaVersion: 1,
+      requirements: [{
+        requirementKey,
+        sourceRequirementIndex: 0,
+        mcpId: 'github',
+        requirement: 'required',
+        reason: 'Read issue context.',
+        assignment: { type: 'reviewer_only', targetAgents: [], targetId: null },
+        agentPermissions: {},
+        prohibitedCapabilities: [],
+        fallback: { action: 'ask_user', message: 'Ask for context.' },
+      }],
+      promptOverlays: { reviewer: 'Use the supplied issue context.' },
+      requirementContexts: [{
+        requirementKey,
+        sourceRequirementIndex: 0,
+        agent: 'reviewer',
+        mcpId: 'github',
+        promptOverlay: 'Use the supplied issue context.',
+      }],
+      mcpAwareSubtasks: [],
+      normalizationErrors: [],
+    }
+    reviewerPrepared.mcpExecutionDesign.grantDecisions.decisions = [{
+      ...reviewerPrepared.mcpExecutionDesign.grantDecisions.decisions[0],
+      requirementKey,
+      decisionId: 'grant-reviewer-1',
+      agent: 'reviewer',
+      capabilities: [],
+      normalizedCapabilities: [],
+      capabilityClasses: [],
+      assignment: { type: 'reviewer_only', targetId: null },
+    }]
+    const rows = buildWorkforceMaterializationRows(
+      {
+        taskId: 'task-1',
+        architectRunId: 'run-1',
+        artifactId: 'artifact-1',
+        prepared: reviewerPrepared,
+      },
+      {
+        activeAgents: [{ agentType: 'reviewer', displayName: 'Reviewer' }],
+        idFactory: deterministicIds(),
+      },
+    )
+
+    expect(rows.workPackages).toHaveLength(1)
+    expect(rows.workPackages[0].mcpRequirements).toEqual([
+      expect.objectContaining({ requirementKey, agent: 'reviewer' }),
+    ])
+    expect(rows.workPackages[0].metadata).toMatchObject({
+      mcpGrants: [expect.objectContaining({ requirementKey, agent: 'reviewer' })],
+    })
+    const broker = evaluateWorkPackageMcpBroker({
+      assignedRole: 'reviewer',
+      mcpOverview: {
+        projectId: 'project-1',
+        config: { profile: 'default', requiredMcps: ['github'], overrides: {} },
+        catalog: [],
+        mcpsRoot: '/tmp/mcps',
+        statuses: [{
+          mcpId: 'github', displayName: 'GitHub', description: '', installPath: '/tmp/mcps/github',
+          installState: 'installed', status: 'healthy', enabled: true, error: null,
+          checkedAt: '2026-07-14T00:00:00.000Z',
+        }],
+        summary: { label: 'Healthy', status: 'healthy', missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+      },
+      mcpRequirements: rows.workPackages[0].mcpRequirements,
+      metadata: rows.workPackages[0].metadata,
+      title: rows.workPackages[0].title,
+    })
+    expect(broker.evaluations).toHaveLength(1)
+    expect(broker.evaluations[0].decision.mode).not.toBe('unknown_legacy')
   })
 
   it('keeps manual review gates even when executable QA and Reviewer packages exist', () => {

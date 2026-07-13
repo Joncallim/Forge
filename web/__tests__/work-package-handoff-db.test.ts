@@ -396,14 +396,15 @@ describe('handoffApprovedWorkPackages', () => {
     expect(result).toMatchObject({
       status: 'blocked',
       claimedPackageId: null,
-      blockedReason: expect.stringContaining("MCP 'github' is not configured"),
+      blockedReason: expect.stringContaining('planning context was not materialized'),
     })
 
     expect(blockUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      blockedReason: expect.stringContaining("MCP 'github' is not configured"),
+      blockedReason: expect.stringContaining('planning context was not materialized'),
       metadata: expect.objectContaining({
         mcpBroker: expect.objectContaining({
-          retryable: true,
+          recoveryAction: 'revise_plan',
+          retryable: false,
           status: 'blocked',
         }),
       }),
@@ -411,7 +412,7 @@ describe('handoffApprovedWorkPackages', () => {
     }))
     expect(mocks.dbTransaction).not.toHaveBeenCalled()
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
-      blockedReason: expect.stringContaining("MCP 'github' is not configured"),
+      blockedReason: expect.stringContaining('planning context was not materialized'),
       status: 'blocked',
       workPackageId: 'pkg-1',
     }))
@@ -633,6 +634,116 @@ describe('handoffApprovedWorkPackages', () => {
     expect(mocks.dbTransaction).not.toHaveBeenCalled()
   })
 
+  it('preserves an approved project filesystem grant through the broker handoff check', async () => {
+    const projectGrant = {
+      schemaVersion: 1,
+      mcpId: 'filesystem',
+      status: 'approved',
+      grantMode: 'always_allow',
+      capabilities: ['filesystem.project.read'],
+      grantApprovalId: 'grant-project-1',
+      approvedAt: '2026-07-14T00:00:00.000Z',
+      approvedBy: 'user-1',
+      reason: 'Approved project context.',
+    }
+    const project = {
+      id: 'project-1',
+      mcpConfig: {
+        profile: 'default',
+        requiredMcps: ['filesystem'],
+        overrides: {},
+        grants: { filesystem: projectGrant },
+      },
+    }
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'pkg-fs-project',
+        assignedRole: 'backend',
+        harnessId: 'harness-1',
+        mcpRequirements: [{
+          requirementKey: 'mcp-requirement-v1-fs-1',
+          sourceRequirementIndex: 0,
+          agent: 'backend',
+          mcpId: 'filesystem',
+          requirement: 'required',
+          permissions: ['filesystem.project.read'],
+          prohibitedCapabilities: [],
+          assignment: { type: 'agent', targetId: null },
+          fallback: { action: 'block', message: '' },
+        }],
+        metadata: {
+          mcpGrantPhases: {
+            effective: {
+              schemaVersion: 1,
+              phase: 'effective',
+              source: 'project-filesystem-approval',
+              grantApprovalId: projectGrant.grantApprovalId,
+              grantMode: 'always_allow',
+              scope: 'project',
+              mcpId: 'filesystem',
+              approvedAt: projectGrant.approvedAt,
+              approvedBy: projectGrant.approvedBy,
+              grants: [{
+                mcpId: 'filesystem',
+                status: 'approved',
+                capabilities: projectGrant.capabilities,
+                grantApprovalId: projectGrant.grantApprovalId,
+                grantMode: 'always_allow',
+                reason: projectGrant.reason,
+              }],
+              reason: projectGrant.reason,
+              runtimeIssued: false,
+              runtimeEnforcement: 'bounded_context_packet',
+              status: 'approved',
+            },
+          },
+        },
+        sequence: 1,
+        status: 'pending',
+        title: 'Read project files',
+      }]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ project }]))
+      .mockReturnValueOnce(chain([{ project }]))
+    mocks.getProjectMcpOverview.mockResolvedValue({
+      projectId: project.id,
+      config: project.mcpConfig,
+      catalog: [],
+      mcpsRoot: '/tmp/forge/mcps',
+      statuses: [{
+        mcpId: 'filesystem',
+        displayName: 'Filesystem',
+        description: 'Filesystem MCP',
+        enabled: true,
+        error: null,
+        installPath: '/tmp/forge/mcps/filesystem',
+        installState: 'installed',
+        status: 'healthy',
+        checkedAt: '2026-07-14T00:00:01.000Z',
+      }],
+      summary: {
+        label: 'MCPs healthy',
+        status: 'healthy',
+        missing: 0,
+        authRequired: 0,
+        unhealthy: 0,
+        disabled: 0,
+      },
+    })
+    const readyUpdate = updateChain([{ id: 'pkg-fs-project' }])
+    mocks.dbUpdate.mockReturnValueOnce(readyUpdate)
+
+    await expect(handoffApprovedWorkPackages('task-1', { claimEnabled: false })).resolves.toEqual({
+      claimedPackageId: null,
+      status: 'ready_only',
+      readyPackageIds: ['pkg-fs-project'],
+    })
+    expect(readyUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      blockedReason: null,
+      status: 'ready',
+    }))
+  })
+
   it('runs the broker before ready promotion when handoff claiming is disabled', async () => {
     mocks.dbSelect
       .mockReturnValueOnce(chain([
@@ -642,6 +753,7 @@ describe('handoffApprovedWorkPackages', () => {
           harnessId: 'harness-1',
           mcpRequirements: [{
             mcpId: 'slack',
+            agent: 'backend',
             requirement: 'optional',
             permissions: ['slack.messages.read'],
             fallback: { action: 'continue_without_mcp', message: 'Use local context.' },
@@ -661,15 +773,18 @@ describe('handoffApprovedWorkPackages', () => {
     const result = await handoffApprovedWorkPackages('task-1', { claimEnabled: false })
 
     expect(result).toMatchObject({
-      blockedReason: expect.stringContaining("Unknown MCP 'slack'"),
+      blockedReason: expect.stringContaining('mcpId must identify a known MCP'),
       claimedPackageId: null,
       readyPackageIds: [],
       status: 'blocked',
     })
     expect(blockUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      blockedReason: expect.stringContaining("Unknown MCP 'slack'"),
+      blockedReason: expect.stringContaining('mcpId must identify a known MCP'),
       metadata: expect.objectContaining({
         mcpBroker: expect.objectContaining({
+          schemaVersion: 1,
+          mode: 'blocked',
+          recoveryAction: 'revise_plan',
           retryable: false,
           status: 'blocked',
         }),
@@ -691,16 +806,25 @@ describe('handoffApprovedWorkPackages', () => {
           harnessId: 'harness-1',
           harnessToolPolicy: null,
           mcpRequirements: [{
+            requirementKey: 'filesystem-write-v1',
+            sourceRequirementIndex: 0,
             mcpId: 'filesystem',
+            agent: 'frontend',
             requirement: 'required',
-            permissions: [],
-            fallback: { action: 'ask_user', message: 'Use project defaults if MCP context is unavailable.' },
+            permissions: ['filesystem.project.write'],
+            assignment: { type: 'agent', targetId: null },
+            fallback: { action: 'block', message: '' },
           }],
           metadata: {
             promptOverlay: 'Use the project context if available, otherwise continue with the greenfield scaffold.',
             mcpAwareSubtasks: [{
               id: 'inspect-repository',
-              mcpCapabilities: ['filesystem.project.list', 'filesystem.project.read', 'filesystem.project.search'],
+              agent: 'frontend',
+              mcpCapabilities: ['filesystem.project.write'],
+              capabilityBindings: [{
+                capability: 'filesystem.project.write',
+                requirementKey: 'filesystem-write-v1',
+              }],
             }],
           },
           sequence: 1,
@@ -861,15 +985,17 @@ describe('handoffApprovedWorkPackages', () => {
     const result = await handoffApprovedWorkPackages('task-1')
 
     expect(result).toMatchObject({
-      blockedReason: expect.stringContaining('outside the allowed beta scope'),
+      blockedReason: expect.stringContaining('deferred live MCP capabilities'),
       claimedPackageId: null,
       readyPackageIds: [],
       status: 'blocked',
     })
     expect(blockUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      blockedReason: expect.stringContaining('outside the allowed beta scope'),
+      blockedReason: expect.stringContaining('deferred live MCP capabilities'),
       metadata: expect.objectContaining({
         mcpBroker: expect.objectContaining({
+          mode: 'deferred_live_mcp',
+          recoveryAction: 'revise_plan',
           retryable: false,
           status: 'blocked',
         }),
@@ -951,16 +1077,17 @@ describe('handoffApprovedWorkPackages', () => {
     const result = await handoffApprovedWorkPackages('task-1')
 
     expect(result).toMatchObject({
-      blockedReason: expect.stringContaining("MCP 'github' is not configured"),
+      blockedReason: expect.stringContaining('planning context was not materialized'),
       claimedPackageId: null,
       readyPackageIds: [],
       status: 'blocked',
     })
     expect(blockUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      blockedReason: expect.stringContaining("MCP 'github' is not configured"),
+      blockedReason: expect.stringContaining('planning context was not materialized'),
       metadata: expect.objectContaining({
         mcpBroker: expect.objectContaining({
-          retryable: true,
+          recoveryAction: 'revise_plan',
+          retryable: false,
           status: 'blocked',
         }),
       }),
@@ -1054,17 +1181,17 @@ describe('handoffApprovedWorkPackages', () => {
     const result = await handoffApprovedWorkPackages('task-1')
 
     expect(result).toMatchObject({
-      blockedReason: expect.stringContaining("MCP 'github' is not configured"),
+      blockedReason: expect.stringContaining('planning context was not materialized'),
       claimedPackageId: null,
       readyPackageIds: [],
       status: 'blocked',
     })
     expect(blockUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      blockedReason: expect.stringContaining("MCP 'github' is not configured"),
+      blockedReason: expect.stringContaining('planning context was not materialized'),
       status: 'blocked',
     }))
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
-      blockedReason: expect.stringContaining("MCP 'github' is not configured"),
+      blockedReason: expect.stringContaining('planning context was not materialized'),
       status: 'blocked',
       workPackageId: 'pkg-2',
     }))
@@ -2304,7 +2431,14 @@ describe('handoffApprovedWorkPackages', () => {
             permissions: ['github.issues.read'],
             fallback: { action: 'block', message: 'Connect GitHub first.' },
           }],
-          metadata: {},
+          metadata: {
+            requirementContexts: [{
+              requirementKey: 'legacy-0-github-backend',
+              agent: 'backend',
+              mcpId: 'github',
+              promptOverlay: 'Use the supplied GitHub planning context.',
+            }],
+          },
           sequence: 1,
           status: 'blocked',
           title: 'Backend package',

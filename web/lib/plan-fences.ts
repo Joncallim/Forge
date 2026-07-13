@@ -110,12 +110,13 @@ export function isOpenQuestionsShape(parsed: unknown): boolean {
 
 export function isMcpExecutionDesignShape(parsed: unknown): boolean {
   if (typeof parsed !== 'object' || parsed === null) return false
-  const value = parsed as { schemaVersion?: unknown; requirements?: unknown; promptOverlays?: unknown; mcpAwareSubtasks?: unknown }
+  const value = parsed as { schemaVersion?: unknown; requirements?: unknown; promptOverlays?: unknown; requirementContexts?: unknown; mcpAwareSubtasks?: unknown }
   return (
     value.schemaVersion === 1 &&
     Array.isArray(value.requirements) &&
     typeof value.promptOverlays === 'object' &&
     value.promptOverlays !== null &&
+    (value.requirementContexts === undefined || Array.isArray(value.requirementContexts)) &&
     Array.isArray(value.mcpAwareSubtasks)
   )
 }
