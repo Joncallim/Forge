@@ -13,6 +13,9 @@ Read these files first when operating at repository root:
 - `web/CLAUDE.md` — web app package context.
 
 When asked to review, do not perform a single generic pass. Use the orthogonal
-review skill, report findings by angle, list coverage, and state unchecked areas.
-Never claim that no issues exist; use scoped verdicts such as "No blockers found
-in the inspected scope."
+review skill: full mode for PR/implementation/merge or risky work, and bounded
+quick mode only for trivial or explicitly narrow checks. Report evidence,
+severity, blocking/advisory disposition, confidence, coverage, and unchecked
+areas. Review is read-only unless fixes are explicitly requested and cannot bypass
+normal gates or human authority. Never claim that no issues exist; use scoped
+verdicts and the skill's explicit "not proof of correctness" caveat.

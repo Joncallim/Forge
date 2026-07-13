@@ -6,7 +6,18 @@ Do not perform a single generic review pass. Run separate orthogonal passes with
 
 ## Core rule
 
-A review is complete only when each required angle has been checked, findings are separated by angle, and unverified areas are explicitly listed.
+A full review is complete only when each required angle has been checked, findings are separated by angle, and unverified areas are explicitly listed. A quick review is complete when at least two relevant independent angles were checked and every omitted angle is disclosed.
+
+## Review depth
+
+- **Full review** — use for pull requests, implementations, merge/readiness decisions, broad fixes, security-sensitive work, or requests for a comprehensive/another sweep. Run all relevant passes below and explain any pass that is not applicable.
+- **Quick review** — use only for a trivial or explicitly narrow check. Run at least two relevant independent angles, keep the report compact, and list the full-review passes not run. Escalate to full review if scope, risk, or evidence is uncertain.
+
+Do not turn a one-line or clearly bounded check into a ceremonial ten-pass report. Do not use quick mode to weaken a PR, merge, security, or release review.
+
+## Safety and authority
+
+Review is read-only unless the user explicitly asks for fixes. Report findings before editing. A review recommendation never bypasses tests, continuous integration, MCP/tool admission, security policy, repository-write controls, human approval, or merge authority. Recommend merge or changes; do not claim to grant approval.
 
 Never say:
 
@@ -35,6 +46,7 @@ Reason: One short paragraph.
 For each finding, use this structure:
 
 - Severity: Blocker / High / Medium / Low / Nit
+- Disposition: Blocking / Advisory
 - Angle:
 - Evidence:
 - File / location:
@@ -60,6 +72,8 @@ For each finding, use this structure:
 ### Required Next Actions
 
 List only concrete actions.
+
+Blocking findings must be addressed before completion or merge. Advisory findings may be deferred when the residual risk and owner are explicit.
 
 ### Final Statement
 
