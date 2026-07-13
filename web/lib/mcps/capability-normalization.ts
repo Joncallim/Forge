@@ -9,7 +9,9 @@ export type McpCapabilityClass =
 
 export type McpDeliveryKind = 'bounded_context_packet' | 'planning_context_only'
 
-const SAFE_READ_SUPPLEMENT_CAPABILITIES = Object.freeze({
+const SAFE_READ_SUPPLEMENT_CAPABILITIES: Readonly<
+  Record<'github' | 'filesystem', readonly string[]>
+> = Object.freeze({
   filesystem: Object.freeze([] as string[]),
   github: Object.freeze([
     'github.actions.read',
@@ -20,13 +22,13 @@ const SAFE_READ_SUPPLEMENT_CAPABILITIES = Object.freeze({
   ]),
 })
 
+function exactCapabilityPattern(capability: string): RegExp {
+  return new RegExp(`^${capability.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`)
+}
+
 export const SAFE_READ_SUPPLEMENT: Readonly<Record<'github' | 'filesystem', readonly RegExp[]>> = Object.freeze({
-  filesystem: Object.freeze([]),
-  github: Object.freeze([
-    Object.freeze(/^github\.actions\.read$/),
-    Object.freeze(/^github\.repository\.(read|list)$/),
-    Object.freeze(/^github\.contents\.(list|search)$/),
-  ]),
+  filesystem: Object.freeze(SAFE_READ_SUPPLEMENT_CAPABILITIES.filesystem.map(exactCapabilityPattern)),
+  github: Object.freeze(SAFE_READ_SUPPLEMENT_CAPABILITIES.github.map(exactCapabilityPattern)),
 })
 
 export const DEFERRED_CAPABILITY_FAMILIES: Readonly<
@@ -61,7 +63,15 @@ export function normalizeCapability(capability: string): string {
 }
 
 const UNSAFE_CAPABILITY_TEXT = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u
-const GITHUB_CREDENTIAL_TEXT = /(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_=-]{10,})/u
+const WELL_KNOWN_CREDENTIAL_TEXT = /(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_=-]{10,}|sk_[A-Za-z0-9_=-]{10,}|xox[baprs](?:-|_)[A-Za-z0-9_=-]{10,}|(?:glpat|sk(?:-(?:proj|ant|live|test))?)-[A-Za-z0-9_-]{8,}|(?:AKIA|ASIA)[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/u
+const PRIVATE_KEY_TEXT = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/gi
+const DATABASE_URL_TEXT = /\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss):\/\/[^\s'"`<>)]+/gi
+const DOCKER_AUTH_TEXT = /(["'](?:auth|identitytoken|\.dockerconfigjson|dockerconfigjson)["']\s*:\s*)(["'])(?:(?!\2).){1,4096}\2/gi
+const NETRC_PASSWORD_TEXT = /(\bpassword\s+)(?![=:])[^\s]+/gi
+const PGPASS_ROW_TEXT = /(^|\n)([^\s:#][^:\n]*:[^:\n]*:[^:\n]*:[^:\n]*:)[^\s:\n]+/g
+const SECRET_KEY_NAME = '[A-Za-z0-9_.-]*(?:token|access[_-]?token|refresh[_-]?token|api[_-]?key|password|passwd|secret|client[_-]?secret|credential|private[_-]?key|npm[_-]?token)[A-Za-z0-9_.-]*'
+const QUOTED_SECRET_ASSIGNMENT_TEXT = new RegExp(`\\b(${SECRET_KEY_NAME})(\\s*[:=]\\s*)(["'])(?:(?!\\3).){1,4096}\\3`, 'gi')
+const UNQUOTED_SECRET_ASSIGNMENT_TEXT = new RegExp(`\\b(${SECRET_KEY_NAME})(\\s*[:=]\\s*)[^\\s&"',}]+`, 'gi')
 
 export function isSafeCapabilityText(value: unknown): value is string {
   if (
@@ -69,7 +79,7 @@ export function isSafeCapabilityText(value: unknown): value is string {
     value.trim() === '' ||
     value.length > 240 ||
     UNSAFE_CAPABILITY_TEXT.test(value) ||
-    GITHUB_CREDENTIAL_TEXT.test(value)
+    WELL_KNOWN_CREDENTIAL_TEXT.test(value)
   ) {
     return false
   }
@@ -142,7 +152,7 @@ function isCatalogSafeRead(mcpId: string, capability: string): boolean {
 }
 
 export function classifyCapability(mcpId: string, capability: string): McpCapabilityClass {
-  if (!isKnownMcpId(mcpId)) return 'unknown'
+  if (!isKnownMcpId(mcpId) || !isSafeCapabilityText(capability)) return 'unknown'
   const canonical = canonicalCapabilityForMcp(mcpId, capability)
   if (!canonical.startsWith(`${mcpId}.`)) return 'unknown'
   if (mcpId === 'filesystem' && canonical === 'filesystem.project.write') return 'planning_only'
@@ -160,6 +170,23 @@ export function assertSafeCatalogCapabilities(): void {
       if (!address || isDeferredCapability(mcpId, canonical) || !safeOperations.has(address.operation)) {
         throw new Error(`MCP catalog capability '${capability}' is not a safe read capability.`)
       }
+    }
+  }
+  for (const [mcpId, capabilities] of Object.entries(SAFE_READ_SUPPLEMENT_CAPABILITIES)) {
+    const seen = new Set<string>()
+    for (const capability of capabilities) {
+      const address = capabilityAddress(mcpId, capability)
+      if (
+        capability !== normalizeCapability(capability) ||
+        !capability.startsWith(`${mcpId}.`) ||
+        seen.has(capability) ||
+        !address ||
+        isDeferredCapability(mcpId, capability) ||
+        !safeOperations.has(address.operation)
+      ) {
+        throw new Error(`MCP safe-read supplement capability '${capability}' is not an exact safe read capability.`)
+      }
+      seen.add(capability)
     }
   }
 }
@@ -205,7 +232,7 @@ export function isMcpHealthy(mcpId: string, status: ProjectMcpStatus | null): bo
   return status !== null &&
     status.mcpId === mcpId &&
     status.installState === 'installed' &&
-    status.enabled &&
+    status.enabled === true &&
     status.status === 'healthy'
 }
 
@@ -213,7 +240,7 @@ export function mcpHealthReason(mcpId: string, status: ProjectMcpStatus | null):
   if (!status) return `MCP '${mcpId}' is not configured.`
   if (status.mcpId !== mcpId) return `MCP '${mcpId}' has no matching health observation.`
   if (status.installState !== 'installed') return `MCP '${mcpId}' is not installed (${status.installState}).`
-  if (!status.enabled) return `MCP '${mcpId}' is disabled.`
+  if (status.enabled !== true) return `MCP '${mcpId}' is disabled.`
   if (status.status !== 'healthy') {
     const detail = sanitizeMcpError(status.error, 240)
     return detail ? `MCP '${mcpId}' is ${status.status}: ${detail}` : `MCP '${mcpId}' is ${status.status}.`
@@ -224,20 +251,22 @@ export function mcpHealthReason(mcpId: string, status: ProjectMcpStatus | null):
 export function sanitizeMcpError(value: unknown, maxLength = 240): string {
   if (typeof value !== 'string') return ''
   return value
+    .replace(PRIVATE_KEY_TEXT, '[redacted]')
+    .replace(DATABASE_URL_TEXT, '[redacted]')
+    .replace(DOCKER_AUTH_TEXT, '$1$2[redacted]$2')
+    .replace(NETRC_PASSWORD_TEXT, '$1[redacted]')
+    .replace(PGPASS_ROW_TEXT, '$1$2[redacted]')
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
     .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, ' ')
     .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/:@]+:[^\s/@]+@/gi, '$1[redacted]@')
     .replace(/\b(?:basic|bearer)\s+[^\s,;]+/gi, '[redacted]')
-    .replace(/\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_=-]{10,})\b/g, '[redacted]')
-    .replace(/\bsk-[a-z0-9_-]{8,}\b/gi, '[redacted]')
-    .replace(
-      /\b(api[ _-]?key|access[ _-]?token|auth(?:entication|orization)?[ _-]?token|authorization|client[ _-]?secret|password|passwd|pwd|secret|private[ _-]?key)\b(["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&]+)/gi,
-      '$1$2[redacted]',
-    )
-    .replace(
-      /([?&](?:api[_-]?key|access[_-]?token|auth[_-]?token|authorization|client[_-]?secret|password|passwd|pwd|secret|private[_-]?key)=)[^&#\s]*/gi,
-      '$1[redacted]',
-    )
+    .replace(/\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_=-]{10,}|sk_[A-Za-z0-9_=-]{10,}|xox[baprs]-[A-Za-z0-9-]{10,}|xox[baprs]_[A-Za-z0-9_=-]{10,})\b/g, '[redacted]')
+    .replace(/\b(?:glpat|sk(?:-(?:proj|ant|live|test))?)-[A-Za-z0-9_-]{8,}\b/g, '[redacted]')
+    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, '[redacted]')
+    .replace(/\bAIza[A-Za-z0-9_-]{20,}\b/g, '[redacted]')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[redacted]')
+    .replace(QUOTED_SECRET_ASSIGNMENT_TEXT, '$1$2$3[redacted]$3')
+    .replace(UNQUOTED_SECRET_ASSIGNMENT_TEXT, '$1$2[redacted]')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, maxLength)

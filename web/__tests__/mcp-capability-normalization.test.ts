@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { MCP_CATALOG } from '@/lib/mcps/catalog'
 import { SAFE_BETA_CAPABILITY_PATTERNS } from '@/worker/mcp-execution-design'
 import {
@@ -12,6 +12,9 @@ import {
   coverageKeysForGrant,
   coverageKeysForProhibition,
   isDeferredCapability,
+  isSafeCapabilityText,
+  isMcpHealthy,
+  mcpHealthReason,
   mcpDeliveryKind,
   mergeCapabilityFields,
   normalizeCapability,
@@ -74,6 +77,8 @@ describe('MCP capability normalization', () => {
     ['github', 'github..read', 'unknown'],
     ['github', 'github.pull_requests. read', 'unknown'],
     ['github', 'github.pull requests.read', 'bounded_read_only'],
+    ['github', 'github.pull\nrequests.read', 'unknown'],
+    ['github', 'github.pull\trequests.read', 'unknown'],
     ['github', 'github.prototype.write', 'unknown'],
     ['github', 'github.hasOwnProperty.write', 'unknown'],
     ['github', ' unknown.read ', 'unknown'],
@@ -145,7 +150,7 @@ describe('MCP capability normalization', () => {
     expect(() => assertSafeCatalogCapabilities()).not.toThrow()
   })
 
-  it('exports deferred classification and freezes the policy registries at runtime', () => {
+  it('exports deferred classification and freezes policy-data containers at runtime', () => {
     expect(isDeferredCapability('github', 'github.pull_requests.merge')).toBe(true)
     expect(isDeferredCapability('github', 'github.issues.read')).toBe(false)
     expect(Object.isFrozen(DEFERRED_CAPABILITY_FAMILIES)).toBe(true)
@@ -155,6 +160,20 @@ describe('MCP capability normalization', () => {
     expect(Object.isFrozen(SAFE_READ_SUPPLEMENT.github)).toBe(true)
     expect(() => (DEFERRED_CAPABILITY_FAMILIES.github.issues as unknown as string[]).push('execute')).toThrow()
     expect(() => (SAFE_READ_SUPPLEMENT.github as unknown as RegExp[]).push(/^github\.issues\.write$/)).toThrow()
+  })
+
+  it('keeps mutable RegExp compatibility views isolated from classifier authority', () => {
+    const supplementPattern = SAFE_READ_SUPPLEMENT.github[0]
+    const originalSource = supplementPattern.source
+    const originalFlags = supplementPattern.flags
+    try {
+      supplementPattern.compile('^filesystem\\.project\\.read$')
+      expect(supplementPattern.test('filesystem.project.read')).toBe(true)
+      expect(classifyCapability('github', 'filesystem.project.read')).toBe('unknown')
+      expect(SAFE_BETA_CAPABILITY_PATTERNS.github.some((pattern) => pattern.test('filesystem.project.read'))).toBe(false)
+    } finally {
+      supplementPattern.compile(originalSource, originalFlags)
+    }
   })
 
   it('keeps safe-read compatibility negative for deferred and malformed capabilities', () => {
@@ -179,6 +198,60 @@ describe('MCP capability normalization', () => {
     expect(sanitized.match(/\[redacted\]/g)).toHaveLength(2)
   })
 
+  it('redacts every well-known token family supported by Forge', () => {
+    const credentials = [
+      `xoxb-${'a'.repeat(24)}`,
+      `glpat-${'b'.repeat(24)}`,
+      `AKIA${'C'.repeat(16)}`,
+      `AIza${'d'.repeat(24)}`,
+      `eyJ${'e'.repeat(12)}.${'f'.repeat(12)}.${'g'.repeat(12)}`,
+      `sk_${'h'.repeat(24)}`,
+      `sk-ant-${'i'.repeat(24)}`,
+    ]
+    const sanitized = sanitizeMcpError(`probe ${credentials.join(' ')} failed`, 1_000)
+    for (const credential of credentials) expect(sanitized).not.toContain(credential)
+    expect(sanitized.match(/\[redacted\]/g)).toHaveLength(credentials.length)
+  })
+
+  it('redacts broad secret assignments and structured credential formats', () => {
+    const marker = ['fixture', 'super', 'secret', 'value'].join('')
+    const secrets = [
+      `credential=${marker}`,
+      `refresh_token=${marker}`,
+      `npm_token=${marker}`,
+      `fooCredential: '${marker}'`,
+      `redis://:${marker}@localhost:6379/0`,
+      `password ${marker}`,
+      `host:5432:db:user:${marker}`,
+      `{"auth":"${marker}"}`,
+      `-----BEGIN PRIVATE KEY-----\n${marker}\n-----END PRIVATE KEY-----`,
+    ]
+    for (const secret of secrets) {
+      expect(sanitizeMcpError(secret, 1_000), secret).not.toContain(marker)
+      expect(isSafeCapabilityText(secret), secret).toBe(false)
+    }
+  })
+
+  it('requires an exact enabled boolean for MCP health', () => {
+    const baseStatus = {
+      mcpId: 'filesystem',
+      displayName: 'Filesystem',
+      description: '',
+      installPath: '',
+      installState: 'installed' as const,
+      status: 'healthy' as const,
+      enabled: true,
+      error: null,
+      checkedAt: '2026-07-13T00:00:00.000Z',
+    }
+    expect(isMcpHealthy('filesystem', baseStatus)).toBe(true)
+    for (const enabled of ['false', 1, {}]) {
+      const malformed = { ...baseStatus, enabled: enabled as unknown as boolean }
+      expect(isMcpHealthy('filesystem', malformed)).toBe(false)
+      expect(mcpHealthReason('filesystem', malformed)).toContain('disabled')
+    }
+  })
+
   it('rejects unsafe catalog verbs and deferred overlap', () => {
     MCP_CATALOG.github.runtime.capabilities.push('github.issues.execute')
     try {
@@ -193,6 +266,23 @@ describe('MCP capability normalization', () => {
       expect(classifyCapability('github', 'github.pull_requests.write')).toBe('deferred_live_mcp')
     } finally {
       MCP_CATALOG.github.runtime.capabilities.pop()
+    }
+  })
+
+  it('classifies an explicit deferred pair before an injected safe-read overlap', () => {
+    const capability = 'github.pull_requests.write'
+    const originalHas = Set.prototype.has
+    const safeReadLookup = vi.spyOn(Set.prototype, 'has').mockImplementation(function (
+      this: Set<unknown>,
+      value,
+    ) {
+      return value === capability || originalHas.call(this, value)
+    })
+    try {
+      expect(classifyCapability('github', capability)).toBe('deferred_live_mcp')
+      expect(safeReadLookup).not.toHaveBeenCalled()
+    } finally {
+      safeReadLookup.mockRestore()
     }
   })
 
