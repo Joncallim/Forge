@@ -199,6 +199,17 @@ describe('admitMcpRequirement', () => {
   })
 
   it.each([
+    'constructor',
+    'filesystem.project. read',
+    ' FILESYSTEM.READ ',
+    'github.secrets.banana',
+  ])('fails closed for malformed precomputed prohibition key %s', (key) => {
+    const decision = admitMcpRequirement(requirement({ packageProhibitedKeys: new Set([key]) }))
+    expect(decision).toMatchObject({ status: 'blocked', mode: 'blocked', recoveryAction: 'revise_plan' })
+    expect(decision.reason).toContain('prohibition set')
+  })
+
+  it.each([
     ['github.issues.reed'],
     ['filesystem.project. read'],
     ['filesystem.project.read'],
@@ -246,6 +257,40 @@ describe('admitMcpRequirement', () => {
     expect(JSON.stringify(decision)).not.toContain(credential)
     expect(JSON.stringify(decision)).not.toMatch(/[\u202a-\u202e\u2066-\u2069]/u)
   })
+
+  it.each([
+    { phase: 'approved', source: 'none', status: 'denied', coveredCapabilities: ['filesystem.project.read'] },
+    { phase: 'approved', source: 'project-level', status: 'approved', grantMode: 'allow_once', coveredCapabilities: ['filesystem.project.read'] },
+    { phase: 'approved', source: 'package-local', status: 'approved', grantMode: 'always_allow', consumed: true, coveredCapabilities: ['filesystem.project.read'] },
+    { phase: 'denied', source: 'package-local', status: 'denied', coveredCapabilities: ['filesystem.project.read'] },
+    { phase: 'revoked', source: 'project-level', status: 'not_issued', coveredCapabilities: [], revocationReason: '' },
+  ])('rejects an incoherent effective grant tuple: %j', (effectiveGrant) => {
+    const decision = admitMcpRequirement(requirement({ effectiveGrant }))
+    expect(decision).toMatchObject({ mode: 'blocked', status: 'blocked', recoveryAction: 'revise_plan' })
+    expect(decision.reason).toContain('grant coverage/state')
+  })
+
+  it.each([
+    ['MCP id', { mcpId: ' filesystem ' }],
+    ['agent', { agent: 7 }],
+    ['requirement', { requirement: 'sometimes' }],
+    ['prompt context evidence', { hasPromptOnlyContext: 'yes' }],
+  ])('fails closed and safely projects malformed direct %s', (expected, override) => {
+    const decision = admitMcpRequirement(requirement(override))
+    expect(decision).toMatchObject({ mode: 'blocked', status: 'blocked', recoveryAction: 'revise_plan' })
+    expect(decision.reason).toContain(expected)
+  })
+
+  it('does not treat a truthy non-boolean health flag as healthy', () => {
+    const decision = admitMcpRequirement(requirement({
+      status: status('filesystem', { enabled: 'yes' as unknown as boolean }),
+    }))
+    expect(decision).toMatchObject({
+      mode: 'bounded_context_approved',
+      status: 'blocked',
+      recoveryAction: 'install_or_fix_mcp',
+    })
+  })
 })
 
 describe('admitWorkPackageMcp', () => {
@@ -261,6 +306,7 @@ describe('admitWorkPackageMcp', () => {
   })
 
   it('narrows filesystem grants per requirement and does not let an optional miss revoke a covered required capability', () => {
+    const grantCalls: Array<{ requirementKey: string; requiredCapabilities: string[] }> = []
     const admission = admitPackage({
       entries: [
         rawEntry({ requirementKey: 'read', capabilities: ['filesystem.project.read'] }),
@@ -272,7 +318,10 @@ describe('admitWorkPackageMcp', () => {
           fallback: { action: 'continue_without_mcp', message: 'Continue without listing.' },
         }),
       ],
-      effectiveGrantFor: ({ requirementKey }) => requirementKey === 'read' ? approvedRead : noGrant,
+      effectiveGrantFor: ({ requirementKey, requiredCapabilities }) => {
+        grantCalls.push({ requirementKey, requiredCapabilities })
+        return requiredCapabilities.includes('filesystem.project.read') ? approvedRead : noGrant
+      },
     })
     expect(admission.evaluations).toHaveLength(2)
     expect(Object.fromEntries(admission.evaluations.map(({ decision, source }) => [
@@ -283,6 +332,10 @@ describe('admitWorkPackageMcp', () => {
       list: ['warning', 'bounded_context_required'],
     })
     expect(admission.aggregate.status).toBe('warning')
+    expect(grantCalls.sort((left, right) => left.requirementKey.localeCompare(right.requirementKey))).toEqual([
+      { requirementKey: 'list', requiredCapabilities: ['filesystem.project.list'] },
+      { requirementKey: 'read', requiredCapabilities: ['filesystem.project.read'] },
+    ])
   })
 
   it('keeps two same-agent same-MCP requirements distinct by requirementKey', () => {
@@ -305,6 +358,7 @@ describe('admitWorkPackageMcp', () => {
           requirement: 'required',
           capabilities: ['filesystem.project.read'],
           fallback: { action: 'block', message: 'Context is required.' },
+          assignment: { type: 'agent', targetId: null },
           promptOverlayPresent: false,
         },
         {
@@ -316,6 +370,7 @@ describe('admitWorkPackageMcp', () => {
           requirement: 'required',
           capabilities: ['filesystem.project.search'],
           fallback: { action: 'ask_user', message: 'Ask about search.' },
+          assignment: { type: 'agent', targetId: null },
           promptOverlayPresent: false,
         },
       ],
@@ -326,6 +381,7 @@ describe('admitWorkPackageMcp', () => {
     })
     expect(admission.evaluations.map((evaluation) => evaluation.source.requirementKey)).toEqual(['allow-read', 'deny-search'])
     expect(admission.evaluations.map(({ decision }) => decision.status)).toEqual(['allowed', 'blocked'])
+    expect(admission.evaluations.map(({ source }) => source.fallback.action)).toEqual(['block', 'ask_user'])
   })
 
   it('joins the current raw and derived legacy pair once', () => {
@@ -409,6 +465,271 @@ describe('admitWorkPackageMcp', () => {
       })
       expect(admission.evaluations[0].decision.reason, field).toContain(`'${field}'`)
     }
+  })
+
+  it.each([
+    ['requirement', { requirement: 'sometimes' }],
+    ['fallback', { fallback: { action: 'banana', message: 'invalid' } }],
+    ['mcpId', { mcpId: ' filesystem ' }],
+  ])('fails closed for malformed package policy %s even when bounded context is otherwise approved', (field, override) => {
+    const admission = admitPackage({ entries: [rawEntry(override)] })
+    expect(admission.aggregate).toMatchObject({ status: 'blocked', primaryRecoveryAction: 'revise_plan' })
+    expect(admission.evaluations[0].decision.reason).toContain(field === 'mcpId' ? 'mcpId' : field)
+  })
+
+  it.each([
+    ['hostile type', { type: '__proto__', targetId: 'team' }],
+    ['scalar', 'agent'],
+    ['null', null],
+    ['non-string target', { type: 'agent', targetId: 7 }],
+  ])('fails closed for malformed source assignment: %s', (_label, assignment) => {
+    const admission = admitPackage({ entries: [rawEntry({ assignment })] })
+    expect(admission.aggregate).toMatchObject({ status: 'blocked', primaryRecoveryAction: 'revise_plan' })
+    expect(admission.evaluations[0].decision.reason).toContain('assignment')
+  })
+
+  it('keeps absent legacy assignment compatible', () => {
+    const policy = Object.fromEntries(
+      Object.entries(rawEntry()).filter(([key]) =>
+        key !== 'assignment' && key !== 'requirementKey' && key !== 'sourceRequirementIndex',
+      ),
+    )
+    expect(admitPackage({ entries: [policy] })).toMatchObject({
+      evaluations: [{ decision: { status: 'allowed' }, source: { assignment: { type: 'agent', targetId: null } } }],
+      aggregate: { status: 'allowed' },
+    })
+  })
+
+  it('fails closed for malformed derived-envelope assignment', () => {
+    const admission = admitPackage({
+      entries: [
+        rawEntry(),
+        grantEntry({ assignment: { type: 'agent', targetId: 7 } }),
+      ],
+    })
+    expect(admission).toMatchObject({
+      evaluations: [{ decision: { status: 'blocked', recoveryAction: 'revise_plan' } }],
+      aggregate: { status: 'blocked' },
+    })
+    expect(admission.evaluations[0].decision.reason).toContain('assignment')
+
+    const missingAssignment = Object.fromEntries(
+      Object.entries(grantEntry()).filter(([key]) => key !== 'assignment'),
+    )
+    const missing = admitPackage({ entries: [rawEntry(), missingAssignment] })
+    expect(missing.evaluations[0].decision).toMatchObject({ status: 'blocked', recoveryAction: 'revise_plan' })
+    expect(missing.evaluations[0].decision.reason).toContain('assignment')
+  })
+
+  it('requires keyed raw policies to retain assignment and source index', () => {
+    const keyed = Object.fromEntries(
+      Object.entries(rawEntry()).filter(([key]) => key !== 'assignment' && key !== 'sourceRequirementIndex'),
+    )
+    const admission = admitPackage({ entries: [keyed] })
+    expect(admission.evaluations[0].decision).toMatchObject({ status: 'blocked', recoveryAction: 'revise_plan' })
+    expect(admission.evaluations[0].decision.reason).toContain('assignment')
+    expect(admission.evaluations[0].decision.reason).toContain('sourceRequirementIndex')
+  })
+
+  it('does not collapse malformed requirement and subtask agents into shared authorization coverage', () => {
+    const malformedPolicy = admitPackage({ entries: [rawEntry({ agent: 7 })] })
+    expect(malformedPolicy).toMatchObject({
+      evaluations: [{ decision: { agent: 'unknown', status: 'blocked', recoveryAction: 'revise_plan' } }],
+      aggregate: { status: 'blocked' },
+    })
+
+    const malformedSubtask = admitPackage({
+      subtasks: [{
+        id: 'malformed-agent',
+        agent: 7,
+        mcpCapabilities: ['filesystem.project.read'],
+        capabilityBindings: [{ capability: 'filesystem.project.read', requirementKey: 'requirement-1' }],
+      }],
+    })
+    expect(malformedSubtask.subtaskDecisions).toEqual([
+      expect.objectContaining({
+        subtaskId: 'malformed-agent',
+        agent: 'unknown',
+        capability: 'invalid.subtask.mcp-declaration',
+        status: 'blocked',
+      }),
+    ])
+
+    const bothMalformed = admitPackage({
+      entries: [rawEntry({ agent: 7 })],
+      subtasks: [{
+        id: 'shared-unknown',
+        agent: 7,
+        mcpCapabilities: ['filesystem.project.read'],
+        capabilityBindings: [{ capability: 'filesystem.project.read', requirementKey: 'requirement-1' }],
+      }],
+    })
+    expect(bothMalformed.evaluations.every((evaluation) => evaluation.decision.status === 'blocked')).toBe(true)
+    expect(bothMalformed.subtaskDecisions.every((decision) => decision.status === 'blocked')).toBe(true)
+    expect(bothMalformed.aggregate.status).toBe('blocked')
+  })
+
+  it('retains valid assignedRole-only identity for a keyless legacy policy', () => {
+    const legacyPolicy = Object.fromEntries(
+      Object.entries(rawEntry({ assignedRole: 'backend' })).filter(([key]) =>
+        key !== 'agent' && key !== 'requirementKey' && key !== 'sourceRequirementIndex',
+      ),
+    )
+    const admission = admitPackage({ entries: [legacyPolicy] })
+    expect(admission.evaluations[0].decision).toMatchObject({ agent: 'backend', status: 'allowed' })
+    expect(admission.aggregate.status).toBe('allowed')
+  })
+
+  it('does not derive keyed policy or subtask authorization identity from assignment targetAgents', () => {
+    const keyedPolicy = Object.fromEntries(
+      Object.entries(rawEntry({
+        assignment: { type: 'workforce', targetId: 'delivery-team', targetAgents: ['backend'] },
+      })).filter(([key]) => key !== 'agent'),
+    )
+    const policyAdmission = admitPackage({ entries: [keyedPolicy] })
+    expect(policyAdmission.evaluations[0].decision).toMatchObject({ status: 'blocked', recoveryAction: 'revise_plan' })
+
+    const subtaskAdmission = admitPackage({
+      subtasks: [{
+        id: 'assignment-only-agent',
+        assignment: { type: 'workforce', targetId: 'delivery-team', targetAgents: ['backend'] },
+        mcpCapabilities: ['filesystem.project.read'],
+        capabilityBindings: [{ capability: 'filesystem.project.read', requirementKey: 'requirement-1' }],
+      }],
+    })
+    expect(subtaskAdmission.subtaskDecisions).toEqual([
+      expect.objectContaining({
+        capability: 'invalid.subtask.mcp-declaration',
+        status: 'blocked',
+        recoveryAction: 'revise_plan',
+      }),
+    ])
+  })
+
+  it('distinguishes a valid empty requirement list from a malformed entries container', () => {
+    const empty = admitPackage({ entries: [] })
+    expect(empty).toMatchObject({ evaluations: [], aggregate: { status: 'allowed', retryable: false } })
+
+    for (const entries of [null, 'invalid', { mcpId: 'filesystem' }, 7]) {
+      let callbackCalls = 0
+      const unexpectedCallback = () => {
+        callbackCalls += 1
+        throw new Error('malformed entries must not invoke callbacks')
+      }
+      const malformed = admitWorkPackageMcp({
+        entries: entries as unknown as Array<Record<string, unknown>>,
+        subtasks: [],
+        label: 'Malformed entries',
+        statusFor: unexpectedCallback,
+        effectiveGrantFor: unexpectedCallback,
+        hasPromptOnlyContextFor: unexpectedCallback,
+      })
+      expect(malformed.aggregate, String(entries)).toMatchObject({
+        status: 'blocked',
+        primaryRecoveryAction: 'revise_plan',
+      })
+      expect(malformed.aggregate.blockedReason).toContain('entries must be an array')
+      expect(callbackCalls).toBe(0)
+    }
+  })
+
+  it('does not invoke callbacks for structurally invalid entry items', () => {
+    for (const entries of [
+      [null],
+      [{}],
+      [rawEntry({ mcpId: 'constructor' })],
+    ]) {
+      let callbackCalls = 0
+      const unexpectedCallback = () => {
+        callbackCalls += 1
+        throw new Error('invalid entries must not invoke callbacks')
+      }
+      const admission = admitWorkPackageMcp({
+        entries: entries as Array<Record<string, unknown>>,
+        subtasks: [],
+        label: 'Invalid entry',
+        statusFor: unexpectedCallback,
+        effectiveGrantFor: unexpectedCallback,
+        hasPromptOnlyContextFor: unexpectedCallback,
+      })
+      expect(admission.aggregate.status).toBe('blocked')
+      expect(callbackCalls).toBe(0)
+    }
+  })
+
+  it('rejects non-boolean prompt-context evidence from direct, callback, and persisted-envelope sources', () => {
+    const direct = admitMcpRequirement(requirement({
+      mcpId: 'github',
+      requestedCapabilities: ['github.issues.read'],
+      effectiveGrant: noGrant,
+      hasPromptOnlyContext: 'yes',
+    }))
+    expect(direct).toMatchObject({ status: 'blocked', recoveryAction: 'revise_plan' })
+
+    const githubRaw = rawEntry({
+      mcpId: 'github',
+      requirement: 'optional',
+      capabilities: ['github.issues.read'],
+      fallback: { action: 'continue_without_mcp', message: 'Continue.' },
+    })
+    const callback = admitPackage({
+      entries: [githubRaw],
+      effectiveGrantFor: () => noGrant,
+      hasPromptOnlyContextFor: () => 'yes' as unknown as boolean,
+    })
+    expect(callback).toMatchObject({
+      evaluations: [{ decision: { status: 'blocked', recoveryAction: 'revise_plan' } }],
+      aggregate: { status: 'blocked' },
+    })
+    expect(callback.evaluations[0].decision.reason).toContain('callback must return boolean')
+
+    const persisted = admitPackage({
+      entries: [
+        githubRaw,
+        grantEntry({
+          mcpId: 'github',
+          requirement: 'optional',
+          capabilities: ['github.issues.read'],
+          fallback: { action: 'continue_without_mcp', message: 'Continue.' },
+          promptOverlayPresent: 'true',
+        }),
+      ],
+      effectiveGrantFor: () => noGrant,
+      hasPromptOnlyContextFor: () => false,
+    })
+    expect(persisted).toMatchObject({
+      evaluations: [{
+        decision: { status: 'blocked', recoveryAction: 'revise_plan' },
+        source: { promptOverlayPresent: false },
+      }],
+      aggregate: { status: 'blocked' },
+    })
+    expect(persisted.evaluations[0].decision.reason).toContain('promptOverlayPresent')
+
+    const keyedMissingPrompt = Object.fromEntries(
+      Object.entries(grantEntry({
+        mcpId: 'github',
+        capabilities: ['github.issues.read'],
+        requirement: 'optional',
+        fallback: { action: 'continue_without_mcp', message: 'Continue.' },
+      })).filter(([key]) => key !== 'promptOverlayPresent'),
+    )
+    const missing = admitPackage({
+      entries: [githubRaw, keyedMissingPrompt],
+      effectiveGrantFor: () => noGrant,
+      hasPromptOnlyContextFor: () => true,
+    })
+    expect(missing.evaluations[0].decision).toMatchObject({ status: 'blocked', recoveryAction: 'revise_plan' })
+    expect(missing.evaluations[0].decision.reason).toContain('promptOverlayPresent')
+
+    const keylessRaw = Object.fromEntries(Object.entries(githubRaw).filter(([key]) => key !== 'requirementKey'))
+    const keylessGrant = Object.fromEntries(Object.entries(keyedMissingPrompt).filter(([key]) => key !== 'requirementKey'))
+    const legacy = admitPackage({
+      entries: [keylessRaw, keylessGrant],
+      effectiveGrantFor: () => noGrant,
+      hasPromptOnlyContextFor: () => true,
+    })
+    expect(legacy.evaluations[0].decision).toMatchObject({ status: 'allowed', mode: 'planning_only' })
   })
 
   it.each([null, '', 7, ' trailing ', 'x'.repeat(161)])(
@@ -735,6 +1056,60 @@ describe('admitWorkPackageMcp', () => {
       recoveryAction: 'revise_plan',
     })])
     expect(JSON.stringify(admission)).not.toMatch(/\u001b|github_pat_/i)
+  })
+
+  it('emits one capability decision and fails closed for duplicate declared subtask capabilities', () => {
+    const admission = admitPackage({
+      subtasks: [{
+        id: 'duplicate-read',
+        agent: 'backend',
+        mcpCapabilities: ['filesystem.project.read', ' FILESYSTEM.PROJECT.READ '],
+        capabilityBindings: [{ capability: 'filesystem.project.read', requirementKey: 'requirement-1' }],
+      }],
+    })
+    expect(admission.subtaskDecisions.filter((decision) =>
+      decision.capability === 'filesystem.project.read',
+    )).toHaveLength(1)
+    expect(admission.subtaskDecisions).toContainEqual(expect.objectContaining({
+      capability: 'invalid.subtask.mcp-declaration',
+      status: 'blocked',
+      recoveryAction: 'revise_plan',
+    }))
+    expect(admission.aggregate.status).toBe('blocked')
+  })
+
+  it.each([7, null, '', ' bad ', 'a\u202eb'])('fails closed for malformed subtask id %j', (id) => {
+    const admission = admitPackage({
+      subtasks: [{
+        id,
+        agent: 'backend',
+        mcpCapabilities: ['filesystem.project.read'],
+        capabilityBindings: [{ capability: 'filesystem.project.read', requirementKey: 'requirement-1' }],
+      }],
+    })
+    expect(admission.subtaskDecisions).toHaveLength(1)
+    expect(admission.subtaskDecisions[0]).toMatchObject({
+      capability: 'invalid.subtask.mcp-declaration',
+      status: 'blocked',
+      recoveryAction: 'revise_plan',
+    })
+  })
+
+  it('does not emit duplicate capability decisions for duplicate subtask ids', () => {
+    const subtask = {
+      id: 'same-subtask',
+      agent: 'backend',
+      mcpCapabilities: ['filesystem.project.read'],
+      capabilityBindings: [{ capability: 'filesystem.project.read', requirementKey: 'requirement-1' }],
+    }
+    const admission = admitPackage({ subtasks: [subtask, { ...subtask }] })
+    expect(admission.subtaskDecisions.filter((decision) =>
+      decision.capability === 'filesystem.project.read',
+    )).toHaveLength(1)
+    expect(admission.subtaskDecisions).toContainEqual(expect.objectContaining({
+      capability: 'invalid.subtask.mcp-declaration',
+      status: 'blocked',
+    }))
   })
 
   it.each([
@@ -1128,6 +1503,32 @@ describe('admitWorkPackageMcp', () => {
     }))
   })
 
+  it('sanitizes direct identities and projected assignment or decision identifiers without leaking', () => {
+    const marker = 'fixture-sensitive-value-123456'
+    const direct = admitMcpRequirement(requirement({
+      mcpId: `filesystem\u202ebearer ${marker}`,
+      agent: `backend secret=${marker}`,
+    }))
+    const assignment = admitPackage({
+      entries: [rawEntry({
+        assignment: { type: 'agent', targetId: `secret=${marker}` },
+      })],
+    })
+    const decisionId = admitPackage({
+      entries: [
+        rawEntry(),
+        grantEntry({ decisionId: `api_key=${marker}` }),
+      ],
+    })
+    const serialized = JSON.stringify({ direct, assignment, decisionId })
+
+    expect(direct).toMatchObject({ status: 'blocked', recoveryAction: 'revise_plan' })
+    expect(serialized).not.toContain(marker)
+    expect(serialized).not.toMatch(/[\u202a-\u202e\u2066-\u2069]/u)
+    expect(assignment.evaluations[0].source.assignment.targetId).toContain('[redacted]')
+    expect(decisionId.aggregate.status).toBe('blocked')
+  })
+
   it('sanitizes controls, bidi, ANSI escapes, and common secret tokens from operator-facing reasons', () => {
     const admission = admitPackage({
       entries: [rawEntry({
@@ -1178,7 +1579,7 @@ describe('admitWorkPackageMcp', () => {
   it.each([
     `sk-${'a'.repeat(24)}`,
     'bearer supersecret123',
-    'api_key=supersecret123',
+    ['api', '_key=', 'fixture', 'value123'].join(''),
   ])('rejects sanitizer-recognized capability credentials across direct and adapted surfaces: %s', (secret) => {
     const capability = `filesystem.project.read.${secret}`
     const direct = admitMcpRequirement(requirement({ requestedCapabilities: [capability] }))
@@ -1244,6 +1645,31 @@ describe('admitWorkPackageMcp', () => {
       error: null,
       checkedAt: null,
     })
+
+    const malformed = admitPackage({
+      statusFor: () => status('filesystem', { enabled: 'false' as unknown as boolean }),
+    })
+    expect(malformed.evaluations[0]).toMatchObject({
+      decision: { status: 'blocked', recoveryAction: 'install_or_fix_mcp' },
+      health: { observed: false, enabled: false, checkedAt: null },
+    })
+  })
+
+  it('redacts broad health-error secrets from canonical and adapted outputs', () => {
+    const marker = ['fixture', 'health', 'secret', 'value'].join('')
+    const admission = admitPackage({
+      statusFor: (mcpId) => status(mcpId, {
+        status: 'unhealthy',
+        error: `refresh_token=${marker}`,
+      }),
+    })
+    const outputs = [
+      admission,
+      admissionToValidation(admission),
+      admissionToGrantPreview(admission),
+      admissionToBrokerCheck(admission),
+    ]
+    for (const output of outputs) expect(JSON.stringify(output)).not.toContain(marker)
   })
 
   it('rejects a healthy status from another MCP without relabelling the snapshot', () => {
@@ -1419,6 +1845,84 @@ describe('admitWorkPackageMcp', () => {
     expect(admission.subtaskDecisions[0].reason).not.toBe('broker mutation')
   })
 
+  it('keeps a subtask-only blocker visible in grant preview without changing legacy summary counts', () => {
+    const admission = admitPackage({
+      entries: [rawEntry({
+        requirement: 'optional',
+        fallback: { action: 'continue_without_mcp', message: 'Continue.' },
+      })],
+      subtasks: [{
+        id: 'read-without-context',
+        agent: 'backend',
+        mcpCapabilities: ['filesystem.project.read'],
+        capabilityBindings: [{ capability: 'filesystem.project.read', requirementKey: 'requirement-1' }],
+      }],
+      effectiveGrantFor: () => noGrant,
+    })
+    const preview = admissionToGrantPreview(admission)
+
+    expect(preview).toMatchObject({
+      summary: { proposed: 0, warning: 1, blocked: 0 },
+      admissionStatus: 'blocked',
+      blocked: [expect.stringContaining('without approved filesystem context')],
+      blockedReason: expect.stringContaining('without approved filesystem context'),
+      retryable: false,
+      primaryRecoveryAction: 'approve_project_filesystem_context',
+      evaluations: expect.any(Array),
+      subtaskDecisions: [expect.objectContaining({ status: 'blocked' })],
+    })
+
+    preview.blocked.push('preview mutation')
+    preview.evaluations[0].decision.normalizedCapabilities.push('preview mutation')
+    preview.subtaskDecisions[0].reason = 'preview mutation'
+    expect(admission.aggregate.blocked).not.toContain('preview mutation')
+    expect(admission.evaluations[0].decision.normalizedCapabilities).not.toContain('preview mutation')
+    expect(admission.subtaskDecisions[0].reason).not.toBe('preview mutation')
+  })
+
+  it('computes retryable only when every blocker is install_or_fix_mcp', () => {
+    const unhealthyStatus = (mcpId: string) => mcpId === 'filesystem'
+      ? status('filesystem', { status: 'unhealthy', error: 'probe failed' })
+      : status(mcpId)
+    const allHealth = admitPackage({
+      entries: [
+        rawEntry({ requirementKey: 'one' }),
+        rawEntry({ requirementKey: 'two', sourceRequirementIndex: 1 }),
+      ],
+      statusFor: unhealthyStatus,
+    })
+    expect(allHealth.aggregate).toMatchObject({ status: 'blocked', retryable: true })
+
+    const mixed = admitPackage({
+      entries: [
+        rawEntry({ requirementKey: 'fs' }),
+        rawEntry({
+          requirementKey: 'gh',
+          sourceRequirementIndex: 1,
+          mcpId: 'github',
+          capabilities: ['github.issues.read'],
+        }),
+      ],
+      statusFor: unhealthyStatus,
+      hasPromptOnlyContextFor: () => false,
+    })
+    expect(mixed.aggregate).toMatchObject({
+      status: 'blocked',
+      retryable: false,
+      primaryRecoveryAction: 'revise_plan',
+    })
+
+    const warningOnly = admitPackage({
+      entries: [rawEntry({
+        requirement: 'optional',
+        fallback: { action: 'continue_without_mcp', message: 'Continue.' },
+      })],
+      statusFor: unhealthyStatus,
+    })
+    expect(warningOnly.aggregate).toMatchObject({ status: 'warning', retryable: false })
+    expect(admitPackage().aggregate).toMatchObject({ status: 'allowed', retryable: false })
+  })
+
   it('passes each requirement exact bounded capabilities to grant resolution and names them in failures', () => {
     const calls: Array<{ requirementKey: string; requiredCapabilities: string[] }> = []
     const admission = admitPackage({
@@ -1457,6 +1961,95 @@ describe('admitWorkPackageMcp', () => {
 })
 
 describe('readEffectiveGrantState', () => {
+  it('never approves an invalid, empty, or silently narrowed required-capability set', () => {
+    const project = {
+      mcpConfig: {
+        grants: {
+          filesystem: {
+            schemaVersion: 1,
+            mcpId: 'filesystem',
+            status: 'approved',
+            grantMode: 'always_allow',
+            capabilities: ['filesystem.project.read'],
+          },
+        },
+      },
+    }
+    const invalidSets: unknown[] = [
+      [],
+      ['filesystem.project.write'],
+      ['github.issues.read'],
+      ['filesystem.project.read', 'filesystem.project.write'],
+      ['filesystem.project.read', 42],
+      'filesystem.project.read',
+      null,
+    ]
+    for (const requiredCapabilities of invalidSets) {
+      expect(() => readEffectiveGrantState(
+        { metadata: {} },
+        project,
+        requiredCapabilities as string[],
+      )).not.toThrow()
+      expect(readEffectiveGrantState(
+        { metadata: {} },
+        project,
+        requiredCapabilities as string[],
+      ), JSON.stringify(requiredCapabilities)).toMatchObject({ phase: 'none', status: 'not_issued' })
+    }
+  })
+
+  it('rejects mixed-invalid and contradictory persisted filesystem grant records', () => {
+    const packageWithGrants = (grants: unknown[]) => ({
+      metadata: {
+        mcpGrantPhases: {
+          effective: {
+            schemaVersion: 1,
+            phase: 'effective',
+            source: 'explicit-grant-approval',
+            runtimeEnforcement: 'bounded_context_packet',
+            status: 'approved',
+            grantMode: 'allow_once',
+            runtimeIssued: false,
+            grants,
+          },
+        },
+      },
+    })
+    const invalidGrants = [
+      [{ mcpId: 'filesystem', status: 'approved', capabilities: ['filesystem.project.read', 42] }],
+      [
+        { mcpId: 'filesystem', status: 'approved', capabilities: ['filesystem.project.read'] },
+        { mcpId: 'filesystem', status: 'denied', capabilities: ['filesystem.project.read'] },
+      ],
+      [{ mcpId: 'filesystem', status: 'approved', capabilities: ['filesystem.project.read', 'filesystem.project.write'] }],
+    ]
+    for (const grants of invalidGrants) {
+      expect(readEffectiveGrantState(
+        packageWithGrants(grants),
+        { mcpConfig: {} },
+        ['filesystem.project.read'],
+      )).toMatchObject({ phase: 'none', status: 'not_issued' })
+    }
+
+    expect(readEffectiveGrantState(
+      { metadata: {} },
+      {
+        mcpConfig: {
+          grants: {
+            filesystem: {
+              schemaVersion: 1,
+              mcpId: 'filesystem',
+              status: 'approved',
+              grantMode: 'always_allow',
+              capabilities: ['filesystem.project.read', 42],
+            },
+          },
+        },
+      },
+      ['filesystem.project.read'],
+    )).toMatchObject({ phase: 'none', status: 'not_issued' })
+  })
+
   it('keeps an insufficient package-local approval historically approved while admission fails closed', () => {
     const effectiveGrant = readEffectiveGrantState({
       metadata: {
@@ -1556,6 +2149,7 @@ describe('readEffectiveGrantState', () => {
             runtimeEnforcement: 'bounded_context_packet',
             status: 'approved',
             ...(includeGrantMode ? { grantMode } : {}),
+            runtimeIssued: false,
             grants: [{
               mcpId: 'filesystem',
               status: 'approved',
@@ -1591,6 +2185,60 @@ describe('readEffectiveGrantState', () => {
         ['filesystem.project.read'],
       ), label).toMatchObject({ phase: 'none', status: 'not_issued' })
     }
+  })
+
+  it('requires an exact persisted runtimeIssued boolean for explicit grants', () => {
+    const packageForRuntimeState = (grantMode: 'allow_once' | 'always_allow', runtimeIssued: unknown, include = true) => ({
+      metadata: {
+        mcpGrantPhases: {
+          effective: {
+            schemaVersion: 1,
+            phase: 'effective',
+            source: 'explicit-grant-approval',
+            runtimeEnforcement: 'bounded_context_packet',
+            status: 'approved',
+            grantMode,
+            ...(include ? { runtimeIssued } : {}),
+            grants: [{
+              mcpId: 'filesystem',
+              status: 'approved',
+              capabilities: ['filesystem.project.read'],
+            }],
+          },
+        },
+      },
+    })
+
+    for (const grantMode of ['allow_once', 'always_allow'] as const) {
+      for (const [label, runtimeIssued, include] of [
+        ['missing', undefined, false],
+        ['string', 'true', true],
+        ['number', 1, true],
+        ['null', null, true],
+      ] as const) {
+        expect(readEffectiveGrantState(
+          packageForRuntimeState(grantMode, runtimeIssued, include),
+          { mcpConfig: {} },
+          ['filesystem.project.read'],
+        ), `${grantMode}/${label}`).toMatchObject({ phase: 'none', status: 'not_issued' })
+      }
+      expect(readEffectiveGrantState(
+        packageForRuntimeState(grantMode, false),
+        { mcpConfig: {} },
+        ['filesystem.project.read'],
+      )).toMatchObject({ phase: 'approved', consumed: false })
+    }
+
+    expect(readEffectiveGrantState(
+      packageForRuntimeState('allow_once', true),
+      { mcpConfig: {} },
+      ['filesystem.project.read'],
+    )).toMatchObject({ phase: 'approved', consumed: true })
+    expect(readEffectiveGrantState(
+      packageForRuntimeState('always_allow', true),
+      { mcpConfig: {} },
+      ['filesystem.project.read'],
+    )).toMatchObject({ phase: 'approved', grantMode: 'always_allow' })
   })
 
   it('keeps a narrowed project grant approved when it still covers this requirement', () => {

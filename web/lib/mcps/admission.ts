@@ -157,9 +157,15 @@ export type McpGrantPreviewDecision = Omit<McpGrantDecisions['decisions'][number
 
 export type McpGrantPreview = Omit<McpGrantDecisions, 'decisions'> & {
   decisions: McpGrantPreviewDecision[]
+  admissionStatus: McpWorkPackageAdmission['aggregate']['status']
+  blocked: string[]
+  warnings: string[]
+  blockedReason: string | null
   retryable: boolean
   primaryMode?: McpAdmissionMode
   primaryRecoveryAction?: McpRecoveryAction
+  evaluations: McpAdmissionEvaluation[]
+  subtaskDecisions: McpWorkPackageAdmission['subtaskDecisions']
 }
 
 export type McpBrokerAdmissionCheck = WorkPackageMcpBrokerCheck & {
@@ -189,14 +195,73 @@ function ownRecord(value: unknown): Record<string, unknown> | null {
   return isRecord(value) ? Object.fromEntries(Object.entries(value)) : null
 }
 
-function records(value: unknown): Record<string, unknown>[] {
-  return Array.isArray(value)
-    ? value.map(ownRecord).filter((entry): entry is Record<string, unknown> => entry !== null)
-    : []
-}
-
 function text(value: unknown, maxLength = 240): string {
   return sanitizeMcpError(value, maxLength)
+}
+
+function projectedIdentity(
+  value: unknown,
+  maxLength: number,
+): { value: string; valid: boolean } {
+  const projected = text(value, maxLength)
+  return {
+    value: projected,
+    valid: typeof value === 'string' &&
+      value.length <= maxLength &&
+      value.trim() === value &&
+      isSafeCapabilityText(value) &&
+      projected === value &&
+      projected.length > 0,
+  }
+}
+
+function validMcpIdText(value: unknown): boolean {
+  return typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 80 &&
+    value.trim() === value &&
+    isSafeCapabilityText(value) &&
+    /^[a-z0-9][a-z0-9_-]*$/.test(value)
+}
+
+const MCP_INSTALL_STATES = new Set<ProjectMcpStatus['installState']>(['installed', 'missing'])
+const MCP_HEALTH_STATUSES = new Set<ProjectMcpStatus['status']>([
+  'healthy',
+  'unhealthy',
+  'disabled',
+  'auth_required',
+  'configuration_required',
+  'unknown',
+])
+
+function validatedProjectMcpStatus(mcpId: string, value: unknown): ProjectMcpStatus | null {
+  const status = ownRecord(value)
+  if (
+    !status ||
+    status.mcpId !== mcpId ||
+    !MCP_INSTALL_STATES.has(status.installState as ProjectMcpStatus['installState']) ||
+    !MCP_HEALTH_STATUSES.has(status.status as ProjectMcpStatus['status']) ||
+    typeof status.enabled !== 'boolean' ||
+    (status.error !== null && typeof status.error !== 'string') ||
+    typeof status.checkedAt !== 'string' ||
+    status.checkedAt.length === 0 ||
+    status.checkedAt.length > 80 ||
+    status.checkedAt.trim() !== status.checkedAt ||
+    !Number.isFinite(Date.parse(status.checkedAt))
+  ) {
+    return null
+  }
+  return {
+    mcpId,
+    displayName: '',
+    description: '',
+    installPath: '',
+    installState: status.installState as ProjectMcpStatus['installState'],
+    status: status.status as ProjectMcpStatus['status'],
+    enabled: status.enabled,
+    error: status.error,
+    checkedAt: status.checkedAt,
+  }
 }
 
 function strings(value: unknown): string[] {
@@ -243,17 +308,41 @@ function boundedTexts(value: unknown, maxLength = 300): string[] {
     : []
 }
 
-function grantCapabilities(value: unknown): string[] {
+function boundedFilesystemCapabilities(
+  value: unknown,
+  options: { allowEmpty: boolean },
+): { valid: boolean; capabilities: string[] } {
+  if (!Array.isArray(value)) return { valid: false, capabilities: [] }
   const result = new Set<string>()
-  for (const grant of records(value)) {
-    if (grant.mcpId !== 'filesystem' || grant.status !== 'approved') continue
-    for (const capability of strings(grant.capabilities)) {
-      if (classifyCapability('filesystem', capability) === 'bounded_read_only') {
-        result.add(canonicalCapabilityForMcp('filesystem', capability))
-      }
+  for (const capability of value) {
+    if (
+      !isSafeCapabilityText(capability) ||
+      classifyCapability('filesystem', capability) !== 'bounded_read_only'
+    ) {
+      return { valid: false, capabilities: [] }
     }
+    result.add(canonicalCapabilityForMcp('filesystem', capability))
   }
-  return [...result].sort()
+  const capabilities = [...result].sort()
+  return {
+    valid: options.allowEmpty || capabilities.length > 0,
+    capabilities,
+  }
+}
+
+function grantCapabilities(value: unknown): { valid: boolean; capabilities: string[] } {
+  if (!Array.isArray(value)) return { valid: false, capabilities: [] }
+  const result = new Set<string>()
+  for (const valueItem of value) {
+    const grant = ownRecord(valueItem)
+    if (!grant) return { valid: false, capabilities: [] }
+    if (grant.mcpId !== 'filesystem') continue
+    if (grant.status !== 'approved') return { valid: false, capabilities: [] }
+    const parsed = boundedFilesystemCapabilities(grant.capabilities, { allowEmpty: true })
+    if (!parsed.valid) return { valid: false, capabilities: [] }
+    for (const capability of parsed.capabilities) result.add(capability)
+  }
+  return { valid: true, capabilities: [...result].sort() }
 }
 
 function covers(covered: readonly string[], required: readonly string[]): boolean {
@@ -266,24 +355,22 @@ export function readEffectiveGrantState(
   project: { mcpConfig: unknown },
   requiredCapabilities: string[],
 ): EffectiveGrantState {
-  const required = requiredCapabilities
-    .filter((capability) => classifyCapability('filesystem', capability) === 'bounded_read_only')
-    .map((capability) => canonicalCapabilityForMcp('filesystem', capability))
+  const parsedRequired = boundedFilesystemCapabilities(requiredCapabilities, { allowEmpty: false })
+  if (!parsedRequired.valid) return noGrant()
+  const required = parsedRequired.capabilities
   const metadata = ownRecord(pkg.metadata) ?? {}
   const phases = ownRecord(metadata.mcpGrantPhases) ?? {}
   const effective = ownRecord(phases.effective)
   const config = ownRecord(project.mcpConfig) ?? {}
   const grants = ownRecord(config.grants) ?? {}
   const projectGrant = ownRecord(grants.filesystem)
+  const parsedProjectCapabilities = boundedFilesystemCapabilities(projectGrant?.capabilities, { allowEmpty: false })
   const validProjectGrant = projectGrant?.schemaVersion === 1 &&
     projectGrant.mcpId === 'filesystem' &&
     projectGrant.status === 'approved' &&
-    projectGrant.grantMode === 'always_allow'
-  const projectCovered = validProjectGrant
-    ? strings(projectGrant.capabilities)
-        .filter((capability) => classifyCapability('filesystem', capability) === 'bounded_read_only')
-        .map((capability) => canonicalCapabilityForMcp('filesystem', capability))
-    : []
+    projectGrant.grantMode === 'always_allow' &&
+    parsedProjectCapabilities.valid
+  const projectCovered = validProjectGrant ? parsedProjectCapabilities.capabilities : []
 
   const validEffective = effective?.schemaVersion === 1 &&
     effective.phase === 'effective' &&
@@ -341,12 +428,15 @@ export function readEffectiveGrantState(
     validEffective &&
     effective.status === 'approved' &&
     effective.source === 'explicit-grant-approval' &&
-    (effective.grantMode === 'allow_once' || effective.grantMode === 'always_allow')
+    (effective.grantMode === 'allow_once' || effective.grantMode === 'always_allow') &&
+    typeof effective.runtimeIssued === 'boolean'
   ) {
     // The persisted phase records what was approved, even when its capability set is
     // narrower than this requirement. Admission rechecks exact coverage and fails
     // closed; it must not invent a new phase or grant mode to describe that mismatch.
-    const coveredCapabilities = grantCapabilities(effective.grants)
+    const parsedGrantCapabilities = grantCapabilities(effective.grants)
+    if (!parsedGrantCapabilities.valid) return noGrant()
+    const coveredCapabilities = parsedGrantCapabilities.capabilities
     const grantMode = effective.grantMode
     const consumed = grantMode === 'allow_once' && effective.runtimeIssued === true
     return {
@@ -368,7 +458,9 @@ export function readEffectiveGrantState(
     effective.runtimeIssued === true &&
     Array.isArray(effective.grants)
   ) {
-    const coveredCapabilities = grantCapabilities(effective.grants)
+    const parsedGrantCapabilities = grantCapabilities(effective.grants)
+    if (!parsedGrantCapabilities.valid) return noGrant()
+    const coveredCapabilities = parsedGrantCapabilities.capabilities
     if (coveredCapabilities.length > 0) {
       return {
         phase: 'approved',
@@ -427,13 +519,72 @@ function readProhibitedCapabilityKeys(value: unknown): { keys: Set<string>; malf
       return { keys: new Set(), malformed: true }
     }
     const items = [...value as Iterable<unknown>]
-    if (items.some((item) => !isSafeCapabilityText(item))) {
-      return { keys: new Set(), malformed: true }
+    const keys = new Set<string>()
+    for (const item of items) {
+      if (!isSafeCapabilityText(item) || normalizeCapability(item) !== item) {
+        return { keys: new Set(), malformed: true }
+      }
+      const mcpId = capabilityMcpId(item)
+      if (!mcpId || classifyCapability(mcpId, item) === 'unknown') {
+        return { keys: new Set(), malformed: true }
+      }
+      for (const key of coverageKeysForProhibition(item)) keys.add(key)
     }
-    return { keys: new Set(items as string[]), malformed: false }
+    return { keys, malformed: false }
   } catch {
     return { keys: new Set(), malformed: true }
   }
+}
+
+function coherentEffectiveGrantState(grant: Record<string, unknown>): boolean {
+  const covered = boundedFilesystemCapabilities(grant.coveredCapabilities, { allowEmpty: true })
+  if (!covered.valid) return false
+  if (
+    Object.hasOwn(grant, 'grantApprovalId') &&
+    grant.grantApprovalId !== undefined &&
+    typeof grant.grantApprovalId !== 'string'
+  ) return false
+  if (
+    Object.hasOwn(grant, 'revocationReason') &&
+    grant.revocationReason !== undefined &&
+    typeof grant.revocationReason !== 'string'
+  ) return false
+  if (Object.hasOwn(grant, 'consumed') && typeof grant.consumed !== 'boolean') return false
+  if (Object.hasOwn(grant, 'grantMode') && grant.grantMode !== 'allow_once' && grant.grantMode !== 'always_allow') {
+    return false
+  }
+  if (grant.phase !== 'revoked' && grant.revocationReason !== undefined) return false
+
+  if (grant.phase === 'none' || grant.phase === 'proposed' || grant.phase === 'not_issued') {
+    return grant.source === 'none' &&
+      grant.status === 'not_issued' &&
+      covered.capabilities.length === 0 &&
+      !Object.hasOwn(grant, 'grantMode') &&
+      !Object.hasOwn(grant, 'consumed')
+  }
+  if (grant.phase === 'denied') {
+    return grant.source === 'package-local' &&
+      grant.status === 'denied' &&
+      covered.capabilities.length === 0 &&
+      !Object.hasOwn(grant, 'grantMode') &&
+      !Object.hasOwn(grant, 'consumed')
+  }
+  if (grant.phase === 'revoked') {
+    return grant.source === 'project-level' &&
+      grant.status === 'not_issued' &&
+      typeof grant.revocationReason === 'string' &&
+      text(grant.revocationReason, 300).length > 0 &&
+      !Object.hasOwn(grant, 'grantMode') &&
+      !Object.hasOwn(grant, 'consumed')
+  }
+  if (grant.phase !== 'approved' || grant.status !== 'approved') return false
+  if (grant.source === 'project-level') {
+    return grant.grantMode === 'always_allow' &&
+      (!Object.hasOwn(grant, 'consumed') || grant.consumed === false)
+  }
+  if (grant.source !== 'package-local') return false
+  if (grant.grantMode !== 'allow_once' && grant.grantMode !== 'always_allow') return false
+  return grant.grantMode === 'allow_once' || !Object.hasOwn(grant, 'consumed') || grant.consumed === false
 }
 
 export function admitMcpRequirement(input: {
@@ -448,6 +599,19 @@ export function admitMcpRequirement(input: {
   fallback: { action: McpFallbackAction }
   evidenceRefs?: string[]
 }): McpAdmissionDecision {
+  const mcpIdentity = projectedIdentity(input.mcpId, 80)
+  const agentIdentity = projectedIdentity(input.agent, 80)
+  const mcpId = mcpIdentity.value
+  const agent = agentIdentity.value
+  const requirement = input.requirement === 'optional' || input.requirement === 'required'
+    ? input.requirement
+    : 'required'
+  const malformedMcpId = !mcpIdentity.valid || !validMcpIdText(input.mcpId)
+  const malformedAgent = !agentIdentity.valid || agentIdentity.value === 'unknown'
+  const malformedRequirement = input.requirement !== 'required' && input.requirement !== 'optional'
+  const malformedPromptContext = typeof input.hasPromptOnlyContext !== 'boolean'
+  const hasPromptOnlyContext = input.hasPromptOnlyContext === true
+  const observedStatus = validatedProjectMcpStatus(mcpId, input.status)
   const requestedCapabilities = Array.isArray(input.requestedCapabilities)
     ? input.requestedCapabilities.filter(isSafeCapabilityText)
     : []
@@ -463,24 +627,15 @@ export function admitMcpRequirement(input: {
   const prohibited = readProhibitedCapabilityKeys(input.packageProhibitedKeys)
   const grant = ownRecord(input.effectiveGrant)
   const grantCoveredCapabilities = grant?.coveredCapabilities
-  const validGrantPhases: EffectiveGrantState['phase'][] = ['none', 'proposed', 'approved', 'denied', 'revoked', 'not_issued']
-  const validGrantSources: EffectiveGrantState['source'][] = ['none', 'package-local', 'project-level']
-  const validGrantStatuses: EffectiveGrantState['status'][] = ['not_issued', 'approved', 'denied']
-  const malformedGrantCoverage = grant === null ||
-    !Array.isArray(grantCoveredCapabilities) ||
-    grantCoveredCapabilities.some((capability) => !isSafeCapabilityText(capability)) ||
-    !validGrantPhases.includes(grant.phase as EffectiveGrantState['phase']) ||
-    !validGrantSources.includes(grant.source as EffectiveGrantState['source']) ||
-    !validGrantStatuses.includes(grant.status as EffectiveGrantState['status']) ||
-    (Object.hasOwn(grant, 'grantMode') && grant.grantMode !== 'allow_once' && grant.grantMode !== 'always_allow') ||
-    (Object.hasOwn(grant, 'consumed') && typeof grant.consumed !== 'boolean')
-  const effectiveGrant: EffectiveGrantState = malformedGrantCoverage
+  const parsedGrantCoverage = boundedFilesystemCapabilities(grantCoveredCapabilities, { allowEmpty: true })
+  const malformedGrant = grant === null || !coherentEffectiveGrantState(grant)
+  const effectiveGrant: EffectiveGrantState = malformedGrant
     ? noGrant()
     : {
         phase: grant.phase as EffectiveGrantState['phase'],
         source: grant.source as EffectiveGrantState['source'],
         status: grant.status as EffectiveGrantState['status'],
-        coveredCapabilities: [...grantCoveredCapabilities as string[]],
+        coveredCapabilities: [...parsedGrantCoverage.capabilities],
         ...(grant.grantMode === 'allow_once' || grant.grantMode === 'always_allow'
           ? { grantMode: grant.grantMode }
           : {}),
@@ -489,18 +644,18 @@ export function admitMcpRequirement(input: {
         ...(typeof grant.revocationReason === 'string' ? { revocationReason: text(grant.revocationReason, 300) } : {}),
       }
   const normalizedCapabilities = requestedCapabilities.map((capability) =>
-    canonicalCapabilityForMcp(input.mcpId, capability),
+    canonicalCapabilityForMcp(mcpId, capability),
   )
   const capabilityClasses = normalizedCapabilities.map((capability) => ({
     capability,
-    class: classifyCapability(input.mcpId, capability),
-    deliveryKind: mcpDeliveryKind(input.mcpId),
+    class: classifyCapability(mcpId, capability),
+    deliveryKind: mcpDeliveryKind(mcpId),
   }))
   const base = {
     schemaVersion: 1 as const,
-    mcpId: input.mcpId,
-    agent: input.agent,
-    requirement: input.requirement,
+    mcpId,
+    agent,
+    requirement,
     requestedCapabilities: [...requestedCapabilities],
     normalizedCapabilities,
     capabilityClasses,
@@ -523,16 +678,20 @@ export function admitMcpRequirement(input: {
     ...(recoveryAction ? { recoveryAction } : {}),
     ...(grantState ? { grantState } : {}),
   })
-  const canProceed = canProceedWithoutMcp(input.requirement, {
+  const canProceed = canProceedWithoutMcp(requirement, {
     action: malformedFallback ? 'block' : fallbackAction,
   })
 
   const malformedDirectInputs = [
+    ...(malformedMcpId ? ['MCP id'] : []),
+    ...(malformedAgent ? ['agent'] : []),
+    ...(malformedRequirement ? ['requirement'] : []),
     ...(malformedRequestedCapabilities ? ['requested capabilities'] : []),
     ...(malformedEvidenceRefs ? ['evidence references'] : []),
     ...(malformedFallback ? ['fallback'] : []),
+    ...(malformedPromptContext ? ['prompt context evidence'] : []),
     ...(prohibited.malformed ? ['prohibition set'] : []),
-    ...(malformedGrantCoverage ? ['grant coverage'] : []),
+    ...(malformedGrant ? ['grant coverage/state'] : []),
   ]
   if (malformedDirectInputs.length > 0) {
     return result(
@@ -542,11 +701,11 @@ export function admitMcpRequirement(input: {
       'revise_plan',
     )
   }
-  if (!isKnownMcpId(input.mcpId)) {
+  if (!isKnownMcpId(mcpId)) {
     return result(
       'blocked',
       'blocked',
-      `Unknown MCP '${input.mcpId}' for capabilities: ${capabilityReasonList(normalizedCapabilities)}.`,
+      `Unknown MCP '${mcpId}' for capabilities: ${capabilityReasonList(normalizedCapabilities)}.`,
       'revise_plan',
     )
   }
@@ -557,7 +716,7 @@ export function admitMcpRequirement(input: {
     return result(
       'blocked',
       'blocked',
-      `MCP '${input.mcpId}' includes unknown capabilities: ${capabilityReasonList(unknownCapabilities)}.`,
+      `MCP '${mcpId}' includes unknown capabilities: ${capabilityReasonList(unknownCapabilities)}.`,
       'revise_plan',
     )
   }
@@ -568,7 +727,7 @@ export function admitMcpRequirement(input: {
     return result(
       'blocked',
       'blocked',
-      `MCP '${input.mcpId}' includes package-prohibited capabilities: ${capabilityReasonList(prohibitedCapabilities)}.`,
+      `MCP '${mcpId}' includes package-prohibited capabilities: ${capabilityReasonList(prohibitedCapabilities)}.`,
       'revise_plan',
     )
   }
@@ -614,11 +773,11 @@ export function admitMcpRequirement(input: {
         grantStateForDecision(effectiveGrant),
       )
     }
-    if (!isMcpHealthy(input.mcpId, input.status)) {
+    if (!isMcpHealthy(mcpId, observedStatus)) {
       return result(
         'bounded_context_approved',
         canProceed ? 'warning' : 'blocked',
-        `${mcpHealthReason(input.mcpId, input.status)} Required capabilities: ${capabilityReasonList(boundedPacketCapabilities)}.`,
+        `${mcpHealthReason(mcpId, observedStatus)} Required capabilities: ${capabilityReasonList(boundedPacketCapabilities)}.`,
         'install_or_fix_mcp',
         grantStateForDecision(effectiveGrant),
       )
@@ -636,7 +795,7 @@ export function admitMcpRequirement(input: {
     (item) => item.class === 'bounded_read_only' && item.deliveryKind === 'planning_context_only',
   )
   if (planningContextReads) {
-    if (input.hasPromptOnlyContext) {
+    if (hasPromptOnlyContext) {
       return result(
         'planning_only',
         'allowed',
@@ -659,7 +818,7 @@ export function admitMcpRequirement(input: {
         )
   }
 
-  if (normalizedCapabilities.length === 0 && !input.hasPromptOnlyContext && !canProceed) {
+  if (normalizedCapabilities.length === 0 && !hasPromptOnlyContext && !canProceed) {
     return result('blocked', 'blocked', 'The MCP requirement has no capabilities or materialized planning context.', 'revise_plan')
   }
   return result(
@@ -691,10 +850,85 @@ function fallbackOf(entry: Record<string, unknown>): { action: McpFallbackAction
   return { action, message: text(fallback.message, 500) }
 }
 
+function policyShapeValidationErrors(entry: Record<string, unknown>): string[] {
+  const errors: string[] = []
+  const keyed = explicitRequirementKey(entry).present
+  if (!validMcpIdText(entry.mcpId)) {
+    errors.push('MCP policy mcpId must be an exact bounded identifier.')
+  } else if (!isKnownMcpId(entry.mcpId as string)) {
+    errors.push('MCP policy mcpId must identify a known MCP.')
+  }
+  if (entry.requirement !== 'required' && entry.requirement !== 'optional') {
+    errors.push("MCP policy requirement must be 'required' or 'optional'.")
+  }
+  const agentError = entryAgentValidationError(entry, { allowLegacyFallback: !keyed })
+  if (agentError) errors.push(agentError)
+  const assignmentError = assignmentValidationError(entry, { required: keyed })
+  if (assignmentError) errors.push(assignmentError)
+  if (keyed && !sourceRequirementIndex(entry).present) {
+    errors.push('A keyed MCP policy must persist sourceRequirementIndex.')
+  }
+  const fallback = Object.hasOwn(entry, 'fallback') ? ownRecord(entry.fallback) : null
+  if (
+    !fallback ||
+    (fallback.action !== 'block' && fallback.action !== 'continue_without_mcp' && fallback.action !== 'ask_user')
+  ) {
+    errors.push('MCP policy fallback must contain one exact supported action.')
+  }
+  return errors
+}
+
+function promptEvidenceValidationError(entry: Record<string, unknown> | null): string | null {
+  if (!entry) return null
+  if (!Object.hasOwn(entry, 'promptOverlayPresent')) {
+    return explicitRequirementKey(entry).present
+      ? 'A keyed derived MCP envelope must persist boolean promptOverlayPresent evidence.'
+      : null
+  }
+  return typeof entry.promptOverlayPresent === 'boolean'
+    ? null
+    : 'Derived promptOverlayPresent evidence must be boolean when present.'
+}
+
 function entryAgent(entry: Record<string, unknown>): string {
   return (Object.hasOwn(entry, 'agent') ? text(entry.agent, 80) : '') ||
     (Object.hasOwn(entry, 'assignedRole') ? text(entry.assignedRole, 80) : '') ||
+    legacyAssignmentAgent(entry) ||
     'unknown'
+}
+
+function legacyAssignmentAgent(entry: Record<string, unknown>): string | null {
+  const assignment = ownRecord(entry.assignment)
+  if (!assignment || !Array.isArray(assignment.targetAgents) || assignment.targetAgents.length !== 1) return null
+  const projected = projectedIdentity(assignment.targetAgents[0], 80)
+  return projected.valid && projected.value !== 'unknown' ? projected.value : null
+}
+
+function entryAgentValidationError(
+  entry: Record<string, unknown>,
+  options: { allowLegacyFallback: boolean },
+): string | null {
+  const hasAgent = Object.hasOwn(entry, 'agent')
+  const hasAssignedRole = Object.hasOwn(entry, 'assignedRole')
+  if (!hasAgent && !options.allowLegacyFallback) {
+    return 'MCP policy must persist an explicit agent identity.'
+  }
+  if (!hasAgent && !hasAssignedRole) {
+    return legacyAssignmentAgent(entry) ? null : 'MCP policy agent identity is required.'
+  }
+
+  const agent = hasAgent ? projectedIdentity(entry.agent, 80) : null
+  const assignedRole = hasAssignedRole ? projectedIdentity(entry.assignedRole, 80) : null
+  if (agent && (!agent.valid || agent.value === 'unknown')) {
+    return 'MCP policy agent identity must be an exact safe value.'
+  }
+  if (assignedRole && (!assignedRole.valid || assignedRole.value === 'unknown')) {
+    return 'MCP policy assignedRole identity must be an exact safe value.'
+  }
+  if (agent && assignedRole && agent.value !== assignedRole.value) {
+    return 'MCP policy agent and assignedRole identities must agree.'
+  }
+  return null
 }
 
 function namedAgent(entry: Record<string, unknown>): string | null {
@@ -743,6 +977,7 @@ function explicitRequirementKey(entry: Record<string, unknown>): ExplicitRequire
 function validDecisionId(entry: Record<string, unknown>): boolean {
   return Object.hasOwn(entry, 'decisionId') &&
     typeof entry.decisionId === 'string' &&
+    isSafeCapabilityText(entry.decisionId) &&
     entry.decisionId.length > 0 &&
     entry.decisionId.length <= 160 &&
     entry.decisionId.trim() === entry.decisionId &&
@@ -944,7 +1179,8 @@ function joinEntries(entries: Array<Record<string, unknown>>): JoinedEntry[] {
 }
 
 function snapshot(mcpId: string, status: ProjectMcpStatus | null): McpHealthSnapshot {
-  if (!status || status.mcpId !== mcpId) {
+  const observed = validatedProjectMcpStatus(mcpId, status)
+  if (!observed) {
     return {
       schemaVersion: 1,
       observed: false,
@@ -960,21 +1196,50 @@ function snapshot(mcpId: string, status: ProjectMcpStatus | null): McpHealthSnap
     schemaVersion: 1,
     observed: true,
     mcpId,
-    installState: status.installState,
-    status: status.status,
-    enabled: status.enabled,
-    error: status.error === null ? null : sanitizeMcpError(status.error, 240) || null,
-    checkedAt: status.checkedAt,
+    installState: observed.installState,
+    status: observed.status,
+    enabled: observed.enabled,
+    error: observed.error === null ? null : sanitizeMcpError(observed.error, 240) || null,
+    checkedAt: observed.checkedAt,
   }
+}
+
+const MCP_ASSIGNMENT_TYPES = new Set<McpAssignmentType>([
+  'agent',
+  'multiple_agents',
+  'workforce',
+  'architect_only',
+  'reviewer_only',
+])
+
+function assignmentValidationError(
+  entry: Record<string, unknown>,
+  options: { required?: boolean } = {},
+): string | null {
+  if (!Object.hasOwn(entry, 'assignment')) {
+    return options.required ? 'A keyed MCP record must persist assignment evidence.' : null
+  }
+  const assignment = ownRecord(entry.assignment)
+  if (!assignment) return 'MCP source assignment must be a record when present.'
+  if (!MCP_ASSIGNMENT_TYPES.has(assignment.type as McpAssignmentType)) {
+    return 'MCP source assignment type is unsupported.'
+  }
+  if (!Object.hasOwn(assignment, 'targetId') || (assignment.targetId !== null && typeof assignment.targetId !== 'string')) {
+    return 'MCP source assignment targetId must be a string or null.'
+  }
+  if (typeof assignment.targetId === 'string') {
+    const target = projectedIdentity(assignment.targetId, 160)
+    if (!target.valid) return 'MCP source assignment targetId must be an exact safe value.'
+  }
+  return null
 }
 
 function assignmentOf(entry: Record<string, unknown>): { type: McpAssignmentType; targetId: string | null } {
   const assignment = Object.hasOwn(entry, 'assignment') ? ownRecord(entry.assignment) ?? {} : {}
-  const allowed = new Set(['agent', 'multiple_agents', 'workforce', 'architect_only', 'reviewer_only'])
-  const type = typeof assignment.type === 'string' && allowed.has(assignment.type)
+  const type = typeof assignment.type === 'string' && MCP_ASSIGNMENT_TYPES.has(assignment.type as McpAssignmentType)
     ? assignment.type as McpAssignmentType
     : 'agent'
-  return { type, targetId: typeof assignment.targetId === 'string' ? assignment.targetId : null }
+  return { type, targetId: typeof assignment.targetId === 'string' ? text(assignment.targetId, 160) || null : null }
 }
 
 function planningCoverageKey(requirementKey: string, agent: string, capability: string): string {
@@ -997,9 +1262,57 @@ export function admitWorkPackageMcp(input: {
   effectiveGrantFor: (entry: { requirementKey: string; mcpId: string; requiredCapabilities: string[] }) => EffectiveGrantState
   hasPromptOnlyContextFor: (entry: { requirementKey: string; agent: string; mcpId: string }) => boolean
 }): McpWorkPackageAdmission {
-  const entries = Array.isArray(input.entries)
-    ? input.entries.map((entry) => ownRecord(entry) ?? {})
-    : []
+  const malformedEntriesContainer = !Array.isArray(input.entries)
+  if (malformedEntriesContainer) {
+    const reason = decisionReason('MCP requirement entries must be an array of policy records.')
+    const health = snapshot('invalid', null)
+    return {
+      schemaVersion: 2,
+      evaluations: [{
+        decision: {
+          schemaVersion: 1,
+          mcpId: 'invalid',
+          agent: 'unknown',
+          requirement: 'required',
+          requestedCapabilities: [],
+          normalizedCapabilities: [],
+          capabilityClasses: [],
+          mode: 'blocked',
+          status: 'blocked',
+          reason,
+          recoveryAction: 'revise_plan',
+          evidenceRefs: [],
+        },
+        source: {
+          requirementKey: 'invalid-entries-container',
+          decisionId: 'req-invalid-entries-container',
+          sourceRequirementIndex: 0,
+          assignment: { type: 'agent', targetId: null },
+          fallback: { action: 'block', message: '' },
+          promptOverlayPresent: false,
+        },
+        health,
+      }],
+      subtaskDecisions: [],
+      referencedHealth: [{
+        mcpId: 'invalid',
+        installState: 'unknown',
+        status: 'unknown',
+        enabled: false,
+        error: null,
+      }],
+      aggregate: {
+        status: 'blocked',
+        blocked: [reason],
+        warnings: [],
+        blockedReason: `MCP/capability broker blocked "${text(input.label, 160) || 'work package'}": ${reason}`,
+        retryable: false,
+        primaryMode: 'blocked',
+        primaryRecoveryAction: 'revise_plan',
+      },
+    }
+  }
+  const entries = input.entries.map((entry) => ownRecord(entry) ?? {})
   const joined = joinEntries(entries)
   const packageProhibitedKeys = new Set<string>()
   const invalidProhibitions = new Map<string, string[]>()
@@ -1026,19 +1339,49 @@ export function admitWorkPackageMcp(input: {
   for (const item of joined) {
     const envelope = item.grant ?? item.raw ?? {}
     const policy = item.raw
-    const mcpId = text((policy ?? envelope).mcpId, 80)
+    const mcpId = projectedIdentity((policy ?? envelope).mcpId, 80).value
     const agent = entryAgent(policy ?? envelope)
     const fallback = fallbackOf(policy ?? envelope)
-    const status = input.statusFor(mcpId)
-    const health = snapshot(mcpId, status)
     const requestedCapabilities = policy ? mergeCapabilityFields(policy) : []
     const persistedPromptOnlyContext = item.grant?.promptOverlayPresent === true
-    const callbackPromptOnlyContext = input.hasPromptOnlyContextFor({ requirementKey: item.requirementKey, agent, mcpId })
+    const promptEvidenceError = promptEvidenceValidationError(item.grant)
+    const envelopeAgentError = item.grant && explicitRequirementKey(item.grant).present
+      ? entryAgentValidationError(item.grant, { allowLegacyFallback: false })
+      : null
+    const envelopeAssignmentError = item.grant
+      ? assignmentValidationError(item.grant, { required: explicitRequirementKey(item.grant).present })
+      : null
+    const invalid = invalidProhibitions.get(item.requirementKey)
+    const preflightErrors = policy
+      ? [
+          ...(item.joinError ? [item.joinError] : []),
+          ...capabilityFieldValidationErrors(policy),
+          ...policyShapeValidationErrors(policy),
+          ...(promptEvidenceError ? [promptEvidenceError] : []),
+          ...(envelopeAgentError ? [envelopeAgentError] : []),
+          ...(envelopeAssignmentError ? [envelopeAssignmentError] : []),
+          ...(invalid ?? []),
+        ]
+      : []
+    const consultCallbacks = policy !== null && preflightErrors.length === 0
+    const status = consultCallbacks
+      ? validatedProjectMcpStatus(mcpId, input.statusFor(mcpId))
+      : null
+    const health = snapshot(mcpId, status)
+    const callbackPromptOnlyContextValue = consultCallbacks
+      ? input.hasPromptOnlyContextFor({ requirementKey: item.requirementKey, agent, mcpId })
+      : false
+    const callbackPromptOnlyContext = callbackPromptOnlyContextValue === true
+    const callbackPromptEvidenceError = typeof callbackPromptOnlyContextValue === 'boolean'
+      ? null
+      : 'Prompt-context materialization callback must return boolean evidence.'
     const hasPromptOnlyContext = persistedPromptOnlyContext || callbackPromptOnlyContext
     const requiredCapabilities = requestedCapabilities.filter((capability) =>
       classifyCapability(mcpId, capability) === 'bounded_read_only' && mcpDeliveryKind(mcpId) === 'bounded_context_packet',
     )
-    const effectiveGrant = input.effectiveGrantFor({ requirementKey: item.requirementKey, mcpId, requiredCapabilities })
+    const effectiveGrant = consultCallbacks
+      ? input.effectiveGrantFor({ requirementKey: item.requirementKey, mcpId, requiredCapabilities })
+      : noGrant()
     let decision: McpAdmissionDecision
     if (!policy) {
       decision = {
@@ -1068,12 +1411,9 @@ export function admitWorkPackageMcp(input: {
         fallback,
         evidenceRefs: boundedTexts(policy.evidenceRefs),
       })
-      const invalid = invalidProhibitions.get(item.requirementKey)
-      const policyErrors = capabilityFieldValidationErrors(policy)
       const failClosedErrors = [
-        ...(item.joinError ? [item.joinError] : []),
-        ...policyErrors,
-        ...(invalid ?? []),
+        ...preflightErrors,
+        ...(callbackPromptEvidenceError ? [callbackPromptEvidenceError] : []),
       ]
       if (failClosedErrors.length > 0) {
         decision = {
@@ -1148,14 +1488,29 @@ export function admitWorkPackageMcp(input: {
         : {
             subtask: { id: `invalid-subtask-${index}` },
             structuralErrors: [`subtasks item ${index} must be a record.`],
-          })
+      })
     })
   }
+  const seenSubtaskIds = new Set<string>()
   for (const { subtask, structuralErrors } of subtasks) {
-    const subtaskId = text(subtask.id, 160) || 'unknown-subtask'
+    const subtaskIdentity = projectedIdentity(subtask.id, 160)
+    const subtaskId = subtaskIdentity.value || 'unknown-subtask'
     const agent = entryAgent(subtask)
     const declarationErrors: string[] = [...structuralErrors]
+    const invalidSubtaskId = !subtaskIdentity.valid || subtaskIdentity.value === 'unknown-subtask'
+    let duplicateSubtaskId = false
+    if (invalidSubtaskId) {
+      declarationErrors.push('Subtask id must be an exact safe value.')
+    } else if (seenSubtaskIds.has(subtaskId)) {
+      duplicateSubtaskId = true
+      declarationErrors.push(`Subtask id '${subtaskId}' is duplicated.`)
+    } else {
+      seenSubtaskIds.add(subtaskId)
+    }
+    const agentError = entryAgentValidationError(subtask, { allowLegacyFallback: false })
+    if (agentError) declarationErrors.push(agentError.replace(/^MCP policy /, 'Subtask '))
     const declaredCapabilities: string[] = []
+    const seenDeclaredCapabilities = new Set<string>()
     if (!Object.hasOwn(subtask, 'mcpCapabilities')) {
       declarationErrors.push('mcpCapabilities must be present as an array of safe non-empty strings.')
     } else {
@@ -1169,7 +1524,13 @@ export function admitWorkPackageMcp(input: {
           if (!isSafeCapabilityText(capability)) {
             declarationErrors.push(`mcpCapabilities item ${index} must be a safe non-empty string.`)
           } else {
-            declaredCapabilities.push(normalizeCapability(capability))
+            const normalized = normalizeCapability(capability)
+            if (seenDeclaredCapabilities.has(normalized)) {
+              declarationErrors.push(`mcpCapabilities item ${index} duplicates '${normalized}'.`)
+            } else {
+              seenDeclaredCapabilities.add(normalized)
+              declaredCapabilities.push(normalized)
+            }
           }
         }
       }
@@ -1206,7 +1567,9 @@ export function admitWorkPackageMcp(input: {
       }
     })
 
-    for (const rawCapability of declaredCapabilities) {
+    for (const rawCapability of agentError || invalidSubtaskId || duplicateSubtaskId
+      ? []
+      : declaredCapabilities) {
       const mcpId = capabilityMcpId(rawCapability)
       const capability = mcpId ? canonicalCapabilityForMcp(mcpId, rawCapability) : normalizeCapability(rawCapability)
       const capabilityClass = mcpId ? classifyCapability(mcpId, capability) : 'unknown'
@@ -1478,7 +1841,13 @@ export function admissionToGrantPreview(admission: McpWorkPackageAdmission): Mcp
     runtimeEnforcement: 'not_implemented',
     summary,
     decisions,
+    admissionStatus: admission.aggregate.status,
+    blocked: [...admission.aggregate.blocked],
+    warnings: [...admission.aggregate.warnings],
+    blockedReason: admission.aggregate.blockedReason,
     retryable: admission.aggregate.retryable,
+    evaluations: admission.evaluations.map(cloneEvaluation),
+    subtaskDecisions: admission.subtaskDecisions.map((decision) => ({ ...decision })),
     ...(admission.aggregate.primaryMode ? { primaryMode: admission.aggregate.primaryMode } : {}),
     ...(admission.aggregate.primaryRecoveryAction
       ? { primaryRecoveryAction: admission.aggregate.primaryRecoveryAction }
