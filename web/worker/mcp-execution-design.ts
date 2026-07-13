@@ -1,21 +1,23 @@
 import { MCP_EXECUTION_DESIGN_FENCE, findFence, isMcpExecutionDesignShape } from '@/lib/plan-fences'
 import { isKnownMcpId } from '@/lib/mcps/catalog'
+import { MCP_CATALOG } from '@/lib/mcps/catalog'
+import { SAFE_READ_SUPPLEMENT } from '@/lib/mcps/capability-normalization'
 import type { ProjectMcpOverview, ProjectMcpStatus } from '@/lib/mcps/types'
 
 const ASSIGNMENT_TYPES = new Set(['agent', 'multiple_agents', 'workforce', 'architect_only', 'reviewer_only'])
 const FALLBACK_ACTIONS = new Set(['block', 'continue_without_mcp', 'ask_user'])
-const SAFE_BETA_CAPABILITY_PATTERNS: Record<string, RegExp[]> = {
-  filesystem: [
-    /^filesystem\.(?:project\.)?read$/,
-    /^filesystem\.(?:project\.)?list$/,
-    /^filesystem\.(?:project\.)?search$/,
-  ],
-  github: [
-    /^github\.(?:issues|pull_requests|contents|repository|actions)\.read$/,
-    /^github\.(?:repository|contents)\.list$/,
-    /^github\.(?:repository|contents)\.search$/,
-  ],
-}
+export const SAFE_BETA_CAPABILITY_PATTERNS: Record<string, RegExp[]> = Object.fromEntries(
+  Object.entries(MCP_CATALOG).map(([mcpId, entry]) => [
+    mcpId,
+    [
+      ...entry.runtime.capabilities.map((capability) => new RegExp(`^${capability.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`)),
+      ...(SAFE_READ_SUPPLEMENT[mcpId as keyof typeof SAFE_READ_SUPPLEMENT] ?? []),
+      ...(mcpId === 'filesystem'
+        ? [/^filesystem\.read$/, /^filesystem\.list$/, /^filesystem\.search$/]
+        : []),
+    ],
+  ]),
+)
 const NON_RETRYABLE_BROKER_BLOCK_PATTERN = /Unknown MCP|outside the allowed beta scope|no approved capabilities|does not name a known MCP|not covered by an explicit approved grant|Run-scoped MCP prompt overlays/i
 const RETRYABLE_BROKER_BLOCK_PATTERN = /not configured|auth_required|missing|unhealthy|disabled|not installed|install_required/i
 
