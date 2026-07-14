@@ -6,6 +6,7 @@ import {
   coverageKeysForGrant,
   mcpDeliveryKind,
   normalizeCapability,
+  REQUIREMENT_CAPABILITY_FIELDS,
 } from '@/lib/mcps/capability-normalization'
 import {
   admissionToBrokerCheck,
@@ -174,10 +175,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function objectArray(value: unknown): Record<string, unknown>[] {
-  return Array.isArray(value) ? value.filter(isRecord) : []
-}
-
 const MAX_AGENT_IDENTITY_LENGTH = 40
 const MAX_REQUIREMENTS = 20
 const MAX_REQUIREMENT_CONTEXTS = 120
@@ -185,6 +182,19 @@ const MAX_MCP_AWARE_SUBTASKS = 40
 const MAX_CAPABILITY_REQUIREMENTS = 30
 const MAX_PROMPT_OVERLAYS = 40
 const MAX_AGENT_PERMISSIONS = 6
+const MAX_BROKER_POLICIES = 40
+const MAX_BROKER_GRANTS = 40
+const MAX_BROKER_NORMALIZATION_ITEMS = 200
+const MAX_BROKER_NESTED_ITEMS = 30
+const MAX_EXECUTOR_PROMPT_OVERLAY_LENGTH = 2_000
+
+function normalizeExecutorPromptOverlay(values: readonly unknown[]): string {
+  return values
+    .filter((value): value is string => typeof value === 'string')
+    .join('\n\n')
+    .trim()
+    .replace(/\s+/g, ' ')
+}
 
 function strictText(
   value: unknown,
@@ -640,7 +650,25 @@ function normalizeRequirementContexts(
       }
     }
   }
-  return { contexts, errors }
+  const contextsByAgent = new Map<string, McpRequirementContext[]>()
+  for (const context of contexts) {
+    const agentContexts = contextsByAgent.get(context.agent) ?? []
+    agentContexts.push(context)
+    contextsByAgent.set(context.agent, agentContexts)
+  }
+  const overflowingAgents = new Set<string>()
+  for (const [agent, agentContexts] of contextsByAgent) {
+    const executorOverlay = normalizeExecutorPromptOverlay(agentContexts.map((context) => context.promptOverlay))
+    if (executorOverlay.length <= MAX_EXECUTOR_PROMPT_OVERLAY_LENGTH) continue
+    overflowingAgents.add(agent)
+    errors.push(
+      `MCP requirement contexts for canonical package agent '${agent}' exceed the executor overlay limit of ${MAX_EXECUTOR_PROMPT_OVERLAY_LENGTH} characters; no prompt context was materialized for that agent.`,
+    )
+  }
+  return {
+    contexts: contexts.filter((context) => !overflowingAgents.has(context.agent)),
+    errors,
+  }
 }
 
 function normalizeSubtask(
@@ -1209,13 +1237,17 @@ export function deriveMcpGrantDecisions(design: McpExecutionDesign | null, overv
 }
 
 function metadataGrants(metadata: unknown): Record<string, unknown>[] {
-  return isRecord(metadata) ? objectArray(metadata.mcpGrants) : []
+  return isRecord(metadata) ? boundedObjectArray(metadata.mcpGrants, MAX_BROKER_GRANTS) : []
+}
+
+function boundedObjectArray(value: unknown, maxItems: number): Record<string, unknown>[] {
+  return Array.isArray(value) && value.length <= maxItems ? value.filter(isRecord) : []
 }
 
 function brokerEntries(input: { assignedRole?: string; mcpRequirements?: unknown; metadata?: unknown }): Record<string, unknown>[] {
   const fallbackAgent = cleanAgent(input.assignedRole) ?? 'unknown'
   const currentSchema = isRecord(input.metadata) && input.metadata.mcpGrantsSchemaVersion === 2
-  return [...objectArray(input.mcpRequirements), ...metadataGrants(input.metadata)].map((entry) =>
+  return [...boundedObjectArray(input.mcpRequirements, MAX_BROKER_POLICIES), ...metadataGrants(input.metadata)].map((entry) =>
     currentSchema || Object.hasOwn(entry, 'agent') || Object.hasOwn(entry, 'requirementKey')
       ? entry
       : { ...entry, agent: fallbackAgent })
@@ -1224,7 +1256,7 @@ function brokerEntries(input: { assignedRole?: string; mcpRequirements?: unknown
 function brokerSubtasks(metadata: unknown, assignedRole?: string): Record<string, unknown>[] {
   const fallbackAgent = cleanAgent(assignedRole) ?? 'unknown'
   const currentSchema = isRecord(metadata) && metadata.mcpGrantsSchemaVersion === 2
-  return (isRecord(metadata) ? objectArray(metadata.mcpAwareSubtasks) : []).map((subtask) =>
+  return (isRecord(metadata) ? boundedObjectArray(metadata.mcpAwareSubtasks, MAX_MCP_AWARE_SUBTASKS) : []).map((subtask) =>
     currentSchema || Object.hasOwn(subtask, 'agent') || Object.hasOwn(subtask, 'capabilityBindings')
       ? subtask
       : { ...subtask, agent: fallbackAgent })
@@ -1232,12 +1264,14 @@ function brokerSubtasks(metadata: unknown, assignedRole?: string): Record<string
 
 function brokerNormalizationErrors(metadata: unknown): string[] {
   if (!isRecord(metadata)) return []
-  const storedErrors = Array.isArray(metadata.mcpNormalizationErrors)
+  const storedErrors = Array.isArray(metadata.mcpNormalizationErrors) &&
+    metadata.mcpNormalizationErrors.length <= MAX_BROKER_NORMALIZATION_ITEMS
     ? metadata.mcpNormalizationErrors
     .map((error) => cleanText(error, 500))
     .filter((error) => error !== '')
     : []
-  const evidenceErrors = Array.isArray(metadata.mcpNormalizationEvidence)
+  const evidenceErrors = Array.isArray(metadata.mcpNormalizationEvidence) &&
+    metadata.mcpNormalizationEvidence.length <= MAX_BROKER_NORMALIZATION_ITEMS
     ? metadata.mcpNormalizationEvidence.flatMap((value) => {
         if (!isRecord(value)) return []
         const category = value.category
@@ -1252,20 +1286,53 @@ function brokerNormalizationErrors(metadata: unknown): string[] {
 }
 
 function brokerSchemaErrors(input: { mcpRequirements?: unknown; metadata?: unknown }): string[] {
-  if (!isRecord(input.metadata) || input.metadata.mcpGrantsSchemaVersion !== 2) return []
+  const metadata = isRecord(input.metadata) ? input.metadata : null
+  const currentSchema = metadata?.mcpGrantsSchemaVersion === 2
+  const schemaLabel = currentSchema ? 'MCP schema v2' : 'Legacy MCP'
   const errors: string[] = []
-  if (Object.hasOwn(input.metadata, 'mcpNormalizationErrors')) {
-    if (!Array.isArray(input.metadata.mcpNormalizationErrors)) {
-      errors.push('MCP schema v2 normalization errors must be stored as an array.')
-    } else if (input.metadata.mcpNormalizationErrors.some((error) => cleanText(error, 500) === '')) {
-      errors.push('MCP schema v2 normalization errors must contain only non-empty strings.')
+  if (input.metadata !== undefined && input.metadata !== null && metadata === null) {
+    errors.push('Legacy MCP metadata must be stored as a record.')
+  }
+
+  const persistedArray = (
+    value: unknown,
+    options: { label: string; maxItems: number; present: boolean },
+  ): unknown[] => {
+    if (!options.present) return []
+    if (!Array.isArray(value)) {
+      errors.push(`${schemaLabel} ${options.label} must be stored as an array.`)
+      return []
+    }
+    if (value.length > options.maxItems) {
+      errors.push(`${schemaLabel} ${options.label} exceeds the maximum raw count of ${options.maxItems}.`)
+      return []
+    }
+    return value
+  }
+
+  const nestedBoundErrors = (value: Record<string, unknown>, index: number, label: string, fields: readonly string[]) => {
+    for (const field of fields) {
+      if (Array.isArray(value[field]) && value[field].length > MAX_BROKER_NESTED_ITEMS) {
+        errors.push(`${schemaLabel} ${label} ${index} field '${field}' exceeds the maximum raw count of ${MAX_BROKER_NESTED_ITEMS}.`)
+      }
     }
   }
-  if (Object.hasOwn(input.metadata, 'mcpNormalizationEvidence')) {
-    if (!Array.isArray(input.metadata.mcpNormalizationEvidence)) {
-      errors.push('MCP schema v2 normalization evidence must be stored as an array.')
-    } else {
-      input.metadata.mcpNormalizationEvidence.forEach((value, index) => {
+
+  const normalizationErrors = persistedArray(metadata?.mcpNormalizationErrors, {
+    label: 'normalization errors',
+    maxItems: MAX_BROKER_NORMALIZATION_ITEMS,
+    present: metadata !== null && Object.hasOwn(metadata, 'mcpNormalizationErrors'),
+  })
+  if (normalizationErrors.some((error) => cleanText(error, 500) === '')) {
+    errors.push(`${schemaLabel} normalization errors must contain only non-empty strings.`)
+  }
+
+  const normalizationEvidence = persistedArray(metadata?.mcpNormalizationEvidence, {
+    label: 'normalization evidence',
+    maxItems: MAX_BROKER_NORMALIZATION_ITEMS,
+    present: metadata !== null && Object.hasOwn(metadata, 'mcpNormalizationEvidence'),
+  })
+  normalizationEvidence.forEach((value, index) => {
         const evidence = isRecord(value) ? value : null
         if (
           !evidence ||
@@ -1277,82 +1344,133 @@ function brokerSchemaErrors(input: { mcpRequirements?: unknown; metadata?: unkno
           evidence.message.length === 0 ||
           evidence.message.length > 300
         ) {
-          errors.push(`MCP schema v2 normalization evidence ${index} is malformed.`)
+          errors.push(`${schemaLabel} normalization evidence ${index} is malformed.`)
         }
-      })
-    }
-  }
-  const policyEntries = Array.isArray(input.mcpRequirements) ? input.mcpRequirements : []
-  if (input.mcpRequirements !== undefined && !Array.isArray(input.mcpRequirements)) {
-    errors.push('MCP schema v2 policies must be stored as an array.')
-  }
+  })
+
+  const policyEntries = persistedArray(input.mcpRequirements, {
+    label: 'policies',
+    maxItems: MAX_BROKER_POLICIES,
+    present: input.mcpRequirements !== undefined,
+  })
   policyEntries.forEach((value, index) => {
     if (!isRecord(value)) {
-      errors.push(`MCP schema v2 policy ${index} must be a record.`)
+      errors.push(`${schemaLabel} policy ${index} must be a record.`)
       return
     }
-    if (cleanText(value.requirementKey, 200) === '') {
+    nestedBoundErrors(value, index, 'policy', [...REQUIREMENT_CAPABILITY_FIELDS, 'prohibitedCapabilities', 'evidenceRefs'])
+    if (currentSchema && cleanText(value.requirementKey, 200) === '') {
       errors.push(`MCP schema v2 policy ${index} must persist a requirementKey.`)
     }
-    if (cleanAgent(value.agent) === null) {
+    if (currentSchema && cleanAgent(value.agent) === null) {
       errors.push(`MCP schema v2 policy ${index} must persist an explicit agent identity.`)
     }
   })
-  const grants = Array.isArray(input.metadata.mcpGrants) ? input.metadata.mcpGrants : []
-  if (Object.hasOwn(input.metadata, 'mcpGrants') && !Array.isArray(input.metadata.mcpGrants)) {
-    errors.push('MCP schema v2 grant envelopes must be stored as an array.')
-  }
+
+  const grants = persistedArray(metadata?.mcpGrants, {
+    label: 'grant envelopes',
+    maxItems: MAX_BROKER_GRANTS,
+    present: metadata !== null && Object.hasOwn(metadata, 'mcpGrants'),
+  })
   grants.forEach((value, index) => {
     if (!isRecord(value)) {
-      errors.push(`MCP schema v2 grant envelope ${index} must be a record.`)
+      errors.push(`${schemaLabel} grant envelope ${index} must be a record.`)
       return
     }
-    if (cleanText(value.requirementKey, 200) === '') {
+    nestedBoundErrors(value, index, 'grant envelope', [
+      ...REQUIREMENT_CAPABILITY_FIELDS,
+      'normalizedCapabilities',
+      'capabilityClasses',
+      'evidenceRefs',
+    ])
+    if (currentSchema && cleanText(value.requirementKey, 200) === '') {
       errors.push(`MCP schema v2 grant envelope ${index} must persist a requirementKey.`)
     }
-    if (cleanAgent(value.agent) === null) {
+    if (currentSchema && cleanAgent(value.agent) === null) {
       errors.push(`MCP schema v2 grant envelope ${index} must persist an explicit agent identity.`)
     }
   })
-  const subtasks = Array.isArray(input.metadata.mcpAwareSubtasks) ? input.metadata.mcpAwareSubtasks : []
-  if (Object.hasOwn(input.metadata, 'mcpAwareSubtasks') && !Array.isArray(input.metadata.mcpAwareSubtasks)) {
-    errors.push('MCP schema v2 subtasks must be stored as an array.')
-  }
+
+  const subtasks = persistedArray(metadata?.mcpAwareSubtasks, {
+    label: 'subtasks',
+    maxItems: MAX_MCP_AWARE_SUBTASKS,
+    present: metadata !== null && Object.hasOwn(metadata, 'mcpAwareSubtasks'),
+  })
   subtasks.forEach((value, index) => {
     if (!isRecord(value)) {
-      errors.push(`MCP schema v2 subtask ${index} must be a record.`)
+      errors.push(`${schemaLabel} subtask ${index} must be a record.`)
       return
     }
-    if (cleanAgent(value.agent) === null) {
+    nestedBoundErrors(value, index, 'subtask', ['mcpCapabilities', 'capabilityBindings'])
+    if (currentSchema && cleanAgent(value.agent) === null) {
       errors.push(`MCP schema v2 subtask ${index} must persist an explicit agent identity.`)
     }
-    if (!Array.isArray(value.capabilityBindings)) {
+    if (currentSchema && !Array.isArray(value.capabilityBindings)) {
       errors.push(`MCP schema v2 subtask ${index} must persist explicit capabilityBindings.`)
     }
   })
-  const contexts = Array.isArray(input.metadata.requirementContexts) ? input.metadata.requirementContexts : []
-  if (Object.hasOwn(input.metadata, 'requirementContexts') && !Array.isArray(input.metadata.requirementContexts)) {
-    errors.push('MCP schema v2 requirement contexts must be stored as an array.')
-  }
+
+  const contexts = persistedArray(metadata?.requirementContexts, {
+    label: 'requirement contexts',
+    maxItems: MAX_REQUIREMENT_CONTEXTS,
+    present: metadata !== null && Object.hasOwn(metadata, 'requirementContexts'),
+  })
   contexts.forEach((value, index) => {
     if (!isRecord(value)) {
-      errors.push(`MCP schema v2 requirement context ${index} must be a record.`)
+      errors.push(`${schemaLabel} requirement context ${index} must be a record.`)
       return
     }
-    if (
+    const promptOverlay = typeof value.promptOverlay === 'string'
+      ? value.promptOverlay.trim().replace(/\s+/g, ' ')
+      : ''
+    if (currentSchema && (
       cleanText(value.requirementKey, 200) === '' ||
       cleanAgent(value.agent) === null ||
       cleanText(value.mcpId, 80) === '' ||
-      cleanText(value.promptOverlay, 2_000) === ''
-    ) {
+      !Number.isSafeInteger(value.sourceRequirementIndex) ||
+      (value.sourceRequirementIndex as number) < 0 ||
+      promptOverlay === '' ||
+      promptOverlay.length > 1_000
+    )) {
       errors.push(`MCP schema v2 requirement context ${index} must persist complete scoped evidence.`)
     }
+    if (currentSchema && !policyEntries.some((policy) =>
+      isRecord(policy) &&
+      policy.requirementKey === value.requirementKey &&
+      policy.sourceRequirementIndex === value.sourceRequirementIndex &&
+      policy.agent === value.agent &&
+      policy.mcpId === value.mcpId,
+    )) {
+      errors.push(`MCP schema v2 requirement context ${index} does not match an exact persisted policy identity.`)
+    }
   })
-  if (
-    cleanText(input.metadata.promptOverlay, 2_000) !== '' &&
-    contexts.length === 0
-  ) {
-    errors.push('MCP schema v2 prompt context must be scoped by requirement identity.')
+
+  if (currentSchema && metadata) {
+    const validContexts = contexts.filter(isRecord)
+    const expectedExecutorOverlay = normalizeExecutorPromptOverlay(validContexts.map((context) => context.promptOverlay))
+    const actualExecutorOverlay = normalizeExecutorPromptOverlay([metadata.promptOverlay])
+    if (
+      expectedExecutorOverlay.length > MAX_EXECUTOR_PROMPT_OVERLAY_LENGTH ||
+      actualExecutorOverlay.length > MAX_EXECUTOR_PROMPT_OVERLAY_LENGTH
+    ) {
+      errors.push(`MCP schema v2 scoped prompt context exceeds the executor overlay limit of ${MAX_EXECUTOR_PROMPT_OVERLAY_LENGTH} characters.`)
+    }
+    if (actualExecutorOverlay !== expectedExecutorOverlay) {
+      errors.push('MCP schema v2 prompt context must be scoped by requirement identity and the executor overlay must exactly match those contexts.')
+    }
+    grants.filter(isRecord).forEach((grant, index) => {
+      if (typeof grant.promptOverlayPresent !== 'boolean') return
+      const hasMatchingContext = validContexts.some((context) =>
+        context.requirementKey === grant.requirementKey &&
+        context.sourceRequirementIndex === grant.sourceRequirementIndex &&
+        context.agent === grant.agent &&
+        context.mcpId === grant.mcpId &&
+        cleanText(context.promptOverlay, 2_000) !== '',
+      )
+      if (grant.promptOverlayPresent !== hasMatchingContext) {
+        errors.push(`MCP schema v2 grant envelope ${index} prompt evidence does not match its scoped requirement context.`)
+      }
+    })
   }
   return [...new Set(errors)]
 }
@@ -1360,20 +1478,31 @@ function brokerSchemaErrors(input: { mcpRequirements?: unknown; metadata?: unkno
 function brokerHasPromptInstructions(metadata: unknown): boolean {
   return isRecord(metadata) && (
     cleanText(metadata.promptOverlay, 200) !== '' ||
-    objectArray(metadata.requirementContexts).length > 0 ||
+    boundedObjectArray(metadata.requirementContexts, MAX_REQUIREMENT_CONTEXTS).length > 0 ||
     brokerSubtasks(metadata).length > 0 ||
     brokerNormalizationErrors(metadata).length > 0 ||
     (Array.isArray(metadata.mcpNormalizationEvidence) && metadata.mcpNormalizationEvidence.length > 0)
   )
 }
 
-export function hasWorkPackageMcpRuntimeInputs(input: { harnessToolPolicy?: unknown; mcpRequirements?: unknown; metadata?: unknown }): boolean {
-  return brokerEntries(input).length > 0 || brokerHasPromptInstructions(input.metadata) || brokerSchemaErrors(input).length > 0
+type WorkPackageMcpRuntimeInput = { harnessToolPolicy?: unknown; mcpRequirements?: unknown; metadata?: unknown }
+
+function hasWorkPackageMcpRuntimeInputsUnchecked(input: WorkPackageMcpRuntimeInput): boolean {
+  return brokerSchemaErrors(input).length > 0 || brokerEntries(input).length > 0 || brokerHasPromptInstructions(input.metadata)
+}
+
+export function hasWorkPackageMcpRuntimeInputs(input: WorkPackageMcpRuntimeInput): boolean {
+  try {
+    if (brokerSchemaErrors(input).length > 0) return true
+    return hasWorkPackageMcpRuntimeInputsUnchecked(structuredClone(input))
+  } catch {
+    return true
+  }
 }
 
 function brokerHasPromptContext(metadata: unknown, entry: { requirementKey: string; agent: string; mcpId: string }, entries: Record<string, unknown>[]): boolean {
   const meta = isRecord(metadata) ? metadata : {}
-  if (objectArray(meta.requirementContexts).some((context) =>
+  if (boundedObjectArray(meta.requirementContexts, MAX_REQUIREMENT_CONTEXTS).some((context) =>
     context.requirementKey === entry.requirementKey &&
     context.agent === entry.agent &&
     context.mcpId === entry.mcpId &&
@@ -1394,11 +1523,12 @@ export type WorkPackageMcpAdmissionInput = {
   title?: string
 }
 
-export function admitWorkPackageMcpBroker(input: WorkPackageMcpAdmissionInput): McpWorkPackageAdmission {
-  const entries = brokerEntries(input)
+function admitWorkPackageMcpBrokerUnchecked(input: WorkPackageMcpAdmissionInput): McpWorkPackageAdmission {
+  const schemaErrors = brokerSchemaErrors(input)
+  const entries = schemaErrors.length === 0 ? brokerEntries(input) : []
   const admission = admitWorkPackageMcp({
     entries,
-    subtasks: brokerSubtasks(input.metadata, input.assignedRole),
+    subtasks: schemaErrors.length === 0 ? brokerSubtasks(input.metadata, input.assignedRole) : [],
     label: cleanText(input.title, 120) || cleanText(input.assignedRole, 80) || 'work package',
     statusFor: (mcpId) => statusFor(input.mcpOverview, mcpId),
     effectiveGrantFor: ({ requiredCapabilities }) => readEffectiveGrantState(
@@ -1410,7 +1540,7 @@ export function admitWorkPackageMcpBroker(input: WorkPackageMcpAdmissionInput): 
   })
   const normalizationErrors = [
     ...brokerNormalizationErrors(input.metadata),
-    ...brokerSchemaErrors(input),
+    ...schemaErrors,
   ]
   if (normalizationErrors.length === 0) return admission
   // A malformed persisted policy is the fail-closed primary block. Keep its
@@ -1430,6 +1560,26 @@ export function admitWorkPackageMcpBroker(input: WorkPackageMcpAdmissionInput): 
       primaryRecoveryAction: 'revise_plan',
       primaryDecision: undefined,
     },
+  }
+}
+
+function unsafeBrokerInspectionBlock(): McpWorkPackageAdmission {
+  return admitWorkPackageMcp({
+    entries: null as unknown as Array<Record<string, unknown>>,
+    subtasks: [],
+    label: 'work package',
+    statusFor: () => null,
+    effectiveGrantFor: () => ({ phase: 'none', source: 'none', status: 'not_issued', coveredCapabilities: [] }),
+    hasPromptOnlyContextFor: () => false,
+  })
+}
+
+export function admitWorkPackageMcpBroker(input: WorkPackageMcpAdmissionInput): McpWorkPackageAdmission {
+  try {
+    if (brokerSchemaErrors(input).length > 0) return admitWorkPackageMcpBrokerUnchecked(input)
+    return admitWorkPackageMcpBrokerUnchecked(structuredClone(input))
+  } catch {
+    return unsafeBrokerInspectionBlock()
   }
 }
 

@@ -43,7 +43,7 @@ function manifestPath(installPath: string): string {
   return path.join(/*turbopackIgnore: true*/ installPath, 'forge.mcp.json')
 }
 
-function normalizeProjectMcpConfig(rawConfig: Project['mcpConfig'] | null | undefined): ProjectMcpConfig {
+export function normalizeProjectMcpConfig(rawConfig: Project['mcpConfig'] | null | undefined): ProjectMcpConfig {
   const raw = rawConfig && typeof rawConfig === 'object' ? rawConfig : DEFAULT_PROJECT_MCP_CONFIG
   const requiredMcps = Array.isArray(raw.requiredMcps)
     ? Array.from(new Set(raw.requiredMcps.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)))

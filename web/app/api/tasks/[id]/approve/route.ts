@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
+import { isDeepStrictEqual } from 'node:util'
 import { db } from '@/db'
 import { approvalGates, projects, tasks, workPackages } from '@/db/schema'
 import { and, asc, eq, sql } from 'drizzle-orm'
@@ -7,7 +8,7 @@ import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
-import { getProjectMcpOverview } from '@/lib/mcps/manager'
+import { getProjectMcpOverview, normalizeProjectMcpConfig } from '@/lib/mcps/manager'
 import {
   type McpHealthSnapshot,
   type McpWorkPackageAdmission,
@@ -61,6 +62,21 @@ function approvalHealthSnapshot(admissions: McpWorkPackageAdmission[]): McpHealt
     }
   }
   return [...byMcpId.values()].sort((left, right) => left.mcpId.localeCompare(right.mcpId))
+}
+
+function healthSnapshotMatchesLockedPolicy(
+  overview: ProjectMcpOverview,
+  capturedLocalPath: unknown,
+  lockedProject: { localPath?: unknown; mcpConfig: ProjectMcpOverview['config'] },
+): boolean {
+  // The overview is captured before the transaction because probing MCP health
+  // may write cache rows. Approval may consume it only while the normalized
+  // project policy it was captured for is still the locked project policy.
+  return capturedLocalPath === lockedProject.localPath &&
+    isDeepStrictEqual(
+      normalizeProjectMcpConfig(overview.config),
+      normalizeProjectMcpConfig(lockedProject.mcpConfig),
+    )
 }
 
 function buildApprovedPackageGrantPhases(input: {
@@ -202,6 +218,25 @@ export async function POST(
         .for('update')
       if (!lockedProject) {
         return { task: null, approvedGates: [] as { id: string }[], approvalBlock: null }
+      }
+
+      if (!healthSnapshotMatchesLockedPolicy(mcpOverview, projectForHealth.localPath, lockedProject)) {
+        const reason = 'Project MCP health inputs changed while approval health was being checked (configuration or local path). Review the latest project settings and approve again.'
+        return {
+          task: null,
+          approvedGates: [] as { id: string }[],
+          approvalBlock: {
+            error: reason,
+            evidenceRefs: [] as string[],
+            primaryDecision: null,
+            primaryMode: 'blocked' as const,
+            reason,
+            primaryRecoveryAction: 'revise_plan' as const,
+            primaryRetryableContribution: false,
+            retryable: false,
+            workPackageId: null,
+          },
+        }
       }
 
       const [lockedTask] = await tx

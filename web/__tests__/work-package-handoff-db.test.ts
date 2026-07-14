@@ -760,7 +760,7 @@ describe('handoffApprovedWorkPackages', () => {
     expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
   })
 
-  it('preserves an approved project filesystem grant through the broker handoff check', async () => {
+  it('uses a current approved project filesystem grant even when the package has no persisted project-effective phase', async () => {
     const projectGrant = {
       schemaVersion: 1,
       mcpId: 'filesystem',
@@ -792,21 +792,7 @@ describe('handoffApprovedWorkPackages', () => {
         assignment: { type: 'agent', targetId: null },
         fallback: { action: 'block', message: '' },
       }],
-      metadata: {
-        mcpGrantPhases: { effective: {
-          schemaVersion: 1, phase: 'effective', source: 'project-filesystem-approval',
-          grantApprovalId: projectGrant.grantApprovalId, grantMode: 'always_allow',
-          scope: 'project', mcpId: 'filesystem', approvedAt: projectGrant.approvedAt,
-          approvedBy: projectGrant.approvedBy,
-          grants: [{
-            mcpId: 'filesystem', status: 'approved', capabilities: projectGrant.capabilities,
-            grantApprovalId: projectGrant.grantApprovalId, grantMode: 'always_allow',
-            reason: projectGrant.reason,
-          }],
-          reason: projectGrant.reason, runtimeIssued: false,
-          runtimeEnforcement: 'bounded_context_packet', status: 'approved',
-        } },
-      },
+      metadata: {},
       sequence: 1,
       status: 'pending',
       title: 'Read project files',
@@ -890,6 +876,49 @@ describe('handoffApprovedWorkPackages', () => {
     expect(mocks.publishTaskEvent).not.toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
       status: 'ready',
       workPackageId: 'pkg-1',
+    }))
+  })
+
+  it('blocks malformed legacy MCP containers at actual handoff instead of treating them as no runtime input', async () => {
+    const project = {
+      id: 'project-1',
+      mcpConfig: { profile: 'default', requiredMcps: [], overrides: {} },
+    }
+    const pkg = {
+      id: 'pkg-malformed-legacy',
+      assignedRole: 'backend',
+      harnessId: 'harness-1',
+      mcpRequirements: { mcpId: 'github', permissions: ['github.issues.read'] },
+      metadata: { mcpGrants: { decisionId: 'not-an-array' } },
+      sequence: 1,
+      status: 'pending',
+      title: 'Malformed legacy MCP package',
+    }
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([pkg]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ project }]))
+      .mockReturnValueOnce(chain([freshAdmissionRow(pkg, project)]))
+
+    const blockUpdate = updateChain([{ id: pkg.id }])
+    mocks.dbUpdate.mockReturnValueOnce(blockUpdate)
+
+    const result = await handoffApprovedWorkPackages('task-1', { claimEnabled: false })
+
+    expect(result).toMatchObject({
+      blockedReason: expect.stringContaining('Legacy MCP policies must be stored as an array'),
+      claimedPackageId: null,
+      readyPackageIds: [],
+      status: 'blocked',
+    })
+    expect(blockUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      blockedReason: expect.stringContaining('Legacy MCP policies must be stored as an array'),
+      status: 'blocked',
+    }))
+    expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
+    expect(mocks.publishTaskEvent).not.toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
+      status: 'ready',
+      workPackageId: pkg.id,
     }))
   })
 

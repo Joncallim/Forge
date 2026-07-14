@@ -534,7 +534,15 @@ describe('executeWorkPackage', () => {
           fallback: { action: 'block' },
         }],
         metadata: {
+          mcpGrantsSchemaVersion: 2,
           promptOverlay: 'Use GitHub read tools only for this approved run.',
+          requirementContexts: [{
+            requirementKey: 'mcp-requirement-v1-github-read-1',
+            sourceRequirementIndex: 0,
+            agent: 'backend',
+            mcpId: 'github',
+            promptOverlay: 'Use GitHub read tools only for this approved run.',
+          }],
           mcpAwareSubtasks: [{
             id: 'inspect-issue',
             mcpCapabilities: ['github.issues.read'],

@@ -1108,6 +1108,7 @@ function filesystemGrantHandoffBlock(
   const check = requiresFilesystemGrantApproval({
     mcpRequirements: pkg.mcpRequirements,
     metadata: pkg.metadata,
+    projectMcpConfig: project.mcpConfig,
   })
   if (!check.blocked) return null
   return {

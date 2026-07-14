@@ -2946,6 +2946,122 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       .toBeLessThan((lockedPackagesChain.for as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
   })
 
+  it.each([
+    ['MCP configuration', {
+      localPath: '/tmp/project-before',
+      mcpConfig: { profile: 'default', requiredMcps: [], overrides: {} },
+    }],
+    ['project path', {
+      localPath: '/tmp/project-after',
+      mcpConfig: { profile: 'default', requiredMcps: ['github'], overrides: {} },
+    }],
+  ] as const)('returns a no-write 409 when the locked %s changed after health capture', async (_label, lockedState) => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const awaitingTask = {
+      id: 'task-health-policy-drift',
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const capturedProject = {
+      id: 'project-1',
+      localPath: '/tmp/project-before',
+      mcpConfig: { profile: 'default' as const, requiredMcps: ['github'], overrides: {} },
+    }
+    const lockedProjectChain = chain([{ id: 'project-1', ...lockedState }])
+    lockedProjectChain.for = vi.fn(() => lockedProjectChain)
+    mockGetProjectMcpOverview.mockResolvedValueOnce({
+      projectId: capturedProject.id,
+      config: capturedProject.mcpConfig,
+      catalog: [],
+      mcpsRoot: '/tmp/mcps',
+      statuses: [{
+        mcpId: 'github', displayName: 'GitHub', description: '', installPath: '/tmp/mcps/github',
+        installState: 'installed', status: 'healthy', enabled: true, error: null,
+        checkedAt: '2026-07-14T00:00:01.000Z',
+      }],
+      summary: { label: 'Healthy', status: 'healthy', missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+    })
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([capturedProject]))
+      .mockReturnValueOnce(lockedProjectChain)
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest('/api/tasks/task-health-policy-drift/approve', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: awaitingTask.id }),
+    })
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({
+      error: expect.stringContaining('health inputs changed'),
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+      retryable: false,
+      workPackageId: null,
+    })
+    expect(lockedProjectChain.for).toHaveBeenCalledWith('update')
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+    expect(mockRedisPublish).not.toHaveBeenCalled()
+  })
+
+  it('fails closed without approval writes or queueing for malformed legacy MCP containers', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const awaitingTask = {
+      id: 'task-malformed-legacy-mcp',
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const project = {
+      id: 'project-1',
+      localPath: '/tmp/project-1',
+      mcpConfig: { profile: 'default' as const, requiredMcps: [], overrides: {} },
+    }
+    const lockedProject = chain([project])
+    const lockedTask = chain([awaitingTask])
+    const lockedPackages = chain([{
+      id: 'pkg-malformed-legacy-mcp',
+      assignedRole: 'backend',
+      title: 'Malformed legacy MCP package',
+      mcpRequirements: { mcpId: 'github', permissions: ['github.issues.read'] },
+      metadata: { mcpGrants: { decisionId: 'not-an-array' } },
+    }])
+    lockedProject.for = vi.fn(() => lockedProject)
+    lockedTask.for = vi.fn(() => lockedTask)
+    lockedPackages.orderBy = vi.fn(() => lockedPackages)
+    lockedPackages.for = vi.fn(() => lockedPackages)
+    mockGetProjectMcpOverview.mockResolvedValueOnce({
+      projectId: project.id,
+      config: project.mcpConfig,
+      catalog: [], mcpsRoot: '/tmp/mcps', statuses: [],
+      summary: { label: 'None', status: 'missing', missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+    })
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(lockedProject)
+      .mockReturnValueOnce(lockedTask)
+      .mockReturnValueOnce(lockedPackages)
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest('/api/tasks/task-malformed-legacy-mcp/approve', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: awaitingTask.id }),
+    })
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({
+      error: expect.stringContaining('Legacy MCP policies must be stored as an array'),
+      primaryRecoveryAction: 'revise_plan',
+      retryable: false,
+      workPackageId: 'pkg-malformed-legacy-mcp',
+    })
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+    expect(mockRedisPublish).not.toHaveBeenCalled()
+  })
+
   const overflowingSubtaskPolicy = (
     boundaryCapability: string,
     prohibitedCapabilities: readonly string[] = [],
