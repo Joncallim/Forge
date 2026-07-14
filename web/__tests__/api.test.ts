@@ -92,7 +92,8 @@ vi.mock('@/lib/providers/registry', () => ({
 }))
 
 const mockDecideReviewGate = vi.fn()
-vi.mock('@/worker/review-gates', () => ({
+vi.mock('@/worker/review-gates', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/worker/review-gates')>(),
   decideReviewGate: mockDecideReviewGate,
 }))
 
@@ -116,6 +117,17 @@ vi.mock('@/lib/github', () => ({
   validateGitHubTokenEnvVar: mockValidateGitHubTokenEnvVar,
 }))
 
+const mockGetProjectMcpOverview = vi.fn()
+vi.mock('@/lib/mcps/manager', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/mcps/manager')>()
+  return {
+    ...actual,
+    getProjectMcpOverview: (...args: Parameters<typeof actual.getProjectMcpOverview>) => (
+      mockGetProjectMcpOverview(...args) ?? actual.getProjectMcpOverview(...args)
+    ),
+  }
+})
+
 // ---------------------------------------------------------------------------
 // Drizzle chain factory
 // ---------------------------------------------------------------------------
@@ -127,7 +139,7 @@ function chain(resolveValue: unknown) {
     catch: (onRejected: (e: unknown) => unknown) =>
       Promise.resolve(resolveValue).catch(onRejected),
   }
-  const methods = ['from', 'where', 'limit', 'orderBy', 'groupBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'onConflictDoUpdate', 'onConflictDoNothing']
+  const methods = ['from', 'where', 'limit', 'orderBy', 'groupBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'onConflictDoUpdate', 'onConflictDoNothing', 'for']
   methods.forEach((m) => { thenable[m] = () => thenable })
   return thenable
 }
@@ -139,7 +151,7 @@ function rejectingChain(error: unknown) {
     catch: (onRejected: (e: unknown) => unknown) =>
       Promise.reject(error).catch(onRejected),
   }
-  const methods = ['from', 'where', 'limit', 'orderBy', 'groupBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'onConflictDoUpdate', 'onConflictDoNothing']
+  const methods = ['from', 'where', 'limit', 'orderBy', 'groupBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'onConflictDoUpdate', 'onConflictDoNothing', 'for']
   methods.forEach((m) => { thenable[m] = () => thenable })
   return thenable
 }
@@ -2805,7 +2817,18 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
 // ---------------------------------------------------------------------------
 
 describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockGetProjectMcpOverview.mockImplementation(async (project: { id: string; mcpConfig: unknown }) => ({
+      projectId: project.id,
+      config: project.mcpConfig,
+      catalog: [],
+      mcpsRoot: '/tmp/mcps',
+      statuses: [],
+      summary: { label: 'Unavailable', status: 'missing', missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+    }))
+  })
+  afterEach(() => { mockGetProjectMcpOverview.mockReset() })
 
   it('returns 409 when task status is pending', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
@@ -2826,35 +2849,78 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     expect(body.error).toMatch(/awaiting_approval/i)
   })
 
-  it('returns 409 when required filesystem grants are not approved yet', async () => {
+  it('uses the freshly locked project policy and returns 409 when its filesystem grant is absent', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const projectHealthChain = chain([{
+      id: 'project-1',
+      mcpConfig: {
+        grants: {
+          filesystem: {
+            schemaVersion: 1,
+            mcpId: 'filesystem',
+            status: 'approved',
+            grantMode: 'always_allow',
+            capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            grantApprovalId: 'stale-grant',
+            approvedAt: '2026-07-14T00:00:00.000Z',
+            approvedBy: FAKE_SESSION.userId,
+            reason: 'This pre-lock snapshot must not authorize approval.',
+          },
+        },
+      },
+    }])
+    const lockedProjectChain = chain([{ id: 'project-1', mcpConfig: {} }])
+    const lockedTaskChain = chain([{
+      id: 'task-approval',
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+    }])
+    const lockedPackagesChain = chain([{
+      id: 'pkg-fs',
+      assignedRole: 'frontend',
+      title: 'Frontend work package',
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        agent: 'frontend',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        fallback: { action: 'block', message: '' },
+      }],
+      metadata: {
+        mcpGrantPhases: {
+          effective: {
+            schemaVersion: 1,
+            phase: 'effective',
+            runtimeEnforcement: 'approved_snapshot',
+            status: 'not_issued',
+          },
+        },
+      },
+    }])
+    lockedProjectChain.for = vi.fn(() => lockedProjectChain)
+    lockedTaskChain.for = vi.fn(() => lockedTaskChain)
+    lockedPackagesChain.orderBy = vi.fn(() => lockedPackagesChain)
+    lockedPackagesChain.for = vi.fn(() => lockedPackagesChain)
+    mockGetProjectMcpOverview.mockResolvedValueOnce({
+      projectId: 'project-1', config: {}, catalog: [], mcpsRoot: '/tmp/mcps',
+      statuses: [{
+        mcpId: 'filesystem', displayName: 'Filesystem', description: '', installPath: '/tmp/mcps/filesystem',
+        installState: 'installed', status: 'healthy', enabled: true, error: null,
+        checkedAt: '2026-07-14T00:00:01.000Z',
+      }],
+      summary: { label: 'Healthy', status: 'healthy', missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+    })
     mockDbSelect
       .mockReturnValueOnce(chain([{
         id: 'task-approval',
+        projectId: 'project-1',
         status: 'awaiting_approval',
         updatedAt: new Date('2026-06-25T00:00:00.000Z'),
       }]))
-      .mockReturnValueOnce(chain([{
-        id: 'pkg-fs',
-        assignedRole: 'frontend',
-        title: 'Frontend work package',
-        mcpRequirements: [{
-          mcpId: 'filesystem',
-          requirement: 'required',
-          capabilities: ['filesystem.project.read', 'filesystem.project.search'],
-        }],
-        metadata: {
-          mcpGrantPhases: {
-            effective: {
-              schemaVersion: 1,
-              phase: 'effective',
-              runtimeEnforcement: 'approved_snapshot',
-              status: 'not_issued',
-            },
-          },
-        },
-      }]))
-      .mockReturnValueOnce(chain([{ mcpConfig: {} }]))
+      .mockReturnValueOnce(projectHealthChain)
+      .mockReturnValueOnce(lockedProjectChain)
+      .mockReturnValueOnce(lockedTaskChain)
+      .mockReturnValueOnce(lockedPackagesChain)
 
     const { POST } = await import('@/app/api/tasks/[id]/approve/route')
     const req = authRequest('/api/tasks/task-approval/approve', { method: 'POST' })
@@ -2862,15 +2928,733 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
 
     expect(res.status).toBe(409)
     await expect(res.json()).resolves.toMatchObject({
-      error: expect.stringContaining('Approve or deny required filesystem context'),
-      missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      error: expect.stringContaining('Filesystem context approval is required'),
+      primaryRecoveryAction: 'approve_project_filesystem_context',
       workPackageId: 'pkg-fs',
+    })
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+    expect(mockGetProjectMcpOverview.mock.invocationCallOrder[0])
+      .toBeLessThan(mockDbTransaction.mock.invocationCallOrder[0])
+    expect(lockedProjectChain.for).toHaveBeenCalledWith('update')
+    expect(lockedTaskChain.for).toHaveBeenCalledWith('update')
+    expect(lockedPackagesChain.orderBy).toHaveBeenCalledOnce()
+    expect(lockedPackagesChain.for).toHaveBeenCalledWith('update')
+    expect((lockedProjectChain.for as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
+      .toBeLessThan((lockedTaskChain.for as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
+    expect((lockedTaskChain.for as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
+      .toBeLessThan((lockedPackagesChain.for as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
+  })
+
+  it.each([
+    ['MCP configuration', {
+      localPath: '/tmp/project-before',
+      mcpConfig: { profile: 'default', requiredMcps: [], overrides: {} },
+    }],
+    ['project path', {
+      localPath: '/tmp/project-after',
+      mcpConfig: { profile: 'default', requiredMcps: ['github'], overrides: {} },
+    }],
+  ] as const)('returns a no-write 409 when the locked %s changed after health capture', async (_label, lockedState) => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const awaitingTask = {
+      id: 'task-health-policy-drift',
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const capturedProject = {
+      id: 'project-1',
+      localPath: '/tmp/project-before',
+      mcpConfig: { profile: 'default' as const, requiredMcps: ['github'], overrides: {} },
+    }
+    const lockedProjectChain = chain([{ id: 'project-1', ...lockedState }])
+    lockedProjectChain.for = vi.fn(() => lockedProjectChain)
+    mockGetProjectMcpOverview.mockResolvedValueOnce({
+      projectId: capturedProject.id,
+      config: capturedProject.mcpConfig,
+      catalog: [],
+      mcpsRoot: '/tmp/mcps',
+      statuses: [{
+        mcpId: 'github', displayName: 'GitHub', description: '', installPath: '/tmp/mcps/github',
+        installState: 'installed', status: 'healthy', enabled: true, error: null,
+        checkedAt: '2026-07-14T00:00:01.000Z',
+      }],
+      summary: { label: 'Healthy', status: 'healthy', missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+    })
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([capturedProject]))
+      .mockReturnValueOnce(lockedProjectChain)
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest('/api/tasks/task-health-policy-drift/approve', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: awaitingTask.id }),
+    })
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({
+      error: expect.stringContaining('health inputs changed'),
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+      retryable: false,
+      workPackageId: null,
+    })
+    expect(lockedProjectChain.for).toHaveBeenCalledWith('update')
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+    expect(mockRedisPublish).not.toHaveBeenCalled()
+  })
+
+  it('fails closed without approval writes or queueing for malformed legacy MCP containers', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const awaitingTask = {
+      id: 'task-malformed-legacy-mcp',
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const project = {
+      id: 'project-1',
+      localPath: '/tmp/project-1',
+      mcpConfig: { profile: 'default' as const, requiredMcps: [], overrides: {} },
+    }
+    const lockedProject = chain([project])
+    const lockedTask = chain([awaitingTask])
+    const lockedPackages = chain([{
+      id: 'pkg-malformed-legacy-mcp',
+      assignedRole: 'backend',
+      title: 'Malformed legacy MCP package',
+      mcpRequirements: { mcpId: 'github', permissions: ['github.issues.read'] },
+      metadata: { mcpGrants: { decisionId: 'not-an-array' } },
+    }])
+    lockedProject.for = vi.fn(() => lockedProject)
+    lockedTask.for = vi.fn(() => lockedTask)
+    lockedPackages.orderBy = vi.fn(() => lockedPackages)
+    lockedPackages.for = vi.fn(() => lockedPackages)
+    mockGetProjectMcpOverview.mockResolvedValueOnce({
+      projectId: project.id,
+      config: project.mcpConfig,
+      catalog: [], mcpsRoot: '/tmp/mcps', statuses: [],
+      summary: { label: 'None', status: 'missing', missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+    })
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(lockedProject)
+      .mockReturnValueOnce(lockedTask)
+      .mockReturnValueOnce(lockedPackages)
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest('/api/tasks/task-malformed-legacy-mcp/approve', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: awaitingTask.id }),
+    })
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({
+      error: expect.stringContaining('Legacy MCP policies must be stored as an array'),
+      primaryRecoveryAction: 'revise_plan',
+      retryable: false,
+      workPackageId: 'pkg-malformed-legacy-mcp',
+    })
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+    expect(mockRedisPublish).not.toHaveBeenCalled()
+  })
+
+  const overflowingSubtaskPolicy = (
+    boundaryCapability: string,
+    prohibitedCapabilities: readonly string[] = [],
+  ) => ({
+    schemaVersion: 1,
+    requirements: [{
+      mcpId: 'github', requirement: 'required', reason: 'Read issues.',
+      assignment: { type: 'agent', targetAgents: ['backend'], targetId: null },
+      agentPermissions: { backend: ['github.issues.read'] },
+      prohibitedCapabilities: [...prohibitedCapabilities], fallback: { action: 'block', message: 'Revise.' },
+    }],
+    promptOverlays: {}, requirementContexts: [],
+    mcpAwareSubtasks: [{
+      id: 'inspect', agent: 'backend', dependsOn: [],
+      mcpCapabilities: [...Array(30).fill('github.issues.read'), boundaryCapability],
+      inputs: [], outputs: [], verification: [], stoppingCondition: 'Done.', fallback: 'Revise.',
+    }],
+  })
+
+  it.each([
+    ['filesystem first', ['filesystem', 'github']],
+    ['github first', ['github', 'filesystem']],
+  ] as const)('returns one precedence-consistent primary admission decision in either requirement order: %s', async (_label, order) => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const awaitingTask = {
+      id: 'task-mixed-mcp-blockers',
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const project = { id: 'project-1', mcpConfig: {} }
+    const requirements = {
+      filesystem: {
+        requirementKey: 'a-fs',
+        sourceRequirementIndex: 0,
+        mcpId: 'filesystem',
+        agent: 'backend',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read'],
+        evidenceRefs: ['filesystem-proof'],
+        prohibitedCapabilities: [],
+        assignment: { type: 'agent', targetId: null },
+        fallback: { action: 'block', message: '' },
+      },
+      github: {
+        requirementKey: 'z-gh',
+        sourceRequirementIndex: 1,
+        mcpId: 'github',
+        agent: 'backend',
+        requirement: 'required',
+        capabilities: ['github.contents.write'],
+        evidenceRefs: ['github-proof'],
+        prohibitedCapabilities: [],
+        assignment: { type: 'agent', targetId: null },
+        fallback: { action: 'block', message: '' },
+      },
+    }
+    const workPackage = {
+      id: 'pkg-mixed',
+      assignedRole: 'backend',
+      title: 'Mixed MCP blockers',
+      mcpRequirements: order.map((key) => requirements[key]),
+      metadata: {},
+    }
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([workPackage]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest('/api/tasks/task-mixed-mcp-blockers/approve', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: awaitingTask.id }),
+    })
+
+    expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body).toMatchObject({
+      reason: expect.stringContaining('deferred live MCP capabilities'),
+      evidenceRefs: ['github-proof'],
+      primaryMode: 'deferred_live_mcp',
+      primaryRecoveryAction: 'revise_plan',
+      primaryDecision: {
+        kind: 'requirement',
+        mode: 'deferred_live_mcp',
+        recoveryAction: 'revise_plan',
+        retryableContribution: false,
+        requirementKey: 'z-gh',
+        reason: expect.stringContaining('deferred live MCP capabilities'),
+        evidenceRefs: ['github-proof'],
+      },
+      primaryRetryableContribution: false,
+      retryable: false,
+      workPackageId: 'pkg-mixed',
+    })
+    const { evaluateWorkPackageMcpBroker } = await import('@/worker/mcp-execution-design')
+    const broker = evaluateWorkPackageMcpBroker({
+      assignedRole: workPackage.assignedRole,
+      mcpRequirements: workPackage.mcpRequirements,
+      metadata: workPackage.metadata,
+      projectMcpConfig: project.mcpConfig,
+      title: workPackage.title,
+    })
+    const { buildMcpBrokerBlockMetadata } = await import('@/worker/blocked-handoff-retry')
+    const brokerMetadata = buildMcpBrokerBlockMetadata({
+      blockedAt: new Date('2026-07-14T00:00:01.000Z'),
+      check: broker,
+      existingMetadata: {},
+    }) as { mcpBroker: Record<string, unknown> }
+    expect(body.primaryDecision).toEqual(broker.primaryDecision)
+    expect(body.primaryMode).toBe(broker.primaryMode)
+    expect(body.primaryRecoveryAction).toBe(broker.primaryRecoveryAction)
+    expect(body.primaryRetryableContribution).toBe(broker.primaryDecision?.retryableContribution)
+    expect(body.retryable).toBe(broker.retryable)
+    expect(brokerMetadata.mcpBroker.primaryDecision).toEqual(body.primaryDecision)
+    expect(brokerMetadata.mcpBroker.primaryMode).toBe(body.primaryMode)
+    expect(brokerMetadata.mcpBroker.primaryRecoveryAction).toBe(body.primaryRecoveryAction)
+    expect(brokerMetadata.mcpBroker.primaryRetryableContribution).toBe(body.primaryRetryableContribution)
+    expect(brokerMetadata.mcpBroker.retryable).toBe(body.retryable)
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('returns the normalization reason without stale canonical evidence for mixed blockers', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const normalizationError = 'MCP requirement 0 is malformed and cannot be normalized.'
+    const awaitingTask = {
+      id: 'task-normalization-and-policy-blocked',
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const project = { id: 'project-1', mcpConfig: {} }
+    const workPackage = {
+      id: 'pkg-normalization-and-policy-blocked',
+      assignedRole: 'backend',
+      title: 'Malformed mixed policy',
+      mcpRequirements: [{
+        requirementKey: 'deferred-write',
+        sourceRequirementIndex: 0,
+        agent: 'backend',
+        mcpId: 'github',
+        requirement: 'required',
+        permissions: ['github.contents.write'],
+        evidenceRefs: ['stale-canonical-proof'],
+        prohibitedCapabilities: [],
+        assignment: { type: 'agent', targetId: null },
+        fallback: { action: 'block', message: '' },
+      }],
+      metadata: {
+        mcpGrantsSchemaVersion: 2,
+        mcpNormalizationErrors: [normalizationError],
+      },
+    }
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([workPackage]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest('/api/tasks/task-normalization-and-policy-blocked/approve', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: awaitingTask.id }),
+    })
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({
+      reason: normalizationError,
+      evidenceRefs: [],
+      primaryDecision: null,
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+      workPackageId: workPackage.id,
     })
     expect(mockDbUpdate).not.toHaveBeenCalled()
     expect(mockRedisLpush).not.toHaveBeenCalled()
   })
 
-  it('allows plan approval after a required filesystem grant is explicitly denied', async () => {
+  it('rejects canonicalized separator-alias policy with package-wide deny-wins', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const awaitingTask = {
+      id: 'task-separator-deny-wins',
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const project = { id: 'project-1', mcpConfig: {} }
+    const workPackage = {
+      id: 'pkg-separator-deny-wins',
+      assignedRole: 'backend-dev',
+      title: 'Canonical backend package',
+      mcpRequirements: [{
+        requirementKey: 'mcp-requirement-v1-a-separator-read',
+        sourceRequirementIndex: 0,
+        mcpId: 'github',
+        agent: 'backend-dev',
+        requirement: 'required',
+        permissions: ['github.issues.read'],
+        prohibitedCapabilities: [],
+        assignment: { type: 'agent', targetId: null },
+        fallback: { action: 'block', message: '' },
+      }, {
+        requirementKey: 'mcp-requirement-v1-z-separator-deny',
+        sourceRequirementIndex: 1,
+        mcpId: 'github',
+        agent: 'backend-dev',
+        requirement: 'required',
+        permissions: [],
+        prohibitedCapabilities: ['github.issues.read'],
+        assignment: { type: 'agent', targetId: null },
+        fallback: { action: 'block', message: '' },
+      }],
+      metadata: {},
+    }
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([workPackage]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest('/api/tasks/task-separator-deny-wins/approve', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: awaitingTask.id }),
+    })
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+      reason: expect.stringContaining('prohibited'),
+      workPackageId: workPackage.id,
+    })
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('rejects the separator-alias deny policy produced by the real materializer', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const taskId = 'task-materialized-separator-deny'
+    const overview = {
+      projectId: 'project-1',
+      config: { profile: 'default' as const, requiredMcps: [], overrides: {} },
+      catalog: [],
+      mcpsRoot: '/tmp/mcps',
+      statuses: [],
+      summary: { label: 'Unavailable', status: 'missing' as const, missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+    }
+    const { prepareArchitectArtifact } = await import('@/worker/architect-artifact')
+    const preparedArtifact = prepareArchitectArtifact([
+      '# Plan',
+      '- [backend-dev] Implement the canonical package.',
+      '```mcp_execution_design_json',
+      JSON.stringify({
+        schemaVersion: 1,
+        requirements: [{
+          mcpId: 'github', requirement: 'required', reason: 'Read issues.',
+          assignment: { type: 'agent', targetAgents: ['backend_dev'], targetId: null },
+          agentPermissions: { backend_dev: ['github.issues.read'] },
+          prohibitedCapabilities: [], fallback: { action: 'block', message: 'Revise.' },
+        }, {
+          mcpId: 'github', requirement: 'required', reason: 'Deny issue reads.',
+          assignment: { type: 'agent', targetAgents: ['backend-dev'], targetId: null },
+          agentPermissions: {}, prohibitedCapabilities: ['github.issues.read'],
+          fallback: { action: 'block', message: 'Revise.' },
+        }],
+        promptOverlays: {},
+        requirementContexts: [],
+        mcpAwareSubtasks: [],
+      }),
+      '```',
+    ].join('\n'), overview)
+    const { buildWorkforceMaterializationRows } = await import('@/worker/workforce-materializer')
+    let nextId = 0
+    const materialized = buildWorkforceMaterializationRows({
+      taskId,
+      architectRunId: 'run-1',
+      artifactId: 'artifact-1',
+      prepared: preparedArtifact,
+    }, {
+      activeAgents: [{ agentType: 'backend-dev', displayName: 'Backend Dev' }],
+      idFactory: () => `00000000-0000-4000-8000-${String(++nextId).padStart(12, '0')}`,
+    }).workPackages[0]
+    expect(materialized.mcpRequirements).toEqual([
+      expect.objectContaining({ agent: 'backend-dev', permissions: ['github.issues.read'] }),
+      expect.objectContaining({ agent: 'backend-dev', prohibitedCapabilities: ['github.issues.read'] }),
+    ])
+
+    const awaitingTask = {
+      id: taskId,
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const project = { id: 'project-1', mcpConfig: overview.config }
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([materialized]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest(`/api/tasks/${taskId}/approve`, { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: taskId }),
+    })
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+      reason: expect.stringContaining('prohibited'),
+      workPackageId: materialized.id,
+    })
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['malformed deferred requirement', {
+      schemaVersion: 1,
+      requirements: [{
+        mcpId: '', requirement: 'required',
+        assignment: { type: 'agent', targetAgents: ['backend'], targetId: null },
+        agentPermissions: { backend: ['github.contents.write'] },
+        prohibitedCapabilities: [], fallback: { action: 'block', message: 'Revise.' },
+      }],
+      promptOverlays: {}, requirementContexts: [], mcpAwareSubtasks: [],
+    }, 'github.contents.write'],
+    ['malformed requirement context', {
+      schemaVersion: 1,
+      requirements: [{
+        mcpId: 'github', requirement: 'required', reason: 'Read issues.',
+        assignment: { type: 'agent', targetAgents: ['backend'], targetId: null },
+        agentPermissions: { backend: ['github.issues.read'] },
+        prohibitedCapabilities: [], fallback: { action: 'block', message: 'Revise.' },
+      }],
+      promptOverlays: {},
+      requirementContexts: [{ sourceRequirementIndex: '0', agent: 'backend', promptOverlay: 'RAW-CONTEXT' }],
+      mcpAwareSubtasks: [],
+    }, 'RAW-CONTEXT'],
+    ['overflowing deferred subtask', overflowingSubtaskPolicy('github.contents.write'), 'github.contents.write'],
+    ['overflowing prohibited subtask', overflowingSubtaskPolicy('github.issues.read', ['github.issues.read']), 'github.issues.read'],
+    ['overflowing malformed subtask', overflowingSubtaskPolicy('github..read'), 'github..read'],
+    ['overflowing cross-MCP subtask', overflowingSubtaskPolicy('filesystem.project.read'), 'filesystem.project.read'],
+  ] as const)('propagates %s through artifact, materializer, and real approval', async (_label, rawDesign, rawPolicyText) => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const taskId = 'task-nested-policy-invalid'
+    const overview = {
+      projectId: 'project-1',
+      config: { profile: 'default' as const, requiredMcps: [], overrides: {} },
+      catalog: [], mcpsRoot: '/tmp/mcps', statuses: [],
+      summary: { label: 'Unavailable', status: 'missing' as const, missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+    }
+    const { prepareArchitectArtifact } = await import('@/worker/architect-artifact')
+    const preparedArtifact = prepareArchitectArtifact([
+      '# Plan',
+      '- [Backend] Implement the package safely.',
+      '```mcp_execution_design_json',
+      JSON.stringify(rawDesign),
+      '```',
+    ].join('\n'), overview)
+    expect(preparedArtifact.mcpExecutionDesign.proposed?.normalizationErrors?.length).toBeGreaterThan(0)
+    expect(preparedArtifact.mcpExecutionDesign.proposed?.normalizationEvidence).toEqual([
+      expect.objectContaining({ schemaVersion: 1, category: 'normalization', code: 'mcp_design_nested_policy_invalid' }),
+    ])
+    expect(JSON.stringify(preparedArtifact.mcpExecutionDesign.proposed?.normalizationEvidence)).not.toContain(rawPolicyText)
+    if (_label.startsWith('overflowing ')) {
+      expect(preparedArtifact.mcpExecutionDesign.proposed?.mcpAwareSubtasks).toEqual([])
+    }
+
+    const { buildWorkforceMaterializationRows } = await import('@/worker/workforce-materializer')
+    let nextId = 0
+    const materialized = buildWorkforceMaterializationRows({
+      taskId,
+      architectRunId: 'run-1',
+      artifactId: 'artifact-1',
+      prepared: preparedArtifact,
+    }, {
+      activeAgents: [{ agentType: 'backend', displayName: 'Backend' }],
+      idFactory: () => `00000000-0000-4000-8000-${String(++nextId).padStart(12, '0')}`,
+    }).workPackages[0]
+    expect(materialized.metadata).toMatchObject({
+      mcpNormalizationEvidence: [expect.objectContaining({ code: 'mcp_design_nested_policy_invalid' })],
+    })
+    expect((materialized.metadata as { mcpNormalizationErrors: string[] }).mcpNormalizationErrors)
+      .toEqual(expect.arrayContaining([expect.any(String)]))
+    if (_label.startsWith('overflowing ')) {
+      expect(materialized.metadata).toMatchObject({ mcpAwareSubtasks: [] })
+    }
+
+    const awaitingTask = {
+      id: taskId,
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const project = { id: 'project-1', mcpConfig: overview.config }
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([materialized]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest(`/api/tasks/${taskId}/approve`, { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: taskId }),
+    })
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({
+      error: expect.stringContaining('MCP'),
+      primaryRecoveryAction: 'revise_plan',
+      retryable: false,
+      workPackageId: materialized.id,
+    })
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('propagates duplicate JSON object-key blockers through artifact, materializer, and real approval', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const taskId = 'task-duplicate-json-policy-key'
+    const duplicateKey = 'sk_live_DUPLICATE_POLICY_SECRET'
+    const overview = {
+      projectId: 'project-1',
+      config: { profile: 'default' as const, requiredMcps: [], overrides: {} },
+      catalog: [], mcpsRoot: '/tmp/mcps', statuses: [],
+      summary: { label: 'Unavailable', status: 'missing' as const, missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+    }
+    const rawDesign = String.raw`{"schemaVersion":1,"requirements":[],"promptOverlays":{},"requirementContexts":[],"mcpAwareSubtasks":[],"${duplicateKey}":{"assignment":{"type":"agent","type":"architect_only"}},"${duplicateKey}":{}}`
+    const { prepareArchitectArtifact } = await import('@/worker/architect-artifact')
+    const preparedArtifact = prepareArchitectArtifact([
+      '# Plan',
+      '- [Backend] Implement the package safely.',
+      '```mcp_execution_design_json',
+      rawDesign,
+      '```',
+    ].join('\n'), overview)
+
+    expect(preparedArtifact.planText).not.toContain('mcp_execution_design_json')
+    expect(preparedArtifact.planText).not.toContain(duplicateKey)
+    expect(preparedArtifact.mcpExecutionDesign.proposed).toMatchObject({
+      requirements: [],
+      normalizationEvidence: [{
+        schemaVersion: 1,
+        category: 'parse',
+        code: 'mcp_design_json_duplicate_object_key',
+      }],
+    })
+    expect(JSON.stringify(preparedArtifact.mcpExecutionDesign.proposed)).not.toContain(duplicateKey)
+
+    const { buildWorkforceMaterializationRows } = await import('@/worker/workforce-materializer')
+    let nextId = 0
+    const materialized = buildWorkforceMaterializationRows({
+      taskId,
+      architectRunId: 'run-1',
+      artifactId: 'artifact-1',
+      prepared: preparedArtifact,
+    }, {
+      activeAgents: [{ agentType: 'backend', displayName: 'Backend' }],
+      idFactory: () => `00000000-0000-4000-8000-${String(++nextId).padStart(12, '0')}`,
+    }).workPackages[0]
+    expect(materialized.metadata).toMatchObject({
+      mcpNormalizationEvidence: [expect.objectContaining({
+        category: 'parse',
+        code: 'mcp_design_json_duplicate_object_key',
+      })],
+    })
+    expect(JSON.stringify(materialized.metadata)).not.toContain(duplicateKey)
+
+    const awaitingTask = {
+      id: taskId,
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const project = { id: 'project-1', mcpConfig: overview.config }
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([materialized]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest(`/api/tasks/${taskId}/approve`, { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: taskId }),
+    })
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({
+      error: expect.stringContaining('MCP'),
+      primaryRecoveryAction: 'revise_plan',
+      retryable: false,
+      workPackageId: materialized.id,
+    })
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('refuses approval when an unresolved materialized package carries normalization blockers', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const normalizationError = 'MCP requirement 0 prohibitedCapabilities exceeds the maximum of 30 entries and was truncated.'
+    const { buildWorkforceMaterializationRows } = await import('@/worker/workforce-materializer')
+    let nextId = 0
+    const rows = buildWorkforceMaterializationRows({
+      taskId: 'task-normalization-blocked',
+      architectRunId: 'run-1',
+      artifactId: 'artifact-1',
+      prepared: {
+        planText: '# Plan\nImplement the requested change.',
+        questions: [],
+        agents: [{ role: 'Unconfigured Specialist', tasks: 1, summary: 'Implement APIs', steps: ['Implement safely'] }],
+        agentBreakdownSource: 'fence',
+        capabilityClassification: {
+          proposed: { schemaVersion: 1, required: [], optional: [], excluded: [] },
+          validation: { status: 'valid', warnings: [] },
+        },
+        mcpExecutionDesign: {
+          proposed: {
+            schemaVersion: 1,
+            requirements: [],
+            promptOverlays: {},
+            requirementContexts: [],
+            mcpAwareSubtasks: [],
+            normalizationErrors: [normalizationError],
+            normalizationEvidence: [{
+              schemaVersion: 1,
+              category: 'normalization',
+              code: 'mcp_design_nested_policy_invalid',
+              message: 'MCP execution design contains one invalid nested policy declaration.',
+            }],
+          },
+          validation: {
+            status: 'blocked',
+            runtimeEnforcement: 'not_implemented',
+            health: [],
+            blocked: [normalizationError],
+            warnings: [],
+          },
+          grantDecisions: {
+            schemaVersion: 1,
+            runtimeEnforcement: 'not_implemented',
+            summary: { proposed: 0, warning: 0, blocked: 0 },
+            decisions: [],
+          },
+        },
+      },
+    }, {
+      activeAgents: [{ agentType: 'backend', displayName: 'Backend' }],
+      idFactory: () => `00000000-0000-4000-8000-${String(++nextId).padStart(12, '0')}`,
+    })
+    const materializedPackage = rows.workPackages[0]
+    expect(materializedPackage.metadata).toMatchObject({
+      mcpNormalizationErrors: [normalizationError],
+      mcpNormalizationEvidence: [expect.objectContaining({
+        category: 'normalization',
+        code: 'mcp_design_nested_policy_invalid',
+      })],
+    })
+
+    const awaitingTask = {
+      id: 'task-normalization-blocked',
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const project = { id: 'project-1', mcpConfig: {} }
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([materializedPackage]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest('/api/tasks/task-normalization-blocked/approve', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: awaitingTask.id }),
+    })
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({
+      error: expect.stringContaining(normalizationError),
+      primaryRecoveryAction: 'revise_plan',
+      workPackageId: materializedPackage.id,
+    })
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('refuses plan approval when required filesystem context is explicitly denied', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const awaitingTask = {
       id: 'task-approval',
@@ -2884,8 +3668,10 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       title: 'Frontend work package',
       mcpRequirements: [{
         mcpId: 'filesystem',
+        agent: 'frontend',
         requirement: 'required',
         capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        fallback: { action: 'block', message: '' },
       }],
       metadata: {
         mcpGrantPhases: {
@@ -2893,40 +3679,34 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
             schemaVersion: 1,
             phase: 'effective',
             source: 'explicit-grant-approval',
+            grantApprovalId: 'grant-denied-1',
             runtimeEnforcement: 'bounded_context_packet',
             status: 'denied',
+            deniedAt: '2026-06-25T00:00:00.000Z',
             deniedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
           },
         },
       },
     }
-    const taskUpdate = chain([{ ...awaitingTask, status: 'approved', updatedAt: new Date('2026-06-25T00:01:00.000Z') }])
-    taskUpdate.set = vi.fn(() => taskUpdate)
-    const packageUpdate = chain([{ id: 'pkg-fs' }])
-    packageUpdate.set = vi.fn(() => packageUpdate)
-    const gateUpdate = chain([{ id: 'gate-1' }])
-    gateUpdate.set = vi.fn(() => gateUpdate)
     mockDbSelect
       .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([{ id: 'project-1', mcpConfig: {} }]))
+      .mockReturnValueOnce(chain([{ id: 'project-1', mcpConfig: {} }]))
+      .mockReturnValueOnce(chain([awaitingTask]))
       .mockReturnValueOnce(chain([workPackageRow]))
-      .mockReturnValueOnce(chain([{ mcpConfig: {} }]))
-    mockDbUpdate
-      .mockReturnValueOnce(taskUpdate)
-      .mockReturnValueOnce(packageUpdate)
-      .mockReturnValueOnce(gateUpdate)
-    mockRedisLpush.mockResolvedValue(1)
-    mockRedisPublish.mockResolvedValue(1)
 
     const { POST } = await import('@/app/api/tasks/[id]/approve/route')
     const res = await POST(authRequest('/api/tasks/task-approval/approve', { method: 'POST' }) as never, {
       params: Promise.resolve({ id: 'task-approval' }),
     })
 
-    expect(res.status).toBe(200)
-    expect(mockRedisLpush).toHaveBeenCalledWith(
-      'forge:approvals',
-      JSON.stringify({ taskId: 'task-approval', action: 'approve' }),
-    )
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({
+      primaryRecoveryAction: 'approve_project_filesystem_context',
+      workPackageId: 'pkg-fs',
+    })
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
   })
 
   it('uses project-level filesystem approval when approving a plan', async () => {
@@ -2937,14 +3717,38 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       status: 'awaiting_approval',
       updatedAt: new Date('2026-06-25T00:00:00.000Z'),
     }
+    const { deriveMcpGrantDecisions, evaluateWorkPackageMcpBroker, parseMcpExecutionDesign } =
+      await import('@/worker/mcp-execution-design')
+    const normalizedDesign = parseMcpExecutionDesign(`\`\`\`mcp_execution_design_json\n${JSON.stringify({
+      schemaVersion: 1,
+      requirements: [{
+        mcpId: 'filesystem',
+        requirement: 'required',
+        reason: 'Read and search project files.',
+        assignment: { type: 'agent', targetAgents: ['frontend'], targetId: null },
+        agentPermissions: { frontend: ['filesystem.project.read', 'filesystem.project.search'] },
+        prohibitedCapabilities: [],
+        fallback: { action: 'block', message: '' },
+      }],
+      promptOverlays: {},
+      requirementContexts: [],
+      mcpAwareSubtasks: [],
+    })}\n\`\`\``).design!
+    const normalizedRequirement = normalizedDesign.requirements[0]
     const workPackageRow = {
       id: 'pkg-fs',
       assignedRole: 'frontend',
       title: 'Frontend work package',
       mcpRequirements: [{
+        requirementKey: normalizedRequirement.requirementKey,
+        sourceRequirementIndex: normalizedRequirement.sourceRequirementIndex,
         mcpId: 'filesystem',
+        agent: 'frontend',
         requirement: 'required',
-        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        permissions: ['filesystem.project.read', 'filesystem.project.search'],
+        prohibitedCapabilities: [],
+        assignment: { type: 'agent', targetId: null },
+        fallback: { action: 'block', message: '' },
       }],
       metadata: { mcpGrants: [] },
     }
@@ -2954,11 +3758,12 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     packageUpdate.set = vi.fn(() => packageUpdate)
     const gateUpdate = chain([{ id: 'gate-1' }])
     gateUpdate.set = vi.fn(() => gateUpdate)
-    mockDbSelect
-      .mockReturnValueOnce(chain([awaitingTask]))
-      .mockReturnValueOnce(chain([workPackageRow]))
-      .mockReturnValueOnce(chain([{
-        mcpConfig: {
+    const projectRow = {
+      id: 'project-1',
+      mcpConfig: {
+          profile: 'default' as const,
+          requiredMcps: ['filesystem'],
+          overrides: {},
           grants: {
             filesystem: {
               schemaVersion: 1,
@@ -2973,7 +3778,28 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
             },
           },
         },
-      }]))
+    }
+    const fixedOverview = {
+      projectId: 'project-1', config: projectRow.mcpConfig, catalog: [], mcpsRoot: '/tmp/mcps',
+      statuses: [{
+        mcpId: 'filesystem', displayName: 'Filesystem', description: '', installPath: '/tmp/mcps/filesystem',
+        installState: 'installed' as const, status: 'healthy' as const, enabled: true, error: null,
+        checkedAt: '2026-07-05T00:00:01.000Z',
+      }],
+      summary: { label: 'Healthy', status: 'healthy' as const, missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+    }
+    const preview = deriveMcpGrantDecisions(normalizedDesign, fixedOverview)
+    expect(preview).toMatchObject({
+      admissionStatus: 'allowed',
+      decisions: [expect.objectContaining({ mode: 'bounded_context_approved', admissionStatus: 'allowed' })],
+    })
+    mockGetProjectMcpOverview.mockResolvedValueOnce(fixedOverview)
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([projectRow]))
+      .mockReturnValueOnce(chain([projectRow]))
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([workPackageRow]))
     mockDbUpdate
       .mockReturnValueOnce(taskUpdate)
       .mockReturnValueOnce(packageUpdate)
@@ -2991,7 +3817,8 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     const packageGrantPhasesJson = packageSetMock.mock.calls[0][0].metadata?.queryChunks
       ?.find((chunk): chunk is string => typeof chunk === 'string' && chunk.includes('"project-filesystem-approval"'))
     expect(packageGrantPhasesJson).toBeDefined()
-    expect(JSON.parse(packageGrantPhasesJson as string)).toMatchObject({
+    const approvedPhases = JSON.parse(packageGrantPhasesJson as string)
+    expect(approvedPhases).toMatchObject({
       effective: {
         source: 'project-filesystem-approval',
         grantMode: 'always_allow',
@@ -3003,16 +3830,99 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
         })],
       },
     })
+    const gateSetMock = gateUpdate.set as unknown as { mock: { calls: Array<[{ metadata?: { queryChunks?: unknown[] } }]> } }
+    const approvalSnapshotJson = gateSetMock.mock.calls[0][0].metadata?.queryChunks
+      ?.find((chunk): chunk is string => typeof chunk === 'string' && chunk.includes('approvalHealthSnapshot'))
+    expect(JSON.parse(approvalSnapshotJson as string)).toMatchObject({
+      approvalHealthSnapshot: [{
+        schemaVersion: 1,
+        observed: true,
+        mcpId: 'filesystem',
+        installState: 'installed',
+        status: 'healthy',
+        enabled: true,
+        error: null,
+        checkedAt: '2026-07-05T00:00:01.000Z',
+      }],
+    })
     expect(mockRedisLpush).toHaveBeenCalledWith(
       'forge:approvals',
       JSON.stringify({ taskId: 'task-approval', action: 'approve' }),
     )
+
+    const approvedPackage = {
+      ...workPackageRow,
+      blockedReason: null,
+      harnessId: 'harness-1',
+      metadata: { ...workPackageRow.metadata, mcpGrantPhases: approvedPhases },
+      sequence: 1,
+      status: 'pending',
+      updatedAt: new Date('2026-06-25T00:01:00.000Z'),
+    }
+    const broker = evaluateWorkPackageMcpBroker({
+      assignedRole: approvedPackage.assignedRole,
+      mcpOverview: fixedOverview,
+      mcpRequirements: approvedPackage.mcpRequirements,
+      metadata: approvedPackage.metadata,
+      projectMcpConfig: projectRow.mcpConfig,
+      title: approvedPackage.title,
+    })
+    expect(broker).toMatchObject({
+      status: preview.admissionStatus,
+      evaluations: [expect.objectContaining({
+        decision: expect.objectContaining({ mode: preview.decisions[0].mode, status: 'allowed' }),
+      })],
+    })
+
+    const selectFallback = mockDbSelect.getMockImplementation()
+    const updateFallback = mockDbUpdate.getMockImplementation()
+    mockDbSelect.mockReset()
+    mockDbUpdate.mockReset()
+    if (selectFallback) mockDbSelect.mockImplementation(selectFallback)
+    if (updateFallback) mockDbUpdate.mockImplementation(updateFallback)
+    mockGetProjectMcpOverview.mockReset()
+    mockGetProjectMcpOverview.mockResolvedValueOnce(fixedOverview)
+    mockDbSelect
+      .mockReturnValueOnce(chain([approvedPackage]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ project: projectRow }]))
+      .mockReturnValueOnce(chain([{
+        ...approvedPackage,
+        localPath: null,
+        mcpConfig: projectRow.mcpConfig,
+        projectId: projectRow.id,
+      }]))
+      .mockReturnValueOnce(chain([{
+        id: projectRow.id,
+        localPath: null,
+        mcpConfig: projectRow.mcpConfig,
+      }]))
+      .mockReturnValueOnce(chain([{
+        id: 'task-approval',
+        projectId: projectRow.id,
+      }]))
+      .mockReturnValueOnce(chain([approvedPackage]))
+    const readyUpdate = chain([{ id: approvedPackage.id }])
+    readyUpdate.set = vi.fn(() => readyUpdate)
+    mockDbUpdate.mockReturnValueOnce(readyUpdate)
+    const { handoffApprovedWorkPackages } = await vi.importActual<typeof import('@/worker/work-package-handoff')>(
+      '@/worker/work-package-handoff',
+    )
+    await expect(handoffApprovedWorkPackages('task-approval', { claimEnabled: false })).resolves.toMatchObject({
+      status: 'ready_only',
+      readyPackageIds: [approvedPackage.id],
+    })
+    expect(readyUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      blockedReason: null,
+      status: 'ready',
+    }))
   })
 
-  it('approves the plan gate and queues the approval worker job', async () => {
+  it('approves requirement-scoped planning context and queues the approval worker job', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const awaitingTask = {
       id: 'task-approval',
+      projectId: 'project-1',
       status: 'awaiting_approval',
       updatedAt: new Date('2026-06-25T00:00:00.000Z'),
     }
@@ -3020,29 +3930,25 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       id: 'pkg-1',
       assignedRole: 'backend',
       title: 'Backend package',
-      mcpRequirements: [{ mcpId: 'github', capability: 'issues.read' }],
+      mcpRequirements: [{
+        requirementKey: 'mcp-req-v1-github-read-1',
+        sourceRequirementIndex: 0,
+        mcpId: 'github',
+        agent: 'backend',
+        requirement: 'required',
+        capabilities: ['github.issues.read'],
+        assignment: { type: 'agent', targetId: null },
+        fallback: { action: 'block', message: '' },
+      }],
       metadata: {
-        mcpGrants: [{
-          decisionId: 'grant-1',
+        mcpGrants: [],
+        promptOverlay: 'Use the supplied GitHub issue context.',
+        requirementContexts: [{
+          requirementKey: 'mcp-req-v1-github-read-1',
+          agent: 'backend',
           mcpId: 'github',
-          status: 'proposed',
-        }, {
-          decisionId: 'grant-warning',
-          mcpId: 'filesystem',
-          status: 'warning',
-          capabilities: ['filesystem.project.read'],
-        }, {
-          decisionId: 'grant-blocked',
-          mcpId: 'filesystem',
-          status: 'blocked',
-          capabilities: ['filesystem.project.search'],
-        }, {
-          decisionId: 'grant-malformed-approved',
-          mcpId: 'filesystem',
-          status: 'approved',
-          capabilities: ['filesystem.project.read'],
+          promptOverlay: 'Use the supplied GitHub issue context.',
         }],
-        promptOverlay: 'Use GitHub read tools only.',
       },
     }
     const approvedTask = {
@@ -3058,8 +3964,10 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     gateUpdate.set = vi.fn(() => gateUpdate)
     mockDbSelect
       .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([{ id: 'project-1', mcpConfig: {} }]))
+      .mockReturnValueOnce(chain([{ id: 'project-1', mcpConfig: {} }]))
+      .mockReturnValueOnce(chain([awaitingTask]))
       .mockReturnValueOnce(chain([workPackageRow]))
-      .mockReturnValueOnce(chain([{ mcpConfig: {} }]))
     mockDbUpdate
       .mockReturnValueOnce(taskUpdate)
       .mockReturnValueOnce(packageUpdate)
@@ -3084,27 +3992,7 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       approved: {
         phase: 'approved',
         runtimeEnforcement: 'approved_snapshot',
-        grants: expect.arrayContaining([expect.objectContaining({
-          decisionId: 'grant-1',
-          mcpId: 'github',
-          sourceStatus: 'proposed',
-          status: 'proposed',
-        }), expect.objectContaining({
-          decisionId: 'grant-warning',
-          mcpId: 'filesystem',
-          sourceStatus: 'warning',
-          status: 'warning',
-        }), expect.objectContaining({
-          decisionId: 'grant-blocked',
-          mcpId: 'filesystem',
-          sourceStatus: 'blocked',
-          status: 'blocked',
-        }), expect.objectContaining({
-          decisionId: 'grant-malformed-approved',
-          mcpId: 'filesystem',
-          sourceStatus: 'approved',
-          status: 'approved',
-        })]),
+        grants: [],
       },
       effective: {
         phase: 'effective',
@@ -3136,46 +4024,13 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
           packages: [{
             workPackageId: 'pkg-1',
             assignedRole: 'backend',
-            proposedGrants: [{
-              decisionId: 'grant-1',
-              mcpId: 'github',
-              status: 'proposed',
-            }, {
-              decisionId: 'grant-warning',
-              mcpId: 'filesystem',
-              status: 'warning',
-            }, {
-              decisionId: 'grant-blocked',
-              mcpId: 'filesystem',
-              status: 'blocked',
-            }, {
-              decisionId: 'grant-malformed-approved',
-              mcpId: 'filesystem',
-              status: 'approved',
-            }],
-            approvedGrants: expect.arrayContaining([expect.objectContaining({
-              decisionId: 'grant-1',
-              mcpId: 'github',
-              sourceStatus: 'proposed',
-              status: 'proposed',
-            }), expect.objectContaining({
-              decisionId: 'grant-warning',
-              mcpId: 'filesystem',
-              sourceStatus: 'warning',
-              status: 'warning',
-            }), expect.objectContaining({
-              decisionId: 'grant-blocked',
-              mcpId: 'filesystem',
-              sourceStatus: 'blocked',
-              status: 'blocked',
-            }), expect.objectContaining({
-              decisionId: 'grant-malformed-approved',
-              mcpId: 'filesystem',
-              sourceStatus: 'approved',
-              status: 'approved',
-            })]),
+            proposedGrants: [],
+            approvedGrants: [],
             effectiveGrants: [],
-            proposedRequirements: [{ mcpId: 'github', capability: 'issues.read' }],
+            proposedRequirements: [expect.objectContaining({
+              mcpId: 'github',
+              capabilities: ['github.issues.read'],
+            })],
             promptOverlayPresent: true,
           }],
         },
@@ -3186,6 +4041,16 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
           status: 'package_scoped',
         },
       },
+      approvalHealthSnapshot: [{
+        schemaVersion: 1,
+        observed: false,
+        mcpId: 'github',
+        installState: 'unknown',
+        status: 'unknown',
+        enabled: false,
+        error: null,
+        checkedAt: null,
+      }],
     })
     expect(mockRedisLpush).toHaveBeenCalledWith(
       'forge:approvals',
@@ -3212,6 +4077,7 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       phase: 'effective',
       source: 'explicit-grant-approval',
       grantApprovalId: 'grant-approval-1',
+      grantMode: 'allow_once',
       runtimeIssued: false,
       runtimeEnforcement: 'bounded_context_packet',
       status: 'approved',
@@ -3223,6 +4089,7 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     }
     const awaitingTask = {
       id: 'task-approval',
+      projectId: 'project-1',
       status: 'awaiting_approval',
       updatedAt: new Date('2026-06-25T00:00:00.000Z'),
     }
@@ -3230,9 +4097,15 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       id: 'pkg-1',
       assignedRole: 'backend',
       title: 'Backend package',
-      mcpRequirements: [{ mcpId: 'filesystem', capabilities: ['filesystem.project.read'] }],
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        agent: 'backend',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read'],
+        fallback: { action: 'block', message: '' },
+      }],
       metadata: {
-        mcpGrants: [{ mcpId: 'filesystem', status: 'proposed', capabilities: ['filesystem.project.read'] }],
+        mcpGrants: [],
         mcpGrantPhases: { effective: explicitEffective },
       },
     }
@@ -3247,10 +4120,21 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     packageUpdate.set = vi.fn(() => packageUpdate)
     const gateUpdate = chain([{ id: 'gate-1' }])
     gateUpdate.set = vi.fn(() => gateUpdate)
+    mockGetProjectMcpOverview.mockResolvedValueOnce({
+      projectId: 'project-1', config: {}, catalog: [], mcpsRoot: '/tmp/mcps',
+      statuses: [{
+        mcpId: 'filesystem', displayName: 'Filesystem', description: '', installPath: '/tmp/mcps/filesystem',
+        installState: 'installed', status: 'healthy', enabled: true, error: null,
+        checkedAt: '2026-06-25T00:00:30.000Z',
+      }],
+      summary: { label: 'Healthy', status: 'healthy', missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+    })
     mockDbSelect
       .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([{ id: 'project-1', mcpConfig: {} }]))
+      .mockReturnValueOnce(chain([{ id: 'project-1', mcpConfig: {} }]))
+      .mockReturnValueOnce(chain([awaitingTask]))
       .mockReturnValueOnce(chain([workPackageRow]))
-      .mockReturnValueOnce(chain([{ mcpConfig: {} }]))
     mockDbUpdate
       .mockReturnValueOnce(taskUpdate)
       .mockReturnValueOnce(packageUpdate)
@@ -3276,6 +4160,7 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const awaitingTask = {
       id: 'task-approval',
+      projectId: 'project-1',
       status: 'awaiting_approval',
       updatedAt: new Date('2026-06-25T00:00:00.000Z'),
     }
@@ -3290,8 +4175,10 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     gateUpdate.set = vi.fn(() => gateUpdate)
     mockDbSelect
       .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([{ id: 'project-1', mcpConfig: {} }]))
+      .mockReturnValueOnce(chain([{ id: 'project-1', mcpConfig: {} }]))
+      .mockReturnValueOnce(chain([awaitingTask]))
       .mockReturnValueOnce(chain([]))
-      .mockReturnValueOnce(chain([{ mcpConfig: {} }]))
     mockDbUpdate
       .mockReturnValueOnce(taskUpdate)
       .mockReturnValueOnce(gateUpdate)
@@ -3318,6 +4205,7 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const awaitingTask = {
       id: 'task-approval',
+      projectId: 'project-1',
       status: 'awaiting_approval',
       updatedAt: new Date('2026-06-25T00:00:00.000Z'),
     }
@@ -3332,8 +4220,10 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     gateUpdate.set = vi.fn(() => gateUpdate)
     mockDbSelect
       .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([{ id: 'project-1', mcpConfig: {} }]))
+      .mockReturnValueOnce(chain([{ id: 'project-1', mcpConfig: {} }]))
+      .mockReturnValueOnce(chain([awaitingTask]))
       .mockReturnValueOnce(chain([]))
-      .mockReturnValueOnce(chain([{ mcpConfig: {} }]))
     mockDbUpdate
       .mockReturnValueOnce(taskUpdate)
       .mockReturnValueOnce(gateUpdate)
@@ -4376,6 +5266,26 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     }
   }
 
+  function mockTaskGrantTransactionLocks(input: {
+    packages: Array<Record<string, unknown>>
+    project: Record<string, unknown>
+    task: Record<string, unknown>
+  }) {
+    const transactionSelect = vi.fn()
+      .mockReturnValueOnce(chain([input.project]))
+      .mockReturnValueOnce(chain([input.task]))
+      .mockReturnValueOnce(chain(input.packages))
+      .mockImplementation(() => mockDbSelect())
+    mockDbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) =>
+      callback({
+        select: transactionSelect,
+        insert: mockDbInsert,
+        update: mockDbUpdate,
+        delete: mockDbDelete,
+      }),
+    )
+  }
+
   it('approves edited read-only filesystem grants and persists an effective phase', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbInsert.mockReturnValue(chain([{
@@ -4417,6 +5327,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([pkg]))
         .mockReturnValue(chain([pkg]))
+      mockTaskGrantTransactionLocks({
+        packages: [pkg],
+        project,
+        task: grantTask(project.id as string),
+      })
       mockDbUpdate
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)
@@ -4496,6 +5411,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([pkg]))
         .mockReturnValueOnce(chain([pkg]))
         .mockReturnValue(chain([pkg]))
+      mockTaskGrantTransactionLocks({
+        packages: [pkg],
+        project,
+        task: grantTask(project.id as string),
+      })
       mockDbUpdate
         .mockReturnValueOnce(projectUpdate)
         .mockReturnValueOnce(approvalUpdate)
@@ -4678,6 +5598,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       .mockReturnValueOnce(chain([grantTask()]))
       .mockReturnValueOnce(chain([{ id: 'project-fs-grant' }]))
       .mockReturnValueOnce(chain([pkg]))
+    mockTaskGrantTransactionLocks({
+      packages: [pkg],
+      project: { id: 'project-fs-grant', mcpConfig: {} },
+      task: grantTask(),
+    })
     mockDbUpdate
       .mockReturnValueOnce(approvalUpdate)
       .mockReturnValueOnce(packageUpdate)
@@ -4714,6 +5639,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       .mockReturnValueOnce(chain([grantTask()]))
       .mockReturnValueOnce(chain([{ id: 'project-fs-grant' }]))
       .mockReturnValueOnce(chain([grantPackage()]))
+    mockTaskGrantTransactionLocks({
+      packages: [grantPackage()],
+      project: { id: 'project-fs-grant', mcpConfig: {} },
+      task: grantTask(),
+    })
 
     const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
     const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
@@ -4762,6 +5692,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([{ mcpId: 'filesystem', installPath: filesystemPath, enabled: true }]))
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([grantPackage()]))
+      mockTaskGrantTransactionLocks({
+        packages: [grantPackage()],
+        project,
+        task: grantTask(project.id as string),
+      })
 
       const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
       const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
@@ -4791,6 +5726,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([{ mcpId: 'filesystem', installPath: filesystemPath, enabled: true }]))
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([{ ...grantPackage(), mcpRequirements: [], metadata: {} }]))
+      mockTaskGrantTransactionLocks({
+        packages: [{ ...grantPackage(), mcpRequirements: [], metadata: {} }],
+        project,
+        task: grantTask(project.id as string),
+      })
 
       const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
       const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
@@ -4850,6 +5790,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([{ mcpId: 'filesystem', installPath: filesystemPath, enabled: true }]))
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([pkg]))
+      mockTaskGrantTransactionLocks({
+        packages: [pkg],
+        project,
+        task: grantTask(project.id as string),
+      })
       mockDbUpdate
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)
@@ -4920,6 +5865,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([failedPkg]))
         .mockReturnValueOnce(chain([]))
+      mockTaskGrantTransactionLocks({
+        packages: [failedPkg],
+        project,
+        task: grantTask(project.id as string, 'failed'),
+      })
       mockDbUpdate
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)
@@ -5008,6 +5958,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       .mockReturnValueOnce(chain([grantTask('project-fs-grant', 'failed')]))
       .mockReturnValueOnce(chain([{ id: 'project-fs-grant' }]))
       .mockReturnValueOnce(chain([failedPkg]))
+    mockTaskGrantTransactionLocks({
+      packages: [failedPkg],
+      project: { id: 'project-fs-grant', mcpConfig: {} },
+      task: grantTask('project-fs-grant', 'failed'),
+    })
     mockDbUpdate
       .mockReturnValueOnce(approvalUpdate)
       .mockReturnValueOnce(packageUpdate)
@@ -5088,6 +6043,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([blockedPkg]))
         .mockReturnValueOnce(chain([]))
+      mockTaskGrantTransactionLocks({
+        packages: [blockedPkg],
+        project,
+        task: grantTask(project.id as string, 'failed'),
+      })
       mockDbUpdate
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)
@@ -5176,6 +6136,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
           status: 'failed',
           metadata: { mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' } },
         }]))
+      mockTaskGrantTransactionLocks({
+        packages: [failedPkg],
+        project,
+        task: grantTask(project.id as string, 'failed'),
+      })
       mockDbUpdate
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)
@@ -5254,6 +6219,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
           status: 'blocked',
           metadata: { mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' } },
         }]))
+      mockTaskGrantTransactionLocks({
+        packages: [failedPkg],
+        project,
+        task: grantTask(project.id as string, 'failed'),
+      })
       mockDbUpdate
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)
@@ -5369,6 +6339,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([failedPkg]))
         .mockReturnValueOnce(chain([]))
+      mockTaskGrantTransactionLocks({
+        packages: [failedPkg],
+        project,
+        task: grantTask(project.id as string, 'failed'),
+      })
       mockDbUpdate
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)

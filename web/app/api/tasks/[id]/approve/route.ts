@@ -1,18 +1,25 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
+import { isDeepStrictEqual } from 'node:util'
 import { db } from '@/db'
 import { approvalGates, projects, tasks, workPackages } from '@/db/schema'
-import { and, eq, sql } from 'drizzle-orm'
+import { and, asc, eq, sql } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
+import { getProjectMcpOverview, normalizeProjectMcpConfig } from '@/lib/mcps/manager'
+import {
+  type McpHealthSnapshot,
+  type McpWorkPackageAdmission,
+} from '@/lib/mcps/admission'
+import { admitWorkPackageMcpBroker } from '@/worker/mcp-execution-design'
+import type { ProjectMcpOverview } from '@/lib/mcps/types'
 import {
   isExplicitFilesystemEffectivePhase,
   isRecord as isFilesystemGrantRecord,
   projectFilesystemEffectivePhase,
   projectFilesystemGrantCovers,
-  requiresFilesystemGrantApproval,
 } from '@/lib/mcps/filesystem-grants'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -27,6 +34,49 @@ function recordArray(value: unknown): Record<string, unknown>[] {
 
 function approvedStatusForGrant(status: unknown): string {
   return typeof status === 'string' ? status : 'unknown'
+}
+
+function admissionForLockedPackage(input: {
+  assignedRole: string
+  mcpOverview: ProjectMcpOverview
+  mcpConfig: unknown
+  mcpRequirements: unknown
+  metadata: unknown
+  title: string
+}): McpWorkPackageAdmission {
+  return admitWorkPackageMcpBroker({
+    assignedRole: input.assignedRole,
+    mcpOverview: input.mcpOverview,
+    mcpRequirements: input.mcpRequirements,
+    metadata: input.metadata,
+    projectMcpConfig: input.mcpConfig,
+    title: input.title,
+  })
+}
+
+function approvalHealthSnapshot(admissions: McpWorkPackageAdmission[]): McpHealthSnapshot[] {
+  const byMcpId = new Map<string, McpHealthSnapshot>()
+  for (const admission of admissions) {
+    for (const evaluation of admission.evaluations) {
+      byMcpId.set(evaluation.health.mcpId, { ...evaluation.health })
+    }
+  }
+  return [...byMcpId.values()].sort((left, right) => left.mcpId.localeCompare(right.mcpId))
+}
+
+function healthSnapshotMatchesLockedPolicy(
+  overview: ProjectMcpOverview,
+  capturedLocalPath: unknown,
+  lockedProject: { localPath?: unknown; mcpConfig: ProjectMcpOverview['config'] },
+): boolean {
+  // The overview is captured before the transaction because probing MCP health
+  // may write cache rows. Approval may consume it only while the normalized
+  // project policy it was captured for is still the locked project policy.
+  return capturedLocalPath === lockedProject.localPath &&
+    isDeepStrictEqual(
+      normalizeProjectMcpConfig(overview.config),
+      normalizeProjectMcpConfig(lockedProject.mcpConfig),
+    )
 }
 
 function buildApprovedPackageGrantPhases(input: {
@@ -146,8 +196,58 @@ export async function POST(
       )
     }
 
+
+    const [projectForHealth] = await db
+      .select()
+      .from(projects)
+      .where(eq(projects.id, existing.projectId))
+      .limit(1)
+    if (!projectForHealth) {
+      return NextResponse.json({ error: 'Project not found' }, { status: 404 })
+    }
+    // Live MCP checks may update cached status rows, so they must complete
+    // before the status-flip transaction acquires any project/task locks.
+    const mcpOverview = await getProjectMcpOverview(projectForHealth)
+
     const approvedAt = new Date()
-    const { task, approvedGates, missingFilesystemGrant } = await db.transaction(async (tx) => {
+    const { task, approvedGates, approvalBlock } = await db.transaction(async (tx) => {
+      const [lockedProject] = await tx
+        .select()
+        .from(projects)
+        .where(eq(projects.id, existing.projectId))
+        .for('update')
+      if (!lockedProject) {
+        return { task: null, approvedGates: [] as { id: string }[], approvalBlock: null }
+      }
+
+      if (!healthSnapshotMatchesLockedPolicy(mcpOverview, projectForHealth.localPath, lockedProject)) {
+        const reason = 'Project MCP health inputs changed while approval health was being checked (configuration or local path). Review the latest project settings and approve again.'
+        return {
+          task: null,
+          approvedGates: [] as { id: string }[],
+          approvalBlock: {
+            error: reason,
+            evidenceRefs: [] as string[],
+            primaryDecision: null,
+            primaryMode: 'blocked' as const,
+            reason,
+            primaryRecoveryAction: 'revise_plan' as const,
+            primaryRetryableContribution: false,
+            retryable: false,
+            workPackageId: null,
+          },
+        }
+      }
+
+      const [lockedTask] = await tx
+        .select()
+        .from(tasks)
+        .where(and(accessibleTaskCondition(taskId, session.userId), eq(tasks.status, 'awaiting_approval')))
+        .for('update')
+      if (!lockedTask) {
+        return { task: null, approvedGates: [] as { id: string }[], approvalBlock: null }
+      }
+
       const rawPackageRows = await tx
         .select({
           id: workPackages.id,
@@ -158,15 +258,47 @@ export async function POST(
         })
         .from(workPackages)
         .where(eq(workPackages.taskId, taskId))
-      const [projectGrantRow] = await tx
-        .select({ mcpConfig: projects.mcpConfig })
-        .from(projects)
-        .where(eq(projects.id, existing.projectId))
-        .limit(1)
+        .orderBy(asc(workPackages.id))
+        .for('update')
+
+      const admissions = rawPackageRows.map((pkg) => admissionForLockedPackage({
+        assignedRole: pkg.assignedRole,
+        mcpOverview,
+        mcpConfig: lockedProject.mcpConfig,
+        mcpRequirements: pkg.mcpRequirements,
+        metadata: pkg.metadata,
+        title: pkg.title,
+      }))
+      const blockedIndex = admissions.findIndex((admission) => admission.aggregate.status === 'blocked')
+      if (blockedIndex >= 0) {
+        const admission = admissions[blockedIndex]
+        const pkg = rawPackageRows[blockedIndex]
+        const primaryDecision = admission.aggregate.primaryDecision
+        const reason = primaryDecision?.reason ?? admission.aggregate.blocked[0] ?? 'MCP admission blocked this work package.'
+        return {
+          task: null,
+          approvedGates: [] as { id: string }[],
+          approvalBlock: {
+            error: admission.aggregate.blockedReason ?? reason,
+            evidenceRefs: primaryDecision ? [...primaryDecision.evidenceRefs] : [],
+            primaryDecision: primaryDecision ? {
+              ...primaryDecision,
+              evidenceRefs: [...primaryDecision.evidenceRefs],
+            } : null,
+            primaryMode: primaryDecision?.mode ?? 'blocked',
+            reason,
+            primaryRecoveryAction: primaryDecision?.recoveryAction ?? 'revise_plan',
+            primaryRetryableContribution: primaryDecision?.retryableContribution ?? false,
+            retryable: admission.aggregate.retryable,
+            workPackageId: pkg.id,
+          },
+        }
+      }
+      const consumedHealthSnapshot = approvalHealthSnapshot(admissions)
 
       const packageRows = rawPackageRows.map((pkg) => {
         const grant = projectFilesystemGrantCovers({
-          mcpConfig: projectGrantRow?.mcpConfig,
+          mcpConfig: lockedProject.mcpConfig,
           mcpRequirements: pkg.mcpRequirements,
           metadata: pkg.metadata,
         })
@@ -186,28 +318,6 @@ export async function POST(
         }
       })
 
-      const missingGrant = packageRows
-        .map((pkg) => ({
-          pkg,
-          grant: requiresFilesystemGrantApproval({
-            mcpRequirements: pkg.mcpRequirements,
-            metadata: pkg.metadata,
-          }),
-        }))
-        .find(({ grant }) => grant.blocked)
-
-      if (missingGrant) {
-        return {
-          task: null,
-          approvedGates: [] as { id: string }[],
-          missingFilesystemGrant: {
-            error: `Approve or deny required filesystem context for "${missingGrant.pkg.title}" before approving the plan.`,
-            missingCapabilities: missingGrant.grant.missingCapabilities,
-            workPackageId: missingGrant.pkg.id,
-          },
-        }
-      }
-
       const [approvedTask] = await tx
         .update(tasks)
         .set({ errorMessage: null, status: 'approved', updatedAt: approvedAt })
@@ -215,7 +325,7 @@ export async function POST(
         .returning()
 
       if (!approvedTask) {
-        return { task: null, approvedGates: [] as { id: string }[], missingFilesystemGrant: null }
+        return { task: null, approvedGates: [] as { id: string }[], approvalBlock: null }
       }
 
       const approvedGrantSnapshot = buildApprovedGrantSnapshot({
@@ -260,6 +370,7 @@ export async function POST(
                 note: 'Effective MCP grants are persisted on each work package. The executor may issue bounded read-only filesystem context packets from those package snapshots; live MCP tools remain disabled.',
               },
             },
+            approvalHealthSnapshot: consumedHealthSnapshot,
           })}::jsonb`,
           decidedAt: approvedAt,
           decidedBy: session.userId,
@@ -274,11 +385,11 @@ export async function POST(
         )
         .returning({ id: approvalGates.id })
 
-      return { task: approvedTask, approvedGates: gates, missingFilesystemGrant: null }
+      return { task: approvedTask, approvedGates: gates, approvalBlock: null }
     })
 
-    if (missingFilesystemGrant) {
-      return NextResponse.json(missingFilesystemGrant, { status: 409 })
+    if (approvalBlock) {
+      return NextResponse.json(approvalBlock, { status: 409 })
     }
 
     if (!task) {

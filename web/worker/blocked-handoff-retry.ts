@@ -1,4 +1,5 @@
 import { redis } from '../lib/redis'
+import type { McpBrokerAdmissionCheck } from '../lib/mcps/admission'
 
 const APPROVAL_QUEUE_KEY = 'forge:approvals'
 const DEDUPE_KEY_PREFIX = 'forge:blocked-handoff-retry:'
@@ -30,36 +31,67 @@ function stringValue(value: unknown): string | null {
 }
 
 export function buildMcpBrokerBlockMetadata(input: {
-  blocked: string[]
   blockedAt: Date
-  blockedReason: string
+  check: McpBrokerAdmissionCheck
   existingMetadata: unknown
-  retryable: boolean
-  warnings: string[]
 }): JsonObject {
+  const blockedReason = stringValue(input.check.blockedReason)
+  if (input.check.status !== 'blocked' || input.check.blocked.length === 0 || !blockedReason) {
+    throw new Error('Canonical MCP broker metadata requires a blocked check with a blocked reason.')
+  }
   const existingMetadata = isRecord(input.existingMetadata) ? input.existingMetadata : {}
   const existingBroker = isRecord(existingMetadata.mcpBroker) ? existingMetadata.mcpBroker : {}
   const existingReason = stringValue(existingBroker.blockedReason)
   const existingAttempts = numberValue(existingBroker.autoRetryAttempts) ?? 0
-  const autoRetryAttempts = input.retryable && existingReason === input.blockedReason
+  const autoRetryAttempts = input.check.retryable && existingReason === blockedReason
     ? existingAttempts + 1
-    : input.retryable ? 1 : 0
+    : input.check.retryable ? 1 : 0
   const nextAutoRetryAt =
-    input.retryable && autoRetryAttempts <= MAX_AUTO_RETRY_ATTEMPTS
+    input.check.retryable && autoRetryAttempts <= MAX_AUTO_RETRY_ATTEMPTS
       ? new Date(input.blockedAt.getTime() + DEFAULT_AUTO_RETRY_DELAY_MS).toISOString()
       : null
+  const decisions = [
+    ...input.check.evaluations.map((evaluation) => ({
+      kind: 'requirement',
+      ...evaluation.decision,
+      requirementKey: evaluation.source.requirementKey,
+      decisionId: evaluation.source.decisionId,
+      sourceRequirementIndex: evaluation.source.sourceRequirementIndex,
+    })),
+    ...input.check.subtaskDecisions.map((decision) => ({ kind: 'subtask', ...decision })),
+  ]
+  const evidence = input.check.evaluations.map((evaluation) => ({
+    kind: 'requirement',
+    requirementKey: evaluation.source.requirementKey,
+    decisionId: evaluation.source.decisionId,
+    source: { ...evaluation.source },
+    health: { ...evaluation.health },
+    evidenceRefs: [...evaluation.decision.evidenceRefs],
+  }))
 
   return {
     ...existingMetadata,
     mcpBroker: {
+      schemaVersion: 1,
       autoRetryAttempts,
-      blocked: input.blocked.slice(0, 20),
+      blocked: [...input.check.blocked],
       blockedAt: input.blockedAt.toISOString(),
-      blockedReason: input.blockedReason,
+      blockedReason,
+      decisions,
+      evidence,
+      mode: input.check.primaryMode ?? null,
       nextAutoRetryAt,
-      retryable: input.retryable && autoRetryAttempts <= MAX_AUTO_RETRY_ATTEMPTS,
+      primaryMode: input.check.primaryMode ?? null,
+      primaryDecision: input.check.primaryDecision ? {
+        ...input.check.primaryDecision,
+        evidenceRefs: [...input.check.primaryDecision.evidenceRefs],
+      } : null,
+      primaryRecoveryAction: input.check.primaryRecoveryAction ?? null,
+      primaryRetryableContribution: input.check.primaryDecision?.retryableContribution ?? null,
+      recoveryAction: input.check.primaryRecoveryAction ?? null,
+      retryable: input.check.retryable,
       status: 'blocked',
-      warnings: input.warnings.slice(0, 20),
+      warnings: [...input.check.warnings],
     },
   }
 }

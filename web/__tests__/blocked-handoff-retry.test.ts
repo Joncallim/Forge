@@ -20,6 +20,31 @@ import {
   enqueueBlockedHandoffRetry,
   shouldAutoRetryBlockedHandoff,
 } from '@/worker/blocked-handoff-retry'
+import { evaluateWorkPackageMcpBroker } from '@/worker/mcp-execution-design'
+import {
+  admissionToBrokerCheck,
+  admitWorkPackageMcp,
+  type McpBrokerAdmissionCheck,
+} from '@/lib/mcps/admission'
+
+function brokerCheck(input: {
+  blocked: string[]
+  blockedReason?: string
+  primaryRecoveryAction: 'install_or_fix_mcp' | 'revise_plan'
+  retryable: boolean
+}): McpBrokerAdmissionCheck {
+  return {
+    status: 'blocked',
+    blocked: input.blocked,
+    warnings: [],
+    blockedReason: input.blockedReason ?? input.blocked.join('; '),
+    retryable: input.retryable,
+    primaryMode: 'blocked',
+    primaryRecoveryAction: input.primaryRecoveryAction,
+    evaluations: [],
+    subtaskDecisions: [],
+  }
+}
 
 describe('blocked handoff retry helper', () => {
   beforeEach(() => {
@@ -32,19 +57,24 @@ describe('blocked handoff retry helper', () => {
   it('marks transient broker blocks for bounded auto-retry', () => {
     const blockedAt = new Date('2026-06-29T17:00:00.000Z')
     const metadata = buildMcpBrokerBlockMetadata({
-      blocked: ["MCP 'github' is not configured for this project."],
       blockedAt,
-      blockedReason: 'GitHub missing.',
+      check: brokerCheck({
+        blocked: ["MCP 'github' is not configured for this project."],
+        blockedReason: 'GitHub missing.',
+        primaryRecoveryAction: 'install_or_fix_mcp',
+        retryable: true,
+      }),
       existingMetadata: { source: 'architect-artifact' },
-      retryable: true,
-      warnings: [],
     })
 
     expect(metadata).toMatchObject({
       source: 'architect-artifact',
       mcpBroker: {
+        schemaVersion: 1,
         autoRetryAttempts: 1,
         blockedReason: 'GitHub missing.',
+        mode: 'blocked',
+        recoveryAction: 'install_or_fix_mcp',
         retryable: true,
         status: 'blocked',
       },
@@ -53,16 +83,128 @@ describe('blocked handoff retry helper', () => {
     expect(shouldAutoRetryBlockedHandoff(metadata, new Date('2026-06-29T17:05:00.000Z'))).toBe(true)
   })
 
+  it('persists the canonical mode, recovery action, decisions, and evidence structurally', () => {
+    const check = evaluateWorkPackageMcpBroker({
+      assignedRole: 'backend',
+      mcpRequirements: [
+        {
+          requirementKey: 'mcp-policy-v1-read-1',
+          sourceRequirementIndex: 0,
+          agent: 'backend',
+          mcpId: 'github',
+          requirement: 'required',
+          permissions: ['github.issues.read'],
+          assignment: { type: 'agent', targetId: null },
+          fallback: { action: 'block', message: '' },
+        },
+        {
+          requirementKey: 'mcp-policy-v1-write-1',
+          sourceRequirementIndex: 1,
+          agent: 'backend',
+          mcpId: 'github',
+          requirement: 'required',
+          permissions: ['github.contents.write'],
+          assignment: { type: 'agent', targetId: null },
+          fallback: { action: 'block', message: '' },
+        },
+      ],
+      metadata: {
+        requirementContexts: [{
+          requirementKey: 'mcp-policy-v1-read-1',
+          agent: 'backend',
+          mcpId: 'github',
+          promptOverlay: 'Use the supplied issue context.',
+        }],
+      },
+      title: 'Backend package',
+    })
+
+    expect(check.status).toBe('blocked')
+    expect(check.primaryRecoveryAction).toBe('revise_plan')
+    expect(check.retryable).toBe(false)
+
+    const metadata = buildMcpBrokerBlockMetadata({
+      blockedAt: new Date('2026-06-29T17:00:00.000Z'),
+      check,
+      existingMetadata: {},
+    })
+
+    expect(metadata).toMatchObject({
+      mcpBroker: {
+        schemaVersion: 1,
+        status: 'blocked',
+        mode: check.primaryMode,
+        primaryMode: check.primaryMode,
+        recoveryAction: check.primaryRecoveryAction,
+        primaryRecoveryAction: check.primaryRecoveryAction,
+        primaryDecision: check.primaryDecision,
+        primaryRetryableContribution: false,
+        retryable: check.retryable,
+        decisions: [expect.objectContaining({
+          kind: 'requirement',
+          requirementKey: 'mcp-policy-v1-read-1',
+        }), expect.objectContaining({
+          kind: 'requirement',
+          requirementKey: 'mcp-policy-v1-write-1',
+        })],
+        evidence: [expect.objectContaining({
+          requirementKey: 'mcp-policy-v1-read-1',
+          health: expect.objectContaining({ observed: false, checkedAt: null }),
+        }), expect.objectContaining({ requirementKey: 'mcp-policy-v1-write-1' })],
+      },
+    })
+  })
+
+  it('copies a true install-or-fix primary contribution into broker metadata without re-deriving it', () => {
+    const check = admissionToBrokerCheck(admitWorkPackageMcp({
+      entries: [{
+        requirementKey: 'filesystem-health', sourceRequirementIndex: 0, agent: 'backend', mcpId: 'filesystem',
+        requirement: 'required', capabilities: ['filesystem.project.read'], prohibitedCapabilities: [],
+        assignment: { type: 'agent', targetId: null }, fallback: { action: 'block', message: '' },
+      }],
+      subtasks: [],
+      label: 'Backend package',
+      statusFor: () => ({
+        mcpId: 'filesystem', displayName: 'Filesystem', description: '', installPath: '/tmp/filesystem',
+        installState: 'installed', status: 'unhealthy', enabled: true, error: 'probe failed',
+        checkedAt: '2026-07-14T00:00:00.000Z',
+      }),
+      effectiveGrantFor: () => ({
+        phase: 'approved', source: 'package-local', status: 'approved', grantMode: 'allow_once',
+        consumed: false, coveredCapabilities: ['filesystem.project.read'],
+      }),
+      hasPromptOnlyContextFor: () => false,
+    }))
+    expect(check).toMatchObject({
+      retryable: true,
+      primaryDecision: { recoveryAction: 'install_or_fix_mcp', retryableContribution: true },
+    })
+
+    const metadata = buildMcpBrokerBlockMetadata({
+      blockedAt: new Date('2026-07-14T00:01:00.000Z'),
+      check,
+      existingMetadata: {},
+    }) as { mcpBroker: Record<string, unknown> }
+    expect(metadata.mcpBroker).toMatchObject({
+      primaryDecision: check.primaryDecision,
+      primaryRetryableContribution: true,
+    })
+    ;(metadata.mcpBroker.primaryDecision as { retryableContribution: boolean }).retryableContribution = false
+    expect(check.primaryDecision?.retryableContribution).toBe(true)
+  })
+
   it('stops auto-retry metadata after the retry budget is exhausted', () => {
     let metadata: unknown = {}
     for (let attempt = 0; attempt < 4; attempt += 1) {
       metadata = buildMcpBrokerBlockMetadata({
-        blocked: ["MCP 'github' is auth_required/auth_required: Connect GitHub."],
         blockedAt: new Date(`2026-06-29T17:0${attempt}:00.000Z`),
-        blockedReason: 'GitHub auth required.',
+        check: brokerCheck({
+          blocked: ["MCP 'github' is auth_required/auth_required: Connect GitHub."],
+          blockedReason: 'GitHub auth required.',
+          primaryRecoveryAction: 'install_or_fix_mcp',
+          retryable: true,
+        }),
         existingMetadata: metadata,
-        retryable: true,
-        warnings: [],
       })
     }
 
@@ -70,7 +212,7 @@ describe('blocked handoff retry helper', () => {
       mcpBroker: {
         autoRetryAttempts: 4,
         nextAutoRetryAt: null,
-        retryable: false,
+        retryable: true,
       },
     })
     expect(shouldAutoRetryBlockedHandoff(metadata, new Date('2026-06-29T18:00:00.000Z'))).toBe(false)
@@ -78,12 +220,14 @@ describe('blocked handoff retry helper', () => {
 
   it('does not auto-retry permanent policy blocks', () => {
     const metadata = buildMcpBrokerBlockMetadata({
-      blocked: ["MCP 'github' capability 'github.contents.write' is outside the allowed beta scope."],
       blockedAt: new Date('2026-06-29T17:00:00.000Z'),
-      blockedReason: 'Unsafe capability.',
+      check: brokerCheck({
+        blocked: ["MCP 'github' capability 'github.contents.write' is outside the allowed beta scope."],
+        blockedReason: 'Unsafe capability.',
+        primaryRecoveryAction: 'revise_plan',
+        retryable: false,
+      }),
       existingMetadata: {},
-      retryable: false,
-      warnings: [],
     })
 
     expect(metadata).toMatchObject({
@@ -94,6 +238,21 @@ describe('blocked handoff retry helper', () => {
       },
     })
     expect(shouldAutoRetryBlockedHandoff(metadata, new Date('2026-06-29T18:00:00.000Z'))).toBe(false)
+  })
+
+  it('refuses to persist metadata for a non-blocked or reasonless canonical check', () => {
+    const blockedAt = new Date('2026-06-29T17:00:00.000Z')
+    const allowed = {
+      ...brokerCheck({ blocked: ['temporary'], primaryRecoveryAction: 'revise_plan', retryable: false }),
+      status: 'allowed' as const,
+      blocked: [],
+      blockedReason: null,
+    }
+    expect(() => buildMcpBrokerBlockMetadata({
+      blockedAt,
+      check: allowed,
+      existingMetadata: {},
+    })).toThrow(/requires a blocked check with a blocked reason/)
   })
 
   it('dedupes queued retry approval jobs per task', async () => {
@@ -125,28 +284,34 @@ describe('blocked handoff retry helper', () => {
   it('sweep helper enqueues only due retryable blocked handoffs once per task', async () => {
     const now = new Date('2026-06-29T17:10:00.000Z')
     const dueRetryable = buildMcpBrokerBlockMetadata({
-      blocked: ["MCP 'github' is not configured for this project."],
       blockedAt: new Date('2026-06-29T17:00:00.000Z'),
-      blockedReason: 'GitHub missing.',
+      check: brokerCheck({
+        blocked: ["MCP 'github' is not configured for this project."],
+        blockedReason: 'GitHub missing.',
+        primaryRecoveryAction: 'install_or_fix_mcp',
+        retryable: true,
+      }),
       existingMetadata: {},
-      retryable: true,
-      warnings: [],
     })
     const notDueRetryable = buildMcpBrokerBlockMetadata({
-      blocked: ["MCP 'github' is auth_required/auth_required: Connect GitHub."],
       blockedAt: new Date('2026-06-29T17:09:00.000Z'),
-      blockedReason: 'GitHub auth required.',
+      check: brokerCheck({
+        blocked: ["MCP 'github' is auth_required/auth_required: Connect GitHub."],
+        blockedReason: 'GitHub auth required.',
+        primaryRecoveryAction: 'install_or_fix_mcp',
+        retryable: true,
+      }),
       existingMetadata: {},
-      retryable: true,
-      warnings: [],
     })
     const permanent = buildMcpBrokerBlockMetadata({
-      blocked: ["Unknown MCP 'slack' was requested."],
       blockedAt: new Date('2026-06-29T17:00:00.000Z'),
-      blockedReason: 'Unknown MCP.',
+      check: brokerCheck({
+        blocked: ["Unknown MCP 'slack' was requested."],
+        blockedReason: 'Unknown MCP.',
+        primaryRecoveryAction: 'revise_plan',
+        retryable: false,
+      }),
       existingMetadata: {},
-      retryable: false,
-      warnings: [],
     })
     const enqueue = vi.fn(async () => ({ status: 'enqueued' as const }))
 

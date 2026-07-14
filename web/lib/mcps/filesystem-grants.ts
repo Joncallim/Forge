@@ -1,3 +1,18 @@
+import {
+  admitWorkPackageMcp,
+  readEffectiveGrantState,
+  type McpWorkPackageAdmission,
+} from './admission'
+import {
+  canonicalCapabilityForMcp,
+  classifyCapability,
+  coverageKeysForGrant,
+  isMcpHealthy,
+  mcpDeliveryKind,
+  mcpHealthReason,
+} from './capability-normalization'
+import type { ProjectMcpStatus } from './types'
+
 export const FILESYSTEM_MCP_ID = 'filesystem'
 
 export const FILESYSTEM_PROJECT_CAPABILITIES = [
@@ -7,12 +22,20 @@ export const FILESYSTEM_PROJECT_CAPABILITIES = [
 ] as const
 
 export type FilesystemProjectCapability = typeof FILESYSTEM_PROJECT_CAPABILITIES[number]
+export type FilesystemProjectRequestCapability =
+  | FilesystemProjectCapability
+  | 'filesystem.project.write'
 
 const FILESYSTEM_PROJECT_CAPABILITY_SET = new Set<string>(FILESYSTEM_PROJECT_CAPABILITIES)
 
 export type FilesystemCapabilitySummary = {
   blockingCapabilities: FilesystemProjectCapability[]
-  requestedCapabilities: FilesystemProjectCapability[]
+  /** Capabilities kept in the plan/operator projection, including write. */
+  planningVisibleCapabilities: FilesystemProjectRequestCapability[]
+  /** Capabilities that may activate a bounded read-only runtime packet. */
+  boundedRuntimeRequestedCapabilities: FilesystemProjectCapability[]
+  /** Compatibility alias for the planning-visible capability projection. */
+  requestedCapabilities: FilesystemProjectRequestCapability[]
 }
 
 export type ProjectFilesystemGrant = {
@@ -31,16 +54,13 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function normalizeCapability(value: string): string {
-  return value.trim().toLowerCase().replace(/\s+/g, '_')
-}
-
 export function canonicalFilesystemProjectCapability(value: unknown): FilesystemProjectCapability | null {
   if (typeof value !== 'string') return null
-  const normalized = normalizeCapability(value)
-  const match = normalized.match(/^filesystem\.(?:project\.)?(read|list|search)$/)
-  if (!match) return null
-  const capability = `filesystem.project.${match[1]}` as FilesystemProjectCapability
+  const capability = canonicalCapabilityForMcp(FILESYSTEM_MCP_ID, value) as FilesystemProjectCapability
+  if (
+    classifyCapability(FILESYSTEM_MCP_ID, capability) !== 'bounded_read_only' ||
+    mcpDeliveryKind(FILESYSTEM_MCP_ID) !== 'bounded_context_packet'
+  ) return null
   return FILESYSTEM_PROJECT_CAPABILITY_SET.has(capability) ? capability : null
 }
 
@@ -58,7 +78,7 @@ export function hasUnsafeFilesystemCapability(values: unknown): boolean {
   if (!Array.isArray(values)) return false
   return values.some((value) => (
     typeof value === 'string' &&
-    normalizeCapability(value).startsWith('filesystem.') &&
+    canonicalCapabilityForMcp(FILESYSTEM_MCP_ID, value).startsWith('filesystem.') &&
     canonicalFilesystemProjectCapability(value) === null
   ))
 }
@@ -69,54 +89,121 @@ function recordArray(value: unknown): Record<string, unknown>[] {
     : []
 }
 
-function textArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return []
-  return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+function filesystemProjectionPolicy(entry: Record<string, unknown>): Record<string, unknown> {
+  if (Object.hasOwn(entry, 'decisionId') || Object.hasOwn(entry, 'requirementKey')) return entry
+  const assignment = isRecord(entry.assignment) ? entry.assignment : {}
+  const hasLegacyAgent = typeof entry.agent === 'string' ||
+    typeof entry.assignedRole === 'string' ||
+    (Array.isArray(assignment.targetAgents) && assignment.targetAgents.length === 1)
+  return {
+    ...entry,
+    ...(!hasLegacyAgent ? { assignedRole: 'filesystem-projection' } : {}),
+    ...(!isRecord(entry.fallback) ? { fallback: { action: 'block', message: '' } } : {}),
+  }
 }
 
-function requirementCapabilities(requirement: Record<string, unknown>): FilesystemProjectCapability[] {
-  return canonicalFilesystemProjectCapabilities([
-    ...textArray(requirement.permissions),
-    ...textArray(requirement.capabilities),
-    ...textArray(requirement.requiredCapabilities),
-    ...textArray(requirement.mcpCapabilities),
-  ])
+function filesystemProjectionAdmission(input: {
+  mcpRequirements: unknown
+  metadata: unknown
+  projectMcpConfig?: unknown
+}): McpWorkPackageAdmission {
+  const metadata = isRecord(input.metadata) ? input.metadata : {}
+  const project = { mcpConfig: input.projectMcpConfig ?? {} }
+  const entries = recordArray(input.mcpRequirements).map(filesystemProjectionPolicy)
+  const fallbackAgents = [...new Set(entries.flatMap((entry) => {
+    if (typeof entry.agent === 'string' && entry.agent.trim()) return [entry.agent]
+    if (typeof entry.assignedRole === 'string' && entry.assignedRole.trim()) return [entry.assignedRole]
+    const assignment = isRecord(entry.assignment) ? entry.assignment : {}
+    return Array.isArray(assignment.targetAgents) && assignment.targetAgents.length === 1 &&
+      typeof assignment.targetAgents[0] === 'string'
+      ? [assignment.targetAgents[0]]
+      : []
+  }))]
+  const legacySubtaskAgent = fallbackAgents.length === 1 ? fallbackAgents[0] : 'filesystem-projection'
+  return admitWorkPackageMcp({
+    entries: [
+      ...entries,
+      ...recordArray(metadata.mcpGrants),
+    ],
+    subtasks: recordArray(metadata.mcpAwareSubtasks).map((subtask) => {
+      const assignment = isRecord(subtask.assignment) ? subtask.assignment : {}
+      const hasAgent = typeof subtask.agent === 'string' ||
+        typeof subtask.assignedRole === 'string' ||
+        (Array.isArray(assignment.targetAgents) && assignment.targetAgents.length === 1)
+      return hasAgent ? subtask : { ...subtask, agent: legacySubtaskAgent }
+    }),
+    label: 'filesystem grant projection',
+    statusFor: () => null,
+    effectiveGrantFor: ({ requiredCapabilities }) => readEffectiveGrantState(
+      { metadata },
+      project,
+      requiredCapabilities,
+    ),
+    hasPromptOnlyContextFor: () => false,
+  })
 }
 
-function fallbackAction(value: unknown): string {
-  return isRecord(value) && typeof value.action === 'string' ? value.action.trim() : ''
+function filesystemRequestedCapability(value: string): FilesystemProjectRequestCapability | null {
+  const capability = canonicalCapabilityForMcp(FILESYSTEM_MCP_ID, value)
+  const capabilityClass = classifyCapability(FILESYSTEM_MCP_ID, capability)
+  if (capability === 'filesystem.project.write' && capabilityClass === 'planning_only') {
+    return capability
+  }
+  return canonicalFilesystemProjectCapability(capability)
 }
 
 export function summarizeFilesystemCapabilities(input: {
   mcpRequirements: unknown
   metadata: unknown
+  projectMcpConfig?: unknown
 }): FilesystemCapabilitySummary {
-  const requested = new Set<FilesystemProjectCapability>()
+  const admission = filesystemProjectionAdmission(input)
+  const planningVisible = new Set<FilesystemProjectRequestCapability>()
+  const boundedRuntimeRequested = new Set<FilesystemProjectCapability>()
   const blocking = new Set<FilesystemProjectCapability>()
 
-  for (const requirement of recordArray(input.mcpRequirements)) {
-    if (requirement.mcpId !== FILESYSTEM_MCP_ID) continue
-    const capabilities = requirementCapabilities(requirement)
-    for (const capability of capabilities) requested.add(capability)
-    if (requirement.requirement === 'optional' && fallbackAction(requirement.fallback) === 'continue_without_mcp') {
-      continue
+  for (const evaluation of admission.evaluations) {
+    if (evaluation.decision.mcpId !== FILESYSTEM_MCP_ID) continue
+    for (const value of evaluation.decision.normalizedCapabilities) {
+      const capability = filesystemRequestedCapability(value)
+      if (!capability) continue
+      planningVisible.add(capability)
+      if (capability !== 'filesystem.project.write') boundedRuntimeRequested.add(capability)
+      if (
+        capability !== 'filesystem.project.write' &&
+        evaluation.decision.status === 'blocked' &&
+        evaluation.decision.recoveryAction === 'approve_project_filesystem_context'
+      ) blocking.add(capability)
     }
-    for (const capability of capabilities) blocking.add(capability)
+  }
+  for (const decision of admission.subtaskDecisions) {
+    if (decision.mcpId !== FILESYSTEM_MCP_ID) continue
+    const capability = filesystemRequestedCapability(decision.capability)
+    if (!capability) continue
+    planningVisible.add(capability)
+    if (capability !== 'filesystem.project.write') boundedRuntimeRequested.add(capability)
+    if (
+      capability !== 'filesystem.project.write' &&
+      decision.status === 'blocked' &&
+      decision.recoveryAction === 'approve_project_filesystem_context'
+    ) blocking.add(capability)
   }
 
-  const metadata = isRecord(input.metadata) ? input.metadata : {}
-  for (const subtask of recordArray(metadata.mcpAwareSubtasks)) {
-    for (const capability of textArray(subtask.mcpCapabilities)) {
-      const canonical = canonicalFilesystemProjectCapability(capability)
-      if (canonical) requested.add(canonical)
-    }
+  // A bounded filesystem packet contains file contents even when the Architect
+  // only asked to list or search paths. Preserve that runtime dependency in
+  // the projection so approval, execution, and audit evidence all require the
+  // read capability explicitly.
+  if (boundedRuntimeRequested.size > 0) {
+    planningVisible.add('filesystem.project.read')
+    boundedRuntimeRequested.add('filesystem.project.read')
   }
-  if (requested.size > 0) requested.add('filesystem.project.read')
   if (blocking.size > 0) blocking.add('filesystem.project.read')
 
   return {
     blockingCapabilities: [...blocking].sort(),
-    requestedCapabilities: [...requested].sort(),
+    planningVisibleCapabilities: [...planningVisible].sort(),
+    boundedRuntimeRequestedCapabilities: [...boundedRuntimeRequested].sort(),
+    requestedCapabilities: [...planningVisible].sort(),
   }
 }
 
@@ -138,21 +225,10 @@ export function filesystemGrantHealthError(
   statuses: ReadonlyArray<FilesystemMcpStatusLike>,
 ): string | null {
   const filesystem = statuses.find((status) => status.mcpId === FILESYSTEM_MCP_ID)
-  if (!filesystem) {
-    return 'Project filesystem MCP is not configured. Add filesystem to the project MCP requirements and run the MCP installer before approving filesystem access.'
-  }
-  if (filesystem.enabled === false) {
-    return 'Project filesystem MCP is disabled. Enable it before approving filesystem access.'
-  }
-  if (filesystem.installState !== 'installed') {
-    return `Project filesystem MCP is not installed (${filesystem.installState ?? 'missing'}). Run the MCP installer before approving filesystem access.`
-  }
-  if (filesystem.status !== 'healthy') {
-    return filesystem.error
-      ? `Project filesystem MCP is ${filesystem.status}: ${filesystem.error}`
-      : `Project filesystem MCP is ${filesystem.status ?? 'unknown'}. Resolve its status before approving filesystem access.`
-  }
-  return null
+  const status = filesystem as ProjectMcpStatus | undefined
+  return isMcpHealthy(FILESYSTEM_MCP_ID, status ?? null)
+    ? null
+    : mcpHealthReason(FILESYSTEM_MCP_ID, status ?? null)
 }
 
 export function projectFilesystemGrantFromConfig(mcpConfig: unknown): ProjectFilesystemGrant | null {
@@ -194,8 +270,11 @@ export function projectFilesystemGrantCovers(input: {
     mcpRequirements: input.mcpRequirements,
     metadata: input.metadata,
   })
-  if (summary.blockingCapabilities.length === 0 && summary.requestedCapabilities.length === 0) return null
-  const required = summary.blockingCapabilities.length > 0 ? summary.blockingCapabilities : summary.requestedCapabilities
+  if (summary.blockingCapabilities.length === 0 && summary.boundedRuntimeRequestedCapabilities.length === 0) return null
+  const required = summary.blockingCapabilities.length > 0
+    ? summary.blockingCapabilities
+    : summary.boundedRuntimeRequestedCapabilities
+  if (required.length === 0) return null
   return required.every((capability) => grant.capabilities.includes(capability)) ? grant : null
 }
 
@@ -304,37 +383,51 @@ export function requiresFilesystemGrantApproval(input: {
   mcpRequirements: unknown
   metadata: unknown
   projectMcpConfig?: unknown
-}): { blocked: boolean; missingCapabilities: FilesystemProjectCapability[]; requestedCapabilities: FilesystemProjectCapability[] } {
+}): { blocked: boolean; missingCapabilities: FilesystemProjectCapability[]; requestedCapabilities: FilesystemProjectRequestCapability[] } {
+  const admission = filesystemProjectionAdmission(input)
   const { blockingCapabilities, requestedCapabilities } = summarizeFilesystemCapabilities(input)
   if (blockingCapabilities.length === 0) {
     return { blocked: false, missingCapabilities: [], requestedCapabilities }
   }
+  const missing = new Set<FilesystemProjectCapability>()
   const metadata = isRecord(input.metadata) ? input.metadata : {}
-  const phases = isRecord(metadata.mcpGrantPhases) ? metadata.mcpGrantPhases : {}
-  const effective = isRecord(phases.effective) ? phases.effective : {}
-  if (
-    effective.schemaVersion === 1 &&
-    effective.phase === 'effective' &&
-    effective.runtimeEnforcement === 'bounded_context_packet' &&
-    effective.status === 'denied'
-  ) {
-    return { blocked: false, missingCapabilities: [], requestedCapabilities }
-  }
-  if (Object.hasOwn(input, 'projectMcpConfig')) {
-    const projectGrant = projectFilesystemGrantCovers({
-      mcpConfig: input.projectMcpConfig,
-      mcpRequirements: input.mcpRequirements,
-      metadata: input.metadata,
-    })
-    if (projectGrant) {
-      return { blocked: false, missingCapabilities: [], requestedCapabilities }
+  const project = { mcpConfig: input.projectMcpConfig ?? {} }
+  for (const evaluation of admission.evaluations) {
+    if (
+      evaluation.decision.mcpId !== FILESYSTEM_MCP_ID ||
+      evaluation.decision.status !== 'blocked' ||
+      evaluation.decision.recoveryAction !== 'approve_project_filesystem_context'
+    ) continue
+    const grantState = readEffectiveGrantState(
+      { metadata },
+      project,
+      evaluation.decision.normalizedCapabilities,
+    )
+    const coveredKeys = new Set(grantState.coveredCapabilities.flatMap(coverageKeysForGrant))
+    for (const value of evaluation.decision.normalizedCapabilities) {
+      const capability = canonicalFilesystemProjectCapability(value)
+      if (
+        capability &&
+        (grantState.phase !== 'approved' || grantState.consumed === true ||
+          !coverageKeysForGrant(capability).some((key) => coveredKeys.has(key)))
+      ) missing.add(capability)
     }
-    if (isProjectFilesystemEffectivePhase(effective)) {
-      return { blocked: true, missingCapabilities: blockingCapabilities, requestedCapabilities }
+  }
+  for (const decision of admission.subtaskDecisions) {
+    if (
+      decision.mcpId !== FILESYSTEM_MCP_ID ||
+      decision.status !== 'blocked' ||
+      decision.recoveryAction !== 'approve_project_filesystem_context'
+    ) continue
+    const capability = canonicalFilesystemProjectCapability(decision.capability)
+    const grantState = capability
+      ? readEffectiveGrantState({ metadata }, project, [capability])
+      : null
+    if (capability && (grantState?.phase !== 'approved' || grantState.consumed === true)) {
+      missing.add(capability)
     }
   }
-  const approved = approvedEffectiveFilesystemCapabilities(input.metadata)
-  const missingCapabilities = blockingCapabilities.filter((capability) => !approved.includes(capability))
+  const missingCapabilities = [...missing].sort()
   return { blocked: missingCapabilities.length > 0, missingCapabilities, requestedCapabilities }
 }
 

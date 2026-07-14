@@ -1249,14 +1249,38 @@ function effectiveFilesystemGrant(
 function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig: unknown): Record<string, unknown> {
   const effectiveGrant = effectiveFilesystemGrant(workPackage, projectMcpConfig)
   const capabilities = effectiveGrant.capabilities
-  const { blockingCapabilities, requestedCapabilities } = summarizeFilesystemCapabilities({
+  const {
+    blockingCapabilities,
+    boundedRuntimeRequestedCapabilities,
+    planningVisibleCapabilities,
+    requestedCapabilities,
+  } = summarizeFilesystemCapabilities({
     mcpRequirements: workPackage.mcpRequirements,
     metadata: workPackage.metadata,
   })
+  const runtimeRequestedCapabilities = boundedRuntimeRequestedCapabilities
+  const runtimeRequestedCapabilitySet = new Set<string>(runtimeRequestedCapabilities)
+  const issuedCapabilities = capabilities.filter((capability) => runtimeRequestedCapabilitySet.has(capability))
   const missingRequestedCapabilities = capabilities.length > 0
-    ? requestedCapabilities.filter((capability) => !capabilities.includes(capability))
+    ? runtimeRequestedCapabilities.filter((capability) => !issuedCapabilities.includes(capability))
     : []
   const missingBlockingCapabilities = blockingCapabilities.filter((capability) => !capabilities.includes(capability))
+  if (runtimeRequestedCapabilities.length === 0 && planningVisibleCapabilities.length > 0) {
+    return {
+      schemaVersion: 1,
+      capabilitySource: 'approved-work-package-mcp-grant-phases',
+      capabilities,
+      grantApprovalId: effectiveGrant.grantApprovalId,
+      grantMode: effectiveGrant.grantMode,
+      projectGrant: effectiveGrant.projectGrant,
+      planningVisibleCapabilities,
+      requestedCapabilities,
+      reason: 'This work package requested filesystem capabilities for planning or repository-write instructions only. Bounded read-only runtime context was not requested, so no filesystem context is issued.',
+      runtimeIssued: false,
+      runtimeEnforcement: 'bounded_context_packet',
+      status: 'not_issued_optional',
+    }
+  }
   if (effectiveGrant.projectGrantRevoked) {
     return {
       schemaVersion: 1,
@@ -1267,6 +1291,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig
       grantMode: effectiveGrant.grantMode,
       missingBlockingCapabilities,
       projectGrant: effectiveGrant.projectGrant,
+      planningVisibleCapabilities,
       requestedCapabilities,
       reason: 'Project-level filesystem approval was removed or no longer covers this package. Approve filesystem context again before execution.',
       runtimeIssued: false,
@@ -1274,7 +1299,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig
       status: blockingCapabilities.length > 0 ? 'blocked' : 'not_issued_optional',
     }
   }
-  if (capabilities.length > 0 && requestedCapabilities.length === 0) {
+  if (capabilities.length > 0 && runtimeRequestedCapabilities.length === 0) {
     return {
       schemaVersion: 1,
       capabilitySource: 'approved-work-package-mcp-grant-phases',
@@ -1282,10 +1307,12 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig
       grantApprovalId: effectiveGrant.grantApprovalId,
       grantMode: effectiveGrant.grantMode,
       projectGrant: effectiveGrant.projectGrant,
-      reason: 'A filesystem effective grant was present, but this work package did not request filesystem capabilities. Refusing to issue filesystem context.',
+      planningVisibleCapabilities,
+      requestedCapabilities,
+      reason: 'A filesystem effective grant was present, but this work package did not request filesystem capabilities that can activate bounded read-only context. Refusing to issue filesystem context.',
       runtimeIssued: false,
       runtimeEnforcement: 'bounded_context_packet',
-      status: 'blocked',
+      status: planningVisibleCapabilities.length > 0 ? 'not_issued_optional' : 'blocked',
     }
   }
   if (missingBlockingCapabilities.length > 0) {
@@ -1298,6 +1325,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig
       grantMode: effectiveGrant.grantMode,
       missingBlockingCapabilities,
       projectGrant: effectiveGrant.projectGrant,
+      planningVisibleCapabilities,
       requestedCapabilities,
       reason: `Filesystem capabilities were required by the plan but not covered by approved effective grants: ${missingBlockingCapabilities.join(', ')}.`,
       runtimeIssued: false,
@@ -1314,6 +1342,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig
       grantApprovalId: effectiveGrant.grantApprovalId,
       grantMode: effectiveGrant.grantMode,
       projectGrant: effectiveGrant.projectGrant,
+      planningVisibleCapabilities,
       requestedCapabilities,
       reason: 'Bounded filesystem context packets include file contents and require an approved filesystem.project.read grant.',
       runtimeIssued: false,
@@ -1329,6 +1358,7 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig
       grantApprovalId: effectiveGrant.grantApprovalId,
       grantMode: effectiveGrant.grantMode,
       projectGrant: effectiveGrant.projectGrant,
+      planningVisibleCapabilities,
       requestedCapabilities,
       reason: 'Filesystem capabilities were requested by the plan, but no non-blocked package-local effective grant was approved.',
       runtimeIssued: false,
@@ -1336,13 +1366,14 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig
       status: 'blocked',
     }
   }
-  if (capabilities.length === 0 && requestedCapabilities.length > 0) {
+  if (capabilities.length === 0 && runtimeRequestedCapabilities.length > 0) {
     return {
       schemaVersion: 1,
       capabilitySource: 'approved-work-package-mcp-grant-phases',
       grantApprovalId: effectiveGrant.grantApprovalId,
       grantMode: effectiveGrant.grantMode,
       projectGrant: effectiveGrant.projectGrant,
+      planningVisibleCapabilities,
       requestedCapabilities,
       reason: 'Filesystem capabilities were requested as optional continue-without-MCP access; no approved effective filesystem grant was issued.',
       runtimeIssued: false,
@@ -1361,13 +1392,14 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig
   return {
     schemaVersion: 1,
     capabilitySource: 'approved-work-package-mcp-grant-phases',
-    capabilities,
+    capabilities: issuedCapabilities,
     grantApprovalId: effectiveGrant.grantApprovalId,
     grantMode: effectiveGrant.grantMode,
     missingRequestedCapabilities,
     mode: 'read_only_context_packet',
     omittedOptionalCapabilities: missingRequestedCapabilities,
     projectGrant: effectiveGrant.projectGrant,
+    planningVisibleCapabilities,
     requestedCapabilities,
     runtimeIssued: true,
     runtimeEnforcement: 'bounded_context_packet',
@@ -1567,12 +1599,17 @@ function formatMcpAwareSubtask(subtask: Record<string, unknown>): string {
   ].filter((part): part is string => part !== null).join('; ')
 }
 
-function buildRunScopedMcpPromptLines(workPackage: WorkPackageRow): string[] {
+function buildRunScopedMcpPromptLines(
+  workPackage: WorkPackageRow,
+  filesystemRuntime?: Record<string, unknown>,
+): string[] {
   const metadata = isRecord(workPackage.metadata) ? workPackage.metadata : {}
   const promptOverlay = cleanPromptText(metadata.promptOverlay, 2_000)
   const requirements = promptRecordArray(workPackage.mcpRequirements)
   const subtasks = promptRecordArray(metadata.mcpAwareSubtasks)
-  const filesystemCapabilities = effectiveFilesystemGrant(workPackage).capabilities
+  const filesystemCapabilities = filesystemRuntime?.runtimeIssued === true
+    ? runtimeStringArray(filesystemRuntime.capabilities)
+    : []
 
   if (promptOverlay === '' && requirements.length === 0 && subtasks.length === 0) return []
 
@@ -1624,6 +1661,7 @@ function buildPriorReviewPromptLines(context: WorkPackagePriorReviewContext | un
 
 export function buildExecutionPrompt(input: {
   attemptNumber: number
+  filesystemRuntime?: Record<string, unknown>
   hostExecutionContext: ExecutionContextPacket
   hostProjectRoot: string
   priorReviewContext?: WorkPackagePriorReviewContext
@@ -1631,7 +1669,7 @@ export function buildExecutionPrompt(input: {
   task: TaskRow
   workPackage: WorkPackageRow
 }): string {
-  const runScopedMcpLines = buildRunScopedMcpPromptLines(input.workPackage)
+  const runScopedMcpLines = buildRunScopedMcpPromptLines(input.workPackage, input.filesystemRuntime)
   const priorReviewLines = buildPriorReviewPromptLines(input.priorReviewContext)
   const executionContext = formatExecutionContextPacket(input.hostExecutionContext)
 
@@ -1872,6 +1910,7 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
     }
     const prompt = buildExecutionPrompt({
       attemptNumber,
+      filesystemRuntime,
       hostExecutionContext,
       hostProjectRoot,
       priorReviewContext: context.priorReviewContext,

@@ -94,6 +94,30 @@ function grantEntry(overrides: Record<string, unknown> = {}) {
   }
 }
 
+type HostileInspectionKind = 'getter' | 'get trap' | 'ownKeys trap' | 'revoked proxy'
+
+function hostileInspectionValue(kind: HostileInspectionKind, secret: string): Record<string, unknown> {
+  if (kind === 'getter') {
+    return Object.defineProperty({}, 'coveredCapabilities', {
+      enumerable: true,
+      get: () => { throw new Error(`hostile getter ${secret}`) },
+    })
+  }
+  if (kind === 'get trap') {
+    return new Proxy({}, {
+      get: () => { throw new Error(`hostile get trap ${secret}`) },
+    })
+  }
+  if (kind === 'ownKeys trap') {
+    return new Proxy({}, {
+      ownKeys: () => { throw new Error(`hostile ownKeys ${secret}`) },
+    })
+  }
+  const revoked = Proxy.revocable({}, {})
+  revoked.revoke()
+  return revoked.proxy
+}
+
 function admitPackage(input: {
   entries?: Array<Record<string, unknown>>
   subtasks?: Array<Record<string, unknown>>
@@ -239,8 +263,17 @@ describe('admitMcpRequirement', () => {
 
   it.each([
     ['evidence references', { evidenceRefs: 'proof' }],
+    ['evidence references', { evidenceRefs: Array(31).fill('proof') }],
+    ['requested capabilities', { requestedCapabilities: Array(31).fill('filesystem.project.read') }],
     ['prohibition set', { packageProhibitedKeys: ['filesystem.project.read'] }],
+    ['prohibition set', { packageProhibitedKeys: {
+      has: () => false,
+      *[Symbol.iterator](): Generator<string> {
+        for (let index = 0; index < 31; index += 1) yield 'github.issues.read'
+      },
+    } }],
     ['grant coverage', { effectiveGrant: { ...approvedRead, coveredCapabilities: 'filesystem.project.read' } }],
+    ['grant coverage', { effectiveGrant: { ...approvedRead, coveredCapabilities: Array(31).fill('filesystem.project.read') } }],
     ['fallback', { fallback: Object.create({ action: 'continue_without_mcp' }) }],
   ])('fails closed for malformed direct API %s', (expected, override) => {
     const decision = admitMcpRequirement(requirement(override))
@@ -257,6 +290,22 @@ describe('admitMcpRequirement', () => {
     expect(JSON.stringify(decision)).not.toContain(credential)
     expect(JSON.stringify(decision)).not.toMatch(/[\u202a-\u202e\u2066-\u2069]/u)
   })
+
+  it.each(['getter', 'get trap', 'ownKeys trap', 'revoked proxy'] as const)(
+    'converts hostile direct fallback and effective-grant %s inspection into a sanitized block',
+    (kind) => {
+      const secret = `github_pat_${kind}_${'s'.repeat(80)}`
+      for (const override of [
+        { fallback: hostileInspectionValue(kind, secret) },
+        { effectiveGrant: hostileInspectionValue(kind, secret) },
+      ]) {
+        const decision = admitMcpRequirement(requirement(override))
+        expect(decision).toMatchObject({ mode: 'blocked', status: 'blocked', recoveryAction: 'revise_plan' })
+        expect(decision.reason).toBe('MCP admission input could not be safely inspected.')
+        expect(JSON.stringify(decision)).not.toContain(secret)
+      }
+    },
+  )
 
   it.each([
     { phase: 'approved', source: 'none', status: 'denied', coveredCapabilities: ['filesystem.project.read'] },
@@ -657,6 +706,38 @@ describe('admitWorkPackageMcp', () => {
     }
   })
 
+  it.each(['getter', 'get trap', 'ownKeys trap', 'revoked proxy'] as const)(
+    'blocks hostile %s entry and subtask inspection before invoking callbacks',
+    (kind) => {
+      const secret = `github_pat_${kind}_${'x'.repeat(80)}`
+      for (const input of [
+        { entries: [hostileInspectionValue(kind, secret)], subtasks: [] },
+        { entries: [rawEntry()], subtasks: [hostileInspectionValue(kind, secret)] },
+      ]) {
+        let callbackCalls = 0
+        const unexpectedCallback = () => {
+          callbackCalls += 1
+          throw new Error(`callback should not run ${secret}`)
+        }
+        const admission = admitWorkPackageMcp({
+          entries: input.entries,
+          subtasks: input.subtasks,
+          label: 'Hostile package input',
+          statusFor: unexpectedCallback,
+          effectiveGrantFor: unexpectedCallback,
+          hasPromptOnlyContextFor: unexpectedCallback,
+        })
+        expect(admission.aggregate).toMatchObject({
+          status: 'blocked',
+          primaryRecoveryAction: 'revise_plan',
+          retryable: false,
+        })
+        expect(callbackCalls).toBe(0)
+        expect(JSON.stringify(admission)).not.toContain(secret)
+      }
+    },
+  )
+
   it('rejects non-boolean prompt-context evidence from direct, callback, and persisted-envelope sources', () => {
     const direct = admitMcpRequirement(requirement({
       mcpId: 'github',
@@ -730,6 +811,76 @@ describe('admitWorkPackageMcp', () => {
       hasPromptOnlyContextFor: () => true,
     })
     expect(legacy.evaluations[0].decision).toMatchObject({ status: 'allowed', mode: 'planning_only' })
+  })
+
+  it.each(['status', 'prompt context', 'effective grant'] as const)(
+    'converts a throwing %s callback into a sanitized deterministic plan-revision block',
+    (throwingCallback) => {
+      const secret = `github_pat_${'z'.repeat(82)}`
+      const failure = () => { throw new Error(`callback failed ${secret}`) }
+      const admission = admitPackage({
+        statusFor: throwingCallback === 'status' ? failure : (mcpId) => status(mcpId),
+        hasPromptOnlyContextFor: throwingCallback === 'prompt context'
+          ? failure as unknown as () => boolean
+          : () => false,
+        effectiveGrantFor: throwingCallback === 'effective grant'
+          ? failure
+          : () => approvedRead,
+      })
+
+      expect(admission).toMatchObject({
+        evaluations: [{ decision: { mode: 'blocked', status: 'blocked', recoveryAction: 'revise_plan' } }],
+        aggregate: { status: 'blocked', primaryRecoveryAction: 'revise_plan', retryable: false },
+      })
+      expect(admission.evaluations[0].decision.reason).toMatch(/resolution failed closed/)
+      expect(JSON.stringify(admission)).not.toContain(secret)
+    },
+  )
+
+  it.each(['getter', 'get trap', 'ownKeys trap', 'revoked proxy'] as const)(
+    'fully snapshots a hostile %s effective-grant callback result inside the fail-closed boundary',
+    (kind) => {
+      const secret = `github_pat_${kind}_${'g'.repeat(80)}`
+      const admission = admitPackage({
+        effectiveGrantFor: () => hostileInspectionValue(kind, secret) as unknown as EffectiveGrantState,
+      })
+
+      expect(admission).toMatchObject({
+        evaluations: [{ decision: { mode: 'blocked', status: 'blocked', recoveryAction: 'revise_plan' } }],
+        aggregate: { status: 'blocked', primaryRecoveryAction: 'revise_plan', retryable: false },
+      })
+      expect(admission.evaluations[0].decision.reason).toBe('MCP admission input could not be safely inspected.')
+      expect(JSON.stringify(admission)).not.toContain(secret)
+    },
+  )
+
+  it('rejects raw and nested admission overflow before invoking any callback', () => {
+    for (const input of [
+      { entries: Array.from({ length: 81 }, () => rawEntry()), subtasks: [] },
+      { entries: [rawEntry({ capabilities: Array(31).fill('filesystem.project.read') })], subtasks: [] },
+      { entries: [rawEntry()], subtasks: Array.from({ length: 41 }, (_, index) => ({
+        id: `subtask-${index}`,
+        agent: 'backend',
+        mcpCapabilities: ['filesystem.project.read'],
+      })) },
+    ]) {
+      let callbackCalls = 0
+      const unexpectedCallback = () => {
+        callbackCalls += 1
+        throw new Error('overflow must be rejected before callback resolution')
+      }
+      const admission = admitWorkPackageMcp({
+        entries: input.entries,
+        subtasks: input.subtasks,
+        label: 'Overflowing package',
+        statusFor: unexpectedCallback,
+        effectiveGrantFor: unexpectedCallback,
+        hasPromptOnlyContextFor: unexpectedCallback,
+      })
+      expect(admission.aggregate).toMatchObject({ status: 'blocked', primaryRecoveryAction: 'revise_plan' })
+      expect(admission.aggregate.blockedReason).toMatch(/maximum raw count/)
+      expect(callbackCalls).toBe(0)
+    }
   })
 
   it.each([null, '', 7, ' trailing ', 'x'.repeat(161)])(
@@ -1726,6 +1877,10 @@ describe('admitWorkPackageMcp', () => {
       retryable: true,
       primaryMode: 'bounded_context_approved',
       primaryRecoveryAction: 'install_or_fix_mcp',
+      primaryDecision: {
+        recoveryAction: 'install_or_fix_mcp',
+        retryableContribution: true,
+      },
     })
 
     const validation = admissionToValidation(admission)
@@ -1737,7 +1892,12 @@ describe('admitWorkPackageMcp', () => {
       admissionStatus: 'blocked',
       health: expect.objectContaining({ observed: true, checkedAt }),
     })
-    expect(preview).toMatchObject({ retryable: true, primaryMode: 'bounded_context_approved', primaryRecoveryAction: 'install_or_fix_mcp' })
+    expect(preview).toMatchObject({
+      retryable: true,
+      primaryMode: 'bounded_context_approved',
+      primaryRecoveryAction: 'install_or_fix_mcp',
+      primaryDecision: { retryableContribution: true },
+    })
 
     const broker = admissionToBrokerCheck(admission)
     expect(broker).toMatchObject({
@@ -1745,6 +1905,7 @@ describe('admitWorkPackageMcp', () => {
       retryable: true,
       primaryMode: 'bounded_context_approved',
       primaryRecoveryAction: 'install_or_fix_mcp',
+      primaryDecision: { retryableContribution: true },
       evaluations: expect.any(Array),
       subtaskDecisions: expect.any(Array),
     })
@@ -1910,6 +2071,7 @@ describe('admitWorkPackageMcp', () => {
       status: 'blocked',
       retryable: false,
       primaryRecoveryAction: 'revise_plan',
+      primaryDecision: { retryableContribution: false },
     })
 
     const warningOnly = admitPackage({
@@ -1921,6 +2083,73 @@ describe('admitWorkPackageMcp', () => {
     })
     expect(warningOnly.aggregate).toMatchObject({ status: 'warning', retryable: false })
     expect(admitPackage().aggregate).toMatchObject({ status: 'allowed', retryable: false })
+  })
+
+  it.each([
+    ['filesystem first', ['filesystem', 'github']],
+    ['github first', ['github', 'filesystem']],
+  ] as const)('selects one precedence-consistent primary blocker with evidence: %s', (_label, order) => {
+    const entries = {
+      filesystem: rawEntry({
+        requirementKey: 'a-fs',
+        sourceRequirementIndex: 0,
+        evidenceRefs: ['filesystem-proof'],
+      }),
+      github: rawEntry({
+        requirementKey: 'z-gh',
+        sourceRequirementIndex: 1,
+        mcpId: 'github',
+        capabilities: ['github.contents.write'],
+        evidenceRefs: ['github-proof'],
+      }),
+    }
+    const admission = admitPackage({
+      entries: order.map((key) => entries[key]),
+      effectiveGrantFor: () => noGrant,
+    })
+
+    expect(admission.aggregate.blocked[0]).toContain('Filesystem context approval is required')
+    expect(admission.aggregate).toMatchObject({
+      primaryMode: 'deferred_live_mcp',
+      primaryRecoveryAction: 'revise_plan',
+      primaryDecision: {
+        kind: 'requirement',
+        mode: 'deferred_live_mcp',
+        recoveryAction: 'revise_plan',
+        retryableContribution: false,
+        requirementKey: 'z-gh',
+        decisionId: expect.any(String),
+        reason: expect.stringContaining('deferred live MCP capabilities'),
+        evidenceRefs: ['github-proof'],
+      },
+    })
+    const preview = admissionToGrantPreview(admission)
+    expect(preview.primaryDecision).toEqual(admission.aggregate.primaryDecision)
+    expect(admissionToBrokerCheck(admission).primaryDecision).toEqual(admission.aggregate.primaryDecision)
+    if (preview.primaryDecision) preview.primaryDecision.retryableContribution = true
+    expect(admission.aggregate.primaryDecision?.retryableContribution).toBe(false)
+    expect(admissionToBrokerCheck(admission)).toMatchObject({
+      primaryMode: admission.aggregate.primaryDecision?.mode,
+      primaryRecoveryAction: admission.aggregate.primaryDecision?.recoveryAction,
+      retryable: false,
+    })
+  })
+
+  it('derives a subtask primary decision retryability contribution from its recovery action', () => {
+    const admission = admitPackage({
+      entries: [],
+      subtasks: [{ id: 'unsafe-write', agent: 'backend', mcpCapabilities: ['github.contents.write'] }],
+    })
+    expect(admission.aggregate).toMatchObject({
+      status: 'blocked',
+      retryable: false,
+      primaryDecision: {
+        kind: 'subtask',
+        recoveryAction: 'revise_plan',
+        retryableContribution: false,
+        subtaskId: 'unsafe-write',
+      },
+    })
   })
 
   it('passes each requirement exact bounded capabilities to grant resolution and names them in failures', () => {

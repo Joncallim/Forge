@@ -116,6 +116,22 @@ export type McpAdmissionEvaluation = {
   health: McpHealthSnapshot
 }
 
+export type McpPrimaryBlockingDecision = {
+  kind: 'requirement' | 'subtask'
+  mode: McpAdmissionMode
+  recoveryAction: McpRecoveryAction
+  retryableContribution: boolean
+  reason: string
+  evidenceRefs: string[]
+  requirementKey: string
+  agent: string
+  mcpId: string
+  decisionId?: string
+  sourceRequirementIndex?: number
+  subtaskId?: string
+  capability?: string
+}
+
 export type McpWorkPackageAdmission = {
   schemaVersion: 2
   evaluations: McpAdmissionEvaluation[]
@@ -140,6 +156,7 @@ export type McpWorkPackageAdmission = {
     retryable: boolean
     primaryMode?: McpAdmissionMode
     primaryRecoveryAction?: McpRecoveryAction
+    primaryDecision?: McpPrimaryBlockingDecision
   }
 }
 
@@ -164,6 +181,7 @@ export type McpGrantPreview = Omit<McpGrantDecisions, 'decisions'> & {
   retryable: boolean
   primaryMode?: McpAdmissionMode
   primaryRecoveryAction?: McpRecoveryAction
+  primaryDecision?: McpPrimaryBlockingDecision
   evaluations: McpAdmissionEvaluation[]
   subtaskDecisions: McpWorkPackageAdmission['subtaskDecisions']
 }
@@ -172,6 +190,7 @@ export type McpBrokerAdmissionCheck = WorkPackageMcpBrokerCheck & {
   retryable: boolean
   primaryMode?: McpAdmissionMode
   primaryRecoveryAction?: McpRecoveryAction
+  primaryDecision?: McpPrimaryBlockingDecision
   evaluations: McpAdmissionEvaluation[]
   subtaskDecisions: McpWorkPackageAdmission['subtaskDecisions']
 }
@@ -182,6 +201,10 @@ const NO_GRANT: EffectiveGrantState = {
   status: 'not_issued',
   coveredCapabilities: [],
 }
+
+const MAX_ADMISSION_ENTRIES = 80
+const MAX_ADMISSION_SUBTASKS = 40
+const MAX_ADMISSION_NESTED_ITEMS = 30
 
 function noGrant(phase: EffectiveGrantState['phase'] = 'none'): EffectiveGrantState {
   return { ...NO_GRANT, phase, coveredCapabilities: [] }
@@ -312,7 +335,9 @@ function boundedFilesystemCapabilities(
   value: unknown,
   options: { allowEmpty: boolean },
 ): { valid: boolean; capabilities: string[] } {
-  if (!Array.isArray(value)) return { valid: false, capabilities: [] }
+  if (!Array.isArray(value) || value.length > MAX_ADMISSION_NESTED_ITEMS) {
+    return { valid: false, capabilities: [] }
+  }
   const result = new Set<string>()
   for (const capability of value) {
     if (
@@ -331,7 +356,9 @@ function boundedFilesystemCapabilities(
 }
 
 function grantCapabilities(value: unknown): { valid: boolean; capabilities: string[] } {
-  if (!Array.isArray(value)) return { valid: false, capabilities: [] }
+  if (!Array.isArray(value) || value.length > MAX_ADMISSION_NESTED_ITEMS) {
+    return { valid: false, capabilities: [] }
+  }
   const result = new Set<string>()
   for (const valueItem of value) {
     const grant = ownRecord(valueItem)
@@ -518,9 +545,13 @@ function readProhibitedCapabilityKeys(value: unknown): { keys: Set<string>; malf
     if (typeof iterator !== 'function' || typeof has !== 'function') {
       return { keys: new Set(), malformed: true }
     }
-    const items = [...value as Iterable<unknown>]
     const keys = new Set<string>()
-    for (const item of items) {
+    let itemCount = 0
+    for (const item of value as Iterable<unknown>) {
+      itemCount += 1
+      if (itemCount > MAX_ADMISSION_NESTED_ITEMS) {
+        return { keys: new Set(), malformed: true }
+      }
       if (!isSafeCapabilityText(item) || normalizeCapability(item) !== item) {
         return { keys: new Set(), malformed: true }
       }
@@ -587,7 +618,7 @@ function coherentEffectiveGrantState(grant: Record<string, unknown>): boolean {
   return grant.grantMode === 'allow_once' || !Object.hasOwn(grant, 'consumed') || grant.consumed === false
 }
 
-export function admitMcpRequirement(input: {
+type McpRequirementAdmissionInput = {
   mcpId: string
   agent: string
   requirement: 'required' | 'optional'
@@ -598,7 +629,9 @@ export function admitMcpRequirement(input: {
   effectiveGrant: EffectiveGrantState
   fallback: { action: McpFallbackAction }
   evidenceRefs?: string[]
-}): McpAdmissionDecision {
+}
+
+function admitMcpRequirementUnchecked(input: McpRequirementAdmissionInput): McpAdmissionDecision {
   const mcpIdentity = projectedIdentity(input.mcpId, 80)
   const agentIdentity = projectedIdentity(input.agent, 80)
   const mcpId = mcpIdentity.value
@@ -612,14 +645,18 @@ export function admitMcpRequirement(input: {
   const malformedPromptContext = typeof input.hasPromptOnlyContext !== 'boolean'
   const hasPromptOnlyContext = input.hasPromptOnlyContext === true
   const observedStatus = validatedProjectMcpStatus(mcpId, input.status)
-  const requestedCapabilities = Array.isArray(input.requestedCapabilities)
+  const requestedCapabilities = Array.isArray(input.requestedCapabilities) &&
+    input.requestedCapabilities.length <= MAX_ADMISSION_NESTED_ITEMS
     ? input.requestedCapabilities.filter(isSafeCapabilityText)
     : []
   const malformedRequestedCapabilities = !Array.isArray(input.requestedCapabilities) ||
+    input.requestedCapabilities.length > MAX_ADMISSION_NESTED_ITEMS ||
     input.requestedCapabilities.some((capability) => !isSafeCapabilityText(capability))
   const evidenceRefs = input.evidenceRefs
   const malformedEvidenceRefs = evidenceRefs !== undefined &&
-    (!Array.isArray(evidenceRefs) || evidenceRefs.some((ref) => typeof ref !== 'string'))
+    (!Array.isArray(evidenceRefs) ||
+      evidenceRefs.length > MAX_ADMISSION_NESTED_ITEMS ||
+      evidenceRefs.some((ref) => typeof ref !== 'string'))
   const fallback = ownRecord(input.fallback)
   const fallbackAction = fallback?.action
   const malformedFallback = fallback === null ||
@@ -659,7 +696,7 @@ export function admitMcpRequirement(input: {
     requestedCapabilities: [...requestedCapabilities],
     normalizedCapabilities,
     capabilityClasses,
-    evidenceRefs: (Array.isArray(evidenceRefs) ? evidenceRefs : [])
+    evidenceRefs: (Array.isArray(evidenceRefs) && evidenceRefs.length <= MAX_ADMISSION_NESTED_ITEMS ? evidenceRefs : [])
       .filter((ref): ref is string => typeof ref === 'string')
       .map((ref) => text(ref, 300))
       .filter(Boolean),
@@ -827,6 +864,45 @@ export function admitMcpRequirement(input: {
     `This requirement is planning-only for: ${capabilityReasonList(normalizedCapabilities)}. It grants no live MCP capability.`,
     'continue_as_prompt_context',
   )
+}
+
+function unsafeRequirementInspectionBlock(): McpAdmissionDecision {
+  return {
+    schemaVersion: 1,
+    mcpId: 'invalid',
+    agent: 'unknown',
+    requirement: 'required',
+    requestedCapabilities: [],
+    normalizedCapabilities: [],
+    capabilityClasses: [],
+    mode: 'blocked',
+    status: 'blocked',
+    reason: 'MCP admission input could not be safely inspected.',
+    recoveryAction: 'revise_plan',
+    evidenceRefs: [],
+  }
+}
+
+export function admitMcpRequirement(input: McpRequirementAdmissionInput): McpAdmissionDecision {
+  try {
+    const packageProhibitedKeys = input.packageProhibitedKeys
+    return admitMcpRequirementUnchecked({
+      mcpId: structuredClone(input.mcpId),
+      agent: structuredClone(input.agent),
+      requirement: structuredClone(input.requirement),
+      requestedCapabilities: structuredClone(input.requestedCapabilities),
+      packageProhibitedKeys: packageProhibitedKeys instanceof Set
+        ? structuredClone(packageProhibitedKeys)
+        : [] as unknown as ReadonlySet<string>,
+      status: structuredClone(input.status),
+      hasPromptOnlyContext: structuredClone(input.hasPromptOnlyContext),
+      effectiveGrant: structuredClone(input.effectiveGrant),
+      fallback: structuredClone(input.fallback),
+      ...(input.evidenceRefs === undefined ? {} : { evidenceRefs: structuredClone(input.evidenceRefs) }),
+    })
+  } catch {
+    return unsafeRequirementInspectionBlock()
+  }
 }
 
 type JoinedEntry = {
@@ -1254,64 +1330,150 @@ function intersects(left: readonly string[], right: ReadonlySet<string>): boolea
   return left.some((item) => right.has(item))
 }
 
-export function admitWorkPackageMcp(input: {
+function structuralAdmissionBlock(label: unknown, reasonText: string): McpWorkPackageAdmission {
+  const reason = decisionReason(reasonText)
+  const health = snapshot('invalid', null)
+  return {
+    schemaVersion: 2,
+    evaluations: [{
+      decision: {
+        schemaVersion: 1,
+        mcpId: 'invalid',
+        agent: 'unknown',
+        requirement: 'required',
+        requestedCapabilities: [],
+        normalizedCapabilities: [],
+        capabilityClasses: [],
+        mode: 'blocked',
+        status: 'blocked',
+        reason,
+        recoveryAction: 'revise_plan',
+        evidenceRefs: [],
+      },
+      source: {
+        requirementKey: 'invalid-admission-shape',
+        decisionId: 'req-invalid-admission-shape',
+        sourceRequirementIndex: 0,
+        assignment: { type: 'agent', targetId: null },
+        fallback: { action: 'block', message: '' },
+        promptOverlayPresent: false,
+      },
+      health,
+    }],
+    subtaskDecisions: [],
+    referencedHealth: [{
+      mcpId: 'invalid',
+      installState: 'unknown',
+      status: 'unknown',
+      enabled: false,
+      error: null,
+    }],
+    aggregate: {
+      status: 'blocked',
+      blocked: [reason],
+      warnings: [],
+      blockedReason: `MCP/capability broker blocked "${text(label, 160) || 'work package'}": ${reason}`,
+      retryable: false,
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+    },
+  }
+}
+
+function malformedSubtasksContainerBlock(label: unknown): McpWorkPackageAdmission {
+  const reason = decisionReason('Malformed subtask MCP declaration: subtasks must be an array of subtask records.')
+  const decision: McpWorkPackageAdmission['subtaskDecisions'][number] = {
+    subtaskId: 'invalid-subtasks-container',
+    agent: 'unknown',
+    requirementKey: '',
+    mcpId: '',
+    capability: 'invalid.subtask.mcp-declaration',
+    class: 'unknown',
+    deliveryKind: null,
+    status: 'blocked',
+    reason,
+    recoveryAction: 'revise_plan',
+  }
+  return {
+    schemaVersion: 2,
+    evaluations: [],
+    subtaskDecisions: [decision],
+    referencedHealth: [],
+    aggregate: {
+      status: 'blocked',
+      blocked: [reason],
+      warnings: [],
+      blockedReason: `MCP/capability broker blocked "${text(label, 160) || 'work package'}": ${reason}`,
+      retryable: false,
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+      primaryDecision: {
+        kind: 'subtask',
+        mode: 'blocked',
+        recoveryAction: 'revise_plan',
+        retryableContribution: false,
+        reason,
+        evidenceRefs: [],
+        requirementKey: '',
+        agent: 'unknown',
+        mcpId: '',
+        subtaskId: decision.subtaskId,
+        capability: decision.capability,
+      },
+    },
+  }
+}
+
+function admissionBoundError(
+  entries: unknown,
+  subtasks: unknown,
+): string | null {
+  if (!Array.isArray(entries)) return 'MCP requirement entries must be an array of policy records.'
+  if (!Array.isArray(subtasks)) return 'MCP-aware subtasks must be an array of subtask records.'
+  if (entries.length > MAX_ADMISSION_ENTRIES) {
+    return `MCP requirement entries exceed the maximum raw count of ${MAX_ADMISSION_ENTRIES}.`
+  }
+  if (subtasks.length > MAX_ADMISSION_SUBTASKS) {
+    return `MCP-aware subtasks exceed the maximum raw count of ${MAX_ADMISSION_SUBTASKS}.`
+  }
+
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]
+    if (!isRecord(entry)) continue
+    for (const field of [...REQUIREMENT_CAPABILITY_FIELDS, 'prohibitedCapabilities', 'evidenceRefs', 'capabilityClasses']) {
+      const value = entry[field]
+      if (Array.isArray(value) && value.length > MAX_ADMISSION_NESTED_ITEMS) {
+        return `MCP requirement entry ${index} field '${field}' exceeds the maximum raw count of ${MAX_ADMISSION_NESTED_ITEMS}.`
+      }
+    }
+  }
+
+  for (let index = 0; index < subtasks.length; index += 1) {
+    const subtask = subtasks[index]
+    if (!isRecord(subtask)) continue
+    for (const field of ['mcpCapabilities', 'capabilityBindings']) {
+      const value = subtask[field]
+      if (Array.isArray(value) && value.length > MAX_ADMISSION_NESTED_ITEMS) {
+        return `MCP-aware subtask ${index} field '${field}' exceeds the maximum raw count of ${MAX_ADMISSION_NESTED_ITEMS}.`
+      }
+    }
+  }
+  return null
+}
+
+type WorkPackageMcpAdmissionInput = {
   entries: Array<Record<string, unknown>>
   subtasks: Array<Record<string, unknown>>
   label: string
   statusFor: (mcpId: string) => ProjectMcpStatus | null
   effectiveGrantFor: (entry: { requirementKey: string; mcpId: string; requiredCapabilities: string[] }) => EffectiveGrantState
   hasPromptOnlyContextFor: (entry: { requirementKey: string; agent: string; mcpId: string }) => boolean
-}): McpWorkPackageAdmission {
-  const malformedEntriesContainer = !Array.isArray(input.entries)
-  if (malformedEntriesContainer) {
-    const reason = decisionReason('MCP requirement entries must be an array of policy records.')
-    const health = snapshot('invalid', null)
-    return {
-      schemaVersion: 2,
-      evaluations: [{
-        decision: {
-          schemaVersion: 1,
-          mcpId: 'invalid',
-          agent: 'unknown',
-          requirement: 'required',
-          requestedCapabilities: [],
-          normalizedCapabilities: [],
-          capabilityClasses: [],
-          mode: 'blocked',
-          status: 'blocked',
-          reason,
-          recoveryAction: 'revise_plan',
-          evidenceRefs: [],
-        },
-        source: {
-          requirementKey: 'invalid-entries-container',
-          decisionId: 'req-invalid-entries-container',
-          sourceRequirementIndex: 0,
-          assignment: { type: 'agent', targetId: null },
-          fallback: { action: 'block', message: '' },
-          promptOverlayPresent: false,
-        },
-        health,
-      }],
-      subtaskDecisions: [],
-      referencedHealth: [{
-        mcpId: 'invalid',
-        installState: 'unknown',
-        status: 'unknown',
-        enabled: false,
-        error: null,
-      }],
-      aggregate: {
-        status: 'blocked',
-        blocked: [reason],
-        warnings: [],
-        blockedReason: `MCP/capability broker blocked "${text(input.label, 160) || 'work package'}": ${reason}`,
-        retryable: false,
-        primaryMode: 'blocked',
-        primaryRecoveryAction: 'revise_plan',
-      },
-    }
-  }
+}
+
+function admitWorkPackageMcpUnchecked(input: WorkPackageMcpAdmissionInput): McpWorkPackageAdmission {
+  if (!Array.isArray(input.subtasks)) return malformedSubtasksContainerBlock(input.label)
+  const boundError = admissionBoundError(input.entries, input.subtasks)
+  if (boundError) return structuralAdmissionBlock(input.label, boundError)
   const entries = input.entries.map((entry) => ownRecord(entry) ?? {})
   const joined = joinEntries(entries)
   const packageProhibitedKeys = new Set<string>()
@@ -1364,13 +1526,24 @@ export function admitWorkPackageMcp(input: {
         ]
       : []
     const consultCallbacks = policy !== null && preflightErrors.length === 0
-    const status = consultCallbacks
-      ? validatedProjectMcpStatus(mcpId, input.statusFor(mcpId))
-      : null
+    const callbackErrors: string[] = []
+    let status: ProjectMcpStatus | null = null
+    if (consultCallbacks) {
+      try {
+        status = validatedProjectMcpStatus(mcpId, input.statusFor(mcpId))
+      } catch {
+        callbackErrors.push('MCP status resolution failed closed; recompute the work-package plan.')
+      }
+    }
     const health = snapshot(mcpId, status)
-    const callbackPromptOnlyContextValue = consultCallbacks
-      ? input.hasPromptOnlyContextFor({ requirementKey: item.requirementKey, agent, mcpId })
-      : false
+    let callbackPromptOnlyContextValue: unknown = false
+    if (consultCallbacks && callbackErrors.length === 0) {
+      try {
+        callbackPromptOnlyContextValue = input.hasPromptOnlyContextFor({ requirementKey: item.requirementKey, agent, mcpId })
+      } catch {
+        callbackErrors.push('Prompt-context evidence resolution failed closed; recompute the work-package plan.')
+      }
+    }
     const callbackPromptOnlyContext = callbackPromptOnlyContextValue === true
     const callbackPromptEvidenceError = typeof callbackPromptOnlyContextValue === 'boolean'
       ? null
@@ -1379,9 +1552,14 @@ export function admitWorkPackageMcp(input: {
     const requiredCapabilities = requestedCapabilities.filter((capability) =>
       classifyCapability(mcpId, capability) === 'bounded_read_only' && mcpDeliveryKind(mcpId) === 'bounded_context_packet',
     )
-    const effectiveGrant = consultCallbacks
-      ? input.effectiveGrantFor({ requirementKey: item.requirementKey, mcpId, requiredCapabilities })
-      : noGrant()
+    let effectiveGrant = noGrant()
+    if (consultCallbacks && callbackErrors.length === 0) {
+      try {
+        effectiveGrant = input.effectiveGrantFor({ requirementKey: item.requirementKey, mcpId, requiredCapabilities })
+      } catch {
+        callbackErrors.push('Effective grant resolution failed closed; recompute the work-package plan.')
+      }
+    }
     let decision: McpAdmissionDecision
     if (!policy) {
       decision = {
@@ -1413,6 +1591,7 @@ export function admitWorkPackageMcp(input: {
       })
       const failClosedErrors = [
         ...preflightErrors,
+        ...callbackErrors,
         ...(callbackPromptEvidenceError ? [callbackPromptEvidenceError] : []),
       ]
       if (failClosedErrors.length > 0) {
@@ -1566,6 +1745,14 @@ export function admitWorkPackageMcp(input: {
         declarationErrors.push(`capabilityBindings item ${index} does not match a declared subtask capability.`)
       }
     })
+    if (Object.hasOwn(subtask, 'capabilityBindings') && Array.isArray(subtask.capabilityBindings)) {
+      for (const capability of declaredCapabilities) {
+        const count = bindings.filter((binding) => binding.capability === capability).length
+        if (count !== 1) {
+          declarationErrors.push(`Subtask capability '${capability}' must have exactly one explicit requirement binding.`)
+        }
+      }
+    }
 
     for (const rawCapability of agentError || invalidSubtaskId || duplicateSubtaskId
       ? []
@@ -1713,11 +1900,37 @@ export function admitWorkPackageMcp(input: {
       mode: item.decision.mode,
       action: item.decision.recoveryAction,
       stableKey: `requirement\u0000${item.source.requirementKey}\u0000${item.decision.agent}\u0000${item.decision.mcpId}`,
+      decision: {
+        kind: 'requirement' as const,
+        mode: item.decision.mode,
+        recoveryAction: item.decision.recoveryAction as McpRecoveryAction,
+        retryableContribution: item.decision.recoveryAction === 'install_or_fix_mcp',
+        reason: item.decision.reason,
+        evidenceRefs: [...item.decision.evidenceRefs],
+        requirementKey: item.source.requirementKey,
+        agent: item.decision.agent,
+        mcpId: item.decision.mcpId,
+        decisionId: item.source.decisionId,
+        sourceRequirementIndex: item.source.sourceRequirementIndex,
+      },
     })),
     ...subtaskDecisions.filter((item) => item.status === 'blocked').map((item) => ({
       mode: item.class === 'deferred_live_mcp' ? 'deferred_live_mcp' as const : 'blocked' as const,
       action: item.recoveryAction,
       stableKey: `subtask\u0000${item.subtaskId}\u0000${item.agent}\u0000${item.capability}\u0000${item.requirementKey}`,
+      decision: {
+        kind: 'subtask' as const,
+        mode: item.class === 'deferred_live_mcp' ? 'deferred_live_mcp' as const : 'blocked' as const,
+        recoveryAction: item.recoveryAction as McpRecoveryAction,
+        retryableContribution: item.recoveryAction === 'install_or_fix_mcp',
+        reason: item.reason,
+        evidenceRefs: [],
+        requirementKey: item.requirementKey,
+        agent: item.agent,
+        mcpId: item.mcpId,
+        subtaskId: item.subtaskId,
+        capability: item.capability,
+      },
     })),
   ]
   const precedence: McpRecoveryAction[] = [
@@ -1765,14 +1978,48 @@ export function admitWorkPackageMcp(input: {
       blocked,
       warnings,
       blockedReason: blocked.length > 0 ? `MCP/capability broker blocked "${label}": ${blocked.join('; ')}` : null,
-      retryable: blockingItems.length > 0 && blockingItems.every((item) => item.action === 'install_or_fix_mcp'),
-      ...(primary ? { primaryMode: primary.mode, primaryRecoveryAction: primary.action } : {}),
+      retryable: blockingItems.length > 0 && blockingItems.every((item) => item.decision.retryableContribution),
+      ...(primary ? {
+        primaryMode: primary.decision.mode,
+        primaryRecoveryAction: primary.decision.recoveryAction,
+        primaryDecision: primary.decision,
+      } : {}),
     },
+  }
+}
+
+export function admitWorkPackageMcp(input: WorkPackageMcpAdmissionInput): McpWorkPackageAdmission {
+  try {
+    const entries = input.entries
+    const subtasks = input.subtasks
+    const label = input.label
+    const statusFor = input.statusFor
+    const effectiveGrantFor = input.effectiveGrantFor
+    const hasPromptOnlyContextFor = input.hasPromptOnlyContextFor
+    if (!Array.isArray(subtasks)) return malformedSubtasksContainerBlock(label)
+    const boundError = admissionBoundError(entries, subtasks)
+    if (boundError) return structuralAdmissionBlock(label, boundError)
+    return admitWorkPackageMcpUnchecked({
+      entries: structuredClone(entries),
+      subtasks: structuredClone(subtasks),
+      label: structuredClone(label),
+      statusFor,
+      effectiveGrantFor,
+      hasPromptOnlyContextFor,
+    })
+  } catch {
+    return structuralAdmissionBlock('work package', 'MCP admission input could not be safely inspected.')
   }
 }
 
 function cloneHealthSnapshot(health: McpHealthSnapshot): McpHealthSnapshot {
   return { ...health }
+}
+
+function clonePrimaryDecision(
+  decision: McpPrimaryBlockingDecision,
+): McpPrimaryBlockingDecision {
+  return { ...decision, evidenceRefs: [...decision.evidenceRefs] }
 }
 
 function cloneEvaluation(evaluation: McpAdmissionEvaluation): McpAdmissionEvaluation {
@@ -1848,9 +2095,16 @@ export function admissionToGrantPreview(admission: McpWorkPackageAdmission): Mcp
     retryable: admission.aggregate.retryable,
     evaluations: admission.evaluations.map(cloneEvaluation),
     subtaskDecisions: admission.subtaskDecisions.map((decision) => ({ ...decision })),
-    ...(admission.aggregate.primaryMode ? { primaryMode: admission.aggregate.primaryMode } : {}),
-    ...(admission.aggregate.primaryRecoveryAction
-      ? { primaryRecoveryAction: admission.aggregate.primaryRecoveryAction }
+    ...(admission.aggregate.primaryDecision?.mode
+      ? { primaryMode: admission.aggregate.primaryDecision.mode }
+      : admission.aggregate.primaryMode ? { primaryMode: admission.aggregate.primaryMode } : {}),
+    ...(admission.aggregate.primaryDecision?.recoveryAction
+      ? { primaryRecoveryAction: admission.aggregate.primaryDecision.recoveryAction }
+      : admission.aggregate.primaryRecoveryAction
+        ? { primaryRecoveryAction: admission.aggregate.primaryRecoveryAction }
+      : {}),
+    ...(admission.aggregate.primaryDecision
+      ? { primaryDecision: clonePrimaryDecision(admission.aggregate.primaryDecision) }
       : {}),
   }
 }
@@ -1864,9 +2118,16 @@ export function admissionToBrokerCheck(admission: McpWorkPackageAdmission): McpB
     retryable: admission.aggregate.retryable,
     evaluations: admission.evaluations.map(cloneEvaluation),
     subtaskDecisions: admission.subtaskDecisions.map((decision) => ({ ...decision })),
-    ...(admission.aggregate.primaryMode ? { primaryMode: admission.aggregate.primaryMode } : {}),
-    ...(admission.aggregate.primaryRecoveryAction
-      ? { primaryRecoveryAction: admission.aggregate.primaryRecoveryAction }
+    ...(admission.aggregate.primaryDecision?.mode
+      ? { primaryMode: admission.aggregate.primaryDecision.mode }
+      : admission.aggregate.primaryMode ? { primaryMode: admission.aggregate.primaryMode } : {}),
+    ...(admission.aggregate.primaryDecision?.recoveryAction
+      ? { primaryRecoveryAction: admission.aggregate.primaryDecision.recoveryAction }
+      : admission.aggregate.primaryRecoveryAction
+        ? { primaryRecoveryAction: admission.aggregate.primaryRecoveryAction }
+      : {}),
+    ...(admission.aggregate.primaryDecision
+      ? { primaryDecision: clonePrimaryDecision(admission.aggregate.primaryDecision) }
       : {}),
   }
 }

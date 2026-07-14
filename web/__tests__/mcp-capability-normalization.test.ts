@@ -1,6 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
 import { MCP_CATALOG } from '@/lib/mcps/catalog'
-import { SAFE_BETA_CAPABILITY_PATTERNS } from '@/worker/mcp-execution-design'
 import {
   DEFERRED_CAPABILITY_FAMILIES,
   SAFE_READ_SUPPLEMENT,
@@ -162,7 +161,7 @@ describe('MCP capability normalization', () => {
     expect(() => (SAFE_READ_SUPPLEMENT.github as unknown as RegExp[]).push(/^github\.issues\.write$/)).toThrow()
   })
 
-  it('keeps mutable RegExp compatibility views isolated from classifier authority', () => {
+  it('keeps mutable supplement RegExp views isolated from classifier authority', () => {
     const supplementPattern = SAFE_READ_SUPPLEMENT.github[0]
     const originalSource = supplementPattern.source
     const originalFlags = supplementPattern.flags
@@ -170,21 +169,8 @@ describe('MCP capability normalization', () => {
       supplementPattern.compile('^filesystem\\.project\\.read$')
       expect(supplementPattern.test('filesystem.project.read')).toBe(true)
       expect(classifyCapability('github', 'filesystem.project.read')).toBe('unknown')
-      expect(SAFE_BETA_CAPABILITY_PATTERNS.github.some((pattern) => pattern.test('filesystem.project.read'))).toBe(false)
     } finally {
       supplementPattern.compile(originalSource, originalFlags)
-    }
-  })
-
-  it('keeps safe-read compatibility negative for deferred and malformed capabilities', () => {
-    for (const capability of [
-      'github.pull_requests.write',
-      'github.pull_requests.merge',
-      'github.issues.execute',
-      'github.constructor.read',
-      'github.pull requests.read',
-    ]) {
-      expect(SAFE_BETA_CAPABILITY_PATTERNS.github.some((pattern) => pattern.test(capability)), capability).toBe(false)
     }
   })
 
@@ -286,48 +272,12 @@ describe('MCP capability normalization', () => {
     }
   })
 
-  it('keeps classifier authority private from catalog and compatibility-regex mutation', () => {
+  it('keeps classifier authority private from catalog mutation', () => {
     MCP_CATALOG.github.runtime.capabilities.push('github.widgets.read')
     try {
       expect(classifyCapability('github', 'github.widgets.read')).toBe('unknown')
     } finally {
       MCP_CATALOG.github.runtime.capabilities.pop()
     }
-
-    const compatibilityPattern = SAFE_BETA_CAPABILITY_PATTERNS.github.find(
-      (pattern) => pattern.source === '^github\\.actions\\.read$',
-    )
-    expect(compatibilityPattern).toBeDefined()
-    const originalSource = compatibilityPattern?.source ?? ''
-    const originalFlags = compatibilityPattern?.flags ?? ''
-    try {
-      compatibilityPattern?.compile('^github\\.widgets\\.read$')
-      expect(SAFE_BETA_CAPABILITY_PATTERNS.github.some((pattern) => pattern.test('github.widgets.read'))).toBe(true)
-      expect(classifyCapability('github', 'github.widgets.read')).toBe('unknown')
-      expect(classifyCapability('github', 'github.pull_requests.read')).toBe('bounded_read_only')
-      expect(isDeferredCapability('github', 'github.pull_requests.read')).toBe(false)
-    } finally {
-      compatibilityPattern?.compile(originalSource, originalFlags)
-    }
-  })
-
-  it.each([
-    ['filesystem', 'filesystem.project.read'],
-    ['filesystem', 'filesystem.read'],
-    ['filesystem', 'filesystem.project.list'],
-    ['filesystem', 'filesystem.list'],
-    ['filesystem', 'filesystem.project.search'],
-    ['filesystem', 'filesystem.search'],
-    ['github', 'github.issues.read'],
-    ['github', 'github.pull_requests.read'],
-    ['github', 'github.contents.read'],
-    ['github', 'github.repository.search'],
-    ['github', 'github.actions.read'],
-    ['github', 'github.repository.read'],
-    ['github', 'github.repository.list'],
-    ['github', 'github.contents.list'],
-    ['github', 'github.contents.search'],
-  ])('preserves SAFE_BETA compatibility for %s / %s', (mcpId, capability) => {
-    expect(SAFE_BETA_CAPABILITY_PATTERNS[mcpId].some((pattern) => pattern.test(capability))).toBe(true)
   })
 })

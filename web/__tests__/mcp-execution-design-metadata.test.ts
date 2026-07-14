@@ -63,6 +63,7 @@ describe('latestMcpExecutionDesignFromArtifacts', () => {
     expect(result?.grantDecisions?.summary.warning).toBe(1)
     expect(result?.grantDecisions?.decisions[0]).toMatchObject({
       decisionId: 'req-0:backend:github',
+      mode: 'unknown_legacy',
       status: 'warning',
       promptOverlayPresent: true,
     })
@@ -84,5 +85,29 @@ describe('latestMcpExecutionDesignFromArtifacts', () => {
     expect(result?.validation.status).toBe('valid')
     expect(result?.proposed?.requirements[0].mcpId).toBe('github')
     expect(result?.grantDecisions).toBeNull()
+  })
+
+  it('preserves canonical identity, observation, and scoped context metadata', () => {
+    const current = artifact('2026-07-14T00:00:00.000Z', 'github', 'valid')
+    const mcp = current.metadata.mcpExecutionDesign
+    const proposed = mcp.proposed as Record<string, unknown>
+    ;(proposed.requirements as Array<Record<string, unknown>>)[0].requirementKey = 'mcp-requirement-v1-test-1'
+    ;(proposed.requirements as Array<Record<string, unknown>>)[0].sourceRequirementIndex = 0
+    proposed.requirementContexts = [{ requirementKey: 'mcp-requirement-v1-test-1', sourceRequirementIndex: 0, agent: 'backend', mcpId: 'github', promptOverlay: 'Scoped.' }]
+    const decision = (mcp.grantDecisions.decisions as Array<Record<string, unknown>>)[0]
+    decision.requirementKey = 'mcp-requirement-v1-test-1'
+    decision.mode = 'planning_only'
+    decision.admissionStatus = 'allowed'
+    decision.grantState = { phase: 'not_issued' }
+    decision.health = { schemaVersion: 1, observed: false, mcpId: 'github', installState: 'unknown', status: 'unknown', enabled: false, error: null, checkedAt: null }
+
+    const result = latestMcpExecutionDesignFromArtifacts([current])
+    expect(result?.proposed?.requirementContexts[0]).toMatchObject({ requirementKey: 'mcp-requirement-v1-test-1', agent: 'backend' })
+    expect(result?.grantDecisions?.decisions[0]).toMatchObject({
+      requirementKey: 'mcp-requirement-v1-test-1',
+      mode: 'planning_only',
+      grantState: { phase: 'not_issued' },
+      health: { observed: false, checkedAt: null },
+    })
   })
 })

@@ -3,6 +3,7 @@ import {
   approvedEffectiveFilesystemCapabilities,
   isFilesystemGrantBlockedPackageMetadata,
   requiresFilesystemGrantApproval,
+  summarizeFilesystemCapabilities,
 } from '@/lib/mcps/filesystem-grants'
 
 const REQUIRED_FILESYSTEM_REQUIREMENT = [{
@@ -17,6 +18,9 @@ function approvedEffectivePhase(capabilities: string[]): Record<string, unknown>
       effective: {
         schemaVersion: 1,
         phase: 'effective',
+        source: 'explicit-grant-approval',
+        grantMode: 'allow_once',
+        runtimeIssued: false,
         runtimeEnforcement: 'bounded_context_packet',
         status: 'approved',
         grants: [{ mcpId: 'filesystem', status: 'approved', capabilities }],
@@ -26,6 +30,56 @@ function approvedEffectivePhase(capabilities: string[]): Record<string, unknown>
 }
 
 describe('requiresFilesystemGrantApproval', () => {
+  it('keeps filesystem.project.write visible as planning-only without requesting a live grant', () => {
+    const summary = summarizeFilesystemCapabilities({
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        agent: 'backend',
+        requirement: 'required',
+        capabilities: ['filesystem.project.write'],
+        fallback: { action: 'block', message: '' },
+      }],
+      metadata: {},
+    })
+
+    expect(summary).toEqual({
+      blockingCapabilities: [],
+      boundedRuntimeRequestedCapabilities: [],
+      planningVisibleCapabilities: ['filesystem.project.write'],
+      requestedCapabilities: ['filesystem.project.write'],
+    })
+    expect(requiresFilesystemGrantApproval({
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        agent: 'backend',
+        requirement: 'required',
+        capabilities: ['filesystem.project.write'],
+        fallback: { action: 'block', message: '' },
+      }],
+      metadata: {},
+    })).toMatchObject({ blocked: false, requestedCapabilities: ['filesystem.project.write'] })
+  })
+
+  it('projects read plus write into distinct planning and bounded-runtime capability sets', () => {
+    const summary = summarizeFilesystemCapabilities({
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        agent: 'backend',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read', 'filesystem.project.write'],
+        fallback: { action: 'block', message: '' },
+      }],
+      metadata: approvedEffectivePhase(['filesystem.project.read']),
+    })
+
+    expect(summary).toMatchObject({
+      blockingCapabilities: [],
+      boundedRuntimeRequestedCapabilities: ['filesystem.project.read'],
+      planningVisibleCapabilities: ['filesystem.project.read', 'filesystem.project.write'],
+      requestedCapabilities: ['filesystem.project.read', 'filesystem.project.write'],
+    })
+  })
+
   it('holds a required filesystem package that has no approved effective grant', () => {
     const result = requiresFilesystemGrantApproval({
       mcpRequirements: REQUIRED_FILESYSTEM_REQUIREMENT,

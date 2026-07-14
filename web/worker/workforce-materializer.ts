@@ -15,6 +15,7 @@ import {
   projectFilesystemEffectivePhase,
   projectFilesystemGrantCovers,
 } from '../lib/mcps/filesystem-grants'
+import { canonicalAgentPackageIdentity } from '../lib/mcps/agent-package-identity'
 import type { PreparedArchitectArtifact } from './architect-artifact'
 import type { ReviewRequirement } from './agent-breakdown'
 import { isImplementationPackageRole } from './review-gates'
@@ -67,7 +68,7 @@ function normalizeAgentType(role: string): string {
 }
 
 function normalizeRoleLookup(value: string): string {
-  return normalizeAgentType(value).replace(/_/g, '-')
+  return canonicalAgentPackageIdentity(value)
 }
 
 function displayNameForSlug(slug: string): string {
@@ -143,29 +144,40 @@ function roleMatches(value: string, agentType: string, aliases: string[]): boole
     aliases.some((alias) => normalizeRoleLookup(alias) === normalized)
 }
 
-function firstMatchingObjectValue<T>(
+function matchingObjectValues<T>(
   object: Record<string, T>,
   agentType: string,
   aliases: string[],
-): T | undefined {
-  for (const [key, value] of Object.entries(object)) {
-    if (roleMatches(key, agentType, aliases)) return value
-  }
-  return undefined
+): T[] {
+  return Object.entries(object)
+    .filter(([key]) => roleMatches(key, agentType, aliases))
+    .map(([, value]) => value)
 }
 
 function mcpGrantsForAgent(prepared: PreparedArchitectArtifact, agentType: string, aliases: string[]): JsonObject[] {
   return prepared.mcpExecutionDesign.grantDecisions.decisions
     .filter((decision) => roleMatches(decision.agent, agentType, aliases))
     .map((decision) => ({
+      requirementKey: decision.requirementKey,
       decisionId: decision.decisionId,
+      sourceRequirementIndex: decision.sourceRequirementIndex,
+      agent: agentType,
       mcpId: decision.mcpId,
       capabilities: decision.capabilities,
+      normalizedCapabilities: decision.normalizedCapabilities ?? decision.capabilities,
+      capabilityClasses: decision.capabilityClasses ?? [],
       requirement: decision.requirement,
       status: decision.status,
+      admissionStatus: decision.admissionStatus ?? (decision.status === 'proposed' ? 'allowed' : decision.status),
+      mode: decision.mode ?? 'unknown_legacy',
+      recoveryAction: decision.recoveryAction,
+      grantState: decision.grantState ?? { phase: 'not_issued' },
+      evidenceRefs: decision.evidenceRefs ?? [],
       reason: decision.reason,
+      assignment: decision.assignment,
       fallback: decision.fallback,
       health: decision.health,
+      promptOverlayPresent: decision.promptOverlayPresent,
     }))
 }
 
@@ -176,20 +188,42 @@ function mcpRequirementsForAgent(prepared: PreparedArchitectArtifact, agentType:
   const candidates = new Set([agentType, ...aliases].map(normalizeRoleLookup))
   return design.requirements
     .filter((requirement) => {
-      const targetAgents = requirement.assignment.targetAgents.map(normalizeRoleLookup)
-      const permissionAgents = Object.keys(requirement.agentPermissions).map(normalizeRoleLookup)
-      return targetAgents.some((agent) => candidates.has(agent)) ||
-        permissionAgents.some((agent) => candidates.has(agent))
+      const requirementAgents = requirementAgentsForMaterialization(requirement).map(normalizeRoleLookup)
+      return requirementAgents.some((agent) => candidates.has(agent))
     })
-    .map((requirement) => ({
+    .map((requirement, index) => ({
+      requirementKey: requirement.requirementKey,
+      sourceRequirementIndex: requirement.sourceRequirementIndex ?? index,
+      agent: agentType,
       mcpId: requirement.mcpId,
       requirement: requirement.requirement,
       reason: requirement.reason,
       assignment: requirement.assignment,
-      permissions: firstMatchingObjectValue(requirement.agentPermissions, agentType, aliases) ?? [],
+      permissions: [...new Set(matchingObjectValues(requirement.agentPermissions, agentType, aliases).flat())].sort(),
       prohibitedCapabilities: requirement.prohibitedCapabilities,
       fallback: requirement.fallback,
     }))
+}
+
+function requirementAgentsForMaterialization(
+  requirement: NonNullable<PreparedArchitectArtifact['mcpExecutionDesign']['proposed']>['requirements'][number],
+): string[] {
+  const agents = new Set([...requirement.assignment.targetAgents, ...Object.keys(requirement.agentPermissions)])
+  if (requirement.assignment.type === 'architect_only') agents.add('architect')
+  if (requirement.assignment.type === 'reviewer_only') agents.add('reviewer')
+  return [...agents]
+}
+
+function mcpRequirementContextsForAgent(
+  prepared: PreparedArchitectArtifact,
+  agentType: string,
+  aliases: string[],
+): JsonObject[] {
+  const design = prepared.mcpExecutionDesign.proposed
+  if (!design) return []
+  return (design.requirementContexts ?? [])
+    .filter((context) => roleMatches(context.agent, agentType, aliases))
+    .map((context) => ({ ...context, agent: agentType }))
 }
 
 function mcpSubtasksForAgent(prepared: PreparedArchitectArtifact, agentType: string, aliases: string[]): JsonObject[] {
@@ -200,8 +234,10 @@ function mcpSubtasksForAgent(prepared: PreparedArchitectArtifact, agentType: str
     .filter((subtask) => roleMatches(subtask.agent, agentType, aliases))
     .map((subtask) => ({
       id: subtask.id,
+      agent: agentType,
       dependsOn: subtask.dependsOn,
       mcpCapabilities: subtask.mcpCapabilities,
+      capabilityBindings: subtask.capabilityBindings ?? [],
       inputs: subtask.inputs,
       outputs: subtask.outputs,
       verification: subtask.verification,
@@ -217,6 +253,13 @@ function planningOnlyHarnessMetadata(): JsonObject {
     runtimePolicyApplied: false,
     note: 'Harness records shape planning for beta handoff only; it is not wired as a runtime tool or MCP policy.',
   }
+}
+
+function mcpNormalizationEvidence(
+  prepared: PreparedArchitectArtifact,
+): JsonObject[] {
+  return (prepared.mcpExecutionDesign.proposed?.normalizationEvidence ?? [])
+    .map((evidence) => ({ ...evidence }))
 }
 
 function mcpGrantPhaseMetadata(input: {
@@ -324,6 +367,9 @@ export function buildWorkforceMaterializationRows(
           source: 'architect-artifact',
           architectRunId: input.architectRunId,
           artifactId: input.artifactId,
+          mcpGrantsSchemaVersion: 2,
+          mcpNormalizationErrors: [...(input.prepared.mcpExecutionDesign.proposed?.normalizationErrors ?? [])],
+          mcpNormalizationEvidence: mcpNormalizationEvidence(input.prepared),
           unresolvedAgentRole: agent.role,
           requiresAgentConfiguration: true,
         },
@@ -337,8 +383,9 @@ export function buildWorkforceMaterializationRows(
     const mcpGrants = mcpGrantsForAgent(input.prepared, agentType, aliases)
     const mcpRequirements = mcpRequirementsForAgent(input.prepared, agentType, aliases)
     const mcpSubtasks = mcpSubtasksForAgent(input.prepared, agentType, aliases)
-    const promptOverlay = input.prepared.mcpExecutionDesign.proposed
-      ? firstMatchingObjectValue(input.prepared.mcpExecutionDesign.proposed.promptOverlays, agentType, aliases) ?? null
+    const requirementContexts = mcpRequirementContextsForAgent(input.prepared, agentType, aliases)
+    const promptOverlay = requirementContexts.length > 0
+      ? requirementContexts.map((context) => context.promptOverlay).filter((value): value is string => typeof value === 'string').join('\n\n') || null
       : null
 
     harnesses.push({
@@ -366,12 +413,16 @@ export function buildWorkforceMaterializationRows(
       architectRunId: input.architectRunId,
       artifactId: input.artifactId,
       mcpGrants,
+      mcpGrantsSchemaVersion: 2,
+      mcpNormalizationErrors: [...(input.prepared.mcpExecutionDesign.proposed?.normalizationErrors ?? [])],
+      mcpNormalizationEvidence: mcpNormalizationEvidence(input.prepared),
       mcpGrantPhases: mcpGrantPhaseMetadata({
         grants: mcpGrants,
         validationStatus: input.prepared.mcpExecutionDesign.validation.status,
       }),
       harnessSemantics: planningOnlyHarnessMetadata(),
       promptOverlay,
+      requirementContexts,
       plannedTasks: agent.tasks,
       mcpAwareSubtasks: mcpSubtasks,
     }
@@ -433,6 +484,8 @@ export function buildWorkforceMaterializationRows(
         workPackageIds: packages.map((pkg) => pkg.id),
         harnessIds: harnesses.map((harness) => harness.id),
         mcpExecutionStatus: input.prepared.mcpExecutionDesign.validation.status,
+        mcpNormalizationErrors: [...(input.prepared.mcpExecutionDesign.proposed?.normalizationErrors ?? [])],
+        mcpNormalizationEvidence: mcpNormalizationEvidence(input.prepared),
       },
     },
   }

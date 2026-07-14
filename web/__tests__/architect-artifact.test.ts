@@ -62,12 +62,12 @@ describe('prepareArchitectArtifact', () => {
       mcpId: 'github',
       requirement: 'required',
     })
-    expect(prepared.mcpExecutionDesign.validation.status).toBe('blocked')
-    expect(prepared.mcpExecutionDesign.grantDecisions.summary.blocked).toBe(1)
+    expect(prepared.mcpExecutionDesign.validation.status).toBe('valid')
+    expect(prepared.mcpExecutionDesign.grantDecisions.summary.proposed).toBe(1)
     expect(prepared.mcpExecutionDesign.grantDecisions.decisions[0]).toMatchObject({
       agent: 'backend',
       mcpId: 'github',
-      status: 'blocked',
+      status: 'proposed',
     })
     expect(prepared.agents[0]).toMatchObject({ role: 'Backend', tasks: 1 })
     expect(prepared.agentBreakdownSource).toBe('fence')
@@ -78,6 +78,54 @@ describe('prepareArchitectArtifact', () => {
 
     expect(prepared.agents[0]).toMatchObject({ role: 'Frontend', tasks: 1 })
     expect(prepared.agentBreakdownSource).toBe('fallback')
+  })
+
+  it('preserves a malformed supplied MCP fence as a blocking proposed design', () => {
+    const prepared = prepareArchitectArtifact([
+      '# Plan',
+      'Implement the backend change.',
+      '```mcp_execution_design_json',
+      '{"schemaVersion":1,"requirements":{},"promptOverlays":{},"mcpAwareSubtasks":[]}',
+      '```',
+    ].join('\n'), emptyOverview)
+
+    expect(prepared.planText).toBe('# Plan\nImplement the backend change.')
+    expect(prepared.mcpExecutionDesign.proposed?.normalizationErrors?.[0]).toMatch(/does not match schema version 1/)
+    expect(prepared.mcpExecutionDesign.proposed?.normalizationEvidence).toEqual([
+      expect.objectContaining({
+        schemaVersion: 1,
+        category: 'shape',
+        code: 'mcp_design_schema_shape_invalid',
+      }),
+    ])
+    expect(prepared.mcpExecutionDesign.validation).toMatchObject({ status: 'blocked' })
+    expect(prepared.mcpExecutionDesign.grantDecisions).toMatchObject({ admissionStatus: 'blocked' })
+  })
+
+  it('propagates a multiple-exact-fence blocker without retaining either policy declaration', () => {
+    const valid = '```mcp_execution_design_json\n{"schemaVersion":1,"requirements":[],"promptOverlays":{},"requirementContexts":[],"mcpAwareSubtasks":[]}\n```'
+    const malformed = '```mcp_execution_design_json\n{"schemaVersion":1,not-json}\n```'
+    const prepared = prepareArchitectArtifact([
+      '# Plan',
+      valid,
+      'Keep this human-readable plan.',
+      malformed,
+    ].join('\n'), emptyOverview)
+
+    expect(prepared.planText).toContain('Keep this human-readable plan.')
+    expect(prepared.planText).not.toContain('mcp_execution_design_json')
+    expect(prepared.mcpExecutionDesign.proposed).toMatchObject({
+      requirements: [],
+      normalizationEvidence: [{
+        category: 'shape',
+        code: 'mcp_design_multiple_exact_fences',
+      }],
+    })
+    expect(prepared.mcpExecutionDesign.validation.status).toBe('blocked')
+    expect(prepared.mcpExecutionDesign.grantDecisions).toMatchObject({
+      admissionStatus: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+    })
   })
 })
 

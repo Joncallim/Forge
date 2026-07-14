@@ -1,6 +1,8 @@
 export type McpExecutionDesignMetadata = {
   proposed: {
     requirements: Array<{
+      requirementKey?: string
+      sourceRequirementIndex?: number
       mcpId: string
       requirement: 'required' | 'optional'
       reason: string
@@ -17,10 +19,18 @@ export type McpExecutionDesignMetadata = {
       }
     }>
     promptOverlays: Record<string, string>
+    requirementContexts: Array<{
+      requirementKey: string
+      sourceRequirementIndex: number
+      agent: string
+      mcpId: string
+      promptOverlay: string
+    }>
     mcpAwareSubtasks: Array<{
       id: string
       agent: string
       mcpCapabilities: string[]
+      capabilityBindings: Array<{ capability: string; requirementKey: string }>
       verification: string[]
       stoppingCondition: string
       fallback: string
@@ -48,6 +58,7 @@ export type McpExecutionDesignMetadata = {
       blocked: number
     }
     decisions: Array<{
+      requirementKey?: string
       decisionId: string
       sourceRequirementIndex: number
       agent: string
@@ -65,12 +76,23 @@ export type McpExecutionDesignMetadata = {
         message: string
       }
       health: {
+        schemaVersion?: number
+        observed?: boolean
+        mcpId?: string
         installState: string
         status: string
         enabled: boolean
         error: string | null
+        checkedAt?: string | null
       }
       promptOverlayPresent: boolean
+      admissionStatus?: 'allowed' | 'warning' | 'blocked'
+      mode: 'planning_only' | 'bounded_context_required' | 'bounded_context_approved' | 'blocked' | 'deferred_live_mcp' | 'unknown_legacy'
+      recoveryAction?: string
+      grantState?: { phase: string; consumed?: boolean; revocationReason?: string }
+      normalizedCapabilities: string[]
+      capabilityClasses: Array<{ capability: string; class: string; deliveryKind: string | null }>
+      evidenceRefs: string[]
     }>
   } | null
 }
@@ -112,7 +134,16 @@ function normalizeGrantDecisions(raw: unknown): McpExecutionDesignMetadata['gran
           const assignment = isRecord(item.assignment) ? item.assignment : {}
           const fallback = isRecord(item.fallback) ? item.fallback : {}
           const health = isRecord(item.health) ? item.health : {}
+          const grantState = isRecord(item.grantState) && typeof item.grantState.phase === 'string'
+            ? {
+                phase: item.grantState.phase,
+                ...(typeof item.grantState.consumed === 'boolean' ? { consumed: item.grantState.consumed } : {}),
+                ...(typeof item.grantState.revocationReason === 'string' ? { revocationReason: item.grantState.revocationReason } : {}),
+              }
+            : undefined
+          const validModes = new Set(['planning_only', 'bounded_context_required', 'bounded_context_approved', 'blocked', 'deferred_live_mcp'])
           return {
+            ...(typeof item.requirementKey === 'string' ? { requirementKey: item.requirementKey } : {}),
             decisionId: typeof item.decisionId === 'string' ? item.decisionId : '',
             sourceRequirementIndex: typeof item.sourceRequirementIndex === 'number' ? item.sourceRequirementIndex : 0,
             agent: typeof item.agent === 'string' ? item.agent : '',
@@ -130,12 +161,31 @@ function normalizeGrantDecisions(raw: unknown): McpExecutionDesignMetadata['gran
               message: typeof fallback.message === 'string' ? fallback.message : '',
             },
             health: {
+              ...(health.schemaVersion === 1 ? { schemaVersion: 1 } : {}),
+              ...(typeof health.observed === 'boolean' ? { observed: health.observed } : {}),
+              ...(typeof health.mcpId === 'string' ? { mcpId: health.mcpId } : {}),
               installState: typeof health.installState === 'string' ? health.installState : 'unknown',
               status: typeof health.status === 'string' ? health.status : 'unknown',
               enabled: health.enabled === true,
               error: typeof health.error === 'string' ? health.error : null,
+              ...(typeof health.checkedAt === 'string' || health.checkedAt === null ? { checkedAt: health.checkedAt } : {}),
             },
             promptOverlayPresent: item.promptOverlayPresent === true,
+            ...(item.admissionStatus === 'allowed' || item.admissionStatus === 'warning' || item.admissionStatus === 'blocked'
+              ? { admissionStatus: item.admissionStatus }
+              : {}),
+            mode: validModes.has(item.mode as string) ? item.mode as 'planning_only' | 'bounded_context_required' | 'bounded_context_approved' | 'blocked' | 'deferred_live_mcp' : 'unknown_legacy',
+            ...(typeof item.recoveryAction === 'string' ? { recoveryAction: item.recoveryAction } : {}),
+            ...(grantState ? { grantState } : {}),
+            normalizedCapabilities: normalizeStringArray(item.normalizedCapabilities),
+            capabilityClasses: Array.isArray(item.capabilityClasses)
+              ? item.capabilityClasses.filter(isRecord).map((classification) => ({
+                  capability: typeof classification.capability === 'string' ? classification.capability : '',
+                  class: typeof classification.class === 'string' ? classification.class : 'unknown',
+                  deliveryKind: typeof classification.deliveryKind === 'string' ? classification.deliveryKind : null,
+                }))
+              : [],
+            evidenceRefs: normalizeStringArray(item.evidenceRefs),
           }
         })
       : [],
@@ -161,6 +211,8 @@ export function latestMcpExecutionDesignFromArtifacts(
             ? rawProposed.requirements
               .filter(isRecord)
               .map((item) => ({
+                ...(typeof item.requirementKey === 'string' ? { requirementKey: item.requirementKey } : {}),
+                ...(typeof item.sourceRequirementIndex === 'number' ? { sourceRequirementIndex: item.sourceRequirementIndex } : {}),
                 mcpId: typeof item.mcpId === 'string' ? item.mcpId : '',
                 requirement: item.requirement === 'optional' ? 'optional' as const : 'required' as const,
                 reason: typeof item.reason === 'string' ? item.reason : '',
@@ -194,11 +246,26 @@ export function latestMcpExecutionDesignFromArtifacts(
                 .map(([agent, value]) => [agent, value as string]),
             )
             : {},
+          requirementContexts: Array.isArray(rawProposed.requirementContexts)
+            ? rawProposed.requirementContexts.filter(isRecord).map((context) => ({
+                requirementKey: typeof context.requirementKey === 'string' ? context.requirementKey : '',
+                sourceRequirementIndex: typeof context.sourceRequirementIndex === 'number' ? context.sourceRequirementIndex : 0,
+                agent: typeof context.agent === 'string' ? context.agent : '',
+                mcpId: typeof context.mcpId === 'string' ? context.mcpId : '',
+                promptOverlay: typeof context.promptOverlay === 'string' ? context.promptOverlay : '',
+              }))
+            : [],
           mcpAwareSubtasks: Array.isArray(rawProposed.mcpAwareSubtasks)
             ? rawProposed.mcpAwareSubtasks.filter(isRecord).map((item) => ({
                 id: typeof item.id === 'string' ? item.id : '',
                 agent: typeof item.agent === 'string' ? item.agent : '',
                 mcpCapabilities: normalizeStringArray(item.mcpCapabilities),
+                capabilityBindings: Array.isArray(item.capabilityBindings)
+                  ? item.capabilityBindings.filter(isRecord).map((binding) => ({
+                      capability: typeof binding.capability === 'string' ? binding.capability : '',
+                      requirementKey: typeof binding.requirementKey === 'string' ? binding.requirementKey : '',
+                    }))
+                  : [],
                 verification: normalizeStringArray(item.verification),
                 stoppingCondition: typeof item.stoppingCondition === 'string' ? item.stoppingCondition : '',
                 fallback: typeof item.fallback === 'string' ? item.fallback : '',
