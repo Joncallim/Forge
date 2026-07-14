@@ -2860,35 +2860,43 @@ contract. This split must match the per-step release manifest metadata above.
 
 ### S5 — UI and copy hardening
 
-- New `web/lib/mcps/admission-copy.ts`: pure map from `mode`+`recoveryAction`+
-  `status`+structured `grantState` → `{ statusKey, badgeText, headline, body, cta? }`. Every surface reads
-  it. Mapping:
-  - `planning_only` → neutral "Planning context", no CTA.
-  - `bounded_context_required` with `grantState.phase:'none'|'proposed'|'not_issued'`
-    → amber "Needs project context"; `phase:'denied'` → amber "Context was denied";
-    `phase:'revoked'` → amber "Project context was removed" and includes the
-    persisted `revocationReason`. All link to the package's filesystem grant control.
-    `phase:'approved'` with `consumed:true` → amber "One-time context approval was
-    already used" and the same re-approval control; an unconsumed approved grant
-    cannot reach `bounded_context_required` and is treated as invalid persisted state.
-  - `bounded_context_approved` → green "Context approved".
-  - `blocked`+`install_or_fix_mcp` → red, CTA deep-link
-    `/dashboard/projects/{projectId}#project-mcps-heading`.
-  - `blocked`+`revise_plan` → red, CTA "Request changes / regenerate plan".
-  - `deferred_live_mcp` → **neutral slate** "Deferred — MCP boundary", body "Forge
-    did not issue this MCP capability. This is not a broken install. ACP workers
-    are local processes and are not security-sandboxed by this MCP decision."
-    **When it is a *required* (blocking) deferred requirement, it
-    still carries the `revise_plan` CTA** so the operator can remove/regenerate the
-    offending requirement instead of being stuck with an unapprovable plan and no
-    action; an *optional* deferred requirement is warning-only and approvable.
-  - `unknown_legacy` → neutral "Re-open plan to recompute"; grant state read live
-    from package metadata, never invented.
+- New `web/lib/mcps/admission-copy.ts` contains three pure, exhaustive surface
+  presenters—`admissionPresentation`, `projectMcpPresentation`, and
+  `catalogMcpPresentation`—plus a typed
+  `packetCurrentStatePresentation` for S4's live audit or current
+  `packet_issuance` marker. They
+  share copy primitives but accept distinct truth sources; history, health,
+  catalog facts, and current packet recovery are never forced into one optional
+  input shape.
+- The task page presents three separate facts: historical canonical decision,
+  current actionable grant/broker/live-audit/lease state, and immutable terminal
+  packet evidence tied
+  to one exact `agentRunId` and package attempt. Current state may show that history
+  is stale; it may not relabel an older decision or artifact.
+- The admission presenter validates the complete tuple before mapping it. Unknown,
+  malformed, or incoherent values become neutral `unknown_legacy` with no retry.
+  Then precedence is `revise_plan` → `approve_project_filesystem_context` →
+  `install_or_fix_mcp` → warning-only deferred/planning → positive allowed state.
+  In particular, `bounded_context_approved` plus `status:'blocked'|'warning'` and
+  `install_or_fix_mcp` is unhealthy/remediation copy, not green. Green "Context
+  approved" requires `status:'allowed'`, coherent unconsumed approved grant state,
+  no recovery action, and `retryable:false`.
+- Phase copy remains structured: never-approved/proposed/not-issued → "Needs
+  project context"; denied → "Context was denied"; revoked → "Project context was
+  removed" with bounded revocation detail; approved+consumed → "One-time context
+  approval was already used". No branch parses human reason text.
+- `planning_only` is neutral and has no CTA. Required deferred is neutral boundary
+  copy plus `revise_plan`; optional deferred is neutral with no retry. All ACP copy
+  says only that Forge issued no MCP handle through its channel and does not claim
+  the local ACP process lacks shell, network, or credential access.
 - Add `deferred`/`planning`/`legacy` neutral buckets to `statusBadgeClass`
   (`tasks/[id]/page.tsx:1203`).
 - Extend `execution-design-metadata.ts` decision type/normalizer to carry `mode`,
   `recoveryAction`, structured `grantState`, `normalizedCapabilities`, `capabilityClasses`, `evidenceRefs`
-  (`unknown_legacy` for old artifacts).
+  (`unknown_legacy` for old artifacts). Validate tuple coherence and bound arrays,
+  labels, identifiers, revocation detail, and MCP errors before rendering. Strip
+  control/bidirectional formatting characters and secret/path detail. Untrusted
+  copy is rendered only as React text, never Markdown, raw HTML, routes, or DOM IDs.
 - Replace the status-only ternary, split planning-only warnings from degradation
   warnings, stop rendering deferred capabilities as destructive alerts, gate
   `RetryHandoffControls` on `aggregate.retryable`, surface the bounded-context
@@ -2907,6 +2915,54 @@ contract. This split must match the per-step release manifest metadata above.
   approve_project_filesystem_context > install_or_fix_mcp > defer_live_mcp_feature`).
   Because the producer/persistence contract lives in S2, retry/recovery is
   deployable before this UI slice ships.
+- Broker retry additionally requires current compatibility: task exactly
+  `approved`,
+  package still blocked by the same versioned marker and policy fingerprint, no
+  execution or issuance lease, and primary action exactly `install_or_fix_mcp`.
+  The route locks and rechecks this predicate and returns a stale-action `409`
+  without enqueueing when it changed. Setup, grant, revise-plan, and issuance
+  reapproval remain different actions.
+- S4 issuance recovery remains separate from broker retry. One-time
+  `reapprove_allow_once` targets the package grant control; post-intent
+  `review_then_reapprove_allow_once` requires acknowledgement first.
+  Always-allow `retry_execution` is available from delivery
+  `not_exposed|submission_failed` with disposition `retry_execution`, or from
+  delivery `submission_uncertain|submitted` only after acknowledgement changes the
+  separate disposition to `reviewed_submission`. In both cases the task is
+  `approved`, package/policy/coverage match, and no lease is active.
+  `review_submission` records acknowledgement actor/time without changing the
+  immutable delivery; the later retry still rechecks current coverage. Every
+  marker has `autoRetryable:false`; unknown/stale markers expose no action and
+  S4's route rechecks under the global order.
+- A live audit with `status:'claiming'`, delivery `submitting`, and a
+  **server-computed PostgreSQL-time** `leaseActive:true` is current in-progress
+  state with no action. The browser never compares lease timestamps with its own
+  clock. Stale/unknown observations are neutral until S4 recovery persists
+  terminal `submission_uncertain` state.
+- S4 evidence uses opaque `rootRef` or the phrase "this project", never a host
+  filesystem root. S5 ignores generic artifact prose and legacy path-valued `root`
+  fields and renders only validated counts, byte count, omission/redaction summary,
+  and discriminated assembly plus terminal delivery state from the run-linked
+  artifact. Terminal delivery is exhaustive over
+  `not_exposed|submission_failed|submitted|submission_uncertain`; live
+  `submitting` never appears in the artifact, and assembly never implies ACP
+  acceptance. It never
+  shows selected names, root paths, relative/absolute paths, excerpts, or contents.
+- Project health action precedence is total: missing→install, disabled→enable,
+  auth-required→connect, configuration-required→configure, unhealthy→fix,
+  unknown→refresh, healthy→no CTA, and incoherent/future→neutral unavailable. The
+  catalog presenter is static and never consumes task or project action state.
+- CTA outputs are discriminated unions with required action-specific handlers or
+  validated targets; setup is never encoded as retry, and invalid status/action
+  pairings are unrepresentable after fail-closed normalization.
+- The project remediation fragment moves focus to a programmatically focusable
+  heading. Tests cover keyboard/screen-reader semantics, mobile order, hostile and
+  oversized persisted text, stale retry races, future enums, and multiple attempts
+  with separate history/current/evidence.
+- During rollout S5 dual-reads old and new producer schemas but old/incoherent
+  records remain neutral and non-actionable. Rollback removes UI code only; it does
+  not reinterpret or drop S2/S4 schema, and legacy path-valued evidence remains
+  suppressed.
 
 ### S6 — End-to-end regression
 

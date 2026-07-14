@@ -1,6 +1,11 @@
 # Issue #180 Architecture Review Amendments
 
-This document is authoritative where it narrows or clarifies `issue-180-mcp-operator-copy.md`.
+Status: historical review record.
+
+All normative amendments below were incorporated into
+`issue-180-mcp-operator-copy.md` during integrated review round 3. The primary
+architecture document is authoritative; this file records why it changed and must
+not override or narrow the primary document.
 
 ## Review round 1 findings and resolutions
 
@@ -46,6 +51,10 @@ The shared module exports one vetted boundary sentence. Task deferred copy and c
 
 Readers validate persisted enums and map malformed/unknown values to a safe legacy/recompute presentation. UI switches should be exhaustive over normalized types and never fall through to a positive or retryable state.
 
-## Review round 2 conclusion
+## Historical round 2 conclusion
 
-The architecture now preserves one source of human copy while keeping admission, project-health, and catalog inputs truthful and strongly typed. It separates historical decisions, current controls, and issued evidence, and avoids conflating remediation with retry. No further architecture findings were identified in the reviewed scope.
+At that point the architecture preserved one source of human copy while keeping
+admission, project-health, and catalog inputs distinct. Integrated round 3 later
+added total tuple precedence, locked retry compatibility, opaque packet root
+references, bounded safe text, rollout compatibility, and stronger tests; consult
+the primary document for the current contract.

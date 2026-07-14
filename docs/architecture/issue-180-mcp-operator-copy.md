@@ -11,12 +11,15 @@ Give operators one consistent explanation and action for every canonical MCP adm
 
 ## Presentation contract
 
-Create `web/lib/mcps/admission-copy.ts` as a pure, exhaustive mapper.
+Create `web/lib/mcps/admission-copy.ts` as one copy module with three surface
+presenters plus one current issuance-recovery presenter. Task admission decisions,
+project health rows, catalog entries, and the S4 packet-recovery marker are
+different truth sources; no presenter invents fields owned by another source.
 
 ```ts
-type AdmissionPresentationInput = {
+type AdmissionDecisionPresentationInput = {
   mode: McpAdmissionMode;
-  status: McpAdmissionStatus;
+  admissionStatus: McpAdmissionStatus;
   recoveryAction?: McpRecoveryAction;
   grantState?: {
     phase: EffectiveGrantState['phase'];
@@ -26,7 +29,62 @@ type AdmissionPresentationInput = {
   requirement: 'required' | 'optional';
   retryable: boolean;
   projectId: string;
+  packageGrantTargetId?: string;
 };
+
+type ProjectMcpPresentationInput = {
+  projectId: string;
+  mcpId: McpId;
+  installState: McpInstallState;
+  healthStatus: McpHealthStatus;
+  enabled: boolean;
+  remediation?: ProjectMcpStatus['remediation'];
+  runtime: McpCatalogEntry['runtime'];
+};
+
+type CatalogMcpPresentationInput = Pick<McpCatalogEntry, 'id' | 'runtime'>;
+
+type PacketCurrentStatePresentationInput =
+  | {
+      source: 'active_claim';
+      taskStatus: TaskStatus;
+      packageStatus: WorkPackageStatus;
+      auditStatus: 'claiming';
+      deliveryState: 'submitting';
+      leaseActive: true;
+      databaseObservedAt: string;
+    }
+  | {
+      source: 'recovery_marker';
+      marker: PacketIssuanceRecoveryMarkerV2;
+      taskStatus: TaskStatus;
+      packageStatus: WorkPackageStatus;
+      currentPolicyFingerprint: string;
+      currentCoverageMatches: boolean;
+      executionLeaseActive: boolean;
+      issuanceLeaseActive: boolean;
+    };
+
+type PresentationCta =
+  | { kind: 'scroll'; label: string; targetId: string }
+  | { kind: 'link'; label: string; href: string }
+  | { kind: 'request_changes'; label: string }
+  | {
+      kind: 'retry';
+      label: string;
+      handler: 'retry_mcp_broker' | 'retry_packet_execution';
+    }
+  | {
+      kind: 'review_submission';
+      label: string;
+      handler: 'acknowledge_possible_submission';
+    }
+  | { kind: 'install'; label: string; handler: 'install_mcp' }
+  | { kind: 'enable'; label: string; handler: 'enable_mcp' }
+  | { kind: 'connect'; label: string; handler: 'connect_account' }
+  | { kind: 'configure'; label: string; handler: 'configure_project_mcp' }
+  | { kind: 'inspect_fix'; label: string; handler: 'inspect_mcp_health' }
+  | { kind: 'refresh'; label: string; handler: 'refresh_mcp_health' };
 
 type AdmissionPresentation = {
   statusKey: 'planning' | 'approved' | 'action_required' | 'deferred' | 'unhealthy' | 'legacy';
@@ -34,18 +92,78 @@ type AdmissionPresentation = {
   badgeText: string;
   headline: string;
   body: string;
-  cta?: {
-    kind: 'scroll' | 'link' | 'request_changes' | 'retry';
-    label: string;
-    href?: string;
-    targetId?: string;
-  };
+  cta?: PresentationCta;
 };
+
+type McpSurfacePresentation = AdmissionPresentation;
+
+admissionPresentation(input: AdmissionDecisionPresentationInput): AdmissionPresentation;
+projectMcpPresentation(input: ProjectMcpPresentationInput): McpSurfacePresentation;
+catalogMcpPresentation(input: CatalogMcpPresentationInput): McpSurfacePresentation;
+packetCurrentStatePresentation(input: PacketCurrentStatePresentationInput): AdmissionPresentation;
 ```
 
-The function must be deterministic, total, side-effect-free, and tested as a matrix. Human strings live here; component code renders the result.
+The functions must be deterministic, total, side-effect-free, and tested as
+matrices. Human strings live here; component code renders the result. Shared
+primitives own tones, badges, CTA shapes, runtime-boundary wording, and safe text
+normalization, while each presenter accepts only fields its source can truthfully
+provide.
+
+## Three truth sources
+
+The task page keeps these sources visually and structurally separate:
+
+1. **Historical decision** — the versioned S2 preview/approval snapshot explains
+   what Forge decided at that time.
+2. **Current actionable state** — current package grant phases, project grant
+   revision, package status, S2 broker marker, S4 `packet_issuance` recovery
+   marker, active run-scoped packet audit, and leases determine which action is
+   valid now.
+3. **Issued evidence** — the immutable S4 artifact belongs to one exact
+   `agentRunId` and work-package attempt.
+
+Current grant state may add a bounded stale-state note to a historical decision,
+but it must never relabel an old decision or packet artifact. Packet evidence is
+rendered in the matching run/attempt, never selected as a task-global "latest"
+artifact.
 
 ## Canonical mapping
+
+### Tuple validation and precedence
+
+The mapper validates the complete normalized tuple before selecting copy. The
+following precedence is normative:
+
+1. malformed, unknown, or incoherent persisted tuples become a neutral
+   `unknown_legacy`/recompute presentation with no retry;
+2. `recoveryAction:'revise_plan'` is an action-required presentation, including a
+   required deferred requirement;
+3. `recoveryAction:'approve_project_filesystem_context'` is an action-required
+   grant presentation driven by structured grant phase;
+4. `recoveryAction:'install_or_fix_mcp'` is unhealthy/remediation copy, even when
+   `mode:'bounded_context_approved'` records that grant coverage exists;
+5. warning-only deferred/planning states are neutral and never retryable;
+6. positive `Context approved` requires `mode:'bounded_context_approved'`,
+   `admissionStatus:'allowed'`, coherent approved and unconsumed grant state, no
+   recovery action, and `retryable:false`.
+
+Valid combinations include:
+
+| Mode | Admission status | Recovery action | Presentation |
+|---|---|---|---|
+| `planning_only` | `allowed|warning` | `continue_as_prompt_context` | neutral planning; no CTA |
+| `bounded_context_required` | `blocked|warning` | `approve_project_filesystem_context` | phase-aware grant action |
+| `bounded_context_approved` | `allowed` | none | positive approved context |
+| `bounded_context_approved` | `blocked|warning` | `install_or_fix_mcp` | unhealthy/remediation, never positive |
+| `blocked` | `blocked` | `revise_plan` | destructive/action-required revise-plan |
+| `deferred_live_mcp` | `blocked` | `revise_plan` | neutral boundary plus revise-plan CTA |
+| `deferred_live_mcp` | `warning` | `defer_live_mcp_feature` | neutral boundary; no CTA |
+| `unknown_legacy` | any normalized legacy status | none | neutral recompute; no retry |
+
+Examples of incoherent tuples are approved context without an approved current
+grant, required context with an unconsumed covering approval, retryable true for
+anything other than an install/fix broker block, and a positive status with a
+remediation action. They fail safely; the UI never repairs them from reason text.
 
 ### Planning only
 
@@ -59,7 +177,7 @@ The function must be deterministic, total, side-effect-free, and tested as a mat
 
 Phase-specific copy:
 
-- `none|proposed`: `Needs project context`;
+- `none|proposed|not_issued`: `Needs project context`;
 - `denied`: `Context was denied`;
 - `revoked`: `Project context was removed`, include bounded revocation reason;
 - approved + consumed: `One-time context approval was already used`.
@@ -68,10 +186,12 @@ CTA scrolls to the exact package grant controls. Do not infer phase from reason 
 
 ### Bounded context approved
 
-- Badge: `Context approved`
-- Tone: positive
-- Body: only approved read-only project context may be assembled.
-- If issued artifact exists, show metadata summary; otherwise say not yet issued.
+- When allowed and coherent, badge `Context approved`, positive tone, and body
+  saying only approved read-only project context may be assembled.
+- When health overlay changes the same mode to warning/blocked plus
+  `install_or_fix_mcp`, render unhealthy/remediation copy, not green approval.
+- Packet evidence is independent: show the matching run artifact when it exists;
+  otherwise say that no packet evidence exists for that run.
 
 ### Blocked + install/fix
 
@@ -115,9 +235,27 @@ Extend `execution-design-metadata.ts` to read and validate persisted:
 Rules:
 
 - malformed values become `unknown_legacy` or are omitted fail-closed;
+- validate complete tuple coherence after validating each enum; a recognized mode
+  with a missing/unknown `admissionStatus`, recovery action, or incompatible grant
+  state is not positive;
+- bound every persisted array and string before rendering: at most 64 items per
+  list, 300 UTF-8 bytes for operator detail/revocation text, 120 bytes for labels,
+  and 80 bytes for opaque identifiers;
+- remove control/bidirectional formatting characters and use the existing MCP
+  secret redaction for health/reason detail; never expose a host path;
 - package current grant phases override stale preview grant state for live display;
 - no reason-string parsing;
 - S5 writes no broker/admission state.
+
+All untrusted detail is rendered as React text nodes. It is never passed to
+Markdown, `dangerouslySetInnerHTML`, an `href`, or a DOM identifier. Presenter CTAs
+construct routes and targets only from validated application identifiers.
+
+Legacy preview decisions without a canonical mode or admission status remain
+readable as neutral recompute history. Legacy S4 packet artifacts containing a
+path-valued `root` are never rendered. New evidence uses opaque `rootRef`; rollout
+keeps the reader dual-format until S4 producers are upgraded, but neither format
+authorizes an action.
 
 ## Task page architecture
 
@@ -133,9 +271,70 @@ Group canonical decisions into separate sections:
 
 Do not put deferred or pure planning warnings in the destructive blocker alert.
 
-### Retry controls
+### Broker retry controls
 
-`RetryHandoffControls` renders only when persisted `metadata.mcpBroker.retryable === true`. Its action and label derive from persisted `primaryRecoveryAction`. Never infer retryability from status or reason.
+`RetryHandoffControls` renders only when all current compatibility conditions are
+true:
+
+- task status is exactly `approved`;
+- package status is still `blocked`;
+- the current versioned broker marker has `retryable:true` and
+  `primaryRecoveryAction:'install_or_fix_mcp'`;
+- the marker's package-policy fingerprint and block revision still match current
+  package policy;
+- no execution lease or S4 issuance claim is active for the package.
+
+The retry route re-reads and locks project, task, and package in the global order,
+rechecks the same predicate, and returns a structured stale-action `409` without
+enqueueing when it no longer holds. The UI check is convenience, not authority.
+Setup/remediation, revise-plan, approve-context, and issuance reapproval actions are
+never rendered as retry.
+
+### Packet issuance recovery controls
+
+The current-state reader validates either S4's live run-scoped claim summary or
+its versioned `packet_issuance` marker and passes the discriminated input to
+`packetCurrentStatePresentation`; it never folds either source into the S2
+`mcpBroker` contract. Runtime parsing normalizes unknown task/package statuses to
+a fail-closed neutral state before the typed presenter is called.
+
+- A live `claiming` audit with `delivery:'submitting'` and unexpired lease renders
+  “Submitting to worker” as current state with no action. It is not immutable run
+  evidence and is never read from a terminal artifact.
+  The server computes `leaseActive` against PostgreSQL time and supplies the
+  observation timestamp; the browser never compares `leaseExpiresAt` with
+  `Date.now()`. Stale/unknown observations normalize to neutral “Refreshing run
+  state” until recovery persists a terminal result.
+
+- `reapprove_allow_once` shows “Approve one-time context again” and targets the
+  package grant control. It never renders generic retry because the nonce burned
+  when the packet claim committed.
+- `review_then_reapprove_allow_once` first shows the possible-prior-submission
+  acknowledgement. After the S4 action records that acknowledgement, the marker
+  becomes `reapprove_allow_once`; only then does the package grant control create
+  a fresh nonce.
+- `retry_execution` is available for an `always_allow` marker whose delivery is
+  `not_exposed|submission_failed` and disposition is `retry_execution`, or whose
+  delivery is `submission_uncertain|submitted` and separately recorded
+  disposition is `reviewed_submission`. In both cases the task is `approved`, the
+  package is still `blocked`, policy/coverage fingerprints match, current project
+  coverage is exact, and neither execution nor issuance lease is active. The
+  server route locks and rechecks the same predicate, clears only the matched
+  marker, moves the package to `ready`, and wakes after commit. The normal claim
+  path creates any new run.
+- `review_submission` is a marker disposition paired with immutable delivery
+  `submission_uncertain|submitted`. It states that ACP may already have accepted
+  work and offers S4's acknowledgement action. Acknowledgement keeps delivery
+  unchanged, sets actor/time, and changes only the disposition to
+  `reviewed_submission`; if exact current coverage still holds, the presenter may
+  then offer S4's explicit `retry_execution` action. A live `submitting` claim is
+  evidence-only and has no recovery action until stale recovery converts delivery
+  to `submission_uncertain`.
+
+Every issuance marker has `autoRetryable:false`; the UI does not synthesize queue
+retry from delivery state. Unknown/malformed/stale markers are neutral, expose no
+action, and return a stale-action response if a previously rendered control races
+current state.
 
 ### Grant controls
 
@@ -147,14 +346,23 @@ Read S4 artifact by `(agentRunId, artifactType='mcp_bounded_context_packet_metad
 
 Display only:
 
-- approved root identifier;
+- opaque approved `rootRef` (or the phrase `this project`); never a filesystem path;
 - included count;
 - byte count;
 - omitted count;
 - redaction summary;
-- assembled versus pre-assembly failure state.
+- assembly state and delivery state as separate facts.
 
-Never display selected paths, file names, excerpts, or contents. Clearly separate packet evidence from sandbox-generated files and host-applied changes.
+Never display selected paths, root paths, file names, excerpts, or contents. Ignore
+generic artifact prose and render only validated typed metadata. Clearly separate
+packet evidence from sandbox-generated files and host-applied changes. A failed
+pre-assembly snapshot shows stage and sanitized reason without invented zero
+counts. Delivery copy is exhaustive over S4's exact states:
+`not_exposed|submission_failed|submitted|submission_uncertain`; terminal artifacts
+never contain live `submitting`. Assembly never implies ACP acceptance. The
+current-state reader may show a live `submitting` audit only while its lease is
+valid; after recovery the terminal artifact/marker must say
+`submission_uncertain`.
 
 ### Client policy removal
 
@@ -168,6 +376,28 @@ For each configured MCP:
 - runtime boundary note based on catalog mode and `liveTools`;
 - remediation CTA from catalog metadata for missing, disabled, unhealthy, configuration-required, and auth-required states;
 - stable anchor `project-mcps-heading`.
+
+Project-health action precedence is exhaustive:
+
+| Current state | Action |
+|---|---|
+| install missing | install using catalog remediation |
+| installed but disabled or `enabled:false` | enable |
+| `auth_required` | connect account |
+| `configuration_required` | configure project path/settings |
+| `unhealthy` | inspect/fix using bounded remediation |
+| `unknown` | refresh status; no handoff retry |
+| healthy and enabled | no remediation CTA |
+| incoherent/future value | neutral `Status unavailable`; refresh only |
+
+Each project action uses the matching typed `kind` and validated `handler` (or a
+catalog-owned validated `href` where navigation is the real action). Setup actions
+are never encoded as `retry`; components switch exhaustively on this discriminant
+and cannot call a different handler because two actions share a generic link.
+
+Project health describes setup independently of a historical task decision. In
+particular, GitHub planning-only context is not presented as admission-blocked by
+GitHub runtime health.
 
 Boundary text examples:
 
@@ -183,6 +413,11 @@ Each catalog entry displays:
 - static `No live tool handles (beta)` line;
 - supported safe-read capabilities and remediation metadata without implying runtime authorization.
 
+The catalog presenter consumes static catalog data only. It never accepts project
+health, task retryability, or grant state. An unknown future runtime mode or
+`liveTools:true` value fails to neutral `Runtime boundary unavailable` copy and
+does not invent beta authorization.
+
 ## Accessibility and responsive behavior
 
 - Badge color is never the only signal.
@@ -191,10 +426,17 @@ Each catalog entry displays:
 - Neutral deferred/planning states retain adequate contrast.
 - Mobile cards preserve headline, body, and action ordering.
 - Artifact metadata tables collapse into labelled rows on narrow screens.
+- Cross-page remediation focuses a programmatically focusable
+  `project-mcps-heading` after fragment navigation and retains scroll margin.
+- Async grant, retry, and stale-action results use appropriate polite/assertive
+  live regions without moving focus unexpectedly.
 
 ## Test matrix
 
-Unit-test every valid `(mode,status,recoveryAction,grantState,requirement,retryable)` mapping and malformed/legacy inputs.
+Unit-test every valid
+`(mode,admissionStatus,recoveryAction,grantState,requirement,retryable)` mapping,
+all invalid tuple pairs, and malformed/legacy inputs. Exhaustively test project
+health and catalog runtime presenters, including unknown future enum values.
 
 Component/integration tests:
 
@@ -210,6 +452,25 @@ Component/integration tests:
 10. project unhealthy/missing remediation;
 11. catalog boundary badges;
 12. keyboard focus and mobile rendering.
+13. approved coverage plus unhealthy status never renders green;
+14. stale policy fingerprint or active lease hides retry and the route rejects it;
+15. hostile/oversized strings are bounded, redacted, and rendered as text;
+16. two runs keep historical decision, current controls, and each run's evidence separate;
+17. legacy path-valued `root` is not rendered and new opaque `rootRef` is;
+18. missing/unhealthy GitHub project health does not relabel admitted planning context.
+19. every S4 delivery state renders separately from assembly and never implies
+    submission from counts alone;
+20. one-time issuance recovery targets reapproval, safe pre-intent always-allow
+    recovery uses the locked retry predicate, and post-intent ambiguity requires
+    review with no direct retry.
+21. `not_issued` maps to Needs project context, and each project health state
+    invokes its distinct typed install/enable/connect/configure/fix/refresh action.
+22. a live `submitting` audit is current in-progress state only; terminal artifacts
+    reject `submitting` and render recovered `submission_uncertain` separately.
+23. task/package status normalization and every CTA discriminant fail closed; an
+    install CTA cannot carry a refresh/configure handler.
+24. skewed browser clocks cannot change live submission copy because the server's
+    database-time `leaseActive` observation is authoritative.
 
 ## Ownership boundaries
 
@@ -221,14 +482,25 @@ Component/integration tests:
 
 ## Implementation order
 
-1. Add presentation contract and exhaustive tests.
-2. Harden metadata reader.
-3. Replace task-page status/retry/grant rendering.
-4. Add packet evidence display.
-5. Remove client policy reimplementation.
+1. Land the S4 evidence schema and producer with opaque `rootRef` and ensure S2
+   broker fields are deployed.
+2. Add the three surface presenters, the issuance-recovery presenter, and
+   exhaustive tests.
+3. Harden the dual-format metadata reader, including incoherent/future values.
+4. Replace task-page status/retry/grant rendering and remove client policy copies.
+5. Add run-linked packet evidence display.
 6. Update project and catalog MCP surfaces.
-7. Run accessibility, responsive, and preview verification.
+7. Run accessibility, hostile-input, responsive, and preview verification.
+
+S5 is read-compatible during rollout: old records stay neutral and non-actionable;
+new fields become visible only after their producer is deployed. Rollback removes
+only the S5 reader/UI code. It does not roll back or reinterpret S2/S4 schema, and
+old path-valued evidence remains suppressed.
 
 ## Stop conditions
 
-Stop if the UI must parse reasons, infer retryability, invent legacy modes, persist admission state, or expose packet names/paths/content. Stop if copy claims ACP is sandboxed or that equivalent operations are impossible outside the MCP channel.
+Stop if the UI must parse reasons, infer retryability, invent legacy modes, persist
+admission state, render an unvalidated tuple, or expose packet root paths,
+names/paths/content. Stop if the retry route cannot atomically recheck current
+compatibility, or if copy claims ACP is sandboxed or that equivalent operations are
+impossible outside the MCP channel.
