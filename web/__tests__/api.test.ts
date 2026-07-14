@@ -2946,6 +2946,496 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       .toBeLessThan((lockedPackagesChain.for as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
   })
 
+  it.each([
+    ['filesystem first', ['filesystem', 'github']],
+    ['github first', ['github', 'filesystem']],
+  ] as const)('returns one precedence-consistent primary admission decision in either requirement order: %s', async (_label, order) => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const awaitingTask = {
+      id: 'task-mixed-mcp-blockers',
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const project = { id: 'project-1', mcpConfig: {} }
+    const requirements = {
+      filesystem: {
+        requirementKey: 'a-fs',
+        sourceRequirementIndex: 0,
+        mcpId: 'filesystem',
+        agent: 'backend',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read'],
+        evidenceRefs: ['filesystem-proof'],
+        prohibitedCapabilities: [],
+        assignment: { type: 'agent', targetId: null },
+        fallback: { action: 'block', message: '' },
+      },
+      github: {
+        requirementKey: 'z-gh',
+        sourceRequirementIndex: 1,
+        mcpId: 'github',
+        agent: 'backend',
+        requirement: 'required',
+        capabilities: ['github.contents.write'],
+        evidenceRefs: ['github-proof'],
+        prohibitedCapabilities: [],
+        assignment: { type: 'agent', targetId: null },
+        fallback: { action: 'block', message: '' },
+      },
+    }
+    const workPackage = {
+      id: 'pkg-mixed',
+      assignedRole: 'backend',
+      title: 'Mixed MCP blockers',
+      mcpRequirements: order.map((key) => requirements[key]),
+      metadata: {},
+    }
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([workPackage]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest('/api/tasks/task-mixed-mcp-blockers/approve', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: awaitingTask.id }),
+    })
+
+    expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body).toMatchObject({
+      reason: expect.stringContaining('deferred live MCP capabilities'),
+      evidenceRefs: ['github-proof'],
+      primaryMode: 'deferred_live_mcp',
+      primaryRecoveryAction: 'revise_plan',
+      primaryDecision: {
+        kind: 'requirement',
+        mode: 'deferred_live_mcp',
+        recoveryAction: 'revise_plan',
+        requirementKey: 'z-gh',
+        reason: expect.stringContaining('deferred live MCP capabilities'),
+        evidenceRefs: ['github-proof'],
+      },
+      retryable: false,
+      workPackageId: 'pkg-mixed',
+    })
+    const { evaluateWorkPackageMcpBroker } = await import('@/worker/mcp-execution-design')
+    const broker = evaluateWorkPackageMcpBroker({
+      assignedRole: workPackage.assignedRole,
+      mcpRequirements: workPackage.mcpRequirements,
+      metadata: workPackage.metadata,
+      projectMcpConfig: project.mcpConfig,
+      title: workPackage.title,
+    })
+    const { buildMcpBrokerBlockMetadata } = await import('@/worker/blocked-handoff-retry')
+    const brokerMetadata = buildMcpBrokerBlockMetadata({
+      blockedAt: new Date('2026-07-14T00:00:01.000Z'),
+      check: broker,
+      existingMetadata: {},
+    }) as { mcpBroker: Record<string, unknown> }
+    expect(body.primaryDecision).toEqual(broker.primaryDecision)
+    expect(body.primaryMode).toBe(broker.primaryMode)
+    expect(body.primaryRecoveryAction).toBe(broker.primaryRecoveryAction)
+    expect(body.retryable).toBe(broker.retryable)
+    expect(brokerMetadata.mcpBroker.primaryDecision).toEqual(body.primaryDecision)
+    expect(brokerMetadata.mcpBroker.primaryMode).toBe(body.primaryMode)
+    expect(brokerMetadata.mcpBroker.primaryRecoveryAction).toBe(body.primaryRecoveryAction)
+    expect(brokerMetadata.mcpBroker.retryable).toBe(body.retryable)
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('returns the normalization reason without stale canonical evidence for mixed blockers', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const normalizationError = 'MCP requirement 0 is malformed and cannot be normalized.'
+    const awaitingTask = {
+      id: 'task-normalization-and-policy-blocked',
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const project = { id: 'project-1', mcpConfig: {} }
+    const workPackage = {
+      id: 'pkg-normalization-and-policy-blocked',
+      assignedRole: 'backend',
+      title: 'Malformed mixed policy',
+      mcpRequirements: [{
+        requirementKey: 'deferred-write',
+        sourceRequirementIndex: 0,
+        agent: 'backend',
+        mcpId: 'github',
+        requirement: 'required',
+        permissions: ['github.contents.write'],
+        evidenceRefs: ['stale-canonical-proof'],
+        prohibitedCapabilities: [],
+        assignment: { type: 'agent', targetId: null },
+        fallback: { action: 'block', message: '' },
+      }],
+      metadata: {
+        mcpGrantsSchemaVersion: 2,
+        mcpNormalizationErrors: [normalizationError],
+      },
+    }
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([workPackage]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest('/api/tasks/task-normalization-and-policy-blocked/approve', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: awaitingTask.id }),
+    })
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({
+      reason: normalizationError,
+      evidenceRefs: [],
+      primaryDecision: null,
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+      workPackageId: workPackage.id,
+    })
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('rejects canonicalized separator-alias policy with package-wide deny-wins', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const awaitingTask = {
+      id: 'task-separator-deny-wins',
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const project = { id: 'project-1', mcpConfig: {} }
+    const workPackage = {
+      id: 'pkg-separator-deny-wins',
+      assignedRole: 'backend-dev',
+      title: 'Canonical backend package',
+      mcpRequirements: [{
+        requirementKey: 'mcp-requirement-v1-a-separator-read',
+        sourceRequirementIndex: 0,
+        mcpId: 'github',
+        agent: 'backend-dev',
+        requirement: 'required',
+        permissions: ['github.issues.read'],
+        prohibitedCapabilities: [],
+        assignment: { type: 'agent', targetId: null },
+        fallback: { action: 'block', message: '' },
+      }, {
+        requirementKey: 'mcp-requirement-v1-z-separator-deny',
+        sourceRequirementIndex: 1,
+        mcpId: 'github',
+        agent: 'backend-dev',
+        requirement: 'required',
+        permissions: [],
+        prohibitedCapabilities: ['github.issues.read'],
+        assignment: { type: 'agent', targetId: null },
+        fallback: { action: 'block', message: '' },
+      }],
+      metadata: {},
+    }
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([workPackage]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest('/api/tasks/task-separator-deny-wins/approve', { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: awaitingTask.id }),
+    })
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+      reason: expect.stringContaining('prohibited'),
+      workPackageId: workPackage.id,
+    })
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('rejects the separator-alias deny policy produced by the real materializer', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const taskId = 'task-materialized-separator-deny'
+    const overview = {
+      projectId: 'project-1',
+      config: { profile: 'default' as const, requiredMcps: [], overrides: {} },
+      catalog: [],
+      mcpsRoot: '/tmp/mcps',
+      statuses: [],
+      summary: { label: 'Unavailable', status: 'missing' as const, missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+    }
+    const { prepareArchitectArtifact } = await import('@/worker/architect-artifact')
+    const preparedArtifact = prepareArchitectArtifact([
+      '# Plan',
+      '- [backend-dev] Implement the canonical package.',
+      '```mcp_execution_design_json',
+      JSON.stringify({
+        schemaVersion: 1,
+        requirements: [{
+          mcpId: 'github', requirement: 'required', reason: 'Read issues.',
+          assignment: { type: 'agent', targetAgents: ['backend_dev'], targetId: null },
+          agentPermissions: { backend_dev: ['github.issues.read'] },
+          prohibitedCapabilities: [], fallback: { action: 'block', message: 'Revise.' },
+        }, {
+          mcpId: 'github', requirement: 'required', reason: 'Deny issue reads.',
+          assignment: { type: 'agent', targetAgents: ['backend-dev'], targetId: null },
+          agentPermissions: {}, prohibitedCapabilities: ['github.issues.read'],
+          fallback: { action: 'block', message: 'Revise.' },
+        }],
+        promptOverlays: {},
+        requirementContexts: [],
+        mcpAwareSubtasks: [],
+      }),
+      '```',
+    ].join('\n'), overview)
+    const { buildWorkforceMaterializationRows } = await import('@/worker/workforce-materializer')
+    let nextId = 0
+    const materialized = buildWorkforceMaterializationRows({
+      taskId,
+      architectRunId: 'run-1',
+      artifactId: 'artifact-1',
+      prepared: preparedArtifact,
+    }, {
+      activeAgents: [{ agentType: 'backend-dev', displayName: 'Backend Dev' }],
+      idFactory: () => `00000000-0000-4000-8000-${String(++nextId).padStart(12, '0')}`,
+    }).workPackages[0]
+    expect(materialized.mcpRequirements).toEqual([
+      expect.objectContaining({ agent: 'backend-dev', permissions: ['github.issues.read'] }),
+      expect.objectContaining({ agent: 'backend-dev', prohibitedCapabilities: ['github.issues.read'] }),
+    ])
+
+    const awaitingTask = {
+      id: taskId,
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const project = { id: 'project-1', mcpConfig: overview.config }
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([materialized]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest(`/api/tasks/${taskId}/approve`, { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: taskId }),
+    })
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+      reason: expect.stringContaining('prohibited'),
+      workPackageId: materialized.id,
+    })
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['malformed deferred requirement', {
+      schemaVersion: 1,
+      requirements: [{
+        mcpId: '', requirement: 'required',
+        assignment: { type: 'agent', targetAgents: ['backend'], targetId: null },
+        agentPermissions: { backend: ['github.contents.write'] },
+        prohibitedCapabilities: [], fallback: { action: 'block', message: 'Revise.' },
+      }],
+      promptOverlays: {}, requirementContexts: [], mcpAwareSubtasks: [],
+    }, 'github.contents.write'],
+    ['malformed requirement context', {
+      schemaVersion: 1,
+      requirements: [{
+        mcpId: 'github', requirement: 'required', reason: 'Read issues.',
+        assignment: { type: 'agent', targetAgents: ['backend'], targetId: null },
+        agentPermissions: { backend: ['github.issues.read'] },
+        prohibitedCapabilities: [], fallback: { action: 'block', message: 'Revise.' },
+      }],
+      promptOverlays: {},
+      requirementContexts: [{ sourceRequirementIndex: '0', agent: 'backend', promptOverlay: 'RAW-CONTEXT' }],
+      mcpAwareSubtasks: [],
+    }, 'RAW-CONTEXT'],
+    ['overflowing unsafe subtask', {
+      schemaVersion: 1,
+      requirements: [{
+        mcpId: 'github', requirement: 'required', reason: 'Read issues.',
+        assignment: { type: 'agent', targetAgents: ['backend'], targetId: null },
+        agentPermissions: { backend: ['github.issues.read'] },
+        prohibitedCapabilities: [], fallback: { action: 'block', message: 'Revise.' },
+      }],
+      promptOverlays: {}, requirementContexts: [],
+      mcpAwareSubtasks: [{
+        id: 'inspect', agent: 'backend', dependsOn: [],
+        mcpCapabilities: [...Array(30).fill('github.issues.read'), 'github.contents.write'],
+        inputs: [], outputs: [], verification: [], stoppingCondition: 'Done.', fallback: 'Revise.',
+      }],
+    }, 'github.contents.write'],
+  ] as const)('propagates %s through artifact, materializer, and real approval', async (_label, rawDesign, rawPolicyText) => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const taskId = 'task-nested-policy-invalid'
+    const overview = {
+      projectId: 'project-1',
+      config: { profile: 'default' as const, requiredMcps: [], overrides: {} },
+      catalog: [], mcpsRoot: '/tmp/mcps', statuses: [],
+      summary: { label: 'Unavailable', status: 'missing' as const, missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+    }
+    const { prepareArchitectArtifact } = await import('@/worker/architect-artifact')
+    const preparedArtifact = prepareArchitectArtifact([
+      '# Plan',
+      '- [Backend] Implement the package safely.',
+      '```mcp_execution_design_json',
+      JSON.stringify(rawDesign),
+      '```',
+    ].join('\n'), overview)
+    expect(preparedArtifact.mcpExecutionDesign.proposed?.normalizationErrors?.length).toBeGreaterThan(0)
+    expect(preparedArtifact.mcpExecutionDesign.proposed?.normalizationEvidence).toEqual([
+      expect.objectContaining({ schemaVersion: 1, category: 'normalization', code: 'mcp_design_nested_policy_invalid' }),
+    ])
+    expect(JSON.stringify(preparedArtifact.mcpExecutionDesign.proposed?.normalizationEvidence)).not.toContain(rawPolicyText)
+    if (_label === 'overflowing unsafe subtask') {
+      expect(preparedArtifact.mcpExecutionDesign.proposed?.mcpAwareSubtasks).toEqual([])
+    }
+
+    const { buildWorkforceMaterializationRows } = await import('@/worker/workforce-materializer')
+    let nextId = 0
+    const materialized = buildWorkforceMaterializationRows({
+      taskId,
+      architectRunId: 'run-1',
+      artifactId: 'artifact-1',
+      prepared: preparedArtifact,
+    }, {
+      activeAgents: [{ agentType: 'backend', displayName: 'Backend' }],
+      idFactory: () => `00000000-0000-4000-8000-${String(++nextId).padStart(12, '0')}`,
+    }).workPackages[0]
+    expect(materialized.metadata).toMatchObject({
+      mcpNormalizationEvidence: [expect.objectContaining({ code: 'mcp_design_nested_policy_invalid' })],
+    })
+    expect((materialized.metadata as { mcpNormalizationErrors: string[] }).mcpNormalizationErrors)
+      .toEqual(expect.arrayContaining([expect.any(String)]))
+    if (_label === 'overflowing unsafe subtask') {
+      expect(materialized.metadata).toMatchObject({ mcpAwareSubtasks: [] })
+    }
+
+    const awaitingTask = {
+      id: taskId,
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const project = { id: 'project-1', mcpConfig: overview.config }
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([materialized]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest(`/api/tasks/${taskId}/approve`, { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: taskId }),
+    })
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({
+      error: expect.stringContaining('MCP'),
+      primaryRecoveryAction: 'revise_plan',
+      retryable: false,
+      workPackageId: materialized.id,
+    })
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
+  it('propagates duplicate JSON object-key blockers through artifact, materializer, and real approval', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const taskId = 'task-duplicate-json-policy-key'
+    const duplicateKey = 'sk_live_DUPLICATE_POLICY_SECRET'
+    const overview = {
+      projectId: 'project-1',
+      config: { profile: 'default' as const, requiredMcps: [], overrides: {} },
+      catalog: [], mcpsRoot: '/tmp/mcps', statuses: [],
+      summary: { label: 'Unavailable', status: 'missing' as const, missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+    }
+    const rawDesign = String.raw`{"schemaVersion":1,"requirements":[],"promptOverlays":{},"requirementContexts":[],"mcpAwareSubtasks":[],"${duplicateKey}":{"assignment":{"type":"agent","type":"architect_only"}},"${duplicateKey}":{}}`
+    const { prepareArchitectArtifact } = await import('@/worker/architect-artifact')
+    const preparedArtifact = prepareArchitectArtifact([
+      '# Plan',
+      '- [Backend] Implement the package safely.',
+      '```mcp_execution_design_json',
+      rawDesign,
+      '```',
+    ].join('\n'), overview)
+
+    expect(preparedArtifact.planText).not.toContain('mcp_execution_design_json')
+    expect(preparedArtifact.planText).not.toContain(duplicateKey)
+    expect(preparedArtifact.mcpExecutionDesign.proposed).toMatchObject({
+      requirements: [],
+      normalizationEvidence: [{
+        schemaVersion: 1,
+        category: 'parse',
+        code: 'mcp_design_json_duplicate_object_key',
+      }],
+    })
+    expect(JSON.stringify(preparedArtifact.mcpExecutionDesign.proposed)).not.toContain(duplicateKey)
+
+    const { buildWorkforceMaterializationRows } = await import('@/worker/workforce-materializer')
+    let nextId = 0
+    const materialized = buildWorkforceMaterializationRows({
+      taskId,
+      architectRunId: 'run-1',
+      artifactId: 'artifact-1',
+      prepared: preparedArtifact,
+    }, {
+      activeAgents: [{ agentType: 'backend', displayName: 'Backend' }],
+      idFactory: () => `00000000-0000-4000-8000-${String(++nextId).padStart(12, '0')}`,
+    }).workPackages[0]
+    expect(materialized.metadata).toMatchObject({
+      mcpNormalizationEvidence: [expect.objectContaining({
+        category: 'parse',
+        code: 'mcp_design_json_duplicate_object_key',
+      })],
+    })
+    expect(JSON.stringify(materialized.metadata)).not.toContain(duplicateKey)
+
+    const awaitingTask = {
+      id: taskId,
+      projectId: 'project-1',
+      status: 'awaiting_approval',
+      updatedAt: new Date('2026-07-14T00:00:00.000Z'),
+    }
+    const project = { id: 'project-1', mcpConfig: overview.config }
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([materialized]))
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const res = await POST(authRequest(`/api/tasks/${taskId}/approve`, { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: taskId }),
+    })
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({
+      error: expect.stringContaining('MCP'),
+      primaryRecoveryAction: 'revise_plan',
+      retryable: false,
+      workPackageId: materialized.id,
+    })
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+  })
+
   it('refuses approval when an unresolved materialized package carries normalization blockers', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const normalizationError = 'MCP requirement 0 prohibitedCapabilities exceeds the maximum of 30 entries and was truncated.'
@@ -2972,6 +3462,12 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
             requirementContexts: [],
             mcpAwareSubtasks: [],
             normalizationErrors: [normalizationError],
+            normalizationEvidence: [{
+              schemaVersion: 1,
+              category: 'normalization',
+              code: 'mcp_design_nested_policy_invalid',
+              message: 'MCP execution design contains one invalid nested policy declaration.',
+            }],
           },
           validation: {
             status: 'blocked',
@@ -2993,7 +3489,13 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       idFactory: () => `00000000-0000-4000-8000-${String(++nextId).padStart(12, '0')}`,
     })
     const materializedPackage = rows.workPackages[0]
-    expect(materializedPackage.metadata).toMatchObject({ mcpNormalizationErrors: [normalizationError] })
+    expect(materializedPackage.metadata).toMatchObject({
+      mcpNormalizationErrors: [normalizationError],
+      mcpNormalizationEvidence: [expect.objectContaining({
+        category: 'normalization',
+        code: 'mcp_design_nested_policy_invalid',
+      })],
+    })
 
     const awaitingTask = {
       id: 'task-normalization-blocked',
@@ -3222,10 +3724,12 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
 
     const approvedPackage = {
       ...workPackageRow,
+      blockedReason: null,
       harnessId: 'harness-1',
       metadata: { ...workPackageRow.metadata, mcpGrantPhases: approvedPhases },
       sequence: 1,
       status: 'pending',
+      updatedAt: new Date('2026-06-25T00:01:00.000Z'),
     }
     const broker = evaluateWorkPackageMcpBroker({
       assignedRole: approvedPackage.assignedRole,
@@ -3249,7 +3753,12 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       .mockReturnValueOnce(chain([approvedPackage]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([{ project: projectRow }]))
-      .mockReturnValueOnce(chain([{ project: projectRow }]))
+      .mockReturnValueOnce(chain([{
+        ...approvedPackage,
+        localPath: null,
+        mcpConfig: projectRow.mcpConfig,
+        projectId: projectRow.id,
+      }]))
     const readyUpdate = chain([{ id: approvedPackage.id }])
     readyUpdate.set = vi.fn(() => readyUpdate)
     mockDbUpdate.mockReturnValueOnce(readyUpdate)

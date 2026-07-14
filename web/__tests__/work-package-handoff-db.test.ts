@@ -116,6 +116,20 @@ function insertChain(returnValue: unknown = []) {
   return insert
 }
 
+function freshAdmissionRow(
+  pkg: Record<string, unknown>,
+  project: Record<string, unknown> = { id: 'project-1' },
+) {
+  return {
+    ...pkg,
+    blockedReason: pkg.blockedReason ?? null,
+    updatedAt: pkg.updatedAt ?? null,
+    projectId: project.id,
+    localPath: project.localPath ?? null,
+    mcpConfig: project.mcpConfig ?? null,
+  }
+}
+
 function defaultSourceArtifact(input: {
   content?: string
   id?: string
@@ -343,12 +357,18 @@ describe('handoffApprovedWorkPackages', () => {
   })
 
   it('blocks a required unavailable MCP before claiming the package', async () => {
+    const pkg = {
+      id: 'pkg-1', assignedRole: 'backend', harnessId: 'harness-1',
+      mcpRequirements: [{
+        mcpId: 'github', requirement: 'required', permissions: ['github.issues.read'],
+        fallback: { action: 'block', message: 'Connect GitHub first.' },
+      }],
+      metadata: {}, sequence: 1, status: 'pending', title: 'Backend package',
+    }
     mocks.dbSelect
       .mockReturnValueOnce(chain([
         {
-          id: 'pkg-1',
-          assignedRole: 'backend',
-          harnessId: 'harness-1',
+          ...pkg,
           harnessToolPolicy: {
             mcpGrants: [{
               mcpId: 'github',
@@ -358,20 +378,11 @@ describe('handoffApprovedWorkPackages', () => {
               fallback: { action: 'block', message: 'Connect GitHub first.' },
             }],
           },
-          mcpRequirements: [{
-            mcpId: 'github',
-            requirement: 'required',
-            permissions: ['github.issues.read'],
-            fallback: { action: 'block', message: 'Connect GitHub first.' },
-          }],
-          metadata: {},
-          sequence: 1,
-          status: 'pending',
-          title: 'Backend package',
         },
       ]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+      .mockReturnValueOnce(chain([freshAdmissionRow(pkg)]))
     mocks.getProjectMcpOverview.mockResolvedValue({
       projectId: 'project-1',
       config: { profile: 'default', requiredMcps: [], overrides: {} },
@@ -401,13 +412,7 @@ describe('handoffApprovedWorkPackages', () => {
 
     expect(blockUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
       blockedReason: expect.stringContaining('planning context was not materialized'),
-      metadata: expect.objectContaining({
-        mcpBroker: expect.objectContaining({
-          recoveryAction: 'revise_plan',
-          retryable: false,
-          status: 'blocked',
-        }),
-      }),
+      metadata: expect.anything(),
       status: 'blocked',
     }))
     expect(mocks.dbTransaction).not.toHaveBeenCalled()
@@ -422,20 +427,15 @@ describe('handoffApprovedWorkPackages', () => {
     ['architect', 'harness-architect', 'Architect package'],
     ['security', 'harness-security', 'Security package'],
   ])('fails stale Architect-created reserved %s packages before no-op handoff', async (assignedRole, harnessId, title) => {
+    const pkg = {
+      id: 'pkg-review', assignedRole, harnessId, mcpRequirements: [],
+      metadata: { source: 'architect-artifact' }, sequence: 1, status: 'pending', title,
+    }
     mocks.dbSelect
-      .mockReturnValueOnce(chain([
-        {
-          id: 'pkg-review',
-          assignedRole,
-          harnessId,
-          mcpRequirements: [],
-          metadata: { source: 'architect-artifact' },
-          sequence: 1,
-          status: 'pending',
-          title,
-        },
-      ]))
+      .mockReturnValueOnce(chain([pkg]))
       .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+      .mockReturnValueOnce(chain([freshAdmissionRow(pkg)]))
 
     const failedUpdate = updateChain([{ id: 'pkg-review' }])
     mocks.dbUpdate.mockReturnValueOnce(failedUpdate)
@@ -450,13 +450,7 @@ describe('handoffApprovedWorkPackages', () => {
     })
     expect(failedUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
       blockedReason: expect.stringContaining('reserved for review gates'),
-      metadata: expect.objectContaining({
-        handoffSafety: expect.objectContaining({
-          source: 'architect-reserved-role',
-          status: 'failed',
-        }),
-        source: 'architect-artifact',
-      }),
+      metadata: expect.anything(),
       status: 'failed',
     }))
     expect(mocks.dbTransaction).not.toHaveBeenCalled()
@@ -472,20 +466,16 @@ describe('handoffApprovedWorkPackages', () => {
   })
 
   it('fails the task when auto-progress reaches a terminal reserved-role handoff block', async () => {
+    const pkg = {
+      id: 'pkg-review', assignedRole: 'security', harnessId: 'harness-security',
+      mcpRequirements: [], metadata: { source: 'architect-artifact' }, sequence: 1,
+      status: 'pending', title: 'Security package',
+    }
     mocks.dbSelect
-      .mockReturnValueOnce(chain([
-        {
-          id: 'pkg-review',
-          assignedRole: 'security',
-          harnessId: 'harness-security',
-          mcpRequirements: [],
-          metadata: { source: 'architect-artifact' },
-          sequence: 1,
-          status: 'pending',
-          title: 'Security package',
-        },
-      ]))
+      .mockReturnValueOnce(chain([pkg]))
       .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+      .mockReturnValueOnce(chain([freshAdmissionRow(pkg)]))
 
     const failedPackageUpdate = updateChain([{ id: 'pkg-review' }])
     const failedTaskUpdate = updateChain([{ id: 'task-1' }])
@@ -515,25 +505,19 @@ describe('handoffApprovedWorkPackages', () => {
   })
 
   it('holds a required filesystem package for grant approval before claiming or running it', async () => {
+    const pkg = {
+      id: 'pkg-fs', assignedRole: 'backend', harnessId: 'harness-1',
+      mcpRequirements: [{
+        mcpId: 'filesystem', requirement: 'required',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      }],
+      metadata: {}, sequence: 1, status: 'pending', title: 'Read project files',
+    }
     mocks.dbSelect
-      .mockReturnValueOnce(chain([
-        {
-          id: 'pkg-fs',
-          assignedRole: 'backend',
-          harnessId: 'harness-1',
-          mcpRequirements: [{
-            mcpId: 'filesystem',
-            requirement: 'required',
-            capabilities: ['filesystem.project.read', 'filesystem.project.search'],
-          }],
-          // Plan-approved, but no approved effective filesystem grant issued yet.
-          metadata: {},
-          sequence: 1,
-          status: 'pending',
-          title: 'Read project files',
-        },
-      ]))
+      .mockReturnValueOnce(chain([pkg]))
       .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+      .mockReturnValueOnce(chain([freshAdmissionRow(pkg)]))
 
     const failedPackageUpdate = updateChain([{ id: 'pkg-fs' }])
     const failedTaskUpdate = updateChain([{ id: 'task-1' }])
@@ -553,12 +537,7 @@ describe('handoffApprovedWorkPackages', () => {
     // implementation run/transaction was ever started, so no attempt is spent.
     expect(failedPackageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
       status: 'failed',
-      metadata: expect.objectContaining({
-        mcpGrantBlock: expect.objectContaining({
-          source: 'filesystem-grant-approval',
-          status: 'failed',
-        }),
-      }),
+      metadata: expect.anything(),
     }))
     expect(failedTaskUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
       errorMessage: expect.stringContaining('requires filesystem grant approval'),
@@ -568,45 +547,31 @@ describe('handoffApprovedWorkPackages', () => {
   })
 
   it('holds a stale project-level filesystem grant when the project grant was revoked', async () => {
-    mocks.dbSelect
-      .mockReturnValueOnce(chain([
-        {
-          id: 'pkg-fs-project',
-          assignedRole: 'backend',
-          harnessId: 'harness-1',
-          mcpRequirements: [{
-            mcpId: 'filesystem',
-            requirement: 'required',
-            capabilities: ['filesystem.project.read'],
+    const project = {
+      id: 'project-1',
+      mcpConfig: { profile: 'default', requiredMcps: [], overrides: {} },
+    }
+    const pkg = {
+      id: 'pkg-fs-project', assignedRole: 'backend', harnessId: 'harness-1',
+      mcpRequirements: [{
+        mcpId: 'filesystem', requirement: 'required', capabilities: ['filesystem.project.read'],
+      }],
+      metadata: {
+        mcpGrantPhases: { effective: {
+          schemaVersion: 1, phase: 'effective', source: 'project-filesystem-approval',
+          runtimeEnforcement: 'bounded_context_packet', status: 'approved',
+          grants: [{
+            mcpId: 'filesystem', status: 'approved', capabilities: ['filesystem.project.read'],
           }],
-          metadata: {
-            mcpGrantPhases: {
-              effective: {
-                schemaVersion: 1,
-                phase: 'effective',
-                source: 'project-filesystem-approval',
-                runtimeEnforcement: 'bounded_context_packet',
-                status: 'approved',
-                grants: [{
-                  mcpId: 'filesystem',
-                  status: 'approved',
-                  capabilities: ['filesystem.project.read'],
-                }],
-              },
-            },
-          },
-          sequence: 1,
-          status: 'pending',
-          title: 'Read project files',
-        },
-      ]))
+        } },
+      },
+      sequence: 1, status: 'pending', title: 'Read project files',
+    }
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([pkg]))
       .mockReturnValueOnce(chain([]))
-      .mockReturnValueOnce(chain([{
-        project: {
-          id: 'project-1',
-          mcpConfig: { profile: 'default', requiredMcps: [], overrides: {} },
-        },
-      }]))
+      .mockReturnValueOnce(chain([{ project }]))
+      .mockReturnValueOnce(chain([freshAdmissionRow(pkg, project)]))
 
     const failedPackageUpdate = updateChain([{ id: 'pkg-fs-project' }])
     const failedTaskUpdate = updateChain([{ id: 'task-1' }])
@@ -624,12 +589,7 @@ describe('handoffApprovedWorkPackages', () => {
     })
     expect(failedPackageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
       status: 'failed',
-      metadata: expect.objectContaining({
-        mcpGrantBlock: expect.objectContaining({
-          source: 'filesystem-grant-approval',
-          status: 'failed',
-        }),
-      }),
+      metadata: expect.anything(),
     }))
     expect(mocks.dbTransaction).not.toHaveBeenCalled()
   })
@@ -655,56 +615,41 @@ describe('handoffApprovedWorkPackages', () => {
         grants: { filesystem: projectGrant },
       },
     }
+    const pkg = {
+      id: 'pkg-fs-project',
+      assignedRole: 'backend',
+      harnessId: 'harness-1',
+      mcpRequirements: [{
+        requirementKey: 'mcp-requirement-v1-fs-1', sourceRequirementIndex: 0,
+        agent: 'backend', mcpId: 'filesystem', requirement: 'required',
+        permissions: ['filesystem.project.read'], prohibitedCapabilities: [],
+        assignment: { type: 'agent', targetId: null },
+        fallback: { action: 'block', message: '' },
+      }],
+      metadata: {
+        mcpGrantPhases: { effective: {
+          schemaVersion: 1, phase: 'effective', source: 'project-filesystem-approval',
+          grantApprovalId: projectGrant.grantApprovalId, grantMode: 'always_allow',
+          scope: 'project', mcpId: 'filesystem', approvedAt: projectGrant.approvedAt,
+          approvedBy: projectGrant.approvedBy,
+          grants: [{
+            mcpId: 'filesystem', status: 'approved', capabilities: projectGrant.capabilities,
+            grantApprovalId: projectGrant.grantApprovalId, grantMode: 'always_allow',
+            reason: projectGrant.reason,
+          }],
+          reason: projectGrant.reason, runtimeIssued: false,
+          runtimeEnforcement: 'bounded_context_packet', status: 'approved',
+        } },
+      },
+      sequence: 1,
+      status: 'pending',
+      title: 'Read project files',
+    }
     mocks.dbSelect
-      .mockReturnValueOnce(chain([{
-        id: 'pkg-fs-project',
-        assignedRole: 'backend',
-        harnessId: 'harness-1',
-        mcpRequirements: [{
-          requirementKey: 'mcp-requirement-v1-fs-1',
-          sourceRequirementIndex: 0,
-          agent: 'backend',
-          mcpId: 'filesystem',
-          requirement: 'required',
-          permissions: ['filesystem.project.read'],
-          prohibitedCapabilities: [],
-          assignment: { type: 'agent', targetId: null },
-          fallback: { action: 'block', message: '' },
-        }],
-        metadata: {
-          mcpGrantPhases: {
-            effective: {
-              schemaVersion: 1,
-              phase: 'effective',
-              source: 'project-filesystem-approval',
-              grantApprovalId: projectGrant.grantApprovalId,
-              grantMode: 'always_allow',
-              scope: 'project',
-              mcpId: 'filesystem',
-              approvedAt: projectGrant.approvedAt,
-              approvedBy: projectGrant.approvedBy,
-              grants: [{
-                mcpId: 'filesystem',
-                status: 'approved',
-                capabilities: projectGrant.capabilities,
-                grantApprovalId: projectGrant.grantApprovalId,
-                grantMode: 'always_allow',
-                reason: projectGrant.reason,
-              }],
-              reason: projectGrant.reason,
-              runtimeIssued: false,
-              runtimeEnforcement: 'bounded_context_packet',
-              status: 'approved',
-            },
-          },
-        },
-        sequence: 1,
-        status: 'pending',
-        title: 'Read project files',
-      }]))
+      .mockReturnValueOnce(chain([pkg]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([{ project }]))
-      .mockReturnValueOnce(chain([{ project }]))
+      .mockReturnValueOnce(chain([freshAdmissionRow(pkg, project)]))
     mocks.getProjectMcpOverview.mockResolvedValue({
       projectId: project.id,
       config: project.mcpConfig,
@@ -745,27 +690,20 @@ describe('handoffApprovedWorkPackages', () => {
   })
 
   it('runs the broker before ready promotion when handoff claiming is disabled', async () => {
+    const pkg = {
+      id: 'pkg-1', assignedRole: 'backend', harnessId: 'harness-1',
+      mcpRequirements: [{
+        mcpId: 'slack', agent: 'backend', requirement: 'optional',
+        permissions: ['slack.messages.read'],
+        fallback: { action: 'continue_without_mcp', message: 'Use local context.' },
+      }],
+      metadata: {}, sequence: 1, status: 'pending', title: 'Backend package',
+    }
     mocks.dbSelect
-      .mockReturnValueOnce(chain([
-        {
-          id: 'pkg-1',
-          assignedRole: 'backend',
-          harnessId: 'harness-1',
-          mcpRequirements: [{
-            mcpId: 'slack',
-            agent: 'backend',
-            requirement: 'optional',
-            permissions: ['slack.messages.read'],
-            fallback: { action: 'continue_without_mcp', message: 'Use local context.' },
-          }],
-          metadata: {},
-          sequence: 1,
-          status: 'pending',
-          title: 'Backend package',
-        },
-      ]))
+      .mockReturnValueOnce(chain([pkg]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+      .mockReturnValueOnce(chain([freshAdmissionRow(pkg)]))
 
     const blockUpdate = updateChain([{ id: 'pkg-1' }])
     mocks.dbUpdate.mockReturnValueOnce(blockUpdate)
@@ -780,15 +718,7 @@ describe('handoffApprovedWorkPackages', () => {
     })
     expect(blockUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
       blockedReason: expect.stringContaining('mcpId must identify a known MCP'),
-      metadata: expect.objectContaining({
-        mcpBroker: expect.objectContaining({
-          schemaVersion: 1,
-          mode: 'blocked',
-          recoveryAction: 'revise_plan',
-          retryable: false,
-          status: 'blocked',
-        }),
-      }),
+      metadata: expect.anything(),
       status: 'blocked',
     }))
     expect(mocks.publishTaskEvent).not.toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
@@ -798,42 +728,27 @@ describe('handoffApprovedWorkPackages', () => {
   })
 
   it('promotes prompt-only MCP filesystem packages when handoff claiming is disabled', async () => {
+    const pkg = {
+      id: 'pkg-1', assignedRole: 'frontend', harnessId: 'harness-1', harnessToolPolicy: null,
+      mcpRequirements: [{
+        requirementKey: 'filesystem-write-v1', sourceRequirementIndex: 0, mcpId: 'filesystem',
+        agent: 'frontend', requirement: 'required', permissions: ['filesystem.project.write'],
+        assignment: { type: 'agent', targetId: null }, fallback: { action: 'block', message: '' },
+      }],
+      metadata: {
+        promptOverlay: 'Use the project context if available, otherwise continue with the greenfield scaffold.',
+        mcpAwareSubtasks: [{
+          id: 'inspect-repository', agent: 'frontend', mcpCapabilities: ['filesystem.project.write'],
+          capabilityBindings: [{ capability: 'filesystem.project.write', requirementKey: 'filesystem-write-v1' }],
+        }],
+      },
+      sequence: 1, status: 'pending', title: 'Frontend work package',
+    }
     mocks.dbSelect
-      .mockReturnValueOnce(chain([
-        {
-          id: 'pkg-1',
-          assignedRole: 'frontend',
-          harnessId: 'harness-1',
-          harnessToolPolicy: null,
-          mcpRequirements: [{
-            requirementKey: 'filesystem-write-v1',
-            sourceRequirementIndex: 0,
-            mcpId: 'filesystem',
-            agent: 'frontend',
-            requirement: 'required',
-            permissions: ['filesystem.project.write'],
-            assignment: { type: 'agent', targetId: null },
-            fallback: { action: 'block', message: '' },
-          }],
-          metadata: {
-            promptOverlay: 'Use the project context if available, otherwise continue with the greenfield scaffold.',
-            mcpAwareSubtasks: [{
-              id: 'inspect-repository',
-              agent: 'frontend',
-              mcpCapabilities: ['filesystem.project.write'],
-              capabilityBindings: [{
-                capability: 'filesystem.project.write',
-                requirementKey: 'filesystem-write-v1',
-              }],
-            }],
-          },
-          sequence: 1,
-          status: 'pending',
-          title: 'Frontend work package',
-        },
-      ]))
+      .mockReturnValueOnce(chain([pkg]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+      .mockReturnValueOnce(chain([freshAdmissionRow(pkg)]))
 
     mocks.getProjectMcpOverview.mockResolvedValue({
       projectId: 'project-1',
@@ -934,26 +849,19 @@ describe('handoffApprovedWorkPackages', () => {
   })
 
   it('rechecks the broker for packages that were already ready before handoff', async () => {
+    const pkg = {
+      id: 'pkg-1', assignedRole: 'backend', harnessId: 'harness-1',
+      mcpRequirements: [{
+        mcpId: 'github', requirement: 'required', permissions: ['github.contents.write'],
+        fallback: { action: 'block', message: 'Use read-only GitHub access.' },
+      }],
+      metadata: {}, sequence: 1, status: 'ready', title: 'Backend package',
+    }
     mocks.dbSelect
-      .mockReturnValueOnce(chain([
-        {
-          id: 'pkg-1',
-          assignedRole: 'backend',
-          harnessId: 'harness-1',
-          mcpRequirements: [{
-            mcpId: 'github',
-            requirement: 'required',
-            permissions: ['github.contents.write'],
-            fallback: { action: 'block', message: 'Use read-only GitHub access.' },
-          }],
-          metadata: {},
-          sequence: 1,
-          status: 'ready',
-          title: 'Backend package',
-        },
-      ]))
+      .mockReturnValueOnce(chain([pkg]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+      .mockReturnValueOnce(chain([freshAdmissionRow(pkg)]))
     mocks.getProjectMcpOverview.mockResolvedValue({
       projectId: 'project-1',
       config: { profile: 'default', requiredMcps: ['github'], overrides: {} },
@@ -992,14 +900,7 @@ describe('handoffApprovedWorkPackages', () => {
     })
     expect(blockUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
       blockedReason: expect.stringContaining('deferred live MCP capabilities'),
-      metadata: expect.objectContaining({
-        mcpBroker: expect.objectContaining({
-          mode: 'deferred_live_mcp',
-          recoveryAction: 'revise_plan',
-          retryable: false,
-          status: 'blocked',
-        }),
-      }),
+      metadata: expect.anything(),
       status: 'blocked',
     }))
     expect(mocks.dbTransaction).not.toHaveBeenCalled()
@@ -1027,6 +928,15 @@ describe('handoffApprovedWorkPackages', () => {
       ]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+      .mockReturnValueOnce(chain([{
+        id: 'pkg-1', assignedRole: 'backend', blockedReason: null, harnessId: 'harness-1',
+        mcpRequirements: [{
+          mcpId: 'github', requirement: 'optional', permissions: ['github.issues.read'],
+          fallback: { action: 'continue_without_mcp', message: 'Use local context.' },
+        }],
+        metadata: {}, sequence: 1, status: 'pending', title: 'Backend package', updatedAt: null,
+        projectId: 'project-1', localPath: null, mcpConfig: null,
+      }]))
 
     const readyUpdate = updateChain([{ id: 'pkg-1' }])
     mocks.dbUpdate.mockReturnValueOnce(readyUpdate)
@@ -1049,27 +959,19 @@ describe('handoffApprovedWorkPackages', () => {
   })
 
   it('blocks an optional unavailable MCP with ask_user fallback before claiming the package', async () => {
+    const pkg = {
+      id: 'pkg-1', assignedRole: 'backend', harnessId: 'harness-1', harnessToolPolicy: null,
+      mcpRequirements: [{
+        mcpId: 'github', requirement: 'optional', permissions: ['github.issues.read'],
+        fallback: { action: 'ask_user', message: 'Connect GitHub or choose a local-only plan.' },
+      }],
+      metadata: {}, sequence: 1, status: 'pending', title: 'Backend package',
+    }
     mocks.dbSelect
-      .mockReturnValueOnce(chain([
-        {
-          id: 'pkg-1',
-          assignedRole: 'backend',
-          harnessId: 'harness-1',
-          harnessToolPolicy: null,
-          mcpRequirements: [{
-            mcpId: 'github',
-            requirement: 'optional',
-            permissions: ['github.issues.read'],
-            fallback: { action: 'ask_user', message: 'Connect GitHub or choose a local-only plan.' },
-          }],
-          metadata: {},
-          sequence: 1,
-          status: 'pending',
-          title: 'Backend package',
-        },
-      ]))
+      .mockReturnValueOnce(chain([pkg]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+      .mockReturnValueOnce(chain([freshAdmissionRow(pkg)]))
 
     const blockUpdate = updateChain([{ id: 'pkg-1' }])
     mocks.dbUpdate.mockReturnValueOnce(blockUpdate)
@@ -1084,13 +986,7 @@ describe('handoffApprovedWorkPackages', () => {
     })
     expect(blockUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
       blockedReason: expect.stringContaining('planning context was not materialized'),
-      metadata: expect.objectContaining({
-        mcpBroker: expect.objectContaining({
-          recoveryAction: 'revise_plan',
-          retryable: false,
-          status: 'blocked',
-        }),
-      }),
+      metadata: expect.anything(),
       status: 'blocked',
     }))
     expect(mocks.dbTransaction).not.toHaveBeenCalled()
@@ -1170,6 +1066,14 @@ describe('handoffApprovedWorkPackages', () => {
         { workPackageId: 'pkg-2', dependsOnWorkPackageId: 'pkg-1' },
       ]))
       .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+      .mockReturnValueOnce(chain([freshAdmissionRow({
+        id: 'pkg-2', assignedRole: 'frontend', harnessId: 'harness-2',
+        mcpRequirements: [{
+          mcpId: 'github', requirement: 'optional', permissions: ['github.issues.read'],
+          fallback: { action: 'ask_user', message: 'Connect GitHub before frontend handoff.' },
+        }],
+        metadata: {}, sequence: 2, status: 'pending', title: 'Frontend package',
+      })]))
 
     const readyUpdate = updateChain([{ id: 'pkg-1' }])
     const blockUpdate = updateChain([{ id: 'pkg-2' }])
@@ -1624,7 +1528,7 @@ describe('handoffApprovedWorkPackages', () => {
         assignedRole: 'backend',
         harnessId: 'harness-1',
         mcpRequirements: [],
-        metadata: {},
+        metadata: { preClaimMetadata: 'keep' },
         sequence: 1,
         status: 'pending',
         title: 'Backend package',
@@ -1650,6 +1554,7 @@ describe('handoffApprovedWorkPackages', () => {
     const runModelUpdate = updateChain([{ id: 'run-1' }])
     const runFailedUpdate = updateChain([{ id: 'run-1' }])
     const packageBlockedUpdate = updateChain([{ id: 'pkg-1' }])
+    const packageBlockedSet = packageBlockedUpdate.set as ReturnType<typeof vi.fn>
     mocks.dbUpdate
       .mockReturnValueOnce(readyUpdate)
       .mockReturnValueOnce(runModelUpdate)
@@ -1705,15 +1610,30 @@ describe('handoffApprovedWorkPackages', () => {
         sandboxPath: '/workspace/project/.forge/task-runs/task-1/pkg-1/attempt-1',
       },
     ))
+    const afterWorkPackageClaimed = vi.fn(async () => {
+      // The real PostgreSQL companion test writes grant + unrelated JSONB here.
+      // This unit seam proves cleanup happens strictly after the claim commits.
+    })
 
     try {
-      await expect(handoffApprovedWorkPackages('task-1', { finalAttempt: false }))
+      await expect(handoffApprovedWorkPackages('task-1', {
+        afterWorkPackageClaimed,
+        finalAttempt: false,
+      }))
         .rejects.toThrow('model unavailable')
 
+      expect(afterWorkPackageClaimed).toHaveBeenCalledWith({
+        attempt: 1,
+        packageId: 'pkg-1',
+        runId: 'run-1',
+      })
       expect(packageBlockedUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
         blockedReason: 'Retrying package execution after error: model unavailable Authorization: Bearer [REDACTED_TOKEN] https://[REDACTED_USERINFO]@example.com/repo.git',
+        metadata: expect.anything(),
         status: 'blocked',
       }))
+      expect(packageBlockedSet.mock.calls[0][0].metadata)
+        .not.toEqual({ preClaimMetadata: 'keep' })
       expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
         blockedReason: 'Retrying package execution after error: model unavailable Authorization: Bearer [REDACTED_TOKEN] https://[REDACTED_USERINFO]@example.com/repo.git',
         status: 'blocked',
@@ -2446,6 +2366,19 @@ describe('handoffApprovedWorkPackages', () => {
       ]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([{ project: { id: 'project-1' } }]))
+      .mockReturnValueOnce(chain([{
+        id: 'pkg-1', assignedRole: 'backend', blockedReason: null, harnessId: 'harness-1',
+        mcpRequirements: [{
+          mcpId: 'github', requirement: 'required', permissions: ['github.issues.read'],
+          fallback: { action: 'block', message: 'Connect GitHub first.' },
+        }],
+        metadata: { requirementContexts: [{
+          requirementKey: 'legacy-0-github-backend', agent: 'backend', mcpId: 'github',
+          promptOverlay: 'Use the supplied GitHub planning context.',
+        }] },
+        sequence: 1, status: 'blocked', title: 'Backend package', updatedAt: null,
+        projectId: 'project-1', localPath: null, mcpConfig: null,
+      }]))
     mocks.getProjectMcpOverview.mockResolvedValue({
       projectId: 'project-1',
       config: { profile: 'default', requiredMcps: ['github'], overrides: {} },
@@ -2489,5 +2422,119 @@ describe('handoffApprovedWorkPackages', () => {
       blockedReason: null,
       status: 'running',
     }))
+  })
+
+  it('durably blocks after repeated package or project freshness conflicts without starting a run', async () => {
+    const candidate = {
+      id: 'pkg-racing',
+      assignedRole: 'backend',
+      blockedReason: null,
+      harnessId: 'harness-1',
+      mcpRequirements: [{
+        mcpId: 'github',
+        requirement: 'optional',
+        permissions: ['github.issues.read'],
+        fallback: { action: 'continue_without_mcp', message: 'Use local context.' },
+      }],
+      metadata: { concurrentWriterValue: 'must-survive' },
+      sequence: 1,
+      status: 'pending',
+      title: 'Racing package',
+      updatedAt: new Date('2026-07-14T01:00:00.000Z'),
+    }
+    const project = {
+      id: 'project-1',
+      localPath: '/workspace/project',
+      mcpConfig: { profile: 'default', requiredMcps: [], overrides: {} },
+    }
+
+    // Each admission pass captures MCP health, then its package+project CAS
+    // loses to a simulated allow-once/config/localPath or metadata update.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      mocks.dbSelect
+        .mockReturnValueOnce(chain([candidate]))
+        .mockReturnValueOnce(chain([]))
+        .mockReturnValueOnce(chain([{ project }]))
+        .mockReturnValueOnce(chain([{
+          ...candidate,
+          projectId: project.id,
+          localPath: project.localPath,
+          mcpConfig: project.mcpConfig,
+        }]))
+    }
+    // The exhaustion path reloads the latest row before applying its generic,
+    // blockable-status-only jsonb_set marker.
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([candidate]))
+      .mockReturnValueOnce(chain([]))
+
+    const failedCasUpdates = Array.from({ length: 3 }, () => updateChain([]))
+    const durableBlockUpdate = updateChain([{ id: candidate.id }])
+    mocks.dbUpdate
+      .mockReturnValueOnce(failedCasUpdates[0])
+      .mockReturnValueOnce(failedCasUpdates[1])
+      .mockReturnValueOnce(failedCasUpdates[2])
+      .mockReturnValueOnce(durableBlockUpdate)
+
+    const result = await handoffApprovedWorkPackages('task-1')
+
+    expect(result).toMatchObject({
+      status: 'blocked',
+      claimedPackageId: null,
+      blockedReason: expect.stringContaining('changed repeatedly while MCP health was being checked'),
+    })
+    expect(mocks.getProjectMcpOverview).toHaveBeenCalledTimes(3)
+    expect(mocks.dbTransaction).not.toHaveBeenCalled()
+    const durableBlockSet = durableBlockUpdate.set as ReturnType<typeof vi.fn>
+    expect(durableBlockSet).toHaveBeenCalledWith(expect.objectContaining({
+      blockedReason: expect.stringContaining('changed repeatedly'),
+      metadata: expect.anything(),
+      status: 'blocked',
+    }))
+    // Concurrent metadata is not copied from the stale snapshot; production
+    // uses jsonb_set against the current database value.
+    expect(durableBlockSet.mock.calls[0][0].metadata).not.toEqual(candidate.metadata)
+    expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
+      handoffFreshnessBlock: expect.objectContaining({ status: 'blocked' }),
+      status: 'blocked',
+      workPackageId: candidate.id,
+    }))
+  })
+
+  it('rechecks MCP health after a claim CAS conflict and starts no stale run', async () => {
+    const candidate = {
+      id: 'pkg-claim-race', assignedRole: 'backend', blockedReason: null, harnessId: 'harness-1',
+      mcpRequirements: [{
+        mcpId: 'github', requirement: 'optional', permissions: ['github.issues.read'],
+        fallback: { action: 'continue_without_mcp', message: 'Use local context.' },
+      }],
+      metadata: {}, sequence: 1, status: 'pending', title: 'Claim race', updatedAt: null,
+    }
+    const project = { id: 'project-1', localPath: '/workspace/project', mcpConfig: null }
+    const fresh = { ...candidate, projectId: project.id, localPath: project.localPath, mcpConfig: null }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      mocks.dbSelect
+        .mockReturnValueOnce(chain([candidate]))
+        .mockReturnValueOnce(chain([]))
+        .mockReturnValueOnce(chain([{ project }]))
+        .mockReturnValueOnce(chain([fresh]))
+    }
+    mocks.dbUpdate
+      .mockReturnValueOnce(updateChain([{ id: candidate.id }]))
+      .mockReturnValueOnce(updateChain([{ id: candidate.id }]))
+
+    const lostClaim = updateChain([])
+    const staleInsert = vi.fn()
+    mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
+      callback({ insert: staleInsert, update: vi.fn().mockReturnValueOnce(lostClaim) }),
+    )
+    mockNoOpHandoffTransaction({ packageId: candidate.id, runId: 'run-fresh' })
+
+    const result = await handoffApprovedWorkPackages('task-1')
+
+    expect(result).toMatchObject({ status: 'handed_off', claimedPackageId: candidate.id })
+    expect(mocks.getProjectMcpOverview).toHaveBeenCalledTimes(2)
+    expect(staleInsert).not.toHaveBeenCalled()
+    expect(mocks.publishTaskEvent.mock.calls.filter(([, type]) => type === 'run:started')).toHaveLength(1)
   })
 })

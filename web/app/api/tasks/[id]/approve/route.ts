@@ -238,14 +238,22 @@ export async function POST(
       if (blockedIndex >= 0) {
         const admission = admissions[blockedIndex]
         const pkg = rawPackageRows[blockedIndex]
-        const reason = admission.aggregate.blocked[0] ?? 'MCP admission blocked this work package.'
+        const primaryDecision = admission.aggregate.primaryDecision
+        const reason = primaryDecision?.reason ?? admission.aggregate.blocked[0] ?? 'MCP admission blocked this work package.'
         return {
           task: null,
           approvedGates: [] as { id: string }[],
           approvalBlock: {
             error: admission.aggregate.blockedReason ?? reason,
+            evidenceRefs: primaryDecision ? [...primaryDecision.evidenceRefs] : [],
+            primaryDecision: primaryDecision ? {
+              ...primaryDecision,
+              evidenceRefs: [...primaryDecision.evidenceRefs],
+            } : null,
+            primaryMode: primaryDecision?.mode ?? 'blocked',
             reason,
-            primaryRecoveryAction: admission.aggregate.primaryRecoveryAction ?? 'revise_plan',
+            primaryRecoveryAction: primaryDecision?.recoveryAction ?? 'revise_plan',
+            retryable: admission.aggregate.retryable,
             workPackageId: pkg.id,
           },
         }

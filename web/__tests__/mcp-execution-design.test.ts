@@ -36,6 +36,10 @@ function fence(value: Record<string, unknown>): string {
   return `\`\`\`mcp_execution_design_json\n${JSON.stringify(value)}\n\`\`\``
 }
 
+function rawFence(jsonBlock: string): string {
+  return `\`\`\`mcp_execution_design_json\n${jsonBlock}\n\`\`\``
+}
+
 function requirement(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     mcpId: 'github',
@@ -83,6 +87,179 @@ describe('MCP execution design normalization', () => {
     expect(second.requirements[0].requirementKey).not.toBe('architect-controlled-key')
   })
 
+  it('rejects target-agent overflow deterministically before assigning any target', () => {
+    const agents = ['g', 'f', 'e', 'd', 'c', 'b', 'a']
+    const parse = (targetAgents: string[]) => parseMcpExecutionDesign(fence(design({
+      requirements: [requirement({
+        assignment: { type: 'agent', targetAgents, targetId: null },
+        agentPermissions: { backend: ['github.issues.read'] },
+      })],
+      requirementContexts: [],
+    }))).design!
+
+    const forward = parse(agents)
+    const reverse = parse([...agents].reverse())
+    for (const parsed of [forward, reverse]) {
+      expect(parsed.requirements).toEqual([])
+      expect(parsed.normalizationErrors).toEqual(expect.arrayContaining([
+        expect.stringMatching(/targetAgents exceeds the maximum raw count of 6/),
+      ]))
+      expect(validateMcpExecutionDesign(parsed, overview([healthyGithub])).status).toBe('blocked')
+    }
+    expect(reverse.normalizationErrors).toEqual(forward.normalizationErrors)
+
+    const withinLimit = agents.slice(0, 6)
+    const withinLimitForward = parse(withinLimit).requirements[0]
+    const withinLimitReverse = parse([...withinLimit].reverse()).requirements[0]
+    expect(withinLimitReverse.requirementKey).toBe(withinLimitForward.requirementKey)
+    expect(withinLimitForward.assignment.targetAgents).toEqual([...withinLimit].sort())
+    expect(withinLimitReverse.assignment.targetAgents).toEqual([...withinLimit].sort())
+  })
+
+  it.each([
+    ['non-array container', 'backend'],
+    ['invalid item type', ['backend', 42]],
+    ['overlong identity', ['a'.repeat(41)]],
+    ['raw-count overflow with duplicates', Array(7).fill('backend')],
+    ['canonical package collision', ['backend_dev', 'backend-dev']],
+    ['truncation collision', [`${'a'.repeat(40)}-first`, `${'a'.repeat(40)}-second`]],
+  ])('rejects the entire target assignment for %s', (_label, targetAgents) => {
+    const parsed = parseMcpExecutionDesign(fence(design({
+      requirements: [requirement({
+        assignment: { type: 'agent', targetAgents, targetId: null },
+        agentPermissions: { backend: ['github.issues.read'] },
+      })],
+      requirementContexts: [],
+    }))).design!
+
+    expect(parsed.requirements).toEqual([])
+    expect(parsed.normalizationErrors?.length).toBeGreaterThan(0)
+    expect(validateMcpExecutionDesign(parsed, overview([healthyGithub])).status).toBe('blocked')
+  })
+
+  it.each([
+    ['case', { Backend: ['github.pull_requests.write'], backend: ['github.issues.read'] }],
+    ['truncation', {
+      [`${'a'.repeat(40)}-first`]: ['github.pull_requests.write'],
+      [`${'a'.repeat(40)}-second`]: ['github.issues.read'],
+    }],
+  ])('tombstones normalized agent-permission %s collisions in either input order', (_label, permissions) => {
+    const entries = Object.entries(permissions)
+    const parse = (orderedEntries: typeof entries) => parseMcpExecutionDesign(fence(design({
+      requirements: [requirement({
+        assignment: { type: 'agent', targetAgents: [], targetId: null },
+        agentPermissions: Object.fromEntries(orderedEntries),
+      })],
+      requirementContexts: [],
+    }))).design!
+    const forward = parse(entries)
+    const reverse = parse([...entries].reverse())
+
+    for (const parsed of [forward, reverse]) {
+      expect(parsed.requirements).toEqual([])
+      expect(parsed.requirementContexts).toEqual([])
+      expect(parsed.normalizationErrors).toEqual(expect.arrayContaining([
+        expect.stringMatching(/agentPermissions contains colliding normalized keys/),
+      ]))
+      expect(validateMcpExecutionDesign(parsed, overview([healthyGithub])).status).toBe('blocked')
+    }
+    expect(reverse.normalizationErrors).toEqual(forward.normalizationErrors)
+  })
+
+  it.each([
+    ['case', { Backend: 'FIRST', backend: 'SECOND' }],
+    ['package separator alias', { backend_dev: 'FIRST', 'backend-dev': 'SECOND' }],
+    ['truncation', { [`${'a'.repeat(40)}-first`]: 'FIRST', [`${'a'.repeat(40)}-second`]: 'SECOND' }],
+  ])('rejects distinct normalized legacy prompt-overlay %s collisions in either input order', (_label, overlays) => {
+    const entries = Object.entries(overlays)
+    const parse = (orderedEntries: typeof entries) => parseMcpExecutionDesign(fence(design({
+      promptOverlays: Object.fromEntries(orderedEntries),
+      requirementContexts: undefined,
+    }))).design!
+
+    for (const parsed of [parse(entries), parse([...entries].reverse())]) {
+      expect(parsed.promptOverlays).toEqual({})
+      expect(parsed.requirementContexts).toEqual([])
+      expect(parsed.normalizationErrors).toEqual(expect.arrayContaining([
+        expect.stringMatching(/prompt overlays contain distinct colliding normalized keys/),
+      ]))
+      expect(validateMcpExecutionDesign(parsed, overview([healthyGithub])).status).toBe('blocked')
+    }
+  })
+
+  it('deduplicates identical normalized legacy prompt overlays deterministically', () => {
+    const parsed = parseMcpExecutionDesign(fence(design({
+      promptOverlays: { Backend: 'Same context.', backend: 'Same context.' },
+      requirementContexts: undefined,
+    }))).design!
+
+    expect(parsed.promptOverlays).toEqual({ backend: 'Same context.' })
+    expect(parsed.requirementContexts).toEqual([expect.objectContaining({ agent: 'backend', promptOverlay: 'Same context.' })])
+    expect(parsed.normalizationErrors).toEqual([])
+  })
+
+  it('materializes one unambiguous legacy prompt overlay', () => {
+    const parsed = parseMcpExecutionDesign(fence(design({
+      promptOverlays: { Backend: 'Use the supplied issue context.' },
+      requirementContexts: undefined,
+    }))).design!
+
+    expect(parsed.promptOverlays).toEqual({ backend: 'Use the supplied issue context.' })
+    expect(parsed.requirementContexts).toEqual([
+      expect.objectContaining({
+        agent: 'backend',
+        mcpId: 'github',
+        promptOverlay: 'Use the supplied issue context.',
+      }),
+    ])
+    expect(parsed.normalizationErrors).toEqual([])
+  })
+
+  it('does not deduplicate raw-distinct overlay values that normalize to the same text', () => {
+    const parsed = parseMcpExecutionDesign(fence(design({
+      promptOverlays: { Backend: 'Same  context.', backend: 'Same context.' },
+      requirementContexts: undefined,
+    }))).design!
+
+    expect(parsed.promptOverlays).toEqual({})
+    expect(parsed.requirementContexts).toEqual([])
+    expect(parsed.normalizationErrors).toEqual(expect.arrayContaining([
+      expect.stringMatching(/distinct colliding normalized keys or values/),
+    ]))
+  })
+
+  it('does not deduplicate distinct overlong overlay values that share a bounded prefix', () => {
+    const sharedPrefix = 'x'.repeat(1000)
+    const parsed = parseMcpExecutionDesign(fence(design({
+      promptOverlays: { Backend: `${sharedPrefix}A`, backend: `${sharedPrefix}B` },
+      requirementContexts: undefined,
+    }))).design!
+
+    expect(parsed.promptOverlays).toEqual({})
+    expect(parsed.requirementContexts).toEqual([])
+    expect(parsed.normalizationErrors).toEqual(expect.arrayContaining([
+      expect.stringMatching(/overlong overlay value/),
+      expect.stringMatching(/distinct colliding normalized keys or values/),
+    ]))
+  })
+
+  it('deduplicates identical package separator aliases into one canonical context', () => {
+    const parsed = parseMcpExecutionDesign(fence(design({
+      requirements: [requirement({
+        assignment: { type: 'agent', targetAgents: ['backend_dev'], targetId: null },
+        agentPermissions: { backend_dev: ['github.issues.read'] },
+      })],
+      promptOverlays: { backend_dev: 'Same context.', 'backend-dev': 'Same context.' },
+      requirementContexts: undefined,
+    }))).design!
+
+    expect(parsed.promptOverlays).toEqual({ 'backend-dev': 'Same context.' })
+    expect(parsed.requirementContexts).toEqual([
+      expect.objectContaining({ agent: 'backend-dev', promptOverlay: 'Same context.' }),
+    ])
+    expect(parsed.normalizationErrors).toEqual([])
+  })
+
   it('keeps exact duplicates independently addressable', () => {
     const parsed = parseMcpExecutionDesign(fence(design({ requirements: [requirement(), requirement()] }))).design!
     expect(parsed.requirements.map((item) => item.requirementKey)).toEqual([
@@ -105,6 +282,98 @@ describe('MCP execution design normalization', () => {
     expect(parsed.mcpAwareSubtasks[0].capabilityBindings).toEqual([{ capability: 'github.issues.read', requirementKey: key }])
   })
 
+  it('matches explicit subtask bindings across package separator aliases', () => {
+    const parsed = parseMcpExecutionDesign(fence(design({
+      requirements: [requirement({
+        assignment: { type: 'agent', targetAgents: ['backend_dev'], targetId: null },
+        agentPermissions: { backend_dev: ['github.issues.read'] },
+      })],
+      requirementContexts: [{ sourceRequirementIndex: 0, agent: 'backend-dev', promptOverlay: 'Use issue context.' }],
+      mcpAwareSubtasks: [{
+        id: 'inspect', agent: 'backend-dev', dependsOn: [], mcpCapabilities: ['github.issues.read'],
+        capabilityRequirements: [{ capability: 'github.issues.read', sourceRequirementIndex: 0 }],
+        inputs: [], outputs: [], verification: [], stoppingCondition: 'Done.', fallback: 'Ask user.',
+      }],
+    }))).design!
+
+    expect(parsed.requirements[0].assignment.targetAgents).toEqual(['backend_dev'])
+    expect(parsed.requirements[0].agentPermissions).toEqual({ backend_dev: ['github.issues.read'] })
+    expect(parsed.mcpAwareSubtasks[0]).toMatchObject({
+      agent: 'backend-dev',
+      capabilityBindings: [{
+        capability: 'github.issues.read',
+        requirementKey: parsed.requirements[0].requirementKey,
+      }],
+    })
+    expect(parsed.normalizationErrors).toEqual([])
+  })
+
+  it('tombstones package-alias permission collisions before legacy subtask binding', () => {
+    const permissionEntries = [
+      ['backend_dev', ['github.pull_requests.write']],
+      ['backend-dev', ['github.issues.read']],
+    ] as const
+    const parse = (entries: ReadonlyArray<readonly [string, readonly string[]]>) => parseMcpExecutionDesign(fence(design({
+      requirements: [requirement({
+        assignment: { type: 'agent', targetAgents: ['backend_dev'], targetId: null },
+        agentPermissions: Object.fromEntries(entries),
+      })],
+      requirementContexts: [],
+      mcpAwareSubtasks: [{
+        id: 'inspect', agent: 'backend_dev', dependsOn: [], mcpCapabilities: ['github.issues.read'],
+        inputs: [], outputs: [], verification: [], stoppingCondition: 'Done.', fallback: 'Ask user.',
+      }],
+    }))).design!
+
+    for (const parsed of [parse(permissionEntries), parse([...permissionEntries].reverse())]) {
+      expect(parsed.requirements).toEqual([])
+      expect(parsed.mcpAwareSubtasks[0].capabilityBindings).toEqual([])
+      expect(parsed.normalizationErrors).toEqual(expect.arrayContaining([
+        expect.stringMatching(/agentPermissions contains colliding normalized keys/),
+      ]))
+      expect(validateMcpExecutionDesign(parsed, overview([healthyGithub])).status).toBe('blocked')
+    }
+  })
+
+  it('hashes package separator aliases to the same new requirement identity', () => {
+    const parse = (agent: string) => parseMcpExecutionDesign(fence(design({
+      requirements: [requirement({
+        assignment: { type: 'agent', targetAgents: [agent], targetId: null },
+        agentPermissions: { [agent]: ['github.issues.read'] },
+      })],
+      requirementContexts: [],
+    }))).design!.requirements[0].requirementKey
+
+    expect(parse('backend_dev')).toBe(parse('backend-dev'))
+    expect(parse('backend')).not.toBe(parse('frontend'))
+  })
+
+  it('does not infer a legacy binding when package aliases match multiple requirements', () => {
+    const parsed = parseMcpExecutionDesign(fence(design({
+      requirements: [
+        requirement({
+          assignment: { type: 'agent', targetAgents: ['backend_dev'], targetId: null },
+          agentPermissions: { backend_dev: ['github.issues.read'] },
+        }),
+        requirement({
+          assignment: { type: 'agent', targetAgents: ['backend-dev'], targetId: null },
+          agentPermissions: { 'backend-dev': ['github.issues.read'] },
+        }),
+      ],
+      requirementContexts: [],
+      mcpAwareSubtasks: [{
+        id: 'inspect', agent: 'backend-dev', dependsOn: [], mcpCapabilities: ['github.issues.read'],
+        inputs: [], outputs: [], verification: [], stoppingCondition: 'Done.', fallback: 'Ask user.',
+      }],
+    }))).design!
+
+    expect(parsed.mcpAwareSubtasks[0].capabilityBindings).toEqual([])
+    expect(validateMcpExecutionDesign(parsed, overview([healthyGithub]))).toMatchObject({
+      status: 'blocked',
+      blocked: expect.arrayContaining([expect.stringMatching(/exactly one explicit requirement binding/)]),
+    })
+  })
+
   it('fails closed when explicit subtask bindings omit a declared capability', () => {
     const parsed = parseMcpExecutionDesign(fence(design({
       requirements: [
@@ -123,7 +392,8 @@ describe('MCP execution design normalization', () => {
       }],
     }))).design!
 
-    expect(parsed.normalizationErrors?.join('\n')).toMatch(/filesystem\.project\.write.*exactly one requirement binding/)
+    expect(parsed.normalizationErrors?.join('\n')).toMatch(/declared capability without exactly one requirement binding/)
+    expect(parsed.mcpAwareSubtasks).toEqual([])
     expect(validateMcpExecutionDesign(parsed, overview([healthyGithub])).status).toBe('blocked')
   })
 
@@ -139,7 +409,7 @@ describe('MCP execution design normalization', () => {
       }))).design!
 
       expect(parsed.normalizationErrors?.join('\n')).toMatch(/capabilityRequirements must be an array/)
-      expect(parsed.mcpAwareSubtasks[0].capabilityBindings).toEqual([])
+      expect(parsed.mcpAwareSubtasks).toEqual([])
       expect(validateMcpExecutionDesign(parsed, overview([healthyGithub])).status).toBe('blocked')
     },
   )
@@ -153,9 +423,16 @@ describe('MCP execution design normalization', () => {
 
     expect(parsed.requirements).toEqual([])
     expect(parsed.mcpAwareSubtasks).toEqual([])
-    expect(parsed.normalizationErrors).toEqual([
+    expect(parsed.normalizationErrors).toEqual(expect.arrayContaining([
       'MCP requirement 0 is malformed and cannot be normalized.',
       'MCP-aware subtask 0 is malformed and cannot be normalized.',
+    ]))
+    expect(parsed.normalizationEvidence).toEqual([
+      expect.objectContaining({
+        category: 'normalization',
+        code: 'mcp_design_nested_policy_invalid',
+        message: expect.stringMatching(/invalid nested policy declaration/),
+      }),
     ])
     expect(validateMcpExecutionDesign(parsed, overview([healthyGithub]))).toMatchObject({
       status: 'blocked',
@@ -164,6 +441,45 @@ describe('MCP execution design normalization', () => {
         'MCP-aware subtask 0 is malformed and cannot be normalized.',
       ]),
     })
+  })
+
+  it.each([
+    ['malformed deferred requirement', {
+      requirements: [{
+        requirement: 'required',
+        mcpId: '',
+        agentPermissions: { backend: ['github.contents.write'] },
+      }],
+      requirementContexts: [],
+      mcpAwareSubtasks: [],
+    }, 'github.contents.write'],
+    ['malformed requirement context', {
+      requirementContexts: [{
+        sourceRequirementIndex: '0',
+        agent: 'backend',
+        promptOverlay: 'RAW-CONTEXT-SHOULD-NOT-BE-EVIDENCE',
+      }],
+    }, 'RAW-CONTEXT-SHOULD-NOT-BE-EVIDENCE'],
+    ['malformed nested subtask', {
+      mcpAwareSubtasks: [{
+        id: '',
+        agent: 'backend',
+        mcpCapabilities: ['github.contents.write'],
+      }],
+    }, 'github.contents.write'],
+  ] as const)('records bounded normalization evidence for %s', (_label, overrides, rawPolicyText) => {
+    const parsed = parseMcpExecutionDesign(fence(design(overrides))).design!
+
+    expect(parsed.normalizationErrors?.length).toBeGreaterThan(0)
+    expect(parsed.normalizationEvidence).toEqual([
+      expect.objectContaining({
+        schemaVersion: 1,
+        category: 'normalization',
+        code: 'mcp_design_nested_policy_invalid',
+      }),
+    ])
+    expect(JSON.stringify(parsed.normalizationEvidence)).not.toContain(rawPolicyText)
+    expect(validateMcpExecutionDesign(parsed, overview([healthyGithub])).status).toBe('blocked')
   })
 
   it('blocks nested policy overflow instead of dropping a trailing prohibition', () => {
@@ -182,10 +498,314 @@ describe('MCP execution design normalization', () => {
     }))).design!
 
     expect(parsed.normalizationErrors).toEqual(expect.arrayContaining([
-      expect.stringMatching(/permissions.*exceeds the maximum of 20/),
-      expect.stringMatching(/prohibitedCapabilities exceeds the maximum of 30/),
+      expect.stringMatching(/agentPermissions.*maximum raw count of 20/),
+      expect.stringMatching(/prohibitedCapabilities exceeds the maximum raw count of 30/),
     ]))
     expect(validateMcpExecutionDesign(parsed, overview([healthyFilesystem])).status).toBe('blocked')
+  })
+
+  it.each([
+    [undefined, 'github.contents.write'],
+    ['not-an-array', 'github.contents.write'],
+    [null, 'github.contents.write'],
+    [[...Array(30).fill('github.issues.read'), 'github.contents.write'], 'github.contents.write'],
+    [[...Array(29).fill('github.issues.read'), 42, 'github.contents.write'], 'github.contents.write'],
+    [[...Array(29).fill('github.issues.read'), 'x'.repeat(101), 'github.contents.write'], 'github.contents.write'],
+  ])('fails closed for malformed or overflowing subtask capability input %#', (mcpCapabilities, unsafeCapability) => {
+    const parsed = parseMcpExecutionDesign(fence(design({
+      mcpAwareSubtasks: [{
+        id: 'inspect', agent: 'backend', dependsOn: [], mcpCapabilities,
+        inputs: [], outputs: [], verification: [], stoppingCondition: 'Done.', fallback: 'Ask user.',
+      }],
+    }))).design!
+
+    expect(parsed.normalizationErrors?.length).toBeGreaterThan(0)
+    expect(validateMcpExecutionDesign(parsed, overview([healthyGithub])).status).toBe('blocked')
+    expect(parsed.mcpAwareSubtasks).toEqual([])
+    expect(JSON.stringify(parsed.mcpAwareSubtasks)).not.toContain(unsafeCapability)
+  })
+
+  it('accepts exactly thirty valid subtask capability entries before deduplication', () => {
+    const parsed = parseMcpExecutionDesign(fence(design({
+      mcpAwareSubtasks: [{
+        id: 'inspect', agent: 'backend', dependsOn: [],
+        mcpCapabilities: Array(30).fill('github.issues.read'),
+        inputs: [], outputs: [], verification: [], stoppingCondition: 'Done.', fallback: 'Ask user.',
+      }],
+    }))).design!
+
+    expect(parsed.normalizationErrors).toEqual([])
+    expect(parsed.mcpAwareSubtasks[0].mcpCapabilities).toEqual(['github.issues.read'])
+  })
+
+  it.each([
+    ['deferred', 'github.contents.write', []],
+    ['prohibited', 'github.issues.read', ['github.issues.read']],
+    ['malformed', 'github..read', []],
+    ['cross-MCP', 'filesystem.project.read', []],
+  ] as const)('fails closed when a %s capability appears at or beyond the subtask boundary', (
+    _label,
+    boundaryCapability,
+    prohibitedCapabilities,
+  ) => {
+    const parse = (prefixLength: number) => parseMcpExecutionDesign(fence(design({
+      requirements: [requirement({ prohibitedCapabilities })],
+      mcpAwareSubtasks: [{
+        id: 'inspect', agent: 'backend', dependsOn: [],
+        mcpCapabilities: [...Array(prefixLength).fill('github.issues.read'), boundaryCapability],
+        inputs: [], outputs: [], verification: [], stoppingCondition: 'Done.', fallback: 'Ask user.',
+      }],
+    }))).design!
+
+    const atBoundary = parse(29)
+    const beyondBoundary = parse(30)
+    expect(atBoundary.normalizationErrors).toEqual([])
+    expect(beyondBoundary.normalizationErrors).toEqual(expect.arrayContaining([
+      expect.stringMatching(/mcpCapabilities exceeds the maximum raw count of 30/),
+    ]))
+    expect(atBoundary.mcpAwareSubtasks[0].mcpCapabilities).toContain(boundaryCapability)
+    expect(beyondBoundary.mcpAwareSubtasks).toEqual([])
+    for (const parsed of [atBoundary, beyondBoundary]) {
+      expect(validateMcpExecutionDesign(parsed, overview([healthyGithub, healthyFilesystem])).status).toBe('blocked')
+      expect(deriveMcpGrantDecisions(parsed, overview([healthyGithub, healthyFilesystem]))).toMatchObject({
+        admissionStatus: 'blocked',
+        primaryRecoveryAction: 'revise_plan',
+      })
+    }
+  })
+
+  it.each([
+    ['not json', 'parse'],
+    [JSON.stringify([]), 'shape'],
+    [JSON.stringify({ schemaVersion: 1, requirements: {}, promptOverlays: {}, mcpAwareSubtasks: [] }), 'shape'],
+    [JSON.stringify({ schemaVersion: 1, requirements: [], promptOverlays: {}, requirementContexts: {}, mcpAwareSubtasks: [] }), 'shape'],
+    [JSON.stringify({ schemaVersion: 1, requirements: [], promptOverlays: {}, mcpAwareSubtasks: {} }), 'shape'],
+  ] as const)('blocks a supplied malformed exact MCP design fence: %s', (jsonBlock, category) => {
+    const parsed = parseMcpExecutionDesign(`# Plan\n\`\`\`mcp_execution_design_json\n${jsonBlock}\n\`\`\``)
+
+    expect(parsed.planText).toBe('# Plan')
+    expect(parsed.design?.normalizationErrors?.[0]).toMatch(/must be regenerated/)
+    expect(parsed.design?.normalizationEvidence).toEqual([
+      expect.objectContaining({ schemaVersion: 1, category, code: expect.any(String) }),
+    ])
+    expect(validateMcpExecutionDesign(parsed.design, overview([])).status).toBe('blocked')
+  })
+
+  it.each([
+    ['deny first', String.raw`{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Read issues.","assignment":{"type":"agent","targetAgents":["backend"],"targetId":null},"agentPermissions":{"backend":["github.issues.read"]},"prohibitedCapabilities":["github.issues.read"],"prohibitedCapabilities":[],"fallback":{"action":"block","message":"Stop."}}],"promptOverlays":{},"requirementContexts":[],"mcpAwareSubtasks":[]}`],
+    ['deny last', String.raw`{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Read issues.","assignment":{"type":"agent","targetAgents":["backend"],"targetId":null},"agentPermissions":{"backend":["github.issues.read"]},"prohibitedCapabilities":[],"prohibitedCapabilities":["github.issues.read"],"fallback":{"action":"block","message":"Stop."}}],"promptOverlays":{},"requirementContexts":[],"mcpAwareSubtasks":[]}`],
+  ] as const)('blocks duplicate prohibitedCapabilities independent of member order: %s', (_label, jsonBlock) => {
+    const parsed = parseMcpExecutionDesign(`# Plan\n${rawFence(jsonBlock)}`)
+
+    expect(parsed.planText).toBe('# Plan')
+    expect(parsed.planText).not.toContain('prohibitedCapabilities')
+    expect(parsed.design).toMatchObject({
+      requirements: [],
+      normalizationErrors: ['The supplied MCP execution design fence contains duplicate JSON object keys and must be regenerated.'],
+      normalizationEvidence: [{
+        schemaVersion: 1,
+        category: 'parse',
+        code: 'mcp_design_json_duplicate_object_key',
+      }],
+    })
+    expect(validateMcpExecutionDesign(parsed.design, overview([healthyGithub])).status).toBe('blocked')
+  })
+
+  it.each([
+    ['agent permission', String.raw`{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Read issues.","assignment":{"type":"agent","targetAgents":["backend"],"targetId":null},"agentPermissions":{"backend":["github.issues.read"],"backend":[]},"prohibitedCapabilities":[],"fallback":{"action":"block","message":"Stop."}}],"promptOverlays":{},"requirementContexts":[],"mcpAwareSubtasks":[]}`],
+    ['nested fallback', String.raw`{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Read issues.","assignment":{"type":"agent","targetAgents":["backend"],"targetId":null},"agentPermissions":{"backend":["github.issues.read"]},"prohibitedCapabilities":[],"fallback":{"action":"block","action":"continue_without_mcp","message":"Stop."}}],"promptOverlays":{},"requirementContexts":[],"mcpAwareSubtasks":[]}`],
+    ['nested assignment', String.raw`{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Read issues.","assignment":{"type":"agent","type":"architect_only","targetAgents":["backend"],"targetId":null},"agentPermissions":{"backend":["github.issues.read"]},"prohibitedCapabilities":[],"fallback":{"action":"block","message":"Stop."}}],"promptOverlays":{},"requirementContexts":[],"mcpAwareSubtasks":[]}`],
+    ['identical values', String.raw`{"schemaVersion":1,"schemaVersion":1,"requirements":[],"promptOverlays":{},"requirementContexts":[],"mcpAwareSubtasks":[]}`],
+    ['escaped-equivalent names', String.raw`{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Read issues.","assignment":{"type":"agent","targetAgents":["backend"],"targetId":null},"agentPermissions":{"backend":["github.issues.read"]},"prohibitedCapabilities":["github.issues.read"],"prohibitedCapabilit\u0069es":[],"fallback":{"action":"block","message":"Stop."}}],"promptOverlays":{},"requirementContexts":[],"mcpAwareSubtasks":[]}`],
+  ] as const)('blocks duplicate decoded JSON object keys at every nesting level: %s', (_label, jsonBlock) => {
+    const parsed = parseMcpExecutionDesign(rawFence(jsonBlock))
+
+    expect(parsed.design?.requirements).toEqual([])
+    expect(parsed.design?.normalizationEvidence).toEqual([
+      expect.objectContaining({ category: 'parse', code: 'mcp_design_json_duplicate_object_key' }),
+    ])
+  })
+
+  it('keeps duplicate-key evidence generic and bounded', () => {
+    const secretKey = 'sk_live_SUPER_SECRET_POLICY_KEY'
+    const parsed = parseMcpExecutionDesign(rawFence(String.raw`{"schemaVersion":1,"requirements":[],"promptOverlays":{},"requirementContexts":[],"mcpAwareSubtasks":[],"${secretKey}":1,"${secretKey}":2}`))
+    const evidence = JSON.stringify({
+      errors: parsed.design?.normalizationErrors,
+      evidence: parsed.design?.normalizationEvidence,
+    })
+
+    expect(evidence).not.toContain(secretKey)
+    expect(evidence.length).toBeLessThan(500)
+  })
+
+  it('allows repeated array values because they are not duplicate object members', () => {
+    const parsed = parseMcpExecutionDesign(fence(design({
+      requirements: [requirement({
+        agentPermissions: { backend: ['github.issues.read', 'github.issues.read'] },
+        prohibitedCapabilities: ['github.pull_requests.merge', 'github.pull_requests.merge'],
+      })],
+    }))).design!
+
+    expect(parsed.normalizationErrors).toEqual([])
+    expect(parsed.requirements[0].agentPermissions.backend).toEqual(['github.issues.read'])
+    expect(parsed.requirements[0].prohibitedCapabilities).toEqual(['github.pull_requests.merge'])
+  })
+
+  it('keeps a genuinely absent MCP design warning-only', () => {
+    const parsed = parseMcpExecutionDesign('# Plan\nNo MCP policy was supplied.')
+    expect(parsed.design).toBeNull()
+    expect(validateMcpExecutionDesign(parsed.design, overview([]))).toMatchObject({
+      status: 'warnings',
+      blocked: [],
+    })
+  })
+
+  it('blocks an unterminated exact MCP design fence but ignores an incomplete generic fence', () => {
+    const exact = parseMcpExecutionDesign('# Plan\n```mcp_execution_design_json\n{"schemaVersion":1')
+    expect(exact.planText).toBe('# Plan')
+    expect(exact.design?.normalizationErrors?.[0]).toMatch(/incomplete/)
+    expect(exact.design?.normalizationEvidence).toEqual([
+      expect.objectContaining({ category: 'parse', code: 'mcp_design_fence_incomplete' }),
+    ])
+    expect(validateMcpExecutionDesign(exact.design, overview([])).status).toBe('blocked')
+
+    const genericText = '# Plan\n```json\n{"schemaVersion":1'
+    expect(parseMcpExecutionDesign(genericText)).toEqual({
+      planText: genericText,
+      design: null,
+    })
+  })
+
+  it.each(['valid-first', 'malformed-first'] as const)(
+    'rejects every exact declaration when valid and malformed fences are both present: %s',
+    (order) => {
+      const validFence = fence(design())
+      const malformedFence = '```mcp_execution_design_json\n{"schemaVersion":1,not-json}\n```'
+      const declarations = order === 'valid-first'
+        ? [validFence, malformedFence]
+        : [malformedFence, validFence]
+      const parsed = parseMcpExecutionDesign([
+        '# Plan',
+        declarations[0],
+        'Keep this plan prose.',
+        declarations[1],
+        'Keep this conclusion.',
+      ].join('\n'))
+
+      expect(parsed.planText).toContain('# Plan')
+      expect(parsed.planText).toContain('Keep this plan prose.')
+      expect(parsed.planText).toContain('Keep this conclusion.')
+      expect(parsed.planText).not.toContain('mcp_execution_design_json')
+      expect(parsed.planText).not.toContain('github.issues.read')
+      expect(parsed.design).toMatchObject({
+        requirements: [],
+        mcpAwareSubtasks: [],
+        normalizationErrors: ['Multiple exact MCP execution design fences were supplied; all policy declarations were rejected.'],
+        normalizationEvidence: [{
+          category: 'shape',
+          code: 'mcp_design_multiple_exact_fences',
+        }],
+      })
+    },
+  )
+
+  it.each(['valid-first', 'incomplete-first'] as const)(
+    'rejects every exact declaration when valid and incomplete fences are both present: %s',
+    (order) => {
+      const validFence = fence(design())
+      const incompleteFence = '```mcp_execution_design_json\n{"schemaVersion":1'
+      const raw = order === 'valid-first'
+        ? `# Plan\n${validFence}\n${incompleteFence}`
+        : `# Plan\n${incompleteFence}\n${validFence}`
+      const parsed = parseMcpExecutionDesign(raw)
+
+      expect(parsed.planText).toBe('# Plan')
+      expect(parsed.planText).not.toContain('mcp_execution_design_json')
+      expect(parsed.design).toMatchObject({
+        requirements: [],
+        normalizationErrors: ['Multiple exact MCP execution design fences were supplied; all policy declarations were rejected.'],
+        normalizationEvidence: [{ code: 'mcp_design_multiple_exact_fences' }],
+      })
+    },
+  )
+
+  it.each([
+    ['requirement enum', { requirements: [requirement({ requirement: 'sometimes' })] }],
+    ['assignment enum', { requirements: [requirement({ assignment: { type: 'root', targetAgents: ['backend'], targetId: null } })] }],
+    ['fallback enum', { requirements: [requirement({ fallback: { action: 'allow', message: 'Unsafe.' } })] }],
+    ['overlong requirement reason', { requirements: [requirement({ reason: 'x'.repeat(361) })] }],
+  ] as const)('tombstones a current-schema requirement with invalid raw %s', (_label, overrides) => {
+    const parsed = parseMcpExecutionDesign(fence(design(overrides))).design!
+
+    expect(parsed.requirements).toEqual([])
+    expect(parsed.normalizationErrors?.length).toBeGreaterThan(0)
+    expect(parsed.normalizationEvidence).toEqual([
+      expect.objectContaining({ category: 'normalization', code: 'mcp_design_nested_policy_invalid' }),
+    ])
+    expect(validateMcpExecutionDesign(parsed, overview([healthyGithub])).status).toBe('blocked')
+  })
+
+  it.each([
+    ['requirements', { requirements: Array.from({ length: 21 }, () => requirement()) }, /requirements exceeds the maximum raw count of 20/],
+    ['requirementContexts', { requirementContexts: Array.from({ length: 121 }, () => ({ sourceRequirementIndex: 0, agent: 'backend', promptOverlay: 'Context.' })) }, /requirementContexts exceeds the maximum raw count of 120/],
+    ['mcpAwareSubtasks', { mcpAwareSubtasks: Array.from({ length: 41 }, (_, index) => ({
+      id: `inspect-${index}`, agent: 'backend', dependsOn: [], mcpCapabilities: ['github.issues.read'],
+      inputs: [], outputs: [], verification: [], stoppingCondition: 'Done.', fallback: 'Ask user.',
+    })) }, /subtasks exceeds the maximum raw count of 40/],
+  ] as const)('checks the %s bound before iterating policy entries', (_label, overrides, errorPattern) => {
+    const parsed = parseMcpExecutionDesign(fence(design(overrides))).design!
+
+    expect(parsed.normalizationErrors?.join('\n')).toMatch(errorPattern)
+    expect(parsed.normalizationEvidence).toEqual([
+      expect.objectContaining({ category: 'normalization' }),
+    ])
+    expect(validateMcpExecutionDesign(parsed, overview([healthyGithub])).status).toBe('blocked')
+  })
+
+  it('rejects capabilityRequirements overflow before binding iteration', () => {
+    const parsed = parseMcpExecutionDesign(fence(design({
+      mcpAwareSubtasks: [{
+        id: 'inspect', agent: 'backend', dependsOn: [], mcpCapabilities: ['github.issues.read'],
+        capabilityRequirements: Array.from({ length: 31 }, () => ({ capability: 'github.issues.read', sourceRequirementIndex: 0 })),
+        inputs: [], outputs: [], verification: [], stoppingCondition: 'Done.', fallback: 'Ask user.',
+      }],
+    }))).design!
+
+    expect(parsed.mcpAwareSubtasks).toEqual([])
+    expect(parsed.normalizationErrors?.join('\n')).toMatch(/capabilityRequirements exceeds the maximum raw count of 30/)
+  })
+
+  it('never includes Architect-controlled secret-like identifiers in normalization errors or evidence', () => {
+    const secretId = 'sk_live_SUPER_SECRET_SUBTASK'
+    const secretMcpId = 'secret_mcp_SUPER_SECRET'
+    const secretAgent = 'secret_agent_SUPER_SECRET'
+    const parsed = parseMcpExecutionDesign(fence(design({
+      requirements: [requirement({ mcpId: secretMcpId, requirement: 'invalid-enum' })],
+      requirementContexts: [{
+        sourceRequirementIndex: 0,
+        agent: secretAgent,
+        promptOverlay: 'token=SUPER_SECRET_CONTEXT',
+      }],
+      mcpAwareSubtasks: [{
+        id: secretId,
+        agent: secretAgent,
+        dependsOn: [],
+        mcpCapabilities: ['github.issues.read'],
+        capabilityRequirements: 'invalid',
+        inputs: [], outputs: [], verification: [], stoppingCondition: 'Done.', fallback: 'Ask user.',
+      }],
+    }))).design!
+    const boundedEvidence = JSON.stringify({
+      normalizationErrors: parsed.normalizationErrors,
+      normalizationEvidence: parsed.normalizationEvidence,
+    })
+
+    expect(parsed.requirements).toEqual([])
+    expect(parsed.mcpAwareSubtasks).toEqual([])
+    expect(boundedEvidence).not.toContain(secretId)
+    expect(boundedEvidence).not.toContain(secretMcpId)
+    expect(boundedEvidence).not.toContain(secretAgent)
+    expect(boundedEvidence).not.toContain('SUPER_SECRET_CONTEXT')
   })
 
   it('fails closed instead of assigning an ambiguous legacy overlay', () => {
@@ -209,7 +829,7 @@ describe('MCP execution design normalization', () => {
     }))).design!
 
     expect(parsed.normalizationErrors).toEqual([
-      "MCP 'github' requirement does not target any valid agent.",
+      'MCP requirement 0 does not target any valid agent.',
     ])
     expect(validateMcpExecutionDesign(parsed, overview([healthyGithub]))).toMatchObject({
       status: 'blocked',
@@ -232,6 +852,70 @@ describe('canonical admission adapters', () => {
       health: { schemaVersion: 1, observed: true, checkedAt: healthyGithub.checkedAt },
       grantState: { phase: 'not_issued' },
     })
+  })
+
+  it('partitions separator aliases as one materialized package with package-wide deny-wins policy', () => {
+    const parsed = parseMcpExecutionDesign(fence(design({
+      requirements: [
+        requirement({
+          assignment: { type: 'agent', targetAgents: ['backend_dev'], targetId: null },
+          agentPermissions: { backend_dev: ['github.issues.read'] },
+          prohibitedCapabilities: [],
+        }),
+        requirement({
+          assignment: { type: 'agent', targetAgents: ['backend-dev'], targetId: null },
+          agentPermissions: {},
+          prohibitedCapabilities: ['github.issues.read'],
+        }),
+      ],
+      requirementContexts: [
+        { sourceRequirementIndex: 0, agent: 'backend_dev', promptOverlay: 'Use issue context.' },
+        { sourceRequirementIndex: 1, agent: 'backend-dev', promptOverlay: 'Use issue context.' },
+      ],
+    }))).design!
+
+    const validation = validateMcpExecutionDesign(parsed, overview([healthyGithub]))
+    const preview = deriveMcpGrantDecisions(parsed, overview([healthyGithub]))
+    expect(validation.status).toBe('blocked')
+    expect(preview).toMatchObject({
+      admissionStatus: 'blocked',
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+    })
+    expect(preview.decisions.map((decision) => decision.agent)).toEqual(['backend-dev', 'backend-dev'])
+  })
+
+  it('keeps genuinely distinct package roles independently partitioned', () => {
+    const parsed = parseMcpExecutionDesign(fence(design({
+      requirements: [
+        requirement({
+          assignment: { type: 'agent', targetAgents: ['backend'], targetId: null },
+          agentPermissions: { backend: ['github.issues.read'] },
+          prohibitedCapabilities: [],
+        }),
+        requirement({
+          assignment: { type: 'agent', targetAgents: ['frontend'], targetId: null },
+          agentPermissions: { frontend: ['github.issues.read'] },
+          prohibitedCapabilities: [],
+        }),
+        requirement({
+          assignment: { type: 'agent', targetAgents: ['frontend'], targetId: null },
+          agentPermissions: {},
+          prohibitedCapabilities: ['github.issues.read'],
+        }),
+      ],
+      requirementContexts: [
+        { sourceRequirementIndex: 0, agent: 'backend', promptOverlay: 'Use issue context.' },
+        { sourceRequirementIndex: 1, agent: 'frontend', promptOverlay: 'Use issue context.' },
+        { sourceRequirementIndex: 2, agent: 'frontend', promptOverlay: 'Use issue context.' },
+      ],
+    }))).design!
+
+    const preview = deriveMcpGrantDecisions(parsed, overview([healthyGithub]))
+    expect(preview.decisions.find((decision) => decision.agent === 'backend')).toMatchObject({ admissionStatus: 'allowed' })
+    expect(preview.decisions.filter((decision) => decision.agent === 'frontend')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ admissionStatus: 'blocked' }),
+    ]))
   })
 
   it('keeps multi-MCP subtask bindings distinct and blocks missing coverage', () => {
@@ -534,6 +1218,38 @@ describe('canonical admission adapters', () => {
       retryable: false,
       blocked: ['MCP requirement 0 is malformed and cannot be normalized.'],
     })
+  })
+
+  it('uses a normalization reason instead of stale canonical decision evidence for mixed blockers', () => {
+    const normalizationError = 'MCP requirement 0 is malformed and cannot be normalized.'
+    const broker = evaluateWorkPackageMcpBroker({
+      assignedRole: 'backend',
+      title: 'Backend package',
+      mcpRequirements: [{
+        requirementKey: 'deferred-write',
+        sourceRequirementIndex: 0,
+        agent: 'backend',
+        mcpId: 'github',
+        requirement: 'required',
+        permissions: ['github.contents.write'],
+        prohibitedCapabilities: [],
+        assignment: { type: 'agent', targetId: null },
+        fallback: { action: 'block', message: '' },
+      }],
+      metadata: {
+        mcpGrantsSchemaVersion: 2,
+        mcpNormalizationErrors: [normalizationError],
+      },
+    })
+
+    expect(broker).toMatchObject({
+      status: 'blocked',
+      blocked: [normalizationError, expect.stringContaining('deferred live MCP capabilities')],
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+      retryable: false,
+    })
+    expect(broker.primaryDecision).toBeUndefined()
   })
 
   it('blocks grant-only data as unknown_legacy', () => {

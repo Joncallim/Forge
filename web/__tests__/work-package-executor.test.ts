@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   dbUpdate: vi.fn(),
   dbUpdateSet: vi.fn(),
   dbUpdateWhere: vi.fn(),
+  buildExecutionContextPacket: vi.fn(),
   generateText: vi.fn(),
   getModel: vi.fn(),
   publishTaskEvent: vi.fn(),
@@ -38,6 +39,15 @@ vi.mock('@/worker/events', () => ({
 vi.mock('@/worker/task-logs', () => ({
   recordTaskLogBestEffort: mocks.recordTaskLogBestEffort,
 }))
+
+vi.mock('@/worker/execution-context-packet', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/worker/execution-context-packet')>()
+  mocks.buildExecutionContextPacket.mockImplementation(actual.buildExecutionContextPacket)
+  return {
+    ...actual,
+    buildExecutionContextPacket: mocks.buildExecutionContextPacket,
+  }
+})
 
 import {
   executeWorkPackage,
@@ -605,6 +615,124 @@ describe('executeWorkPackage', () => {
         capabilities: ['filesystem.project.read', 'filesystem.project.search'],
         mode: 'read_only_context_packet',
         runtimeEnforcement: 'bounded_context_packet',
+        runtimeIssued: true,
+        status: 'issued',
+      },
+    })
+  })
+
+  it('continues without repository context when a stale approved read grant meets only a write planning requirement', async () => {
+    await fs.writeFile(path.join(tempRoot, 'PRIVATE.md'), 'must not enter runtime context\n')
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Continued with planning-only write instructions.',
+        files: [{ path: 'package.json', content: '{}' }],
+        commands: [],
+      }),
+    })
+
+    const result = await executeWorkPackage(context({
+      workPackage: {
+        ...context().workPackage,
+        assignedRole: 'backend',
+        mcpRequirements: [{
+          mcpId: 'filesystem',
+          requirement: 'required',
+          capabilities: ['filesystem.project.write'],
+          fallback: { action: 'block' },
+        }],
+        metadata: {
+          mcpGrantPhases: {
+            effective: {
+              schemaVersion: 1,
+              phase: 'effective',
+              runtimeEnforcement: 'bounded_context_packet',
+              source: 'explicit-grant-approval',
+              status: 'approved',
+              grants: [{
+                mcpId: 'filesystem',
+                status: 'approved',
+                capabilities: ['filesystem.project.read'],
+              }],
+            },
+          },
+        },
+      },
+    }))
+
+    expect(mocks.generateText).toHaveBeenCalledOnce()
+    expect(mocks.buildExecutionContextPacket).not.toHaveBeenCalled()
+    expect(mocks.generateText.mock.calls[0][0].prompt).not.toContain('PRIVATE.md')
+    expect(mocks.generateText.mock.calls[0][0].prompt).toContain('does not issue live MCP runtime tools')
+    expect(result.executionContextPacket).toMatchObject({
+      files: [],
+      totals: { includedFiles: 0, includedBytes: 0 },
+    })
+    expect(result.executionContextArtifactMetadata).toMatchObject({
+      filesystemMcpRuntime: {
+        planningVisibleCapabilities: ['filesystem.project.write'],
+        requestedCapabilities: ['filesystem.project.write'],
+        runtimeIssued: false,
+        status: 'not_issued_optional',
+      },
+    })
+    expect(mocks.dbInsertValues).toHaveBeenCalledWith(expect.objectContaining({
+      fileCount: 0,
+      requestedCapabilities: ['filesystem.project.write'],
+      status: 'not_issued_optional',
+    }))
+  })
+
+  it('issues only approved read context for an explicit read plus planning-write requirement', async () => {
+    await fs.writeFile(path.join(tempRoot, 'README.md'), 'approved project context\n')
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Used approved read context.',
+        files: [{ path: 'package.json', content: '{}' }],
+        commands: [],
+      }),
+    })
+
+    const result = await executeWorkPackage(context({
+      workPackage: {
+        ...context().workPackage,
+        assignedRole: 'backend',
+        mcpRequirements: [{
+          mcpId: 'filesystem',
+          requirement: 'required',
+          capabilities: ['filesystem.project.read', 'filesystem.project.write'],
+          fallback: { action: 'block' },
+        }],
+        metadata: {
+          mcpGrantPhases: {
+            effective: {
+              schemaVersion: 1,
+              phase: 'effective',
+              runtimeEnforcement: 'bounded_context_packet',
+              source: 'explicit-grant-approval',
+              status: 'approved',
+              grants: [{
+                mcpId: 'filesystem',
+                status: 'approved',
+                capabilities: ['filesystem.project.read'],
+              }],
+            },
+          },
+        },
+      },
+    }))
+
+    expect(mocks.generateText.mock.calls[0][0].prompt).toContain('File: README.md')
+    expect(mocks.buildExecutionContextPacket).toHaveBeenCalledOnce()
+    expect(result.executionContextArtifactMetadata).toMatchObject({
+      filesystemMcpRuntime: {
+        capabilities: ['filesystem.project.read'],
+        missingRequestedCapabilities: [],
+        omittedOptionalCapabilities: [],
+        planningVisibleCapabilities: ['filesystem.project.read', 'filesystem.project.write'],
+        requestedCapabilities: ['filesystem.project.read', 'filesystem.project.write'],
         runtimeIssued: true,
         status: 'issued',
       },

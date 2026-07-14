@@ -82,6 +82,10 @@ export function buildMcpBrokerBlockMetadata(input: {
       mode: input.check.primaryMode ?? null,
       nextAutoRetryAt,
       primaryMode: input.check.primaryMode ?? null,
+      primaryDecision: input.check.primaryDecision ? {
+        ...input.check.primaryDecision,
+        evidenceRefs: [...input.check.primaryDecision.evidenceRefs],
+      } : null,
       primaryRecoveryAction: input.check.primaryRecoveryAction ?? null,
       recoveryAction: input.check.primaryRecoveryAction ?? null,
       retryable: input.check.retryable,

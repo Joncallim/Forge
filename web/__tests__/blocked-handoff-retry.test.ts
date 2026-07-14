@@ -133,6 +133,7 @@ describe('blocked handoff retry helper', () => {
         primaryMode: check.primaryMode,
         recoveryAction: check.primaryRecoveryAction,
         primaryRecoveryAction: check.primaryRecoveryAction,
+        primaryDecision: check.primaryDecision,
         retryable: check.retryable,
         decisions: [expect.objectContaining({
           kind: 'requirement',

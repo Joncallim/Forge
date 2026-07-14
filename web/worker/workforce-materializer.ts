@@ -15,6 +15,7 @@ import {
   projectFilesystemEffectivePhase,
   projectFilesystemGrantCovers,
 } from '../lib/mcps/filesystem-grants'
+import { canonicalAgentPackageIdentity } from '../lib/mcps/agent-package-identity'
 import type { PreparedArchitectArtifact } from './architect-artifact'
 import type { ReviewRequirement } from './agent-breakdown'
 import { isImplementationPackageRole } from './review-gates'
@@ -67,7 +68,7 @@ function normalizeAgentType(role: string): string {
 }
 
 function normalizeRoleLookup(value: string): string {
-  return normalizeAgentType(value).replace(/_/g, '-')
+  return canonicalAgentPackageIdentity(value)
 }
 
 function displayNameForSlug(slug: string): string {
@@ -143,15 +144,14 @@ function roleMatches(value: string, agentType: string, aliases: string[]): boole
     aliases.some((alias) => normalizeRoleLookup(alias) === normalized)
 }
 
-function firstMatchingObjectValue<T>(
+function matchingObjectValues<T>(
   object: Record<string, T>,
   agentType: string,
   aliases: string[],
-): T | undefined {
-  for (const [key, value] of Object.entries(object)) {
-    if (roleMatches(key, agentType, aliases)) return value
-  }
-  return undefined
+): T[] {
+  return Object.entries(object)
+    .filter(([key]) => roleMatches(key, agentType, aliases))
+    .map(([, value]) => value)
 }
 
 function mcpGrantsForAgent(prepared: PreparedArchitectArtifact, agentType: string, aliases: string[]): JsonObject[] {
@@ -161,7 +161,7 @@ function mcpGrantsForAgent(prepared: PreparedArchitectArtifact, agentType: strin
       requirementKey: decision.requirementKey,
       decisionId: decision.decisionId,
       sourceRequirementIndex: decision.sourceRequirementIndex,
-      agent: decision.agent,
+      agent: agentType,
       mcpId: decision.mcpId,
       capabilities: decision.capabilities,
       normalizedCapabilities: decision.normalizedCapabilities ?? decision.capabilities,
@@ -194,16 +194,12 @@ function mcpRequirementsForAgent(prepared: PreparedArchitectArtifact, agentType:
     .map((requirement, index) => ({
       requirementKey: requirement.requirementKey,
       sourceRequirementIndex: requirement.sourceRequirementIndex ?? index,
-      agent: firstMatchingObjectValue(
-        Object.fromEntries(requirementAgentsForMaterialization(requirement).map((agent) => [agent, agent])),
-        agentType,
-        aliases,
-      ) ?? agentType,
+      agent: agentType,
       mcpId: requirement.mcpId,
       requirement: requirement.requirement,
       reason: requirement.reason,
       assignment: requirement.assignment,
-      permissions: firstMatchingObjectValue(requirement.agentPermissions, agentType, aliases) ?? [],
+      permissions: [...new Set(matchingObjectValues(requirement.agentPermissions, agentType, aliases).flat())].sort(),
       prohibitedCapabilities: requirement.prohibitedCapabilities,
       fallback: requirement.fallback,
     }))
@@ -227,7 +223,7 @@ function mcpRequirementContextsForAgent(
   if (!design) return []
   return (design.requirementContexts ?? [])
     .filter((context) => roleMatches(context.agent, agentType, aliases))
-    .map((context) => ({ ...context }))
+    .map((context) => ({ ...context, agent: agentType }))
 }
 
 function mcpSubtasksForAgent(prepared: PreparedArchitectArtifact, agentType: string, aliases: string[]): JsonObject[] {
@@ -238,7 +234,7 @@ function mcpSubtasksForAgent(prepared: PreparedArchitectArtifact, agentType: str
     .filter((subtask) => roleMatches(subtask.agent, agentType, aliases))
     .map((subtask) => ({
       id: subtask.id,
-      agent: subtask.agent,
+      agent: agentType,
       dependsOn: subtask.dependsOn,
       mcpCapabilities: subtask.mcpCapabilities,
       capabilityBindings: subtask.capabilityBindings ?? [],
@@ -257,6 +253,13 @@ function planningOnlyHarnessMetadata(): JsonObject {
     runtimePolicyApplied: false,
     note: 'Harness records shape planning for beta handoff only; it is not wired as a runtime tool or MCP policy.',
   }
+}
+
+function mcpNormalizationEvidence(
+  prepared: PreparedArchitectArtifact,
+): JsonObject[] {
+  return (prepared.mcpExecutionDesign.proposed?.normalizationEvidence ?? [])
+    .map((evidence) => ({ ...evidence }))
 }
 
 function mcpGrantPhaseMetadata(input: {
@@ -366,6 +369,7 @@ export function buildWorkforceMaterializationRows(
           artifactId: input.artifactId,
           mcpGrantsSchemaVersion: 2,
           mcpNormalizationErrors: [...(input.prepared.mcpExecutionDesign.proposed?.normalizationErrors ?? [])],
+          mcpNormalizationEvidence: mcpNormalizationEvidence(input.prepared),
           unresolvedAgentRole: agent.role,
           requiresAgentConfiguration: true,
         },
@@ -411,6 +415,7 @@ export function buildWorkforceMaterializationRows(
       mcpGrants,
       mcpGrantsSchemaVersion: 2,
       mcpNormalizationErrors: [...(input.prepared.mcpExecutionDesign.proposed?.normalizationErrors ?? [])],
+      mcpNormalizationEvidence: mcpNormalizationEvidence(input.prepared),
       mcpGrantPhases: mcpGrantPhaseMetadata({
         grants: mcpGrants,
         validationStatus: input.prepared.mcpExecutionDesign.validation.status,
@@ -480,6 +485,7 @@ export function buildWorkforceMaterializationRows(
         harnessIds: harnesses.map((harness) => harness.id),
         mcpExecutionStatus: input.prepared.mcpExecutionDesign.validation.status,
         mcpNormalizationErrors: [...(input.prepared.mcpExecutionDesign.proposed?.normalizationErrors ?? [])],
+        mcpNormalizationEvidence: mcpNormalizationEvidence(input.prepared),
       },
     },
   }

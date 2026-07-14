@@ -1923,6 +1923,52 @@ describe('admitWorkPackageMcp', () => {
     expect(admitPackage().aggregate).toMatchObject({ status: 'allowed', retryable: false })
   })
 
+  it.each([
+    ['filesystem first', ['filesystem', 'github']],
+    ['github first', ['github', 'filesystem']],
+  ] as const)('selects one precedence-consistent primary blocker with evidence: %s', (_label, order) => {
+    const entries = {
+      filesystem: rawEntry({
+        requirementKey: 'a-fs',
+        sourceRequirementIndex: 0,
+        evidenceRefs: ['filesystem-proof'],
+      }),
+      github: rawEntry({
+        requirementKey: 'z-gh',
+        sourceRequirementIndex: 1,
+        mcpId: 'github',
+        capabilities: ['github.contents.write'],
+        evidenceRefs: ['github-proof'],
+      }),
+    }
+    const admission = admitPackage({
+      entries: order.map((key) => entries[key]),
+      effectiveGrantFor: () => noGrant,
+    })
+
+    expect(admission.aggregate.blocked[0]).toContain('Filesystem context approval is required')
+    expect(admission.aggregate).toMatchObject({
+      primaryMode: 'deferred_live_mcp',
+      primaryRecoveryAction: 'revise_plan',
+      primaryDecision: {
+        kind: 'requirement',
+        mode: 'deferred_live_mcp',
+        recoveryAction: 'revise_plan',
+        requirementKey: 'z-gh',
+        decisionId: expect.any(String),
+        reason: expect.stringContaining('deferred live MCP capabilities'),
+        evidenceRefs: ['github-proof'],
+      },
+    })
+    expect(admissionToGrantPreview(admission).primaryDecision).toEqual(admission.aggregate.primaryDecision)
+    expect(admissionToBrokerCheck(admission).primaryDecision).toEqual(admission.aggregate.primaryDecision)
+    expect(admissionToBrokerCheck(admission)).toMatchObject({
+      primaryMode: admission.aggregate.primaryDecision?.mode,
+      primaryRecoveryAction: admission.aggregate.primaryDecision?.recoveryAction,
+      retryable: false,
+    })
+  })
+
   it('passes each requirement exact bounded capabilities to grant resolution and names them in failures', () => {
     const calls: Array<{ requirementKey: string; requiredCapabilities: string[] }> = []
     const admission = admitPackage({

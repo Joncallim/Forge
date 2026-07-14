@@ -30,6 +30,11 @@ const FILESYSTEM_PROJECT_CAPABILITY_SET = new Set<string>(FILESYSTEM_PROJECT_CAP
 
 export type FilesystemCapabilitySummary = {
   blockingCapabilities: FilesystemProjectCapability[]
+  /** Capabilities kept in the plan/operator projection, including write. */
+  planningVisibleCapabilities: FilesystemProjectRequestCapability[]
+  /** Capabilities that may activate a bounded read-only runtime packet. */
+  boundedRuntimeRequestedCapabilities: FilesystemProjectCapability[]
+  /** Compatibility alias for the planning-visible capability projection. */
   requestedCapabilities: FilesystemProjectRequestCapability[]
 }
 
@@ -153,7 +158,8 @@ export function summarizeFilesystemCapabilities(input: {
   projectMcpConfig?: unknown
 }): FilesystemCapabilitySummary {
   const admission = filesystemProjectionAdmission(input)
-  const requested = new Set<FilesystemProjectRequestCapability>()
+  const planningVisible = new Set<FilesystemProjectRequestCapability>()
+  const boundedRuntimeRequested = new Set<FilesystemProjectCapability>()
   const blocking = new Set<FilesystemProjectCapability>()
 
   for (const evaluation of admission.evaluations) {
@@ -161,7 +167,8 @@ export function summarizeFilesystemCapabilities(input: {
     for (const value of evaluation.decision.normalizedCapabilities) {
       const capability = filesystemRequestedCapability(value)
       if (!capability) continue
-      requested.add(capability)
+      planningVisible.add(capability)
+      if (capability !== 'filesystem.project.write') boundedRuntimeRequested.add(capability)
       if (
         capability !== 'filesystem.project.write' &&
         evaluation.decision.status === 'blocked' &&
@@ -173,7 +180,8 @@ export function summarizeFilesystemCapabilities(input: {
     if (decision.mcpId !== FILESYSTEM_MCP_ID) continue
     const capability = filesystemRequestedCapability(decision.capability)
     if (!capability) continue
-    requested.add(capability)
+    planningVisible.add(capability)
+    if (capability !== 'filesystem.project.write') boundedRuntimeRequested.add(capability)
     if (
       capability !== 'filesystem.project.write' &&
       decision.status === 'blocked' &&
@@ -185,14 +193,17 @@ export function summarizeFilesystemCapabilities(input: {
   // only asked to list or search paths. Preserve that runtime dependency in
   // the projection so approval, execution, and audit evidence all require the
   // read capability explicitly.
-  if ([...requested].some((capability) => capability !== 'filesystem.project.write')) {
-    requested.add('filesystem.project.read')
+  if (boundedRuntimeRequested.size > 0) {
+    planningVisible.add('filesystem.project.read')
+    boundedRuntimeRequested.add('filesystem.project.read')
   }
   if (blocking.size > 0) blocking.add('filesystem.project.read')
 
   return {
     blockingCapabilities: [...blocking].sort(),
-    requestedCapabilities: [...requested].sort(),
+    planningVisibleCapabilities: [...planningVisible].sort(),
+    boundedRuntimeRequestedCapabilities: [...boundedRuntimeRequested].sort(),
+    requestedCapabilities: [...planningVisible].sort(),
   }
 }
 
@@ -259,11 +270,10 @@ export function projectFilesystemGrantCovers(input: {
     mcpRequirements: input.mcpRequirements,
     metadata: input.metadata,
   })
-  if (summary.blockingCapabilities.length === 0 && summary.requestedCapabilities.length === 0) return null
-  const grantableRequested = summary.requestedCapabilities.filter(
-    (capability): capability is FilesystemProjectCapability => capability !== 'filesystem.project.write',
-  )
-  const required = summary.blockingCapabilities.length > 0 ? summary.blockingCapabilities : grantableRequested
+  if (summary.blockingCapabilities.length === 0 && summary.boundedRuntimeRequestedCapabilities.length === 0) return null
+  const required = summary.blockingCapabilities.length > 0
+    ? summary.blockingCapabilities
+    : summary.boundedRuntimeRequestedCapabilities
   if (required.length === 0) return null
   return required.every((capability) => grant.capabilities.includes(capability)) ? grant : null
 }

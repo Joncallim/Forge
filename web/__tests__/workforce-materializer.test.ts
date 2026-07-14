@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import fs from 'node:fs'
 import path from 'node:path'
-import type { PreparedArchitectArtifact } from '@/worker/architect-artifact'
+import { prepareArchitectArtifact, type PreparedArchitectArtifact } from '@/worker/architect-artifact'
 import {
   buildWorkforceMaterializationRows,
   isWorkforceMaterializationEnabled,
@@ -159,6 +159,70 @@ function deterministicIds(): () => string {
 }
 
 describe('workforce materializer', () => {
+  it('persists invalid-design normalization blockers for package admission', () => {
+    const invalidPrepared = structuredClone(prepared)
+    invalidPrepared.agents = [{ role: 'Backend', tasks: 1, summary: 'APIs', steps: ['Add tables'] }]
+    invalidPrepared.mcpExecutionDesign.proposed = {
+      schemaVersion: 1,
+      requirements: [],
+      promptOverlays: {},
+      requirementContexts: [],
+      mcpAwareSubtasks: [],
+      normalizationErrors: ['The supplied MCP execution design fence is invalid and must be regenerated.'],
+      normalizationEvidence: [{
+        schemaVersion: 1,
+        category: 'shape',
+        code: 'mcp_design_schema_shape_invalid',
+        message: 'The supplied MCP execution design fence is invalid and must be regenerated.',
+      }],
+    }
+    invalidPrepared.mcpExecutionDesign.validation = {
+      status: 'blocked', runtimeEnforcement: 'not_implemented', health: [],
+      blocked: ['The supplied MCP execution design fence is invalid and must be regenerated.'], warnings: [],
+    }
+    invalidPrepared.mcpExecutionDesign.grantDecisions = {
+      schemaVersion: 1, runtimeEnforcement: 'not_implemented', summary: { proposed: 0, warning: 0, blocked: 0 },
+      decisions: [], admissionStatus: 'blocked',
+      blocked: ['The supplied MCP execution design fence is invalid and must be regenerated.'],
+    }
+
+    const rows = buildWorkforceMaterializationRows(
+      { taskId: 'task-1', architectRunId: 'run-1', artifactId: 'artifact-1', prepared: invalidPrepared },
+      { idFactory: deterministicIds(), activeAgents: [{ agentType: 'backend', displayName: 'Backend' }] },
+    )
+    const pkg = rows.workPackages[0]
+    expect(pkg.metadata).toMatchObject({
+      mcpGrantsSchemaVersion: 2,
+      mcpNormalizationErrors: ['The supplied MCP execution design fence is invalid and must be regenerated.'],
+      mcpNormalizationEvidence: [expect.objectContaining({
+        schemaVersion: 1,
+        category: 'shape',
+        code: 'mcp_design_schema_shape_invalid',
+      })],
+    })
+    expect(evaluateWorkPackageMcpBroker({
+      assignedRole: pkg.assignedRole,
+      mcpRequirements: pkg.mcpRequirements,
+      metadata: pkg.metadata,
+      title: pkg.title,
+    })).toMatchObject({ status: 'blocked', retryable: false, primaryRecoveryAction: 'revise_plan' })
+
+    const metadataWithEvidenceOnly = {
+      ...(pkg.metadata as Record<string, unknown>),
+      mcpNormalizationErrors: [],
+    }
+    expect(evaluateWorkPackageMcpBroker({
+      assignedRole: pkg.assignedRole,
+      mcpRequirements: pkg.mcpRequirements,
+      metadata: metadataWithEvidenceOnly,
+      title: pkg.title,
+    })).toMatchObject({
+      status: 'blocked',
+      blocked: [expect.stringContaining('mcp_design_schema_shape_invalid')],
+      primaryRecoveryAction: 'revise_plan',
+    })
+  })
+
   it('attaches MCP grants/requirements when the design spells the agent with a different separator', () => {
     // Canonical agentType is `backend-dev`; the MCP execution design spells the
     // same agent `backend_dev`. Matching must be separator-insensitive, or the
@@ -168,6 +232,13 @@ describe('workforce materializer', () => {
     const design = separatorPrepared.mcpExecutionDesign.proposed!
     design.requirements[0].assignment.targetAgents = ['backend_dev']
     design.requirements[0].agentPermissions = { backend_dev: ['github.issues.read'] }
+    design.requirementContexts = [{
+      requirementKey: design.requirements[0].requirementKey as string,
+      sourceRequirementIndex: 0,
+      agent: 'backend_dev',
+      mcpId: 'github',
+      promptOverlay: 'Use GitHub read tools only.',
+    }]
     design.mcpAwareSubtasks[0].agent = 'backend_dev'
     separatorPrepared.mcpExecutionDesign.grantDecisions.decisions[0].agent = 'backend_dev'
 
@@ -179,9 +250,177 @@ describe('workforce materializer', () => {
     const pkg = rows.workPackages.find((p) => p.assignedRole === 'backend-dev')
     expect(pkg).toBeDefined()
     expect(pkg!.metadata).toMatchObject({
-      mcpGrants: [expect.objectContaining({ decisionId: 'grant-1', mcpId: 'github' })],
+      mcpGrants: [expect.objectContaining({ decisionId: 'grant-1', mcpId: 'github', agent: 'backend-dev' })],
+      requirementContexts: [expect.objectContaining({ agent: 'backend-dev' })],
+      mcpAwareSubtasks: [expect.objectContaining({ agent: 'backend-dev' })],
     })
-    expect(pkg!.mcpRequirements).toEqual([expect.objectContaining({ mcpId: 'github' })])
+    expect(pkg!.mcpRequirements).toEqual([expect.objectContaining({ mcpId: 'github', agent: 'backend-dev' })])
+    expect(evaluateWorkPackageMcpBroker({
+      assignedRole: pkg!.assignedRole,
+      mcpRequirements: pkg!.mcpRequirements,
+      metadata: pkg!.metadata,
+      title: pkg!.title,
+    }).status).toBe('allowed')
+  })
+
+  it('materializes separator aliases into one deny-wins package policy', () => {
+    const separatorPrepared = structuredClone(prepared)
+    separatorPrepared.agents = [{ role: 'backend-dev', tasks: 1, summary: 'APIs', steps: ['Add tables'] }]
+    const first = separatorPrepared.mcpExecutionDesign.proposed!.requirements[0]
+    first.assignment.targetAgents = ['backend_dev']
+    first.agentPermissions = { backend_dev: ['github.issues.read'] }
+    first.prohibitedCapabilities = []
+    separatorPrepared.mcpExecutionDesign.proposed!.requirements.push({
+      ...structuredClone(first),
+      requirementKey: 'mcp-requirement-v1-separator-deny-1',
+      sourceRequirementIndex: 1,
+      assignment: { ...first.assignment, targetAgents: ['backend-dev'] },
+      agentPermissions: {},
+      prohibitedCapabilities: ['github.issues.read'],
+    })
+
+    const rows = buildWorkforceMaterializationRows(
+      { taskId: 'task-1', architectRunId: 'run-1', artifactId: 'artifact-1', prepared: separatorPrepared },
+      { idFactory: deterministicIds(), activeAgents: [{ agentType: 'backend-dev', displayName: 'Backend Dev' }] },
+    )
+    const pkg = rows.workPackages[0]
+
+    expect(pkg.mcpRequirements).toHaveLength(2)
+    expect(evaluateWorkPackageMcpBroker({
+      assignedRole: pkg.assignedRole,
+      mcpRequirements: pkg.mcpRequirements,
+      metadata: pkg.metadata,
+      title: pkg.title,
+    })).toMatchObject({
+      status: 'blocked',
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+      blocked: expect.arrayContaining([expect.stringContaining('package-prohibited')]),
+    })
+  })
+
+  it('keeps genuinely distinct materialized package roles independently partitioned', () => {
+    const distinctPrepared = structuredClone(prepared)
+    distinctPrepared.agents = [
+      { role: 'Backend', tasks: 1, summary: 'Backend APIs', steps: ['Implement APIs'] },
+      { role: 'Frontend', tasks: 1, summary: 'Frontend UI', steps: ['Implement UI'] },
+    ]
+    const first = distinctPrepared.mcpExecutionDesign.proposed!.requirements[0]
+    first.assignment.targetAgents = ['backend']
+    first.agentPermissions = { backend: ['github.issues.read'] }
+    first.prohibitedCapabilities = []
+    distinctPrepared.mcpExecutionDesign.proposed!.requirements.push({
+      ...structuredClone(first),
+      requirementKey: 'mcp-requirement-v1-frontend-read-1',
+      sourceRequirementIndex: 1,
+      assignment: { ...first.assignment, targetAgents: ['frontend'] },
+      agentPermissions: { frontend: ['github.issues.read'] },
+      prohibitedCapabilities: [],
+    }, {
+      ...structuredClone(first),
+      requirementKey: 'mcp-requirement-v1-frontend-deny-1',
+      sourceRequirementIndex: 2,
+      assignment: { ...first.assignment, targetAgents: ['frontend'] },
+      agentPermissions: {},
+      prohibitedCapabilities: ['github.issues.read'],
+    })
+
+    const rows = buildWorkforceMaterializationRows(
+      { taskId: 'task-1', architectRunId: 'run-1', artifactId: 'artifact-1', prepared: distinctPrepared },
+      {
+        idFactory: deterministicIds(),
+        activeAgents: [
+          { agentType: 'backend', displayName: 'Backend' },
+          { agentType: 'frontend', displayName: 'Frontend' },
+        ],
+      },
+    )
+    const backend = rows.workPackages.find((pkg) => pkg.assignedRole === 'backend')!
+    const frontend = rows.workPackages.find((pkg) => pkg.assignedRole === 'frontend')!
+
+    expect(backend.mcpRequirements).toHaveLength(1)
+    expect(frontend.mcpRequirements).toHaveLength(2)
+    expect(evaluateWorkPackageMcpBroker({
+      assignedRole: backend.assignedRole,
+      mcpRequirements: backend.mcpRequirements,
+      metadata: backend.metadata,
+      title: backend.title,
+    }).status).toBe('allowed')
+    expect(evaluateWorkPackageMcpBroker({
+      assignedRole: frontend.assignedRole,
+      mcpRequirements: frontend.mcpRequirements,
+      metadata: frontend.metadata,
+      title: frontend.title,
+    })).toMatchObject({
+      status: 'blocked',
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+    })
+  })
+
+  it('omits an overflowing unsafe subtask through artifact preparation and materialization', () => {
+    const raw = [
+      '# Plan',
+      '- [Backend] Implement the package safely.',
+      '```mcp_execution_design_json',
+      JSON.stringify({
+        schemaVersion: 1,
+        requirements: [{
+          mcpId: 'github',
+          requirement: 'required',
+          reason: 'Read issue context.',
+          assignment: { type: 'agent', targetAgents: ['backend'], targetId: null },
+          agentPermissions: { backend: ['github.issues.read'] },
+          prohibitedCapabilities: [],
+          fallback: { action: 'block', message: 'Revise the plan.' },
+        }],
+        promptOverlays: {},
+        requirementContexts: [],
+        mcpAwareSubtasks: [{
+          id: 'inspect',
+          agent: 'backend',
+          dependsOn: [],
+          mcpCapabilities: [...Array(30).fill('github.issues.read'), 'github.contents.write'],
+          inputs: [],
+          outputs: [],
+          verification: [],
+          stoppingCondition: 'Done.',
+          fallback: 'Revise the plan.',
+        }],
+      }),
+      '```',
+    ].join('\n')
+    const artifact = prepareArchitectArtifact(raw, {
+      projectId: 'project-1',
+      config: { profile: 'default', requiredMcps: [], overrides: {} },
+      catalog: [],
+      mcpsRoot: '/tmp/mcps',
+      statuses: [],
+      summary: { label: 'Unavailable', status: 'missing', missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+    })
+    expect(artifact.mcpExecutionDesign.proposed?.mcpAwareSubtasks).toEqual([])
+    expect(artifact.mcpExecutionDesign.proposed?.normalizationErrors).toEqual(expect.arrayContaining([
+      expect.stringMatching(/mcpCapabilities exceeds the maximum raw count of 30/),
+    ]))
+
+    const rows = buildWorkforceMaterializationRows(
+      { taskId: 'task-1', architectRunId: 'run-1', artifactId: 'artifact-1', prepared: artifact },
+      { idFactory: deterministicIds(), activeAgents: [{ agentType: 'backend', displayName: 'Backend' }] },
+    )
+    const pkg = rows.workPackages[0]
+    expect(pkg.metadata).toMatchObject({
+      mcpAwareSubtasks: [],
+      mcpNormalizationEvidence: [expect.objectContaining({ code: 'mcp_design_nested_policy_invalid' })],
+    })
+    expect((pkg.metadata as { mcpNormalizationErrors: string[] }).mcpNormalizationErrors).toEqual(expect.arrayContaining([
+      expect.stringMatching(/mcpCapabilities exceeds the maximum raw count of 30/),
+    ]))
+    expect(evaluateWorkPackageMcpBroker({
+      assignedRole: pkg.assignedRole,
+      mcpRequirements: pkg.mcpRequirements,
+      metadata: pkg.metadata,
+      title: pkg.title,
+    })).toMatchObject({ status: 'blocked', retryable: false, primaryRecoveryAction: 'revise_plan' })
   })
 
   it('inherits project-level filesystem approval for new packages', () => {

@@ -116,6 +116,21 @@ export type McpAdmissionEvaluation = {
   health: McpHealthSnapshot
 }
 
+export type McpPrimaryBlockingDecision = {
+  kind: 'requirement' | 'subtask'
+  mode: McpAdmissionMode
+  recoveryAction: McpRecoveryAction
+  reason: string
+  evidenceRefs: string[]
+  requirementKey: string
+  agent: string
+  mcpId: string
+  decisionId?: string
+  sourceRequirementIndex?: number
+  subtaskId?: string
+  capability?: string
+}
+
 export type McpWorkPackageAdmission = {
   schemaVersion: 2
   evaluations: McpAdmissionEvaluation[]
@@ -140,6 +155,7 @@ export type McpWorkPackageAdmission = {
     retryable: boolean
     primaryMode?: McpAdmissionMode
     primaryRecoveryAction?: McpRecoveryAction
+    primaryDecision?: McpPrimaryBlockingDecision
   }
 }
 
@@ -164,6 +180,7 @@ export type McpGrantPreview = Omit<McpGrantDecisions, 'decisions'> & {
   retryable: boolean
   primaryMode?: McpAdmissionMode
   primaryRecoveryAction?: McpRecoveryAction
+  primaryDecision?: McpPrimaryBlockingDecision
   evaluations: McpAdmissionEvaluation[]
   subtaskDecisions: McpWorkPackageAdmission['subtaskDecisions']
 }
@@ -172,6 +189,7 @@ export type McpBrokerAdmissionCheck = WorkPackageMcpBrokerCheck & {
   retryable: boolean
   primaryMode?: McpAdmissionMode
   primaryRecoveryAction?: McpRecoveryAction
+  primaryDecision?: McpPrimaryBlockingDecision
   evaluations: McpAdmissionEvaluation[]
   subtaskDecisions: McpWorkPackageAdmission['subtaskDecisions']
 }
@@ -1721,11 +1739,35 @@ export function admitWorkPackageMcp(input: {
       mode: item.decision.mode,
       action: item.decision.recoveryAction,
       stableKey: `requirement\u0000${item.source.requirementKey}\u0000${item.decision.agent}\u0000${item.decision.mcpId}`,
+      decision: {
+        kind: 'requirement' as const,
+        mode: item.decision.mode,
+        recoveryAction: item.decision.recoveryAction as McpRecoveryAction,
+        reason: item.decision.reason,
+        evidenceRefs: [...item.decision.evidenceRefs],
+        requirementKey: item.source.requirementKey,
+        agent: item.decision.agent,
+        mcpId: item.decision.mcpId,
+        decisionId: item.source.decisionId,
+        sourceRequirementIndex: item.source.sourceRequirementIndex,
+      },
     })),
     ...subtaskDecisions.filter((item) => item.status === 'blocked').map((item) => ({
       mode: item.class === 'deferred_live_mcp' ? 'deferred_live_mcp' as const : 'blocked' as const,
       action: item.recoveryAction,
       stableKey: `subtask\u0000${item.subtaskId}\u0000${item.agent}\u0000${item.capability}\u0000${item.requirementKey}`,
+      decision: {
+        kind: 'subtask' as const,
+        mode: item.class === 'deferred_live_mcp' ? 'deferred_live_mcp' as const : 'blocked' as const,
+        recoveryAction: item.recoveryAction as McpRecoveryAction,
+        reason: item.reason,
+        evidenceRefs: [],
+        requirementKey: item.requirementKey,
+        agent: item.agent,
+        mcpId: item.mcpId,
+        subtaskId: item.subtaskId,
+        capability: item.capability,
+      },
     })),
   ]
   const precedence: McpRecoveryAction[] = [
@@ -1774,13 +1816,23 @@ export function admitWorkPackageMcp(input: {
       warnings,
       blockedReason: blocked.length > 0 ? `MCP/capability broker blocked "${label}": ${blocked.join('; ')}` : null,
       retryable: blockingItems.length > 0 && blockingItems.every((item) => item.action === 'install_or_fix_mcp'),
-      ...(primary ? { primaryMode: primary.mode, primaryRecoveryAction: primary.action } : {}),
+      ...(primary ? {
+        primaryMode: primary.decision.mode,
+        primaryRecoveryAction: primary.decision.recoveryAction,
+        primaryDecision: primary.decision,
+      } : {}),
     },
   }
 }
 
 function cloneHealthSnapshot(health: McpHealthSnapshot): McpHealthSnapshot {
   return { ...health }
+}
+
+function clonePrimaryDecision(
+  decision: McpPrimaryBlockingDecision,
+): McpPrimaryBlockingDecision {
+  return { ...decision, evidenceRefs: [...decision.evidenceRefs] }
 }
 
 function cloneEvaluation(evaluation: McpAdmissionEvaluation): McpAdmissionEvaluation {
@@ -1856,9 +1908,16 @@ export function admissionToGrantPreview(admission: McpWorkPackageAdmission): Mcp
     retryable: admission.aggregate.retryable,
     evaluations: admission.evaluations.map(cloneEvaluation),
     subtaskDecisions: admission.subtaskDecisions.map((decision) => ({ ...decision })),
-    ...(admission.aggregate.primaryMode ? { primaryMode: admission.aggregate.primaryMode } : {}),
-    ...(admission.aggregate.primaryRecoveryAction
-      ? { primaryRecoveryAction: admission.aggregate.primaryRecoveryAction }
+    ...(admission.aggregate.primaryDecision?.mode
+      ? { primaryMode: admission.aggregate.primaryDecision.mode }
+      : admission.aggregate.primaryMode ? { primaryMode: admission.aggregate.primaryMode } : {}),
+    ...(admission.aggregate.primaryDecision?.recoveryAction
+      ? { primaryRecoveryAction: admission.aggregate.primaryDecision.recoveryAction }
+      : admission.aggregate.primaryRecoveryAction
+        ? { primaryRecoveryAction: admission.aggregate.primaryRecoveryAction }
+      : {}),
+    ...(admission.aggregate.primaryDecision
+      ? { primaryDecision: clonePrimaryDecision(admission.aggregate.primaryDecision) }
       : {}),
   }
 }
@@ -1872,9 +1931,16 @@ export function admissionToBrokerCheck(admission: McpWorkPackageAdmission): McpB
     retryable: admission.aggregate.retryable,
     evaluations: admission.evaluations.map(cloneEvaluation),
     subtaskDecisions: admission.subtaskDecisions.map((decision) => ({ ...decision })),
-    ...(admission.aggregate.primaryMode ? { primaryMode: admission.aggregate.primaryMode } : {}),
-    ...(admission.aggregate.primaryRecoveryAction
-      ? { primaryRecoveryAction: admission.aggregate.primaryRecoveryAction }
+    ...(admission.aggregate.primaryDecision?.mode
+      ? { primaryMode: admission.aggregate.primaryDecision.mode }
+      : admission.aggregate.primaryMode ? { primaryMode: admission.aggregate.primaryMode } : {}),
+    ...(admission.aggregate.primaryDecision?.recoveryAction
+      ? { primaryRecoveryAction: admission.aggregate.primaryDecision.recoveryAction }
+      : admission.aggregate.primaryRecoveryAction
+        ? { primaryRecoveryAction: admission.aggregate.primaryRecoveryAction }
+      : {}),
+    ...(admission.aggregate.primaryDecision
+      ? { primaryDecision: clonePrimaryDecision(admission.aggregate.primaryDecision) }
       : {}),
   }
 }

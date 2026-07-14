@@ -183,6 +183,8 @@ function grantStateForPackage(input: {
     title: input.pkg.title,
     assignedRole: input.pkg.assignedRole,
     requestedCapabilities: summary.requestedCapabilities,
+    planningVisibleCapabilities: summary.planningVisibleCapabilities,
+    boundedRuntimeRequestedCapabilities: summary.boundedRuntimeRequestedCapabilities,
     blockingCapabilities: summary.blockingCapabilities,
     approval: input.approval
       ? {
@@ -323,7 +325,7 @@ export async function PUT(
           mcpRequirements: pkg.mcpRequirements,
           metadata: pkg.metadata,
         })
-        const requestedSet = new Set(summary.requestedCapabilities)
+        const requestedSet = new Set(summary.boundedRuntimeRequestedCapabilities)
         if (grant.decision === 'approved' && requestedSet.size === 0) {
           throw Object.assign(new Error('Cannot approve filesystem context for a package that did not request filesystem capabilities.'), { status: 400 })
         }

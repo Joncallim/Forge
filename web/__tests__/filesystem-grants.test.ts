@@ -44,6 +44,8 @@ describe('requiresFilesystemGrantApproval', () => {
 
     expect(summary).toEqual({
       blockingCapabilities: [],
+      boundedRuntimeRequestedCapabilities: [],
+      planningVisibleCapabilities: ['filesystem.project.write'],
       requestedCapabilities: ['filesystem.project.write'],
     })
     expect(requiresFilesystemGrantApproval({
@@ -56,6 +58,26 @@ describe('requiresFilesystemGrantApproval', () => {
       }],
       metadata: {},
     })).toMatchObject({ blocked: false, requestedCapabilities: ['filesystem.project.write'] })
+  })
+
+  it('projects read plus write into distinct planning and bounded-runtime capability sets', () => {
+    const summary = summarizeFilesystemCapabilities({
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        agent: 'backend',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read', 'filesystem.project.write'],
+        fallback: { action: 'block', message: '' },
+      }],
+      metadata: approvedEffectivePhase(['filesystem.project.read']),
+    })
+
+    expect(summary).toMatchObject({
+      blockingCapabilities: [],
+      boundedRuntimeRequestedCapabilities: ['filesystem.project.read'],
+      planningVisibleCapabilities: ['filesystem.project.read', 'filesystem.project.write'],
+      requestedCapabilities: ['filesystem.project.read', 'filesystem.project.write'],
+    })
   })
 
   it('holds a required filesystem package that has no approved effective grant', () => {

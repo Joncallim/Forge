@@ -116,6 +116,7 @@ export function isMcpExecutionDesignShape(parsed: unknown): boolean {
     Array.isArray(value.requirements) &&
     typeof value.promptOverlays === 'object' &&
     value.promptOverlays !== null &&
+    !Array.isArray(value.promptOverlays) &&
     (value.requirementContexts === undefined || Array.isArray(value.requirementContexts)) &&
     Array.isArray(value.mcpAwareSubtasks)
   )

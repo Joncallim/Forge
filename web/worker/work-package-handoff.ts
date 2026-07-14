@@ -12,6 +12,7 @@ import {
   workPackages,
 } from '../db/schema'
 import { getProjectMcpOverview } from '../lib/mcps/manager'
+import type { ProjectMcpOverview } from '../lib/mcps/types'
 import { publishTaskEvent } from './events'
 import {
   evaluateWorkPackageMcpBroker,
@@ -20,7 +21,6 @@ import {
 import type { McpBrokerAdmissionCheck } from '../lib/mcps/admission'
 import { buildMcpBrokerBlockMetadata } from './blocked-handoff-retry'
 import {
-  FILESYSTEM_GRANT_BLOCK_METADATA_KEY,
   isProjectFilesystemEffectivePhase,
   requiresFilesystemGrantApproval,
 } from '../lib/mcps/filesystem-grants'
@@ -106,9 +106,150 @@ type ExecutionLease = {
 }
 
 type HandoffOptions = {
+  /** Integration seam for a write racing the evaluated snapshot and its compare-and-set. */
+  afterMcpAdmissionEvaluated?: (input: { attempt: number; packageId: string; status: 'allowed' | 'blocked' }) => Promise<void>
+  /** Integration seam for deterministic races; runs after health I/O and before the fresh database read. */
+  afterMcpHealthCaptured?: (input: { attempt: number; packageId: string; projectId: string }) => Promise<void>
+  /** Integration seam for a concurrent write after the execution lease is committed. */
+  afterWorkPackageClaimed?: (input: { attempt: number; packageId: string; runId: string }) => Promise<void>
   claimEnabled?: boolean
   finalAttempt?: boolean
+  freshnessAttempt?: number
   staleRecoveryAttempted?: boolean
+}
+
+type McpProjectFreshnessSnapshot = {
+  id: string
+  localPath: string | null
+  mcpConfig: unknown
+}
+
+type McpHealthCapture = {
+  error: string | null
+  overview: ProjectMcpOverview | null
+  project: McpProjectFreshnessSnapshot
+}
+
+type HandoffBlockDecision =
+  | {
+      blocked: string[]
+      blockedReason: string
+      check: McpBrokerAdmissionCheck
+      kind: 'broker'
+      terminalBlock?: false
+      warnings: string[]
+    }
+  | {
+      blockedReason: string
+      kind: 'filesystem_grant'
+      missingCapabilities: string[]
+      requestedCapabilities: string[]
+      terminalBlock: true
+    }
+  | {
+      blockedReason: string
+      kind: 'reserved_role'
+      terminalBlock: true
+    }
+
+type HandoffAdmissionResult =
+  | { pkg: HandoffPackage; project: McpProjectFreshnessSnapshot; status: 'allowed' }
+  | { blockedReason: string; status: 'blocked'; terminalBlock?: boolean }
+  | { pkg: HandoffPackage; status: 'conflict' }
+
+const MAX_HANDOFF_FRESHNESS_ATTEMPTS = 3
+
+function jsonbSnapshotEquals(column: unknown, value: unknown) {
+  return sql`${column} IS NOT DISTINCT FROM ${JSON.stringify(value ?? null)}::jsonb`
+}
+
+function projectFreshnessExists(taskId: string, snapshot: McpProjectFreshnessSnapshot) {
+  return sql`exists (
+    select 1 from ${tasks}
+    inner join ${projects} on ${tasks.projectId} = ${projects.id}
+    where ${tasks.id} = ${taskId}
+      and ${projects.id} = ${snapshot.id}
+      and ${projects.localPath} IS NOT DISTINCT FROM ${snapshot.localPath}
+      and ${projects.mcpConfig} IS NOT DISTINCT FROM ${JSON.stringify(snapshot.mcpConfig ?? null)}::jsonb
+  )`
+}
+
+function packageFreshnessConditions(pkg: HandoffPackage) {
+  return [
+    eq(workPackages.assignedRole, pkg.assignedRole),
+    sql`${workPackages.blockedReason} IS NOT DISTINCT FROM ${pkg.blockedReason ?? null}`,
+    sql`${workPackages.harnessId} IS NOT DISTINCT FROM ${pkg.harnessId}`,
+    jsonbSnapshotEquals(workPackages.metadata, pkg.metadata),
+    jsonbSnapshotEquals(workPackages.mcpRequirements, pkg.mcpRequirements),
+    eq(workPackages.title, pkg.title),
+  ]
+}
+
+function handoffFreshnessConditions(input: {
+  pkg: HandoffPackage
+  project: McpProjectFreshnessSnapshot
+  taskId: string
+}) {
+  return [
+    eq(workPackages.id, input.pkg.id),
+    eq(workPackages.status, input.pkg.status),
+    ...packageFreshnessConditions(input.pkg),
+    projectFreshnessExists(input.taskId, input.project),
+  ]
+}
+
+function sameJsonSnapshot(left: unknown, right: unknown): boolean {
+  const canonicalize = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonicalize)
+    if (!isRecord(value)) return value ?? null
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+        .map(([key, entry]) => [key, canonicalize(entry)]),
+    )
+  }
+  return JSON.stringify(canonicalize(left)) === JSON.stringify(canonicalize(right))
+}
+
+async function rereadMcpHandoffInputs(taskId: string, packageId: string): Promise<{
+  pkg: HandoffPackage
+  project: McpProjectFreshnessSnapshot
+} | null> {
+  const [row] = await db
+    .select({
+      assignedRole: workPackages.assignedRole,
+      blockedReason: workPackages.blockedReason,
+      harnessId: workPackages.harnessId,
+      id: workPackages.id,
+      localPath: projects.localPath,
+      mcpConfig: projects.mcpConfig,
+      mcpRequirements: workPackages.mcpRequirements,
+      metadata: workPackages.metadata,
+      projectId: projects.id,
+      sequence: workPackages.sequence,
+      status: workPackages.status,
+      title: workPackages.title,
+      updatedAt: workPackages.updatedAt,
+    })
+    .from(workPackages)
+    .innerJoin(tasks, eq(workPackages.taskId, tasks.id))
+    .innerJoin(projects, eq(tasks.projectId, projects.id))
+    .where(and(eq(workPackages.id, packageId), eq(workPackages.taskId, taskId)))
+    .limit(1)
+  if (!row) return null
+  return {
+    pkg: row,
+    project: { id: row.projectId, localPath: row.localPath, mcpConfig: row.mcpConfig },
+  }
+}
+
+function mcpProjectSnapshotsMatch(
+  left: McpProjectFreshnessSnapshot,
+  right: McpProjectFreshnessSnapshot,
+): boolean {
+  return left.id === right.id &&
+    left.localPath === right.localPath &&
+    sameJsonSnapshot(left.mcpConfig, right.mcpConfig)
 }
 
 async function publishTaskEventBestEffort(
@@ -564,15 +705,12 @@ async function recoverStaleRunningPackage(taskId: string, pkg: HandoffPackage): 
   const recoveredAt = new Date()
   const cutoff = staleRunningPackageCutoff(recoveredAt)
   const blockedReason = `Recovered stale running work package "${pkg.title}" after the worker lost its execution lease. The next handoff retry will start a new attempt.`
-  const metadata = {
-    ...metadataWithoutExecutionLease(pkg.metadata),
-    staleRunningRecovery: {
-      recoveredAt: recoveredAt.toISOString(),
-      reason: blockedReason,
-      source: 'work-package-handoff',
-      staleAfterSeconds: staleRunningPackageSeconds(),
-      status: 'blocked',
-    },
+  const staleRunningRecovery = {
+    recoveredAt: recoveredAt.toISOString(),
+    reason: blockedReason,
+    source: 'work-package-handoff',
+    staleAfterSeconds: staleRunningPackageSeconds(),
+    status: 'blocked',
   }
   const lease = executionLeaseFromMetadata(pkg.metadata)
   const [run] = await db
@@ -597,7 +735,12 @@ async function recoverStaleRunningPackage(taskId: string, pkg: HandoffPackage): 
     .update(workPackages)
     .set({
       blockedReason,
-      metadata,
+      metadata: sql`jsonb_set(
+        coalesce(${workPackages.metadata}, '{}'::jsonb) - 'executionLease',
+        '{staleRunningRecovery}',
+        ${JSON.stringify(staleRunningRecovery)}::jsonb,
+        true
+      )`,
       status: 'blocked',
       updatedAt: recoveredAt,
     })
@@ -632,7 +775,7 @@ async function recoverStaleRunningPackage(taskId: string, pkg: HandoffPackage): 
 
   await publishTaskEvent(taskId, 'work_package:status', {
     blockedReason,
-    staleRunningRecovery: metadata.staleRunningRecovery,
+    staleRunningRecovery,
     status: 'blocked',
     updatedAt: recoveredAt.toISOString(),
     workPackageId: pkg.id,
@@ -731,9 +874,10 @@ async function failWorkPackageForMcpBroker(input: {
   blockedReason: string
   check?: McpBrokerAdmissionCheck
   pkg: HandoffPackage
+  project: McpProjectFreshnessSnapshot
   taskId: string
   warnings: string[]
-}): Promise<{ blockedReason: string; status: 'blocked' } | { status: 'allowed' }> {
+}): Promise<{ blockedReason: string; status: 'blocked' } | { pkg: HandoffPackage; status: 'conflict' }> {
   const blockedAt = new Date()
   const check: McpBrokerAdmissionCheck = input.check ?? {
     status: 'blocked',
@@ -751,21 +895,22 @@ async function failWorkPackageForMcpBroker(input: {
     check,
     existingMetadata: input.pkg.metadata,
   })
+  const brokerMarker = metadata.mcpBroker
   const [blockedRow] = await db
     .update(workPackages)
     .set({
       blockedReason: input.blockedReason,
-      metadata,
+      // This path owns only metadata.mcpBroker. The compare-and-set predicate
+      // below proves the broker evaluated the current JSON document, while
+      // jsonb_set keeps unrelated fields written by concurrent features intact.
+      metadata: sql`jsonb_set(coalesce(${workPackages.metadata}, '{}'::jsonb), '{mcpBroker}', ${JSON.stringify(brokerMarker)}::jsonb, true)`,
       status: 'blocked',
       updatedAt: blockedAt,
     })
-    .where(and(eq(workPackages.id, input.pkg.id), inArray(workPackages.status, ['pending', 'ready', 'needs_rework', 'blocked'])))
+    .where(and(...handoffFreshnessConditions(input)))
     .returning({ id: workPackages.id })
 
-  // A concurrent actor moved the package out of a blockable state (e.g. it was
-  // already claimed and is running). Don't emit a spurious blocked event or
-  // revert the task — the later ready→running claim guards correctness anyway.
-  if (!blockedRow) return { status: 'allowed' }
+  if (!blockedRow) return { pkg: input.pkg, status: 'conflict' }
 
   await publishTaskEvent(input.taskId, 'work_package:status', {
     blockedReason: input.blockedReason,
@@ -816,33 +961,34 @@ async function failWorkPackageForFilesystemGrant(input: {
   blockedReason: string
   missingCapabilities: string[]
   pkg: HandoffPackage
+  project: McpProjectFreshnessSnapshot
   requestedCapabilities: string[]
   taskId: string
-}): Promise<{ blockedReason: string; status: 'blocked'; terminalBlock: true } | { status: 'allowed' }> {
+}): Promise<
+  | { blockedReason: string; status: 'blocked'; terminalBlock: true }
+  | { pkg: HandoffPackage; status: 'conflict' }
+> {
   const failedAt = new Date()
-  const metadata = {
-    ...(isRecord(input.pkg.metadata) ? input.pkg.metadata : {}),
-    [FILESYSTEM_GRANT_BLOCK_METADATA_KEY]: {
-      blockedAt: failedAt.toISOString(),
-      missingCapabilities: input.missingCapabilities,
-      reason: input.blockedReason,
-      requestedCapabilities: input.requestedCapabilities,
-      source: 'filesystem-grant-approval',
-      status: 'failed',
-    },
+  const grantBlockMarker = {
+    blockedAt: failedAt.toISOString(),
+    missingCapabilities: input.missingCapabilities,
+    reason: input.blockedReason,
+    requestedCapabilities: input.requestedCapabilities,
+    source: 'filesystem-grant-approval',
+    status: 'failed',
   }
   const [failedRow] = await db
     .update(workPackages)
     .set({
       blockedReason: input.blockedReason,
-      metadata,
+      metadata: sql`jsonb_set(coalesce(${workPackages.metadata}, '{}'::jsonb), '{mcpGrantBlock}', ${JSON.stringify(grantBlockMarker)}::jsonb, true)`,
       status: 'failed',
       updatedAt: failedAt,
     })
-    .where(and(eq(workPackages.id, input.pkg.id), inArray(workPackages.status, ['pending', 'ready', 'needs_rework', 'blocked'])))
+    .where(and(...handoffFreshnessConditions(input)))
     .returning({ id: workPackages.id })
 
-  if (!failedRow) return { status: 'allowed' }
+  if (!failedRow) return { pkg: input.pkg, status: 'conflict' }
 
   await publishTaskEvent(input.taskId, 'work_package:status', {
     blockedReason: input.blockedReason,
@@ -881,17 +1027,19 @@ function packageProjectFilesystemEffectivePhase(pkg: HandoffPackage): Record<str
   return isProjectFilesystemEffectivePhase(effective) ? effective : null
 }
 
-async function filesystemGrantHandoffBlock(taskId: string, pkg: HandoffPackage): Promise<{
+function filesystemGrantHandoffBlock(
+  pkg: HandoffPackage,
+  project: McpProjectFreshnessSnapshot,
+): {
   blockedReason: string
   missingCapabilities: string[]
   requestedCapabilities: string[]
-} | null> {
+} | null {
   if (packageProjectFilesystemEffectivePhase(pkg)) {
-    const project = await loadTaskProjectForMcpBroker(taskId)
     const check = requiresFilesystemGrantApproval({
       mcpRequirements: pkg.mcpRequirements,
       metadata: pkg.metadata,
-      projectMcpConfig: project?.mcpConfig ?? null,
+      projectMcpConfig: project.mcpConfig,
     })
     if (!check.blocked) return null
     return {
@@ -916,37 +1064,35 @@ async function filesystemGrantHandoffBlock(taskId: string, pkg: HandoffPackage):
 async function failWorkPackageForReservedRole(input: {
   blockedReason: string
   pkg: HandoffPackage
+  project: McpProjectFreshnessSnapshot
   taskId: string
-}): Promise<{ blockedReason: string; status: 'blocked'; terminalBlock: true } | { status: 'allowed' }> {
+}): Promise<
+  | { blockedReason: string; status: 'blocked'; terminalBlock: true }
+  | { pkg: HandoffPackage; status: 'conflict' }
+> {
   const failedAt = new Date()
-  const metadata = {
-    ...(isRecord(input.pkg.metadata) ? input.pkg.metadata : {}),
-    handoffSafety: {
-      blockedAt: failedAt.toISOString(),
-      reason: input.blockedReason,
-      source: 'architect-reserved-role',
-      status: 'failed',
-    },
+  const handoffSafetyMarker = {
+    blockedAt: failedAt.toISOString(),
+    reason: input.blockedReason,
+    source: 'architect-reserved-role',
+    status: 'failed',
   }
   const [failedRow] = await db
     .update(workPackages)
     .set({
       blockedReason: input.blockedReason,
-      metadata,
+      metadata: sql`jsonb_set(coalesce(${workPackages.metadata}, '{}'::jsonb), '{handoffSafety}', ${JSON.stringify(handoffSafetyMarker)}::jsonb, true)`,
       status: 'failed',
       updatedAt: failedAt,
     })
-    .where(and(eq(workPackages.id, input.pkg.id), inArray(workPackages.status, ['pending', 'ready', 'needs_rework', 'blocked'])))
+    .where(and(...handoffFreshnessConditions(input)))
     .returning({ id: workPackages.id })
 
-  if (!failedRow) return { status: 'allowed' }
+  if (!failedRow) return { pkg: input.pkg, status: 'conflict' }
 
   await publishTaskEvent(input.taskId, 'work_package:status', {
     blockedReason: input.blockedReason,
-    handoffSafety: {
-      source: 'architect-reserved-role',
-      status: 'failed',
-    },
+    handoffSafety: { source: 'architect-reserved-role', status: 'failed' },
     status: 'failed',
     updatedAt: failedAt.toISOString(),
     workPackageId: input.pkg.id,
@@ -1089,87 +1235,172 @@ async function loadPriorReviewContext(
   }
 }
 
-async function assertWorkPackageMcpBrokerAllowsHandoff(
-  taskId: string,
-  pkg: HandoffPackage,
-): Promise<{ blockedReason: string; status: 'blocked'; terminalBlock?: boolean } | { status: 'allowed' }> {
-  if (!hasWorkPackageMcpRuntimeInputs(pkg)) return { status: 'allowed' }
-
+async function captureMcpHealth(taskId: string): Promise<McpHealthCapture | null> {
   const project = await loadTaskProjectForMcpBroker(taskId)
-  if (!project) {
-    const blockedReason = `MCP/capability broker blocked "${pkg.title}": project MCP overview could not be loaded.`
-    return failWorkPackageForMcpBroker({
-      blocked: ['Project MCP overview could not be loaded.'],
-      blockedReason,
-      pkg,
-      taskId,
+  if (!project) return null
+  const projectSnapshot = {
+    id: project.id,
+    localPath: project.localPath ?? null,
+    mcpConfig: project.mcpConfig ?? null,
+  }
+  try {
+    return {
+      error: null,
+      overview: await getProjectMcpOverview(project),
+      project: projectSnapshot,
+    }
+  } catch (err) {
+    return {
+      error: err instanceof Error ? err.message : String(err),
+      overview: null,
+      project: projectSnapshot,
+    }
+  }
+}
+
+function brokerFailureDecision(pkg: HandoffPackage, message: string): HandoffBlockDecision {
+  const blockedReason = `MCP/capability broker blocked "${pkg.title}": evaluation failed (${message}).`
+  const blocked = [`Broker evaluation failed: ${message}`]
+  return {
+    blocked,
+    blockedReason,
+    check: {
+      status: 'blocked',
+      blocked,
       warnings: [],
-    })
+      blockedReason,
+      retryable: false,
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+      evaluations: [],
+      subtaskDecisions: [],
+    },
+    kind: 'broker',
+    warnings: [],
+  }
+}
+
+function evaluateWorkPackageHandoffAdmission(input: {
+  health: McpHealthCapture
+  pkg: HandoffPackage
+  project: McpProjectFreshnessSnapshot
+}): { status: 'allowed' } | HandoffBlockDecision {
+  const { health, pkg, project } = input
+  const reservedRoleBlock = architectReservedHandoffBlockedReason(pkg)
+  if (reservedRoleBlock) {
+    return { blockedReason: reservedRoleBlock, kind: 'reserved_role', terminalBlock: true }
   }
 
-  let check: ReturnType<typeof evaluateWorkPackageMcpBroker>
+  const filesystemGrantBlock = filesystemGrantHandoffBlock(pkg, project)
+  if (filesystemGrantBlock) {
+    return { ...filesystemGrantBlock, kind: 'filesystem_grant', terminalBlock: true }
+  }
+
+  if (!hasWorkPackageMcpRuntimeInputs(pkg)) return { status: 'allowed' }
+  if (health.error || !health.overview) {
+    return brokerFailureDecision(pkg, health.error ?? 'project MCP overview could not be loaded')
+  }
+
   try {
-    const mcpOverview = await getProjectMcpOverview(project)
-    check = evaluateWorkPackageMcpBroker({
+    const check = evaluateWorkPackageMcpBroker({
       assignedRole: pkg.assignedRole,
-      mcpOverview,
+      mcpOverview: health.overview,
       mcpRequirements: pkg.mcpRequirements,
       metadata: pkg.metadata,
       projectMcpConfig: project.mcpConfig,
       title: pkg.title,
     })
+    if (check.status !== 'blocked') return { status: 'allowed' }
+    return {
+      blocked: check.blocked,
+      blockedReason: check.blockedReason ?? 'MCP/capability broker blocked this work package.',
+      check,
+      kind: 'broker',
+      warnings: check.warnings,
+    }
   } catch (err) {
-    // The broker is the safety gate; an unexpected failure here must block the
-    // package, never crash the handoff (which would terminally fail the task).
-    const message = err instanceof Error ? err.message : String(err)
-    const blockedReason = `MCP/capability broker blocked "${pkg.title}": evaluation failed (${message}).`
-    return failWorkPackageForMcpBroker({
-      blocked: [`Broker evaluation failed: ${message}`],
-      blockedReason,
-      pkg,
-      taskId,
-      warnings: [],
-    })
+    return brokerFailureDecision(pkg, err instanceof Error ? err.message : String(err))
   }
-
-  if (check.status !== 'blocked') return { status: 'allowed' }
-
-  const blockedReason = check.blockedReason ?? 'MCP/capability broker blocked this work package.'
-  return failWorkPackageForMcpBroker({
-    blocked: check.blocked,
-    blockedReason,
-    check,
-    pkg,
-    taskId,
-    warnings: check.warnings,
-  })
 }
 
-async function assertWorkPackageAllowsHandoff(
+async function persistWorkPackageHandoffBlock(input: {
+  decision: HandoffBlockDecision
+  pkg: HandoffPackage
+  project: McpProjectFreshnessSnapshot
+  taskId: string
+}): Promise<HandoffAdmissionResult> {
+  const common = { pkg: input.pkg, project: input.project, taskId: input.taskId }
+  switch (input.decision.kind) {
+    case 'broker':
+      return failWorkPackageForMcpBroker({
+        ...common,
+        blocked: input.decision.blocked,
+        blockedReason: input.decision.blockedReason,
+        check: input.decision.check,
+        warnings: input.decision.warnings,
+      })
+    case 'filesystem_grant':
+      return failWorkPackageForFilesystemGrant({
+        ...common,
+        blockedReason: input.decision.blockedReason,
+        missingCapabilities: input.decision.missingCapabilities,
+        requestedCapabilities: input.decision.requestedCapabilities,
+      })
+    case 'reserved_role':
+      return failWorkPackageForReservedRole({
+        ...common,
+        blockedReason: input.decision.blockedReason,
+      })
+  }
+}
+
+/**
+ * Optimistic handoff invariant (no schema/version column required): MCP health
+ * is captured without a database transaction, then every admission input is
+ * loaded fresh and evaluated. The block/claim compare-and-set must still match
+ * package status, role, policy JSON, metadata JSON, and project MCP config/path.
+ * A miss never falls through to execution; callers recapture health and retry.
+ */
+async function admitWorkPackageForHandoff(
   taskId: string,
-  pkg: HandoffPackage,
-): Promise<{ blockedReason: string; status: 'blocked'; terminalBlock?: boolean } | { status: 'allowed' }> {
-  const reservedRoleBlock = architectReservedHandoffBlockedReason(pkg)
-  if (reservedRoleBlock) {
-    return failWorkPackageForReservedRole({
-      blockedReason: reservedRoleBlock,
-      pkg,
-      taskId,
-    })
+  candidate: HandoffPackage,
+  options: HandoffOptions,
+): Promise<HandoffAdmissionResult> {
+  const health = await captureMcpHealth(taskId)
+  if (!health) return { pkg: candidate, status: 'conflict' }
+  await options.afterMcpHealthCaptured?.({
+    attempt: (options.freshnessAttempt ?? 0) + 1,
+    packageId: candidate.id,
+    projectId: health.project.id,
+  })
+
+  const fresh = await rereadMcpHandoffInputs(taskId, candidate.id)
+  if (!fresh || !mcpProjectSnapshotsMatch(health.project, fresh.project)) {
+    return { pkg: fresh?.pkg ?? candidate, status: 'conflict' }
+  }
+  if (!['pending', 'ready', 'needs_rework', 'blocked'].includes(fresh.pkg.status)) {
+    return { pkg: fresh.pkg, status: 'conflict' }
   }
 
-  const filesystemGrantBlock = await filesystemGrantHandoffBlock(taskId, pkg)
-  if (filesystemGrantBlock) {
-    return failWorkPackageForFilesystemGrant({
-      blockedReason: filesystemGrantBlock.blockedReason,
-      missingCapabilities: filesystemGrantBlock.missingCapabilities,
-      pkg,
-      requestedCapabilities: filesystemGrantBlock.requestedCapabilities,
-      taskId,
-    })
+  const decision = evaluateWorkPackageHandoffAdmission({
+    health,
+    pkg: fresh.pkg,
+    project: fresh.project,
+  })
+  await options.afterMcpAdmissionEvaluated?.({
+    attempt: (options.freshnessAttempt ?? 0) + 1,
+    packageId: candidate.id,
+    status: 'status' in decision ? 'allowed' : 'blocked',
+  })
+  if ('status' in decision) {
+    return { pkg: fresh.pkg, project: fresh.project, status: 'allowed' }
   }
-
-  return assertWorkPackageMcpBrokerAllowsHandoff(taskId, pkg)
+  return persistWorkPackageHandoffBlock({
+    decision,
+    pkg: fresh.pkg,
+    project: fresh.project,
+    taskId,
+  })
 }
 
 export async function progressWorkforce(
@@ -1260,29 +1491,43 @@ export async function handoffApprovedWorkPackages(
       newlyReadyPackageIds.has(pkg.id) || pkg.status === 'ready'
     )
     const allowedReadyPackageIds: string[] = []
+    const freshnessPromotedPackageIds = new Set<string>()
 
     for (const readyPackage of readyOnlyCandidates) {
-      const broker = await assertWorkPackageAllowsHandoff(taskId, readyPackage)
-      if (broker.status === 'blocked') {
-        await promoteReadyPackages(
-          taskId,
-          allowedReadyPackageIds.filter((id) => newlyReadyPackageIds.has(id)),
-          now,
-        )
+      if (!hasWorkPackageMcpRuntimeInputs(readyPackage) && !architectReservedHandoffBlockedReason(readyPackage)) {
+        allowedReadyPackageIds.push(readyPackage.id)
+        continue
+      }
+      const admission = await admitWorkPackageForHandoff(taskId, readyPackage, options)
+      if (admission.status === 'conflict') {
+        return retryAfterHandoffFreshnessConflict(taskId, admission.pkg, options)
+      }
+      if (admission.status === 'blocked') {
         return {
           status: 'blocked',
           readyPackageIds: allowedReadyPackageIds,
           claimedPackageId: null,
-          blockedReason: broker.blockedReason,
-          terminalBlock: broker.terminalBlock,
+          blockedReason: admission.blockedReason,
+          terminalBlock: admission.terminalBlock,
         }
       }
-      allowedReadyPackageIds.push(readyPackage.id)
+      const promoted = await promotePackageWithFreshnessCas({
+        pkg: admission.pkg,
+        project: admission.project,
+        taskId,
+      })
+      if (!promoted) {
+        return retryAfterHandoffFreshnessConflict(taskId, admission.pkg, options)
+      }
+      freshnessPromotedPackageIds.add(admission.pkg.id)
+      allowedReadyPackageIds.push(admission.pkg.id)
     }
 
     await promoteReadyPackages(
       taskId,
-      allowedReadyPackageIds.filter((id) => newlyReadyPackageIds.has(id)),
+      allowedReadyPackageIds.filter((id) =>
+        newlyReadyPackageIds.has(id) && !freshnessPromotedPackageIds.has(id)
+      ),
       now,
     )
 
@@ -1305,34 +1550,53 @@ export async function handoffApprovedWorkPackages(
     }
   }
 
-  const nextPackage = state.nextPackage
+  let nextPackage = state.nextPackage
   if (!nextPackage) {
     return { status: 'no_ready_packages', readyPackageIds: [], claimedPackageId: null }
   }
 
-  const broker = await assertWorkPackageAllowsHandoff(taskId, nextPackage)
-  if (broker.status === 'blocked') {
-    return {
-      status: 'blocked',
-      readyPackageIds: [],
-      claimedPackageId: null,
-      blockedReason: broker.blockedReason,
-      terminalBlock: broker.terminalBlock,
-    }
-  }
-
   const allowedReadyPackageIds = [nextPackage.id]
-  await promoteReadyPackages(
-    taskId,
-    allowedReadyPackageIds.filter((id) => newlyReadyPackageIds.has(id)),
-    now,
-  )
+  let projectSnapshot: McpProjectFreshnessSnapshot | undefined
+  if (hasWorkPackageMcpRuntimeInputs(nextPackage) || architectReservedHandoffBlockedReason(nextPackage)) {
+    const admission = await admitWorkPackageForHandoff(taskId, nextPackage, options)
+    if (admission.status === 'conflict') {
+      return retryAfterHandoffFreshnessConflict(taskId, admission.pkg, options)
+    }
+    if (admission.status === 'blocked') {
+      return {
+        status: 'blocked',
+        readyPackageIds: [],
+        claimedPackageId: null,
+        blockedReason: admission.blockedReason,
+        terminalBlock: admission.terminalBlock,
+      }
+    }
+    nextPackage = admission.pkg
+    projectSnapshot = admission.project
+    const freshPackage = await promotePackageWithFreshnessCas({
+      pkg: admission.pkg,
+      project: admission.project,
+      taskId,
+    })
+    if (!freshPackage) {
+      return retryAfterHandoffFreshnessConflict(taskId, nextPackage, options)
+    }
+    nextPackage = freshPackage
+  } else {
+    await promoteReadyPackages(
+      taskId,
+      allowedReadyPackageIds.filter((id) => newlyReadyPackageIds.has(id)),
+      now,
+    )
+  }
 
   if (isWorkPackageExecutionEnabled()) {
     return executeReadyWorkPackage(taskId, nextPackage, allowedReadyPackageIds, {
+      afterWorkPackageClaimed: options.afterWorkPackageClaimed,
       claimEnabled,
       finalAttempt: options.finalAttempt,
-    })
+      freshnessAttempt: options.freshnessAttempt,
+    }, projectSnapshot)
   }
 
   const handoffStartedAt = new Date()
@@ -1359,7 +1623,14 @@ export async function handoffApprovedWorkPackages(
         metadata: metadataWithoutExecutionLease(nextPackage.metadata),
         updatedAt: handoffStartedAt,
       })
-      .where(and(eq(workPackages.id, nextPackage.id), eq(workPackages.status, 'ready')))
+      .where(and(
+        eq(workPackages.id, nextPackage.id),
+        eq(workPackages.status, 'ready'),
+        ...packageFreshnessConditions(nextPackage),
+        ...(projectSnapshot ? [
+          projectFreshnessExists(taskId, projectSnapshot),
+        ] : []),
+      ))
       .returning({ id: workPackages.id })
 
     if (!claimed) return null
@@ -1396,11 +1667,7 @@ export async function handoffApprovedWorkPackages(
   })
 
   if (!handoff) {
-    return {
-      status: 'already_handed_off',
-      readyPackageIds: allowedReadyPackageIds,
-      claimedPackageId: nextPackage.id,
-    }
+    return retryAfterHandoffFreshnessConflict(taskId, nextPackage, options)
   }
 
   await publishTaskEvent(taskId, 'run:started', {
@@ -1530,11 +1797,105 @@ async function promoteReadyPackages(taskId: string, packageIds: string[], now: D
   }
 }
 
+async function promotePackageWithFreshnessCas(input: {
+  pkg: HandoffPackage
+  project: McpProjectFreshnessSnapshot
+  taskId: string
+}): Promise<HandoffPackage | null> {
+  const promotedAt = new Date()
+  const [updated] = await db
+    .update(workPackages)
+    .set({ blockedReason: null, status: 'ready', updatedAt: promotedAt })
+    .where(and(
+      ...handoffFreshnessConditions(input),
+    ))
+    .returning({ id: workPackages.id })
+
+  if (!updated) return null
+  if (input.pkg.status !== 'ready') {
+    await publishTaskEventBestEffort(input.taskId, 'work_package:status', {
+      status: 'ready',
+      updatedAt: promotedAt.toISOString(),
+      workPackageId: input.pkg.id,
+    })
+  }
+  return { ...input.pkg, blockedReason: null, status: 'ready', updatedAt: promotedAt }
+}
+
+async function blockHandoffFreshnessExhaustion(input: {
+  pkg: HandoffPackage
+  project: McpProjectFreshnessSnapshot
+  taskId: string
+}): Promise<string | null> {
+  const blockedAt = new Date()
+  const blockedReason = `Work package "${input.pkg.title}" changed repeatedly while MCP health was being checked. Handoff was paused before execution; retry after package and project configuration settle.`
+  const marker = JSON.stringify({
+    blockedAt: blockedAt.toISOString(),
+    reason: blockedReason,
+    source: 'work-package-handoff',
+    status: 'blocked',
+  })
+  const [blocked] = await db
+    .update(workPackages)
+    .set({
+      blockedReason,
+      metadata: sql`jsonb_set(coalesce(${workPackages.metadata}, '{}'::jsonb), '{handoffFreshnessBlock}', ${marker}::jsonb, true)`,
+      status: 'blocked',
+      updatedAt: blockedAt,
+    })
+    .where(and(
+      ...handoffFreshnessConditions(input),
+    ))
+    .returning({ id: workPackages.id })
+
+  if (!blocked) return null
+  await publishTaskEventBestEffort(input.taskId, 'work_package:status', {
+    blockedReason,
+    handoffFreshnessBlock: { source: 'work-package-handoff', status: 'blocked' },
+    status: 'blocked',
+    updatedAt: blockedAt.toISOString(),
+    workPackageId: input.pkg.id,
+  })
+  await recordTaskLogBestEffort({
+    eventType: 'work_package.handoff_freshness_blocked',
+    level: 'warning',
+    message: blockedReason,
+    metadata: { workPackageId: input.pkg.id },
+    source: 'worker',
+    taskId: input.taskId,
+    title: 'Handoff paused after concurrent changes',
+    workPackageId: input.pkg.id,
+  })
+  return blockedReason
+}
+
+async function retryAfterHandoffFreshnessConflict(
+  taskId: string,
+  pkg: HandoffPackage,
+  options: HandoffOptions,
+): Promise<WorkPackageHandoffResult> {
+  const freshnessAttempt = (options.freshnessAttempt ?? 0) + 1
+  if (freshnessAttempt < MAX_HANDOFF_FRESHNESS_ATTEMPTS) {
+    return handoffApprovedWorkPackages(taskId, { ...options, freshnessAttempt })
+  }
+  const latest = await rereadMcpHandoffInputs(taskId, pkg.id)
+  const blockedReason = latest && ['pending', 'ready', 'needs_rework', 'blocked'].includes(latest.pkg.status)
+    ? await blockHandoffFreshnessExhaustion({ ...latest, taskId })
+    : null
+  return {
+    status: 'blocked',
+    readyPackageIds: [],
+    claimedPackageId: null,
+    blockedReason: blockedReason ?? 'Handoff freshness changed again before a safe block could be recorded. Retry the handoff.',
+  }
+}
+
 async function executeReadyWorkPackage(
   taskId: string,
   nextPackage: HandoffPackage,
   readyPackageIds: string[],
   options: HandoffOptions = {},
+  projectSnapshot?: McpProjectFreshnessSnapshot,
 ): Promise<WorkPackageHandoffResult> {
   const attemptNumber = await nextImplementationAttemptNumber(taskId, nextPackage.id)
   const claimedAt = new Date()
@@ -1547,7 +1908,14 @@ async function executeReadyWorkPackage(
         metadata: metadataWithoutExecutionLease(nextPackage.metadata),
         updatedAt: claimedAt,
       })
-      .where(and(eq(workPackages.id, nextPackage.id), eq(workPackages.status, 'ready')))
+      .where(and(
+        eq(workPackages.id, nextPackage.id),
+        eq(workPackages.status, 'ready'),
+        ...packageFreshnessConditions(nextPackage),
+        ...(projectSnapshot ? [
+          projectFreshnessExists(taskId, projectSnapshot),
+        ] : []),
+      ))
       .returning({ id: workPackages.id })
 
     if (!claimed) return { status: 'already_handed_off' as const }
@@ -1604,11 +1972,7 @@ async function executeReadyWorkPackage(
   })
 
   if (claim.status === 'already_handed_off') {
-    return {
-      status: 'already_handed_off',
-      readyPackageIds,
-      claimedPackageId: nextPackage.id,
-    }
+    return retryAfterHandoffFreshnessConflict(taskId, nextPackage, options)
   }
 
   if (claim.status === 'attempt_limit') {
@@ -1652,6 +2016,11 @@ async function executeReadyWorkPackage(
   let packageFailureHandled = false
 
   try {
+  await options.afterWorkPackageClaimed?.({
+    attempt: attemptNumber,
+    packageId: nextPackage.id,
+    runId: run.id,
+  })
   await publishTaskEventBestEffort(taskId, 'work_package:status', {
     status: 'running',
     updatedAt: new Date().toISOString(),
@@ -1683,7 +2052,10 @@ async function executeReadyWorkPackage(
       .update(workPackages)
       .set({
         blockedReason,
-        metadata: metadataWithoutExecutionLease(nextPackage.metadata),
+        // The lease predicate fences this cleanup to our run. Remove only the
+        // field this worker owns from the current JSONB document so grant or
+        // unrelated metadata written after claim cannot be rolled back.
+        metadata: sql`coalesce(${workPackages.metadata}, '{}'::jsonb) - 'executionLease'`,
         status: packageStatus,
         updatedAt: failedAt,
       })
@@ -2068,7 +2440,7 @@ async function executeReadyWorkPackage(
       .update(workPackages)
       .set({
         blockedReason,
-        metadata: metadataWithoutExecutionLease(nextPackage.metadata),
+        metadata: sql`coalesce(${workPackages.metadata}, '{}'::jsonb) - 'executionLease'`,
         status: packageStatus,
         updatedAt: failedAt,
       })
