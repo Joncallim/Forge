@@ -1,6 +1,11 @@
 # Issue #181 Architecture Review Amendments
 
-This document is authoritative where it narrows or clarifies `issue-181-e2e-admission-regression.md`.
+Status: historical review record.
+
+All normative amendments below were incorporated into
+`issue-181-e2e-admission-regression.md` during integrated review round 3. The
+primary architecture document is authoritative; this file records why it changed
+and must not override or narrow the primary document.
 
 ## Review round 1 findings and resolutions
 
@@ -49,6 +54,11 @@ Use deterministic timeouts, fixed clocks/database time, and bounded race barrier
 
 Scenario fixtures carry a schema version and name the expected lower-slice contracts. If a producer schema changes, fixture parsing fails clearly rather than silently defaulting. Scenario builders consume production normalizers/admission contracts and never duplicate their logic.
 
-## Review round 2 conclusion
+## Historical round 2 conclusion
 
-The amended test architecture now has clear ownership, exercises the real route through truthful dependency seams, shares fixed observations for parity, and prevents Playwright or duplicate fixtures from becoming an alternate policy implementation. No further architecture findings were identified in the reviewed scope.
+At that point the architecture had clearer ownership, exercised the real route,
+shared fixed observations, and kept Playwright from becoming an alternate policy
+implementation. Integrated round 3 later added the complete failure/recovery and
+mixed-version matrices, both packet grant modes, PostgreSQL-time barriers,
+persistence-wide leakage sentinels, exact CI budgets, and ADR 0008 supersession;
+consult the primary document for the current contract.
