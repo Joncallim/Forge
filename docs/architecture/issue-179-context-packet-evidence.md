@@ -421,8 +421,11 @@ Artifact content is a bounded human-readable summary derived only from these per
     security rotation, and two projects sharing one host path preserve the
     documented opaque `rootRef` identity and database uniqueness.
 20. Every issuance failure persists `autoRetryable:false`; `always_allow`
-    exposes `retry_execution` only for `not_exposed|submission_failed`, while
-    post-intent states expose `review_submission` with no direct retry.
+    exposes `retry_execution` immediately only for
+    `not_exposed|submission_failed`. Post-intent states initially expose
+    `review_submission` with no retry; only the append-only acknowledgement may
+    change disposition to `reviewed_submission`, after which the same locked
+    current-coverage predicate may expose `retry_execution`.
 21. Packet-recovery actions race double-click, grant revocation, policy mutation,
     task/package transition, and a new lease. The append-only action row and
     marker compare-and-set select one result; Redis failure leaves committed
