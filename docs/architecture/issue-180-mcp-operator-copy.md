@@ -461,8 +461,10 @@ Component/integration tests:
 19. every S4 delivery state renders separately from assembly and never implies
     submission from counts alone;
 20. one-time issuance recovery targets reapproval, safe pre-intent always-allow
-    recovery uses the locked retry predicate, and post-intent ambiguity requires
-    review with no direct retry.
+    recovery uses the locked retry predicate, and post-intent ambiguity initially
+    requires review with no retry; only a recorded acknowledgement may yield the
+    `reviewed_submission` disposition and then expose the same locked
+    current-coverage retry predicate.
 21. `not_issued` maps to Needs project context, and each project health state
     invokes its distinct typed install/enable/connect/configure/fix/refresh action.
 22. a live `submitting` audit is current in-progress state only; terminal artifacts
