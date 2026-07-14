@@ -67,6 +67,10 @@ Avoid:
 - Agent names without state, output, or accountability.
 - Hiding diffs, logs, tests, or failures behind too many clicks.
 
+The product identity follows the principle **Many specialists. One coordinated
+system.** See the [visual identity guide](brand.md) for the mark, motion,
+status, accessibility, and generated-asset rules.
+
 ## Required Screens
 
 | Screen | Purpose |

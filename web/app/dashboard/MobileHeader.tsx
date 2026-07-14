@@ -1,8 +1,9 @@
 'use client'
 
 import { useState } from 'react'
-import { MenuIcon, HammerIcon } from 'lucide-react'
+import { MenuIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { ForgeWordmark } from '@/components/brand'
 import {
   Sheet,
   SheetContent,
@@ -28,14 +29,13 @@ export function MobileHeader() {
         </Button>
 
         <SheetContent side="left" id="mobile-nav-sheet" aria-label="Navigation menu">
-          <SheetTitle className="sr-only">Navigation</SheetTitle>
+          <SheetTitle className="sr-only">Navigation menu</SheetTitle>
           <MobileNav onClose={() => setOpen(false)} />
         </SheetContent>
       </Sheet>
 
-      <div className="flex items-center gap-2">
-        <HammerIcon className="size-4 text-primary" aria-hidden="true" />
-        <span className="text-sm font-semibold">Forge</span>
+      <div className="flex items-center">
+        <ForgeWordmark size="xs" />
       </div>
     </header>
   )
