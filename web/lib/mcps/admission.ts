@@ -120,6 +120,7 @@ export type McpPrimaryBlockingDecision = {
   kind: 'requirement' | 'subtask'
   mode: McpAdmissionMode
   recoveryAction: McpRecoveryAction
+  retryableContribution: boolean
   reason: string
   evidenceRefs: string[]
   requirementKey: string
@@ -1743,6 +1744,7 @@ export function admitWorkPackageMcp(input: {
         kind: 'requirement' as const,
         mode: item.decision.mode,
         recoveryAction: item.decision.recoveryAction as McpRecoveryAction,
+        retryableContribution: item.decision.recoveryAction === 'install_or_fix_mcp',
         reason: item.decision.reason,
         evidenceRefs: [...item.decision.evidenceRefs],
         requirementKey: item.source.requirementKey,
@@ -1760,6 +1762,7 @@ export function admitWorkPackageMcp(input: {
         kind: 'subtask' as const,
         mode: item.class === 'deferred_live_mcp' ? 'deferred_live_mcp' as const : 'blocked' as const,
         recoveryAction: item.recoveryAction as McpRecoveryAction,
+        retryableContribution: item.recoveryAction === 'install_or_fix_mcp',
         reason: item.reason,
         evidenceRefs: [],
         requirementKey: item.requirementKey,
@@ -1815,7 +1818,7 @@ export function admitWorkPackageMcp(input: {
       blocked,
       warnings,
       blockedReason: blocked.length > 0 ? `MCP/capability broker blocked "${label}": ${blocked.join('; ')}` : null,
-      retryable: blockingItems.length > 0 && blockingItems.every((item) => item.action === 'install_or_fix_mcp'),
+      retryable: blockingItems.length > 0 && blockingItems.every((item) => item.decision.retryableContribution),
       ...(primary ? {
         primaryMode: primary.decision.mode,
         primaryRecoveryAction: primary.decision.recoveryAction,

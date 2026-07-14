@@ -2,9 +2,12 @@ import crypto from 'node:crypto'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { test, expect, type TestInfo } from '@playwright/test'
 import postgres from 'postgres'
 import { handoffApprovedWorkPackages } from '../worker/work-package-handoff'
+import { createSession } from '../lib/session'
+import { redis } from '../lib/redis'
 
 const databaseUrl = process.env.DATABASE_URL
 if (!databaseUrl) throw new Error('DATABASE_URL is required for MCP handoff concurrency tests.')
@@ -76,6 +79,7 @@ function explicitFilesystemGrant(grantApprovalId = crypto.randomUUID()) {
 
 async function seedPackage(sql: Sql, input: {
   metadata: JsonObject
+  mcpConfig?: JsonObject
   mcpRequirements: JsonObject[]
   title: string
 }) {
@@ -87,15 +91,16 @@ async function seedPackage(sql: Sql, input: {
   await mkdir(projectPath, { recursive: true })
   await sql`insert into users (id, display_name) values (${userId}, ${`Concurrency ${packageId}`})`
   await sql`
-    insert into projects (id, name, local_path, mcp_config)
+    insert into projects (id, name, local_path, mcp_config, submitted_by)
     values (
       ${projectId}, ${`Concurrency ${packageId}`}, ${projectPath},
-      ${sql.json({ profile: 'custom', requiredMcps: ['filesystem'], overrides: {} })}
+      ${sql.json(input.mcpConfig ?? { profile: 'custom', requiredMcps: ['filesystem'], overrides: {} })},
+      ${userId}
     )
   `
   await sql`
-    insert into tasks (id, project_id, title, prompt, status)
-    values (${taskId}, ${projectId}, ${input.title}, ${input.title}, 'approved')
+    insert into tasks (id, project_id, title, prompt, status, submitted_by)
+    values (${taskId}, ${projectId}, ${input.title}, ${input.title}, 'approved', ${userId})
   `
   await sql`
     insert into work_packages (
@@ -111,6 +116,46 @@ async function seedPackage(sql: Sql, input: {
   return { packageId, projectId, taskId, userId }
 }
 
+async function seedSiblingPackage(sql: Sql, input: {
+  metadata: JsonObject
+  mcpRequirements: JsonObject[]
+  taskId: string
+  title: string
+}) {
+  const packageId = crypto.randomUUID()
+  await sql`
+    insert into work_packages (
+      id, task_id, assigned_role, title, summary, status, sequence, steps,
+      required_capabilities, acceptance_criteria, mcp_requirements,
+      review_requirement, metadata
+    ) values (
+      ${packageId}, ${input.taskId}, 'backend', ${input.title}, ${input.title}, 'pending', 2,
+      ${sql.json(['Implement the sibling package.'])}, ${sql.json({})}, ${sql.json(['It is safe.'])},
+      ${sql.json(input.mcpRequirements)}, 'none', ${sql.json(input.metadata)}
+    )
+  `
+  await sql`
+    insert into work_package_dependencies (work_package_id, depends_on_work_package_id)
+    values (${packageId}, ${packageId})
+  `
+  return packageId
+}
+
+async function waitForLockWaiters(sql: Sql, blockingPid: number, expected: number): Promise<number[]> {
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    const rows = await sql`
+      select activity.pid::int as pid
+      from pg_stat_activity activity
+      where activity.datname = current_database()
+        and activity.wait_event_type = 'Lock'
+        and ${blockingPid} = any(pg_blocking_pids(activity.pid))
+    `
+    if (rows.length >= expected) return rows.map((row) => row.pid)
+    await delay(10)
+  }
+  throw new Error(`Expected ${expected} transaction(s) to wait on PostgreSQL backend ${blockingPid}.`)
+}
+
 function desktopOnly(testInfo: TestInfo) {
   test.skip(testInfo.project.name !== 'chromium-desktop', 'Database concurrency coverage runs once.')
 }
@@ -123,8 +168,10 @@ test.describe('MCP handoff optimistic concurrency', () => {
   let previousExecutionFlag: string | undefined
   let previousWorkspaceRoot: string | undefined
   let previousMcpsRoot: string | undefined
+  let previousWorkspaceSettings: Array<{ key: string; value: string }> = []
   const usersToDelete: string[] = []
   const projectsToDelete: string[] = []
+  const sessionsToDelete: string[] = []
 
   test.beforeEach(async ({}, testInfo) => {
     desktopOnly(testInfo)
@@ -137,6 +184,16 @@ test.describe('MCP handoff optimistic concurrency', () => {
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '0'
     process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
     process.env.FORGE_MCPS_ROOT = path.join(workspaceRoot, 'mcps')
+
+    previousWorkspaceSettings = await sql`
+      select key, value from app_settings where key in ('workspaceRoot', 'mcpsRoot')
+    `
+    await sql`
+      insert into app_settings (key, value) values
+        ('workspaceRoot', ${workspaceRoot}),
+        ('mcpsRoot', ${path.join(workspaceRoot, 'mcps')})
+      on conflict (key) do update set value = excluded.value, updated_at = now()
+    `
 
     const installPath = path.join(workspaceRoot, 'mcps', 'filesystem')
     await mkdir(installPath, { recursive: true })
@@ -156,6 +213,7 @@ test.describe('MCP handoff optimistic concurrency', () => {
 
   test.afterEach(async () => {
     if (!sql || !writer) return
+    await Promise.all(sessionsToDelete.splice(0).map((sessionId) => redis.del(`session:${sessionId}`)))
     for (const userId of usersToDelete.splice(0)) {
       await sql`delete from users where id = ${userId}`
     }
@@ -163,6 +221,13 @@ test.describe('MCP handoff optimistic concurrency', () => {
       await sql`delete from projects where id = ${projectId}`
     }
     await sql`delete from mcp_installations where mcp_id = 'filesystem'`
+    await sql`delete from app_settings where key in ('workspaceRoot', 'mcpsRoot')`
+    for (const setting of previousWorkspaceSettings.splice(0)) {
+      await sql`
+        insert into app_settings (key, value) values (${setting.key}, ${setting.value})
+        on conflict (key) do update set value = excluded.value, updated_at = now()
+      `
+    }
     await Promise.all([sql.end(), writer.end()])
     await rm(workspaceRoot, { recursive: true, force: true })
     if (previousExecutionFlag === undefined) delete process.env.FORGE_WORK_PACKAGE_EXECUTION
@@ -238,6 +303,271 @@ test.describe('MCP handoff optimistic concurrency', () => {
     expect(pkg.metadata.mcpGrantBlock.status).toBe('failed')
     const [{ count }] = await sql`select count(*)::int as count from agent_runs where work_package_id = ${seeded.packageId}`
     expect(count).toBe(0)
+    const [{ count: contextPacketAudits }] = await sql`
+      select count(*)::int as count
+      from filesystem_mcp_runtime_audits
+      where work_package_id = ${seeded.packageId}
+        and operation = 'context_packet'
+    `
+    expect(contextPacketAudits).toBe(0)
+  })
+
+  test('B2: project grant revocation holding the project lock before claim wins with zero runs', async () => {
+    const projectGrant = {
+      schemaVersion: 1,
+      mcpId: 'filesystem',
+      status: 'approved',
+      grantMode: 'always_allow',
+      capabilities: ['filesystem.project.read'],
+      grantApprovalId: crypto.randomUUID(),
+      approvedAt: new Date().toISOString(),
+      approvedBy: crypto.randomUUID(),
+      reason: 'Project context approved for the race fixture.',
+    }
+    const effective = {
+      ...explicitFilesystemGrant(projectGrant.grantApprovalId),
+      source: 'project-filesystem-approval',
+      grantMode: 'always_allow',
+      scope: 'project',
+      approvedAt: projectGrant.approvedAt,
+      approvedBy: projectGrant.approvedBy,
+      reason: projectGrant.reason,
+      grants: [{
+        mcpId: 'filesystem',
+        status: 'approved',
+        capabilities: projectGrant.capabilities,
+        grantApprovalId: projectGrant.grantApprovalId,
+        grantMode: 'always_allow',
+        reason: projectGrant.reason,
+      }],
+    }
+    const seeded = await seedPackage(sql, {
+      metadata: { mcpGrantPhases: { effective }, ownerNote: 'keep-project-race' },
+      mcpConfig: {
+        profile: 'custom',
+        requiredMcps: ['filesystem'],
+        overrides: {},
+        grants: { filesystem: projectGrant },
+      },
+      mcpRequirements: filesystemRequirement,
+      title: 'Project grant claim race',
+    })
+    usersToDelete.push(seeded.userId)
+    projectsToDelete.push(seeded.projectId)
+
+    let resolveWriterLocked!: () => void
+    const writerLocked = new Promise<void>((resolve) => { resolveWriterLocked = resolve })
+    let resolveRevocation!: () => void
+    const allowRevocationCommit = new Promise<void>((resolve) => { resolveRevocation = resolve })
+    let revokeProject: Promise<unknown> | null = null
+    let releaseAfterClaimWait: Promise<void> | null = null
+
+    const result = await handoffApprovedWorkPackages(seeded.taskId, {
+      beforeWorkPackageClaimPersisted: async ({ attempt, packageId, projectId }) => {
+        if (attempt !== 1) return
+        expect(packageId).toBe(seeded.packageId)
+        expect(projectId).toBe(seeded.projectId)
+        let writerPid = 0
+        revokeProject = writer.begin(async (tx) => {
+          const [backend] = await tx`select pg_backend_pid()::int as pid`
+          writerPid = backend.pid
+          await tx`
+            update projects
+            set mcp_config = jsonb_set(
+                  mcp_config - 'grants',
+                  '{revokedBy}', ${tx.json('operator-during-claim')}, true
+                ),
+                updated_at = now()
+            where id = ${seeded.projectId}
+          `
+          resolveWriterLocked()
+          await allowRevocationCommit
+        })
+        await writerLocked
+
+        // Release the revocation only after the handoff transaction is visibly
+        // waiting on its project row lock. This makes the interleaving stable:
+        // revocation commits first, then handoff reads the fresh project row.
+        releaseAfterClaimWait = (async () => {
+          try {
+            for (let attempt = 0; attempt < 200; attempt += 1) {
+              const [row] = await sql`
+                select exists (
+                  select 1
+                  from pg_stat_activity activity
+                  where activity.datname = current_database()
+                    and activity.wait_event_type = 'Lock'
+                    and ${writerPid} = any(pg_blocking_pids(activity.pid))
+                ) as waiting
+              `
+              if (row.waiting) return
+              await delay(10)
+            }
+            throw new Error('Handoff claim did not wait on the project revocation lock.')
+          } finally {
+            resolveRevocation()
+          }
+        })()
+      },
+    })
+
+    await Promise.all([revokeProject, releaseAfterClaimWait])
+    expect(result).toMatchObject({ status: 'blocked', claimedPackageId: null, terminalBlock: true })
+    const [project] = await sql`select mcp_config from projects where id = ${seeded.projectId}`
+    expect(project.mcp_config.grants).toBeUndefined()
+    expect(project.mcp_config.revokedBy).toBe('operator-during-claim')
+    const [pkg] = await sql`select status, metadata from work_packages where id = ${seeded.packageId}`
+    expect(pkg.status).toBe('failed')
+    expect(pkg.metadata.ownerNote).toBe('keep-project-race')
+    expect(pkg.metadata.mcpGrantBlock.status).toBe('failed')
+    const [{ count: runs }] = await sql`
+      select count(*)::int as count from agent_runs where work_package_id = ${seeded.packageId}
+    `
+    expect(runs).toBe(0)
+    const [{ count: contextPacketAudits }] = await sql`
+      select count(*)::int as count
+      from filesystem_mcp_runtime_audits
+      where work_package_id = ${seeded.packageId}
+        and operation = 'context_packet'
+    `
+    expect(contextPacketAudits).toBe(0)
+  })
+
+  test('F: mixed task grants and handoff recovery share project-to-package lock order without deadlock', async () => {
+    const seeded = await seedPackage(sql, {
+      metadata: { mcpGrantPhases: { effective: explicitFilesystemGrant() }, ownerNote: 'mixed-grant-owner' },
+      mcpRequirements: filesystemRequirement,
+      title: 'Mixed grant handoff target',
+    })
+    usersToDelete.push(seeded.userId)
+    projectsToDelete.push(seeded.projectId)
+    await sql`update work_packages set status = 'ready' where id = ${seeded.packageId}`
+    const siblingPackageId = await seedSiblingPackage(sql, {
+      metadata: { ownerNote: 'always-allow-sibling' },
+      mcpRequirements: filesystemRequirement,
+      taskId: seeded.taskId,
+      title: 'Project-wide grant sibling',
+    })
+    const sessionId = await createSession(seeded.userId, null, {
+      ip: '127.0.0.1',
+      userAgent: 'MCP concurrency regression',
+    })
+    sessionsToDelete.push(sessionId)
+
+    let resolveBlockerStarted!: () => void
+    const blockerStarted = new Promise<void>((resolve) => { resolveBlockerStarted = resolve })
+    let resolveTaskLock!: () => void
+    const releaseTaskLock = new Promise<void>((resolve) => { resolveTaskLock = resolve })
+    let resolveRaceStarted!: () => void
+    const raceStarted = new Promise<void>((resolve) => { resolveRaceStarted = resolve })
+    let blockingPid = 0
+    let blocker: Promise<unknown> | undefined
+    let releaseWatcher: Promise<void> | undefined
+    let routeResponse: Promise<Response> | undefined
+    const baseUrl = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
+    const admissionAttempts: number[] = []
+    const handoff = handoffApprovedWorkPackages(seeded.taskId, {
+      afterMcpAdmissionEvaluated: async ({ attempt, packageId }) => {
+        if (packageId === seeded.packageId) admissionAttempts.push(attempt)
+      },
+      beforeWorkPackageClaimPersisted: async ({ attempt, packageId }) => {
+        if (attempt !== 1 || packageId !== seeded.packageId) return
+        blocker = writer.begin(async (tx) => {
+          const [backend] = await tx`select pg_backend_pid()::int as pid`
+          blockingPid = backend.pid
+          await tx`select id from tasks where id = ${seeded.taskId} for update`
+          resolveBlockerStarted()
+          await releaseTaskLock
+        })
+        await blockerStarted
+        routeResponse = fetch(`${baseUrl}/api/tasks/${seeded.taskId}/filesystem-grants`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Cookie: `forge_session=${sessionId}`,
+          },
+          body: JSON.stringify({
+            schemaVersion: 1,
+            grants: [{
+              workPackageId: seeded.packageId,
+              decision: 'approved',
+              capabilities: ['filesystem.project.read'],
+              grantMode: 'allow_once',
+              reason: 'One bounded context issue for the target.',
+            }, {
+              workPackageId: siblingPackageId,
+              decision: 'approved',
+              capabilities: ['filesystem.project.read'],
+              grantMode: 'always_allow',
+              reason: 'Project-wide bounded context for siblings.',
+            }],
+          }),
+        })
+        const [routePid] = await Promise.race([
+          waitForLockWaiters(sql, blockingPid, 1),
+          routeResponse.then(async (response) => {
+            throw new Error(`Mixed grant route returned before the task lock barrier (${response.status}): ${await response.text()}`)
+          }),
+        ])
+        releaseWatcher = waitForLockWaiters(sql, routePid, 1)
+          .then(() => resolveTaskLock())
+        resolveRaceStarted()
+      },
+    })
+
+    try {
+      await Promise.race([
+        raceStarted,
+        delay(10_000).then(() => {
+          throw new Error('Mixed grant race did not reach the pre-claim lock-order barrier.')
+        }),
+      ])
+      if (!routeResponse) throw new Error('Mixed grant route did not start.')
+
+      const [response, handoffResult] = await Promise.race([
+        Promise.all([routeResponse, handoff] as const),
+        delay(10_000).then(() => {
+          throw new Error('Mixed grant update and handoff did not complete; possible lock-order deadlock.')
+        }),
+      ])
+      const responseBody = response.status === 200 ? '' : await response.text()
+      expect(response.status, responseBody).toBe(200)
+      expect(handoffResult).toMatchObject({ status: 'handed_off', claimedPackageId: seeded.packageId })
+      expect(admissionAttempts).toEqual([1, 2])
+    } finally {
+      resolveTaskLock()
+      await Promise.race([
+        Promise.allSettled([
+          blocker,
+          releaseWatcher,
+          routeResponse,
+          handoff,
+        ].filter((pending): pending is Promise<unknown> => pending !== undefined)),
+        delay(5_000),
+      ])
+    }
+
+    const [project] = await sql`select mcp_config from projects where id = ${seeded.projectId}`
+    expect(project.mcp_config.grants.filesystem).toMatchObject({
+      grantMode: 'always_allow',
+      capabilities: ['filesystem.project.read'],
+      status: 'approved',
+    })
+    const [target] = await sql`select metadata from work_packages where id = ${seeded.packageId}`
+    expect(target.metadata.ownerNote).toBe('mixed-grant-owner')
+    expect(target.metadata.mcpGrantPhases.effective.source).toBe('project-filesystem-approval')
+    const [{ count: approvals }] = await sql`
+      select count(*)::int as count
+      from filesystem_mcp_grant_approvals
+      where task_id = ${seeded.taskId}
+    `
+    expect(approvals).toBe(2)
+    const [{ count: runs }] = await sql`
+      select count(*)::int as count
+      from agent_runs
+      where work_package_id = ${seeded.packageId}
+    `
+    expect(runs).toBe(1)
   })
 
   test('C-D: broker blocks patch owned metadata and policy mutation is reevaluated', async () => {

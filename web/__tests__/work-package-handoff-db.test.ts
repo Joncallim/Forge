@@ -53,6 +53,9 @@ vi.mock('@/worker/review-gates', () => ({
   REVIEW_GATE_TYPES: ['qa_review', 'reviewer_review', 'security_review'],
   materializeReviewGatesForWorkPackageCompletion: mocks.materializeReviewGatesForWorkPackageCompletion,
   completeTaskIfReviewGatesSatisfied: mocks.completeTaskIfReviewGatesSatisfied,
+  isImplementationPackageRole: (role: string) => ![
+    '', 'architect', 'handoff', 'pm', 'qa', 'reviewer', 'security', 'security-review', 'security_review',
+  ].includes(role.trim().toLowerCase()),
 }))
 
 vi.mock('@/worker/work-package-executor', () => ({
@@ -69,10 +72,14 @@ function fixtureSecret(...parts: string[]) {
 }
 
 import { handoffApprovedWorkPackages, progressWorkforce } from '@/worker/work-package-handoff'
+import { prepareArchitectArtifact } from '@/worker/architect-artifact'
+import { evaluateWorkPackageMcpBroker } from '@/worker/mcp-execution-design'
+import { buildWorkforceMaterializationRows } from '@/worker/workforce-materializer'
 
 const originalExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
 const tempRoots: string[] = []
 const execFile = promisify(execFileCallback)
+let latestFreshAdmission: Record<string, unknown> | null = null
 
 async function initDirtyGitRepo(dir: string) {
   await execFile('git', ['init', '-b', 'main'], { cwd: dir })
@@ -85,13 +92,24 @@ async function initDirtyGitRepo(dir: string) {
 }
 
 function chain(resolveValue: unknown) {
+  const captureFreshAdmission = () => {
+    if (!Array.isArray(resolveValue)) return
+    const fresh = resolveValue.find((row) => (
+      row && typeof row === 'object' &&
+      'projectId' in row && 'mcpConfig' in row && 'assignedRole' in row && 'status' in row
+    ))
+    if (fresh) latestFreshAdmission = { ...(fresh as Record<string, unknown>) }
+  }
   const thenable: Record<string, unknown> = {
     then: (onFulfilled: (v: unknown) => unknown, onRejected?: (e: unknown) => unknown) =>
-      Promise.resolve(resolveValue).then(onFulfilled, onRejected),
+      Promise.resolve().then(() => {
+        captureFreshAdmission()
+        return resolveValue
+      }).then(onFulfilled, onRejected),
     catch: (onRejected: (e: unknown) => unknown) =>
       Promise.resolve(resolveValue).catch(onRejected),
   }
-  const methods = ['from', 'where', 'limit', 'orderBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'leftJoin']
+  const methods = ['from', 'where', 'limit', 'orderBy', 'values', 'returning', 'set', 'offset', 'innerJoin', 'leftJoin', 'for']
   methods.forEach((method) => {
     thenable[method] = () => thenable
   })
@@ -106,8 +124,65 @@ function chainWithLimit<T>(resolveValue: T[]) {
 
 function updateChain(returnValue: unknown) {
   const update = chain(returnValue)
-  update.set = vi.fn(() => update)
+  const returnedId = Array.isArray(returnValue) && returnValue[0] && typeof returnValue[0] === 'object'
+    ? (returnValue[0] as { id?: unknown }).id
+    : null
+  update.set = vi.fn((values: Record<string, unknown>) => {
+    const currentFreshAdmission = latestFreshAdmission
+    if (currentFreshAdmission && currentFreshAdmission.id === returnedId) {
+      latestFreshAdmission = {
+        ...currentFreshAdmission,
+        ...values,
+        // SQL expressions patch the current JSONB value in PostgreSQL. Keep
+        // the fixture's materialized metadata document for later lock reads.
+        ...(values.metadata && typeof values.metadata === 'object' && 'queryChunks' in values.metadata
+          ? { metadata: currentFreshAdmission.metadata }
+          : {}),
+      }
+    }
+    return update
+  })
   return update
+}
+
+function freshLockSelectMock() {
+  let call = 0
+  return vi.fn(() => {
+    call += 1
+    if (!latestFreshAdmission) return chain([])
+    if (call === 1) {
+      return chain([{
+        id: latestFreshAdmission.projectId,
+        localPath: latestFreshAdmission.localPath ?? null,
+        mcpConfig: latestFreshAdmission.mcpConfig ?? null,
+      }])
+    }
+    if (call === 2) {
+      return chain([{ id: 'task-1', projectId: latestFreshAdmission.projectId }])
+    }
+    return chain([{
+      assignedRole: latestFreshAdmission.assignedRole,
+      blockedReason: latestFreshAdmission.blockedReason ?? null,
+      harnessId: latestFreshAdmission.harnessId ?? null,
+      id: latestFreshAdmission.id,
+      mcpRequirements: latestFreshAdmission.mcpRequirements,
+      metadata: latestFreshAdmission.metadata,
+      sequence: latestFreshAdmission.sequence,
+      status: latestFreshAdmission.status,
+      title: latestFreshAdmission.title,
+      updatedAt: latestFreshAdmission.updatedAt ?? null,
+    }])
+  })
+}
+
+function jsonbMarkerFromUpdate(update: ReturnType<typeof updateChain>): Record<string, unknown> {
+  const setMock = update.set as ReturnType<typeof vi.fn>
+  const metadata = setMock.mock.calls[0]?.[0]?.metadata as { queryChunks?: unknown[] } | undefined
+  const serialized = metadata?.queryChunks?.find((chunk): chunk is string => (
+    typeof chunk === 'string' && chunk.startsWith('{')
+  ))
+  if (!serialized) throw new Error('Expected the handoff update to persist a JSONB marker.')
+  return JSON.parse(serialized) as Record<string, unknown>
 }
 
 function insertChain(returnValue: unknown = []) {
@@ -170,6 +245,7 @@ function mockNoOpHandoffTransaction(input: {
   mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
     callback({
       insert: vi.fn().mockReturnValueOnce(runInsert),
+      select: freshLockSelectMock(),
       update: vi.fn()
         .mockReturnValueOnce(claimUpdate)
         .mockReturnValueOnce(leaseUpdate),
@@ -178,17 +254,107 @@ function mockNoOpHandoffTransaction(input: {
   return { claimUpdate, leaseUpdate, runInsert }
 }
 
+function mockFreshPromotionTransaction() {
+  mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
+    callback({
+      insert: vi.fn(),
+      select: freshLockSelectMock(),
+      update: mocks.dbUpdate,
+    }),
+  )
+}
+
+function healthyMcpOverview() {
+  return {
+    projectId: 'project-1',
+    config: { profile: 'default' as const, requiredMcps: ['filesystem', 'github'], overrides: {} },
+    catalog: [],
+    mcpsRoot: '/tmp/forge/mcps',
+    statuses: ['filesystem', 'github'].map((mcpId) => ({
+      mcpId,
+      displayName: mcpId === 'github' ? 'GitHub' : 'Filesystem',
+      description: '',
+      enabled: true,
+      error: null,
+      installPath: `/tmp/forge/mcps/${mcpId}`,
+      installState: 'installed' as const,
+      status: 'healthy' as const,
+      checkedAt: '2026-07-14T00:00:00.000Z',
+    })),
+    summary: {
+      label: 'MCPs healthy',
+      status: 'healthy' as const,
+      missing: 0,
+      authRequired: 0,
+      unhealthy: 0,
+      disabled: 0,
+    },
+  }
+}
+
+function materializePackageFromPlan(input: {
+  plan: string
+  role?: string
+}) {
+  const overview = healthyMcpOverview()
+  const prepared = prepareArchitectArtifact(input.plan, overview)
+  let nextId = 0
+  const role = input.role ?? 'backend'
+  const rows = buildWorkforceMaterializationRows({
+    taskId: 'task-1',
+    architectRunId: 'run-architect',
+    artifactId: 'artifact-plan',
+    prepared,
+  }, {
+    activeAgents: [{ agentType: role, displayName: role }],
+    idFactory: () => `00000000-0000-4000-8000-${String(++nextId).padStart(12, '0')}`,
+  })
+  const pkg = rows.workPackages.find((candidate) => candidate.assignedRole === role)
+  if (!pkg) throw new Error(`Expected a materialized ${role} package.`)
+  return { overview, pkg, prepared }
+}
+
+async function blockMaterializedPackageAtHandoff(
+  pkg: Record<string, unknown>,
+  overview: ReturnType<typeof healthyMcpOverview>,
+) {
+  if (typeof pkg.id !== 'string') throw new Error('Expected a materialized package id.')
+  const packageId = pkg.id
+  const project = { id: 'project-1', mcpConfig: overview.config }
+  const handoffPackage = {
+    ...pkg,
+    blockedReason: pkg.blockedReason ?? null,
+    harnessId: pkg.harnessId ?? null,
+    sequence: pkg.sequence ?? 1,
+    status: 'pending',
+    updatedAt: pkg.updatedAt ?? null,
+  }
+  mocks.dbSelect
+    .mockReturnValueOnce(chain([handoffPackage]))
+    .mockReturnValueOnce(chain([]))
+    .mockReturnValueOnce(chain([{ project }]))
+    .mockReturnValueOnce(chain([freshAdmissionRow(handoffPackage, project)]))
+  mocks.getProjectMcpOverview.mockResolvedValue(overview)
+  const blockUpdate = updateChain([{ id: packageId }])
+  mocks.dbUpdate.mockReturnValueOnce(blockUpdate)
+
+  const result = await handoffApprovedWorkPackages('task-1', { claimEnabled: false })
+  return { blockUpdate, result }
+}
+
 describe('handoffApprovedWorkPackages', () => {
   beforeEach(() => {
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '0'
     vi.clearAllMocks()
     mocks.dbInsert.mockReset()
     mocks.dbSelect.mockReset()
+    latestFreshAdmission = null
     mocks.dbTransaction.mockReset()
     mocks.dbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) =>
       callback({
         insert: vi.fn(),
-        update: vi.fn(),
+        select: freshLockSelectMock(),
+        update: mocks.dbUpdate,
       }),
     )
     mocks.dbUpdate.mockReset()
@@ -415,7 +581,7 @@ describe('handoffApprovedWorkPackages', () => {
       metadata: expect.anything(),
       status: 'blocked',
     }))
-    expect(mocks.dbTransaction).not.toHaveBeenCalled()
+    expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
       blockedReason: expect.stringContaining('planning context was not materialized'),
       status: 'blocked',
@@ -453,7 +619,7 @@ describe('handoffApprovedWorkPackages', () => {
       metadata: expect.anything(),
       status: 'failed',
     }))
-    expect(mocks.dbTransaction).not.toHaveBeenCalled()
+    expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
       blockedReason: expect.stringContaining('reserved for review gates'),
       handoffSafety: expect.objectContaining({
@@ -543,7 +709,7 @@ describe('handoffApprovedWorkPackages', () => {
       errorMessage: expect.stringContaining('requires filesystem grant approval'),
       status: 'failed',
     }))
-    expect(mocks.dbTransaction).not.toHaveBeenCalled()
+    expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
   })
 
   it('holds a stale project-level filesystem grant when the project grant was revoked', async () => {
@@ -591,7 +757,7 @@ describe('handoffApprovedWorkPackages', () => {
       status: 'failed',
       metadata: expect.anything(),
     }))
-    expect(mocks.dbTransaction).not.toHaveBeenCalled()
+    expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
   })
 
   it('preserves an approved project filesystem grant through the broker handoff check', async () => {
@@ -725,6 +891,228 @@ describe('handoffApprovedWorkPackages', () => {
       status: 'ready',
       workPackageId: 'pkg-1',
     }))
+  })
+
+  it.each([
+    ['deferred', 'github.contents.write', []],
+    ['prohibited', 'github.issues.read', ['github.issues.read']],
+    ['malformed', 'github..read', []],
+    ['cross-MCP', 'filesystem.project.read', []],
+  ] as const)('blocks materialized subtask overflow containing a trailing %s capability at actual handoff', async (
+    _label,
+    boundaryCapability,
+    prohibitedCapabilities,
+  ) => {
+    const { overview, pkg, prepared } = materializePackageFromPlan({
+      plan: [
+        '# Plan',
+        '- [Backend] Implement the package safely.',
+        '```mcp_execution_design_json',
+        JSON.stringify({
+          schemaVersion: 1,
+          requirements: [{
+            mcpId: 'github',
+            requirement: 'required',
+            reason: 'Read issue context.',
+            assignment: { type: 'agent', targetAgents: ['backend'], targetId: null },
+            agentPermissions: { backend: ['github.issues.read'] },
+            prohibitedCapabilities,
+            fallback: { action: 'block', message: 'Revise the plan.' },
+          }],
+          promptOverlays: {},
+          requirementContexts: [],
+          mcpAwareSubtasks: [{
+            id: 'inspect',
+            agent: 'backend',
+            dependsOn: [],
+            mcpCapabilities: [...Array(30).fill('github.issues.read'), boundaryCapability],
+            inputs: [],
+            outputs: [],
+            verification: [],
+            stoppingCondition: 'Done.',
+            fallback: 'Revise the plan.',
+          }],
+        }),
+        '```',
+      ].join('\n'),
+    })
+
+    expect(prepared.mcpExecutionDesign.grantDecisions).toMatchObject({
+      admissionStatus: 'blocked',
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+    })
+    expect(prepared.mcpExecutionDesign.proposed).toMatchObject({
+      mcpAwareSubtasks: [],
+      normalizationErrors: expect.arrayContaining([
+        expect.stringMatching(/mcpCapabilities exceeds the maximum raw count of 30/),
+      ]),
+    })
+    expect(pkg.metadata).toMatchObject({
+      mcpAwareSubtasks: [],
+      mcpNormalizationErrors: expect.arrayContaining([
+        expect.stringMatching(/mcpCapabilities exceeds the maximum raw count of 30/),
+      ]),
+    })
+    const broker = evaluateWorkPackageMcpBroker({
+      assignedRole: pkg.assignedRole,
+      mcpOverview: overview,
+      mcpRequirements: pkg.mcpRequirements,
+      metadata: pkg.metadata,
+      projectMcpConfig: overview.config,
+      title: pkg.title,
+    })
+    expect(broker).toMatchObject({
+      status: 'blocked',
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+      retryable: false,
+    })
+
+    const { blockUpdate, result } = await blockMaterializedPackageAtHandoff(pkg, overview)
+    expect(result).toMatchObject({
+      status: 'blocked',
+      claimedPackageId: null,
+      blockedReason: expect.stringContaining('mcpCapabilities exceeds the maximum raw count of 30'),
+    })
+    expect(blockUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'blocked' }))
+    expect(jsonbMarkerFromUpdate(blockUpdate)).toMatchObject({
+      primaryMode: broker.primaryMode,
+      primaryRecoveryAction: broker.primaryRecoveryAction,
+    })
+    expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
+  })
+
+  it('blocks a real materialized separator-alias deny policy at handoff with preview parity', async () => {
+    const { overview, pkg, prepared } = materializePackageFromPlan({
+      role: 'backend-dev',
+      plan: [
+        '# Plan',
+        '- [backend-dev] Implement the canonical package.',
+        '```mcp_execution_design_json',
+        JSON.stringify({
+          schemaVersion: 1,
+          requirements: [{
+            mcpId: 'github',
+            requirement: 'required',
+            reason: 'Read issues.',
+            assignment: { type: 'agent', targetAgents: ['backend_dev'], targetId: null },
+            agentPermissions: { backend_dev: ['github.issues.read'] },
+            prohibitedCapabilities: [],
+            fallback: { action: 'block', message: 'Revise the plan.' },
+          }, {
+            mcpId: 'github',
+            requirement: 'required',
+            reason: 'Deny issue reads.',
+            assignment: { type: 'agent', targetAgents: ['backend-dev'], targetId: null },
+            agentPermissions: {},
+            prohibitedCapabilities: ['github.issues.read'],
+            fallback: { action: 'block', message: 'Revise the plan.' },
+          }],
+          promptOverlays: {},
+          requirementContexts: [],
+          mcpAwareSubtasks: [],
+        }),
+        '```',
+      ].join('\n'),
+    })
+    const preview = prepared.mcpExecutionDesign.grantDecisions
+    expect(preview).toMatchObject({
+      admissionStatus: 'blocked',
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+    })
+    expect(pkg.mcpRequirements).toEqual([
+      expect.objectContaining({ agent: 'backend-dev', permissions: ['github.issues.read'] }),
+      expect.objectContaining({ agent: 'backend-dev', prohibitedCapabilities: ['github.issues.read'] }),
+    ])
+    const broker = evaluateWorkPackageMcpBroker({
+      assignedRole: pkg.assignedRole,
+      mcpOverview: overview,
+      mcpRequirements: pkg.mcpRequirements,
+      metadata: pkg.metadata,
+      projectMcpConfig: overview.config,
+      title: pkg.title,
+    })
+    expect(broker).toMatchObject({
+      status: 'blocked',
+      primaryMode: preview.primaryMode,
+      primaryRecoveryAction: preview.primaryRecoveryAction,
+    })
+
+    const { blockUpdate, result } = await blockMaterializedPackageAtHandoff(pkg, overview)
+    expect(result).toMatchObject({
+      status: 'blocked',
+      claimedPackageId: null,
+      blockedReason: expect.stringContaining('prohibited'),
+    })
+    expect(blockUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'blocked' }))
+    expect(jsonbMarkerFromUpdate(blockUpdate)).toMatchObject({
+      primaryMode: preview.primaryMode,
+      primaryRecoveryAction: preview.primaryRecoveryAction,
+    })
+    expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps an invalid exact fence durable through materialization and actual handoff', async () => {
+    const { overview, pkg, prepared } = materializePackageFromPlan({
+      plan: [
+        '# Plan',
+        '- [Backend] Implement the package safely.',
+        '```mcp_execution_design_json',
+        '{"schemaVersion":1,not-json}',
+        '```',
+      ].join('\n'),
+    })
+    expect(prepared.planText).not.toContain('mcp_execution_design_json')
+    expect(prepared.mcpExecutionDesign.proposed).toMatchObject({
+      requirements: [],
+      normalizationEvidence: [{
+        schemaVersion: 1,
+        category: 'parse',
+        code: 'mcp_design_json_parse_failed',
+      }],
+    })
+    expect(prepared.mcpExecutionDesign.grantDecisions).toMatchObject({
+      admissionStatus: 'blocked',
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+    })
+    expect(pkg.metadata).toMatchObject({
+      mcpNormalizationErrors: [expect.stringMatching(/invalid JSON/)],
+      mcpNormalizationEvidence: [{
+        schemaVersion: 1,
+        category: 'parse',
+        code: 'mcp_design_json_parse_failed',
+      }],
+    })
+    const broker = evaluateWorkPackageMcpBroker({
+      assignedRole: pkg.assignedRole,
+      mcpOverview: overview,
+      mcpRequirements: pkg.mcpRequirements,
+      metadata: pkg.metadata,
+      projectMcpConfig: overview.config,
+      title: pkg.title,
+    })
+    expect(broker).toMatchObject({
+      status: 'blocked',
+      primaryMode: 'blocked',
+      primaryRecoveryAction: 'revise_plan',
+      retryable: false,
+    })
+
+    const { blockUpdate, result } = await blockMaterializedPackageAtHandoff(pkg, overview)
+    expect(result).toMatchObject({
+      status: 'blocked',
+      claimedPackageId: null,
+      blockedReason: expect.stringContaining('invalid JSON'),
+    })
+    expect(blockUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'blocked' }))
+    expect(jsonbMarkerFromUpdate(blockUpdate)).toMatchObject({
+      primaryMode: broker.primaryMode,
+      primaryRecoveryAction: broker.primaryRecoveryAction,
+    })
+    expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
   })
 
   it('promotes prompt-only MCP filesystem packages when handoff claiming is disabled', async () => {
@@ -903,7 +1291,7 @@ describe('handoffApprovedWorkPackages', () => {
       metadata: expect.anything(),
       status: 'blocked',
     }))
-    expect(mocks.dbTransaction).not.toHaveBeenCalled()
+    expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
   })
 
   it('continues handoff for an optional unavailable MCP with continue_without_mcp fallback', async () => {
@@ -940,6 +1328,7 @@ describe('handoffApprovedWorkPackages', () => {
 
     const readyUpdate = updateChain([{ id: 'pkg-1' }])
     mocks.dbUpdate.mockReturnValueOnce(readyUpdate)
+    mockFreshPromotionTransaction()
     const { claimUpdate } = mockNoOpHandoffTransaction()
 
     const result = await handoffApprovedWorkPackages('task-1')
@@ -989,7 +1378,7 @@ describe('handoffApprovedWorkPackages', () => {
       metadata: expect.anything(),
       status: 'blocked',
     }))
-    expect(mocks.dbTransaction).not.toHaveBeenCalled()
+    expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
   })
 
   it('returns blocked when auto-advancing into a broker-blocked follow-on package', async () => {
@@ -1164,6 +1553,7 @@ describe('handoffApprovedWorkPackages', () => {
       .mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
         callback({
           insert: vi.fn().mockReturnValueOnce(runInsert),
+          select: freshLockSelectMock(),
           update: vi.fn()
             .mockReturnValueOnce(claimUpdate)
             .mockReturnValueOnce(leaseUpdate),
@@ -1370,6 +1760,7 @@ describe('handoffApprovedWorkPackages', () => {
       .mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
         callback({
           insert: vi.fn().mockReturnValueOnce(runInsert),
+          select: freshLockSelectMock(),
           update: vi.fn()
             .mockReturnValueOnce(claimUpdate)
             .mockReturnValueOnce(leaseUpdate),
@@ -1475,6 +1866,7 @@ describe('handoffApprovedWorkPackages', () => {
     mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
       callback({
         insert: vi.fn(),
+        select: freshLockSelectMock(),
         update: vi.fn()
           .mockReturnValueOnce(claimUpdate)
           .mockReturnValueOnce(failedPackageUpdate),
@@ -1563,6 +1955,7 @@ describe('handoffApprovedWorkPackages', () => {
     mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
       callback({
         insert: vi.fn().mockReturnValueOnce(insertChain([{ id: 'run-1', agentRunId: 'run-1' }])),
+        select: freshLockSelectMock(),
         update: vi.fn()
           .mockReturnValueOnce(claimUpdate)
           .mockReturnValueOnce(leaseUpdate),
@@ -1736,6 +2129,7 @@ describe('handoffApprovedWorkPackages', () => {
       .mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
         callback({
           insert: vi.fn().mockReturnValueOnce(insertChain([{ id: 'run-1', agentRunId: 'run-1' }])),
+          select: freshLockSelectMock(),
           update: vi.fn()
             .mockReturnValueOnce(claimUpdate)
             .mockReturnValueOnce(leaseUpdate),
@@ -2406,6 +2800,7 @@ describe('handoffApprovedWorkPackages', () => {
 
     const readyUpdate = updateChain([{ id: 'pkg-1' }])
     mocks.dbUpdate.mockReturnValueOnce(readyUpdate)
+    mockFreshPromotionTransaction()
     const { claimUpdate } = mockNoOpHandoffTransaction()
 
     const result = await handoffApprovedWorkPackages('task-1')
@@ -2465,8 +2860,7 @@ describe('handoffApprovedWorkPackages', () => {
     // The exhaustion path reloads the latest row before applying its generic,
     // blockable-status-only jsonb_set marker.
     mocks.dbSelect
-      .mockReturnValueOnce(chain([candidate]))
-      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([freshAdmissionRow(candidate, project)]))
 
     const failedCasUpdates = Array.from({ length: 3 }, () => updateChain([]))
     const durableBlockUpdate = updateChain([{ id: candidate.id }])
@@ -2484,7 +2878,7 @@ describe('handoffApprovedWorkPackages', () => {
       blockedReason: expect.stringContaining('changed repeatedly while MCP health was being checked'),
     })
     expect(mocks.getProjectMcpOverview).toHaveBeenCalledTimes(3)
-    expect(mocks.dbTransaction).not.toHaveBeenCalled()
+    expect(mocks.dbTransaction).toHaveBeenCalledTimes(4)
     const durableBlockSet = durableBlockUpdate.set as ReturnType<typeof vi.fn>
     expect(durableBlockSet).toHaveBeenCalledWith(expect.objectContaining({
       blockedReason: expect.stringContaining('changed repeatedly'),
@@ -2525,9 +2919,15 @@ describe('handoffApprovedWorkPackages', () => {
 
     const lostClaim = updateChain([])
     const staleInsert = vi.fn()
+    mockFreshPromotionTransaction()
     mocks.dbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) =>
-      callback({ insert: staleInsert, update: vi.fn().mockReturnValueOnce(lostClaim) }),
+      callback({
+        insert: staleInsert,
+        select: freshLockSelectMock(),
+        update: vi.fn().mockReturnValueOnce(lostClaim),
+      }),
     )
+    mockFreshPromotionTransaction()
     mockNoOpHandoffTransaction({ packageId: candidate.id, runId: 'run-fresh' })
 
     const result = await handoffApprovedWorkPackages('task-1')

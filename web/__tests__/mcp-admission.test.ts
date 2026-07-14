@@ -1726,6 +1726,10 @@ describe('admitWorkPackageMcp', () => {
       retryable: true,
       primaryMode: 'bounded_context_approved',
       primaryRecoveryAction: 'install_or_fix_mcp',
+      primaryDecision: {
+        recoveryAction: 'install_or_fix_mcp',
+        retryableContribution: true,
+      },
     })
 
     const validation = admissionToValidation(admission)
@@ -1737,7 +1741,12 @@ describe('admitWorkPackageMcp', () => {
       admissionStatus: 'blocked',
       health: expect.objectContaining({ observed: true, checkedAt }),
     })
-    expect(preview).toMatchObject({ retryable: true, primaryMode: 'bounded_context_approved', primaryRecoveryAction: 'install_or_fix_mcp' })
+    expect(preview).toMatchObject({
+      retryable: true,
+      primaryMode: 'bounded_context_approved',
+      primaryRecoveryAction: 'install_or_fix_mcp',
+      primaryDecision: { retryableContribution: true },
+    })
 
     const broker = admissionToBrokerCheck(admission)
     expect(broker).toMatchObject({
@@ -1745,6 +1754,7 @@ describe('admitWorkPackageMcp', () => {
       retryable: true,
       primaryMode: 'bounded_context_approved',
       primaryRecoveryAction: 'install_or_fix_mcp',
+      primaryDecision: { retryableContribution: true },
       evaluations: expect.any(Array),
       subtaskDecisions: expect.any(Array),
     })
@@ -1910,6 +1920,7 @@ describe('admitWorkPackageMcp', () => {
       status: 'blocked',
       retryable: false,
       primaryRecoveryAction: 'revise_plan',
+      primaryDecision: { retryableContribution: false },
     })
 
     const warningOnly = admitPackage({
@@ -1954,18 +1965,39 @@ describe('admitWorkPackageMcp', () => {
         kind: 'requirement',
         mode: 'deferred_live_mcp',
         recoveryAction: 'revise_plan',
+        retryableContribution: false,
         requirementKey: 'z-gh',
         decisionId: expect.any(String),
         reason: expect.stringContaining('deferred live MCP capabilities'),
         evidenceRefs: ['github-proof'],
       },
     })
-    expect(admissionToGrantPreview(admission).primaryDecision).toEqual(admission.aggregate.primaryDecision)
+    const preview = admissionToGrantPreview(admission)
+    expect(preview.primaryDecision).toEqual(admission.aggregate.primaryDecision)
     expect(admissionToBrokerCheck(admission).primaryDecision).toEqual(admission.aggregate.primaryDecision)
+    if (preview.primaryDecision) preview.primaryDecision.retryableContribution = true
+    expect(admission.aggregate.primaryDecision?.retryableContribution).toBe(false)
     expect(admissionToBrokerCheck(admission)).toMatchObject({
       primaryMode: admission.aggregate.primaryDecision?.mode,
       primaryRecoveryAction: admission.aggregate.primaryDecision?.recoveryAction,
       retryable: false,
+    })
+  })
+
+  it('derives a subtask primary decision retryability contribution from its recovery action', () => {
+    const admission = admitPackage({
+      entries: [],
+      subtasks: [{ id: 'unsafe-write', agent: 'backend', mcpCapabilities: ['github.contents.write'] }],
+    })
+    expect(admission.aggregate).toMatchObject({
+      status: 'blocked',
+      retryable: false,
+      primaryDecision: {
+        kind: 'subtask',
+        recoveryAction: 'revise_plan',
+        retryableContribution: false,
+        subtaskId: 'unsafe-write',
+      },
     })
   })
 

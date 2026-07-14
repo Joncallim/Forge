@@ -87,6 +87,7 @@ export function buildMcpBrokerBlockMetadata(input: {
         evidenceRefs: [...input.check.primaryDecision.evidenceRefs],
       } : null,
       primaryRecoveryAction: input.check.primaryRecoveryAction ?? null,
+      primaryRetryableContribution: input.check.primaryDecision?.retryableContribution ?? null,
       recoveryAction: input.check.primaryRecoveryAction ?? null,
       retryable: input.check.retryable,
       status: 'blocked',

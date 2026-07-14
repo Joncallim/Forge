@@ -621,7 +621,7 @@ describe('executeWorkPackage', () => {
     })
   })
 
-  it('continues without repository context when a stale approved read grant meets only a write planning requirement', async () => {
+  it('continues without repository context when a revoked stale project read grant meets only a write planning requirement', async () => {
     await fs.writeFile(path.join(tempRoot, 'PRIVATE.md'), 'must not enter runtime context\n')
     mocks.generateText.mockResolvedValue({
       text: JSON.stringify({
@@ -648,7 +648,11 @@ describe('executeWorkPackage', () => {
               schemaVersion: 1,
               phase: 'effective',
               runtimeEnforcement: 'bounded_context_packet',
-              source: 'explicit-grant-approval',
+              source: 'project-filesystem-approval',
+              grantApprovalId: 'grant-project-stale',
+              grantMode: 'always_allow',
+              scope: 'project',
+              mcpId: 'filesystem',
               status: 'approved',
               grants: [{
                 mcpId: 'filesystem',

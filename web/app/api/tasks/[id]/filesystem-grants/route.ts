@@ -295,7 +295,6 @@ export async function PUT(
       .select()
       .from(workPackages)
       .where(and(eq(workPackages.taskId, taskId), inArray(workPackages.id, requestedPackageIds)))
-    const packageById = new Map(packageRows.map((pkg) => [pkg.id, pkg]))
     if (packageRows.length !== requestedPackageIds.length) {
       return NextResponse.json({ error: 'One or more work packages do not belong to this task.' }, { status: 404 })
     }
@@ -309,6 +308,55 @@ export async function PUT(
 
     const now = new Date()
     const { states: results, recoveredTask } = await db.transaction(async (tx) => {
+      // Keep the same global lock order as handoff admission. Always-allow
+      // grants can update the project and sibling packages, while failed-grant
+      // recovery can update the task. Lock every row this request may touch
+      // before the first write so mixed grant batches cannot deadlock with a
+      // concurrent project -> task -> package handoff claim.
+      const [lockedProject] = await tx
+        .select()
+        .from(projects)
+        .where(eq(projects.id, project.id))
+        .for('update')
+      if (!lockedProject) {
+        throw Object.assign(new Error('Project not found.'), { status: 404 })
+      }
+
+      const [lockedTask] = await tx
+        .select()
+        .from(tasks)
+        .where(and(eq(tasks.id, taskId), eq(tasks.projectId, lockedProject.id)))
+        .for('update')
+      if (!lockedTask) {
+        throw Object.assign(new Error('Task not found.'), { status: 404 })
+      }
+      if (!EDITABLE_TASK_STATUSES.includes(lockedTask.status as typeof EDITABLE_TASK_STATUSES[number])) {
+        throw Object.assign(
+          new Error(`Cannot edit filesystem grants while task status is '${lockedTask.status}'. Edit grants before execution starts or from a failed filesystem-grant recovery state.`),
+          { status: 409 },
+        )
+      }
+
+      const lockedPackageRows = await tx
+        .select()
+        .from(workPackages)
+        .where(eq(workPackages.taskId, taskId))
+        .orderBy(workPackages.id)
+        .for('update')
+      const lockedPackageById = new Map(lockedPackageRows.map((pkg) => [pkg.id, pkg]))
+      if (requestedPackageIds.some((packageId) => !lockedPackageById.has(packageId))) {
+        throw Object.assign(new Error('One or more work packages do not belong to this task.'), { status: 404 })
+      }
+      const noLongerEditable = requestedPackageIds
+        .map((packageId) => lockedPackageById.get(packageId)!)
+        .filter((pkg) => !canEditPackageGrant({ pkg, taskStatus: lockedTask.status }))
+      if (noLongerEditable.length > 0) {
+        throw Object.assign(
+          new Error(`Cannot edit filesystem grants for packages already in ${noLongerEditable.map((pkg) => `'${pkg.status}'`).join(', ')} status.`),
+          { status: 409 },
+        )
+      }
+
       const states: Array<ReturnType<typeof grantStateForPackage>> = []
       let shouldRecoverTask = false
       for (const grant of parsed.data.grants) {
@@ -316,7 +364,7 @@ export async function PUT(
           throw Object.assign(new Error('Only read-only project-scoped filesystem capabilities may be approved. filesystem.project.write is not supported.'), { status: 400 })
         }
 
-        const pkg = packageById.get(grant.workPackageId)
+        const pkg = lockedPackageById.get(grant.workPackageId)
         if (!pkg) {
           throw Object.assign(new Error('Work package not found.'), { status: 404 })
         }
@@ -381,14 +429,14 @@ export async function PUT(
         })
         const phases = buildGrantPhases({ effective, metadata: pkg.metadata })
         if (grant.decision === 'approved' && grant.grantMode === 'always_allow') {
-          const existingGrants = isRecord(project.mcpConfig.grants) ? project.mcpConfig.grants : {}
+          const existingGrants = isRecord(lockedProject.mcpConfig.grants) ? lockedProject.mcpConfig.grants : {}
           const existingFilesystemGrant = isRecord(existingGrants.filesystem) ? existingGrants.filesystem : {}
           const mergedCapabilities = canonicalFilesystemProjectCapabilities([
             ...canonicalFilesystemProjectCapabilities(existingFilesystemGrant.capabilities),
             ...capabilities,
           ])
           const nextMcpConfig = {
-            ...project.mcpConfig,
+            ...lockedProject.mcpConfig,
             grants: {
               ...existingGrants,
               filesystem: {
@@ -404,11 +452,19 @@ export async function PUT(
               },
             },
           }
-          project.mcpConfig = nextMcpConfig
-          await tx
+          const previousMcpConfig = lockedProject.mcpConfig
+          const [updatedProject] = await tx
             .update(projects)
             .set({ mcpConfig: nextMcpConfig, updatedAt: now })
-            .where(eq(projects.id, project.id))
+            .where(and(
+              eq(projects.id, lockedProject.id),
+              sql`${projects.mcpConfig} IS NOT DISTINCT FROM ${JSON.stringify(previousMcpConfig)}::jsonb`,
+            ))
+            .returning({ id: projects.id })
+          if (!updatedProject) {
+            throw Object.assign(new Error('Project filesystem configuration changed while grants were being saved. Retry the grant update.'), { status: 409 })
+          }
+          lockedProject.mcpConfig = nextMcpConfig
 
           const projectGrant = projectFilesystemGrantCovers({
             mcpConfig: nextMcpConfig,
@@ -417,12 +473,9 @@ export async function PUT(
           })
           const projectEffective = projectGrant ? projectFilesystemEffectivePhase(projectGrant) : null
           if (projectEffective) {
-            const siblingPackages = await tx
-              .select()
-              .from(workPackages)
-              .where(and(eq(workPackages.taskId, taskId), inArray(workPackages.status, [...STANDARD_EDITABLE_PACKAGE_STATUSES])))
-            for (const sibling of siblingPackages) {
+            for (const sibling of lockedPackageById.values()) {
               if (sibling.id === pkg.id) continue
+              if (!STANDARD_EDITABLE_PACKAGE_STATUSES.includes(sibling.status as typeof STANDARD_EDITABLE_PACKAGE_STATUSES[number])) continue
               if (!projectFilesystemGrantCovers({
                 mcpConfig: nextMcpConfig,
                 mcpRequirements: sibling.mcpRequirements,
@@ -430,7 +483,7 @@ export async function PUT(
               })) {
                 continue
               }
-              await tx
+              const [updatedSibling] = await tx
                 .update(workPackages)
                 .set({
                   metadata: grantMetadataUpdateSql({
@@ -444,6 +497,7 @@ export async function PUT(
                 })
                 .where(and(eq(workPackages.id, sibling.id), eq(workPackages.taskId, taskId)))
                 .returning()
+              if (updatedSibling) lockedPackageById.set(updatedSibling.id, updatedSibling)
             }
           }
         }
@@ -454,7 +508,7 @@ export async function PUT(
           .where(eq(filesystemMcpGrantApprovals.id, approval.id))
           .returning()
 
-        const recoveryStatus = packageUpdateStatus({ decision: grant.decision, pkg, taskStatus: task.status })
+        const recoveryStatus = packageUpdateStatus({ decision: grant.decision, pkg, taskStatus: lockedTask.status })
         const updateableStatuses = recoveryStatus.status
           ? [...FAILED_GRANT_RECOVERY_PACKAGE_STATUSES]
           : [...STANDARD_EDITABLE_PACKAGE_STATUSES]
@@ -477,6 +531,7 @@ export async function PUT(
         if (!updatedPackage) {
           throw Object.assign(new Error(`Cannot edit filesystem grants for package '${pkg.title}' because execution has already started or the package is no longer editable.`), { status: 409 })
         }
+        lockedPackageById.set(updatedPackage.id, updatedPackage)
 
         if (recoveryStatus.status === 'ready') {
           shouldRecoverTask = true
@@ -484,7 +539,7 @@ export async function PUT(
         states.push(grantStateForPackage({ approval: updatedApproval, pkg: updatedPackage }))
       }
       let recoveredTask: typeof tasks.$inferSelect | null = null
-      if (task.status === 'failed' && shouldRecoverTask) {
+      if (lockedTask.status === 'failed' && shouldRecoverTask) {
         const remainingBlockedPackages = await tx
           .select({ metadata: workPackages.metadata, status: workPackages.status })
           .from(workPackages)

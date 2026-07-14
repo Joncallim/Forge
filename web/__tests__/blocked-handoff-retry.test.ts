@@ -21,7 +21,11 @@ import {
   shouldAutoRetryBlockedHandoff,
 } from '@/worker/blocked-handoff-retry'
 import { evaluateWorkPackageMcpBroker } from '@/worker/mcp-execution-design'
-import type { McpBrokerAdmissionCheck } from '@/lib/mcps/admission'
+import {
+  admissionToBrokerCheck,
+  admitWorkPackageMcp,
+  type McpBrokerAdmissionCheck,
+} from '@/lib/mcps/admission'
 
 function brokerCheck(input: {
   blocked: string[]
@@ -134,6 +138,7 @@ describe('blocked handoff retry helper', () => {
         recoveryAction: check.primaryRecoveryAction,
         primaryRecoveryAction: check.primaryRecoveryAction,
         primaryDecision: check.primaryDecision,
+        primaryRetryableContribution: false,
         retryable: check.retryable,
         decisions: [expect.objectContaining({
           kind: 'requirement',
@@ -148,6 +153,44 @@ describe('blocked handoff retry helper', () => {
         }), expect.objectContaining({ requirementKey: 'mcp-policy-v1-write-1' })],
       },
     })
+  })
+
+  it('copies a true install-or-fix primary contribution into broker metadata without re-deriving it', () => {
+    const check = admissionToBrokerCheck(admitWorkPackageMcp({
+      entries: [{
+        requirementKey: 'filesystem-health', sourceRequirementIndex: 0, agent: 'backend', mcpId: 'filesystem',
+        requirement: 'required', capabilities: ['filesystem.project.read'], prohibitedCapabilities: [],
+        assignment: { type: 'agent', targetId: null }, fallback: { action: 'block', message: '' },
+      }],
+      subtasks: [],
+      label: 'Backend package',
+      statusFor: () => ({
+        mcpId: 'filesystem', displayName: 'Filesystem', description: '', installPath: '/tmp/filesystem',
+        installState: 'installed', status: 'unhealthy', enabled: true, error: 'probe failed',
+        checkedAt: '2026-07-14T00:00:00.000Z',
+      }),
+      effectiveGrantFor: () => ({
+        phase: 'approved', source: 'package-local', status: 'approved', grantMode: 'allow_once',
+        consumed: false, coveredCapabilities: ['filesystem.project.read'],
+      }),
+      hasPromptOnlyContextFor: () => false,
+    }))
+    expect(check).toMatchObject({
+      retryable: true,
+      primaryDecision: { recoveryAction: 'install_or_fix_mcp', retryableContribution: true },
+    })
+
+    const metadata = buildMcpBrokerBlockMetadata({
+      blockedAt: new Date('2026-07-14T00:01:00.000Z'),
+      check,
+      existingMetadata: {},
+    }) as { mcpBroker: Record<string, unknown> }
+    expect(metadata.mcpBroker).toMatchObject({
+      primaryDecision: check.primaryDecision,
+      primaryRetryableContribution: true,
+    })
+    ;(metadata.mcpBroker.primaryDecision as { retryableContribution: boolean }).retryableContribution = false
+    expect(check.primaryDecision?.retryableContribution).toBe(true)
   })
 
   it('stops auto-retry metadata after the retry budget is exhausted', () => {

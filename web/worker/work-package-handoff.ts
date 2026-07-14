@@ -112,6 +112,8 @@ type HandoffOptions = {
   afterMcpHealthCaptured?: (input: { attempt: number; packageId: string; projectId: string }) => Promise<void>
   /** Integration seam for a concurrent write after the execution lease is committed. */
   afterWorkPackageClaimed?: (input: { attempt: number; packageId: string; runId: string }) => Promise<void>
+  /** Integration seam for a policy writer that acquires its project lock immediately before claim persistence. */
+  beforeWorkPackageClaimPersisted?: (input: { attempt: number; packageId: string; projectId: string }) => Promise<void>
   claimEnabled?: boolean
   finalAttempt?: boolean
   freshnessAttempt?: number
@@ -163,17 +165,6 @@ function jsonbSnapshotEquals(column: unknown, value: unknown) {
   return sql`${column} IS NOT DISTINCT FROM ${JSON.stringify(value ?? null)}::jsonb`
 }
 
-function projectFreshnessExists(taskId: string, snapshot: McpProjectFreshnessSnapshot) {
-  return sql`exists (
-    select 1 from ${tasks}
-    inner join ${projects} on ${tasks.projectId} = ${projects.id}
-    where ${tasks.id} = ${taskId}
-      and ${projects.id} = ${snapshot.id}
-      and ${projects.localPath} IS NOT DISTINCT FROM ${snapshot.localPath}
-      and ${projects.mcpConfig} IS NOT DISTINCT FROM ${JSON.stringify(snapshot.mcpConfig ?? null)}::jsonb
-  )`
-}
-
 function packageFreshnessConditions(pkg: HandoffPackage) {
   return [
     eq(workPackages.assignedRole, pkg.assignedRole),
@@ -187,14 +178,11 @@ function packageFreshnessConditions(pkg: HandoffPackage) {
 
 function handoffFreshnessConditions(input: {
   pkg: HandoffPackage
-  project: McpProjectFreshnessSnapshot
-  taskId: string
 }) {
   return [
     eq(workPackages.id, input.pkg.id),
     eq(workPackages.status, input.pkg.status),
     ...packageFreshnessConditions(input.pkg),
-    projectFreshnessExists(input.taskId, input.project),
   ]
 }
 
@@ -250,6 +238,66 @@ function mcpProjectSnapshotsMatch(
   return left.id === right.id &&
     left.localPath === right.localPath &&
     sameJsonSnapshot(left.mcpConfig, right.mcpConfig)
+}
+
+function mcpPackageSnapshotsMatch(left: HandoffPackage, right: HandoffPackage): boolean {
+  return left.id === right.id &&
+    left.status === right.status &&
+    left.assignedRole === right.assignedRole &&
+    (left.blockedReason ?? null) === (right.blockedReason ?? null) &&
+    left.harnessId === right.harnessId &&
+    left.title === right.title &&
+    sameJsonSnapshot(left.mcpRequirements, right.mcpRequirements) &&
+    sameJsonSnapshot(left.metadata, right.metadata)
+}
+
+/**
+ * Serialize every persistence boundary that consumes an evaluated MCP snapshot.
+ * Project policy writers use the same project -> task -> package order, so a
+ * grant/config change either commits before this check (and is rejected as
+ * stale) or waits until the block/promotion/claim transaction has committed.
+ */
+async function lockFreshMcpHandoffInputs(
+  tx: WorkPackageLeaseTransaction,
+  taskId: string,
+  pkgSnapshot: HandoffPackage,
+  projectSnapshot: McpProjectFreshnessSnapshot,
+): Promise<boolean> {
+  const [lockedProject] = await tx
+    .select({
+      id: projects.id,
+      localPath: projects.localPath,
+      mcpConfig: projects.mcpConfig,
+    })
+    .from(projects)
+    .where(eq(projects.id, projectSnapshot.id))
+    .for('update')
+  if (!lockedProject || !mcpProjectSnapshotsMatch(projectSnapshot, lockedProject)) return false
+
+  const [lockedTask] = await tx
+    .select({ id: tasks.id, projectId: tasks.projectId })
+    .from(tasks)
+    .where(and(eq(tasks.id, taskId), eq(tasks.projectId, lockedProject.id)))
+    .for('update')
+  if (!lockedTask) return false
+
+  const [lockedPackage] = await tx
+    .select({
+      assignedRole: workPackages.assignedRole,
+      blockedReason: workPackages.blockedReason,
+      harnessId: workPackages.harnessId,
+      id: workPackages.id,
+      mcpRequirements: workPackages.mcpRequirements,
+      metadata: workPackages.metadata,
+      sequence: workPackages.sequence,
+      status: workPackages.status,
+      title: workPackages.title,
+      updatedAt: workPackages.updatedAt,
+    })
+    .from(workPackages)
+    .where(and(eq(workPackages.id, pkgSnapshot.id), eq(workPackages.taskId, taskId)))
+    .for('update')
+  return Boolean(lockedPackage && mcpPackageSnapshotsMatch(pkgSnapshot, lockedPackage))
 }
 
 async function publishTaskEventBestEffort(
@@ -896,19 +944,23 @@ async function failWorkPackageForMcpBroker(input: {
     existingMetadata: input.pkg.metadata,
   })
   const brokerMarker = metadata.mcpBroker
-  const [blockedRow] = await db
-    .update(workPackages)
-    .set({
-      blockedReason: input.blockedReason,
-      // This path owns only metadata.mcpBroker. The compare-and-set predicate
-      // below proves the broker evaluated the current JSON document, while
-      // jsonb_set keeps unrelated fields written by concurrent features intact.
-      metadata: sql`jsonb_set(coalesce(${workPackages.metadata}, '{}'::jsonb), '{mcpBroker}', ${JSON.stringify(brokerMarker)}::jsonb, true)`,
-      status: 'blocked',
-      updatedAt: blockedAt,
-    })
-    .where(and(...handoffFreshnessConditions(input)))
-    .returning({ id: workPackages.id })
+  const blockedRow = await db.transaction(async (tx) => {
+    if (!await lockFreshMcpHandoffInputs(tx, input.taskId, input.pkg, input.project)) return null
+    const [row] = await tx
+      .update(workPackages)
+      .set({
+        blockedReason: input.blockedReason,
+        // This path owns only metadata.mcpBroker. The exact package CAS proves
+        // the broker evaluated this JSON document; jsonb_set preserves fields
+        // owned by concurrent features.
+        metadata: sql`jsonb_set(coalesce(${workPackages.metadata}, '{}'::jsonb), '{mcpBroker}', ${JSON.stringify(brokerMarker)}::jsonb, true)`,
+        status: 'blocked',
+        updatedAt: blockedAt,
+      })
+      .where(and(...handoffFreshnessConditions(input)))
+      .returning({ id: workPackages.id })
+    return row ?? null
+  })
 
   if (!blockedRow) return { pkg: input.pkg, status: 'conflict' }
 
@@ -977,16 +1029,20 @@ async function failWorkPackageForFilesystemGrant(input: {
     source: 'filesystem-grant-approval',
     status: 'failed',
   }
-  const [failedRow] = await db
-    .update(workPackages)
-    .set({
-      blockedReason: input.blockedReason,
-      metadata: sql`jsonb_set(coalesce(${workPackages.metadata}, '{}'::jsonb), '{mcpGrantBlock}', ${JSON.stringify(grantBlockMarker)}::jsonb, true)`,
-      status: 'failed',
-      updatedAt: failedAt,
-    })
-    .where(and(...handoffFreshnessConditions(input)))
-    .returning({ id: workPackages.id })
+  const failedRow = await db.transaction(async (tx) => {
+    if (!await lockFreshMcpHandoffInputs(tx, input.taskId, input.pkg, input.project)) return null
+    const [row] = await tx
+      .update(workPackages)
+      .set({
+        blockedReason: input.blockedReason,
+        metadata: sql`jsonb_set(coalesce(${workPackages.metadata}, '{}'::jsonb), '{mcpGrantBlock}', ${JSON.stringify(grantBlockMarker)}::jsonb, true)`,
+        status: 'failed',
+        updatedAt: failedAt,
+      })
+      .where(and(...handoffFreshnessConditions(input)))
+      .returning({ id: workPackages.id })
+    return row ?? null
+  })
 
   if (!failedRow) return { pkg: input.pkg, status: 'conflict' }
 
@@ -1077,16 +1133,20 @@ async function failWorkPackageForReservedRole(input: {
     source: 'architect-reserved-role',
     status: 'failed',
   }
-  const [failedRow] = await db
-    .update(workPackages)
-    .set({
-      blockedReason: input.blockedReason,
-      metadata: sql`jsonb_set(coalesce(${workPackages.metadata}, '{}'::jsonb), '{handoffSafety}', ${JSON.stringify(handoffSafetyMarker)}::jsonb, true)`,
-      status: 'failed',
-      updatedAt: failedAt,
-    })
-    .where(and(...handoffFreshnessConditions(input)))
-    .returning({ id: workPackages.id })
+  const failedRow = await db.transaction(async (tx) => {
+    if (!await lockFreshMcpHandoffInputs(tx, input.taskId, input.pkg, input.project)) return null
+    const [row] = await tx
+      .update(workPackages)
+      .set({
+        blockedReason: input.blockedReason,
+        metadata: sql`jsonb_set(coalesce(${workPackages.metadata}, '{}'::jsonb), '{handoffSafety}', ${JSON.stringify(handoffSafetyMarker)}::jsonb, true)`,
+        status: 'failed',
+        updatedAt: failedAt,
+      })
+      .where(and(...handoffFreshnessConditions(input)))
+      .returning({ id: workPackages.id })
+    return row ?? null
+  })
 
   if (!failedRow) return { pkg: input.pkg, status: 'conflict' }
 
@@ -1355,11 +1415,11 @@ async function persistWorkPackageHandoffBlock(input: {
 }
 
 /**
- * Optimistic handoff invariant (no schema/version column required): MCP health
- * is captured without a database transaction, then every admission input is
- * loaded fresh and evaluated. The block/claim compare-and-set must still match
- * package status, role, policy JSON, metadata JSON, and project MCP config/path.
- * A miss never falls through to execution; callers recapture health and retry.
+ * Project-locked handoff invariant (no schema/version column required): live
+ * MCP health is captured outside a transaction, then admission inputs are read
+ * fresh and evaluated. Every persistence boundary locks project -> task ->
+ * package, verifies the locked project snapshot, and applies an exact package
+ * compare-and-set. A miss never executes; callers recapture health and retry.
  */
 async function admitWorkPackageForHandoff(
   taskId: string,
@@ -1593,6 +1653,7 @@ export async function handoffApprovedWorkPackages(
   if (isWorkPackageExecutionEnabled()) {
     return executeReadyWorkPackage(taskId, nextPackage, allowedReadyPackageIds, {
       afterWorkPackageClaimed: options.afterWorkPackageClaimed,
+      beforeWorkPackageClaimPersisted: options.beforeWorkPackageClaimPersisted,
       claimEnabled,
       finalAttempt: options.finalAttempt,
       freshnessAttempt: options.freshnessAttempt,
@@ -1614,7 +1675,21 @@ export async function handoffApprovedWorkPackages(
     source: 'work-package-handoff',
     workPackageId: nextPackage.id,
   }
+  if (projectSnapshot) {
+    await options.beforeWorkPackageClaimPersisted?.({
+      attempt: (options.freshnessAttempt ?? 0) + 1,
+      packageId: nextPackage.id,
+      projectId: projectSnapshot.id,
+    })
+  }
   const handoff = await db.transaction(async (tx) => {
+    if (projectSnapshot && !await lockFreshMcpHandoffInputs(
+      tx,
+      taskId,
+      nextPackage,
+      projectSnapshot,
+    )) return null
+
     const [claimed] = await tx
       .update(workPackages)
       .set({
@@ -1627,9 +1702,6 @@ export async function handoffApprovedWorkPackages(
         eq(workPackages.id, nextPackage.id),
         eq(workPackages.status, 'ready'),
         ...packageFreshnessConditions(nextPackage),
-        ...(projectSnapshot ? [
-          projectFreshnessExists(taskId, projectSnapshot),
-        ] : []),
       ))
       .returning({ id: workPackages.id })
 
@@ -1803,13 +1875,15 @@ async function promotePackageWithFreshnessCas(input: {
   taskId: string
 }): Promise<HandoffPackage | null> {
   const promotedAt = new Date()
-  const [updated] = await db
-    .update(workPackages)
-    .set({ blockedReason: null, status: 'ready', updatedAt: promotedAt })
-    .where(and(
-      ...handoffFreshnessConditions(input),
-    ))
-    .returning({ id: workPackages.id })
+  const updated = await db.transaction(async (tx) => {
+    if (!await lockFreshMcpHandoffInputs(tx, input.taskId, input.pkg, input.project)) return null
+    const [row] = await tx
+      .update(workPackages)
+      .set({ blockedReason: null, status: 'ready', updatedAt: promotedAt })
+      .where(and(...handoffFreshnessConditions(input)))
+      .returning({ id: workPackages.id })
+    return row ?? null
+  })
 
   if (!updated) return null
   if (input.pkg.status !== 'ready') {
@@ -1835,18 +1909,20 @@ async function blockHandoffFreshnessExhaustion(input: {
     source: 'work-package-handoff',
     status: 'blocked',
   })
-  const [blocked] = await db
-    .update(workPackages)
-    .set({
-      blockedReason,
-      metadata: sql`jsonb_set(coalesce(${workPackages.metadata}, '{}'::jsonb), '{handoffFreshnessBlock}', ${marker}::jsonb, true)`,
-      status: 'blocked',
-      updatedAt: blockedAt,
-    })
-    .where(and(
-      ...handoffFreshnessConditions(input),
-    ))
-    .returning({ id: workPackages.id })
+  const blocked = await db.transaction(async (tx) => {
+    if (!await lockFreshMcpHandoffInputs(tx, input.taskId, input.pkg, input.project)) return null
+    const [row] = await tx
+      .update(workPackages)
+      .set({
+        blockedReason,
+        metadata: sql`jsonb_set(coalesce(${workPackages.metadata}, '{}'::jsonb), '{handoffFreshnessBlock}', ${marker}::jsonb, true)`,
+        status: 'blocked',
+        updatedAt: blockedAt,
+      })
+      .where(and(...handoffFreshnessConditions(input)))
+      .returning({ id: workPackages.id })
+    return row ?? null
+  })
 
   if (!blocked) return null
   await publishTaskEventBestEffort(input.taskId, 'work_package:status', {
@@ -1899,7 +1975,21 @@ async function executeReadyWorkPackage(
 ): Promise<WorkPackageHandoffResult> {
   const attemptNumber = await nextImplementationAttemptNumber(taskId, nextPackage.id)
   const claimedAt = new Date()
+  if (projectSnapshot) {
+    await options.beforeWorkPackageClaimPersisted?.({
+      attempt: (options.freshnessAttempt ?? 0) + 1,
+      packageId: nextPackage.id,
+      projectId: projectSnapshot.id,
+    })
+  }
   const claim = await db.transaction(async (tx) => {
+    if (projectSnapshot && !await lockFreshMcpHandoffInputs(
+      tx,
+      taskId,
+      nextPackage,
+      projectSnapshot,
+    )) return { status: 'already_handed_off' as const }
+
     const [claimed] = await tx
       .update(workPackages)
       .set({
@@ -1912,9 +2002,6 @@ async function executeReadyWorkPackage(
         eq(workPackages.id, nextPackage.id),
         eq(workPackages.status, 'ready'),
         ...packageFreshnessConditions(nextPackage),
-        ...(projectSnapshot ? [
-          projectFreshnessExists(taskId, projectSnapshot),
-        ] : []),
       ))
       .returning({ id: workPackages.id })
 

@@ -2946,6 +2946,25 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       .toBeLessThan((lockedPackagesChain.for as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
   })
 
+  const overflowingSubtaskPolicy = (
+    boundaryCapability: string,
+    prohibitedCapabilities: readonly string[] = [],
+  ) => ({
+    schemaVersion: 1,
+    requirements: [{
+      mcpId: 'github', requirement: 'required', reason: 'Read issues.',
+      assignment: { type: 'agent', targetAgents: ['backend'], targetId: null },
+      agentPermissions: { backend: ['github.issues.read'] },
+      prohibitedCapabilities: [...prohibitedCapabilities], fallback: { action: 'block', message: 'Revise.' },
+    }],
+    promptOverlays: {}, requirementContexts: [],
+    mcpAwareSubtasks: [{
+      id: 'inspect', agent: 'backend', dependsOn: [],
+      mcpCapabilities: [...Array(30).fill('github.issues.read'), boundaryCapability],
+      inputs: [], outputs: [], verification: [], stoppingCondition: 'Done.', fallback: 'Revise.',
+    }],
+  })
+
   it.each([
     ['filesystem first', ['filesystem', 'github']],
     ['github first', ['github', 'filesystem']],
@@ -3014,10 +3033,12 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
         kind: 'requirement',
         mode: 'deferred_live_mcp',
         recoveryAction: 'revise_plan',
+        retryableContribution: false,
         requirementKey: 'z-gh',
         reason: expect.stringContaining('deferred live MCP capabilities'),
         evidenceRefs: ['github-proof'],
       },
+      primaryRetryableContribution: false,
       retryable: false,
       workPackageId: 'pkg-mixed',
     })
@@ -3038,10 +3059,12 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     expect(body.primaryDecision).toEqual(broker.primaryDecision)
     expect(body.primaryMode).toBe(broker.primaryMode)
     expect(body.primaryRecoveryAction).toBe(broker.primaryRecoveryAction)
+    expect(body.primaryRetryableContribution).toBe(broker.primaryDecision?.retryableContribution)
     expect(body.retryable).toBe(broker.retryable)
     expect(brokerMetadata.mcpBroker.primaryDecision).toEqual(body.primaryDecision)
     expect(brokerMetadata.mcpBroker.primaryMode).toBe(body.primaryMode)
     expect(brokerMetadata.mcpBroker.primaryRecoveryAction).toBe(body.primaryRecoveryAction)
+    expect(brokerMetadata.mcpBroker.primaryRetryableContribution).toBe(body.primaryRetryableContribution)
     expect(brokerMetadata.mcpBroker.retryable).toBe(body.retryable)
     expect(mockDbUpdate).not.toHaveBeenCalled()
     expect(mockRedisLpush).not.toHaveBeenCalled()
@@ -3266,21 +3289,10 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       requirementContexts: [{ sourceRequirementIndex: '0', agent: 'backend', promptOverlay: 'RAW-CONTEXT' }],
       mcpAwareSubtasks: [],
     }, 'RAW-CONTEXT'],
-    ['overflowing unsafe subtask', {
-      schemaVersion: 1,
-      requirements: [{
-        mcpId: 'github', requirement: 'required', reason: 'Read issues.',
-        assignment: { type: 'agent', targetAgents: ['backend'], targetId: null },
-        agentPermissions: { backend: ['github.issues.read'] },
-        prohibitedCapabilities: [], fallback: { action: 'block', message: 'Revise.' },
-      }],
-      promptOverlays: {}, requirementContexts: [],
-      mcpAwareSubtasks: [{
-        id: 'inspect', agent: 'backend', dependsOn: [],
-        mcpCapabilities: [...Array(30).fill('github.issues.read'), 'github.contents.write'],
-        inputs: [], outputs: [], verification: [], stoppingCondition: 'Done.', fallback: 'Revise.',
-      }],
-    }, 'github.contents.write'],
+    ['overflowing deferred subtask', overflowingSubtaskPolicy('github.contents.write'), 'github.contents.write'],
+    ['overflowing prohibited subtask', overflowingSubtaskPolicy('github.issues.read', ['github.issues.read']), 'github.issues.read'],
+    ['overflowing malformed subtask', overflowingSubtaskPolicy('github..read'), 'github..read'],
+    ['overflowing cross-MCP subtask', overflowingSubtaskPolicy('filesystem.project.read'), 'filesystem.project.read'],
   ] as const)('propagates %s through artifact, materializer, and real approval', async (_label, rawDesign, rawPolicyText) => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const taskId = 'task-nested-policy-invalid'
@@ -3303,7 +3315,7 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       expect.objectContaining({ schemaVersion: 1, category: 'normalization', code: 'mcp_design_nested_policy_invalid' }),
     ])
     expect(JSON.stringify(preparedArtifact.mcpExecutionDesign.proposed?.normalizationEvidence)).not.toContain(rawPolicyText)
-    if (_label === 'overflowing unsafe subtask') {
+    if (_label.startsWith('overflowing ')) {
       expect(preparedArtifact.mcpExecutionDesign.proposed?.mcpAwareSubtasks).toEqual([])
     }
 
@@ -3323,7 +3335,7 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     })
     expect((materialized.metadata as { mcpNormalizationErrors: string[] }).mcpNormalizationErrors)
       .toEqual(expect.arrayContaining([expect.any(String)]))
-    if (_label === 'overflowing unsafe subtask') {
+    if (_label.startsWith('overflowing ')) {
       expect(materialized.metadata).toMatchObject({ mcpAwareSubtasks: [] })
     }
 
@@ -3746,8 +3758,13 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       })],
     })
 
-    mockDbSelect.mockClear()
-    mockDbUpdate.mockClear()
+    const selectFallback = mockDbSelect.getMockImplementation()
+    const updateFallback = mockDbUpdate.getMockImplementation()
+    mockDbSelect.mockReset()
+    mockDbUpdate.mockReset()
+    if (selectFallback) mockDbSelect.mockImplementation(selectFallback)
+    if (updateFallback) mockDbUpdate.mockImplementation(updateFallback)
+    mockGetProjectMcpOverview.mockReset()
     mockGetProjectMcpOverview.mockResolvedValueOnce(fixedOverview)
     mockDbSelect
       .mockReturnValueOnce(chain([approvedPackage]))
@@ -3759,6 +3776,16 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
         mcpConfig: projectRow.mcpConfig,
         projectId: projectRow.id,
       }]))
+      .mockReturnValueOnce(chain([{
+        id: projectRow.id,
+        localPath: null,
+        mcpConfig: projectRow.mcpConfig,
+      }]))
+      .mockReturnValueOnce(chain([{
+        id: 'task-approval',
+        projectId: projectRow.id,
+      }]))
+      .mockReturnValueOnce(chain([approvedPackage]))
     const readyUpdate = chain([{ id: approvedPackage.id }])
     readyUpdate.set = vi.fn(() => readyUpdate)
     mockDbUpdate.mockReturnValueOnce(readyUpdate)
@@ -5123,6 +5150,26 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     }
   }
 
+  function mockTaskGrantTransactionLocks(input: {
+    packages: Array<Record<string, unknown>>
+    project: Record<string, unknown>
+    task: Record<string, unknown>
+  }) {
+    const transactionSelect = vi.fn()
+      .mockReturnValueOnce(chain([input.project]))
+      .mockReturnValueOnce(chain([input.task]))
+      .mockReturnValueOnce(chain(input.packages))
+      .mockImplementation(() => mockDbSelect())
+    mockDbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) =>
+      callback({
+        select: transactionSelect,
+        insert: mockDbInsert,
+        update: mockDbUpdate,
+        delete: mockDbDelete,
+      }),
+    )
+  }
+
   it('approves edited read-only filesystem grants and persists an effective phase', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbInsert.mockReturnValue(chain([{
@@ -5164,6 +5211,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([pkg]))
         .mockReturnValue(chain([pkg]))
+      mockTaskGrantTransactionLocks({
+        packages: [pkg],
+        project,
+        task: grantTask(project.id as string),
+      })
       mockDbUpdate
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)
@@ -5243,6 +5295,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([pkg]))
         .mockReturnValueOnce(chain([pkg]))
         .mockReturnValue(chain([pkg]))
+      mockTaskGrantTransactionLocks({
+        packages: [pkg],
+        project,
+        task: grantTask(project.id as string),
+      })
       mockDbUpdate
         .mockReturnValueOnce(projectUpdate)
         .mockReturnValueOnce(approvalUpdate)
@@ -5425,6 +5482,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       .mockReturnValueOnce(chain([grantTask()]))
       .mockReturnValueOnce(chain([{ id: 'project-fs-grant' }]))
       .mockReturnValueOnce(chain([pkg]))
+    mockTaskGrantTransactionLocks({
+      packages: [pkg],
+      project: { id: 'project-fs-grant', mcpConfig: {} },
+      task: grantTask(),
+    })
     mockDbUpdate
       .mockReturnValueOnce(approvalUpdate)
       .mockReturnValueOnce(packageUpdate)
@@ -5461,6 +5523,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       .mockReturnValueOnce(chain([grantTask()]))
       .mockReturnValueOnce(chain([{ id: 'project-fs-grant' }]))
       .mockReturnValueOnce(chain([grantPackage()]))
+    mockTaskGrantTransactionLocks({
+      packages: [grantPackage()],
+      project: { id: 'project-fs-grant', mcpConfig: {} },
+      task: grantTask(),
+    })
 
     const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
     const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
@@ -5509,6 +5576,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([{ mcpId: 'filesystem', installPath: filesystemPath, enabled: true }]))
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([grantPackage()]))
+      mockTaskGrantTransactionLocks({
+        packages: [grantPackage()],
+        project,
+        task: grantTask(project.id as string),
+      })
 
       const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
       const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
@@ -5538,6 +5610,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([{ mcpId: 'filesystem', installPath: filesystemPath, enabled: true }]))
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([{ ...grantPackage(), mcpRequirements: [], metadata: {} }]))
+      mockTaskGrantTransactionLocks({
+        packages: [{ ...grantPackage(), mcpRequirements: [], metadata: {} }],
+        project,
+        task: grantTask(project.id as string),
+      })
 
       const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
       const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
@@ -5597,6 +5674,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([{ mcpId: 'filesystem', installPath: filesystemPath, enabled: true }]))
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([pkg]))
+      mockTaskGrantTransactionLocks({
+        packages: [pkg],
+        project,
+        task: grantTask(project.id as string),
+      })
       mockDbUpdate
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)
@@ -5667,6 +5749,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([failedPkg]))
         .mockReturnValueOnce(chain([]))
+      mockTaskGrantTransactionLocks({
+        packages: [failedPkg],
+        project,
+        task: grantTask(project.id as string, 'failed'),
+      })
       mockDbUpdate
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)
@@ -5755,6 +5842,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       .mockReturnValueOnce(chain([grantTask('project-fs-grant', 'failed')]))
       .mockReturnValueOnce(chain([{ id: 'project-fs-grant' }]))
       .mockReturnValueOnce(chain([failedPkg]))
+    mockTaskGrantTransactionLocks({
+      packages: [failedPkg],
+      project: { id: 'project-fs-grant', mcpConfig: {} },
+      task: grantTask('project-fs-grant', 'failed'),
+    })
     mockDbUpdate
       .mockReturnValueOnce(approvalUpdate)
       .mockReturnValueOnce(packageUpdate)
@@ -5835,6 +5927,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([blockedPkg]))
         .mockReturnValueOnce(chain([]))
+      mockTaskGrantTransactionLocks({
+        packages: [blockedPkg],
+        project,
+        task: grantTask(project.id as string, 'failed'),
+      })
       mockDbUpdate
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)
@@ -5923,6 +6020,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
           status: 'failed',
           metadata: { mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' } },
         }]))
+      mockTaskGrantTransactionLocks({
+        packages: [failedPkg],
+        project,
+        task: grantTask(project.id as string, 'failed'),
+      })
       mockDbUpdate
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)
@@ -6001,6 +6103,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
           status: 'blocked',
           metadata: { mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' } },
         }]))
+      mockTaskGrantTransactionLocks({
+        packages: [failedPkg],
+        project,
+        task: grantTask(project.id as string, 'failed'),
+      })
       mockDbUpdate
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)
@@ -6116,6 +6223,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([]))
         .mockReturnValueOnce(chain([failedPkg]))
         .mockReturnValueOnce(chain([]))
+      mockTaskGrantTransactionLocks({
+        packages: [failedPkg],
+        project,
+        task: grantTask(project.id as string, 'failed'),
+      })
       mockDbUpdate
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)

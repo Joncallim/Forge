@@ -253,6 +253,7 @@ export async function POST(
             primaryMode: primaryDecision?.mode ?? 'blocked',
             reason,
             primaryRecoveryAction: primaryDecision?.recoveryAction ?? 'revise_plan',
+            primaryRetryableContribution: primaryDecision?.retryableContribution ?? false,
             retryable: admission.aggregate.retryable,
             workPackageId: pkg.id,
           },

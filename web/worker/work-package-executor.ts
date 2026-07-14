@@ -1265,6 +1265,22 @@ function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig
     ? runtimeRequestedCapabilities.filter((capability) => !issuedCapabilities.includes(capability))
     : []
   const missingBlockingCapabilities = blockingCapabilities.filter((capability) => !capabilities.includes(capability))
+  if (runtimeRequestedCapabilities.length === 0 && planningVisibleCapabilities.length > 0) {
+    return {
+      schemaVersion: 1,
+      capabilitySource: 'approved-work-package-mcp-grant-phases',
+      capabilities,
+      grantApprovalId: effectiveGrant.grantApprovalId,
+      grantMode: effectiveGrant.grantMode,
+      projectGrant: effectiveGrant.projectGrant,
+      planningVisibleCapabilities,
+      requestedCapabilities,
+      reason: 'This work package requested filesystem capabilities for planning or repository-write instructions only. Bounded read-only runtime context was not requested, so no filesystem context is issued.',
+      runtimeIssued: false,
+      runtimeEnforcement: 'bounded_context_packet',
+      status: 'not_issued_optional',
+    }
+  }
   if (effectiveGrant.projectGrantRevoked) {
     return {
       schemaVersion: 1,
