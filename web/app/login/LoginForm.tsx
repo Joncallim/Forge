@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { startAuthentication } from '@simplewebauthn/browser'
 import { Button } from '@/components/ui/button'
+import { ForgeWordmark } from '@/components/brand'
 
 type SignInMethod = 'password' | 'passkey'
 
@@ -157,9 +158,10 @@ export function LoginForm({ passkeysEnabled = true }: LoginFormProps) {
     <div className="flex min-h-full flex-1 flex-col items-center justify-center bg-background px-4 py-12">
       <div className="w-full max-w-sm rounded-xl border border-border bg-card p-8 shadow-sm">
         {/* Wordmark */}
-        <div className="mb-6 text-center">
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">
-            Forge
+        <div className="mb-6 flex flex-col items-center text-center">
+          <h1 className="flex items-center">
+            <ForgeWordmark size="lg" />
+            <span className="sr-only"> — Sign in</span>
           </h1>
           <p className="mt-2 text-sm text-muted-foreground">
             {passkeysEnabled ? 'Sign in to the local account with your password or passkey' : 'Sign in to the local account with your password'}

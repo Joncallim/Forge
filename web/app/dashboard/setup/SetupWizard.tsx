@@ -2,9 +2,10 @@
 
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { ArrowRightIcon, CheckCircle2Icon, ServerIcon } from 'lucide-react'
+import { ArrowRightIcon, CheckCircle2Icon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { ForgeMotionMark } from '@/components/brand'
 import { PRESETS } from '@/lib/recommendations'
 import { applyPreset } from '@/lib/applyPreset'
 
@@ -53,8 +54,14 @@ export function SetupWizard({ hasProviders }: SetupWizardProps) {
     <div className="px-4 py-6 sm:px-6 lg:px-8">
       <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
         <div>
-          <div className="mb-2 flex items-center gap-2">
-            <ServerIcon className="size-5 text-muted-foreground" aria-hidden="true" />
+          <div className="mb-2 flex items-center gap-3">
+            <ForgeMotionMark
+              size={44}
+              showWordmark
+              decorative={false}
+              playOnceKey="forge-setup-identity-v1"
+            />
+            <span className="h-6 w-px bg-border" aria-hidden="true" />
             <h1 className="text-xl font-semibold text-foreground">Setup</h1>
           </div>
           <p className="max-w-2xl text-sm leading-6 text-muted-foreground">

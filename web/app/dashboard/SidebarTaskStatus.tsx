@@ -2,8 +2,8 @@
 
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
-import { ActivityIcon, AlertTriangleIcon, CheckCircle2Icon } from 'lucide-react'
 import { TooltipContent, TooltipRoot, TooltipTrigger } from '@/components/ui/tooltip'
+import { ForgeStatusMark, type ForgeStatus } from '@/components/brand'
 import { TASK_STATUS_REFRESH_EVENT } from '@/lib/task-events'
 import { cn } from '@/lib/utils'
 
@@ -89,13 +89,17 @@ export function SidebarTaskStatus() {
         ? 'text-emerald-600 dark:text-emerald-400'
         : 'text-muted-foreground'
 
-  const Icon = errored
-    ? AlertTriangleIcon
-    : attention > 0
-      ? AlertTriangleIcon
-      : idle
-        ? CheckCircle2Icon
-        : ActivityIcon
+  const forgeStatus: ForgeStatus = errored
+    ? 'disconnected'
+    : failed > 0
+      ? 'failed'
+      : awaitingApproval > 0 || awaitingAnswers > 0
+        ? 'awaiting-approval'
+        : (summary?.byStatus.running ?? 0) > 0 || (summary?.byStatus.approved ?? 0) > 0
+          ? 'executing'
+          : (summary?.byStatus.pending ?? 0) > 0
+            ? 'planning'
+            : 'idle'
 
   const primaryAttention = awaitingApproval > 0
     ? `Needs Approval${awaitingApproval > 1 ? ` (${awaitingApproval})` : ''}`
@@ -166,9 +170,12 @@ export function SidebarTaskStatus() {
           />
         }
       >
-        <Icon
-          className={cn('size-3.5 shrink-0', tone, !idle && !errored && active > 0 && 'animate-pulse')}
-          aria-hidden="true"
+        <ForgeStatusMark
+          status={forgeStatus}
+          size={16}
+          showLabel={false}
+          decorative
+          className="shrink-0"
         />
         <span className={cn('min-w-0 flex-1 truncate font-medium', tone)}>{summaryLine}</span>
       </TooltipTrigger>

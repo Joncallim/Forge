@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="web/public/brand/forge-wordmark-light.svg">
+  <img src="web/public/brand/forge-wordmark-dark.svg" alt="FORGE" width="250">
+</picture>
+
 # Forge
 
 Forge is a local control room for AI coding work.
@@ -181,6 +186,7 @@ implementation plan.
 - [CLI architecture](docs/cli-command-architecture.md) - `forge` command taxonomy and routing.
 - [Developer guide](docs/developer-guide.md) - web app, worker, database, tests, prompts, and coding standards.
 - [Design guide](docs/design.md) - product model, UI principles, screenshot evidence, and visual QA notes.
+- [Visual identity](docs/brand.md) - logo meaning, component APIs, motion, status, accessibility, and asset generation.
 - [ACP and Zed connector](docs/acp-zed-connector.md) - how Forge talks to local ACP agents such as Codex CLI and Claude Code.
 - [GitHub issue intake](docs/github-issue-intake.md) - how Forge validates GitHub Issues before marking them ready for agent work.
 - [GitHub-native agent workflow](docs/workflows/github-native-agent-workflow.md) - issue-to-handoff-to-PR workflow for controlled agent work on GitHub.

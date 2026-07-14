@@ -10,10 +10,10 @@ import {
   BotIcon,
   SettingsIcon,
   LogOutIcon,
-  HammerIcon,
 } from 'lucide-react'
 import { useSession } from '@/hooks/useSession'
 import { Button } from '@/components/ui/button'
+import { ForgeWordmark } from '@/components/brand'
 import { SidebarTaskStatus } from './SidebarTaskStatus'
 import { cn } from '@/lib/utils'
 
@@ -63,9 +63,8 @@ export function DesktopSidebar() {
       aria-label="Main navigation"
     >
       {/* Branding */}
-      <div className="mb-2 flex shrink-0 items-center gap-2 px-3 py-2">
-        <HammerIcon className="size-5 text-sidebar-primary" aria-hidden="true" />
-        <span className="text-base font-semibold text-sidebar-foreground">Forge</span>
+      <div className="mb-2 flex shrink-0 items-center px-3 py-2 text-sidebar-foreground">
+        <ForgeWordmark size="sm" />
       </div>
 
       {/* Nav links — scroll internally if they ever exceed the viewport so the
@@ -110,9 +109,8 @@ export function MobileNav({ onClose }: MobileNavProps) {
   return (
     <div className="flex h-full flex-col gap-2 px-3 py-4">
       {/* Branding */}
-      <div className="mb-2 flex items-center gap-2 px-3 py-2">
-        <HammerIcon className="size-5 text-sidebar-primary" aria-hidden="true" />
-        <span className="text-base font-semibold text-sidebar-foreground">Forge</span>
+      <div className="mb-2 flex items-center px-3 py-2 text-sidebar-foreground">
+        <ForgeWordmark size="sm" />
       </div>
 
       {/* Nav links */}
