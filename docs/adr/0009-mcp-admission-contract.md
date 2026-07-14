@@ -1358,85 +1358,119 @@ none of those slices may weaken this state, precedence, or lock contract.
   merge through `gh`; the executable prompt contains the static warning but none
   of that overlay/subtask/requirement text. Tests do not mislabel prompt compliance
   as OS-level enforcement.
-- **Prompt-injection boundary.** Forge's immutable system message states that
+- **Prompt-injection boundary.** Forge's actual provider system-role message states that
   bounded packet contents are untrusted data and that requirement overlays are
   subordinate run instructions; neither can override tool, credential, repository,
   or admission policy. Serialize each section as length-bounded JSON with explicit
   `{kind, requirementKey, content}` fields rather than concatenating raw delimiter
   text; reject/escape invalid encoding and truncate only at documented boundaries.
-  Re-assert the immutable policy after the serialized context. Adversarial tests
+  A Forge-authored reminder may appear after serialized user-role context to aid
+  model attention, but that reminder is not immutable and is not an enforcement
+  boundary. Adversarial tests assert actual system/user role separation and
   include a repository file and an allowed overlay containing fake system markers,
   closing fences, and instructions to use `gh`/read credentials; the bytes remain
-  quoted data and do not alter the issued tool surface or policy section.
-- **Atomic one-time issuance claim.** Every operator approval generates a new
-  immutable `grantDecisionNonce` (UUID) even though the existing
-  `filesystem_mcp_grant_approvals` row is upserted by `work_package_id`; persist the
-  nonce in the approval row and effective-grant snapshot. Reapproval must replace
-  the nonce, so it represents a new issuable decision without reusing the burned
-  issuance key. Before assembling or exposing a packet for an `allow_once` grant,
-  S4 follows the applicable ordered subsequence of the canonical version-2 lock
-  list above. It locks project, task, work package, and grant approval first, then
-  every applicable epoch, authenticated worker/root-writer instance, binding-
-  generation, hierarchy, run, and local-run-evidence/task-projection source family
-  before the runtime-audit claim. It verifies the effective grant and nonce are still
-  approved/unconsumed, inserts a `filesystem_mcp_runtime_audits` claim keyed
-  uniquely by `(grantApprovalId, grantDecisionNonce)` for
-  `operation:'context_packet'`, and marks the grant consumed with an approved-state
-  compare-and-set. Add the matching partial unique index in the SQL migration and
-  `web/db/schema.ts`. Grant/reapproval endpoints use the identical lock order before
-  rotating the nonce. Only the winning claim may assemble/deliver the packet;
-  duplicate cooperative workers block before reading packet contents. The hard
-  guarantee is one winning claim per decision nonce: a crash after the claim burns
-  that nonce, records the audit as failed on recovery, and requires explicit
-  reapproval. Claims persist `{status:'claiming', claimToken,
-  claimedByAgentRunId, leaseExpiresAt}`. S4 owns
-  `reconcileStaleFilesystemIssuanceClaims(now)`, invoked at worker startup and by
-  the periodic recovery sweep; it locks expired `claiming` rows with `FOR UPDATE
-  SKIP LOCKED`, marks them `failed` with a crash/lease-expired reason, and never
-  reopens the same nonce. `claimToken` is a fencing token, not audit decoration:
-  the owner heartbeats/renews the lease with an ownership compare-and-set during
-  assembly; immediately before every packet-content read, prompt exposure/submission,
-  and finalization it must atomically verify
-  `(status='claiming', claimToken, claimedByAgentRunId, leaseExpiresAt > now)`.
-  Finalization also compares that tuple. The reconciler's `claiming → failed`
-  transition invalidates the token, so an expired/stale worker cannot begin a new
-  Forge-governed read or persist/finalize after recovery. This is database/audit
-  fencing, not revocation of bytes already in process memory or cancellation of an
-  in-flight ACP submission: a lease can expire after the final check and external
-  I/O is not atomic with PostgreSQL. The beta therefore promises one winning claim
-  and best-effort at-most-once delivery by cooperative workers, not cryptographic
-  exactly-once disclosure. Hard revocation/idempotent external submission requires
-  a cancellable fenced delivery broker in the later #40/#60 security epic, and UI/
-  operator copy must preserve this boundary. Immediately after assembly and **before any exposure**,
-  the owner CAS-persists the immutable packet metadata snapshot on the audit claim
-  under the fencing token. That snapshot is a discriminated union:
-  `{packetAssembled:true, root, includedCount, byteCount, omittedCount,
-  redactionSummary}` or, when assembly never completed,
-  `{packetAssembled:false, failureStage, reason}`. Recovery/finalization upserts the
-  run artifact from this durable snapshot; it never re-reads or reassembles a burned
-  one-time packet and never invents zero counts. A crash after assembly but before
-  artifact creation therefore still produces truthful failed-run evidence, while a
-  pre-assembly crash is explicitly represented as no packet assembled. A later explicit approval rotates the nonce and creates a
-  new claim. The packet-metadata artifact upsert is tied to the winning
-  `agentRunId`; success and failure finalization are idempotent. Tests race two
-  workers, race claim versus reapproval, race a delayed live worker against lease
-  expiry/reconciliation, restart after an expired claim, and inject failures before assembly, after
-  assembly, and after prompt submission, proving one claim/packet per decision nonce
-  at most, successful explicit reapproval with a fresh nonce, no deadlock, and an
-  auditable recovery state. The delayed-worker test asserts that a stale token
-  cannot start a subsequent governed read or write/finalize state; it does not make
-  the unrealizable claim that PostgreSQL can recall an already-started ACP request.
+  quoted data and do not alter the issued MCP surface. Task/debug logs retain only
+  the existing sanitized digest, byte count, and omission counters—never prompt or
+  packet bytes, names, paths, or rejected Architect text.
+- **Every packet has an atomic run claim; `allow_once` adds a decision fence.** S3
+  assigns a project-serialized `grantDecisionRevision` to every package/project
+  filesystem decision. Every packet run has one claim unique on
+  `(agentRunId, operation)` for protocol-v2 `operation:'context_packet'`. A package
+  `allow_once` decision also has an immutable UUID `grantDecisionNonce`, rotated by
+  explicit reapproval, and an additional unique claim on
+  `(grantApprovalId, grantDecisionNonce, operation)` where the nonce is non-null.
+  Project `always_allow` claims have no nonce; they snapshot the exact current
+  project revision and covered capabilities. Each claim stores immutable actor,
+  decision time/revision, mode, required/approved capability sets, and a canonical
+  policy fingerprint so later approval-row updates cannot rewrite history.
+
+  Structured serialization reuses the producer ceilings (20 requirements, 40
+  subtasks, 2,000 characters per overlay), caps the full executable MCP JSON block
+  at 128 KiB, and omits only whole documented optional fields. Packet assembly keeps
+  the current 50-file, 160 KiB total, 24 KiB-per-file, depth-6, 500-entry, and
+  5,000-traversal ceilings. Typed evidence also bounds `rootRef` to 80 ASCII
+  characters, redaction summaries to 32 known keys with counts no greater than
+  5,000, sanitized failure detail to 512 UTF-8 bytes, and artifact text to 16 KiB.
+
+  Extend the existing package claim transaction instead of creating a second run
+  lifecycle. The full order is project → tasks ascending → packages ascending →
+  approval/decision rows ascending → agent run → runtime audit → packet artifact.
+  The transaction conditionally moves the package to `running`, creates the agent
+  run and existing execution lease, inserts the packet claim and authorization
+  snapshot, and—only for `allow_once`—consumes the exact nonce. Any failure rolls all
+  of those writes and the attempt back. A run needing no packet creates no packet
+  audit/artifact.
+
+  The packet lease is subordinate to the execution lease. One database-time
+  heartbeat compare-and-sets both; every repository read batch, prompt exposure,
+  ACP submission, and terminal finalization verifies package/run execution ownership
+  plus `{status:'claiming', claimToken, claimedByAgentRunId,
+  leaseExpiresAt > PostgreSQL now()}`. An `always_allow` boundary also rechecks that
+  the current project decision revision still covers the package. Revocation stops
+  a later Forge-governed boundary but cannot recall bytes or cancel external I/O
+  already started.
+
+  Stale recovery first discovers candidate audit IDs without row locks. Each
+  candidate is then processed in a fresh top-down transaction; it never locks an
+  audit/approval and reaches backward. The transaction compare-and-sets a still-
+  expired claim, invalidates the token, fails the linked run, clears only that run's
+  execution lease, moves the package to a structured issuance-recovery block,
+  returns task `running → approved`, and atomically persists terminal audit + unique
+  artifact. An `allow_once` nonce stays burned; an `always_allow` run claim can
+  start a new operator-requested run only under current project coverage. Every
+  versioned `packet_issuance` marker has `autoRetryable:false`, immutable terminal
+  delivery, separate disposition/acknowledgement fields, fingerprints, and bounded
+  failure code. The normative matrix is: one-time +
+  `not_exposed|submission_failed` → `reapprove_allow_once`; one-time +
+  `submission_uncertain|submitted` → `review_then_reapprove_allow_once`;
+  always-allow + `not_exposed|submission_failed` → `retry_execution`; and
+  always-allow + `submission_uncertain|submitted` → `review_submission`.
+  Acknowledgement never changes delivery: it records actor/database time and moves
+  the disposition to `reapprove_allow_once` or `reviewed_submission`.
+
+  S4 owns a packet-recovery route and append-only
+  `filesystem_mcp_issuance_recovery_actions` table. The route locks project → task
+  → package → decision → prior run → audit, CAS-validates the marker/prior audit,
+  and records acknowledgement even if current grant coverage was later revoked.
+  A separate always-allow `retry_execution` transition requires exact current
+  revision/coverage/policy, clears only the packet marker, moves
+  `blocked → ready`, commits, then wakes Redis. For one-time reapproval, S3 rotates
+  the fresh nonce and calls S4's package-scoped resolver in the same transaction;
+  the resolver verifies the prior terminal audit/marker and clears only S4 state.
+  Double/stale/policy/lease races are compare-and-set misses. The marker never
+  reuses `mcpGrantBlock`/`mcpBroker` or persists a path/reason.
+
+  Immediately after assembly and **before any exposure**, persist an immutable
+  assembly discriminant: `state:'assembled'` with opaque non-path `rootRef`, bounded
+  counts, and closed-category redaction counts, or `state:'not_assembled'` with a
+  bounded failure code and only `claim|preflight|assembly` stage. Store delivery
+  separately as
+  `not_exposed|submitting|submission_failed|submitted|submission_uncertain`.
+  Immediately before ACP I/O, ownership-CAS `not_exposed → submitting` with a
+  random attempt ID and database time. Expired/crashed `submitting` becomes
+  `submission_uncertain` and is never automatically replayed. A submission failure
+  never rewrites an assembled packet as unassembled. `rootRef` is a dedicated,
+  unique project UUID generated from secure random bytes under the project lock,
+  never path-derived; preview, approval, claim, and artifact read the same stable
+  value. Free-text repository errors, file names,
+  paths, excerpts, and contents are excluded from audits, artifacts, logs, and APIs.
+  Terminal audit transition and artifact upsert occur in one ownership-fenced
+  transaction; the partial unique artifact index supplies idempotency, not
+  crash-consistency by itself. This is cooperative database fencing, not
+  cryptographic exactly-once disclosure; hard cancellation still belongs to #40/#60.
 - **Evidence lifecycle — planned scope vs issued evidence.** Pre-run,
-  `McpAdmissionDecision.evidenceRefs` carries only *planned scope* (root path +
-  capability set), never file contents. The bounded read-only context packet is
-  assembled during execution and requires an `agentRunId`; after the run (including
-  **failed** runs) insert exactly one idempotent `artifacts` row for the attempt:
+  `McpAdmissionDecision.evidenceRefs` carries only opaque planned-scope identifiers
+  plus capability set, never paths or file contents. The bounded read-only context
+  packet is assembled during execution and requires an `agentRunId`; after a packet
+  claim (including **failed** claims) insert exactly one idempotent `artifacts` row:
   `artifactType:'mcp_bounded_context_packet_metadata'`, linked by
   `artifacts.agentRunId`, with `content` containing the versioned, human-readable
-  metadata summary and `metadata` containing the staged discriminated union plus
-  `{schemaVersion:1, workPackageId}`: assembled runs carry
-  `{packetAssembled:true,root,includedCount,byteCount,omittedCount,redactionSummary}`;
-  pre-assembly failures carry `{packetAssembled:false,failureStage,reason}`.
+  metadata summary and `metadata` containing `{schemaVersion:2, workPackageId}` plus
+  immutable authorization, assembly, and terminal delivery snapshots. A live
+  `submitting` value exists only on the current audit and is converted to
+  `submission_uncertain` before terminal artifact finalization. Assembled runs carry
+  opaque `rootRef`, included/byte/omitted counts, and closed redaction counts;
+  pre-assembly failures carry a bounded failure code/stage and no fabricated counts.
   `(agentRunId, artifactType)` is the stable lookup contract; retry/upsert behavior
   must not create duplicates for one run. S4 owns a database migration adding a
   partial unique index on `(agent_run_id, artifact_type)` where
@@ -1447,14 +1481,30 @@ none of those slices may weaken this state, precedence, or lock contract.
   `web/db/schema.ts` declares the same partial unique index. A concurrent-finalizer
   test proves one row survives. S5 queries this artifact relationship directly—no
   `agent_runs` metadata column or migration is introduced. The artifact
-  contains packet **metadata** only (root, included file count, byte count, omitted
-  count, and redaction summary—the exact ADR 0008 audit vocabulary). File names and
+  contains packet **metadata** only (opaque root reference, included file count, byte
+  count, omitted count, and redaction summary—the ADR 0008 audit vocabulary without
+  a persisted host path). File names and
   relative/absolute paths are not persisted because they can disclose sensitive
   structure even without contents.
   **File contents stay prompt-only and are not persisted**; "selected excerpts" are
   not written to an inspectable artifact. `mcpCapabilityList` imports
   `mergeCapabilityFields`; executor filesystem gating uses shared
   `coverageKeysForGrant`/`classifyCapability`.
+- **Additive rollout is part of the guarantee.** Expand schema with a unique
+  nullable project `root_ref`, nullable v2 fields/indexes, and the append-only
+  issuance-recovery action table/unique key; generate `root_ref` for new
+  projects and backfill existing projects in bounded batches, then make it non-null
+  before v2 producers. Deploy dual readers that treat legacy one-time approvals
+  without nonce as non-issuable and legacy audit zero/default columns as
+  `unknown_legacy`; deploy v2 writers with packet issuance disabled; drain every
+  legacy packet issuer; then start only v2 workers and enable issuance. After the
+  drain, #179 owns a restartable migration that clears every legacy path-valued
+  audit `root`, writes only aggregate scrub counts, and prevents v2 writers from
+  repopulating it; it never derives `rootRef` from a path. SQL, Drizzle, and conflict
+  predicates must match. Rollback keeps additive schema/v2 data and
+  must not restart a legacy issuer; disable/drain issuance until a v2 worker is
+  restored. #180 reads this v2 evidence and #181 owns mixed-version, migration,
+  dual-lease, failure-injection, atomic-finalization, and rollback sentinels.
 - Sandbox-generated files (`.forge/task-runs/...`) stay clearly separated from
   host-repository writes in artifacts.
 

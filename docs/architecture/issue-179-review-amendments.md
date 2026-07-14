@@ -1,6 +1,8 @@
-# Issue #179 Architecture Review Amendments
+# Issue #179 Historical Architecture Review Amendments
 
-This document is authoritative where it narrows or clarifies `issue-179-context-packet-evidence.md`.
+Status: superseded review record.
+
+All binding corrections from this record and the later integrated security/concurrency review are folded into `issue-179-context-packet-evidence.md`. The primary document is authoritative. This file remains only to preserve review history and must not be implemented as a separate or higher-precedence contract.
 
 ## Review round 1 findings and resolutions
 
@@ -66,6 +68,6 @@ project → task(s ascending) → package(s ascending) → grant approval → ru
 
 #178 grant mutations may rotate a nonce only after project/task/package locks. #179 claim code must never take an audit/approval lock and then reach backward for package/task/project.
 
-## Review round 2 conclusion
+## Historical round 2 conclusion
 
-The amended design now handles legacy approvals without manufacturing authority, ties run creation to claim ownership, separates decision and lease identities, and aligns migrations with conflict writers. No further architecture findings were identified in the reviewed scope. Implementation must still prove race and recovery behavior with real PostgreSQL tests.
+At that review point, the amendments handled legacy approvals without manufacturing authority, tied run creation to claim ownership, separated decision and lease identities, and aligned migrations with conflict writers. A later integrated review found additional cross-slice lease, recovery, evidence-atomicity, path-leakage, and rollout gaps. Their corrections now live in the authoritative primary document.
