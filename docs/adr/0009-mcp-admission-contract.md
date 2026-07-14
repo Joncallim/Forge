@@ -910,63 +910,118 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
 
 ### S3 — Filesystem grant recovery (deterministic, recoverable)
 
-- `requiresFilesystemGrantApproval` (`filesystem-grants.ts:315-322`) must stop
-  returning `{blocked:false}` for a `denied` effective phase when blocking
-  capabilities are non-empty and no `continue_without_mcp` fallback applies.
-  Return a distinct `deniedRequired:true` so handoff HOLDS the package pre-claim
-  (zero attempts) instead of letting the executor throw at
-  `work-package-executor.ts:1790`.
-- **Recoverable held state, not a crash.** `failWorkPackageForFilesystemGrant`
-  (`work-package-handoff.ts:807`) sets the package to **`blocked`** (in the
-  recovery set) with the `mcpGrantBlock` marker and does **not** drive the task to
-  `failed`; `progressWorkforce` (`:1165-1193`) must treat a filesystem-grant
-  terminal block as *held* (task stays operator-actionable), not as task failure.
-  Both never-approved-required and denied-required take this held path.
-- `filesystemGrantHandoffBlock` (`work-package-handoff.ts:876-906`): pass
-  `project?.mcpConfig` into `requiresFilesystemGrantApproval` in **both** branches
-  (the default branch at `:896-899` currently omits it), closing the
-  approval-vs-handoff project-coverage divergence.
-- **One project-wide reconciliation routine.** Extract
-  `reconcileFilesystemGrantsForProject(projectId, tx)` and call it from **both**
-  the per-task `always_allow` path (`tasks/[id]/filesystem-grants/route.ts:411-446`,
-  which currently reconciles only current-task standard-status siblings) and the
-  project route (`projects/[id]/filesystem-grant/route.ts:166-244`). Both endpoints
-  recover the identical package set for identical grant state.
-- **One lock order and no whole-JSON lost updates.** Both grant endpoints begin the
-  transaction by selecting the project row `FOR UPDATE`, then derive `nextMcpConfig`
-  from that locked, freshly read value. They must not compute a full replacement
-  from the project object fetched for authorization before the transaction. The
-  reconciliation routine then locks affected tasks `FOR UPDATE` in ascending ID
-  order and candidate work packages `FOR UPDATE` in ascending ID order. All callers
-  use the same global project-then-task-then-package lock order. Package updates use `jsonb_set`/`#-` only for the owned
-  `mcpGrantPhases` and `mcpGrantBlock` paths (or an `updatedAt` compare-and-set and
-  retry); they never replace `metadata` from a stale JavaScript spread. This
-  preserves concurrent broker, lease, audit, and evidence fields. Add two
-  concurrency tests: disjoint simultaneous `always_allow` grants retain the union
-  plus unrelated `mcpConfig` keys, and a simultaneous broker metadata update
-  survives reconciliation.
-- **Reuse the S1 reader — do not re-implement.** `filesystem-grants.ts` **imports**
-  `readEffectiveGrantState` from `admission.ts` (S1 owns it); S3 adds no second
-  copy. S3's job is to pass the required-capability set and the recovery/precedence
-  behavior *through* that one reader, and to make `requiresFilesystemGrantApproval`
-  a projection over it.
-- **Precedence.** A later project-level `always_allow` grant covering a capability
-  supersedes an earlier package-local `denied` effective phase for that capability
-  (operator's later, broader decision wins). Document and test this precedence in
-  the S1-owned `readEffectiveGrantState` (evaluated against the package's
-  `requiredCapabilities`).
-- **Revoked project grant is distinct from never-approved.** When
-  `readEffectiveGrantState` returns `phase:'revoked'` (a project grant that
-  previously covered the package no longer does), the held-block `reason` and the S5
-  copy say "project filesystem context was removed — approve it again", carrying
-  `revocationReason`, separate from the first-time "needs project context" copy.
-  Test the two recovery messages separately; a revoked grant must not read as a
-  brand-new request.
-- **Acceptance tests assert exact transitions** (package `pending/ready →
-  blocked`, task not `failed`, zero new `agentRuns`; then grant approval →
-  package `ready`, task re-driven), not just attempt counts.
-- Preserve: a filesystem block is never auto-retried
-  (`shouldAutoRetryBlockedHandoff`, `blocked-handoff-retry.ts:67-79`).
+- **Canonical projection and operator hold.**
+  `requiresFilesystemGrantApproval` imports the S1-owned
+  `readEffectiveGrantState`; S3 adds no second reader and never parses human
+  text. It evaluates both handoff branches with fresh project MCP configuration
+  and the exact required capability set. Required `none`, `denied`, `revoked`,
+  and consumed-one-time decisions hold before claim when
+  `continue_without_mcp` does not apply:
+
+  ```text
+  package pending | ready → blocked
+  task    running         → approved
+  ```
+
+  The package gets a filesystem-only v2 marker, creates no `agent_runs`, and
+  consumes no attempt. Its explicit handoff disposition is
+  `{taskDisposition:'operator_hold', autoRetryable:false,
+  terminalFailure:false}`. It must not reuse the existing `terminalBlock` flag,
+  which current orchestrator paths interpret as task failure. The task returns to
+  the grant endpoint's operator-actionable `approved` state and must not stay
+  `running` without a live execution lease. If another package has a live lease,
+  task aggregation must preserve that fact explicitly rather than treating the
+  held package as failure.
+- **Database-ordered precedence.** Every filesystem decision mutation increments
+  a project-scoped PostgreSQL `BIGINT` counter while the project row is locked.
+  JSON/evidence serializes the positive `grantDecisionRevision` as a canonical
+  decimal string; comparisons use database integers, never JavaScript number
+  precision or lexical string order. A project `always_allow` supersedes a package denial only when it
+  covers the complete required set and its revision is greater. A denial wins at
+  an equal or greater revision. `approvedAt`/`deniedAt` are display evidence only,
+  never authority. Legacy rows without comparable revisions fail closed until an
+  explicit operator decision assigns one; migration must not manufacture order
+  from timestamps. Removed or narrowed project coverage is `revoked`, not
+  first-time `none`, and retains the latest revision and a bounded reason code.
+- **Package-local `allow_once`.** An unconsumed one-time decision can approve only
+  its package. Denial, one-time approval, nonce rotation/consumption, and
+  reapproval lock and reevaluate only that target package; they never run a
+  project scan. If a covering project grant already wins, do not create a shadow
+  one-time decision. #179 owns the per-run claim and nonce-fenced issuance.
+- **One positive and negative project reconciler.** Equivalent
+  `always_allow` decisions from the task and project endpoints call one service
+  with the caller's `lockedProject`, fresh `nextMcpConfig`, allocated revision,
+  and trigger. It must not reacquire or reread the project. Grant removal or
+  narrowing also calls it: eligible `pending`/`ready` packages that lose exact
+  coverage proactively become held, while still-covered subsets remain eligible.
+  A running, already-claimed package is not retroactively stripped; #179 fences
+  the current run and the new decision governs future claims.
+- **Global lock order.** S3 uses this prefix:
+
+  ```text
+  project → affected tasks (ID ascending) → affected packages (ID ascending)
+          → grant approval
+  ```
+
+  S3 normally stops at approval. #179 owns the complete suffix: grant approval →
+  agent run → runtime audit claim → packet artifact. Candidate discovery may
+  happen without retained locks, but mutation reacquires all required rows in the
+  complete order and uses compare-and-set. No endpoint nests the project lock or
+  performs Redis/network work in the transaction.
+- **Bounded marker and JSON ownership.** The v2 filesystem marker remains outside
+  `metadata.mcpBroker` and contains only structured filesystem kind/source,
+  `holdKind`, exact normalized requirement keys/capabilities, grant
+  phase/revision, operator-hold disposition, bounded reason code, and
+  `blockFingerprint`. The fingerprint is a versioned
+  digest of policy inputs, not human text or timestamps. Recovery clears it only
+  with a matching fingerprint. Reconciliation owns narrow
+  `metadata.mcpGrantPhases` and filesystem-marker `jsonb_set`/`#-` patches (or a
+  metadata-version compare-and-retry), never a stale whole-JSON replacement.
+- **Exact recovery.** A matching filesystem-held package moves
+  `blocked → ready` after full coverage and its task is woken after commit.
+  Changed-fingerprint and generic MCP/security/dependency/reviewer blocks remain.
+  Historical `failed` recovery is allowed only through the v2 marker, the exact
+  v1 `{source:'filesystem-grant-approval'}` marker, or a versioned,
+  fixture-backed, time-bounded legacy adapter that cannot match generic failure.
+  The adapter upgrades state on the next safe mutation and never infers from
+  requirements or error prose alone.
+- **One-time reapproval handoff to S4.** S3 never clears S4's
+  `packet_issuance` marker in its project reconciler. After a package-local
+  reapproval rotates a fresh nonce under project → task → package → approval
+  locks, it calls S4's package-scoped resolver in the same transaction. S4
+  continues to prior run → audit, verifies the exact terminal prior claim,
+  `reapprove_allow_once` marker/fingerprint, changed nonce, current policy, and no
+  active lease, then clears only its packet marker and moves `blocked → ready`.
+  Stale/double/policy-drift races are compare-and-set misses; Redis wakes only
+  after commit.
+- **PostgreSQL truth and failure behavior.** PostgreSQL commits decision,
+  revision, marker, package, and task transitions atomically. Redis is post-commit
+  wake-up only; a failed wake leaves recovered `ready` work for the periodic
+  sweep. A failed transaction leaves no partial hold/recovery. Policy or
+  fingerprint races retry from locked state. A revocation/handoff race has one
+  serialized result: either #179 claims first under its fence, or S3 holds before
+  claim. Generic packet/execution failure never burns or recreates an approval.
+- **Mixed-version rollout.** Ship additive nullable fields and the dual v1/v2
+  reader before v2 writers. Then drain old workers or protocol-gate claims because
+  an old orchestrator can misread the new operator-hold marker as task failure. Enable
+  S3 revision writers/holds/reconciliation before #179 issuance producers and
+  #180/#181 consumers. Rollback disables writers/new claims but retains schema and
+  the dual reader; it does not guess or downgrade revisions. Remove v1 support
+  only after the bounded migration window.
+- **Required PostgreSQL tests.** Prove exact hold and recovery transitions,
+  `running → approved`, zero runs/attempts, monotonic revision precedence under
+  equal/reversed timestamps, legacy fail-closed behavior, grant narrowing/removal,
+  exact capability subsets, package-local one-time boundaries, fingerprint
+  compare-and-set, JSONB coexistence, endpoint equivalence, Redis-wake loss,
+  old/new worker gating and rollback, and deadlock freedom across the global
+  S3/#179 order. #181 owns the cross-slice failure and rollout regression matrix;
+  #180 renders historical decision, current effective state, and packet evidence
+  separately. A filesystem hold remains excluded from automatic retry.
+
+The detailed S3 design is
+`docs/architecture/issue-178-filesystem-grant-recovery.md`. #179 owns issuance
+and evidence, #180 owns presentation, and #181 owns the integrated regression;
+none of those slices may weaken this state, precedence, or lock contract.
 
 ### S4 — Prompt/context assembly and bounded-context packet evidence (builds on #43)
 
