@@ -1,6 +1,10 @@
-# Issue #178 Architecture Review Amendments
+# Historical: Issue #178 Architecture Review Amendments (Rounds 1–2)
 
-This document is authoritative where it narrows or clarifies `issue-178-filesystem-grant-recovery.md`.
+> **Superseded.** This file is retained only as review provenance. The round-3
+> contract is integrated into
+> `docs/architecture/issue-178-filesystem-grant-recovery.md` and the S3 section
+> of `docs/adr/0009-mcp-admission-contract.md`. Those primary documents are
+> authoritative; do not implement from this file.
 
 ## Review round 1 findings and resolutions
 
@@ -65,6 +69,11 @@ The implementation should prefer explicit existing filesystem block metadata. A 
 
 It must not infer recoverability from filesystem requirements alone.
 
-## Review round 2 conclusion
+## Review round 2 historical conclusion
 
-The amended architecture now keeps `allow_once` package-local, provides one shared project-wide path for equivalent `always_allow` decisions, composes with endpoint-owned locks, and remains compatible with #179's extended lock order. No further architecture findings were identified in the reviewed scope. This is not proof of implementation correctness; real PostgreSQL concurrency tests remain mandatory.
+Round 2 established that `allow_once` is package-local, equivalent
+`always_allow` decisions share one project path, and endpoint-owned transactions
+compose with #179's extended lock order. Round 3 found additional state,
+precedence, negative-reconciliation, failure, and rollout requirements. Those
+corrections now live only in the authoritative primary document and ADR. This
+historical conclusion is not an implementation verdict or proof of correctness.
