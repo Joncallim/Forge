@@ -1400,8 +1400,10 @@ none of those slices may weaken this state, precedence, or lock contract.
   Extend the existing package claim transaction instead of creating a second run
   lifecycle. The full order is project → tasks ascending → packages ascending →
   approval/decision rows ascending → worker-protocol epoch → agent runs ascending →
-  runtime audits ascending → all artifacts by stable key → issuance-recovery
-  actions by unique key → review-gate rows ascending. One shared package-claim
+  runtime audits ascending → host-apply ledgers/entries by run and ordinal → all
+  artifacts by stable key → issuance-recovery actions by unique key → integrity
+  alerts/resolutions by stable key → review-gate rows ascending. One shared
+  package-claim
   primitive locks project, task, and every sibling package in stable order,
   recomputes dependencies/candidate eligibility, proves no sibling is
   running/leased or `awaiting_review`, sets transaction-local protocol 2, and
@@ -1595,8 +1597,8 @@ none of those slices may weaken this state, precedence, or lock contract.
   post-submission stage failure is not auto-resubmitted; host apply may be partial,
   so acknowledgement covers prior external work plus possible local changes and
   Forge never claims rollback. Review-gate materialization/decision follows the
-  global order (all artifacts, action rows, then gates) and rereads source
-  run/artifact, package status, and lease under the
+  global order (host ledgers, all artifacts, action rows, integrity rows, then
+  gates) and rereads source run/artifact, package status, and lease under the
   transaction locks before compare-and-set; gate-first locking and
   pre-transaction-only freshness are forbidden. `completion_preparation` covers
   only pre-transaction work; gate/finalizer database failure rolls back with no

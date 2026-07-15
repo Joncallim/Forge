@@ -232,14 +232,18 @@ project
   → worker-protocol epoch
   → agent run(s ascending)
   → runtime audit(s ascending)
+  → host-apply ledger(s) by run ID, then entries by ordinal
   → all artifact rows (agent-run ID, artifact type, artifact ID ascending)
   → issuance-recovery action rows (runtime-audit ID, action, marker fingerprint)
+  → integrity alert rows (runtime-audit ID, reason, evidence fingerprint)
+  → integrity resolution rows (alert ID, expected fingerprint, resolution)
   → review-gate row(s ascending)
 ```
 
 Candidate discovery and exact-replay lookup may happen without retained locks,
-but every mutation reacquires the applicable rows in this order. New artifact or
-action rows use these same stable keys for uniqueness waits. A post-submission
+but every mutation reacquires the applicable rows in this order. New ledger,
+artifact, action, alert, and resolution rows use these stable keys for uniqueness
+waits. A post-submission
 host-side effect fence is an external precondition, not a database row: worker and
 recovery acquire it while holding **no** database locks, then enter the order above.
 No database transaction waits for that host fence, preventing a fence↔row cycle.
@@ -386,6 +390,13 @@ run/package/marker state, creates no retry action, emits one deduplicated bounde
 `post_submission_quiescence_unproven` integrity alert, and retries on the owning
 host. Thus no actionable marker or later run can coexist with an in-flight stale
 host operation.
+
+The quiescence-alert insert is the sole path that does not own the host fence. It
+never waits for that fence while holding database locks. After a bounded failed
+acquisition, it starts a short fresh transaction, follows the full applicable
+database order through audit → host ledger → artifacts → alert, revalidates the
+same active intent/fingerprint, inserts or rereads the unique alert, and commits
+without changing run/package/lease/marker state.
 
 ## Packet metadata staging
 
@@ -880,8 +891,9 @@ Artifact content is a bounded human-readable summary derived only from these per
 
 Review-gate materialization and decisions participate in the same global order.
 The finalizer and every gate-decision transaction lock project → task → package →
-applicable runs/audits ascending → all artifacts by stable key → applicable
-recovery-action rows by unique key → all relevant gate rows ascending; no path
+applicable runs/audits ascending → host ledgers/entries by run/ordinal → all
+artifacts by stable key → applicable recovery actions → integrity
+alerts/resolutions → all relevant gate rows ascending; no path
 may lock a gate and then reach backward to the package. Before changing a gate or
 package, the decision transaction rereads the source run, exact artifact identity,
 package status, and execution-lease state under those locks. It compare-and-sets
@@ -1027,8 +1039,8 @@ orderings and prove one coherent winner without deadlock.
     task `running`, suppress recovery actions, and start no later specialist until
     mandatory review completes.
 42. Duplicate action, exact replay, one-time resolution, success repair, and gate
-    decision races acquire all artifacts, action rows, and gates in the complete
-    tail without deadlock.
+    decision races acquire host ledgers/entries, all artifacts, action rows,
+    integrity alerts/resolutions, and gates in the complete tail without deadlock.
 43. Every normal packet retry, acknowledgement, reapproval, S2 refresh, and generic
     promotion rejects both integrity-hold reasons. Authorized repair requires the
     exact alert fingerprint, writes one resolution, and cannot rewrite evidence;
