@@ -42,8 +42,9 @@ Make required bounded-filesystem denials, revocations, and missing grants recove
    `always_allow` mutations call the same project-wide service. Package-local
    decisions share its evaluator and lock order but never scan sibling packages.
 6. **One lock order.** S3 uses the prefix project → tasks ascending → packages
-   ascending → grant approval. #179 owns the full suffix: agent run → runtime
-   audit claim → packet artifact. S3 normally stops at the approval row.
+   ascending → grant approval. #179 owns the full suffix: worker-protocol epoch →
+   agent run → runtime audit claim → packet artifact. S3 normally stops at the
+   approval row and does not acquire the epoch row.
 7. **No stale whole-JSON writes.** Owned JSONB paths are patched atomically or protected by explicit compare-and-retry.
 8. **No automatic retry.** A filesystem grant block requires operator action.
 
@@ -241,7 +242,8 @@ project → affected tasks (ID ascending) → affected packages (ID ascending)
 ```
 
 S3 grant mutations normally stop after the grant approval row. #179 defines the
-full suffix as grant approval → agent run → runtime audit claim → packet artifact.
+full suffix as grant approval → worker-protocol epoch → agent run → runtime audit
+claim → packet artifact.
 No path may acquire package before task, approval before package, run/audit before
 approval, or artifact before the audit it summarizes. A stale-audit sweeper that
 needs a package must first discover candidates without retaining row locks, then
@@ -428,7 +430,8 @@ minimum, prove:
    `blocked → ready`; generic blocks and changed-fingerprint blocks remain.
 8. The v2 reader and exact v1 adapter work during rollout, while ambiguous legacy
    errors do not recover. Redis failure after commit is repaired by the sweep.
-9. The full project → tasks → packages → approval → agent run → audit → artifact order has
+9. The full project → tasks → packages → approval → protocol epoch → agent run →
+   audit → artifact order has
    no deadlock across S3 reconciliation, #179 issuance, nonce rotation, and stale
    claim recovery.
 10. Fresh one-time reapproval invokes only #179's package-scoped resolver; stale

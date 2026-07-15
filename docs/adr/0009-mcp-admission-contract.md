@@ -964,7 +964,8 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   ```
 
   S3 normally stops at approval. #179 owns the complete suffix: grant approval →
-  agent run → runtime audit claim → packet artifact. Candidate discovery may
+  worker-protocol epoch → agent run → runtime audit claim → packet artifact. S3
+  does not acquire the epoch row. Candidate discovery may
   happen without retained locks, but mutation reacquires all required rows in the
   complete order and uses compare-and-set. No endpoint nests the project lock or
   performs Redis/network work in the transaction.
