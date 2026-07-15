@@ -932,8 +932,16 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   which current orchestrator paths interpret as task failure. The task returns to
   the grant endpoint's operator-actionable `approved` state only when no sibling
   has a live execution lease or `awaiting_review`. Either task-wide barrier keeps
-  the task `running`. S3 uses S4's shared sibling-aware task reconciler rather than
-  treating the held package as failure or weakening mandatory review.
+  the task `running`. S3 and S4 use one database-owned operator-hold task-
+  convergence service whose closed recognized-marker union includes S3
+  `filesystem_grant` and S4 `packet_issuance`/integrity holds. Under project →
+  task → all sibling package locks, it requires at least one recognized hold,
+  proves both task-wide barriers clear, and changes only task `running → approved`
+  while preserving package markers/blocks and creating no run or attempt. It is
+  invoked after sibling completion/review resolution and by startup/periodic
+  database discovery; Redis is only a wake hint. An S3-only task never depends on
+  the presence of an S4 marker. S3 may wrap the service but must not duplicate its
+  predicate or treat the held package as failure.
 - **Database-ordered precedence.** Every filesystem decision mutation increments
   a project-scoped PostgreSQL `BIGINT` counter while the project row is locked.
   JSON/evidence serializes the positive `grantDecisionRevision` as a canonical
@@ -1042,7 +1050,9 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   schema and the dual reader; it does not guess or downgrade revisions or restart
   v1 services against v2 state. Remove v1 support only after the bounded window.
 - **Required PostgreSQL tests.** Prove exact hold and recovery transitions,
-  barrier-aware `running → approved`, zero runs/attempts, monotonic revision precedence under
+  barrier-aware `running → approved`, including direct and startup/periodic
+  convergence for S3-only, S4-only, and mixed recognized holds after sibling
+  lease/review release, zero runs/attempts, monotonic revision precedence under
   equal/reversed timestamps, legacy fail-closed behavior, grant narrowing/removal,
   exact capability subsets, package-local one-time boundaries, fingerprint
   compare-and-set, JSONB coexistence, endpoint equivalence, Redis-wake loss,

@@ -161,8 +161,19 @@ terminal implementation failure. The canonical nonterminal task state is
 `approved`. This matches the task grant endpoint's editable states and gives the
 operator a reachable reapproval action. A task remains `running` when a different
 package has a current execution lease **or** is `awaiting_review`; the latter is a
-mandatory task-wide barrier even after every lease clears. S3 uses S4's shared
-sibling-aware task reconciler rather than maintaining a weaker aggregate rule.
+mandatory task-wide barrier even after every lease clears. S3 and S4 share one
+operator-hold task-convergence service. Its closed marker union includes at least
+S3 `filesystem_grant` and S4 `packet_issuance`/integrity hold markers; it never
+requires an S4 marker when a valid S3 marker exists. Under project → task → all
+sibling package locks, it validates at least one recognized hold, proves that no
+sibling has a live execution lease or `awaiting_review`, and compare-and-sets only
+task `running → approved`. It preserves every package marker and `blocked` status,
+creates no run or attempt, and performs no Redis or external work in the
+transaction. S3's terminalization path, sibling completion or review-gate
+resolution, worker startup, and periodic recovery all invoke or enqueue this same
+service. Redis is only a wake hint; the database scan is the loss-tolerant
+fallback. S3 may expose a wrapper, but it must not duplicate or weaken the shared
+predicate.
 
 ### Optional fallback
 
@@ -498,6 +509,12 @@ minimum, prove:
    blocked, and task `running → approved` occurs only without another live lease
    or sibling `awaiting_review`. Race both hold/revocation and post-review
    reconciliation against approval/rejection decisions in both lock orderings.
+   Create an S3-only hold while a sibling lease is live and while a sibling is
+   `awaiting_review`; after each barrier clears, prove both the direct post-commit
+   callback and startup/periodic fallback use the shared recognized-hold service,
+   change only task `running → approved`, preserve the marker/package block, and
+   create no run, attempt, wake, or claim before explicit grant action. Repeat the
+   shared predicate fixtures for S4-only and mixed S3/S4 holds.
 6. Required denial/revocation/consumed-once holds create no `agent_runs`, consume
    no attempt, and write the bounded v2 marker and fingerprint.
 7. A covering grant moves only a matching filesystem-held package
