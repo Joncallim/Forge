@@ -47,7 +47,7 @@ type CatalogMcpPresentationInput = Pick<McpCatalogEntry, 'id' | 'runtime'>;
 type ActivePacketClaimState =
   | {
       phase: 'preparing';
-      assemblyState: 'pending';
+      assemblyState: 'not_assembled';
       deliveryState: 'not_exposed';
     }
   | {
@@ -66,28 +66,9 @@ type ActivePacketClaimState =
       deliveryState: 'submitted';
     }
   | {
-      phase: 'failed_finalizing';
-      failurePoint: 'pre_submission';
-      assemblyState: 'not_assembled';
-      deliveryState: 'not_exposed';
-    }
-  | {
-      phase: 'failed_finalizing';
-      failurePoint: 'post_assembly_pre_submission';
-      assemblyState: 'assembled';
-      deliveryState: 'not_exposed';
-    }
-  | {
-      phase: 'failed_finalizing';
-      failurePoint: 'submission_rejected';
+      phase: 'rejected_finalizing';
       assemblyState: 'assembled';
       deliveryState: 'submission_failed';
-    }
-  | {
-      phase: 'failed_finalizing';
-      failurePoint: 'provider_response_invalid';
-      assemblyState: 'assembled';
-      deliveryState: 'submitted';
     };
 
 type PacketRecoveryRequestIdentity = {
@@ -126,6 +107,12 @@ type PacketCurrentStatePresentationInput =
         | { state: 'unknown' };
       executionLeaseActive: boolean;
       issuanceLeaseActive: boolean;
+    }
+  | {
+      source: 'integrity_hold';
+      hold: PacketIntegrityHoldV2;
+      taskStatus: TaskStatus;
+      packageStatus: WorkPackageStatus;
     };
 
 type PresentationCta =
@@ -370,17 +357,23 @@ a fail-closed neutral state before the typed presenter is called.
 
 - The server exhaustively maps a live `claiming` audit with an unexpired lease
   into `ActivePacketClaimState`. The discriminated union makes impossible pairs
-  unrepresentable: pending or pre-submission failure is never submitted, and
-  submitting always has assembled metadata; an assembled failure before intent is
-  the explicit `post_assembly_pre_submission` variant. It renders “Preparing project
-  context”, “Context assembled”, “Submitting to worker”, “Worker accepted —
-  finalizing”, or the bounded failed-finalizing variant. These are current states
-  with no action, not immutable run evidence, and are never read from a terminal
-  artifact. The server validates the complete claim-state discriminant, computes
+  unrepresentable: unassembled is never submitted, and submitting always has
+  assembled metadata. It renders “Preparing project context”, “Context assembled”,
+  “Submitting to worker”, “Worker accepted — finalizing”, or “Submission rejected
+  — finalizing”. These are the last durable staged states, with no action; they are
+  not worker-memory failure intent and are never read from a terminal artifact. A
+  local preflight/assembly/provider/post-submission error remains on its last
+  durable staged copy until S4 atomically commits terminal evidence. S5 never
+  invents `failed_finalizing`. The server validates the complete claim-state discriminant, computes
   `leaseActive` against PostgreSQL time, and supplies the observation timestamp;
   the browser never compares `leaseExpiresAt` with `Date.now()`. An expired or
   incoherent observation normalizes to neutral “Refreshing run state” until S4
   recovery/finalization persists a terminal result.
+
+- A typed `packet_integrity_hold` renders neutral “Run evidence needs operator
+  repair” with static text and no web action. It never borrows packet-failure copy,
+  never offers reapproval/retry, and never displays a database or exception detail.
+  Its separately authorized privileged repair path is outside S5.
 
 - `reapprove_allow_once` shows “Approve one-time context again” and targets the
   package grant control. It never renders generic retry because the nonce burned
@@ -428,8 +421,13 @@ current state.
 The current-state reader imports S4's discriminated
 `PacketIssuanceRecoveryMarkerV2` union and rejects every known-invalid
 grant-mode/delivery/disposition/acknowledgement combination before presentation.
-It also validates `recoveryFailure.failureCode` against S4's terminal tuple. The
-browser never assembles those independent fields into a state.
+It joins `priorRuntimeAuditId` to the exact prior audit and packet artifact,
+proves their typed terminal tuples equal, binds the marker identity/fingerprint to
+that failed tuple, and validates assembly + delivery + terminal status + failure
+code/conditional stage together. The marker alone is insufficient. Missing,
+mismatched, or terminal-success-plus-failure-marker evidence becomes a typed or
+neutral integrity hold with no action. The browser never assembles those
+independent fields into a state.
 
 Both packet actions carry S4's immutable version-2 request identity
 `{priorRuntimeAuditId, markerFingerprint}`. Components do not reconstruct it from
@@ -441,7 +439,13 @@ the task exactly `approved`; S5 never performs that transition.
 
 S5 imports S4's exact closed `PacketFailureCode` enum. It maps only those values to
 bounded copy; an unknown value is legacy/unknown and actionless, never displayed as
-server-provided free text.
+server-provided free text. `post_submission_execution_failed` additionally
+requires S4's closed stage and renders static stage copy. For `host_apply`, the
+copy warns that some local files may already have changed. Every such submitted
+failure says the external submission may have produced work, says Forge did not
+roll back local changes, requires the operator to inspect/resolve the working tree,
+and offers no automatic resubmission. It never displays a path, file name, command,
+provider text, or raw/sanitized exception.
 
 ### Grant controls
 
@@ -466,7 +470,10 @@ packet evidence from sandbox-generated files and host-applied changes. A failed
 pre-assembly snapshot shows stage plus enum-derived static failure copy without
 invented zero counts or raw/sanitized exception detail. A terminal success is
 valid only with `assembled+submitted`; a terminal failure must match S4's exact
-assembly/delivery/failure-code compatibility table. Delivery copy is exhaustive over S4's exact states:
+assembly/delivery/failure-code/conditional-stage compatibility table. A
+post-submission execution failure is shown separately from provider-response
+validity and from host-change evidence; packet state never claims whether local
+changes were fully or partially applied. Delivery copy is exhaustive over S4's exact states:
 `not_exposed|submission_failed|submitted|submission_uncertain`; terminal artifacts
 never contain live `submitting`. Assembly never implies ACP acceptance. The
 current-state reader may show any validated live phase above only while its lease
@@ -578,7 +585,7 @@ Component/integration tests:
     invokes its distinct typed install/enable/connect/configure/fix/refresh action.
 22. a live `submitting` audit is current in-progress state only; terminal artifacts
     reject `submitting` and render recovered `submission_uncertain` separately.
-    Live preparing/assembled/submitting/accepted-finalizing/failed-finalizing
+    Live preparing/assembled/submitting/accepted-finalizing/rejected-finalizing
     phases are exhaustive, actionless, and never sourced from terminal artifacts.
 23. task/package status normalization and every CTA discriminant fail closed; an
     install CTA cannot carry a refresh/configure handler.
@@ -592,8 +599,9 @@ Component/integration tests:
     transition; only a changed fingerprint/state renders a stale-action `409`.
 27. every valid `ActivePacketClaimState` pair renders its intended actionless copy;
     invalid phase/assembly/delivery cross-products fail closed to “Refreshing run
-    state” and cannot reach the typed presenter, including the valid distinct
-    assembled/`not_exposed` failed-finalizing variant.
+    state” and cannot reach the typed presenter. Preflight, assembly,
+    provider-validation, and post-submission local failures cannot be inferred
+    before terminal commit; a restarted reader shows the last durable phase.
 28. retry and acknowledgement controls carry the exact version-2 prior-audit and
     marker-fingerprint identity. A component cannot submit an action-only request
     or substitute identity from another task/package.
@@ -611,6 +619,17 @@ Component/integration tests:
     failure tuple renders assembly, delivery, and enum-derived cause separately;
     every known-invalid stage/delivery/code combination and all raw path-bearing
     exception text fail closed without display.
+34. every closed post-submission stage renders bounded static copy. `host_apply`
+    warns of possible partial local changes; all stages require prior-work review,
+    expose no automatic resubmission, and never render raw/path-bearing detail.
+35. a recovery marker is actionable only when the exact prior audit and artifact
+    have equal typed failed tuples and match marker identity. Mismatch,
+    terminal-success-plus-failure-marker, and both `PacketIntegrityHoldV2` reasons
+    render neutral, actionless maintenance copy.
+36. killing the worker after each persisted active phase and reading from a new
+    process proves S5 derives preparing, assembled, submitting,
+    rejected-finalizing, or accepted-finalizing from PostgreSQL alone and never
+    synthesizes `failed_finalizing`.
 
 ## Ownership boundaries
 

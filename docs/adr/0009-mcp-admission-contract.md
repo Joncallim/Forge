@@ -2948,16 +2948,19 @@ contract. This split must match the per-step release manifest metadata above.
   task-state reconciler reaches exactly `approved`.
 - S5 imports S4's discriminated recovery-marker union. Every known-invalid
   grant-mode/delivery/disposition/acknowledgement/failure combination is neutral
-  and actionless before presentation; the browser never composes independent
-  fields into an action.
+  and actionless before presentation. The server joins the exact prior audit and
+  artifact, proves typed terminal tuple equality plus marker identity, and
+  validates assembly/delivery/terminal/failure-stage together; the browser never
+  composes independent fields into an action. A typed packet integrity hold is
+  neutral, non-retryable, and has no web CTA.
 - A live audit with `status:'claiming'` and a **server-computed PostgreSQL-time**
   `leaseActive:true` is first normalized into one discriminated claim-state union:
-  preparing=`pending/not_exposed`, assembled=`assembled/not_exposed`,
+  preparing=`not_assembled/not_exposed`, assembled=`assembled/not_exposed`,
   submitting=`assembled/submitting`, accepted-finalizing=`assembled/submitted`, and
-  the closed pre-submission (both not-assembled and assembled/not-exposed),
-  submission-rejected, or provider-invalid
-  failed-finalizing variants. Impossible phase/assembly/delivery cross-products
-  fail closed. Valid current phases render actionlessly. The browser never compares lease
+  rejected-finalizing=`assembled/submission_failed`. Local failure intent is not a
+  durable live phase; preflight, assembly, provider-validation, and
+  post-submission failures remain on their last persisted copy until terminal
+  commit. Impossible phase/assembly/delivery cross-products fail closed. Valid current phases render actionlessly. The browser never compares lease
   timestamps or derives phase itself. Stale/unknown observations are neutral until
   S4 recovery/finalization persists terminal evidence.
 - S4 evidence uses opaque `rootRef` or the phrase "this project", never a host
@@ -2973,7 +2976,10 @@ contract. This split must match the per-step release manifest metadata above.
 - S5 imports S4's closed `PacketFailureCode` enum and maps only those values to
   bounded static copy. Unknown/future codes are neutral legacy/unknown evidence,
   never untrusted free-text operator copy. Packet evidence accepts no raw or
-  sanitized exception detail.
+  sanitized exception detail. A post-submission failure additionally requires its
+  closed stage; copy warns about prior external work and possible partial local
+  files, requires working-tree inspection, and never offers automatic resubmission
+  or claims rollback.
 - Project health action precedence is total: missing→install, disabled→enable,
   auth-required→connect, configuration-required→configure, unhealthy→fix,
   unknown→refresh, healthy→no CTA, and incoherent/future→neutral unavailable. The
