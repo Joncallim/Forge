@@ -241,7 +241,8 @@ async function reconcileFilesystemGrantsForProject(
     trigger:
       | 'task_always_allow'
       | 'project_always_allow'
-      | 'project_grant_revocation';
+      | 'project_grant_revocation'
+      | 'project_root_repoint';
     actorId: string;
   },
 ): Promise<FilesystemGrantReconciliationResult>;
@@ -370,6 +371,12 @@ from that project grant and proactively hold eligible `pending` or `ready`
 packages that no longer have exact coverage. For example, narrowing
 `read + list` to `read` leaves a read-only package eligible but holds a package
 that still requires both capabilities.
+
+`project_root_repoint` uses the same negative scan with a distinct bounded reason.
+It carries the newly incremented root-binding revision, revokes every decision
+bound to the prior root, and does not manufacture a new grant-decision revision or
+change the ordering between otherwise unrelated grant decisions. Only later
+explicit operator reapproval allocates new authority for the new root.
 
 The negative transition writes `holdKind:'revoked_required'`, the new decision
 revision, a bounded reason code, and a fresh fingerprint; it never copies a raw
