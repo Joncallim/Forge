@@ -554,15 +554,78 @@ executable only by its exact certificate-authenticated non-superuser `NOINHERIT`
 login, which has no cross-role membership, `SET ROLE`, or session-authorization
 privilege. Immutable `session_user` proves the calling boundary, but the shared
 human-history web login is never treated as an end-user identity. That reader
-accepts an opaque Forge session credential plus task/version—not a user ID—and,
-inside one transaction, hashes it, locks the matching live `forge_sessions` row,
-derives the user, rechecks ACL, appends the text-free read audit, and returns text.
-The credential is a prepared/binary parameter and is never stored, logged, audited,
-returned, or placed in SQL text. The package resolver continues to derive its exact
-worker identity directly from its distinct `session_user`. Two-user same-web-login,
-swapped/expired/revoked/fabricated credential, wrong-login/cross-reader, and hostile
-`SET ROLE` tests prove zero-byte/zero-forged-audit denial; catalog tests prove the
-production role attributes and lack of membership.
+has the exact signature
+`forge.read_architect_plan_history_v1(p_session_credential bytea, p_task_id uuid,
+p_plan_version bigint)`, not a user-ID argument. The current session table is
+`public.sessions`, not `forge_sessions`: today `sessions.id uuid` is both the raw
+lowercase-UUID `forge_session` cookie and `session:<uuid>` Redis key,
+`revoked_at` exists, and no database expiry exists. S4 makes `id` an independent
+internal UUID and adds `credential_digest_v1 bytea NOT NULL CHECK
+(octet_length(credential_digest_v1) = 32)` with a unique index and
+`expires_at timestamptz NOT NULL`; existing `user_id` and `revoked_at` remain the
+identity and revocation authority, and existing `last_seen_at` becomes the
+database activity clock.
+
+`SESSION_CREDENTIAL_DOMAIN_V1` is exactly UTF-8
+`forge:web-session:v1\0` (21 bytes; hex
+`666f7267653a7765622d73657373696f6e3a763100`). The credential input is exactly
+the current cookie's 36 lowercase ASCII UUID-v4 bytes, including hyphens and valid
+variant, with no case fold, percent decode, UUID-binary conversion, normalization,
+or hex/base64/text round trip. The database stores
+`SHA-256(domain_bytes || credential_bytes)` as a 32-byte `bytea`, with no added
+delimiter or length prefix. The fixed vector cookie
+`00000000-0000-4000-8000-000000000000` yields
+`a4a6fe7265a6d2ec096cb0d31bb6b79d91a3d9a36537827009cb01f22e1f58e4`.
+The function receives the credential through a prepared binary bind, validates it,
+locks the digest-matched row `FOR UPDATE`, then requires `revoked_at IS NULL` and
+`clock_timestamp() < expires_at`; equality is expired. That locked row derives
+the user. To preserve today's sliding seven-day lifetime, a valid authentication
+strictly more than 60 seconds after `last_seen_at` synchronously sets
+`last_seen_at = db_now` and `expires_at = db_now + interval '7 days'` under the
+same lock; more frequent reads do not extend it. ACL is rechecked, expiry/revocation
+is checked once more with database time, and the text-free audit and text return
+commit together.
+
+Redis is only a cache. The v2 key is
+`session:v2:<lowercase credential-digest hex>`, never the cookie. Creation commits
+PostgreSQL first with one `db_now`, `last_seen_at = db_now`, and
+`expires_at = db_now + interval '7 days'`, then writes Redis with `PXAT` no later
+than the committed `expires_at`; every
+authentication rechecks PostgreSQL. A threshold refresh commits the database
+expiry first, and only its after-commit action may advance Redis `PXAT`, never past
+that returned expiry. Database refresh failure denies the request and cannot
+extend Redis; Redis refresh failure cannot revoke a database-valid session and the
+next database-authorized read repairs it. Revocation commits `revoked_at` and a
+digest-keyed durable invalidation item first, then deletes Redis; retry/
+reconciliation handles deletion failure, and a stale cache entry cannot authorize.
+The migration first adds nullable columns
+and a dual reader/writer. New sessions use separate row IDs, unchanged UUID
+cookies, digests, database expiry, and v2 cache keys. After the legacy sliding-TTL
+writer is stopped and its processes drained, each locked legacy row uses Redis 7
+`PEXPIRETIME session:<legacy-id>` plus cached `lastSeenAt`: missing, malformed,
+non-expiring, or elapsed entries are revoked; a live row gets that exact absolute
+`expires_at`, reconciled `last_seen_at`, its digest, a fresh independent ID, and a
+v2 `PXAT` no later than that expiry before the raw-key entry is deleted.
+The resumable migrator rejects collisions and never extends expiry. Only after all
+live rows, binaries, and credentials are drained may S4 remove the raw-ID fallback,
+validate and make the columns strict, purge/zero-scan old `session:*` keys and all
+sinks, and enable the history route.
+
+The raw credential exists only in the cookie, bounded request buffer, and prepared
+binary argument until hashing. Argument-one bind logging/tracing is redacted; it is
+never persisted after the migration fence, returned, logged, audited, placed in
+SQL text, or included in Redis/invalidation. The bounded legacy-ID migration read
+is the sole temporary exception and cannot coexist with the enabled history route.
+Required tests cover valid, exact-expiry, expired, revoked, swapped-user/task,
+fabricated/malformed, wrong-domain/re-encoded/bit-flipped, simultaneous two-user,
+read-versus-revoke, and read-versus-expiry cases; denials return zero bytes and no
+read audit. Migration crash/resume, collision, exact expiry/activity backfill,
+60-second threshold/seven-day refresh, database-failure/no-Redis-extension,
+Redis-failure/database-valid repair, stale-cache/lost-delete, purge, and fixed-
+vector tests are mandatory. The package resolver continues
+to derive its exact worker identity directly from its distinct `session_user`.
+Wrong-login/cross-reader, hostile `SET ROLE`, and catalog tests prove zero-byte/
+zero-forged-audit denial and the production role attributes/lack of membership.
 
 Every entry string is NFC normalized. Its canonical bytes are RFC 8785 JSON
 Canonicalization Scheme serialization of the complete scoped entry tuple encoded
@@ -2658,6 +2721,39 @@ contract. This split must match the per-step release manifest metadata above.
   enablement roll back together; a committed receipt cannot replay. Database error,
   lease/deadline expiry, or controller death denies new ingress/issuance without lowering epoch.
 
+  Controller leases have one byte-level construction. The external controller
+  generates every raw secret as exactly 32 operating-system CSPRNG bytes.
+  `CONTROLLER_LEASE_DIGEST_DOMAIN_V1` is exactly the 35 UTF-8 bytes of
+  `forge:epic-172-controller-lease:v1\0` (hex
+  `666f7267653a657069632d3137322d636f6e74726f6c6c65722d6c656173653a763100`).
+  The stored digest is the fixed 32-byte
+  `SHA-256(domain_bytes || raw_secret_bytes)`, with raw concatenation and no added
+  delimiter, length prefix, conversion, normalization, or hex/base64/text round
+  trip. Digest/secret function arguments and the stored digest are binary `bytea`.
+  The fixed non-production vector is secret hex
+  `000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f` to digest
+  hex `9889482e88c98806a17cded064e203c3dd4108af93acb8db66a5a699d87b5947`.
+  `web/__tests__/__fixtures__/epic-172-controller-lease-v1.json` is the single
+  language-neutral constants/vector fixture for the controller, S4 database
+  helper/migration, and S6 verifier; production rejects its fixture secret.
+
+  The owner-only fixed-search-path
+  `forge.epic_172_controller_lease_digest_v1(bytea)` rejects lengths other than 32
+  and returns exactly 32 bytes. Every comparison calls
+  `forge.constant_time_equal_32_v1(bytea, bytea)` after locking the singleton. The
+  helper rejects non-32-byte operands, scans and XOR-accumulates all 32 byte
+  positions, and decides only after the loop, with no data-dependent early return.
+  Opening validates a 32-byte digest. A heartbeat accepts the 32-byte raw current
+  secret and 32-byte next digest only as prepared binary parameters, hashes and
+  constant-time-compares the current secret, rejects `next == current`, and then
+  performs its generation compare-and-set. Tests share the fixed vector and reject
+  wrong domain, 0/31/33-byte secret, non-32-byte digest, bit flip, re-encoding,
+  fixture-secret production use, stale/replay, swapped controller, delayed/out-of-
+  order, wrong binding/generation, and `next == current`. Two concurrent identical
+  heartbeats prove exactly one advances or extends the lease. Secret scans cover
+  bind capture, SQL/application logs, traces, errors, audit, inspect output, Redis,
+  and database state.
+
   The exact controller certificate login is non-superuser `NOINHERIT` with no
   `SET ROLE`/session-authorization authority. Every 10 seconds it invokes the
   fixed-search-path, `PUBLIC`-revoked heartbeat, which derives immutable
@@ -2665,14 +2761,15 @@ contract. This split must match the per-step release manifest metadata above.
   authorization digest/controller-token digest/fingerprint/generation before
   extending only to `least(clock_timestamp()+45 seconds, expires_at)`. For each
   call, the external controller generates the fresh next token locally and sends
-  the current raw secret plus only the next domain-separated digest as prepared/
+  the current raw secret plus only the next canonical v1 digest as prepared/
   binary parameters over its direct mutually authenticated database connection.
-  The heartbeat hashes the current secret and compare-and-sets its digest plus lease
-  generation to the supplied next digest/generation; it returns no raw token. The
+  The heartbeat hashes and constant-time-compares the current secret and
+  compare-and-sets its digest plus lease generation to the supplied next digest/
+  generation; it returns no raw token. The
   presented token is consumed; reuse, theft after rotation, delay, or out-of-order
-  generation cannot extend the lease. Raw current/next tokens are never stored,
-  audited, logged, interpolated into SQL, returned by inspect, or exposed to worker/writer
-  principals. Every
+  generation cannot extend the lease. Raw current/next tokens are never durably
+  stored, audited, logged, interpolated into SQL, returned by inspect, or exposed
+  to worker/writer principals. Every
   provisional boundary calls the same database gate. Lease/deadline expiry lets the
   first boundary or separately credentialed watchdog atomically change the sole
   singleton to `disabled`, clear all flags, and append one non-authoritative
