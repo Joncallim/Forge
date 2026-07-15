@@ -1358,15 +1358,19 @@ none of those slices may weaken this state, precedence, or lock contract.
   merge through `gh`; the executable prompt contains the static warning but none
   of that overlay/subtask/requirement text. Tests do not mislabel prompt compliance
   as OS-level enforcement.
-- **Prompt-injection boundary.** Forge's actual provider system-role message states that
-  bounded packet contents are untrusted data and that requirement overlays are
-  subordinate run instructions; neither can override tool, credential, repository,
-  or admission policy. Serialize each section as length-bounded JSON with explicit
+- **Prompt-injection boundary.** For providers that preserve roles, Forge's actual
+  system-role wire input states that bounded packet contents are untrusted data and
+  requirement overlays are subordinate run instructions; tests capture that real
+  role separation. The current ACP adapter flattens all roles into one
+  `session/prompt` string, so it receives a bounded Forge-authored guidance section
+  before quoted data and makes no immutable-role or enforcement claim. Serialize
+  each section as length-bounded JSON with explicit
   `{kind, requirementKey, content}` fields rather than concatenating raw delimiter
   text; reject/escape invalid encoding and truncate only at documented boundaries.
   A Forge-authored reminder may appear after serialized user-role context to aid
   model attention, but that reminder is not immutable and is not an enforcement
-  boundary. Adversarial tests assert actual system/user role separation and
+  boundary. Adversarial tests assert actual system/user role separation only for
+  adapters that preserve it; the ACP fake asserts the flattened wire representation and
   include a repository file and an allowed overlay containing fake system markers,
   closing fences, and instructions to use `gh`/read credentials; the bytes remain
   quoted data and do not alter the issued MCP surface. Task/debug logs retain only
@@ -1401,6 +1405,17 @@ none of those slices may weaken this state, precedence, or lock contract.
   of those writes and the attempt back. A run needing no packet creates no packet
   audit/artifact.
 
+  Mixed-worker cutover uses a durable database barrier. A singleton
+  `forge_runtime_protocol_epochs` row starts with the filesystem packet minimum at
+  1; legacy audit inserts default to protocol 1 and v2 workers write 2. A PostgreSQL
+  audit-insert trigger takes a shared epoch-row lock and rejects null/lower packet
+  protocols before any bounded repository read. Activation updates only the epoch
+  row, so it cannot reverse entity locks. After old-worker drain, deployment
+  locks the epoch exclusively, aborts if any nonterminal v1 audit remains, and then
+  advances it to 2. Shared trigger locks serialize racing inserts; the epoch is
+  never lowered on rollback. This fences Forge's
+  cooperative packet producer, not independent ACP host access.
+
   The packet lease is subordinate to the execution lease. One database-time
   heartbeat compare-and-sets both; every repository read batch, prompt exposure,
   ACP submission, and terminal finalization verifies package/run execution ownership
@@ -1418,6 +1433,10 @@ none of those slices may weaken this state, precedence, or lock contract.
   returns task `running → approved`, and atomically persists terminal audit + unique
   artifact. An `allow_once` nonce stays burned; an `always_allow` run claim can
   start a new operator-requested run only under current project coverage. Every
+  existing generic stale-package path first checks for a linked v2 issuance claim;
+  packet-bearing runs delegate by audit ID to this top-down transaction and never
+  clear leases, write generic stale markers, or publish terminal events separately.
+  Only packet-free runs may retain generic recovery. Every
   versioned `packet_issuance` marker has `autoRetryable:false`, immutable terminal
   delivery, separate disposition/acknowledgement fields, fingerprints, and bounded
   failure code. The normative matrix is: one-time +
@@ -1432,12 +1451,23 @@ none of those slices may weaken this state, precedence, or lock contract.
   `filesystem_mcp_issuance_recovery_actions` table. The route locks project → task
   → package → decision → prior run → audit, CAS-validates the marker/prior audit,
   and records acknowledgement even if current grant coverage was later revoked.
-  A separate always-allow `retry_execution` transition requires exact current
-  revision/coverage/policy, clears only the packet marker, moves
-  `blocked → ready`, commits, then wakes Redis. For one-time reapproval, S3 rotates
+  A separate always-allow `retry_execution` transition accepts either the same
+  revision/coverage or a greater project decision revision that exactly covers an
+  unchanged package policy. The latter is explicit operator reauthorization after
+  grant replacement, never automatic retry. It records prior and authorizing
+  revision/fingerprint evidence in the append-only action row, clears only the
+  packet marker, moves `blocked → ready`, commits, then wakes Redis; the normal new
+  claim snapshots the current decision. Missing, older, unknown, narrower, or
+  policy-changed decisions fail closed. For one-time reapproval, S3 rotates
   the fresh nonce and calls S4's package-scoped resolver in the same transaction;
-  the resolver verifies the prior terminal audit/marker and clears only S4 state.
-  Double/stale/policy/lease races are compare-and-set misses. The marker never
+  the resolver verifies the prior terminal audit/marker, writes append-only
+  `resolve_after_allow_once_reapproval` evidence for the new approval decision,
+  and clears only S4 state atomically.
+  Every acknowledgement, retry, and one-time resolution writes an append-only
+  action row atomically. An exact replay of `(audit, action, marker fingerprint)`
+  returns the recorded HTTP 200 result with no second mutation/wake; only a changed
+  fingerprint or unmatched durable state returns 409. Double/stale/policy/lease
+  races are compare-and-set or idempotency-ledger outcomes. The marker never
   reuses `mcpGrantBlock`/`mcpBroker` or persists a path/reason.
 
   Immediately after assembly and **before any exposure**, persist an immutable
@@ -1449,10 +1479,15 @@ none of those slices may weaken this state, precedence, or lock contract.
   Immediately before ACP I/O, ownership-CAS `not_exposed → submitting` with a
   random attempt ID and database time. Expired/crashed `submitting` becomes
   `submission_uncertain` and is never automatically replayed. A submission failure
-  never rewrites an assembled packet as unassembled. `rootRef` is a dedicated,
-  unique project UUID generated from secure random bytes under the project lock,
-  never path-derived; preview, approval, claim, and artifact read the same stable
-  value. Free-text repository errors, file names,
+  never rewrites an assembled packet as unassembled. One packet claim permits one
+  external model/ACP submission: after an accepted but Forge-invalid response, the
+  run fails with `submitted` evidence and does not use the executor's automatic
+  correction loop. Packet-free generation may retain that loop. `rootRef` is a
+  dedicated, unique project UUID with database `DEFAULT gen_random_uuid()` kept
+  through the mixed-version window, never path-derived; preview, approval, claim,
+  and artifact read the same lifetime-stable value. Rotation is out of scope
+  because approved-but-unclaimed snapshots would require invalidation/reapproval.
+  Free-text repository errors, file names,
   paths, excerpts, and contents are excluded from audits, artifacts, logs, and APIs.
   Terminal audit transition and artifact upsert occur in one ownership-fenced
   transaction; the partial unique artifact index supplies idempotency, not
@@ -1491,18 +1526,21 @@ none of those slices may weaken this state, precedence, or lock contract.
   `mergeCapabilityFields`; executor filesystem gating uses shared
   `coverageKeysForGrant`/`classifyCapability`.
 - **Additive rollout is part of the guarantee.** Expand schema with a unique
-  nullable project `root_ref`, nullable v2 fields/indexes, and the append-only
-  issuance-recovery action table/unique key; generate `root_ref` for new
-  projects and backfill existing projects in bounded batches, then make it non-null
+  nullable project `root_ref` using database `DEFAULT gen_random_uuid()`, nullable
+  v2 fields/indexes, the append-only issuance-recovery action table/unique key, and
+  the epoch singleton/default/trigger; keep the root default for old writers,
+  backfill existing projects in bounded batches, then make it non-null
   before v2 producers. Deploy dual readers that treat legacy one-time approvals
   without nonce as non-issuable and legacy audit zero/default columns as
-  `unknown_legacy`; deploy v2 writers with packet issuance disabled; drain every
-  legacy packet issuer; then start only v2 workers and enable issuance. After the
-  drain, #179 owns a restartable migration that clears every legacy path-valued
+  `unknown_legacy`; deploy v2 writers with packet issuance disabled at epoch 1;
+  drain every legacy packet issuer, advance the durable epoch to 2, then enable
+  issuance. After that durable cutover, #179 owns a separately gated restartable
+  post-drain operation/later migration—not an expansion migration already visible
+  to the ordinary migrator—that clears every legacy path-valued
   audit `root`, writes only aggregate scrub counts, and prevents v2 writers from
   repopulating it; it never derives `rootRef` from a path. SQL, Drizzle, and conflict
-  predicates must match. Rollback keeps additive schema/v2 data and
-  must not restart a legacy issuer; disable/drain issuance until a v2 worker is
+  predicates must match. Rollback keeps additive schema/v2 data, never lowers the
+  epoch, and must not restart a legacy issuer; disable/drain issuance until a v2 worker is
   restored. #180 reads this v2 evidence and #181 owns mixed-version, migration,
   dual-lease, failure-injection, atomic-finalization, and rollback sentinels.
 - Sandbox-generated files (`.forge/task-runs/...`) stay clearly separated from
