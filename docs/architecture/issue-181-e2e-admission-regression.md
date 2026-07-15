@@ -197,13 +197,30 @@ exact coverage fingerprint.
 - a valid provider response then fails at each closed local stage, including host
   apply after one successful file; one submitted request, exact failure stage,
   separate partial-host evidence, and no automatic retry/rollback survive;
+- expiry/recovery barriers before the first host replacement, between replacements,
+  and after the last replacement prove the process-lifetime host fence is acquired
+  with no database locks and held through finalization. Recovery cannot create an
+  action while it is held; crash-left `applying` becomes ledger `unknown`, and
+  exact-fingerprint working-tree review precedes any new run;
+- process death after each durable effect-stage entry proves possible-local-change
+  guidance survives even when the primary failure code is lease/worker loss;
 - definitive `submission_failed + submission_rejected` persistence races a crash
   and lease expiry; recovery preserves the staged rejection cause;
 - stale S4 recovery races packet-free and handoff-only claims in both orderings;
   no task moves to `approved` beside a newly established sibling lease;
+- claim/recovery races an `awaiting_review` sibling and its decision in both
+  orderings; no later specialist or recovery action appears before required review;
 - atomic packet finalization races a stale review-gate decision in both
   orderings; top-down locks and in-transaction source-run/artifact/package/lease
   checks produce one coherent winner without deadlock;
+- duplicate action, exact replay, one-time resolution, success repair, and review
+  decision prove the all-artifacts → recovery-actions → review-gates lock tail;
+- every normal web recovery/reapproval path rejects integrity holds. The bounded
+  Release/DevOps alert deduplicates, privileged resolution checks authorization
+  and fingerprint, and one append-only result survives; immutable evidence is not
+  rewritten;
+- pre-transaction `completion_preparation` failure persists that stage, while a
+  gate/finalizer database failure rolls back and persists no such cause;
 - one committed packet claim makes at most one external model/ACP submission; an
   accepted but Forge-invalid response does not trigger the existing automatic
   correction loop; the packet-bearing AI SDK call has `maxRetries:0`, every lower
@@ -247,18 +264,21 @@ means a one-time decision nonce can be replaced only by explicit reapproval.
 | Durable `submitting` intent, crash before/around ACP call | package S4 `blocked`; task `approved` after lease recovery | claim terminal failed; one-time nonce burned | staged assembly; recovery maps delivery to `submission_uncertain`; run/audit failed + one artifact | no submission replay | acknowledge possible prior work; then reapprove one-time or explicitly retry always-allow under current coverage |
 | Transport proves pre-acceptance rejection | package S4 `blocked`; task `approved` | claim terminal failed; one-time nonce burned | delivery `submission_failed`; run/audit failed + one artifact | no packet auto-retry | `allow_once`: reapprove; `always_allow`: explicit `retry_execution` if coverage matches |
 | Transport accepts response, Forge validation rejects it | package S4 `blocked`; task `approved` | claim terminal failed; one-time nonce burned | exactly one external prompt call; delivery `submitted`; terminal `provider_response_invalid`; failed run/audit + one artifact | no correction submission on this packet claim | acknowledge accepted submission, then grant-mode action |
-| Valid submitted response, then local execution stage fails | package S4 `blocked`; task follows sibling rule | claim terminal failed; one-time nonce burned | delivery stays `submitted`; terminal `post_submission_execution_failed` plus exactly one stage (`sandbox_apply|validation|host_apply|repository_evidence|completion_materialization`); one failed run/audit/artifact; separate host evidence may show partial writes | no model resubmission, local retry, or rollback | acknowledge prior external work and possible partial local changes; inspect/resolve working tree, then grant-mode action |
+| Valid submitted response, then local execution stage fails | package S4 `blocked`; task follows lease/review barrier | claim terminal failed; one-time nonce burned | delivery stays `submitted`; effect intent becomes `quiesced`; terminal `post_submission_execution_failed` plus exactly one stage (`sandbox_apply|validation|host_apply|repository_evidence|completion_preparation`); one failed run/audit/artifact; host ledger fingerprints applied/unknown entries | no model resubmission, local retry, or rollback | acknowledge prior external work; when host review is required, inspect/resolve working tree against exact ledger fingerprint, then grant-mode action |
 | Transport accepted/returned, crash before outcome persistence | package S4 `blocked`; task `approved` after recovery | claim terminal failed; one-time nonce burned | recovery uses `submission_uncertain`; one failed run/audit and one artifact | no submission replay | acknowledge possible prior work before any new decision/run |
-| `submitted` persisted, crash before finalization | package S4 `blocked`; task `approved` after recovery | claim terminal failed; one-time nonce burned | delivery remains `submitted`; failed run/audit + one artifact | no submission replay | acknowledge prior submission before any new decision/run |
-| Atomic live terminal transaction fails | package/run/lease/audit/marker/task/artifact all remain at the preterminal state until retry/recovery; then package S4 `blocked`; task follows sibling rule | claim remains `claiming`; nonce stays burned | the whole terminal transaction rolls back; staged assembly/delivery remain; live retry or sweeper commits run/package/lease/audit/artifact/marker/task atomically | automatic terminal-state retry only | row-specific action only after atomic terminal state exists |
+| `submitted` persisted, crash before effect intent | recovery first acquires host fence, then package S4 `blocked`; task follows lease/review barrier | claim terminal failed; one-time nonce burned | delivery remains `submitted`; effect is `not_started`; failed run/audit + one artifact | no submission replay | acknowledge prior submission before any new decision/run |
+| Active post-submission effect, fence still held/unreachable | package/run remain unchanged; task remains `running` | claim stays `claiming`; nonce burned | active intent/ledger immutable; one deduplicated quiescence alert; no terminal marker | owning-host recovery retry only; no state mutation/new run | no web action; “Waiting for worker changes to stop” |
+| Crash during host apply or after replacement before outcome | recovery acquires fence, blocks package; task follows lease/review barrier | claim terminal failed; nonce burned | leftover `applying → unknown`; effect becomes `quiesced`; primary failure may remain lease/worker loss; host review required by ledger fingerprint | no host/model retry or rollback | inspect/resolve working tree and acknowledge exact ledger fingerprint before grant-mode action |
+| Atomic live terminal transaction fails | package/run/lease/audit/marker/task/artifacts/actions/gates all remain at preterminal state until retry/recovery; host fence remains held while live retry runs; then package follows terminal outcome | claim remains `claiming`; nonce stays burned | whole terminal transaction rolls back; staged assembly/delivery/effect/ledger remain; no `completion_preparation` cause is persisted | automatic terminal-state retry only while fenced; owning-host recovery after process death | row-specific action only after atomic terminal/quiescent state exists |
 | Seeded terminal-failure audit/artifact + live-package split | S4 repair fails the run, clears its lease, blocks package; task follows sibling rule | terminal claim remains immutable; nonce remains burned | exact audit/artifact tuple equality required; marker copies the immutable failure object/delivery; no second artifact | idempotent S4 repair only; no submission | disposition-specific action from immutable failure |
 | Seeded terminal-success audit/artifact + complete success materialization | repair completes the exact normal package/review-gate transition; task follows normal completion/review rule | successful claim remains immutable; nonce remains burned | matching completion artifact, configured repository evidence, and review-gate materialization are required; no marker/second artifact | idempotent success reconstruction only; no submission | none |
-| Seeded terminal-success with incomplete materialization, or audit/artifact mismatch | live run failed only for bounded integrity reason; lease cleared; package has typed S4 integrity hold; task follows sibling rule | immutable packet claim/outcome unchanged | existing evidence unchanged; `packet_integrity_hold` is non-retryable and is not a packet-failure marker | no retry/resubmission | no web action; separately authorized privileged data repair |
+| Seeded terminal-success with incomplete materialization, or audit/artifact mismatch | live run failed only for bounded integrity reason; lease cleared; package has typed S4 integrity hold; task follows sibling rule | immutable packet claim/outcome unchanged | existing evidence unchanged; one bounded Release/DevOps alert; `packet_integrity_hold` is non-retryable and is not a packet-failure marker | no retry/resubmission | no web action; fingerprint-bound privileged runbook/command only |
 | Redis wake fails after grant/recovery action | committed package `ready`; task `approved` | unchanged | unchanged | periodic database sweep re-enqueues; duplicate wakes harmless | none |
 | Always-allow packet block, then project grant revoked/restored | package remains S4 `blocked` until explicit retry; task `approved` | prior claim remains terminal; new decision has a greater revision | prior run/audit/artifact immutable; recovery action records the authorizing new revision; new run later snapshots it | none while uncovered; no automatic retry after restore | grant control while uncovered; after exact restore, explicit retry (and prior-submission acknowledgement first when required) |
-| Worker restart or lease expiry | stale live state becomes package S4 `blocked`; task `approved` | token invalidated; audit terminal failed; one-time nonce burned | run failed; one artifact from staged state; stale owner loses every later CAS | startup/periodic reconciliation only, never delivery replay | disposition-specific action above |
+| Worker restart or lease expiry | owning-host recovery first proves effect fence quiescent, then stale state becomes package S4 `blocked`; task follows lease/review barrier | token invalidated; audit terminal failed; one-time nonce burned | run failed; one artifact from staged state; stale owner cannot perform a later host operation; ledger review may remain required | startup/periodic owning-host reconciliation only, never delivery/host replay | disposition/host-review action above |
 | Generic stale-running recovery sees linked v2 claim | only unified S4 recovery mutates package/task | unified token invalidation; nonce remains burned | one failed run/audit/artifact; no generic stale marker or duplicate event | S4 sweeper/delegation only | disposition-specific action above |
 | Packet recovery completes while sibling lease is live | package stays S4 `blocked`; task stays `running` | terminal claim/nonce unchanged | marker/artifact immutable; sibling run remains live | S4 post-sibling/periodic task reconciler later moves only task `running → approved` | no action until task is approved, then marker-specific action |
+| Packet recovery completes while sibling is `awaiting_review` | package stays S4 `blocked`; task stays `running` | terminal claim/nonce unchanged | marker/artifact immutable; required review state unchanged | review decision completes first; S4 reconciler later moves only task | no action; “Waiting for required review” |
 
 S6 imports S4's exact schema: assembly is `assembled|not_assembled`; staged
 delivery is
@@ -271,9 +291,10 @@ the conditional closed post-submission stage. The suite exhausts valid and known
 grant-mode × delivery-state recovery-disposition matrix, including
 `reapprove_allow_once`, `review_then_reapprove_allow_once`, `retry_execution`,
 and `review_submission`, plus every known-invalid grant-mode/delivery/disposition/
-acknowledgement cross-product. Acknowledgement never changes immutable delivery: it
-changes only disposition to `reapprove_allow_once` or `reviewed_submission` with
-database actor/time evidence. Retry from `reviewed_submission` still requires
+acknowledgement and host-review cross-product. Acknowledgement never changes immutable delivery: it
+changes disposition to `reapprove_allow_once` or `reviewed_submission` and, when
+required, host review to `reviewed`, with database actor/time and exact ledger
+fingerprint evidence. Retry from `reviewed_submission` still requires
 current exact always-allow coverage. The locked route may accept the same effective
 decision or a greater effective decision revision that exactly covers unchanged
 package policy only when canonical S1 `readEffectiveGrantState` returns approved
@@ -296,7 +317,7 @@ code because it leaves no durable distinguishing fact; recovery uses the last
 durable phase and ownership predicates. Unknown or known-incompatible codes fail
 closed in S5/S6 and never become free-text assertions. Packet-owned state accepts
 no raw/sanitized exception detail. When another sibling package retains a live
-execution lease, S4 recovery leaves the task `running`; the marker is actionless
+execution lease or `awaiting_review` status, S4 recovery leaves the task `running`; the marker is actionless
 until S4's post-sibling/periodic task reconciler reaches `approved`.
 
 ## Prompt/instruction assertions
@@ -329,6 +350,9 @@ Assert:
   and diagnostic copies;
 - prompt logging retains only the existing digest/byte-count snapshot and bounded
   section/omission counts, never the executable prompt string.
+- a static documentation/operator-copy sentinel permits only MCP-channel scope and
+  rejects claims that ACP lacks shell, network, credential, or host-filesystem
+  access or that unimplemented S3–S6 behavior is already live.
 
 ## Layer 3: Playwright operator flow
 
@@ -362,17 +386,24 @@ Keep this small:
 11. Leave a sibling execution lease live while packet recovery completes. The task
     stays `running` and the marker says “Waiting for active package” without an
     action; after S4's post-sibling task reconciler reaches `approved`, the bounded
-    action may appear.
+    action may appear. Repeat with an `awaiting_review` sibling and assert “Waiting
+    for required review” until its mandatory gate decision completes.
 12. Invoke direct progress, sibling continuation, and periodic readiness with an
     S4 recovery or integrity-hold marker while current always-allow admission is
     otherwise valid. None promotes or claims it; only the exact packet
-    action/resolver can clear a recovery marker, while an integrity hold has no web
-    action.
+    action/resolver can clear a recovery marker. Every normal action rejects an
+    integrity hold; it has no web action.
 13. Render every post-submission failure stage from the exact failed
-    audit/artifact/marker tuple. All copy is static; `host_apply` warns of possible
-    partial changes; no path/raw detail or automatic resubmission appears.
+    audit/artifact/marker tuple. All copy is static; `host_apply` and a required
+    host-ledger review warn of possible partial changes; changed ledger fingerprint
+    hides retry; no path/raw detail or automatic resubmission appears.
 14. Seed tuple mismatch, immutable-success-plus-failure-marker, and both typed
-    integrity-hold reasons. Every state is neutral, non-retryable, and actionless.
+    integrity-hold reasons. Every state is neutral, non-retryable, actionless, and
+    names Release/DevOps plus the checked-in runbook without exposing repair as a
+    browser control.
+15. Render an expired submitted claim with active effect intent and quiescence
+    alert as “Waiting for worker changes to stop.” It remains actionless until
+    owning-host recovery persists `quiesced`.
 
 Back-end integration tests remain authoritative for concurrency and state transitions.
 
@@ -412,7 +443,8 @@ S4 changes cross web and worker process boundaries, so S6 must prove this rollou
 
 1. **Expand schema first.** #179 adds/backfills the unique project `root_ref` with
    database `DEFAULT gen_random_uuid()` retained for old writers, nullable
-   nonce/claim/snapshot fields, issuance-recovery action table, protocol epoch
+   nonce/claim/snapshot/effect fields, host-apply ledger/entries,
+   issuance-recovery action and integrity alert/resolution tables, protocol epoch
    singleton, `work_packages.claim_protocol_version`, the rejecting package
    `running`-transition trigger, new status vocabulary, and partial indexes without
    changing legacy readers. Existing
@@ -439,6 +471,10 @@ S4 changes cross web and worker process boundaries, so S6 must prove this rollou
    Separately start a genuine
    pre-trigger fixture and prove activation is forbidden until the fixture is
    externally drained. Rollback never lowers the epoch.
+   Activation is also forbidden until every host-write worker proves the shared
+   process-lifetime project fence and same-host recovery routing, and the
+   Release/DevOps integrity inspect/resolve commands plus runbook pass their
+   authorization/fingerprint tests.
 5. **Post-drain scrub.** Only after durable epoch-2 evidence, #179—not test-only
    S6—runs its separately gated restartable operation/later migration that clears
    legacy persisted root paths and records only aggregate scrub counts. It is not
@@ -453,8 +489,9 @@ cutover, and existing duplicate-permitted artifact types. An incompatible old
 packet writer reconnecting through the bridge trigger is rejected at its package
 transition before repository reads. Rollback is
 code-only and forward-schema-compatible: leave additive columns, indexes, root
-default, and monotonic epoch in place, disable v2 packet production, and never
-restart an old packet writer against v2 state.
+default, ledgers/alerts, and monotonic epoch in place; disable v2 packet production;
+prove all effect fences quiescent and intents terminal/held; and never restart an
+old packet writer against v2 state.
 
 ## CI commands and budgets
 
@@ -557,11 +594,14 @@ strict no-skip/no-retry policy is scoped to the four named commands above.
 2. Add real approve-route task-tracker flows.
 3. Add grant recovery/concurrency flows.
 4. Integrate issuance/evidence race scenarios.
-5. Add prompt filtering/injection assertions.
-6. Add thin Playwright presentation flow.
-7. Add the failure/recovery and mixed-version matrices.
-8. Add persistence-wide leakage sentinels and failure diagnostics.
-9. Wire the four named CI commands and enforce numeric budgets.
+5. Add host-fence/effect-ledger crash barriers, review-pending arbitration, and
+   complete artifact/action/gate lock-order races.
+6. Add integrity alert/runbook/privileged-resolution contract tests.
+7. Add prompt filtering/injection assertions.
+8. Add thin Playwright presentation flow.
+9. Add the failure/recovery and mixed-version matrices.
+10. Add persistence-wide leakage sentinels and failure diagnostics.
+11. Wire the four named CI commands and enforce numeric budgets.
 
 ## Completion gate
 
@@ -578,3 +618,7 @@ content persistence, worker-wall-clock lease authority, timing sleeps as race
 proof, policy reimplementation, or production-only test hooks that bypass
 route/transaction behavior. Stop if mixed-version behavior, a failure-matrix row,
 or a persistence sink has no explicit owner and sentinel.
+Also stop if a test can expose a new run/action before host quiescence,
+fingerprint-bound working-tree review, or mandatory sibling review; if normal web
+actions can clear integrity holds; if completion preparation and atomic rollback
+are conflated; or if lock-order tests omit artifacts/action rows/gates.
