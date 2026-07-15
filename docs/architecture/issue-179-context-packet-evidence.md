@@ -589,6 +589,24 @@ assembly, delivery, grant, path, or packet action. Only exact
 may clear it. Packet retry/reapproval/acknowledgement and generic readiness never
 do. A packet run may carry both markers; each owner clears only its own state.
 
+```ts
+type LocalEffectRecoveryMarkerV1 = {
+  schemaVersion: 1;
+  kind: 'local_effect_recovery';
+  source: 'local-run-evidence';
+  priorAgentRunId: string;
+  localRunEvidenceId: string;
+  reason:
+    | 'host_apply_requires_review'
+    | 'repository_change_requires_review'
+    | 'host_and_repository_change_require_review';
+  evidenceFingerprint: string;
+  reviewState: 'review_required';
+  taskDisposition: 'operator_hold';
+  autoRetryable: false;
+};
+```
+
 ## Fencing lifecycle
 
 The packet lease is subordinate to the package execution lease. One heartbeat operation renews both under compare-and-set using PostgreSQL `now()`; heartbeat configuration has validated minimum/maximum values and an interval strictly below the lease duration. A worker must not renew either lease after ownership of either one is lost.
@@ -948,7 +966,7 @@ type PostSubmissionFailureStage =
   | 'repository_evidence'
   | 'completion_preparation';
 
-type PacketPostSubmissionEffectIntent =
+type LocalRunEffectIntent =
   | { state: 'not_started' }
   | {
       state: 'active';
