@@ -1491,7 +1491,7 @@ none of those slices may weaken this state, precedence, or lock contract.
 
   S4 owns a packet-recovery route and append-only
   `filesystem_mcp_issuance_recovery_actions` table. The route locks project → task
-  → package → decision → prior run → audit, accepts a version-2 request carrying
+  → package → decision → prior run → audit → exact packet artifact, accepts a version-2 request carrying
   `{action, priorRuntimeAuditId, markerFingerprint}`, binds that identity to the
   routed task/package, CAS-validates the marker/prior audit, and records
   acknowledgement even if current grant coverage was later revoked.
@@ -1509,7 +1509,8 @@ none of those slices may weaken this state, precedence, or lock contract.
   claim snapshots the current decision. Missing, older, unknown, narrower, or
   policy-changed decisions fail closed. For one-time reapproval, S3 rotates
   the fresh nonce and calls S4's package-scoped resolver in the same transaction;
-  the resolver verifies the prior terminal audit/marker, writes append-only
+  the resolver continues to prior run → audit → exact packet artifact, proves
+  canonical typed audit/artifact equality, verifies the prior terminal marker, and writes append-only
   `resolve_after_allow_once_reapproval` evidence for the new approval decision,
   and clears only S4 state atomically.
   Every acknowledgement, retry, and one-time resolution writes an append-only

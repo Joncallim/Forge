@@ -622,7 +622,9 @@ POST /api/tasks/{taskId}/work-packages/{packageId}/packet-issuance-recovery
 ```
 
 The route authorizes the operator, then locks project → task → package → current
-grant decision → prior agent run → prior runtime audit. Every action requires task
+grant decision → prior agent run → prior runtime audit → exact packet artifact.
+Under those locks it proves canonical typed equality between the audit and
+artifact terminal tuples before reading the marker as actionable. Every action requires task
 `approved`, package `blocked`, a request whose task/package route owns the exact
 prior audit, the exact marker/prior-audit/delivery identity, and no active lease.
 It checks the append-only ledger by the complete versioned request identity before
@@ -685,7 +687,8 @@ Fresh one-time reapproval has one explicit cross-slice integration point. After
 #178 rotates the nonce under project → task → package → approval locks, it calls
 an S4-owned package-scoped resolver in the same transaction. The resolver
 continues to prior agent run → runtime audit, verifies the terminal prior claim,
-the exact `reapprove_allow_once` marker/fingerprint, changed fresh nonce, and
+then locks the exact packet artifact and proves canonical typed audit/artifact
+tuple equality. It verifies the exact `reapprove_allow_once` marker/fingerprint, changed fresh nonce, and
 current policy, then clears only the packet marker and moves `blocked → ready`.
 It also inserts `resolve_after_allow_once_reapproval` evidence referencing the new
 approval decision; marker clearing and that evidence are atomic.
