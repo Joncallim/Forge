@@ -1400,9 +1400,12 @@ none of those slices may weaken this state, precedence, or lock contract.
   Extend the existing package claim transaction instead of creating a second run
   lifecycle. The full order is project → tasks ascending → packages ascending →
   approval/decision rows ascending → worker-protocol epoch → agent run → runtime
-  audit → packet artifact. One shared package-claim primitive sets transaction-local
-  protocol 2 before every v2 transition to `running`, including packet-free and
-  handoff-only mode. A packet-bearing transaction then creates the agent
+  audit → packet artifact → review-gate rows ascending. One shared package-claim
+  primitive locks project, task, and every sibling package in stable order,
+  recomputes dependencies/candidate eligibility, proves no sibling is running or
+  leased, sets transaction-local protocol 2, and claims exactly one package. This
+  applies to packet-bearing, packet-free, and handoff-only execution. A
+  packet-bearing transaction then creates the agent
   run and existing execution lease, inserts the packet claim and authorization
   snapshot, and—only for `allow_once`—consumes the exact nonce. Any failure rolls all
   of those writes and the attempt back. A run needing no packet creates no packet
@@ -1450,8 +1453,8 @@ none of those slices may weaken this state, precedence, or lock contract.
   audit/approval and reaches backward. The transaction compare-and-sets a still-
   expired claim, invalidates the token, fails the linked run, clears only that run's
   execution lease, moves the package to a structured issuance-recovery block, and
-  atomically persists terminal audit + unique artifact. It locks running/claiming
-  sibling packages in ascending order and returns task `running → approved` only
+  atomically persists terminal audit + unique artifact. It locks every sibling
+  package in ascending order and returns task `running → approved` only
   when no sibling has a live execution lease; otherwise the task remains `running`
   and recovery has no action until an S4-owned top-down task-state reconciler,
   invoked after sibling lease release and periodically, proves no live sibling
@@ -1462,9 +1465,13 @@ none of those slices may weaken this state, precedence, or lock contract.
   packet-bearing runs delegate by audit ID to this top-down transaction and never
   clear leases, write generic stale markers, or publish terminal events separately.
   A compare-and-set miss is handled only after proving run/package terminal and the
-  lease cleared. A seeded terminal-audit/live-package split takes an idempotent S4
-  repair branch that preserves audit/artifact, fails the run, clears its lease, and
-  creates the marker/task disposition without resubmission.
+  lease cleared. A seeded terminal-audit/live-package split first requires exact
+  typed audit/artifact tuple equality. Terminal failure repair copies the immutable
+  failure object/delivery into the marker. Terminal success creates no failure
+  marker and may reconstruct success only from matching completion,
+  repository-evidence, and review-gate materialization; missing/mismatched evidence
+  enters a neutral non-retryable integrity hold. Repair never resubmits or turns
+  immutable success into retryable failure.
   Only packet-free runs may retain generic recovery. Every
   versioned `packet_issuance` marker has `autoRetryable:false`, immutable terminal
   delivery, separate disposition/acknowledgement fields, fingerprints, and bounded
@@ -1473,7 +1480,10 @@ none of those slices may weaken this state, precedence, or lock contract.
   `submission_uncertain|submitted` → `review_then_reapprove_allow_once`;
   always-allow + `not_exposed|submission_failed` → `retry_execution`; and
   always-allow + `submission_uncertain|submitted` → `review_submission`.
-  Acknowledgement never changes delivery: it records actor/database time and moves
+  Every marker reader/action joins the exact prior audit and artifact, proves
+  their typed terminal tuples equal and binds the marker identity to that failed
+  tuple. Missing, mismatched, or success-plus-failure-marker evidence is neutral,
+  non-retryable, and actionless. Acknowledgement never changes delivery: it records actor/database time and moves
   the disposition to `reapprove_allow_once` or `reviewed_submission`.
 
   S4 owns a packet-recovery route and append-only
@@ -1520,9 +1530,14 @@ none of those slices may weaken this state, precedence, or lock contract.
   never rewrites an assembled packet as unassembled. Audit/artifact adds a
   terminal discriminant: `{status:'succeeded'}` is valid only with
   `assembled+submitted`; `{status:'failed',failureCode}` uses the closed shared enum
-  `authorization_changed|execution_lease_expired|issuance_lease_expired|worker_stopped|preflight_failed|assembly_failed|submission_rejected|submission_uncertain|provider_response_invalid`.
+  `authorization_changed|execution_lease_expired|issuance_lease_expired|worker_stopped|preflight_failed|assembly_failed|submission_rejected|submission_uncertain|provider_response_invalid|post_submission_execution_failed`.
+  The last code is valid only with assembled/submitted evidence and exactly one
+  closed stage:
+  `sandbox_apply|validation|host_apply|repository_evidence|completion_materialization`.
   A normative compatibility table constrains assembly stage, delivery, terminal
-  status, and failure code; known-invalid cross-products fail closed. There is no
+  status, failure code, and conditional stage; known-invalid cross-products fail
+  closed. Definitive `submission_failed` is staged atomically with
+  `submission_rejected` and is not later reclassified as lease expiry. There is no
   `terminalization_interrupted` code because a rolled-back atomic terminalizer
   leaves no durable evidence distinguishing it from a worker/lease failure.
   Packet-owned persistence accepts no raw/sanitized exception detail; operator copy
@@ -1540,7 +1555,13 @@ none of those slices may weaken this state, precedence, or lock contract.
   paths, excerpts, and contents are excluded from packet-owned audits, artifacts,
   logs, events, queues, and APIs. Live finalization extends the existing
   ownership-fenced run/package terminal transaction and atomically updates
-  run/package/lease, audit, artifact, recovery marker, and task disposition. A v2
+  run/package/lease, audit, artifact, recovery marker, and task disposition. A
+  post-submission stage failure is not auto-resubmitted; host apply may be partial,
+  so acknowledgement covers prior external work plus possible local changes and
+  Forge never claims rollback. Review-gate materialization/decision follows the
+  global order and rereads source run/artifact, package status, and lease under the
+  transaction locks before compare-and-set; gate-first locking and
+  pre-transaction-only freshness are forbidden. A v2
   writer cannot commit terminal packet evidence with a still-running linked
   package. The partial unique artifact index supplies idempotency, not
   crash-consistency by itself. This is cooperative database fencing, not
@@ -1591,8 +1612,13 @@ none of those slices may weaken this state, precedence, or lock contract.
   prove packet, packet-free, and handoff-only package claims use the shared
   protocol primitive and traverse the trigger before executor work, operationally drain
   every process already past that newly installed boundary, verify no running
-  package has null/protocol-1 claim evidence, then use the privileged
-  three-statement `READ COMMITTED` activation to advance the epoch to 2 and
+  package has null/protocol-1 claim evidence, then use the checked-in `web`
+  command `npm run protocol:activate-work-package-v2 -- --actor <operator-id>`.
+  It defaults to dry-run blocker output; `--apply` verifies `READ COMMITTED`, runs
+  the privileged three-statement activation, checks postconditions, is idempotent,
+  and retains the database audit. The required operator procedure is
+  `docs/operators/work-package-protocol-v2-cutover.md`; ad hoc SQL is forbidden.
+  Advance the epoch to 2 with that command and
   enable issuance. After that durable cutover, #179 owns a separately gated restartable
   post-drain operation/later migration—not an expansion migration already visible
   to the ordinary migrator—that clears every legacy path-valued

@@ -175,10 +175,14 @@ executor can read repository context. The trigger reads the transaction-local
 `forge.worker_protocol` setting (`1` when absent for legacy binaries), takes a
 shared lock on the epoch row, rejects a lower protocol, and writes the observed
 version to `work_packages.claim_protocol_version`. One shared v2 package-claim
-primitive sets `SET LOCAL forge.worker_protocol='2'` before every conditional
-`running` transition: packet-bearing execution, packet-free execution, and
-handoff-only mode when `FORGE_WORK_PACKAGE_EXECUTION=0`. Only the packet-bearing
-branch continues to the issuance audit/nonce work below.
+primitive locks project → task → every sibling package in ascending ID order,
+recomputes dependency/candidate eligibility, proves no sibling is running or
+leased, sets `SET LOCAL forge.worker_protocol='2'`, and only then attempts one
+conditional `running` transition. This is required for packet-bearing execution,
+packet-free execution, and handoff-only mode when
+`FORGE_WORK_PACKAGE_EXECUTION=0`; no direct writer may update only its preselected
+package. Only the packet-bearing branch continues to the issuance audit/nonce
+work below.
 The trigger therefore fences a restarted old binary before *any* executor work,
 not merely before a late audit. It governs cooperative Forge execution and does
 not confine an ACP process or revoke other host access.
@@ -218,11 +222,13 @@ project
   → agent run
   → runtime audit claim
   → packet metadata artifact
+  → review-gate row(s ascending)
 ```
 
-Live health checks and other network/system probes happen before the transaction and are not persistence inputs. Every current `ready → running` writer must call the shared protocol-v2 package-claim primitive. For a packet-bearing package, extend that same package/run claim transaction rather than creating an independent claim lifecycle:
+Live health checks and other network/system probes happen before the transaction and are not persistence inputs. Every current `ready → running` writer must call the shared protocol-v2 package-claim primitive. In every mode it locks project → task → all sibling packages ascending, recomputes candidate/dependency state under lock, proves no sibling has `running` status or a live execution lease, and claims exactly one eligible package. This includes packet-free and handoff-only paths even when there is no MCP project snapshot. For a packet-bearing package, extend that same package/run claim transaction rather than creating an independent claim lifecycle:
 
-1. Lock project, task, and package rows in global order.
+1. Lock project, task, and every sibling package row in global order; recompute
+   eligibility and select the one candidate under those locks.
 2. Lock the applicable approval/decision row after the package.
 3. Re-read current package requirements and canonical admission. Verify exact required coverage and decision revision. For `allow_once`, also verify the approval ID + nonce is approved and unconsumed.
 4. The shared primitive sets transaction-local worker protocol 2, then conditionally
@@ -324,7 +330,15 @@ type PacketFailureCode =
   | 'assembly_failed'
   | 'submission_rejected'
   | 'submission_uncertain'
-  | 'provider_response_invalid';
+  | 'provider_response_invalid'
+  | 'post_submission_execution_failed';
+
+type PostSubmissionFailureStage =
+  | 'sandbox_apply'
+  | 'validation'
+  | 'host_apply'
+  | 'repository_evidence'
+  | 'completion_materialization';
 
 type PacketAssemblySnapshot =
   | {
@@ -360,14 +374,25 @@ type TerminalPacketDeliveryOutcome = Exclude<
 
 type PacketTerminalOutcome =
   | { status: 'succeeded' }
-  | { status: 'failed'; failureCode: PacketFailureCode };
+  | {
+      status: 'failed';
+      failureCode: Exclude<
+        PacketFailureCode,
+        'post_submission_execution_failed'
+      >;
+    }
+  | {
+      status: 'failed';
+      failureCode: 'post_submission_execution_failed';
+      failureStage: PostSubmissionFailureStage;
+    };
 
 type PacketIssuanceRecoveryCommon = {
   schemaVersion: 2;
   kind: 'packet_issuance';
   priorAgentRunId: string;
   priorRuntimeAuditId: string;
-  recoveryFailure: { status: 'failed'; failureCode: PacketFailureCode };
+  recoveryFailure: Extract<PacketTerminalOutcome, { status: 'failed' }>;
   autoRetryable: false;
   markerFingerprint: string;
   policyFingerprint: string;
@@ -433,10 +458,12 @@ and creates no recovery marker. A failed tuple permits only:
 | `assembled` | `not_exposed` | authorization/lease codes or `worker_stopped` |
 | `assembled` | `submission_failed` | `submission_rejected` |
 | `assembled` | `submission_uncertain` | authorization/lease codes, `worker_stopped`, or `submission_uncertain` |
-| `assembled` | `submitted` | authorization/lease codes, `worker_stopped`, or `provider_response_invalid` |
+| `assembled` | `submitted` | authorization/lease codes, `worker_stopped`, `provider_response_invalid`, or `post_submission_execution_failed` with exactly one closed `failureStage` |
 
-The first ownership failure successfully persisted by the live owner is primary.
-If stale recovery must derive a cause, it uses the deterministic order
+The first bounded failure successfully persisted by the live owner is primary.
+`submission_failed` is atomically staged with `submission_rejected`; recovery
+preserves that definitive pair even when a lease later expires. Otherwise, if
+stale recovery must derive a cause, it uses the deterministic order
 `authorization_changed → execution_lease_expired → issuance_lease_expired →
 delivery-specific cause → worker_stopped`. An atomic terminalizer rollback leaves
 no durable fact that distinguishes “never started” from “started then rolled
@@ -444,6 +471,19 @@ back”, so there is deliberately no `terminalization_interrupted` code; recover
 uses the last durable phase and ownership predicates. SQL checks, Drizzle parsing,
 API readers, S5, and S6 accept exactly these tuples. Every known-invalid
 cross-product fails closed as legacy/unknown evidence.
+
+`post_submission_execution_failed` means Forge accepted a valid provider response
+and then failed at one bounded local stage: sandbox apply, validation, host apply,
+repository-evidence persistence, or completion/review-gate materialization. It is
+valid only with `assembled + submitted` and requires exactly one
+`PostSubmissionFailureStage`; every other failure code forbids `failureStage`.
+Delivery remains `submitted`, so recovery follows the possible-prior-work path and
+never automatically resubmits. A `host_apply` failure may have changed some files
+before it stopped. The packet audit records only the closed stage; existing
+repository/host-apply evidence remains the separate source for changed files.
+Operator acknowledgement covers both the prior external submission and possible
+partial local changes. The operator must inspect and resolve the working tree
+before choosing a new run; Forge never claims rollback.
 
 `rootRef` is an opaque, project-scoped random identifier and is never derived from, reversible to, or displayed as an absolute/relative filesystem path. Counts are non-negative bounded integers. Redaction summaries use a closed set of category keys and bounded counts. Packet-owned failure evidence is enum-only: it never accepts raw exception text and has no “sanitized detail” field. No selected names, paths, excerpts, free-text repository errors, or file contents enter the audit, artifact, task log, debug log, event, queue payload, or API response.
 
@@ -464,7 +504,7 @@ The packet keeps the existing assembly ceilings: `50` included files, `160 KiB` 
 
 `reconcileStaleFilesystemIssuanceClaims()` runs at startup and periodic recovery. Candidate discovery selects expired audit IDs without holding audit-row locks. For each candidate, a fresh transaction:
 
-1. locks project → task → every running/claiming sibling package in ascending ID
+1. locks project → task → every sibling package in ascending ID
    order → approval decision → worker-protocol epoch → agent run → runtime audit
    in global order;
 2. compare-and-sets only a still-`claiming` row whose lease is expired according to PostgreSQL `now()`;
@@ -484,11 +524,20 @@ issuance claim. If a nonterminal claim exists, it delegates the candidate ID to
 this S4 top-down transaction. A compare-and-set miss is “already handled” only
 after rereading under the same locks and proving the package/run are no longer
 running and the execution lease is cleared. A terminal packet audit/artifact with
-a still-running linked run/package is an invariant-repair branch: preserve the
-immutable audit/artifact, fail the run, clear only its lease, write the recovery
-marker from the terminal delivery plus deterministic worker/lease cause, and apply
-the same task disposition atomically. It never resubmits or creates a second
-artifact. Only a run with no packet claim may use the legacy generic recovery path. Both execution-lease-first
+a still-running linked run/package is an invariant-repair branch. It first proves
+byte-for-byte-equivalent typed terminal tuples in the audit and artifact; mismatch
+enters a neutral, non-retryable integrity hold and alerts operators without
+changing packet evidence or exposing a retry action. For terminal failure, repair
+fails the run, clears only its lease, blocks the package, and copies the exact
+immutable failure object and delivery into the marker; it never derives a
+worker/lease replacement cause. For terminal success, repair creates no failure
+marker. It may reconstruct the normal success-side run/package/review-gate
+transition only when the matching completion artifact, repository evidence
+required by the configured host-write mode, and review-gate materialization
+already exist for that run. Otherwise it enters the neutral integrity hold for
+privileged manual repair. It never resubmits, creates a second artifact, rewrites
+terminal evidence, or converts success into retryable failure. Only a run with no
+packet claim may use the legacy generic recovery path. Both execution-lease-first
 and issuance-lease-first expiry therefore converge on one S4 marker, one failed
 run/audit, and one artifact using PostgreSQL time. The legacy path never clears a
 v2 execution lease, writes `staleRunningRecovery`, or publishes terminal events for
@@ -508,7 +557,12 @@ The package marker is versioned `packet_issuance` metadata and contains only
 claim/authorization fingerprints, bounded failure code, delivery state, and a
 typed recovery disposition. Every issuance-recovery marker has
 `autoRetryable:false`; no packet failure is inferred into the S2 broker retry
-policy. This matrix is normative:
+policy. A marker is not a standalone terminal record: every reader/action joins
+its exact prior audit and packet artifact, proves their typed terminal tuples are
+equal, binds the marker fingerprint/identity to that failed tuple, and validates
+assembly + delivery + terminal status + failure code/stage together. Missing,
+mismatched, or terminal-success-plus-failure-marker evidence is a neutral,
+non-retryable integrity hold with no action. This matrix is normative:
 
 | Grant mode | Delivery at recovery | Disposition | Direct action |
 |---|---|---|---|
@@ -642,7 +696,20 @@ Artifact metadata:
 }
 ```
 
-Artifact content is a bounded human-readable summary derived only from these persisted typed snapshots. A live finalizer extends the existing run/package terminal transaction: after external work is complete it locks top-down, verifies both ownership predicates, terminalizes the agent run and package/review-gate transition, clears the execution lease, writes any recovery marker and task disposition for failure, transitions the audit to terminal, and upserts the artifact in one transaction. It contains no network, Redis, filesystem, provider, or rendering work. Thus a protocol-v2 writer cannot commit terminal packet evidence while leaving its linked run/package `running`. The partial unique index makes repeated or competing live/recovery finalizers idempotent; it does not replace this crash-consistency transaction. Recovery never rereads or reassembles a burned packet. The invariant-repair branch above handles legacy/manual partial state without rewriting already-terminal evidence.
+Artifact content is a bounded human-readable summary derived only from these persisted typed snapshots. A live finalizer extends the existing run/package terminal transaction: after external work completes—or after a bounded external-work stage fails—it locks top-down, verifies both ownership predicates, terminalizes the agent run and package/review-gate transition, clears the execution lease, writes any recovery marker and task disposition for failure, transitions the audit to terminal, and upserts the artifact in one transaction. Sandbox writes, validation commands, host writes, repository-evidence collection, and review-gate preparation happen before this transaction and each maps to the closed post-submission stage above. The transaction contains no network, Redis, filesystem, provider, or rendering work. Thus a protocol-v2 writer cannot commit terminal packet evidence while leaving its linked run/package `running`. The partial unique index makes repeated or competing live/recovery finalizers idempotent; it does not replace this crash-consistency transaction. Recovery never rereads or reassembles a burned packet. The invariant-repair branch above handles legacy/manual partial state without rewriting already-terminal evidence.
+
+## Review-gate concurrency boundary
+
+Review-gate materialization and decisions participate in the same global order.
+The finalizer and every gate-decision transaction lock project → task → package →
+applicable run/audit/artifact → all relevant gate rows in stable ID order; no path
+may lock a gate and then reach backward to the package. Before changing a gate or
+package, the decision transaction rereads the source run, exact artifact identity,
+package status, and execution-lease state under those locks. It compare-and-sets
+the package/gate against those identities. A stale source run/artifact, a new live
+lease, or a changed package status is a no-mutation stale decision, never approval
+of newer work. Finalizer-versus-gate-decision PostgreSQL races exercise both lock
+orderings and prove one coherent winner without deadlock.
 
 ## Run lifecycle integration
 
@@ -747,6 +814,26 @@ Artifact content is a bounded human-readable summary derived only from these per
     every known-invalid cross-product is neutral and non-actionable. A successful
     acknowledgement rotates the marker fingerprint while an exact prior request
     still replays from the ledger.
+34. A valid submitted response then fails independently at sandbox apply,
+    validation, host apply after at least one successful file, repository-evidence
+    persistence, and completion/review-gate materialization. Each case persists
+    one exact `post_submission_execution_failed` stage, performs no second model
+    submission, preserves separate host evidence, and requires acknowledgement of
+    possible prior and partial local work.
+35. Seeded terminal/live splits prove exact audit/artifact tuple equality. Failed
+    splits copy the immutable failure object; a fully evidenced success split
+    reconstructs only the matching success transition; mismatched or incomplete
+    success enters a neutral integrity hold with no retry marker.
+36. Pairwise packet, packet-free, and handoff-only claims race in both orderings.
+    Every writer locks all siblings and recomputes eligibility, so one specialist
+    owns a live lease. Stale recovery races both non-packet modes and never commits
+    task `running → approved` beside a newly established sibling lease.
+37. Atomic finalization races a stale review-gate decision in both orderings. The
+    decision rereads source run/artifact, package status, and lease under top-down
+    locks; it either wins coherently or makes no mutation.
+38. Definitive `submission_failed + submission_rejected` persistence races a
+    crash/lease expiry. Recovery preserves the staged cause rather than
+    reclassifying it as lease expiry.
 
 Real PostgreSQL owns transaction, lock, lease, migration, index, and failure-injection evidence. Lease tests compare against database time, not a fake worker clock. #181 composes a small cross-slice sentinel set from these tests instead of maintaining a second policy implementation.
 
@@ -777,8 +864,14 @@ The claimed uniqueness guarantee is valid only after legacy packet issuers are d
    package trigger, including genuine pre-trigger processes. A process-local flag
    alone is not proof that another old worker is absent.
 5. **Cut over.** Start only v2-capable workers, verify no v1 claim remains, then
-   use the privileged three-statement `READ COMMITTED` activation transaction to
-   advance the durable epoch to 2 before enabling v2 grant writes and packet
+   run the checked-in `web` maintenance command
+   `npm run protocol:activate-work-package-v2 -- --actor <operator-id>`. Its
+   default dry run reports every blocker; `--apply` verifies `READ COMMITTED`,
+   executes the privileged three-statement activation, is idempotent, verifies
+   epoch/postconditions, and retains the database activation audit. The
+   layman-readable procedure is
+   `docs/operators/work-package-protocol-v2-cutover.md`; ad hoc SQL is forbidden.
+   Use that command to advance the durable epoch to 2 before enabling v2 grant writes and packet
    issuance. Shared-first v1 causes activation to abort; activation-first rejects
    stale v1 before repository reads.
 6. **Scrub legacy paths.** After epoch-2 activation durably proves cutover, #179
@@ -814,9 +907,12 @@ until a v2-capable worker is restored.
 6. Stage typed assembly metadata before exposure and atomically finalize the
    run/package/lease, audit, artifact, marker, and task disposition.
 7. Add race, restart, injection, migration, mixed-worker, rollback, and failure-point tests.
-8. Drain legacy issuers and activate the durable protocol barrier before #180
+8. Add the checked-in activation command and operator runbook, exercise the real
+   command under both bridge-trigger orderings and a genuine pre-trigger worker,
+   and retain its database audit as release evidence.
+9. Drain legacy issuers and activate the durable protocol barrier before #180
    evidence rendering is considered release-ready.
-9. Only after durable cutover evidence exists, execute the separately gated,
+10. Only after durable cutover evidence exists, execute the separately gated,
    restartable root scrub. It is a post-drain operation/later migration, never an
    expansion migration that the normal migrator could run early.
 
@@ -832,4 +928,6 @@ the durable epoch trigger cannot reject v1 writers before bounded reads; if lega
 issuers cannot be proven drained; if generic readiness can bypass an S4 marker; if
 the finalization parser accepts a known-invalid tuple; or if S2/#178 do not expose requirement-scoped
 decisions, decision revision, and structured operator-hold identity needed for
-filtering and recovery.
+filtering and recovery; if a valid submitted response can fail without a truthful
+closed stage; if a gate path locks backward or decides from pre-transaction
+freshness; or if a terminal-success split can become a packet-failure retry.
