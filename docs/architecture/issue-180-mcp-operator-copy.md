@@ -77,6 +77,12 @@ type PacketRecoveryRequestIdentity = {
   markerFingerprint: string;
 };
 
+type LocalEffectRecoveryRequestIdentity = {
+  schemaVersion: 1;
+  localRunEvidenceId: string;
+  evidenceFingerprint: string;
+};
+
 type PacketCurrentStatePresentationInput =
   | {
       source: 'active_claim';
@@ -96,6 +102,8 @@ type PacketCurrentStatePresentationInput =
       localChangeBarrier: {
         unresolvedCount: number;
         fingerprint: string | null;
+        version: number;
+        sourceSetFingerprint: string;
       };
       currentPolicyFingerprint: string;
       currentAuthorization:
@@ -149,11 +157,12 @@ type PacketCurrentStatePresentationInput =
     }
   | {
       source: 'quiescence_wait';
-      reason: 'post_submission_quiescence_unproven';
-      priorRuntimeAuditId: string;
+      reason: 'local_run_quiescence_unproven';
+      localRunEvidenceId: string;
+      priorRuntimeAuditId: string | null;
       evidenceFingerprint: string;
       effectIntent: Extract<
-        PacketPostSubmissionEffectIntent,
+        LocalRunEffectIntent,
         { state: 'not_started' | 'active' }
       >;
       containmentLeaseState: 'active' | 'orphaned';
@@ -161,6 +170,21 @@ type PacketCurrentStatePresentationInput =
       packageStatus: 'running';
       leaseActive: false;
     };
+
+type LocalRunRecoveryPresentationInput = {
+  source: 'local_effect_recovery';
+  marker: LocalEffectRecoveryMarkerV1;
+  localRunEvidenceId: string;
+  packetAuditId: string | null;
+  taskStatus: TaskStatus;
+  packageStatus: WorkPackageStatus;
+  localChangeBarrier: {
+    unresolvedCount: number;
+    fingerprint: string | null;
+    version: number;
+    sourceSetFingerprint: string;
+  };
+};
 
 type PresentationCta =
   | { kind: 'scroll'; label: string; targetId: string }
@@ -187,7 +211,7 @@ type PresentationCta =
       kind: 'review_local_changes';
       label: string;
       handler: 'review_local_changes';
-      request: PacketRecoveryRequestIdentity;
+      request: LocalEffectRecoveryRequestIdentity;
     }
   | { kind: 'install'; label: string; handler: 'install_mcp' }
   | { kind: 'enable'; label: string; handler: 'enable_mcp' }
@@ -211,6 +235,7 @@ admissionPresentation(input: AdmissionDecisionPresentationInput): AdmissionPrese
 projectMcpPresentation(input: ProjectMcpPresentationInput): McpSurfacePresentation;
 catalogMcpPresentation(input: CatalogMcpPresentationInput): McpSurfacePresentation;
 packetCurrentStatePresentation(input: PacketCurrentStatePresentationInput): AdmissionPresentation;
+localRunRecoveryPresentation(input: LocalRunRecoveryPresentationInput): AdmissionPresentation;
 ```
 
 The functions must be deterministic, total, side-effect-free, and tested as
@@ -403,10 +428,13 @@ never rendered as retry.
 ### Packet issuance recovery controls
 
 The current-state reader validates S4's live run-scoped claim summary, versioned
-`packet_issuance` marker, typed integrity hold, or bounded quiescence alert and passes the discriminated input to
-`packetCurrentStatePresentation`; it never folds either source into the S2
-`mcpBroker` contract. Runtime parsing normalizes unknown task/package statuses to
-a fail-closed neutral state before the typed presenter is called.
+`packet_issuance` marker, or typed packet integrity hold and passes it to
+`packetCurrentStatePresentation`. The generic reader separately validates bounded
+quiescence/local-effect state and passes it to `localRunRecoveryPresentation`; a
+packet page may join both by the audit's required local-run evidence ID. Neither
+source is folded into the S2 `mcpBroker` contract. Runtime parsing normalizes
+unknown task/package statuses to a fail-closed neutral state before a typed
+presenter is called.
 
 - The server exhaustively maps a live `claiming` audit with an unexpired lease
   into `ActivePacketClaimState`. The discriminated union makes impossible pairs
@@ -420,7 +448,7 @@ a fail-closed neutral state before the typed presenter is called.
   invents `failed_finalizing`. The server validates the complete claim-state discriminant, computes
   `leaseActive` against PostgreSQL time, and supplies the observation timestamp;
   the browser never compares `leaseExpiresAt` with `Date.now()`. An expired
-  observation with an unproven active/orphaned containment lease and S4's bounded alert
+  observation with an unproven active/orphaned containment lease and S4's generic bounded alert
   renders “Waiting for worker changes to stop” with no action until the
   protected authoritative host fence service and operating-system containment
   adapter prove the complete per-run execution group empty. The long-lived queue
@@ -464,12 +492,12 @@ a fail-closed neutral state before the typed presenter is called.
   package grant control. It never renders generic retry because the nonce burned
   when the packet claim committed.
 - Review precedence applies before every grant/delivery disposition. When either
-  S4 host-ledger or repository baseline/change evidence is `review_required`, S5
+  S4 host-ledger, working-tree, or Git-control evidence is `review_required`, S5
   offers only `review_local_changes` with label “I reviewed the local changes,”
-  bound to the exact marker and evidence fingerprints. For definitive
-  `submission_failed`, copy keeps the two facts separate: “The provider rejected
-  the request. Forge also detected local changes that require review.” It never
-  claims the provider caused them. After S4 records the local review, it advances
+  bound to the exact generic local-run evidence ID and combined fingerprint. For
+  definitive `submission_failed`, copy keeps the two facts separate: “The request
+  was not accepted. Forge also detected local changes that require review.” It does
+  not attribute the failure or changes to a provider. After S4 records the local review, it advances
   to the stored delivery/grant-mode disposition without changing delivery.
 - `review_then_reapprove_allow_once` then shows only the possible-prior-submission
   acknowledgement. After S4 records it against the exact marker, delivery, and
@@ -482,8 +510,9 @@ a fail-closed neutral state before the typed presenter is called.
   package is still `blocked`, package policy is unchanged, current authorization
   is `same_decision|newer_covering_decision`, and neither execution nor issuance
   lease is active. Both `hostApplyReview` and `repositoryChangeReview` must be
-  `not_applicable|reviewed`, and the task-local-change count/fingerprint must be
-  zero/null; required, mismatched, or stale review exposes no retry. A newer
+  `not_applicable|reviewed`, both repository comparisons must be unchanged, and
+  the task-local-change count/fingerprint/version/source set must be the verified
+  zero/null/current tuple; required, missing, mismatched, or stale review/projection exposes no retry. A newer
   decision is shown as explicit reauthorization, not as
   continuity of the old grant. The server route locks and rechecks the same
   predicate, records the authorizing current revision, clears only the matched
@@ -519,12 +548,12 @@ current state.
 The current-state reader imports S4's discriminated
 `PacketIssuanceRecoveryMarkerV2` union and rejects every known-invalid
 grant-mode/delivery/disposition/acknowledgement combination before presentation.
-It joins `priorRuntimeAuditId` to the exact prior audit, all applicable run
-artifacts (including the packet artifact), any host-apply ledger/review, and the
-authoritative pre-submission repository baseline plus post-quiescence change result,
-change fingerprint, and repository-review row. It proves the typed terminal tuples
-equal; binds marker, host-review, repository-review, and task-local-change barrier
-fingerprints; and validates assembly + delivery + terminal status + failure code/
+It joins `priorRuntimeAuditId` to the exact prior audit and its required generic
+local-run evidence row, all applicable run artifacts (including the packet
+artifact), any host-apply ledger/review, and both authoritative pre-exposure
+working-tree/Git-control baselines plus post-quiescence comparison/review rows. It
+proves the typed terminal tuples equal; binds marker, host review, both repository
+reviews, and the task-local-change version/source fingerprint; and validates assembly + delivery + terminal status + failure code/
 conditional stage together. Normal repository review accepts only
 `not_applicable|review_required|reviewed`; `abandoned` is valid solely on a joined
 integrity-quarantine resolution and never on an audit/marker review. The marker
@@ -533,15 +562,31 @@ mismatched, or terminal-success-plus-failure-marker evidence becomes a typed or
 neutral integrity hold with no action. The browser never assembles those
 independent fields into a state.
 
-Both packet actions carry S4's immutable version-2 request identity
-`{priorRuntimeAuditId, markerFingerprint}`. Components do not reconstruct it from
-the current marker or send an action-only request. When stale recovery leaves the
+Every mutation control carries its authoritative immutable request identity.
+`retry_packet_execution` and `acknowledge_possible_submission` carry S4's packet
+version-2 `{priorRuntimeAuditId, markerFingerprint}`;
+`review_local_changes` carries generic version-1
+`{localRunEvidenceId, evidenceFingerprint}`. Components do not reconstruct either
+from the current marker or send an action-only request. All three handlers reject
+stale identity without mutation. When stale recovery leaves the
 task `running` because another sibling package still holds a live execution lease,
 the marker renders neutral “Waiting for active package” with no action. If
 `siblingBarrier:'awaiting_review'`, it instead renders “Waiting for required
 review.” Actions
-become eligible only after S4's post-sibling/periodic task-state reconciler makes
+become eligible only after S4's shared post-sibling/periodic operator-hold reconciler makes
 the task exactly `approved`; S5 never performs that transition.
+
+`localRunRecoveryPresentation` owns packet-independent local recovery. Its server
+reader joins `metadata.local_effect_recovery` to the exact generic local-run row,
+host ledger/review, both working-tree/Git-control comparisons, protected-service
+receipt/quiescence state, and verified task aggregate. A null `packetAuditId` is a
+truthful no-packet run: the UI shows local-change review or “Waiting for worker
+changes to stop,” but renders no packet counts, assembly/delivery claim, submission
+acknowledgement, retry/reapproval control, or packet artifact. Exact local review
+uses `{localRunEvidenceId,evidenceFingerprint}`; quarantine remains a privileged
+operator path outside normal CTA rendering. Missing/mismatched generic evidence is
+a neutral integrity hold. A packet run may join both presenters, but the local
+action clears only its marker and the packet action never clears local evidence.
 
 S5 imports S4's exact closed `PacketFailureCode` enum. It maps only those values to
 bounded copy; an unknown value is legacy/unknown and actionless, never displayed as
@@ -585,7 +630,8 @@ generic artifact prose and render only validated typed metadata. Clearly separat
 packet evidence from sandbox-generated files and host-applied changes. A failed
 pre-assembly snapshot shows stage plus enum-derived static failure copy without
 invented zero counts or raw/sanitized exception detail. A terminal success is
-valid only with `assembled+submitted`, repository `unchanged/not_applicable`, and
+valid only with `assembled+submitted`, both working-tree and Git-control evidence
+`unchanged/not_applicable`, and
 one of S4's disjoint effect tuples: `not_started` with no local stage/ledger, or
 `quiesced(actualLastStage)` with a complete declared host-write ledger. Changed or
 unverifiable evidence never renders success, even when reviewed. A terminal failure must match S4's exact
@@ -598,7 +644,7 @@ never contain live `submitting`. Assembly never implies ACP acceptance. The
 current-state reader may show any validated live phase above only while its lease
 is valid. After recovery/finalization, the matching terminal artifact/marker owns
 the result; an expired `submitting` intent becomes `submission_uncertain`.
-The host-apply ledger and ACP repository baseline/change evidence remain separate:
+The host-apply ledger and ACP working-tree/Git-control baseline/change evidence remain separate:
 packet presentation consumes only their bounded
 `not_applicable|review_required|reviewed` states and fingerprints. Exact write-plan
 entries, repository paths, and diffs stay in the authorized repository-change
@@ -734,7 +780,7 @@ Component/integration tests:
     `not_covering` from the canonical reader and never exposes packet retry.
 30. a recovery marker on a `running` task with a live sibling package renders
     “Waiting for active package” without an action; the same durable marker becomes
-    actionable only after the S4 task-state reconciler makes the task `approved`.
+    actionable only after the shared operator-hold reconciler makes the task `approved`.
     An `awaiting_review` sibling renders “Waiting for required review” and likewise
     suppresses every action.
     A materialized sibling local-change barrier suppresses every new-run/reapproval
@@ -761,14 +807,15 @@ Component/integration tests:
     process proves S5 derives preparing, assembled, submitting,
     rejected-finalizing, or accepted-finalizing from PostgreSQL alone and never
     synthesizes `failed_finalizing`.
-37. an expired submitted claim with active effect intent and a quiescence alert
+37. an expired packet or no-packet local run with active effect intent and a quiescence alert
     renders “Waiting for worker changes to stop,” remains actionless, and never
     exposes a new-run control until S4 persists `quiesced`.
 38. every `HostApplyRecoveryReview` tuple is exhaustive. `review_required` uses
-    exact marker/ledger-fingerprint `review_local_changes` and hides retry/reapproval;
+    exact local-run/ledger-fingerprint `review_local_changes` and hides retry/reapproval;
     `reviewed` permits only the normal locked predicate; changed fingerprints fail
-    closed. The same matrix independently covers every `RepositoryChangeReview`,
-    including `not_observed`, unchanged, changed, and unverifiable outcomes.
+    closed. The same matrix independently covers working-tree and Git-control
+    `RepositoryChangeReview`, including `not_observed`, unchanged, changed, and
+    unverifiable outcomes.
 39. `completion_preparation` renders only for a terminal failed tuple. Atomic
     gate/finalizer rollback remains neutral in-progress/recovery state and cannot
     be mislabeled with that cause.
@@ -787,7 +834,7 @@ Component/integration tests:
     only an authenticated fresh same-host recovery instance may finish stale work.
 43. a root-binding mismatch renders bounded `root_changed` reapproval copy with no
     old-decision retry and no old/new path or internal resource reference.
-44. changed or unverifiable repository evidence before Forge's first local stage
+44. changed or unverifiable working-tree or Git-control evidence before Forge's first local stage
     renders the bounded external-change review message for valid response, failure,
     and submission uncertainty. Retry, reapproval, new-run, and root-management
     actions remain hidden; only exact local review or privileged quarantine can
@@ -796,34 +843,46 @@ Component/integration tests:
     support route with “Project removed — evidence retained,” while normal lists
     hide it, root reuse does not relabel it, no former path is displayed, and no
     execution/retry/reapproval/review-gate/root-management CTA is present.
-46. `submission_failed + changed|unverifiable` in both grant modes says the
-    provider rejected the request **and** local changes need review without claiming
-    causation. Only local review is offered; afterward immutable delivery remains
-    rejected and the correct reapproval/retry action appears.
-47. A marker whose repository baseline/change/review fingerprint differs from its
-    audit or task barrier renders a neutral integrity hold with no action. The same
-    parity holds for host ledger/review evidence.
+46. `submission_failed + changed|unverifiable` in both grant modes says “The
+    request was not accepted” and separately says local changes need review. A
+    provider HTTP rejection and a locally definitive adapter/pre-send/transport
+    refusal render identical neutral actor wording. Only local review is offered;
+    afterward immutable delivery remains `submission_failed` and the correct
+    reapproval/retry action appears.
+47. A marker whose working-tree/Git-control comparison/review fingerprint differs
+    from its generic record, audit, or task barrier version/source set renders a
+    neutral integrity hold with no action. The same parity holds for host ledger/
+    review evidence.
 48. Audit/marker-level repository `abandoned` is rejected as incoherent. Only an
     exact joined quarantine resolution may render intentional abandonment, and it
     never exposes retry.
-49. Both successful effect branches render only with unchanged/not-applicable
-    repository evidence. A fabricated no-stage `quiesced` tuple and every success
+49. Both successful effect branches render only when working-tree and Git-control
+    evidence are unchanged/not-applicable. A fabricated no-stage `quiesced` tuple and every success
     with changed/unverifiable/reviewed evidence fail closed.
+50. Packet-free and handoff-only local-run recovery renders the exact generic
+    quiescence/local-change state and local-review action, with packet audit/artifact/
+    counts/delivery/retry/reapproval/acknowledgement absent. A packet run joins both
+    presenters without either action clearing the other's marker.
+51. Stale packet identity is rejected without mutation by packet retry and possible-
+    submission acknowledgement. Stale generic local-run identity is rejected by
+    local-change review. Substituting packet identity for local evidence, or vice
+    versa, fails closed.
 
 ## Ownership boundaries
 
 - #177 owns broker and decision persistence.
 - #178 owns grant recovery behavior.
-- #179 owns issuance and artifact schema.
+- #179 owns generic local-run evidence plus packet issuance/artifact schema.
 - #180 is reader/presentation only.
 - If a required field is missing from current producers, fix the producing issue/contract instead of persisting UI state here.
 
 ## Implementation order
 
-1. Land the S4 evidence/fence/host-ledger/integrity-alert schema and producer with
-   opaque `rootRef`; install its operator runbook; and ensure S2 broker fields are deployed.
-2. Add the three surface presenters plus issuance-recovery, quiescence-wait, and
-   integrity-hold presenters, and
+1. Land the S4 generic local-run/dual-repository evidence, packet/fence/host-ledger/
+   integrity schema and producer with opaque `rootRef`; install its operator
+   runbook; and ensure S2 broker fields are deployed.
+2. Add the three surface presenters plus packet issuance, packet-independent local-
+   recovery/quiescence, and integrity-hold presenters, and
    exhaustive tests.
 3. Harden the dual-format metadata reader, including incoherent/future values.
 4. Replace task-page status/retry/grant rendering and remove client policy copies.
@@ -843,7 +902,11 @@ admission state, render an unvalidated tuple, or expose packet root paths,
 names/paths/content. Stop if the retry route cannot atomically recheck current
 compatibility, or if copy claims ACP is sandboxed or that equivalent operations are
 impossible outside the MCP channel.
-Also stop if any action appears while host quiescence or working-tree review is
+Also stop if any action appears while host quiescence or working-tree/Git-control review is
 unproven, while a sibling awaits mandatory review, or on an integrity hold; if
 packet copy needs host ledger paths; or if atomic finalizer rollback is mislabeled
 as `completion_preparation`.
+Stop if Git-control evidence is omitted; if a no-packet local run must manufacture
+packet evidence/action; if local review is authorized only by a packet identity;
+if a stale task projection is presented as retryable; or if `submission_failed`
+copy attributes rejection to a provider without persisted actor evidence.

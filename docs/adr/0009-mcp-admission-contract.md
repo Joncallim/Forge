@@ -2925,10 +2925,13 @@ contract. This split must match the per-step release manifest metadata above.
 - S4 issuance recovery remains separate from broker retry. One-time
   `reapprove_allow_once` targets the package grant control; post-intent
   `review_then_reapprove_allow_once` requires acknowledgement first.
-  Independent review precedence applies first: any exact host/repository
+  Independent review precedence applies first: any exact host/working-tree/Git-control
   `review_required` marker—including `submission_failed`—offers only
   `review_local_changes`. That action completes matched local evidence and advances
   to the deterministic delivery/grant disposition without changing delivery.
+  `submission_failed` copy says “The request was not accepted”; it never says a
+  provider rejected it because local adapter/TLS/transport refusal proves no such
+  actor. Local-change copy is a separate sentence.
   Possible-submission acknowledgement remains a separate later action.
   Always-allow `retry_execution` is available from delivery
   `not_exposed|submission_failed` with disposition `retry_execution`, or from
@@ -2947,24 +2950,29 @@ contract. This split must match the per-step release manifest metadata above.
   `review_submission` records acknowledgement actor/time without changing the
   immutable delivery after local review is complete; the later retry still
   rechecks current coverage, requires both reviews `not_applicable|reviewed`, and
-  requires the task local-change barrier zero/null. Every
+  requires the verified current-version task local-change projection zero/null
+  with matching source fingerprint. Every
   marker has `autoRetryable:false`; unknown/stale markers expose no action and
   S4's route rechecks under the global order.
-- Packet local-review, retry, and possible-submission acknowledgement controls carry S4's full
-  version-2 identity `{priorRuntimeAuditId, markerFingerprint}`; components never
-  synthesize an action-only request. A recovery marker on a task that remains
+- Every mutation control carries authoritative identity. Packet retry and possible-
+  submission acknowledgement carry S4's version-2
+  `{priorRuntimeAuditId, markerFingerprint}`; generic local review carries
+  `{localRunEvidenceId,evidenceFingerprint}` for packet and no-packet runs.
+  Components never synthesize an action-only request, and all three handlers reject
+  stale/substituted identity without mutation. A recovery marker on a task that remains
   `running` because another sibling package has a live lease renders neutral
-  “Waiting for active package” without an action until S4's post-sibling/periodic
-  task-state reconciler reaches exactly `approved`. An `awaiting_review` sibling
+  “Waiting for active package” without an action until the shared operator-hold
+  reconciler reaches exactly `approved`. An `awaiting_review` sibling
   renders “Waiting for required review” and preserves the same action suppression.
   A sibling local-change barrier suppresses every new-run/reapproval action; only
   the marker owning the exact fingerprint may expose its local-review action.
-- S5 imports S4's discriminated recovery-marker union. Every known-invalid
+- S5 imports S4's packet and generic local-effect recovery-marker unions. Every known-invalid
   grant-mode/delivery/disposition/acknowledgement/failure combination is neutral
   and actionless before presentation. The server joins the exact prior audit, all
-  applicable run artifacts, host ledger, and repository baseline/change review;
-  proves typed terminal tuple equality plus every marker/host/repository/task-
-  barrier fingerprint; and
+  applicable run artifacts, required generic local-run record, host ledger, and
+  both working-tree/Git-control comparison reviews; proves typed terminal tuple
+  equality plus every marker/host/repository/task-projection version/source
+  fingerprint; and
   validates assembly/delivery/terminal/failure-stage together; the browser never
   composes independent fields into an action. Normal audit/marker repository review is exactly
   `not_applicable|review_required|reviewed`; `abandoned` exists only on the joined
@@ -2990,20 +2998,22 @@ contract. This split must match the per-step release manifest metadata above.
   durable live phase; preflight, assembly, provider-validation, and
   post-submission failures remain on their last persisted copy until terminal
   commit. Impossible phase/assembly/delivery cross-products fail closed. Valid current phases render actionlessly. The browser never compares lease
-  timestamps or derives phase itself. An expired submitted claim with an active or
+  timestamps or derives phase itself. An expired packet or no-packet local run with an active or
   orphaned containment lease/quiescence alert renders “Waiting for worker changes
   to stop” and no action until the protected authoritative owning-host service and
   operating-system adapter prove the complete per-run execution group empty; the
   long-lived queue worker is outside that group;
   wrong/stale/divergent-key/insufficient-containment/unreachable host evidence remains
   waiting. Other stale/unknown observations are neutral until S4
-  recovery/finalization persists terminal evidence.
+  recovery/finalization persists terminal evidence. A no-packet local run renders
+  only generic quiescence/review state: no packet counts, audit/artifact, assembly/
+  delivery claim, retry/reapproval, or submission acknowledgement is invented.
 - S4 evidence uses opaque `rootRef` or the phrase "this project", never a host
   filesystem root. S5 ignores generic artifact prose and legacy path-valued `root`
   fields and renders only validated counts, byte count, omission/redaction summary,
   and discriminated assembly, terminal delivery, and terminal success/failure from
   the run-linked artifact. Success is valid only for `assembled+submitted`,
-  unchanged/not-applicable repository evidence, and S4's no-local-stage
+  unchanged/not-applicable working-tree **and** Git-control evidence, and S4's no-local-stage
   `not_started` or with-local-stage `quiesced(actualLastStage)` branch; failed
   tuples must match S4's exact stage/delivery/code table. Terminal delivery is exhaustive over
   `not_exposed|submission_failed|submitted|submission_uncertain`; live
@@ -3018,7 +3028,7 @@ contract. This split must match the per-step release manifest metadata above.
   files, requires working-tree inspection, and never offers automatic resubmission
   or claims rollback. `completion_preparation` is pre-transaction only; atomic
   gate/finalizer rollback never renders that cause. Packet UI consumes only the
-  host ledger and repository baseline/change evidence's bounded review states and
+  host ledger and both repository comparison evidence's bounded review states and
   fingerprints, never entry paths or diffs.
   `external_repository_change_requires_review` says the Agent Communication
   Protocol runtime is not a filesystem sandbox, Forge stopped before its local
