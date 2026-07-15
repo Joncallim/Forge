@@ -1825,7 +1825,8 @@ contract. This split must match the per-step release manifest metadata above.
   `forge_heartbeat_current_instance()` owned by a non-login role, with fixed
   `pg_catalog, forge` search path and `PUBLIC` execution revoked, derives exactly
   one row from immutable `session_user` (not the definer-valued `current_user`). It
-  locks epoch → exact instance → applicable binding generation/rotation, then
+  locks protocol epoch → exact authenticated instance → applicable active/pending
+  binding generation/rotation, then
   revalidates the epoch pointer, principal, lifecycle state, and active-or-pending
   generation/token before compare-and-setting only `last_seen_at` for an allowed
   `candidate|active` row. An
@@ -1853,9 +1854,12 @@ contract. This split must match the per-step release manifest metadata above.
   Candidate credentials expire after a bounded database-time provisioning window;
   at most 64 unpromoted candidates per host/generation retain live credentials.
   Expired/rolled-back candidates and drained instances follow revoke → terminate
-  sessions → retire → certificate destruction/login drop. A restartable GC handles
+  sessions → retire → client-certificate/private-key destruction in the credential
+  store → PostgreSQL login-role drop. A restartable GC handles
   at most 64 tombstoned identities per transaction only after proving no membership,
-  recovery ownership, transition pin, role ownership/grant, or session remains;
+  package/run/evidence reference, recovery election/receipt or ownership, membership/
+  takeover ledger, reservation/maintenance transition pin, alert/audit, role
+  ownership/grant, or session remains;
   immutable instance/principal/certificate fingerprints and destroy/drop evidence
   remain append-only and identities are never reused. A locked installation-wide
   budget has a hard maximum of 256 undestroyed credential-resource slots (operators
@@ -2006,7 +2010,14 @@ contract. This split must match the per-step release manifest metadata above.
   hooks, attributes, executable filters/diff drivers, and unresolved symlink
   targets rather than letting host configuration affect the snapshot. Linked/
   external gitdir/common directories and allowlisted alternates require ordered
-  resource fences; unsupported/unbounded stores disable local execution. All three
+  resource fences; unsupported/unbounded stores disable local execution. Exact
+  lazy-fetch behavior is governed by the single digest-bound predicate above; this
+  paragraph does not define a second probe or argument rule.
+  Credential/network helpers, automatic maintenance, and all object/control writes
+  are also disabled. Missing promised objects or
+  a command that would hydrate, fetch, repack, write a commit-graph, or otherwise
+  mutate Git state fails pre-exposure as unavailable rather than contacting a
+  remote or manufacturing authority. All three
   enforce file/byte/depth/time ceilings and matching scans/equivalent snapshot
   proof, with only narrow versioned volatile exclusions. Version 1 defaults/hard
   maxima are: working tree 100,000/500,000 files, 32 MiB/256 MiB hashed bytes,
@@ -2069,11 +2080,18 @@ contract. This split must match the per-step release manifest metadata above.
   adapter under the untrusted run user. Inputs/outputs use
   allowlisted one-way handoff and the exchange manifest/final digest is bound to
   generic local evidence. Service lifecycle capabilities/state handles never enter
-  ACP environment, arguments, inherited descriptors, or readable storage. The run
-  mount namespace exposes project/exchange as `nosuid,nodev`; preflight rejects
-  setuid/setgid entries and `security.capability`. Private PID/procfs, ptrace/signal
-  policy, distinct UIDs, and the non-dumpable shim prevent ACP from reading or
-  signalling trusted processes. A supported adapter places that shim/child, ACP, validation, response-driven work, and
+  ACP environment, arguments, inherited descriptors, or readable storage.
+  Supported-host mounts and identities prevent set-user-ID/
+  set-group-ID and file-capability elevation, device-node access,
+  `/proc/<pid>/mem`, `/proc/<pid>/{maps,environ,fd}`, `process_vm_readv`, `ptrace`,
+  cross-user signals, and descriptor-based escape; required `nosuid`/`nodev`
+  behavior is preflighted. Any elevated transition uses only the immutable
+  signature-verified trusted shim outside the checkout with fixed operations and
+  arguments. That shim has a distinct non-ACP user ID, is non-dumpable, and is
+  protected by the kernel ptrace/process-memory boundary. ACP cannot assume its user
+  ID, forge its `SO_PEERCRED`, signal or trace it, inherit its descriptors, or
+  replace, proxy, path/environment/argument-inject, or directly invoke it. A
+  supported adapter places that shim/child, ACP, validation, response-driven work, and
   every descendant in one non-escapable group before repository access. Normal
   success exits that child and releases without terminating the queue worker.
   Inherited descriptors or process-tree guesses are insufficient, and unsupported
@@ -2167,7 +2185,10 @@ contract. This split must match the per-step release manifest metadata above.
   that tombstone and a greater recovery epoch. A top-down compare-and-set appends the
   matching database election tombstone and installs the greater-epoch candidate;
   the view and service reject the old receipt/owner. Already-granted takeover cannot
-  be tombstoned or re-elected, so expiry permits progress without concurrent W2s.
+  be tombstoned or re-elected, so expiry permits progress without concurrent W2s. A
+  receipt from a lower recovery epoch, replaced W2, or older binding generation
+  remains historical replay evidence only and can never grant takeover or
+  terminalize current state.
   Wrong/missing/stale/draining/divergent-key/insufficient-containment/unreachable
   W2 or fabricated/cross-run/expired/replayed challenge is alert-only.
   Underlying lock acquisition alone is insufficient, and state remains actionless
@@ -2181,8 +2202,11 @@ contract. This split must match the per-step release manifest metadata above.
   fully qualified objects, `PUBLIC` revoked, and no caller IDs. Immutable
   `session_user` plus database state select the row; the watchdog cannot SET ROLE/
   session authorization and has only bounded-view SELECT/function EXECUTE, with no
-  direct DML, heartbeat, claim, fence, repair, credential, or repository access.
-  Failure records one
+  direct DML, heartbeat, claim, fence, terminalize, repair, credential, repository,
+  base-table, or cross-definer-function access. It
+  cannot supply or select candidate, evidence, run, instance, host, generation, or
+  alert IDs: the fixed no-argument function derives all bounded candidates and
+  identifiers from its qualified view and database time. Failure records one
   bounded quiescence alert. Ledger paths/errors/resource
   references never enter packet-owned evidence. A submitted crash may retain a
   lease/worker failure code while host-ledger or repository-change evidence forces
@@ -3181,205 +3205,370 @@ contract. This split must match the per-step release manifest metadata above.
 
 ### S6 — End-to-end regression
 
-- `web/__tests__` (or `web/e2e`) regression for a local-only tiny task-tracker
-  project: Architect creates frontend/QA/docs/review packages; the MCP plan
-  includes prompt-only context and no live tool handles; approval succeeds and
-  handoff advances ready packages. Split filesystem coverage into two explicit
-  scenarios: (A) a task missing required filesystem context is rejected by the
-  **real approval route** with 409 and never reaches handoff; (B) a task approved
-  while covered then loses/narrows that grant before handoff (or a pre-existing
-  approved legacy fixture) and is held `blocked` pre-claim with zero attempts, task
-  not failed. Restoring coverage re-drives it. A deferred GitHub-write capability
-  is reported as `deferred_live_mcp`, not an install error; a healthy GitHub read
-  is planning context, not an approvable bounded packet. The regression also
-  verifies requirement-indexed context (two same-agent/same-MCP requirements,
-  exactly one materialized), catalog/deferred disjointness, lock-safe concurrent
-  grant union, preservation of concurrent package metadata, one packet-metadata
-  artifact per run on success/failure, and that deferred/unknown capabilities are
-  absent from the executable MCP instruction block. ACP copy explicitly preserves
-  the non-sandbox warning. Assembly crash fixtures stop before intent, after
-  `assembling` but before the first read, during assembly, after the final byte but
-  before the immutable snapshot, and after that snapshot. Every indeterminate pre-
-  snapshot case terminalizes as `assembly_unconfirmed` with no counts/`rootRef`
-  and no reassembly. Packet-free and handoff-only fixtures prove exactly one ACP
-  call per generic row, no validation retry, the live exact-owner typed-
-  `pre_io_refusal` exception, and orphan recovery to `uncertain`. Failure-selection
-  fixtures prove that an already persisted stage/delivery cause wins; without one,
-  selection is exactly `authorization_changed → execution_lease_expired →
-  local_evidence_lease_expired → issuance_lease_expired → delivery/stage-specific
-  cause → worker_stopped`, with `worker_stopped` residual. Redaction
-  fixtures pass every closed category through producer, database, parser, API, and
-  S5, and reject an unknown key carrying a path/content/prompt/credential sentinel
-  before persistence or rendering. Authorization fixtures exhaust the two valid
-  snapshot arms and every invalid source/mode/approval-FK/nonce cross-product in
-  PostgreSQL, Drizzle, task/project/artifact APIs, and S5; task and project
-  `always_allow` readers return byte-equivalent locked project-decision revision/
-  root/capability/fingerprint fields. They also reject every JSON/scalar mismatch,
-  authorization update, and otherwise valid cross-package/task/project approval
-  tuple through the retained composite FK. Protocol-v2 fixtures require non-null,
-  exact-equality task/package/run/local-evidence IDs and prove null cannot bypass
-  `MATCH SIMPLE` or either partial unique index. Direct table DML is denied; only
-  the typed relational constructor builds JSONB/scalars. Raw duplicate object keys
-  fail before JSON/JSONB conversion, and retained JSONB still must equal every
-  mirror. A second dedicated principal copies still-
-  live execution/local/packet/W2 tokens and attempts heartbeat, governed read,
-  assembly, exposure, submission, and finalization before expiry and before/after
-  original-principal revocation; every attempt fails epoch → pinned instance →
-  `current_user`, and token sentinels are absent from ACP/exchange/queue/log/API/
-  export/error sinks. Accepted/rejected plan-text sentinels remain only in insert-
-  only protected plan entries; the artifact header is non-text. Tests cover stable
-  IDs, canonical base-10 plan version, 1..256-character ID bounds, NFC/RFC-8785
-  bytes, keyed domain digest, duplicate/reordered/Unicode input, deterministic and
-  ambiguous legacy mapping, key rotation, and update/delete rejection. Authorized
-  history commits its bounded read audit; unauthorized/cross-task/wrong-stage
-  history and stale/digest/key/agent/requirement/binding references return no text.
-  Real-role database tests prove only the non-login owner can directly read plan
-  tables: web/worker/application/reporting/migration/maintenance direct `SELECT`,
-  copied-query, catalog/view discovery, hostile search-path, and temp-shadow
-  attempts fail. Exactly the fixed-search-path, `PUBLIC`-revoked audited human-
-  history and package-bound one-entry resolver functions remain executable; neither
-  enumerates text or accepts free-form SQL.
-  Generic task/artifact APIs, live events, SSE snapshot/replay, queues/logs/exports/
-  diagnostics/errors expose only allowlisted IDs/progress. A seeded legacy Redis
-  history key is purged after publisher credential revocation/drain, zero-scanned,
-  and cannot be recreated; v2 history contains no sentinel. Only eligible fragments
-  appear ephemerally in provider/ACP capture; whole/rejected/ineligible text does
-  not. Normal, no-command, stderr-warning, no-op
-  handoff start, and no-op handoff completion prompt producers are covered by one
-  repository-wide alias sentinel. Seeded legacy unkeyed prompt hashes are exact
-  count-only `{kind:'unknown_legacy_digest',byteCount}` or absent before drain and
-  removed by the checkpoint afterward; boolean/truncation/prefix/surrogate shapes
-  fail, and mixed-version database/API/export/SSE fixtures prove no hash is re-
-  keyed or exposed. String/object/array/nested-message values under every closed
-  prompt alias are hidden by the sole compatible reader; crash/resume/fingerprint-
-  conflict tests prove the post-drain scrub removes them without lost updates.
-  Projection fixtures prove final-generation transaction-local
-  dedup, direct-DML abort, exact parity with the eight-value
-  `CURRENT_LOCAL_PROJECTION_HEAD_KINDS`, one preallocated head per kind/package,
-  count-neutral revision/FK/fingerprint/CAS advancement, immutable history outside
-  the cap, exactly 256 packages/2,048 heads, and typed package-257 whole-task
-  `active → archive_pending → legacy_archived` inspect/archive/checkpoint path.
-  It rejects reparent/delete and an over-limit replacement, and retains all source
-  evidence while a separate at-most-256 replacement has exact heads. The PostgreSQL 16 maximum-
-  cardinality p95 <= 40 ms/p99 <= 100 ms budgets remain unchanged.
-- Plus the S2 preview==approval==handoff invariant suite.
-- Approval PostgreSQL fixtures race package approve/deny/revoke/reapprove and
-  project grant changes in both lock orderings. They prove every committed decision
-  row is immutable, exactly one preallocated current pointer CAS wins, losing
-  decision/pointer transactions roll back together, and historical audits still
-  resolve their original parent rather than the new pointer.
-- A static release-order suite imports Step 0's data-only
-  `web/lib/mcps/epic-172-release-order-v1.json` through its sole
-  `web/lib/mcps/epic-172-release-order.ts` validator, checks the shared node registry
-  plus separately named `codeDependencyGraph` and `runtimeActivationGraph` graphs, and rejects
-  cycles, missing
-  `step0_retention_bridge → s3_issue_178 → s4_expand →
-  s4_producers_disabled → s5_compatible_consumers_deployed →
-  s6_pre_activation_green → s4_controlled_activation →
-  s6_post_activation_green → ingress_and_issuance_enabled →
-  s5_s6_release_ready` edges, obsolete `s4_activate`, every truncated chain,
-  graph/evidence substitution, a copied graph/helper, and any Step 0 import of S3/#178 or
-  S4 expansion/producer symbols. It refuses #178 until all project-management
-  create/update/repoint/archive/delete ingress is closed and drained and without
-  route/retention-FK/hard-delete-guard evidence. A wording-parity sentinel rejects
-  a narrowed "delete ingress" prerequisite outside its own denylist fixture. It
-  refuses remaining S4 expansion or producers without predecessor
-  evidence. It also proves Step 0 installed the generic signer/durable-evidence/
-  short-lived-transition-authorization/consumption stores, verifier, dedicated
-  principals, recorder, transition-identity uniqueness, sole authoritative disabled
-  enablement singleton, and append-only transition audit before its signed empty-predecessor receipt and
-  before S3; downstream slices only import that substrate. It validates dependencies per manifest step: exact
-  `owner:{issue:179,slice:'step0'}` plus `[176,177]` issue dependencies for
-  `step0_retention_bridge`, and exact `owner:{issue:178,slice:'s3'}` plus the Step 0
-  postcondition dependency for `s3_issue_178`; exact
-  `owner:{issue:179,slice:'s4'}` for `s4_expand`, `s4_producers_disabled`,
-  `s4_controlled_activation`, and `ingress_and_issuance_enabled`; exact
-  `owner:{issue:180,slice:'s5'}` for `s5_compatible_consumers_deployed`; and exact
-  `owner:{issue:181,slice:'s6'}` for `s6_pre_activation_green`,
-  `s6_post_activation_green`, and `s5_s6_release_ready`. A joint-owner shape,
-  header/manifest drift, or remaining-slice attempt to generate, rewrite, fork,
-  shadow, or extend Step 0's files fails. A lock-order suite imports #178/S3's
-  `web/lib/mcps/mcp-admission-lock-order-v2.json` through its one helper, proves exact parity with the
-  canonical ADR JSON, and proves every declared transaction path is an applicable-
-  row ordered subsequence with no reverse edge, synthetic filler lock, or second
-  runtime sequence. Release-evidence fixtures reject unknown fields, wrong owner/
-  graph/build/SHA/epoch/predecessor/controller identity, duplicate nonce, future
-  node issue/recording outside signer validity, wrong domain/key/signature, retired-key new
-  evidence, cross-node/kind substitution, and any unsigned/null-signature or
-  database-maintenance arm for every Step 0/S3/S4/S5/S6/enablement row. It proves
-  Step 0 installed the generic store/verifier/principals/recorder before its signed
-  first receipt and S3. Distinct receipt IDs/nonces with one canonical manifest,
-  node-or-kind, owner, builds, SHA, epoch, and predecessor-set identity conflict.
-  Durable-node fixtures wait over 30 minutes and still consume the exact retained
-  node using a separate fresh authorization. Transition-authorization fixtures
-  reject zero/over-30-minute lifetime, expiry, wrong source/target/operation/
-  controller/domain and replay, and permit a newly signed attempt after expiry
-  without duplicating the durable node.
-  Two consumers race one transition
-  receipt and exactly one wins; failure after every verification/consumption/state
-  write rolls back consumption and leaves the durable receipt retryable with a
-  still-valid or newly signed transition authorization. General
-  application roles cannot record/consume. The checked-in Node verifier is tested
-  on stock PostgreSQL 16 with locked signer rows and no crypto extension/network.
-  `enabled_build_tests_green` is a separate signed required-evidence kind, not a
-  graph node; missing/failed/stale/cross-bound preflight or any of the exact five
-  suites prevents final readiness. One transaction uniquely consumes both the
-  enabled-build and `ingress_and_issuance_enabled` receipts, appends one uniquely
-  identified `s5_s6_release_ready`, and promotes only the same unexpired
-  provisional owner to `active`; rollback removes both consumptions and promotion.
-  Database-time fixtures require the exact 1,560-second deadline, exact controller
-  login/run/authorization/token digest, 10-second heartbeats, and lease capped at
-  45 seconds and the overall deadline. They gate every ingress/issuance boundary,
-  race heartbeat with failure/watchdog/disable/expiry/promotion, prove one
-  authoritative singleton winner plus append-only non-authoritative audit, reject
-  reused/stolen-after-rotation/delayed/out-of-order token generations while only
-  the authenticated controller receives the raw next token, and fail
-  closed on expiry/controller death within 45 seconds/suite/evidence/PostgreSQL
-  failure without epoch lowering. A near-cap no-retry fixture completes the exact
-  660-second DAG and promotes with 900 seconds remaining. It exercises the canonical inspect and
-  dry-run/apply disable commands plus
-  `docs/operators/epic-172-provisional-enablement-v1.md`. Scrub dry-run/apply/batch/resume are actionless for every
-  invalid readiness/evidence variant.
-- #179's release gate also runs the real PostgreSQL and host-boundary suites, not
-  mocks: heartbeat must visibly wait in epoch → exact instance → generation/
-  rotation order and revalidate after each barrier. Deterministic W2 barriers run
-  before and after database recovery-lease expiry, committed-receipt expiry, the
-  protected service's no-grant proof, the protected `expired_ungranted` tombstone,
-  new-challenge creation, the database compare-and-set of the exact old owner/
-  election/receipt, the append-only database election tombstone, the greater
-  recovery-epoch/candidate commit, and service verification of that greater epoch
-  plus both tombstones followed by new-challenge burn. They also run after both
-  expiries but before no-grant proof. Every boundary injects crash/rollback and a
-  delayed old W2/receipt before and after each commit. No-grant without both
-  expiries, either tombstone alone, an uncommitted/unchanged epoch, or an already
-  granted takeover is actionless; only the exact greater-epoch protected and
-  database tombstones permit a new owner. The watchdog login may invoke only its zero-argument, fixed-path,
-  non-login-owned function. Migration fixtures prove nullable/no-default
-  `root_ref`, the separate default, insert-time null filling, re-null rejection,
-  unrelated updates to still-null rows, concurrent uniqueness, checkpointed bounded
-  backfill, zero-null proof validation, and the final short `SET NOT NULL` under old-
-  writer, crash, lock, and disk/WAL pressure. Journal fixtures require exactly one
-  `insert|root_update|archive` outcome per generation; a static parity sentinel
-  rejects stale `deleted_row`, `deleted-row`, or generic delete outcomes in schema,
-  reconciler, activation, fixtures, and architecture contracts; the sentinel's own
-  denylist fixture is the only allowlisted occurrence. Network-listener
-  partial-clone fixtures exercise release-pinned supported and unsupported Git
-  binaries (or digest-bound deterministic shims), inspect the exact environment and
-  argument vector of every probe and operational child, and require
-  `GIT_NO_LAZY_FETCH=1` everywhere. Supported probes require global
-  `--no-lazy-fetch` on operational children; unsupported probes forbid it; missing,
-  mismatched, or ambiguous probe evidence fails closed. The suite proves zero
-  network connections, zero object-storage write syscalls, and unchanged loose-
-  object, pack, index, multi-pack-index, and commit-graph bytes. Linux fixtures prove
-  paired trusted-shim/untrusted-run principals,
-  `nosuid,nodev`, setid/capability rejection, and proc/ptrace/signal isolation.
-  Principal-lifecycle fixtures exhaust per-host and hard 256-slot installation
-  bounds, assert the deduplicated capacity alert and blocked unreserved additions,
-  and crash every
-  revoke, session-termination, tombstone, certificate-destruction, role-drop, and
-  bounded-GC boundary without identity reuse. Marker fixtures exhaust the pending
-  and acknowledged `local_invocation_uncertain` union arms, fingerprint rotation,
-  exact replay, and rejection of mixed fields.
+- S6 has four evidence layers: contract invariants, PostgreSQL integration,
+  thin Playwright operator flows, and a separately trusted supported-host boundary.
+  They map to five timeout-bearing suite commands, six manifest partitions, and the
+  separate host preflight; no browser/database fixture substitutes for host proof.
+- A local-only tiny task-tracker regression uses the real authenticated approval
+  route and handoff pipeline. Prompt-only context approves and advances packages;
+  missing required filesystem context returns 409; coverage lost after approval
+  holds the package before claim with zero attempt/run/audit/artifact and keeps the
+  task operator-actionable; restoring exact coverage commits first and Redis only
+  wakes/re-drives it.
+- The fixed-observation preview==approval==handoff suite covers every capability
+  class, requirement field and fallback, requirement-key joins, mixed subtasks,
+  prohibited/unknown/deferred inputs, legacy data, and mutation sentinels. GitHub
+  planning context with materialized instructions remains allowed for healthy,
+  absent, missing, disabled, unhealthy, and auth-required health observations; it
+  never receives an install/fix admission action or bounded packet.
+- Every packet attempt for `allow_once` **or** `always_allow` uses one run-scoped
+  issuance claim/token/lease. One-time grants additionally claim and burn the
+  operator decision nonce; project grants snapshot locked decision revision and
+  root-binding revision plus exact coverage. Real PostgreSQL tests exercise both transaction orderings with
+  barriers and observed lock waits. Lease comparisons use database time, not a
+  mocked worker clock or sleeps as correctness proof.
+  Every local-root run also has distinct execution and generic local-evidence
+  ownership; packet ownership is optional. S6 races all three expiry winners and
+  ties, asserts `authorization_changed → execution_lease_expired →
+  local_evidence_lease_expired → issuance_lease_expired → worker_stopped`
+  precedence, and proves no heartbeat infers one lease from another. Packet-free/
+  handoff ACP calls compare-and-set durable generic invocation
+  `not_started → invoking` before I/O. Only the still-live exact owner/attempt may
+  persist `definitive_not_started`, from the trusted typed `pre_io_refusal` before
+  adapter process launch, serialization, socket/network, credential, or repository
+  I/O; only that state plus unchanged/not-applicable repository evidence permits
+  direct policy-eligible retry. A returned boundary yields `returned`, and any
+  possibly-started call without return proof yields `uncertain`.
+  `invoking|returned|uncertain` requires acknowledgement before retry even when
+  repository evidence is unchanged; restart never makes a second call.
+  One committed packet claim makes at most one external model/ACP submission;
+  packet-bearing AI SDK calls use `maxRetries:0`, lower adapters do not replay
+  after possible acceptance, and accepted-but-invalid output terminalizes as
+  `submitted` plus terminal `provider_response_invalid` failure without the
+  executor's automatic correction loop. Wire-level
+  failure injection proves one request. Generic stale-running recovery delegates a
+  linked v2 claim to S4 and cannot write a competing marker/event. Direct progress,
+  sibling continuation, and periodic readiness cannot bypass a packet recovery or
+  integrity-hold marker via generic promotion. Pairwise packet, packet-free, and
+  handoff-only claims lock/recheck every sibling and establish one running
+  specialist; an `awaiting_review` sibling blocks the next claim and packet action.
+- The failure matrix explicitly covers pre-approval, approved/pre-handoff,
+  package-claim rollback, pre/post issuance claim, assembly, staged/pre-exposure,
+  prompt submission uncertainty, every closed valid-response/post-submission local
+  failure stage (including partial host apply), run-lifetime resource-fence and
+  operating-system containment quiescence, missing-root reservation/create races,
+  project root repoint/tombstone/reuse and alias identity,
+  wrong-host action suppression,
+  exact registered worker/root-writer and binding-key identity, pre-submission
+  repository baseline/change review, per-entry apply intent/outcome/unknown state,
+  `GIT_NO_LAZY_FETCH=1`/`git --no-lazy-fetch`, promisor/network/object-write Git behavior,
+  atomic live
+  run/package/lease/audit/artifact finalization, exact terminal-failure repair,
+  fully evidenced terminal-success repair, typed/owned integrity alert/hold and
+  permanent mismatch quarantine adjudication with complete sibling evidence,
+  pre-transaction completion preparation versus finalizer rollback, Redis failure,
+  restart, and lease expiry. Every row states
+  package/task, nonce/claim, run/artifact, allowed automation, and required operator
+  action. A committed packet claim eventually yields exactly one typed run artifact;
+  preclaim/no-packet/losing-worker paths yield zero.
+- S6 imports S4's versioned authorization,
+  `assembled|not_assembled|assembly_unconfirmed` terminal assembly plus live-only
+  `assembling`,
+  staged delivery, terminal-delivery, terminal success/failure, the discriminated
+  packet-recovery marker, effect intent, host-ledger and repository-change review
+  unions, typed
+  packet-integrity alert/hold, and append-only
+  acknowledgement/decline contracts. It never invents enums. Durable `submitting` intent
+  precedes ACP I/O; stale intent becomes `submission_uncertain`. Acknowledgement
+  changes disposition/actor/time, never immutable delivery. Tests cover the exact
+  one-time/always-allow recovery matrix, all generic local review/possible-
+  invocation acknowledgement/policy-eligible retry/decline actions, packet decline,
+  stale/double actions, revocation followed
+  by restoration under a greater exactly covering decision, the S3→S4 one-time
+  resolver, and S5 current-state controls. The seven exact UI-route mutation
+  identities are `review_local_changes`, `acknowledge_possible_local_invocation`,
+  `retry_local_execution`, `decline_local_retry`, `retry_execution`,
+  `acknowledge_possible_submission`, and `decline_packet_recovery`; the internal
+  S3→S4 one-time-reapproval resolver is an eighth durable identity but never an
+  eighth CTA. Exact replay/stale-identity tests cover all eight. Local possible-
+  invocation acknowledgement must persist actor/time, retain immutable invocation
+  uncertainty, rotate the fingerprint, and expose the explicit post-ack
+  `retry_local_execution` marker only under current policy eligibility; ordinary
+  decline remains available. Every valid and known-invalid
+  assembly/delivery/effect/terminal/code/conditional-stage/ledger/fingerprint,
+  grant-mode/disposition/acknowledgement/root-binding, host-review, and repository-
+  review tuple
+  is tested. The shared expected table forbids terminal `active`, requires
+  post-effect `quiesced`, enforces caught-stage equality and fingerprint identity,
+  forbids quiesced `applying`, and permits success only with a complete all-
+  `applied` ledger; PostgreSQL/finalizer/repair/parser/API/S5 must agree. Retry
+  under the replacement decision is explicit, reruns canonical S1
+  `readEffectiveGrantState` so an equal/newer package denial still wins, requires
+  the decision's current root-binding revision, records prior/current decision and
+  root revisions, and leaves prior evidence
+  unchanged. Recovery requests carry the version-2 prior-audit and marker identity
+  bound to the routed task/package. Exact repeated recovery actions return one
+  recorded success with no second wake;
+  changed fingerprint/state returns 409. S5/S6 exhaustively cover durable live
+  preparing, assembled, submitting, submission-rejected/finalizing, and
+  accepted/finalizing phases as a discriminated assembly/delivery union; they
+  never infer a failed/finalizing worker-memory phase. Invalid cross-products fail closed. If a
+  sibling lease remains live or a sibling is `awaiting_review`, the task stays `running` and recovery is actionless
+  until S4's post-sibling/periodic reconciler reaches `approved`. The failure matrix imports the exact
+  closed S4 `PacketFailureCode`; no test or UI invents a code or accepts raw
+  exception detail. PostgreSQL barriers also cover stale recovery against
+  packet-free/handoff-only claims and finalization against stale review-gate
+  decisions in both orderings. Definitive submission rejection survives a
+  crash/lease-expiry race without cause reclassification.
+  Further barriers prove no action from before the first repository read while the
+  host fence service lease or nonempty/unverifiable containment group exists;
+  project management uses namespace/ordered resource fences; wrong-host `not_started`
+  recovery reads only the run pin while active/quiesced also checks intent host;
+  crash-left or live outcome-write uncertainty becomes `unknown`; working-tree,
+  Git-control, and Git-storage reviews are independently bound to ledger and
+  baseline/change fingerprints; and
+  lease/worker failure still retains local-change guidance.
+  Committed-election barriers require both the database recovery lease and service
+  receipt to expire, prove takeover was never granted, atomically retain the
+  protected `expired_ungranted` receipt tombstone, append the matching database
+  election tombstone under the top-down compare-and-set, and install only the
+  tombstone-bound greater recovery epoch/candidate/challenge. Tests crash before and
+  after each boundary and race the old receipt against protected-service grant,
+  final database compare-and-set, replacement W2, and binding generation; stale
+  receipts remain historical and never authorize. Heartbeat barriers
+  prove epoch → exact instance → applicable generation/rotation ordering against
+  drain, claim, activation, replacement, and rotation. The watchdog's fixed
+  `SECURITY DEFINER` privilege boundary is attacked through hostile search paths,
+  temporary objects, caller-selected candidate/evidence/instance IDs, parameterized
+  variants, direct SQL, cross-function calls, and duplicate producers. Principal
+  retirement/garbage collection crashes at login/connection revocation, session
+  termination, client-certificate/private-key destruction, login-role drop, and
+  immutable name/incarnation tombstone boundaries without deleting/reusing identity,
+  evading live references, or hiding pending/retired resource backlog from its cap
+  and alert. S6 invokes exact dry run
+  `npm run protocol:gc-work-package-principals -- --actor <operator-id>` and exact
+  apply `npm run protocol:gc-work-package-principals -- --actor <operator-id> --apply`,
+  and verifies `docs/operators/work-package-principal-lifecycle-v2.md`. Supported-host attacks cover `nosuid`/`nodev`, setid, file capabilities,
+  device nodes, `/proc/<pid>/mem`, `/proc/<pid>/{maps,environ,fd}`, descriptors,
+  `process_vm_readv`, `ptrace`, cross-user signals, and attempts to assume or forge
+  the distinct non-dumpable trusted-shim identity or replace/proxy/inject its path,
+  environment, and arguments.
+  Duplicate/replay/reapproval/success-repair/gate tests import the canonical
+  version-2 lock manifest and derive its relative-edge fixture. Every production mutation declares the sequence of
+  row categories it actually acquires; static validation requires that sequence to
+  be an ordered subsequence of the manifest, with ascending/stable
+  order within repeated categories and no undeclared/reversed acquisition. Real
+  PostgreSQL barriers race every adjacent pair actually acquired for grant/reconciliation,
+  all-mode claim, local/packet actions, finalizer/repair, W2 election, activation/
+  replacement/rotation, and project/root-management paths in both orderings. Paths
+  need not acquire inapplicable rows or a fictitious full prefix. Normal actions cannot
+  clear integrity holds; privileged repair is authorized, fingerprinted,
+  append-only, and evidence-preserving. Generic mismatch tests distinguish an exact
+  reconstructable failure tuple from irreconcilable mismatch and missing evidence;
+  only the latter two require quarantine. Exact generic
+  `quarantined_abandoned` closure requires the complete sibling-evidence set,
+  repository disposition, and cancelled task/package before S5 renders permanent
+  closure. A true packet audit/artifact mismatch has only the exact
+  sibling-evidence-set-bound `quarantined_abandoned` task/package closure and never
+  becomes retryable or clears another sibling's root-management barrier.
+- Packet-owned evidence uses opaque `rootRef` and counts/redaction only. Unique sentinels prove
+  packet/rejected text, credentials, root/selected paths, names, excerpts, and
+  contents are absent from packet metadata artifacts, audits, task/package metadata and reasons,
+  task logs/exports/events, API/SSE responses, run errors, diagnostics, and queue
+  payloads. Every CI output is also a leakage sink. A no-tee wrapper quarantines
+  child stdout/stderr, reports, summaries, annotations, and attachments before the
+  live runner channel; that channel receives only fixed status codes. Only
+  schema-validated sanitized UTF-8 text/JSON regenerated from path-free tuples may
+  upload after scanning. Raw logs/traces/reports, screenshots, video, Document
+  Object Model snapshots, diffs, dumps, archives, and all opaque/binary formats are
+  non-allowlisted, remain in the disposable VM, and are destroyed. Unknown fields,
+  types, keys, parse failures, non-allowlisted files, or any seeded sentinel
+  suppress the complete upload and fail the controller check. Seeded post-prompt,
+  live-log, annotation, compressed-image, and video failures prove no sentinel can
+  reach either the live channel or an uploaded sink.
+  Specialist source artifacts/sandbox/host changes are a separate output
+  boundary and are not used to claim that model output cannot echo context.
+  Existing prompt logging remains digest/count
+  only. Role-preserving providers prove actual wire-level system-role separation;
+  the ACP fake proves its flattened guidance/data representation and preserves the
+  non-sandbox, non-enforcement warning.
+- S6 proves #179's cross-process rollout with two disjoint fixtures: a sacrificial
+  pre-bridge fixture demonstrates the old route's possible irreversible filesystem-
+  first loss and is never used for retention assertions; a fresh post-bridge fixture
+  proves archive/conflict before filesystem work after every old route/session
+  drains, retained-evidence foreign keys become `RESTRICT|NO ACTION`, and the
+  database rejects hard delete before the journal window. The rootRef migration
+  adds a nullable no-default column, then installs a database-owned insert bridge
+  that supplies a UUID for omitted and explicitly null inserts plus the database
+  UUID default for omitted values. Tests prove unrelated updates to legacy still-
+  null rows remain legal during bounded backfill, while a bound row cannot be re-
+  nulled. The migration creates no pre-backfill `NOT VALID` non-null helper; it
+  performs restartable zero-null/unique backfill and only after zero-null proof adds
+  and validates the non-null check and sets `root_ref NOT NULL`. It then deploys additive
+  root-binding/key/reservation/tombstone schema and checked-in canonical host-
+  binding command, typed worker/root-writer capability registry, host ledger,
+  repository baseline/change review, recovery-action/integrity tables,
+  terminal/effect constraint, dual readers, non-issuable legacy decisions, neutral
+  legacy preview/audit interpretation, package and project-root epoch triggers,
+  disabled management ingress plus v1 database-role/session revocation and
+  operational drain, the checked-in
+  privileged dry-run/`--apply` activation command and operator runbook around the
+  three-statement `READ COMMITTED` activation, epoch-2 all-mode v2 producer
+  cutover, then #179's separately gated root-path scrub through the exact dry-run/
+  apply/inspect commands and `docs/operators/legacy-runtime-root-scrub-v2.md`, then
+  S5. Tests prove a
+  genuine pre-trigger process must be drained; v1-shared-first forces activation
+  abort, activation-first rejects v1, and packet/packet-free/handoff-only v2 claims
+  succeed after cutover. Command and later-claim tests reject zero/multiple,
+  unregistered, stale, draining, incompatible, divergent-key, wrong-host, and
+  undrained instance rows plus unbound/maintenance/reservation roots; one fresh
+  active host pins exact instance IDs, epoch host/key, fence-service/containment
+  versions, root-writer credential generation, and v2 ingress owner. They prove
+  actor identity, idempotency, postconditions, exact capability audit,
+  operating-system containment support, and the
+  Release/DevOps integrity runbook/commands. Epoch-2 root-writer replacement must
+  adopt exact old reservations/maintenance pins or retain `cleanup_required` under
+  its takeover ledger before ingress. Tests invoke exact replacement dry-run
+  `npm run protocol:replace-work-package-instance -- --candidate <new-instance-id> --replaces <old-instance-id> --actor <operator-id>`
+  and exact apply
+  `npm run protocol:replace-work-package-instance -- --candidate <new-instance-id> --replaces <old-instance-id> --actor <operator-id> --apply`, using
+  `docs/operators/work-package-instance-replacement-v2.md`. Host-key rotation uses the exact documented
+  dry-run/apply/inspect/discard commands and requires coherent K1 projections,
+  markers, reviews, holds, and terminal evidence; ad hoc SQL is not release evidence. Rollback
+  retains the forward schema/default/ledgers/evidence tombstones, proves every
+  containment group empty, disables root management, and never lowers the epoch or
+  restarts a legacy root writer.
+  Unsupported macOS/Windows/same-user/non-delegated hosts fail preflight with epoch
+  1 unchanged, perform no v2 drain or scrub, and retain truthful legacy/pre-cutover
+  presentation; the suite does not turn current beta support into a Linux
+  containment claim.
+- CI has five timeout-bearing suite commands enforced by a process-tree deadline
+  wrapper: `test:mcp:contract` (60 seconds), `test:mcp:postgres` (240),
+  `test:mcp:issuance` (300), `e2e:mcp-operator` (240), and
+  `test:mcp:host-boundary` (420). The reviewed manifest has six partitions:
+  contract, PostgreSQL, issuance, operator desktop, operator mobile, and host
+  boundary. The four-layer mapping is contract → contract command/partition,
+  PostgreSQL integration → PostgreSQL and issuance commands/partitions, thin
+  operator flow → one command with desktop/mobile partitions, and supported-host
+  boundary → host command/partition after separate `preflight:mcp:host-boundary`.
+  Database suites run desktop-only once; operator accessibility runs
+  desktop and mobile. Dedicated projects/tags and generic-project `grepInvert`
+  prevent duplicate execution. Wrappers prove static expected → collected → first-
+  attempt executed identity, detecting deletion, untagged tests, overlap, omission,
+  runtime skips, and retries.
+
+  The host job uses an ephemeral single-job signed Ubuntu image only for a trusted
+  merge-queue SHA or protected manual dispatch—never `pull_request_target` or
+  privileged fork code. An external controller verifies and prefetches the reviewed
+  SHA, digest-pinned actions/dependencies, immutable root harness, and PostgreSQL 16
+  TLS fixture before starting checkout code in a separate zero-egress user/mount/
+  PID/network namespace. Only the outside coordinator retains narrow GitHub status/
+  cancellation connectivity; the read-only token and all secrets remain outside.
+  The controller supplies one random expiring challenge/nonce bound to run/job/SHA/
+  image/boot/harness/TLS identity. The immutable root harness signs the observed
+  preflight envelope. The exact checkout request/verify client is
+  `verify-mcp-host-boundary-attestation.mjs`; it uses the fixed root-harness socket
+  and controller challenge, writes only the signed envelope, and verifies it with
+  the pinned public key. Repository code can mint neither the observed attestation
+  facts nor the signature. Before running scenarios, the separate host test command
+  re-verifies the same signature, pinned key, and bindings. The external controller
+  verifier remains independent of both checkout clients and validates signer,
+  nonce, signature, every binding, expiry, and replay before the gate passes.
+
+  A separate external-controller-owned required GitHub Check Run,
+  `forge/host-boundary-controller`, is created `in_progress` for the exact SHA
+  before provisioning and remains pending after runner/test-process completion.
+  Only the controller's outside-checkout GitHub App may conclude it; runner,
+  workflow, checkout, harness, and cleanup credentials have no `checks:write`.
+  The repository ruleset pins the required check to the exact audited App
+  integration/App ID; same-name Actions or foreign-App checks cannot satisfy it and
+  cause configuration-drift failure. Checkout callbacks are advisory. The outside-
+  checkout coordinator signs a single-use suite-result envelope over run/job/SHA/
+  image/boot, suite-manifest and executed-ID digests, first-attempt exit status,
+  output-scan digest, nonce, issued-at, and expiry. It never signs incomplete,
+  skipped, retried, duplicated, or unscanned execution. Success requires the
+  independently verified preflight and signed suite-result envelope,
+  signed teardown envelope, out-of-band VM destruction/reimage, and the controller's
+  signed same-run/job/SHA/boot destruction/reimage receipt. A runner-reported green
+  result never concludes the required check.
+
+  Root-harness cleanup and its separately challenge-bound signed teardown envelope
+  are best-effort evidence; nonzero residue still fails the gate. VM containment is
+  owned by the external controller, whose cancellation watcher and independent TTL
+  destroy the VM on success, failure, runner loss, timeout, or cancellation. A
+  controller-signed destruction/reimage receipt is mandatory and prevents reuse.
+  Negative tests forge/replay/expire/cross-bind both envelopes, kill runner/harness
+  cleanup, forge runner success and suite-result envelopes, omit a manifest ID,
+  substitute a stale output-scan digest, create same-name foreign checks, drop/
+  duplicate callbacks, delay the Checks API, replay a prior receipt, and prove out-of-band destruction while the external
+  check remains pending and then fails unless the complete same-job evidence set
+  arrives. Only the controller retries Check Run API failure. Generic test/e2e
+  remains required smoke compatibility but is not a substitute for these gates.
+  Unexpected skips, budget overruns, missing diagnostics, invalid attestations, or
+  missing destruction/reimage proof fail CI.
+- A checked-in dimension-scoped parity sentinel compares ADR 0009 with all four
+  owning issue fixtures: #178 supplies S3 lock/hold/revision/journal-handoff and the
+  internal S3→S4 resolver; #179 supplies S4 leases, lock tail, evidence/actions, and
+  exact rollout commands; #180 supplies current-state/action presentation; #181
+  supplies the four-layer/five-command/six-partition/preflight/runner mapping. It
+  asserts the seven exact UI-route action identities—including
+  `acknowledge_possible_submission`—plus the internal resolver as eight durable
+  mutation identities, without exposing an eighth CTA. It also imports the
+  canonical version-2 manifest's relative lock edges and each production mutation's applicable-row
+  sequence. The complete literal command/runbook parity set is:
+
+  ```text
+  npm run project-roots:reconcile-expansion -- --through <generation> --actor <operator-id> --apply
+  npm run project-roots:bind-v2 -- --actor <operator-id>
+  npm run project-roots:bind-v2 -- --actor <operator-id> --apply
+  npm run protocol:activate-work-package-v2 -- --actor <operator-id>
+  npm run protocol:activate-work-package-v2 -- --actor <operator-id> --apply
+  npm run protocol:replace-work-package-instance -- --candidate <new-instance-id> --replaces <old-instance-id> --actor <operator-id>
+  npm run protocol:replace-work-package-instance -- --candidate <new-instance-id> --replaces <old-instance-id> --actor <operator-id> --apply
+  npm run protocol:gc-work-package-principals -- --actor <operator-id>
+  npm run protocol:gc-work-package-principals -- --actor <operator-id> --apply
+  npm run protocol:rotate-host-binding-key-v2 -- --pending-key-ref <opaque-secret-ref> --actor <operator-id>
+  npm run protocol:rotate-host-binding-key-v2 -- --pending-key-ref <opaque-secret-ref> --actor <operator-id> --apply
+  npm run protocol:inspect-host-binding-key-rotation-v2 -- --rotation <rotation-id>
+  npm run protocol:rotate-host-binding-key-v2 -- --rotation <rotation-id> --discard --actor <operator-id> --apply
+  npm run local-execution-integrity:inspect -- --alert <id>
+  npm run local-execution-integrity:resolve -- --alert <id> --actor <operator-id> --expected-fingerprint <digest> --resolution verified_success
+  npm run local-execution-integrity:resolve -- --alert <id> --actor <operator-id> --expected-fingerprint <digest> --resolution verified_failure
+  npm run local-execution-integrity:resolve -- --alert <id> --actor <operator-id> --expected-fingerprint <digest> --resolution projection_recomputed
+  npm run local-execution-integrity:resolve -- --alert <id> --actor <operator-id> --expected-fingerprint <digest> --resolution generic_failure_reconstructed
+  npm run local-execution-integrity:resolve -- --alert <id> --actor <operator-id> --expected-fingerprint <digest> --resolution quarantined_abandoned --expected-sibling-evidence-set-fingerprint <digest> --repository-disposition reviewed
+  npm run local-execution-integrity:resolve -- --alert <id> --actor <operator-id> --expected-fingerprint <digest> --resolution quarantined_abandoned --expected-sibling-evidence-set-fingerprint <digest> --repository-disposition abandoned
+  npm run protocol:scrub-legacy-runtime-roots -- --actor <operator-id>
+  npm run protocol:scrub-legacy-runtime-roots -- --actor <operator-id> --apply
+  npm run protocol:inspect-legacy-runtime-root-scrub -- --operation <operation-id>
+  npm run protocol:inspect-host-boundary-controller -- --run <controller-run-id> --sha <sha>
+  npm run protocol:verify-host-boundary-controller-ruleset -- --repository <owner/repo> --app-id <github-app-id> --check forge/host-boundary-controller
+  npm run protocol:retry-host-boundary-controller-check -- --run <controller-run-id> --sha <sha> --actor <operator-id> --expected-state failed --apply
+  npm run protocol:retry-host-boundary-controller-check -- --run <controller-run-id> --sha <sha> --actor <operator-id> --expected-state timed_out --apply
+  npm run protocol:rotate-host-boundary-controller-key -- --pending-key-ref <opaque-secret-ref> --actor <operator-id>
+  npm run protocol:rotate-host-boundary-controller-key -- --pending-key-ref <opaque-secret-ref> --actor <operator-id> --apply
+  npm run protocol:inspect-host-boundary-controller-key-rotation -- --rotation <rotation-id>
+  npm run protocol:rotate-host-boundary-controller-key -- --rotation <rotation-id> --discard --actor <operator-id> --apply
+  docs/operators/project-root-binding-v2.md
+  docs/operators/work-package-protocol-v2-cutover.md
+  docs/operators/work-package-instance-replacement-v2.md
+  docs/operators/work-package-principal-lifecycle-v2.md
+  docs/operators/host-binding-key-rotation-v2.md
+  docs/operators/local-execution-integrity-repair.md
+  docs/operators/legacy-runtime-root-scrub-v2.md
+  docs/operators/host-boundary-controller-v2.md
+  ```
+
+  Optional-option notation, prose aliases, changed placeholders, missing commands/
+  guides, or ad hoc alternatives are parity failures. Any owner,
+  action, lock-edge/sequence, or literal-command drift fails before executable
+  suites; source constants are imported instead of reimplementing policy.
+  `quarantined_abandoned` stores the exact operator-supplied sibling-evidence-set
+  fingerprint and explicit repository disposition; it never recomputes or chooses
+  either after request authorization. The controller interfaces and
+  `docs/operators/host-boundary-controller-v2.md` are Release/DevOps-owned and are
+  the only supported inspection, exact-App ruleset verification, fingerprinted
+  failed-check retry, and credential rotation/discard paths.
 
 ## <a id="43-re-scope"></a>#43 re-scope
 
