@@ -1441,9 +1441,10 @@ none of those slices may weaken this state, precedence, or lock contract.
   a later Forge-governed boundary but cannot recall bytes or cancel external I/O
   already started.
 
-  A valid or known-but-incoherent `metadata.packet_issuance` marker is an absolute
-  S4-owned guard before generic candidate selection, admission refresh, readiness
-  promotion, and package claim. Direct progress, sibling continuation, and
+  A valid or known-but-incoherent `metadata.packet_issuance` or
+  `metadata.packet_integrity_hold` marker is an absolute S4-owned guard before
+  generic candidate selection, admission refresh, readiness promotion, and
+  package claim. Direct progress, sibling continuation, and
   periodic sweeps cannot clear or bypass it even when current grant coverage is
   allowed. Only S4's exact recovery route or the S3→S4 one-time resolver may
   compare-and-set that marker away and move `blocked → ready`.
@@ -1470,8 +1471,10 @@ none of those slices may weaken this state, precedence, or lock contract.
   failure object/delivery into the marker. Terminal success creates no failure
   marker and may reconstruct success only from matching completion,
   repository-evidence, and review-gate materialization; missing/mismatched evidence
-  enters a neutral non-retryable integrity hold. Repair never resubmits or turns
-  immutable success into retryable failure.
+  enters a typed `packet_integrity_hold` that fails only the live run, clears its
+  lease, blocks the package, exposes no recovery action, and requires separately
+  authorized privileged repair. Repair never resubmits or turns immutable success
+  into retryable failure.
   Only packet-free runs may retain generic recovery. Every
   versioned `packet_issuance` marker has `autoRetryable:false`, immutable terminal
   delivery, separate disposition/acknowledgement fields, fingerprints, and bounded

@@ -243,11 +243,12 @@ Only the winner proceeds. A failure at any statement rolls the whole claim trans
 
 ## Packet-recovery admission guard
 
-A validated `metadata.packet_issuance` marker is an absolute S4-owned block before
-generic readiness calculation, admission refresh, promotion, or package claim.
-`loadHandoffState`, direct `progressWorkforce`, sibling-completion continuation,
-and periodic ready sweeps must all call one S4 parser/guard before treating a
-`blocked` package as a candidate. A known v2 marker with an invalid tuple also
+A validated `metadata.packet_issuance` or `metadata.packet_integrity_hold` marker
+is an absolute S4-owned block before generic readiness calculation, admission
+refresh, promotion, or package claim. `loadHandoffState`, direct
+`progressWorkforce`, sibling-completion continuation, and periodic ready sweeps
+must all call one S4 parser/guard before treating a `blocked` package as a
+candidate. A known v2 marker with an invalid tuple also
 fails closed and is never generically promoted. Current canonical grant coverage
 does not clear this guard.
 
@@ -445,6 +446,18 @@ type PacketIssuanceRecoveryState =
 
 type PacketIssuanceRecoveryMarkerV2 =
   PacketIssuanceRecoveryCommon & PacketIssuanceRecoveryState;
+
+type PacketIntegrityHoldV2 = {
+  schemaVersion: 2;
+  kind: 'packet_integrity_hold';
+  priorAgentRunId: string;
+  priorRuntimeAuditId: string;
+  reason:
+    | 'audit_artifact_mismatch'
+    | 'terminal_success_materialization_incomplete';
+  autoRetryable: false;
+  markerFingerprint: string;
+};
 ```
 
 The terminal tuple is normative. `succeeded` permits only `assembled + submitted`
@@ -542,6 +555,14 @@ and issuance-lease-first expiry therefore converge on one S4 marker, one failed
 run/audit, and one artifact using PostgreSQL time. The legacy path never clears a
 v2 execution lease, writes `staleRunningRecovery`, or publishes terminal events for
 a packet-bearing run outside the S4 commit.
+
+The neutral integrity branch atomically fails only the live run with bounded
+reason `packet_integrity_hold`, clears its lease, blocks the package with the typed
+`PacketIntegrityHoldV2`, and applies the sibling-aware task disposition. It does
+not state that packet issuance failed, does not create an issuance-recovery action,
+and exposes no web recovery CTA. Resolution is a separately authorized privileged
+data-repair procedure outside these slices. The generic S4 admission guard treats
+both `packet_issuance` and `packet_integrity_hold` as absolute blocks.
 
 `reconcilePacketRecoveryTaskDisposition(taskId)` owns the sibling-convergence seam.
 It runs in a new top-down transaction after any sibling releases/terminalizes its
