@@ -68,9 +68,12 @@ allowlist.
 
 ## Consequences
 
-This closes the MCP Filesystem epic for the safe beta path: installation/status,
-approval, runtime enforcement, and auditability are implemented without exposing
-arbitrary host filesystem access to agents.
+When the ADR 0009 S3–S6 slices are implemented and their release evidence passes,
+this decision completes the Forge-issued MCP-channel beta path for setup,
+approval, cooperative enforcement, and auditability without issuing arbitrary
+filesystem access through that MCP channel. It does **not** confine an Agent
+Client Protocol (ACP) process: ACP may still have shell, network, environment,
+credential, or equivalent host-filesystem access outside Forge's MCP channel.
 
 Future live filesystem MCP execution needs a separate design for hard process
 sandboxing, path-scoped tool brokering, write approval, and adversarial prompt
