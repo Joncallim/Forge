@@ -1,62 +1,120 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="web/public/brand/forge-wordmark-light.svg">
-  <img src="web/public/brand/forge-wordmark-dark.svg" alt="FORGE" width="250">
-</picture>
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="web/public/brand/forge-wordmark-light.svg">
+    <img src="web/public/brand/forge-wordmark-dark.svg" alt="FORGE" width="360">
+  </picture>
 
-# Forge
+  <p><strong>Many specialists. One coordinated system.</strong></p>
+  <p>A local-first control plane for planning, executing, verifying, and governing AI coding work.</p>
 
-Forge is a local control room for AI coding work.
+  <p>
+    <img alt="Status: beta" src="https://img.shields.io/badge/status-beta-0891b2">
+    <img alt="Node 22+" src="https://img.shields.io/badge/Node.js-22%2B-339933?logo=nodedotjs&logoColor=white">
+    <img alt="Next.js 16" src="https://img.shields.io/badge/Next.js-16-000000?logo=nextdotjs&logoColor=white">
+    <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white">
+    <img alt="PostgreSQL" src="https://img.shields.io/badge/PostgreSQL-backed-4169E1?logo=postgresql&logoColor=white">
+    <img alt="Redis" src="https://img.shields.io/badge/Redis-queue-DC382D?logo=redis&logoColor=white">
+  </p>
 
-You open Forge in a browser, connect one or more AI models, create a software
-task, and review the plan Forge produces. The long-term goal is a managed AI
-workforce that can plan, build, test, review, and prepare pull requests while a
-human stays in control of the important decisions.
+  <p>
+    <a href="#quick-start">Quick start</a> ·
+    <a href="#what-forge-does-today">Capabilities</a> ·
+    <a href="#visual-tour">Visual tour</a> ·
+    <a href="docs/near-term-roadmap.md">Near-term roadmap</a> ·
+    <a href="docs/wiki.md">Wiki</a>
+  </p>
+</div>
 
-Today, Forge is an Orchestrator-stage beta. In the default path, Forge plans
-work and waits for your approval. Workforce materialization, handoff, specialist
-package execution, and local repository edits are enabled unless explicitly
-disabled. Architect completion can create durable work packages and review
-gates before the task reaches `awaiting_approval`; approval releases ready
-packages for execution. Forge keeps generated files in per-package attempt
-sandboxes under `.forge/task-runs` and, after the package execution step, applies
-repository-affecting output to the local project. It still does not make
-commits, open pull requests, merge code, or run specialists in parallel.
+<p align="center">
+  <img src="web/public/brand/forge-og.png" alt="FORGE — coordinated AI software delivery" width="900">
+</p>
 
-## What Forge Does Today
+## About
 
-1. You create a project.
-2. You describe a task.
-3. Forge queues the task.
-4. A background worker asks the Architect agent to write a plan.
-5. Forge saves the plan and shows it in the dashboard.
-6. You approve, reject, or revise the plan.
-7. If Workforce records exist, approval releases ready work packages for
-   handoff, broker checks, package execution, local file edits, and manual
-   review gates.
+FORGE is a browser-based control room for AI-assisted software delivery. It
+connects projects, providers, coding agents, durable work packages, bounded
+execution, evidence, approvals, and GitHub workflows in one operator-controlled
+system.
 
-Under the hood, Forge runs a web app, PostgreSQL, Redis, and a worker process.
-For normal local use, the worker starts inside the web app, so one command starts
-the dashboard and the task loop together.
+The product goal is not “give a chatbot shell access.” FORGE separates model
+judgement from deterministic execution:
 
 ```text
-Browser -> Forge dashboard -> Redis queue -> Forge worker -> AI model -> review in browser
+Human intent
+  -> Architect plan
+  -> durable work packages
+  -> capability and MCP admission
+  -> bounded context
+  -> sandboxed specialist execution
+  -> QA / Reviewer / Security gates
+  -> evidence, recovery, and GitHub handoff
 ```
 
-## Vocabulary
+FORGE is currently a **single-operator beta**. It can plan and execute approved
+specialist packages, apply guarded local repository changes, and preserve the
+evidence needed for review. It deliberately stops short of general autonomous
+commits, merges, broad live MCP authority, or unrestricted host control.
 
-| Term | Plain-English meaning |
+## Why FORGE
+
+| Principle | What it means in practice |
 |---|---|
-| Dashboard | The browser UI where you configure Forge and review work. |
-| Project | A local or GitHub-backed repository Forge can reason about. |
-| Task | A request you give Forge, such as "add login" or "review this bug." |
-| Architect | The planning agent that writes the first implementation plan. |
-| Artifact | A saved output, usually the Architect plan Markdown. |
-| Approval | The human checkpoint before Forge marks the current stage complete. |
-| Workforce | The future/sandboxed specialist-agent system: Backend, Frontend, QA, Reviewer, DevOps, and custom agents. |
-| Forge Workspace | The planned dockable workspace that links browser, repo, notes, docs, Playwright, Notion, GitHub, logs, and AI task context. |
-| ACP provider | A local command-line coding agent connected through the Agent Client Protocol. See [ACP and Zed connector](docs/acp-zed-connector.md). |
+| **Human authority** | Plans, risky capabilities, review gates, and final outcomes remain inspectable and controllable. |
+| **Deterministic boundaries** | Models produce structured plans and requests; FORGE validates scope, policy, commands, files, and outcomes. |
+| **Bounded context** | Specialists receive the minimum relevant repository evidence rather than unrestricted filesystem access. |
+| **Durable evidence** | Tasks, attempts, work packages, runs, artifacts, approvals, and blocked reasons survive beyond a chat session. |
+| **Runtime-neutral agents** | Direct model APIs, local models, Codex CLI, and Claude Code can sit behind consistent FORGE contracts. |
+| **GitHub-native delivery** | Structured issues, controlled handoffs, PR contracts, and acceptance-criteria checks keep implementation traceable. |
 
-## Fast Setup
+## What FORGE Does Today
+
+### Plan and coordinate
+
+- Create local or GitHub-backed projects.
+- Configure cloud, local, and ACP-backed providers.
+- Ask the Architect to produce an implementation plan.
+- Materialize plans into durable work packages, dependencies, capabilities, and review gates.
+- Revise, approve, reject, retry, stop, and recover work from the dashboard.
+
+### Execute within policy
+
+- Queue work through Redis and persist orchestration truth in PostgreSQL.
+- Execute eligible specialist packages sequentially.
+- Build bounded repository context packets.
+- Write generated output into per-attempt sandboxes under `.forge/task-runs`.
+- Apply validated repository-affecting files through guarded local-write policy.
+- Enforce command, file-count, byte, timeout, validation, and retry limits.
+- Broker MCP requirements through explicit admission and approval state.
+
+### Review and preserve evidence
+
+- Store plans, execution output, command results, repository evidence, findings, and rework history as artifacts.
+- Require QA and Reviewer gates, with Security gates for higher-risk work.
+- Keep structured task attempts and blocked/recovery reasons.
+- Validate GitHub issues before agent work.
+- Generate controlled Claude Code or Codex handoff packages.
+- Check pull requests against linked issue acceptance criteria.
+
+## How A Task Flows
+
+```text
+Create task
+  -> Redis wakes the worker
+  -> Architect plans
+  -> FORGE materializes packages and gates
+  -> operator reviews the plan
+  -> capability/MCP admission runs
+  -> specialist executes in a bounded attempt sandbox
+  -> validated output may be applied to the local project
+  -> QA / Reviewer / Security evidence is collected
+  -> operator accepts, requests rework, or stops
+```
+
+The web app is the control plane. PostgreSQL stores durable state. Redis carries
+wake-up, retry, and dead-letter transport. The worker performs planning,
+handoff, execution, recovery, and evidence capture.
+
+## Quick Start
 
 From the repository root:
 
@@ -66,8 +124,7 @@ bash scripts/install.sh
 
 The installer prepares local services, creates
 `~/Documents/Forge/config/forge.env`, installs web dependencies, prepares the
-database, and can set up a small local Ollama model so Forge can run without API
-keys.
+database, and can configure a small local Ollama model.
 
 Useful variants:
 
@@ -77,7 +134,7 @@ forge upgrade                        # sync dependencies and migrations after pu
 FORGE_SKIP_OLLAMA=1 bash scripts/install.sh
 ```
 
-Then start Forge:
+Start FORGE:
 
 ```bash
 forge
@@ -93,30 +150,6 @@ The first account creates a password and, by default, a passkey. To use password
 only, set `FORGE_PASSKEYS_ENABLED=0` in
 `~/Documents/Forge/config/forge.env` before creating the first account.
 
-If you kept settings during uninstall/reinstall, Forge keeps the existing
-single-user account. Registration will stay closed, so recover from the shell:
-
-```bash
-forge reset-credentials
-```
-
-Use `http://localhost:3000` for local passkeys unless you also update
-`WEBAUTHN_RP_ID` and `WEBAUTHN_ORIGIN` in the workspace env file.
-
-## Try A Task
-
-1. Open the dashboard.
-2. Apply a provider preset in setup, or add a provider manually.
-3. Create a project from a GitHub repo or local folder.
-4. Create a task with a short prompt.
-5. Wait for the task to reach `Awaiting Approval`.
-6. Read the Architect plan and approve or reject it.
-
-On the task detail page, you can also stop a non-terminal task, delete a
-terminal individual task and its run history, retry the task with the same or
-another provider, retry a blocked handoff after fixing the cause, and inspect
-Agent history with queue attempts collapsed under it.
-
 For a no-cost plumbing test, run with the mock Architect:
 
 ```bash
@@ -124,74 +157,149 @@ cd web
 FORGE_WORKER_MOCK_ARCHITECT=1 npm run dev
 ```
 
-## What Is Not Built Yet
+## Try A Task
 
-- MCP runtime grants for specialists.
-- Branch, commit, pull request, and merge automation.
-- Parallel specialist execution.
-- Autonomous reviewer agents for generated code. The current beta uses manual
-  QA, Reviewer, and Security approval gates.
-- Forge Workspace panes for built-in Chromium, Playwright, notepad, Markdown,
-  coding, terminal/logs, Notion, and GitHub.
-- Notion/GitHub link graph sync and write-back approvals.
+1. Open the dashboard.
+2. Apply a provider preset or add a provider manually.
+3. Create a project from a GitHub repository or local folder.
+4. Create a focused task with testable acceptance criteria.
+5. Wait for the Architect plan and work-package preview.
+6. Review capability/MCP requirements and approve or revise the plan.
+7. Inspect execution evidence, generated files, commands, and review gates.
+8. Accept the result, request rework, or fix a blocked condition and retry.
 
-The first Workforce build slice is present as durable planning records:
-work packages, harness metadata, approval gates, and VCS summaries can now be
-stored and displayed. Architect completion materializes those records before
-plan approval; approval releases ready packages. Workforce materialization,
-handoff, package execution, and local repository writes are default-on. Disable
-them with `FORGE_WORKFORCE_MATERIALIZATION=0`,
-`FORGE_WORK_PACKAGE_HANDOFF=0`, `FORGE_WORK_PACKAGE_EXECUTION=0`, or
-`FORGE_HOST_REPOSITORY_WRITES=0`.
+## Safety Model
 
-## Forge Workspace Direction
+FORGE is designed around explicit ceilings rather than presumed agent trust:
 
-After sequential sandboxed Workforce execution is reliable, the next major
-product direction is **Forge Workspace**: a dockable, AI-assisted workbench that
-brings browser, repo, notes, docs, Playwright, GitHub, Notion, terminals, logs,
-and task artifacts into one saved context.
+- project paths are validated before execution;
+- context packets are bounded and inspectable;
+- generated files are size/count limited and path checked;
+- supported validation commands are allowlisted;
+- MCP proposals, approvals, and effective grants are separate states;
+- secrets are stored as encrypted settings or environment-variable names;
+- prompts, logs, and evidence use redaction and bounded output;
+- higher-risk work requires Security review;
+- ACP adapters remain local processes and are not presented as OS confinement;
+- final authority remains with the operator.
 
-The product should feel OS-like without becoming a full operating system. The
-first implementation should be a workspace shell with dockable panes, a command
-palette, a right-side context inspector, and explicit permission gates for agent
-operations. The Notion/GitHub integration should use a link graph rather than a
-naive bidirectional mirror: Notion remains the planning and intent surface, while
-repositories remain the implementation source of truth.
+The next deterministic-execution foundation is
+[#201 — Operation Catalog and typed execution harness](https://github.com/Joncallim/Forge/issues/201):
+agents select approved typed operations, while FORGE constructs, executes, and
+verifies the actual action.
 
-See [Forge Workspace roadmap](docs/workspace-roadmap.md) for the proposed
-implementation plan.
+## Current Boundaries
 
-## Screenshots
+Not built or intentionally deferred:
 
-### Setup Wizard
+- broad live MCP tool/credential grants for specialists;
+- general automatic branch, commit, PR, merge, or deployment authority;
+- parallel specialist execution;
+- fully autonomous QA, Reviewer, or Security gates;
+- arbitrary model-authored shell execution;
+- earned autonomy without verified historical evidence;
+- the full dockable Forge Workspace shell and link graph.
 
-![Forge setup wizard](docs/assets/gui/desktop-01-setup.png)
+Current execution paths can be disabled with explicit flags including:
 
-### Provider Review
+```text
+FORGE_WORKFORCE_MATERIALIZATION=0
+FORGE_WORK_PACKAGE_HANDOFF=0
+FORGE_WORK_PACKAGE_EXECUTION=0
+FORGE_HOST_REPOSITORY_WRITES=0
+FORGE_ACP_WORK_PACKAGE_EXECUTION=0
+```
 
-![Forge providers page after applying a preset](docs/assets/gui/desktop-02-providers.png)
+## Roadmap
 
-### Architect Plan Awaiting Approval
+The near-term order is deliberately reliability-first:
 
-![Forge task detail page awaiting approval](docs/assets/gui/desktop-03-task-awaiting-approval.png)
+1. finish and prove MCP admission under Epic #172;
+2. run focused end-to-end and failure testing;
+3. close observed safety, recovery, and operator-blocking bugs;
+4. add the deterministic Operation Catalog in #201;
+5. normalize execution outcomes and stop reasons in #185;
+6. continue the reliability and earned-autonomy work in Epic #184;
+7. resume broad Forge Workspace expansion after the trust layer is proven.
 
-### Completed Orchestrator Task
+See the [near-term execution roadmap](docs/near-term-roadmap.md) for exit criteria
+and the broader [product roadmap](docs/roadmap.md) for the long-form direction.
 
-![Forge task detail page after approval](docs/assets/gui/desktop-04-task-completed.png)
+## Visual Tour
 
-## Docs
+<table>
+  <tr>
+    <td width="50%">
+      <strong>Setup and provider configuration</strong><br><br>
+      <img src="docs/assets/gui/desktop-01-setup.png" alt="FORGE setup wizard">
+    </td>
+    <td width="50%">
+      <strong>Provider readiness</strong><br><br>
+      <img src="docs/assets/gui/desktop-02-providers.png" alt="FORGE providers page">
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <strong>Architect plan and approval</strong><br><br>
+      <img src="docs/assets/gui/desktop-03-task-awaiting-approval.png" alt="FORGE task awaiting approval">
+    </td>
+    <td width="50%">
+      <strong>Completed orchestration evidence</strong><br><br>
+      <img src="docs/assets/gui/desktop-04-task-completed.png" alt="FORGE completed task">
+    </td>
+  </tr>
+</table>
 
-- [Wiki overview](docs/wiki.md) - layman-readable overview mirrored into the Notion wiki.
-- [Operator guide](docs/operator-guide.md) - install, run, deploy, uninstall, and troubleshoot Forge.
-- [CLI architecture](docs/cli-command-architecture.md) - `forge` command taxonomy and routing.
-- [Developer guide](docs/developer-guide.md) - web app, worker, database, tests, prompts, and coding standards.
-- [Design guide](docs/design.md) - product model, UI principles, screenshot evidence, and visual QA notes.
-- [Visual identity](docs/brand.md) - logo meaning, component APIs, motion, status, accessibility, and asset generation.
-- [ACP and Zed connector](docs/acp-zed-connector.md) - how Forge talks to local ACP agents such as Codex CLI and Claude Code.
-- [GitHub issue intake](docs/github-issue-intake.md) - how Forge validates GitHub Issues before marking them ready for agent work.
-- [GitHub-native agent workflow](docs/workflows/github-native-agent-workflow.md) - issue-to-handoff-to-PR workflow for controlled agent work on GitHub.
-- [GitHub agent PR contract](docs/github-agent-pr-contract.md) - pull request body format used by generated agent work and the PR checker.
-- [GitHub agent run log](docs/github-agent-run-log.md) - durable run state stored on the dedicated run-log branch.
-- [Roadmap](docs/roadmap.md) - current beta status, Workforce architecture, Forge Workspace direction, and upcoming slices.
-- [Forge Workspace roadmap](docs/workspace-roadmap.md) - proposed implementation plan for dockable panes, browsers, Notion/GitHub linking, and permissioned agent operations.
-- [Architecture decisions](docs/adr/) - durable ADRs for major technical decisions.
+## Core Vocabulary
+
+| Term | Plain-English meaning |
+|---|---|
+| Dashboard | The browser UI where projects, providers, tasks, approvals, and evidence are managed. |
+| Project | A local or GitHub-backed repository FORGE can reason about. |
+| Task | A user objective submitted to FORGE. |
+| Architect | The planning agent that turns intent into a bounded plan and work packages. |
+| Work package | A durable, scoped unit of execution with role, capabilities, steps, and acceptance criteria. |
+| Harness | A reusable execution overlay describing prompts, tools, inputs, outputs, validation, and provider preference. |
+| Artifact | Persisted plan, evidence, output, finding, report, or log linked to a run. |
+| Approval gate | A human or policy checkpoint before work can progress. |
+| MCP admission | The policy decision that classifies and approves, defers, or blocks requested MCP capabilities. |
+| ACP provider | A local coding-agent CLI connected through Agent Client Protocol. |
+| Project Sentinel | Planned deterministic regression and workflow monitoring under Epic #184. |
+| Operation Catalog | Planned typed execution surface where agents request approved operations rather than arbitrary commands. |
+| Forge Workspace | Planned dockable workbench linking browser, repo, docs, terminals, GitHub, Notion, and task evidence. |
+
+## Documentation
+
+| Guide | Purpose |
+|---|---|
+| [Wiki overview](docs/wiki.md) | Plain-English product overview. |
+| [Operator guide](docs/operator-guide.md) | Install, configure, run, repair, deploy, and troubleshoot FORGE. |
+| [Developer guide](docs/developer-guide.md) | Web app, worker, database, tests, prompts, and implementation conventions. |
+| [Near-term roadmap](docs/near-term-roadmap.md) | Current execution order and exit criteria. |
+| [Product roadmap](docs/roadmap.md) | Broader beta, Workforce, and Workspace direction. |
+| [Visual identity](docs/brand.md) | Logo meaning, components, motion, status, accessibility, and generated assets. |
+| [Design guide](docs/design.md) | Product model, UI principles, screenshots, and visual QA. |
+| [CLI architecture](docs/cli-command-architecture.md) | `forge` command taxonomy and routing. |
+| [ACP and Zed connector](docs/acp-zed-connector.md) | How FORGE connects to Codex CLI and Claude Code. |
+| [GitHub-native workflow](docs/workflows/github-native-agent-workflow.md) | Controlled issue-to-handoff-to-PR workflow. |
+| [GitHub PR contract](docs/github-agent-pr-contract.md) | Required PR structure and acceptance-criteria evidence. |
+| [GitHub agent run log](docs/github-agent-run-log.md) | Durable GitHub workflow run state. |
+| [Forge Workspace roadmap](docs/workspace-roadmap.md) | Future dockable workspace and context-linking plan. |
+| [Architecture decisions](docs/adr/) | Durable technical decisions and safety boundaries. |
+
+## Repository Profile
+
+Suggested GitHub **About** description:
+
+> Local-first control plane for planning, executing, verifying, and governing AI coding agents with bounded context and human approval.
+
+Suggested topics:
+
+```text
+ai-agents  coding-agents  agent-orchestration  local-first  nextjs
+typescript  postgresql  redis  mcp  acp  developer-tools
+```
+
+The repository is public, but FORGE remains a rapidly evolving beta. Review the
+current boundaries and operator documentation before relying on it for important
+or sensitive work.
