@@ -134,20 +134,33 @@ file name, content excerpt, free-text reason, or credential.
 
 Required additive schema changes:
 
-- `projects.root_binding_revision BIGINT NOT NULL DEFAULT 1`, an internal opaque
+- `projects.root_binding_revision BIGINT NOT NULL DEFAULT 0`, where `0` is the
+  sole unbound/non-issuable state, plus an internal opaque
   `host_resource_ref`, authoritative opaque `host_id`, host-binding-key
   fingerprint, and a bounded `root_maintenance_state`
   (`none|deleting|repair_required`) with nullable UUID token and expected revision.
   `host_resource_ref` is an installation-keyed digest of the host ID plus the
-  platform-normalized canonical real path; it is never a packet field. Add
-  `deleted_at` and `deleted_by_user_id` tombstone fields. A partial unique index on
-  `(host_id, host_resource_ref) WHERE deleted_at IS NULL AND host_resource_ref IS
-  NOT NULL` rejects two live project records for one physical root, including
-  aliases, while allowing a safely released root to be reused;
+  platform-normalized canonical real path; it is never a packet field. Reuse the
+  existing `archived_at` as the one project-removal tombstone and add only bounded
+  `archived_by_user_id`/`archive_reason:'project_removed'` audit fields. A partial
+  unique index on `(host_id, host_resource_ref) WHERE archived_at IS NULL AND
+  host_resource_ref IS NOT NULL` rejects two live project records for one exact
+  physical root, including aliases, while allowing a safely released root to be
+  reused. There is no second `deleted_at` lifecycle;
+- durable `project_host_root_hierarchy_claims` for every live root and missing-root
+  reservation. Each owner stores one installation-keyed full-root reference and
+  the ordered installation-keyed references for every canonical ancestor prefix.
+  A deferred constraint trigger locks one host hierarchy-guard row and rejects a
+  candidate whose full reference equals another live owner's full/ancestor
+  reference or whose ancestor set contains another live owner's full reference.
+  Sibling roots may share ancestors; ancestor/descendant roots may not. Raw paths
+  and segment names never enter this table;
 - durable `project_host_root_reservations` for roots that do not exist yet. Each
   row stores authoritative host ID, binding-key fingerprint, canonical existing
   parent resource identity, platform-normalized missing suffix digest, random
-  reservation token, a restricted root-management-only planned path,
+  reservation token, exact root-writer instance ID and database-credential
+  generation for the current transition, hierarchy-claim owner ID, a restricted
+  root-management-only planned path,
   `planned|materialized|bound|cleanup_required`, created-object identity when
   available, and database times. The path is never packet evidence, a task event,
   or general API/log output. Its live unique key is the host, parent identity, and
@@ -169,6 +182,12 @@ Required additive schema changes:
 - nullable protocol-v2 `agent_runs.claim_worker_instance_id`, `claim_host_id`,
   `claim_host_resource_ref`, and `claim_root_binding_revision`; a created run copies
   the package pin exactly;
+- `tasks.unresolved_local_change_count INTEGER NOT NULL DEFAULT 0` plus nullable
+  canonical `local_change_barrier_fingerprint`. The atomic terminalizer,
+  acknowledgement, and quarantine paths derive this materialized claim barrier
+  from every sibling audit's exact host/repository review evidence while holding
+  the task and sibling package rows. A count/fingerprint mismatch is an integrity
+  hold, never a reason to proceed;
 - `filesystem_mcp_runtime_audits` fields:
   - `protocol_version`;
   - `grant_approval_id`;
@@ -183,11 +202,15 @@ Required additive schema changes:
   - delivery outcome;
   - a pre-submission repository baseline fingerprint and post-quiescence repository
     change result (`unchanged|changed|unverifiable`) with a fingerprint-bound
-    repository review (`not_applicable|review_required|reviewed|abandoned`);
+    repository review (`not_applicable|review_required|reviewed`); abandonment is
+    solely a separate integrity-quarantine resolution disposition;
   - post-submission effect intent (`not_started|active|quiesced`) with bounded stage,
     owning host ID, random fence token, and nullable host-apply ledger fingerprint;
   - host-apply recovery review (`not_applicable|review_required|reviewed`) bound to
     that exact ledger fingerprint; a recovery marker copies, never invents, it;
+  - nullable current recovery-worker instance ID, recovery token, and recovery
+    lease. These identify the fresh process performing stale recovery and never
+    replace the immutable claiming-worker pin;
   - terminal success/failure outcome and bounded failure code/stage, with database
     checks matching the normative tuple table below.
 - run-scoped `work_package_host_apply_ledgers` plus ordered entry rows. An entry
@@ -195,7 +218,7 @@ Required additive schema changes:
   `planned|applying|applied|unknown`, claim/fence identity, and database times;
   packet-owned evidence never copies its path or error detail;
 - append-only `filesystem_mcp_issuance_recovery_actions` with actor, typed action
-  (`acknowledge_possible_submission|retry_execution|resolve_after_allow_once_reapproval`),
+  (`review_local_changes|acknowledge_possible_submission|retry_execution|resolve_after_allow_once_reapproval`),
   prior runtime-audit/agent-run IDs, marker fingerprint, delivery state, nullable
   prior/authorizing root-binding revision, authorizing decision
   revision/coverage fingerprint/approval ID, database time,
@@ -209,6 +232,10 @@ Required additive schema changes:
   host-ledger fingerprint, host-review disposition, and one canonical
   sibling-evidence-set fingerprint. It records repository disposition
   `reviewed|abandoned`; omission is invalid.
+- append-only `forge_host_binding_key_rotations` with active and pending key
+  fingerprints/credential generations, one random rotation token, actor/time,
+  `preparing|rebinding|verified|promoted|rolled_back`, bounded batch checkpoints,
+  and a complete-set verification fingerprint. It never stores either key.
 
 Two separate partial unique indexes are required for protocol v2 `operation='context_packet'` rows:
 
@@ -241,8 +268,10 @@ and containment versions, and exact host-binding-key fingerprint equality. It pi
 the validated instance ID on the package. A caller cannot satisfy the trigger with
 host/version strings alone. One shared v2 package-claim
 primitive locks project → task → every sibling package in ascending ID order,
-recomputes dependency/candidate eligibility, proves no sibling is running or
-leased and none is `awaiting_review`, sets both
+recomputes dependency/candidate eligibility, rejects `projects.archived_at IS NOT
+NULL`, proves no sibling is running or leased and none is `awaiting_review`, and
+requires the locked task's unresolved-local-change count to be zero with no
+barrier fingerprint. It sets both
 `SET LOCAL forge.worker_protocol='2'` and
 `SET LOCAL forge.worker_instance_id='<registered-instance-id>'`; the trigger reads
 host, versions, and binding-key fingerprint from that locked registry row rather
@@ -305,16 +334,21 @@ package transition with zero repository reads.
 
 ### Durable project-root writer barrier
 
-An expand-phase trigger also covers project insert, any update of `local_path`,
-host binding, root-binding revision, root maintenance, or tombstone fields, and
-hard delete. It takes the epoch row in shared mode, after the project row when one
-exists. At epoch 1, a legacy create or repoint may preserve rollout compatibility
-only by clearing the nullable host binding, incrementing/invalidating the
-root-binding revision, and invoking S3's negative `project_root_repoint`
-reconciliation; it cannot leave a v2-issuable project. Legacy hard delete is
-allowed only at epoch 1 while v2 evidence production is disabled; the cutover
-drains that route before any immutable v2 evidence exists. At epoch 2, hard delete
-is rejected and the trigger requires
+The project-root trigger is enabled only inside the cutover maintenance window,
+after project-management ingress is disabled, the v1 database credential and
+sessions are revoked, old web/root-writer services are drained, and the canonical
+S3 TypeScript reconciler has processed every expansion-window root change. It
+never calls or duplicates that reconciler. While the epoch is still 1 it rejects
+every root-bearing project mutation and hard delete; ingress remains disabled, so
+this is a short activation barrier rather than a supported old-route mode.
+
+At epoch 2 the trigger covers any root-bearing project insert, any update of
+`local_path`, host binding, positive root-binding revision, root maintenance, or
+`archived_at`/archive audit fields, and hard delete. A rootless insert is the sole
+exception: `local_path`, host/resource/key binding, hierarchy owner, maintenance,
+and reservation fields must all remain null/`none`; it confers no filesystem
+authority. Attaching a root later is a full reservation/binding transition. Hard
+delete is always rejected. Every governed transition requires
 `forge.root_management_protocol='2'`, a transaction-local registered writer
 instance ID, maintenance/reservation token, authoritative host ID, resource ref,
 binding-key fingerprint, and a well-formed monotonic revision/tombstone transition.
@@ -324,13 +358,13 @@ credential-generation equality. Missing or malformed state
 fails before any database mutation.
 
 Activation's exclusive epoch lock serializes statement two with this trigger.
-An epoch-1 writer that wins first is visible to the fresh activation snapshot and
-leaves an unbound project that blocks cutover. If activation wins first, the stale
-writer wakes at epoch 2 and is rejected. The operational drain includes old web
-and root-management processes already past the trigger; rollback never restarts
-them. No trigger or transaction waits for an external namespace, resource, or
-containment fence: routes acquire it first with zero database locks, then set the
-validated token/settings and enter the database order.
+The trigger rejects root mutation until activation commits; after activation it
+accepts only registered v2 writers. The operational drain includes old web and
+root-management processes already past any database boundary; rollback never
+restarts them. No trigger or transaction waits for an external namespace,
+resource, hierarchy, or containment fence: routes acquire it first with zero
+database locks, then set the validated token/settings and enter the database
+order.
 
 The root-mutation trigger cannot undo filesystem work an old route performs before
 its database statement. Cutover therefore keeps project-management ingress
@@ -346,11 +380,30 @@ sandbox an unrelated host process with direct operating-system access.
 The installation host-binding key is operator-controlled secret material; only
 its stable fingerprint is stored in PostgreSQL. Missing or divergent same-host key
 material blocks registration, root management, activation, and claims. Backup is
-a required cutover artifact. Rotation or loss is an explicit maintenance event:
-disable issuance/root management, drain every instance, prove no live containment
-lease or effect, install the new key, recompute/rebind every live root under its
-namespace/resource fence, audit the old/new fingerprints, and reactivate. It is
-never a silent configuration replacement.
+a required cutover artifact. Rotation or loss is an explicit two-phase maintenance
+event; a normal root writer can never cross the active-key trigger by itself.
+The operator disables issuance and project ingress, revokes the active root-writer
+credential, drains every instance, and proves there is no live claim, reservation,
+containment lease, or effect. One exclusive transaction then creates a rotation
+row/token and records `active K1` plus `pending K2` and its pending credential
+generation without changing the active epoch key.
+
+Only a separately credentialed rotation command may use that token. With no
+database locks held it acquires the complete old/new hierarchy and resource-fence
+set in canonical order. Restartable bounded transactions lock affected project
+rows ascending → epoch → rotation instance → host hierarchy guard → reservations, compare-and-
+set K1 inputs, and write shadow K2 references/checkpoints; normal claims and root
+writers remain disabled and cannot observe shadow bindings as authority. After a
+complete-set scan proves every live project and reservation has exactly one K2
+shadow and no K1/K2 hierarchy collision, one transaction atomically promotes K2,
+its credential generation, and all verified shadows and marks the rotation
+`promoted`. Ingress credentials rotate only in that commit; registered K2 writers
+start afterward. Before promotion, a crash resumes from verified checkpoints or
+rolls back all shadows under the same token. After promotion, rollback to K1 is
+forbidden; recovery completes K2 activation. Root-binding revisions and grant
+decisions do not rotate because the physical root did not change; any identity
+mismatch instead becomes repair-required and revokes authority. It is never a
+silent configuration replacement.
 
 ## Lock order and claim transaction
 
@@ -363,6 +416,7 @@ project
   → grant approval/decision row(s ascending)
   → worker-protocol epoch
   → worker/root-writer instance row(s ascending)
+  → host root-hierarchy guard row
   → agent run(s ascending)
   → runtime audit(s ascending)
   → host-apply ledger(s) by run ID, then entries by ordinal
@@ -386,12 +440,18 @@ fence. No database transaction waits for an external fence, preventing a fence�
 cycle.
 
 Pre-create reservations are a disjoint transaction family serialized by the
-namespace fence. Planning/materialization locks only the reservation row. Final
-binding locks that reservation, inserts the new project, and marks the reservation
-`bound`; it acquires no task/package/approval/run rows. No entity-first path later
-locks a reservation, so this lifecycle cannot reverse the global entity order.
+prefix-aware namespace/hierarchy fence. After acquiring that fence with zero
+database locks, planning, materialization, cleanup, and final binding lock
+protocol epoch → exact fresh root-writer instance → host hierarchy guard →
+reservation. Every transition revalidates active host/key/protocol/freshness/
+drain state and exact root-writer credential generation, and compare-and-sets the
+reservation's writer-instance/generation pin. Final binding then inserts the new
+project, promotes the hierarchy owner, and marks the reservation `bound`; it
+acquires no task/package/approval/run rows. No entity-first path later locks a
+reservation. A stale, draining, unregistered, divergent-key, or wrong-generation
+writer fails before filesystem work and cannot clean up a newer owner's object.
 
-Live health checks and other network/system probes happen before the transaction and are not persistence inputs. Every current `ready → running` writer must call the shared protocol-v2 package-claim primitive. In every mode it locks project → task → all sibling packages ascending, recomputes candidate/dependency state under lock, proves no sibling has `running|awaiting_review` status or a live execution lease, and claims exactly one eligible package. The package status is the authoritative mandatory-review barrier; gate decisions change it only under the same package lock. This includes packet-free and handoff-only paths even when there is no MCP project snapshot. For a packet-bearing package, extend that same package/run claim transaction rather than creating an independent claim lifecycle:
+Live health checks and other network/system probes happen before the transaction and are not persistence inputs. Every current `ready → running` writer must call the shared protocol-v2 package-claim primitive. In every mode it locks project → task → all sibling packages ascending, recomputes candidate/dependency state under lock, rejects an archived project, proves no sibling has `running|awaiting_review` status or a live execution lease, and requires zero unresolved-local-change count plus a null barrier fingerprint. The package status remains the mandatory-review barrier; the task-local-change fields are the separate host/repository evidence barrier. Gate, acknowledgement, and quarantine decisions change them only under the same task/package locks and exact downstream evidence locks. This includes packet-free and handoff-only paths even when there is no MCP project snapshot. For a packet-bearing package, extend that same package/run claim transaction rather than creating an independent claim lifecycle:
 
 1. Lock project, task, and every sibling package row in global order; recompute
    eligibility, require `root_maintenance_state:'none'` plus a populated unique
@@ -476,9 +536,17 @@ the worker computes and persists a versioned opaque repository baseline
 fingerprint under both lease predicates. The baseline covers canonical relative
 entry identity, type, metadata, and content needed to detect tracked, untracked,
 renamed, and deleted changes; no path or content is exposed in packet evidence or
-public APIs. Failure to obtain a complete baseline stops before the ACP call as a
-preflight failure. Failure to obtain the post-call comparison after submission is
-`unverifiable`, never silently unchanged. The owner then CAS-persists
+public APIs. The scanner contract is versioned and bounded: it uses `lstat`, never
+follows symlinks, reads content only from regular files, represents links and
+special entries by bounded type/metadata, and never opens a FIFO, socket, or
+device. Exact versioned rules exclude `.git` internals and Forge's protected
+run-state directory while still including tracked, ignored, and untracked working-
+tree entries. File-count, per-file byte, total-byte, depth, and wall-time ceilings
+are persisted with the scanner version. Two matching ordered scans—or a platform
+snapshot with equivalent proof—are required for stability. Pre-submission churn,
+overflow, unsupported entry metadata, or any incomplete scan stops before the ACP
+call as `preflight_failed`. The same condition after possible exposure produces a
+bounded `unverifiable` comparison, never silently unchanged. The owner then CAS-persists
 `delivery.state:'submitting'` with a random `submissionAttemptId` and database-time
 `intentAt`. Only then may it perform external I/O. A
 definitive pre-acceptance transport rejection may become `submission_failed`; an
@@ -526,20 +594,32 @@ descendant quiescence. Packet-free and handoff-only execution must do the same
 whenever they read or mutate the local root. This is host-resource exclusion, not
 distributed filesystem fencing or an ACP sandbox.
 
-A dedicated host fence service, outside the worker's failure domain, owns the
-resource lock and a durable local lease record. A supported operating-system
-containment adapter places the Forge worker and separately addressable ACP,
-validation, and response-driven subtrees plus every descendant in one non-escapable
-lease group before
-any member can access the project. The adapter—not inherited descriptors,
-parent/child guesses, process names, or a best-effort process-group scan—proves
-whether that complete group is empty. Worker, control-channel, adapter, or service
-loss changes the durable lease to `orphaned`; database recovery and root management
-remain actionless. On restart, the service reacquires/retains the resource fence
-from durable state and may release it only after the adapter proves the group empty.
-A normal owner also waits for group emptiness before release. Protocol-v2 local
-execution is disabled on any host where a descendant can escape containment or
-emptiness cannot be proved.
+A dedicated host fence service, outside the queue worker's failure domain and
+running under a separate protected operating-system principal, owns the resource
+lock and durable local lease record. Its state directory and socket/API are not
+readable, writable, signalable, or callable by the worker/ACP principal except
+through the narrow authenticated client endpoint. Every request verifies kernel
+peer credentials plus an unguessable lease capability bound to run ID, current
+worker instance ID, root identity, and containment-group ID. Release always asks
+the kernel adapter for emptiness; it never trusts a caller's declaration. State
+tamper/corruption, peer mismatch, replay, cross-run/root token use, service death,
+or unverifiable adapter state marks the lease `orphaned|disabled` and blocks root
+reuse until protected-state recovery proves the exact group empty.
+
+The long-lived queue/control worker stays outside containment. For each run, the
+service creates an authenticated per-run execution child and places that child,
+ACP, validation, response-driven work, and every descendant in one non-escapable
+lease group before any member can access the project. The adapter—not inherited
+descriptors, parent/child guesses, process names, or a best-effort process-group
+scan—proves whether that complete per-run group is empty. On normal completion the
+child commits/quiesces the run, exits, and the service releases only after it
+independently observes the group empty; the queue worker need not exit. Execution-
+child, control-channel, adapter, or service loss changes the durable lease to
+`orphaned`; database recovery and root management remain actionless. On restart,
+the service reacquires/retains the resource fence from protected durable state and
+may release it only after the adapter proves the exact group empty. Protocol-v2
+local execution is disabled on any host where a descendant can escape containment,
+the protected service boundary is unavailable, or emptiness cannot be proved.
 
 This containment establishes liveness and resource exclusion only. It does not
 restrict ACP shell, network, credential, or filesystem permissions and is not a
@@ -553,44 +633,63 @@ is `not_started` and its host-apply ledger is empty. After a valid provider resp
 this stops later local stages and terminalizes with bounded
 `external_repository_change_requires_review`; submission-uncertain recovery keeps
 its delivery-specific primary cause but the same review barrier. A new run,
-acknowledgement, reapproval, retry, quarantine, or root-management operation cannot
-proceed until review is `reviewed` or an authorized abandonment binds the exact
-baseline/change evidence.
+reapproval, retry, unrelated acknowledgement, or root-management operation cannot
+proceed until review is `reviewed` or a privileged quarantine resolution records
+an authorized `abandoned` disposition. The exact fingerprint-bound
+`review_local_changes` acknowledgement that atomically changes `review_required →
+reviewed`, and the privileged exact quarantine transition, are the only actions
+allowed to cross this barrier; otherwise the barrier would block its own
+resolution.
 
 Project creation, root repoint, tombstone/delete, recursive filesystem cleanup,
 and every other root-management path participate in the same fence and writer-
 protocol contract. Existing candidate roots use their physical resource fence.
 A destination that does not exist first derives a namespace identity from the
 authoritative host, binding-key fingerprint, canonical existing parent physical
-identity, and platform-normalized missing suffix. The route acquires that namespace
-fence before `mkdir`, clone, or cleanup and inserts a random-token reservation in a
-short transaction. It retains the namespace fence through `planned → materialized`,
+identity, and each platform-normalized missing suffix segment. The hierarchy fence
+service takes shared locks on every strict canonical ancestor and an exclusive
+lock on the complete candidate root, shallow-to-deep with opaque references as the
+tie-breaker. Siblings may share ancestor locks; an ancestor/descendant pair
+conflicts in either acquisition order. The route acquires that hierarchy fence
+before `mkdir`, clone, or cleanup and inserts a random-token reservation plus its
+full/ancestor hierarchy claim in a short transaction. It retains the hierarchy
+fence through `planned → materialized`,
 derives/acquires the new physical resource fence, and atomically converts the
 reservation to the unique live project binding. A loser or crash recovery may
 delete only an object whose reservation token **and** recorded physical object
-identity still match; later path reuse or a mismatched object becomes
+identity still match and whose protected subtree has no other live reservation or
+binding. Later path reuse, a mismatched object, or any descendant claim becomes
 `cleanup_required`, never an unscoped recursive delete.
 
 Root-management paths discover current/candidate identities without retained
-database locks, acquire namespace/resource fences in opaque-reference byte order,
+database locks, acquire hierarchical namespace locks and resource fences in the
+canonical order above,
 then start a fresh top-down transaction. That transaction sets the epoch-2 writer
 instance/maintenance settings, revalidates the old binding and revision, enforces
-the live partial uniqueness constraint, and rejects mutation while any pinned
+the exact-root unique index plus the deferred no-ancestor/no-descendant hierarchy
+constraint, and rejects mutation while any pinned
 claim/lease, sibling `awaiting_review`, active effect, unproven containment
-quiescence, unresolved S4 marker, host-ledger review, or repository-change review
-remains. These barriers apply to terminal and nonterminal tasks. A normal marker
+quiescence, unresolved S4 marker, nonzero/mismatched task-local-change barrier,
+host-ledger review, or repository-change review remains. These barriers apply to
+terminal and nonterminal tasks. A normal marker
 must be resolved or its task explicitly cancelled without rewriting evidence.
 Cancellation acquires the complete applicable tail, requires quiescent effects and
 completed exact host/repository review, appends actor/reason audit, and retains
 every marker/audit/artifact.
 
-Create inserts the unique binding. Repoint atomically advances its revision/binding
+Create compare-and-sets unbound revision `0` to the next positive revision and
+inserts the unique hierarchy binding. Repoint atomically advances its revision/binding
 and invokes S3's `project_root_repoint` negative reconciler so old-root decisions
 become revoked before commit. Project deletion is a tombstone, never a cascading
-row delete: finalization sets `deleted_at`/actor, clears `local_path` and the live
-host binding, and releases the partial unique key while retaining the project
+row delete. After proving no live execution, mandatory review, effect, or exact
+local-change barrier, its top-down finalization atomically closes every nonterminal
+task/package with bounded reason `project_removed`, sets the existing
+`archived_at` plus actor/reason audit, clears `local_path` and the live host/
+hierarchy binding, and releases the partial unique key while retaining the project
 `rootRef`, tasks, packages, runs, audits, artifacts, actions, alerts, and resolutions.
-Normal queries hide tombstones; evidence/operator queries address them explicitly.
+Queue discovery, direct progression, sibling continuation, and every all-mode
+claim reject an archived project even if a stale wake remains. Normal queries hide
+tombstones; evidence/operator queries address them explicitly.
 A hard purge is forbidden until a separate retention/export architecture exists.
 Recursive cleanup first persists typed `deleting` maintenance intent, performs
 filesystem work outside the database transaction while retaining the fence, and
@@ -599,8 +698,9 @@ reacquires the same fence and either completes the exact intent or enters bounde
 manual repair; it never guesses. No path waits for an external fence while holding
 a database lock.
 
-This root-binding protocol closes path reuse: Project B cannot claim a root while
-Project A holds its resource fence, and the unique binding cannot move or be
+This root-binding protocol closes path reuse and overlap: Project B cannot claim
+the same, ancestor, or descendant root while Project A owns the hierarchy/resource
+fences, and the unique/hierarchy binding cannot move or be
 reused until A has no live pin, containment quiescence is proven, and every exact
 host/repository review or abandonment is complete. It also prevents a path edit or
 tombstone cleanup from changing the repository underneath a packet being assembled.
@@ -629,28 +729,39 @@ existing output-plan entry identity/ordinal. Exact paths remain in the separate
 authorized host-write/output evidence where already required for repository work;
 they never enter packet audit, marker, artifact, alert, API copy, or logs.
 
-The worker holds the resource fence through the atomic database finalizer, which sets
-the effect intent to `quiesced` in the same commit, then releases it. Stale
-recovery first proves that its authoritative current host ID exactly equals the
-locked work-package/agent-run host pin. For `active|quiesced`, it additionally
-requires equality with `effectIntent.hostId`; `not_started` has no intent host. A mismatch, missing/stale host
-registration, divergent binding key, insufficient containment capability, or
-unreachable owning host is alert-only: it cannot acquire a different host's local
-lock, terminalize, or expose an action. Same-host recovery asks the host fence
-service for the pinned durable lease **before** any entity row lock. Lock
-acquisition alone is never proof of quiescence: the containment adapter must prove
-the complete worker/ACP/validation/descendant group empty. Only then does recovery
-enter the canonical database order and reread the candidate. It may terminalize
-and expose a recovery marker only while holding that service lease; it maps
-leftover `applying` entries to `unknown`, fingerprints the final ledger state, and
-persists `quiesced` in that same transaction. An actionable marker requires
-effect intent `not_started|quiesced`, never `active`.
-If the containment group is nonempty/unverifiable, the service lease is orphaned,
-or the owning host is unavailable or mismatched, recovery changes no
-run/package/marker state, creates no retry action, emits one deduplicated bounded
-`post_submission_quiescence_unproven` integrity alert, and retries only on the
-authoritative owning host. Thus no actionable marker or later run can coexist with
-an in-flight stale host operation.
+The per-run execution child holds the resource fence through the atomic database
+finalizer. If local work began, that commit sets the effect intent to `quiesced`;
+a no-local-stage success truthfully remains `not_started`. The child then exits and
+the protected service releases only after independent per-run group emptiness.
+
+Stale recovery preserves the original claiming instance as immutable history but
+does not require that dead process to remain fresh. A candidate fresh worker W2
+first enters a short top-down transaction, proves its authoritative host ID equals
+the locked package/run pin, locks the epoch and both W1/W2 instance rows in
+ascending ID order, and requires W2 to be distinct, `active`, database-time fresh,
+same-host/key/protocol/fence/containment generation, and not draining. For
+`active|quiesced`, the pinned host must also equal `effectIntent.hostId`;
+`not_started` has no intent host. The transaction compare-and-sets the audit's
+current recovery-instance ID, random token, and database-time lease, then commits.
+No process may reuse W1's stable instance ID as W2.
+
+With no database locks held, W2 presents that run/instance/root/group-bound token
+to the protected fence service and asks for the pinned durable lease. Lock
+acquisition alone is never proof of quiescence: the adapter must prove the complete
+per-run execution group empty. W2 then re-enters the canonical database order,
+relocks W1/W2 ascending after the epoch, revalidates its freshness and recovery
+token/lease, and rereads the candidate. Only then may it terminalize and expose a
+recovery marker; it maps leftover `applying` entries to `unknown`, fingerprints the
+final ledger state, and persists `quiesced` when local work began. An actionable
+marker requires effect intent `not_started|quiesced`, never `active`.
+
+A wrong-host/key/capability W2, stale/draining/unregistered W2, same-ID takeover,
+nonempty/unverifiable group, orphaned service lease, or unavailable authoritative
+host is alert-only: recovery changes no run/package/marker state, creates no retry
+action, emits one deduplicated bounded `post_submission_quiescence_unproven`
+integrity alert, and retries only through a fresh instance on the authoritative
+owning host. Thus no actionable marker or later run can coexist with an in-flight
+stale host operation.
 
 The quiescence-alert insert is the sole path that does not own the resource fence. It
 never waits for that fence while holding database locks. After a bounded failed
@@ -734,7 +845,7 @@ type RepositoryChangeReview =
       reviewedByUserId: null;
     }
   | {
-      state: 'reviewed' | 'abandoned';
+      state: 'reviewed';
       baselineFingerprint: string;
       changeResult: 'changed' | 'unverifiable';
       changeFingerprint: string;
@@ -804,6 +915,38 @@ type PacketIssuanceRecoveryCommon = {
 };
 
 type PacketIssuanceRecoveryState =
+  | {
+      grantMode: 'allow_once';
+      deliveryState: 'submission_failed';
+      disposition: 'review_local_changes';
+      nextDisposition: 'reapprove_allow_once';
+      acknowledgedAt: null;
+      acknowledgedByUserId: null;
+    }
+  | {
+      grantMode: 'allow_once';
+      deliveryState: 'submission_uncertain' | 'submitted';
+      disposition: 'review_local_changes';
+      nextDisposition: 'review_then_reapprove_allow_once';
+      acknowledgedAt: null;
+      acknowledgedByUserId: null;
+    }
+  | {
+      grantMode: 'always_allow';
+      deliveryState: 'submission_failed';
+      disposition: 'review_local_changes';
+      nextDisposition: 'retry_execution';
+      acknowledgedAt: null;
+      acknowledgedByUserId: null;
+    }
+  | {
+      grantMode: 'always_allow';
+      deliveryState: 'submission_uncertain' | 'submitted';
+      disposition: 'review_local_changes';
+      nextDisposition: 'review_submission';
+      acknowledgedAt: null;
+      acknowledgedByUserId: null;
+    }
   | {
       grantMode: 'allow_once';
       deliveryState: 'not_exposed' | 'submission_failed';
@@ -890,11 +1033,12 @@ the baseline comparison detects or cannot exclude an ACP-originated change.
 |---|---|---|---|---|---|
 | Before any ACP call (`not_exposed`) | nonterminal or failed | `not_started` | no entries | `not_applicable` | `not_applicable + not_observed`; baseline may be null |
 | ACP attempted before an accepted valid response, including `submission_failed|submission_uncertain` | nonterminal or failed | `not_started` | no entries | `not_applicable` | `not_applicable` only when the complete baseline comparison is unchanged; otherwise `review_required|reviewed` |
-| Valid response persisted, before first Forge local stage | nonterminal, failed, or succeeded | `not_started` | no entries | `not_applicable` | `not_applicable` only when unchanged; otherwise `review_required|reviewed` |
+| Valid response persisted, before first Forge local stage | nonterminal or failed | `not_started` | no entries | `not_applicable` | `not_applicable` only when unchanged; otherwise `review_required|reviewed` |
 | Local stage executing or live finalizer retrying | nonterminal only | `active(stage)` | `planned|applying|applied`; never `unknown` | `not_applicable` | derived independently from baseline comparison after containment quiescence |
 | Caught local-stage failure | failed as `post_submission_execution_failed(failureStage)` | `quiesced(lastStage)` where `lastStage === failureStage` | no `applying`; may contain `unknown` when a completed replacement lacks a provable outcome write | `review_required` when host changes are applied or unknown, otherwise `not_applicable` | `review_required|reviewed` when changed/unverifiable, otherwise `not_applicable` |
 | Recovered failure after any local stage | failed with the deterministic recovery code | `quiesced(lastStage)` | no `applying`; may contain `unknown` | `review_required|reviewed` when any host change is applied or unknown | `review_required|reviewed` when changed/unverifiable, otherwise `not_applicable` |
-| Successful run | succeeded | `quiesced(lastStage)` | complete for a host-write plan, otherwise no entries; no `planned|applying|unknown` | `not_applicable` | `review_required|reviewed` when changed/unverifiable, otherwise `not_applicable` |
+| Successful run with no response-driven local stage | succeeded | `not_started` | no entries | `not_applicable` | `not_applicable + unchanged` only |
+| Successful run after one or more local stages | succeeded | `quiesced(actualLastStage)` | complete for a declared host-write plan, otherwise no entries; no `planned|applying|unknown` | `not_applicable` | `not_applicable + unchanged` only |
 
 No terminal row may coexist with `effectIntent.state:'active'`; `quiesced` is
 terminal-only. `not_started`
@@ -906,6 +1050,17 @@ Every nonempty ledger has one canonical fingerprint equal to the intent and any
 `review_required|reviewed` union. A reviewed fingerprint cannot authorize a
 different ledger. A failed row with `submitted` may remain `not_started` only when
 no local stage began; once a stage began, terminalization requires `quiesced`.
+Success is admitted only by the two explicit, disjoint success rows. A changed or
+unverifiable repository comparison can never succeed, even after review; it stops
+Forge local stages and terminalizes failed as
+`external_repository_change_requires_review`. A no-stage success never fabricates
+a `lastStage`.
+The same terminal transaction recomputes the locked task's unresolved-local-change
+count/fingerprint from every sibling audit. Review acknowledgement and privileged
+quarantine recompute it under the same top-down locks. Claim paths trust neither a
+stale count nor a marker alone: count/fingerprint disagreement is an integrity
+hold. Thus terminal package A can never leave packet, packet-free, or handoff-only
+sibling B claimable while A's exact host/repository review remains required.
 
 The migration installs same-row checks plus a deferred PostgreSQL constraint
 trigger that calls one versioned tuple-validation function across the audit,
@@ -935,9 +1090,10 @@ Delivery remains `submitted`, so recovery follows the possible-prior-work path a
 never automatically resubmits. A `host_apply` failure may have changed some files
 before it stopped. The packet audit records only the closed stage; existing
 repository/host-apply evidence remains the separate source for changed files.
-Operator acknowledgement covers both the prior external submission and possible
-partial local changes. The operator must inspect and resolve the working tree
-before choosing a new run; Forge never claims rollback.
+The exact `review_local_changes` action covers partial local changes; the separate
+`acknowledge_possible_submission` action covers prior uncertain/accepted external
+submission. Both must complete when both facts apply. The operator must inspect
+and resolve the working tree before choosing a new run; Forge never claims rollback.
 
 The failure code and local-change evidence are independent. If the process dies
 instead of returning a caught stage error, stale recovery may truthfully select a
@@ -964,15 +1120,20 @@ The packet keeps the existing assembly ceilings: `50` included files, `160 KiB` 
 
 ## Stale claim reconciliation
 
-`reconcileStaleFilesystemIssuanceClaims()` runs at startup and periodic recovery. Candidate discovery selects expired audit IDs without holding audit-row locks. For each candidate, a fresh transaction:
+`reconcileStaleFilesystemIssuanceClaims()` runs at startup and periodic recovery.
+Candidate discovery selects expired audit IDs without holding audit-row locks. It
+uses the fresh W2 selection/token, protected service handoff, and group-emptiness
+protocol above. Its terminalizing transaction:
 
 1. locks project → task → every sibling package in ascending ID
-   order → approval decision → worker-protocol epoch → exact pinned worker instance
+   order → approval decision → worker-protocol epoch → historical claiming and
+   current recovery worker instances in ascending ID order
    → agent run → runtime audit in global order;
 2. compare-and-sets only a still-`claiming` row whose lease is expired according to PostgreSQL `now()`;
 3. invalidates the token by the terminal status transition;
 4. fails the linked running agent run, clears only that run's `executionLease`, and moves the package to a structured issuance-recovery block;
-5. compare-and-sets task `running → approved` only when no other sibling retains
+5. derives the task's unresolved-local-change count/fingerprint from every sibling
+   audit and compare-and-sets task `running → approved` only when no other sibling retains
    a live execution lease or `awaiting_review` status; otherwise the task remains `running` and the marker is
    visible but has no action until the S4 task-state reconciler below makes it
    `approved`;
@@ -1056,8 +1217,9 @@ cross-project requests fail closed.
 Terminalizing the task never clears a repository-management barrier by itself.
 Any unresolved marker, host review, repository-change review, or mismatched
 sibling-evidence fingerprint blocks repoint, tombstone, cleanup, and path reuse for
-terminal as well as nonterminal tasks. Only the exact reviewed/abandoned resolution
-above satisfies that barrier.
+terminal as well as nonterminal tasks. A normal exact `reviewed` transition or the
+separate privileged quarantine disposition `abandoned` satisfies the matching
+fingerprint; task terminalization by itself does not.
 
 `reconcilePacketRecoveryTaskDisposition(taskId)` owns the sibling-convergence seam.
 It runs in a new top-down transaction after any sibling releases/terminalizes its
@@ -1081,6 +1243,13 @@ assembly + delivery + terminal status + failure code/stage together. Missing,
 mismatched, or terminal-success-plus-failure-marker evidence is a neutral,
 non-retryable integrity hold with no action. This matrix is normative:
 
+Before the grant/delivery row is actionable, review precedence applies. If either
+exact host-apply or repository-change review is `review_required`, the marker's
+only normal disposition/action is `review_local_changes`, independent of delivery
+or grant mode. It stores the deterministic `nextDisposition` from the table below.
+Only the matching fingerprint-bound action may change required reviews to
+`reviewed`; privileged quarantine is the only abandonment alternative.
+
 | Grant mode | Delivery at recovery | Disposition | Direct action |
 |---|---|---|---|
 | `allow_once` | `not_exposed|submission_failed` | `reapprove_allow_once` | fresh explicit grant/nonce through #178 |
@@ -1096,24 +1265,25 @@ a new run may proceed only if the canonical effective state remains approved fro
 the matching project-level always-allow decision. Recovery never rereads or
 reassembles a prior packet.
 
-Acknowledgement never changes immutable `deliveryState`. It sets database-time
-`acknowledgedAt`/actor and changes the disposition:
+No recovery action changes immutable `deliveryState`. `review_local_changes`
+requires at least one exact `review_required` host/repository fingerprint,
+attests that the operator inspected/resolved those local changes, atomically
+changes every matched review to `reviewed`, recomputes the task's materialized
+local-change count/fingerprint, and advances only to the stored
+`nextDisposition`. It does not acknowledge provider acceptance and requires no
+current grant coverage. `not_applicable` is valid only when the corresponding
+ledger/baseline proves no possible change. A definitive `submission_failed` can
+therefore complete local review before moving to direct reapproval/retry.
+
+Separately, `acknowledge_possible_submission` is valid only for
+`submission_uncertain|submitted` after all local-change reviews are complete. It
+sets database-time `acknowledgedAt`/actor and changes
 `review_then_reapprove_allow_once → reapprove_allow_once` or
-`review_submission → reviewed_submission`. If any host ledger entry is
-`applying|applied|unknown`, the marker carries `hostApplyReview:'review_required'`
-and its exact ledger fingerprint. The same acknowledgement explicitly attests that
-the operator inspected/resolved the working tree and changes that field to
-`reviewed`; no retry/reapproval is eligible while it remains required or the
-fingerprint changed. `not_applicable` is valid only when no host entry could have
-changed. Independently, detected or unverifiable ACP/repository changes carry
-`repositoryChangeReview:'review_required'`; the same acknowledgement must bind and
-complete its exact baseline/change fingerprint before any new authority or run is
-eligible. The request's marker fingerprint commits to both review fingerprints, so
-components add no free-form assertion field. That compare-and-set rotates the marker
-fingerprint to the digest of the newly acknowledged state; the action ledger keeps
-the prior request fingerprint for exact replay, while the next CTA carries the new
-fingerprint. A marker with acknowledged fields and any other disposition is
-invalid and fails closed.
+`review_submission → reviewed_submission`. The request marker fingerprint commits
+to delivery and every review fingerprint. Each compare-and-set rotates the marker
+fingerprint; the action ledger keeps the prior request fingerprint for exact
+replay while the next CTA carries the new fingerprint. A marker with acknowledged
+fields and any other disposition is invalid and fails closed.
 
 S4 owns the mutation behind these actions, suggested route:
 
@@ -1121,7 +1291,7 @@ S4 owns the mutation behind these actions, suggested route:
 POST /api/tasks/{taskId}/work-packages/{packageId}/packet-issuance-recovery
 {
   schemaVersion: 2,
-  action: retry_execution | acknowledge_possible_submission,
+  action: review_local_changes | retry_execution | acknowledge_possible_submission,
   priorRuntimeAuditId,
   markerFingerprint
 }
@@ -1129,7 +1299,7 @@ POST /api/tasks/{taskId}/work-packages/{packageId}/packet-issuance-recovery
 
 The route authorizes the operator, then locks project → task → every sibling
 package in ID order → current grant decision → protocol epoch → exact pinned
-worker instance → prior agent run → prior runtime audit → host-apply ledger and
+claim/recovery worker instances in ascending ID order → prior agent run → prior runtime audit → host-apply ledger and
 entries → all applicable prior-run artifacts in
 stable order (including the exact packet artifact) → any existing/new matching
 recovery-action row by unique key → applicable integrity alerts/resolutions →
@@ -1139,15 +1309,16 @@ artifact terminal tuples before reading the marker as actionable. Every action r
 `approved`, package `blocked`, a request whose task/package route owns the exact
 prior audit, the exact marker/prior-audit/delivery identity, and no active lease.
 It also requires no sibling `awaiting_review`, no unresolved
-host-effect/containment intent, and both
-host-apply and repository-change review states to be `not_applicable|reviewed` for
-any action that can enable a new claim.
+host-effect/containment intent. Both host-apply and repository-change review states
+must be `not_applicable|reviewed` for any action that can enable a new claim;
+`review_local_changes` and the privileged quarantine command are the two exact
+fingerprint-bound exceptions that may resolve their own barrier.
 It checks the append-only ledger by the complete versioned request identity before
 requiring the marker to remain present, so an exact replay still returns the
-recorded result after successful marker clearing. Acknowledgement deliberately
-does **not** require current grant
-coverage: the operator must be able to acknowledge an old ambiguous submission
-after the grant was revoked. It changes `allow_once` to
+recorded result after successful marker clearing. Neither local-change review nor
+possible-submission acknowledgement requires current grant coverage: the operator
+must be able to resolve old evidence after the grant was revoked. The latter
+changes `allow_once` to
 `reapprove_allow_once` and `always_allow` disposition to `reviewed_submission`,
 while keeping the package blocked.
 
@@ -1183,7 +1354,8 @@ snapshots the new decision. A missing, older, unknown, non-covering, or
 policy-changed decision returns `409` without mutation. A stale marker or
 mismatched prior audit also returns `409` without mutation.
 
-Every successful acknowledgement, retry, or one-time-reapproval resolution writes one append-only
+Every successful local-change review, possible-submission acknowledgement, retry,
+or one-time-reapproval resolution writes one append-only
 `filesystem_mcp_issuance_recovery_actions` row containing actor, action, prior
 audit/run IDs, marker fingerprint, immutable delivery state, nullable authorizing
 current decision revision/coverage fingerprint, prior/current root-binding
@@ -1319,11 +1491,14 @@ orderings and prove one coherent winner without deadlock.
 21. Existing-project backfill, old-writer inserts during cutover, and permitted
     path rename preserve the lifetime-stable opaque `rootRef`. Concurrent project
     create/repoint attempts for the same canonical root—including symlink, alias,
-    case, and filesystem-object variants—select one unique host-resource binding;
-    the loser fails closed before claim or repository reads.
+    case, and filesystem-object variants—and for ancestor/descendant roots select
+    one non-overlapping hierarchy binding; the loser fails closed before create,
+    recursive cleanup, claim, or repository reads.
 22. Every issuance failure persists `autoRetryable:false`; `always_allow`
     exposes `retry_execution` immediately only for
-    `not_exposed|submission_failed`. Post-intent states initially expose
+    `not_exposed|submission_failed` **and only when no local-change review is
+    required**. Any delivery with required host/repository review first exposes
+    `review_local_changes`. Post-intent states then expose
     `review_submission` with no retry; only the append-only acknowledgement may
     change disposition to `reviewed_submission`, after which the locked retry
     predicate may accept either the same decision or a newer decision that exactly
@@ -1359,15 +1534,16 @@ orderings and prove one coherent winner without deadlock.
 30. Every persisted terminal **failure** has exactly one `PacketFailureCode`;
     exhaustive valid and known-invalid assembly/delivery/terminal/code tuples prove
     the parser, SQL checks, API, and UI fail closed with no free-text copy.
-31. Epoch tests cover a genuinely pre-trigger process that must be operationally
-    drained and both bridge-trigger orderings under `READ COMMITTED`: v1 shared
+31. Package-epoch tests cover a genuinely pre-trigger process that must be
+    operationally drained and both package bridge-trigger orderings under `READ COMMITTED`: v1 shared
     first commits and forces activation to abort; activation exclusive first
     rejects v1 with zero repository reads. Packet, packet-free, and handoff-only v2
     claims all succeed after epoch 2 and persist protocol 2.
 32. Direct progress, sibling-completion continuation, and periodic readiness all
     encounter valid and malformed S4 markers. None calls generic promotion; only
     the exact S4 action/resolver clears the marker and makes the package ready.
-33. Every valid grant-mode/delivery/disposition/acknowledgement marker tuple parses;
+33. Every valid grant-mode/delivery/review-precedence/disposition/acknowledgement
+    marker tuple parses;
     every known-invalid cross-product is neutral and non-actionable. A successful
     acknowledgement rotates the marker fingerprint while an exact prior request
     still replays from the ledger.
@@ -1376,7 +1552,9 @@ orderings and prove one coherent winner without deadlock.
     preparation, and completion/review-gate preparation. Each case persists
     one exact `post_submission_execution_failed` stage, performs no second model
     submission, preserves separate host evidence, and requires acknowledgement of
-    possible prior and partial local work.
+    possible prior and partial local work. Local-change review and possible-
+    submission acknowledgement are separate typed actions and neither changes
+    immutable delivery.
 35. Seeded terminal/live splits prove exact audit/artifact tuple equality. Failed
     splits copy the immutable failure object; a fully evidenced success split
     reconstructs only the matching success transition; mismatched or incomplete
@@ -1407,6 +1585,9 @@ orderings and prove one coherent winner without deadlock.
     packet recovery, and its review decision in both orderings. Package locks keep
     task `running`, suppress recovery actions, and start no later specialist until
     mandatory review completes.
+    Repeat with terminal sibling host/repository `review_required`: the materialized
+    task barrier blocks all three claim modes and every repository read until exact
+    review or quarantine resolves the matching fingerprint.
 42. Duplicate action, exact replay, one-time resolution, success repair, and gate
     decision races acquire host ledgers/entries, all artifacts, action rows,
     integrity alerts/resolutions, and gates in the complete tail without deadlock.
@@ -1426,20 +1607,23 @@ orderings and prove one coherent winner without deadlock.
     orderings without deadlock. Crash after typed delete intent and after host
     cleanup is recovered exactly or enters bounded manual repair; no claim starts
     during maintenance.
-47. Kill the worker, host fence service, and control channel first, last, and
-    simultaneously while ACP/validation descendants close inherited descriptors,
+47. Kill the per-run execution child, queue worker, protected host fence service,
+    and control channel first, last, and simultaneously while ACP/validation descendants,
     use nested spawn/`setsid`/double-fork equivalents, and ignore normal
     termination. Recovery remains actionless until the operating-system
-    containment adapter proves the complete group empty. A different, missing,
-    stale, divergent-key, insufficient-adapter, or unreachable host registration
-    is alert-only and cannot terminalize.
+    containment adapter proves the complete per-run group empty. Normal success
+    releases without terminating the queue worker. A fresh same-host W2 is pinned
+    as recovery owner and locks W1/W2 ascending; a different, missing, stale,
+    divergent-key, insufficient-adapter, same-ID takeover, or unreachable W2 is
+    alert-only and cannot terminalize.
     Wrong-host recovery covers both `not_started` (run/package pin only) and
     `active|quiesced` (run/package pin plus intent host) without reading a field
     absent from the union.
 48. Exhaustive assembly/delivery/terminal/effect/ledger/host-review/repository-
     review fixtures prove the two normative tables, stage equality, fingerprint
-    equality, no terminal `active`, and no successful row with
-    `planned|applying|unknown`. PostgreSQL
+    equality, no terminal `active`, the disjoint no-local-stage/with-local-stage
+    success branches, success only with unchanged/not-applicable repository
+    evidence, and no successful row with `planned|applying|unknown`. PostgreSQL
     constraint, finalizer, repair, parser, API, and S5 results agree.
 49. Activation and every later claim reject zero, unregistered, multiple, stale,
     draining, incompatible, wrong-host, divergent-binding-key, and undrained
@@ -1454,17 +1638,21 @@ orderings and prove one coherent winner without deadlock.
     abandoned evidence. Stale, duplicate, unauthorized, or active-sibling attempts
     do nothing.
 51. Two create/clone requests race one nonexistent destination, alias/case forms,
-    and a symlinked parent. Crash at `planned`, materialized, physical-fence, and
+    a symlinked parent, and existing/nonexistent ancestor/descendant destinations
+    in both orderings. Crash at `planned`, materialized, physical-fence, and
     bind boundaries. Only the reservation winner creates/binds; cleanup requires
     matching token and physical object identity and never deletes a reused path.
-52. Tombstoning a normal and `quarantined_abandoned` project releases only the live
-    path/root unique binding. Every task, package, run, audit, artifact, action,
-    alert, resolution, and project `rootRef` remains queryable; hard delete fails.
-53. Legacy project POST/PUT/DELETE writers race activation immediately before and
-    after statement two. Epoch-1 repoint invalidates the binding; epoch-2 legacy or
-    malformed mutation fails before filesystem work or database change. During
-    cutover, disabled ingress plus v1 database-role revocation/connection termination
-    prevents a restarted old route from reading a path before its filesystem call.
+52. Archiving/tombstoning a normal and `quarantined_abandoned` project atomically
+    cancels every nonterminal task/package with `project_removed`, releases only
+    the live path/root hierarchy binding, and leaves every task, package, run,
+    audit, artifact, action, alert, resolution, and project `rootRef` queryable.
+    Queued wakes and all three claim modes do nothing; hard delete fails.
+53. Genuine legacy project POST/PUT/DELETE writers operate only before the cutover
+    maintenance barrier. Disabled ingress plus v1 database-role revocation/session
+    termination and service drain then prevent a restarted old route from reading
+    a path before filesystem work. The root trigger is enabled only afterward,
+    rejects root mutations while epoch 1, and accepts only registered v2 writers
+    after exact activation; it never calls the S3 TypeScript reconciler.
     New writer routes prove the exact registered instance, credential generation,
     and maintenance/reservation token.
 54. Seed legacy approvals with no root-at-decision evidence, including repoint and
@@ -1472,12 +1660,36 @@ orderings and prove one coherent winner without deadlock.
     reapproval on the locked current revision is required.
 55. An ACP runtime changes the repository before Forge's first local stage and
     then succeeds, fails, or leaves submission uncertain. Changed or unverifiable
-    baseline comparison requires exact review and blocks acknowledgement, retry,
-    reapproval, new run, quarantine, repoint, tombstone, and path reuse.
+    baseline comparison can never succeed, requires exact review, and blocks retry,
+    reapproval, new run, repoint, tombstone, and path reuse. Only the exact
+    `review_local_changes` or privileged quarantine transition may cross its own
+    fingerprint barrier.
 56. Host-binding-key backup/rotation disables issuance/root management, drains all
-    instance kinds, proves containment/effects quiescent, rebinds every live root,
-    audits old/new fingerprints, and reactivates. Missing/divergent key material
-    can never claim, create, repoint, recover, or delete.
+    instance kinds, proves containment/effects/reservations quiescent, creates
+    active-K1/pending-K2 rotation state, crash-tests every shadow-rebind batch and
+    complete-set verification, and atomically promotes K2/credentials before
+    reactivation. No mixed set or simultaneous K1/K2 authority becomes visible.
+57. Reservation planning, materialization, cleanup, and binding lock epoch → exact
+    fresh root-writer instance → hierarchy guard → reservation. Activation, drain,
+    and rotation races reject stale, draining, unregistered, wrong-key, or wrong-
+    generation writers before filesystem work and after materialization.
+58. Rootless `localPath:null` project creation succeeds after epoch 2 only with the
+    complete binding/maintenance set null and grants no filesystem authority.
+    Partial state fails; later local-root attachment uses the full reservation and
+    hierarchy protocol.
+59. The versioned repository scanner never follows symlinks or opens FIFO/socket/
+    device entries, remains within file/byte/depth/time bounds for huge/churning
+    trees, fails preflight before exposure when baseline proof is impossible, and
+    produces post-exposure `unverifiable` plus exact review otherwise.
+60. Unauthorized service socket calls, peer mismatch, state mutation/deletion,
+    service `SIGKILL`, stale/cross-run token replay, and corrupt-state restart never
+    release or reuse a root; they create protected orphaned/disabled state.
+61. `submission_failed + changed|unverifiable` in both grant modes first exposes
+    only `review_local_changes`; after exact review, immutable delivery remains
+    `submission_failed` and the correct reapprove/retry action becomes eligible.
+62. Unbound revision `0`, initial binding, legacy expansion-window path changes,
+    and repoint-away/back strictly increase by compare-and-set; no command resets
+    a revision or makes a legacy decision issuable.
 
 Real PostgreSQL owns transaction, lock, lease, migration, index, and failure-injection evidence. Lease tests compare against database time, not a fake worker clock. #181 composes a small cross-slice sentinel set from these tests instead of maintaining a second policy implementation.
 
@@ -1486,16 +1698,19 @@ Real PostgreSQL owns transaction, lock, lease, migration, index, and failure-inj
 The claimed uniqueness guarantee is valid only after legacy packet issuers are drained. Deployment order is therefore part of the architecture:
 
 1. **Expand schema.** Add a nullable project `root_ref` UUID with
-   `DEFAULT gen_random_uuid()` and a unique index; additive root-binding revision,
+   `DEFAULT gen_random_uuid()` and a unique index; additive root-binding revision
+   with explicit unbound default `0`,
    opaque host-resource/host identity and binding-key fingerprint,
-   root-maintenance/tombstone fields, the live-only partial uniqueness constraint,
-   pre-create reservation table, and typed worker/root-writer
+   root-maintenance/archive audit fields, the live-only partial uniqueness and
+   hierarchy-claim/guard constraints, pre-create reservation table with writer
+   pins, task-local-change barrier fields, key-rotation rows, and typed worker/root-writer
    capability/heartbeat registry;
    nullable protocol-v2 nonce/revision/claim/snapshot fields, the exact partial
    indexes, host-apply ledger/entries, append-only issuance-recovery action and
    integrity alert/resolution tables with their unique keys, the protocol epoch
-   singleton, package claim-protocol/instance columns, repository baseline/change
-   evidence, and rejecting package-transition plus project-root-mutation triggers. New
+   singleton, package claim-protocol/instance/recovery columns, repository baseline/change
+   evidence, and the rejecting package-transition trigger. Do **not** enable the
+   project-root trigger while legacy project routes remain live. New
    projects receive a random reference at creation. Backfill existing
    projects in bounded, restartable batches with database-generated random UUIDs.
    Keep the default through the whole mixed-version window so an old project writer
@@ -1505,15 +1720,10 @@ The claimed uniqueness guarantee is valid only after legacy packet issuers are d
    synthetic nonces. Do not reinterpret required legacy zero/default audit
    columns as a truthful packet snapshot.
    `host_resource_ref` remains nullable during expansion because PostgreSQL cannot
-   safely canonicalize host filesystems. The checked-in host command
-   `npm run project-roots:bind-v2 -- --actor <operator-id>` defaults to a dry run;
-   `--apply` derives/fences each root outside database locks and compare-and-sets
-   its host ID/reference/binding-key fingerprint/revision. It binds the project
-   only and never writes a root revision into a legacy approval. Duplicate/alias
-   collisions remain unbound with
-   an audited blocker until the operator repoints or tombstones one project. It never
-   invents uniqueness or rewrites `rootRef`. The layman-readable procedure is
-   `docs/operators/project-root-binding-v2.md`.
+   safely canonicalize host filesystems. Install the dry-run-only form of the
+   checked-in host command and layman-readable procedure
+   `docs/operators/project-root-binding-v2.md`; applying it is a post-drain cutover
+   step below, never a live legacy bridge.
 2. **Deploy dual readers.** Readers understand v1 and v2. Every legacy filesystem
    approval without a stored root-binding revision is non-issuable and requires
    explicit reapproval; current-path inspection is never historical authority.
@@ -1522,14 +1732,23 @@ The claimed uniqueness guarantee is valid only after legacy packet issuers are d
 3. **Deploy v2 writers disabled.** New workers can write/read v2, while the durable
    epoch remains 1 and packet issuance stays disabled. Verify every package claim
    mode uses the shared protocol primitive and traverses the `running`-transition
-   trigger before executor work. Verify every root-management route uses the
-   namespace/resource fence and root-mutation trigger; epoch-1 legacy changes must
-   invalidate binding rather than preserve apparent v2 eligibility.
+   trigger before executor work. Deploy the v2 root routes and protected fence/
+   containment services disabled. Continue recording expansion-window project
+   changes for the later canonical S3 reconciliation; no PostgreSQL trigger calls
+   TypeScript or attempts project → epoch → task locking.
 4. **Drain legacy issuers and root writers.** Disable project-management ingress;
    stop and drain every worker or web/
    management process already past a new trigger, including genuine pre-trigger
    processes; revoke the v1 web database role/credential and terminate its sessions.
    A process-local flag alone is not proof that another old process is absent.
+   Under the canonical S3 order, reconcile every project changed during expansion.
+   Then run
+   `npm run project-roots:bind-v2 -- --actor <operator-id> --apply`; it derives and
+   hierarchy-fences roots outside database locks, compare-and-sets host/key/
+   hierarchy state and the next positive revision, and never upgrades legacy
+   approvals. Duplicate, alias, ancestor/descendant, or unbound rows remain held.
+   With ingress still disabled, enable the project-root trigger; at epoch 1 it
+   rejects root mutation rather than invoking S3.
 5. **Cut over.** Start only v2-capable workers, verify no v1 claim remains, then
    run the checked-in `web` maintenance command
    `npm run protocol:activate-work-package-v2 -- --actor <operator-id>`. Its
@@ -1548,12 +1767,17 @@ The claimed uniqueness guarantee is valid only after legacy packet issuers are d
    authoritative host identity, drain evidence, or runbook is a cutover blocker.
    It records the new root-writer credential generation and exact v2 ingress owner;
    only after commit may project-management ingress be enabled. It also requires
-   every live local project to have a non-null unique root
-   binding/fingerprint, no root-maintenance intent or unresolved reservation, and
+   every live local project to have a positive non-overlapping root
+   binding/fingerprint, no root-maintenance intent or unresolved reservation/
+   rotation, and
    retained audit from the binding command. Legacy approvals remain held.
-   Use that command to advance the durable epoch to 2 before enabling v2 grant writes and packet
-   issuance. Shared-first v1 causes activation to abort; activation-first rejects
-   stale v1 before repository reads.
+   Run exactly
+   `npm run protocol:activate-work-package-v2 -- --actor <operator-id> --apply` to
+   advance the durable epoch;
+   `project-roots:bind-v2` never does so. Only after activation commits may the
+   operator enable registered S3/root writers and project ingress. Enable packet
+   issuance last. Shared-first v1 package claims cause activation to abort;
+   activation-first rejects stale v1 package claims before repository reads.
 6. **Scrub legacy paths.** After epoch-2 activation durably proves cutover, #179
    runs a separately gated, bounded, restartable post-drain operation/later-release
    migration—not an expansion migration already registered with the ordinary
