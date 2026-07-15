@@ -26,6 +26,15 @@ after the package execution step, repository-affecting files are applied to the 
 Branches, commits, pull requests, merges, live specialist MCP grants,
 autonomous reviewer agents, and parallel specialists are still future work.
 
+The protected local-execution protocol designed in Epic #172 is also future work.
+Its first release target is Ubuntu 24.04 with Linux 6.8 or newer because it depends
+on cgroup v2, systemd scopes, separate run users, and kernel-verified Unix-socket
+identity. The current beta installer still supports macOS and Linux as described
+below, but a future #172 activation must refuse unsupported hosts and leave them on
+the clearly labelled legacy/pre-cutover stream; it must not silently disable local
+work or claim the new containment guarantee. Operators may migrate to a supported
+Linux host or wait for a separately reviewed macOS adapter.
+
 ## Install
 
 From the repository root:

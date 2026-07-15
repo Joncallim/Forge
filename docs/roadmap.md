@@ -564,6 +564,16 @@ Current install hardening:
 - Install record so uninstall avoids removing user-owned packages.
 - Safe uninstall by default.
 
+Planned Epic #172 compatibility boundary:
+
+- Keep today’s macOS/Linux beta install path distinct from the future protected
+  local-execution protocol.
+- Release-gate that protocol first to Ubuntu 24.04/Linux 6.8+ hosts that pass the
+  cgroup/systemd/separate-user/socket preflight.
+- On macOS, Windows, same-user development, or an unsupported container, refuse
+  protocol-v2 activation, retain a truthful legacy/pre-cutover state, and explain
+  migration or adapter options. Never claim the Linux containment guarantee.
+
 Future terminal installer goals:
 
 - Explain each install step in plain English.
