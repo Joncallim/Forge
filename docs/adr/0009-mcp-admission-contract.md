@@ -949,8 +949,11 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   A root repoint increments that separate revision and calls the same negative
   reconciler, so old-root project/package decisions become `revoked` and the new
   repository requires explicit reapproval. Stable packet `rootRef` correlation is
-  never authority. Initial backfill may bind existing approval to revision 1 only
-  after the checked-in host procedure proves the canonical root unchanged;
+  never authority. Initial backfill may bind the project to revision 1 only; it
+  never upgrades an existing approval because no legacy row contains immutable
+  root-at-decision evidence. Every legacy decision without a stored binding
+  revision remains non-issuable until explicit reapproval on the current locked
+  binding. A current-path comparison cannot manufacture historical authority;
   unbound or duplicate roots fail closed.
 - **Package-local `allow_once`.** An unconsumed one-time decision can approve only
   its package. Denial, one-time approval, nonce rotation/consumption, and
@@ -973,7 +976,7 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   ```
 
   S3 normally stops at approval. #179 owns the complete suffix: grant approval →
-  worker-protocol epoch → agent runs ascending → runtime audits ascending →
+  worker-protocol epoch → worker-instance rows ascending → agent runs ascending → runtime audits ascending →
   host-apply ledgers/entries by run and ordinal → all artifacts by stable key →
   issuance-recovery actions by unique key → integrity alerts/resolutions by stable
   key → review-gate rows ascending. S3 does not acquire the epoch row. Candidate discovery may
@@ -1002,8 +1005,8 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   reapproval rotates a fresh nonce under project → task → packages in ID order →
   approval locks, it calls S4's package-scoped resolver in the same transaction.
   Package scope limits grant evaluation; the resolver still locks siblings for
-  the task-wide review barrier, then continues through prior run → audit → host
-  ledger/entries → all artifacts → recovery actions → integrity
+  the task-wide review barrier, then continues through protocol epoch → exact
+  worker-instance row → prior run → audit → host ledger/entries → all artifacts → recovery actions → integrity
   alerts/resolutions → review gates. It proves canonical typed audit/artifact
   terminal-tuple equality, verifies the exact terminal prior claim,
   `reapprove_allow_once` marker/fingerprint, changed nonce, current policy, no
@@ -1018,10 +1021,11 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   serialized result: either #179 claims first under its fence, or S3 holds before
   claim. Generic packet/execution failure never burns or recreates an approval.
 - **Mixed-version rollout.** Ship additive nullable decision/root-binding fields
-  and the dual v1/v2 reader before v2 writers. Approval without proven binding is
-  non-issuable. After #179's checked-in host procedure proves an unchanged
-  canonical root, compatible legacy approvals may bind to revision 1;
-  collision/unbound rows remain held. Then drain old workers or protocol-gate claims because
+  and the dual v1/v2 reader before v2 writers. Every approval without a stored
+  binding revision is non-issuable. #179's checked-in host procedure binds only
+  the project to the current canonical root and revision 1; it never upgrades a
+  legacy approval. Collision/unbound rows and all legacy decisions remain held
+  until explicit reapproval. Then drain old workers or protocol-gate claims because
   an old orchestrator can misread the new operator-hold marker as task failure. Enable
   S3 revision writers/holds/reconciliation before #179 issuance producers and
   #180/#181 consumers. Rollback disables writers/new claims but retains schema and
