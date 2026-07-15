@@ -991,7 +991,8 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   `packet_issuance` marker in its project reconciler. After a package-local
   reapproval rotates a fresh nonce under project → task → package → approval
   locks, it calls S4's package-scoped resolver in the same transaction. S4
-  continues to prior run → audit, verifies the exact terminal prior claim,
+  continues to prior run → audit → exact packet artifact, proves canonical typed
+  audit/artifact terminal-tuple equality, verifies the exact terminal prior claim,
   `reapprove_allow_once` marker/fingerprint, changed nonce, current policy, and no
   active lease, then clears only its packet marker and moves `blocked → ready`.
   Stale/double/policy-drift races are compare-and-set misses; Redis wakes only
