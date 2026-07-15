@@ -965,6 +965,19 @@ node; and any substitution of one graph, edge set, or evidence for the other.
   symbol. The Step 0 fixture proves both files exist and validates the first node's
   exact owner, build identity, and route/full-ingress-close/drain/foreign-key/guard
   evidence before permitting `s3_issue_178`.
+- Before recording its own graph receipt, Step 0 also solely installs the generic
+  pinned Ed25519 signer policy/key and audit, append-only immutable durable-release-
+  evidence store, separate append-only short-lived
+  `forge_epic_172_transition_authorizations` attempts in a distinct Ed25519
+  signature domain, append-only consumption ledger, checked-in verifier/recorder/
+  consumer, dedicated certificate-authenticated `NOINHERIT` recorder/consumer/
+  transition principals, canonical transition-identity uniqueness, and the
+  disabled enablement singleton. The bootstrap is not a graph node and creates no
+  unsigned receipt. Once validly recorded, graph-node and required-evidence
+  receipts are immutable durable predecessors and do not expire; state transitions
+  separately require a fresh exact unexpired authorization attempt with lifetime
+  greater than zero and at most 30 minutes. S3 and remaining S4 import this
+  substrate unchanged and do not create or widen it.
 
 ### S3 — Filesystem grant recovery (deterministic, recoverable)
 
@@ -1158,6 +1171,20 @@ node; and any substitution of one graph, edge set, or evidence for the other.
   fingerprint races retry from locked state. A revocation/handoff race has one
   serialized result: either #179 claims first under its fence, or S3 holds before
   claim. Generic packet/execution failure never burns or recreates an approval.
+- **Authorized S3 completion.** S3's final installation/state transaction locks
+  and reverifies the durable `step0_retention_bridge` receipt, signer policy/key,
+  canonical transition identity, exact predecessor set, consumption keys, and one
+  fresh exact signed `forge_epic_172_transition_authorizations` attempt in its
+  distinct Ed25519 signature domain. The attempt binds target `s3_issue_178`,
+  source receipt, exact owner/build/reviewed SHA/epoch-or-none, operation/controller
+  identity, nonce, and expiry. At its final state-changing statement,
+  `clock_timestamp()` must prove the attempt unexpired and unconsumed. The
+  transaction atomically appends predecessor consumption, commits S3 final state,
+  and records the canonically unique durable signed `s3_issue_178` receipt; rollback
+  removes all three. An expired unused
+  attempt remains audit-only and may be replaced by a newly signed exact attempt
+  without rewriting durable evidence. A consumed/replayed attempt or a different
+  attempt for the same completed canonical transition cannot advance state.
 - **Mixed-version rollout.** The `runtimeActivationGraph` graph is the complete ten-node
   chain above; it does not stop at producer disablement or activation and cannot be
   replaced by `codeDependencyGraph`. #179 Step 0 is separately landable. It disables
@@ -1169,11 +1196,17 @@ node; and any substitution of one graph, edge set, or evidence for the other.
   `web/lib/mcps/epic-172-release-order.ts` validator. Neither file imports S3 or
   remaining-S4 symbols. The Step 0 fixture proves the files and first-node route,
   full-ingress-close, drain, retention-FK, hard-delete-guard, owner, and exact-build
-  postconditions before permitting `s3_issue_178`.
+  postconditions before permitting `s3_issue_178`. Before that first receipt, Step
+  0 also installs the generic pinned-signer durable-evidence store, separate
+  append-only short-lived `forge_epic_172_transition_authorizations` store in its
+  distinct Ed25519 signature domain, consumption ledger, verifier/principal,
+  transition-identity, and disabled-enablement substrate described above.
 
   Project-management ingress remains closed while #178 imports the validator,
-  addresses and records only `s3_issue_178`, ships additive nullable decision/root-
-  binding fields and the dual v1/v2 reader, and passes S3 database tests. It remains
+  ships additive nullable decision/root-binding fields and the dual v1/v2 reader,
+  and passes S3 database tests. S3 then uses the one authorized final transaction
+  above to consume the durable Step 0 predecessor with a fresh exact unexpired
+  attempt and record only `s3_issue_178`. It remains
   closed while remaining S4 first adds nullable `root_ref` with no default, then the
   database-owned explicit-null insert bridge, omitted-value default, non-null-to-
   null update guard, and expand-phase monotonic project-root change journal/trigger,
@@ -1246,7 +1279,12 @@ node; and any substitution of one graph, edge set, or evidence for the other.
   A release-order fixture first proves #179 Step 0 solely owns and has checked in
   the data-only `web/lib/mcps/epic-172-release-order-v1.json` and the one
   `web/lib/mcps/epic-172-release-order.ts` validator, with no S3 or remaining-S4
-  import. It validates the first node's full Step 0 postconditions before S3. It
+  import. It also proves Step 0 installs the generic signer/durable-evidence store,
+  separate append-only short-lived `forge_epic_172_transition_authorizations`
+  store in its distinct Ed25519 signature domain, consumption ledger, checked-in
+  verifier/recorder/consumer, dedicated principals, canonical transition identity,
+  and disabled enablement singleton before its own receipt and S3. It validates the
+  first node's full Step 0 postconditions before S3. It
   proves one shared node registry stores owner, required evidence, and exact build
   identity once; separately named `codeDependencyGraph` and `runtimeActivationGraph` edges
   preserve their fixed meanings; and only `runtimeActivationGraph` contains the complete
@@ -1263,6 +1301,15 @@ node; and any substitution of one graph, edge set, or evidence for the other.
   activation green; reject enablement before post-activation green; reject release
   readiness before enablement; and reject substituting either graph, edge set,
   evidence, or build identity for the other.
+  A delayed-transition fixture waits more than 30 minutes after valid Step 0
+  receipt recording and rotates the signer policy/key: durable predecessor evidence
+  remains valid, but an expired authorization attempt cannot advance S3. It proves
+  a newly signed exact replacement attempt can authorize the still-pending S3
+  transition without duplicating either durable node; replay, wrong binding/domain,
+  final-statement expiry, and concurrent double consumption fail closed. Failure
+  injection after every verification/consumption/state/receipt write rolls back all
+  S3 effects and leaves retry possible only with a still-valid or newly signed exact
+  attempt.
   #181 owns
   the cross-slice failure and rollout regression matrix;
   #180 renders historical decision, current effective state, and packet evidence
