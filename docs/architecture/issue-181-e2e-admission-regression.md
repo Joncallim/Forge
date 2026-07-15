@@ -173,6 +173,8 @@ exact coverage fingerprint.
 - claim versus reapproval follows lock order;
 - stale lease recovery invalidates token and never reopens nonce;
 - delayed stale owner cannot begin later governed reads or finalize;
+- normal handoff stale-running recovery delegates packet-bearing v2 runs to the
+  unified S4 transaction and never writes a competing generic stale marker/event;
 - reapproval rotates nonce;
 - success and failure each yield exactly one typed packet metadata artifact;
 - post-assembly snapshot is durable before exposure;
@@ -180,6 +182,11 @@ exact coverage fingerprint.
 - artifact has counts/opaque `rootRef`/redaction only, no root path,
   names/paths/content;
 - concurrent finalizers respect partial unique index.
+- one committed packet claim makes at most one external model/ACP submission; an
+  accepted but Forge-invalid response does not trigger the existing automatic
+  correction loop;
+- a v1 audit writer held across durable epoch-2 activation is rejected before any
+  bounded repository read;
 
 Tests must state the actual guarantee: cooperative one-winning-claim and best-effort delivery, not cryptographic recall of bytes or in-flight I/O.
 
@@ -210,11 +217,14 @@ means a one-time decision nonce can be replaced only by explicit reapproval.
 | Assembly complete, before exposure | package S4 `blocked`; task `approved` | claim terminal failed; one-time nonce burned | staged `assembly.state:'assembled'`; terminal failed audit + one artifact with delivery `not_exposed` and truthful counts/rootRef | terminal evidence transaction may retry; no packet replay | `allow_once`: reapprove; `always_allow`: explicit `retry_execution` if coverage matches |
 | Durable `submitting` intent, crash before/around ACP call | package S4 `blocked`; task `approved` after lease recovery | claim terminal failed; one-time nonce burned | staged assembly; recovery maps delivery to `submission_uncertain`; run/audit failed + one artifact | no submission replay | acknowledge possible prior work; then reapprove one-time or explicitly retry always-allow under current coverage |
 | Transport proves pre-acceptance rejection | package S4 `blocked`; task `approved` | claim terminal failed; one-time nonce burned | delivery `submission_failed`; run/audit failed + one artifact | no packet auto-retry | `allow_once`: reapprove; `always_allow`: explicit `retry_execution` if coverage matches |
+| Transport accepts response, Forge validation rejects it | package S4 `blocked`; task `approved` | claim terminal failed; one-time nonce burned | exactly one external prompt call; delivery `submitted`; failed run/audit + one artifact | no correction submission on this packet claim | acknowledge accepted submission, then grant-mode action |
 | Transport accepted/returned, crash before outcome persistence | package S4 `blocked`; task `approved` after recovery | claim terminal failed; one-time nonce burned | recovery uses `submission_uncertain`; one failed run/audit and one artifact | no submission replay | acknowledge possible prior work before any new decision/run |
 | `submitted` persisted, crash before finalization | package S4 `blocked`; task `approved` after recovery | claim terminal failed; one-time nonce burned | delivery remains `submitted`; failed run/audit + one artifact | no submission replay | acknowledge prior submission before any new decision/run |
 | Terminal audit + artifact transaction fails | package/run stay under the preterminal claim until recovery, then package S4 `blocked`; task `approved` | claim remains `claiming` until top-down sweeper wins; nonce stays burned | both terminal audit and artifact writes roll back; staged assembly/delivery remain; sweeper commits both atomically | automatic terminal-evidence retry only | row-specific action only after atomic terminal state exists |
 | Redis wake fails after grant/recovery action | committed package `ready`; task `approved` | unchanged | unchanged | periodic database sweep re-enqueues; duplicate wakes harmless | none |
+| Always-allow packet block, then project grant revoked/restored | package remains S4 `blocked` until explicit retry; task `approved` | prior claim remains terminal; new decision has a greater revision | prior run/audit/artifact immutable; recovery action records the authorizing new revision; new run later snapshots it | none while uncovered; no automatic retry after restore | grant control while uncovered; after exact restore, explicit retry (and prior-submission acknowledgement first when required) |
 | Worker restart or lease expiry | stale live state becomes package S4 `blocked`; task `approved` | token invalidated; audit terminal failed; one-time nonce burned | run failed; one artifact from staged state; stale owner loses every later CAS | startup/periodic reconciliation only, never delivery replay | disposition-specific action above |
+| Generic stale-running recovery sees linked v2 claim | only unified S4 recovery mutates package/task | unified token invalidation; nonce remains burned | one failed run/audit/artifact; no generic stale marker or duplicate event | S4 sweeper/delegation only | disposition-specific action above |
 
 S6 imports S4's exact schema: assembly is `assembled|not_assembled`; staged
 delivery is
@@ -226,7 +236,10 @@ grant-mode × delivery-state recovery-disposition matrix, including
 and `review_submission`. Acknowledgement never changes immutable delivery: it
 changes only disposition to `reapprove_allow_once` or `reviewed_submission` with
 database actor/time evidence. Retry from `reviewed_submission` still requires
-current exact always-allow coverage.
+current exact always-allow coverage. The locked route may accept the same decision
+or a greater decision revision that exactly covers unchanged package policy; it
+records the authorizing revision, and missing/narrower/unknown coverage fails
+closed.
 
 ## Prompt/instruction assertions
 
@@ -240,7 +253,9 @@ Assert:
 - static Forge boundary warning present;
 - pure planning-only filesystem write hint present;
 - fake system markers and closing fences remain JSON data;
-- immutable boundary policy appears only in the actual provider system-role input;
+- role-preserving adapters carry policy only in the captured system-role wire
+  input; the ACP fake instead asserts its real flattened `session/prompt` guidance
+  and makes no role-separation/enforcement claim;
 - an optional Forge-authored reminder after user-role data is tested only as
   attention guidance, never as immutable policy or enforcement;
 - no raw packet content is persisted as artifact.
@@ -265,8 +280,16 @@ Keep this small:
 7. Verify one-time pre-intent recovery targets fresh approval, always-allow
    pre-intent recovery uses explicit retry, and post-intent states require
    possible-submission acknowledgement before any new decision/run.
-8. Race a stale/double-click recovery action against revocation and a new lease;
-   visible stale state becomes neutral and the server returns `409` without wake.
+8. Race two identical recovery actions: one ledger row and one wake survive, and
+   both return the recorded success. Then change marker fingerprint/state and prove
+   that stale request returns `409` without wake.
+9. Revoke and restore an always-allow grant around a packet-recovery marker. The UI
+   hides retry while uncovered, shows explicit reauthorization for the newer exact
+   decision, requires acknowledgement first for post-intent delivery, and the new
+   run snapshots the new revision.
+10. Exercise every live packet phase: preparing, assembled, submitting,
+    accepted/finalizing, and failed/finalizing. Each is actionless current state;
+    expired/incoherent observations remain neutral until recovery.
 
 Back-end integration tests remain authoritative for concurrency and state transitions.
 
@@ -304,29 +327,38 @@ opaque IDs, tuple fields, bounded enum failure stages, fingerprints, and counts.
 
 S4 changes cross web and worker process boundaries, so S6 must prove this rollout:
 
-1. **Expand schema first.** #179 adds/backfills the unique project `root_ref`,
-   nullable nonce/claim/snapshot fields, issuance-recovery action table, new status
-   vocabulary, and partial indexes without changing legacy readers. Existing
+1. **Expand schema first.** #179 adds/backfills the unique project `root_ref` with
+   database `DEFAULT gen_random_uuid()` retained for old writers, nullable
+   nonce/claim/snapshot fields, issuance-recovery action table, protocol epoch
+   singleton/default/rejecting trigger, new status vocabulary, and partial indexes
+   without changing legacy readers. Existing
    artifacts remain valid; S6 verifies schema/Drizzle/writer predicate parity.
 2. **Deploy dual readers and guarded writers.** New readers treat legacy
    `allow_once` without nonce as non-issuable, old preview decisions as
    `unknown_legacy`, old zero-default audit rows as `unknown_legacy` rather than
    proof of assembly, and legacy path-valued `root` as hidden.
-3. **Protocol gate and drain workers.** New packet producers require the new worker
-   protocol/schema marker. Stop and drain old workers before enabling claim v2;
-   they may not resume after v2 writes begin.
-4. **Cut over producers.** New S4 workers write run-scoped claims and opaque
-   `rootRef`. After the drain, #179—not test-only S6—runs its bounded restartable
-   migration that clears legacy persisted root paths and records only aggregate
-   scrub counts. S6 seeds legacy rows and verifies the result.
-5. **Deploy S5, then S6.** UI consumes but never manufactures new state.
+3. **Durable protocol barrier and drain.** With the epoch still 1 and v2 issuance
+   disabled, prove every audit insert reaches the database trigger before a bounded
+   read. Stop/drain v1 workers and prove no v1 claim remains.
+4. **Cut over producers.** Transactionally advance the monotonic epoch to 2, then
+   enable v2 workers to write run-scoped claims and lifetime-stable opaque
+   `rootRef`. Hold a v1 writer across activation and prove its claim rolls back with
+   zero repository reads. Rollback never lowers the epoch.
+5. **Post-drain scrub.** Only after durable epoch-2 evidence, #179—not test-only
+   S6—runs its separately gated restartable operation/later migration that clears
+   legacy persisted root paths and records only aggregate scrub counts. It is not
+   registered as an ordinary expansion migration. S6 seeds legacy rows and verifies
+   the result.
+6. **Deploy S5, then S6.** UI consumes but never manufactures new state.
 
 Compatibility tests cover old-web/new-worker and new-web/old-worker combinations,
 legacy `allow_once`, old grant-blocked/failed packages, preview rows without mode,
-old audit rows, and existing duplicate-permitted artifact types. An incompatible
-old worker fails startup/claim before repository reads. Rollback is code-only and
-forward-schema-compatible: leave additive columns and indexes in place, disable v2
-packet production, and never restart an old packet writer against v2 state.
+old audit rows, concurrent old project inserts during root backfill/non-null
+cutover, and existing duplicate-permitted artifact types. An incompatible old
+packet writer is rejected by the epoch trigger before repository reads. Rollback is
+code-only and forward-schema-compatible: leave additive columns, indexes, root
+default, and monotonic epoch in place, disable v2 packet production, and never
+restart an old packet writer against v2 state.
 
 ## CI commands and budgets
 
@@ -339,9 +371,9 @@ different layer:
 ```json
 {
   "test:mcp:contract": "node scripts/run-with-deadline.mjs 60 -- vitest run __tests__/mcp-admission-invariant.test.ts --testTimeout=10000",
-  "test:mcp:postgres": "node scripts/run-with-deadline.mjs 240 -- playwright test --project=mcp-postgres --grep @mcp-postgres --timeout=45000",
-  "test:mcp:issuance": "node scripts/run-with-deadline.mjs 300 -- playwright test --project=mcp-issuance --grep @mcp-issuance --timeout=60000",
-  "e2e:mcp-operator": "node scripts/run-with-deadline.mjs 240 -- playwright test --project=mcp-operator-desktop --project=mcp-operator-mobile --grep @mcp-operator --timeout=60000"
+  "test:mcp:postgres": "node scripts/run-with-deadline.mjs 240 -- node scripts/run-playwright-contract.mjs --forbid-skips --forbid-retries -- --project=mcp-postgres --grep @mcp-postgres --timeout=45000",
+  "test:mcp:issuance": "node scripts/run-with-deadline.mjs 300 -- node scripts/run-playwright-contract.mjs --forbid-skips --forbid-retries -- --project=mcp-issuance --grep @mcp-issuance --timeout=60000",
+  "e2e:mcp-operator": "node scripts/run-with-deadline.mjs 240 -- node scripts/run-playwright-contract.mjs --forbid-skips --forbid-retries -- --project=mcp-operator-desktop --project=mcp-operator-mobile --grep @mcp-operator --timeout=60000"
 }
 ```
 
@@ -352,9 +384,15 @@ not carry either database-only tag.
 
 `playwright.config.ts` defines dedicated single-desktop `mcp-postgres` and
 `mcp-issuance` projects plus desktop/mobile `mcp-operator-*` projects. The generic
-desktop/mobile projects set `grepInvert: /@mcp-postgres|@mcp-issuance/`, so
-`npm run e2e` never runs a database race once per viewport. Dedicated projects
-use matching `grep`/`testMatch` rules and shared DB suites are serial. CI runs
+desktop/mobile projects set
+`grepInvert: /@mcp-postgres|@mcp-issuance|@mcp-operator/`, so unqualified
+`npm run e2e` runs each dedicated MCP scenario only through its owning project and
+never duplicates a database race or operator scenario in the generic viewports.
+Dedicated projects use matching `grep`/`testMatch` rules, `retries:0`, and serial
+execution for shared database suites. Remove the current
+`testInfo.project.name !== 'chromium-desktop'` skip from
+`mcp-handoff-concurrency.spec.ts`; project selection belongs in configuration/tags,
+not runtime `test.skip`. CI runs
 each named and generic command with `--list`, asserts exact expected test IDs and
 cardinality, and fails on overlap, omission, or duplicate selection.
 
@@ -365,6 +403,10 @@ cardinality, and fails on overlap, omission, or duplicate selection.
 | `npm run test:mcp:issuance` | desktop-only nonce/claim/lease/failure-point races | 60 s | 300 s |
 | `npm run e2e:mcp-operator` | Chromium desktop + mobile visible flow/accessibility | 60 s | 240 s |
 
+`scripts/run-playwright-contract.mjs` first records the exact `--list` manifest,
+runs Playwright with machine-readable results, and fails if any selected test is
+missing, runtime-skipped, retried/flaky, duplicated, or unexpected. Injected one-skip
+and first-attempt-only-failure fixtures prove those gates. The outer
 `scripts/run-with-deadline.mjs` terminates the process tree and exits non-zero at
 the stated wall budget; workflow job `timeout-minutes` is a second outer bound.
 Per-test `--timeout`/Vitest `--testTimeout` flags above are mandatory, not prose.
