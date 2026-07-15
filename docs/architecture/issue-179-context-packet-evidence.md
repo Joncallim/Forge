@@ -106,7 +106,8 @@ Timestamps are display data, not precedence. A new package-local `allow_once`
 approval also receives an immutable UUID `grantDecisionNonce`; reapproval rotates
 the nonce even when the current approval pointer is updated. The approval decision
 and effective package snapshot must agree on approval ID, decision revision, and
-nonce.
+nonce. They must also match the locked project's current internal root-binding
+revision; an old-root decision is `revoked`, not issuable.
 
 Historical authorization must not be reconstructed by joining an old audit to a mutable current approval row. Each packet claim stores an immutable, bounded authorization snapshot:
 
@@ -116,6 +117,7 @@ type PacketAuthorizationSnapshot = {
   source: 'package_allow_once' | 'project_always_allow';
   grantApprovalId: string | null;
   grantDecisionRevision: string;
+  rootBindingRevision: string;
   grantDecisionNonce: string | null;
   grantMode: 'allow_once' | 'always_allow';
   approvedCapabilities: FilesystemProjectCapability[];
@@ -126,14 +128,32 @@ type PacketAuthorizationSnapshot = {
 };
 ```
 
-The fingerprint uses canonical capability and policy fields only. It never includes a path, prompt, file name, content excerpt, free-text reason, or credential.
+The fingerprint uses canonical capability, policy, decision, and root-binding
+revision fields only. It never includes a path, host-resource reference, prompt,
+file name, content excerpt, free-text reason, or credential.
 
 Required additive schema changes:
 
+- `projects.root_binding_revision BIGINT NOT NULL DEFAULT 1`, an internal opaque
+  `host_resource_ref`, the authoritative opaque `host_id`, and a bounded
+  `root_maintenance_state` (`none|deleting|repair_required`) with nullable UUID
+  token and expected revision. `host_resource_ref` is an installation-keyed digest
+  of the host ID plus the platform-normalized canonical real path; it is never a
+  packet field. A partial unique index on `(host_id, host_resource_ref)` rejects
+  two live project records for one physical root, including aliases;
+- durable `forge_worker_instances` capability/heartbeat rows with instance ID,
+  authoritative host ID, maximum writer protocol, fence-supervisor version,
+  last-seen database time, and `active|draining|drained` state. Capability history
+  and drain acknowledgements are append-only activation evidence;
 - `filesystem_mcp_grant_approvals.grant_decision_nonce UUID NULL` during migration; every new `allow_once` write requires it after cutover;
 - a durable decision revision on the approval decision/effective snapshot, using the #178 project-serialized revision contract;
 - `work_packages.claim_protocol_version INTEGER NULL`, written by the database on
-  each transition to `running` and retained as durable claim evidence;
+  each transition to `running` and retained as durable claim evidence, plus
+  protocol-v2 `claim_host_id`, `claim_host_resource_ref`, and
+  `claim_root_binding_revision` for every local-root all-mode claim;
+- nullable protocol-v2 `agent_runs.claim_host_id`,
+  `claim_host_resource_ref`, and `claim_root_binding_revision`; a created run copies
+  the package pin exactly;
 - `filesystem_mcp_runtime_audits` fields:
   - `protocol_version`;
   - `grant_approval_id`;
@@ -148,6 +168,8 @@ Required additive schema changes:
   - delivery outcome;
   - post-submission effect intent (`not_started|active|quiesced`) with bounded stage,
     owning host ID, random fence token, and nullable host-apply ledger fingerprint;
+  - host-apply recovery review (`not_applicable|review_required|reviewed`) bound to
+    that exact ledger fingerprint; a recovery marker copies, never invents, it;
   - terminal success/failure outcome and bounded failure code/stage, with database
     checks matching the normative tuple table below.
 - run-scoped `work_package_host_apply_ledgers` plus ordered entry rows. An entry
@@ -157,12 +179,14 @@ Required additive schema changes:
 - append-only `filesystem_mcp_issuance_recovery_actions` with actor, typed action
   (`acknowledge_possible_submission|retry_execution|resolve_after_allow_once_reapproval`),
   prior runtime-audit/agent-run IDs, marker fingerprint, delivery state, nullable
-  authorizing decision revision/coverage fingerprint/approval ID, database time,
+  prior/authorizing root-binding revision, authorizing decision
+  revision/coverage fingerprint/approval ID, database time,
   and a unique `(runtime_audit_id, action, marker_fingerprint)` key.
 - append-only `filesystem_mcp_integrity_alerts` and
   `filesystem_mcp_integrity_resolutions`, uniquely fingerprinted per audit/reason,
   with bounded reason, actor/owner, database time, prior alert ID, chosen typed
-  resolution, and no path or free text.
+  resolution (`verified_success|verified_failure|quarantined_abandoned`), and no
+  path or free text.
 
 Two separate partial unique indexes are required for protocol v2 `operation='context_packet'` rows:
 
@@ -176,20 +200,26 @@ SQL migration predicates, Drizzle schema declarations, and conflict writers must
 Mixed-worker safety uses the existing pre-read package claim boundary, not the
 later runtime-audit insert and not a process-local feature flag. Add a singleton
 `forge_runtime_protocol_epochs` row for `name='work_package_execution'` with
-`minimum_writer_protocol`, activation actor/time, and immutable activation audit.
-It begins at protocol 1.
+`minimum_writer_protocol`, nullable active host ID, minimum fence-supervisor
+version, activation actor/time, and immutable activation audit. It begins at
+protocol 1 with no active host.
 
 An expand-phase PostgreSQL trigger runs on every work-package status transition to
 `running`, a boundary every current legacy worker already traverses before the
 executor can read repository context. The trigger reads the transaction-local
 `forge.worker_protocol` setting (`1` when absent for legacy binaries), takes a
 shared lock on the epoch row, rejects a lower protocol, and writes the observed
-version to `work_packages.claim_protocol_version`. One shared v2 package-claim
+version to `work_packages.claim_protocol_version`. At epoch 2 it also requires
+transaction-local `forge.worker_host_id` to equal the epoch's active host and the
+transaction-local `forge.worker_fence_supervisor_version` to meet the epoch
+minimum. One shared v2 package-claim
 primitive locks project → task → every sibling package in ascending ID order,
 recomputes dependency/candidate eligibility, proves no sibling is running or
-leased and none is `awaiting_review`, sets
-`SET LOCAL forge.worker_protocol='2'`, and only then attempts one
-conditional `running` transition. This is required for packet-bearing execution,
+leased and none is `awaiting_review`, sets both
+`SET LOCAL forge.worker_protocol='2'` and
+`SET LOCAL forge.worker_host_id='<authoritative-host-id>'` plus the compiled
+supervisor version, and only then attempts
+one conditional `running` transition. This is required for packet-bearing execution,
 packet-free execution, and handoff-only mode when
 `FORGE_WORK_PACKAGE_EXECUTION=0`; no direct writer may update only its preselected
 package. Only the packet-bearing branch continues to the issuance audit/nonce
@@ -201,15 +231,34 @@ not confine an ACP process or revoke other host access.
 Activation is a deployment-operator/database-maintenance action, not a user-facing
 web route. It uses an explicit PostgreSQL `READ COMMITTED` transaction. Statement
 one locks the epoch row exclusively and finishes any wait. Statement two then uses
-a fresh command snapshot to query for every `running` package with null or
-protocol-1 claim evidence. If any exists, activation aborts without advancing. If
-none exists, statement three updates the epoch to 2 and records the immutable
-activation audit before commit. A v1 transition that acquired the shared lock
+a fresh command snapshot to query both every `running` package with null/protocol-1
+claim evidence and the complete worker-instance capability/heartbeat registry.
+Any package or host-capability blocker aborts without advancing. Otherwise,
+statement three updates the epoch to 2, pins the one active host/minimum supervisor
+version, and records the immutable package/instance activation snapshot before
+commit. A v1 transition that acquired the shared lock
 first therefore commits and is visible to statement two, forcing activation to
 abort. If activation acquired the exclusive lock first, a later v1 transition
 waits, sees epoch 2, and fails. A single-statement check or a snapshot established
 before the lock wait is forbidden. Activation does not lock entity rows or mutate
 them, so it cannot reverse the entity order. The epoch is monotonic and never lowered.
+
+Initial protocol-v2 execution that can read or mutate a local project is explicitly
+single-active-host. Every worker process registers and heartbeats one
+`forge_worker_instances` row from operator-controlled stable host identity; a
+worker cannot self-assert a different host at recovery time. Activation requires
+exactly one distinct fresh active host, every fresh instance on that host to
+advertise protocol 2 and the required fence-supervisor version, and every stale,
+legacy, incompatible, or other-host row to have an audited `drained` disposition.
+Active instances heartbeat every 10 seconds and are fresh only when PostgreSQL
+`now() - last_seen_at <= interval '30 seconds'`; an older non-drained row blocks
+activation rather than being assumed dead.
+The activation audit snapshots the exact instance IDs, host ID, versions,
+heartbeats, and drain evidence. Missing, stale, unreachable, incompatible, or
+multiple-host evidence is a machine-checkable blocker. Multi-host local execution
+remains disabled until a later architecture supplies durable host-affine routing.
+A later process from another host cannot bypass activation: the package-transition
+trigger rejects its host setting before executor reads.
 
 Cutover still requires operational drain of pre-trigger processes before epoch-2
 activation; no schema change can retroactively stop a binary that was already past
@@ -243,20 +292,26 @@ project
 Candidate discovery and exact-replay lookup may happen without retained locks,
 but every mutation reacquires the applicable rows in this order. New ledger,
 artifact, action, alert, and resolution rows use these stable keys for uniqueness
-waits. A post-submission
-host-side effect fence is an external precondition, not a database row: worker and
-recovery acquire it while holding **no** database locks, then enter the order above.
-No database transaction waits for that host fence, preventing a fence↔row cycle.
+waits. A run-lifetime host-resource fence is an external precondition, not a
+database row: post-claim worker revalidation, recovery, project
+create/repoint/delete, and every
+filesystem-management path acquire it while holding **no** database locks, then
+enter the order above. A path repoint acquires old and new opaque resource refs in
+byte order. No database transaction waits for a host fence, preventing a
+fence↔row cycle.
 
 Live health checks and other network/system probes happen before the transaction and are not persistence inputs. Every current `ready → running` writer must call the shared protocol-v2 package-claim primitive. In every mode it locks project → task → all sibling packages ascending, recomputes candidate/dependency state under lock, proves no sibling has `running|awaiting_review` status or a live execution lease, and claims exactly one eligible package. The package status is the authoritative mandatory-review barrier; gate decisions change it only under the same package lock. This includes packet-free and handoff-only paths even when there is no MCP project snapshot. For a packet-bearing package, extend that same package/run claim transaction rather than creating an independent claim lifecycle:
 
 1. Lock project, task, and every sibling package row in global order; recompute
-   eligibility and select the one candidate under those locks.
+   eligibility, require `root_maintenance_state:'none'` plus a populated unique
+   host binding for any local root, and select the one candidate under those locks.
 2. Lock the applicable approval/decision row after the package.
 3. Re-read current package requirements and canonical admission. Verify exact required coverage and decision revision. For `allow_once`, also verify the approval ID + nonce is approved and unconsumed.
+   The decision root-binding revision must equal the locked project and the package
+   claim pin; an old-root decision is revoked.
 4. The shared primitive sets transaction-local worker protocol 2, then conditionally
    moves the package to `running`; the trigger locks/checks the epoch and records
-   claim protocol 2.
+   claim protocol 2 plus the authoritative host/resource/root-revision pin.
 5. Create the `agent_runs` row and existing execution lease.
 6. Insert the per-run unique `claiming` audit with `claimToken`, `agentRunId`, a database-time lease, and the immutable authorization snapshot.
 7. For `allow_once`, win the additional nonce-unique insert and mark that exact decision consumed using a compare-and-set.
@@ -346,26 +401,77 @@ a correction prompt on that claim. Packet-free generation may retain its existin
 validation retries because it discloses no bounded packet and carries no packet
 submission claim.
 
-### Post-submission host-effect quiescence
+### Run-lifetime host-resource fence and post-submission quiescence
+
+Forge derives an internal `hostResourceRef` from the operator-controlled stable
+host ID and the platform-normalized canonical physical root. Canonicalization
+resolves symlinks, applies case folding only on a case-insensitive filesystem, and
+uses stable filesystem device/object identity where the host supports it. An
+installation-keyed digest makes the reference opaque outside the trusted host
+boundary. If Forge cannot prove that aliases converge to one identity, it disables
+protocol-v2 local-root execution on that host. `hostResourceRef` is unrelated to
+the random project-scoped packet `rootRef` and never appears in packet evidence,
+copy, logs, queue payloads, or public APIs.
+
+The project row owns the authoritative host ID, resource reference, and monotonic
+root-binding revision. The all-mode claim transaction pins all three on the run.
+After claim commit and **before the first repository read, context selection, or
+packet assembly**, the worker acquires the corresponding exclusive operating-
+system advisory lock in Forge-controlled host state while holding no database
+locks. It then enters a short top-down transaction and revalidates the project
+binding, claim, and both leases. A mismatch fails before any repository bytes are
+read. The worker retains this one resource fence through packet assembly,
+submission, response-driven local work, atomic terminal finalization, and
+descendant quiescence. Packet-free and handoff-only execution must do the same
+whenever they read or mutate the local root. This is host-resource exclusion, not
+distributed filesystem fencing or an ACP sandbox.
+
+A dedicated local fence supervisor owns the open lock descriptor and the spawned
+process group. Validation and other post-response descendants inherit a
+non-close-on-exec lease descriptor. On worker/control-channel death the supervisor
+terminates the whole group, waits for it, and only then closes its descriptor;
+the inherited descriptor keeps the fence held if the supervisor itself dies while
+a stubborn descendant survives. A normal owner likewise cancels and waits for
+every descendant before release. Protocol-v2 local execution is disabled unless
+the host proves this supervisor/inheritance behavior with the checked-in crash
+test.
+
+Project creation, root repoint, unregister/delete, recursive filesystem cleanup,
+and every other root-management path participate in the same fence protocol.
+They discover current/candidate identities without retaining database locks,
+acquire every affected resource fence in opaque-reference byte order, then start
+a fresh top-down transaction. That transaction revalidates the old binding and
+revision, enforces the `(host_id, host_resource_ref)` uniqueness constraint, and
+rejects mutation while any pinned claim/lease, sibling `awaiting_review`, active
+effect, unproven quiescence, or unresolved S4 marker on a nonterminal task remains.
+A normal packet marker must be resolved or its task explicitly cancelled without
+rewriting evidence before root management can proceed. Such cancellation acquires
+the complete applicable tail, requires quiescent effects and completed host review,
+appends its actor/reason audit, and retains every packet marker/audit/artifact.
+Create inserts the unique binding; repoint
+atomically advances its revision/binding and invokes S3's negative reconciler so
+old-root decisions become revoked before commit. Delete without host cleanup commits
+under the fence. Delete with recursive cleanup first persists a typed `deleting`
+maintenance intent that blocks all claims, performs filesystem work outside the
+database transaction while retaining the fence, and then deletes the project in
+a fresh top-down transaction. Crash recovery reacquires the same fence and either
+completes the exact intent or enters bounded manual repair; it never guesses.
+No path waits for a resource fence while holding a database lock.
+
+This root-binding protocol closes path reuse: Project B cannot claim a root while
+Project A holds its resource fence, and the unique binding cannot move or be
+reused until A has no live pin and quiescence is proven. It also prevents a path
+edit or delete from changing the repository underneath a packet being assembled.
 
 A valid response is persisted as `delivery:'submitted'` before Forge applies any
-response-driven local effect. The owning worker then acquires an exclusive
-operating-system advisory lock keyed by project ID in Forge-controlled host state,
-not inside the repository and not derived from a displayed path. The lock is held
-by an open process file descriptor, releases automatically on process death, and
-must be shared by every worker/recovery process that can access that local project.
-Protocol-v2 packet execution with host writes is disabled on a host that cannot
-provide this lock or route recovery to the same host. This is a host-process
-quiescence guarantee, not distributed filesystem fencing or an ACP sandbox.
-
-The worker acquires the host fence with no database locks. While holding it, a
-short top-down transaction revalidates both leases and CAS-persists an `active`
-post-submission effect intent with opaque host ID, random fence token, and current
-closed stage. The combined heartbeat remains active. Before every later stage and
-before each file replacement, the worker rechecks both ownership predicates and
-advances the durable stage under compare-and-set. Validation children are
-cancelled on ownership loss, but the fence remains held until the child and every
-file operation stop. Each host file uses a validated write-plan entry and:
+response-driven local effect. The worker already owns the run-lifetime resource
+fence. A short top-down transaction revalidates the pinned binding and both leases,
+then CAS-persists an `active` post-submission effect intent with authoritative
+opaque host ID, random fence token, and current closed stage. The combined
+heartbeat remains active. Before every later stage and before each file
+replacement, the worker rechecks the binding and both ownership predicates and
+advances the durable stage under compare-and-set. Each host file uses a validated
+write-plan entry and:
 
 1. persists ledger entry `planned → applying` under the fence and ownership token;
 2. performs one atomic replacement only after another ownership check;
@@ -377,23 +483,28 @@ existing output-plan entry identity/ordinal. Exact paths remain in the separate
 authorized host-write/output evidence where already required for repository work;
 they never enter packet audit, marker, artifact, alert, API copy, or logs.
 
-The worker holds the host fence through the atomic database finalizer, which sets
+The worker holds the resource fence through the atomic database finalizer, which sets
 the effect intent to `quiesced` in the same commit, then releases it. Stale
-recovery likewise acquires the same fence **before** any entity
-row lock, then enters the canonical database order and rereads the candidate. It
+recovery first proves that its authoritative current host ID exactly equals both
+the run's pinned host ID and `effectIntent.hostId`. A mismatch, missing/stale host
+registration, or unreachable owning host is alert-only: it cannot acquire a
+different host's local lock, terminalize, or expose an action. Same-host recovery
+acquires the pinned resource fence **before** any entity row lock, then enters the
+canonical database order and rereads the candidate. It
 may terminalize and expose a recovery marker only while holding the fence; it maps
 leftover `applying` entries to `unknown`, fingerprints the final ledger state, and
 persists `quiesced` in that same transaction. An actionable marker requires
 effect intent `not_started|quiesced`, never `active`.
-If the fence remains held or the owning host is unavailable, recovery changes no
+If the fence remains held or the owning host is unavailable or mismatched, recovery changes no
 run/package/marker state, creates no retry action, emits one deduplicated bounded
-`post_submission_quiescence_unproven` integrity alert, and retries on the owning
-host. Thus no actionable marker or later run can coexist with an in-flight stale
-host operation.
+`post_submission_quiescence_unproven` integrity alert, and retries only on the
+authoritative owning host. Thus no actionable marker or later run can coexist with
+an in-flight stale host operation.
 
-The quiescence-alert insert is the sole path that does not own the host fence. It
+The quiescence-alert insert is the sole path that does not own the resource fence. It
 never waits for that fence while holding database locks. After a bounded failed
-acquisition, it starts a short fresh transaction, follows the full applicable
+acquisition—or after authoritative host mismatch/unavailability prevents an
+attempt—it starts a short fresh transaction, follows the full applicable
 database order through audit → host ledger → artifacts → alert, revalidates the
 same active intent/fingerprint, inserts or rereads the unique alert, and commits
 without changing run/package/lease/marker state.
@@ -593,6 +704,36 @@ and creates no recovery marker. A failed tuple permits only:
 | `assembled` | `submission_uncertain` | authorization/lease codes, `worker_stopped`, or `submission_uncertain` |
 | `assembled` | `submitted` | authorization/lease codes, `worker_stopped`, `provider_response_invalid`, or `post_submission_execution_failed` with exactly one closed `failureStage` |
 
+Effect intent, host ledger, terminal state, and host-review state form one second
+normative compatibility table. “No entries” means the run has no host-apply ledger
+entry rows; “complete” means every expected output-plan entry is `applied`.
+
+| Durable phase | Terminal state | Effect intent | Host ledger | Host review |
+|---|---|---|---|---|
+| Before an accepted valid response, including `submission_uncertain` | nonterminal or failed | `not_started` | no entries | `not_applicable` |
+| Valid response persisted, before first local stage | nonterminal, or failed with a non-local code such as `provider_response_invalid` | `not_started` | no entries | `not_applicable` |
+| Local stage executing or live finalizer retrying | nonterminal only | `active(stage)` | `planned|applying|applied`; never `unknown` | `not_applicable` |
+| Caught local-stage failure | failed as `post_submission_execution_failed(failureStage)` | `quiesced(lastStage)` where `lastStage === failureStage` | no `applying`; no `unknown` on the caught live path | `review_required` when host changes are present or possible, otherwise `not_applicable` |
+| Recovered failure after any local stage | failed with the deterministic recovery code | `quiesced(lastStage)` | no `applying`; may contain `unknown` | `review_required|reviewed` when any host change is applied or unknown |
+| Successful run | succeeded | `quiesced(lastStage)` | complete; no `planned|applying|unknown` | `not_applicable` |
+
+No terminal row may coexist with `effectIntent.state:'active'`; `quiesced` is
+terminal-only. `not_started`
+forbids a ledger and a host-review requirement. Every `active|quiesced` intent
+host ID must match the linked run's pinned host ID; recovery obtains the resource
+reference and root-binding revision only from that locked run/package pin.
+Every nonempty ledger has one canonical fingerprint equal to the intent and any
+`review_required|reviewed` union. A reviewed fingerprint cannot authorize a
+different ledger. A failed row with `submitted` may remain `not_started` only when
+no local stage began; once a stage began, terminalization requires `quiesced`.
+
+The migration installs same-row checks plus a deferred PostgreSQL constraint
+trigger that calls one versioned tuple-validation function across the audit,
+ledger entries, and host-review data before commit. Live/recovery finalizers and
+privileged repair call the same predicate under the complete lock order. Drizzle
+parsers and API readers import matching fixtures; S6 exhausts every allowed row
+and representative forbidden cross-product. No layer may maintain a looser copy.
+
 The first bounded failure successfully persisted by the live owner is primary.
 `submission_failed` is atomically staged with `submission_rejected`; recovery
 preserves that definitive pair even when a lease later expires. Otherwise, if
@@ -636,7 +777,8 @@ other derivative of `localPath`. It stays stable for the lifetime of the project
 including across path edits. Rotation is out of scope because it would invalidate
 approved-but-unclaimed snapshots; any future rotation needs its own privileged,
 audited invalidation/reapproval design. Two projects never share a generated
-reference, even when they point to the same host path.
+`rootRef`, and the separate internal host-resource uniqueness rule prevents them
+from simultaneously owning the same canonical physical root.
 
 The packet keeps the existing assembly ceilings: `50` included files, `160 KiB` total included bytes, `24 KiB` per file, traversal depth `6`, `500` directory entries, and `5,000` total traversed entries. `rootRef` is at most `80` ASCII characters. Redaction summary has at most `32` known keys and each count is `0..5,000`. Artifact human-readable content is at most `16 KiB` and is derived only from typed fields and static copy. Values outside these bounds fail closed rather than being persisted.
 
@@ -702,7 +844,8 @@ payload. Before protocol-v2 activation, implementation must add
 ```text
 npm run packet-integrity:inspect -- --audit <id>
 npm run packet-integrity:resolve -- --audit <id> --actor <operator-id> \
-  --expected-fingerprint <digest> --resolution <verified_success|verified_failure>
+  --expected-fingerprint <digest> \
+  --resolution <verified_success|verified_failure|quarantined_abandoned>
 ```
 
 Inspection is bounded/read-only. Resolution requires the privileged operator
@@ -710,10 +853,19 @@ role, locks in the complete order, compare-and-sets the alert/hold fingerprint,
 and writes one append-only resolution row. `verified_success` runs only the exact
 success reconstruction predicate; `verified_failure` requires coherent immutable
 failed audit/artifact evidence and copies it exactly. Neither option rewrites
-immutable packet evidence. If neither predicate is proven, the command makes no
-mutation and the hold remains. A quiescence alert resolves automatically only
-after owning-host recovery acquires the fence and commits a coherent terminal
-state. Unauthorized, stale, duplicate, and cross-project requests fail closed.
+immutable packet evidence. `quarantined_abandoned` is the sole terminal outcome
+for a proven immutable audit/artifact mismatch that can satisfy neither predicate.
+It requires the exact alert fingerprint, no live sibling lease, no sibling
+`awaiting_review`, and quiescent effects; then one complete-order transaction
+writes the append-only adjudication, moves the held package and every remaining
+nonterminal sibling to `cancelled`, and closes the task as `cancelled`. It retains
+the alert, hold, audit, artifact, and run unchanged, creates no recovery action,
+and can never make the packet or task retryable. Readers join the resolution and
+render permanent evidence quarantine/closure. If no resolution predicate is
+proven, the command makes no mutation and the hold remains. A quiescence alert
+resolves automatically only after owning-host recovery acquires the fence and
+commits a coherent terminal state. Unauthorized, stale, duplicate, and
+cross-project requests fail closed.
 
 `reconcilePacketRecoveryTaskDisposition(taskId)` owns the sibling-convergence seam.
 It runs in a new top-down transaction after any sibling releases/terminalizes its
@@ -780,10 +932,12 @@ POST /api/tasks/{taskId}/work-packages/{packageId}/packet-issuance-recovery
 }
 ```
 
-The route authorizes the operator, then locks project → task → package → current
-grant decision → prior agent run → prior runtime audit → all applicable prior-run
-artifacts in stable order (including the exact packet artifact) → any existing
-matching recovery-action row by unique key.
+The route authorizes the operator, then locks project → task → every sibling
+package in ID order → current grant decision → prior agent run → prior runtime
+audit → host-apply ledger and entries → all applicable prior-run artifacts in
+stable order (including the exact packet artifact) → any existing/new matching
+recovery-action row by unique key → applicable integrity alerts/resolutions →
+review gates.
 Under those locks it proves canonical typed equality between the audit and
 artifact terminal tuples before reading the marker as actionable. Every action requires task
 `approved`, package `blocked`, a request whose task/package route owns the exact
@@ -814,6 +968,11 @@ accepts exactly one of two locked authorization states:
    capability set are unchanged, and that decision covers the complete required
    set.
 
+Both states require the authorizing decision's root-binding revision to equal the
+locked current project. State 1 therefore cannot survive a repoint; state 2 can
+authorize a new run on the new root only after explicit reapproval. The action row
+records both prior and current root-binding revisions.
+
 The canonical reader applies the S3 denial-wins rule, so an equal/newer package
 denial, unknown legacy state, or a project row hidden by a package override cannot
 be mistaken for authorization even when the project decision alone looks broad
@@ -830,7 +989,8 @@ mismatched prior audit also returns `409` without mutation.
 Every successful acknowledgement, retry, or one-time-reapproval resolution writes one append-only
 `filesystem_mcp_issuance_recovery_actions` row containing actor, action, prior
 audit/run IDs, marker fingerprint, immutable delivery state, nullable authorizing
-current decision revision/coverage fingerprint, resulting package status and
+current decision revision/coverage fingerprint, prior/current root-binding
+revision, resulting package status and
 disposition, and database time; a unique
 `(runtime_audit_id, action, marker_fingerprint)` key makes double-clicks
 idempotent. For an allowed always-allow retry, the same transaction inserts that
@@ -848,18 +1008,22 @@ row is stale and returns `409`. This makes idempotency and stale-state rejection
 separate, deterministic cases.
 
 Fresh one-time reapproval has one explicit cross-slice integration point. After
-#178 rotates the nonce under project → task → package → approval locks, it calls
-an S4-owned package-scoped resolver in the same transaction. The resolver
-continues to prior agent run → runtime audit, verifies the terminal prior claim,
-then locks all applicable artifacts in stable order, including the exact packet
-artifact, and proves canonical typed audit/artifact
-tuple equality. It verifies the exact `reapprove_allow_once` marker/fingerprint, changed fresh nonce, and
-current policy, then clears only the packet marker and moves `blocked → ready`.
-It also inserts `resolve_after_allow_once_reapproval` evidence referencing the new
-approval decision after artifact locks; marker clearing and that evidence are atomic.
-It never clears an S3 filesystem-grant marker or scans siblings. A stale marker,
-second reapproval, changed policy, or active lease is a compare-and-set miss.
-Redis wakes the task only after the combined transaction commits.
+#178 rotates the nonce under project → task → every sibling package in ID order →
+approval locks, it calls an S4-owned package-scoped resolver in the same
+transaction. Package scope limits grant evaluation; sibling locks enforce the
+task-wide review barrier. The resolver continues to prior agent run → runtime
+audit → host-apply ledger/entries → all artifacts in stable order, including the
+exact packet artifact → existing/new recovery action → integrity
+alerts/resolutions → review gates. It proves canonical typed audit/artifact tuple
+equality and validates the locked host-review/ledger fingerprint. It verifies the
+exact `reapprove_allow_once` marker/fingerprint, changed fresh nonce, current
+policy/root-binding revision, no active lease, and no sibling `awaiting_review`,
+then clears only the packet marker and moves `blocked → ready`. It inserts
+`resolve_after_allow_once_reapproval` evidence referencing the new approval
+decision; marker clearing and evidence are atomic. It never clears an S3
+filesystem-grant marker. A stale marker, second reapproval, changed policy, active
+lease, unresolved review, or integrity hold is a compare-and-set miss. Redis wakes
+the task only after the combined transaction commits.
 
 ## Artifact contract
 
@@ -885,7 +1049,7 @@ Artifact metadata:
 }
 ```
 
-Artifact content is a bounded human-readable summary derived only from these persisted typed snapshots. A live finalizer extends the existing run/package terminal transaction: after external work completes—or after a bounded external-work stage fails—it locks top-down, verifies both ownership predicates, terminalizes the agent run and package/review-gate transition, clears the execution lease, writes any recovery marker and task disposition for failure, transitions the audit to terminal, and upserts the artifact in one transaction while still holding the host-effect fence. Sandbox writes, validation commands, host writes, repository-evidence preparation, and review-gate preparation happen before this transaction and each maps to the closed post-submission stage above. The transaction contains no network, Redis, filesystem, provider, or rendering work. A gate insert or other finalizer database failure rolls the whole transaction back and persists no `completion_preparation` cause; the worker keeps the fence while retrying, or process death releases it for quiescent recovery. Thus a protocol-v2 writer cannot commit terminal packet evidence while leaving its linked run/package `running`. The partial unique index makes repeated or competing live/recovery finalizers idempotent; it does not replace this crash-consistency transaction. Recovery never rereads or reassembles a burned packet. The invariant-repair branch above handles legacy/manual partial state without rewriting already-terminal evidence.
+Artifact content is a bounded human-readable summary derived only from these persisted typed snapshots. A live finalizer extends the existing run/package terminal transaction: after external work completes—or after a bounded external-work stage fails—it locks top-down, verifies both ownership predicates and the pinned root binding, terminalizes the agent run and package/review-gate transition, clears the execution lease, writes any recovery marker and task disposition for failure, transitions the audit to terminal, and upserts the artifact in one transaction while still holding the run-lifetime resource fence. Sandbox writes, validation commands, host writes, repository-evidence preparation, and review-gate preparation happen before this transaction and each maps to the closed post-submission stage above. The transaction contains no network, Redis, filesystem, provider, or rendering work. A gate insert or other finalizer database failure rolls the whole transaction back and persists no `completion_preparation` cause; the fence supervisor retains exclusion while the worker retries, and on process death retains it until every descendant exits before same-host recovery can acquire it. Thus a protocol-v2 writer cannot commit terminal packet evidence while leaving its linked run/package `running`. The partial unique index makes repeated or competing live/recovery finalizers idempotent; it does not replace this crash-consistency transaction. Recovery never rereads or reassembles a burned packet. The invariant-repair branch above handles legacy/manual partial state without rewriting already-terminal evidence.
 
 ## Review-gate concurrency boundary
 
@@ -948,13 +1112,16 @@ orderings and prove one coherent winner without deadlock.
     delivery evidence, and no automatic correction submission. Packet-free behavior
     retains its existing validation-retry contract.
 18. Logs contain only digest/count metadata; absolute/relative paths, filenames,
-    secrets, HTML, control characters, raw exceptions, and rejected text do not
-    leak through any packet-owned persistence/diagnostic surface.
+    internal host-resource refs, secrets, HTML, control characters,
+    raw exceptions, and rejected text do not leak through any packet-owned
+    persistence/diagnostic surface.
 19. Deferred optional merge overlay text is absent; static ACP non-sandbox warning remains.
 20. Pure filesystem write planning hint remains present without packet.
-21. Existing-project backfill, old-writer inserts during cutover, path rename, and
-    two projects sharing one host path preserve the documented lifetime-stable
-    opaque `rootRef` identity, non-null value, and database uniqueness.
+21. Existing-project backfill, old-writer inserts during cutover, and permitted
+    path rename preserve the lifetime-stable opaque `rootRef`. Concurrent project
+    create/repoint attempts for the same canonical root—including symlink, alias,
+    case, and filesystem-object variants—select one unique host-resource binding;
+    the loser fails closed before claim or repository reads.
 22. Every issuance failure persists `autoRetryable:false`; `always_allow`
     exposes `retry_execution` immediately only for
     `not_exposed|submission_failed`. Post-intent states initially expose
@@ -1044,10 +1211,35 @@ orderings and prove one coherent winner without deadlock.
 43. Every normal packet retry, acknowledgement, reapproval, S2 refresh, and generic
     promotion rejects both integrity-hold reasons. Authorized repair requires the
     exact alert fingerprint, writes one resolution, and cannot rewrite evidence;
-    unauthorized/stale attempts leave the hold unchanged.
+    only mismatch adjudication may cancel/close without retry. Unauthorized/stale
+    attempts leave the hold unchanged.
 44. Pre-transaction completion preparation failure persists its exact closed
     stage; a gate insert/finalizer transaction failure fully rolls back and
     persists no `completion_preparation` cause.
+45. A packet read and host apply race project root repoint, unregister, recursive
+    delete, and reuse by a second project. Run-lifetime resource fencing plus the
+    pinned revision yields one owner; the management loser waits/retries or
+    conflicts without reading, deleting, or overwriting the other repository.
+46. Root repoints and two-root swaps acquire old/new resource refs in both byte
+    orderings without deadlock. Crash after typed delete intent and after host
+    cleanup is recovered exactly or enters bounded manual repair; no claim starts
+    during maintenance.
+47. Killing the worker and then the fence supervisor while a stubborn descendant
+    ignores normal termination leaves the inherited fence held. Recovery remains
+    actionless until the entire process group exits, then one same-host recovery
+    wins. A different, missing, stale, or unreachable host registration is
+    alert-only and cannot terminalize.
+48. Exhaustive assembly/delivery/terminal/effect/ledger/host-review fixtures prove
+    the two normative tables, stage equality, fingerprint equality, no terminal
+    `active`, and no successful row with `planned|applying|unknown`. PostgreSQL
+    constraint, finalizer, repair, parser, API, and S5 results agree.
+49. Activation rejects zero, multiple, stale, incompatible, wrong-host, and
+    undrained worker registrations. One fresh single-host capability set succeeds
+    and the immutable activation audit reproduces the exact decision.
+50. A true audit/artifact mismatch cannot satisfy verified success or failure.
+    Only exact privileged `quarantined_abandoned` closes the package/task, leaves
+    immutable evidence and the alert intact, writes one resolution, and exposes no
+    retry. Stale, duplicate, unauthorized, or active-sibling attempts do nothing.
 
 Real PostgreSQL owns transaction, lock, lease, migration, index, and failure-injection evidence. Lease tests compare against database time, not a fake worker clock. #181 composes a small cross-slice sentinel set from these tests instead of maintaining a second policy implementation.
 
@@ -1056,7 +1248,9 @@ Real PostgreSQL owns transaction, lock, lease, migration, index, and failure-inj
 The claimed uniqueness guarantee is valid only after legacy packet issuers are drained. Deployment order is therefore part of the architecture:
 
 1. **Expand schema.** Add a nullable project `root_ref` UUID with
-   `DEFAULT gen_random_uuid()` and a unique index,
+   `DEFAULT gen_random_uuid()` and a unique index; additive root-binding revision,
+   opaque host-resource/host identity, root-maintenance fields, their partial
+   uniqueness constraint, and worker-instance capability/heartbeat registry;
    nullable protocol-v2 nonce/revision/claim/snapshot fields, the exact partial
    indexes, host-apply ledger/entries, append-only issuance-recovery action and
    integrity alert/resolution tables with their unique keys, the protocol epoch
@@ -1070,6 +1264,14 @@ The claimed uniqueness guarantee is valid only after legacy packet issuers are d
    preview/evidence producer is enabled. Do not rewrite legacy approvals with
    synthetic nonces. Do not reinterpret required legacy zero/default audit
    columns as a truthful packet snapshot.
+   `host_resource_ref` remains nullable during expansion because PostgreSQL cannot
+   safely canonicalize host filesystems. The checked-in host command
+   `npm run project-roots:bind-v2 -- --actor <operator-id>` defaults to a dry run;
+   `--apply` derives/fences each root outside database locks and compare-and-sets
+   its host ID/reference/revision. Duplicate/alias collisions remain unbound with
+   an audited blocker until the operator repoints or deletes one project. It never
+   invents uniqueness or rewrites `rootRef`. The layman-readable procedure is
+   `docs/operators/project-root-binding-v2.md`.
 2. **Deploy dual readers.** Readers understand v1 and v2. Legacy `allow_once` approvals without a nonce are non-issuable and require explicit reapproval. Legacy audit rows without a typed assembly snapshot render as `unknown_legacy`, never `not_assembled` or invented zero counts.
 3. **Deploy v2 writers disabled.** New workers can write/read v2, while the durable
    epoch remains 1 and packet issuance stays disabled. Verify every package claim
@@ -1086,10 +1288,14 @@ The claimed uniqueness guarantee is valid only after legacy packet issuers are d
    epoch/postconditions, and retains the database activation audit. The
    layman-readable procedure is
    `docs/operators/work-package-protocol-v2-cutover.md`; ad hoc SQL is forbidden.
-   Before `--apply`, prove each host-write worker supports the shared process-
-   lifetime project fence and same-host recovery routing, and install the checked-in
-   integrity inspect/repair commands and runbook. A missing fence or runbook is a
-   cutover blocker.
+   Before `--apply`, the command requires exactly one fresh active host and proves
+   every registered worker supports the run-lifetime resource-fence supervisor;
+   all stale, incompatible, legacy, and other-host instances require audited drain
+   evidence. It snapshots those rows in the activation audit. Install the
+   checked-in integrity inspect/repair commands and runbook. Missing capability,
+   authoritative host identity, drain evidence, or runbook is a cutover blocker.
+   It also requires every local project to have a non-null unique root binding,
+   no root-maintenance intent, and retained audit from the binding command.
    Use that command to advance the durable epoch to 2 before enabling v2 grant writes and packet
    issuance. Shared-first v1 causes activation to abort; activation-first rejects
    stale v1 before repository reads.
@@ -1106,16 +1312,17 @@ The claimed uniqueness guarantee is valid only after legacy packet issuers are d
 Rollback leaves the additive schema, epoch, and v2 data in place and never lowers
 the epoch. UI/readers may roll back to a compatible version, but a legacy packet
 issuer must never be restarted once v2 decisions can exist. If worker rollback is
-required, disable packet issuance, acquire/prove every active host-effect fence
+required, disable packet issuance, acquire/prove every active resource fence
 quiescent, terminalize or integrity-hold every active effect intent, drain v2
-workers, and keep issuance disabled until a v2-capable worker with the same fence
-and ledger protocol is restored.
+workers, and keep issuance disabled until a v2-capable worker with the same
+resource-fence supervisor, host identity, and ledger protocol is restored.
 
 ## Implementation order
 
 1. Land #178's decision revision and operator-hold contracts.
-2. Add only the expand schema/backfill, exact indexes, host-apply ledger,
-   issuance-recovery action/integrity tables, database-default root-reference lifecycle, protocol barrier, and legacy
+2. Add only the expand schema/backfill, exact indexes, root-binding/maintenance
+   protocol, worker capability registry, host-apply ledger, issuance-recovery
+   action/integrity tables, database-default root-reference lifecycle, protocol barrier, and legacy
    readers. Do not register the destructive root scrub in the ordinary pending
    migration chain yet.
 3. Add the shared all-mode protocol-v2 package claim, integrated packet claim,
@@ -1125,8 +1332,10 @@ and ledger protocol is restored.
    policy for role-preserving adapters and explicitly non-enforcing flattened
    guidance for ACP.
 5. Replace executor capability merge/gating copies.
-6. Stage typed assembly metadata before exposure; add the host fence, monotonic
-   effect intent, per-entry apply ledger, and quiescent recovery; then atomically
+6. Acquire the resource fence before any repository read; stage typed assembly
+   metadata before exposure; add the supervisor, root-management integration,
+   monotonic effect intent, per-entry apply ledger, and quiescent same-host
+   recovery; then atomically
    finalize the run/package/lease, audit, artifacts, action/marker, gates, and task
    disposition while holding the fence.
 7. Add race, restart, injection, migration, mixed-worker, rollback, and failure-point tests.
@@ -1155,6 +1364,11 @@ filtering and recovery; if a valid submitted response can fail without a truthfu
 closed stage; if a gate path locks backward or decides from pre-transaction
 freshness; or if a terminal-success split can become a packet-failure retry.
 Also stop if a sibling under mandatory review can be bypassed; if any normal route
-can clear an integrity hold; if the complete artifact/action/gate lock tail cannot
-be preserved; if host-effect quiescence is unavailable; or if an unknown/partial
-host apply can expose retry without fingerprint-bound working-tree review.
+can clear an integrity hold; if a true mismatch has no evidence-preserving terminal
+quarantine; if the complete host-ledger/artifact/action/integrity/gate lock tail
+cannot be preserved; if the canonical physical root cannot be fenced from before
+its first read through descendant quiescence; if project management can bypass the
+same fence; if current-host identity or single-host activation capability cannot
+be proven; if terminal/effect/ledger compatibility cannot be enforced; or if an
+unknown/partial host apply can expose retry without fingerprint-bound working-tree
+review.
