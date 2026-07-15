@@ -9,13 +9,16 @@ Depends on: #176, #177
 Release prerequisite: #179 Step 0 only (the separately landable project-removal
 bridge, full project-management-ingress closure, old-process/session drain,
 retention-safe foreign keys, database hard-delete guard, shared release-order
-manifest/validator, and the complete signed release-evidence bootstrap described
-below)
+manifest/validator, and the complete durable-evidence/separate-short-lived-
+`forge_epic_172_transition_authorizations` bootstrap with distinct signature
+domains described below)
 Canonical policy: `docs/adr/0009-mcp-admission-contract.md`
 
 Related slices: [#179](https://github.com/Joncallim/Forge/issues/179) owns the
 separately landable Step 0 safety bridge, shared release-order contract, generic
-signed evidence/consumption substrate, and disabled enablement state and, after
+durable-evidence store, distinct short-lived
+`forge_epic_172_transition_authorizations` store and signature domain, consumption
+substrate, and disabled enablement state and, after
 S3 lands, the remaining packet issuance and evidence work.
 [#180](https://github.com/Joncallim/Forge/issues/180)
 owns presentation, and [#181](https://github.com/Joncallim/Forge/issues/181)
@@ -568,8 +571,10 @@ acyclic order:
    cascades with `RESTRICT|NO ACTION` and install the database hard-delete guard.
    Before recording its own graph receipt, run the separately reversible bootstrap
    that installs the pinned Ed25519 signer-key policy/audit, generic append-only
-   immutable release-evidence store and append-only consumption ledger, checked-in
-   verifier/recorder/consumer, dedicated certificate-authenticated `NOINHERIT`
+   immutable durable-release-evidence store, separate append-only short-lived
+   `forge_epic_172_transition_authorizations` attempts in a distinct Ed25519
+   signature domain, and append-only consumption ledger; the checked-in
+   verifier/recorder/consumer; dedicated certificate-authenticated `NOINHERIT`
    least-privilege recorder/consumer/transition principals, canonical transition-
    identity uniqueness, and the `disabled|provisional|active` enablement singleton
    initialized to `disabled`. The bootstrap is infrastructure, not a graph node;
@@ -577,11 +582,16 @@ acyclic order:
    Ed25519 signer must then record the empty-predecessor
    `step0_retention_bridge` receipt through that substrate. Keep every project-
    management ingress path closed after this checkpoint. This checkpoint has no
-   dependency on #178 and can land on its own; S3 cannot materialize state or
-   record `s3_issue_178` until the signed Step 0 receipt verifies.
+   dependency on #178 and can land on its own; S3 cannot materialize final state or
+   record `s3_issue_178` until the signed Step 0 receipt verifies and a fresh exact
+   unexpired transition-authorization attempt is available for atomic consumption.
 1. After Step 0 is proven, land #178's project `BIGINT` decision counter plus
    nullable decision/root-binding revision and marker fields and the dual v1/v2
-   reader. Do not emit v2 markers yet.
+   reader. Do not emit v2 markers yet. After every S3 contract/database test passes,
+   run the authorized final transaction: reverify the durable Step 0 predecessor,
+   consume one fresh exact unexpired transition-authorization attempt, and
+   atomically retain its consumption, S3 final state, and durable
+   `s3_issue_178` receipt. Remaining S4 cannot begin before that commit.
 2. Only after #178 lands, continue #179's remaining expansion while every project-
    management ingress path remains closed. Add nullable `root_ref` with no default,
    then install both the database-owned explicit-null insert bridge and the omitted-
@@ -761,8 +771,10 @@ minimum, prove:
     `insert|root_update|archive`; a `root-update` mutation sentinel is rejected.
 15. Before its own receipt or any S3 state, #179 Step 0 installs the complete
     generic authentication substrate: pinned Ed25519 signer keys plus singleton
-    policy/change audit; an append-only immutable release-evidence store and
-    append-only consumption ledger; the checked-in verifier, recorder, and
+    policy/change audit; an append-only immutable durable-release-evidence store;
+    separate append-only short-lived `forge_epic_172_transition_authorizations`
+    attempts in their distinct Ed25519 signature domain; an append-only consumption
+    ledger; the checked-in verifier, recorder, and
     consumer; dedicated certificate-authenticated `NOINHERIT` least-privilege
     recorder, consumer, and transition principals; canonical transition-identity
     uniqueness; and the singleton `disabled|provisional|active` enablement row
@@ -813,25 +825,41 @@ minimum, prove:
     green gates and final S5/S6 release readiness. The validator resolves and
     validates dependencies per step, rejects a missing/mismatched owner, and never
     turns #179's later S4 dependency on #178 into a dependency of its independently
-    landable Step 0 node. Every graph node, transition, and required-evidence row,
-    including `s3_issue_178`, must carry a non-null lifecycle-valid Ed25519
-    signature and be atomically consumed through the generic ledger by the
-    dedicated transition path. Fixture, cross-slice contract, implementation-order,
+    landable Step 0 node. Every graph-node and required-evidence receipt, including
+    `s3_issue_178`, must carry a non-null lifecycle-valid Ed25519 signature in the
+    durable-evidence domain. Once validly recorded, that immutable receipt never
+    expires. Every state transition separately locks, reverifies, and consumes one
+    fresh exact unexpired authorization attempt from the distinct transition-
+    authorization domain through the generic ledger and dedicated transition path.
+    Fixture, cross-slice contract, implementation-order,
     and static wording-parity sentinels require the same complete bootstrap list
     and its before-first-receipt/before-S3 ordering. Static ownership/import/parity
     sentinels prove Step 0 is the only creator and version owner of both paths; the
     JSON remains data-only;
     the validator imports no S3 or remaining-S4 symbol; and S3/later slices import
     the one validator, address and record evidence only for their owned nodes, and
-    create no second file, graph, helper, evidence/consumption store, verifier,
-    signer policy/key, principal, transition-identity rule, enablement singleton,
-    or metadata copy. Negative fixtures remove,
+    create no second file, graph, helper, durable-evidence/transition-authorization/
+    consumption store, signature domain, verifier, signer policy/key, principal,
+    transition-identity rule, enablement singleton, or metadata copy. Negative fixtures remove,
     duplicate, or reorder each registry node and each named edge; duplicate owner,
     evidence, or build metadata outside the shared registry; substitute either
     graph, edge set, or evidence for the other; reject the obsolete/truncated
     `s4_activate` chain; reject activation before S5 compatibility and S6 pre-
     activation green; reject enablement before S6 post-activation green; and reject
     release readiness before enablement.
+16. Release-authentication fixtures delay S3 for more than 30 minutes after the
+    valid `step0_retention_bridge` recording and rotate the signer policy/key; the
+    immutable predecessor remains durable and verifiable, but no expired
+    transition authorization may advance S3. An expired unused attempt is retained
+    audit-only. A newly signed exact replacement attempt in the distinct domain
+    may authorize the same pending S3 transition without changing the predecessor
+    or duplicating `s3_issue_178`. Replay of a consumed attempt, reuse under a
+    different operation/controller, wrong source/target/owner/build/SHA/epoch,
+    swapped durable/authorization signature domains, and a final-statement expiry
+    all fail closed. Two consumers racing the same attempt produce one winner;
+    injected rollback after every lock, verification, consumption, state, and
+    receipt write leaves no partial S3 state or consumption and permits retry only
+    with the still-valid attempt or a newly signed exact replacement.
 
 ## Cross-slice contract
 
@@ -850,8 +878,10 @@ or merge/release behavior.
 
 The release contract is deliberately acyclic but has two non-interchangeable
 meanings. Before recording any graph node, #179 Step 0 solely bootstraps the pinned
-Ed25519 signer policy/key/audit, generic immutable evidence store, append-only
-consumption ledger, checked-in verifier/recorder/consumer, dedicated least-
+Ed25519 signer policy/key/audit, generic immutable durable-evidence store, separate
+append-only short-lived `forge_epic_172_transition_authorizations` attempts in
+their distinct Ed25519 signature domain, append-only consumption ledger, checked-in
+verifier/recorder/consumer, dedicated least-
 privilege recorder/consumer/transition principals, unique canonical transition
 identity, and disabled enablement singleton. It also solely creates and versions
 the data-only
@@ -879,11 +909,16 @@ step0_retention_bridge
 filesystem work, disabling all project-management ingress, draining every pre-
 bridge process and database session, replacing evidence-bearing cascades with
 `RESTRICT|NO ACTION`, installing the database hard-delete guard, and creating the
-shared release-order JSON/validator and complete generic signed-evidence bootstrap.
+shared release-order JSON/validator and complete generic durable-evidence/distinct-
+transition-authorization/consumption bootstrap, including the separate append-only
+short-lived `forge_epic_172_transition_authorizations` store in its distinct
+Ed25519 signature domain.
 The bootstrap is not a graph node and produces no receipt. Only after it is
 complete may the external lifecycle-valid Ed25519 signer record the empty-
-predecessor `step0_retention_bridge`; S3 verifies that immutable receipt and its
-unconsumed canonical transition identity before it may record `s3_issue_178`.
+predecessor `step0_retention_bridge`; S3's final transaction locks and reverifies
+that immutable receipt, then consumes one fresh exact unexpired
+`forge_epic_172_transition_authorizations` attempt in the distinct domain before
+it may record `s3_issue_178`.
 It is a separately landable prerequisite and does not depend on S3. All project-
 management ingress stays closed through S3 and remaining S4's `root_ref` default,
 explicit-null insert bridge, non-null-to-null
@@ -915,14 +950,39 @@ each graph under its fixed meaning and validates every node's owner, predecessor
 evidence, and build identity rather than inferring either graph from a whole-issue
 header. It rejects using one graph, edge set, or evidence as the other.
 
+### S3 release-state completion
+
+The final S3 installation/state transaction is the only operation that may consume
+the retained `step0_retention_bridge` predecessor and record `s3_issue_178`. It
+locks the signer policy/key, durable predecessor receipt, canonical transition
+identity, exact predecessor set, fresh authorization-attempt ID/nonce, and both
+consumption uniqueness keys. It reverifies the durable receipt in the release-
+evidence domain and separately reverifies one exact signed authorization attempt in
+the distinct Ed25519 transition-authorization signature domain, bound to target
+`s3_issue_178`, source receipt, `owner:{issue:178,slice:'s3'}`, exact build/reviewed
+SHA, epoch-or-none, operation/controller identity, and lifetime
+`0 < lifetime <= 30 minutes`. Its final state-changing statement uses
+`clock_timestamp()` and requires the attempt still unexpired and unconsumed.
+
+Only then may the transaction append the predecessor consumption, commit S3's
+final state, and append the canonically unique signed `s3_issue_178` receipt. All
+changes commit or roll back together. Once validly recorded, both graph receipts
+remain immutable durable evidence and do not expire. An expired unused
+authorization attempt remains audit-only; a newly signed exact attempt may replace
+its authority without changing either durable receipt or creating a second
+`s3_issue_178`. A committed attempt/consumption cannot replay, and a different
+attempt cannot duplicate the same canonical S3 transition.
+
 ## Implementation order
 
 0. Land and verify the separately deployable #179 Step 0 bridge/full-project-
    ingress-close/drain/retention-safe-FK/hard-delete-guard checkpoint. Step 0 also
    solely creates and versions the data-only release-order JSON and its one
    validator. Before its own receipt, its separately reversible bootstrap installs
-   the pinned Ed25519 policy/key/audit, generic immutable evidence/consumption
-   ledgers, checked-in verifier/recorder/consumer, dedicated least-privilege
+   the pinned Ed25519 policy/key/audit, generic immutable durable-evidence store,
+   separate append-only short-lived `forge_epic_172_transition_authorizations`
+   store and distinct signature domain, append-only consumption ledger, checked-in
+   verifier/recorder/consumer, dedicated least-privilege
    recorder/consumer/transition principals, canonical transition-identity guard,
    and disabled enablement singleton. Its fixture proves those components, then
    records and verifies the signed empty-predecessor first-node receipt before S3.
@@ -935,10 +995,13 @@ header. It rejects using one graph, edge set, or evidence as the other.
    file imports an S4 symbol; remaining #179 only imports them. No S3 state writer
    may land before this contract test passes.
 2. With all project-management ingress still closed, import Step 0's release-order
-   validator and authentication substrate unchanged, verify/consume the signed
-   `step0_retention_bridge` receipt, address and record only the signed
-   `s3_issue_178` transition, and add only S3's additive
-   decision-revision/marker schema and dual reader. After this S3 contract lands,
+   validator and authentication substrate unchanged, then add only S3's additive
+   decision-revision/marker schema and dual reader. After all S3 state and tests are
+   ready, run the one final transaction described above: lock/reverify the durable
+   signed `step0_retention_bridge` receipt, consume a fresh exact unexpired
+   transition-authorization attempt in its distinct domain, atomically retain the
+   predecessor consumption and S3 final state, and record only the durable signed
+   `s3_issue_178` receipt. After this S3 contract lands,
    #179 owns the one expansion-window root-change journal/trigger migration,
    reconcile command, and cutover checkpoint; S3 supplies the canonical negative-
    reconciliation callback those downstream components invoke. Do not create a
@@ -1007,13 +1070,18 @@ Stop rather than improvise if:
   acknowledgement, decline, quarantine, cancellation, repair, or recovery needs a
   ninth row rather than a count-neutral head advance;
 - Step 0 could record its own receipt or let S3 materialize/record state before the
-  pinned Ed25519 policy/key/audit, generic immutable evidence/consumption ledgers,
-  checked-in verifier/recorder/consumer, dedicated recorder/consumer/transition
+  pinned Ed25519 policy/key/audit, generic immutable durable-evidence store,
+  separate append-only short-lived `forge_epic_172_transition_authorizations`
+  store and distinct signature domain, append-only consumption ledger, checked-in
+  verifier/recorder/consumer, dedicated recorder/consumer/transition
   principals, canonical transition-identity uniqueness, and disabled enablement
   singleton are installed and proven; any Step 0/S3 receipt is unsigned, has a
   nullable/maintenance authority arm, duplicates a canonical transition identity,
-  or bypasses atomic consumption;
+  or bypasses atomic consumption; S3's final state/receipt transaction lacks an
+  exact fresh unexpired authorization attempt, conflates its signature domain with
+  durable evidence, or lets an expired/replayed attempt authorize state;
 - #178/S3 would create, version, rewrite, or bypass Step 0's release-order JSON or
-  validator or signed-evidence substrate, record another slice's node, duplicate
-  shared node metadata/store/verifier/key/principal/enablement state, or use
+  validator or durable-evidence/transition-authorization substrate, record another
+  slice's node, duplicate shared node metadata/store/signature domain/verifier/key/
+  principal/enablement state, or use
   `codeDependencyGraph` evidence as `runtimeActivationGraph` evidence (or the reverse).
