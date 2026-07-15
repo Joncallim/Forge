@@ -2940,9 +2940,9 @@ contract. This split must match the per-step release manifest metadata above.
   “Project root changed — approve context again”; S5 never compares revisions or
   displays either path.
   `review_submission` records acknowledgement actor/time without changing the
-  immutable delivery and, when required, exact host-ledger working-tree review;
-  the later retry still rechecks current coverage and requires host review
-  `not_applicable|reviewed`. Every
+  immutable delivery and, when required, exact host-ledger and repository-change
+  working-tree reviews; the later retry still rechecks current coverage and
+  requires both reviews `not_applicable|reviewed`. Every
   marker has `autoRetryable:false`; unknown/stale markers expose no action and
   S4's route rechecks under the global order.
 - Packet retry and possible-submission acknowledgement controls carry S4's full
@@ -2955,16 +2955,22 @@ contract. This split must match the per-step release manifest metadata above.
 - S5 imports S4's discriminated recovery-marker union. Every known-invalid
   grant-mode/delivery/disposition/acknowledgement/failure combination is neutral
   and actionless before presentation. The server joins the exact prior audit, all
-  applicable run artifacts, and host ledger; proves typed terminal tuple equality
-  plus marker/ledger identity; and validates assembly/delivery/terminal/failure-stage together; the browser never
+  applicable run artifacts, host ledger, and repository baseline/change review;
+  proves typed terminal tuple equality plus every marker/review fingerprint; and
+  validates assembly/delivery/terminal/failure-stage together; the browser never
   composes independent fields into an action. A typed packet integrity hold is
   neutral, non-retryable, and has no web CTA. Incomplete success says evidence
   needs operator repair; true audit/artifact mismatch says evidence conflicts and
   is quarantined, never promising repair. Copy names Release/DevOps and the
   checked-in integrity runbook, while privileged resolution remains outside S5.
-  An exact joined `quarantined_abandoned` resolution plus cancelled task/package
+  An exact joined `quarantined_abandoned` resolution, complete sibling-evidence-set
+  fingerprint/repository disposition, plus cancelled task/package
   renders “Task closed — evidence quarantined,” preserves the conflicting records,
   and exposes no new-run control. Status alone never implies that closure.
+  Authorized evidence/history routes render a tombstoned project as “Project
+  removed — evidence retained,” preserve its original opaque rootRef/run evidence,
+  expose no former path or live-root control, and never relabel it when the physical
+  root is reused; normal project lists hide tombstones.
 - A live audit with `status:'claiming'` and a **server-computed PostgreSQL-time**
   `leaseActive:true` is first normalized into one discriminated claim-state union:
   preparing=`not_assembled/not_exposed`, assembled=`assembled/not_exposed`,
@@ -2973,10 +2979,11 @@ contract. This split must match the per-step release manifest metadata above.
   durable live phase; preflight, assembly, provider-validation, and
   post-submission failures remain on their last persisted copy until terminal
   commit. Impossible phase/assembly/delivery cross-products fail closed. Valid current phases render actionlessly. The browser never compares lease
-  timestamps or derives phase itself. An expired submitted claim with active
-  effect intent/quiescence alert renders “Waiting for worker changes to stop” and
-  no action until the authoritative owning host and complete supervised process
-  group release the resource fence; wrong/stale/unreachable host evidence remains
+  timestamps or derives phase itself. An expired submitted claim with an active or
+  orphaned containment lease/quiescence alert renders “Waiting for worker changes
+  to stop” and no action until the authoritative owning host's fence service and
+  operating-system adapter prove the complete lease group empty;
+  wrong/stale/divergent-key/insufficient-containment/unreachable host evidence remains
   waiting. Other stale/unknown observations are neutral until S4
   recovery/finalization persists terminal evidence.
 - S4 evidence uses opaque `rootRef` or the phrase "this project", never a host
@@ -2997,7 +3004,12 @@ contract. This split must match the per-step release manifest metadata above.
   files, requires working-tree inspection, and never offers automatic resubmission
   or claims rollback. `completion_preparation` is pre-transaction only; atomic
   gate/finalizer rollback never renders that cause. Packet UI consumes only the
-  host ledger's bounded review state/fingerprint, never entry paths.
+  host ledger and repository baseline/change evidence's bounded review states and
+  fingerprints, never entry paths or diffs.
+  `external_repository_change_requires_review` says the Agent Communication
+  Protocol runtime is not a filesystem sandbox, Forge stopped before its local
+  apply stages, and exact working-tree review is required; it exposes no path or
+  raw error and no automatic resubmission.
 - Project health action precedence is total: missing→install, disabled→enable,
   auth-required→connect, configuration-required→configure, unhealthy→fix,
   unknown→refresh, healthy→no CTA, and incoherent/future→neutral unavailable. The

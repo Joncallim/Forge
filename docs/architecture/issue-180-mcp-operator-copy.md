@@ -136,6 +136,8 @@ type PacketCurrentStatePresentationInput =
         actorId: string;
         resolvedAt: string;
         evidenceFingerprint: string;
+        siblingEvidenceSetFingerprint: string;
+        repositoryDisposition: 'reviewed' | 'abandoned';
       };
       taskStatus: 'cancelled';
       packageStatus: 'cancelled';
@@ -147,8 +149,9 @@ type PacketCurrentStatePresentationInput =
       evidenceFingerprint: string;
       effectIntent: Extract<
         PacketPostSubmissionEffectIntent,
-        { state: 'active' }
+        { state: 'not_started' | 'active' }
       >;
+      containmentLeaseState: 'active' | 'orphaned';
       taskStatus: 'running';
       packageStatus: 'running';
       leaseActive: false;
@@ -406,10 +409,11 @@ a fail-closed neutral state before the typed presenter is called.
   invents `failed_finalizing`. The server validates the complete claim-state discriminant, computes
   `leaseActive` against PostgreSQL time, and supplies the observation timestamp;
   the browser never compares `leaseExpiresAt` with `Date.now()`. An expired
-  observation with active post-submission effect intent and S4's bounded alert
+  observation with an unproven active/orphaned containment lease and S4's bounded alert
   renders “Waiting for worker changes to stop” with no action until the
-  authoritative owning host and the complete supervised process group prove the
-  resource fence quiescent. A wrong, stale, or unreachable host remains in this
+  authoritative owning host's fence service and operating-system containment
+  adapter prove the complete lease group empty. A wrong, stale, divergent-key,
+  insufficient-containment, or unreachable host remains in this
   state and never offers a new-run control. Other expired/incoherent observations
   normalize to neutral “Refreshing run state” until S4 recovery/finalization
   persists a terminal result.
@@ -428,17 +432,28 @@ a fail-closed neutral state before the typed presenter is called.
 - An exact append-only `quarantined_abandoned` resolution joined to that mismatch,
   cancelled package, and cancelled task renders “Task closed — evidence
   quarantined.” It states that Forge preserved the conflicting records and no new
-  run is available. Missing/mismatched resolution identity remains the unresolved
-  integrity hold; the browser never infers closure from status alone.
+  run is available. The server also validates the exact sibling-evidence-set
+  fingerprint and `reviewed|abandoned` repository disposition; the UI may state
+  “Repository evidence was intentionally abandoned” for the latter without
+  exposing paths or ledger detail. Missing/mismatched resolution or sibling
+  evidence remains the unresolved integrity hold and root-management barrier; the
+  browser never infers closure from status alone.
+
+- Evidence/history routes may explicitly read a tombstoned project and render
+  neutral “Project removed — evidence retained.” They keep the original opaque
+  `rootRef` correlation and immutable task/run evidence, show no former path or
+  live-root control, and never attach that history to a later project that reuses
+  the released physical root. Normal project lists continue to hide tombstones.
 
 - `reapprove_allow_once` shows “Approve one-time context again” and targets the
   package grant control. It never renders generic retry because the nonce burned
   when the packet claim committed.
 - `review_then_reapprove_allow_once` first shows the possible-prior-submission
-  acknowledgement. When S4's host ledger requires review, the same static copy
-  also says local files may contain partial work and the control label is “I
-  reviewed the submission and local changes.” After the S4 action records that
-  acknowledgement against the exact marker/ledger fingerprint, the marker
+  acknowledgement. When either S4's host ledger or repository baseline/change
+  evidence requires review, the same static copy says local files may contain prior
+  or partial work and the control label is “I reviewed the submission and local
+  changes.” After the S4 action records that acknowledgement against the exact
+  marker, ledger, and repository-change fingerprints, the marker
   becomes `reapprove_allow_once`; only then does the package grant control create
   a fresh nonce.
 - `retry_execution` is available for an `always_allow` marker whose delivery is
@@ -447,8 +462,9 @@ a fail-closed neutral state before the typed presenter is called.
   disposition is `reviewed_submission`. In both cases the task is `approved`, the
   package is still `blocked`, package policy is unchanged, current authorization
   is `same_decision|newer_covering_decision`, and neither execution nor issuance
-  lease is active. `hostApplyReview` must be `not_applicable|reviewed`; required or
-  changed-fingerprint review exposes no retry. A newer decision is shown as explicit reauthorization, not as
+  lease is active. Both `hostApplyReview` and `repositoryChangeReview` must be
+  `not_applicable|reviewed`; required or changed-fingerprint review exposes no
+  retry. A newer decision is shown as explicit reauthorization, not as
   continuity of the old grant. The server route locks and rechecks the same
   predicate, records the authorizing current revision, clears only the matched
   marker, moves the package to `ready`, and wakes after commit. The normal claim
@@ -456,8 +472,8 @@ a fail-closed neutral state before the typed presenter is called.
 - `review_submission` is a marker disposition paired with immutable delivery
   `submission_uncertain|submitted`. It states that ACP may already have accepted
   work and offers S4's acknowledgement action. Acknowledgement keeps delivery
-  unchanged, sets actor/time, records the exact host-ledger working-tree review
-  when required, and changes the disposition to
+  unchanged, sets actor/time, records the exact host-ledger and repository-change
+  working-tree reviews when required, and changes the disposition to
   `reviewed_submission`; if exact current coverage still holds, the presenter may
   then offer S4's explicit `retry_execution` action. A live `submitting` claim is
   evidence-only and has no recovery action until stale recovery converts delivery
@@ -512,6 +528,12 @@ failure says the external submission may have produced work, says Forge did not
 roll back local changes, requires the operator to inspect/resolve the working tree,
 and offers no automatic resubmission. It never displays a path, file name, command,
 provider text, or raw/sanitized exception.
+`external_repository_change_requires_review` renders “Repository changed during
+worker submission — review required.” It explains that the Agent Communication
+Protocol (ACP) runtime is not a filesystem sandbox, Forge stopped before its own
+local apply stages, and the operator must review the working tree. Changed and
+unverifiable results use the same bounded caution; no raw path, diff, or error is
+shown on this packet surface.
 `completion_preparation` refers only to work before the atomic finalizer; a gate
 insert/finalizer rollback remains in-progress/recovery state and never renders that
 cause.
@@ -548,10 +570,11 @@ never contain live `submitting`. Assembly never implies ACP acceptance. The
 current-state reader may show any validated live phase above only while its lease
 is valid. After recovery/finalization, the matching terminal artifact/marker owns
 the result; an expired `submitting` intent becomes `submission_uncertain`.
-The host-apply ledger remains separate: packet presentation consumes only its
-bounded `not_applicable|review_required|reviewed` state and fingerprint. Exact
-write-plan entries/paths stay in the authorized repository-change surface and are
-never copied into packet copy, task events, or integrity alerts.
+The host-apply ledger and ACP repository baseline/change evidence remain separate:
+packet presentation consumes only their bounded
+`not_applicable|review_required|reviewed` states and fingerprints. Exact write-plan
+entries, repository paths, and diffs stay in the authorized repository-change
+surface and are never copied into packet copy, task events, or integrity alerts.
 
 ### Client policy removal
 
@@ -711,7 +734,8 @@ Component/integration tests:
 38. every `HostApplyRecoveryReview` tuple is exhaustive. `review_required` uses
     exact marker/ledger-fingerprint acknowledgement and hides retry/reapproval;
     `reviewed` permits only the normal locked predicate; changed fingerprints fail
-    closed.
+    closed. The same matrix independently covers every `RepositoryChangeReview`,
+    including `not_observed`, unchanged, changed, and unverifiable outcomes.
 39. `completion_preparation` renders only for a terminal failed tuple. Atomic
     gate/finalizer rollback remains neutral in-progress/recovery state and cannot
     be mislabeled with that cause.
@@ -719,14 +743,22 @@ Component/integration tests:
     Release/DevOps/runbook copy. A true mismatch uses quarantine language, not a
     repair promise. No browser repair CTA exists; unauthorized, stale-fingerprint,
     and normal recovery controls leave the hold unchanged.
-41. exact `quarantined_abandoned` resolution plus cancelled task/package renders
-    permanent evidence quarantine/closure with no retry. A missing, stale, wrong-
-    reason, or status-only resolution remains actionless and unresolved.
-42. wrong-host recovery and worker/supervisor death with a surviving descendant
-    retain “Waiting for worker changes to stop” and expose no control until S4
-    proves the resource fence quiescent.
+41. exact `quarantined_abandoned` resolution plus cancelled task/package and the
+    complete sibling-evidence-set/repository disposition renders permanent evidence
+    quarantine/closure with no retry. A missing, stale, wrong-reason, incomplete-
+    sibling, or status-only resolution remains actionless and unresolved.
+42. wrong-host recovery and worker/fence-service/control loss with a surviving ACP
+    or validation descendant retain “Waiting for worker changes to stop” and expose
+    no control until S4's containment adapter proves the complete lease group empty.
 43. a root-binding mismatch renders bounded `root_changed` reapproval copy with no
     old-decision retry and no old/new path or internal resource reference.
+44. changed or unverifiable repository evidence before Forge's first local stage
+    renders the bounded external-change review message for valid response, failure,
+    and submission uncertainty. Retry, reapproval, quarantine, and root-management
+    actions remain hidden until the exact fingerprint is reviewed or abandoned.
+45. tombstoned project evidence remains reachable from the authorized history/
+    support route with “Project removed — evidence retained,” while normal lists
+    hide it, root reuse does not relabel it, and no former path is displayed.
 
 ## Ownership boundaries
 
