@@ -2930,18 +2930,29 @@ contract. This split must match the per-step release manifest metadata above.
   delivery `submission_uncertain|submitted` only after acknowledgement changes the
   separate disposition to `reviewed_submission`. In both cases the task is
   `approved`, package policy is unchanged, no lease is active, and the server has
-  classified current authorization as the same decision or a greater decision
-  revision that exactly covers the required set. Newer coverage is explicit
+  classified current authorization through canonical S1 `readEffectiveGrantState`
+  as the same effective project decision or a greater effective project decision
+  that exactly covers the required set. S3 denial-wins still applies to an
+  equal/newer package denial. Newer coverage is explicit
   reauthorization and the action records that revision; a new run snapshots it.
   Missing/narrower/unknown coverage exposes the grant control, not retry.
   `review_submission` records acknowledgement actor/time without changing the
   immutable delivery; the later retry still rechecks current coverage. Every
   marker has `autoRetryable:false`; unknown/stale markers expose no action and
   S4's route rechecks under the global order.
+- Packet retry and possible-submission acknowledgement controls carry S4's full
+  version-2 identity `{priorRuntimeAuditId, markerFingerprint}`; components never
+  synthesize an action-only request. A recovery marker on a task that remains
+  `running` because another sibling package has a live lease renders neutral
+  “Waiting for active package” without an action until task aggregation reaches
+  exactly `approved`.
 - A live audit with `status:'claiming'` and a **server-computed PostgreSQL-time**
-  `leaseActive:true` exhaustively renders actionless current phases for preparing
-  or assembled `not_exposed`, `submitting`, accepted/finalizing `submitted`, and
-  failed/finalizing `submission_failed`. The browser never compares lease
+  `leaseActive:true` is first normalized into one discriminated claim-state union:
+  preparing=`pending/not_exposed`, assembled=`assembled/not_exposed`,
+  submitting=`assembled/submitting`, accepted-finalizing=`assembled/submitted`, and
+  the closed pre-submission, submission-rejected, or provider-invalid
+  failed-finalizing variants. Impossible phase/assembly/delivery cross-products
+  fail closed. Valid current phases render actionlessly. The browser never compares lease
   timestamps or derives phase itself. Stale/unknown observations are neutral until
   S4 recovery/finalization persists terminal evidence.
 - S4 evidence uses opaque `rootRef` or the phrase "this project", never a host
@@ -2953,6 +2964,9 @@ contract. This split must match the per-step release manifest metadata above.
   `submitting` never appears in the artifact, and assembly never implies ACP
   acceptance. It never
   shows selected names, root paths, relative/absolute paths, excerpts, or contents.
+- S5 imports S4's closed `PacketFailureCode` enum and maps only those values to
+  bounded static copy. Unknown/future codes are neutral legacy/unknown evidence,
+  never untrusted free-text operator copy.
 - Project health action precedence is total: missing→install, disabled→enable,
   auth-required→connect, configuration-required→configure, unhealthy→fix,
   unknown→refresh, healthy→no CTA, and incoherent/future→neutral unavailable. The

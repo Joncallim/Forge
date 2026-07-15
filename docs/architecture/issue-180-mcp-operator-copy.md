@@ -44,23 +44,59 @@ type ProjectMcpPresentationInput = {
 
 type CatalogMcpPresentationInput = Pick<McpCatalogEntry, 'id' | 'runtime'>;
 
+type ActivePacketClaimState =
+  | {
+      phase: 'preparing';
+      assemblyState: 'pending';
+      deliveryState: 'not_exposed';
+    }
+  | {
+      phase: 'assembled';
+      assemblyState: 'assembled';
+      deliveryState: 'not_exposed';
+    }
+  | {
+      phase: 'submitting';
+      assemblyState: 'assembled';
+      deliveryState: 'submitting';
+    }
+  | {
+      phase: 'accepted_finalizing';
+      assemblyState: 'assembled';
+      deliveryState: 'submitted';
+    }
+  | {
+      phase: 'failed_finalizing';
+      failurePoint: 'pre_submission';
+      assemblyState: 'not_assembled';
+      deliveryState: 'not_exposed';
+    }
+  | {
+      phase: 'failed_finalizing';
+      failurePoint: 'submission_rejected';
+      assemblyState: 'assembled';
+      deliveryState: 'submission_failed';
+    }
+  | {
+      phase: 'failed_finalizing';
+      failurePoint: 'provider_response_invalid';
+      assemblyState: 'assembled';
+      deliveryState: 'submitted';
+    };
+
+type PacketRecoveryRequestIdentity = {
+  schemaVersion: 2;
+  priorRuntimeAuditId: string;
+  markerFingerprint: string;
+};
+
 type PacketCurrentStatePresentationInput =
   | {
       source: 'active_claim';
       taskStatus: TaskStatus;
       packageStatus: WorkPackageStatus;
       auditStatus: 'claiming';
-      phase:
-        | 'preparing'
-        | 'assembled'
-        | 'submitting'
-        | 'accepted_finalizing'
-        | 'failed_finalizing';
-      deliveryState:
-        | 'not_exposed'
-        | 'submitting'
-        | 'submission_failed'
-        | 'submitted';
+      claimState: ActivePacketClaimState;
       leaseActive: true;
       databaseObservedAt: string;
     }
@@ -77,7 +113,10 @@ type PacketCurrentStatePresentationInput =
             priorDecisionRevision: string;
             decisionRevision: string;
           }
-        | { state: 'not_covering' }
+        | {
+            state: 'not_covering';
+            reason: 'denied' | 'revoked' | 'narrowed' | 'policy_changed';
+          }
         | { state: 'unknown' };
       executionLeaseActive: boolean;
       issuanceLeaseActive: boolean;
@@ -90,12 +129,19 @@ type PresentationCta =
   | {
       kind: 'retry';
       label: string;
-      handler: 'retry_mcp_broker' | 'retry_packet_execution';
+      handler: 'retry_mcp_broker';
+    }
+  | {
+      kind: 'retry_packet_execution';
+      label: string;
+      handler: 'retry_packet_execution';
+      request: PacketRecoveryRequestIdentity;
     }
   | {
       kind: 'review_submission';
       label: string;
       handler: 'acknowledge_possible_submission';
+      request: PacketRecoveryRequestIdentity;
     }
   | { kind: 'install'; label: string; handler: 'install_mcp' }
   | { kind: 'enable'; label: string; handler: 'enable_mcp' }
@@ -316,12 +362,14 @@ its versioned `packet_issuance` marker and passes the discriminated input to
 `mcpBroker` contract. Runtime parsing normalizes unknown task/package statuses to
 a fail-closed neutral state before the typed presenter is called.
 
-- The server exhaustively maps a live `claiming` audit with an unexpired lease:
-  `not_exposed` is “Preparing project context” or “Context assembled”; `submitting`
-  is “Submitting to worker”; `submitted` is “Worker accepted — finalizing”; and
-  `submission_failed` is “Submission failed — finalizing”. These are current states
+- The server exhaustively maps a live `claiming` audit with an unexpired lease
+  into `ActivePacketClaimState`. The discriminated union makes impossible pairs
+  unrepresentable: pending or pre-submission failure is never submitted, and
+  submitting always has assembled metadata. It renders “Preparing project
+  context”, “Context assembled”, “Submitting to worker”, “Worker accepted —
+  finalizing”, or the bounded failed-finalizing variant. These are current states
   with no action, not immutable run evidence, and are never read from a terminal
-  artifact. The server validates the phase/delivery combination, computes
+  artifact. The server validates the complete claim-state discriminant, computes
   `leaseActive` against PostgreSQL time, and supplies the observation timestamp;
   the browser never compares `leaseExpiresAt` with `Date.now()`. An expired or
   incoherent observation normalizes to neutral “Refreshing run state” until S4
@@ -354,8 +402,11 @@ a fail-closed neutral state before the typed presenter is called.
   evidence-only and has no recovery action until stale recovery converts delivery
   to `submission_uncertain`.
 
-If `currentAuthorization.state` is `not_covering`, the UI offers no packet retry.
-It says that project context changed and targets the exact grant control. After an
+`currentAuthorization` is the server's projection of canonical S1
+`readEffectiveGrantState`, not a direct project-row coverage check. The reader
+preserves S3 denial-wins, including an equal/newer package denial. If
+`currentAuthorization.state` is `not_covering`, the UI offers no packet retry. It
+says that project context changed and targets the exact grant control. After an
 operator restores complete coverage, the server returns
 `newer_covering_decision`; a pre-intent marker may then expose explicit retry, and
 a post-intent marker may do so only after possible-submission acknowledgement.
@@ -366,6 +417,17 @@ Every issuance marker has `autoRetryable:false`; the UI does not synthesize queu
 retry from delivery state. Unknown/malformed/stale markers are neutral, expose no
 action, and return a stale-action response if a previously rendered control races
 current state.
+
+Both packet actions carry S4's immutable version-2 request identity
+`{priorRuntimeAuditId, markerFingerprint}`. Components do not reconstruct it from
+the current marker or send an action-only request. When stale recovery leaves the
+task `running` because another sibling package still holds a live execution lease,
+the marker renders neutral “Waiting for active package” with no action. Actions
+become eligible only after normal aggregation makes the task exactly `approved`.
+
+S5 imports S4's exact closed `PacketFailureCode` enum. It maps only those values to
+bounded copy; an unknown value is legacy/unknown and actionless, never displayed as
+server-provided free text.
 
 ### Grant controls
 
@@ -512,6 +574,19 @@ Component/integration tests:
     coverage and changed package policy remain actionless.
 26. two identical recovery actions converge on one recorded success and one visible
     transition; only a changed fingerprint/state renders a stale-action `409`.
+27. every valid `ActivePacketClaimState` pair renders its intended actionless copy;
+    invalid phase/assembly/delivery cross-products fail closed to “Refreshing run
+    state” and cannot reach the typed presenter.
+28. retry and acknowledgement controls carry the exact version-2 prior-audit and
+    marker-fingerprint identity. A component cannot submit an action-only request
+    or substitute identity from another task/package.
+29. a project allow decision racing an equal/newer package denial renders
+    `not_covering` from the canonical reader and never exposes packet retry.
+30. a recovery marker on a `running` task with a live sibling package renders
+    “Waiting for active package” without an action; the same durable marker becomes
+    actionable only after the task is `approved`.
+31. every closed S4 `PacketFailureCode` maps to bounded static copy, while an
+    unknown/future code is neutral, actionless, and never rendered verbatim.
 
 ## Ownership boundaries
 
