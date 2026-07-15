@@ -923,7 +923,8 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   task    running         → approved
   ```
 
-  The package gets a filesystem-only v2 marker, creates no `agent_runs`, and
+  The package gets a filesystem-only v2 marker carrying the exact canonical
+  `EffectiveGrantState['phase']` plus a separate consumed discriminant, creates no `agent_runs`, and
   consumes no attempt. Its explicit handoff disposition is
   `{taskDisposition:'operator_hold', autoRetryable:false,
   terminalFailure:false}`. It must not reuse the existing `terminalBlock` flag,

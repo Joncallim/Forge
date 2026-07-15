@@ -94,7 +94,8 @@ type FilesystemGrantBlockMetadata = {
     | 'consumed_once';
   requirementKeys: string[];
   requestedCapabilities: FilesystemProjectCapability[];
-  grantPhase: 'none' | 'denied' | 'revoked' | 'approved';
+  grantPhase: EffectiveGrantState['phase'];
+  grantConsumed: boolean;
   grantDecisionRevision: string | null;
   deniedRequired: boolean;
   revocationReason: string | null;
@@ -111,7 +112,7 @@ nonterminal. The handoff result must not reuse the existing `terminalBlock` flag
 because current orchestrator paths interpret that flag as task failure.
 
 `blockFingerprint` is a versioned digest of the normalized requirement keys,
-exact required capability set, grant phase, and decision revision. It excludes
+exact required capability set, grant phase, consumed flag, and decision revision. It excludes
 human reason text and timestamps. Recovery compares the fingerprint under lock,
 so a stale grant response cannot clear a block created for changed policy. #180
 uses the structured fields for copy and treats the fingerprint as an opaque
@@ -442,6 +443,10 @@ minimum, prove:
 12. Optional `continue_without_mcp` remains executable without a packet, revoked
     and first-time states remain distinct, and filesystem holds remain excluded
     from automatic retry.
+13. Every canonical phase, including `proposed` and `not_issued`, plus the
+    `consumed` discriminant round-trips through the v2 marker/parser. No known
+    canonical state is normalized from reason text or silently mapped to another
+    phase.
 
 ## Cross-slice contract
 
