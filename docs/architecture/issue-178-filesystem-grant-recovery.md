@@ -185,8 +185,12 @@ for authority.
 Every filesystem decision also stores the positive decimal
 `rootBindingRevision` from the locked project. `readEffectiveGrantState` accepts a
 decision only when that revision equals the project's current internal binding.
-Project root creation or backfill may bind the project to revision 1, but it must
-never add that revision to a pre-v2 approval. The current schema contains no
+An unbound project has the one explicit internal revision `0`, which is never
+issuable and never serialized as decision authority. Project root creation or
+backfill compare-and-sets the locked counter to its next positive value; a normal
+first binding therefore becomes revision 1, while no writer ever forces, resets,
+or decrements the counter. Binding must never add that revision to a pre-v2
+approval. The current schema contains no
 immutable root identity captured when a legacy approval was made, so observing
 today's path cannot prove what that approval originally authorized. Every legacy
 decision without a stored binding revision remains non-issuable until an explicit
@@ -414,23 +418,38 @@ or a human reason are never sufficient recovery evidence.
 ## Mixed-version rollout and rollback
 
 S3 adds a new operator-hold disposition that an old worker cannot interpret, so
-schema compatibility alone is not enough. Roll out in this order:
+schema compatibility alone is not enough. Root-trigger installation and epoch
+activation are cutover operations, not a live mixed-version bridge: PostgreSQL
+must never try to call or duplicate S3's TypeScript reconciler. Roll out in this
+order:
 
 1. Add the project `BIGINT` decision counter plus nullable decision/root-binding
-   revision and marker fields and the dual v1/v2 reader. Do not emit v2 markers
-   yet. Every approval without a stored root-binding revision is non-issuable.
-2. Drain old workers or enforce a protocol/version gate that prevents them from
-   claiming S3-capable packages. An old orchestrator would otherwise turn an
-   operator hold into task failure.
-3. Use #179's checked-in host-binding procedure to bind the project to the current
-   canonical root and initial revision 1. Do not upgrade any legacy approval as a
-   side effect. Collision/unbound rows and every decision without historical
-   binding evidence remain held until explicit reapproval. Then enable revision
-   writers, v2 markers, operator-hold transitions, and positive plus negative
-   reconciliation.
-4. Deploy #179 packet/claim producers only after S3 readers and lock order are
+   revision and marker fields and the dual v1/v2 reader. Backfill unbound root
+   revisions to `0`. Do not emit v2 markers yet. Every approval without a stored
+   root-binding revision is non-issuable.
+2. Disable packet issuance and project-management ingress. Revoke the v1 web/root-
+   writer database credential, terminate its sessions, and drain/disable old web,
+   worker, and root-management services. An old orchestrator could otherwise turn
+   an operator hold into task failure; an old project route performs filesystem
+   work before its database write and therefore cannot be fenced safely by a late
+   trigger rejection.
+3. Under the canonical project → tasks → packages → approvals order, run S3's
+   negative reconciliation for every project whose binding may have changed in
+   the expansion window. Then use #179's checked-in
+   `npm run project-roots:bind-v2 -- --actor <operator-id> --apply` procedure to
+   compare-and-set each live local project to the next positive root
+   revision. Do not upgrade any legacy approval. Collision/unbound rows and every
+   decision without historical binding evidence remain held until explicit
+   reapproval.
+4. Install/enable #179's protocol-v2 root barrier, then run exactly
+   `npm run protocol:activate-work-package-v2 -- --actor <operator-id> --apply`.
+   The binding command never advances the
+   epoch. Only after activation commits may the operator enable registered S3/root
+   writers, v2 markers, operator-hold transitions, and reconciliation; packet
+   issuance is enabled last.
+5. Deploy #179 packet/claim producers only after S3 readers and lock order are
    compatible. Deploy #180/#181 consumers and tests against that contract.
-5. Remove the v1 adapter only after the supported migration window and evidence
+6. Remove the v1 adapter only after the supported migration window and evidence
    show no remaining v1 rows.
 
 Rollback disables v2 writers and new claims but keeps the additive columns and
@@ -530,7 +549,11 @@ or merge/release behavior.
    reconciliation and post-commit wake-up.
 6. Bind decision authority to the internal root revision and make project repoint
    call the same negative reconciler before the new root can be claimed.
-7. Drain or gate incompatible workers, then enable v2 writers.
+7. Drain incompatible workers and root writers, reconcile/bind roots, activate
+   epoch 2 with
+   `npm run protocol:activate-work-package-v2 -- --actor <operator-id> --apply`,
+   then enable v2 writers and
+   issuance in that order.
 8. Run the PostgreSQL concurrency, failure, and cross-slice tests before #179
    producers or #180 presentation depend on the contract.
 

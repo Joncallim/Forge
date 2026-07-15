@@ -949,7 +949,9 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   A root repoint increments that separate revision and calls the same negative
   reconciler, so old-root project/package decisions become `revoked` and the new
   repository requires explicit reapproval. Stable packet `rootRef` correlation is
-  never authority. Initial backfill may bind the project to revision 1 only; it
+  never authority. An unbound project has internal root-binding revision `0`,
+  which is never issuable. Initial backfill compare-and-sets the counter to its
+  next positive value (normally revision 1) and never resets or decrements it; it
   never upgrades an existing approval because no legacy row contains immutable
   root-at-decision evidence. Every legacy decision without a stored binding
   revision remains non-issuable until explicit reapproval on the current locked
@@ -1023,16 +1025,22 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   serialized result: either #179 claims first under its fence, or S3 holds before
   claim. Generic packet/execution failure never burns or recreates an approval.
 - **Mixed-version rollout.** Ship additive nullable decision/root-binding fields
-  and the dual v1/v2 reader before v2 writers. Every approval without a stored
-  binding revision is non-issuable. #179's checked-in host procedure binds only
-  the project to the current canonical root and revision 1; it never upgrades a
-  legacy approval. Collision/unbound rows and all legacy decisions remain held
-  until explicit reapproval. Then drain old workers or protocol-gate claims because
-  an old orchestrator can misread the new operator-hold marker as task failure. Enable
-  S3 revision writers/holds/reconciliation before #179 issuance producers and
-  #180/#181 consumers. Rollback disables writers/new claims but retains schema and
-  the dual reader; it does not guess or downgrade revisions. Remove v1 support
-  only after the bounded migration window.
+  and the dual v1/v2 reader before v2 writers; unbound projects use revision `0`.
+  Every approval without a stored binding revision is non-issuable. The cutover
+  then disables packet and project-management ingress, revokes/terminates v1 web
+  credentials and sessions, and drains old web, worker, and root-management
+  services. S3 performs its canonical negative reconciliation before #179's
+  `npm run project-roots:bind-v2 -- --actor <operator-id> --apply` procedure
+  compare-and-sets each live local project to the next positive revision; it never
+  upgrades a legacy approval. After collision/
+  unbound rows are held, enable the protocol-v2 root barrier and run exactly
+  `npm run protocol:activate-work-package-v2 -- --actor <operator-id> --apply`.
+  The binding command never advances the
+  epoch. Enable registered S3/root writers only after activation, then enable #179
+  issuance and #180/#181 consumers. PostgreSQL triggers never call or reimplement
+  the S3 TypeScript reconciler. Rollback disables writers/new claims but retains
+  schema and the dual reader; it does not guess or downgrade revisions or restart
+  v1 services against v2 state. Remove v1 support only after the bounded window.
 - **Required PostgreSQL tests.** Prove exact hold and recovery transitions,
   barrier-aware `running → approved`, zero runs/attempts, monotonic revision precedence under
   equal/reversed timestamps, legacy fail-closed behavior, grant narrowing/removal,
