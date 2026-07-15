@@ -184,9 +184,12 @@ exact coverage fingerprint.
 - concurrent finalizers respect partial unique index.
 - one committed packet claim makes at most one external model/ACP submission; an
   accepted but Forge-invalid response does not trigger the existing automatic
-  correction loop;
-- a v1 audit writer held across durable epoch-2 activation is rejected before any
-  bounded repository read;
+  correction loop; the packet-bearing AI SDK call has `maxRetries:0`, every lower
+  adapter disables replay after possible acceptance, and wire capture proves one
+  request under a retryable provider failure;
+- a bridge-trigger legacy package claim held across durable epoch-2 activation is
+  rejected at its `running` transition before any bounded repository read, while a
+  genuine pre-trigger process is proved drained operationally;
 
 Tests must state the actual guarantee: cooperative one-winning-claim and best-effort delivery, not cryptographic recall of bytes or in-flight I/O.
 
@@ -236,10 +239,24 @@ grant-mode × delivery-state recovery-disposition matrix, including
 and `review_submission`. Acknowledgement never changes immutable delivery: it
 changes only disposition to `reapprove_allow_once` or `reviewed_submission` with
 database actor/time evidence. Retry from `reviewed_submission` still requires
-current exact always-allow coverage. The locked route may accept the same decision
-or a greater decision revision that exactly covers unchanged package policy; it
+current exact always-allow coverage. The locked route may accept the same effective
+decision or a greater effective decision revision that exactly covers unchanged
+package policy only when canonical S1 `readEffectiveGrantState` returns approved
+`project_always_allow`; an equal/newer package denial still wins. It
 records the authorizing revision, and missing/narrower/unknown coverage fails
 closed.
+
+Every terminal matrix row uses S4's exact closed `PacketFailureCode`:
+authorization loss/override → `authorization_changed`; execution or issuance
+lease loss → the named lease-expiry code; process loss → `worker_stopped`;
+preflight/assembly failure → the named stage code; proven transport refusal →
+`submission_rejected`; accepted-or-unknown transport outcome →
+`submission_uncertain`; accepted but invalid provider output →
+`provider_response_invalid`; and interrupted atomic finalization →
+`terminalization_interrupted`. Unknown codes fail closed in S5/S6 and never become
+free-text assertions. When another sibling package retains a live execution lease,
+S4 recovery leaves the task `running`; the marker is actionless until normal task
+aggregation later reaches `approved`.
 
 ## Prompt/instruction assertions
 
@@ -281,15 +298,23 @@ Keep this small:
    pre-intent recovery uses explicit retry, and post-intent states require
    possible-submission acknowledgement before any new decision/run.
 8. Race two identical recovery actions: one ledger row and one wake survive, and
-   both return the recorded success. Then change marker fingerprint/state and prove
-   that stale request returns `409` without wake.
+   both version-2 requests carry the same routed task/package, prior audit, and
+   marker fingerprint and return the recorded success even after marker clearing.
+   Then substitute a route/identity field and prove the stale request returns `409`
+   without wake.
 9. Revoke and restore an always-allow grant around a packet-recovery marker. The UI
    hides retry while uncovered, shows explicit reauthorization for the newer exact
    decision, requires acknowledgement first for post-intent delivery, and the new
-   run snapshots the new revision.
+   run snapshots the new revision. Race an equal/newer package denial against the
+   restore and prove canonical denial-wins hides retry.
 10. Exercise every live packet phase: preparing, assembled, submitting,
     accepted/finalizing, and failed/finalizing. Each is actionless current state;
-    expired/incoherent observations remain neutral until recovery.
+    every invalid phase/assembly/delivery cross-product and expired/incoherent
+    observation remains neutral until recovery.
+11. Leave a sibling execution lease live while packet recovery completes. The task
+    stays `running` and the marker says “Waiting for active package” without an
+    action; after sibling aggregation reaches `approved`, the bounded action may
+    appear.
 
 Back-end integration tests remain authoritative for concurrency and state transitions.
 
@@ -330,20 +355,24 @@ S4 changes cross web and worker process boundaries, so S6 must prove this rollou
 1. **Expand schema first.** #179 adds/backfills the unique project `root_ref` with
    database `DEFAULT gen_random_uuid()` retained for old writers, nullable
    nonce/claim/snapshot fields, issuance-recovery action table, protocol epoch
-   singleton/default/rejecting trigger, new status vocabulary, and partial indexes
-   without changing legacy readers. Existing
+   singleton, `work_packages.claim_protocol_version`, the rejecting package
+   `running`-transition trigger, new status vocabulary, and partial indexes without
+   changing legacy readers. Existing
    artifacts remain valid; S6 verifies schema/Drizzle/writer predicate parity.
 2. **Deploy dual readers and guarded writers.** New readers treat legacy
    `allow_once` without nonce as non-issuable, old preview decisions as
    `unknown_legacy`, old zero-default audit rows as `unknown_legacy` rather than
    proof of assembly, and legacy path-valued `root` as hidden.
 3. **Durable protocol barrier and drain.** With the epoch still 1 and v2 issuance
-   disabled, prove every audit insert reaches the database trigger before a bounded
-   read. Stop/drain v1 workers and prove no v1 claim remains.
+   disabled, prove every package claim reaches the database transition trigger
+   before a bounded read. Stop/drain processes already past the newly installed
+   trigger and prove no running package has null/protocol-1 claim evidence.
 4. **Cut over producers.** Transactionally advance the monotonic epoch to 2, then
    enable v2 workers to write run-scoped claims and lifetime-stable opaque
-   `rootRef`. Hold a v1 writer across activation and prove its claim rolls back with
-   zero repository reads. Rollback never lowers the epoch.
+   `rootRef`. Hold a bridge-trigger v1 package transition across activation and
+   prove it is rejected with zero repository reads. Separately start a genuine
+   pre-trigger fixture and prove activation is forbidden until the fixture is
+   externally drained. Rollback never lowers the epoch.
 5. **Post-drain scrub.** Only after durable epoch-2 evidence, #179—not test-only
    S6—runs its separately gated restartable operation/later migration that clears
    legacy persisted root paths and records only aggregate scrub counts. It is not
@@ -355,7 +384,8 @@ Compatibility tests cover old-web/new-worker and new-web/old-worker combinations
 legacy `allow_once`, old grant-blocked/failed packages, preview rows without mode,
 old audit rows, concurrent old project inserts during root backfill/non-null
 cutover, and existing duplicate-permitted artifact types. An incompatible old
-packet writer is rejected by the epoch trigger before repository reads. Rollback is
+packet writer reconnecting through the bridge trigger is rejected at its package
+transition before repository reads. Rollback is
 code-only and forward-schema-compatible: leave additive columns, indexes, root
 default, and monotonic epoch in place, disable v2 packet production, and never
 restart an old packet writer against v2 state.
@@ -370,12 +400,22 @@ different layer:
 
 ```json
 {
-  "test:mcp:contract": "node scripts/run-with-deadline.mjs 60 -- vitest run __tests__/mcp-admission-invariant.test.ts --testTimeout=10000",
-  "test:mcp:postgres": "node scripts/run-with-deadline.mjs 240 -- node scripts/run-playwright-contract.mjs --forbid-skips --forbid-retries -- --project=mcp-postgres --grep @mcp-postgres --timeout=45000",
-  "test:mcp:issuance": "node scripts/run-with-deadline.mjs 300 -- node scripts/run-playwright-contract.mjs --forbid-skips --forbid-retries -- --project=mcp-issuance --grep @mcp-issuance --timeout=60000",
-  "e2e:mcp-operator": "node scripts/run-with-deadline.mjs 240 -- node scripts/run-playwright-contract.mjs --forbid-skips --forbid-retries -- --project=mcp-operator-desktop --project=mcp-operator-mobile --grep @mcp-operator --timeout=60000"
+  "test:mcp:contract": "node scripts/run-with-deadline.mjs 60 -- node scripts/run-vitest-contract.mjs --manifest test-contracts/mcp-admission-v2.json --partition contract -- vitest run __tests__/mcp-admission-invariant.test.ts --testTimeout=10000",
+  "test:mcp:postgres": "node scripts/run-with-deadline.mjs 240 -- node scripts/run-playwright-contract.mjs --manifest test-contracts/mcp-admission-v2.json --partition postgres --forbid-skips --forbid-retries -- --project=mcp-postgres --grep @mcp-postgres --timeout=45000",
+  "test:mcp:issuance": "node scripts/run-with-deadline.mjs 300 -- node scripts/run-playwright-contract.mjs --manifest test-contracts/mcp-admission-v2.json --partition issuance --forbid-skips --forbid-retries -- --project=mcp-issuance --grep @mcp-issuance --timeout=60000",
+  "e2e:mcp-operator": "node scripts/run-with-deadline.mjs 240 -- node scripts/run-playwright-contract.mjs --manifest test-contracts/mcp-admission-v2.json --partition operator-desktop --partition operator-mobile --forbid-skips --forbid-retries -- --project=mcp-operator-desktop --project=mcp-operator-mobile --grep @mcp-operator --timeout=60000"
 }
 ```
+
+`web/test-contracts/mcp-admission-v2.json` is a reviewed, checked-in allowlist—not
+output generated from the current test tree. It has `schemaVersion:2` and five
+partitions (`contract`, `postgres`, `issuance`, `operator-desktop`, and
+`operator-mobile`). Each partition declares its runner, an explicit
+`expectedCount`, and the complete sorted array of stable scenario IDs. Count must
+equal array length, IDs are globally unique, and empty or wildcard entries are
+invalid. Every required Vitest and Playwright scenario declares exactly one of
+those IDs in source. Adding, deleting, renaming, or repartitioning a required test
+therefore changes this reviewed contract file in the same PR.
 
 Database scenarios carry exactly one of `@mcp-postgres` or `@mcp-issuance` in
 their title or Playwright `tag` property—never a free-form annotation that
@@ -392,9 +432,12 @@ Dedicated projects use matching `grep`/`testMatch` rules, `retries:0`, and seria
 execution for shared database suites. Remove the current
 `testInfo.project.name !== 'chromium-desktop'` skip from
 `mcp-handoff-concurrency.spec.ts`; project selection belongs in configuration/tags,
-not runtime `test.skip`. CI runs
-each named and generic command with `--list`, asserts exact expected test IDs and
-cardinality, and fails on overlap, omission, or duplicate selection.
+not runtime `test.skip`. CI runs a static-manifest audit before execution. For each
+named partition the wrapper proves `expected manifest IDs → collected IDs →
+executed first-attempt IDs` are identical. It also collects the generic projects
+and fails if a dedicated ID leaks into a generic viewport or if a required test is
+untagged and absent from every partition. This detects deletion and omission
+because the expected side is checked in, not derived from `--list`.
 
 | Script | Scope | Per-test timeout | CI wall-clock budget |
 |---|---|---:|---:|
@@ -403,17 +446,22 @@ cardinality, and fails on overlap, omission, or duplicate selection.
 | `npm run test:mcp:issuance` | desktop-only nonce/claim/lease/failure-point races | 60 s | 300 s |
 | `npm run e2e:mcp-operator` | Chromium desktop + mobile visible flow/accessibility | 60 s | 240 s |
 
-`scripts/run-playwright-contract.mjs` first records the exact `--list` manifest,
-runs Playwright with machine-readable results, and fails if any selected test is
-missing, runtime-skipped, retried/flaky, duplicated, or unexpected. Injected one-skip
-and first-attempt-only-failure fixtures prove those gates. The outer
+`scripts/run-playwright-contract.mjs` and `scripts/run-vitest-contract.mjs` first
+compare collected IDs to the static manifest, run with machine-readable results,
+and then compare executed IDs back to the same manifest. They fail on missing,
+unexpected, runtime-skipped, retried/flaky, duplicated, or second-attempt results.
+Self-tests delete a required test, remove its tag, inject one skip, duplicate an
+ID, and inject a first-attempt-only failure to prove each gate. The outer
 `scripts/run-with-deadline.mjs` terminates the process tree and exits non-zero at
 the stated wall budget; workflow job `timeout-minutes` is a second outer bound.
 Per-test `--timeout`/Vitest `--testTimeout` flags above are mandatory, not prose.
 PostgreSQL suites remain serial unless DB and Redis namespaces are isolated per
 worker. CI uploads traces, screenshots, scenario tuples, and opaque audit/run IDs
 on failure. It fails if a suite is skipped unexpectedly or exceeds its budget;
-increasing a budget requires an explicit review note.
+increasing a budget requires an explicit review note. Generic `npm test` and
+`npm run e2e` must still pass under repository-wide defaults, but their result is
+smoke compatibility, not a substitute for manifest-bound release evidence. The
+strict no-skip/no-retry policy is scoped to the four named commands above.
 
 ## Coverage ownership
 
