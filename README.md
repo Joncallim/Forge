@@ -26,7 +26,7 @@
 </div>
 
 <p align="center">
-  <img src="web/public/brand/forge-og.png" alt="FORGE — coordinated AI software delivery" width="900">
+  <img src="docs/assets/brand/forge-motion.svg" alt="The FORGE mark assembles from six specialist modules around a central orchestration core" width="900">
 </p>
 
 ## About
