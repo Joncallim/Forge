@@ -31,8 +31,9 @@ Make required bounded-filesystem denials, revocations, and missing grants recove
 
 1. **Admission owns the decision.** Recovery reads the canonical S1/S2 decision and never parses human text.
 2. **Held is not failed.** Filesystem grant blocks leave the package `blocked`,
-   return the task to `approved`, and leave execution attempts unchanged. A task
-   must never remain `running` when no work package owns an execution lease.
+   return the task to `approved` only when no sibling owns an execution lease or
+   awaits mandatory review, and leave execution attempts unchanged. A task remains
+   `running` while either task-wide barrier exists.
 3. **Decision order is database order.** A later project `always_allow` may
    supersede an older local denial only when its monotonic
    `grantDecisionRevision` is greater and it covers the exact required set.
@@ -135,7 +136,8 @@ If the canonical projection is blocked:
 
 ```text
 package pending | ready → blocked
-task    running         → approved
+task    running         → approved only with no live sibling lease or `awaiting_review`
+task    running         → running while either task-wide barrier remains
 ```
 
 Effects:
@@ -145,16 +147,17 @@ Effects:
 - do not increment task attempts;
 - do not invoke packet assembly;
 - in the same transaction, keep an already-`approved` task approved or compare
-  and set `running → approved`;
+  and set `running → approved` only after locking sibling packages in ID order and
+  proving none has a live execution lease or `awaiting_review`;
 - return `taskDisposition:'operator_hold'` to `progressWorkforce`.
 
 `progressWorkforce` and the orchestrator must distinguish this hold from a
 terminal implementation failure. The canonical nonterminal task state is
 `approved`. This matches the task grant endpoint's editable states and gives the
-operator a reachable reapproval action. A task may remain `running` only when a
-different package still has a current execution lease; the serial beta worker
-does not have that case today. If parallel execution is introduced later, its
-task aggregation needs a separate design rather than weakening this invariant.
+operator a reachable reapproval action. A task remains `running` when a different
+package has a current execution lease **or** is `awaiting_review`; the latter is a
+mandatory task-wide barrier even after every lease clears. S3 uses S4's shared
+sibling-aware task reconciler rather than maintaining a weaker aggregate rule.
 
 ### Optional fallback
 
@@ -310,9 +313,10 @@ Apply exactly one of these transitions:
    migration path described below.
 2. **Now uncovered, denied, consumed, or revoked.** Write or refresh the v2
    marker from canonical inputs. A package still in `pending` or `ready` moves to
-   `blocked` before claim. If its task is `running` without another live execution
-   lease, compare-and-set the task to `approved` in the same transaction. Do not
-   create an agent run or consume an attempt.
+   `blocked` before claim. If its task is `running`, lock sibling packages in ID
+   order and compare-and-set the task to `approved` only when none has a live
+   execution lease or `awaiting_review`. Do not create an agent run or consume an
+   attempt.
 3. **No longer requires filesystem context.** Clear only a matching filesystem
    marker and recover only a package whose status is proven to be owned by that
    marker. A generic MCP, security, dependency, or reviewer block remains intact.
@@ -322,15 +326,18 @@ under the locks. Never infer recovery or revocation from human text.
 
 S3 never clears #179's `packet_issuance` marker through this reconciler. The one
 integration point is package-local one-time reapproval: after S3 rotates a fresh
-nonce under project → task → package → approval locks, it calls #179's
-package-scoped resolver in the same transaction. That resolver continues to the
-prior agent run → runtime audit → exact packet artifact suffix, proves canonical
-typed audit/artifact terminal-tuple equality, compare-and-sets the exact terminal
-prior audit, `reapprove_allow_once` marker/fingerprint, changed nonce, current policy,
-and no active lease, then clears only the packet marker and moves
-`blocked → ready`. A stale marker, second reapproval, changed policy, or active
-claim is a no-op/conflict; no sibling package is scanned. Redis wake-up remains
-after the combined commit.
+nonce under project → task → packages in ID order → approval locks, it calls
+#179's package-scoped resolver in the same transaction. “Package-scoped” limits
+grant evaluation; the resolver still locks siblings to enforce the task-wide
+review barrier. It then continues through the complete applicable suffix: prior
+agent run → runtime audit → host-apply ledger/entries → all artifacts → existing
+or new recovery action → integrity alerts/resolutions → review gates. It proves
+canonical typed audit/artifact terminal-tuple equality, compare-and-sets the exact
+terminal prior audit, `reapprove_allow_once` marker/fingerprint, changed nonce,
+current policy, no active lease, and no sibling `awaiting_review`, then clears only
+the packet marker and moves `blocked → ready`. A stale marker, second reapproval,
+changed policy, active claim, or unresolved review is a no-op/conflict. Redis
+wake-up remains after the combined commit.
 
 ## Negative reconciliation and revocation
 
@@ -429,7 +436,9 @@ minimum, prove:
    monotonic revisions do. A legacy pair without revisions fails closed.
 5. Project grant removal and narrowing perform negative reconciliation: exact
    covered subsets stay eligible, uncovered `pending`/`ready` packages become
-   blocked, and task `running → approved` occurs only without another live lease.
+   blocked, and task `running → approved` occurs only without another live lease
+   or sibling `awaiting_review`. Race both hold/revocation and post-review
+   reconciliation against approval/rejection decisions in both lock orderings.
 6. Required denial/revocation/consumed-once holds create no `agent_runs`, consume
    no attempt, and write the bounded v2 marker and fingerprint.
 7. A covering grant moves only a matching filesystem-held package
@@ -442,7 +451,7 @@ minimum, prove:
    no deadlock across S3 reconciliation, #179 issuance, nonce rotation, and stale
    claim recovery.
 10. Fresh one-time reapproval invokes only #179's package-scoped resolver; stale
-    marker, double reapproval, policy drift, and active-lease races cannot clear
+    marker, double reapproval, policy drift, active-lease, and awaiting-review races cannot clear
     another block or wake before commit.
 11. Mixed old/new worker gating and rollback retain operator-hold truth; an old
     worker cannot reinterpret a v2 hold as task failure.
@@ -474,7 +483,8 @@ or merge/release behavior.
 1. Add the additive revision/marker schema and dual reader.
 2. Add canonical projection, revision precedence, fingerprint, and unit tests.
 3. Make handoff hold denied/revoked/consumed required grants before claim and
-   return a lease-free task to `approved`.
+   return a barrier-free task to `approved` while preserving `running` for any live
+   sibling lease or `awaiting_review`.
 4. Add the locked project reconciliation service and package-local mutation path.
 5. Migrate both endpoints to the global lock order, including negative
    reconciliation and post-commit wake-up.
