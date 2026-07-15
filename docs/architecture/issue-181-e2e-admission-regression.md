@@ -872,15 +872,103 @@ Assert:
   copying its connection identity fails before bytes are returned. Both logins are
   non-superuser, `NOINHERIT`, cannot `SET ROLE`, and have no session-authorization
   capability. The package resolver derives its exact worker from immutable
-  `session_user`. The shared human-history web login is not an end-user identity:
-  its reader accepts an opaque Forge session credential plus task/version as
-  prepared/binary parameters, hashes and locks the matching live database session,
-  derives the user there, rechecks ACL, and atomically appends the text-free audit.
-  It accepts no user ID and never stores/logs/audits/returns the raw credential. Two
-  users behind the same web login prove valid same-scope reads; swapped, expired,
-  revoked, fabricated, cross-user/task, wrong-login, and definer-`current_user`
-  calls return zero bytes and cannot forge a read audit. Import S4's exact plan-entry identity and projection-
-  resolver fixtures: `{planArtifactId,planVersion,entryId,contentDigest}` resolves
+  `session_user`. The shared human-history web login is not an end-user identity.
+  S6 imports S4's exact database-backed session contract rather than inventing a
+  test-only session table. The current substrate is `public.sessions`: before the
+  migration its `id uuid` is both the raw lowercase-UUID `forge_session` cookie and
+  Redis-key suffix, `revoked_at` exists, and PostgreSQL has no expiry. The final v1
+  row keeps `id uuid` only as an independent internal ID and adds
+  `credential_digest_v1 bytea NOT NULL` with an exact 32-byte length check,
+  `expires_at timestamptz NOT NULL`, and a unique index on
+  `credential_digest_v1`; existing `last_seen_at` becomes the database activity
+  authority, while `user_id` and `revoked_at` remain the identity and revocation
+  authority.
+
+  The shared constant is
+  `SESSION_CREDENTIAL_DOMAIN_V1 = UTF8("forge:web-session:v1\0")`, exactly 21 bytes
+  with hex `666f7267653a7765622d73657373696f6e3a763100`. For compatibility, credential wire
+  bytes are exactly the 36 lowercase ASCII bytes of the existing hyphenated UUID
+  cookie after validating UUID-v4 and variant positions. There is no case folding,
+  Unicode normalization, percent decoding, UUID binary conversion, Base64 decoding,
+  hex decoding, or text round trip. The only digest is
+  `SHA-256(domain_bytes || credential_bytes)`, stored and passed as exactly 32
+  binary bytes, with no added delimiter or length prefix. The cross-component fixed
+  vector maps cookie
+  `00000000-0000-4000-8000-000000000000` to digest
+  `a4a6fe7265a6d2ec096cb0d31bb6b79d91a3d9a36537827009cb01f22e1f58e4`.
+
+  The human reader accepts the raw credential as a prepared binary `bytea` plus
+  task/version, hashes it inside the database, selects and locks the unique matching
+  digest row, then requires `revoked_at IS NULL AND clock_timestamp() < expires_at`
+  before deriving `user_id` and rechecking the task access-control list (ACL). Just
+  before returning text and committing its audit, it rechecks database time and
+  revocation under the same locked row. It accepts no user ID. The v2 Redis key is
+  exactly `session:v2:<lowercase credential-digest hex>`, never the raw credential;
+  its value carries only internal session ID, user ID, absolute `expires_at`, and
+  non-secret metadata, and its time-to-live is no greater than the
+  database's remaining lifetime. Every authentication rechecks PostgreSQL, so a
+  stale cache never authorizes. New-session creation generates the independent
+  internal UUID and raw credential separately, derives the digest, and commits the
+  database row with `last_seen_at = db_now` and
+  `expires_at = db_now + interval '7 days'` before filling Redis or returning the
+  raw cookie.
+
+  PostgreSQL owns the existing sliding seven-day lifetime. Under the locked live
+  row, an authenticated request whose database time is strictly greater than
+  `last_seen_at + interval '60 seconds'` synchronously sets
+  `last_seen_at = db_now` and `expires_at = db_now + interval '7 days'` and commits
+  before Redis is refreshed.
+  A request at or below that threshold does not extend either value.
+  Only after that commit may Redis use `PXAT` no later than the returned database
+  expiry. Redis refresh failure does not revoke a database-valid session; the next
+  read repairs the cache. Database refresh failure denies that request and does not
+  extend Redis, so the cache can never lead the database authority.
+
+  Revocation commits `revoked_at` plus a digest-keyed durable cache-invalidation
+  item before deleting Redis. Retry/reconciliation completes a failed delete, while
+  the database makes the digest unusable immediately.
+
+  Migration first adds nullable digest/expiry columns and transitional dual readers/
+  writers. New sessions already use the independent internal ID, unchanged cookie,
+  digest, database expiry, and v2 cache. The legacy sliding-lifetime writer and its
+  processes stop and drain before backfill. For each locked legacy row, the migrator
+  validates the legacy raw `id::text` and reads both Redis 7
+  `PEXPIRETIME session:<legacy-id>` and cached `lastSeenAt`. A
+  missing, malformed, non-expiring, or elapsed cache entry revokes the session. A
+  live row receives that exact absolute expiry and reconciled activity time before
+  it is assigned its digest and fresh independent internal UUID. It then receives a
+  digest-keyed v2 cache whose `PXAT` is no later than the database expiry; only then
+  is the raw-key cache deleted. Crash/resume identifies work by digest and internal
+  ID and never extends the copied lifetime.
+
+  After old binaries drain, a checkpoint proves every live row migrated and
+  collision-free, disables raw-ID fallback, makes the new columns/check/index strict,
+  and purges the old `session:*` namespace. It zero-scans the database, Redis, logs,
+  traces, and audit payloads. After that checkpoint, the raw credential may exist
+  only in the browser cookie, bounded request buffer, and prepared binary function
+  argument until hashing. It never persists, returns, appears in SQL text, or enters
+  an audit, error, metric, trace, log, invalidation item, or other function. The
+  locked legacy-row rekey is the sole bounded transition exception; bind argument
+  one is redacted by position and failures retain only an aggregate reason code.
+  The human-history route stays disabled until this checkpoint has disabled raw-ID
+  fallback.
+
+  S6 makes the session writer, migration helper, database reader, and test harness
+  agree on the fixed vector. It tests a valid before-expiry read; exact-expiry
+  equality and already-expired rejection; revoked, swapped-user, cross-user/task,
+  fabricated, malformed-length/case/version/variant, wrong-domain, re-encoded, and
+  one-bit-changed credentials; and concurrent read-versus-revoke/expiry plus two
+  simultaneous users behind the same login. No read whose final database check sees
+  expiry or revocation returns bytes or commits an audit.
+
+  Migration cases cover mixed old/new rows, exact backfill expiry/activity,
+  malformed/non-expiring Redis state, digest collision, crash/resume at every
+  database/Redis boundary, Redis-delete loss, old-namespace purge, and post-drain
+  raw-ID fallback. Refresh cases prove no extension at or below 60 seconds, an exact
+  seven-day database-first extension only above 60 seconds, database failure with no
+  cache extension, and Redis failure followed by database-valid cache repair. S6
+  also imports S4's exact plan-entry identity and projection-resolver fixtures:
+  `{planArtifactId,planVersion,entryId,contentDigest}` resolves
   only for the same project/task, package agent, canonical requirement/capability
   binding, plan version, and entry. Cross-project/task/version/entry/agent/
   requirement/digest references, stale replay, and a current-plan substitution for
@@ -1183,7 +1271,8 @@ attestation; it does not transfer S5 implementation ownership to #181.
 
 S6 imports the release-evidence bootstrap installed by Step 0 before either S3 or
 remaining S4 lands: the manifest-backed append-only evidence/key/policy/consumption
-tables, fixed checked-in Node verifier/recorder/consumer, and dedicated certificate-
+tables, the separate append-only `forge_epic_172_transition_authorizations` store,
+the fixed checked-in Node verifier/recorder/consumer, and dedicated certificate-
 authenticated writer/transition principals. The bootstrap imports no S3 or
 remaining-S4 symbol and leaves every recorder/consumer except the one bounded Step 0
 path disabled. S6 creates no second release table, mutable readiness flag, verifier,
@@ -1264,10 +1353,18 @@ may pass the scrub prerequisite.
    any remaining S4 expansion opens yet.
 2. **`s3_issue_178` — land and verify #178/S3.** With project ingress still closed, install the
    decision-revision, operator-hold, negative reconciliation, root-binding, and
-   canonical lock-manifest/helper contract. The release gate records Ed25519-signed
-   exact S3 build and test evidence through the Step 0 store. Missing, unsigned, or
-   duplicate-transition S3 evidence rejects every remaining S4 schema,
-   journal, reader, writer, or producer node.
+   canonical lock-manifest/helper contract. S3 does not treat the durable Step 0
+   receipt as permission to advance. Its recorder first locks and reverifies that
+   exact predecessor, then locks and consumes one separately signed, unexpired
+   `forge_epic_172_transition_authorizations` row whose target is the canonical
+   `s3_issue_178` identity and whose predecessor set, owner, build, reviewed SHA,
+   epoch-or-none, controller run/job, key generation, attempt ID, nonce, issued-at,
+   and expiry all match. The
+   same transaction records the Ed25519-signed exact S3 build and test evidence
+   through the Step 0 store. Rollback consumes neither predecessor nor
+   authorization. Missing, expired, replayed, wrong-domain, wrong-predecessor,
+   wrong-build, or duplicate-transition S3 authority rejects every remaining S4
+   schema, journal, reader, writer, or producer node.
 3. **`s4_expand` — expand schema and deploy compatible S4 readers.** #179 first adds nullable project `root_ref` with **no
    default** while project ingress remains closed. Before the one mixed-version
    project-ingress reopen, a database-owned insert bridge
@@ -1431,6 +1528,44 @@ may pass the scrub prerequisite.
    database time and never beyond the immutable outer deadline. A reused/stolen token,
    wrong login, stale fingerprint, old operation, delayed heartbeat, or `SET ROLE`
    attempt cannot refresh authority.
+
+   S6 imports one byte-exact construction from S4; it does not invent a second
+   controller-token hash. The shared constants are
+   `CONTROLLER_LEASE_SECRET_BYTES_V1 = 32` and
+   `CONTROLLER_LEASE_DIGEST_DOMAIN_V1`, whose value is exactly
+   `UTF8("forge:epic-172-controller-lease:v1\0")`. The domain is exactly 35 bytes,
+   with hex
+   `666f7267653a657069632d3137322d636f6e74726f6c6c65722d6c656173653a763100`.
+   Each production secret is exactly 32 cryptographically secure random bytes, and
+   the only valid digest is
+   `SHA-256(domain_bytes || raw_secret_bytes)`. There is no added delimiter or
+   length prefix and no hex, Base64, or text conversion before hashing. The fixed
+   32-byte digest is stored and passed as binary `bytea`. The raw current secret
+   exists only in bounded controller memory and is never durably stored.
+
+   The checked-in language-neutral fixture
+   `web/__tests__/__fixtures__/epic-172-controller-lease-v1.json` is the single
+   source of the domain bytes, length, and vector imported by the controller, S4
+   migration/database tests, and S6 verifier. Production rejects the fixture secret.
+   The fixed-search-path helper
+   `forge.epic_172_controller_lease_digest_v1(bytea)` rejects an input whose length
+   is not 32 and returns
+   `pg_catalog.sha256(domain_bytes || input)` as exactly 32 bytes. Every lease
+   comparison uses `forge.constant_time_equal_32_v1(bytea, bytea)` after locking the
+   singleton row. That helper rejects non-32-byte operands, scans all 32 positions,
+   accumulates every bytewise exclusive-or result, and decides equality only after
+   the loop, with no data-dependent early return.
+
+   The cross-component fixed vector uses raw-secret hex
+   `000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f`
+   and expects digest hex
+   `9889482e88c98806a17cded064e203c3dd4108af93acb8db66a5a699d87b5947`.
+   Parity tests make the controller, database helper, and S6 verifier
+   produce the exact expected bytes, then reject a secret or digest length other
+   than 32, wrong domain or version, an added delimiter/length prefix, UUID/
+   normalization conversion, a one-bit change, hex/Base64/text
+   reinterpretation, `next = current`, stale or replayed current secrets, wrong
+   generation, and concurrent compare-and-set losers before lease extension.
 
    A suite failure, skipped/retried test, output/teardown/destruction failure,
    controller-detected database or Checks outage, or controller cancellation calls
@@ -1664,8 +1799,8 @@ restate fields it does not own:
 The sentinel therefore asserts eight durable mutation identities—the seven exact
 UI-route actions above plus the internal S3→S4 resolver—without presenting the
 resolver as an eighth CTA. It checks failure-code precedence, the canonical
-  canonical version-2 manifest's relative lock edges plus every production path's
-  applicable-row sequence, and the
+version-2 manifest's relative lock edges plus every production path's applicable-
+row sequence, and the
 following complete literal command/runbook set:
 
 ```text
@@ -1950,11 +2085,13 @@ preflight command is a same-job trust/attestation gate and must pass first.
    pre-activation all-mode, root-binding, journal, Step 0 release-store bootstrap,
    durable-node/fresh-transition-authorization Ed25519 identity, projection-
    overlimit legacy archive, provisional ingress/credential activation/controller-
-   lease/expiry/disable/promotion, key-rotation, and rollback tests.
+   lease/expiry/disable/promotion, canonical controller-secret digest constants and
+   cross-component fixed vectors, key-rotation, and rollback tests.
 8. Add integrity alert/runbook/privileged-resolution/quarantine sibling-evidence
    contract tests.
 9. Add prompt filtering/injection assertions, immutable-`session_user` definer-
-   reader attacks, and the historical task-log prompt scrub.
+   reader attacks, exact `public.sessions` digest/expiry/revocation migration and
+   cache-failure cases, and the historical task-log prompt scrub.
 10. Add thin Playwright packet-current-state and packet-independent local recovery,
     quiescence, reason-specific integrity, review, possible-invocation
     acknowledgement, policy-eligible retry, decline, pending, and unavailable flows.
@@ -2018,7 +2155,10 @@ re-exported, represented by an alternate suppression/truncation arm, or treated 
 keyed evidence; if a historical prompt-shaped task-log field survives or is exposed
 before scrub; if a general database principal can directly read raw plan text, if a
 human reader trusts shared-login `session_user` as a user or accepts an asserted user
-ID instead of deriving it from a live opaque Forge session, if the package reader
+ID instead of deriving it from the exact digest-matched, locked, unrevoked, and
+unexpired `public.sessions` row; if Redis authorizes without that database recheck,
+the post-drain reader accepts a raw-ID fallback, or migration can leave a live raw
+`session:*` key; if the package reader
 does not derive its worker from `session_user`,
 or if either dedicated reader is invoked outside its exact role; if plan history or an
 eligible projection reference leaks through live/SSE/snapshot/replay/Redis state
@@ -2033,7 +2173,10 @@ normal action allocates a ninth head, or max-cardinality recovery, acknowledgeme
 decline, quarantine, cancellation, repair, or migration cannot complete count-
 neutrally; if provisional ingress/issuance survives its database deadline,
 controller death, suite failure, timeout, or database/Checks outage, or if any path
-can bypass/extend a non-active operation; if final readiness does not atomically
+can bypass/extend a non-active operation; if the controller, database helper, and S6
+verifier disagree on the 32-byte secret/digest constants or fixed vector, accept a
+wrong-length/re-encoded/wrong-domain value, or compare fewer than all 32 digest
+bytes; if final readiness does not atomically
 consume both enablement and `enabled_build_tests_green`, uniquely append its node,
 and promote the same provisional operation; if final readiness lacks the post-
 enable `enabled_build_tests_green` evidence or that evidence is incorrectly added
@@ -2120,8 +2263,10 @@ bypasses read hiding and checkpointed migration parity;
 if an eligible plan entry can cross project/task/version/entry/agent/requirement/
 digest scope or survive in a forbidden live/SSE/snapshot/replay/Redis sink; if a
 general application principal can select raw plan entries, if a definer reader
-authorizes owner `current_user`, if the human reader cannot reject swapped/expired/
-revoked session credentials with zero bytes/audit, or if either reader
+authorizes owner `current_user`, if the human reader does not derive identity from
+the locked final-v1 `public.sessions` digest row or cannot reject malformed, swapped,
+exactly expired, revoked, migration-incomplete, or stale-cache credentials with zero
+bytes/audit, or if either reader
 can run outside its exact ACL/package-bound role; if arbitrary authorization JSON can bypass the
 fixed constructor, duplicate keys can reach `JSONB`, or SQL null semantics can erase
 a required protocol-v2 task/package/run scope; if reapproval mutates a decision
@@ -2134,7 +2279,10 @@ or cleared without the checkpointed whole-task archive and retained evidence; if
 the named replacement can claim while `pending` or become eligible outside the
 atomic source-archive/replacement CAS; if
 Step 0 cannot install and use the signed release store
-before S3; if any graph node/transition is not Ed25519 signed; if canonical
+before S3; if S3 can advance from the durable Step 0 receipt alone rather than
+atomically locking and consuming a separately signed, still-unexpired exact
+`forge_epic_172_transition_authorizations` row for `s3_issue_178`; if any graph
+node/transition is not Ed25519 signed; if canonical
 transition uniqueness can be evaded with another receipt/nonce; if durable recorded
 node evidence expires before a later separately deployed node, or if a transition
 authorization can use the wrong signature domain/key generation, omit expiry/nonce/
@@ -2143,7 +2291,9 @@ back transition; if any ingress/issuance boundary can run after the provisional
 database deadline, the 45-second controller lease, or manual/automatic/failure
 disable, if the controller does not generate/retain the initial secret before open,
 if heartbeat uses a different login/service, stores/returns raw tokens, or fails to
-rotate digest/generation atomically, if a heartbeat can extend either deadline, if the enabled proof is not
+rotate digest/generation atomically; if any component drifts from the canonical
+32-byte lease-secret domain, digest bytes, fixed vector, or constant-time comparison;
+if a heartbeat can extend either deadline, if the enabled proof is not
 bounded by the exact 660-second DAG, if failure cannot close all flags without
 lowering the epoch, or if final readiness does not atomically consume both exact
 receipts and promote the same operation; if `enabled_build_tests_green` is missing

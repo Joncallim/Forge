@@ -3,9 +3,9 @@
 Status: historical review record.
 
 All normative amendments below were incorporated into
-`issue-181-e2e-admission-regression.md` during integrated review round 3. The
-primary architecture document is authoritative; this file records why it changed
-and must not override or narrow the primary document.
+`issue-181-e2e-admission-regression.md` during the cited integrated review rounds.
+The primary architecture document is authoritative; this file records why it
+changed and must not override or narrow the primary document.
 
 ## Review round 1 findings and resolutions
 
@@ -62,3 +62,39 @@ implementation. Integrated round 3 later added the complete failure/recovery and
 mixed-version matrices, both packet grant modes, PostgreSQL-time barriers,
 persistence-wide leakage sentinels, exact CI budgets, and ADR 0008 supersession;
 consult the primary document for the current contract.
+
+## Integrated review round 24 findings and resolutions
+
+### 8. S6 must use the same controller-token bytes as S4
+
+The earlier S6 wording said only “domain-separated digest,” which could let the
+external controller, database heartbeat, and verifier implement different byte
+formats. The primary document now imports S4's exact 32-byte secret, UTF-8 domain,
+SHA-256 construction, binary storage, constant-time comparison, and fixed vector.
+Cross-component tests reject wrong lengths, domains, encodings, generations,
+replays, and compare-and-set losers.
+
+### 9. Human plan-history reads need a real database session contract
+
+The earlier text referred generically to a live database session even though the
+current application stores a raw cookie UUID in `public.sessions`, keeps expiry in
+Redis, and has no database expiry column. The primary document now imports S4's
+exact digest and expiry columns, UUID credential bytes, fixed vector, PostgreSQL-
+authoritative sliding refresh, database-before-cache create/refresh/revoke ordering,
+digest-keyed cache repair, and bounded legacy rekey migration. Expiry, revocation,
+cache failure, malformed credentials, crash/resume, and final raw-key removal are
+explicit release-blocking tests.
+
+### 10. Durable Step 0 evidence is not permission for S3 to advance
+
+The S6 release-order restatement previously let `s3_issue_178` appear to proceed
+from the durable Step 0 receipt alone. The primary document now requires the S3
+transaction to lock that receipt and consume one fresh, exact
+`forge_epic_172_transition_authorizations` row before recording S3 evidence.
+Expiry, replay, wrong-domain/binding, duplicate transition, and rollback cases fail
+closed.
+
+### 11. Correct the duplicated manifest wording
+
+The duplicated `canonical` word is removed; the text now says “canonical version-2
+manifest.”
