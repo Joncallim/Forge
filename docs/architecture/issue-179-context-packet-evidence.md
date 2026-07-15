@@ -132,6 +132,8 @@ Required additive schema changes:
 
 - `filesystem_mcp_grant_approvals.grant_decision_nonce UUID NULL` during migration; every new `allow_once` write requires it after cutover;
 - a durable decision revision on the approval decision/effective snapshot, using the #178 project-serialized revision contract;
+- `work_packages.claim_protocol_version INTEGER NULL`, written by the database on
+  each transition to `running` and retained as durable claim evidence;
 - `filesystem_mcp_runtime_audits` fields:
   - `protocol_version`;
   - `grant_approval_id`;
@@ -158,35 +160,40 @@ Two separate partial unique indexes are required for protocol v2 `operation='con
 
 SQL migration predicates, Drizzle schema declarations, and conflict writers must be semantically identical.
 
-## Durable packet-protocol barrier
+## Durable worker-protocol barrier
 
-Mixed-worker safety uses a database fence, not a process-local feature flag. Add a
-singleton `forge_runtime_protocol_epochs` row for
-`name='filesystem_context_packet'` with `minimum_writer_protocol`, activation
-actor/time, and an immutable activation audit. It begins at protocol 1. During
-expansion, legacy audit inserts receive `protocol_version=1` by database default;
-v2 workers explicitly write `2`.
+Mixed-worker safety uses the existing pre-read package claim boundary, not the
+later runtime-audit insert and not a process-local feature flag. Add a singleton
+`forge_runtime_protocol_epochs` row for `name='work_package_execution'` with
+`minimum_writer_protocol`, activation actor/time, and immutable activation audit.
+It begins at protocol 1.
 
-A PostgreSQL `BEFORE INSERT` trigger on a context-packet runtime audit reads the
-singleton and rejects a null/lower `protocol_version`. The audit insert is part of
-the package/run/packet claim transaction and must commit before any repository
-packet read, so after the epoch is activated an already-running v1 process fails
-closed before Forge reads or exposes bounded context. The trigger takes a shared
-lock on the epoch row and stores the observed epoch on the audit; activation updates
-only that singleton row and never reaches into project/task/package rows, so it
-cannot reverse the global entity lock order. This barrier governs only Forge's
-cooperative packet producer; it does not confine an ACP process or revoke other
-host access.
+An expand-phase PostgreSQL trigger runs on every work-package status transition to
+`running`, a boundary every current legacy worker already traverses before the
+executor can read repository context. The trigger reads the transaction-local
+`forge.worker_protocol` setting (`1` when absent for legacy binaries), takes a
+shared lock on the epoch row, rejects a lower protocol, and writes the observed
+version to `work_packages.claim_protocol_version`. A v2 claim sets
+`SET LOCAL forge.worker_protocol='2'` before its conditional `running` transition.
+The trigger therefore fences a restarted old binary before *any* executor work,
+not merely before a late audit. It governs cooperative Forge execution and does
+not confine an ACP process or revoke other host access.
 
-Cutover is an explicit deployment operation: deploy the trigger/default and v2
-readers/writers disabled, observe/drain v1 workers, verify no v1 claims remain,
-then transactionally advance the epoch to 2 and enable v2 producers. The activation
-transaction locks the singleton exclusively, aborts unless no nonterminal
-protocol-1 audit exists, and only then updates the epoch. A v1 insert that already
-holds the trigger's shared lock finishes first and is detected; a later insert
-waits, sees epoch 2, and fails. The epoch is monotonic and is never lowered on
-rollback. Tests hold a v1 writer across activation and prove its audit/claim
-transaction rolls back with zero repository packet reads.
+The activation transaction takes the epoch row exclusively, then—in its stable
+database snapshot—aborts unless there is no `running` package with null or
+protocol-1 claim evidence. A running transition that already holds the shared lock
+finishes first and becomes visible to that check; a later transition waits, sees
+epoch 2, and fails. Activation does not lock entity rows or mutate them, so it
+cannot reverse the entity order. The epoch is monotonic and never lowered.
+
+Cutover still requires operational drain of pre-trigger processes before epoch-2
+activation; no schema change can retroactively stop a binary that was already past
+the package claim when the trigger was installed. After the expand trigger has been
+deployed everywhere and the drain is proven, the durable activation fence prevents
+an old binary from reconnecting. Tests cover both cases: a genuine pre-trigger
+worker must be externally drained, while a legacy worker that traverses the bridge
+trigger and is held across activation is rejected at the package transition with
+zero repository reads.
 
 ## Lock order and claim transaction
 
@@ -197,6 +204,7 @@ project
   → task(s ascending)
   → work package(s ascending)
   → grant approval/decision row(s ascending)
+  → worker-protocol epoch
   → agent run
   → runtime audit claim
   → packet metadata artifact
@@ -207,10 +215,12 @@ Live health checks and other network/system probes happen before the transaction
 1. Lock project, task, and package rows in global order.
 2. Lock the applicable approval/decision row after the package.
 3. Re-read current package requirements and canonical admission. Verify exact required coverage and decision revision. For `allow_once`, also verify the approval ID + nonce is approved and unconsumed.
-4. Conditionally move the package to `running`, create the `agent_runs` row, and create the existing execution lease.
-5. Insert the per-run unique `claiming` audit with `claimToken`, `agentRunId`, a database-time lease, and the immutable authorization snapshot.
-6. For `allow_once`, win the additional nonce-unique insert and mark that exact decision consumed using a compare-and-set.
-7. Commit all package, run, execution-lease, issuance-claim, and consumption state together.
+4. Set transaction-local worker protocol 2, then conditionally move the package to
+   `running`; the trigger locks/checks the epoch and records claim protocol 2.
+5. Create the `agent_runs` row and existing execution lease.
+6. Insert the per-run unique `claiming` audit with `claimToken`, `agentRunId`, a database-time lease, and the immutable authorization snapshot.
+7. For `allow_once`, win the additional nonce-unique insert and mark that exact decision consumed using a compare-and-set.
+8. Commit all package, run, execution-lease, issuance-claim, and consumption state together.
 
 Only the winner proceeds. A failure at any statement rolls the whole claim transaction back: there is no running package, orphan run, issuance audit, consumed nonce, or attempt. Duplicate workers stop before repository packet reads. A run that does not need a packet creates neither an issuance audit nor a packet artifact.
 
@@ -236,7 +246,14 @@ Boundaries:
 - ACP prompt submission;
 - terminal audit transition and artifact upsert.
 
-For project `always_allow`, each boundary also rechecks that the current project decision revision still covers the exact required capabilities. If revocation/narrowing committed before the check, the worker starts no later governed read or exposure. This is cooperative fencing: a grant change cannot recall bytes already read or cancel an external operation that began after the previous check.
+For project `always_allow`, each boundary also reruns canonical S1
+`readEffectiveGrantState` under the S3 locks and requires an effective
+`project_always_allow` approval whose revision and coverage still authorize the
+exact required capabilities. That preserves denial-wins if a package-level denial
+races the project grant. If revocation/narrowing/override committed before the
+check, the worker starts no later governed read or exposure. This is cooperative
+fencing: a grant change cannot recall bytes already read or cancel an external
+operation that began after the previous check.
 
 An invalid execution lease, token, expired lease, or superseded project decision prevents subsequent governed reads and persistence, but cannot revoke data already in memory.
 
@@ -252,7 +269,9 @@ automatically resubmitted. A failure before the intent CAS is still
 that an external request started.
 
 One committed packet claim permits at most one external model/ACP submission.
-Packet-bearing execution therefore bypasses the executor's current
+Packet-bearing execution sets the AI SDK `generateText` option `maxRetries:0`,
+requires every adapter/provider transport beneath it to disable replay after a
+request may have been accepted, and bypasses the executor's current
 `MAX_GENERATION_ATTEMPTS` response-validation loop after the first transport call.
 If the provider accepted a response that Forge later rejects as malformed or
 invalid, delivery remains `submitted`, the run terminalizes as failed, and the
@@ -266,6 +285,18 @@ submission claim.
 Immediately after assembly and before prompt buffering, logging, rendering, ACP request construction, or any other exposure, persist under both valid ownership predicates one immutable assembly snapshot. Assembly state and delivery outcome are separate so a later submission failure cannot rewrite known assembly evidence:
 
 ```ts
+type PacketFailureCode =
+  | 'authorization_changed'
+  | 'execution_lease_expired'
+  | 'issuance_lease_expired'
+  | 'worker_stopped'
+  | 'preflight_failed'
+  | 'assembly_failed'
+  | 'submission_rejected'
+  | 'submission_uncertain'
+  | 'provider_response_invalid'
+  | 'terminalization_interrupted';
+
 type PacketAssemblySnapshot =
   | {
       state: 'assembled';
@@ -323,6 +354,16 @@ type PacketIssuanceRecoveryMarkerV2 = {
 };
 ```
 
+The enum mapping is closed and shared by S4, S5, and S6: authorization revision
+loss maps to `authorization_changed`; the two lease predicates map to their named
+expiry codes; process loss maps to `worker_stopped`; preflight/assembly failures
+map to their named codes; a definitive pre-acceptance transport refusal maps to
+`submission_rejected`; an accepted-or-unknown transport outcome maps to
+`submission_uncertain`; accepted output that fails Forge validation maps to
+`provider_response_invalid`; and an interrupted atomic terminalizer is recovered
+as `terminalization_interrupted`. Unknown values fail closed as legacy/unknown
+evidence and never become free-text UI input.
+
 `rootRef` is an opaque, project-scoped random identifier and is never derived from, reversible to, or displayed as an absolute/relative filesystem path. Counts are non-negative bounded integers. Redaction summaries use a closed set of category keys and bounded counts. Failure codes/stages are enums; optional operator detail is separately sanitized and byte-bounded. No selected names, paths, excerpts, free-text repository errors, or file contents enter the audit, artifact, task log, debug log, or API payload.
 
 `rootRef` is stored in a dedicated project UUID column with database default
@@ -342,11 +383,16 @@ The packet keeps the existing assembly ceilings: `50` included files, `160 KiB` 
 
 `reconcileStaleFilesystemIssuanceClaims()` runs at startup and periodic recovery. Candidate discovery selects expired audit IDs without holding audit-row locks. For each candidate, a fresh transaction:
 
-1. locks project → task → package → approval decision → agent run → runtime audit in global order;
+1. locks project → task → every running/claiming sibling package in ascending ID
+   order → approval decision → worker-protocol epoch → agent run → runtime audit
+   in global order;
 2. compare-and-sets only a still-`claiming` row whose lease is expired according to PostgreSQL `now()`;
 3. invalidates the token by the terminal status transition;
 4. fails the linked running agent run, clears only that run's `executionLease`, and moves the package to a structured issuance-recovery block;
-5. compare-and-sets task `running → approved` so operator recovery remains reachable;
+5. compare-and-sets task `running → approved` only when no other sibling retains
+   a live execution lease; otherwise the task remains `running` and the marker is
+   visible but has no action until normal task aggregation later makes it
+   `approved`;
 6. atomically writes the terminal audit state and unique packet artifact from the durable snapshot.
 
 The reconciler never locks an audit/approval row and then reaches backward for package, task, or project state. Competing reconcilers may discover the same ID; the top-down lock plus terminal compare-and-set chooses one winner.
@@ -391,14 +437,22 @@ S4 owns the mutation behind these actions, suggested route:
 
 ```text
 POST /api/tasks/{taskId}/work-packages/{packageId}/packet-issuance-recovery
-action = retry_execution
-       | acknowledge_possible_submission
+{
+  schemaVersion: 2,
+  action: retry_execution | acknowledge_possible_submission,
+  priorRuntimeAuditId,
+  markerFingerprint
+}
 ```
 
 The route authorizes the operator, then locks project → task → package → current
 grant decision → prior agent run → prior runtime audit. Every action requires task
-`approved`, package `blocked`, the exact marker/prior-audit/delivery identity, and
-no active lease. Acknowledgement deliberately does **not** require current grant
+`approved`, package `blocked`, a request whose task/package route owns the exact
+prior audit, the exact marker/prior-audit/delivery identity, and no active lease.
+It checks the append-only ledger by the complete versioned request identity before
+requiring the marker to remain present, so an exact replay still returns the
+recorded result after successful marker clearing. Acknowledgement deliberately
+does **not** require current grant
 coverage: the operator must be able to acknowledge an old ambiguous submission
 after the grant was revoked. It changes `allow_once` to
 `reapprove_allow_once` and `always_allow` disposition to `reviewed_submission`,
@@ -409,11 +463,18 @@ while keeping the package blocked.
 `submission_uncertain|submitted` with disposition `reviewed_submission`. It then
 accepts exactly one of two locked authorization states:
 
-1. the current project decision revision and coverage fingerprint equal the prior
-   authorization snapshot; or
-2. the current project decision revision is greater, the package policy
-   fingerprint and exact required capability set are unchanged, and that newer
-   decision covers the complete required set.
+1. the canonical S1 `readEffectiveGrantState` result is `approved`, names
+   `project_always_allow` as its source, and its effective decision revision and
+   coverage fingerprint equal the prior authorization snapshot; or
+2. that same canonical reader returns `approved` from `project_always_allow`, its
+   effective decision revision is greater, the package policy fingerprint and
+   exact required capability set are unchanged, and the effective decision covers
+   the complete required set.
+
+The canonical reader applies the S3 denial-wins rule, so an equal/newer package
+denial, unknown legacy state, or a project row hidden by a package override cannot
+be mistaken for authorization even when the project decision alone looks broad
+enough.
 
 The second state is explicit reauthorization after grant removal, narrowing, or
 replacement; it is not automatic retry. The recovery-action row records both the
@@ -434,8 +495,9 @@ evidence, clears only the matched packet marker, and moves package
 `blocked → ready`; it never creates the new run directly. Redis wake-up is after
 commit, and the normal claim path rechecks and snapshots current policy.
 
-An exact replay of an already-committed `(runtimeAuditId, action,
-markerFingerprint)` returns the recorded successful result with HTTP `200`; it
+An exact replay of an already-committed version-2 request
+`(runtimeAuditId, action, markerFingerprint)` bound to the same task/package returns
+the recorded successful result with HTTP `200`; it
 does not mutate or wake again. Two identical concurrent requests select one ledger
 winner, and the loser rereads that row and returns the same result. A request whose
 marker fingerprint or durable state differs and has no matching successful ledger
@@ -544,7 +606,25 @@ Artifact content is a bounded human-readable summary derived only from these per
 26. An always-allow claim is revoked and restored under a newer decision revision:
     uncovered state has no retry, restored exact coverage permits one explicit
     audited retry, the prior artifact stays unchanged, and the new run snapshots
-    the new revision. Older/unknown/narrower decisions and policy drift fail closed.
+    the new revision. An equal/newer package denial racing that restore still wins
+    in the canonical reader. Older/unknown/narrower decisions and policy drift
+    fail closed.
+27. A stale claim with another live sibling package keeps the task `running`,
+    exposes no recovery action, and becomes actionable only after normal sibling
+    aggregation moves the task to `approved`.
+28. The versioned recovery request is bound to its routed task/package, prior
+    audit, and marker fingerprint. Exact post-clear replay is `200` with one ledger
+    row and no wake; substituted route IDs or identity fields are `409`.
+29. An ambiguous retryable provider failure exercises the real packet-bearing AI
+    SDK and adapter stack with `maxRetries:0`; wire capture proves exactly one
+    external request even when provider defaults would otherwise retry.
+30. Every persisted terminal path accepts exactly one `PacketFailureCode`; every
+    invalid or unknown code fails closed in the reader and produces no free-text
+    operator copy.
+31. Epoch tests cover a genuinely pre-trigger process that must be operationally
+    drained and a bridge-trigger legacy claim held across activation. The latter
+    is rejected at the package transition with `claim_protocol_version=1` and zero
+    repository reads.
 
 Real PostgreSQL owns transaction, lock, lease, migration, index, and failure-injection evidence. Lease tests compare against database time, not a fake worker clock. #181 composes a small cross-slice sentinel set from these tests instead of maintaining a second policy implementation.
 
@@ -556,7 +636,8 @@ The claimed uniqueness guarantee is valid only after legacy packet issuers are d
    `DEFAULT gen_random_uuid()` and a unique index,
    nullable protocol-v2 nonce/revision/claim/snapshot fields, the exact partial
    indexes, the append-only issuance-recovery action table/unique key, the protocol
-   epoch singleton, protocol-1 audit default, and rejecting audit trigger. New
+   epoch singleton, package claim-protocol column, and rejecting package-transition
+   trigger. New
    projects receive a random reference at creation. Backfill existing
    projects in bounded, restartable batches with database-generated random UUIDs.
    Keep the default through the whole mixed-version window so an old project writer
@@ -567,12 +648,15 @@ The claimed uniqueness guarantee is valid only after legacy packet issuers are d
    columns as a truthful packet snapshot.
 2. **Deploy dual readers.** Readers understand v1 and v2. Legacy `allow_once` approvals without a nonce are non-issuable and require explicit reapproval. Legacy audit rows without a typed assembly snapshot render as `unknown_legacy`, never `not_assembled` or invented zero counts.
 3. **Deploy v2 writers disabled.** New workers can write/read v2, while the durable
-   epoch remains 1 and packet issuance stays disabled. Verify every context-packet
-   audit insert reaches the trigger before any bounded repository read.
-4. **Drain legacy issuers.** Stop and drain every worker that can assemble a packet without the v2 claim transaction. A process-local flag alone is not proof that another old worker is absent.
+   epoch remains 1 and packet issuance stays disabled. Verify every package claim
+   traverses the `running`-transition trigger before any bounded repository read.
+4. **Drain legacy issuers.** Stop and drain every worker already past the new
+   package trigger, including genuine pre-trigger processes. A process-local flag
+   alone is not proof that another old worker is absent.
 5. **Cut over.** Start only v2-capable workers, verify no v1 claim remains, then
    transactionally advance the durable epoch to 2 before enabling v2 grant writes
-   and packet issuance. A stale v1 insert is rejected before repository reads.
+   and packet issuance. A stale v1 package transition is rejected before
+   repository reads.
 6. **Scrub legacy paths.** After epoch-2 activation durably proves cutover, #179
    runs a separately gated, bounded, restartable post-drain operation/later-release
    migration—not an expansion migration already registered with the ordinary

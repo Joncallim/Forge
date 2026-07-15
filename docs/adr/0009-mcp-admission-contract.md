@@ -1398,30 +1398,38 @@ none of those slices may weaken this state, precedence, or lock contract.
 
   Extend the existing package claim transaction instead of creating a second run
   lifecycle. The full order is project → tasks ascending → packages ascending →
-  approval/decision rows ascending → agent run → runtime audit → packet artifact.
-  The transaction conditionally moves the package to `running`, creates the agent
+  approval/decision rows ascending → worker-protocol epoch → agent run → runtime
+  audit → packet artifact. A v2 worker sets transaction-local protocol 2 before
+  the transaction conditionally moves the package to `running`, then creates the agent
   run and existing execution lease, inserts the packet claim and authorization
   snapshot, and—only for `allow_once`—consumes the exact nonce. Any failure rolls all
   of those writes and the attempt back. A run needing no packet creates no packet
   audit/artifact.
 
   Mixed-worker cutover uses a durable database barrier. A singleton
-  `forge_runtime_protocol_epochs` row starts with the filesystem packet minimum at
-  1; legacy audit inserts default to protocol 1 and v2 workers write 2. A PostgreSQL
-  audit-insert trigger takes a shared epoch-row lock and rejects null/lower packet
-  protocols before any bounded repository read. Activation updates only the epoch
-  row, so it cannot reverse entity locks. After old-worker drain, deployment
-  locks the epoch exclusively, aborts if any nonterminal v1 audit remains, and then
-  advances it to 2. Shared trigger locks serialize racing inserts; the epoch is
-  never lowered on rollback. This fences Forge's
+  `forge_runtime_protocol_epochs` row starts with the work-package execution
+  minimum at 1. An expand-phase PostgreSQL trigger runs on the existing package
+  transition to `running`, reads transaction-local worker protocol (`1` when absent
+  for legacy binaries), takes a shared epoch lock, rejects a lower writer, and
+  records `work_packages.claim_protocol_version`. That transition is the pre-read
+  boundary every current executor traverses; an audit-insert trigger would be too
+  late. Activation updates only the epoch row, so it cannot reverse entity locks.
+  After a proven drain of processes already past the newly installed trigger,
+  deployment locks the epoch exclusively, aborts if any running package has null
+  or protocol-1 claim evidence in the stable snapshot, and advances it to 2.
+  Shared trigger locks serialize racing transitions; the epoch is never lowered on
+  rollback. A legacy transition held across activation is rejected before any
+  repository read. This fences Forge's
   cooperative packet producer, not independent ACP host access.
 
   The packet lease is subordinate to the execution lease. One database-time
   heartbeat compare-and-sets both; every repository read batch, prompt exposure,
   ACP submission, and terminal finalization verifies package/run execution ownership
   plus `{status:'claiming', claimToken, claimedByAgentRunId,
-  leaseExpiresAt > PostgreSQL now()}`. An `always_allow` boundary also rechecks that
-  the current project decision revision still covers the package. Revocation stops
+  leaseExpiresAt > PostgreSQL now()}`. An `always_allow` boundary also reruns the
+  canonical S1 `readEffectiveGrantState` and requires effective
+  `project_always_allow` approval at the expected revision/coverage; an equal/newer
+  package denial therefore still wins. Revocation or override stops
   a later Forge-governed boundary but cannot recall bytes or cancel external I/O
   already started.
 
@@ -1429,9 +1437,12 @@ none of those slices may weaken this state, precedence, or lock contract.
   candidate is then processed in a fresh top-down transaction; it never locks an
   audit/approval and reaches backward. The transaction compare-and-sets a still-
   expired claim, invalidates the token, fails the linked run, clears only that run's
-  execution lease, moves the package to a structured issuance-recovery block,
-  returns task `running → approved`, and atomically persists terminal audit + unique
-  artifact. An `allow_once` nonce stays burned; an `always_allow` run claim can
+  execution lease, moves the package to a structured issuance-recovery block, and
+  atomically persists terminal audit + unique artifact. It locks running/claiming
+  sibling packages in ascending order and returns task `running → approved` only
+  when no sibling has a live execution lease; otherwise the task remains `running`
+  and recovery has no action until normal aggregation reaches `approved`. An
+  `allow_once` nonce stays burned; an `always_allow` run claim can
   start a new operator-requested run only under current project coverage. Every
   existing generic stale-package path first checks for a linked v2 issuance claim;
   packet-bearing runs delegate by audit ID to this top-down transaction and never
@@ -1449,11 +1460,15 @@ none of those slices may weaken this state, precedence, or lock contract.
 
   S4 owns a packet-recovery route and append-only
   `filesystem_mcp_issuance_recovery_actions` table. The route locks project → task
-  → package → decision → prior run → audit, CAS-validates the marker/prior audit,
-  and records acknowledgement even if current grant coverage was later revoked.
+  → package → decision → prior run → audit, accepts a version-2 request carrying
+  `{action, priorRuntimeAuditId, markerFingerprint}`, binds that identity to the
+  routed task/package, CAS-validates the marker/prior audit, and records
+  acknowledgement even if current grant coverage was later revoked.
   A separate always-allow `retry_execution` transition accepts either the same
-  revision/coverage or a greater project decision revision that exactly covers an
-  unchanged package policy. The latter is explicit operator reauthorization after
+  revision/coverage or a greater effective decision revision that exactly covers
+  an unchanged package policy, but only when the canonical S1
+  `readEffectiveGrantState` returns `approved` from `project_always_allow`. This
+  preserves the S3 denial-wins rule for equal/newer package denials. The latter is explicit operator reauthorization after
   grant replacement, never automatic retry. It records prior and authorizing
   revision/fingerprint evidence in the append-only action row, clears only the
   packet marker, moves `blocked → ready`, commits, then wakes Redis; the normal new
@@ -1464,8 +1479,10 @@ none of those slices may weaken this state, precedence, or lock contract.
   `resolve_after_allow_once_reapproval` evidence for the new approval decision,
   and clears only S4 state atomically.
   Every acknowledgement, retry, and one-time resolution writes an append-only
-  action row atomically. An exact replay of `(audit, action, marker fingerprint)`
-  returns the recorded HTTP 200 result with no second mutation/wake; only a changed
+  action row atomically. The ledger is checked before requiring a still-present
+  marker. An exact replay of the same routed version-2
+  `(audit, action, marker fingerprint)` request returns the recorded HTTP 200 result
+  with no second mutation/wake; only a changed
   fingerprint or unmatched durable state returns 409. Double/stale/policy/lease
   races are compare-and-set or idempotency-ledger outcomes. The marker never
   reuses `mcpGrantBlock`/`mcpBroker` or persists a path/reason.
@@ -1479,8 +1496,13 @@ none of those slices may weaken this state, precedence, or lock contract.
   Immediately before ACP I/O, ownership-CAS `not_exposed → submitting` with a
   random attempt ID and database time. Expired/crashed `submitting` becomes
   `submission_uncertain` and is never automatically replayed. A submission failure
-  never rewrites an assembled packet as unassembled. One packet claim permits one
-  external model/ACP submission: after an accepted but Forge-invalid response, the
+  never rewrites an assembled packet as unassembled. `PacketFailureCode` is a
+  closed enum shared downstream:
+  `authorization_changed|execution_lease_expired|issuance_lease_expired|worker_stopped|preflight_failed|assembly_failed|submission_rejected|submission_uncertain|provider_response_invalid|terminalization_interrupted`;
+  unknown values fail closed and never become free-text copy. One packet claim
+  permits one external model/ACP submission: packet-bearing AI SDK calls set
+  `maxRetries:0`, adapter/provider replay after possible acceptance is disabled,
+  and after an accepted but Forge-invalid response, the
   run fails with `submitted` evidence and does not use the executor's automatic
   correction loop. Packet-free generation may retain that loop. `rootRef` is a
   dedicated, unique project UUID with database `DEFAULT gen_random_uuid()` kept
@@ -1528,13 +1550,16 @@ none of those slices may weaken this state, precedence, or lock contract.
 - **Additive rollout is part of the guarantee.** Expand schema with a unique
   nullable project `root_ref` using database `DEFAULT gen_random_uuid()`, nullable
   v2 fields/indexes, the append-only issuance-recovery action table/unique key, and
-  the epoch singleton/default/trigger; keep the root default for old writers,
+  the epoch singleton, package claim-protocol column, and `running`-transition
+  trigger; keep the root default for old writers,
   backfill existing projects in bounded batches, then make it non-null
   before v2 producers. Deploy dual readers that treat legacy one-time approvals
   without nonce as non-issuable and legacy audit zero/default columns as
   `unknown_legacy`; deploy v2 writers with packet issuance disabled at epoch 1;
-  drain every legacy packet issuer, advance the durable epoch to 2, then enable
-  issuance. After that durable cutover, #179 owns a separately gated restartable
+  prove package claims traverse the trigger before reads, operationally drain
+  every process already past that newly installed boundary, verify no running
+  package has null/protocol-1 claim evidence, advance the durable epoch to 2, then
+  enable issuance. After that durable cutover, #179 owns a separately gated restartable
   post-drain operation/later migration—not an expansion migration already visible
   to the ordinary migrator—that clears every legacy path-valued
   audit `root`, writes only aggregate scrub counts, and prevents v2 writers from
