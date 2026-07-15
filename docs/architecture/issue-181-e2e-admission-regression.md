@@ -154,6 +154,10 @@ Use a local task-tracker fixture with frontend, QA, docs, and reviewer packages.
   grant endpoint records explicit new-root approval.
 - Public `rootRef` remains opaque/stable for correlation, but is never treated as
   authority or displayed as a path.
+- Seed pre-v2 `allow_once` and `always_allow` decisions with no root-binding
+  evidence, including roots observed unchanged and repointed A → B → A. The v2
+  binding command binds only the project; every legacy decision remains
+  non-issuable until the real grant endpoint records explicit reapproval.
 
 ## Layer 2: grant/reconciliation concurrency
 
@@ -227,15 +231,33 @@ root-binding revision, and exact coverage fingerprint.
   and one unique binding; repoints acquire both refs in byte order and revoke
   old-root grants before the new root is claimable;
 - recursive-delete crash barriers before maintenance intent, after intent/before
-  filesystem work, after cleanup/before database delete, and during repair prove
+  filesystem work, after cleanup/before database tombstone, and during repair prove
   claims stay blocked and recovery completes the exact token or enters bounded
-  manual repair without guessing;
-- kill the worker and fence supervisor while a stubborn inherited-descriptor child
-  remains. Recovery stays actionless until the entire process group exits. A
-  wrong, stale, missing, or unreachable host registration is alert-only and cannot
-  terminalize;
+  manual repair without guessing. Tombstoning releases the live root but retains
+  every project/task/package/run/audit/artifact/action/alert/resolution row; hard
+  delete fails;
+- race two clone/create requests for a nonexistent destination, canonical parent
+  aliases/case variants, and every planned/materialized/physical-fence/bind crash
+  boundary. The namespace reservation chooses one winner; cleanup requires exact
+  reservation token plus physical object identity and never deletes a reused path;
+- kill the worker, fence service, control channel, and containment adapter first,
+  last, and simultaneously while ACP/validation descendants close descriptors,
+  detach, and ignore termination. Recovery stays actionless until the operating-
+  system adapter proves the complete lease group empty. Wrong, stale, missing,
+  divergent-key, insufficient-containment, or unreachable host registration is
+  alert-only and cannot terminalize;
+- capture a repository baseline under the fence before ACP submission. Direct ACP
+  changes followed by valid response, failure, or submission uncertainty produce
+  changed/unverifiable fingerprint-bound review before any Forge local stage or
+  later action;
 - process death after each durable effect-stage entry proves possible-local-change
   guidance survives even when the primary failure code is lease/worker loss;
+- wrong-host recovery with `effectIntent:not_started` reads only the locked
+  package/run host pin; `active|quiesced` checks both that pin and intent host. Both
+  mismatches remain alert-only and never access a union field that is absent;
+- atomic replacement success followed by failed/lost-ownership
+  `applying → applied` persistence leaves the live run nonterminal or durably maps
+  the entry to `unknown` under the service lease. It can never terminalize success;
 - definitive `submission_failed + submission_rejected` persistence races a crash
   and lease expiry; recovery preserves the staged rejection cause;
 - stale S4 recovery races packet-free and handoff-only claims in both orderings;
@@ -252,8 +274,10 @@ root-binding revision, and exact coverage fingerprint.
   Release/DevOps alert deduplicates, privileged resolution checks authorization
   and fingerprint, and one append-only result survives; immutable evidence is not
   rewritten. A true audit/artifact mismatch can only append
-  `quarantined_abandoned`, cancel/close the package/task, and remain permanently
-  non-retryable;
+  `quarantined_abandoned`, bind every affected sibling marker/baseline/change/
+  ledger/review fingerprint plus reviewed/abandoned repository disposition,
+  cancel/close the package/task, and remain permanently non-retryable. An unknown-
+  ledger sibling continues to block root management until included exactly;
 - pre-transaction `completion_preparation` failure persists that stage, while a
   gate/finalizer database failure rolls back and persists no such cause;
 - one committed packet claim makes at most one external model/ACP submission; an
@@ -266,11 +290,25 @@ root-binding revision, and exact coverage fingerprint.
   activation-exclusive-first rejects v1 before any repository read. A genuine
   pre-trigger process is proved drained operationally. The test invokes the real
   checked-in activation command in dry-run and `--apply` modes. Zero/multiple,
-  stale, incompatible, wrong-host, and undrained worker-instance registrations are
-  blockers; one fresh active host with the required supervisor succeeds. The test
-  verifies actor, exact capability snapshot, pinned epoch host/version,
+  stale, unregistered, draining, incompatible, wrong-host, divergent-binding-key,
+  insufficient-containment, and undrained worker/root-writer instances are blockers
+  at activation and every later claim/mutation. One fresh active host with the
+  required fence service/containment adapter/key/credential generation succeeds.
+  The test verifies exact instance pin, actor, capability snapshot, epoch
+  host/version/key,
   idempotency, postconditions, and saved database audit from the operator runbook;
   packet, packet-free, and handoff-only v2 claims all succeed after epoch 2;
+- assert every mutating path's complete database order includes project → tasks →
+  packages → decisions → protocol epoch → instance rows → runs → audits → host
+  ledgers → artifacts → recovery actions → integrity alerts/resolutions → gates;
+- race legacy web POST/PUT/DELETE with activation before/after statement two. With
+  ingress disabled and v1 database sessions revoked, a restarted old route fails
+  before reading a path or touching the filesystem; epoch-1 writes invalidate the
+  binding and epoch-2 malformed writers fail the root-mutation trigger;
+- exercise binding-key backup, divergent same-host key material, loss, and rotation.
+  Rotation keeps issuance/root management disabled, drains every instance, proves
+  containment/effects empty, fences old/new refs, rebinds every live root, audits
+  both fingerprints, and requires a new activation before any action;
 
 Tests must state the actual guarantee: cooperative one-winning-claim and best-effort delivery, not cryptographic recall of bytes or in-flight I/O.
 
@@ -300,26 +338,29 @@ means a one-time decision nonce can be replaced only by explicit reapproval.
 | Claim committed, failure before assembly | package S4 `blocked`; task `approved` | claim terminal failed; `allow_once` nonce burned; `always_allow` has no nonce | atomic run/audit failure plus one artifact with terminal failed/code, `assembly.state:'not_assembled'`, stage `preflight`, delivery `not_exposed` | evidence finalization only; no packet auto-retry | `allow_once`: reapprove; `always_allow`: explicit `retry_execution` if current coverage matches |
 | Failure during assembly | package S4 `blocked`; task `approved` | claim terminal failed; one-time nonce burned | atomic run/audit failure plus one artifact with terminal `assembly_failed`, `assembly.state:'not_assembled'`, stage `assembly`, delivery `not_exposed`; no counts | evidence finalization only | same grant-mode actions as prior row; never reassemble the old claim |
 | Assembly complete, before exposure | package S4 `blocked`; task `approved` | claim terminal failed; one-time nonce burned | staged `assembly.state:'assembled'`; atomic failed terminal outcome + one artifact with delivery `not_exposed` and truthful counts/rootRef | terminal transaction may retry; no packet replay | `allow_once`: reapprove; `always_allow`: explicit `retry_execution` if coverage matches |
-| Durable `submitting` intent, crash before/around ACP call | package S4 `blocked`; task `approved` after lease recovery | claim terminal failed; one-time nonce burned | staged assembly; recovery maps delivery to `submission_uncertain`; run/audit failed + one artifact | no submission replay | acknowledge possible prior work; then reapprove one-time or explicitly retry always-allow under current coverage |
-| Transport proves pre-acceptance rejection | package S4 `blocked`; task `approved` | claim terminal failed; one-time nonce burned | delivery `submission_failed`; run/audit failed + one artifact | no packet auto-retry | `allow_once`: reapprove; `always_allow`: explicit `retry_execution` if coverage matches |
-| Transport accepts response, Forge validation rejects it | package S4 `blocked`; task `approved` | claim terminal failed; one-time nonce burned | exactly one external prompt call; delivery `submitted`; terminal `provider_response_invalid`; failed run/audit + one artifact | no correction submission on this packet claim | acknowledge accepted submission, then grant-mode action |
-| Valid submitted response, then local execution stage fails | package S4 `blocked`; task follows lease/review barrier | claim terminal failed; one-time nonce burned | delivery stays `submitted`; effect intent becomes `quiesced`; terminal `post_submission_execution_failed` plus exactly one stage (`sandbox_apply|validation|host_apply|repository_evidence|completion_preparation`); one failed run/audit/artifact; host ledger fingerprints applied/unknown entries | no model resubmission, local retry, or rollback | acknowledge prior external work; when host review is required, inspect/resolve working tree against exact ledger fingerprint, then grant-mode action |
+| Durable `submitting` intent, crash before/around ACP call | package S4 `blocked`; task `approved` after containment/fence recovery | claim terminal failed; one-time nonce burned | staged assembly; recovery maps delivery to `submission_uncertain`; repository comparison is unchanged or exact review-required; run/audit failed + one artifact | no submission replay | acknowledge possible prior work and any exact repository review; then grant-mode action |
+| Transport proves pre-acceptance rejection | package S4 `blocked`; task `approved` | claim terminal failed; one-time nonce burned | delivery `submission_failed`; repository comparison persists; run/audit failed + one artifact | no packet auto-retry | complete any exact repository review, then `allow_once` reapproval or explicit `always_allow` retry |
+| Transport accepts response, Forge validation rejects it | package S4 `blocked`; task `approved` | claim terminal failed; one-time nonce burned | exactly one external prompt call; delivery `submitted`; terminal `provider_response_invalid`; repository comparison persists; failed run/audit + one artifact | no correction submission on this packet claim | acknowledge accepted submission and any repository review, then grant-mode action |
+| ACP changes the repository before Forge local work | package S4 `blocked`; task follows lease/review barrier | claim terminal failed; one-time nonce burned | baseline comparison is `changed|unverifiable`; valid response uses `external_repository_change_requires_review` with `not_started`/no host ledger; failure/uncertainty keeps its delivery cause; exact repository review fingerprint persists | no Forge local stage, model replay, or automatic rollback | inspect/resolve the working tree and acknowledge the exact repository fingerprint before any later action |
+| Valid submitted response, then local execution stage fails | package S4 `blocked`; task follows lease/review barrier | claim terminal failed; one-time nonce burned | delivery stays `submitted`; effect intent becomes `quiesced`; terminal `post_submission_execution_failed` plus exactly one stage (`sandbox_apply|validation|host_apply|repository_evidence|completion_preparation`); one failed run/audit/artifact; host ledger and repository-change fingerprints persist | no model resubmission, local retry, or rollback | acknowledge prior external work; complete every required exact host/repository review, then grant-mode action |
 | Finalizer/repair proposes an invalid terminal/effect/ledger tuple | no terminal package/task change; existing nonterminal state remains owned or recovers normally | claim remains unterminalized | deferred PostgreSQL predicate rejects terminal `active`, mismatched stage/fingerprint, quiesced `applying`, or success with `planned|applying|unknown`; no artifact/marker split | transaction rollback only | none until a valid finalizer/recovery predicate succeeds |
-| Transport accepted/returned, crash before outcome persistence | package S4 `blocked`; task `approved` after recovery | claim terminal failed; one-time nonce burned | recovery uses `submission_uncertain`; one failed run/audit and one artifact | no submission replay | acknowledge possible prior work before any new decision/run |
-| `submitted` persisted, crash before effect intent | recovery first acquires the pinned resource fence, then package S4 `blocked`; task follows lease/review barrier | claim terminal failed; one-time nonce burned | delivery remains `submitted`; effect is `not_started`; failed run/audit + one artifact | no submission replay | acknowledge prior submission before any new decision/run |
-| Active post-submission effect, fence still held/unreachable | package/run remain unchanged; task remains `running` | claim stays `claiming`; nonce burned | active intent/ledger immutable; one deduplicated quiescence alert; no terminal marker | owning-host recovery retry only; no state mutation/new run | no web action; “Waiting for worker changes to stop” |
-| Project root repoint/delete/reuse races any live repository read or effect | running claim retains the pinned package/root binding; management mutation does not commit | claim/nonce unchanged | one canonical resource fence covers aliases and both projects; no cross-root read/write/delete | management waits/retries or conflicts; no database lock waits for the fence | resolve the active/review/packet barrier, then retry management |
-| Worker/supervisor dies while a descendant survives | package/run remain unchanged; task `running` | claim stays `claiming`; nonce burned | inherited descriptor keeps resource fence held; quiescence alert only | no recovery action until the last descendant exits | no web action; owning-host recovery later |
-| Recovery runs on wrong, stale, missing, or unreachable host | package/run remain unchanged; task `running` | claim stays `claiming`; nonce burned | persisted host pin/intent unchanged; bounded alert only | no local-fence inference, terminalization, or new run | restore authoritative owning host/registration |
-| Crash during host apply or after replacement before outcome | recovery acquires fence, blocks package; task follows lease/review barrier | claim terminal failed; nonce burned | leftover `applying → unknown`; effect becomes `quiesced`; primary failure may remain lease/worker loss; host review required by ledger fingerprint | no host/model retry or rollback | inspect/resolve working tree and acknowledge exact ledger fingerprint before grant-mode action |
+| Transport accepted/returned, crash before outcome persistence | package S4 `blocked`; task `approved` after containment/fence recovery | claim terminal failed; one-time nonce burned | recovery uses `submission_uncertain`; baseline comparison is unchanged or review-required; one failed run/audit and one artifact | no submission replay | acknowledge possible prior work and exact repository review before any new decision/run |
+| `submitted` persisted, crash before effect intent | host fence service retains/orphans the pinned lease; after containment emptiness proof, package S4 `blocked`; task follows lease/review barrier | claim terminal failed; one-time nonce burned | delivery remains `submitted`; effect is `not_started`; baseline comparison and repository review are mandatory; failed run/audit + one artifact | no submission replay | acknowledge prior submission and exact repository review before any new decision/run |
+| Active post-submission effect, fence/containment unproven | package/run remain unchanged; task remains `running` | claim stays `claiming`; nonce burned | active intent/ledger immutable; durable lease active/orphaned; one deduplicated quiescence alert; no terminal marker | owning-host fence-service recovery only; no state mutation/new run until full group empty | no web action; “Waiting for worker changes to stop” |
+| Project root repoint/tombstone/reuse races any live repository read or effect | running claim retains the pinned package/root binding; management mutation does not commit | claim/nonce unchanged | one canonical resource fence covers aliases and both projects; no cross-root read/write/delete | management waits/retries or conflicts; no database lock waits for the fence | resolve every active/review/packet barrier, then retry management |
+| Worker/fence service/control dies while a descendant survives | package/run remain unchanged; task `running` | claim stays `claiming`; nonce burned | durable lease becomes orphaned; adapter has not proved the full group empty; quiescence alert only | no recovery action based only on lock acquisition | no web action; owning-host recovery later |
+| Recovery runs on wrong, stale, missing, divergent-key, insufficient-containment, or unreachable host | package/run remain unchanged; task `running` | claim stays `claiming`; nonce burned | persisted instance/host/key/root pin and intent unchanged; bounded alert only | no local-fence inference, terminalization, or new run | restore authoritative owning host/registration/capability |
+| Crash during host apply or after replacement before outcome | recovery acquires the service lease after containment emptiness, blocks package; task follows lease/review barrier | claim terminal failed; nonce burned | leftover `applying → unknown`; effect becomes `quiesced`; primary failure may remain lease/worker loss; host review required by ledger fingerprint | no host/model retry or rollback | inspect/resolve working tree and acknowledge every required exact host/repository fingerprint before grant-mode action |
+| Live atomic replacement succeeds but `applying → applied` persistence fails or loses ownership | package/run remain nonterminal while PostgreSQL is unavailable, or terminalize failed only after uncertainty is durable | claim remains fenced until the durable transition; nonce burned | under the service lease the entry becomes `unknown`, exact ledger review is required, and success is rejected | owning-host recovery only; no guessed outcome | inspect/resolve the working tree against the exact ledger fingerprint before any later action |
 | Atomic live terminal transaction fails | package/run/lease/audit/marker/task, host-ledger, artifact, action, integrity, and gate rows all remain at preterminal state until retry/recovery; resource fence remains held while live retry runs; then package follows terminal outcome | claim remains `claiming`; nonce stays burned | whole terminal transaction rolls back; staged assembly/delivery/effect/ledger remain; no `completion_preparation` cause is persisted | automatic terminal-state retry only while fenced; owning-host recovery after process death | row-specific action only after atomic terminal/quiescent state exists |
 | Seeded terminal-failure audit/artifact + live-package split | S4 repair fails the run, clears its lease, blocks package; task follows sibling rule | terminal claim remains immutable; nonce remains burned | exact audit/artifact tuple equality required; marker copies the immutable failure object/delivery; no second artifact | idempotent S4 repair only; no submission | disposition-specific action from immutable failure |
 | Seeded terminal-success audit/artifact + complete success materialization | repair completes the exact normal package/review-gate transition; task follows normal completion/review rule | successful claim remains immutable; nonce remains burned | matching completion artifact, configured repository evidence, and review-gate materialization are required; no marker/second artifact | idempotent success reconstruction only; no submission | none |
 | Seeded terminal-success with incomplete materialization | live run failed only for bounded integrity reason; lease cleared; package has typed S4 integrity hold; task follows sibling rule | immutable packet claim/outcome unchanged | existing evidence unchanged; one bounded Release/DevOps alert; `packet_integrity_hold` is non-retryable and is not a packet-failure marker | exact privileged success repair only when every predicate is proven | no web action; fingerprint-bound runbook/command |
-| Immutable audit/artifact mismatch | live run failed only for integrity reason; lease cleared; package/task held until adjudication | immutable packet claim/outcomes remain conflicting and unchanged | one bounded alert; exact `quarantined_abandoned` appends resolution, cancels nonterminal siblings/package, and closes task cancelled | never retry/resubmit/rewrite evidence | Release/DevOps may permanently close; UI renders evidence quarantine, never repair promise |
+| Immutable audit/artifact mismatch plus sibling unknown repository work | live run failed only for integrity reason; lease cleared; package/task held until adjudication | immutable packet claim/outcomes remain conflicting and unchanged | one bounded alert; exact `quarantined_abandoned` binds every sibling marker/baseline/change/ledger/review fingerprint and reviewed/abandoned disposition before closure | never retry/resubmit/rewrite evidence; root management remains blocked on incomplete sibling evidence | Release/DevOps may permanently close only with the exact evidence set; UI renders evidence quarantine, never repair promise |
+| Project tombstone after normal or quarantined task | project hidden from normal lists; live path/root binding released | all claim/decision history unchanged | every project/task/package/run/audit/artifact/action/alert/resolution and original `rootRef` retained | hard purge forbidden; physical root may be reused only after all review barriers | authorized history says “Project removed — evidence retained” and shows no former path |
 | Redis wake fails after grant/recovery action | committed package `ready`; task `approved` | unchanged | unchanged | periodic database sweep re-enqueues; duplicate wakes harmless | none |
 | Always-allow packet block, then project grant revoked/restored | package remains S4 `blocked` until explicit retry; task `approved` | prior claim remains terminal; new decision has a greater decision revision and current root-binding revision | prior run/audit/artifact immutable; recovery action records prior/current decision and root revisions; new run later snapshots them | none while uncovered; no automatic retry after restore/root change | grant control while uncovered; after exact explicit approval, retry (and prior-submission acknowledgement first when required) |
-| Worker restart or lease expiry | owning-host recovery first proves the pinned resource fence/process group quiescent, then stale state becomes package S4 `blocked`; task follows lease/review barrier | token invalidated; audit terminal failed; one-time nonce burned | run failed; one artifact from staged state; stale owner cannot perform a later host operation; ledger review may remain required | startup/periodic owning-host reconciliation only, never delivery/host replay | disposition/host-review action above |
+| Worker restart or lease expiry | owning-host recovery first obtains the durable service lease and proves the complete containment group empty, then stale state becomes package S4 `blocked`; task follows lease/review barrier | token invalidated; audit terminal failed; one-time nonce burned | run failed; one artifact from staged state; stale owner cannot perform a later host operation; host/repository review may remain required | startup/periodic owning-host reconciliation only, never delivery/host replay | disposition-specific exact review action above |
 | Generic stale-running recovery sees linked v2 claim | only unified S4 recovery mutates package/task | unified token invalidation; nonce remains burned | one failed run/audit/artifact; no generic stale marker or duplicate event | S4 sweeper/delegation only | disposition-specific action above |
 | Packet recovery completes while sibling lease is live | package stays S4 `blocked`; task stays `running` | terminal claim/nonce unchanged | marker/artifact immutable; sibling run remains live | S4 post-sibling/periodic task reconciler later moves only task `running → approved` | no action until task is approved, then marker-specific action |
 | Packet recovery completes while sibling is `awaiting_review` | package stays S4 `blocked`; task stays `running` | terminal claim/nonce unchanged | marker/artifact immutable; required review state unchanged | review decision completes first; S4 reconciler later moves only task | no action; “Waiting for required review” |
@@ -332,7 +373,8 @@ from delivery and never appears as a delivery enum. Each artifact also carries
 S4's terminal `{status:'succeeded'|'failed'}` discriminant; success is valid only
 with `assembled+submitted`, and failure requires one compatible closed code plus
 the conditional closed post-submission stage. The suite exhausts valid and known-
-invalid assembly/delivery/effect/terminal/code/stage/ledger/host-review tuples:
+invalid assembly/delivery/effect/terminal/code/stage/ledger/host-review/repository-
+review tuples:
 `active` is nonterminal only, post-effect terminal state is `quiesced`, caught
 local failure has equal effect/failure stage, quiesced forbids `applying`, success
 requires every expected entry `applied`, and all fingerprints match. PostgreSQL
@@ -341,10 +383,11 @@ same expected table. It also exhausts the
 grant-mode × delivery-state recovery-disposition matrix, including
 `reapprove_allow_once`, `review_then_reapprove_allow_once`, `retry_execution`,
 and `review_submission`, plus every known-invalid grant-mode/delivery/disposition/
-acknowledgement and host-review cross-product. Acknowledgement never changes immutable delivery: it
-changes disposition to `reapprove_allow_once` or `reviewed_submission` and, when
-required, host review to `reviewed`, with database actor/time and exact ledger
-fingerprint evidence. Retry from `reviewed_submission` still requires
+acknowledgement and both review cross-products. Acknowledgement never changes
+immutable delivery: it changes disposition to `reapprove_allow_once` or
+`reviewed_submission` and, when required, host/repository review to `reviewed`,
+with database actor/time and exact ledger/baseline/change fingerprint evidence.
+Retry from `reviewed_submission` still requires
 current exact always-allow coverage and root-binding revision. The locked route may accept the same effective
 decision or a greater effective decision revision that exactly covers unchanged
 package policy only when canonical S1 `readEffectiveGrantState` returns approved
@@ -360,7 +403,9 @@ lease loss → the named lease-expiry code; process loss → `worker_stopped`;
 preflight/assembly failure → the named stage code; proven transport refusal →
 `submission_rejected`; accepted-or-unknown transport outcome →
 `submission_uncertain`; accepted but invalid provider output →
-`provider_response_invalid`; accepted valid output followed by local execution
+`provider_response_invalid`; accepted valid output with changed/unverifiable ACP
+repository evidence before Forge local work →
+`external_repository_change_requires_review`; accepted valid output followed by local execution
 failure → `post_submission_execution_failed` plus its exact closed stage.
 Definitive `submission_failed` is persisted with `submission_rejected` and later
 lease expiry cannot replace that cause. Atomic finalization rollback has no separate cause
@@ -453,16 +498,25 @@ Keep this small:
     integrity-hold reasons. Incomplete success uses repair language; true mismatch
     says evidence is quarantined, not repairable. Every unresolved state is
     non-retryable/actionless and names Release/DevOps plus the runbook. Exact
-    `quarantined_abandoned` plus cancelled package/task renders “Task closed —
-    evidence quarantined” with no browser control or new run.
-15. Render an expired submitted claim with active effect intent and quiescence
-    alert as “Waiting for worker changes to stop.” Wrong-host recovery and a
-    worker/supervisor crash with a surviving descendant remain actionless until
-    owning-host recovery proves the entire process group quiescent and persists
-    `quiesced`.
+    `quarantined_abandoned` plus complete sibling-evidence-set/repository
+    disposition and cancelled package/task renders “Task closed — evidence
+    quarantined” with no browser control or new run. Incomplete sibling evidence
+    remains unresolved and keeps root-management actions hidden.
+15. Render an expired submitted claim with active/orphaned containment lease and
+    quiescence alert as “Waiting for worker changes to stop.” Wrong-host recovery
+    and worker/fence-service/control loss with a surviving descendant remain
+    actionless until owning-host recovery proves the complete lease group empty and
+    persists `quiesced`.
 16. Repoint a project root after approval. The old decision renders “Project root
     changed — approve context again,” exposes no retry, and displays neither path
     nor the internal resource reference. Explicit new-root approval is required.
+17. Render changed and unverifiable ACP repository evidence as “Repository changed
+    during worker submission — review required.” Exact review hides every retry,
+    reapproval, quarantine, and root action until acknowledged; no path/diff/raw
+    error appears.
+18. Tombstone a project and prove authorized history renders “Project removed —
+    evidence retained,” normal lists hide it, path reuse does not relabel the old
+    evidence, and no former path/live-root control appears.
 
 Back-end integration tests remain authoritative for concurrency and state transitions.
 
@@ -502,52 +556,65 @@ S4 changes cross web and worker process boundaries, so S6 must prove this rollou
 
 1. **Expand schema first.** #179 adds/backfills the unique project `root_ref` with
    database `DEFAULT gen_random_uuid()` retained for old writers, nullable
-   nonce/claim/snapshot/effect fields, nullable root-binding/host-resource/
-   maintenance fields, work-package/agent-run root pins, worker-instance
-   capability registry, host-apply ledger/entries, issuance-recovery action and
-   integrity alert/resolution tables, protocol epoch active-host/supervisor fields,
+   nonce/claim/snapshot/effect fields, nullable root-binding/host-resource/key/
+   maintenance/tombstone fields, pre-create reservation table,
+   work-package/agent-run root and worker-instance pins, typed worker/root-writer
+   capability registry, host-apply ledger/entries, repository baseline/change
+   review, issuance-recovery action and integrity alert/resolution tables, protocol
+   epoch active-host/key/fence-service/containment/root-writer-credential fields,
    `work_packages.claim_protocol_version`, the rejecting package
-   `running`-transition trigger, new status vocabulary, and partial indexes without
+   `running`-transition and project-root-mutation triggers, new status vocabulary,
+   and partial indexes without
    changing legacy readers. Existing
    artifacts remain valid; S6 verifies schema/Drizzle/writer predicate parity and
-   the deferred terminal/effect/ledger constraint predicate.
-2. **Deploy dual readers and guarded writers.** New readers treat legacy
-   `allow_once` without nonce as non-issuable, old preview decisions as
+   the deferred terminal/effect/ledger/repository-review constraint predicate.
+   Project root uniqueness is partial to non-tombstoned live bindings, and
+   protocol-v2 hard delete is rejected.
+2. **Deploy dual readers and guarded writers.** New readers treat every legacy
+   filesystem decision without a stored root-binding revision as non-issuable, old preview decisions as
    `unknown_legacy`, old zero-default audit rows as `unknown_legacy` rather than
-   proof of assembly, approval without a proven root-binding revision as
-   non-issuable, and legacy path-valued `root` as hidden.
-3. **Durable protocol barrier and drain.** With the epoch still 1 and v2 issuance
+   proof of assembly, and legacy path-valued `root` as hidden. No current-path
+   observation or binding command upgrades legacy authority.
+3. **Durable protocol barriers and drain.** With the epoch still 1 and v2 issuance
    disabled, prove packet, packet-free, and handoff-only package claims use the
    shared protocol primitive and reach the database transition trigger before
-   executor work. Stop/drain processes already past the newly installed trigger
-   and prove no running package has null/protocol-1 claim evidence.
+   executor work. Prove new root routes acquire reservation/resource fences before
+   filesystem work and reach the root-mutation trigger. Disable project-management
+   ingress, revoke the v1 web database role/credential and terminate its sessions,
+   stop/drain worker and web/root-writer processes already past either trigger, and
+   prove no running package has null/protocol-1 claim evidence.
    Run `npm run project-roots:bind-v2 -- --actor <operator-id>` first as dry-run,
    then `--apply`, using `docs/operators/project-root-binding-v2.md`. Prove
    canonical alias/symlink/case collisions remain audited/unbound blockers until
-   repointed/deleted; the command never changes public `rootRef` or grants old
-   authority to a changed root. Only a proven unchanged canonical root may bind a
-   compatible legacy approval to initial revision 1; every other approval remains
-   held for explicit reapproval.
+   repointed/tombstoned; the command never changes public `rootRef` or any legacy
+   approval. Every decision without immutable historical binding evidence remains
+   held for explicit reapproval, including repoint-away-and-back fixtures.
 4. **Cut over producers.** Invoke the checked-in `web` command
    `npm run protocol:activate-work-package-v2 -- --actor <operator-id>` exactly as
    the operator runbook specifies. Prove its default dry run reports blockers and
    `--apply` verifies/uses the privileged three-statement PostgreSQL
    `READ COMMITTED` protocol: lock epoch exclusively; after any wait, query running
-   null/v1 claims plus the complete worker capability registry and project root
+   null/v1 claims plus the complete worker/root-writer capability registry and project root
    bindings in a fresh command snapshot; then advance the monotonic epoch to 2,
-   pin the one authoritative active host/minimum supervisor version, and audit the
-   exact snapshot. Prove actor identity, idempotency, postconditions, and saved audit;
+   pin the one authoritative active host, binding-key fingerprint, minimum fence-
+   service/containment versions, root-writer credential generation, and exact v2
+   ingress owner, then audit the exact snapshot. Prove actor identity, idempotency,
+   postconditions, and saved audit;
    ad hoc SQL fails the release gate. Enable v2 workers to write run-scoped claims and lifetime-stable opaque
    `rootRef`. Prove v1-shared-first commits and makes activation abort, while
    activation-exclusive-first rejects the later v1 transition with zero reads.
    Separately start a genuine
    pre-trigger fixture and prove activation is forbidden until the fixture is
    externally drained. Rollback never lowers the epoch.
-   Activation is also forbidden for zero/multiple fresh hosts; any stale,
-   incompatible, other-host, or non-drained instance; any unbound/maintenance
-   project root; or a missing run-lifetime resource-fence supervisor. The package
-   trigger rejects a later wrong-host or insufficient-supervisor claim before
-   repository reads. The
+   Activation is also forbidden for zero/multiple fresh hosts; any unregistered,
+   stale, draining, incompatible, divergent-key, other-host, or non-drained worker/
+   root-writer instance; any unbound/maintenance root or live reservation; or a
+   missing run-lifetime fence service/containment adapter. The package trigger
+   locks/validates the exact fresh instance and rejects a later wrong-host/key/
+   containment claim before repository reads. The root trigger does the same for
+   project mutation. Enable project-management ingress only after activation
+   commits the exact owner/credential generation. A restarted v1 route cannot
+   authenticate/read a path and fails before filesystem work. The
    Release/DevOps integrity inspect/resolve commands plus runbook pass their
    authorization/fingerprint tests.
 5. **Post-drain scrub.** Only after durable epoch-2 evidence, #179—not test-only
@@ -559,16 +626,19 @@ S4 changes cross web and worker process boundaries, so S6 must prove this rollou
 
 Compatibility tests cover old-web/new-worker and new-web/old-worker combinations,
 legacy `allow_once`, old grant-blocked/failed packages, preview rows without mode,
-old audit rows, concurrent old project inserts during root backfill/non-null
-cutover, canonical root-binding collisions, and existing duplicate-permitted
+old audit rows, concurrent old project insert/repoint/delete during root backfill/
+activation, canonical root-binding collisions, missing-root reservations,
+tombstones, and existing duplicate-permitted
 artifact types. An incompatible old
 packet writer reconnecting through the bridge trigger is rejected at its package
 transition before repository reads. Rollback is
 code-only and forward-schema-compatible: leave additive columns, indexes, root
 default/bindings, ledgers/alerts, registry, and monotonic epoch in place; disable
-v2 packet production; prove all resource fences quiescent and intents
-terminal/held; and never restart an
-old packet writer against v2 state.
+v2 packet production and root management; prove all containment groups empty and
+intents terminal/held; and never restart an old packet or root writer against v2
+state. Host-binding-key loss/rotation follows disable → drain → prove empty →
+rebind every live root → audit → reactivate; divergent keys never silently split a
+fence identity.
 
 ## CI commands and budgets
 
@@ -654,8 +724,8 @@ strict no-skip/no-retry policy is scoped to the four named commands above.
 - Shared helpers must not reimplement classification or admission.
 - #179 owns run-scoped claims for both grant modes, nonce fencing, snapshot and
   artifact terminal repair, packet-recovery actions/acknowledgements, rootRef/path
-  scrub, root-binding/resource-fence/management/supervisor protocol, worker-host
-  activation registry, effect-ledger constraint, integrity adjudication,
+  scrub, root-binding/reservation/tombstone/fence/containment protocol, worker/root-
+  writer activation registry, effect-ledger/repository-review constraint, integrity adjudication,
   prompt/log leakage tests, and schema/mixed-version tests.
 - #180 owns the three surface presentation matrices plus the packet current-state
   presenter, hostile-input bounds, exact retry/action compatibility,
@@ -673,12 +743,15 @@ strict no-skip/no-retry policy is scoped to the four named commands above.
 2. Add real approve-route task-tracker flows.
 3. Add grant recovery/concurrency flows.
 4. Integrate issuance/evidence race scenarios.
-5. Add run-lifetime resource-fence, root-management/reuse, process-group, wrong-
-   host, effect-ledger crash barriers, and review-pending arbitration.
+5. Add run-lifetime fence-service/containment, reservation/tombstone/root-reuse,
+   wrong-host, binding-key, effect-ledger and ACP baseline crash barriers, plus
+   review-pending arbitration.
 6. Add complete host-ledger/artifact/action/integrity/gate lock-order races plus
-   terminal/effect/ledger constraint tests.
-7. Add worker capability/root-binding activation and rollback tests.
-8. Add integrity alert/runbook/privileged-resolution/quarantine contract tests.
+   terminal/effect/ledger/repository-review constraint tests.
+7. Add worker/root-writer capability, root-binding, ingress/credential activation,
+   key-rotation, and rollback tests.
+8. Add integrity alert/runbook/privileged-resolution/quarantine sibling-evidence
+   contract tests.
 9. Add prompt filtering/injection assertions.
 10. Add thin Playwright presentation flow.
 11. Add the failure/recovery and mixed-version matrices.
@@ -691,7 +764,9 @@ The Epic regression is complete when the named commands exercise contract,
 PostgreSQL, issuance, and operator layers within budget, while normal `npm test`,
 build, migrations, and Playwright remain green. The suite must fail when any one
 admission surface is deliberately mutated to disagree, when an incompatible worker
-tries to claim, or when a path/content sentinel reaches persistence or diagnostics.
+or root writer tries to act, when a legacy approval becomes issuable, when hard
+delete loses evidence, or when a path/content sentinel reaches packet persistence
+or diagnostics.
 
 ## Stop conditions
 
@@ -700,11 +775,14 @@ content persistence, worker-wall-clock lease authority, timing sleeps as race
 proof, policy reimplementation, or production-only test hooks that bypass
 route/transaction behavior. Stop if mixed-version behavior, a failure-matrix row,
 or a persistence sink has no explicit owner and sentinel.
-Also stop if a test can expose a new run/action before resource/process-group quiescence,
-fingerprint-bound working-tree review, or mandatory sibling review; if normal web
+Also stop if a test can expose a new run/action before fence-service/containment
+quiescence, either fingerprint-bound working-tree review, or mandatory sibling review; if normal web
 actions can clear integrity holds; if completion preparation and atomic rollback
 are conflated; if root management/path reuse or wrong-host recovery can bypass the
-run-lifetime fence; if activation cannot machine-check the single-host capability
-snapshot; if effect/ledger/terminal tuples diverge between PostgreSQL and readers;
-or if lock-order tests omit host ledgers, artifacts, action rows, integrity rows,
-or gates.
+run-lifetime fence; if nonexistent-root creation lacks a namespace reservation; if
+activation/later claims cannot machine-check the exact single-host instance/key/
+containment/credential snapshot; if an old web route can read a path after cutover;
+if quarantine can drop a sibling root-management barrier; if effect/ledger/
+repository-review/terminal tuples diverge between PostgreSQL and readers; or if
+lock-order tests omit epoch/instance rows, host ledgers, artifacts, action rows,
+integrity rows, or gates.
