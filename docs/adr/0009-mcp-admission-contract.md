@@ -1500,8 +1500,12 @@ none of those slices may weaken this state, precedence, or lock contract.
   validation, host apply, repository/completion preparation, and every atomic file
   replacement. A run-scoped host-apply ledger records each validated output entry
   `planned → applying → applied`; recovery maps crash-left `applying` to `unknown`.
+  A live owner whose replacement may have succeeded but whose `applied` persistence
+  fails must also durably map to `unknown` under the fence before terminalizing; if
+  PostgreSQL is unavailable it remains active for recovery.
   Same-host recovery must prove authoritative current host ID equals both the run
-  pin and intent before it acquires that resource fence or mutates terminal state.
+  pin and, only for `active|quiesced`, the intent host before it acquires that
+  resource fence or mutates terminal state. `not_started` has no intent host.
   Wrong/missing/stale/unreachable host evidence is alert-only. If the fence cannot
   be acquired, state remains actionless and one bounded quiescence alert is
   recorded. Ledger paths/errors/resource references never enter packet-owned

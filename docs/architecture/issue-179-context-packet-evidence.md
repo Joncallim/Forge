@@ -478,15 +478,20 @@ write-plan entry and:
 3. persists `applying → applied` before starting the next entry.
 
 A crash after replacement but before step 3 leaves `applying`; recovery later
-maps it to `unknown`, never guesses applied/unapplied. The ledger references the
+maps it to `unknown`, never guesses applied/unapplied. A live owner that catches a
+failed/ownership-lost step 3 has the same uncertainty: while retaining the fence it
+must durably map the entry to `unknown` before terminalizing. If PostgreSQL is
+unavailable it leaves intent active and the run nonterminal for fenced recovery;
+it cannot report a caught terminal failure or success from memory. The ledger references the
 existing output-plan entry identity/ordinal. Exact paths remain in the separate
 authorized host-write/output evidence where already required for repository work;
 they never enter packet audit, marker, artifact, alert, API copy, or logs.
 
 The worker holds the resource fence through the atomic database finalizer, which sets
 the effect intent to `quiesced` in the same commit, then releases it. Stale
-recovery first proves that its authoritative current host ID exactly equals both
-the run's pinned host ID and `effectIntent.hostId`. A mismatch, missing/stale host
+recovery first proves that its authoritative current host ID exactly equals the
+locked work-package/agent-run host pin. For `active|quiesced`, it additionally
+requires equality with `effectIntent.hostId`; `not_started` has no intent host. A mismatch, missing/stale host
 registration, or unreachable owning host is alert-only: it cannot acquire a
 different host's local lock, terminalize, or expose an action. Same-host recovery
 acquires the pinned resource fence **before** any entity row lock, then enters the
@@ -713,7 +718,7 @@ entry rows; “complete” means every expected output-plan entry is `applied`.
 | Before an accepted valid response, including `submission_uncertain` | nonterminal or failed | `not_started` | no entries | `not_applicable` |
 | Valid response persisted, before first local stage | nonterminal, or failed with a non-local code such as `provider_response_invalid` | `not_started` | no entries | `not_applicable` |
 | Local stage executing or live finalizer retrying | nonterminal only | `active(stage)` | `planned|applying|applied`; never `unknown` | `not_applicable` |
-| Caught local-stage failure | failed as `post_submission_execution_failed(failureStage)` | `quiesced(lastStage)` where `lastStage === failureStage` | no `applying`; no `unknown` on the caught live path | `review_required` when host changes are present or possible, otherwise `not_applicable` |
+| Caught local-stage failure | failed as `post_submission_execution_failed(failureStage)` | `quiesced(lastStage)` where `lastStage === failureStage` | no `applying`; may contain `unknown` when a completed replacement lacks a provable outcome write | `review_required` when host changes are applied or unknown, otherwise `not_applicable` |
 | Recovered failure after any local stage | failed with the deterministic recovery code | `quiesced(lastStage)` | no `applying`; may contain `unknown` | `review_required|reviewed` when any host change is applied or unknown |
 | Successful run | succeeded | `quiesced(lastStage)` | complete; no `planned|applying|unknown` | `not_applicable` |
 
@@ -1194,9 +1199,12 @@ orderings and prove one coherent winner without deadlock.
     reclassifying it as lease expiry.
 39. Lease expiry/recovery races before the first host replacement, between two
     replacements, and after the final replacement before evidence/finalization.
-    The host fence prevents actionable recovery while stale effects run; a crash
+    The resource fence prevents actionable recovery while stale effects run; a crash
     after replacement/before outcome yields ledger `unknown` and mandatory
     fingerprint-bound working-tree review.
+    The same result is required when the live owner catches failure or ownership
+    loss on the `applying → applied` persistence step; it cannot terminalize until
+    it durably maps uncertainty to `unknown`.
 40. Process death after every post-submission stage and finalizer rollback proves
     monotonic effect intent preserves possible-local-change guidance even when the
     primary terminal code is lease/worker loss. No new run starts until quiescence
@@ -1229,6 +1237,9 @@ orderings and prove one coherent winner without deadlock.
     actionless until the entire process group exits, then one same-host recovery
     wins. A different, missing, stale, or unreachable host registration is
     alert-only and cannot terminalize.
+    Wrong-host recovery covers both `not_started` (run/package pin only) and
+    `active|quiesced` (run/package pin plus intent host) without reading a field
+    absent from the union.
 48. Exhaustive assembly/delivery/terminal/effect/ledger/host-review fixtures prove
     the two normative tables, stage equality, fingerprint equality, no terminal
     `active`, and no successful row with `planned|applying|unknown`. PostgreSQL
