@@ -47,9 +47,10 @@ Make required bounded-filesystem denials, revocations, and missing grants recove
    decisions share its evaluator and lock order but never scan sibling packages.
 6. **One lock order.** S3 uses the prefix project → tasks ascending → packages
    ascending → grant approval. #179 owns the full suffix: worker-protocol epoch →
-   agent runs ascending → runtime audits ascending → host-apply ledgers/entries by
-   run and ordinal → all artifacts by stable key → issuance-recovery actions by
-   unique key → integrity alerts/resolutions by stable key → review-gate rows ascending.
+   worker-instance rows ascending → agent runs ascending → runtime audits
+   ascending → host-apply ledgers/entries by run and ordinal → all artifacts by
+   stable key → issuance-recovery actions by unique key → integrity
+   alerts/resolutions by stable key → review-gate rows ascending.
    S3 normally stops at the approval row and does not acquire the epoch row.
 7. **No stale whole-JSON writes.** Owned JSONB paths are patched atomically or protected by explicit compare-and-retry.
 8. **No automatic retry.** A filesystem grant block requires operator action.
@@ -184,13 +185,17 @@ for authority.
 Every filesystem decision also stores the positive decimal
 `rootBindingRevision` from the locked project. `readEffectiveGrantState` accepts a
 decision only when that revision equals the project's current internal binding.
-Root creation/backfill may bind a pre-existing approval to revision 1 only after
-the checked-in host-binding procedure proves the configured canonical root did not
-change; an unbound or duplicate/aliased root fails closed. A later repoint
-increments the binding revision and invokes the same negative project reconciler
-under project → tasks → packages → approvals locks, marking prior project and
-package coverage `revoked` and holding affected unclaimed packages. The new root
-requires an explicit operator decision. No timestamp or stable `rootRef`
+Project root creation or backfill may bind the project to revision 1, but it must
+never add that revision to a pre-v2 approval. The current schema contains no
+immutable root identity captured when a legacy approval was made, so observing
+today's path cannot prove what that approval originally authorized. Every legacy
+decision without a stored binding revision remains non-issuable until an explicit
+operator reapproval records the current locked revision. An unbound or
+duplicate/aliased root also fails closed. A later repoint increments the binding
+revision and invokes the same negative project reconciler under project → tasks →
+packages → approvals locks, marking prior project and package coverage `revoked`
+and holding affected unclaimed packages. The new root requires an explicit
+operator decision. No timestamp, current-path comparison, or stable `rootRef`
 substitutes for this authority boundary.
 
 Precedence for the exact package-required capability set is:
@@ -264,10 +269,11 @@ project → affected tasks (ID ascending) → affected packages (ID ascending)
 ```
 
 S3 grant mutations normally stop after the grant approval row. #179 defines the
-full suffix as grant approval → worker-protocol epoch → agent runs ascending →
-runtime audits ascending → host-apply ledgers/entries by run and ordinal → all
-artifacts by stable key → issuance-recovery actions by unique key → integrity
-alerts/resolutions by stable key → review-gate rows ascending.
+full suffix as grant approval → worker-protocol epoch → worker-instance rows
+ascending → agent runs ascending → runtime audits ascending → host-apply
+ledgers/entries by run and ordinal → all artifacts by stable key →
+issuance-recovery actions by unique key → integrity alerts/resolutions by stable
+key → review-gate rows ascending.
 No path may acquire package before task, approval before package, run/audit before
 approval, or artifact before the audit it summarizes. A stale-audit sweeper that
 needs a package must first discover candidates without retaining row locks, then
@@ -345,9 +351,10 @@ integration point is package-local one-time reapproval: after S3 rotates a fresh
 nonce under project → task → packages in ID order → approval locks, it calls
 #179's package-scoped resolver in the same transaction. “Package-scoped” limits
 grant evaluation; the resolver still locks siblings to enforce the task-wide
-review barrier. It then continues through the complete applicable suffix: prior
-agent run → runtime audit → host-apply ledger/entries → all artifacts → existing
-or new recovery action → integrity alerts/resolutions → review gates. It proves
+   review barrier. It then continues through the complete applicable suffix:
+   protocol epoch → exact worker-instance row → prior agent run → runtime audit →
+   host-apply ledger/entries → all artifacts → existing or new recovery action →
+   integrity alerts/resolutions → review gates. It proves
 canonical typed audit/artifact terminal-tuple equality, compare-and-sets the exact
 terminal prior audit, `reapprove_allow_once` marker/fingerprint, changed nonce,
 current policy, no active lease, and no sibling `awaiting_review`, then clears only
@@ -404,14 +411,16 @@ schema compatibility alone is not enough. Roll out in this order:
 
 1. Add the project `BIGINT` decision counter plus nullable decision/root-binding
    revision and marker fields and the dual v1/v2 reader. Do not emit v2 markers
-   yet. An approval without a proven root binding is non-issuable.
+   yet. Every approval without a stored root-binding revision is non-issuable.
 2. Drain old workers or enforce a protocol/version gate that prevents them from
    claiming S3-capable packages. An old orchestrator would otherwise turn an
    operator hold into task failure.
-3. After #179's checked-in host-binding procedure proves the existing canonical
-   root, bind compatible legacy approvals to initial revision 1; collision/unbound
-   rows remain held. Then enable revision writers, v2 markers, operator-hold
-   transitions, and positive plus negative reconciliation.
+3. Use #179's checked-in host-binding procedure to bind the project to the current
+   canonical root and initial revision 1. Do not upgrade any legacy approval as a
+   side effect. Collision/unbound rows and every decision without historical
+   binding evidence remain held until explicit reapproval. Then enable revision
+   writers, v2 markers, operator-hold transitions, and positive plus negative
+   reconciliation.
 4. Deploy #179 packet/claim producers only after S3 readers and lock order are
    compatible. Deploy #180/#181 consumers and tests against that contract.
 5. Remove the v1 adapter only after the supported migration window and evidence
@@ -455,7 +464,9 @@ minimum, prove:
    monotonic revisions do. A legacy pair without revisions fails closed.
    Root repoint increments the independent root-binding revision, revokes every
    old-root decision, and cannot expose the new root until explicit reapproval;
-   canonical aliases resolve to the same binding.
+   canonical aliases resolve to the same binding. Seed legacy `allow_once` and
+   `always_allow` decisions, including repoint-away-and-back history, and prove
+   project binding cannot make any of them issuable without explicit reapproval.
 5. Project grant removal and narrowing perform negative reconciliation: exact
    covered subsets stay eligible, uncovered `pending`/`ready` packages become
    blocked, and task `running → approved` occurs only without another live lease
@@ -467,9 +478,9 @@ minimum, prove:
    `blocked → ready`; generic blocks and changed-fingerprint blocks remain.
 8. The v2 reader and exact v1 adapter work during rollout, while ambiguous legacy
    errors do not recover. Redis failure after commit is repaired by the sweep.
-9. The full project → tasks → packages → approval → protocol epoch → agent runs →
-   audits → host-apply ledgers/entries → artifacts → issuance-recovery actions →
-   integrity alerts/resolutions → review-gate rows order has
+9. The full project → tasks → packages → approval → protocol epoch → worker
+   instances → agent runs → audits → host-apply ledgers/entries → artifacts →
+   issuance-recovery actions → integrity alerts/resolutions → review-gate rows order has
    no deadlock across S3 reconciliation, #179 issuance, nonce rotation, and stale
    claim recovery.
 10. Fresh one-time reapproval invokes only #179's package-scoped resolver; stale
