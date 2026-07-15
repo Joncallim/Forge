@@ -2936,6 +2936,9 @@ contract. This split must match the per-step release manifest metadata above.
   equal/newer package denial. Newer coverage is explicit
   reauthorization and the action records that revision; a new run snapshots it.
   Missing/narrower/unknown coverage exposes the grant control, not retry.
+  A root-binding mismatch is a structured `root_changed` revocation and says
+  “Project root changed — approve context again”; S5 never compares revisions or
+  displays either path.
   `review_submission` records acknowledgement actor/time without changing the
   immutable delivery and, when required, exact host-ledger working-tree review;
   the later retry still rechecks current coverage and requires host review
@@ -2955,8 +2958,13 @@ contract. This split must match the per-step release manifest metadata above.
   applicable run artifacts, and host ledger; proves typed terminal tuple equality
   plus marker/ledger identity; and validates assembly/delivery/terminal/failure-stage together; the browser never
   composes independent fields into an action. A typed packet integrity hold is
-  neutral, non-retryable, and has no web CTA. Copy names Release/DevOps and the
+  neutral, non-retryable, and has no web CTA. Incomplete success says evidence
+  needs operator repair; true audit/artifact mismatch says evidence conflicts and
+  is quarantined, never promising repair. Copy names Release/DevOps and the
   checked-in integrity runbook, while privileged resolution remains outside S5.
+  An exact joined `quarantined_abandoned` resolution plus cancelled task/package
+  renders “Task closed — evidence quarantined,” preserves the conflicting records,
+  and exposes no new-run control. Status alone never implies that closure.
 - A live audit with `status:'claiming'` and a **server-computed PostgreSQL-time**
   `leaseActive:true` is first normalized into one discriminated claim-state union:
   preparing=`not_assembled/not_exposed`, assembled=`assembled/not_exposed`,
@@ -2967,7 +2975,9 @@ contract. This split must match the per-step release manifest metadata above.
   commit. Impossible phase/assembly/delivery cross-products fail closed. Valid current phases render actionlessly. The browser never compares lease
   timestamps or derives phase itself. An expired submitted claim with active
   effect intent/quiescence alert renders “Waiting for worker changes to stop” and
-  no action. Other stale/unknown observations are neutral until S4
+  no action until the authoritative owning host and complete supervised process
+  group release the resource fence; wrong/stale/unreachable host evidence remains
+  waiting. Other stale/unknown observations are neutral until S4
   recovery/finalization persists terminal evidence.
 - S4 evidence uses opaque `rootRef` or the phrase "this project", never a host
   filesystem root. S5 ignores generic artifact prose and legacy path-valued `root`

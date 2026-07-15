@@ -94,15 +94,26 @@ type PacketCurrentStatePresentationInput =
       packageStatus: WorkPackageStatus;
       currentPolicyFingerprint: string;
       currentAuthorization:
-        | { state: 'same_decision'; decisionRevision: string }
+        | {
+            state: 'same_decision';
+            decisionRevision: string;
+            rootBindingRevision: string;
+          }
         | {
             state: 'newer_covering_decision';
             priorDecisionRevision: string;
             decisionRevision: string;
+            priorRootBindingRevision: string;
+            rootBindingRevision: string;
           }
         | {
             state: 'not_covering';
-            reason: 'denied' | 'revoked' | 'narrowed' | 'policy_changed';
+            reason:
+              | 'denied'
+              | 'revoked'
+              | 'narrowed'
+              | 'policy_changed'
+              | 'root_changed';
           }
         | { state: 'unknown' };
       executionLeaseActive: boolean;
@@ -116,6 +127,18 @@ type PacketCurrentStatePresentationInput =
       evidenceFingerprint: string;
       taskStatus: TaskStatus;
       packageStatus: WorkPackageStatus;
+    }
+  | {
+      source: 'integrity_quarantine_closed';
+      hold: PacketIntegrityHoldV2 & { reason: 'audit_artifact_mismatch' };
+      resolution: {
+        kind: 'quarantined_abandoned';
+        actorId: string;
+        resolvedAt: string;
+        evidenceFingerprint: string;
+      };
+      taskStatus: 'cancelled';
+      packageStatus: 'cancelled';
     }
   | {
       source: 'quiescence_wait';
@@ -384,18 +407,29 @@ a fail-closed neutral state before the typed presenter is called.
   `leaseActive` against PostgreSQL time, and supplies the observation timestamp;
   the browser never compares `leaseExpiresAt` with `Date.now()`. An expired
   observation with active post-submission effect intent and S4's bounded alert
-  renders “Waiting for worker changes to stop” with no action until owning-host
-  recovery proves the fence quiescent. Other expired/incoherent observations
+  renders “Waiting for worker changes to stop” with no action until the
+  authoritative owning host and the complete supervised process group prove the
+  resource fence quiescent. A wrong, stale, or unreachable host remains in this
+  state and never offers a new-run control. Other expired/incoherent observations
   normalize to neutral “Refreshing run state” until S4 recovery/finalization
   persists a terminal result.
 
-- A typed `packet_integrity_hold` renders neutral “Run evidence needs operator
-  repair” with static text and no web action. It never borrows packet-failure copy,
-  never offers reapproval/retry, and never displays a database or exception detail.
-  It names Release/DevOps ownership and the checked-in
-  `docs/operators/packet-integrity-repair.md` procedure without making that
+- A typed `packet_integrity_hold` is reason-specific and has no web action.
+  `terminal_success_materialization_incomplete` renders neutral “Run evidence
+  needs operator repair.” `audit_artifact_mismatch` renders “Run evidence
+  conflicts — quarantined” and explains that immutable records cannot be rewritten;
+  Release/DevOps may inspect and, when neither verified outcome is provable,
+  permanently close the task. Neither state borrows packet-failure copy or offers
+  reapproval/retry. Both name Release/DevOps ownership and the checked-in
+  `docs/operators/packet-integrity-repair.md` procedure without making its
   privileged command a browser CTA. Alert ID/fingerprint are bounded support
   correlation, not user-editable inputs.
+
+- An exact append-only `quarantined_abandoned` resolution joined to that mismatch,
+  cancelled package, and cancelled task renders “Task closed — evidence
+  quarantined.” It states that Forge preserved the conflicting records and no new
+  run is available. Missing/mismatched resolution identity remains the unresolved
+  integrity hold; the browser never infers closure from status alone.
 
 - `reapprove_allow_once` shows “Approve one-time context again” and targets the
   package grant control. It never renders generic retry because the nonce burned
@@ -438,7 +472,9 @@ operator restores complete coverage, the server returns
 `newer_covering_decision`; a pre-intent marker may then expose explicit retry, and
 a post-intent marker may do so only after possible-submission acknowledgement.
 `unknown` remains neutral and actionless. The browser never compares revision
-strings or computes capability coverage.
+strings, root-binding revisions, or capability coverage. A `root_changed`
+authorization renders “Project root changed — approve context again”; it never
+offers retry under the old decision or displays either filesystem path.
 
 Every issuance marker has `autoRetryable:false`; the UI does not synthesize queue
 retry from delivery state. Unknown/malformed/stale markers are neutral, expose no
@@ -680,8 +716,17 @@ Component/integration tests:
     gate/finalizer rollback remains neutral in-progress/recovery state and cannot
     be mislabeled with that cause.
 40. each integrity reason creates one bounded support correlation with
-    Release/DevOps/runbook copy. No browser repair CTA exists; unauthorized,
-    stale-fingerprint, and normal recovery controls leave the hold unchanged.
+    Release/DevOps/runbook copy. A true mismatch uses quarantine language, not a
+    repair promise. No browser repair CTA exists; unauthorized, stale-fingerprint,
+    and normal recovery controls leave the hold unchanged.
+41. exact `quarantined_abandoned` resolution plus cancelled task/package renders
+    permanent evidence quarantine/closure with no retry. A missing, stale, wrong-
+    reason, or status-only resolution remains actionless and unresolved.
+42. wrong-host recovery and worker/supervisor death with a surviving descendant
+    retain “Waiting for worker changes to stop” and expose no control until S4
+    proves the resource fence quiescent.
+43. a root-binding mismatch renders bounded `root_changed` reapproval copy with no
+    old-decision retry and no old/new path or internal resource reference.
 
 ## Ownership boundaries
 
