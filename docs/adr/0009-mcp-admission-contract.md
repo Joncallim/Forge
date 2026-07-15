@@ -945,6 +945,13 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   explicit operator decision assigns one; migration must not manufacture order
   from timestamps. Removed or narrowed project coverage is `revoked`, not
   first-time `none`, and retains the latest revision and a bounded reason code.
+  Every decision also stores the locked project's internal root-binding revision.
+  A root repoint increments that separate revision and calls the same negative
+  reconciler, so old-root project/package decisions become `revoked` and the new
+  repository requires explicit reapproval. Stable packet `rootRef` correlation is
+  never authority. Initial backfill may bind existing approval to revision 1 only
+  after the checked-in host procedure proves the canonical root unchanged;
+  unbound or duplicate roots fail closed.
 - **Package-local `allow_once`.** An unconsumed one-time decision can approve only
   its package. Denial, one-time approval, nonce rotation/consumption, and
   reapproval lock and reevaluate only that target package; they never run a
@@ -1010,8 +1017,11 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   fingerprint races retry from locked state. A revocation/handoff race has one
   serialized result: either #179 claims first under its fence, or S3 holds before
   claim. Generic packet/execution failure never burns or recreates an approval.
-- **Mixed-version rollout.** Ship additive nullable fields and the dual v1/v2
-  reader before v2 writers. Then drain old workers or protocol-gate claims because
+- **Mixed-version rollout.** Ship additive nullable decision/root-binding fields
+  and the dual v1/v2 reader before v2 writers. Approval without proven binding is
+  non-issuable. After #179's checked-in host procedure proves an unchanged
+  canonical root, compatible legacy approvals may bind to revision 1;
+  collision/unbound rows remain held. Then drain old workers or protocol-gate claims because
   an old orchestrator can misread the new operator-hold marker as task failure. Enable
   S3 revision writers/holds/reconciliation before #179 issuance producers and
   #180/#181 consumers. Rollback disables writers/new claims but retains schema and
@@ -1022,7 +1032,8 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   equal/reversed timestamps, legacy fail-closed behavior, grant narrowing/removal,
   exact capability subsets, package-local one-time boundaries, fingerprint
   compare-and-set, JSONB coexistence, endpoint equivalence, Redis-wake loss,
-  old/new worker gating and rollback, grant mutation/revocation against
+  root-repoint revocation/reapproval and alias equivalence, old/new worker gating
+  and rollback, grant mutation/revocation against
   `awaiting_review` and both review decisions, and deadlock freedom across the
   global S3/#179 order. #181 owns the cross-slice failure and rollout regression matrix;
   #180 renders historical decision, current effective state, and packet evidence
