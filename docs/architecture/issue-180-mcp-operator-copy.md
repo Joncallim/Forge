@@ -90,8 +90,13 @@ type PacketCurrentStatePresentationInput =
   | {
       source: 'recovery_marker';
       marker: PacketIssuanceRecoveryMarkerV2;
+      projectArchived: false;
       taskStatus: TaskStatus;
       packageStatus: WorkPackageStatus;
+      localChangeBarrier: {
+        unresolvedCount: number;
+        fingerprint: string | null;
+      };
       currentPolicyFingerprint: string;
       currentAuthorization:
         | {
@@ -176,6 +181,12 @@ type PresentationCta =
       kind: 'review_submission';
       label: string;
       handler: 'acknowledge_possible_submission';
+      request: PacketRecoveryRequestIdentity;
+    }
+  | {
+      kind: 'review_local_changes';
+      label: string;
+      handler: 'review_local_changes';
       request: PacketRecoveryRequestIdentity;
     }
   | { kind: 'install'; label: string; handler: 'install_mcp' }
@@ -411,8 +422,9 @@ a fail-closed neutral state before the typed presenter is called.
   the browser never compares `leaseExpiresAt` with `Date.now()`. An expired
   observation with an unproven active/orphaned containment lease and S4's bounded alert
   renders “Waiting for worker changes to stop” with no action until the
-  authoritative owning host's fence service and operating-system containment
-  adapter prove the complete lease group empty. A wrong, stale, divergent-key,
+  protected authoritative host fence service and operating-system containment
+  adapter prove the complete per-run execution group empty. The long-lived queue
+  worker is not part of that group. A wrong, stale, divergent-key,
   insufficient-containment, or unreachable host remains in this
   state and never offers a new-run control. Other expired/incoherent observations
   normalize to neutral “Refreshing run state” until S4 recovery/finalization
@@ -442,20 +454,27 @@ a fail-closed neutral state before the typed presenter is called.
 - Evidence/history routes may explicitly read a tombstoned project and render
   neutral “Project removed — evidence retained.” They keep the original opaque
   `rootRef` correlation and immutable task/run evidence, show no former path or
-  live-root control, and never attach that history to a later project that reuses
-  the released physical root. Normal project lists continue to hide tombstones.
+  live-root control, execution/retry/reapproval/review-gate/root-management CTA, or
+  active package progression, and never attach that history to a later project
+  that reuses the released physical root. Normal project lists continue to hide
+  tombstones. S5 consumes S4's bounded `project_removed` cancellation state; it
+  never infers removal from a missing path.
 
 - `reapprove_allow_once` shows “Approve one-time context again” and targets the
   package grant control. It never renders generic retry because the nonce burned
   when the packet claim committed.
-- `review_then_reapprove_allow_once` first shows the possible-prior-submission
-  acknowledgement. When either S4's host ledger or repository baseline/change
-  evidence requires review, the same static copy says local files may contain prior
-  or partial work and the control label is “I reviewed the submission and local
-  changes.” After the S4 action records that acknowledgement against the exact
-  marker, ledger, and repository-change fingerprints, the marker
-  becomes `reapprove_allow_once`; only then does the package grant control create
-  a fresh nonce.
+- Review precedence applies before every grant/delivery disposition. When either
+  S4 host-ledger or repository baseline/change evidence is `review_required`, S5
+  offers only `review_local_changes` with label “I reviewed the local changes,”
+  bound to the exact marker and evidence fingerprints. For definitive
+  `submission_failed`, copy keeps the two facts separate: “The provider rejected
+  the request. Forge also detected local changes that require review.” It never
+  claims the provider caused them. After S4 records the local review, it advances
+  to the stored delivery/grant-mode disposition without changing delivery.
+- `review_then_reapprove_allow_once` then shows only the possible-prior-submission
+  acknowledgement. After S4 records it against the exact marker, delivery, and
+  audit identity, the marker becomes `reapprove_allow_once`; only then does the
+  package grant control create a fresh nonce.
 - `retry_execution` is available for an `always_allow` marker whose delivery is
   `not_exposed|submission_failed` and disposition is `retry_execution`, or whose
   delivery is `submission_uncertain|submitted` and separately recorded
@@ -463,8 +482,9 @@ a fail-closed neutral state before the typed presenter is called.
   package is still `blocked`, package policy is unchanged, current authorization
   is `same_decision|newer_covering_decision`, and neither execution nor issuance
   lease is active. Both `hostApplyReview` and `repositoryChangeReview` must be
-  `not_applicable|reviewed`; required or changed-fingerprint review exposes no
-  retry. A newer decision is shown as explicit reauthorization, not as
+  `not_applicable|reviewed`, and the task-local-change count/fingerprint must be
+  zero/null; required, mismatched, or stale review exposes no retry. A newer
+  decision is shown as explicit reauthorization, not as
   continuity of the old grant. The server route locks and rechecks the same
   predicate, records the authorizing current revision, clears only the matched
   marker, moves the package to `ready`, and wakes after commit. The normal claim
@@ -472,8 +492,7 @@ a fail-closed neutral state before the typed presenter is called.
 - `review_submission` is a marker disposition paired with immutable delivery
   `submission_uncertain|submitted`. It states that ACP may already have accepted
   work and offers S4's acknowledgement action. Acknowledgement keeps delivery
-  unchanged, sets actor/time, records the exact host-ledger and repository-change
-  working-tree reviews when required, and changes the disposition to
+  unchanged, sets actor/time only after local-change review is complete, and changes the disposition to
   `reviewed_submission`; if exact current coverage still holds, the presenter may
   then offer S4's explicit `retry_execution` action. A live `submitting` claim is
   evidence-only and has no recovery action until stale recovery converts delivery
@@ -501,10 +520,15 @@ The current-state reader imports S4's discriminated
 `PacketIssuanceRecoveryMarkerV2` union and rejects every known-invalid
 grant-mode/delivery/disposition/acknowledgement combination before presentation.
 It joins `priorRuntimeAuditId` to the exact prior audit, all applicable run
-artifacts (including the packet artifact), and any host-apply ledger; proves the
-typed terminal tuples equal; binds marker and host-review fingerprints; and
-validates assembly + delivery + terminal status + failure code/conditional stage
-together. The marker alone is insufficient. Missing,
+artifacts (including the packet artifact), any host-apply ledger/review, and the
+authoritative pre-submission repository baseline plus post-quiescence change result,
+change fingerprint, and repository-review row. It proves the typed terminal tuples
+equal; binds marker, host-review, repository-review, and task-local-change barrier
+fingerprints; and validates assembly + delivery + terminal status + failure code/
+conditional stage together. Normal repository review accepts only
+`not_applicable|review_required|reviewed`; `abandoned` is valid solely on a joined
+integrity-quarantine resolution and never on an audit/marker review. The marker
+alone is insufficient. Missing,
 mismatched, or terminal-success-plus-failure-marker evidence becomes a typed or
 neutral integrity hold with no action. The browser never assembles those
 independent fields into a state.
@@ -529,9 +553,10 @@ roll back local changes, requires the operator to inspect/resolve the working tr
 and offers no automatic resubmission. It never displays a path, file name, command,
 provider text, or raw/sanitized exception.
 `external_repository_change_requires_review` renders “Repository changed during
-worker submission — review required.” It explains that the Agent Communication
+the worker attempt — review required.” It explains that the Agent Communication
 Protocol (ACP) runtime is not a filesystem sandbox, Forge stopped before its own
-local apply stages, and the operator must review the working tree. Changed and
+local apply stages, and the operator must review the working tree. It does not say
+the provider caused the change. Changed and
 unverifiable results use the same bounded caution; no raw path, diff, or error is
 shown on this packet surface.
 `completion_preparation` refers only to work before the atomic finalizer; a gate
@@ -560,7 +585,10 @@ generic artifact prose and render only validated typed metadata. Clearly separat
 packet evidence from sandbox-generated files and host-applied changes. A failed
 pre-assembly snapshot shows stage plus enum-derived static failure copy without
 invented zero counts or raw/sanitized exception detail. A terminal success is
-valid only with `assembled+submitted`; a terminal failure must match S4's exact
+valid only with `assembled+submitted`, repository `unchanged/not_applicable`, and
+one of S4's disjoint effect tuples: `not_started` with no local stage/ledger, or
+`quiesced(actualLastStage)` with a complete declared host-write ledger. Changed or
+unverifiable evidence never renders success, even when reviewed. A terminal failure must match S4's exact
 assembly/delivery/failure-code/conditional-stage compatibility table. A
 post-submission execution failure is shown separately from provider-response
 validity and from host-change evidence; packet state never claims whether local
@@ -673,8 +701,9 @@ Component/integration tests:
 19. every S4 delivery state renders separately from assembly and never implies
     submission from counts alone;
 20. one-time issuance recovery targets reapproval, safe pre-intent always-allow
-    recovery uses the locked retry predicate, and post-intent ambiguity initially
-    requires review with no retry; only a recorded acknowledgement may yield the
+    recovery uses the locked retry predicate, every exact local-change barrier
+    first exposes `review_local_changes`, and post-intent ambiguity then requires
+    possible-submission acknowledgement with no retry; only recorded actions may yield the
     `reviewed_submission` disposition and then expose the same locked
     current-coverage retry predicate.
 21. `not_issued` maps to Needs project context, and each project health state
@@ -698,7 +727,7 @@ Component/integration tests:
     state” and cannot reach the typed presenter. Preflight, assembly,
     provider-validation, and post-submission local failures cannot be inferred
     before terminal commit; a restarted reader shows the last durable phase.
-28. retry and acknowledgement controls carry the exact version-2 prior-audit and
+28. local-review, retry, and possible-submission acknowledgement controls carry the exact version-2 prior-audit and
     marker-fingerprint identity. A component cannot submit an action-only request
     or substitute identity from another task/package.
 29. a project allow decision racing an equal/newer package denial renders
@@ -708,9 +737,13 @@ Component/integration tests:
     actionable only after the S4 task-state reconciler makes the task `approved`.
     An `awaiting_review` sibling renders “Waiting for required review” and likewise
     suppresses every action.
+    A materialized sibling local-change barrier suppresses every new-run/reapproval
+    action, while the exact marker that owns the fingerprint may expose only its
+    local-review action.
 31. every closed S4 `PacketFailureCode` maps to bounded static copy, while an
     unknown/future code is neutral, actionless, and never rendered verbatim.
-32. every valid S4 grant-mode/delivery/disposition/acknowledgement marker tuple
+32. every valid S4 grant-mode/delivery/review-precedence/disposition/
+    acknowledgement marker tuple
     renders the one allowed action; every known-invalid cross-product is neutral
     and actionless before the typed presenter.
 33. terminal success renders only for `assembled+submitted`. Every valid terminal
@@ -732,7 +765,7 @@ Component/integration tests:
     renders “Waiting for worker changes to stop,” remains actionless, and never
     exposes a new-run control until S4 persists `quiesced`.
 38. every `HostApplyRecoveryReview` tuple is exhaustive. `review_required` uses
-    exact marker/ledger-fingerprint acknowledgement and hides retry/reapproval;
+    exact marker/ledger-fingerprint `review_local_changes` and hides retry/reapproval;
     `reviewed` permits only the normal locked predicate; changed fingerprints fail
     closed. The same matrix independently covers every `RepositoryChangeReview`,
     including `not_observed`, unchanged, changed, and unverifiable outcomes.
@@ -747,18 +780,35 @@ Component/integration tests:
     complete sibling-evidence-set/repository disposition renders permanent evidence
     quarantine/closure with no retry. A missing, stale, wrong-reason, incomplete-
     sibling, or status-only resolution remains actionless and unresolved.
-42. wrong-host recovery and worker/fence-service/control loss with a surviving ACP
+42. wrong-host recovery and per-run-child/fence-service/control loss with a surviving ACP
     or validation descendant retain “Waiting for worker changes to stop” and expose
-    no control until S4's containment adapter proves the complete lease group empty.
+    no control until S4's protected containment adapter proves the complete per-run
+    group empty. Queue-worker survival does not keep a normally completed run held;
+    only an authenticated fresh same-host recovery instance may finish stale work.
 43. a root-binding mismatch renders bounded `root_changed` reapproval copy with no
     old-decision retry and no old/new path or internal resource reference.
 44. changed or unverifiable repository evidence before Forge's first local stage
     renders the bounded external-change review message for valid response, failure,
-    and submission uncertainty. Retry, reapproval, quarantine, and root-management
-    actions remain hidden until the exact fingerprint is reviewed or abandoned.
+    and submission uncertainty. Retry, reapproval, new-run, and root-management
+    actions remain hidden; only exact local review or privileged quarantine can
+    resolve its own fingerprint barrier.
 45. tombstoned project evidence remains reachable from the authorized history/
     support route with “Project removed — evidence retained,” while normal lists
-    hide it, root reuse does not relabel it, and no former path is displayed.
+    hide it, root reuse does not relabel it, no former path is displayed, and no
+    execution/retry/reapproval/review-gate/root-management CTA is present.
+46. `submission_failed + changed|unverifiable` in both grant modes says the
+    provider rejected the request **and** local changes need review without claiming
+    causation. Only local review is offered; afterward immutable delivery remains
+    rejected and the correct reapproval/retry action appears.
+47. A marker whose repository baseline/change/review fingerprint differs from its
+    audit or task barrier renders a neutral integrity hold with no action. The same
+    parity holds for host ledger/review evidence.
+48. Audit/marker-level repository `abandoned` is rejected as incoherent. Only an
+    exact joined quarantine resolution may render intentional abandonment, and it
+    never exposes retry.
+49. Both successful effect branches render only with unchanged/not-applicable
+    repository evidence. A fabricated no-stage `quiesced` tuple and every success
+    with changed/unverifiable/reviewed evidence fail closed.
 
 ## Ownership boundaries
 
