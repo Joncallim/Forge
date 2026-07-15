@@ -50,7 +50,17 @@ type PacketCurrentStatePresentationInput =
       taskStatus: TaskStatus;
       packageStatus: WorkPackageStatus;
       auditStatus: 'claiming';
-      deliveryState: 'submitting';
+      phase:
+        | 'preparing'
+        | 'assembled'
+        | 'submitting'
+        | 'accepted_finalizing'
+        | 'failed_finalizing';
+      deliveryState:
+        | 'not_exposed'
+        | 'submitting'
+        | 'submission_failed'
+        | 'submitted';
       leaseActive: true;
       databaseObservedAt: string;
     }
@@ -60,7 +70,15 @@ type PacketCurrentStatePresentationInput =
       taskStatus: TaskStatus;
       packageStatus: WorkPackageStatus;
       currentPolicyFingerprint: string;
-      currentCoverageMatches: boolean;
+      currentAuthorization:
+        | { state: 'same_decision'; decisionRevision: string }
+        | {
+            state: 'newer_covering_decision';
+            priorDecisionRevision: string;
+            decisionRevision: string;
+          }
+        | { state: 'not_covering' }
+        | { state: 'unknown' };
       executionLeaseActive: boolean;
       issuanceLeaseActive: boolean;
     };
@@ -298,13 +316,16 @@ its versioned `packet_issuance` marker and passes the discriminated input to
 `mcpBroker` contract. Runtime parsing normalizes unknown task/package statuses to
 a fail-closed neutral state before the typed presenter is called.
 
-- A live `claiming` audit with `delivery:'submitting'` and unexpired lease renders
-  “Submitting to worker” as current state with no action. It is not immutable run
-  evidence and is never read from a terminal artifact.
-  The server computes `leaseActive` against PostgreSQL time and supplies the
-  observation timestamp; the browser never compares `leaseExpiresAt` with
-  `Date.now()`. Stale/unknown observations normalize to neutral “Refreshing run
-  state” until recovery persists a terminal result.
+- The server exhaustively maps a live `claiming` audit with an unexpired lease:
+  `not_exposed` is “Preparing project context” or “Context assembled”; `submitting`
+  is “Submitting to worker”; `submitted` is “Worker accepted — finalizing”; and
+  `submission_failed` is “Submission failed — finalizing”. These are current states
+  with no action, not immutable run evidence, and are never read from a terminal
+  artifact. The server validates the phase/delivery combination, computes
+  `leaseActive` against PostgreSQL time, and supplies the observation timestamp;
+  the browser never compares `leaseExpiresAt` with `Date.now()`. An expired or
+  incoherent observation normalizes to neutral “Refreshing run state” until S4
+  recovery/finalization persists a terminal result.
 
 - `reapprove_allow_once` shows “Approve one-time context again” and targets the
   package grant control. It never renders generic retry because the nonce burned
@@ -317,11 +338,13 @@ a fail-closed neutral state before the typed presenter is called.
   `not_exposed|submission_failed` and disposition is `retry_execution`, or whose
   delivery is `submission_uncertain|submitted` and separately recorded
   disposition is `reviewed_submission`. In both cases the task is `approved`, the
-  package is still `blocked`, policy/coverage fingerprints match, current project
-  coverage is exact, and neither execution nor issuance lease is active. The
-  server route locks and rechecks the same predicate, clears only the matched
+  package is still `blocked`, package policy is unchanged, current authorization
+  is `same_decision|newer_covering_decision`, and neither execution nor issuance
+  lease is active. A newer decision is shown as explicit reauthorization, not as
+  continuity of the old grant. The server route locks and rechecks the same
+  predicate, records the authorizing current revision, clears only the matched
   marker, moves the package to `ready`, and wakes after commit. The normal claim
-  path creates any new run.
+  path creates the new run and snapshots that current decision.
 - `review_submission` is a marker disposition paired with immutable delivery
   `submission_uncertain|submitted`. It states that ACP may already have accepted
   work and offers S4's acknowledgement action. Acknowledgement keeps delivery
@@ -330,6 +353,14 @@ a fail-closed neutral state before the typed presenter is called.
   then offer S4's explicit `retry_execution` action. A live `submitting` claim is
   evidence-only and has no recovery action until stale recovery converts delivery
   to `submission_uncertain`.
+
+If `currentAuthorization.state` is `not_covering`, the UI offers no packet retry.
+It says that project context changed and targets the exact grant control. After an
+operator restores complete coverage, the server returns
+`newer_covering_decision`; a pre-intent marker may then expose explicit retry, and
+a post-intent marker may do so only after possible-submission acknowledgement.
+`unknown` remains neutral and actionless. The browser never compares revision
+strings or computes capability coverage.
 
 Every issuance marker has `autoRetryable:false`; the UI does not synthesize queue
 retry from delivery state. Unknown/malformed/stale markers are neutral, expose no
@@ -360,9 +391,9 @@ pre-assembly snapshot shows stage and sanitized reason without invented zero
 counts. Delivery copy is exhaustive over S4's exact states:
 `not_exposed|submission_failed|submitted|submission_uncertain`; terminal artifacts
 never contain live `submitting`. Assembly never implies ACP acceptance. The
-current-state reader may show a live `submitting` audit only while its lease is
-valid; after recovery the terminal artifact/marker must say
-`submission_uncertain`.
+current-state reader may show any validated live phase above only while its lease
+is valid. After recovery/finalization, the matching terminal artifact/marker owns
+the result; an expired `submitting` intent becomes `submission_uncertain`.
 
 ### Client policy removal
 
@@ -469,10 +500,18 @@ Component/integration tests:
     invokes its distinct typed install/enable/connect/configure/fix/refresh action.
 22. a live `submitting` audit is current in-progress state only; terminal artifacts
     reject `submitting` and render recovered `submission_uncertain` separately.
+    Live preparing/assembled/submitting/accepted-finalizing/failed-finalizing
+    phases are exhaustive, actionless, and never sourced from terminal artifacts.
 23. task/package status normalization and every CTA discriminant fail closed; an
     install CTA cannot carry a refresh/configure handler.
 24. skewed browser clocks cannot change live submission copy because the server's
     database-time `leaseActive` observation is authoritative.
+25. revocation hides packet retry; restoring exact always-allow coverage under a
+    newer revision renders explicit reauthorization and permits one locked retry
+    (after acknowledgement for post-intent delivery), while narrower/unknown
+    coverage and changed package policy remain actionless.
+26. two identical recovery actions converge on one recorded success and one visible
+    transition; only a changed fingerprint/state renders a stale-action `409`.
 
 ## Ownership boundaries
 

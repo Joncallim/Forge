@@ -2929,16 +2929,21 @@ contract. This split must match the per-step release manifest metadata above.
   `not_exposed|submission_failed` with disposition `retry_execution`, or from
   delivery `submission_uncertain|submitted` only after acknowledgement changes the
   separate disposition to `reviewed_submission`. In both cases the task is
-  `approved`, package/policy/coverage match, and no lease is active.
+  `approved`, package policy is unchanged, no lease is active, and the server has
+  classified current authorization as the same decision or a greater decision
+  revision that exactly covers the required set. Newer coverage is explicit
+  reauthorization and the action records that revision; a new run snapshots it.
+  Missing/narrower/unknown coverage exposes the grant control, not retry.
   `review_submission` records acknowledgement actor/time without changing the
   immutable delivery; the later retry still rechecks current coverage. Every
   marker has `autoRetryable:false`; unknown/stale markers expose no action and
   S4's route rechecks under the global order.
-- A live audit with `status:'claiming'`, delivery `submitting`, and a
-  **server-computed PostgreSQL-time** `leaseActive:true` is current in-progress
-  state with no action. The browser never compares lease timestamps with its own
-  clock. Stale/unknown observations are neutral until S4 recovery persists
-  terminal `submission_uncertain` state.
+- A live audit with `status:'claiming'` and a **server-computed PostgreSQL-time**
+  `leaseActive:true` exhaustively renders actionless current phases for preparing
+  or assembled `not_exposed`, `submitting`, accepted/finalizing `submitted`, and
+  failed/finalizing `submission_failed`. The browser never compares lease
+  timestamps or derives phase itself. Stale/unknown observations are neutral until
+  S4 recovery/finalization persists terminal evidence.
 - S4 evidence uses opaque `rootRef` or the phrase "this project", never a host
   filesystem root. S5 ignores generic artifact prose and legacy path-valued `root`
   fields and renders only validated counts, byte count, omission/redaction summary,
