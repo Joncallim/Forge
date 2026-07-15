@@ -170,25 +170,40 @@ exact coverage fingerprint.
 - two workers race one `allow_once` decision nonce: at most one claim/packet;
 - two workers race one `always_allow` package attempt: at most one run-scoped
   claim/packet, with current project revision recorded;
+- packet, packet-free, and handoff-only candidates race pairwise in both
+  orderings: the shared primitive locks all siblings, recomputes eligibility, and
+  establishes exactly one running specialist/lease;
 - claim versus reapproval follows lock order;
 - stale lease recovery invalidates token and never reopens nonce;
 - delayed stale owner cannot begin later governed reads or finalize;
 - normal handoff stale-running recovery delegates packet-bearing v2 runs to the
   unified S4 transaction and never writes a competing generic stale marker/event;
 - direct progress, sibling continuation, and periodic readiness never promote a
-  valid or known-invalid S4 packet marker through generic admission;
+  valid or known-invalid S4 recovery/integrity marker through generic admission;
 - reapproval rotates nonce;
 - success and failure each yield exactly one typed packet metadata artifact with
   a compatible terminal success/failure discriminant; all known-invalid
-  stage/delivery/code tuples fail closed;
+  assembly/delivery/code/conditional-stage tuples fail closed;
 - post-assembly snapshot is durable before exposure;
 - pre-assembly failure is explicit;
 - artifact has counts/opaque `rootRef`/redaction only, no root path,
   names/paths/content;
-- concurrent finalizers respect partial unique index.
+- concurrent finalizers respect the partial unique index;
 - live run/package/lease, packet audit/artifact, recovery marker, and task
   disposition terminalize atomically; seeded partial terminal-audit/live-package
-  state takes the idempotent repair without evidence rewrite;
+  states split by immutable outcome: exact failure is copied, fully evidenced
+  success is reconstructed, and mismatch/incomplete success enters a typed
+  integrity hold without evidence rewrite or packet retry;
+- a valid provider response then fails at each closed local stage, including host
+  apply after one successful file; one submitted request, exact failure stage,
+  separate partial-host evidence, and no automatic retry/rollback survive;
+- definitive `submission_failed + submission_rejected` persistence races a crash
+  and lease expiry; recovery preserves the staged rejection cause;
+- stale S4 recovery races packet-free and handoff-only claims in both orderings;
+  no task moves to `approved` beside a newly established sibling lease;
+- atomic packet finalization races a stale review-gate decision in both
+  orderings; top-down locks and in-transaction source-run/artifact/package/lease
+  checks produce one coherent winner without deadlock;
 - one committed packet claim makes at most one external model/ACP submission; an
   accepted but Forge-invalid response does not trigger the existing automatic
   correction loop; the packet-bearing AI SDK call has `maxRetries:0`, every lower
@@ -197,8 +212,10 @@ exact coverage fingerprint.
 - both bridge-trigger epoch orderings use the supported three-statement
   `READ COMMITTED` activation: v1-shared-first forces activation to abort, while
   activation-exclusive-first rejects v1 before any repository read. A genuine
-  pre-trigger process is proved drained operationally, and packet, packet-free,
-  and handoff-only v2 claims all succeed after epoch 2;
+  pre-trigger process is proved drained operationally. The test invokes the real
+  checked-in activation command in dry-run and `--apply` modes, verifies actor,
+  idempotency, postconditions, and saved database audit from the operator runbook;
+  packet, packet-free, and handoff-only v2 claims all succeed after epoch 2;
 
 Tests must state the actual guarantee: cooperative one-winning-claim and best-effort delivery, not cryptographic recall of bytes or in-flight I/O.
 
@@ -230,10 +247,13 @@ means a one-time decision nonce can be replaced only by explicit reapproval.
 | Durable `submitting` intent, crash before/around ACP call | package S4 `blocked`; task `approved` after lease recovery | claim terminal failed; one-time nonce burned | staged assembly; recovery maps delivery to `submission_uncertain`; run/audit failed + one artifact | no submission replay | acknowledge possible prior work; then reapprove one-time or explicitly retry always-allow under current coverage |
 | Transport proves pre-acceptance rejection | package S4 `blocked`; task `approved` | claim terminal failed; one-time nonce burned | delivery `submission_failed`; run/audit failed + one artifact | no packet auto-retry | `allow_once`: reapprove; `always_allow`: explicit `retry_execution` if coverage matches |
 | Transport accepts response, Forge validation rejects it | package S4 `blocked`; task `approved` | claim terminal failed; one-time nonce burned | exactly one external prompt call; delivery `submitted`; terminal `provider_response_invalid`; failed run/audit + one artifact | no correction submission on this packet claim | acknowledge accepted submission, then grant-mode action |
+| Valid submitted response, then local execution stage fails | package S4 `blocked`; task follows sibling rule | claim terminal failed; one-time nonce burned | delivery stays `submitted`; terminal `post_submission_execution_failed` plus exactly one stage (`sandbox_apply|validation|host_apply|repository_evidence|completion_materialization`); one failed run/audit/artifact; separate host evidence may show partial writes | no model resubmission, local retry, or rollback | acknowledge prior external work and possible partial local changes; inspect/resolve working tree, then grant-mode action |
 | Transport accepted/returned, crash before outcome persistence | package S4 `blocked`; task `approved` after recovery | claim terminal failed; one-time nonce burned | recovery uses `submission_uncertain`; one failed run/audit and one artifact | no submission replay | acknowledge possible prior work before any new decision/run |
 | `submitted` persisted, crash before finalization | package S4 `blocked`; task `approved` after recovery | claim terminal failed; one-time nonce burned | delivery remains `submitted`; failed run/audit + one artifact | no submission replay | acknowledge prior submission before any new decision/run |
 | Atomic live terminal transaction fails | package/run/lease/audit/marker/task/artifact all remain at the preterminal state until retry/recovery; then package S4 `blocked`; task follows sibling rule | claim remains `claiming`; nonce stays burned | the whole terminal transaction rolls back; staged assembly/delivery remain; live retry or sweeper commits run/package/lease/audit/artifact/marker/task atomically | automatic terminal-state retry only | row-specific action only after atomic terminal state exists |
-| Seeded legacy/manual terminal-audit + live-package split | S4 repair fails the run, clears its lease, blocks package; task follows sibling rule | terminal claim remains immutable; nonce remains burned | existing audit/artifact remain byte-for-byte unchanged; no second artifact | idempotent S4 repair only; no submission | disposition-specific action from immutable delivery |
+| Seeded terminal-failure audit/artifact + live-package split | S4 repair fails the run, clears its lease, blocks package; task follows sibling rule | terminal claim remains immutable; nonce remains burned | exact audit/artifact tuple equality required; marker copies the immutable failure object/delivery; no second artifact | idempotent S4 repair only; no submission | disposition-specific action from immutable failure |
+| Seeded terminal-success audit/artifact + complete success materialization | repair completes the exact normal package/review-gate transition; task follows normal completion/review rule | successful claim remains immutable; nonce remains burned | matching completion artifact, configured repository evidence, and review-gate materialization are required; no marker/second artifact | idempotent success reconstruction only; no submission | none |
+| Seeded terminal-success with incomplete materialization, or audit/artifact mismatch | live run failed only for bounded integrity reason; lease cleared; package has typed S4 integrity hold; task follows sibling rule | immutable packet claim/outcome unchanged | existing evidence unchanged; `packet_integrity_hold` is non-retryable and is not a packet-failure marker | no retry/resubmission | no web action; separately authorized privileged data repair |
 | Redis wake fails after grant/recovery action | committed package `ready`; task `approved` | unchanged | unchanged | periodic database sweep re-enqueues; duplicate wakes harmless | none |
 | Always-allow packet block, then project grant revoked/restored | package remains S4 `blocked` until explicit retry; task `approved` | prior claim remains terminal; new decision has a greater revision | prior run/audit/artifact immutable; recovery action records the authorizing new revision; new run later snapshots it | none while uncovered; no automatic retry after restore | grant control while uncovered; after exact restore, explicit retry (and prior-submission acknowledgement first when required) |
 | Worker restart or lease expiry | stale live state becomes package S4 `blocked`; task `approved` | token invalidated; audit terminal failed; one-time nonce burned | run failed; one artifact from staged state; stale owner loses every later CAS | startup/periodic reconciliation only, never delivery replay | disposition-specific action above |
@@ -246,8 +266,8 @@ delivery is
 terminal artifacts exclude live `submitting`. Audit/run finalization is separate
 from delivery and never appears as a delivery enum. Each artifact also carries
 S4's terminal `{status:'succeeded'|'failed'}` discriminant; success is valid only
-with `assembled+submitted`, and failure requires one compatible closed code. The
-suite exhausts valid and known-invalid stage/delivery/terminal/code tuples and the
+with `assembled+submitted`, and failure requires one compatible closed code plus
+the conditional closed post-submission stage. The suite exhausts valid and known-invalid stage/delivery/terminal/code tuples and the
 grant-mode × delivery-state recovery-disposition matrix, including
 `reapprove_allow_once`, `review_then_reapprove_allow_once`, `retry_execution`,
 and `review_submission`, plus every known-invalid grant-mode/delivery/disposition/
@@ -268,7 +288,10 @@ lease loss → the named lease-expiry code; process loss → `worker_stopped`;
 preflight/assembly failure → the named stage code; proven transport refusal →
 `submission_rejected`; accepted-or-unknown transport outcome →
 `submission_uncertain`; accepted but invalid provider output →
-`provider_response_invalid`. Atomic finalization rollback has no separate cause
+`provider_response_invalid`; accepted valid output followed by local execution
+failure → `post_submission_execution_failed` plus its exact closed stage.
+Definitive `submission_failed` is persisted with `submission_rejected` and later
+lease expiry cannot replace that cause. Atomic finalization rollback has no separate cause
 code because it leaves no durable distinguishing fact; recovery uses the last
 durable phase and ownership predicates. Unknown or known-incompatible codes fail
 closed in S5/S6 and never become free-text assertions. Packet-owned state accepts
@@ -330,18 +353,26 @@ Keep this small:
    decision, requires acknowledgement first for post-intent delivery, and the new
    run snapshots the new revision. Race an equal/newer package denial against the
    restore and prove canonical denial-wins hides retry.
-10. Exercise every live packet phase: preparing, assembled, submitting,
-    accepted/finalizing, and failed/finalizing. Each is actionless current state;
+10. Exercise every durable live packet phase: preparing, assembled, submitting,
+    submission-rejected/finalizing, and accepted/finalizing. Each is actionless;
     every invalid phase/assembly/delivery cross-product and expired/incoherent
-    observation remains neutral until recovery, while assembled/`not_exposed`
-    failed-finalizing is a distinct valid phase.
+    observation remains neutral until recovery. Kill the worker after each stage
+    and prove a new process renders only PostgreSQL state, never a synthesized
+    failed/finalizing phase.
 11. Leave a sibling execution lease live while packet recovery completes. The task
     stays `running` and the marker says “Waiting for active package” without an
     action; after S4's post-sibling task reconciler reaches `approved`, the bounded
     action may appear.
 12. Invoke direct progress, sibling continuation, and periodic readiness with an
-    S4 packet marker while current always-allow admission is otherwise valid. None
-    promotes or claims it; only the exact packet action/resolver can make it ready.
+    S4 recovery or integrity-hold marker while current always-allow admission is
+    otherwise valid. None promotes or claims it; only the exact packet
+    action/resolver can clear a recovery marker, while an integrity hold has no web
+    action.
+13. Render every post-submission failure stage from the exact failed
+    audit/artifact/marker tuple. All copy is static; `host_apply` warns of possible
+    partial changes; no path/raw detail or automatic resubmission appears.
+14. Seed tuple mismatch, immutable-success-plus-failure-marker, and both typed
+    integrity-hold reasons. Every state is neutral, non-retryable, and actionless.
 
 Back-end integration tests remain authoritative for concurrency and state transitions.
 
@@ -395,10 +426,14 @@ S4 changes cross web and worker process boundaries, so S6 must prove this rollou
    shared protocol primitive and reach the database transition trigger before
    executor work. Stop/drain processes already past the newly installed trigger
    and prove no running package has null/protocol-1 claim evidence.
-4. **Cut over producers.** Use the privileged three-statement PostgreSQL
+4. **Cut over producers.** Invoke the checked-in `web` command
+   `npm run protocol:activate-work-package-v2 -- --actor <operator-id>` exactly as
+   the operator runbook specifies. Prove its default dry run reports blockers and
+   `--apply` verifies/uses the privileged three-statement PostgreSQL
    `READ COMMITTED` protocol: lock epoch exclusively; after any wait, query running
    null/v1 claims in a fresh command snapshot; then advance the monotonic epoch to
-   2 and audit. Enable v2 workers to write run-scoped claims and lifetime-stable opaque
+   2 and audit. Prove actor identity, idempotency, postconditions, and saved audit;
+   ad hoc SQL fails the release gate. Enable v2 workers to write run-scoped claims and lifetime-stable opaque
    `rootRef`. Prove v1-shared-first commits and makes activation abort, while
    activation-exclusive-first rejects the later v1 transition with zero reads.
    Separately start a genuine
