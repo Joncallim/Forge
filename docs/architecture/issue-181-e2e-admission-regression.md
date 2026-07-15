@@ -198,9 +198,34 @@ and lease. `allow_once` additionally claims and burns its immutable decision non
 `always_allow` instead snapshots the locked project grant decision revision,
 root-binding revision, and exact coverage fingerprint.
 
+S6 imports S4's one database-owned
+`forge.insert_packet_authorization_snapshot_v2(...)` constructor. Application code
+passes only its typed relational task, package, run, approval-decision, grant,
+root-binding, coverage, and source-arm IDs/enums. The function locks and validates
+that exact tuple, selects one closed source arm, and alone constructs the canonical
+`JSONB` object and its scalar mirrors. No application caller passes JSON/JSONB,
+builds authorization with object spread/merge, or inserts the snapshot directly.
+A duplicate-aware raw-JSON boundary rejects repeated lexical keys
+*before* PostgreSQL parses them as `JSONB`, because `JSONB` would otherwise collapse
+duplicates and erase evidence of the attack. The database validator then requires
+exact JSON/scalar equality and the retained scoped approval foreign key.
+
+Protocol-v2 identity is total rather than nullable-by-convention. Every v2 claim,
+runtime audit, authorization snapshot, packet artifact, action, and recovery row has
+non-null task, work-package, and run identity wherever that row kind requires them;
+the package/task/run foreign keys and source-arm checks cannot be bypassed with SQL
+`NULL` or partial `MATCH SIMPLE` semantics. Nullable legacy columns remain readable
+only through the closed legacy arm and can never satisfy a v2 predicate.
+
 - two workers race one `allow_once` decision nonce: at most one claim/packet;
 - two workers race one `always_allow` package attempt: at most one run-scoped
   claim/packet, with current decision and root-binding revisions recorded;
+- raw authorization input with a duplicate top-level or nested semantic key is
+  rejected before `JSONB` conversion. Fixed-constructor fixtures mutate every typed
+  field, key order, source arm, scalar mirror, and package/task/run identity; direct
+  SQL attempts with a null task, package, or run identity, a cross-scope approval,
+  or a JSON/scalar mismatch fail before claim, nonce burn, run, audit, artifact,
+  event, or prompt construction;
 - packet, packet-free, and handoff-only candidates race pairwise in both
   orderings: the shared primitive locks all siblings, recomputes eligibility, and
   establishes exactly one running specialist/lease;
@@ -210,15 +235,30 @@ root-binding revision, and exact coverage fingerprint.
 - execution, generic local-evidence, and optional packet-issuance claims have
   independent tokens/expiries. Heartbeat and recovery exercise all three expiry
   winners and every pairwise tie; none infers or refreshes another;
-- claim versus reapproval follows lock order;
+- for each of those three leases, copy the exact still-live token, run identity,
+  and expiry to another database connection authenticated as the wrong process
+  principal. Exercise heartbeat, repository-read batches, packet assembly, prompt
+  exposure/submission, every local stage and file replacement, and finalization.
+  Every boundary must reject before repository/external I/O or state mutation;
+  token possession never substitutes for the connection-authenticated pinned
+  instance;
+- claim versus reapproval follows lock order. S6 imports S4's append-only approval-
+  decision rows and separately compare-and-set current-decision pointer: every
+  reapproval inserts a new immutable decision with a strictly greater project-
+  serialized positive revision and fresh nonce and advances only the
+  pointer, while prior audit foreign keys continue to identify unchanged historical
+  decisions. A migration/parity test proves the old package-unique history index is
+  removed/replaced and package uniqueness lives on the preallocated pointer;
 - stale lease recovery invalidates token and never reopens nonce;
 - delayed stale owner cannot begin later governed reads or finalize;
 - normal handoff stale-running recovery delegates packet-bearing v2 runs to the
   unified S4 transaction and never writes a competing generic stale marker/event;
 - direct progress, sibling continuation, and periodic readiness never promote a
   valid or known-invalid S4 recovery/integrity marker through generic admission;
-- reapproval rotates nonce;
-- success and failure each yield exactly one typed packet metadata artifact with
+- first claim, two sequential reapprovals, and concurrent claim/reapproval rotate
+  to fresh nonces without updating or deleting either prior decision; historical
+  audit queries still resolve every original approval tuple;
+- each coherently terminalized success or failure yields exactly one typed packet metadata artifact with
   a compatible terminal success/failure discriminant; all known-invalid
   assembly/delivery/code/conditional-stage tuples fail closed. The second
   normative matrix exhausts effect intent, terminal state, ledger entries, host
@@ -305,6 +345,12 @@ root-binding revision, and exact coverage fingerprint.
   old receipt against the greater recovery epoch, replacement W2, and binding
   generation; it remains historical replay evidence and can never grant takeover
   or terminalize;
+- keep the authoritative host unavailable beyond every ordinary worker/recovery
+  timeout while containment emptiness remains unproven. The packet claim stays
+  live/actionless, the run has zero terminal packet artifacts, and repeated S6
+  observation never fabricates an artifact or waits for an unsafe liveness promise.
+  After a valid same-host recovery finally proves quiescence, the one coherent
+  terminal transaction creates the sole artifact;
 - the committed-election test uses a real PostgreSQL 16 TLS fixture with a test
   certificate authority, server certificate, service-only client certificate,
   distinct worker/maintenance/read roles, fixed security-barrier view grants, and
@@ -397,10 +443,35 @@ root-binding revision, and exact coverage fingerprint.
   orderings; no later specialist or recovery action appears before required review;
 - repeat with a terminal sibling's host/repository `review_required`: the task's
   exact database-maintained local-change projection blocks packet, packet-free, and
-  handoff-only claims until review/quarantine resolves it. Exercise stale zero/null,
-  stale nonzero, wrong count/version/fingerprint, direct writes, backfill, two
-  concurrent sibling review transitions, and rollback between evidence/projection;
-  deferred constraints and every claim fail before repository reads;
+  handoff-only claims until review/quarantine resolves it. S6 imports S4's closed
+  `CURRENT_LOCAL_PROJECTION_HEAD_KINDS` tuple with exactly eight kinds. Package
+  creation and the migration backfill preallocate exactly one current-head row per
+  kind in the same package transaction; a later source mutation advances an existing
+  head by compare-and-set and never inserts a ninth row. The 256-package maximum
+  therefore has exactly 2,048 current heads, and recovery remains count-neutral.
+  Exercise stale zero/null, stale nonzero, wrong count/version/fingerprint, missing,
+  duplicated, unknown-kind and ninth heads, direct writes, bounded/idempotent
+  backfill, two concurrent sibling review transitions, and rollback between
+  evidence/head/projection. At maximum cardinality, recovery, possible-invocation
+  and possible-submission acknowledgement, both decline paths, quarantine,
+  cancellation, projection repair, and mixed-version migration must all advance
+  their preallocated heads and complete within budget without allocating a row or
+  requiring capacity relief. Deferred constraints and every claim fail before
+  repository reads when the final heads and task aggregate disagree;
+- seed a legacy task with 257 packages and prove S4's durable
+  `active|archive_pending|legacy_archived` task disposition and checkpointed,
+  whole-task evidence-preserving archive path. Inspect and dry-run are actionless;
+  apply moves the original task through `archive_pending`, cancels or retains its
+  packages under the closed archive policy, preserves all 257 packages, immutable
+  history, and current-head identities in place, and ends at `legacy_archived`
+  without reparenting or deleting evidence. Crash/resume and rollback at every
+  batch boundary are idempotent. The separately created replacement stores its
+  exact source task, `pending|eligible|cancelled` state, positive version, and
+  fingerprints; every claim/wake/ingress/root boundary rejects pending. Final
+  source archive and replacement `pending → eligible` commit atomically, while
+  rollback leaves it pending and cancellation preserves evidence. Replacement tasks
+  admit no more than 256 packages and preallocate exactly 2,048 heads at the cap; the archived
+  task can never be claimed or silently reactivated;
 - atomic packet finalization races a stale review-gate decision in both
   orderings; top-down locks and in-transaction source-run/artifact/package/lease
   checks produce one coherent winner without deadlock;
@@ -442,9 +513,11 @@ root-binding revision, and exact coverage fingerprint.
   attempt ID may record `definitive_not_started` only from a trusted, typed adapter
   refusal produced before adapter process launch, socket/network, credential, or
   repository I/O begins. That proof and transition commit under the same ownership
-  compare-and-set. Recovery never manufactures this proof: an orphaned `invoking`
-  attempt becomes `returned` only with its durable return boundary and `uncertain`
-  otherwise. A restart never treats either as a fresh call. `uncertain|returned` require
+  compare-and-set. Recovery never manufactures this proof: an already committed
+  `returned` state remains `returned`, but orphan/stale recovery always maps a
+  surviving `invoking` row to `uncertain`. This includes a crash after the adapter
+  returns but before the live owner's `returned` compare-and-set commits. A restart
+  never treats either as a fresh call. `uncertain|returned` require
   exact `acknowledge_possible_local_invocation` before retry, while ordinary decline
   is available without acknowledgement. The acknowledgement appends actor/time,
   preserves immutable invocation uncertainty, rotates the local marker fingerprint,
@@ -608,9 +681,13 @@ The suite asserts the exact zero-or-one boundary:
 
 - approval rejection, pre-claim filesystem hold, optional no-packet execution, and
   a losing duplicate worker create no packet issuance artifact;
-- once a run-scoped packet claim commits, that run eventually has exactly one
-  typed packet metadata artifact, including terminal failure and stale-claim
-  recovery;
+- a committed but still-live, unquiesced, or unavailable-host packet claim has zero
+  terminal packet artifacts and at most one artifact can ever exist for the run;
+- exactly one typed packet metadata artifact exists only after coherent atomic
+  terminalization or an authorized repair proves its complete predicate, including
+  terminal failure and safe stale-claim recovery. No liveness claim is made when
+  containment emptiness or an authoritative same-host recovery worker cannot be
+  proven;
 - artifact creation/finalization never rereads or reassembles packet contents.
 
 ### Complete failure and recovery matrix
@@ -630,6 +707,7 @@ enablement path and do not remove that table-wide decline alternative.
 | Coverage lost after approval, before claim | package S3 `blocked`; task `approved` | nonce unclaimed; no packet claim | zero attempts/runs/audits/artifacts | no generic retry | restore exact coverage or explicitly reapprove |
 | Project root repointed after approval, before claim | old-root decision becomes `revoked`; affected package S3 `blocked`; task follows lease/review barrier | no packet claim; old nonce/decision is non-issuable | stable public `rootRef`, but incremented internal root-binding revision; no old-root read | no automatic carry-over to the new repository | explicitly approve context for the new root |
 | Atomic package/run/packet-claim transaction rolls back | package remains `ready`; task returns/stays `approved` | no committed claim; nonce unconsumed | no runnable run, attempt, audit, or artifact | queue may safely try the whole claim again | none |
+| Live execution, generic-local, or packet token copied to a wrong-principal connection | package/task/run remain owned by the original authenticated instance | every original claim remains live and unchanged; copied credential gains no ownership | no extra heartbeat, read, assembly, exposure, submission, local stage, file replacement, finalization, audit, or artifact | none; copied-token request is rejected before I/O/mutation | restore/use the exact connection-authenticated pinned instance; token possession alone is never actionable |
 | Claim committed, failure before preflight is established | package S4 `blocked`; task `approved` | claim terminal failed; `allow_once` nonce burned; `always_allow` has no nonce | atomic run/audit failure plus one artifact with `not_assembled/claim`, delivery `not_exposed`, no counts, and only `authorization_changed|execution_lease_expired|local_evidence_lease_expired|issuance_lease_expired` | evidence finalization only; no packet auto-retry | `allow_once`: reapprove; `always_allow`: explicit `retry_execution` if current coverage matches; either may decline after exact review/quiescence |
 | Preflight established, failure before assembly | package S4 `blocked`; task `approved` | claim terminal failed; one-time nonce burned | atomic run/audit failure plus one artifact with `not_assembled/preflight`, delivery `not_exposed`, no counts, and claim-stage code plus `worker_stopped|preflight_failed` | evidence finalization only; no packet auto-retry | same grant-mode action as claim-stage failure |
 | Failure during assembly after durable intent | package S4 `blocked`; task `approved` | claim terminal failed; one-time nonce burned | the same assembly attempt terminalizes as `assembly.state:'assembly_unconfirmed'`, stage `assembly`, failure code `assembly_failed`, delivery `not_exposed`; one artifact with no counts or `rootRef` | evidence finalization only | same grant-mode actions as prior row; never reassemble the old claim |
@@ -646,7 +724,7 @@ enablement path and do not remove that table-wide decline alternative.
 | Active post-submission effect, fence/containment unproven | package/run remain unchanged; task remains `running` | claim stays `claiming`; nonce burned | active intent/ledger immutable; durable lease active/orphaned; one deduplicated quiescence alert; no terminal marker | owning-host fence-service recovery only; no state mutation/new run until the per-run group is empty | no web action; “Waiting for worker changes to stop” |
 | Project root repoint/tombstone/reuse races any live repository read or effect | running claim retains the pinned package/root binding; management mutation does not commit | claim/nonce unchanged | hierarchy/resource fences cover aliases plus ancestor/descendant roots; no cross-root read/write/delete | management waits/retries or conflicts; no database lock waits for the fence | resolve every active/review/packet barrier, then retry management |
 | Per-run child/fence service/control dies while a descendant survives | package/run remain unchanged; task `running` | claim stays `claiming`; nonce burned | durable lease becomes orphaned; adapter has not proved the per-run group empty; quiescence alert only | no recovery action based only on lock acquisition | no web action; owning-host recovery later |
-| Recovery W2 is wrong, stale, missing, same-ID/principal, spoofed through a caller GUC, divergent-key, insufficient-containment, or unreachable | package/run remain unchanged; task `running` | optional packet claim stays `claiming`; nonce unchanged | historical W1 pin and attempted generic recovery evidence remain bounded; fabricated/rolled-back/replayed service challenge or missing receipt makes no terminal mutation | no local-fence inference, terminalization, or new run | restore a distinct connection-authenticated authoritative same-host W2 and complete one service challenge/receipt election |
+| Recovery W2 is wrong, stale, missing, same-ID/principal, spoofed through a caller GUC, divergent-key, insufficient-containment, or unreachable | package/run remain unchanged; task `running` | optional packet claim stays `claiming`; nonce unchanged | historical W1 pin and attempted generic recovery evidence remain bounded; fabricated/rolled-back/replayed service challenge or missing receipt makes no terminal mutation; zero terminal packet artifacts remain valid indefinitely | no local-fence inference, terminalization, artifact fabrication, or new run | restore a distinct connection-authenticated authoritative same-host W2 and complete one service challenge/receipt election |
 | Crash during host apply or after replacement before outcome | recovery acquires the service lease after containment emptiness, blocks package; task follows lease/review barrier | claim terminal failed; nonce burned | leftover `applying → unknown`; effect becomes `quiesced`; primary failure may remain lease/worker loss; host review required by ledger fingerprint | no host/model retry or rollback | exact local review, then separate possible-submission acknowledgement, then grant-mode action |
 | Live atomic replacement succeeds but `applying → applied` persistence fails or loses ownership | package/run remain nonterminal while PostgreSQL is unavailable, or terminalize failed only after uncertainty is durable | claim remains fenced until the durable transition; nonce burned | under the service lease the entry becomes `unknown`, exact ledger review is required, and success is rejected | owning-host recovery only; no guessed outcome | inspect/resolve the affected working-tree/Git-control/Git-storage state against the exact fingerprints before any later action |
 | Atomic live terminal transaction fails | package/run/lease/audit/marker/task, host-ledger, artifact, action, integrity, and gate rows all remain at preterminal state until retry/recovery; resource fence remains held while live retry runs; then package follows terminal outcome | claim remains `claiming`; nonce stays burned | whole terminal transaction rolls back; staged assembly/delivery/effect/ledger remain; no `completion_preparation` cause is persisted | automatic terminal-state retry only while fenced; owning-host recovery after process death | row-specific action only after atomic terminal/quiescent state exists |
@@ -657,7 +735,7 @@ enablement path and do not remove that table-wide decline alternative.
 | Project archive/tombstone after normal or quarantined task | project hidden from normal lists; every nonterminal task/package cancelled as `project_removed`; live hierarchy/root binding released | all claim/decision history unchanged | every project/task/package/run/audit/artifact/action/alert/resolution and original `rootRef` retained | hard purge forbidden; stale wakes/all-mode claims are no-ops; physical root may be reused only after all review barriers | authorized history says “Project removed — evidence retained,” shows no former path, and exposes no execution action |
 | Redis wake fails after grant/recovery action | committed package `ready`; task `approved` | unchanged | unchanged | periodic database sweep re-enqueues; duplicate wakes harmless | none |
 | Always-allow packet block, then project grant revoked/restored | package remains S4 `blocked` until explicit retry; task `approved` | prior claim remains terminal; new decision has a greater decision revision and current root-binding revision | prior run/audit/artifact immutable; recovery action records prior/current decision and root revisions; new run later snapshots them | none while uncovered; no automatic retry after restore/root change | grant control while uncovered; after exact explicit approval, retry (and prior-submission acknowledgement first when required) |
-| Packet-free/handoff precondition fails before invocation intent | generic `local_effect_recovery` block; task `approved` after sibling checks | no packet claim/nonce/audit/artifact/delivery | generic evidence stays `not_started`; zero adapter calls and no repository effect | evidence finalization only | explicit policy-eligible retry or `decline_local_retry`; no acknowledgement |
+| Packet-free/handoff precondition fails before invocation intent | generic `local_effect_recovery` block or actionless terminal evidence; task follows sibling checks | no packet claim/nonce/audit/artifact/delivery | generic evidence stays `not_started`; zero adapter calls and no repository effect; this bare state is not S4's safe-retry arm | evidence finalization only; no automatic or explicit new run | evidence-preserving `decline_local_retry` only when S4's exact coherent decline predicate is representable; otherwise no action. Direct retry requires a separate exact legal S4 `definitive_not_started` state |
 | Live exact owner receives trusted typed refusal before adapter process/network/credential/repository I/O | generic `local_effect_recovery` block; task `approved` after sibling checks | no packet claim/nonce/audit/artifact/delivery | the same attempt ownership-CAS terminalizes `invoking → definitive_not_started`; zero adapter calls | evidence finalization only | explicit policy-eligible retry or `decline_local_retry`; no acknowledgement |
 | Packet-free/handoff crashes or loses ownership after `invoking` without typed refusal/return proof | actionless quiescence wait, then generic `local_effect_recovery` block; task/root remain held until W2 proves emptiness | no packet claim/nonce/audit/artifact/delivery | generic invocation becomes `uncertain`; run evidence, repository comparisons, W2 election, and task projection persist | authenticated W2/group emptiness only; no replay/correction call | exact review when required; acknowledgement only before retry, or `decline_local_retry` without acknowledgement |
 | Packet-free/handoff adapter returns valid, malformed, invalid, or transport result | generic local block when result cannot complete normally; task follows sibling rule | no packet claim/nonce/audit/artifact/delivery | one wire call; durable `returned` boundary plus response classification and all repository evidence; validation never calls the adapter again | finalization/recovery only; no adapter replay | exact review when required; acknowledgement only before retry, or decline without acknowledgement |
@@ -779,6 +857,52 @@ Assert:
   runtime-audit JSON, packet-metadata artifact prose/metadata, `work_packages.metadata`,
   `blocked_reason`, task events, API/Server-Sent Events responses, captured console
   diagnostics, or queue payloads;
+- the sole raw-Architect-plan source is the append-only, ACL-protected
+  `architect_plan_versions` plus `architect_plan_entries` store; the current
+  `adr_text/architect_plan` artifact is a non-text version header. The dedicated
+  `GET /api/tasks/{taskId}/architect-plan-history/{planVersion}` route returns the
+  version's entries only after current task ACL reauthorization and a committed,
+  text-free `architect_plan_history_reads` audit; unauthorized, cross-task, and
+  wrong-stage reads return no bytes. Direct `SELECT` on either raw-text table is
+  denied to every general web, worker, application, export, diagnostic, migration-
+  runner, and release-controller principal. S6 uses real login-role tests to prove
+  only S4's two fixed-search-path, `PUBLIC`-revoked least-privilege reader boundaries
+  can read text: the ACL-plus-audit human-history reader and the package-bound
+  executable-fragment resolver. Cross-calling either boundary from the other or
+  copying its connection identity fails before bytes are returned. Both logins are
+  non-superuser, `NOINHERIT`, cannot `SET ROLE`, and have no session-authorization
+  capability. The package resolver derives its exact worker from immutable
+  `session_user`. The shared human-history web login is not an end-user identity:
+  its reader accepts an opaque Forge session credential plus task/version as
+  prepared/binary parameters, hashes and locks the matching live database session,
+  derives the user there, rechecks ACL, and atomically appends the text-free audit.
+  It accepts no user ID and never stores/logs/audits/returns the raw credential. Two
+  users behind the same web login prove valid same-scope reads; swapped, expired,
+  revoked, fabricated, cross-user/task, wrong-login, and definer-`current_user`
+  calls return zero bytes and cannot forge a read audit. Import S4's exact plan-entry identity and projection-
+  resolver fixtures: `{planArtifactId,planVersion,entryId,contentDigest}` resolves
+  only for the same project/task, package agent, canonical requirement/capability
+  binding, plan version, and entry. Cross-project/task/version/entry/agent/
+  requirement/digest references, stale replay, and a current-plan substitution for
+  an older reference fail before prompt serialization. The rejected sentinel is
+  absent from every runtime package, execution-design payload, source excerpt,
+  general live task/run API, server-sent event, task snapshot/replay payload,
+  log/export/error/diagnostic, Redis job/retry/dead-letter payload, and provider/ACP
+  wire capture. S6 exercises S4's bounded post-drain purge of legacy Redis and
+  persisted runtime snapshots: purged jobs cannot be replayed, while the authorized
+  history/detail reader still returns the immutable entries and read audit. Static source
+  parity rejects a second history source, copied runtime projection, or production
+  schema invented by S6. Before the compatibility drain, every generic task-log
+  reader hides all prompt-shaped front-matter keys and aliases. After every old
+  writer is drained, S4's checkpointed historical scrub removes string, object,
+  array/nested, and alias forms from every retained task-log row without copying
+  plaintext into its journal. S6 seeds every historical shape and proves zero
+  plaintext through direct SQL, task-log/API/export/SSE/snapshot/replay,
+  Redis/queue payloads, logs, errors, and diagnostics before that checkpoint can
+  complete. Hostile direct SQL, function execution, `SET ROLE`, session-
+  authorization, search-path/temp-object shadowing, and cross-project/task/type/
+  stage/version/entry/agent/requirement/binding substitutions all return zero text
+  and create no forged history-read audit;
 - every CI output is a leakage sink, including process stdout/stderr, step
   annotations/summaries, machine-readable and HTML reports, trace ZIPs and their
   extracted resources, logs, screenshots and screenshot metadata, attachments,
@@ -806,9 +930,20 @@ Assert:
   upload. Seed stdout/stderr/annotation/summary and pixel-rendered screenshot/video
   variants; a fake live GitHub sink receives no sentinel and every media/binary file
   is non-allowlisted even when compression removes literal bytes. Every old
-  `frontMatter.prompt` producer/alias is gone;
-  generic front matter rejects prompt-shaped fields; only the allowlisted bounded
-  section/omission counts and server-private non-reversible keyed digest remain;
+  `frontMatter.prompt` producer/alias is gone, including normal, no-command,
+  stderr-warning, and the no-op handoff start/completion paths. A source-parity
+  sentinel enumerates these production call sites so a no-op path cannot escape
+  merely because it makes no provider call. Generic front matter rejects prompt-
+  shaped fields; only the allowlisted bounded section/omission counts and server-
+  private versioned domain-separated keyed digest remain. Mixed-version fixtures
+  seed legacy unversioned/unkeyed `sha256` prompt digests and prove all readers,
+  API/SSE/log exports, and diagnostics expose exactly S4's count-only
+  `{kind:'unknown_legacy_digest',byteCount}` arm when its bounded byte count is
+  valid, or omit the whole snapshot when it is not. This same two-outcome fixture
+  applies before drain, during the checkpointed migration, and after post-drain
+  completion. The migration removes every raw digest and may retain only that exact
+  count-only arm; any alternate suppression/truncation metadata, reclassified keyed
+  record, or keyed value invented without the original bytes is rejected;
 - a static documentation/operator-copy sentinel permits only MCP-channel scope and
   rejects claims that ACP lacks shell, network, credential, or host-filesystem
   access or that unimplemented S3–S6 behavior is already live.
@@ -890,6 +1025,14 @@ Keep this small:
     disposition and cancelled package/task renders “Task closed — evidence
     quarantined” with no browser control or new run. Incomplete sibling evidence
     remains unresolved and keeps root-management actions hidden.
+    The presenter receives S5's branded, server-validated terminal/current join,
+    not an artifact plus browser-supplied marker fields. That join carries the
+    immutable terminal artifact, its independent runtime-audit ID and generic
+    local-evidence ID/fingerprint, and the separately loaded current projection and
+    optional recovery marker. Same-run/different-audit, same-run/different-evidence-
+    ID, same-ID/different-fingerprint, stale marker, repaired marker, and no-marker
+    substitutions must fail relationship validation. Failure still renders the
+    immutable terminal artifact but asserts no current-state relationship.
 15. Render an expired packet or no-packet local run with active/orphaned containment lease and
     quiescence alert as “Waiting for worker changes to stop.” Wrong-host recovery
     and per-run-child/protected-service/control loss with a surviving descendant
@@ -978,6 +1121,25 @@ signed manifest.
 
 S4 changes cross web and worker process boundaries, so S6 must prove this rollout:
 
+For a legacy task above the 256-package cap, Release/DevOps uses only S4's exact
+whole-task archive interfaces and layman-readable procedure:
+
+```text
+npm run protocol:inspect-local-projection-overlimit -- --task <legacy-task-id>
+npm run protocol:archive-local-projection-overlimit -- --task <legacy-task-id> --replacement <replacement-task-id> --actor <operator-id>
+npm run protocol:archive-local-projection-overlimit -- --task <legacy-task-id> --replacement <replacement-task-id> --actor <operator-id> --apply
+docs/operators/local-projection-overlimit-archive-v2.md
+```
+
+The archive command never splits, reparents, deletes, or fabricates evidence. Its
+checkpointed batches preserve the original task/package/evidence/head identities.
+The named replacement is separate operator-created work with new identities, no
+copied authority/evidence, at most 256 packages, and exactly eight preallocated
+heads per package. It is durably `pending`, and every governed boundary rejects it;
+apply locks and validates both tasks/versions/fingerprints before atomically making
+the source `legacy_archived` and only that replacement `eligible`. Inspection and dry run report opaque IDs, counts,
+checkpoint, and fingerprint only.
+
 #179 Step 0 is the sole creator/version owner of the checked-in
 `web/lib/mcps/epic-172-release-order-v1.json` schema and its one data-only
 validator, `web/lib/mcps/epic-172-release-order.ts`. Neither imports S3 or
@@ -1019,7 +1181,71 @@ exact single-owner tuple for every node: `owner:{issue:179,slice:'step0'}` for
 `s5_s6_release_ready`. The last node is the S6 controller's combined readiness
 attestation; it does not transfer S5 implementation ownership to #181.
 
-1. **Freeze legacy hard delete before expansion.** Deploy the bridge removal route
+S6 imports the release-evidence bootstrap installed by Step 0 before either S3 or
+remaining S4 lands: the manifest-backed append-only evidence/key/policy/consumption
+tables, fixed checked-in Node verifier/recorder/consumer, and dedicated certificate-
+authenticated writer/transition principals. The bootstrap imports no S3 or
+remaining-S4 symbol and leaves every recorder/consumer except the one bounded Step 0
+path disabled. S6 creates no second release table, mutable readiness flag, verifier,
+or key state.
+
+Every graph-node evidence receipt, final-readiness node, and non-node
+`enabled_build_tests_green` evidence uses Ed25519 in S4's dedicated durable-release-
+evidence signature domain. Every transition authorization uses S4's separate
+transition-authorization signature domain. Neither may use an unsigned
+`database_maintenance` arm, the other release domain, or the host-harness
+attestation domain. The durable signed envelope binds its schema/manifest version,
+node or required-evidence kind, owner,
+exact build identities and trusted SHA, epoch where applicable, controller GitHub
+App/integration and run/job, predecessor receipt identities/fingerprint,
+suite/manifest/output evidence when applicable, signing-key ID/generation, a random
+single-use nonce, and issued-at. The recorder verifies the signature, nonce, and
+that issued/recorded database time falls inside the signer's valid policy interval
+before retaining the immutable evidence. There is no separate signed record-by
+field. Once accepted, that
+record is durable evidence for its exact node/build/SHA/epoch/predecessors; elapsed
+wall time or routine signer rotation cannot erase it or make a separately landable
+Step 0/S3 deployment dead-end. It never authorizes a later transition by itself.
+
+Every consumer instead requires a separately signed, renewable transition-
+authorization envelope bound to the target canonical transition identity, exact
+durable predecessor receipt set, current pinned-key generation/policy, controller
+run/job, random single-use nonce, issued-at, and an expiry no more than 30 minutes
+after issue. Only this fresh authorization is rechecked for expiry at consumption.
+An expired unused authorization attempt remains audit; a newly signed attempt with
+a new exact attempt ID and nonce may replace its authority but cannot replace,
+mutate, or duplicate durable node evidence. Rotation,
+retirement, compromise revocation, and emergency disable follow S4's imported
+lifecycle and can stop new authorizations without rewriting history. Neither a
+future/unregistered key nor a host-harness key can become release authority.
+
+S6 imports S4's exact canonical transition-identity helper and type verbatim:
+`{manifestVersion,nodeOrRequiredEvidenceKind,owner,exactBuilds,reviewedSha,
+epochOrNone,canonicalPredecessorReceiptSetDigest}`. The completed-transition store
+has one unique key over that identity in addition to unique durable evidence receipt
+IDs; the authorization ledger separately prevents reuse of each authorization nonce.
+A downstream transition locks the canonical identity, append-only durable evidence,
+key/policy, authorization, complete predecessors, and consumption identities;
+verifies Ed25519 plus every binding and current authorization-expiry predicate; then
+records predecessor consumption and resulting node evidence atomically. Exact replay
+returns the recorded result. A different authorization attempt ID, nonce, controller
+run, signature, or receipt for an already completed canonical transition is a
+duplicate conflict, not a second node. A changed kind, owner, build, reviewed SHA,
+epoch, or predecessor set has a different identity and must satisfy its own manifest
+edge. Two concurrent consumers therefore produce one winner even with separately
+valid fresh authorizations. Transaction rollback consumes nothing. S6 tests forged,
+expired, replayed, cross-build, reviewed-SHA-only mutation, required-evidence-kind
+substitution, Step 0 `epochOrNone`, wrong predecessor/domain/key generation,
+same-transition/different-receipt, renewable authorization after more than 30 minutes,
+signer rotation between separately deployed nodes, concurrent double consumption,
+and rollback before/after every insert.
+
+The release-order sentinel evaluates every strict graph prefix. Scrub dry-run,
+apply, and resume are actionless for every prefix that ends before
+`s5_s6_release_ready`; only the complete graph plus that exact readiness receipt
+may pass the scrub prerequisite.
+
+1. **`step0_retention_bridge` — freeze legacy hard delete before expansion.** Deploy the bridge removal route
    that rejects or archives before filesystem work, disable all project-management ingress, and
    drain every pre-bridge web process/database session. Prove none remains between
    `fs.rm` and SQL. The first migration replaces all evidence-bearing project
@@ -1028,14 +1254,21 @@ attestation; it does not transfer S5 implementation ownership to #181.
    irreversible repository loss and is never reused as retention evidence. A fresh
    fixture created only after bridge deployment, process/session drain, FK change,
    and hard-delete guard proves archive-or-conflict retains every evidence row.
+   In this same separately landable slice, install the release-evidence bootstrap
+   described above, pin the initial Ed25519 key/App/ruleset policy, and use its sole
+   enabled recorder to append signed `step0_retention_bridge` for the exact bridge
+   build and retention postconditions. Direct SQL, an unsigned database fact, or a
+   prose/check status cannot substitute. Only after that signed row commits may the
+   S3 recorder be enabled for its one manifest-owned transition.
    Project ingress stays closed after those checks; neither the journal window nor
    any remaining S4 expansion opens yet.
-2. **Land and verify #178/S3.** With project ingress still closed, install the
+2. **`s3_issue_178` — land and verify #178/S3.** With project ingress still closed, install the
    decision-revision, operator-hold, negative reconciliation, root-binding, and
-   canonical lock-manifest/helper contract. The release gate records the exact S3
-   build and test evidence. Missing S3 evidence rejects every remaining S4 schema,
+   canonical lock-manifest/helper contract. The release gate records Ed25519-signed
+   exact S3 build and test evidence through the Step 0 store. Missing, unsigned, or
+   duplicate-transition S3 evidence rejects every remaining S4 schema,
    journal, reader, writer, or producer node.
-3. **Expand schema.** #179 first adds nullable project `root_ref` with **no
+3. **`s4_expand` — expand schema and deploy compatible S4 readers.** #179 first adds nullable project `root_ref` with **no
    default** while project ingress remains closed. Before the one mixed-version
    project-ingress reopen, a database-owned insert bridge
    assigns `gen_random_uuid()` when a new row omits `root_ref` **or explicitly sends
@@ -1052,7 +1285,11 @@ attestation; it does not transfer S5 implementation ownership to #181.
    hierarchy claims/guard, writer-pinned pre-create reservations, database-
    maintained task local-change projection/deferred constraint with version
    `INTEGER NOT NULL DEFAULT 0` and nullable source-set fingerprint (0/null remains
-   non-authoritative until verified backfill), generic local-run
+   non-authoritative until verified backfill), plus the eight S4-owned current-
+   projection head kinds preallocated once per package. Creation writes all eight
+   in the package transaction; migration backfills them in bounded, idempotent
+   batches before the package becomes v2-authoritative; subsequent source changes
+   only compare-and-set existing heads and never grow row count. Generic local-run
    evidence/actions, binding generations/owner-level rotation shadows, expansion-
    window root-change journal, recovery challenge/receipt fields, work-package/
    agent-run root and worker-instance pins, typed per-incarnation worker/root-writer
@@ -1070,16 +1307,22 @@ attestation; it does not transfer S5 implementation ownership to #181.
    changing legacy readers. Existing
    artifacts remain valid; S6 verifies schema/Drizzle/writer predicate parity and
    the deferred generic-effect/ledger/all-repository/task-projection and optional-
-   packet constraint predicates.
+   packet constraint predicates. The expansion also installs the closed typed
+   authorization constructor, duplicate-aware raw-JSON ingress parser, immutable
+   JSONB/scalar validator, scoped approval foreign key, and protocol-v2 non-null
+   task/package/run predicates. It rejects duplicate lexical JSON keys before
+   `JSONB`, raw object spread/merge writers, and every null-identity direct-SQL
+   bypass before producers are enabled.
    Project root exact uniqueness is partial to `archived_at IS NULL`; the durable
    hierarchy constraint rejects ancestor/descendant live roots, and
    protocol-v2 hard delete is rejected.
-4. **Deploy dual readers and guarded writers.** New readers treat every legacy
+   As part of the same disabled-producer expansion, deploy dual readers and guarded
+   writers. New readers treat every legacy
    filesystem decision without a stored root-binding revision as non-issuable, old preview decisions as
    `unknown_legacy`, old zero-default audit rows as `unknown_legacy` rather than
    proof of assembly, and legacy path-valued `root` as hidden. No current-path
    observation or binding command upgrades legacy authority.
-5. **Durable protocol barriers and drain.** With the epoch still 1, register v2
+4. **`s4_producers_disabled` — prove durable barriers and drain.** With the epoch still 1, register v2
    processes only as authenticated `candidate` and prove packet, packet-free, and
    handoff-only claims reach the database transition trigger and are rejected
    before executor/repository work. Queue/project ingress and packet issuance stay
@@ -1105,14 +1348,18 @@ attestation; it does not transfer S5 implementation ownership to #181.
    held for explicit reapproval, including repoint-away-and-back fixtures.
    With ingress still disabled, enable the root trigger and prove it rejects root
    mutation at epoch 1 without calling S3 or locking task/package rows.
-6. **Deploy compatible S5 consumers and the disabled S6 controller/harness.** S5
+5. **`s5_compatible_consumers_deployed` — deploy compatible S5 and disabled S6.** S5
    readers must accept legacy/unknown plus the complete S4 schema without
    manufacturing state. The external S6 controller, exact-App ruleset, preflight,
    suite manifest, output quarantine, and signed-result verifier are deployed but
-   cannot enable ingress or issuance. The controller-owned required check runs the
-   complete pre-activation partition and records `s6_pre_activation_green` for the
-   exact build/SHA/host image; failure leaves epoch 1 and all ingress disabled.
-7. **Cut over producers under S6 control.** Invoke the checked-in `web` command
+   cannot enable ingress or issuance.
+6. **`s6_pre_activation_green` — require exact pre-activation evidence.** The
+   controller-owned required check runs the complete pre-activation partition and
+   records one fresh signed receipt for the exact S4/S5 builds, predecessor
+   evidence, reviewed SHA, and host image. Missing, stale, cross-build, skipped,
+   retried, or runner-self-attested evidence leaves epoch 1 and all ingress/
+   issuance disabled.
+7. **`s4_controlled_activation` — activate while every producer remains disabled.** Invoke the checked-in `web` command
    `npm run protocol:activate-work-package-v2 -- --actor <operator-id>` for dry-run
    and exactly
    `npm run protocol:activate-work-package-v2 -- --actor <operator-id> --apply`
@@ -1141,12 +1388,75 @@ attestation; it does not transfer S5 implementation ownership to #181.
    `current_user`, rejecting a later spoofed/wrong-host/key/containment claim before
    repository reads. The root trigger does the same for
    project mutation. Activation commits with queue intake, S3/root writers, project
-   ingress, and packet issuance still disabled. The external controller then runs
-   the exact post-activation partition against the committed epoch/build and verifies
-   the signed result, output-scan digest, teardown, and VM destruction/reimage
-   receipt. Only `s6_post_activation_green` may enable queue/project ingress and
-   registered S3/root writers; packet issuance is enabled last in the same audited
-   release operation. `project-roots:bind-v2` never advances the epoch. A restarted v1 route cannot
+   ingress, and packet issuance still disabled.
+8. **`s6_post_activation_green` — require exact post-activation evidence.** The
+   external controller runs the exact post-activation partition against the
+   committed epoch/build and verifies the signed result, output-scan digest,
+   teardown, and VM destruction/reimage receipt. The fresh signed receipt binds
+   the exact activated epoch, S4/S5 builds, controller run, and pre-activation
+   receipt. Failure leaves every writer and ingress/issuance path disabled.
+9. **`ingress_and_issuance_enabled` — enter one bounded provisional window, with
+   issuance last.** One #179-owned audited operation consumes the exact signed post-
+   activation receipt, appends the uniquely identified Ed25519-signed enablement
+   node, enables only the registered S3/root-writer principals in the activation
+   snapshot, then queue/project ingress, and packet issuance last. In the same
+   transaction it compare-and-sets Step 0's one mutable authoritative singleton from
+   `disabled` to S4-owned state `provisional`, with database-owned `started_at`,
+   non-extendable `expires_at = started_at + interval '1560 seconds'`, exact
+   operation/build/SHA/epoch/receipt identity, the digest of the initial random
+   secret generated and retained locally by the external controller before opening,
+   authenticated release-controller login identity, and
+   `lease_expires_at = least(clock_timestamp() + interval '45 seconds',
+   expires_at)`. The closed singleton state type is only
+   `disabled|provisional|active`. Partial enablement rolls back; no S5/S6 path may
+   recreate, extend, or bypass this authority. A separate append-only,
+   non-authoritative transition audit records dispositions
+   `opened|heartbeat|failed_disabled|expired_disabled|manually_disabled|promoted_active`
+   without becoming a second readiness flag or state machine.
+
+   Every queue intake, project-management ingress, S3/root-writer mutation, package
+   claim, bounded-context read, packet exposure, and issuance boundary checks the
+   same singleton and PostgreSQL time before external or repository I/O. `active`
+   is open. `provisional` is open only for the exact owner/build/SHA/epoch while
+   both `clock_timestamp() < expires_at` and
+   `clock_timestamp() < lease_expires_at`. The external controller uses
+   its dedicated non-superuser, `NOINHERIT`, certificate-authenticated
+   `session_user` plus the single-use lease secret to heartbeat every 10 seconds.
+   Before each direct mutually authenticated database call, it generates the next
+   random secret locally and sends the current raw secret plus only the next digest
+   as prepared/binary parameters. The function hashes and consumes the current
+   secret, compare-and-sets its digest/generation to the supplied next digest/
+   generation, and returns no raw token.
+   The fixed function can extend only that exact lease to at most 45 seconds from
+   database time and never beyond the immutable outer deadline. A reused/stolen token,
+   wrong login, stale fingerprint, old operation, delayed heartbeat, or `SET ROLE`
+   attempt cannot refresh authority.
+
+   A suite failure, skipped/retried test, output/teardown/destruction failure,
+   controller-detected database or Checks outage, or controller cancellation calls
+   the dedicated failure transition immediately. It compare-and-sets only the exact
+   provisional owner to `disabled`, clears every writer/ingress/issuance flag, and
+   appends `failed_disabled` atomically. Controller death requires no successful
+   callback: its missed heartbeat makes every governed boundary reject within 45
+   seconds. At either lease or outer expiry, the first boundary closes the same
+   flags and appends `expired_disabled` before rejecting; a separately credentialed
+   non-worker database-time watchdog performs the same idempotent transition while
+   idle. Expiry/disable does not lower the protocol epoch, delete evidence,
+   fabricate a graph node, or restart a legacy writer.
+
+   Release/DevOps uses only these exact interfaces and guide:
+
+   ```text
+   npm run protocol:inspect-epic-172-provisional-enablement -- --operation <operation-id>
+   npm run protocol:disable-epic-172-provisional-enablement -- --actor <operator-id> --expected-operation <operation-id>
+   npm run protocol:disable-epic-172-provisional-enablement -- --actor <operator-id> --expected-operation <operation-id> --apply
+   docs/operators/epic-172-provisional-enablement-v1.md
+   ```
+
+   Inspect is read-only. Disable without `--apply` is an exact dry run; apply locks
+   the operation/evidence and closes writers, ingress, and issuance atomically.
+   It appends `manually_disabled` but leaves authoritative state simply `disabled`.
+   `project-roots:bind-v2` never advances the epoch. A restarted v1 route cannot
    authenticate/read a path and fails before filesystem work. The
    Release/DevOps integrity inspect/resolve commands plus runbook pass their
    authorization/fingerprint tests. Process principals cannot write their registry
@@ -1193,22 +1503,81 @@ attestation; it does not transfer S5 implementation ownership to #181.
   apply
   `npm run protocol:gc-work-package-principals -- --actor <operator-id> --apply`,
   and verifies `docs/operators/work-package-principal-lifecycle-v2.md` matches both.
-8. **Post-drain scrub.** Only after durable epoch-2 evidence, #179—not test-only
-   S6—runs its separately gated restartable operation/later migration through
-   exact dry run
-   `npm run protocol:scrub-legacy-runtime-roots -- --actor <operator-id>`, exact
-   apply
-   `npm run protocol:scrub-legacy-runtime-roots -- --actor <operator-id> --apply`,
-   and exact inspect
-   `npm run protocol:inspect-legacy-runtime-root-scrub -- --operation <operation-id>`, using
-   `docs/operators/legacy-runtime-root-scrub-v2.md`. S6 seeds legacy rows, crashes/
-   resumes bounded checkpoints, verifies only aggregate counts, proves applied
-   batches are not rolled back, and requires a zero-remaining inspect result before
-   eventual column drop. The operation is not registered as an ordinary expansion
-   migration.
-9. **Mark S5/S6 release-ready.** Only after the controller-owned post-activation
-   check is green and ingress/issuance enablement is audited may S5/S6 be marked
-   release-ready. UI consumes but never manufactures new state.
+
+After enablement, the external controller reruns the complete manifest-required
+release suites against the actually enabled build. It records
+`enabled_build_tests_green` as controller-owned required evidence inside the later
+final-readiness receipt, not as an eleventh graph node. That signed receipt binds
+the exact enabled S3/S4/S5/S6 builds, trusted SHA, epoch, controller App/integration
+and run/job, suite-manifest and executed-ID digests, output/teardown/destruction
+evidence, signing-key generation, and the exact `ingress_and_issuance_enabled`
+predecessor receipt. A pre-enable, stale, partial, retried, cross-build, or runner-
+self-attested result is not this evidence. The controller must record and consume it
+before the provisional operation's database deadline; no client clock or renewed
+receipt extends that deadline.
+
+The enabled controller has a hard **660-second** database-measured deadline from
+the provisional `started_at`, leaving a 900-second safety margin before the outer
+1,560-second fail-closed deadline. Its fixed execution graph is: controller
+orchestration and scheduling in at most 60 seconds; signed host preflight in at
+most 30 seconds; then the five fully isolated suites run concurrently,
+without retry, with the slowest bounded at 420 seconds; output scan, teardown,
+out-of-band destruction/reimage, and their signed evidence complete in at most 120
+seconds; controller verification, signing, evidence recording, and the final
+readiness transaction complete in at most 30 seconds. The controller heartbeats
+every 10 seconds throughout all five phases. It may not serialize the five suite
+ceilings, borrow unused time from the safety margin, extend either deadline, or
+retry a partition. A phase-budget miss invokes the authoritative failure-disable
+transition. S6 proves a near-cap 660-second success and deterministic failure for
+every one-second-over-budget, missed-heartbeat, and outer-expiry ordering.
+
+10. **`s5_s6_release_ready` — mark final readiness.** Only after #179's enablement
+   evidence is durable and the exact fresh `enabled_build_tests_green` receipt is
+   verified, and while the exact provisional operation is still before both its
+   PostgreSQL outer deadline and live controller-lease deadline, may the S6
+   controller atomically insert two unique consumption rows—one for
+   `ingress_and_issuance_enabled`, one for `enabled_build_tests_green`—append exactly
+   one Ed25519-signed `s5_s6_release_ready` row under the canonical transition
+   identity, compare-and-set the singleton from `provisional` to `active` with null
+   expiry/lease, and append the non-authoritative `promoted_active` audit disposition. All
+   authority/evidence writes commit or roll
+   back together. A second enabled-build receipt, different nonce/signature for the
+   same transition, expired/disabled operation, or already-consumed enablement row
+   cannot record another readiness node. UI consumes but never manufactures this
+   state. `enabled_build_tests_green` remains nested required evidence; adding it to
+   either graph is invalid.
+
+After that exact final-readiness receipt exists, #179—not test-only S6—may run its
+separately gated restartable post-drain scrub/later migration through
+exact dry run
+`npm run protocol:scrub-legacy-runtime-roots -- --actor <operator-id>`, exact
+apply
+`npm run protocol:scrub-legacy-runtime-roots -- --actor <operator-id> --apply`,
+and exact inspect
+`npm run protocol:inspect-legacy-runtime-root-scrub -- --operation <operation-id>`, using
+`docs/operators/legacy-runtime-root-scrub-v2.md`. S6 seeds legacy rows, crashes/
+resumes bounded checkpoints, verifies only aggregate counts, proves applied
+batches are not rolled back, and requires a zero-remaining inspect result before
+eventual column drop. The operation is not registered as an ordinary expansion
+migration. Readiness denial sentinels omit, forge, expire, replay, cross-bind, or
+substitute the `enabled_build_tests_green`/enablement receipt, race two final-
+readiness consumers using the same and separately valid receipt/nonces, and roll
+back before/after each of the two consumption inserts, readiness insert, and
+provisional-to-active promotion/audit append; none records a second or partial
+`s5_s6_release_ready`.
+Kill the controller and runner, fail/timeout each suite, drop the database and
+Checks API at every boundary, expire the window while idle and during each
+ingress/issuance path, expire the 45-second lease during every governed boundary,
+race stale/stolen heartbeats with failure, and race automatic expiry with manual
+disable and final promotion. The failure transition/watchdog/first caller closes
+all flags exactly once, every later
+path rejects before I/O, inspect reports the durable reason, and a disabled
+operation cannot be extended, reactivated, or finalized. Scrub denial sentinels try dry-run,
+apply, and resume with epoch 2, post-activation green, and ingress/issuance
+enablement but no valid final receipt—or with final evidence missing the enabled-
+build subreceipt. Every attempt is actionless and creates no scrub operation or
+checkpoint. A resumed scrub rechecks the same exact final receipt and nested
+evidence.
 
 Compatibility tests cover old-web/new-worker and new-web/old-worker combinations,
 legacy `allow_once`, old grant-blocked/failed packages, preview rows without mode,
@@ -1303,8 +1672,14 @@ following complete literal command/runbook set:
 npm run project-roots:reconcile-expansion -- --through <generation> --actor <operator-id> --apply
 npm run project-roots:bind-v2 -- --actor <operator-id>
 npm run project-roots:bind-v2 -- --actor <operator-id> --apply
+npm run protocol:inspect-local-projection-overlimit -- --task <legacy-task-id>
+npm run protocol:archive-local-projection-overlimit -- --task <legacy-task-id> --replacement <replacement-task-id> --actor <operator-id>
+npm run protocol:archive-local-projection-overlimit -- --task <legacy-task-id> --replacement <replacement-task-id> --actor <operator-id> --apply
 npm run protocol:activate-work-package-v2 -- --actor <operator-id>
 npm run protocol:activate-work-package-v2 -- --actor <operator-id> --apply
+npm run protocol:inspect-epic-172-provisional-enablement -- --operation <operation-id>
+npm run protocol:disable-epic-172-provisional-enablement -- --actor <operator-id> --expected-operation <operation-id>
+npm run protocol:disable-epic-172-provisional-enablement -- --actor <operator-id> --expected-operation <operation-id> --apply
 npm run protocol:replace-work-package-instance -- --candidate <new-instance-id> --replaces <old-instance-id> --actor <operator-id>
 npm run protocol:replace-work-package-instance -- --candidate <new-instance-id> --replaces <old-instance-id> --actor <operator-id> --apply
 npm run protocol:gc-work-package-principals -- --actor <operator-id>
@@ -1332,7 +1707,9 @@ npm run protocol:rotate-host-boundary-controller-key -- --pending-key-ref <opaqu
 npm run protocol:inspect-host-boundary-controller-key-rotation -- --rotation <rotation-id>
 npm run protocol:rotate-host-boundary-controller-key -- --rotation <rotation-id> --discard --actor <operator-id> --apply
 docs/operators/project-root-binding-v2.md
+docs/operators/local-projection-overlimit-archive-v2.md
 docs/operators/work-package-protocol-v2-cutover.md
+docs/operators/epic-172-provisional-enablement-v1.md
 docs/operators/work-package-instance-replacement-v2.md
 docs/operators/work-package-principal-lifecycle-v2.md
 docs/operators/host-binding-key-rotation-v2.md
@@ -1386,6 +1763,15 @@ because the expected side is checked in, not derived from `--list`.
 | `npm run test:mcp:issuance` | desktop-only nonce/claim/lease/failure-point races | 60 s | 300 s |
 | `npm run e2e:mcp-operator` | Chromium desktop + mobile visible flow/accessibility | 60 s | 240 s |
 | `npm run test:mcp:host-boundary` | Ubuntu 24.04 cgroup/UID/socket containment and descendant-escape sentinels | 90 s | 420 s |
+
+For the post-enable proof these five suite commands run concurrently in isolated
+database, Redis, filesystem, and host-fixture namespaces; their 420-second maximum
+is one DAG phase, not a 1,260-second serial allowance. The 60-second controller-
+orchestration phase, 30-second preflight, 420-second concurrent suite phase,
+120-second teardown/output/destruction phase, and 30-second signing/final-
+transaction phase form the mandatory 660-second outer
+controller budget described above. Workflow/process ceilings remain defensive inner
+bounds and cannot authorize a retry or extend that controller deadline.
 
 The release-blocking host-boundary job in `.github/workflows/web-ci.yml` targets a
 dedicated **ephemeral, single-job** self-hosted runner labelled `[self-hosted,
@@ -1547,33 +1933,42 @@ preflight command is a same-job trust/attestation gate and must pass first.
 1. Build shared scenario builder and invariant matrix.
 2. Add real approve-route task-tracker flows.
 3. Add grant recovery/concurrency flows.
-4. Integrate issuance/evidence race scenarios.
+4. Integrate issuance/evidence race scenarios, including duplicate-key-before-
+   `JSONB`, fixed typed authorization construction, and protocol-v2 null-identity
+   direct-SQL attacks, plus append-only approval decisions/current-pointer
+   reapproval history.
 5. Add protected control-state/exchange and run-lifetime fence/containment,
    new/existing-project reservation, tombstone/root-reuse, caller-authentication,
    binding-generation, generic effect-ledger and all-repository crash barriers,
    plus review-pending arbitration.
 6. Add complete generic-evidence/optional-audit/host-ledger/artifact/action/
    integrity/gate lock-order races plus terminal/effect/all-repository/task-
-   projection constraint tests.
+   projection constraint tests, including exactly eight preallocated current heads
+   per package and count-neutral maximum-cardinality recovery/action/migration.
 7. Add candidate/active principal, no-direct-registry-write/protected-heartbeat,
    service-only committed-election reader, audited epoch-2 replacement,
-   pre-activation all-mode, root-binding, journal, ingress/credential activation,
-   key-rotation, and rollback tests.
+   pre-activation all-mode, root-binding, journal, Step 0 release-store bootstrap,
+   durable-node/fresh-transition-authorization Ed25519 identity, projection-
+   overlimit legacy archive, provisional ingress/credential activation/controller-
+   lease/expiry/disable/promotion, key-rotation, and rollback tests.
 8. Add integrity alert/runbook/privileged-resolution/quarantine sibling-evidence
    contract tests.
-9. Add prompt filtering/injection assertions.
+9. Add prompt filtering/injection assertions, immutable-`session_user` definer-
+   reader attacks, and the historical task-log prompt scrub.
 10. Add thin Playwright packet-current-state and packet-independent local recovery,
     quiescence, reason-specific integrity, review, possible-invocation
     acknowledgement, policy-eligible retry, decline, pending, and unavailable flows.
 11. Add the claim/preflight boundary, full failure/recovery, and mixed-version
     matrices, including the no-local-ACP-replay sentinel.
-12. Add persistence-wide leakage sentinels and failure diagnostics.
+12. Add persistence-wide leakage sentinels, raw-plan direct-SQL/principal attacks,
+    and failure diagnostics.
 13. Wire the five named suite commands plus the separate same-job host-boundary
     preflight client, immutable root harness, external signed-attestation verifier,
     exact-App-pinned controller-owned required Check Run, signed suite-result
     envelope, controller-enforced zero-egress namespace/destruction TTL, no-tee
     live-output quarantine, sanitized text/JSON-only upload allowlist, TLS fixture,
-    controller operator runbook/exact commands, and numeric budgets.
+    controller/provisional-enablement operator runbooks and exact commands, and
+    numeric budgets, including the 660-second enabled-run DAG.
 
 ## Completion gate
 
@@ -1607,9 +2002,43 @@ teardown/destruction/reimage receipt; unredacted request body; or an unscanned/
 sentinel-bearing allowlisted record, or any uploaded trace, report, raw log,
 screenshot/video/DOM snapshot, attachment, diff, dump, archive, or opaque binary.
 It must also fail if Step 0 does not own the one release-manifest schema/validator,
+if Step 0 does not install the signed release-evidence bootstrap before S3/S4, if
+any graph node or transition uses unsigned/database-only evidence, if one canonical
+transition accepts a different receipt/nonce or records twice,
 if code-dependency and runtime-activation graphs are absent or substituted, if S5
 accepts `not_assembled/assembly` or lacks live `assembling`, or if total W2 loss
-renders passive waiting copy instead of the exact Release/DevOps branch.
+renders passive waiting copy instead of the exact Release/DevOps branch. It also
+fails if copied live execution/generic/packet credentials work under a wrong
+database principal at any governed boundary; if an unavailable authoritative host
+fabricates a terminal artifact; if a bare `not_started` local invocation exposes
+retry; if recovery maps a surviving `invoking` row to `returned`; if rejected
+Architect text escapes `architect_plan_entries` into any runtime/operational sink;
+if either no-op handoff prompt producer survives; if a legacy unkeyed digest is
+re-exported, represented by an alternate suppression/truncation arm, or treated as
+keyed evidence; if a historical prompt-shaped task-log field survives or is exposed
+before scrub; if a general database principal can directly read raw plan text, if a
+human reader trusts shared-login `session_user` as a user or accepts an asserted user
+ID instead of deriving it from a live opaque Forge session, if the package reader
+does not derive its worker from `session_user`,
+or if either dedicated reader is invoked outside its exact role; if plan history or an
+eligible projection reference leaks through live/SSE/snapshot/replay/Redis state
+or crosses its exact entry scope; if release
+evidence bypasses the manifest-backed append-only store, pinned signing-key
+lifecycle, Ed25519 signature domain, canonical transition identity,
+freshness/replay, or atomic-consumption rules; if a duplicate lexical authorization
+key reaches `JSONB`, a writer bypasses the fixed typed constructor, or a protocol-v2
+claim/audit/artifact/action accepts a null required task/package/run identity; if
+the 256-package projection lacks exactly 2,048 preallocated current heads, any
+normal action allocates a ninth head, or max-cardinality recovery, acknowledgement,
+decline, quarantine, cancellation, repair, or migration cannot complete count-
+neutrally; if provisional ingress/issuance survives its database deadline,
+controller death, suite failure, timeout, or database/Checks outage, or if any path
+can bypass/extend a non-active operation; if final readiness does not atomically
+consume both enablement and `enabled_build_tests_green`, uniquely append its node,
+and promote the same provisional operation; if final readiness lacks the post-
+enable `enabled_build_tests_green` evidence or that evidence is incorrectly added
+as a graph node; or if legacy-root scrub dry-run/
+apply/resume succeeds before exact `s5_s6_release_ready` evidence.
 
 ## Stop conditions
 
@@ -1664,7 +2093,8 @@ rewrites all owners in its flip; if journal watermark gaps pass cutover; or if r
 prompt aliases survive.
 Stop if local retry ignores any of the three ownership leases, sibling barriers, or
 server policy eligibility; if unchanged repository evidence exposes direct retry
-without `definitive_not_started`; if an orphaned/recovered `invoking` attempt can become
+without `definitive_not_started`, including from bare `not_started`; if an
+orphaned/recovered `invoking` attempt can become either `returned` or
 `definitive_not_started`, or if the still-live exact owner/attempt can record that
 state without the trusted typed pre-I/O refusal and ownership compare-and-set; if
 coherent reviewed packet/local recovery lacks an
@@ -1680,3 +2110,43 @@ channel; if any non-allowlisted media/binary/archive can upload; if sanitized
 text/JSON bypasses schema/key/value scanning and the signed manifest; if the seeded
 post-prompt failure does not exercise live and stored sinks; or if unsupported macOS/Windows/container fixtures
 can advance epoch 2.
+Stop as well if a copied ownership token works under a principal other than the
+pinned authenticated instance; if terminal packet-artifact cardinality assumes
+liveness while quiescence/owning-host recovery is unproven; if rejected Architect
+text has any source besides the append-only ACL-gated `architect_plan_entries` or
+enters a runtime package/API/SSE/log/export/error/wire sink; if a no-op handoff
+producer, historical prompt-shaped task-log field, or legacy unkeyed prompt digest
+bypasses read hiding and checkpointed migration parity;
+if an eligible plan entry can cross project/task/version/entry/agent/requirement/
+digest scope or survive in a forbidden live/SSE/snapshot/replay/Redis sink; if a
+general application principal can select raw plan entries, if a definer reader
+authorizes owner `current_user`, if the human reader cannot reject swapped/expired/
+revoked session credentials with zero bytes/audit, or if either reader
+can run outside its exact ACL/package-bound role; if arbitrary authorization JSON can bypass the
+fixed constructor, duplicate keys can reach `JSONB`, or SQL null semantics can erase
+a required protocol-v2 task/package/run scope; if reapproval mutates a decision
+already referenced by historical evidence instead of inserting a new immutable
+decision with strictly greater revision/fresh nonce and compare-and-setting the
+current pointer, or if the old package-unique history index survives; if the exact eight projection heads
+are not preallocated per package or any ordinary action/migration needs a ninth row
+at maximum cardinality; if an over-limit task can be reparented, deleted, claimed,
+or cleared without the checkpointed whole-task archive and retained evidence; if
+the named replacement can claim while `pending` or become eligible outside the
+atomic source-archive/replacement CAS; if
+Step 0 cannot install and use the signed release store
+before S3; if any graph node/transition is not Ed25519 signed; if canonical
+transition uniqueness can be evaded with another receipt/nonce; if durable recorded
+node evidence expires before a later separately deployed node, or if a transition
+authorization can use the wrong signature domain/key generation, omit expiry/nonce/
+predecessor/build bindings, replay, double-consume, or stay consumed after a rolled-
+back transition; if any ingress/issuance boundary can run after the provisional
+database deadline, the 45-second controller lease, or manual/automatic/failure
+disable, if the controller does not generate/retain the initial secret before open,
+if heartbeat uses a different login/service, stores/returns raw tokens, or fails to
+rotate digest/generation atomically, if a heartbeat can extend either deadline, if the enabled proof is not
+bounded by the exact 660-second DAG, if failure cannot close all flags without
+lowering the epoch, or if final readiness does not atomically consume both exact
+receipts and promote the same operation; if `enabled_build_tests_green` is missing
+from final readiness, predates enablement, binds a different enabled build, or
+appears as an eleventh graph node; or if root scrub can start or resume before the
+complete final-readiness evidence.

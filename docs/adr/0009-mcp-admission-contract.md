@@ -1825,8 +1825,7 @@ contract. This split must match the per-step release manifest metadata above.
   `forge_heartbeat_current_instance()` owned by a non-login role, with fixed
   `pg_catalog, forge` search path and `PUBLIC` execution revoked, derives exactly
   one row from immutable `session_user` (not the definer-valued `current_user`). It
-  locks protocol epoch → exact authenticated instance → applicable active/pending
-  binding generation/rotation, then
+  locks epoch → exact instance → applicable binding generation/rotation, then
   revalidates the epoch pointer, principal, lifecycle state, and active-or-pending
   generation/token before compare-and-setting only `last_seen_at` for an allowed
   `candidate|active` row. An
@@ -1854,12 +1853,9 @@ contract. This split must match the per-step release manifest metadata above.
   Candidate credentials expire after a bounded database-time provisioning window;
   at most 64 unpromoted candidates per host/generation retain live credentials.
   Expired/rolled-back candidates and drained instances follow revoke → terminate
-  sessions → retire → client-certificate/private-key destruction in the credential
-  store → PostgreSQL login-role drop. A restartable GC handles
+  sessions → retire → certificate destruction/login drop. A restartable GC handles
   at most 64 tombstoned identities per transaction only after proving no membership,
-  package/run/evidence reference, recovery election/receipt or ownership, membership/
-  takeover ledger, reservation/maintenance transition pin, alert/audit, role
-  ownership/grant, or session remains;
+  recovery ownership, transition pin, role ownership/grant, or session remains;
   immutable instance/principal/certificate fingerprints and destroy/drop evidence
   remain append-only and identities are never reused. A locked installation-wide
   budget has a hard maximum of 256 undestroyed credential-resource slots (operators
@@ -2010,14 +2006,7 @@ contract. This split must match the per-step release manifest metadata above.
   hooks, attributes, executable filters/diff drivers, and unresolved symlink
   targets rather than letting host configuration affect the snapshot. Linked/
   external gitdir/common directories and allowlisted alternates require ordered
-  resource fences; unsupported/unbounded stores disable local execution. Exact
-  lazy-fetch behavior is governed by the single digest-bound predicate above; this
-  paragraph does not define a second probe or argument rule.
-  Credential/network helpers, automatic maintenance, and all object/control writes
-  are also disabled. Missing promised objects or
-  a command that would hydrate, fetch, repack, write a commit-graph, or otherwise
-  mutate Git state fails pre-exposure as unavailable rather than contacting a
-  remote or manufacturing authority. All three
+  resource fences; unsupported/unbounded stores disable local execution. All three
   enforce file/byte/depth/time ceilings and matching scans/equivalent snapshot
   proof, with only narrow versioned volatile exclusions. Version 1 defaults/hard
   maxima are: working tree 100,000/500,000 files, 32 MiB/256 MiB hashed bytes,
@@ -2080,18 +2069,11 @@ contract. This split must match the per-step release manifest metadata above.
   adapter under the untrusted run user. Inputs/outputs use
   allowlisted one-way handoff and the exchange manifest/final digest is bound to
   generic local evidence. Service lifecycle capabilities/state handles never enter
-  ACP environment, arguments, inherited descriptors, or readable storage.
-  Supported-host mounts and identities prevent set-user-ID/
-  set-group-ID and file-capability elevation, device-node access,
-  `/proc/<pid>/mem`, `/proc/<pid>/{maps,environ,fd}`, `process_vm_readv`, `ptrace`,
-  cross-user signals, and descriptor-based escape; required `nosuid`/`nodev`
-  behavior is preflighted. Any elevated transition uses only the immutable
-  signature-verified trusted shim outside the checkout with fixed operations and
-  arguments. That shim has a distinct non-ACP user ID, is non-dumpable, and is
-  protected by the kernel ptrace/process-memory boundary. ACP cannot assume its user
-  ID, forge its `SO_PEERCRED`, signal or trace it, inherit its descriptors, or
-  replace, proxy, path/environment/argument-inject, or directly invoke it. A
-  supported adapter places that shim/child, ACP, validation, response-driven work, and
+  ACP environment, arguments, inherited descriptors, or readable storage. The run
+  mount namespace exposes project/exchange as `nosuid,nodev`; preflight rejects
+  setuid/setgid entries and `security.capability`. Private PID/procfs, ptrace/signal
+  policy, distinct UIDs, and the non-dumpable shim prevent ACP from reading or
+  signalling trusted processes. A supported adapter places that shim/child, ACP, validation, response-driven work, and
   every descendant in one non-escapable group before repository access. Normal
   success exits that child and releases without terminating the queue worker.
   Inherited descriptors or process-tree guesses are insufficient, and unsupported
@@ -2185,10 +2167,7 @@ contract. This split must match the per-step release manifest metadata above.
   that tombstone and a greater recovery epoch. A top-down compare-and-set appends the
   matching database election tombstone and installs the greater-epoch candidate;
   the view and service reject the old receipt/owner. Already-granted takeover cannot
-  be tombstoned or re-elected, so expiry permits progress without concurrent W2s. A
-  receipt from a lower recovery epoch, replaced W2, or older binding generation
-  remains historical replay evidence only and can never grant takeover or
-  terminalize current state.
+  be tombstoned or re-elected, so expiry permits progress without concurrent W2s.
   Wrong/missing/stale/draining/divergent-key/insufficient-containment/unreachable
   W2 or fabricated/cross-run/expired/replayed challenge is alert-only.
   Underlying lock acquisition alone is insufficient, and state remains actionless
@@ -2202,11 +2181,8 @@ contract. This split must match the per-step release manifest metadata above.
   fully qualified objects, `PUBLIC` revoked, and no caller IDs. Immutable
   `session_user` plus database state select the row; the watchdog cannot SET ROLE/
   session authorization and has only bounded-view SELECT/function EXECUTE, with no
-  direct DML, heartbeat, claim, fence, terminalize, repair, credential, repository,
-  base-table, or cross-definer-function access. It
-  cannot supply or select candidate, evidence, run, instance, host, generation, or
-  alert IDs: the fixed no-argument function derives all bounded candidates and
-  identifiers from its qualified view and database time. Failure records one
+  direct DML, heartbeat, claim, fence, repair, credential, or repository access.
+  Failure records one
   bounded quiescence alert. Ledger paths/errors/resource
   references never enter packet-owned evidence. A submitted crash may retain a
   lease/worker failure code while host-ledger or repository-change evidence forces
@@ -3224,21 +3200,37 @@ contract. This split must match the per-step release manifest metadata above.
 - Every packet attempt for `allow_once` **or** `always_allow` uses one run-scoped
   issuance claim/token/lease. One-time grants additionally claim and burn the
   operator decision nonce; project grants snapshot locked decision revision and
-  root-binding revision plus exact coverage. Real PostgreSQL tests exercise both transaction orderings with
+  root-binding revision plus exact coverage. S6 proves protocol-v2 task, package,
+  run, and local-evidence identity is non-null and exactly equal across claim,
+  audit, authorization, artifact, action, and recovery rows, so `MATCH SIMPLE` and
+  nullable partial-index semantics cannot bypass scope or per-run uniqueness.
+  Authorization JSONB is constructed only by the fixed typed relational function;
+  direct table DML is denied, and duplicate-aware raw-input parsing rejects repeated
+  lexical keys before JSON/JSONB normalization. Real PostgreSQL tests exercise both transaction orderings with
   barriers and observed lock waits. Lease comparisons use database time, not a
   mocked worker clock or sleeps as correctness proof.
   Every local-root run also has distinct execution and generic local-evidence
   ownership; packet ownership is optional. S6 races all three expiry winners and
-  ties, asserts `authorization_changed → execution_lease_expired →
-  local_evidence_lease_expired → issuance_lease_expired → worker_stopped`
-  precedence, and proves no heartbeat infers one lease from another. Packet-free/
+  ties. An already-persisted stage/delivery cause remains primary; otherwise the
+  fixed precedence is `authorization_changed → execution_lease_expired →
+  local_evidence_lease_expired → issuance_lease_expired → delivery/stage-specific
+  cause → worker_stopped`, with `worker_stopped` residual. No heartbeat may infer
+  one lease from another. For each lease independently, S6 copies an otherwise
+  live token/run/expiry tuple to a second database connection authenticated as the
+  wrong process principal and proves heartbeat, repository-read batches, packet
+  assembly, prompt exposure/submission, every local stage/file replacement, and
+  finalization reject it before I/O or mutation. Possession of a token never
+  substitutes for the connection-authenticated pinned instance. Packet-free/
   handoff ACP calls compare-and-set durable generic invocation
   `not_started → invoking` before I/O. Only the still-live exact owner/attempt may
   persist `definitive_not_started`, from the trusted typed `pre_io_refusal` before
   adapter process launch, serialization, socket/network, credential, or repository
   I/O; only that state plus unchanged/not-applicable repository evidence permits
-  direct policy-eligible retry. A returned boundary yields `returned`, and any
-  possibly-started call without return proof yields `uncertain`.
+  direct policy-eligible retry. A `returned` state already committed by the live
+  owner remains `returned`. Orphan/stale recovery always maps a surviving
+  `invoking` row to `uncertain`, including a crash after the adapter returns but
+  before the owner's returned-state compare-and-set; recovery never infers
+  `returned` from an external boundary.
   `invoking|returned|uncertain` requires acknowledgement before retry even when
   repository evidence is unchanged; restart never makes a second call.
   One committed packet claim makes at most one external model/ACP submission;
@@ -3269,8 +3261,30 @@ contract. This split must match the per-step release manifest metadata above.
   pre-transaction completion preparation versus finalizer rollback, Redis failure,
   restart, and lease expiry. Every row states
   package/task, nonce/claim, run/artifact, allowed automation, and required operator
-  action. A committed packet claim eventually yields exactly one typed run artifact;
-  preclaim/no-packet/losing-worker paths yield zero.
+  action. A claimed run has at most one typed packet artifact while it remains live
+  or unquiesced. Exactly one exists only after coherent atomic terminalization, or
+  after an authorized repair proves the complete predicate. Preclaim, no-packet,
+  losing-worker, unavailable-host, and unquiesced-live paths yield zero; no liveness
+  promise applies when containment emptiness or an authoritative same-host recovery
+  worker cannot be proven.
+- Task local-change projection reads exactly the closed eight-value
+  `CURRENT_LOCAL_PROJECTION_HEAD_KINDS` set preallocated once per package. It never
+  counts append-only history. Every terminal, review, acknowledgement, decline,
+  retry, quarantine, cancellation, repair, and migration transition appends its
+  immutable row and advances an existing head count-neutrally by exact
+  revision/fingerprint/source-FK compare-and-set. Maximum-cardinality fixtures use
+  256 packages/2,048 heads and prove every recovery path remains live within the
+  PostgreSQL p95/p99 budget; a ninth/unknown/duplicate/missing/cross-package head
+  and package 257 fail before claim or I/O, with typed evidence-preserving migration
+  remediation. The over-limit fixture proves the exact
+  `active|archive_pending|legacy_archived` whole-task archive, retaining every one
+  of 257 package/evidence/head identities without reparent or delete, checkpointing
+  and resuming bounded batches, and leaving the original task permanently
+  unclaimable. The replacement stores exact source task,
+  `pending|eligible|cancelled` state, version, and fingerprints; every boundary
+  rejects pending, final source archive plus `pending → eligible` is atomic, and
+  rollback/cancellation retains evidence. Separate replacement tasks admit no more than 256 packages and
+  exactly 2,048 heads at the cap.
 - S6 imports S4's versioned authorization,
   `assembled|not_assembled|assembly_unconfirmed` terminal assembly plus live-only
   `assembling`,
@@ -3290,7 +3304,13 @@ contract. This split must match the per-step release manifest metadata above.
   `retry_local_execution`, `decline_local_retry`, `retry_execution`,
   `acknowledge_possible_submission`, and `decline_packet_recovery`; the internal
   S3→S4 one-time-reapproval resolver is an eighth durable identity but never an
-  eighth CTA. Exact replay/stale-identity tests cover all eight. Local possible-
+  eighth CTA. Reapproval inserts a fresh immutable approval-decision row with a
+  strictly greater project-serialized positive revision and fresh nonce and
+  compare-and-sets only the separate current-decision pointer; first claim, two
+  sequential reapprovals, concurrent claim/reapproval, and historical queries prove
+  no prior audited decision changes. Migration parity proves the old package-unique
+  history index is removed/replaced and package uniqueness lives on the pointer.
+  Exact replay/stale-identity tests cover all eight. Local possible-
   invocation acknowledgement must persist actor/time, retain immutable invocation
   uncertainty, rotate the fingerprint, and expose the explicit post-ack
   `retry_local_execution` marker only under current policy eligibility; ordinary
@@ -3312,7 +3332,13 @@ contract. This split must match the per-step release manifest metadata above.
   changed fingerprint/state returns 409. S5/S6 exhaustively cover durable live
   preparing, assembled, submitting, submission-rejected/finalizing, and
   accepted/finalizing phases as a discriminated assembly/delivery union; they
-  never infer a failed/finalizing worker-memory phase. Invalid cross-products fail closed. If a
+  never infer a failed/finalizing worker-memory phase. The terminal/current
+  presenter accepts only S5's runtime-branded server join containing independent
+  terminal run, runtime-audit, and generic local-evidence ID/fingerprint plus the
+  separately loaded current projection/marker. Same-run/different-audit,
+  different-evidence-ID, same-ID/different-fingerprint, stale, repaired, and absent
+  marker cases render immutable terminal evidence only and assert no current
+  relationship; browser data cannot construct the brand. Invalid cross-products fail closed. If a
   sibling lease remains live or a sibling is `awaiting_review`, the task stays `running` and recovery is actionless
   until S4's post-sibling/periodic reconciler reaches `approved`. The failure matrix imports the exact
   closed S4 `PacketFailureCode`; no test or UI invents a code or accepts raw
@@ -3386,6 +3412,49 @@ contract. This split must match the per-step release manifest metadata above.
   suppress the complete upload and fail the controller check. Seeded post-prompt,
   live-log, annotation, compressed-image, and video failures prove no sentinel can
   reach either the live channel or an uploaded sink.
+  The only raw Architect-plan source is the append-only, ACL-protected
+  `architect_plan_versions` plus `architect_plan_entries` store; the current
+  `adr_text/architect_plan` artifact is a non-text header. The dedicated
+  `GET /api/tasks/{taskId}/architect-plan-history/{planVersion}` route returns
+  entries only after current task ACL reauthorization and a committed, text-free
+  `architect_plan_history_reads` audit. Unauthorized, cross-task, and wrong-stage
+  reads return no bytes. General web, worker, application, reporting, migration,
+  diagnostic, maintenance, and release principals have no direct `SELECT` on the
+  text tables. Real-role attacks prove only the fixed-search-path, PUBLIC-revoked
+  audited human-history reader and package-bound one-entry resolver can return
+  text. Both logins are non-superuser, `NOINHERIT`, cannot `SET ROLE`, and lack
+  session-authorization capability. The package resolver derives its registered
+  worker from immutable `session_user`. The shared human web login is not a user
+  identity: that reader accepts only an opaque Forge session credential plus task/
+  version, hashes and locks the live database session, derives the user, checks ACL,
+  and appends the audit atomically. It accepts no user ID; the prepared/binary raw
+  credential is never stored, logged, audited, or returned. Two-user same-login and
+  swapped/expired/revoked/fabricated/cross-task tests prove zero-byte/zero-forged-
+  audit denial. Cross-reader credentials, direct SQL, `SET ROLE`, hostile search paths,
+  temporary shadow objects, and cross-task/type/stage/binding calls return no
+  bytes. S6 imports S4's exact eligible-reference identity and proves
+  `{planArtifactId,planVersion,entryId,contentDigest}` can resolve only for the same
+  project/task, package agent, canonical requirement/capability binding, plan
+  version, and entry. Cross-scope, stale-replay, and current-plan-substitution
+  references fail before serialization. Raw/rejected plan text and resolvable
+  artifact location are absent from general live APIs, SSE, snapshots/replay,
+  Redis job/retry/dead-letter payloads, and every ordinary sink. S6 exercises S4's
+  bounded post-drain persisted/Redis purge and proves purged work cannot replay,
+  while the authorized history reader still returns the immutable entries and audit.
+  Static source parity proves no second history source, copied runtime projection,
+  or S6-created production schema exists. The normal, no-command, stderr-warning,
+  and both no-op handoff prompt producers are removed. Mixed-version fixtures
+  expose a legacy unkeyed digest only as exact count-only
+  `{kind:'unknown_legacy_digest',byteCount}` when its bounded count is valid, or
+  omit the whole snapshot. Those are the only outcomes before drain, during the
+  checkpointed migration, and after post-drain completion. The migration removes
+  the raw digest; alternate suppression/truncation metadata, reclassification as
+  keyed evidence, and invention of a keyed value without the original bytes fail.
+  Before old writers drain, compatible task-log readers hide every prompt-shaped
+  front-matter key/alias. The checkpointed post-drain scrub removes historical
+  string, object, array/nested, and alias forms without journaling plaintext. Seeded
+  direct-SQL, task-log/API/export/SSE/snapshot/replay, Redis/queue, log, error, and
+  diagnostic fixtures prove zero historical plaintext remains.
   Specialist source artifacts/sandbox/host changes are a separate output
   boundary and are not used to claim that model output cannot echo context.
   Existing prompt logging remains digest/count
@@ -3411,12 +3480,116 @@ contract. This split must match the per-step release manifest metadata above.
   terminal/effect constraint, dual readers, non-issuable legacy decisions, neutral
   legacy preview/audit interpretation, package and project-root epoch triggers,
   disabled management ingress plus v1 database-role/session revocation and
-  operational drain, the checked-in
-  privileged dry-run/`--apply` activation command and operator runbook around the
-  three-statement `READ COMMITTED` activation, epoch-2 all-mode v2 producer
-  cutover, then #179's separately gated root-path scrub through the exact dry-run/
-  apply/inspect commands and `docs/operators/legacy-runtime-root-scrub-v2.md`, then
-  S5. Tests prove a
+  operational drain. The same separately landable Step 0 first installs the
+  generic append-only signer-policy/key/evidence/consumption store, checked-in Node
+  Ed25519 verifier, canonical transition-identity constraint, disabled enablement
+  singleton, and dedicated certificate-authenticated writer/transition principals.
+  That substrate imports no S3 or remaining-S4 symbol and creates no graph node by
+  itself; only afterward may it record the signed empty-predecessor
+  `step0_retention_bridge` receipt and enable the one S3 recorder. S6 then proves the exact ten-node
+  `runtimeActivationGraph`, without collapsing code delivery into runtime order:
+  `step0_retention_bridge → s3_issue_178 → s4_expand →
+  s4_producers_disabled → s5_compatible_consumers_deployed →
+  s6_pre_activation_green → s4_controlled_activation →
+  s6_post_activation_green → ingress_and_issuance_enabled →
+  s5_s6_release_ready`. Compatible S5 consumers and the disabled S6 controller are
+  deployed before pre-activation green and the checked-in privileged dry-run/
+  `--apply` three-statement `READ COMMITTED` activation. Every writer and ingress/
+  issuance path remains disabled through post-activation green; one #179-owned
+  operation then consumes the signed post-activation receipt and opens the exact
+  database-owned `ingress_and_issuance_enabled` provisional owner in Step 0's one
+  mutable authoritative `disabled|provisional|active` singleton. It binds exact
+  owner/build/SHA/epoch, `started_at`, non-extendable
+  `expires_at = started_at + interval '1560 seconds'`, authenticated controller
+  login and the digest of its locally generated/retained initial secret, and a database-time controller lease capped
+  at `least(clock_timestamp() + interval '45 seconds', expires_at)`, then enables
+  registered writers, queue/project ingress, and packet issuance last. The
+  controller heartbeats every 10 seconds through its fixed `session_user`-bound
+  function. Before each direct mutually authenticated database call it generates
+  the next secret locally and sends current raw secret plus next digest as prepared/
+  binary parameters; the function hashes/consumes the current secret and compare-
+  and-sets its digest/generation to the next digest/generation without returning raw
+  token. Every governed path admits only active state or the exact provisional
+  owner while both deadlines are live. Stolen/stale heartbeats fail; a suite/
+  evidence/Checks/database failure atomically compare-and-sets the exact owner to
+  disabled and clears all flags, while controller death denies every boundary
+  within 45 seconds. Expiry/manual/failure disable and final promotion append only
+  non-authoritative audit dispositions; they do not invent a second state machine.
+  S6 imports Step 0/S4's one manifest-backed append-only release-
+  evidence store, receipt verifier, atomic-consumption operation, and pinned
+  controller signing-key lifecycle; it creates no second table, mutable readiness
+  flag, verifier, graph, or key state. Durable node/required-evidence receipts use
+  S4's dedicated durable-release-evidence domain; transition authorizations use
+  S4's separate transition-authorization domain. Both are distinct from host-
+  harness attestation and bind
+  schema/manifest version, evidence kind/node, owner, exact build identities and
+  trusted SHA, epoch, controller App/integration and run/job, complete predecessor
+  receipt set/fingerprint, applicable suite/output evidence, signing-key ID/
+  generation, random single-use nonce, and issued-at. The recorder verifies issued/
+  recorded database time against signer-policy validity before immutable retention;
+  there is no separate signed record-by field. Accepted
+  evidence remains durable for its exact node/build/SHA/epoch/predecessors and does
+  not expire between separately deployed slices. It cannot authorize its successor
+  alone. Each consumer requires a separate renewable, Ed25519-signed transition-
+  authorization envelope for the canonical target, exact predecessor receipts,
+  current key generation/policy, controller run/job, nonce, and expiry no more than
+  30 minutes after issue. An expired unused attempt remains audit and a newly signed
+  attempt with a new exact attempt ID/nonce may replace its authority; it never
+  replaces or duplicates a node. Only an imported lifecycle-valid pinned key may sign new evidence; every Step 0/S3/S4/S5/
+  S6/enablement node and required-evidence row uses that Ed25519 arm—there is no
+  unsigned or nullable-signature database-maintenance authority. Future, unregistered,
+  retired/revoked, wrong-generation, and host-harness keys do not gain authority.
+
+  S6 imports S4's exact canonical transition helper/type verbatim:
+  `{manifestVersion,nodeOrRequiredEvidenceKind,owner,exactBuilds,reviewedSha,
+  epochOrNone,canonicalPredecessorReceiptSetDigest}`. Completed transitions are
+  unique on that identity and durable evidence receipt ID; the separate
+  authorization ledger makes every authorization attempt ID/nonce single-use. A
+  different fresh attempt can replace expired unused authority but conflicts if the canonical
+  transition already completed. Every consuming transition locks the append-only identities, validates domain,
+  key, signature, bindings, current authorization expiry, nonce, non-consumption, and predecessors, then
+  records consumption plus resulting evidence atomically. Concurrent double-
+  consumption has one winner; rollback consumes nothing; exact replay returns the
+  recorded result; changed-kind/owner/build/reviewed-SHA/epoch/predecessor replay fails. S6 attacks
+  forged, expired, replayed, cross-build, wrong-predecessor/domain/key-generation
+  authorizations, required-evidence-kind substitution, Step 0 epoch-none, same-
+  transition distinct receipts/nonces, a delay beyond 30 minutes, and every signing-
+  key rotation boundary.
+
+  After `ingress_and_issuance_enabled`, the external controller runs the complete
+  release suites against the actually enabled build and signs
+  `enabled_build_tests_green`. This is required evidence inside—not a graph node
+  before—`s5_s6_release_ready`. It binds the exact enabled S3/S4/S5/S6 builds,
+  trusted SHA, epoch, controller App/run/job, suite-manifest/executed-ID and output/
+  teardown/destruction evidence, signing-key generation, and exact enablement
+  predecessor and exact provisional owner/deadline. Before that PostgreSQL deadline,
+  and while the short controller lease remains live,
+  final readiness atomically inserts unique consumption rows for both that fresh
+  receipt and the unconsumed enablement receipt, appends one canonically unique
+  signed `s5_s6_release_ready`, and compare-and-sets the same provisional operation
+  to active with null expiry/lease while appending a non-authoritative `promoted_active`
+  audit disposition. All writes commit or roll back together. The enabled controller
+  has one database-measured 660-second deadline from provisional start:
+  orchestration/scheduling ≤60 seconds; preflight ≤30 seconds; five isolated suites
+  concurrently with the slowest ≤420 seconds and
+  no retries; output scan, teardown, and out-of-band destruction evidence ≤120
+  seconds; verification/signing/evidence/final transaction ≤30 seconds. Ten-second
+  heartbeats run throughout, and the remaining 900 seconds is safety margin before
+  the immutable 1,560-second outer deadline. A phase overrun or missed heartbeat
+  disables the operation. Missing,
+  pre-enable, stale, forged, expired, replayed,
+  partial, cross-build, wrong-predecessor, runner-self-attested, or concurrently
+  double-consumed evidence, a second enabled-build receipt/nonce for the same
+  transition, or an expired/disabled window records no readiness or promotion. A
+  graph-parity sentinel rejects
+  making `enabled_build_tests_green` an eleventh node. Only after the exact final-
+  readiness receipt with that nested evidence exists may #179 run the separately
+  gated root-path scrub through the dry-run/apply/inspect commands and
+  `docs/operators/legacy-runtime-root-scrub-v2.md`. A denial sentinel proves epoch
+  2, post-activation green, ingress enablement, or an invalid/missing enabled-build
+  receipt without final readiness cannot start or resume a scrub. Readiness and
+  scrub dry-run/apply/resume revalidate the exact receipt chain after rollback,
+  replay, and signing-key rotation. Tests also prove a
   genuine pre-trigger process must be drained; v1-shared-first forces activation
   abort, activation-first rejects v1, and packet/packet-free/handoff-only v2 claims
   succeed after cutover. Command and later-claim tests reject zero/multiple,
@@ -3456,6 +3629,13 @@ contract. This split must match the per-step release manifest metadata above.
   prevent duplicate execution. Wrappers prove static expected → collected → first-
   attempt executed identity, detecting deletion, untagged tests, overlap, omission,
   runtime skips, and retries.
+  In the enabled proof, orchestration is a 60-second phase, preflight is a 30-second
+  phase, and all five suites run
+  concurrently in isolated database/Redis/filesystem/host namespaces, so 420
+  seconds is the suite-DAG maximum rather than a serial sum. Teardown/output/
+  destruction has 120 seconds and signing/evidence/final readiness 30 seconds, for
+  one non-retryable 660-second controller deadline with continuous 10-second lease
+  heartbeats and 900 seconds of outer-window margin.
 
   The host job uses an ephemeral single-job signed Ubuntu image only for a trusted
   merge-queue SHA or protected manual dispatch—never `pull_request_target` or
@@ -3521,8 +3701,14 @@ contract. This split must match the per-step release manifest metadata above.
   npm run project-roots:reconcile-expansion -- --through <generation> --actor <operator-id> --apply
   npm run project-roots:bind-v2 -- --actor <operator-id>
   npm run project-roots:bind-v2 -- --actor <operator-id> --apply
+  npm run protocol:inspect-local-projection-overlimit -- --task <legacy-task-id>
+  npm run protocol:archive-local-projection-overlimit -- --task <legacy-task-id> --replacement <replacement-task-id> --actor <operator-id>
+  npm run protocol:archive-local-projection-overlimit -- --task <legacy-task-id> --replacement <replacement-task-id> --actor <operator-id> --apply
   npm run protocol:activate-work-package-v2 -- --actor <operator-id>
   npm run protocol:activate-work-package-v2 -- --actor <operator-id> --apply
+  npm run protocol:inspect-epic-172-provisional-enablement -- --operation <operation-id>
+  npm run protocol:disable-epic-172-provisional-enablement -- --actor <operator-id> --expected-operation <operation-id>
+  npm run protocol:disable-epic-172-provisional-enablement -- --actor <operator-id> --expected-operation <operation-id> --apply
   npm run protocol:replace-work-package-instance -- --candidate <new-instance-id> --replaces <old-instance-id> --actor <operator-id>
   npm run protocol:replace-work-package-instance -- --candidate <new-instance-id> --replaces <old-instance-id> --actor <operator-id> --apply
   npm run protocol:gc-work-package-principals -- --actor <operator-id>
@@ -3550,7 +3736,9 @@ contract. This split must match the per-step release manifest metadata above.
   npm run protocol:inspect-host-boundary-controller-key-rotation -- --rotation <rotation-id>
   npm run protocol:rotate-host-boundary-controller-key -- --rotation <rotation-id> --discard --actor <operator-id> --apply
   docs/operators/project-root-binding-v2.md
+  docs/operators/local-projection-overlimit-archive-v2.md
   docs/operators/work-package-protocol-v2-cutover.md
+  docs/operators/epic-172-provisional-enablement-v1.md
   docs/operators/work-package-instance-replacement-v2.md
   docs/operators/work-package-principal-lifecycle-v2.md
   docs/operators/host-binding-key-rotation-v2.md
