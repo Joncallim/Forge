@@ -37,7 +37,10 @@ Make required bounded-filesystem denials, revocations, and missing grants recove
 3. **Decision order is database order.** A later project `always_allow` may
    supersede an older local denial only when its monotonic
    `grantDecisionRevision` is greater and it covers the exact required set.
-   Human timestamps are display fields, never precedence inputs.
+   Human timestamps are display fields, never precedence inputs. Every decision
+   also binds the project's internal root-binding revision. A project root repoint
+   makes older coverage `revoked`; stable public `rootRef` correlation never
+   carries authority to a different repository.
 4. **Revoked is distinct.** Previously available project coverage that no longer satisfies the package is `revoked`, not first-time `none`.
 5. **One project reconciliation routine.** Task-level and project-level
    `always_allow` mutations call the same project-wide service. Package-local
@@ -115,7 +118,8 @@ nonterminal. The handoff result must not reuse the existing `terminalBlock` flag
 because current orchestrator paths interpret that flag as task failure.
 
 `blockFingerprint` is a versioned digest of the normalized requirement keys,
-exact required capability set, grant phase, consumed flag, and decision revision. It excludes
+exact required capability set, grant phase, consumed flag, decision revision, and
+root-binding revision. It excludes
 human reason text and timestamps. Recovery compares the fingerprint under lock,
 so a stale grant response cannot clear a block created for changed policy. #180
 uses the structured fields for copy and treats the fingerprint as an opaque
@@ -176,6 +180,18 @@ package-local approval or denial persists the allocated revision in its effectiv
 phase; an active project grant persists the revision that created or changed it.
 `approvedAt` and `deniedAt` remain useful operator evidence but are never compared
 for authority.
+
+Every filesystem decision also stores the positive decimal
+`rootBindingRevision` from the locked project. `readEffectiveGrantState` accepts a
+decision only when that revision equals the project's current internal binding.
+Root creation/backfill may bind a pre-existing approval to revision 1 only after
+the checked-in host-binding procedure proves the configured canonical root did not
+change; an unbound or duplicate/aliased root fails closed. A later repoint
+increments the binding revision and invokes the same negative project reconciler
+under project → tasks → packages → approvals locks, marking prior project and
+package coverage `revoked` and holding affected unclaimed packages. The new root
+requires an explicit operator decision. No timestamp or stable `rootRef`
+substitutes for this authority boundary.
 
 Precedence for the exact package-required capability set is:
 
@@ -386,13 +402,16 @@ or a human reason are never sufficient recovery evidence.
 S3 adds a new operator-hold disposition that an old worker cannot interpret, so
 schema compatibility alone is not enough. Roll out in this order:
 
-1. Add the project `BIGINT` decision counter plus nullable revision/marker fields
-   and the dual v1/v2 reader. Do not emit v2 markers yet.
+1. Add the project `BIGINT` decision counter plus nullable decision/root-binding
+   revision and marker fields and the dual v1/v2 reader. Do not emit v2 markers
+   yet. An approval without a proven root binding is non-issuable.
 2. Drain old workers or enforce a protocol/version gate that prevents them from
    claiming S3-capable packages. An old orchestrator would otherwise turn an
    operator hold into task failure.
-3. Enable revision writers, v2 markers, operator-hold transitions, and positive
-   plus negative reconciliation.
+3. After #179's checked-in host-binding procedure proves the existing canonical
+   root, bind compatible legacy approvals to initial revision 1; collision/unbound
+   rows remain held. Then enable revision writers, v2 markers, operator-hold
+   transitions, and positive plus negative reconciliation.
 4. Deploy #179 packet/claim producers only after S3 readers and lock order are
    compatible. Deploy #180/#181 consumers and tests against that contract.
 5. Remove the v1 adapter only after the supported migration window and evidence
@@ -434,6 +453,9 @@ minimum, prove:
    package.
 4. Equal, reversed, and skewed display timestamps never change precedence;
    monotonic revisions do. A legacy pair without revisions fails closed.
+   Root repoint increments the independent root-binding revision, revokes every
+   old-root decision, and cannot expose the new root until explicit reapproval;
+   canonical aliases resolve to the same binding.
 5. Project grant removal and narrowing perform negative reconciliation: exact
    covered subsets stay eligible, uncovered `pending`/`ready` packages become
    blocked, and task `running → approved` occurs only without another live lease
@@ -488,8 +510,10 @@ or merge/release behavior.
 4. Add the locked project reconciliation service and package-local mutation path.
 5. Migrate both endpoints to the global lock order, including negative
    reconciliation and post-commit wake-up.
-6. Drain or gate incompatible workers, then enable v2 writers.
-7. Run the PostgreSQL concurrency, failure, and cross-slice tests before #179
+6. Bind decision authority to the internal root revision and make project repoint
+   call the same negative reconciler before the new root can be claimed.
+7. Drain or gate incompatible workers, then enable v2 writers.
+8. Run the PostgreSQL concurrency, failure, and cross-slice tests before #179
    producers or #180 presentation depend on the contract.
 
 ## Implementation stop conditions
