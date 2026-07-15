@@ -73,6 +73,12 @@ type ActivePacketClaimState =
     }
   | {
       phase: 'failed_finalizing';
+      failurePoint: 'post_assembly_pre_submission';
+      assemblyState: 'assembled';
+      deliveryState: 'not_exposed';
+    }
+  | {
+      phase: 'failed_finalizing';
       failurePoint: 'submission_rejected';
       assemblyState: 'assembled';
       deliveryState: 'submission_failed';
@@ -365,7 +371,8 @@ a fail-closed neutral state before the typed presenter is called.
 - The server exhaustively maps a live `claiming` audit with an unexpired lease
   into `ActivePacketClaimState`. The discriminated union makes impossible pairs
   unrepresentable: pending or pre-submission failure is never submitted, and
-  submitting always has assembled metadata. It renders “Preparing project
+  submitting always has assembled metadata; an assembled failure before intent is
+  the explicit `post_assembly_pre_submission` variant. It renders “Preparing project
   context”, “Context assembled”, “Submitting to worker”, “Worker accepted —
   finalizing”, or the bounded failed-finalizing variant. These are current states
   with no action, not immutable run evidence, and are never read from a terminal
@@ -418,12 +425,19 @@ retry from delivery state. Unknown/malformed/stale markers are neutral, expose n
 action, and return a stale-action response if a previously rendered control races
 current state.
 
+The current-state reader imports S4's discriminated
+`PacketIssuanceRecoveryMarkerV2` union and rejects every known-invalid
+grant-mode/delivery/disposition/acknowledgement combination before presentation.
+It also validates `recoveryFailure.failureCode` against S4's terminal tuple. The
+browser never assembles those independent fields into a state.
+
 Both packet actions carry S4's immutable version-2 request identity
 `{priorRuntimeAuditId, markerFingerprint}`. Components do not reconstruct it from
 the current marker or send an action-only request. When stale recovery leaves the
 task `running` because another sibling package still holds a live execution lease,
 the marker renders neutral “Waiting for active package” with no action. Actions
-become eligible only after normal aggregation makes the task exactly `approved`.
+become eligible only after S4's post-sibling/periodic task-state reconciler makes
+the task exactly `approved`; S5 never performs that transition.
 
 S5 imports S4's exact closed `PacketFailureCode` enum. It maps only those values to
 bounded copy; an unknown value is legacy/unknown and actionless, never displayed as
@@ -444,13 +458,15 @@ Display only:
 - byte count;
 - omitted count;
 - redaction summary;
-- assembly state and delivery state as separate facts.
+- assembly state, delivery state, and terminal success/failure as separate facts.
 
 Never display selected paths, root paths, file names, excerpts, or contents. Ignore
 generic artifact prose and render only validated typed metadata. Clearly separate
 packet evidence from sandbox-generated files and host-applied changes. A failed
-pre-assembly snapshot shows stage and sanitized reason without invented zero
-counts. Delivery copy is exhaustive over S4's exact states:
+pre-assembly snapshot shows stage plus enum-derived static failure copy without
+invented zero counts or raw/sanitized exception detail. A terminal success is
+valid only with `assembled+submitted`; a terminal failure must match S4's exact
+assembly/delivery/failure-code compatibility table. Delivery copy is exhaustive over S4's exact states:
 `not_exposed|submission_failed|submitted|submission_uncertain`; terminal artifacts
 never contain live `submitting`. Assembly never implies ACP acceptance. The
 current-state reader may show any validated live phase above only while its lease
@@ -576,7 +592,8 @@ Component/integration tests:
     transition; only a changed fingerprint/state renders a stale-action `409`.
 27. every valid `ActivePacketClaimState` pair renders its intended actionless copy;
     invalid phase/assembly/delivery cross-products fail closed to “Refreshing run
-    state” and cannot reach the typed presenter.
+    state” and cannot reach the typed presenter, including the valid distinct
+    assembled/`not_exposed` failed-finalizing variant.
 28. retry and acknowledgement controls carry the exact version-2 prior-audit and
     marker-fingerprint identity. A component cannot submit an action-only request
     or substitute identity from another task/package.
@@ -584,9 +601,16 @@ Component/integration tests:
     `not_covering` from the canonical reader and never exposes packet retry.
 30. a recovery marker on a `running` task with a live sibling package renders
     “Waiting for active package” without an action; the same durable marker becomes
-    actionable only after the task is `approved`.
+    actionable only after the S4 task-state reconciler makes the task `approved`.
 31. every closed S4 `PacketFailureCode` maps to bounded static copy, while an
     unknown/future code is neutral, actionless, and never rendered verbatim.
+32. every valid S4 grant-mode/delivery/disposition/acknowledgement marker tuple
+    renders the one allowed action; every known-invalid cross-product is neutral
+    and actionless before the typed presenter.
+33. terminal success renders only for `assembled+submitted`. Every valid terminal
+    failure tuple renders assembly, delivery, and enum-derived cause separately;
+    every known-invalid stage/delivery/code combination and all raw path-bearing
+    exception text fail closed without display.
 
 ## Ownership boundaries
 
