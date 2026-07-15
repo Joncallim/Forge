@@ -43,8 +43,9 @@ Make required bounded-filesystem denials, revocations, and missing grants recove
    decisions share its evaluator and lock order but never scan sibling packages.
 6. **One lock order.** S3 uses the prefix project → tasks ascending → packages
    ascending → grant approval. #179 owns the full suffix: worker-protocol epoch →
-   agent runs ascending → runtime audits ascending → all artifacts by stable key →
-   issuance-recovery actions by unique key → review-gate rows ascending.
+   agent runs ascending → runtime audits ascending → host-apply ledgers/entries by
+   run and ordinal → all artifacts by stable key → issuance-recovery actions by
+   unique key → integrity alerts/resolutions by stable key → review-gate rows ascending.
    S3 normally stops at the approval row and does not acquire the epoch row.
 7. **No stale whole-JSON writes.** Owned JSONB paths are patched atomically or protected by explicit compare-and-retry.
 8. **No automatic retry.** A filesystem grant block requires operator action.
@@ -245,8 +246,9 @@ project → affected tasks (ID ascending) → affected packages (ID ascending)
 
 S3 grant mutations normally stop after the grant approval row. #179 defines the
 full suffix as grant approval → worker-protocol epoch → agent runs ascending →
-runtime audits ascending → all artifacts by stable key → issuance-recovery actions
-by unique key → review-gate rows ascending.
+runtime audits ascending → host-apply ledgers/entries by run and ordinal → all
+artifacts by stable key → issuance-recovery actions by unique key → integrity
+alerts/resolutions by stable key → review-gate rows ascending.
 No path may acquire package before task, approval before package, run/audit before
 approval, or artifact before the audit it summarizes. A stale-audit sweeper that
 needs a package must first discover candidates without retaining row locks, then
@@ -435,7 +437,8 @@ minimum, prove:
 8. The v2 reader and exact v1 adapter work during rollout, while ambiguous legacy
    errors do not recover. Redis failure after commit is repaired by the sweep.
 9. The full project → tasks → packages → approval → protocol epoch → agent runs →
-   audits → artifacts → issuance-recovery actions → review-gate rows order has
+   audits → host-apply ledgers/entries → artifacts → issuance-recovery actions →
+   integrity alerts/resolutions → review-gate rows order has
    no deadlock across S3 reconciliation, #179 issuance, nonce rotation, and stale
    claim recovery.
 10. Fresh one-time reapproval invokes only #179's package-scoped resolver; stale
