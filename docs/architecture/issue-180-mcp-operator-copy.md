@@ -107,12 +107,28 @@ type PacketCurrentStatePresentationInput =
         | { state: 'unknown' };
       executionLeaseActive: boolean;
       issuanceLeaseActive: boolean;
+      siblingBarrier: 'none' | 'active_execution' | 'awaiting_review';
     }
   | {
       source: 'integrity_hold';
       hold: PacketIntegrityHoldV2;
+      alertId: string;
+      evidenceFingerprint: string;
       taskStatus: TaskStatus;
       packageStatus: WorkPackageStatus;
+    }
+  | {
+      source: 'quiescence_wait';
+      reason: 'post_submission_quiescence_unproven';
+      priorRuntimeAuditId: string;
+      evidenceFingerprint: string;
+      effectIntent: Extract<
+        PacketPostSubmissionEffectIntent,
+        { state: 'active' }
+      >;
+      taskStatus: 'running';
+      packageStatus: 'running';
+      leaseActive: false;
     };
 
 type PresentationCta =
@@ -349,8 +365,8 @@ never rendered as retry.
 
 ### Packet issuance recovery controls
 
-The current-state reader validates either S4's live run-scoped claim summary or
-its versioned `packet_issuance` marker and passes the discriminated input to
+The current-state reader validates S4's live run-scoped claim summary, versioned
+`packet_issuance` marker, typed integrity hold, or bounded quiescence alert and passes the discriminated input to
 `packetCurrentStatePresentation`; it never folds either source into the S2
 `mcpBroker` contract. Runtime parsing normalizes unknown task/package statuses to
 a fail-closed neutral state before the typed presenter is called.
@@ -366,20 +382,29 @@ a fail-closed neutral state before the typed presenter is called.
   durable staged copy until S4 atomically commits terminal evidence. S5 never
   invents `failed_finalizing`. The server validates the complete claim-state discriminant, computes
   `leaseActive` against PostgreSQL time, and supplies the observation timestamp;
-  the browser never compares `leaseExpiresAt` with `Date.now()`. An expired or
-  incoherent observation normalizes to neutral “Refreshing run state” until S4
-  recovery/finalization persists a terminal result.
+  the browser never compares `leaseExpiresAt` with `Date.now()`. An expired
+  observation with active post-submission effect intent and S4's bounded alert
+  renders “Waiting for worker changes to stop” with no action until owning-host
+  recovery proves the fence quiescent. Other expired/incoherent observations
+  normalize to neutral “Refreshing run state” until S4 recovery/finalization
+  persists a terminal result.
 
 - A typed `packet_integrity_hold` renders neutral “Run evidence needs operator
   repair” with static text and no web action. It never borrows packet-failure copy,
   never offers reapproval/retry, and never displays a database or exception detail.
-  Its separately authorized privileged repair path is outside S5.
+  It names Release/DevOps ownership and the checked-in
+  `docs/operators/packet-integrity-repair.md` procedure without making that
+  privileged command a browser CTA. Alert ID/fingerprint are bounded support
+  correlation, not user-editable inputs.
 
 - `reapprove_allow_once` shows “Approve one-time context again” and targets the
   package grant control. It never renders generic retry because the nonce burned
   when the packet claim committed.
 - `review_then_reapprove_allow_once` first shows the possible-prior-submission
-  acknowledgement. After the S4 action records that acknowledgement, the marker
+  acknowledgement. When S4's host ledger requires review, the same static copy
+  also says local files may contain partial work and the control label is “I
+  reviewed the submission and local changes.” After the S4 action records that
+  acknowledgement against the exact marker/ledger fingerprint, the marker
   becomes `reapprove_allow_once`; only then does the package grant control create
   a fresh nonce.
 - `retry_execution` is available for an `always_allow` marker whose delivery is
@@ -388,7 +413,8 @@ a fail-closed neutral state before the typed presenter is called.
   disposition is `reviewed_submission`. In both cases the task is `approved`, the
   package is still `blocked`, package policy is unchanged, current authorization
   is `same_decision|newer_covering_decision`, and neither execution nor issuance
-  lease is active. A newer decision is shown as explicit reauthorization, not as
+  lease is active. `hostApplyReview` must be `not_applicable|reviewed`; required or
+  changed-fingerprint review exposes no retry. A newer decision is shown as explicit reauthorization, not as
   continuity of the old grant. The server route locks and rechecks the same
   predicate, records the authorizing current revision, clears only the matched
   marker, moves the package to `ready`, and wakes after commit. The normal claim
@@ -396,7 +422,8 @@ a fail-closed neutral state before the typed presenter is called.
 - `review_submission` is a marker disposition paired with immutable delivery
   `submission_uncertain|submitted`. It states that ACP may already have accepted
   work and offers S4's acknowledgement action. Acknowledgement keeps delivery
-  unchanged, sets actor/time, and changes only the disposition to
+  unchanged, sets actor/time, records the exact host-ledger working-tree review
+  when required, and changes the disposition to
   `reviewed_submission`; if exact current coverage still holds, the presenter may
   then offer S4's explicit `retry_execution` action. A live `submitting` claim is
   evidence-only and has no recovery action until stale recovery converts delivery
@@ -421,10 +448,11 @@ current state.
 The current-state reader imports S4's discriminated
 `PacketIssuanceRecoveryMarkerV2` union and rejects every known-invalid
 grant-mode/delivery/disposition/acknowledgement combination before presentation.
-It joins `priorRuntimeAuditId` to the exact prior audit and packet artifact,
-proves their typed terminal tuples equal, binds the marker identity/fingerprint to
-that failed tuple, and validates assembly + delivery + terminal status + failure
-code/conditional stage together. The marker alone is insufficient. Missing,
+It joins `priorRuntimeAuditId` to the exact prior audit, all applicable run
+artifacts (including the packet artifact), and any host-apply ledger; proves the
+typed terminal tuples equal; binds marker and host-review fingerprints; and
+validates assembly + delivery + terminal status + failure code/conditional stage
+together. The marker alone is insufficient. Missing,
 mismatched, or terminal-success-plus-failure-marker evidence becomes a typed or
 neutral integrity hold with no action. The browser never assembles those
 independent fields into a state.
@@ -433,7 +461,9 @@ Both packet actions carry S4's immutable version-2 request identity
 `{priorRuntimeAuditId, markerFingerprint}`. Components do not reconstruct it from
 the current marker or send an action-only request. When stale recovery leaves the
 task `running` because another sibling package still holds a live execution lease,
-the marker renders neutral “Waiting for active package” with no action. Actions
+the marker renders neutral “Waiting for active package” with no action. If
+`siblingBarrier:'awaiting_review'`, it instead renders “Waiting for required
+review.” Actions
 become eligible only after S4's post-sibling/periodic task-state reconciler makes
 the task exactly `approved`; S5 never performs that transition.
 
@@ -446,6 +476,9 @@ failure says the external submission may have produced work, says Forge did not
 roll back local changes, requires the operator to inspect/resolve the working tree,
 and offers no automatic resubmission. It never displays a path, file name, command,
 provider text, or raw/sanitized exception.
+`completion_preparation` refers only to work before the atomic finalizer; a gate
+insert/finalizer rollback remains in-progress/recovery state and never renders that
+cause.
 
 ### Grant controls
 
@@ -479,6 +512,10 @@ never contain live `submitting`. Assembly never implies ACP acceptance. The
 current-state reader may show any validated live phase above only while its lease
 is valid. After recovery/finalization, the matching terminal artifact/marker owns
 the result; an expired `submitting` intent becomes `submission_uncertain`.
+The host-apply ledger remains separate: packet presentation consumes only its
+bounded `not_applicable|review_required|reviewed` state and fingerprint. Exact
+write-plan entries/paths stay in the authorized repository-change surface and are
+never copied into packet copy, task events, or integrity alerts.
 
 ### Client policy removal
 
@@ -610,6 +647,8 @@ Component/integration tests:
 30. a recovery marker on a `running` task with a live sibling package renders
     “Waiting for active package” without an action; the same durable marker becomes
     actionable only after the S4 task-state reconciler makes the task `approved`.
+    An `awaiting_review` sibling renders “Waiting for required review” and likewise
+    suppresses every action.
 31. every closed S4 `PacketFailureCode` maps to bounded static copy, while an
     unknown/future code is neutral, actionless, and never rendered verbatim.
 32. every valid S4 grant-mode/delivery/disposition/acknowledgement marker tuple
@@ -630,6 +669,19 @@ Component/integration tests:
     process proves S5 derives preparing, assembled, submitting,
     rejected-finalizing, or accepted-finalizing from PostgreSQL alone and never
     synthesizes `failed_finalizing`.
+37. an expired submitted claim with active effect intent and a quiescence alert
+    renders “Waiting for worker changes to stop,” remains actionless, and never
+    exposes a new-run control until S4 persists `quiesced`.
+38. every `HostApplyRecoveryReview` tuple is exhaustive. `review_required` uses
+    exact marker/ledger-fingerprint acknowledgement and hides retry/reapproval;
+    `reviewed` permits only the normal locked predicate; changed fingerprints fail
+    closed.
+39. `completion_preparation` renders only for a terminal failed tuple. Atomic
+    gate/finalizer rollback remains neutral in-progress/recovery state and cannot
+    be mislabeled with that cause.
+40. each integrity reason creates one bounded support correlation with
+    Release/DevOps/runbook copy. No browser repair CTA exists; unauthorized,
+    stale-fingerprint, and normal recovery controls leave the hold unchanged.
 
 ## Ownership boundaries
 
@@ -641,9 +693,10 @@ Component/integration tests:
 
 ## Implementation order
 
-1. Land the S4 evidence schema and producer with opaque `rootRef` and ensure S2
-   broker fields are deployed.
-2. Add the three surface presenters, the issuance-recovery presenter, and
+1. Land the S4 evidence/fence/host-ledger/integrity-alert schema and producer with
+   opaque `rootRef`; install its operator runbook; and ensure S2 broker fields are deployed.
+2. Add the three surface presenters plus issuance-recovery, quiescence-wait, and
+   integrity-hold presenters, and
    exhaustive tests.
 3. Harden the dual-format metadata reader, including incoherent/future values.
 4. Replace task-page status/retry/grant rendering and remove client policy copies.
@@ -663,3 +716,7 @@ admission state, render an unvalidated tuple, or expose packet root paths,
 names/paths/content. Stop if the retry route cannot atomically recheck current
 compatibility, or if copy claims ACP is sandboxed or that equivalent operations are
 impossible outside the MCP channel.
+Also stop if any action appears while host quiescence or working-tree review is
+unproven, while a sibling awaits mandatory review, or on an integrity hold; if
+packet copy needs host ledger paths; or if atomic finalizer rollback is mislabeled
+as `completion_preparation`.

@@ -2937,7 +2937,9 @@ contract. This split must match the per-step release manifest metadata above.
   reauthorization and the action records that revision; a new run snapshots it.
   Missing/narrower/unknown coverage exposes the grant control, not retry.
   `review_submission` records acknowledgement actor/time without changing the
-  immutable delivery; the later retry still rechecks current coverage. Every
+  immutable delivery and, when required, exact host-ledger working-tree review;
+  the later retry still rechecks current coverage and requires host review
+  `not_applicable|reviewed`. Every
   marker has `autoRetryable:false`; unknown/stale markers expose no action and
   S4's route rechecks under the global order.
 - Packet retry and possible-submission acknowledgement controls carry S4's full
@@ -2945,14 +2947,16 @@ contract. This split must match the per-step release manifest metadata above.
   synthesize an action-only request. A recovery marker on a task that remains
   `running` because another sibling package has a live lease renders neutral
   “Waiting for active package” without an action until S4's post-sibling/periodic
-  task-state reconciler reaches exactly `approved`.
+  task-state reconciler reaches exactly `approved`. An `awaiting_review` sibling
+  renders “Waiting for required review” and preserves the same action suppression.
 - S5 imports S4's discriminated recovery-marker union. Every known-invalid
   grant-mode/delivery/disposition/acknowledgement/failure combination is neutral
-  and actionless before presentation. The server joins the exact prior audit and
-  artifact, proves typed terminal tuple equality plus marker identity, and
-  validates assembly/delivery/terminal/failure-stage together; the browser never
+  and actionless before presentation. The server joins the exact prior audit, all
+  applicable run artifacts, and host ledger; proves typed terminal tuple equality
+  plus marker/ledger identity; and validates assembly/delivery/terminal/failure-stage together; the browser never
   composes independent fields into an action. A typed packet integrity hold is
-  neutral, non-retryable, and has no web CTA.
+  neutral, non-retryable, and has no web CTA. Copy names Release/DevOps and the
+  checked-in integrity runbook, while privileged resolution remains outside S5.
 - A live audit with `status:'claiming'` and a **server-computed PostgreSQL-time**
   `leaseActive:true` is first normalized into one discriminated claim-state union:
   preparing=`not_assembled/not_exposed`, assembled=`assembled/not_exposed`,
@@ -2961,8 +2965,10 @@ contract. This split must match the per-step release manifest metadata above.
   durable live phase; preflight, assembly, provider-validation, and
   post-submission failures remain on their last persisted copy until terminal
   commit. Impossible phase/assembly/delivery cross-products fail closed. Valid current phases render actionlessly. The browser never compares lease
-  timestamps or derives phase itself. Stale/unknown observations are neutral until
-  S4 recovery/finalization persists terminal evidence.
+  timestamps or derives phase itself. An expired submitted claim with active
+  effect intent/quiescence alert renders “Waiting for worker changes to stop” and
+  no action. Other stale/unknown observations are neutral until S4
+  recovery/finalization persists terminal evidence.
 - S4 evidence uses opaque `rootRef` or the phrase "this project", never a host
   filesystem root. S5 ignores generic artifact prose and legacy path-valued `root`
   fields and renders only validated counts, byte count, omission/redaction summary,
@@ -2979,7 +2985,9 @@ contract. This split must match the per-step release manifest metadata above.
   sanitized exception detail. A post-submission failure additionally requires its
   closed stage; copy warns about prior external work and possible partial local
   files, requires working-tree inspection, and never offers automatic resubmission
-  or claims rollback.
+  or claims rollback. `completion_preparation` is pre-transaction only; atomic
+  gate/finalizer rollback never renders that cause. Packet UI consumes only the
+  host ledger's bounded review state/fingerprint, never entry paths.
 - Project health action precedence is total: missing→install, disabled→enable,
   auth-required→connect, configuration-required→configure, unhealthy→fix,
   unknown→refresh, healthy→no CTA, and incoherent/future→neutral unavailable. The
