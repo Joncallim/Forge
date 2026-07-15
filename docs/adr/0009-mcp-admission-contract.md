@@ -963,11 +963,13 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
 - **One positive and negative project reconciler.** Equivalent
   `always_allow` decisions from the task and project endpoints call one service
   with the caller's `lockedProject`, fresh `nextMcpConfig`, allocated revision,
-  and trigger. It must not reacquire or reread the project. Grant removal or
+  and closed trigger (`task_always_allow|project_always_allow|project_grant_revocation|project_root_repoint`). It must not reacquire or reread the project. Grant removal or
   narrowing also calls it: eligible `pending`/`ready` packages that lose exact
   coverage proactively become held, while still-covered subsets remain eligible.
   A running, already-claimed package is not retroactively stripped; #179 fences
-  the current run and the new decision governs future claims.
+  the current run and the new decision governs future claims. A root repoint uses
+  `project_root_repoint`, carries the incremented root-binding revision, and revokes
+  old-root coverage without changing unrelated grant-decision ordering.
 - **Global lock order.** S3 uses this prefix:
 
   ```text
