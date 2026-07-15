@@ -920,7 +920,8 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
 
   ```text
   package pending | ready → blocked
-  task    running         → approved
+  task    running         → approved only with no live sibling lease or `awaiting_review`
+  task    running         → running while either task-wide barrier remains
   ```
 
   The package gets a filesystem-only v2 marker carrying the exact canonical
@@ -929,10 +930,10 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   `{taskDisposition:'operator_hold', autoRetryable:false,
   terminalFailure:false}`. It must not reuse the existing `terminalBlock` flag,
   which current orchestrator paths interpret as task failure. The task returns to
-  the grant endpoint's operator-actionable `approved` state and must not stay
-  `running` without a live execution lease. If another package has a live lease,
-  task aggregation must preserve that fact explicitly rather than treating the
-  held package as failure.
+  the grant endpoint's operator-actionable `approved` state only when no sibling
+  has a live execution lease or `awaiting_review`. Either task-wide barrier keeps
+  the task `running`. S3 uses S4's shared sibling-aware task reconciler rather than
+  treating the held package as failure or weakening mandatory review.
 - **Database-ordered precedence.** Every filesystem decision mutation increments
   a project-scoped PostgreSQL `BIGINT` counter while the project row is locked.
   JSON/evidence serializes the positive `grantDecisionRevision` as a canonical
@@ -991,14 +992,17 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   requirements or error prose alone.
 - **One-time reapproval handoff to S4.** S3 never clears S4's
   `packet_issuance` marker in its project reconciler. After a package-local
-  reapproval rotates a fresh nonce under project → task → package → approval
-  locks, it calls S4's package-scoped resolver in the same transaction. S4
-  continues to prior run → audit → exact packet artifact, proves canonical typed
-  audit/artifact terminal-tuple equality, verifies the exact terminal prior claim,
-  `reapprove_allow_once` marker/fingerprint, changed nonce, current policy, and no
-  active lease, then clears only its packet marker and moves `blocked → ready`.
-  Stale/double/policy-drift races are compare-and-set misses; Redis wakes only
-  after commit.
+  reapproval rotates a fresh nonce under project → task → packages in ID order →
+  approval locks, it calls S4's package-scoped resolver in the same transaction.
+  Package scope limits grant evaluation; the resolver still locks siblings for
+  the task-wide review barrier, then continues through prior run → audit → host
+  ledger/entries → all artifacts → recovery actions → integrity
+  alerts/resolutions → review gates. It proves canonical typed audit/artifact
+  terminal-tuple equality, verifies the exact terminal prior claim,
+  `reapprove_allow_once` marker/fingerprint, changed nonce, current policy, no
+  active lease, and no sibling `awaiting_review`, then clears only its packet
+  marker and moves `blocked → ready`. Stale/double/policy-drift/active-review
+  races are compare-and-set misses; Redis wakes only after commit.
 - **PostgreSQL truth and failure behavior.** PostgreSQL commits decision,
   revision, marker, package, and task transitions atomically. Redis is post-commit
   wake-up only; a failed wake leaves recovered `ready` work for the periodic
@@ -1014,12 +1018,13 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   the dual reader; it does not guess or downgrade revisions. Remove v1 support
   only after the bounded migration window.
 - **Required PostgreSQL tests.** Prove exact hold and recovery transitions,
-  `running → approved`, zero runs/attempts, monotonic revision precedence under
+  barrier-aware `running → approved`, zero runs/attempts, monotonic revision precedence under
   equal/reversed timestamps, legacy fail-closed behavior, grant narrowing/removal,
   exact capability subsets, package-local one-time boundaries, fingerprint
   compare-and-set, JSONB coexistence, endpoint equivalence, Redis-wake loss,
-  old/new worker gating and rollback, and deadlock freedom across the global
-  S3/#179 order. #181 owns the cross-slice failure and rollout regression matrix;
+  old/new worker gating and rollback, grant mutation/revocation against
+  `awaiting_review` and both review decisions, and deadlock freedom across the
+  global S3/#179 order. #181 owns the cross-slice failure and rollout regression matrix;
   #180 renders historical decision, current effective state, and packet evidence
   separately. A filesystem hold remains excluded from automatic retry.
 
