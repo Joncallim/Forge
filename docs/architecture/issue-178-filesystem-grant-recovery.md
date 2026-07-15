@@ -320,8 +320,9 @@ S3 never clears #179's `packet_issuance` marker through this reconciler. The one
 integration point is package-local one-time reapproval: after S3 rotates a fresh
 nonce under project → task → package → approval locks, it calls #179's
 package-scoped resolver in the same transaction. That resolver continues to the
-prior agent run → runtime audit suffix, compare-and-sets the exact terminal prior
-audit, `reapprove_allow_once` marker/fingerprint, changed nonce, current policy,
+prior agent run → runtime audit → exact packet artifact suffix, proves canonical
+typed audit/artifact terminal-tuple equality, compare-and-sets the exact terminal
+prior audit, `reapprove_allow_once` marker/fingerprint, changed nonce, current policy,
 and no active lease, then clears only the packet marker and moves
 `blocked → ready`. A stale marker, second reapproval, changed policy, or active
 claim is a no-op/conflict; no sibling package is scanned. Redis wake-up remains
