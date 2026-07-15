@@ -965,9 +965,10 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   ```
 
   S3 normally stops at approval. #179 owns the complete suffix: grant approval →
-  worker-protocol epoch → agent runs ascending → runtime audits ascending → all
-  artifacts by stable key → issuance-recovery actions by unique key → review-gate
-  rows ascending. S3 does not acquire the epoch row. Candidate discovery may
+  worker-protocol epoch → agent runs ascending → runtime audits ascending →
+  host-apply ledgers/entries by run and ordinal → all artifacts by stable key →
+  issuance-recovery actions by unique key → integrity alerts/resolutions by stable
+  key → review-gate rows ascending. S3 does not acquire the epoch row. Candidate discovery may
   happen without retained locks, but mutation reacquires all required rows in the
   complete order and uses compare-and-set. No endpoint nests the project lock or
   performs Redis/network work in the transaction.
