@@ -311,6 +311,11 @@ and recovery live in the shared decision instead of a second filesystem-only
 policy:
 
 ```ts
+export type FilesystemGrantRevocationReason =
+  | 'project_grant_removed'
+  | 'project_grant_narrowed'
+  | 'project_root_repoint'
+
 export type EffectiveGrantState = {
   phase: 'none' | 'proposed' | 'approved' | 'denied' | 'revoked' | 'not_issued'
   source: 'none' | 'package-local' | 'project-level'
@@ -319,7 +324,7 @@ export type EffectiveGrantState = {
   consumed?: boolean            // allow_once already issued -> treat as none for a retry
   coveredCapabilities: string[] // canonical filesystem.project.*
   grantApprovalId?: string
-  revocationReason?: string      // set only when phase === 'revoked'
+  revocationReason?: FilesystemGrantRevocationReason // set only when phase === 'revoked'
 }
 // `requiredCapabilities` is REQUIRED: revocation and coverage are defined relative
 // to what THIS package needs. The requested capabilities live on
@@ -383,7 +388,7 @@ export type McpAdmissionDecision = {
   grantState?: {
     phase: EffectiveGrantState['phase']
     consumed?: boolean
-    revocationReason?: string
+    revocationReason?: FilesystemGrantRevocationReason
   }                         // present for bounded filesystem decisions; structured UI discriminator
   evidenceRefs: string[]   // PLANNED scope only pre-run (root + capability set); run evidence added later, see S4
 }
