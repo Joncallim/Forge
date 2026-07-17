@@ -43,10 +43,10 @@ judgement from deterministic execution:
 Human intent
   -> Architect plan
   -> durable work packages
-  -> capability and MCP admission
+  -> capability and Model Context Protocol (MCP) admission
   -> bounded context
   -> sandboxed specialist execution
-  -> QA / Reviewer / Security gates
+  -> quality assurance (QA) / Reviewer / Security gates
   -> evidence, recovery, and GitHub handoff
 ```
 
@@ -64,14 +64,14 @@ commits, merges, broad live MCP authority, or unrestricted host control.
 | **Bounded context** | Specialists receive the minimum relevant repository evidence rather than unrestricted filesystem access. |
 | **Durable evidence** | Tasks, attempts, work packages, runs, artifacts, approvals, and blocked reasons survive beyond a chat session. |
 | **Runtime-neutral agents** | Direct model APIs, local models, Codex CLI, and Claude Code can sit behind consistent FORGE contracts. |
-| **GitHub-native delivery** | Structured issues, controlled handoffs, PR contracts, and acceptance-criteria checks keep implementation traceable. |
+| **GitHub-native delivery** | Structured issues, controlled handoffs, pull request (PR) contracts, and acceptance-criteria checks keep implementation traceable. |
 
 ## What FORGE Does Today
 
 ### Plan and coordinate
 
 - Create local or GitHub-backed projects.
-- Configure cloud, local, and ACP-backed providers.
+- Configure cloud, local, and Agent Client Protocol (ACP)-backed providers.
 - Ask the Architect to produce an implementation plan.
 - Materialize plans into durable work packages, dependencies, capabilities, and review gates.
 - Revise, approve, reject, retry, stop, and recover work from the dashboard.

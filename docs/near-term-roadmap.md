@@ -13,7 +13,7 @@ FORGE should expand autonomy only after the current execution path is determinis
 The near-term sequence is therefore:
 
 ```text
-Finish MCP admission
+Finish Model Context Protocol (MCP) admission
   -> test the complete operator path
   -> fix observed bugs
   -> add typed deterministic operations
@@ -53,13 +53,13 @@ Test at least:
 
 - clean install and first task;
 - local and GitHub-backed projects;
-- provider/ACP readiness and refusal paths;
+- provider/Agent Client Protocol (ACP) readiness and refusal paths;
 - plan approval and revision;
 - work-package execution and generated-file application;
 - MCP grant approval, denial, revocation, and recovery;
 - retry exhaustion and dead-letter recovery;
-- QA, Reviewer, and Security gates;
-- GitHub issue, dispatch, handoff, and PR-contract workflows;
+- quality assurance (QA), Reviewer, and Security gates;
+- GitHub issue, dispatch, handoff, and pull request (PR) contract workflows;
 - stale, malformed, missing, and contradictory evidence.
 
 ### Exit criteria
@@ -86,8 +86,11 @@ Fix in this order:
 - Critical and high-severity bugs from the focused test cycle are closed or explicitly accepted with mitigations.
 - The full release gate passes:
 
+From the repository root:
+
 ```bash
 git diff --check
+cd web
 npm run lint
 npx tsc --noEmit --pretty false
 npm test
