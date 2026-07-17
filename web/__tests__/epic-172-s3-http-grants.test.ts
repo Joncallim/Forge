@@ -60,7 +60,7 @@ describe('S3: local projection heads', () => {
 
   it('rejects reassignment across head kinds', () => {
     const headId = '550e8400-e29b-41d4-a716-446655440000'
-    const identity = buildProjectionHeadIdentity(
+    const identity = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000', 
       '660e8400-e29b-41d4-a716-446655440001',
       'filesystem_grant_decision',
       0,
@@ -79,8 +79,8 @@ describe('S3: local projection heads', () => {
 
   it('rejects fingerprint mismatches', () => {
     const wpId = '660e8400-e29b-41d4-a716-446655440001'
-    const identityA = buildProjectionHeadIdentity(wpId, 'lease_expiry', 3)
-    const identityB = buildProjectionHeadIdentity(
+    const identityA = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000', wpId, 'lease_expiry', 3)
+    const identityB = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000', 
       '770e8400-e29b-41d4-a716-446655440002',
       'lease_expiry',
       3,
@@ -98,7 +98,7 @@ describe('S3: local projection heads', () => {
   })
 
   it('asserts head is not missing', () => {
-    const identity = buildProjectionHeadIdentity(
+    const identity = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000', 
       '660e8400-e29b-41d4-a716-446655440001',
       'integrity_hold',
       5,
@@ -122,13 +122,14 @@ describe('S3: local projection heads', () => {
 
   it('builds deterministic projection head fingerprints', () => {
     const wpId = '660e8400-e29b-41d4-a716-446655440001'
-    const identity = buildProjectionHeadIdentity(wpId, 'terminal_state', 6)
+    const identity = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000', wpId, 'terminal_state', 6)
     const fingerprint = projectionHeadFingerprint(identity)
     expect(fingerprint).toMatch(
-      /^head:v1:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:terminal_state:6$/,
+      /^head:v1:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:terminal_state:6$/,
     )
     const sameFingerprint = projectionHeadFingerprint({
       headId: identity.headId,
+      taskId: identity.taskId,
       workPackageId: wpId,
       kind: 'terminal_state',
       index: 6,
