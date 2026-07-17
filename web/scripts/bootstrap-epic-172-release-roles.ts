@@ -7,6 +7,29 @@ const ROLE_NAMES = [
   'forge_release_transition',
 ] as const
 const ROUTINES_OWNER = 'forge_release_routines_owner'
+const ALL_ROLE_NAMES = [...ROLE_NAMES, ROUTINES_OWNER] as const
+
+type ReleaseRoleRow = Readonly<{
+  roleName: string
+  canLogin: boolean
+  inherits: boolean
+  isSuperuser: boolean
+  canCreateDatabase: boolean
+  canCreateRole: boolean
+  canReplicate: boolean
+  bypassesRls: boolean
+}>
+
+function roleIsUnsafe(role: ReleaseRoleRow): boolean {
+  const shouldLogin = ROLE_NAMES.includes(role.roleName as typeof ROLE_NAMES[number])
+  return role.canLogin !== shouldLogin
+    || role.inherits
+    || role.isSuperuser
+    || role.canCreateDatabase
+    || role.canCreateRole
+    || role.canReplicate
+    || role.bypassesRls
+}
 
 async function main(): Promise<void> {
   const adminUrl = process.env.FORGE_DATABASE_ADMIN_URL?.trim()
@@ -33,7 +56,7 @@ async function main(): Promise<void> {
         current_user as "currentUser",
         rolcreaterole as "canCreateRole",
         rolsuper as "isSuperuser"
-      from pg_roles
+      from pg_catalog.pg_roles
       where rolname = current_user
     `
     if (!authority || (!authority.canCreateRole && !authority.isSuperuser)) {
@@ -43,20 +66,65 @@ async function main(): Promise<void> {
     await client.unsafe(`
       do $$
       begin
-        if not exists (select 1 from pg_roles where rolname = 'forge_release_evidence_writer') then
-          create role forge_release_evidence_writer login noinherit nosuperuser nocreatedb nocreaterole noreplication;
+        if not exists (select 1 from pg_catalog.pg_roles where rolname = 'forge_release_evidence_writer') then
+          create role forge_release_evidence_writer login noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
         end if;
-        if not exists (select 1 from pg_roles where rolname = 'forge_release_transition') then
-          create role forge_release_transition login noinherit nosuperuser nocreatedb nocreaterole noreplication;
+        if not exists (select 1 from pg_catalog.pg_roles where rolname = 'forge_release_transition') then
+          create role forge_release_transition login noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
         end if;
-        if not exists (select 1 from pg_roles where rolname = 'forge_release_routines_owner') then
-          create role forge_release_routines_owner nologin noinherit nosuperuser nocreatedb nocreaterole noreplication;
+        if not exists (select 1 from pg_catalog.pg_roles where rolname = 'forge_release_routines_owner') then
+          create role forge_release_routines_owner nologin noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
         end if;
       end;
       $$;
     `)
 
-    await client`grant create on schema public to forge_release_routines_owner`
+    if (ALL_ROLE_NAMES.includes(migrationRole as typeof ALL_ROLE_NAMES[number])) {
+      throw new Error('The ordinary migration login must not be a dedicated Epic 172 release principal.')
+    }
+    const roles = await client<ReleaseRoleRow[]>`
+      select
+        rolname as "roleName",
+        rolcanlogin as "canLogin",
+        rolinherit as "inherits",
+        rolsuper as "isSuperuser",
+        rolcreatedb as "canCreateDatabase",
+        rolcreaterole as "canCreateRole",
+        rolreplication as "canReplicate",
+        rolbypassrls as "bypassesRls"
+      from pg_catalog.pg_roles
+      where rolname = any(${client.array([...ALL_ROLE_NAMES])}::text[])
+      order by rolname
+    `
+    if (roles.length !== ALL_ROLE_NAMES.length || roles.some(roleIsUnsafe)) {
+      throw new Error(
+        'Dedicated release roles must have exact LOGIN/NOLOGIN, NOINHERIT, NOSUPERUSER, NOCREATEDB, NOCREATEROLE, NOREPLICATION, and NOBYPASSRLS settings.',
+      )
+    }
+    const initialMemberships = await client<{
+      roleName: string
+      memberName: string
+      adminOption: boolean
+    }[]>`
+      select
+        granted.rolname as "roleName",
+        member.rolname as "memberName",
+        membership.admin_option as "adminOption"
+      from pg_catalog.pg_auth_members membership
+      join pg_catalog.pg_roles granted on granted.oid = membership.roleid
+      join pg_catalog.pg_roles member on member.oid = membership.member
+      where granted.rolname = any(${client.array([...ALL_ROLE_NAMES])}::text[])
+         or member.rolname = any(${client.array([...ALL_ROLE_NAMES])}::text[])
+      order by granted.rolname, member.rolname
+    `
+    if (initialMemberships.some((membership) => (
+      membership.roleName !== ROUTINES_OWNER
+      || membership.memberName !== migrationRole
+      || membership.adminOption
+    ))) {
+      throw new Error('Dedicated release roles must not have role memberships or delegation paths.')
+    }
+
     const [{ ownedReleaseTables }] = await client<{ ownedReleaseTables: number }[]>`
       select count(*)::integer as "ownedReleaseTables"
       from pg_catalog.pg_tables
@@ -73,6 +141,7 @@ async function main(): Promise<void> {
         ])
     `
     const transferComplete = ownedReleaseTables === 7
+    await client`grant create on schema public to forge_release_routines_owner`
     if (transferComplete) {
       // Re-running bootstrap after migration must not silently restore owner
       // authority to the ordinary application login.
@@ -137,46 +206,35 @@ async function main(): Promise<void> {
       await client`grant execute on function public.forge_finalize_epic_172_release_owner_bootstrap_v1() to ${client(migrationRole)}`
     }
 
-    const roles = await client<{
-      canLogin: boolean
-      inherits: boolean
+    const finalMemberships = await client<{
       roleName: string
+      memberName: string
+      adminOption: boolean
     }[]>`
       select
-        rolname as "roleName",
-        rolcanlogin as "canLogin",
-        rolinherit as "inherits"
-      from pg_roles
-      where rolname in (
-        'forge_release_evidence_writer',
-        'forge_release_transition'
-      )
-      order by rolname
+        granted.rolname as "roleName",
+        member.rolname as "memberName",
+        membership.admin_option as "adminOption"
+      from pg_catalog.pg_auth_members membership
+      join pg_catalog.pg_roles granted on granted.oid = membership.roleid
+      join pg_catalog.pg_roles member on member.oid = membership.member
+      where granted.rolname = any(${client.array([...ALL_ROLE_NAMES])}::text[])
+         or member.rolname = any(${client.array([...ALL_ROLE_NAMES])}::text[])
+      order by granted.rolname, member.rolname
     `
+    const expectedMembershipCount = transferComplete ? 0 : 1
     if (
-      roles.length !== ROLE_NAMES.length ||
-      roles.some((role) => !role.canLogin || role.inherits)
+      finalMemberships.length !== expectedMembershipCount
+      || finalMemberships.some((membership) => (
+        membership.roleName !== ROUTINES_OWNER
+        || membership.memberName !== migrationRole
+        || membership.adminOption
+      ))
     ) {
-      throw new Error('Dedicated release-role verification failed; no database migration was attempted.')
+      throw new Error('The temporary release-owner membership is not exact or permits delegation.')
     }
 
-    const [owner] = await client<{
-      canLogin: boolean
-      inherits: boolean
-      roleName: string
-    }[]>`
-      select
-        rolname as "roleName",
-        rolcanlogin as "canLogin",
-        rolinherit as "inherits"
-      from pg_roles
-      where rolname = ${ROUTINES_OWNER}
-    `
-    if (!owner || owner.canLogin || owner.inherits) {
-      throw new Error('The release-routines owner must be a NOLOGIN NOINHERIT role.')
-    }
-
-    console.log(`✓ Verified ${roles.length} dedicated NOINHERIT release roles as ${authority.currentUser}.`)
+    console.log(`✓ Verified ${roles.length} exact least-privilege release roles as ${authority.currentUser}.`)
     if (transferComplete) {
       console.log(`✓ Release objects already belong to ${ROUTINES_OWNER}; migration role ${migrationRole} remains unprivileged.`)
     } else {

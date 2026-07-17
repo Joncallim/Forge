@@ -264,8 +264,8 @@ async function classifyProjectMcp(
   project: Project,
   mcpId: string,
   installation: McpInstallationRow | undefined,
+  workspace: Awaited<ReturnType<typeof getWorkspaceSettings>>,
 ): Promise<ProjectMcpStatus> {
-  const workspace = await getWorkspaceSettings()
   const config = normalizeProjectMcpConfig(project.mcpConfig)
   const override = config.overrides[mcpId]
   const entry = isKnownMcpId(mcpId) ? MCP_CATALOG[mcpId] : null
@@ -458,15 +458,20 @@ export async function getCachedProjectMcpSummaries(
   return summaries
 }
 
-export async function getProjectMcpOverview(project: Project): Promise<ProjectMcpOverview> {
-  const workspace = await getWorkspaceSettings()
+export async function getProjectMcpOverview(
+  project: Project,
+  options: { cache?: boolean; ensureWorkspace?: boolean } = {},
+): Promise<ProjectMcpOverview> {
+  const workspace = await getWorkspaceSettings({ ensure: options.ensureWorkspace ?? true })
   const config = normalizeProjectMcpConfig(project.mcpConfig)
   const installations = await listInstallationRows()
   const statuses = await Promise.all(
-    config.requiredMcps.map((mcpId) => classifyProjectMcp(project, mcpId, installations.get(mcpId))),
+    config.requiredMcps.map((mcpId) => classifyProjectMcp(project, mcpId, installations.get(mcpId), workspace)),
   )
 
-  await Promise.all(statuses.map((status) => cacheProjectStatus(project.id, status)))
+  if (options.cache ?? true) {
+    await Promise.all(statuses.map((status) => cacheProjectStatus(project.id, status)))
+  }
 
   return {
     projectId: project.id,

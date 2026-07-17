@@ -1,4 +1,5 @@
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
+import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { decideEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
@@ -104,33 +105,50 @@ describe('Epic 172 project-management ingress decision', () => {
 })
 
 describe('Epic 172 project route ingress sentinel', () => {
-  const routePaths = [
-    '../app/api/projects/route.ts',
-    '../app/api/projects/[id]/route.ts',
-    '../app/api/projects/[id]/filesystem-grant/route.ts',
-    '../app/api/projects/[id]/issues/route.ts',
-    '../app/api/projects/[id]/mcps/route.ts',
-    '../app/api/projects/[id]/mcps/install-recommended/route.ts',
-    '../app/api/projects/[id]/roadmap/route.ts',
-  ]
+  const projectApiRoot = fileURLToPath(new URL('../app/api/projects/', import.meta.url))
+  const apiRoot = fileURLToPath(new URL('../app/api/', import.meta.url))
+
+  function collectRouteFiles(directory: string): string[] {
+    return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+      const entryPath = path.join(directory, entry.name)
+      if (entry.isDirectory()) return collectRouteFiles(entryPath)
+      return entry.name === 'route.ts' ? [entryPath] : []
+    })
+  }
+
+  function routeHandlers(source: string) {
+    const matches = [...source.matchAll(/export async function (GET|POST|PUT|PATCH|DELETE)\b/g)]
+    return matches.map((match, index) => ({
+      body: source.slice(match.index, matches[index + 1]?.index ?? source.length),
+      method: match[1],
+    }))
+  }
+
+  function routeLabel(routePath: string): string {
+    return `../app/api/${path.relative(apiRoot, routePath).split(path.sep).join('/')}`
+  }
 
   it('guards every POST, PUT, and DELETE while preserving GET reads', () => {
     const guarded: string[] = []
-    for (const relativePath of routePaths) {
-      const source = readFileSync(fileURLToPath(new URL(relativePath, import.meta.url)), 'utf8')
-      const matches = [...source.matchAll(/export async function (GET|POST|PUT|DELETE)\b/g)]
-      for (const [index, match] of matches.entries()) {
-        const body = source.slice(match.index, matches[index + 1]?.index ?? source.length)
-        const label = `${relativePath}:${match[1]}`
-        if (match[1] === 'GET') {
+    for (const routePath of collectRouteFiles(projectApiRoot).sort()) {
+      const source = readFileSync(routePath, 'utf8')
+      for (const { body, method } of routeHandlers(source)) {
+        const label = `${routeLabel(routePath)}:${method}`
+        if (method === 'GET') {
           expect(body, label).not.toContain('guardEpic172ProjectManagementIngress()')
+          expect(body, label).not.toMatch(/\b(?:db|tx)\s*\.\s*(?:insert|update|delete)\s*\(/)
+          expect(body, label).not.toMatch(/\bfs\s*\.\s*(?:appendFile|mkdir|rename|rm|unlink|writeFile)\s*\(/)
+          expect(body, label).not.toContain('claimAccessibleLegacyProjects(')
+          if (body.includes('getProjectMcpOverview(')) {
+            expect(body, label).toContain('{ cache: false, ensureWorkspace: false }')
+          }
         } else {
           expect(body.match(/guardEpic172ProjectManagementIngress\(\)/g), label).toHaveLength(1)
           guarded.push(label)
         }
       }
     }
-    expect(guarded).toEqual([
+    expect(guarded.sort()).toEqual([
       '../app/api/projects/route.ts:POST',
       '../app/api/projects/[id]/route.ts:PUT',
       '../app/api/projects/[id]/route.ts:DELETE',
@@ -138,7 +156,41 @@ describe('Epic 172 project route ingress sentinel', () => {
       '../app/api/projects/[id]/issues/route.ts:POST',
       '../app/api/projects/[id]/mcps/route.ts:PUT',
       '../app/api/projects/[id]/mcps/install-recommended/route.ts:POST',
-    ])
+    ].sort())
+  })
+
+  it('requires the gate before every project-table or project-filesystem mutation in any API route', () => {
+    const mutationPatterns = [
+      /\.(?:insert|update|delete)\s*\(\s*projects\s*\)/g,
+      /await\s+(?:registerProjectPath|setProjectMcpConfig|unregisterProjectPath)\s*\(/g,
+    ]
+    const observedMutations: string[] = []
+
+    for (const routePath of collectRouteFiles(apiRoot)) {
+      const source = readFileSync(routePath, 'utf8')
+      for (const { body, method } of routeHandlers(source)) {
+        for (const pattern of mutationPatterns) {
+          for (const match of body.matchAll(pattern)) {
+            const label = `${routeLabel(routePath)}:${method}:${match[0]}`
+            observedMutations.push(label)
+            const guardIndex = body.indexOf('guardEpic172ProjectManagementIngress()')
+            expect(guardIndex, label).toBeGreaterThanOrEqual(0)
+            expect(guardIndex, label).toBeLessThan(match.index ?? 0)
+          }
+        }
+      }
+    }
+    expect(observedMutations).toContain(
+      '../app/api/tasks/[id]/filesystem-grants/route.ts:PUT:.update(projects)',
+    )
+  })
+
+  it('keeps shared project and task access helpers read-only', () => {
+    for (const relativePath of ['../lib/project-access.ts', '../lib/task-access.ts']) {
+      const source = readFileSync(fileURLToPath(new URL(relativePath, import.meta.url)), 'utf8')
+      expect(source, relativePath).not.toMatch(/\bdb\s*\.\s*(?:insert|update|delete)\s*\(/)
+      expect(source, relativePath).not.toContain('claimAccessibleLegacyProjects')
+    }
   })
 
   it('checks removal ingress before rejecting file deletion or archiving', () => {

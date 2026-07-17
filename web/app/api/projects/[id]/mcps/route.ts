@@ -68,7 +68,7 @@ export async function GET(
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
     }
 
-    const overview = await getProjectMcpOverview(project)
+    const overview = await getProjectMcpOverview(project, { cache: false, ensureWorkspace: false })
     return NextResponse.json({ overview })
   } catch (err) {
     console.error('[GET /api/projects/:id/mcps] Unexpected error', err)

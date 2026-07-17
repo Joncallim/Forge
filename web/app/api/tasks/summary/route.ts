@@ -4,7 +4,7 @@ import { and, count, desc, eq, inArray } from 'drizzle-orm'
 import { db } from '@/db'
 import { projects, tasks } from '@/db/schema'
 import { getSession } from '@/lib/session'
-import { accessibleProjectOwnerCondition, claimAccessibleLegacyProjects } from '@/lib/project-access'
+import { accessibleProjectOwnerCondition } from '@/lib/project-access'
 
 // ---------------------------------------------------------------------------
 // GET /api/tasks/summary
@@ -24,8 +24,6 @@ export async function GET(request: NextRequest) {
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
-
-    await claimAccessibleLegacyProjects(session.userId)
 
     const grouped = await db
       .select({ status: tasks.status, total: count() })

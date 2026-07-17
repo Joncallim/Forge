@@ -131,14 +131,42 @@ export async function installEpic172ReleaseSigner(input: Readonly<{
   }
 }
 
-async function changeEpic172ReleaseSignerState(input: Readonly<{
+type Epic172SignerStateChange = Readonly<{
   databaseUrl: string
   signerKeyId: string
   actor: string
   reason: string
-  action: 'activate' | 'retire'
-}>): Promise<string> {
+}> & (
+  | Readonly<{
+    action: 'activate'
+    expectedActiveSignerKeyId?: string
+    expectedActiveGeneration?: number
+  }>
+  | Readonly<{
+    action: 'retire'
+    expectedGeneration: number
+  }>
+)
+
+async function changeEpic172ReleaseSignerState(input: Epic172SignerStateChange): Promise<string> {
   boundedLifecycleText(input.actor, input.reason)
+  if (input.action === 'activate') {
+    const hasExpectedKey = input.expectedActiveSignerKeyId !== undefined
+    const hasExpectedGeneration = input.expectedActiveGeneration !== undefined
+    if (
+      hasExpectedKey !== hasExpectedGeneration
+      || (hasExpectedGeneration && (
+        !Number.isSafeInteger(input.expectedActiveGeneration)
+        || input.expectedActiveGeneration! <= 0
+      ))
+    ) {
+      throw new Epic172ReleaseTransactionError(
+        'Signer rotation requires both the expected active key ID and positive generation.',
+      )
+    }
+  } else if (!Number.isSafeInteger(input.expectedGeneration) || input.expectedGeneration <= 0) {
+    throw new Epic172ReleaseTransactionError('Signer retirement requires the exact positive generation.')
+  }
   const client = releaseClient(input.databaseUrl)
   try {
     return await client.begin('isolation level serializable', async (tx) => {
@@ -146,12 +174,19 @@ async function changeEpic172ReleaseSignerState(input: Readonly<{
       const rows = input.action === 'activate'
         ? await tx<{ signerKeyId: string }[]>`
           select forge.activate_epic_172_release_signer_v1(
-            ${input.signerKeyId}::uuid, ${input.actor.trim()}::text, ${input.reason}::text
+            ${input.signerKeyId}::uuid,
+            ${input.expectedActiveSignerKeyId ?? null}::uuid,
+            ${input.expectedActiveGeneration ?? null}::bigint,
+            ${input.actor.trim()}::text,
+            ${input.reason}::text
           )::text as "signerKeyId"
         `
         : await tx<{ signerKeyId: string }[]>`
           select forge.retire_epic_172_release_signer_v1(
-            ${input.signerKeyId}::uuid, ${input.actor.trim()}::text, ${input.reason}::text
+            ${input.signerKeyId}::uuid,
+            ${input.expectedGeneration}::bigint,
+            ${input.actor.trim()}::text,
+            ${input.reason}::text
           )::text as "signerKeyId"
         `
       if (!rows[0]) throw new Epic172ReleaseTransactionError(`The signer ${input.action} operation did not commit.`)
@@ -165,6 +200,8 @@ async function changeEpic172ReleaseSignerState(input: Readonly<{
 export function activateEpic172ReleaseSigner(input: Readonly<{
   databaseUrl: string
   signerKeyId: string
+  expectedActiveSignerKeyId?: string
+  expectedActiveGeneration?: number
   actor: string
   reason: string
 }>): Promise<string> {
@@ -174,6 +211,7 @@ export function activateEpic172ReleaseSigner(input: Readonly<{
 export function retireEpic172ReleaseSigner(input: Readonly<{
   databaseUrl: string
   signerKeyId: string
+  expectedGeneration: number
   actor: string
   reason: string
 }>): Promise<string> {

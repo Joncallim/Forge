@@ -38,9 +38,10 @@ vi.mock('@/lib/session', () => ({
 
 // Existing route-contract cases exercise behavior behind the release gate.
 // The gate itself and its fail-closed route placement have a focused suite.
+const mockGuardEpic172ProjectManagementIngress = vi.fn().mockResolvedValue(null)
 vi.mock('@/lib/projects/epic-172-project-ingress', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/projects/epic-172-project-ingress')>(),
-  guardEpic172ProjectManagementIngress: vi.fn().mockResolvedValue(null),
+  guardEpic172ProjectManagementIngress: mockGuardEpic172ProjectManagementIngress,
 }))
 
 // DB mock — returns fluent chain helpers per-call
@@ -238,7 +239,6 @@ describe('GET /api/projects — auth guard', () => {
     process.env.HOME = fakeHome
     process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
     mockDbSelect
-      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([project]))
       .mockReturnValueOnce(chain([]))
 
@@ -252,6 +252,8 @@ describe('GET /api/projects — auth guard', () => {
         localPath: project.localPath,
         displayLocalPath: '~/Documents/Forge/projects/list-display',
       })
+      expect(mockGuardEpic172ProjectManagementIngress).not.toHaveBeenCalled()
+      expect(mockDbUpdate).not.toHaveBeenCalled()
     } finally {
       if (previousRoot === undefined) {
         delete process.env.FORGE_WORKSPACE_ROOT
@@ -1889,6 +1891,11 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
           '/Forge Workspace/mcps/filesystem',
           '/Forge Workspace/mcps/github',
         ])
+        expect(mockGetProjectMcpOverview).toHaveBeenCalledWith(
+          project,
+          { cache: false, ensureWorkspace: false },
+        )
+        expect(mockDbInsert).not.toHaveBeenCalled()
       })
     } finally {
       if (previousDisplayRoot === undefined) {
@@ -1990,7 +1997,6 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
 
     await withWorkspaceProject(async (project) => {
       mockDbSelect
-        .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
         .mockReturnValueOnce(chain([project]))
         .mockReturnValueOnce(chain([
           {
@@ -2411,42 +2417,18 @@ describe('GET /api/projects/:id — 404 when project not found', () => {
     expect(body.error).toMatch(/not found/i)
   })
 
-  it('claims a legacy null-owned project for bootstrap-owner direct lookups', async () => {
+  it('keeps legacy null-owned project reads non-mutating until bootstrap ownership is assigned', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
-    const claimedProject = {
-      id: 'project-legacy',
-      name: 'Legacy Project',
-      submittedBy: 'user-abc',
-      githubRepo: null,
-      localPath: null,
-      githubTokenEnvVar: null,
-      pmProviderConfigId: null,
-      mcpConfig: {
-        profile: 'default',
-        requiredMcps: ['filesystem', 'github'],
-        overrides: {},
-      },
-      defaultBranch: 'main',
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      archivedAt: null,
-    }
-    mockDbSelect
-      .mockReturnValueOnce(chain([]))
-      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
-    mockDbUpdate.mockReturnValue(chain([claimedProject]))
+    mockDbSelect.mockReturnValueOnce(chain([]))
 
     const { GET } = await import('@/app/api/projects/[id]/route')
     const res = await GET(authRequest('/api/projects/project-legacy') as never, {
       params: Promise.resolve({ id: 'project-legacy' }),
     })
 
-    expect(res.status).toBe(200)
-    const body = await res.json()
-    expect(body.project).toMatchObject({
-      id: 'project-legacy',
-      submittedBy: 'user-abc',
-    })
+    expect(res.status).toBe(404)
+    expect(mockDbSelect).toHaveBeenCalledOnce()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
   })
 })
 
@@ -5382,6 +5364,43 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     })
   })
 
+  it('blocks an always-allow project grant before any database write when project ingress is closed', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValueOnce(chain([grantTask()]))
+    mockGuardEpic172ProjectManagementIngress.mockResolvedValueOnce(Response.json(
+      {
+        code: 'epic_172_project_management_ingress_closed',
+        error: 'Project management is temporarily disabled while release safety checks are incomplete.',
+        reason: 'disabled',
+      },
+      { status: 503 },
+    ))
+
+    const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
+    const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        schemaVersion: 1,
+        grants: [{
+          workPackageId: FS_GRANT_PACKAGE_ID,
+          decision: 'approved',
+          capabilities: ['filesystem.project.read'],
+          grantMode: 'always_allow',
+        }],
+      }),
+    }) as never, {
+      params: Promise.resolve({ id: 'task-fs-grant' }),
+    })
+
+    expect(res.status).toBe(503)
+    expect(mockGuardEpic172ProjectManagementIngress).toHaveBeenCalledOnce()
+    expect(mockDbSelect).toHaveBeenCalledOnce()
+    expect(mockDbTransaction).not.toHaveBeenCalled()
+    expect(mockDbInsert).not.toHaveBeenCalled()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+  })
+
   it('persists always-allow filesystem grants on the project MCP config', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbInsert.mockReturnValue(chain([{
@@ -7976,7 +7995,6 @@ describe('GET /api/tasks — includes project name', () => {
     }
 
     mockDbSelect
-      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([listedTask]))
       .mockReturnValueOnce(chain([{ total: 1 }]))
 
@@ -8020,7 +8038,6 @@ describe('GET /api/tasks/summary', () => {
   it('aggregates task statuses and returns the latest attention tasks', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect
-      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([
         { status: 'pending', total: 2 },
         { status: 'running', total: 1 },
@@ -8059,13 +8076,12 @@ describe('GET /api/tasks/summary', () => {
         { id: 'task-failed', title: 'Investigate failure', status: 'failed' },
       ],
     })
-    expect(mockDbSelect).toHaveBeenCalledTimes(3)
+    expect(mockDbSelect).toHaveBeenCalledTimes(2)
   })
 
   it('returns 500 when the summary query fails', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect
-      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(rejectingChain(new Error('database unavailable')))
 
     const { GET } = await import('@/app/api/tasks/summary/route')

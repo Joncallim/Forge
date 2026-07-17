@@ -10,7 +10,6 @@ import { generateTaskTitle } from '@/lib/task-title'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import {
   accessibleProjectOwnerCondition,
-  claimAccessibleLegacyProjects,
   getAccessibleProject,
 } from '@/lib/project-access'
 
@@ -39,8 +38,6 @@ export async function GET(request: NextRequest) {
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
-
-    await claimAccessibleLegacyProjects(session.userId)
 
     const { searchParams } = request.nextUrl
     const projectId = searchParams.get('projectId') ?? undefined

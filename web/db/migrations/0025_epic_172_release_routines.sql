@@ -1,19 +1,58 @@
 DO $$
 BEGIN
-  IF NOT EXISTS (
-    SELECT 1
+  IF current_user IN (
+    'forge_release_evidence_writer',
+    'forge_release_transition',
+    'forge_release_routines_owner'
+  ) THEN
+    RAISE EXCEPTION 'The migration login must not be a dedicated Epic 172 release principal'
+      USING ERRCODE = '42501';
+  END IF;
+  IF (
+    SELECT pg_catalog.count(*)
     FROM pg_catalog.pg_roles
-    WHERE rolname = 'forge_release_routines_owner'
-      AND NOT rolcanlogin
+    WHERE rolname IN (
+      'forge_release_evidence_writer',
+      'forge_release_transition',
+      'forge_release_routines_owner'
+    )
       AND NOT rolinherit
       AND NOT rolsuper
-  ) THEN
-    RAISE EXCEPTION 'forge_release_routines_owner must exist as a NOLOGIN NOINHERIT non-superuser role; run protocol:bootstrap-epic-172-release-roles first'
+      AND NOT rolcreatedb
+      AND NOT rolcreaterole
+      AND NOT rolreplication
+      AND NOT rolbypassrls
+      AND rolcanlogin = (rolname <> 'forge_release_routines_owner')
+  ) <> 3 THEN
+    RAISE EXCEPTION 'Epic 172 release roles must have exact least-privilege attributes; run protocol:bootstrap-epic-172-release-roles first'
       USING ERRCODE = '42501';
   END IF;
 
-  IF NOT pg_catalog.pg_has_role(current_user, 'forge_release_routines_owner', 'MEMBER') THEN
-    RAISE EXCEPTION 'migration role % is not temporarily authorized to transfer the Epic 172 release substrate; rerun protocol:bootstrap-epic-172-release-roles', current_user
+  IF (
+    SELECT pg_catalog.count(*)
+    FROM pg_catalog.pg_auth_members membership
+    JOIN pg_catalog.pg_roles granted ON granted.oid = membership.roleid
+    JOIN pg_catalog.pg_roles member ON member.oid = membership.member
+    WHERE granted.rolname IN (
+      'forge_release_evidence_writer',
+      'forge_release_transition',
+      'forge_release_routines_owner'
+    )
+       OR member.rolname IN (
+      'forge_release_evidence_writer',
+      'forge_release_transition',
+      'forge_release_routines_owner'
+    )
+  ) <> 1 OR NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_auth_members membership
+    JOIN pg_catalog.pg_roles granted ON granted.oid = membership.roleid
+    JOIN pg_catalog.pg_roles member ON member.oid = membership.member
+    WHERE granted.rolname = 'forge_release_routines_owner'
+      AND member.rolname = current_user
+      AND NOT membership.admin_option
+  ) THEN
+    RAISE EXCEPTION 'migration role % must hold the sole non-admin temporary Epic 172 owner membership', current_user
       USING ERRCODE = '42501';
   END IF;
 END;
@@ -86,7 +125,10 @@ SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
-  v_existing_keys integer;
+  v_key_count integer;
+  v_active_count integer;
+  v_staged_count integer;
+  v_max_generation bigint;
 BEGIN
   IF session_user <> 'forge_release_evidence_writer' THEN
     RAISE EXCEPTION 'Epic 172 signer installation requires the dedicated writer login'
@@ -95,18 +137,29 @@ BEGIN
   PERFORM pg_catalog.pg_advisory_xact_lock(
     pg_catalog.hashtextextended('forge:epic-172:signer-policy', 0)
   );
-  SELECT pg_catalog.count(*)::integer
-  INTO v_existing_keys
-  FROM public.forge_release_signer_keys;
-  IF v_existing_keys <> 0
-     OR p_generation <> 1
-     OR pg_catalog.octet_length(p_public_key_spki) NOT BETWEEN 1 AND 512
+  IF pg_catalog.octet_length(p_public_key_spki) NOT BETWEEN 1 AND 512
      OR p_github_app_id !~ '^[1-9][0-9]{0,19}$'
      OR p_ruleset_fingerprint !~ '^[0-9a-f]{64}$'
      OR p_valid_until <= p_valid_from
      OR pg_catalog.length(pg_catalog.btrim(p_actor)) NOT BETWEEN 1 AND 200
      OR pg_catalog.length(p_reason) > 1000 THEN
-    RAISE EXCEPTION 'Step 0 permits only the reviewed first signer; rotation requires signed predecessor-bound lifecycle evidence'
+    RAISE EXCEPTION 'Epic 172 signer installation fields are invalid'
+      USING ERRCODE = '22023';
+  END IF;
+  SELECT
+    pg_catalog.count(*)::integer,
+    pg_catalog.count(*) FILTER (WHERE status = 'active')::integer,
+    pg_catalog.count(*) FILTER (WHERE status = 'staged')::integer,
+    pg_catalog.max(generation)
+  INTO v_key_count, v_active_count, v_staged_count, v_max_generation
+  FROM public.forge_release_signer_keys;
+  IF (v_key_count = 0 AND p_generation <> 1)
+     OR (v_key_count > 0 AND (
+       v_active_count <> 1
+       OR v_staged_count <> 0
+       OR p_generation <> v_max_generation + 1
+     )) THEN
+    RAISE EXCEPTION 'Epic 172 signer installation requires generation 1 on an empty policy or the exact next generation with one active signer and no staged signer'
       USING ERRCODE = '22023';
   END IF;
   INSERT INTO public.forge_release_signer_keys (
@@ -128,6 +181,8 @@ $$;
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION forge.activate_epic_172_release_signer_v1(
   p_signer_key_id uuid,
+  p_expected_active_signer_key_id uuid,
+  p_expected_active_generation bigint,
   p_actor text,
   p_reason text
 )
@@ -139,7 +194,9 @@ AS $$
 DECLARE
   v_now timestamptz := pg_catalog.clock_timestamp();
   v_staged public.forge_release_signer_keys%ROWTYPE;
+  v_active public.forge_release_signer_keys%ROWTYPE;
   v_key_count integer;
+  v_staged_count integer;
 BEGIN
   IF session_user <> 'forge_release_evidence_writer' THEN
     RAISE EXCEPTION 'Epic 172 signer activation requires the dedicated writer login'
@@ -157,21 +214,61 @@ BEGIN
   WHERE id = p_signer_key_id
   FOR UPDATE;
   IF v_staged.status <> 'staged'
-     OR v_staged.generation <> 1
      OR v_now < v_staged.valid_from
      OR v_now >= v_staged.valid_until THEN
     RAISE EXCEPTION 'Only a currently valid staged Epic 172 signer may activate'
       USING ERRCODE = '22023';
   END IF;
-  SELECT pg_catalog.count(*)::integer INTO v_key_count
+  SELECT pg_catalog.count(*)::integer,
+         pg_catalog.count(*) FILTER (WHERE status = 'staged')::integer
+  INTO v_key_count, v_staged_count
   FROM public.forge_release_signer_keys;
-  IF v_key_count <> 1 THEN
-    RAISE EXCEPTION 'Unsigned Epic 172 signer rotation is forbidden; signed predecessor-bound lifecycle evidence is required'
-      USING ERRCODE = '42501';
+  SELECT * INTO v_active
+  FROM public.forge_release_signer_keys
+  WHERE policy_id = 'forge-epic-172-release-signing-v1'
+    AND status = 'active'
+  FOR UPDATE;
+
+  IF v_staged.generation = 1 THEN
+    IF p_expected_active_signer_key_id IS NOT NULL
+       OR p_expected_active_generation IS NOT NULL
+       OR v_active.id IS NOT NULL
+       OR v_key_count <> 1
+       OR v_staged_count <> 1 THEN
+      RAISE EXCEPTION 'First signer activation requires an empty active-policy compare-and-set'
+        USING ERRCODE = '40001';
+    END IF;
+  ELSIF p_expected_active_signer_key_id IS NULL
+     OR p_expected_active_generation IS NULL
+     OR v_active.id IS NULL
+     OR v_active.id <> p_expected_active_signer_key_id
+     OR v_active.generation <> p_expected_active_generation
+     OR v_staged.generation <> p_expected_active_generation + 1
+     OR v_staged_count <> 1 THEN
+    RAISE EXCEPTION 'Signer rotation compare-and-set did not match the exact active generation'
+      USING ERRCODE = '40001';
+  ELSE
+    UPDATE public.forge_release_signer_keys
+    SET status = 'retiring', retirement_started_at = v_now
+    WHERE id = v_active.id AND status = 'active';
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Signer rotation lost the active-generation compare-and-set race'
+        USING ERRCODE = '40001';
+    END IF;
+    INSERT INTO public.forge_release_signer_key_lifecycle_audits (
+      signer_key_id, signer_generation, action, prior_status, new_status, actor, reason, occurred_at
+    ) VALUES (
+      v_active.id, v_active.generation, 'retirement_started', 'active', 'retiring',
+      pg_catalog.btrim(p_actor), p_reason, v_now
+    );
   END IF;
   UPDATE public.forge_release_signer_keys
   SET status = 'active', activated_at = v_now
-  WHERE id = v_staged.id;
+  WHERE id = v_staged.id AND status = 'staged';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Signer activation lost the staged-generation compare-and-set race'
+      USING ERRCODE = '40001';
+  END IF;
   INSERT INTO public.forge_release_signer_key_lifecycle_audits (
     signer_key_id, signer_generation, action, prior_status, new_status, actor, reason, occurred_at
   ) VALUES (
@@ -184,6 +281,7 @@ $$;
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION forge.retire_epic_172_release_signer_v1(
   p_signer_key_id uuid,
+  p_expected_generation bigint,
   p_actor text,
   p_reason text
 )
@@ -193,13 +291,54 @@ SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
+  v_now timestamptz := pg_catalog.clock_timestamp();
+  v_retiring public.forge_release_signer_keys%ROWTYPE;
 BEGIN
   IF session_user <> 'forge_release_evidence_writer' THEN
     RAISE EXCEPTION 'Epic 172 signer retirement requires the dedicated writer login'
       USING ERRCODE = '42501';
   END IF;
-  RAISE EXCEPTION 'Unsigned Epic 172 signer retirement is forbidden; signed predecessor-bound lifecycle evidence is required'
-    USING ERRCODE = '42501';
+  IF p_expected_generation <= 0
+     OR pg_catalog.length(pg_catalog.btrim(p_actor)) NOT BETWEEN 1 AND 200
+     OR pg_catalog.length(p_reason) > 1000 THEN
+    RAISE EXCEPTION 'Epic 172 signer retirement generation, actor, or reason is invalid'
+      USING ERRCODE = '22023';
+  END IF;
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended('forge:epic-172:signer-policy', 0)
+  );
+  SELECT * INTO STRICT v_retiring
+  FROM public.forge_release_signer_keys
+  WHERE id = p_signer_key_id
+  FOR UPDATE;
+  IF v_retiring.generation <> p_expected_generation
+     OR v_retiring.status <> 'retiring'
+     OR NOT EXISTS (
+       SELECT 1
+       FROM public.forge_release_signer_keys active_key
+       WHERE active_key.policy_id = v_retiring.policy_id
+         AND active_key.status = 'active'
+         AND active_key.generation > v_retiring.generation
+     ) THEN
+    RAISE EXCEPTION 'Signer retirement compare-and-set requires the exact retiring generation and a newer active signer'
+      USING ERRCODE = '40001';
+  END IF;
+  UPDATE public.forge_release_signer_keys
+  SET status = 'retired', retired_at = v_now
+  WHERE id = v_retiring.id
+    AND generation = p_expected_generation
+    AND status = 'retiring';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Signer retirement lost the generation compare-and-set race'
+      USING ERRCODE = '40001';
+  END IF;
+  INSERT INTO public.forge_release_signer_key_lifecycle_audits (
+    signer_key_id, signer_generation, action, prior_status, new_status, actor, reason, occurred_at
+  ) VALUES (
+    v_retiring.id, v_retiring.generation, 'retired', 'retiring', 'retired',
+    pg_catalog.btrim(p_actor), p_reason, v_now
+  );
+  RETURN v_retiring.id;
 END;
 $$;
 --> statement-breakpoint
@@ -958,9 +1097,9 @@ ALTER FUNCTION forge.assert_epic_172_transition_authorization_live_v1(uuid,text)
   OWNER TO forge_release_routines_owner;
 ALTER FUNCTION forge.install_epic_172_release_signer_v1(uuid,bigint,bytea,text,text,timestamptz,timestamptz,text,text)
   OWNER TO forge_release_routines_owner;
-ALTER FUNCTION forge.activate_epic_172_release_signer_v1(uuid,text,text)
+ALTER FUNCTION forge.activate_epic_172_release_signer_v1(uuid,uuid,bigint,text,text)
   OWNER TO forge_release_routines_owner;
-ALTER FUNCTION forge.retire_epic_172_release_signer_v1(uuid,text,text)
+ALTER FUNCTION forge.retire_epic_172_release_signer_v1(uuid,bigint,text,text)
   OWNER TO forge_release_routines_owner;
 ALTER FUNCTION forge.read_epic_172_enablement_state_v1()
   OWNER TO forge_release_routines_owner;
@@ -985,9 +1124,9 @@ REVOKE ALL ON FUNCTION forge.assert_epic_172_transition_authorization_live_v1(uu
   FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.install_epic_172_release_signer_v1(uuid,bigint,bytea,text,text,timestamptz,timestamptz,text,text)
   FROM PUBLIC;
-REVOKE ALL ON FUNCTION forge.activate_epic_172_release_signer_v1(uuid,text,text)
+REVOKE ALL ON FUNCTION forge.activate_epic_172_release_signer_v1(uuid,uuid,bigint,text,text)
   FROM PUBLIC;
-REVOKE ALL ON FUNCTION forge.retire_epic_172_release_signer_v1(uuid,text,text)
+REVOKE ALL ON FUNCTION forge.retire_epic_172_release_signer_v1(uuid,bigint,text,text)
   FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.read_epic_172_enablement_state_v1()
   FROM PUBLIC;
@@ -1013,9 +1152,9 @@ GRANT EXECUTE ON FUNCTION forge.assert_epic_172_transition_authorization_live_v1
   TO forge_release_transition;
 GRANT EXECUTE ON FUNCTION forge.install_epic_172_release_signer_v1(uuid,bigint,bytea,text,text,timestamptz,timestamptz,text,text)
   TO forge_release_evidence_writer;
-GRANT EXECUTE ON FUNCTION forge.activate_epic_172_release_signer_v1(uuid,text,text)
+GRANT EXECUTE ON FUNCTION forge.activate_epic_172_release_signer_v1(uuid,uuid,bigint,text,text)
   TO forge_release_evidence_writer;
-GRANT EXECUTE ON FUNCTION forge.retire_epic_172_release_signer_v1(uuid,text,text)
+GRANT EXECUTE ON FUNCTION forge.retire_epic_172_release_signer_v1(uuid,bigint,text,text)
   TO forge_release_evidence_writer;
 GRANT EXECUTE ON FUNCTION forge.lock_epic_172_signer_for_verification_v1(uuid)
   TO forge_release_evidence_writer, forge_release_transition;

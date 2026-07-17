@@ -303,11 +303,32 @@ FOR EACH ROW EXECUTE FUNCTION "forge_epic_172_reject_mutation_v1"();
 --> statement-breakpoint
 DO $$
 BEGIN
-	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'forge_release_evidence_writer') THEN
-		CREATE ROLE forge_release_evidence_writer LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+	IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'forge_release_evidence_writer') THEN
+		CREATE ROLE forge_release_evidence_writer LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 	END IF;
-	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'forge_release_transition') THEN
-		CREATE ROLE forge_release_transition LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+	IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'forge_release_transition') THEN
+		CREATE ROLE forge_release_transition LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+	END IF;
+	IF (
+		SELECT count(*)
+		FROM pg_catalog.pg_roles
+		WHERE rolname IN ('forge_release_evidence_writer', 'forge_release_transition')
+		  AND rolcanlogin AND NOT rolinherit AND NOT rolsuper AND NOT rolcreatedb
+		  AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls
+	) <> 2 THEN
+		RAISE EXCEPTION 'Epic 172 release logins must have exact least-privilege role attributes'
+			USING ERRCODE = '42501';
+	END IF;
+	IF EXISTS (
+		SELECT 1
+		FROM pg_catalog.pg_auth_members membership
+		JOIN pg_catalog.pg_roles granted ON granted.oid = membership.roleid
+		JOIN pg_catalog.pg_roles member ON member.oid = membership.member
+		WHERE granted.rolname IN ('forge_release_evidence_writer', 'forge_release_transition')
+		   OR member.rolname IN ('forge_release_evidence_writer', 'forge_release_transition')
+	) THEN
+		RAISE EXCEPTION 'Epic 172 release logins must not have role memberships or delegation paths'
+			USING ERRCODE = '42501';
 	END IF;
 END;
 $$;

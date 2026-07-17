@@ -3,6 +3,7 @@ import {
   randomBytes,
   randomUUID,
   sign,
+  type KeyObject,
 } from 'node:crypto'
 import postgres from 'postgres'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -66,6 +67,10 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
   function makeReleaseEnvelope(
     evidenceKind: Epic172ReleaseEvidenceKind,
     predecessorReceiptIds: readonly string[],
+    signer: Readonly<{ signerKeyId: string; signerGeneration: number }> = {
+      signerKeyId,
+      signerGeneration: 1,
+    },
   ): Epic172ReleaseEvidenceEnvelope {
     const canonicalPredecessors = [...predecessorReceiptIds].sort()
     const predecessorSetDigest = epic172ReceiptSetDigest(canonicalPredecessors)
@@ -96,8 +101,8 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
         epoch: contract.epoch,
         canonicalPredecessorReceiptSetDigest: predecessorSetDigest,
       }),
-      signerKeyId,
-      signerGeneration: 1,
+      signerKeyId: signer.signerKeyId,
+      signerGeneration: signer.signerGeneration,
       githubAppId,
       controllerRunId: 'postgres-recorder-run',
       controllerJobId: 'postgres-recorder-job',
@@ -119,6 +124,10 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
   function makeS3Authorization(
     receiptId: string,
     lifetimeMs = 5 * 60_000,
+    signer: Readonly<{ signerKeyId: string; signerGeneration: number }> = {
+      signerKeyId,
+      signerGeneration: 1,
+    },
   ): Epic172TransitionAuthorizationEnvelope {
     const issuedAt = new Date()
     const sourceReceiptIds = [receiptId]
@@ -149,16 +158,19 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
       operation: 'record_s3_receipt',
       controllerLoginId: 'forge-epic-172-postgres-test',
       controllerRunId: 'postgres-recorder-run',
-      signerKeyId,
-      signerGeneration: 1,
+      signerKeyId: signer.signerKeyId,
+      signerGeneration: signer.signerGeneration,
       nonce: randomUUID(),
       issuedAt: issuedAt.toISOString(),
       expiresAt: new Date(issuedAt.getTime() + lifetimeMs).toISOString(),
     }
   }
 
-  async function recordRelease(envelope: Epic172ReleaseEvidenceEnvelope) {
-    const detachedSignature = sign(null, epic172ReleaseEvidenceSignedBytes(envelope), keys.privateKey)
+  async function recordRelease(
+    envelope: Epic172ReleaseEvidenceEnvelope,
+    privateKey: KeyObject = keys.privateKey,
+  ) {
+    const detachedSignature = sign(null, epic172ReleaseEvidenceSignedBytes(envelope), privateKey)
     return recordEpic172ReleaseEvidence({
       databaseUrl: WRITER_URL!,
       envelope,
@@ -167,8 +179,11 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
     })
   }
 
-  async function recordAuthorization(envelope: Epic172TransitionAuthorizationEnvelope) {
-    const detachedSignature = sign(null, epic172TransitionAuthorizationSignedBytes(envelope), keys.privateKey)
+  async function recordAuthorization(
+    envelope: Epic172TransitionAuthorizationEnvelope,
+    privateKey: KeyObject = keys.privateKey,
+  ) {
+    const detachedSignature = sign(null, epic172TransitionAuthorizationSignedBytes(envelope), privateKey)
     return recordEpic172TransitionAuthorization({
       databaseUrl: WRITER_URL!,
       envelope,
@@ -453,10 +468,11 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
     expect(count).toBe(0)
   })
 
-  it('does not let the writer rotate or retire without signed predecessor-bound lifecycle evidence', async () => {
+  it('rotates and retires signer generations with rollback-safe compare-and-set transitions', async () => {
+    const retainedGenerationOne = await recordRelease(makeStep0Envelope())
     const nextKeys = generateKeyPairSync('ed25519')
     const nextKeyId = randomUUID()
-    await expect(installEpic172ReleaseSigner({
+    await installEpic172ReleaseSigner({
       databaseUrl: WRITER_URL!,
       signerKeyId: nextKeyId,
       generation: 2,
@@ -467,19 +483,153 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
       validUntil: new Date(Date.now() + 60 * 60_000),
       actor: 'postgres-test',
       reason: 'rotate disposable signer',
-    })).rejects.toThrow(/signed predecessor-bound lifecycle evidence/)
+    })
+
+    await expect(writer.begin(async (tx) => {
+      await tx`
+        select forge.activate_epic_172_release_signer_v1(
+          ${nextKeyId}::uuid,
+          ${signerKeyId}::uuid,
+          1::bigint,
+          'postgres-test'::text,
+          'rollback rotation'::text
+        )
+      `
+      throw new Error('injected rotation rollback')
+    })).rejects.toThrow(/injected rotation rollback/)
+    const afterRotationRollback = await writer<{ generation: string; status: string }[]>`
+      select generation::text as generation, status
+      from public.forge_release_signer_keys
+      order by generation
+    `
+    expect(afterRotationRollback).toEqual([
+      { generation: '1', status: 'active' },
+      { generation: '2', status: 'staged' },
+    ])
+
+    await expect(activateEpic172ReleaseSigner({
+      databaseUrl: WRITER_URL!,
+      signerKeyId: nextKeyId,
+      expectedActiveSignerKeyId: signerKeyId,
+      expectedActiveGeneration: 9,
+      actor: 'postgres-test',
+      reason: 'wrong compare-and-set generation',
+    })).rejects.toThrow(/compare-and-set/)
+
+    const activationInput = {
+      databaseUrl: WRITER_URL!,
+      signerKeyId: nextKeyId,
+      expectedActiveSignerKeyId: signerKeyId,
+      expectedActiveGeneration: 1,
+      actor: 'postgres-test',
+      reason: 'activate reviewed generation two',
+    }
+    const activationRace = await Promise.allSettled([
+      activateEpic172ReleaseSigner(activationInput),
+      activateEpic172ReleaseSigner(activationInput),
+    ])
+    expect(activationRace.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1)
+    expect(activationRace.filter((outcome) => outcome.status === 'rejected')).toHaveLength(1)
+
+    const afterRotation = await writer<{ generation: string; status: string }[]>`
+      select generation::text as generation, status
+      from public.forge_release_signer_keys
+      order by generation
+    `
+    expect(afterRotation).toEqual([
+      { generation: '1', status: 'retiring' },
+      { generation: '2', status: 'active' },
+    ])
+    expect(afterRotation.filter((row) => row.status === 'active')).toHaveLength(1)
+
+    const rejectedGenerationOne = makeStep0Envelope()
+    await expect(recordRelease(rejectedGenerationOne)).rejects.toThrow(/lifecycle-valid/)
+    const [{ rejectedCount }] = await writer<{ rejectedCount: number }[]>`
+      select count(*)::integer as "rejectedCount"
+      from public.forge_epic_172_release_evidence
+      where id = ${rejectedGenerationOne.receiptId}::uuid
+    `
+    expect(rejectedCount).toBe(0)
+
+    const generationTwoAuthorization = makeS3Authorization(
+      retainedGenerationOne.receiptId,
+      5 * 60_000,
+      { signerKeyId: nextKeyId, signerGeneration: 2 },
+    )
+    await recordAuthorization(generationTwoAuthorization, nextKeys.privateKey)
+
     await expect(retireEpic172ReleaseSigner({
-      databaseUrl: WRITER_URL!, signerKeyId, actor: 'postgres-test', reason: 'complete generation-one retirement',
-    })).rejects.toThrow(/signed predecessor-bound lifecycle evidence/)
+      databaseUrl: WRITER_URL!,
+      signerKeyId,
+      expectedGeneration: 2,
+      actor: 'postgres-test',
+      reason: 'wrong retirement generation',
+    })).rejects.toThrow(/compare-and-set/)
+    await expect(writer.begin(async (tx) => {
+      await tx`
+        select forge.retire_epic_172_release_signer_v1(
+          ${signerKeyId}::uuid,
+          1::bigint,
+          'postgres-test'::text,
+          'rollback retirement'::text
+        )
+      `
+      throw new Error('injected retirement rollback')
+    })).rejects.toThrow(/injected retirement rollback/)
+    const [afterRetirementRollback] = await writer<{ status: string }[]>`
+      select status from public.forge_release_signer_keys where id = ${signerKeyId}::uuid
+    `
+    expect(afterRetirementRollback?.status).toBe('retiring')
+
+    const retirementInput = {
+      databaseUrl: WRITER_URL!,
+      signerKeyId,
+      expectedGeneration: 1,
+      actor: 'postgres-test',
+      reason: 'complete generation-one retirement',
+    }
+    const retirementRace = await Promise.allSettled([
+      retireEpic172ReleaseSigner(retirementInput),
+      retireEpic172ReleaseSigner(retirementInput),
+    ])
+    expect(retirementRace.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1)
+    expect(retirementRace.filter((outcome) => outcome.status === 'rejected')).toHaveLength(1)
+
     const rows = await writer<{ generation: string; status: string }[]>`
       select generation::text as generation, status
       from public.forge_release_signer_keys
       order by generation
     `
-    expect(rows).toEqual([{ generation: '1', status: 'active' }])
+    expect(rows).toEqual([
+      { generation: '1', status: 'retired' },
+      { generation: '2', status: 'active' },
+    ])
+    expect(rows.filter((row) => row.status === 'active')).toHaveLength(1)
+
+    const retainedResult = await runEpic172AuthorizedTransition({
+      databaseUrl: TRANSITION_URL!,
+      receiptId: retainedGenerationOne.receiptId,
+      authorizationId: generationTwoAuthorization.authorizationId,
+      consumerNode: generationTwoAuthorization.targetNode,
+      transitionIdentityDigest: generationTwoAuthorization.transitionIdentityDigest,
+      operationId: generationTwoAuthorization.operationId,
+      applyTransition: async () => 'retained-generation-one-verified',
+    })
+    expect(retainedResult.result).toBe('retained-generation-one-verified')
+
+    await expect(retireEpic172ReleaseSigner({
+      ...retirementInput,
+    })).rejects.toThrow()
     const audits = await writer<{ action: string }[]>`
       select action from public.forge_release_signer_key_lifecycle_audits order by occurred_at, id
     `
-    expect(audits.map((row) => row.action).sort()).toEqual(['activated', 'installed'])
+    expect(audits.map((row) => row.action).sort()).toEqual([
+      'activated',
+      'activated',
+      'installed',
+      'installed',
+      'retired',
+      'retirement_started',
+    ])
   })
 })

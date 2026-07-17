@@ -128,6 +128,43 @@ evidence, and the external signer private key must never enter Forge.
     separately signed, unexpired transition authorization. Use
     `prepare-authorization` and `record-authorization` for that later handoff.
 
+## Rotate the external signer
+
+Forge stores public keys only. Generate the next Ed25519 key outside Forge and
+retain its private key only in the external signer. Install generation 2 with
+`install-signer` and a new key ID, public key, ruleset fingerprint, and reviewed
+validity window. Installation succeeds only for the exact next generation while
+one signer is active and no other signer is staged.
+
+Activate it with an explicit compare-and-set against the active key:
+
+```bash
+npm run protocol:epic-172-release -- rotate-signer \
+  --key-id 00000000-0000-4000-8000-000000000002 \
+  --expected-active-key-id 00000000-0000-4000-8000-000000000001 \
+  --expected-active-generation 1 \
+  --actor release-operator \
+  --reason 'Rotate to reviewed signer generation 2'
+```
+
+The database records one cutoff time, moves generation 1 to `retiring`, and
+activates generation 2 in the same transaction. Generation 1 receipts already
+retained before that cutoff still verify, but generation 1 cannot record new
+evidence or authorizations after the rotation commits. After checking retained
+receipt verification, finish the lifecycle transition with the exact generation:
+
+```bash
+npm run protocol:epic-172-release -- retire-signer \
+  --key-id 00000000-0000-4000-8000-000000000001 \
+  --generation 1 \
+  --actor release-operator \
+  --reason 'Retained generation 1 receipts verified under generation 2'
+```
+
+If either compare-and-set loses a race, inspect the signer lifecycle audits and
+start again from the current active generation. Do not retry with guessed IDs or
+edit signer rows directly.
+
 ## Failure and rollback
 
 - If role bootstrap or migration fails, keep every Forge process and project write

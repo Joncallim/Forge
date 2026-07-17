@@ -7,6 +7,7 @@ import {
   installEpic172ReleaseSigner,
   recordEpic172ReleaseEvidence,
   recordEpic172TransitionAuthorization,
+  retireEpic172ReleaseSigner,
 } from '../lib/mcps/epic-172-release-recorder'
 import {
   epic172EnvelopeDigest,
@@ -78,6 +79,8 @@ type Command =
   | 'prepare-evidence'
   | 'record-authorization'
   | 'record-evidence'
+  | 'retire-signer'
+  | 'rotate-signer'
 
 export type Epic172ReleaseCli = Readonly<{
   command: Command
@@ -108,6 +111,8 @@ const commandOptions: Readonly<Record<Command, readonly string[]>> = {
   'prepare-evidence': ['input'],
   'record-authorization': ['input'],
   'record-evidence': ['input'],
+  'retire-signer': ['actor', 'generation', 'key-id', 'reason'],
+  'rotate-signer': ['actor', 'expected-active-generation', 'expected-active-key-id', 'key-id', 'reason'],
 }
 
 function usage(): string {
@@ -120,6 +125,9 @@ Commands:
   install-signer --key-id UUID --generation N --public-key FILE --github-app-id ID \\
     --ruleset-fingerprint SHA256 --valid-from ISO --valid-until ISO --actor ID --reason TEXT
   activate-signer --key-id UUID --actor ID --reason TEXT
+  rotate-signer --key-id UUID --expected-active-key-id UUID \
+    --expected-active-generation N --actor ID --reason TEXT
+  retire-signer --key-id UUID --generation N --actor ID --reason TEXT
   prepare-evidence --input ENVELOPE_JSON
   prepare-authorization --input ENVELOPE_JSON
   record-evidence --input SIGNED_JSON
@@ -271,8 +279,25 @@ async function inspectReleaseBridge(): Promise<boolean> {
         and trigger_row.tgname = 'forge_epic_172_projects_no_hard_delete'
         and not trigger_row.tgisinternal
     `
-    const roles = await sql<{ role: string; canLogin: boolean; inherits: boolean }[]>`
-      select rolname as role, rolcanlogin as "canLogin", rolinherit as inherits
+    const roles = await sql<{
+      role: string
+      canLogin: boolean
+      inherits: boolean
+      isSuperuser: boolean
+      canCreateDatabase: boolean
+      canCreateRole: boolean
+      canReplicate: boolean
+      bypassesRls: boolean
+    }[]>`
+      select
+        rolname as role,
+        rolcanlogin as "canLogin",
+        rolinherit as inherits,
+        rolsuper as "isSuperuser",
+        rolcreatedb as "canCreateDatabase",
+        rolcreaterole as "canCreateRole",
+        rolreplication as "canReplicate",
+        rolbypassrls as "bypassesRls"
       from pg_catalog.pg_roles
       where rolname = any(${sql.array([
         'forge_release_routines_owner',
@@ -280,6 +305,26 @@ async function inspectReleaseBridge(): Promise<boolean> {
         'forge_release_transition',
       ])}::text[])
       order by rolname
+    `
+    const principalMemberships = await sql<{ role: string; member: string; adminOption: boolean }[]>`
+      select
+        granted.rolname as role,
+        member.rolname as member,
+        membership.admin_option as "adminOption"
+      from pg_catalog.pg_auth_members membership
+      join pg_catalog.pg_roles granted on granted.oid = membership.roleid
+      join pg_catalog.pg_roles member on member.oid = membership.member
+      where granted.rolname = any(${sql.array([
+        'forge_release_routines_owner',
+        'forge_release_evidence_writer',
+        'forge_release_transition',
+      ])}::text[])
+         or member.rolname = any(${sql.array([
+        'forge_release_routines_owner',
+        'forge_release_evidence_writer',
+        'forge_release_transition',
+      ])}::text[])
+      order by granted.rolname, member.rolname
     `
     const [receipt] = await sql<{ count: number }[]>`
       select count(*)::int as count
@@ -294,10 +339,21 @@ async function inspectReleaseBridge(): Promise<boolean> {
     const missingOrUnsafeForeignKeys = EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS.filter((name) => (
       !['a', 'r'].includes(retentionMap.get(name.slice(0, 63)) ?? '')
     ))
-    const principalsReady = roleMap.get('forge_release_routines_owner')?.canLogin === false
-      && roleMap.get('forge_release_routines_owner')?.inherits === false
-      && ['forge_release_evidence_writer', 'forge_release_transition']
-        .every((role) => roleMap.get(role)?.canLogin === true && roleMap.get(role)?.inherits === false)
+    const leastPrivilege = (role: typeof roles[number] | undefined, canLogin: boolean): boolean => Boolean(
+      role
+      && role.canLogin === canLogin
+      && !role.inherits
+      && !role.isSuperuser
+      && !role.canCreateDatabase
+      && !role.canCreateRole
+      && !role.canReplicate
+      && !role.bypassesRls,
+    )
+    const principalsReady = roles.length === 3
+      && leastPrivilege(roleMap.get('forge_release_routines_owner'), false)
+      && leastPrivilege(roleMap.get('forge_release_evidence_writer'), true)
+      && leastPrivilege(roleMap.get('forge_release_transition'), true)
+      && principalMemberships.length === 0
     const ready = enablement?.state === 'disabled'
       && missingOrUnsafeForeignKeys.length === 0
       && trigger?.enabled === true
@@ -309,6 +365,7 @@ async function inspectReleaseBridge(): Promise<boolean> {
       missingOrUnsafeForeignKeys,
       projectHardDeleteGuard: trigger?.enabled === true,
       principals: roles,
+      principalMemberships,
       step0ReceiptCount: receipt?.count ?? 0,
     }, null, 2)}\n`)
     return ready
@@ -365,6 +422,29 @@ export async function runEpic172ReleaseCli(cli: Epic172ReleaseCli): Promise<numb
       reason: cli.options.reason,
     })
     process.stdout.write(`${JSON.stringify({ signerKeyId, status: 'active' })}\n`)
+    return 0
+  }
+  if (cli.command === 'rotate-signer') {
+    const signerKeyId = await activateEpic172ReleaseSigner({
+      databaseUrl,
+      signerKeyId: cli.options['key-id'],
+      expectedActiveSignerKeyId: cli.options['expected-active-key-id'],
+      expectedActiveGeneration: parsePositiveInteger(cli.options['expected-active-generation']),
+      actor: cli.options.actor,
+      reason: cli.options.reason,
+    })
+    process.stdout.write(`${JSON.stringify({ signerKeyId, status: 'active' })}\n`)
+    return 0
+  }
+  if (cli.command === 'retire-signer') {
+    const signerKeyId = await retireEpic172ReleaseSigner({
+      databaseUrl,
+      signerKeyId: cli.options['key-id'],
+      expectedGeneration: parsePositiveInteger(cli.options.generation),
+      actor: cli.options.actor,
+      reason: cli.options.reason,
+    })
+    process.stdout.write(`${JSON.stringify({ signerKeyId, status: 'retired' })}\n`)
     return 0
   }
   const signed = await readSignedEnvelope(cli.options.input)

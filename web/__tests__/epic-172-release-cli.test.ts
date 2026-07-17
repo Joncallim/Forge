@@ -25,6 +25,38 @@ describe('Epic 172 release CLI boundary', () => {
       command: 'prepare-authorization',
       options: { input: 'authorization.json' },
     })
+    expect(parseEpic172ReleaseCliArgs([
+      'rotate-signer',
+      '--key-id', '00000000-0000-4000-8000-000000000002',
+      '--expected-active-key-id', '00000000-0000-4000-8000-000000000001',
+      '--expected-active-generation', '1',
+      '--actor', 'release-operator',
+      '--reason', 'rotate',
+    ])).toEqual({
+      command: 'rotate-signer',
+      options: {
+        'key-id': '00000000-0000-4000-8000-000000000002',
+        'expected-active-key-id': '00000000-0000-4000-8000-000000000001',
+        'expected-active-generation': '1',
+        actor: 'release-operator',
+        reason: 'rotate',
+      },
+    })
+    expect(parseEpic172ReleaseCliArgs([
+      'retire-signer',
+      '--key-id', '00000000-0000-4000-8000-000000000001',
+      '--generation', '1',
+      '--actor', 'release-operator',
+      '--reason', 'retire',
+    ])).toEqual({
+      command: 'retire-signer',
+      options: {
+        'key-id': '00000000-0000-4000-8000-000000000001',
+        generation: '1',
+        actor: 'release-operator',
+        reason: 'retire',
+      },
+    })
     expect(() => parseEpic172ReleaseCliArgs([
       'record-evidence',
       '--input',

@@ -6,6 +6,7 @@ import { db } from '@/db'
 import { filesystemMcpGrantApprovals, projects, tasks, workPackages } from '@/db/schema'
 import { getSession } from '@/lib/session'
 import { getAccessibleTask } from '@/lib/task-access'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 import { getProjectMcpOverview } from '@/lib/mcps/manager'
 import {
   canonicalFilesystemProjectCapabilities,
@@ -272,6 +273,14 @@ export async function PUT(
         { error: 'Validation failed', details: parsed.error.flatten() },
         { status: 400 },
       )
+    }
+
+    const writesProjectGrant = parsed.data.grants.some((grant) => (
+      grant.decision === 'approved' && grant.grantMode === 'always_allow'
+    ))
+    if (writesProjectGrant) {
+      const ingressBlock = await guardEpic172ProjectManagementIngress()
+      if (ingressBlock) return ingressBlock
     }
 
     const requestedPackageIds = [...new Set(parsed.data.grants.map((grant) => grant.workPackageId))]
