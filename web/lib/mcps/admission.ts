@@ -17,6 +17,7 @@ import {
   type McpCapabilityClass,
   type McpDeliveryKind,
 } from './capability-normalization'
+import { parseProjectFilesystemDecisionAuthority } from './filesystem-project-authority'
 import type { ProjectMcpStatus } from './types'
 import type {
   McpAssignmentType,
@@ -384,7 +385,11 @@ function covers(covered: readonly string[], required: readonly string[]): boolea
 
 export function readEffectiveGrantState(
   pkg: { metadata: unknown },
-  project: { mcpConfig: unknown; rootBindingRevision?: unknown },
+  project: {
+    mcpConfig?: unknown
+    filesystemGrantDecision?: unknown
+    rootBindingRevision?: unknown
+  },
   requiredCapabilities: string[],
 ): EffectiveGrantState {
   const parsedRequired = boundedFilesystemCapabilities(requiredCapabilities, { allowEmpty: false })
@@ -404,23 +409,26 @@ export function readEffectiveGrantState(
   const currentRootRevision = canonicalRevision(
     project.rootBindingRevision ?? config.rootBindingRevision,
   )
-  const grants = ownRecord(config.grants) ?? {}
-  const projectGrant = ownRecord(grants.filesystem)
-  const projectRevocation = ownRecord(grants.filesystemRevocation)
-  const parsedProjectCapabilities = boundedFilesystemCapabilities(projectGrant?.capabilities, { allowEmpty: false })
-  const projectDecisionRevision = canonicalRevision(projectGrant?.grantDecisionRevision)
-  const projectRootRevision = canonicalRevision(projectGrant?.rootBindingRevision)
-  const validProjectGrant = projectGrant?.schemaVersion === 2 &&
-    projectGrant.mcpId === 'filesystem' &&
-    projectGrant.status === 'approved' &&
-    projectGrant.grantMode === 'always_allow' &&
+  const projectDecision = parseProjectFilesystemDecisionAuthority(project.filesystemGrantDecision)
+  const parsedProjectCapabilities = boundedFilesystemCapabilities(projectDecision?.capabilities, { allowEmpty: false })
+  const projectDecisionRevision = canonicalRevision(projectDecision?.grantDecisionRevision)
+  const projectRootRevision = canonicalRevision(projectDecision?.rootBindingRevision)
+  const validProjectGrant = projectDecision?.decision === 'approved' &&
     parsedProjectCapabilities.valid &&
     projectDecisionRevision !== null &&
     projectRootRevision !== null &&
     projectRootRevision === currentRootRevision
   const projectCovered = validProjectGrant ? parsedProjectCapabilities.capabilities : []
-  const revocationDecisionRevision = canonicalRevision(projectRevocation?.grantDecisionRevision)
-  const revocationRootRevision = canonicalRevision(projectRevocation?.rootBindingRevision)
+  const revocationDecisionRevision = projectDecision?.decision === 'revoked'
+    ? canonicalRevision(projectDecision.grantDecisionRevision)
+    : null
+  const revocationRootRevision = projectDecision?.decision === 'revoked'
+    ? canonicalRevision(projectDecision.rootBindingRevision)
+    : null
+  const validProjectRevocation = projectDecision?.decision === 'revoked' &&
+    revocationDecisionRevision !== null &&
+    revocationRootRevision !== null &&
+    revocationRootRevision === currentRootRevision
 
   const validEffective = effective?.schemaVersion === 2 &&
     effective.phase === 'effective' &&
@@ -434,7 +442,7 @@ export function readEffectiveGrantState(
     status: 'approved',
     grantMode: 'always_allow',
     coveredCapabilities: projectCovered,
-    grantApprovalId: text(projectGrant?.grantApprovalId) || undefined,
+    grantApprovalId: projectDecision?.decisionId,
     grantDecisionRevision: projectDecisionRevision ?? undefined,
     rootBindingRevision: projectRootRevision ?? undefined,
   })
@@ -455,9 +463,9 @@ export function readEffectiveGrantState(
         source: 'package-local',
         status: 'not_issued',
         coveredCapabilities: [],
-        grantApprovalId: text(effective.grantApprovalId) || undefined,
-        grantDecisionRevision: localDecisionRevision,
-        rootBindingRevision: localRootRevision,
+        grantApprovalId: validProjectRevocation ? projectDecision.decisionId : text(effective.grantApprovalId) || undefined,
+        grantDecisionRevision: validProjectRevocation ? revocationDecisionRevision! : localDecisionRevision,
+        rootBindingRevision: validProjectRevocation ? revocationRootRevision! : localRootRevision,
         revocationReason: 'project_root_repoint',
       }
     }
@@ -487,16 +495,16 @@ export function readEffectiveGrantState(
         source: 'project-level',
         status: 'not_issued',
         coveredCapabilities: [],
-        grantApprovalId: text(effective.grantApprovalId) || undefined,
-        grantDecisionRevision: historicalRevision ?? undefined,
-        rootBindingRevision: historicalRootRevision,
+        grantApprovalId: validProjectRevocation ? projectDecision.decisionId : text(effective.grantApprovalId) || undefined,
+        grantDecisionRevision: validProjectRevocation ? revocationDecisionRevision! : historicalRevision ?? undefined,
+        rootBindingRevision: validProjectRevocation ? revocationRootRevision! : historicalRootRevision,
         revocationReason: 'project_root_repoint',
       }
     }
     if (!validProjectGrant || !covers(projectCovered, required)) {
-      const removalReason = projectRevocation?.revocationReason === 'project_root_repoint'
+      const removalReason = projectDecision?.revocationReason === 'project_root_repoint'
         ? 'project_root_repoint'
-        : projectGrant ? 'project_grant_narrowed' : 'project_grant_removed'
+        : validProjectGrant ? 'project_grant_narrowed' : 'project_grant_removed'
       const effectiveRevision = removalReason === 'project_grant_narrowed'
         ? projectDecisionRevision ?? historicalRevision
         : revocationDecisionRevision ?? historicalRevision ?? projectDecisionRevision
@@ -534,9 +542,9 @@ export function readEffectiveGrantState(
         source: 'package-local',
         status: 'not_issued',
         coveredCapabilities: [],
-        grantApprovalId: text(effective.grantApprovalId) || undefined,
-        grantDecisionRevision: localDecisionRevision,
-        rootBindingRevision: localRootRevision,
+        grantApprovalId: validProjectRevocation ? projectDecision.decisionId : text(effective.grantApprovalId) || undefined,
+        grantDecisionRevision: validProjectRevocation ? revocationDecisionRevision! : localDecisionRevision,
+        rootBindingRevision: validProjectRevocation ? revocationRootRevision! : localRootRevision,
         revocationReason: 'project_root_repoint',
       }
     }
@@ -574,9 +582,9 @@ export function readEffectiveGrantState(
         source: 'package-local',
         status: 'not_issued',
         coveredCapabilities: [],
-        grantApprovalId: text(effective.grantApprovalId) || undefined,
-        grantDecisionRevision: localDecisionRevision,
-        rootBindingRevision: localRootRevision,
+        grantApprovalId: validProjectRevocation ? projectDecision.decisionId : text(effective.grantApprovalId) || undefined,
+        grantDecisionRevision: validProjectRevocation ? revocationDecisionRevision! : localDecisionRevision,
+        rootBindingRevision: validProjectRevocation ? revocationRootRevision! : localRootRevision,
         revocationReason: 'project_root_repoint',
       }
     }
@@ -600,6 +608,31 @@ export function readEffectiveGrantState(
 
   if (validProjectGrant && covers(projectCovered, required)) {
     return projectResult()
+  }
+
+  if (validProjectRevocation) {
+    return {
+      phase: 'revoked',
+      source: 'project-level',
+      status: 'not_issued',
+      coveredCapabilities: [],
+      grantApprovalId: projectDecision.decisionId,
+      grantDecisionRevision: revocationDecisionRevision!,
+      rootBindingRevision: revocationRootRevision!,
+      revocationReason: projectDecision.revocationReason!,
+    }
+  }
+  if (validProjectGrant && projectDecision.revocationReason === 'project_grant_narrowed') {
+    return {
+      phase: 'revoked',
+      source: 'project-level',
+      status: 'not_issued',
+      coveredCapabilities: projectCovered,
+      grantApprovalId: projectDecision.decisionId,
+      grantDecisionRevision: projectDecisionRevision!,
+      rootBindingRevision: projectRootRevision!,
+      revocationReason: 'project_grant_narrowed',
+    }
   }
 
   // Exact bounded v1 adapter. A legacy denial remains a denial, but missing

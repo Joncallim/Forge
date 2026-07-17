@@ -15,6 +15,7 @@ import {
   projectFilesystemEffectivePhase,
   projectFilesystemGrantCovers,
 } from '../lib/mcps/filesystem-grants'
+import { loadCurrentProjectFilesystemDecision } from '../lib/mcps/filesystem-grant-reconciliation'
 import { canonicalAgentPackageIdentity } from '../lib/mcps/agent-package-identity'
 import type { PreparedArchitectArtifact } from './architect-artifact'
 import type { ReviewRequirement } from './agent-breakdown'
@@ -51,6 +52,7 @@ type BuildOptions = {
   activeAgents?: MaterializerAgentCatalogRow[]
   idFactory?: () => string
   projectMcpConfig?: unknown
+  projectFilesystemDecision?: unknown
   projectRootBindingRevision?: unknown
 }
 
@@ -436,6 +438,7 @@ export function buildWorkforceMaterializationRows(
       mcpConfig: options.projectMcpConfig,
       mcpRequirements,
       metadata: packageMetadata,
+      projectFilesystemDecision: options.projectFilesystemDecision,
       projectRootBindingRevision: options.projectRootBindingRevision,
     })
     if (projectGrant) {
@@ -522,6 +525,7 @@ export async function materializeWorkforceFromArchitectArtifact(
       .where(eq(agentConfigs.isActive, true)),
     db
       .select({
+        id: projects.id,
         mcpConfig: projects.mcpConfig,
         rootBindingRevision: projects.rootBindingRevision,
       })
@@ -531,9 +535,13 @@ export async function materializeWorkforceFromArchitectArtifact(
       .limit(1)
       .then((rows) => rows[0] ?? null),
   ])
+  const projectFilesystemDecision = taskProject
+    ? await loadCurrentProjectFilesystemDecision(taskProject.id)
+    : null
   const rows = buildWorkforceMaterializationRows(input, {
     activeAgents,
     projectMcpConfig: taskProject?.mcpConfig,
+    projectFilesystemDecision,
     projectRootBindingRevision: taskProject?.rootBindingRevision,
   })
   if (rows.workPackages.length === 0) {

@@ -127,6 +127,7 @@ vi.mock('@/lib/github', () => ({
 }))
 
 const mockGetProjectMcpOverview = vi.fn()
+const mockLoadCurrentProjectFilesystemDecision = vi.fn().mockResolvedValue(null)
 vi.mock('@/lib/mcps/manager', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/mcps/manager')>()
   return {
@@ -136,6 +137,11 @@ vi.mock('@/lib/mcps/manager', async (importOriginal) => {
     ),
   }
 })
+
+vi.mock('@/lib/mcps/filesystem-grant-reconciliation', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/filesystem-grant-reconciliation')>(),
+  loadCurrentProjectFilesystemDecision: mockLoadCurrentProjectFilesystemDecision,
+}))
 
 // ---------------------------------------------------------------------------
 // Drizzle chain factory
@@ -3781,6 +3787,21 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     }
     const fixedOverview = {
       projectId: 'project-1', rootBindingRevision: '1', config: projectRow.mcpConfig, catalog: [], mcpsRoot: '/tmp/mcps',
+      filesystemGrantDecision: {
+        schemaVersion: 2 as const,
+        decisionId: 'grant-approval-1',
+        projectId: 'project-1',
+        decision: 'approved' as const,
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        grantDecisionRevision: '1',
+        rootBindingRevision: '1',
+        decisionFingerprint: `sha256:${'1'.repeat(64)}`,
+        decisionGeneration: '1',
+        decidedAt: '2026-07-05T00:00:00.000Z',
+        decidedBy: FAKE_SESSION.userId,
+        reason: 'Trusted project.',
+        revocationReason: null,
+      },
       statuses: [{
         mcpId: 'filesystem', displayName: 'Filesystem', description: '', installPath: '/tmp/mcps/filesystem',
         installState: 'installed' as const, status: 'healthy' as const, enabled: true, error: null,
@@ -3794,6 +3815,9 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       decisions: [expect.objectContaining({ mode: 'bounded_context_approved', admissionStatus: 'allowed' })],
     })
     mockGetProjectMcpOverview.mockResolvedValueOnce(fixedOverview)
+    mockLoadCurrentProjectFilesystemDecision
+      .mockResolvedValueOnce(fixedOverview.filesystemGrantDecision)
+      .mockResolvedValueOnce(fixedOverview.filesystemGrantDecision)
     mockDbSelect
       .mockReturnValueOnce(chain([awaitingTask]))
       .mockReturnValueOnce(chain([projectRow]))
@@ -3865,6 +3889,7 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       mcpRequirements: approvedPackage.mcpRequirements,
       metadata: approvedPackage.metadata,
       projectMcpConfig: projectRow.mcpConfig,
+      projectFilesystemDecision: fixedOverview.filesystemGrantDecision,
       projectRootBindingRevision: projectRow.rootBindingRevision,
       title: approvedPackage.title,
     })
@@ -3883,6 +3908,7 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     if (updateFallback) mockDbUpdate.mockImplementation(updateFallback)
     mockGetProjectMcpOverview.mockReset()
     mockGetProjectMcpOverview.mockResolvedValueOnce(fixedOverview)
+    mockLoadCurrentProjectFilesystemDecision.mockResolvedValueOnce(fixedOverview.filesystemGrantDecision)
     mockDbSelect
       .mockReturnValueOnce(chain([approvedPackage]))
       .mockReturnValueOnce(chain([]))
@@ -5295,11 +5321,25 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       createdAt: new Date(),
       updatedAt: new Date(),
     }))
+    const projectPointer = {
+      projectId: String((lockedProject as Record<string, unknown>).id),
+      currentDecisionId: null,
+      currentDecisionProjectId: null,
+      currentDecisionRevision: null,
+      currentRootBindingRevision: null,
+      currentDecisionFingerprint: null,
+      currentDecisionGeneration: null,
+      pointerGeneration: BigInt(0),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }
     const transactionSelect = vi.fn()
       .mockReturnValueOnce(chain([lockedProject]))
       .mockReturnValueOnce(chain([input.task]))
       .mockReturnValueOnce(chain(input.packages))
       .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([projectPointer]))
       .mockReturnValueOnce(chain(pointerRows))
       .mockImplementation(() => mockDbSelect())
     const projectUpdate = chain([])
@@ -5322,17 +5362,29 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     const transactionUpdate = vi.fn((table: Parameters<typeof getTableName>[0]) => {
       const tableName = getTableName(table)
       if (tableName === 'projects') return projectUpdate
+      if (tableName === 'project_filesystem_current_decision_pointers') return dynamicUpdate(projectPointer)
       const configured = mockDbUpdate(table)
       if (configured) return configured
       if (tableName === 'work_packages') return dynamicUpdate(input.packages[0] ?? {})
       if (tableName === 'tasks') return dynamicUpdate(input.task)
       return dynamicUpdate({})
     })
+    const transactionInsert = vi.fn((table: Parameters<typeof getTableName>[0]) => {
+      if (getTableName(table) !== 'project_filesystem_grant_decisions') return mockDbInsert(table)
+      const insert = chain([])
+      let values: Record<string, unknown> = {}
+      insert.values = vi.fn((next: Record<string, unknown>) => {
+        values = next
+        return insert
+      })
+      insert.returning = vi.fn(() => chain([values]))
+      return insert
+    })
     mockDbSelect.mockImplementation(() => chain([]))
     mockDbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) =>
       callback({
         select: transactionSelect,
-        insert: mockDbInsert,
+        insert: transactionInsert,
         update: transactionUpdate,
         delete: mockDbDelete,
       }),
@@ -5521,7 +5573,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
           grants: expect.objectContaining({
             filesystem: expect.objectContaining({
               capabilities: ['filesystem.project.read', 'filesystem.project.search'],
-              grantApprovalId: FS_GRANT_APPROVAL_ID,
+              grantApprovalId: expect.any(String),
               grantMode: 'always_allow',
               status: 'approved',
             }),

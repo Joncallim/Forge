@@ -16,6 +16,8 @@ import {
   summarizeFilesystemCapabilities,
 } from '../lib/mcps/filesystem-grants'
 import { readEffectiveGrantState } from '../lib/mcps/admission'
+import { loadCurrentProjectFilesystemDecision } from '../lib/mcps/filesystem-grant-reconciliation'
+import type { ProjectFilesystemDecisionAuthority } from '../lib/mcps/filesystem-project-authority'
 import {
   buildEmptyExecutionContextPacket,
   buildExecutionContextPacket,
@@ -84,6 +86,7 @@ export type WorkPackageExecutionContext = {
   providerConnector?: string
   providerConfigId?: string | null
   project: ProjectRow
+  projectFilesystemDecision?: ProjectFilesystemDecisionAuthority | null
   priorReviewContext?: WorkPackagePriorReviewContext
   task: TaskRow
   workPackage: WorkPackageRow
@@ -1189,6 +1192,7 @@ function metadataRecord(value: unknown, key: string): Record<string, unknown> {
 function effectiveFilesystemGrant(
   workPackage: WorkPackageRow,
   projectMcpConfig: unknown = null,
+  projectFilesystemDecision: unknown = null,
   projectRootBindingRevision: unknown = null,
 ): {
   capabilities: string[]
@@ -1216,6 +1220,7 @@ function effectiveFilesystemGrant(
     mcpRequirements: workPackage.mcpRequirements,
     metadata: workPackage.metadata,
     projectMcpConfig,
+    projectFilesystemDecision,
     projectRootBindingRevision,
   })
   const requiredCapabilities = summary.blockingCapabilities.length > 0
@@ -1225,6 +1230,7 @@ function effectiveFilesystemGrant(
     { metadata: workPackage.metadata },
     {
       mcpConfig: projectMcpConfig,
+      filesystemGrantDecision: projectFilesystemDecision,
       rootBindingRevision: projectRootBindingRevision,
     },
     requiredCapabilities,
@@ -1273,6 +1279,7 @@ function effectiveFilesystemGrant(
       mcpConfig: projectMcpConfig,
       mcpRequirements: workPackage.mcpRequirements,
       metadata: workPackage.metadata,
+      projectFilesystemDecision,
       projectRootBindingRevision,
     })
   ) {
@@ -1290,11 +1297,13 @@ function effectiveFilesystemGrant(
 function filesystemRuntimeMetadata(
   workPackage: WorkPackageRow,
   projectMcpConfig: unknown,
+  projectFilesystemDecision: unknown,
   projectRootBindingRevision: unknown,
 ): Record<string, unknown> {
   const effectiveGrant = effectiveFilesystemGrant(
     workPackage,
     projectMcpConfig,
+    projectFilesystemDecision,
     projectRootBindingRevision,
   )
   const capabilities = effectiveGrant.capabilities
@@ -1828,6 +1837,7 @@ export async function loadWorkPackageExecutionContext(
   }
 
   const validatedProjectRoot = await assertProjectLocalPathForExecution(row.project)
+  const projectFilesystemDecision = await loadCurrentProjectFilesystemDecision(row.project.id)
 
   return {
     agentConfig: agentConfig ?? null,
@@ -1836,6 +1846,7 @@ export async function loadWorkPackageExecutionContext(
     providerConnector: `${provider.config.displayName} (${provider.config.providerType})`,
     providerConfigId,
     project: row.project,
+    projectFilesystemDecision,
     task: row.task,
     workPackage: row.workPackage,
   }
@@ -1851,6 +1862,7 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
   const filesystemRuntime = filesystemRuntimeMetadata(
     context.workPackage,
     context.project.mcpConfig,
+    context.projectFilesystemDecision,
     context.project.rootBindingRevision,
   )
   if (filesystemRuntime.status === 'blocked') {

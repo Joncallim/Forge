@@ -131,6 +131,21 @@ describe('requiresFilesystemGrantApproval', () => {
           },
         },
       },
+      projectFilesystemDecision: {
+        schemaVersion: 2,
+        decisionId: 'grant-approval-1',
+        projectId: 'project-1',
+        decision: 'approved',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        grantDecisionRevision: '1',
+        rootBindingRevision: '1',
+        decisionFingerprint: `sha256:${'1'.repeat(64)}`,
+        decisionGeneration: '1',
+        decidedAt: '2099-07-13T09:00:00.000Z',
+        decidedBy: 'user-1',
+        reason: 'Project grant approved.',
+        revocationReason: null,
+      },
       projectRootBindingRevision: '1',
     })
 

@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   completeTaskIfReviewGatesSatisfied: vi.fn(),
   executeWorkPackage: vi.fn(),
   loadWorkPackageExecutionContext: vi.fn(),
+  loadCurrentProjectFilesystemDecision: vi.fn().mockResolvedValue(null),
   publishTaskEvent: vi.fn(),
   WorkPackageExecutionError: class WorkPackageExecutionError extends Error {
     failureDetails: unknown
@@ -65,6 +66,11 @@ vi.mock('@/worker/work-package-executor', () => ({
   WorkPackageExecutionError: mocks.WorkPackageExecutionError,
   isArchitectReservedExecutionRole: (role: string) =>
     ['architect', 'security', 'security-review', 'security_review'].includes(role.trim().toLowerCase()),
+}))
+
+vi.mock('@/lib/mcps/filesystem-grant-reconciliation', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/filesystem-grant-reconciliation')>(),
+  loadCurrentProjectFilesystemDecision: mocks.loadCurrentProjectFilesystemDecision,
 }))
 
 function fixtureSecret(...parts: string[]) {
@@ -362,6 +368,8 @@ describe('handoffApprovedWorkPackages', () => {
     mocks.dbUpdate.mockReset()
     mocks.executeWorkPackage.mockReset()
     mocks.loadWorkPackageExecutionContext.mockReset()
+    mocks.loadCurrentProjectFilesystemDecision.mockReset()
+    mocks.loadCurrentProjectFilesystemDecision.mockResolvedValue(null)
     mocks.getProjectMcpOverview.mockResolvedValue({
       projectId: 'project-1',
       config: { profile: 'default', requiredMcps: [], overrides: {} },
@@ -785,6 +793,21 @@ describe('handoffApprovedWorkPackages', () => {
         grants: { filesystem: projectGrant },
       },
     }
+    mocks.loadCurrentProjectFilesystemDecision.mockResolvedValue({
+      schemaVersion: 2,
+      decisionId: projectGrant.grantApprovalId,
+      projectId: project.id,
+      decision: 'approved',
+      capabilities: projectGrant.capabilities,
+      grantDecisionRevision: projectGrant.grantDecisionRevision,
+      rootBindingRevision: projectGrant.rootBindingRevision,
+      decisionFingerprint: `sha256:${'1'.repeat(64)}`,
+      decisionGeneration: '1',
+      decidedAt: projectGrant.approvedAt,
+      decidedBy: projectGrant.approvedBy,
+      reason: projectGrant.reason,
+      revocationReason: null,
+    })
     const pkg = {
       id: 'pkg-fs-project',
       assignedRole: 'backend',

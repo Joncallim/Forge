@@ -873,6 +873,81 @@ export type FilesystemMcpCurrentDecisionPointer = InferSelectModel<typeof filesy
 export type NewFilesystemMcpCurrentDecisionPointer = InferInsertModel<typeof filesystemMcpCurrentDecisionPointers>
 
 // ---------------------------------------------------------------------------
+// projectFilesystemGrantDecisions / projectFilesystemCurrentDecisionPointers
+// ---------------------------------------------------------------------------
+// Project always-allow authority is not stored in projects.mcp_config. Every
+// decision is immutable; exactly one preallocated project-owned pointer names
+// the current retained decision through an exact compare-and-set boundary.
+export const projectFilesystemGrantDecisions = pgTable(
+  'project_filesystem_grant_decisions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'restrict' }),
+    decision: text('decision').notNull(),
+    capabilities: jsonb('capabilities').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' }).notNull(),
+    rootBindingRevision: bigint('root_binding_revision', { mode: 'bigint' }).notNull(),
+    decisionFingerprint: text('decision_fingerprint').notNull(),
+    decisionGeneration: bigint('decision_generation', { mode: 'bigint' }).notNull(),
+    priorDecisionId: uuid('prior_decision_id'),
+    priorDecisionRevision: bigint('prior_decision_revision', { mode: 'bigint' }),
+    priorRootBindingRevision: bigint('prior_root_binding_revision', { mode: 'bigint' }),
+    priorDecisionFingerprint: text('prior_decision_fingerprint'),
+    priorDecisionGeneration: bigint('prior_decision_generation', { mode: 'bigint' }),
+    revocationReason: text('revocation_reason'),
+    reason: text('reason').notNull().default(''),
+    decidedBy: uuid('decided_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    decidedAt: timestamp('decided_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('project_filesystem_grant_decisions_project_revision_idx')
+      .on(t.projectId, t.grantDecisionRevision),
+    uniqueIndex('project_filesystem_grant_decisions_project_generation_idx')
+      .on(t.projectId, t.decisionGeneration),
+    uniqueIndex('project_filesystem_grant_decisions_parent_tuple_idx')
+      .on(
+        t.id,
+        t.projectId,
+        t.grantDecisionRevision,
+        t.rootBindingRevision,
+        t.decisionFingerprint,
+        t.decisionGeneration,
+      ),
+  ],
+)
+
+export type ProjectFilesystemGrantDecision = InferSelectModel<typeof projectFilesystemGrantDecisions>
+export type NewProjectFilesystemGrantDecision = InferInsertModel<typeof projectFilesystemGrantDecisions>
+
+export const projectFilesystemCurrentDecisionPointers = pgTable(
+  'project_filesystem_current_decision_pointers',
+  {
+    projectId: uuid('project_id')
+      .primaryKey()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    currentDecisionId: uuid('current_decision_id'),
+    currentDecisionProjectId: uuid('current_decision_project_id'),
+    currentDecisionRevision: bigint('current_decision_revision', { mode: 'bigint' }),
+    currentRootBindingRevision: bigint('current_root_binding_revision', { mode: 'bigint' }),
+    currentDecisionFingerprint: text('current_decision_fingerprint'),
+    currentDecisionGeneration: bigint('current_decision_generation', { mode: 'bigint' }),
+    pointerGeneration: bigint('pointer_generation', { mode: 'bigint' }).notNull().default(BigInt(0)),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('project_filesystem_current_decision_pointers_decision_idx').on(t.currentDecisionId),
+  ],
+)
+
+export type ProjectFilesystemCurrentDecisionPointer = InferSelectModel<typeof projectFilesystemCurrentDecisionPointers>
+export type NewProjectFilesystemCurrentDecisionPointer = InferInsertModel<typeof projectFilesystemCurrentDecisionPointers>
+
+// ---------------------------------------------------------------------------
 // workPackageDependencies
 // ---------------------------------------------------------------------------
 export const workPackageDependencies = pgTable(

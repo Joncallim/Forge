@@ -1,6 +1,6 @@
 -- Epic 172 / issue 178 (S3): monotonic filesystem decisions, immutable
 -- decision history, a preallocated current-authority pointer, and the strict
--- nonterminal operator-hold marker. Step 0 owns migrations 0023 and 0024.
+-- nonterminal operator-hold marker. Step 0 owns migrations 0023 through 0025.
 
 ALTER TABLE "projects"
   ADD COLUMN "grant_decision_revision" bigint DEFAULT 0 NOT NULL,
@@ -27,9 +27,7 @@ ALTER TABLE "filesystem_mcp_grant_approvals"
     CHECK ("grant_nonce" IS NULL OR "decision" = 'approved'),
   ADD CONSTRAINT "filesystem_mcp_grant_approvals_scope_check"
     CHECK (
-      ("decision_scope" = 'package' AND "task_id" IS NOT NULL AND "work_package_id" IS NOT NULL)
-      OR
-      ("decision_scope" = 'project' AND "task_id" IS NULL AND "work_package_id" IS NULL)
+      "decision_scope" = 'package' AND "task_id" IS NOT NULL AND "work_package_id" IS NOT NULL
     );
 
 UPDATE "filesystem_mcp_grant_approvals" approval
@@ -146,6 +144,164 @@ $$;
 CREATE TRIGGER "filesystem_mcp_grant_approvals_append_only"
 BEFORE UPDATE OR DELETE ON "filesystem_mcp_grant_approvals"
 FOR EACH ROW EXECUTE FUNCTION "forge_reject_filesystem_grant_history_mutation"();
+
+CREATE FUNCTION "forge_is_canonical_filesystem_capability_set"(value jsonb)
+RETURNS boolean LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT jsonb_typeof(value) = 'array'
+    AND NOT EXISTS (
+      SELECT 1 FROM jsonb_array_elements(value) AS item
+      WHERE jsonb_typeof(item) <> 'string'
+         OR item #>> '{}' NOT IN (
+           'filesystem.project.list',
+           'filesystem.project.read',
+           'filesystem.project.search'
+         )
+    )
+    AND value = COALESCE((
+      SELECT jsonb_agg(capability ORDER BY capability)
+      FROM (
+        SELECT DISTINCT item #>> '{}' AS capability
+        FROM jsonb_array_elements(value) AS item
+      ) canonical
+    ), '[]'::jsonb)
+$$;
+
+CREATE TABLE "project_filesystem_grant_decisions" (
+  "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+  "project_id" uuid NOT NULL,
+  "decision" text NOT NULL,
+  "capabilities" jsonb DEFAULT '[]'::jsonb NOT NULL,
+  "grant_decision_revision" bigint NOT NULL,
+  "root_binding_revision" bigint NOT NULL,
+  "decision_fingerprint" text NOT NULL,
+  "decision_generation" bigint NOT NULL,
+  "prior_decision_id" uuid,
+  "prior_decision_revision" bigint,
+  "prior_root_binding_revision" bigint,
+  "prior_decision_fingerprint" text,
+  "prior_decision_generation" bigint,
+  "revocation_reason" text,
+  "reason" text DEFAULT '' NOT NULL,
+  "decided_by" uuid NOT NULL,
+  "decided_at" timestamp with time zone DEFAULT now() NOT NULL,
+  CONSTRAINT "project_filesystem_grant_decisions_project_fk"
+    FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON DELETE restrict,
+  CONSTRAINT "project_filesystem_grant_decisions_actor_fk"
+    FOREIGN KEY ("decided_by") REFERENCES "users"("id") ON DELETE restrict,
+  CONSTRAINT "project_filesystem_grant_decisions_revision_check"
+    CHECK ("grant_decision_revision" > 0 AND "root_binding_revision" > 0 AND "decision_generation" > 0),
+  CONSTRAINT "project_filesystem_grant_decisions_fingerprint_check"
+    CHECK ("decision_fingerprint" ~ '^sha256:[0-9a-f]{64}$'),
+  CONSTRAINT "project_filesystem_grant_decisions_capabilities_check"
+    CHECK (forge_is_canonical_filesystem_capability_set("capabilities")),
+  CONSTRAINT "project_filesystem_grant_decisions_prior_tuple_check"
+    CHECK (
+      (
+        "prior_decision_id" IS NULL AND "prior_decision_revision" IS NULL
+        AND "prior_root_binding_revision" IS NULL AND "prior_decision_fingerprint" IS NULL
+        AND "prior_decision_generation" IS NULL AND "decision_generation" = 1
+      ) OR (
+        "prior_decision_id" IS NOT NULL AND "prior_decision_revision" > 0
+        AND "prior_root_binding_revision" > 0
+        AND "prior_decision_fingerprint" ~ '^sha256:[0-9a-f]{64}$'
+        AND "prior_decision_generation" > 0
+        AND "decision_generation" = "prior_decision_generation" + 1
+      )
+    ),
+  CONSTRAINT "project_filesystem_grant_decisions_state_check"
+    CHECK (
+      (
+        "decision" = 'approved'
+        AND "capabilities" ? 'filesystem.project.read'
+        AND ("revocation_reason" IS NULL OR "revocation_reason" = 'project_grant_narrowed')
+      ) OR (
+        "decision" = 'revoked'
+        AND "capabilities" = '[]'::jsonb
+        AND "revocation_reason" IN ('project_grant_removed', 'project_root_repoint')
+      )
+    )
+);
+
+CREATE UNIQUE INDEX "project_filesystem_grant_decisions_project_revision_idx"
+  ON "project_filesystem_grant_decisions" ("project_id", "grant_decision_revision");
+CREATE UNIQUE INDEX "project_filesystem_grant_decisions_project_generation_idx"
+  ON "project_filesystem_grant_decisions" ("project_id", "decision_generation");
+CREATE UNIQUE INDEX "project_filesystem_grant_decisions_parent_tuple_idx"
+  ON "project_filesystem_grant_decisions" (
+    "id", "project_id", "grant_decision_revision", "root_binding_revision",
+    "decision_fingerprint", "decision_generation"
+  );
+
+CREATE TABLE "project_filesystem_current_decision_pointers" (
+  "project_id" uuid PRIMARY KEY NOT NULL,
+  "current_decision_id" uuid,
+  "current_decision_project_id" uuid,
+  "current_decision_revision" bigint,
+  "current_root_binding_revision" bigint,
+  "current_decision_fingerprint" text,
+  "current_decision_generation" bigint,
+  "pointer_generation" bigint DEFAULT 0 NOT NULL,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+  "updated_at" timestamp with time zone DEFAULT now() NOT NULL,
+  CONSTRAINT "project_filesystem_current_decision_pointers_project_fk"
+    FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON DELETE cascade,
+  CONSTRAINT "project_filesystem_current_decision_pointers_parent_fk"
+    FOREIGN KEY (
+      "current_decision_id", "current_decision_project_id", "current_decision_revision",
+      "current_root_binding_revision", "current_decision_fingerprint", "current_decision_generation"
+    ) REFERENCES "project_filesystem_grant_decisions" (
+      "id", "project_id", "grant_decision_revision", "root_binding_revision",
+      "decision_fingerprint", "decision_generation"
+    ) MATCH FULL ON UPDATE restrict ON DELETE restrict,
+  CONSTRAINT "project_filesystem_current_decision_pointers_tuple_check"
+    CHECK (
+      (
+        "current_decision_id" IS NULL AND "current_decision_revision" IS NULL
+        AND "current_decision_project_id" IS NULL
+        AND "current_root_binding_revision" IS NULL AND "current_decision_fingerprint" IS NULL
+        AND "current_decision_generation" IS NULL
+        AND "pointer_generation" = 0
+      ) OR (
+        "current_decision_id" IS NOT NULL AND "current_decision_revision" > 0
+        AND "current_decision_project_id" = "project_id"
+        AND "current_root_binding_revision" > 0
+        AND "current_decision_fingerprint" ~ '^sha256:[0-9a-f]{64}$'
+        AND "current_decision_generation" > 0
+        AND "pointer_generation" = "current_decision_generation"
+      )
+    )
+);
+
+CREATE UNIQUE INDEX "project_filesystem_current_decision_pointers_decision_idx"
+  ON "project_filesystem_current_decision_pointers" ("current_decision_id")
+  WHERE "current_decision_id" IS NOT NULL;
+
+INSERT INTO "project_filesystem_current_decision_pointers" ("project_id")
+SELECT "id" FROM "projects";
+
+CREATE FUNCTION "forge_preallocate_project_filesystem_decision_pointer"()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO "project_filesystem_current_decision_pointers" ("project_id") VALUES (NEW."id");
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER "projects_preallocate_filesystem_decision_pointer"
+AFTER INSERT ON "projects"
+FOR EACH ROW EXECUTE FUNCTION "forge_preallocate_project_filesystem_decision_pointer"();
+
+CREATE FUNCTION "forge_reject_project_filesystem_decision_mutation"()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'project filesystem grant decision history is append-only'
+    USING ERRCODE = '55000';
+END;
+$$;
+
+CREATE TRIGGER "project_filesystem_grant_decisions_append_only"
+BEFORE UPDATE OR DELETE ON "project_filesystem_grant_decisions"
+FOR EACH ROW EXECUTE FUNCTION "forge_reject_project_filesystem_decision_mutation"();
 
 -- SQL mirrors the closed TypeScript hold-state union. Version-1 markers remain
 -- readable during the bounded migration window; every version-2 writer is

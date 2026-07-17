@@ -7,9 +7,12 @@ import { projects } from '../db/schema'
 import {
   convergeRecognizedOperatorHoldTask,
   filesystemMcpConfigAfterRootRepoint,
+  loadCurrentProjectFilesystemDecision,
+  mutateProjectFilesystemGrant,
   mutateTaskFilesystemGrants,
   reconcileFilesystemGrantsForProject,
 } from '../lib/mcps/filesystem-grant-reconciliation'
+import { requiresFilesystemGrantApproval } from '../lib/mcps/filesystem-grants'
 
 const RUN = process.env.RUN_FORGE_POSTGRES_TESTS === '1'
 test.skip(!RUN, 'Set RUN_FORGE_POSTGRES_TESTS=1 against a migrated disposable PostgreSQL database.')
@@ -217,7 +220,417 @@ test('mcp-admission.grant-reconciliation: operator hold preserves a running task
   }
 })
 
-test('root repoint revokes old-root authority without allocating a grant decision', async () => {
+test('simultaneous disjoint task always-allow decisions serialize and preserve their capability union', async () => {
+  const fixture = await seed()
+  const sql = sqlClient()
+  const requirement = (capabilities: string[]) => [{
+    mcpId: 'filesystem',
+    agent: 'backend',
+    requirement: 'required',
+    capabilities,
+    fallback: { action: 'block', message: '' },
+  }]
+  try {
+    await sql`
+      update projects
+      set mcp_config = ${sql.json({ profile: 'strict', unrelated: { keep: true } })}
+      where id = ${fixture.projectId}
+    `
+    await sql`
+      update work_packages
+      set mcp_requirements = case id
+        when ${fixture.lowerPackageId} then ${sql.json(requirement(['filesystem.project.read', 'filesystem.project.list']))}
+        else ${sql.json(requirement(['filesystem.project.read', 'filesystem.project.search']))}
+      end
+      where id in (${fixture.lowerPackageId}, ${fixture.targetPackageId})
+    `
+
+    const outcomes = await Promise.all([
+      mutateTaskFilesystemGrants({
+        actorId: fixture.userId,
+        mutations: [{
+          capabilities: ['filesystem.project.read', 'filesystem.project.list'],
+          decision: 'approved',
+          grantMode: 'always_allow',
+          reason: 'list-capability approval',
+          workPackageId: fixture.lowerPackageId,
+        }],
+        projectId: fixture.projectId,
+        taskId: fixture.taskId,
+      }),
+      mutateTaskFilesystemGrants({
+        actorId: fixture.userId,
+        mutations: [{
+          capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+          decision: 'approved',
+          grantMode: 'always_allow',
+          reason: 'search-capability approval',
+          workPackageId: fixture.targetPackageId,
+        }],
+        projectId: fixture.projectId,
+        taskId: fixture.taskId,
+      }),
+    ])
+    expect(outcomes).toHaveLength(2)
+
+    const authority = await loadCurrentProjectFilesystemDecision(fixture.projectId)
+    expect(authority).toMatchObject({
+      capabilities: [
+        'filesystem.project.list',
+        'filesystem.project.read',
+        'filesystem.project.search',
+      ],
+      decision: 'approved',
+      grantDecisionRevision: '2',
+      decisionGeneration: '2',
+    })
+    const decisions = await sql<{ capabilities: string[]; grant_decision_revision: string }[]>`
+      select capabilities, grant_decision_revision::text
+      from project_filesystem_grant_decisions
+      where project_id = ${fixture.projectId}
+      order by grant_decision_revision
+    `
+    expect(decisions.map((decision) => decision.grant_decision_revision)).toEqual(['1', '2'])
+    expect(decisions[1].capabilities).toEqual([
+      'filesystem.project.list',
+      'filesystem.project.read',
+      'filesystem.project.search',
+    ])
+    const [project] = await sql<{ mcp_config: Record<string, unknown> }[]>`
+      select mcp_config from projects where id = ${fixture.projectId}
+    `
+    expect(project.mcp_config).toMatchObject({ profile: 'strict', unrelated: { keep: true } })
+  } finally {
+    await sql.end()
+  }
+})
+
+test('task and project always-allow mutations converge through the same immutable project authority', async () => {
+  const fixture = await seed()
+  const sql = sqlClient()
+  try {
+    await sql`
+      update work_packages
+      set mcp_requirements = ${sql.json([{
+        mcpId: 'filesystem',
+        agent: 'backend',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        fallback: { action: 'block', message: '' },
+      }])}
+      where id = ${fixture.lowerPackageId}
+    `
+    await mutateTaskFilesystemGrants({
+      actorId: fixture.userId,
+      mutations: [{
+        capabilities: ['filesystem.project.read'],
+        decision: 'approved',
+        grantMode: 'always_allow',
+        reason: 'task endpoint equivalent',
+        workPackageId: fixture.targetPackageId,
+      }],
+      projectId: fixture.projectId,
+      taskId: fixture.taskId,
+    })
+    let packageRows = await sql<{ id: string; status: string }[]>`
+      select id, status from work_packages
+      where id in (${fixture.lowerPackageId}, ${fixture.targetPackageId})
+      order by id
+    `
+    expect(packageRows.find((pkg) => pkg.id === fixture.lowerPackageId)?.status).toBe('blocked')
+    expect(packageRows.find((pkg) => pkg.id === fixture.targetPackageId)?.status).toBe('ready')
+
+    await mutateProjectFilesystemGrant({
+      actorId: fixture.userId,
+      capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      enabled: true,
+      projectId: fixture.projectId,
+      reason: 'project endpoint equivalent',
+    })
+    packageRows = await sql<{ id: string; status: string }[]>`
+      select id, status from work_packages
+      where id in (${fixture.lowerPackageId}, ${fixture.targetPackageId})
+      order by id
+    `
+    expect(packageRows.map((pkg) => pkg.status)).toEqual(['ready', 'ready'])
+    const authority = await loadCurrentProjectFilesystemDecision(fixture.projectId)
+    expect(authority).toMatchObject({
+      capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      decision: 'approved',
+      grantDecisionRevision: '2',
+    })
+  } finally {
+    await sql.end()
+  }
+})
+
+test('config-only legacy project grants fail closed without an immutable current decision', async () => {
+  const fixture = await seed()
+  const sql = sqlClient()
+  try {
+    const compatibilityGrant = {
+      schemaVersion: 2,
+      mcpId: 'filesystem',
+      status: 'approved',
+      grantMode: 'always_allow',
+      capabilities: ['filesystem.project.read'],
+      grantApprovalId: randomUUID(),
+      grantDecisionRevision: '1',
+      rootBindingRevision: '1',
+    }
+    await sql`
+      update projects set mcp_config = ${sql.json({ grants: { filesystem: compatibilityGrant } })}
+      where id = ${fixture.projectId}
+    `
+    expect(await loadCurrentProjectFilesystemDecision(fixture.projectId)).toBeNull()
+    expect(requiresFilesystemGrantApproval({
+      mcpRequirements: [{
+        mcpId: 'filesystem',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read'],
+      }],
+      metadata: {},
+      projectMcpConfig: { grants: { filesystem: compatibilityGrant } },
+      projectFilesystemDecision: null,
+      projectRootBindingRevision: '1',
+    })).toMatchObject({ blocked: true })
+  } finally {
+    await sql.end()
+  }
+})
+
+test('narrowing and removal append retained decisions and negatively reconcile future authority', async () => {
+  const fixture = await seed()
+  const sql = sqlClient()
+  try {
+    await sql`
+      update work_packages
+      set status = 'ready', mcp_requirements = ${sql.json([{
+        mcpId: 'filesystem',
+        agent: 'backend',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read'],
+        fallback: { action: 'block', message: '' },
+      }])}
+      where id = ${fixture.lowerPackageId}
+    `
+    await sql`
+      update work_packages
+      set mcp_requirements = ${sql.json([{
+        mcpId: 'filesystem',
+        agent: 'backend',
+        requirement: 'required',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        fallback: { action: 'block', message: '' },
+      }])}
+      where id = ${fixture.targetPackageId}
+    `
+    await mutateProjectFilesystemGrant({
+      actorId: fixture.userId,
+      capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      enabled: true,
+      projectId: fixture.projectId,
+      reason: 'broad project approval',
+    })
+    await mutateProjectFilesystemGrant({
+      actorId: fixture.userId,
+      capabilities: ['filesystem.project.read'],
+      enabled: true,
+      projectId: fixture.projectId,
+      reason: 'narrow project approval',
+    })
+    let rows = await sql<{ id: string; marker: Record<string, unknown> | null; status: string }[]>`
+      select id, status, metadata->'mcpGrantBlock' as marker
+      from work_packages where id in (${fixture.lowerPackageId}, ${fixture.targetPackageId})
+      order by id
+    `
+    expect(rows.find((pkg) => pkg.id === fixture.lowerPackageId)?.status).toBe('ready')
+    expect(rows.find((pkg) => pkg.id === fixture.targetPackageId)).toMatchObject({
+      status: 'blocked',
+      marker: { revocationReason: 'project_grant_narrowed' },
+    })
+
+    await mutateProjectFilesystemGrant({
+      actorId: fixture.userId,
+      capabilities: [],
+      enabled: false,
+      projectId: fixture.projectId,
+      reason: 'remove project approval',
+    })
+    rows = await sql<{ id: string; marker: Record<string, unknown> | null; status: string }[]>`
+      select id, status, metadata->'mcpGrantBlock' as marker
+      from work_packages where id in (${fixture.lowerPackageId}, ${fixture.targetPackageId})
+      order by id
+    `
+    expect(rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: 'blocked', marker: expect.objectContaining({ revocationReason: 'project_grant_removed' }) }),
+      expect.objectContaining({ status: 'blocked', marker: expect.objectContaining({ revocationReason: 'project_grant_removed' }) }),
+    ]))
+    const decisions = await sql<{
+      decision: string
+      grant_decision_revision: string
+      revocation_reason: string | null
+    }[]>`
+      select decision, grant_decision_revision::text, revocation_reason
+      from project_filesystem_grant_decisions
+      where project_id = ${fixture.projectId}
+      order by grant_decision_revision
+    `
+    expect(decisions).toEqual([
+      { decision: 'approved', grant_decision_revision: '1', revocation_reason: null },
+      { decision: 'approved', grant_decision_revision: '2', revocation_reason: 'project_grant_narrowed' },
+      { decision: 'revoked', grant_decision_revision: '3', revocation_reason: 'project_grant_removed' },
+    ])
+  } finally {
+    await sql.end()
+  }
+})
+
+test('project pointer retains an exact S4 parent, rejects mismatches, and rolls back a stale CAS append', async () => {
+  const fixture = await seed()
+  const other = await seed()
+  const sql = sqlClient()
+  try {
+    await mutateProjectFilesystemGrant({
+      actorId: fixture.userId,
+      capabilities: ['filesystem.project.read'],
+      enabled: true,
+      projectId: fixture.projectId,
+      reason: 'initial project approval',
+    })
+    const [first] = await sql<{
+      current_decision_fingerprint: string
+      current_decision_generation: string
+      current_decision_id: string
+      current_decision_project_id: string
+      current_decision_revision: string
+      current_root_binding_revision: string
+      pointer_generation: string
+    }[]>`
+      select current_decision_id, current_decision_project_id,
+             current_decision_revision::text, current_root_binding_revision::text,
+             current_decision_fingerprint, current_decision_generation::text,
+             pointer_generation::text
+      from project_filesystem_current_decision_pointers
+      where project_id = ${fixture.projectId}
+    `
+    expect(first).toMatchObject({
+      current_decision_project_id: fixture.projectId,
+      current_decision_revision: '1',
+      current_decision_generation: '1',
+      pointer_generation: '1',
+    })
+    const [s4Parent] = await sql<{ id: string }[]>`
+      select id from project_filesystem_grant_decisions
+      where project_id = ${fixture.projectId} and grant_decision_revision = 1
+    `
+    expect(s4Parent.id).toBe(first.current_decision_id)
+
+    await expect(sql`
+      update project_filesystem_current_decision_pointers
+      set current_decision_revision = current_decision_revision + 1
+      where project_id = ${fixture.projectId}
+    `).rejects.toMatchObject({ code: '23503' })
+    await expect(sql`
+      update project_filesystem_current_decision_pointers
+      set current_decision_fingerprint = ${`sha256:${'f'.repeat(64)}`}
+      where project_id = ${fixture.projectId}
+    `).rejects.toMatchObject({ code: '23503' })
+    await expect(sql`
+      update project_filesystem_current_decision_pointers
+      set current_root_binding_revision = current_root_binding_revision + 1
+      where project_id = ${fixture.projectId}
+    `).rejects.toMatchObject({ code: '23503' })
+    await expect(sql`
+      update project_filesystem_current_decision_pointers
+      set current_decision_project_id = ${other.projectId}
+      where project_id = ${fixture.projectId}
+    `).rejects.toMatchObject({ code: '23514' })
+    await expect(sql`
+      update project_filesystem_grant_decisions set reason = 'mutated'
+      where id = ${first.current_decision_id}
+    `).rejects.toMatchObject({ code: '55000' })
+    await expect(sql`
+      delete from project_filesystem_grant_decisions where id = ${first.current_decision_id}
+    `).rejects.toMatchObject({ code: '55000' })
+
+    await mutateProjectFilesystemGrant({
+      actorId: fixture.userId,
+      capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+      enabled: true,
+      projectId: fixture.projectId,
+      reason: 'advance current project approval',
+    })
+    const [current] = await sql<{
+      current_decision_fingerprint: string
+      current_decision_generation: string
+      current_decision_id: string
+      current_decision_revision: string
+      current_root_binding_revision: string
+      pointer_generation: string
+    }[]>`
+      select current_decision_id, current_decision_revision::text,
+             current_root_binding_revision::text, current_decision_fingerprint,
+             current_decision_generation::text, pointer_generation::text
+      from project_filesystem_current_decision_pointers
+      where project_id = ${fixture.projectId}
+    `
+    const candidateId = randomUUID()
+    await expect(sql.begin(async (tx) => {
+      const candidateRevision = (BigInt(current.current_decision_revision) + BigInt(1)).toString()
+      const candidateGeneration = (BigInt(current.current_decision_generation) + BigInt(1)).toString()
+      const candidateFingerprint = `sha256:${'e'.repeat(64)}`
+      await tx`
+        insert into project_filesystem_grant_decisions (
+          id, project_id, decision, capabilities, grant_decision_revision,
+          root_binding_revision, decision_fingerprint, decision_generation,
+          prior_decision_id, prior_decision_revision, prior_root_binding_revision,
+          prior_decision_fingerprint, prior_decision_generation,
+          revocation_reason, reason, decided_by
+        ) values (
+          ${candidateId}, ${fixture.projectId}, 'approved', ${tx.json(['filesystem.project.read'])},
+          ${candidateRevision}, ${current.current_root_binding_revision}, ${candidateFingerprint}, ${candidateGeneration},
+          ${current.current_decision_id}, ${current.current_decision_revision}, ${current.current_root_binding_revision},
+          ${current.current_decision_fingerprint}, ${current.current_decision_generation},
+          null, 'stale CAS candidate', ${fixture.userId}
+        )
+      `
+      const advanced = await tx<{ id: string }[]>`
+        update project_filesystem_current_decision_pointers
+        set current_decision_id = ${candidateId},
+            current_decision_project_id = ${fixture.projectId},
+            current_decision_revision = ${candidateRevision},
+            current_root_binding_revision = ${current.current_root_binding_revision},
+            current_decision_fingerprint = ${candidateFingerprint},
+            current_decision_generation = ${candidateGeneration},
+            pointer_generation = ${candidateGeneration}
+        where project_id = ${fixture.projectId}
+          and current_decision_id = ${first.current_decision_id}
+          and current_decision_revision = ${first.current_decision_revision}
+          and current_root_binding_revision = ${first.current_root_binding_revision}
+          and current_decision_fingerprint = ${first.current_decision_fingerprint}
+          and pointer_generation = ${first.pointer_generation}
+        returning current_decision_id as id
+      `
+      if (advanced.length === 0) throw new Error('stale project pointer CAS')
+    })).rejects.toThrow('stale project pointer CAS')
+    const [{ count: rolledBack }] = await sql<{ count: number }[]>`
+      select count(*)::int as count from project_filesystem_grant_decisions
+      where id = ${candidateId}
+    `
+    expect(rolledBack).toBe(0)
+    const history = await sql<{ grant_decision_revision: string }[]>`
+      select grant_decision_revision::text from project_filesystem_grant_decisions
+      where project_id = ${fixture.projectId}
+      order by grant_decision_revision
+    `
+    expect(history.map((decision) => decision.grant_decision_revision)).toEqual(['1', '2'])
+  } finally {
+    await sql.end()
+  }
+})
+
+test('root repoint appends negative project authority and requires explicit new-root approval', async () => {
   const fixture = await seed()
   await mutateTaskFilesystemGrants({
     actorId: fixture.userId,
@@ -268,14 +681,14 @@ test('root repoint revokes old-root authority without allocating a grant decisio
       select grant_decision_revision::text, root_binding_revision::text
       from projects where id = ${fixture.projectId}
     `
-    expect(project).toEqual({ grant_decision_revision: '1', root_binding_revision: '2' })
+    expect(project).toEqual({ grant_decision_revision: '2', root_binding_revision: '2' })
     const [held] = await sql<{ marker: Record<string, unknown>; status: string }[]>`
       select metadata->'mcpGrantBlock' as marker, status
       from work_packages where id = ${fixture.targetPackageId}
     `
     expect(held.status).toBe('blocked')
     expect(held.marker).toMatchObject({
-      grantDecisionRevision: '1',
+      grantDecisionRevision: '2',
       holdKind: 'revoked_required',
       revocationReason: 'project_root_repoint',
     })
@@ -284,6 +697,23 @@ test('root repoint revokes old-root authority without allocating a grant decisio
       where project_id = ${fixture.projectId}
     `
     expect(count).toBe(1)
+    const [negativeDecision] = await sql<{
+      decision: string
+      grant_decision_revision: string
+      revocation_reason: string
+      root_binding_revision: string
+    }[]>`
+      select decision, grant_decision_revision::text, revocation_reason,
+             root_binding_revision::text
+      from project_filesystem_grant_decisions
+      where project_id = ${fixture.projectId}
+    `
+    expect(negativeDecision).toEqual({
+      decision: 'revoked',
+      grant_decision_revision: '2',
+      revocation_reason: 'project_root_repoint',
+      root_binding_revision: '2',
+    })
 
     const [pointer] = await sql<{
       current_decision_id: string

@@ -18,6 +18,9 @@ import {
   type FilesystemGrantHoldState,
   type FilesystemGrantRevocationReason,
 } from './filesystem-grant-lifecycle'
+import {
+  parseProjectFilesystemDecisionAuthority,
+} from './filesystem-project-authority'
 
 export const FILESYSTEM_MCP_ID = 'filesystem'
 
@@ -114,11 +117,13 @@ function filesystemProjectionAdmission(input: {
   mcpRequirements: unknown
   metadata: unknown
   projectMcpConfig?: unknown
+  projectFilesystemDecision?: unknown
   projectRootBindingRevision?: unknown
 }): McpWorkPackageAdmission {
   const metadata = isRecord(input.metadata) ? input.metadata : {}
   const project = {
     mcpConfig: input.projectMcpConfig ?? {},
+    filesystemGrantDecision: input.projectFilesystemDecision,
     rootBindingRevision: input.projectRootBindingRevision,
   }
   const entries = recordArray(input.mcpRequirements).map(filesystemProjectionPolicy)
@@ -168,6 +173,7 @@ export function summarizeFilesystemCapabilities(input: {
   mcpRequirements: unknown
   metadata: unknown
   projectMcpConfig?: unknown
+  projectFilesystemDecision?: unknown
   projectRootBindingRevision?: unknown
 }): FilesystemCapabilitySummary {
   const admission = filesystemProjectionAdmission(input)
@@ -281,13 +287,32 @@ export function projectFilesystemGrantFromConfig(mcpConfig: unknown): ProjectFil
   }
 }
 
+export function projectFilesystemGrantFromAuthority(value: unknown): ProjectFilesystemGrant | null {
+  const authority = parseProjectFilesystemDecisionAuthority(value)
+  if (!authority || authority.decision !== 'approved') return null
+  return {
+    schemaVersion: 2,
+    mcpId: FILESYSTEM_MCP_ID,
+    status: 'approved',
+    grantMode: 'always_allow',
+    capabilities: authority.capabilities as FilesystemProjectCapability[],
+    grantApprovalId: authority.decisionId,
+    approvedAt: authority.decidedAt,
+    approvedBy: authority.decidedBy,
+    reason: authority.reason,
+    grantDecisionRevision: authority.grantDecisionRevision as ProjectFilesystemGrant['grantDecisionRevision'],
+    rootBindingRevision: authority.rootBindingRevision as ProjectFilesystemGrant['rootBindingRevision'],
+  }
+}
+
 export function projectFilesystemGrantCovers(input: {
   mcpConfig: unknown
   mcpRequirements: unknown
   metadata: unknown
+  projectFilesystemDecision?: unknown
   projectRootBindingRevision?: unknown
 }): ProjectFilesystemGrant | null {
-  const grant = projectFilesystemGrantFromConfig(input.mcpConfig)
+  const grant = projectFilesystemGrantFromAuthority(input.projectFilesystemDecision)
   if (!grant) return null
   const rootBindingRevision = canonicalPositiveDecisionRevision(
     typeof input.projectRootBindingRevision === 'bigint'
@@ -414,6 +439,7 @@ export function requiresFilesystemGrantApproval(input: {
   mcpRequirements: unknown
   metadata: unknown
   projectMcpConfig?: unknown
+  projectFilesystemDecision?: unknown
   projectRootBindingRevision?: unknown
 }): {
   blocked: boolean
@@ -431,6 +457,7 @@ export function requiresFilesystemGrantApproval(input: {
   const metadata = isRecord(input.metadata) ? input.metadata : {}
   const project = {
     mcpConfig: input.projectMcpConfig ?? {},
+    filesystemGrantDecision: input.projectFilesystemDecision,
     rootBindingRevision: input.projectRootBindingRevision,
   }
   const blockingStates: ReturnType<typeof readEffectiveGrantState>[] = []

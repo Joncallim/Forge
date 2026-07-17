@@ -17,6 +17,7 @@ import {
 } from './architect-context'
 import type { OpenQuestion } from './open-questions'
 import { getProjectMcpOverview } from '../lib/mcps/manager'
+import { loadCurrentProjectFilesystemDecision } from '../lib/mcps/filesystem-grant-reconciliation'
 import type { ProjectMcpOverview } from '../lib/mcps/types'
 import {
   assertTargetedPlanRevision,
@@ -661,7 +662,8 @@ async function runArchitect(
   let text = ''
 
   try {
-    const mcpOverview = await getProjectMcpOverview(project)
+    const projectFilesystemDecision = await loadCurrentProjectFilesystemDecision(project.id)
+    const mcpOverview = await getProjectMcpOverview(project, projectFilesystemDecision)
     let usage: { inputTokens: number | null; outputTokens: number | null } = {
       inputTokens: null,
       outputTokens: null,

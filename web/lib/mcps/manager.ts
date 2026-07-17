@@ -31,6 +31,7 @@ import type {
   ProjectMcpOverview,
   ProjectMcpStatus,
 } from './types'
+import type { ProjectFilesystemDecisionAuthority } from './filesystem-project-authority'
 
 type McpInstallationRow = typeof mcpInstallations.$inferSelect
 type CachedProjectMcpStatusRow = typeof projectMcpStatusChecks.$inferSelect
@@ -466,6 +467,7 @@ export async function getCachedProjectMcpSummaries(
 
 export async function getProjectMcpOverview(
   project: Project,
+  filesystemGrantDecision: ProjectFilesystemDecisionAuthority | null = null,
   options: { cache?: boolean; ensureWorkspace?: boolean } = {},
 ): Promise<ProjectMcpOverview> {
   const workspace = await getWorkspaceSettings({ ensure: options.ensureWorkspace ?? true })
@@ -481,6 +483,7 @@ export async function getProjectMcpOverview(
 
   return {
     projectId: project.id,
+    filesystemGrantDecision,
     rootBindingRevision: (project.rootBindingRevision ?? BigInt(0)).toString(),
     config,
     catalog: catalogEntries(),

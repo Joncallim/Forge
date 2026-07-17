@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/db'
-import { projects, type ProjectMcpConfig } from '@/db/schema'
+import { projects } from '@/db/schema'
 import { getSession } from '@/lib/session'
 import { accessibleProjectCondition } from '@/lib/project-access'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
@@ -11,9 +11,12 @@ import { redis } from '@/lib/redis'
 import {
   filesystemGrantHealthError,
   isRecord,
-  projectFilesystemGrantFromConfig,
+  projectFilesystemGrantFromAuthority,
 } from '@/lib/mcps/filesystem-grants'
-import { mutateProjectFilesystemGrant } from '@/lib/mcps/filesystem-grant-reconciliation'
+import {
+  loadCurrentProjectFilesystemDecision,
+  mutateProjectFilesystemGrant,
+} from '@/lib/mcps/filesystem-grant-reconciliation'
 
 const ALL_READ_ONLY_CAPABILITIES = [
   'filesystem.project.read',
@@ -32,8 +35,8 @@ async function findProject(id: string, userId: string) {
   return project ?? null
 }
 
-function grantSummary(mcpConfig: ProjectMcpConfig) {
-  const grant = projectFilesystemGrantFromConfig(mcpConfig)
+function grantSummary(authority: unknown) {
+  const grant = projectFilesystemGrantFromAuthority(authority)
   return grant ? {
     enabled: true,
     capabilities: grant.capabilities,
@@ -62,10 +65,15 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     const { id } = await params
     const project = await findProject(id, session.userId)
     if (!project) return NextResponse.json({ error: 'Project not found' }, { status: 404 })
-    const overview = await getProjectMcpOverview(project, { cache: false, ensureWorkspace: false })
+    const authority = await loadCurrentProjectFilesystemDecision(project.id)
+    const overview = await getProjectMcpOverview(
+      project,
+      authority,
+      { cache: false, ensureWorkspace: false },
+    )
     return NextResponse.json({
       schemaVersion: 2,
-      grant: grantSummary(project.mcpConfig),
+      grant: grantSummary(authority),
       healthError: filesystemGrantHealthError(overview.statuses),
     })
   } catch (err) {
@@ -113,7 +121,7 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
     }
     const response = {
       schemaVersion: 2,
-      grant: grantSummary(result.mcpConfig),
+      grant: grantSummary(result.authority),
       healthError,
       recoveredTaskIds: result.recoveredTaskIds,
     }

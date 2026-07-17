@@ -1206,6 +1206,7 @@ function admissionForAgent(design: McpExecutionDesign, packageIdentity: string, 
       { metadata: {} },
       {
         mcpConfig: overview.config,
+        filesystemGrantDecision: overview.filesystemGrantDecision,
         rootBindingRevision: overview.rootBindingRevision,
       },
       requiredCapabilities,
@@ -1554,6 +1555,7 @@ export type WorkPackageMcpAdmissionInput = {
   mcpRequirements?: unknown
   metadata?: unknown
   projectMcpConfig?: unknown
+  projectFilesystemDecision?: unknown
   projectRootBindingRevision?: unknown
   title?: string
 }
@@ -1570,6 +1572,7 @@ function admitWorkPackageMcpBrokerUnchecked(input: WorkPackageMcpAdmissionInput)
       { metadata: input.metadata },
       {
         mcpConfig: input.projectMcpConfig ?? {},
+        filesystemGrantDecision: input.projectFilesystemDecision,
         rootBindingRevision: input.projectRootBindingRevision,
       },
       requiredCapabilities,

@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { and, eq, inArray, isNull, or, sql } from 'drizzle-orm'
+import { and, eq, inArray, isNull, sql } from 'drizzle-orm'
 import { db } from '@/db'
 import {
   filesystemMcpCurrentDecisionPointers,
   filesystemMcpGrantApprovals,
+  projectFilesystemCurrentDecisionPointers,
+  projectFilesystemGrantDecisions,
   projects,
   tasks,
   workPackages,
@@ -20,18 +22,51 @@ import {
   isFilesystemGrantBlockedPackageMetadata,
   isRecord,
   projectFilesystemEffectivePhase,
-  projectFilesystemGrantFromConfig,
+  projectFilesystemGrantFromAuthority,
   requiresFilesystemGrantApproval,
   summarizeFilesystemCapabilities,
   type FilesystemProjectCapability,
 } from './filesystem-grants'
 import { assertMcpAdmissionLockSequence } from './mcp-admission-lock-order'
 import { readEffectiveGrantState } from './admission'
+import {
+  parseProjectFilesystemDecisionAuthority,
+  type ProjectFilesystemDecisionAuthority,
+  type ProjectFilesystemDecisionRevocationReason,
+} from './filesystem-project-authority'
 
 type GrantTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0]
 type LockedProject = typeof projects.$inferSelect
 type LockedTask = typeof tasks.$inferSelect
 type LockedPackage = typeof workPackages.$inferSelect
+type ProjectDecisionPointer = typeof projectFilesystemCurrentDecisionPointers.$inferSelect
+
+function isEmptyProjectDecisionPointer(pointer: ProjectDecisionPointer): boolean {
+  return pointer.currentDecisionId === null &&
+    pointer.currentDecisionProjectId === null &&
+    pointer.currentDecisionRevision === null &&
+    pointer.currentRootBindingRevision === null &&
+    pointer.currentDecisionFingerprint === null &&
+    pointer.currentDecisionGeneration === null &&
+    pointer.pointerGeneration === BigInt(0)
+}
+
+function projectDecisionPointerParent(
+  pointer: ProjectDecisionPointer,
+  decisions: readonly (typeof projectFilesystemGrantDecisions.$inferSelect)[],
+) {
+  if (isEmptyProjectDecisionPointer(pointer)) return null
+  return decisions.find((decision) => (
+    pointer.currentDecisionProjectId === pointer.projectId &&
+    decision.id === pointer.currentDecisionId &&
+    decision.projectId === pointer.currentDecisionProjectId &&
+    decision.grantDecisionRevision === pointer.currentDecisionRevision &&
+    decision.rootBindingRevision === pointer.currentRootBindingRevision &&
+    decision.decisionFingerprint === pointer.currentDecisionFingerprint &&
+    decision.decisionGeneration === pointer.currentDecisionGeneration &&
+    pointer.pointerGeneration === pointer.currentDecisionGeneration
+  )) ?? undefined
+}
 
 export type FilesystemGrantMutation = {
   capabilities: string[]
@@ -48,7 +83,13 @@ export type FilesystemGrantMutation = {
 }
 
 export type FilesystemGrantMutationResult = {
-  approvals: Array<typeof filesystemMcpGrantApprovals.$inferSelect>
+  approvals: Array<{
+    id: string
+    capabilities: string[]
+    decision: string
+    grantDecisionRevision: bigint | null
+    workPackageId: string | null
+  }>
   recoveredTaskIds: string[]
   states: Array<{
     approvalId: string
@@ -199,6 +240,177 @@ function grantPointerFingerprint(input: {
   })).digest('hex')}`
 }
 
+function projectDecisionAuthority(
+  decision: typeof projectFilesystemGrantDecisions.$inferSelect,
+): ProjectFilesystemDecisionAuthority {
+  const authority = parseProjectFilesystemDecisionAuthority({
+    schemaVersion: 2,
+    decisionId: decision.id,
+    projectId: decision.projectId,
+    decision: decision.decision,
+    capabilities: decision.capabilities,
+    grantDecisionRevision: decision.grantDecisionRevision.toString(),
+    rootBindingRevision: decision.rootBindingRevision.toString(),
+    decisionFingerprint: decision.decisionFingerprint,
+    decisionGeneration: decision.decisionGeneration.toString(),
+    decidedAt: decision.decidedAt.toISOString(),
+    decidedBy: decision.decidedBy,
+    reason: decision.reason,
+    revocationReason: decision.revocationReason,
+  })
+  if (!authority) throw httpError('The current project filesystem decision is malformed.', 409)
+  return authority
+}
+
+export async function loadCurrentProjectFilesystemDecision(
+  projectId: string,
+): Promise<ProjectFilesystemDecisionAuthority | null> {
+  const [row] = await db
+    .select({ decision: projectFilesystemGrantDecisions })
+    .from(projectFilesystemCurrentDecisionPointers)
+    .innerJoin(projectFilesystemGrantDecisions, and(
+      eq(projectFilesystemGrantDecisions.id, projectFilesystemCurrentDecisionPointers.currentDecisionId),
+      eq(projectFilesystemGrantDecisions.projectId, projectFilesystemCurrentDecisionPointers.currentDecisionProjectId),
+      eq(projectFilesystemCurrentDecisionPointers.currentDecisionProjectId, projectFilesystemCurrentDecisionPointers.projectId),
+      eq(projectFilesystemGrantDecisions.grantDecisionRevision, projectFilesystemCurrentDecisionPointers.currentDecisionRevision),
+      eq(projectFilesystemGrantDecisions.rootBindingRevision, projectFilesystemCurrentDecisionPointers.currentRootBindingRevision),
+      eq(projectFilesystemGrantDecisions.decisionFingerprint, projectFilesystemCurrentDecisionPointers.currentDecisionFingerprint),
+      eq(projectFilesystemGrantDecisions.decisionGeneration, projectFilesystemCurrentDecisionPointers.currentDecisionGeneration),
+      eq(projectFilesystemCurrentDecisionPointers.pointerGeneration, projectFilesystemCurrentDecisionPointers.currentDecisionGeneration),
+    ))
+    .where(eq(projectFilesystemCurrentDecisionPointers.projectId, projectId))
+    .limit(1)
+  return row && isRecord(row.decision) && typeof row.decision.id === 'string'
+    ? projectDecisionAuthority(row.decision as typeof projectFilesystemGrantDecisions.$inferSelect)
+    : null
+}
+
+function projectDecisionFingerprint(input: {
+  actorId: string
+  capabilities: readonly string[]
+  decidedAt: Date
+  decision: 'approved' | 'revoked'
+  decisionId: string
+  generation: bigint
+  prior: ProjectDecisionPointer
+  projectId: string
+  reason: string
+  revision: bigint
+  revocationReason: ProjectFilesystemDecisionRevocationReason | null
+  rootBindingRevision: bigint
+}): string {
+  return `sha256:${createHash('sha256').update(JSON.stringify({
+    actorId: input.actorId,
+    capabilities: input.capabilities,
+    decidedAt: input.decidedAt.toISOString(),
+    decision: input.decision,
+    decisionId: input.decisionId,
+    generation: input.generation.toString(),
+    priorDecisionFingerprint: input.prior.currentDecisionFingerprint,
+    priorDecisionId: input.prior.currentDecisionId,
+    priorDecisionRevision: input.prior.currentDecisionRevision?.toString() ?? null,
+    priorGeneration: input.prior.pointerGeneration.toString(),
+    priorRootBindingRevision: input.prior.currentRootBindingRevision?.toString() ?? null,
+    projectId: input.projectId,
+    reason: input.reason,
+    revision: input.revision.toString(),
+    revocationReason: input.revocationReason,
+    rootBindingRevision: input.rootBindingRevision.toString(),
+  })).digest('hex')}`
+}
+
+async function appendProjectFilesystemDecision(input: {
+  actorId: string
+  capabilities: readonly string[]
+  decision: 'approved' | 'revoked'
+  lockedProject: LockedProject
+  now: Date
+  pointer: ProjectDecisionPointer
+  reason: string
+  revision: bigint
+  revocationReason: ProjectFilesystemDecisionRevocationReason | null
+  rootBindingRevision?: bigint
+  tx: GrantTransaction
+}): Promise<{
+  authority: ProjectFilesystemDecisionAuthority
+  decision: typeof projectFilesystemGrantDecisions.$inferSelect
+  pointer: ProjectDecisionPointer
+}> {
+  const decisionId = randomUUID()
+  const generation = input.pointer.pointerGeneration + BigInt(1)
+  const rootBindingRevision = input.rootBindingRevision ?? input.lockedProject.rootBindingRevision
+  const fingerprint = projectDecisionFingerprint({
+    actorId: input.actorId,
+    capabilities: input.capabilities,
+    decidedAt: input.now,
+    decision: input.decision,
+    decisionId,
+    generation,
+    prior: input.pointer,
+    projectId: input.lockedProject.id,
+    reason: input.reason,
+    revision: input.revision,
+    revocationReason: input.revocationReason,
+    rootBindingRevision,
+  })
+  const [decision] = await input.tx.insert(projectFilesystemGrantDecisions).values({
+    id: decisionId,
+    projectId: input.lockedProject.id,
+    decision: input.decision,
+    capabilities: [...input.capabilities],
+    grantDecisionRevision: input.revision,
+    rootBindingRevision,
+    decisionFingerprint: fingerprint,
+    decisionGeneration: generation,
+    priorDecisionId: input.pointer.currentDecisionId,
+    priorDecisionRevision: input.pointer.currentDecisionRevision,
+    priorRootBindingRevision: input.pointer.currentRootBindingRevision,
+    priorDecisionFingerprint: input.pointer.currentDecisionFingerprint,
+    priorDecisionGeneration: input.pointer.pointerGeneration === BigInt(0)
+      ? null
+      : input.pointer.pointerGeneration,
+    revocationReason: input.revocationReason,
+    reason: input.reason,
+    decidedBy: input.actorId,
+    decidedAt: input.now,
+  }).returning()
+  const [pointer] = await input.tx.update(projectFilesystemCurrentDecisionPointers).set({
+    currentDecisionId: decision.id,
+    currentDecisionProjectId: decision.projectId,
+    currentDecisionRevision: decision.grantDecisionRevision,
+    currentRootBindingRevision: decision.rootBindingRevision,
+    currentDecisionFingerprint: decision.decisionFingerprint,
+    currentDecisionGeneration: decision.decisionGeneration,
+    pointerGeneration: decision.decisionGeneration,
+    updatedAt: input.now,
+  }).where(and(
+    eq(projectFilesystemCurrentDecisionPointers.projectId, input.pointer.projectId),
+    input.pointer.currentDecisionId === null
+      ? isNull(projectFilesystemCurrentDecisionPointers.currentDecisionId)
+      : eq(projectFilesystemCurrentDecisionPointers.currentDecisionId, input.pointer.currentDecisionId),
+    input.pointer.currentDecisionProjectId === null
+      ? isNull(projectFilesystemCurrentDecisionPointers.currentDecisionProjectId)
+      : eq(projectFilesystemCurrentDecisionPointers.currentDecisionProjectId, input.pointer.currentDecisionProjectId),
+    input.pointer.currentDecisionRevision === null
+      ? isNull(projectFilesystemCurrentDecisionPointers.currentDecisionRevision)
+      : eq(projectFilesystemCurrentDecisionPointers.currentDecisionRevision, input.pointer.currentDecisionRevision),
+    input.pointer.currentRootBindingRevision === null
+      ? isNull(projectFilesystemCurrentDecisionPointers.currentRootBindingRevision)
+      : eq(projectFilesystemCurrentDecisionPointers.currentRootBindingRevision, input.pointer.currentRootBindingRevision),
+    input.pointer.currentDecisionFingerprint === null
+      ? isNull(projectFilesystemCurrentDecisionPointers.currentDecisionFingerprint)
+      : eq(projectFilesystemCurrentDecisionPointers.currentDecisionFingerprint, input.pointer.currentDecisionFingerprint),
+    input.pointer.currentDecisionGeneration === null
+      ? isNull(projectFilesystemCurrentDecisionPointers.currentDecisionGeneration)
+      : eq(projectFilesystemCurrentDecisionPointers.currentDecisionGeneration, input.pointer.currentDecisionGeneration),
+    eq(projectFilesystemCurrentDecisionPointers.pointerGeneration, input.pointer.pointerGeneration),
+  )).returning()
+  if (!pointer) {
+    throw httpError('Project filesystem decision changed concurrently. Review the current authority before retrying.', 409)
+  }
+  return { authority: projectDecisionAuthority(decision), decision, pointer }
+}
+
 function buildEffectivePhase(input: {
   approvalId: string
   capabilities: FilesystemProjectCapability[]
@@ -288,6 +500,7 @@ async function applyCanonicalProjection(input: {
   now: Date
   packages: Map<string, LockedPackage>
   packageIds: readonly string[]
+  projectAuthority: ProjectFilesystemDecisionAuthority | null
   forcePackageIds?: ReadonlySet<string>
   tx: GrantTransaction
 }): Promise<Set<string>> {
@@ -299,6 +512,7 @@ async function applyCanonicalProjection(input: {
       mcpRequirements: pkg.mcpRequirements,
       metadata: pkg.metadata,
       projectMcpConfig: input.lockedProject.mcpConfig,
+      projectFilesystemDecision: input.projectAuthority,
       projectRootBindingRevision: input.lockedProject.rootBindingRevision,
     })
     const existingMarker = isRecord(pkg.metadata)
@@ -316,7 +530,7 @@ async function applyCanonicalProjection(input: {
 
     if (!check.blocked) {
       if (!parsedMarker && !exactV1Marker && !forcePersist) continue
-      const grant = projectFilesystemGrantFromConfig(input.lockedProject.mcpConfig)
+      const grant = projectFilesystemGrantFromAuthority(input.projectAuthority)
       const effective = grant
         ? phasesWithEffective(pkg.metadata, projectFilesystemEffectivePhase(grant))
         : forcePersist ? currentPhases : undefined
@@ -398,6 +612,7 @@ export type FilesystemGrantProjectReconciliationResult = {
 
 /** Build the grant-only config patch S4 uses after it atomically advances the root binding. */
 export function filesystemMcpConfigAfterRootRepoint(input: {
+  grantApprovalId?: string | null
   grantDecisionRevision: bigint
   mcpConfig: ProjectMcpConfig
   rootBindingRevision: bigint
@@ -417,9 +632,9 @@ export function filesystemMcpConfigAfterRootRepoint(input: {
           ...withoutFilesystem,
           filesystemRevocation: {
             schemaVersion: 2,
-            grantApprovalId: typeof previousGrant.grantApprovalId === 'string'
-              ? previousGrant.grantApprovalId
-              : null,
+            grantApprovalId: input.grantApprovalId ?? (
+              typeof previousGrant.grantApprovalId === 'string' ? previousGrant.grantApprovalId : null
+            ),
             grantDecisionRevision: input.grantDecisionRevision.toString(),
             rootBindingRevision: input.rootBindingRevision.toString(),
             revocationReason: 'project_root_repoint',
@@ -429,46 +644,22 @@ export function filesystemMcpConfigAfterRootRepoint(input: {
   }
 }
 
-function packageEffectivePhase(pkg: LockedPackage): Record<string, unknown> | null {
-  const metadata = isRecord(pkg.metadata) ? pkg.metadata : {}
-  const phases = isRecord(metadata.mcpGrantPhases) ? metadata.mcpGrantPhases : {}
-  return isRecord(phases.effective) ? phases.effective : null
-}
-
 function projectReconciliationCandidateIds(input: {
   packages: readonly LockedPackage[]
   rootBindingRevision: bigint
   trigger: FilesystemGrantProjectReconciliationTrigger
 }): string[] {
-  if (input.trigger === 'task_always_allow' || input.trigger === 'project_always_allow') {
-    return input.packages.map((pkg) => pkg.id)
-  }
-  if (input.trigger === 'project_grant_revocation') {
-    return input.packages
-      .filter((pkg) => packageEffectivePhase(pkg)?.source === 'project-filesystem-approval')
-      .map((pkg) => pkg.id)
-  }
-  return input.packages
-    .filter((pkg) => {
-      const effective = packageEffectivePhase(pkg)
-      if (effective?.schemaVersion !== 2) return false
-      const decisionRevision = typeof effective.grantDecisionRevision === 'string'
-        ? effective.grantDecisionRevision
-        : ''
-      const rootRevision = typeof effective.rootBindingRevision === 'string'
-        ? effective.rootBindingRevision
-        : ''
-      return /^[1-9][0-9]*$/.test(decisionRevision) &&
-        /^[1-9][0-9]*$/.test(rootRevision) &&
-        BigInt(rootRevision) !== input.rootBindingRevision
-    })
-    .map((pkg) => pkg.id)
+  // Immutable project authority, not per-package projection metadata, owns
+  // narrowing/removal/repoint semantics. Reevaluate the complete locked set so
+  // untouched pending/ready packages cannot retain authority by omission.
+  return input.packages.map((pkg) => pkg.id)
 }
 
 async function reconcileLockedProjectRows(input: {
   lockedProject: LockedProject
   nextMcpConfig: ProjectMcpConfig
   packages: Map<string, LockedPackage>
+  projectAuthority: ProjectFilesystemDecisionAuthority | null
   taskRows: readonly LockedTask[]
   trigger: FilesystemGrantProjectReconciliationTrigger
   tx: GrantTransaction
@@ -488,6 +679,7 @@ async function reconcileLockedProjectRows(input: {
     now: input.now,
     packages: input.packages,
     packageIds,
+    projectAuthority: input.projectAuthority,
     tx: input.tx,
   })
   for (const task of input.taskRows) {
@@ -531,22 +723,11 @@ export async function reconcileFilesystemGrantsForProject(
   if (input.trigger !== 'project_root_repoint' && input.grantDecisionRevision === '0') {
     throw new Error('Grant reconciliation requires a positive decision revision.')
   }
-  if (input.trigger === 'project_root_repoint') {
-    const grants = isRecord(input.nextMcpConfig.grants) ? input.nextMcpConfig.grants : {}
-    const revocation = isRecord(grants.filesystemRevocation) ? grants.filesystemRevocation : null
-    if (Object.hasOwn(grants, 'filesystem')) {
-      throw new Error('Root repoint must remove active filesystem authority before reconciliation.')
-    }
-    if (
-      input.grantDecisionRevision !== '0' &&
-      (
-        revocation?.revocationReason !== 'project_root_repoint' ||
-        revocation.grantDecisionRevision !== input.grantDecisionRevision ||
-        revocation.rootBindingRevision !== input.lockedProject.rootBindingRevision.toString()
-      )
-    ) {
-      throw new Error('Root repoint must carry the current decision and new root-binding revisions.')
-    }
+  if (input.trigger !== 'project_root_repoint') {
+    throw new Error('Direct project reconciliation is reserved for the root-repoint authority transition.')
+  }
+  if (BigInt(input.grantDecisionRevision) !== input.lockedProject.grantDecisionRevision) {
+    throw httpError('Project filesystem decision changed before root reconciliation.', 409)
   }
   assertMcpAdmissionLockSequence([
     'project',
@@ -569,6 +750,17 @@ export async function reconcileFilesystemGrantsForProject(
     .where(eq(filesystemMcpGrantApprovals.projectId, input.lockedProject.id))
     .orderBy(filesystemMcpGrantApprovals.id)
     .for('update')
+  const projectDecisionRows = await tx.select().from(projectFilesystemGrantDecisions)
+    .where(eq(projectFilesystemGrantDecisions.projectId, input.lockedProject.id))
+    .orderBy(projectFilesystemGrantDecisions.id)
+    .for('update')
+  const [projectPointer] = await tx.select().from(projectFilesystemCurrentDecisionPointers)
+    .where(eq(projectFilesystemCurrentDecisionPointers.projectId, input.lockedProject.id))
+    .for('update')
+  if (!projectPointer) throw httpError('Project filesystem decision authority is not initialized.', 409)
+  if (projectDecisionPointerParent(projectPointer, projectDecisionRows) === undefined) {
+    throw httpError('Project filesystem decision pointer does not match its immutable parent.', 409)
+  }
   const pointerRows = packageRows.length === 0
     ? []
     : await tx.select({ id: filesystemMcpCurrentDecisionPointers.id })
@@ -582,11 +774,43 @@ export async function reconcileFilesystemGrantsForProject(
   if (pointerRows.length !== packageRows.length) {
     throw httpError('Filesystem decision authority is not initialized for every package.', 409)
   }
-  return reconcileLockedProjectRows({
+  const now = new Date()
+  const revision = input.lockedProject.grantDecisionRevision + BigInt(1)
+  const appended = await appendProjectFilesystemDecision({
+    actorId: input.actorId,
+    capabilities: [],
+    decision: 'revoked',
     lockedProject: input.lockedProject,
-    nextMcpConfig: input.nextMcpConfig,
-    now: new Date(),
+    now,
+    pointer: projectPointer,
+    reason: 'Project root binding changed; explicit filesystem reapproval is required.',
+    revision,
+    revocationReason: 'project_root_repoint',
+    rootBindingRevision: input.lockedProject.rootBindingRevision,
+    tx,
+  })
+  const nextMcpConfig = filesystemMcpConfigAfterRootRepoint({
+    grantApprovalId: appended.decision.id,
+    grantDecisionRevision: revision,
+    mcpConfig: input.nextMcpConfig,
+    rootBindingRevision: input.lockedProject.rootBindingRevision,
+  })
+  const [updatedProject] = await tx.update(projects).set({
+    grantDecisionRevision: revision,
+    mcpConfig: nextMcpConfig,
+    updatedAt: now,
+  }).where(and(
+    eq(projects.id, input.lockedProject.id),
+    eq(projects.grantDecisionRevision, input.lockedProject.grantDecisionRevision),
+    eq(projects.rootBindingRevision, input.lockedProject.rootBindingRevision),
+  )).returning()
+  if (!updatedProject) throw httpError('Project root authority changed concurrently.', 409)
+  return reconcileLockedProjectRows({
+    lockedProject: updatedProject,
+    nextMcpConfig,
+    now,
     packages: new Map(packageRows.map((pkg) => [pkg.id, pkg])),
+    projectAuthority: appended.authority,
     taskRows,
     trigger: input.trigger,
     tx,
@@ -639,10 +863,7 @@ async function lockMutationRows(input: {
   if (input.targetPackageIds.length > 0 || input.projectWide) {
     const decisionScope = input.projectWide
       ? eq(filesystemMcpGrantApprovals.projectId, project.id)
-      : or(
-          inArray(filesystemMcpGrantApprovals.workPackageId, [...input.targetPackageIds]),
-          eq(filesystemMcpGrantApprovals.decisionScope, 'project'),
-        )
+      : inArray(filesystemMcpGrantApprovals.workPackageId, [...input.targetPackageIds])
     await input.tx
       .select({ id: filesystemMcpGrantApprovals.id })
       .from(filesystemMcpGrantApprovals)
@@ -652,6 +873,26 @@ async function lockMutationRows(input: {
       ))
       .orderBy(filesystemMcpGrantApprovals.id)
       .for('update')
+  }
+
+  const projectDecisionRows = await input.tx
+    .select()
+    .from(projectFilesystemGrantDecisions)
+    .where(eq(projectFilesystemGrantDecisions.projectId, project.id))
+    .orderBy(projectFilesystemGrantDecisions.id)
+    .for('update')
+
+  const [projectPointer] = await input.tx
+    .select()
+    .from(projectFilesystemCurrentDecisionPointers)
+    .where(eq(projectFilesystemCurrentDecisionPointers.projectId, project.id))
+    .for('update')
+  if (!projectPointer) {
+    throw httpError('Project filesystem decision authority is not initialized.', 409)
+  }
+  const currentProjectDecision = projectDecisionPointerParent(projectPointer, projectDecisionRows)
+  if (currentProjectDecision === undefined) {
+    throw httpError('Project filesystem decision pointer does not match its immutable parent.', 409)
   }
 
   const pointerPackageIds = input.projectWide
@@ -672,6 +913,8 @@ async function lockMutationRows(input: {
     packageById,
     pointerByPackageId: new Map(pointerRows.map((pointer) => [pointer.workPackageId, pointer])),
     project,
+    projectAuthority: currentProjectDecision ? projectDecisionAuthority(currentProjectDecision) : null,
+    projectPointer,
     taskRows,
   }
 }
@@ -731,7 +974,9 @@ export async function mutateTaskFilesystemGrants(input: {
 
     let revision = locked.project.grantDecisionRevision
     let nextConfig = locked.project.mcpConfig
-    const approvals: Array<typeof filesystemMcpGrantApprovals.$inferSelect> = []
+    let projectAuthority = locked.projectAuthority
+    let projectPointer = locked.projectPointer
+    const approvals: FilesystemGrantMutationResult['approvals'] = []
     const states: FilesystemGrantMutationResult['states'] = []
     const directlyAffected = new Set<string>()
 
@@ -746,6 +991,7 @@ export async function mutateTaskFilesystemGrants(input: {
           { metadata: pkg.metadata },
           {
             mcpConfig: nextConfig,
+            filesystemGrantDecision: projectAuthority,
             rootBindingRevision: locked.project.rootBindingRevision,
           },
           required,
@@ -766,38 +1012,31 @@ export async function mutateTaskFilesystemGrants(input: {
 
       if (mutation.decision === 'approved' && mutation.grantMode === 'always_allow') {
         const grants = isRecord(nextConfig.grants) ? nextConfig.grants : {}
-        const current = isRecord(grants.filesystem) ? grants.filesystem : {}
         const merged = canonicalFilesystemProjectCapabilities([
-          ...canonicalFilesystemProjectCapabilities(current.capabilities),
+          ...(projectAuthority?.decision === 'approved' ? projectAuthority.capabilities : []),
           ...capabilities,
         ])
-        const effectiveGrant = {
-          schemaVersion: 2,
-          phase: 'effective',
-          source: 'project-filesystem-approval',
-          grantApprovalId: approvalId,
-          grantDecisionRevision: revisionText,
-          rootBindingRevision: locked.project.rootBindingRevision.toString(),
-          status: 'approved',
+        const appended = await appendProjectFilesystemDecision({
+          actorId: input.actorId,
           capabilities: merged,
-        }
-        const [approval] = await tx.insert(filesystemMcpGrantApprovals).values({
-          id: approvalId,
-          projectId: locked.project.id,
-          taskId: null,
-          workPackageId: null,
-          decisionScope: 'project',
-          decidedBy: input.actorId,
           decision: 'approved',
-          capabilities: merged,
+          lockedProject: locked.project,
+          now,
+          pointer: projectPointer,
           reason: mutation.reason,
-          effectiveGrant,
-          grantDecisionRevision: revision,
-          rootBindingRevision: locked.project.rootBindingRevision,
-          pointerFingerprint: null,
-          updatedAt: now,
-        }).returning()
-        approvals.push(approval)
+          revision,
+          revocationReason: null,
+          tx,
+        })
+        projectAuthority = appended.authority
+        projectPointer = appended.pointer
+        approvals.push({
+          id: appended.decision.id,
+          capabilities: appended.decision.capabilities,
+          decision: appended.decision.decision,
+          grantDecisionRevision: appended.decision.grantDecisionRevision,
+          workPackageId: null,
+        })
         nextConfig = {
           ...nextConfig,
           grants: {
@@ -808,7 +1047,7 @@ export async function mutateTaskFilesystemGrants(input: {
               status: 'approved',
               grantMode: 'always_allow',
               capabilities: merged,
-              grantApprovalId: approval.id,
+              grantApprovalId: appended.decision.id,
               grantDecisionRevision: revisionText,
               rootBindingRevision: locked.project.rootBindingRevision.toString(),
               approvedAt: now.toISOString(),
@@ -817,7 +1056,12 @@ export async function mutateTaskFilesystemGrants(input: {
             },
           },
         }
-        states.push({ approvalId, decision: 'approved', grantDecisionRevision: revisionText, workPackageId: pkg.id })
+        states.push({
+          approvalId: appended.decision.id,
+          decision: 'approved',
+          grantDecisionRevision: revisionText,
+          workPackageId: pkg.id,
+        })
         continue
       }
 
@@ -908,7 +1152,13 @@ export async function mutateTaskFilesystemGrants(input: {
         updatedAt: now,
       })
       directlyAffected.add(pkg.id)
-      approvals.push(approval)
+      approvals.push({
+        id: approval.id,
+        capabilities: approval.capabilities,
+        decision: approval.decision,
+        grantDecisionRevision: approval.grantDecisionRevision,
+        workPackageId: approval.workPackageId,
+      })
       states.push({ approvalId, decision: mutation.decision, grantDecisionRevision: revisionText, workPackageId: pkg.id })
     }
 
@@ -930,6 +1180,7 @@ export async function mutateTaskFilesystemGrants(input: {
         nextMcpConfig: nextConfig,
         now,
         packages: locked.packageById,
+        projectAuthority,
         taskRows: locked.taskRows,
         trigger: 'task_always_allow',
         tx,
@@ -941,6 +1192,7 @@ export async function mutateTaskFilesystemGrants(input: {
       now,
       packages: locked.packageById,
       packageIds: [...directlyAffected],
+      projectAuthority,
       forcePackageIds: directlyAffected,
       tx,
     })
@@ -970,7 +1222,8 @@ export async function mutateProjectFilesystemGrant(input: {
   projectId: string
   reason: string
 }): Promise<{
-  grant: ReturnType<typeof projectFilesystemGrantFromConfig>
+  authority: ProjectFilesystemDecisionAuthority
+  grant: ReturnType<typeof projectFilesystemGrantFromAuthority>
   mcpConfig: ProjectMcpConfig
   recoveredTaskIds: string[]
 }> {
@@ -987,32 +1240,29 @@ export async function mutateProjectFilesystemGrant(input: {
     }
     const revision = locked.project.grantDecisionRevision + BigInt(1)
     const revisionText = revision.toString()
-    const approvalId = randomUUID()
     const capabilities = canonicalFilesystemProjectCapabilities(input.capabilities)
+    if (input.enabled && (capabilities.length === 0 || !capabilities.includes('filesystem.project.read'))) {
+      throw httpError('Project filesystem authority must include filesystem.project.read.', 400)
+    }
     const existingGrants = isRecord(locked.project.mcpConfig.grants)
       ? locked.project.mcpConfig.grants
       : {}
-    const [approval] = await tx.insert(filesystemMcpGrantApprovals).values({
-      id: approvalId,
-      projectId: locked.project.id,
-      taskId: null,
-      workPackageId: null,
-      decisionScope: 'project',
-      decidedBy: input.actorId,
-      decision: input.enabled ? 'approved' : 'denied',
+    const narrowed = input.enabled && locked.projectAuthority?.decision === 'approved' &&
+      locked.projectAuthority.capabilities.some((capability) => !capabilities.includes(capability as FilesystemProjectCapability))
+    const appended = await appendProjectFilesystemDecision({
+      actorId: input.actorId,
       capabilities: input.enabled ? capabilities : [],
+      decision: input.enabled ? 'approved' : 'revoked',
+      lockedProject: locked.project,
+      now,
+      pointer: locked.projectPointer,
       reason: input.reason,
-      effectiveGrant: {
-        schemaVersion: 2,
-        source: 'project-filesystem-approval',
-        status: input.enabled ? 'approved' : 'revoked',
-        grantDecisionRevision: revisionText,
-        rootBindingRevision: locked.project.rootBindingRevision.toString(),
-      },
-      grantDecisionRevision: revision,
-      rootBindingRevision: locked.project.rootBindingRevision,
-      updatedAt: now,
-    }).returning()
+      revision,
+      revocationReason: input.enabled
+        ? narrowed ? 'project_grant_narrowed' : null
+        : 'project_grant_removed',
+      tx,
+    })
     const nextGrants = input.enabled
       ? {
           ...existingGrants,
@@ -1022,7 +1272,7 @@ export async function mutateProjectFilesystemGrant(input: {
             status: 'approved',
             grantMode: 'always_allow',
             capabilities,
-            grantApprovalId: approval.id,
+            grantApprovalId: appended.decision.id,
             grantDecisionRevision: revisionText,
             rootBindingRevision: locked.project.rootBindingRevision.toString(),
             approvedAt: now.toISOString(),
@@ -1035,7 +1285,7 @@ export async function mutateProjectFilesystemGrant(input: {
           ...Object.fromEntries(Object.entries(existingGrants).filter(([key]) => key !== 'filesystem')),
           filesystemRevocation: {
             schemaVersion: 2,
-            grantApprovalId: approval.id,
+            grantApprovalId: appended.decision.id,
             grantDecisionRevision: revisionText,
             rootBindingRevision: locked.project.rootBindingRevision.toString(),
             revocationReason: 'project_grant_removed',
@@ -1057,12 +1307,14 @@ export async function mutateProjectFilesystemGrant(input: {
       nextMcpConfig: nextConfig,
       now,
       packages: locked.packageById,
+      projectAuthority: appended.authority,
       taskRows: locked.taskRows,
       trigger: input.enabled ? 'project_always_allow' : 'project_grant_revocation',
       tx,
     })
     return {
-      grant: projectFilesystemGrantFromConfig(updatedProject.mcpConfig),
+      authority: appended.authority,
+      grant: projectFilesystemGrantFromAuthority(appended.authority),
       mcpConfig: updatedProject.mcpConfig,
       recoveredTaskIds: reconciled.recoveredTaskIds,
     }

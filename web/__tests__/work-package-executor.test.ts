@@ -62,6 +62,32 @@ import { sanitizeWorkerMessage } from '@/worker/redaction'
 const now = new Date('2026-06-26T00:00:00.000Z')
 let tempRoot = ''
 
+function immutableProjectAuthorityFromConfig(mcpConfig: unknown) {
+  const config = mcpConfig && typeof mcpConfig === 'object' ? mcpConfig as Record<string, unknown> : {}
+  const grants = config.grants && typeof config.grants === 'object'
+    ? config.grants as Record<string, unknown>
+    : {}
+  const grant = grants.filesystem && typeof grants.filesystem === 'object'
+    ? grants.filesystem as Record<string, unknown>
+    : null
+  if (!grant || grant.status !== 'approved') return null
+  return {
+    schemaVersion: 2 as const,
+    decisionId: String(grant.grantApprovalId ?? 'grant-project-1'),
+    projectId: 'project-1',
+    decision: 'approved' as const,
+    capabilities: Array.isArray(grant.capabilities) ? [...grant.capabilities].sort() : [],
+    grantDecisionRevision: String(grant.grantDecisionRevision ?? '1'),
+    rootBindingRevision: String(grant.rootBindingRevision ?? '1'),
+    decisionFingerprint: `sha256:${'1'.repeat(64)}`,
+    decisionGeneration: '1',
+    decidedAt: String(grant.approvedAt ?? now.toISOString()),
+    decidedBy: String(grant.approvedBy ?? 'user-1'),
+    reason: String(grant.reason ?? ''),
+    revocationReason: null,
+  }
+}
+
 function fixtureSecret(...parts: string[]) {
   return parts.join('')
 }
@@ -102,6 +128,8 @@ function context(overrides: Partial<WorkPackageExecutionContext> = {}): WorkPack
     validatedProjectRoot: tempRoot,
     model: { provider: 'test', modelId: 'test-model' } as never,
     modelIdUsed: 'test-model',
+    projectFilesystemDecision: overrides.projectFilesystemDecision ??
+      immutableProjectAuthorityFromConfig(overrides.project?.mcpConfig),
     project: {
       id: 'project-1',
       name: 'Tracker Smoke',

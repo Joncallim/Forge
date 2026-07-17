@@ -29,7 +29,11 @@ import {
   buildFilesystemGrantBlockMetadata,
   type FilesystemGrantHoldState,
 } from '../lib/mcps/filesystem-grant-lifecycle'
-import { convergeOperatorHeldTask } from '../lib/mcps/filesystem-grant-reconciliation'
+import {
+  convergeOperatorHeldTask,
+  loadCurrentProjectFilesystemDecision,
+} from '../lib/mcps/filesystem-grant-reconciliation'
+import type { ProjectFilesystemDecisionAuthority } from '../lib/mcps/filesystem-project-authority'
 import { assertMcpAdmissionLockSequence } from '../lib/mcps/mcp-admission-lock-order'
 import { updateTaskStatusIfCurrent } from './task-state'
 import {
@@ -128,6 +132,8 @@ type HandoffOptions = {
 }
 
 type McpProjectFreshnessSnapshot = {
+  filesystemGrantDecision?: ProjectFilesystemDecisionAuthority | null
+  grantDecisionRevision: bigint
   id: string
   localPath: string | null
   mcpConfig: unknown
@@ -224,6 +230,7 @@ async function rereadMcpHandoffInputs(taskId: string, packageId: string): Promis
       blockedReason: workPackages.blockedReason,
       harnessId: workPackages.harnessId,
       id: workPackages.id,
+      grantDecisionRevision: projects.grantDecisionRevision,
       localPath: projects.localPath,
       mcpConfig: projects.mcpConfig,
       mcpRequirements: workPackages.mcpRequirements,
@@ -241,9 +248,12 @@ async function rereadMcpHandoffInputs(taskId: string, packageId: string): Promis
     .where(and(eq(workPackages.id, packageId), eq(workPackages.taskId, taskId)))
     .limit(1)
   if (!row) return null
+  const filesystemGrantDecision = await loadCurrentProjectFilesystemDecision(row.projectId)
   return {
     pkg: row,
     project: {
+      filesystemGrantDecision,
+      grantDecisionRevision: row.grantDecisionRevision ?? BigInt(0),
       id: row.projectId,
       localPath: row.localPath,
       mcpConfig: row.mcpConfig,
@@ -257,6 +267,7 @@ function mcpProjectSnapshotsMatch(
   right: McpProjectFreshnessSnapshot,
 ): boolean {
   return left.id === right.id &&
+    (left.grantDecisionRevision ?? BigInt(0)) === (right.grantDecisionRevision ?? BigInt(0)) &&
     left.localPath === right.localPath &&
     (left.rootBindingRevision ?? BigInt(0)) === (right.rootBindingRevision ?? BigInt(0)) &&
     sameJsonSnapshot(left.mcpConfig, right.mcpConfig)
@@ -288,6 +299,7 @@ async function lockFreshMcpHandoffInputs(
   const [lockedProject] = await tx
     .select({
       id: projects.id,
+      grantDecisionRevision: projects.grantDecisionRevision,
       localPath: projects.localPath,
       mcpConfig: projects.mcpConfig,
       rootBindingRevision: projects.rootBindingRevision,
@@ -1059,6 +1071,7 @@ async function failWorkPackageForFilesystemGrant(input: {
     const [lockedProject] = await tx
       .select({
         id: projects.id,
+        grantDecisionRevision: projects.grantDecisionRevision,
         localPath: projects.localPath,
         mcpConfig: projects.mcpConfig,
         rootBindingRevision: projects.rootBindingRevision,
@@ -1151,6 +1164,7 @@ function filesystemGrantHandoffBlock(
       mcpRequirements: pkg.mcpRequirements,
       metadata: pkg.metadata,
       projectMcpConfig: project.mcpConfig,
+      projectFilesystemDecision: project.filesystemGrantDecision,
       projectRootBindingRevision: project.rootBindingRevision,
     })
     if (!check.blocked) return null
@@ -1167,6 +1181,7 @@ function filesystemGrantHandoffBlock(
     mcpRequirements: pkg.mcpRequirements,
     metadata: pkg.metadata,
     projectMcpConfig: project.mcpConfig,
+    projectFilesystemDecision: project.filesystemGrantDecision,
     projectRootBindingRevision: project.rootBindingRevision,
   })
   if (!check.blocked) return null
@@ -1360,7 +1375,10 @@ async function loadPriorReviewContext(
 async function captureMcpHealth(taskId: string): Promise<McpHealthCapture | null> {
   const project = await loadTaskProjectForMcpBroker(taskId)
   if (!project) return null
+  const filesystemGrantDecision = await loadCurrentProjectFilesystemDecision(project.id)
   const projectSnapshot = {
+    filesystemGrantDecision,
+    grantDecisionRevision: project.grantDecisionRevision ?? BigInt(0),
     id: project.id,
     localPath: project.localPath ?? null,
     mcpConfig: project.mcpConfig ?? null,
@@ -1369,7 +1387,7 @@ async function captureMcpHealth(taskId: string): Promise<McpHealthCapture | null
   try {
     return {
       error: null,
-      overview: await getProjectMcpOverview(project),
+      overview: await getProjectMcpOverview(project, filesystemGrantDecision),
       project: projectSnapshot,
     }
   } catch (err) {
@@ -1431,6 +1449,7 @@ function evaluateWorkPackageHandoffAdmission(input: {
       mcpRequirements: pkg.mcpRequirements,
       metadata: pkg.metadata,
       projectMcpConfig: project.mcpConfig,
+      projectFilesystemDecision: project.filesystemGrantDecision,
       projectRootBindingRevision: project.rootBindingRevision,
       title: pkg.title,
     })
