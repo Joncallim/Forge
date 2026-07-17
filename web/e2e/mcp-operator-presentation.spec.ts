@@ -5,9 +5,11 @@ import {
   seedProject,
   seedSession,
 } from './helpers'
+import { applyEpic172Step0E2EBridge } from './epic-172-step0-bridge'
 
 test.describe('MCP operator presentation', () => {
-  test.beforeEach(async () => {
+  test.beforeEach(async ({}, testInfo) => {
+    applyEpic172Step0E2EBridge(testInfo, 'mcp-operator-presentation.spec.ts')
     await resetState()
   })
 

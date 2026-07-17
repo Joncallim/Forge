@@ -4734,11 +4734,12 @@ export function filesystemGrantExpectedPointerFromState(state: {
   pointerFingerprint?: string | null
   pointerVersion?: string | null
   workPackageId?: string
-}): { currentDecisionId: string | null; currentDecisionRevision: string | null; pointerFingerprint: string; pointerVersion: string } {
+}): { currentDecisionId: string | null; currentDecisionRevision: string | null; pointerFingerprint: string; pointerVersion: string } | null {
+  if (!state?.currentDecision && !state?.pointerFingerprint) return null
   return {
     currentDecisionId: typeof state?.currentDecision?.id === 'string' ? state.currentDecision.id : null,
-    currentDecisionRevision: null,
-    pointerFingerprint: state?.pointerFingerprint ?? '',
-    pointerVersion: state?.pointerVersion ?? '0',
+    currentDecisionRevision: typeof state?.currentDecision?.grantDecisionRevision === 'string' ? state.currentDecision.grantDecisionRevision : null,
+    pointerFingerprint: (state?.pointerFingerprint as string) ?? '',
+    pointerVersion: (state?.pointerVersion as string) ?? '0',
   }
 }
