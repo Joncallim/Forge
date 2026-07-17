@@ -1,10 +1,21 @@
 import { describe, expect, it } from 'vitest'
 import {
   decodeEpic172SignedEnvelope,
+  EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS,
   parseEpic172ReleaseCliArgs,
 } from '@/scripts/epic-172-release'
 
 describe('Epic 172 release CLI boundary', () => {
+  it('inspects the exact release and retained-evidence foreign-key set', () => {
+    expect(EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS).toHaveLength(43)
+    expect(new Set(EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS)).toHaveProperty('size', 43)
+    expect(new Set(EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS.map((name) => name.slice(0, 63))))
+      .toHaveProperty('size', 43)
+    expect(EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS).toContain('tasks_project_id_projects_id_fk')
+    expect(EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS).toContain(
+      'forge_epic_172_release_evidence_signer_key_id_forge_release_signer_keys_id_fk',
+    )
+  })
   it('accepts only the closed command option contract', () => {
     expect(parseEpic172ReleaseCliArgs(['record-evidence', '--input', 'receipt.json'])).toEqual({
       command: 'record-evidence',

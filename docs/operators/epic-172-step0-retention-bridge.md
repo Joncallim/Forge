@@ -59,7 +59,7 @@ evidence, and the external signer private key must never enter Forge.
    ```
 
    The command exits nonzero unless the enablement row is disabled, the project
-   hard-delete trigger is enabled, at least 43 release/retention foreign keys use
+   hard-delete trigger is enabled, the exact 43 release/retention foreign keys use
    `RESTRICT` or `NO ACTION`, and all four role identities have the expected login
    and inheritance settings. `step0ReceiptCount` may still be zero at this point.
 

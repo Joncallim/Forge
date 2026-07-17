@@ -20,6 +20,56 @@ const WRITER_DATABASE_URL = 'FORGE_EPIC_172_EVIDENCE_DATABASE_URL'
 const ADMIN_DATABASE_URL = 'FORGE_EPIC_172_ADMIN_DATABASE_URL'
 const MAX_INPUT_BYTES = 128 * 1024
 
+export const EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS = Object.freeze([
+  'agent_runs_task_id_tasks_id_fk',
+  'agent_runs_work_package_id_work_packages_id_fk',
+  'approval_gates_task_id_tasks_id_fk',
+  'approval_gates_work_package_id_work_packages_id_fk',
+  'approval_gates_source_agent_run_id_agent_runs_id_fk',
+  'approval_gates_source_artifact_id_artifacts_id_fk',
+  'artifacts_agent_run_id_agent_runs_id_fk',
+  'filesystem_mcp_grant_approvals_task_id_tasks_id_fk',
+  'filesystem_mcp_grant_approvals_work_package_id_work_packages_id_fk',
+  'filesystem_mcp_runtime_audits_task_id_tasks_id_fk',
+  'filesystem_mcp_runtime_audits_work_package_id_work_packages_id_fk',
+  'filesystem_mcp_runtime_audits_agent_run_id_agent_runs_id_fk',
+  'filesystem_mcp_runtime_audits_grant_approval_id_filesystem_mcp_grant_approvals_id_fk',
+  'project_mcp_status_checks_project_id_projects_id_fk',
+  'repository_command_audits_task_id_tasks_id_fk',
+  'repository_command_audits_work_package_id_work_packages_id_fk',
+  'repository_command_audits_agent_run_id_agent_runs_id_fk',
+  'repository_command_audits_artifact_id_artifacts_id_fk',
+  'task_attempts_task_id_tasks_id_fk',
+  'task_logs_task_id_tasks_id_fk',
+  'task_logs_task_attempt_id_task_attempts_id_fk',
+  'task_logs_agent_run_id_agent_runs_id_fk',
+  'task_logs_work_package_id_work_packages_id_fk',
+  'task_logs_artifact_id_artifacts_id_fk',
+  'task_logs_approval_gate_id_approval_gates_id_fk',
+  'task_questions_task_id_tasks_id_fk',
+  'tasks_project_id_projects_id_fk',
+  'vcs_changes_task_id_tasks_id_fk',
+  'vcs_changes_work_package_id_work_packages_id_fk',
+  'vcs_changes_agent_run_id_agent_runs_id_fk',
+  'work_package_dependencies_work_package_id_work_packages_id_fk',
+  'work_package_dependencies_depends_on_work_package_id_work_packages_id_fk',
+  'work_packages_task_id_tasks_id_fk',
+  'forge_epic_172_enablement_state_enablement_receipt_id_forge_epic_172_release_evidence_id_fk',
+  'forge_epic_172_enablement_state_final_readiness_receipt_id_forge_epic_172_release_evidence_id_fk',
+  'forge_epic_172_enablement_state_opening_authorization_id_forge_epic_172_transition_authorizations_id_fk',
+  'forge_epic_172_enablement_transition_audits_authorization_id_forge_epic_172_transition_authorizations_id_fk',
+  'forge_epic_172_enablement_transition_audits_evidence_receipt_id_forge_epic_172_release_evidence_id_fk',
+  'forge_epic_172_release_evidence_signer_key_id_forge_release_signer_keys_id_fk',
+  'forge_epic_172_release_evidence_consumptions_receipt_id_forge_epic_172_release_evidence_id_fk',
+  'forge_epic_172_release_evidence_consumptions_authorization_id_forge_epic_172_transition_authorizations_id_fk',
+  'forge_epic_172_transition_authorizations_signer_key_id_forge_release_signer_keys_id_fk',
+  'forge_release_signer_key_lifecycle_audits_signer_key_id_forge_release_signer_keys_id_fk',
+] as const)
+
+const EPIC_172_REQUIRED_RETENTION_PHYSICAL_KEYS = Object.freeze(
+  EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS.map((name) => name.slice(0, 63)),
+)
+
 type Command =
   | 'activate-signer'
   | 'inspect'
@@ -201,14 +251,17 @@ async function inspectReleaseBridge(): Promise<boolean> {
       from public.forge_epic_172_enablement_state
       where singleton_id = 'epic-172'
     `
-    const [retention] = await sql<{ constraintCount: number }[]>`
-      select count(*)::int as "constraintCount"
+    const retentionRows = await sql<{ constraintName: string; deleteAction: string }[]>`
+      select
+        constraint_row.conname as "constraintName",
+        constraint_row.confdeltype::text as "deleteAction"
       from pg_catalog.pg_constraint constraint_row
       join pg_catalog.pg_namespace namespace_row
         on namespace_row.oid = constraint_row.connamespace
       where namespace_row.nspname = 'public'
         and constraint_row.contype = 'f'
-        and constraint_row.confdeltype = 'r'
+        and constraint_row.conname = any(${sql.array([...EPIC_172_REQUIRED_RETENTION_PHYSICAL_KEYS])}::text[])
+      order by constraint_row.conname
     `
     const [trigger] = await sql<{ enabled: boolean }[]>`
       select (trigger_row.tgenabled <> 'D') as enabled
@@ -238,18 +291,23 @@ async function inspectReleaseBridge(): Promise<boolean> {
         and predecessor_receipt_ids = '[]'::jsonb
     `
     const roleMap = new Map(roles.map((role) => [role.role, role]))
+    const retentionMap = new Map(retentionRows.map((row) => [row.constraintName, row.deleteAction]))
+    const missingOrUnsafeForeignKeys = EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS.filter((name) => (
+      !['a', 'r'].includes(retentionMap.get(name.slice(0, 63)) ?? '')
+    ))
     const principalsReady = roleMap.get('forge_release_routines_owner')?.canLogin === false
       && roleMap.get('forge_release_routines_owner')?.inherits === false
       && ['forge_release_evidence_writer', 'forge_release_evidence_consumer', 'forge_release_transition']
         .every((role) => roleMap.get(role)?.canLogin === true && roleMap.get(role)?.inherits === false)
     const ready = enablement?.state === 'disabled'
-      && (retention?.constraintCount ?? 0) >= 43
+      && missingOrUnsafeForeignKeys.length === 0
       && trigger?.enabled === true
       && principalsReady
     process.stdout.write(`${JSON.stringify({
       ready,
       enablement,
-      restrictForeignKeys: retention?.constraintCount ?? 0,
+      retentionForeignKeys: retentionRows.length,
+      missingOrUnsafeForeignKeys,
       projectHardDeleteGuard: trigger?.enabled === true,
       principals: roles,
       step0ReceiptCount: receipt?.count ?? 0,
