@@ -9,7 +9,6 @@ export type TaskLogLevel = 'info' | 'success' | 'warning' | 'error'
 export type TaskLogFrontMatter = {
   connector?: string | null
   model?: string | null
-  prompt?: string | null
   timestamp?: string
 }
 

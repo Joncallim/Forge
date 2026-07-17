@@ -34,6 +34,9 @@ export type McpFallbackAction = 'block' | 'continue_without_mcp' | 'ask_user'
 export type McpValidationStatus = 'valid' | 'blocked' | 'warnings'
 export type McpGrantDecisionStatus = 'proposed' | 'warning' | 'blocked'
 export type WorkPackageMcpBrokerStatus = 'allowed' | 'blocked' | 'warnings'
+export type McpPlanningConfidence = 'low' | 'medium' | 'high'
+export type McpPlanningScope = { kind: 'project' }
+export const MCP_PLANNING_ACCESS_MODE = 'planning_instruction' as const
 
 export type McpExecutionRequirement = {
   requirementKey?: string
@@ -41,6 +44,9 @@ export type McpExecutionRequirement = {
   mcpId: string
   requirement: McpRequirementLevel
   reason: string
+  confidence?: McpPlanningConfidence
+  scope?: McpPlanningScope
+  accessMode?: typeof MCP_PLANNING_ACCESS_MODE
   assignment: {
     type: McpAssignmentType
     targetAgents: string[]
@@ -62,6 +68,8 @@ export type McpRequirementContext = {
 export type McpAwareSubtask = {
   id: string
   agent: string
+  scope?: McpPlanningScope
+  accessMode?: typeof MCP_PLANNING_ACCESS_MODE
   dependsOn: string[]
   mcpCapabilities: string[]
   capabilityBindings?: Array<{ capability: string; requirementKey: string }>
@@ -454,6 +462,18 @@ function normalizeRequirement(raw: unknown, sourceRequirementIndex: number, erro
   const requirement = raw.requirement === 'optional' ? 'optional' : 'required'
   const reason = strictText(raw.reason, 360, { allowEmpty: true })
   if (!reason.valid) localErrors.push(`MCP requirement ${sourceRequirementIndex} reason must be a bounded string.`)
+  const confidence: McpPlanningConfidence = raw.confidence === 'low' || raw.confidence === 'high'
+    ? raw.confidence
+    : 'medium'
+  if (raw.confidence !== undefined && !['low', 'medium', 'high'].includes(String(raw.confidence))) {
+    localErrors.push(`MCP requirement ${sourceRequirementIndex} confidence must be low, medium, or high.`)
+  }
+  if (raw.scope !== undefined && (!isRecord(raw.scope) || raw.scope.kind !== 'project')) {
+    localErrors.push(`MCP requirement ${sourceRequirementIndex} scope must be project-scoped.`)
+  }
+  if (raw.accessMode !== undefined && raw.accessMode !== MCP_PLANNING_ACCESS_MODE) {
+    localErrors.push(`MCP requirement ${sourceRequirementIndex} accessMode must be planning_instruction.`)
+  }
   const normalizedAssignment = normalizeAssignment(raw.assignment, localErrors, sourceRequirementIndex)
   const normalizedPermissions = normalizePermissions(raw.agentPermissions, localErrors, sourceRequirementIndex)
   const prohibitedCapabilities = normalizePolicyCapabilities(raw.prohibitedCapabilities, {
@@ -480,6 +500,9 @@ function normalizeRequirement(raw: unknown, sourceRequirementIndex: number, erro
     mcpId: mcpId.value.toLowerCase(),
     requirement,
     reason: reason.value,
+    confidence,
+    scope: { kind: 'project' },
+    accessMode: MCP_PLANNING_ACCESS_MODE,
     assignment: normalizedAssignment.assignment,
     // An invalid assignment is one rejected policy unit. Do not salvage an
     // agentPermissions subset that could give a different package access.
@@ -683,6 +706,12 @@ function normalizeSubtask(
   if (!id.valid) localErrors.push(`MCP-aware subtask ${subtaskIndex} id must be a bounded non-empty string.`)
   const agent = cleanAgent(raw.agent)
   if (!agent) localErrors.push(`MCP-aware subtask ${subtaskIndex} agent must be a bounded agent identity.`)
+  if (raw.scope !== undefined && (!isRecord(raw.scope) || raw.scope.kind !== 'project')) {
+    localErrors.push(`MCP-aware subtask ${subtaskIndex} scope must be project-scoped.`)
+  }
+  if (raw.accessMode !== undefined && raw.accessMode !== MCP_PLANNING_ACCESS_MODE) {
+    localErrors.push(`MCP-aware subtask ${subtaskIndex} accessMode must be planning_instruction.`)
+  }
   const normalizedCapabilities = normalizePolicyCapabilities(raw.mcpCapabilities, {
     errors: localErrors,
     label: `MCP-aware subtask ${subtaskIndex} mcpCapabilities`,
@@ -788,6 +817,8 @@ function normalizeSubtask(
   return {
     id: id.value,
     agent,
+    scope: { kind: 'project' },
+    accessMode: MCP_PLANNING_ACCESS_MODE,
     dependsOn: dependsOn.values,
     mcpCapabilities,
     capabilityBindings,
@@ -1173,7 +1204,11 @@ function admissionForAgent(design: McpExecutionDesign, packageIdentity: string, 
     statusFor: (mcpId) => statusFor(overview, mcpId),
     effectiveGrantFor: ({ requiredCapabilities }) => readEffectiveGrantState(
       { metadata: {} },
-      { mcpConfig: overview.config },
+      {
+        mcpConfig: overview.config,
+        filesystemGrantDecision: overview.filesystemGrantDecision,
+        rootBindingRevision: overview.rootBindingRevision,
+      },
       requiredCapabilities,
     ),
     hasPromptOnlyContextFor: ({ requirementKey, mcpId }) => contexts.has(`${requirementKey}\u0000${mcpId}`),
@@ -1520,6 +1555,8 @@ export type WorkPackageMcpAdmissionInput = {
   mcpRequirements?: unknown
   metadata?: unknown
   projectMcpConfig?: unknown
+  projectFilesystemDecision?: unknown
+  projectRootBindingRevision?: unknown
   title?: string
 }
 
@@ -1533,7 +1570,11 @@ function admitWorkPackageMcpBrokerUnchecked(input: WorkPackageMcpAdmissionInput)
     statusFor: (mcpId) => statusFor(input.mcpOverview, mcpId),
     effectiveGrantFor: ({ requiredCapabilities }) => readEffectiveGrantState(
       { metadata: input.metadata },
-      { mcpConfig: input.projectMcpConfig ?? {} },
+      {
+        mcpConfig: input.projectMcpConfig ?? {},
+        filesystemGrantDecision: input.projectFilesystemDecision,
+        rootBindingRevision: input.projectRootBindingRevision,
+      },
       requiredCapabilities,
     ),
     hasPromptOnlyContextFor: (entry) => brokerHasPromptContext(input.metadata, entry, entries),

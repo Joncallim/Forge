@@ -11,6 +11,7 @@ import {
   bigint,
   customType,
   check,
+  foreignKey,
   index,
   uniqueIndex,
 } from 'drizzle-orm/pg-core'
@@ -190,14 +191,425 @@ export const projects = pgTable('projects', {
     .$type<ProjectMcpConfig>()
     .notNull()
     .default(sql`'{"profile":"default","requiredMcps":["filesystem","github"],"overrides":{}}'::jsonb`),
+  // Opaque packet identity. It is random and never derived from localPath.
+  rootRef: uuid('root_ref').notNull().defaultRandom(),
+  // S3 serializes this BIGINT as a canonical decimal string at every JSON/API
+  // boundary. Database order, never timestamps, decides grant precedence.
+  grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' })
+    .notNull()
+    .default(BigInt(0)),
+  // Zero is the explicit unbound state. S4 binds a project root by advancing
+  // this counter; S3 never upgrades a legacy decision implicitly.
+  rootBindingRevision: bigint('root_binding_revision', { mode: 'bigint' })
+    .notNull()
+    .default(BigInt(0)),
   defaultBranch: text('default_branch').notNull().default('main'),
   createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
   archivedAt: timestamp('archived_at', tsOpts),
-})
+}, (t) => [
+  uniqueIndex('projects_root_ref_idx').on(t.rootRef),
+])
 
 export type Project = InferSelectModel<typeof projects>
 export type NewProject = InferInsertModel<typeof projects>
+
+// ---------------------------------------------------------------------------
+// Epic 172 release authentication and transition substrate
+//
+// These tables deliberately do not reference projects, tasks, or runs. Release
+// evidence must outlive ordinary application records and remains valid after a
+// signer stops accepting new signatures. The migration adds append-only guards
+// and grants writes only to the dedicated release principals.
+// ---------------------------------------------------------------------------
+export const forgeReleaseSignerKeys = pgTable(
+  'forge_release_signer_keys',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    policyId: text('policy_id').notNull().default('forge-epic-172-release-signing-v1'),
+    generation: bigint('generation', { mode: 'number' }).notNull(),
+    algorithm: text('algorithm').notNull().default('Ed25519'),
+    publicKeySpki: bytea('public_key_spki').notNull(),
+    githubAppId: text('github_app_id').notNull(),
+    rulesetFingerprint: text('ruleset_fingerprint').notNull(),
+    // Staged keys cannot sign; active keys may; retiring/retired keys verify only.
+    status: text('status').notNull().default('staged'),
+    validFrom: timestamp('valid_from', tsOpts).notNull(),
+    validUntil: timestamp('valid_until', tsOpts).notNull(),
+    activatedAt: timestamp('activated_at', tsOpts),
+    retirementStartedAt: timestamp('retirement_started_at', tsOpts),
+    retiredAt: timestamp('retired_at', tsOpts),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('forge_release_signer_keys_policy_generation_idx').on(t.policyId, t.generation),
+    uniqueIndex('forge_release_signer_keys_ruleset_fingerprint_idx').on(t.rulesetFingerprint),
+    uniqueIndex('forge_release_signer_keys_one_active_policy_idx')
+      .on(t.policyId)
+      .where(sql`${t.status} = 'active'`),
+    index('forge_release_signer_keys_status_validity_idx').on(t.status, t.validFrom, t.validUntil),
+    check('forge_release_signer_keys_policy_chk', sql`${t.policyId} = 'forge-epic-172-release-signing-v1'`),
+    check('forge_release_signer_keys_generation_chk', sql`${t.generation} > 0`),
+    check('forge_release_signer_keys_algorithm_chk', sql`${t.algorithm} = 'Ed25519'`),
+    check('forge_release_signer_keys_public_key_chk', sql`octet_length(${t.publicKeySpki}) > 0`),
+    check('forge_release_signer_keys_fingerprint_chk', sql`${t.rulesetFingerprint} ~ '^[0-9a-f]{64}$'`),
+    check('forge_release_signer_keys_status_chk', sql`${t.status} in ('staged', 'active', 'retiring', 'retired')`),
+    check('forge_release_signer_keys_validity_chk', sql`${t.validUntil} > ${t.validFrom}`),
+    check(
+      'forge_release_signer_keys_lifecycle_chk',
+      sql`(${t.status} = 'staged' and ${t.activatedAt} is null and ${t.retirementStartedAt} is null and ${t.retiredAt} is null)
+        or (${t.status} = 'active' and ${t.activatedAt} is not null and ${t.retirementStartedAt} is null and ${t.retiredAt} is null)
+        or (${t.status} = 'retiring' and ${t.activatedAt} is not null and ${t.retirementStartedAt} is not null and ${t.retiredAt} is null)
+        or (${t.status} = 'retired' and ${t.activatedAt} is not null and ${t.retirementStartedAt} is not null and ${t.retiredAt} is not null)`,
+    ),
+  ],
+)
+
+export type ForgeReleaseSignerKey = InferSelectModel<typeof forgeReleaseSignerKeys>
+export type NewForgeReleaseSignerKey = InferInsertModel<typeof forgeReleaseSignerKeys>
+
+export const forgeReleaseSignerKeyLifecycleAudits = pgTable(
+  'forge_release_signer_key_lifecycle_audits',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    signerKeyId: uuid('signer_key_id')
+      .notNull()
+      .references(() => forgeReleaseSignerKeys.id, { onDelete: 'restrict' }),
+    signerGeneration: bigint('signer_generation', { mode: 'number' }).notNull(),
+    action: text('action').notNull(),
+    priorStatus: text('prior_status'),
+    newStatus: text('new_status').notNull(),
+    actor: text('actor').notNull(),
+    reason: text('reason').notNull().default(''),
+    occurredAt: timestamp('occurred_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    index('forge_release_signer_lifecycle_key_idx').on(t.signerKeyId, t.occurredAt),
+    check('forge_release_signer_lifecycle_generation_chk', sql`${t.signerGeneration} > 0`),
+    check(
+      'forge_release_signer_lifecycle_action_chk',
+      sql`${t.action} in ('installed', 'activated', 'retirement_started', 'retired')`,
+    ),
+    check(
+      'forge_release_signer_lifecycle_prior_status_chk',
+      sql`${t.priorStatus} is null or ${t.priorStatus} in ('staged', 'active', 'retiring', 'retired')`,
+    ),
+    check(
+      'forge_release_signer_lifecycle_new_status_chk',
+      sql`${t.newStatus} in ('staged', 'active', 'retiring', 'retired')`,
+    ),
+    check('forge_release_signer_lifecycle_actor_chk', sql`length(btrim(${t.actor})) between 1 and 200`),
+    check('forge_release_signer_lifecycle_reason_chk', sql`length(${t.reason}) <= 1000`),
+  ],
+)
+
+export type ForgeReleaseSignerKeyLifecycleAudit = InferSelectModel<typeof forgeReleaseSignerKeyLifecycleAudits>
+export type NewForgeReleaseSignerKeyLifecycleAudit = InferInsertModel<typeof forgeReleaseSignerKeyLifecycleAudits>
+
+export const forgeEpic172ReleaseEvidence = pgTable(
+  'forge_epic_172_release_evidence',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    manifestVersion: integer('manifest_version').notNull().default(1),
+    evidenceKind: text('evidence_kind').notNull(),
+    ownerIssue: integer('owner_issue').notNull(),
+    ownerSlice: text('owner_slice').notNull(),
+    exactBuilds: jsonb('exact_builds').$type<string[]>().notNull(),
+    requiredEvidence: jsonb('required_evidence').$type<Array<{ name: string; measurementDigest: string }>>().notNull(),
+    reviewedSha: text('reviewed_sha').notNull(),
+    epoch: bigint('epoch', { mode: 'number' }),
+    predecessorReceiptIds: jsonb('predecessor_receipt_ids').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    predecessorSetDigest: text('predecessor_set_digest').notNull(),
+    transitionIdentityDigest: text('transition_identity_digest').notNull(),
+    signerKeyId: uuid('signer_key_id')
+      .notNull()
+      .references(() => forgeReleaseSignerKeys.id, { onDelete: 'restrict' }),
+    signerGeneration: bigint('signer_generation', { mode: 'number' }).notNull(),
+    githubAppId: text('github_app_id').notNull(),
+    controllerRunId: text('controller_run_id').notNull(),
+    controllerJobId: text('controller_job_id').notNull(),
+    signatureDomain: text('signature_domain').notNull().default('forge:epic-172-release-evidence:v1'),
+    envelopeVersion: integer('envelope_version').notNull().default(1),
+    envelopeDigest: text('envelope_digest').notNull(),
+    detachedSignature: bytea('detached_signature').notNull(),
+    nonce: uuid('nonce').notNull(),
+    issuedAt: timestamp('issued_at', tsOpts).notNull(),
+    recordedAt: timestamp('recorded_at', tsOpts).defaultNow().notNull(),
+    envelope: jsonb('envelope').$type<Record<string, unknown>>().notNull(),
+  },
+  (t) => [
+    uniqueIndex('forge_epic_172_release_evidence_transition_identity_idx').on(t.transitionIdentityDigest),
+    uniqueIndex('forge_epic_172_release_evidence_nonce_idx').on(t.nonce),
+    uniqueIndex('forge_epic_172_release_evidence_envelope_digest_idx').on(t.envelopeDigest),
+    index('forge_epic_172_release_evidence_kind_idx').on(t.manifestVersion, t.evidenceKind),
+    index('forge_epic_172_release_evidence_signer_idx').on(t.signerKeyId, t.signerGeneration),
+    check('forge_epic_172_release_evidence_manifest_chk', sql`${t.manifestVersion} = 1`),
+    check('forge_epic_172_release_evidence_owner_issue_chk', sql`${t.ownerIssue} > 0`),
+    check('forge_epic_172_release_evidence_owner_slice_chk', sql`${t.ownerSlice} in ('step0', 's3', 's4', 's5', 's6')`),
+    check('forge_epic_172_release_evidence_builds_chk', sql`jsonb_typeof(${t.exactBuilds}) = 'array' and jsonb_array_length(${t.exactBuilds}) > 0`),
+    check('forge_epic_172_release_evidence_required_evidence_chk', sql`jsonb_typeof(${t.requiredEvidence}) = 'array' and jsonb_array_length(${t.requiredEvidence}) > 0`),
+    check('forge_epic_172_release_evidence_sha_chk', sql`${t.reviewedSha} ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'`),
+    check('forge_epic_172_release_evidence_epoch_chk', sql`${t.epoch} is null or ${t.epoch} > 0`),
+    check('forge_epic_172_release_evidence_predecessors_chk', sql`jsonb_typeof(${t.predecessorReceiptIds}) = 'array'`),
+    check('forge_epic_172_release_evidence_predecessor_digest_chk', sql`${t.predecessorSetDigest} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_release_evidence_identity_digest_chk', sql`${t.transitionIdentityDigest} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_release_evidence_generation_chk', sql`${t.signerGeneration} > 0`),
+    check('forge_epic_172_release_evidence_domain_chk', sql`${t.signatureDomain} = 'forge:epic-172-release-evidence:v1'`),
+    check('forge_epic_172_release_evidence_envelope_version_chk', sql`${t.envelopeVersion} = 1`),
+    check('forge_epic_172_release_evidence_envelope_digest_chk', sql`${t.envelopeDigest} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_release_evidence_signature_chk', sql`octet_length(${t.detachedSignature}) = 64`),
+    check('forge_epic_172_release_evidence_time_chk', sql`${t.recordedAt} >= ${t.issuedAt}`),
+    check('forge_epic_172_release_evidence_envelope_chk', sql`jsonb_typeof(${t.envelope}) = 'object'`),
+  ],
+)
+
+export type ForgeEpic172ReleaseEvidence = InferSelectModel<typeof forgeEpic172ReleaseEvidence>
+export type NewForgeEpic172ReleaseEvidence = InferInsertModel<typeof forgeEpic172ReleaseEvidence>
+
+export const forgeEpic172TransitionAuthorizations = pgTable(
+  'forge_epic_172_transition_authorizations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    manifestVersion: integer('manifest_version').notNull().default(1),
+    targetNode: text('target_node').notNull(),
+    transitionIdentityDigest: text('transition_identity_digest').notNull(),
+    sourceReceiptIds: jsonb('source_receipt_ids').$type<string[]>().notNull(),
+    sourceReceiptSetDigest: text('source_receipt_set_digest').notNull(),
+    ownerIssue: integer('owner_issue').notNull(),
+    ownerSlice: text('owner_slice').notNull(),
+    exactBuilds: jsonb('exact_builds').$type<string[]>().notNull(),
+    reviewedSha: text('reviewed_sha').notNull(),
+    epoch: bigint('epoch', { mode: 'number' }),
+    operationId: text('operation_id').notNull(),
+    operation: text('operation').notNull(),
+    controllerLoginId: text('controller_login_id').notNull(),
+    controllerRunId: text('controller_run_id').notNull(),
+    signerKeyId: uuid('signer_key_id')
+      .notNull()
+      .references(() => forgeReleaseSignerKeys.id, { onDelete: 'restrict' }),
+    signerGeneration: bigint('signer_generation', { mode: 'number' }).notNull(),
+    signatureDomain: text('signature_domain').notNull().default('forge:epic-172-transition-authorization:v1'),
+    envelopeVersion: integer('envelope_version').notNull().default(1),
+    envelopeDigest: text('envelope_digest').notNull(),
+    detachedSignature: bytea('detached_signature').notNull(),
+    nonce: uuid('nonce').notNull(),
+    issuedAt: timestamp('issued_at', tsOpts).notNull(),
+    expiresAt: timestamp('expires_at', tsOpts).notNull(),
+    recordedAt: timestamp('recorded_at', tsOpts).defaultNow().notNull(),
+    envelope: jsonb('envelope').$type<Record<string, unknown>>().notNull(),
+  },
+  (t) => [
+    uniqueIndex('forge_epic_172_transition_authorizations_nonce_idx').on(t.nonce),
+    uniqueIndex('forge_epic_172_transition_authorizations_envelope_digest_idx').on(t.envelopeDigest),
+    index('forge_epic_172_transition_authorizations_target_idx').on(t.manifestVersion, t.targetNode),
+    index('forge_epic_172_transition_authorizations_expiry_idx').on(t.expiresAt),
+    index('forge_epic_172_transition_authorizations_signer_idx').on(t.signerKeyId, t.signerGeneration),
+    check('forge_epic_172_transition_authorizations_manifest_chk', sql`${t.manifestVersion} = 1`),
+    check('forge_epic_172_transition_authorizations_identity_chk', sql`${t.transitionIdentityDigest} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_transition_authorizations_sources_chk', sql`jsonb_typeof(${t.sourceReceiptIds}) = 'array' and jsonb_array_length(${t.sourceReceiptIds}) > 0`),
+    check('forge_epic_172_transition_authorizations_source_digest_chk', sql`${t.sourceReceiptSetDigest} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_transition_authorizations_owner_issue_chk', sql`${t.ownerIssue} > 0`),
+    check('forge_epic_172_transition_authorizations_owner_slice_chk', sql`${t.ownerSlice} in ('step0', 's3', 's4', 's5', 's6')`),
+    check('forge_epic_172_transition_authorizations_builds_chk', sql`jsonb_typeof(${t.exactBuilds}) = 'array' and jsonb_array_length(${t.exactBuilds}) > 0`),
+    check('forge_epic_172_transition_authorizations_sha_chk', sql`${t.reviewedSha} ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'`),
+    check('forge_epic_172_transition_authorizations_epoch_chk', sql`${t.epoch} is null or ${t.epoch} > 0`),
+    check('forge_epic_172_transition_authorizations_generation_chk', sql`${t.signerGeneration} > 0`),
+    check('forge_epic_172_transition_authorizations_domain_chk', sql`${t.signatureDomain} = 'forge:epic-172-transition-authorization:v1'`),
+    check('forge_epic_172_transition_authorizations_envelope_version_chk', sql`${t.envelopeVersion} = 1`),
+    check('forge_epic_172_transition_authorizations_envelope_digest_chk', sql`${t.envelopeDigest} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_transition_authorizations_signature_chk', sql`octet_length(${t.detachedSignature}) = 64`),
+    check('forge_epic_172_transition_authorizations_lifetime_chk', sql`${t.expiresAt} > ${t.issuedAt} and ${t.expiresAt} <= ${t.issuedAt} + interval '30 minutes'`),
+    check('forge_epic_172_transition_authorizations_recorded_chk', sql`${t.recordedAt} >= ${t.issuedAt}`),
+    check('forge_epic_172_transition_authorizations_envelope_chk', sql`jsonb_typeof(${t.envelope}) = 'object'`),
+  ],
+)
+
+export type ForgeEpic172TransitionAuthorization = InferSelectModel<typeof forgeEpic172TransitionAuthorizations>
+export type NewForgeEpic172TransitionAuthorization = InferInsertModel<typeof forgeEpic172TransitionAuthorizations>
+
+export const forgeEpic172ReleaseEvidenceConsumptions = pgTable(
+  'forge_epic_172_release_evidence_consumptions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    receiptId: uuid('receipt_id')
+      .notNull()
+      .references(() => forgeEpic172ReleaseEvidence.id, { onDelete: 'restrict' }),
+    transitionIdentityDigest: text('transition_identity_digest').notNull(),
+    authorizationId: uuid('authorization_id')
+      .notNull()
+      .references(() => forgeEpic172TransitionAuthorizations.id, { onDelete: 'restrict' }),
+    consumerNode: text('consumer_node').notNull(),
+    operationId: text('operation_id').notNull(),
+    actor: text('actor').notNull(),
+    consumedAt: timestamp('consumed_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('forge_epic_172_release_evidence_consumptions_receipt_idx').on(t.receiptId),
+    uniqueIndex('forge_epic_172_release_evidence_consumptions_authorization_receipt_idx')
+      .on(t.authorizationId, t.receiptId),
+    uniqueIndex('forge_epic_172_release_evidence_consumptions_identity_consumer_idx')
+      .on(t.transitionIdentityDigest, t.consumerNode),
+    index('forge_epic_172_release_evidence_consumptions_operation_idx').on(t.operationId),
+    check('forge_epic_172_release_evidence_consumptions_identity_chk', sql`${t.transitionIdentityDigest} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_release_evidence_consumptions_consumer_chk', sql`length(btrim(${t.consumerNode})) between 1 and 100`),
+    check('forge_epic_172_release_evidence_consumptions_operation_chk', sql`length(btrim(${t.operationId})) between 1 and 200`),
+    check('forge_epic_172_release_evidence_consumptions_actor_chk', sql`length(btrim(${t.actor})) between 1 and 200`),
+  ],
+)
+
+export type ForgeEpic172ReleaseEvidenceConsumption = InferSelectModel<typeof forgeEpic172ReleaseEvidenceConsumptions>
+export type NewForgeEpic172ReleaseEvidenceConsumption = InferInsertModel<typeof forgeEpic172ReleaseEvidenceConsumptions>
+
+export const forgeEpic172S3ReleaseState = pgTable(
+  'forge_epic_172_s3_release_state',
+  {
+    singletonId: text('singleton_id').primaryKey(),
+    state: text('state').notNull(),
+    stateFingerprint: text('state_fingerprint').notNull(),
+    predecessorReceiptId: uuid('predecessor_receipt_id')
+      .references(() => forgeEpic172ReleaseEvidence.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    authorizationId: uuid('authorization_id')
+      .references(() => forgeEpic172TransitionAuthorizations.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    evidenceReceiptId: uuid('evidence_receipt_id')
+      .references(() => forgeEpic172ReleaseEvidence.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    transitionIdentityDigest: text('transition_identity_digest'),
+    completedAt: timestamp('completed_at', tsOpts),
+  },
+  (t) => [
+    check('forge_epic_172_s3_release_state_singleton_chk', sql`${t.singletonId} = 's3_issue_178'`),
+    check('forge_epic_172_s3_release_state_state_chk', sql`${t.state} in ('pending', 'complete')`),
+    check('forge_epic_172_s3_release_state_fingerprint_chk', sql`${t.stateFingerprint} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_s3_release_state_tuple_chk', sql`
+      (
+        ${t.state} = 'pending'
+        and ${t.stateFingerprint} = '7a97eed28629c7d0d7c11a48d3509f1c479d614882dc61a7e2c1891f32c3a5dc'
+        and ${t.predecessorReceiptId} is null
+        and ${t.authorizationId} is null
+        and ${t.evidenceReceiptId} is null
+        and ${t.transitionIdentityDigest} is null
+        and ${t.completedAt} is null
+      ) or (
+        ${t.state} = 'complete'
+        and ${t.predecessorReceiptId} is not null
+        and ${t.authorizationId} is not null
+        and ${t.evidenceReceiptId} is not null
+        and ${t.evidenceReceiptId} <> ${t.predecessorReceiptId}
+        and ${t.transitionIdentityDigest} ~ '^[0-9a-f]{64}$'
+        and ${t.stateFingerprint} = ${t.transitionIdentityDigest}
+        and ${t.completedAt} is not null
+      )
+    `),
+  ],
+)
+
+export type ForgeEpic172S3ReleaseState = InferSelectModel<typeof forgeEpic172S3ReleaseState>
+export type NewForgeEpic172S3ReleaseState = InferInsertModel<typeof forgeEpic172S3ReleaseState>
+
+export const forgeEpic172EnablementState = pgTable(
+  'forge_epic_172_enablement_state',
+  {
+    singletonId: text('singleton_id').primaryKey().default('epic-172'),
+    state: text('state').notNull().default('disabled'),
+    ownerOperationId: text('owner_operation_id'),
+    exactBuilds: jsonb('exact_builds').$type<string[]>(),
+    reviewedSha: text('reviewed_sha'),
+    epoch: bigint('epoch', { mode: 'number' }),
+    startedAt: timestamp('started_at', tsOpts),
+    expiresAt: timestamp('expires_at', tsOpts),
+    enablementReceiptId: uuid('enablement_receipt_id')
+      .references(() => forgeEpic172ReleaseEvidence.id, { onDelete: 'restrict' }),
+    finalReadinessReceiptId: uuid('final_readiness_receipt_id')
+      .references(() => forgeEpic172ReleaseEvidence.id, { onDelete: 'restrict' }),
+    openingAuthorizationId: uuid('opening_authorization_id')
+      .references(() => forgeEpic172TransitionAuthorizations.id, { onDelete: 'restrict' }),
+    controllerLoginId: text('controller_login_id'),
+    controllerRunId: text('controller_run_id'),
+    controllerTokenDigest: bytea('controller_token_digest'),
+    leaseGeneration: bigint('lease_generation', { mode: 'number' }),
+    lastHeartbeatAt: timestamp('last_heartbeat_at', tsOpts),
+    leaseExpiresAt: timestamp('lease_expires_at', tsOpts),
+    stateFingerprint: text('state_fingerprint').notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    check('forge_epic_172_enablement_singleton_chk', sql`${t.singletonId} = 'epic-172'`),
+    check('forge_epic_172_enablement_state_chk', sql`${t.state} in ('disabled', 'provisional', 'active')`),
+    check('forge_epic_172_enablement_sha_chk', sql`${t.reviewedSha} is null or ${t.reviewedSha} ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'`),
+    check('forge_epic_172_enablement_epoch_chk', sql`${t.epoch} is null or ${t.epoch} > 0`),
+    check('forge_epic_172_enablement_token_chk', sql`${t.controllerTokenDigest} is null or octet_length(${t.controllerTokenDigest}) = 32`),
+    check('forge_epic_172_enablement_lease_generation_chk', sql`${t.leaseGeneration} is null or ${t.leaseGeneration} > 0`),
+    check('forge_epic_172_enablement_fingerprint_chk', sql`${t.stateFingerprint} ~ '^[0-9a-f]{64}$'`),
+    check(
+      'forge_epic_172_enablement_disabled_chk',
+      sql`${t.state} <> 'disabled' or (
+        ${t.ownerOperationId} is null and ${t.exactBuilds} is null and ${t.reviewedSha} is null and
+        ${t.epoch} is null and ${t.startedAt} is null and ${t.expiresAt} is null and
+        ${t.enablementReceiptId} is null and ${t.finalReadinessReceiptId} is null and
+        ${t.openingAuthorizationId} is null and ${t.controllerLoginId} is null and
+        ${t.controllerRunId} is null and ${t.controllerTokenDigest} is null and
+        ${t.leaseGeneration} is null and ${t.lastHeartbeatAt} is null and ${t.leaseExpiresAt} is null
+      )`,
+    ),
+    check(
+      'forge_epic_172_enablement_provisional_chk',
+      sql`${t.state} <> 'provisional' or (
+        ${t.ownerOperationId} is not null and jsonb_typeof(${t.exactBuilds}) = 'array' and
+        ${t.reviewedSha} is not null and ${t.epoch} is not null and ${t.startedAt} is not null and
+        ${t.expiresAt} is not null and ${t.expiresAt} > ${t.startedAt} and
+        ${t.enablementReceiptId} is not null and ${t.openingAuthorizationId} is not null and
+        ${t.controllerLoginId} is not null and ${t.controllerRunId} is not null and
+        ${t.controllerTokenDigest} is not null and ${t.leaseGeneration} is not null and
+        ${t.lastHeartbeatAt} is not null and ${t.leaseExpiresAt} is not null and
+        ${t.leaseExpiresAt} <= ${t.expiresAt}
+      )`,
+    ),
+    check(
+      'forge_epic_172_enablement_active_chk',
+      sql`${t.state} <> 'active' or (
+        ${t.ownerOperationId} is not null and jsonb_typeof(${t.exactBuilds}) = 'array' and
+        ${t.reviewedSha} is not null and ${t.epoch} is not null and
+        ${t.enablementReceiptId} is not null and ${t.finalReadinessReceiptId} is not null
+      )`,
+    ),
+  ],
+)
+
+export type ForgeEpic172EnablementState = InferSelectModel<typeof forgeEpic172EnablementState>
+export type NewForgeEpic172EnablementState = InferInsertModel<typeof forgeEpic172EnablementState>
+
+export const forgeEpic172EnablementTransitionAudits = pgTable(
+  'forge_epic_172_enablement_transition_audits',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    disposition: text('disposition').notNull(),
+    priorStateFingerprint: text('prior_state_fingerprint').notNull(),
+    newStateFingerprint: text('new_state_fingerprint').notNull(),
+    operationId: text('operation_id').notNull(),
+    actor: text('actor').notNull(),
+    controllerRunId: text('controller_run_id'),
+    authorizationId: uuid('authorization_id')
+      .references(() => forgeEpic172TransitionAuthorizations.id, { onDelete: 'restrict' }),
+    evidenceReceiptId: uuid('evidence_receipt_id')
+      .references(() => forgeEpic172ReleaseEvidence.id, { onDelete: 'restrict' }),
+    occurredAt: timestamp('occurred_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    index('forge_epic_172_enablement_transition_operation_idx').on(t.operationId, t.occurredAt),
+    index('forge_epic_172_enablement_transition_disposition_idx').on(t.disposition, t.occurredAt),
+    check(
+      'forge_epic_172_enablement_transition_disposition_chk',
+      sql`${t.disposition} in ('opened', 'heartbeat', 'failed_disabled', 'expired_disabled', 'manually_disabled', 'promoted_active')`,
+    ),
+    check('forge_epic_172_enablement_transition_prior_fingerprint_chk', sql`${t.priorStateFingerprint} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_enablement_transition_new_fingerprint_chk', sql`${t.newStateFingerprint} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_enablement_transition_operation_chk', sql`length(btrim(${t.operationId})) between 1 and 200`),
+    check('forge_epic_172_enablement_transition_actor_chk', sql`length(btrim(${t.actor})) between 1 and 200`),
+  ],
+)
+
+export type ForgeEpic172EnablementTransitionAudit = InferSelectModel<typeof forgeEpic172EnablementTransitionAudits>
+export type NewForgeEpic172EnablementTransitionAudit = InferInsertModel<typeof forgeEpic172EnablementTransitionAudits>
 
 // ---------------------------------------------------------------------------
 // mcpInstallations
@@ -232,7 +644,7 @@ export const projectMcpStatusChecks = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     projectId: uuid('project_id')
       .notNull()
-      .references(() => projects.id, { onDelete: 'cascade' }),
+      .references(() => projects.id, { onDelete: 'restrict' }),
     mcpId: text('mcp_id').notNull(),
     status: text('status').notNull(),
     installState: text('install_state').notNull(),
@@ -260,7 +672,7 @@ export const tasks = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     projectId: uuid('project_id')
       .notNull()
-      .references(() => projects.id, { onDelete: 'cascade' }),
+      .references(() => projects.id, { onDelete: 'restrict' }),
     submittedBy: uuid('submitted_by').references(() => users.id, {
       onDelete: 'set null',
     }),
@@ -299,7 +711,7 @@ export const taskAttempts = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     queueName: text('queue_name').notNull(),
     attemptNumber: integer('attempt_number').notNull().default(1),
     // 'running'|'completed'|'failed'|'dead_lettered'
@@ -384,7 +796,7 @@ export const workPackages = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     harnessId: uuid('harness_id').references(() => agentHarnesses.id, {
       onDelete: 'set null',
     }),
@@ -435,12 +847,14 @@ export const filesystemMcpGrantApprovals = pgTable(
   'filesystem_mcp_grant_approvals',
   {
     id: uuid('id').primaryKey().defaultRandom(),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'restrict' }),
     taskId: uuid('task_id')
-      .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id')
-      .notNull()
-      .references(() => workPackages.id, { onDelete: 'cascade' }),
+      .references(() => workPackages.id, { onDelete: 'restrict' }),
+    decisionScope: text('decision_scope').notNull().default('package'),
     decidedBy: uuid('decided_by').references(() => users.id, {
       onDelete: 'set null',
     }),
@@ -452,18 +866,247 @@ export const filesystemMcpGrantApprovals = pgTable(
       .$type<Record<string, unknown>>()
       .notNull()
       .default(sql`'{}'::jsonb`),
+    grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' }),
+    rootBindingRevision: bigint('root_binding_revision', { mode: 'bigint' }),
+    // Fresh only for allow_once approvals. It is immutable with the decision
+    // row and may never be reused after an S4 consumer records issuance.
+    grantNonce: uuid('grant_nonce'),
+    pointerFingerprint: text('pointer_fingerprint'),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
   },
   (t) => [
-    uniqueIndex('filesystem_mcp_grant_approvals_work_package_id_idx').on(t.workPackageId),
+    index('filesystem_mcp_grant_approvals_work_package_id_idx').on(t.workPackageId),
+    index('filesystem_mcp_grant_approvals_project_id_idx').on(t.projectId),
+    uniqueIndex('filesystem_mcp_grant_approvals_grant_nonce_idx').on(t.grantNonce),
     index('filesystem_mcp_grant_approvals_task_id_idx').on(t.taskId),
     index('filesystem_mcp_grant_approvals_decision_idx').on(t.decision),
+    index('filesystem_mcp_grant_approvals_revision_idx').on(t.grantDecisionRevision),
+    uniqueIndex('filesystem_mcp_grant_approvals_pointer_parent_idx').on(
+      t.id,
+      t.taskId,
+      t.workPackageId,
+      t.grantDecisionRevision,
+      t.pointerFingerprint,
+    ),
   ],
 )
 
 export type FilesystemMcpGrantApproval = InferSelectModel<typeof filesystemMcpGrantApprovals>
 export type NewFilesystemMcpGrantApproval = InferInsertModel<typeof filesystemMcpGrantApprovals>
+
+// ---------------------------------------------------------------------------
+// filesystemMcpCurrentDecisionPointers
+// ---------------------------------------------------------------------------
+// Exactly one authority slot is preallocated for each package. Immutable
+// decisions are appended above; this pointer advances with an exact compare and
+// set, so concurrent reapprovals have one winner.
+export const filesystemMcpCurrentDecisionPointers = pgTable(
+  'filesystem_mcp_current_decision_pointers',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id')
+      .notNull()
+      .references(() => tasks.id, { onDelete: 'cascade' }),
+    workPackageId: uuid('work_package_id')
+      .notNull()
+      .references(() => workPackages.id, { onDelete: 'cascade' }),
+    currentDecisionId: uuid('current_decision_id'),
+    currentDecisionTaskId: uuid('current_decision_task_id'),
+    currentDecisionWorkPackageId: uuid('current_decision_work_package_id'),
+    currentDecisionRevision: bigint('current_decision_revision', { mode: 'bigint' }),
+    currentDecisionFingerprint: text('current_decision_fingerprint'),
+    pointerFingerprint: text('pointer_fingerprint').notNull(),
+    pointerVersion: bigint('pointer_version', { mode: 'bigint' }).notNull().default(BigInt(0)),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('filesystem_mcp_current_decision_pointers_work_package_idx').on(t.workPackageId),
+    index('filesystem_mcp_current_decision_pointers_task_idx').on(t.taskId),
+    uniqueIndex('filesystem_mcp_current_decision_pointers_current_decision_idx').on(t.currentDecisionId),
+    foreignKey({
+      columns: [
+        t.currentDecisionId,
+        t.currentDecisionTaskId,
+        t.currentDecisionWorkPackageId,
+        t.currentDecisionRevision,
+        t.currentDecisionFingerprint,
+      ],
+      foreignColumns: [
+        filesystemMcpGrantApprovals.id,
+        filesystemMcpGrantApprovals.taskId,
+        filesystemMcpGrantApprovals.workPackageId,
+        filesystemMcpGrantApprovals.grantDecisionRevision,
+        filesystemMcpGrantApprovals.pointerFingerprint,
+      ],
+      name: 'filesystem_mcp_current_decision_pointers_parent_fk',
+    }),
+  ],
+)
+
+export type FilesystemMcpCurrentDecisionPointer = InferSelectModel<typeof filesystemMcpCurrentDecisionPointers>
+export type NewFilesystemMcpCurrentDecisionPointer = InferInsertModel<typeof filesystemMcpCurrentDecisionPointers>
+
+// ---------------------------------------------------------------------------
+// projectFilesystemGrantDecisions / projectFilesystemCurrentDecisionPointers
+// ---------------------------------------------------------------------------
+// Project always-allow authority is not stored in projects.mcp_config. Every
+// decision is immutable; exactly one preallocated project-owned pointer names
+// the current retained decision through an exact compare-and-set boundary.
+export const projectFilesystemGrantDecisions = pgTable(
+  'project_filesystem_grant_decisions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'restrict' }),
+    decision: text('decision').notNull(),
+    capabilities: jsonb('capabilities').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' }).notNull(),
+    rootBindingRevision: bigint('root_binding_revision', { mode: 'bigint' }).notNull(),
+    decisionFingerprint: text('decision_fingerprint').notNull(),
+    decisionGeneration: bigint('decision_generation', { mode: 'bigint' }).notNull(),
+    priorDecisionId: uuid('prior_decision_id'),
+    priorDecisionProjectId: uuid('prior_decision_project_id'),
+    priorDecisionRevision: bigint('prior_decision_revision', { mode: 'bigint' }),
+    priorRootBindingRevision: bigint('prior_root_binding_revision', { mode: 'bigint' }),
+    priorDecisionFingerprint: text('prior_decision_fingerprint'),
+    priorDecisionGeneration: bigint('prior_decision_generation', { mode: 'bigint' }),
+    revocationReason: text('revocation_reason'),
+    reason: text('reason').notNull().default(''),
+    decidedBy: uuid('decided_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    decidedAt: timestamp('decided_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('project_filesystem_grant_decisions_project_revision_idx')
+      .on(t.projectId, t.grantDecisionRevision),
+    uniqueIndex('project_filesystem_grant_decisions_project_generation_idx')
+      .on(t.projectId, t.decisionGeneration),
+    uniqueIndex('project_filesystem_grant_decisions_parent_tuple_idx')
+      .on(
+        t.id,
+        t.projectId,
+        t.grantDecisionRevision,
+        t.rootBindingRevision,
+        t.decisionFingerprint,
+        t.decisionGeneration,
+      ),
+    foreignKey({
+      columns: [
+        t.priorDecisionId,
+        t.priorDecisionProjectId,
+        t.priorDecisionRevision,
+        t.priorRootBindingRevision,
+        t.priorDecisionFingerprint,
+        t.priorDecisionGeneration,
+      ],
+      foreignColumns: [
+        t.id,
+        t.projectId,
+        t.grantDecisionRevision,
+        t.rootBindingRevision,
+        t.decisionFingerprint,
+        t.decisionGeneration,
+      ],
+      name: 'project_filesystem_grant_decisions_prior_fk',
+    }),
+  ],
+)
+
+export type ProjectFilesystemGrantDecision = InferSelectModel<typeof projectFilesystemGrantDecisions>
+export type NewProjectFilesystemGrantDecision = InferInsertModel<typeof projectFilesystemGrantDecisions>
+
+export const projectFilesystemCurrentDecisionPointers = pgTable(
+  'project_filesystem_current_decision_pointers',
+  {
+    projectId: uuid('project_id')
+      .primaryKey()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    currentDecisionId: uuid('current_decision_id'),
+    currentDecisionProjectId: uuid('current_decision_project_id'),
+    currentDecisionRevision: bigint('current_decision_revision', { mode: 'bigint' }),
+    currentRootBindingRevision: bigint('current_root_binding_revision', { mode: 'bigint' }),
+    currentDecisionFingerprint: text('current_decision_fingerprint'),
+    currentDecisionGeneration: bigint('current_decision_generation', { mode: 'bigint' }),
+    pointerGeneration: bigint('pointer_generation', { mode: 'bigint' }).notNull().default(BigInt(0)),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('project_filesystem_current_decision_pointers_decision_idx').on(t.currentDecisionId),
+  ],
+)
+
+export type ProjectFilesystemCurrentDecisionPointer = InferSelectModel<typeof projectFilesystemCurrentDecisionPointers>
+export type NewProjectFilesystemCurrentDecisionPointer = InferInsertModel<typeof projectFilesystemCurrentDecisionPointers>
+
+// ---------------------------------------------------------------------------
+// workPackageLocalProjectionHeads
+// ---------------------------------------------------------------------------
+// Preallocated per-package projection heads for the S3→S4 protocol surface.
+// Eight immutable heads are created on work_package INSERT. The package limit
+// of 256 ensures at most 2,048 heads. Heads cannot be deleted or reassigned.
+export const workPackageLocalProjectionHeads = pgTable(
+  'work_package_local_projection_heads',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workPackageId: uuid('work_package_id')
+      .notNull()
+      .references(() => workPackages.id, { onDelete: 'restrict' }),
+    headKind: text('head_kind').notNull(),
+    headIndex: bigint('head_index', { mode: 'bigint' }).notNull(),
+    headFingerprint: text('head_fingerprint').notNull(),
+    headVersion: bigint('head_version', { mode: 'bigint' }).notNull().default(BigInt(0)),
+    state: text('state').notNull().default('preallocated'),
+    leaseToken: uuid('lease_token'),
+    expiresAt: timestamp('expires_at', tsOpts),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('work_package_local_projection_heads_package_kind_idx')
+      .on(t.workPackageId, t.headKind),
+    index('work_package_local_projection_heads_kind_idx').on(t.headKind),
+    index('work_package_local_projection_heads_state_idx').on(t.state),
+    uniqueIndex('work_package_local_projection_heads_fingerprint_idx')
+      .on(t.headFingerprint),
+    uniqueIndex('work_package_local_projection_heads_lease_token_idx').on(t.leaseToken),
+    check('work_package_projection_head_kind_chk', sql`
+      ${t.headKind} in (
+        'filesystem_grant_decision',
+        'execution_evidence',
+        'claim_token',
+        'lease_expiry',
+        'recovery_marker',
+        'integrity_hold',
+        'terminal_state',
+        'artifact_reference'
+      )
+    `),
+    check('work_package_projection_head_state_chk', sql`
+      ${t.state} in ('preallocated', 'claimed', 'active', 'terminal', 'uncertain')
+    `),
+    check('work_package_projection_head_index_chk', sql`
+      ${t.headIndex} >= 0 and ${t.headIndex} < 8
+    `),
+    check('work_package_projection_head_version_chk', sql`
+      ${t.headVersion} >= 0
+    `),
+    check('work_package_projection_head_fingerprint_chk', sql`
+      ${t.headFingerprint} ~ '^head:v1:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[a-z_]+:[0-7]$'
+    `),
+    check('work_package_projection_head_lease_chk', sql`
+      (${t.state} in ('claimed', 'active') and ${t.leaseToken} is not null)
+      or (${t.state} not in ('claimed', 'active') and ${t.leaseToken} is null)
+    `),
+  ],
+)
+
+export type WorkPackageLocalProjectionHead = InferSelectModel<typeof workPackageLocalProjectionHeads>
+export type NewWorkPackageLocalProjectionHead = InferInsertModel<typeof workPackageLocalProjectionHeads>
 
 // ---------------------------------------------------------------------------
 // workPackageDependencies
@@ -474,10 +1117,10 @@ export const workPackageDependencies = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     workPackageId: uuid('work_package_id')
       .notNull()
-      .references(() => workPackages.id, { onDelete: 'cascade' }),
+      .references(() => workPackages.id, { onDelete: 'restrict' }),
     dependsOnWorkPackageId: uuid('depends_on_work_package_id')
       .notNull()
-      .references(() => workPackages.id, { onDelete: 'cascade' }),
+      .references(() => workPackages.id, { onDelete: 'restrict' }),
     dependencyType: text('dependency_type').notNull().default('finish_to_start'),
     metadata: jsonb('metadata')
       .$type<Record<string, unknown>>()
@@ -507,9 +1150,9 @@ export const agentRuns = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id').references(() => workPackages.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     harnessId: uuid('harness_id').references(() => agentHarnesses.id, {
       onDelete: 'set null',
@@ -554,7 +1197,7 @@ export const artifacts = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     agentRunId: uuid('agent_run_id')
       .notNull()
-      .references(() => agentRuns.id, { onDelete: 'cascade' }),
+      .references(() => agentRuns.id, { onDelete: 'restrict' }),
     // 'pr_url'|'file_diff'|'adr_text'|'test_report'|'review_finding'|'log_output'
     artifactType: text('artifact_type').notNull(),
     content: text('content').notNull(),
@@ -571,6 +1214,112 @@ export type Artifact = InferSelectModel<typeof artifacts>
 export type NewArtifact = InferInsertModel<typeof artifacts>
 
 // ---------------------------------------------------------------------------
+// S4 protected Architect history and task-bound execution references
+// ---------------------------------------------------------------------------
+export const architectPlanVersions = pgTable(
+  'architect_plan_versions',
+  {
+    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    planArtifactId: uuid('plan_artifact_id').notNull().references(() => artifacts.id, { onDelete: 'restrict' }),
+    planVersion: bigint('plan_version', { mode: 'bigint' }).notNull(),
+    digestKeyId: text('digest_key_id').notNull(),
+    entryCount: integer('entry_count').notNull(),
+    entrySetDigest: text('entry_set_digest').notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('architect_plan_versions_task_version_idx').on(t.taskId, t.planVersion),
+    uniqueIndex('architect_plan_versions_artifact_version_idx').on(t.planArtifactId, t.planVersion),
+  ],
+)
+
+export const architectPlanEntries = pgTable(
+  'architect_plan_entries',
+  {
+    taskId: uuid('task_id').notNull(),
+    planArtifactId: uuid('plan_artifact_id').notNull(),
+    planVersion: bigint('plan_version', { mode: 'bigint' }).notNull(),
+    entryId: text('entry_id').notNull(),
+    entryKind: text('entry_kind').notNull(),
+    agent: text('agent'),
+    requirementKey: text('requirement_key'),
+    bindingFingerprint: text('binding_fingerprint'),
+    content: text('content').notNull(),
+    contentDigest: text('content_digest').notNull(),
+    digestKeyId: text('digest_key_id').notNull(),
+    projectionEligible: boolean('projection_eligible').notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('architect_plan_entries_version_entry_idx').on(t.taskId, t.planVersion, t.entryId),
+    index('architect_plan_entries_artifact_version_idx').on(t.planArtifactId, t.planVersion),
+  ],
+)
+
+export const architectPlanExecutionReferences = pgTable(
+  'architect_plan_execution_references',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    workPackageId: uuid('work_package_id').notNull().references(() => workPackages.id, { onDelete: 'restrict' }),
+    agentRunId: uuid('agent_run_id').notNull().references(() => agentRuns.id, { onDelete: 'restrict' }),
+    planArtifactId: uuid('plan_artifact_id').notNull(),
+    planVersion: bigint('plan_version', { mode: 'bigint' }).notNull(),
+    entryId: text('entry_id').notNull(),
+    agent: text('agent').notNull(),
+    requirementKey: text('requirement_key'),
+    bindingFingerprint: text('binding_fingerprint'),
+    contentDigest: text('content_digest').notNull(),
+    digestKeyId: text('digest_key_id').notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    resolvedAt: timestamp('resolved_at', tsOpts),
+  },
+  (t) => [
+    uniqueIndex('architect_plan_execution_references_run_entry_idx').on(t.agentRunId, t.entryId),
+    index('architect_plan_execution_references_package_idx').on(t.workPackageId, t.agentRunId),
+  ],
+)
+
+export const architectPlanHistoryReads = pgTable(
+  'architect_plan_history_reads',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    requestId: uuid('request_id').notNull().unique(),
+    userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+    taskId: uuid('task_id').notNull(),
+    planVersion: bigint('plan_version', { mode: 'bigint' }).notNull(),
+    returnedEntryCount: integer('returned_entry_count').notNull(),
+    entrySetDigest: text('entry_set_digest').notNull(),
+    readAt: timestamp('read_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [index('architect_plan_history_reads_task_version_idx').on(t.taskId, t.planVersion)],
+)
+
+export const epic172S4ProtocolState = pgTable('epic_172_s4_protocol_state', {
+  singleton: boolean('singleton').primaryKey().default(true),
+  producersEnabled: boolean('producers_enabled').notNull().default(false),
+  protocolEpoch: integer('protocol_epoch').notNull().default(1),
+  enabledBuildSha: text('enabled_build_sha'),
+  updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+})
+
+export const workPackageLocalRunEvidence = pgTable(
+  'work_package_local_run_evidence',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    workPackageId: uuid('work_package_id').notNull().references(() => workPackages.id, { onDelete: 'restrict' }),
+    agentRunId: uuid('agent_run_id').notNull().references(() => agentRuns.id, { onDelete: 'restrict' }).unique(),
+    claimToken: uuid('claim_token').notNull().unique(),
+    leaseExpiresAt: timestamp('lease_expires_at', tsOpts).notNull(),
+    state: text('state').notNull().default('claimed'),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    terminalAt: timestamp('terminal_at', tsOpts),
+  },
+  (t) => [index('work_package_local_run_evidence_package_idx').on(t.workPackageId, t.agentRunId)],
+)
+
+// ---------------------------------------------------------------------------
 // filesystemMcpRuntimeAudits
 // ---------------------------------------------------------------------------
 export const filesystemMcpRuntimeAudits = pgTable(
@@ -579,15 +1328,15 @@ export const filesystemMcpRuntimeAudits = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id').references(() => workPackages.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     agentRunId: uuid('agent_run_id').references(() => agentRuns.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     grantApprovalId: uuid('grant_approval_id').references(() => filesystemMcpGrantApprovals.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     operation: text('operation').notNull().default('context_packet'),
     // 'issued'|'blocked'|'not_issued_optional'|'failed'
@@ -612,6 +1361,25 @@ export const filesystemMcpRuntimeAudits = pgTable(
       .$type<Record<string, unknown>>()
       .notNull()
       .default(sql`'{}'::jsonb`),
+    protocolVersion: integer('protocol_version'),
+    localRunEvidenceId: uuid('local_run_evidence_id').references(() => workPackageLocalRunEvidence.id, {
+      onDelete: 'restrict',
+    }),
+    claimToken: uuid('claim_token'),
+    leaseExpiresAt: timestamp('lease_expires_at', tsOpts),
+    authorizationSnapshot: jsonb('authorization_snapshot').$type<Record<string, unknown>>(),
+    authorizationSource: text('authorization_source'),
+    grantMode: text('grant_mode'),
+    grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' }),
+    grantDecisionNonce: uuid('grant_decision_nonce'),
+    authorizationRootBindingRevision: bigint('authorization_root_binding_revision', { mode: 'bigint' }),
+    projectDecisionId: uuid('project_decision_id').references(() => filesystemMcpGrantApprovals.id, {
+      onDelete: 'restrict',
+    }),
+    assembly: jsonb('assembly').$type<Record<string, unknown>>(),
+    delivery: jsonb('delivery').$type<Record<string, unknown>>(),
+    terminal: jsonb('terminal').$type<Record<string, unknown>>(),
+    terminalAt: timestamp('terminal_at', tsOpts),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
   },
   (t) => [
@@ -627,6 +1395,22 @@ export const filesystemMcpRuntimeAudits = pgTable(
 export type FilesystemMcpRuntimeAudit = InferSelectModel<typeof filesystemMcpRuntimeAudits>
 export type NewFilesystemMcpRuntimeAudit = InferInsertModel<typeof filesystemMcpRuntimeAudits>
 
+export const filesystemMcpDecisionNonceClaims = pgTable(
+  'filesystem_mcp_decision_nonce_claims',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    grantApprovalId: uuid('grant_approval_id').notNull().references(() => filesystemMcpGrantApprovals.id, {
+      onDelete: 'restrict',
+    }),
+    grantDecisionNonce: uuid('grant_decision_nonce').notNull().unique(),
+    runtimeAuditId: uuid('runtime_audit_id').notNull().references(() => filesystemMcpRuntimeAudits.id, {
+      onDelete: 'restrict',
+    }).unique(),
+    claimedAt: timestamp('claimed_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [index('filesystem_mcp_decision_nonce_claims_approval_idx').on(t.grantApprovalId)],
+)
+
 // ---------------------------------------------------------------------------
 // approvalGates
 // ---------------------------------------------------------------------------
@@ -636,19 +1420,19 @@ export const approvalGates = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id').references(() => workPackages.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     gateType: text('gate_type').notNull(),
     // gate_type: 'plan_approval'|'qa_review'|'reviewer_review'|'security_review'
     // status: 'pending'|'approved'|'rejected'|'completed'|'needs_rework'|'cancelled'
     status: text('status').notNull().default('pending'),
     sourceAgentRunId: uuid('source_agent_run_id').references(() => agentRuns.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     sourceArtifactId: uuid('source_artifact_id').references(() => artifacts.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     title: text('title').notNull(),
     instructions: text('instructions').notNull(),
@@ -688,21 +1472,21 @@ export const taskLogs = pgTable(
     sequence: bigint('sequence', { mode: 'number' }).generatedAlwaysAsIdentity(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     taskAttemptId: uuid('task_attempt_id').references(() => taskAttempts.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     agentRunId: uuid('agent_run_id').references(() => agentRuns.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     workPackageId: uuid('work_package_id').references(() => workPackages.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     artifactId: uuid('artifact_id').references(() => artifacts.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     approvalGateId: uuid('approval_gate_id').references(() => approvalGates.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     // 'info'|'success'|'warning'|'error'
     level: text('level').notNull().default('info'),
@@ -746,12 +1530,12 @@ export const vcsChanges = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id').references(() => workPackages.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     agentRunId: uuid('agent_run_id').references(() => agentRuns.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     changeType: text('change_type').notNull().default('branch'),
     // 'planned'|'created'|'updated'|'submitted'|'merged'|'abandoned'|'failed'
@@ -789,15 +1573,15 @@ export const repositoryCommandAudits = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id').references(() => workPackages.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     agentRunId: uuid('agent_run_id').references(() => agentRuns.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     artifactId: uuid('artifact_id').references(() => artifacts.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     cwd: text('cwd').notNull(),
     command: text('command').notNull(),
@@ -942,7 +1726,7 @@ export const taskQuestions = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     question: text('question').notNull(),
     suggestions: jsonb('suggestions').$type<string[]>().notNull().default([]),
     answer: text('answer'),

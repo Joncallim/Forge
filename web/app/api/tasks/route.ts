@@ -10,9 +10,9 @@ import { generateTaskTitle } from '@/lib/task-title'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import {
   accessibleProjectOwnerCondition,
-  claimAccessibleLegacyProjects,
   getAccessibleProject,
 } from '@/lib/project-access'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -39,8 +39,6 @@ export async function GET(request: NextRequest) {
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
-
-    await claimAccessibleLegacyProjects(session.userId)
 
     const { searchParams } = request.nextUrl
     const projectId = searchParams.get('projectId') ?? undefined
@@ -114,6 +112,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
+
     let body: unknown
     try {
       body = await request.json()
@@ -158,7 +159,6 @@ export async function POST(request: NextRequest) {
       frontMatter: {
         model: data.pmProviderConfigId ?? null,
         connector: 'task-default',
-        prompt: data.prompt,
       },
       level: 'info',
       message: `Task "${task.title}" was created and queued for planning.`,

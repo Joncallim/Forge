@@ -66,21 +66,21 @@ describe('task log export formatting', () => {
   it('formats jsonl with redacted prompt-bearing fields', () => {
     const jsonl = formatTaskLogsJsonl({ logs: [baseLog], task })
     const row = JSON.parse(jsonl) as {
-      frontMatter: { prompt: { byteLength: number; sha256: string } }
+      frontMatter: Record<string, unknown>
       message: string
       metadata: {
         nested: { authorization: string }
-        stderr: { byteLength: number; sha256: string }
-        stdout: { byteLength: number; sha256: string }
+        stderr: { kind: string; byteCount: number }
+        stdout: { kind: string; byteCount: number }
       }
     }
 
-    expect(row.frontMatter.prompt.byteLength).toBeGreaterThan(0)
-    expect(row.frontMatter.prompt.sha256).toHaveLength(64)
+    expect(row.frontMatter).not.toHaveProperty('prompt')
     expect(row.message).toContain('[REDACTED_TOKEN]')
     expect(row.metadata.nested.authorization).toContain('[REDACTED_TOKEN]')
-    expect(row.metadata.stderr.sha256).toHaveLength(64)
-    expect(row.metadata.stdout.sha256).toHaveLength(64)
+    expect(row.metadata.stderr).toEqual({ kind: 'unknown_legacy_digest', byteCount: expect.any(Number) })
+    expect(row.metadata.stdout).toEqual({ kind: 'unknown_legacy_digest', byteCount: expect.any(Number) })
+    expect(jsonl).not.toContain('sha256')
     expect(jsonl).not.toContain('command printed')
   })
 

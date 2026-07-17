@@ -45,6 +45,15 @@ describe('computeReadyWorkPackageIds', () => {
       { ...packageBase, id: 'blocked', sequence: 6, status: 'blocked' },
     ], [])).toEqual(['pending', 'needs-rework', 'blocked'])
   })
+
+  it('never promotes a package carrying a packet recovery or malformed packet marker', () => {
+    expect(computeReadyWorkPackageIds([
+      { ...packageBase, id: 'plain' },
+      { ...packageBase, id: 'recovering', status: 'blocked', metadata: { packet_issuance: { schemaVersion: 2 } } },
+      { ...packageBase, id: 'integrity', status: 'blocked', metadata: { packet_integrity_hold: { schemaVersion: 2 } } },
+      { ...packageBase, id: 'local', status: 'blocked', metadata: { local_effect_recovery: { schemaVersion: 1 } } },
+    ], [])).toEqual(['plain'])
+  })
 })
 
 describe('isWorkPackageHandoffEnabled', () => {

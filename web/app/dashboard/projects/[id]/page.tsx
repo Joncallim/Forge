@@ -5,8 +5,17 @@ import { useRouter, useParams } from 'next/navigation'
 import { PlusIcon, ExternalLinkIcon, ArrowLeftIcon, Trash2Icon, RefreshCwIcon, DownloadIcon, SettingsIcon, ChevronRightIcon, ChevronDownIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { McpPresentation } from '@/components/mcps/McpPresentation'
 import { MarkdownView } from '@/components/MarkdownView'
 import { FilesystemAccessControl } from './FilesystemAccessControl'
+import {
+  projectMcpPresentationFromUnknown,
+  type PresentationCta,
+} from '@/lib/mcps/admission-copy'
+import type {
+  McpHealthStatus,
+  ProjectMcpOverview,
+} from '@/lib/mcps/types'
 import {
   Dialog,
   DialogContent,
@@ -26,52 +35,6 @@ interface Project {
   defaultBranch: string
   createdAt: string
   archivedAt: string | null
-}
-
-type McpStatusName = 'healthy' | 'unhealthy' | 'disabled' | 'auth_required' | 'configuration_required' | 'unknown'
-
-type ProjectMcpStatus = {
-  mcpId: string
-  displayName: string
-  description: string
-  installPath: string
-  displayInstallPath?: string
-  installState: 'installed' | 'missing'
-  status: McpStatusName
-  enabled: boolean
-  error: string | null
-  checkedAt: string
-}
-
-type ProjectMcpConfig = {
-  profile: 'default' | 'custom'
-  requiredMcps: string[]
-  overrides: Record<string, { enabled?: boolean; installPath?: string }>
-}
-
-type McpCatalogEntry = {
-  id: string
-  displayName: string
-  description: string
-  recommended: boolean
-  requiresAuth: boolean
-}
-
-type ProjectMcpOverview = {
-  projectId: string
-  config: ProjectMcpConfig
-  catalog: McpCatalogEntry[]
-  mcpsRoot: string
-  displayMcpsRoot?: string
-  statuses: ProjectMcpStatus[]
-  summary: {
-    label: string
-    status: McpStatusName | 'missing'
-    missing: number
-    authRequired: number
-    unhealthy: number
-    disabled: number
-  }
 }
 
 interface Task {
@@ -111,7 +74,7 @@ function statusLabel(status: string): string {
   return status.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
 }
 
-function mcpPillClass(status: McpStatusName | 'missing'): string {
+function mcpPillClass(status: McpHealthStatus | 'missing'): string {
   const base = 'inline-flex h-6 items-center rounded-full px-2.5 text-xs font-medium'
   if (status === 'healthy') {
     return `${base} bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300`
@@ -129,16 +92,6 @@ function sameStringSet(left: string[], right: string[]): boolean {
   if (left.length !== right.length) return false
   const rightSet = new Set(right)
   return left.every((item) => rightSet.has(item))
-}
-
-function mcpErrorClass(status: ProjectMcpStatus): string {
-  if (status.status === 'unhealthy') {
-    return 'mt-1 text-xs font-medium text-destructive'
-  }
-  if (status.installState === 'missing' || status.status === 'auth_required' || status.status === 'configuration_required') {
-    return 'mt-1 text-xs font-medium text-amber-700 dark:text-amber-300'
-  }
-  return 'mt-1 text-xs text-muted-foreground'
 }
 
 function formatDate(iso: string): string {
@@ -518,6 +471,14 @@ export default function ProjectDetailPage() {
     loadData()
   }, [loadData])
 
+  useEffect(() => {
+    if (loading || window.location.hash !== '#project-mcps-heading') return
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById('project-mcps-heading')?.focus({ preventScroll: true })
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [loading])
+
   function handleTaskDialogOpenChange(open: boolean) {
     if (open) {
       setTaskComposerMinimized(false)
@@ -597,12 +558,13 @@ export default function ProjectDetailPage() {
     ))
   }
 
-  async function saveAndInstallSelectedMcps() {
+  async function saveAndInstallSelectedMcps(selectedOverride?: string[]) {
     if (!mcpOverview) return
+    const requestedSelection = selectedOverride ?? selectedMcpIds
     const selectedIds = mcpOverview.catalog
       .map((entry) => entry.id)
-      .filter((id) => selectedMcpIds.includes(id))
-    const selectedSet = new Set(selectedIds)
+      .filter((id) => requestedSelection.includes(id))
+    const selectedSet = new Set<string>(selectedIds)
     const overrides = Object.fromEntries(
       Object.entries(mcpOverview.config.overrides ?? {}).filter(([mcpId]) => selectedSet.has(mcpId)),
     )
@@ -653,6 +615,31 @@ export default function ProjectDetailPage() {
     }
   }
 
+  function runProjectMcpAction(action: PresentationCta, mcpId: string) {
+    if (action.kind === 'install' || action.kind === 'enable') {
+      const nextSelection = [...new Set([...selectedMcpIds, mcpId])]
+      setSelectedMcpIds(nextSelection)
+      void saveAndInstallSelectedMcps(nextSelection)
+      return
+    }
+    if (action.kind === 'connect') {
+      router.push('/dashboard/settings#github')
+      return
+    }
+    if (action.kind === 'configure') {
+      if (mcpId === 'filesystem') openProjectPathDialog()
+      else router.push('/dashboard/settings#mcps')
+      return
+    }
+    if (action.kind === 'inspect_fix') {
+      router.push('/dashboard/settings#mcps')
+      return
+    }
+    if (action.kind === 'refresh') {
+      void refreshMcpStatus()
+    }
+  }
+
   function openProjectPathDialog() {
     setProjectPathInput(projectLocalPathInputValue(project))
     setProjectPathError(null)
@@ -686,31 +673,20 @@ export default function ProjectDetailPage() {
     }
   }
 
-  async function handleDeleteProject() {
+  async function handleArchiveProject() {
     if (!project || deleting) return
 
     const confirmed = window.confirm(
-      `Delete the project "${project.name}"?\n\nThis permanently removes the project and all of its tasks and history.`,
+      `Archive the project "${project.name}"?\n\nForge keeps its tasks, runs, reviews, and project files as retained history.`,
     )
     if (!confirmed) return
 
-    let deleteFiles = false
-    if (project.localPath) {
-      const localPathLabel = projectLocalPathLabel(project)
-      deleteFiles = window.confirm(
-        `Also delete the project folder and everything inside it from disk?\n\n${localPathLabel}\n\nClick Cancel to remove only the Forge project record. Use Cancel when the folder is missing or was deleted outside Forge.`,
-      )
-    }
-
     setDeleting(true)
     try {
-      const res = await fetch(
-        `/api/projects/${projectId}${deleteFiles ? '?deleteFiles=true' : ''}`,
-        { method: 'DELETE' },
-      )
+      const res = await fetch(`/api/projects/${projectId}`, { method: 'DELETE' })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
-        throw new Error(body.error ?? 'Failed to delete project')
+        throw new Error(body.error ?? 'Failed to archive project')
       }
       router.push('/dashboard/projects')
     } catch (err) {
@@ -802,15 +778,14 @@ export default function ProjectDetailPage() {
           <Button
             variant="outline"
             size="sm"
-            onClick={handleDeleteProject}
+            onClick={handleArchiveProject}
             disabled={deleting}
             aria-busy={deleting}
-            aria-label={`Delete project ${project.name}`}
-            title="Removes this project record. You can keep files on disk, which also works for orphaned projects whose folder is missing."
-            className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+            aria-label={`Archive project ${project.name}`}
+            title="Hides the project from active work while retaining its tasks, runs, reviews, and files."
           >
             <Trash2Icon aria-hidden="true" />
-            {deleting ? 'Deleting…' : 'Delete'}
+            {deleting ? 'Archiving…' : 'Archive'}
           </Button>
           <Dialog open={dialogOpen} onOpenChange={handleTaskDialogOpenChange}>
             <DialogTrigger
@@ -941,7 +916,11 @@ export default function ProjectDetailPage() {
       <section aria-labelledby="project-mcps-heading" className="mb-6 rounded-xl border border-border bg-card p-4">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h2 id="project-mcps-heading" className="text-sm font-medium text-foreground">
+            <h2
+              id="project-mcps-heading"
+              tabIndex={-1}
+              className="scroll-mt-24 rounded-sm text-sm font-medium text-foreground outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+            >
               MCP tools
             </h2>
             <p className="mt-1 text-xs text-muted-foreground">
@@ -957,7 +936,7 @@ export default function ProjectDetailPage() {
             <Button
               variant="outline"
               size="sm"
-              onClick={saveAndInstallSelectedMcps}
+              onClick={() => void saveAndInstallSelectedMcps()}
               disabled={!mcpOverview || savingMcpSelection || (!mcpSelectionChanged && selectedMissingCount === 0)}
               aria-busy={savingMcpSelection}
               aria-label="Save MCP tool selection and install selected tools"
@@ -1001,18 +980,18 @@ export default function ProjectDetailPage() {
             {mcpOverview.catalog.map((entry) => {
               const selected = selectedMcpIds.includes(entry.id)
               const status = statusByMcpId.get(entry.id)
-              const statusText = !selected
-                ? 'Not selected'
-                : status
-                  ? status.installState === 'missing' ? 'Missing' : statusLabel(status.status)
-                  : 'Pending'
-              const pillClass = selected && status
-                ? mcpPillClass(status.installState === 'missing' ? 'missing' : status.status)
-                : mcpPillClass('disabled')
+              const presentation = projectMcpPresentationFromUnknown({
+                projectId,
+                mcpId: entry.id,
+                installState: selected ? status?.installState : 'installed',
+                healthStatus: selected ? status?.status : 'disabled',
+                enabled: selected ? status?.enabled : false,
+                runtime: entry.runtime,
+              })
 
               return (
-                <li key={entry.id} className="flex flex-col gap-3 px-3 py-3 lg:flex-row lg:items-center lg:justify-between">
-                  <div className="min-w-0 flex-1">
+                <li key={entry.id} className="grid gap-3 px-3 py-3 lg:grid-cols-[minmax(0,1fr)_minmax(18rem,28rem)] lg:items-start">
+                  <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
                       <label className="inline-flex items-center gap-2 text-sm font-medium text-foreground">
                         <input
@@ -1024,7 +1003,6 @@ export default function ProjectDetailPage() {
                         />
                         {entry.displayName}
                       </label>
-                      <span className={pillClass}>{statusText}</span>
                       {entry.recommended && (
                         <span className="inline-flex h-6 items-center rounded-full bg-muted px-2.5 text-xs font-medium text-muted-foreground">
                           Recommended
@@ -1032,24 +1010,27 @@ export default function ProjectDetailPage() {
                       )}
                     </div>
                     <p className="mt-1 text-xs text-muted-foreground">{entry.description}</p>
-                    {selected && status?.error && (
-                      <p className={mcpErrorClass(status)}>{status.error}</p>
-                    )}
                   </div>
-                  <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center lg:justify-end">
-                    {selected && status?.mcpId === 'filesystem' && status.status === 'configuration_required' && (
-                      <Button type="button" variant="outline" size="sm" onClick={openProjectPathDialog}>
-                        <SettingsIcon aria-hidden="true" />
-                        Configure
+                  <McpPresentation
+                    presentation={presentation}
+                    renderAction={(action) => (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="w-full sm:w-auto"
+                        disabled={savingMcpSelection || refreshingMcps}
+                        aria-busy={
+                          (action.kind === 'install' || action.kind === 'enable')
+                            ? savingMcpSelection
+                            : action.kind === 'refresh' && refreshingMcps
+                        }
+                        onClick={() => runProjectMcpAction(action, entry.id)}
+                      >
+                        {action.label}
                       </Button>
                     )}
-                    {selected && status?.mcpId === 'github' && status.status === 'auth_required' && (
-                      <Button type="button" variant="outline" size="sm" onClick={() => router.push('/dashboard/settings#github')}>
-                        <SettingsIcon aria-hidden="true" />
-                        Connect
-                      </Button>
-                    )}
-                  </div>
+                  />
                 </li>
               )
             })}

@@ -4,6 +4,7 @@ import { agentRuns, approvalGates, artifacts, workPackages } from '../db/schema'
 import { publishTaskEvent, type TaskEventPayload } from './events'
 import { sanitizeWorkerMessage } from './redaction'
 import { updateTaskStatusIfCurrent } from './task-state'
+import { convergeRecognizedOperatorHoldTask } from '../lib/mcps/filesystem-grant-reconciliation'
 
 export const REVIEW_GATE_TYPES = ['qa_review', 'reviewer_review', 'security_review'] as const
 export type ReviewGateType = typeof REVIEW_GATE_TYPES[number]
@@ -1096,6 +1097,18 @@ export async function decideReviewGate(input: {
   const completion = decided.packageStatus === 'completed'
     ? await completeTaskIfReviewGatesSatisfied(input.taskId)
     : { status: 'blocked' as const }
+
+  // A review barrier may have been the last reason a running task could not
+  // return to its durable operator hold. Recheck after every existing
+  // post-decision projection has consumed the committed review state; no wake
+  // or claim is created here.
+  try {
+    await convergeRecognizedOperatorHoldTask(input.taskId)
+  } catch (err) {
+    // The review decision is already durable. Startup and periodic convergence
+    // will retry this database-derived transition without relying on Redis.
+    console.warn('[review-gates] Deferred operator-hold convergence to fallback sweep', err)
+  }
 
   return {
     status: 'decided',

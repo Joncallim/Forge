@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { getSession } from '@/lib/session'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 import {
   getWorkspaceSettings,
   resolveWorkspaceInputPath,
@@ -21,7 +22,7 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const workspace = await getWorkspaceSettings()
+    const workspace = await getWorkspaceSettings({ ensure: false })
     return NextResponse.json({ workspace: serializeWorkspaceSettings(workspace) })
   } catch (err) {
     console.error('[GET /api/settings/workspace] Unexpected error', err)
@@ -35,6 +36,9 @@ export async function PUT(request: NextRequest) {
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+
+    const ingressResponse = await guardEpic172ProjectManagementIngress()
+    if (ingressResponse) return ingressResponse
 
     const parsed = updateSchema.safeParse(await request.json().catch(() => null))
     if (!parsed.success) {

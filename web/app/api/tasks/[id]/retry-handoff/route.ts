@@ -3,6 +3,7 @@ import type { NextRequest } from 'next/server'
 import { getSession } from '@/lib/session'
 import { getAccessibleTask } from '@/lib/task-access'
 import { enqueueBlockedHandoffRetry } from '@/worker/blocked-handoff-retry'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 
 // ---------------------------------------------------------------------------
 // POST /api/tasks/:id/retry-handoff
@@ -22,6 +23,9 @@ export async function POST(
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
 
     const { id: taskId } = await params
 

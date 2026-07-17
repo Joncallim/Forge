@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   dbSelect: vi.fn(),
   dbTransaction: vi.fn(async (callback: (tx: unknown) => unknown) =>
     callback({
+      execute: vi.fn().mockResolvedValue([{ now: '2026-07-17 00:00:00+00' }]),
       insert: vi.fn(),
       update: vi.fn(),
     }),
@@ -20,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   completeTaskIfReviewGatesSatisfied: vi.fn(),
   executeWorkPackage: vi.fn(),
   loadWorkPackageExecutionContext: vi.fn(),
+  loadCurrentProjectFilesystemDecision: vi.fn().mockResolvedValue(null),
   publishTaskEvent: vi.fn(),
   WorkPackageExecutionError: class WorkPackageExecutionError extends Error {
     failureDetails: unknown
@@ -65,6 +67,11 @@ vi.mock('@/worker/work-package-executor', () => ({
   WorkPackageExecutionError: mocks.WorkPackageExecutionError,
   isArchitectReservedExecutionRole: (role: string) =>
     ['architect', 'security', 'security-review', 'security_review'].includes(role.trim().toLowerCase()),
+}))
+
+vi.mock('@/lib/mcps/filesystem-grant-reconciliation', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/filesystem-grant-reconciliation')>(),
+  loadCurrentProjectFilesystemDecision: mocks.loadCurrentProjectFilesystemDecision,
 }))
 
 function fixtureSecret(...parts: string[]) {
@@ -155,6 +162,7 @@ function freshLockSelectMock() {
         id: latestFreshAdmission.projectId,
         localPath: latestFreshAdmission.localPath ?? null,
         mcpConfig: latestFreshAdmission.mcpConfig ?? null,
+        rootBindingRevision: latestFreshAdmission.rootBindingRevision ?? BigInt(0),
       }])
     }
     if (call === 2) {
@@ -202,6 +210,7 @@ function freshAdmissionRow(
     projectId: project.id,
     localPath: project.localPath ?? null,
     mcpConfig: project.mcpConfig ?? null,
+    rootBindingRevision: project.rootBindingRevision ?? BigInt(0),
   }
 }
 
@@ -352,6 +361,7 @@ describe('handoffApprovedWorkPackages', () => {
     mocks.dbTransaction.mockReset()
     mocks.dbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) =>
       callback({
+        execute: vi.fn().mockResolvedValue([{ now: '2026-07-17 00:00:00+00' }]),
         insert: vi.fn(),
         select: freshLockSelectMock(),
         update: mocks.dbUpdate,
@@ -360,6 +370,8 @@ describe('handoffApprovedWorkPackages', () => {
     mocks.dbUpdate.mockReset()
     mocks.executeWorkPackage.mockReset()
     mocks.loadWorkPackageExecutionContext.mockReset()
+    mocks.loadCurrentProjectFilesystemDecision.mockReset()
+    mocks.loadCurrentProjectFilesystemDecision.mockResolvedValue(null)
     mocks.getProjectMcpOverview.mockResolvedValue({
       projectId: 'project-1',
       config: { profile: 'default', requiredMcps: [], overrides: {} },
@@ -697,18 +709,15 @@ describe('handoffApprovedWorkPackages', () => {
       blockedReason: expect.stringContaining('requires filesystem grant approval'),
       claimedPackageId: null,
       status: 'blocked',
-      terminalBlock: true,
+      taskDisposition: 'operator_hold',
     })
-    // Failed at the gate: the package carries the grant-block marker and no
+    // Held at the gate: the package carries the grant-block marker and no
     // implementation run/transaction was ever started, so no attempt is spent.
     expect(failedPackageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      status: 'failed',
+      status: 'blocked',
       metadata: expect.anything(),
     }))
-    expect(failedTaskUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      errorMessage: expect.stringContaining('requires filesystem grant approval'),
-      status: 'failed',
-    }))
+    expect(failedTaskUpdate.set).not.toHaveBeenCalled()
     expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
   })
 
@@ -716,6 +725,7 @@ describe('handoffApprovedWorkPackages', () => {
     const project = {
       id: 'project-1',
       mcpConfig: { profile: 'default', requiredMcps: [], overrides: {} },
+      rootBindingRevision: BigInt(1),
     }
     const pkg = {
       id: 'pkg-fs-project', assignedRole: 'backend', harnessId: 'harness-1',
@@ -724,8 +734,9 @@ describe('handoffApprovedWorkPackages', () => {
       }],
       metadata: {
         mcpGrantPhases: { effective: {
-          schemaVersion: 1, phase: 'effective', source: 'project-filesystem-approval',
+          schemaVersion: 2, phase: 'effective', source: 'project-filesystem-approval',
           runtimeEnforcement: 'bounded_context_packet', status: 'approved',
+          grantDecisionRevision: '1', rootBindingRevision: '1',
           grants: [{
             mcpId: 'filesystem', status: 'approved', capabilities: ['filesystem.project.read'],
           }],
@@ -751,10 +762,10 @@ describe('handoffApprovedWorkPackages', () => {
       blockedReason: expect.stringContaining('project-level filesystem grant'),
       claimedPackageId: null,
       status: 'blocked',
-      terminalBlock: true,
+      taskDisposition: 'operator_hold',
     })
     expect(failedPackageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      status: 'failed',
+      status: 'blocked',
       metadata: expect.anything(),
     }))
     expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
@@ -762,7 +773,7 @@ describe('handoffApprovedWorkPackages', () => {
 
   it('uses a current approved project filesystem grant even when the package has no persisted project-effective phase', async () => {
     const projectGrant = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       mcpId: 'filesystem',
       status: 'approved',
       grantMode: 'always_allow',
@@ -771,9 +782,12 @@ describe('handoffApprovedWorkPackages', () => {
       approvedAt: '2026-07-14T00:00:00.000Z',
       approvedBy: 'user-1',
       reason: 'Approved project context.',
+      grantDecisionRevision: '1',
+      rootBindingRevision: '1',
     }
     const project = {
       id: 'project-1',
+      rootBindingRevision: BigInt(1),
       mcpConfig: {
         profile: 'default',
         requiredMcps: ['filesystem'],
@@ -781,6 +795,21 @@ describe('handoffApprovedWorkPackages', () => {
         grants: { filesystem: projectGrant },
       },
     }
+    mocks.loadCurrentProjectFilesystemDecision.mockResolvedValue({
+      schemaVersion: 2,
+      decisionId: projectGrant.grantApprovalId,
+      projectId: project.id,
+      decision: 'approved',
+      capabilities: projectGrant.capabilities,
+      grantDecisionRevision: projectGrant.grantDecisionRevision,
+      rootBindingRevision: projectGrant.rootBindingRevision,
+      decisionFingerprint: `sha256:${'1'.repeat(64)}`,
+      decisionGeneration: '1',
+      decidedAt: projectGrant.approvedAt,
+      decidedBy: projectGrant.approvedBy,
+      reason: projectGrant.reason,
+      revocationReason: null,
+    })
     const pkg = {
       id: 'pkg-fs-project',
       assignedRole: 'backend',
@@ -1555,6 +1584,8 @@ describe('handoffApprovedWorkPackages', () => {
             attemptNumber: 2,
             heartbeatAt: '2026-06-25T00:00:00.000Z',
             runId: 'run-2',
+            source: 'work-package-handoff',
+            staleAfterSeconds: 900,
           },
         },
         status: 'running',
@@ -1766,6 +1797,8 @@ describe('handoffApprovedWorkPackages', () => {
             attemptNumber: 1,
             heartbeatAt: '2026-06-25T00:00:00.000Z',
             runId: 'run-1',
+            source: 'work-package-handoff',
+            staleAfterSeconds: 900,
           },
         },
         status: 'running',
@@ -1964,6 +1997,8 @@ describe('handoffApprovedWorkPackages', () => {
             attemptNumber: 1,
             heartbeatAt: '2026-06-25T00:00:00.000Z',
             runId: 'run-1',
+            source: 'work-package-handoff',
+            staleAfterSeconds: 900,
           },
         },
         status: 'running',
@@ -2118,6 +2153,8 @@ describe('handoffApprovedWorkPackages', () => {
               attemptNumber: 1,
               heartbeatAt: '2026-06-25T00:00:00.000Z',
               runId: 'run-1',
+              source: 'work-package-handoff',
+              staleAfterSeconds: 900,
             },
           },
           status: 'running',
@@ -2335,6 +2372,8 @@ describe('handoffApprovedWorkPackages', () => {
               attemptNumber: 1,
               heartbeatAt: '2026-06-25T00:00:00.000Z',
               runId: 'run-1',
+              source: 'work-package-handoff',
+              staleAfterSeconds: 900,
             },
           },
           status: 'running',
@@ -2553,6 +2592,8 @@ describe('handoffApprovedWorkPackages', () => {
               attemptNumber: 1,
               heartbeatAt: '2026-06-25T00:00:00.000Z',
               runId: 'run-1',
+              source: 'work-package-handoff',
+              staleAfterSeconds: 900,
             },
           },
           status: 'running',

@@ -1,3 +1,6 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import ts from 'typescript'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -31,7 +34,7 @@ describe('task log writer', () => {
     vi.clearAllMocks()
   })
 
-  it('sanitizes prompt front matter before insert and publishes the created log', async () => {
+  it('removes prompt front matter before insert and publishes the created log', async () => {
     const row = {
       id: 'log-1',
       taskId: 'task-1',
@@ -68,13 +71,7 @@ describe('task log writer', () => {
     })
 
     expect(chain.values).toHaveBeenCalledWith(expect.objectContaining({
-      frontMatter: expect.objectContaining({
-        prompt: expect.objectContaining({
-          byteLength: expect.any(Number),
-          sha256: expect.any(String),
-          truncated: false,
-        }),
-      }),
+      frontMatter: expect.not.objectContaining({ prompt: expect.anything() }),
       metadata: expect.objectContaining({
         nested: expect.objectContaining({
           token: '[REDACTED_TOKEN]',
@@ -90,7 +87,7 @@ describe('task log writer', () => {
     }))
   })
 
-  it('hashes nested prompt-shaped objects instead of preserving their text', () => {
+  it('recursively removes prompt aliases and keeps count metadata for other output', () => {
     const sanitized = sanitizeLogStructuredValue({
       mcpExecutionDesign: {
         promptOverlays: {
@@ -114,26 +111,69 @@ describe('task log writer', () => {
           stdout: 'stdout copied Bearer ghp_secret12345',
         },
       ],
-    }) as {
-      mcpExecutionDesign: { promptOverlays: { byteLength: number; sha256: string } }
-      nested: { prompt: { byteLength: number; sha256: string } }
-      feedback: { byteLength: number; sha256: string }
-      partialOutput: { byteLength: number; sha256: string }
+    }) as unknown as {
+      mcpExecutionDesign: Record<string, unknown>
+      nested: Record<string, unknown>
+      feedback: { kind: string; byteCount: number }
       commandResults: Array<{
-        stderr: { byteLength: number; sha256: string }
-        stdout: { byteLength: number; sha256: string }
+        stderr: { kind: string; byteCount: number }
+        stdout: { kind: string; byteCount: number }
       }>
     }
 
-    expect(sanitized.mcpExecutionDesign.promptOverlays.sha256).toHaveLength(64)
-    expect(sanitized.nested.prompt.sha256).toHaveLength(64)
-    expect(sanitized.feedback.sha256).toHaveLength(64)
-    expect(sanitized.partialOutput.sha256).toHaveLength(64)
-    expect(sanitized.commandResults[0].stderr.sha256).toHaveLength(64)
-    expect(sanitized.commandResults[0].stdout.sha256).toHaveLength(64)
+    expect(sanitized.mcpExecutionDesign).not.toHaveProperty('promptOverlays')
+    expect(sanitized.nested).not.toHaveProperty('prompt')
+    expect(sanitized.feedback).toEqual({ kind: 'unknown_legacy_digest', byteCount: expect.any(Number) })
+    expect(sanitized.commandResults[0].stderr).toEqual({ kind: 'unknown_legacy_digest', byteCount: expect.any(Number) })
+    expect(sanitized.commandResults[0].stdout).toEqual({ kind: 'unknown_legacy_digest', byteCount: expect.any(Number) })
+    expect(JSON.stringify(sanitized)).not.toContain('sha256')
     expect(JSON.stringify(sanitized)).not.toContain('sk-live-secret')
     expect(JSON.stringify(sanitized)).not.toContain('ghp_secret12345')
     expect(JSON.stringify(sanitized)).not.toContain('original user prompt')
     expect(JSON.stringify(sanitized)).not.toContain('failing test printed')
+  })
+
+  it('keeps prompt aliases out of every checked-in task-log front-matter producer', () => {
+    const roots = [path.resolve(process.cwd(), 'worker'), path.resolve(process.cwd(), 'app/api')]
+    const files: string[] = []
+    const visitDirectory = (directory: string) => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const target = path.join(directory, entry.name)
+        if (entry.isDirectory()) visitDirectory(target)
+        else if (entry.isFile() && target.endsWith('.ts') && !target.endsWith('/worker/task-logs.ts')) files.push(target)
+      }
+    }
+    roots.forEach(visitDirectory)
+
+    const violations: string[] = []
+    const propertyName = (name: ts.PropertyName): string | null => {
+      if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text
+      return null
+    }
+    for (const file of files) {
+      const source = ts.createSourceFile(file, fs.readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true)
+      const inspectFrontMatter = (node: ts.Node) => {
+        if (ts.isPropertyAssignment(node) && propertyName(node.name) === 'frontMatter') {
+          if (!ts.isObjectLiteralExpression(node.initializer)) {
+            violations.push(`${path.relative(process.cwd(), file)}:${source.getLineAndCharacterOfPosition(node.getStart()).line + 1}:dynamic-front-matter`)
+          } else {
+            const inspectKey = (candidate: ts.Node) => {
+              if (ts.isPropertyAssignment(candidate) || ts.isShorthandPropertyAssignment(candidate)) {
+                const key = propertyName(candidate.name)
+                if (key && (/prompt/i.test(key) || key === 'messages')) {
+                  violations.push(`${path.relative(process.cwd(), file)}:${source.getLineAndCharacterOfPosition(candidate.getStart()).line + 1}:${key}`)
+                }
+              }
+              ts.forEachChild(candidate, inspectKey)
+            }
+            inspectKey(node.initializer)
+          }
+        }
+        ts.forEachChild(node, inspectFrontMatter)
+      }
+      inspectFrontMatter(source)
+    }
+
+    expect(violations).toEqual([])
   })
 })

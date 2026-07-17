@@ -4,6 +4,7 @@ const mocks = vi.hoisted(() => ({
   dbSelect: vi.fn(),
   getProvider: vi.fn(),
   getModel: vi.fn(),
+  loadCurrentProjectFilesystemDecision: vi.fn().mockResolvedValue(null),
   resolveDefaultProvider: vi.fn(),
   assertProjectLocalPathForExecution: vi.fn(),
 }))
@@ -23,6 +24,11 @@ vi.mock('@/lib/providers/default', () => ({
 
 vi.mock('@/lib/projects/local-path', () => ({
   assertProjectLocalPathForExecution: mocks.assertProjectLocalPathForExecution,
+}))
+
+vi.mock('@/lib/mcps/filesystem-grant-reconciliation', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/filesystem-grant-reconciliation')>(),
+  loadCurrentProjectFilesystemDecision: mocks.loadCurrentProjectFilesystemDecision,
 }))
 
 import { loadWorkPackageExecutionContext } from '@/worker/work-package-executor'

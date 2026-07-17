@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "domainUtf8": "forge:epic-172-controller-lease:v1\u0000",
+  "domainHex": "666f7267653a657069632d3137322d636f6e74726f6c6c65722d6c656173653a763100",
+  "secretBytes": 32,
+  "secretHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "digestHex": "9889482e88c98806a17cded064e203c3dd4108af93acb8db66a5a699d87b5947"
+}

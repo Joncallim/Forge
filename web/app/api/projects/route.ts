@@ -9,11 +9,12 @@ import { z } from 'zod'
 import { db } from '@/db'
 import { DEFAULT_PROJECT_MCP_CONFIG, projects, type ProjectMcpConfig } from '@/db/schema'
 import { and, isNull, desc } from 'drizzle-orm'
-import { accessibleProjectOwnerCondition, claimAccessibleLegacyProjects } from '@/lib/project-access'
+import { accessibleProjectOwnerCondition } from '@/lib/project-access'
 import { getSession } from '@/lib/session'
 import { registerProjectPath } from '@/lib/project-registry'
 import { resolveGitHubToken, validateGitHubTokenEnvVar } from '@/lib/github'
 import { getCachedProjectMcpSummaries } from '@/lib/mcps/manager'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 import { buildCloneUrl, OWNER_REPO_RE, redactToken } from '@/lib/projects/clone'
 import {
   assertProjectLocalPathAllowed,
@@ -215,9 +216,19 @@ async function assertProjectConfigPathSafe(localPath: string): Promise<void> {
 function projectResponse<T extends { localPath: string | null }>(
   project: T,
   workspace: WorkspaceSettings,
-): T & { displayLocalPath: string | null } {
+) {
+  const revisions = project as T & {
+    grantDecisionRevision?: bigint
+    rootBindingRevision?: bigint
+  }
   return {
     ...project,
+    ...(typeof revisions.grantDecisionRevision === 'bigint'
+      ? { grantDecisionRevision: revisions.grantDecisionRevision.toString() }
+      : {}),
+    ...(typeof revisions.rootBindingRevision === 'bigint'
+      ? { rootBindingRevision: revisions.rootBindingRevision.toString() }
+      : {}),
     displayLocalPath: project.localPath
       ? displayPathForWorkspacePath(workspace, project.localPath)
       : null,
@@ -234,8 +245,6 @@ export async function GET(request: NextRequest) {
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
-
-    await claimAccessibleLegacyProjects(session.userId)
 
     const rows = await db
       .select()
@@ -267,6 +276,9 @@ export async function POST(request: NextRequest) {
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
 
     let body: unknown
     try {
