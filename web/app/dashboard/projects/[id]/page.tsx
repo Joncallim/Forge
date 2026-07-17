@@ -564,7 +564,7 @@ export default function ProjectDetailPage() {
     const selectedIds = mcpOverview.catalog
       .map((entry) => entry.id)
       .filter((id) => requestedSelection.includes(id))
-    const selectedSet = new Set(selectedIds)
+    const selectedSet = new Set<string>(selectedIds)
     const overrides = Object.fromEntries(
       Object.entries(mcpOverview.config.overrides ?? {}).filter(([mcpId]) => selectedSet.has(mcpId)),
     )
