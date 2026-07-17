@@ -13,13 +13,13 @@ jobs:
       postgres:
         image: postgres:16-alpine
         env:
-          POSTGRES_USER: forge
+          POSTGRES_USER: forge_e2e
           POSTGRES_PASSWORD: forge
-          POSTGRES_DB: forge
+          POSTGRES_DB: forge_e2e
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U forge"
+          --health-cmd "pg_isready -U forge_e2e -d forge_e2e"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -36,8 +36,11 @@ jobs:
       run:
         working-directory: web
     env:
-      DATABASE_URL: postgresql://forge:forge@localhost:5432/forge
-      REDIS_URL: redis://localhost:6379/0
+      DATABASE_URL: postgresql://forge_e2e:forge@localhost:5432/forge_e2e
+      REDIS_URL: redis://localhost:6379/15
+      FORGE_E2E_ALLOW_DESTRUCTIVE_RESET: '1'
+      FORGE_E2E_DATABASE_URL: postgresql://forge_e2e:forge@localhost:5432/forge_e2e
+      FORGE_E2E_REDIS_URL: redis://localhost:6379/15
       SESSION_SECRET: 0000000000000000000000000000000000000000000000000000000000000000
       WEBAUTHN_RP_ID: localhost
       WEBAUTHN_RP_NAME: Forge
