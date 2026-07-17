@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
+import { applyEpic172Step0E2EBridge } from './epic-172-step0-bridge'
 import {
   installSessionCookie,
   resetState,
@@ -14,6 +15,7 @@ test.describe('Orchestrator-stage beta smoke', () => {
   let session: Awaited<ReturnType<typeof seedSession>>
 
   test.beforeEach(async ({ context }, testInfo) => {
+    applyEpic172Step0E2EBridge(testInfo, 'orchestrator-stage.spec.ts')
     await resetState()
     session = await seedSession()
     await installSessionCookie(context, session)

@@ -6,6 +6,7 @@ import { createSession } from '../lib/session'
 import { redis } from '../lib/redis'
 import { parseMcpExecutionDesign } from '../worker/mcp-execution-design'
 import { validateMcpOperatorReviewHistory } from '../worker/mcp-plan-review'
+import { applyEpic172Step0E2EBridge } from './epic-172-step0-bridge'
 
 const databaseUrl = process.env.DATABASE_URL ?? ''
 const redisUrl = process.env.REDIS_URL ?? ''
@@ -153,6 +154,7 @@ test.describe('MCP plan review PostgreSQL concurrency', () => {
   const approvalTasksToRemove: string[] = []
 
   test.beforeEach(async ({}, testInfo) => {
+    applyEpic172Step0E2EBridge(testInfo, 'mcp-plan-review-concurrency.spec.ts')
     desktopOnly(testInfo)
     sql = postgres(databaseUrl, { max: 1 })
     locker = postgres(databaseUrl, { max: 1 })

@@ -17,3 +17,22 @@ The PostgreSQL user and database names must contain `e2e` or `test`. The Redis
 URL must select a nonzero logical database. Playwright ignores inherited
 `DATABASE_URL` and `REDIS_URL` values unless they exactly match these dedicated
 test URLs. Continuous integration uses the same contract.
+
+## Step 0 release bridge
+
+Epic 172 Step 0 deliberately keeps project-management changes disabled. Later
+release steps must present signed evidence before those changes can be enabled.
+That means a small number of older browser flows cannot complete yet, including
+task creation, approval, cancellation, retry, and MCP plan-review writes.
+
+Continuous integration sets `FORGE_EPIC_172_STEP0_E2E_BRIDGE=1` only on the
+Playwright test runner. The flag is not passed to the Forge web server and does
+not enable an application route. A reviewed inventory in
+`e2e/epic-172-step0-bridge.ts` skips only tests that require the later signed
+activation. Every other test still runs. A source test fails when a Playwright
+test is added, renamed, removed, or left out of that inventory.
+
+The mixed-lock Case F test is also run first as a dedicated check. It proves the
+real filesystem-grant HTTP route returns 503 without changing stored data, then
+uses the shared internal mutation service to test lock order. This keeps the
+disabled boundary and the recovery regression covered without a runtime bypass.

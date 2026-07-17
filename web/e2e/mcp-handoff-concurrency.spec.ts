@@ -11,6 +11,7 @@ import { createSession } from '../lib/session'
 import { redis } from '../lib/redis'
 import { projects, workPackages } from '../db/schema'
 import { withLockedTaskFilesystemGrantMutation } from '../lib/tasks/filesystem-grant-mutation'
+import { applyEpic172Step0E2EBridge } from './epic-172-step0-bridge'
 
 const databaseUrl = process.env.DATABASE_URL
 if (!databaseUrl) throw new Error('DATABASE_URL is required for MCP handoff concurrency tests.')
@@ -176,6 +177,7 @@ test.describe('MCP handoff optimistic concurrency', () => {
   const sessionsToDelete: string[] = []
 
   test.beforeEach(async ({}, testInfo) => {
+    applyEpic172Step0E2EBridge(testInfo, 'mcp-handoff-concurrency.spec.ts')
     desktopOnly(testInfo)
     sql = postgres(databaseUrl, { max: 1 })
     writer = postgres(databaseUrl, { max: 1 })
@@ -433,7 +435,9 @@ test.describe('MCP handoff optimistic concurrency', () => {
     expect(contextPacketAudits).toBe(0)
   })
 
-  test('F: mixed task grants and handoff recovery share project-to-package lock order without deadlock', async () => {
+  test('F: mixed task grants and handoff recovery share project-to-package lock order without deadlock', {
+    tag: '@epic172-disabled-ingress',
+  }, async () => {
     const seeded = await seedPackage(sql, {
       metadata: { mcpGrantPhases: { effective: explicitFilesystemGrant() }, ownerNote: 'mixed-grant-owner' },
       mcpRequirements: filesystemRequirement,
