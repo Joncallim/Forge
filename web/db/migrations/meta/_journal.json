@@ -162,6 +162,13 @@
       "when": 1783296000000,
       "tag": "0022_backfill_default_workforce_members",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1784258966103,
+      "tag": "0023_epic_172_release_substrate",
+      "breakpoints": true
     }
   ]
 }

@@ -200,6 +200,354 @@ export type Project = InferSelectModel<typeof projects>
 export type NewProject = InferInsertModel<typeof projects>
 
 // ---------------------------------------------------------------------------
+// Epic 172 release authentication and transition substrate
+//
+// These tables deliberately do not reference projects, tasks, or runs. Release
+// evidence must outlive ordinary application records and remains valid after a
+// signer stops accepting new signatures. The migration adds append-only guards
+// and grants writes only to the dedicated release principals.
+// ---------------------------------------------------------------------------
+export const forgeReleaseSignerKeys = pgTable(
+  'forge_release_signer_keys',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    policyId: text('policy_id').notNull().default('forge-epic-172-release-signing-v1'),
+    generation: bigint('generation', { mode: 'number' }).notNull(),
+    algorithm: text('algorithm').notNull().default('Ed25519'),
+    publicKeySpki: bytea('public_key_spki').notNull(),
+    githubAppId: text('github_app_id').notNull(),
+    rulesetFingerprint: text('ruleset_fingerprint').notNull(),
+    // active keys may sign new records; retiring/retired keys verify only.
+    status: text('status').notNull().default('active'),
+    validFrom: timestamp('valid_from', tsOpts).notNull(),
+    validUntil: timestamp('valid_until', tsOpts).notNull(),
+    activatedAt: timestamp('activated_at', tsOpts),
+    retirementStartedAt: timestamp('retirement_started_at', tsOpts),
+    retiredAt: timestamp('retired_at', tsOpts),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('forge_release_signer_keys_policy_generation_idx').on(t.policyId, t.generation),
+    uniqueIndex('forge_release_signer_keys_ruleset_fingerprint_idx').on(t.rulesetFingerprint),
+    uniqueIndex('forge_release_signer_keys_one_active_policy_idx')
+      .on(t.policyId)
+      .where(sql`${t.status} = 'active'`),
+    index('forge_release_signer_keys_status_validity_idx').on(t.status, t.validFrom, t.validUntil),
+    check('forge_release_signer_keys_policy_chk', sql`${t.policyId} = 'forge-epic-172-release-signing-v1'`),
+    check('forge_release_signer_keys_generation_chk', sql`${t.generation} > 0`),
+    check('forge_release_signer_keys_algorithm_chk', sql`${t.algorithm} = 'Ed25519'`),
+    check('forge_release_signer_keys_public_key_chk', sql`octet_length(${t.publicKeySpki}) > 0`),
+    check('forge_release_signer_keys_fingerprint_chk', sql`${t.rulesetFingerprint} ~ '^[0-9a-f]{64}$'`),
+    check('forge_release_signer_keys_status_chk', sql`${t.status} in ('active', 'retiring', 'retired')`),
+    check('forge_release_signer_keys_validity_chk', sql`${t.validUntil} > ${t.validFrom}`),
+    check(
+      'forge_release_signer_keys_lifecycle_chk',
+      sql`(${t.status} = 'active' and ${t.retirementStartedAt} is null and ${t.retiredAt} is null)
+        or (${t.status} = 'retiring' and ${t.retirementStartedAt} is not null and ${t.retiredAt} is null)
+        or (${t.status} = 'retired' and ${t.retirementStartedAt} is not null and ${t.retiredAt} is not null)`,
+    ),
+  ],
+)
+
+export type ForgeReleaseSignerKey = InferSelectModel<typeof forgeReleaseSignerKeys>
+export type NewForgeReleaseSignerKey = InferInsertModel<typeof forgeReleaseSignerKeys>
+
+export const forgeReleaseSignerKeyLifecycleAudits = pgTable(
+  'forge_release_signer_key_lifecycle_audits',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    signerKeyId: uuid('signer_key_id')
+      .notNull()
+      .references(() => forgeReleaseSignerKeys.id, { onDelete: 'restrict' }),
+    signerGeneration: bigint('signer_generation', { mode: 'number' }).notNull(),
+    action: text('action').notNull(),
+    priorStatus: text('prior_status'),
+    newStatus: text('new_status').notNull(),
+    actor: text('actor').notNull(),
+    reason: text('reason').notNull().default(''),
+    occurredAt: timestamp('occurred_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    index('forge_release_signer_lifecycle_key_idx').on(t.signerKeyId, t.occurredAt),
+    check('forge_release_signer_lifecycle_generation_chk', sql`${t.signerGeneration} > 0`),
+    check(
+      'forge_release_signer_lifecycle_action_chk',
+      sql`${t.action} in ('installed', 'activated', 'retirement_started', 'retired')`,
+    ),
+    check(
+      'forge_release_signer_lifecycle_prior_status_chk',
+      sql`${t.priorStatus} is null or ${t.priorStatus} in ('active', 'retiring', 'retired')`,
+    ),
+    check(
+      'forge_release_signer_lifecycle_new_status_chk',
+      sql`${t.newStatus} in ('active', 'retiring', 'retired')`,
+    ),
+    check('forge_release_signer_lifecycle_actor_chk', sql`length(btrim(${t.actor})) between 1 and 200`),
+    check('forge_release_signer_lifecycle_reason_chk', sql`length(${t.reason}) <= 1000`),
+  ],
+)
+
+export type ForgeReleaseSignerKeyLifecycleAudit = InferSelectModel<typeof forgeReleaseSignerKeyLifecycleAudits>
+export type NewForgeReleaseSignerKeyLifecycleAudit = InferInsertModel<typeof forgeReleaseSignerKeyLifecycleAudits>
+
+export const forgeEpic172ReleaseEvidence = pgTable(
+  'forge_epic_172_release_evidence',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    manifestVersion: integer('manifest_version').notNull().default(1),
+    evidenceKind: text('evidence_kind').notNull(),
+    ownerIssue: integer('owner_issue').notNull(),
+    ownerSlice: text('owner_slice').notNull(),
+    exactBuilds: jsonb('exact_builds').$type<string[]>().notNull(),
+    reviewedSha: text('reviewed_sha').notNull(),
+    epoch: bigint('epoch', { mode: 'number' }),
+    predecessorReceiptIds: jsonb('predecessor_receipt_ids').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    predecessorSetDigest: text('predecessor_set_digest').notNull(),
+    transitionIdentityDigest: text('transition_identity_digest').notNull(),
+    signerKeyId: uuid('signer_key_id')
+      .notNull()
+      .references(() => forgeReleaseSignerKeys.id, { onDelete: 'restrict' }),
+    signerGeneration: bigint('signer_generation', { mode: 'number' }).notNull(),
+    githubAppId: text('github_app_id').notNull(),
+    controllerRunId: text('controller_run_id').notNull(),
+    controllerJobId: text('controller_job_id').notNull(),
+    signatureDomain: text('signature_domain').notNull().default('forge:epic-172-release-evidence:v1'),
+    envelopeVersion: integer('envelope_version').notNull().default(1),
+    envelopeDigest: text('envelope_digest').notNull(),
+    detachedSignature: bytea('detached_signature').notNull(),
+    nonce: uuid('nonce').notNull(),
+    issuedAt: timestamp('issued_at', tsOpts).notNull(),
+    recordedAt: timestamp('recorded_at', tsOpts).defaultNow().notNull(),
+    envelope: jsonb('envelope').$type<Record<string, unknown>>().notNull(),
+  },
+  (t) => [
+    uniqueIndex('forge_epic_172_release_evidence_transition_identity_idx').on(t.transitionIdentityDigest),
+    uniqueIndex('forge_epic_172_release_evidence_nonce_idx').on(t.nonce),
+    uniqueIndex('forge_epic_172_release_evidence_envelope_digest_idx').on(t.envelopeDigest),
+    index('forge_epic_172_release_evidence_kind_idx').on(t.manifestVersion, t.evidenceKind),
+    index('forge_epic_172_release_evidence_signer_idx').on(t.signerKeyId, t.signerGeneration),
+    check('forge_epic_172_release_evidence_manifest_chk', sql`${t.manifestVersion} = 1`),
+    check('forge_epic_172_release_evidence_owner_issue_chk', sql`${t.ownerIssue} > 0`),
+    check('forge_epic_172_release_evidence_owner_slice_chk', sql`${t.ownerSlice} in ('step0', 's3', 's4', 's5', 's6')`),
+    check('forge_epic_172_release_evidence_builds_chk', sql`jsonb_typeof(${t.exactBuilds}) = 'array' and jsonb_array_length(${t.exactBuilds}) > 0`),
+    check('forge_epic_172_release_evidence_sha_chk', sql`${t.reviewedSha} ~ '^[0-9a-f]{40,64}$'`),
+    check('forge_epic_172_release_evidence_epoch_chk', sql`${t.epoch} is null or ${t.epoch} > 0`),
+    check('forge_epic_172_release_evidence_predecessors_chk', sql`jsonb_typeof(${t.predecessorReceiptIds}) = 'array'`),
+    check('forge_epic_172_release_evidence_predecessor_digest_chk', sql`${t.predecessorSetDigest} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_release_evidence_identity_digest_chk', sql`${t.transitionIdentityDigest} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_release_evidence_generation_chk', sql`${t.signerGeneration} > 0`),
+    check('forge_epic_172_release_evidence_domain_chk', sql`${t.signatureDomain} = 'forge:epic-172-release-evidence:v1'`),
+    check('forge_epic_172_release_evidence_envelope_version_chk', sql`${t.envelopeVersion} = 1`),
+    check('forge_epic_172_release_evidence_envelope_digest_chk', sql`${t.envelopeDigest} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_release_evidence_signature_chk', sql`octet_length(${t.detachedSignature}) = 64`),
+    check('forge_epic_172_release_evidence_time_chk', sql`${t.recordedAt} >= ${t.issuedAt}`),
+    check('forge_epic_172_release_evidence_envelope_chk', sql`jsonb_typeof(${t.envelope}) = 'object'`),
+  ],
+)
+
+export type ForgeEpic172ReleaseEvidence = InferSelectModel<typeof forgeEpic172ReleaseEvidence>
+export type NewForgeEpic172ReleaseEvidence = InferInsertModel<typeof forgeEpic172ReleaseEvidence>
+
+export const forgeEpic172TransitionAuthorizations = pgTable(
+  'forge_epic_172_transition_authorizations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    manifestVersion: integer('manifest_version').notNull().default(1),
+    targetNode: text('target_node').notNull(),
+    transitionIdentityDigest: text('transition_identity_digest').notNull(),
+    sourceReceiptIds: jsonb('source_receipt_ids').$type<string[]>().notNull(),
+    sourceReceiptSetDigest: text('source_receipt_set_digest').notNull(),
+    ownerIssue: integer('owner_issue').notNull(),
+    ownerSlice: text('owner_slice').notNull(),
+    exactBuilds: jsonb('exact_builds').$type<string[]>().notNull(),
+    reviewedSha: text('reviewed_sha').notNull(),
+    epoch: bigint('epoch', { mode: 'number' }),
+    operationId: text('operation_id').notNull(),
+    operation: text('operation').notNull(),
+    controllerLoginId: text('controller_login_id').notNull(),
+    controllerRunId: text('controller_run_id').notNull(),
+    signerKeyId: uuid('signer_key_id')
+      .notNull()
+      .references(() => forgeReleaseSignerKeys.id, { onDelete: 'restrict' }),
+    signerGeneration: bigint('signer_generation', { mode: 'number' }).notNull(),
+    signatureDomain: text('signature_domain').notNull().default('forge:epic-172-transition-authorization:v1'),
+    envelopeVersion: integer('envelope_version').notNull().default(1),
+    envelopeDigest: text('envelope_digest').notNull(),
+    detachedSignature: bytea('detached_signature').notNull(),
+    nonce: uuid('nonce').notNull(),
+    issuedAt: timestamp('issued_at', tsOpts).notNull(),
+    expiresAt: timestamp('expires_at', tsOpts).notNull(),
+    recordedAt: timestamp('recorded_at', tsOpts).defaultNow().notNull(),
+    envelope: jsonb('envelope').$type<Record<string, unknown>>().notNull(),
+  },
+  (t) => [
+    uniqueIndex('forge_epic_172_transition_authorizations_nonce_idx').on(t.nonce),
+    uniqueIndex('forge_epic_172_transition_authorizations_envelope_digest_idx').on(t.envelopeDigest),
+    index('forge_epic_172_transition_authorizations_target_idx').on(t.manifestVersion, t.targetNode),
+    index('forge_epic_172_transition_authorizations_expiry_idx').on(t.expiresAt),
+    index('forge_epic_172_transition_authorizations_signer_idx').on(t.signerKeyId, t.signerGeneration),
+    check('forge_epic_172_transition_authorizations_manifest_chk', sql`${t.manifestVersion} = 1`),
+    check('forge_epic_172_transition_authorizations_identity_chk', sql`${t.transitionIdentityDigest} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_transition_authorizations_sources_chk', sql`jsonb_typeof(${t.sourceReceiptIds}) = 'array' and jsonb_array_length(${t.sourceReceiptIds}) > 0`),
+    check('forge_epic_172_transition_authorizations_source_digest_chk', sql`${t.sourceReceiptSetDigest} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_transition_authorizations_owner_issue_chk', sql`${t.ownerIssue} > 0`),
+    check('forge_epic_172_transition_authorizations_owner_slice_chk', sql`${t.ownerSlice} in ('step0', 's3', 's4', 's5', 's6')`),
+    check('forge_epic_172_transition_authorizations_builds_chk', sql`jsonb_typeof(${t.exactBuilds}) = 'array' and jsonb_array_length(${t.exactBuilds}) > 0`),
+    check('forge_epic_172_transition_authorizations_sha_chk', sql`${t.reviewedSha} ~ '^[0-9a-f]{40,64}$'`),
+    check('forge_epic_172_transition_authorizations_epoch_chk', sql`${t.epoch} is null or ${t.epoch} > 0`),
+    check('forge_epic_172_transition_authorizations_generation_chk', sql`${t.signerGeneration} > 0`),
+    check('forge_epic_172_transition_authorizations_domain_chk', sql`${t.signatureDomain} = 'forge:epic-172-transition-authorization:v1'`),
+    check('forge_epic_172_transition_authorizations_envelope_version_chk', sql`${t.envelopeVersion} = 1`),
+    check('forge_epic_172_transition_authorizations_envelope_digest_chk', sql`${t.envelopeDigest} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_transition_authorizations_signature_chk', sql`octet_length(${t.detachedSignature}) = 64`),
+    check('forge_epic_172_transition_authorizations_lifetime_chk', sql`${t.expiresAt} > ${t.issuedAt} and ${t.expiresAt} <= ${t.issuedAt} + interval '30 minutes'`),
+    check('forge_epic_172_transition_authorizations_recorded_chk', sql`${t.recordedAt} >= ${t.issuedAt}`),
+    check('forge_epic_172_transition_authorizations_envelope_chk', sql`jsonb_typeof(${t.envelope}) = 'object'`),
+  ],
+)
+
+export type ForgeEpic172TransitionAuthorization = InferSelectModel<typeof forgeEpic172TransitionAuthorizations>
+export type NewForgeEpic172TransitionAuthorization = InferInsertModel<typeof forgeEpic172TransitionAuthorizations>
+
+export const forgeEpic172ReleaseEvidenceConsumptions = pgTable(
+  'forge_epic_172_release_evidence_consumptions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    receiptId: uuid('receipt_id')
+      .notNull()
+      .references(() => forgeEpic172ReleaseEvidence.id, { onDelete: 'restrict' }),
+    transitionIdentityDigest: text('transition_identity_digest').notNull(),
+    authorizationId: uuid('authorization_id')
+      .notNull()
+      .references(() => forgeEpic172TransitionAuthorizations.id, { onDelete: 'restrict' }),
+    consumerNode: text('consumer_node').notNull(),
+    operationId: text('operation_id').notNull(),
+    actor: text('actor').notNull(),
+    consumedAt: timestamp('consumed_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('forge_epic_172_release_evidence_consumptions_receipt_idx').on(t.receiptId),
+    uniqueIndex('forge_epic_172_release_evidence_consumptions_authorization_idx').on(t.authorizationId),
+    uniqueIndex('forge_epic_172_release_evidence_consumptions_identity_consumer_idx')
+      .on(t.transitionIdentityDigest, t.consumerNode),
+    index('forge_epic_172_release_evidence_consumptions_operation_idx').on(t.operationId),
+    check('forge_epic_172_release_evidence_consumptions_identity_chk', sql`${t.transitionIdentityDigest} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_release_evidence_consumptions_consumer_chk', sql`length(btrim(${t.consumerNode})) between 1 and 100`),
+    check('forge_epic_172_release_evidence_consumptions_operation_chk', sql`length(btrim(${t.operationId})) between 1 and 200`),
+    check('forge_epic_172_release_evidence_consumptions_actor_chk', sql`length(btrim(${t.actor})) between 1 and 200`),
+  ],
+)
+
+export type ForgeEpic172ReleaseEvidenceConsumption = InferSelectModel<typeof forgeEpic172ReleaseEvidenceConsumptions>
+export type NewForgeEpic172ReleaseEvidenceConsumption = InferInsertModel<typeof forgeEpic172ReleaseEvidenceConsumptions>
+
+export const forgeEpic172EnablementState = pgTable(
+  'forge_epic_172_enablement_state',
+  {
+    singletonId: text('singleton_id').primaryKey().default('epic-172'),
+    state: text('state').notNull().default('disabled'),
+    ownerOperationId: text('owner_operation_id'),
+    exactBuilds: jsonb('exact_builds').$type<string[]>(),
+    reviewedSha: text('reviewed_sha'),
+    epoch: bigint('epoch', { mode: 'number' }),
+    startedAt: timestamp('started_at', tsOpts),
+    expiresAt: timestamp('expires_at', tsOpts),
+    enablementReceiptId: uuid('enablement_receipt_id')
+      .references(() => forgeEpic172ReleaseEvidence.id, { onDelete: 'restrict' }),
+    finalReadinessReceiptId: uuid('final_readiness_receipt_id')
+      .references(() => forgeEpic172ReleaseEvidence.id, { onDelete: 'restrict' }),
+    openingAuthorizationId: uuid('opening_authorization_id')
+      .references(() => forgeEpic172TransitionAuthorizations.id, { onDelete: 'restrict' }),
+    controllerLoginId: text('controller_login_id'),
+    controllerRunId: text('controller_run_id'),
+    controllerTokenDigest: text('controller_token_digest'),
+    leaseGeneration: bigint('lease_generation', { mode: 'number' }),
+    lastHeartbeatAt: timestamp('last_heartbeat_at', tsOpts),
+    leaseExpiresAt: timestamp('lease_expires_at', tsOpts),
+    stateFingerprint: text('state_fingerprint').notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    check('forge_epic_172_enablement_singleton_chk', sql`${t.singletonId} = 'epic-172'`),
+    check('forge_epic_172_enablement_state_chk', sql`${t.state} in ('disabled', 'provisional', 'active')`),
+    check('forge_epic_172_enablement_sha_chk', sql`${t.reviewedSha} is null or ${t.reviewedSha} ~ '^[0-9a-f]{40,64}$'`),
+    check('forge_epic_172_enablement_epoch_chk', sql`${t.epoch} is null or ${t.epoch} > 0`),
+    check('forge_epic_172_enablement_token_chk', sql`${t.controllerTokenDigest} is null or ${t.controllerTokenDigest} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_enablement_lease_generation_chk', sql`${t.leaseGeneration} is null or ${t.leaseGeneration} > 0`),
+    check('forge_epic_172_enablement_fingerprint_chk', sql`${t.stateFingerprint} ~ '^[0-9a-f]{64}$'`),
+    check(
+      'forge_epic_172_enablement_disabled_chk',
+      sql`${t.state} <> 'disabled' or (
+        ${t.ownerOperationId} is null and ${t.exactBuilds} is null and ${t.reviewedSha} is null and
+        ${t.epoch} is null and ${t.startedAt} is null and ${t.expiresAt} is null and
+        ${t.enablementReceiptId} is null and ${t.finalReadinessReceiptId} is null and
+        ${t.openingAuthorizationId} is null and ${t.controllerLoginId} is null and
+        ${t.controllerRunId} is null and ${t.controllerTokenDigest} is null and
+        ${t.leaseGeneration} is null and ${t.lastHeartbeatAt} is null and ${t.leaseExpiresAt} is null
+      )`,
+    ),
+    check(
+      'forge_epic_172_enablement_provisional_chk',
+      sql`${t.state} <> 'provisional' or (
+        ${t.ownerOperationId} is not null and jsonb_typeof(${t.exactBuilds}) = 'array' and
+        ${t.reviewedSha} is not null and ${t.epoch} is not null and ${t.startedAt} is not null and
+        ${t.expiresAt} is not null and ${t.expiresAt} > ${t.startedAt} and
+        ${t.enablementReceiptId} is not null and ${t.openingAuthorizationId} is not null and
+        ${t.controllerLoginId} is not null and ${t.controllerRunId} is not null and
+        ${t.controllerTokenDigest} is not null and ${t.leaseGeneration} is not null and
+        ${t.lastHeartbeatAt} is not null and ${t.leaseExpiresAt} is not null and
+        ${t.leaseExpiresAt} <= ${t.expiresAt}
+      )`,
+    ),
+    check(
+      'forge_epic_172_enablement_active_chk',
+      sql`${t.state} <> 'active' or (
+        ${t.ownerOperationId} is not null and jsonb_typeof(${t.exactBuilds}) = 'array' and
+        ${t.reviewedSha} is not null and ${t.epoch} is not null and
+        ${t.enablementReceiptId} is not null and ${t.finalReadinessReceiptId} is not null
+      )`,
+    ),
+  ],
+)
+
+export type ForgeEpic172EnablementState = InferSelectModel<typeof forgeEpic172EnablementState>
+export type NewForgeEpic172EnablementState = InferInsertModel<typeof forgeEpic172EnablementState>
+
+export const forgeEpic172EnablementTransitionAudits = pgTable(
+  'forge_epic_172_enablement_transition_audits',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    disposition: text('disposition').notNull(),
+    priorStateFingerprint: text('prior_state_fingerprint').notNull(),
+    newStateFingerprint: text('new_state_fingerprint').notNull(),
+    operationId: text('operation_id').notNull(),
+    actor: text('actor').notNull(),
+    controllerRunId: text('controller_run_id'),
+    authorizationId: uuid('authorization_id')
+      .references(() => forgeEpic172TransitionAuthorizations.id, { onDelete: 'restrict' }),
+    evidenceReceiptId: uuid('evidence_receipt_id')
+      .references(() => forgeEpic172ReleaseEvidence.id, { onDelete: 'restrict' }),
+    occurredAt: timestamp('occurred_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    index('forge_epic_172_enablement_transition_operation_idx').on(t.operationId, t.occurredAt),
+    index('forge_epic_172_enablement_transition_disposition_idx').on(t.disposition, t.occurredAt),
+    check(
+      'forge_epic_172_enablement_transition_disposition_chk',
+      sql`${t.disposition} in ('opened', 'heartbeat', 'failed_disabled', 'expired_disabled', 'manually_disabled', 'promoted_active')`,
+    ),
+    check('forge_epic_172_enablement_transition_prior_fingerprint_chk', sql`${t.priorStateFingerprint} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_enablement_transition_new_fingerprint_chk', sql`${t.newStateFingerprint} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_enablement_transition_operation_chk', sql`length(btrim(${t.operationId})) between 1 and 200`),
+    check('forge_epic_172_enablement_transition_actor_chk', sql`length(btrim(${t.actor})) between 1 and 200`),
+  ],
+)
+
+export type ForgeEpic172EnablementTransitionAudit = InferSelectModel<typeof forgeEpic172EnablementTransitionAudits>
+export type NewForgeEpic172EnablementTransitionAudit = InferInsertModel<typeof forgeEpic172EnablementTransitionAudits>
+
+// ---------------------------------------------------------------------------
 // mcpInstallations
 // ---------------------------------------------------------------------------
 export const mcpInstallations = pgTable(
