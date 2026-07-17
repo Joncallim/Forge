@@ -1,0 +1,229 @@
+{
+  "schemaVersion": 1,
+  "manifestId": "forge-epic-172-release-order-v1",
+  "nodes": [
+    {
+      "id": "step0_retention_bridge",
+      "owner": { "issue": 179, "slice": "step0" },
+      "issueDependencies": [176, 177],
+      "requiredEvidence": [
+        "project_removal_route_archive_or_reject_before_filesystem_work",
+        "all_project_management_ingress_closed",
+        "pre_bridge_processes_and_sessions_drained",
+        "retention_foreign_keys_restrict_or_no_action",
+        "database_hard_delete_guard_installed",
+        "release_authentication_substrate_installed",
+        "enablement_state_initialized_disabled",
+        "signed_empty_predecessor_receipt_retained"
+      ],
+      "buildIdentity": {
+        "exactBuilds": ["issue_179_step0"],
+        "reviewedSha": "required",
+        "epoch": "none"
+      }
+    },
+    {
+      "id": "s3_issue_178",
+      "owner": { "issue": 178, "slice": "s3" },
+      "issueDependencies": [],
+      "requiredEvidence": [
+        "step0_retention_bridge_receipt",
+        "grant_decision_revision_contract_green",
+        "operator_hold_and_reconciliation_contract_green",
+        "canonical_lock_order_contract_green",
+        "postgresql_s3_evidence_green"
+      ],
+      "buildIdentity": {
+        "exactBuilds": ["issue_178_s3"],
+        "reviewedSha": "required",
+        "epoch": "none"
+      }
+    },
+    {
+      "id": "s4_expand",
+      "owner": { "issue": 179, "slice": "s4" },
+      "issueDependencies": [],
+      "requiredEvidence": [
+        "s3_issue_178_receipt",
+        "additive_schema_and_protocol_v2_expansion_complete",
+        "root_reference_lifecycle_guards_green",
+        "postgresql_expansion_tests_green",
+        "all_v2_producers_disabled"
+      ],
+      "buildIdentity": {
+        "exactBuilds": ["issue_179_s4"],
+        "reviewedSha": "required",
+        "epoch": "none"
+      }
+    },
+    {
+      "id": "s4_producers_disabled",
+      "owner": { "issue": 179, "slice": "s4" },
+      "issueDependencies": [],
+      "requiredEvidence": [
+        "s4_expand_receipt",
+        "legacy_credentials_publishers_and_sessions_drained",
+        "expansion_journal_reconciled_through_watermark",
+        "project_root_bindings_complete",
+        "legacy_prompt_and_event_data_zero_scan_green",
+        "all_v2_producers_disabled"
+      ],
+      "buildIdentity": {
+        "exactBuilds": ["issue_179_s4"],
+        "reviewedSha": "required",
+        "epoch": "none"
+      }
+    },
+    {
+      "id": "s5_compatible_consumers_deployed",
+      "owner": { "issue": 180, "slice": "s5" },
+      "issueDependencies": [],
+      "requiredEvidence": [
+        "s4_producers_disabled_receipt",
+        "compatible_s5_evidence_consumers_deployed",
+        "disabled_s6_controller_and_supported_host_harness_deployed",
+        "writers_ingress_and_issuance_remain_disabled"
+      ],
+      "buildIdentity": {
+        "exactBuilds": ["issue_179_s4", "issue_180_s5", "issue_181_s6"],
+        "reviewedSha": "required",
+        "epoch": "none"
+      }
+    },
+    {
+      "id": "s6_pre_activation_green",
+      "owner": { "issue": 181, "slice": "s6" },
+      "issueDependencies": [],
+      "requiredEvidence": [
+        "s5_compatible_consumers_deployed_receipt",
+        "exact_pre_activation_manifest_green",
+        "supported_host_preflight_green",
+        "pinned_signer_lifecycle_green",
+        "writers_ingress_and_issuance_remain_disabled"
+      ],
+      "buildIdentity": {
+        "exactBuilds": ["issue_179_s4", "issue_180_s5", "issue_181_s6"],
+        "reviewedSha": "required",
+        "epoch": "none"
+      }
+    },
+    {
+      "id": "s4_controlled_activation",
+      "owner": { "issue": 179, "slice": "s4" },
+      "issueDependencies": [],
+      "requiredEvidence": [
+        "s6_pre_activation_green_receipt",
+        "legacy_claims_drained",
+        "host_root_and_task_readiness_green",
+        "controlled_activation_audit_retained",
+        "activated_epoch_committed",
+        "writers_ingress_and_issuance_remain_disabled"
+      ],
+      "buildIdentity": {
+        "exactBuilds": ["issue_179_s4", "issue_180_s5", "issue_181_s6"],
+        "reviewedSha": "required",
+        "epoch": "required"
+      }
+    },
+    {
+      "id": "s6_post_activation_green",
+      "owner": { "issue": 181, "slice": "s6" },
+      "issueDependencies": [],
+      "requiredEvidence": [
+        "s4_controlled_activation_receipt",
+        "exact_post_activation_manifest_green",
+        "pre_activation_receipt_binding_verified",
+        "controller_run_binding_verified",
+        "writers_ingress_and_issuance_remain_disabled"
+      ],
+      "buildIdentity": {
+        "exactBuilds": ["issue_179_s4", "issue_180_s5", "issue_181_s6"],
+        "reviewedSha": "required",
+        "epoch": "required"
+      }
+    },
+    {
+      "id": "ingress_and_issuance_enabled",
+      "owner": { "issue": 179, "slice": "s4" },
+      "issueDependencies": [],
+      "requiredEvidence": [
+        "s6_post_activation_green_receipt",
+        "fresh_opening_transition_authorization",
+        "provisional_enablement_window_open",
+        "controller_lease_live",
+        "registered_s3_and_root_writers_enabled_first",
+        "queue_and_project_ingress_enabled_next",
+        "packet_issuance_enabled_last"
+      ],
+      "buildIdentity": {
+        "exactBuilds": ["issue_179_s4", "issue_180_s5", "issue_181_s6"],
+        "reviewedSha": "required",
+        "epoch": "required"
+      }
+    },
+    {
+      "id": "s5_s6_release_ready",
+      "owner": { "issue": 181, "slice": "s6" },
+      "issueDependencies": [],
+      "requiredEvidence": [
+        "ingress_and_issuance_enabled_receipt",
+        "enabled_build_tests_green",
+        "provisional_enablement_and_controller_lease_live",
+        "fresh_final_transition_authorization",
+        "signed_final_readiness_envelope",
+        "enablement_promoted_active"
+      ],
+      "buildIdentity": {
+        "exactBuilds": ["issue_179_s4", "issue_180_s5", "issue_181_s6"],
+        "reviewedSha": "required",
+        "epoch": "required"
+      }
+    }
+  ],
+  "codeDependencyGraph": {
+    "meaning": "implementation_and_import_prerequisites",
+    "nodes": [
+      "s1_issue_176",
+      "s2_issue_177",
+      "step0_retention_bridge",
+      "s3_issue_178",
+      "s4_remaining_issue_179",
+      "s5_issue_180",
+      "s6_issue_181"
+    ],
+    "edges": [
+      { "from": "s1_issue_176", "to": "s2_issue_177" },
+      { "from": "s2_issue_177", "to": "step0_retention_bridge" },
+      { "from": "step0_retention_bridge", "to": "s3_issue_178" },
+      { "from": "s3_issue_178", "to": "s4_remaining_issue_179" },
+      { "from": "s4_remaining_issue_179", "to": "s5_issue_180" },
+      { "from": "s5_issue_180", "to": "s6_issue_181" }
+    ]
+  },
+  "runtimeActivationGraph": {
+    "meaning": "operational_release_transitions",
+    "nodes": [
+      "step0_retention_bridge",
+      "s3_issue_178",
+      "s4_expand",
+      "s4_producers_disabled",
+      "s5_compatible_consumers_deployed",
+      "s6_pre_activation_green",
+      "s4_controlled_activation",
+      "s6_post_activation_green",
+      "ingress_and_issuance_enabled",
+      "s5_s6_release_ready"
+    ],
+    "edges": [
+      { "from": "step0_retention_bridge", "to": "s3_issue_178" },
+      { "from": "s3_issue_178", "to": "s4_expand" },
+      { "from": "s4_expand", "to": "s4_producers_disabled" },
+      { "from": "s4_producers_disabled", "to": "s5_compatible_consumers_deployed" },
+      { "from": "s5_compatible_consumers_deployed", "to": "s6_pre_activation_green" },
+      { "from": "s6_pre_activation_green", "to": "s4_controlled_activation" },
+      { "from": "s4_controlled_activation", "to": "s6_post_activation_green" },
+      { "from": "s6_post_activation_green", "to": "ingress_and_issuance_enabled" },
+      { "from": "ingress_and_issuance_enabled", "to": "s5_s6_release_ready" }
+    ]
+  }
+}
