@@ -7,6 +7,7 @@ const mockUpdate = vi.fn()
 const mockGetProjectMcpOverview = vi.fn()
 const mockRedisLpush = vi.fn()
 const mockRedisPublish = vi.fn()
+const mockGuardEpic172ProjectManagementIngress = vi.fn().mockResolvedValue(null)
 
 function chain(value: unknown) {
   const result: Record<string, unknown> = {
@@ -35,6 +36,9 @@ vi.mock('@/lib/redis', () => ({
   redis: { lpush: mockRedisLpush, publish: mockRedisPublish },
 }))
 vi.mock('@/worker/task-logs', () => ({ recordTaskLogBestEffort: vi.fn() }))
+vi.mock('@/lib/projects/epic-172-project-ingress', () => ({
+  guardEpic172ProjectManagementIngress: mockGuardEpic172ProjectManagementIngress,
+}))
 
 function proposedDesign() {
   return {

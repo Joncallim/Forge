@@ -5,9 +5,12 @@ import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { test, expect, type TestInfo } from '@playwright/test'
 import postgres from 'postgres'
+import { eq } from 'drizzle-orm'
 import { handoffApprovedWorkPackages } from '../worker/work-package-handoff'
 import { createSession } from '../lib/session'
 import { redis } from '../lib/redis'
+import { projects, workPackages } from '../db/schema'
+import { withLockedTaskFilesystemGrantMutation } from '../lib/tasks/filesystem-grant-mutation'
 
 const databaseUrl = process.env.DATABASE_URL
 if (!databaseUrl) throw new Error('DATABASE_URL is required for MCP handoff concurrency tests.')
@@ -459,9 +462,46 @@ test.describe('MCP handoff optimistic concurrency', () => {
     let blockingPid = 0
     let blocker: Promise<unknown> | undefined
     let releaseWatcher: Promise<void> | undefined
-    let routeResponse: Promise<Response> | undefined
+    let grantMutation: Promise<string> | undefined
     const baseUrl = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
     const admissionAttempts: number[] = []
+
+    const [beforeProject] = await sql`select mcp_config from projects where id = ${seeded.projectId}`
+    const [beforeTarget] = await sql`select metadata from work_packages where id = ${seeded.packageId}`
+    const [{ count: beforeApprovals }] = await sql`
+      select count(*)::int as count
+      from filesystem_mcp_grant_approvals
+      where task_id = ${seeded.taskId}
+    `
+    const closedResponse = await fetch(`${baseUrl}/api/tasks/${seeded.taskId}/filesystem-grants`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: `forge_session=${sessionId}`,
+      },
+      body: JSON.stringify({
+        schemaVersion: 1,
+        grants: [{
+          workPackageId: siblingPackageId,
+          decision: 'approved',
+          capabilities: ['filesystem.project.read'],
+          grantMode: 'always_allow',
+          reason: 'This HTTP request must remain closed during Step 0.',
+        }],
+      }),
+    })
+    expect(closedResponse.status, await closedResponse.text()).toBe(503)
+    const [afterClosedProject] = await sql`select mcp_config from projects where id = ${seeded.projectId}`
+    const [afterClosedTarget] = await sql`select metadata from work_packages where id = ${seeded.packageId}`
+    const [{ count: afterClosedApprovals }] = await sql`
+      select count(*)::int as count
+      from filesystem_mcp_grant_approvals
+      where task_id = ${seeded.taskId}
+    `
+    expect(afterClosedProject.mcp_config).toEqual(beforeProject.mcp_config)
+    expect(afterClosedTarget.metadata).toEqual(beforeTarget.metadata)
+    expect(afterClosedApprovals).toBe(beforeApprovals)
+
     const handoff = handoffApprovedWorkPackages(seeded.taskId, {
       afterMcpAdmissionEvaluated: async ({ attempt, packageId }) => {
         if (packageId === seeded.packageId) admissionAttempts.push(attempt)
@@ -476,36 +516,92 @@ test.describe('MCP handoff optimistic concurrency', () => {
           await releaseTaskLock
         })
         await blockerStarted
-        routeResponse = fetch(`${baseUrl}/api/tasks/${seeded.taskId}/filesystem-grants`, {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-            Cookie: `forge_session=${sessionId}`,
-          },
-          body: JSON.stringify({
-            schemaVersion: 1,
-            grants: [{
-              workPackageId: seeded.packageId,
-              decision: 'approved',
-              capabilities: ['filesystem.project.read'],
-              grantMode: 'allow_once',
-              reason: 'One bounded context issue for the target.',
-            }, {
-              workPackageId: siblingPackageId,
-              decision: 'approved',
-              capabilities: ['filesystem.project.read'],
+        const grantApprovalId = crypto.randomUUID()
+        grantMutation = withLockedTaskFilesystemGrantMutation({
+          projectId: seeded.projectId,
+          taskId: seeded.taskId,
+          apply: async ({ lockedPackageRows, lockedProject, tx }) => {
+            expect(lockedPackageRows.map((pkg) => pkg.id).sort()).toEqual([
+              seeded.packageId,
+              siblingPackageId,
+            ].sort())
+            const existingConfig = lockedProject.mcpConfig
+            const existingGrants = existingConfig.grants ?? {}
+            const now = new Date()
+            await tx
+              .update(projects)
+              .set({
+                mcpConfig: {
+                  ...existingConfig,
+                  grants: {
+                    ...existingGrants,
+                    filesystem: {
+                      schemaVersion: 1,
+                      mcpId: 'filesystem',
+                      status: 'approved',
+                      grantMode: 'always_allow',
+                      capabilities: ['filesystem.project.read'],
+                      grantApprovalId,
+                      approvedAt: now.toISOString(),
+                      approvedBy: seeded.userId,
+                      reason: 'Shared internal grant-service lock-order test.',
+                    },
+                  },
+                },
+                updatedAt: now,
+              })
+              .where(eq(projects.id, lockedProject.id))
+            const effectiveProjectGrant = {
+              schemaVersion: 1,
+              phase: 'effective',
+              source: 'project-filesystem-approval',
+              grantApprovalId,
               grantMode: 'always_allow',
-              reason: 'Project-wide bounded context for siblings.',
-            }],
-          }),
+              scope: 'project',
+              mcpId: 'filesystem',
+              approvedAt: now.toISOString(),
+              approvedBy: seeded.userId,
+              grants: [{
+                mcpId: 'filesystem',
+                status: 'approved',
+                capabilities: ['filesystem.project.read'],
+                grantApprovalId,
+                grantMode: 'always_allow',
+                reason: 'Shared internal grant-service lock-order test.',
+              }],
+              reason: 'Shared internal grant-service lock-order test.',
+              runtimeIssued: false,
+              runtimeEnforcement: 'bounded_context_packet',
+              status: 'approved',
+            }
+            for (const pkg of lockedPackageRows) {
+              const metadata = pkg.metadata as JsonObject
+              const phases = (metadata.mcpGrantPhases ?? {}) as JsonObject
+              await tx
+                .update(workPackages)
+                .set({
+                  metadata: {
+                    ...metadata,
+                    mcpGrantPhases: {
+                      ...phases,
+                      schemaVersion: 1,
+                      effective: effectiveProjectGrant,
+                    },
+                  },
+                  updatedAt: now,
+                })
+                .where(eq(workPackages.id, pkg.id))
+            }
+            return grantApprovalId
+          },
         })
-        const [routePid] = await Promise.race([
+        const [grantPid] = await Promise.race([
           waitForLockWaiters(sql, blockingPid, 1),
-          routeResponse.then(async (response) => {
-            throw new Error(`Mixed grant route returned before the task lock barrier (${response.status}): ${await response.text()}`)
+          grantMutation.then(() => {
+            throw new Error('Shared grant mutation returned before the task lock barrier.')
           }),
         ])
-        releaseWatcher = waitForLockWaiters(sql, routePid, 1)
+        releaseWatcher = waitForLockWaiters(sql, grantPid, 1)
           .then(() => resolveTaskLock())
         resolveRaceStarted()
       },
@@ -518,16 +614,15 @@ test.describe('MCP handoff optimistic concurrency', () => {
           throw new Error('Mixed grant race did not reach the pre-claim lock-order barrier.')
         }),
       ])
-      if (!routeResponse) throw new Error('Mixed grant route did not start.')
+      if (!grantMutation) throw new Error('Shared grant mutation did not start.')
 
-      const [response, handoffResult] = await Promise.race([
-        Promise.all([routeResponse, handoff] as const),
+      const [grantApprovalId, handoffResult] = await Promise.race([
+        Promise.all([grantMutation, handoff] as const),
         delay(10_000).then(() => {
           throw new Error('Mixed grant update and handoff did not complete; possible lock-order deadlock.')
         }),
       ])
-      const responseBody = response.status === 200 ? '' : await response.text()
-      expect(response.status, responseBody).toBe(200)
+      expect(grantApprovalId).toMatch(/^[0-9a-f-]{36}$/)
       expect(handoffResult).toMatchObject({ status: 'handed_off', claimedPackageId: seeded.packageId })
       expect(admissionAttempts).toEqual([1, 2])
     } finally {
@@ -536,7 +631,7 @@ test.describe('MCP handoff optimistic concurrency', () => {
         Promise.allSettled([
           blocker,
           releaseWatcher,
-          routeResponse,
+          grantMutation,
           handoff,
         ].filter((pending): pending is Promise<unknown> => pending !== undefined)),
         delay(5_000),
@@ -557,7 +652,7 @@ test.describe('MCP handoff optimistic concurrency', () => {
       from filesystem_mcp_grant_approvals
       where task_id = ${seeded.taskId}
     `
-    expect(approvals).toBe(2)
+    expect(approvals).toBe(0)
     const [{ count: runs }] = await sql`
       select count(*)::int as count
       from agent_runs

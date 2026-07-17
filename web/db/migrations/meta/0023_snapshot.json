@@ -1778,7 +1778,7 @@
         },
         "forge_epic_172_enablement_sha_chk": {
           "name": "forge_epic_172_enablement_sha_chk",
-          "value": "\"forge_epic_172_enablement_state\".\"reviewed_sha\" is null or \"forge_epic_172_enablement_state\".\"reviewed_sha\" ~ '^[0-9a-f]{40,64}$'"
+          "value": "\"forge_epic_172_enablement_state\".\"reviewed_sha\" is null or \"forge_epic_172_enablement_state\".\"reviewed_sha\" ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'"
         },
         "forge_epic_172_enablement_epoch_chk": {
           "name": "forge_epic_172_enablement_epoch_chk",
@@ -2268,7 +2268,7 @@
         },
         "forge_epic_172_release_evidence_sha_chk": {
           "name": "forge_epic_172_release_evidence_sha_chk",
-          "value": "\"forge_epic_172_release_evidence\".\"reviewed_sha\" ~ '^[0-9a-f]{40,64}$'"
+          "value": "\"forge_epic_172_release_evidence\".\"reviewed_sha\" ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'"
         },
         "forge_epic_172_release_evidence_epoch_chk": {
           "name": "forge_epic_172_release_evidence_epoch_chk",
@@ -2795,7 +2795,7 @@
         },
         "forge_epic_172_transition_authorizations_sha_chk": {
           "name": "forge_epic_172_transition_authorizations_sha_chk",
-          "value": "\"forge_epic_172_transition_authorizations\".\"reviewed_sha\" ~ '^[0-9a-f]{40,64}$'"
+          "value": "\"forge_epic_172_transition_authorizations\".\"reviewed_sha\" ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'"
         },
         "forge_epic_172_transition_authorizations_epoch_chk": {
           "name": "forge_epic_172_transition_authorizations_epoch_chk",

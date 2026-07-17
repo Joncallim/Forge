@@ -5395,7 +5395,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
 
     expect(res.status).toBe(503)
     expect(mockGuardEpic172ProjectManagementIngress).toHaveBeenCalledOnce()
-    expect(mockDbSelect).toHaveBeenCalledOnce()
+    expect(mockDbSelect).not.toHaveBeenCalled()
     expect(mockDbTransaction).not.toHaveBeenCalled()
     expect(mockDbInsert).not.toHaveBeenCalled()
     expect(mockDbUpdate).not.toHaveBeenCalled()
@@ -8089,5 +8089,101 @@ describe('GET /api/tasks/summary', () => {
 
     expect(res.status).toBe(500)
     expect(await res.json()).toEqual({ error: 'Internal server error' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Suite 3.10 — Epic 172 disabled ingress covers every mutation family
+// ---------------------------------------------------------------------------
+
+describe('Epic 172 disabled mutation ingress', () => {
+  type InvokeMutation = () => Promise<Response>
+
+  function closedIngressResponse() {
+    return Response.json({
+      code: 'epic_172_project_management_ingress_closed',
+      error: 'Project management is temporarily disabled while release safety checks are incomplete.',
+      reason: 'disabled',
+    }, { status: 503 })
+  }
+
+  const taskParams = { params: Promise.resolve({ id: 'task-closed' }) }
+  const gateParams = { params: Promise.resolve({ id: 'task-closed', gateId: 'gate-closed' }) }
+  const mutationFamilies: Array<[string, InvokeMutation]> = [
+    ['task create and enqueue', async () => {
+      const { POST } = await import('@/app/api/tasks/route')
+      return POST(authRequest('/api/tasks', { method: 'POST' }) as never)
+    }],
+    ['task cancellation', async () => {
+      const { DELETE } = await import('@/app/api/tasks/[id]/route')
+      return DELETE(authRequest('/api/tasks/task-closed', { method: 'DELETE' }) as never, taskParams)
+    }],
+    ['task approval', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+      return POST(authRequest('/api/tasks/task-closed/approve', { method: 'POST' }) as never, taskParams)
+    }],
+    ['task rejection', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/reject/route')
+      return POST(authRequest('/api/tasks/task-closed/reject', { method: 'POST' }) as never, taskParams)
+    }],
+    ['task answers', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/questions/route')
+      return POST(authRequest('/api/tasks/task-closed/questions', { method: 'POST' }) as never, taskParams)
+    }],
+    ['approval-gate decision', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/approval-gates/[gateId]/route')
+      return POST(authRequest('/api/tasks/task-closed/approval-gates/gate-closed', { method: 'POST' }) as never, gateParams)
+    }],
+    ['task replan', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/replan/route')
+      return POST(authRequest('/api/tasks/task-closed/replan', { method: 'POST' }) as never, taskParams)
+    }],
+    ['task retry', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/retry/route')
+      return POST(authRequest('/api/tasks/task-closed/retry', { method: 'POST' }) as never, taskParams)
+    }],
+    ['handoff retry enqueue', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/retry-handoff/route')
+      return POST(authRequest('/api/tasks/task-closed/retry-handoff', { method: 'POST' }) as never, taskParams)
+    }],
+    ['MCP plan review', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/mcp-plan-review/route')
+      return POST(authRequest('/api/tasks/task-closed/mcp-plan-review', { method: 'POST' }) as never, taskParams)
+    }],
+    ['task filesystem grant', async () => {
+      const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
+      return PUT(authRequest('/api/tasks/task-closed/filesystem-grants', { method: 'PUT' }) as never, taskParams)
+    }],
+    ['provider deactivation and task repointing', async () => {
+      const { DELETE } = await import('@/app/api/providers/[id]/route')
+      return DELETE(
+        authRequest('/api/providers/provider-closed', { method: 'DELETE' }) as never,
+        { params: Promise.resolve({ id: 'provider-closed' }) },
+      )
+    }],
+  ]
+
+  it.each(mutationFamilies)('returns 503 with zero mutation side effects for %s', async (_name, invoke) => {
+    vi.clearAllMocks()
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockGuardEpic172ProjectManagementIngress.mockImplementation(async () => closedIngressResponse())
+
+    const response = await invoke()
+
+    expect(response.status).toBe(503)
+    expect(mockGuardEpic172ProjectManagementIngress).toHaveBeenCalledOnce()
+    expect(mockDbSelect).not.toHaveBeenCalled()
+    expect(mockDbInsert).not.toHaveBeenCalled()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockDbDelete).not.toHaveBeenCalled()
+    expect(mockDbTransaction).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+    expect(mockRedisPublish).not.toHaveBeenCalled()
+    expect(mockRedisSet).not.toHaveBeenCalled()
+    expect(mockRedisZadd).not.toHaveBeenCalled()
+    expect(mockRedisExpire).not.toHaveBeenCalled()
+    expect(mockRedisDel).not.toHaveBeenCalled()
+    expect(mockDecideReviewGate).not.toHaveBeenCalled()
+    expect(mockExecFile).not.toHaveBeenCalled()
   })
 })

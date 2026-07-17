@@ -18,6 +18,11 @@ evidence, and the external signer private key must never enter Forge.
   `LOGIN NOINHERIT`; do not give them
   passwords, role memberships, or the normal Forge application URL.
 - Keep a short-lived administrator URL available for role creation and inspection.
+- Treat that administrator as a trusted maintenance principal. The bootstrap checks
+  the exact release-role attributes, memberships, and release-object ownership it
+  manages. It does not audit or repair unrelated pre-existing PostgreSQL roles,
+  object owners, default privileges, or access-control lists (ACLs); the database
+  administrator must review those separately before the release window.
 - Prepare an external Ed25519 signer. Forge receives its public key and detached
   signatures only.
 - Record the exact reviewed commit and build identity. Step 0 uses

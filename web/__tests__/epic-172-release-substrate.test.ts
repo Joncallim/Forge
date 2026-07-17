@@ -49,6 +49,8 @@ describe('Epic 172 Step 0 release substrate', () => {
     expect(migration).toContain("octet_length(\"forge_epic_172_release_evidence\".\"detached_signature\") = 64")
     expect(migration).toContain("octet_length(\"forge_epic_172_transition_authorizations\".\"detached_signature\") = 64")
     expect(migration).toContain("interval '30 minutes'")
+    expect(migration.match(/\^\(\[0-9a-f\]\{40\}\|\[0-9a-f\]\{64\}\)\$/g)).toHaveLength(3)
+    expect(migration).not.toContain('{40,64}')
     expect(migration.match(/ON DELETE restrict/g)).toHaveLength(10)
   })
 

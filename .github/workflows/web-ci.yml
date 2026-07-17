@@ -36,10 +36,10 @@ jobs:
       run:
         working-directory: web
     env:
-      DATABASE_URL: postgresql://forge_e2e:forge@localhost:5432/forge_e2e
+      DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_epic_172_ci_test
       REDIS_URL: redis://localhost:6379/15
       FORGE_E2E_ALLOW_DESTRUCTIVE_RESET: '1'
-      FORGE_E2E_DATABASE_URL: postgresql://forge_e2e:forge@localhost:5432/forge_e2e
+      FORGE_E2E_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_epic_172_ci_test
       FORGE_E2E_REDIS_URL: redis://localhost:6379/15
       SESSION_SECRET: 0000000000000000000000000000000000000000000000000000000000000000
       WEBAUTHN_RP_ID: localhost
@@ -56,16 +56,151 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - run: npm install
+      - name: Create disposable migration and ordinary app logins
+        working-directory: .
+        env:
+          PGPASSWORD: forge
+        run: |
+          psql --host localhost --username forge_e2e --dbname postgres --set ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE forge_migration_test
+            LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+            PASSWORD 'forge_migration_test';
+          CREATE ROLE forge_app_test
+            LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+            PASSWORD 'forge_app_test';
+          CREATE DATABASE forge_epic_172_ci_test OWNER forge_migration_test;
+          SQL
       - name: Bootstrap Epic 172 release roles
         run: npm run protocol:bootstrap-epic-172-release-roles
         env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
           # The disposable CI database login owns this isolated PostgreSQL
           # service and is therefore the short-lived administrator here.
-          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_e2e
-      - run: npm run db:migrate
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+      - name: Configure disposable release-principal passwords
+        working-directory: .
+        env:
+          PGPASSWORD: forge
+        run: |
+          psql --host localhost --username forge_e2e --dbname forge_epic_172_ci_test --set ON_ERROR_STOP=1 <<'SQL'
+          ALTER ROLE forge_release_evidence_writer PASSWORD 'forge_writer_test';
+          ALTER ROLE forge_release_transition PASSWORD 'forge_transition_test';
+          SQL
+      - name: Apply migrations as the disposable migration owner
+        run: npm run db:migrate
+        env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
+      - name: Grant and verify the ordinary app boundary
+        working-directory: .
+        env:
+          PGPASSWORD: forge
+        run: |
+          psql --host localhost --username forge_e2e --dbname forge_epic_172_ci_test --set ON_ERROR_STOP=1 <<'SQL'
+          GRANT CONNECT ON DATABASE forge_epic_172_ci_test TO forge_app_test;
+          GRANT USAGE ON SCHEMA public, forge TO forge_app_test;
+          GRANT EXECUTE ON FUNCTION forge.read_epic_172_enablement_state_v1() TO forge_app_test;
+          DO $grant_application_acl$
+          DECLARE
+            object_row record;
+          BEGIN
+            FOR object_row IN
+              SELECT schemaname, tablename
+              FROM pg_catalog.pg_tables
+              WHERE schemaname = 'public'
+                AND tablename <> ALL (ARRAY[
+                  'forge_release_signer_keys',
+                  'forge_release_signer_key_lifecycle_audits',
+                  'forge_epic_172_release_evidence',
+                  'forge_epic_172_transition_authorizations',
+                  'forge_epic_172_release_evidence_consumptions',
+                  'forge_epic_172_enablement_state',
+                  'forge_epic_172_enablement_transition_audits'
+                ])
+            LOOP
+              EXECUTE format(
+                'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE %I.%I TO forge_app_test',
+                object_row.schemaname,
+                object_row.tablename
+              );
+            END LOOP;
+            FOR object_row IN
+              SELECT sequence_schema, sequence_name
+              FROM information_schema.sequences
+              WHERE sequence_schema = 'public'
+                AND sequence_name NOT LIKE 'forge_release_%'
+                AND sequence_name NOT LIKE 'forge_epic_172_%'
+            LOOP
+              EXECUTE format(
+                'GRANT USAGE, SELECT ON SEQUENCE %I.%I TO forge_app_test',
+                object_row.sequence_schema,
+                object_row.sequence_name
+              );
+            END LOOP;
+          END;
+          $grant_application_acl$;
+          SQL
+          PGPASSWORD=forge_app_test psql \
+            --host localhost \
+            --username forge_app_test \
+            --dbname forge_epic_172_ci_test \
+            --set ON_ERROR_STOP=1 <<'SQL'
+          DO $verify_application_acl$
+          DECLARE
+            release_table text;
+            release_privilege text;
+          BEGIN
+            IF has_schema_privilege(current_user, 'public', 'CREATE')
+              OR has_schema_privilege(current_user, 'forge', 'CREATE') THEN
+              RAISE EXCEPTION 'ordinary app may not create objects in public or forge';
+            END IF;
+            FOR release_table IN SELECT unnest(ARRAY[
+              'public.forge_release_signer_keys',
+              'public.forge_release_signer_key_lifecycle_audits',
+              'public.forge_epic_172_release_evidence',
+              'public.forge_epic_172_transition_authorizations',
+              'public.forge_epic_172_release_evidence_consumptions',
+              'public.forge_epic_172_enablement_state',
+              'public.forge_epic_172_enablement_transition_audits'
+            ]) LOOP
+              FOREACH release_privilege IN ARRAY ARRAY[
+                'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
+              ] LOOP
+                IF has_table_privilege(current_user, release_table, release_privilege) THEN
+                  RAISE EXCEPTION 'ordinary app unexpectedly has % on %', release_privilege, release_table;
+                END IF;
+              END LOOP;
+            END LOOP;
+            IF EXISTS (
+              SELECT 1
+              FROM pg_catalog.pg_tables
+              WHERE schemaname = 'public'
+                AND tablename LIKE 'forge%'
+                AND tableowner = current_user
+            ) THEN
+              RAISE EXCEPTION 'ordinary app unexpectedly owns a Forge table';
+            END IF;
+            IF (
+              SELECT array_agg(p.proname ORDER BY p.proname)
+              FROM pg_catalog.pg_proc p
+              JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = 'forge'
+                AND has_function_privilege(current_user, p.oid, 'EXECUTE')
+            ) IS DISTINCT FROM ARRAY['read_epic_172_enablement_state_v1']::name[] THEN
+              RAISE EXCEPTION 'ordinary app has an unexpected Epic 172 routine ACL';
+            END IF;
+          END;
+          $verify_application_acl$;
+          SQL
       - run: npm run lint
       - run: npx tsc --noEmit
       - run: npm test
+      - name: Prove Epic 172 writer, transition, and ordinary-app PostgreSQL boundaries
+        run: npx vitest run __tests__/epic-172-release-recorder.postgres.test.ts
+        env:
+          FORGE_EPIC_172_REQUIRE_POSTGRES_TEST: '1'
+          FORGE_EPIC_172_TEST_APP_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_EPIC_172_TEST_WRITER_DATABASE_URL: postgresql://forge_release_evidence_writer:forge_writer_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_EPIC_172_TEST_TRANSITION_DATABASE_URL: postgresql://forge_release_transition:forge_transition_test@localhost:5432/forge_epic_172_ci_test
       - run: npm run build
       - run: npx playwright install chromium
       - run: npm run e2e

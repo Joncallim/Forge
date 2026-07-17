@@ -20,6 +20,7 @@ import { publishTaskEvent } from '@/worker/events'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
 import { validateMcpOperatorReviewHistory } from '@/worker/mcp-plan-review'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 
 // ---------------------------------------------------------------------------
 // GET /api/tasks/:id
@@ -257,6 +258,9 @@ export async function DELETE(
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
 
     const { id } = await params
     const mode = new URL(request.url).searchParams.get('mode') === 'delete' ? 'delete' : 'cancel'

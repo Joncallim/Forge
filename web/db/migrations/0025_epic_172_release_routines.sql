@@ -75,6 +75,8 @@ ALTER TABLE public.forge_epic_172_enablement_transition_audits OWNER TO forge_re
 ALTER FUNCTION public.forge_epic_172_reject_mutation_v1() OWNER TO forge_release_routines_owner;
 REVOKE ALL ON FUNCTION public.forge_epic_172_reject_mutation_v1() FROM PUBLIC;
 --> statement-breakpoint
+SET LOCAL ROLE forge_release_routines_owner;
+--> statement-breakpoint
 DROP INDEX public.forge_epic_172_release_evidence_consumptions_authorization_idx;
 CREATE UNIQUE INDEX forge_epic_172_release_evidence_consumptions_authorization_receipt_idx
   ON public.forge_epic_172_release_evidence_consumptions (authorization_id, receipt_id);
@@ -1167,7 +1169,7 @@ GRANT EXECUTE ON FUNCTION forge.epic_172_controller_lease_digest_v1(bytea)
 --> statement-breakpoint
 DO $$
 DECLARE
-  v_migration_role name := current_user;
+  v_migration_role name := session_user;
 BEGIN
   EXECUTE pg_catalog.format(
     'REVOKE ALL ON TABLE public.forge_release_signer_keys, public.forge_release_signer_key_lifecycle_audits, public.forge_epic_172_release_evidence, public.forge_epic_172_transition_authorizations, public.forge_epic_172_release_evidence_consumptions, public.forge_epic_172_enablement_state, public.forge_epic_172_enablement_transition_audits FROM %I',
@@ -1184,5 +1186,7 @@ BEGIN
   );
 END;
 $$;
+--> statement-breakpoint
+RESET ROLE;
 --> statement-breakpoint
 SELECT public.forge_finalize_epic_172_release_owner_bootstrap_v1();

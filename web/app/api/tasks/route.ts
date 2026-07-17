@@ -12,6 +12,7 @@ import {
   accessibleProjectOwnerCondition,
   getAccessibleProject,
 } from '@/lib/project-access'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -110,6 +111,9 @@ export async function POST(request: NextRequest) {
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
 
     let body: unknown
     try {

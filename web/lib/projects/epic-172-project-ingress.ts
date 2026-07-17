@@ -5,7 +5,7 @@ import type { ForgeEpic172EnablementState } from '@/db/schema'
 
 const PROVISIONAL_WINDOW_MS = 1_560_000
 const MAX_CONTROLLER_LEASE_MS = 45_000
-const SHA_PATTERN = /^[0-9a-f]{40,64}$/
+const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/
 
 type EnablementState = Pick<

@@ -27,6 +27,11 @@ describe('Epic 172 signed release recorder boundary', () => {
     expect(bootstrap).not.toContain('with admin option')
     expect(migration.match(/OWNER TO forge_release_routines_owner/g)?.length).toBeGreaterThanOrEqual(12)
     expect(migration).toContain('SELECT public.forge_finalize_epic_172_release_owner_bootstrap_v1()')
+    expect(migration).toContain('SET LOCAL ROLE forge_release_routines_owner')
+    expect(migration).toContain('v_migration_role name := session_user')
+    expect(migration.indexOf('RESET ROLE')).toBeLessThan(
+      migration.indexOf('SELECT public.forge_finalize_epic_172_release_owner_bootstrap_v1()'),
+    )
     expect(migration).not.toMatch(/GRANT\s+(?:INSERT|UPDATE|DELETE)/i)
   })
 

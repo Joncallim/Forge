@@ -201,6 +201,15 @@ describe('Epic 172 release envelope verifier', () => {
     expect(() => epic172ReleaseEvidenceSignedBytes(releaseEnvelope({
       predecessorReceiptIds: ['00000000-0000-4000-8000-000000000006'],
     }))).toThrow(/only Step 0/)
+    for (const length of [39, 41, 63, 65]) {
+      expect(() => epic172ReleaseEvidenceSignedBytes(releaseEnvelope({
+        reviewedSha: 'a'.repeat(length),
+      }))).toThrow(/reviewed Git SHA/)
+    }
+    expect(() => epic172ReleaseEvidenceSignedBytes(releaseEnvelope({
+      reviewedSha: 'a'.repeat(64),
+      exactBuilds: [`issue_179_step0@${'a'.repeat(64)}`],
+    }))).not.toThrow()
   })
 
   it('cryptographically binds the exact ordered postcondition measurements', () => {

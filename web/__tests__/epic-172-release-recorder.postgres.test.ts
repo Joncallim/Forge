@@ -37,6 +37,13 @@ const WRITER_URL = process.env.FORGE_EPIC_172_TEST_WRITER_DATABASE_URL
 const TRANSITION_URL = process.env.FORGE_EPIC_172_TEST_TRANSITION_DATABASE_URL
 const APP_URL = process.env.FORGE_EPIC_172_TEST_APP_DATABASE_URL
 const hasPostgresFixture = Boolean(WRITER_URL && TRANSITION_URL && APP_URL)
+const requirePostgresFixture = process.env.FORGE_EPIC_172_REQUIRE_POSTGRES_TEST === '1'
+
+if (requirePostgresFixture && !hasPostgresFixture) {
+  throw new Error(
+    'FORGE_EPIC_172_REQUIRE_POSTGRES_TEST=1 requires the app, writer, and transition PostgreSQL URLs; the explicit contract suite may not skip.',
+  )
+}
 
 describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contract', () => {
   const writer = postgres(WRITER_URL!, { max: 2 })

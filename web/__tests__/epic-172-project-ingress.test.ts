@@ -63,6 +63,12 @@ describe('Epic 172 project-management ingress decision', () => {
       allowed: false,
       reason: 'incomplete_identity',
     })
+    for (const length of [39, 41, 63, 65]) {
+      expect(decideEpic172ProjectManagementIngress(
+        provisionalState({ reviewedSha: 'a'.repeat(length) }),
+        NOW,
+      )).toEqual({ allowed: false, reason: 'incomplete_identity' })
+    }
     expect(decideEpic172ProjectManagementIngress(
       { ...provisionalState(), state: 'unexpected' } as unknown as TestState,
       NOW,
@@ -78,6 +84,10 @@ describe('Epic 172 project-management ingress decision', () => {
       allowed: true,
       state: 'provisional',
     })
+    expect(decideEpic172ProjectManagementIngress(
+      provisionalState({ reviewedSha: 'b'.repeat(64) }),
+      NOW,
+    )).toEqual({ allowed: true, state: 'provisional' })
     expect(decideEpic172ProjectManagementIngress(activeState({ finalReadinessReceiptId: null }), NOW)).toEqual({
       allowed: false,
       reason: 'incomplete_identity',
@@ -183,6 +193,90 @@ describe('Epic 172 project route ingress sentinel', () => {
     expect(observedMutations).toContain(
       '../app/api/tasks/[id]/filesystem-grants/route.ts:PUT:.update(projects)',
     )
+  })
+
+  it('inventories and gates every task, package, approval, answer, and enqueue mutation', () => {
+    const mutationPatterns = [
+      /\.(?:insert|update|delete)\s*\(\s*(?:tasks|workPackages|approvalGates|taskQuestions|filesystemMcpGrantApprovals|projects)\s*\)/g,
+      /redis\.(?:lpush|rpush)\s*\(\s*['"]forge:(?:tasks|approvals|answers)['"]/g,
+      /\b(?:decideReviewGate|enqueueBlockedHandoffRetry)\s*\(/g,
+    ]
+    const guardedHandlers = new Set<string>()
+    const observedMutations: string[] = []
+
+    for (const routePath of collectRouteFiles(apiRoot).sort()) {
+      const source = readFileSync(routePath, 'utf8')
+      for (const { body, method } of routeHandlers(source)) {
+        const handlerLabel = `${routeLabel(routePath)}:${method}`
+        const matches = mutationPatterns.flatMap((pattern) => [...body.matchAll(pattern)])
+        if (matches.length === 0) continue
+
+        const guardMatches = [...body.matchAll(/guardEpic172ProjectManagementIngress\(\)/g)]
+        expect(guardMatches, handlerLabel).toHaveLength(1)
+        const guardIndex = guardMatches[0].index ?? -1
+        expect(guardIndex, handlerLabel).toBeGreaterThanOrEqual(0)
+        for (const match of matches) {
+          observedMutations.push(`${handlerLabel}:${match[0]}`)
+          expect(guardIndex, `${handlerLabel}:${match[0]}`).toBeLessThan(match.index ?? 0)
+        }
+
+        // Authentication is the sole route work allowed before the release gate.
+        // Params, request bodies, access lookups, database writes, queue calls,
+        // and filesystem operations must all occur after it.
+        for (const postAuthOperation of [
+          'await params',
+          'request.json()',
+          'getAccessibleTask(',
+          'getAccessibleProject(',
+          'generateTaskTitle(',
+          'fs.',
+        ]) {
+          const operationIndex = body.indexOf(postAuthOperation)
+          if (operationIndex >= 0) {
+            expect(guardIndex, `${handlerLabel}:${postAuthOperation}`).toBeLessThan(operationIndex)
+          }
+        }
+        guardedHandlers.add(handlerLabel)
+      }
+    }
+
+    expect([...guardedHandlers].sort()).toEqual([
+      '../app/api/projects/[id]/filesystem-grant/route.ts:PUT',
+      '../app/api/projects/[id]/route.ts:DELETE',
+      '../app/api/projects/[id]/route.ts:PUT',
+      '../app/api/projects/route.ts:POST',
+      '../app/api/providers/[id]/route.ts:DELETE',
+      '../app/api/tasks/route.ts:POST',
+      '../app/api/tasks/[id]/route.ts:DELETE',
+      '../app/api/tasks/[id]/approval-gates/[gateId]/route.ts:POST',
+      '../app/api/tasks/[id]/approve/route.ts:POST',
+      '../app/api/tasks/[id]/filesystem-grants/route.ts:PUT',
+      '../app/api/tasks/[id]/mcp-plan-review/route.ts:POST',
+      '../app/api/tasks/[id]/questions/route.ts:POST',
+      '../app/api/tasks/[id]/reject/route.ts:POST',
+      '../app/api/tasks/[id]/replan/route.ts:POST',
+      '../app/api/tasks/[id]/retry-handoff/route.ts:POST',
+      '../app/api/tasks/[id]/retry/route.ts:POST',
+    ].sort())
+    expect(observedMutations.some((mutation) => mutation.includes("redis.lpush('forge:tasks'"))).toBe(true)
+    expect(observedMutations.some((mutation) => mutation.includes("redis.lpush('forge:approvals'"))).toBe(true)
+    expect(observedMutations.some((mutation) => mutation.includes("redis.lpush('forge:answers'"))).toBe(true)
+  })
+
+  it('gates provider deactivation before affected task or agent repointing', () => {
+    const routePath = fileURLToPath(new URL('../app/api/providers/[id]/route.ts', import.meta.url))
+    const source = readFileSync(routePath, 'utf8')
+    const deleteHandler = routeHandlers(source).find(({ method }) => method === 'DELETE')
+    expect(deleteHandler).toBeDefined()
+    const body = deleteHandler?.body ?? ''
+    const guardMatches = [...body.matchAll(/guardEpic172ProjectManagementIngress\(\)/g)]
+    expect(guardMatches).toHaveLength(1)
+    const guardIndex = guardMatches[0].index ?? -1
+    for (const operation of ['await params', '.update(agentConfigs)', '.update(tasks)', '.update(providerConfigs)']) {
+      const operationIndex = body.indexOf(operation)
+      expect(operationIndex, operation).toBeGreaterThanOrEqual(0)
+      expect(guardIndex, operation).toBeLessThan(operationIndex)
+    }
   })
 
   it('keeps shared project and task access helpers read-only', () => {
