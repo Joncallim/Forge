@@ -5,7 +5,7 @@
   </picture>
 
   <p><strong>Many specialists. One coordinated system.</strong></p>
-  <p>A local-first control plane for planning, executing, verifying, and governing AI coding work.</p>
+  <p>A local-first control plane for planning, executing, verifying, and governing artificial intelligence (AI) coding work.</p>
 
   <p>
     <img alt="Status: beta" src="https://img.shields.io/badge/status-beta-0891b2">
@@ -63,7 +63,7 @@ commits, merges, broad live MCP authority, or unrestricted host control.
 | **Deterministic boundaries** | Models produce structured plans and requests; FORGE validates scope, policy, commands, files, and outcomes. |
 | **Bounded context** | Specialists receive the minimum relevant repository evidence rather than unrestricted filesystem access. |
 | **Durable evidence** | Tasks, attempts, work packages, runs, artifacts, approvals, and blocked reasons survive beyond a chat session. |
-| **Runtime-neutral agents** | Direct model APIs, local models, Codex CLI, and Claude Code can sit behind consistent FORGE contracts. |
+| **Runtime-neutral agents** | Direct model application programming interfaces (APIs), local models, the Codex command-line interface (CLI), and Claude Code can sit behind consistent FORGE contracts. |
 | **GitHub-native delivery** | Structured issues, controlled handoffs, pull request (PR) contracts, and acceptance-criteria checks keep implementation traceable. |
 
 ## What FORGE Does Today
@@ -180,7 +180,7 @@ FORGE is designed around explicit ceilings rather than presumed agent trust:
 - secrets are stored as encrypted settings or environment-variable names;
 - prompts, logs, and evidence use redaction and bounded output;
 - higher-risk work requires Security review;
-- ACP adapters remain local processes and are not presented as OS confinement;
+- ACP adapters remain local processes and are not presented as operating system (OS) confinement;
 - final authority remains with the operator.
 
 The next deterministic-execution foundation is
@@ -254,7 +254,7 @@ and the broader [product roadmap](docs/roadmap.md) for the long-form direction.
 
 | Term | Plain-English meaning |
 |---|---|
-| Dashboard | The browser UI where projects, providers, tasks, approvals, and evidence are managed. |
+| Dashboard | The browser user interface (UI) where projects, providers, tasks, approvals, and evidence are managed. |
 | Project | A local or GitHub-backed repository FORGE can reason about. |
 | Task | A user objective submitted to FORGE. |
 | Architect | The planning agent that turns intent into a bounded plan and work packages. |

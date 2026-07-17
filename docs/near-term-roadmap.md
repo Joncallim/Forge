@@ -78,7 +78,7 @@ Fix in this order:
 1. state corruption, unsafe execution, or policy bypass;
 2. false-success and missing-evidence defects;
 3. recovery, concurrency, and idempotency defects;
-4. operator-blocking UX and unclear remediation;
+4. operator-blocking user experience (UX) and unclear remediation;
 5. performance and visual polish.
 
 ### Exit criteria
@@ -191,7 +191,7 @@ Resume major Workspace expansion after:
 - typed operations and canonical outcomes exist;
 - the first reliability evidence can be inspected.
 
-Small usability improvements that directly support testing, evidence inspection, and recovery may continue. Large new surfaces, broad integrations, and general autonomous-operation UI should wait.
+Small usability improvements that directly support testing, evidence inspection, and recovery may continue. Large new surfaces, broad integrations, and general autonomous-operation user interface (UI) work should wait.
 
 ## Decision Filter For New Work
 
