@@ -232,6 +232,11 @@ To run package models but keep generated files sandbox-only, use:
 FORGE_HOST_REPOSITORY_WRITES=0
 ```
 
+Deployments adopting the Epic #172 retention and signed-release substrate must
+use the [Step 0 retention bridge runbook](operators/epic-172-step0-retention-bridge.md).
+That maintenance checkpoint keeps project ingress and packet issuance disabled;
+it is separate from normal day-to-day package execution.
+
 With the default execution path:
 
 1. The operator approves the Architect plan. Today, approval enforces only the

@@ -1,4 +1,5 @@
 import type { ProjectMcpConfig } from '@/db/schema'
+import type { ProjectFilesystemDecisionAuthority } from './filesystem-project-authority'
 
 export type McpId = 'filesystem' | 'github'
 
@@ -62,6 +63,9 @@ export type ProjectMcpStatus = {
 
 export type ProjectMcpOverview = {
   projectId: string
+  /** Internal authority binding; absent legacy/test fixtures fail closed. */
+  rootBindingRevision?: string
+  filesystemGrantDecision?: ProjectFilesystemDecisionAuthority | null
   config: ProjectMcpConfig
   catalog: McpCatalogEntry[]
   mcpsRoot: string

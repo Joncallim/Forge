@@ -16,13 +16,15 @@ function approvedEffectivePhase(capabilities: string[]): Record<string, unknown>
   return {
     mcpGrantPhases: {
       effective: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         phase: 'effective',
         source: 'explicit-grant-approval',
         grantMode: 'allow_once',
         runtimeIssued: false,
         runtimeEnforcement: 'bounded_context_packet',
         status: 'approved',
+        grantDecisionRevision: '1',
+        rootBindingRevision: '1',
         grants: [{ mcpId: 'filesystem', status: 'approved', capabilities }],
       },
     },
@@ -70,6 +72,7 @@ describe('requiresFilesystemGrantApproval', () => {
         fallback: { action: 'block', message: '' },
       }],
       metadata: approvedEffectivePhase(['filesystem.project.read']),
+      projectRootBindingRevision: '1',
     })
 
     expect(summary).toMatchObject({
@@ -94,6 +97,7 @@ describe('requiresFilesystemGrantApproval', () => {
     const result = requiresFilesystemGrantApproval({
       mcpRequirements: REQUIRED_FILESYSTEM_REQUIREMENT,
       metadata: approvedEffectivePhase(['filesystem.project.read']),
+      projectRootBindingRevision: '1',
     })
     expect(result.blocked).toBe(true)
     expect(result.missingCapabilities).toEqual(['filesystem.project.search'])
@@ -103,6 +107,7 @@ describe('requiresFilesystemGrantApproval', () => {
     const result = requiresFilesystemGrantApproval({
       mcpRequirements: REQUIRED_FILESYSTEM_REQUIREMENT,
       metadata: approvedEffectivePhase(['filesystem.project.read', 'filesystem.project.search']),
+      projectRootBindingRevision: '1',
     })
     expect(result.blocked).toBe(false)
     expect(result.missingCapabilities).toEqual([])
@@ -115,15 +120,33 @@ describe('requiresFilesystemGrantApproval', () => {
       projectMcpConfig: {
         grants: {
           filesystem: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             mcpId: 'filesystem',
             status: 'approved',
             grantMode: 'always_allow',
             capabilities: ['filesystem.project.read', 'filesystem.project.search'],
             grantApprovalId: 'grant-approval-1',
+            grantDecisionRevision: '1',
+            rootBindingRevision: '1',
           },
         },
       },
+      projectFilesystemDecision: {
+        schemaVersion: 2,
+        decisionId: 'grant-approval-1',
+        projectId: 'project-1',
+        decision: 'approved',
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        grantDecisionRevision: '1',
+        rootBindingRevision: '1',
+        decisionFingerprint: `sha256:${'1'.repeat(64)}`,
+        decisionGeneration: '1',
+        decidedAt: '2099-07-13T09:00:00.000Z',
+        decidedBy: 'user-1',
+        reason: 'Project grant approved.',
+        revocationReason: null,
+      },
+      projectRootBindingRevision: '1',
     })
 
     expect(result.blocked).toBe(false)
@@ -136,11 +159,13 @@ describe('requiresFilesystemGrantApproval', () => {
       metadata: {
         mcpGrantPhases: {
           effective: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             phase: 'effective',
             source: 'project-filesystem-approval',
             runtimeEnforcement: 'bounded_context_packet',
             status: 'approved',
+            grantDecisionRevision: '1',
+            rootBindingRevision: '1',
             grants: [{
               mcpId: 'filesystem',
               status: 'approved',
@@ -150,6 +175,7 @@ describe('requiresFilesystemGrantApproval', () => {
         },
       },
       projectMcpConfig: { profile: 'default', requiredMcps: [], overrides: {} },
+      projectRootBindingRevision: '1',
     })
 
     expect(result.blocked).toBe(true)
@@ -190,13 +216,36 @@ describe('requiresFilesystemGrantApproval', () => {
 })
 
 describe('isFilesystemGrantBlockedPackageMetadata', () => {
-  it('recognises the handoff grant-block marker', () => {
+  it('recognises only the strict S3 marker and rejects legacy or placeholder S4 shapes', () => {
+    expect(isFilesystemGrantBlockedPackageMetadata({
+      mcpGrantBlock: {
+        schemaVersion: 2,
+        kind: 'filesystem_grant',
+        source: 'filesystem-grant-approval',
+        taskDisposition: 'operator_hold',
+        autoRetryable: false,
+        terminalFailure: false,
+        requirementKeys: ['r1'],
+        requestedCapabilities: ['filesystem.project.read'],
+        recoveryAction: 'approve_project_filesystem_context',
+        blockFingerprint: `sha256:${'0'.repeat(64)}`,
+        blockedAt: '2026-07-17T00:00:00.000Z',
+        holdKind: 'approval_required',
+        grantPhase: 'not_issued',
+        grantConsumed: false,
+        grantDecisionRevision: null,
+        revocationReason: null,
+      },
+    })).toBe(true)
     expect(isFilesystemGrantBlockedPackageMetadata({
       mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' },
-    })).toBe(true)
-  })
-
-  it('rejects metadata without the marker or from another source', () => {
+    })).toBe(false)
+    expect(isFilesystemGrantBlockedPackageMetadata({
+      operatorHold: { schemaVersion: 2, kind: 'integrity', taskDisposition: 'operator_hold' },
+    })).toBe(false)
+    expect(isFilesystemGrantBlockedPackageMetadata({
+      mcpPacketBlock: { schemaVersion: 2, kind: 'packet_issuance', taskDisposition: 'operator_hold' },
+    })).toBe(false)
     expect(isFilesystemGrantBlockedPackageMetadata({})).toBe(false)
     expect(isFilesystemGrantBlockedPackageMetadata(null)).toBe(false)
     expect(isFilesystemGrantBlockedPackageMetadata({ mcpGrantBlock: { source: 'other' } })).toBe(false)

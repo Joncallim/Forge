@@ -5,6 +5,7 @@ import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 import { getAccessibleTask } from '@/lib/task-access'
 import { decideReviewGate } from '@/worker/review-gates'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 
 const DecisionSchema = z.object({
   decision: z.enum(['completed', 'needs_rework']),
@@ -22,6 +23,9 @@ export async function POST(
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
 
     let body: unknown
     try {

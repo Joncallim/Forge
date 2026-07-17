@@ -14,6 +14,10 @@ import {
   type McpWorkPackageAdmission,
 } from '@/lib/mcps/admission'
 import { admitWorkPackageMcpBroker } from '@/worker/mcp-execution-design'
+import {
+  projectReviewedMcpPlanToPackages,
+  validateMcpOperatorReviewHistory,
+} from '@/worker/mcp-plan-review'
 import type { ProjectMcpOverview } from '@/lib/mcps/types'
 import {
   isExplicitFilesystemEffectivePhase,
@@ -21,6 +25,8 @@ import {
   projectFilesystemEffectivePhase,
   projectFilesystemGrantCovers,
 } from '@/lib/mcps/filesystem-grants'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
+import { loadCurrentProjectFilesystemDecision } from '@/lib/mcps/filesystem-grant-reconciliation'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -40,8 +46,10 @@ function admissionForLockedPackage(input: {
   assignedRole: string
   mcpOverview: ProjectMcpOverview
   mcpConfig: unknown
+  projectFilesystemDecision: unknown
   mcpRequirements: unknown
   metadata: unknown
+  rootBindingRevision: unknown
   title: string
 }): McpWorkPackageAdmission {
   return admitWorkPackageMcpBroker({
@@ -50,6 +58,8 @@ function admissionForLockedPackage(input: {
     mcpRequirements: input.mcpRequirements,
     metadata: input.metadata,
     projectMcpConfig: input.mcpConfig,
+    projectFilesystemDecision: input.projectFilesystemDecision,
+    projectRootBindingRevision: input.rootBindingRevision,
     title: input.title,
   })
 }
@@ -66,13 +76,22 @@ function approvalHealthSnapshot(admissions: McpWorkPackageAdmission[]): McpHealt
 
 function healthSnapshotMatchesLockedPolicy(
   overview: ProjectMcpOverview,
+  capturedGrantDecisionRevision: unknown,
   capturedLocalPath: unknown,
-  lockedProject: { localPath?: unknown; mcpConfig: ProjectMcpOverview['config'] },
+  lockedProject: {
+    grantDecisionRevision?: unknown
+    localPath?: unknown
+    mcpConfig: ProjectMcpOverview['config']
+    rootBindingRevision?: unknown
+  },
 ): boolean {
   // The overview is captured before the transaction because probing MCP health
   // may write cache rows. Approval may consume it only while the normalized
   // project policy it was captured for is still the locked project policy.
   return capturedLocalPath === lockedProject.localPath &&
+    String(capturedGrantDecisionRevision ?? 0) === String(lockedProject.grantDecisionRevision ?? 0) &&
+    (overview.rootBindingRevision === undefined ||
+      overview.rootBindingRevision === String(lockedProject.rootBindingRevision ?? 0)) &&
     isDeepStrictEqual(
       normalizeProjectMcpConfig(overview.config),
       normalizeProjectMcpConfig(lockedProject.mcpConfig),
@@ -161,7 +180,9 @@ function buildApprovedGrantSnapshot(input: {
         approvedGrants: Array.isArray(approved.grants) ? approved.grants : [],
         effectiveGrants: Array.isArray(effective.grants) ? effective.grants : [],
         proposedRequirements: Array.isArray(pkg.mcpRequirements) ? pkg.mcpRequirements : [],
+        approvedRequirements: Array.isArray(pkg.mcpRequirements) ? pkg.mcpRequirements : [],
         promptOverlayPresent: typeof metadata.promptOverlay === 'string' && metadata.promptOverlay.trim() !== '',
+        ...(isRecord(metadata.mcpOperatorReview) ? { mcpOperatorReview: metadata.mcpOperatorReview } : {}),
       }
     }),
   }
@@ -180,6 +201,9 @@ export async function POST(
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
 
     const { id: taskId } = await params
 
@@ -207,7 +231,8 @@ export async function POST(
     }
     // Live MCP checks may update cached status rows, so they must complete
     // before the status-flip transaction acquires any project/task locks.
-    const mcpOverview = await getProjectMcpOverview(projectForHealth)
+    const projectFilesystemDecision = await loadCurrentProjectFilesystemDecision(projectForHealth.id)
+    const mcpOverview = await getProjectMcpOverview(projectForHealth, projectFilesystemDecision)
 
     const approvedAt = new Date()
     const { task, approvedGates, approvalBlock } = await db.transaction(async (tx) => {
@@ -220,7 +245,12 @@ export async function POST(
         return { task: null, approvedGates: [] as { id: string }[], approvalBlock: null }
       }
 
-      if (!healthSnapshotMatchesLockedPolicy(mcpOverview, projectForHealth.localPath, lockedProject)) {
+      if (!healthSnapshotMatchesLockedPolicy(
+        mcpOverview,
+        projectForHealth.grantDecisionRevision,
+        projectForHealth.localPath,
+        lockedProject,
+      )) {
         const reason = 'Project MCP health inputs changed while approval health was being checked (configuration or local path). Review the latest project settings and approve again.'
         return {
           task: null,
@@ -248,25 +278,74 @@ export async function POST(
         return { task: null, approvedGates: [] as { id: string }[], approvalBlock: null }
       }
 
-      const rawPackageRows = await tx
+      const storedPackageRows = await tx
         .select({
           id: workPackages.id,
           assignedRole: workPackages.assignedRole,
           title: workPackages.title,
           mcpRequirements: workPackages.mcpRequirements,
           metadata: workPackages.metadata,
+          planGateMetadata: sql<unknown>`(
+            select ${approvalGates.metadata} from ${approvalGates}
+            where ${approvalGates.taskId} = ${taskId}
+              and ${approvalGates.gateType} = 'plan_approval'
+              and ${approvalGates.status} = 'pending'
+            limit 1
+          )`,
+          planGateSourceArtifactId: sql<string | null>`(
+            select ${approvalGates.sourceArtifactId} from ${approvalGates}
+            where ${approvalGates.taskId} = ${taskId}
+              and ${approvalGates.gateType} = 'plan_approval'
+              and ${approvalGates.status} = 'pending'
+            limit 1
+          )`,
         })
         .from(workPackages)
         .where(eq(workPackages.taskId, taskId))
         .orderBy(asc(workPackages.id))
         .for('update')
+      const gateMetadata = isRecord(storedPackageRows[0]?.planGateMetadata) ? storedPackageRows[0].planGateMetadata : {}
+      const planGateSourceArtifactId = storedPackageRows[0]?.planGateSourceArtifactId
+      const reviewValidation = validateMcpOperatorReviewHistory(gateMetadata, planGateSourceArtifactId)
+      const operatorReview = reviewValidation.valid ? reviewValidation.head : null
+      const reviewBlockReason = !reviewValidation.valid
+        ? reviewValidation.error
+        : gateMetadata.mcpOperatorReviewRequired === true && !operatorReview
+          ? 'Review and save every proposed MCP requirement before approving this plan.'
+          : operatorReview?.blockers.join(' ') || null
+      if (reviewBlockReason) {
+        return {
+          task: null,
+          approvedGates: [] as { id: string }[],
+          approvalBlock: {
+            error: reviewBlockReason,
+            evidenceRefs: operatorReview ? [`mcp-review:${operatorReview.digest}`] : [] as string[],
+            primaryDecision: null,
+            primaryMode: 'blocked' as const,
+            reason: reviewBlockReason,
+            primaryRecoveryAction: 'revise_plan' as const,
+            primaryRetryableContribution: false,
+            retryable: false,
+            workPackageId: null,
+          },
+        }
+      }
+      const rawPackageRows = operatorReview
+        ? projectReviewedMcpPlanToPackages({
+            review: operatorReview,
+            overview: mcpOverview,
+            packages: storedPackageRows,
+          })
+        : storedPackageRows
 
       const admissions = rawPackageRows.map((pkg) => admissionForLockedPackage({
         assignedRole: pkg.assignedRole,
         mcpOverview,
         mcpConfig: lockedProject.mcpConfig,
+        projectFilesystemDecision,
         mcpRequirements: pkg.mcpRequirements,
         metadata: pkg.metadata,
+        rootBindingRevision: lockedProject.rootBindingRevision,
         title: pkg.title,
       }))
       const blockedIndex = admissions.findIndex((admission) => admission.aggregate.status === 'blocked')
@@ -301,6 +380,8 @@ export async function POST(
           mcpConfig: lockedProject.mcpConfig,
           mcpRequirements: pkg.mcpRequirements,
           metadata: pkg.metadata,
+          projectFilesystemDecision,
+          projectRootBindingRevision: lockedProject.rootBindingRevision,
         })
         if (!grant) return pkg
         const metadata = isFilesystemGrantRecord(pkg.metadata) ? pkg.metadata : {}
@@ -311,7 +392,7 @@ export async function POST(
             ...metadata,
             mcpGrantPhases: {
               ...phases,
-              schemaVersion: 1,
+              schemaVersion: 2,
               effective: projectFilesystemEffectivePhase(grant),
             },
           },
@@ -340,12 +421,19 @@ export async function POST(
           approvedBy: session.userId,
           metadata: pkg.metadata,
         })
+        const update = operatorReview
+          ? {
+              mcpRequirements: pkg.mcpRequirements,
+              metadata: { ...(isRecord(pkg.metadata) ? pkg.metadata : {}), mcpGrantPhases: phases },
+              updatedAt: approvedAt,
+            }
+          : {
+              metadata: sql`jsonb_set(${workPackages.metadata}, '{mcpGrantPhases}', ${JSON.stringify(phases)}::jsonb, true)`,
+              updatedAt: approvedAt,
+            }
         await tx
           .update(workPackages)
-          .set({
-            metadata: sql`jsonb_set(${workPackages.metadata}, '{mcpGrantPhases}', ${JSON.stringify(phases)}::jsonb, true)`,
-            updatedAt: approvedAt,
-          })
+          .set(update)
           .where(eq(workPackages.id, pkg.id))
       }
 

@@ -62,6 +62,32 @@ import { sanitizeWorkerMessage } from '@/worker/redaction'
 const now = new Date('2026-06-26T00:00:00.000Z')
 let tempRoot = ''
 
+function immutableProjectAuthorityFromConfig(mcpConfig: unknown) {
+  const config = mcpConfig && typeof mcpConfig === 'object' ? mcpConfig as Record<string, unknown> : {}
+  const grants = config.grants && typeof config.grants === 'object'
+    ? config.grants as Record<string, unknown>
+    : {}
+  const grant = grants.filesystem && typeof grants.filesystem === 'object'
+    ? grants.filesystem as Record<string, unknown>
+    : null
+  if (!grant || grant.status !== 'approved') return null
+  return {
+    schemaVersion: 2 as const,
+    decisionId: String(grant.grantApprovalId ?? 'grant-project-1'),
+    projectId: 'project-1',
+    decision: 'approved' as const,
+    capabilities: Array.isArray(grant.capabilities) ? [...grant.capabilities].sort() : [],
+    grantDecisionRevision: String(grant.grantDecisionRevision ?? '1'),
+    rootBindingRevision: String(grant.rootBindingRevision ?? '1'),
+    decisionFingerprint: `sha256:${'1'.repeat(64)}`,
+    decisionGeneration: '1',
+    decidedAt: String(grant.approvedAt ?? now.toISOString()),
+    decidedBy: String(grant.approvedBy ?? 'user-1'),
+    reason: String(grant.reason ?? ''),
+    revocationReason: null,
+  }
+}
+
 function fixtureSecret(...parts: string[]) {
   return parts.join('')
 }
@@ -102,8 +128,11 @@ function context(overrides: Partial<WorkPackageExecutionContext> = {}): WorkPack
     validatedProjectRoot: tempRoot,
     model: { provider: 'test', modelId: 'test-model' } as never,
     modelIdUsed: 'test-model',
+    projectFilesystemDecision: overrides.projectFilesystemDecision ??
+      immutableProjectAuthorityFromConfig(overrides.project?.mcpConfig),
     project: {
       id: 'project-1',
+      rootRef: '00000000-0000-4000-8000-000000000001',
       name: 'Tracker Smoke',
       submittedBy: null,
       githubRepo: null,
@@ -111,6 +140,8 @@ function context(overrides: Partial<WorkPackageExecutionContext> = {}): WorkPack
       githubTokenEnvVar: null,
       pmProviderConfigId: null,
       mcpConfig: { profile: 'default', requiredMcps: [], overrides: {} },
+      grantDecisionRevision: BigInt(1),
+      rootBindingRevision: BigInt(1),
       defaultBranch: 'main',
       createdAt: now,
       updatedAt: now,
@@ -593,10 +624,14 @@ describe('executeWorkPackage', () => {
         metadata: {
           mcpGrantPhases: {
             effective: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               phase: 'effective',
               runtimeEnforcement: 'bounded_context_packet',
-              source: 'task-approval',
+              source: 'explicit-grant-approval',
+              grantMode: 'allow_once',
+              runtimeIssued: false,
+              grantDecisionRevision: '1',
+              rootBindingRevision: '1',
               status: 'approved',
               grants: [{
                 mcpId: 'filesystem',
@@ -653,7 +688,7 @@ describe('executeWorkPackage', () => {
         metadata: {
           mcpGrantPhases: {
             effective: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               phase: 'effective',
               runtimeEnforcement: 'bounded_context_packet',
               source: 'project-filesystem-approval',
@@ -662,6 +697,8 @@ describe('executeWorkPackage', () => {
               scope: 'project',
               mcpId: 'filesystem',
               status: 'approved',
+              grantDecisionRevision: '1',
+              rootBindingRevision: '1',
               grants: [{
                 mcpId: 'filesystem',
                 status: 'approved',
@@ -720,10 +757,14 @@ describe('executeWorkPackage', () => {
         metadata: {
           mcpGrantPhases: {
             effective: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               phase: 'effective',
               runtimeEnforcement: 'bounded_context_packet',
               source: 'explicit-grant-approval',
+              grantMode: 'allow_once',
+              runtimeIssued: false,
+              grantDecisionRevision: '1',
+              rootBindingRevision: '1',
               status: 'approved',
               grants: [{
                 mcpId: 'filesystem',
@@ -776,12 +817,15 @@ describe('executeWorkPackage', () => {
         metadata: {
           mcpGrantPhases: {
             effective: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               phase: 'effective',
               grantMode: 'allow_once',
               runtimeEnforcement: 'bounded_context_packet',
               source: 'explicit-grant-approval',
               status: 'approved',
+              runtimeIssued: false,
+              grantDecisionRevision: '1',
+              rootBindingRevision: '1',
               grants: [{
                 mcpId: 'filesystem',
                 status: 'approved',
@@ -873,13 +917,15 @@ describe('executeWorkPackage', () => {
         metadata: {
           mcpGrantPhases: {
             effective: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               phase: 'effective',
               source: 'project-filesystem-approval',
               grantMode: 'always_allow',
               grantApprovalId: 'grant-approval-1',
               runtimeEnforcement: 'bounded_context_packet',
               status: 'approved',
+              grantDecisionRevision: '1',
+              rootBindingRevision: '1',
               grants: [{
                 mcpId: 'filesystem',
                 status: 'approved',
@@ -935,7 +981,7 @@ describe('executeWorkPackage', () => {
         metadata: {
           mcpGrantPhases: {
             effective: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               phase: 'effective',
               runtimeEnforcement: 'bounded_context_packet',
               source: 'task-approval',
@@ -993,10 +1039,14 @@ describe('executeWorkPackage', () => {
         metadata: {
           mcpGrantPhases: {
             effective: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               phase: 'effective',
               runtimeEnforcement: 'bounded_context_packet',
               source: 'explicit-grant-approval',
+              grantMode: 'allow_once',
+              runtimeIssued: false,
+              grantDecisionRevision: '1',
+              rootBindingRevision: '1',
               status: 'approved',
               grants: [{
                 mcpId: 'filesystem',
@@ -1059,10 +1109,14 @@ describe('executeWorkPackage', () => {
           }],
           mcpGrantPhases: {
             effective: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               phase: 'effective',
               runtimeEnforcement: 'bounded_context_packet',
               source: 'explicit-grant-approval',
+              grantMode: 'allow_once',
+              runtimeIssued: false,
+              grantDecisionRevision: '1',
+              rootBindingRevision: '1',
               status: 'approved',
               grants: [{
                 mcpId: 'filesystem',
@@ -1107,7 +1161,7 @@ describe('executeWorkPackage', () => {
               capabilities: ['filesystem.project.search'],
             }],
             effective: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               phase: 'effective',
               runtimeEnforcement: 'bounded_context_packet',
               source: 'task-approval',
@@ -1143,6 +1197,10 @@ describe('executeWorkPackage', () => {
               phase: 'effective',
               runtimeEnforcement: 'bounded_context_packet',
               source: 'explicit-grant-approval',
+              grantMode: 'allow_once',
+              runtimeIssued: false,
+              grantDecisionRevision: '1',
+              rootBindingRevision: '1',
               status: 'denied',
               grantApprovalId: deniedGrantApprovalId,
               deniedCapabilities: ['filesystem.project.read'],
@@ -1184,10 +1242,14 @@ describe('executeWorkPackage', () => {
         metadata: {
           mcpGrantPhases: {
             effective: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               phase: 'effective',
               runtimeEnforcement: 'bounded_context_packet',
               source: 'explicit-grant-approval',
+              grantMode: 'allow_once',
+              runtimeIssued: false,
+              grantDecisionRevision: '1',
+              rootBindingRevision: '1',
               status: 'approved',
               grants: [{
                 mcpId: 'filesystem',
@@ -1228,10 +1290,14 @@ describe('executeWorkPackage', () => {
         metadata: {
           mcpGrantPhases: {
             effective: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               phase: 'effective',
               runtimeEnforcement: 'bounded_context_packet',
               source: 'explicit-grant-approval',
+              grantMode: 'allow_once',
+              runtimeIssued: false,
+              grantDecisionRevision: '1',
+              rootBindingRevision: '1',
               status: 'approved',
               grants: [{
                 mcpId: 'filesystem',
@@ -1266,10 +1332,14 @@ describe('executeWorkPackage', () => {
         metadata: {
           mcpGrantPhases: {
             effective: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               phase: 'effective',
               runtimeEnforcement: 'bounded_context_packet',
               source: 'explicit-grant-approval',
+              grantMode: 'allow_once',
+              runtimeIssued: false,
+              grantDecisionRevision: '1',
+              rootBindingRevision: '1',
               status: 'approved',
               grants: [{
                 mcpId: 'filesystem',
@@ -1703,10 +1773,14 @@ describe('executeWorkPackage', () => {
         metadata: {
           mcpGrantPhases: {
             effective: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               phase: 'effective',
               runtimeEnforcement: 'bounded_context_packet',
-              source: 'task-approval',
+              source: 'explicit-grant-approval',
+              grantMode: 'allow_once',
+              runtimeIssued: false,
+              grantDecisionRevision: '1',
+              rootBindingRevision: '1',
               status: 'approved',
               grants: [{
                 mcpId: 'filesystem',

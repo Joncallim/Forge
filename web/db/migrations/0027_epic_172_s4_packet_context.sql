@@ -1,0 +1,822 @@
+-- Epic 172 / issue 179 (remaining S4): protected Architect history, bounded
+-- executable references, and the disabled-by-default packet-issuance claim.
+--
+-- This migration is additive. S4 producers remain disabled until the signed
+-- runtime activation graph enables the matching S4/S5 build and protocol epoch.
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles
+    WHERE rolname = 'forge_s4_routines_owner'
+      AND NOT rolcanlogin AND NOT rolinherit AND NOT rolsuper
+  ) THEN
+    RAISE EXCEPTION 'forge_s4_routines_owner must be bootstrapped as NOLOGIN NOINHERIT before migration'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT pg_catalog.pg_has_role(current_user, 'forge_s4_routines_owner', 'MEMBER') THEN
+    RAISE EXCEPTION 'migration role must be temporarily authorized to transfer S4 objects'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles
+    WHERE rolname = 'forge_architect_plan_writer' AND rolcanlogin AND NOT rolinherit AND NOT rolsuper
+  ) OR NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles
+    WHERE rolname = 'forge_architect_plan_resolver' AND rolcanlogin AND NOT rolinherit AND NOT rolsuper
+  ) OR NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles
+    WHERE rolname = 'forge_packet_issuer' AND rolcanlogin AND NOT rolinherit AND NOT rolsuper
+  ) THEN
+    RAISE EXCEPTION 'dedicated S4 logins must be bootstrapped before migration'
+      USING ERRCODE = '42501';
+  END IF;
+END;
+$$;
+--> statement-breakpoint
+CREATE SCHEMA IF NOT EXISTS forge;
+--> statement-breakpoint
+ALTER TABLE public.projects
+  ADD COLUMN root_ref uuid DEFAULT pg_catalog.gen_random_uuid() NOT NULL;
+--> statement-breakpoint
+CREATE UNIQUE INDEX projects_root_ref_idx ON public.projects (root_ref);
+--> statement-breakpoint
+CREATE TABLE public.architect_plan_versions (
+  task_id uuid NOT NULL,
+  plan_artifact_id uuid NOT NULL,
+  plan_version bigint NOT NULL,
+  digest_key_id text NOT NULL,
+  entry_count integer NOT NULL,
+  entry_set_digest text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  PRIMARY KEY (task_id, plan_version),
+  UNIQUE (plan_artifact_id, plan_version),
+  CONSTRAINT architect_plan_versions_task_fk
+    FOREIGN KEY (task_id) REFERENCES public.tasks(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT architect_plan_versions_artifact_fk
+    FOREIGN KEY (plan_artifact_id) REFERENCES public.artifacts(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT architect_plan_versions_version_chk CHECK (plan_version > 0),
+  CONSTRAINT architect_plan_versions_key_chk CHECK (digest_key_id ~ '^[a-z0-9._-]{1,64}$'),
+  CONSTRAINT architect_plan_versions_count_chk CHECK (entry_count BETWEEN 1 AND 256),
+  CONSTRAINT architect_plan_versions_digest_chk CHECK (entry_set_digest ~ '^hmac-sha256:[0-9a-f]{64}$')
+);
+--> statement-breakpoint
+CREATE TABLE public.architect_plan_entries (
+  task_id uuid NOT NULL,
+  plan_artifact_id uuid NOT NULL,
+  plan_version bigint NOT NULL,
+  entry_id text NOT NULL,
+  entry_kind text NOT NULL,
+  agent text,
+  requirement_key text,
+  binding_fingerprint text,
+  content text NOT NULL,
+  content_digest text NOT NULL,
+  digest_key_id text NOT NULL,
+  projection_eligible boolean NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  PRIMARY KEY (task_id, plan_version, entry_id),
+  CONSTRAINT architect_plan_entries_version_fk
+    FOREIGN KEY (task_id, plan_version)
+    REFERENCES public.architect_plan_versions(task_id, plan_version)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT architect_plan_entries_artifact_version_fk
+    FOREIGN KEY (plan_artifact_id, plan_version)
+    REFERENCES public.architect_plan_versions(plan_artifact_id, plan_version)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT architect_plan_entries_id_chk CHECK (
+    pg_catalog.length(entry_id) BETWEEN 1 AND 256 AND entry_id ~ '^[a-z0-9._:-]+$'
+  ),
+  CONSTRAINT architect_plan_entries_kind_chk CHECK (entry_kind IN ('plan_body','requirement','overlay','subtask','legacy_full_plan')),
+  CONSTRAINT architect_plan_entries_agent_chk CHECK (agent IS NULL OR agent ~ '^[a-z0-9._-]{1,64}$'),
+  CONSTRAINT architect_plan_entries_requirement_chk CHECK (requirement_key IS NULL OR requirement_key ~ '^[a-z0-9._-]{1,64}$'),
+  CONSTRAINT architect_plan_entries_binding_chk CHECK (binding_fingerprint IS NULL OR binding_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+  CONSTRAINT architect_plan_entries_content_chk CHECK (pg_catalog.octet_length(content) BETWEEN 1 AND 65536),
+  CONSTRAINT architect_plan_entries_digest_chk CHECK (content_digest ~ '^hmac-sha256:[0-9a-f]{64}$'),
+  CONSTRAINT architect_plan_entries_key_chk CHECK (digest_key_id ~ '^[a-z0-9._-]{1,64}$'),
+  CONSTRAINT architect_plan_entries_legacy_chk CHECK (entry_kind <> 'legacy_full_plan' OR NOT projection_eligible)
+);
+--> statement-breakpoint
+CREATE TABLE public.architect_plan_execution_references (
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  task_id uuid NOT NULL,
+  work_package_id uuid NOT NULL,
+  agent_run_id uuid NOT NULL,
+  plan_artifact_id uuid NOT NULL,
+  plan_version bigint NOT NULL,
+  entry_id text NOT NULL,
+  agent text NOT NULL,
+  requirement_key text,
+  binding_fingerprint text,
+  content_digest text NOT NULL,
+  digest_key_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  resolved_at timestamptz,
+  CONSTRAINT architect_plan_execution_references_task_fk
+    FOREIGN KEY (task_id) REFERENCES public.tasks(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT architect_plan_execution_references_package_fk
+    FOREIGN KEY (work_package_id) REFERENCES public.work_packages(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT architect_plan_execution_references_run_fk
+    FOREIGN KEY (agent_run_id) REFERENCES public.agent_runs(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT architect_plan_execution_references_entry_fk
+    FOREIGN KEY (task_id, plan_version, entry_id)
+    REFERENCES public.architect_plan_entries(task_id, plan_version, entry_id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT architect_plan_execution_references_id_chk CHECK (
+    pg_catalog.length(entry_id) BETWEEN 1 AND 256 AND entry_id ~ '^[a-z0-9._:-]+$'
+  ),
+  CONSTRAINT architect_plan_execution_references_agent_chk CHECK (agent ~ '^[a-z0-9._-]{1,64}$'),
+  CONSTRAINT architect_plan_execution_references_requirement_chk CHECK (requirement_key IS NULL OR requirement_key ~ '^[a-z0-9._-]{1,64}$'),
+  CONSTRAINT architect_plan_execution_references_binding_chk CHECK (binding_fingerprint IS NULL OR binding_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+  CONSTRAINT architect_plan_execution_references_digest_chk CHECK (content_digest ~ '^hmac-sha256:[0-9a-f]{64}$'),
+  CONSTRAINT architect_plan_execution_references_key_chk CHECK (digest_key_id ~ '^[a-z0-9._-]{1,64}$'),
+  UNIQUE (agent_run_id, entry_id)
+);
+--> statement-breakpoint
+CREATE INDEX architect_plan_execution_references_package_idx
+  ON public.architect_plan_execution_references (work_package_id, agent_run_id);
+--> statement-breakpoint
+CREATE TABLE public.architect_plan_history_reads (
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  request_id uuid NOT NULL UNIQUE,
+  user_id uuid NOT NULL,
+  task_id uuid NOT NULL,
+  plan_version bigint NOT NULL,
+  returned_entry_count integer NOT NULL,
+  entry_set_digest text NOT NULL,
+  read_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  CONSTRAINT architect_plan_history_reads_user_fk
+    FOREIGN KEY (user_id) REFERENCES public.users(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT architect_plan_history_reads_version_fk
+    FOREIGN KEY (task_id, plan_version)
+    REFERENCES public.architect_plan_versions(task_id, plan_version)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT architect_plan_history_reads_count_chk CHECK (returned_entry_count BETWEEN 0 AND 256),
+  CONSTRAINT architect_plan_history_reads_digest_chk CHECK (entry_set_digest ~ '^hmac-sha256:[0-9a-f]{64}$')
+);
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.reject_s4_retained_mutation_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+BEGIN
+  RAISE EXCEPTION 'S4 protected history is append-only' USING ERRCODE = '55000';
+END;
+$$;
+--> statement-breakpoint
+CREATE TRIGGER architect_plan_versions_append_only
+  BEFORE UPDATE OR DELETE ON public.architect_plan_versions
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
+CREATE TRIGGER architect_plan_entries_append_only
+  BEFORE UPDATE OR DELETE ON public.architect_plan_entries
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
+CREATE TRIGGER architect_plan_history_reads_append_only
+  BEFORE UPDATE OR DELETE ON public.architect_plan_history_reads
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.resolve_architect_plan_entry_v1(p_reference_id uuid)
+RETURNS TABLE (
+  entry_id text,
+  entry_kind text,
+  agent text,
+  requirement_key text,
+  binding_fingerprint text,
+  content text,
+  content_digest text
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF session_user <> 'forge_architect_plan_resolver' THEN
+    RAISE EXCEPTION 'Architect plan resolution requires the dedicated resolver login'
+      USING ERRCODE = '42501';
+  END IF;
+
+  RETURN QUERY
+  WITH locked_reference AS (
+    SELECT reference.*
+    FROM public.architect_plan_execution_references reference
+    WHERE reference.id = p_reference_id
+      AND reference.resolved_at IS NULL
+    FOR UPDATE
+  ), authorized AS (
+    SELECT reference.id, entry.entry_id, entry.entry_kind, entry.agent,
+      entry.requirement_key, entry.binding_fingerprint, entry.content,
+      entry.content_digest
+    FROM locked_reference reference
+    JOIN public.work_packages package
+      ON package.id = reference.work_package_id
+     AND package.task_id = reference.task_id
+     AND package.assigned_role = reference.agent
+    JOIN public.agent_runs run
+      ON run.id = reference.agent_run_id
+     AND run.task_id = reference.task_id
+     AND run.work_package_id = reference.work_package_id
+     AND run.status = 'running'
+    JOIN public.architect_plan_entries entry
+      ON entry.task_id = reference.task_id
+     AND entry.plan_artifact_id = reference.plan_artifact_id
+     AND entry.plan_version = reference.plan_version
+     AND entry.entry_id = reference.entry_id
+     AND entry.agent IS NOT DISTINCT FROM reference.agent
+     AND entry.requirement_key IS NOT DISTINCT FROM reference.requirement_key
+     AND entry.binding_fingerprint IS NOT DISTINCT FROM reference.binding_fingerprint
+     AND entry.content_digest = reference.content_digest
+     AND entry.digest_key_id = reference.digest_key_id
+     AND entry.projection_eligible
+  ), marked AS (
+    UPDATE public.architect_plan_execution_references reference
+    SET resolved_at = pg_catalog.clock_timestamp()
+    FROM authorized
+    WHERE reference.id = authorized.id
+    RETURNING authorized.*
+  )
+  SELECT marked.entry_id, marked.entry_kind, marked.agent,
+    marked.requirement_key, marked.binding_fingerprint, marked.content,
+    marked.content_digest
+  FROM marked;
+END;
+$$;
+--> statement-breakpoint
+CREATE TABLE public.epic_172_s4_protocol_state (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  producers_enabled boolean NOT NULL DEFAULT false,
+  protocol_epoch integer NOT NULL DEFAULT 1 CHECK (protocol_epoch BETWEEN 1 AND 2),
+  enabled_build_sha text,
+  updated_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  CHECK (NOT producers_enabled OR (protocol_epoch = 2 AND enabled_build_sha ~ '^[0-9a-f]{40}$'))
+);
+INSERT INTO public.epic_172_s4_protocol_state (singleton) VALUES (true);
+--> statement-breakpoint
+CREATE TABLE public.work_package_local_run_evidence (
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  task_id uuid NOT NULL,
+  work_package_id uuid NOT NULL,
+  agent_run_id uuid NOT NULL UNIQUE,
+  claim_token uuid NOT NULL UNIQUE,
+  lease_expires_at timestamptz NOT NULL,
+  state text NOT NULL DEFAULT 'claimed',
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  terminal_at timestamptz,
+  CONSTRAINT work_package_local_run_evidence_task_fk
+    FOREIGN KEY (task_id) REFERENCES public.tasks(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT work_package_local_run_evidence_package_fk
+    FOREIGN KEY (work_package_id) REFERENCES public.work_packages(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT work_package_local_run_evidence_run_fk
+    FOREIGN KEY (agent_run_id) REFERENCES public.agent_runs(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT work_package_local_run_evidence_state_chk CHECK (state IN ('claimed','terminal','uncertain')),
+  CONSTRAINT work_package_local_run_evidence_terminal_chk CHECK ((state = 'claimed') = (terminal_at IS NULL)),
+  CONSTRAINT work_package_local_run_evidence_identity_key
+    UNIQUE (id, task_id, work_package_id, agent_run_id)
+);
+--> statement-breakpoint
+CREATE TABLE public.filesystem_mcp_decision_nonce_claims (
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  grant_approval_id uuid NOT NULL,
+  grant_decision_nonce uuid NOT NULL UNIQUE,
+  runtime_audit_id uuid NOT NULL UNIQUE,
+  claimed_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  CONSTRAINT filesystem_mcp_decision_nonce_claims_approval_fk
+    FOREIGN KEY (grant_approval_id) REFERENCES public.filesystem_mcp_grant_approvals(id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT filesystem_mcp_decision_nonce_claims_audit_fk
+    FOREIGN KEY (runtime_audit_id) REFERENCES public.filesystem_mcp_runtime_audits(id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+--> statement-breakpoint
+ALTER TABLE public.filesystem_mcp_runtime_audits
+  ADD COLUMN protocol_version integer,
+  ADD COLUMN local_run_evidence_id uuid,
+  ADD COLUMN claim_token uuid,
+  ADD COLUMN lease_expires_at timestamptz,
+  ADD COLUMN authorization_snapshot jsonb,
+  ADD COLUMN authorization_source text,
+  ADD COLUMN grant_mode text,
+  ADD COLUMN grant_decision_revision bigint,
+  ADD COLUMN grant_decision_nonce uuid,
+  ADD COLUMN authorization_root_binding_revision bigint,
+  ADD COLUMN project_decision_id uuid,
+  ADD COLUMN assembly jsonb,
+  ADD COLUMN delivery jsonb,
+  ADD COLUMN terminal jsonb,
+  ADD COLUMN terminal_at timestamptz;
+--> statement-breakpoint
+ALTER TABLE public.filesystem_mcp_grant_approvals
+  ADD CONSTRAINT filesystem_mcp_grant_approvals_packet_identity_key
+    UNIQUE (id, task_id, work_package_id, grant_decision_revision, grant_nonce);
+--> statement-breakpoint
+ALTER TABLE public.filesystem_mcp_runtime_audits
+  ADD CONSTRAINT filesystem_mcp_runtime_audits_local_evidence_fk
+    FOREIGN KEY (local_run_evidence_id) REFERENCES public.work_package_local_run_evidence(id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  ADD CONSTRAINT filesystem_mcp_runtime_audits_project_decision_fk
+    FOREIGN KEY (project_decision_id) REFERENCES public.filesystem_mcp_grant_approvals(id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  ADD CONSTRAINT filesystem_mcp_runtime_audits_local_identity_fk
+    FOREIGN KEY (local_run_evidence_id, task_id, work_package_id, agent_run_id)
+    REFERENCES public.work_package_local_run_evidence(id, task_id, work_package_id, agent_run_id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  ADD CONSTRAINT filesystem_mcp_runtime_audits_package_authority_fk
+    FOREIGN KEY (
+      grant_approval_id, task_id, work_package_id,
+      grant_decision_revision, grant_decision_nonce
+    ) REFERENCES public.filesystem_mcp_grant_approvals(
+      id, task_id, work_package_id, grant_decision_revision, grant_nonce
+    ) MATCH SIMPLE ON UPDATE RESTRICT ON DELETE RESTRICT,
+  ADD CONSTRAINT filesystem_mcp_runtime_audits_protocol_v2_chk CHECK (
+    protocol_version IS DISTINCT FROM 2 OR (
+      task_id IS NOT NULL AND work_package_id IS NOT NULL AND agent_run_id IS NOT NULL
+      AND local_run_evidence_id IS NOT NULL AND claim_token IS NOT NULL
+      AND lease_expires_at IS NOT NULL AND authorization_snapshot IS NOT NULL
+      AND grant_decision_revision > 0 AND authorization_root_binding_revision > 0
+      AND root = '' AND reason = '' AND metadata = '{}'::jsonb
+      AND (
+        authorization_source = 'package_allow_once' AND grant_mode = 'allow_once'
+        AND grant_approval_id IS NOT NULL AND project_decision_id IS NULL
+        AND grant_decision_nonce IS NOT NULL
+        OR
+        authorization_source = 'project_always_allow' AND grant_mode = 'always_allow'
+        AND grant_approval_id IS NULL AND project_decision_id IS NOT NULL
+        AND grant_decision_nonce IS NULL
+      )
+    )
+  );
+--> statement-breakpoint
+CREATE UNIQUE INDEX filesystem_mcp_runtime_audits_v2_run_idx
+  ON public.filesystem_mcp_runtime_audits (agent_run_id, operation)
+  WHERE protocol_version = 2;
+CREATE UNIQUE INDEX filesystem_mcp_runtime_audits_v2_claim_token_idx
+  ON public.filesystem_mcp_runtime_audits (claim_token)
+  WHERE protocol_version = 2;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.validate_packet_authorization_snapshot_v2(
+  p_snapshot jsonb,
+  p_source text,
+  p_mode text,
+  p_approval_id uuid,
+  p_revision bigint,
+  p_nonce uuid,
+  p_root_revision bigint
+)
+RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_approved text[];
+  v_required text[];
+BEGIN
+  IF p_snapshot IS NULL OR pg_catalog.jsonb_typeof(p_snapshot) <> 'object'
+     OR (SELECT pg_catalog.count(*) <> 12 FROM pg_catalog.jsonb_object_keys(p_snapshot))
+     OR p_snapshot - ARRAY[
+      'schemaVersion','source','grantMode','grantApprovalId','grantDecisionRevision',
+      'grantDecisionNonce','rootBindingRevision','approvedCapabilities',
+      'requiredCapabilities','decidedByUserId','decidedAt','coverageFingerprint'
+     ] <> '{}'::jsonb
+     OR pg_catalog.jsonb_typeof(p_snapshot->'approvedCapabilities') <> 'array'
+     OR pg_catalog.jsonb_typeof(p_snapshot->'requiredCapabilities') <> 'array' THEN
+    RETURN false;
+  END IF;
+
+  SELECT pg_catalog.array_agg(value ORDER BY ordinality)
+  INTO v_approved
+  FROM pg_catalog.jsonb_array_elements_text(p_snapshot->'approvedCapabilities')
+    WITH ORDINALITY AS item(value, ordinality);
+  SELECT pg_catalog.array_agg(value ORDER BY ordinality)
+  INTO v_required
+  FROM pg_catalog.jsonb_array_elements_text(p_snapshot->'requiredCapabilities')
+    WITH ORDINALITY AS item(value, ordinality);
+
+  RETURN COALESCE(
+    p_revision > 0
+    AND p_root_revision > 0
+    AND pg_catalog.cardinality(v_approved) BETWEEN 1 AND 3
+    AND pg_catalog.cardinality(v_required) BETWEEN 1 AND 3
+    AND v_approved = ARRAY(SELECT DISTINCT cap FROM pg_catalog.unnest(v_approved) cap ORDER BY cap)
+    AND v_required = ARRAY(SELECT DISTINCT cap FROM pg_catalog.unnest(v_required) cap ORDER BY cap)
+    AND v_approved <@ ARRAY['filesystem.project.list','filesystem.project.read','filesystem.project.search']::text[]
+    AND v_required <@ v_approved
+    AND p_snapshot->'schemaVersion' = '2'::jsonb
+    AND p_snapshot->>'source' = p_source
+    AND p_snapshot->>'grantMode' = p_mode
+    AND p_snapshot->>'grantDecisionRevision' = p_revision::text
+    AND p_snapshot->>'rootBindingRevision' = p_root_revision::text
+    AND p_snapshot->>'decidedByUserId' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    AND p_snapshot->>'decidedAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$'
+    AND p_snapshot->>'coverageFingerprint' ~ '^sha256:[0-9a-f]{64}$'
+    AND (
+      p_source = 'package_allow_once'
+      AND p_mode = 'allow_once'
+      AND p_approval_id IS NOT NULL AND p_nonce IS NOT NULL
+      AND p_snapshot->>'grantApprovalId' = p_approval_id::text
+      AND p_snapshot->>'grantDecisionNonce' = p_nonce::text
+      OR
+      p_source = 'project_always_allow'
+      AND p_mode = 'always_allow'
+      AND p_approval_id IS NULL AND p_nonce IS NULL
+      AND p_snapshot->'grantApprovalId' = 'null'::jsonb
+      AND p_snapshot->'grantDecisionNonce' = 'null'::jsonb
+    ),
+    false
+  );
+EXCEPTION WHEN OTHERS THEN
+  RETURN false;
+END;
+$$;
+--> statement-breakpoint
+ALTER TABLE public.filesystem_mcp_runtime_audits
+  ADD CONSTRAINT filesystem_mcp_runtime_audits_snapshot_v2_chk CHECK (
+    protocol_version IS DISTINCT FROM 2 OR
+    forge.validate_packet_authorization_snapshot_v2(
+      authorization_snapshot, authorization_source, grant_mode,
+      grant_approval_id, grant_decision_revision, grant_decision_nonce,
+      authorization_root_binding_revision
+    )
+  );
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.guard_packet_authorization_v2()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.protocol_version = 2
+       AND pg_catalog.current_setting('forge.s4_packet_writer', true) IS DISTINCT FROM 'on' THEN
+      RAISE EXCEPTION 'protocol-v2 packet evidence requires the fixed-path writer'
+        USING ERRCODE = '42501';
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF OLD.protocol_version = 2 AND (
+    NEW.protocol_version IS DISTINCT FROM OLD.protocol_version
+    OR NEW.task_id IS DISTINCT FROM OLD.task_id
+    OR NEW.work_package_id IS DISTINCT FROM OLD.work_package_id
+    OR NEW.agent_run_id IS DISTINCT FROM OLD.agent_run_id
+    OR NEW.local_run_evidence_id IS DISTINCT FROM OLD.local_run_evidence_id
+    OR NEW.claim_token IS DISTINCT FROM OLD.claim_token
+    OR NEW.authorization_snapshot IS DISTINCT FROM OLD.authorization_snapshot
+    OR NEW.authorization_source IS DISTINCT FROM OLD.authorization_source
+    OR NEW.grant_mode IS DISTINCT FROM OLD.grant_mode
+    OR NEW.grant_approval_id IS DISTINCT FROM OLD.grant_approval_id
+    OR NEW.project_decision_id IS DISTINCT FROM OLD.project_decision_id
+    OR NEW.grant_decision_revision IS DISTINCT FROM OLD.grant_decision_revision
+    OR NEW.grant_decision_nonce IS DISTINCT FROM OLD.grant_decision_nonce
+    OR NEW.authorization_root_binding_revision IS DISTINCT FROM OLD.authorization_root_binding_revision
+    OR NEW.capabilities IS DISTINCT FROM OLD.capabilities
+    OR NEW.requested_capabilities IS DISTINCT FROM OLD.requested_capabilities
+  ) THEN
+    RAISE EXCEPTION 'protocol-v2 packet authorization is immutable'
+      USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+--> statement-breakpoint
+CREATE TRIGGER filesystem_mcp_runtime_audits_protocol_v2_guard
+BEFORE INSERT OR UPDATE ON public.filesystem_mcp_runtime_audits
+FOR EACH ROW EXECUTE FUNCTION forge.guard_packet_authorization_v2();
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.insert_packet_authorization_snapshot_v2(
+  p_agent_run_id uuid,
+  p_local_run_evidence_id uuid,
+  p_decision_id uuid,
+  p_claim_token uuid,
+  p_lease_seconds integer,
+  p_required_capabilities text[]
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_run public.agent_runs%ROWTYPE;
+  v_package public.work_packages%ROWTYPE;
+  v_task public.tasks%ROWTYPE;
+  v_project public.projects%ROWTYPE;
+  v_decision public.filesystem_mcp_grant_approvals%ROWTYPE;
+  v_pointer public.filesystem_mcp_current_decision_pointers%ROWTYPE;
+  v_local public.work_package_local_run_evidence%ROWTYPE;
+  v_source text;
+  v_mode text;
+  v_approved text[];
+  v_required text[];
+  v_snapshot jsonb;
+  v_audit_id uuid := pg_catalog.gen_random_uuid();
+BEGIN
+  IF session_user <> 'forge_packet_issuer' THEN
+    RAISE EXCEPTION 'packet issuance requires the dedicated issuer login' USING ERRCODE = '42501';
+  END IF;
+  IF p_lease_seconds NOT BETWEEN 1 AND 45 THEN
+    RAISE EXCEPTION 'packet lease must be between 1 and 45 seconds' USING ERRCODE = '22023';
+  END IF;
+  IF NOT (SELECT state.producers_enabled AND state.protocol_epoch = 2
+          FROM public.epic_172_s4_protocol_state state WHERE state.singleton) THEN
+    RAISE EXCEPTION 'S4 packet producers are disabled' USING ERRCODE = '55000';
+  END IF;
+
+  SELECT run.* INTO STRICT v_run FROM public.agent_runs run WHERE run.id = p_agent_run_id;
+  SELECT package.* INTO STRICT v_package FROM public.work_packages package WHERE package.id = v_run.work_package_id;
+  SELECT task.* INTO STRICT v_task FROM public.tasks task WHERE task.id = v_package.task_id;
+  IF v_run.task_id <> v_task.id THEN
+    RAISE EXCEPTION 'agent run does not belong to its package task' USING ERRCODE = '40001';
+  END IF;
+  SELECT project.* INTO STRICT v_project FROM public.projects project WHERE project.id = v_task.project_id FOR UPDATE;
+  PERFORM 1 FROM public.tasks task WHERE task.id = v_task.id FOR UPDATE;
+  PERFORM 1 FROM public.work_packages package WHERE package.task_id = v_task.id ORDER BY package.id FOR UPDATE;
+
+  SELECT decision.* INTO STRICT v_decision
+  FROM public.filesystem_mcp_grant_approvals decision
+  WHERE decision.id = p_decision_id
+  FOR UPDATE;
+  IF v_decision.decision <> 'approved'
+     OR v_decision.grant_decision_revision IS NULL
+     OR v_decision.root_binding_revision IS NULL
+     OR v_decision.root_binding_revision <> v_project.root_binding_revision
+     OR v_decision.decided_by IS NULL THEN
+    RAISE EXCEPTION 'packet authorization is stale or incomplete' USING ERRCODE = '40001';
+  END IF;
+
+  SELECT ARRAY(
+    SELECT pg_catalog.jsonb_array_elements_text(v_decision.capabilities) ORDER BY 1
+  ) INTO v_approved;
+  SELECT ARRAY(SELECT cap FROM pg_catalog.unnest(p_required_capabilities) cap ORDER BY cap) INTO v_required;
+  IF pg_catalog.cardinality(v_required) NOT BETWEEN 1 AND 3
+     OR v_required IS DISTINCT FROM ARRAY(SELECT DISTINCT cap FROM pg_catalog.unnest(v_required) cap ORDER BY cap)
+     OR v_required <@ ARRAY['filesystem.project.list','filesystem.project.read','filesystem.project.search']::text[] IS NOT TRUE
+     OR v_required <@ v_approved IS NOT TRUE THEN
+    RAISE EXCEPTION 'packet capability coverage is invalid' USING ERRCODE = '22023';
+  END IF;
+
+  IF v_decision.decision_scope = 'package' THEN
+    SELECT pointer.* INTO STRICT v_pointer
+    FROM public.filesystem_mcp_current_decision_pointers pointer
+    WHERE pointer.work_package_id = v_package.id
+    FOR UPDATE;
+    IF v_decision.project_id <> v_project.id
+       OR v_decision.task_id <> v_task.id OR v_decision.work_package_id <> v_package.id
+       OR v_decision.grant_nonce IS NULL
+       OR v_pointer.current_decision_id <> v_decision.id
+       OR v_pointer.current_decision_revision <> v_decision.grant_decision_revision
+       OR v_pointer.pointer_fingerprint <> v_decision.pointer_fingerprint THEN
+      RAISE EXCEPTION 'allow-once decision is not the current package authority' USING ERRCODE = '40001';
+    END IF;
+    v_source := 'package_allow_once';
+    v_mode := 'allow_once';
+  ELSIF v_decision.decision_scope = 'project' THEN
+    -- S3 must supply the ADR-required append-only project decision table and
+    -- project-owned current pointer before this arm can issue. A mutable
+    -- projects.mcp_config read is not historical authority and must never be
+    -- normalized into a protocol-v2 snapshot.
+    RAISE EXCEPTION 'project always-allow packet authority is not installed'
+      USING ERRCODE = '55000';
+  ELSE
+    RAISE EXCEPTION 'unknown packet authorization source' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT evidence.* INTO STRICT v_local
+  FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = p_local_run_evidence_id
+    AND evidence.agent_run_id = v_run.id
+    AND evidence.task_id = v_task.id
+    AND evidence.work_package_id = v_package.id
+    AND evidence.state = 'claimed'
+    AND pg_catalog.clock_timestamp() < evidence.lease_expires_at
+  FOR UPDATE;
+
+  v_snapshot := pg_catalog.jsonb_build_object(
+    'schemaVersion', 2,
+    'source', v_source,
+    'grantMode', v_mode,
+    'grantApprovalId', CASE WHEN v_source = 'package_allow_once' THEN pg_catalog.to_jsonb(v_decision.id::text) ELSE 'null'::jsonb END,
+    'grantDecisionRevision', v_decision.grant_decision_revision::text,
+    'grantDecisionNonce', CASE WHEN v_source = 'package_allow_once' THEN pg_catalog.to_jsonb(v_decision.grant_nonce::text) ELSE 'null'::jsonb END,
+    'rootBindingRevision', v_decision.root_binding_revision::text,
+    'approvedCapabilities', pg_catalog.to_jsonb(v_approved),
+    'requiredCapabilities', pg_catalog.to_jsonb(v_required),
+    'decidedByUserId', v_decision.decided_by::text,
+    'decidedAt', pg_catalog.to_char(v_decision.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+    'coverageFingerprint', v_decision.pointer_fingerprint
+  );
+
+  PERFORM pg_catalog.set_config('forge.s4_packet_writer', 'on', true);
+  INSERT INTO public.filesystem_mcp_runtime_audits (
+    id, task_id, work_package_id, agent_run_id, local_run_evidence_id,
+    grant_approval_id, project_decision_id, operation, status, capabilities,
+    requested_capabilities, root, file_count, byte_count, omitted_count,
+    redaction_applied, redaction_summary, omitted_summary, reason, metadata,
+    protocol_version, claim_token, lease_expires_at, authorization_snapshot,
+    authorization_source, grant_mode, grant_decision_revision,
+    grant_decision_nonce, authorization_root_binding_revision
+  ) VALUES (
+    v_audit_id, v_task.id, v_package.id, v_run.id, v_local.id,
+    CASE WHEN v_source = 'package_allow_once' THEN v_decision.id ELSE NULL END,
+    CASE WHEN v_source = 'project_always_allow' THEN v_decision.id ELSE NULL END,
+    'context_packet', 'claiming', pg_catalog.to_jsonb(v_approved), pg_catalog.to_jsonb(v_required),
+    '', 0, 0, 0, false, '{}'::jsonb, '{}'::jsonb, '', '{}'::jsonb,
+    2, p_claim_token, LEAST(v_local.lease_expires_at, pg_catalog.clock_timestamp() + pg_catalog.make_interval(secs => p_lease_seconds)),
+    v_snapshot, v_source, v_mode, v_decision.grant_decision_revision,
+    v_decision.grant_nonce, v_decision.root_binding_revision
+  );
+
+  IF v_source = 'package_allow_once' THEN
+    INSERT INTO public.filesystem_mcp_decision_nonce_claims (
+      grant_approval_id, grant_decision_nonce, runtime_audit_id
+    ) VALUES (v_decision.id, v_decision.grant_nonce, v_audit_id);
+  END IF;
+  RETURN v_audit_id;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.insert_architect_plan_version_v1(
+  p_agent_run_id uuid,
+  p_plan_artifact_id uuid,
+  p_plan_version bigint,
+  p_digest_key_id text,
+  p_entry_set_digest text,
+  p_entry_ids text[],
+  p_entry_kinds text[],
+  p_agents text[],
+  p_requirement_keys text[],
+  p_binding_fingerprints text[],
+  p_contents text[],
+  p_content_digests text[],
+  p_projection_eligible text[]
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_task_id uuid;
+  v_count integer := pg_catalog.cardinality(p_entry_ids);
+  v_expected_version bigint;
+  v_ordinal integer;
+BEGIN
+  IF session_user <> 'forge_architect_plan_writer' THEN
+    RAISE EXCEPTION 'Architect plan writes require the dedicated writer login' USING ERRCODE = '42501';
+  END IF;
+  IF v_count NOT BETWEEN 1 AND 256
+     OR ARRAY[
+       pg_catalog.cardinality(p_entry_kinds), pg_catalog.cardinality(p_agents),
+       pg_catalog.cardinality(p_requirement_keys), pg_catalog.cardinality(p_binding_fingerprints),
+       pg_catalog.cardinality(p_contents), pg_catalog.cardinality(p_content_digests),
+       pg_catalog.cardinality(p_projection_eligible)
+     ] <> pg_catalog.array_fill(v_count, ARRAY[7]) THEN
+    RAISE EXCEPTION 'Architect plan entry arrays must have one bounded shared length' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT run.task_id INTO STRICT v_task_id
+  FROM public.agent_runs run
+  WHERE run.id = p_agent_run_id AND run.agent_type = 'architect'
+  FOR UPDATE;
+  PERFORM 1 FROM public.tasks task WHERE task.id = v_task_id FOR UPDATE;
+  SELECT COALESCE(MAX(version.plan_version), 0) + 1 INTO v_expected_version
+  FROM public.architect_plan_versions version WHERE version.task_id = v_task_id;
+  IF p_plan_version <> v_expected_version THEN
+    RAISE EXCEPTION 'Architect plan version must be the next task-scoped BIGINT' USING ERRCODE = '40001';
+  END IF;
+
+  INSERT INTO public.artifacts (id, agent_run_id, artifact_type, content, metadata)
+  VALUES (
+    p_plan_artifact_id, p_agent_run_id, 'adr_text',
+    'Architect plan available in protected history',
+    pg_catalog.jsonb_build_object(
+      'schemaVersion', 1, 'stage', 'architect_plan', 'historyAvailable', true
+    )
+  );
+  INSERT INTO public.architect_plan_versions (
+    task_id, plan_artifact_id, plan_version, digest_key_id, entry_count, entry_set_digest
+  ) VALUES (v_task_id, p_plan_artifact_id, p_plan_version, p_digest_key_id, v_count, p_entry_set_digest);
+
+  FOR v_ordinal IN 1..v_count LOOP
+    INSERT INTO public.architect_plan_entries (
+      task_id, plan_artifact_id, plan_version, entry_id, entry_kind, agent,
+      requirement_key, binding_fingerprint, content, content_digest,
+      digest_key_id, projection_eligible
+    ) VALUES (
+      v_task_id, p_plan_artifact_id, p_plan_version, p_entry_ids[v_ordinal],
+      p_entry_kinds[v_ordinal], p_agents[v_ordinal], p_requirement_keys[v_ordinal],
+      p_binding_fingerprints[v_ordinal], p_contents[v_ordinal],
+      p_content_digests[v_ordinal], p_digest_key_id,
+      CASE p_projection_eligible[v_ordinal]
+        WHEN 'true' THEN true
+        WHEN 'false' THEN false
+        ELSE NULL
+      END
+    );
+  END LOOP;
+  RETURN p_plan_artifact_id;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.bind_architect_plan_entry_v1(
+  p_task_id uuid,
+  p_work_package_id uuid,
+  p_agent_run_id uuid,
+  p_plan_artifact_id uuid,
+  p_plan_version bigint,
+  p_entry_id text,
+  p_content_digest text,
+  p_digest_key_id text,
+  p_requirement_key text,
+  p_binding_fingerprint text
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_reference_id uuid := pg_catalog.gen_random_uuid();
+  v_agent text;
+BEGIN
+  IF session_user <> 'forge_packet_issuer' THEN
+    RAISE EXCEPTION 'Architect plan binding requires the dedicated package issuer login' USING ERRCODE = '42501';
+  END IF;
+  SELECT package.assigned_role INTO STRICT v_agent
+  FROM public.work_packages package
+  JOIN public.agent_runs run
+    ON run.id = p_agent_run_id
+   AND run.task_id = package.task_id
+   AND run.work_package_id = package.id
+   AND run.status = 'running'
+  WHERE package.id = p_work_package_id AND package.task_id = p_task_id
+  FOR UPDATE OF package;
+  PERFORM 1 FROM public.architect_plan_entries entry
+  WHERE entry.task_id = p_task_id
+    AND entry.plan_artifact_id = p_plan_artifact_id
+    AND entry.plan_version = p_plan_version
+    AND entry.entry_id = p_entry_id
+    AND entry.agent = v_agent
+    AND entry.content_digest = p_content_digest
+    AND entry.digest_key_id = p_digest_key_id
+    AND entry.requirement_key IS NOT DISTINCT FROM p_requirement_key
+    AND entry.binding_fingerprint IS NOT DISTINCT FROM p_binding_fingerprint
+    AND entry.projection_eligible;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Architect plan reference is stale, cross-task, or ineligible' USING ERRCODE = '40001';
+  END IF;
+  INSERT INTO public.architect_plan_execution_references (
+    id, task_id, work_package_id, agent_run_id, plan_artifact_id, plan_version,
+    entry_id, agent, requirement_key, binding_fingerprint, content_digest, digest_key_id
+  ) VALUES (
+    v_reference_id, p_task_id, p_work_package_id, p_agent_run_id,
+    p_plan_artifact_id, p_plan_version, p_entry_id, v_agent, p_requirement_key,
+    p_binding_fingerprint, p_content_digest, p_digest_key_id
+  );
+  RETURN v_reference_id;
+END;
+$$;
+--> statement-breakpoint
+ALTER TABLE public.architect_plan_versions OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.architect_plan_entries OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.architect_plan_execution_references OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.architect_plan_history_reads OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.epic_172_s4_protocol_state OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.work_package_local_run_evidence OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.filesystem_mcp_decision_nonce_claims OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.reject_s4_retained_mutation_v1() OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.resolve_architect_plan_entry_v1(uuid) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.validate_packet_authorization_snapshot_v2(jsonb,text,text,uuid,bigint,uuid,bigint) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,integer,text[]) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.guard_packet_authorization_v2() OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) OWNER TO forge_s4_routines_owner;
+--> statement-breakpoint
+-- The NOLOGIN owner receives only the existing-table privileges required by
+-- the fixed-path functions above. Interactive and application logins receive
+-- no equivalent table access.
+GRANT SELECT ON public.tasks, public.projects, public.work_packages,
+  public.agent_runs, public.artifacts, public.filesystem_mcp_grant_approvals,
+  public.filesystem_mcp_current_decision_pointers,
+  public.filesystem_mcp_runtime_audits TO forge_s4_routines_owner;
+GRANT UPDATE ON public.tasks, public.projects, public.work_packages,
+  public.agent_runs, public.filesystem_mcp_grant_approvals,
+  public.filesystem_mcp_current_decision_pointers TO forge_s4_routines_owner;
+GRANT INSERT ON public.artifacts, public.filesystem_mcp_runtime_audits
+  TO forge_s4_routines_owner;
+--> statement-breakpoint
+REVOKE ALL ON public.architect_plan_versions, public.architect_plan_entries,
+  public.architect_plan_execution_references, public.architect_plan_history_reads,
+  public.epic_172_s4_protocol_state, public.work_package_local_run_evidence,
+  public.filesystem_mcp_decision_nonce_claims FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.resolve_architect_plan_entry_v1(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,integer,text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.validate_packet_authorization_snapshot_v2(jsonb,text,text,uuid,bigint,uuid,bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.guard_packet_authorization_v2() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) FROM PUBLIC;
+GRANT USAGE ON SCHEMA forge TO forge_architect_plan_writer, forge_architect_plan_resolver, forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) TO forge_architect_plan_writer;
+GRANT EXECUTE ON FUNCTION forge.resolve_architect_plan_entry_v1(uuid) TO forge_architect_plan_resolver;
+GRANT EXECUTE ON FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,integer,text[]) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) TO forge_packet_issuer;
+--> statement-breakpoint
+SELECT public.forge_finalize_epic_172_s4_owner_bootstrap_v1();

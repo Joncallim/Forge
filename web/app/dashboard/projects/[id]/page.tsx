@@ -673,31 +673,20 @@ export default function ProjectDetailPage() {
     }
   }
 
-  async function handleDeleteProject() {
+  async function handleArchiveProject() {
     if (!project || deleting) return
 
     const confirmed = window.confirm(
-      `Delete the project "${project.name}"?\n\nThis permanently removes the project and all of its tasks and history.`,
+      `Archive the project "${project.name}"?\n\nForge keeps its tasks, runs, reviews, and project files as retained history.`,
     )
     if (!confirmed) return
 
-    let deleteFiles = false
-    if (project.localPath) {
-      const localPathLabel = projectLocalPathLabel(project)
-      deleteFiles = window.confirm(
-        `Also delete the project folder and everything inside it from disk?\n\n${localPathLabel}\n\nClick Cancel to remove only the Forge project record. Use Cancel when the folder is missing or was deleted outside Forge.`,
-      )
-    }
-
     setDeleting(true)
     try {
-      const res = await fetch(
-        `/api/projects/${projectId}${deleteFiles ? '?deleteFiles=true' : ''}`,
-        { method: 'DELETE' },
-      )
+      const res = await fetch(`/api/projects/${projectId}`, { method: 'DELETE' })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
-        throw new Error(body.error ?? 'Failed to delete project')
+        throw new Error(body.error ?? 'Failed to archive project')
       }
       router.push('/dashboard/projects')
     } catch (err) {
@@ -789,15 +778,14 @@ export default function ProjectDetailPage() {
           <Button
             variant="outline"
             size="sm"
-            onClick={handleDeleteProject}
+            onClick={handleArchiveProject}
             disabled={deleting}
             aria-busy={deleting}
-            aria-label={`Delete project ${project.name}`}
-            title="Removes this project record. You can keep files on disk, which also works for orphaned projects whose folder is missing."
-            className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+            aria-label={`Archive project ${project.name}`}
+            title="Hides the project from active work while retaining its tasks, runs, reviews, and files."
           >
             <Trash2Icon aria-hidden="true" />
-            {deleting ? 'Deleting…' : 'Delete'}
+            {deleting ? 'Archiving…' : 'Archive'}
           </Button>
           <Dialog open={dialogOpen} onOpenChange={handleTaskDialogOpenChange}>
             <DialogTrigger

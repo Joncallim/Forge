@@ -14,7 +14,9 @@
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { getTableName } from 'drizzle-orm'
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { canonicalS3Marker } from '../test-support/filesystem-grant-marker-fixtures'
 
 // ---------------------------------------------------------------------------
 // Module-level mocks
@@ -34,6 +36,14 @@ vi.mock('@/lib/session', () => ({
     maxAge: 604800,
     path: '/',
   }),
+}))
+
+// Existing route-contract cases exercise behavior behind the release gate.
+// The gate itself and its fail-closed route placement have a focused suite.
+const mockGuardEpic172ProjectManagementIngress = vi.fn().mockResolvedValue(null)
+vi.mock('@/lib/projects/epic-172-project-ingress', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/projects/epic-172-project-ingress')>(),
+  guardEpic172ProjectManagementIngress: mockGuardEpic172ProjectManagementIngress,
 }))
 
 // DB mock — returns fluent chain helpers per-call
@@ -118,6 +128,7 @@ vi.mock('@/lib/github', () => ({
 }))
 
 const mockGetProjectMcpOverview = vi.fn()
+const mockLoadCurrentProjectFilesystemDecision = vi.fn().mockResolvedValue(null)
 vi.mock('@/lib/mcps/manager', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/mcps/manager')>()
   return {
@@ -127,6 +138,11 @@ vi.mock('@/lib/mcps/manager', async (importOriginal) => {
     ),
   }
 })
+
+vi.mock('@/lib/mcps/filesystem-grant-reconciliation', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/filesystem-grant-reconciliation')>(),
+  loadCurrentProjectFilesystemDecision: mockLoadCurrentProjectFilesystemDecision,
+}))
 
 // ---------------------------------------------------------------------------
 // Drizzle chain factory
@@ -223,6 +239,8 @@ describe('GET /api/projects — auth guard', () => {
         requiredMcps: ['filesystem', 'github'],
         overrides: {},
       },
+      grantDecisionRevision: BigInt(0),
+      rootBindingRevision: BigInt(1),
       defaultBranch: 'main',
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -231,7 +249,6 @@ describe('GET /api/projects — auth guard', () => {
     process.env.HOME = fakeHome
     process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
     mockDbSelect
-      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([project]))
       .mockReturnValueOnce(chain([]))
 
@@ -245,6 +262,8 @@ describe('GET /api/projects — auth guard', () => {
         localPath: project.localPath,
         displayLocalPath: '~/Documents/Forge/projects/list-display',
       })
+      expect(mockGuardEpic172ProjectManagementIngress).not.toHaveBeenCalled()
+      expect(mockDbUpdate).not.toHaveBeenCalled()
     } finally {
       if (previousRoot === undefined) {
         delete process.env.FORGE_WORKSPACE_ROOT
@@ -1074,7 +1093,7 @@ describe('PUT /api/projects/:id — local path display handling', () => {
   })
 })
 
-describe('DELETE /api/projects/:id — file deletion boundary', () => {
+describe('DELETE /api/projects/:id — retained-evidence archive boundary', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
   function projectRow(localPath: string) {
@@ -1092,12 +1111,9 @@ describe('DELETE /api/projects/:id — file deletion boundary', () => {
     }
   }
 
-  it('refuses to remove the shared workspace root', async () => {
+  it('rejects deleteFiles before inspecting the project or filesystem', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
-    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-delete-root-'))
-    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
-    mockDbSelect.mockReturnValue(chain([projectRow(workspaceRoot)]))
 
     try {
       const { DELETE } = await import('@/app/api/projects/[id]/route')
@@ -1105,22 +1121,20 @@ describe('DELETE /api/projects/:id — file deletion boundary', () => {
         params: Promise.resolve({ id: 'project-delete' }),
       })
 
-      expect(res.status).toBe(400)
+      expect(res.status).toBe(409)
       const body = await res.json()
-      expect(body.error).toMatch(/shared Forge workspace directory/i)
+      expect(body.code).toBe('project_hard_delete_disabled')
+      expect(body.error).toMatch(/retry without deleteFiles to archive/i)
+      expect(mockDbSelect).not.toHaveBeenCalled()
+      expect(mockDbUpdate).not.toHaveBeenCalled()
       expect(mockDbDelete).not.toHaveBeenCalled()
       await expect(fs.stat(workspaceRoot)).resolves.toMatchObject({})
     } finally {
-      if (previousRoot === undefined) {
-        delete process.env.FORGE_WORKSPACE_ROOT
-      } else {
-        process.env.FORGE_WORKSPACE_ROOT = previousRoot
-      }
       await fs.rm(workspaceRoot, { recursive: true, force: true })
     }
   })
 
-  it('removes a Forge-owned project directory with a matching marker', async () => {
+  it('archives a Forge-owned project without touching its directory', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const previousRoot = process.env.FORGE_WORKSPACE_ROOT
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-delete-owned-'))
@@ -1132,18 +1146,26 @@ describe('DELETE /api/projects/:id — file deletion boundary', () => {
       `${JSON.stringify({ projectId: 'project-delete' })}\n`,
     )
     mockDbSelect.mockReturnValue(chain([projectRow(localPath)]))
-    mockDbDelete.mockReturnValue(chain(undefined))
+    mockDbUpdate.mockReturnValue(chain(undefined))
 
     try {
       const { DELETE } = await import('@/app/api/projects/[id]/route')
-      const res = await DELETE(nextAuthRequest('/api/projects/project-delete?deleteFiles=true') as never, {
+      const res = await DELETE(nextAuthRequest('/api/projects/project-delete') as never, {
         params: Promise.resolve({ id: 'project-delete' }),
       })
 
       expect(res.status).toBe(200)
       const body = await res.json()
-      expect(body.filesDeleted).toBe(true)
-      await expect(fs.stat(localPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(body).toMatchObject({
+        archived: true,
+        filesDeleted: false,
+        fileDeletionSkippedReason: 'retained_release_evidence',
+      })
+      expect(mockDbUpdate).toHaveBeenCalled()
+      expect(mockDbDelete).not.toHaveBeenCalled()
+      await expect(fs.readFile(path.join(localPath, 'forge.project.json'), 'utf-8')).resolves.toContain(
+        'project-delete',
+      )
     } finally {
       if (previousRoot === undefined) {
         delete process.env.FORGE_WORKSPACE_ROOT
@@ -1154,7 +1176,7 @@ describe('DELETE /api/projects/:id — file deletion boundary', () => {
     }
   })
 
-  it('removes only the DB record when deleteFiles targets an external local path', async () => {
+  it('archives an external project path without deleting its files', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const previousRoot = process.env.FORGE_WORKSPACE_ROOT
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-delete-external-workspace-'))
@@ -1163,22 +1185,21 @@ describe('DELETE /api/projects/:id — file deletion boundary', () => {
     await fs.writeFile(externalFile, 'do not delete\n')
     process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
     mockDbSelect.mockReturnValue(chain([projectRow(externalRoot)]))
-    mockDbDelete.mockReturnValue(chain(undefined))
+    mockDbUpdate.mockReturnValue(chain(undefined))
 
     try {
       const { DELETE } = await import('@/app/api/projects/[id]/route')
-      const res = await DELETE(nextAuthRequest('/api/projects/project-delete?deleteFiles=true') as never, {
+      const res = await DELETE(nextAuthRequest('/api/projects/project-delete') as never, {
         params: Promise.resolve({ id: 'project-delete' }),
       })
 
       expect(res.status).toBe(200)
       const body = await res.json()
       expect(body.filesDeleted).toBe(false)
-      expect(body.fileDeletionSkippedReason).toBe('outside_forge_managed_projects')
-      expect(body.fileDeletionMessage).toMatch(/outside Forge-managed projects/i)
-      expect(body.localPath).toBe(externalRoot)
-      expect(body.displayLocalPath).toBe(externalRoot)
-      expect(mockDbDelete).toHaveBeenCalled()
+      expect(body.fileDeletionSkippedReason).toBe('retained_release_evidence')
+      expect(body.fileDeletionMessage).toMatch(/archived the project record/i)
+      expect(mockDbUpdate).toHaveBeenCalled()
+      expect(mockDbDelete).not.toHaveBeenCalled()
       await expect(fs.readFile(externalFile, 'utf-8')).resolves.toBe('do not delete\n')
     } finally {
       if (previousRoot === undefined) {
@@ -1295,11 +1316,12 @@ describe('GET /api/filesystem/directories — folder selector', () => {
     }
   })
 
-  it('defaults to the active workspace projects directory', async () => {
+  it('defaults to the active workspace projects directory without bootstrapping workspace files', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const previousRoot = process.env.FORGE_WORKSPACE_ROOT
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-workspace-test-'))
     process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    await fs.mkdir(path.join(workspaceRoot, 'projects'))
 
     try {
       const { GET } = await import('@/app/api/filesystem/directories/route')
@@ -1308,9 +1330,9 @@ describe('GET /api/filesystem/directories — folder selector', () => {
       expect(res.status).toBe(200)
       const body = await res.json()
       expect(body.path).toBe(path.join(workspaceRoot, 'projects'))
-      await expect(fs.stat(path.join(workspaceRoot, 'mcps'))).resolves.toMatchObject({})
-      await expect(fs.stat(path.join(workspaceRoot, 'templates'))).resolves.toMatchObject({})
-      await expect(fs.stat(path.join(workspaceRoot, 'global-settings.json'))).resolves.toMatchObject({})
+      await expect(fs.stat(path.join(workspaceRoot, 'mcps'))).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(fs.stat(path.join(workspaceRoot, 'templates'))).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(fs.stat(path.join(workspaceRoot, 'global-settings.json'))).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
       if (previousRoot === undefined) {
         delete process.env.FORGE_WORKSPACE_ROOT
@@ -1816,6 +1838,8 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
         requiredMcps: ['filesystem', 'github'],
         overrides: {},
       },
+      grantDecisionRevision: BigInt(0),
+      rootBindingRevision: BigInt(1),
       defaultBranch: 'main',
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -1880,6 +1904,12 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
           '/Forge Workspace/mcps/filesystem',
           '/Forge Workspace/mcps/github',
         ])
+        expect(mockGetProjectMcpOverview).toHaveBeenCalledWith(
+          project,
+          null,
+          { cache: false, ensureWorkspace: false },
+        )
+        expect(mockDbInsert).not.toHaveBeenCalled()
       })
     } finally {
       if (previousDisplayRoot === undefined) {
@@ -1981,7 +2011,6 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
 
     await withWorkspaceProject(async (project) => {
       mockDbSelect
-        .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
         .mockReturnValueOnce(chain([project]))
         .mockReturnValueOnce(chain([
           {
@@ -2196,7 +2225,7 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
           ...project.mcpConfig,
           grants: {
             filesystem: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               mcpId: 'filesystem',
               status: 'approved',
               grantMode: 'always_allow',
@@ -2205,6 +2234,8 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
               approvedAt: '2026-07-05T00:00:00.000Z',
               approvedBy: 'user-abc',
               reason: 'Trusted project',
+              grantDecisionRevision: '1',
+              rootBindingRevision: '1',
             },
           },
         },
@@ -2402,42 +2433,18 @@ describe('GET /api/projects/:id — 404 when project not found', () => {
     expect(body.error).toMatch(/not found/i)
   })
 
-  it('claims a legacy null-owned project for bootstrap-owner direct lookups', async () => {
+  it('keeps legacy null-owned project reads non-mutating until bootstrap ownership is assigned', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
-    const claimedProject = {
-      id: 'project-legacy',
-      name: 'Legacy Project',
-      submittedBy: 'user-abc',
-      githubRepo: null,
-      localPath: null,
-      githubTokenEnvVar: null,
-      pmProviderConfigId: null,
-      mcpConfig: {
-        profile: 'default',
-        requiredMcps: ['filesystem', 'github'],
-        overrides: {},
-      },
-      defaultBranch: 'main',
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      archivedAt: null,
-    }
-    mockDbSelect
-      .mockReturnValueOnce(chain([]))
-      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
-    mockDbUpdate.mockReturnValue(chain([claimedProject]))
+    mockDbSelect.mockReturnValueOnce(chain([]))
 
     const { GET } = await import('@/app/api/projects/[id]/route')
     const res = await GET(authRequest('/api/projects/project-legacy') as never, {
       params: Promise.resolve({ id: 'project-legacy' }),
     })
 
-    expect(res.status).toBe(200)
-    const body = await res.json()
-    expect(body.project).toMatchObject({
-      id: 'project-legacy',
-      submittedBy: 'user-abc',
-    })
+    expect(res.status).toBe(404)
+    expect(mockDbSelect).toHaveBeenCalledOnce()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
   })
 })
 
@@ -2752,13 +2759,12 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
     )
   })
 
-  it('hard-deletes an individual task when mode=delete is requested', async () => {
+  it.each(['completed', 'failed', 'cancelled', 'rejected'])('retains a terminal %s task instead of reaching immutable grant-history foreign keys', async (status) => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect.mockReturnValue(chain([{
       id: 'task-delete',
-      status: 'completed',
+      status,
     }]))
-    mockDbDelete.mockReturnValue(chain([{ id: 'task-delete' }]))
 
     const { DELETE } = await import('@/app/api/tasks/[id]/route')
     const req = authRequest('/api/tasks/task-delete?mode=delete', { method: 'DELETE' })
@@ -2766,10 +2772,10 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
 
     const res = await DELETE(req as never, { params })
 
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(409)
     const body = await res.json()
-    expect(body).toEqual({ ok: true, mode: 'delete' })
-    expect(mockDbDelete).toHaveBeenCalled()
+    expect(body.error).toMatch(/retains task, run, review, and immutable filesystem-grant evidence/i)
+    expect(mockDbDelete).not.toHaveBeenCalled()
   })
 
   it('rejects hard-delete for active tasks so operators must stop them first', async () => {
@@ -2791,13 +2797,12 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
     expect(mockDbDelete).not.toHaveBeenCalled()
   })
 
-  it('rejects hard-delete when the task stops being terminal before delete commits', async () => {
+  it('never reaches a terminal task delete because retention is unconditional', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect.mockReturnValue(chain([{
       id: 'task-raced-delete',
       status: 'failed',
     }]))
-    mockDbDelete.mockReturnValue(chain([]))
 
     const { DELETE } = await import('@/app/api/tasks/[id]/route')
     const req = authRequest('/api/tasks/task-raced-delete?mode=delete', { method: 'DELETE' })
@@ -2807,8 +2812,8 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
 
     expect(res.status).toBe(409)
     const body = await res.json()
-    expect(body.error).toMatch(/no longer terminal/i)
-    expect(mockDbDelete).toHaveBeenCalled()
+    expect(body.error).toMatch(/retains task, run, review, and immutable filesystem-grant evidence/i)
+    expect(mockDbDelete).not.toHaveBeenCalled()
   })
 })
 
@@ -3760,13 +3765,14 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     gateUpdate.set = vi.fn(() => gateUpdate)
     const projectRow = {
       id: 'project-1',
+      rootBindingRevision: BigInt(1),
       mcpConfig: {
           profile: 'default' as const,
           requiredMcps: ['filesystem'],
           overrides: {},
           grants: {
             filesystem: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               mcpId: 'filesystem',
               status: 'approved',
               grantMode: 'always_allow',
@@ -3775,12 +3781,29 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
               approvedAt: '2026-07-05T00:00:00.000Z',
               approvedBy: FAKE_SESSION.userId,
               reason: 'Trusted project.',
+              grantDecisionRevision: '1',
+              rootBindingRevision: '1',
             },
           },
         },
     }
     const fixedOverview = {
-      projectId: 'project-1', config: projectRow.mcpConfig, catalog: [], mcpsRoot: '/tmp/mcps',
+      projectId: 'project-1', rootBindingRevision: '1', config: projectRow.mcpConfig, catalog: [], mcpsRoot: '/tmp/mcps',
+      filesystemGrantDecision: {
+        schemaVersion: 2 as const,
+        decisionId: 'grant-approval-1',
+        projectId: 'project-1',
+        decision: 'approved' as const,
+        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        grantDecisionRevision: '1',
+        rootBindingRevision: '1',
+        decisionFingerprint: `sha256:${'1'.repeat(64)}`,
+        decisionGeneration: '1',
+        decidedAt: '2026-07-05T00:00:00.000Z',
+        decidedBy: FAKE_SESSION.userId,
+        reason: 'Trusted project.',
+        revocationReason: null,
+      },
       statuses: [{
         mcpId: 'filesystem', displayName: 'Filesystem', description: '', installPath: '/tmp/mcps/filesystem',
         installState: 'installed' as const, status: 'healthy' as const, enabled: true, error: null,
@@ -3794,6 +3817,9 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       decisions: [expect.objectContaining({ mode: 'bounded_context_approved', admissionStatus: 'allowed' })],
     })
     mockGetProjectMcpOverview.mockResolvedValueOnce(fixedOverview)
+    mockLoadCurrentProjectFilesystemDecision
+      .mockResolvedValueOnce(fixedOverview.filesystemGrantDecision)
+      .mockResolvedValueOnce(fixedOverview.filesystemGrantDecision)
     mockDbSelect
       .mockReturnValueOnce(chain([awaitingTask]))
       .mockReturnValueOnce(chain([projectRow]))
@@ -3865,6 +3891,8 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       mcpRequirements: approvedPackage.mcpRequirements,
       metadata: approvedPackage.metadata,
       projectMcpConfig: projectRow.mcpConfig,
+      projectFilesystemDecision: fixedOverview.filesystemGrantDecision,
+      projectRootBindingRevision: projectRow.rootBindingRevision,
       title: approvedPackage.title,
     })
     expect(broker).toMatchObject({
@@ -3882,6 +3910,7 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     if (updateFallback) mockDbUpdate.mockImplementation(updateFallback)
     mockGetProjectMcpOverview.mockReset()
     mockGetProjectMcpOverview.mockResolvedValueOnce(fixedOverview)
+    mockLoadCurrentProjectFilesystemDecision.mockResolvedValueOnce(fixedOverview.filesystemGrantDecision)
     mockDbSelect
       .mockReturnValueOnce(chain([approvedPackage]))
       .mockReturnValueOnce(chain([]))
@@ -3891,11 +3920,13 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
         localPath: null,
         mcpConfig: projectRow.mcpConfig,
         projectId: projectRow.id,
+        rootBindingRevision: projectRow.rootBindingRevision,
       }]))
       .mockReturnValueOnce(chain([{
         id: projectRow.id,
         localPath: null,
         mcpConfig: projectRow.mcpConfig,
+        rootBindingRevision: projectRow.rootBindingRevision,
       }]))
       .mockReturnValueOnce(chain([{
         id: 'task-approval',
@@ -4073,7 +4104,7 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
   it('preserves explicit filesystem effective grants when approving the plan', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const explicitEffective = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       phase: 'effective',
       source: 'explicit-grant-approval',
       grantApprovalId: 'grant-approval-1',
@@ -4081,6 +4112,8 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       runtimeIssued: false,
       runtimeEnforcement: 'bounded_context_packet',
       status: 'approved',
+      grantDecisionRevision: '1',
+      rootBindingRevision: '1',
       grants: [{
         mcpId: 'filesystem',
         status: 'approved',
@@ -4121,7 +4154,7 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     const gateUpdate = chain([{ id: 'gate-1' }])
     gateUpdate.set = vi.fn(() => gateUpdate)
     mockGetProjectMcpOverview.mockResolvedValueOnce({
-      projectId: 'project-1', config: {}, catalog: [], mcpsRoot: '/tmp/mcps',
+      projectId: 'project-1', rootBindingRevision: '1', config: {}, catalog: [], mcpsRoot: '/tmp/mcps',
       statuses: [{
         mcpId: 'filesystem', displayName: 'Filesystem', description: '', installPath: '/tmp/mcps/filesystem',
         installState: 'installed', status: 'healthy', enabled: true, error: null,
@@ -4131,8 +4164,8 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     })
     mockDbSelect
       .mockReturnValueOnce(chain([awaitingTask]))
-      .mockReturnValueOnce(chain([{ id: 'project-1', mcpConfig: {} }]))
-      .mockReturnValueOnce(chain([{ id: 'project-1', mcpConfig: {} }]))
+      .mockReturnValueOnce(chain([{ id: 'project-1', mcpConfig: {}, rootBindingRevision: BigInt(1) }]))
+      .mockReturnValueOnce(chain([{ id: 'project-1', mcpConfig: {}, rootBindingRevision: BigInt(1) }]))
       .mockReturnValueOnce(chain([awaitingTask]))
       .mockReturnValueOnce(chain([workPackageRow]))
     mockDbUpdate
@@ -5216,6 +5249,8 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         requiredMcps: ['filesystem'],
         overrides: {},
       },
+      grantDecisionRevision: BigInt(0),
+      rootBindingRevision: BigInt(1),
       defaultBranch: 'main',
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -5266,24 +5301,111 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     }
   }
 
+  function strictGrantBlockMarker() {
+    return canonicalS3Marker({
+      holdKind: 'approval_required',
+      grantPhase: 'not_issued',
+      grantConsumed: false,
+      grantDecisionRevision: null,
+      revocationReason: null,
+    })
+  }
+
   function mockTaskGrantTransactionLocks(input: {
     packages: Array<Record<string, unknown>>
     project: Record<string, unknown>
     task: Record<string, unknown>
   }) {
+    const lockedProject = {
+      grantDecisionRevision: BigInt(0),
+      rootBindingRevision: BigInt(1),
+      mcpConfig: {},
+      ...input.project,
+    }
+    const pointerRows = input.packages.slice(0, 1).map((pkg, index) => ({
+      id: `00000000-0000-4000-8000-${String(700 + index).padStart(12, '0')}`,
+      taskId: pkg.taskId,
+      workPackageId: pkg.id,
+      currentDecisionId: null,
+      currentDecisionTaskId: null,
+      currentDecisionWorkPackageId: null,
+      currentDecisionRevision: null,
+      currentDecisionFingerprint: null,
+      pointerFingerprint: `empty:${String(pkg.id)}`,
+      pointerVersion: BigInt(0),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }))
+    const projectPointer = {
+      projectId: String((lockedProject as Record<string, unknown>).id),
+      currentDecisionId: null,
+      currentDecisionProjectId: null,
+      currentDecisionRevision: null,
+      currentRootBindingRevision: null,
+      currentDecisionFingerprint: null,
+      currentDecisionGeneration: null,
+      pointerGeneration: BigInt(0),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }
     const transactionSelect = vi.fn()
-      .mockReturnValueOnce(chain([input.project]))
+      .mockReturnValueOnce(chain([lockedProject]))
       .mockReturnValueOnce(chain([input.task]))
       .mockReturnValueOnce(chain(input.packages))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([projectPointer]))
+      .mockReturnValueOnce(chain(pointerRows))
       .mockImplementation(() => mockDbSelect())
+    const projectUpdate = chain([])
+    let projectValues: Record<string, unknown> = {}
+    projectUpdate.set = vi.fn((values: Record<string, unknown>) => {
+      projectValues = values
+      return projectUpdate
+    })
+    projectUpdate.returning = vi.fn(() => chain([{ ...lockedProject, ...projectValues }]))
+    const dynamicUpdate = (row: Record<string, unknown>) => {
+      const update = chain([])
+      let values: Record<string, unknown> = {}
+      update.set = vi.fn((next: Record<string, unknown>) => {
+        values = next
+        return update
+      })
+      update.returning = vi.fn(() => chain([{ ...row, ...values }]))
+      return update
+    }
+    const transactionUpdate = vi.fn((table: Parameters<typeof getTableName>[0]) => {
+      const tableName = getTableName(table)
+      if (tableName === 'projects') return projectUpdate
+      if (tableName === 'project_filesystem_current_decision_pointers') return dynamicUpdate(projectPointer)
+      const configured = mockDbUpdate(table)
+      if (configured) return configured
+      if (tableName === 'work_packages') return dynamicUpdate(input.packages[0] ?? {})
+      if (tableName === 'tasks') return dynamicUpdate(input.task)
+      return dynamicUpdate({})
+    })
+    const transactionInsert = vi.fn((table: Parameters<typeof getTableName>[0]) => {
+      if (getTableName(table) !== 'project_filesystem_grant_decisions') return mockDbInsert(table)
+      const insert = chain([])
+      let values: Record<string, unknown> = {}
+      insert.values = vi.fn((next: Record<string, unknown>) => {
+        values = next
+        return insert
+      })
+      insert.returning = vi.fn(() => chain([values]))
+      return insert
+    })
+    mockDbSelect.mockImplementation(() => chain([]))
     mockDbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) =>
       callback({
         select: transactionSelect,
-        insert: mockDbInsert,
-        update: mockDbUpdate,
+        insert: transactionInsert,
+        update: transactionUpdate,
         delete: mockDbDelete,
+        execute: vi.fn(async () => [{ now: '2026-07-03 00:01:00+00' }]),
       }),
     )
+    return { projectUpdate }
   }
 
   it('approves edited read-only filesystem grants and persists an effective phase', async () => {
@@ -5356,23 +5478,48 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
 
       expect(res.status).toBe(200)
       const packageSetMock = packageUpdate.set as unknown as { mock: { calls: Array<[{ metadata?: { queryChunks?: unknown[] } }]> } }
-      const phasesJson = packageSetMock.mock.calls[0][0].metadata?.queryChunks
-        ?.find((chunk): chunk is string => typeof chunk === 'string' && chunk.includes('"source":"explicit-grant-approval"'))
-      expect(JSON.parse(phasesJson as string)).toMatchObject({
-        effective: {
-          grantMode: 'allow_once',
-          source: 'explicit-grant-approval',
-          scope: 'next_context_issue',
-          runtimeEnforcement: 'bounded_context_packet',
-          status: 'approved',
-          grants: [expect.objectContaining({
-            mcpId: 'filesystem',
-            capabilities: ['filesystem.project.read'],
-            grantMode: 'allow_once',
-          })],
-        },
-      })
+      const phaseSql = flattenSqlChunks(packageSetMock.mock.calls[0][0].metadata)
+      expect(phaseSql).toContain('"source":"explicit-grant-approval"')
+      expect(phaseSql).toContain('"grantMode":"allow_once"')
+      expect(phaseSql).toContain('"capabilities":["filesystem.project.read"]')
     })
+  })
+
+  it('blocks an always-allow project grant before any database write when project ingress is closed', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValueOnce(chain([grantTask()]))
+    mockGuardEpic172ProjectManagementIngress.mockResolvedValueOnce(Response.json(
+      {
+        code: 'epic_172_project_management_ingress_closed',
+        error: 'Project management is temporarily disabled while release safety checks are incomplete.',
+        reason: 'disabled',
+      },
+      { status: 503 },
+    ))
+
+    const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
+    const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        schemaVersion: 1,
+        grants: [{
+          workPackageId: FS_GRANT_PACKAGE_ID,
+          decision: 'approved',
+          capabilities: ['filesystem.project.read'],
+          grantMode: 'always_allow',
+        }],
+      }),
+    }) as never, {
+      params: Promise.resolve({ id: 'task-fs-grant' }),
+    })
+
+    expect(res.status).toBe(503)
+    expect(mockGuardEpic172ProjectManagementIngress).toHaveBeenCalledOnce()
+    expect(mockDbSelect).not.toHaveBeenCalled()
+    expect(mockDbTransaction).not.toHaveBeenCalled()
+    expect(mockDbInsert).not.toHaveBeenCalled()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
   })
 
   it('persists always-allow filesystem grants on the project MCP config', async () => {
@@ -5389,8 +5536,6 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
 
     await withFilesystemProject(async (project, filesystemPath) => {
       const pkg = grantPackage()
-      const projectUpdate = chain([project])
-      projectUpdate.set = vi.fn(() => projectUpdate)
       const approvalUpdate = chain([{
         id: FS_GRANT_APPROVAL_ID,
         taskId: 'task-fs-grant',
@@ -5411,13 +5556,12 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([pkg]))
         .mockReturnValueOnce(chain([pkg]))
         .mockReturnValue(chain([pkg]))
-      mockTaskGrantTransactionLocks({
+      const { projectUpdate } = mockTaskGrantTransactionLocks({
         packages: [pkg],
         project,
         task: grantTask(project.id as string),
       })
       mockDbUpdate
-        .mockReturnValueOnce(projectUpdate)
         .mockReturnValueOnce(approvalUpdate)
         .mockReturnValueOnce(packageUpdate)
 
@@ -5445,7 +5589,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
           grants: expect.objectContaining({
             filesystem: expect.objectContaining({
               capabilities: ['filesystem.project.read', 'filesystem.project.search'],
-              grantApprovalId: FS_GRANT_APPROVAL_ID,
+              grantApprovalId: expect.any(String),
               grantMode: 'always_allow',
               status: 'approved',
             }),
@@ -5457,19 +5601,22 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
 
   it('reconciles failed package grant blocks when enabling the project filesystem grant', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
-    mockDbInsert.mockReturnValue(chain(undefined))
+    mockDbInsert.mockReturnValue(chain([{
+      id: FS_GRANT_APPROVAL_ID,
+      decision: 'approved',
+      capabilities: ['filesystem.project.read', 'filesystem.project.list', 'filesystem.project.search'],
+    }]))
 
     await withFilesystemProject(async (project, filesystemPath) => {
       const failedPkg = {
         ...grantPackage({
-          mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' },
+          mcpGrantBlock: strictGrantBlockMarker(),
         }),
         blockedReason: 'Missing filesystem grant.',
-        status: 'failed',
+        status: 'blocked',
       }
-      const projectUpdate = chain([project])
-      projectUpdate.set = vi.fn(() => projectUpdate)
-      const packageUpdate = chain([failedPkg])
+      const recoveredPkg = { ...failedPkg, blockedReason: null, status: 'ready' }
+      const packageUpdate = chain([recoveredPkg])
       packageUpdate.set = vi.fn(() => packageUpdate)
       const taskUpdate = chain([{ ...grantTask(project.id as string, 'approved'), updatedAt: new Date('2026-07-03T00:02:00.000Z') }])
       taskUpdate.set = vi.fn(() => taskUpdate)
@@ -5481,8 +5628,12 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([grantTask(project.id as string, 'failed')]))
         .mockReturnValueOnce(chain([failedPkg]))
         .mockReturnValueOnce(chain([]))
+      mockTaskGrantTransactionLocks({
+        packages: [failedPkg],
+        project,
+        task: grantTask(project.id as string, 'failed'),
+      })
       mockDbUpdate
-        .mockReturnValueOnce(projectUpdate)
         .mockReturnValueOnce(packageUpdate)
         .mockReturnValueOnce(taskUpdate)
 
@@ -5498,16 +5649,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       expect(res.status).toBe(200)
       expect(packageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
         blockedReason: null,
-        metadata: expect.objectContaining({
-          mcpGrantPhases: expect.objectContaining({
-            effective: expect.objectContaining({
-              source: 'project-filesystem-approval',
-              status: 'approved',
-            }),
-          }),
-        }),
         status: 'ready',
       }))
+      const packageSetMock = packageUpdate.set as unknown as { mock: { calls: Array<[{ metadata?: unknown }]> } }
+      expect(flattenSqlChunks(packageSetMock.mock.calls[0][0].metadata)).toContain('project-filesystem-approval')
+      expect(flattenSqlChunks(packageSetMock.mock.calls[0][0].metadata)).toContain('mcpGrantBlock')
       expect(taskUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
         errorMessage: null,
         status: 'approved',
@@ -5516,26 +5662,29 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         taskId: 'task-fs-grant',
         action: 'approve',
       }))
-      expect(mockRedisPublish).toHaveBeenCalledWith('forge:task:task-fs-grant', expect.any(String))
+      expect(mockRedisPublish).not.toHaveBeenCalled()
     })
   })
 
   it('returns 202 when project grant recovery cannot enqueue the worker job', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
-    mockDbInsert.mockReturnValue(chain(undefined))
+    mockDbInsert.mockReturnValue(chain([{
+      id: FS_GRANT_APPROVAL_ID,
+      decision: 'approved',
+      capabilities: ['filesystem.project.read', 'filesystem.project.list', 'filesystem.project.search'],
+    }]))
     mockRedisLpush.mockRejectedValueOnce(new Error('redis offline'))
 
     await withFilesystemProject(async (project, filesystemPath) => {
       const failedPkg = {
         ...grantPackage({
-          mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' },
+          mcpGrantBlock: strictGrantBlockMarker(),
         }),
         blockedReason: 'Missing filesystem grant.',
-        status: 'failed',
+        status: 'blocked',
       }
-      const projectUpdate = chain([project])
-      projectUpdate.set = vi.fn(() => projectUpdate)
-      const packageUpdate = chain([failedPkg])
+      const recoveredPkg = { ...failedPkg, blockedReason: null, status: 'ready' }
+      const packageUpdate = chain([recoveredPkg])
       packageUpdate.set = vi.fn(() => packageUpdate)
       const taskUpdate = chain([{ ...grantTask(project.id as string, 'approved'), updatedAt: new Date('2026-07-03T00:02:00.000Z') }])
       taskUpdate.set = vi.fn(() => taskUpdate)
@@ -5547,8 +5696,12 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([grantTask(project.id as string, 'failed')]))
         .mockReturnValueOnce(chain([failedPkg]))
         .mockReturnValueOnce(chain([]))
+      mockTaskGrantTransactionLocks({
+        packages: [failedPkg],
+        project,
+        task: grantTask(project.id as string, 'failed'),
+      })
       mockDbUpdate
-        .mockReturnValueOnce(projectUpdate)
         .mockReturnValueOnce(packageUpdate)
         .mockReturnValueOnce(taskUpdate)
 
@@ -5563,7 +5716,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
 
       expect(res.status).toBe(202)
       const body = await res.json()
-      expect(body.error).toContain('could not enqueue')
+      expect(body.error).toContain('wake-ups failed')
       expect(body.failedTaskIds).toEqual(['task-fs-grant'])
       expect(body.recoveredTaskIds).toEqual(['task-fs-grant'])
       expect(mockRedisPublish).not.toHaveBeenCalled()
@@ -5621,15 +5774,10 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
 
     expect(res.status).toBe(200)
     const packageSetMock = packageUpdate.set as unknown as { mock: { calls: Array<[{ metadata?: { queryChunks?: unknown[] } }]> } }
-    const phasesJson = packageSetMock.mock.calls[0][0].metadata?.queryChunks
-      ?.find((chunk): chunk is string => typeof chunk === 'string' && chunk.includes('"status":"denied"'))
-    expect(JSON.parse(phasesJson as string)).toMatchObject({
-      effective: {
-        source: 'explicit-grant-approval',
-        status: 'denied',
-        deniedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-      },
-    })
+    const phaseSql = flattenSqlChunks(packageSetMock.mock.calls[0][0].metadata)
+    expect(phaseSql).toContain('"source":"explicit-grant-approval"')
+    expect(phaseSql).toContain('"status":"denied"')
+    expect(phaseSql).toContain('"deniedCapabilities":["filesystem.project.read","filesystem.project.search"]')
   })
 
   it('rejects filesystem write capability approvals', async () => {
@@ -5831,16 +5979,9 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     await withFilesystemProject(async (project, filesystemPath) => {
       const failedPkg = {
         ...grantPackage({
-          mcpGrantBlock: {
-            blockedAt: '2026-07-03T00:00:30.000Z',
-            missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            reason: 'Work package "Read project files" requires filesystem grant approval.',
-            requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            source: 'filesystem-grant-approval',
-            status: 'failed',
-          },
+          mcpGrantBlock: strictGrantBlockMarker(),
         }),
-        status: 'failed',
+        status: 'blocked',
         blockedReason: 'Work package "Read project files" requires filesystem grant approval.',
       }
       const recoveredPkg = { ...failedPkg, blockedReason: null, status: 'ready' }
@@ -5898,7 +6039,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         status: 'ready',
       }))
       const packageSetMock = packageUpdate.set as unknown as { mock: { calls: Array<[{ metadata?: unknown }]> } }
-      expect(flattenSqlChunks(packageSetMock.mock.calls[0][0].metadata)).toContain(`- 'mcpGrantBlock'`)
+      expect(flattenSqlChunks(packageSetMock.mock.calls[0][0].metadata)).toContain('- mcpGrantBlock')
       expect(taskUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
         errorMessage: null,
         status: 'approved',
@@ -5925,16 +6066,9 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
 
     const failedPkg = {
       ...grantPackage({
-        mcpGrantBlock: {
-          blockedAt: '2026-07-03T00:00:30.000Z',
-          missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-          reason: 'Work package "Read project files" requires filesystem grant approval.',
-          requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-          source: 'filesystem-grant-approval',
-          status: 'failed',
-        },
+        mcpGrantBlock: strictGrantBlockMarker(),
       }),
-      status: 'failed',
+      status: 'blocked',
       blockedReason: 'Work package "Read project files" requires filesystem grant approval.',
     }
     const deniedPkg = {
@@ -5986,7 +6120,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
 
     expect(res.status).toBe(200)
     expect(packageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      blockedReason: 'Filesystem grant denied by operator; execution remains blocked.',
+      blockedReason: expect.stringContaining('operator decision'),
       status: 'blocked',
     }))
     expect(mockRedisLpush).not.toHaveBeenCalled()
@@ -6009,14 +6143,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     await withFilesystemProject(async (project, filesystemPath) => {
       const blockedPkg = {
         ...grantPackage({
-          mcpGrantBlock: {
-            blockedAt: '2026-07-03T00:00:30.000Z',
-            missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            reason: 'Work package "Read project files" requires filesystem grant approval.',
-            requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            source: 'filesystem-grant-approval',
-            status: 'failed',
-          },
+          mcpGrantBlock: strictGrantBlockMarker(),
         }),
         status: 'blocked',
         blockedReason: 'Filesystem grant denied by operator; execution remains blocked.',
@@ -6101,16 +6228,9 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     await withFilesystemProject(async (project, filesystemPath) => {
       const failedPkg = {
         ...grantPackage({
-          mcpGrantBlock: {
-            blockedAt: '2026-07-03T00:00:30.000Z',
-            missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            reason: 'Work package "Read project files" requires filesystem grant approval.',
-            requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            source: 'filesystem-grant-approval',
-            status: 'failed',
-          },
+          mcpGrantBlock: strictGrantBlockMarker(),
         }),
-        status: 'failed',
+        status: 'blocked',
         blockedReason: 'Work package "Read project files" requires filesystem grant approval.',
       }
       const recoveredPkg = { ...failedPkg, blockedReason: null, status: 'ready' }
@@ -6134,10 +6254,18 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([failedPkg]))
         .mockReturnValueOnce(chain([{
           status: 'failed',
-          metadata: { mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' } },
+          metadata: {},
         }]))
       mockTaskGrantTransactionLocks({
-        packages: [failedPkg],
+        packages: [
+          failedPkg,
+          {
+            ...grantPackage(),
+            id: '00000000-0000-4000-8000-000000000212',
+            status: 'failed',
+            metadata: {},
+          },
+        ],
         project,
         task: grantTask(project.id as string, 'failed'),
       })
@@ -6184,16 +6312,9 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     await withFilesystemProject(async (project, filesystemPath) => {
       const failedPkg = {
         ...grantPackage({
-          mcpGrantBlock: {
-            blockedAt: '2026-07-03T00:00:30.000Z',
-            missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            reason: 'Work package "Read project files" requires filesystem grant approval.',
-            requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            source: 'filesystem-grant-approval',
-            status: 'failed',
-          },
+          mcpGrantBlock: strictGrantBlockMarker(),
         }),
-        status: 'failed',
+        status: 'blocked',
         blockedReason: 'Work package "Read project files" requires filesystem grant approval.',
       }
       const recoveredPkg = { ...failedPkg, blockedReason: null, status: 'ready' }
@@ -6217,10 +6338,18 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([failedPkg]))
         .mockReturnValueOnce(chain([{
           status: 'blocked',
-          metadata: { mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' } },
+          metadata: { mcpGrantBlock: strictGrantBlockMarker() },
         }]))
       mockTaskGrantTransactionLocks({
-        packages: [failedPkg],
+        packages: [
+          failedPkg,
+          {
+            ...grantPackage(),
+            id: '00000000-0000-4000-8000-000000000212',
+            status: 'blocked',
+            metadata: { mcpGrantBlock: strictGrantBlockMarker() },
+          },
+        ],
         project,
         task: grantTask(project.id as string, 'failed'),
       })
@@ -6305,16 +6434,9 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     await withFilesystemProject(async (project, filesystemPath) => {
       const failedPkg = {
         ...grantPackage({
-          mcpGrantBlock: {
-            blockedAt: '2026-07-03T00:00:30.000Z',
-            missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            reason: 'Work package "Read project files" requires filesystem grant approval.',
-            requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            source: 'filesystem-grant-approval',
-            status: 'failed',
-          },
+          mcpGrantBlock: strictGrantBlockMarker(),
         }),
-        status: 'failed',
+        status: 'blocked',
         blockedReason: 'Work package "Read project files" requires filesystem grant approval.',
       }
       const recoveredPkg = { ...failedPkg, blockedReason: null, status: 'ready' }
@@ -6383,6 +6505,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       .mockReturnValueOnce(chain([grantTask('project-fs-grant', 'failed')]))
       .mockReturnValueOnce(chain([{ id: 'project-fs-grant' }]))
       .mockReturnValueOnce(chain([failedPkg]))
+    mockTaskGrantTransactionLocks({
+      packages: [failedPkg],
+      project: { id: 'project-fs-grant', mcpConfig: {} },
+      task: grantTask('project-fs-grant', 'failed'),
+    })
 
     const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
     const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
@@ -6415,6 +6542,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       .mockReturnValueOnce(chain([grantTask('project-fs-grant', 'failed')]))
       .mockReturnValueOnce(chain([{ id: 'project-fs-grant' }]))
       .mockReturnValueOnce(chain([failedPkg]))
+    mockTaskGrantTransactionLocks({
+      packages: [failedPkg],
+      project: { id: 'project-fs-grant', mcpConfig: {} },
+      task: grantTask('project-fs-grant', 'failed'),
+    })
 
     const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
     const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
@@ -7969,7 +8101,6 @@ describe('GET /api/tasks — includes project name', () => {
     }
 
     mockDbSelect
-      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([listedTask]))
       .mockReturnValueOnce(chain([{ total: 1 }]))
 
@@ -8013,7 +8144,6 @@ describe('GET /api/tasks/summary', () => {
   it('aggregates task statuses and returns the latest attention tasks', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect
-      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([
         { status: 'pending', total: 2 },
         { status: 'running', total: 1 },
@@ -8052,13 +8182,12 @@ describe('GET /api/tasks/summary', () => {
         { id: 'task-failed', title: 'Investigate failure', status: 'failed' },
       ],
     })
-    expect(mockDbSelect).toHaveBeenCalledTimes(3)
+    expect(mockDbSelect).toHaveBeenCalledTimes(2)
   })
 
   it('returns 500 when the summary query fails', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect
-      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(rejectingChain(new Error('database unavailable')))
 
     const { GET } = await import('@/app/api/tasks/summary/route')
@@ -8066,5 +8195,164 @@ describe('GET /api/tasks/summary', () => {
 
     expect(res.status).toBe(500)
     expect(await res.json()).toEqual({ error: 'Internal server error' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Suite 3.10 — Epic 172 disabled ingress covers every mutation family
+// ---------------------------------------------------------------------------
+
+describe('Epic 172 disabled mutation ingress', () => {
+  type InvokeMutation = () => Promise<Response>
+
+  function closedIngressResponse() {
+    return Response.json({
+      code: 'epic_172_project_management_ingress_closed',
+      error: 'Project management is temporarily disabled while release safety checks are incomplete.',
+      reason: 'disabled',
+    }, { status: 503 })
+  }
+
+  const taskParams = { params: Promise.resolve({ id: 'task-closed' }) }
+  const gateParams = { params: Promise.resolve({ id: 'task-closed', gateId: 'gate-closed' }) }
+  const mutationFamilies: Array<[string, InvokeMutation]> = [
+    ['task create and enqueue', async () => {
+      const { POST } = await import('@/app/api/tasks/route')
+      return POST(authRequest('/api/tasks', { method: 'POST' }) as never)
+    }],
+    ['task cancellation', async () => {
+      const { DELETE } = await import('@/app/api/tasks/[id]/route')
+      return DELETE(authRequest('/api/tasks/task-closed', { method: 'DELETE' }) as never, taskParams)
+    }],
+    ['task approval', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+      return POST(authRequest('/api/tasks/task-closed/approve', { method: 'POST' }) as never, taskParams)
+    }],
+    ['task rejection', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/reject/route')
+      return POST(authRequest('/api/tasks/task-closed/reject', { method: 'POST' }) as never, taskParams)
+    }],
+    ['task answers', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/questions/route')
+      return POST(authRequest('/api/tasks/task-closed/questions', { method: 'POST' }) as never, taskParams)
+    }],
+    ['approval-gate decision', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/approval-gates/[gateId]/route')
+      return POST(authRequest('/api/tasks/task-closed/approval-gates/gate-closed', { method: 'POST' }) as never, gateParams)
+    }],
+    ['task replan', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/replan/route')
+      return POST(authRequest('/api/tasks/task-closed/replan', { method: 'POST' }) as never, taskParams)
+    }],
+    ['task retry', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/retry/route')
+      return POST(authRequest('/api/tasks/task-closed/retry', { method: 'POST' }) as never, taskParams)
+    }],
+    ['handoff retry enqueue', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/retry-handoff/route')
+      return POST(authRequest('/api/tasks/task-closed/retry-handoff', { method: 'POST' }) as never, taskParams)
+    }],
+    ['MCP plan review', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/mcp-plan-review/route')
+      return POST(authRequest('/api/tasks/task-closed/mcp-plan-review', { method: 'POST' }) as never, taskParams)
+    }],
+    ['task filesystem grant', async () => {
+      const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
+      return PUT(authRequest('/api/tasks/task-closed/filesystem-grants', { method: 'PUT' }) as never, taskParams)
+    }],
+    ['provider deactivation and task repointing', async () => {
+      const { DELETE } = await import('@/app/api/providers/[id]/route')
+      return DELETE(
+        authRequest('/api/providers/provider-closed', { method: 'DELETE' }) as never,
+        { params: Promise.resolve({ id: 'provider-closed' }) },
+      )
+    }],
+    ['workspace directory creation', async () => {
+      const { POST } = await import('@/app/api/filesystem/directories/route')
+      return POST(authRequest('/api/filesystem/directories', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parentPath: '/never-read', name: 'never-created' }),
+      }) as never)
+    }],
+    ['workspace settings update', async () => {
+      const { PUT } = await import('@/app/api/settings/workspace/route')
+      return PUT(authRequest('/api/settings/workspace', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceRoot: '/never-read' }),
+      }) as never)
+    }],
+  ]
+
+  it.each(mutationFamilies)('returns 503 with zero mutation side effects for %s', async (_name, invoke) => {
+    vi.clearAllMocks()
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockGuardEpic172ProjectManagementIngress.mockImplementation(async () => closedIngressResponse())
+
+    const response = await invoke()
+
+    expect(response.status).toBe(503)
+    expect(mockGuardEpic172ProjectManagementIngress).toHaveBeenCalledOnce()
+    expect(mockDbSelect).not.toHaveBeenCalled()
+    expect(mockDbInsert).not.toHaveBeenCalled()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockDbDelete).not.toHaveBeenCalled()
+    expect(mockDbTransaction).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+    expect(mockRedisPublish).not.toHaveBeenCalled()
+    expect(mockRedisSet).not.toHaveBeenCalled()
+    expect(mockRedisZadd).not.toHaveBeenCalled()
+    expect(mockRedisExpire).not.toHaveBeenCalled()
+    expect(mockRedisDel).not.toHaveBeenCalled()
+    expect(mockDecideReviewGate).not.toHaveBeenCalled()
+    expect(mockExecFile).not.toHaveBeenCalled()
+  })
+
+  it('returns 503 before workspace or directory routes can touch the filesystem', async () => {
+    vi.clearAllMocks()
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockGuardEpic172ProjectManagementIngress.mockImplementation(async () => closedIngressResponse())
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-epic-172-disabled-workspace-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const directoryPath = path.join(workspaceRoot, 'never-created-directory')
+    const replacementRoot = path.join(workspaceRoot, 'never-created-workspace')
+
+    try {
+      const [{ POST }, { PUT }] = await Promise.all([
+        import('@/app/api/filesystem/directories/route'),
+        import('@/app/api/settings/workspace/route'),
+      ])
+      const directoryResponse = await POST(authRequest('/api/filesystem/directories', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parentPath: workspaceRoot, name: path.basename(directoryPath) }),
+      }) as never)
+      const workspaceResponse = await PUT(authRequest('/api/settings/workspace', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceRoot: replacementRoot }),
+      }) as never)
+
+      expect(directoryResponse.status).toBe(503)
+      expect(workspaceResponse.status).toBe(503)
+      expect(mockGuardEpic172ProjectManagementIngress).toHaveBeenCalledTimes(2)
+      await expect(fs.stat(directoryPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(fs.stat(replacementRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(fs.stat(path.join(workspaceRoot, 'global-settings.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(await fs.readdir(workspaceRoot)).toEqual([])
+      expect(mockDbSelect).not.toHaveBeenCalled()
+      expect(mockDbInsert).not.toHaveBeenCalled()
+      expect(mockDbUpdate).not.toHaveBeenCalled()
+      expect(mockRedisLpush).not.toHaveBeenCalled()
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
   })
 })

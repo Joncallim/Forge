@@ -3,6 +3,7 @@ import type { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { getSession } from '@/lib/session'
 import { getAccessibleProject } from '@/lib/project-access'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 import { resolveGitHubToken } from '@/lib/github'
 import {
   createProjectIssue,
@@ -66,6 +67,9 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   try {
     const session = await getSession(request)
     if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
 
     const { id } = await params
     const project = await getAccessibleProject(id, session.userId)
