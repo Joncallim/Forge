@@ -4730,14 +4730,16 @@ export default function TaskDetailPage() {
 
 
 export function filesystemGrantExpectedPointerFromState(state: {
-  currentDecision?: { id?: string } | null
+  currentDecision?: Record<string, unknown> | null
   pointerFingerprint?: string | null
   pointerVersion?: string | null
-}): { currentDecisionId: string | null; currentDecisionRevision: string | null; pointerFingerprint: string; pointerVersion: string } {
+  workPackageId?: string
+}): { currentDecisionId: string | null; currentDecisionRevision: string | null; pointerFingerprint: string; pointerVersion: string } | null {
+  if (!state?.currentDecision && !state?.pointerFingerprint) return null
   return {
-    currentDecisionId: state?.currentDecision?.id ?? null,
-    currentDecisionRevision: null,
-    pointerFingerprint: state?.pointerFingerprint ?? '',
-    pointerVersion: state?.pointerVersion ?? '0',
+    currentDecisionId: typeof state?.currentDecision?.id === 'string' ? state.currentDecision.id : null,
+    currentDecisionRevision: typeof state?.currentDecision?.grantDecisionRevision === 'string' ? state.currentDecision.grantDecisionRevision : null,
+    pointerFingerprint: (state?.pointerFingerprint as string) ?? '',
+    pointerVersion: (state?.pointerVersion as string) ?? '0',
   }
 }

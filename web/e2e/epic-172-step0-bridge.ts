@@ -134,6 +134,10 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
     classification: 'signed-activation-required',
   },
   {
+    id: 'mcp-operator-presentation.spec.ts::uses the same bounded runtime vocabulary on desktop and mobile',
+    classification: 'run-disabled-safe',
+  },
+  {
     id: 'orchestrator-stage.spec.ts::setup, task execution, artifact review, and approval handoff',
     classification: 'signed-activation-required',
   },
