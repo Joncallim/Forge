@@ -53,8 +53,7 @@
     "e2e:epic-172-disabled-ingress": "playwright test e2e/mcp-handoff-concurrency.spec.ts --project=chromium-desktop --grep @epic172-disabled-ingress",
     "e2e:ui": "playwright test --ui",
     "test": "vitest run",
-    "test:watch": "vitest",
-    "test:mcp:issuance": "vitest run __tests__/epic-172-s4-context.test.ts __tests__/epic-172-s4-postgres.test.ts __tests__/work-package-handoff.test.ts"
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.54.1",

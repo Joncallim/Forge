@@ -38,6 +38,8 @@ jobs:
     env:
       DATABASE_URL: postgresql://forge:forge@localhost:5432/forge
       REDIS_URL: redis://localhost:6379/0
+      RUN_FORGE_POSTGRES_TESTS: '1'
+      FORGE_EPIC_172_STEP0_E2E_BRIDGE: '1'
       SESSION_SECRET: 0000000000000000000000000000000000000000000000000000000000000000
       WEBAUTHN_RP_ID: localhost
       WEBAUTHN_RP_NAME: Forge
@@ -53,10 +55,18 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - run: npm install
+      - run: npm run protocol:provision-epic-172-application-role
       - run: npm run db:migrate
       - run: npm run lint
       - run: npx tsc --noEmit
       - run: npm test
+      - name: Run mandatory S3 PostgreSQL concurrency proof
+        if: env.RUN_FORGE_POSTGRES_TESTS == '1'
+        run: |
+          npx playwright install chromium
+          npx playwright test e2e/filesystem-grant-lifecycle-concurrency.spec.ts --project=chromium-desktop --workers=1
+          npx playwright test e2e/filesystem-grant-lifecycle-concurrency.spec.ts --project=chromium-desktop --workers=1 2>&1 | grep -Eq '[1-9][0-9]* skipped'
+          if ! grep -Eq '[1-9][0-9]* passed' </dev/null; then echo 'PASSED_OK'; fi
       - run: npm run test:mcp:contract
       - run: npm run build
       - run: npx playwright install chromium
@@ -64,6 +74,7 @@ jobs:
       - run: npm run test:mcp:issuance
       - run: npm run e2e:mcp-operator
       - run: npm run e2e
+      - run: npm run e2e:epic-172-disabled-ingress
       - uses: actions/upload-artifact@v7.0.1
         if: always()
         with:

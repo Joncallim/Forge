@@ -91,12 +91,19 @@ describe('Epic 172 Step 0 E2E bridge', () => {
     }
   })
 
-  it('skips only the ten flows that require later signed activation', () => {
+  it('skips only the flows that require later signed activation', () => {
     expect(EPIC_172_STEP0_E2E_INVENTORY
       .filter((entry) => entry.classification === 'signed-activation-required')
       .map((entry) => entry.id)
       .sort()).toEqual([
       'helper-stage.spec.ts::setup, task execution, artifact review, and approval handoff',
+      'mcp-host-boundary.spec.ts::epic-172.cgroup-descendant-containment',
+      'mcp-host-boundary.spec.ts::epic-172.failure-injection-quiescence',
+      'mcp-host-boundary.spec.ts::epic-172.peer-credential-boundary',
+      'mcp-host-boundary.spec.ts::epic-172.protected-fence-service',
+      'mcp-host-boundary.spec.ts::epic-172.supported-host-preflight',
+      'mcp-host-boundary.spec.ts::epic-172.teardown-zero-residue',
+      'mcp-host-boundary.spec.ts::epic-172.uid-credential-isolation',
       'mcp-plan-review-concurrency.spec.ts::rejects an old review after a locked plan replacement commits',
       'mcp-plan-review-concurrency.spec.ts::review and approval cannot produce a stale approval or an unprojected approved package',
       'mcp-plan-review-concurrency.spec.ts::serializes concurrent review saves to one contiguous history revision',

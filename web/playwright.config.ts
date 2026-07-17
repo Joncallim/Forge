@@ -1,9 +1,15 @@
 import { defineConfig, devices } from '@playwright/test'
+import { EPIC_172_STEP0_E2E_BRIDGE_ENV } from './e2e/epic-172-step0-bridge'
 
 const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
 const trustedHostBoundary = process.env.FORGE_TRUSTED_HOST_BOUNDARY === '1'
 const dedicatedMcpTags = /@mcp-postgres|@mcp-issuance|@mcp-operator|@mcp-host-boundary/
 const noMcpArtifacts = Object.freeze({ trace: 'off', screenshot: 'off', video: 'off' } as const)
+
+const inheritedEnvironment = { ...process.env }
+const epic172Step0E2EBridge = inheritedEnvironment[EPIC_172_STEP0_E2E_BRIDGE_ENV]
+delete process.env[EPIC_172_STEP0_E2E_BRIDGE_ENV]
+delete inheritedEnvironment[EPIC_172_STEP0_E2E_BRIDGE_ENV]
 
 export default defineConfig({
   testDir: './e2e',
@@ -46,6 +52,9 @@ export default defineConfig({
       FORGE_EMBED_WORKER: '0',
     },
   },
+  metadata: Object.freeze({
+    [EPIC_172_STEP0_E2E_BRIDGE_ENV]: epic172Step0E2EBridge,
+  }),
   projects: [
     {
       name: 'chromium-desktop',

@@ -11,6 +11,7 @@ import {
   createFixedHostBoundaryScenarioRequest,
   verifyHostBoundaryScenarioResult,
 } from '../scripts/lib/mcp-host-boundary-scenario.mjs'
+import { applyEpic172Step0E2EBridge } from './epic-172-step0-bridge'
 
 const driverSocket = process.env.FORGE_HOST_BOUNDARY_DRIVER_SOCKET ?? ''
 const challengePath = process.env.FORGE_HOST_BOUNDARY_CONTROLLER_CHALLENGE ?? ''
@@ -81,6 +82,10 @@ function requestFixedScenario(socketPath: string, request: unknown): Promise<unk
 test.describe('Epic 172 supported host boundary @mcp-host-boundary', () => {
   test.describe.configure({ mode: 'serial', retries: 0 })
 
+  test.beforeEach(async ({}, testInfo) => {
+    applyEpic172Step0E2EBridge(testInfo, 'mcp-host-boundary.spec.ts')
+  })
+
   test.beforeAll(async () => {
     if (!driverSocket || !challengePath || !attestationPath || !publicKeyPath) {
       throw new Error('The trusted host-boundary project requires its external controller inputs.')
@@ -121,21 +126,24 @@ test.describe('Epic 172 supported host boundary @mcp-host-boundary', () => {
     publicKeyPem = key
   })
 
-  for (const scenarioId of HOST_BOUNDARY_SCENARIO_IDS) {
-    test(scenarioId, {
-      tag: '@mcp-host-boundary',
-      annotation: { type: 'scenarioId', description: scenarioId },
-    }, async () => {
-      const request = createFixedHostBoundaryScenarioRequest({ preflightEnvelope, scenarioId })
-      expect(request).not.toHaveProperty('command')
-      expect(request).not.toHaveProperty('path')
-      const result = await requestFixedScenario(driverSocket, request)
-      expect(() => verifyHostBoundaryScenarioResult({
-        preflightEnvelope,
-        publicKeyPem,
-        result,
-        scenarioId,
-      })).not.toThrow()
-    })
+  async function runScenario(scenarioId: string): Promise<void> {
+    const request = createFixedHostBoundaryScenarioRequest({ preflightEnvelope, scenarioId })
+    expect(request).not.toHaveProperty('command')
+    expect(request).not.toHaveProperty('path')
+    const result = await requestFixedScenario(driverSocket, request)
+    expect(() => verifyHostBoundaryScenarioResult({
+      preflightEnvelope,
+      publicKeyPem,
+      result,
+      scenarioId,
+    })).not.toThrow()
   }
+
+  test('epic-172.cgroup-descendant-containment', { tag: '@mcp-host-boundary', annotation: { type: 'scenarioId', description: 'epic-172.cgroup-descendant-containment' } }, async () => runScenario('epic-172.cgroup-descendant-containment'))
+  test('epic-172.failure-injection-quiescence', { tag: '@mcp-host-boundary', annotation: { type: 'scenarioId', description: 'epic-172.failure-injection-quiescence' } }, async () => runScenario('epic-172.failure-injection-quiescence'))
+  test('epic-172.peer-credential-boundary', { tag: '@mcp-host-boundary', annotation: { type: 'scenarioId', description: 'epic-172.peer-credential-boundary' } }, async () => runScenario('epic-172.peer-credential-boundary'))
+  test('epic-172.protected-fence-service', { tag: '@mcp-host-boundary', annotation: { type: 'scenarioId', description: 'epic-172.protected-fence-service' } }, async () => runScenario('epic-172.protected-fence-service'))
+  test('epic-172.supported-host-preflight', { tag: '@mcp-host-boundary', annotation: { type: 'scenarioId', description: 'epic-172.supported-host-preflight' } }, async () => runScenario('epic-172.supported-host-preflight'))
+  test('epic-172.teardown-zero-residue', { tag: '@mcp-host-boundary', annotation: { type: 'scenarioId', description: 'epic-172.teardown-zero-residue' } }, async () => runScenario('epic-172.teardown-zero-residue'))
+  test('epic-172.uid-credential-isolation', { tag: '@mcp-host-boundary', annotation: { type: 'scenarioId', description: 'epic-172.uid-credential-isolation' } }, async () => runScenario('epic-172.uid-credential-isolation'))
 })
