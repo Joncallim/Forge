@@ -41,6 +41,13 @@ import {
   type McpExecutionDesignMetadata,
 } from '@/lib/mcps/execution-design-metadata'
 import {
+  approvedGrantsForDisplay,
+  latestMcpPlanReviewForDisplay,
+  mcpPlanOverlayCount,
+  mcpRequirementDisplayKey,
+  type McpPlanReviewDisplayItem,
+} from '@/lib/mcps/plan-review-metadata'
+import {
   artifactArrayField,
   mergeArtifacts,
   taskLevelArtifactsForWorkPackages,
@@ -1939,17 +1946,17 @@ function ApprovedGrantSnapshot({ packages }: { packages: WorkforceRecord[] }) {
         {packages.map((pkg, index) => {
           const packageId = stringField(pkg, ['workPackageId', 'id']) || `Package ${index + 1}`
           const assignedRole = stringField(pkg, ['assignedRole', 'role'])
-          const proposedGrants = jsonArrayField(pkg, ['proposedGrants', 'grants'])
-          const proposedRequirements = jsonArrayField(pkg, ['proposedRequirements', 'requirements'])
+          const approvedGrants = approvedGrantsForDisplay(pkg)
+          const proposedRequirements = jsonArrayField(pkg, ['approvedRequirements', 'proposedRequirements', 'requirements'])
           return (
             <div key={recordKey(pkg, 'approved-grant-package', index)} className="rounded-md border border-border bg-background px-2 py-1.5">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="break-all font-mono text-[11px] text-foreground">{packageId}</span>
                 {assignedRole !== '' && <Badge variant="secondary">{assignedRole}</Badge>}
               </div>
-              {proposedGrants.length > 0 && (
+              {approvedGrants.length > 0 && (
                 <p className="mt-1 text-muted-foreground">
-                  Grants: {proposedGrants.map((grant) => stringField(grant, ['mcpId', 'id']) || 'MCP').join(', ')}
+                  Grants: {approvedGrants.map((grant) => stringField(grant, ['mcpId', 'id']) || 'MCP').join(', ')}
                 </p>
               )}
               {proposedRequirements.length > 0 && (
@@ -3092,14 +3099,93 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
   )
 }
 
-function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | null }) {
-  if (!design) return null
+function initialMcpReviewItems(
+  design: McpExecutionDesignMetadata | null,
+  existing: ReturnType<typeof latestMcpPlanReviewForDisplay>,
+): McpPlanReviewDisplayItem[] {
+  if (existing && existing.items.length > 0) {
+    return existing.items.map((item) => ({
+      ...item,
+      assignment: { ...item.assignment, targetAgents: [...item.assignment.targetAgents] },
+      agentPermissions: Object.fromEntries(Object.entries(item.agentPermissions).map(([agent, capabilities]) => [agent, [...capabilities]])),
+      promptOverlays: { ...item.promptOverlays },
+    }))
+  }
+  const proposed = design?.proposed
+  if (!proposed) return []
+  return proposed.requirements.map((requirement, index) => {
+    const key = mcpRequirementDisplayKey(requirement, index)
+    const promptOverlays = Object.fromEntries(proposed.requirementContexts
+      .filter((context) => context.requirementKey === key)
+      .map((context) => [context.agent, context.promptOverlay]))
+    return {
+      requirementKey: key,
+      decision: 'approved',
+      assignment: { ...requirement.assignment, targetAgents: [...requirement.assignment.targetAgents] },
+      agentPermissions: Object.fromEntries(Object.entries(requirement.agentPermissions).map(([agent, capabilities]) => [agent, [...capabilities]])),
+      promptOverlays,
+    }
+  })
+}
 
-  const proposed = design.proposed
+function McpAccessPlanPanel({
+  approvalGate,
+  design,
+  onSaved,
+  status,
+  workPackages,
+}: {
+  approvalGate: ApprovalGate | null
+  design: McpExecutionDesignMetadata | null
+  onSaved: () => Promise<void>
+  status: string
+  workPackages: WorkPackage[]
+}) {
+  const proposed = design?.proposed
   const requirements = proposed?.requirements ?? []
-  const overlayCount = proposed ? Object.keys(proposed.promptOverlays).length : 0
+  const overlayCount = mcpPlanOverlayCount(design)
   const subtaskCount = proposed?.mcpAwareSubtasks.length ?? 0
-  const grantPreview = design.grantDecisions
+  const grantPreview = design?.grantDecisions
+  const existingReview = useMemo(() => latestMcpPlanReviewForDisplay(approvalGate), [approvalGate])
+  const [draftItems, setDraftItems] = useState<McpPlanReviewDisplayItem[]>(() => initialMcpReviewItems(design, existingReview))
+  const [reviewSaving, setReviewSaving] = useState(false)
+  const [reviewError, setReviewError] = useState<string | null>(null)
+  const sourceArtifactId = approvalGate ? stringField(approvalGate, ['sourceArtifactId']) : ''
+  const packageAgents = [...new Set(workPackages.map((pkg) => stringField(pkg, ['assignedRole'])).filter(Boolean))].sort()
+  const reviewEnabled = status === 'awaiting_approval' && sourceArtifactId !== '' && requirements.length > 0
+
+  useEffect(() => {
+    setDraftItems(initialMcpReviewItems(design, existingReview))
+  }, [design, existingReview])
+
+  const updateDraft = (index: number, update: (item: McpPlanReviewDisplayItem) => McpPlanReviewDisplayItem) => {
+    setDraftItems((items) => items.map((item, itemIndex) => itemIndex === index ? update(item) : item))
+  }
+
+  const saveReview = async () => {
+    setReviewSaving(true)
+    setReviewError(null)
+    try {
+      const response = await fetch(`/api/tasks/${stringField(approvalGate ?? {}, ['taskId'])}/mcp-plan-review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sourceArtifactId,
+          baseRevision: existingReview?.revision ?? 0,
+          baseDigest: existingReview?.digest ?? null,
+          items: draftItems,
+        }),
+      })
+      const body = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(typeof body.error === 'string' ? body.error : 'Failed to save MCP access review.')
+      await onSaved()
+    } catch (error) {
+      setReviewError(error instanceof Error ? error.message : 'Failed to save MCP access review.')
+    } finally {
+      setReviewSaving(false)
+    }
+  }
+  if (!design) return null
   const missingDesignOnly =
     requirements.length === 0 &&
     design.validation.blocked.length === 0 &&
@@ -3131,6 +3217,18 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
           MCP access is beta-planned only. Forge records proposed requirements and brokered decisions, but no live MCP tool handles are issued to package runs; approved inputs become run-scoped prompt instructions.
         </p>
       </div>
+
+      {existingReview && (
+        <div className="mb-3 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
+          <p className="font-medium text-foreground">Operator review revision {existingReview.revision}</p>
+          <p className="mt-1 break-all font-mono text-[11px]">{existingReview.digest}</p>
+          {existingReview.blockers.length > 0 && (
+            <ul role="alert" className="mt-2 list-disc pl-4 text-destructive">
+              {existingReview.blockers.map((blocker, index) => <li key={duplicateSafeKey('mcp-review-blocker', blocker, index)}>{blocker}</li>)}
+            </ul>
+          )}
+        </div>
+      )}
 
       {design.validation.blocked.length > 0 && (
         <div role="alert" className="mb-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
@@ -3208,6 +3306,13 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
         <ul className="flex flex-col gap-3" aria-label="MCP requirements">
           {requirements.map((requirement, index) => {
             const permissionEntries = Object.entries(requirement.agentPermissions)
+            const draft = draftItems[index]
+            const availableCapabilities = [...new Set(permissionEntries.flatMap(([, capabilities]) => capabilities))].sort()
+            const selectedAgents = draft?.assignment.type === 'architect_only'
+              ? ['architect']
+              : draft?.assignment.type === 'reviewer_only'
+                ? ['reviewer']
+                : draft?.assignment.targetAgents ?? []
             return (
               <li key={`${requirement.mcpId}-${requirement.assignment.type}-${index}`} className="border-t border-border pt-3 first:border-t-0 first:pt-0">
                 <div className="mb-1 flex flex-wrap items-center gap-2">
@@ -3215,6 +3320,8 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
                   <Badge variant={requirement.requirement === 'required' ? 'outline' : 'secondary'}>
                     {requirement.requirement}
                   </Badge>
+                  <Badge variant="outline">Confidence: {requirement.confidence}</Badge>
+                  <Badge variant="secondary">Project scope · planning instruction</Badge>
                 </div>
                 {requirement.reason && (
                   <p className="text-sm text-muted-foreground">{requirement.reason}</p>
@@ -3251,10 +3358,177 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
                     <dd>{requirement.fallback.action}: {requirement.fallback.message}</dd>
                   </div>
                 </dl>
+                {reviewEnabled && draft && (
+                  <div className="mt-3 grid gap-3 rounded-md border border-border bg-muted/20 p-3 text-xs">
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant={draft.decision === 'approved' ? 'default' : 'outline'}
+                        onClick={() => updateDraft(index, (item) => ({ ...item, decision: 'approved' }))}
+                      >Approve requirement</Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant={draft.decision === 'denied' ? 'destructive' : 'outline'}
+                        onClick={() => updateDraft(index, (item) => ({ ...item, decision: 'denied' }))}
+                      >Deny requirement</Button>
+                    </div>
+                    {draft.decision === 'approved' && (
+                      <>
+                        <label className="grid gap-1 font-medium text-foreground">
+                          Assignment
+                          <select
+                            className="h-9 rounded-md border border-input bg-background px-2 font-normal"
+                            value={draft.assignment.type}
+                            onChange={(event) => updateDraft(index, (item) => {
+                              const type = event.target.value
+                              const targets = type === 'architect_only'
+                                ? ['architect']
+                                : type === 'reviewer_only'
+                                  ? ['reviewer']
+                                  : item.assignment.targetAgents.filter((agent) => packageAgents.includes(agent))
+                              const fallbackTargets = targets.length > 0 ? targets : packageAgents.slice(0, type === 'multiple_agents' ? 2 : 1)
+                              return {
+                                ...item,
+                                assignment: { ...item.assignment, type, targetAgents: fallbackTargets },
+                                agentPermissions: Object.fromEntries(fallbackTargets.map((agent) => [agent, item.agentPermissions[agent] ?? availableCapabilities])),
+                                promptOverlays: Object.fromEntries(fallbackTargets.flatMap((agent) => item.promptOverlays[agent] ? [[agent, item.promptOverlays[agent]]] : [])),
+                              }
+                            })}
+                          >
+                            <option value="agent">Single agent</option>
+                            <option value="multiple_agents">Multiple agents</option>
+                            <option value="workforce">Workforce</option>
+                            <option value="architect_only">Architect only</option>
+                            <option value="reviewer_only">Reviewer only</option>
+                          </select>
+                        </label>
+                        {draft.assignment.type === 'workforce' && (
+                          <label className="grid gap-1 font-medium text-foreground">
+                            Workforce id
+                            <input
+                              className="h-9 rounded-md border border-input bg-background px-2 font-normal"
+                              value={draft.assignment.targetId ?? ''}
+                              onChange={(event) => updateDraft(index, (item) => ({ ...item, assignment: { ...item.assignment, targetId: event.target.value } }))}
+                            />
+                          </label>
+                        )}
+                        {!['architect_only', 'reviewer_only'].includes(draft.assignment.type) && (
+                          <fieldset className="grid gap-1">
+                            <legend className="font-medium text-foreground">Assigned package agents</legend>
+                            <div className="flex flex-wrap gap-3">
+                              {packageAgents.map((agent) => (
+                                <label key={agent} className="flex items-center gap-1.5">
+                                  <input
+                                    type="checkbox"
+                                    checked={selectedAgents.includes(agent)}
+                                    onChange={(event) => updateDraft(index, (item) => {
+                                      const nextTargets = event.target.checked
+                                        ? item.assignment.type === 'agent' ? [agent] : [...new Set([...item.assignment.targetAgents, agent])]
+                                        : item.assignment.targetAgents.filter((candidate) => candidate !== agent)
+                                      return {
+                                        ...item,
+                                        assignment: { ...item.assignment, targetAgents: nextTargets },
+                                        agentPermissions: Object.fromEntries(nextTargets.map((target) => [target, item.agentPermissions[target] ?? availableCapabilities])),
+                                        promptOverlays: Object.fromEntries(nextTargets.flatMap((target) => item.promptOverlays[target] ? [[target, item.promptOverlays[target]]] : [])),
+                                      }
+                                    })}
+                                  />
+                                  {agent}
+                                </label>
+                              ))}
+                            </div>
+                          </fieldset>
+                        )}
+                        {selectedAgents.map((agent) => (
+                          <fieldset key={agent} className="grid gap-2 rounded-md border border-border bg-background p-2">
+                            <legend className="px-1 font-medium text-foreground">{agent}</legend>
+                            <div className="flex flex-wrap gap-3">
+                              {availableCapabilities.map((capability) => (
+                                <label key={capability} className="flex items-center gap-1.5 font-mono text-[11px]">
+                                  <input
+                                    type="checkbox"
+                                    checked={(draft.agentPermissions[agent] ?? []).includes(capability)}
+                                    onChange={(event) => updateDraft(index, (item) => ({
+                                      ...item,
+                                      agentPermissions: {
+                                        ...item.agentPermissions,
+                                        [agent]: event.target.checked
+                                          ? [...new Set([...(item.agentPermissions[agent] ?? []), capability])].sort()
+                                          : (item.agentPermissions[agent] ?? []).filter((candidate) => candidate !== capability),
+                                      },
+                                    }))}
+                                  />
+                                  {capability}
+                                </label>
+                              ))}
+                            </div>
+                            <label className="grid gap-1 font-medium text-foreground">
+                              Package prompt overlay
+                              <textarea
+                                className="min-h-20 rounded-md border border-input bg-background px-2 py-1.5 font-normal"
+                                maxLength={1000}
+                                value={draft.promptOverlays[agent] ?? ''}
+                                onChange={(event) => updateDraft(index, (item) => ({ ...item, promptOverlays: { ...item.promptOverlays, [agent]: event.target.value } }))}
+                              />
+                            </label>
+                          </fieldset>
+                        ))}
+                      </>
+                    )}
+                  </div>
+                )}
               </li>
             )
           })}
         </ul>
+      )}
+
+      {proposed && proposed.requirementContexts.length > 0 && (
+        <div className="mt-3 border-t border-border pt-3 text-xs">
+          <p className="font-medium text-foreground">Requirement-scoped package context</p>
+          <ul className="mt-2 grid gap-2">
+            {proposed.requirementContexts.map((context, index) => (
+              <li key={duplicateSafeKey('mcp-context', `${context.requirementKey}-${context.agent}`, index)} className="rounded-md border border-border px-2 py-1.5">
+                <p className="font-medium text-foreground">{context.agent} · {context.mcpId}</p>
+                <p className="mt-1 text-muted-foreground">{context.promptOverlay}</p>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {proposed && proposed.mcpAwareSubtasks.length > 0 && (
+        <div className="mt-3 border-t border-border pt-3 text-xs">
+          <p className="font-medium text-foreground">Full MCP-aware subtask instructions</p>
+          <ul className="mt-2 grid gap-2">
+            {proposed.mcpAwareSubtasks.map((subtask) => (
+              <li key={subtask.id} className="rounded-md border border-border px-2 py-2">
+                <p className="font-medium text-foreground">{subtask.id} · {subtask.agent}</p>
+                <p className="mt-1 font-mono text-[11px] text-muted-foreground">{subtask.mcpCapabilities.join(', ')}</p>
+                <dl className="mt-2 grid gap-1 text-muted-foreground">
+                  <div><dt className="font-medium text-foreground">Depends on</dt><dd>{subtask.dependsOn.join(', ') || 'None'}</dd></div>
+                  <div><dt className="font-medium text-foreground">Inputs</dt><dd>{subtask.inputs.join(', ') || 'None'}</dd></div>
+                  <div><dt className="font-medium text-foreground">Outputs</dt><dd>{subtask.outputs.join(', ') || 'None'}</dd></div>
+                  <div><dt className="font-medium text-foreground">Verification</dt><dd>{subtask.verification.join(', ') || 'None'}</dd></div>
+                  <div><dt className="font-medium text-foreground">Stopping condition</dt><dd>{subtask.stoppingCondition || 'Not specified'}</dd></div>
+                  <div><dt className="font-medium text-foreground">Fallback</dt><dd>{subtask.fallback || 'Not specified'}</dd></div>
+                </dl>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {reviewEnabled && (
+        <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-border pt-3">
+          <Button type="button" size="sm" disabled={reviewSaving} onClick={() => void saveReview()}>
+            {reviewSaving ? 'Saving review…' : existingReview ? 'Save new review revision' : 'Save MCP access review'}
+          </Button>
+          <p className="text-xs text-muted-foreground">Saving records a new immutable revision. Task approval admits this reviewed version.</p>
+          {reviewError && <p role="alert" className="w-full text-xs text-destructive">{reviewError}</p>}
+        </div>
       )}
 
       {(overlayCount > 0 || subtaskCount > 0) && (
@@ -4121,7 +4395,15 @@ export default function TaskDetailPage() {
   const canDeleteTask = canDeleteTaskStatus(effectiveTaskStatus)
   const plannedAgents = plannedAgentsFromArtifacts(mergedArtifacts)
   const capabilityClassification = latestCapabilityClassificationFromArtifacts(mergedArtifacts)
-  const mcpExecutionDesign = latestMcpExecutionDesignFromArtifacts(mergedArtifacts)
+  const planApprovalGate = approvalGates.find((gate) => (
+    stringField(gate, ['gateType', 'type']) === 'plan_approval' &&
+    stringField(gate, ['status', 'state']) === 'pending'
+  )) ?? approvalGates.find((gate) => stringField(gate, ['gateType', 'type']) === 'plan_approval') ?? null
+  const planSourceArtifactId = planApprovalGate ? stringField(planApprovalGate, ['sourceArtifactId']) : ''
+  const planSourceArtifact = planSourceArtifactId === ''
+    ? null
+    : mergedArtifacts.find((artifact) => artifact.id === planSourceArtifactId) ?? null
+  const mcpExecutionDesign = latestMcpExecutionDesignFromArtifacts(planSourceArtifact ? [planSourceArtifact] : mergedArtifacts)
 
   const taskLevelArtifacts = taskLevelArtifactsForWorkPackages(mergedArtifacts, workPackages)
   const adrArtifacts = taskLevelArtifacts.filter((artifact) => artifact.artifactType === 'adr_text')
@@ -4562,7 +4844,13 @@ export default function TaskDetailPage() {
               the prompt rather than the workforce execution column. */}
           <div className="mb-6 grid gap-6">
             <CapabilityClassificationPanel classification={capabilityClassification} />
-            <McpAccessPlanPanel design={mcpExecutionDesign} />
+            <McpAccessPlanPanel
+              approvalGate={planApprovalGate}
+              design={mcpExecutionDesign}
+              onSaved={loadTask}
+              status={effectiveTaskStatus}
+              workPackages={workPackages}
+            />
           </div>
 
           <TaskLogsPanel
