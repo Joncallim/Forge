@@ -1,6 +1,8 @@
 import { defineConfig, devices } from '@playwright/test'
 
 const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
+const trustedHostBoundary = process.env.FORGE_TRUSTED_HOST_BOUNDARY === '1'
+const dedicatedMcpTags = /@mcp-postgres|@mcp-issuance|@mcp-operator|@mcp-host-boundary/
 
 export default defineConfig({
   testDir: './e2e',
@@ -44,10 +46,46 @@ export default defineConfig({
     {
       name: 'chromium-desktop',
       use: { ...devices['Desktop Chrome'] },
+      grepInvert: dedicatedMcpTags,
     },
     {
       name: 'chromium-mobile',
       use: { ...devices['Pixel 5'] },
+      grepInvert: dedicatedMcpTags,
     },
+    {
+      name: 'mcp-postgres',
+      grep: /@mcp-postgres/,
+      fullyParallel: false,
+      retries: 0,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'mcp-issuance',
+      grep: /@mcp-issuance/,
+      fullyParallel: false,
+      retries: 0,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'mcp-operator-desktop',
+      grep: /@mcp-operator/,
+      retries: 0,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'mcp-operator-mobile',
+      grep: /@mcp-operator/,
+      retries: 0,
+      use: { ...devices['Pixel 5'] },
+    },
+    ...(trustedHostBoundary ? [{
+      name: 'mcp-host-boundary',
+      testMatch: /mcp-host-boundary\.spec\.ts/,
+      grep: /@mcp-host-boundary/,
+      fullyParallel: false,
+      retries: 0,
+      use: { ...devices['Desktop Chrome'] },
+    }] : []),
   ],
 })

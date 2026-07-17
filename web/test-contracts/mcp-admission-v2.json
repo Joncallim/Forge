@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 2,
+  "contractVersion": "mcp-admission-v2",
+  "partitions": [
+    {
+      "id": "contract",
+      "runner": "vitest",
+      "expectedCount": 5,
+      "executionKeys": [
+        "vitest::epic-172.controller-disabled-by-default",
+        "vitest::epic-172.controller-failure-rollback",
+        "vitest::epic-172.release-order-s6-ownership",
+        "vitest::epic-172.signed-evidence-step0-adapter",
+        "vitest::epic-172.suite-manifest-exact"
+      ]
+    },
+    {
+      "id": "host-boundary",
+      "runner": "playwright",
+      "expectedCount": 7,
+      "executionKeys": [
+        "mcp-host-boundary::epic-172.cgroup-descendant-containment",
+        "mcp-host-boundary::epic-172.failure-injection-quiescence",
+        "mcp-host-boundary::epic-172.peer-credential-boundary",
+        "mcp-host-boundary::epic-172.protected-fence-service",
+        "mcp-host-boundary::epic-172.supported-host-preflight",
+        "mcp-host-boundary::epic-172.teardown-zero-residue",
+        "mcp-host-boundary::epic-172.uid-credential-isolation"
+      ]
+    },
+    {
+      "id": "issuance",
+      "runner": "playwright",
+      "expectedCount": 3,
+      "executionKeys": [
+        "mcp-issuance::mcp-admission.allow-once-single-winner",
+        "mcp-issuance::mcp-admission.always-allow-single-run-claim",
+        "mcp-issuance::mcp-admission.failure-recovery-atomicity"
+      ]
+    },
+    {
+      "id": "operator-desktop",
+      "runner": "playwright",
+      "expectedCount": 1,
+      "executionKeys": [
+        "mcp-operator-desktop::mcp-admission.operator-recovery"
+      ]
+    },
+    {
+      "id": "operator-mobile",
+      "runner": "playwright",
+      "expectedCount": 1,
+      "executionKeys": [
+        "mcp-operator-mobile::mcp-admission.operator-recovery"
+      ]
+    },
+    {
+      "id": "postgres",
+      "runner": "playwright",
+      "expectedCount": 2,
+      "executionKeys": [
+        "mcp-postgres::mcp-admission.grant-reconciliation",
+        "mcp-postgres::mcp-admission.real-approval-route"
+      ]
+    }
+  ]
+}
