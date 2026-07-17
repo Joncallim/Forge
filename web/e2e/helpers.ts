@@ -4,6 +4,7 @@ import path from 'node:path'
 import Redis from 'ioredis'
 import postgres from 'postgres'
 import type { BrowserContext, TestInfo } from '@playwright/test'
+import { seedAgentConfigs } from '../db/seed-agents'
 import { resolveDestructiveE2EEnvironment } from './destructive-environment'
 
 const root = path.resolve(__dirname, '..')
@@ -143,7 +144,6 @@ export async function resetState(): Promise<void> {
     redis.disconnect()
   }
 
-  const { seedAgentConfigs } = await import('../db/seed-agents')
   await seedAgentConfigs()
 }
 
