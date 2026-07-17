@@ -34,6 +34,7 @@ type SeededReviewTask = {
   artifactId: string
   gateId: string
   packageId: string
+  projectId: string
   sessionId: string
   taskId: string
   userId: string
@@ -118,7 +119,7 @@ async function seedReviewTask(sql: Sql): Promise<SeededReviewTask> {
     ip: '127.0.0.1',
     userAgent: 'MCP plan review concurrency regression',
   })
-  return { artifactId, gateId, packageId, sessionId, taskId, userId }
+  return { artifactId, gateId, packageId, projectId, sessionId, taskId, userId }
 }
 
 async function waitForLockWaiters(sql: Sql, blockingPid: number, expected: number): Promise<number[]> {
@@ -147,7 +148,7 @@ test.describe('MCP plan review PostgreSQL concurrency', () => {
   test.describe.configure({ mode: 'serial' })
   let sql: Sql
   let locker: Sql
-  const usersToDelete: string[] = []
+  const projectsToArchive: string[] = []
   const sessionsToDelete: string[] = []
   const approvalTasksToRemove: string[] = []
 
@@ -163,15 +164,19 @@ test.describe('MCP plan review PostgreSQL concurrency', () => {
     for (const taskId of approvalTasksToRemove.splice(0)) {
       await redis.lrem('forge:approvals', 0, JSON.stringify({ taskId, action: 'approve' }))
     }
-    for (const userId of usersToDelete.splice(0)) {
-      await sql`delete from users where id = ${userId}`
+    for (const projectId of projectsToArchive.splice(0)) {
+      await sql`
+        update projects
+        set archived_at = coalesce(archived_at, now()), updated_at = now()
+        where id = ${projectId}
+      `
     }
     await Promise.all([sql.end(), locker.end()])
   })
 
   test('serializes concurrent review saves to one contiguous history revision', async ({ request }) => {
     const seed = await seedReviewTask(sql)
-    usersToDelete.push(seed.userId)
+    projectsToArchive.push(seed.projectId)
     sessionsToDelete.push(seed.sessionId)
 
     const responses = await Promise.all([postReview(request, seed), postReview(request, seed)])
@@ -188,7 +193,7 @@ test.describe('MCP plan review PostgreSQL concurrency', () => {
 
   test('review and approval cannot produce a stale approval or an unprojected approved package', async ({ request }) => {
     const seed = await seedReviewTask(sql)
-    usersToDelete.push(seed.userId)
+    projectsToArchive.push(seed.projectId)
     sessionsToDelete.push(seed.sessionId)
     approvalTasksToRemove.push(seed.taskId)
 
@@ -235,7 +240,7 @@ test.describe('MCP plan review PostgreSQL concurrency', () => {
 
   test('rejects an old review after a locked plan replacement commits', async ({ request }) => {
     const seed = await seedReviewTask(sql)
-    usersToDelete.push(seed.userId)
+    projectsToArchive.push(seed.projectId)
     sessionsToDelete.push(seed.sessionId)
     const replacementArtifactId = crypto.randomUUID()
     const [run] = await sql`select source_agent_run_id from approval_gates where id = ${seed.gateId}`

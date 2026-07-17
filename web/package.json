@@ -18,6 +18,7 @@
     "db:migrate:kit": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio",
     "protocol:bootstrap-epic-172-release-roles": "tsx scripts/bootstrap-epic-172-release-roles.ts",
+    "protocol:epic-172-release": "tsx scripts/epic-172-release.ts",
     "db:seed-agents": "npx tsx db/seed-agents.ts",
     "db:seed-providers": "npx tsx db/seed-providers.ts",
     "auth:reset-password": "tsx scripts/reset-password.ts",

@@ -3,6 +3,7 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import {
   installSessionCookie,
   resetState,
+  seedProject,
   seedSession,
   startMockWorker,
   stopWorker,
@@ -10,10 +11,12 @@ import {
 
 test.describe('helper-stage beta smoke', () => {
   let worker: ChildProcessWithoutNullStreams | null = null
+  let session: Awaited<ReturnType<typeof seedSession>>
 
   test.beforeEach(async ({ context }, testInfo) => {
     await resetState()
-    await installSessionCookie(context, await seedSession())
+    session = await seedSession()
+    await installSessionCookie(context, session)
     worker = await startMockWorker(testInfo)
   })
 
@@ -47,11 +50,8 @@ test.describe('helper-stage beta smoke', () => {
 
     await page.goto('/dashboard/projects')
     await expect(page.getByRole('heading', { name: 'Projects' })).toBeVisible()
-    await page.getByRole('button', { name: 'Create new project' }).click()
-    await page.getByLabel('Name').fill(projectName)
-    await page.getByLabel('GitHub Repo').fill('owner/forge-smoke')
-    await page.getByLabel('Default Branch').fill('main')
-    await page.getByRole('button', { name: 'Create Project' }).click()
+    await seedProject({ name: projectName, userId: session.userId, githubRepo: 'owner/forge-smoke' })
+    await page.reload()
     await expect(page.getByRole('button', { name: `Open project ${projectName}` })).toBeVisible()
 
     await page.getByRole('button', { name: `Open project ${projectName}` }).click()

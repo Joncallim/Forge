@@ -128,15 +128,19 @@ export async function resetState(): Promise<void> {
   const redis = redisClient()
 
   try {
-    // The local Forge role does not necessarily own every table reached by a
-    // blanket TRUNCATE ... CASCADE anymore. Delete the mutable top-level rows
-    // that E2E touches and let foreign keys cascade from there instead.
+    // Epic 172 retains project, task, and execution history even in the
+    // dedicated E2E database. Hide prior fixtures through the same archive
+    // boundary as the product, and clear only non-retained setup/session state.
+    // Random fixture identities keep retained rows isolated between tests.
     await sql.begin(async (tx) => {
-      await tx`delete from projects`
+      await tx`
+        update projects
+        set archived_at = coalesce(archived_at, now()), updated_at = now()
+        where archived_at is null
+      `
       await tx`delete from provider_configs`
       await tx`delete from sessions`
       await tx`delete from credentials`
-      await tx`delete from users`
     })
     await redis.flushdb()
   } finally {

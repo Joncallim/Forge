@@ -169,7 +169,6 @@ test.describe('MCP handoff optimistic concurrency', () => {
   let previousWorkspaceRoot: string | undefined
   let previousMcpsRoot: string | undefined
   let previousWorkspaceSettings: Array<{ key: string; value: string }> = []
-  const usersToDelete: string[] = []
   const projectsToDelete: string[] = []
   const sessionsToDelete: string[] = []
 
@@ -214,11 +213,12 @@ test.describe('MCP handoff optimistic concurrency', () => {
   test.afterEach(async () => {
     if (!sql || !writer) return
     await Promise.all(sessionsToDelete.splice(0).map((sessionId) => redis.del(`session:${sessionId}`)))
-    for (const userId of usersToDelete.splice(0)) {
-      await sql`delete from users where id = ${userId}`
-    }
     for (const projectId of projectsToDelete.splice(0)) {
-      await sql`delete from projects where id = ${projectId}`
+      await sql`
+        update projects
+        set archived_at = coalesce(archived_at, now()), updated_at = now()
+        where id = ${projectId}
+      `
     }
     await sql`delete from mcp_installations where mcp_id = 'filesystem'`
     await sql`delete from app_settings where key in ('workspaceRoot', 'mcpsRoot')`
@@ -244,7 +244,6 @@ test.describe('MCP handoff optimistic concurrency', () => {
       mcpRequirements: filesystemRequirement,
       title: 'Grant arrival race',
     })
-    usersToDelete.push(seeded.userId)
     projectsToDelete.push(seeded.projectId)
     const effective = explicitFilesystemGrant()
 
@@ -278,7 +277,6 @@ test.describe('MCP handoff optimistic concurrency', () => {
       mcpRequirements: filesystemRequirement,
       title: 'Grant revocation race',
     })
-    usersToDelete.push(seeded.userId)
     projectsToDelete.push(seeded.projectId)
 
     const result = await handoffApprovedWorkPackages(seeded.taskId, {
@@ -352,7 +350,6 @@ test.describe('MCP handoff optimistic concurrency', () => {
       mcpRequirements: filesystemRequirement,
       title: 'Project grant claim race',
     })
-    usersToDelete.push(seeded.userId)
     projectsToDelete.push(seeded.projectId)
 
     let resolveWriterLocked!: () => void
@@ -439,7 +436,6 @@ test.describe('MCP handoff optimistic concurrency', () => {
       mcpRequirements: filesystemRequirement,
       title: 'Mixed grant handoff target',
     })
-    usersToDelete.push(seeded.userId)
     projectsToDelete.push(seeded.projectId)
     await sql`update work_packages set status = 'ready' where id = ${seeded.packageId}`
     const siblingPackageId = await seedSiblingPackage(sql, {
@@ -576,7 +572,6 @@ test.describe('MCP handoff optimistic concurrency', () => {
       mcpRequirements: unknownMcpRequirement,
       title: 'Broker metadata race',
     })
-    usersToDelete.push(brokerSeed.userId)
     projectsToDelete.push(brokerSeed.projectId)
     await handoffApprovedWorkPackages(brokerSeed.taskId, {
       afterMcpHealthCaptured: async () => {
@@ -598,7 +593,6 @@ test.describe('MCP handoff optimistic concurrency', () => {
       mcpRequirements: optionalGitHubRequirement,
       title: 'Policy mutation race',
     })
-    usersToDelete.push(policySeed.userId)
     projectsToDelete.push(policySeed.projectId)
     const result = await handoffApprovedWorkPackages(policySeed.taskId, {
       afterMcpHealthCaptured: async ({ attempt }) => {
@@ -627,7 +621,6 @@ test.describe('MCP handoff optimistic concurrency', () => {
       mcpRequirements: optionalGitHubRequirement,
       title: 'Successful CAS retry',
     })
-    usersToDelete.push(retrySeed.userId)
     projectsToDelete.push(retrySeed.projectId)
     const retryAttempts: number[] = []
     const retryResult = await handoffApprovedWorkPackages(retrySeed.taskId, {
@@ -654,7 +647,6 @@ test.describe('MCP handoff optimistic concurrency', () => {
       mcpRequirements: unknownMcpRequirement,
       title: 'Terminal CAS conflict',
     })
-    usersToDelete.push(conflictSeed.userId)
     projectsToDelete.push(conflictSeed.projectId)
     const conflictAttempts: number[] = []
     const conflictResult = await handoffApprovedWorkPackages(conflictSeed.taskId, {
@@ -687,7 +679,6 @@ test.describe('MCP handoff optimistic concurrency', () => {
       mcpRequirements: optionalGitHubRequirement,
       title: 'Post-claim metadata race',
     })
-    usersToDelete.push(seeded.userId)
     projectsToDelete.push(seeded.projectId)
     const effective = explicitFilesystemGrant()
 

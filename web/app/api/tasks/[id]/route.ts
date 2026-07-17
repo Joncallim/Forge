@@ -274,31 +274,15 @@ export async function DELETE(
           { status: 409 },
         )
       }
-
-      const [deleted] = await db
-        .delete(tasks)
-        .where(and(accessibleTaskCondition(id, session.userId), inArray(tasks.status, [...TERMINAL_TASK_STATUSES])))
-        .returning({ id: tasks.id })
-
-      if (!deleted) {
-        return NextResponse.json(
-          { error: 'Cannot delete task because it is no longer terminal. Stop it first, then delete it after cancellation completes.' },
-          { status: 409 },
-        )
-      }
-
-      await publishTaskEvent(id, 'task:deleted', {
-        taskId: id,
-        deletedAt: new Date().toISOString(),
-      }).catch(() => undefined)
-
-      console.info('[DELETE /api/tasks/:id] Deleted task', { id })
-      return NextResponse.json({ ok: true, mode: 'delete' })
+      return NextResponse.json(
+        { error: 'Task deletion is disabled because Forge retains task, run, and review evidence. The terminal task remains available in history.' },
+        { status: 409 },
+      )
     }
 
     if (TERMINAL_TASK_STATUSES.includes(existing.status as typeof TERMINAL_TASK_STATUSES[number])) {
       return NextResponse.json(
-        { error: `Cannot stop task with status '${existing.status}'. Delete it instead if it is no longer needed.` },
+        { error: `Cannot stop task with status '${existing.status}'. Forge retains terminal task and execution history.` },
         { status: 409 },
       )
     }

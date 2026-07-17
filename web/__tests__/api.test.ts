@@ -2761,13 +2761,12 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
     )
   })
 
-  it('hard-deletes an individual task when mode=delete is requested', async () => {
+  it('retains a terminal task when mode=delete is requested', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect.mockReturnValue(chain([{
       id: 'task-delete',
       status: 'completed',
     }]))
-    mockDbDelete.mockReturnValue(chain([{ id: 'task-delete' }]))
 
     const { DELETE } = await import('@/app/api/tasks/[id]/route')
     const req = authRequest('/api/tasks/task-delete?mode=delete', { method: 'DELETE' })
@@ -2775,10 +2774,10 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
 
     const res = await DELETE(req as never, { params })
 
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(409)
     const body = await res.json()
-    expect(body).toEqual({ ok: true, mode: 'delete' })
-    expect(mockDbDelete).toHaveBeenCalled()
+    expect(body.error).toMatch(/retains task, run, and review evidence/i)
+    expect(mockDbDelete).not.toHaveBeenCalled()
   })
 
   it('rejects hard-delete for active tasks so operators must stop them first', async () => {
@@ -2800,13 +2799,12 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
     expect(mockDbDelete).not.toHaveBeenCalled()
   })
 
-  it('rejects hard-delete when the task stops being terminal before delete commits', async () => {
+  it('does not attempt a delete for any terminal task', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect.mockReturnValue(chain([{
       id: 'task-raced-delete',
       status: 'failed',
     }]))
-    mockDbDelete.mockReturnValue(chain([]))
 
     const { DELETE } = await import('@/app/api/tasks/[id]/route')
     const req = authRequest('/api/tasks/task-raced-delete?mode=delete', { method: 'DELETE' })
@@ -2816,8 +2814,8 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
 
     expect(res.status).toBe(409)
     const body = await res.json()
-    expect(body.error).toMatch(/no longer terminal/i)
-    expect(mockDbDelete).toHaveBeenCalled()
+    expect(body.error).toMatch(/retains task, run, and review evidence/i)
+    expect(mockDbDelete).not.toHaveBeenCalled()
   })
 })
 
