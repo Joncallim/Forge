@@ -5,6 +5,7 @@ import { db } from '@/db'
 import { approvalGates, artifacts, tasks, workPackages } from '@/db/schema'
 import { getSession } from '@/lib/session'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
+import { recordHistoryRead } from '@/lib/mcps/history-reader'
 import type { McpExecutionDesign } from '@/worker/mcp-execution-design'
 import {
   buildMcpOperatorReview,
@@ -64,6 +65,30 @@ function parseReviewInput(value: unknown): McpPlanReviewInput | null {
         items,
       }
     : null
+}
+
+export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  try {
+    const session = await getSession(request)
+    if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    const { id: taskId } = await params
+    const existing = await getAccessibleTask(taskId, session.userId)
+    if (!existing) return NextResponse.json({ error: 'Task not found' }, { status: 404 })
+
+    await recordHistoryRead({
+      planVersion: '1',
+      taskId,
+      userId: session.userId,
+    }).catch(() => {})
+
+    return NextResponse.json({ taskId, planReview: null })
+  } catch (err) {
+    console.error('[mcp-plan-review GET] Unexpected error', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+  }
 }
 
 export async function POST(
