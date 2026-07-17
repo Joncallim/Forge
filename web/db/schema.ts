@@ -217,8 +217,8 @@ export const forgeReleaseSignerKeys = pgTable(
     publicKeySpki: bytea('public_key_spki').notNull(),
     githubAppId: text('github_app_id').notNull(),
     rulesetFingerprint: text('ruleset_fingerprint').notNull(),
-    // active keys may sign new records; retiring/retired keys verify only.
-    status: text('status').notNull().default('active'),
+    // Staged keys cannot sign; active keys may; retiring/retired keys verify only.
+    status: text('status').notNull().default('staged'),
     validFrom: timestamp('valid_from', tsOpts).notNull(),
     validUntil: timestamp('valid_until', tsOpts).notNull(),
     activatedAt: timestamp('activated_at', tsOpts),
@@ -238,13 +238,14 @@ export const forgeReleaseSignerKeys = pgTable(
     check('forge_release_signer_keys_algorithm_chk', sql`${t.algorithm} = 'Ed25519'`),
     check('forge_release_signer_keys_public_key_chk', sql`octet_length(${t.publicKeySpki}) > 0`),
     check('forge_release_signer_keys_fingerprint_chk', sql`${t.rulesetFingerprint} ~ '^[0-9a-f]{64}$'`),
-    check('forge_release_signer_keys_status_chk', sql`${t.status} in ('active', 'retiring', 'retired')`),
+    check('forge_release_signer_keys_status_chk', sql`${t.status} in ('staged', 'active', 'retiring', 'retired')`),
     check('forge_release_signer_keys_validity_chk', sql`${t.validUntil} > ${t.validFrom}`),
     check(
       'forge_release_signer_keys_lifecycle_chk',
-      sql`(${t.status} = 'active' and ${t.retirementStartedAt} is null and ${t.retiredAt} is null)
-        or (${t.status} = 'retiring' and ${t.retirementStartedAt} is not null and ${t.retiredAt} is null)
-        or (${t.status} = 'retired' and ${t.retirementStartedAt} is not null and ${t.retiredAt} is not null)`,
+      sql`(${t.status} = 'staged' and ${t.activatedAt} is null and ${t.retirementStartedAt} is null and ${t.retiredAt} is null)
+        or (${t.status} = 'active' and ${t.activatedAt} is not null and ${t.retirementStartedAt} is null and ${t.retiredAt} is null)
+        or (${t.status} = 'retiring' and ${t.activatedAt} is not null and ${t.retirementStartedAt} is not null and ${t.retiredAt} is null)
+        or (${t.status} = 'retired' and ${t.activatedAt} is not null and ${t.retirementStartedAt} is not null and ${t.retiredAt} is not null)`,
     ),
   ],
 )
@@ -276,11 +277,11 @@ export const forgeReleaseSignerKeyLifecycleAudits = pgTable(
     ),
     check(
       'forge_release_signer_lifecycle_prior_status_chk',
-      sql`${t.priorStatus} is null or ${t.priorStatus} in ('active', 'retiring', 'retired')`,
+      sql`${t.priorStatus} is null or ${t.priorStatus} in ('staged', 'active', 'retiring', 'retired')`,
     ),
     check(
       'forge_release_signer_lifecycle_new_status_chk',
-      sql`${t.newStatus} in ('active', 'retiring', 'retired')`,
+      sql`${t.newStatus} in ('staged', 'active', 'retiring', 'retired')`,
     ),
     check('forge_release_signer_lifecycle_actor_chk', sql`length(btrim(${t.actor})) between 1 and 200`),
     check('forge_release_signer_lifecycle_reason_chk', sql`length(${t.reason}) <= 1000`),
@@ -427,7 +428,8 @@ export const forgeEpic172ReleaseEvidenceConsumptions = pgTable(
   },
   (t) => [
     uniqueIndex('forge_epic_172_release_evidence_consumptions_receipt_idx').on(t.receiptId),
-    uniqueIndex('forge_epic_172_release_evidence_consumptions_authorization_idx').on(t.authorizationId),
+    uniqueIndex('forge_epic_172_release_evidence_consumptions_authorization_receipt_idx')
+      .on(t.authorizationId, t.receiptId),
     uniqueIndex('forge_epic_172_release_evidence_consumptions_identity_consumer_idx')
       .on(t.transitionIdentityDigest, t.consumerNode),
     index('forge_epic_172_release_evidence_consumptions_operation_idx').on(t.operationId),
@@ -460,7 +462,7 @@ export const forgeEpic172EnablementState = pgTable(
       .references(() => forgeEpic172TransitionAuthorizations.id, { onDelete: 'restrict' }),
     controllerLoginId: text('controller_login_id'),
     controllerRunId: text('controller_run_id'),
-    controllerTokenDigest: text('controller_token_digest'),
+    controllerTokenDigest: bytea('controller_token_digest'),
     leaseGeneration: bigint('lease_generation', { mode: 'number' }),
     lastHeartbeatAt: timestamp('last_heartbeat_at', tsOpts),
     leaseExpiresAt: timestamp('lease_expires_at', tsOpts),
@@ -473,7 +475,7 @@ export const forgeEpic172EnablementState = pgTable(
     check('forge_epic_172_enablement_state_chk', sql`${t.state} in ('disabled', 'provisional', 'active')`),
     check('forge_epic_172_enablement_sha_chk', sql`${t.reviewedSha} is null or ${t.reviewedSha} ~ '^[0-9a-f]{40,64}$'`),
     check('forge_epic_172_enablement_epoch_chk', sql`${t.epoch} is null or ${t.epoch} > 0`),
-    check('forge_epic_172_enablement_token_chk', sql`${t.controllerTokenDigest} is null or ${t.controllerTokenDigest} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_enablement_token_chk', sql`${t.controllerTokenDigest} is null or octet_length(${t.controllerTokenDigest}) = 32`),
     check('forge_epic_172_enablement_lease_generation_chk', sql`${t.leaseGeneration} is null or ${t.leaseGeneration} > 0`),
     check('forge_epic_172_enablement_fingerprint_chk', sql`${t.stateFingerprint} ~ '^[0-9a-f]{64}$'`),
     check(

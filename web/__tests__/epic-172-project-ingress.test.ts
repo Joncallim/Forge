@@ -25,7 +25,7 @@ function provisionalState(overrides: Partial<TestState> = {}): TestState {
     openingAuthorizationId: '00000000-0000-4000-8000-000000000002',
     controllerLoginId: 'forge-epic-172-controller',
     controllerRunId: 'controller-run-1',
-    controllerTokenDigest: 'b'.repeat(64),
+    controllerTokenDigest: Buffer.alloc(32, 0xb),
     leaseGeneration: 3,
     lastHeartbeatAt: HEARTBEAT,
     leaseExpiresAt: LEASE_EXPIRES,
@@ -164,9 +164,8 @@ describe('Epic 172 project route ingress sentinel', () => {
       fileURLToPath(new URL('../lib/projects/epic-172-project-ingress.ts', import.meta.url)),
       'utf8',
     )
-    expect(source).toContain('.from(forgeEpic172EnablementState)')
-    expect(source).toContain(".where(eq(forgeEpic172EnablementState.singletonId, 'epic-172'))")
-    expect(source).toContain('clock_timestamp()')
+    expect(source).toContain('from forge.read_epic_172_enablement_state_v1()')
+    expect(source).not.toContain('.from(forgeEpic172EnablementState)')
     expect(source).toContain("reason: 'database_unavailable'")
   })
 })

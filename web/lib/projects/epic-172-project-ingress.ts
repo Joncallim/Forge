@@ -1,10 +1,7 @@
-import { eq, sql } from 'drizzle-orm'
+import { sql } from 'drizzle-orm'
 import { NextResponse } from 'next/server'
 import { db } from '@/db'
-import {
-  forgeEpic172EnablementState,
-  type ForgeEpic172EnablementState,
-} from '@/db/schema'
+import type { ForgeEpic172EnablementState } from '@/db/schema'
 
 const PROVISIONAL_WINDOW_MS = 1_560_000
 const MAX_CONTROLLER_LEASE_MS = 45_000
@@ -60,6 +57,10 @@ function isDate(value: unknown): value is Date {
   return value instanceof Date && Number.isFinite(value.getTime())
 }
 
+function isDigestBytes(value: unknown): value is Uint8Array {
+  return value instanceof Uint8Array && value.byteLength === 32
+}
+
 function hasCoreIdentity(state: EnablementState): boolean {
   return isNonEmptyText(state.ownerOperationId)
     && isExactBuildSet(state.exactBuilds)
@@ -103,8 +104,7 @@ export function decideEpic172ProjectManagementIngress(
     state.finalReadinessReceiptId !== null
     || !isDate(state.startedAt)
     || !isDate(state.expiresAt)
-    || typeof state.controllerTokenDigest !== 'string'
-    || !DIGEST_PATTERN.test(state.controllerTokenDigest)
+    || !isDigestBytes(state.controllerTokenDigest)
     || !Number.isSafeInteger(state.leaseGeneration)
     || (state.leaseGeneration ?? 0) <= 0
     || !isDate(state.lastHeartbeatAt)
@@ -135,30 +135,28 @@ export function decideEpic172ProjectManagementIngress(
 
 export async function readEpic172ProjectManagementIngress(): Promise<Epic172ProjectIngressDecision> {
   try {
-    const rows = await db
-      .select({
-        state: forgeEpic172EnablementState.state,
-        ownerOperationId: forgeEpic172EnablementState.ownerOperationId,
-        exactBuilds: forgeEpic172EnablementState.exactBuilds,
-        reviewedSha: forgeEpic172EnablementState.reviewedSha,
-        epoch: forgeEpic172EnablementState.epoch,
-        startedAt: forgeEpic172EnablementState.startedAt,
-        expiresAt: forgeEpic172EnablementState.expiresAt,
-        enablementReceiptId: forgeEpic172EnablementState.enablementReceiptId,
-        finalReadinessReceiptId: forgeEpic172EnablementState.finalReadinessReceiptId,
-        openingAuthorizationId: forgeEpic172EnablementState.openingAuthorizationId,
-        controllerLoginId: forgeEpic172EnablementState.controllerLoginId,
-        controllerRunId: forgeEpic172EnablementState.controllerRunId,
-        controllerTokenDigest: forgeEpic172EnablementState.controllerTokenDigest,
-        leaseGeneration: forgeEpic172EnablementState.leaseGeneration,
-        lastHeartbeatAt: forgeEpic172EnablementState.lastHeartbeatAt,
-        leaseExpiresAt: forgeEpic172EnablementState.leaseExpiresAt,
-        stateFingerprint: forgeEpic172EnablementState.stateFingerprint,
-        databaseNow: sql<Date>`clock_timestamp()`,
-      })
-      .from(forgeEpic172EnablementState)
-      .where(eq(forgeEpic172EnablementState.singletonId, 'epic-172'))
-      .limit(2)
+    const rows = await db.execute<EnablementState & { databaseNow: Date }>(sql`
+      select
+        state,
+        owner_operation_id as "ownerOperationId",
+        exact_builds as "exactBuilds",
+        reviewed_sha as "reviewedSha",
+        epoch,
+        started_at as "startedAt",
+        expires_at as "expiresAt",
+        enablement_receipt_id::text as "enablementReceiptId",
+        final_readiness_receipt_id::text as "finalReadinessReceiptId",
+        opening_authorization_id::text as "openingAuthorizationId",
+        controller_login_id as "controllerLoginId",
+        controller_run_id as "controllerRunId",
+        controller_token_digest as "controllerTokenDigest",
+        lease_generation as "leaseGeneration",
+        last_heartbeat_at as "lastHeartbeatAt",
+        lease_expires_at as "leaseExpiresAt",
+        state_fingerprint as "stateFingerprint",
+        database_now as "databaseNow"
+      from forge.read_epic_172_enablement_state_v1()
+    `)
 
     if (rows.length !== 1) return { allowed: false, reason: 'missing_state' }
     const { databaseNow, ...state } = rows[0]
