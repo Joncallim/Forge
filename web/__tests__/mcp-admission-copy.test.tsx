@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { McpPresentation } from '@/components/mcps/McpPresentation'
 import {
   MCP_OPERATOR_RECOVERY_SUITE_ID,
   MCP_UI_MUTATION_HANDLERS,
@@ -190,6 +192,52 @@ describe('MCP admission operator copy', () => {
     expect(presentation).toMatchObject({ badgeText: 'Status unavailable', actions: [] })
     expect(JSON.stringify(presentation)).not.toContain(hostile)
     expect(JSON.stringify(presentation)).not.toContain('id_ed25519')
+  })
+
+  it('renders no empty action group and preserves primary-then-decline DOM order', () => {
+    const noActions = renderToStaticMarkup(
+      <McpPresentation presentation={admissionPresentation(decision({}))} />,
+    )
+    const twoActions = renderToStaticMarkup(
+      <McpPresentation
+        presentation={{
+          statusKey: 'action_required',
+          tone: 'warning',
+          badgeText: 'Recovery available',
+          headline: 'Review packet recovery',
+          body: 'Choose the next evidence-preserving action.',
+          actions: [
+            {
+              kind: 'retry_packet_execution',
+              label: 'Retry packet execution',
+              handler: 'retry_execution',
+              request: {
+                schemaVersion: 2,
+                priorRuntimeAuditId: '22222222-2222-4222-8222-222222222222',
+                markerFingerprint: `sha256:${'a'.repeat(64)}`,
+              },
+            },
+            {
+              kind: 'decline_packet_recovery',
+              label: 'Do not retry this package',
+              handler: 'decline_packet_recovery',
+              request: {
+                schemaVersion: 2,
+                priorRuntimeAuditId: '22222222-2222-4222-8222-222222222222',
+                markerFingerprint: `sha256:${'a'.repeat(64)}`,
+              },
+            },
+          ],
+        }}
+        renderAction={(action) => <button type="button">{action.label}</button>}
+      />,
+    )
+
+    expect(noActions).not.toContain('role="group"')
+    expect(twoActions).toContain('role="group"')
+    expect(twoActions.indexOf('Retry packet execution')).toBeLessThan(
+      twoActions.indexOf('Do not retry this package'),
+    )
   })
 })
 

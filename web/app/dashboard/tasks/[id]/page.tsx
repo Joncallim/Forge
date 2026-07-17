@@ -28,6 +28,7 @@ import {
   SelectTrigger,
 } from '@/components/ui/select'
 import { MarkdownView } from '@/components/MarkdownView'
+import { McpPresentation } from '@/components/mcps/McpPresentation'
 import { PlanDiffView } from '@/components/PlanDiffView'
 import { mergeAgentRun, useTaskStream } from '@/hooks/useTaskStream'
 import type { AgentRun, Artifact, TaskQuestion } from '@/hooks/useTaskStream'
@@ -40,6 +41,10 @@ import {
   latestMcpExecutionDesignFromArtifacts,
   type McpExecutionDesignMetadata,
 } from '@/lib/mcps/execution-design-metadata'
+import {
+  admissionPresentationFromUnknown,
+  type PresentationCta,
+} from '@/lib/mcps/admission-copy'
 import {
   artifactArrayField,
   mergeArtifacts,
@@ -1714,36 +1719,64 @@ function BrokerRetrySummary({ broker }: { broker: WorkforceRecord | null }) {
   )
 }
 
-function McpGrantCards({ grants }: { grants: WorkforceRecord[] }) {
+function PresentationActionButton({
+  action,
+  onActivate,
+}: {
+  action: PresentationCta
+  onActivate: (action: PresentationCta) => void
+}) {
+  const decline = action.kind === 'decline_packet_recovery' || action.kind === 'decline_local_retry'
+  return (
+    <Button
+      type="button"
+      size="sm"
+      variant={decline ? 'outline' : 'secondary'}
+      className="w-full sm:w-auto"
+      onClick={() => onActivate(action)}
+    >
+      {action.label}
+    </Button>
+  )
+}
+
+function McpGrantCards({
+  grants,
+  onAction,
+  packageId,
+  projectId,
+}: {
+  grants: WorkforceRecord[]
+  onAction: (action: PresentationCta) => void
+  packageId: string
+  projectId: string
+}) {
   if (grants.length === 0) return null
+  const packageGrantTargetId = packageId === '' ? undefined : `filesystem-grant-${packageId}`
 
   return (
     <div>
-      <p className="font-medium text-muted-foreground">Brokered MCP grant decisions</p>
+      <p className="font-medium text-muted-foreground">Current MCP admission</p>
       <p className="mt-1 text-muted-foreground">
-        No live MCP tool handles are issued in beta. These brokered decisions only shape run-scoped package instructions.
+        Current package admission is separate from plan history and run evidence. No live MCP tool handles are issued in beta.
       </p>
       <div className="mt-2 grid gap-2">
         {grants.map((grant, index) => {
-          const mcpId = stringField(grant, ['mcpId', 'id']) || 'MCP'
-          const status = stringField(grant, ['status', 'state']) || 'proposed'
-          const requirement = stringField(grant, ['requirement'])
-          const reason = stringField(grant, ['reason'])
-          const capabilities = stringArrayField(grant, ['capabilities', 'permissions'])
-          const fallback = describeMcpFallback(grant.fallback)
+          const presentation = admissionPresentationFromUnknown({
+            ...grant,
+            retryable: booleanField(grant, ['retryable']) ?? false,
+          }, {
+            projectId,
+            ...(packageGrantTargetId ? { packageGrantTargetId } : {}),
+          })
           return (
-            <div key={recordKey(grant, 'mcp-grant', index)} className="rounded-md border border-border bg-background px-2 py-1.5">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-mono text-xs font-medium text-foreground">{mcpId}</span>
-                <Badge variant="outline" className={statusBadgeClass(status)}>{statusLabel(status)}</Badge>
-                {requirement !== '' && <Badge variant="secondary">{requirement}</Badge>}
-              </div>
-              {reason !== '' && <p className="mt-1 text-muted-foreground">{reason}</p>}
-              {capabilities.length > 0 && (
-                <p className="mt-1 break-words font-mono text-[11px] text-muted-foreground">{capabilities.join(', ')}</p>
+            <McpPresentation
+              key={recordKey(grant, 'mcp-grant', index)}
+              presentation={presentation}
+              renderAction={(action) => (
+                <PresentationActionButton action={action} onActivate={onAction} />
               )}
-              {fallback !== '' && <p className="mt-1 text-muted-foreground">Fallback: {fallback}</p>}
-            </div>
+            />
           )
         })}
       </div>
@@ -1842,7 +1875,11 @@ function FilesystemGrantControls({
   }
 
   return (
-    <div className="rounded-md border border-border bg-background px-2.5 py-2">
+    <div
+      id={`filesystem-grant-${packageId}`}
+      tabIndex={-1}
+      className="scroll-mt-24 rounded-md border border-border bg-background px-2.5 py-2 outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+    >
       <div className="flex flex-wrap items-center gap-2">
         <p className="font-medium text-muted-foreground">Filesystem context grant</p>
         <Badge variant="outline" className={statusBadgeClass(effective.status)}>{statusLabel(effective.status)}</Badge>
@@ -2444,6 +2481,8 @@ function WorkforcePanel({
   filesystemAudits,
   fallbackAgents,
   onGateDecided,
+  onMcpAction,
+  projectId,
   taskId,
   taskStatus,
   artifacts,
@@ -2456,6 +2495,8 @@ function WorkforcePanel({
   filesystemAudits: FilesystemAudit[]
   fallbackAgents: PlannedAgent[]
   onGateDecided: () => Promise<void>
+  onMcpAction: (action: PresentationCta) => void
+  projectId: string
   taskId: string
   taskStatus: string | null
   artifacts: Artifact[]
@@ -2716,7 +2757,12 @@ function WorkforcePanel({
                             taskId={taskId}
                             taskStatus={taskStatus}
                           />
-                          <McpGrantCards grants={mcpGrants} />
+                          <McpGrantCards
+                            grants={mcpGrants}
+                            onAction={onMcpAction}
+                            packageId={pkgId}
+                            projectId={projectId}
+                          />
                           <McpSubtaskCards subtasks={mcpSubtasks} />
                           {packageArtifacts.length > 0 && (
                             <div>
@@ -3092,7 +3138,15 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
   )
 }
 
-function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | null }) {
+function McpAccessPlanPanel({
+  design,
+  onAction,
+  projectId,
+}: {
+  design: McpExecutionDesignMetadata | null
+  onAction: (action: PresentationCta) => void
+  projectId: string
+}) {
   if (!design) return null
 
   const proposed = design.proposed
@@ -3168,31 +3222,27 @@ function McpAccessPlanPanel({ design }: { design: McpExecutionDesignMetadata | n
           </div>
           <ul className="grid gap-2 text-xs">
             {grantPreview.decisions.map((decision) => {
-              const statusText = decision.status === 'blocked'
-                ? 'Do not assign MCP-backed work until this MCP issue is resolved.'
-                : decision.status === 'warning'
-                  ? 'Optional MCP access is unavailable. Continue using the Architect fallback.'
-                  : 'Plan-approved for prompt context only. Forge does not attach live MCP tools in beta.'
+              const primaryDecisionId = grantPreview.primaryDecision?.decisionId
+              const presentationGrantState = (
+                decision.mode === 'planning_only' ||
+                decision.mode === 'blocked' ||
+                decision.mode === 'deferred_live_mcp' ||
+                decision.mode === 'unknown_legacy'
+              ) ? { kind: 'not_applicable' } : decision.grantState
+              const presentation = admissionPresentationFromUnknown({
+                ...decision,
+                grantState: presentationGrantState,
+                retryable: grantPreview.retryable && primaryDecisionId === decision.decisionId,
+              }, { projectId })
 
               return (
-                <li key={decision.decisionId} className="rounded-md border border-border bg-muted/20 px-2.5 py-2">
-                  <div className="mb-1 flex flex-wrap items-center gap-2">
-                    <Badge variant="outline" className={statusBadgeClass(decision.status)}>{decision.status}</Badge>
-                    <span className="font-medium text-foreground">{decision.agent}</span>
-                    <span className="text-muted-foreground">{decision.mcpId}</span>
-                  </div>
-                  <p className="text-muted-foreground">{statusText}</p>
-                  {decision.capabilities.length > 0 && (
-                    <p className="mt-1 break-words text-muted-foreground">
-                      Proposed capabilities: {decision.capabilities.join(', ')}
-                    </p>
-                  )}
-                  {decision.health.status !== 'healthy' && (
-                    <p className="mt-1 text-muted-foreground">
-                      Status: {decision.health.installState}/{decision.health.status}
-                      {decision.health.error ? `: ${decision.health.error}` : ''}
-                    </p>
-                  )}
+                <li key={decision.decisionId}>
+                  <McpPresentation
+                    presentation={presentation}
+                    renderAction={(action) => (
+                      <PresentationActionButton action={action} onActivate={onAction} />
+                    )}
+                  />
                 </li>
               )
             })}
@@ -4074,6 +4124,31 @@ export default function TaskDetailPage() {
     }
   }
 
+  function handleMcpPresentationAction(action: PresentationCta) {
+    if (action.kind === 'link') {
+      router.push(action.href)
+      return
+    }
+    const targetId = action.kind === 'scroll'
+      ? action.targetId
+      : action.kind === 'request_changes'
+        ? 'task-plan-actions'
+        : action.kind === 'reapprove_packet_context'
+          ? action.targetId
+          : null
+    if (action.kind === 'request_changes') {
+      setActionMode('replan')
+      setActionError(null)
+    }
+    if (targetId) {
+      window.requestAnimationFrame(() => {
+        const target = document.getElementById(targetId)
+        target?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        target?.focus({ preventScroll: true })
+      })
+    }
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center px-4 py-16" role="status" aria-live="polite">
@@ -4341,7 +4416,11 @@ export default function TaskDetailPage() {
 
           {/* Approve / Change plan / Restart actions */}
           {isAwaitingApproval && (
-            <div className="mb-6 rounded-lg border border-border bg-card p-4">
+            <div
+              id="task-plan-actions"
+              tabIndex={-1}
+              className="mb-6 scroll-mt-24 rounded-lg border border-border bg-card p-4 outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+            >
               <p className="mb-3 text-sm font-medium text-foreground">
                 Review the plan. You can approve it, request changes, or restart the task.
               </p>
@@ -4562,7 +4641,11 @@ export default function TaskDetailPage() {
               the prompt rather than the workforce execution column. */}
           <div className="mb-6 grid gap-6">
             <CapabilityClassificationPanel classification={capabilityClassification} />
-            <McpAccessPlanPanel design={mcpExecutionDesign} />
+            <McpAccessPlanPanel
+              design={mcpExecutionDesign}
+              onAction={handleMcpPresentationAction}
+              projectId={task.projectId}
+            />
           </div>
 
           <TaskLogsPanel
@@ -4615,6 +4698,8 @@ export default function TaskDetailPage() {
             commandAudits={commandAudits}
             filesystemAudits={filesystemAudits}
             fallbackAgents={plannedAgents}
+            onMcpAction={handleMcpPresentationAction}
+            projectId={task.projectId}
             taskId={taskId}
             taskStatus={currentStatus}
             onGateDecided={loadTask}
