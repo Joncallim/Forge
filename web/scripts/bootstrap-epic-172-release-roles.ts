@@ -4,7 +4,6 @@ import { getRequiredEnv } from '@/lib/env'
 
 const ROLE_NAMES = [
   'forge_release_evidence_writer',
-  'forge_release_evidence_consumer',
   'forge_release_transition',
 ] as const
 const ROUTINES_OWNER = 'forge_release_routines_owner'
@@ -46,9 +45,6 @@ async function main(): Promise<void> {
       begin
         if not exists (select 1 from pg_roles where rolname = 'forge_release_evidence_writer') then
           create role forge_release_evidence_writer login noinherit nosuperuser nocreatedb nocreaterole noreplication;
-        end if;
-        if not exists (select 1 from pg_roles where rolname = 'forge_release_evidence_consumer') then
-          create role forge_release_evidence_consumer login noinherit nosuperuser nocreatedb nocreaterole noreplication;
         end if;
         if not exists (select 1 from pg_roles where rolname = 'forge_release_transition') then
           create role forge_release_transition login noinherit nosuperuser nocreatedb nocreaterole noreplication;
@@ -153,7 +149,6 @@ async function main(): Promise<void> {
       from pg_roles
       where rolname in (
         'forge_release_evidence_writer',
-        'forge_release_evidence_consumer',
         'forge_release_transition'
       )
       order by rolname

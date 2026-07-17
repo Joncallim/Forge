@@ -83,6 +83,17 @@ describe('Epic 172 signed release recorder boundary', () => {
     expect(migration).toContain('DROP INDEX public.forge_epic_172_release_evidence_consumptions_authorization_idx')
     expect(migration).toContain('forge_epic_172_release_evidence_consumptions_authorization_receipt_idx')
     expect(migration).toContain('UNIQUE INDEX forge_epic_172_release_evidence_consumptions_authorization_receipt_idx')
+    expect(migration).toContain('lock_epic_172_transition_verification_v1(\n  p_receipt_ids uuid[]')
+    expect(service).toContain('authorization.sourceReceiptIds.length !== input.receiptIds.length')
+    expect(service).toContain('for (const receiptId of receiptIds)')
+  })
+
+  it('persists the exact ordered required-evidence measurement contract', () => {
+    expect(migration).toContain('p_required_evidence jsonb')
+    expect(migration).toContain("WHEN 'enabled_build_tests_green' THEN ARRAY[")
+    expect(migration).toContain("claim.value ->> 'name' IS DISTINCT FROM v_expected_evidence_names")
+    expect(migration).toContain("claim.value ->> 'measurementDigest' ~ '^[0-9a-f]{64}$'")
+    expect(service).toContain('envelope.requiredEvidence.map')
   })
 
   it('stores and compares controller lease material as exact 32-byte values', () => {

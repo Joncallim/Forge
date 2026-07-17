@@ -42,6 +42,17 @@ export type Epic172ReleaseNodeId = typeof RUNTIME_NODE_IDS[number]
 export type Epic172CodeDependencyNodeId = typeof CODE_DEPENDENCY_NODE_IDS[number]
 export type Epic172ReleaseGraphName = 'codeDependencyGraph' | 'runtimeActivationGraph'
 
+export const EPIC_172_ENABLED_BUILD_TESTS_GREEN_REQUIRED_EVIDENCE = Object.freeze([
+  'post_activation_receipt_binding_verified',
+  'ingress_and_issuance_enabled_evidence_verified',
+  'static_suite_manifest_verified',
+  'executed_test_ids_verified',
+  'first_attempt_results_green',
+  'output_scan_green',
+  'teardown_verified',
+  'destruction_or_reimage_verified',
+] as const)
+
 export type Epic172ReleaseOwner = Readonly<{
   issue: number
   slice: 'step0' | 's3' | 's4' | 's5' | 's6'
@@ -346,6 +357,14 @@ export function getEpic172ReleaseOrderNode(id: Epic172ReleaseNodeId): Epic172Rel
   const node = epic172ReleaseOrder.nodes.find((candidate) => candidate.id === id)
   if (!node) throw new Error(`Epic 172 release-order node ${JSON.stringify(id)} is not registered`)
   return node
+}
+
+export function getEpic172RequiredEvidenceNames(
+  id: Epic172ReleaseNodeId | 'enabled_build_tests_green',
+): readonly string[] {
+  return id === 'enabled_build_tests_green'
+    ? EPIC_172_ENABLED_BUILD_TESTS_GREEN_REQUIRED_EVIDENCE
+    : getEpic172ReleaseOrderNode(id).requiredEvidence
 }
 
 export function getEpic172ReleaseOrderEdges(graph: Epic172ReleaseGraphName): readonly Epic172ReleaseEdge[] {

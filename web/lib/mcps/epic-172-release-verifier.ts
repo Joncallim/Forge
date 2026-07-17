@@ -6,6 +6,7 @@ import {
 } from 'node:crypto'
 import {
   getEpic172ReleaseOrderNode,
+  getEpic172RequiredEvidenceNames,
   type Epic172ReleaseNodeId,
 } from './epic-172-release-order'
 
@@ -33,6 +34,11 @@ export type Epic172EnvelopeOwner = Readonly<{
 
 export type Epic172ReleaseEvidenceKind = Epic172ReleaseNodeId | 'enabled_build_tests_green'
 
+export type Epic172RequiredEvidenceClaim = Readonly<{
+  name: string
+  measurementDigest: string
+}>
+
 export type Epic172ReleaseEvidenceEnvelope = Readonly<{
   envelopeVersion: 1
   receiptId: string
@@ -40,6 +46,7 @@ export type Epic172ReleaseEvidenceEnvelope = Readonly<{
   evidenceKind: Epic172ReleaseEvidenceKind
   owner: Epic172EnvelopeOwner
   exactBuilds: readonly string[]
+  requiredEvidence: readonly Epic172RequiredEvidenceClaim[]
   reviewedSha: string
   epoch: number | null
   predecessorReceiptIds: readonly string[]
@@ -223,6 +230,32 @@ function releaseEvidenceKindAt(value: unknown): Epic172ReleaseEvidenceKind {
   }
 }
 
+function requiredEvidenceAt(
+  value: unknown,
+  kind: Epic172ReleaseEvidenceKind,
+): readonly Epic172RequiredEvidenceClaim[] {
+  const expectedNames = getEpic172RequiredEvidenceNames(kind)
+  if (!Array.isArray(value) || value.length !== expectedNames.length) {
+    fail('requiredEvidence', `expected exactly ${expectedNames.length} ordered measurement claims for ${JSON.stringify(kind)}`)
+  }
+  return value.map((entry, index) => {
+    const record = recordAt(entry, `requiredEvidence[${index}]`, ['name', 'measurementDigest'])
+    const name = stringAt(record.name, `requiredEvidence[${index}].name`, 128)
+    if (name !== expectedNames[index]) {
+      fail(`requiredEvidence[${index}].name`, `expected ${JSON.stringify(expectedNames[index])}`)
+    }
+    return {
+      name,
+      measurementDigest: matchingStringAt(
+        record.measurementDigest,
+        `requiredEvidence[${index}].measurementDigest`,
+        DIGEST_PATTERN,
+        'a lowercase SHA-256 measurement digest',
+      ),
+    }
+  })
+}
+
 function targetNodeAt(value: unknown): Exclude<Epic172ReleaseNodeId, 'step0_retention_bridge'> {
   const node = releaseEvidenceKindAt(value)
   if (node === 'enabled_build_tests_green' || node === 'step0_retention_bridge') {
@@ -239,6 +272,7 @@ export function parseEpic172ReleaseEvidenceEnvelope(value: unknown): Epic172Rele
     'evidenceKind',
     'owner',
     'exactBuilds',
+    'requiredEvidence',
     'reviewedSha',
     'epoch',
     'predecessorReceiptIds',
@@ -260,6 +294,7 @@ export function parseEpic172ReleaseEvidenceEnvelope(value: unknown): Epic172Rele
   const exactBuilds = uniqueStringsAt(record.exactBuilds, 'exactBuilds', { min: 1, max: 8 })
   const epoch = nullablePositiveIntegerAt(record.epoch, 'epoch')
   assertBuildAndEpochContract(evidenceKind, exactBuilds, epoch)
+  const requiredEvidence = requiredEvidenceAt(record.requiredEvidence, evidenceKind)
   const predecessorReceiptIds = uniqueStringsAt(record.predecessorReceiptIds, 'predecessorReceiptIds', {
     min: 0,
     max: MAX_ARRAY_ITEMS,
@@ -299,6 +334,7 @@ export function parseEpic172ReleaseEvidenceEnvelope(value: unknown): Epic172Rele
     evidenceKind,
     owner,
     exactBuilds,
+    requiredEvidence,
     reviewedSha,
     epoch,
     predecessorReceiptIds,

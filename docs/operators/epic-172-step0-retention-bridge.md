@@ -14,8 +14,8 @@ evidence, and the external signer private key must never enter Forge.
 ## Before the maintenance window
 
 - Prepare separate PostgreSQL certificates and connection URLs for
-  `forge_release_evidence_writer`, `forge_release_evidence_consumer`, and
-  `forge_release_transition`. These roles are `LOGIN NOINHERIT`; do not give them
+  `forge_release_evidence_writer` and `forge_release_transition`. These roles are
+  `LOGIN NOINHERIT`; do not give them
   passwords, role memberships, or the normal Forge application URL.
 - Keep a short-lived administrator URL available for role creation and inspection.
 - Prepare an external Ed25519 signer. Forge receives its public key and detached
@@ -60,7 +60,7 @@ evidence, and the external signer private key must never enter Forge.
 
    The command exits nonzero unless the enablement row is disabled, the project
    hard-delete trigger is enabled, the exact 43 release/retention foreign keys use
-   `RESTRICT` or `NO ACTION`, and all four role identities have the expected login
+   `RESTRICT` or `NO ACTION`, and all three release role identities have the expected login
    and inheritance settings. `step0ReceiptCount` may still be zero at this point.
 
 7. Install and activate the external signer's public key through the certificate-
@@ -73,7 +73,7 @@ evidence, and the external signer private key must never enter Forge.
      --key-id 00000000-0000-4000-8000-000000000001 \
      --generation 1 \
      --public-key /outside-forge/release-public-key.pem \
-     --github-app-id forge-release-controller \
+     --github-app-id 172179 \
      --ruleset-fingerprint 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
      --valid-from 2026-07-17T00:00:00.000Z \
      --valid-until 2026-08-17T00:00:00.000Z \
@@ -90,6 +90,13 @@ evidence, and the external signer private key must never enter Forge.
    `step0_retention_bridge`. It must use an empty sorted predecessor list and the
    empty-set digest
    `4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945`.
+   Its `requiredEvidence` array must contain every Step 0 postcondition from the
+   release-order manifest, in that exact order. Each entry has only `name` and
+   `measurementDigest`; the digest is the lowercase SHA-256 digest of the
+   separately retained, bounded measurement artifact that proves that one
+   postcondition. Do not put raw logs, secrets, or an unbounded transcript in the
+   envelope. Digests shown in automated test fixtures are deterministic test data,
+   not production evidence.
    Fill `transitionIdentityDigest` with the shared
    `epic172TransitionIdentityDigest` algorithm. Only do this after a human has
    verified the route, ingress closure, drain, retention constraints, hard-delete

@@ -209,6 +209,7 @@ CREATE OR REPLACE FUNCTION forge.record_epic_172_release_evidence_v1(
   p_owner_issue integer,
   p_owner_slice text,
   p_exact_builds jsonb,
+  p_required_evidence jsonb,
   p_reviewed_sha text,
   p_epoch bigint,
   p_predecessor_receipt_ids jsonb,
@@ -234,6 +235,7 @@ DECLARE
   v_now timestamptz := pg_catalog.clock_timestamp();
   v_key public.forge_release_signer_keys%ROWTYPE;
   v_expected_kinds text[];
+  v_expected_evidence_names text[];
   v_actual_kinds text[];
   v_actual_count integer;
   v_expected_envelope jsonb;
@@ -288,6 +290,113 @@ BEGIN
     RAISE EXCEPTION 'Unknown Epic 172 evidence kind %', p_evidence_kind USING ERRCODE = '22023';
   END IF;
 
+  v_expected_evidence_names := CASE p_evidence_kind
+    WHEN 'step0_retention_bridge' THEN ARRAY[
+      'project_removal_route_archive_or_reject_before_filesystem_work',
+      'all_project_management_ingress_closed',
+      'pre_bridge_processes_and_sessions_drained',
+      'retention_foreign_keys_restrict_or_no_action',
+      'database_hard_delete_guard_installed',
+      'release_authentication_substrate_installed',
+      'enablement_state_initialized_disabled',
+      'signed_empty_predecessor_receipt_retained'
+    ]
+    WHEN 's3_issue_178' THEN ARRAY[
+      'step0_retention_bridge_receipt',
+      'grant_decision_revision_contract_green',
+      'operator_hold_and_reconciliation_contract_green',
+      'canonical_lock_order_contract_green',
+      'postgresql_s3_evidence_green'
+    ]
+    WHEN 's4_expand' THEN ARRAY[
+      's3_issue_178_receipt',
+      'additive_schema_and_protocol_v2_expansion_complete',
+      'root_reference_lifecycle_guards_green',
+      'postgresql_expansion_tests_green',
+      'all_v2_producers_disabled'
+    ]
+    WHEN 's4_producers_disabled' THEN ARRAY[
+      's4_expand_receipt',
+      'legacy_credentials_publishers_and_sessions_drained',
+      'expansion_journal_reconciled_through_watermark',
+      'project_root_bindings_complete',
+      'legacy_prompt_and_event_data_zero_scan_green',
+      'all_v2_producers_disabled'
+    ]
+    WHEN 's5_compatible_consumers_deployed' THEN ARRAY[
+      's4_producers_disabled_receipt',
+      'compatible_s5_evidence_consumers_deployed',
+      'disabled_s6_controller_and_supported_host_harness_deployed',
+      'writers_ingress_and_issuance_remain_disabled'
+    ]
+    WHEN 's6_pre_activation_green' THEN ARRAY[
+      's5_compatible_consumers_deployed_receipt',
+      'exact_pre_activation_manifest_green',
+      'supported_host_preflight_green',
+      'pinned_signer_lifecycle_green',
+      'writers_ingress_and_issuance_remain_disabled'
+    ]
+    WHEN 's4_controlled_activation' THEN ARRAY[
+      's6_pre_activation_green_receipt',
+      'legacy_claims_drained',
+      'host_root_and_task_readiness_green',
+      'controlled_activation_audit_retained',
+      'activated_epoch_committed',
+      'writers_ingress_and_issuance_remain_disabled'
+    ]
+    WHEN 's6_post_activation_green' THEN ARRAY[
+      's4_controlled_activation_receipt',
+      'exact_post_activation_manifest_green',
+      'pre_activation_receipt_binding_verified',
+      'controller_run_binding_verified',
+      'writers_ingress_and_issuance_remain_disabled'
+    ]
+    WHEN 'ingress_and_issuance_enabled' THEN ARRAY[
+      's6_post_activation_green_receipt',
+      'fresh_opening_transition_authorization',
+      'provisional_enablement_window_open',
+      'controller_lease_live',
+      'registered_s3_and_root_writers_enabled_first',
+      'queue_and_project_ingress_enabled_next',
+      'packet_issuance_enabled_last'
+    ]
+    WHEN 's5_s6_release_ready' THEN ARRAY[
+      'ingress_and_issuance_enabled_receipt',
+      'enabled_build_tests_green',
+      'provisional_enablement_and_controller_lease_live',
+      'fresh_final_transition_authorization',
+      'signed_final_readiness_envelope',
+      'enablement_promoted_active'
+    ]
+    WHEN 'enabled_build_tests_green' THEN ARRAY[
+      'post_activation_receipt_binding_verified',
+      'ingress_and_issuance_enabled_evidence_verified',
+      'static_suite_manifest_verified',
+      'executed_test_ids_verified',
+      'first_attempt_results_green',
+      'output_scan_green',
+      'teardown_verified',
+      'destruction_or_reimage_verified'
+    ]
+    ELSE NULL
+  END;
+  IF jsonb_typeof(p_required_evidence) <> 'array'
+     OR jsonb_array_length(p_required_evidence) <> pg_catalog.cardinality(v_expected_evidence_names)
+     OR EXISTS (
+       SELECT 1
+       FROM jsonb_array_elements(p_required_evidence) WITH ORDINALITY AS claim(value, ordinal)
+       WHERE jsonb_typeof(claim.value) <> 'object'
+          OR claim.value <> pg_catalog.jsonb_build_object(
+            'name', claim.value -> 'name',
+            'measurementDigest', claim.value -> 'measurementDigest'
+          )
+          OR claim.value ->> 'name' IS DISTINCT FROM v_expected_evidence_names[claim.ordinal::integer]
+          OR (claim.value ->> 'measurementDigest' ~ '^[0-9a-f]{64}$') IS NOT TRUE
+     ) THEN
+    RAISE EXCEPTION 'Epic 172 required-evidence measurements do not match the exact manifest contract for %', p_evidence_kind
+      USING ERRCODE = '22023';
+  END IF;
+
   IF jsonb_typeof(p_predecessor_receipt_ids) <> 'array'
      OR jsonb_array_length(p_predecessor_receipt_ids) <> pg_catalog.cardinality(v_expected_kinds)
      OR EXISTS (
@@ -327,6 +436,7 @@ BEGIN
     'evidenceKind', p_evidence_kind,
     'owner', pg_catalog.jsonb_build_object('issue', p_owner_issue, 'slice', p_owner_slice),
     'exactBuilds', p_exact_builds,
+    'requiredEvidence', p_required_evidence,
     'reviewedSha', p_reviewed_sha,
     'epoch', p_epoch,
     'predecessorReceiptIds', p_predecessor_receipt_ids,
@@ -347,13 +457,13 @@ BEGIN
 
   RETURN QUERY
   INSERT INTO public.forge_epic_172_release_evidence (
-    id, manifest_version, evidence_kind, owner_issue, owner_slice, exact_builds,
+    id, manifest_version, evidence_kind, owner_issue, owner_slice, exact_builds, required_evidence,
     reviewed_sha, epoch, predecessor_receipt_ids, predecessor_set_digest,
     transition_identity_digest, signer_key_id, signer_generation, github_app_id,
     controller_run_id, controller_job_id, signature_domain, envelope_version,
     envelope_digest, detached_signature, nonce, issued_at, recorded_at, envelope
   ) VALUES (
-    p_receipt_id, 1, p_evidence_kind, p_owner_issue, p_owner_slice, p_exact_builds,
+    p_receipt_id, 1, p_evidence_kind, p_owner_issue, p_owner_slice, p_exact_builds, p_required_evidence,
     p_reviewed_sha, p_epoch, p_predecessor_receipt_ids, p_predecessor_set_digest,
     p_transition_identity_digest, p_signer_key_id, p_signer_generation, p_github_app_id,
     p_controller_run_id, p_controller_job_id, 'forge:epic-172-release-evidence:v1', 1,
@@ -499,7 +609,7 @@ END;
 $$;
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION forge.lock_epic_172_transition_verification_v1(
-  p_receipt_id uuid,
+  p_receipt_ids uuid[],
   p_authorization_id uuid
 )
 RETURNS void
@@ -508,25 +618,56 @@ SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
-  v_receipt_signer uuid;
-  v_authorization_signer uuid;
+  v_receipt_count integer;
 BEGIN
   IF session_user <> 'forge_release_transition' THEN
     RAISE EXCEPTION 'Epic 172 transition verification locks require the dedicated transition login'
       USING ERRCODE = '42501';
   END IF;
-  SELECT signer_key_id INTO STRICT v_receipt_signer
+  IF pg_catalog.cardinality(p_receipt_ids) NOT BETWEEN 1 AND 64 THEN
+    RAISE EXCEPTION 'Epic 172 transition receipt set must contain 1..64 receipts'
+      USING ERRCODE = '22023';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.unnest(p_receipt_ids) WITH ORDINALITY AS receipt(id, ordinal)
+    WHERE ordinal > 1 AND id <= p_receipt_ids[ordinal::integer - 1]
+  ) THEN
+    RAISE EXCEPTION 'Epic 172 transition receipt set must be unique and canonically sorted'
+      USING ERRCODE = '22023';
+  END IF;
+
+  PERFORM 1
   FROM public.forge_epic_172_release_evidence
-  WHERE id = p_receipt_id
+  WHERE id = ANY(p_receipt_ids)
+  ORDER BY id
   FOR KEY SHARE;
-  SELECT signer_key_id INTO STRICT v_authorization_signer
+  GET DIAGNOSTICS v_receipt_count = ROW_COUNT;
+  IF v_receipt_count <> pg_catalog.cardinality(p_receipt_ids) THEN
+    RAISE EXCEPTION 'The exact Epic 172 transition receipt set is not retained'
+      USING ERRCODE = '23503';
+  END IF;
+
+  PERFORM 1
   FROM public.forge_epic_172_transition_authorizations
   WHERE id = p_authorization_id
   FOR KEY SHARE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'The exact Epic 172 transition authorization is not retained'
+      USING ERRCODE = '23503';
+  END IF;
   PERFORM 1
-  FROM public.forge_release_signer_keys
-  WHERE id = ANY(ARRAY[v_receipt_signer, v_authorization_signer])
-  ORDER BY id
+  FROM public.forge_release_signer_keys signer
+  WHERE signer.id IN (
+    SELECT evidence.signer_key_id
+    FROM public.forge_epic_172_release_evidence evidence
+    WHERE evidence.id = ANY(p_receipt_ids)
+    UNION
+    SELECT authorization_row.signer_key_id
+    FROM public.forge_epic_172_transition_authorizations authorization_row
+    WHERE authorization_row.id = p_authorization_id
+  )
+  ORDER BY signer.id
   FOR UPDATE;
 END;
 $$;
@@ -807,7 +948,7 @@ BEGIN
 END;
 $$;
 --> statement-breakpoint
-ALTER FUNCTION forge.record_epic_172_release_evidence_v1(uuid,text,integer,text,jsonb,text,bigint,jsonb,text,text,uuid,bigint,text,text,text,text,bytea,uuid,timestamptz,jsonb)
+ALTER FUNCTION forge.record_epic_172_release_evidence_v1(uuid,text,integer,text,jsonb,jsonb,text,bigint,jsonb,text,text,uuid,bigint,text,text,text,text,bytea,uuid,timestamptz,jsonb)
   OWNER TO forge_release_routines_owner;
 ALTER FUNCTION forge.record_epic_172_transition_authorization_v1(uuid,text,text,jsonb,text,integer,text,jsonb,text,bigint,text,text,text,text,uuid,bigint,text,bytea,uuid,timestamptz,timestamptz,jsonb)
   OWNER TO forge_release_routines_owner;
@@ -827,14 +968,14 @@ ALTER FUNCTION forge.lock_epic_172_signer_for_verification_v1(uuid)
   OWNER TO forge_release_routines_owner;
 ALTER FUNCTION forge.lock_epic_172_release_receipts_v1(uuid[])
   OWNER TO forge_release_routines_owner;
-ALTER FUNCTION forge.lock_epic_172_transition_verification_v1(uuid,uuid)
+ALTER FUNCTION forge.lock_epic_172_transition_verification_v1(uuid[],uuid)
   OWNER TO forge_release_routines_owner;
 ALTER FUNCTION forge.epic_172_controller_lease_digest_v1(bytea)
   OWNER TO forge_release_routines_owner;
 ALTER FUNCTION forge.constant_time_equal_32_v1(bytea,bytea)
   OWNER TO forge_release_routines_owner;
 --> statement-breakpoint
-REVOKE ALL ON FUNCTION forge.record_epic_172_release_evidence_v1(uuid,text,integer,text,jsonb,text,bigint,jsonb,text,text,uuid,bigint,text,text,text,text,bytea,uuid,timestamptz,jsonb)
+REVOKE ALL ON FUNCTION forge.record_epic_172_release_evidence_v1(uuid,text,integer,text,jsonb,jsonb,text,bigint,jsonb,text,text,uuid,bigint,text,text,text,text,bytea,uuid,timestamptz,jsonb)
   FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.record_epic_172_transition_authorization_v1(uuid,text,text,jsonb,text,integer,text,jsonb,text,bigint,text,text,text,text,uuid,bigint,text,bytea,uuid,timestamptz,timestamptz,jsonb)
   FROM PUBLIC;
@@ -854,7 +995,7 @@ REVOKE ALL ON FUNCTION forge.lock_epic_172_signer_for_verification_v1(uuid)
   FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.lock_epic_172_release_receipts_v1(uuid[])
   FROM PUBLIC;
-REVOKE ALL ON FUNCTION forge.lock_epic_172_transition_verification_v1(uuid,uuid)
+REVOKE ALL ON FUNCTION forge.lock_epic_172_transition_verification_v1(uuid[],uuid)
   FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.epic_172_controller_lease_digest_v1(bytea)
   FROM PUBLIC;
@@ -862,7 +1003,7 @@ REVOKE ALL ON FUNCTION forge.constant_time_equal_32_v1(bytea,bytea)
   FROM PUBLIC;
 --> statement-breakpoint
 GRANT USAGE ON SCHEMA forge TO forge_release_evidence_writer, forge_release_transition;
-GRANT EXECUTE ON FUNCTION forge.record_epic_172_release_evidence_v1(uuid,text,integer,text,jsonb,text,bigint,jsonb,text,text,uuid,bigint,text,text,text,text,bytea,uuid,timestamptz,jsonb)
+GRANT EXECUTE ON FUNCTION forge.record_epic_172_release_evidence_v1(uuid,text,integer,text,jsonb,jsonb,text,bigint,jsonb,text,text,uuid,bigint,text,text,text,text,bytea,uuid,timestamptz,jsonb)
   TO forge_release_evidence_writer;
 GRANT EXECUTE ON FUNCTION forge.record_epic_172_transition_authorization_v1(uuid,text,text,jsonb,text,integer,text,jsonb,text,bigint,text,text,text,text,uuid,bigint,text,bytea,uuid,timestamptz,timestamptz,jsonb)
   TO forge_release_evidence_writer;
@@ -880,7 +1021,7 @@ GRANT EXECUTE ON FUNCTION forge.lock_epic_172_signer_for_verification_v1(uuid)
   TO forge_release_evidence_writer, forge_release_transition;
 GRANT EXECUTE ON FUNCTION forge.lock_epic_172_release_receipts_v1(uuid[])
   TO forge_release_evidence_writer, forge_release_transition;
-GRANT EXECUTE ON FUNCTION forge.lock_epic_172_transition_verification_v1(uuid,uuid)
+GRANT EXECUTE ON FUNCTION forge.lock_epic_172_transition_verification_v1(uuid[],uuid)
   TO forge_release_transition;
 GRANT EXECUTE ON FUNCTION forge.epic_172_controller_lease_digest_v1(bytea)
   TO forge_release_transition;

@@ -25,6 +25,7 @@ type SignerRow = Readonly<{
 }>
 
 type StoredReleaseRow = Readonly<{
+  receiptId: string
   envelope: unknown
   envelopeDigest: string
   detachedSignature: Uint8Array
@@ -304,6 +305,7 @@ async function insertVerifiedEvidence(
       ${envelope.owner.issue}::integer,
       ${envelope.owner.slice}::text,
       ${tx.json([...envelope.exactBuilds])}::jsonb,
+      ${tx.json(envelope.requiredEvidence.map((claim) => ({ ...claim })))}::jsonb,
       ${envelope.reviewedSha}::text,
       ${envelope.epoch}::bigint,
       ${tx.json([...envelope.predecessorReceiptIds])}::jsonb,
@@ -417,28 +419,30 @@ export async function recordEpic172TransitionAuthorization(
 
 async function lockStoredTransition(
   tx: postgres.TransactionSql,
-  receiptId: string,
+  receiptIds: readonly string[],
   authorizationId: string,
 ): Promise<{
-  receipt: StoredReleaseRow
+  receipts: readonly StoredReleaseRow[]
   authorization: StoredAuthorizationRow
   signerById: Map<string, SignerRow>
 }> {
   await tx`
     select forge.lock_epic_172_transition_verification_v1(
-      ${receiptId}::uuid,
+      ${tx.array([...receiptIds])}::uuid[],
       ${authorizationId}::uuid
     )
   `
-  const [receipt] = await tx<StoredReleaseRow[]>`
+  const receipts = await tx<StoredReleaseRow[]>`
     select
+      id::text as "receiptId",
       envelope,
       envelope_digest as "envelopeDigest",
       detached_signature as "detachedSignature",
       signer_key_id::text as "signerKeyId",
       transition_identity_digest as "transitionIdentityDigest"
     from public.forge_epic_172_release_evidence
-    where id = ${receiptId}::uuid
+    where id = any(${tx.array([...receiptIds])}::uuid[])
+    order by id
   `
   const [authorization] = await tx<StoredAuthorizationRow[]>`
     select
@@ -452,10 +456,16 @@ async function lockStoredTransition(
     from public.forge_epic_172_transition_authorizations
     where id = ${authorizationId}::uuid
   `
-  if (!receipt || !authorization) {
+  if (receipts.length !== receiptIds.length || !authorization) {
     throw new Epic172ReleaseTransactionError('The exact release receipt and transition authorization are required.')
   }
-  const signerIds = [...new Set([receipt.signerKeyId, authorization.signerKeyId])].sort()
+  if (receipts.some((receipt, index) => receipt.receiptId !== receiptIds[index])) {
+    throw new Epic172ReleaseTransactionError('The release receipt set is not canonical.')
+  }
+  const signerIds = [...new Set([
+    ...receipts.map((receipt) => receipt.signerKeyId),
+    authorization.signerKeyId,
+  ])].sort()
   const signers = await tx<SignerRow[]>`
     select
       id::text as id,
@@ -468,30 +478,23 @@ async function lockStoredTransition(
   if (signers.length !== signerIds.length) {
     throw new Epic172ReleaseTransactionError('A signer key required by the transition is missing.')
   }
-  return { receipt, authorization, signerById: new Map(signers.map((signer) => [signer.id, signer])) }
+  return { receipts, authorization, signerById: new Map(signers.map((signer) => [signer.id, signer])) }
 }
 
 function verifyStoredTransition(
   locked: Awaited<ReturnType<typeof lockStoredTransition>>,
   databaseNow: Date,
   input: {
+    receiptIds: readonly string[]
     consumerNode: string
     operationId: string
     transitionIdentityDigest: string
   },
 ): void {
-  const receiptSigner = locked.signerById.get(locked.receipt.signerKeyId)
   const authorizationSigner = locked.signerById.get(locked.authorization.signerKeyId)
-  if (!receiptSigner || !authorizationSigner) {
+  if (!authorizationSigner) {
     throw new Epic172ReleaseTransactionError('The transition signer lock was lost.')
   }
-  const receipt = requireVerified(verifyEpic172ReleaseEvidence({
-    envelope: locked.receipt.envelope,
-    envelopeDigest: locked.receipt.envelopeDigest,
-    detachedSignature: locked.receipt.detachedSignature,
-    publicKeySpki: receiptSigner.publicKeySpki,
-    databaseNow,
-  }))
   const authorization = requireVerified(verifyEpic172TransitionAuthorization({
     envelope: locked.authorization.envelope,
     envelopeDigest: locked.authorization.envelopeDigest,
@@ -499,49 +502,89 @@ function verifyStoredTransition(
     publicKeySpki: authorizationSigner.publicKeySpki,
     databaseNow,
   }))
-  assertSignerGeneration(receiptSigner, receipt.signerGeneration)
   assertSignerGeneration(authorizationSigner, authorization.signerGeneration)
+  const receipts = locked.receipts.map((stored) => {
+    const signer = locked.signerById.get(stored.signerKeyId)
+    if (!signer) throw new Epic172ReleaseTransactionError('A transition receipt signer lock was lost.')
+    const receipt = requireVerified(verifyEpic172ReleaseEvidence({
+      envelope: stored.envelope,
+      envelopeDigest: stored.envelopeDigest,
+      detachedSignature: stored.detachedSignature,
+      publicKeySpki: signer.publicKeySpki,
+      databaseNow,
+    }))
+    assertSignerGeneration(signer, receipt.signerGeneration)
+    if (stored.receiptId !== receipt.receiptId || stored.transitionIdentityDigest !== receipt.transitionIdentityDigest) {
+      throw new Epic172ReleaseTransactionError('A stored receipt does not match its signed identity.')
+    }
+    return receipt
+  })
   if (
-    locked.receipt.transitionIdentityDigest !== receipt.transitionIdentityDigest
-    || locked.authorization.transitionIdentityDigest !== authorization.transitionIdentityDigest
+    locked.authorization.transitionIdentityDigest !== authorization.transitionIdentityDigest
     || authorization.transitionIdentityDigest !== input.transitionIdentityDigest
     || authorization.targetNode !== input.consumerNode
     || authorization.operationId !== input.operationId
-    || !authorization.sourceReceiptIds.includes(receipt.receiptId)
+    || authorization.sourceReceiptIds.length !== input.receiptIds.length
+    || authorization.sourceReceiptIds.some((receiptId, index) => receiptId !== input.receiptIds[index])
+    || receipts.some((receipt, index) => receipt.receiptId !== input.receiptIds[index])
   ) {
     throw new Epic172ReleaseTransactionError('The receipt and authorization do not bind the exact requested transition.')
   }
 }
 
+type Epic172AuthorizedTransitionReceiptInput =
+  | Readonly<{ receiptIds: readonly string[]; receiptId?: never }>
+  | Readonly<{ receiptId: string; receiptIds?: never }>
+
+function canonicalTransitionReceiptIds(input: Epic172AuthorizedTransitionReceiptInput): readonly string[] {
+  const receiptIds = 'receiptIds' in input ? [...(input.receiptIds ?? [])] : [input.receiptId]
+  if (receiptIds.length === 0 || receiptIds.length > 64) {
+    throw new Epic172ReleaseTransactionError('A transition requires 1..64 exact receipt IDs.')
+  }
+  const sorted = [...receiptIds].sort()
+  if (new Set(receiptIds).size !== receiptIds.length || sorted.some((receiptId, index) => receiptId !== receiptIds[index])) {
+    throw new Epic172ReleaseTransactionError('Transition receipt IDs must be unique and canonically sorted.')
+  }
+  return receiptIds
+}
+
 export async function runEpic172AuthorizedTransition<Result>(input: Readonly<{
   databaseUrl: string
-  receiptId: string
   authorizationId: string
   consumerNode: string
   transitionIdentityDigest: string
   operationId: string
   applyTransition: (tx: postgres.TransactionSql) => Promise<Result>
-}>): Promise<{ consumption: Epic172EvidenceConsumption; result: Result }> {
+}> & Epic172AuthorizedTransitionReceiptInput): Promise<{
+  consumption: Epic172EvidenceConsumption
+  consumptions: readonly Epic172EvidenceConsumption[]
+  result: Result
+}> {
+  const receiptIds = canonicalTransitionReceiptIds(input)
   const client = releaseClient(input.databaseUrl)
   try {
     return await client.begin('isolation level serializable', async (tx) => {
       const databaseNow = await assertPrincipal(tx, RELEASE_TRANSITION)
-      const locked = await lockStoredTransition(tx, input.receiptId, input.authorizationId)
-      verifyStoredTransition(locked, databaseNow, input)
+      const locked = await lockStoredTransition(tx, receiptIds, input.authorizationId)
+      verifyStoredTransition(locked, databaseNow, { ...input, receiptIds })
 
-      const [consumption] = await tx<Epic172EvidenceConsumption[]>`
-        select
-          consumption_id::text as "consumptionId",
-          consumed_at as "consumedAt"
-        from forge.consume_epic_172_release_evidence_v1(
-          ${input.receiptId}::uuid,
-          ${input.authorizationId}::uuid,
-          ${input.consumerNode}::text,
-          ${input.transitionIdentityDigest}::text,
-          ${input.operationId}::text
-        )
-      `
-      if (!consumption) throw new Epic172ReleaseTransactionError('The release receipt was not consumed.')
+      const consumptions: Epic172EvidenceConsumption[] = []
+      for (const receiptId of receiptIds) {
+        const [consumption] = await tx<Epic172EvidenceConsumption[]>`
+          select
+            consumption_id::text as "consumptionId",
+            consumed_at as "consumedAt"
+          from forge.consume_epic_172_release_evidence_v1(
+            ${receiptId}::uuid,
+            ${input.authorizationId}::uuid,
+            ${input.consumerNode}::text,
+            ${input.transitionIdentityDigest}::text,
+            ${input.operationId}::text
+          )
+        `
+        if (!consumption) throw new Epic172ReleaseTransactionError('The exact release receipt set was not consumed.')
+        consumptions.push(consumption)
+      }
 
       const result = await input.applyTransition(tx)
       await tx`
@@ -550,7 +593,7 @@ export async function runEpic172AuthorizedTransition<Result>(input: Readonly<{
           ${input.operationId}::text
         )
       `
-      return { consumption, result }
+      return { consumption: consumptions[0], consumptions, result }
     })
   } finally {
     await client.end({ timeout: 5 })

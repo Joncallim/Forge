@@ -8,6 +8,11 @@ import postgres from 'postgres'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import controllerLeaseFixture from './__fixtures__/epic-172-controller-lease-v1.json'
 import {
+  getEpic172ReleaseOrderNode,
+  getEpic172RequiredEvidenceNames,
+  type Epic172ReleaseNodeId,
+} from '@/lib/mcps/epic-172-release-order'
+import {
   activateEpic172ReleaseSigner,
   installEpic172ReleaseSigner,
   recordEpic172ReleaseEvidence,
@@ -22,6 +27,9 @@ import {
   epic172TransitionAuthorizationSignedBytes,
   epic172TransitionIdentityDigest,
   type CanonicalJsonValue,
+  type Epic172ReleaseEvidenceEnvelope,
+  type Epic172ReleaseEvidenceKind,
+  type Epic172TransitionAuthorizationEnvelope,
 } from '@/lib/mcps/epic-172-release-verifier'
 
 const WRITER_URL = process.env.FORGE_EPIC_172_TEST_WRITER_DATABASE_URL
@@ -39,29 +47,53 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
   let step0ReceiptId = ''
   let step0Envelope: ReturnType<typeof makeStep0Envelope>
 
-  function makeStep0Envelope(overrides: Record<string, unknown> = {}) {
-    const predecessorReceiptIds: string[] = []
-    const predecessorSetDigest = epic172ReceiptSetDigest(predecessorReceiptIds)
+  function releaseContract(kind: Epic172ReleaseEvidenceKind) {
+    if (kind === 'enabled_build_tests_green') {
+      return {
+        owner: { issue: 181, slice: 's6' } as const,
+        buildSlots: ['issue_179_s4', 'issue_180_s5', 'issue_181_s6'] as const,
+        epoch: 7,
+      }
+    }
+    const node = getEpic172ReleaseOrderNode(kind)
+    return {
+      owner: node.owner,
+      buildSlots: node.buildIdentity.exactBuilds,
+      epoch: node.buildIdentity.epoch === 'required' ? 7 : null,
+    }
+  }
+
+  function makeReleaseEnvelope(
+    evidenceKind: Epic172ReleaseEvidenceKind,
+    predecessorReceiptIds: readonly string[],
+  ): Epic172ReleaseEvidenceEnvelope {
+    const canonicalPredecessors = [...predecessorReceiptIds].sort()
+    const predecessorSetDigest = epic172ReceiptSetDigest(canonicalPredecessors)
     const reviewedSha = randomBytes(20).toString('hex')
-    const exactBuilds = [`issue_179_step0@${reviewedSha}`]
-    const envelope = {
+    const contract = releaseContract(evidenceKind)
+    const exactBuilds = contract.buildSlots.map((slot) => `${slot}@${reviewedSha}`)
+    return {
       envelopeVersion: 1,
       receiptId: randomUUID(),
       manifestVersion: 1,
-      evidenceKind: 'step0_retention_bridge',
-      owner: { issue: 179, slice: 'step0' },
+      evidenceKind,
+      owner: contract.owner,
       exactBuilds,
+      requiredEvidence: getEpic172RequiredEvidenceNames(evidenceKind).map((name, index) => ({
+        name,
+        measurementDigest: (index + 1).toString(16).padStart(64, '0'),
+      })),
       reviewedSha,
-      epoch: null,
-      predecessorReceiptIds,
+      epoch: contract.epoch,
+      predecessorReceiptIds: canonicalPredecessors,
       predecessorSetDigest,
       transitionIdentityDigest: epic172TransitionIdentityDigest({
         manifestVersion: 1,
-        nodeOrRequiredEvidenceKind: 'step0_retention_bridge',
-        owner: { issue: 179, slice: 'step0' },
+        nodeOrRequiredEvidenceKind: evidenceKind,
+        owner: contract.owner,
         exactBuilds,
         reviewedSha,
-        epoch: null,
+        epoch: contract.epoch,
         canonicalPredecessorReceiptSetDigest: predecessorSetDigest,
       }),
       signerKeyId,
@@ -71,12 +103,23 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
       controllerJobId: 'postgres-recorder-job',
       nonce: randomUUID(),
       issuedAt: new Date().toISOString(),
+    }
+  }
+
+  function makeStep0Envelope(
+    overrides: Partial<Epic172ReleaseEvidenceEnvelope> = {},
+  ): Epic172ReleaseEvidenceEnvelope {
+    const envelope = {
+      ...makeReleaseEnvelope('step0_retention_bridge', []),
       ...overrides,
     }
     return envelope
   }
 
-  function makeS3Authorization(receiptId: string, lifetimeMs = 5 * 60_000) {
+  function makeS3Authorization(
+    receiptId: string,
+    lifetimeMs = 5 * 60_000,
+  ): Epic172TransitionAuthorizationEnvelope {
     const issuedAt = new Date()
     const sourceReceiptIds = [receiptId]
     const sourceReceiptSetDigest = epic172ReceiptSetDigest(sourceReceiptIds)
@@ -114,7 +157,7 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
     }
   }
 
-  async function recordRelease(envelope: ReturnType<typeof makeStep0Envelope>) {
+  async function recordRelease(envelope: Epic172ReleaseEvidenceEnvelope) {
     const detachedSignature = sign(null, epic172ReleaseEvidenceSignedBytes(envelope), keys.privateKey)
     return recordEpic172ReleaseEvidence({
       databaseUrl: WRITER_URL!,
@@ -124,7 +167,7 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
     })
   }
 
-  async function recordAuthorization(envelope: ReturnType<typeof makeS3Authorization>) {
+  async function recordAuthorization(envelope: Epic172TransitionAuthorizationEnvelope) {
     const detachedSignature = sign(null, epic172TransitionAuthorizationSignedBytes(envelope), keys.privateKey)
     return recordEpic172TransitionAuthorization({
       databaseUrl: WRITER_URL!,
@@ -132,6 +175,72 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
       envelopeDigest: epic172EnvelopeDigest(envelope as CanonicalJsonValue),
       detachedSignature,
     })
+  }
+
+  async function seedFinalReadinessSources(): Promise<readonly [string, string]> {
+    let predecessorReceiptId = step0ReceiptId
+    const chain: readonly Epic172ReleaseNodeId[] = [
+      's3_issue_178',
+      's4_expand',
+      's4_producers_disabled',
+      's5_compatible_consumers_deployed',
+      's6_pre_activation_green',
+      's4_controlled_activation',
+      's6_post_activation_green',
+      'ingress_and_issuance_enabled',
+    ]
+    for (const evidenceKind of chain) {
+      predecessorReceiptId = (await recordRelease(
+        makeReleaseEnvelope(evidenceKind, [predecessorReceiptId]),
+      )).receiptId
+    }
+    const enabledBuildTestsGreen = await recordRelease(
+      makeReleaseEnvelope('enabled_build_tests_green', [predecessorReceiptId]),
+    )
+    return [enabledBuildTestsGreen.receiptId, predecessorReceiptId].sort() as [string, string]
+  }
+
+  function makeFinalReadinessAuthorization(
+    sourceReceiptIds: readonly [string, string],
+  ): Epic172TransitionAuthorizationEnvelope {
+    const sourceReceiptSetDigest = epic172ReceiptSetDigest(sourceReceiptIds)
+    const reviewedSha = randomBytes(20).toString('hex')
+    const exactBuilds = [
+      `issue_179_s4@${reviewedSha}`,
+      `issue_180_s5@${reviewedSha}`,
+      `issue_181_s6@${reviewedSha}`,
+    ]
+    const issuedAt = new Date()
+    return {
+      envelopeVersion: 1,
+      authorizationId: randomUUID(),
+      manifestVersion: 1,
+      targetNode: 's5_s6_release_ready',
+      transitionIdentityDigest: epic172TransitionIdentityDigest({
+        manifestVersion: 1,
+        nodeOrRequiredEvidenceKind: 's5_s6_release_ready',
+        owner: { issue: 181, slice: 's6' },
+        exactBuilds,
+        reviewedSha,
+        epoch: 7,
+        canonicalPredecessorReceiptSetDigest: sourceReceiptSetDigest,
+      }),
+      sourceReceiptIds,
+      sourceReceiptSetDigest,
+      owner: { issue: 181, slice: 's6' },
+      exactBuilds,
+      reviewedSha,
+      epoch: 7,
+      operationId: `postgres-final-readiness-${randomUUID()}`,
+      operation: 'record_final_readiness_receipt',
+      controllerLoginId: 'forge-epic-172-postgres-test',
+      controllerRunId: 'postgres-recorder-run',
+      signerKeyId,
+      signerGeneration: 1,
+      nonce: randomUUID(),
+      issuedAt: issuedAt.toISOString(),
+      expiresAt: new Date(issuedAt.getTime() + 5 * 60_000).toISOString(),
+    }
   }
 
   beforeAll(async () => {
@@ -185,7 +294,7 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
     await expect(app`select * from public.forge_epic_172_enablement_state`).rejects.toThrow(/permission denied/)
     await expect(app`
       select forge.record_epic_172_release_evidence_v1(
-        null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null
+        null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null
       )
     `).rejects.toThrow(/permission denied/)
   })
@@ -217,6 +326,13 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
   })
 
   it('retains one canonical identity and rejects wrong signatures before insertion', async () => {
+    const [stored] = await writer<{ requiredEvidence: unknown }[]>`
+      select required_evidence as "requiredEvidence"
+      from public.forge_epic_172_release_evidence
+      where id = ${step0ReceiptId}::uuid
+    `
+    expect(stored?.requiredEvidence).toEqual(step0Envelope.requiredEvidence)
+
     const duplicate = {
       ...step0Envelope,
       receiptId: randomUUID(),
@@ -268,6 +384,49 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
     ])
     expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1)
     expect(outcomes.filter((outcome) => outcome.status === 'rejected')).toHaveLength(1)
+  })
+
+  it('atomically consumes both final-readiness receipts with one race winner', async () => {
+    const receiptIds = await seedFinalReadinessSources()
+    const authorization = makeFinalReadinessAuthorization(receiptIds)
+    await recordAuthorization(authorization)
+    const transitionInput = {
+      databaseUrl: TRANSITION_URL!,
+      receiptIds,
+      authorizationId: authorization.authorizationId,
+      consumerNode: authorization.targetNode,
+      transitionIdentityDigest: authorization.transitionIdentityDigest,
+      operationId: authorization.operationId,
+    }
+
+    await expect(runEpic172AuthorizedTransition({
+      ...transitionInput,
+      applyTransition: async () => { throw new Error('injected final-readiness failure') },
+    })).rejects.toThrow(/injected final-readiness failure/)
+    const [{ afterRollback }] = await transition<{ afterRollback: number }[]>`
+      select count(*)::integer as "afterRollback"
+      from public.forge_epic_172_release_evidence_consumptions
+      where authorization_id = ${authorization.authorizationId}::uuid
+    `
+    expect(afterRollback).toBe(0)
+
+    const outcomes = await Promise.allSettled([
+      runEpic172AuthorizedTransition({ ...transitionInput, applyTransition: async () => 'first' }),
+      runEpic172AuthorizedTransition({ ...transitionInput, applyTransition: async () => 'second' }),
+    ])
+    const fulfilled = outcomes.filter((outcome) => outcome.status === 'fulfilled')
+    expect(fulfilled).toHaveLength(1)
+    expect(outcomes.filter((outcome) => outcome.status === 'rejected')).toHaveLength(1)
+    if (fulfilled[0]?.status !== 'fulfilled') throw new Error('expected one final-readiness race winner')
+    expect(fulfilled[0]?.value.consumptions).toHaveLength(2)
+
+    const committed = await transition<{ receiptId: string }[]>`
+      select receipt_id::text as "receiptId"
+      from public.forge_epic_172_release_evidence_consumptions
+      where authorization_id = ${authorization.authorizationId}::uuid
+      order by receipt_id
+    `
+    expect(committed.map((row) => row.receiptId)).toEqual(receiptIds)
   })
 
   it('rechecks expiry after transition work and rolls back a late consumption', async () => {

@@ -2019,6 +2019,12 @@
           "primaryKey": false,
           "notNull": true
         },
+        "required_evidence": {
+          "name": "required_evidence",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true
+        },
         "reviewed_sha": {
           "name": "reviewed_sha",
           "type": "text",
@@ -2255,6 +2261,10 @@
         "forge_epic_172_release_evidence_builds_chk": {
           "name": "forge_epic_172_release_evidence_builds_chk",
           "value": "jsonb_typeof(\"forge_epic_172_release_evidence\".\"exact_builds\") = 'array' and jsonb_array_length(\"forge_epic_172_release_evidence\".\"exact_builds\") > 0"
+        },
+        "forge_epic_172_release_evidence_required_evidence_chk": {
+          "name": "forge_epic_172_release_evidence_required_evidence_chk",
+          "value": "jsonb_typeof(\"forge_epic_172_release_evidence\".\"required_evidence\") = 'array' and jsonb_array_length(\"forge_epic_172_release_evidence\".\"required_evidence\") > 0"
         },
         "forge_epic_172_release_evidence_sha_chk": {
           "name": "forge_epic_172_release_evidence_sha_chk",

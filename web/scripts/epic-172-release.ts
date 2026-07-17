@@ -277,7 +277,6 @@ async function inspectReleaseBridge(): Promise<boolean> {
       where rolname = any(${sql.array([
         'forge_release_routines_owner',
         'forge_release_evidence_writer',
-        'forge_release_evidence_consumer',
         'forge_release_transition',
       ])}::text[])
       order by rolname
@@ -297,7 +296,7 @@ async function inspectReleaseBridge(): Promise<boolean> {
     ))
     const principalsReady = roleMap.get('forge_release_routines_owner')?.canLogin === false
       && roleMap.get('forge_release_routines_owner')?.inherits === false
-      && ['forge_release_evidence_writer', 'forge_release_evidence_consumer', 'forge_release_transition']
+      && ['forge_release_evidence_writer', 'forge_release_transition']
         .every((role) => roleMap.get(role)?.canLogin === true && roleMap.get(role)?.inherits === false)
     const ready = enablement?.state === 'disabled'
       && missingOrUnsafeForeignKeys.length === 0

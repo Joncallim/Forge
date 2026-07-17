@@ -76,6 +76,7 @@ CREATE TABLE "forge_epic_172_release_evidence" (
 	"owner_issue" integer NOT NULL,
 	"owner_slice" text NOT NULL,
 	"exact_builds" jsonb NOT NULL,
+	"required_evidence" jsonb NOT NULL,
 	"reviewed_sha" text NOT NULL,
 	"epoch" bigint,
 	"predecessor_receipt_ids" jsonb DEFAULT '[]'::jsonb NOT NULL,
@@ -98,6 +99,7 @@ CREATE TABLE "forge_epic_172_release_evidence" (
 	CONSTRAINT "forge_epic_172_release_evidence_owner_issue_chk" CHECK ("forge_epic_172_release_evidence"."owner_issue" > 0),
 	CONSTRAINT "forge_epic_172_release_evidence_owner_slice_chk" CHECK ("forge_epic_172_release_evidence"."owner_slice" in ('step0', 's3', 's4', 's5', 's6')),
 	CONSTRAINT "forge_epic_172_release_evidence_builds_chk" CHECK (jsonb_typeof("forge_epic_172_release_evidence"."exact_builds") = 'array' and jsonb_array_length("forge_epic_172_release_evidence"."exact_builds") > 0),
+	CONSTRAINT "forge_epic_172_release_evidence_required_evidence_chk" CHECK (jsonb_typeof("forge_epic_172_release_evidence"."required_evidence") = 'array' and jsonb_array_length("forge_epic_172_release_evidence"."required_evidence") > 0),
 	CONSTRAINT "forge_epic_172_release_evidence_sha_chk" CHECK ("forge_epic_172_release_evidence"."reviewed_sha" ~ '^[0-9a-f]{40,64}$'),
 	CONSTRAINT "forge_epic_172_release_evidence_epoch_chk" CHECK ("forge_epic_172_release_evidence"."epoch" is null or "forge_epic_172_release_evidence"."epoch" > 0),
 	CONSTRAINT "forge_epic_172_release_evidence_predecessors_chk" CHECK (jsonb_typeof("forge_epic_172_release_evidence"."predecessor_receipt_ids") = 'array'),
@@ -304,9 +306,6 @@ BEGIN
 	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'forge_release_evidence_writer') THEN
 		CREATE ROLE forge_release_evidence_writer LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
 	END IF;
-	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'forge_release_evidence_consumer') THEN
-		CREATE ROLE forge_release_evidence_consumer LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
-	END IF;
 	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'forge_release_transition') THEN
 		CREATE ROLE forge_release_transition LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
 	END IF;
@@ -321,7 +320,7 @@ REVOKE ALL ON TABLE
 	"forge_epic_172_release_evidence_consumptions",
 	"forge_epic_172_enablement_state",
 	"forge_epic_172_enablement_transition_audits"
-FROM PUBLIC, forge_release_evidence_writer, forge_release_evidence_consumer, forge_release_transition;
+FROM PUBLIC, forge_release_evidence_writer, forge_release_transition;
 --> statement-breakpoint
 GRANT SELECT ON TABLE
 	"forge_release_signer_keys",
@@ -329,13 +328,6 @@ GRANT SELECT ON TABLE
 	"forge_epic_172_release_evidence",
 	"forge_epic_172_transition_authorizations"
 TO forge_release_evidence_writer;
---> statement-breakpoint
-GRANT SELECT ON TABLE
-	"forge_release_signer_keys",
-	"forge_epic_172_release_evidence",
-	"forge_epic_172_transition_authorizations",
-	"forge_epic_172_release_evidence_consumptions"
-TO forge_release_evidence_consumer;
 --> statement-breakpoint
 GRANT SELECT ON TABLE
 	"forge_release_signer_keys",

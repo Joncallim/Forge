@@ -3,6 +3,7 @@ import {
   sign,
 } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
+import { getEpic172RequiredEvidenceNames } from '@/lib/mcps/epic-172-release-order'
 import {
   canonicalizeEpic172Json,
   EPIC_172_RELEASE_EVIDENCE_DOMAIN,
@@ -29,13 +30,18 @@ function keyPair() {
 }
 
 function releaseEnvelope(overrides: Record<string, unknown> = {}) {
+  const evidenceKind = (overrides.evidenceKind ?? 'step0_retention_bridge') as 'step0_retention_bridge'
   const envelope = {
     envelopeVersion: 1,
     receiptId: '00000000-0000-4000-8000-000000000001',
     manifestVersion: 1,
-    evidenceKind: 'step0_retention_bridge',
+    evidenceKind,
     owner: { issue: 179, slice: 'step0' },
     exactBuilds: ['issue_179_step0@café'],
+    requiredEvidence: getEpic172RequiredEvidenceNames(evidenceKind).map((name, index) => ({
+      name,
+      measurementDigest: (index + 1).toString(16).padStart(64, '0'),
+    })),
     reviewedSha: 'a'.repeat(40),
     epoch: null,
     predecessorReceiptIds: [],
@@ -195,6 +201,34 @@ describe('Epic 172 release envelope verifier', () => {
     expect(() => epic172ReleaseEvidenceSignedBytes(releaseEnvelope({
       predecessorReceiptIds: ['00000000-0000-4000-8000-000000000006'],
     }))).toThrow(/only Step 0/)
+  })
+
+  it('cryptographically binds the exact ordered postcondition measurements', () => {
+    const envelope = releaseEnvelope()
+    const keys = keyPair()
+    const detachedSignature = sign(null, epic172ReleaseEvidenceSignedBytes(envelope), keys.privateKey)
+    const changedMeasurement = structuredClone(envelope)
+    changedMeasurement.requiredEvidence[0].measurementDigest = 'f'.repeat(64)
+    expect(verifyEpic172ReleaseEvidence({
+      envelope: changedMeasurement,
+      envelopeDigest: epic172EnvelopeDigest(changedMeasurement as CanonicalJsonValue),
+      detachedSignature,
+      publicKeySpki: keys.publicKeySpki,
+      databaseNow: NOW,
+    })).toEqual({ ok: false, reason: 'invalid_signature' })
+
+    expect(() => epic172ReleaseEvidenceSignedBytes(releaseEnvelope({ requiredEvidence: [] }))).toThrow(/expected exactly/)
+    const reordered = structuredClone(envelope.requiredEvidence)
+    ;[reordered[0], reordered[1]] = [reordered[1], reordered[0]]
+    expect(() => epic172ReleaseEvidenceSignedBytes(releaseEnvelope({ requiredEvidence: reordered }))).toThrow(/expected/)
+    expect(() => epic172ReleaseEvidenceSignedBytes(releaseEnvelope({
+      requiredEvidence: [...envelope.requiredEvidence, { name: 'extra', measurementDigest: 'a'.repeat(64) }],
+    }))).toThrow(/expected exactly/)
+    expect(() => epic172ReleaseEvidenceSignedBytes(releaseEnvelope({
+      requiredEvidence: envelope.requiredEvidence.map((claim, index) => (
+        index === 0 ? { ...claim, measurementDigest: 'not-a-digest' } : claim
+      )),
+    }))).toThrow(/measurement digest/)
   })
 
   it('rejects future-issued release evidence even with a valid signature', () => {

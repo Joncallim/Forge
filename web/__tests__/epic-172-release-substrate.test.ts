@@ -57,8 +57,8 @@ describe('Epic 172 Step 0 release substrate', () => {
     expect(migration).toContain('BEFORE UPDATE OR DELETE ON "forge_epic_172_release_evidence"')
     expect(migration).toContain('BEFORE DELETE ON "forge_epic_172_enablement_state"')
     expect(migration).toContain('forge_release_evidence_writer LOGIN NOINHERIT')
-    expect(migration).toContain('forge_release_evidence_consumer LOGIN NOINHERIT')
     expect(migration).toContain('forge_release_transition LOGIN NOINHERIT')
+    expect(migration).not.toContain('forge_release_evidence_consumer')
     expect(migration).not.toMatch(/GRANT\s+(?:INSERT|UPDATE|DELETE)/)
   })
 
