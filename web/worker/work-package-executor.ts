@@ -1924,7 +1924,6 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
       frontMatter: {
         connector: providerConnector,
         model: context.modelIdUsed,
-        prompt,
       },
       level: 'info',
       message: `Prepared execution prompt for "${context.workPackage.title}".`,
@@ -1961,7 +1960,6 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
         frontMatter: {
           connector: providerConnector,
           model: context.modelIdUsed,
-          prompt,
         },
         level: 'warning',
         message: `Execution plan for "${context.workPackage.title}" did not include validation commands.`,
@@ -1997,7 +1995,6 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
           frontMatter: {
             connector: providerConnector,
             model: context.modelIdUsed,
-            prompt,
           },
           level: 'warning',
           message: `Validation command emitted stderr: ${normalizeCommand(command)}`,

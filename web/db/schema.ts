@@ -190,11 +190,15 @@ export const projects = pgTable('projects', {
     .$type<ProjectMcpConfig>()
     .notNull()
     .default(sql`'{"profile":"default","requiredMcps":["filesystem","github"],"overrides":{}}'::jsonb`),
+  // Opaque packet identity. It is random and never derived from localPath.
+  rootRef: uuid('root_ref').notNull().defaultRandom(),
   defaultBranch: text('default_branch').notNull().default('main'),
   createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
   archivedAt: timestamp('archived_at', tsOpts),
-})
+}, (t) => [
+  uniqueIndex('projects_root_ref_idx').on(t.rootRef),
+])
 
 export type Project = InferSelectModel<typeof projects>
 export type NewProject = InferInsertModel<typeof projects>
@@ -571,6 +575,112 @@ export type Artifact = InferSelectModel<typeof artifacts>
 export type NewArtifact = InferInsertModel<typeof artifacts>
 
 // ---------------------------------------------------------------------------
+// S4 protected Architect history and task-bound execution references
+// ---------------------------------------------------------------------------
+export const architectPlanVersions = pgTable(
+  'architect_plan_versions',
+  {
+    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    planArtifactId: uuid('plan_artifact_id').notNull().references(() => artifacts.id, { onDelete: 'restrict' }),
+    planVersion: bigint('plan_version', { mode: 'bigint' }).notNull(),
+    digestKeyId: text('digest_key_id').notNull(),
+    entryCount: integer('entry_count').notNull(),
+    entrySetDigest: text('entry_set_digest').notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('architect_plan_versions_task_version_idx').on(t.taskId, t.planVersion),
+    uniqueIndex('architect_plan_versions_artifact_version_idx').on(t.planArtifactId, t.planVersion),
+  ],
+)
+
+export const architectPlanEntries = pgTable(
+  'architect_plan_entries',
+  {
+    taskId: uuid('task_id').notNull(),
+    planArtifactId: uuid('plan_artifact_id').notNull(),
+    planVersion: bigint('plan_version', { mode: 'bigint' }).notNull(),
+    entryId: text('entry_id').notNull(),
+    entryKind: text('entry_kind').notNull(),
+    agent: text('agent'),
+    requirementKey: text('requirement_key'),
+    bindingFingerprint: text('binding_fingerprint'),
+    content: text('content').notNull(),
+    contentDigest: text('content_digest').notNull(),
+    digestKeyId: text('digest_key_id').notNull(),
+    projectionEligible: boolean('projection_eligible').notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('architect_plan_entries_version_entry_idx').on(t.taskId, t.planVersion, t.entryId),
+    index('architect_plan_entries_artifact_version_idx').on(t.planArtifactId, t.planVersion),
+  ],
+)
+
+export const architectPlanExecutionReferences = pgTable(
+  'architect_plan_execution_references',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    workPackageId: uuid('work_package_id').notNull().references(() => workPackages.id, { onDelete: 'restrict' }),
+    agentRunId: uuid('agent_run_id').notNull().references(() => agentRuns.id, { onDelete: 'restrict' }),
+    planArtifactId: uuid('plan_artifact_id').notNull(),
+    planVersion: bigint('plan_version', { mode: 'bigint' }).notNull(),
+    entryId: text('entry_id').notNull(),
+    agent: text('agent').notNull(),
+    requirementKey: text('requirement_key'),
+    bindingFingerprint: text('binding_fingerprint'),
+    contentDigest: text('content_digest').notNull(),
+    digestKeyId: text('digest_key_id').notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    resolvedAt: timestamp('resolved_at', tsOpts),
+  },
+  (t) => [
+    uniqueIndex('architect_plan_execution_references_run_entry_idx').on(t.agentRunId, t.entryId),
+    index('architect_plan_execution_references_package_idx').on(t.workPackageId, t.agentRunId),
+  ],
+)
+
+export const architectPlanHistoryReads = pgTable(
+  'architect_plan_history_reads',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    requestId: uuid('request_id').notNull().unique(),
+    userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+    taskId: uuid('task_id').notNull(),
+    planVersion: bigint('plan_version', { mode: 'bigint' }).notNull(),
+    returnedEntryCount: integer('returned_entry_count').notNull(),
+    entrySetDigest: text('entry_set_digest').notNull(),
+    readAt: timestamp('read_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [index('architect_plan_history_reads_task_version_idx').on(t.taskId, t.planVersion)],
+)
+
+export const epic172S4ProtocolState = pgTable('epic_172_s4_protocol_state', {
+  singleton: boolean('singleton').primaryKey().default(true),
+  producersEnabled: boolean('producers_enabled').notNull().default(false),
+  protocolEpoch: integer('protocol_epoch').notNull().default(1),
+  enabledBuildSha: text('enabled_build_sha'),
+  updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+})
+
+export const workPackageLocalRunEvidence = pgTable(
+  'work_package_local_run_evidence',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    workPackageId: uuid('work_package_id').notNull().references(() => workPackages.id, { onDelete: 'restrict' }),
+    agentRunId: uuid('agent_run_id').notNull().references(() => agentRuns.id, { onDelete: 'restrict' }).unique(),
+    claimToken: uuid('claim_token').notNull().unique(),
+    leaseExpiresAt: timestamp('lease_expires_at', tsOpts).notNull(),
+    state: text('state').notNull().default('claimed'),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    terminalAt: timestamp('terminal_at', tsOpts),
+  },
+  (t) => [index('work_package_local_run_evidence_package_idx').on(t.workPackageId, t.agentRunId)],
+)
+
+// ---------------------------------------------------------------------------
 // filesystemMcpRuntimeAudits
 // ---------------------------------------------------------------------------
 export const filesystemMcpRuntimeAudits = pgTable(
@@ -612,6 +722,25 @@ export const filesystemMcpRuntimeAudits = pgTable(
       .$type<Record<string, unknown>>()
       .notNull()
       .default(sql`'{}'::jsonb`),
+    protocolVersion: integer('protocol_version'),
+    localRunEvidenceId: uuid('local_run_evidence_id').references(() => workPackageLocalRunEvidence.id, {
+      onDelete: 'restrict',
+    }),
+    claimToken: uuid('claim_token'),
+    leaseExpiresAt: timestamp('lease_expires_at', tsOpts),
+    authorizationSnapshot: jsonb('authorization_snapshot').$type<Record<string, unknown>>(),
+    authorizationSource: text('authorization_source'),
+    grantMode: text('grant_mode'),
+    grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' }),
+    grantDecisionNonce: uuid('grant_decision_nonce'),
+    authorizationRootBindingRevision: bigint('authorization_root_binding_revision', { mode: 'bigint' }),
+    projectDecisionId: uuid('project_decision_id').references(() => filesystemMcpGrantApprovals.id, {
+      onDelete: 'restrict',
+    }),
+    assembly: jsonb('assembly').$type<Record<string, unknown>>(),
+    delivery: jsonb('delivery').$type<Record<string, unknown>>(),
+    terminal: jsonb('terminal').$type<Record<string, unknown>>(),
+    terminalAt: timestamp('terminal_at', tsOpts),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
   },
   (t) => [
@@ -626,6 +755,22 @@ export const filesystemMcpRuntimeAudits = pgTable(
 
 export type FilesystemMcpRuntimeAudit = InferSelectModel<typeof filesystemMcpRuntimeAudits>
 export type NewFilesystemMcpRuntimeAudit = InferInsertModel<typeof filesystemMcpRuntimeAudits>
+
+export const filesystemMcpDecisionNonceClaims = pgTable(
+  'filesystem_mcp_decision_nonce_claims',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    grantApprovalId: uuid('grant_approval_id').notNull().references(() => filesystemMcpGrantApprovals.id, {
+      onDelete: 'restrict',
+    }),
+    grantDecisionNonce: uuid('grant_decision_nonce').notNull().unique(),
+    runtimeAuditId: uuid('runtime_audit_id').notNull().references(() => filesystemMcpRuntimeAudits.id, {
+      onDelete: 'restrict',
+    }).unique(),
+    claimedAt: timestamp('claimed_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [index('filesystem_mcp_decision_nonce_claims_approval_idx').on(t.grantApprovalId)],
+)
 
 // ---------------------------------------------------------------------------
 // approvalGates

@@ -104,6 +104,7 @@ function context(overrides: Partial<WorkPackageExecutionContext> = {}): WorkPack
     modelIdUsed: 'test-model',
     project: {
       id: 'project-1',
+      rootRef: '00000000-0000-4000-8000-000000000001',
       name: 'Tracker Smoke',
       submittedBy: null,
       githubRepo: null,

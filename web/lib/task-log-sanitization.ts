@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto'
 import type { TaskLog } from '@/db/schema'
 import { sanitizeWorkerMessage } from '@/worker/redaction'
 
@@ -28,13 +27,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+export const LEGACY_TASK_LOG_PROMPT_KEYS = [
+  'prompt',
+  'promptInput',
+  'prompt_input',
+  'promptOverlay',
+  'prompt_overlay',
+  'systemPrompt',
+  'system_prompt',
+  'userPrompt',
+  'user_prompt',
+  'sessionPrompt',
+  'session_prompt',
+  'executablePrompt',
+  'executable_prompt',
+  'messages',
+] as const
+
+const LEGACY_TASK_LOG_PROMPT_KEY_SET = new Set<string>(LEGACY_TASK_LOG_PROMPT_KEYS)
+
 function isPromptKey(key: string): boolean {
-  return /prompt/i.test(key)
+  return LEGACY_TASK_LOG_PROMPT_KEY_SET.has(key) || /prompt/i.test(key)
 }
 
 function isSnapshotOnlyKey(key: string): boolean {
-  return isPromptKey(key) ||
-    /(?:stdout|stderr|output|errorMessage|stack|trace|feedback|raw)/i.test(key) ||
+  return /(?:stdout|stderr|output|errorMessage|stack|trace|feedback|raw)/i.test(key) ||
     /^message$/i.test(key)
 }
 
@@ -80,6 +97,9 @@ export function sanitizeLogStructuredValue(
   const result: Record<string, unknown> = {}
   const entries = Object.entries(value).slice(0, maxObjectKeys)
   for (const [key, item] of entries) {
+    // Prompt-bearing keys are removed at every depth. A digest of low-entropy
+    // prompt text is still a prompt oracle, so no replacement value is emitted.
+    if (isPromptKey(key)) continue
     const safeKey = sanitizeString(key, 256)
     if (isSecretNamedKey(key)) {
       // Redact the whole value regardless of shape — a shapeless secret under a
@@ -109,23 +129,17 @@ function promptSnapshotSource(value: unknown): string {
   }
 }
 
-export function sanitizePromptSnapshot(value: unknown): { byteLength: number; sha256: string; truncated: boolean } {
+export function sanitizePromptSnapshot(value: unknown): { kind: 'unknown_legacy_digest'; byteCount: number } {
   const sanitized = sanitizeWorkerMessage(promptSnapshotSource(value))
-  const sha256 = createHash('sha256').update(sanitized).digest('hex')
   const buffer = Buffer.from(sanitized)
   return {
-    byteLength: buffer.byteLength,
-    sha256,
-    truncated: false,
+    kind: 'unknown_legacy_digest',
+    byteCount: buffer.byteLength,
   }
 }
 
 export function sanitizeLogFrontMatter(frontMatter: Record<string, unknown>): Record<string, unknown> {
-  const cleaned = sanitizeLogStructuredValue(frontMatter, { stringByteLimit: DEFAULT_STRING_BYTE_LIMIT }) as Record<string, unknown>
-  for (const key of ['prompt', 'promptInput', 'inputPrompt']) {
-    if (typeof frontMatter[key] === 'string') cleaned[key] = sanitizePromptSnapshot(frontMatter[key])
-  }
-  return cleaned
+  return sanitizeLogStructuredValue(frontMatter, { stringByteLimit: DEFAULT_STRING_BYTE_LIMIT }) as Record<string, unknown>
 }
 
 export function sanitizeLogRecordForOutput<T extends TaskLog>(log: T): T {

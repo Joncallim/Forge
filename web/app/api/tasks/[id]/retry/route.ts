@@ -112,7 +112,6 @@ export async function POST(
       frontMatter: {
         model: providerId ?? null,
         connector: providerId ? 'provider-override' : 'task-default',
-        prompt: task.prompt,
       },
       level: 'info',
       message: retryHandoff

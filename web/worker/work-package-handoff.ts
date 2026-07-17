@@ -48,6 +48,8 @@ import {
 import { defaultOnFeatureFlagEnabled } from './feature-flags'
 import { sanitizeWorkerMessage } from './redaction'
 import { recordTaskLogBestEffort } from './task-logs'
+import { packetCandidateGuard } from '../lib/mcps/packet-issuance-v2'
+import { localEffectCandidateGuard } from '../lib/mcps/local-run-evidence-v2'
 
 type HandoffPackage = {
   id: string
@@ -675,6 +677,7 @@ export function computeReadyWorkPackageIds(
 
   return packages
     .filter((pkg) => pkg.status === 'pending' || pkg.status === 'needs_rework' || pkg.status === 'blocked')
+    .filter((pkg) => !packetCandidateGuard(pkg.metadata).blocked && !localEffectCandidateGuard(pkg.metadata).blocked)
     .filter((pkg) =>
       (dependenciesByPackageId.get(pkg.id) ?? []).every((dependencyId) =>
         completedPackageIds.has(dependencyId),
@@ -724,7 +727,9 @@ async function loadHandoffState(taskId: string): Promise<HandoffState> {
   const alreadyRunningPackage = packageRows.find((pkg) => pkg.status === 'running') ?? null
   const readyPackageIdSet = new Set([
     ...readyPackageIds,
-    ...packageRows.filter((pkg) => pkg.status === 'ready').map((pkg) => pkg.id),
+    ...packageRows
+      .filter((pkg) => pkg.status === 'ready' && !packetCandidateGuard(pkg.metadata).blocked && !localEffectCandidateGuard(pkg.metadata).blocked)
+      .map((pkg) => pkg.id),
   ])
   const nextPackage = packageRows.find((pkg) => readyPackageIdSet.has(pkg.id)) ?? null
 
@@ -1756,7 +1761,6 @@ export async function handoffApprovedWorkPackages(
     frontMatter: {
       connector: 'forge-handoff/no-op',
       model: 'forge-handoff/no-op',
-      prompt: `No-op handoff for ${nextPackage.assignedRole}: ${nextPackage.title}`,
     },
     level: 'info',
     message: `No-op handoff run started for "${nextPackage.title}".`,
@@ -1814,7 +1818,6 @@ export async function handoffApprovedWorkPackages(
     frontMatter: {
       connector: 'forge-handoff/no-op',
       model: 'forge-handoff/no-op',
-      prompt: `No-op handoff for ${nextPackage.assignedRole}: ${nextPackage.title}`,
     },
     level: 'success',
     message: `No-op handoff completed for "${nextPackage.title}".`,
@@ -1857,7 +1860,11 @@ async function promoteReadyPackages(taskId: string, packageIds: string[], now: D
     const [updated] = await db
       .update(workPackages)
       .set({ blockedReason: null, status: 'ready', updatedAt: now })
-      .where(and(eq(workPackages.id, packageId), inArray(workPackages.status, ['pending', 'needs_rework', 'blocked'])))
+      .where(and(
+        eq(workPackages.id, packageId),
+        inArray(workPackages.status, ['pending', 'needs_rework', 'blocked']),
+        sql`NOT (coalesce(${workPackages.metadata}, '{}'::jsonb) ?| ARRAY['packet_issuance','packet_integrity_hold','local_effect_recovery','local_effect_integrity_hold'])`,
+      ))
       .returning({ id: workPackages.id })
 
     if (updated) {
@@ -1875,13 +1882,17 @@ async function promotePackageWithFreshnessCas(input: {
   project: McpProjectFreshnessSnapshot
   taskId: string
 }): Promise<HandoffPackage | null> {
+  if (packetCandidateGuard(input.pkg.metadata).blocked || localEffectCandidateGuard(input.pkg.metadata).blocked) return null
   const promotedAt = new Date()
   const updated = await db.transaction(async (tx) => {
     if (!await lockFreshMcpHandoffInputs(tx, input.taskId, input.pkg, input.project)) return null
     const [row] = await tx
       .update(workPackages)
       .set({ blockedReason: null, status: 'ready', updatedAt: promotedAt })
-      .where(and(...handoffFreshnessConditions(input)))
+      .where(and(
+        ...handoffFreshnessConditions(input),
+        sql`NOT (coalesce(${workPackages.metadata}, '{}'::jsonb) ?| ARRAY['packet_issuance','packet_integrity_hold','local_effect_recovery','local_effect_integrity_hold'])`,
+      ))
       .returning({ id: workPackages.id })
     return row ?? null
   })

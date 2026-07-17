@@ -107,7 +107,6 @@ export async function POST(
       frontMatter: {
         model: task.pmProviderConfigId ?? null,
         connector: 'task-default',
-        prompt: task.prompt,
       },
       level: 'warning',
       message: 'Plan revision was requested.',

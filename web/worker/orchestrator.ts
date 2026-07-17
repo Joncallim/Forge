@@ -674,7 +674,6 @@ async function runArchitect(
         frontMatter: {
           connector: `${providerResult.config.displayName} (${providerResult.config.providerType})`,
           model: providerResult.config.modelId,
-          prompt: task.prompt,
         },
         level: 'info',
         message: 'Architect mock run started.',
@@ -716,7 +715,6 @@ async function runArchitect(
         frontMatter: {
           connector: `${providerResult.config.displayName} (${providerResult.config.providerType})`,
           model: providerResult.config.modelId,
-          prompt,
         },
         level: 'info',
         message: 'Architect model run started.',
@@ -896,7 +894,6 @@ async function runArchitect(
         frontMatter: {
           connector: `${providerResult.config.displayName} (${providerResult.config.providerType})`,
           model: providerResult.config.modelId,
-          prompt: task.prompt,
         },
         level: 'success',
         message: `Architect run completed with ${openQuestionCount} open question${openQuestionCount === 1 ? '' : 's'}.`,
@@ -959,7 +956,6 @@ async function runArchitect(
       frontMatter: {
         connector: `${providerResult.config.displayName} (${providerResult.config.providerType})`,
         model: providerResult.config.modelId,
-        prompt: task.prompt,
       },
       level: 'error',
       message: 'Architect run failed.',
