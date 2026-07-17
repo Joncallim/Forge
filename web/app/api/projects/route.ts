@@ -14,6 +14,7 @@ import { getSession } from '@/lib/session'
 import { registerProjectPath } from '@/lib/project-registry'
 import { resolveGitHubToken, validateGitHubTokenEnvVar } from '@/lib/github'
 import { getCachedProjectMcpSummaries } from '@/lib/mcps/manager'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 import { buildCloneUrl, OWNER_REPO_RE, redactToken } from '@/lib/projects/clone'
 import {
   assertProjectLocalPathAllowed,
@@ -267,6 +268,9 @@ export async function POST(request: NextRequest) {
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
 
     let body: unknown
     try {

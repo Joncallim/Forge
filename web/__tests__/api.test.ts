@@ -36,6 +36,13 @@ vi.mock('@/lib/session', () => ({
   }),
 }))
 
+// Existing route-contract cases exercise behavior behind the release gate.
+// The gate itself and its fail-closed route placement have a focused suite.
+vi.mock('@/lib/projects/epic-172-project-ingress', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/projects/epic-172-project-ingress')>(),
+  guardEpic172ProjectManagementIngress: vi.fn().mockResolvedValue(null),
+}))
+
 // DB mock — returns fluent chain helpers per-call
 const mockDbSelect = vi.fn()
 const mockDbInsert = vi.fn()

@@ -15,6 +15,7 @@ import {
   assertProjectLocalPathPreflightAllowed,
   assertProjectPathNotProtected,
 } from '@/lib/projects/local-path'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 import {
   displayPathForWorkspacePath,
   getWorkspaceSettings,
@@ -127,6 +128,9 @@ export async function PUT(
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
 
     const { id } = await params
 
@@ -323,6 +327,9 @@ export async function DELETE(
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
 
     const { id } = await params
     const deleteFiles = request.nextUrl.searchParams.get('deleteFiles') === 'true'
