@@ -141,7 +141,7 @@ describe('Epic 172 project route ingress sentinel', () => {
     ])
   })
 
-  it('checks removal ingress before project lookup, workspace access, or filesystem work', () => {
+  it('checks removal ingress before rejecting file deletion or archiving', () => {
     const source = readFileSync(
       fileURLToPath(new URL('../app/api/projects/[id]/route.ts', import.meta.url)),
       'utf8',
@@ -149,15 +149,14 @@ describe('Epic 172 project route ingress sentinel', () => {
     const deleteBody = source.slice(source.indexOf('export async function DELETE'))
     const guardIndex = deleteBody.indexOf('guardEpic172ProjectManagementIngress()')
     expect(guardIndex).toBeGreaterThan(0)
-    for (const operation of [
-      'getAccessibleProject(',
-      'getWorkspaceSettings(',
-      'checkProjectDeletePath(',
-      'fs.rm(',
-      'db.delete(',
-    ]) {
+    for (const operation of ['deleteFiles', 'getAccessibleProject(', '.update(projects)']) {
       expect(deleteBody.indexOf(operation), operation).toBeGreaterThan(guardIndex)
     }
+    expect(deleteBody).not.toContain('getWorkspaceSettings(')
+    expect(deleteBody).not.toContain('checkProjectDeletePath(')
+    expect(deleteBody).not.toContain('fs.rm(')
+    expect(deleteBody).not.toContain('db.delete(')
+    expect(deleteBody).toContain("archivedAt, updatedAt: archivedAt")
   })
 
   it('reads the singleton with database time and fails closed on read errors', () => {

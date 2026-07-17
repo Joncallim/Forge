@@ -1081,7 +1081,7 @@ describe('PUT /api/projects/:id — local path display handling', () => {
   })
 })
 
-describe('DELETE /api/projects/:id — file deletion boundary', () => {
+describe('DELETE /api/projects/:id — retained-evidence archive boundary', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
   function projectRow(localPath: string) {
@@ -1099,12 +1099,9 @@ describe('DELETE /api/projects/:id — file deletion boundary', () => {
     }
   }
 
-  it('refuses to remove the shared workspace root', async () => {
+  it('rejects deleteFiles before inspecting the project or filesystem', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
-    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-delete-root-'))
-    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
-    mockDbSelect.mockReturnValue(chain([projectRow(workspaceRoot)]))
 
     try {
       const { DELETE } = await import('@/app/api/projects/[id]/route')
@@ -1112,22 +1109,20 @@ describe('DELETE /api/projects/:id — file deletion boundary', () => {
         params: Promise.resolve({ id: 'project-delete' }),
       })
 
-      expect(res.status).toBe(400)
+      expect(res.status).toBe(409)
       const body = await res.json()
-      expect(body.error).toMatch(/shared Forge workspace directory/i)
+      expect(body.code).toBe('project_hard_delete_disabled')
+      expect(body.error).toMatch(/retry without deleteFiles to archive/i)
+      expect(mockDbSelect).not.toHaveBeenCalled()
+      expect(mockDbUpdate).not.toHaveBeenCalled()
       expect(mockDbDelete).not.toHaveBeenCalled()
       await expect(fs.stat(workspaceRoot)).resolves.toMatchObject({})
     } finally {
-      if (previousRoot === undefined) {
-        delete process.env.FORGE_WORKSPACE_ROOT
-      } else {
-        process.env.FORGE_WORKSPACE_ROOT = previousRoot
-      }
       await fs.rm(workspaceRoot, { recursive: true, force: true })
     }
   })
 
-  it('removes a Forge-owned project directory with a matching marker', async () => {
+  it('archives a Forge-owned project without touching its directory', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const previousRoot = process.env.FORGE_WORKSPACE_ROOT
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-delete-owned-'))
@@ -1139,18 +1134,26 @@ describe('DELETE /api/projects/:id — file deletion boundary', () => {
       `${JSON.stringify({ projectId: 'project-delete' })}\n`,
     )
     mockDbSelect.mockReturnValue(chain([projectRow(localPath)]))
-    mockDbDelete.mockReturnValue(chain(undefined))
+    mockDbUpdate.mockReturnValue(chain(undefined))
 
     try {
       const { DELETE } = await import('@/app/api/projects/[id]/route')
-      const res = await DELETE(nextAuthRequest('/api/projects/project-delete?deleteFiles=true') as never, {
+      const res = await DELETE(nextAuthRequest('/api/projects/project-delete') as never, {
         params: Promise.resolve({ id: 'project-delete' }),
       })
 
       expect(res.status).toBe(200)
       const body = await res.json()
-      expect(body.filesDeleted).toBe(true)
-      await expect(fs.stat(localPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(body).toMatchObject({
+        archived: true,
+        filesDeleted: false,
+        fileDeletionSkippedReason: 'retained_release_evidence',
+      })
+      expect(mockDbUpdate).toHaveBeenCalled()
+      expect(mockDbDelete).not.toHaveBeenCalled()
+      await expect(fs.readFile(path.join(localPath, 'forge.project.json'), 'utf-8')).resolves.toContain(
+        'project-delete',
+      )
     } finally {
       if (previousRoot === undefined) {
         delete process.env.FORGE_WORKSPACE_ROOT
@@ -1161,7 +1164,7 @@ describe('DELETE /api/projects/:id — file deletion boundary', () => {
     }
   })
 
-  it('removes only the DB record when deleteFiles targets an external local path', async () => {
+  it('archives an external project path without deleting its files', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const previousRoot = process.env.FORGE_WORKSPACE_ROOT
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-delete-external-workspace-'))
@@ -1170,22 +1173,21 @@ describe('DELETE /api/projects/:id — file deletion boundary', () => {
     await fs.writeFile(externalFile, 'do not delete\n')
     process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
     mockDbSelect.mockReturnValue(chain([projectRow(externalRoot)]))
-    mockDbDelete.mockReturnValue(chain(undefined))
+    mockDbUpdate.mockReturnValue(chain(undefined))
 
     try {
       const { DELETE } = await import('@/app/api/projects/[id]/route')
-      const res = await DELETE(nextAuthRequest('/api/projects/project-delete?deleteFiles=true') as never, {
+      const res = await DELETE(nextAuthRequest('/api/projects/project-delete') as never, {
         params: Promise.resolve({ id: 'project-delete' }),
       })
 
       expect(res.status).toBe(200)
       const body = await res.json()
       expect(body.filesDeleted).toBe(false)
-      expect(body.fileDeletionSkippedReason).toBe('outside_forge_managed_projects')
-      expect(body.fileDeletionMessage).toMatch(/outside Forge-managed projects/i)
-      expect(body.localPath).toBe(externalRoot)
-      expect(body.displayLocalPath).toBe(externalRoot)
-      expect(mockDbDelete).toHaveBeenCalled()
+      expect(body.fileDeletionSkippedReason).toBe('retained_release_evidence')
+      expect(body.fileDeletionMessage).toMatch(/archived the project record/i)
+      expect(mockDbUpdate).toHaveBeenCalled()
+      expect(mockDbDelete).not.toHaveBeenCalled()
       await expect(fs.readFile(externalFile, 'utf-8')).resolves.toBe('do not delete\n')
     } finally {
       if (previousRoot === undefined) {
