@@ -1306,11 +1306,12 @@ describe('GET /api/filesystem/directories — folder selector', () => {
     }
   })
 
-  it('defaults to the active workspace projects directory', async () => {
+  it('defaults to the active workspace projects directory without bootstrapping workspace files', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const previousRoot = process.env.FORGE_WORKSPACE_ROOT
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-workspace-test-'))
     process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    await fs.mkdir(path.join(workspaceRoot, 'projects'))
 
     try {
       const { GET } = await import('@/app/api/filesystem/directories/route')
@@ -1319,9 +1320,9 @@ describe('GET /api/filesystem/directories — folder selector', () => {
       expect(res.status).toBe(200)
       const body = await res.json()
       expect(body.path).toBe(path.join(workspaceRoot, 'projects'))
-      await expect(fs.stat(path.join(workspaceRoot, 'mcps'))).resolves.toMatchObject({})
-      await expect(fs.stat(path.join(workspaceRoot, 'templates'))).resolves.toMatchObject({})
-      await expect(fs.stat(path.join(workspaceRoot, 'global-settings.json'))).resolves.toMatchObject({})
+      await expect(fs.stat(path.join(workspaceRoot, 'mcps'))).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(fs.stat(path.join(workspaceRoot, 'templates'))).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(fs.stat(path.join(workspaceRoot, 'global-settings.json'))).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
       if (previousRoot === undefined) {
         delete process.env.FORGE_WORKSPACE_ROOT
@@ -8161,6 +8162,22 @@ describe('Epic 172 disabled mutation ingress', () => {
         { params: Promise.resolve({ id: 'provider-closed' }) },
       )
     }],
+    ['workspace directory creation', async () => {
+      const { POST } = await import('@/app/api/filesystem/directories/route')
+      return POST(authRequest('/api/filesystem/directories', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parentPath: '/never-read', name: 'never-created' }),
+      }) as never)
+    }],
+    ['workspace settings update', async () => {
+      const { PUT } = await import('@/app/api/settings/workspace/route')
+      return PUT(authRequest('/api/settings/workspace', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceRoot: '/never-read' }),
+      }) as never)
+    }],
   ]
 
   it.each(mutationFamilies)('returns 503 with zero mutation side effects for %s', async (_name, invoke) => {
@@ -8185,5 +8202,52 @@ describe('Epic 172 disabled mutation ingress', () => {
     expect(mockRedisDel).not.toHaveBeenCalled()
     expect(mockDecideReviewGate).not.toHaveBeenCalled()
     expect(mockExecFile).not.toHaveBeenCalled()
+  })
+
+  it('returns 503 before workspace or directory routes can touch the filesystem', async () => {
+    vi.clearAllMocks()
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockGuardEpic172ProjectManagementIngress.mockImplementation(async () => closedIngressResponse())
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-epic-172-disabled-workspace-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const directoryPath = path.join(workspaceRoot, 'never-created-directory')
+    const replacementRoot = path.join(workspaceRoot, 'never-created-workspace')
+
+    try {
+      const [{ POST }, { PUT }] = await Promise.all([
+        import('@/app/api/filesystem/directories/route'),
+        import('@/app/api/settings/workspace/route'),
+      ])
+      const directoryResponse = await POST(authRequest('/api/filesystem/directories', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parentPath: workspaceRoot, name: path.basename(directoryPath) }),
+      }) as never)
+      const workspaceResponse = await PUT(authRequest('/api/settings/workspace', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceRoot: replacementRoot }),
+      }) as never)
+
+      expect(directoryResponse.status).toBe(503)
+      expect(workspaceResponse.status).toBe(503)
+      expect(mockGuardEpic172ProjectManagementIngress).toHaveBeenCalledTimes(2)
+      await expect(fs.stat(directoryPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(fs.stat(replacementRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(fs.stat(path.join(workspaceRoot, 'global-settings.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(await fs.readdir(workspaceRoot)).toEqual([])
+      expect(mockDbSelect).not.toHaveBeenCalled()
+      expect(mockDbInsert).not.toHaveBeenCalled()
+      expect(mockDbUpdate).not.toHaveBeenCalled()
+      expect(mockRedisLpush).not.toHaveBeenCalled()
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
   })
 })

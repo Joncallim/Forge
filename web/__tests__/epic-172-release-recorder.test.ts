@@ -14,6 +14,18 @@ const bootstrap = readFileSync(
   fileURLToPath(new URL('../scripts/bootstrap-epic-172-release-roles.ts', import.meta.url)),
   'utf8',
 )
+const provisionApplicationRole = readFileSync(
+  fileURLToPath(new URL('../scripts/provision-epic-172-application-role.ts', import.meta.url)),
+  'utf8',
+)
+const operatorRunbook = readFileSync(
+  fileURLToPath(new URL('../../docs/operators/epic-172-step0-retention-bridge.md', import.meta.url)),
+  'utf8',
+)
+const webCi = readFileSync(
+  fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)),
+  'utf8',
+)
 
 describe('Epic 172 signed release recorder boundary', () => {
   it('moves release objects behind one non-login owner and removes bootstrap authority', () => {
@@ -43,6 +55,32 @@ describe('Epic 172 signed release recorder boundary', () => {
     expect(migration).toContain('TO forge_release_evidence_writer')
     expect(migration).toContain('TO forge_release_transition')
     expect(migration).toContain('REVOKE ALL ON FUNCTION forge.read_epic_172_enablement_state_v1()')
+  })
+
+  it('provisions the real ordinary app principal with one fixed release-reader grant', () => {
+    expect(provisionApplicationRole).toContain("requiredConnectionUrl('FORGE_APPLICATION_DATABASE_URL')")
+    expect(provisionApplicationRole).toContain('identity.currentUser !== identity.sessionUser')
+    expect(provisionApplicationRole).toContain('applicationRoleIsUnsafe(role)')
+    expect(provisionApplicationRole).toContain('membershipCount !== 0')
+    expect(provisionApplicationRole).toContain('grant usage on schema forge')
+    expect(provisionApplicationRole).toContain(
+      'grant execute on function forge.read_epic_172_enablement_state_v1()',
+    )
+    expect(provisionApplicationRole).toContain('unexpectedTablePrivileges.length !== 0')
+    expect(provisionApplicationRole).toContain("executableForgeFunctions.length !== 1")
+    expect(provisionApplicationRole).toContain("!== 'read_epic_172_enablement_state_v1'")
+    expect(operatorRunbook).toContain('npm run protocol:provision-epic-172-application-role')
+    expect(webCi).toContain('run: npm run protocol:provision-epic-172-application-role')
+    expect(webCi).not.toContain(
+      'GRANT EXECUTE ON FUNCTION forge.read_epic_172_enablement_state_v1() TO forge_app_test;',
+    )
+  })
+
+  it('documents the immutable Step 0 build suffix required by the verifier', () => {
+    expect(operatorRunbook).toContain(
+      'exactBuilds:["issue_179_step0@<immutable-build-identity>"]',
+    )
+    expect(operatorRunbook).not.toContain('exactBuilds:["issue_179_step0"]')
   })
 
   it('locks exact signer, nonce, identity, predecessor, and authorization rows', () => {

@@ -90,6 +90,11 @@ jobs:
         run: npm run db:migrate
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
+      - name: Provision the ordinary app release-reader boundary
+        run: npm run protocol:provision-epic-172-application-role
+        env:
+          FORGE_APPLICATION_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
       - name: Grant and verify the ordinary app boundary
         working-directory: .
         env:
@@ -97,8 +102,7 @@ jobs:
         run: |
           psql --host localhost --username forge_e2e --dbname forge_epic_172_ci_test --set ON_ERROR_STOP=1 <<'SQL'
           GRANT CONNECT ON DATABASE forge_epic_172_ci_test TO forge_app_test;
-          GRANT USAGE ON SCHEMA public, forge TO forge_app_test;
-          GRANT EXECUTE ON FUNCTION forge.read_epic_172_enablement_state_v1() TO forge_app_test;
+          GRANT USAGE ON SCHEMA public TO forge_app_test;
           DO $grant_application_acl$
           DECLARE
             object_row record;

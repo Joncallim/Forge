@@ -18,6 +18,9 @@ evidence, and the external signer private key must never enter Forge.
   `LOGIN NOINHERIT`; do not give them
   passwords, role memberships, or the normal Forge application URL.
 - Keep a short-lived administrator URL available for role creation and inspection.
+- Keep the ordinary Forge application URL available to the provisioning command.
+  The command uses that connection only to derive the real application login; it
+  never prints the URL or its credentials.
 - Treat that administrator as a trusted maintenance principal. The bootstrap checks
   the exact release-role attributes, memberships, and release-object ownership it
   manages. It does not audit or repair unrelated pre-existing PostgreSQL roles,
@@ -25,9 +28,10 @@ evidence, and the external signer private key must never enter Forge.
   administrator must review those separately before the release window.
 - Prepare an external Ed25519 signer. Forge receives its public key and detached
   signatures only.
-- Record the exact reviewed commit and build identity. Step 0 uses
-  `exactBuilds:["issue_179_step0"]`, `owner:{"issue":179,"slice":"step0"}`, and
-  `epoch:null`.
+- Record the exact reviewed commit and immutable build identity. The manifest slot
+  is `issue_179_step0`, but a signed envelope must bind it to an immutable suffix,
+  for example `exactBuilds:["issue_179_step0@<immutable-build-identity>"]`.
+  It also uses `owner:{"issue":179,"slice":"step0"}` and `epoch:null`.
 
 ## Deploy and prove the bridge
 
@@ -54,9 +58,23 @@ evidence, and the external signer private key must never enter Forge.
    DATABASE_URL='postgresql://forge-migration@…' npm run db:migrate
    ```
 
-5. Deploy the Step 0 web and worker build. Keep project ingress and release
+5. Provision the ordinary application's fixed release-reader boundary. This
+   command derives the database role from the application connection itself and
+   exits nonzero unless it is an ordinary `LOGIN NOINHERIT` role with no role
+   memberships, schema creation rights, release-table access, or unexpected
+   `forge` routine access.
+
+   ```bash
+   FORGE_DATABASE_ADMIN_URL='postgresql://…' \
+   FORGE_APPLICATION_DATABASE_URL='postgresql://forge-app@…' \
+   npm run protocol:provision-epic-172-application-role
+   ```
+
+   Its only release-specific grants are `USAGE` on schema `forge` and `EXECUTE`
+   on `forge.read_epic_172_enablement_state_v1()`.
+6. Deploy the Step 0 web and worker build. Keep project ingress and release
    enablement closed. Do not start an older binary against the migrated database.
-6. Inspect the live database using a short-lived administrator URL:
+7. Inspect the live database using a short-lived administrator URL:
 
    ```bash
    FORGE_EPIC_172_ADMIN_DATABASE_URL='postgresql://…' \
@@ -68,7 +86,7 @@ evidence, and the external signer private key must never enter Forge.
    `RESTRICT` or `NO ACTION`, and all three release role identities have the expected login
    and inheritance settings. `step0ReceiptCount` may still be zero at this point.
 
-7. Install and activate the external signer's public key through the certificate-
+8. Install and activate the external signer's public key through the certificate-
    authenticated evidence-writer URL. The example timestamps must be replaced by
    the reviewed validity window.
 
@@ -91,7 +109,7 @@ evidence, and the external signer private key must never enter Forge.
      --reason 'Activate the first reviewed signer generation'
    ```
 
-8. Outside Forge, build the closed `Epic172ReleaseEvidenceEnvelope` for
+9. Outside Forge, build the closed `Epic172ReleaseEvidenceEnvelope` for
    `step0_retention_bridge`. It must use an empty sorted predecessor list and the
    empty-set digest
    `4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945`.
@@ -106,7 +124,7 @@ evidence, and the external signer private key must never enter Forge.
    `epic172TransitionIdentityDigest` algorithm. Only do this after a human has
    verified the route, ingress closure, drain, retention constraints, hard-delete
    guard, release substrate, and disabled state.
-9. Ask Forge to validate the unsigned envelope and print the exact domain-separated
+10. Ask Forge to validate the unsigned envelope and print the exact domain-separated
    bytes that the external signer must sign:
 
    ```bash
@@ -119,7 +137,7 @@ evidence, and the external signer private key must never enter Forge.
    creates a closed JSON object containing only `envelope`, `envelopeDigest`, and
    `detachedSignatureBase64`. Neither this command nor any Forge process accepts a
    private-key option.
-10. Record the signed receipt and inspect again:
+11. Record the signed receipt and inspect again:
 
     ```bash
     npm run protocol:epic-172-release -- record-evidence \

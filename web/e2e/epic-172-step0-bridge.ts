@@ -130,7 +130,7 @@ export function resolveEpic172Step0E2EDisposition(input: {
 
 export function applyEpic172Step0E2EBridge(testInfo: TestInfo, specFile: string): void {
   const disposition = resolveEpic172Step0E2EDisposition({
-    bridgeValue: process.env[EPIC_172_STEP0_E2E_BRIDGE_ENV],
+    bridgeValue: testInfo.config.metadata[EPIC_172_STEP0_E2E_BRIDGE_ENV] as string | undefined,
     specFile,
     testTitle: testInfo.title,
   })

@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { extname, join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import {
@@ -10,6 +10,32 @@ import {
 } from '@/e2e/epic-172-step0-bridge'
 
 const e2eDirectory = fileURLToPath(new URL('../e2e', import.meta.url))
+const repositoryRoot = fileURLToPath(new URL('../../', import.meta.url))
+
+const IGNORED_SOURCE_DIRECTORIES = new Set([
+  '.git',
+  '.next',
+  'coverage',
+  'node_modules',
+  'playwright-report',
+  'test-results',
+])
+const REVIEWED_SOURCE_EXTENSIONS = new Set([
+  '.cjs', '.js', '.json', '.md', '.mjs', '.toml', '.ts', '.tsx', '.yaml', '.yml',
+])
+
+function repositorySources(directory = repositoryRoot): Array<{ file: string; source: string }> {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    if (entry.isDirectory() && IGNORED_SOURCE_DIRECTORIES.has(entry.name)) return []
+    const entryPath = join(directory, entry.name)
+    if (entry.isDirectory()) return repositorySources(entryPath)
+    if (!REVIEWED_SOURCE_EXTENSIONS.has(extname(entry.name))) return []
+    return [{
+      file: relative(repositoryRoot, entryPath).split(sep).join('/'),
+      source: readFileSync(entryPath, 'utf8'),
+    }]
+  })
+}
 
 function specSources() {
   return readdirSync(e2eDirectory)
@@ -95,7 +121,7 @@ describe('Epic 172 Step 0 E2E bridge', () => {
     expect(taggedSources[0].source.match(new RegExp(EPIC_172_DISABLED_INGRESS_TAG, 'g'))).toHaveLength(1)
   })
 
-  it('runs the dedicated proof and the reviewed bridge suite in CI without forwarding a bypass to the app', () => {
+  it('runs the dedicated proof and keeps the bridge value out of the application environment', () => {
     const workflow = readFileSync(new URL('../../.github/workflows/web-ci.yml', import.meta.url), 'utf8')
     const packageJson = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
       scripts: Record<string, string>
@@ -107,6 +133,19 @@ describe('Epic 172 Step 0 E2E bridge', () => {
     )
     expect(workflow).toContain('run: npm run e2e:epic-172-disabled-ingress')
     expect(workflow).toContain(`FORGE_EPIC_172_STEP0_E2E_BRIDGE: '1'`)
-    expect(playwrightConfig).not.toContain(EPIC_172_STEP0_E2E_BRIDGE_ENV)
+    expect(playwrightConfig).toContain('const epic172Step0E2EBridge = inheritedEnvironment[EPIC_172_STEP0_E2E_BRIDGE_ENV]')
+    expect(playwrightConfig).toContain('delete process.env[EPIC_172_STEP0_E2E_BRIDGE_ENV]')
+    expect(playwrightConfig).toContain('[EPIC_172_STEP0_E2E_BRIDGE_ENV]: epic172Step0E2EBridge')
+
+    const literalConsumers = repositorySources()
+      .filter(({ source }) => source.includes(EPIC_172_STEP0_E2E_BRIDGE_ENV))
+      .map(({ file }) => file)
+      .sort()
+    expect(literalConsumers).toEqual([
+      '.github/workflows/web-ci.yml',
+      'web/__tests__/epic-172-step0-e2e-bridge.test.ts',
+      'web/e2e/README.md',
+      'web/e2e/epic-172-step0-bridge.ts',
+    ])
   })
 })

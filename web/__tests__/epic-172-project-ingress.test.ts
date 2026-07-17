@@ -169,6 +169,43 @@ describe('Epic 172 project route ingress sentinel', () => {
     ].sort())
   })
 
+  it('gates workspace and directory writes while keeping both GET handlers side-effect free', () => {
+    const routes = [
+      {
+        path: fileURLToPath(new URL('../app/api/filesystem/directories/route.ts', import.meta.url)),
+        mutationMethod: 'POST',
+        mutationOperations: ['request.json()', 'getWorkspaceSettings(', 'fs.mkdir('],
+      },
+      {
+        path: fileURLToPath(new URL('../app/api/settings/workspace/route.ts', import.meta.url)),
+        mutationMethod: 'PUT',
+        mutationOperations: ['request.json()', 'getWorkspaceSettings(', 'saveWorkspaceSettings('],
+      },
+    ]
+
+    for (const route of routes) {
+      const source = readFileSync(route.path, 'utf8')
+      const label = routeLabel(route.path)
+      const handlers = routeHandlers(source)
+      const getBody = handlers.find(({ method }) => method === 'GET')?.body ?? ''
+      expect(getBody, `${label}:GET`).toContain('getWorkspaceSettings({ ensure: false })')
+      expect(getBody, `${label}:GET`).not.toContain('guardEpic172ProjectManagementIngress()')
+      expect(getBody, `${label}:GET`).not.toMatch(/\bfs\s*\.\s*(?:appendFile|mkdir|rename|rm|unlink|writeFile)\s*\(/)
+      expect(getBody, `${label}:GET`).not.toContain('saveWorkspaceSettings(')
+
+      const mutationBody = handlers.find(({ method }) => method === route.mutationMethod)?.body ?? ''
+      const guardMatches = [...mutationBody.matchAll(/guardEpic172ProjectManagementIngress\(\)/g)]
+      expect(guardMatches, `${label}:${route.mutationMethod}`).toHaveLength(1)
+      const guardIndex = guardMatches[0].index ?? -1
+      expect(guardIndex, `${label}:${route.mutationMethod}`).toBeGreaterThanOrEqual(0)
+      for (const operation of route.mutationOperations) {
+        const operationIndex = mutationBody.indexOf(operation)
+        expect(operationIndex, `${label}:${route.mutationMethod}:${operation}`).toBeGreaterThanOrEqual(0)
+        expect(guardIndex, `${label}:${route.mutationMethod}:${operation}`).toBeLessThan(operationIndex)
+      }
+    }
+  })
+
   it('requires the gate before every project-table or project-filesystem mutation in any API route', () => {
     const mutationPatterns = [
       /\.(?:insert|update|delete)\s*\(\s*projects\s*\)/g,

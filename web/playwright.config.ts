@@ -1,9 +1,13 @@
 import { defineConfig, devices } from '@playwright/test'
 import { resolveDestructiveE2EEnvironment } from './e2e/destructive-environment'
+import { EPIC_172_STEP0_E2E_BRIDGE_ENV } from './e2e/epic-172-step0-bridge'
 
 const inheritedEnvironment = { ...process.env }
+const epic172Step0E2EBridge = inheritedEnvironment[EPIC_172_STEP0_E2E_BRIDGE_ENV]
 delete process.env.DATABASE_URL
 delete process.env.REDIS_URL
+delete process.env[EPIC_172_STEP0_E2E_BRIDGE_ENV]
+delete inheritedEnvironment[EPIC_172_STEP0_E2E_BRIDGE_ENV]
 
 const hasE2EEnvironment = Boolean(
   inheritedEnvironment.FORGE_E2E_ALLOW_DESTRUCTIVE_RESET ||
@@ -22,6 +26,12 @@ const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
 
 export default defineConfig({
   testDir: './e2e',
+  // Keep the temporary Step 0 test disposition in Playwright configuration.
+  // It is deliberately removed from process.env before Playwright starts the
+  // Forge web server, so application code cannot turn it into a runtime bypass.
+  metadata: {
+    [EPIC_172_STEP0_E2E_BRIDGE_ENV]: epic172Step0E2EBridge,
+  },
   globalTeardown: './e2e/global-teardown.ts',
   timeout: 60_000,
   // Tests share one dev Postgres/Redis instance and each does a global

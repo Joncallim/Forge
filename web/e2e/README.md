@@ -26,8 +26,9 @@ That means a small number of older browser flows cannot complete yet, including
 task creation, approval, cancellation, retry, and MCP plan-review writes.
 
 Continuous integration sets `FORGE_EPIC_172_STEP0_E2E_BRIDGE=1` only on the
-Playwright test runner. The flag is not passed to the Forge web server and does
-not enable an application route. A reviewed inventory in
+Playwright test runner. The configuration captures it as test metadata and
+removes it from the process environment before the Forge web server starts. The
+application has no bridge flag or bypass. A reviewed inventory in
 `e2e/epic-172-step0-bridge.ts` skips only tests that require the later signed
 activation. Every other test still runs. A source test fails when a Playwright
 test is added, renamed, removed, or left out of that inventory.
