@@ -6,6 +6,9 @@ export type McpExecutionDesignMetadata = {
       mcpId: string
       requirement: 'required' | 'optional'
       reason: string
+      confidence: 'low' | 'medium' | 'high'
+      scope: { kind: 'project' }
+      accessMode: 'planning_instruction'
       assignment: {
         type: string
         targetAgents: string[]
@@ -29,8 +32,13 @@ export type McpExecutionDesignMetadata = {
     mcpAwareSubtasks: Array<{
       id: string
       agent: string
+      scope: { kind: 'project' }
+      accessMode: 'planning_instruction'
+      dependsOn: string[]
       mcpCapabilities: string[]
       capabilityBindings: Array<{ capability: string; requirementKey: string }>
+      inputs: string[]
+      outputs: string[]
       verification: string[]
       stoppingCondition: string
       fallback: string
@@ -216,6 +224,9 @@ export function latestMcpExecutionDesignFromArtifacts(
                 mcpId: typeof item.mcpId === 'string' ? item.mcpId : '',
                 requirement: item.requirement === 'optional' ? 'optional' as const : 'required' as const,
                 reason: typeof item.reason === 'string' ? item.reason : '',
+                confidence: item.confidence === 'low' || item.confidence === 'high' ? item.confidence as 'low' | 'high' : 'medium' as const,
+                scope: { kind: 'project' as const },
+                accessMode: 'planning_instruction' as const,
                 assignment: isRecord(item.assignment)
                   ? {
                       type: typeof item.assignment.type === 'string' ? item.assignment.type : 'agent',
@@ -259,6 +270,9 @@ export function latestMcpExecutionDesignFromArtifacts(
             ? rawProposed.mcpAwareSubtasks.filter(isRecord).map((item) => ({
                 id: typeof item.id === 'string' ? item.id : '',
                 agent: typeof item.agent === 'string' ? item.agent : '',
+                scope: { kind: 'project' as const },
+                accessMode: 'planning_instruction' as const,
+                dependsOn: normalizeStringArray(item.dependsOn),
                 mcpCapabilities: normalizeStringArray(item.mcpCapabilities),
                 capabilityBindings: Array.isArray(item.capabilityBindings)
                   ? item.capabilityBindings.filter(isRecord).map((binding) => ({
@@ -266,6 +280,8 @@ export function latestMcpExecutionDesignFromArtifacts(
                       requirementKey: typeof binding.requirementKey === 'string' ? binding.requirementKey : '',
                     }))
                   : [],
+                inputs: normalizeStringArray(item.inputs),
+                outputs: normalizeStringArray(item.outputs),
                 verification: normalizeStringArray(item.verification),
                 stoppingCondition: typeof item.stoppingCondition === 'string' ? item.stoppingCondition : '',
                 fallback: typeof item.fallback === 'string' ? item.fallback : '',

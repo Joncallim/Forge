@@ -5,6 +5,7 @@ import Redis from 'ioredis'
 import postgres from 'postgres'
 import type { BrowserContext, TestInfo } from '@playwright/test'
 import { seedAgentConfigs } from '../db/seed-agents'
+import { resolveDestructiveE2EEnvironment } from './destructive-environment'
 
 const root = path.resolve(__dirname, '..')
 const workerLogs = new WeakMap<ChildProcessWithoutNullStreams, string[]>()
@@ -32,15 +33,22 @@ export function getBaseUrl(): string {
   return process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
 }
 
+function installedE2EEnvironment() {
+  const environment = resolveDestructiveE2EEnvironment()
+  // Playwright hooks and dynamically imported seed modules can run in separate
+  // processes. Install only the already validated, dedicated test identities.
+  process.env.DATABASE_URL = environment.databaseUrl
+  process.env.REDIS_URL = environment.redisUrl
+  return environment
+}
+
 function sqlClient() {
-  const databaseUrl = process.env.DATABASE_URL
-  if (!databaseUrl) throw new Error('DATABASE_URL is required for E2E tests')
+  const { databaseUrl } = installedE2EEnvironment()
   return postgres(databaseUrl, { max: 1 })
 }
 
 function redisClient() {
-  const redisUrl = process.env.REDIS_URL
-  if (!redisUrl) throw new Error('REDIS_URL is required for E2E tests')
+  const { redisUrl } = installedE2EEnvironment()
   return new Redis(redisUrl, { maxRetriesPerRequest: 3 })
 }
 
@@ -120,15 +128,19 @@ export async function resetState(): Promise<void> {
   const redis = redisClient()
 
   try {
-    // The local Forge role does not necessarily own every table reached by a
-    // blanket TRUNCATE ... CASCADE anymore. Delete the mutable top-level rows
-    // that E2E touches and let foreign keys cascade from there instead.
+    // Epic 172 retains project, task, execution, and immutable grant history in
+    // the dedicated E2E database. Hide prior project fixtures through the same
+    // archive boundary as the product. Random fixture identities isolate all
+    // retained S3 authority rows, so reset never needs elevated TRUNCATE rights.
     await sql.begin(async (tx) => {
-      await tx`delete from projects`
+      await tx`
+        update projects
+        set archived_at = coalesce(archived_at, now()), updated_at = now()
+        where archived_at is null
+      `
       await tx`delete from provider_configs`
       await tx`delete from sessions`
       await tx`delete from credentials`
-      await tx`delete from users`
     })
     await redis.flushdb()
   } finally {

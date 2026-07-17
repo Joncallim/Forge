@@ -4,6 +4,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { z } from 'zod'
 import { getSession } from '@/lib/session'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 import {
   displayPathForWorkspacePath,
   getWorkspaceSettings,
@@ -107,7 +108,7 @@ export async function GET(request: NextRequest) {
 
     const requestedPath = request.nextUrl.searchParams.get('path')
     const showHidden = request.nextUrl.searchParams.get('showHidden') === '1'
-    const workspace = await getWorkspaceSettings()
+    const workspace = await getWorkspaceSettings({ ensure: false })
     const currentPath = resolveDirectoryPath(requestedPath, workspace)
     await assertRealPathWithinWorkspace(currentPath, workspace)
     const stat = await fs.stat(currentPath)
@@ -172,6 +173,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
+    const ingressResponse = await guardEpic172ProjectManagementIngress()
+    if (ingressResponse) return ingressResponse
+
     let body: unknown
     try {
       body = await request.json()
@@ -195,7 +199,7 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const workspace = await getWorkspaceSettings()
+    const workspace = await getWorkspaceSettings({ ensure: false })
     const parentPath = resolveDirectoryPath(parsed.data.parentPath ?? null, workspace)
     const directoryPath = path.join(/*turbopackIgnore: true*/ parentPath, directoryName)
 

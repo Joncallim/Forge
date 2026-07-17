@@ -5,6 +5,7 @@ import { db } from '@/db'
 import { projects } from '@/db/schema'
 import { getSession } from '@/lib/session'
 import { accessibleProjectCondition } from '@/lib/project-access'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 import { isKnownMcpId } from '@/lib/mcps/catalog'
 import { getProjectMcpOverview, installMcps, installRecommendedMcps } from '@/lib/mcps/manager'
 import type { McpId } from '@/lib/mcps/types'
@@ -59,6 +60,9 @@ export async function POST(
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
 
     const { id } = await params
     const [project] = await db

@@ -1,8 +1,10 @@
 import { expect, test } from '@playwright/test'
+import { applyEpic172Step0E2EBridge } from './epic-172-step0-bridge'
 import { installSessionCookie, resetState, seedSession } from './helpers'
 
 test.describe('FORGE brand lifecycle', () => {
-  test.beforeEach(async ({ context }) => {
+  test.beforeEach(async ({ context }, testInfo) => {
+    applyEpic172Step0E2EBridge(testInfo, 'brand-lifecycle.spec.ts')
     await resetState()
     await installSessionCookie(context, await seedSession())
   })

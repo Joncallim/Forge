@@ -17,6 +17,7 @@ import {
 } from './architect-context'
 import type { OpenQuestion } from './open-questions'
 import { getProjectMcpOverview } from '../lib/mcps/manager'
+import { loadCurrentProjectFilesystemDecision } from '../lib/mcps/filesystem-grant-reconciliation'
 import type { ProjectMcpOverview } from '../lib/mcps/types'
 import {
   assertTargetedPlanRevision,
@@ -333,11 +334,12 @@ export function buildArchitectPrompt(
     '- Required unavailable MCPs should declare a fallback with action `block` or `ask_user`; optional unavailable MCPs should declare `continue_without_mcp` where reasonable.',
     '- After the agent breakdown block, append a fenced code block tagged exactly `mcp_execution_design_json` containing a single JSON object of this shape:',
     '```json',
-    '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Inspect issue context and repository state.","assignment":{"type":"agent","targetAgents":["backend"],"targetId":null},"agentPermissions":{"backend":["github.issues.read","github.contents.read"]},"prohibitedCapabilities":["github.pull_requests.merge"],"fallback":{"action":"ask_user","message":"Connect GitHub before implementation."}}],"promptOverlays":{},"requirementContexts":[{"sourceRequirementIndex":0,"agent":"backend","promptOverlay":"Use GitHub MCP only for the approved repository and issue context. Do not merge pull requests."}],"mcpAwareSubtasks":[{"id":"inspect-repository","agent":"backend","dependsOn":[],"mcpCapabilities":["github.issues.read"],"capabilityRequirements":[{"capability":"github.issues.read","sourceRequirementIndex":0}],"inputs":["Task prompt"],"outputs":["Repository context"],"verification":["Relevant files identified"],"stoppingCondition":"Repository context is captured.","fallback":"Ask user for repository context manually."}]}',
+    '{"schemaVersion":1,"requirements":[{"mcpId":"github","requirement":"required","reason":"Inspect issue context and repository state.","confidence":"high","scope":{"kind":"project"},"accessMode":"planning_instruction","assignment":{"type":"agent","targetAgents":["backend"],"targetId":null},"agentPermissions":{"backend":["github.issues.read","github.contents.read"]},"prohibitedCapabilities":["github.pull_requests.merge"],"fallback":{"action":"ask_user","message":"Connect GitHub before implementation."}}],"promptOverlays":{},"requirementContexts":[{"sourceRequirementIndex":0,"agent":"backend","promptOverlay":"Use GitHub MCP only for the approved repository and issue context. Do not merge pull requests."}],"mcpAwareSubtasks":[{"id":"inspect-repository","agent":"backend","scope":{"kind":"project"},"accessMode":"planning_instruction","dependsOn":[],"mcpCapabilities":["github.issues.read"],"capabilityRequirements":[{"capability":"github.issues.read","sourceRequirementIndex":0}],"inputs":["Task prompt"],"outputs":["Repository context"],"verification":["Relevant files identified"],"stoppingCondition":"Repository context is captured.","fallback":"Ask user for repository context manually."}]}',
     '```',
     '- Use empty arrays/objects when no MCP access is needed.',
     '- Scope prompt context to a requirement with `requirementContexts[{sourceRequirementIndex,agent,promptOverlay}]`. The index refers to the requirement array in this fence only.',
     '- Bind each MCP-aware subtask capability with `capabilityRequirements[{capability,sourceRequirementIndex}]`; do not invent persistent requirement keys.',
+    '- Set requirement `confidence` to `low`, `medium`, or `high`. Keep every requirement and MCP-aware subtask project-scoped with `scope:{"kind":"project"}` and `accessMode:"planning_instruction"`; these records never grant live tool handles.',
     '',
     'Open questions:',
     answeredQuestions.length === 0
@@ -660,7 +662,8 @@ async function runArchitect(
   let text = ''
 
   try {
-    const mcpOverview = await getProjectMcpOverview(project)
+    const projectFilesystemDecision = await loadCurrentProjectFilesystemDecision(project.id)
+    const mcpOverview = await getProjectMcpOverview(project, projectFilesystemDecision)
     let usage: { inputTokens: number | null; outputTokens: number | null } = {
       inputTokens: null,
       outputTokens: null,
@@ -1310,6 +1313,7 @@ async function publishHandoffResult(
     claimedPackageId: handoff.claimedPackageId,
     readyPackageIds: handoff.readyPackageIds,
     blockedReason: handoff.status === 'blocked' ? handoff.blockedReason : undefined,
+    taskDisposition: handoff.status === 'blocked' ? handoff.taskDisposition : undefined,
     status: handoff.status,
     terminalBlock: handoff.status === 'blocked' ? handoff.terminalBlock : undefined,
   })

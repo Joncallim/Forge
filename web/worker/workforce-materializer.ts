@@ -15,6 +15,7 @@ import {
   projectFilesystemEffectivePhase,
   projectFilesystemGrantCovers,
 } from '../lib/mcps/filesystem-grants'
+import { loadCurrentProjectFilesystemDecision } from '../lib/mcps/filesystem-grant-reconciliation'
 import { canonicalAgentPackageIdentity } from '../lib/mcps/agent-package-identity'
 import type { PreparedArchitectArtifact } from './architect-artifact'
 import type { ReviewRequirement } from './agent-breakdown'
@@ -51,6 +52,8 @@ type BuildOptions = {
   activeAgents?: MaterializerAgentCatalogRow[]
   idFactory?: () => string
   projectMcpConfig?: unknown
+  projectFilesystemDecision?: unknown
+  projectRootBindingRevision?: unknown
 }
 
 function featureFlagDisabled(value: string | undefined): boolean {
@@ -198,6 +201,9 @@ function mcpRequirementsForAgent(prepared: PreparedArchitectArtifact, agentType:
       mcpId: requirement.mcpId,
       requirement: requirement.requirement,
       reason: requirement.reason,
+      confidence: requirement.confidence ?? 'medium',
+      scope: requirement.scope ?? { kind: 'project' },
+      accessMode: requirement.accessMode ?? 'planning_instruction',
       assignment: requirement.assignment,
       permissions: [...new Set(matchingObjectValues(requirement.agentPermissions, agentType, aliases).flat())].sort(),
       prohibitedCapabilities: requirement.prohibitedCapabilities,
@@ -235,6 +241,8 @@ function mcpSubtasksForAgent(prepared: PreparedArchitectArtifact, agentType: str
     .map((subtask) => ({
       id: subtask.id,
       agent: agentType,
+      scope: subtask.scope ?? { kind: 'project' },
+      accessMode: subtask.accessMode ?? 'planning_instruction',
       dependsOn: subtask.dependsOn,
       mcpCapabilities: subtask.mcpCapabilities,
       capabilityBindings: subtask.capabilityBindings ?? [],
@@ -430,12 +438,14 @@ export function buildWorkforceMaterializationRows(
       mcpConfig: options.projectMcpConfig,
       mcpRequirements,
       metadata: packageMetadata,
+      projectFilesystemDecision: options.projectFilesystemDecision,
+      projectRootBindingRevision: options.projectRootBindingRevision,
     })
     if (projectGrant) {
       const phases = packageMetadata.mcpGrantPhases
       packageMetadata.mcpGrantPhases = {
         ...(typeof phases === 'object' && phases !== null && !Array.isArray(phases) ? phases : {}),
-        schemaVersion: 1,
+        schemaVersion: 2,
         effective: projectFilesystemEffectivePhase(projectGrant),
       }
     }
@@ -484,6 +494,7 @@ export function buildWorkforceMaterializationRows(
         workPackageIds: packages.map((pkg) => pkg.id),
         harnessIds: harnesses.map((harness) => harness.id),
         mcpExecutionStatus: input.prepared.mcpExecutionDesign.validation.status,
+        mcpOperatorReviewRequired: (input.prepared.mcpExecutionDesign.proposed?.requirements.length ?? 0) > 0,
         mcpNormalizationErrors: [...(input.prepared.mcpExecutionDesign.proposed?.normalizationErrors ?? [])],
         mcpNormalizationEvidence: mcpNormalizationEvidence(input.prepared),
       },
@@ -513,16 +524,25 @@ export async function materializeWorkforceFromArchitectArtifact(
       .from(agentConfigs)
       .where(eq(agentConfigs.isActive, true)),
     db
-      .select({ mcpConfig: projects.mcpConfig })
+      .select({
+        id: projects.id,
+        mcpConfig: projects.mcpConfig,
+        rootBindingRevision: projects.rootBindingRevision,
+      })
       .from(tasks)
       .innerJoin(projects, eq(tasks.projectId, projects.id))
       .where(eq(tasks.id, input.taskId))
       .limit(1)
       .then((rows) => rows[0] ?? null),
   ])
+  const projectFilesystemDecision = taskProject
+    ? await loadCurrentProjectFilesystemDecision(taskProject.id)
+    : null
   const rows = buildWorkforceMaterializationRows(input, {
     activeAgents,
     projectMcpConfig: taskProject?.mcpConfig,
+    projectFilesystemDecision,
+    projectRootBindingRevision: taskProject?.rootBindingRevision,
   })
   if (rows.workPackages.length === 0) {
     throw new Error(

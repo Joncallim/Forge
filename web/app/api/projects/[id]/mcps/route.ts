@@ -6,6 +6,7 @@ import { db } from '@/db'
 import { projects, type ProjectMcpConfig } from '@/db/schema'
 import { getSession } from '@/lib/session'
 import { accessibleProjectCondition } from '@/lib/project-access'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 import { isKnownMcpId } from '@/lib/mcps/catalog'
 import { getProjectMcpOverview, setProjectMcpConfig } from '@/lib/mcps/manager'
 import { getWorkspaceSettings, isWithinPath } from '@/lib/workspace'
@@ -67,7 +68,11 @@ export async function GET(
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
     }
 
-    const overview = await getProjectMcpOverview(project)
+    const overview = await getProjectMcpOverview(
+      project,
+      null,
+      { cache: false, ensureWorkspace: false },
+    )
     return NextResponse.json({ overview })
   } catch (err) {
     console.error('[GET /api/projects/:id/mcps] Unexpected error', err)
@@ -84,6 +89,9 @@ export async function PUT(
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
 
     const { id } = await params
     const project = await findProject(id, session.userId)

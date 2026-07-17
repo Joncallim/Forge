@@ -21,9 +21,20 @@ import {
 import type { McpBrokerAdmissionCheck } from '../lib/mcps/admission'
 import { buildMcpBrokerBlockMetadata } from './blocked-handoff-retry'
 import {
+  canonicalFilesystemProjectCapabilities,
   isProjectFilesystemEffectivePhase,
   requiresFilesystemGrantApproval,
 } from '../lib/mcps/filesystem-grants'
+import {
+  buildFilesystemGrantBlockMetadata,
+  type FilesystemGrantHoldState,
+} from '../lib/mcps/filesystem-grant-lifecycle'
+import {
+  convergeOperatorHeldTask,
+  loadCurrentProjectFilesystemDecision,
+} from '../lib/mcps/filesystem-grant-reconciliation'
+import type { ProjectFilesystemDecisionAuthority } from '../lib/mcps/filesystem-project-authority'
+import { assertMcpAdmissionLockSequence } from '../lib/mcps/mcp-admission-lock-order'
 import { updateTaskStatusIfCurrent } from './task-state'
 import {
   completeTaskIfReviewGatesSatisfied,
@@ -50,6 +61,12 @@ import { sanitizeWorkerMessage } from './redaction'
 import { recordTaskLogBestEffort } from './task-logs'
 import { packetCandidateGuard } from '../lib/mcps/packet-issuance-v2'
 import { localEffectCandidateGuard } from '../lib/mcps/local-run-evidence-v2'
+import {
+  executionLeaseIsStale,
+  parseExecutionLeaseMetadata,
+  staleRunningPackageSeconds,
+  type ExecutionLease,
+} from './execution-lease'
 
 type HandoffPackage = {
   id: string
@@ -81,7 +98,6 @@ type WorkPackageLeaseTransaction = Parameters<Parameters<typeof db.transaction>[
 
 const MAX_PRIOR_REVIEW_SOURCE_ARTIFACTS = 10
 const MAX_PRIOR_REVIEW_SOURCE_ARTIFACT_BYTES = 2 * 1024
-const DEFAULT_STALE_RUNNING_PACKAGE_SECONDS = 15 * 60
 const DEFAULT_EXECUTION_LEASE_HEARTBEAT_SECONDS = 60
 
 class ExecutionLeaseLostError extends Error {
@@ -96,15 +112,6 @@ class RepositoryEvidenceBlockedError extends Error {
     super(message)
     this.name = 'RepositoryEvidenceBlockedError'
   }
-}
-
-type ExecutionLease = {
-  acquiredAt: string
-  attemptNumber: number
-  heartbeatAt: string
-  runId: string
-  source: 'work-package-handoff'
-  staleAfterSeconds: number
 }
 
 type HandoffOptions = {
@@ -123,9 +130,12 @@ type HandoffOptions = {
 }
 
 type McpProjectFreshnessSnapshot = {
+  filesystemGrantDecision?: ProjectFilesystemDecisionAuthority | null
+  grantDecisionRevision: bigint
   id: string
   localPath: string | null
   mcpConfig: unknown
+  rootBindingRevision: bigint
 }
 
 type McpHealthCapture = {
@@ -145,10 +155,12 @@ type HandoffBlockDecision =
     }
   | {
       blockedReason: string
+      holdState: FilesystemGrantHoldState
       kind: 'filesystem_grant'
       missingCapabilities: string[]
+      requirementKeys: string[]
       requestedCapabilities: string[]
-      terminalBlock: true
+      terminalBlock?: false
     }
   | {
       blockedReason: string
@@ -158,7 +170,12 @@ type HandoffBlockDecision =
 
 type HandoffAdmissionResult =
   | { pkg: HandoffPackage; project: McpProjectFreshnessSnapshot; status: 'allowed' }
-  | { blockedReason: string; status: 'blocked'; terminalBlock?: boolean }
+  | {
+      blockedReason: string
+      status: 'blocked'
+      taskDisposition?: 'operator_hold'
+      terminalBlock?: boolean
+    }
   | { pkg: HandoffPackage; status: 'conflict' }
 
 const MAX_HANDOFF_FRESHNESS_ATTEMPTS = 3
@@ -211,11 +228,13 @@ async function rereadMcpHandoffInputs(taskId: string, packageId: string): Promis
       blockedReason: workPackages.blockedReason,
       harnessId: workPackages.harnessId,
       id: workPackages.id,
+      grantDecisionRevision: projects.grantDecisionRevision,
       localPath: projects.localPath,
       mcpConfig: projects.mcpConfig,
       mcpRequirements: workPackages.mcpRequirements,
       metadata: workPackages.metadata,
       projectId: projects.id,
+      rootBindingRevision: projects.rootBindingRevision,
       sequence: workPackages.sequence,
       status: workPackages.status,
       title: workPackages.title,
@@ -227,9 +246,17 @@ async function rereadMcpHandoffInputs(taskId: string, packageId: string): Promis
     .where(and(eq(workPackages.id, packageId), eq(workPackages.taskId, taskId)))
     .limit(1)
   if (!row) return null
+  const filesystemGrantDecision = await loadCurrentProjectFilesystemDecision(row.projectId)
   return {
     pkg: row,
-    project: { id: row.projectId, localPath: row.localPath, mcpConfig: row.mcpConfig },
+    project: {
+      filesystemGrantDecision,
+      grantDecisionRevision: row.grantDecisionRevision ?? BigInt(0),
+      id: row.projectId,
+      localPath: row.localPath,
+      mcpConfig: row.mcpConfig,
+      rootBindingRevision: row.rootBindingRevision ?? BigInt(0),
+    },
   }
 }
 
@@ -238,7 +265,9 @@ function mcpProjectSnapshotsMatch(
   right: McpProjectFreshnessSnapshot,
 ): boolean {
   return left.id === right.id &&
+    (left.grantDecisionRevision ?? BigInt(0)) === (right.grantDecisionRevision ?? BigInt(0)) &&
     left.localPath === right.localPath &&
+    (left.rootBindingRevision ?? BigInt(0)) === (right.rootBindingRevision ?? BigInt(0)) &&
     sameJsonSnapshot(left.mcpConfig, right.mcpConfig)
 }
 
@@ -268,8 +297,10 @@ async function lockFreshMcpHandoffInputs(
   const [lockedProject] = await tx
     .select({
       id: projects.id,
+      grantDecisionRevision: projects.grantDecisionRevision,
       localPath: projects.localPath,
       mcpConfig: projects.mcpConfig,
+      rootBindingRevision: projects.rootBindingRevision,
     })
     .from(projects)
     .where(eq(projects.id, projectSnapshot.id))
@@ -563,6 +594,7 @@ export type WorkPackageHandoffResult =
       readyPackageIds: string[]
       claimedPackageId: string | null
       blockedReason?: string
+      taskDisposition?: 'operator_hold'
       terminalBlock?: boolean
     }
 
@@ -579,15 +611,6 @@ export function isWorkPackageExecutionEnabled(
   return defaultOnFeatureFlagEnabled(env.FORGE_WORK_PACKAGE_EXECUTION)
 }
 
-function staleRunningPackageSeconds(
-  env: Record<string, string | undefined> = process.env,
-): number {
-  const raw = env.FORGE_RUNNING_WORK_PACKAGE_STALE_SECONDS?.trim()
-  if (!raw) return DEFAULT_STALE_RUNNING_PACKAGE_SECONDS
-  const parsed = Number(raw)
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_STALE_RUNNING_PACKAGE_SECONDS
-}
-
 function executionLeaseHeartbeatSeconds(
   env: Record<string, string | undefined> = process.env,
 ): number {
@@ -602,26 +625,8 @@ function staleRunningPackageCutoff(now = new Date()): Date {
 }
 
 function executionLeaseFromMetadata(metadata: unknown): ExecutionLease | null {
-  if (!isRecord(metadata) || !isRecord(metadata.executionLease)) return null
-  const lease = metadata.executionLease
-  if (
-    typeof lease.runId !== 'string' ||
-    typeof lease.attemptNumber !== 'number' ||
-    typeof lease.acquiredAt !== 'string' ||
-    typeof lease.heartbeatAt !== 'string'
-  ) {
-    return null
-  }
-  return {
-    acquiredAt: lease.acquiredAt,
-    attemptNumber: lease.attemptNumber,
-    heartbeatAt: lease.heartbeatAt,
-    runId: lease.runId,
-    source: 'work-package-handoff',
-    staleAfterSeconds: typeof lease.staleAfterSeconds === 'number'
-      ? lease.staleAfterSeconds
-      : staleRunningPackageSeconds(),
-  }
+  const parsed = parseExecutionLeaseMetadata(metadata)
+  return parsed.state === 'valid' ? parsed.lease : null
 }
 
 function metadataWithoutExecutionLease(metadata: unknown): Record<string, unknown> {
@@ -651,8 +656,10 @@ function executionLeaseMetadata(input: {
 
 function isStaleRunningPackage(pkg: HandoffPackage, now = new Date()): boolean {
   if (pkg.status !== 'running') return false
-  const lease = executionLeaseFromMetadata(pkg.metadata)
-  const heartbeatAt = lease ? new Date(lease.heartbeatAt) : pkg.updatedAt
+  const parsed = parseExecutionLeaseMetadata(pkg.metadata)
+  if (parsed.state === 'malformed') return false
+  if (parsed.state === 'valid') return executionLeaseIsStale(parsed.lease, now)
+  const heartbeatAt = pkg.updatedAt
   return heartbeatAt instanceof Date &&
     Number.isFinite(heartbeatAt.getTime()) &&
     heartbeatAt.getTime() <= staleRunningPackageCutoff(now).getTime()
@@ -1011,55 +1018,89 @@ function architectReservedHandoffBlockedReason(pkg: HandoffPackage): string | nu
 // effective filesystem grant) would let the package be claimed and run, and the
 // executor would throw a guaranteed "context blocked" error on every attempt —
 // burning the whole implementation attempt budget on failed runs and leaving no
-// budget for the corrected run after the operator approves the grant. Failing
+// budget for the corrected run after the operator approves the grant. Holding
 // here creates no agent run and consumes no attempt, so the recovery run starts
 // fresh at attempt 1 once the grant is approved.
 async function failWorkPackageForFilesystemGrant(input: {
   blockedReason: string
+  holdState: FilesystemGrantHoldState
   missingCapabilities: string[]
   pkg: HandoffPackage
   project: McpProjectFreshnessSnapshot
+  requirementKeys: string[]
   requestedCapabilities: string[]
   taskId: string
 }): Promise<
-  | { blockedReason: string; status: 'blocked'; terminalBlock: true }
+  | { blockedReason: string; status: 'blocked'; taskDisposition: 'operator_hold' }
   | { pkg: HandoffPackage; status: 'conflict' }
 > {
-  const failedAt = new Date()
-  const grantBlockMarker = {
-    blockedAt: failedAt.toISOString(),
-    missingCapabilities: input.missingCapabilities,
-    reason: input.blockedReason,
-    requestedCapabilities: input.requestedCapabilities,
-    source: 'filesystem-grant-approval',
-    status: 'failed',
-  }
-  const failedRow = await db.transaction(async (tx) => {
-    if (!await lockFreshMcpHandoffInputs(tx, input.taskId, input.pkg, input.project)) return null
+  const failedResult = await db.transaction(async (tx) => {
+    assertMcpAdmissionLockSequence(['project', 'tasks:id-ascending', 'work-packages:id-ascending'])
+    const [lockedProject] = await tx
+      .select({
+        id: projects.id,
+        grantDecisionRevision: projects.grantDecisionRevision,
+        localPath: projects.localPath,
+        mcpConfig: projects.mcpConfig,
+        rootBindingRevision: projects.rootBindingRevision,
+      })
+      .from(projects)
+      .where(eq(projects.id, input.project.id))
+      .for('update')
+    if (!lockedProject || !mcpProjectSnapshotsMatch(input.project, lockedProject)) return null
+    const [lockedTask] = await tx.select().from(tasks)
+      .where(and(eq(tasks.id, input.taskId), eq(tasks.projectId, lockedProject.id)))
+      .for('update')
+    if (!lockedTask) return null
+    const siblings = await tx.select().from(workPackages)
+      .where(eq(workPackages.taskId, input.taskId))
+      .orderBy(workPackages.id)
+      .for('update')
+    const lockedPackage = siblings.find((pkg) => pkg.id === input.pkg.id)
+    if (!lockedPackage || !mcpPackageSnapshotsMatch(input.pkg, lockedPackage)) return null
+    const [clock] = await tx.execute(sql<{ now: string }>`select transaction_timestamp()::text as now`)
+    const clockValue = (clock as { now?: unknown } | undefined)?.now
+    const failedAt = new Date(typeof clockValue === 'string' || clockValue instanceof Date ? clockValue : '')
+    if (!Number.isFinite(failedAt.getTime())) throw new Error('Database transaction clock is unavailable.')
+    const grantBlockMarker = buildFilesystemGrantBlockMetadata({
+      blockedAt: failedAt,
+      hold: input.holdState,
+      requirementKeys: input.requirementKeys,
+      requestedCapabilities: canonicalFilesystemProjectCapabilities(input.missingCapabilities),
+      rootBindingRevision: input.project.rootBindingRevision.toString(),
+    })
     const [row] = await tx
       .update(workPackages)
       .set({
         blockedReason: input.blockedReason,
         metadata: sql`jsonb_set(coalesce(${workPackages.metadata}, '{}'::jsonb), '{mcpGrantBlock}', ${JSON.stringify(grantBlockMarker)}::jsonb, true)`,
-        status: 'failed',
+        status: 'blocked',
         updatedAt: failedAt,
       })
       .where(and(...handoffFreshnessConditions(input)))
-      .returning({ id: workPackages.id })
-    return row ?? null
+      .returning()
+    if (!row) return null
+    await convergeOperatorHeldTask(
+      tx,
+      lockedTask,
+      siblings.map((pkg) => pkg.id === row.id ? row : pkg),
+      failedAt,
+    )
+    return { failedAt, row }
   })
 
-  if (!failedRow) return { pkg: input.pkg, status: 'conflict' }
+  if (!failedResult) return { pkg: input.pkg, status: 'conflict' }
+  const { failedAt } = failedResult
 
   await publishTaskEvent(input.taskId, 'work_package:status', {
     blockedReason: input.blockedReason,
     mcpGrantBlock: {
-      missingCapabilities: input.missingCapabilities,
+      holdKind: input.holdState.holdKind,
       requestedCapabilities: input.requestedCapabilities,
       source: 'filesystem-grant-approval',
-      status: 'failed',
+      taskDisposition: 'operator_hold',
     },
-    status: 'failed',
+    status: 'blocked',
     updatedAt: failedAt.toISOString(),
     workPackageId: input.pkg.id,
   })
@@ -1078,7 +1119,7 @@ async function failWorkPackageForFilesystemGrant(input: {
     workPackageId: input.pkg.id,
   })
 
-  return { blockedReason: input.blockedReason, status: 'blocked', terminalBlock: true }
+  return { blockedReason: input.blockedReason, status: 'blocked', taskDisposition: 'operator_hold' }
 }
 
 function packageProjectFilesystemEffectivePhase(pkg: HandoffPackage): Record<string, unknown> | null {
@@ -1093,7 +1134,9 @@ function filesystemGrantHandoffBlock(
   project: McpProjectFreshnessSnapshot,
 ): {
   blockedReason: string
+  holdState: FilesystemGrantHoldState
   missingCapabilities: string[]
+  requirementKeys: string[]
   requestedCapabilities: string[]
 } | null {
   if (packageProjectFilesystemEffectivePhase(pkg)) {
@@ -1101,11 +1144,15 @@ function filesystemGrantHandoffBlock(
       mcpRequirements: pkg.mcpRequirements,
       metadata: pkg.metadata,
       projectMcpConfig: project.mcpConfig,
+      projectFilesystemDecision: project.filesystemGrantDecision,
+      projectRootBindingRevision: project.rootBindingRevision,
     })
     if (!check.blocked) return null
     return {
       blockedReason: `Work package "${pkg.title}" was covered by a project-level filesystem grant, but that project grant was removed or no longer covers ${check.missingCapabilities.join(', ')}. Approve filesystem context again before execution.`,
+      holdState: check.holdState!,
       missingCapabilities: check.missingCapabilities,
+      requirementKeys: check.requirementKeys,
       requestedCapabilities: check.requestedCapabilities,
     }
   }
@@ -1114,11 +1161,15 @@ function filesystemGrantHandoffBlock(
     mcpRequirements: pkg.mcpRequirements,
     metadata: pkg.metadata,
     projectMcpConfig: project.mcpConfig,
+    projectFilesystemDecision: project.filesystemGrantDecision,
+    projectRootBindingRevision: project.rootBindingRevision,
   })
   if (!check.blocked) return null
   return {
     blockedReason: `Work package "${pkg.title}" requires filesystem grant approval for ${check.missingCapabilities.join(', ')} before execution. Approve filesystem context for this package, then re-run the task.`,
+    holdState: check.holdState!,
     missingCapabilities: check.missingCapabilities,
+    requirementKeys: check.requirementKeys,
     requestedCapabilities: check.requestedCapabilities,
   }
 }
@@ -1304,15 +1355,19 @@ async function loadPriorReviewContext(
 async function captureMcpHealth(taskId: string): Promise<McpHealthCapture | null> {
   const project = await loadTaskProjectForMcpBroker(taskId)
   if (!project) return null
+  const filesystemGrantDecision = await loadCurrentProjectFilesystemDecision(project.id)
   const projectSnapshot = {
+    filesystemGrantDecision,
+    grantDecisionRevision: project.grantDecisionRevision ?? BigInt(0),
     id: project.id,
     localPath: project.localPath ?? null,
     mcpConfig: project.mcpConfig ?? null,
+    rootBindingRevision: project.rootBindingRevision ?? BigInt(0),
   }
   try {
     return {
       error: null,
-      overview: await getProjectMcpOverview(project),
+      overview: await getProjectMcpOverview(project, filesystemGrantDecision),
       project: projectSnapshot,
     }
   } catch (err) {
@@ -1359,7 +1414,7 @@ function evaluateWorkPackageHandoffAdmission(input: {
 
   const filesystemGrantBlock = filesystemGrantHandoffBlock(pkg, project)
   if (filesystemGrantBlock) {
-    return { ...filesystemGrantBlock, kind: 'filesystem_grant', terminalBlock: true }
+    return { ...filesystemGrantBlock, kind: 'filesystem_grant' }
   }
 
   if (!hasWorkPackageMcpRuntimeInputs(pkg)) return { status: 'allowed' }
@@ -1374,6 +1429,8 @@ function evaluateWorkPackageHandoffAdmission(input: {
       mcpRequirements: pkg.mcpRequirements,
       metadata: pkg.metadata,
       projectMcpConfig: project.mcpConfig,
+      projectFilesystemDecision: project.filesystemGrantDecision,
+      projectRootBindingRevision: project.rootBindingRevision,
       title: pkg.title,
     })
     if (check.status !== 'blocked') return { status: 'allowed' }
@@ -1409,7 +1466,9 @@ async function persistWorkPackageHandoffBlock(input: {
       return failWorkPackageForFilesystemGrant({
         ...common,
         blockedReason: input.decision.blockedReason,
+        holdState: input.decision.holdState,
         missingCapabilities: input.decision.missingCapabilities,
+        requirementKeys: input.decision.requirementKeys,
         requestedCapabilities: input.decision.requestedCapabilities,
       })
     case 'reserved_role':
@@ -1574,6 +1633,7 @@ export async function handoffApprovedWorkPackages(
           readyPackageIds: allowedReadyPackageIds,
           claimedPackageId: null,
           blockedReason: admission.blockedReason,
+          taskDisposition: admission.taskDisposition,
           terminalBlock: admission.terminalBlock,
         }
       }
@@ -1634,6 +1694,7 @@ export async function handoffApprovedWorkPackages(
         readyPackageIds: [],
         claimedPackageId: null,
         blockedReason: admission.blockedReason,
+        taskDisposition: admission.taskDisposition,
         terminalBlock: admission.terminalBlock,
       }
     }
