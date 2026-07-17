@@ -15,6 +15,7 @@ import {
   assertProjectLocalPathPreflightAllowed,
   assertProjectPathNotProtected,
 } from '@/lib/projects/local-path'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 import {
   displayPathForWorkspacePath,
   getWorkspaceSettings,
@@ -128,6 +129,9 @@ export async function PUT(
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
+
     const { id } = await params
 
     const existing = await getAccessibleProject(id, session.userId)
@@ -225,94 +229,10 @@ export async function PUT(
 // ---------------------------------------------------------------------------
 // DELETE /api/projects/:id
 //
-// Removes the project (cascading to its tasks/runs/artifacts). With
-// ?deleteFiles=true it also removes the local project folder from disk.
+// Project history is release evidence under Epic 172. "Remove" therefore
+// archives the project record. Requests that also ask Forge to delete files are
+// rejected before any workspace lookup or filesystem operation.
 // ---------------------------------------------------------------------------
-
-type ProjectDeletePathCheck =
-  | { action: 'delete' }
-  | { action: 'skip'; reason: string; message: string }
-  | { action: 'error'; message: string }
-
-async function checkProjectDeletePath(target: string, projectId: string): Promise<ProjectDeletePathCheck> {
-  const workspace = await getWorkspaceSettings()
-  const resolved = path.resolve(/*turbopackIgnore: true*/ target)
-  const protectedRoots = [
-    workspace.workspaceRoot,
-    workspace.projectsRoot,
-    workspace.mcpsRoot,
-    workspace.templatesRoot,
-    workspace.localMemoryRoot,
-    workspace.checkpointsRoot,
-    workspace.promptsRoot,
-    workspace.agentPromptsRoot,
-    workspace.workforcesRoot,
-    workspace.configRoot,
-    workspace.runtimeRoot,
-    workspace.logsRoot,
-    workspace.backupsRoot,
-  ].map((root) => path.resolve(/*turbopackIgnore: true*/ root))
-
-  if (protectedRoots.includes(resolved)) {
-    return {
-      action: 'error',
-      message: 'Refusing to delete files: the project path points at a shared Forge workspace directory.',
-    }
-  }
-
-  if (!isWithinPath(workspace.projectsRoot, resolved)) {
-    return {
-      action: 'skip',
-      reason: 'outside_forge_managed_projects',
-      message: 'Files were not deleted because the project path is outside Forge-managed projects.',
-    }
-  }
-
-  let stat
-  try {
-    stat = await fs.lstat(resolved)
-  } catch {
-    return {
-      action: 'error',
-      message: 'Refusing to delete files: the project path does not exist.',
-    }
-  }
-  if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    return {
-      action: 'error',
-      message: 'Refusing to delete files: the project path must be a real directory.',
-    }
-  }
-
-  const [realProjectsRoot, realTarget] = await Promise.all([
-    fs.realpath(workspace.projectsRoot),
-    fs.realpath(resolved),
-  ])
-  if (realTarget === realProjectsRoot || !isWithinPath(realProjectsRoot, realTarget)) {
-    return {
-      action: 'error',
-      message: 'Refusing to delete files: the project path escapes the real Forge projects directory.',
-    }
-  }
-
-  try {
-    const raw = await fs.readFile(path.join(/*turbopackIgnore: true*/ resolved, 'forge.project.json'), 'utf-8')
-    const marker = JSON.parse(raw) as { projectId?: unknown }
-    if (marker.projectId !== projectId) {
-      return {
-        action: 'error',
-        message: 'Refusing to delete files: the Forge project marker does not match this project.',
-      }
-    }
-  } catch {
-    return {
-      action: 'error',
-      message: 'Refusing to delete files: no matching Forge project marker was found.',
-    }
-  }
-
-  return { action: 'delete' }
-}
 
 export async function DELETE(
   request: NextRequest,
@@ -324,8 +244,21 @@ export async function DELETE(
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
+
     const { id } = await params
     const deleteFiles = request.nextUrl.searchParams.get('deleteFiles') === 'true'
+
+    if (deleteFiles) {
+      return NextResponse.json(
+        {
+          error: 'Project files cannot be deleted while retained release evidence is enabled. Retry without deleteFiles to archive the project.',
+          code: 'project_hard_delete_disabled',
+        },
+        { status: 409 },
+      )
+    }
 
     const existing = await getAccessibleProject(id, session.userId)
 
@@ -333,55 +266,19 @@ export async function DELETE(
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
     }
 
-    const workspace = await getWorkspaceSettings({ ensure: false })
-    let filesDeleted = false
-    let fileDeletionSkippedReason: string | null = null
-    let fileDeletionMessage: string | null = null
-    if (deleteFiles && existing.localPath) {
-      const deletePathCheck = await checkProjectDeletePath(existing.localPath, id)
-      if (deletePathCheck.action === 'error') {
-        return NextResponse.json(
-          { error: deletePathCheck.message },
-          { status: 400 },
-        )
-      }
-      if (deletePathCheck.action === 'skip') {
-        fileDeletionSkippedReason = deletePathCheck.reason
-        fileDeletionMessage = deletePathCheck.message
-      } else {
-        try {
-          await fs.rm(existing.localPath, { recursive: true, force: true })
-          filesDeleted = true
-        } catch (err) {
-          console.error('[DELETE /api/projects/:id] Failed to remove project files', err)
-          return NextResponse.json(
-            { error: `Could not delete project files: ${err instanceof Error ? err.message : 'unknown error'}` },
-            { status: 500 },
-          )
-        }
-      }
-    }
+    const archivedAt = new Date()
+    await db
+      .update(projects)
+      .set({ archivedAt, updatedAt: archivedAt })
+      .where(and(eq(projects.id, id), accessibleProjectOwnerCondition(session.userId)))
 
-    if (existing.localPath) {
-      await unregisterProjectPath(existing.localPath)
-    }
-
-    await db.delete(projects).where(and(eq(projects.id, id), accessibleProjectOwnerCondition(session.userId)))
-
-    console.info('[DELETE /api/projects/:id] Deleted project', {
-      id,
-      filesDeleted,
-      fileDeletionSkippedReason,
-    })
+    console.info('[DELETE /api/projects/:id] Archived project', { id })
     return NextResponse.json({
       ok: true,
-      filesDeleted,
-      fileDeletionSkippedReason,
-      fileDeletionMessage,
-      localPath: existing.localPath,
-      displayLocalPath: existing.localPath
-        ? displayPathForWorkspacePath(workspace, existing.localPath)
-        : null,
+      archived: true,
+      filesDeleted: false,
+      fileDeletionSkippedReason: 'retained_release_evidence',
+      fileDeletionMessage: 'Project files were retained. Forge archived the project record instead.',
     })
   } catch (err) {
     console.error('[DELETE /api/projects/:id] Unexpected error', err)

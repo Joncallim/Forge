@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { applyEpic172Step0E2EBridge } from './epic-172-step0-bridge'
 import {
   installSessionCookie,
   resetState,
@@ -7,7 +8,8 @@ import {
 } from './helpers'
 
 test.describe('project task composer', () => {
-  test.beforeEach(async () => {
+  test.beforeEach(async ({}, testInfo) => {
+    applyEpic172Step0E2EBridge(testInfo, 'project-task-composer.spec.ts')
     await resetState()
   })
 

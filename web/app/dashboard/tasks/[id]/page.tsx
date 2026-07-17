@@ -16,7 +16,6 @@ import {
   InfoIcon,
   DownloadIcon,
   SquareIcon,
-  Trash2Icon,
   LoaderCircleIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -1564,7 +1563,8 @@ export function canStopTaskStatus(status: string): boolean {
 }
 
 export function canDeleteTaskStatus(status: string): boolean {
-  return TERMINAL_TASK_STATUSES.has(status)
+  void status
+  return false
 }
 
 // ---------------------------------------------------------------------------
@@ -4333,24 +4333,6 @@ export default function TaskDetailPage() {
     }
   }
 
-  async function handleDeleteTask() {
-    if (!window.confirm('Delete this task and its run history? This cannot be undone.')) return
-    setActionLoading(true)
-    setActionError(null)
-    try {
-      const res = await fetch(`/api/tasks/${taskId}?mode=delete`, { method: 'DELETE' })
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}))
-        throw new Error(body.error ?? 'Failed to delete task')
-      }
-      router.push('/dashboard/tasks')
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
-    } finally {
-      setActionLoading(false)
-    }
-  }
-
   if (loading) {
     return (
       <div className="flex items-center justify-center px-4 py-16" role="status" aria-live="polite">
@@ -4395,7 +4377,6 @@ export default function TaskDetailPage() {
   const canRetryTask = ['failed', 'cancelled', 'rejected'].includes(effectiveTaskStatus)
   const canShowRetryTask = canRetryTask || retryCardCollapsing
   const canStopTask = canStopTaskStatus(effectiveTaskStatus)
-  const canDeleteTask = canDeleteTaskStatus(effectiveTaskStatus)
   const plannedAgents = plannedAgentsFromArtifacts(mergedArtifacts)
   const capabilityClassification = latestCapabilityClassificationFromArtifacts(mergedArtifacts)
   const planApprovalGate = approvalGates.find((gate) => (
@@ -4465,18 +4446,6 @@ export default function TaskDetailPage() {
               >
                 <SquareIcon aria-hidden="true" />
                 Stop
-              </Button>
-            )}
-            {canDeleteTask && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => void handleDeleteTask()}
-                disabled={actionLoading}
-                aria-busy={actionLoading}
-              >
-                <Trash2Icon aria-hidden="true" />
-                Delete
               </Button>
             )}
           </div>

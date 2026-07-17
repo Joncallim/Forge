@@ -36,6 +36,14 @@ vi.mock('@/lib/session', () => ({
   }),
 }))
 
+// Existing route-contract cases exercise behavior behind the release gate.
+// The gate itself and its fail-closed route placement have a focused suite.
+const mockGuardEpic172ProjectManagementIngress = vi.fn().mockResolvedValue(null)
+vi.mock('@/lib/projects/epic-172-project-ingress', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/projects/epic-172-project-ingress')>(),
+  guardEpic172ProjectManagementIngress: mockGuardEpic172ProjectManagementIngress,
+}))
+
 // DB mock — returns fluent chain helpers per-call
 const mockDbSelect = vi.fn()
 const mockDbInsert = vi.fn()
@@ -231,7 +239,6 @@ describe('GET /api/projects — auth guard', () => {
     process.env.HOME = fakeHome
     process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
     mockDbSelect
-      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([project]))
       .mockReturnValueOnce(chain([]))
 
@@ -245,6 +252,8 @@ describe('GET /api/projects — auth guard', () => {
         localPath: project.localPath,
         displayLocalPath: '~/Documents/Forge/projects/list-display',
       })
+      expect(mockGuardEpic172ProjectManagementIngress).not.toHaveBeenCalled()
+      expect(mockDbUpdate).not.toHaveBeenCalled()
     } finally {
       if (previousRoot === undefined) {
         delete process.env.FORGE_WORKSPACE_ROOT
@@ -1074,7 +1083,7 @@ describe('PUT /api/projects/:id — local path display handling', () => {
   })
 })
 
-describe('DELETE /api/projects/:id — file deletion boundary', () => {
+describe('DELETE /api/projects/:id — retained-evidence archive boundary', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
   function projectRow(localPath: string) {
@@ -1092,12 +1101,9 @@ describe('DELETE /api/projects/:id — file deletion boundary', () => {
     }
   }
 
-  it('refuses to remove the shared workspace root', async () => {
+  it('rejects deleteFiles before inspecting the project or filesystem', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
-    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-delete-root-'))
-    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
-    mockDbSelect.mockReturnValue(chain([projectRow(workspaceRoot)]))
 
     try {
       const { DELETE } = await import('@/app/api/projects/[id]/route')
@@ -1105,22 +1111,20 @@ describe('DELETE /api/projects/:id — file deletion boundary', () => {
         params: Promise.resolve({ id: 'project-delete' }),
       })
 
-      expect(res.status).toBe(400)
+      expect(res.status).toBe(409)
       const body = await res.json()
-      expect(body.error).toMatch(/shared Forge workspace directory/i)
+      expect(body.code).toBe('project_hard_delete_disabled')
+      expect(body.error).toMatch(/retry without deleteFiles to archive/i)
+      expect(mockDbSelect).not.toHaveBeenCalled()
+      expect(mockDbUpdate).not.toHaveBeenCalled()
       expect(mockDbDelete).not.toHaveBeenCalled()
       await expect(fs.stat(workspaceRoot)).resolves.toMatchObject({})
     } finally {
-      if (previousRoot === undefined) {
-        delete process.env.FORGE_WORKSPACE_ROOT
-      } else {
-        process.env.FORGE_WORKSPACE_ROOT = previousRoot
-      }
       await fs.rm(workspaceRoot, { recursive: true, force: true })
     }
   })
 
-  it('removes a Forge-owned project directory with a matching marker', async () => {
+  it('archives a Forge-owned project without touching its directory', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const previousRoot = process.env.FORGE_WORKSPACE_ROOT
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-delete-owned-'))
@@ -1132,18 +1136,26 @@ describe('DELETE /api/projects/:id — file deletion boundary', () => {
       `${JSON.stringify({ projectId: 'project-delete' })}\n`,
     )
     mockDbSelect.mockReturnValue(chain([projectRow(localPath)]))
-    mockDbDelete.mockReturnValue(chain(undefined))
+    mockDbUpdate.mockReturnValue(chain(undefined))
 
     try {
       const { DELETE } = await import('@/app/api/projects/[id]/route')
-      const res = await DELETE(nextAuthRequest('/api/projects/project-delete?deleteFiles=true') as never, {
+      const res = await DELETE(nextAuthRequest('/api/projects/project-delete') as never, {
         params: Promise.resolve({ id: 'project-delete' }),
       })
 
       expect(res.status).toBe(200)
       const body = await res.json()
-      expect(body.filesDeleted).toBe(true)
-      await expect(fs.stat(localPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(body).toMatchObject({
+        archived: true,
+        filesDeleted: false,
+        fileDeletionSkippedReason: 'retained_release_evidence',
+      })
+      expect(mockDbUpdate).toHaveBeenCalled()
+      expect(mockDbDelete).not.toHaveBeenCalled()
+      await expect(fs.readFile(path.join(localPath, 'forge.project.json'), 'utf-8')).resolves.toContain(
+        'project-delete',
+      )
     } finally {
       if (previousRoot === undefined) {
         delete process.env.FORGE_WORKSPACE_ROOT
@@ -1154,7 +1166,7 @@ describe('DELETE /api/projects/:id — file deletion boundary', () => {
     }
   })
 
-  it('removes only the DB record when deleteFiles targets an external local path', async () => {
+  it('archives an external project path without deleting its files', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const previousRoot = process.env.FORGE_WORKSPACE_ROOT
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-delete-external-workspace-'))
@@ -1163,22 +1175,21 @@ describe('DELETE /api/projects/:id — file deletion boundary', () => {
     await fs.writeFile(externalFile, 'do not delete\n')
     process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
     mockDbSelect.mockReturnValue(chain([projectRow(externalRoot)]))
-    mockDbDelete.mockReturnValue(chain(undefined))
+    mockDbUpdate.mockReturnValue(chain(undefined))
 
     try {
       const { DELETE } = await import('@/app/api/projects/[id]/route')
-      const res = await DELETE(nextAuthRequest('/api/projects/project-delete?deleteFiles=true') as never, {
+      const res = await DELETE(nextAuthRequest('/api/projects/project-delete') as never, {
         params: Promise.resolve({ id: 'project-delete' }),
       })
 
       expect(res.status).toBe(200)
       const body = await res.json()
       expect(body.filesDeleted).toBe(false)
-      expect(body.fileDeletionSkippedReason).toBe('outside_forge_managed_projects')
-      expect(body.fileDeletionMessage).toMatch(/outside Forge-managed projects/i)
-      expect(body.localPath).toBe(externalRoot)
-      expect(body.displayLocalPath).toBe(externalRoot)
-      expect(mockDbDelete).toHaveBeenCalled()
+      expect(body.fileDeletionSkippedReason).toBe('retained_release_evidence')
+      expect(body.fileDeletionMessage).toMatch(/archived the project record/i)
+      expect(mockDbUpdate).toHaveBeenCalled()
+      expect(mockDbDelete).not.toHaveBeenCalled()
       await expect(fs.readFile(externalFile, 'utf-8')).resolves.toBe('do not delete\n')
     } finally {
       if (previousRoot === undefined) {
@@ -1295,11 +1306,12 @@ describe('GET /api/filesystem/directories — folder selector', () => {
     }
   })
 
-  it('defaults to the active workspace projects directory', async () => {
+  it('defaults to the active workspace projects directory without bootstrapping workspace files', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const previousRoot = process.env.FORGE_WORKSPACE_ROOT
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-workspace-test-'))
     process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    await fs.mkdir(path.join(workspaceRoot, 'projects'))
 
     try {
       const { GET } = await import('@/app/api/filesystem/directories/route')
@@ -1308,9 +1320,9 @@ describe('GET /api/filesystem/directories — folder selector', () => {
       expect(res.status).toBe(200)
       const body = await res.json()
       expect(body.path).toBe(path.join(workspaceRoot, 'projects'))
-      await expect(fs.stat(path.join(workspaceRoot, 'mcps'))).resolves.toMatchObject({})
-      await expect(fs.stat(path.join(workspaceRoot, 'templates'))).resolves.toMatchObject({})
-      await expect(fs.stat(path.join(workspaceRoot, 'global-settings.json'))).resolves.toMatchObject({})
+      await expect(fs.stat(path.join(workspaceRoot, 'mcps'))).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(fs.stat(path.join(workspaceRoot, 'templates'))).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(fs.stat(path.join(workspaceRoot, 'global-settings.json'))).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
       if (previousRoot === undefined) {
         delete process.env.FORGE_WORKSPACE_ROOT
@@ -1880,6 +1892,11 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
           '/Forge Workspace/mcps/filesystem',
           '/Forge Workspace/mcps/github',
         ])
+        expect(mockGetProjectMcpOverview).toHaveBeenCalledWith(
+          project,
+          { cache: false, ensureWorkspace: false },
+        )
+        expect(mockDbInsert).not.toHaveBeenCalled()
       })
     } finally {
       if (previousDisplayRoot === undefined) {
@@ -1981,7 +1998,6 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
 
     await withWorkspaceProject(async (project) => {
       mockDbSelect
-        .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
         .mockReturnValueOnce(chain([project]))
         .mockReturnValueOnce(chain([
           {
@@ -2402,42 +2418,18 @@ describe('GET /api/projects/:id — 404 when project not found', () => {
     expect(body.error).toMatch(/not found/i)
   })
 
-  it('claims a legacy null-owned project for bootstrap-owner direct lookups', async () => {
+  it('keeps legacy null-owned project reads non-mutating until bootstrap ownership is assigned', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
-    const claimedProject = {
-      id: 'project-legacy',
-      name: 'Legacy Project',
-      submittedBy: 'user-abc',
-      githubRepo: null,
-      localPath: null,
-      githubTokenEnvVar: null,
-      pmProviderConfigId: null,
-      mcpConfig: {
-        profile: 'default',
-        requiredMcps: ['filesystem', 'github'],
-        overrides: {},
-      },
-      defaultBranch: 'main',
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      archivedAt: null,
-    }
-    mockDbSelect
-      .mockReturnValueOnce(chain([]))
-      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
-    mockDbUpdate.mockReturnValue(chain([claimedProject]))
+    mockDbSelect.mockReturnValueOnce(chain([]))
 
     const { GET } = await import('@/app/api/projects/[id]/route')
     const res = await GET(authRequest('/api/projects/project-legacy') as never, {
       params: Promise.resolve({ id: 'project-legacy' }),
     })
 
-    expect(res.status).toBe(200)
-    const body = await res.json()
-    expect(body.project).toMatchObject({
-      id: 'project-legacy',
-      submittedBy: 'user-abc',
-    })
+    expect(res.status).toBe(404)
+    expect(mockDbSelect).toHaveBeenCalledOnce()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
   })
 })
 
@@ -2752,13 +2744,12 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
     )
   })
 
-  it('hard-deletes an individual task when mode=delete is requested', async () => {
+  it('retains a terminal task when mode=delete is requested', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect.mockReturnValue(chain([{
       id: 'task-delete',
       status: 'completed',
     }]))
-    mockDbDelete.mockReturnValue(chain([{ id: 'task-delete' }]))
 
     const { DELETE } = await import('@/app/api/tasks/[id]/route')
     const req = authRequest('/api/tasks/task-delete?mode=delete', { method: 'DELETE' })
@@ -2766,10 +2757,10 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
 
     const res = await DELETE(req as never, { params })
 
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(409)
     const body = await res.json()
-    expect(body).toEqual({ ok: true, mode: 'delete' })
-    expect(mockDbDelete).toHaveBeenCalled()
+    expect(body.error).toMatch(/retains task, run, and review evidence/i)
+    expect(mockDbDelete).not.toHaveBeenCalled()
   })
 
   it('rejects hard-delete for active tasks so operators must stop them first', async () => {
@@ -2791,13 +2782,12 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
     expect(mockDbDelete).not.toHaveBeenCalled()
   })
 
-  it('rejects hard-delete when the task stops being terminal before delete commits', async () => {
+  it('does not attempt a delete for any terminal task', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect.mockReturnValue(chain([{
       id: 'task-raced-delete',
       status: 'failed',
     }]))
-    mockDbDelete.mockReturnValue(chain([]))
 
     const { DELETE } = await import('@/app/api/tasks/[id]/route')
     const req = authRequest('/api/tasks/task-raced-delete?mode=delete', { method: 'DELETE' })
@@ -2807,8 +2797,8 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
 
     expect(res.status).toBe(409)
     const body = await res.json()
-    expect(body.error).toMatch(/no longer terminal/i)
-    expect(mockDbDelete).toHaveBeenCalled()
+    expect(body.error).toMatch(/retains task, run, and review evidence/i)
+    expect(mockDbDelete).not.toHaveBeenCalled()
   })
 })
 
@@ -5373,6 +5363,43 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         },
       })
     })
+  })
+
+  it('blocks an always-allow project grant before any database write when project ingress is closed', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbSelect.mockReturnValueOnce(chain([grantTask()]))
+    mockGuardEpic172ProjectManagementIngress.mockResolvedValueOnce(Response.json(
+      {
+        code: 'epic_172_project_management_ingress_closed',
+        error: 'Project management is temporarily disabled while release safety checks are incomplete.',
+        reason: 'disabled',
+      },
+      { status: 503 },
+    ))
+
+    const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
+    const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        schemaVersion: 1,
+        grants: [{
+          workPackageId: FS_GRANT_PACKAGE_ID,
+          decision: 'approved',
+          capabilities: ['filesystem.project.read'],
+          grantMode: 'always_allow',
+        }],
+      }),
+    }) as never, {
+      params: Promise.resolve({ id: 'task-fs-grant' }),
+    })
+
+    expect(res.status).toBe(503)
+    expect(mockGuardEpic172ProjectManagementIngress).toHaveBeenCalledOnce()
+    expect(mockDbSelect).not.toHaveBeenCalled()
+    expect(mockDbTransaction).not.toHaveBeenCalled()
+    expect(mockDbInsert).not.toHaveBeenCalled()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
   })
 
   it('persists always-allow filesystem grants on the project MCP config', async () => {
@@ -7969,7 +7996,6 @@ describe('GET /api/tasks — includes project name', () => {
     }
 
     mockDbSelect
-      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([listedTask]))
       .mockReturnValueOnce(chain([{ total: 1 }]))
 
@@ -8013,7 +8039,6 @@ describe('GET /api/tasks/summary', () => {
   it('aggregates task statuses and returns the latest attention tasks', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect
-      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(chain([
         { status: 'pending', total: 2 },
         { status: 'running', total: 1 },
@@ -8052,13 +8077,12 @@ describe('GET /api/tasks/summary', () => {
         { id: 'task-failed', title: 'Investigate failure', status: 'failed' },
       ],
     })
-    expect(mockDbSelect).toHaveBeenCalledTimes(3)
+    expect(mockDbSelect).toHaveBeenCalledTimes(2)
   })
 
   it('returns 500 when the summary query fails', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect
-      .mockReturnValueOnce(chain([{ id: 'user-abc' }]))
       .mockReturnValueOnce(rejectingChain(new Error('database unavailable')))
 
     const { GET } = await import('@/app/api/tasks/summary/route')
@@ -8066,5 +8090,164 @@ describe('GET /api/tasks/summary', () => {
 
     expect(res.status).toBe(500)
     expect(await res.json()).toEqual({ error: 'Internal server error' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Suite 3.10 — Epic 172 disabled ingress covers every mutation family
+// ---------------------------------------------------------------------------
+
+describe('Epic 172 disabled mutation ingress', () => {
+  type InvokeMutation = () => Promise<Response>
+
+  function closedIngressResponse() {
+    return Response.json({
+      code: 'epic_172_project_management_ingress_closed',
+      error: 'Project management is temporarily disabled while release safety checks are incomplete.',
+      reason: 'disabled',
+    }, { status: 503 })
+  }
+
+  const taskParams = { params: Promise.resolve({ id: 'task-closed' }) }
+  const gateParams = { params: Promise.resolve({ id: 'task-closed', gateId: 'gate-closed' }) }
+  const mutationFamilies: Array<[string, InvokeMutation]> = [
+    ['task create and enqueue', async () => {
+      const { POST } = await import('@/app/api/tasks/route')
+      return POST(authRequest('/api/tasks', { method: 'POST' }) as never)
+    }],
+    ['task cancellation', async () => {
+      const { DELETE } = await import('@/app/api/tasks/[id]/route')
+      return DELETE(authRequest('/api/tasks/task-closed', { method: 'DELETE' }) as never, taskParams)
+    }],
+    ['task approval', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+      return POST(authRequest('/api/tasks/task-closed/approve', { method: 'POST' }) as never, taskParams)
+    }],
+    ['task rejection', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/reject/route')
+      return POST(authRequest('/api/tasks/task-closed/reject', { method: 'POST' }) as never, taskParams)
+    }],
+    ['task answers', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/questions/route')
+      return POST(authRequest('/api/tasks/task-closed/questions', { method: 'POST' }) as never, taskParams)
+    }],
+    ['approval-gate decision', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/approval-gates/[gateId]/route')
+      return POST(authRequest('/api/tasks/task-closed/approval-gates/gate-closed', { method: 'POST' }) as never, gateParams)
+    }],
+    ['task replan', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/replan/route')
+      return POST(authRequest('/api/tasks/task-closed/replan', { method: 'POST' }) as never, taskParams)
+    }],
+    ['task retry', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/retry/route')
+      return POST(authRequest('/api/tasks/task-closed/retry', { method: 'POST' }) as never, taskParams)
+    }],
+    ['handoff retry enqueue', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/retry-handoff/route')
+      return POST(authRequest('/api/tasks/task-closed/retry-handoff', { method: 'POST' }) as never, taskParams)
+    }],
+    ['MCP plan review', async () => {
+      const { POST } = await import('@/app/api/tasks/[id]/mcp-plan-review/route')
+      return POST(authRequest('/api/tasks/task-closed/mcp-plan-review', { method: 'POST' }) as never, taskParams)
+    }],
+    ['task filesystem grant', async () => {
+      const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
+      return PUT(authRequest('/api/tasks/task-closed/filesystem-grants', { method: 'PUT' }) as never, taskParams)
+    }],
+    ['provider deactivation and task repointing', async () => {
+      const { DELETE } = await import('@/app/api/providers/[id]/route')
+      return DELETE(
+        authRequest('/api/providers/provider-closed', { method: 'DELETE' }) as never,
+        { params: Promise.resolve({ id: 'provider-closed' }) },
+      )
+    }],
+    ['workspace directory creation', async () => {
+      const { POST } = await import('@/app/api/filesystem/directories/route')
+      return POST(authRequest('/api/filesystem/directories', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parentPath: '/never-read', name: 'never-created' }),
+      }) as never)
+    }],
+    ['workspace settings update', async () => {
+      const { PUT } = await import('@/app/api/settings/workspace/route')
+      return PUT(authRequest('/api/settings/workspace', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceRoot: '/never-read' }),
+      }) as never)
+    }],
+  ]
+
+  it.each(mutationFamilies)('returns 503 with zero mutation side effects for %s', async (_name, invoke) => {
+    vi.clearAllMocks()
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockGuardEpic172ProjectManagementIngress.mockImplementation(async () => closedIngressResponse())
+
+    const response = await invoke()
+
+    expect(response.status).toBe(503)
+    expect(mockGuardEpic172ProjectManagementIngress).toHaveBeenCalledOnce()
+    expect(mockDbSelect).not.toHaveBeenCalled()
+    expect(mockDbInsert).not.toHaveBeenCalled()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockDbDelete).not.toHaveBeenCalled()
+    expect(mockDbTransaction).not.toHaveBeenCalled()
+    expect(mockRedisLpush).not.toHaveBeenCalled()
+    expect(mockRedisPublish).not.toHaveBeenCalled()
+    expect(mockRedisSet).not.toHaveBeenCalled()
+    expect(mockRedisZadd).not.toHaveBeenCalled()
+    expect(mockRedisExpire).not.toHaveBeenCalled()
+    expect(mockRedisDel).not.toHaveBeenCalled()
+    expect(mockDecideReviewGate).not.toHaveBeenCalled()
+    expect(mockExecFile).not.toHaveBeenCalled()
+  })
+
+  it('returns 503 before workspace or directory routes can touch the filesystem', async () => {
+    vi.clearAllMocks()
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockGuardEpic172ProjectManagementIngress.mockImplementation(async () => closedIngressResponse())
+    const previousRoot = process.env.FORGE_WORKSPACE_ROOT
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-epic-172-disabled-workspace-'))
+    process.env.FORGE_WORKSPACE_ROOT = workspaceRoot
+    const directoryPath = path.join(workspaceRoot, 'never-created-directory')
+    const replacementRoot = path.join(workspaceRoot, 'never-created-workspace')
+
+    try {
+      const [{ POST }, { PUT }] = await Promise.all([
+        import('@/app/api/filesystem/directories/route'),
+        import('@/app/api/settings/workspace/route'),
+      ])
+      const directoryResponse = await POST(authRequest('/api/filesystem/directories', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parentPath: workspaceRoot, name: path.basename(directoryPath) }),
+      }) as never)
+      const workspaceResponse = await PUT(authRequest('/api/settings/workspace', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspaceRoot: replacementRoot }),
+      }) as never)
+
+      expect(directoryResponse.status).toBe(503)
+      expect(workspaceResponse.status).toBe(503)
+      expect(mockGuardEpic172ProjectManagementIngress).toHaveBeenCalledTimes(2)
+      await expect(fs.stat(directoryPath)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(fs.stat(replacementRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(fs.stat(path.join(workspaceRoot, 'global-settings.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(await fs.readdir(workspaceRoot)).toEqual([])
+      expect(mockDbSelect).not.toHaveBeenCalled()
+      expect(mockDbInsert).not.toHaveBeenCalled()
+      expect(mockDbUpdate).not.toHaveBeenCalled()
+      expect(mockRedisLpush).not.toHaveBeenCalled()
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.FORGE_WORKSPACE_ROOT
+      } else {
+        process.env.FORGE_WORKSPACE_ROOT = previousRoot
+      }
+      await fs.rm(workspaceRoot, { recursive: true, force: true })
+    }
   })
 })

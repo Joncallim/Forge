@@ -15,6 +15,7 @@ import {
   validateProviderApiKeyEnvVar,
   validateProviderBaseUrl,
 } from '@/lib/providers/credentials'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 
 // ---------------------------------------------------------------------------
 // Validation schema (all fields optional for PUT)
@@ -286,6 +287,9 @@ export async function DELETE(
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
 
     const [primaryUser] = await db
       .select({ id: users.id })

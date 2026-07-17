@@ -7,6 +7,7 @@ import { db } from '@/db'
 import { projects, tasks, workPackages, type ProjectMcpConfig } from '@/db/schema'
 import { getSession } from '@/lib/session'
 import { accessibleProjectCondition } from '@/lib/project-access'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 import { getProjectMcpOverview } from '@/lib/mcps/manager'
 import { redis } from '@/lib/redis'
 import {
@@ -80,7 +81,7 @@ export async function GET(
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
     }
 
-    const overview = await getProjectMcpOverview(project)
+    const overview = await getProjectMcpOverview(project, { cache: false, ensureWorkspace: false })
     return NextResponse.json({
       grant: grantSummary(project.mcpConfig),
       healthError: filesystemGrantHealthError(overview.statuses),
@@ -100,6 +101,9 @@ export async function PUT(
     if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
+
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
 
     const { id } = await params
     const project = await findProject(id, session.userId)

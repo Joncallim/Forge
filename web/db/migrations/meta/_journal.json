@@ -162,6 +162,27 @@
       "when": 1783296000000,
       "tag": "0022_backfill_default_workforce_members",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1784258966103,
+      "tag": "0023_epic_172_release_substrate",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1784259621495,
+      "tag": "0024_epic_172_retention_fks",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1784263200000,
+      "tag": "0025_epic_172_release_routines",
+      "breakpoints": true
     }
   ]
 }

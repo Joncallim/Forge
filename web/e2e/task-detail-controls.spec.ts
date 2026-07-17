@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { applyEpic172Step0E2EBridge } from './epic-172-step0-bridge'
 import {
   installSessionCookie,
   resetState,
@@ -8,11 +9,12 @@ import {
 } from './helpers'
 
 test.describe('task detail operator controls', () => {
-  test.beforeEach(async () => {
+  test.beforeEach(async ({}, testInfo) => {
+    applyEpic172Step0E2EBridge(testInfo, 'task-detail-controls.spec.ts')
     await resetState()
   })
 
-  test('stops an active task before allowing hard delete', async ({ page, context }) => {
+  test('stops an active task while retaining its execution history', async ({ page, context }) => {
     const session = await seedSession('Task Control Operator')
     await installSessionCookie(context, session)
     const { taskId } = await seedProjectTask({
@@ -31,10 +33,8 @@ test.describe('task detail operator controls', () => {
     await page.getByRole('button', { name: 'Stop' }).click()
     await expect(page.getByText('Cancelled', { exact: true }).first()).toBeVisible()
     await expect(page.getByRole('button', { name: 'Stop' })).toHaveCount(0)
-    await expect(page.getByRole('button', { name: 'Delete' })).toBeVisible()
-
-    await page.getByRole('button', { name: 'Delete' }).click()
-    await expect(page).toHaveURL(/\/dashboard\/tasks$/)
+    await expect(page.getByRole('button', { name: 'Delete' })).toHaveCount(0)
+    await expect(page).toHaveURL(new RegExp(`/dashboard/tasks/${taskId}$`))
   })
 
   test('shows retry submitted feedback while collapsing the retry form', async ({ page, context }) => {

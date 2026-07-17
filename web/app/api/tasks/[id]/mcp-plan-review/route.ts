@@ -12,6 +12,7 @@ import {
   validateMcpOperatorReviewHistory,
   type McpPlanReviewInput,
 } from '@/worker/mcp-plan-review'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -72,6 +73,9 @@ export async function POST(
   try {
     const session = await getSession(request)
     if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
     const { id: taskId } = await params
     const existing = await getAccessibleTask(taskId, session.userId)
     if (!existing) return NextResponse.json({ error: 'Task not found' }, { status: 404 })

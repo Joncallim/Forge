@@ -43,7 +43,7 @@ describe('task page retry handoff controls', () => {
     expect(canRetryHandoffForTaskStatus('awaiting_review', false)).toBe(false)
   })
 
-  it('shows stop for active tasks and delete only for terminal tasks', () => {
+  it('shows stop for active tasks and retains every task history', () => {
     expect(canStopTaskStatus('running')).toBe(true)
     expect(canStopTaskStatus('approved')).toBe(true)
     expect(canStopTaskStatus('failed')).toBe(false)
@@ -51,8 +51,8 @@ describe('task page retry handoff controls', () => {
 
     expect(canDeleteTaskStatus('running')).toBe(false)
     expect(canDeleteTaskStatus('approved')).toBe(false)
-    expect(canDeleteTaskStatus('failed')).toBe(true)
-    expect(canDeleteTaskStatus('cancelled')).toBe(true)
+    expect(canDeleteTaskStatus('failed')).toBe(false)
+    expect(canDeleteTaskStatus('cancelled')).toBe(false)
   })
 
   it('finds required filesystem grants that still need explicit approval', () => {

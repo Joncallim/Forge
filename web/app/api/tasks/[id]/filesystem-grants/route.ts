@@ -6,6 +6,7 @@ import { db } from '@/db'
 import { filesystemMcpGrantApprovals, projects, tasks, workPackages } from '@/db/schema'
 import { getSession } from '@/lib/session'
 import { getAccessibleTask } from '@/lib/task-access'
+import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 import { getProjectMcpOverview } from '@/lib/mcps/manager'
 import {
   canonicalFilesystemProjectCapabilities,
@@ -21,6 +22,7 @@ import {
 } from '@/lib/mcps/filesystem-grants'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import { redis } from '@/lib/redis'
+import { withLockedTaskFilesystemGrantMutation } from '@/lib/tasks/filesystem-grant-mutation'
 
 const grantRequestSchema = z.object({
   schemaVersion: z.literal(1),
@@ -251,6 +253,9 @@ export async function PUT(
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
+    const ingressBlock = await guardEpic172ProjectManagementIngress()
+    if (ingressBlock) return ingressBlock
+
     const { id: taskId } = await params
     const task = await getAccessibleTask(taskId, session.userId)
     if (!task) {
@@ -307,29 +312,15 @@ export async function PUT(
     }
 
     const now = new Date()
-    const { states: results, recoveredTask } = await db.transaction(async (tx) => {
+    const { states: results, recoveredTask } = await withLockedTaskFilesystemGrantMutation({
+      projectId: project.id,
+      taskId,
+      apply: async ({ lockedPackageRows, lockedProject, lockedTask, tx }) => {
       // Keep the same global lock order as handoff admission. Always-allow
       // grants can update the project and sibling packages, while failed-grant
       // recovery can update the task. Lock every row this request may touch
       // before the first write so mixed grant batches cannot deadlock with a
       // concurrent project -> task -> package handoff claim.
-      const [lockedProject] = await tx
-        .select()
-        .from(projects)
-        .where(eq(projects.id, project.id))
-        .for('update')
-      if (!lockedProject) {
-        throw Object.assign(new Error('Project not found.'), { status: 404 })
-      }
-
-      const [lockedTask] = await tx
-        .select()
-        .from(tasks)
-        .where(and(eq(tasks.id, taskId), eq(tasks.projectId, lockedProject.id)))
-        .for('update')
-      if (!lockedTask) {
-        throw Object.assign(new Error('Task not found.'), { status: 404 })
-      }
       if (!EDITABLE_TASK_STATUSES.includes(lockedTask.status as typeof EDITABLE_TASK_STATUSES[number])) {
         throw Object.assign(
           new Error(`Cannot edit filesystem grants while task status is '${lockedTask.status}'. Edit grants before execution starts or from a failed filesystem-grant recovery state.`),
@@ -337,12 +328,6 @@ export async function PUT(
         )
       }
 
-      const lockedPackageRows = await tx
-        .select()
-        .from(workPackages)
-        .where(eq(workPackages.taskId, taskId))
-        .orderBy(workPackages.id)
-        .for('update')
       const lockedPackageById = new Map(lockedPackageRows.map((pkg) => [pkg.id, pkg]))
       if (requestedPackageIds.some((packageId) => !lockedPackageById.has(packageId))) {
         throw Object.assign(new Error('One or more work packages do not belong to this task.'), { status: 404 })
@@ -557,6 +542,7 @@ export async function PUT(
         recoveredTask = updatedTask ?? null
       }
       return { states, recoveredTask }
+      },
     })
 
     await Promise.all(results.map((state) => recordTaskLogBestEffort({
