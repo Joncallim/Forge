@@ -191,13 +191,21 @@ function assertBuildAndEpochContract(
   epoch: number | null,
 ): void {
   const contract = kind === 'enabled_build_tests_green'
-    ? { buildCount: 3, epoch: 'required' as const }
+    ? {
+      exactBuilds: ['issue_179_s4', 'issue_180_s5', 'issue_181_s6'] as const,
+      epoch: 'required' as const,
+    }
     : {
-      buildCount: getEpic172ReleaseOrderNode(kind).buildIdentity.exactBuilds.length,
+      exactBuilds: getEpic172ReleaseOrderNode(kind).buildIdentity.exactBuilds,
       epoch: getEpic172ReleaseOrderNode(kind).buildIdentity.epoch,
     }
-  if (exactBuilds.length !== contract.buildCount) {
-    fail('exactBuilds', `expected exactly ${contract.buildCount} build identities for ${JSON.stringify(kind)}`)
+  if (exactBuilds.length !== contract.exactBuilds.length) {
+    fail('exactBuilds', `expected exactly ${contract.exactBuilds.length} build identities for ${JSON.stringify(kind)}`)
+  }
+  for (const [index, buildSlot] of contract.exactBuilds.entries()) {
+    if (!exactBuilds[index]?.startsWith(`${buildSlot}@`) || exactBuilds[index].length === buildSlot.length + 1) {
+      fail(`exactBuilds[${index}]`, `expected the ${JSON.stringify(buildSlot)} build slot in manifest order`)
+    }
   }
   if ((contract.epoch === 'required') !== (epoch !== null)) {
     fail('epoch', `${contract.epoch === 'required' ? 'is required' : 'must be null'} for ${JSON.stringify(kind)}`)
@@ -261,6 +269,29 @@ export function parseEpic172ReleaseEvidenceEnvelope(value: unknown): Epic172Rele
   if ((evidenceKind === 'step0_retention_bridge') !== (predecessorReceiptIds.length === 0)) {
     fail('predecessorReceiptIds', 'only Step 0 may use the empty predecessor set')
   }
+  const predecessorSetDigest = matchingStringAt(
+    record.predecessorSetDigest,
+    'predecessorSetDigest',
+    DIGEST_PATTERN,
+    'a SHA-256 digest',
+  )
+  assertCanonicalReceiptSet(predecessorReceiptIds, predecessorSetDigest, 'predecessorReceiptIds')
+  const reviewedSha = matchingStringAt(record.reviewedSha, 'reviewedSha', SHA_PATTERN, 'a reviewed Git SHA')
+  const transitionIdentityDigest = matchingStringAt(
+    record.transitionIdentityDigest,
+    'transitionIdentityDigest',
+    DIGEST_PATTERN,
+    'a SHA-256 digest',
+  )
+  assertTransitionIdentity({
+    kind: evidenceKind,
+    owner,
+    exactBuilds,
+    reviewedSha,
+    epoch,
+    predecessorSetDigest,
+    transitionIdentityDigest,
+  })
   return {
     envelopeVersion: 1,
     receiptId: matchingStringAt(record.receiptId, 'receiptId', UUID_PATTERN, 'a UUID'),
@@ -268,21 +299,11 @@ export function parseEpic172ReleaseEvidenceEnvelope(value: unknown): Epic172Rele
     evidenceKind,
     owner,
     exactBuilds,
-    reviewedSha: matchingStringAt(record.reviewedSha, 'reviewedSha', SHA_PATTERN, 'a reviewed Git SHA'),
+    reviewedSha,
     epoch,
     predecessorReceiptIds,
-    predecessorSetDigest: matchingStringAt(
-      record.predecessorSetDigest,
-      'predecessorSetDigest',
-      DIGEST_PATTERN,
-      'a SHA-256 digest',
-    ),
-    transitionIdentityDigest: matchingStringAt(
-      record.transitionIdentityDigest,
-      'transitionIdentityDigest',
-      DIGEST_PATTERN,
-      'a SHA-256 digest',
-    ),
+    predecessorSetDigest,
+    transitionIdentityDigest,
     signerKeyId: matchingStringAt(record.signerKeyId, 'signerKeyId', UUID_PATTERN, 'a UUID'),
     signerGeneration: positiveIntegerAt(record.signerGeneration, 'signerGeneration'),
     githubAppId: matchingStringAt(record.githubAppId, 'githubAppId', /^[1-9][0-9]{0,19}$/, 'a GitHub App ID'),
@@ -332,32 +353,46 @@ export function parseEpic172TransitionAuthorizationEnvelope(
   if (lifetimeMs <= 0 || lifetimeMs > 30 * 60 * 1000) {
     fail('expiresAt', 'authorization lifetime must be greater than zero and at most 30 minutes')
   }
+  const sourceReceiptIds = uniqueStringsAt(record.sourceReceiptIds, 'sourceReceiptIds', {
+    min: 1,
+    max: MAX_ARRAY_ITEMS,
+    pattern: UUID_PATTERN,
+    label: 'a UUID',
+  })
+  const sourceReceiptSetDigest = matchingStringAt(
+    record.sourceReceiptSetDigest,
+    'sourceReceiptSetDigest',
+    DIGEST_PATTERN,
+    'a SHA-256 digest',
+  )
+  assertCanonicalReceiptSet(sourceReceiptIds, sourceReceiptSetDigest, 'sourceReceiptIds')
+  const reviewedSha = matchingStringAt(record.reviewedSha, 'reviewedSha', SHA_PATTERN, 'a reviewed Git SHA')
+  const transitionIdentityDigest = matchingStringAt(
+    record.transitionIdentityDigest,
+    'transitionIdentityDigest',
+    DIGEST_PATTERN,
+    'a SHA-256 digest',
+  )
+  assertTransitionIdentity({
+    kind: targetNode,
+    owner,
+    exactBuilds,
+    reviewedSha,
+    epoch,
+    predecessorSetDigest: sourceReceiptSetDigest,
+    transitionIdentityDigest,
+  })
   return {
     envelopeVersion: 1,
     authorizationId: matchingStringAt(record.authorizationId, 'authorizationId', UUID_PATTERN, 'a UUID'),
     manifestVersion: 1,
     targetNode,
-    transitionIdentityDigest: matchingStringAt(
-      record.transitionIdentityDigest,
-      'transitionIdentityDigest',
-      DIGEST_PATTERN,
-      'a SHA-256 digest',
-    ),
-    sourceReceiptIds: uniqueStringsAt(record.sourceReceiptIds, 'sourceReceiptIds', {
-      min: 1,
-      max: MAX_ARRAY_ITEMS,
-      pattern: UUID_PATTERN,
-      label: 'a UUID',
-    }),
-    sourceReceiptSetDigest: matchingStringAt(
-      record.sourceReceiptSetDigest,
-      'sourceReceiptSetDigest',
-      DIGEST_PATTERN,
-      'a SHA-256 digest',
-    ),
+    transitionIdentityDigest,
+    sourceReceiptIds,
+    sourceReceiptSetDigest,
     owner,
     exactBuilds,
-    reviewedSha: matchingStringAt(record.reviewedSha, 'reviewedSha', SHA_PATTERN, 'a reviewed Git SHA'),
+    reviewedSha,
     epoch,
     operationId: stringAt(record.operationId, 'operationId'),
     operation: matchingStringAt(record.operation, 'operation', IDENTIFIER_PATTERN, 'a bounded operation'),
@@ -417,6 +452,74 @@ export function canonicalizeEpic172Json(value: CanonicalJsonValue): Buffer {
 
 export function epic172EnvelopeDigest(envelope: CanonicalJsonValue): string {
   return createHash('sha256').update(canonicalizeEpic172Json(envelope)).digest('hex')
+}
+
+export function epic172ReceiptSetDigest(receiptIds: readonly string[]): string {
+  const canonicalIds = [...receiptIds].sort()
+  if (new Set(canonicalIds).size !== canonicalIds.length) {
+    fail('receiptIds', 'duplicate entries are forbidden')
+  }
+  for (const [index, receiptId] of canonicalIds.entries()) {
+    matchingStringAt(receiptId, `receiptIds[${index}]`, UUID_PATTERN, 'a UUID')
+  }
+  return epic172EnvelopeDigest(canonicalIds)
+}
+
+export function epic172TransitionIdentityDigest(input: {
+  manifestVersion: 1
+  nodeOrRequiredEvidenceKind: Epic172ReleaseEvidenceKind
+  owner: Epic172EnvelopeOwner
+  exactBuilds: readonly string[]
+  reviewedSha: string
+  epoch: number | null
+  canonicalPredecessorReceiptSetDigest: string
+}): string {
+  return epic172EnvelopeDigest({
+    manifestVersion: input.manifestVersion,
+    nodeOrRequiredEvidenceKind: input.nodeOrRequiredEvidenceKind,
+    owner: input.owner,
+    exactBuilds: input.exactBuilds,
+    reviewedSha: input.reviewedSha,
+    epochOrNone: input.epoch ?? 'none',
+    canonicalPredecessorReceiptSetDigest: input.canonicalPredecessorReceiptSetDigest,
+  })
+}
+
+function assertCanonicalReceiptSet(
+  receiptIds: readonly string[],
+  receiptSetDigest: string,
+  path: string,
+): void {
+  const sorted = [...receiptIds].sort()
+  if (sorted.some((receiptId, index) => receiptId !== receiptIds[index])) {
+    fail(path, 'receipt IDs must use canonical ascending order')
+  }
+  if (epic172ReceiptSetDigest(receiptIds) !== receiptSetDigest) {
+    fail(`${path}Digest`, 'does not match the canonical receipt set')
+  }
+}
+
+function assertTransitionIdentity(input: {
+  kind: Epic172ReleaseEvidenceKind
+  owner: Epic172EnvelopeOwner
+  exactBuilds: readonly string[]
+  reviewedSha: string
+  epoch: number | null
+  predecessorSetDigest: string
+  transitionIdentityDigest: string
+}): void {
+  const expected = epic172TransitionIdentityDigest({
+    manifestVersion: 1,
+    nodeOrRequiredEvidenceKind: input.kind,
+    owner: input.owner,
+    exactBuilds: input.exactBuilds,
+    reviewedSha: input.reviewedSha,
+    epoch: input.epoch,
+    canonicalPredecessorReceiptSetDigest: input.predecessorSetDigest,
+  })
+  if (expected !== input.transitionIdentityDigest) {
+    fail('transitionIdentityDigest', 'does not match the canonical transition identity')
+  }
 }
 
 function signedBytes(domain: string, envelope: CanonicalJsonValue): Buffer {

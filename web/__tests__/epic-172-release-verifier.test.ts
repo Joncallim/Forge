@@ -8,7 +8,9 @@ import {
   EPIC_172_RELEASE_EVIDENCE_DOMAIN,
   EPIC_172_TRANSITION_AUTHORIZATION_DOMAIN,
   epic172EnvelopeDigest,
+  epic172ReceiptSetDigest,
   epic172ReleaseEvidenceSignedBytes,
+  epic172TransitionIdentityDigest,
   epic172TransitionAuthorizationSignedBytes,
   parseEpic172TransitionAuthorizationEnvelope,
   verifyEpic172ReleaseEvidence,
@@ -27,7 +29,7 @@ function keyPair() {
 }
 
 function releaseEnvelope(overrides: Record<string, unknown> = {}) {
-  return {
+  const envelope = {
     envelopeVersion: 1,
     receiptId: '00000000-0000-4000-8000-000000000001',
     manifestVersion: 1,
@@ -37,8 +39,8 @@ function releaseEnvelope(overrides: Record<string, unknown> = {}) {
     reviewedSha: 'a'.repeat(40),
     epoch: null,
     predecessorReceiptIds: [],
-    predecessorSetDigest: 'b'.repeat(64),
-    transitionIdentityDigest: 'c'.repeat(64),
+    predecessorSetDigest: '',
+    transitionIdentityDigest: '',
     signerKeyId: '00000000-0000-4000-8000-000000000002',
     signerGeneration: 1,
     githubAppId: '123456',
@@ -48,17 +50,32 @@ function releaseEnvelope(overrides: Record<string, unknown> = {}) {
     issuedAt: '2026-07-17T03:59:00.000Z',
     ...overrides,
   }
+  envelope.predecessorSetDigest = typeof overrides.predecessorSetDigest === 'string'
+    ? overrides.predecessorSetDigest
+    : epic172ReceiptSetDigest(envelope.predecessorReceiptIds as string[])
+  envelope.transitionIdentityDigest = typeof overrides.transitionIdentityDigest === 'string'
+    ? overrides.transitionIdentityDigest
+    : epic172TransitionIdentityDigest({
+      manifestVersion: 1,
+      nodeOrRequiredEvidenceKind: envelope.evidenceKind as 'step0_retention_bridge',
+      owner: envelope.owner as { issue: number; slice: 'step0' },
+      exactBuilds: envelope.exactBuilds as string[],
+      reviewedSha: envelope.reviewedSha as string,
+      epoch: envelope.epoch as number | null,
+      canonicalPredecessorReceiptSetDigest: envelope.predecessorSetDigest,
+    })
+  return envelope
 }
 
 function transitionEnvelope(overrides: Record<string, unknown> = {}) {
-  return {
+  const envelope = {
     envelopeVersion: 1,
     authorizationId: '00000000-0000-4000-8000-000000000004',
     manifestVersion: 1,
     targetNode: 's3_issue_178',
-    transitionIdentityDigest: 'd'.repeat(64),
+    transitionIdentityDigest: '',
     sourceReceiptIds: ['00000000-0000-4000-8000-000000000001'],
-    sourceReceiptSetDigest: 'e'.repeat(64),
+    sourceReceiptSetDigest: '',
     owner: { issue: 178, slice: 's3' },
     exactBuilds: ['issue_178_s3@build-1'],
     reviewedSha: 'f'.repeat(40),
@@ -74,6 +91,21 @@ function transitionEnvelope(overrides: Record<string, unknown> = {}) {
     expiresAt: '2026-07-17T04:29:00.000Z',
     ...overrides,
   }
+  envelope.sourceReceiptSetDigest = typeof overrides.sourceReceiptSetDigest === 'string'
+    ? overrides.sourceReceiptSetDigest
+    : epic172ReceiptSetDigest(envelope.sourceReceiptIds as string[])
+  envelope.transitionIdentityDigest = typeof overrides.transitionIdentityDigest === 'string'
+    ? overrides.transitionIdentityDigest
+    : epic172TransitionIdentityDigest({
+      manifestVersion: 1,
+      nodeOrRequiredEvidenceKind: envelope.targetNode as 's3_issue_178',
+      owner: envelope.owner as { issue: number; slice: 's3' },
+      exactBuilds: envelope.exactBuilds as string[],
+      reviewedSha: envelope.reviewedSha as string,
+      epoch: envelope.epoch as number | null,
+      canonicalPredecessorReceiptSetDigest: envelope.sourceReceiptSetDigest,
+    })
+  return envelope
 }
 
 describe('Epic 172 release envelope verifier', () => {
@@ -157,6 +189,9 @@ describe('Epic 172 release envelope verifier', () => {
   it('rejects unknown fields and manifest-invalid epoch or predecessor cross-products', () => {
     expect(() => epic172ReleaseEvidenceSignedBytes(releaseEnvelope({ unexpected: true }))).toThrow(/unknown field/)
     expect(() => epic172ReleaseEvidenceSignedBytes(releaseEnvelope({ epoch: 2 }))).toThrow(/must be null/)
+    expect(() => epic172ReleaseEvidenceSignedBytes(releaseEnvelope({
+      exactBuilds: ['issue_178_s3@wrong-slice'],
+    }))).toThrow(/issue_179_step0.*manifest order/)
     expect(() => epic172ReleaseEvidenceSignedBytes(releaseEnvelope({
       predecessorReceiptIds: ['00000000-0000-4000-8000-000000000006'],
     }))).toThrow(/only Step 0/)
