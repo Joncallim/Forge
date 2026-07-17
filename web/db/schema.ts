@@ -580,7 +580,7 @@ export const projectMcpStatusChecks = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     projectId: uuid('project_id')
       .notNull()
-      .references(() => projects.id, { onDelete: 'cascade' }),
+      .references(() => projects.id, { onDelete: 'restrict' }),
     mcpId: text('mcp_id').notNull(),
     status: text('status').notNull(),
     installState: text('install_state').notNull(),
@@ -608,7 +608,7 @@ export const tasks = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     projectId: uuid('project_id')
       .notNull()
-      .references(() => projects.id, { onDelete: 'cascade' }),
+      .references(() => projects.id, { onDelete: 'restrict' }),
     submittedBy: uuid('submitted_by').references(() => users.id, {
       onDelete: 'set null',
     }),
@@ -647,7 +647,7 @@ export const taskAttempts = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     queueName: text('queue_name').notNull(),
     attemptNumber: integer('attempt_number').notNull().default(1),
     // 'running'|'completed'|'failed'|'dead_lettered'
@@ -732,7 +732,7 @@ export const workPackages = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     harnessId: uuid('harness_id').references(() => agentHarnesses.id, {
       onDelete: 'set null',
     }),
@@ -785,10 +785,10 @@ export const filesystemMcpGrantApprovals = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id')
       .notNull()
-      .references(() => workPackages.id, { onDelete: 'cascade' }),
+      .references(() => workPackages.id, { onDelete: 'restrict' }),
     decidedBy: uuid('decided_by').references(() => users.id, {
       onDelete: 'set null',
     }),
@@ -822,10 +822,10 @@ export const workPackageDependencies = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     workPackageId: uuid('work_package_id')
       .notNull()
-      .references(() => workPackages.id, { onDelete: 'cascade' }),
+      .references(() => workPackages.id, { onDelete: 'restrict' }),
     dependsOnWorkPackageId: uuid('depends_on_work_package_id')
       .notNull()
-      .references(() => workPackages.id, { onDelete: 'cascade' }),
+      .references(() => workPackages.id, { onDelete: 'restrict' }),
     dependencyType: text('dependency_type').notNull().default('finish_to_start'),
     metadata: jsonb('metadata')
       .$type<Record<string, unknown>>()
@@ -855,9 +855,9 @@ export const agentRuns = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id').references(() => workPackages.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     harnessId: uuid('harness_id').references(() => agentHarnesses.id, {
       onDelete: 'set null',
@@ -902,7 +902,7 @@ export const artifacts = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     agentRunId: uuid('agent_run_id')
       .notNull()
-      .references(() => agentRuns.id, { onDelete: 'cascade' }),
+      .references(() => agentRuns.id, { onDelete: 'restrict' }),
     // 'pr_url'|'file_diff'|'adr_text'|'test_report'|'review_finding'|'log_output'
     artifactType: text('artifact_type').notNull(),
     content: text('content').notNull(),
@@ -927,15 +927,15 @@ export const filesystemMcpRuntimeAudits = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id').references(() => workPackages.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     agentRunId: uuid('agent_run_id').references(() => agentRuns.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     grantApprovalId: uuid('grant_approval_id').references(() => filesystemMcpGrantApprovals.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     operation: text('operation').notNull().default('context_packet'),
     // 'issued'|'blocked'|'not_issued_optional'|'failed'
@@ -984,19 +984,19 @@ export const approvalGates = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id').references(() => workPackages.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     gateType: text('gate_type').notNull(),
     // gate_type: 'plan_approval'|'qa_review'|'reviewer_review'|'security_review'
     // status: 'pending'|'approved'|'rejected'|'completed'|'needs_rework'|'cancelled'
     status: text('status').notNull().default('pending'),
     sourceAgentRunId: uuid('source_agent_run_id').references(() => agentRuns.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     sourceArtifactId: uuid('source_artifact_id').references(() => artifacts.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     title: text('title').notNull(),
     instructions: text('instructions').notNull(),
@@ -1036,21 +1036,21 @@ export const taskLogs = pgTable(
     sequence: bigint('sequence', { mode: 'number' }).generatedAlwaysAsIdentity(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     taskAttemptId: uuid('task_attempt_id').references(() => taskAttempts.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     agentRunId: uuid('agent_run_id').references(() => agentRuns.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     workPackageId: uuid('work_package_id').references(() => workPackages.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     artifactId: uuid('artifact_id').references(() => artifacts.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     approvalGateId: uuid('approval_gate_id').references(() => approvalGates.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     // 'info'|'success'|'warning'|'error'
     level: text('level').notNull().default('info'),
@@ -1094,12 +1094,12 @@ export const vcsChanges = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id').references(() => workPackages.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     agentRunId: uuid('agent_run_id').references(() => agentRuns.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     changeType: text('change_type').notNull().default('branch'),
     // 'planned'|'created'|'updated'|'submitted'|'merged'|'abandoned'|'failed'
@@ -1137,15 +1137,15 @@ export const repositoryCommandAudits = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id').references(() => workPackages.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     agentRunId: uuid('agent_run_id').references(() => agentRuns.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     artifactId: uuid('artifact_id').references(() => artifacts.id, {
-      onDelete: 'set null',
+      onDelete: 'restrict',
     }),
     cwd: text('cwd').notNull(),
     command: text('command').notNull(),
@@ -1290,7 +1290,7 @@ export const taskQuestions = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     taskId: uuid('task_id')
       .notNull()
-      .references(() => tasks.id, { onDelete: 'cascade' }),
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     question: text('question').notNull(),
     suggestions: jsonb('suggestions').$type<string[]>().notNull().default([]),
     answer: text('answer'),

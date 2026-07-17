@@ -169,6 +169,13 @@
       "when": 1784258966103,
       "tag": "0023_epic_172_release_substrate",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1784259621495,
+      "tag": "0024_epic_172_retention_fks",
+      "breakpoints": true
     }
   ]
 }

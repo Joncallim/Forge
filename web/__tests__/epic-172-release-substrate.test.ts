@@ -16,6 +16,10 @@ const migration = readFileSync(
   fileURLToPath(new URL('../db/migrations/0023_epic_172_release_substrate.sql', import.meta.url)),
   'utf8',
 )
+const retentionMigration = readFileSync(
+  fileURLToPath(new URL('../db/migrations/0024_epic_172_retention_fks.sql', import.meta.url)),
+  'utf8',
+)
 
 describe('Epic 172 Step 0 release substrate', () => {
   it('exports exactly the seven owned release and transition tables', () => {
@@ -63,5 +67,13 @@ describe('Epic 172 Step 0 release substrate', () => {
     expect(migration).toContain("'epic-172',\n\t'disabled'")
     expect(migration).toContain('b0789177e07f4a9307f3397a938999b6fcc8c835a97e03d2770f83e4978c2585')
     expect(migration).toContain("in ('disabled', 'provisional', 'active')")
+  })
+
+  it('replaces evidence-bearing cascades and rejects project hard delete', () => {
+    expect(retentionMigration.match(/ON DELETE restrict/g)).toHaveLength(33)
+    expect(retentionMigration).not.toMatch(/ON DELETE (?:cascade|set null)/)
+    expect(retentionMigration).toContain('BEFORE DELETE ON "projects"')
+    expect(retentionMigration).toContain('Forge project hard delete is disabled')
+    expect(retentionMigration).toContain('archive the project')
   })
 })
