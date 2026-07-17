@@ -133,9 +133,9 @@ describe('MCP operator plan review', () => {
     })).toThrow(/widens the Architect proposal/)
   })
 
-  it('enforces asymmetric per-agent ceilings and never grants a reassigned agent the requirement-wide union', () => {
+  it('preserves asymmetric original-agent ceilings and requires explicit capabilities for a new planned workforce assignee', () => {
     const design = parsedDesign([requirement({
-      assignment: { type: 'multiple_agents', targetAgents: ['backend', 'frontend'], targetId: null },
+      assignment: { type: 'workforce', targetAgents: ['backend', 'frontend'], targetId: 'delivery' },
       agentPermissions: {
         backend: ['github.contents.read', 'github.repository.search'],
         frontend: ['github.issues.read'],
@@ -143,9 +143,14 @@ describe('MCP operator plan review', () => {
     })])
     expect(mcpCapabilityCeilingForAgent(design.requirements[0] as never, 'backend')).toEqual(['github.contents.read', 'github.repository.search'])
     expect(mcpCapabilityCeilingForAgent(design.requirements[0] as never, 'frontend')).toEqual(['github.issues.read'])
+    expect(mcpCapabilityCeilingForAgent(design.requirements[0] as never, 'qa')).toEqual([
+      'github.contents.read',
+      'github.issues.read',
+      'github.repository.search',
+    ])
     const base = approvedItem(design, 0)
     expect(() => buildMcpOperatorReview({
-      proposedDesign: design, plannedAgents: ['backend', 'frontend'], previous: null, createdBy: 'user-1',
+      proposedDesign: design, plannedAgents: ['backend', 'frontend', 'qa'], previous: null, createdBy: 'user-1',
       review: {
         sourceArtifactId: 'artifact-1', baseRevision: 0, baseDigest: null,
         items: [{
@@ -156,28 +161,45 @@ describe('MCP operator plan review', () => {
       },
     })).toThrow(/for 'frontend'/)
     expect(() => buildMcpOperatorReview({
-      proposedDesign: design, plannedAgents: ['backend', 'frontend'], previous: null, createdBy: 'user-1',
+      proposedDesign: design, plannedAgents: ['backend', 'frontend', 'qa'], previous: null, createdBy: 'user-1',
       review: {
         sourceArtifactId: 'artifact-1', baseRevision: 0, baseDigest: null,
         items: [{
           ...base,
-          assignment: { type: 'agent', targetAgents: ['frontend'], targetId: null },
-          agentPermissions: { frontend: [] },
+          assignment: { type: 'agent', targetAgents: ['qa'], targetId: null },
+          agentPermissions: { qa: [] },
         }],
       },
     })).toThrow(/must specify reduced capabilities/)
-    const safe = buildMcpOperatorReview({
-      proposedDesign: design, plannedAgents: ['backend', 'frontend'], previous: null, createdBy: 'user-1',
+    expect(() => buildMcpOperatorReview({
+      proposedDesign: design, plannedAgents: ['backend', 'frontend', 'qa'], previous: null, createdBy: 'user-1',
       review: {
         sourceArtifactId: 'artifact-1', baseRevision: 0, baseDigest: null,
         items: [{
           ...base,
-          assignment: { type: 'agent', targetAgents: ['frontend'], targetId: null },
-          agentPermissions: { frontend: ['github.issues.read'] },
+          assignment: { type: 'agent', targetAgents: ['qa'], targetId: null },
+          agentPermissions: { qa: ['github.pull_requests.write'] },
+        }],
+      },
+    })).toThrow(/for 'qa'/)
+    const safe = buildMcpOperatorReview({
+      proposedDesign: design, plannedAgents: ['backend', 'frontend', 'qa'], previous: null, createdBy: 'user-1',
+      review: {
+        sourceArtifactId: 'artifact-1', baseRevision: 0, baseDigest: null,
+        items: [{
+          ...base,
+          assignment: { type: 'workforce', targetAgents: ['backend', 'qa'], targetId: 'delivery-v2' },
+          agentPermissions: {
+            backend: ['github.contents.read'],
+            qa: ['github.issues.read'],
+          },
         }],
       },
     })
-    expect(safe.reviewedDesign.requirements[0].agentPermissions).toEqual({ frontend: ['github.issues.read'] })
+    expect(safe.reviewedDesign.requirements[0].agentPermissions).toEqual({
+      backend: ['github.contents.read'],
+      qa: ['github.issues.read'],
+    })
   })
 
   it('persists non-filesystem denial decisions and blocks approval unless the optional fallback permits continuation', () => {

@@ -37,13 +37,18 @@ export function mcpPlanOverlayCount(design: McpExecutionDesignMetadata | null): 
 }
 
 export function mcpCapabilityCeilingForAgent(
-  requirement: NonNullable<McpExecutionDesignMetadata['proposed']>['requirements'][number],
+  requirement: { agentPermissions: Record<string, string[]> },
   agent: string,
 ): string[] {
   const identity = canonicalAgentPackageIdentity(agent)
-  return [...new Set(Object.entries(requirement.agentPermissions)
+  const permissionEntries = Object.entries(requirement.agentPermissions)
+  const originalAgentEntries = permissionEntries
     .filter(([candidate]) => canonicalAgentPackageIdentity(candidate) === identity)
-    .flatMap(([, capabilities]) => capabilities))].sort()
+  // Existing assignees stay inside their own Architect-proposed ceiling. A
+  // newly selected planned assignee may choose from the requirement-wide
+  // ceiling, but the review draft deliberately starts that assignee at zero.
+  const ceilingEntries = originalAgentEntries.length > 0 ? originalAgentEntries : permissionEntries
+  return [...new Set(ceilingEntries.flatMap(([, capabilities]) => capabilities))].sort()
 }
 
 export function latestMcpPlanReviewForDisplay(gate: unknown): McpPlanReviewDisplayRecord | null {

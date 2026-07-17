@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { canonicalAgentPackageIdentity } from '@/lib/mcps/agent-package-identity'
+import { mcpCapabilityCeilingForAgent } from '@/lib/mcps/plan-review-metadata'
 import type { ProjectMcpOverview } from '@/lib/mcps/types'
 import {
   deriveMcpGrantDecisions,
@@ -270,11 +271,8 @@ export function buildMcpOperatorReview(input: ReviewBuildInput): McpOperatorRevi
   for (const [index, item] of items.entries()) {
     const original = proposedByKey.get(item.requirementKey)
     if (!original) throw new Error(`Review item ${index + 1} does not match a proposed MCP requirement.`)
-    const allowedCapabilitiesByAgent = new Map(Object.entries(original.agentPermissions).map(
-      ([agent, capabilities]) => [normalizeAgent(agent), new Set(capabilities)] as const,
-    ))
     for (const [agent, capabilities] of Object.entries(item.agentPermissions)) {
-      const allowedCapabilities = allowedCapabilitiesByAgent.get(normalizeAgent(agent)) ?? new Set<string>()
+      const allowedCapabilities = new Set(mcpCapabilityCeilingForAgent(original, agent))
       for (const capability of capabilities) {
         if (!allowedCapabilities.has(capability)) {
           throw new Error(`Review item ${index + 1} widens the Architect proposal for '${agent}' with capability '${capability}'.`)
