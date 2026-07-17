@@ -584,7 +584,7 @@ async function applyCanonicalProjection(input: {
       pkg.status !== 'pending' &&
       pkg.status !== 'ready'
     ) continue
-    const requestedCapabilities = canonicalFilesystemProjectCapabilities(check.missingCapabilities)
+    const requestedCapabilities = canonicalFilesystemProjectCapabilities(check.requestedCapabilities)
     const marker = buildFilesystemGrantBlockMetadata({
       blockedAt: input.now,
       hold: check.holdState,

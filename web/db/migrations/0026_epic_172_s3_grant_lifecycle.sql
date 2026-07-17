@@ -954,6 +954,183 @@ GRANT EXECUTE ON FUNCTION forge.complete_epic_172_s3_release_v1(uuid,text,uuid,i
 GRANT EXECUTE ON FUNCTION forge.consume_epic_172_release_evidence_v1(uuid,uuid,text,text,text)
   TO forge_release_transition;
 --> statement-breakpoint
+-- ---------------------------------------------------------------------------
+-- S3 local projection heads — 8 preallocated per package (max 256 packages)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.work_package_local_projection_heads (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  work_package_id uuid NOT NULL
+    REFERENCES public.work_packages(id) ON DELETE RESTRICT,
+  head_kind text NOT NULL,
+  head_index bigint NOT NULL,
+  head_fingerprint text NOT NULL,
+  head_version bigint NOT NULL DEFAULT 0,
+  state text NOT NULL DEFAULT 'preallocated',
+  lease_token uuid,
+  expires_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT work_package_projection_head_kind_chk CHECK (
+    head_kind IN (
+      'filesystem_grant_decision',
+      'execution_evidence',
+      'claim_token',
+      'lease_expiry',
+      'recovery_marker',
+      'integrity_hold',
+      'terminal_state',
+      'artifact_reference'
+    )
+  ),
+  CONSTRAINT work_package_projection_head_state_chk CHECK (
+    state IN ('preallocated', 'claimed', 'active', 'terminal', 'uncertain')
+  ),
+  CONSTRAINT work_package_projection_head_index_chk CHECK (
+    head_index >= 0 AND head_index < 8
+  ),
+  CONSTRAINT work_package_projection_head_version_chk CHECK (
+    head_version >= 0
+  ),
+  CONSTRAINT work_package_projection_head_fingerprint_chk CHECK (
+    head_fingerprint ~ '^head:v1:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[a-z_]+:[0-7]$'
+  ),
+  CONSTRAINT work_package_projection_head_lease_chk CHECK (
+    (state IN ('claimed', 'active') AND lease_token IS NOT NULL)
+    OR (state NOT IN ('claimed', 'active') AND lease_token IS NULL)
+  )
+);
+--> statement-breakpoint
+CREATE UNIQUE INDEX work_package_local_projection_heads_package_kind_idx
+  ON public.work_package_local_projection_heads(work_package_id, head_kind);
+--> statement-breakpoint
+CREATE INDEX work_package_local_projection_heads_kind_idx
+  ON public.work_package_local_projection_heads(head_kind);
+--> statement-breakpoint
+CREATE INDEX work_package_local_projection_heads_state_idx
+  ON public.work_package_local_projection_heads(state);
+--> statement-breakpoint
+CREATE UNIQUE INDEX work_package_local_projection_heads_fingerprint_idx
+  ON public.work_package_local_projection_heads(head_fingerprint);
+--> statement-breakpoint
+CREATE UNIQUE INDEX work_package_local_projection_heads_lease_token_idx
+  ON public.work_package_local_projection_heads(lease_token);
+--> statement-breakpoint
+-- Preallocation: on INSERT into work_packages, create 8 heads (fails above 256)
+CREATE OR REPLACE FUNCTION forge.preallocate_local_projection_heads_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_package_count bigint;
+BEGIN
+  SELECT count(*) INTO STRICT v_package_count FROM public.work_packages;
+  IF v_package_count > 256 THEN
+    RAISE EXCEPTION 'S3 package limit exceeded: at most 256 work packages allowed'
+      USING ERRCODE = '54000';
+  END IF;
+  INSERT INTO public.work_package_local_projection_heads (
+    work_package_id, head_kind, head_index, head_fingerprint
+  ) VALUES
+    (NEW.id, 'filesystem_grant_decision', 0,
+     'head:v1:' || NEW.id::text || ':filesystem_grant_decision:0'),
+    (NEW.id, 'execution_evidence',      1,
+     'head:v1:' || NEW.id::text || ':execution_evidence:1'),
+    (NEW.id, 'claim_token',             2,
+     'head:v1:' || NEW.id::text || ':claim_token:2'),
+    (NEW.id, 'lease_expiry',            3,
+     'head:v1:' || NEW.id::text || ':lease_expiry:3'),
+    (NEW.id, 'recovery_marker',         4,
+     'head:v1:' || NEW.id::text || ':recovery_marker:4'),
+    (NEW.id, 'integrity_hold',          5,
+     'head:v1:' || NEW.id::text || ':integrity_hold:5'),
+    (NEW.id, 'terminal_state',          6,
+     'head:v1:' || NEW.id::text || ':terminal_state:6'),
+    (NEW.id, 'artifact_reference',      7,
+     'head:v1:' || NEW.id::text || ':artifact_reference:7');
+  RETURN NEW;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE TRIGGER trg_preallocate_projection_heads
+  AFTER INSERT ON public.work_packages
+  FOR EACH ROW EXECUTE FUNCTION forge.preallocate_local_projection_heads_v1();
+--> statement-breakpoint
+-- Reject deletion or reassignment of projection heads
+CREATE OR REPLACE FUNCTION forge.reject_projection_head_mutation_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'Projection heads are immutable: deletion is forbidden'
+      USING ERRCODE = '55000';
+  END IF;
+  IF NEW.head_kind <> OLD.head_kind
+     OR NEW.work_package_id <> OLD.work_package_id THEN
+    RAISE EXCEPTION 'Projection head identity is immutable: cannot reassign head_kind or work_package_id'
+      USING ERRCODE = '55000';
+  END IF;
+  IF OLD.state = 'deleted' THEN
+    RAISE EXCEPTION 'Cannot operate on a deleted projection head'
+      USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE TRIGGER trg_reject_projection_head_mutation
+  BEFORE UPDATE OR DELETE ON public.work_package_local_projection_heads
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_projection_head_mutation_v1();
+--> statement-breakpoint
+-- Backfill heads for existing packages (after the trigger is active)
+DO $$
+DECLARE
+  v_pkg public.work_packages%ROWTYPE;
+  v_count bigint;
+BEGIN
+  SELECT count(*) INTO v_count FROM public.work_packages;
+  IF v_count > 256 THEN
+    RAISE EXCEPTION 'Cannot backfill: % existing packages exceeds S3 limit of 256', v_count
+      USING ERRCODE = '54000';
+  END IF;
+  FOR v_pkg IN SELECT * FROM public.work_packages LOOP
+    INSERT INTO public.work_package_local_projection_heads (
+      work_package_id, head_kind, head_index, head_fingerprint
+    ) VALUES
+      (v_pkg.id, 'filesystem_grant_decision', 0,
+       'head:v1:' || v_pkg.id || ':filesystem_grant_decision:0'),
+      (v_pkg.id, 'execution_evidence',      1,
+       'head:v1:' || v_pkg.id || ':execution_evidence:1'),
+      (v_pkg.id, 'claim_token',             2,
+       'head:v1:' || v_pkg.id || ':claim_token:2'),
+      (v_pkg.id, 'lease_expiry',            3,
+       'head:v1:' || v_pkg.id || ':lease_expiry:3'),
+      (v_pkg.id, 'recovery_marker',         4,
+       'head:v1:' || v_pkg.id || ':recovery_marker:4'),
+      (v_pkg.id, 'integrity_hold',          5,
+       'head:v1:' || v_pkg.id || ':integrity_hold:5'),
+      (v_pkg.id, 'terminal_state',          6,
+       'head:v1:' || v_pkg.id || ':terminal_state:6'),
+      (v_pkg.id, 'artifact_reference',      7,
+       'head:v1:' || v_pkg.id || ':artifact_reference:7')
+    ON CONFLICT (work_package_id, head_kind) DO NOTHING;
+  END LOOP;
+END;
+$$;
+--> statement-breakpoint
+ALTER TABLE public.work_package_local_projection_heads
+  OWNER TO forge_release_routines_owner;
+--> statement-breakpoint
+GRANT SELECT, INSERT, UPDATE ON public.work_package_local_projection_heads
+  TO forge_release_evidence_writer;
+--> statement-breakpoint
+REVOKE DELETE, TRUNCATE ON public.work_package_local_projection_heads
+  FROM forge_release_evidence_writer;
+--> statement-breakpoint
 RESET ROLE;
 --> statement-breakpoint
 SELECT public.forge_finalize_epic_172_s3_owner_bootstrap_v1();

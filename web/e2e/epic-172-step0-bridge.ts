@@ -90,6 +90,10 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
     classification: 'run-disabled-safe',
   },
   {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::S3: mutation vs claim contention from lower sibling',
+    classification: 'run-disabled-safe',
+  },
+  {
     id: 'mcp-handoff-concurrency.spec.ts::A: a grant arriving after health capture wins and unrelated metadata survives',
     classification: 'run-disabled-safe',
   },

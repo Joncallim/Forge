@@ -1170,3 +1170,114 @@ test('the complete sibling lock waits on the lower ID before reaching the target
     await Promise.all([blocker.end(), contender.end(), observer.end()])
   }
 })
+
+test('S3: mutation vs claim contention from lower sibling', async () => {
+  const fixture = await seed({ siblingStatus: 'pending' })
+  const sql = sqlClient()
+  const altSql = sqlClient()
+  try {
+    await sql`insert into users (id, display_name) values (${randomUUID()}, 'Claim actor')`
+    await mutateTaskFilesystemGrants({
+      actorId: fixture.userId,
+      projectId: fixture.projectId,
+      taskId: fixture.taskId,
+      mutations: [{
+        workPackageId: fixture.targetPackageId,
+        decision: 'approved',
+        capabilities: ['filesystem.project.read'],
+        grantMode: 'allow_once',
+        reason: 'Pre-claim approval',
+      }],
+    })
+
+    const claimRunId = randomUUID()
+    const packageId = fixture.targetPackageId
+
+    const claim = await altSql.begin(async (tx) => {
+      await tx`SET LOCAL application_name = 'forge-s3-claim-contender'`
+      const [pkg] = await tx`
+        select id, task_id, status, metadata
+        from work_packages
+        where id = ${packageId}
+        for update
+      `
+      expect(pkg).toBeDefined()
+
+      const [decision] = await tx`
+        select id, work_package_id, grant_decision_revision, pointer_fingerprint
+        from filesystem_mcp_grant_approvals
+        where work_package_id = ${packageId}
+          and decision = 'approved'
+        order by created_at desc
+        limit 1
+      `
+      expect(decision).toBeDefined()
+
+      const [pointer] = await tx`
+        select id, work_package_id, current_decision_revision, current_decision_fingerprint,
+               pointer_fingerprint, pointer_version
+        from filesystem_mcp_current_decision_pointers
+        where work_package_id = ${packageId}
+        for update
+      `
+      if (pointer) {
+        const newVersion = Number(pointer.pointerVersion) + 1
+        await tx`
+          update filesystem_mcp_current_decision_pointers
+          set current_decision_id = ${decision.id},
+              current_decision_task_id = ${fixture.taskId},
+              current_decision_work_package_id = ${packageId},
+              current_decision_revision = ${decision.grant_decision_revision},
+              current_decision_fingerprint = ${decision.pointer_fingerprint},
+              pointer_fingerprint = ${decision.pointer_fingerprint},
+              pointer_version = ${newVersion},
+              updated_at = now()
+          where work_package_id = ${packageId}
+        `
+      }
+
+      await tx`
+        insert into filesystem_mcp_runtime_audits (
+          id, task_id, work_package_id, agent_run_id, grant_approval_id,
+          status, operation, capabilities, file_count, duration_ms, created_at
+        ) values (
+          ${randomUUID()}, ${fixture.taskId}, ${packageId}, ${claimRunId},
+          ${decision.id}, 'completed', 'context_packet_delivered',
+          ${sql.json(['filesystem.project.read'])}, 0, 0, now()
+        )
+      `
+
+      return { claimed: true, decisionId: decision.id }
+    })
+
+    // Concurrent mutation from lower sibling after claim
+    const mutation = await mutateTaskFilesystemGrants({
+      actorId: fixture.userId,
+      projectId: fixture.projectId,
+      taskId: fixture.taskId,
+      mutations: [{
+        workPackageId: fixture.lowerPackageId,
+        decision: 'approved',
+        capabilities: ['filesystem.project.read'],
+        grantMode: 'allow_once',
+        reason: 'Lower sibling mutation after claim',
+      }],
+    })
+
+    expect(claim.claimed).toBe(true)
+    expect(mutation.approvals).toHaveLength(1)
+    expect(mutation.approvals[0].workPackageId).toBe(fixture.lowerPackageId)
+
+    const [audit] = await sql`
+      select id, work_package_id, grant_approval_id, operation
+      from filesystem_mcp_runtime_audits
+      where agent_run_id = ${claimRunId}
+        and operation = 'context_packet_delivered'
+    `
+    expect(audit).toBeDefined()
+    expect(audit.work_package_id).toBe(packageId)
+    expect(audit.grant_approval_id).toBe(claim.decisionId)
+  } finally {
+    await Promise.all([sql.end(), altSql.end()])
+  }
+})

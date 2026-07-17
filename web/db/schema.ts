@@ -1040,6 +1040,71 @@ export type ProjectFilesystemCurrentDecisionPointer = InferSelectModel<typeof pr
 export type NewProjectFilesystemCurrentDecisionPointer = InferInsertModel<typeof projectFilesystemCurrentDecisionPointers>
 
 // ---------------------------------------------------------------------------
+// workPackageLocalProjectionHeads
+// ---------------------------------------------------------------------------
+// Preallocated per-package projection heads for the S3→S4 protocol surface.
+// Eight immutable heads are created on work_package INSERT. The package limit
+// of 256 ensures at most 2,048 heads. Heads cannot be deleted or reassigned.
+export const workPackageLocalProjectionHeads = pgTable(
+  'work_package_local_projection_heads',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workPackageId: uuid('work_package_id')
+      .notNull()
+      .references(() => workPackages.id, { onDelete: 'restrict' }),
+    headKind: text('head_kind').notNull(),
+    headIndex: bigint('head_index', { mode: 'bigint' }).notNull(),
+    headFingerprint: text('head_fingerprint').notNull(),
+    headVersion: bigint('head_version', { mode: 'bigint' }).notNull().default(BigInt(0)),
+    state: text('state').notNull().default('preallocated'),
+    leaseToken: uuid('lease_token'),
+    expiresAt: timestamp('expires_at', tsOpts),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('work_package_local_projection_heads_package_kind_idx')
+      .on(t.workPackageId, t.headKind),
+    index('work_package_local_projection_heads_kind_idx').on(t.headKind),
+    index('work_package_local_projection_heads_state_idx').on(t.state),
+    uniqueIndex('work_package_local_projection_heads_fingerprint_idx')
+      .on(t.headFingerprint),
+    uniqueIndex('work_package_local_projection_heads_lease_token_idx').on(t.leaseToken),
+    check('work_package_projection_head_kind_chk', sql`
+      ${t.headKind} in (
+        'filesystem_grant_decision',
+        'execution_evidence',
+        'claim_token',
+        'lease_expiry',
+        'recovery_marker',
+        'integrity_hold',
+        'terminal_state',
+        'artifact_reference'
+      )
+    `),
+    check('work_package_projection_head_state_chk', sql`
+      ${t.state} in ('preallocated', 'claimed', 'active', 'terminal', 'uncertain')
+    `),
+    check('work_package_projection_head_index_chk', sql`
+      ${t.headIndex} >= 0 and ${t.headIndex} < 8
+    `),
+    check('work_package_projection_head_version_chk', sql`
+      ${t.headVersion} >= 0
+    `),
+    check('work_package_projection_head_fingerprint_chk', sql`
+      ${t.headFingerprint} ~ '^head:v1:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[a-z_]+:[0-7]$'
+    `),
+    check('work_package_projection_head_lease_chk', sql`
+      (${t.state} in ('claimed', 'active') and ${t.leaseToken} is not null)
+      or (${t.state} not in ('claimed', 'active') and ${t.leaseToken} is null)
+    `),
+  ],
+)
+
+export type WorkPackageLocalProjectionHead = InferSelectModel<typeof workPackageLocalProjectionHeads>
+export type NewWorkPackageLocalProjectionHead = InferInsertModel<typeof workPackageLocalProjectionHeads>
+
+// ---------------------------------------------------------------------------
 // workPackageDependencies
 // ---------------------------------------------------------------------------
 export const workPackageDependencies = pgTable(
