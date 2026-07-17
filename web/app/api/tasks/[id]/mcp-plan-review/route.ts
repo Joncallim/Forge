@@ -8,8 +8,8 @@ import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
 import type { McpExecutionDesign } from '@/worker/mcp-execution-design'
 import {
   buildMcpOperatorReview,
-  latestMcpOperatorReview,
-  mcpOperatorReviewHistory,
+  mcpOperatorReviewSummary,
+  validateMcpOperatorReviewHistory,
   type McpPlanReviewInput,
 } from '@/worker/mcp-plan-review'
 
@@ -18,21 +18,29 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function parseReviewInput(value: unknown): McpPlanReviewInput | null {
-  if (!isRecord(value) || typeof value.sourceArtifactId !== 'string' || !Number.isSafeInteger(value.baseRevision)) return null
-  if (value.baseDigest !== null && typeof value.baseDigest !== 'string') return null
+  if (!isRecord(value) || typeof value.sourceArtifactId !== 'string' || value.sourceArtifactId.length > 100 || !Number.isSafeInteger(value.baseRevision)) return null
+  if ((value.baseRevision as number) < 0 || (value.baseRevision as number) > 32) return null
+  if (value.baseDigest !== null && (typeof value.baseDigest !== 'string' || !/^[a-f0-9]{64}$/.test(value.baseDigest))) return null
   if (!Array.isArray(value.items) || value.items.length > 20) return null
   const items = value.items.flatMap((raw) => {
-    if (!isRecord(raw) || typeof raw.requirementKey !== 'string' || !['approved', 'denied'].includes(String(raw.decision))) return []
-    if (!isRecord(raw.assignment) || typeof raw.assignment.type !== 'string' || !Array.isArray(raw.assignment.targetAgents)) return []
-    if (raw.assignment.targetId !== null && typeof raw.assignment.targetId !== 'string') return []
+    if (!isRecord(raw) || typeof raw.requirementKey !== 'string' || raw.requirementKey.length > 160 || !['approved', 'denied'].includes(String(raw.decision))) return []
+    if (!isRecord(raw.assignment) || typeof raw.assignment.type !== 'string' || raw.assignment.type.length > 40 || !Array.isArray(raw.assignment.targetAgents)) return []
+    if (raw.assignment.targetAgents.length > 6 || !raw.assignment.targetAgents.every((agent) => typeof agent === 'string' && agent.length <= 40)) return []
+    if (raw.assignment.targetId !== null && (typeof raw.assignment.targetId !== 'string' || raw.assignment.targetId.length > 80)) return []
     if (!isRecord(raw.agentPermissions) || !isRecord(raw.promptOverlays)) return []
-    const targetAgents = raw.assignment.targetAgents.filter((agent): agent is string => typeof agent === 'string')
-    const agentPermissions = Object.fromEntries(Object.entries(raw.agentPermissions).flatMap(([agent, capabilities]) => (
-      Array.isArray(capabilities) && capabilities.every((capability) => typeof capability === 'string')
+    if (Object.keys(raw.agentPermissions).length > 6 || Object.keys(raw.promptOverlays).length > 6) return []
+    if (Object.keys(raw.agentPermissions).some((agent) => agent.length > 40) || Object.keys(raw.promptOverlays).some((agent) => agent.length > 40)) return []
+    const permissionEntries = Object.entries(raw.agentPermissions)
+    const overlayEntries = Object.entries(raw.promptOverlays)
+    if (permissionEntries.some(([, capabilities]) => !Array.isArray(capabilities) || capabilities.length > 20 || !capabilities.every((capability) => typeof capability === 'string' && capability.length <= 100))) return []
+    if (overlayEntries.some(([, overlay]) => typeof overlay !== 'string' || overlay.length > 1000)) return []
+    const targetAgents = raw.assignment.targetAgents as string[]
+    const agentPermissions = Object.fromEntries(permissionEntries.flatMap(([agent, capabilities]) => (
+      Array.isArray(capabilities)
         ? [[agent, capabilities as string[]]]
         : []
     )))
-    const promptOverlays = Object.fromEntries(Object.entries(raw.promptOverlays).flatMap(([agent, overlay]) => (
+    const promptOverlays = Object.fromEntries(overlayEntries.flatMap(([agent, overlay]) => (
       typeof overlay === 'string' ? [[agent, overlay]] : []
     )))
     return [{
@@ -100,15 +108,12 @@ export async function POST(
       }
       const packages = await tx.select({ assignedRole: workPackages.assignedRole })
         .from(workPackages).where(eq(workPackages.taskId, taskId))
-      const history = mcpOperatorReviewHistory(gate.metadata)
-      const previous = latestMcpOperatorReview(gate.metadata)
       const gateMetadata = isRecord(gate.metadata) ? gate.metadata : {}
-      if (
-        (Array.isArray(gateMetadata.mcpOperatorReviews) && gateMetadata.mcpOperatorReviews.length !== history.length) ||
-        (isRecord(gateMetadata.mcpOperatorReview) && !previous)
-      ) {
-        return { status: 409 as const, error: 'The saved MCP review history failed its integrity check. Revise the plan before continuing.' }
+      const historyValidation = validateMcpOperatorReviewHistory(gateMetadata, gate.sourceArtifactId)
+      if (!historyValidation.valid) {
+        return { status: 409 as const, error: historyValidation.error }
       }
+      const { head: previous, history } = historyValidation
       let review
       try {
         review = buildMcpOperatorReview({
@@ -121,18 +126,17 @@ export async function POST(
       } catch (error) {
         return { status: 409 as const, error: error instanceof Error ? error.message : 'MCP plan review failed.' }
       }
+      const updatedMetadata = {
+        ...gateMetadata,
+        mcpOperatorReviews: [...history, review],
+        mcpOperatorReview: mcpOperatorReviewSummary(review),
+      }
+      const updatedValidation = validateMcpOperatorReviewHistory(updatedMetadata, gate.sourceArtifactId)
+      if (!updatedValidation.valid) {
+        return { status: 409 as const, error: updatedValidation.error }
+      }
       await tx.update(approvalGates).set({
-        metadata: {
-          ...gateMetadata,
-          mcpOperatorReviews: [...history, review],
-          mcpOperatorReview: {
-            schemaVersion: 1,
-            sourceArtifactId: review.sourceArtifactId,
-            revision: review.revision,
-            digest: review.digest,
-            blockers: review.blockers,
-          },
-        },
+        metadata: updatedMetadata,
         updatedAt: new Date(review.createdAt),
       }).where(and(eq(approvalGates.id, gate.id), eq(approvalGates.status, 'pending')))
       return { status: 200 as const, review }

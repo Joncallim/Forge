@@ -15,8 +15,8 @@ import {
 } from '@/lib/mcps/admission'
 import { admitWorkPackageMcpBroker } from '@/worker/mcp-execution-design'
 import {
-  latestMcpOperatorReview,
   projectReviewedMcpPlanToPackages,
+  validateMcpOperatorReviewHistory,
 } from '@/worker/mcp-plan-review'
 import type { ProjectMcpOverview } from '@/lib/mcps/types'
 import {
@@ -281,14 +281,13 @@ export async function POST(
         .orderBy(asc(workPackages.id))
         .for('update')
       const gateMetadata = isRecord(storedPackageRows[0]?.planGateMetadata) ? storedPackageRows[0].planGateMetadata : {}
-      const operatorReview = latestMcpOperatorReview(gateMetadata)
       const planGateSourceArtifactId = storedPackageRows[0]?.planGateSourceArtifactId
-      const reviewBlockReason = isRecord(gateMetadata.mcpOperatorReview) && !operatorReview
-        ? 'The saved MCP operator review failed its integrity check. Reload or revise the plan before approval.'
+      const reviewValidation = validateMcpOperatorReviewHistory(gateMetadata, planGateSourceArtifactId)
+      const operatorReview = reviewValidation.valid ? reviewValidation.head : null
+      const reviewBlockReason = !reviewValidation.valid
+        ? reviewValidation.error
         : gateMetadata.mcpOperatorReviewRequired === true && !operatorReview
           ? 'Review and save every proposed MCP requirement before approving this plan.'
-        : operatorReview && operatorReview.sourceArtifactId !== planGateSourceArtifactId
-          ? 'The MCP operator review targets a different Architect artifact. Reload and review the current plan.'
           : operatorReview?.blockers.join(' ') || null
       if (reviewBlockReason) {
         return {

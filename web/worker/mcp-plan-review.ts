@@ -51,6 +51,12 @@ export type McpReviewedPackageProjection = {
   metadata: Record<string, unknown>
 }
 
+export const MAX_MCP_OPERATOR_REVIEW_REVISIONS = 32
+
+export type McpOperatorReviewHistoryValidation =
+  | { valid: true; history: McpOperatorReviewRecord[]; head: McpOperatorReviewRecord | null }
+  | { valid: false; error: string; history: []; head: null }
+
 type ReviewBuildInput = {
   proposedDesign: McpExecutionDesign
   plannedAgents: string[]
@@ -94,23 +100,34 @@ function normalizeAgent(value: string): string {
 }
 
 function normalizedReviewItems(items: McpPlanReviewItemInput[]): McpPlanReviewItemInput[] {
-  return items.map((item) => ({
-    requirementKey: item.requirementKey,
-    decision: item.decision,
-    assignment: {
-      type: item.assignment.type,
-      targetAgents: [...new Set(item.assignment.targetAgents.map(normalizeAgent).filter(Boolean))].sort(),
-      targetId: item.assignment.targetId?.trim() || null,
-    },
-    agentPermissions: Object.fromEntries(Object.entries(item.agentPermissions)
-      .map(([agent, capabilities]) => [normalizeAgent(agent), [...new Set(capabilities.map((capability) => capability.trim()).filter(Boolean))].sort()] as const)
-      .filter(([agent, capabilities]) => agent !== '' && capabilities.length > 0)
-      .sort(([left], [right]) => left.localeCompare(right))),
-    promptOverlays: Object.fromEntries(Object.entries(item.promptOverlays)
-      .map(([agent, overlay]) => [normalizeAgent(agent), overlay.trim().replace(/\s+/g, ' ')] as const)
-      .filter(([agent, overlay]) => agent !== '' && overlay !== '')
-      .sort(([left], [right]) => left.localeCompare(right))),
-  }))
+  return items.map((item) => {
+    if (item.decision === 'denied') {
+      return {
+        requirementKey: item.requirementKey,
+        decision: 'denied',
+        assignment: { type: 'agent', targetAgents: [], targetId: null },
+        agentPermissions: {},
+        promptOverlays: {},
+      }
+    }
+    return {
+      requirementKey: item.requirementKey,
+      decision: item.decision,
+      assignment: {
+        type: item.assignment.type,
+        targetAgents: [...new Set(item.assignment.targetAgents.map(normalizeAgent).filter(Boolean))].sort(),
+        targetId: item.assignment.targetId?.trim() || null,
+      },
+      agentPermissions: Object.fromEntries(Object.entries(item.agentPermissions)
+        .map(([agent, capabilities]) => [normalizeAgent(agent), [...new Set(capabilities.map((capability) => capability.trim()).filter(Boolean))].sort()] as const)
+        .filter(([agent, capabilities]) => agent !== '' && capabilities.length > 0)
+        .sort(([left], [right]) => left.localeCompare(right))),
+      promptOverlays: Object.fromEntries(Object.entries(item.promptOverlays)
+        .map(([agent, overlay]) => [normalizeAgent(agent), overlay.trim().replace(/\s+/g, ' ')] as const)
+        .filter(([agent, overlay]) => agent !== '' && overlay !== '')
+        .sort(([left], [right]) => left.localeCompare(right))),
+    }
+  })
 }
 
 function validateAssignment(item: McpPlanReviewItemInput, plannedAgents: Set<string>, label: string): string[] {
@@ -189,7 +206,7 @@ function rawReviewedDesign(
     }))
   })
 
-  const mcpAwareSubtasks = proposed.mcpAwareSubtasks.flatMap((subtask) => {
+  const retainedSubtasks = proposed.mcpAwareSubtasks.flatMap((subtask) => {
     const bindings = subtask.capabilityBindings ?? []
     const capabilityRequirements = bindings.flatMap((binding) => {
       const sourceRequirementIndex = includedIndex.get(binding.requirementKey)
@@ -215,9 +232,18 @@ function rawReviewedDesign(
       fallback: subtask.fallback,
     }]
   })
+  const retainedIds = new Set(retainedSubtasks.map((subtask) => subtask.id))
+  for (const subtask of retainedSubtasks) {
+    const missingDependencies = subtask.dependsOn.filter((dependency) => !retainedIds.has(dependency))
+    if (missingDependencies.length > 0) {
+      blockers.push(
+        `MCP-aware subtask '${subtask.id}' depends on unavailable subtask${missingDependencies.length === 1 ? '' : 's'} ${missingDependencies.map((id) => `'${id}'`).join(', ')}. Revise the plan or restore the required capabilities.`,
+      )
+    }
+  }
 
   return {
-    raw: { schemaVersion: 1, requirements, promptOverlays: {}, requirementContexts, mcpAwareSubtasks },
+    raw: { schemaVersion: 1, requirements, promptOverlays: {}, requirementContexts, mcpAwareSubtasks: retainedSubtasks },
     blockers,
   }
 }
@@ -228,6 +254,9 @@ export function buildMcpOperatorReview(input: ReviewBuildInput): McpOperatorRevi
   const previousDigest = input.previous?.digest ?? null
   if (input.review.baseRevision !== previousRevision || input.review.baseDigest !== previousDigest) {
     throw new Error('MCP plan review revision conflict. Reload the task and try again.')
+  }
+  if (previousRevision >= MAX_MCP_OPERATOR_REVIEW_REVISIONS) {
+    throw new Error(`MCP plan review reached its ${MAX_MCP_OPERATOR_REVIEW_REVISIONS}-revision limit. Replan before recording another review.`)
   }
 
   const proposedByKey = new Map(input.proposedDesign.requirements.map((requirement, index) => [requirementKey(requirement, index), requirement]))
@@ -241,10 +270,15 @@ export function buildMcpOperatorReview(input: ReviewBuildInput): McpOperatorRevi
   for (const [index, item] of items.entries()) {
     const original = proposedByKey.get(item.requirementKey)
     if (!original) throw new Error(`Review item ${index + 1} does not match a proposed MCP requirement.`)
-    const allowedCapabilities = new Set(Object.values(original.agentPermissions).flat())
-    for (const capability of Object.values(item.agentPermissions).flat()) {
-      if (!allowedCapabilities.has(capability)) {
-        throw new Error(`Review item ${index + 1} widens the Architect proposal with capability '${capability}'.`)
+    const allowedCapabilitiesByAgent = new Map(Object.entries(original.agentPermissions).map(
+      ([agent, capabilities]) => [normalizeAgent(agent), new Set(capabilities)] as const,
+    ))
+    for (const [agent, capabilities] of Object.entries(item.agentPermissions)) {
+      const allowedCapabilities = allowedCapabilitiesByAgent.get(normalizeAgent(agent)) ?? new Set<string>()
+      for (const capability of capabilities) {
+        if (!allowedCapabilities.has(capability)) {
+          throw new Error(`Review item ${index + 1} widens the Architect proposal for '${agent}' with capability '${capability}'.`)
+        }
       }
     }
     const errors = validateAssignment(item, plannedAgents, `Review item ${index + 1}`)
@@ -278,12 +312,70 @@ export function isValidMcpOperatorReview(value: unknown): value is McpOperatorRe
 }
 
 export function mcpOperatorReviewHistory(metadata: unknown): McpOperatorReviewRecord[] {
-  if (!isRecord(metadata) || !Array.isArray(metadata.mcpOperatorReviews)) return []
-  return metadata.mcpOperatorReviews.filter(isValidMcpOperatorReview)
+  const validation = validateMcpOperatorReviewHistory(metadata)
+  return validation.valid ? validation.history : []
 }
 
 export function latestMcpOperatorReview(metadata: unknown): McpOperatorReviewRecord | null {
-  return mcpOperatorReviewHistory(metadata).at(-1) ?? null
+  const validation = validateMcpOperatorReviewHistory(metadata)
+  return validation.valid ? validation.head : null
+}
+
+function reviewSummary(review: McpOperatorReviewRecord): Record<string, unknown> {
+  return {
+    schemaVersion: 1,
+    sourceArtifactId: review.sourceArtifactId,
+    revision: review.revision,
+    digest: review.digest,
+    blockers: review.blockers,
+  }
+}
+
+export function mcpOperatorReviewSummary(review: McpOperatorReviewRecord): Record<string, unknown> {
+  return reviewSummary(review)
+}
+
+export function validateMcpOperatorReviewHistory(
+  metadata: unknown,
+  expectedSourceArtifactId?: string | null,
+): McpOperatorReviewHistoryValidation {
+  if (!isRecord(metadata)) {
+    return { valid: true, history: [], head: null }
+  }
+  const rawHistory = metadata.mcpOperatorReviews
+  const rawSummary = metadata.mcpOperatorReview
+  if (rawHistory === undefined && rawSummary === undefined) {
+    return { valid: true, history: [], head: null }
+  }
+  if (!Array.isArray(rawHistory) || rawHistory.length === 0 || rawHistory.length > MAX_MCP_OPERATOR_REVIEW_REVISIONS) {
+    return { valid: false, error: 'MCP operator review history is missing, empty, or exceeds its revision limit.', history: [], head: null }
+  }
+  const history: McpOperatorReviewRecord[] = []
+  let previousDigest: string | null = null
+  let sourceArtifactId: string | null = null
+  for (let index = 0; index < rawHistory.length; index += 1) {
+    const raw = rawHistory[index]
+    if (!isValidMcpOperatorReview(raw)) {
+      return { valid: false, error: `MCP operator review revision ${index + 1} failed its digest check.`, history: [], head: null }
+    }
+    if (raw.revision !== index + 1 || raw.previousDigest !== previousDigest) {
+      return { valid: false, error: `MCP operator review history is not a contiguous revision chain at revision ${index + 1}.`, history: [], head: null }
+    }
+    sourceArtifactId ??= raw.sourceArtifactId
+    if (
+      raw.sourceArtifactId !== sourceArtifactId ||
+      (expectedSourceArtifactId !== undefined && raw.sourceArtifactId !== expectedSourceArtifactId)
+    ) {
+      return { valid: false, error: 'MCP operator review history does not belong to the current Architect artifact.', history: [], head: null }
+    }
+    history.push(raw)
+    previousDigest = raw.digest
+  }
+  const head = history.at(-1)!
+  if (!isRecord(rawSummary) || JSON.stringify(stableValue(rawSummary)) !== JSON.stringify(stableValue(reviewSummary(head)))) {
+    return { valid: false, error: 'MCP operator review summary does not exactly match the validated history head.', history: [], head: null }
+  }
+  return { valid: true, history, head }
 }
 
 function roleMatches(left: string, right: string): boolean {

@@ -43,6 +43,7 @@ import {
 import {
   approvedGrantsForDisplay,
   latestMcpPlanReviewForDisplay,
+  mcpCapabilityCeilingForAgent,
   mcpPlanOverlayCount,
   mcpRequirementDisplayKey,
   type McpPlanReviewDisplayItem,
@@ -3307,7 +3308,6 @@ function McpAccessPlanPanel({
           {requirements.map((requirement, index) => {
             const permissionEntries = Object.entries(requirement.agentPermissions)
             const draft = draftItems[index]
-            const availableCapabilities = [...new Set(permissionEntries.flatMap(([, capabilities]) => capabilities))].sort()
             const selectedAgents = draft?.assignment.type === 'architect_only'
               ? ['architect']
               : draft?.assignment.type === 'reviewer_only'
@@ -3392,7 +3392,7 @@ function McpAccessPlanPanel({
                               return {
                                 ...item,
                                 assignment: { ...item.assignment, type, targetAgents: fallbackTargets },
-                                agentPermissions: Object.fromEntries(fallbackTargets.map((agent) => [agent, item.agentPermissions[agent] ?? availableCapabilities])),
+                                agentPermissions: Object.fromEntries(fallbackTargets.map((agent) => [agent, item.agentPermissions[agent] ?? []])),
                                 promptOverlays: Object.fromEntries(fallbackTargets.flatMap((agent) => item.promptOverlays[agent] ? [[agent, item.promptOverlays[agent]]] : [])),
                               }
                             })}
@@ -3430,7 +3430,7 @@ function McpAccessPlanPanel({
                                       return {
                                         ...item,
                                         assignment: { ...item.assignment, targetAgents: nextTargets },
-                                        agentPermissions: Object.fromEntries(nextTargets.map((target) => [target, item.agentPermissions[target] ?? availableCapabilities])),
+                                        agentPermissions: Object.fromEntries(nextTargets.map((target) => [target, item.agentPermissions[target] ?? []])),
                                         promptOverlays: Object.fromEntries(nextTargets.flatMap((target) => item.promptOverlays[target] ? [[target, item.promptOverlays[target]]] : [])),
                                       }
                                     })}
@@ -3445,7 +3445,7 @@ function McpAccessPlanPanel({
                           <fieldset key={agent} className="grid gap-2 rounded-md border border-border bg-background p-2">
                             <legend className="px-1 font-medium text-foreground">{agent}</legend>
                             <div className="flex flex-wrap gap-3">
-                              {availableCapabilities.map((capability) => (
+                              {mcpCapabilityCeilingForAgent(requirement, agent).map((capability) => (
                                 <label key={capability} className="flex items-center gap-1.5 font-mono text-[11px]">
                                   <input
                                     type="checkbox"
@@ -3463,6 +3463,9 @@ function McpAccessPlanPanel({
                                   {capability}
                                 </label>
                               ))}
+                              {mcpCapabilityCeilingForAgent(requirement, agent).length === 0 && (
+                                <span className="text-muted-foreground">No Architect-proposed capabilities are available for this assignee.</span>
+                              )}
                             </div>
                             <label className="grid gap-1 font-medium text-foreground">
                               Package prompt overlay

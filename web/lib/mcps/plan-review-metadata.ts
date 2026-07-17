@@ -1,4 +1,5 @@
 import type { McpExecutionDesignMetadata } from './execution-design-metadata'
+import { canonicalAgentPackageIdentity } from './agent-package-identity'
 
 export type McpPlanReviewDisplayItem = {
   requirementKey: string
@@ -35,9 +36,19 @@ export function mcpPlanOverlayCount(design: McpExecutionDesignMetadata | null): 
   return design?.proposed?.requirementContexts.filter((context) => context.promptOverlay.trim() !== '').length ?? 0
 }
 
+export function mcpCapabilityCeilingForAgent(
+  requirement: NonNullable<McpExecutionDesignMetadata['proposed']>['requirements'][number],
+  agent: string,
+): string[] {
+  const identity = canonicalAgentPackageIdentity(agent)
+  return [...new Set(Object.entries(requirement.agentPermissions)
+    .filter(([candidate]) => canonicalAgentPackageIdentity(candidate) === identity)
+    .flatMap(([, capabilities]) => capabilities))].sort()
+}
+
 export function latestMcpPlanReviewForDisplay(gate: unknown): McpPlanReviewDisplayRecord | null {
-  if (!isRecord(gate) || !isRecord(gate.metadata) || !Array.isArray(gate.metadata.mcpOperatorReviews)) return null
-  const raw = [...gate.metadata.mcpOperatorReviews].reverse().find(isRecord)
+  if (!isRecord(gate) || gate.mcpOperatorReviewIntegrity !== 'valid') return null
+  const raw = isRecord(gate.validatedMcpOperatorReview) ? gate.validatedMcpOperatorReview : null
   if (!raw || typeof raw.sourceArtifactId !== 'string' || typeof raw.revision !== 'number' || typeof raw.digest !== 'string') return null
   const items = Array.isArray(raw.items) ? raw.items.flatMap((item) => {
     if (!isRecord(item) || typeof item.requirementKey !== 'string' || !isRecord(item.assignment)) return []

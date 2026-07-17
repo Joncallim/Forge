@@ -5,13 +5,17 @@ import { latestMcpExecutionDesignFromArtifacts } from '@/lib/mcps/execution-desi
 import {
   approvedGrantsForDisplay,
   latestMcpPlanReviewForDisplay,
+  mcpCapabilityCeilingForAgent,
   mcpPlanOverlayCount,
 } from '@/lib/mcps/plan-review-metadata'
 import { parseMcpExecutionDesign } from '@/worker/mcp-execution-design'
 import {
   buildMcpOperatorReview,
   isValidMcpOperatorReview,
+  MAX_MCP_OPERATOR_REVIEW_REVISIONS,
+  mcpOperatorReviewSummary,
   projectReviewedMcpPlanToPackages,
+  validateMcpOperatorReviewHistory,
   type McpPlanReviewItemInput,
 } from '@/worker/mcp-plan-review'
 
@@ -63,6 +67,34 @@ function approvedItem(design: ReturnType<typeof parsedDesign>, index: number): M
   }
 }
 
+function reviewMetadata(history: ReturnType<typeof buildMcpOperatorReview>[], summary = history.at(-1)) {
+  return {
+    mcpOperatorReviews: history,
+    ...(summary ? { mcpOperatorReview: mcpOperatorReviewSummary(summary) } : {}),
+  }
+}
+
+function reviewChain(count: number, design = parsedDesign([requirement()])) {
+  const history: ReturnType<typeof buildMcpOperatorReview>[] = []
+  for (let index = 0; index < count; index += 1) {
+    const previous = history.at(-1) ?? null
+    history.push(buildMcpOperatorReview({
+      proposedDesign: design,
+      plannedAgents: ['backend'],
+      previous,
+      createdBy: 'user-1',
+      review: {
+        sourceArtifactId: 'artifact-1',
+        baseRevision: previous?.revision ?? 0,
+        baseDigest: previous?.digest ?? null,
+        items: [approvedItem(design, 0)],
+      },
+      createdAt: new Date(1_752_710_400_000 + index * 1_000),
+    }))
+  }
+  return history
+}
+
 describe('MCP operator plan review', () => {
   it('supports single, multiple-agent, and workforce assignments while preventing capability widening', () => {
     const design = parsedDesign([
@@ -84,9 +116,9 @@ describe('MCP operator plan review', () => {
     const items = design.requirements.map((_, index) => approvedItem(design, index))
     items[0] = {
       ...items[0],
-      assignment: { type: 'agent', targetAgents: ['frontend'], targetId: null },
-      agentPermissions: { frontend: ['github.issues.read'] },
-      promptOverlays: { frontend: 'Use only the approved issue context.' },
+      assignment: { type: 'agent', targetAgents: ['backend'], targetId: null },
+      agentPermissions: { backend: ['github.issues.read'] },
+      promptOverlays: { backend: 'Use only the approved issue context.' },
     }
     const review = buildMcpOperatorReview({
       proposedDesign: design, plannedAgents: ['backend', 'frontend'],
@@ -94,11 +126,58 @@ describe('MCP operator plan review', () => {
       previous: null, createdBy: 'user-1', createdAt: new Date('2026-07-17T00:00:00.000Z'),
     })
     expect(review.reviewedDesign.requirements.map((item) => item.assignment.type)).toEqual(['agent', 'multiple_agents', 'workforce'])
-    expect(review.reviewedDesign.requirements[0].agentPermissions).toEqual({ frontend: ['github.issues.read'] })
+    expect(review.reviewedDesign.requirements[0].agentPermissions).toEqual({ backend: ['github.issues.read'] })
     expect(() => buildMcpOperatorReview({
       proposedDesign: design, plannedAgents: ['backend'], previous: null, createdBy: 'user-1',
       review: { sourceArtifactId: 'artifact-1', baseRevision: 0, baseDigest: null, items: [{ ...approvedItem(design, 0), agentPermissions: { backend: ['github.pull_requests.write'] } }, ...items.slice(1)] },
     })).toThrow(/widens the Architect proposal/)
+  })
+
+  it('enforces asymmetric per-agent ceilings and never grants a reassigned agent the requirement-wide union', () => {
+    const design = parsedDesign([requirement({
+      assignment: { type: 'multiple_agents', targetAgents: ['backend', 'frontend'], targetId: null },
+      agentPermissions: {
+        backend: ['github.contents.read', 'github.repository.search'],
+        frontend: ['github.issues.read'],
+      },
+    })])
+    expect(mcpCapabilityCeilingForAgent(design.requirements[0] as never, 'backend')).toEqual(['github.contents.read', 'github.repository.search'])
+    expect(mcpCapabilityCeilingForAgent(design.requirements[0] as never, 'frontend')).toEqual(['github.issues.read'])
+    const base = approvedItem(design, 0)
+    expect(() => buildMcpOperatorReview({
+      proposedDesign: design, plannedAgents: ['backend', 'frontend'], previous: null, createdBy: 'user-1',
+      review: {
+        sourceArtifactId: 'artifact-1', baseRevision: 0, baseDigest: null,
+        items: [{
+          ...base,
+          assignment: { type: 'agent', targetAgents: ['frontend'], targetId: null },
+          agentPermissions: { frontend: ['github.contents.read'] },
+        }],
+      },
+    })).toThrow(/for 'frontend'/)
+    expect(() => buildMcpOperatorReview({
+      proposedDesign: design, plannedAgents: ['backend', 'frontend'], previous: null, createdBy: 'user-1',
+      review: {
+        sourceArtifactId: 'artifact-1', baseRevision: 0, baseDigest: null,
+        items: [{
+          ...base,
+          assignment: { type: 'agent', targetAgents: ['frontend'], targetId: null },
+          agentPermissions: { frontend: [] },
+        }],
+      },
+    })).toThrow(/must specify reduced capabilities/)
+    const safe = buildMcpOperatorReview({
+      proposedDesign: design, plannedAgents: ['backend', 'frontend'], previous: null, createdBy: 'user-1',
+      review: {
+        sourceArtifactId: 'artifact-1', baseRevision: 0, baseDigest: null,
+        items: [{
+          ...base,
+          assignment: { type: 'agent', targetAgents: ['frontend'], targetId: null },
+          agentPermissions: { frontend: ['github.issues.read'] },
+        }],
+      },
+    })
+    expect(safe.reviewedDesign.requirements[0].agentPermissions).toEqual({ frontend: ['github.issues.read'] })
   })
 
   it('persists non-filesystem denial decisions and blocks approval unless the optional fallback permits continuation', () => {
@@ -139,6 +218,106 @@ describe('MCP operator plan review', () => {
       proposedDesign: design, plannedAgents: ['backend'], previous: first, createdBy: 'user-1',
       review: { sourceArtifactId: 'artifact-1', baseRevision: 0, baseDigest: null, items: [approvedItem(design, 0)] },
     })).toThrow(/revision conflict/)
+  })
+
+  it.each([
+    ['invalid suffix', (history: ReturnType<typeof reviewChain>) => [history[0], { ...history[1], blockers: ['tampered'] }]],
+    ['missing middle', (history: ReturnType<typeof reviewChain>) => [history[0], history[2]]],
+    ['reordered history', (history: ReturnType<typeof reviewChain>) => [history[1], history[0], history[2]]],
+    ['duplicate revision', (history: ReturnType<typeof reviewChain>) => [history[0], history[0], history[2]]],
+  ])('fails closed for %s', (_label, mutate) => {
+    const history = reviewChain(3)
+    expect(validateMcpOperatorReviewHistory(reviewMetadata(mutate(history) as typeof history), 'artifact-1')).toMatchObject({ valid: false })
+  })
+
+  it('rejects wrong-source histories and summary/head mismatches', () => {
+    const history = reviewChain(2)
+    expect(validateMcpOperatorReviewHistory(reviewMetadata(history), 'artifact-2')).toMatchObject({ valid: false })
+    const mixedSourceHead = buildMcpOperatorReview({
+      proposedDesign: parsedDesign([requirement()]), plannedAgents: ['backend'], previous: history[0], createdBy: 'user-1',
+      review: {
+        sourceArtifactId: 'artifact-2', baseRevision: history[0].revision, baseDigest: history[0].digest,
+        items: history[0].items,
+      },
+    })
+    expect(validateMcpOperatorReviewHistory(reviewMetadata([history[0], mixedSourceHead]))).toMatchObject({ valid: false })
+    expect(validateMcpOperatorReviewHistory({
+      ...reviewMetadata(history),
+      mcpOperatorReview: { ...mcpOperatorReviewSummary(history[1]), revision: 1 },
+    }, 'artifact-1')).toMatchObject({ valid: false })
+  })
+
+  it('canonicalizes denied reviews to a closed minimal record and bounds revision volume', () => {
+    const design = parsedDesign([requirement({ requirement: 'optional', fallback: { action: 'continue_without_mcp', message: 'Continue.' } })])
+    const denied = buildMcpOperatorReview({
+      proposedDesign: design, plannedAgents: ['backend'], previous: null, createdBy: 'user-1',
+      review: {
+        sourceArtifactId: 'artifact-1', baseRevision: 0, baseDigest: null,
+        items: [{
+          ...approvedItem(design, 0), decision: 'denied',
+          assignment: { type: 'workforce', targetAgents: ['unknown'], targetId: 'malicious' },
+          agentPermissions: { unknown: ['github.pull_requests.write'] },
+          promptOverlays: { unknown: 'untrusted' },
+        }],
+      },
+    })
+    expect(denied.items[0]).toEqual({
+      requirementKey: design.requirements[0].requirementKey,
+      decision: 'denied',
+      assignment: { type: 'agent', targetAgents: [], targetId: null },
+      agentPermissions: {},
+      promptOverlays: {},
+    })
+    const full = reviewChain(MAX_MCP_OPERATOR_REVIEW_REVISIONS)
+    expect(() => buildMcpOperatorReview({
+      proposedDesign: parsedDesign([requirement()]), plannedAgents: ['backend'], previous: full.at(-1)!, createdBy: 'user-1',
+      review: {
+        sourceArtifactId: 'artifact-1', baseRevision: full.length, baseDigest: full.at(-1)!.digest,
+        items: full[0].items,
+      },
+    })).toThrow(/revision limit/)
+    expect(validateMcpOperatorReviewHistory({
+      mcpOperatorReviews: [...full, full[0]],
+      mcpOperatorReview: mcpOperatorReviewSummary(full.at(-1)!),
+    }, 'artifact-1')).toMatchObject({ valid: false })
+  })
+
+  it.each([
+    ['chain', [
+      { id: 'removed', dependsOn: [], capability: 'github.issues.read' },
+      { id: 'retained', dependsOn: ['removed'], capability: 'github.contents.read' },
+    ], ["MCP-aware subtask 'retained' depends on unavailable subtask 'removed'"]],
+    ['diamond', [
+      { id: 'removed', dependsOn: [], capability: 'github.issues.read' },
+      { id: 'left', dependsOn: ['removed'], capability: 'github.contents.read' },
+      { id: 'right', dependsOn: ['removed'], capability: 'github.contents.read' },
+      { id: 'join', dependsOn: ['left', 'right'], capability: 'github.contents.read' },
+    ], ["MCP-aware subtask 'left' depends on unavailable subtask 'removed'", "MCP-aware subtask 'right' depends on unavailable subtask 'removed'"]],
+    ['pre-existing missing dependency', [
+      { id: 'retained', dependsOn: ['never-existed'], capability: 'github.contents.read' },
+    ], ["MCP-aware subtask 'retained' depends on unavailable subtask 'never-existed'"]],
+  ])('blocks a retained %s graph with removed dependencies', (_label, graph, expected) => {
+    const design = parsedDesign(
+      [requirement()],
+      [],
+      graph.map((subtask) => ({
+        id: subtask.id,
+        agent: 'backend',
+        dependsOn: subtask.dependsOn,
+        mcpCapabilities: [subtask.capability],
+        capabilityRequirements: [{ capability: subtask.capability, sourceRequirementIndex: 0 }],
+        inputs: ['Input'], outputs: ['Output'], verification: ['Verified'],
+        stoppingCondition: 'Done.', fallback: 'Stop.',
+      })),
+    )
+    const review = buildMcpOperatorReview({
+      proposedDesign: design, plannedAgents: ['backend'], previous: null, createdBy: 'user-1',
+      review: {
+        sourceArtifactId: 'artifact-1', baseRevision: 0, baseDigest: null,
+        items: [{ ...approvedItem(design, 0), agentPermissions: { backend: ['github.contents.read'] } }],
+      },
+    })
+    expect(review.blockers).toEqual(expected.map((message) => expect.stringContaining(message)))
   })
 
   it('projects the reviewed version with canonical health, overlay composition, and no live handles', () => {
@@ -186,7 +365,11 @@ describe('MCP operator plan review', () => {
       } },
     }])
     expect(mcpPlanOverlayCount(displayDesign)).toBe(1)
-    expect(latestMcpPlanReviewForDisplay({ metadata: { mcpOperatorReviews: [review] } })).toMatchObject({ revision: 1, digest: review.digest })
+    expect(latestMcpPlanReviewForDisplay({
+      mcpOperatorReviewIntegrity: 'valid',
+      validatedMcpOperatorReview: review,
+    })).toMatchObject({ revision: 1, digest: review.digest })
+    expect(latestMcpPlanReviewForDisplay({ metadata: reviewMetadata([review]) })).toBeNull()
     expect(approvedGrantsForDisplay({ proposedGrants: [{ mcpId: 'wrong' }], approvedGrants: [{ mcpId: 'github' }] })).toEqual([{ mcpId: 'github' }])
   })
 })

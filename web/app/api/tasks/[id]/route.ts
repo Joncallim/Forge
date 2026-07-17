@@ -19,6 +19,7 @@ import { getSession } from '@/lib/session'
 import { publishTaskEvent } from '@/worker/events'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
+import { validateMcpOperatorReviewHistory } from '@/worker/mcp-plan-review'
 
 // ---------------------------------------------------------------------------
 // GET /api/tasks/:id
@@ -216,6 +217,14 @@ export async function GET(
         artifacts: artifactsByWorkPackageId.get(pkg.id) ?? [],
       }
     })
+    const taskApprovalGatesWithValidatedReviews = taskApprovalGates.map((gate) => {
+      const validation = validateMcpOperatorReviewHistory(gate.metadata, gate.sourceArtifactId)
+      return {
+        ...gate,
+        validatedMcpOperatorReview: validation.valid ? validation.head : null,
+        mcpOperatorReviewIntegrity: validation.valid ? 'valid' : 'invalid',
+      }
+    })
 
     return NextResponse.json({
       task,
@@ -224,7 +233,7 @@ export async function GET(
       attempts,
       questions,
       workPackages: taskWorkPackagesWithPrompts,
-      approvalGates: taskApprovalGates,
+      approvalGates: taskApprovalGatesWithValidatedReviews,
       commandAudits: taskCommandAudits,
       filesystemAudits: taskFilesystemAudits,
       vcsChanges: taskVcsChanges,
