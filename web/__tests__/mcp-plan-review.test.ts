@@ -221,6 +221,54 @@ describe('MCP operator plan review', () => {
     expect(allowed.reviewedDesign.requirements).toEqual([])
   })
 
+  it('rejects review of a normalized partial design and preserves existing package blockers during projection', () => {
+    const design = parsedDesign([requirement()])
+    const normalizationErrors = ['A duplicate context was omitted during normalization.']
+    const normalizationEvidence: NonNullable<typeof design.normalizationEvidence> = [{
+      schemaVersion: 1,
+      category: 'normalization',
+      code: 'duplicate_context',
+      message: normalizationErrors[0],
+    }]
+    expect(() => buildMcpOperatorReview({
+      proposedDesign: { ...design, normalizationErrors, normalizationEvidence },
+      plannedAgents: ['backend'],
+      previous: null,
+      createdBy: 'user-1',
+      review: {
+        sourceArtifactId: 'artifact-1',
+        baseRevision: 0,
+        baseDigest: null,
+        items: [approvedItem(design, 0)],
+      },
+    })).toThrow(/unresolved normalization blockers/)
+
+    const review = buildMcpOperatorReview({
+      proposedDesign: design,
+      plannedAgents: ['backend'],
+      previous: null,
+      createdBy: 'user-1',
+      review: {
+        sourceArtifactId: 'artifact-1',
+        baseRevision: 0,
+        baseDigest: null,
+        items: [approvedItem(design, 0)],
+      },
+    })
+    const [projected] = projectReviewedMcpPlanToPackages({
+      review,
+      overview: overview(),
+      packages: [{
+        id: 'pkg-normalization-blocked',
+        assignedRole: 'backend',
+        title: 'Backend',
+        metadata: { mcpNormalizationErrors: normalizationErrors, mcpNormalizationEvidence: normalizationEvidence },
+      }],
+    })
+    expect(projected.metadata.mcpNormalizationErrors).toEqual(normalizationErrors)
+    expect(projected.metadata.mcpNormalizationEvidence).toEqual(normalizationEvidence)
+  })
+
   it('chains immutable revisions, detects conflicts, and rejects digest tampering', () => {
     const design = parsedDesign([requirement()])
     const first = buildMcpOperatorReview({

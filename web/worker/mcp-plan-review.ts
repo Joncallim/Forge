@@ -251,6 +251,9 @@ function rawReviewedDesign(
 
 export function buildMcpOperatorReview(input: ReviewBuildInput): McpOperatorReviewRecord {
   if (input.review.sourceArtifactId.trim() === '') throw new Error('A source artifact id is required.')
+  if ((input.proposedDesign.normalizationErrors?.length ?? 0) > 0) {
+    throw new Error('The Architect MCP plan has unresolved normalization blockers. Replan before recording an operator review.')
+  }
   const previousRevision = input.previous?.revision ?? 0
   const previousDigest = input.previous?.digest ?? null
   if (input.review.baseRevision !== previousRevision || input.review.baseDigest !== previousDigest) {
@@ -431,8 +434,8 @@ export function projectReviewedMcpPlanToPackages(input: {
         ...metadata,
         mcpGrantsSchemaVersion: 2,
         mcpGrants: grants,
-        mcpNormalizationErrors: [],
-        mcpNormalizationEvidence: [],
+        mcpNormalizationErrors: metadata.mcpNormalizationErrors ?? [],
+        mcpNormalizationEvidence: metadata.mcpNormalizationEvidence ?? [],
         requirementContexts,
         promptOverlay: requirementContexts.map((context) => context.promptOverlay).join('\n\n') || null,
         mcpAwareSubtasks,
