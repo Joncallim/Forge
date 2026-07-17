@@ -38,15 +38,67 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
     classification: 'signed-activation-required',
   },
   {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::mcp-admission.real-approval-route: concurrent reapproval has one CAS winner and immutable history',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::mcp-admission.grant-reconciliation: operator hold preserves a running task until lease and review barriers clear',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::expired execution leases allow convergence while malformed leases fail closed',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::simultaneous disjoint task always-allow decisions serialize and preserve their capability union',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::task and project always-allow mutations converge through the same immutable project authority',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::a newer covering project decision recovers a consumed package-local approval',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::config-only legacy project grants fail closed without an immutable current decision',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::narrowing and removal append retained decisions and negatively reconcile future authority',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::project pointer retains an exact S4 parent, rejects mismatches, and rolls back a stale CAS append',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::root repoint keeps the retained project decision and pointer unchanged while revoking issuance',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::root repoint retains decision authority and requires explicit approval after every binding change',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::the database enforces the same exhaustive strict S3 marker fixtures as TypeScript',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::the complete sibling lock waits on the lower ID before reaching the target',
+    classification: 'run-disabled-safe',
+  },
+  {
     id: 'mcp-handoff-concurrency.spec.ts::A: a grant arriving after health capture wins and unrelated metadata survives',
     classification: 'run-disabled-safe',
   },
   {
-    id: 'mcp-handoff-concurrency.spec.ts::B: a revocation after health capture blocks without creating a run',
+    id: 'mcp-handoff-concurrency.spec.ts::B: a denial after health capture creates an operator hold without a run',
     classification: 'run-disabled-safe',
   },
   {
-    id: 'mcp-handoff-concurrency.spec.ts::B2: project grant revocation holding the project lock before claim wins with zero runs',
+    id: 'mcp-handoff-concurrency.spec.ts::B2: a canonical project revocation before claim wins with zero runs',
     classification: 'run-disabled-safe',
   },
   {
@@ -96,6 +148,14 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
   {
     id: 'task-detail-controls.spec.ts::warns before saving project-wide filesystem approval',
     classification: 'run-disabled-safe',
+  },
+  {
+    id: 'task-detail-controls.spec.ts::loads the package pointer and carries D1 into an explicit D2 reapproval',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'task-detail-controls.spec.ts::refreshes a stale pointer and waits for a second explicit confirmation',
+    classification: 'signed-activation-required',
   },
 ] as const satisfies readonly Epic172Step0E2EEntry[]
 

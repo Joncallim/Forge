@@ -266,14 +266,9 @@ test.describe('MCP handoff optimistic concurrency', () => {
   test.afterEach(async () => {
     if (!sql || !writer) return
     await Promise.all(sessionsToDelete.splice(0).map((sessionId) => redis.del(`session:${sessionId}`)))
-    await sql`
-      truncate table
-        filesystem_mcp_runtime_audits,
-        filesystem_mcp_current_decision_pointers,
-        filesystem_mcp_grant_approvals,
-        project_filesystem_current_decision_pointers,
-        project_filesystem_grant_decisions
-    `
+    // Grant decisions and runtime audits are retained evidence. The fixtures
+    // use random identities, so archive their projects instead of requiring the
+    // ordinary application role to truncate protected history.
     usersToDelete.splice(0)
     for (const projectId of projectsToDelete.splice(0)) {
       await sql`

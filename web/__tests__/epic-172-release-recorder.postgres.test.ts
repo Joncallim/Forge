@@ -59,7 +59,7 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
     if (kind === 'enabled_build_tests_green') {
       return {
         owner: { issue: 181, slice: 's6' } as const,
-        buildSlots: ['issue_179_s4', 'issue_180_s5', 'issue_181_s6'] as const,
+        buildSlots: ['issue_178_s3', 'issue_179_s4', 'issue_180_s5', 'issue_181_s6'] as const,
         epoch: 7,
       }
     }

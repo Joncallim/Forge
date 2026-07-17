@@ -22,9 +22,13 @@ import {
   INVALID_S3_MARKERS,
   VALID_S3_HOLD_STATES,
 } from '../test-support/filesystem-grant-marker-fixtures'
+import { applyEpic172Step0E2EBridge } from './epic-172-step0-bridge'
 
 const RUN = process.env.RUN_FORGE_POSTGRES_TESTS === '1'
 test.skip(!RUN, 'Set RUN_FORGE_POSTGRES_TESTS=1 against a migrated disposable PostgreSQL database.')
+test.beforeEach(async ({}, testInfo) => {
+  applyEpic172Step0E2EBridge(testInfo, 'filesystem-grant-lifecycle-concurrency.spec.ts')
+})
 
 function sqlClient() {
   const url = process.env.DATABASE_URL

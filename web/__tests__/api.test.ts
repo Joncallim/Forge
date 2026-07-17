@@ -1906,6 +1906,7 @@ describe('GET/POST/PUT /api/projects/:id/mcps — shared MCP management', () => 
         ])
         expect(mockGetProjectMcpOverview).toHaveBeenCalledWith(
           project,
+          null,
           { cache: false, ensureWorkspace: false },
         )
         expect(mockDbInsert).not.toHaveBeenCalled()

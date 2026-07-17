@@ -15,6 +15,37 @@ function order(overrides: Partial<Parameters<typeof completeEpic172S3Release>[0]
 }
 
 describe('Epic 172 S3 release seam', () => {
+  it('orders migration 0026 strictly after the integrated Step 0 chain', () => {
+    const journal = JSON.parse(readFileSync(
+      fileURLToPath(new URL('../db/migrations/meta/_journal.json', import.meta.url)),
+      'utf8',
+    )) as { entries: Array<{ idx: number; tag: string; when: number }> }
+    const entries = journal.entries.filter((entry) => entry.tag.startsWith('002'))
+    const byTag = new Map(entries.map((entry) => [entry.tag, entry]))
+    const exactTags = [
+      '0023_epic_172_release_substrate',
+      '0024_epic_172_retention_fks',
+      '0025_epic_172_release_routines',
+      '0026_epic_172_s3_grant_lifecycle',
+    ]
+    expect(exactTags.map((tag) => byTag.get(tag)?.idx)).toEqual([23, 24, 25, 26])
+    expect(exactTags.map((tag) => byTag.get(tag)?.when)).toEqual(
+      [...exactTags.map((tag) => byTag.get(tag)?.when)].sort((left, right) => Number(left) - Number(right)),
+    )
+    expect(byTag.get('0026_epic_172_s3_grant_lifecycle')?.when).toBeGreaterThan(
+      byTag.get('0025_epic_172_release_routines')?.when ?? Number.MAX_SAFE_INTEGER,
+    )
+  })
+
+  it('keeps retained S3 authority history out of ordinary-app E2E truncation', () => {
+    for (const relativePath of ['../e2e/helpers.ts', '../e2e/mcp-handoff-concurrency.spec.ts']) {
+      const source = readFileSync(fileURLToPath(new URL(relativePath, import.meta.url)), 'utf8')
+      expect(source, relativePath).not.toMatch(
+        /truncate\s+table[\s\S]{0,400}(?:filesystem_mcp_grant_approvals|project_filesystem_grant_decisions)/i,
+      )
+    }
+  })
+
   it('keeps the real PostgreSQL concurrency proof mandatory and single-project in CI', () => {
     const workflow = readFileSync(
       fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)),

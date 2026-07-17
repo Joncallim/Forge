@@ -199,7 +199,7 @@ function assertBuildAndEpochContract(
 ): void {
   const contract = kind === 'enabled_build_tests_green'
     ? {
-      exactBuilds: ['issue_179_s4', 'issue_180_s5', 'issue_181_s6'] as const,
+      exactBuilds: ['issue_178_s3', 'issue_179_s4', 'issue_180_s5', 'issue_181_s6'] as const,
       epoch: 'required' as const,
     }
     : {
