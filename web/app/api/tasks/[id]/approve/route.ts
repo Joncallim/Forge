@@ -14,6 +14,10 @@ import {
   type McpWorkPackageAdmission,
 } from '@/lib/mcps/admission'
 import { admitWorkPackageMcpBroker } from '@/worker/mcp-execution-design'
+import {
+  projectReviewedMcpPlanToPackages,
+  validateMcpOperatorReviewHistory,
+} from '@/worker/mcp-plan-review'
 import type { ProjectMcpOverview } from '@/lib/mcps/types'
 import {
   isExplicitFilesystemEffectivePhase,
@@ -161,7 +165,9 @@ function buildApprovedGrantSnapshot(input: {
         approvedGrants: Array.isArray(approved.grants) ? approved.grants : [],
         effectiveGrants: Array.isArray(effective.grants) ? effective.grants : [],
         proposedRequirements: Array.isArray(pkg.mcpRequirements) ? pkg.mcpRequirements : [],
+        approvedRequirements: Array.isArray(pkg.mcpRequirements) ? pkg.mcpRequirements : [],
         promptOverlayPresent: typeof metadata.promptOverlay === 'string' && metadata.promptOverlay.trim() !== '',
+        ...(isRecord(metadata.mcpOperatorReview) ? { mcpOperatorReview: metadata.mcpOperatorReview } : {}),
       }
     }),
   }
@@ -248,18 +254,65 @@ export async function POST(
         return { task: null, approvedGates: [] as { id: string }[], approvalBlock: null }
       }
 
-      const rawPackageRows = await tx
+      const storedPackageRows = await tx
         .select({
           id: workPackages.id,
           assignedRole: workPackages.assignedRole,
           title: workPackages.title,
           mcpRequirements: workPackages.mcpRequirements,
           metadata: workPackages.metadata,
+          planGateMetadata: sql<unknown>`(
+            select ${approvalGates.metadata} from ${approvalGates}
+            where ${approvalGates.taskId} = ${taskId}
+              and ${approvalGates.gateType} = 'plan_approval'
+              and ${approvalGates.status} = 'pending'
+            limit 1
+          )`,
+          planGateSourceArtifactId: sql<string | null>`(
+            select ${approvalGates.sourceArtifactId} from ${approvalGates}
+            where ${approvalGates.taskId} = ${taskId}
+              and ${approvalGates.gateType} = 'plan_approval'
+              and ${approvalGates.status} = 'pending'
+            limit 1
+          )`,
         })
         .from(workPackages)
         .where(eq(workPackages.taskId, taskId))
         .orderBy(asc(workPackages.id))
         .for('update')
+      const gateMetadata = isRecord(storedPackageRows[0]?.planGateMetadata) ? storedPackageRows[0].planGateMetadata : {}
+      const planGateSourceArtifactId = storedPackageRows[0]?.planGateSourceArtifactId
+      const reviewValidation = validateMcpOperatorReviewHistory(gateMetadata, planGateSourceArtifactId)
+      const operatorReview = reviewValidation.valid ? reviewValidation.head : null
+      const reviewBlockReason = !reviewValidation.valid
+        ? reviewValidation.error
+        : gateMetadata.mcpOperatorReviewRequired === true && !operatorReview
+          ? 'Review and save every proposed MCP requirement before approving this plan.'
+          : operatorReview?.blockers.join(' ') || null
+      if (reviewBlockReason) {
+        return {
+          task: null,
+          approvedGates: [] as { id: string }[],
+          approvalBlock: {
+            error: reviewBlockReason,
+            evidenceRefs: operatorReview ? [`mcp-review:${operatorReview.digest}`] : [] as string[],
+            primaryDecision: null,
+            primaryMode: 'blocked' as const,
+            reason: reviewBlockReason,
+            primaryRecoveryAction: 'revise_plan' as const,
+            primaryRetryableContribution: false,
+            retryable: false,
+            workPackageId: null,
+          },
+        }
+      }
+      const rawPackageRows = operatorReview
+        ? projectReviewedMcpPlanToPackages({
+            review: operatorReview,
+            overview: mcpOverview,
+            packages: storedPackageRows,
+          })
+        : storedPackageRows
 
       const admissions = rawPackageRows.map((pkg) => admissionForLockedPackage({
         assignedRole: pkg.assignedRole,
@@ -340,12 +393,19 @@ export async function POST(
           approvedBy: session.userId,
           metadata: pkg.metadata,
         })
+        const update = operatorReview
+          ? {
+              mcpRequirements: pkg.mcpRequirements,
+              metadata: { ...(isRecord(pkg.metadata) ? pkg.metadata : {}), mcpGrantPhases: phases },
+              updatedAt: approvedAt,
+            }
+          : {
+              metadata: sql`jsonb_set(${workPackages.metadata}, '{mcpGrantPhases}', ${JSON.stringify(phases)}::jsonb, true)`,
+              updatedAt: approvedAt,
+            }
         await tx
           .update(workPackages)
-          .set({
-            metadata: sql`jsonb_set(${workPackages.metadata}, '{mcpGrantPhases}', ${JSON.stringify(phases)}::jsonb, true)`,
-            updatedAt: approvedAt,
-          })
+          .set(update)
           .where(eq(workPackages.id, pkg.id))
       }
 

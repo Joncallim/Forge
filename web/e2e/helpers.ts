@@ -5,6 +5,7 @@ import Redis from 'ioredis'
 import postgres from 'postgres'
 import type { BrowserContext, TestInfo } from '@playwright/test'
 import { seedAgentConfigs } from '../db/seed-agents'
+import { resolveDestructiveE2EEnvironment } from './destructive-environment'
 
 const root = path.resolve(__dirname, '..')
 const workerLogs = new WeakMap<ChildProcessWithoutNullStreams, string[]>()
@@ -32,15 +33,22 @@ export function getBaseUrl(): string {
   return process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
 }
 
+function installedE2EEnvironment() {
+  const environment = resolveDestructiveE2EEnvironment()
+  // Some Playwright hooks and dynamically imported seed modules run in a
+  // separate process. Install only the already-validated dedicated identities.
+  process.env.DATABASE_URL = environment.databaseUrl
+  process.env.REDIS_URL = environment.redisUrl
+  return environment
+}
+
 function sqlClient() {
-  const databaseUrl = process.env.DATABASE_URL
-  if (!databaseUrl) throw new Error('DATABASE_URL is required for E2E tests')
+  const { databaseUrl } = installedE2EEnvironment()
   return postgres(databaseUrl, { max: 1 })
 }
 
 function redisClient() {
-  const redisUrl = process.env.REDIS_URL
-  if (!redisUrl) throw new Error('REDIS_URL is required for E2E tests')
+  const { redisUrl } = installedE2EEnvironment()
   return new Redis(redisUrl, { maxRetriesPerRequest: 3 })
 }
 

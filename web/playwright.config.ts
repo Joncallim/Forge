@@ -1,4 +1,22 @@
 import { defineConfig, devices } from '@playwright/test'
+import { resolveDestructiveE2EEnvironment } from './e2e/destructive-environment'
+
+const inheritedEnvironment = { ...process.env }
+delete process.env.DATABASE_URL
+delete process.env.REDIS_URL
+
+const hasE2EEnvironment = Boolean(
+  inheritedEnvironment.FORGE_E2E_ALLOW_DESTRUCTIVE_RESET ||
+  inheritedEnvironment.FORGE_E2E_DATABASE_URL ||
+  inheritedEnvironment.FORGE_E2E_REDIS_URL,
+)
+const e2eEnvironment = hasE2EEnvironment
+  ? resolveDestructiveE2EEnvironment(inheritedEnvironment)
+  : null
+if (e2eEnvironment) {
+  process.env.DATABASE_URL = e2eEnvironment.databaseUrl
+  process.env.REDIS_URL = e2eEnvironment.redisUrl
+}
 
 const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
 
@@ -30,8 +48,8 @@ export default defineConfig({
     reuseExistingServer: process.env.PLAYWRIGHT_REUSE_EXISTING_SERVER === '1',
     timeout: 120_000,
     env: {
-      DATABASE_URL: process.env.DATABASE_URL ?? '',
-      REDIS_URL: process.env.REDIS_URL ?? '',
+      DATABASE_URL: e2eEnvironment?.databaseUrl ?? '',
+      REDIS_URL: e2eEnvironment?.redisUrl ?? '',
       SESSION_SECRET: process.env.SESSION_SECRET ?? '',
       WEBAUTHN_RP_ID: process.env.WEBAUTHN_RP_ID ?? 'localhost',
       WEBAUTHN_RP_NAME: process.env.WEBAUTHN_RP_NAME ?? 'Forge',
