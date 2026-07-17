@@ -1092,7 +1092,7 @@ node; and any substitution of one graph, edge set, or evidence for the other.
       "host-binding-generation-rotation-row",
       "host-root-hierarchy-guard-row",
       "agent-runs:id-ascending",
-      "local-run-evidence-task-projection-source-rows:id-ascending",
+      "local-run-evidence-task-projection-heads:id-ascending",
       "optional-runtime-audits:id-ascending",
       "host-apply-ledgers:run-id-then-entry-ordinal",
       "artifacts:agent-run-id-artifact-type-artifact-id",

@@ -27,6 +27,12 @@ describe('MCP admission lock order v2', () => {
 
   it('accepts the complete order and ordered subsequences', () => {
     expect(() => assertMcpAdmissionLockSequence(MCP_ADMISSION_LOCK_ORDER.families)).not.toThrow()
+    expect(MCP_ADMISSION_LOCK_ORDER.families).toContain(
+      'local-run-evidence-task-projection-heads:id-ascending',
+    )
+    expect(MCP_ADMISSION_LOCK_ORDER.families).not.toContain(
+      'local-run-evidence-task-projection-source-rows:id-ascending',
+    )
     expect(isMcpAdmissionLockSequence([
       'project',
       'work-packages:id-ascending',
