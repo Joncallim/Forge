@@ -461,3 +461,499 @@ ALTER TABLE "work_packages"
       ) IS TRUE
     )
   );
+--> statement-breakpoint
+-- The release ledger is owned by a separate NOLOGIN role. The administrator-
+-- installed helper grants this migration login a non-inheriting SET ROLE path
+-- only for this versioned S3 section, including upgraded Step 0 databases.
+SELECT public.forge_begin_epic_172_s3_owner_bootstrap_v1();
+--> statement-breakpoint
+SET LOCAL ROLE forge_release_routines_owner;
+--> statement-breakpoint
+CREATE TABLE public.forge_epic_172_s3_release_state (
+  singleton_id text PRIMARY KEY,
+  state text NOT NULL,
+  state_fingerprint text NOT NULL,
+  predecessor_receipt_id uuid,
+  authorization_id uuid,
+  evidence_receipt_id uuid,
+  transition_identity_digest text,
+  completed_at timestamptz,
+  CONSTRAINT forge_epic_172_s3_release_state_singleton_chk
+    CHECK (singleton_id = 's3_issue_178'),
+  CONSTRAINT forge_epic_172_s3_release_state_state_chk
+    CHECK (state IN ('pending', 'complete')),
+  CONSTRAINT forge_epic_172_s3_release_state_fingerprint_chk
+    CHECK (state_fingerprint ~ '^[0-9a-f]{64}$'),
+  CONSTRAINT forge_epic_172_s3_release_state_tuple_chk CHECK (
+    (
+      state = 'pending'
+      AND state_fingerprint = '7a97eed28629c7d0d7c11a48d3509f1c479d614882dc61a7e2c1891f32c3a5dc'
+      AND predecessor_receipt_id IS NULL
+      AND authorization_id IS NULL
+      AND evidence_receipt_id IS NULL
+      AND transition_identity_digest IS NULL
+      AND completed_at IS NULL
+    ) OR (
+      state = 'complete'
+      AND predecessor_receipt_id IS NOT NULL
+      AND authorization_id IS NOT NULL
+      AND evidence_receipt_id IS NOT NULL
+      AND evidence_receipt_id <> predecessor_receipt_id
+      AND transition_identity_digest ~ '^[0-9a-f]{64}$'
+      AND state_fingerprint = transition_identity_digest
+      AND completed_at IS NOT NULL
+    )
+  ),
+  CONSTRAINT forge_epic_172_s3_release_state_predecessor_receipt_id_forge_epic_172_release_evidence_id_fk
+    FOREIGN KEY (predecessor_receipt_id)
+    REFERENCES public.forge_epic_172_release_evidence(id)
+    ON UPDATE restrict ON DELETE restrict,
+  CONSTRAINT forge_epic_172_s3_release_state_authorization_id_forge_epic_172_transition_authorizations_id_fk
+    FOREIGN KEY (authorization_id)
+    REFERENCES public.forge_epic_172_transition_authorizations(id)
+    ON UPDATE restrict ON DELETE restrict,
+  CONSTRAINT forge_epic_172_s3_release_state_evidence_receipt_id_forge_epic_172_release_evidence_id_fk
+    FOREIGN KEY (evidence_receipt_id)
+    REFERENCES public.forge_epic_172_release_evidence(id)
+    ON UPDATE restrict ON DELETE restrict
+);
+--> statement-breakpoint
+INSERT INTO public.forge_epic_172_s3_release_state (
+  singleton_id, state, state_fingerprint
+) VALUES (
+  's3_issue_178',
+  'pending',
+  '7a97eed28629c7d0d7c11a48d3509f1c479d614882dc61a7e2c1891f32c3a5dc'
+);
+--> statement-breakpoint
+CREATE FUNCTION forge.guard_epic_172_s3_evidence_insert_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF NEW.evidence_kind = 's3_issue_178'
+     AND session_user <> 'forge_release_transition' THEN
+    RAISE EXCEPTION 's3_issue_178 evidence requires the atomic dedicated S3 completion transaction'
+      USING ERRCODE = '42501';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+--> statement-breakpoint
+CREATE TRIGGER forge_epic_172_s3_evidence_atomic_insert
+BEFORE INSERT ON public.forge_epic_172_release_evidence
+FOR EACH ROW EXECUTE FUNCTION forge.guard_epic_172_s3_evidence_insert_v1();
+--> statement-breakpoint
+CREATE FUNCTION forge.guard_epic_172_s3_state_transition_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'Epic 172 S3 release state is durable' USING ERRCODE = '55000';
+  END IF;
+  IF session_user <> 'forge_release_transition'
+     OR OLD.state <> 'pending'
+     OR NEW.state <> 'complete'
+     OR NEW.singleton_id <> OLD.singleton_id THEN
+    RAISE EXCEPTION 'Epic 172 S3 release state permits only its dedicated one-way completion'
+      USING ERRCODE = '42501';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+--> statement-breakpoint
+CREATE TRIGGER forge_epic_172_s3_release_state_one_way
+BEFORE UPDATE OR DELETE ON public.forge_epic_172_s3_release_state
+FOR EACH ROW EXECUTE FUNCTION forge.guard_epic_172_s3_state_transition_v1();
+--> statement-breakpoint
+CREATE FUNCTION forge.lock_epic_172_s3_completion_v1(
+  p_predecessor_receipt_id uuid,
+  p_authorization_id uuid,
+  p_output_signer_key_id uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_state text;
+  v_locked_signers integer;
+BEGIN
+  IF session_user <> 'forge_release_transition' THEN
+    RAISE EXCEPTION 'Epic 172 S3 verification locks require the dedicated transition login'
+      USING ERRCODE = '42501';
+  END IF;
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended('forge:epic-172:s3-completion:v1', 0)
+  );
+  SELECT state INTO STRICT v_state
+  FROM public.forge_epic_172_s3_release_state
+  WHERE singleton_id = 's3_issue_178'
+  FOR UPDATE;
+  IF v_state <> 'pending' THEN
+    RAISE EXCEPTION 'Epic 172 S3 release state is already complete'
+      USING ERRCODE = '55000';
+  END IF;
+  PERFORM 1
+  FROM public.forge_epic_172_release_evidence
+  WHERE id = p_predecessor_receipt_id
+  FOR KEY SHARE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'The exact Step 0 predecessor is not retained' USING ERRCODE = '23503';
+  END IF;
+  PERFORM 1
+  FROM public.forge_epic_172_transition_authorizations
+  WHERE id = p_authorization_id
+  FOR KEY SHARE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'The exact S3 transition authorization is not retained' USING ERRCODE = '23503';
+  END IF;
+  PERFORM 1
+  FROM public.forge_release_signer_keys signer
+  WHERE signer.id IN (
+    p_output_signer_key_id,
+    (SELECT evidence.signer_key_id FROM public.forge_epic_172_release_evidence evidence
+      WHERE evidence.id = p_predecessor_receipt_id),
+    (SELECT authorization_row.signer_key_id FROM public.forge_epic_172_transition_authorizations authorization_row
+      WHERE authorization_row.id = p_authorization_id)
+  )
+  ORDER BY signer.id
+  FOR UPDATE;
+  GET DIAGNOSTICS v_locked_signers = ROW_COUNT;
+  IF v_locked_signers <> (
+    SELECT pg_catalog.count(DISTINCT signer_id)
+    FROM pg_catalog.unnest(ARRAY[
+      p_output_signer_key_id,
+      (SELECT evidence.signer_key_id FROM public.forge_epic_172_release_evidence evidence
+        WHERE evidence.id = p_predecessor_receipt_id),
+      (SELECT authorization_row.signer_key_id FROM public.forge_epic_172_transition_authorizations authorization_row
+        WHERE authorization_row.id = p_authorization_id)
+    ]) signer_id
+  ) THEN
+    RAISE EXCEPTION 'An exact signer required by S3 completion is missing' USING ERRCODE = '23503';
+  END IF;
+END;
+$$;
+--> statement-breakpoint
+CREATE FUNCTION forge.complete_epic_172_s3_release_v1(
+  p_authorization_id uuid,
+  p_expected_state_fingerprint text,
+  p_receipt_id uuid,
+  p_owner_issue integer,
+  p_owner_slice text,
+  p_exact_builds jsonb,
+  p_required_evidence jsonb,
+  p_reviewed_sha text,
+  p_epoch bigint,
+  p_predecessor_receipt_ids jsonb,
+  p_predecessor_set_digest text,
+  p_transition_identity_digest text,
+  p_signer_key_id uuid,
+  p_signer_generation bigint,
+  p_github_app_id text,
+  p_controller_run_id text,
+  p_controller_job_id text,
+  p_envelope_digest text,
+  p_detached_signature bytea,
+  p_nonce uuid,
+  p_issued_at timestamptz,
+  p_envelope jsonb
+)
+RETURNS TABLE (receipt_id uuid, consumption_id uuid, completed_at timestamptz)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_now timestamptz := pg_catalog.clock_timestamp();
+  v_predecessor public.forge_epic_172_release_evidence%ROWTYPE;
+  v_authorization public.forge_epic_172_transition_authorizations%ROWTYPE;
+  v_predecessor_key public.forge_release_signer_keys%ROWTYPE;
+  v_authorization_key public.forge_release_signer_keys%ROWTYPE;
+  v_output_key public.forge_release_signer_keys%ROWTYPE;
+  v_expected_evidence_names text[] := ARRAY[
+    'step0_retention_bridge_receipt',
+    'grant_decision_revision_contract_green',
+    'operator_hold_and_reconciliation_contract_green',
+    'canonical_lock_order_contract_green',
+    'postgresql_s3_evidence_green'
+  ];
+  v_expected_envelope jsonb;
+  v_consumption_id uuid;
+  v_completed_at timestamptz;
+BEGIN
+  IF session_user <> 'forge_release_transition' THEN
+    RAISE EXCEPTION 'Epic 172 S3 completion requires the dedicated transition login'
+      USING ERRCODE = '42501';
+  END IF;
+  IF jsonb_typeof(p_predecessor_receipt_ids) <> 'array'
+     OR jsonb_array_length(p_predecessor_receipt_ids) <> 1 THEN
+    RAISE EXCEPTION 'S3 completion requires exactly one Step 0 predecessor'
+      USING ERRCODE = '22023';
+  END IF;
+  PERFORM forge.lock_epic_172_s3_completion_v1(
+    (p_predecessor_receipt_ids ->> 0)::uuid,
+    p_authorization_id,
+    p_signer_key_id
+  );
+
+  SELECT * INTO STRICT v_predecessor
+  FROM public.forge_epic_172_release_evidence
+  WHERE id = (p_predecessor_receipt_ids ->> 0)::uuid;
+  SELECT * INTO STRICT v_authorization
+  FROM public.forge_epic_172_transition_authorizations
+  WHERE id = p_authorization_id;
+  SELECT * INTO STRICT v_predecessor_key
+  FROM public.forge_release_signer_keys WHERE id = v_predecessor.signer_key_id;
+  SELECT * INTO STRICT v_authorization_key
+  FROM public.forge_release_signer_keys WHERE id = v_authorization.signer_key_id;
+  SELECT * INTO STRICT v_output_key
+  FROM public.forge_release_signer_keys WHERE id = p_signer_key_id;
+
+  IF v_predecessor.evidence_kind <> 'step0_retention_bridge'
+     OR v_authorization.target_node <> 's3_issue_178'
+     OR v_authorization.source_receipt_ids <> p_predecessor_receipt_ids
+     OR v_authorization.source_receipt_set_digest <> p_predecessor_set_digest
+     OR v_authorization.transition_identity_digest <> p_transition_identity_digest
+     OR v_authorization.owner_issue <> 178
+     OR v_authorization.owner_slice <> 's3'
+     OR v_authorization.exact_builds <> p_exact_builds
+     OR v_authorization.reviewed_sha <> p_reviewed_sha
+     OR v_authorization.epoch IS NOT NULL
+     OR v_authorization.operation <> 'record_s3_receipt'
+     OR v_authorization.controller_run_id <> p_controller_run_id
+     OR p_owner_issue <> 178
+     OR p_owner_slice <> 's3'
+     OR p_epoch IS NOT NULL
+     OR jsonb_typeof(p_exact_builds) <> 'array'
+     OR jsonb_array_length(p_exact_builds) <> 1
+     OR (p_exact_builds ->> 0) NOT LIKE 'issue_178_s3@%'
+     OR pg_catalog.length(p_exact_builds ->> 0) <= pg_catalog.length('issue_178_s3@') THEN
+    RAISE EXCEPTION 'The S3 receipt, Step 0 predecessor, and authorization are not one exact transition'
+      USING ERRCODE = '22023';
+  END IF;
+  IF jsonb_typeof(p_required_evidence) <> 'array'
+     OR jsonb_array_length(p_required_evidence) <> pg_catalog.cardinality(v_expected_evidence_names)
+     OR EXISTS (
+       SELECT 1
+       FROM jsonb_array_elements(p_required_evidence) WITH ORDINALITY AS claim(value, ordinal)
+       WHERE jsonb_typeof(claim.value) <> 'object'
+          OR claim.value <> pg_catalog.jsonb_build_object(
+            'name', claim.value -> 'name',
+            'measurementDigest', claim.value -> 'measurementDigest'
+          )
+          OR claim.value ->> 'name' IS DISTINCT FROM v_expected_evidence_names[claim.ordinal::integer]
+          OR (claim.value ->> 'measurementDigest' ~ '^[0-9a-f]{64}$') IS NOT TRUE
+     ) THEN
+    RAISE EXCEPTION 'The S3 required-evidence measurements do not match the exact manifest contract'
+      USING ERRCODE = '22023';
+  END IF;
+  IF v_predecessor.signer_generation <> v_predecessor_key.generation
+     OR v_predecessor.github_app_id <> v_predecessor_key.github_app_id
+     OR v_predecessor.issued_at < v_predecessor_key.valid_from
+     OR v_predecessor.issued_at >= v_predecessor_key.valid_until
+     OR (v_predecessor_key.retirement_started_at IS NOT NULL
+       AND v_predecessor.issued_at >= v_predecessor_key.retirement_started_at)
+     OR v_authorization.signer_generation <> v_authorization_key.generation
+     OR v_authorization.issued_at < v_authorization_key.valid_from
+     OR v_authorization.issued_at >= v_authorization_key.valid_until
+     OR (v_authorization_key.retirement_started_at IS NOT NULL
+       AND v_authorization.issued_at >= v_authorization_key.retirement_started_at)
+     OR v_now >= v_authorization.expires_at
+     OR v_output_key.policy_id <> 'forge-epic-172-release-signing-v1'
+     OR v_output_key.algorithm <> 'Ed25519'
+     OR v_output_key.generation <> p_signer_generation
+     OR v_output_key.github_app_id <> p_github_app_id
+     OR v_output_key.status <> 'active'
+     OR v_output_key.activated_at IS NULL
+     OR p_issued_at < v_output_key.valid_from
+     OR p_issued_at < v_output_key.activated_at
+     OR p_issued_at >= v_output_key.valid_until
+     OR p_issued_at > v_now
+     OR v_now >= v_output_key.valid_until THEN
+    RAISE EXCEPTION 'The S3 signer policy, retained signatures, or authorization lifetime is not valid'
+      USING ERRCODE = '22023';
+  END IF;
+
+  v_expected_envelope := pg_catalog.jsonb_build_object(
+    'envelopeVersion', 1,
+    'receiptId', p_receipt_id::text,
+    'manifestVersion', 1,
+    'evidenceKind', 's3_issue_178',
+    'owner', pg_catalog.jsonb_build_object('issue', p_owner_issue, 'slice', p_owner_slice),
+    'exactBuilds', p_exact_builds,
+    'requiredEvidence', p_required_evidence,
+    'reviewedSha', p_reviewed_sha,
+    'epoch', p_epoch,
+    'predecessorReceiptIds', p_predecessor_receipt_ids,
+    'predecessorSetDigest', p_predecessor_set_digest,
+    'transitionIdentityDigest', p_transition_identity_digest,
+    'signerKeyId', p_signer_key_id::text,
+    'signerGeneration', p_signer_generation,
+    'githubAppId', p_github_app_id,
+    'controllerRunId', p_controller_run_id,
+    'controllerJobId', p_controller_job_id,
+    'nonce', p_nonce::text,
+    'issuedAt', pg_catalog.to_char(p_issued_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+  );
+  IF p_envelope <> v_expected_envelope THEN
+    RAISE EXCEPTION 'The signed S3 envelope does not match its verified typed fields'
+      USING ERRCODE = '22023';
+  END IF;
+
+  INSERT INTO public.forge_epic_172_release_evidence_consumptions (
+    receipt_id, transition_identity_digest, authorization_id, consumer_node,
+    operation_id, actor, consumed_at
+  ) VALUES (
+    v_predecessor.id, v_predecessor.transition_identity_digest, p_authorization_id,
+    's3_issue_178', v_authorization.operation_id, v_authorization.controller_login_id, v_now
+  ) RETURNING id INTO v_consumption_id;
+
+  INSERT INTO public.forge_epic_172_release_evidence (
+    id, manifest_version, evidence_kind, owner_issue, owner_slice, exact_builds, required_evidence,
+    reviewed_sha, epoch, predecessor_receipt_ids, predecessor_set_digest,
+    transition_identity_digest, signer_key_id, signer_generation, github_app_id,
+    controller_run_id, controller_job_id, signature_domain, envelope_version,
+    envelope_digest, detached_signature, nonce, issued_at, recorded_at, envelope
+  ) VALUES (
+    p_receipt_id, 1, 's3_issue_178', p_owner_issue, p_owner_slice, p_exact_builds, p_required_evidence,
+    p_reviewed_sha, p_epoch, p_predecessor_receipt_ids, p_predecessor_set_digest,
+    p_transition_identity_digest, p_signer_key_id, p_signer_generation, p_github_app_id,
+    p_controller_run_id, p_controller_job_id, 'forge:epic-172-release-evidence:v1', 1,
+    p_envelope_digest, p_detached_signature, p_nonce, p_issued_at, v_now, p_envelope
+  );
+
+  UPDATE public.forge_epic_172_s3_release_state state_row
+  SET
+    state = 'complete',
+    state_fingerprint = p_transition_identity_digest,
+    predecessor_receipt_id = v_predecessor.id,
+    authorization_id = p_authorization_id,
+    evidence_receipt_id = p_receipt_id,
+    transition_identity_digest = p_transition_identity_digest,
+    completed_at = pg_catalog.clock_timestamp()
+  WHERE state_row.singleton_id = 's3_issue_178'
+    AND state_row.state = 'pending'
+    AND state_row.state_fingerprint = p_expected_state_fingerprint
+    AND pg_catalog.clock_timestamp() < v_authorization.expires_at
+    AND EXISTS (
+      SELECT 1
+      FROM public.forge_epic_172_release_evidence_consumptions consumption
+      WHERE consumption.id = v_consumption_id
+        AND consumption.receipt_id = v_predecessor.id
+        AND consumption.authorization_id = p_authorization_id
+        AND consumption.consumer_node = 's3_issue_178'
+    )
+  RETURNING state_row.completed_at INTO v_completed_at;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'S3 authorization expired or the final state compare-and-set was lost'
+      USING ERRCODE = '40001';
+  END IF;
+  RETURN QUERY SELECT p_receipt_id, v_consumption_id, v_completed_at;
+END;
+$$;
+--> statement-breakpoint
+-- Generic transitions remain available to later release nodes, but S3 cannot
+-- consume its predecessor outside the dedicated three-write completion path.
+CREATE OR REPLACE FUNCTION forge.consume_epic_172_release_evidence_v1(
+  p_receipt_id uuid,
+  p_authorization_id uuid,
+  p_consumer_node text,
+  p_transition_identity_digest text,
+  p_operation_id text
+)
+RETURNS TABLE (consumption_id uuid, consumed_at timestamptz)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_now timestamptz := pg_catalog.clock_timestamp();
+  v_receipt public.forge_epic_172_release_evidence%ROWTYPE;
+  v_authorization public.forge_epic_172_transition_authorizations%ROWTYPE;
+  v_receipt_key public.forge_release_signer_keys%ROWTYPE;
+  v_authorization_key public.forge_release_signer_keys%ROWTYPE;
+BEGIN
+  IF session_user <> 'forge_release_transition' THEN
+    RAISE EXCEPTION 'Epic 172 evidence consumption requires the dedicated transition login'
+      USING ERRCODE = '42501';
+  END IF;
+  IF p_consumer_node = 's3_issue_178' THEN
+    RAISE EXCEPTION 's3_issue_178 requires the dedicated S3 completion transaction'
+      USING ERRCODE = '42501';
+  END IF;
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended('forge:epic-172:consumption:receipt:' || p_receipt_id::text, 0)
+  );
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended('forge:epic-172:consumption:identity:' || p_transition_identity_digest || ':' || p_consumer_node, 0)
+  );
+  SELECT * INTO STRICT v_receipt
+  FROM public.forge_epic_172_release_evidence
+  WHERE id = p_receipt_id
+  FOR KEY SHARE;
+  SELECT * INTO STRICT v_authorization
+  FROM public.forge_epic_172_transition_authorizations
+  WHERE id = p_authorization_id
+  FOR KEY SHARE;
+  SELECT * INTO STRICT v_receipt_key
+  FROM public.forge_release_signer_keys
+  WHERE id = v_receipt.signer_key_id
+  FOR UPDATE;
+  IF v_authorization.signer_key_id = v_receipt.signer_key_id THEN
+    v_authorization_key := v_receipt_key;
+  ELSE
+    SELECT * INTO STRICT v_authorization_key
+    FROM public.forge_release_signer_keys
+    WHERE id = v_authorization.signer_key_id
+    FOR UPDATE;
+  END IF;
+  IF v_authorization.transition_identity_digest <> p_transition_identity_digest
+     OR v_authorization.target_node <> p_consumer_node
+     OR v_authorization.operation_id <> p_operation_id
+     OR NOT v_authorization.source_receipt_ids @> pg_catalog.jsonb_build_array(p_receipt_id::text)
+     OR v_authorization.controller_login_id = ''
+     OR v_receipt.signer_generation <> v_receipt_key.generation
+     OR v_authorization.signer_generation <> v_authorization_key.generation
+     OR v_receipt.github_app_id <> v_receipt_key.github_app_id
+     OR v_receipt.issued_at < v_receipt_key.valid_from
+     OR v_receipt.issued_at >= v_receipt_key.valid_until
+     OR (v_receipt_key.retirement_started_at IS NOT NULL AND v_receipt.issued_at >= v_receipt_key.retirement_started_at)
+     OR v_authorization.issued_at < v_authorization_key.valid_from
+     OR v_authorization.issued_at >= v_authorization_key.valid_until
+     OR (v_authorization_key.retirement_started_at IS NOT NULL AND v_authorization.issued_at >= v_authorization_key.retirement_started_at)
+     OR v_now >= v_authorization.expires_at THEN
+    RAISE EXCEPTION 'Epic 172 receipt and authorization are not an exact live transition binding'
+      USING ERRCODE = '22023';
+  END IF;
+  RETURN QUERY
+  INSERT INTO public.forge_epic_172_release_evidence_consumptions (
+    receipt_id, transition_identity_digest, authorization_id, consumer_node,
+    operation_id, actor, consumed_at
+  ) VALUES (
+    p_receipt_id, v_receipt.transition_identity_digest, p_authorization_id,
+    p_consumer_node, p_operation_id, v_authorization.controller_login_id, v_now
+  )
+  RETURNING id, forge_epic_172_release_evidence_consumptions.consumed_at;
+END;
+$$;
+--> statement-breakpoint
+REVOKE ALL ON FUNCTION forge.guard_epic_172_s3_evidence_insert_v1() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.guard_epic_172_s3_state_transition_v1() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.lock_epic_172_s3_completion_v1(uuid,uuid,uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.complete_epic_172_s3_release_v1(uuid,text,uuid,integer,text,jsonb,jsonb,text,bigint,jsonb,text,text,uuid,bigint,text,text,text,text,bytea,uuid,timestamptz,jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.consume_epic_172_release_evidence_v1(uuid,uuid,text,text,text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION forge.lock_epic_172_s3_completion_v1(uuid,uuid,uuid)
+  TO forge_release_transition;
+GRANT EXECUTE ON FUNCTION forge.complete_epic_172_s3_release_v1(uuid,text,uuid,integer,text,jsonb,jsonb,text,bigint,jsonb,text,text,uuid,bigint,text,text,text,text,bytea,uuid,timestamptz,jsonb)
+  TO forge_release_transition;
+GRANT EXECUTE ON FUNCTION forge.consume_epic_172_release_evidence_v1(uuid,uuid,text,text,text)
+  TO forge_release_transition;
+--> statement-breakpoint
+RESET ROLE;
+--> statement-breakpoint
+SELECT public.forge_finalize_epic_172_s3_owner_bootstrap_v1();

@@ -77,6 +77,11 @@ jobs:
           # The disposable CI database login owns this isolated PostgreSQL
           # service and is therefore the short-lived administrator here.
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+      - name: Bootstrap migration-0026 S3 release ownership
+        run: npm run protocol:bootstrap-epic-172-s3-release-owner
+        env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
       - name: Configure disposable release-principal passwords
         working-directory: .
         env:
@@ -118,7 +123,8 @@ jobs:
                   'forge_epic_172_transition_authorizations',
                   'forge_epic_172_release_evidence_consumptions',
                   'forge_epic_172_enablement_state',
-                  'forge_epic_172_enablement_transition_audits'
+                  'forge_epic_172_enablement_transition_audits',
+                  'forge_epic_172_s3_release_state'
                 ])
             LOOP
               EXECUTE format(
@@ -164,7 +170,8 @@ jobs:
               'public.forge_epic_172_transition_authorizations',
               'public.forge_epic_172_release_evidence_consumptions',
               'public.forge_epic_172_enablement_state',
-              'public.forge_epic_172_enablement_transition_audits'
+              'public.forge_epic_172_enablement_transition_audits',
+              'public.forge_epic_172_s3_release_state'
             ]) LOOP
               FOREACH release_privilege IN ARRAY ARRAY[
                 'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'

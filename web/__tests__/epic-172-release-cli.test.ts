@@ -7,10 +7,10 @@ import {
 
 describe('Epic 172 release CLI boundary', () => {
   it('inspects the exact release and retained-evidence foreign-key set', () => {
-    expect(EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS).toHaveLength(43)
-    expect(new Set(EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS)).toHaveProperty('size', 43)
+    expect(EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS).toHaveLength(46)
+    expect(new Set(EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS)).toHaveProperty('size', 46)
     expect(new Set(EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS.map((name) => name.slice(0, 63))))
-      .toHaveProperty('size', 43)
+      .toHaveProperty('size', 46)
     expect(EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS).toContain('tasks_project_id_projects_id_fk')
     expect(EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS).toContain(
       'forge_epic_172_release_evidence_signer_key_id_forge_release_signer_keys_id_fk',
@@ -24,6 +24,25 @@ describe('Epic 172 release CLI boundary', () => {
     expect(parseEpic172ReleaseCliArgs(['prepare-authorization', '--input', 'authorization.json'])).toEqual({
       command: 'prepare-authorization',
       options: { input: 'authorization.json' },
+    })
+    expect(parseEpic172ReleaseCliArgs([
+      'complete-s3',
+      '--authorization-id', '00000000-0000-4000-8000-000000000003',
+      '--build-sha', 'immutable-build',
+      '--controller-id', 'release-controller',
+      '--input', 's3-receipt.json',
+      '--operation-id', 's3-operation',
+      '--reviewed-sha', 'a'.repeat(40),
+    ])).toEqual({
+      command: 'complete-s3',
+      options: {
+        'authorization-id': '00000000-0000-4000-8000-000000000003',
+        'build-sha': 'immutable-build',
+        'controller-id': 'release-controller',
+        input: 's3-receipt.json',
+        'operation-id': 's3-operation',
+        'reviewed-sha': 'a'.repeat(40),
+      },
     })
     expect(parseEpic172ReleaseCliArgs([
       'rotate-signer',

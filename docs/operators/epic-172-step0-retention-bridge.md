@@ -56,10 +56,25 @@ evidence, and the external signer private key must never enter Forge.
    npm run protocol:bootstrap-epic-172-release-roles
    ```
 
+   If migration 0026 is in the deployment, install its separate, one-version S3
+   handoff before running migrations. This helper does not grant ownership yet.
+   Migration 0026 grants the migration login a non-inheriting owner membership,
+   uses it only through `SET LOCAL ROLE`, and revokes it before commit. Run this
+   command both on a fresh database and when Step 0 is already installed:
+
+   ```bash
+   FORGE_DATABASE_ADMIN_URL='postgresql://…' \
+   DATABASE_URL='postgresql://forge-migration@…' \
+   npm run protocol:bootstrap-epic-172-s3-release-owner
+   ```
+
 4. Run the normal migration as the migration login. Migration 0025 transfers the
    seven release tables and fixed-path routines to the `NOLOGIN NOINHERIT`
-   `forge_release_routines_owner`, then removes the migration login's temporary
-   membership before the transaction commits.
+   `forge_release_routines_owner`, then removes its temporary membership.
+   Migration 0026 briefly grants a new `INHERIT FALSE`, `SET TRUE`, `ADMIN FALSE`
+   membership to create the S3-only completion objects under that same owner. Its
+   versioned finalizer verifies the owner and exact routine grants, then removes
+   the membership and both helper grants before the transaction commits.
 
    ```bash
    DATABASE_URL='postgresql://forge-migration@…' npm run db:migrate
@@ -157,6 +172,28 @@ evidence, and the external signer private key must never enter Forge.
     `step0ReceiptCount` must be exactly one before S3 is allowed to consume a
     separately signed, unexpired transition authorization. Use
     `prepare-authorization` and `record-authorization` for that later handoff.
+
+    Once the S3 build and its five required measurements have been reviewed,
+    prepare and externally sign the `s3_issue_178` evidence envelope. Record the
+    authorization with the evidence-writer URL, then complete S3 with the
+    transition-only URL. `--build-sha` is the immutable suffix after
+    `issue_178_s3@` in the signed envelope; `--reviewed-sha`, controller ID, and
+    operation ID must exactly match the signed authorization.
+
+    ```bash
+    export FORGE_EPIC_172_TRANSITION_DATABASE_URL='postgresql://forge_release_transition@…'
+    npm run protocol:epic-172-release -- complete-s3 \
+      --authorization-id 00000000-0000-4000-8000-000000000003 \
+      --build-sha '<immutable-build-identity>' \
+      --controller-id release-controller \
+      --operation-id s3-install-2026-07-17 \
+      --reviewed-sha '<reviewed-commit-sha>' \
+      --input /outside-forge/s3-signed.json
+    ```
+
+    This command is the only S3 completion path. PostgreSQL either commits the
+    Step 0 consumption, final S3 state, and signed S3 receipt together, or leaves
+    all three unchanged.
 
 ## Rotate the external signer
 

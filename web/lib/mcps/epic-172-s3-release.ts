@@ -25,14 +25,31 @@ export type Epic172S3TransitionAdapter = {
     authorizationAttemptId: string
     buildSha: string
     controllerIdentity: string
+    operationId: string
     reviewedSha: string
   }) => Promise<{ receiptId: string }>
+}
+
+export function createEpic172S3PostgresTransitionAdapter(
+  input: Epic172SignedEnvelopeInput & Readonly<{ databaseUrl: string }>,
+): Epic172S3TransitionAdapter {
+  return {
+    consumeAuthorizationAndRecordS3: (transition) => completeEpic172S3ReleaseTransition({
+      ...input,
+      authorizationId: transition.authorizationAttemptId,
+      buildSha: transition.buildSha,
+      controllerIdentity: transition.controllerIdentity,
+      operationId: transition.operationId,
+      reviewedSha: transition.reviewedSha,
+    }),
+  }
 }
 
 export async function completeEpic172S3Release(input: {
   authorizationAttemptId: string
   buildSha: string
   controllerIdentity: string
+  operationId: string
   order: Epic172ReleaseOrderAdapter
   reviewedSha: string
   transition: Epic172S3TransitionAdapter
@@ -56,6 +73,11 @@ export async function completeEpic172S3Release(input: {
     authorizationAttemptId: input.authorizationAttemptId,
     buildSha: input.buildSha,
     controllerIdentity: input.controllerIdentity,
+    operationId: input.operationId,
     reviewedSha: input.reviewedSha,
   })
 }
+import {
+  completeEpic172S3ReleaseTransition,
+  type Epic172SignedEnvelopeInput,
+} from './epic-172-release-recorder'

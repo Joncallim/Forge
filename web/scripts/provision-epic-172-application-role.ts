@@ -15,6 +15,7 @@ const RELEASE_TABLES = [
   'public.forge_epic_172_release_evidence_consumptions',
   'public.forge_epic_172_enablement_state',
   'public.forge_epic_172_enablement_transition_audits',
+  'public.forge_epic_172_s3_release_state',
 ] as const
 
 const TABLE_PRIVILEGES = [

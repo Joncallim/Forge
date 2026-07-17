@@ -456,6 +456,51 @@ export const forgeEpic172ReleaseEvidenceConsumptions = pgTable(
 export type ForgeEpic172ReleaseEvidenceConsumption = InferSelectModel<typeof forgeEpic172ReleaseEvidenceConsumptions>
 export type NewForgeEpic172ReleaseEvidenceConsumption = InferInsertModel<typeof forgeEpic172ReleaseEvidenceConsumptions>
 
+export const forgeEpic172S3ReleaseState = pgTable(
+  'forge_epic_172_s3_release_state',
+  {
+    singletonId: text('singleton_id').primaryKey(),
+    state: text('state').notNull(),
+    stateFingerprint: text('state_fingerprint').notNull(),
+    predecessorReceiptId: uuid('predecessor_receipt_id')
+      .references(() => forgeEpic172ReleaseEvidence.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    authorizationId: uuid('authorization_id')
+      .references(() => forgeEpic172TransitionAuthorizations.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    evidenceReceiptId: uuid('evidence_receipt_id')
+      .references(() => forgeEpic172ReleaseEvidence.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    transitionIdentityDigest: text('transition_identity_digest'),
+    completedAt: timestamp('completed_at', tsOpts),
+  },
+  (t) => [
+    check('forge_epic_172_s3_release_state_singleton_chk', sql`${t.singletonId} = 's3_issue_178'`),
+    check('forge_epic_172_s3_release_state_state_chk', sql`${t.state} in ('pending', 'complete')`),
+    check('forge_epic_172_s3_release_state_fingerprint_chk', sql`${t.stateFingerprint} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_s3_release_state_tuple_chk', sql`
+      (
+        ${t.state} = 'pending'
+        and ${t.stateFingerprint} = '7a97eed28629c7d0d7c11a48d3509f1c479d614882dc61a7e2c1891f32c3a5dc'
+        and ${t.predecessorReceiptId} is null
+        and ${t.authorizationId} is null
+        and ${t.evidenceReceiptId} is null
+        and ${t.transitionIdentityDigest} is null
+        and ${t.completedAt} is null
+      ) or (
+        ${t.state} = 'complete'
+        and ${t.predecessorReceiptId} is not null
+        and ${t.authorizationId} is not null
+        and ${t.evidenceReceiptId} is not null
+        and ${t.evidenceReceiptId} <> ${t.predecessorReceiptId}
+        and ${t.transitionIdentityDigest} ~ '^[0-9a-f]{64}$'
+        and ${t.stateFingerprint} = ${t.transitionIdentityDigest}
+        and ${t.completedAt} is not null
+      )
+    `),
+  ],
+)
+
+export type ForgeEpic172S3ReleaseState = InferSelectModel<typeof forgeEpic172S3ReleaseState>
+export type NewForgeEpic172S3ReleaseState = InferInsertModel<typeof forgeEpic172S3ReleaseState>
+
 export const forgeEpic172EnablementState = pgTable(
   'forge_epic_172_enablement_state',
   {
