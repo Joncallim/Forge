@@ -21,6 +21,13 @@ evidence, and the external signer private key must never enter Forge.
 - Keep the ordinary Forge application URL available to the provisioning command.
   The command uses that connection only to derive the real application login; it
   never prints the URL or its credentials.
+- If an older installation uses one PostgreSQL login for both migrations and the
+  running application, split those duties before this maintenance window. Create
+  an ordinary `LOGIN NOINHERIT` application role and give it only the normal Forge
+  table and sequence access required by your deployment. Do not give it ownership,
+  schema creation rights, a release role, or direct release-table access. The
+  release-reader provisioning command below deliberately does not create the role
+  or widen its normal application privileges.
 - Treat that administrator as a trusted maintenance principal. The bootstrap checks
   the exact release-role attributes, memberships, and release-object ownership it
   manages. It does not audit or repair unrelated pre-existing PostgreSQL roles,
