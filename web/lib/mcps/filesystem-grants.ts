@@ -562,10 +562,5 @@ export const FILESYSTEM_GRANT_BLOCK_METADATA_KEY = 'mcpGrantBlock'
 export function isFilesystemGrantBlockedPackageMetadata(metadata: unknown): boolean {
   if (!isRecord(metadata)) return false
   const marker = metadata[FILESYSTEM_GRANT_BLOCK_METADATA_KEY]
-  return parseFilesystemGrantBlockMetadata(marker) !== null || (
-    isRecord(marker) &&
-    marker.source === 'filesystem-grant-approval' &&
-    marker.status === 'failed' &&
-    marker.schemaVersion !== 2
-  )
+  return parseFilesystemGrantBlockMetadata(marker) !== null
 }

@@ -71,6 +71,7 @@ test.describe('task detail operator controls', () => {
     await expect(page.getByText('Cancelled', { exact: true }).first()).toBeVisible()
     await expect(page.getByRole('button', { name: 'Stop' })).toHaveCount(0)
     await expect(page.getByRole('button', { name: 'Delete' })).toHaveCount(0)
+    await expect(page.getByText('Task history is retained for audit.')).toBeVisible()
     await expect(page).toHaveURL(new RegExp(`/dashboard/tasks/${taskId}$`))
   })
 

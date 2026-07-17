@@ -216,13 +216,36 @@ describe('requiresFilesystemGrantApproval', () => {
 })
 
 describe('isFilesystemGrantBlockedPackageMetadata', () => {
-  it('recognises the handoff grant-block marker', () => {
+  it('recognises only the strict S3 marker and rejects legacy or placeholder S4 shapes', () => {
+    expect(isFilesystemGrantBlockedPackageMetadata({
+      mcpGrantBlock: {
+        schemaVersion: 2,
+        kind: 'filesystem_grant',
+        source: 'filesystem-grant-approval',
+        taskDisposition: 'operator_hold',
+        autoRetryable: false,
+        terminalFailure: false,
+        requirementKeys: ['r1'],
+        requestedCapabilities: ['filesystem.project.read'],
+        recoveryAction: 'approve_project_filesystem_context',
+        blockFingerprint: `sha256:${'0'.repeat(64)}`,
+        blockedAt: '2026-07-17T00:00:00.000Z',
+        holdKind: 'approval_required',
+        grantPhase: 'not_issued',
+        grantConsumed: false,
+        grantDecisionRevision: null,
+        revocationReason: null,
+      },
+    })).toBe(true)
     expect(isFilesystemGrantBlockedPackageMetadata({
       mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' },
-    })).toBe(true)
-  })
-
-  it('rejects metadata without the marker or from another source', () => {
+    })).toBe(false)
+    expect(isFilesystemGrantBlockedPackageMetadata({
+      operatorHold: { schemaVersion: 2, kind: 'integrity', taskDisposition: 'operator_hold' },
+    })).toBe(false)
+    expect(isFilesystemGrantBlockedPackageMetadata({
+      mcpPacketBlock: { schemaVersion: 2, kind: 'packet_issuance', taskDisposition: 'operator_hold' },
+    })).toBe(false)
     expect(isFilesystemGrantBlockedPackageMetadata({})).toBe(false)
     expect(isFilesystemGrantBlockedPackageMetadata(null)).toBe(false)
     expect(isFilesystemGrantBlockedPackageMetadata({ mcpGrantBlock: { source: 'other' } })).toBe(false)

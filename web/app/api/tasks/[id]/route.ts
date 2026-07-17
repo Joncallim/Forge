@@ -279,7 +279,7 @@ export async function DELETE(
         )
       }
       return NextResponse.json(
-        { error: 'Task deletion is disabled because Forge retains task, run, and review evidence. The terminal task remains available in history.' },
+        { error: 'Task deletion is disabled because Forge retains task, run, review, and immutable filesystem-grant evidence. The terminal task remains available in history.' },
         { status: 409 },
       )
     }

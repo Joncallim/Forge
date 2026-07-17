@@ -591,6 +591,11 @@ export function readEffectiveGrantState(
     const parsedGrantCapabilities = grantCapabilities(effective.grants)
     if (!parsedGrantCapabilities.valid) return noGrant()
     const coveredCapabilities = parsedGrantCapabilities.capabilities
+    if (
+      validProjectGrant &&
+      covers(projectCovered, required) &&
+      BigInt(projectDecisionRevision!) > BigInt(localDecisionRevision)
+    ) return projectResult()
     if (coveredCapabilities.length > 0) {
       return {
         phase: 'approved',
@@ -603,6 +608,25 @@ export function readEffectiveGrantState(
         grantDecisionRevision: localDecisionRevision,
         rootBindingRevision: localRootRevision,
       }
+    }
+  }
+
+  if (
+    projectDecision?.decision === 'approved' &&
+    projectDecisionRevision !== null &&
+    projectRootRevision !== null &&
+    currentRootRevision !== null &&
+    projectRootRevision !== currentRootRevision
+  ) {
+    return {
+      phase: 'revoked',
+      source: 'project-level',
+      status: 'not_issued',
+      coveredCapabilities: [],
+      grantApprovalId: projectDecision.decisionId,
+      grantDecisionRevision: projectDecisionRevision,
+      rootBindingRevision: projectRootRevision,
+      revocationReason: 'project_root_repoint',
     }
   }
 

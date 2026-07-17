@@ -4657,6 +4657,11 @@ export default function TaskDetailPage() {
                 Stop
               </Button>
             )}
+            {TERMINAL_TASK_STATUSES.has(effectiveTaskStatus) && (
+              <p className="text-xs text-muted-foreground">
+                Task history is retained for audit.
+              </p>
+            )}
           </div>
         </div>
 

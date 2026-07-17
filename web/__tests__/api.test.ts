@@ -16,6 +16,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { getTableName } from 'drizzle-orm'
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { canonicalS3Marker } from '../test-support/filesystem-grant-marker-fixtures'
 
 // ---------------------------------------------------------------------------
 // Module-level mocks
@@ -2757,11 +2758,11 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
     )
   })
 
-  it('retains a terminal task when mode=delete is requested', async () => {
+  it.each(['completed', 'failed', 'cancelled', 'rejected'])('retains a terminal %s task instead of reaching immutable grant-history foreign keys', async (status) => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect.mockReturnValue(chain([{
       id: 'task-delete',
-      status: 'completed',
+      status,
     }]))
 
     const { DELETE } = await import('@/app/api/tasks/[id]/route')
@@ -2772,7 +2773,7 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
 
     expect(res.status).toBe(409)
     const body = await res.json()
-    expect(body.error).toMatch(/retains task, run, and review evidence/i)
+    expect(body.error).toMatch(/retains task, run, review, and immutable filesystem-grant evidence/i)
     expect(mockDbDelete).not.toHaveBeenCalled()
   })
 
@@ -2795,7 +2796,7 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
     expect(mockDbDelete).not.toHaveBeenCalled()
   })
 
-  it('does not attempt a delete for any terminal task', async () => {
+  it('never reaches a terminal task delete because retention is unconditional', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbSelect.mockReturnValue(chain([{
       id: 'task-raced-delete',
@@ -2810,7 +2811,7 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
 
     expect(res.status).toBe(409)
     const body = await res.json()
-    expect(body.error).toMatch(/retains task, run, and review evidence/i)
+    expect(body.error).toMatch(/retains task, run, review, and immutable filesystem-grant evidence/i)
     expect(mockDbDelete).not.toHaveBeenCalled()
   })
 })
@@ -5299,6 +5300,16 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     }
   }
 
+  function strictGrantBlockMarker() {
+    return canonicalS3Marker({
+      holdKind: 'approval_required',
+      grantPhase: 'not_issued',
+      grantConsumed: false,
+      grantDecisionRevision: null,
+      revocationReason: null,
+    })
+  }
+
   function mockTaskGrantTransactionLocks(input: {
     packages: Array<Record<string, unknown>>
     project: Record<string, unknown>
@@ -5315,8 +5326,11 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       taskId: pkg.taskId,
       workPackageId: pkg.id,
       currentDecisionId: null,
+      currentDecisionTaskId: null,
+      currentDecisionWorkPackageId: null,
       currentDecisionRevision: null,
-      pointerFingerprint: `sha256:${'0'.repeat(64)}`,
+      currentDecisionFingerprint: null,
+      pointerFingerprint: `empty:${String(pkg.id)}`,
       pointerVersion: BigInt(0),
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -5387,6 +5401,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         insert: transactionInsert,
         update: transactionUpdate,
         delete: mockDbDelete,
+        execute: vi.fn(async () => [{ now: '2026-07-03 00:01:00+00' }]),
       }),
     )
     return { projectUpdate }
@@ -5594,10 +5609,10 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     await withFilesystemProject(async (project, filesystemPath) => {
       const failedPkg = {
         ...grantPackage({
-          mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' },
+          mcpGrantBlock: strictGrantBlockMarker(),
         }),
         blockedReason: 'Missing filesystem grant.',
-        status: 'failed',
+        status: 'blocked',
       }
       const recoveredPkg = { ...failedPkg, blockedReason: null, status: 'ready' }
       const packageUpdate = chain([recoveredPkg])
@@ -5662,10 +5677,10 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     await withFilesystemProject(async (project, filesystemPath) => {
       const failedPkg = {
         ...grantPackage({
-          mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' },
+          mcpGrantBlock: strictGrantBlockMarker(),
         }),
         blockedReason: 'Missing filesystem grant.',
-        status: 'failed',
+        status: 'blocked',
       }
       const recoveredPkg = { ...failedPkg, blockedReason: null, status: 'ready' }
       const packageUpdate = chain([recoveredPkg])
@@ -5963,16 +5978,9 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     await withFilesystemProject(async (project, filesystemPath) => {
       const failedPkg = {
         ...grantPackage({
-          mcpGrantBlock: {
-            blockedAt: '2026-07-03T00:00:30.000Z',
-            missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            reason: 'Work package "Read project files" requires filesystem grant approval.',
-            requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            source: 'filesystem-grant-approval',
-            status: 'failed',
-          },
+          mcpGrantBlock: strictGrantBlockMarker(),
         }),
-        status: 'failed',
+        status: 'blocked',
         blockedReason: 'Work package "Read project files" requires filesystem grant approval.',
       }
       const recoveredPkg = { ...failedPkg, blockedReason: null, status: 'ready' }
@@ -6057,16 +6065,9 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
 
     const failedPkg = {
       ...grantPackage({
-        mcpGrantBlock: {
-          blockedAt: '2026-07-03T00:00:30.000Z',
-          missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-          reason: 'Work package "Read project files" requires filesystem grant approval.',
-          requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-          source: 'filesystem-grant-approval',
-          status: 'failed',
-        },
+        mcpGrantBlock: strictGrantBlockMarker(),
       }),
-      status: 'failed',
+      status: 'blocked',
       blockedReason: 'Work package "Read project files" requires filesystem grant approval.',
     }
     const deniedPkg = {
@@ -6141,14 +6142,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     await withFilesystemProject(async (project, filesystemPath) => {
       const blockedPkg = {
         ...grantPackage({
-          mcpGrantBlock: {
-            blockedAt: '2026-07-03T00:00:30.000Z',
-            missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            reason: 'Work package "Read project files" requires filesystem grant approval.',
-            requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            source: 'filesystem-grant-approval',
-            status: 'failed',
-          },
+          mcpGrantBlock: strictGrantBlockMarker(),
         }),
         status: 'blocked',
         blockedReason: 'Filesystem grant denied by operator; execution remains blocked.',
@@ -6233,16 +6227,9 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     await withFilesystemProject(async (project, filesystemPath) => {
       const failedPkg = {
         ...grantPackage({
-          mcpGrantBlock: {
-            blockedAt: '2026-07-03T00:00:30.000Z',
-            missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            reason: 'Work package "Read project files" requires filesystem grant approval.',
-            requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            source: 'filesystem-grant-approval',
-            status: 'failed',
-          },
+          mcpGrantBlock: strictGrantBlockMarker(),
         }),
-        status: 'failed',
+        status: 'blocked',
         blockedReason: 'Work package "Read project files" requires filesystem grant approval.',
       }
       const recoveredPkg = { ...failedPkg, blockedReason: null, status: 'ready' }
@@ -6266,7 +6253,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([failedPkg]))
         .mockReturnValueOnce(chain([{
           status: 'failed',
-          metadata: { mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' } },
+          metadata: {},
         }]))
       mockTaskGrantTransactionLocks({
         packages: [
@@ -6324,16 +6311,9 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     await withFilesystemProject(async (project, filesystemPath) => {
       const failedPkg = {
         ...grantPackage({
-          mcpGrantBlock: {
-            blockedAt: '2026-07-03T00:00:30.000Z',
-            missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            reason: 'Work package "Read project files" requires filesystem grant approval.',
-            requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            source: 'filesystem-grant-approval',
-            status: 'failed',
-          },
+          mcpGrantBlock: strictGrantBlockMarker(),
         }),
-        status: 'failed',
+        status: 'blocked',
         blockedReason: 'Work package "Read project files" requires filesystem grant approval.',
       }
       const recoveredPkg = { ...failedPkg, blockedReason: null, status: 'ready' }
@@ -6357,7 +6337,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         .mockReturnValueOnce(chain([failedPkg]))
         .mockReturnValueOnce(chain([{
           status: 'blocked',
-          metadata: { mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' } },
+          metadata: { mcpGrantBlock: strictGrantBlockMarker() },
         }]))
       mockTaskGrantTransactionLocks({
         packages: [
@@ -6366,7 +6346,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
             ...grantPackage(),
             id: '00000000-0000-4000-8000-000000000212',
             status: 'blocked',
-            metadata: { mcpGrantBlock: { source: 'filesystem-grant-approval', status: 'failed' } },
+            metadata: { mcpGrantBlock: strictGrantBlockMarker() },
           },
         ],
         project,
@@ -6453,16 +6433,9 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     await withFilesystemProject(async (project, filesystemPath) => {
       const failedPkg = {
         ...grantPackage({
-          mcpGrantBlock: {
-            blockedAt: '2026-07-03T00:00:30.000Z',
-            missingCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            reason: 'Work package "Read project files" requires filesystem grant approval.',
-            requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-            source: 'filesystem-grant-approval',
-            status: 'failed',
-          },
+          mcpGrantBlock: strictGrantBlockMarker(),
         }),
-        status: 'failed',
+        status: 'blocked',
         blockedReason: 'Work package "Read project files" requires filesystem grant approval.',
       }
       const recoveredPkg = { ...failedPkg, blockedReason: null, status: 'ready' }

@@ -2478,6 +2478,58 @@ describe('readEffectiveGrantState', () => {
     )).toMatchObject({ phase: 'none', status: 'not_issued' })
   })
 
+  it('lets a newer complete project decision recover a consumed allow-once decision', () => {
+    const state = readEffectiveGrantState({
+      metadata: {
+        mcpGrantPhases: {
+          effective: {
+            schemaVersion: 2,
+            phase: 'effective',
+            source: 'explicit-grant-approval',
+            runtimeEnforcement: 'bounded_context_packet',
+            status: 'consumed',
+            grantMode: 'allow_once',
+            runtimeIssued: true,
+            grantDecisionRevision: '1',
+            rootBindingRevision: '1',
+            grants: [{
+              mcpId: 'filesystem',
+              status: 'approved',
+              capabilities: ['filesystem.project.read'],
+            }],
+          },
+        },
+      },
+    }, {
+      filesystemGrantDecision: {
+        schemaVersion: 2,
+        decisionId: 'project-decision-2',
+        projectId: 'project-1',
+        decision: 'approved',
+        capabilities: ['filesystem.project.read'],
+        grantDecisionRevision: '2',
+        rootBindingRevision: '1',
+        decisionFingerprint: `sha256:${'2'.repeat(64)}`,
+        decisionGeneration: '1',
+        decidedAt: '2026-07-17T00:00:00.000Z',
+        decidedBy: 'user-1',
+        reason: 'Recover consumed package authority.',
+        revocationReason: null,
+      },
+      mcpConfig: {},
+      rootBindingRevision: '1',
+    }, ['filesystem.project.read'])
+
+    expect(state).toMatchObject({
+      grantApprovalId: 'project-decision-2',
+      grantDecisionRevision: '2',
+      grantMode: 'always_allow',
+      phase: 'approved',
+      source: 'project-level',
+    })
+    expect(state).not.toHaveProperty('consumed')
+  })
+
   it('keeps a narrowed project grant approved when it still covers this requirement', () => {
     const pkg = {
       metadata: {
@@ -2571,6 +2623,35 @@ describe('readEffectiveGrantState', () => {
         revocationReason: 'project_root_repoint',
       })
     }
+  })
+
+  it('retains the old project decision revision as negative authority after root repoint', () => {
+    expect(readEffectiveGrantState({ metadata: {} }, {
+      filesystemGrantDecision: {
+        schemaVersion: 2,
+        decisionId: 'old-root-project-decision',
+        projectId: 'project-1',
+        decision: 'approved',
+        capabilities: ['filesystem.project.read'],
+        grantDecisionRevision: '7',
+        rootBindingRevision: '3',
+        decisionFingerprint: `sha256:${'7'.repeat(64)}`,
+        decisionGeneration: '4',
+        decidedAt: '2026-07-17T00:00:00.000Z',
+        decidedBy: 'user-1',
+        reason: 'Old-root authority.',
+        revocationReason: null,
+      },
+      mcpConfig: {},
+      rootBindingRevision: '4',
+    }, ['filesystem.project.read'])).toMatchObject({
+      phase: 'revoked',
+      source: 'project-level',
+      grantApprovalId: 'old-root-project-decision',
+      grantDecisionRevision: '7',
+      rootBindingRevision: '3',
+      revocationReason: 'project_root_repoint',
+    })
   })
 
   it('allows only a later covering project grant to supersede a package denial', () => {

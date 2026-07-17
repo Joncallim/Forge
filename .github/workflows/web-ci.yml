@@ -207,6 +207,22 @@ jobs:
           FORGE_EPIC_172_TEST_TRANSITION_DATABASE_URL: postgresql://forge_release_transition:forge_transition_test@localhost:5432/forge_epic_172_ci_test
       - run: npm run build
       - run: npx playwright install chromium
+      - name: Run mandatory S3 PostgreSQL concurrency proof
+        env:
+          RUN_FORGE_POSTGRES_TESTS: '1'
+        run: |
+          set -o pipefail
+          report="$(mktemp)"
+          npx playwright test e2e/filesystem-grant-lifecycle-concurrency.spec.ts \
+            --project=chromium-desktop --workers=1 --reporter=line | tee "$report"
+          if grep -Eq '[1-9][0-9]* skipped' "$report"; then
+            echo 'The mandatory S3 PostgreSQL concurrency proof was skipped.' >&2
+            exit 1
+          fi
+          if ! grep -Eq '[1-9][0-9]* passed' "$report"; then
+            echo 'The mandatory S3 PostgreSQL concurrency proof did not report a passing test.' >&2
+            exit 1
+          fi
       - name: Prove Epic 172 Step 0 disabled ingress and mixed-lock recovery
         run: npm run e2e:epic-172-disabled-ingress
       - name: Run the fail-closed Epic 172 Step 0 E2E bridge suite

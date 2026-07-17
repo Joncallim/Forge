@@ -6,6 +6,11 @@ import {
   parseFilesystemGrantHoldState,
   type FilesystemGrantHoldState,
 } from '@/lib/mcps/filesystem-grant-lifecycle'
+import {
+  canonicalS3Marker,
+  INVALID_S3_MARKERS,
+  VALID_S3_HOLD_STATES,
+} from '../test-support/filesystem-grant-marker-fixtures'
 
 const REVISION = canonicalPositiveDecisionRevision('12')!
 
@@ -54,6 +59,14 @@ describe('filesystem grant lifecycle', () => {
       rootBindingRevision: '7',
     }).blockFingerprint).toBe(marker.blockFingerprint)
     expect(parseFilesystemGrantBlockMetadata({ ...marker, reason: 'not canonical' })).toBeNull()
+  })
+
+  it.each(VALID_S3_HOLD_STATES)('accepts the shared SQL/TypeScript marker arm $holdKind/$grantPhase', (hold) => {
+    expect(parseFilesystemGrantBlockMetadata(canonicalS3Marker(hold))).not.toBeNull()
+  })
+
+  it.each(INVALID_S3_MARKERS)('rejects the shared SQL/TypeScript marker fixture: $label', ({ marker }) => {
+    expect(parseFilesystemGrantBlockMetadata(marker)).toBeNull()
   })
 
   it.each(['0', '00', '01', '-1', '1.0', ' 1', 1, null])('rejects non-canonical revision %j', (value) => {

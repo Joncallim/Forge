@@ -59,6 +59,12 @@ import {
 import { defaultOnFeatureFlagEnabled } from './feature-flags'
 import { sanitizeWorkerMessage } from './redaction'
 import { recordTaskLogBestEffort } from './task-logs'
+import {
+  executionLeaseIsStale,
+  parseExecutionLeaseMetadata,
+  staleRunningPackageSeconds,
+  type ExecutionLease,
+} from './execution-lease'
 
 type HandoffPackage = {
   id: string
@@ -90,7 +96,6 @@ type WorkPackageLeaseTransaction = Parameters<Parameters<typeof db.transaction>[
 
 const MAX_PRIOR_REVIEW_SOURCE_ARTIFACTS = 10
 const MAX_PRIOR_REVIEW_SOURCE_ARTIFACT_BYTES = 2 * 1024
-const DEFAULT_STALE_RUNNING_PACKAGE_SECONDS = 15 * 60
 const DEFAULT_EXECUTION_LEASE_HEARTBEAT_SECONDS = 60
 
 class ExecutionLeaseLostError extends Error {
@@ -105,15 +110,6 @@ class RepositoryEvidenceBlockedError extends Error {
     super(message)
     this.name = 'RepositoryEvidenceBlockedError'
   }
-}
-
-type ExecutionLease = {
-  acquiredAt: string
-  attemptNumber: number
-  heartbeatAt: string
-  runId: string
-  source: 'work-package-handoff'
-  staleAfterSeconds: number
 }
 
 type HandoffOptions = {
@@ -613,15 +609,6 @@ export function isWorkPackageExecutionEnabled(
   return defaultOnFeatureFlagEnabled(env.FORGE_WORK_PACKAGE_EXECUTION)
 }
 
-function staleRunningPackageSeconds(
-  env: Record<string, string | undefined> = process.env,
-): number {
-  const raw = env.FORGE_RUNNING_WORK_PACKAGE_STALE_SECONDS?.trim()
-  if (!raw) return DEFAULT_STALE_RUNNING_PACKAGE_SECONDS
-  const parsed = Number(raw)
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_STALE_RUNNING_PACKAGE_SECONDS
-}
-
 function executionLeaseHeartbeatSeconds(
   env: Record<string, string | undefined> = process.env,
 ): number {
@@ -636,26 +623,8 @@ function staleRunningPackageCutoff(now = new Date()): Date {
 }
 
 function executionLeaseFromMetadata(metadata: unknown): ExecutionLease | null {
-  if (!isRecord(metadata) || !isRecord(metadata.executionLease)) return null
-  const lease = metadata.executionLease
-  if (
-    typeof lease.runId !== 'string' ||
-    typeof lease.attemptNumber !== 'number' ||
-    typeof lease.acquiredAt !== 'string' ||
-    typeof lease.heartbeatAt !== 'string'
-  ) {
-    return null
-  }
-  return {
-    acquiredAt: lease.acquiredAt,
-    attemptNumber: lease.attemptNumber,
-    heartbeatAt: lease.heartbeatAt,
-    runId: lease.runId,
-    source: 'work-package-handoff',
-    staleAfterSeconds: typeof lease.staleAfterSeconds === 'number'
-      ? lease.staleAfterSeconds
-      : staleRunningPackageSeconds(),
-  }
+  const parsed = parseExecutionLeaseMetadata(metadata)
+  return parsed.state === 'valid' ? parsed.lease : null
 }
 
 function metadataWithoutExecutionLease(metadata: unknown): Record<string, unknown> {
@@ -685,8 +654,10 @@ function executionLeaseMetadata(input: {
 
 function isStaleRunningPackage(pkg: HandoffPackage, now = new Date()): boolean {
   if (pkg.status !== 'running') return false
-  const lease = executionLeaseFromMetadata(pkg.metadata)
-  const heartbeatAt = lease ? new Date(lease.heartbeatAt) : pkg.updatedAt
+  const parsed = parseExecutionLeaseMetadata(pkg.metadata)
+  if (parsed.state === 'malformed') return false
+  if (parsed.state === 'valid') return executionLeaseIsStale(parsed.lease, now)
+  const heartbeatAt = pkg.updatedAt
   return heartbeatAt instanceof Date &&
     Number.isFinite(heartbeatAt.getTime()) &&
     heartbeatAt.getTime() <= staleRunningPackageCutoff(now).getTime()
@@ -1042,7 +1013,7 @@ function architectReservedHandoffBlockedReason(pkg: HandoffPackage): string | nu
 // effective filesystem grant) would let the package be claimed and run, and the
 // executor would throw a guaranteed "context blocked" error on every attempt —
 // burning the whole implementation attempt budget on failed runs and leaving no
-// budget for the corrected run after the operator approves the grant. Failing
+// budget for the corrected run after the operator approves the grant. Holding
 // here creates no agent run and consumes no attempt, so the recovery run starts
 // fresh at attempt 1 once the grant is approved.
 async function failWorkPackageForFilesystemGrant(input: {
@@ -1058,15 +1029,7 @@ async function failWorkPackageForFilesystemGrant(input: {
   | { blockedReason: string; status: 'blocked'; taskDisposition: 'operator_hold' }
   | { pkg: HandoffPackage; status: 'conflict' }
 > {
-  const failedAt = new Date()
-  const grantBlockMarker = buildFilesystemGrantBlockMetadata({
-    blockedAt: failedAt,
-    hold: input.holdState,
-    requirementKeys: input.requirementKeys,
-    requestedCapabilities: canonicalFilesystemProjectCapabilities(input.missingCapabilities),
-    rootBindingRevision: input.project.rootBindingRevision.toString(),
-  })
-  const failedRow = await db.transaction(async (tx) => {
+  const failedResult = await db.transaction(async (tx) => {
     assertMcpAdmissionLockSequence(['project', 'tasks:id-ascending', 'work-packages:id-ascending'])
     const [lockedProject] = await tx
       .select({
@@ -1090,6 +1053,17 @@ async function failWorkPackageForFilesystemGrant(input: {
       .for('update')
     const lockedPackage = siblings.find((pkg) => pkg.id === input.pkg.id)
     if (!lockedPackage || !mcpPackageSnapshotsMatch(input.pkg, lockedPackage)) return null
+    const [clock] = await tx.execute(sql<{ now: string }>`select transaction_timestamp()::text as now`)
+    const clockValue = (clock as { now?: unknown } | undefined)?.now
+    const failedAt = new Date(typeof clockValue === 'string' || clockValue instanceof Date ? clockValue : '')
+    if (!Number.isFinite(failedAt.getTime())) throw new Error('Database transaction clock is unavailable.')
+    const grantBlockMarker = buildFilesystemGrantBlockMetadata({
+      blockedAt: failedAt,
+      hold: input.holdState,
+      requirementKeys: input.requirementKeys,
+      requestedCapabilities: canonicalFilesystemProjectCapabilities(input.missingCapabilities),
+      rootBindingRevision: input.project.rootBindingRevision.toString(),
+    })
     const [row] = await tx
       .update(workPackages)
       .set({
@@ -1107,10 +1081,11 @@ async function failWorkPackageForFilesystemGrant(input: {
       siblings.map((pkg) => pkg.id === row.id ? row : pkg),
       failedAt,
     )
-    return row
+    return { failedAt, row }
   })
 
-  if (!failedRow) return { pkg: input.pkg, status: 'conflict' }
+  if (!failedResult) return { pkg: input.pkg, status: 'conflict' }
+  const { failedAt } = failedResult
 
   await publishTaskEvent(input.taskId, 'work_package:status', {
     blockedReason: input.blockedReason,

@@ -101,7 +101,16 @@ function boundedSortedStrings(value: unknown, maxItems: number): string[] | null
     output.add(item)
   }
   const result = [...output].sort()
-  return result.length === value.length ? result : null
+  return result.length === value.length && result.every((item, index) => item === value[index])
+    ? result
+    : null
+}
+
+function isCanonicalUtcTimestamp(value: unknown): value is string {
+  return typeof value === 'string' &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) &&
+    Number.isFinite(Date.parse(value)) &&
+    new Date(value).toISOString() === value
 }
 
 export function parseFilesystemGrantHoldState(value: unknown): FilesystemGrantHoldState | null {
@@ -189,8 +198,7 @@ export function parseFilesystemGrantBlockMetadata(
     row.autoRetryable !== false ||
     row.terminalFailure !== false ||
     row.recoveryAction !== 'approve_project_filesystem_context' ||
-    typeof row.blockedAt !== 'string' ||
-    !Number.isFinite(Date.parse(row.blockedAt)) ||
+    !isCanonicalUtcTimestamp(row.blockedAt) ||
     typeof row.blockFingerprint !== 'string' ||
     !/^sha256:[0-9a-f]{64}$/.test(row.blockFingerprint)
   ) return null

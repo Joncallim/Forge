@@ -5,7 +5,6 @@ import Redis from 'ioredis'
 import postgres from 'postgres'
 import type { BrowserContext, TestInfo } from '@playwright/test'
 import { seedAgentConfigs } from '../db/seed-agents'
-import { resolveDestructiveE2EEnvironment } from './destructive-environment'
 
 const root = path.resolve(__dirname, '..')
 const workerLogs = new WeakMap<ChildProcessWithoutNullStreams, string[]>()
@@ -33,22 +32,15 @@ export function getBaseUrl(): string {
   return process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
 }
 
-function installedE2EEnvironment() {
-  const environment = resolveDestructiveE2EEnvironment()
-  // Some Playwright hooks and dynamically imported seed modules run in a
-  // separate process. Install only the already-validated dedicated identities.
-  process.env.DATABASE_URL = environment.databaseUrl
-  process.env.REDIS_URL = environment.redisUrl
-  return environment
-}
-
 function sqlClient() {
-  const { databaseUrl } = installedE2EEnvironment()
+  const databaseUrl = process.env.DATABASE_URL
+  if (!databaseUrl) throw new Error('DATABASE_URL is required for E2E tests')
   return postgres(databaseUrl, { max: 1 })
 }
 
 function redisClient() {
-  const { redisUrl } = installedE2EEnvironment()
+  const redisUrl = process.env.REDIS_URL
+  if (!redisUrl) throw new Error('REDIS_URL is required for E2E tests')
   return new Redis(redisUrl, { maxRetriesPerRequest: 3 })
 }
 
@@ -128,11 +120,19 @@ export async function resetState(): Promise<void> {
   const redis = redisClient()
 
   try {
-    // Epic 172 retains project, task, and execution history even in the
-    // dedicated E2E database. Hide prior fixtures through the same archive
-    // boundary as the product, and clear only non-retained setup/session state.
-    // Random fixture identities keep retained rows isolated between tests.
+    // Epic 172 retains project, task, execution, and immutable grant history in
+    // the dedicated E2E database. Clear only the test-owned S3 authority graph,
+    // then hide prior project fixtures through the same archive boundary as the
+    // product. Random fixture identities isolate the retained rows.
     await sql.begin(async (tx) => {
+      await tx`
+        truncate table
+          filesystem_mcp_runtime_audits,
+          filesystem_mcp_current_decision_pointers,
+          filesystem_mcp_grant_approvals,
+          project_filesystem_current_decision_pointers,
+          project_filesystem_grant_decisions
+      `
       await tx`
         update projects
         set archived_at = coalesce(archived_at, now()), updated_at = now()

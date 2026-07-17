@@ -542,19 +542,11 @@ must not reconstruct precedence.
 
 ## Failed-package and marker compatibility
 
-The v2 marker above is authoritative. During a bounded migration window, a dual
-reader may also recognize the exact v1 marker
-`{source:'filesystem-grant-approval'}` and upgrade it on the next safe mutation.
-A historical `failed` package may be recovered only when that durable marker
-proves the failure was filesystem-grant-related, or when a versioned,
-fixture-backed legacy failure signature is converted once to the marker before
-recovery.
-
-The legacy signature must be exact, unable to match generic executor failures,
-and removed or disabled after the declared support window. Legacy decision rows
-without comparable revisions remain ambiguous and fail closed; migration must
-not backfill ordering from timestamps. Requirements alone, an error substring,
-or a human reason are never sufficient recovery evidence.
+Only the strict S3 version-2 marker above is grant-recovery authority. A loose
+version-1 source tag, an S4 placeholder object, requirements alone, an error
+substring, or a human reason cannot authorize recovery. Historical packages
+without the complete S3 marker remain ambiguous and fail closed; migration must
+not infer authority or decision order from timestamps.
 
 ## Mixed-version rollout and rollback
 

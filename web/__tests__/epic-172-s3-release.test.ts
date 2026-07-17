@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { completeEpic172S3Release } from '@/lib/mcps/epic-172-s3-release'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 
 function order(overrides: Partial<Parameters<typeof completeEpic172S3Release>[0]['order']> = {}) {
   return {
@@ -13,6 +15,19 @@ function order(overrides: Partial<Parameters<typeof completeEpic172S3Release>[0]
 }
 
 describe('Epic 172 S3 release seam', () => {
+  it('keeps the real PostgreSQL concurrency proof mandatory and single-project in CI', () => {
+    const workflow = readFileSync(
+      fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)),
+      'utf8',
+    )
+    expect(workflow).toContain('name: Run mandatory S3 PostgreSQL concurrency proof')
+    expect(workflow).toContain("RUN_FORGE_POSTGRES_TESTS: '1'")
+    expect(workflow).toContain('e2e/filesystem-grant-lifecycle-concurrency.spec.ts')
+    expect(workflow).toContain('--project=chromium-desktop --workers=1')
+    expect(workflow).toContain("grep -Eq '[1-9][0-9]* skipped'")
+    expect(workflow).toContain("if ! grep -Eq '[1-9][0-9]* passed'")
+  })
+
   it('delegates the atomic signed transition only after manifest ownership and predecessor checks', async () => {
     const consume = vi.fn().mockResolvedValue({ receiptId: 'receipt-s3' })
     await expect(completeEpic172S3Release({

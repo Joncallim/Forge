@@ -71,12 +71,11 @@ describe('task page retry handoff controls', () => {
     expect(canRetryHandoffForTaskStatus('awaiting_review', false)).toBe(false)
   })
 
-  it('shows stop for active tasks and retains every task history', () => {
+  it('shows stop only for active tasks and never offers deletion', () => {
     expect(canStopTaskStatus('running')).toBe(true)
     expect(canStopTaskStatus('approved')).toBe(true)
     expect(canStopTaskStatus('failed')).toBe(false)
     expect(canStopTaskStatus('cancelled')).toBe(false)
-
     expect(canDeleteTaskStatus('running')).toBe(false)
     expect(canDeleteTaskStatus('approved')).toBe(false)
     expect(canDeleteTaskStatus('failed')).toBe(false)

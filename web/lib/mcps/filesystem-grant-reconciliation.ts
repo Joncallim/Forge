@@ -19,7 +19,6 @@ import {
   canonicalFilesystemProjectCapabilities,
   FILESYSTEM_GRANT_BLOCK_METADATA_KEY,
   FILESYSTEM_MCP_ID,
-  isFilesystemGrantBlockedPackageMetadata,
   isRecord,
   projectFilesystemEffectivePhase,
   projectFilesystemGrantFromAuthority,
@@ -34,12 +33,15 @@ import {
   type ProjectFilesystemDecisionAuthority,
   type ProjectFilesystemDecisionRevocationReason,
 } from './filesystem-project-authority'
+import { executionLeaseBlocksConvergence } from '@/worker/execution-lease'
 
 type GrantTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0]
 type LockedProject = typeof projects.$inferSelect
 type LockedTask = typeof tasks.$inferSelect
 type LockedPackage = typeof workPackages.$inferSelect
 type ProjectDecisionPointer = typeof projectFilesystemCurrentDecisionPointers.$inferSelect
+type PackageDecisionPointer = typeof filesystemMcpCurrentDecisionPointers.$inferSelect
+type PackageDecision = typeof filesystemMcpGrantApprovals.$inferSelect
 
 function isEmptyProjectDecisionPointer(pointer: ProjectDecisionPointer): boolean {
   return pointer.currentDecisionId === null &&
@@ -65,6 +67,32 @@ function projectDecisionPointerParent(
     decision.decisionFingerprint === pointer.currentDecisionFingerprint &&
     decision.decisionGeneration === pointer.currentDecisionGeneration &&
     pointer.pointerGeneration === pointer.currentDecisionGeneration
+  )) ?? undefined
+}
+
+function packageDecisionPointerParent(
+  pointer: PackageDecisionPointer,
+  decisions: readonly PackageDecision[],
+): PackageDecision | null | undefined {
+  const emptyAdapter = pointer.currentDecisionId === null &&
+    pointer.currentDecisionTaskId === null &&
+    pointer.currentDecisionWorkPackageId === null &&
+    pointer.currentDecisionRevision === null &&
+    pointer.currentDecisionFingerprint === null &&
+    (
+      (pointer.pointerVersion === BigInt(0) && pointer.pointerFingerprint === `empty:${pointer.workPackageId}`) ||
+      (pointer.pointerVersion === BigInt(1) && /^legacy:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(pointer.pointerFingerprint))
+    )
+  if (emptyAdapter) return null
+  return decisions.find((decision) => (
+    decision.id === pointer.currentDecisionId &&
+    decision.taskId === pointer.currentDecisionTaskId &&
+    decision.workPackageId === pointer.currentDecisionWorkPackageId &&
+    decision.grantDecisionRevision === pointer.currentDecisionRevision &&
+    decision.pointerFingerprint === pointer.currentDecisionFingerprint &&
+    pointer.currentDecisionTaskId === pointer.taskId &&
+    pointer.currentDecisionWorkPackageId === pointer.workPackageId &&
+    pointer.currentDecisionFingerprint === pointer.pointerFingerprint
   )) ?? undefined
 }
 
@@ -100,35 +128,27 @@ export type FilesystemGrantMutationResult = {
 }
 
 const TASK_EDITABLE = new Set(['awaiting_approval', 'approved', 'running', 'failed'])
-const PACKAGE_EDITABLE = new Set(['pending', 'ready', 'blocked', 'needs_rework', 'failed'])
+const PACKAGE_EDITABLE = new Set(['pending', 'ready', 'blocked', 'needs_rework'])
 
 function httpError(message: string, status: number): Error {
   return Object.assign(new Error(message), { status })
 }
 
-function isLiveExecutionLease(pkg: LockedPackage): boolean {
-  if (pkg.status !== 'running' || !isRecord(pkg.metadata)) return false
-  const lease = isRecord(pkg.metadata.executionLease) ? pkg.metadata.executionLease : null
-  return Boolean(
-    lease &&
-    typeof lease.runId === 'string' &&
-    lease.runId.length > 0 &&
-    typeof lease.heartbeatAt === 'string',
-  )
+async function lockedTransactionNow(tx: GrantTransaction): Promise<Date> {
+  const [clock] = await tx.execute(sql<{ now: string }>`select transaction_timestamp()::text as now`)
+  const clockValue = (clock as { now?: unknown } | undefined)?.now
+  const now = new Date(typeof clockValue === 'string' || clockValue instanceof Date ? clockValue : '')
+  if (!Number.isFinite(now.getTime())) throw new Error('Database transaction clock is unavailable.')
+  return now
+}
+
+function isLiveExecutionLease(pkg: LockedPackage, now: Date): boolean {
+  return pkg.status === 'running' && executionLeaseBlocksConvergence(pkg.metadata, now)
 }
 
 function isRecognizedOperatorHold(pkg: LockedPackage): boolean {
   if (!isRecord(pkg.metadata)) return false
-  if (parseFilesystemGrantBlockMetadata(pkg.metadata[FILESYSTEM_GRANT_BLOCK_METADATA_KEY])) return true
-  for (const key of ['mcpPacketBlock', 'operatorHold']) {
-    const marker = isRecord(pkg.metadata[key]) ? pkg.metadata[key] : null
-    if (
-      marker?.schemaVersion === 2 &&
-      (marker.kind === 'packet_issuance' || marker.kind === 'integrity') &&
-      marker.taskDisposition === 'operator_hold'
-    ) return true
-  }
-  return false
+  return parseFilesystemGrantBlockMetadata(pkg.metadata[FILESYSTEM_GRANT_BLOCK_METADATA_KEY]) !== null
 }
 
 /**
@@ -143,7 +163,7 @@ export async function convergeOperatorHeldTask(
 ): Promise<boolean> {
   if (task.status !== 'running') return false
   if (!siblings.some(isRecognizedOperatorHold)) return false
-  if (siblings.some((pkg) => pkg.status === 'awaiting_review' || isLiveExecutionLease(pkg))) return false
+  if (siblings.some((pkg) => pkg.status === 'awaiting_review' || isLiveExecutionLease(pkg, now))) return false
   const [updated] = await tx
     .update(tasks)
     .set({ status: 'approved', errorMessage: null, updatedAt: now })
@@ -164,7 +184,7 @@ async function recoverLegacyFailedGrantTask(
     pkg.status === 'failed' ||
     pkg.status === 'blocked' ||
     pkg.status === 'awaiting_review' ||
-    isLiveExecutionLease(pkg)
+    isLiveExecutionLease(pkg, now)
   ))) return false
   const [updated] = await tx.update(tasks).set({
     errorMessage: null,
@@ -201,7 +221,7 @@ export async function convergeRecognizedOperatorHolds(limit = 100): Promise<numb
         .where(eq(workPackages.taskId, task.id))
         .orderBy(workPackages.id)
         .for('update')
-      return convergeOperatorHeldTask(tx, task, siblings)
+      return convergeOperatorHeldTask(tx, task, siblings, await lockedTransactionNow(tx))
     })
     if (changed) converged += 1
   }
@@ -222,7 +242,7 @@ export async function convergeRecognizedOperatorHoldTask(taskId: string): Promis
     if (!task) return false
     const siblings = await tx.select().from(workPackages)
       .where(eq(workPackages.taskId, task.id)).orderBy(workPackages.id).for('update')
-    return convergeOperatorHeldTask(tx, task, siblings)
+    return convergeOperatorHeldTask(tx, task, siblings, await lockedTransactionNow(tx))
   })
 }
 
@@ -363,6 +383,7 @@ async function appendProjectFilesystemDecision(input: {
     decisionFingerprint: fingerprint,
     decisionGeneration: generation,
     priorDecisionId: input.pointer.currentDecisionId,
+    priorDecisionProjectId: input.pointer.currentDecisionProjectId,
     priorDecisionRevision: input.pointer.currentDecisionRevision,
     priorRootBindingRevision: input.pointer.currentRootBindingRevision,
     priorDecisionFingerprint: input.pointer.currentDecisionFingerprint,
@@ -519,22 +540,18 @@ async function applyCanonicalProjection(input: {
       ? pkg.metadata[FILESYSTEM_GRANT_BLOCK_METADATA_KEY]
       : undefined
     const parsedMarker = parseFilesystemGrantBlockMetadata(existingMarker)
-    const exactV1Marker = isRecord(existingMarker) &&
-      existingMarker.source === 'filesystem-grant-approval' &&
-      existingMarker.status === 'failed' &&
-      existingMarker.schemaVersion !== 2
     const forcePersist = input.forcePackageIds?.has(pkg.id) === true
     const currentPhases = isRecord(pkg.metadata) && isRecord(pkg.metadata.mcpGrantPhases)
       ? pkg.metadata.mcpGrantPhases
       : undefined
 
     if (!check.blocked) {
-      if (!parsedMarker && !exactV1Marker && !forcePersist) continue
+      if (!parsedMarker && !forcePersist) continue
       const grant = projectFilesystemGrantFromAuthority(input.projectAuthority)
       const effective = grant
         ? phasesWithEffective(pkg.metadata, projectFilesystemEffectivePhase(grant))
         : forcePersist ? currentPhases : undefined
-      const recovering = Boolean(parsedMarker || exactV1Marker)
+      const recovering = Boolean(parsedMarker)
       const [updated] = await input.tx
         .update(workPackages)
         .set({
@@ -545,12 +562,10 @@ async function applyCanonicalProjection(input: {
             : pkg.status,
           updatedAt: input.now,
         })
-        .where(parsedMarker || exactV1Marker
+        .where(parsedMarker
           ? and(
               eq(workPackages.id, pkg.id),
-              parsedMarker
-                ? sql`${workPackages.metadata}->'mcpGrantBlock'->>'blockFingerprint' = ${parsedMarker.blockFingerprint}`
-                : sql`${workPackages.metadata}->'mcpGrantBlock'->>'source' = 'filesystem-grant-approval'`,
+              sql`${workPackages.metadata}->'mcpGrantBlock'->>'blockFingerprint' = ${parsedMarker.blockFingerprint}`,
             )
           : eq(workPackages.id, pkg.id))
         .returning()
@@ -566,7 +581,6 @@ async function applyCanonicalProjection(input: {
     // security, or execution failure must remain intact.
     if (
       !parsedMarker &&
-      !exactV1Marker &&
       pkg.status !== 'pending' &&
       pkg.status !== 'ready'
     ) continue
@@ -745,7 +759,7 @@ export async function reconcileFilesystemGrantsForProject(
       .where(inArray(workPackages.taskId, taskRows.map((task) => task.id)))
       .orderBy(workPackages.id)
       .for('update')
-  await tx.select({ id: filesystemMcpGrantApprovals.id })
+  const packageDecisionRows = await tx.select()
     .from(filesystemMcpGrantApprovals)
     .where(eq(filesystemMcpGrantApprovals.projectId, input.lockedProject.id))
     .orderBy(filesystemMcpGrantApprovals.id)
@@ -758,12 +772,13 @@ export async function reconcileFilesystemGrantsForProject(
     .where(eq(projectFilesystemCurrentDecisionPointers.projectId, input.lockedProject.id))
     .for('update')
   if (!projectPointer) throw httpError('Project filesystem decision authority is not initialized.', 409)
-  if (projectDecisionPointerParent(projectPointer, projectDecisionRows) === undefined) {
+  const currentProjectDecision = projectDecisionPointerParent(projectPointer, projectDecisionRows)
+  if (currentProjectDecision === undefined) {
     throw httpError('Project filesystem decision pointer does not match its immutable parent.', 409)
   }
   const pointerRows = packageRows.length === 0
     ? []
-    : await tx.select({ id: filesystemMcpCurrentDecisionPointers.id })
+    : await tx.select()
       .from(filesystemMcpCurrentDecisionPointers)
       .where(inArray(
         filesystemMcpCurrentDecisionPointers.workPackageId,
@@ -774,43 +789,23 @@ export async function reconcileFilesystemGrantsForProject(
   if (pointerRows.length !== packageRows.length) {
     throw httpError('Filesystem decision authority is not initialized for every package.', 409)
   }
-  const now = new Date()
-  const revision = input.lockedProject.grantDecisionRevision + BigInt(1)
-  const appended = await appendProjectFilesystemDecision({
-    actorId: input.actorId,
-    capabilities: [],
-    decision: 'revoked',
-    lockedProject: input.lockedProject,
-    now,
-    pointer: projectPointer,
-    reason: 'Project root binding changed; explicit filesystem reapproval is required.',
-    revision,
-    revocationReason: 'project_root_repoint',
-    rootBindingRevision: input.lockedProject.rootBindingRevision,
-    tx,
-  })
+  if (pointerRows.some((pointer) => packageDecisionPointerParent(pointer, packageDecisionRows) === undefined)) {
+    throw httpError('Filesystem decision pointer does not match its immutable package decision.', 409)
+  }
+  const now = await lockedTransactionNow(tx)
+  const revision = input.lockedProject.grantDecisionRevision
   const nextMcpConfig = filesystemMcpConfigAfterRootRepoint({
-    grantApprovalId: appended.decision.id,
+    grantApprovalId: currentProjectDecision?.id ?? null,
     grantDecisionRevision: revision,
     mcpConfig: input.nextMcpConfig,
     rootBindingRevision: input.lockedProject.rootBindingRevision,
   })
-  const [updatedProject] = await tx.update(projects).set({
-    grantDecisionRevision: revision,
-    mcpConfig: nextMcpConfig,
-    updatedAt: now,
-  }).where(and(
-    eq(projects.id, input.lockedProject.id),
-    eq(projects.grantDecisionRevision, input.lockedProject.grantDecisionRevision),
-    eq(projects.rootBindingRevision, input.lockedProject.rootBindingRevision),
-  )).returning()
-  if (!updatedProject) throw httpError('Project root authority changed concurrently.', 409)
   return reconcileLockedProjectRows({
-    lockedProject: updatedProject,
+    lockedProject: input.lockedProject,
     nextMcpConfig,
     now,
     packages: new Map(packageRows.map((pkg) => [pkg.id, pkg])),
-    projectAuthority: appended.authority,
+    projectAuthority: currentProjectDecision ? projectDecisionAuthority(currentProjectDecision) : null,
     taskRows,
     trigger: input.trigger,
     tx,
@@ -860,12 +855,13 @@ async function lockMutationRows(input: {
     throw httpError('One or more work packages do not belong to this task.', 404)
   }
 
+  let packageDecisionRows: PackageDecision[] = []
   if (input.targetPackageIds.length > 0 || input.projectWide) {
     const decisionScope = input.projectWide
       ? eq(filesystemMcpGrantApprovals.projectId, project.id)
       : inArray(filesystemMcpGrantApprovals.workPackageId, [...input.targetPackageIds])
-    await input.tx
-      .select({ id: filesystemMcpGrantApprovals.id })
+    packageDecisionRows = await input.tx
+      .select()
       .from(filesystemMcpGrantApprovals)
       .where(and(
         eq(filesystemMcpGrantApprovals.projectId, project.id),
@@ -909,6 +905,9 @@ async function lockMutationRows(input: {
   if (pointerRows.length !== pointerPackageIds.length) {
     throw httpError('Filesystem decision authority is not initialized for every package.', 409)
   }
+  if (pointerRows.some((pointer) => packageDecisionPointerParent(pointer, packageDecisionRows) === undefined)) {
+    throw httpError('Filesystem decision pointer does not match its immutable package decision.', 409)
+  }
   return {
     packageById,
     pointerByPackageId: new Map(pointerRows.map((pointer) => [pointer.workPackageId, pointer])),
@@ -922,9 +921,6 @@ async function lockMutationRows(input: {
 function validatePackageMutation(pkg: LockedPackage, mutation: FilesystemGrantMutation) {
   if (!PACKAGE_EDITABLE.has(pkg.status)) {
     throw httpError(`Cannot edit filesystem grants for package '${pkg.title}' after execution starts.`, 409)
-  }
-  if (pkg.status === 'failed' && !isFilesystemGrantBlockedPackageMetadata(pkg.metadata)) {
-    throw httpError(`Cannot edit filesystem grants for package '${pkg.title}' because its failure is not a filesystem grant hold.`, 409)
   }
   const summary = summarizeFilesystemCapabilities({
     mcpRequirements: pkg.mcpRequirements,
@@ -955,7 +951,6 @@ export async function mutateTaskFilesystemGrants(input: {
   const projectWide = input.mutations.some((mutation) => (
     mutation.decision === 'approved' && mutation.grantMode === 'always_allow'
   ))
-  const now = new Date()
   return db.transaction(async (tx) => {
     const locked = await lockMutationRows({
       projectId: input.projectId,
@@ -964,6 +959,7 @@ export async function mutateTaskFilesystemGrants(input: {
       projectWide,
       tx,
     })
+    const now = await lockedTransactionNow(tx)
     const targetTask = locked.taskRows.find((task) => task.id === input.taskId)
     if (!targetTask || !TASK_EDITABLE.has(targetTask.status)) {
       throw httpError(`Cannot edit filesystem grants while task status is '${targetTask?.status ?? 'missing'}'.`, 409)
@@ -1125,7 +1121,10 @@ export async function mutateTaskFilesystemGrants(input: {
         .update(filesystemMcpCurrentDecisionPointers)
         .set({
           currentDecisionId: approval.id,
+          currentDecisionTaskId: approval.taskId,
+          currentDecisionWorkPackageId: approval.workPackageId,
           currentDecisionRevision: revision,
+          currentDecisionFingerprint: nextFingerprint,
           pointerFingerprint: nextFingerprint,
           pointerVersion: pointer.pointerVersion + BigInt(1),
           updatedAt: now,
@@ -1135,9 +1134,18 @@ export async function mutateTaskFilesystemGrants(input: {
           pointer.currentDecisionId
             ? eq(filesystemMcpCurrentDecisionPointers.currentDecisionId, pointer.currentDecisionId)
             : isNull(filesystemMcpCurrentDecisionPointers.currentDecisionId),
+          pointer.currentDecisionTaskId === null
+            ? isNull(filesystemMcpCurrentDecisionPointers.currentDecisionTaskId)
+            : eq(filesystemMcpCurrentDecisionPointers.currentDecisionTaskId, pointer.currentDecisionTaskId),
+          pointer.currentDecisionWorkPackageId === null
+            ? isNull(filesystemMcpCurrentDecisionPointers.currentDecisionWorkPackageId)
+            : eq(filesystemMcpCurrentDecisionPointers.currentDecisionWorkPackageId, pointer.currentDecisionWorkPackageId),
           pointer.currentDecisionRevision === null
             ? isNull(filesystemMcpCurrentDecisionPointers.currentDecisionRevision)
             : eq(filesystemMcpCurrentDecisionPointers.currentDecisionRevision, pointer.currentDecisionRevision),
+          pointer.currentDecisionFingerprint === null
+            ? isNull(filesystemMcpCurrentDecisionPointers.currentDecisionFingerprint)
+            : eq(filesystemMcpCurrentDecisionPointers.currentDecisionFingerprint, pointer.currentDecisionFingerprint),
           eq(filesystemMcpCurrentDecisionPointers.pointerFingerprint, pointer.pointerFingerprint),
           eq(filesystemMcpCurrentDecisionPointers.pointerVersion, pointer.pointerVersion),
         ))
@@ -1227,7 +1235,6 @@ export async function mutateProjectFilesystemGrant(input: {
   mcpConfig: ProjectMcpConfig
   recoveredTaskIds: string[]
 }> {
-  const now = new Date()
   return db.transaction(async (tx) => {
     const locked = await lockMutationRows({
       projectId: input.projectId,
@@ -1235,6 +1242,7 @@ export async function mutateProjectFilesystemGrant(input: {
       projectWide: true,
       tx,
     })
+    const now = await lockedTransactionNow(tx)
     if (locked.project.rootBindingRevision <= BigInt(0)) {
       throw httpError('The project root is not bound to protocol v2. Filesystem decisions remain disabled.', 409)
     }

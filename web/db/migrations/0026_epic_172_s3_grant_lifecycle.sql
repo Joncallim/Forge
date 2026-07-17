@@ -60,13 +60,20 @@ CREATE UNIQUE INDEX "filesystem_mcp_grant_approvals_grant_nonce_idx"
   WHERE "grant_nonce" IS NOT NULL;
 CREATE INDEX "filesystem_mcp_grant_approvals_revision_idx"
   ON "filesystem_mcp_grant_approvals" ("grant_decision_revision");
+CREATE UNIQUE INDEX "filesystem_mcp_grant_approvals_pointer_parent_idx"
+  ON "filesystem_mcp_grant_approvals" (
+    "id", "task_id", "work_package_id", "grant_decision_revision", "pointer_fingerprint"
+  );
 
 CREATE TABLE "filesystem_mcp_current_decision_pointers" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
   "task_id" uuid NOT NULL,
   "work_package_id" uuid NOT NULL,
   "current_decision_id" uuid,
+  "current_decision_task_id" uuid,
+  "current_decision_work_package_id" uuid,
   "current_decision_revision" bigint,
+  "current_decision_fingerprint" text,
   "pointer_fingerprint" text NOT NULL,
   "pointer_version" bigint DEFAULT 0 NOT NULL,
   "created_at" timestamp with time zone DEFAULT now() NOT NULL,
@@ -75,17 +82,41 @@ CREATE TABLE "filesystem_mcp_current_decision_pointers" (
     FOREIGN KEY ("task_id") REFERENCES "tasks"("id") ON DELETE cascade,
   CONSTRAINT "filesystem_mcp_current_decision_pointers_package_fk"
     FOREIGN KEY ("work_package_id") REFERENCES "work_packages"("id") ON DELETE cascade,
-  CONSTRAINT "filesystem_mcp_current_decision_pointers_decision_fk"
-    FOREIGN KEY ("current_decision_id") REFERENCES "filesystem_mcp_grant_approvals"("id") ON DELETE restrict,
+  CONSTRAINT "filesystem_mcp_current_decision_pointers_parent_fk"
+    FOREIGN KEY (
+      "current_decision_id", "current_decision_task_id", "current_decision_work_package_id",
+      "current_decision_revision", "current_decision_fingerprint"
+    ) REFERENCES "filesystem_mcp_grant_approvals" (
+      "id", "task_id", "work_package_id", "grant_decision_revision", "pointer_fingerprint"
+    ) MATCH FULL ON UPDATE restrict ON DELETE restrict,
   CONSTRAINT "filesystem_mcp_current_decision_pointers_version_check"
     CHECK ("pointer_version" >= 0),
   CONSTRAINT "filesystem_mcp_current_decision_pointers_revision_check"
     CHECK (
-      ("current_decision_id" IS NULL AND "current_decision_revision" IS NULL AND "pointer_version" = 0)
+      (
+        "current_decision_id" IS NULL
+        AND "current_decision_task_id" IS NULL
+        AND "current_decision_work_package_id" IS NULL
+        AND "current_decision_revision" IS NULL
+        AND "current_decision_fingerprint" IS NULL
+        AND (
+          ("pointer_version" = 0 AND "pointer_fingerprint" = ('empty:' || "work_package_id"::text))
+          OR (
+            "pointer_version" = 1
+            AND "pointer_fingerprint" ~ '^legacy:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          )
+        )
+      )
       OR
-      ("current_decision_id" IS NOT NULL AND "current_decision_revision" IS NULL)
-      OR
-      ("current_decision_id" IS NOT NULL AND "current_decision_revision" > 0 AND "pointer_version" > 0)
+      (
+        "current_decision_id" IS NOT NULL
+        AND "current_decision_task_id" = "task_id"
+        AND "current_decision_work_package_id" = "work_package_id"
+        AND "current_decision_revision" > 0
+        AND "current_decision_fingerprint" = "pointer_fingerprint"
+        AND "current_decision_fingerprint" ~ '^sha256:[0-9a-f]{64}$'
+        AND "pointer_version" > 0
+      )
     )
 );
 
@@ -97,17 +128,14 @@ CREATE UNIQUE INDEX "filesystem_mcp_current_decision_pointers_current_decision_i
   ON "filesystem_mcp_current_decision_pointers" ("current_decision_id")
   WHERE "current_decision_id" IS NOT NULL;
 
--- Existing mutable rows are retained as ambiguous legacy history. They become
--- the current pointer but receive no invented revision or root authority.
+-- Existing mutable rows are retained as ambiguous legacy history. The pointer
+-- records an explicit all-null adapter and receives no invented authority.
 INSERT INTO "filesystem_mcp_current_decision_pointers" (
-  "task_id", "work_package_id", "current_decision_id",
-  "current_decision_revision", "pointer_fingerprint", "pointer_version"
+  "task_id", "work_package_id", "pointer_fingerprint", "pointer_version"
 )
 SELECT
   wp."task_id",
   wp."id",
-  approval."id",
-  NULL,
   CASE WHEN approval."id" IS NULL
     THEN 'empty:' || wp."id"::text
     ELSE 'legacy:' || approval."id"::text
@@ -166,6 +194,46 @@ RETURNS boolean LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
     ), '[]'::jsonb)
 $$;
 
+CREATE FUNCTION "forge_is_canonical_bounded_string_set"(
+  value jsonb,
+  max_items integer,
+  max_length integer
+)
+RETURNS boolean LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
+BEGIN
+  IF jsonb_typeof(value) <> 'array' OR jsonb_array_length(value) > max_items THEN
+    RETURN false;
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM jsonb_array_elements(value) AS item
+    WHERE jsonb_typeof(item) <> 'string'
+       OR length(item #>> '{}') = 0
+       OR length(item #>> '{}') > max_length
+  ) THEN
+    RETURN false;
+  END IF;
+  RETURN value = COALESCE((
+    SELECT jsonb_agg(item_value ORDER BY item_value)
+    FROM (
+      SELECT DISTINCT item #>> '{}' AS item_value
+      FROM jsonb_array_elements(value) AS item
+    ) canonical
+  ), '[]'::jsonb);
+END;
+$$;
+
+CREATE FUNCTION "forge_is_canonical_utc_timestamp"(value text)
+RETURNS boolean LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
+BEGIN
+  IF value !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$' THEN
+    RETURN false;
+  END IF;
+  RETURN to_char(value::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') = value;
+EXCEPTION WHEN OTHERS THEN
+  RETURN false;
+END;
+$$;
+
 CREATE TABLE "project_filesystem_grant_decisions" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
   "project_id" uuid NOT NULL,
@@ -176,6 +244,7 @@ CREATE TABLE "project_filesystem_grant_decisions" (
   "decision_fingerprint" text NOT NULL,
   "decision_generation" bigint NOT NULL,
   "prior_decision_id" uuid,
+  "prior_decision_project_id" uuid,
   "prior_decision_revision" bigint,
   "prior_root_binding_revision" bigint,
   "prior_decision_fingerprint" text,
@@ -197,11 +266,13 @@ CREATE TABLE "project_filesystem_grant_decisions" (
   CONSTRAINT "project_filesystem_grant_decisions_prior_tuple_check"
     CHECK (
       (
-        "prior_decision_id" IS NULL AND "prior_decision_revision" IS NULL
+        "prior_decision_id" IS NULL AND "prior_decision_project_id" IS NULL
+        AND "prior_decision_revision" IS NULL
         AND "prior_root_binding_revision" IS NULL AND "prior_decision_fingerprint" IS NULL
         AND "prior_decision_generation" IS NULL AND "decision_generation" = 1
       ) OR (
-        "prior_decision_id" IS NOT NULL AND "prior_decision_revision" > 0
+        "prior_decision_id" IS NOT NULL AND "prior_decision_project_id" = "project_id"
+        AND "prior_decision_revision" > 0
         AND "prior_root_binding_revision" > 0
         AND "prior_decision_fingerprint" ~ '^sha256:[0-9a-f]{64}$'
         AND "prior_decision_generation" > 0
@@ -231,6 +302,16 @@ CREATE UNIQUE INDEX "project_filesystem_grant_decisions_parent_tuple_idx"
     "id", "project_id", "grant_decision_revision", "root_binding_revision",
     "decision_fingerprint", "decision_generation"
   );
+
+ALTER TABLE "project_filesystem_grant_decisions"
+  ADD CONSTRAINT "project_filesystem_grant_decisions_prior_fk"
+  FOREIGN KEY (
+    "prior_decision_id", "prior_decision_project_id", "prior_decision_revision",
+    "prior_root_binding_revision", "prior_decision_fingerprint", "prior_decision_generation"
+  ) REFERENCES "project_filesystem_grant_decisions" (
+    "id", "project_id", "grant_decision_revision", "root_binding_revision",
+    "decision_fingerprint", "decision_generation"
+  ) MATCH FULL ON UPDATE restrict ON DELETE restrict;
 
 CREATE TABLE "project_filesystem_current_decision_pointers" (
   "project_id" uuid PRIMARY KEY NOT NULL,
@@ -303,9 +384,9 @@ CREATE TRIGGER "project_filesystem_grant_decisions_append_only"
 BEFORE UPDATE OR DELETE ON "project_filesystem_grant_decisions"
 FOR EACH ROW EXECUTE FUNCTION "forge_reject_project_filesystem_decision_mutation"();
 
--- SQL mirrors the closed TypeScript hold-state union. Version-1 markers remain
--- readable during the bounded migration window; every version-2 writer is
--- constrained to one of the four canonical arms.
+-- SQL mirrors the closed TypeScript S3 hold-state union. Older marker-shaped
+-- JSON remains retained as data but is not S3 recovery authority; every
+-- version-2 writer is constrained to exact S3 keys, bounds, and blocked status.
 ALTER TABLE "work_packages"
   ADD CONSTRAINT "work_packages_filesystem_grant_hold_v2_check"
   CHECK (
@@ -314,21 +395,37 @@ ALTER TABLE "work_packages"
     OR (
       (
       jsonb_typeof("metadata"->'mcpGrantBlock') = 'object'
+      AND "status" = 'blocked'
+      AND ("metadata"->'mcpGrantBlock') ?& ARRAY[
+        'schemaVersion','kind','source','taskDisposition','autoRetryable',
+        'terminalFailure','requirementKeys','requestedCapabilities',
+        'recoveryAction','blockFingerprint','blockedAt','holdKind',
+        'grantPhase','grantConsumed','grantDecisionRevision','revocationReason'
+      ]
       AND ("metadata"->'mcpGrantBlock') - ARRAY[
         'schemaVersion','kind','source','taskDisposition','autoRetryable',
         'terminalFailure','requirementKeys','requestedCapabilities',
         'recoveryAction','blockFingerprint','blockedAt','holdKind',
         'grantPhase','grantConsumed','grantDecisionRevision','revocationReason'
       ] = '{}'::jsonb
+      AND "metadata"->'mcpGrantBlock'->'schemaVersion' = '2'::jsonb
       AND "metadata"->'mcpGrantBlock'->>'kind' = 'filesystem_grant'
       AND "metadata"->'mcpGrantBlock'->>'source' = 'filesystem-grant-approval'
       AND "metadata"->'mcpGrantBlock'->>'taskDisposition' = 'operator_hold'
       AND "metadata"->'mcpGrantBlock'->'autoRetryable' = 'false'::jsonb
       AND "metadata"->'mcpGrantBlock'->'terminalFailure' = 'false'::jsonb
-      AND jsonb_typeof("metadata"->'mcpGrantBlock'->'requirementKeys') = 'array'
-      AND jsonb_typeof("metadata"->'mcpGrantBlock'->'requestedCapabilities') = 'array'
+      AND forge_is_canonical_bounded_string_set(
+        "metadata"->'mcpGrantBlock'->'requirementKeys', 256, 240
+      )
+      AND forge_is_canonical_bounded_string_set(
+        "metadata"->'mcpGrantBlock'->'requestedCapabilities', 3, 240
+      )
+      AND forge_is_canonical_filesystem_capability_set(
+        "metadata"->'mcpGrantBlock'->'requestedCapabilities'
+      )
       AND "metadata"->'mcpGrantBlock'->>'recoveryAction' = 'approve_project_filesystem_context'
       AND ("metadata"->'mcpGrantBlock'->>'blockFingerprint') ~ '^sha256:[0-9a-f]{64}$'
+      AND forge_is_canonical_utc_timestamp("metadata"->'mcpGrantBlock'->>'blockedAt')
       AND (
         (
           "metadata"->'mcpGrantBlock'->>'holdKind' = 'approval_required'

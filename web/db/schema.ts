@@ -11,6 +11,7 @@ import {
   bigint,
   customType,
   check,
+  foreignKey,
   index,
   uniqueIndex,
 } from 'drizzle-orm/pg-core'
@@ -832,6 +833,13 @@ export const filesystemMcpGrantApprovals = pgTable(
     index('filesystem_mcp_grant_approvals_task_id_idx').on(t.taskId),
     index('filesystem_mcp_grant_approvals_decision_idx').on(t.decision),
     index('filesystem_mcp_grant_approvals_revision_idx').on(t.grantDecisionRevision),
+    uniqueIndex('filesystem_mcp_grant_approvals_pointer_parent_idx').on(
+      t.id,
+      t.taskId,
+      t.workPackageId,
+      t.grantDecisionRevision,
+      t.pointerFingerprint,
+    ),
   ],
 )
 
@@ -854,9 +862,11 @@ export const filesystemMcpCurrentDecisionPointers = pgTable(
     workPackageId: uuid('work_package_id')
       .notNull()
       .references(() => workPackages.id, { onDelete: 'cascade' }),
-    currentDecisionId: uuid('current_decision_id')
-      .references(() => filesystemMcpGrantApprovals.id, { onDelete: 'restrict' }),
+    currentDecisionId: uuid('current_decision_id'),
+    currentDecisionTaskId: uuid('current_decision_task_id'),
+    currentDecisionWorkPackageId: uuid('current_decision_work_package_id'),
     currentDecisionRevision: bigint('current_decision_revision', { mode: 'bigint' }),
+    currentDecisionFingerprint: text('current_decision_fingerprint'),
     pointerFingerprint: text('pointer_fingerprint').notNull(),
     pointerVersion: bigint('pointer_version', { mode: 'bigint' }).notNull().default(BigInt(0)),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
@@ -866,6 +876,23 @@ export const filesystemMcpCurrentDecisionPointers = pgTable(
     uniqueIndex('filesystem_mcp_current_decision_pointers_work_package_idx').on(t.workPackageId),
     index('filesystem_mcp_current_decision_pointers_task_idx').on(t.taskId),
     uniqueIndex('filesystem_mcp_current_decision_pointers_current_decision_idx').on(t.currentDecisionId),
+    foreignKey({
+      columns: [
+        t.currentDecisionId,
+        t.currentDecisionTaskId,
+        t.currentDecisionWorkPackageId,
+        t.currentDecisionRevision,
+        t.currentDecisionFingerprint,
+      ],
+      foreignColumns: [
+        filesystemMcpGrantApprovals.id,
+        filesystemMcpGrantApprovals.taskId,
+        filesystemMcpGrantApprovals.workPackageId,
+        filesystemMcpGrantApprovals.grantDecisionRevision,
+        filesystemMcpGrantApprovals.pointerFingerprint,
+      ],
+      name: 'filesystem_mcp_current_decision_pointers_parent_fk',
+    }),
   ],
 )
 
@@ -892,6 +919,7 @@ export const projectFilesystemGrantDecisions = pgTable(
     decisionFingerprint: text('decision_fingerprint').notNull(),
     decisionGeneration: bigint('decision_generation', { mode: 'bigint' }).notNull(),
     priorDecisionId: uuid('prior_decision_id'),
+    priorDecisionProjectId: uuid('prior_decision_project_id'),
     priorDecisionRevision: bigint('prior_decision_revision', { mode: 'bigint' }),
     priorRootBindingRevision: bigint('prior_root_binding_revision', { mode: 'bigint' }),
     priorDecisionFingerprint: text('prior_decision_fingerprint'),
@@ -917,6 +945,25 @@ export const projectFilesystemGrantDecisions = pgTable(
         t.decisionFingerprint,
         t.decisionGeneration,
       ),
+    foreignKey({
+      columns: [
+        t.priorDecisionId,
+        t.priorDecisionProjectId,
+        t.priorDecisionRevision,
+        t.priorRootBindingRevision,
+        t.priorDecisionFingerprint,
+        t.priorDecisionGeneration,
+      ],
+      foreignColumns: [
+        t.id,
+        t.projectId,
+        t.grantDecisionRevision,
+        t.rootBindingRevision,
+        t.decisionFingerprint,
+        t.decisionGeneration,
+      ],
+      name: 'project_filesystem_grant_decisions_prior_fk',
+    }),
   ],
 )
 
