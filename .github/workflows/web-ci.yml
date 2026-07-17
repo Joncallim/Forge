@@ -57,8 +57,12 @@ jobs:
       - run: npm run lint
       - run: npx tsc --noEmit
       - run: npm test
+      - run: npm run test:mcp:contract
       - run: npm run build
       - run: npx playwright install chromium
+      - run: npm run test:mcp:postgres
+      - run: npm run test:mcp:issuance
+      - run: npm run e2e:mcp-operator
       - run: npm run e2e
       - uses: actions/upload-artifact@v7.0.1
         if: always()

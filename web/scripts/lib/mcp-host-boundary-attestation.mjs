@@ -3,6 +3,9 @@ import { createPublicKey, verify } from 'node:crypto'
 export const HOST_BOUNDARY_ATTESTATION_DOMAIN_V2 = 'forge:mcp-host-boundary-attestation:v2\0'
 export const HOST_BOUNDARY_PREFLIGHT_OPERATION_V2 = 'attest_fixed_mcp_host_boundary_v2'
 export const HOST_BOUNDARY_MAX_ENVELOPE_BYTES = 64 * 1024
+// The preflight must cover the complete concurrent suite phase (up to 420s)
+// while remaining bounded by the controller's 660s enabled-run deadline.
+export const HOST_BOUNDARY_PREFLIGHT_MAX_LIFETIME_MS = 11 * 60_000
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/
 const HEX_SHA = /^[a-f0-9]{40}$|^[a-f0-9]{64}$/
@@ -95,8 +98,11 @@ function parsePayload(value) {
   const expiresAt = requireIsoTime(value.expiresAt, 'expiresAt')
   const issuedMilliseconds = Date.parse(issuedAt)
   const expiresMilliseconds = Date.parse(expiresAt)
-  if (expiresMilliseconds <= issuedMilliseconds || expiresMilliseconds - issuedMilliseconds > 5 * 60_000) {
-    throw new Error('Host-boundary evidence lifetime must be positive and at most five minutes.')
+  if (
+    expiresMilliseconds <= issuedMilliseconds
+    || expiresMilliseconds - issuedMilliseconds > HOST_BOUNDARY_PREFLIGHT_MAX_LIFETIME_MS
+  ) {
+    throw new Error('Host-boundary evidence lifetime must be positive and at most eleven minutes.')
   }
 
   return Object.freeze({

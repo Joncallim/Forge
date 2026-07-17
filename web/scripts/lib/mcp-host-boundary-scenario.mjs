@@ -148,7 +148,12 @@ export function verifyHostBoundaryScenarioResult(input) {
     throw new Error('Host-boundary scenario did not prove all closed safety facts.')
   }
   const observedAt = Date.parse(result.payload.observedAt)
-  if (!Number.isFinite(observedAt) || observedAt < Date.parse(preflight.payload.issuedAt) || observedAt >= Date.parse(preflight.payload.expiresAt)) {
+  if (
+    !Number.isFinite(observedAt)
+    || new Date(observedAt).toISOString() !== result.payload.observedAt
+    || observedAt < Date.parse(preflight.payload.issuedAt)
+    || observedAt >= Date.parse(preflight.payload.expiresAt)
+  ) {
     throw new Error('Host-boundary scenario result is outside the preflight evidence window.')
   }
   const publicKey = createPublicKey(input.publicKeyPem)

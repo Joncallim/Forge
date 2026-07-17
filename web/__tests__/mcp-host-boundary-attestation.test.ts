@@ -127,6 +127,18 @@ describe('MCP supported-host preflight attestation', () => {
     })).toThrow(/signature/)
   })
 
+  it('covers the 420-second host suite but rejects evidence beyond the 660-second controller window', () => {
+    const nearDeadline = makeEnvelope({ expiresAt: '2026-07-17T02:11:00.000Z' })
+    expect(() => verifyHostBoundaryAttestation({
+      envelope: nearDeadline,
+      expected: expectedFor(nearDeadline),
+      localPlatform: 'linux',
+      now: new Date('2026-07-17T02:07:30.000Z'),
+      publicKeyPem,
+    })).not.toThrow()
+    expect(() => makeEnvelope({ expiresAt: '2026-07-17T02:11:00.001Z' })).toThrow(/eleven minutes/)
+  })
+
   it('builds only the fixed harness operation', () => {
     const envelope = makeEnvelope()
     const challenge = { ...envelope.payload } as Record<string, unknown>

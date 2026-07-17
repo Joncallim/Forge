@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { open, readFile, rename, rm } from 'node:fs/promises'
+import { mkdir, open, readFile } from 'node:fs/promises'
 import net from 'node:net'
 import path from 'node:path'
 import process from 'node:process'
@@ -9,6 +9,13 @@ import {
   createFixedHostBoundaryRequest,
   verifyHostBoundaryAttestation,
 } from './lib/mcp-host-boundary-attestation.mjs'
+
+const FIXED_PREFLIGHT_PATHS = Object.freeze({
+  '--harness-socket': '/run/forge-host-boundary/attest.sock',
+  '--controller-challenge': '/run/forge-host-boundary/controller-challenge.json',
+  '--public-key': '/usr/share/forge-host-boundary/attestation.pub',
+  '--signed-envelope-out': path.resolve(process.cwd(), '.artifacts/mcp-host-boundary-preflight.signed.json'),
+})
 
 function parseArgs(argv) {
   const allowed = new Set(['--harness-socket', '--controller-challenge', '--public-key', '--signed-envelope-out'])
@@ -84,25 +91,29 @@ function requestAttestation(socketPath, request) {
   })
 }
 
-async function writeEnvelopeAtomically(filePath, envelope) {
+async function writeFirstAttemptEnvelope(filePath, envelope) {
   const absolute = path.resolve(filePath)
-  const temporary = `${absolute}.${process.pid}.tmp`
+  const parent = path.dirname(absolute)
   let handle
   try {
-    handle = await open(temporary, 'wx', 0o600)
+    await mkdir(parent, { recursive: true, mode: 0o700 })
+    // A trusted run is first-attempt-only. Refuse to replace an earlier envelope;
+    // replay or stale residue must stop the run instead of being hidden.
+    handle = await open(absolute, 'wx', 0o600)
     await handle.writeFile(`${JSON.stringify(envelope)}\n`, 'utf8')
     await handle.sync()
     await handle.close()
     handle = undefined
-    await rename(temporary, absolute)
   } finally {
     await handle?.close().catch(() => undefined)
-    await rm(temporary, { force: true }).catch(() => undefined)
   }
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2))
+  for (const [key, fixedPath] of Object.entries(FIXED_PREFLIGHT_PATHS)) {
+    if (path.resolve(args[key]) !== fixedPath) throw new Error('Host-boundary preflight path is not the fixed reviewed path.')
+  }
   const challenge = await readJsonFile(args['--controller-challenge'], 'Controller challenge', 16 * 1024)
   const request = createFixedHostBoundaryRequest(challenge)
   const envelope = await requestAttestation(args['--harness-socket'], request)
@@ -120,7 +131,7 @@ async function main() {
     workflowRunId: challenge.workflowRunId,
   }
   const verified = verifyHostBoundaryAttestation({ envelope, expected, publicKeyPem })
-  await writeEnvelopeAtomically(args['--signed-envelope-out'], verified)
+  await writeFirstAttemptEnvelope(args['--signed-envelope-out'], verified)
   process.stdout.write(`HOST_BOUNDARY_PREFLIGHT_VERIFIED run=${verified.payload.controllerRunId}\n`)
 }
 

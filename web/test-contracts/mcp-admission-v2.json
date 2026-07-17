@@ -5,10 +5,11 @@
     {
       "id": "contract",
       "runner": "vitest",
-      "expectedCount": 5,
+      "expectedCount": 6,
       "executionKeys": [
         "vitest::epic-172.controller-disabled-by-default",
         "vitest::epic-172.controller-failure-rollback",
+        "vitest::epic-172.deadline-process-tree-kill",
         "vitest::epic-172.release-order-s6-ownership",
         "vitest::epic-172.signed-evidence-step0-adapter",
         "vitest::epic-172.suite-manifest-exact"

@@ -61,6 +61,12 @@ writes the signed envelope. It cannot manufacture facts or sign an envelope. The
 external controller independently verifies the same envelope and rejects replay,
 expiry, or any changed binding.
 
+The envelope may remain valid for at most 11 minutes: long enough to cover the
+420-second host partition, but never beyond the controller's 660-second enabled-run
+deadline. The output file must not already exist. Existing output is treated as
+stale or replayed evidence and stops the run. The host-only Playwright project does
+not start the Forge web server or run application database cleanup.
+
 The five release suites are then run without retries. The host-boundary suite is:
 
 ```text

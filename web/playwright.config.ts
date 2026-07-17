@@ -3,10 +3,11 @@ import { defineConfig, devices } from '@playwright/test'
 const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
 const trustedHostBoundary = process.env.FORGE_TRUSTED_HOST_BOUNDARY === '1'
 const dedicatedMcpTags = /@mcp-postgres|@mcp-issuance|@mcp-operator|@mcp-host-boundary/
+const noMcpArtifacts = Object.freeze({ trace: 'off', screenshot: 'off', video: 'off' } as const)
 
 export default defineConfig({
   testDir: './e2e',
-  globalTeardown: './e2e/global-teardown.ts',
+  globalTeardown: trustedHostBoundary ? undefined : './e2e/global-teardown.ts',
   timeout: 60_000,
   // Tests share one dev Postgres/Redis instance and each does a global
   // truncate in beforeEach, so concurrent workers race on each other's data.
@@ -19,12 +20,15 @@ export default defineConfig({
   },
   fullyParallel: false,
   reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : 'list',
-  use: {
+  use: trustedHostBoundary ? {
+    baseURL,
+    ...noMcpArtifacts,
+  } : {
     baseURL,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },
-  webServer: {
+  webServer: trustedHostBoundary ? undefined : {
     command: 'npm run dev -- --hostname 127.0.0.1',
     url: baseURL,
     // Reusing an arbitrary local dev server can bypass the E2E env below
@@ -58,26 +62,26 @@ export default defineConfig({
       grep: /@mcp-postgres/,
       fullyParallel: false,
       retries: 0,
-      use: { ...devices['Desktop Chrome'] },
+      use: { ...devices['Desktop Chrome'], ...noMcpArtifacts },
     },
     {
       name: 'mcp-issuance',
       grep: /@mcp-issuance/,
       fullyParallel: false,
       retries: 0,
-      use: { ...devices['Desktop Chrome'] },
+      use: { ...devices['Desktop Chrome'], ...noMcpArtifacts },
     },
     {
       name: 'mcp-operator-desktop',
       grep: /@mcp-operator/,
       retries: 0,
-      use: { ...devices['Desktop Chrome'] },
+      use: { ...devices['Desktop Chrome'], ...noMcpArtifacts },
     },
     {
       name: 'mcp-operator-mobile',
       grep: /@mcp-operator/,
       retries: 0,
-      use: { ...devices['Pixel 5'] },
+      use: { ...devices['Pixel 5'], ...noMcpArtifacts },
     },
     ...(trustedHostBoundary ? [{
       name: 'mcp-host-boundary',
@@ -85,7 +89,7 @@ export default defineConfig({
       grep: /@mcp-host-boundary/,
       fullyParallel: false,
       retries: 0,
-      use: { ...devices['Desktop Chrome'] },
+      use: { ...devices['Desktop Chrome'], ...noMcpArtifacts },
     }] : []),
   ],
 })

@@ -31,6 +31,17 @@ describe('Epic 172 S6 trusted CI wiring', () => {
     expect(workflow).not.toContain('checks: write')
   })
 
+  it('runs every non-privileged S6 partition in ordinary web CI', async () => {
+    const workflow = await readFile(path.join(repositoryRoot, '.github/workflows/web-ci.yml'), 'utf8')
+    for (const command of [
+      'npm run test:mcp:contract',
+      'npm run test:mcp:postgres',
+      'npm run test:mcp:issuance',
+      'npm run e2e:mcp-operator',
+    ]) expect(workflow).toContain(command)
+    expect(workflow).not.toContain('npm run test:mcp:host-boundary')
+  })
+
   it('keeps every controller mutation behind the fixed external socket and documented exact commands', async () => {
     const guide = await readFile(path.join(repositoryRoot, 'docs/operators/host-boundary-controller-v2.md'), 'utf8')
     const commands = [
@@ -46,5 +57,16 @@ describe('Epic 172 S6 trusted CI wiring', () => {
     for (const command of commands) expect(guide).toContain(command)
     expect(guide).toContain('macOS, Windows, a same-user container')
     expect(guide).toContain('not trusted release proof')
+  })
+
+  it('runs the host-only partition without starting the web app or its database teardown', async () => {
+    const config = await readFile(path.join(process.cwd(), 'playwright.config.ts'), 'utf8')
+    expect(config).toContain("globalTeardown: trustedHostBoundary ? undefined : './e2e/global-teardown.ts'")
+    expect(config).toContain('webServer: trustedHostBoundary ? undefined : {')
+    expect(config).toContain("trace: 'off'")
+    expect(config).toContain("screenshot: 'off'")
+    expect(config).toContain("video: 'off'")
+    expect(config).toContain("const noMcpArtifacts = Object.freeze({ trace: 'off', screenshot: 'off', video: 'off' } as const)")
+    expect(config.match(/\.\.\.noMcpArtifacts/g)).toHaveLength(6)
   })
 })

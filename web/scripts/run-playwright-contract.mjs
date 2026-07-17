@@ -7,6 +7,14 @@ import path from 'node:path'
 import process from 'node:process'
 
 const PARTITIONS = new Set(['postgres', 'issuance', 'operator-desktop', 'operator-mobile', 'host-boundary'])
+const MANIFEST_PARTITIONS = Object.freeze({
+  contract: { runner: 'vitest', prefix: 'vitest::' },
+  'host-boundary': { runner: 'playwright', prefix: 'mcp-host-boundary::' },
+  issuance: { runner: 'playwright', prefix: 'mcp-issuance::' },
+  'operator-desktop': { runner: 'playwright', prefix: 'mcp-operator-desktop::' },
+  'operator-mobile': { runner: 'playwright', prefix: 'mcp-operator-mobile::' },
+  postgres: { runner: 'playwright', prefix: 'mcp-postgres::' },
+})
 
 function parseArgs(argv) {
   const separator = argv.indexOf('--')
@@ -33,11 +41,40 @@ function parseManifest(value, requestedPartitions) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || value.schemaVersion !== 2 || value.contractVersion !== 'mcp-admission-v2') {
     throw new Error('Invalid MCP admission suite manifest.')
   }
+  if (Object.keys(value).sort().join('\n') !== ['contractVersion', 'partitions', 'schemaVersion'].join('\n')) {
+    throw new Error('Suite manifest has an unexpected field.')
+  }
   if (!Array.isArray(value.partitions) || value.partitions.length !== 6) throw new Error('Suite manifest must have six partitions.')
+  const manifestIds = value.partitions.map((partition) => partition?.id).sort()
+  const expectedIds = Object.keys(MANIFEST_PARTITIONS).sort()
+  if (manifestIds.some((id, index) => id !== expectedIds[index])) throw new Error('Suite manifest partition set is invalid.')
+  const allKeys = []
+  for (const partition of value.partitions) {
+    const contract = MANIFEST_PARTITIONS[partition.id]
+    const keys = Object.keys(partition).sort()
+    if (
+      keys.join('\n') !== ['executionKeys', 'expectedCount', 'id', 'runner'].join('\n')
+      || partition.runner !== contract.runner
+      || !Number.isSafeInteger(partition.expectedCount)
+      || partition.expectedCount <= 0
+      || !Array.isArray(partition.executionKeys)
+      || partition.executionKeys.length !== partition.expectedCount
+      || partition.executionKeys.some((key) => (
+        typeof key !== 'string'
+        || !key.startsWith(contract.prefix)
+        || key.includes('*')
+        || key.includes('?')
+      ))
+      || partition.executionKeys.some((key, index) => key !== [...partition.executionKeys].sort()[index])
+      || new Set(partition.executionKeys).size !== partition.executionKeys.length
+    ) throw new Error(`Invalid ${partition.id} partition contract.`)
+    allKeys.push(...partition.executionKeys)
+  }
+  if (new Set(allKeys).size !== allKeys.length) throw new Error('Duplicate execution key across manifest partitions.')
   const selected = value.partitions.filter((partition) => requestedPartitions.includes(partition.id))
   if (selected.length !== requestedPartitions.length) throw new Error('Requested partition is missing from the suite manifest.')
   for (const partition of selected) {
-    if (partition.runner !== 'playwright' || !Array.isArray(partition.executionKeys) || partition.executionKeys.length !== partition.expectedCount || partition.expectedCount <= 0) {
+    if (partition.runner !== 'playwright') {
       throw new Error('Invalid Playwright partition contract.')
     }
   }

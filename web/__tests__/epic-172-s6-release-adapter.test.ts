@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   EPIC_172_S6_CONTROLLER_DEFAULT_STATE,
   EPIC_172_S6_OWNED_NODE_IDS,
+  EPIC_172_S6_RECORDABLE_EVIDENCE_KINDS,
   assertEpic172S6ReleaseOrderOwnership,
   createEpic172S6ReleaseStoreAdapter,
 } from '@/lib/mcps/epic-172-s6-release-adapter'
@@ -14,6 +15,12 @@ describe('Epic 172 S6 release adapter', () => {
       's6_post_activation_green',
       's5_s6_release_ready',
     ])
+    expect(EPIC_172_S6_RECORDABLE_EVIDENCE_KINDS).toEqual([
+      's6_pre_activation_green',
+      's6_post_activation_green',
+      'enabled_build_tests_green',
+    ])
+    expect(EPIC_172_S6_RECORDABLE_EVIDENCE_KINDS).not.toContain('s5_s6_release_ready')
   })
 
   it('[scenarioId=epic-172.controller-disabled-by-default] exposes no local activation authority', () => {

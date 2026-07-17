@@ -1,6 +1,7 @@
 export const HOST_BOUNDARY_ATTESTATION_DOMAIN_V2: string
 export const HOST_BOUNDARY_PREFLIGHT_OPERATION_V2: string
 export const HOST_BOUNDARY_MAX_ENVELOPE_BYTES: number
+export const HOST_BOUNDARY_PREFLIGHT_MAX_LIFETIME_MS: number
 
 export type HostBoundaryAttestationEnvelope = Readonly<{
   schemaVersion: 2

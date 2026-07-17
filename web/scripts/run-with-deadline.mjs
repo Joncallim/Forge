@@ -34,10 +34,18 @@ async function main() {
     stdio: 'inherit',
   })
   let timedOut = false
+  let killEscalation = Promise.resolve()
   const deadline = setTimeout(() => {
     timedOut = true
     killProcessGroup(child, 'SIGTERM')
-    setTimeout(() => killProcessGroup(child, 'SIGKILL'), 2_000).unref()
+    // Keep the wrapper alive through forced process-group termination. The
+    // direct child may exit on SIGTERM while one of its descendants ignores it.
+    killEscalation = new Promise((resolve) => {
+      setTimeout(() => {
+        killProcessGroup(child, 'SIGKILL')
+        resolve()
+      }, 2_000)
+    })
   }, parsed.milliseconds)
   deadline.unref()
 
@@ -47,6 +55,7 @@ async function main() {
   })
   clearTimeout(deadline)
   if (timedOut) {
+    await killEscalation
     process.stderr.write('DEADLINE_EXCEEDED\n')
     process.exitCode = 124
     return

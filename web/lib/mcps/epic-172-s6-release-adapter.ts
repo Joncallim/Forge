@@ -17,6 +17,22 @@ export const EPIC_172_S6_OWNED_NODE_IDS = Object.freeze([
 
 export type Epic172S6OwnedNodeId = typeof EPIC_172_S6_OWNED_NODE_IDS[number]
 
+export const EPIC_172_S6_RECORDABLE_EVIDENCE_KINDS = Object.freeze([
+  's6_pre_activation_green',
+  's6_post_activation_green',
+  'enabled_build_tests_green',
+] as const)
+
+export type Epic172S6RecordableEvidenceKind = typeof EPIC_172_S6_RECORDABLE_EVIDENCE_KINDS[number]
+export type Epic172S6VerifiedReleaseEvidence = Extract<
+  ReturnType<typeof verifyEpic172ReleaseEvidence>,
+  Readonly<{ ok: true }>
+>
+export type Epic172S6VerifiedTransitionAuthorization = Extract<
+  ReturnType<typeof verifyEpic172TransitionAuthorization>,
+  Readonly<{ ok: true }>
+>
+
 export const EPIC_172_S6_CONTROLLER_DEFAULT_STATE = Object.freeze({
   externalControllerRequired: true,
   hostBoundaryEvidenceTrustedLocally: false,
@@ -71,8 +87,8 @@ export type Epic172S6ReleaseStoreAdapter = Readonly<{
    * S6-owned envelope in the same transaction as its canonical consumption rows.
    */
   recordOwnedEvidence: (
-    nodeId: Epic172S6OwnedNodeId,
-    verified: ReturnType<typeof verifyEpic172ReleaseEvidence>,
+    evidenceKind: Epic172S6RecordableEvidenceKind,
+    verified: Epic172S6VerifiedReleaseEvidence,
   ) => Promise<unknown>
   /**
    * The implementation is supplied by Step 0. It must consume a verified fresh
@@ -80,7 +96,7 @@ export type Epic172S6ReleaseStoreAdapter = Readonly<{
    */
   consumeOwnedTransition: (
     nodeId: Epic172S6OwnedNodeId,
-    verified: ReturnType<typeof verifyEpic172TransitionAuthorization>,
+    verified: Epic172S6VerifiedTransitionAuthorization,
   ) => Promise<unknown>
 }>
 

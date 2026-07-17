@@ -16,6 +16,12 @@ const driverSocket = process.env.FORGE_HOST_BOUNDARY_DRIVER_SOCKET ?? ''
 const challengePath = process.env.FORGE_HOST_BOUNDARY_CONTROLLER_CHALLENGE ?? ''
 const attestationPath = process.env.FORGE_HOST_BOUNDARY_PREFLIGHT_ATTESTATION ?? ''
 const publicKeyPath = process.env.FORGE_HOST_BOUNDARY_ATTESTATION_PUBLIC_KEY ?? ''
+const FIXED_HOST_PATHS = Object.freeze({
+  driverSocket: '/run/forge-host-boundary/scenario.sock',
+  challengePath: '/run/forge-host-boundary/controller-challenge.json',
+  attestationPath: path.resolve(process.cwd(), '.artifacts/mcp-host-boundary-preflight.signed.json'),
+  publicKeyPath: '/usr/share/forge-host-boundary/attestation.pub',
+})
 
 let preflightEnvelope: unknown
 let publicKeyPem: Buffer
@@ -45,7 +51,7 @@ function requestFixedScenario(socketPath: string, request: unknown): Promise<unk
       if (error) reject(error)
       else resolve(result)
     }
-    socket.setTimeout(30_000)
+    socket.setTimeout(85_000)
     socket.once('connect', () => socket.end(bytes))
     socket.on('data', (chunk: Buffer) => {
       byteCount += chunk.length
@@ -78,6 +84,14 @@ test.describe('Epic 172 supported host boundary @mcp-host-boundary', () => {
   test.beforeAll(async () => {
     if (!driverSocket || !challengePath || !attestationPath || !publicKeyPath) {
       throw new Error('The trusted host-boundary project requires its external controller inputs.')
+    }
+    if (
+      driverSocket !== FIXED_HOST_PATHS.driverSocket
+      || challengePath !== FIXED_HOST_PATHS.challengePath
+      || path.resolve(attestationPath) !== FIXED_HOST_PATHS.attestationPath
+      || publicKeyPath !== FIXED_HOST_PATHS.publicKeyPath
+    ) {
+      throw new Error('The trusted host-boundary project requires the fixed reviewed paths.')
     }
     const [challenge, envelope, key] = await Promise.all([
       readJson(challengePath, 'Controller challenge'),

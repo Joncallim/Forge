@@ -6,12 +6,12 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import process from 'node:process'
 
-const SOCKET = process.env.FORGE_HOST_BOUNDARY_CONTROLLER_SOCKET
-  ?? '/run/forge-host-boundary-controller/control.sock'
+const SOCKET = '/run/forge-host-boundary-controller/control.sock'
 const MAX_RESPONSE_BYTES = 16 * 1024
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const SAFE_ARGUMENT = /^\S{1,256}$/
 const SHA = /^[a-f0-9]{40}$|^[a-f0-9]{64}$/
+const FINGERPRINT = /^sha256:[a-f0-9]{64}$/
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 
 function parseOptions(argv) {
@@ -54,7 +54,7 @@ function buildRequest(operation, options) {
   }
   if (operation === 'verify-ruleset') {
     exactOptions(options, ['--app-id', '--check', '--repository'])
-    if (!/^\d{1,20}$/.test(options['--app-id']) || !REPOSITORY.test(options['--repository']) || options['--check'] !== 'forge/host-boundary-controller') {
+    if (!/^[1-9]\d{0,19}$/.test(options['--app-id']) || !REPOSITORY.test(options['--repository']) || options['--check'] !== 'forge/host-boundary-controller') {
       throw new Error('Ruleset verification binding is invalid.')
     }
     return { schemaVersion: 2, requestId, operation: 'verify_exact_app_ruleset', appId: options['--app-id'], checkName: options['--check'], repository: options['--repository'] }
@@ -116,23 +116,61 @@ export function validateHostBoundaryControllerResponse(value, request) {
     throw new Error('Controller response facts are invalid.')
   }
   const factKeys = Object.keys(value.facts).sort()
-  const expectedFactKeys = ['appId', 'keyGeneration', 'reviewedSha', 'rotationId', 'rulesetFingerprint', 'runId', 'state'].sort()
+  const expectedFactKeys = [
+    'appId',
+    'keyGeneration',
+    'reviewedSha',
+    'rotationId',
+    'rulesetFingerprint',
+    'runId',
+    'sourceRunId',
+    'sourceState',
+    'state',
+  ].sort()
   if (factKeys.length !== expectedFactKeys.length || factKeys.some((key, index) => key !== expectedFactKeys[index])) {
     throw new Error('Controller response facts have an unexpected field.')
   }
   if (
     !['disabled', 'pending', 'failed', 'timed_out', 'succeeded', 'rotation_pending', 'rotation_blocked'].includes(value.facts.state)
-    || ![value.facts.appId, value.facts.rotationId, value.facts.rulesetFingerprint, value.facts.runId]
+    || ![value.facts.rotationId, value.facts.runId, value.facts.sourceRunId]
       .every((fact) => fact === null || (typeof fact === 'string' && OPAQUE_ID.test(fact)))
+    || !(value.facts.appId === null || (typeof value.facts.appId === 'string' && /^[1-9]\d{0,19}$/.test(value.facts.appId)))
+    || !(value.facts.rulesetFingerprint === null || (
+      typeof value.facts.rulesetFingerprint === 'string' && FINGERPRINT.test(value.facts.rulesetFingerprint)
+    ))
+    || !(value.facts.sourceState === null || ['failed', 'timed_out'].includes(value.facts.sourceState))
     || !(value.facts.reviewedSha === null || (typeof value.facts.reviewedSha === 'string' && SHA.test(value.facts.reviewedSha)))
     || !(value.facts.keyGeneration === null || (Number.isSafeInteger(value.facts.keyGeneration) && value.facts.keyGeneration > 0))
   ) {
     throw new Error('Controller response facts are invalid.')
   }
-  if (request.runId && value.facts.runId !== request.runId) throw new Error('Controller response run binding is invalid.')
+  if (request.operation === 'retry_failed_controller_check') {
+    if (
+      value.facts.sourceRunId !== request.runId
+      || value.facts.sourceState !== request.expectedState
+      || value.facts.reviewedSha !== request.reviewedSha
+      || (value.disposition === 'accepted' && (
+        value.facts.state !== 'pending'
+        || value.facts.runId === null
+        || value.facts.runId === request.runId
+      ))
+    ) {
+      throw new Error('Controller retry response did not bind a fresh operation.')
+    }
+  } else {
+    if (value.facts.sourceRunId !== null) throw new Error('Controller response has an unexpected source run.')
+    if (value.facts.sourceState !== null) throw new Error('Controller response has an unexpected source state.')
+    if (request.runId && value.facts.runId !== request.runId) throw new Error('Controller response run binding is invalid.')
+  }
   if (request.reviewedSha && value.facts.reviewedSha !== request.reviewedSha) throw new Error('Controller response SHA binding is invalid.')
   if (request.appId && value.facts.appId !== request.appId) throw new Error('Controller response App binding is invalid.')
   if (request.rotationId && value.facts.rotationId !== request.rotationId) throw new Error('Controller response rotation binding is invalid.')
+  if (
+    request.operation === 'verify_exact_app_ruleset'
+    && (value.disposition !== 'accepted' || value.facts.rulesetFingerprint === null)
+  ) {
+    throw new Error('Controller ruleset verification did not prove the exact App binding.')
+  }
   return value
 }
 
