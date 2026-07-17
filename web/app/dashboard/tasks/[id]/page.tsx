@@ -1782,6 +1782,115 @@ function filesystemEffectiveState(pkg: WorkPackage): {
   }
 }
 
+type TaskFilesystemGrantDecision = {
+  capabilities: string[]
+  decision: 'approved' | 'denied'
+  grantDecisionRevision: string | null
+  id: string
+  reason: string | null
+}
+
+type TaskFilesystemGrantState = {
+  currentDecision: TaskFilesystemGrantDecision | null
+  pointerFingerprint: string | null
+  pointerVersion: string
+  workPackageId: string
+}
+
+export type FilesystemGrantExpectedPointer = {
+  currentDecisionId: string
+  currentDecisionRevision: string | null
+  pointerFingerprint: string
+  pointerVersion: string
+}
+
+/**
+ * A reapproval is valid only against the exact package decision the operator
+ * reviewed. An empty package has no prior decision, so its first decision (D1)
+ * intentionally has no expected pointer.
+ */
+export function filesystemGrantExpectedPointerFromState(
+  state: TaskFilesystemGrantState | null,
+): FilesystemGrantExpectedPointer | null {
+  if (!state?.currentDecision || !state.pointerFingerprint) return null
+  return {
+    currentDecisionId: state.currentDecision.id,
+    currentDecisionRevision: state.currentDecision.grantDecisionRevision,
+    pointerFingerprint: state.pointerFingerprint,
+    pointerVersion: state.pointerVersion,
+  }
+}
+
+function sameFilesystemGrantPointer(
+  left: FilesystemGrantExpectedPointer | null,
+  right: FilesystemGrantExpectedPointer | null,
+): boolean {
+  if (left === null || right === null) return left === right
+  return left.currentDecisionId === right.currentDecisionId &&
+    left.currentDecisionRevision === right.currentDecisionRevision &&
+    left.pointerFingerprint === right.pointerFingerprint &&
+    left.pointerVersion === right.pointerVersion
+}
+
+function taskFilesystemGrantStateFromResponse(
+  value: unknown,
+  workPackageId: string,
+): TaskFilesystemGrantState {
+  if (!isRecord(value) || !Array.isArray(value.grants)) {
+    throw new Error('Forge returned an invalid filesystem grant state.')
+  }
+  const rawState = value.grants.find((grant) => isRecord(grant) && grant.workPackageId === workPackageId)
+  if (!isRecord(rawState)) {
+    throw new Error('Forge did not return filesystem grant state for this work package.')
+  }
+  if (typeof rawState.pointerVersion !== 'string' || !/^(0|[1-9][0-9]*)$/.test(rawState.pointerVersion)) {
+    throw new Error('Forge returned an invalid filesystem grant pointer version.')
+  }
+  if (rawState.pointerFingerprint !== null && typeof rawState.pointerFingerprint !== 'string') {
+    throw new Error('Forge returned an invalid filesystem grant pointer fingerprint.')
+  }
+
+  if (rawState.currentDecision === null) {
+    return {
+      currentDecision: null,
+      pointerFingerprint: rawState.pointerFingerprint,
+      pointerVersion: rawState.pointerVersion,
+      workPackageId,
+    }
+  }
+  if (!isRecord(rawState.currentDecision)) {
+    throw new Error('Forge returned an invalid current filesystem decision.')
+  }
+  const decision = rawState.currentDecision
+  if (
+    typeof decision.id !== 'string' || decision.id === '' ||
+    (decision.decision !== 'approved' && decision.decision !== 'denied') ||
+    !Array.isArray(decision.capabilities) ||
+    !decision.capabilities.every((capability) => typeof capability === 'string') ||
+    (decision.reason !== null && typeof decision.reason !== 'string') ||
+    (decision.grantDecisionRevision !== null && (
+      typeof decision.grantDecisionRevision !== 'string' ||
+      !/^[1-9][0-9]*$/.test(decision.grantDecisionRevision)
+    )) ||
+    typeof rawState.pointerFingerprint !== 'string' || rawState.pointerFingerprint === ''
+  ) {
+    throw new Error('Forge returned an incomplete current filesystem decision pointer.')
+  }
+
+  return {
+    currentDecision: {
+      capabilities: [...decision.capabilities],
+      decision: decision.decision,
+      grantDecisionRevision: decision.grantDecisionRevision,
+      id: decision.id,
+      reason: decision.reason,
+    },
+    pointerFingerprint: rawState.pointerFingerprint,
+    pointerVersion: rawState.pointerVersion,
+    workPackageId,
+  }
+}
+
 function FilesystemGrantControls({
   onUpdated,
   pkg,
@@ -1799,6 +1908,10 @@ function FilesystemGrantControls({
   const [reason, setReason] = useState(effective.reason)
   const [saving, setSaving] = useState<'allow_once' | 'always_allow' | 'denied' | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [grantState, setGrantState] = useState<TaskFilesystemGrantState | null>(null)
+  const [grantStateLoading, setGrantStateLoading] = useState(true)
+  const [grantStateError, setGrantStateError] = useState<string | null>(null)
+  const [requiresReconfirmation, setRequiresReconfirmation] = useState(false)
   const packageId = stringField(pkg, ['id'])
   const packageStatus = stringField(pkg, ['status'])
 
@@ -1806,6 +1919,51 @@ function FilesystemGrantControls({
     setSelected(effective.capabilities.length > 0 ? effective.capabilities : summary.requestedCapabilities)
     setReason(effective.reason)
   }, [effective, summary])
+
+  const applyGrantState = useCallback((nextState: TaskFilesystemGrantState) => {
+    setGrantState(nextState)
+    const current = nextState.currentDecision
+    if (!current) return
+    setSelected(current.decision === 'approved' ? current.capabilities : summary.requestedCapabilities)
+    setReason(current.reason ?? '')
+  }, [summary.requestedCapabilities])
+
+  const loadGrantState = useCallback(async (signal?: AbortSignal) => {
+    setGrantStateLoading(true)
+    setGrantStateError(null)
+    try {
+      const response = await fetch(`/api/tasks/${taskId}/filesystem-grants`, {
+        cache: 'no-store',
+        signal,
+      })
+      const body: unknown = await response.json().catch(() => null)
+      if (!response.ok) {
+        const message = isRecord(body) && typeof body.error === 'string'
+          ? body.error
+          : 'Failed to load the current filesystem decision.'
+        throw new Error(message)
+      }
+      const nextState = taskFilesystemGrantStateFromResponse(body, packageId)
+      if (!signal?.aborted) applyGrantState(nextState)
+      return nextState
+    } catch (loadError) {
+      if (signal?.aborted) return null
+      const message = loadError instanceof Error
+        ? loadError.message
+        : 'Failed to load the current filesystem decision.'
+      setGrantStateError(message)
+      throw loadError
+    } finally {
+      if (!signal?.aborted) setGrantStateLoading(false)
+    }
+  }, [applyGrantState, packageId, taskId])
+
+  useEffect(() => {
+    if (packageId === '') return
+    const controller = new AbortController()
+    void loadGrantState(controller.signal).catch(() => undefined)
+    return () => controller.abort()
+  }, [loadGrantState, packageId])
 
   if (summary.requestedCapabilities.length === 0 || packageId === '') return null
 
@@ -1817,9 +1975,14 @@ function FilesystemGrantControls({
   const deniedRequired = effective.status === 'denied' && summary.blockingCapabilities.length > 0
 
   async function submit(decision: 'approved' | 'denied', grantMode: 'allow_once' | 'always_allow' = 'always_allow') {
+    if (!grantState || grantStateLoading) {
+      setError('Wait for Forge to load the current filesystem decision before confirming.')
+      return
+    }
     setSaving(decision === 'approved' ? grantMode : 'denied')
     setError(null)
     try {
+      const expectedPointer = filesystemGrantExpectedPointerFromState(grantState)
       const res = await fetch(`/api/tasks/${taskId}/filesystem-grants`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -1831,16 +1994,49 @@ function FilesystemGrantControls({
             capabilities: decision === 'approved' ? selected : [],
             grantMode,
             reason: reason.trim() || undefined,
+            ...(expectedPointer ? { expectedPointer } : {}),
           }],
         }),
       })
-      const body = await res.json().catch(() => ({}))
+      const body: unknown = await res.json().catch(() => ({}))
+      if (res.status === 409) {
+        try {
+          const refreshedState = await loadGrantState()
+          const refreshedPointer = filesystemGrantExpectedPointerFromState(refreshedState)
+          if (!sameFilesystemGrantPointer(expectedPointer, refreshedPointer)) {
+            setRequiresReconfirmation(true)
+            setError('The filesystem decision changed while you were reviewing it. Forge refreshed the current decision; review it and choose an action again to confirm.')
+          } else {
+            setRequiresReconfirmation(false)
+            setError(isRecord(body) && typeof body.error === 'string'
+              ? body.error
+              : 'Forge could not save this filesystem decision.')
+          }
+        } catch {
+          setRequiresReconfirmation(false)
+          setError('Forge rejected this filesystem decision and could not refresh the current pointer. Reload the task before confirming another decision.')
+        }
+        return
+      }
       if (!res.ok) {
-        throw new Error(body.error ?? 'Failed to save filesystem grant')
+        throw new Error(isRecord(body) && typeof body.error === 'string'
+          ? body.error
+          : 'Failed to save filesystem grant')
+      }
+      setRequiresReconfirmation(false)
+      let refreshError: string | null = null
+      try {
+        await loadGrantState()
+      } catch {
+        refreshError = 'The decision was saved, but Forge could not refresh its current pointer. Reload the task before making another decision.'
       }
       await onUpdated()
       if (res.status === 202) {
-        setError(body.error ?? 'Filesystem grant saved, but Forge could not requeue the recovered task. Retry handoff manually.')
+        setError(isRecord(body) && typeof body.error === 'string'
+          ? body.error
+          : 'Filesystem grant saved, but Forge could not requeue the recovered task. Retry handoff manually.')
+      } else if (refreshError) {
+        setError(refreshError)
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An unexpected error occurred')
@@ -1853,10 +2049,22 @@ function FilesystemGrantControls({
     <div className="rounded-md border border-border bg-background px-2.5 py-2">
       <div className="flex flex-wrap items-center gap-2">
         <p className="font-medium text-muted-foreground">Filesystem context grant</p>
-        <Badge variant="outline" className={statusBadgeClass(effective.status)}>{statusLabel(effective.status)}</Badge>
+        <Badge variant="outline" className={statusBadgeClass(grantState?.currentDecision?.decision ?? effective.status)}>
+          {statusLabel(grantState?.currentDecision?.decision ?? effective.status)}
+        </Badge>
         {effective.grantMode !== '' && <Badge variant="secondary">{statusLabel(effective.grantMode)}</Badge>}
         {summary.blockingCapabilities.length > 0 && <Badge variant="secondary">required</Badge>}
       </div>
+      {grantStateLoading && <p role="status" className="mt-2 text-xs text-muted-foreground">Loading current filesystem decision…</p>}
+      {grantState?.currentDecision && (
+        <p className="mt-2 break-all font-mono text-[11px] text-muted-foreground">
+          Current decision {grantState.currentDecision.id}
+          {grantState.currentDecision.grantDecisionRevision
+            ? ` · revision ${grantState.currentDecision.grantDecisionRevision}`
+            : ''}
+          {` · pointer ${grantState.pointerVersion}`}
+        </p>
+      )}
       <div className="mt-2 flex flex-wrap gap-2">
         {FILESYSTEM_CAPABILITY_OPTIONS.filter((capability) => summary.requestedCapabilities.includes(capability)).map((capability) => (
           <label key={capability} className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 font-mono text-[11px] text-foreground">
@@ -1897,31 +2105,31 @@ function FilesystemGrantControls({
           />
           <div className="flex flex-wrap gap-2">
             <Button
-              disabled={saving !== null || approveDisabled}
+              disabled={saving !== null || grantStateLoading || grantState === null || grantStateError !== null || approveDisabled}
               onClick={() => void submit('approved', 'allow_once')}
               size="sm"
               type="button"
               variant="outline"
             >
-              {saving === 'allow_once' ? 'Saving...' : 'Allow once'}
+              {saving === 'allow_once' ? 'Saving...' : requiresReconfirmation ? 'Confirm allow once' : 'Allow once'}
             </Button>
             <Button
-              disabled={saving !== null || approveDisabled}
+              disabled={saving !== null || grantStateLoading || grantState === null || grantStateError !== null || approveDisabled}
               onClick={() => void submit('approved', 'always_allow')}
               size="sm"
               type="button"
               variant="outline"
             >
-              {saving === 'always_allow' ? 'Saving...' : 'Always allow'}
+              {saving === 'always_allow' ? 'Saving...' : requiresReconfirmation ? 'Confirm always allow' : 'Always allow'}
             </Button>
             <Button
-              disabled={saving !== null}
+              disabled={saving !== null || grantStateLoading || grantState === null || grantStateError !== null}
               onClick={() => void submit('denied')}
               size="sm"
               type="button"
               variant="outline"
             >
-              {saving === 'denied' ? 'Saving...' : 'Deny'}
+              {saving === 'denied' ? 'Saving...' : requiresReconfirmation ? 'Confirm deny' : 'Deny'}
             </Button>
           </div>
         </div>
@@ -1929,6 +2137,7 @@ function FilesystemGrantControls({
       {effective.grantApprovalId !== '' && (
         <p className="mt-2 break-all font-mono text-[11px] text-muted-foreground">Grant {effective.grantApprovalId}</p>
       )}
+      {grantStateError !== null && <p role="alert" className="mt-2 text-xs text-destructive">{grantStateError}</p>}
       {error !== null && <p role="alert" className="mt-2 text-xs text-destructive">{error}</p>}
     </div>
   )
