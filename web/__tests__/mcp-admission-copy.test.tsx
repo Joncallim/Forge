@@ -239,6 +239,29 @@ describe('MCP admission operator copy', () => {
       twoActions.indexOf('Do not retry this package'),
     )
   })
+
+  it('renders bounded packet facts as semantic description-list text', () => {
+    const markup = renderToStaticMarkup(
+      <McpPresentation presentation={{
+        statusKey: 'approved',
+        tone: 'positive',
+        badgeText: 'Evidence retained',
+        headline: 'Bounded context packet completed',
+        body: 'Only bounded metadata is shown.',
+        actions: [],
+        facts: [
+          { label: 'Included files', value: '4' },
+          { label: 'Delivery', value: 'Submitted to worker' },
+        ],
+      }} />,
+    )
+
+    expect(markup).toContain('<dl')
+    expect(markup).toContain('<dt')
+    expect(markup).toContain('<dd')
+    expect(markup.indexOf('Included files')).toBeLessThan(markup.indexOf('Delivery'))
+    expect(markup).not.toContain('role="group"')
+  })
 })
 
 describe('project MCP operator copy', () => {
