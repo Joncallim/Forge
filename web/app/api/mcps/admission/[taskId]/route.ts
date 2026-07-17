@@ -5,6 +5,7 @@ import { asc, eq } from 'drizzle-orm'
 import { db } from '@/db'
 import { workPackages } from '@/db/schema'
 import { getSession } from '@/lib/session'
+import { getAccessibleTask } from '@/lib/task-access'
 import {
   computeFreshnessFingerprint,
   type S5AdmissionPresenter,
@@ -22,13 +23,17 @@ export async function GET(
     if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
     const { taskId } = await params
-    const packages = await db
+    const task = await getAccessibleTask(taskId, session.userId)
+    if (!task || task.submittedBy !== session.userId) {
+      return NextResponse.json({ error: 'Task not found' }, { status: 404 })
+    }
+    const pkgRecords = await db
       .select()
       .from(workPackages)
       .where(eq(workPackages.taskId, taskId))
       .orderBy(asc(workPackages.sequence))
 
-    const pkgPresenters: S5PackagePresenter[] = packages.map((pkg) => {
+    const pkgPresenters: S5PackagePresenter[] = pkgRecords.map((pkg) => {
       const summary = summarizeFilesystemCapabilities({
         mcpRequirements: pkg.mcpRequirements,
         metadata: pkg.metadata,
@@ -52,7 +57,7 @@ export async function GET(
 
     const presenter: S5AdmissionPresenter = {
       computedAt: new Date().toISOString(),
-      freshnessFingerprint: computeFreshnessFingerprint({ taskId, packageIds: packages.map((p) => p.id) }),
+      freshnessFingerprint: computeFreshnessFingerprint({ taskId, packageIds: pkgRecords.map((p) => p.id) }),
       cacheBypassId: '',
       taskId,
       packages: pkgPresenters,

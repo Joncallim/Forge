@@ -5,6 +5,7 @@ import { asc, eq } from 'drizzle-orm'
 import { db } from '@/db'
 import { filesystemMcpRuntimeAudits, workPackages } from '@/db/schema'
 import { getSession } from '@/lib/session'
+import { getAccessibleTask } from '@/lib/task-access'
 import { computeFreshnessFingerprint } from '@/lib/mcps/s5-server-reader'
 
 export async function GET(
@@ -15,6 +16,10 @@ export async function GET(
     const session = await getSession(request)
     if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     const { taskId } = await params
+    const task = await getAccessibleTask(taskId, session.userId)
+    if (!task || task.submittedBy !== session.userId) {
+      return NextResponse.json({ error: 'Task not found' }, { status: 404 })
+    }
 
     const audits = await db
       .select()

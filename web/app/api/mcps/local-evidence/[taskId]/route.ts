@@ -5,6 +5,7 @@ import { eq } from 'drizzle-orm'
 import { db } from '@/db'
 import { workPackageLocalRunEvidence, workPackages } from '@/db/schema'
 import { getSession } from '@/lib/session'
+import { getAccessibleTask } from '@/lib/task-access'
 import { computeFreshnessFingerprint } from '@/lib/mcps/s5-server-reader'
 
 export async function GET(
@@ -15,10 +16,13 @@ export async function GET(
     const session = await getSession(request)
     if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     const { taskId } = await params
+    const task = await getAccessibleTask(taskId, session.userId)
+    if (!task || task.submittedBy !== session.userId) {
+      return NextResponse.json({ error: 'Task not found' }, { status: 404 })
+    }
 
     const evidence = await db
       .select({
-        claimToken: workPackageLocalRunEvidence.claimToken,
         state: workPackageLocalRunEvidence.state,
         leaseExpiresAt: workPackageLocalRunEvidence.leaseExpiresAt,
         terminalAt: workPackageLocalRunEvidence.terminalAt,
@@ -31,7 +35,6 @@ export async function GET(
       freshnessFingerprint: computeFreshnessFingerprint({ taskId, evidenceCount: evidence.length }),
       taskId,
       evidenceRecords: evidence.map((e) => ({
-        claimToken: e.claimToken,
         state: e.state,
         leaseExpiresAt: e.leaseExpiresAt?.toISOString() ?? null,
         terminalAt: e.terminalAt?.toISOString() ?? null,
