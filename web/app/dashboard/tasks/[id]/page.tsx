@@ -4730,12 +4730,13 @@ export default function TaskDetailPage() {
 
 
 export function filesystemGrantExpectedPointerFromState(state: {
-  currentDecision?: { id?: string } | null
+  currentDecision?: Record<string, unknown> | null
   pointerFingerprint?: string | null
   pointerVersion?: string | null
+  workPackageId?: string
 }): { currentDecisionId: string | null; currentDecisionRevision: string | null; pointerFingerprint: string; pointerVersion: string } {
   return {
-    currentDecisionId: state?.currentDecision?.id ?? null,
+    currentDecisionId: typeof state?.currentDecision?.id === 'string' ? state.currentDecision.id : null,
     currentDecisionRevision: null,
     pointerFingerprint: state?.pointerFingerprint ?? '',
     pointerVersion: state?.pointerVersion ?? '0',
