@@ -56,6 +56,12 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - run: npm install
+      - name: Bootstrap Epic 172 release roles
+        run: npm run protocol:bootstrap-epic-172-release-roles
+        env:
+          # The disposable CI database login owns this isolated PostgreSQL
+          # service and is therefore the short-lived administrator here.
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_e2e
       - run: npm run db:migrate
       - run: npm run lint
       - run: npx tsc --noEmit
