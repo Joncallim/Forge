@@ -155,6 +155,7 @@ function freshLockSelectMock() {
         id: latestFreshAdmission.projectId,
         localPath: latestFreshAdmission.localPath ?? null,
         mcpConfig: latestFreshAdmission.mcpConfig ?? null,
+        rootBindingRevision: latestFreshAdmission.rootBindingRevision ?? BigInt(0),
       }])
     }
     if (call === 2) {
@@ -202,6 +203,7 @@ function freshAdmissionRow(
     projectId: project.id,
     localPath: project.localPath ?? null,
     mcpConfig: project.mcpConfig ?? null,
+    rootBindingRevision: project.rootBindingRevision ?? BigInt(0),
   }
 }
 
@@ -697,18 +699,15 @@ describe('handoffApprovedWorkPackages', () => {
       blockedReason: expect.stringContaining('requires filesystem grant approval'),
       claimedPackageId: null,
       status: 'blocked',
-      terminalBlock: true,
+      taskDisposition: 'operator_hold',
     })
-    // Failed at the gate: the package carries the grant-block marker and no
+    // Held at the gate: the package carries the grant-block marker and no
     // implementation run/transaction was ever started, so no attempt is spent.
     expect(failedPackageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      status: 'failed',
+      status: 'blocked',
       metadata: expect.anything(),
     }))
-    expect(failedTaskUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      errorMessage: expect.stringContaining('requires filesystem grant approval'),
-      status: 'failed',
-    }))
+    expect(failedTaskUpdate.set).not.toHaveBeenCalled()
     expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
   })
 
@@ -716,6 +715,7 @@ describe('handoffApprovedWorkPackages', () => {
     const project = {
       id: 'project-1',
       mcpConfig: { profile: 'default', requiredMcps: [], overrides: {} },
+      rootBindingRevision: BigInt(1),
     }
     const pkg = {
       id: 'pkg-fs-project', assignedRole: 'backend', harnessId: 'harness-1',
@@ -724,8 +724,9 @@ describe('handoffApprovedWorkPackages', () => {
       }],
       metadata: {
         mcpGrantPhases: { effective: {
-          schemaVersion: 1, phase: 'effective', source: 'project-filesystem-approval',
+          schemaVersion: 2, phase: 'effective', source: 'project-filesystem-approval',
           runtimeEnforcement: 'bounded_context_packet', status: 'approved',
+          grantDecisionRevision: '1', rootBindingRevision: '1',
           grants: [{
             mcpId: 'filesystem', status: 'approved', capabilities: ['filesystem.project.read'],
           }],
@@ -751,10 +752,10 @@ describe('handoffApprovedWorkPackages', () => {
       blockedReason: expect.stringContaining('project-level filesystem grant'),
       claimedPackageId: null,
       status: 'blocked',
-      terminalBlock: true,
+      taskDisposition: 'operator_hold',
     })
     expect(failedPackageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      status: 'failed',
+      status: 'blocked',
       metadata: expect.anything(),
     }))
     expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
@@ -762,7 +763,7 @@ describe('handoffApprovedWorkPackages', () => {
 
   it('uses a current approved project filesystem grant even when the package has no persisted project-effective phase', async () => {
     const projectGrant = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       mcpId: 'filesystem',
       status: 'approved',
       grantMode: 'always_allow',
@@ -771,9 +772,12 @@ describe('handoffApprovedWorkPackages', () => {
       approvedAt: '2026-07-14T00:00:00.000Z',
       approvedBy: 'user-1',
       reason: 'Approved project context.',
+      grantDecisionRevision: '1',
+      rootBindingRevision: '1',
     }
     const project = {
       id: 'project-1',
+      rootBindingRevision: BigInt(1),
       mcpConfig: {
         profile: 'default',
         requiredMcps: ['filesystem'],

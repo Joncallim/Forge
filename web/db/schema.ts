@@ -190,6 +190,16 @@ export const projects = pgTable('projects', {
     .$type<ProjectMcpConfig>()
     .notNull()
     .default(sql`'{"profile":"default","requiredMcps":["filesystem","github"],"overrides":{}}'::jsonb`),
+  // S3 serializes this BIGINT as a canonical decimal string at every JSON/API
+  // boundary. Database order, never timestamps, decides grant precedence.
+  grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' })
+    .notNull()
+    .default(BigInt(0)),
+  // Zero is the explicit unbound state. S4 binds a project root by advancing
+  // this counter; S3 never upgrades a legacy decision implicitly.
+  rootBindingRevision: bigint('root_binding_revision', { mode: 'bigint' })
+    .notNull()
+    .default(BigInt(0)),
   defaultBranch: text('default_branch').notNull().default('main'),
   createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
@@ -787,12 +797,14 @@ export const filesystemMcpGrantApprovals = pgTable(
   'filesystem_mcp_grant_approvals',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    taskId: uuid('task_id')
+    projectId: uuid('project_id')
       .notNull()
+      .references(() => projects.id, { onDelete: 'restrict' }),
+    taskId: uuid('task_id')
       .references(() => tasks.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id')
-      .notNull()
       .references(() => workPackages.id, { onDelete: 'restrict' }),
+    decisionScope: text('decision_scope').notNull().default('package'),
     decidedBy: uuid('decided_by').references(() => users.id, {
       onDelete: 'set null',
     }),
@@ -804,18 +816,61 @@ export const filesystemMcpGrantApprovals = pgTable(
       .$type<Record<string, unknown>>()
       .notNull()
       .default(sql`'{}'::jsonb`),
+    grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' }),
+    rootBindingRevision: bigint('root_binding_revision', { mode: 'bigint' }),
+    // Fresh only for allow_once approvals. It is immutable with the decision
+    // row and may never be reused after an S4 consumer records issuance.
+    grantNonce: uuid('grant_nonce'),
+    pointerFingerprint: text('pointer_fingerprint'),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
   },
   (t) => [
-    uniqueIndex('filesystem_mcp_grant_approvals_work_package_id_idx').on(t.workPackageId),
+    index('filesystem_mcp_grant_approvals_work_package_id_idx').on(t.workPackageId),
+    index('filesystem_mcp_grant_approvals_project_id_idx').on(t.projectId),
+    uniqueIndex('filesystem_mcp_grant_approvals_grant_nonce_idx').on(t.grantNonce),
     index('filesystem_mcp_grant_approvals_task_id_idx').on(t.taskId),
     index('filesystem_mcp_grant_approvals_decision_idx').on(t.decision),
+    index('filesystem_mcp_grant_approvals_revision_idx').on(t.grantDecisionRevision),
   ],
 )
 
 export type FilesystemMcpGrantApproval = InferSelectModel<typeof filesystemMcpGrantApprovals>
 export type NewFilesystemMcpGrantApproval = InferInsertModel<typeof filesystemMcpGrantApprovals>
+
+// ---------------------------------------------------------------------------
+// filesystemMcpCurrentDecisionPointers
+// ---------------------------------------------------------------------------
+// Exactly one authority slot is preallocated for each package. Immutable
+// decisions are appended above; this pointer advances with an exact compare and
+// set, so concurrent reapprovals have one winner.
+export const filesystemMcpCurrentDecisionPointers = pgTable(
+  'filesystem_mcp_current_decision_pointers',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id')
+      .notNull()
+      .references(() => tasks.id, { onDelete: 'cascade' }),
+    workPackageId: uuid('work_package_id')
+      .notNull()
+      .references(() => workPackages.id, { onDelete: 'cascade' }),
+    currentDecisionId: uuid('current_decision_id')
+      .references(() => filesystemMcpGrantApprovals.id, { onDelete: 'restrict' }),
+    currentDecisionRevision: bigint('current_decision_revision', { mode: 'bigint' }),
+    pointerFingerprint: text('pointer_fingerprint').notNull(),
+    pointerVersion: bigint('pointer_version', { mode: 'bigint' }).notNull().default(BigInt(0)),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('filesystem_mcp_current_decision_pointers_work_package_idx').on(t.workPackageId),
+    index('filesystem_mcp_current_decision_pointers_task_idx').on(t.taskId),
+    uniqueIndex('filesystem_mcp_current_decision_pointers_current_decision_idx').on(t.currentDecisionId),
+  ],
+)
+
+export type FilesystemMcpCurrentDecisionPointer = InferSelectModel<typeof filesystemMcpCurrentDecisionPointers>
+export type NewFilesystemMcpCurrentDecisionPointer = InferInsertModel<typeof filesystemMcpCurrentDecisionPointers>
 
 // ---------------------------------------------------------------------------
 // workPackageDependencies

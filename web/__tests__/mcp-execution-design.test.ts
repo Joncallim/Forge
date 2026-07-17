@@ -1089,7 +1089,7 @@ describe('canonical admission adapters', () => {
       overrides: {},
       grants: {
         filesystem: {
-          schemaVersion: 1,
+          schemaVersion: 2,
           mcpId: 'filesystem',
           status: 'approved',
           grantMode: 'always_allow',
@@ -1098,10 +1098,16 @@ describe('canonical admission adapters', () => {
           approvedAt: '2026-07-14T00:00:00.000Z',
           approvedBy: 'user-1',
           reason: 'Approved for this project.',
+          grantDecisionRevision: '1',
+          rootBindingRevision: '1',
         },
       },
     }
-    const mcpOverview = { ...overview([healthyFilesystem]), config: projectMcpConfig }
+    const mcpOverview = {
+      ...overview([healthyFilesystem]),
+      config: projectMcpConfig,
+      rootBindingRevision: '1',
+    }
     const preview = deriveMcpGrantDecisions(parsed, mcpOverview)
     const requirementKey = parsed.requirements[0].requirementKey as string
     const rawPolicy = {
@@ -1121,6 +1127,7 @@ describe('canonical admission adapters', () => {
       mcpRequirements: [rawPolicy],
       metadata: { mcpGrants: preview.decisions },
       projectMcpConfig,
+      projectRootBindingRevision: '1',
       title: 'Backend package',
     })
 

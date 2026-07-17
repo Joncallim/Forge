@@ -49,13 +49,19 @@ export function normalizeProjectMcpConfig(rawConfig: Project['mcpConfig'] | null
     ? Array.from(new Set(raw.requiredMcps.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)))
     : DEFAULT_PROJECT_MCP_CONFIG.requiredMcps
   const filesystemGrant = projectFilesystemGrantFromConfig(raw)
-  const grants = filesystemGrant ? { filesystem: filesystemGrant } : undefined
+  const rawGrants = raw.grants && typeof raw.grants === 'object' && !Array.isArray(raw.grants)
+    ? raw.grants
+    : {}
+  const grants = {
+    ...Object.fromEntries(Object.entries(rawGrants).filter(([key]) => key !== 'filesystem')),
+    ...(filesystemGrant ? { filesystem: filesystemGrant } : {}),
+  }
 
   return {
     profile: raw.profile === 'custom' ? 'custom' : 'default',
     requiredMcps,
     overrides: raw.overrides && typeof raw.overrides === 'object' ? raw.overrides : {},
-    ...(grants ? { grants } : {}),
+    ...(Object.keys(grants).length > 0 ? { grants } : {}),
   }
 }
 
@@ -475,6 +481,7 @@ export async function getProjectMcpOverview(
 
   return {
     projectId: project.id,
+    rootBindingRevision: (project.rootBindingRevision ?? BigInt(0)).toString(),
     config,
     catalog: catalogEntries(),
     mcpsRoot: workspace.mcpsRoot,

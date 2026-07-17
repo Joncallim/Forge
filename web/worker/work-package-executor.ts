@@ -15,6 +15,7 @@ import {
   projectFilesystemGrantCovers,
   summarizeFilesystemCapabilities,
 } from '../lib/mcps/filesystem-grants'
+import { readEffectiveGrantState } from '../lib/mcps/admission'
 import {
   buildEmptyExecutionContextPacket,
   buildExecutionContextPacket,
@@ -1188,6 +1189,7 @@ function metadataRecord(value: unknown, key: string): Record<string, unknown> {
 function effectiveFilesystemGrant(
   workPackage: WorkPackageRow,
   projectMcpConfig: unknown = null,
+  projectRootBindingRevision: unknown = null,
 ): {
   capabilities: string[]
   grantApprovalId: string | null
@@ -1210,13 +1212,60 @@ function effectiveFilesystemGrant(
       source: 'project-filesystem-approval',
     }
     : null
+  const summary = summarizeFilesystemCapabilities({
+    mcpRequirements: workPackage.mcpRequirements,
+    metadata: workPackage.metadata,
+    projectMcpConfig,
+    projectRootBindingRevision,
+  })
+  const requiredCapabilities = summary.blockingCapabilities.length > 0
+    ? summary.blockingCapabilities
+    : summary.boundedRuntimeRequestedCapabilities
+  const state = readEffectiveGrantState(
+    { metadata: workPackage.metadata },
+    {
+      mcpConfig: projectMcpConfig,
+      rootBindingRevision: projectRootBindingRevision,
+    },
+    requiredCapabilities,
+  )
   if (
-    effective.schemaVersion !== 1 ||
+    effective.schemaVersion !== 2 ||
     effective.phase !== 'effective' ||
     effective.runtimeEnforcement !== 'bounded_context_packet' ||
     effective.status !== 'approved'
   ) {
     return { capabilities: [], grantApprovalId, grantMode, projectGrant, projectGrantRevoked: false }
+  }
+  const envelopeCapabilities = new Set<string>()
+  for (const grant of promptRecordArray(effective.grants)) {
+    if (cleanPromptText(grant.mcpId, 80) !== 'filesystem') continue
+    if (cleanPromptText(grant.status, 80) !== 'approved') continue
+    for (const capability of mcpCapabilityList(grant)) {
+      const alias = canonicalFilesystemProjectCapability(capability)
+      if (alias) envelopeCapabilities.add(alias)
+    }
+  }
+  // A package with no bounded filesystem request must not silently carry an
+  // approved runtime grant. Surface the orphaned authority so the runtime
+  // projection below blocks instead of treating it as "not requested".
+  if (requiredCapabilities.length === 0 && envelopeCapabilities.size > 0) {
+    return {
+      capabilities: [...envelopeCapabilities].sort(),
+      grantApprovalId,
+      grantMode,
+      projectGrant,
+      projectGrantRevoked: false,
+    }
+  }
+  if (state.phase !== 'approved' || state.consumed === true) {
+    return {
+      capabilities: [],
+      grantApprovalId: null,
+      grantMode,
+      projectGrant,
+      projectGrantRevoked: state.phase === 'revoked',
+    }
   }
   if (
     effective.source === 'project-filesystem-approval' &&
@@ -1224,21 +1273,13 @@ function effectiveFilesystemGrant(
       mcpConfig: projectMcpConfig,
       mcpRequirements: workPackage.mcpRequirements,
       metadata: workPackage.metadata,
+      projectRootBindingRevision,
     })
   ) {
     return { capabilities: [], grantApprovalId: null, grantMode, projectGrant, projectGrantRevoked: true }
   }
-  const capabilities = new Set<string>()
-  for (const grant of promptRecordArray(effective.grants)) {
-    if (cleanPromptText(grant.mcpId, 80) !== 'filesystem') continue
-    if (cleanPromptText(grant.status, 80) !== 'approved') continue
-    for (const capability of mcpCapabilityList(grant)) {
-      const alias = canonicalFilesystemProjectCapability(capability)
-      if (alias) capabilities.add(alias)
-    }
-  }
   return {
-    capabilities: [...capabilities].sort(),
+    capabilities: [...envelopeCapabilities].sort(),
     grantApprovalId: effective.source === 'project-filesystem-approval' ? null : grantApprovalId,
     grantMode,
     projectGrant,
@@ -1246,8 +1287,16 @@ function effectiveFilesystemGrant(
   }
 }
 
-function filesystemRuntimeMetadata(workPackage: WorkPackageRow, projectMcpConfig: unknown): Record<string, unknown> {
-  const effectiveGrant = effectiveFilesystemGrant(workPackage, projectMcpConfig)
+function filesystemRuntimeMetadata(
+  workPackage: WorkPackageRow,
+  projectMcpConfig: unknown,
+  projectRootBindingRevision: unknown,
+): Record<string, unknown> {
+  const effectiveGrant = effectiveFilesystemGrant(
+    workPackage,
+    projectMcpConfig,
+    projectRootBindingRevision,
+  )
   const capabilities = effectiveGrant.capabilities
   const {
     blockingCapabilities,
@@ -1799,7 +1848,11 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
     throw new Error('Execution attempt number must be a positive integer.')
   }
 
-  const filesystemRuntime = filesystemRuntimeMetadata(context.workPackage, context.project.mcpConfig)
+  const filesystemRuntime = filesystemRuntimeMetadata(
+    context.workPackage,
+    context.project.mcpConfig,
+    context.project.rootBindingRevision,
+  )
   if (filesystemRuntime.status === 'blocked') {
     await recordFilesystemRuntimeAuditBestEffort({
       agentRunId: context.agentRunId ?? null,

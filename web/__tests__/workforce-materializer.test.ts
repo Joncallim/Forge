@@ -454,7 +454,7 @@ describe('workforce materializer', () => {
         projectMcpConfig: {
           grants: {
             filesystem: {
-              schemaVersion: 1,
+              schemaVersion: 2,
               mcpId: 'filesystem',
               status: 'approved',
               grantMode: 'always_allow',
@@ -463,9 +463,12 @@ describe('workforce materializer', () => {
               approvedAt: '2026-07-05T00:00:00.000Z',
               approvedBy: 'user-1',
               reason: 'Trusted project.',
+              grantDecisionRevision: '1',
+              rootBindingRevision: '1',
             },
           },
         },
+        projectRootBindingRevision: '1',
       },
     )
 

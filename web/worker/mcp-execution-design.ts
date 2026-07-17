@@ -1204,7 +1204,10 @@ function admissionForAgent(design: McpExecutionDesign, packageIdentity: string, 
     statusFor: (mcpId) => statusFor(overview, mcpId),
     effectiveGrantFor: ({ requiredCapabilities }) => readEffectiveGrantState(
       { metadata: {} },
-      { mcpConfig: overview.config },
+      {
+        mcpConfig: overview.config,
+        rootBindingRevision: overview.rootBindingRevision,
+      },
       requiredCapabilities,
     ),
     hasPromptOnlyContextFor: ({ requirementKey, mcpId }) => contexts.has(`${requirementKey}\u0000${mcpId}`),
@@ -1551,6 +1554,7 @@ export type WorkPackageMcpAdmissionInput = {
   mcpRequirements?: unknown
   metadata?: unknown
   projectMcpConfig?: unknown
+  projectRootBindingRevision?: unknown
   title?: string
 }
 
@@ -1564,7 +1568,10 @@ function admitWorkPackageMcpBrokerUnchecked(input: WorkPackageMcpAdmissionInput)
     statusFor: (mcpId) => statusFor(input.mcpOverview, mcpId),
     effectiveGrantFor: ({ requiredCapabilities }) => readEffectiveGrantState(
       { metadata: input.metadata },
-      { mcpConfig: input.projectMcpConfig ?? {} },
+      {
+        mcpConfig: input.projectMcpConfig ?? {},
+        rootBindingRevision: input.projectRootBindingRevision,
+      },
       requiredCapabilities,
     ),
     hasPromptOnlyContextFor: (entry) => brokerHasPromptContext(input.metadata, entry, entries),

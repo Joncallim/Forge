@@ -62,6 +62,8 @@ export type ProjectMcpStatus = {
 
 export type ProjectMcpOverview = {
   projectId: string
+  /** Internal authority binding; absent legacy/test fixtures fail closed. */
+  rootBindingRevision?: string
   config: ProjectMcpConfig
   catalog: McpCatalogEntry[]
   mcpsRoot: string

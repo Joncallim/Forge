@@ -47,6 +47,7 @@ function admissionForLockedPackage(input: {
   mcpConfig: unknown
   mcpRequirements: unknown
   metadata: unknown
+  rootBindingRevision: unknown
   title: string
 }): McpWorkPackageAdmission {
   return admitWorkPackageMcpBroker({
@@ -55,6 +56,7 @@ function admissionForLockedPackage(input: {
     mcpRequirements: input.mcpRequirements,
     metadata: input.metadata,
     projectMcpConfig: input.mcpConfig,
+    projectRootBindingRevision: input.rootBindingRevision,
     title: input.title,
   })
 }
@@ -72,12 +74,18 @@ function approvalHealthSnapshot(admissions: McpWorkPackageAdmission[]): McpHealt
 function healthSnapshotMatchesLockedPolicy(
   overview: ProjectMcpOverview,
   capturedLocalPath: unknown,
-  lockedProject: { localPath?: unknown; mcpConfig: ProjectMcpOverview['config'] },
+  lockedProject: {
+    localPath?: unknown
+    mcpConfig: ProjectMcpOverview['config']
+    rootBindingRevision?: unknown
+  },
 ): boolean {
   // The overview is captured before the transaction because probing MCP health
   // may write cache rows. Approval may consume it only while the normalized
   // project policy it was captured for is still the locked project policy.
   return capturedLocalPath === lockedProject.localPath &&
+    (overview.rootBindingRevision === undefined ||
+      overview.rootBindingRevision === String(lockedProject.rootBindingRevision ?? 0)) &&
     isDeepStrictEqual(
       normalizeProjectMcpConfig(overview.config),
       normalizeProjectMcpConfig(lockedProject.mcpConfig),
@@ -324,6 +332,7 @@ export async function POST(
         mcpConfig: lockedProject.mcpConfig,
         mcpRequirements: pkg.mcpRequirements,
         metadata: pkg.metadata,
+        rootBindingRevision: lockedProject.rootBindingRevision,
         title: pkg.title,
       }))
       const blockedIndex = admissions.findIndex((admission) => admission.aggregate.status === 'blocked')
@@ -358,6 +367,7 @@ export async function POST(
           mcpConfig: lockedProject.mcpConfig,
           mcpRequirements: pkg.mcpRequirements,
           metadata: pkg.metadata,
+          projectRootBindingRevision: lockedProject.rootBindingRevision,
         })
         if (!grant) return pkg
         const metadata = isFilesystemGrantRecord(pkg.metadata) ? pkg.metadata : {}
@@ -368,7 +378,7 @@ export async function POST(
             ...metadata,
             mcpGrantPhases: {
               ...phases,
-              schemaVersion: 1,
+              schemaVersion: 2,
               effective: projectFilesystemEffectivePhase(grant),
             },
           },

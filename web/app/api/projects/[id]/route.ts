@@ -76,9 +76,19 @@ async function assertExistingLocalPathWithinWorkspace(
 function projectResponse<T extends { localPath: string | null }>(
   project: T,
   workspace: WorkspaceSettings,
-): T & { displayLocalPath: string | null } {
+) {
+  const revisions = project as T & {
+    grantDecisionRevision?: bigint
+    rootBindingRevision?: bigint
+  }
   return {
     ...project,
+    ...(typeof revisions.grantDecisionRevision === 'bigint'
+      ? { grantDecisionRevision: revisions.grantDecisionRevision.toString() }
+      : {}),
+    ...(typeof revisions.rootBindingRevision === 'bigint'
+      ? { rootBindingRevision: revisions.rootBindingRevision.toString() }
+      : {}),
     displayLocalPath: project.localPath
       ? displayPathForWorkspacePath(workspace, project.localPath)
       : null,

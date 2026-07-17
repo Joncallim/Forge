@@ -1,0 +1,24 @@
+{
+  "contract": "forge-cross-slice-database-lock-order",
+  "version": 2,
+  "applicableRows": "ordered-subsequence",
+  "families": [
+    "project",
+    "tasks:id-ascending",
+    "work-packages:id-ascending",
+    "grant-approval-decision-rows:id-ascending",
+    "worker-protocol-epoch",
+    "authenticated-worker-root-writer-instance-rows:id-ascending",
+    "host-binding-generation-rotation-row",
+    "host-root-hierarchy-guard-row",
+    "agent-runs:id-ascending",
+    "local-run-evidence-task-projection-source-rows:id-ascending",
+    "optional-runtime-audits:id-ascending",
+    "host-apply-ledgers:run-id-then-entry-ordinal",
+    "artifacts:agent-run-id-artifact-type-artifact-id",
+    "local-issuance-recovery-actions:local-evidence-or-audit-id-action-marker-fingerprint",
+    "integrity-alerts:local-evidence-or-audit-id-reason-evidence-fingerprint",
+    "integrity-resolutions:alert-id-expected-fingerprint-resolution",
+    "review-gates:id-ascending"
+  ]
+}

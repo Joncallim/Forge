@@ -46,6 +46,8 @@ const project = {
   githubTokenEnvVar: null,
   pmProviderConfigId: null,
   mcpConfig: { profile: 'default' as const, requiredMcps: ['filesystem', 'github'], overrides: {} },
+  grantDecisionRevision: BigInt(0),
+  rootBindingRevision: BigInt(0),
   defaultBranch: 'main',
   createdAt: new Date('2026-06-24T00:00:00.000Z'),
   updatedAt: new Date('2026-06-24T00:00:00.000Z'),

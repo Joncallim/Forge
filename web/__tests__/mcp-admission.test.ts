@@ -2195,7 +2195,7 @@ describe('readEffectiveGrantState', () => {
       mcpConfig: {
         grants: {
           filesystem: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             mcpId: 'filesystem',
             status: 'approved',
             grantMode: 'always_allow',
@@ -2257,7 +2257,7 @@ describe('readEffectiveGrantState', () => {
         packageWithGrants(grants),
         { mcpConfig: {} },
         ['filesystem.project.read'],
-      )).toMatchObject({ phase: 'none', status: 'not_issued' })
+      )).toMatchObject({ phase: 'not_issued', status: 'not_issued' })
     }
 
     expect(readEffectiveGrantState(
@@ -2284,13 +2284,15 @@ describe('readEffectiveGrantState', () => {
       metadata: {
         mcpGrantPhases: {
           effective: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             phase: 'effective',
             source: 'explicit-grant-approval',
             runtimeEnforcement: 'bounded_context_packet',
             status: 'approved',
             grantMode: 'allow_once',
             runtimeIssued: false,
+            grantDecisionRevision: '1',
+            rootBindingRevision: '1',
             grants: [{
               mcpId: 'filesystem',
               status: 'approved',
@@ -2299,7 +2301,7 @@ describe('readEffectiveGrantState', () => {
           },
         },
       },
-    }, { mcpConfig: {} }, ['filesystem.project.read', 'filesystem.project.list'])
+    }, { mcpConfig: {}, rootBindingRevision: '1' }, ['filesystem.project.read', 'filesystem.project.list'])
 
     expect(effectiveGrant).toMatchObject({
       phase: 'approved',
@@ -2323,7 +2325,7 @@ describe('readEffectiveGrantState', () => {
       metadata: {
         mcpGrantPhases: {
           effective: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             phase: 'effective',
             source: 'explicit-grant-approval',
             runtimeEnforcement: 'bounded_context_packet',
@@ -2342,18 +2344,20 @@ describe('readEffectiveGrantState', () => {
       metadata: {
         mcpGrantPhases: {
           effective: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             phase: 'effective',
             source: 'explicit-grant-approval',
             runtimeEnforcement: 'bounded_context_packet',
             status: 'approved',
             grantMode: 'allow_once',
             runtimeIssued: true,
+            grantDecisionRevision: '1',
+            rootBindingRevision: '1',
             grants: [{ mcpId: 'filesystem', status: 'approved', capabilities: ['filesystem.project.read'] }],
           },
         },
       },
-    }, { mcpConfig: {} }, ['filesystem.project.read'])).toMatchObject({
+    }, { mcpConfig: {}, rootBindingRevision: '1' }, ['filesystem.project.read'])).toMatchObject({
       phase: 'approved',
       source: 'package-local',
       consumed: true,
@@ -2372,13 +2376,15 @@ describe('readEffectiveGrantState', () => {
       metadata: {
         mcpGrantPhases: {
           effective: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             phase: 'effective',
             source: 'explicit-grant-approval',
             runtimeEnforcement: 'bounded_context_packet',
             status: 'approved',
             ...(includeGrantMode ? { grantMode } : {}),
             runtimeIssued: false,
+            grantDecisionRevision: '1',
+            rootBindingRevision: '1',
             grants: [{
               mcpId: 'filesystem',
               status: 'approved',
@@ -2389,10 +2395,10 @@ describe('readEffectiveGrantState', () => {
       },
     })
 
-    for (const grantMode of ['allow_once', 'always_allow'] as const) {
+    for (const grantMode of ['allow_once'] as const) {
       expect(readEffectiveGrantState(
         packageForMode(grantMode),
-        { mcpConfig: {} },
+        { mcpConfig: {}, rootBindingRevision: '1' },
         ['filesystem.project.read'],
       ), grantMode).toMatchObject({
         phase: 'approved',
@@ -2410,7 +2416,7 @@ describe('readEffectiveGrantState', () => {
     ] as const) {
       expect(readEffectiveGrantState(
         pkg,
-        { mcpConfig: {} },
+        { mcpConfig: {}, rootBindingRevision: '1' },
         ['filesystem.project.read'],
       ), label).toMatchObject({ phase: 'none', status: 'not_issued' })
     }
@@ -2421,13 +2427,15 @@ describe('readEffectiveGrantState', () => {
       metadata: {
         mcpGrantPhases: {
           effective: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             phase: 'effective',
             source: 'explicit-grant-approval',
             runtimeEnforcement: 'bounded_context_packet',
             status: 'approved',
             grantMode,
             ...(include ? { runtimeIssued } : {}),
+            grantDecisionRevision: '1',
+            rootBindingRevision: '1',
             grants: [{
               mcpId: 'filesystem',
               status: 'approved',
@@ -2438,7 +2446,7 @@ describe('readEffectiveGrantState', () => {
       },
     })
 
-    for (const grantMode of ['allow_once', 'always_allow'] as const) {
+    for (const grantMode of ['allow_once'] as const) {
       for (const [label, runtimeIssued, include] of [
         ['missing', undefined, false],
         ['string', 'true', true],
@@ -2447,27 +2455,27 @@ describe('readEffectiveGrantState', () => {
       ] as const) {
         expect(readEffectiveGrantState(
           packageForRuntimeState(grantMode, runtimeIssued, include),
-          { mcpConfig: {} },
+          { mcpConfig: {}, rootBindingRevision: '1' },
           ['filesystem.project.read'],
         ), `${grantMode}/${label}`).toMatchObject({ phase: 'none', status: 'not_issued' })
       }
       expect(readEffectiveGrantState(
         packageForRuntimeState(grantMode, false),
-        { mcpConfig: {} },
+        { mcpConfig: {}, rootBindingRevision: '1' },
         ['filesystem.project.read'],
       )).toMatchObject({ phase: 'approved', consumed: false })
     }
 
     expect(readEffectiveGrantState(
       packageForRuntimeState('allow_once', true),
-      { mcpConfig: {} },
+      { mcpConfig: {}, rootBindingRevision: '1' },
       ['filesystem.project.read'],
     )).toMatchObject({ phase: 'approved', consumed: true })
     expect(readEffectiveGrantState(
       packageForRuntimeState('always_allow', true),
-      { mcpConfig: {} },
+      { mcpConfig: {}, rootBindingRevision: '1' },
       ['filesystem.project.read'],
-    )).toMatchObject({ phase: 'approved', grantMode: 'always_allow' })
+    )).toMatchObject({ phase: 'none', status: 'not_issued' })
   })
 
   it('keeps a narrowed project grant approved when it still covers this requirement', () => {
@@ -2475,12 +2483,14 @@ describe('readEffectiveGrantState', () => {
       metadata: {
         mcpGrantPhases: {
           effective: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             phase: 'effective',
             source: 'project-filesystem-approval',
             runtimeEnforcement: 'bounded_context_packet',
             status: 'approved',
             grantApprovalId: 'project-grant',
+            grantDecisionRevision: '1',
+            rootBindingRevision: '1',
             grants: [{ mcpId: 'filesystem', status: 'approved', capabilities: ['filesystem.project.read', 'filesystem.project.list'] }],
           },
         },
@@ -2490,22 +2500,62 @@ describe('readEffectiveGrantState', () => {
       mcpConfig: {
         grants: {
           filesystem: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             mcpId: 'filesystem',
             status: 'approved',
             grantMode: 'always_allow',
             capabilities: ['filesystem.project.read'],
             grantApprovalId: 'project-grant-2',
+            grantDecisionRevision: '2',
+            rootBindingRevision: '1',
           },
         },
       },
+      rootBindingRevision: '1',
     }
     expect(readEffectiveGrantState(pkg, project, ['filesystem.project.read'])).toMatchObject({ phase: 'approved' })
     expect(readEffectiveGrantState(pkg, project, ['filesystem.project.read', 'filesystem.project.list'])).toMatchObject({
       phase: 'revoked',
       source: 'project-level',
-      revocationReason: expect.any(String),
+      grantDecisionRevision: '2',
+      revocationReason: 'project_grant_narrowed',
     })
+  })
+
+  it('revokes both approval and denial decisions when the root binding changes', () => {
+    const packageWithStatus = (status: 'approved' | 'denied') => ({
+      metadata: {
+        mcpGrantPhases: {
+          effective: {
+            schemaVersion: 2,
+            phase: 'effective',
+            source: 'explicit-grant-approval',
+            runtimeEnforcement: 'bounded_context_packet',
+            status,
+            grantMode: 'allow_once',
+            runtimeIssued: false,
+            grantDecisionRevision: '7',
+            rootBindingRevision: '3',
+            grants: status === 'approved'
+              ? [{ mcpId: 'filesystem', status: 'approved', capabilities: ['filesystem.project.read'] }]
+              : [],
+          },
+        },
+      },
+    })
+    for (const status of ['approved', 'denied'] as const) {
+      expect(readEffectiveGrantState(
+        packageWithStatus(status),
+        { mcpConfig: {}, rootBindingRevision: '4' },
+        ['filesystem.project.read'],
+      ), status).toMatchObject({
+        phase: 'revoked',
+        source: 'package-local',
+        grantDecisionRevision: '7',
+        rootBindingRevision: '3',
+        revocationReason: 'project_root_repoint',
+      })
+    }
   })
 
   it('allows only a later covering project grant to supersede a package denial', () => {
@@ -2513,50 +2563,55 @@ describe('readEffectiveGrantState', () => {
       metadata: {
         mcpGrantPhases: {
           effective: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             phase: 'effective',
             source: 'explicit-grant-approval',
             runtimeEnforcement: 'bounded_context_packet',
             status: 'denied',
-            deniedAt: '2026-07-13T09:00:00.000Z',
+            deniedAt: '2099-07-13T09:00:00.000Z',
             grantApprovalId: 'denied-package',
+            grantDecisionRevision: '2',
+            rootBindingRevision: '1',
           },
         },
       },
     }
-    const projectWithApprovedAt = (approvedAt: unknown) => ({
+    const projectWithRevision = (grantDecisionRevision: unknown) => ({
       mcpConfig: {
         grants: {
           filesystem: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             mcpId: 'filesystem',
             status: 'approved',
             grantMode: 'always_allow',
             capabilities: ['filesystem.project.read'],
-            approvedAt,
+            approvedAt: '2000-01-01T00:00:00.000Z',
             grantApprovalId: 'project-grant',
+            grantDecisionRevision,
+            rootBindingRevision: '1',
           },
         },
       },
+      rootBindingRevision: '1',
     })
 
     expect(readEffectiveGrantState(
       deniedPackage,
-      projectWithApprovedAt('2026-07-13T09:00:00.001Z'),
+      projectWithRevision('3'),
       ['filesystem.project.read'],
     )).toMatchObject({ phase: 'approved', source: 'project-level' })
 
-    for (const approvedAt of [
-      '2026-07-13T08:59:59.999Z',
-      '2026-07-13T09:00:00.000Z',
-      'not-a-timestamp',
+    for (const decisionRevision of [
+      '1',
+      '2',
+      '03',
       null,
     ]) {
       expect(readEffectiveGrantState(
         deniedPackage,
-        projectWithApprovedAt(approvedAt),
+        projectWithRevision(decisionRevision),
         ['filesystem.project.read'],
-      ), String(approvedAt)).toMatchObject({ phase: 'denied', source: 'package-local' })
+      ), String(decisionRevision)).toMatchObject({ phase: 'denied', source: 'package-local' })
     }
   })
 
@@ -2565,7 +2620,7 @@ describe('readEffectiveGrantState', () => {
       metadata: {
         mcpGrantPhases: {
           effective: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             phase: 'effective',
             source: 'explicit-grant-approval',
             runtimeEnforcement: 'bounded_context_packet',
@@ -2679,7 +2734,7 @@ describe('readEffectiveGrantState', () => {
       metadata: {
         mcpGrantPhases: {
           effective: {
-            schemaVersion: 1,
+            schemaVersion: 2,
             phase: 'effective',
             source: 'explicit-grant-approval',
             runtimeEnforcement: 'bounded_context_packet',
@@ -2689,6 +2744,8 @@ describe('readEffectiveGrantState', () => {
             consumedAt: '2026-07-13T09:00:00.000Z',
             consumedByAgentRunId: 'run-1',
             consumedOnAttempt: 2,
+            grantDecisionRevision: '1',
+            rootBindingRevision: '1',
             grants: [{
               mcpId: 'filesystem',
               status: 'approved',
@@ -2697,7 +2754,7 @@ describe('readEffectiveGrantState', () => {
           },
         },
       },
-    }, { mcpConfig: {} }, ['filesystem.project.read'])
+    }, { mcpConfig: {}, rootBindingRevision: '1' }, ['filesystem.project.read'])
 
     expect(result).toMatchObject({
       phase: 'approved',

@@ -51,6 +51,7 @@ type BuildOptions = {
   activeAgents?: MaterializerAgentCatalogRow[]
   idFactory?: () => string
   projectMcpConfig?: unknown
+  projectRootBindingRevision?: unknown
 }
 
 function featureFlagDisabled(value: string | undefined): boolean {
@@ -435,12 +436,13 @@ export function buildWorkforceMaterializationRows(
       mcpConfig: options.projectMcpConfig,
       mcpRequirements,
       metadata: packageMetadata,
+      projectRootBindingRevision: options.projectRootBindingRevision,
     })
     if (projectGrant) {
       const phases = packageMetadata.mcpGrantPhases
       packageMetadata.mcpGrantPhases = {
         ...(typeof phases === 'object' && phases !== null && !Array.isArray(phases) ? phases : {}),
-        schemaVersion: 1,
+        schemaVersion: 2,
         effective: projectFilesystemEffectivePhase(projectGrant),
       }
     }
@@ -519,7 +521,10 @@ export async function materializeWorkforceFromArchitectArtifact(
       .from(agentConfigs)
       .where(eq(agentConfigs.isActive, true)),
     db
-      .select({ mcpConfig: projects.mcpConfig })
+      .select({
+        mcpConfig: projects.mcpConfig,
+        rootBindingRevision: projects.rootBindingRevision,
+      })
       .from(tasks)
       .innerJoin(projects, eq(tasks.projectId, projects.id))
       .where(eq(tasks.id, input.taskId))
@@ -529,6 +534,7 @@ export async function materializeWorkforceFromArchitectArtifact(
   const rows = buildWorkforceMaterializationRows(input, {
     activeAgents,
     projectMcpConfig: taskProject?.mcpConfig,
+    projectRootBindingRevision: taskProject?.rootBindingRevision,
   })
   if (rows.workPackages.length === 0) {
     throw new Error(

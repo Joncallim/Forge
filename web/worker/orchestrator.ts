@@ -1315,6 +1315,7 @@ async function publishHandoffResult(
     claimedPackageId: handoff.claimedPackageId,
     readyPackageIds: handoff.readyPackageIds,
     blockedReason: handoff.status === 'blocked' ? handoff.blockedReason : undefined,
+    taskDisposition: handoff.status === 'blocked' ? handoff.taskDisposition : undefined,
     status: handoff.status,
     terminalBlock: handoff.status === 'blocked' ? handoff.terminalBlock : undefined,
   })
