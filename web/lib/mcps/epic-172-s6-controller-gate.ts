@@ -3,6 +3,12 @@ import {
   EPIC_172_S6_SUITE_COMMANDS,
   epic172S6SuiteManifest,
 } from './epic-172-s6-suite-contract'
+import {
+  verifyEpic172S6ReleaseEvidenceInput,
+  assertEpic172S6ReleaseOrderOwnership,
+  EPIC_172_S6_RECORDABLE_EVIDENCE_KINDS,
+  type Epic172S6RecordableEvidenceKind,
+} from './epic-172-s6-release-adapter'
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
@@ -352,6 +358,11 @@ export function evaluateEpic172S6ControllerEvidence(
     return disabled('signature_invalid')
   }
   if (!verified.ok) return disabled('signature_invalid')
+  try {
+    assertEpic172S6ReleaseOrderOwnership()
+  } catch {
+    return disabled('cross_bound_evidence')
+  }
   let bundle: Epic172S6ExternalEvidenceBundle
   try {
     bundle = parseEpic172S6ExternalEvidenceBundle(verified.value)

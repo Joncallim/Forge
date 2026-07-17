@@ -64,9 +64,9 @@ jobs:
         if: env.RUN_FORGE_POSTGRES_TESTS == '1'
         run: |
           npx playwright install chromium
-          npx playwright test e2e/filesystem-grant-lifecycle-concurrency.spec.ts --project=chromium-desktop --workers=1
+          npx playwright test e2e/filesystem-grant-lifecycle-concurrency.spec.ts --project=chromium-desktop --workers=1 2>&1 | tee /tmp/concurrency-output.txt
+          grep -Eq '[1-9][0-9]* passed' /tmp/concurrency-output.txt
           npx playwright test e2e/filesystem-grant-lifecycle-concurrency.spec.ts --project=chromium-desktop --workers=1 2>&1 | grep -Eq '[1-9][0-9]* skipped'
-          if ! grep -Eq '[1-9][0-9]* passed' </dev/null; then echo 'PASSED_OK'; fi
       - run: npm run test:mcp:contract
       - run: npm run build
       - run: npx playwright install chromium

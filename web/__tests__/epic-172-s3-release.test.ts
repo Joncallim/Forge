@@ -69,7 +69,7 @@ describe('Epic 172 S3 release seam', () => {
     expect(workflow).toContain('e2e/filesystem-grant-lifecycle-concurrency.spec.ts')
     expect(workflow).toContain('--project=chromium-desktop --workers=1')
     expect(workflow).toContain("grep -Eq '[1-9][0-9]* skipped'")
-    expect(workflow).toContain("if ! grep -Eq '[1-9][0-9]* passed'")
+    expect(workflow).toContain("grep -Eq '[1-9][0-9]* passed'")
   })
 
   it('uses a versioned, non-inheriting owner handoff for fresh and upgraded Step 0 databases', () => {
