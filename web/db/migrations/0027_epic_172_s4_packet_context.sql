@@ -4,6 +4,8 @@
 -- This migration is additive. S4 producers remain disabled until the signed
 -- runtime activation graph enables the matching S4/S5 build and protocol epoch.
 
+SELECT public.forge_begin_epic_172_s4_owner_bootstrap_v1();
+--> statement-breakpoint
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -317,7 +319,7 @@ ALTER TABLE public.filesystem_mcp_runtime_audits
     FOREIGN KEY (local_run_evidence_id) REFERENCES public.work_package_local_run_evidence(id)
     ON UPDATE RESTRICT ON DELETE RESTRICT,
   ADD CONSTRAINT filesystem_mcp_runtime_audits_project_decision_fk
-    FOREIGN KEY (project_decision_id) REFERENCES public.filesystem_mcp_grant_approvals(id)
+    FOREIGN KEY (project_decision_id) REFERENCES public.project_filesystem_grant_decisions(id)
     ON UPDATE RESTRICT ON DELETE RESTRICT,
   ADD CONSTRAINT filesystem_mcp_runtime_audits_local_identity_fk
     FOREIGN KEY (local_run_evidence_id, task_id, work_package_id, agent_run_id)
@@ -508,10 +510,15 @@ DECLARE
   v_local public.work_package_local_run_evidence%ROWTYPE;
   v_source text;
   v_mode text;
-  v_project_decision_generation bigint;
   v_project_decision public.project_filesystem_grant_decisions%ROWTYPE;
-  v_grant_approval_id uuid := NULL;
-  v_grant_nonce uuid := NULL;
+  v_grant_approval_id uuid;
+  v_project_decision_id uuid;
+  v_grant_nonce uuid;
+  v_grant_revision bigint;
+  v_root_revision bigint;
+  v_decided_by uuid;
+  v_decided_at timestamptz;
+  v_coverage_fingerprint text;
   v_approved text[];
   v_required text[];
   v_snapshot jsonb;
@@ -538,30 +545,19 @@ BEGIN
   PERFORM 1 FROM public.tasks task WHERE task.id = v_task.id FOR UPDATE;
   PERFORM 1 FROM public.work_packages package WHERE package.task_id = v_task.id ORDER BY package.id FOR UPDATE;
 
-  SELECT decision.* INTO STRICT v_decision
+  SELECT decision.* INTO v_decision
   FROM public.filesystem_mcp_grant_approvals decision
   WHERE decision.id = p_decision_id
   FOR UPDATE;
-  IF v_decision.decision <> 'approved'
-     OR v_decision.grant_decision_revision IS NULL
-     OR v_decision.root_binding_revision IS NULL
-     OR v_decision.root_binding_revision <> v_project.root_binding_revision
-     OR v_decision.decided_by IS NULL THEN
-    RAISE EXCEPTION 'packet authorization is stale or incomplete' USING ERRCODE = '40001';
-  END IF;
-
-  SELECT ARRAY(
-    SELECT pg_catalog.jsonb_array_elements_text(v_decision.capabilities) ORDER BY 1
-  ) INTO v_approved;
-  SELECT ARRAY(SELECT cap FROM pg_catalog.unnest(p_required_capabilities) cap ORDER BY cap) INTO v_required;
-  IF pg_catalog.cardinality(v_required) NOT BETWEEN 1 AND 3
-     OR v_required IS DISTINCT FROM ARRAY(SELECT DISTINCT cap FROM pg_catalog.unnest(v_required) cap ORDER BY cap)
-     OR v_required <@ ARRAY['filesystem.project.list','filesystem.project.read','filesystem.project.search']::text[] IS NOT TRUE
-     OR v_required <@ v_approved IS NOT TRUE THEN
-    RAISE EXCEPTION 'packet capability coverage is invalid' USING ERRCODE = '22023';
-  END IF;
-
-  IF v_decision.decision_scope = 'package' THEN
+  IF FOUND THEN
+    IF v_decision.decision <> 'approved'
+       OR v_decision.decision_scope <> 'package'
+       OR v_decision.grant_decision_revision IS NULL
+       OR v_decision.root_binding_revision IS NULL
+       OR v_decision.root_binding_revision <> v_project.root_binding_revision
+       OR v_decision.decided_by IS NULL THEN
+      RAISE EXCEPTION 'packet authorization is stale or incomplete' USING ERRCODE = '40001';
+    END IF;
     SELECT pointer.* INTO STRICT v_pointer
     FROM public.filesystem_mcp_current_decision_pointers pointer
     WHERE pointer.work_package_id = v_package.id
@@ -574,13 +570,24 @@ BEGIN
        OR v_pointer.pointer_fingerprint <> v_decision.pointer_fingerprint THEN
       RAISE EXCEPTION 'allow-once decision is not the current package authority' USING ERRCODE = '40001';
     END IF;
+    SELECT ARRAY(
+      SELECT pg_catalog.jsonb_array_elements_text(v_decision.capabilities) ORDER BY 1
+    ) INTO v_approved;
     v_source := 'package_allow_once';
     v_mode := 'allow_once';
-  ELSIF v_decision.decision_scope = 'project' THEN
+    v_grant_approval_id := v_decision.id;
+    v_project_decision_id := NULL;
+    v_grant_nonce := v_decision.grant_nonce;
+    v_grant_revision := v_decision.grant_decision_revision;
+    v_root_revision := v_decision.root_binding_revision;
+    v_decided_by := v_decision.decided_by;
+    v_decided_at := v_decision.created_at;
+    v_coverage_fingerprint := v_decision.pointer_fingerprint;
+  ELSE
     -- S3 supplies the append-only project decision table and project-owned
     -- current pointer. The project-level always-allow grant is resolved from
     -- the immutable decision history, not from the mutable mcp_config blob.
-    SELECT pd.*, pp.current_decision_generation INTO v_project_decision, v_project_decision_generation
+    SELECT pd.* INTO v_project_decision
     FROM public.project_filesystem_current_decision_pointers pp
     JOIN public.project_filesystem_grant_decisions pd
       ON pd.id = pp.current_decision_id
@@ -589,17 +596,37 @@ BEGIN
       AND pd.root_binding_revision = pp.current_root_binding_revision
       AND pd.decision_fingerprint = pp.current_decision_fingerprint
       AND pd.decision_generation = pp.current_decision_generation
-    WHERE pp.project_id = v_project.id;
-    IF NOT FOUND OR v_project_decision.decision <> 'approved' THEN
+    WHERE pp.project_id = v_project.id
+      AND pd.id = p_decision_id
+    FOR UPDATE OF pp, pd;
+    IF NOT FOUND
+       OR v_project_decision.project_id <> v_project.id
+       OR v_project_decision.decision <> 'approved'
+       OR v_project_decision.root_binding_revision <> v_project.root_binding_revision THEN
       RAISE EXCEPTION 'project always-allow grant is not currently approved'
         USING ERRCODE = '55000';
     END IF;
-    v_grant_approval_id := NULL;
-    v_grant_nonce := NULL;
+    SELECT ARRAY(
+      SELECT pg_catalog.jsonb_array_elements_text(v_project_decision.capabilities) ORDER BY 1
+    ) INTO v_approved;
     v_source := 'project_always_allow';
     v_mode := 'always_allow';
-  ELSE
-    RAISE EXCEPTION 'unknown packet authorization source' USING ERRCODE = '22023';
+    v_grant_approval_id := NULL;
+    v_project_decision_id := v_project_decision.id;
+    v_grant_nonce := NULL;
+    v_grant_revision := v_project_decision.grant_decision_revision;
+    v_root_revision := v_project_decision.root_binding_revision;
+    v_decided_by := v_project_decision.decided_by;
+    v_decided_at := v_project_decision.decided_at;
+    v_coverage_fingerprint := v_project_decision.decision_fingerprint;
+  END IF;
+
+  SELECT ARRAY(SELECT cap FROM pg_catalog.unnest(p_required_capabilities) cap ORDER BY cap) INTO v_required;
+  IF pg_catalog.cardinality(v_required) NOT BETWEEN 1 AND 3
+     OR v_required IS DISTINCT FROM ARRAY(SELECT DISTINCT cap FROM pg_catalog.unnest(v_required) cap ORDER BY cap)
+     OR v_required <@ ARRAY['filesystem.project.list','filesystem.project.read','filesystem.project.search']::text[] IS NOT TRUE
+     OR v_required <@ v_approved IS NOT TRUE THEN
+    RAISE EXCEPTION 'packet capability coverage is invalid' USING ERRCODE = '22023';
   END IF;
 
   SELECT evidence.* INTO STRICT v_local
@@ -608,6 +635,7 @@ BEGIN
     AND evidence.agent_run_id = v_run.id
     AND evidence.task_id = v_task.id
     AND evidence.work_package_id = v_package.id
+    AND evidence.claim_token = p_claim_token
     AND evidence.state = 'claimed'
     AND pg_catalog.clock_timestamp() < evidence.lease_expires_at
   FOR UPDATE;
@@ -616,15 +644,15 @@ BEGIN
     'schemaVersion', 2,
     'source', v_source,
     'grantMode', v_mode,
-    'grantApprovalId', CASE WHEN v_source = 'package_allow_once' THEN pg_catalog.to_jsonb(v_decision.id::text) ELSE 'null'::jsonb END,
-    'grantDecisionRevision', v_decision.grant_decision_revision::text,
-    'grantDecisionNonce', CASE WHEN v_source = 'package_allow_once' THEN pg_catalog.to_jsonb(v_decision.grant_nonce::text) ELSE 'null'::jsonb END,
-    'rootBindingRevision', v_decision.root_binding_revision::text,
+    'grantApprovalId', CASE WHEN v_grant_approval_id IS NOT NULL THEN pg_catalog.to_jsonb(v_grant_approval_id::text) ELSE 'null'::jsonb END,
+    'grantDecisionRevision', v_grant_revision::text,
+    'grantDecisionNonce', CASE WHEN v_grant_nonce IS NOT NULL THEN pg_catalog.to_jsonb(v_grant_nonce::text) ELSE 'null'::jsonb END,
+    'rootBindingRevision', v_root_revision::text,
     'approvedCapabilities', pg_catalog.to_jsonb(v_approved),
     'requiredCapabilities', pg_catalog.to_jsonb(v_required),
-    'decidedByUserId', v_decision.decided_by::text,
-    'decidedAt', pg_catalog.to_char(v_decision.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
-    'coverageFingerprint', v_decision.pointer_fingerprint
+    'decidedByUserId', v_decided_by::text,
+    'decidedAt', pg_catalog.to_char(v_decided_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+    'coverageFingerprint', v_coverage_fingerprint
   );
 
   PERFORM pg_catalog.set_config('forge.s4_packet_writer', 'on', true);
@@ -638,19 +666,18 @@ BEGIN
     grant_decision_nonce, authorization_root_binding_revision
   ) VALUES (
     v_audit_id, v_task.id, v_package.id, v_run.id, v_local.id,
-    CASE WHEN v_source = 'package_allow_once' THEN v_decision.id ELSE NULL END,
-    CASE WHEN v_source = 'project_always_allow' THEN v_decision.id ELSE NULL END,
+    v_grant_approval_id, v_project_decision_id,
     'context_packet', 'claiming', pg_catalog.to_jsonb(v_approved), pg_catalog.to_jsonb(v_required),
     '', 0, 0, 0, false, '{}'::jsonb, '{}'::jsonb, '', '{}'::jsonb,
     2, p_claim_token, LEAST(v_local.lease_expires_at, pg_catalog.clock_timestamp() + pg_catalog.make_interval(secs => p_lease_seconds)),
-    v_snapshot, v_source, v_mode, v_decision.grant_decision_revision,
-    v_decision.grant_nonce, v_decision.root_binding_revision
+    v_snapshot, v_source, v_mode, v_grant_revision,
+    v_grant_nonce, v_root_revision
   );
 
   IF v_source = 'package_allow_once' THEN
     INSERT INTO public.filesystem_mcp_decision_nonce_claims (
       grant_approval_id, grant_decision_nonce, runtime_audit_id
-    ) VALUES (v_decision.id, v_decision.grant_nonce, v_audit_id);
+    ) VALUES (v_grant_approval_id, v_grant_nonce, v_audit_id);
   END IF;
   RETURN v_audit_id;
 END;
@@ -798,6 +825,39 @@ BEGIN
 END;
 $$;
 --> statement-breakpoint
+-- The NOLOGIN owner receives only the existing-table privileges required by
+-- the fixed-path functions above. Interactive and application logins receive
+-- no equivalent table access.
+GRANT SELECT ON public.tasks, public.projects, public.work_packages,
+  public.agent_runs, public.artifacts, public.filesystem_mcp_grant_approvals,
+  public.filesystem_mcp_current_decision_pointers,
+  public.project_filesystem_grant_decisions,
+  public.project_filesystem_current_decision_pointers,
+  public.filesystem_mcp_runtime_audits TO forge_s4_routines_owner;
+GRANT UPDATE ON public.tasks, public.projects, public.work_packages,
+  public.agent_runs, public.filesystem_mcp_grant_approvals,
+  public.filesystem_mcp_current_decision_pointers,
+  public.project_filesystem_grant_decisions,
+  public.project_filesystem_current_decision_pointers TO forge_s4_routines_owner;
+GRANT INSERT ON public.artifacts, public.filesystem_mcp_runtime_audits
+  TO forge_s4_routines_owner;
+--> statement-breakpoint
+REVOKE ALL ON public.architect_plan_versions, public.architect_plan_entries,
+  public.architect_plan_execution_references, public.architect_plan_history_reads,
+  public.epic_172_s4_protocol_state, public.work_package_local_run_evidence,
+  public.filesystem_mcp_decision_nonce_claims FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.reject_s4_retained_mutation_v1() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.resolve_architect_plan_entry_v1(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,integer,text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.validate_packet_authorization_snapshot_v2(jsonb,text,text,uuid,bigint,uuid,bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.guard_packet_authorization_v2() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) TO forge_architect_plan_writer;
+GRANT EXECUTE ON FUNCTION forge.resolve_architect_plan_entry_v1(uuid) TO forge_architect_plan_resolver;
+GRANT EXECUTE ON FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,integer,text[]) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) TO forge_packet_issuer;
+--> statement-breakpoint
 ALTER TABLE public.architect_plan_versions OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.architect_plan_entries OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.architect_plan_execution_references OWNER TO forge_s4_routines_owner;
@@ -812,34 +872,5 @@ ALTER FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid
 ALTER FUNCTION forge.guard_packet_authorization_v2() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) OWNER TO forge_s4_routines_owner;
---> statement-breakpoint
--- The NOLOGIN owner receives only the existing-table privileges required by
--- the fixed-path functions above. Interactive and application logins receive
--- no equivalent table access.
-GRANT SELECT ON public.tasks, public.projects, public.work_packages,
-  public.agent_runs, public.artifacts, public.filesystem_mcp_grant_approvals,
-  public.filesystem_mcp_current_decision_pointers,
-  public.filesystem_mcp_runtime_audits TO forge_s4_routines_owner;
-GRANT UPDATE ON public.tasks, public.projects, public.work_packages,
-  public.agent_runs, public.filesystem_mcp_grant_approvals,
-  public.filesystem_mcp_current_decision_pointers TO forge_s4_routines_owner;
-GRANT INSERT ON public.artifacts, public.filesystem_mcp_runtime_audits
-  TO forge_s4_routines_owner;
---> statement-breakpoint
-REVOKE ALL ON public.architect_plan_versions, public.architect_plan_entries,
-  public.architect_plan_execution_references, public.architect_plan_history_reads,
-  public.epic_172_s4_protocol_state, public.work_package_local_run_evidence,
-  public.filesystem_mcp_decision_nonce_claims FROM PUBLIC;
-REVOKE ALL ON FUNCTION forge.resolve_architect_plan_entry_v1(uuid) FROM PUBLIC;
-REVOKE ALL ON FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,integer,text[]) FROM PUBLIC;
-REVOKE ALL ON FUNCTION forge.validate_packet_authorization_snapshot_v2(jsonb,text,text,uuid,bigint,uuid,bigint) FROM PUBLIC;
-REVOKE ALL ON FUNCTION forge.guard_packet_authorization_v2() FROM PUBLIC;
-REVOKE ALL ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) FROM PUBLIC;
-REVOKE ALL ON FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) FROM PUBLIC;
-GRANT USAGE ON SCHEMA forge TO forge_architect_plan_writer, forge_architect_plan_resolver, forge_packet_issuer;
-GRANT EXECUTE ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) TO forge_architect_plan_writer;
-GRANT EXECUTE ON FUNCTION forge.resolve_architect_plan_entry_v1(uuid) TO forge_architect_plan_resolver;
-GRANT EXECUTE ON FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,integer,text[]) TO forge_packet_issuer;
-GRANT EXECUTE ON FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) TO forge_packet_issuer;
 --> statement-breakpoint
 SELECT public.forge_finalize_epic_172_s4_owner_bootstrap_v1();

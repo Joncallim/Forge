@@ -94,7 +94,7 @@ export async function readHistoryLog(input: {
       order by read_at desc
       limit 100
     `
-  } catch (error) {
+  } catch {
     throw new HistoryReaderError(
       'invalid_evidence',
       'The protected history read failed closed.',

@@ -82,7 +82,12 @@ jobs:
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
-      - name: Configure disposable release-principal passwords
+      - name: Bootstrap migration-0027 S4 protocol ownership
+        run: npm run protocol:bootstrap-epic-172-s4-roles
+        env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+      - name: Configure disposable release and S4 principal passwords
         working-directory: .
         env:
           PGPASSWORD: forge
@@ -90,6 +95,10 @@ jobs:
           psql --host localhost --username forge_e2e --dbname forge_epic_172_ci_test --set ON_ERROR_STOP=1 <<'SQL'
           ALTER ROLE forge_release_evidence_writer PASSWORD 'forge_writer_test';
           ALTER ROLE forge_release_transition PASSWORD 'forge_transition_test';
+          ALTER ROLE forge_architect_plan_writer PASSWORD 'forge_plan_writer_test';
+          ALTER ROLE forge_architect_plan_resolver PASSWORD 'forge_plan_resolver_test';
+          ALTER ROLE forge_architect_plan_history_reader PASSWORD 'forge_plan_history_reader_test';
+          ALTER ROLE forge_packet_issuer PASSWORD 'forge_packet_issuer_test';
           SQL
       - name: Apply migrations as the disposable migration owner
         run: npm run db:migrate
@@ -124,7 +133,14 @@ jobs:
                   'forge_epic_172_release_evidence_consumptions',
                   'forge_epic_172_enablement_state',
                   'forge_epic_172_enablement_transition_audits',
-                  'forge_epic_172_s3_release_state'
+                  'forge_epic_172_s3_release_state',
+                  'architect_plan_versions',
+                  'architect_plan_entries',
+                  'architect_plan_execution_references',
+                  'architect_plan_history_reads',
+                  'epic_172_s4_protocol_state',
+                  'work_package_local_run_evidence',
+                  'filesystem_mcp_decision_nonce_claims'
                 ])
             LOOP
               EXECUTE format(
@@ -171,7 +187,14 @@ jobs:
               'public.forge_epic_172_release_evidence_consumptions',
               'public.forge_epic_172_enablement_state',
               'public.forge_epic_172_enablement_transition_audits',
-              'public.forge_epic_172_s3_release_state'
+              'public.forge_epic_172_s3_release_state',
+              'public.architect_plan_versions',
+              'public.architect_plan_entries',
+              'public.architect_plan_execution_references',
+              'public.architect_plan_history_reads',
+              'public.epic_172_s4_protocol_state',
+              'public.work_package_local_run_evidence',
+              'public.filesystem_mcp_decision_nonce_claims'
             ]) LOOP
               FOREACH release_privilege IN ARRAY ARRAY[
                 'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
@@ -202,16 +225,21 @@ jobs:
           END;
           $verify_application_acl$;
           SQL
-      - run: npm run lint
+      - run: npm run lint -- --max-warnings=0
       - run: npx tsc --noEmit
-      - run: npm test
-      - name: Prove Epic 172 writer, transition, and ordinary-app PostgreSQL boundaries
-        run: npx vitest run __tests__/epic-172-release-recorder.postgres.test.ts
+      - name: Run the complete zero-skip unit suite
+        run: npm test
         env:
           FORGE_EPIC_172_REQUIRE_POSTGRES_TEST: '1'
           FORGE_EPIC_172_TEST_APP_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_WRITER_DATABASE_URL: postgresql://forge_release_evidence_writer:forge_writer_test@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_TRANSITION_DATABASE_URL: postgresql://forge_release_transition:forge_transition_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_S4_REQUIRE_POSTGRES_TEST: '1'
+          FORGE_S4_POSTGRES_TEST_DATABASE_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+          FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL: postgresql://forge_architect_plan_writer:forge_plan_writer_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL: postgresql://forge_architect_plan_resolver:forge_plan_resolver_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL: postgresql://forge_architect_plan_history_reader:forge_plan_history_reader_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_PACKET_ISSUER_DATABASE_URL: postgresql://forge_packet_issuer:forge_packet_issuer_test@localhost:5432/forge_epic_172_ci_test
       - run: npm run build
       - run: npx playwright install chromium
       - name: Run mandatory S3 PostgreSQL concurrency proof
@@ -221,7 +249,7 @@ jobs:
           set -o pipefail
           report="$(mktemp)"
           npx playwright test e2e/filesystem-grant-lifecycle-concurrency.spec.ts \
-            --project=chromium-desktop --workers=1 --reporter=line | tee "$report"
+            --project=chromium-desktop --workers=1 --retries=0 --reporter=line | tee "$report"
           if grep -Eq '[1-9][0-9]* skipped' "$report"; then
             echo 'The mandatory S3 PostgreSQL concurrency proof was skipped.' >&2
             exit 1

@@ -184,6 +184,9 @@ async function main(): Promise<void> {
           raise exception 'A competing release-role membership exists before the S3 handoff'
             using errcode = '42501';
         end if;
+        execute 'grant references (id) on table public.tasks to forge_release_routines_owner';
+        execute 'grant select (id, task_id), references (id) on table public.work_packages to forge_release_routines_owner';
+        execute 'grant trigger on table public.work_packages to forge_release_routines_owner';
         execute pg_catalog.format(
           'grant forge_release_routines_owner to %I with admin false, inherit false, set true',
           session_user
@@ -255,6 +258,47 @@ async function main(): Promise<void> {
             and pg_catalog.has_function_privilege('forge_release_transition', routine.oid, 'execute')
         ) <> 2 then
           raise exception 'The exact fixed-path S3 completion routine boundary is incomplete'
+            using errcode = '42501';
+        end if;
+        execute 'revoke references (id) on table public.tasks from forge_release_routines_owner';
+        execute 'revoke references (id) on table public.work_packages from forge_release_routines_owner';
+        execute 'revoke trigger on table public.work_packages from forge_release_routines_owner';
+        if not pg_catalog.has_column_privilege(
+          'forge_release_routines_owner', 'public.work_packages', 'id', 'select'
+        ) or not pg_catalog.has_column_privilege(
+          'forge_release_routines_owner', 'public.work_packages', 'task_id', 'select'
+        ) or pg_catalog.has_table_privilege(
+          'forge_release_routines_owner', 'public.work_packages', 'select'
+        ) or pg_catalog.has_table_privilege(
+          'forge_release_routines_owner', 'public.work_packages', 'references'
+        ) or pg_catalog.has_table_privilege(
+          'forge_release_routines_owner', 'public.work_packages', 'trigger'
+        ) or pg_catalog.has_table_privilege(
+          'forge_release_routines_owner', 'public.tasks', 'references'
+        ) then
+          raise exception 'The post-bootstrap S3 source-table ACL is not exact'
+            using errcode = '42501';
+        end if;
+        if not exists (
+          select 1
+          from pg_catalog.pg_class table_row
+          join pg_catalog.pg_namespace namespace_row on namespace_row.oid = table_row.relnamespace
+          where namespace_row.nspname = 'public'
+            and table_row.relname = 'work_package_local_projection_heads'
+            and table_row.relkind = 'r'
+            and table_row.relowner = 'forge_release_routines_owner'::regrole
+            and not exists (
+              select 1
+              from pg_catalog.aclexplode(
+                coalesce(
+                  table_row.relacl,
+                  pg_catalog.acldefault('r', table_row.relowner)
+                )
+              ) acl
+              where acl.grantee <> table_row.relowner
+            )
+        ) then
+          raise exception 'The projection-head table owner or direct ACL is not exact'
             using errcode = '42501';
         end if;
         execute pg_catalog.format('revoke forge_release_routines_owner from %I', session_user);

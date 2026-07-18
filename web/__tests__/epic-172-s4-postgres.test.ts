@@ -12,9 +12,16 @@ const issuerUrl = process.env.FORGE_PACKET_ISSUER_DATABASE_URL?.trim()
 const writerUrl = process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL?.trim()
 const resolverUrl = process.env.FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL?.trim()
 const enabled = Boolean(adminUrl && issuerUrl && writerUrl && resolverUrl)
+const requirePostgresFixture = process.env.FORGE_S4_REQUIRE_POSTGRES_TEST === '1'
 const SHA = `sha256:${'a'.repeat(64)}`
 
-describe.runIf(enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
+if (requirePostgresFixture && !enabled) {
+  throw new Error(
+    'FORGE_S4_REQUIRE_POSTGRES_TEST=1 requires the S4 administrator, packet issuer, Architect plan writer, and Architect plan resolver PostgreSQL URLs; the explicit contract suite may not skip.',
+  )
+}
+
+describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
   const ids = {
     user: randomUUID(),
     project: randomUUID(),
@@ -80,7 +87,10 @@ describe.runIf(enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       await tx`
         update filesystem_mcp_current_decision_pointers
         set current_decision_id = ${ids.decision}::uuid,
+            current_decision_task_id = ${ids.task}::uuid,
+            current_decision_work_package_id = ${ids.package}::uuid,
             current_decision_revision = 1,
+            current_decision_fingerprint = ${SHA},
             pointer_fingerprint = ${SHA},
             pointer_version = 1
         where work_package_id = ${ids.package}::uuid
@@ -161,11 +171,11 @@ describe.runIf(enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     const attempts = await Promise.allSettled([
       issuer`select forge.insert_packet_authorization_snapshot_v2(
         ${ids.firstRun}::uuid, ${ids.firstEvidence}::uuid, ${ids.decision}::uuid,
-        ${randomUUID()}::uuid, 20, array['filesystem.project.read']::text[]
+        ${ids.firstLocalClaim}::uuid, 20, array['filesystem.project.read']::text[]
       )`,
       issuer`select forge.insert_packet_authorization_snapshot_v2(
         ${ids.secondRun}::uuid, ${ids.secondEvidence}::uuid, ${ids.decision}::uuid,
-        ${randomUUID()}::uuid, 20, array['filesystem.project.read']::text[]
+        ${ids.secondLocalClaim}::uuid, 20, array['filesystem.project.read']::text[]
       )`,
     ])
     expect(attempts.filter((attempt) => attempt.status === 'fulfilled')).toHaveLength(1)
@@ -212,7 +222,10 @@ describe.runIf(enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       `
       await tx`
         update filesystem_mcp_current_decision_pointers
-        set current_decision_id = ${decisionId}::uuid, current_decision_revision = 2,
+        set current_decision_id = ${decisionId}::uuid,
+            current_decision_task_id = ${ids.task}::uuid,
+            current_decision_work_package_id = ${packageId}::uuid,
+            current_decision_revision = 2, current_decision_fingerprint = ${SHA},
             pointer_fingerprint = ${SHA}, pointer_version = 1
         where work_package_id = ${packageId}::uuid
       `
@@ -245,6 +258,7 @@ describe.runIf(enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     const runId = randomUUID()
     const evidenceId = randomUUID()
     const decisionId = randomUUID()
+    const claimToken = randomUUID()
     await admin.begin(async (tx) => {
       await tx`
         insert into work_packages (
@@ -256,14 +270,12 @@ describe.runIf(enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         values (${runId}::uuid, ${ids.task}::uuid, ${packageId}::uuid, 'backend', 'test', 'running')
       `
       await tx`
-        insert into filesystem_mcp_grant_approvals (
-          id, project_id, task_id, work_package_id, decided_by, decision,
-          capabilities, effective_grant, decision_scope, grant_decision_revision,
-          root_binding_revision, grant_nonce, pointer_fingerprint
+        insert into project_filesystem_grant_decisions (
+          id, project_id, decision, capabilities, grant_decision_revision,
+          root_binding_revision, decision_fingerprint, decision_generation, decided_by
         ) values (
-          ${decisionId}::uuid, ${ids.project}::uuid, null, null, ${ids.user}::uuid,
-          'approved', '["filesystem.project.read"]'::jsonb, '{}'::jsonb,
-          'project', 3, 1, null, ${SHA}
+          ${decisionId}::uuid, ${ids.project}::uuid, 'approved',
+          '["filesystem.project.read"]'::jsonb, 3, 1, ${SHA}, 1, ${ids.user}::uuid
         )
       `
       await tx`
@@ -271,14 +283,14 @@ describe.runIf(enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
           id, task_id, work_package_id, agent_run_id, claim_token, lease_expires_at
         ) values (
           ${evidenceId}::uuid, ${ids.task}::uuid, ${packageId}::uuid, ${runId}::uuid,
-          ${randomUUID()}::uuid, clock_timestamp() + interval '30 seconds'
+          ${claimToken}::uuid, clock_timestamp() + interval '30 seconds'
         )
       `
     })
 
     await expect(issuer`select forge.insert_packet_authorization_snapshot_v2(
       ${runId}::uuid, ${evidenceId}::uuid, ${decisionId}::uuid,
-      ${randomUUID()}::uuid, 20, array['filesystem.project.read']::text[]
+      ${claimToken}::uuid, 20, array['filesystem.project.read']::text[]
     )`).rejects.toMatchObject({ code: '55000' })
     const [row] = await admin<{ audits: number }[]>`
       select count(*)::integer as audits from filesystem_mcp_runtime_audits

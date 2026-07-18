@@ -3,7 +3,6 @@ import {
   buildFilesystemGrantBlockMetadata,
   parseFilesystemGrantBlockMetadata,
   filesystemGrantBlockFingerprint,
-  parseFilesystemGrantHoldState,
 } from '@/lib/mcps/filesystem-grant-lifecycle'
 import {
   canonicalFilesystemProjectCapabilities,
