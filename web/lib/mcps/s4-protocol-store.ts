@@ -147,3 +147,37 @@ export async function resolveArchitectPlanEntry(input: {
 export function executableReferenceForEntry(entry: ArchitectPlanEntryEnvelope): ArchitectPlanEntryReference {
   return architectPlanEntryReference(entry)
 }
+
+export async function bindArchitectPlanEntry(input: {
+  agentRunId: string
+  bindingFingerprint: string
+  contentDigest: string
+  digestKeyId: string
+  entryId: string
+  planArtifactId: string
+  planVersion: string
+  requirementKey: string
+  taskId: string
+  workPackageId: string
+}): Promise<string> {
+  return withDedicatedClient('FORGE_PACKET_ISSUER_DATABASE_URL', async (sql) => {
+    const rows = await sql<{ bind_architect_plan_entry_v1: string }[]>`
+      select forge.bind_architect_plan_entry_v1(
+        ${input.taskId}::uuid,
+        ${input.workPackageId}::uuid,
+        ${input.agentRunId}::uuid,
+        ${input.planArtifactId}::uuid,
+        ${input.planVersion}::bigint,
+        ${input.entryId}::text,
+        ${input.contentDigest}::text,
+        ${input.digestKeyId}::text,
+        ${input.requirementKey}::text,
+        ${input.bindingFingerprint}::text
+      ) as reference_id
+    `
+    if (rows.length !== 1) {
+      throw new S4ProtocolStoreError('conflict', 'Claim binding failed: the entry reference could not be created.')
+    }
+    return rows[0].bind_architect_plan_entry_v1
+  })
+}

@@ -6,6 +6,7 @@ import { asc, eq } from 'drizzle-orm'
 import { db } from '@/db'
 import { workPackages } from '@/db/schema'
 import { getSession } from '@/lib/session'
+import { getAccessibleTask } from '@/lib/task-access'
 
 export async function GET(
   request: NextRequest,
@@ -15,6 +16,10 @@ export async function GET(
     const session = await getSession(request)
     if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     const { taskId } = await params
+    const task = await getAccessibleTask(taskId, session.userId)
+    if (!task || task.submittedBy !== session.userId) {
+      return NextResponse.json({ error: 'Task not found' }, { status: 404 })
+    }
 
     const packages = await db
       .select({ id: workPackages.id, updatedAt: workPackages.updatedAt })

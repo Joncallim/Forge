@@ -959,6 +959,8 @@ GRANT EXECUTE ON FUNCTION forge.consume_epic_172_release_evidence_v1(uuid,uuid,t
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.work_package_local_projection_heads (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_id uuid NOT NULL
+    REFERENCES public.tasks(id) ON DELETE RESTRICT,
   work_package_id uuid NOT NULL
     REFERENCES public.work_packages(id) ON DELETE RESTRICT,
   head_kind text NOT NULL,
@@ -1009,6 +1011,9 @@ CREATE INDEX work_package_local_projection_heads_kind_idx
 CREATE INDEX work_package_local_projection_heads_state_idx
   ON public.work_package_local_projection_heads(state);
 --> statement-breakpoint
+CREATE INDEX work_package_local_projection_heads_task_id_idx
+  ON public.work_package_local_projection_heads(task_id);
+--> statement-breakpoint
 CREATE UNIQUE INDEX work_package_local_projection_heads_fingerprint_idx
   ON public.work_package_local_projection_heads(head_fingerprint);
 --> statement-breakpoint
@@ -1031,24 +1036,24 @@ BEGIN
       USING ERRCODE = '54000';
   END IF;
   INSERT INTO public.work_package_local_projection_heads (
-    work_package_id, head_kind, head_index, head_fingerprint
+    task_id, work_package_id, head_kind, head_index, head_fingerprint
   ) VALUES
-    (NEW.id, 'filesystem_grant_decision', 0,
-     'head:v1:' || NEW.id::text || ':filesystem_grant_decision:0'),
-    (NEW.id, 'execution_evidence',      1,
-     'head:v1:' || NEW.id::text || ':execution_evidence:1'),
-    (NEW.id, 'claim_token',             2,
-     'head:v1:' || NEW.id::text || ':claim_token:2'),
-    (NEW.id, 'lease_expiry',            3,
-     'head:v1:' || NEW.id::text || ':lease_expiry:3'),
-    (NEW.id, 'recovery_marker',         4,
-     'head:v1:' || NEW.id::text || ':recovery_marker:4'),
-    (NEW.id, 'integrity_hold',          5,
-     'head:v1:' || NEW.id::text || ':integrity_hold:5'),
-    (NEW.id, 'terminal_state',          6,
-     'head:v1:' || NEW.id::text || ':terminal_state:6'),
-    (NEW.id, 'artifact_reference',      7,
-     'head:v1:' || NEW.id::text || ':artifact_reference:7');
+    (NEW.task_id, NEW.id, 'filesystem_grant_decision', 0,
+     'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':filesystem_grant_decision:0'),
+    (NEW.task_id, NEW.id, 'execution_evidence',      1,
+     'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':execution_evidence:1'),
+    (NEW.task_id, NEW.id, 'claim_token',             2,
+     'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':claim_token:2'),
+    (NEW.task_id, NEW.id, 'lease_expiry',            3,
+     'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':lease_expiry:3'),
+    (NEW.task_id, NEW.id, 'recovery_marker',         4,
+     'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':recovery_marker:4'),
+    (NEW.task_id, NEW.id, 'integrity_hold',          5,
+     'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':integrity_hold:5'),
+    (NEW.task_id, NEW.id, 'terminal_state',          6,
+     'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':terminal_state:6'),
+    (NEW.task_id, NEW.id, 'artifact_reference',      7,
+     'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':artifact_reference:7');
   RETURN NEW;
 END;
 $$;
@@ -1099,24 +1104,24 @@ BEGIN
   END IF;
   FOR v_pkg IN SELECT * FROM public.work_packages LOOP
     INSERT INTO public.work_package_local_projection_heads (
-      work_package_id, head_kind, head_index, head_fingerprint
+      task_id, work_package_id, head_kind, head_index, head_fingerprint
     ) VALUES
-      (v_pkg.id, 'filesystem_grant_decision', 0,
-       'head:v1:' || v_pkg.id || ':filesystem_grant_decision:0'),
-      (v_pkg.id, 'execution_evidence',      1,
-       'head:v1:' || v_pkg.id || ':execution_evidence:1'),
-      (v_pkg.id, 'claim_token',             2,
-       'head:v1:' || v_pkg.id || ':claim_token:2'),
-      (v_pkg.id, 'lease_expiry',            3,
-       'head:v1:' || v_pkg.id || ':lease_expiry:3'),
-      (v_pkg.id, 'recovery_marker',         4,
-       'head:v1:' || v_pkg.id || ':recovery_marker:4'),
-      (v_pkg.id, 'integrity_hold',          5,
-       'head:v1:' || v_pkg.id || ':integrity_hold:5'),
-      (v_pkg.id, 'terminal_state',          6,
-       'head:v1:' || v_pkg.id || ':terminal_state:6'),
-      (v_pkg.id, 'artifact_reference',      7,
-       'head:v1:' || v_pkg.id || ':artifact_reference:7')
+      (v_pkg.task_id, v_pkg.id, 'filesystem_grant_decision', 0,
+       'head:v1:' || v_pkg.task_id || ':' || v_pkg.id || ':filesystem_grant_decision:0'),
+      (v_pkg.task_id, v_pkg.id, 'execution_evidence',      1,
+       'head:v1:' || v_pkg.task_id || ':' || v_pkg.id || ':execution_evidence:1'),
+      (v_pkg.task_id, v_pkg.id, 'claim_token',             2,
+       'head:v1:' || v_pkg.task_id || ':' || v_pkg.id || ':claim_token:2'),
+      (v_pkg.task_id, v_pkg.id, 'lease_expiry',            3,
+       'head:v1:' || v_pkg.task_id || ':' || v_pkg.id || ':lease_expiry:3'),
+      (v_pkg.task_id, v_pkg.id, 'recovery_marker',         4,
+       'head:v1:' || v_pkg.task_id || ':' || v_pkg.id || ':recovery_marker:4'),
+      (v_pkg.task_id, v_pkg.id, 'integrity_hold',          5,
+       'head:v1:' || v_pkg.task_id || ':' || v_pkg.id || ':integrity_hold:5'),
+      (v_pkg.task_id, v_pkg.id, 'terminal_state',          6,
+       'head:v1:' || v_pkg.task_id || ':' || v_pkg.id || ':terminal_state:6'),
+      (v_pkg.task_id, v_pkg.id, 'artifact_reference',      7,
+       'head:v1:' || v_pkg.task_id || ':' || v_pkg.id || ':artifact_reference:7')
     ON CONFLICT (work_package_id, head_kind) DO NOTHING;
   END LOOP;
 END;

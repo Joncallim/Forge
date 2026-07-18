@@ -5,6 +5,7 @@ import { asc, eq } from 'drizzle-orm'
 import { db } from '@/db'
 import { workPackages } from '@/db/schema'
 import { getSession } from '@/lib/session'
+import { getAccessibleTask } from '@/lib/task-access'
 import { computeFreshnessFingerprint } from '@/lib/mcps/s5-server-reader'
 import { parseFilesystemGrantBlockMetadata } from '@/lib/mcps/filesystem-grant-lifecycle'
 
@@ -17,6 +18,10 @@ export async function GET(
     if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
     const { taskId } = await params
+    const task = await getAccessibleTask(taskId, session.userId)
+    if (!task || task.submittedBy !== session.userId) {
+      return NextResponse.json({ error: 'Task not found' }, { status: 404 })
+    }
     const packages = await db
       .select({ id: workPackages.id, metadata: workPackages.metadata, status: workPackages.status })
       .from(workPackages).where(eq(workPackages.taskId, taskId)).orderBy(asc(workPackages.sequence))

@@ -5,6 +5,7 @@ import { asc, eq } from 'drizzle-orm'
 import { db } from '@/db'
 import { filesystemMcpGrantApprovals, filesystemMcpCurrentDecisionPointers, workPackages } from '@/db/schema'
 import { getSession } from '@/lib/session'
+import { getAccessibleTask } from '@/lib/task-access'
 import { computeFreshnessFingerprint } from '@/lib/mcps/s5-server-reader'
 
 export async function GET(
@@ -16,6 +17,10 @@ export async function GET(
     if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
     const { taskId } = await params
+    const task = await getAccessibleTask(taskId, session.userId)
+    if (!task || task.submittedBy !== session.userId) {
+      return NextResponse.json({ error: 'Task not found' }, { status: 404 })
+    }
     const [packages, decisions, pointers] = await Promise.all([
       db.select({ id: workPackages.id, title: workPackages.title }).from(workPackages).where(eq(workPackages.taskId, taskId)).orderBy(asc(workPackages.sequence)),
       db.select().from(filesystemMcpGrantApprovals).where(eq(filesystemMcpGrantApprovals.taskId, taskId)).orderBy(asc(filesystemMcpGrantApprovals.createdAt)),

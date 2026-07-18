@@ -47,7 +47,7 @@ function projectMcp(
 }
 
 describe('MCP admission operator copy', () => {
-  it('keeps the S6 suite and seven S4 UI mutation identities stable', () => {
+  it('keeps the S6 suite and S4 UI mutation identities stable', () => {
     expect(MCP_OPERATOR_RECOVERY_SUITE_ID).toBe('mcp-admission.operator-recovery')
     expect(MCP_UI_MUTATION_HANDLERS).toEqual([
       'review_local_changes',
@@ -57,6 +57,7 @@ describe('MCP admission operator copy', () => {
       'retry_execution',
       'acknowledge_possible_submission',
       'decline_packet_recovery',
+      'approve_project_filesystem_context',
     ])
   })
 

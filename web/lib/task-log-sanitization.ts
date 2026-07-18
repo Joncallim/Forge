@@ -1,5 +1,6 @@
 import type { TaskLog } from '@/db/schema'
 import { sanitizeWorkerMessage } from '@/worker/redaction'
+import { sanitizePromptPayload } from '@/lib/mcps/leakage-drain'
 
 const DEFAULT_STRING_BYTE_LIMIT = 16 * 1024
 const DEFAULT_MAX_DEPTH = 6
@@ -146,9 +147,9 @@ export function sanitizeLogRecordForOutput<T extends TaskLog>(log: T): T {
   return {
     ...log,
     eventType: sanitizeString(log.eventType, 500),
-    frontMatter: sanitizeLogFrontMatter(isRecord(log.frontMatter) ? log.frontMatter : {}),
+    frontMatter: sanitizeLogFrontMatter(isRecord(log.frontMatter) ? log.frontMatter : {}) as Record<string, string>,
     level: sanitizeString(log.level, 50),
-    message: sanitizeString(log.message, 60 * 1024),
+    message: sanitizePromptPayload({ message: sanitizeString(log.message, 60 * 1024) }).message as string,
     metadata: sanitizeLogStructuredValue(log.metadata, { stringByteLimit: DEFAULT_STRING_BYTE_LIMIT }) as Record<string, unknown>,
     source: sanitizeString(log.source, 100),
     title: sanitizeString(log.title, 500),
