@@ -181,3 +181,5 @@ export async function bindArchitectPlanEntry(input: {
     return rows[0].bind_architect_plan_entry_v1
   })
 }
+
+export const bindClaim = bindArchitectPlanEntry
