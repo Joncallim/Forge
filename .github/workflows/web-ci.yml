@@ -202,11 +202,10 @@ jobs:
           END;
           $verify_application_acl$;
           SQL
-      - run: npm run lint
+      - run: npm run lint -- --max-warnings=0
       - run: npx tsc --noEmit
-      - run: npm test
-      - name: Prove Epic 172 writer, transition, and ordinary-app PostgreSQL boundaries
-        run: npx vitest run __tests__/epic-172-release-recorder.postgres.test.ts
+      - name: Run the complete zero-skip unit suite
+        run: npm test
         env:
           FORGE_EPIC_172_REQUIRE_POSTGRES_TEST: '1'
           FORGE_EPIC_172_TEST_APP_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_epic_172_ci_test
