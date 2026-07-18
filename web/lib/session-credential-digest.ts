@@ -1,9 +1,9 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
-import { eq } from 'drizzle-orm'
+import { and, eq } from 'drizzle-orm'
 import { db } from '@/db'
 import { sessions } from '@/db/schema'
 
-const CREDENTIAL_DIGEST_DOMAIN = Buffer.from('forge:session-credential-digest:v1\0')
+export const SESSION_CREDENTIAL_DOMAIN_V1 = Buffer.from('forge:web-session:v1\0', 'utf8')
 
 const DIGEST_ALGORITHM = 'sha256'
 
@@ -13,50 +13,56 @@ export type SessionCredentialDigest = {
   issuedAt: Date
 }
 
-export function computeCredentialDigest(input: {
-  credentialId: string
-  sessionId: string
-  userId: string
-}): SessionCredentialDigest {
-  const hmac = createHash(DIGEST_ALGORITHM)
-  hmac.update(CREDENTIAL_DIGEST_DOMAIN)
-  const payload = `${input.sessionId}\0${input.userId}\0${input.credentialId}`
-  hmac.update(payload)
+export function isCanonicalSessionCredential(credential: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(credential)
+}
+
+export function computeCredentialDigest(credential: string): SessionCredentialDigest {
+  if (!isCanonicalSessionCredential(credential)) {
+    throw new Error('Session credential must be an exact lowercase UUIDv4')
+  }
+  const hash = createHash(DIGEST_ALGORITHM)
+  hash.update(SESSION_CREDENTIAL_DOMAIN_V1)
+  hash.update(Buffer.from(credential, 'ascii'))
   return {
     digestAlgorithm: DIGEST_ALGORITHM,
-    digest: hmac.digest(),
+    digest: hash.digest(),
     issuedAt: new Date(),
   }
 }
 
 export function verifyCredentialDigest(record: {
   credentialDigest?: Buffer | null
-}, input: {
-  credentialId: string
-  sessionId: string
-  userId: string
-}): boolean {
+}, credential: string): boolean {
   if (!record.credentialDigest) return false
-  const expected = computeCredentialDigest(input)
+  let expected: SessionCredentialDigest
+  try {
+    expected = computeCredentialDigest(credential)
+  } catch {
+    return false
+  }
   return record.credentialDigest.length === expected.digest.length &&
     timingSafeEqual(record.credentialDigest, expected.digest)
 }
 
 export async function rekeySessionCredentialDigest(input: {
   credentialId: string
-  sessionId: string
+  sessionCredential: string
   userId: string
 }): Promise<void> {
-  computeCredentialDigest(input)
+  const digest = computeCredentialDigest(input.sessionCredential).digest
   const [updated] = await db
     .update(sessions)
     .set({
       credentialId: input.credentialId as Sessions['credentialId'],
       lastSeenAt: new Date(),
     })
-    .where(eq(sessions.id, input.sessionId))
+    .where(and(
+      eq(sessions.userId, input.userId),
+      eq(sessions.credentialDigestV1, digest),
+    ))
     .returning({ id: sessions.id })
-  if (!updated) throw new Error(`Session ${input.sessionId} not found for credential rekey`)
+  if (!updated) throw new Error('Session not found for credential rekey')
 }
 
 export async function invalidateSessionCredentialDigests(userId: string): Promise<number> {

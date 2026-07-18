@@ -184,7 +184,7 @@ async function main(): Promise<void> {
           raise exception 'A competing release-role membership exists before the S3 handoff'
             using errcode = '42501';
         end if;
-        execute 'grant references (id) on table public.tasks to forge_release_routines_owner';
+        execute 'grant select (id, local_projection_scope_state), references (id) on table public.tasks to forge_release_routines_owner';
         execute 'grant select (id, task_id), references (id) on table public.work_packages to forge_release_routines_owner';
         execute 'grant trigger on table public.work_packages to forge_release_routines_owner';
         execute pg_catalog.format(
@@ -225,12 +225,29 @@ async function main(): Promise<void> {
             and table_row.relname = 'forge_epic_172_s3_release_state'
             and table_row.relkind = 'r'
             and table_row.relowner = 'forge_release_routines_owner'::regrole
+            and (
+              select pg_catalog.count(*)
+              from pg_catalog.aclexplode(table_row.relacl) acl
+              where acl.grantee = 0
+                and acl.privilege_type = 'SELECT'
+            ) = 1
+            and (
+              select pg_catalog.count(*)
+              from pg_catalog.aclexplode(table_row.relacl) acl
+              where acl.grantee = 'forge_release_evidence_writer'::regrole
+                and acl.privilege_type = any(array['SELECT', 'INSERT', 'UPDATE'])
+            ) = 3
             and not exists (
               select 1
-              from pg_catalog.aclexplode(
-                coalesce(table_row.relacl, pg_catalog.acldefault('r', table_row.relowner))
-              ) acl
+              from pg_catalog.aclexplode(table_row.relacl) acl
               where acl.grantee <> table_row.relowner
+                and not (
+                  (acl.grantee = 0 and acl.privilege_type = 'SELECT')
+                  or (
+                    acl.grantee = 'forge_release_evidence_writer'::regrole
+                    and acl.privilege_type = any(array['SELECT', 'INSERT', 'UPDATE'])
+                  )
+                )
             )
         ) then
           raise exception 'The S3 release state owner or direct table ACL is incorrect'
@@ -266,7 +283,11 @@ async function main(): Promise<void> {
         if not pg_catalog.has_column_privilege(
           'forge_release_routines_owner', 'public.work_packages', 'id', 'select'
         ) or not pg_catalog.has_column_privilege(
+          'forge_release_routines_owner', 'public.tasks', 'id', 'select'
+        ) or not pg_catalog.has_column_privilege(
           'forge_release_routines_owner', 'public.work_packages', 'task_id', 'select'
+        ) or not pg_catalog.has_column_privilege(
+          'forge_release_routines_owner', 'public.tasks', 'local_projection_scope_state', 'select'
         ) or pg_catalog.has_table_privilege(
           'forge_release_routines_owner', 'public.work_packages', 'select'
         ) or pg_catalog.has_table_privilege(
@@ -279,12 +300,15 @@ async function main(): Promise<void> {
           raise exception 'The post-bootstrap S3 source-table ACL is not exact'
             using errcode = '42501';
         end if;
-        if not exists (
-          select 1
+        if (
+          select pg_catalog.count(*)
           from pg_catalog.pg_class table_row
           join pg_catalog.pg_namespace namespace_row on namespace_row.oid = table_row.relnamespace
           where namespace_row.nspname = 'public'
-            and table_row.relname = 'work_package_local_projection_heads'
+            and table_row.relname = any(array[
+              'work_package_local_projection_heads',
+              'work_package_local_projection_sources'
+            ])
             and table_row.relkind = 'r'
             and table_row.relowner = 'forge_release_routines_owner'::regrole
             and not exists (
@@ -297,8 +321,28 @@ async function main(): Promise<void> {
               ) acl
               where acl.grantee <> table_row.relowner
             )
+        ) <> 2 then
+          raise exception 'The projection source/head table owner or direct ACL is not exact'
+            using errcode = '42501';
+        end if;
+        if not exists (
+          select 1
+          from pg_catalog.pg_proc routine
+          join pg_catalog.pg_namespace namespace_row on namespace_row.oid = routine.pronamespace
+          where namespace_row.nspname = 'forge'
+            and routine.proname = 'advance_local_projection_head_v1'
+            and routine.proowner = 'forge_release_routines_owner'::regrole
+            and routine.prosecdef
+            and routine.proconfig = array['search_path=""']
+            and not exists (
+              select 1
+              from pg_catalog.aclexplode(
+                coalesce(routine.proacl, pg_catalog.acldefault('f', routine.proowner))
+              ) acl
+              where acl.grantee = 0 and acl.privilege_type = 'EXECUTE'
+            )
         ) then
-          raise exception 'The projection-head table owner or direct ACL is not exact'
+          raise exception 'The projection-head advancement routine boundary is not exact'
             using errcode = '42501';
         end if;
         execute pg_catalog.format('revoke forge_release_routines_owner from %I', session_user);

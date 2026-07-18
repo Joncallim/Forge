@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   loadWorkPackageExecutionContext: vi.fn(),
   loadCurrentProjectFilesystemDecision: vi.fn().mockResolvedValue(null),
   publishTaskEvent: vi.fn(),
+  projectionScopeState: 'active' as 'active' | 'archive_pending',
   WorkPackageExecutionError: class WorkPackageExecutionError extends Error {
     failureDetails: unknown
 
@@ -37,8 +38,32 @@ const mocks = vi.hoisted(() => ({
 vi.mock('@/db', () => ({
   db: {
     insert: mocks.dbInsert,
-    select: mocks.dbSelect,
-    transaction: mocks.dbTransaction,
+    select: (selection?: Record<string, unknown>) => {
+      if (selection && 'localProjectionScopeState' in selection) {
+        return chain([{ localProjectionScopeState: mocks.projectionScopeState }])
+      }
+      const selected = mocks.dbSelect(selection)
+      if (selected !== undefined) return selected
+      if (selection && 'assignedRole' in selection && latestFreshAdmission) {
+        return chain([latestFreshAdmission])
+      }
+      return chain([])
+    },
+    transaction: (callback: (tx: Record<string, unknown>) => unknown) =>
+      mocks.dbTransaction((tx: unknown) => {
+        const txRecord = tx && typeof tx === 'object'
+          ? tx as Record<string, unknown>
+          : {}
+        return callback({
+          ...txRecord,
+          execute: typeof txRecord.execute === 'function'
+            ? txRecord.execute
+            : vi.fn().mockResolvedValue([{
+                now: '2026-07-17 00:00:00+00',
+                pid: 4242,
+              }]),
+        })
+      }),
     update: mocks.dbUpdate,
   },
 }))
@@ -101,11 +126,24 @@ async function initDirtyGitRepo(dir: string) {
 function chain(resolveValue: unknown) {
   const captureFreshAdmission = () => {
     if (!Array.isArray(resolveValue)) return
-    const fresh = resolveValue.find((row) => (
+    const freshAdmission = resolveValue.find((row) => (
       row && typeof row === 'object' &&
       'projectId' in row && 'mcpConfig' in row && 'assignedRole' in row && 'status' in row
     ))
-    if (fresh) latestFreshAdmission = { ...(fresh as Record<string, unknown>) }
+    const claimablePackage = resolveValue.find((row) => (
+      row && typeof row === 'object' &&
+      'assignedRole' in row && 'id' in row && 'status' in row &&
+      ['blocked', 'needs_rework', 'pending', 'ready'].includes(String((row as { status: unknown }).status))
+    ))
+    const fresh = freshAdmission ?? claimablePackage
+    if (fresh) {
+      latestFreshAdmission = {
+        localPath: null,
+        mcpConfig: null,
+        projectId: 'project-1',
+        ...fresh as Record<string, unknown>,
+      }
+    }
   }
   const thenable: Record<string, unknown> = {
     then: (onFulfilled: (v: unknown) => unknown, onRejected?: (e: unknown) => unknown) =>
@@ -153,28 +191,41 @@ function updateChain(returnValue: unknown) {
 }
 
 function freshLockSelectMock() {
-  let call = 0
-  return vi.fn(() => {
-    call += 1
+  return vi.fn((selection?: Record<string, unknown>) => {
     if (!latestFreshAdmission) return chain([])
-    if (call === 1) {
+    if (selection && Object.keys(selection).length === 1 && 'projectId' in selection) {
+      return chain([{ projectId: latestFreshAdmission.projectId }])
+    }
+    if (selection && 'grantDecisionRevision' in selection) {
       return chain([{
         id: latestFreshAdmission.projectId,
+        grantDecisionRevision: latestFreshAdmission.grantDecisionRevision ?? BigInt(0),
         localPath: latestFreshAdmission.localPath ?? null,
         mcpConfig: latestFreshAdmission.mcpConfig ?? null,
         rootBindingRevision: latestFreshAdmission.rootBindingRevision ?? BigInt(0),
       }])
     }
-    if (call === 2) {
+    if (selection && 'state' in selection) {
+      return chain([{ state: mocks.projectionScopeState }])
+    }
+    if (selection && Object.keys(selection).length === 2 && 'id' in selection && 'projectId' in selection) {
       return chain([{ id: 'task-1', projectId: latestFreshAdmission.projectId }])
+    }
+    if (selection && Object.keys(selection).length === 1 && 'id' in selection) {
+      return chain([])
     }
     return chain([{
       assignedRole: latestFreshAdmission.assignedRole,
       blockedReason: latestFreshAdmission.blockedReason ?? null,
+      grantDecisionRevision: latestFreshAdmission.grantDecisionRevision ?? BigInt(0),
       harnessId: latestFreshAdmission.harnessId ?? null,
       id: latestFreshAdmission.id,
+      localPath: latestFreshAdmission.localPath ?? null,
+      mcpConfig: latestFreshAdmission.mcpConfig ?? null,
       mcpRequirements: latestFreshAdmission.mcpRequirements,
       metadata: latestFreshAdmission.metadata,
+      projectId: latestFreshAdmission.projectId,
+      rootBindingRevision: latestFreshAdmission.rootBindingRevision ?? BigInt(0),
       sequence: latestFreshAdmission.sequence,
       status: latestFreshAdmission.status,
       title: latestFreshAdmission.title,
@@ -357,6 +408,7 @@ describe('handoffApprovedWorkPackages', () => {
     vi.clearAllMocks()
     mocks.dbInsert.mockReset()
     mocks.dbSelect.mockReset()
+    mocks.projectionScopeState = 'active'
     latestFreshAdmission = null
     mocks.dbTransaction.mockReset()
     mocks.dbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) =>
@@ -405,6 +457,27 @@ describe('handoffApprovedWorkPackages', () => {
       process.env.FORGE_WORK_PACKAGE_EXECUTION = originalExecutionFlag
     }
     await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
+  })
+
+  it('keeps archive-pending projection scopes non-claimable', async () => {
+    mocks.projectionScopeState = 'archive_pending'
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'pkg-legacy-overlimit',
+        assignedRole: 'backend',
+        harnessId: null,
+        sequence: 1,
+        status: 'pending',
+        title: 'Legacy over-limit package',
+      }]))
+
+    await expect(handoffApprovedWorkPackages('task-1')).resolves.toEqual({
+      status: 'no_ready_packages',
+      readyPackageIds: [],
+      claimedPackageId: null,
+    })
+    expect(mocks.dbUpdate).not.toHaveBeenCalled()
+    expect(mocks.dbTransaction).not.toHaveBeenCalled()
   })
 
   it('marks root packages ready, claims the first package, and records a no-op handoff run', async () => {
@@ -2343,7 +2416,7 @@ describe('handoffApprovedWorkPackages', () => {
       insert: vi.fn(() => ({
         values: vi.fn((values: Record<string, unknown>) => insertForValues(values)),
       })),
-      select: vi.fn(() => chain([])),
+      select: freshLockSelectMock(),
       update: vi.fn(() => updateChain([{ id: 'pkg-1' }])),
     })
 
@@ -2563,7 +2636,7 @@ describe('handoffApprovedWorkPackages', () => {
       insert: vi.fn(() => ({
         values: vi.fn((values: Record<string, unknown>) => insertForValues(values)),
       })),
-      select: vi.fn(() => chain([])),
+      select: freshLockSelectMock(),
       update: vi.fn(() => updateChain([{ id: 'pkg-1' }])),
     })
 

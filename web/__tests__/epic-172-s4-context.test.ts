@@ -30,6 +30,8 @@ import {
   MCP_ADMISSION_OPERATOR_RECOVERY_SUITE_ID,
   PACKET_ISSUANCE_RECOVERY_ACTIONS,
 } from '@/lib/mcps/recovery-actions-v2'
+import { computeCredentialDigest } from '@/lib/session-credential-digest'
+import { sanitizePromptPayload } from '@/lib/mcps/leakage-drain'
 
 const TASK_ID = '00000000-0000-4000-8000-000000000001'
 const ARTIFACT_ID = '00000000-0000-4000-8000-000000000002'
@@ -155,9 +157,45 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     )
     expect(s4RoleBootstrap).toContain("has_schema_privilege('${OWNER}', 'forge', 'create')")
   })
+
+  it('resumably upgrades legacy raw-id sessions into database authority', () => {
+    expect(s4Migration).toContain("pg_catalog.convert_to('forge:web-session:v1', 'UTF8')")
+    expect(s4Migration).toContain("|| pg_catalog.decode('00', 'hex')")
+    expect(s4Migration).toContain("|| pg_catalog.convert_to(id::text, 'UTF8')")
+    expect(s4Migration).toContain('credential_digest_v1 = COALESCE(')
+    expect(s4Migration).toContain("expires_at = COALESCE(expires_at, last_seen_at + interval '7 days')")
+    expect(s4Migration).toContain('SET id = pg_catalog.gen_random_uuid()')
+    expect(s4Migration).toContain("legacy raw-cookie session primary key remains after rekey")
+    expect(s4Migration).not.toMatch(/WHERE\s+(?:session_row\.)?id\s*=\s*(?:p_)?session_credential/i)
+    expect(s4Migration).toContain('ALTER COLUMN credential_digest_v1 SET NOT NULL')
+    expect(s4Migration).toContain('ALTER COLUMN expires_at SET NOT NULL')
+  })
 })
 
 describe('Epic 172 S4 protected Architect plan history', () => {
+  it('uses the exact domain-separated raw-cookie digest vector', () => {
+    expect(computeCredentialDigest('00000000-0000-4000-8000-000000000000').digest.toString('hex'))
+      .toBe('a4a6fe7265a6d2ec096cb0d31bb6b79d91a3d9a36537827009cb01f22e1f58e4')
+    expect(() => computeCredentialDigest('00000000-0000-4000-8000-00000000000A'))
+      .toThrow(/lowercase UUIDv4/)
+  })
+
+  it('normalizes prompt and secret aliases before draining them', () => {
+    expect(sanitizePromptPayload({
+      plan_body: 'raw plan',
+      fullPlan: 'raw plan',
+      architect_plan: 'raw plan',
+      private_key: 'raw key',
+      message: 'architect_plan: raw plan',
+    })).toEqual({
+      plan_body: '[prompt content drained by S4 leakage barrier]',
+      fullPlan: '[prompt content drained by S4 leakage barrier]',
+      architect_plan: '[prompt content drained by S4 leakage barrier]',
+      private_key: '[redacted: 7 bytes]',
+      message: '[secret value drained]',
+    })
+  })
+
   it('materializes deterministic NFC HMAC envelopes and text-free executable references', () => {
     const key = randomBytes(32)
     const first = materializeArchitectPlanEntries({

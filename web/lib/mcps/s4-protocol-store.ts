@@ -161,7 +161,7 @@ export async function bindArchitectPlanEntry(input: {
   workPackageId: string
 }): Promise<string> {
   return withDedicatedClient('FORGE_PACKET_ISSUER_DATABASE_URL', async (sql) => {
-    const rows = await sql<{ bind_architect_plan_entry_v1: string }[]>`
+    const rows = await sql<{ referenceId: string }[]>`
       select forge.bind_architect_plan_entry_v1(
         ${input.taskId}::uuid,
         ${input.workPackageId}::uuid,
@@ -173,13 +173,50 @@ export async function bindArchitectPlanEntry(input: {
         ${input.digestKeyId}::text,
         ${input.requirementKey}::text,
         ${input.bindingFingerprint}::text
-      ) as reference_id
+      ) as "referenceId"
     `
     if (rows.length !== 1) {
       throw new S4ProtocolStoreError('conflict', 'Claim binding failed: the entry reference could not be created.')
     }
-    return rows[0].bind_architect_plan_entry_v1
+    return rows[0].referenceId
   })
 }
 
-export const bindClaim = bindArchitectPlanEntry
+export async function claimPacketAuthorization(input: {
+  agentRunId: string
+  decisionId: string
+  leaseSeconds?: number
+  requiredCapabilities: readonly string[]
+}): Promise<{ auditId: string; claimToken: string; localRunEvidenceId: string }> {
+  const claimToken = randomUUID()
+  const leaseSeconds = input.leaseSeconds ?? 45
+  return withDedicatedClient('FORGE_PACKET_ISSUER_DATABASE_URL', async (sql) => sql.begin(async (tx) => {
+    const evidenceRows = await tx<{ localRunEvidenceId: string }[]>`
+      select forge.create_local_run_evidence_v1(
+        ${input.agentRunId}::uuid,
+        ${claimToken}::uuid,
+        ${leaseSeconds}::integer
+      ) as "localRunEvidenceId"
+    `
+    if (evidenceRows.length !== 1) {
+      throw new S4ProtocolStoreError('conflict', 'Local run evidence could not be claimed.')
+    }
+    const localRunEvidenceId = evidenceRows[0].localRunEvidenceId
+    const auditRows = await tx<{ auditId: string }[]>`
+      select forge.insert_packet_authorization_snapshot_v2(
+        ${input.agentRunId}::uuid,
+        ${localRunEvidenceId}::uuid,
+        ${input.decisionId}::uuid,
+        ${claimToken}::uuid,
+        ${leaseSeconds}::integer,
+        ${tx.array([...input.requiredCapabilities], 1009)}::text[]
+      ) as "auditId"
+    `
+    if (auditRows.length !== 1) {
+      throw new S4ProtocolStoreError('conflict', 'Packet authorization could not be claimed.')
+    }
+    return { auditId: auditRows[0].auditId, claimToken, localRunEvidenceId }
+  }))
+}
+
+export const bindClaim = claimPacketAuthorization

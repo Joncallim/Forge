@@ -18,6 +18,7 @@ import {
 import { readEffectiveGrantState } from '../lib/mcps/admission'
 import { loadCurrentProjectFilesystemDecision } from '../lib/mcps/filesystem-grant-reconciliation'
 import type { ProjectFilesystemDecisionAuthority } from '../lib/mcps/filesystem-project-authority'
+import { claimPacketAuthorization } from '../lib/mcps/s4-protocol-store'
 import {
   buildEmptyExecutionContextPacket,
   buildExecutionContextPacket,
@@ -1892,22 +1893,42 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
     })
     throw new Error(`Filesystem MCP context blocked for "${context.workPackage.title}": ${cleanPromptText(filesystemRuntime.reason, 600) || 'no approved effective filesystem grant.'}`)
   }
+  let packetAuthorizationAuditId: string | null = null
+  if (filesystemRuntime.runtimeIssued === true) {
+    if (!context.agentRunId) {
+      throw new Error('Bounded filesystem context requires an active agent run identity.')
+    }
+    const decisionId = filesystemRuntime.grantMode === 'always_allow'
+      ? context.projectFilesystemDecision?.decisionId
+      : runtimeString(filesystemRuntime.grantApprovalId)
+    if (!decisionId) {
+      throw new Error('Bounded filesystem context requires a current immutable grant decision.')
+    }
+    const claim = await claimPacketAuthorization({
+      agentRunId: context.agentRunId,
+      decisionId,
+      requiredCapabilities: runtimeStringArray(filesystemRuntime.capabilities),
+    })
+    packetAuthorizationAuditId = claim.auditId
+  }
   let hostExecutionContext: ExecutionContextPacket
   try {
     hostExecutionContext = filesystemRuntime.runtimeIssued === true
       ? context.hostExecutionContext ?? await buildExecutionContextPacket(hostProjectRoot)
       : buildEmptyExecutionContextPacket(hostProjectRoot)
   } catch (err) {
-    await recordFilesystemRuntimeAuditBestEffort({
-      agentRunId: context.agentRunId ?? null,
-      attemptNumber,
-      errorMessage: err instanceof Error ? err.message : String(err),
-      hostProjectRoot,
-      runtime: filesystemRuntime,
-      status: 'failed',
-      taskId: context.task.id,
-      workPackageId: context.workPackage.id,
-    })
+    if (!packetAuthorizationAuditId) {
+      await recordFilesystemRuntimeAuditBestEffort({
+        agentRunId: context.agentRunId ?? null,
+        attemptNumber,
+        errorMessage: err instanceof Error ? err.message : String(err),
+        hostProjectRoot,
+        runtime: filesystemRuntime,
+        status: 'failed',
+        taskId: context.task.id,
+        workPackageId: context.workPackage.id,
+      })
+    }
     throw err
   }
   if (filesystemRuntime.status === 'not_issued_optional') {
@@ -1926,6 +1947,7 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
   const executionContextArtifactMetadata = {
     ...executionContextPacketMetadata(hostExecutionContext),
     filesystemMcpRuntime: filesystemRuntime,
+    ...(packetAuthorizationAuditId ? { packetAuthorizationAuditId } : {}),
   }
   const sandboxRoot = await prepareSandboxRoot(hostProjectRoot, context.task.id, context.workPackage.id, attemptNumber)
   try {
@@ -1939,16 +1961,6 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
     const system = context.agentConfig?.systemPrompt || defaultSystemPrompt(context.workPackage.assignedRole)
     const providerConnector = context.providerConnector ?? context.providerConfigId ?? 'unknown-provider'
     if (filesystemRuntime.runtimeIssued === true) {
-      await recordFilesystemRuntimeAuditBestEffort({
-        agentRunId: context.agentRunId ?? null,
-        attemptNumber,
-        contextPacket: hostExecutionContext,
-        hostProjectRoot,
-        runtime: filesystemRuntime,
-        status: 'issued',
-        taskId: context.task.id,
-        workPackageId: context.workPackage.id,
-      })
       await recordTaskLogBestEffort({
         agentRunId: context.agentRunId ?? null,
         eventType: 'mcp.filesystem.context_issued',

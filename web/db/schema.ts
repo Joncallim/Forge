@@ -80,7 +80,7 @@ export type NewCredential = InferInsertModel<typeof credentials>
 export const sessions = pgTable(
   'sessions',
   {
-    id: uuid('id').primaryKey().defaultRandom(), // same UUID in Redis + cookie
+    id: uuid('id').primaryKey().defaultRandom(),
     userId: uuid('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
@@ -92,11 +92,13 @@ export const sessions = pgTable(
     revokedAt: timestamp('revoked_at', tsOpts),
     userAgent: text('user_agent'),
     ipAddress: inet('ip_address'),
-    credentialDigest: bytea('credential_digest'),
+    credentialDigestV1: bytea('credential_digest_v1').notNull(),
+    expiresAt: timestamp('expires_at', tsOpts).notNull(),
   },
   (t) => [
     index('sessions_user_id_idx').on(t.userId),
     index('sessions_revoked_at_idx').on(t.revokedAt),
+    uniqueIndex('sessions_credential_digest_v1_idx').on(t.credentialDigestV1),
   ],
 )
 
@@ -703,6 +705,14 @@ export const tasks = pgTable(
 export type Task = InferSelectModel<typeof tasks>
 export type NewTask = InferInsertModel<typeof tasks>
 
+// Narrow mapping for the migration-0026 claimability boundary. Keeping this
+// separate avoids making protocol-only upgrade metadata part of every Task DTO.
+export const taskLocalProjectionScopes = pgTable('tasks', {
+  id: uuid('id').primaryKey(),
+  localProjectionScopeState: text('local_projection_scope_state').notNull(),
+  localProjectionOverlimitPackageCount: integer('local_projection_overlimit_package_count'),
+})
+
 // ---------------------------------------------------------------------------
 // taskAttempts
 // ---------------------------------------------------------------------------
@@ -1045,11 +1055,56 @@ export type ProjectFilesystemCurrentDecisionPointer = InferSelectModel<typeof pr
 export type NewProjectFilesystemCurrentDecisionPointer = InferInsertModel<typeof projectFilesystemCurrentDecisionPointers>
 
 // ---------------------------------------------------------------------------
-// workPackageLocalProjectionHeads
+// workPackageLocalProjectionSources / workPackageLocalProjectionHeads
 // ---------------------------------------------------------------------------
 // Preallocated per-package projection heads for the S3→S4 protocol surface.
 // Eight immutable heads are created on work_package INSERT. The package limit
-// of 256 ensures at most 2,048 heads. Heads cannot be deleted or reassigned.
+// of 256 ensures at most 2,048 heads. Sources are append-only; heads may advance
+// only through the fixed compare-and-set routine installed by migration 0026.
+export const workPackageLocalProjectionSources = pgTable(
+  'work_package_local_projection_sources',
+  {
+    id: uuid('id').primaryKey(),
+    taskId: uuid('task_id')
+      .notNull()
+      .references(() => tasks.id, { onDelete: 'restrict' }),
+    workPackageId: uuid('work_package_id')
+      .notNull()
+      .references(() => workPackages.id, { onDelete: 'restrict' }),
+    sourceKind: text('source_kind').notNull(),
+    sourceRevision: bigint('source_revision', { mode: 'bigint' }).notNull(),
+    sourceFingerprint: text('source_fingerprint').notNull(),
+    contribution: jsonb('contribution').notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('work_package_local_projection_sources_identity_idx').on(
+      t.id,
+      t.taskId,
+      t.workPackageId,
+      t.sourceKind,
+      t.sourceRevision,
+      t.sourceFingerprint,
+    ),
+    uniqueIndex('work_package_local_projection_sources_package_kind_revision_idx').on(
+      t.workPackageId,
+      t.sourceKind,
+      t.sourceRevision,
+    ),
+    check('work_package_projection_source_revision_chk', sql`${t.sourceRevision} > 0`),
+    check('work_package_projection_source_fingerprint_chk', sql`
+      ${t.sourceFingerprint} ~ '^sha256:[0-9a-f]{64}$'
+    `),
+    check('work_package_projection_source_contribution_chk', sql`
+      jsonb_typeof(${t.contribution}) = 'object'
+      and octet_length(${t.contribution}::text) <= 4096
+    `),
+  ],
+)
+
+export type WorkPackageLocalProjectionSource = InferSelectModel<typeof workPackageLocalProjectionSources>
+export type NewWorkPackageLocalProjectionSource = InferInsertModel<typeof workPackageLocalProjectionSources>
+
 export const workPackageLocalProjectionHeads = pgTable(
   'work_package_local_projection_heads',
   {
@@ -1063,10 +1118,15 @@ export const workPackageLocalProjectionHeads = pgTable(
     headKind: text('head_kind').notNull(),
     headIndex: bigint('head_index', { mode: 'bigint' }).notNull(),
     headFingerprint: text('head_fingerprint').notNull(),
-    headVersion: bigint('head_version', { mode: 'bigint' }).notNull().default(BigInt(0)),
-    state: text('state').notNull().default('preallocated'),
-    leaseToken: uuid('lease_token'),
-    expiresAt: timestamp('expires_at', tsOpts),
+    headRevision: bigint('head_revision', { mode: 'bigint' }).notNull().default(BigInt(0)),
+    compareAndSetFingerprint: text('compare_and_set_fingerprint').notNull(),
+    currentSourceId: uuid('current_source_id'),
+    currentSourceTaskId: uuid('current_source_task_id'),
+    currentSourceWorkPackageId: uuid('current_source_work_package_id'),
+    currentSourceKind: text('current_source_kind'),
+    currentSourceRevision: bigint('current_source_revision', { mode: 'bigint' }),
+    currentSourceFingerprint: text('current_source_fingerprint'),
+    contribution: jsonb('contribution').notNull().default({}),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
   },
@@ -1074,38 +1134,79 @@ export const workPackageLocalProjectionHeads = pgTable(
     uniqueIndex('work_package_local_projection_heads_package_kind_idx')
       .on(t.workPackageId, t.headKind),
     index('work_package_local_projection_heads_kind_idx').on(t.headKind),
-    index('work_package_local_projection_heads_state_idx').on(t.state),
     index('work_package_local_projection_heads_task_id_idx').on(t.taskId),
     uniqueIndex('work_package_local_projection_heads_fingerprint_idx')
       .on(t.headFingerprint),
-    uniqueIndex('work_package_local_projection_heads_lease_token_idx').on(t.leaseToken),
+    uniqueIndex('work_package_local_projection_heads_cas_fingerprint_idx')
+      .on(t.compareAndSetFingerprint),
+    foreignKey({
+      columns: [
+        t.currentSourceId,
+        t.currentSourceTaskId,
+        t.currentSourceWorkPackageId,
+        t.currentSourceKind,
+        t.currentSourceRevision,
+        t.currentSourceFingerprint,
+      ],
+      foreignColumns: [
+        workPackageLocalProjectionSources.id,
+        workPackageLocalProjectionSources.taskId,
+        workPackageLocalProjectionSources.workPackageId,
+        workPackageLocalProjectionSources.sourceKind,
+        workPackageLocalProjectionSources.sourceRevision,
+        workPackageLocalProjectionSources.sourceFingerprint,
+      ],
+      name: 'work_package_projection_heads_current_source_fk',
+    }).onDelete('restrict').onUpdate('restrict'),
     check('work_package_projection_head_kind_chk', sql`
       ${t.headKind} in (
-        'filesystem_grant_decision',
-        'execution_evidence',
-        'claim_token',
-        'lease_expiry',
-        'recovery_marker',
-        'integrity_hold',
-        'terminal_state',
-        'artifact_reference'
+        'local_run',
+        'local_recovery',
+        'packet_recovery',
+        'repository_review',
+        'host_apply_review',
+        'operator_hold',
+        'integrity',
+        'terminal_disposition'
       )
-    `),
-    check('work_package_projection_head_state_chk', sql`
-      ${t.state} in ('preallocated', 'claimed', 'active', 'terminal', 'uncertain')
     `),
     check('work_package_projection_head_index_chk', sql`
       ${t.headIndex} >= 0 and ${t.headIndex} < 8
     `),
-    check('work_package_projection_head_version_chk', sql`
-      ${t.headVersion} >= 0
+    check('work_package_projection_head_revision_chk', sql`
+      ${t.headRevision} >= 0
     `),
     check('work_package_projection_head_fingerprint_chk', sql`
-      ${t.headFingerprint} ~ '^head:v1:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[a-z_]+:[0-7]$'
+      ${t.headFingerprint} ~ '^head:v1:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[a-z_]+:[0-7]$'
     `),
-    check('work_package_projection_head_lease_chk', sql`
-      (${t.state} in ('claimed', 'active') and ${t.leaseToken} is not null)
-      or (${t.state} not in ('claimed', 'active') and ${t.leaseToken} is null)
+    check('work_package_projection_head_cas_fingerprint_chk', sql`
+      ${t.compareAndSetFingerprint} ~ '^(head:v1:[0-9a-f:-]+:[a-z_]+:[0-7]|sha256:[0-9a-f]{64})$'
+    `),
+    check('work_package_projection_head_contribution_chk', sql`
+      jsonb_typeof(${t.contribution}) = 'object'
+      and octet_length(${t.contribution}::text) <= 4096
+    `),
+    check('work_package_projection_head_source_tuple_chk', sql`
+      (
+        ${t.headRevision} = 0
+        and ${t.currentSourceId} is null
+        and ${t.currentSourceTaskId} is null
+        and ${t.currentSourceWorkPackageId} is null
+        and ${t.currentSourceKind} is null
+        and ${t.currentSourceRevision} is null
+        and ${t.currentSourceFingerprint} is null
+        and ${t.contribution} = '{}'::jsonb
+        and ${t.compareAndSetFingerprint} = ${t.headFingerprint}
+      ) or (
+        ${t.headRevision} > 0
+        and ${t.currentSourceId} is not null
+        and ${t.currentSourceTaskId} = ${t.taskId}
+        and ${t.currentSourceWorkPackageId} = ${t.workPackageId}
+        and ${t.currentSourceKind} = ${t.headKind}
+        and ${t.currentSourceRevision} = ${t.headRevision}
+        and ${t.currentSourceFingerprint} is not null
+        and ${t.compareAndSetFingerprint} ~ '^sha256:[0-9a-f]{64}$'
+      )
     `),
   ],
 )

@@ -7,7 +7,9 @@ import {
   projectFilesystemCurrentDecisionPointers,
   projectFilesystemGrantDecisions,
   projects,
+  taskLocalProjectionScopes,
   tasks,
+  workPackageLocalProjectionHeads,
   workPackages,
   type ProjectMcpConfig,
 } from '@/db/schema'
@@ -34,6 +36,10 @@ import {
   type ProjectFilesystemDecisionRevocationReason,
 } from './filesystem-project-authority'
 import { executionLeaseBlocksConvergence } from '@/worker/execution-lease'
+import {
+  projectionHeadCompareAndSetFingerprint,
+  projectionSourceFingerprint,
+} from './local-projection-heads'
 
 type GrantTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0]
 type LockedProject = typeof projects.$inferSelect
@@ -140,6 +146,65 @@ async function lockedTransactionNow(tx: GrantTransaction): Promise<Date> {
   const now = new Date(typeof clockValue === 'string' || clockValue instanceof Date ? clockValue : '')
   if (!Number.isFinite(now.getTime())) throw new Error('Database transaction clock is unavailable.')
   return now
+}
+
+async function advanceOperatorHoldProjection(input: Readonly<{
+  authoritativeDecisionId: string
+  decision: 'approved' | 'denied' | 'revoked'
+  grantDecisionRevision: bigint
+  taskId: string
+  tx: GrantTransaction
+  workPackageId: string
+}>): Promise<void> {
+  const [head] = await input.tx
+    .select()
+    .from(workPackageLocalProjectionHeads)
+    .where(and(
+      eq(workPackageLocalProjectionHeads.taskId, input.taskId),
+      eq(workPackageLocalProjectionHeads.workPackageId, input.workPackageId),
+      eq(workPackageLocalProjectionHeads.headKind, 'operator_hold'),
+    ))
+  if (!head) throw new Error('The preallocated operator-hold projection head is missing.')
+
+  const sourceId = randomUUID()
+  const sourceRevision = head.headRevision + BigInt(1)
+  const contribution = {
+    authoritativeDecisionId: input.authoritativeDecisionId,
+    decision: input.decision,
+    grantDecisionRevision: input.grantDecisionRevision.toString(),
+    operatorHold: input.decision !== 'approved',
+  }
+  const sourceFingerprint = projectionSourceFingerprint({
+    contribution,
+    kind: 'operator_hold',
+    revision: sourceRevision,
+    sourceId,
+    taskId: input.taskId,
+    workPackageId: input.workPackageId,
+  })
+  const nextFingerprint = projectionHeadCompareAndSetFingerprint({
+    headFingerprint: head.headFingerprint,
+    revision: sourceRevision,
+    sourceFingerprint,
+  })
+  const [result] = await input.tx.execute(sql<{ advanced: boolean }>`
+    select "advanced"
+    from forge.advance_local_projection_head_v1(
+      ${input.taskId}::uuid,
+      ${input.workPackageId}::uuid,
+      ${'operator_hold'}::text,
+      ${sourceId}::uuid,
+      ${sourceRevision}::bigint,
+      ${sourceFingerprint}::text,
+      ${JSON.stringify(contribution)}::jsonb,
+      ${head.headRevision}::bigint,
+      ${head.compareAndSetFingerprint}::text,
+      ${nextFingerprint}::text
+    )
+  `)
+  if (!(result as { advanced?: boolean } | undefined)?.advanced) {
+    throw httpError('Operator-hold projection changed concurrently. Retry from current state.', 409)
+  }
 }
 
 function isLiveExecutionLease(pkg: LockedPackage, now: Date): boolean {
@@ -964,6 +1029,16 @@ export async function mutateTaskFilesystemGrants(input: {
     if (!targetTask || !TASK_EDITABLE.has(targetTask.status)) {
       throw httpError(`Cannot edit filesystem grants while task status is '${targetTask?.status ?? 'missing'}'.`, 409)
     }
+    const [targetProjectionScope] = await tx
+      .select({ state: taskLocalProjectionScopes.localProjectionScopeState })
+      .from(taskLocalProjectionScopes)
+      .where(eq(taskLocalProjectionScopes.id, input.taskId))
+    if (targetProjectionScope?.state !== 'active') {
+      throw httpError(
+        `Task projection scope is '${targetProjectionScope?.state ?? 'missing'}' and is not claimable.`,
+        409,
+      )
+    }
     if (locked.project.rootBindingRevision <= BigInt(0)) {
       throw httpError('The project root is not bound to protocol v2. Filesystem decisions remain disabled.', 409)
     }
@@ -1151,6 +1226,14 @@ export async function mutateTaskFilesystemGrants(input: {
         ))
         .returning()
       if (!advanced) throw httpError('Filesystem decision changed concurrently. Review the latest decision before retrying.', 409)
+      await advanceOperatorHoldProjection({
+        authoritativeDecisionId: approval.id,
+        decision: mutation.decision,
+        grantDecisionRevision: revision,
+        taskId: pkg.taskId,
+        tx,
+        workPackageId: pkg.id,
+      })
       locked.pointerByPackageId.set(pkg.id, advanced)
       const phases = phasesWithEffective(pkg.metadata, effective)
       const metadata = isRecord(pkg.metadata) ? pkg.metadata : {}
@@ -1193,6 +1276,18 @@ export async function mutateTaskFilesystemGrants(input: {
         trigger: 'task_always_allow',
         tx,
       })
+      if (projectAuthority) {
+        for (const pkg of [...locked.packageById.values()].sort((left, right) => left.id.localeCompare(right.id))) {
+          await advanceOperatorHoldProjection({
+            authoritativeDecisionId: projectAuthority.decisionId,
+            decision: projectAuthority.decision,
+            grantDecisionRevision: BigInt(projectAuthority.grantDecisionRevision),
+            taskId: pkg.taskId,
+            tx,
+            workPackageId: pkg.id,
+          })
+        }
+      }
       return { approvals, recoveredTaskIds: reconciled.recoveredTaskIds, states }
     }
     const recoveredTaskIds = await applyCanonicalProjection({

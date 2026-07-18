@@ -6,18 +6,21 @@ import {
   recordArchitectPlanVersion,
   resolveArchitectPlanEntry,
 } from '@/lib/mcps/s4-protocol-store'
+import { computeCredentialDigest } from '@/lib/session-credential-digest'
+import { readArchitectPlanHistory } from '@/lib/mcps/history-reader'
 
 const adminUrl = process.env.FORGE_S4_POSTGRES_TEST_DATABASE_URL?.trim()
 const issuerUrl = process.env.FORGE_PACKET_ISSUER_DATABASE_URL?.trim()
 const writerUrl = process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL?.trim()
 const resolverUrl = process.env.FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL?.trim()
-const enabled = Boolean(adminUrl && issuerUrl && writerUrl && resolverUrl)
+const historyReaderUrl = process.env.FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL?.trim()
+const enabled = Boolean(adminUrl && issuerUrl && writerUrl && resolverUrl && historyReaderUrl)
 const requirePostgresFixture = process.env.FORGE_S4_REQUIRE_POSTGRES_TEST === '1'
 const SHA = `sha256:${'a'.repeat(64)}`
 
 if (requirePostgresFixture && !enabled) {
   throw new Error(
-    'FORGE_S4_REQUIRE_POSTGRES_TEST=1 requires the S4 administrator, packet issuer, Architect plan writer, and Architect plan resolver PostgreSQL URLs; the explicit contract suite may not skip.',
+    'FORGE_S4_REQUIRE_POSTGRES_TEST=1 requires the S4 administrator, packet issuer, Architect plan writer, Architect plan resolver, and Architect history reader PostgreSQL URLs; the explicit contract suite may not skip.',
   )
 }
 
@@ -38,12 +41,14 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     nonce: randomUUID(),
   }
   const key = randomBytes(32)
+  const sessionCredential = randomUUID()
   let admin: ReturnType<typeof postgres>
   let issuer: ReturnType<typeof postgres>
 
   beforeAll(async () => {
     process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL = writerUrl!
     process.env.FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL = resolverUrl!
+    process.env.FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL = historyReaderUrl!
     admin = postgres(adminUrl!, { max: 1, onnotice: () => {} })
     issuer = postgres(issuerUrl!, { max: 2, onnotice: () => {} })
 
@@ -55,8 +60,16 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         ) values (${ids.project}::uuid, 'S4 PostgreSQL test', ${ids.user}::uuid, 1, 1)
       `
       await tx`
-        insert into tasks (id, project_id, submitted_by, title, prompt)
-        values (${ids.task}::uuid, ${ids.project}::uuid, ${ids.user}::uuid, 'S4 test', 'protected')
+        insert into tasks (id, project_id, submitted_by, title, prompt, status)
+        values (${ids.task}::uuid, ${ids.project}::uuid, ${ids.user}::uuid, 'S4 test', 'protected', 'running')
+      `
+      await tx`
+        insert into sessions (id, user_id, credential_digest_v1, expires_at)
+        values (
+          ${randomUUID()}::uuid, ${ids.user}::uuid,
+          ${computeCredentialDigest(sessionCredential).digest}::bytea,
+          clock_timestamp() + interval '7 days'
+        )
       `
       await tx`
         insert into work_packages (
@@ -141,6 +154,17 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       content: 'Architect plan available in protected history',
       metadata: { schemaVersion: 1, stage: 'architect_plan', historyAvailable: true },
     })
+    await expect(readArchitectPlanHistory({
+      planVersion: '1', sessionCredential, taskId: ids.task,
+    })).resolves.toEqual([expect.objectContaining({
+      entryId: 'subtask:000001:backend',
+      content: 'Read only the approved bounded project context.',
+    })])
+    const [historyAudit] = await admin<{ reads: number }[]>`
+      select count(*)::integer as reads from architect_plan_history_reads
+      where task_id = ${ids.task}::uuid and user_id = ${ids.user}::uuid
+    `
+    expect(historyAudit.reads).toBe(1)
     const reference = executableReferenceForEntry(recorded.entries[0])
     const [bound] = await issuer<{ referenceId: string }[]>`
       select forge.bind_architect_plan_entry_v1(
@@ -165,6 +189,51 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       referenceId: bound.referenceId,
       taskId: ids.task,
     })).rejects.toMatchObject({ code: 'invalid_evidence' })
+  })
+
+  it('resume-safely rekeys a crash-window legacy session and leaves no raw-id lookup target', async () => {
+    const legacyCredential = randomUUID()
+    const legacyUser = randomUUID()
+    const expectedDigest = computeCredentialDigest(legacyCredential).digest
+    await admin.begin(async (tx) => {
+      await tx`insert into users (id, display_name) values (${legacyUser}::uuid, 'Legacy session rekey test')`
+      // This is the durable state after digest backfill but before the independent
+      // primary-key update. It models a statement-level migration interruption.
+      await tx`
+        insert into sessions (id, user_id, credential_digest_v1, expires_at)
+        values (
+          ${legacyCredential}::uuid, ${legacyUser}::uuid, ${expectedDigest}::bytea,
+          clock_timestamp() + interval '7 days'
+        )
+      `
+    })
+
+    const applyRekey = () => admin`
+      update sessions
+      set id = gen_random_uuid()
+      where credential_digest_v1 = sha256(
+        convert_to('forge:web-session:v1', 'UTF8') || decode('00', 'hex') || convert_to(id::text, 'UTF8')
+      )
+    `
+    expect((await applyRekey()).count).toBe(1)
+    expect((await applyRekey()).count).toBe(0)
+
+    const [proof] = await admin<{
+      digestRows: number
+      rawIdRows: number
+      retainedRawIds: number
+    }[]>`
+      select
+        count(*) filter (where credential_digest_v1 = ${expectedDigest}::bytea)::integer as "digestRows",
+        count(*) filter (where id = ${legacyCredential}::uuid)::integer as "rawIdRows",
+        count(*) filter (
+          where credential_digest_v1 = sha256(
+            convert_to('forge:web-session:v1', 'UTF8') || decode('00', 'hex') || convert_to(id::text, 'UTF8')
+          )
+        )::integer as "retainedRawIds"
+      from sessions
+    `
+    expect(proof).toEqual({ digestRows: 1, rawIdRows: 0, retainedRawIds: 0 })
   })
 
   it('allow-once-single-winner: atomically keeps one audit and one nonce claim', async () => {
@@ -311,4 +380,31 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     `
     expect(row.malformed).toBe(0)
   })
+
+  it('creates local evidence only through the running-run fixed principal', async () => {
+    const packageId = randomUUID()
+    const runId = randomUUID()
+    const claimToken = randomUUID()
+    await admin.begin(async (tx) => {
+      await tx`
+        insert into work_packages (id, task_id, assigned_role, title, summary, sequence, status)
+        values (${packageId}::uuid, ${ids.task}::uuid, 'backend', 'Fixed writer package', 'bounded', 4, 'running')
+      `
+      await tx`
+        insert into agent_runs (id, task_id, work_package_id, agent_type, model_id_used, status)
+        values (${runId}::uuid, ${ids.task}::uuid, ${packageId}::uuid, 'backend', 'test', 'running')
+      `
+    })
+    const [created] = await issuer<{ evidenceId: string }[]>`
+      select forge.create_local_run_evidence_v1(
+        ${runId}::uuid, ${claimToken}::uuid, 30
+      ) as "evidenceId"
+    `
+    const [row] = await admin<{ agentRunId: string; state: string }[]>`
+      select agent_run_id as "agentRunId", state
+      from work_package_local_run_evidence where id = ${created.evidenceId}::uuid
+    `
+    expect(row).toEqual({ agentRunId: runId, state: 'claimed' })
+  })
+
 })

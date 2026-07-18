@@ -14,6 +14,7 @@ const {
   mockPublishTaskEvent,
   mockReadLatestArchitectCheckpointSafely,
   mockWriteArchitectCheckpointSafely,
+  mockRecordArchitectPlanVersion,
 } = vi.hoisted(() => ({
   mockDbSelect: vi.fn(),
   mockDbInsert: vi.fn(),
@@ -26,6 +27,7 @@ const {
   mockPublishTaskEvent: vi.fn(),
   mockReadLatestArchitectCheckpointSafely: vi.fn(),
   mockWriteArchitectCheckpointSafely: vi.fn(),
+  mockRecordArchitectPlanVersion: vi.fn(),
 }))
 
 vi.mock('@/db', () => ({
@@ -52,6 +54,10 @@ vi.mock('@/worker/workforce-materializer', () => ({
 
 vi.mock('@/worker/events', () => ({
   publishTaskEvent: mockPublishTaskEvent,
+}))
+
+vi.mock('@/lib/mcps/s4-protocol-store', () => ({
+  recordArchitectPlanVersion: mockRecordArchitectPlanVersion,
 }))
 
 vi.mock('@/worker/checkpoints', async (importOriginal) => {
@@ -108,6 +114,13 @@ describe('answered-question retry contract', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX = 'a'.repeat(64)
+    process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID = 'test-v1'
+    mockRecordArchitectPlanVersion.mockResolvedValue({
+      artifactId: 'artifact-1',
+      entries: [{ entryId: 'plan_body:000000' }],
+      entrySetDigest: `hmac-sha256:${'a'.repeat(64)}`,
+    })
     vi.resetModules()
     selectResults.length = 0
     insertResults.length = 0
@@ -232,6 +245,14 @@ describe('answered-question retry contract', () => {
     )
     updateResults.push(
       [{ id: task.id }],
+      [{
+        id: 'artifact-1',
+        agentRunId: 'run-1',
+        artifactType: 'adr_text',
+        content: 'Architect plan available in protected history',
+        metadata: {},
+        createdAt: new Date('2026-01-01T00:03:00Z'),
+      }],
       undefined,
       [{ id: task.id }],
     )
@@ -244,14 +265,6 @@ describe('answered-question retry contract', () => {
         modelIdUsed: 'mock-model',
         status: 'running',
         startedAt: new Date('2026-01-01T00:02:00Z'),
-      }],
-      [{
-        id: 'artifact-1',
-        agentRunId: 'run-1',
-        artifactType: 'adr_text',
-        content: 'plan',
-        metadata: {},
-        createdAt: new Date('2026-01-01T00:03:00Z'),
       }],
       restoredRows,
     )

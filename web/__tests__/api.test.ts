@@ -51,9 +51,31 @@ const mockDbSelect = vi.fn()
 const mockDbInsert = vi.fn()
 const mockDbUpdate = vi.fn()
 const mockDbDelete = vi.fn()
+let mockProjectionScopeState: 'active' | 'archive_pending' = 'active'
+function isProjectionScopeSelection(selection: unknown): boolean {
+  if (!selection || typeof selection !== 'object') return false
+  if ('localProjectionScopeState' in selection) return true
+  if (Object.keys(selection).length === 1 && 'state' in selection) return true
+  const candidate = (selection as Record<string, unknown>).state
+    ?? (selection as Record<string, unknown>).localProjectionScopeState
+  return Boolean(
+    candidate
+    && typeof candidate === 'object'
+    && (candidate as { name?: unknown }).name === 'local_projection_scope_state',
+  )
+}
+function scopeAwareDbSelect(selection?: unknown) {
+  if (isProjectionScopeSelection(selection)) {
+    const key = selection && typeof selection === 'object' && 'state' in selection
+      ? 'state'
+      : 'localProjectionScopeState'
+    return chain([{ [key]: mockProjectionScopeState }])
+  }
+  return mockDbSelect(selection)
+}
 const mockDbTransaction = vi.fn(async (callback: (tx: unknown) => unknown) =>
   callback({
-    select: mockDbSelect,
+    select: scopeAwareDbSelect,
     insert: mockDbInsert,
     update: mockDbUpdate,
     delete: mockDbDelete,
@@ -62,7 +84,7 @@ const mockDbTransaction = vi.fn(async (callback: (tx: unknown) => unknown) =>
 
 vi.mock('@/db', () => ({
   db: {
-    select: mockDbSelect,
+    select: scopeAwareDbSelect,
     insert: mockDbInsert,
     update: mockDbUpdate,
     delete: mockDbDelete,
@@ -207,6 +229,7 @@ function nextAuthRequest(path: string, init: RequestInit = {}) {
 describe('GET /api/projects — auth guard', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mockProjectionScopeState = 'active'
     mockDbUpdate.mockReturnValue(chain([]))
   })
 
@@ -5203,13 +5226,14 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
 
   beforeEach(() => {
     vi.clearAllMocks()
+    mockProjectionScopeState = 'active'
     mockDbSelect.mockReset()
     mockDbInsert.mockReset()
     mockDbUpdate.mockReset()
     mockDbDelete.mockReset()
     mockDbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) =>
       callback({
-        select: mockDbSelect,
+        select: scopeAwareDbSelect,
         insert: mockDbInsert,
         update: mockDbUpdate,
         delete: mockDbDelete,
@@ -5356,7 +5380,21 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([projectPointer]))
       .mockReturnValueOnce(chain(pointerRows))
-      .mockImplementation(() => mockDbSelect())
+      .mockImplementation((selection?: unknown) => {
+        if (isProjectionScopeSelection(selection)) return scopeAwareDbSelect(selection)
+        if (selection === undefined) {
+          return chain([{
+            id: '00000000-0000-4000-8000-000000000901',
+            taskId: input.task.id,
+            workPackageId: input.packages[0]?.id,
+            headKind: 'operator_hold',
+            headFingerprint: 'head:v1:test:operator_hold:0',
+            headRevision: BigInt(0),
+            compareAndSetFingerprint: `sha256:${'a'.repeat(64)}`,
+          }])
+        }
+        return mockDbSelect(selection)
+      })
     const projectUpdate = chain([])
     let projectValues: Record<string, unknown> = {}
     projectUpdate.set = vi.fn((values: Record<string, unknown>) => {
@@ -5402,7 +5440,10 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         insert: transactionInsert,
         update: transactionUpdate,
         delete: mockDbDelete,
-        execute: vi.fn(async () => [{ now: '2026-07-03 00:01:00+00' }]),
+        execute: vi.fn(async () => [{
+          advanced: true,
+          now: '2026-07-03 00:01:00+00',
+        }]),
       }),
     )
     return { projectUpdate }

@@ -6,6 +6,7 @@ import postgres from 'postgres'
 import type { BrowserContext, TestInfo } from '@playwright/test'
 import { seedAgentConfigs } from '../db/seed-agents'
 import { resolveDestructiveE2EEnvironment } from './destructive-environment'
+import { computeCredentialDigest } from '../lib/session-credential-digest'
 
 const root = path.resolve(__dirname, '..')
 const workerLogs = new WeakMap<ChildProcessWithoutNullStreams, string[]>()
@@ -156,7 +157,10 @@ export async function seedSession(displayName = 'E2E Operator'): Promise<SeededS
   const redis = redisClient()
   const userId = crypto.randomUUID()
   const sessionId = crypto.randomUUID()
+  const sessionRowId = crypto.randomUUID()
   const now = Date.now()
+  const expiresAt = now + 60 * 60 * 1000
+  const digest = computeCredentialDigest(sessionId).digest
 
   try {
     await sql`
@@ -164,20 +168,22 @@ export async function seedSession(displayName = 'E2E Operator'): Promise<SeededS
       values (${userId}, ${displayName})
     `
     await sql`
-      insert into sessions (id, user_id, user_agent)
-      values (${sessionId}, ${userId}, 'Playwright E2E')
+      insert into sessions (
+        id, user_id, user_agent, credential_digest_v1, expires_at
+      ) values (
+        ${sessionRowId}, ${userId}, 'Playwright E2E', ${digest},
+        ${new Date(expiresAt)}
+      )
     `
     await redis.set(
-      `session:${sessionId}`,
+      `session:v2:${digest.toString('hex')}`,
       JSON.stringify({
         userId,
-        credentialId: null,
-        userAgent: 'Playwright E2E',
-        ip: '127.0.0.1',
+        expiresAt,
         lastSeenAt: now,
       }),
-      'EX',
-      60 * 60,
+      'PXAT',
+      expiresAt,
     )
   } finally {
     await sql.end()
