@@ -302,6 +302,98 @@ describe('getSession', () => {
     expect(mockRedisSet).toHaveBeenCalledWith(expect.stringMatching(/^session:v2:/), expect.any(String), 'PXAT', expect.any(Number))
   })
 
+  it('authorizes when a raw PostgreSQL clock timestamp is returned as text', async () => {
+    const now = new Date()
+    mockRedisSet.mockResolvedValue('OK')
+    mockDbSelect.mockReturnValue(chain([{
+      sessionId: '00000000-0000-4000-8000-000000000010',
+      userId: 'user-abc',
+      lastSeenAt: now,
+      expiresAt: new Date(now.getTime() + 60_000),
+      revokedAt: null,
+      databaseNow: now.toISOString().replace('T', ' ').replace('Z', '+00'),
+    }]))
+
+    const req = fakeRequest('00000000-0000-4000-8000-000000000000')
+    const result = await getSession(req)
+
+    expect(result).toEqual({
+      sessionId: '00000000-0000-4000-8000-000000000010',
+      userId: 'user-abc',
+    })
+    expect(mockRedisSet).toHaveBeenCalledOnce()
+  })
+
+  it('fails closed when PostgreSQL returns a non-finite session timestamp', async () => {
+    const now = new Date()
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockDbSelect.mockReturnValue(chain([{
+      sessionId: '00000000-0000-4000-8000-000000000010',
+      userId: 'user-abc',
+      lastSeenAt: now,
+      expiresAt: new Date(now.getTime() + 60_000),
+      revokedAt: null,
+      databaseNow: 'infinity',
+    }]))
+
+    const req = fakeRequest('00000000-0000-4000-8000-000000000000')
+    const result = await getSession(req)
+
+    expect(result).toBeNull()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisSet).not.toHaveBeenCalled()
+    expect(consoleError).toHaveBeenCalledWith(
+      'Database-authoritative session check failed:',
+      expect.objectContaining({ message: expect.stringContaining('invalid clock') }),
+    )
+    consoleError.mockRestore()
+  })
+
+  it('fails closed when a stored session expiry is non-finite', async () => {
+    const now = new Date()
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    mockDbSelect.mockReturnValue(chain([{
+      sessionId: '00000000-0000-4000-8000-000000000010',
+      userId: 'user-abc',
+      lastSeenAt: now,
+      expiresAt: new Date('infinity'),
+      revokedAt: null,
+      databaseNow: now,
+    }]))
+
+    const req = fakeRequest('00000000-0000-4000-8000-000000000000')
+    const result = await getSession(req)
+
+    expect(result).toBeNull()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisSet).not.toHaveBeenCalled()
+    expect(consoleError).toHaveBeenCalledWith(
+      'Database-authoritative session check failed:',
+      expect.objectContaining({ message: expect.stringContaining('invalid expiry') }),
+    )
+    consoleError.mockRestore()
+  })
+
+  it('denies a session exactly at its database expiry boundary', async () => {
+    const now = new Date()
+    mockRedisDel.mockResolvedValue(1)
+    mockDbSelect.mockReturnValue(chain([{
+      sessionId: '00000000-0000-4000-8000-000000000010',
+      userId: 'user-abc',
+      lastSeenAt: new Date(now.getTime() - 30_000),
+      expiresAt: now,
+      revokedAt: null,
+      databaseNow: now,
+    }]))
+
+    const req = fakeRequest('00000000-0000-4000-8000-000000000000')
+    const result = await getSession(req)
+
+    expect(result).toBeNull()
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisSet).not.toHaveBeenCalled()
+  })
+
   it('denies and removes stale cache state for a revoked database row', async () => {
     mockRedisDel.mockResolvedValue(1)
     const now = new Date()
