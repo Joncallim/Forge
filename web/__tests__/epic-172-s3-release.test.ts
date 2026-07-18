@@ -67,7 +67,7 @@ describe('Epic 172 S3 release seam', () => {
     expect(workflow).toContain('name: Run mandatory S3 PostgreSQL concurrency proof')
     expect(workflow).toContain("RUN_FORGE_POSTGRES_TESTS: '1'")
     expect(workflow).toContain('e2e/filesystem-grant-lifecycle-concurrency.spec.ts')
-    expect(workflow).toContain('--project=chromium-desktop --workers=1')
+    expect(workflow).toContain('--project=chromium-desktop --workers=1 --retries=0')
     expect(workflow).toContain("grep -Eq '[1-9][0-9]* skipped'")
     expect(workflow).toContain("if ! grep -Eq '[1-9][0-9]* passed'")
   })

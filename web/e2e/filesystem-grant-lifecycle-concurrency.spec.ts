@@ -1213,15 +1213,14 @@ test('S3: mutation vs claim contention from lower sibling', async () => {
       `
       expect(decision).toBeDefined()
 
-      const [pointer] = await tx`
-        select id, work_package_id, current_decision_revision, current_decision_fingerprint,
-               pointer_fingerprint, pointer_version
+      const [pointer] = await tx<{ pointerVersion: string }[]>`
+        select pointer_version::text as "pointerVersion"
         from filesystem_mcp_current_decision_pointers
         where work_package_id = ${packageId}
         for update
       `
       if (pointer) {
-        const newVersion = Number(pointer.pointerVersion) + 1
+        const newVersion = (BigInt(pointer.pointerVersion) + BigInt(1)).toString()
         await tx`
           update filesystem_mcp_current_decision_pointers
           set current_decision_id = ${decision.id},
@@ -1230,7 +1229,7 @@ test('S3: mutation vs claim contention from lower sibling', async () => {
               current_decision_revision = ${decision.grant_decision_revision},
               current_decision_fingerprint = ${decision.pointer_fingerprint},
               pointer_fingerprint = ${decision.pointer_fingerprint},
-              pointer_version = ${newVersion},
+              pointer_version = ${newVersion}::bigint,
               updated_at = now()
           where work_package_id = ${packageId}
         `
