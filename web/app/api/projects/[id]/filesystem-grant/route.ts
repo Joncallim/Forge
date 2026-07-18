@@ -10,9 +10,9 @@ import { getProjectMcpOverview } from '@/lib/mcps/manager'
 import { redis } from '@/lib/redis'
 import {
   filesystemGrantHealthError,
-  isRecord,
   projectFilesystemGrantFromAuthority,
 } from '@/lib/mcps/filesystem-grants'
+import { respondToRouteError } from '@/lib/http/route-error'
 import {
   loadCurrentProjectFilesystemDecision,
   mutateProjectFilesystemGrant,
@@ -77,8 +77,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       healthError: filesystemGrantHealthError(overview.statuses),
     })
   } catch (err) {
-    console.error('[GET /api/projects/:id/filesystem-grant] Unexpected error', err)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    return respondToRouteError('GET /api/projects/:id/filesystem-grant', err)
   }
 }
 
@@ -129,8 +128,6 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
       ? NextResponse.json({ ...response, error: 'The project decision was saved, but some recovery wake-ups failed.', failedTaskIds: queueFailures }, { status: 202 })
       : NextResponse.json(response)
   } catch (err) {
-    const status = isRecord(err) && typeof err.status === 'number' ? err.status : 500
-    if (status === 500) console.error('[PUT /api/projects/:id/filesystem-grant] Unexpected error', err)
-    return NextResponse.json({ error: err instanceof Error ? err.message : 'Internal server error' }, { status })
+    return respondToRouteError('PUT /api/projects/:id/filesystem-grant', err)
   }
 }

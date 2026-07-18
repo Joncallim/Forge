@@ -15,6 +15,7 @@ import type { ProjectMcpStatus } from './types'
 import {
   canonicalPositiveDecisionRevision,
   parseFilesystemGrantBlockMetadata,
+  type FilesystemGrantBlockMetadata,
   type FilesystemGrantHoldState,
   type FilesystemGrantRevocationReason,
 } from './filesystem-grant-lifecycle'
@@ -559,8 +560,19 @@ export function requiresFilesystemGrantApproval(input: {
  */
 export const FILESYSTEM_GRANT_BLOCK_METADATA_KEY = 'mcpGrantBlock'
 
+/**
+ * The single canonical reader for the operator-hold grant block. Every consumer
+ * — the reconciliation service, the block predicate below, and the legacy
+ * compatibility adapter — reads the block through here so the location
+ * (`metadata.mcpGrantBlock`) and the strict canonical parse are defined once.
+ */
+export function readFilesystemGrantBlockFromMetadata(
+  metadata: unknown,
+): FilesystemGrantBlockMetadata | null {
+  if (!isRecord(metadata)) return null
+  return parseFilesystemGrantBlockMetadata(metadata[FILESYSTEM_GRANT_BLOCK_METADATA_KEY])
+}
+
 export function isFilesystemGrantBlockedPackageMetadata(metadata: unknown): boolean {
-  if (!isRecord(metadata)) return false
-  const marker = metadata[FILESYSTEM_GRANT_BLOCK_METADATA_KEY]
-  return parseFilesystemGrantBlockMetadata(marker) !== null
+  return readFilesystemGrantBlockFromMetadata(metadata) !== null
 }

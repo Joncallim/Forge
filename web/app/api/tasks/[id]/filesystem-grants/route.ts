@@ -16,9 +16,9 @@ import { getProjectMcpOverview } from '@/lib/mcps/manager'
 import {
   filesystemGrantHealthError,
   hasUnsafeFilesystemCapability,
-  isRecord,
   summarizeFilesystemCapabilities,
 } from '@/lib/mcps/filesystem-grants'
+import { respondToRouteError } from '@/lib/http/route-error'
 import {
   mutateTaskFilesystemGrants,
   type FilesystemGrantMutation,
@@ -115,8 +115,7 @@ export async function GET(
     }
     return NextResponse.json({ schemaVersion: 2, grants: await readGrantStates(taskId) })
   } catch (err) {
-    console.error('[tasks/filesystem-grants GET] Unexpected error', err)
-    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+    return respondToRouteError('GET /api/tasks/:id/filesystem-grants', err)
   }
 }
 
@@ -196,8 +195,6 @@ export async function PUT(
       ? NextResponse.json({ ...response, error: 'The decision was saved, but some recovery wake-ups failed.', failedTaskIds: queueFailures }, { status: 202 })
       : NextResponse.json(response)
   } catch (err) {
-    const status = isRecord(err) && typeof err.status === 'number' ? err.status : 500
-    if (status === 500) console.error('[tasks/filesystem-grants PUT] Unexpected error', err)
-    return NextResponse.json({ error: err instanceof Error ? err.message : 'Internal server error' }, { status })
+    return respondToRouteError('PUT /api/tasks/:id/filesystem-grants', err)
   }
 }
