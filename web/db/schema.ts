@@ -1053,6 +1053,9 @@ export const workPackageLocalProjectionHeads = pgTable(
   'work_package_local_projection_heads',
   {
     id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id')
+      .notNull()
+      .references(() => tasks.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id')
       .notNull()
       .references(() => workPackages.id, { onDelete: 'restrict' }),
@@ -1071,6 +1074,7 @@ export const workPackageLocalProjectionHeads = pgTable(
       .on(t.workPackageId, t.headKind),
     index('work_package_local_projection_heads_kind_idx').on(t.headKind),
     index('work_package_local_projection_heads_state_idx').on(t.state),
+    index('work_package_local_projection_heads_task_id_idx').on(t.taskId),
     uniqueIndex('work_package_local_projection_heads_fingerprint_idx')
       .on(t.headFingerprint),
     uniqueIndex('work_package_local_projection_heads_lease_token_idx').on(t.leaseToken),

@@ -504,6 +504,10 @@ DECLARE
   v_local public.work_package_local_run_evidence%ROWTYPE;
   v_source text;
   v_mode text;
+  v_project_decision_generation bigint;
+  v_project_decision public.project_filesystem_grant_decisions%ROWTYPE;
+  v_grant_approval_id uuid := NULL;
+  v_grant_nonce uuid := NULL;
   v_approved text[];
   v_required text[];
   v_snapshot jsonb;
@@ -569,12 +573,27 @@ BEGIN
     v_source := 'package_allow_once';
     v_mode := 'allow_once';
   ELSIF v_decision.decision_scope = 'project' THEN
-    -- S3 must supply the ADR-required append-only project decision table and
-    -- project-owned current pointer before this arm can issue. A mutable
-    -- projects.mcp_config read is not historical authority and must never be
-    -- normalized into a protocol-v2 snapshot.
-    RAISE EXCEPTION 'project always-allow packet authority is not installed'
-      USING ERRCODE = '55000';
+    -- S3 supplies the append-only project decision table and project-owned
+    -- current pointer. The project-level always-allow grant is resolved from
+    -- the immutable decision history, not from the mutable mcp_config blob.
+    SELECT pd.*, pp.current_decision_generation INTO v_project_decision, v_project_decision_generation
+    FROM public.project_filesystem_current_decision_pointers pp
+    JOIN public.project_filesystem_grant_decisions pd
+      ON pd.id = pp.current_decision_id
+      AND pd.project_id = pp.current_decision_project_id
+      AND pd.grant_decision_revision = pp.current_decision_revision
+      AND pd.root_binding_revision = pp.current_root_binding_revision
+      AND pd.decision_fingerprint = pp.current_decision_fingerprint
+      AND pd.decision_generation = pp.current_decision_generation
+    WHERE pp.project_id = v_project.id;
+    IF NOT FOUND OR v_project_decision.decision <> 'approved' THEN
+      RAISE EXCEPTION 'project always-allow grant is not currently approved'
+        USING ERRCODE = '55000';
+    END IF;
+    v_grant_approval_id := NULL;
+    v_grant_nonce := NULL;
+    v_source := 'project_always_allow';
+    v_mode := 'always_allow';
   ELSE
     RAISE EXCEPTION 'unknown packet authorization source' USING ERRCODE = '22023';
   END IF;

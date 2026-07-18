@@ -3,6 +3,7 @@ import { sessions, users } from '@/db/schema'
 import { eq } from 'drizzle-orm'
 import { redis } from '@/lib/redis'
 import { isIP } from 'node:net'
+import { computeCredentialDigest } from '@/lib/session-credential-digest'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -136,6 +137,11 @@ export async function createSession(
     userAgent: meta.userAgent ?? null,
     ip,
     lastSeenAt: now,
+  }
+
+  // Compute and record the credential digest for rekey detection
+  if (credentialId) {
+    computeCredentialDigest({ credentialId, sessionId, userId })
   }
 
   // Write to Redis with 7-day TTL
