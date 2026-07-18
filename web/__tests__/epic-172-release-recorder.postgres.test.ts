@@ -372,12 +372,61 @@ describe.skipIf(!hasPostgresFixture)('Epic 172 release recorder PostgreSQL contr
   })
 
   it('keeps direct DML closed while the app can read the disabled gate', async () => {
-    const [privileges] = await app<{ canInsert: boolean; canSelectState: boolean }[]>`
+    const [privileges] = await app<{
+      canInsert: boolean
+      canSelectState: boolean
+      ownerCanReadPackageId: boolean
+      ownerCanReadPackageTaskId: boolean
+      ownerCanReferencePackages: boolean
+      ownerCanReferenceTasks: boolean
+      ownerCanTriggerPackages: boolean
+    }[]>`
       select
         has_table_privilege(current_user, 'public.forge_epic_172_release_evidence', 'INSERT') as "canInsert",
-        has_table_privilege(current_user, 'public.forge_epic_172_enablement_state', 'SELECT') as "canSelectState"
+        has_table_privilege(current_user, 'public.forge_epic_172_enablement_state', 'SELECT') as "canSelectState",
+        has_column_privilege(
+          'forge_release_routines_owner', 'public.work_packages', 'id', 'SELECT'
+        ) as "ownerCanReadPackageId",
+        has_column_privilege(
+          'forge_release_routines_owner', 'public.work_packages', 'task_id', 'SELECT'
+        ) as "ownerCanReadPackageTaskId",
+        has_table_privilege(
+          'forge_release_routines_owner', 'public.work_packages', 'REFERENCES'
+        ) as "ownerCanReferencePackages",
+        has_table_privilege(
+          'forge_release_routines_owner', 'public.tasks', 'REFERENCES'
+        ) as "ownerCanReferenceTasks",
+        has_table_privilege(
+          'forge_release_routines_owner', 'public.work_packages', 'TRIGGER'
+        ) as "ownerCanTriggerPackages"
     `
-    expect(privileges).toEqual({ canInsert: false, canSelectState: false })
+    expect(privileges).toEqual({
+      canInsert: false,
+      canSelectState: false,
+      ownerCanReadPackageId: true,
+      ownerCanReadPackageTaskId: true,
+      ownerCanReferencePackages: false,
+      ownerCanReferenceTasks: false,
+      ownerCanTriggerPackages: false,
+    })
+    const [writerProjectionPrivileges] = await writer<{
+      canDelete: boolean
+      canInsert: boolean
+      canSelect: boolean
+      canUpdate: boolean
+    }[]>`
+      select
+        has_table_privilege(current_user, 'public.work_package_local_projection_heads', 'DELETE') as "canDelete",
+        has_table_privilege(current_user, 'public.work_package_local_projection_heads', 'INSERT') as "canInsert",
+        has_table_privilege(current_user, 'public.work_package_local_projection_heads', 'SELECT') as "canSelect",
+        has_table_privilege(current_user, 'public.work_package_local_projection_heads', 'UPDATE') as "canUpdate"
+    `
+    expect(writerProjectionPrivileges).toEqual({
+      canDelete: false,
+      canInsert: false,
+      canSelect: false,
+      canUpdate: false,
+    })
     const [gate] = await app<{ state: string }[]>`select state from forge.read_epic_172_enablement_state_v1()`
     expect(gate).toEqual({ state: 'disabled' })
     await expect(app`select * from public.forge_epic_172_enablement_state`).rejects.toThrow(/permission denied/)

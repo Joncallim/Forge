@@ -1030,7 +1030,9 @@ AS $$
 DECLARE
   v_package_count bigint;
 BEGIN
-  SELECT count(*) INTO STRICT v_package_count FROM public.work_packages;
+  SELECT count(id) INTO STRICT v_package_count
+  FROM public.work_packages
+  WHERE task_id = NEW.task_id;
   IF v_package_count > 256 THEN
     RAISE EXCEPTION 'S3 package limit exceeded: at most 256 work packages allowed'
       USING ERRCODE = '54000';
@@ -1057,6 +1059,8 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+--> statement-breakpoint
+REVOKE ALL ON FUNCTION forge.preallocate_local_projection_heads_v1() FROM PUBLIC;
 --> statement-breakpoint
 CREATE OR REPLACE TRIGGER trg_preallocate_projection_heads
   AFTER INSERT ON public.work_packages
@@ -1087,6 +1091,8 @@ BEGIN
 END;
 $$;
 --> statement-breakpoint
+REVOKE ALL ON FUNCTION forge.reject_projection_head_mutation_v1() FROM PUBLIC;
+--> statement-breakpoint
 CREATE OR REPLACE TRIGGER trg_reject_projection_head_mutation
   BEFORE UPDATE OR DELETE ON public.work_package_local_projection_heads
   FOR EACH ROW EXECUTE FUNCTION forge.reject_projection_head_mutation_v1();
@@ -1094,15 +1100,20 @@ CREATE OR REPLACE TRIGGER trg_reject_projection_head_mutation
 -- Backfill heads for existing packages (after the trigger is active)
 DO $$
 DECLARE
-  v_pkg public.work_packages%ROWTYPE;
-  v_count bigint;
+  v_pkg record;
+  v_over_limit_task_id uuid;
 BEGIN
-  SELECT count(*) INTO v_count FROM public.work_packages;
-  IF v_count > 256 THEN
-    RAISE EXCEPTION 'Cannot backfill: % existing packages exceeds S3 limit of 256', v_count
+  SELECT task_id INTO v_over_limit_task_id
+  FROM public.work_packages
+  GROUP BY task_id
+  HAVING count(id) > 256
+  ORDER BY task_id
+  LIMIT 1;
+  IF v_over_limit_task_id IS NOT NULL THEN
+    RAISE EXCEPTION 'Cannot backfill: task % exceeds S3 limit of 256 packages', v_over_limit_task_id
       USING ERRCODE = '54000';
   END IF;
-  FOR v_pkg IN SELECT * FROM public.work_packages LOOP
+  FOR v_pkg IN SELECT id, task_id FROM public.work_packages LOOP
     INSERT INTO public.work_package_local_projection_heads (
       task_id, work_package_id, head_kind, head_index, head_fingerprint
     ) VALUES
@@ -1131,12 +1142,8 @@ ALTER TABLE public.work_package_local_projection_heads
   OWNER TO forge_release_routines_owner;
 --> statement-breakpoint
 REVOKE ALL ON public.work_package_local_projection_heads FROM PUBLIC;
-GRANT SELECT ON public.work_package_local_projection_heads TO PUBLIC;
-GRANT SELECT, INSERT, UPDATE ON public.work_package_local_projection_heads
-  TO forge_release_evidence_writer;
---> statement-breakpoint
-REVOKE DELETE, TRUNCATE ON public.work_package_local_projection_heads
-  FROM forge_release_evidence_writer;
+REVOKE ALL ON public.work_package_local_projection_heads
+  FROM forge_release_evidence_writer, forge_release_transition;
 --> statement-breakpoint
 RESET ROLE;
 --> statement-breakpoint

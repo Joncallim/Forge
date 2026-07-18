@@ -72,12 +72,56 @@ describe('Epic 172 S3 release seam', () => {
     expect(workflow).toContain("if ! grep -Eq '[1-9][0-9]* passed'")
   })
 
+  it('runs the primary unit suite with mandatory release PostgreSQL fixtures and zero lint warnings', () => {
+    const workflow = readFileSync(
+      fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)),
+      'utf8',
+    )
+    expect(workflow).toContain('npm run lint -- --max-warnings=0')
+    expect(workflow).toContain('name: Run the complete zero-skip unit suite')
+    expect(workflow).toContain('run: npm test')
+    expect(workflow).toContain("FORGE_EPIC_172_REQUIRE_POSTGRES_TEST: '1'")
+    expect(workflow).toContain('FORGE_EPIC_172_TEST_APP_DATABASE_URL:')
+    expect(workflow).toContain('FORGE_EPIC_172_TEST_WRITER_DATABASE_URL:')
+    expect(workflow).toContain('FORGE_EPIC_172_TEST_TRANSITION_DATABASE_URL:')
+    expect(workflow).not.toContain(
+      'run: npx vitest run __tests__/epic-172-release-recorder.postgres.test.ts',
+    )
+  })
+
   it('uses a versioned, non-inheriting owner handoff for fresh and upgraded Step 0 databases', () => {
     expect(ownerBootstrap).toContain('forge_begin_epic_172_s3_owner_bootstrap_v1')
     expect(ownerBootstrap).toContain('forge_finalize_epic_172_s3_owner_bootstrap_v1')
     expect(ownerBootstrap).toContain('with admin false, inherit false, set true')
     expect(ownerBootstrap).toContain('A competing release-role membership exists before the S3 handoff')
     expect(ownerBootstrap).toContain('S3 release ownership is already complete')
+    expect(ownerBootstrap).toContain(
+      'grant references (id) on table public.tasks to forge_release_routines_owner',
+    )
+    expect(ownerBootstrap).toContain(
+      'grant select (id, task_id), references (id) on table public.work_packages to forge_release_routines_owner',
+    )
+    expect(ownerBootstrap).toContain(
+      'revoke references (id) on table public.tasks from forge_release_routines_owner',
+    )
+    expect(ownerBootstrap).toContain('The post-bootstrap S3 source-table ACL is not exact')
+    expect(ownerBootstrap).toContain('The projection-head table owner or direct ACL is not exact')
+    expect(migration).toContain('REVOKE ALL ON public.work_package_local_projection_heads FROM PUBLIC')
+    expect(migration).toContain(
+      'FROM forge_release_evidence_writer, forge_release_transition',
+    )
+    expect(migration).not.toContain(
+      'GRANT SELECT ON public.work_package_local_projection_heads TO PUBLIC',
+    )
+    expect(migration).not.toContain(
+      'GRANT SELECT, INSERT, UPDATE ON public.work_package_local_projection_heads',
+    )
+    expect(migration).toContain(
+      'REVOKE ALL ON FUNCTION forge.preallocate_local_projection_heads_v1() FROM PUBLIC',
+    )
+    expect(migration).toContain(
+      'REVOKE ALL ON FUNCTION forge.reject_projection_head_mutation_v1() FROM PUBLIC',
+    )
     expect(migration.indexOf('forge_begin_epic_172_s3_owner_bootstrap_v1')).toBeLessThan(
       migration.indexOf('SET LOCAL ROLE forge_release_routines_owner'),
     )
