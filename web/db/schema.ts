@@ -92,6 +92,7 @@ export const sessions = pgTable(
     revokedAt: timestamp('revoked_at', tsOpts),
     userAgent: text('user_agent'),
     ipAddress: inet('ip_address'),
+    credentialDigest: bytea('credential_digest'),
   },
   (t) => [
     index('sessions_user_id_idx').on(t.userId),
