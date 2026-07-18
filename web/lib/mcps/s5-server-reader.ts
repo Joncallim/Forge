@@ -1,17 +1,5 @@
 import 'server-only'
 import { createHash, randomUUID } from 'node:crypto'
-import { asc, eq } from 'drizzle-orm'
-import { db } from '@/db'
-import {
-  filesystemMcpGrantApprovals,
-  filesystemMcpCurrentDecisionPointers,
-  projectFilesystemCurrentDecisionPointers,
-  workPackages,
-  type FilesystemMcpGrantApproval,
-} from '@/db/schema'
-import { summarizeFilesystemCapabilities } from '@/lib/mcps/filesystem-grants'
-import { loadCurrentProjectFilesystemDecision } from '@/lib/mcps/filesystem-grant-reconciliation'
-import { parseFilesystemGrantBlockMetadata } from '@/lib/mcps/filesystem-grant-lifecycle'
 
 export type S5AdmissionPresenter = Readonly<{
   computedAt: string

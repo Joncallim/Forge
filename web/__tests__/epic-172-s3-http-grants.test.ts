@@ -60,7 +60,7 @@ describe('S3: local projection heads', () => {
 
   it('rejects reassignment across head kinds', () => {
     const headId = '550e8400-e29b-41d4-a716-446655440000'
-    const identity = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000', 
+    const identity = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000',
       '660e8400-e29b-41d4-a716-446655440001',
       'filesystem_grant_decision',
       0,
@@ -80,7 +80,7 @@ describe('S3: local projection heads', () => {
   it('rejects fingerprint mismatches', () => {
     const wpId = '660e8400-e29b-41d4-a716-446655440001'
     const identityA = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000', wpId, 'lease_expiry', 3)
-    const identityB = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000', 
+    const identityB = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000',
       '770e8400-e29b-41d4-a716-446655440002',
       'lease_expiry',
       3,
@@ -98,7 +98,7 @@ describe('S3: local projection heads', () => {
   })
 
   it('asserts head is not missing', () => {
-    const identity = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000', 
+    const identity = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000',
       '660e8400-e29b-41d4-a716-446655440001',
       'integrity_hold',
       5,

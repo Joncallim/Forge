@@ -1378,7 +1378,7 @@ export const filesystemMcpRuntimeAudits = pgTable(
     grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' }),
     grantDecisionNonce: uuid('grant_decision_nonce'),
     authorizationRootBindingRevision: bigint('authorization_root_binding_revision', { mode: 'bigint' }),
-    projectDecisionId: uuid('project_decision_id').references(() => filesystemMcpGrantApprovals.id, {
+    projectDecisionId: uuid('project_decision_id').references(() => projectFilesystemGrantDecisions.id, {
       onDelete: 'restrict',
     }),
     assembly: jsonb('assembly').$type<Record<string, unknown>>(),
