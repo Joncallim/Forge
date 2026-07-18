@@ -64,7 +64,7 @@ describe('S3: generic error boundary on grant PUT routes', () => {
     // The detail is retained only in the internal server log, keyed by the same
     // correlation id, so operators can still trace the failure out-of-band.
     const loggedPayload = consoleError.mock.calls
-      .map((call) => JSON.stringify(call))
+      .map((call: unknown[]) => JSON.stringify(call))
       .join('\n')
     expect(loggedPayload).toContain(body.correlationId)
     expect(loggedPayload).toContain(NONCE)

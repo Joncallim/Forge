@@ -27,7 +27,7 @@ describe('S3: legacy filesystem grant block adapter', () => {
       mcpRequirements: [],
       metadata: { mcpGrantBlock: canonicalBlock },
       projectMcpConfig: EMPTY_CONFIG,
-      projectRootBindingRevision: 7n, // bigint, as returned by Drizzle for the revision column
+      projectRootBindingRevision: BigInt(7), // bigint, as returned by Drizzle for the revision column
     })
 
     expect(state.workPackageId).toBe(WP)
