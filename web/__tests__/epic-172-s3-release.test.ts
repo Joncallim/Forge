@@ -70,6 +70,22 @@ describe('Epic 172 S3 release seam', () => {
     expect(workflow).toContain('--project=chromium-desktop --workers=1 --retries=0')
     expect(workflow).toContain("grep -Eq '[1-9][0-9]* skipped'")
     expect(workflow).toContain("if ! grep -Eq '[1-9][0-9]* passed'")
+    const concurrencyProof = readFileSync(
+      fileURLToPath(new URL('../e2e/filesystem-grant-lifecycle-concurrency.spec.ts', import.meta.url)),
+      'utf8',
+    )
+    expect(concurrencyProof).not.toMatch(
+      /insert into filesystem_mcp_runtime_audits[\s\S]{0,400}duration_ms/i,
+    )
+    const claimFixture = concurrencyProof.indexOf("SET LOCAL application_name = 'forge-s3-claim-contender'")
+    const claimRunInsert = concurrencyProof.indexOf('insert into agent_runs (', claimFixture)
+    const claimAuditInsert = concurrencyProof.indexOf(
+      'insert into filesystem_mcp_runtime_audits (',
+      claimFixture,
+    )
+    expect(claimFixture).toBeGreaterThan(0)
+    expect(claimRunInsert).toBeGreaterThan(claimFixture)
+    expect(claimRunInsert).toBeLessThan(claimAuditInsert)
   })
 
   it('runs the primary unit suite with mandatory release PostgreSQL fixtures and zero lint warnings', () => {

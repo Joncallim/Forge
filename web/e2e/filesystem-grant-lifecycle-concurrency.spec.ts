@@ -36,7 +36,11 @@ function sqlClient() {
   return postgres(url, { max: 1 })
 }
 
-async function seed(input: { siblingStatus?: string; taskStatus?: string } = {}) {
+async function seed(input: {
+  siblingRequiresFilesystem?: boolean
+  siblingStatus?: string
+  taskStatus?: string
+} = {}) {
   const sql = sqlClient()
   const userId = randomUUID()
   const projectId = randomUUID()
@@ -74,7 +78,7 @@ async function seed(input: { siblingStatus?: string; taskStatus?: string } = {})
         id, task_id, assigned_role, title, summary, status, sequence,
         mcp_requirements, metadata
       ) values
-        (${lowerPackageId}, ${taskId}, 'backend', 'lower sibling', 'test', ${input.siblingStatus ?? 'pending'}, 1, ${sql.json([])}, ${sql.json(siblingMetadata)}),
+        (${lowerPackageId}, ${taskId}, 'backend', 'lower sibling', 'test', ${input.siblingStatus ?? 'pending'}, 1, ${sql.json(input.siblingRequiresFilesystem ? requirements : [])}, ${sql.json(siblingMetadata)}),
         (${targetPackageId}, ${taskId}, 'backend', 'target', 'test', 'ready', 2, ${sql.json(requirements)}, ${sql.json({})})
     `
     const [pointer] = await sql<{
@@ -1172,7 +1176,7 @@ test('the complete sibling lock waits on the lower ID before reaching the target
 })
 
 test('S3: mutation vs claim contention from lower sibling', async () => {
-  const fixture = await seed({ siblingStatus: 'pending' })
+  const fixture = await seed({ siblingRequiresFilesystem: true, siblingStatus: 'pending' })
   const sql = sqlClient()
   const altSql = sqlClient()
   try {
@@ -1236,13 +1240,21 @@ test('S3: mutation vs claim contention from lower sibling', async () => {
       }
 
       await tx`
+        insert into agent_runs (
+          id, task_id, work_package_id, agent_type, model_id_used, status
+        ) values (
+          ${claimRunId}, ${fixture.taskId}, ${packageId}, 'backend', 's3-contention-fixture', 'completed'
+        )
+      `
+
+      await tx`
         insert into filesystem_mcp_runtime_audits (
           id, task_id, work_package_id, agent_run_id, grant_approval_id,
-          status, operation, capabilities, file_count, duration_ms, created_at
+          status, operation, capabilities, file_count, created_at
         ) values (
           ${randomUUID()}, ${fixture.taskId}, ${packageId}, ${claimRunId},
           ${decision.id}, 'completed', 'context_packet_delivered',
-          ${sql.json(['filesystem.project.read'])}, 0, 0, now()
+          ${sql.json(['filesystem.project.read'])}, 0, now()
         )
       `
 
