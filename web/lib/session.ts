@@ -3,7 +3,7 @@ import { sessions, users } from '@/db/schema'
 import { eq } from 'drizzle-orm'
 import { redis } from '@/lib/redis'
 import { isIP } from 'node:net'
-import { computeCredentialDigest } from '@/lib/session-credential-digest'
+import { verifyCredentialDigest, computeCredentialDigest } from '@/lib/session-credential-digest'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -12,6 +12,7 @@ import { computeCredentialDigest } from '@/lib/session-credential-digest'
 export type SessionData = {
   userId: string
   credentialId: string | null
+  credentialDigest: string | null
   userAgent: string | null
   ip: string | null
   lastSeenAt: number // unix ms, stored in Redis for write-behind logic
@@ -99,6 +100,19 @@ export async function getSession(
     return null
   }
 
+  // Verify credential digest if one was stored at session creation.
+  // A mismatch means the credential was rotated/removed; destroy the session.
+  if (data.credentialDigest && data.credentialId) {
+    const ok = verifyCredentialDigest(
+      { credentialDigest: Buffer.from(data.credentialDigest, 'hex') },
+      { credentialId: data.credentialId, sessionId, userId: data.userId },
+    )
+    if (!ok) {
+      await destroySession(sessionId)
+      return null
+    }
+  }
+
   // Write-behind: update lastSeenAt in DB if the stored timestamp is >60s old
   const now = Date.now()
   if (now - (data.lastSeenAt ?? 0) > WRITE_BEHIND_INTERVAL_MS) {
@@ -131,17 +145,19 @@ export async function createSession(
   const now = Date.now()
   const ip = sessionIp(meta.ip)
 
+  // Compute and store the credential digest for rekey detection
+  let credentialDigest: string | null = null
+  if (credentialId) {
+    credentialDigest = computeCredentialDigest({ credentialId, sessionId, userId }).digest.toString('hex')
+  }
+
   const data: SessionData = {
     userId,
     credentialId,
+    credentialDigest,
     userAgent: meta.userAgent ?? null,
     ip,
     lastSeenAt: now,
-  }
-
-  // Compute and record the credential digest for rekey detection
-  if (credentialId) {
-    computeCredentialDigest({ credentialId, sessionId, userId })
   }
 
   // Write to Redis with 7-day TTL
