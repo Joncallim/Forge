@@ -75,8 +75,11 @@ async function seedBase(admin: ReturnType<typeof postgres>) {
       ) values (${ids.project}::uuid, 'S6 issuance project', ${ids.user}::uuid, 1, 1)
     `
     await tx`
-      insert into tasks (id, project_id, submitted_by, title, prompt)
-      values (${ids.task}::uuid, ${ids.project}::uuid, ${ids.user}::uuid, 'S6 issuance task', 'protected')
+      insert into tasks (id, project_id, submitted_by, title, prompt, status)
+      values (
+        ${ids.task}::uuid, ${ids.project}::uuid, ${ids.user}::uuid,
+        'S6 issuance task', 'protected', 'running'
+      )
     `
     await tx`
       update epic_172_s4_protocol_state
