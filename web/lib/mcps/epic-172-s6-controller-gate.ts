@@ -4,10 +4,7 @@ import {
   epic172S6SuiteManifest,
 } from './epic-172-s6-suite-contract'
 import {
-  verifyEpic172S6ReleaseEvidenceInput,
   assertEpic172S6ReleaseOrderOwnership,
-  EPIC_172_S6_RECORDABLE_EVIDENCE_KINDS,
-  type Epic172S6RecordableEvidenceKind,
 } from './epic-172-s6-release-adapter'
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/

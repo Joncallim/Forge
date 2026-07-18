@@ -107,7 +107,10 @@ function expectedPointer(pointer: Awaited<ReturnType<typeof seed>>['pointer']) {
   }
 }
 
-test('mcp-admission.real-approval-route: concurrent reapproval has one CAS winner and immutable history', async () => {
+test('mcp-admission.real-approval-route: concurrent reapproval has one CAS winner and immutable history', {
+  tag: '@mcp-postgres',
+  annotation: { type: 'scenarioId', description: 'mcp-admission.real-approval-route' },
+}, async () => {
   const fixture = await seed()
   const mutation = {
     capabilities: ['filesystem.project.read'],
@@ -233,7 +236,10 @@ test('mcp-admission.real-approval-route: concurrent reapproval has one CAS winne
   }
 })
 
-test('mcp-admission.grant-reconciliation: operator hold preserves a running task until lease and review barriers clear', async () => {
+test('mcp-admission.grant-reconciliation: operator hold preserves a running task until lease and review barriers clear', {
+  tag: '@mcp-postgres',
+  annotation: { type: 'scenarioId', description: 'mcp-admission.grant-reconciliation' },
+}, async () => {
   const fixture = await seed({ siblingStatus: 'running', taskStatus: 'running' })
   await mutateTaskFilesystemGrants({
     actorId: fixture.userId,

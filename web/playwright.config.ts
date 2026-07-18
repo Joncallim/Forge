@@ -1,15 +1,32 @@
 import { defineConfig, devices } from '@playwright/test'
+import { resolveDestructiveE2EEnvironment } from './e2e/destructive-environment'
 import { EPIC_172_STEP0_E2E_BRIDGE_ENV } from './e2e/epic-172-step0-bridge'
 
-const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
 const trustedHostBoundary = process.env.FORGE_TRUSTED_HOST_BOUNDARY === '1'
 const dedicatedMcpTags = /@mcp-postgres|@mcp-issuance|@mcp-operator|@mcp-host-boundary/
 const noMcpArtifacts = Object.freeze({ trace: 'off', screenshot: 'off', video: 'off' } as const)
 
 const inheritedEnvironment = { ...process.env }
 const epic172Step0E2EBridge = inheritedEnvironment[EPIC_172_STEP0_E2E_BRIDGE_ENV]
+delete process.env.DATABASE_URL
+delete process.env.REDIS_URL
 delete process.env[EPIC_172_STEP0_E2E_BRIDGE_ENV]
 delete inheritedEnvironment[EPIC_172_STEP0_E2E_BRIDGE_ENV]
+
+const hasE2EEnvironment = Boolean(
+  inheritedEnvironment.FORGE_E2E_ALLOW_DESTRUCTIVE_RESET
+  || inheritedEnvironment.FORGE_E2E_DATABASE_URL
+  || inheritedEnvironment.FORGE_E2E_REDIS_URL,
+)
+const e2eEnvironment = !trustedHostBoundary && hasE2EEnvironment
+  ? resolveDestructiveE2EEnvironment(inheritedEnvironment)
+  : null
+if (e2eEnvironment) {
+  process.env.DATABASE_URL = e2eEnvironment.databaseUrl
+  process.env.REDIS_URL = e2eEnvironment.redisUrl
+}
+
+const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? 'http://127.0.0.1:3000'
 
 export default defineConfig({
   testDir: './e2e',
@@ -42,8 +59,8 @@ export default defineConfig({
     reuseExistingServer: process.env.PLAYWRIGHT_REUSE_EXISTING_SERVER === '1',
     timeout: 120_000,
     env: {
-      DATABASE_URL: process.env.DATABASE_URL ?? '',
-      REDIS_URL: process.env.REDIS_URL ?? '',
+      DATABASE_URL: e2eEnvironment?.databaseUrl ?? '',
+      REDIS_URL: e2eEnvironment?.redisUrl ?? '',
       SESSION_SECRET: process.env.SESSION_SECRET ?? '',
       WEBAUTHN_RP_ID: process.env.WEBAUTHN_RP_ID ?? 'localhost',
       WEBAUTHN_RP_NAME: process.env.WEBAUTHN_RP_NAME ?? 'Forge',
@@ -52,9 +69,9 @@ export default defineConfig({
       FORGE_EMBED_WORKER: '0',
     },
   },
-  metadata: Object.freeze({
+  metadata: {
     [EPIC_172_STEP0_E2E_BRIDGE_ENV]: epic172Step0E2EBridge,
-  }),
+  },
   projects: [
     {
       name: 'chromium-desktop',

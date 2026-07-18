@@ -40,6 +40,9 @@ describe('Epic 172 S6 trusted CI wiring', () => {
       'npm run e2e:mcp-operator',
     ]) expect(workflow).toContain(command)
     expect(workflow).not.toContain('npm run test:mcp:host-boundary')
+    expect(workflow).not.toContain('actions/upload-artifact')
+    expect(workflow).not.toContain('web/playwright-report')
+    expect(workflow).not.toContain('web/test-results')
   })
 
   it('keeps every controller mutation behind the fixed external socket and documented exact commands', async () => {

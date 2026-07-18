@@ -7,7 +7,6 @@ import {
   verifyHostBoundaryAttestation,
 } from '../scripts/lib/mcp-host-boundary-attestation.mjs'
 import {
-  HOST_BOUNDARY_SCENARIO_IDS,
   createFixedHostBoundaryScenarioRequest,
   verifyHostBoundaryScenarioResult,
 } from '../scripts/lib/mcp-host-boundary-scenario.mjs'

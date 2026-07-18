@@ -193,6 +193,22 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
     id: 'mcp-host-boundary.spec.ts::epic-172.uid-credential-isolation',
     classification: 'signed-activation-required',
   },
+  {
+    id: 'mcp-issuance.spec.ts::mcp-admission.allow-once-single-winner',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'mcp-issuance.spec.ts::mcp-admission.always-allow-single-run-claim',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'mcp-issuance.spec.ts::mcp-admission.failure-recovery-atomicity',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'mcp-operator-recovery.spec.ts::mcp-admission.operator-recovery: presents authenticated filesystem recovery controls',
+    classification: 'run-disabled-safe',
+  },
 ] as const satisfies readonly Epic172Step0E2EEntry[]
 
 const inventoryById = new Map<string, Epic172Step0E2EEntry>(
