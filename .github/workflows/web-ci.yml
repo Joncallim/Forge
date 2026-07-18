@@ -172,8 +172,7 @@ jobs:
               'public.forge_epic_172_transition_authorizations',
               'public.forge_epic_172_release_evidence_consumptions',
               'public.forge_epic_172_enablement_state',
-              'public.forge_epic_172_enablement_transition_audits',
-              'public.forge_epic_172_s3_release_state'
+              'public.forge_epic_172_enablement_transition_audits'
             ]) LOOP
               FOREACH release_privilege IN ARRAY ARRAY[
                 'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
@@ -182,6 +181,24 @@ jobs:
                   RAISE EXCEPTION 'ordinary app unexpectedly has % on %', release_privilege, release_table;
                 END IF;
               END LOOP;
+            END LOOP;
+            IF NOT has_table_privilege(
+              current_user,
+              'public.forge_epic_172_s3_release_state',
+              'SELECT'
+            ) THEN
+              RAISE EXCEPTION 'ordinary app cannot read the S3 release projection';
+            END IF;
+            FOREACH release_privilege IN ARRAY ARRAY[
+              'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
+            ] LOOP
+              IF has_table_privilege(
+                current_user,
+                'public.forge_epic_172_s3_release_state',
+                release_privilege
+              ) THEN
+                RAISE EXCEPTION 'ordinary app unexpectedly has % on the S3 release projection', release_privilege;
+              END IF;
             END LOOP;
             IF EXISTS (
               SELECT 1
