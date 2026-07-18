@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
-import { and, eq } from 'drizzle-orm'
+import { and, eq, sql } from 'drizzle-orm'
 import { db } from '@/db'
 import { sessions } from '@/db/schema'
 
@@ -55,7 +55,7 @@ export async function rekeySessionCredentialDigest(input: {
     .update(sessions)
     .set({
       credentialId: input.credentialId as Sessions['credentialId'],
-      lastSeenAt: new Date(),
+      lastSeenAt: sql`pg_catalog.clock_timestamp()`,
     })
     .where(and(
       eq(sessions.userId, input.userId),
@@ -69,7 +69,7 @@ export async function invalidateSessionCredentialDigests(userId: string): Promis
   const result = await db
     .update(sessions)
     .set({
-      revokedAt: new Date(),
+      revokedAt: sql`pg_catalog.clock_timestamp()`,
     })
     .where(eq(sessions.userId, userId))
     .returning({ id: sessions.id })

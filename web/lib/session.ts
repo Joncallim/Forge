@@ -41,10 +41,10 @@ function sessionIp(ip: string | null | undefined): string | null {
   return isIP(ip) === 0 ? null : ip
 }
 
-function parseDatabaseTimestamp(value: Date | string): Date {
+function parseDatabaseTimestamp(value: Date | string, field: string): Date {
   const timestamp = value instanceof Date ? value : new Date(value)
   if (!Number.isFinite(timestamp.getTime())) {
-    throw new Error('PostgreSQL returned an invalid session timestamp')
+    throw new Error(`PostgreSQL returned an invalid ${field} session timestamp`)
   }
   return timestamp
 }
@@ -88,15 +88,16 @@ async function authorizeSession(digest: Buffer): Promise<AuthorizedSession | nul
     if (!row || row.revokedAt || !row.expiresAt) {
       return null
     }
-    const databaseNow = parseDatabaseTimestamp(row.databaseNow)
-    if (databaseNow >= row.expiresAt) return null
-    const liveExpiresAt = row.expiresAt
+    const databaseNow = parseDatabaseTimestamp(row.databaseNow, 'clock')
+    const lastSeenAt = parseDatabaseTimestamp(row.lastSeenAt, 'last-seen')
+    const liveExpiresAt = parseDatabaseTimestamp(row.expiresAt, 'expiry')
+    if (databaseNow >= liveExpiresAt) return null
 
-    if (databaseNow.getTime() - row.lastSeenAt.getTime() <= WRITE_BEHIND_INTERVAL_MS) {
+    if (databaseNow.getTime() - lastSeenAt.getTime() <= WRITE_BEHIND_INTERVAL_MS) {
       return {
         sessionId: row.sessionId,
         userId: row.userId,
-        lastSeenAt: row.lastSeenAt,
+        lastSeenAt,
         expiresAt: liveExpiresAt,
         refreshed: false,
       }
@@ -114,12 +115,14 @@ async function authorizeSession(digest: Buffer): Promise<AuthorizedSession | nul
         expiresAt: sessions.expiresAt,
       })
 
-    if (!refreshed.expiresAt) throw new Error('Session refresh did not return an expiry')
+    if (!refreshed?.lastSeenAt || !refreshed.expiresAt) {
+      throw new Error('Session refresh did not return authoritative timestamps')
+    }
     return {
       sessionId: row.sessionId,
       userId: row.userId,
-      lastSeenAt: refreshed.lastSeenAt,
-      expiresAt: refreshed.expiresAt,
+      lastSeenAt: parseDatabaseTimestamp(refreshed.lastSeenAt, 'refreshed last-seen'),
+      expiresAt: parseDatabaseTimestamp(refreshed.expiresAt, 'refreshed expiry'),
       refreshed: true,
     }
   })
