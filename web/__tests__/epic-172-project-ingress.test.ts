@@ -279,7 +279,6 @@ describe('Epic 172 project route ingress sentinel', () => {
     }
 
     expect([...guardedHandlers].sort()).toEqual([
-      '../app/api/mcps/grant-state/[taskId]/route.ts:PUT',
       '../app/api/projects/[id]/filesystem-grant/route.ts:PUT',
       '../app/api/projects/[id]/route.ts:DELETE',
       '../app/api/projects/[id]/route.ts:PUT',
