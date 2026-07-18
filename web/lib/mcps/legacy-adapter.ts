@@ -1,12 +1,14 @@
 import {
+  buildFilesystemGrantBlockMetadata,
   canonicalPositiveDecisionRevision,
-  parseFilesystemGrantBlockMetadata,
+  parseFilesystemGrantHoldState,
   type FilesystemGrantBlockMetadata,
 } from './filesystem-grant-lifecycle'
 import {
   canonicalFilesystemProjectCapabilities,
   projectFilesystemEffectivePhase,
   projectFilesystemGrantFromAuthority,
+  readFilesystemGrantBlockFromMetadata,
   requiresFilesystemGrantApproval,
   summarizeFilesystemCapabilities,
   type FilesystemProjectCapability,
@@ -27,6 +29,21 @@ export type LegacyPackageGrantState = {
   requestedCapabilities: FilesystemProjectRequestCapability[]
   requirementKeys: string[]
   blockMetadata: FilesystemGrantBlockMetadata | null
+  blockFingerprint: string | null
+  fingerprintVerified: boolean
+}
+
+/**
+ * Canonicalize a project root-binding revision (bigint/number/string) to the
+ * exact decimal string form the S3 block fingerprint is computed against.
+ */
+function canonicalRootBindingRevision(value: unknown): string | null {
+  if (typeof value === 'bigint' || typeof value === 'number') {
+    const text = value.toString()
+    return /^[1-9][0-9]*$/.test(text) ? text : null
+  }
+  if (typeof value === 'string') return /^[1-9][0-9]*$/.test(value) ? value : null
+  return null
 }
 
 export function isLegacyAdapterExpired(now: Date = new Date()): boolean {
@@ -44,13 +61,15 @@ export function assertLegacyAdapterNotExpired(now: Date = new Date()): void {
 }
 
 export function legacyFilesystemGrantBlock(input: {
+  workPackageId: string
   mcpRequirements?: unknown
   metadata: unknown
   projectMcpConfig: ProjectMcpConfig
   projectFilesystemDecision?: unknown
   projectRootBindingRevision?: unknown
+  now?: Date
 }): LegacyPackageGrantState {
-  assertLegacyAdapterNotExpired()
+  assertLegacyAdapterNotExpired(input.now)
   const summary = summarizeFilesystemCapabilities({
     mcpRequirements: input.mcpRequirements,
     metadata: input.metadata,
@@ -62,21 +81,43 @@ export function legacyFilesystemGrantBlock(input: {
     projectFilesystemDecision: input.projectFilesystemDecision,
     projectRootBindingRevision: input.projectRootBindingRevision,
   })
+
+  // Read the persisted block from its one canonical location and reconstruct the
+  // compatibility record so the fingerprint is derived from — and verified
+  // against — the canonical fields rather than trusted verbatim from storage.
+  const storedBlock = readFilesystemGrantBlockFromMetadata(input.metadata)
   let blockMetadata: FilesystemGrantBlockMetadata | null = null
-  if (requires.blocked && requires.holdState) {
-    const marker = input.metadata as Record<string, unknown> | null
-    if (marker && typeof marker === 'object' && !Array.isArray(marker)) {
-      const parsed = parseFilesystemGrantBlockMetadata(marker)
-      if (parsed && parsed.kind === 'filesystem_grant') blockMetadata = parsed
+  let blockFingerprint: string | null = null
+  let fingerprintVerified = false
+  if (storedBlock) {
+    const hold = parseFilesystemGrantHoldState(storedBlock)
+    const rootBindingRevision = canonicalRootBindingRevision(input.projectRootBindingRevision)
+    if (hold && rootBindingRevision !== null) {
+      const reconstructed = buildFilesystemGrantBlockMetadata({
+        blockedAt: new Date(storedBlock.blockedAt),
+        hold,
+        requirementKeys: storedBlock.requirementKeys,
+        requestedCapabilities: storedBlock.requestedCapabilities,
+        rootBindingRevision,
+      })
+      blockFingerprint = reconstructed.blockFingerprint
+      fingerprintVerified = reconstructed.blockFingerprint === storedBlock.blockFingerprint
+      blockMetadata = fingerprintVerified ? reconstructed : storedBlock
+    } else {
+      blockMetadata = storedBlock
+      blockFingerprint = storedBlock.blockFingerprint
     }
   }
+
   return {
-    workPackageId: '',
+    workPackageId: input.workPackageId,
     isBlocked: requires.blocked,
     missingCapabilities: requires.missingCapabilities,
     requestedCapabilities: summary.requestedCapabilities,
     requirementKeys: requires.requirementKeys,
     blockMetadata,
+    blockFingerprint,
+    fingerprintVerified,
   }
 }
 
