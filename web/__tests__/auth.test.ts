@@ -302,6 +302,28 @@ describe('getSession', () => {
     expect(mockRedisSet).toHaveBeenCalledWith(expect.stringMatching(/^session:v2:/), expect.any(String), 'PXAT', expect.any(Number))
   })
 
+  it('authorizes when a raw PostgreSQL clock timestamp is returned as text', async () => {
+    const now = new Date()
+    mockRedisSet.mockResolvedValue('OK')
+    mockDbSelect.mockReturnValue(chain([{
+      sessionId: '00000000-0000-4000-8000-000000000010',
+      userId: 'user-abc',
+      lastSeenAt: now,
+      expiresAt: new Date(now.getTime() + 60_000),
+      revokedAt: null,
+      databaseNow: now.toISOString(),
+    }]))
+
+    const req = fakeRequest('00000000-0000-4000-8000-000000000000')
+    const result = await getSession(req)
+
+    expect(result).toEqual({
+      sessionId: '00000000-0000-4000-8000-000000000010',
+      userId: 'user-abc',
+    })
+    expect(mockRedisSet).toHaveBeenCalledOnce()
+  })
+
   it('denies and removes stale cache state for a revoked database row', async () => {
     mockRedisDel.mockResolvedValue(1)
     const now = new Date()
