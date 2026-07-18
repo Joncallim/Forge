@@ -1,47 +1,20 @@
 import 'server-only'
-import { NextResponse } from 'next/server'
-import type { NextRequest } from 'next/server'
-import { eq } from 'drizzle-orm'
-import { db } from '@/db'
-import { workPackageLocalRunEvidence } from '@/db/schema'
-import { getSession } from '@/lib/session'
-import { getAccessibleTask } from '@/lib/task-access'
-import { computeFreshnessFingerprint } from '@/lib/mcps/s5-server-reader'
+import { NextResponse, type NextRequest } from 'next/server'
+import { readAuthorizedS5State, S5RouteAuthorizationError } from '@/lib/mcps/s5-route'
 
-export async function GET(
-  request: NextRequest,
-  { params }: { params: Promise<{ taskId: string }> },
-) {
+export async function GET(request: NextRequest, { params }: { params: Promise<{ taskId: string }> }) {
   try {
-    const session = await getSession(request)
-    if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     const { taskId } = await params
-    const task = await getAccessibleTask(taskId, session.userId)
-    if (!task || task.submittedBy !== session.userId) {
-      return NextResponse.json({ error: 'Task not found' }, { status: 404 })
-    }
-
-    const evidence = await db
-      .select({
-        state: workPackageLocalRunEvidence.state,
-        leaseExpiresAt: workPackageLocalRunEvidence.leaseExpiresAt,
-        terminalAt: workPackageLocalRunEvidence.terminalAt,
-      })
-      .from(workPackageLocalRunEvidence)
-      .where(eq(workPackageLocalRunEvidence.taskId, taskId))
-
+    const { state } = await readAuthorizedS5State(request, taskId)
     return NextResponse.json({
-      computedAt: new Date().toISOString(),
-      freshnessFingerprint: computeFreshnessFingerprint({ taskId, evidenceCount: evidence.length }),
+      computedAt: state.computedAt,
+      freshnessFingerprint: state.freshnessFingerprint,
       taskId,
-      evidenceRecords: evidence.map((e) => ({
-        state: e.state,
-        leaseExpiresAt: e.leaseExpiresAt?.toISOString() ?? null,
-        terminalAt: e.terminalAt?.toISOString() ?? null,
-      })),
+      evidenceRecords: state.evidenceRecords,
     })
-  } catch (err) {
-    console.error('[mcps/local-evidence GET] Unexpected error', err)
+  } catch (error) {
+    if (error instanceof S5RouteAuthorizationError) return NextResponse.json({ error: error.message }, { status: error.status })
+    console.error('[mcps/local-evidence GET] Unexpected error', error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
