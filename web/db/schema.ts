@@ -80,7 +80,7 @@ export type NewCredential = InferInsertModel<typeof credentials>
 export const sessions = pgTable(
   'sessions',
   {
-    id: uuid('id').primaryKey().defaultRandom(), // same UUID in Redis + cookie
+    id: uuid('id').primaryKey().defaultRandom(),
     userId: uuid('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
@@ -92,11 +92,13 @@ export const sessions = pgTable(
     revokedAt: timestamp('revoked_at', tsOpts),
     userAgent: text('user_agent'),
     ipAddress: inet('ip_address'),
-    credentialDigest: bytea('credential_digest'),
+    credentialDigestV1: bytea('credential_digest_v1').notNull(),
+    expiresAt: timestamp('expires_at', tsOpts).notNull(),
   },
   (t) => [
     index('sessions_user_id_idx').on(t.userId),
     index('sessions_revoked_at_idx').on(t.revokedAt),
+    uniqueIndex('sessions_credential_digest_v1_idx').on(t.credentialDigestV1),
   ],
 )
 

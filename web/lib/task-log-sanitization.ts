@@ -149,7 +149,10 @@ export function sanitizeLogRecordForOutput<T extends TaskLog>(log: T): T {
     eventType: sanitizeString(log.eventType, 500),
     frontMatter: sanitizeLogFrontMatter(isRecord(log.frontMatter) ? log.frontMatter : {}) as Record<string, string>,
     level: sanitizeString(log.level, 50),
-    message: sanitizePromptPayload({ message: sanitizeString(log.message, 60 * 1024) }).message as string,
+    message: String(
+      sanitizePromptPayload({ message: sanitizeString(log.message, 60 * 1024) }).message
+        ?? '[content drained]',
+    ),
     metadata: sanitizeLogStructuredValue(log.metadata, { stringByteLimit: DEFAULT_STRING_BYTE_LIMIT }) as Record<string, unknown>,
     source: sanitizeString(log.source, 100),
     title: sanitizeString(log.title, 500),

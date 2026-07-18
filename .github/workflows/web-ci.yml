@@ -46,6 +46,12 @@ jobs:
       WEBAUTHN_RP_NAME: Forge
       WEBAUTHN_ORIGIN: http://localhost:3000
       NEXT_PUBLIC_APP_URL: http://localhost:3000
+      FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL: postgresql://forge_architect_plan_writer:forge_plan_writer_test@localhost:5432/forge_epic_172_ci_test
+      FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL: postgresql://forge_architect_plan_resolver:forge_plan_resolver_test@localhost:5432/forge_epic_172_ci_test
+      FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL: postgresql://forge_architect_plan_history_reader:forge_plan_history_reader_test@localhost:5432/forge_epic_172_ci_test
+      FORGE_PACKET_ISSUER_DATABASE_URL: postgresql://forge_packet_issuer:forge_packet_issuer_test@localhost:5432/forge_epic_172_ci_test
+      FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID: ci-v1
     steps:
       - uses: actions/checkout@v7.0.0
 

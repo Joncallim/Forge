@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mockGetSession = vi.fn()
+const mockReadSessionCredential = vi.fn()
+const mockReadArchitectPlanHistory = vi.fn()
 const mockGetAccessibleTask = vi.fn()
 const mockSelect = vi.fn()
 const mockUpdate = vi.fn()
@@ -18,7 +20,13 @@ function chain(value: unknown) {
   return result
 }
 
-vi.mock('@/lib/session', () => ({ getSession: mockGetSession }))
+vi.mock('@/lib/session', () => ({
+  getSession: mockGetSession,
+  readSessionCredential: mockReadSessionCredential,
+}))
+vi.mock('@/lib/mcps/history-reader', () => ({
+  readArchitectPlanHistory: mockReadArchitectPlanHistory,
+}))
 vi.mock('@/lib/task-access', () => ({
   getAccessibleTask: mockGetAccessibleTask,
   accessibleTaskCondition: vi.fn(() => ({ condition: true })),
@@ -217,5 +225,37 @@ ${JSON.stringify({
     expect(response.status).toBe(400)
     expect(mockSelect).not.toHaveBeenCalled()
     expect(mockUpdate).not.toHaveBeenCalled()
+  })
+})
+
+describe('GET /api/tasks/:id/mcp-plan-review', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockGetSession.mockResolvedValue({ userId: 'user-1' })
+    mockReadSessionCredential.mockReturnValue('00000000-0000-4000-8000-000000000000')
+    mockGetAccessibleTask.mockResolvedValue({ id: 'task-1' })
+    mockReadArchitectPlanHistory.mockResolvedValue([{ entryId: 'plan_body:000000', content: 'protected plan' }])
+  })
+
+  it('returns only the audited fixed-principal history result', async () => {
+    const { GET } = await import('@/app/api/tasks/[id]/mcp-plan-review/route')
+    const response = await GET(new Request('http://localhost/api/tasks/task-1/mcp-plan-review?planVersion=2') as never, {
+      params: Promise.resolve({ id: 'task-1' }),
+    })
+    expect(response.status).toBe(200)
+    expect(mockReadArchitectPlanHistory).toHaveBeenCalledWith({
+      planVersion: '2',
+      sessionCredential: '00000000-0000-4000-8000-000000000000',
+      taskId: 'task-1',
+    })
+  })
+
+  it('fails closed when the dedicated history reader rejects the request', async () => {
+    mockReadArchitectPlanHistory.mockRejectedValue(new Error('reader unavailable'))
+    const { GET } = await import('@/app/api/tasks/[id]/mcp-plan-review/route')
+    const response = await GET(new Request('http://localhost/api/tasks/task-1/mcp-plan-review') as never, {
+      params: Promise.resolve({ id: 'task-1' }),
+    })
+    expect(response.status).toBe(500)
   })
 })

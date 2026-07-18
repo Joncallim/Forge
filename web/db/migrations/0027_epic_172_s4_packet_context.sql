@@ -29,6 +29,9 @@ BEGIN
   ) OR NOT EXISTS (
     SELECT 1 FROM pg_catalog.pg_roles
     WHERE rolname = 'forge_packet_issuer' AND rolcanlogin AND NOT rolinherit AND NOT rolsuper
+  ) OR NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles
+    WHERE rolname = 'forge_architect_plan_history_reader' AND rolcanlogin AND NOT rolinherit AND NOT rolsuper
   ) THEN
     RAISE EXCEPTION 'dedicated S4 logins must be bootstrapped before migration'
       USING ERRCODE = '42501';
@@ -36,9 +39,81 @@ BEGIN
 END;
 $$;
 --> statement-breakpoint
--- S4 credential digest: stored per-session for rekey detection.
+-- S4 session credential authority. These columns remain nullable until the
+-- legacy raw-id session writer and its Redis keys have been drained.
 ALTER TABLE public.sessions
-  ADD COLUMN IF NOT EXISTS credential_digest bytea;
+  ADD COLUMN IF NOT EXISTS credential_digest_v1 bytea,
+  ADD COLUMN IF NOT EXISTS expires_at timestamptz;
+--> statement-breakpoint
+-- Resume-safe legacy conversion: the old row ID was the exact lowercase UUIDv4
+-- cookie. Derive its v1 digest and database expiry without consulting Redis.
+-- The digest write deliberately precedes the primary-key rekey. If a non-
+-- transactional migration runner stops between the two statements, the second
+-- statement can still recognize the old raw-cookie row by its exact digest.
+UPDATE public.sessions
+SET credential_digest_v1 = COALESCE(
+      credential_digest_v1,
+      pg_catalog.sha256(
+        pg_catalog.convert_to('forge:web-session:v1', 'UTF8')
+        || pg_catalog.decode('00', 'hex')
+        || pg_catalog.convert_to(id::text, 'UTF8')
+      )
+    ),
+    expires_at = COALESCE(expires_at, last_seen_at + interval '7 days')
+WHERE credential_digest_v1 IS NULL OR expires_at IS NULL;
+--> statement-breakpoint
+-- Replace every legacy raw-cookie primary key with an independent database UUID.
+-- Rows already created by the v1 writer have independent IDs and therefore do
+-- not match this predicate. Re-running this statement is a no-op after success.
+-- No repository migration defines an inbound foreign key to sessions(id); fail
+-- closed if a deployment added one instead of silently orphaning its rows.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_constraint constraint_row
+    WHERE constraint_row.contype = 'f'
+      AND constraint_row.confrelid = 'public.sessions'::pg_catalog.regclass
+  ) THEN
+    RAISE EXCEPTION 'sessions(id) has an unsupported inbound foreign key; rekey dependents explicitly'
+      USING ERRCODE = '55000';
+  END IF;
+END;
+$$;
+UPDATE public.sessions
+SET id = pg_catalog.gen_random_uuid()
+WHERE credential_digest_v1 = pg_catalog.sha256(
+  pg_catalog.convert_to('forge:web-session:v1', 'UTF8')
+  || pg_catalog.decode('00', 'hex')
+  || pg_catalog.convert_to(id::text, 'UTF8')
+);
+--> statement-breakpoint
+-- Zero-scan proof: no session row may retain the raw cookie as its internal ID.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM public.sessions session_row
+    WHERE session_row.credential_digest_v1 = pg_catalog.sha256(
+      pg_catalog.convert_to('forge:web-session:v1', 'UTF8')
+      || pg_catalog.decode('00', 'hex')
+      || pg_catalog.convert_to(session_row.id::text, 'UTF8')
+    )
+  ) THEN
+    RAISE EXCEPTION 'legacy raw-cookie session primary key remains after rekey'
+      USING ERRCODE = '55000';
+  END IF;
+END;
+$$;
+--> statement-breakpoint
+ALTER TABLE public.sessions
+  ADD CONSTRAINT sessions_credential_digest_v1_length_chk
+  CHECK (pg_catalog.octet_length(credential_digest_v1) = 32),
+  ALTER COLUMN credential_digest_v1 SET NOT NULL,
+  ALTER COLUMN expires_at SET NOT NULL;
+--> statement-breakpoint
+CREATE UNIQUE INDEX sessions_credential_digest_v1_idx
+  ON public.sessions (credential_digest_v1);
 --> statement-breakpoint
 CREATE SCHEMA IF NOT EXISTS forge;
 --> statement-breakpoint
@@ -180,6 +255,133 @@ CREATE TRIGGER architect_plan_entries_append_only
 CREATE TRIGGER architect_plan_history_reads_append_only
   BEFORE UPDATE OR DELETE ON public.architect_plan_history_reads
   FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.guard_architect_plan_public_artifact_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+BEGIN
+  IF TG_OP = 'INSERT' AND EXISTS (
+    SELECT 1 FROM public.agent_runs run
+    WHERE run.id = NEW.agent_run_id AND run.agent_type = 'architect'
+  ) THEN
+    IF session_user <> 'forge_architect_plan_writer'
+       OR current_user <> 'forge_s4_routines_owner'
+       OR NEW.artifact_type <> 'adr_text'
+       OR NEW.content <> 'Architect plan available in protected history' THEN
+      RAISE EXCEPTION 'Architect artifacts require the protected plan writer'
+        USING ERRCODE = '42501';
+    END IF;
+  ELSIF TG_OP = 'UPDATE' AND EXISTS (
+    SELECT 1 FROM public.architect_plan_versions version
+    WHERE version.plan_artifact_id = OLD.id
+  ) AND (
+    NEW.agent_run_id IS DISTINCT FROM OLD.agent_run_id
+    OR NEW.artifact_type IS DISTINCT FROM OLD.artifact_type
+    OR NEW.content IS DISTINCT FROM 'Architect plan available in protected history'
+  ) THEN
+    RAISE EXCEPTION 'Protected Architect artifact identity and public header are immutable'
+      USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER artifacts_architect_plan_public_guard
+  BEFORE INSERT OR UPDATE ON public.artifacts
+  FOR EACH ROW EXECUTE FUNCTION forge.guard_architect_plan_public_artifact_v1();
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.read_architect_plan_history_v1(
+  p_session_credential bytea,
+  p_task_id uuid,
+  p_plan_version bigint
+)
+RETURNS TABLE (
+  entry_id text,
+  entry_kind text,
+  agent text,
+  requirement_key text,
+  binding_fingerprint text,
+  content text,
+  content_digest text,
+  digest_key_id text,
+  projection_eligible boolean
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_credential_text text;
+  v_credential_digest bytea;
+  v_session public.sessions%ROWTYPE;
+  v_version public.architect_plan_versions%ROWTYPE;
+  v_request_id uuid := pg_catalog.gen_random_uuid();
+BEGIN
+  IF session_user <> 'forge_architect_plan_history_reader' THEN
+    RAISE EXCEPTION 'Architect plan history requires the dedicated reader login'
+      USING ERRCODE = '42501';
+  END IF;
+  IF pg_catalog.octet_length(p_session_credential) <> 36 THEN
+    RAISE EXCEPTION 'Session credential is malformed' USING ERRCODE = '22023';
+  END IF;
+  v_credential_text := pg_catalog.convert_from(p_session_credential, 'UTF8');
+  IF v_credential_text !~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+     OR pg_catalog.convert_to(v_credential_text, 'UTF8') <> p_session_credential THEN
+    RAISE EXCEPTION 'Session credential is malformed' USING ERRCODE = '22023';
+  END IF;
+
+  v_credential_digest := pg_catalog.sha256(
+    pg_catalog.decode('666f7267653a7765622d73657373696f6e3a763100', 'hex') || p_session_credential
+  );
+  SELECT session_row.* INTO STRICT v_session
+  FROM public.sessions session_row
+  WHERE session_row.credential_digest_v1 = v_credential_digest
+  FOR UPDATE;
+  IF v_session.revoked_at IS NOT NULL
+     OR v_session.expires_at IS NULL
+     OR pg_catalog.clock_timestamp() >= v_session.expires_at THEN
+    RAISE EXCEPTION 'Session credential is revoked or expired' USING ERRCODE = '28000';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM public.tasks task
+    WHERE task.id = p_task_id AND task.submitted_by = v_session.user_id
+    FOR KEY SHARE
+  ) THEN
+    RAISE EXCEPTION 'Task history is not accessible to this session' USING ERRCODE = '42501';
+  END IF;
+  IF pg_catalog.clock_timestamp() > v_session.last_seen_at + interval '60 seconds' THEN
+    UPDATE public.sessions
+    SET last_seen_at = pg_catalog.clock_timestamp(),
+        expires_at = pg_catalog.clock_timestamp() + interval '7 days'
+    WHERE id = v_session.id;
+  END IF;
+
+  SELECT version_row.* INTO STRICT v_version
+  FROM public.architect_plan_versions version_row
+  WHERE version_row.task_id = p_task_id
+    AND version_row.plan_version = p_plan_version;
+
+  INSERT INTO public.architect_plan_history_reads (
+    request_id, user_id, task_id, plan_version, returned_entry_count, entry_set_digest
+  ) VALUES (
+    v_request_id, v_session.user_id, p_task_id, p_plan_version,
+    v_version.entry_count, v_version.entry_set_digest
+  );
+
+  RETURN QUERY
+  SELECT plan_entry.entry_id, plan_entry.entry_kind, plan_entry.agent,
+    plan_entry.requirement_key, plan_entry.binding_fingerprint,
+    plan_entry.content, plan_entry.content_digest, plan_entry.digest_key_id,
+    plan_entry.projection_eligible
+  FROM public.architect_plan_entries plan_entry
+  WHERE plan_entry.task_id = p_task_id
+    AND plan_entry.plan_version = p_plan_version
+  ORDER BY plan_entry.entry_id
+  LIMIT 256;
+END;
+$$;
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION forge.resolve_architect_plan_entry_v1(p_reference_id uuid)
 RETURNS TABLE (
@@ -452,7 +654,8 @@ AS $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
     IF NEW.protocol_version = 2
-       AND pg_catalog.current_setting('forge.s4_packet_writer', true) IS DISTINCT FROM 'on' THEN
+       AND (session_user <> 'forge_packet_issuer'
+            OR current_user <> 'forge_s4_routines_owner') THEN
       RAISE EXCEPTION 'protocol-v2 packet evidence requires the fixed-path writer'
         USING ERRCODE = '42501';
     END IF;
@@ -486,6 +689,74 @@ $$;
 CREATE TRIGGER filesystem_mcp_runtime_audits_protocol_v2_guard
 BEFORE INSERT OR UPDATE ON public.filesystem_mcp_runtime_audits
 FOR EACH ROW EXECUTE FUNCTION forge.guard_packet_authorization_v2();
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.create_local_run_evidence_v1(
+  p_agent_run_id uuid,
+  p_claim_token uuid,
+  p_lease_seconds integer
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_task_id uuid;
+  v_package_id uuid;
+  v_project_id uuid;
+  v_evidence_id uuid := pg_catalog.gen_random_uuid();
+BEGIN
+  IF session_user <> 'forge_packet_issuer' THEN
+    RAISE EXCEPTION 'local run evidence requires the dedicated issuer login'
+      USING ERRCODE = '42501';
+  END IF;
+  IF p_lease_seconds NOT BETWEEN 1 AND 45 THEN
+    RAISE EXCEPTION 'local evidence lease must be between 1 and 45 seconds'
+      USING ERRCODE = '22023';
+  END IF;
+  IF NOT (SELECT state.producers_enabled AND state.protocol_epoch = 2
+          FROM public.epic_172_s4_protocol_state state WHERE state.singleton) THEN
+    RAISE EXCEPTION 'S4 packet producers are disabled' USING ERRCODE = '55000';
+  END IF;
+
+  SELECT run.task_id, run.work_package_id, task.project_id
+  INTO STRICT v_task_id, v_package_id, v_project_id
+  FROM public.agent_runs run
+  JOIN public.work_packages package ON package.id = run.work_package_id
+  JOIN public.tasks task ON task.id = package.task_id AND task.id = run.task_id
+  WHERE run.id = p_agent_run_id;
+
+  PERFORM 1 FROM public.projects project WHERE project.id = v_project_id FOR UPDATE;
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id = v_task_id AND task.project_id = v_project_id AND task.status = 'running'
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'packet task is not running' USING ERRCODE = '40001';
+  END IF;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id = v_task_id ORDER BY package.id FOR UPDATE;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.id = v_package_id AND package.task_id = v_task_id AND package.status = 'running';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'packet work package is not running' USING ERRCODE = '40001';
+  END IF;
+  PERFORM 1 FROM public.agent_runs run
+  WHERE run.id = p_agent_run_id AND run.task_id = v_task_id
+    AND run.work_package_id = v_package_id AND run.status = 'running'
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'packet agent run is not running' USING ERRCODE = '40001';
+  END IF;
+
+  INSERT INTO public.work_package_local_run_evidence (
+    id, task_id, work_package_id, agent_run_id, claim_token, lease_expires_at
+  ) VALUES (
+    v_evidence_id, v_task_id, v_package_id, p_agent_run_id, p_claim_token,
+    pg_catalog.clock_timestamp() + pg_catalog.make_interval(secs => p_lease_seconds)
+  );
+  RETURN v_evidence_id;
+END;
+$$;
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION forge.insert_packet_authorization_snapshot_v2(
   p_agent_run_id uuid,
@@ -542,8 +813,16 @@ BEGIN
     RAISE EXCEPTION 'agent run does not belong to its package task' USING ERRCODE = '40001';
   END IF;
   SELECT project.* INTO STRICT v_project FROM public.projects project WHERE project.id = v_task.project_id FOR UPDATE;
-  PERFORM 1 FROM public.tasks task WHERE task.id = v_task.id FOR UPDATE;
+  SELECT task.* INTO STRICT v_task FROM public.tasks task
+  WHERE task.id = v_task.id AND task.project_id = v_project.id AND task.status = 'running'
+  FOR UPDATE;
   PERFORM 1 FROM public.work_packages package WHERE package.task_id = v_task.id ORDER BY package.id FOR UPDATE;
+  SELECT package.* INTO STRICT v_package FROM public.work_packages package
+  WHERE package.id = v_package.id AND package.task_id = v_task.id AND package.status = 'running';
+  SELECT run.* INTO STRICT v_run FROM public.agent_runs run
+  WHERE run.id = p_agent_run_id AND run.task_id = v_task.id
+    AND run.work_package_id = v_package.id AND run.status = 'running'
+  FOR UPDATE;
 
   SELECT decision.* INTO v_decision
   FROM public.filesystem_mcp_grant_approvals decision
@@ -655,7 +934,6 @@ BEGIN
     'coverageFingerprint', v_coverage_fingerprint
   );
 
-  PERFORM pg_catalog.set_config('forge.s4_packet_writer', 'on', true);
   INSERT INTO public.filesystem_mcp_runtime_audits (
     id, task_id, work_package_id, agent_run_id, local_run_evidence_id,
     grant_approval_id, project_decision_id, operation, status, capabilities,
@@ -834,6 +1112,7 @@ GRANT SELECT ON public.tasks, public.projects, public.work_packages,
   public.project_filesystem_grant_decisions,
   public.project_filesystem_current_decision_pointers,
   public.filesystem_mcp_runtime_audits TO forge_s4_routines_owner;
+GRANT SELECT, UPDATE ON public.sessions TO forge_s4_routines_owner;
 GRANT UPDATE ON public.tasks, public.projects, public.work_packages,
   public.agent_runs, public.filesystem_mcp_grant_approvals,
   public.filesystem_mcp_current_decision_pointers,
@@ -847,14 +1126,19 @@ REVOKE ALL ON public.architect_plan_versions, public.architect_plan_entries,
   public.epic_172_s4_protocol_state, public.work_package_local_run_evidence,
   public.filesystem_mcp_decision_nonce_claims FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.reject_s4_retained_mutation_v1() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.guard_architect_plan_public_artifact_v1() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.resolve_architect_plan_entry_v1(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.create_local_run_evidence_v1(uuid,uuid,integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,integer,text[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.validate_packet_authorization_snapshot_v2(jsonb,text,text,uuid,bigint,uuid,bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.guard_packet_authorization_v2() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) TO forge_architect_plan_writer;
+GRANT EXECUTE ON FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) TO forge_architect_plan_history_reader;
 GRANT EXECUTE ON FUNCTION forge.resolve_architect_plan_entry_v1(uuid) TO forge_architect_plan_resolver;
+GRANT EXECUTE ON FUNCTION forge.create_local_run_evidence_v1(uuid,uuid,integer) TO forge_packet_issuer;
 GRANT EXECUTE ON FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,integer,text[]) TO forge_packet_issuer;
 GRANT EXECUTE ON FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) TO forge_packet_issuer;
 --> statement-breakpoint
@@ -866,7 +1150,10 @@ ALTER TABLE public.epic_172_s4_protocol_state OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.work_package_local_run_evidence OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.filesystem_mcp_decision_nonce_claims OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.reject_s4_retained_mutation_v1() OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.guard_architect_plan_public_artifact_v1() OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.resolve_architect_plan_entry_v1(uuid) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.create_local_run_evidence_v1(uuid,uuid,integer) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.validate_packet_authorization_snapshot_v2(jsonb,text,text,uuid,bigint,uuid,bigint) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,integer,text[]) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.guard_packet_authorization_v2() OWNER TO forge_s4_routines_owner;
