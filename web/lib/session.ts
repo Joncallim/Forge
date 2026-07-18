@@ -1,21 +1,17 @@
 import { db } from '@/db'
-import { sessions, users } from '@/db/schema'
-import { eq } from 'drizzle-orm'
+import { sessions } from '@/db/schema'
+import { eq, sql } from 'drizzle-orm'
 import { redis } from '@/lib/redis'
 import { isIP } from 'node:net'
-import { verifyCredentialDigest, computeCredentialDigest } from '@/lib/session-credential-digest'
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+import {
+  computeCredentialDigest,
+  isCanonicalSessionCredential,
+} from '@/lib/session-credential-digest'
 
 export type SessionData = {
   userId: string
-  credentialId: string | null
-  credentialDigest: string | null
-  userAgent: string | null
-  ip: string | null
-  lastSeenAt: number // unix ms, stored in Redis for write-behind logic
+  expiresAt: number
+  lastSeenAt: number
 }
 
 export type CookieOptions = {
@@ -24,7 +20,7 @@ export type CookieOptions = {
   secure: boolean
   sameSite: 'strict'
   maxAge: number
-  path: string
+  path: '/'
 }
 
 type SessionMeta = {
@@ -32,19 +28,12 @@ type SessionMeta = {
   ip?: string | null
 }
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
+const SESSION_TTL_MS = SESSION_TTL_SECONDS * 1000
+const WRITE_BEHIND_INTERVAL_MS = 60 * 1000
 
-const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7 // 7 days
-const WRITE_BEHIND_INTERVAL_MS = 60 * 1000 // 60 seconds
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function redisKey(sessionId: string): string {
-  return `session:${sessionId}`
+function redisKey(digest: Buffer): string {
+  return `session:v2:${digest.toString('hex')}`
 }
 
 function sessionIp(ip: string | null | undefined): string | null {
@@ -52,148 +41,160 @@ function sessionIp(ip: string | null | undefined): string | null {
   return isIP(ip) === 0 ? null : ip
 }
 
-// ---------------------------------------------------------------------------
-// getSession
-// ---------------------------------------------------------------------------
+export function readSessionCredential(request: Request): string | null {
+  const cookieHeader = request.headers.get('cookie') ?? ''
+  for (const cookie of cookieHeader.split(';')) {
+    const segment = cookie.trimStart()
+    const separator = segment.indexOf('=')
+    if (separator === -1 || segment.slice(0, separator).trim() !== 'forge_session') continue
+    const credential = segment.slice(separator + 1)
+    return isCanonicalSessionCredential(credential) ? credential : null
+  }
+  return null
+}
+
+type AuthorizedSession = {
+  sessionId: string
+  userId: string
+  lastSeenAt: Date
+  expiresAt: Date
+  refreshed: boolean
+}
+
+async function authorizeSession(digest: Buffer): Promise<AuthorizedSession | null> {
+  return db.transaction(async (tx) => {
+    const [row] = await tx
+      .select({
+        sessionId: sessions.id,
+        userId: sessions.userId,
+        lastSeenAt: sessions.lastSeenAt,
+        expiresAt: sessions.expiresAt,
+        revokedAt: sessions.revokedAt,
+        databaseNow: sql<Date>`pg_catalog.clock_timestamp()`,
+      })
+      .from(sessions)
+      .where(eq(sessions.credentialDigestV1, digest))
+      .limit(1)
+      .for('update')
+
+    if (!row || row.revokedAt || !row.expiresAt || row.databaseNow >= row.expiresAt) {
+      return null
+    }
+    const liveExpiresAt = row.expiresAt
+
+    if (row.databaseNow.getTime() - row.lastSeenAt.getTime() <= WRITE_BEHIND_INTERVAL_MS) {
+      return { ...row, expiresAt: liveExpiresAt, refreshed: false }
+    }
+
+    const [refreshed] = await tx
+      .update(sessions)
+      .set({
+        lastSeenAt: sql`pg_catalog.clock_timestamp()`,
+        expiresAt: sql`pg_catalog.clock_timestamp() + interval '7 days'`,
+      })
+      .where(eq(sessions.id, row.sessionId))
+      .returning({
+        lastSeenAt: sessions.lastSeenAt,
+        expiresAt: sessions.expiresAt,
+      })
+
+    if (!refreshed.expiresAt) throw new Error('Session refresh did not return an expiry')
+    return { ...row, ...refreshed, expiresAt: refreshed.expiresAt, refreshed: true }
+  })
+}
+
+async function cacheAuthorizedSession(digest: Buffer, session: AuthorizedSession): Promise<void> {
+  const cache: SessionData = {
+    userId: session.userId,
+    expiresAt: session.expiresAt.getTime(),
+    lastSeenAt: session.lastSeenAt.getTime(),
+  }
+  await redis.set(
+    redisKey(digest),
+    JSON.stringify(cache),
+    'PXAT',
+    session.expiresAt.getTime(),
+  )
+}
 
 export async function getSession(
   request: Request,
 ): Promise<{ sessionId: string; userId: string } | null> {
-  // Parse forge_session cookie from request headers
-  const cookieHeader = request.headers.get('cookie') ?? ''
-  const cookies = Object.fromEntries(
-    cookieHeader
-      .split(';')
-      .map((c) => c.trim())
-      .filter(Boolean)
-      .map((c) => {
-        const idx = c.indexOf('=')
-        if (idx === -1) return [c, '']
-        return [c.slice(0, idx).trim(), c.slice(idx + 1).trim()]
-      }),
-  )
+  const credential = readSessionCredential(request)
+  if (!credential) return null
+  const digest = computeCredentialDigest(credential).digest
 
-  const sessionId = cookies['forge_session']
-  if (!sessionId) return null
-
-  const raw = await redis.get(redisKey(sessionId))
-  if (!raw) return null
-
-  let data: SessionData
+  let authorized: AuthorizedSession | null
   try {
-    data = JSON.parse(raw) as SessionData
-  } catch {
+    authorized = await authorizeSession(digest)
+  } catch (error) {
+    console.error('Database-authoritative session check failed:', error)
     return null
   }
 
-  // The Postgres users row may have been deleted (DB reset, fresh install with
-  // a surviving Redis volume, etc.) while the Redis session entry outlives it.
-  // Re-validate on every call so a dead userId never reaches callers.
-  const [user] = await db
-    .select({ id: users.id })
-    .from(users)
-    .where(eq(users.id, data.userId))
-    .limit(1)
-
-  if (!user) {
-    await redis.del(redisKey(sessionId)).catch(() => {})
+  if (!authorized) {
+    await redis.del(redisKey(digest)).catch(() => {})
     return null
   }
 
-  // Verify credential digest if one was stored at session creation.
-  // A mismatch means the credential was rotated/removed; destroy the session.
-  if (data.credentialDigest && data.credentialId) {
-    const ok = verifyCredentialDigest(
-      { credentialDigest: Buffer.from(data.credentialDigest, 'hex') },
-      { credentialId: data.credentialId, sessionId, userId: data.userId },
-    )
-    if (!ok) {
-      await destroySession(sessionId)
-      return null
-    }
-  }
-
-  // Write-behind: update lastSeenAt in DB if the stored timestamp is >60s old
-  const now = Date.now()
-  if (now - (data.lastSeenAt ?? 0) > WRITE_BEHIND_INTERVAL_MS) {
-    // Update Redis timestamp first (fire-and-forget the DB write)
-    const updated: SessionData = { ...data, lastSeenAt: now }
-    // Allow failure silently — do not await
-    redis
-      .set(redisKey(sessionId), JSON.stringify(updated), 'EX', SESSION_TTL_SECONDS)
-      .catch(() => {})
-
-    // Fire-and-forget DB write
-    void db.update(sessions).set({ lastSeenAt: new Date() }).where(eq(sessions.id, sessionId)).execute().catch((err: unknown) => {
-      console.error('Session write-behind failed:', err)
-    })
-  }
-
-  return { sessionId, userId: data.userId }
+  // Redis is a repairable cache only. Failure never turns a database-valid
+  // session into an authorization failure and never extends database expiry.
+  await cacheAuthorizedSession(digest, authorized).catch(() => {})
+  return { sessionId: authorized.sessionId, userId: authorized.userId }
 }
-
-// ---------------------------------------------------------------------------
-// createSession
-// ---------------------------------------------------------------------------
 
 export async function createSession(
   userId: string,
   credentialId: string | null,
   meta: SessionMeta,
 ): Promise<string> {
-  const sessionId = crypto.randomUUID()
-  const now = Date.now()
+  const credential = crypto.randomUUID()
+  const digest = computeCredentialDigest(credential).digest
   const ip = sessionIp(meta.ip)
 
-  // Compute and store the credential digest for rekey detection
-  let credentialDigest: string | null = null
-  if (credentialId) {
-    credentialDigest = computeCredentialDigest({ credentialId, sessionId, userId }).digest.toString('hex')
-  }
+  const [created] = await db
+    .insert(sessions)
+    .values({
+      id: crypto.randomUUID(),
+      userId,
+      credentialId: credentialId ?? undefined,
+      credentialDigestV1: digest,
+      createdAt: sql`pg_catalog.clock_timestamp()`,
+      lastSeenAt: sql`pg_catalog.clock_timestamp()`,
+      expiresAt: sql`pg_catalog.clock_timestamp() + interval '7 days'`,
+      userAgent: meta.userAgent ?? undefined,
+      ipAddress: ip ?? undefined,
+    })
+    .returning({
+      sessionId: sessions.id,
+      lastSeenAt: sessions.lastSeenAt,
+      expiresAt: sessions.expiresAt,
+    })
 
-  const data: SessionData = {
+  if (!created?.expiresAt) throw new Error('Session creation did not return an expiry')
+  await cacheAuthorizedSession(digest, {
+    sessionId: created.sessionId,
     userId,
-    credentialId,
-    credentialDigest,
-    userAgent: meta.userAgent ?? null,
-    ip,
-    lastSeenAt: now,
-  }
+    lastSeenAt: created.lastSeenAt,
+    expiresAt: created.expiresAt,
+    refreshed: true,
+  }).catch(() => {})
 
-  // Write to Redis with 7-day TTL
-  await redis.set(redisKey(sessionId), JSON.stringify(data), 'EX', SESSION_TTL_SECONDS)
-
-  // Insert audit row into PostgreSQL with credential digest for DB-authoritative rekey
-  await db.insert(sessions).values({
-    id: sessionId,
-    userId,
-    credentialId: credentialId ?? undefined,
-    credentialDigest: credentialDigest ? Buffer.from(credentialDigest, 'hex') : undefined,
-    userAgent: meta.userAgent ?? undefined,
-    ipAddress: ip ?? undefined,
-  })
-
-  return sessionId
+  return credential
 }
 
-// ---------------------------------------------------------------------------
-// destroySession
-// ---------------------------------------------------------------------------
+export async function destroySession(sessionCredential: string): Promise<void> {
+  if (!isCanonicalSessionCredential(sessionCredential)) return
+  const digest = computeCredentialDigest(sessionCredential).digest
 
-export async function destroySession(sessionId: string): Promise<void> {
-  // Delete from Redis immediately
-  await redis.del(redisKey(sessionId))
-
-  // Mark revoked in PostgreSQL
+  // PostgreSQL revocation is authoritative and commits before cache deletion.
   await db
     .update(sessions)
-    .set({ revokedAt: new Date() })
-    .where(eq(sessions.id, sessionId))
-}
+    .set({ revokedAt: sql`pg_catalog.clock_timestamp()` })
+    .where(eq(sessions.credentialDigestV1, digest))
 
-// ---------------------------------------------------------------------------
-// sessionCookieOptions
-// ---------------------------------------------------------------------------
+  await redis.del(redisKey(digest)).catch(() => {})
+}
 
 export function sessionCookieOptions(): CookieOptions {
   return {
@@ -201,7 +202,7 @@ export function sessionCookieOptions(): CookieOptions {
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
     sameSite: 'strict',
-    maxAge: 60 * 60 * 24 * 7,
+    maxAge: SESSION_TTL_MS / 1000,
     path: '/',
   }
 }

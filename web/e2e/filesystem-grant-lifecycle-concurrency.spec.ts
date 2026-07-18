@@ -4,6 +4,7 @@ import { and, eq } from 'drizzle-orm'
 import postgres from 'postgres'
 import { db } from '../db'
 import { projects } from '../db/schema'
+import { handoffApprovedWorkPackages } from '../worker/work-package-handoff'
 import {
   convergeRecognizedOperatorHoldTask,
   filesystemMcpConfigAfterRootRepoint,
@@ -26,14 +27,6 @@ import { applyEpic172Step0E2EBridge } from './epic-172-step0-bridge'
 import { installSessionCookie, seedSession } from './helpers'
 
 const RUN = process.env.RUN_FORGE_POSTGRES_TESTS === '1'
-const S4_ADMIN_URL = process.env.FORGE_S4_POSTGRES_TEST_DATABASE_URL?.trim()
-const PACKET_ISSUER_URL = process.env.FORGE_PACKET_ISSUER_DATABASE_URL?.trim()
-const RUN_S4_ISSUANCE = Boolean(S4_ADMIN_URL && PACKET_ISSUER_URL)
-if (RUN && Boolean(S4_ADMIN_URL) !== Boolean(PACKET_ISSUER_URL)) {
-  throw new Error(
-    'The post-0027 contention proof requires both FORGE_S4_POSTGRES_TEST_DATABASE_URL and FORGE_PACKET_ISSUER_DATABASE_URL.',
-  )
-}
 test.skip(!RUN, 'Set RUN_FORGE_POSTGRES_TESTS=1 against a migrated disposable PostgreSQL database.')
 test.beforeEach(async ({}, testInfo) => {
   applyEpic172Step0E2EBridge(testInfo, 'filesystem-grant-lifecycle-concurrency.spec.ts')
@@ -43,6 +36,20 @@ function sqlClient() {
   const url = process.env.DATABASE_URL
   if (!url) throw new Error('DATABASE_URL is required')
   return postgres(url, { max: 1 })
+}
+
+async function bounded<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${label} exceeded ${milliseconds}ms`)), milliseconds)
+      }),
+    ])
+  } finally {
+    if (timeout) clearTimeout(timeout)
+  }
 }
 
 async function seed(input: {
@@ -1213,12 +1220,35 @@ test('the complete sibling lock waits on the lower ID before reaching the target
 })
 
 test('S3: mutation vs claim contention from lower sibling', async () => {
-  const fixture = await seed({ siblingRequiresFilesystem: true, siblingStatus: 'pending' })
+  const fixture = await seed({ siblingRequiresFilesystem: false, siblingStatus: 'pending' })
   const sql = sqlClient()
-  const altSql = sqlClient()
+  const observer = sqlClient()
+  const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
+  process.env.FORGE_WORK_PACKAGE_EXECUTION = '0'
+  let resolveClaimRelease: () => void = () => {}
+  let claimReleased = false
+  const claimRelease = new Promise<void>((resolve) => { resolveClaimRelease = resolve })
+  const releaseClaim = () => {
+    if (claimReleased) return
+    claimReleased = true
+    resolveClaimRelease()
+  }
+  let claimPromise: ReturnType<typeof handoffApprovedWorkPackages> | undefined
+  let mutationPromise: ReturnType<typeof mutateTaskFilesystemGrants> | undefined
   try {
-    await sql`insert into users (id, display_name) values (${randomUUID()}, 'Claim actor')`
-    await mutateTaskFilesystemGrants({
+    let signalClaimLocked!: (pid: number) => void
+    const claimLocked = new Promise<number>((resolve) => { signalClaimLocked = resolve })
+    claimPromise = handoffApprovedWorkPackages(fixture.taskId, {
+      claimEnabled: true,
+      afterWorkPackageClaimRowsLocked: async ({ backendPid, packageId }) => {
+        expect(packageId).toBe(fixture.lowerPackageId)
+        signalClaimLocked(backendPid)
+        await claimRelease
+      },
+    })
+
+    const claimPid = await claimLocked
+    mutationPromise = mutateTaskFilesystemGrants({
       actorId: fixture.userId,
       projectId: fixture.projectId,
       taskId: fixture.taskId,
@@ -1227,143 +1257,63 @@ test('S3: mutation vs claim contention from lower sibling', async () => {
         decision: 'approved',
         capabilities: ['filesystem.project.read'],
         grantMode: 'allow_once',
-        reason: 'Pre-claim approval',
+        reason: 'Higher sibling mutation overlapping lower claim',
       }],
     })
+    let mutationSettled = false
+    void mutationPromise.then(
+      () => { mutationSettled = true },
+      () => { mutationSettled = true },
+    )
 
-    const claimRunId = randomUUID()
-    const packageId = fixture.targetPackageId
-    const claim = RUN_S4_ISSUANCE
-      ? await (async () => {
-          const admin = postgres(S4_ADMIN_URL!, { max: 1 })
-          const issuer = postgres(PACKET_ISSUER_URL!, { max: 1 })
-          const localEvidenceId = randomUUID()
-          const claimToken = randomUUID()
-          try {
-            const [decision] = await sql<{ id: string }[]>`
-              select id
-              from filesystem_mcp_grant_approvals
-              where work_package_id = ${packageId}
-                and decision = 'approved'
-              order by created_at desc
-              limit 1
-            `
-            expect(decision).toBeDefined()
-            await admin.begin(async (tx) => {
-              await tx`
-                insert into agent_runs (
-                  id, task_id, work_package_id, agent_type, model_id_used, status
-                ) values (
-                  ${claimRunId}, ${fixture.taskId}, ${packageId},
-                  'backend', 's3-contention-fixture', 'running'
-                )
-              `
-              await tx`
-                insert into work_package_local_run_evidence (
-                  id, task_id, work_package_id, agent_run_id,
-                  claim_token, lease_expires_at
-                ) values (
-                  ${localEvidenceId}, ${fixture.taskId}, ${packageId}, ${claimRunId},
-                  ${claimToken}, clock_timestamp() + interval '30 seconds'
-                )
-              `
-              await tx`
-                update epic_172_s4_protocol_state
-                set producers_enabled = true,
-                    protocol_epoch = 2,
-                    enabled_build_sha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-                where singleton
-              `
-            })
-            const [claimed] = await issuer<{ auditId: string }[]>`
-              select forge.insert_packet_authorization_snapshot_v2(
-                ${claimRunId}::uuid,
-                ${localEvidenceId}::uuid,
-                ${decision.id}::uuid,
-                ${claimToken}::uuid,
-                20,
-                array['filesystem.project.read']::text[]
-              ) as "auditId"
-            `
-            return {
-              auditId: claimed.auditId,
-              claimed: true,
-              decisionId: decision.id,
-              operation: 'context_packet',
-            }
-          } finally {
-            await Promise.all([admin.end(), issuer.end()])
-          }
-        })()
-      : await altSql.begin(async (tx) => {
-          // Migration 0026 compatibility: before S4 exists there is no packet
-          // issuer routine or protected local-evidence table to call.
-          await tx`SET LOCAL application_name = 'forge-s3-claim-contender'`
-          const [decision] = await tx`
-            select id, work_package_id, grant_decision_revision, pointer_fingerprint
-            from filesystem_mcp_grant_approvals
-            where work_package_id = ${packageId}
-              and decision = 'approved'
-            order by created_at desc
-            limit 1
-          `
-          expect(decision).toBeDefined()
-          await tx`
-            insert into agent_runs (
-              id, task_id, work_package_id, agent_type, model_id_used, status
-            ) values (
-              ${claimRunId}, ${fixture.taskId}, ${packageId},
-              'backend', 's3-contention-fixture', 'completed'
-            )
-          `
-          const auditId = randomUUID()
-          await tx`
-            insert into filesystem_mcp_runtime_audits (
-              id, task_id, work_package_id, agent_run_id, grant_approval_id,
-              status, operation, capabilities, file_count, created_at
-            ) values (
-              ${auditId}, ${fixture.taskId}, ${packageId}, ${claimRunId},
-              ${decision.id}, 'completed', 'context_packet_delivered',
-              ${sql.json(['filesystem.project.read'])}, 0, now()
-            )
-          `
-          return {
-            auditId,
-            claimed: true,
-            decisionId: decision.id,
-            operation: 'context_packet_delivered',
-          }
-        })
+    let observed: { blockers: number[]; wait_event_type: string | null } | undefined
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const [row] = await observer<{ blockers: number[]; wait_event_type: string | null }[]>`
+        select pg_blocking_pids(pid) as blockers, wait_event_type
+        from pg_stat_activity
+        where ${claimPid} = any(pg_blocking_pids(pid))
+          and wait_event_type = 'Lock'
+      `
+      if (row) {
+        observed = row
+        break
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    expect(observed?.blockers).toContain(claimPid)
+    expect(observed?.wait_event_type).toBe('Lock')
+    expect(mutationSettled).toBe(false)
 
-    // Concurrent mutation from lower sibling after claim
-    const mutation = await mutateTaskFilesystemGrants({
-      actorId: fixture.userId,
-      projectId: fixture.projectId,
-      taskId: fixture.taskId,
-      mutations: [{
-        workPackageId: fixture.lowerPackageId,
-        decision: 'approved',
-        capabilities: ['filesystem.project.read'],
-        grantMode: 'allow_once',
-        reason: 'Lower sibling mutation after claim',
-      }],
-    })
+    releaseClaim()
+    const [claim, mutation] = await bounded(
+      Promise.all([claimPromise, mutationPromise]),
+      5_000,
+      'production claim and grant mutation contention',
+    )
 
-    expect(claim.claimed).toBe(true)
+    expect(claim.claimedPackageId).toBe(fixture.lowerPackageId)
     expect(mutation.approvals).toHaveLength(1)
-    expect(mutation.approvals[0].workPackageId).toBe(fixture.lowerPackageId)
+    expect(mutation.approvals[0].workPackageId).toBe(fixture.targetPackageId)
 
-    const [audit] = await sql`
-      select id, work_package_id, grant_approval_id, operation
-      from filesystem_mcp_runtime_audits
-      where id = ${claim.auditId}
-        and agent_run_id = ${claimRunId}
-        and operation = ${claim.operation}
+    const [claimed] = await sql<{ run_count: number; status: string }[]>`
+      select package.status, count(run.id)::integer as run_count
+      from work_packages package
+      join agent_runs run on run.work_package_id = package.id
+      where package.id = ${fixture.lowerPackageId}
+      group by package.status
     `
-    expect(audit).toBeDefined()
-    expect(audit.work_package_id).toBe(packageId)
-    expect(audit.grant_approval_id).toBe(claim.decisionId)
+    expect(['awaiting_review', 'completed']).toContain(claimed.status)
+    expect(claimed.run_count).toBe(1)
   } finally {
-    await Promise.all([sql.end(), altSql.end()])
+    releaseClaim()
+    const active: Promise<unknown>[] = []
+    if (claimPromise) active.push(claimPromise)
+    if (mutationPromise) active.push(mutationPromise)
+    if (active.length > 0) {
+      await bounded(Promise.allSettled(active), 5_000, 'contention cleanup')
+    }
+    if (previousExecutionFlag === undefined) delete process.env.FORGE_WORK_PACKAGE_EXECUTION
+    else process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
+    await Promise.all([sql.end(), observer.end()])
   }
 })

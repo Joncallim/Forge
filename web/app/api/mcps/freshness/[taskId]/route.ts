@@ -1,48 +1,21 @@
 import 'server-only'
-import { NextResponse } from 'next/server'
-import type { NextRequest } from 'next/server'
-import { createHash } from 'node:crypto'
-import { asc, eq } from 'drizzle-orm'
-import { db } from '@/db'
-import { workPackages } from '@/db/schema'
-import { getSession } from '@/lib/session'
-import { getAccessibleTask } from '@/lib/task-access'
+import { NextResponse, type NextRequest } from 'next/server'
+import { readAuthorizedS5State, S5RouteAuthorizationError } from '@/lib/mcps/s5-route'
 
-export async function GET(
-  request: NextRequest,
-  { params }: { params: Promise<{ taskId: string }> },
-) {
+export async function GET(request: NextRequest, { params }: { params: Promise<{ taskId: string }> }) {
   try {
-    const session = await getSession(request)
-    if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     const { taskId } = await params
-    const task = await getAccessibleTask(taskId, session.userId)
-    if (!task || task.submittedBy !== session.userId) {
-      return NextResponse.json({ error: 'Task not found' }, { status: 404 })
-    }
-
-    const packages = await db
-      .select({ id: workPackages.id, updatedAt: workPackages.updatedAt })
-      .from(workPackages).where(eq(workPackages.taskId, taskId))
-      .orderBy(asc(workPackages.sequence))
-
-    const fingerprint = createHash('sha256')
-      .update(packages.map((p) => `${p.id}:${p.updatedAt?.getTime() ?? 0}`).join('\n'))
-      .digest('hex')
-
-    const casToken = createHash('sha256')
-      .update(`forge:s5:cas-recheck:v1\0${fingerprint}\0${Date.now()}`)
-      .digest('hex').substring(0, 16)
-
+    const { state } = await readAuthorizedS5State(request, taskId)
     return NextResponse.json({
-      computedAt: new Date().toISOString(),
-      fingerprint: `sha256:${fingerprint}`,
-      casRecheckToken: `recheck:${casToken}`,
-      freshnessAgeMs: Date.now() - new Date().getTime(),
+      computedAt: state.computedAt,
+      fingerprint: state.freshnessFingerprint,
+      casRecheckToken: state.freshnessFingerprint,
+      freshnessAgeMs: 0,
       taskId,
     })
-  } catch (err) {
-    console.error('[mcps/freshness GET] Unexpected error', err)
+  } catch (error) {
+    if (error instanceof S5RouteAuthorizationError) return NextResponse.json({ error: error.message }, { status: error.status })
+    console.error('[mcps/freshness GET] Unexpected error', error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

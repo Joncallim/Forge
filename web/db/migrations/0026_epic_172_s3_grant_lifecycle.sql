@@ -2,6 +2,32 @@
 -- decision history, a preallocated current-authority pointer, and the strict
 -- nonterminal operator-hold marker. Step 0 owns migrations 0023 through 0025.
 
+ALTER TABLE "tasks"
+  ADD COLUMN "local_projection_scope_state" text DEFAULT 'active' NOT NULL,
+  ADD COLUMN "local_projection_overlimit_package_count" integer,
+  ADD CONSTRAINT "tasks_local_projection_scope_state_check"
+    CHECK ("local_projection_scope_state" IN ('active', 'archive_pending', 'legacy_archived')),
+  ADD CONSTRAINT "tasks_local_projection_overlimit_check"
+    CHECK (
+      ("local_projection_scope_state" = 'active' AND "local_projection_overlimit_package_count" IS NULL)
+      OR (
+        "local_projection_scope_state" IN ('archive_pending', 'legacy_archived')
+        AND "local_projection_overlimit_package_count" > 256
+      )
+    );
+
+UPDATE "tasks" task
+SET
+  "local_projection_scope_state" = 'archive_pending',
+  "local_projection_overlimit_package_count" = package_count.count
+FROM (
+  SELECT task_id, count(*)::integer AS count
+  FROM "work_packages"
+  GROUP BY task_id
+  HAVING count(*) > 256
+) package_count
+WHERE task.id = package_count.task_id;
+
 ALTER TABLE "projects"
   ADD COLUMN "grant_decision_revision" bigint DEFAULT 0 NOT NULL,
   ADD COLUMN "root_binding_revision" bigint DEFAULT 0 NOT NULL,
@@ -526,6 +552,15 @@ INSERT INTO public.forge_epic_172_s3_release_state (
   '7a97eed28629c7d0d7c11a48d3509f1c479d614882dc61a7e2c1891f32c3a5dc'
 );
 --> statement-breakpoint
+REVOKE ALL ON public.forge_epic_172_s3_release_state FROM PUBLIC;
+GRANT SELECT ON public.forge_epic_172_s3_release_state TO PUBLIC;
+GRANT SELECT, INSERT, UPDATE ON public.forge_epic_172_s3_release_state
+  TO forge_release_evidence_writer;
+REVOKE DELETE, TRUNCATE ON public.forge_epic_172_s3_release_state
+  FROM forge_release_evidence_writer;
+REVOKE ALL ON public.forge_epic_172_s3_release_state
+  FROM forge_release_transition;
+--> statement-breakpoint
 CREATE FUNCTION forge.guard_epic_172_s3_evidence_insert_v1()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -955,51 +990,102 @@ GRANT EXECUTE ON FUNCTION forge.consume_epic_172_release_evidence_v1(uuid,uuid,t
   TO forge_release_transition;
 --> statement-breakpoint
 -- ---------------------------------------------------------------------------
--- S3 local projection heads — 8 preallocated per package (max 256 packages)
+-- S3 local projection sources and heads — 8 exact heads per claimable package
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS public.work_package_local_projection_heads (
+CREATE TABLE public.work_package_local_projection_sources (
+  id uuid PRIMARY KEY,
+  task_id uuid NOT NULL REFERENCES public.tasks(id) ON DELETE RESTRICT,
+  work_package_id uuid NOT NULL REFERENCES public.work_packages(id) ON DELETE RESTRICT,
+  source_kind text NOT NULL,
+  source_revision bigint NOT NULL,
+  source_fingerprint text NOT NULL,
+  contribution jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT work_package_projection_source_kind_chk CHECK (
+    source_kind IN (
+      'local_run', 'local_recovery', 'packet_recovery', 'repository_review',
+      'host_apply_review', 'operator_hold', 'integrity', 'terminal_disposition'
+    )
+  ),
+  CONSTRAINT work_package_projection_source_revision_chk CHECK (source_revision > 0),
+  CONSTRAINT work_package_projection_source_fingerprint_chk CHECK (
+    source_fingerprint ~ '^sha256:[0-9a-f]{64}$'
+  ),
+  CONSTRAINT work_package_projection_source_contribution_chk CHECK (
+    jsonb_typeof(contribution) = 'object' AND octet_length(contribution::text) <= 4096
+  ),
+  CONSTRAINT work_package_projection_source_identity_unique UNIQUE (
+    id, task_id, work_package_id, source_kind, source_revision, source_fingerprint
+  ),
+  CONSTRAINT work_package_projection_source_revision_unique UNIQUE (
+    work_package_id, source_kind, source_revision
+  )
+);
+--> statement-breakpoint
+CREATE TABLE public.work_package_local_projection_heads (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  task_id uuid NOT NULL
-    REFERENCES public.tasks(id) ON DELETE RESTRICT,
-  work_package_id uuid NOT NULL
-    REFERENCES public.work_packages(id) ON DELETE RESTRICT,
+  task_id uuid NOT NULL REFERENCES public.tasks(id) ON DELETE RESTRICT,
+  work_package_id uuid NOT NULL REFERENCES public.work_packages(id) ON DELETE RESTRICT,
   head_kind text NOT NULL,
   head_index bigint NOT NULL,
   head_fingerprint text NOT NULL,
-  head_version bigint NOT NULL DEFAULT 0,
-  state text NOT NULL DEFAULT 'preallocated',
-  lease_token uuid,
-  expires_at timestamptz,
+  head_revision bigint NOT NULL DEFAULT 0,
+  compare_and_set_fingerprint text NOT NULL,
+  current_source_id uuid,
+  current_source_task_id uuid,
+  current_source_work_package_id uuid,
+  current_source_kind text,
+  current_source_revision bigint,
+  current_source_fingerprint text,
+  contribution jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT work_package_projection_head_kind_chk CHECK (
     head_kind IN (
-      'filesystem_grant_decision',
-      'execution_evidence',
-      'claim_token',
-      'lease_expiry',
-      'recovery_marker',
-      'integrity_hold',
-      'terminal_state',
-      'artifact_reference'
+      'local_run', 'local_recovery', 'packet_recovery', 'repository_review',
+      'host_apply_review', 'operator_hold', 'integrity', 'terminal_disposition'
     )
   ),
-  CONSTRAINT work_package_projection_head_state_chk CHECK (
-    state IN ('preallocated', 'claimed', 'active', 'terminal', 'uncertain')
-  ),
-  CONSTRAINT work_package_projection_head_index_chk CHECK (
-    head_index >= 0 AND head_index < 8
-  ),
-  CONSTRAINT work_package_projection_head_version_chk CHECK (
-    head_version >= 0
-  ),
+  CONSTRAINT work_package_projection_head_index_chk CHECK (head_index >= 0 AND head_index < 8),
+  CONSTRAINT work_package_projection_head_revision_chk CHECK (head_revision >= 0),
   CONSTRAINT work_package_projection_head_fingerprint_chk CHECK (
     head_fingerprint ~ '^head:v1:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[a-z_]+:[0-7]$'
   ),
-  CONSTRAINT work_package_projection_head_lease_chk CHECK (
-    (state IN ('claimed', 'active') AND lease_token IS NOT NULL)
-    OR (state NOT IN ('claimed', 'active') AND lease_token IS NULL)
-  )
+  CONSTRAINT work_package_projection_head_cas_fingerprint_chk CHECK (
+    compare_and_set_fingerprint = head_fingerprint
+    OR compare_and_set_fingerprint ~ '^sha256:[0-9a-f]{64}$'
+  ),
+  CONSTRAINT work_package_projection_head_contribution_chk CHECK (
+    jsonb_typeof(contribution) = 'object' AND octet_length(contribution::text) <= 4096
+  ),
+  CONSTRAINT work_package_projection_head_source_tuple_chk CHECK (
+    (
+      head_revision = 0
+      AND current_source_id IS NULL
+      AND current_source_task_id IS NULL
+      AND current_source_work_package_id IS NULL
+      AND current_source_kind IS NULL
+      AND current_source_revision IS NULL
+      AND current_source_fingerprint IS NULL
+      AND contribution = '{}'::jsonb
+      AND compare_and_set_fingerprint = head_fingerprint
+    ) OR (
+      head_revision > 0
+      AND current_source_id IS NOT NULL
+      AND current_source_task_id = task_id
+      AND current_source_work_package_id = work_package_id
+      AND current_source_kind = head_kind
+      AND current_source_revision = head_revision
+      AND current_source_fingerprint IS NOT NULL
+      AND compare_and_set_fingerprint ~ '^sha256:[0-9a-f]{64}$'
+    )
+  ),
+  CONSTRAINT work_package_projection_heads_current_source_fk FOREIGN KEY (
+    current_source_id, current_source_task_id, current_source_work_package_id,
+    current_source_kind, current_source_revision, current_source_fingerprint
+  ) REFERENCES public.work_package_local_projection_sources (
+    id, task_id, work_package_id, source_kind, source_revision, source_fingerprint
+  ) MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX work_package_local_projection_heads_package_kind_idx
@@ -1008,20 +1094,18 @@ CREATE UNIQUE INDEX work_package_local_projection_heads_package_kind_idx
 CREATE INDEX work_package_local_projection_heads_kind_idx
   ON public.work_package_local_projection_heads(head_kind);
 --> statement-breakpoint
-CREATE INDEX work_package_local_projection_heads_state_idx
-  ON public.work_package_local_projection_heads(state);
---> statement-breakpoint
 CREATE INDEX work_package_local_projection_heads_task_id_idx
   ON public.work_package_local_projection_heads(task_id);
 --> statement-breakpoint
 CREATE UNIQUE INDEX work_package_local_projection_heads_fingerprint_idx
   ON public.work_package_local_projection_heads(head_fingerprint);
 --> statement-breakpoint
-CREATE UNIQUE INDEX work_package_local_projection_heads_lease_token_idx
-  ON public.work_package_local_projection_heads(lease_token);
+CREATE UNIQUE INDEX work_package_local_projection_heads_cas_fingerprint_idx
+  ON public.work_package_local_projection_heads(compare_and_set_fingerprint);
 --> statement-breakpoint
--- Preallocation: on INSERT into work_packages, create 8 heads (fails above 256)
-CREATE OR REPLACE FUNCTION forge.preallocate_local_projection_heads_v1()
+-- Serialize package creation per task before the row exists. This closes the
+-- 255 -> 257 race while retaining a bounded, typed legacy-upgrade state.
+CREATE OR REPLACE FUNCTION forge.guard_local_projection_package_limit_v1()
 RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1029,33 +1113,60 @@ SET search_path = ''
 AS $$
 DECLARE
   v_package_count bigint;
+  v_scope_state text;
 BEGIN
-  SELECT count(id) INTO STRICT v_package_count
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended('forge:projection-package-limit:v1:' || NEW.task_id::text, 0)
+  );
+  SELECT local_projection_scope_state INTO STRICT v_scope_state
+  FROM public.tasks
+  WHERE id = NEW.task_id;
+  IF v_scope_state <> 'active' THEN
+    RAISE EXCEPTION 'S3_PROJECTION_SCOPE_NOT_CLAIMABLE: task state is %', v_scope_state
+      USING ERRCODE = 'P1726';
+  END IF;
+  SELECT count(*) INTO STRICT v_package_count
   FROM public.work_packages
   WHERE task_id = NEW.task_id;
-  IF v_package_count > 256 THEN
-    RAISE EXCEPTION 'S3 package limit exceeded: at most 256 work packages allowed'
+  IF v_package_count >= 256 THEN
+    RAISE EXCEPTION 'S3_PACKAGE_LIMIT_EXCEEDED: at most 256 work packages are claimable'
       USING ERRCODE = '54000';
   END IF;
+  RETURN NEW;
+END;
+$$;
+--> statement-breakpoint
+REVOKE ALL ON FUNCTION forge.guard_local_projection_package_limit_v1() FROM PUBLIC;
+--> statement-breakpoint
+CREATE TRIGGER trg_guard_projection_package_limit
+  BEFORE INSERT ON public.work_packages
+  FOR EACH ROW EXECUTE FUNCTION forge.guard_local_projection_package_limit_v1();
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.preallocate_local_projection_heads_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
   INSERT INTO public.work_package_local_projection_heads (
-    task_id, work_package_id, head_kind, head_index, head_fingerprint
-  ) VALUES
-    (NEW.task_id, NEW.id, 'filesystem_grant_decision', 0,
-     'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':filesystem_grant_decision:0'),
-    (NEW.task_id, NEW.id, 'execution_evidence',      1,
-     'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':execution_evidence:1'),
-    (NEW.task_id, NEW.id, 'claim_token',             2,
-     'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':claim_token:2'),
-    (NEW.task_id, NEW.id, 'lease_expiry',            3,
-     'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':lease_expiry:3'),
-    (NEW.task_id, NEW.id, 'recovery_marker',         4,
-     'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':recovery_marker:4'),
-    (NEW.task_id, NEW.id, 'integrity_hold',          5,
-     'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':integrity_hold:5'),
-    (NEW.task_id, NEW.id, 'terminal_state',          6,
-     'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':terminal_state:6'),
-    (NEW.task_id, NEW.id, 'artifact_reference',      7,
-     'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':artifact_reference:7');
+    task_id, work_package_id, head_kind, head_index,
+    head_fingerprint, compare_and_set_fingerprint
+  )
+  SELECT
+    NEW.task_id,
+    NEW.id,
+    kind_row.head_kind,
+    kind_row.head_index,
+    'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':' ||
+      kind_row.head_kind || ':' || kind_row.head_index::text,
+    'head:v1:' || NEW.task_id::text || ':' || NEW.id::text || ':' ||
+      kind_row.head_kind || ':' || kind_row.head_index::text
+  FROM (VALUES
+    ('local_run', 0), ('local_recovery', 1), ('packet_recovery', 2),
+    ('repository_review', 3), ('host_apply_review', 4), ('operator_hold', 5),
+    ('integrity', 6), ('terminal_disposition', 7)
+  ) AS kind_row(head_kind, head_index);
   RETURN NEW;
 END;
 $$;
@@ -1066,7 +1177,20 @@ CREATE OR REPLACE TRIGGER trg_preallocate_projection_heads
   AFTER INSERT ON public.work_packages
   FOR EACH ROW EXECUTE FUNCTION forge.preallocate_local_projection_heads_v1();
 --> statement-breakpoint
--- Reject deletion or reassignment of projection heads
+-- Sources are append-only; every head identity column is immutable.
+CREATE OR REPLACE FUNCTION forge.reject_projection_source_mutation_v1()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+BEGIN
+  RAISE EXCEPTION 'Projection sources are append-only' USING ERRCODE = '55000';
+END;
+$$;
+--> statement-breakpoint
+REVOKE ALL ON FUNCTION forge.reject_projection_source_mutation_v1() FROM PUBLIC;
+--> statement-breakpoint
+CREATE TRIGGER trg_reject_projection_source_mutation
+  BEFORE UPDATE OR DELETE ON public.work_package_local_projection_sources
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_projection_source_mutation_v1();
+--> statement-breakpoint
 CREATE OR REPLACE FUNCTION forge.reject_projection_head_mutation_v1()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -1078,13 +1202,14 @@ BEGIN
     RAISE EXCEPTION 'Projection heads are immutable: deletion is forbidden'
       USING ERRCODE = '55000';
   END IF;
-  IF NEW.head_kind <> OLD.head_kind
-     OR NEW.work_package_id <> OLD.work_package_id THEN
-    RAISE EXCEPTION 'Projection head identity is immutable: cannot reassign head_kind or work_package_id'
-      USING ERRCODE = '55000';
-  END IF;
-  IF OLD.state = 'deleted' THEN
-    RAISE EXCEPTION 'Cannot operate on a deleted projection head'
+  IF NEW.id <> OLD.id
+     OR NEW.task_id <> OLD.task_id
+     OR NEW.work_package_id <> OLD.work_package_id
+     OR NEW.head_kind <> OLD.head_kind
+     OR NEW.head_index <> OLD.head_index
+     OR NEW.head_fingerprint <> OLD.head_fingerprint
+     OR NEW.created_at <> OLD.created_at THEN
+    RAISE EXCEPTION 'Projection head identity is immutable'
       USING ERRCODE = '55000';
   END IF;
   RETURN NEW;
@@ -1097,50 +1222,119 @@ CREATE OR REPLACE TRIGGER trg_reject_projection_head_mutation
   BEFORE UPDATE OR DELETE ON public.work_package_local_projection_heads
   FOR EACH ROW EXECUTE FUNCTION forge.reject_projection_head_mutation_v1();
 --> statement-breakpoint
--- Backfill heads for existing packages (after the trigger is active)
-DO $$
+INSERT INTO public.work_package_local_projection_heads (
+  task_id, work_package_id, head_kind, head_index,
+  head_fingerprint, compare_and_set_fingerprint
+)
+SELECT
+  package_row.task_id,
+  package_row.id,
+  kind_row.head_kind,
+  kind_row.head_index,
+  'head:v1:' || package_row.task_id::text || ':' || package_row.id::text || ':' ||
+    kind_row.head_kind || ':' || kind_row.head_index::text,
+  'head:v1:' || package_row.task_id::text || ':' || package_row.id::text || ':' ||
+    kind_row.head_kind || ':' || kind_row.head_index::text
+FROM public.work_packages package_row
+JOIN public.tasks task_row ON task_row.id = package_row.task_id
+CROSS JOIN (VALUES
+  ('local_run', 0), ('local_recovery', 1), ('packet_recovery', 2),
+  ('repository_review', 3), ('host_apply_review', 4), ('operator_hold', 5),
+  ('integrity', 6), ('terminal_disposition', 7)
+) AS kind_row(head_kind, head_index)
+WHERE task_row.local_projection_scope_state = 'active';
+--> statement-breakpoint
+-- The only mutable route is exact prior revision/fingerprint compare-and-set.
+CREATE OR REPLACE FUNCTION forge.advance_local_projection_head_v1(
+  p_task_id uuid,
+  p_work_package_id uuid,
+  p_head_kind text,
+  p_source_id uuid,
+  p_source_revision bigint,
+  p_source_fingerprint text,
+  p_contribution jsonb,
+  p_expected_head_revision bigint,
+  p_expected_compare_and_set_fingerprint text,
+  p_next_compare_and_set_fingerprint text
+)
+RETURNS TABLE (
+  "headId" uuid,
+  "advanced" boolean,
+  "headRevision" bigint,
+  "compareAndSetFingerprint" text
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
 DECLARE
-  v_pkg record;
-  v_over_limit_task_id uuid;
+  v_head public.work_package_local_projection_heads%ROWTYPE;
+  v_scope_state text;
 BEGIN
-  SELECT task_id INTO v_over_limit_task_id
-  FROM public.work_packages
-  GROUP BY task_id
-  HAVING count(id) > 256
-  ORDER BY task_id
-  LIMIT 1;
-  IF v_over_limit_task_id IS NOT NULL THEN
-    RAISE EXCEPTION 'Cannot backfill: task % exceeds S3 limit of 256 packages', v_over_limit_task_id
-      USING ERRCODE = '54000';
+  IF p_head_kind NOT IN (
+    'local_run', 'local_recovery', 'packet_recovery', 'repository_review',
+    'host_apply_review', 'operator_hold', 'integrity', 'terminal_disposition'
+  ) OR p_source_revision <> p_expected_head_revision + 1
+     OR p_source_fingerprint !~ '^sha256:[0-9a-f]{64}$'
+     OR p_next_compare_and_set_fingerprint !~ '^sha256:[0-9a-f]{64}$'
+     OR jsonb_typeof(p_contribution) <> 'object'
+     OR octet_length(p_contribution::text) > 4096 THEN
+    RAISE EXCEPTION 'Invalid projection-head advancement input' USING ERRCODE = '22023';
   END IF;
-  FOR v_pkg IN SELECT id, task_id FROM public.work_packages LOOP
-    INSERT INTO public.work_package_local_projection_heads (
-      task_id, work_package_id, head_kind, head_index, head_fingerprint
-    ) VALUES
-      (v_pkg.task_id, v_pkg.id, 'filesystem_grant_decision', 0,
-       'head:v1:' || v_pkg.task_id || ':' || v_pkg.id || ':filesystem_grant_decision:0'),
-      (v_pkg.task_id, v_pkg.id, 'execution_evidence',      1,
-       'head:v1:' || v_pkg.task_id || ':' || v_pkg.id || ':execution_evidence:1'),
-      (v_pkg.task_id, v_pkg.id, 'claim_token',             2,
-       'head:v1:' || v_pkg.task_id || ':' || v_pkg.id || ':claim_token:2'),
-      (v_pkg.task_id, v_pkg.id, 'lease_expiry',            3,
-       'head:v1:' || v_pkg.task_id || ':' || v_pkg.id || ':lease_expiry:3'),
-      (v_pkg.task_id, v_pkg.id, 'recovery_marker',         4,
-       'head:v1:' || v_pkg.task_id || ':' || v_pkg.id || ':recovery_marker:4'),
-      (v_pkg.task_id, v_pkg.id, 'integrity_hold',          5,
-       'head:v1:' || v_pkg.task_id || ':' || v_pkg.id || ':integrity_hold:5'),
-      (v_pkg.task_id, v_pkg.id, 'terminal_state',          6,
-       'head:v1:' || v_pkg.task_id || ':' || v_pkg.id || ':terminal_state:6'),
-      (v_pkg.task_id, v_pkg.id, 'artifact_reference',      7,
-       'head:v1:' || v_pkg.task_id || ':' || v_pkg.id || ':artifact_reference:7')
-    ON CONFLICT (work_package_id, head_kind) DO NOTHING;
-  END LOOP;
+  SELECT local_projection_scope_state INTO STRICT v_scope_state
+  FROM public.tasks WHERE id = p_task_id;
+  IF v_scope_state <> 'active' THEN
+    RAISE EXCEPTION 'S3_PROJECTION_SCOPE_NOT_CLAIMABLE: task state is %', v_scope_state
+      USING ERRCODE = 'P1726';
+  END IF;
+  SELECT * INTO STRICT v_head
+  FROM public.work_package_local_projection_heads
+  WHERE task_id = p_task_id
+    AND work_package_id = p_work_package_id
+    AND head_kind = p_head_kind
+  FOR UPDATE;
+  IF v_head.head_revision <> p_expected_head_revision
+     OR v_head.compare_and_set_fingerprint <> p_expected_compare_and_set_fingerprint THEN
+    RETURN QUERY SELECT v_head.id, false, v_head.head_revision, v_head.compare_and_set_fingerprint;
+    RETURN;
+  END IF;
+  INSERT INTO public.work_package_local_projection_sources (
+    id, task_id, work_package_id, source_kind, source_revision,
+    source_fingerprint, contribution
+  ) VALUES (
+    p_source_id, p_task_id, p_work_package_id, p_head_kind, p_source_revision,
+    p_source_fingerprint, p_contribution
+  );
+  UPDATE public.work_package_local_projection_heads
+  SET
+    head_revision = p_source_revision,
+    compare_and_set_fingerprint = p_next_compare_and_set_fingerprint,
+    current_source_id = p_source_id,
+    current_source_task_id = p_task_id,
+    current_source_work_package_id = p_work_package_id,
+    current_source_kind = p_head_kind,
+    current_source_revision = p_source_revision,
+    current_source_fingerprint = p_source_fingerprint,
+    contribution = p_contribution,
+    updated_at = pg_catalog.clock_timestamp()
+  WHERE id = v_head.id;
+  RETURN QUERY SELECT v_head.id, true, p_source_revision, p_next_compare_and_set_fingerprint;
 END;
 $$;
+--> statement-breakpoint
+REVOKE ALL ON FUNCTION forge.advance_local_projection_head_v1(
+  uuid,uuid,text,uuid,bigint,text,jsonb,bigint,text,text
+) FROM PUBLIC;
+--> statement-breakpoint
+ALTER TABLE public.work_package_local_projection_sources
+  OWNER TO forge_release_routines_owner;
 --> statement-breakpoint
 ALTER TABLE public.work_package_local_projection_heads
   OWNER TO forge_release_routines_owner;
 --> statement-breakpoint
+REVOKE ALL ON public.work_package_local_projection_sources FROM PUBLIC;
+REVOKE ALL ON public.work_package_local_projection_sources
+  FROM forge_release_evidence_writer, forge_release_transition;
 REVOKE ALL ON public.work_package_local_projection_heads FROM PUBLIC;
 REVOKE ALL ON public.work_package_local_projection_heads
   FROM forge_release_evidence_writer, forge_release_transition;

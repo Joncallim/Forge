@@ -1,8 +1,7 @@
 import postgres from 'postgres'
-import { randomUUID } from 'node:crypto'
 
 export class HistoryReaderError extends Error {
-  readonly code: 'configuration' | 'conflict' | 'invalid_evidence'
+  readonly code: 'configuration' | 'invalid_evidence'
 
   constructor(code: HistoryReaderError['code'], message: string) {
     super(message)
@@ -22,20 +21,24 @@ function historyReaderUrl(): string {
   return value
 }
 
-export type HistoryReadEntry = {
-  requestId: string
-  userId: string
-  taskId: string
-  planVersion: bigint
-  readAt: Date
+export type ArchitectPlanHistoryEntry = {
+  entryId: string
+  entryKind: 'plan_body' | 'requirement' | 'overlay' | 'subtask' | 'legacy_full_plan'
+  agent: string | null
+  requirementKey: string | null
+  bindingFingerprint: string | null
+  content: string
+  contentDigest: string
+  digestKeyId: string
+  projectionEligible: boolean
 }
 
-export async function recordHistoryRead(input: {
+export async function readArchitectPlanHistory(input: {
   planVersion: string
+  sessionCredential: string
   taskId: string
-  userId: string
-}): Promise<string> {
-  const requestId = randomUUID()
+}): Promise<readonly ArchitectPlanHistoryEntry[]> {
+  const credentialBytes = Buffer.from(input.sessionCredential, 'ascii')
   const sql = postgres(historyReaderUrl(), {
     max: 1,
     prepare: true,
@@ -43,56 +46,17 @@ export async function recordHistoryRead(input: {
     transform: { undefined: null },
   })
   try {
-    await sql`
-      insert into architect_plan_history_reads (id, request_id, user_id, task_id, plan_version, read_at)
-      values (
-        ${randomUUID()}::uuid,
-        ${requestId}::uuid,
-        ${input.userId}::uuid,
+    return await sql<ArchitectPlanHistoryEntry[]>`
+      select entry_id as "entryId", entry_kind as "entryKind", agent,
+        requirement_key as "requirementKey",
+        binding_fingerprint as "bindingFingerprint", content,
+        content_digest as "contentDigest", digest_key_id as "digestKeyId",
+        projection_eligible as "projectionEligible"
+      from forge.read_architect_plan_history_v1(
+        ${credentialBytes}::bytea,
         ${input.taskId}::uuid,
-        ${input.planVersion}::bigint,
-        now()
+        ${input.planVersion}::bigint
       )
-    `
-    return requestId
-  } catch (error) {
-    const code =
-      typeof error === 'object' &&
-      error !== null &&
-      'code' in error
-        ? String((error as { code?: unknown }).code)
-        : ''
-    throw new HistoryReaderError(
-      code === '23505' ? 'conflict' : 'invalid_evidence',
-      'The protected history read failed closed.',
-    )
-  } finally {
-    await sql.end({ timeout: 5 })
-  }
-}
-
-export async function readHistoryLog(input: {
-  taskId: string
-  userId: string
-}): Promise<readonly HistoryReadEntry[]> {
-  const sql = postgres(historyReaderUrl(), {
-    max: 1,
-    prepare: true,
-    onnotice: () => {},
-    transform: { undefined: null },
-  })
-  try {
-    return await sql<HistoryReadEntry[]>`
-      select request_id as "requestId",
-             user_id as "userId",
-             task_id as "taskId",
-             plan_version as "planVersion",
-             read_at as "readAt"
-      from architect_plan_history_reads
-      where task_id = ${input.taskId}::uuid
-        and user_id = ${input.userId}::uuid
-      order by read_at desc
-      limit 100
     `
   } catch {
     throw new HistoryReaderError(
@@ -100,6 +64,7 @@ export async function readHistoryLog(input: {
       'The protected history read failed closed.',
     )
   } finally {
+    credentialBytes.fill(0)
     await sql.end({ timeout: 5 })
   }
 }

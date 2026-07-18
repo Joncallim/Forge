@@ -7,6 +7,7 @@ import { redis } from '../lib/redis'
 import { parseMcpExecutionDesign } from '../worker/mcp-execution-design'
 import { validateMcpOperatorReviewHistory } from '../worker/mcp-plan-review'
 import { applyEpic172Step0E2EBridge } from './epic-172-step0-bridge'
+import { computeCredentialDigest } from '../lib/session-credential-digest'
 
 const databaseUrl = process.env.DATABASE_URL ?? ''
 const redisUrl = process.env.REDIS_URL ?? ''
@@ -96,7 +97,7 @@ async function seedReviewTask(sql: Sql): Promise<SeededReviewTask> {
   `
   await sql`
     insert into agent_runs (id, task_id, agent_type, model_id_used, status)
-    values (${runId}, ${taskId}, 'architect', 'e2e-fixture', 'completed')
+    values (${runId}, ${taskId}, 'architect-fixture', 'e2e-fixture', 'completed')
   `
   await sql`
     insert into artifacts (id, agent_run_id, artifact_type, content, metadata)
@@ -162,7 +163,9 @@ test.describe('MCP plan review PostgreSQL concurrency', () => {
 
   test.afterEach(async () => {
     if (!sql || !locker) return
-    await Promise.all(sessionsToDelete.splice(0).map((sessionId) => redis.del(`session:${sessionId}`)))
+    await Promise.all(sessionsToDelete.splice(0).map((sessionId) => (
+      redis.del(`session:v2:${computeCredentialDigest(sessionId).digest.toString('hex')}`)
+    )))
     for (const taskId of approvalTasksToRemove.splice(0)) {
       await redis.lrem('forge:approvals', 0, JSON.stringify({ taskId, action: 'approve' }))
     }

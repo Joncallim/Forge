@@ -3,9 +3,9 @@ import type { NextRequest } from 'next/server'
 import { and, eq } from 'drizzle-orm'
 import { db } from '@/db'
 import { approvalGates, artifacts, tasks, workPackages } from '@/db/schema'
-import { getSession } from '@/lib/session'
+import { getSession, readSessionCredential } from '@/lib/session'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
-import { recordHistoryRead } from '@/lib/mcps/history-reader'
+import { readArchitectPlanHistory } from '@/lib/mcps/history-reader'
 import type { McpExecutionDesign } from '@/worker/mcp-execution-design'
 import {
   buildMcpOperatorReview,
@@ -78,13 +78,19 @@ export async function GET(
     const existing = await getAccessibleTask(taskId, session.userId)
     if (!existing) return NextResponse.json({ error: 'Task not found' }, { status: 404 })
 
-    await recordHistoryRead({
-      planVersion: '1',
+    const sessionCredential = readSessionCredential(request)
+    if (!sessionCredential) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    const requestedVersion = new URL(request.url).searchParams.get('planVersion') ?? '1'
+    if (!/^[1-9][0-9]{0,18}$/.test(requestedVersion)) {
+      return NextResponse.json({ error: 'Invalid Architect plan version.' }, { status: 400 })
+    }
+    const entries = await readArchitectPlanHistory({
+      planVersion: requestedVersion,
+      sessionCredential,
       taskId,
-      userId: session.userId,
-    }).catch(() => {})
+    })
 
-    return NextResponse.json({ taskId, planReview: null })
+    return NextResponse.json({ taskId, planVersion: requestedVersion, entries })
   } catch (err) {
     console.error('[mcp-plan-review GET] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

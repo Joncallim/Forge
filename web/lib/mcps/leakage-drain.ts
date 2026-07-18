@@ -1,4 +1,4 @@
-const PROMPT_BEARING_KEYS = new Set([
+const PROMPT_BEARING_KEY_ALIASES = [
   'prompt',
   'system_prompt',
   'systemPrompt',
@@ -13,9 +13,9 @@ const PROMPT_BEARING_KEYS = new Set([
   'plan_body',
   'full_plan',
   'architect_plan',
-])
+] as const
 
-const SECRET_KEYS = new Set([
+const SECRET_KEY_ALIASES = [
   'apiKey',
   'api_key',
   'token',
@@ -34,7 +34,14 @@ const SECRET_KEYS = new Set([
   'encryption_key',
   'signingKey',
   'signing_key',
-])
+] as const
+
+function normalizeKey(key: string): string {
+  return key.toLowerCase().replace(/[_-]/g, '')
+}
+
+const PROMPT_BEARING_KEYS = new Set(PROMPT_BEARING_KEY_ALIASES.map(normalizeKey))
+const SECRET_KEYS = new Set(SECRET_KEY_ALIASES.map(normalizeKey))
 
 const BYTE_LIMIT = 65536
 
@@ -45,9 +52,9 @@ export function byteCount(input: string): number {
 }
 
 export function isPromptBearingKey(key: string): boolean {
-  const lower = key.toLowerCase().replace(/[_-]/g, '')
+  const lower = normalizeKey(key)
   for (const prefix of PROMPT_BEARING_KEYS) {
-    if (lower === prefix || lower.startsWith(prefix + '_') || lower.endsWith('_' + prefix)) {
+    if (lower === prefix || lower.startsWith(prefix) || lower.endsWith(prefix)) {
       return true
     }
   }
@@ -55,7 +62,7 @@ export function isPromptBearingKey(key: string): boolean {
 }
 
 export function isSecretKey(key: string): boolean {
-  const lower = key.toLowerCase().replace(/[_-]/g, '')
+  const lower = normalizeKey(key)
   for (const prefix of SECRET_KEYS) {
     if (lower === prefix || lower.startsWith(prefix) || lower.endsWith(prefix)) {
       return true
@@ -76,24 +83,25 @@ export function drainPromptLeakage(value: unknown, depth = 0): string | null {
   if (depth > DEPTH_LIMIT) return '[max depth]'
 
   if (typeof value === 'string') {
-    const lower = value.toLowerCase()
-    for (const key of PROMPT_BEARING_KEYS) {
-      if (lower.includes(key)) return '[prompt content drained]'
-    }
+    const secretProbe = value
+      .replaceAll('[REDACTED_TOKEN]', '')
+      .replaceAll('[REDACTED_SECRET]', '')
+    const secretProbeLower = secretProbe.toLowerCase()
     if (
-      /api[_-]?key[=:/]\s*\S+/.test(lower) ||
-      /bearer\s+\S+/.test(lower) ||
-      /token[=:/]\s*\S+/.test(lower) ||
-      /password[=:/]\s*\S+/.test(lower) ||
-      /secret[=:/]\s*\S+/.test(lower) ||
-      /-----begin\s+(rsa|openssh|ec|dsa|pgp)\s+private/i.test(value) ||
-      /sk-[a-zA-Z0-9]{20,}/.test(value) ||
-      /ghp_[a-zA-Z0-9]{36}/.test(value) ||
-      /gho_[a-zA-Z0-9]{36}/.test(value) ||
-      /ghu_[a-zA-Z0-9]{36}/.test(value) ||
-      /ghs_[a-zA-Z0-9]{36}/.test(value) ||
-      /ghr_[a-zA-Z0-9]{36}/.test(value) ||
-      /xox[bprsa]-[a-zA-Z0-9-]+/.test(value)
+      /(?:system[_ -]?prompt|user[_ -]?prompt|assistant[_ -]?prompt|plan[_ -]?body|full[_ -]?plan|architect[_ -]?plan)\s*[:=]/i.test(value) ||
+      /api[_-]?key[=:/]\s*\S+/.test(secretProbeLower) ||
+      /bearer\s+\S+/.test(secretProbeLower) ||
+      /token[=:/]\s*\S+/.test(secretProbeLower) ||
+      /password[=:/]\s*\S+/.test(secretProbeLower) ||
+      /secret[=:/]\s*\S+/.test(secretProbeLower) ||
+      /-----begin\s+(rsa|openssh|ec|dsa|pgp)\s+private/i.test(secretProbe) ||
+      /sk-[a-zA-Z0-9]{20,}/.test(secretProbe) ||
+      /ghp_[a-zA-Z0-9]{36}/.test(secretProbe) ||
+      /gho_[a-zA-Z0-9]{36}/.test(secretProbe) ||
+      /ghu_[a-zA-Z0-9]{36}/.test(secretProbe) ||
+      /ghs_[a-zA-Z0-9]{36}/.test(secretProbe) ||
+      /ghr_[a-zA-Z0-9]{36}/.test(secretProbe) ||
+      /xox[bprsa]-[a-zA-Z0-9-]+/.test(secretProbe)
     ) {
       return '[secret value drained]'
     }
@@ -163,7 +171,7 @@ export function sanitizePromptPayload(payload: Record<string, unknown>): Record<
       const drained = drainPromptLeakage(value)
       if (drained !== null) result[key] = drained
     } else if (typeof value === 'string') {
-      result[key] = truncateUtf8Safe(value, 8192)
+      result[key] = drainPromptLeakage(value) ?? '[content drained]'
     } else {
       result[key] = value
     }

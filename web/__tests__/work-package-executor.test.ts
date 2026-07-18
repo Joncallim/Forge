@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   getModel: vi.fn(),
   publishTaskEvent: vi.fn(),
   recordTaskLogBestEffort: vi.fn(),
+  claimPacketAuthorization: vi.fn(),
 }))
 
 vi.mock('ai', () => ({
@@ -38,6 +39,10 @@ vi.mock('@/worker/events', () => ({
 
 vi.mock('@/worker/task-logs', () => ({
   recordTaskLogBestEffort: mocks.recordTaskLogBestEffort,
+}))
+
+vi.mock('@/lib/mcps/s4-protocol-store', () => ({
+  claimPacketAuthorization: mocks.claimPacketAuthorization,
 }))
 
 vi.mock('@/worker/execution-context-packet', async (importOriginal) => {
@@ -122,9 +127,22 @@ function context(overrides: Partial<WorkPackageExecutionContext> = {}): WorkPack
       },
     }
     : defaultWorkPackage
+  const workPackageMetadata = workPackage.metadata && typeof workPackage.metadata === 'object'
+    ? workPackage.metadata as Record<string, unknown>
+    : {}
+  const phases = workPackageMetadata.mcpGrantPhases && typeof workPackageMetadata.mcpGrantPhases === 'object'
+    ? workPackageMetadata.mcpGrantPhases as Record<string, unknown>
+    : null
+  const effective = phases?.effective && typeof phases.effective === 'object'
+    ? phases.effective as Record<string, unknown>
+    : null
+  if (effective?.source === 'explicit-grant-approval' && !effective.grantApprovalId) {
+    effective.grantApprovalId = '00000000-0000-4000-8000-000000000020'
+  }
 
   return {
     agentConfig: null,
+    agentRunId: '00000000-0000-4000-8000-000000000010',
     validatedProjectRoot: tempRoot,
     model: { provider: 'test', modelId: 'test-model' } as never,
     modelIdUsed: 'test-model',
@@ -408,6 +426,11 @@ describe('executeWorkPackage', () => {
     mocks.dbUpdate.mockReturnValue({ set: mocks.dbUpdateSet })
     mocks.dbUpdateSet.mockReturnValue({ where: mocks.dbUpdateWhere })
     mocks.dbUpdateWhere.mockResolvedValue(undefined)
+    mocks.claimPacketAuthorization.mockResolvedValue({
+      auditId: '00000000-0000-4000-8000-000000000030',
+      claimToken: '00000000-0000-4000-8000-000000000031',
+      localRunEvidenceId: '00000000-0000-4000-8000-000000000032',
+    })
     tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-executor-test-'))
   })
 
@@ -1067,15 +1090,11 @@ describe('executeWorkPackage', () => {
         status: 'issued',
       }),
     })
-    const auditPayload = mocks.dbInsertValues.mock.calls
-      .map((call) => call[0] as Record<string, unknown>)
-      .find((payload) => payload.status === 'issued')
-    expect(auditPayload).toMatchObject({
-      requestedCapabilities: ['filesystem.project.read', 'filesystem.project.search'],
-      status: 'issued',
-    })
-    expect(auditPayload?.metadata).toMatchObject({
-      omittedOptionalCapabilities: ['filesystem.project.search'],
+    expect(mocks.claimPacketAuthorization).toHaveBeenCalledWith(expect.objectContaining({
+      requiredCapabilities: ['filesystem.project.read'],
+    }))
+    expect(result.executionContextArtifactMetadata).toMatchObject({
+      packetAuthorizationAuditId: '00000000-0000-4000-8000-000000000030',
     })
   })
 
@@ -1824,21 +1843,13 @@ describe('executeWorkPackage', () => {
       }),
       redaction: expect.objectContaining({ applied: true }),
     })
-    const auditPayload = mocks.dbInsertValues.mock.calls
-      .map((call) => call[0] as Record<string, unknown>)
-      .find((payload) => payload.status === 'issued')
-    expect(auditPayload).toMatchObject({
-      capabilities: ['filesystem.project.read'],
-      fileCount: 1,
-      omittedCount: expect.any(Number),
-      redactionApplied: true,
-      requestedCapabilities: ['filesystem.project.read'],
-      root: tempRoot,
-      status: 'issued',
-      taskId: 'task-1',
-      workPackageId: 'pkg-1',
+    expect(mocks.claimPacketAuthorization).toHaveBeenCalledWith(expect.objectContaining({
+      requiredCapabilities: ['filesystem.project.read'],
+    }))
+    expect(result.executionContextArtifactMetadata).toMatchObject({
+      packetAuthorizationAuditId: '00000000-0000-4000-8000-000000000030',
     })
-    expect(JSON.stringify(auditPayload)).not.toContain('should-not-leak')
+    expect(JSON.stringify(result.executionContextArtifactMetadata)).not.toContain('should-not-leak')
   })
 
   it('audits blocked filesystem context when required grants are missing', async () => {

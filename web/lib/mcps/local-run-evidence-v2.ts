@@ -42,6 +42,7 @@ export type LocalEffectRecoveryMarkerV1 = {
       disposition: 'review_local_changes'
       nextDisposition: 'retry_local_execution' | 'acknowledge_possible_local_invocation' | 'dependent_packet'
       reviewState: 'review_required'
+      invocationAttemptId?: string
     }
   | {
       reason: LocalReviewReason
@@ -178,10 +179,14 @@ export function parseLocalEffectRecoveryMarker(value: unknown): LocalEffectRecov
   if (!isRecord(value) || !commonRecovery(value)) return null
   const reason = value.reason
   const reviewReason = reason === 'host_apply_requires_review' || reason === 'repository_change_requires_review' || reason === 'host_and_repository_change_require_review'
+  const reviewKeys = value.nextDisposition === 'acknowledge_possible_local_invocation'
+    ? [...RECOVERY_COMMON_KEYS, 'nextDisposition', 'invocationAttemptId']
+    : [...RECOVERY_COMMON_KEYS, 'nextDisposition']
   if (
-    exactKeys(value, [...RECOVERY_COMMON_KEYS, 'nextDisposition']) &&
+    exactKeys(value, reviewKeys) &&
     reviewReason && value.disposition === 'review_local_changes' && value.reviewState === 'review_required' &&
-    ['retry_local_execution', 'acknowledge_possible_local_invocation', 'dependent_packet'].includes(value.nextDisposition as string)
+    ['retry_local_execution', 'acknowledge_possible_local_invocation', 'dependent_packet'].includes(value.nextDisposition as string) &&
+    (value.nextDisposition !== 'acknowledge_possible_local_invocation' || uuid(value.invocationAttemptId))
   ) return value as LocalEffectRecoveryMarkerV1
   if (exactKeys(value, RECOVERY_COMMON_KEYS) && reviewReason && value.disposition === 'retry_local_execution' && value.reviewState === 'reviewed') {
     return value as LocalEffectRecoveryMarkerV1

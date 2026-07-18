@@ -43,6 +43,8 @@ import {
 } from './work-package-handoff'
 import { completeTaskIfReviewGatesSatisfied } from './review-gates'
 import { sanitizeWorkerMessage } from './redaction'
+import { recordArchitectPlanVersion } from '../lib/mcps/s4-protocol-store'
+import { ARCHITECT_PLAN_HEADER } from '../lib/mcps/architect-plan-entries'
 
 type TaskRow = typeof tasks.$inferSelect
 type ProjectRow = typeof projects.$inferSelect
@@ -480,21 +482,52 @@ async function createArtifact(
   taskId: string,
   agentRunId: string,
   content: string,
+  planVersion: string,
   metadataExtra: Record<string, unknown> = {},
 ): Promise<typeof artifacts.$inferSelect> {
-  const [artifact] = await db
-    .insert(artifacts)
-    .values({
-      agentRunId,
-      artifactType: 'adr_text',
+  const keyHex = process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX?.trim() ?? ''
+  const digestKeyId = process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID?.trim() ?? ''
+  if (!/^[0-9a-f]{64,}$/.test(keyHex) || keyHex.length % 2 !== 0) {
+    throw new Error('FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX must be an even-length lowercase hex key of at least 32 bytes.')
+  }
+  if (!/^[a-z0-9._-]{1,64}$/.test(digestKeyId)) {
+    throw new Error('FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID is required for protected Architect history.')
+  }
+  const protectedPlan = await recordArchitectPlanVersion({
+    agentRunId,
+    digestKey: Buffer.from(keyHex, 'hex'),
+    digestKeyId,
+    entries: [{
+      agent: null,
+      bindingFingerprint: null,
       content,
+      entryId: 'plan_body:000000',
+      entryKind: 'plan_body',
+      projectionEligible: false,
+      requirementKey: null,
+    }],
+    planVersion,
+    taskId,
+  })
+  const [artifact] = await db
+    .update(artifacts)
+    .set({
       metadata: {
         stage: 'architect_plan',
         generatedBy: 'forge-worker',
+        historyAvailable: true,
+        planVersion,
+        entryCount: protectedPlan.entries.length,
+        entrySetDigest: protectedPlan.entrySetDigest,
         ...metadataExtra,
       },
     })
+    .where(eq(artifacts.id, protectedPlan.artifactId))
     .returning()
+
+  if (!artifact || artifact.content !== ARCHITECT_PLAN_HEADER) {
+    throw new Error('Protected Architect artifact did not retain the safe public header.')
+  }
 
   await publishTaskEvent(taskId, 'artifact:created', {
     id: artifact.id,
@@ -522,6 +555,13 @@ async function createArtifact(
   })
 
   return artifact
+}
+
+function planTextFromCheckpoint(checkpoint: ArchitectResumeCheckpoint | null): string | null {
+  if (!checkpoint) return null
+  const match = /(?:^|\n)## Plan Artifact\n\n([\s\S]*?)(?=\n\n## Open Questions(?:\n|$))/.exec(checkpoint.markdown)
+  const plan = match?.[1]?.trim() ?? ''
+  return plan && plan !== 'No plan artifact was produced before this checkpoint.' ? plan : null
 }
 
 /**
@@ -636,9 +676,9 @@ async function runArchitect(
   if (!model) {
     throw new Error(`Provider config ${providerConfigId} is missing or inactive`)
   }
-  const previousPlanArtifact = await loadLatestPlanArtifact(task.id)
-  const previousPlan = previousPlanArtifact?.content ?? null
   const resumeCheckpoint = await readLatestArchitectCheckpointSafely(task.id)
+  const previousPlanArtifact = await loadLatestPlanArtifact(task.id)
+  const previousPlan = planTextFromCheckpoint(resumeCheckpoint)
   const startedAt = new Date()
   const [run] = await db
     .insert(agentRuns)
@@ -841,7 +881,11 @@ async function runArchitect(
         title: 'Plan regenerated',
       })
     }
-    const artifact = await createArtifact(task.id, run.id, artifactPlanText, {
+    const previousVersion = previousPlanArtifact?.metadata.planVersion
+    const planVersion = typeof previousVersion === 'string' && /^[1-9][0-9]*$/.test(previousVersion)
+      ? (BigInt(previousVersion) + BigInt(1)).toString()
+      : '1'
+    const artifact = await createArtifact(task.id, run.id, artifactPlanText, planVersion, {
       openQuestionCount: prepared.questions.length,
       regeneratedFromPlan: regeneratedPlanReason !== null,
       regeneratedPlanReason,

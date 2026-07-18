@@ -1,32 +1,32 @@
-import { eq, and } from 'drizzle-orm'
+import { and, asc, eq, sql } from 'drizzle-orm'
 import { db } from '@/db'
 import { workPackageLocalProjectionHeads } from '@/db/schema'
 import {
+  CURRENT_LOCAL_PROJECTION_HEAD_KINDS,
   isLocalProjectionHeadKind,
-  assertProjectionHeadNotDeleted,
-  projectionHeadFingerprint,
+  projectionHeadCompareAndSetFingerprint,
+  projectionSourceFingerprint,
   type LocalProjectionHeadKind,
-  type ProjectionHeadState,
 } from './local-projection-heads'
 
 type HeadRow = typeof workPackageLocalProjectionHeads.$inferSelect
 
-export type ProjectionHeadAdvancement = {
-  workPackageId: string
-  kind: LocalProjectionHeadKind
+export type ProjectionHeadAdvancement = Readonly<{
+  contribution: Readonly<Record<string, unknown>>
   expectedFingerprint: string
-  expectedVersion: bigint
-  newState: ProjectionHeadState
-  leaseToken?: string | null
-  expiresAt?: Date | null
-}
+  expectedRevision: bigint
+  kind: LocalProjectionHeadKind
+  sourceId: string
+  taskId: string
+  workPackageId: string
+}>
 
-export type ProjectionHeadAdvancementResult = {
-  headId: string
+export type ProjectionHeadAdvancementResult = Readonly<{
   advanced: boolean
-  newVersion: bigint
+  headId: string
   newFingerprint: string
-}
+  newRevision: bigint
+}>
 
 export async function advanceLocalProjectionHead(
   input: ProjectionHeadAdvancement,
@@ -34,63 +34,51 @@ export async function advanceLocalProjectionHead(
   if (!isLocalProjectionHeadKind(input.kind)) {
     throw new Error(`Invalid projection head kind: ${input.kind}`)
   }
-  const now = new Date()
-  const [head] = await db
-    .select()
-    .from(workPackageLocalProjectionHeads)
-    .where(
-      and(
-        eq(workPackageLocalProjectionHeads.workPackageId, input.workPackageId),
-        eq(workPackageLocalProjectionHeads.headKind, input.kind),
-      ),
-    )
-    .limit(1)
-
-  if (!head) {
-    throw new Error(`Missing projection head: ${input.kind} for package ${input.workPackageId}`)
-  }
-  assertProjectionHeadNotDeleted(head)
-
-  if (
-    head.headFingerprint !== input.expectedFingerprint ||
-    head.headVersion !== input.expectedVersion
-  ) {
-    return { headId: head.id, advanced: false, newVersion: head.headVersion, newFingerprint: head.headFingerprint }
-  }
-
-  const newVersion = head.headVersion + BigInt(1)
-  const newFingerprint = projectionHeadFingerprint({
-    headId: head.id,
-    taskId: head.taskId,
-    workPackageId: head.workPackageId,
+  const sourceRevision = input.expectedRevision + BigInt(1)
+  const sourceFingerprint = projectionSourceFingerprint({
+    contribution: input.contribution,
     kind: input.kind,
-    index: Number(head.headIndex),
+    revision: sourceRevision,
+    sourceId: input.sourceId,
+    taskId: input.taskId,
+    workPackageId: input.workPackageId,
+  })
+  const nextFingerprint = projectionHeadCompareAndSetFingerprint({
+    headFingerprint: `head:v1:${input.taskId}:${input.workPackageId}:${input.kind}:${
+      CURRENT_LOCAL_PROJECTION_HEAD_KINDS.indexOf(input.kind)
+    }`,
+    revision: sourceRevision,
+    sourceFingerprint,
   })
 
-  const [updated] = await db
-    .update(workPackageLocalProjectionHeads)
-    .set({
-      state: input.newState,
-      headVersion: newVersion,
-      headFingerprint: newFingerprint,
-      leaseToken: input.leaseToken ?? null,
-      expiresAt: input.expiresAt ?? null,
-      updatedAt: now,
-    })
-    .where(
-      and(
-        eq(workPackageLocalProjectionHeads.id, head.id),
-        eq(workPackageLocalProjectionHeads.headFingerprint, input.expectedFingerprint),
-        eq(workPackageLocalProjectionHeads.headVersion, input.expectedVersion),
-      ),
+  const rows = await db.execute<{
+    advanced: boolean
+    headId: string
+    headRevision: bigint
+    compareAndSetFingerprint: string
+  }>(sql`
+    select *
+    from forge.advance_local_projection_head_v1(
+      ${input.taskId}::uuid,
+      ${input.workPackageId}::uuid,
+      ${input.kind}::text,
+      ${input.sourceId}::uuid,
+      ${sourceRevision}::bigint,
+      ${sourceFingerprint}::text,
+      ${JSON.stringify(input.contribution)}::jsonb,
+      ${input.expectedRevision}::bigint,
+      ${input.expectedFingerprint}::text,
+      ${nextFingerprint}::text
     )
-    .returning()
-
-  if (!updated) {
-    return { headId: head.id, advanced: false, newVersion: head.headVersion, newFingerprint: head.headFingerprint }
+  `)
+  const [result] = rows
+  if (!result) throw new Error('Projection-head advancement returned no result.')
+  return {
+    advanced: result.advanced,
+    headId: result.headId,
+    newFingerprint: result.compareAndSetFingerprint,
+    newRevision: result.headRevision,
   }
-
-  return { headId: updated.id, advanced: true, newVersion, newFingerprint }
 }
 
 export async function readProjectionHead(input: {
@@ -100,12 +88,10 @@ export async function readProjectionHead(input: {
   const [head] = await db
     .select()
     .from(workPackageLocalProjectionHeads)
-    .where(
-      and(
-        eq(workPackageLocalProjectionHeads.workPackageId, input.workPackageId),
-        eq(workPackageLocalProjectionHeads.headKind, input.kind),
-      ),
-    )
+    .where(and(
+      eq(workPackageLocalProjectionHeads.workPackageId, input.workPackageId),
+      eq(workPackageLocalProjectionHeads.headKind, input.kind),
+    ))
     .limit(1)
   return head ?? null
 }
@@ -117,11 +103,12 @@ export async function readTaskProjectionHeads(input: {
   return db
     .select()
     .from(workPackageLocalProjectionHeads)
-    .where(
-      and(
-        eq(workPackageLocalProjectionHeads.taskId, input.taskId),
-        eq(workPackageLocalProjectionHeads.headKind, input.kind),
-      ),
+    .where(and(
+      eq(workPackageLocalProjectionHeads.taskId, input.taskId),
+      eq(workPackageLocalProjectionHeads.headKind, input.kind),
+    ))
+    .orderBy(
+      asc(workPackageLocalProjectionHeads.workPackageId),
+      asc(workPackageLocalProjectionHeads.headIndex),
     )
-    .orderBy(eq(workPackageLocalProjectionHeads.headIndex, workPackageLocalProjectionHeads.headIndex))
 }

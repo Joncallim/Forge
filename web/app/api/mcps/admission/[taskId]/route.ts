@@ -1,72 +1,15 @@
 import 'server-only'
-import { NextResponse } from 'next/server'
-import type { NextRequest } from 'next/server'
-import { asc, eq } from 'drizzle-orm'
-import { db } from '@/db'
-import { workPackages } from '@/db/schema'
-import { getSession } from '@/lib/session'
-import { getAccessibleTask } from '@/lib/task-access'
-import {
-  computeFreshnessFingerprint,
-  type S5AdmissionPresenter,
-  type S5PackagePresenter,
-} from '@/lib/mcps/s5-server-reader'
-import { summarizeFilesystemCapabilities } from '@/lib/mcps/filesystem-grants'
-import { parseFilesystemGrantBlockMetadata } from '@/lib/mcps/filesystem-grant-lifecycle'
+import { NextResponse, type NextRequest } from 'next/server'
+import { admissionProjection } from '@/lib/mcps/s5-server-reader'
+import { readAuthorizedS5State, S5RouteAuthorizationError } from '@/lib/mcps/s5-route'
 
-export async function GET(
-  request: NextRequest,
-  { params }: { params: Promise<{ taskId: string }> },
-) {
+export async function GET(request: NextRequest, { params }: { params: Promise<{ taskId: string }> }) {
   try {
-    const session = await getSession(request)
-    if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-
     const { taskId } = await params
-    const task = await getAccessibleTask(taskId, session.userId)
-    if (!task || task.submittedBy !== session.userId) {
-      return NextResponse.json({ error: 'Task not found' }, { status: 404 })
-    }
-    const pkgRecords = await db
-      .select()
-      .from(workPackages)
-      .where(eq(workPackages.taskId, taskId))
-      .orderBy(asc(workPackages.sequence))
-
-    const pkgPresenters: S5PackagePresenter[] = pkgRecords.map((pkg) => {
-      const summary = summarizeFilesystemCapabilities({
-        mcpRequirements: pkg.mcpRequirements,
-        metadata: pkg.metadata,
-      })
-      const meta = pkg.metadata as Record<string, unknown> | null
-      const blockMeta = meta ? parseFilesystemGrantBlockMetadata(meta) : null
-      return {
-        workPackageId: pkg.id,
-        title: pkg.title,
-        assignedRole: pkg.assignedRole,
-        status: pkg.status,
-        requestedCapabilities: summary.requestedCapabilities,
-        boundedRuntimeRequestedCapabilities: summary.boundedRuntimeRequestedCapabilities,
-        blockingCapabilities: summary.blockingCapabilities,
-        currentDecision: null,
-        blockMetadata: blockMeta,
-        pointerFingerprint: null,
-        pointerVersion: null,
-      }
-    })
-
-    const presenter: S5AdmissionPresenter = {
-      computedAt: new Date().toISOString(),
-      freshnessFingerprint: computeFreshnessFingerprint({ taskId, packageIds: pkgRecords.map((p) => p.id) }),
-      cacheBypassId: '',
-      taskId,
-      packages: pkgPresenters,
-      projectGrant: null,
-    }
-
-    return NextResponse.json(presenter)
-  } catch (err) {
-    console.error('[mcps/admission GET] Unexpected error', err)
+    return NextResponse.json(admissionProjection((await readAuthorizedS5State(request, taskId)).state))
+  } catch (error) {
+    if (error instanceof S5RouteAuthorizationError) return NextResponse.json({ error: error.message }, { status: error.status })
+    console.error('[mcps/admission GET] Unexpected error', error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
