@@ -6,6 +6,7 @@ import {
   artifacts,
   projects,
   repositoryCommandAudits,
+  taskLocalProjectionScopes,
   tasks,
   vcsChanges,
   workPackageDependencies,
@@ -119,6 +120,8 @@ type HandoffOptions = {
   afterMcpHealthCaptured?: (input: { attempt: number; packageId: string; projectId: string }) => Promise<void>
   /** Integration seam for a concurrent write after the execution lease is committed. */
   afterWorkPackageClaimed?: (input: { attempt: number; packageId: string; runId: string }) => Promise<void>
+  /** Integration seam for deterministic contention after the production claim owns canonical rows. */
+  afterWorkPackageClaimRowsLocked?: (input: { backendPid: number; packageId: string }) => Promise<void>
   /** Integration seam for a policy writer that acquires its project lock immediately before claim persistence. */
   beforeWorkPackageClaimPersisted?: (input: { attempt: number; packageId: string; projectId: string }) => Promise<void>
   claimEnabled?: boolean
@@ -290,8 +293,14 @@ async function lockFreshMcpHandoffInputs(
   tx: WorkPackageLeaseTransaction,
   taskId: string,
   pkgSnapshot: HandoffPackage,
-  projectSnapshot: McpProjectFreshnessSnapshot,
+  projectSnapshot?: McpProjectFreshnessSnapshot,
 ): Promise<boolean> {
+  const projectId = projectSnapshot?.id ?? (await tx
+    .select({ projectId: tasks.projectId })
+    .from(tasks)
+    .where(eq(tasks.id, taskId))
+    .limit(1))[0]?.projectId
+  if (!projectId) return false
   const [lockedProject] = await tx
     .select({
       id: projects.id,
@@ -301,9 +310,12 @@ async function lockFreshMcpHandoffInputs(
       rootBindingRevision: projects.rootBindingRevision,
     })
     .from(projects)
-    .where(eq(projects.id, projectSnapshot.id))
+    .where(eq(projects.id, projectId))
     .for('update')
-  if (!lockedProject || !mcpProjectSnapshotsMatch(projectSnapshot, lockedProject)) return false
+  if (
+    !lockedProject
+    || (projectSnapshot && !mcpProjectSnapshotsMatch(projectSnapshot, lockedProject))
+  ) return false
 
   const [lockedTask] = await tx
     .select({ id: tasks.id, projectId: tasks.projectId })
@@ -311,8 +323,13 @@ async function lockFreshMcpHandoffInputs(
     .where(and(eq(tasks.id, taskId), eq(tasks.projectId, lockedProject.id)))
     .for('update')
   if (!lockedTask) return false
+  const [lockedScope] = await tx
+    .select({ state: taskLocalProjectionScopes.localProjectionScopeState })
+    .from(taskLocalProjectionScopes)
+    .where(eq(taskLocalProjectionScopes.id, taskId))
+  if (lockedScope?.state !== 'active') return false
 
-  const [lockedPackage] = await tx
+  const lockedPackages = await tx
     .select({
       assignedRole: workPackages.assignedRole,
       blockedReason: workPackages.blockedReason,
@@ -326,8 +343,10 @@ async function lockFreshMcpHandoffInputs(
       updatedAt: workPackages.updatedAt,
     })
     .from(workPackages)
-    .where(and(eq(workPackages.id, pkgSnapshot.id), eq(workPackages.taskId, taskId)))
+    .where(eq(workPackages.taskId, taskId))
+    .orderBy(workPackages.id)
     .for('update')
+  const lockedPackage = lockedPackages.find((pkg) => pkg.id === pkgSnapshot.id)
   return Boolean(lockedPackage && mcpPackageSnapshotsMatch(pkgSnapshot, lockedPackage))
 }
 
@@ -692,6 +711,11 @@ export function computeReadyWorkPackageIds(
 }
 
 async function loadHandoffState(taskId: string): Promise<HandoffState> {
+  const [taskScope] = await db
+    .select({ localProjectionScopeState: taskLocalProjectionScopes.localProjectionScopeState })
+    .from(taskLocalProjectionScopes)
+    .where(eq(taskLocalProjectionScopes.id, taskId))
+    .limit(1)
   const packageRows = await db
     .select({
       id: workPackages.id,
@@ -709,11 +733,11 @@ async function loadHandoffState(taskId: string): Promise<HandoffState> {
     .where(eq(workPackages.taskId, taskId))
     .orderBy(asc(workPackages.sequence), asc(workPackages.createdAt))
 
-  if (packageRows.length === 0) {
+  if (packageRows.length === 0 || taskScope?.localProjectionScopeState !== 'active') {
     return {
       alreadyRunningPackage: null,
       nextPackage: null,
-      packages: [],
+      packages: packageRows,
       readyPackageIds: [],
     }
   }
@@ -1715,6 +1739,7 @@ export async function handoffApprovedWorkPackages(
   if (isWorkPackageExecutionEnabled()) {
     return executeReadyWorkPackage(taskId, nextPackage, allowedReadyPackageIds, {
       afterWorkPackageClaimed: options.afterWorkPackageClaimed,
+      afterWorkPackageClaimRowsLocked: options.afterWorkPackageClaimRowsLocked,
       beforeWorkPackageClaimPersisted: options.beforeWorkPackageClaimPersisted,
       claimEnabled,
       finalAttempt: options.finalAttempt,
@@ -1745,12 +1770,17 @@ export async function handoffApprovedWorkPackages(
     })
   }
   const handoff = await db.transaction(async (tx) => {
-    if (projectSnapshot && !await lockFreshMcpHandoffInputs(
+    if (!await lockFreshMcpHandoffInputs(
       tx,
       taskId,
       nextPackage,
       projectSnapshot,
     )) return null
+    const [claimBackend] = await tx.execute(sql<{ pid: number }>`select pg_backend_pid()::integer as pid`)
+    await options.afterWorkPackageClaimRowsLocked?.({
+      backendPid: Number((claimBackend as { pid: number }).pid),
+      packageId: nextPackage.id,
+    })
 
     const [claimed] = await tx
       .update(workPackages)
@@ -2045,12 +2075,17 @@ async function executeReadyWorkPackage(
     })
   }
   const claim = await db.transaction(async (tx) => {
-    if (projectSnapshot && !await lockFreshMcpHandoffInputs(
+    if (!await lockFreshMcpHandoffInputs(
       tx,
       taskId,
       nextPackage,
       projectSnapshot,
     )) return { status: 'already_handed_off' as const }
+    const [claimBackend] = await tx.execute(sql<{ pid: number }>`select pg_backend_pid()::integer as pid`)
+    await options.afterWorkPackageClaimRowsLocked?.({
+      backendPid: Number((claimBackend as { pid: number }).pid),
+      packageId: nextPackage.id,
+    })
 
     const [claimed] = await tx
       .update(workPackages)

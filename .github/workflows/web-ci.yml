@@ -124,7 +124,9 @@ jobs:
                   'forge_epic_172_release_evidence_consumptions',
                   'forge_epic_172_enablement_state',
                   'forge_epic_172_enablement_transition_audits',
-                  'forge_epic_172_s3_release_state'
+                  'forge_epic_172_s3_release_state',
+                  'work_package_local_projection_sources',
+                  'work_package_local_projection_heads'
                 ])
             LOOP
               EXECUTE format(
