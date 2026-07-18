@@ -1,0 +1,53 @@
+name: MCP Host Boundary (trusted handoff)
+
+on:
+  workflow_dispatch:
+    inputs:
+      reviewed_sha:
+        description: Exact trusted merge-queue or release commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-host-boundary-${{ inputs.reviewed_sha }}
+  cancel-in-progress: false
+
+jobs:
+  trusted-host-boundary:
+    # This Actions job is not the required release check. The independently
+    # installed controller GitHub App owns forge/host-boundary-controller.
+    environment: forge-host-boundary-release
+    runs-on: [self-hosted, linux, x64, forge-host-boundary]
+    timeout-minutes: 15
+    steps:
+      - name: Check out the reviewed commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.reviewed_sha }}
+          persist-credentials: false
+
+      - name: Use the immutable offline dependency cache
+        working-directory: web
+        run: npm ci --offline --ignore-scripts
+
+      - name: Verify the signed supported-host preflight
+        working-directory: web
+        run: npm run preflight:mcp:host-boundary
+
+      - name: Run the fixed host-boundary partition
+        working-directory: web
+        env:
+          FORGE_HOST_BOUNDARY_CONTROLLER_CHALLENGE: /run/forge-host-boundary/controller-challenge.json
+          FORGE_HOST_BOUNDARY_DRIVER_SOCKET: /run/forge-host-boundary/scenario.sock
+        run: npm run test:mcp:host-boundary
+
+      - name: Report advisory runner completion
+        if: always()
+        run: echo HOST_BOUNDARY_RUNNER_PROCESS_ENDED
+
+      # No checkout-owned cleanup or artifact upload can make the release gate
+      # green. The external controller verifies signed teardown evidence and
+      # destroys/reimages the VM out of band before concluding its Check Run.

@@ -38,7 +38,7 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
     classification: 'signed-activation-required',
   },
   {
-    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::mcp-admission.real-approval-route: concurrent reapproval has one CAS winner and immutable history',
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::mcp-admission.real-approval-route: authenticated route stays fail-closed and service CAS preserves immutable history',
     classification: 'run-disabled-safe',
   },
   {
@@ -164,6 +164,50 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
   {
     id: 'task-detail-controls.spec.ts::refreshes a stale pointer and waits for a second explicit confirmation',
     classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.cgroup-descendant-containment',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.failure-injection-quiescence',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.peer-credential-boundary',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.protected-fence-service',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.supported-host-preflight',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.teardown-zero-residue',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-host-boundary.spec.ts::epic-172.uid-credential-isolation',
+    classification: 'signed-activation-required',
+  },
+  {
+    id: 'mcp-issuance.spec.ts::mcp-admission.allow-once-single-winner',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'mcp-issuance.spec.ts::mcp-admission.always-allow-single-run-claim',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'mcp-issuance.spec.ts::mcp-admission.failure-recovery-atomicity',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'mcp-operator-recovery.spec.ts::mcp-admission.operator-recovery: presents authenticated filesystem recovery controls',
+    classification: 'run-disabled-safe',
   },
 ] as const satisfies readonly Epic172Step0E2EEntry[]
 
