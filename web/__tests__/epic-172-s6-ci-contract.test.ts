@@ -45,6 +45,21 @@ describe('Epic 172 S6 trusted CI wiring', () => {
     expect(workflow).not.toContain('web/test-results')
   })
 
+  it('keeps dedicated manifest projects out of the repository-wide Playwright smoke', () => {
+    expect(packageJson.scripts.e2e).toBe(
+      'playwright test --project=chromium-desktop --project=chromium-mobile',
+    )
+    for (const project of [
+      'mcp-postgres',
+      'mcp-issuance',
+      'mcp-operator-desktop',
+      'mcp-operator-mobile',
+      'mcp-host-boundary',
+    ]) {
+      expect(packageJson.scripts.e2e).not.toContain(project)
+    }
+  })
+
   it('keeps every controller mutation behind the fixed external socket and documented exact commands', async () => {
     const guide = await readFile(path.join(repositoryRoot, 'docs/operators/host-boundary-controller-v2.md'), 'utf8')
     const commands = [

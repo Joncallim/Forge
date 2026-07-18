@@ -49,7 +49,7 @@
     "protocol:retry-host-boundary-controller-check": "node scripts/host-boundary-controller-cli.mjs retry",
     "protocol:rotate-host-boundary-controller-key": "node scripts/host-boundary-controller-cli.mjs rotate-key",
     "protocol:inspect-host-boundary-controller-key-rotation": "node scripts/host-boundary-controller-cli.mjs inspect-key-rotation",
-    "e2e": "playwright test",
+    "e2e": "playwright test --project=chromium-desktop --project=chromium-mobile",
     "e2e:epic-172-disabled-ingress": "playwright test e2e/mcp-handoff-concurrency.spec.ts --project=chromium-desktop --grep @epic172-disabled-ingress",
     "e2e:ui": "playwright test --ui",
     "test": "vitest run",

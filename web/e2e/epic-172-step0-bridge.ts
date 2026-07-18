@@ -38,7 +38,7 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
     classification: 'signed-activation-required',
   },
   {
-    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::mcp-admission.real-approval-route: concurrent reapproval has one CAS winner and immutable history',
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::mcp-admission.real-approval-route: authenticated route stays fail-closed and service CAS preserves immutable history',
     classification: 'run-disabled-safe',
   },
   {

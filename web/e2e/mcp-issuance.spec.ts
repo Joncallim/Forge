@@ -18,6 +18,49 @@ function clients() {
   }
 }
 
+type ProtocolState = {
+  enabledBuildSha: string | null
+  producersEnabled: boolean
+  protocolEpoch: string
+}
+
+async function captureProtocolState(admin: ReturnType<typeof postgres>): Promise<ProtocolState> {
+  const [state] = await admin<ProtocolState[]>`
+    select producers_enabled as "producersEnabled",
+           protocol_epoch::text as "protocolEpoch",
+           enabled_build_sha as "enabledBuildSha"
+    from epic_172_s4_protocol_state
+    where singleton
+  `
+  if (!state) throw new Error('The S4 protocol singleton is missing.')
+  return state
+}
+
+async function restoreProtocolState(
+  admin: ReturnType<typeof postgres>,
+  state: ProtocolState,
+): Promise<void> {
+  await admin`
+    update epic_172_s4_protocol_state
+    set producers_enabled = ${state.producersEnabled},
+        protocol_epoch = ${state.protocolEpoch}::bigint,
+        enabled_build_sha = ${state.enabledBuildSha}
+    where singleton
+  `
+}
+
+async function closeClients(
+  admin: ReturnType<typeof postgres>,
+  issuer: ReturnType<typeof postgres>,
+  protocolState: ProtocolState,
+): Promise<void> {
+  try {
+    await restoreProtocolState(admin, protocolState)
+  } finally {
+    await Promise.all([admin.end({ timeout: 5 }), issuer.end({ timeout: 5 })])
+  }
+}
+
 async function seedBase(admin: ReturnType<typeof postgres>) {
   const ids = {
     project: randomUUID(),
@@ -131,7 +174,8 @@ test.describe('Epic 172 manifest-bound packet issuance', () => {
     tag: '@mcp-issuance',
     annotation: { type: 'scenarioId', description: 'mcp-admission.allow-once-single-winner' },
   }, async () => {
-      const { admin, issuer } = clients()
+    const { admin, issuer } = clients()
+    const protocolState = await captureProtocolState(admin)
     try {
       const base = await seedBase(admin)
       const first = await seedPackageRun(admin, { sequence: 1, taskId: base.task })
@@ -169,7 +213,7 @@ test.describe('Epic 172 manifest-bound packet issuance', () => {
       `
       expect(counts).toEqual({ audits: 1, nonceClaims: 1 })
     } finally {
-      await Promise.all([admin.end({ timeout: 5 }), issuer.end({ timeout: 5 })])
+      await closeClients(admin, issuer, protocolState)
     }
   })
 
@@ -178,6 +222,7 @@ test.describe('Epic 172 manifest-bound packet issuance', () => {
     annotation: { type: 'scenarioId', description: 'mcp-admission.always-allow-single-run-claim' },
   }, async () => {
     const { admin, issuer } = clients()
+    const protocolState = await captureProtocolState(admin)
     try {
       const base = await seedBase(admin)
       const run = await seedPackageRun(admin, { sequence: 1, taskId: base.task })
@@ -220,7 +265,7 @@ test.describe('Epic 172 manifest-bound packet issuance', () => {
       `
       expect(counts).toEqual({ audits: 1, nonceClaims: 0 })
     } finally {
-      await Promise.all([admin.end({ timeout: 5 }), issuer.end({ timeout: 5 })])
+      await closeClients(admin, issuer, protocolState)
     }
   })
 
@@ -229,6 +274,7 @@ test.describe('Epic 172 manifest-bound packet issuance', () => {
     annotation: { type: 'scenarioId', description: 'mcp-admission.failure-recovery-atomicity' },
   }, async () => {
     const { admin, issuer } = clients()
+    const protocolState = await captureProtocolState(admin)
     try {
       const base = await seedBase(admin)
       const run = await seedPackageRun(admin, { sequence: 1, taskId: base.task })
@@ -252,7 +298,7 @@ test.describe('Epic 172 manifest-bound packet issuance', () => {
       `
       expect(counts).toEqual({ audits: 0, nonceClaims: 0 })
     } finally {
-      await Promise.all([admin.end({ timeout: 5 }), issuer.end({ timeout: 5 })])
+      await closeClients(admin, issuer, protocolState)
     }
   })
 })

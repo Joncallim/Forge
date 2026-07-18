@@ -23,6 +23,7 @@ import {
   VALID_S3_HOLD_STATES,
 } from '../test-support/filesystem-grant-marker-fixtures'
 import { applyEpic172Step0E2EBridge } from './epic-172-step0-bridge'
+import { installSessionCookie, seedSession } from './helpers'
 
 const RUN = process.env.RUN_FORGE_POSTGRES_TESTS === '1'
 const S4_ADMIN_URL = process.env.FORGE_S4_POSTGRES_TEST_DATABASE_URL?.trim()
@@ -48,14 +49,17 @@ async function seed(input: {
   siblingRequiresFilesystem?: boolean
   siblingStatus?: string
   taskStatus?: string
+  userId?: string
 } = {}) {
   const sql = sqlClient()
-  const userId = randomUUID()
+  const userId = input.userId ?? randomUUID()
   const projectId = randomUUID()
   const taskId = randomUUID()
   const [lowerPackageId, targetPackageId] = [randomUUID(), randomUUID()].sort()
   try {
-    await sql`insert into users (id, display_name) values (${userId}, 'S3 test operator')`
+    if (!input.userId) {
+      await sql`insert into users (id, display_name) values (${userId}, 'S3 test operator')`
+    }
     await sql`
       insert into projects (id, name, submitted_by, grant_decision_revision, root_binding_revision)
       values (${projectId}, 'S3 race fixture', ${userId}, 0, 1)
@@ -115,11 +119,13 @@ function expectedPointer(pointer: Awaited<ReturnType<typeof seed>>['pointer']) {
   }
 }
 
-test('mcp-admission.real-approval-route: concurrent reapproval has one CAS winner and immutable history', {
+test('mcp-admission.real-approval-route: authenticated route stays fail-closed and service CAS preserves immutable history', {
   tag: '@mcp-postgres',
   annotation: { type: 'scenarioId', description: 'mcp-admission.real-approval-route' },
-}, async () => {
-  const fixture = await seed()
+}, async ({ context, page }) => {
+  const session = await seedSession('S6 authenticated grant-route operator')
+  await installSessionCookie(context, session)
+  const fixture = await seed({ userId: session.userId })
   const mutation = {
     capabilities: ['filesystem.project.read'],
     decision: 'approved' as const,
@@ -128,6 +134,23 @@ test('mcp-admission.real-approval-route: concurrent reapproval has one CAS winne
     workPackageId: fixture.targetPackageId,
     expectedPointer: expectedPointer(fixture.pointer),
   }
+
+  const readResponse = await page.request.get(`/api/tasks/${fixture.taskId}/filesystem-grants`)
+  expect(readResponse.status()).toBe(200)
+  await expect(readResponse.json()).resolves.toMatchObject({
+    schemaVersion: 2,
+    grants: [expect.objectContaining({ workPackageId: fixture.targetPackageId })],
+  })
+
+  const guardedMutationResponse = await page.request.put(
+    `/api/tasks/${fixture.taskId}/filesystem-grants`,
+    { data: { schemaVersion: 2, grants: [mutation] } },
+  )
+  expect(guardedMutationResponse.status()).toBe(503)
+  await expect(guardedMutationResponse.json()).resolves.toMatchObject({
+    code: 'epic_172_project_management_ingress_closed',
+  })
+
   const outcomes = await Promise.allSettled([
     mutateTaskFilesystemGrants({
       actorId: fixture.userId,
