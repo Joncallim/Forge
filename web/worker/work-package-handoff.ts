@@ -127,6 +127,7 @@ type HandoffOptions = {
   claimEnabled?: boolean
   finalAttempt?: boolean
   freshnessAttempt?: number
+  priorBlockedContext?: { packageId: string; reason: string | null }
   staleRecoveryAttempted?: boolean
 }
 
@@ -1612,6 +1613,17 @@ export async function handoffApprovedWorkPackages(
   options: HandoffOptions = {},
 ): Promise<WorkPackageHandoffResult> {
   const state = await loadHandoffState(taskId)
+  const retainPromotedPackageContext = state.nextPackage?.status === 'ready' &&
+    state.nextPackage.blockedReason === null &&
+    options.priorBlockedContext?.packageId === state.nextPackage.id
+  options = {
+    ...options,
+    priorBlockedContext: state.nextPackage
+      ? retainPromotedPackageContext
+        ? options.priorBlockedContext
+        : { packageId: state.nextPackage.id, reason: state.nextPackage.blockedReason ?? null }
+      : options.priorBlockedContext,
+  }
   if (state.alreadyRunningPackage && !options.staleRecoveryAttempted) {
     const recovered = await recoverStaleRunningPackage(taskId, state.alreadyRunningPackage)
     if (recovered) {
@@ -1729,11 +1741,16 @@ export async function handoffApprovedWorkPackages(
     }
     nextPackage = freshPackage
   } else {
-    await promoteReadyPackages(
-      taskId,
-      allowedReadyPackageIds.filter((id) => newlyReadyPackageIds.has(id)),
-      now,
-    )
+    const newlyPromotedPackageIds = allowedReadyPackageIds.filter((id) => newlyReadyPackageIds.has(id))
+    await promoteReadyPackages(taskId, newlyPromotedPackageIds, now)
+    if (newlyPromotedPackageIds.includes(nextPackage.id)) {
+      nextPackage = {
+        ...nextPackage,
+        blockedReason: null,
+        status: 'ready',
+        updatedAt: now,
+      }
+    }
   }
 
   if (isWorkPackageExecutionEnabled()) {
@@ -1744,6 +1761,7 @@ export async function handoffApprovedWorkPackages(
       claimEnabled,
       finalAttempt: options.finalAttempt,
       freshnessAttempt: options.freshnessAttempt,
+      priorBlockedContext: options.priorBlockedContext,
     }, projectSnapshot)
   }
 
@@ -2359,7 +2377,12 @@ async function executeReadyWorkPackage(
       }
     }
 
-    const priorReviewContext = await loadPriorReviewContext(taskId, nextPackage)
+    const priorReviewContext = await loadPriorReviewContext(taskId, {
+      ...nextPackage,
+      blockedReason: options.priorBlockedContext?.packageId === nextPackage.id
+        ? options.priorBlockedContext.reason
+        : nextPackage.blockedReason,
+    })
     const execution = await executeWorkPackage({
       ...context,
       agentRunId: run.id,

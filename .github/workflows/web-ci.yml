@@ -48,6 +48,13 @@ jobs:
       NEXT_PUBLIC_APP_URL: http://localhost:3000
     steps:
       - uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Reject whitespace errors in the pull-request diff
+        if: github.event_name == 'pull_request'
+        working-directory: .
+        run: git diff --check "${{ github.event.pull_request.base.sha }}...HEAD"
 
       - uses: actions/setup-node@v6.4.0
         with:
@@ -200,6 +207,21 @@ jobs:
                 RAISE EXCEPTION 'ordinary app unexpectedly has % on the S3 release projection', release_privilege;
               END IF;
             END LOOP;
+            FOREACH release_table IN ARRAY ARRAY[
+              'public.work_package_local_projection_sources',
+              'public.work_package_local_projection_heads'
+            ] LOOP
+              IF NOT has_table_privilege(current_user, release_table, 'SELECT') THEN
+                RAISE EXCEPTION 'ordinary app cannot read local projection table %', release_table;
+              END IF;
+              FOREACH release_privilege IN ARRAY ARRAY[
+                'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
+              ] LOOP
+                IF has_table_privilege(current_user, release_table, release_privilege) THEN
+                  RAISE EXCEPTION 'ordinary app unexpectedly has % on %', release_privilege, release_table;
+                END IF;
+              END LOOP;
+            END LOOP;
             IF EXISTS (
               SELECT 1
               FROM pg_catalog.pg_tables
@@ -215,7 +237,10 @@ jobs:
               JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
               WHERE n.nspname = 'forge'
                 AND has_function_privilege(current_user, p.oid, 'EXECUTE')
-            ) IS DISTINCT FROM ARRAY['read_epic_172_enablement_state_v1']::name[] THEN
+            ) IS DISTINCT FROM ARRAY[
+              'advance_local_projection_head_v1',
+              'read_epic_172_enablement_state_v1'
+            ]::name[] THEN
               RAISE EXCEPTION 'ordinary app has an unexpected Epic 172 routine ACL';
             END IF;
           END;

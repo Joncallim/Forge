@@ -77,15 +77,11 @@ describe('Epic 172 S3 release seam', () => {
     expect(concurrencyProof).not.toMatch(
       /insert into filesystem_mcp_runtime_audits[\s\S]{0,400}duration_ms/i,
     )
-    const claimFixture = concurrencyProof.indexOf("SET LOCAL application_name = 'forge-s3-claim-contender'")
-    const claimRunInsert = concurrencyProof.indexOf('insert into agent_runs (', claimFixture)
-    const claimAuditInsert = concurrencyProof.indexOf(
-      'insert into filesystem_mcp_runtime_audits (',
-      claimFixture,
-    )
-    expect(claimFixture).toBeGreaterThan(0)
-    expect(claimRunInsert).toBeGreaterThan(claimFixture)
-    expect(claimRunInsert).toBeLessThan(claimAuditInsert)
+    expect(concurrencyProof).toContain('handoffApprovedWorkPackages(fixture.taskId')
+    expect(concurrencyProof).toContain('afterWorkPackageClaimRowsLocked: async')
+    expect(concurrencyProof).toContain('pg_blocking_pids(pid)')
+    expect(concurrencyProof).toContain('expect(mutationSettled).toBe(false)')
+    expect(concurrencyProof).toContain("'production claim and grant mutation contention'")
   })
 
   it('runs the primary unit suite with mandatory release PostgreSQL fixtures and zero lint warnings', () => {
@@ -112,7 +108,7 @@ describe('Epic 172 S3 release seam', () => {
     expect(ownerBootstrap).toContain('A competing release-role membership exists before the S3 handoff')
     expect(ownerBootstrap).toContain('S3 release ownership is already complete')
     expect(ownerBootstrap).toContain(
-      'grant references (id) on table public.tasks to forge_release_routines_owner',
+      'grant select (id, local_projection_scope_state), references (id) on table public.tasks to forge_release_routines_owner',
     )
     expect(ownerBootstrap).toContain(
       'grant select (id, task_id), references (id) on table public.work_packages to forge_release_routines_owner',
@@ -121,8 +117,10 @@ describe('Epic 172 S3 release seam', () => {
       'revoke references (id) on table public.tasks from forge_release_routines_owner',
     )
     expect(ownerBootstrap).toContain('The post-bootstrap S3 source-table ACL is not exact')
-    expect(ownerBootstrap).toContain('The projection-head table owner or direct ACL is not exact')
+    expect(ownerBootstrap).toContain('The projection source/head table owner or direct ACL is not exact')
+    expect(ownerBootstrap).toContain("routine.proname = 'advance_local_projection_head_v1'")
     expect(migration).toContain('REVOKE ALL ON public.work_package_local_projection_heads FROM PUBLIC')
+    expect(migration).toContain('REVOKE ALL ON public.work_package_local_projection_sources FROM PUBLIC')
     expect(migration).toContain(
       'FROM forge_release_evidence_writer, forge_release_transition',
     )
@@ -137,6 +135,9 @@ describe('Epic 172 S3 release seam', () => {
     )
     expect(migration).toContain(
       'REVOKE ALL ON FUNCTION forge.reject_projection_head_mutation_v1() FROM PUBLIC',
+    )
+    expect(migration).toContain(
+      'REVOKE ALL ON FUNCTION forge.advance_local_projection_head_v1(',
     )
     expect(migration.indexOf('forge_begin_epic_172_s3_owner_bootstrap_v1')).toBeLessThan(
       migration.indexOf('SET LOCAL ROLE forge_release_routines_owner'),
