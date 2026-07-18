@@ -57,7 +57,7 @@ describe('Epic 172 signed release recorder boundary', () => {
     expect(migration).toContain('REVOKE ALL ON FUNCTION forge.read_epic_172_enablement_state_v1()')
   })
 
-  it('provisions the real ordinary app principal with one fixed release-reader grant', () => {
+  it('provisions the real ordinary app principal with exact fixed reader and projection grants', () => {
     expect(provisionApplicationRole).toContain("requiredConnectionUrl('FORGE_APPLICATION_DATABASE_URL')")
     expect(provisionApplicationRole).toContain('identity.currentUser !== identity.sessionUser')
     expect(provisionApplicationRole).toContain('applicationRoleIsUnsafe(role)')
@@ -66,8 +66,12 @@ describe('Epic 172 signed release recorder boundary', () => {
     expect(provisionApplicationRole).toContain(
       'grant execute on function forge.read_epic_172_enablement_state_v1()',
     )
+    expect(provisionApplicationRole).toContain(
+      'grant execute on function forge.advance_local_projection_head_v1(',
+    )
     expect(provisionApplicationRole).toContain('unexpectedTablePrivileges.length !== 0')
-    expect(provisionApplicationRole).toContain("executableForgeFunctions.length !== 1")
+    expect(provisionApplicationRole).toContain('executableForgeFunctions.length !== 2')
+    expect(provisionApplicationRole).toContain("!== 'advance_local_projection_head_v1'")
     expect(provisionApplicationRole).toContain("!== 'read_epic_172_enablement_state_v1'")
     expect(operatorRunbook).toContain('npm run protocol:provision-epic-172-application-role')
     expect(webCi).toContain('run: npm run protocol:provision-epic-172-application-role')

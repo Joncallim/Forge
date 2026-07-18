@@ -9,7 +9,6 @@ import {
   projectionHeadFingerprint,
   assertProjectionHeadReassignment,
   assertProjectionHeadNotMissing,
-  assertProjectionHeadNotDeleted,
   buildProjectionHeadIdentity,
 } from '@/lib/mcps/local-projection-heads'
 import {
@@ -31,6 +30,16 @@ describe('S3: local projection heads', () => {
   it('has exactly eight preallocated head kinds', () => {
     expect(CURRENT_LOCAL_PROJECTION_HEAD_KINDS).toHaveLength(8)
     expect(CURRENT_LOCAL_PROJECTION_HEAD_KIND_COUNT).toBe(8)
+    expect([...CURRENT_LOCAL_PROJECTION_HEAD_KINDS]).toEqual([
+      'local_run',
+      'local_recovery',
+      'packet_recovery',
+      'repository_review',
+      'host_apply_review',
+      'operator_hold',
+      'integrity',
+      'terminal_disposition',
+    ])
   })
 
   it('enforces 2,048 heads at 256 packages', () => {
@@ -49,7 +58,7 @@ describe('S3: local projection heads', () => {
   })
 
   it('asserts valid and rejects invalid head kinds', () => {
-    assertLocalProjectionHeadKind('filesystem_grant_decision')
+    assertLocalProjectionHeadKind('operator_hold')
     expect(() => assertLocalProjectionHeadKind('arbitrary_head')).toThrow(
       'Invalid projection head kind',
     )
@@ -62,14 +71,14 @@ describe('S3: local projection heads', () => {
     const headId = '550e8400-e29b-41d4-a716-446655440000'
     const identity = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000',
       '660e8400-e29b-41d4-a716-446655440001',
-      'filesystem_grant_decision',
+      'local_run',
       0,
     )
     expect(() =>
       assertProjectionHeadReassignment(
         {
           headId,
-          kind: 'claim_token',
+          kind: 'packet_recovery',
           headFingerprint: projectionHeadFingerprint(identity),
         },
         identity,
@@ -79,17 +88,17 @@ describe('S3: local projection heads', () => {
 
   it('rejects fingerprint mismatches', () => {
     const wpId = '660e8400-e29b-41d4-a716-446655440001'
-    const identityA = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000', wpId, 'lease_expiry', 3)
+    const identityA = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000', wpId, 'repository_review', 3)
     const identityB = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000',
       '770e8400-e29b-41d4-a716-446655440002',
-      'lease_expiry',
+      'repository_review',
       3,
     )
     expect(() =>
       assertProjectionHeadReassignment(
         {
           headId: identityA.headId,
-          kind: 'lease_expiry',
+          kind: 'repository_review',
           headFingerprint: projectionHeadFingerprint(identityA),
         },
         identityB,
@@ -100,10 +109,10 @@ describe('S3: local projection heads', () => {
   it('asserts head is not missing', () => {
     const identity = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000',
       '660e8400-e29b-41d4-a716-446655440001',
-      'integrity_hold',
-      5,
+      'integrity',
+      6,
     )
-    assertProjectionHeadNotMissing({ headId: identity.headId, kind: 'integrity_hold' }, identity)
+    assertProjectionHeadNotMissing({ headId: identity.headId, kind: 'integrity' }, identity)
     expect(() =>
       assertProjectionHeadNotMissing(null, identity),
     ).toThrow('Missing projection head')
@@ -112,27 +121,19 @@ describe('S3: local projection heads', () => {
     ).toThrow('Missing projection head')
   })
 
-  it('asserts head is not deleted', () => {
-    assertProjectionHeadNotDeleted({ state: 'preallocated' })
-    assertProjectionHeadNotDeleted({ state: 'claimed' })
-    expect(() => assertProjectionHeadNotDeleted({ state: 'deleted' })).toThrow(
-      'Cannot operate on a deleted projection head',
-    )
-  })
-
   it('builds deterministic projection head fingerprints', () => {
     const wpId = '660e8400-e29b-41d4-a716-446655440001'
-    const identity = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000', wpId, 'terminal_state', 6)
+    const identity = buildProjectionHeadIdentity('111e8400-e29b-41d4-a716-446655440000', wpId, 'terminal_disposition', 7)
     const fingerprint = projectionHeadFingerprint(identity)
     expect(fingerprint).toMatch(
-      /^head:v1:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:terminal_state:6$/,
+      /^head:v1:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:terminal_disposition:7$/,
     )
     const sameFingerprint = projectionHeadFingerprint({
       headId: identity.headId,
       taskId: identity.taskId,
       workPackageId: wpId,
-      kind: 'terminal_state',
-      index: 6,
+      kind: 'terminal_disposition',
+      index: 7,
     })
     expect(fingerprint).toBe(sameFingerprint)
   })
