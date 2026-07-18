@@ -60,6 +60,7 @@ export const PROJECTION_HEAD_STATES: ReadonlySet<ProjectionHeadState> = new Set(
 
 export type LocalProjectionHeadIdentity = Readonly<{
   headId: string
+  taskId: string
   workPackageId: string
   kind: LocalProjectionHeadKind
   index: number
@@ -76,7 +77,7 @@ export type LocalProjectionHeadRecord = LocalProjectionHeadIdentity & {
 }
 
 export function projectionHeadFingerprint(identity: LocalProjectionHeadIdentity): string {
-  return `head:v1:${identity.workPackageId}:${identity.kind}:${identity.index}`
+  return `head:v1:${identity.taskId}:${identity.workPackageId}:${identity.kind}:${identity.index}`
 }
 
 export function assertProjectionHeadReassignment(
@@ -113,9 +114,10 @@ export function assertProjectionHeadNotDeleted(record: { state: string }): void 
 }
 
 export function buildProjectionHeadIdentity(
+  taskId: string,
   workPackageId: string,
   kind: LocalProjectionHeadKind,
   index: number,
 ): LocalProjectionHeadIdentity {
-  return { headId: randomUUID(), workPackageId, kind, index }
+  return { headId: randomUUID(), taskId, workPackageId, kind, index }
 }
