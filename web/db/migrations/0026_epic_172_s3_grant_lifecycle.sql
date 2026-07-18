@@ -1130,14 +1130,13 @@ $$;
 ALTER TABLE public.work_package_local_projection_heads
   OWNER TO forge_release_routines_owner;
 --> statement-breakpoint
+REVOKE ALL ON public.work_package_local_projection_heads FROM PUBLIC;
+GRANT SELECT ON public.work_package_local_projection_heads TO PUBLIC;
 GRANT SELECT, INSERT, UPDATE ON public.work_package_local_projection_heads
   TO forge_release_evidence_writer;
 --> statement-breakpoint
 REVOKE DELETE, TRUNCATE ON public.work_package_local_projection_heads
   FROM forge_release_evidence_writer;
---> statement-breakpoint
-REVOKE ALL ON public.work_package_local_projection_heads FROM PUBLIC;
-GRANT SELECT ON public.work_package_local_projection_heads TO PUBLIC;
 --> statement-breakpoint
 RESET ROLE;
 --> statement-breakpoint
