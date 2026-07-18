@@ -245,6 +245,8 @@ jobs:
       - name: Run mandatory S3 PostgreSQL concurrency proof
         env:
           RUN_FORGE_POSTGRES_TESTS: '1'
+          FORGE_S4_POSTGRES_TEST_DATABASE_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+          FORGE_PACKET_ISSUER_DATABASE_URL: postgresql://forge_packet_issuer:forge_packet_issuer_test@localhost:5432/forge_epic_172_ci_test
         run: |
           set -o pipefail
           report="$(mktemp)"
