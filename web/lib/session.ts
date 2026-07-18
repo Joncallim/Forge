@@ -41,6 +41,14 @@ function sessionIp(ip: string | null | undefined): string | null {
   return isIP(ip) === 0 ? null : ip
 }
 
+function parseDatabaseTimestamp(value: Date | string): Date {
+  const timestamp = value instanceof Date ? value : new Date(value)
+  if (!Number.isFinite(timestamp.getTime())) {
+    throw new Error('PostgreSQL returned an invalid session timestamp')
+  }
+  return timestamp
+}
+
 export function readSessionCredential(request: Request): string | null {
   const cookieHeader = request.headers.get('cookie') ?? ''
   for (const cookie of cookieHeader.split(';')) {
@@ -70,20 +78,28 @@ async function authorizeSession(digest: Buffer): Promise<AuthorizedSession | nul
         lastSeenAt: sessions.lastSeenAt,
         expiresAt: sessions.expiresAt,
         revokedAt: sessions.revokedAt,
-        databaseNow: sql<Date>`pg_catalog.clock_timestamp()`,
+        databaseNow: sql<Date | string>`pg_catalog.clock_timestamp()`,
       })
       .from(sessions)
       .where(eq(sessions.credentialDigestV1, digest))
       .limit(1)
       .for('update')
 
-    if (!row || row.revokedAt || !row.expiresAt || row.databaseNow >= row.expiresAt) {
+    if (!row || row.revokedAt || !row.expiresAt) {
       return null
     }
+    const databaseNow = parseDatabaseTimestamp(row.databaseNow)
+    if (databaseNow >= row.expiresAt) return null
     const liveExpiresAt = row.expiresAt
 
-    if (row.databaseNow.getTime() - row.lastSeenAt.getTime() <= WRITE_BEHIND_INTERVAL_MS) {
-      return { ...row, expiresAt: liveExpiresAt, refreshed: false }
+    if (databaseNow.getTime() - row.lastSeenAt.getTime() <= WRITE_BEHIND_INTERVAL_MS) {
+      return {
+        sessionId: row.sessionId,
+        userId: row.userId,
+        lastSeenAt: row.lastSeenAt,
+        expiresAt: liveExpiresAt,
+        refreshed: false,
+      }
     }
 
     const [refreshed] = await tx
@@ -99,7 +115,13 @@ async function authorizeSession(digest: Buffer): Promise<AuthorizedSession | nul
       })
 
     if (!refreshed.expiresAt) throw new Error('Session refresh did not return an expiry')
-    return { ...row, ...refreshed, expiresAt: refreshed.expiresAt, refreshed: true }
+    return {
+      sessionId: row.sessionId,
+      userId: row.userId,
+      lastSeenAt: refreshed.lastSeenAt,
+      expiresAt: refreshed.expiresAt,
+      refreshed: true,
+    }
   })
 }
 
