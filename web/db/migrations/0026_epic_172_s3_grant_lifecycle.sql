@@ -994,7 +994,7 @@ CREATE TABLE IF NOT EXISTS public.work_package_local_projection_heads (
     head_version >= 0
   ),
   CONSTRAINT work_package_projection_head_fingerprint_chk CHECK (
-    head_fingerprint ~ '^head:v1:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[a-z_]+:[0-7]$'
+    head_fingerprint ~ '^head:v1:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[a-z_]+:[0-7]$'
   ),
   CONSTRAINT work_package_projection_head_lease_chk CHECK (
     (state IN ('claimed', 'active') AND lease_token IS NOT NULL)
@@ -1135,6 +1135,9 @@ GRANT SELECT, INSERT, UPDATE ON public.work_package_local_projection_heads
 --> statement-breakpoint
 REVOKE DELETE, TRUNCATE ON public.work_package_local_projection_heads
   FROM forge_release_evidence_writer;
+--> statement-breakpoint
+REVOKE ALL ON public.work_package_local_projection_heads FROM PUBLIC;
+GRANT SELECT ON public.work_package_local_projection_heads TO PUBLIC;
 --> statement-breakpoint
 RESET ROLE;
 --> statement-breakpoint
