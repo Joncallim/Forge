@@ -163,11 +163,12 @@ export async function createSession(
   // Write to Redis with 7-day TTL
   await redis.set(redisKey(sessionId), JSON.stringify(data), 'EX', SESSION_TTL_SECONDS)
 
-  // Insert audit row into PostgreSQL
+  // Insert audit row into PostgreSQL with credential digest for DB-authoritative rekey
   await db.insert(sessions).values({
     id: sessionId,
     userId,
     credentialId: credentialId ?? undefined,
+    credentialDigest: credentialDigest ? Buffer.from(credentialDigest, 'hex') : undefined,
     userAgent: meta.userAgent ?? undefined,
     ipAddress: ip ?? undefined,
   })

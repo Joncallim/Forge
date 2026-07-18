@@ -34,6 +34,10 @@ BEGIN
 END;
 $$;
 --> statement-breakpoint
+-- S4 credential digest: stored per-session for rekey detection.
+ALTER TABLE public.sessions
+  ADD COLUMN IF NOT EXISTS credential_digest bytea;
+--> statement-breakpoint
 CREATE SCHEMA IF NOT EXISTS forge;
 --> statement-breakpoint
 ALTER TABLE public.projects
