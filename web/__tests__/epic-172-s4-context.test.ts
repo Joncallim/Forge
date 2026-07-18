@@ -1,4 +1,6 @@
 import { randomBytes } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import type { McpWorkPackageAdmission } from '@/lib/mcps/admission'
 import {
@@ -37,6 +39,18 @@ const AUDIT_ID = '00000000-0000-4000-8000-000000000005'
 const APPROVAL_ID = '00000000-0000-4000-8000-000000000006'
 const NONCE = '00000000-0000-4000-8000-000000000007'
 const SHA = `sha256:${'a'.repeat(64)}`
+const webCiWorkflow = readFileSync(
+  fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)),
+  'utf8',
+)
+const s4RoleBootstrap = readFileSync(
+  fileURLToPath(new URL('../scripts/bootstrap-epic-172-s4-roles.ts', import.meta.url)),
+  'utf8',
+)
+const s4Migration = readFileSync(
+  fileURLToPath(new URL('../db/migrations/0027_epic_172_s4_packet_context.sql', import.meta.url)),
+  'utf8',
+)
 
 function decision(overrides: Record<string, unknown> = {}) {
   return {
@@ -88,6 +102,60 @@ function admission(overrides: Partial<McpWorkPackageAdmission> = {}): McpWorkPac
     ...overrides,
   } as McpWorkPackageAdmission
 }
+
+describe('Epic 172 S4 PostgreSQL CI contract', () => {
+  it('bootstraps S4 before migration and makes all dedicated PostgreSQL fixtures mandatory', () => {
+    const bootstrapIndex = webCiWorkflow.indexOf('name: Bootstrap migration-0027 S4 protocol ownership')
+    const migrateIndex = webCiWorkflow.indexOf('name: Apply migrations as the disposable migration owner')
+    expect(bootstrapIndex).toBeGreaterThan(-1)
+    expect(migrateIndex).toBeGreaterThan(bootstrapIndex)
+    expect(webCiWorkflow).toContain('npm run protocol:bootstrap-epic-172-s4-roles')
+    expect(webCiWorkflow).toContain("FORGE_S4_REQUIRE_POSTGRES_TEST: '1'")
+    for (const variable of [
+      'FORGE_S4_POSTGRES_TEST_DATABASE_URL',
+      'FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL',
+      'FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL',
+      'FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL',
+      'FORGE_PACKET_ISSUER_DATABASE_URL',
+    ]) {
+      expect(webCiWorkflow).toContain(`${variable}:`)
+    }
+  })
+
+  it('keeps every S4-owned table outside the ordinary application grant loop', () => {
+    for (const table of [
+      'architect_plan_versions',
+      'architect_plan_entries',
+      'architect_plan_execution_references',
+      'architect_plan_history_reads',
+      'epic_172_s4_protocol_state',
+      'work_package_local_run_evidence',
+      'filesystem_mcp_decision_nonce_claims',
+    ]) {
+      expect(webCiWorkflow.match(new RegExp(`'public\\.${table}'`, 'g'))).toHaveLength(1)
+      expect(webCiWorkflow.match(new RegExp(`'${table}'`, 'g'))).toHaveLength(1)
+    }
+  })
+
+  it('opens and closes one migration-session-bound S4 schema authority fence', () => {
+    expect(s4Migration.indexOf('SELECT public.forge_begin_epic_172_s4_owner_bootstrap_v1();'))
+      .toBeLessThan(s4Migration.indexOf('DO $$'))
+    expect(s4Migration.trimEnd()).toMatch(
+      /SELECT public\.forge_finalize_epic_172_s4_owner_bootstrap_v1\(\);$/,
+    )
+    expect(s4RoleBootstrap).toContain('security definer')
+    expect(s4RoleBootstrap).toContain('if session_user <> ${migrationLiteral}')
+    expect(s4RoleBootstrap).toContain("'grant usage, create on schema forge to %I'")
+    expect(s4RoleBootstrap).toContain("'revoke usage, create on schema forge from %I'")
+    expect(s4RoleBootstrap).toContain(
+      "'revoke execute on function public.forge_begin_epic_172_s4_owner_bootstrap_v1() from %I'",
+    )
+    expect(s4RoleBootstrap).toContain(
+      "'revoke execute on function public.forge_finalize_epic_172_s4_owner_bootstrap_v1() from %I'",
+    )
+    expect(s4RoleBootstrap).toContain("has_schema_privilege('${OWNER}', 'forge', 'create')")
+  })
+})
 
 describe('Epic 172 S4 protected Architect plan history', () => {
   it('materializes deterministic NFC HMAC envelopes and text-free executable references', () => {
