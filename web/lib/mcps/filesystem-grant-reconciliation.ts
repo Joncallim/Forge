@@ -13,10 +13,7 @@ import {
   workPackages,
   type ProjectMcpConfig,
 } from '@/db/schema'
-import {
-  buildFilesystemGrantBlockMetadata,
-  parseFilesystemGrantBlockMetadata,
-} from './filesystem-grant-lifecycle'
+import { buildFilesystemGrantBlockMetadata } from './filesystem-grant-lifecycle'
 import {
   canonicalFilesystemProjectCapabilities,
   FILESYSTEM_GRANT_BLOCK_METADATA_KEY,
@@ -24,10 +21,12 @@ import {
   isRecord,
   projectFilesystemEffectivePhase,
   projectFilesystemGrantFromAuthority,
+  readFilesystemGrantBlockFromMetadata,
   requiresFilesystemGrantApproval,
   summarizeFilesystemCapabilities,
   type FilesystemProjectCapability,
 } from './filesystem-grants'
+import { publicHttpError } from '@/lib/http/route-error'
 import { assertMcpAdmissionLockSequence } from './mcp-admission-lock-order'
 import { readEffectiveGrantState } from './admission'
 import {
@@ -137,7 +136,10 @@ const TASK_EDITABLE = new Set(['awaiting_approval', 'approved', 'running', 'fail
 const PACKAGE_EDITABLE = new Set(['pending', 'ready', 'blocked', 'needs_rework'])
 
 function httpError(message: string, status: number): Error {
-  return Object.assign(new Error(message), { status })
+  // Every reconciliation httpError is an approved 4xx operator message. Route it
+  // through the branded public-error constructor so the route boundary can tell
+  // it apart from an untyped internal failure and surface its message safely.
+  return publicHttpError(message, status)
 }
 
 async function lockedTransactionNow(tx: GrantTransaction): Promise<Date> {
@@ -212,8 +214,7 @@ function isLiveExecutionLease(pkg: LockedPackage, now: Date): boolean {
 }
 
 function isRecognizedOperatorHold(pkg: LockedPackage): boolean {
-  if (!isRecord(pkg.metadata)) return false
-  return parseFilesystemGrantBlockMetadata(pkg.metadata[FILESYSTEM_GRANT_BLOCK_METADATA_KEY]) !== null
+  return readFilesystemGrantBlockFromMetadata(pkg.metadata) !== null
 }
 
 /**
@@ -601,10 +602,7 @@ async function applyCanonicalProjection(input: {
       projectFilesystemDecision: input.projectAuthority,
       projectRootBindingRevision: input.lockedProject.rootBindingRevision,
     })
-    const existingMarker = isRecord(pkg.metadata)
-      ? pkg.metadata[FILESYSTEM_GRANT_BLOCK_METADATA_KEY]
-      : undefined
-    const parsedMarker = parseFilesystemGrantBlockMetadata(existingMarker)
+    const parsedMarker = readFilesystemGrantBlockFromMetadata(pkg.metadata)
     const forcePersist = input.forcePackageIds?.has(pkg.id) === true
     const currentPhases = isRecord(pkg.metadata) && isRecord(pkg.metadata.mcpGrantPhases)
       ? pkg.metadata.mcpGrantPhases
