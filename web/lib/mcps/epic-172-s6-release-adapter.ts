@@ -81,42 +81,10 @@ export function verifyEpic172S6TransitionAuthorizationInput(
   return verifyEpic172TransitionAuthorization(input)
 }
 
-export type Epic172S6ReleaseStoreAdapter = Readonly<{
-  /**
-   * The implementation is supplied by Step 0. It must record one already-verified
-   * S6-owned envelope in the same transaction as its canonical consumption rows.
-   */
-  recordOwnedEvidence: (
-    evidenceKind: Epic172S6RecordableEvidenceKind,
-    verified: Epic172S6VerifiedReleaseEvidence,
-  ) => Promise<unknown>
-  /**
-   * The implementation is supplied by Step 0. It must consume a verified fresh
-   * authorization and its exact predecessors atomically or roll back all writes.
-   */
-  consumeOwnedTransition: (
-    nodeId: Epic172S6OwnedNodeId,
-    verified: Epic172S6VerifiedTransitionAuthorization,
-  ) => Promise<unknown>
-}>
-
-export function createEpic172S6ReleaseStoreAdapter(
-  adapter: Epic172S6ReleaseStoreAdapter,
-): Epic172S6ReleaseStoreAdapter {
-  assertEpic172S6ReleaseOrderOwnership()
-  if (!adapter || typeof adapter.recordOwnedEvidence !== 'function' || typeof adapter.consumeOwnedTransition !== 'function') {
-    throw new Error('Step 0 release store and transition consumer adapters are required.')
-  }
-  return Object.freeze({
-    recordOwnedEvidence: adapter.recordOwnedEvidence,
-    consumeOwnedTransition: adapter.consumeOwnedTransition,
-  })
-}
-
 /**
  * Concrete called function that performs the atomic S6 DB transition using the
  * fixed forge_release_transition principal. No adapter indirection; this is the
- * single production implementation.
+ * single production implementation called by the release controller.
  */
 export async function executeEpic172S6AtomicTransition(input: {
   authorizationAttemptId: string
