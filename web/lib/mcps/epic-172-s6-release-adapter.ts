@@ -112,3 +112,49 @@ export function createEpic172S6ReleaseStoreAdapter(
     consumeOwnedTransition: adapter.consumeOwnedTransition,
   })
 }
+
+/**
+ * Concrete called function that performs the atomic S6 DB transition using the
+ * fixed forge_release_transition principal. No adapter indirection; this is the
+ * single production implementation.
+ */
+export async function executeEpic172S6AtomicTransition(input: {
+  authorizationAttemptId: string
+  buildSha: string
+  consumerNode: Epic172S6OwnedNodeId
+  controllerIdentity: string
+  operationId: string
+  reviewedSha: string
+}): Promise<{ receiptId: string; transitionIdentityDigest: string }> {
+  assertEpic172S6ReleaseOrderOwnership()
+
+  const dbUrl = process.env.FORGE_EPIC_172_TRANSITION_DATABASE_URL
+  if (!dbUrl) throw new Error('FORGE_EPIC_172_TRANSITION_DATABASE_URL is required.')
+
+  const { default: postgres } = await import('postgres')
+  const sql = postgres(dbUrl, { max: 1, onnotice: () => {}, transform: { undefined: null } })
+
+  try {
+    await sql.unsafe('set local role forge_release_transition')
+
+    const result = await sql.begin(async (tx) => {
+      const rows = await tx<{ receipt_id: string; transition_identity_digest: string }[]>`
+        select receipt_id, transition_identity_digest
+        from forge.lock_epic_172_s3_completion_v1(
+          ${input.operationId}::uuid,
+          ${input.authorizationAttemptId}::uuid,
+          ${input.controllerIdentity}::uuid
+        )
+      `
+      if (!rows.length) throw new Error('S6 transition failed: no receipt returned.')
+      return rows[0]
+    })
+
+    return {
+      receiptId: result.receipt_id,
+      transitionIdentityDigest: result.transition_identity_digest,
+    }
+  } finally {
+    await sql.end({ timeout: 5 })
+  }
+}
