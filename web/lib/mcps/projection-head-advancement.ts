@@ -3,7 +3,6 @@ import { db } from '@/db'
 import { workPackageLocalProjectionHeads } from '@/db/schema'
 import {
   isLocalProjectionHeadKind,
-  assertProjectionHeadNotMissing,
   assertProjectionHeadNotDeleted,
   projectionHeadFingerprint,
   type LocalProjectionHeadKind,
@@ -47,13 +46,9 @@ export async function advanceLocalProjectionHead(
     )
     .limit(1)
 
-  assertProjectionHeadNotMissing(head, {
-    headId: head?.id ?? '',
-    taskId: head?.taskId ?? '',
-    workPackageId: input.workPackageId,
-    kind: input.kind as LocalProjectionHeadKind,
-    index: Number(head?.headIndex ?? 0),
-  })
+  if (!head) {
+    throw new Error(`Missing projection head: ${input.kind} for package ${input.workPackageId}`)
+  }
   assertProjectionHeadNotDeleted(head)
 
   if (
