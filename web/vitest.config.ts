@@ -7,5 +7,10 @@ export default defineConfig({
     testTimeout: 10_000,
     exclude: ['e2e/**', 'node_modules/**', '.next/**', '**/*.uninstall-trash.*'],
   },
-  resolve: { alias: { '@': path.resolve(__dirname, '.') } },
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, '.'),
+      'server-only': path.resolve(__dirname, '__mocks__/server-only.ts'),
+    },
+  },
 })
