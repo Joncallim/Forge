@@ -9,6 +9,7 @@ import { redis } from '@/lib/redis'
 import { getAccessibleTask } from '@/lib/task-access'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 import { publishTaskEvent } from '@/worker/events'
+import { taskQuestionSummary } from '@/lib/mcps/clarification-projection'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -48,12 +49,17 @@ export async function GET(
     }
 
     const questions = await db
-      .select()
+      .select({
+        id: taskQuestions.id,
+        status: taskQuestions.status,
+        createdAt: taskQuestions.createdAt,
+        answeredAt: taskQuestions.answeredAt,
+      })
       .from(taskQuestions)
       .where(eq(taskQuestions.taskId, taskId))
       .orderBy(asc(taskQuestions.createdAt))
 
-    return NextResponse.json({ questions })
+    return NextResponse.json({ questions: questions.map(taskQuestionSummary) })
   } catch (err) {
     console.error('[GET /api/tasks/:id/questions] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
@@ -111,7 +117,7 @@ export async function POST(
     const questionIds = answers.map((a) => a.id)
 
     const existingQuestions = await db
-      .select()
+      .select({ id: taskQuestions.id })
       .from(taskQuestions)
       .where(and(eq(taskQuestions.taskId, taskId), inArray(taskQuestions.id, questionIds)))
 
@@ -136,7 +142,12 @@ export async function POST(
             answeredBy: session.userId,
           })
           .where(eq(taskQuestions.id, id))
-          .returning(),
+          .returning({
+            id: taskQuestions.id,
+            status: taskQuestions.status,
+            createdAt: taskQuestions.createdAt,
+            answeredAt: taskQuestions.answeredAt,
+          }),
       ),
     )
     const updatedQuestions = updated.flat()
@@ -167,7 +178,10 @@ export async function POST(
       allAnswered,
     })
 
-    return NextResponse.json({ questions: updatedQuestions, allAnswered })
+    return NextResponse.json({
+      questions: updatedQuestions.map(taskQuestionSummary),
+      allAnswered,
+    })
   } catch (err) {
     console.error('[POST /api/tasks/:id/questions] Unexpected error', err)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

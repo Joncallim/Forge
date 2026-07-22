@@ -2619,11 +2619,22 @@ describe('GET /api/tasks/:id — task details', () => {
       },
       createdAt: new Date(),
     }
+    const questionRow = {
+      id: '77777777-7777-4777-8777-777777777777',
+      taskId: task.id,
+      question: 'RAW-QUESTION-SENTINEL',
+      suggestions: ['RAW-SUGGESTION-SENTINEL'],
+      answer: 'RAW-ANSWER-SENTINEL',
+      status: 'answered',
+      createdAt: new Date('2026-07-22T00:00:00.000Z'),
+      answeredAt: new Date('2026-07-22T00:01:00.000Z'),
+      answeredBy: FAKE_SESSION.userId,
+    }
     mockDbSelect
       .mockReturnValueOnce(chain([task]))
       .mockReturnValueOnce(chain([packageRun, qaPackageRun, taskLevelRun]))
       .mockReturnValueOnce(chain([]))
-      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([questionRow]))
       .mockReturnValueOnce(chain([packageArtifact, qaPackageArtifact, taskLevelArtifact]))
       .mockReturnValueOnce(chain([workPackage, qaWorkPackage]))
       .mockReturnValueOnce(chain([]))
@@ -2693,6 +2704,19 @@ describe('GET /api/tasks/:id — task details', () => {
     )).toEqual(['artifact-1', 'artifact-2'])
     expect(JSON.stringify(body.workPackages)).not.toContain('RAW-')
     expect(body.workPackages[0]).not.toHaveProperty('promptOverlay')
+    expect(body.questions).toEqual([{
+      id: questionRow.id,
+      status: 'answered',
+      createdAt: '2026-07-22T00:00:00.000Z',
+      answeredAt: '2026-07-22T00:01:00.000Z',
+    }])
+    expect(body.clarification).toEqual({
+      planVersion: '7',
+      questionCount: 1,
+      openCount: 0,
+      answeredCount: 1,
+    })
+    expect(JSON.stringify(body.questions)).not.toContain('RAW-')
   })
 
   it('omits an effective filesystem grant nonce without mutating persisted package metadata', async () => {
@@ -7089,6 +7113,83 @@ describe('POST /api/tasks/:id/questions', () => {
     const res = await POST(req as never, { params: Promise.resolve({ id: 'task-1' }) })
     expect(res.status).toBe(409)
     expect(mockDbUpdate).not.toHaveBeenCalled()
+  })
+
+  it('keeps the generic question listing content-free', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const questionId = '77777777-7777-4777-8777-777777777777'
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ id: 'task-1', status: 'awaiting_answers' }]))
+      .mockReturnValueOnce(chain([{
+        id: questionId,
+        status: 'open',
+        createdAt: new Date('2026-07-22T00:00:00.000Z'),
+        answeredAt: null,
+        question: 'RAW-QUESTION-SENTINEL',
+        suggestions: ['RAW-SUGGESTION-SENTINEL'],
+        answer: 'RAW-ANSWER-SENTINEL',
+      }]))
+    const { GET } = await import('@/app/api/tasks/[id]/questions/route')
+    const response = await GET(authRequest('/api/tasks/task-1/questions') as never, {
+      params: Promise.resolve({ id: 'task-1' }),
+    })
+    expect(response.status).toBe(200)
+    const body = await response.json()
+    expect(body.questions).toEqual([{
+      id: questionId,
+      status: 'open',
+      createdAt: '2026-07-22T00:00:00.000Z',
+      answeredAt: null,
+    }])
+    expect(JSON.stringify(body)).not.toContain('RAW-')
+  })
+
+  it('accepts an opaque question id and answer but returns only content-free summaries', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const questionId = '77777777-7777-4777-8777-777777777777'
+    const answer = 'RAW-OPERATOR-ANSWER-SENTINEL'
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ id: 'task-1', status: 'awaiting_answers' }]))
+      .mockReturnValueOnce(chain([{ id: questionId }]))
+      .mockReturnValueOnce(chain([{ status: 'answered' }]))
+    const update = chain([{
+      id: questionId,
+      status: 'answered',
+      createdAt: new Date('2026-07-22T00:00:00.000Z'),
+      answeredAt: new Date('2026-07-22T00:01:00.000Z'),
+      question: 'RAW-QUESTION-SENTINEL',
+      suggestions: ['RAW-SUGGESTION-SENTINEL'],
+      answer,
+    }])
+    const setAnswer = vi.fn(() => update)
+    update.set = setAnswer
+    mockDbUpdate.mockReturnValue(update)
+    mockRedisLpush.mockResolvedValue(1)
+    mockRedisEval.mockResolvedValue(1)
+
+    const { POST } = await import('@/app/api/tasks/[id]/questions/route')
+    const response = await POST(authRequest('/api/tasks/task-1/questions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers: [{ id: questionId, answer }] }),
+    }) as never, { params: Promise.resolve({ id: 'task-1' }) })
+
+    expect(response.status).toBe(200)
+    const body = await response.json()
+    expect(body).toEqual({
+      questions: [{
+        id: questionId,
+        status: 'answered',
+        createdAt: '2026-07-22T00:00:00.000Z',
+        answeredAt: '2026-07-22T00:01:00.000Z',
+      }],
+      allAnswered: true,
+    })
+    expect(JSON.stringify(body)).not.toContain('RAW-')
+    expect(setAnswer).toHaveBeenCalledWith(expect.objectContaining({ answer }))
+    const answeredEvent = mockRedisEval.mock.calls.find((call) => call[4] === 'questions:answered')
+    expect(JSON.parse(answeredEvent?.[5] as string)).toEqual({ answeredCount: 1, allAnswered: true })
+    expect(JSON.stringify(mockRedisEval.mock.calls)).not.toContain('RAW-')
   })
 })
 

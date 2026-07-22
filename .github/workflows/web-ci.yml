@@ -102,16 +102,28 @@ jobs:
           # The disposable CI database login owns this isolated PostgreSQL
           # service and is therefore the short-lived administrator here.
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+      - name: Apply migrations through 0025
+        run: npx tsx scripts/ci/migrate-through-0025.ts
+        env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
       - name: Bootstrap migration-0026 S3 release ownership
         run: npm run protocol:bootstrap-epic-172-s3-release-owner
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+      - name: Apply migrations through 0026
+        run: npx tsx scripts/ci/migrate-through-0026.ts
+        env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
       - name: Bootstrap migration-0027 S4 protocol ownership
         run: npm run protocol:bootstrap-epic-172-s4-roles
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+      - name: Apply migrations as the disposable migration owner
+        run: npm run db:migrate
+        env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
       - name: Configure disposable release and S4 principal passwords
         working-directory: .
         env:
@@ -125,10 +137,6 @@ jobs:
           ALTER ROLE forge_architect_plan_history_reader PASSWORD 'forge_plan_history_reader_test';
           ALTER ROLE forge_packet_issuer PASSWORD 'forge_packet_issuer_test';
           SQL
-      - name: Apply migrations as the disposable migration owner
-        run: npm run db:migrate
-        env:
-          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
       - name: Reconcile fresh-install root references with zero-scan proof
         run: npm run project-roots:reconcile-expansion
         env:

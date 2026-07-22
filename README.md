@@ -51,9 +51,10 @@ Human intent
 ```
 
 FORGE is currently a **single-operator beta**. It can plan and execute approved
-specialist packages, apply guarded local repository changes, and preserve the
-evidence needed for review. It deliberately stops short of general autonomous
-commits, merges, broad live MCP authority, or unrestricted host control.
+specialist packages, keep generated files in reviewable sandboxes, and preserve
+the evidence needed for review. Direct host repository writes are unavailable.
+It also stops short of autonomous commits, merges, broad live MCP authority, or
+unrestricted host control.
 
 ## Why FORGE
 
@@ -82,7 +83,7 @@ commits, merges, broad live MCP authority, or unrestricted host control.
 - Execute eligible specialist packages sequentially.
 - Build bounded repository context packets.
 - Write generated output into per-attempt sandboxes under `.forge/task-runs`.
-- Apply validated repository-affecting files through guarded local-write policy.
+- Keep generated files there for review and manual application.
 - Enforce command, file-count, byte, timeout, validation, and retry limits.
 - Broker MCP requirements through explicit admission and approval state.
 
@@ -105,7 +106,7 @@ Create task
   -> operator reviews the plan
   -> capability/MCP admission runs
   -> specialist executes in a bounded attempt sandbox
-  -> validated output may be applied to the local project
+  -> operator reviews and manually applies accepted files
   -> QA / Reviewer / Security evidence is collected
   -> operator accepts, requests rework, or stops
 ```
@@ -206,9 +207,15 @@ Current execution paths can be disabled with explicit flags including:
 FORGE_WORKFORCE_MATERIALIZATION=0
 FORGE_WORK_PACKAGE_HANDOFF=0
 FORGE_WORK_PACKAGE_EXECUTION=0
-FORGE_HOST_REPOSITORY_WRITES=0
 FORGE_ACP_WORK_PACKAGE_EXECUTION=0
 ```
+
+Host repository writes are not an available execution path. Leave
+`FORGE_HOST_REPOSITORY_WRITES` unset or set it to `0`, `false`, `off`, `no`, or
+`disabled` for successful sandbox-only execution. Setting it to an enable value
+such as `1` or `true`—including through the legacy `FORGE_REPOSITORY_EDITS`
+alias—fails closed. Generated files remain under `.forge/task-runs` for review
+and manual application until Forge has a hardened repository-write adapter.
 
 ## Roadmap
 

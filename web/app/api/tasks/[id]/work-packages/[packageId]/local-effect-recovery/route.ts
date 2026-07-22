@@ -43,6 +43,9 @@ export async function POST(
     if (!body) {
       return NextResponse.json({ error: 'Invalid local-effect recovery payload.' }, { status: 400 })
     }
+    if (task.status !== 'approved' || task.localProjectionScopeState !== 'active') {
+      return NextResponse.json({ error: 'Recovery state changed. Reload and retry.' }, { status: 409 })
+    }
 
     const result = await applyLocalEffectRecoveryActionV2({
       taskId,

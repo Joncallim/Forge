@@ -16,15 +16,15 @@ For normal local use, `forge` starts both the dashboard and the worker. For
 split deployments, the worker can still run separately.
 
 The most important beta boundary: Forge may write plans, approval records,
-work-package records, handoff/review-gate state, and local repository file
-edits, but not repository commits. Workforce materialization, handoff,
-specialist package execution, and local repository writes are enabled unless
+work-package records, handoff/review-gate state, and generated sandbox files,
+but it does not write directly into the host repository. Workforce
+materialization, handoff, and specialist package execution are enabled unless
 explicitly disabled. Forge may give a specialist bounded read-only
-host-repository context. Generated files are written into a package sandbox at
-`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/` and,
-after the package execution step, repository-affecting files are applied to the local project.
-Branches, commits, pull requests, merges, live specialist MCP grants,
-autonomous reviewer agents, and parallel specialists are still future work.
+host-repository context. Generated files remain under
+`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/` for
+review and manual application. Direct host writes, branches, commits, pull
+requests, merges, live specialist MCP grants, autonomous reviewer agents, and
+parallel specialists are still future work.
 
 The protected local-execution protocol designed in Epic #172 is also future work.
 Its first release target is Ubuntu 24.04 with Linux 6.8 or newer because it depends
@@ -215,22 +215,28 @@ npm run test:providers -- --provider "Provider Name"
 
 ## Executable Workforce Beta
 
-Workforce materialization, handoff, package execution, and local repository
-writes are default-on. To keep the older handoff-artifact-only behavior, set
-one of the disable values (`0`, `false`, `off`, `no`, or `disabled`) in the
-worker environment. If `FORGE_EMBED_WORKER` is enabled, that is the web process
-because it hosts the worker loop; in split deployments, do not set it on the
-web-only process.
+Workforce materialization, handoff, and package execution are default-on. To
+keep the older handoff-artifact-only behavior, set one of the disable values
+(`0`, `false`, `off`, `no`, or `disabled`) in the worker environment. If
+`FORGE_EMBED_WORKER` is enabled, that is the web process because it hosts the
+worker loop; in split deployments, do not set it on the web-only process.
 
 ```bash
 FORGE_WORK_PACKAGE_EXECUTION=0
 ```
 
-To run package models but keep generated files sandbox-only, use:
+Package models already run sandbox-only when this setting is absent. You may
+also make that boundary explicit:
 
 ```bash
 FORGE_HOST_REPOSITORY_WRITES=0
 ```
+
+Do not set this flag to `1` or `true`. Direct host repository writes are
+unavailable, so an enable request fails closed after Forge preserves the
+generated sandbox files. The legacy `FORGE_REPOSITORY_EDITS` alias follows the
+same rule. Review files under `.forge/task-runs`, then apply accepted changes
+manually until Forge has a hardened repository-write adapter.
 
 Deployments adopting the Epic #172 retention and signed-release substrate must
 use the [Step 0 retention bridge runbook](operators/epic-172-step0-retention-bridge.md).
@@ -257,8 +263,8 @@ With the default execution path:
    instructions. This is not a live MCP grant or an unbounded filesystem view.
 6. Generated output is written under the project folder at
    `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`.
-7. Repository-affecting files are applied to the local project unless
-   `FORGE_HOST_REPOSITORY_WRITES=0` is set.
+7. Review the generated files and apply accepted changes manually. Direct host
+   repository application is unavailable.
 8. QA, Reviewer, and Security gates appear when required. In this beta, those
    are manual operator decisions, not proof that separate reviewer agents ran.
 
@@ -267,8 +273,8 @@ one of four states you can act on without reading logs (target-state UI; the
 copy/badge contract lands with S5):
 
 - **Planning context** -- the Architect only suggested an MCP; it is recorded as
-  prompt instructions and never blocks handoff. Generated file writes go through
-  the Forge sandbox/host-apply path, not a live MCP write tool.
+  prompt instructions and never blocks handoff. Generated files stay in the
+  Forge sandbox for manual review; they are not written through a live MCP tool.
 - **Needs project context** -- the package needs bounded read-only filesystem
   context (`filesystem.project.read|list|search`). Approve or deny the exact
   grant shown. Approval today holds a never-approved required grant before the
@@ -359,7 +365,7 @@ Worker and workspace options:
 | `FORGE_WORKFORCE_MATERIALIZATION` | Set `0` or `false` to disable default Workforce record materialization |
 | `FORGE_WORK_PACKAGE_HANDOFF` | Set `0` or `false` to disable default work-package handoff claims |
 | `FORGE_WORK_PACKAGE_EXECUTION` | Set `0`, `false`, `off`, `no`, or `disabled` to disable default package execution and create handoff artifacts only |
-| `FORGE_HOST_REPOSITORY_WRITES` | Set `0`, `false`, `off`, `no`, or `disabled` to keep generated files sandbox-only and skip local project edits |
+| `FORGE_HOST_REPOSITORY_WRITES` | Leave unset, or set `0`, `false`, `off`, `no`, or `disabled`, for successful sandbox-only execution. Enable values fail closed after preserving sandbox output; the legacy `FORGE_REPOSITORY_EDITS` alias behaves the same way. |
 | `FORGE_ACP_WORK_PACKAGE_EXECUTION` | Set `0`, `false`, `off`, `no`, or `disabled` to block ACP package execution when local adapter process access is not acceptable |
 | `FORGE_RUNNING_WORK_PACKAGE_STALE_SECONDS` | Defaults to `900`; retry handoff treats older running package rows as interrupted and recovers them before continuing |
 | `FORGE_WORKSPACE_ROOT` | Fixed workspace root override |

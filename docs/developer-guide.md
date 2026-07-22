@@ -9,13 +9,12 @@ Forge is a Next.js app with a background worker. The dashboard records what the
 operator wants. The worker does the queued work and saves evidence for review.
 
 The current worker starts with the Architect planning stage. Workforce data
-structures now exist for work packages, harnesses, approval gates, and VCS
-summaries. Work-package handoff, sequential specialist execution, and local
-repository edits are default-on unless explicitly disabled. Executable packages
-may receive bounded read-only host-repository context. Generated files are first
-written to per-package sandboxes under
-`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`, then
-repository-affecting files are applied to the local project after the package execution step.
+structures now exist for work packages, harnesses, approval gates, and version
+control summaries. Work-package handoff and sequential specialist execution are
+enabled by default. Executable packages may receive bounded read-only
+host-repository context. Generated files remain in per-package sandboxes under
+`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/` for
+review and manual application. Direct host repository writes are unavailable.
 Forge still does not grant MCP runtime access to specialists, create branches or
 commits, open pull requests, merge work, run autonomous reviewer agents, or run
 specialists in parallel.
@@ -152,8 +151,8 @@ POST /api/tasks
   -> approval job releases ready work packages
   -> MCP/capability broker validates the next handoff before ready/claim
   -> execution reads bounded host context, writes generated output to
-     `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`,
-     and applies local repository edits unless `FORGE_HOST_REPOSITORY_WRITES=0`
+     `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`
+     for review and manual application
   -> manual package QA/Reviewer/Security review gates complete when required
   -> task completes after all work packages and review gates are complete
 ```
@@ -175,7 +174,7 @@ Feature flag defaults:
 | `FORGE_WORKFORCE_MATERIALIZATION` | enabled | Set `0` or `false` to skip durable work-package/gate records. |
 | `FORGE_WORK_PACKAGE_HANDOFF` | enabled | Set `0` or `false` to stop package handoff claims. |
 | `FORGE_WORK_PACKAGE_EXECUTION` | enabled | Set `0`, `false`, `off`, `no`, or `disabled` to stop specialist package execution and create handoff artifacts only. |
-| `FORGE_HOST_REPOSITORY_WRITES` | enabled | Set `0`, `false`, `off`, `no`, or `disabled` to keep generated files sandbox-only and skip local project edits. |
+| `FORGE_HOST_REPOSITORY_WRITES` | unavailable | Leave unset, or set `0`, `false`, `off`, `no`, or `disabled`, for successful sandbox-only execution. Enable values fail closed after preserving sandbox output. The legacy `FORGE_REPOSITORY_EDITS` alias follows the same rule. |
 | `FORGE_ACP_WORK_PACKAGE_EXECUTION` | enabled | Set `0`, `false`, `off`, `no`, or `disabled` to block ACP package execution when local adapter process access is not acceptable. |
 | `FORGE_RUNNING_WORK_PACKAGE_STALE_SECONDS` | `900` | Recovery window before a retry marks an interrupted running work package blocked and starts the next eligible attempt. |
 
@@ -183,9 +182,11 @@ Feature flag defaults:
 
 `FORGE_WORK_PACKAGE_EXECUTION=0` changes only the final package execution step:
 approval records reviewable handoff artifacts but does not call a specialist
-package model. `FORGE_HOST_REPOSITORY_WRITES=0` still lets package models run,
-but keeps generated files under `.forge/task-runs` instead of applying them to
-the local project.
+package model. With host-write configuration unset or explicitly disabled,
+package models run successfully and keep generated files under
+`.forge/task-runs` for review and manual application. An enable value such as
+`1` or `true` is an unsupported request and fails closed; it never authorizes a
+host write.
 
 When execution is enabled:
 
@@ -205,13 +206,11 @@ When execution is enabled:
    `npm run lint`. In the beta, Forge performs static validation of the
    generated sandbox output for those command labels, including script safety,
    placeholder checks, and JavaScript syntax checks; it does not run arbitrary
-   package scripts. Repository-affecting packages must include at least one
-   validation command before Forge applies generated files to the host
-   repository.
-8. If host repository writes are enabled, Forge applies generated files only
-   after sandbox validation passes and the host working tree is clean. Forge
-   writes each file through a temporary sibling file and atomic rename; a
-   mid-batch failure records which paths were already written in the error.
+   package scripts.
+8. Direct host repository application is unavailable. If an operator requests
+   it with an enable value, Forge preserves the sandbox output and returns a
+   fail-closed unavailable result. A hardened repository-write adapter is
+   required before this boundary can change.
 9. Package artifacts record the generated file list, sandbox path, command
    results, model/provider snapshot, and review source artifact.
 

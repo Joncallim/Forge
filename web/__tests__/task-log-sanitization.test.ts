@@ -49,6 +49,41 @@ describe('sanitizeLogStructuredValue sensitive-key removal', () => {
     expect(cleaned.tokenCount).toBe(5)
   })
 
+  it('removes clarification text aliases from structured task logs', () => {
+    const cleaned = sanitizeLogStructuredValue({
+      id: 'question-1',
+      status: 'open',
+      question: 'RAW-QUESTION-SENTINEL',
+      suggestions: ['RAW-SUGGESTION-SENTINEL'],
+      answer: 'RAW-ANSWER-SENTINEL',
+      nested: {
+        openQuestions: [{ question: 'RAW-NESTED-QUESTION-SENTINEL' }],
+        answeredQuestions: [{ answer: 'RAW-NESTED-ANSWER-SENTINEL' }],
+      },
+    }) as Record<string, unknown>
+
+    expect(cleaned).toEqual({
+      id: 'question-1',
+      status: 'open',
+      nested: {},
+    })
+    expect(JSON.stringify(cleaned)).not.toContain('RAW-')
+    for (const key of [
+      'question',
+      'questions',
+      'suggestion',
+      'suggestions',
+      'answer',
+      'answers',
+      'openQuestion',
+      'openQuestions',
+      'answeredQuestion',
+      'answeredQuestions',
+    ]) {
+      expect(classifySensitivePayloadKey(key)).toBe('prompt')
+    }
+  })
+
   it('leaves ordinary values untouched', () => {
     const cleaned = sanitizeLogStructuredValue({
       status: 'ready',

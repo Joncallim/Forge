@@ -22,6 +22,7 @@ import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
 import { validateMcpOperatorReviewHistory } from '@/worker/mcp-plan-review'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 import { sanitizeWorkPackageMetadata } from '@/lib/mcps/leakage-drain'
+import { taskQuestionSummary } from '@/lib/mcps/clarification-projection'
 
 // ---------------------------------------------------------------------------
 // GET /api/tasks/:id
@@ -60,6 +61,19 @@ function taskDetailArtifact<T extends { artifactType: string; metadata: unknown 
     ...artifact,
     metadata: protectedArchitectHistory ? { historyAvailable: true } : sanitized,
   }
+}
+
+function latestProtectedPlanVersion(
+  taskArtifacts: readonly { artifactType: string; metadata: unknown }[],
+): string | null {
+  for (let index = taskArtifacts.length - 1; index >= 0; index -= 1) {
+    const artifact = taskArtifacts[index]
+    if (artifact.artifactType !== 'adr_text' || !isRecord(artifact.metadata)) continue
+    if (artifact.metadata.historyAvailable !== true) continue
+    const planVersion = artifact.metadata.planVersion
+    if (typeof planVersion === 'string' && /^[1-9][0-9]{0,18}$/.test(planVersion)) return planVersion
+  }
+  return null
 }
 
 function taskDetailApprovalGateMetadata(metadata: unknown): Record<string, unknown> {
@@ -247,11 +261,17 @@ export async function GET(
       .where(eq(taskAttempts.taskId, id))
       .orderBy(asc(taskAttempts.createdAt))
 
-    const questions = await db
-      .select()
+    const questionRows = await db
+      .select({
+        id: taskQuestions.id,
+        status: taskQuestions.status,
+        createdAt: taskQuestions.createdAt,
+        answeredAt: taskQuestions.answeredAt,
+      })
       .from(taskQuestions)
       .where(eq(taskQuestions.taskId, id))
       .orderBy(asc(taskQuestions.createdAt))
+    const questions = questionRows.map(taskQuestionSummary)
 
     // Fetch artifacts for all runs
     const runIds = runs.map((r) => r.id)
@@ -335,6 +355,12 @@ export async function GET(
       artifacts: safeTaskArtifacts,
       attempts,
       questions,
+      clarification: {
+        planVersion: latestProtectedPlanVersion(taskArtifacts),
+        questionCount: questions.length,
+        openCount: questions.filter((question) => question.status !== 'answered').length,
+        answeredCount: questions.filter((question) => question.status === 'answered').length,
+      },
       workPackages: taskWorkPackagesWithPrompts,
       approvalGates: taskApprovalGatesWithValidatedReviews,
       commandAudits: taskCommandAudits,

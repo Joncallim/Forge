@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import postgres from 'postgres'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
-  bindArchitectReplanEntry,
+  bindArchitectReplanContext,
   executableReferenceForEntry,
   recordArchitectPlanVersion,
   resolveArchitectPlanEntry,
@@ -37,6 +37,8 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     replanRun: randomUUID(),
     firstRun: randomUUID(),
     secondRun: randomUUID(),
+    firstClaimRun: randomUUID(),
+    secondClaimRun: randomUUID(),
     firstEvidence: randomUUID(),
     secondEvidence: randomUUID(),
     firstLocalClaim: randomUUID(),
@@ -74,18 +76,20 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         values (${ids.task}::uuid, ${ids.project}::uuid, ${ids.user}::uuid, 'S4 test', 'protected', 'running')
       `
       await tx`
-        insert into sessions (id, user_id, credential_digest_v1, expires_at)
+        insert into sessions (
+          id, user_id, credential_digest_v1, expires_at, credential_storage_version
+        )
         values (
           ${randomUUID()}::uuid, ${ids.user}::uuid,
           ${computeCredentialDigest(sessionCredential).digest}::bytea,
-          clock_timestamp() + interval '7 days'
+          clock_timestamp() + interval '7 days', 2
         )
       `
       await tx`
         insert into work_packages (
           id, task_id, assigned_role, title, summary, sequence, status
         ) values (
-          ${ids.package}::uuid, ${ids.task}::uuid, 'backend', 'S4 test package', 'bounded', 1, 'running'
+          ${ids.package}::uuid, ${ids.task}::uuid, 'backend', 'S4 test package', 'bounded', 1, 'ready'
         )
       `
       await tx`
@@ -120,18 +124,6 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         where work_package_id = ${ids.package}::uuid
       `
       await tx`
-        update work_packages
-        set metadata = jsonb_build_object('executionLease', jsonb_build_object(
-          'acquiredAt', to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
-          'attemptNumber', 1,
-          'heartbeatAt', to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
-          'runId', ${ids.firstRun}::text,
-          'source', 'work-package-handoff',
-          'staleAfterSeconds', 30
-        ))
-        where id = ${ids.package}::uuid
-      `
-      await tx`
         insert into forge_release_signer_keys (
           id, generation, public_key_spki, github_app_id, ruleset_fingerprint,
           status, valid_from, valid_until
@@ -155,12 +147,12 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
             `issue_179_s4@${'a'.repeat(40)}`,
             `issue_180_s5@${'a'.repeat(40)}`,
             `issue_181_s6@${'a'.repeat(40)}`,
-          ])}::jsonb,
+          ])}::text::jsonb,
           '[{"name":"postgres_fixture","measurementDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]'::jsonb,
           ${'a'.repeat(40)}, 2, '[]'::jsonb, ${'0'.repeat(64)}, ${'c'.repeat(64)},
           ${ids.signerKey}::uuid, 1, 's4-postgres-test', 's4-postgres-test', 'enablement',
           ${'e'.repeat(64)}, decode(repeat('aa', 64), 'hex'), ${randomUUID()}::uuid,
-          clock_timestamp(), '{}'::jsonb
+          transaction_timestamp(), '{}'::jsonb
         ),
         (
           ${ids.readinessReceipt}::uuid, 's5_s6_release_ready', 181, 's6',
@@ -168,12 +160,12 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
             `issue_179_s4@${'a'.repeat(40)}`,
             `issue_180_s5@${'a'.repeat(40)}`,
             `issue_181_s6@${'a'.repeat(40)}`,
-          ])}::jsonb,
+          ])}::text::jsonb,
           '[{"name":"postgres_fixture","measurementDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]'::jsonb,
           ${'a'.repeat(40)}, 2, '[]'::jsonb, ${'1'.repeat(64)}, ${'d'.repeat(64)},
           ${ids.signerKey}::uuid, 1, 's4-postgres-test', 's4-postgres-test', 'readiness',
           ${'f'.repeat(64)}, decode(repeat('bb', 64), 'hex'), ${randomUUID()}::uuid,
-          clock_timestamp(), '{}'::jsonb
+          transaction_timestamp(), '{}'::jsonb
         )
       `
       await tx`
@@ -183,7 +175,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
               `issue_179_s4@${'a'.repeat(40)}`,
               `issue_180_s5@${'a'.repeat(40)}`,
               `issue_181_s6@${'a'.repeat(40)}`,
-            ])}::jsonb,
+            ])}::text::jsonb,
             reviewed_sha = ${'a'.repeat(40)}, epoch = 2,
             enablement_receipt_id = ${ids.enablementReceipt}::uuid,
             final_readiness_receipt_id = ${ids.readinessReceipt}::uuid,
@@ -255,7 +247,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
               `issue_179_s4@${'a'.repeat(40)}`,
               `issue_180_s5@${'a'.repeat(40)}`,
               `issue_181_s6@${'a'.repeat(40)}`,
-            ])}::jsonb,
+            ])}::text::jsonb,
             reviewed_sha = ${'a'.repeat(40)}, epoch = 2,
             enablement_receipt_id = ${ids.enablementReceipt}::uuid,
             final_readiness_receipt_id = ${ids.readinessReceipt}::uuid,
@@ -288,12 +280,36 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         projectionEligible: false,
         requirementKey: null,
       }, {
+        agent: null,
+        bindingFingerprint: null,
+        content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }),
+        entryId: 'requirement:plan-policy',
+        entryKind: 'requirement',
+        projectionEligible: false,
+        requirementKey: 'plan-policy',
+      }, {
         agent: 'backend',
         bindingFingerprint: SHA,
-        content: 'Read only the approved bounded project context.',
+        content: JSON.stringify({
+          capabilityBindings: [{
+            capability: 'filesystem.project.read',
+            requirementKey: 'filesystem-context',
+          }],
+          schemaVersion: 1,
+        }),
         entryId: 'subtask:000001:backend',
         entryKind: 'subtask',
         projectionEligible: true,
+        requirementKey: 'filesystem-context',
+      }, {
+        agent: 'backend',
+        bindingFingerprint: SHA,
+        content: JSON.stringify({
+          agent: 'backend', requirementKey: 'filesystem-context', schemaVersion: 1,
+        }),
+        entryId: 'routing:filesystem-context:backend',
+        entryKind: 'routing',
+        projectionEligible: false,
         requirementKey: 'filesystem-context',
       }],
     })
@@ -306,10 +322,10 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     })
     await expect(readArchitectPlanHistory({
       planVersion: '1', sessionCredential, taskId: ids.task,
-    })).resolves.toEqual([expect.objectContaining({
+    })).resolves.toEqual(expect.arrayContaining([expect.objectContaining({
       entryId: 'subtask:000001:backend',
-      content: 'Read only the approved bounded project context.',
-    })])
+      content: expect.stringContaining('filesystem.project.read'),
+    })]))
     const [historyAudit] = await admin<{ reads: number }[]>`
       select count(*)::integer as reads from architect_plan_history_reads
       where task_id = ${ids.task}::uuid and user_id = ${ids.user}::uuid
@@ -330,8 +346,8 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       reference,
       referenceId: bound.referenceId,
       taskId: ids.task,
-    })).resolves.toEqual({
-      content: 'Read only the approved bounded project context.',
+    })).resolves.toMatchObject({
+      content: expect.stringContaining('filesystem.project.read'),
       entryId: 'subtask:000001:backend',
     })
     await expect(resolveArchitectPlanEntry({
@@ -346,15 +362,23 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     expect(architectReplanReferenceForEntry(planBody)).toEqual(expect.objectContaining({
       entryId: 'plan_body:000000',
     }))
-    const replanReferenceId = await bindArchitectReplanEntry({
+    const replanContext = await bindArchitectReplanContext({
       agentRunId: ids.replanRun,
-      taskId: ids.task,
+      priorPlanArtifactId: recorded.artifactId,
     })
+    expect(replanContext.map((entry) => entry.entryId)).toEqual(expect.arrayContaining([
+      'plan_body:000000',
+      'requirement:plan-policy',
+      'routing:filesystem-context:backend',
+    ]))
+    const replanReferenceId = replanContext.find(
+      (entry) => entry.entryId === 'plan_body:000000',
+    )!.referenceId
     await expect(resolveArchitectPlanEntry({
       digestKey: key,
       expectedPurpose: 'architect_replan',
       referenceId: replanReferenceId,
-    })).resolves.toEqual({
+    })).resolves.toMatchObject({
       content: 'Prior protected Architect plan body.',
       entryId: 'plan_body:000000',
     })
@@ -374,10 +398,12 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       // This is the durable state after digest backfill but before the independent
       // primary-key update. It models a statement-level migration interruption.
       await tx`
-        insert into sessions (id, user_id, credential_digest_v1, expires_at)
+        insert into sessions (
+          id, user_id, credential_digest_v1, expires_at, credential_storage_version
+        )
         values (
           ${legacyCredential}::uuid, ${legacyUser}::uuid, ${expectedDigest}::bytea,
-          clock_timestamp() + interval '7 days'
+          clock_timestamp() + interval '7 days', 2
         )
       `
     })
@@ -411,14 +437,58 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
   })
 
   it('allow-once-single-winner: atomically keeps one audit and one nonce claim', async () => {
+    const packageId = randomUUID()
+    const decisionId = randomUUID()
+    const nonce = randomUUID()
+    await admin.begin(async (tx) => {
+      await tx`
+        insert into work_packages (
+          id, task_id, assigned_role, title, summary, sequence, status
+        ) values (
+          ${packageId}::uuid, ${ids.task}::uuid, 'backend',
+          'Single-winner package', 'bounded', 10, 'ready'
+        )
+      `
+      await tx`
+        insert into filesystem_mcp_grant_approvals (
+          id, project_id, task_id, work_package_id, decided_by, decision,
+          capabilities, effective_grant, decision_scope, grant_decision_revision,
+          root_binding_revision, grant_nonce, pointer_fingerprint
+        ) values (
+          ${decisionId}::uuid, ${ids.project}::uuid, ${ids.task}::uuid,
+          ${packageId}::uuid, ${ids.user}::uuid, 'approved',
+          '["filesystem.project.read"]'::jsonb, '{}'::jsonb, 'package', 1, 1,
+          ${nonce}::uuid, ${SHA}
+        )
+      `
+      await tx`
+        update filesystem_mcp_current_decision_pointers
+        set current_decision_id = ${decisionId}::uuid,
+            current_decision_task_id = ${ids.task}::uuid,
+            current_decision_work_package_id = ${packageId}::uuid,
+            current_decision_revision = 1,
+            current_decision_fingerprint = ${SHA},
+            pointer_fingerprint = ${SHA}, pointer_version = 1
+        where work_package_id = ${packageId}::uuid
+      `
+    })
+    const [snapshot] = await admin<{ updatedAt: string }[]>`
+      select updated_at::text as "updatedAt" from work_packages where id = ${packageId}::uuid
+    `
     const attempts = await Promise.allSettled([
-      issuer`select * from forge.claim_packet_lifecycle_v2(
-        ${ids.firstRun}::uuid, ${ids.decision}::uuid,
+      issuer`select * from forge.claim_work_package_lifecycle_v2(
+        'packet', ${ids.task}::uuid, ${packageId}::uuid,
+        ${snapshot.updatedAt}::text::timestamptz, ${ids.firstClaimRun}::uuid,
+        'backend', null, 1, null, 'test', null, 'not_applicable',
+        'implementation', 30, ${decisionId}::uuid,
         ${ids.firstLocalClaim}::uuid, ${randomUUID()}::uuid,
         30, 20, array['filesystem.project.read']::text[]
       )`,
-      issuer`select * from forge.claim_packet_lifecycle_v2(
-        ${ids.secondRun}::uuid, ${ids.decision}::uuid,
+      issuer`select * from forge.claim_work_package_lifecycle_v2(
+        'packet', ${ids.task}::uuid, ${packageId}::uuid,
+        ${snapshot.updatedAt}::text::timestamptz, ${ids.secondClaimRun}::uuid,
+        'backend', null, 1, null, 'test', null, 'not_applicable',
+        'implementation', 30, ${decisionId}::uuid,
         ${ids.secondLocalClaim}::uuid, ${randomUUID()}::uuid,
         30, 20, array['filesystem.project.read']::text[]
       )`,
@@ -433,9 +503,14 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       from filesystem_mcp_runtime_audits audit
       left join filesystem_mcp_decision_nonce_claims claim
         on claim.runtime_audit_id = audit.id
-      where audit.grant_approval_id = ${ids.decision}::uuid
+      where audit.grant_approval_id = ${decisionId}::uuid
     `
     expect(counts).toEqual({ audits: 1, nonceClaims: 1 })
+    await admin`
+      update work_packages
+      set status = 'blocked', metadata = metadata - 'executionLease'
+      where id = ${packageId}::uuid
+    `
   })
 
   it('failure-recovery-atomicity: rolls back both audit and nonce on invalid coverage', async () => {
@@ -447,22 +522,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       await tx`
         insert into work_packages (
           id, task_id, assigned_role, title, summary, sequence, status
-        ) values (${packageId}::uuid, ${ids.task}::uuid, 'backend', 'Rollback package', 'bounded', 2, 'running')
-      `
-      await tx`
-        insert into agent_runs (id, task_id, work_package_id, agent_type, model_id_used, status)
-        values (${runId}::uuid, ${ids.task}::uuid, ${packageId}::uuid, 'backend', 'test', 'running')
-      `
-      await tx`
-        update work_packages
-        set metadata = jsonb_build_object('executionLease', jsonb_build_object(
-          'acquiredAt', to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
-          'attemptNumber', 1,
-          'heartbeatAt', to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
-          'runId', ${runId}::text,
-          'source', 'work-package-handoff', 'staleAfterSeconds', 30
-        ))
-        where id = ${packageId}::uuid
+        ) values (${packageId}::uuid, ${ids.task}::uuid, 'backend', 'Rollback package', 'bounded', 11, 'ready')
       `
       await tx`
         insert into filesystem_mcp_grant_approvals (
@@ -485,20 +545,28 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         where work_package_id = ${packageId}::uuid
       `
     })
+    const [snapshot] = await admin<{ updatedAt: string }[]>`
+      select updated_at::text as "updatedAt" from work_packages where id = ${packageId}::uuid
+    `
 
-    await expect(issuer`select * from forge.claim_packet_lifecycle_v2(
-      ${runId}::uuid, ${decisionId}::uuid,
+    await expect(issuer`select * from forge.claim_work_package_lifecycle_v2(
+      'packet', ${ids.task}::uuid, ${packageId}::uuid,
+      ${snapshot.updatedAt}::text::timestamptz, ${runId}::uuid,
+      'backend', null, 1, null, 'test', null, 'not_applicable',
+      'implementation', 30, ${decisionId}::uuid,
       ${randomUUID()}::uuid, ${randomUUID()}::uuid,
       30, 20, array['filesystem.project.write']::text[]
     )`).rejects.toBeDefined()
-    const [row] = await admin<{ audits: number; nonceClaims: number }[]>`
+    const [row] = await admin<{ audits: number; nonceClaims: number; runs: number }[]>`
       select
         (select count(*)::integer from filesystem_mcp_runtime_audits
           where grant_approval_id = ${decisionId}::uuid) as audits,
         (select count(*)::integer from filesystem_mcp_decision_nonce_claims
-          where grant_approval_id = ${decisionId}::uuid) as "nonceClaims"
+          where grant_approval_id = ${decisionId}::uuid) as "nonceClaims",
+        (select count(*)::integer from agent_runs
+          where id = ${runId}::uuid) as runs
     `
-    expect(row).toEqual({ audits: 0, nonceClaims: 0 })
+    expect(row).toEqual({ audits: 0, nonceClaims: 0, runs: 0 })
   })
 
   it('always-allow-single-run-claim: fails closed without the immutable S3 project pointer', async () => {
@@ -510,22 +578,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       await tx`
         insert into work_packages (
           id, task_id, assigned_role, title, summary, sequence, status
-        ) values (${packageId}::uuid, ${ids.task}::uuid, 'backend', 'Project grant package', 'bounded', 3, 'running')
-      `
-      await tx`
-        insert into agent_runs (id, task_id, work_package_id, agent_type, model_id_used, status)
-        values (${runId}::uuid, ${ids.task}::uuid, ${packageId}::uuid, 'backend', 'test', 'running')
-      `
-      await tx`
-        update work_packages
-        set metadata = jsonb_build_object('executionLease', jsonb_build_object(
-          'acquiredAt', to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
-          'attemptNumber', 1,
-          'heartbeatAt', to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
-          'runId', ${runId}::text,
-          'source', 'work-package-handoff', 'staleAfterSeconds', 30
-        ))
-        where id = ${packageId}::uuid
+        ) values (${packageId}::uuid, ${ids.task}::uuid, 'backend', 'Project grant package', 'bounded', 12, 'ready')
       `
       await tx`
         insert into project_filesystem_grant_decisions (
@@ -537,9 +590,15 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         )
       `
     })
+    const [snapshot] = await admin<{ updatedAt: string }[]>`
+      select updated_at::text as "updatedAt" from work_packages where id = ${packageId}::uuid
+    `
 
-    await expect(issuer`select * from forge.claim_packet_lifecycle_v2(
-      ${runId}::uuid, ${decisionId}::uuid,
+    await expect(issuer`select * from forge.claim_work_package_lifecycle_v2(
+      'packet', ${ids.task}::uuid, ${packageId}::uuid,
+      ${snapshot.updatedAt}::text::timestamptz, ${runId}::uuid,
+      'backend', null, 1, null, 'test', null, 'not_applicable',
+      'implementation', 30, ${decisionId}::uuid,
       ${claimToken}::uuid, ${randomUUID()}::uuid,
       30, 20, array['filesystem.project.read']::text[]
     )`).rejects.toMatchObject({ code: '55000' })
@@ -570,31 +629,23 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     await admin.begin(async (tx) => {
       await tx`
         insert into work_packages (id, task_id, assigned_role, title, summary, sequence, status)
-        values (${packageId}::uuid, ${ids.task}::uuid, 'backend', 'Fixed writer package', 'bounded', 4, 'running')
-      `
-      await tx`
-        insert into agent_runs (id, task_id, work_package_id, agent_type, model_id_used, status)
-        values (${runId}::uuid, ${ids.task}::uuid, ${packageId}::uuid, 'backend', 'test', 'running')
-      `
-      await tx`
-        update work_packages
-        set metadata = jsonb_build_object('executionLease', jsonb_build_object(
-          'acquiredAt', to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
-          'attemptNumber', 1,
-          'heartbeatAt', to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
-          'runId', ${runId}::text,
-          'source', 'work-package-handoff', 'staleAfterSeconds', 30
-        ))
-        where id = ${packageId}::uuid
+        values (${packageId}::uuid, ${ids.task}::uuid, 'backend', 'Fixed writer package', 'bounded', 13, 'ready')
       `
     })
     await expect(issuer`
       select forge.create_local_run_evidence_v1(${runId}::uuid, ${claimToken}::uuid, 30)
     `).rejects.toMatchObject({ code: '42501' })
+    const [snapshot] = await admin<{ updatedAt: string }[]>`
+      select updated_at::text as "updatedAt" from work_packages where id = ${packageId}::uuid
+    `
     const [created] = await issuer<{ evidenceId: string }[]>`
       select local_run_evidence_id as "evidenceId"
-      from forge.claim_local_lifecycle_v2(
-        ${runId}::uuid, ${claimToken}::uuid, 30
+      from forge.claim_work_package_lifecycle_v2(
+        'local_only', ${ids.task}::uuid, ${packageId}::uuid,
+        ${snapshot.updatedAt}::text::timestamptz, ${runId}::uuid,
+        'backend', null, 1, null, 'test', null, 'not_applicable',
+        'implementation', 30, null, ${claimToken}::uuid, null,
+        30, null, array[]::text[]
       )
     `
     const [row] = await admin<{ agentRunId: string; state: string }[]>`

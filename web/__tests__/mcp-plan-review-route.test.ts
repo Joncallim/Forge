@@ -376,6 +376,15 @@ describe('GET /api/tasks/:id/architect-plan-history/:planVersion', () => {
   })
 
   it('returns only the audited fixed-principal history result', async () => {
+    mockReadArchitectPlanHistory.mockResolvedValueOnce([{
+      entryId: 'clarification_question:11111111-1111-4111-8111-111111111111',
+      entryKind: 'clarification_question',
+      content: JSON.stringify({
+        schemaVersion: 1,
+        question: 'AUDITED-QUESTION-SENTINEL',
+        suggestions: ['AUDITED-SUGGESTION-SENTINEL'],
+      }),
+    }])
     const { GET } = await import('@/app/api/tasks/[id]/architect-plan-history/[planVersion]/route')
     const response = await GET(new Request('http://localhost/api/tasks/task-1/architect-plan-history/2') as never, {
       params: Promise.resolve({ id: 'task-1', planVersion: '2' }),
@@ -385,6 +394,12 @@ describe('GET /api/tasks/:id/architect-plan-history/:planVersion', () => {
       planVersion: '2',
       sessionCredential: '00000000-0000-4000-8000-000000000000',
       taskId: 'task-1',
+    })
+    await expect(response.json()).resolves.toMatchObject({
+      entries: [{
+        entryKind: 'clarification_question',
+        content: expect.stringContaining('AUDITED-QUESTION-SENTINEL'),
+      }],
     })
   })
 

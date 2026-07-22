@@ -179,6 +179,40 @@ describe('protected S4 operator recovery routes', () => {
     expect(mockApplyPacket).not.toHaveBeenCalled()
   })
 
+  it.each(['pending', 'running', 'awaiting_answers', 'completed']) (
+    'rejects local-effect recovery for task status %s before the protected mutation',
+    async (status) => {
+      mockGetAccessibleTask.mockResolvedValue({
+        id: taskId,
+        projectId: 'project-1',
+        status,
+        localProjectionScopeState: 'active',
+      })
+      const { POST } = await import('@/app/api/tasks/[id]/work-packages/[packageId]/local-effect-recovery/route')
+      const response = await POST(localRequest('review_local_changes') as never, {
+        params: Promise.resolve({ id: taskId, packageId }),
+      })
+      expect(response.status).toBe(409)
+      expect(mockApplyLocal).not.toHaveBeenCalled()
+      expect(mockConverge).not.toHaveBeenCalled()
+    },
+  )
+
+  it('rejects local-effect recovery when the approved task projection is no longer active', async () => {
+    mockGetAccessibleTask.mockResolvedValue({
+      id: taskId,
+      projectId: 'project-1',
+      status: 'approved',
+      localProjectionScopeState: 'archive_pending',
+    })
+    const { POST } = await import('@/app/api/tasks/[id]/work-packages/[packageId]/local-effect-recovery/route')
+    const response = await POST(localRequest('review_local_changes') as never, {
+      params: Promise.resolve({ id: taskId, packageId }),
+    })
+    expect(response.status).toBe(409)
+    expect(mockApplyLocal).not.toHaveBeenCalled()
+  })
+
   it('rejects retry without an exact current approved project filesystem decision', async () => {
     mockLoadCurrentProjectFilesystemDecision.mockResolvedValue({
       decisionId: projectDecisionId,

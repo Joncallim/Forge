@@ -1,5 +1,6 @@
 import { sanitizeWorkerMessage } from './redaction'
 import { defaultOnFeatureFlagState } from './feature-flags'
+import { hostRepositoryWritePolicyState } from './repository-edit-policy'
 
 const DEFAULT_CLAIM_TIMEOUT_SECONDS = 5
 const APPROVAL_CLAIM_TIMEOUT_SECONDS = 1
@@ -226,13 +227,13 @@ async function startWorkerOnce(
 
   const run = async (): Promise<void> => {
     const executionMode = defaultOnFeatureFlagState(process.env.FORGE_WORK_PACKAGE_EXECUTION)
-    const hostWriteMode = defaultOnFeatureFlagState(
-      process.env.FORGE_HOST_REPOSITORY_WRITES ?? process.env.FORGE_REPOSITORY_EDITS,
-    )
+    const hostWriteMode = hostRepositoryWritePolicyState()
     console.info('[worker] Started', {
       claimTimeoutSeconds,
+      hostRepositoryWritesAvailable: hostWriteMode.available,
       hostRepositoryWritesEnabled: hostWriteMode.enabled,
       hostRepositoryWritesFlagRecognized: hostWriteMode.recognized,
+      hostRepositoryWritesRequested: hostWriteMode.requested,
       maxAttempts,
       providerHealthIntervalSeconds,
       source,
@@ -241,6 +242,13 @@ async function startWorkerOnce(
       workPackageExecutionFlagRecognized: executionMode.recognized,
       workerId,
     })
+
+    if (hostWriteMode.requested) {
+      console.warn('[worker] Host repository writes are unavailable; enabled requests fail closed after sandbox output is preserved', {
+        flag: hostWriteMode.source,
+        workerId,
+      })
+    }
 
     try {
       if (providerHealthIntervalSeconds > 0) {

@@ -294,6 +294,8 @@ describe('task page Workforce beta presentation helpers', () => {
         commandResults: [{ command: ['npm', 'test'], exitCode: 0 }],
         files: ['src/app.tsx'],
         generatedBy: 'work-package-executor',
+        hostRepositoryWritePaths: ['src/app.tsx'],
+        hostRepositoryWrites: true,
         sandboxPath: '/repo/.forge/task-runs/task-1/pkg-1',
         validationStatus: 'passed',
         workPackageId: 'pkg-1',
@@ -306,16 +308,18 @@ describe('task page Workforce beta presentation helpers', () => {
       commandCount: 1,
       fileCount: 1,
       files: ['src/app.tsx'],
-      hostRepositoryWritePaths: [],
-      hostRepositoryWrites: false,
       sandboxPath: '/repo/.forge/task-runs/task-1/pkg-1',
       validationStatus: 'passed',
     }])
-    expect(workforceExecutionSummary({
+    const summary = workforceExecutionSummary({
       artifacts: [sandboxArtifact],
       runs: [],
       workPackages: [packageBase],
-    }).mode).toBe('sandbox_output')
+    })
+    expect(summary.mode).toBe('sandbox_output')
+    expect(summary.detail).toContain('apply accepted changes manually')
+    expect(summary.detail).not.toContain('host-write')
+    expect(summary.detail).not.toContain('applied')
   })
 
   it('merges streamed runs with initial DB runs while preserving package execution fields', () => {

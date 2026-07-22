@@ -17,17 +17,23 @@ Forge is trusted with commits or PR automation.
 
 ## Decision
 
-Forge will allow executable Workforce beta runs with default-on local project
-edits and a reviewable sandbox copy of every generated file.
+Forge will allow executable Workforce beta runs in sandbox-only mode. Generated
+files remain reviewable without giving the beta a direct host repository write
+path.
 
 ### Execution Boundary
 
-- Work-package materialization, handoff, model execution, and local repository
-  writes are enabled by default.
+- Work-package materialization, handoff, and model execution are enabled by
+  default. Host repository writes are unavailable.
 - `FORGE_WORK_PACKAGE_EXECUTION=0`, `false`, `off`, `no`, or `disabled`
   disables model execution and keeps the handoff-artifact-only path.
-- `FORGE_HOST_REPOSITORY_WRITES=0`, `false`, `off`, `no`, or `disabled` lets
-  package models run but keeps generated files sandbox-only.
+- Leaving `FORGE_HOST_REPOSITORY_WRITES` unset, or setting it to `0`, `false`,
+  `off`, `no`, or `disabled`, lets package models run successfully in
+  sandbox-only mode.
+- Setting `FORGE_HOST_REPOSITORY_WRITES` to an enable value such as `1` or
+  `true` fails closed. The legacy `FORGE_REPOSITORY_EDITS` alias follows the
+  same rule. Forge preserves generated sandbox files but does not report them
+  as applied to the host repository.
 - ACP-backed work-package execution is enabled after an operator configures an
   ACP provider and approves the task. ACP adapters are local processes and are
   not OS-confined by Forge. Set `FORGE_ACP_WORK_PACKAGE_EXECUTION=0`, `false`,
@@ -41,20 +47,17 @@ edits and a reviewable sandbox copy of every generated file.
   not give the specialist an unbounded filesystem view.
 - Generated output is first written under the validated project root at
   `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`.
-- After the package execution step, repository-affecting package output is
-  applied to the local project unless host repository writes are explicitly
-  disabled. This is a local file edit, not a branch, commit, pull request,
-  merge, or issue update. Forge blocks this path when the working tree is dirty
-  so generated output does not interleave with operator edits.
+- Generated output remains under `.forge/task-runs` for operator review and
+  manual application. Direct host application will remain unavailable until a
+  later, security-reviewed slice provides an operating-system-enforced project
+  boundary or hardened repository-write adapter.
 - File writes must use relative paths. Absolute paths, path traversal, `.git`,
   `.forge`, `node_modules`, symlink targets, and local conflict-copy names are
   outside the beta boundary.
 - Package validation requests are limited to the approved validation surface,
   currently `npm test`, `npm run build`, and `npm run lint`. In the beta,
   Forge performs static validation for those command labels against generated
-  sandbox output; it does not run arbitrary package scripts. Repository-
-  affecting packages that provide no validation commands fail before host files
-  are applied.
+  sandbox output; it does not run arbitrary package scripts.
 - Repository evidence commands are limited to read-only Git status/diff
   evidence, redacted, bounded, and audited. Host package-manager validation is
   blocked in repository evidence; package validation remains inside the sandbox.
@@ -138,14 +141,15 @@ The executable Workforce beta explicitly defers:
 - user-edited grant scopes,
 - autonomous QA, Reviewer, or Security agent-run gates,
 - harness-enforced execution policy,
+- direct host repository writes,
 - remote repository writes.
 
 ## Consequences
 
-Operators can review generated sandbox files, applied host-file metadata, static
-validation results, repository evidence, proposed and brokered grants, blocked
-reasons, prompt overlays, review gates, rework reasons, and structured security
-findings before deciding whether output is useful.
+Operators can review generated sandbox files, static validation results,
+repository evidence, proposed and brokered grants, blocked reasons, prompt
+overlays, review gates, rework reasons, and structured security findings before
+manually applying useful output.
 
 The cost is extra terminology and a stricter product boundary. That cost is
 intentional: Forge should prove sequential execution and manual review before

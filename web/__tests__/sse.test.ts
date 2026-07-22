@@ -316,6 +316,71 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     expect(lines.join('\n')).not.toContain('RAW-API-KEY-SENTINEL')
   }, 2000)
 
+  it('reduces reconnect question snapshots to opaque status and timestamp summaries', async () => {
+    let selectCount = 0
+    mockDbSelect.mockImplementation(() => {
+      selectCount += 1
+      if (selectCount === 1) return dbChain([fakeTask()])
+      if (selectCount === 2) return dbChain([{ status: fakeTask().status }])
+      if (selectCount === 3) {
+        return dbChain([{
+          id: 'run-task',
+          taskId: 'task-sse-1',
+          workPackageId: null,
+          agentType: 'architect',
+          modelIdUsed: 'openrouter/architect',
+          status: 'completed',
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+          startedAt: new Date('2026-07-22T00:00:00.000Z'),
+          completedAt: new Date('2026-07-22T00:00:01.000Z'),
+          errorMessage: null,
+          createdAt: new Date('2026-07-22T00:00:00.000Z'),
+        }])
+      }
+      if (selectCount === 4) return dbChain([])
+      if (selectCount === 5) {
+        return dbChain([{
+          id: '00000000-0000-4000-8000-000000000001',
+          status: 'open',
+          createdAt: new Date('2026-07-22T00:00:02.000Z'),
+          answeredAt: null,
+          question: 'RAW-QUESTION-SENTINEL',
+          suggestions: ['RAW-SUGGESTION-SENTINEL'],
+          answer: 'RAW-ANSWER-SENTINEL',
+        }])
+      }
+      return dbChain([])
+    })
+
+    const { GET } = await import('@/app/api/tasks/[id]/runs/route')
+    const params = Promise.resolve({ id: 'task-sse-1' })
+    const res = await GET(sseRequest() as never, { params })
+
+    const lines = await readLines(res.body!, 500)
+    const questionPayload = dataPayloads(lines).find((payload) => (
+      Array.isArray(payload.questionSummaries)
+    ))
+    const questionSummaries = questionPayload?.questionSummaries as Array<Record<string, unknown>> | undefined
+    expect(lines).toContain('event: questions:created')
+    expect(questionPayload).toEqual({
+      questionSummaries: [{
+        id: '00000000-0000-4000-8000-000000000001',
+        status: 'open',
+        createdAt: '2026-07-22T00:00:02.000Z',
+        answeredAt: null,
+      }],
+      questionCount: 1,
+      openCount: 1,
+      answeredCount: 0,
+    })
+    expect(questionSummaries?.[0]).not.toHaveProperty('question')
+    expect(questionSummaries?.[0]).not.toHaveProperty('suggestions')
+    expect(questionSummaries?.[0]).not.toHaveProperty('answer')
+    expect(lines.join('\n')).not.toContain('RAW-')
+  }, 2000)
+
   it('rejects legacy live run chunks so model output cannot bypass the closed Redis schema', async () => {
     const { GET } = await import('@/app/api/tasks/[id]/runs/route')
     const params = Promise.resolve({ id: 'task-sse-1' })

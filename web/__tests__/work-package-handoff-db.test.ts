@@ -2459,7 +2459,7 @@ describe('handoffApprovedWorkPackages', () => {
     }
   })
 
-  it('blocks repository-affecting packages on non-Git project paths without retrying handoff', async () => {
+  it('allows unset host-write configuration to advance non-Git paths in sandbox-only mode', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
     const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'forge-non-git-project-'))
@@ -2590,26 +2590,12 @@ describe('handoffApprovedWorkPackages', () => {
       const result = await handoffApprovedWorkPackages('task-1', { finalAttempt: false })
 
       expect(result).toMatchObject({
-        status: 'blocked',
-        claimedPackageId: null,
+        status: 'already_handed_off',
+        claimedPackageId: 'pkg-1',
         readyPackageIds: ['pkg-1'],
-        blockedReason: expect.stringContaining('Project local path is not a Git repository'),
       })
-      expect(packageBlockedUpdate.set as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(expect.objectContaining({
-        blockedReason: expect.stringContaining('Project local path is not a Git repository'),
-        status: 'blocked',
-      }))
-      expect(runFailedUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-        errorMessage: expect.stringContaining('Project local path is not a Git repository'),
-        status: 'failed',
-      }))
-      expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
+      expect(mocks.executeWorkPackage).toHaveBeenCalledOnce()
       expect(firstEvidenceLookup).toHaveBeenCalledOnce()
-      expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
-        blockedReason: expect.stringContaining('Project local path is not a Git repository'),
-        status: 'blocked',
-        workPackageId: 'pkg-1',
-      }))
     } finally {
       if (previousExecutionFlag === undefined) {
         delete process.env.FORGE_WORK_PACKAGE_EXECUTION

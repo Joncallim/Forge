@@ -1,5 +1,5 @@
 import { generateText, type LanguageModel } from 'ai'
-import { execFile as execFileCallback, spawn } from 'node:child_process'
+import { execFile as execFileCallback } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
@@ -206,6 +206,24 @@ export class WorkPackageExecutionError extends Error {
   }
 }
 
+const HOST_REPOSITORY_WRITE_UNAVAILABLE_MESSAGE = [
+  'Direct host repository application is unavailable because Forge does not have an OS-enforced project-root namespace or hardened repository-write adapter.',
+  'Generated files remain in the execution sandbox.',
+  'Set FORGE_HOST_REPOSITORY_WRITES=0 to use sandbox-only execution.',
+].join(' ')
+
+export class HostRepositoryWriteUnavailableError extends WorkPackageExecutionError {
+  readonly code = 'HOST_REPOSITORY_WRITE_UNAVAILABLE'
+
+  constructor(
+    failureDetails: WorkPackageExecutionFailureDetails,
+    packetFailure: Extract<PacketTerminalOutcome, { status: 'failed' }> | null = null,
+  ) {
+    super(HOST_REPOSITORY_WRITE_UNAVAILABLE_MESSAGE, failureDetails, packetFailure)
+    this.name = 'HostRepositoryWriteUnavailableError'
+  }
+}
+
 export function resolveExecutionProviderConfigId(input: {
   agentProviderConfigId?: string | null
   taskProviderConfigId?: string | null
@@ -329,6 +347,16 @@ function isAcpModel(model: LanguageModel): boolean {
 function isAcpWorkPackageExecutionEnabled(env: Record<string, string | undefined> = process.env): boolean {
   const state = defaultOnFeatureFlagState(env.FORGE_ACP_WORK_PACKAGE_EXECUTION)
   return state.recognized && state.enabled
+}
+
+function isHostRepositoryWriteExplicitlyEnabled(
+  workPackage: WorkPackageRow,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const rawValue = env.FORGE_HOST_REPOSITORY_WRITES ?? env.FORGE_REPOSITORY_EDITS
+  if (rawValue === undefined || rawValue.trim() === '') return false
+  const state = defaultOnFeatureFlagState(rawValue)
+  return state.recognized && state.enabled && shouldApplyHostRepositoryWrites(workPackage, env)
 }
 
 function generationTimeoutMs(): number {
@@ -958,405 +986,37 @@ function assertRelativeWritePath(filePath: string): void {
   }
 }
 
-function assertHostRepositoryWritePath(filePath: string): void {
-  assertRelativeWritePath(filePath)
-  const [topLevel] = path.normalize(filePath).split(/[\\/]+/).filter((part) => part && part !== '.')
-  if (topLevel === '.forge') {
-    throw new Error(`File path is reserved for Forge runtime state and cannot be written to the host repository: ${filePath}`)
-  }
-}
-
 function isWithinPath(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate)
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
 }
 
-type FilesystemIdentity = {
-  dev: bigint
-  ino: bigint
-}
-
-type PinnedWritableTarget = {
-  parent: string
-  parentIdentity: FilesystemIdentity
-  realParent: string
-  realRoot: string
-  target: string
-  targetName: string
-}
-
-// Node does not expose openat/renameat. The helper's current working directory
-// is the pinned directory handle: it verifies that directory before touching a
-// relative name, so swapping the lexical parent cannot redirect the operation.
-const PINNED_FILESYSTEM_HELPER = String.raw`
-const fs = require('node:fs/promises')
-const { constants } = require('node:fs')
-
-function fail(message) {
-  throw new Error(message)
-}
-
-function entryName(value) {
-  if (!value || value === '.' || value === '..' || value.includes('/') || value.includes(String.fromCharCode(0))) {
-    fail('invalid relative entry name')
-  }
-  return value
-}
-
-async function lstatOrNull(filePath) {
-  try {
-    return await fs.lstat(filePath, { bigint: true })
-  } catch (error) {
-    if (error && error.code === 'ENOENT') return null
-    throw error
-  }
-}
-
-function sameIdentity(stat, expectedDev, expectedIno) {
-  return stat.dev === expectedDev && stat.ino === expectedIno
-}
-
-async function assertParent(expectedDev, expectedIno, expectedRealPath) {
-  const stat = await fs.stat('.', { bigint: true })
-  if (!stat.isDirectory() || !sameIdentity(stat, expectedDev, expectedIno)) {
-    fail('validated parent directory identity changed')
-  }
-  if (await fs.realpath('.') !== expectedRealPath) {
-    fail('validated parent directory path changed')
-  }
-}
-
-async function removeIfIdentityMatches(filePath, identity) {
-  const stat = await lstatOrNull(filePath)
-  if (stat && sameIdentity(stat, identity.dev, identity.ino)) {
-    await fs.unlink(filePath)
-  }
-}
-
-async function createDirectory(expectedDev, expectedIno, expectedRealPath, rawName) {
-  const name = entryName(rawName)
-  await assertParent(expectedDev, expectedIno, expectedRealPath)
-  let created = false
-  let stat = await lstatOrNull(name)
-  if (!stat) {
-    try {
-      await fs.mkdir(name, { mode: 0o777 })
-      created = true
-    } catch (error) {
-      if (!error || error.code !== 'EEXIST') throw error
-    }
-    stat = await fs.lstat(name, { bigint: true })
-  }
-  if (stat.isSymbolicLink() || !stat.isDirectory()) {
-    fail('writable path component is not a real directory')
-  }
-  try {
-    await assertParent(expectedDev, expectedIno, expectedRealPath)
-  } catch (error) {
-    if (created) await removeIfIdentityMatches(name, stat).catch(() => {})
-    throw error
-  }
-}
-
-async function readStdin() {
-  const chunks = []
-  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk))
-  return Buffer.concat(chunks)
-}
-
-async function atomicWrite(
-  expectedDev,
-  expectedIno,
-  expectedRealPath,
-  rawTargetName,
-  rawTempName,
-  rawBackupName,
-  replaceExisting,
-) {
-  const targetName = entryName(rawTargetName)
-  const tempName = entryName(rawTempName)
-  const backupName = entryName(rawBackupName)
-  await assertParent(expectedDev, expectedIno, expectedRealPath)
-  const content = await readStdin()
-  await assertParent(expectedDev, expectedIno, expectedRealPath)
-
-  const originalTarget = await lstatOrNull(targetName)
-  if (originalTarget?.isSymbolicLink()) fail('target is a symbolic link')
-  if (originalTarget && !originalTarget.isFile()) fail('target is not a regular file')
-  if (originalTarget && !replaceExisting) fail('target already exists')
-
-  let tempIdentity = null
-  let backupIdentity = null
-  let committed = false
-  try {
-    const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0)
-    const handle = await fs.open(tempName, flags, 0o666)
-    try {
-      await handle.writeFile(content)
-      await handle.sync()
-      const stat = await handle.stat({ bigint: true })
-      if (!stat.isFile()) fail('temporary output is not a regular file')
-      tempIdentity = { dev: stat.dev, ino: stat.ino }
-    } finally {
-      await handle.close()
-    }
-
-    const tempStat = await fs.lstat(tempName, { bigint: true })
-    if (!tempIdentity || tempStat.isSymbolicLink() || !tempStat.isFile()
-      || !sameIdentity(tempStat, tempIdentity.dev, tempIdentity.ino)) {
-      fail('temporary output identity changed')
-    }
-    await assertParent(expectedDev, expectedIno, expectedRealPath)
-
-    if (originalTarget) {
-      const currentTarget = await fs.lstat(targetName, { bigint: true })
-      if (currentTarget.isSymbolicLink() || !currentTarget.isFile()
-        || !sameIdentity(currentTarget, originalTarget.dev, originalTarget.ino)) {
-        fail('target identity changed before replacement')
-      }
-      await fs.link(targetName, backupName)
-      const backupStat = await fs.lstat(backupName, { bigint: true })
-      if (backupStat.isSymbolicLink() || !backupStat.isFile()
-        || !sameIdentity(backupStat, originalTarget.dev, originalTarget.ino)) {
-        fail('replacement backup identity changed')
-      }
-      backupIdentity = { dev: backupStat.dev, ino: backupStat.ino }
-    }
-
-    await assertParent(expectedDev, expectedIno, expectedRealPath)
-    await fs.rename(tempName, targetName)
-    committed = true
-
-    try {
-      const writtenTarget = await fs.lstat(targetName, { bigint: true })
-      if (!tempIdentity || writtenTarget.isSymbolicLink() || !writtenTarget.isFile()
-        || !sameIdentity(writtenTarget, tempIdentity.dev, tempIdentity.ino)) {
-        fail('written target identity changed')
-      }
-      await assertParent(expectedDev, expectedIno, expectedRealPath)
-    } catch (error) {
-      const currentTarget = await lstatOrNull(targetName)
-      const targetStillWritten = currentTarget && tempIdentity
-        && sameIdentity(currentTarget, tempIdentity.dev, tempIdentity.ino)
-      if (targetStillWritten && backupIdentity) {
-        await fs.rename(targetName, tempName)
-        await fs.rename(backupName, targetName)
-        await removeIfIdentityMatches(tempName, tempIdentity)
-        backupIdentity = null
-      } else if (targetStillWritten) {
-        await removeIfIdentityMatches(targetName, tempIdentity)
-      } else if (backupIdentity) {
-        // Preserve the original inode under its unique backup name when an
-        // unrelated writer changed the target before rollback could run.
-        backupIdentity = null
-      }
-      committed = false
-      throw error
-    }
-
-    if (backupIdentity) {
-      await removeIfIdentityMatches(backupName, backupIdentity)
-      backupIdentity = null
-    }
-  } finally {
-    if (!committed && tempIdentity) await removeIfIdentityMatches(tempName, tempIdentity).catch(() => {})
-    if (backupIdentity) await removeIfIdentityMatches(backupName, backupIdentity).catch(() => {})
-  }
-}
-
-async function main() {
-  const [operation, devText, inoText, realParent, ...args] = process.argv.slice(1)
-  const expectedDev = BigInt(devText)
-  const expectedIno = BigInt(inoText)
-  if (operation === 'mkdir') {
-    await createDirectory(expectedDev, expectedIno, realParent, args[0])
-    return
-  }
-  if (operation === 'write') {
-    await atomicWrite(
-      expectedDev,
-      expectedIno,
-      realParent,
-      args[0],
-      args[1],
-      args[2],
-      args[3] === 'replace',
-    )
-    return
-  }
-  fail('unsupported pinned filesystem operation')
-}
-
-main().catch((error) => {
-  process.stderr.write(error && error.message ? error.message : String(error))
-  process.exitCode = 1
-})
-`
-
-function filesystemIdentity(stat: { dev: bigint; ino: bigint }): FilesystemIdentity {
-  return { dev: stat.dev, ino: stat.ino }
-}
-
-function sameFilesystemIdentity(
-  left: { dev: bigint; ino: bigint },
-  right: FilesystemIdentity,
-): boolean {
-  return left.dev === right.dev && left.ino === right.ino
-}
-
-async function lstatOrNull(filePath: string) {
-  return fs.lstat(filePath, { bigint: true }).catch((err: NodeJS.ErrnoException) => {
-    if (err.code === 'ENOENT') return null
-    throw err
-  })
-}
-
-async function runPinnedFilesystemHelper(input: {
-  args: string[]
-  content?: string
-  parent: string
-}): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn(process.execPath, ['-e', PINNED_FILESYSTEM_HELPER, '--', ...input.args], {
-      cwd: input.parent,
-      env: { CI: '1', NODE_ENV: 'test', PATH: process.env.PATH ?? '' },
-      stdio: ['pipe', 'ignore', 'pipe'],
-    })
-    let stderr = ''
-    child.stderr.setEncoding('utf8')
-    child.stderr.on('data', (chunk: string) => {
-      if (stderr.length < 4_000) stderr += chunk.slice(0, 4_000 - stderr.length)
-    })
-    child.stdin.on('error', () => {})
-    child.once('error', reject)
-    child.once('close', (code, signal) => {
-      if (code === 0) {
-        resolve()
-        return
-      }
-      reject(new Error(stderr.trim() || `Pinned filesystem helper stopped with ${signal ?? `exit code ${code}`}.`))
-    })
-    child.stdin.end(input.content ?? '')
-  })
-}
-
-async function assertPinnedParent(target: PinnedWritableTarget): Promise<void> {
-  const stat = await fs.lstat(target.parent, { bigint: true }).catch((err: NodeJS.ErrnoException) => {
-    if (err.code === 'ENOENT') return null
-    throw err
-  })
-  if (!stat || stat.isSymbolicLink() || !stat.isDirectory()
-    || !sameFilesystemIdentity(stat, target.parentIdentity)) {
-    throw new Error('Validated writable parent directory identity changed before the file operation.')
-  }
-  const realParent = await fs.realpath(target.parent)
-  if (realParent !== target.realParent || !isWithinPath(target.realRoot, realParent)) {
-    throw new Error('Validated writable parent directory escaped the project before the file operation.')
-  }
-}
-
-async function createPinnedDirectory(
-  parent: PinnedWritableTarget,
-  name: string,
-): Promise<void> {
-  await runPinnedFilesystemHelper({
-    args: [
-      'mkdir',
-      parent.parentIdentity.dev.toString(),
-      parent.parentIdentity.ino.toString(),
-      parent.realParent,
-      name,
-    ],
-    parent: parent.parent,
-  })
-}
-
-async function assertWritableParent(projectRoot: string, filePath: string): Promise<PinnedWritableTarget> {
+async function assertWritableParent(projectRoot: string, filePath: string): Promise<string> {
   const resolvedRoot = path.resolve(projectRoot)
   const target = path.resolve(resolvedRoot, filePath)
   if (!isWithinPath(resolvedRoot, target)) {
     throw new Error(`File path escapes the project: ${filePath}`)
   }
 
-  const parent = path.dirname(target)
-  const rootStat = await fs.lstat(resolvedRoot, { bigint: true })
+  const rootStat = await fs.lstat(resolvedRoot)
   if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
     throw new Error(`Project root is not a real directory: ${filePath}`)
   }
-  const realRoot = await fs.realpath(resolvedRoot)
-  let current: PinnedWritableTarget = {
-    parent: resolvedRoot,
-    parentIdentity: filesystemIdentity(rootStat),
-    realParent: realRoot,
-    realRoot,
-    target: resolvedRoot,
-    targetName: path.basename(resolvedRoot),
-  }
+  const parent = path.dirname(target)
   const relativeParent = path.relative(resolvedRoot, parent)
   const segments = relativeParent === '' ? [] : relativeParent.split(path.sep)
-  for (const segment of segments) {
-    await assertPinnedParent(current)
-    const next = path.join(current.parent, segment)
-    let stat = await lstatOrNull(next)
-    if (!stat) {
-      await createPinnedDirectory(current, segment)
-      await assertPinnedParent(current)
-      stat = await fs.lstat(next, { bigint: true })
-    }
-    if (stat.isSymbolicLink()) {
-      throw new Error(`File path contains a symbolic link and cannot be written by Forge: ${filePath}`)
-    }
-    if (!stat.isDirectory()) {
-      throw new Error(`File path parent is not a directory and cannot be written by Forge: ${filePath}`)
-    }
-    const realNext = await fs.realpath(next)
-    if (!isWithinPath(realRoot, realNext)) {
-      throw new Error(`File path escapes the real project directory: ${filePath}`)
-    }
-    current = {
-      parent: next,
-      parentIdentity: filesystemIdentity(stat),
-      realParent: realNext,
-      realRoot,
-      target: next,
-      targetName: segment,
-    }
-  }
-  await assertPinnedParent(current)
-  return {
-    ...current,
-    target,
-    targetName: path.basename(target),
-  }
-}
-
-async function writePinnedTarget(
-  target: PinnedWritableTarget,
-  content: string,
-  replaceExisting: boolean,
-): Promise<void> {
-  await assertPinnedParent(target)
-  await runPinnedFilesystemHelper({
-    args: [
-      'write',
-      target.parentIdentity.dev.toString(),
-      target.parentIdentity.ino.toString(),
-      target.realParent,
-      target.targetName,
-      `.forge-write-${process.pid}-${randomUUID()}.tmp`,
-      `.forge-backup-${process.pid}-${randomUUID()}.tmp`,
-      replaceExisting ? 'replace' : 'fresh',
-    ],
-    content,
-    parent: target.parent,
-  })
+  await ensureDirectoryNoSymlink(resolvedRoot, segments)
+  return target
 }
 
 async function writeExecutionFile(projectRoot: string, file: WorkPackageExecutionFile): Promise<void> {
   assertRelativeWritePath(file.path)
   const target = await assertWritableParent(projectRoot, file.path)
 
-  const targetStat = await lstatOrNull(target.target)
+  const targetStat = await fs.lstat(target).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === 'ENOENT') return null
+    throw err
+  })
   if (targetStat?.isSymbolicLink()) {
     throw new Error(`File path targets a symlink and cannot be written by Forge: ${file.path}`)
   }
@@ -1364,45 +1024,11 @@ async function writeExecutionFile(projectRoot: string, file: WorkPackageExecutio
     throw new Error(`File path already exists in the fresh execution sandbox: ${file.path}`)
   }
 
-  await writePinnedTarget(target, file.content, false)
-}
-
-async function hostRepositoryWriteTarget(
-  projectRoot: string,
-  file: WorkPackageExecutionFile,
-): Promise<PinnedWritableTarget> {
-  assertHostRepositoryWritePath(file.path)
-  const target = await assertWritableParent(projectRoot, file.path)
-  const targetStat = await lstatOrNull(target.target)
-  if (targetStat?.isSymbolicLink()) {
-    throw new Error(`File path targets a symlink and cannot be written by Forge: ${file.path}`)
-  }
-  if (targetStat && !targetStat.isFile()) {
-    throw new Error(`File path is not a regular file and cannot be written by Forge: ${file.path}`)
-  }
-  return target
-}
-
-async function writeHostRepositoryFiles(
-  projectRoot: string,
-  files: WorkPackageExecutionFile[],
-  beforeWrite?: () => Promise<void>,
-): Promise<void> {
-  const written: string[] = []
-  for (const file of files) {
-    await beforeWrite?.()
-    const target = await hostRepositoryWriteTarget(projectRoot, file)
-    try {
-      await beforeWrite?.()
-      await writePinnedTarget(target, file.content, true)
-      written.push(file.path)
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      const detail = written.length > 0
-        ? ` ${written.length} file(s) were already written: ${written.join(', ')}.`
-        : ''
-      throw new Error(`Failed to apply generated file to host repository: ${file.path}. ${message}.${detail}`)
-    }
+  const handle = await fs.open(target, 'wx')
+  try {
+    await handle.writeFile(file.content)
+  } finally {
+    await handle.close()
   }
 }
 
@@ -2664,7 +2290,7 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
     }
 
     const commandResults: WorkPackageExecutionCommandResult[] = []
-    const hostRepositoryWrites = shouldApplyHostRepositoryWrites(context.workPackage)
+    const hostRepositoryWrites = isHostRepositoryWriteExplicitlyEnabled(context.workPackage)
     if (plan.commands.length === 0) {
       await recordTaskLogBestEffort({
         agentRunId: context.agentRunId ?? null,
@@ -2736,30 +2362,22 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
       }
     }
 
-    const hostRepositoryWritePaths = hostRepositoryWrites
-      ? plan.files.map((file) => file.path.split(/[\\/]+/).filter(Boolean).join('/'))
-      : []
+    const hostRepositoryWritePaths: string[] = []
     if (hostRepositoryWrites) {
       packetFailureStage = 'host_apply'
       await context.assertS4LifecycleOwned?.()
-      await writeHostRepositoryFiles(hostProjectRoot, plan.files, context.assertS4LifecycleOwned)
-      await recordTaskLogBestEffort({
-        agentRunId: context.agentRunId ?? null,
-        eventType: 'repository.files_written',
-        level: 'success',
-        message: `Applied ${plan.files.length} generated file(s) to the host repository for "${context.workPackage.title}".`,
-        metadata: {
+      throw new HostRepositoryWriteUnavailableError(
+        executionFailureDetails({
           attemptNumber,
-          files: hostRepositoryWritePaths,
-          hostProjectRoot,
-          repositoryWrites: true,
-          workPackageId: context.workPackage.id,
-        },
-        source: 'worker',
-        taskId: context.task.id,
-        title: 'Host repository files written',
-        workPackageId: context.workPackage.id,
-      })
+          commandResults,
+          files: plan.files,
+          sandboxRoot,
+          summary: plan.summary,
+        }),
+        packetLifecycle
+          ? packetFailure ?? packetFailureForExecutionStage(packetFailureStage)
+          : null,
+      )
     }
 
     const artifactContent = executionArtifactContent({

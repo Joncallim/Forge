@@ -406,8 +406,13 @@ export function containsForbiddenV2EventData(value: unknown, sentinels: readonly
   const envelope = value
   if (Object.keys(envelope).some((key) => key !== 'type' && key !== 'data')) return true
   if (typeof envelope.type !== 'string' || !isRecord(envelope.data)) return true
+  if (!matchesClosedV2EventSchema(envelope.type, envelope.data)) return true
+  // The closed questions:created notification deliberately uses one empty
+  // array. It conveys no clarification content, while the same key remains
+  // sensitive everywhere else (including task logs and richer event shapes).
+  if (envelope.type === 'questions:created') return false
   if (containsUnconditionalForbiddenEvidence(envelope.data, sentinels)) return true
-  return !matchesClosedV2EventSchema(envelope.type, envelope.data)
+  return false
 }
 
 function validateBoundedInteger(name: string, value: number, maximum: number): void {

@@ -14,7 +14,6 @@ const mocks = vi.hoisted(() => ({
   getModel: vi.fn(),
   publishTaskEvent: vi.fn(),
   recordTaskLogBestEffort: vi.fn(),
-  claimPacketAuthorization: vi.fn(),
   beginPacketAssemblyV2: vi.fn(),
   completePacketAssemblyV2: vi.fn(),
   beginPacketDeliveryV2: vi.fn(),
@@ -74,6 +73,7 @@ vi.mock('@/worker/execution-context-packet', async (importOriginal) => {
 import {
   executeWorkPackage,
   hasLocalConflictCopyPathSegment,
+  HostRepositoryWriteUnavailableError,
   parseWorkPackageExecutionPlan,
   resolveProtectedArchitectPlanContext,
   resolveExecutionProviderConfigId,
@@ -232,6 +232,17 @@ function hostWriteContext(overrides: Partial<WorkPackageExecutionContext> = {}):
       ...base.workPackage,
       metadata: { repositoryWrites: true },
     },
+  }
+}
+
+async function withExplicitHostRepositoryWrites<T>(run: () => Promise<T>): Promise<T> {
+  const previous = process.env.FORGE_HOST_REPOSITORY_WRITES
+  process.env.FORGE_HOST_REPOSITORY_WRITES = '1'
+  try {
+    return await run()
+  } finally {
+    if (previous === undefined) delete process.env.FORGE_HOST_REPOSITORY_WRITES
+    else process.env.FORGE_HOST_REPOSITORY_WRITES = previous
   }
 }
 
@@ -468,11 +479,6 @@ describe('executeWorkPackage', () => {
     mocks.dbUpdate.mockReturnValue({ set: mocks.dbUpdateSet })
     mocks.dbUpdateSet.mockReturnValue({ where: mocks.dbUpdateWhere })
     mocks.dbUpdateWhere.mockResolvedValue(undefined)
-    mocks.claimPacketAuthorization.mockResolvedValue({
-      auditId: '00000000-0000-4000-8000-000000000030',
-      claimToken: '00000000-0000-4000-8000-000000000031',
-      localRunEvidenceId: '00000000-0000-4000-8000-000000000032',
-    })
     mocks.beginPacketAssemblyV2.mockResolvedValue(true)
     mocks.completePacketAssemblyV2.mockResolvedValue(true)
     mocks.beginPacketDeliveryV2.mockResolvedValue(true)
@@ -643,7 +649,7 @@ describe('executeWorkPackage', () => {
     expect(mocks.generateText).not.toHaveBeenCalled()
   })
 
-  it('writes generated files into the task sandbox and runs allowed commands', async () => {
+  it('fails host application with a typed operator error while preserving new sandbox files', async () => {
     mocks.generateText.mockResolvedValue({
       text: JSON.stringify({
         schemaVersion: 1,
@@ -671,31 +677,38 @@ describe('executeWorkPackage', () => {
       }),
     })
 
-    const result = await executeWorkPackage(hostWriteContext())
     const sandbox = path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'attempt-1')
+    let failure: unknown
+    try {
+      await withExplicitHostRepositoryWrites(() => executeWorkPackage(hostWriteContext()))
+    } catch (err) {
+      failure = err
+    }
 
+    expect(failure).toBeInstanceOf(HostRepositoryWriteUnavailableError)
+    expect(failure).toMatchObject({
+      code: 'HOST_REPOSITORY_WRITE_UNAVAILABLE',
+      failureDetails: {
+        artifactMetadata: {
+          hostRepositoryWritePaths: [],
+          hostRepositoryWrites: false,
+          repositoryWrites: false,
+          sandboxWrites: true,
+        },
+        sandboxPath: sandbox,
+      },
+    })
+    expect((failure as Error).message).toContain('FORGE_HOST_REPOSITORY_WRITES=0')
     await expect(fs.stat(path.join(sandbox, 'package.json'))).resolves.toBeTruthy()
-    await expect(fs.readFile(path.join(tempRoot, 'package.json'), 'utf8')).resolves.toContain('node --test')
-    expect(result.sandboxPath).toBe(sandbox)
-    expect(result.hostRepositoryWrites).toBe(true)
-    expect(result.repositoryWrites).toBe(true)
-    expect(result.hostRepositoryWritePaths).toEqual(['package.json', 'build-check.js', 'index.test.js'])
-    expect(result.commandResults.map((item) => item.exitCode)).toEqual([0, 0])
-    expect(result.artifactMetadata).toMatchObject({
-      hostRepositoryWritePaths: ['package.json', 'build-check.js', 'index.test.js'],
-      hostRepositoryWrites: true,
-      repositoryWrites: true,
-      sandboxPath: sandbox,
-      sandboxWrites: true,
-    })
-    expect(result.executionContextArtifactMetadata).toMatchObject({
-      artifactKind: 'host_readonly_execution_context',
-      hostRepositoryWrites: false,
-      sandboxWrites: false,
-    })
+    await expect(fs.stat(path.join(tempRoot, 'package.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fs.stat(path.join(tempRoot, 'build-check.js'))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fs.stat(path.join(tempRoot, 'index.test.js'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(mocks.recordTaskLogBestEffort).not.toHaveBeenCalledWith(expect.objectContaining({
+      eventType: 'repository.files_written',
+    }))
   })
 
-  it('writes valid nested host files and removes atomic-write helper files', async () => {
+  it('does not create nested repository paths when host application is enabled', async () => {
     mocks.generateText.mockResolvedValue({
       text: JSON.stringify({
         schemaVersion: 1,
@@ -711,17 +724,42 @@ describe('executeWorkPackage', () => {
       }),
     })
 
-    const result = await executeWorkPackage(hostWriteContext())
+    await expect(withExplicitHostRepositoryWrites(() => executeWorkPackage(hostWriteContext())))
+      .rejects.toBeInstanceOf(HostRepositoryWriteUnavailableError)
 
-    await expect(fs.readFile(path.join(tempRoot, 'src', 'lib', 'app.js'), 'utf8'))
+    await expect(fs.stat(path.join(tempRoot, 'src'))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fs.readFile(
+      path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'attempt-1', 'src', 'lib', 'app.js'),
+      'utf8',
+    ))
       .resolves.toBe('module.exports = { ready: true };\n')
-    await expect(fs.readdir(path.join(tempRoot, 'src', 'lib'))).resolves.toEqual(['app.js'])
-    expect(result.hostRepositoryWritePaths).toEqual(['src/lib/app.js', 'package.json'])
-    expect((await fs.readdir(tempRoot)).some((entry) => entry.includes('.forge-write-') || entry.includes('.forge-backup-')))
-      .toBe(false)
   })
 
-  it('rejects a symlinked parent before creating its missing descendants', async () => {
+  it('does not replace existing repository files when host application is enabled', async () => {
+    await fs.writeFile(path.join(tempRoot, 'existing.js'), 'original repository content\n')
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Attempt an existing-file replacement.',
+        files: [
+          { path: 'existing.js', content: 'module.exports = { replaced: true };\n' },
+          {
+            path: 'package.json',
+            content: JSON.stringify({ scripts: { build: 'node --check existing.js' } }),
+          },
+        ],
+        commands: [['npm', 'run', 'build']],
+      }),
+    })
+
+    await expect(withExplicitHostRepositoryWrites(() => executeWorkPackage(hostWriteContext())))
+      .rejects.toBeInstanceOf(HostRepositoryWriteUnavailableError)
+    await expect(fs.readFile(path.join(tempRoot, 'existing.js'), 'utf8'))
+      .resolves.toBe('original repository content\n')
+    await expect(fs.stat(path.join(tempRoot, 'package.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('does not follow repository symlinks when host application is enabled', async () => {
     const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-executor-outside-'))
     try {
       await fs.symlink(outsideRoot, path.join(tempRoot, 'linked'))
@@ -740,7 +778,8 @@ describe('executeWorkPackage', () => {
         }),
       })
 
-      await expect(executeWorkPackage(hostWriteContext())).rejects.toThrow(/symbolic link/i)
+      await expect(withExplicitHostRepositoryWrites(() => executeWorkPackage(hostWriteContext())))
+        .rejects.toBeInstanceOf(HostRepositoryWriteUnavailableError)
       await expect(fs.readdir(outsideRoot)).resolves.toEqual([])
       await expect(fs.stat(path.join(tempRoot, 'package.json'))).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
@@ -748,24 +787,32 @@ describe('executeWorkPackage', () => {
     }
   })
 
-  it('rejects a validated host parent swapped to an external symlink before replacement', async () => {
-    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-executor-swap-outside-'))
+  it('does not write through a repository parent reparented during sandbox generation', async () => {
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-executor-reparent-outside-'))
     const hostParent = path.join(tempRoot, 'src')
-    const movedParent = path.join(tempRoot, 'src-before-swap')
+    const movedParent = path.join(outsideRoot, 'src-reparented')
     const hostTarget = path.join(hostParent, 'app.js')
-    let swapped = false
+    const sandboxTarget = path.join(
+      tempRoot,
+      '.forge',
+      'task-runs',
+      'task-1',
+      'pkg-1',
+      'attempt-1',
+      'src',
+      'app.js',
+    )
+    let reparented = false
     await fs.mkdir(hostParent)
     await fs.writeFile(hostTarget, 'original project content\n')
     await fs.writeFile(path.join(outsideRoot, 'app.js'), 'outside sentinel\n')
-    const realLstat = fs.lstat.bind(fs)
-    const lstatSpy = vi.spyOn(fs, 'lstat').mockImplementation(async (filePath, options) => {
-      const stat = await realLstat(filePath, options as never)
-      if (!swapped && path.resolve(String(filePath)) === hostTarget) {
-        swapped = true
-        await fs.rename(hostParent, movedParent)
-        await fs.symlink(outsideRoot, hostParent)
-      }
-      return stat as never
+    const assertOwned = vi.fn(async () => {
+      if (reparented) return
+      const sandboxFileExists = await fs.stat(sandboxTarget).then(() => true).catch(() => false)
+      if (!sandboxFileExists) return
+      await fs.rename(hostParent, movedParent)
+      await fs.symlink(movedParent, hostParent)
+      reparented = true
     })
 
     try {
@@ -784,17 +831,15 @@ describe('executeWorkPackage', () => {
         }),
       })
 
-      await expect(executeWorkPackage(hostWriteContext())).rejects.toThrow(/parent directory identity changed/i)
-    } finally {
-      lstatSpy.mockRestore()
-    }
-
-    try {
-      expect(swapped).toBe(true)
+      await expect(withExplicitHostRepositoryWrites(
+        () => executeWorkPackage(hostWriteContext({ assertS4LifecycleOwned: assertOwned })),
+      ))
+        .rejects.toBeInstanceOf(HostRepositoryWriteUnavailableError)
+      expect(reparented).toBe(true)
       await expect(fs.readFile(path.join(outsideRoot, 'app.js'), 'utf8')).resolves.toBe('outside sentinel\n')
-      await expect(fs.readdir(outsideRoot)).resolves.toEqual(['app.js'])
       await expect(fs.readFile(path.join(movedParent, 'app.js'), 'utf8'))
         .resolves.toBe('original project content\n')
+      await expect(fs.readdir(movedParent)).resolves.toEqual(['app.js'])
       await expect(fs.stat(path.join(tempRoot, 'package.json'))).rejects.toMatchObject({ code: 'ENOENT' })
     } finally {
       await fs.rm(outsideRoot, { recursive: true, force: true })
@@ -834,9 +879,11 @@ describe('executeWorkPackage', () => {
     }))
   })
 
-  it('keeps generated files sandbox-only when host repository writes are disabled', async () => {
+  it('defaults normal executions to successful sandbox-only output', async () => {
     const previous = process.env.FORGE_HOST_REPOSITORY_WRITES
-    process.env.FORGE_HOST_REPOSITORY_WRITES = '0'
+    const previousLegacy = process.env.FORGE_REPOSITORY_EDITS
+    delete process.env.FORGE_HOST_REPOSITORY_WRITES
+    delete process.env.FORGE_REPOSITORY_EDITS
     mocks.generateText.mockResolvedValue({
       text: JSON.stringify({
         schemaVersion: 1,
@@ -847,7 +894,7 @@ describe('executeWorkPackage', () => {
     })
 
     try {
-      const result = await executeWorkPackage(context())
+      const result = await executeWorkPackage(hostWriteContext())
       const sandbox = path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'attempt-1')
 
       await expect(fs.stat(path.join(sandbox, 'package.json'))).resolves.toBeTruthy()
@@ -861,6 +908,8 @@ describe('executeWorkPackage', () => {
     } finally {
       if (previous === undefined) delete process.env.FORGE_HOST_REPOSITORY_WRITES
       else process.env.FORGE_HOST_REPOSITORY_WRITES = previous
+      if (previousLegacy === undefined) delete process.env.FORGE_REPOSITORY_EDITS
+      else process.env.FORGE_REPOSITORY_EDITS = previousLegacy
     }
   })
 
@@ -1175,7 +1224,6 @@ describe('executeWorkPackage', () => {
       },
     }))
 
-    expect(mocks.claimPacketAuthorization).not.toHaveBeenCalled()
     expect(mocks.beginPacketAssemblyV2).toHaveBeenCalledOnce()
     expect(mocks.beginPacketDeliveryV2).toHaveBeenCalledOnce()
     expect(mocks.completePacketDeliveryV2).toHaveBeenCalledWith(expect.objectContaining({
@@ -1388,7 +1436,6 @@ describe('executeWorkPackage', () => {
         status: 'issued',
       }),
     })
-    expect(mocks.claimPacketAuthorization).not.toHaveBeenCalled()
     expect(mocks.beginPacketAssemblyV2).toHaveBeenCalledOnce()
     expect(result.executionContextArtifactMetadata).toMatchObject({
       packetAuthorizationAuditId: '00000000-0000-4000-8000-000000000030',
@@ -2003,7 +2050,7 @@ describe('executeWorkPackage', () => {
       .rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('refuses to apply generated files into Forge runtime paths on the host repository', async () => {
+  it('fails closed before applying generated Forge runtime paths to the host repository', async () => {
     mocks.generateText.mockResolvedValue({
       text: JSON.stringify({
         schemaVersion: 1,
@@ -2017,13 +2064,14 @@ describe('executeWorkPackage', () => {
       }),
     })
 
-    await expect(executeWorkPackage(hostWriteContext())).rejects.toThrow(/reserved for Forge runtime state/i)
+    await expect(withExplicitHostRepositoryWrites(() => executeWorkPackage(hostWriteContext())))
+      .rejects.toBeInstanceOf(HostRepositoryWriteUnavailableError)
     await expect(fs.stat(path.join(tempRoot, '.forge', 'state.json'))).rejects.toMatchObject({
       code: 'ENOENT',
     })
   })
 
-  it('normalizes leading dot segments before rejecting Forge runtime host paths', async () => {
+  it('fails closed before applying dot-prefixed Forge runtime paths to the host repository', async () => {
     mocks.generateText.mockResolvedValue({
       text: JSON.stringify({
         schemaVersion: 1,
@@ -2037,7 +2085,8 @@ describe('executeWorkPackage', () => {
       }),
     })
 
-    await expect(executeWorkPackage(hostWriteContext())).rejects.toThrow(/reserved for Forge runtime state/i)
+    await expect(withExplicitHostRepositoryWrites(() => executeWorkPackage(hostWriteContext())))
+      .rejects.toBeInstanceOf(HostRepositoryWriteUnavailableError)
     await expect(fs.stat(path.join(tempRoot, '.forge', 'state.json'))).rejects.toMatchObject({
       code: 'ENOENT',
     })
@@ -2053,7 +2102,8 @@ describe('executeWorkPackage', () => {
       }),
     })
 
-    await expect(executeWorkPackage(hostWriteContext())).rejects.toThrow(/did not include validation commands/i)
+    await expect(withExplicitHostRepositoryWrites(() => executeWorkPackage(hostWriteContext())))
+      .rejects.toThrow(/did not include validation commands/i)
     await expect(fs.stat(path.join(tempRoot, 'src', 'app.js'))).rejects.toMatchObject({
       code: 'ENOENT',
     })
@@ -2142,7 +2192,6 @@ describe('executeWorkPackage', () => {
       }),
       redaction: expect.objectContaining({ applied: true }),
     })
-    expect(mocks.claimPacketAuthorization).not.toHaveBeenCalled()
     expect(mocks.completePacketAssemblyV2).toHaveBeenCalledWith(expect.objectContaining({
       rootRef: '00000000-0000-4000-8000-000000000001',
     }))

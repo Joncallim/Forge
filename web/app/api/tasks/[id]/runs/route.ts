@@ -13,6 +13,7 @@ import {
   type TaskEventEnvelopeV2,
 } from '@/worker/events'
 import { taskEventRedisConfiguration } from '@/lib/task-event-redis'
+import { taskQuestionSummary } from '@/lib/mcps/clarification-projection'
 
 // ---------------------------------------------------------------------------
 // SSE stream — GET /api/tasks/:id/runs
@@ -195,20 +196,23 @@ export async function GET(
         }
 
         const existingQuestions = await db
-          .select()
+          .select({
+            id: taskQuestions.id,
+            status: taskQuestions.status,
+            createdAt: taskQuestions.createdAt,
+            answeredAt: taskQuestions.answeredAt,
+          })
           .from(taskQuestions)
           .where(eq(taskQuestions.taskId, taskId))
           .orderBy(asc(taskQuestions.createdAt))
 
         if (existingQuestions.length > 0) {
+          const questions = existingQuestions.map(taskQuestionSummary)
           sendSnapshotEvent('questions:created', {
-            questions: existingQuestions.map((q) => ({
-              id: q.id,
-              question: q.question,
-              suggestions: q.suggestions,
-              answer: q.answer,
-              status: q.status,
-            })),
+            questionSummaries: questions,
+            questionCount: questions.length,
+            openCount: questions.filter((question) => question.status !== 'answered').length,
+            answeredCount: questions.filter((question) => question.status === 'answered').length,
           })
         }
       }
