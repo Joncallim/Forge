@@ -7,13 +7,15 @@ import {
   projectFilesystemCurrentDecisionPointers,
   projectFilesystemGrantDecisions,
   projects,
-  taskLocalProjectionScopes,
   tasks,
   workPackageLocalProjectionHeads,
   workPackages,
   type ProjectMcpConfig,
 } from '@/db/schema'
-import { buildFilesystemGrantBlockMetadata } from './filesystem-grant-lifecycle'
+import {
+  buildFilesystemGrantBlockMetadata,
+  type FilesystemGrantBlockMetadata,
+} from './filesystem-grant-lifecycle'
 import {
   canonicalFilesystemProjectCapabilities,
   FILESYSTEM_GRANT_BLOCK_METADATA_KEY,
@@ -150,11 +152,32 @@ async function lockedTransactionNow(tx: GrantTransaction): Promise<Date> {
   return now
 }
 
-async function advanceOperatorHoldProjection(input: Readonly<{
-  authoritativeDecisionId: string
-  decision: 'approved' | 'denied' | 'revoked'
-  grantDecisionRevision: bigint
+type OperatorHoldProjectionAuthority = Readonly<{
+  decisionId: string
+  grantDecisionRevision: string
+}>
+
+type OperatorHoldProjectionTransition = 'hold' | 'refresh' | 'recovery'
+
+function transitionAuthorityForProjection(input: Readonly<{
+  defaultAuthority?: OperatorHoldProjectionAuthority | null
+  marker: FilesystemGrantBlockMetadata | null
+  packageAuthority?: OperatorHoldProjectionAuthority
+}>): OperatorHoldProjectionAuthority | null {
+  const revision = input.marker?.grantDecisionRevision ?? null
+  if (revision !== null) {
+    if (input.packageAuthority?.grantDecisionRevision === revision) return input.packageAuthority
+    if (input.defaultAuthority?.grantDecisionRevision === revision) return input.defaultAuthority
+  }
+  return input.defaultAuthority ?? input.packageAuthority ?? null
+}
+
+export async function advanceFilesystemGrantOperatorHoldProjection(input: Readonly<{
+  authority: OperatorHoldProjectionAuthority | null
+  marker: FilesystemGrantBlockMetadata | null
+  priorBlockFingerprint: string | null
   taskId: string
+  transition: OperatorHoldProjectionTransition
   tx: GrantTransaction
   workPackageId: string
 }>): Promise<void> {
@@ -171,10 +194,14 @@ async function advanceOperatorHoldProjection(input: Readonly<{
   const sourceId = randomUUID()
   const sourceRevision = head.headRevision + BigInt(1)
   const contribution = {
-    authoritativeDecisionId: input.authoritativeDecisionId,
-    decision: input.decision,
-    grantDecisionRevision: input.grantDecisionRevision.toString(),
-    operatorHold: input.decision !== 'approved',
+    authoritativeDecisionId: input.authority?.decisionId ?? null,
+    grantDecisionRevision: input.authority?.grantDecisionRevision ?? null,
+    kind: 'filesystem_grant',
+    mcpGrantBlock: input.marker,
+    operatorHold: input.marker !== null,
+    priorBlockFingerprint: input.priorBlockFingerprint,
+    schemaVersion: 1,
+    transition: input.transition,
   }
   const sourceFingerprint = projectionSourceFingerprint({
     contribution,
@@ -583,11 +610,14 @@ function metadataPatchSql(input: {
 }
 
 async function applyCanonicalProjection(input: {
+  defaultTransitionAuthority?: OperatorHoldProjectionAuthority | null
   lockedProject: LockedProject
   now: Date
   packages: Map<string, LockedPackage>
   packageIds: readonly string[]
   projectAuthority: ProjectFilesystemDecisionAuthority | null
+  taskProjectionScopeById: ReadonlyMap<string, string>
+  transitionAuthorityByPackageId?: ReadonlyMap<string, OperatorHoldProjectionAuthority>
   forcePackageIds?: ReadonlySet<string>
   tx: GrantTransaction
 }): Promise<Set<string>> {
@@ -634,7 +664,24 @@ async function applyCanonicalProjection(input: {
         .returning()
       if (!updated && forcePersist) throw httpError('Work package is no longer editable.', 409)
       if (updated) input.packages.set(updated.id, updated)
-      if (updated && recovering && updated.status === 'ready') recoveredTaskIds.add(updated.taskId)
+      if (updated && recovering) {
+        if (input.taskProjectionScopeById.get(updated.taskId) === 'active') {
+          await advanceFilesystemGrantOperatorHoldProjection({
+            authority: transitionAuthorityForProjection({
+              defaultAuthority: input.defaultTransitionAuthority,
+              marker: null,
+              packageAuthority: input.transitionAuthorityByPackageId?.get(updated.id),
+            }),
+            marker: null,
+            priorBlockFingerprint: parsedMarker!.blockFingerprint,
+            taskId: updated.taskId,
+            transition: 'recovery',
+            tx: input.tx,
+            workPackageId: updated.id,
+          })
+        }
+        if (updated.status === 'ready') recoveredTaskIds.add(updated.taskId)
+      }
       continue
     }
 
@@ -655,6 +702,8 @@ async function applyCanonicalProjection(input: {
       requestedCapabilities,
       rootBindingRevision: input.lockedProject.rootBindingRevision.toString(),
     })
+    const markerChanged = parsedMarker?.blockFingerprint !== marker.blockFingerprint
+    if (!markerChanged && !forcePersist) continue
     const [updated] = await input.tx
       .update(workPackages)
       .set({
@@ -662,7 +711,7 @@ async function applyCanonicalProjection(input: {
         metadata: metadataPatchSql({
           clearMarker: false,
           effective: forcePersist ? currentPhases : undefined,
-          marker,
+          marker: markerChanged ? marker : undefined,
         }),
         status: ['pending', 'ready', 'needs_rework', 'failed'].includes(pkg.status)
           ? 'blocked'
@@ -672,7 +721,24 @@ async function applyCanonicalProjection(input: {
       .where(eq(workPackages.id, pkg.id))
       .returning()
     if (!updated && forcePersist) throw httpError('Work package is no longer editable.', 409)
-    if (updated) input.packages.set(updated.id, updated)
+    if (updated) {
+      input.packages.set(updated.id, updated)
+      if (markerChanged && input.taskProjectionScopeById.get(updated.taskId) === 'active') {
+        await advanceFilesystemGrantOperatorHoldProjection({
+          authority: transitionAuthorityForProjection({
+            defaultAuthority: input.defaultTransitionAuthority,
+            marker,
+            packageAuthority: input.transitionAuthorityByPackageId?.get(updated.id),
+          }),
+          marker,
+          priorBlockFingerprint: parsedMarker?.blockFingerprint ?? null,
+          taskId: updated.taskId,
+          transition: parsedMarker ? 'refresh' : 'hold',
+          tx: input.tx,
+          workPackageId: updated.id,
+        })
+      }
+    }
   }
   return recoveredTaskIds
 }
@@ -733,11 +799,13 @@ function projectReconciliationCandidateIds(input: {
 }
 
 async function reconcileLockedProjectRows(input: {
+  defaultTransitionAuthority?: OperatorHoldProjectionAuthority | null
   lockedProject: LockedProject
   nextMcpConfig: ProjectMcpConfig
   packages: Map<string, LockedPackage>
   projectAuthority: ProjectFilesystemDecisionAuthority | null
   taskRows: readonly LockedTask[]
+  transitionAuthorityByPackageId?: ReadonlyMap<string, OperatorHoldProjectionAuthority>
   trigger: FilesystemGrantProjectReconciliationTrigger
   tx: GrantTransaction
   now: Date
@@ -752,11 +820,16 @@ async function reconcileLockedProjectRows(input: {
     mcpConfig: input.nextMcpConfig,
   }
   const recovered = await applyCanonicalProjection({
+    defaultTransitionAuthority: input.defaultTransitionAuthority,
     lockedProject: evaluationProject,
     now: input.now,
     packages: input.packages,
     packageIds,
     projectAuthority: input.projectAuthority,
+    taskProjectionScopeById: new Map(
+      input.taskRows.map((task) => [task.id, task.localProjectionScopeState]),
+    ),
+    transitionAuthorityByPackageId: input.transitionAuthorityByPackageId,
     tx: input.tx,
   })
   for (const task of input.taskRows) {
@@ -811,6 +884,7 @@ export async function reconcileFilesystemGrantsForProject(
     'tasks:id-ascending',
     'work-packages:id-ascending',
     'grant-approval-decision-rows:id-ascending',
+    'local-run-evidence-task-projection-heads:id-ascending',
   ])
   const taskRows = await tx.select().from(tasks)
     .where(eq(tasks.projectId, input.lockedProject.id))
@@ -855,6 +929,16 @@ export async function reconcileFilesystemGrantsForProject(
   if (pointerRows.some((pointer) => packageDecisionPointerParent(pointer, packageDecisionRows) === undefined)) {
     throw httpError('Filesystem decision pointer does not match its immutable package decision.', 409)
   }
+  const transitionAuthorityByPackageId = new Map<string, OperatorHoldProjectionAuthority>()
+  for (const pointer of pointerRows) {
+    const decision = packageDecisionPointerParent(pointer, packageDecisionRows)
+    if (decision?.grantDecisionRevision !== null && decision?.grantDecisionRevision !== undefined) {
+      transitionAuthorityByPackageId.set(pointer.workPackageId, {
+        decisionId: decision.id,
+        grantDecisionRevision: decision.grantDecisionRevision.toString(),
+      })
+    }
+  }
   const now = await lockedTransactionNow(tx)
   const revision = input.lockedProject.grantDecisionRevision
   const nextMcpConfig = filesystemMcpConfigAfterRootRepoint({
@@ -864,12 +948,19 @@ export async function reconcileFilesystemGrantsForProject(
     rootBindingRevision: input.lockedProject.rootBindingRevision,
   })
   return reconcileLockedProjectRows({
+    defaultTransitionAuthority: currentProjectDecision
+      ? {
+          decisionId: currentProjectDecision.id,
+          grantDecisionRevision: currentProjectDecision.grantDecisionRevision.toString(),
+        }
+      : null,
     lockedProject: input.lockedProject,
     nextMcpConfig,
     now,
     packages: new Map(packageRows.map((pkg) => [pkg.id, pkg])),
     projectAuthority: currentProjectDecision ? projectDecisionAuthority(currentProjectDecision) : null,
     taskRows,
+    transitionAuthorityByPackageId,
     trigger: input.trigger,
     tx,
   })
@@ -887,6 +978,7 @@ async function lockMutationRows(input: {
     'tasks:id-ascending',
     'work-packages:id-ascending',
     'grant-approval-decision-rows:id-ascending',
+    'local-run-evidence-task-projection-heads:id-ascending',
   ])
   const [project] = await input.tx
     .select()
@@ -968,11 +1060,17 @@ async function lockMutationRows(input: {
   if (pointerRows.length !== pointerPackageIds.length) {
     throw httpError('Filesystem decision authority is not initialized for every package.', 409)
   }
-  if (pointerRows.some((pointer) => packageDecisionPointerParent(pointer, packageDecisionRows) === undefined)) {
-    throw httpError('Filesystem decision pointer does not match its immutable package decision.', 409)
+  const packageDecisionByPackageId = new Map<string, PackageDecision>()
+  for (const pointer of pointerRows) {
+    const decision = packageDecisionPointerParent(pointer, packageDecisionRows)
+    if (decision === undefined) {
+      throw httpError('Filesystem decision pointer does not match its immutable package decision.', 409)
+    }
+    if (decision) packageDecisionByPackageId.set(pointer.workPackageId, decision)
   }
   return {
     packageById,
+    packageDecisionByPackageId,
     pointerByPackageId: new Map(pointerRows.map((pointer) => [pointer.workPackageId, pointer])),
     project,
     projectAuthority: currentProjectDecision ? projectDecisionAuthority(currentProjectDecision) : null,
@@ -1027,13 +1125,13 @@ export async function mutateTaskFilesystemGrants(input: {
     if (!targetTask || !TASK_EDITABLE.has(targetTask.status)) {
       throw httpError(`Cannot edit filesystem grants while task status is '${targetTask?.status ?? 'missing'}'.`, 409)
     }
-    const [targetProjectionScope] = await tx
-      .select({ state: taskLocalProjectionScopes.localProjectionScopeState })
-      .from(taskLocalProjectionScopes)
-      .where(eq(taskLocalProjectionScopes.id, input.taskId))
-    if (targetProjectionScope?.state !== 'active') {
+    const projectionScopeByTaskId = new Map(
+      locked.taskRows.map((task) => [task.id, task.localProjectionScopeState]),
+    )
+    const targetProjectionScopeState = projectionScopeByTaskId.get(input.taskId)
+    if (targetProjectionScopeState !== 'active') {
       throw httpError(
-        `Task projection scope is '${targetProjectionScope?.state ?? 'missing'}' and is not claimable.`,
+        `Task projection scope is '${targetProjectionScopeState ?? 'missing'}' and is not claimable.`,
         409,
       )
     }
@@ -1048,6 +1146,7 @@ export async function mutateTaskFilesystemGrants(input: {
     const approvals: FilesystemGrantMutationResult['approvals'] = []
     const states: FilesystemGrantMutationResult['states'] = []
     const directlyAffected = new Set<string>()
+    const transitionAuthorityByPackageId = new Map<string, OperatorHoldProjectionAuthority>()
 
     for (const mutation of input.mutations) {
       const pkg = locked.packageById.get(mutation.workPackageId)!
@@ -1224,13 +1323,9 @@ export async function mutateTaskFilesystemGrants(input: {
         ))
         .returning()
       if (!advanced) throw httpError('Filesystem decision changed concurrently. Review the latest decision before retrying.', 409)
-      await advanceOperatorHoldProjection({
-        authoritativeDecisionId: approval.id,
-        decision: mutation.decision,
-        grantDecisionRevision: revision,
-        taskId: pkg.taskId,
-        tx,
-        workPackageId: pkg.id,
+      transitionAuthorityByPackageId.set(pkg.id, {
+        decisionId: approval.id,
+        grantDecisionRevision: revisionText,
       })
       locked.pointerByPackageId.set(pkg.id, advanced)
       const phases = phasesWithEffective(pkg.metadata, effective)
@@ -1265,6 +1360,12 @@ export async function mutateTaskFilesystemGrants(input: {
 
     if (projectWide) {
       const reconciled = await reconcileLockedProjectRows({
+        defaultTransitionAuthority: projectAuthority
+          ? {
+              decisionId: projectAuthority.decisionId,
+              grantDecisionRevision: projectAuthority.grantDecisionRevision,
+            }
+          : null,
         lockedProject: locked.project,
         nextMcpConfig: nextConfig,
         now,
@@ -1274,18 +1375,6 @@ export async function mutateTaskFilesystemGrants(input: {
         trigger: 'task_always_allow',
         tx,
       })
-      if (projectAuthority) {
-        for (const pkg of [...locked.packageById.values()].sort((left, right) => left.id.localeCompare(right.id))) {
-          await advanceOperatorHoldProjection({
-            authoritativeDecisionId: projectAuthority.decisionId,
-            decision: projectAuthority.decision,
-            grantDecisionRevision: BigInt(projectAuthority.grantDecisionRevision),
-            taskId: pkg.taskId,
-            tx,
-            workPackageId: pkg.id,
-          })
-        }
-      }
       return { approvals, recoveredTaskIds: reconciled.recoveredTaskIds, states }
     }
     const recoveredTaskIds = await applyCanonicalProjection({
@@ -1294,6 +1383,8 @@ export async function mutateTaskFilesystemGrants(input: {
       packages: locked.packageById,
       packageIds: [...directlyAffected],
       projectAuthority,
+      taskProjectionScopeById: projectionScopeByTaskId,
+      transitionAuthorityByPackageId,
       forcePackageIds: directlyAffected,
       tx,
     })
@@ -1404,6 +1495,10 @@ export async function mutateProjectFilesystemGrant(input: {
     )).returning()
     if (!updatedProject) throw httpError('Project filesystem policy changed concurrently. Retry from the current state.', 409)
     const reconciled = await reconcileLockedProjectRows({
+      defaultTransitionAuthority: {
+        decisionId: appended.decision.id,
+        grantDecisionRevision: appended.decision.grantDecisionRevision.toString(),
+      },
       lockedProject: updatedProject,
       nextMcpConfig: nextConfig,
       now,

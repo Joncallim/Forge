@@ -76,7 +76,13 @@ jobs:
             LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
             PASSWORD 'forge_app_test';
           CREATE DATABASE forge_epic_172_ci_test OWNER forge_migration_test;
+          CREATE DATABASE forge_migration_0026_upgrade_test OWNER forge_migration_test;
           SQL
+      - name: Prove populated migration 0025 to 0026 upgrade
+        run: bash scripts/ci/prove-migration-0026-upgrade.sh
+        env:
+          FORGE_MIGRATION_0026_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_migration_0026_upgrade_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_migration_0026_upgrade_test
       - name: Bootstrap Epic 172 release roles
         run: npm run protocol:bootstrap-epic-172-release-roles
         env:

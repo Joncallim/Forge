@@ -19,6 +19,7 @@ import {
   summarizeFilesystemCapabilities,
 } from '@/lib/mcps/filesystem-grants'
 import { respondToRouteError } from '@/lib/http/route-error'
+import { logged500Error } from '@/lib/logged-500'
 import {
   mutateTaskFilesystemGrants,
   type FilesystemGrantMutation,
@@ -186,7 +187,7 @@ export async function PUT(
       try {
         await redis.lpush('forge:approvals', JSON.stringify({ taskId: recoveredTaskId, action: 'approve' }))
       } catch (err) {
-        console.error('[tasks/filesystem-grants PUT] Failed to enqueue recovery', err)
+        logged500Error('PUT /api/tasks/:id/filesystem-grants', err)
         queueFailures.push(recoveredTaskId)
       }
     }

@@ -2,7 +2,7 @@ import { streamText } from 'ai'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { db } from '../db'
-import { agentConfigs, agentRuns, artifacts, projects, taskQuestions, tasks } from '../db/schema'
+import { agentConfigs, agentRuns, artifacts, projects, taskQuestions, tasks, type Task } from '../db/schema'
 import { getModel, getProvider } from '../lib/providers/registry'
 import { resolveDefaultProvider } from '../lib/providers/default'
 import { and, asc, desc, eq } from 'drizzle-orm'
@@ -44,7 +44,7 @@ import {
 import { completeTaskIfReviewGatesSatisfied } from './review-gates'
 import { sanitizeWorkerMessage } from './redaction'
 
-type TaskRow = typeof tasks.$inferSelect
+type TaskRow = Task
 type ProjectRow = typeof projects.$inferSelect
 type AgentConfigRow = typeof agentConfigs.$inferSelect
 

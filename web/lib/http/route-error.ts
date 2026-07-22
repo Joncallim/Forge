@@ -50,9 +50,10 @@ export function isPublicHttpError(err: unknown): err is PublicHttpError {
  * Canonical route error boundary. Typed public 4xx errors surface their
  * approved message and status. Every other value — a plain Error, an object
  * with a forged numeric `status`, or an untyped 5xx — is logged server-side
- * against a fresh correlation id and answered with fixed generic text. No
- * exception message, stack, filesystem path, SQL detail, prompt fragment,
- * nonce, or token ever reaches the HTTP response body.
+ * against a fresh correlation id and answered with fixed generic text. The log
+ * retains only an allowlisted error class and validated error code; exception
+ * messages, stacks, filesystem paths, SQL details, prompt fragments, nonces,
+ * and tokens never reach either output.
  */
 export function respondToRouteError(route: string, err: unknown): NextResponse {
   if (isPublicHttpError(err)) {
