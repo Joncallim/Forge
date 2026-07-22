@@ -20,6 +20,53 @@ export class S4ProtocolStoreError extends Error {
   }
 }
 
+const ARCHITECT_PLAN_PROTECTION_ENV = [
+  'FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL',
+  'FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX',
+  'FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID',
+] as const
+
+export type ArchitectPlanStorageConfiguration =
+  | { mode: 'legacy' }
+  | { mode: 'protected'; digestKey: Buffer; digestKeyId: string }
+
+/**
+ * Keeps ordinary planning compatible until protected Architect history is
+ * provisioned. A partially provisioned boundary is never treated as legacy:
+ * doing so could put plan text back into the public artifact after an operator
+ * has started the protected-history cutover.
+ */
+export function architectPlanStorageConfiguration(
+  environment: NodeJS.ProcessEnv = process.env,
+): ArchitectPlanStorageConfiguration {
+  const configured = ARCHITECT_PLAN_PROTECTION_ENV.filter((name) => Boolean(environment[name]?.trim()))
+  if (configured.length === 0) return { mode: 'legacy' }
+  if (configured.length !== ARCHITECT_PLAN_PROTECTION_ENV.length) {
+    const missing = ARCHITECT_PLAN_PROTECTION_ENV.filter((name) => !environment[name]?.trim())
+    throw new S4ProtocolStoreError(
+      'configuration',
+      `Protected Architect history is partially configured; missing ${missing.join(', ')}.`,
+    )
+  }
+
+  const keyHex = environment.FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX!.trim()
+  const digestKeyId = environment.FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID!.trim()
+  if (!/^[0-9a-f]{64,}$/.test(keyHex) || keyHex.length % 2 !== 0) {
+    throw new S4ProtocolStoreError(
+      'configuration',
+      'FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX must be an even-length lowercase hex key of at least 32 bytes.',
+    )
+  }
+  if (!/^[a-z0-9._-]{1,64}$/.test(digestKeyId)) {
+    throw new S4ProtocolStoreError(
+      'configuration',
+      'FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID is invalid for protected Architect history.',
+    )
+  }
+
+  return { mode: 'protected', digestKey: Buffer.from(keyHex, 'hex'), digestKeyId }
+}
+
 function dedicatedUrl(name: string): string {
   const value = process.env[name]?.trim()
   if (!value) throw new S4ProtocolStoreError('configuration', `${name} is required for the dedicated S4 database boundary`)

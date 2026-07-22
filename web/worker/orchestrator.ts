@@ -43,7 +43,10 @@ import {
 } from './work-package-handoff'
 import { completeTaskIfReviewGatesSatisfied } from './review-gates'
 import { sanitizeWorkerMessage } from './redaction'
-import { recordArchitectPlanVersion } from '../lib/mcps/s4-protocol-store'
+import {
+  architectPlanStorageConfiguration,
+  recordArchitectPlanVersion,
+} from '../lib/mcps/s4-protocol-store'
 import { ARCHITECT_PLAN_HEADER } from '../lib/mcps/architect-plan-entries'
 
 type TaskRow = Task
@@ -395,7 +398,7 @@ function mockArchitectPlan(task: TaskRow, project: ProjectRow): string {
   ].join('\n')
 }
 
-type LatestPlanArtifact = {
+export type LatestPlanArtifact = {
   content: string
   metadata: Record<string, unknown>
 }
@@ -478,56 +481,74 @@ async function loadLatestPlanArtifact(taskId: string): Promise<LatestPlanArtifac
   }
 }
 
-async function createArtifact(
+export async function createArchitectPlanArtifact(
   taskId: string,
   agentRunId: string,
   content: string,
   planVersion: string,
   metadataExtra: Record<string, unknown> = {},
 ): Promise<typeof artifacts.$inferSelect> {
-  const keyHex = process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX?.trim() ?? ''
-  const digestKeyId = process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID?.trim() ?? ''
-  if (!/^[0-9a-f]{64,}$/.test(keyHex) || keyHex.length % 2 !== 0) {
-    throw new Error('FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX must be an even-length lowercase hex key of at least 32 bytes.')
-  }
-  if (!/^[a-z0-9._-]{1,64}$/.test(digestKeyId)) {
-    throw new Error('FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID is required for protected Architect history.')
-  }
-  const protectedPlan = await recordArchitectPlanVersion({
-    agentRunId,
-    digestKey: Buffer.from(keyHex, 'hex'),
-    digestKeyId,
-    entries: [{
-      agent: null,
-      bindingFingerprint: null,
-      content,
-      entryId: 'plan_body:000000',
-      entryKind: 'plan_body',
-      projectionEligible: false,
-      requirementKey: null,
-    }],
-    planVersion,
-    taskId,
-  })
-  const [artifact] = await db
-    .update(artifacts)
-    .set({
-      metadata: {
-        stage: 'architect_plan',
-        generatedBy: 'forge-worker',
-        historyAvailable: true,
-        planVersion,
-        entryCount: protectedPlan.entries.length,
-        entrySetDigest: protectedPlan.entrySetDigest,
-        ...metadataExtra,
-      },
+  const storage = architectPlanStorageConfiguration()
+  let artifact: typeof artifacts.$inferSelect | undefined
+  if (storage.mode === 'legacy') {
+    const [legacyArtifact] = await db
+      .insert(artifacts)
+      .values({
+        agentRunId,
+        artifactType: 'adr_text',
+        content,
+        metadata: {
+          stage: 'architect_plan',
+          generatedBy: 'forge-worker',
+          historyAvailable: false,
+          planVersion,
+          storageMode: 'legacy',
+          ...metadataExtra,
+        },
+      })
+      .returning()
+    artifact = legacyArtifact
+  } else {
+    const protectedPlan = await recordArchitectPlanVersion({
+      agentRunId,
+      digestKey: storage.digestKey,
+      digestKeyId: storage.digestKeyId,
+      entries: [{
+        agent: null,
+        bindingFingerprint: null,
+        content,
+        entryId: 'plan_body:000000',
+        entryKind: 'plan_body',
+        projectionEligible: false,
+        requirementKey: null,
+      }],
+      planVersion,
+      taskId,
     })
-    .where(eq(artifacts.id, protectedPlan.artifactId))
-    .returning()
+    const [protectedArtifact] = await db
+      .update(artifacts)
+      .set({
+        metadata: {
+          stage: 'architect_plan',
+          generatedBy: 'forge-worker',
+          historyAvailable: true,
+          planVersion,
+          entryCount: protectedPlan.entries.length,
+          entrySetDigest: protectedPlan.entrySetDigest,
+          storageMode: 'protected',
+          ...metadataExtra,
+        },
+      })
+      .where(eq(artifacts.id, protectedPlan.artifactId))
+      .returning()
+    artifact = protectedArtifact
 
-  if (!artifact || artifact.content !== ARCHITECT_PLAN_HEADER) {
-    throw new Error('Protected Architect artifact did not retain the safe public header.')
+    if (!artifact || artifact.content !== ARCHITECT_PLAN_HEADER) {
+      throw new Error('Protected Architect artifact did not retain the safe public header.')
+    }
   }
+
+  if (!artifact) throw new Error('Architect artifact was not persisted.')
 
   await publishTaskEvent(taskId, 'artifact:created', {
     id: artifact.id,
@@ -562,6 +583,23 @@ function planTextFromCheckpoint(checkpoint: ArchitectResumeCheckpoint | null): s
   const match = /(?:^|\n)## Plan Artifact\n\n([\s\S]*?)(?=\n\n## Open Questions(?:\n|$))/.exec(checkpoint.markdown)
   const plan = match?.[1]?.trim() ?? ''
   return plan && plan !== 'No plan artifact was produced before this checkpoint.' ? plan : null
+}
+
+export function previousPlanForReplan(
+  artifact: LatestPlanArtifact | null,
+  checkpoint: ArchitectResumeCheckpoint | null,
+): string | null {
+  if (artifact) {
+    const protectedArtifact = artifact.content === ARCHITECT_PLAN_HEADER || artifact.metadata.historyAvailable === true
+    if (protectedArtifact) {
+      throw new Error(
+        'The previous Architect plan is protected, but no purpose-bound Architect replan resolver is available. Replan failed closed.',
+      )
+    }
+    const durablePlan = artifact.content.trim()
+    if (durablePlan) return durablePlan
+  }
+  return planTextFromCheckpoint(checkpoint)
 }
 
 /**
@@ -678,7 +716,7 @@ async function runArchitect(
   }
   const resumeCheckpoint = await readLatestArchitectCheckpointSafely(task.id)
   const previousPlanArtifact = await loadLatestPlanArtifact(task.id)
-  const previousPlan = planTextFromCheckpoint(resumeCheckpoint)
+  const previousPlan = previousPlanForReplan(previousPlanArtifact, resumeCheckpoint)
   const startedAt = new Date()
   const [run] = await db
     .insert(agentRuns)
@@ -700,6 +738,7 @@ async function runArchitect(
   })
 
   let text = ''
+  let outputBytes = 0
 
   try {
     const projectFilesystemDecision = await loadCurrentProjectFilesystemDecision(project.id)
@@ -711,6 +750,7 @@ async function runArchitect(
 
     if (process.env.FORGE_WORKER_MOCK_ARCHITECT === '1') {
       text = mockArchitectPlan(task, project)
+      outputBytes = Buffer.byteLength(text, 'utf8')
       await recordTaskLogBestEffort({
         agentRunId: run.id,
         eventType: 'run.started',
@@ -725,9 +765,9 @@ async function runArchitect(
         taskId: task.id,
         title: 'Architect run started',
       })
-      await publishTaskEvent(task.id, 'run:chunk', {
+      await publishTaskEvent(task.id, 'run:progress', {
         runId: run.id,
-        delta: text,
+        outputBytes,
       })
     } else {
       const profile = detectSoftwareProfile(task, project)
@@ -785,9 +825,10 @@ async function runArchitect(
 
         for await (const delta of result.textStream) {
           text += delta
-          await publishTaskEvent(task.id, 'run:chunk', {
+          outputBytes += Buffer.byteLength(delta, 'utf8')
+          await publishTaskEvent(task.id, 'run:progress', {
             runId: run.id,
-            delta,
+            outputBytes,
           })
         }
 
@@ -885,7 +926,7 @@ async function runArchitect(
     const planVersion = typeof previousVersion === 'string' && /^[1-9][0-9]*$/.test(previousVersion)
       ? (BigInt(previousVersion) + BigInt(1)).toString()
       : '1'
-    const artifact = await createArtifact(task.id, run.id, artifactPlanText, planVersion, {
+    const artifact = await createArchitectPlanArtifact(task.id, run.id, artifactPlanText, planVersion, {
       openQuestionCount: prepared.questions.length,
       regeneratedFromPlan: regeneratedPlanReason !== null,
       regeneratedPlanReason,

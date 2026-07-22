@@ -56,7 +56,8 @@ vi.mock('@/worker/events', () => ({
   publishTaskEvent: mockPublishTaskEvent,
 }))
 
-vi.mock('@/lib/mcps/s4-protocol-store', () => ({
+vi.mock('@/lib/mcps/s4-protocol-store', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/s4-protocol-store')>(),
   recordArchitectPlanVersion: mockRecordArchitectPlanVersion,
 }))
 
@@ -105,6 +106,7 @@ const repoRoot = path.resolve(__dirname, '..')
 
 describe('answered-question retry contract', () => {
   const previousMockArchitect = process.env.FORGE_WORKER_MOCK_ARCHITECT
+  const previousArchitectPlanWriterUrl = process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL
   const selectResults: unknown[] = []
   const insertResults: unknown[] = []
   const updateResults: unknown[] = []
@@ -116,6 +118,7 @@ describe('answered-question retry contract', () => {
     vi.clearAllMocks()
     process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX = 'a'.repeat(64)
     process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID = 'test-v1'
+    process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL = 'postgresql://writer/test'
     mockRecordArchitectPlanVersion.mockResolvedValue({
       artifactId: 'artifact-1',
       entries: [{ entryId: 'plan_body:000000' }],
@@ -166,6 +169,11 @@ describe('answered-question retry contract', () => {
       delete process.env.FORGE_WORKER_MOCK_ARCHITECT
     } else {
       process.env.FORGE_WORKER_MOCK_ARCHITECT = previousMockArchitect
+    }
+    if (previousArchitectPlanWriterUrl === undefined) {
+      delete process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL
+    } else {
+      process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL = previousArchitectPlanWriterUrl
     }
   })
 
