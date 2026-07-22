@@ -119,6 +119,7 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
       'FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL',
       'FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL',
       'FORGE_PACKET_ISSUER_DATABASE_URL',
+      'FORGE_EPIC_172_TEST_APP_DATABASE_URL',
     ]) {
       expect(webCiWorkflow).toContain(`${variable}:`)
     }
@@ -145,6 +146,46 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(s4Migration).toContain("'issue_179_s4@' || state.reviewed_sha")
     expect(s4Migration).toContain("'issue_180_s5@' || state.reviewed_sha")
     expect(s4Migration).toContain("'issue_181_s6@' || state.reviewed_sha")
+  })
+
+  it('keeps the ordinary-app Architect trigger on an S4-owned security-definer bridge', () => {
+    const definitions = s4Migration.match(/CREATE OR REPLACE FUNCTION[\s\S]*?\$\$;/g) ?? []
+    const predicate = definitions.find((definition) => definition.startsWith(
+      'CREATE OR REPLACE FUNCTION forge.s4_protected_paths_enabled_v1()',
+    ))
+    const guard = definitions.find((definition) => definition.startsWith(
+      'CREATE OR REPLACE FUNCTION forge.guard_architect_plan_public_artifact_v1()',
+    ))
+
+    expect(predicate).toMatch(/SECURITY DEFINER\s+SET search_path = pg_catalog, public/)
+    expect(guard).toMatch(/SECURITY DEFINER\s+SET search_path = pg_catalog, forge/)
+    for (const routine of [
+      's4_protected_paths_enabled_v1',
+      'guard_architect_plan_public_artifact_v1',
+    ]) {
+      expect(s4Migration).toContain(`REVOKE ALL ON FUNCTION forge.${routine}() FROM PUBLIC;`)
+      expect(s4Migration).toContain(
+        `ALTER FUNCTION forge.${routine}() OWNER TO forge_s4_routines_owner;`,
+      )
+    }
+
+    const predicateCallers = definitions.filter((definition) => (
+      definition.includes('forge.s4_protected_paths_enabled_v1()')
+      && !definition.startsWith('CREATE OR REPLACE FUNCTION forge.s4_protected_paths_enabled_v1()')
+    ))
+    expect(predicateCallers.map((definition) => definition.match(
+      /CREATE OR REPLACE FUNCTION forge\.([a-z0-9_]+)/,
+    )?.[1])).toEqual([
+      'guard_architect_plan_public_artifact_v1',
+      'read_architect_plan_history_v1',
+      'resolve_architect_plan_entry_v1',
+      'create_local_run_evidence_v1',
+      'insert_packet_authorization_snapshot_v2',
+      'insert_architect_plan_version_v1',
+      'bind_architect_plan_entry_v1',
+      'bind_architect_replan_entry_v1',
+    ])
+    for (const caller of predicateCallers) expect(caller).toContain('SECURITY DEFINER')
   })
 
   it('keeps the Architect replan arm purpose-discriminated and one-reader-only', () => {

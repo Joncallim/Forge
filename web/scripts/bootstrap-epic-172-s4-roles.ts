@@ -219,6 +219,24 @@ async function main(): Promise<void> {
             raise exception 'The S4 routine owner or PUBLIC boundary is incomplete'
               using errcode = '42501';
           end if;
+          if (
+            select pg_catalog.count(*)
+            from pg_catalog.pg_proc routine
+            where routine.oid = any(array[
+              'forge.s4_protected_paths_enabled_v1()'::pg_catalog.regprocedure,
+              'forge.guard_architect_plan_public_artifact_v1()'::pg_catalog.regprocedure
+            ])
+              and routine.prosecdef
+              and routine.proconfig = case routine.proname
+                when 's4_protected_paths_enabled_v1'
+                  then array['search_path=pg_catalog, public']::text[]
+                when 'guard_architect_plan_public_artifact_v1'
+                  then array['search_path=pg_catalog, forge']::text[]
+              end
+          ) <> 2 then
+            raise exception 'The S4 application-trigger bridge is not security-definer with its fixed search path'
+              using errcode = '42501';
+          end if;
           if not pg_catalog.has_function_privilege(
                '${OWNER}', 'forge.read_epic_172_enablement_state_v1()', 'execute'
              ) or exists (

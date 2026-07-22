@@ -15,13 +15,14 @@ const issuerUrl = process.env.FORGE_PACKET_ISSUER_DATABASE_URL?.trim()
 const writerUrl = process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL?.trim()
 const resolverUrl = process.env.FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL?.trim()
 const historyReaderUrl = process.env.FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL?.trim()
-const enabled = Boolean(adminUrl && issuerUrl && writerUrl && resolverUrl && historyReaderUrl)
+const appUrl = process.env.FORGE_EPIC_172_TEST_APP_DATABASE_URL?.trim()
+const enabled = Boolean(adminUrl && issuerUrl && writerUrl && resolverUrl && historyReaderUrl && appUrl)
 const requirePostgresFixture = process.env.FORGE_S4_REQUIRE_POSTGRES_TEST === '1'
 const SHA = `sha256:${'a'.repeat(64)}`
 
 if (requirePostgresFixture && !enabled) {
   throw new Error(
-    'FORGE_S4_REQUIRE_POSTGRES_TEST=1 requires the S4 administrator, packet issuer, Architect plan writer, Architect plan resolver, and Architect history reader PostgreSQL URLs; the explicit contract suite may not skip.',
+    'FORGE_S4_REQUIRE_POSTGRES_TEST=1 requires the S4 administrator, ordinary app, packet issuer, Architect plan writer, Architect plan resolver, and Architect history reader PostgreSQL URLs; the explicit contract suite may not skip.',
   )
 }
 
@@ -49,6 +50,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
   const key = randomBytes(32)
   const sessionCredential = randomUUID()
   let admin: ReturnType<typeof postgres>
+  let app: ReturnType<typeof postgres>
   let issuer: ReturnType<typeof postgres>
 
   beforeAll(async () => {
@@ -56,6 +58,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     process.env.FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL = resolverUrl!
     process.env.FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL = historyReaderUrl!
     admin = postgres(adminUrl!, { max: 1, onnotice: () => {} })
+    app = postgres(appUrl!, { max: 1, onnotice: () => {} })
     issuer = postgres(issuerUrl!, { max: 2, onnotice: () => {} })
 
     await admin.begin(async (tx) => {
@@ -201,7 +204,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         where singleton_id = 'epic-172'
       `
     }
-    await Promise.all([admin?.end({ timeout: 5 }), issuer?.end({ timeout: 5 })])
+    await Promise.all([admin?.end({ timeout: 5 }), app?.end({ timeout: 5 }), issuer?.end({ timeout: 5 })])
   })
 
   it('permits only legacy adr_text planning while Step 0 is disabled', async () => {
@@ -221,7 +224,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         insert into agent_runs (id, task_id, work_package_id, agent_type, model_id_used, status)
         values (${ids.legacyArchitectRun}::uuid, ${ids.task}::uuid, null, 'architect', 'test', 'completed')
       `
-      await expect(admin`
+      await expect(app`
         insert into artifacts (agent_run_id, artifact_type, content, metadata)
         values (
           ${ids.legacyArchitectRun}::uuid, 'adr_text', 'Legacy Architect plan body',
@@ -256,6 +259,13 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         where singleton_id = 'epic-172'
       `
     }
+    await expect(app`
+      insert into artifacts (agent_run_id, artifact_type, content, metadata)
+      values (
+        ${ids.legacyArchitectRun}::uuid, 'adr_text', 'Unprotected active Architect plan body',
+        '{"storageMode":"legacy"}'::jsonb
+      )
+    `).rejects.toMatchObject({ code: '42501' })
   })
 
   it('protects task-bound Architect source and burns each execution reference once', async () => {

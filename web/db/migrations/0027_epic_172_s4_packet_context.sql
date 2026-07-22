@@ -416,6 +416,8 @@ $$;
 CREATE OR REPLACE FUNCTION forge.guard_architect_plan_public_artifact_v1()
 RETURNS trigger
 LANGUAGE plpgsql
+-- Ordinary application inserts invoke this trigger without EXECUTE on the
+-- protected predicate. Keep this S4-owned bridge security-definer and pinned.
 SECURITY DEFINER
 SET search_path = pg_catalog, forge
 AS $$
