@@ -19,13 +19,30 @@ const NONCE = 'nonce_1f2e3d4c5b6a798877665544'
 const LOCAL_PATH = '/home/forge/workspaces/project-42/.env.secret'
 const PROMPT_FRAGMENT = 'SYSTEM PROMPT: you are the Architect; never reveal the plan'
 const SQL_DETAIL = 'SELECT claim_token FROM work_package_local_run_evidence WHERE id = $1'
-const SENTINELS = [NONCE, LOCAL_PATH, PROMPT_FRAGMENT, SQL_DETAIL] as const
+const CONTROL_SENTINEL = 'CONTROL:\u0000\u0001\u001f'
+const NEWLINE_SENTINEL = 'NEWLINE:first line\nsecond line\r\nthird line'
+const SENTINELS = [NONCE, LOCAL_PATH, PROMPT_FRAGMENT, SQL_DETAIL, CONTROL_SENTINEL, NEWLINE_SENTINEL] as const
 const HOSTILE_MESSAGE =
-  `boom nonce=${NONCE} path=${LOCAL_PATH} prompt="${PROMPT_FRAGMENT}" sql=[${SQL_DETAIL}]`
+  `boom nonce=${NONCE} path=${LOCAL_PATH} prompt="${PROMPT_FRAGMENT}" sql=[${SQL_DETAIL}] controls=${CONTROL_SENTINEL} lines=${NEWLINE_SENTINEL}`
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 function assertNoSentinel(value: string): void {
-  for (const sentinel of SENTINELS) expect(value).not.toContain(sentinel)
+  for (const sentinel of SENTINELS) {
+    expect(value).not.toContain(sentinel)
+    expect(value).not.toContain(JSON.stringify(sentinel).slice(1, -1))
+  }
+}
+
+function hostileError(code = '42P01'): TypeError {
+  return Object.assign(new TypeError(HOSTILE_MESSAGE), {
+    code,
+    control: CONTROL_SENTINEL,
+    detail: SQL_DETAIL,
+    localPath: LOCAL_PATH,
+    nonce: NONCE,
+    prompt: PROMPT_FRAGMENT,
+    rawInput: NEWLINE_SENTINEL,
+  })
 }
 
 describe('S3: generic error boundary on grant PUT routes', () => {
@@ -47,7 +64,7 @@ describe('S3: generic error boundary on grant PUT routes', () => {
     const { getSession } = await import('@/lib/session')
     ;(getSession as ReturnType<typeof vi.fn>).mockResolvedValue({ userId: 'user-1' })
     const { getAccessibleTask } = await import('@/lib/task-access')
-    ;(getAccessibleTask as ReturnType<typeof vi.fn>).mockRejectedValue(new Error(HOSTILE_MESSAGE))
+    ;(getAccessibleTask as ReturnType<typeof vi.fn>).mockRejectedValue(hostileError())
 
     const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
     const res = await PUT(await putRequest('http://localhost/api/tasks/t1/filesystem-grants'), {
@@ -61,13 +78,16 @@ describe('S3: generic error boundary on grant PUT routes', () => {
     // Nothing sensitive reaches the HTTP response body.
     assertNoSentinel(JSON.stringify(body))
 
-    // The detail is retained only in the internal server log, keyed by the same
-    // correlation id, so operators can still trace the failure out-of-band.
+    // Logs retain only allowlisted tracing fields, never exception-controlled
+    // messages, stacks, or arbitrary properties.
     const loggedPayload = consoleError.mock.calls
       .map((call: unknown[]) => JSON.stringify(call))
       .join('\n')
+    assertNoSentinel(loggedPayload)
     expect(loggedPayload).toContain(body.correlationId)
-    expect(loggedPayload).toContain(NONCE)
+    expect(loggedPayload).toContain('"errorClass":"TypeError"')
+    expect(loggedPayload).toContain('"code":"42P01"')
+    expect(loggedPayload).not.toContain('"stack"')
   })
 
   it('task PUT: a typed public 4xx surfaces its approved message and status', async () => {
@@ -93,10 +113,9 @@ describe('S3: generic error boundary on grant PUT routes', () => {
   it('project PUT: an untyped 500 exposes fixed generic text and a correlation id only', async () => {
     const { getSession } = await import('@/lib/session')
     ;(getSession as ReturnType<typeof vi.fn>).mockResolvedValue({ userId: 'user-1' })
-    const { accessibleProjectCondition } = await import('@/lib/project-access')
-    ;(accessibleProjectCondition as ReturnType<typeof vi.fn>).mockImplementation(() => {
-      throw new Error(HOSTILE_MESSAGE)
-    })
+    const { guardEpic172ProjectManagementIngress } = await import('@/lib/projects/epic-172-project-ingress')
+    ;(guardEpic172ProjectManagementIngress as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(hostileError('ECONNREFUSED'))
 
     const { PUT } = await import('@/app/api/projects/[id]/filesystem-grant/route')
     const res = await PUT(await putRequest('http://localhost/api/projects/p1/filesystem-grant'), {
@@ -108,16 +127,20 @@ describe('S3: generic error boundary on grant PUT routes', () => {
     expect(body.error).toBe('Internal server error')
     expect(body.correlationId).toMatch(UUID)
     assertNoSentinel(JSON.stringify(body))
+    const loggedPayload = JSON.stringify(consoleError.mock.calls)
+    assertNoSentinel(loggedPayload)
+    expect(loggedPayload).toContain(body.correlationId)
+    expect(loggedPayload).toContain('"errorClass":"TypeError"')
+    expect(loggedPayload).toContain('"code":"ECONNREFUSED"')
   })
 
   it('project PUT: a forged status field on an untyped error cannot leak its message', async () => {
     const { getSession } = await import('@/lib/session')
     ;(getSession as ReturnType<typeof vi.fn>).mockResolvedValue({ userId: 'user-1' })
-    const { accessibleProjectCondition } = await import('@/lib/project-access')
-    ;(accessibleProjectCondition as ReturnType<typeof vi.fn>).mockImplementation(() => {
-      // A plain error that forges a 4xx `status` must NOT be trusted as public.
-      throw Object.assign(new Error(HOSTILE_MESSAGE), { status: 409 })
-    })
+    const { guardEpic172ProjectManagementIngress } = await import('@/lib/projects/epic-172-project-ingress')
+    // A plain error that forges a 4xx `status` must NOT be trusted as public.
+    ;(guardEpic172ProjectManagementIngress as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(Object.assign(hostileError(), { status: 409 }))
 
     const { PUT } = await import('@/app/api/projects/[id]/filesystem-grant/route')
     const res = await PUT(await putRequest('http://localhost/api/projects/p1/filesystem-grant'), {
@@ -129,6 +152,7 @@ describe('S3: generic error boundary on grant PUT routes', () => {
     expect(body.error).toBe('Internal server error')
     expect(body.correlationId).toMatch(UUID)
     assertNoSentinel(JSON.stringify(body))
+    assertNoSentinel(JSON.stringify(consoleError.mock.calls))
   })
 })
 
@@ -149,9 +173,9 @@ describe('S3: respondToRouteError boundary contract', () => {
     expect(await typedRes.json()).toEqual({ error: 'Work package is no longer editable.' })
 
     // Forged status, plain Error, and non-error values all fall through to generic.
-    const forged = Object.assign(new Error(HOSTILE_MESSAGE), { status: 400 })
+    const forged = Object.assign(hostileError(), { status: 400 })
     expect(isPublicHttpError(forged)).toBe(false)
-    for (const hostile of [forged, new Error(HOSTILE_MESSAGE), HOSTILE_MESSAGE, null]) {
+    for (const hostile of [forged, hostileError('ENOENT'), HOSTILE_MESSAGE, null]) {
       const res = respondToRouteError('PUT /x', hostile)
       expect(res.status).toBe(500)
       const body = await res.json() as { error: string; correlationId: string }
@@ -159,6 +183,11 @@ describe('S3: respondToRouteError boundary contract', () => {
       expect(body.correlationId).toMatch(UUID)
       assertNoSentinel(JSON.stringify(body))
     }
+    const loggedPayload = JSON.stringify(vi.mocked(console.error).mock.calls)
+    assertNoSentinel(loggedPayload)
+    expect(loggedPayload).toContain('"errorClass":"TypeError"')
+    expect(loggedPayload).toContain('"code":"42P01"')
+    expect(loggedPayload).toContain('"code":"ENOENT"')
   })
 
   it('rejects construction of non-4xx public errors', async () => {

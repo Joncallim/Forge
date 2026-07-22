@@ -54,8 +54,13 @@ const mockDbDelete = vi.fn()
 let mockProjectionScopeState: 'active' | 'archive_pending' = 'active'
 function isProjectionScopeSelection(selection: unknown): boolean {
   if (!selection || typeof selection !== 'object') return false
-  if ('localProjectionScopeState' in selection) return true
-  if (Object.keys(selection).length === 1 && 'state' in selection) return true
+  const keys = Object.keys(selection)
+  if (!keys.every((key) => [
+    'localProjectionOverlimitPackageCount',
+    'localProjectionScopeState',
+    'state',
+    'taskId',
+  ].includes(key))) return false
   const candidate = (selection as Record<string, unknown>).state
     ?? (selection as Record<string, unknown>).localProjectionScopeState
   return Boolean(
@@ -2649,6 +2654,58 @@ describe('GET /api/tasks/:id — task details', () => {
     expect(body.workPackages.flatMap(
       (pkg: { artifacts: Array<{ id: string }> }) => pkg.artifacts.map((artifact) => artifact.id),
     )).toEqual(['artifact-1', 'artifact-2'])
+  })
+
+  it('omits an effective filesystem grant nonce without mutating persisted package metadata', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const grantNonce = 'nonce_task_detail_must_not_serialize'
+    const task = {
+      id: 'task-grant-nonce',
+      status: 'running',
+      projectId: 'proj-1',
+      submittedBy: FAKE_SESSION.userId,
+    }
+    const persistedWorkPackage = {
+      id: 'package-grant-nonce',
+      taskId: task.id,
+      harnessId: null,
+      sequence: 1,
+      metadata: {
+        mcpGrantPhases: {
+          effective: {
+            phase: 'effective',
+            grantNonce,
+            status: 'approved',
+          },
+        },
+      },
+      createdAt: new Date(),
+    }
+    mockDbSelect
+      .mockReturnValueOnce(chain([task]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([persistedWorkPackage]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+
+    const { GET } = await import('@/app/api/tasks/[id]/route')
+    const res = await GET(authRequest(`/api/tasks/${task.id}`) as never, {
+      params: Promise.resolve({ id: task.id }),
+    })
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(persistedWorkPackage.metadata.mcpGrantPhases.effective.grantNonce).toBe(grantNonce)
+    expect(body.workPackages[0].metadata.mcpGrantPhases.effective).toEqual({
+      phase: 'effective',
+      status: 'approved',
+    })
+    expect(JSON.stringify(body)).not.toContain('grantNonce')
+    expect(JSON.stringify(body)).not.toContain(grantNonce)
   })
 
   it('returns task details when the optional repository command audit table has not been migrated yet', async () => {
@@ -5303,6 +5360,8 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       projectId,
       status,
       submittedBy,
+      localProjectionScopeState: 'active',
+      localProjectionOverlimitPackageCount: null,
       updatedAt: new Date('2026-07-03T00:00:00.000Z'),
     }
   }
@@ -5338,7 +5397,9 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
   function mockTaskGrantTransactionLocks(input: {
     packages: Array<Record<string, unknown>>
     project: Record<string, unknown>
+    projectWidePointers?: boolean
     task: Record<string, unknown>
+    tasks?: Array<Record<string, unknown>>
   }) {
     const lockedProject = {
       grantDecisionRevision: BigInt(0),
@@ -5346,7 +5407,7 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       mcpConfig: {},
       ...input.project,
     }
-    const pointerRows = input.packages.slice(0, 1).map((pkg, index) => ({
+    const pointerRows = (input.projectWidePointers ? input.packages : input.packages.slice(0, 1)).map((pkg, index) => ({
       id: `00000000-0000-4000-8000-${String(700 + index).padStart(12, '0')}`,
       taskId: pkg.taskId,
       workPackageId: pkg.id,
@@ -5372,21 +5433,27 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       createdAt: new Date(),
       updatedAt: new Date(),
     }
+    let projectionHeadReads = 0
     const transactionSelect = vi.fn()
       .mockReturnValueOnce(chain([lockedProject]))
-      .mockReturnValueOnce(chain([input.task]))
+      .mockReturnValueOnce(chain(input.tasks ?? [input.task]))
       .mockReturnValueOnce(chain(input.packages))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([projectPointer]))
       .mockReturnValueOnce(chain(pointerRows))
       .mockImplementation((selection?: unknown) => {
-        if (isProjectionScopeSelection(selection)) return scopeAwareDbSelect(selection)
+        if (isProjectionScopeSelection(selection)) {
+          return scopeAwareDbSelect(selection)
+        }
         if (selection === undefined) {
+          projectionHeadReads += 1
+          if (projectionHeadReads > 1) return chain([])
+          const targetPackage = input.packages.find((pkg) => pkg.taskId === input.task.id)
           return chain([{
             id: '00000000-0000-4000-8000-000000000901',
             taskId: input.task.id,
-            workPackageId: input.packages[0]?.id,
+            workPackageId: targetPackage?.id,
             headKind: 'operator_hold',
             headFingerprint: 'head:v1:test:operator_hold:0',
             headRevision: BigInt(0),
@@ -5433,6 +5500,10 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       insert.returning = vi.fn(() => chain([values]))
       return insert
     })
+    const transactionExecute = vi.fn(async () => [{
+      advanced: true,
+      now: '2026-07-03 00:01:00+00',
+    }])
     mockDbSelect.mockImplementation(() => chain([]))
     mockDbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) =>
       callback({
@@ -5440,13 +5511,10 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
         insert: transactionInsert,
         update: transactionUpdate,
         delete: mockDbDelete,
-        execute: vi.fn(async () => [{
-          advanced: true,
-          now: '2026-07-03 00:01:00+00',
-        }]),
+        execute: transactionExecute,
       }),
     )
-    return { projectUpdate }
+    return { projectUpdate, projectionHeadReads: () => projectionHeadReads }
   }
 
   it('approves edited read-only filesystem grants and persists an effective phase', async () => {
@@ -5640,6 +5708,69 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
     })
   })
 
+  it('keeps an active task always-allow approval valid when the project also has an archive-pending over-limit task', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    mockDbInsert.mockReturnValue(chain(undefined))
+
+    await withFilesystemProject(async (project, filesystemPath) => {
+      const activeTask = grantTask(project.id as string)
+      const archivedTask = {
+        ...grantTask(project.id as string),
+        id: '00000000-0000-4000-8000-000000000302',
+        localProjectionScopeState: 'archive_pending',
+        localProjectionOverlimitPackageCount: 257,
+        title: 'Migrated over-limit task',
+      }
+      const activePackage = grantPackage()
+      const archivedPackage = {
+        ...grantPackage(),
+        id: '00000000-0000-4000-8000-000000000303',
+        taskId: archivedTask.id,
+        mcpRequirements: [],
+        title: 'Archived package without projection heads',
+      }
+      mockDbSelect
+        .mockReturnValueOnce(chain([activeTask]))
+        .mockReturnValueOnce(chain([project]))
+        .mockReturnValueOnce(chain([{ mcpId: 'filesystem', installPath: filesystemPath, enabled: true }]))
+        .mockReturnValueOnce(chain([]))
+        .mockReturnValueOnce(chain([activePackage]))
+        .mockReturnValueOnce(chain([activePackage]))
+        .mockReturnValue(chain([activePackage]))
+      const transaction = mockTaskGrantTransactionLocks({
+        packages: [activePackage, archivedPackage],
+        project,
+        projectWidePointers: true,
+        task: activeTask,
+        tasks: [activeTask, archivedTask],
+      })
+
+      const { PUT } = await import('@/app/api/tasks/[id]/filesystem-grants/route')
+      const res = await PUT(authRequest('/api/tasks/task-fs-grant/filesystem-grants', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          schemaVersion: 1,
+          grants: [{
+            workPackageId: FS_GRANT_PACKAGE_ID,
+            decision: 'approved',
+            capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+            grantMode: 'always_allow',
+            reason: 'Trusted active task',
+          }],
+        }),
+      }) as never, {
+        params: Promise.resolve({ id: activeTask.id }),
+      })
+
+      expect(res.status).toBe(200)
+      // Neither package changes operator-hold state: the active package was
+      // already clear and the archive-pending package has no claimable head.
+      // Project-wide approval must therefore commit without querying either.
+      expect(transaction.projectionHeadReads()).toBe(0)
+    })
+  })
+
   it('reconciles failed package grant blocks when enabling the project filesystem grant', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     mockDbInsert.mockReturnValue(chain([{
@@ -5714,9 +5845,15 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       decision: 'approved',
       capabilities: ['filesystem.project.read', 'filesystem.project.list', 'filesystem.project.search'],
     }]))
-    mockRedisLpush.mockRejectedValueOnce(new Error('redis offline'))
+    const enqueueSecret = 'nonce=project-enqueue-secret path=/tmp/project-secret sql=SELECT secret\ncontrol=\u0000'
+    mockRedisLpush.mockRejectedValueOnce(Object.assign(new TypeError(enqueueSecret), {
+      code: 'ECONNREFUSED',
+      detail: enqueueSecret,
+    }))
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
 
-    await withFilesystemProject(async (project, filesystemPath) => {
+    try {
+      await withFilesystemProject(async (project, filesystemPath) => {
       const failedPkg = {
         ...grantPackage({
           mcpGrantBlock: strictGrantBlockMarker(),
@@ -5761,7 +5898,16 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       expect(body.failedTaskIds).toEqual(['task-fs-grant'])
       expect(body.recoveredTaskIds).toEqual(['task-fs-grant'])
       expect(mockRedisPublish).not.toHaveBeenCalled()
-    })
+      const loggedPayload = JSON.stringify(consoleError.mock.calls)
+      expect(loggedPayload).not.toContain('project-enqueue-secret')
+      expect(loggedPayload).not.toContain('/tmp/project-secret')
+      expect(loggedPayload).toContain('"errorClass":"TypeError"')
+      expect(loggedPayload).toContain('"code":"ECONNREFUSED"')
+      expect(loggedPayload).toContain('PUT /api/projects/:id/filesystem-grant')
+      })
+    } finally {
+      consoleError.mockRestore()
+    }
   })
 
   it('denies filesystem grants and records a blocking effective phase', async () => {
@@ -6470,9 +6616,15 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
       reason: 'Grant fixed',
       updatedAt: new Date('2026-07-03T00:01:00.000Z'),
     }]))
-    mockRedisLpush.mockRejectedValueOnce(new Error('redis down'))
+    const enqueueSecret = 'nonce=task-enqueue-secret path=/tmp/task-secret sql=SELECT secret\ncontrol=\u0000'
+    mockRedisLpush.mockRejectedValueOnce(Object.assign(new TypeError(enqueueSecret), {
+      code: 'EHOSTUNREACH',
+      detail: enqueueSecret,
+    }))
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
 
-    await withFilesystemProject(async (project, filesystemPath) => {
+    try {
+      await withFilesystemProject(async (project, filesystemPath) => {
       const failedPkg = {
         ...grantPackage({
           mcpGrantBlock: strictGrantBlockMarker(),
@@ -6531,7 +6683,16 @@ describe('PUT /api/tasks/:id/filesystem-grants — explicit grant approvals', ()
 
       expect(res.status).toBe(202)
       expect(mockDbUpdate).toHaveBeenCalledTimes(3)
-    })
+      const loggedPayload = JSON.stringify(consoleError.mock.calls)
+      expect(loggedPayload).not.toContain('task-enqueue-secret')
+      expect(loggedPayload).not.toContain('/tmp/task-secret')
+      expect(loggedPayload).toContain('"errorClass":"TypeError"')
+      expect(loggedPayload).toContain('"code":"EHOSTUNREACH"')
+      expect(loggedPayload).toContain('PUT /api/tasks/:id/filesystem-grants')
+      })
+    } finally {
+      consoleError.mockRestore()
+    }
   })
 
   it('does not open failed grant recovery for unrelated failed packages', async () => {

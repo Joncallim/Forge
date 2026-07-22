@@ -200,12 +200,12 @@ export const projects = pgTable('projects', {
   // boundary. Database order, never timestamps, decides grant precedence.
   grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' })
     .notNull()
-    .default(BigInt(0)),
+    .default(sql`0`),
   // Zero is the explicit unbound state. S4 binds a project root by advancing
   // this counter; S3 never upgrades a legacy decision implicitly.
   rootBindingRevision: bigint('root_binding_revision', { mode: 'bigint' })
     .notNull()
-    .default(BigInt(0)),
+    .default(sql`0`),
   defaultBranch: text('default_branch').notNull().default('main'),
   createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
@@ -690,6 +690,8 @@ export const tasks = pgTable(
     githubBranch: text('github_branch'),
     githubPrUrl: text('github_pr_url'),
     errorMessage: text('error_message'),
+    localProjectionScopeState: text('local_projection_scope_state').notNull().default('active'),
+    localProjectionOverlimitPackageCount: integer('local_projection_overlimit_package_count'),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
     completedAt: timestamp('completed_at', tsOpts),
@@ -702,16 +704,17 @@ export const tasks = pgTable(
   ],
 )
 
-export type Task = InferSelectModel<typeof tasks>
-export type NewTask = InferInsertModel<typeof tasks>
+type TaskRow = InferSelectModel<typeof tasks>
+type NewTaskRow = InferInsertModel<typeof tasks>
+type TaskProjectionScopeFields = 'localProjectionScopeState' | 'localProjectionOverlimitPackageCount'
 
-// Narrow mapping for the migration-0026 claimability boundary. Keeping this
-// separate avoids making protocol-only upgrade metadata part of every Task DTO.
-export const taskLocalProjectionScopes = pgTable('tasks', {
-  id: uuid('id').primaryKey(),
-  localProjectionScopeState: text('local_projection_scope_state').notNull(),
-  localProjectionOverlimitPackageCount: integer('local_projection_overlimit_package_count'),
-})
+export type Task = Omit<TaskRow, TaskProjectionScopeFields>
+export type NewTask = Omit<NewTaskRow, TaskProjectionScopeFields>
+
+// Keep the focused protocol query surface without registering a second,
+// partial Drizzle definition for the same physical table. Duplicate table
+// definitions make migration snapshot generation discard one of the shapes.
+export const taskLocalProjectionScopes = tasks
 
 // ---------------------------------------------------------------------------
 // taskAttempts
@@ -928,7 +931,7 @@ export const filesystemMcpCurrentDecisionPointers = pgTable(
     currentDecisionRevision: bigint('current_decision_revision', { mode: 'bigint' }),
     currentDecisionFingerprint: text('current_decision_fingerprint'),
     pointerFingerprint: text('pointer_fingerprint').notNull(),
-    pointerVersion: bigint('pointer_version', { mode: 'bigint' }).notNull().default(BigInt(0)),
+    pointerVersion: bigint('pointer_version', { mode: 'bigint' }).notNull().default(sql`0`),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
   },
@@ -1042,7 +1045,7 @@ export const projectFilesystemCurrentDecisionPointers = pgTable(
     currentRootBindingRevision: bigint('current_root_binding_revision', { mode: 'bigint' }),
     currentDecisionFingerprint: text('current_decision_fingerprint'),
     currentDecisionGeneration: bigint('current_decision_generation', { mode: 'bigint' }),
-    pointerGeneration: bigint('pointer_generation', { mode: 'bigint' }).notNull().default(BigInt(0)),
+    pointerGeneration: bigint('pointer_generation', { mode: 'bigint' }).notNull().default(sql`0`),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
   },
@@ -1118,7 +1121,7 @@ export const workPackageLocalProjectionHeads = pgTable(
     headKind: text('head_kind').notNull(),
     headIndex: bigint('head_index', { mode: 'bigint' }).notNull(),
     headFingerprint: text('head_fingerprint').notNull(),
-    headRevision: bigint('head_revision', { mode: 'bigint' }).notNull().default(BigInt(0)),
+    headRevision: bigint('head_revision', { mode: 'bigint' }).notNull().default(sql`0`),
     compareAndSetFingerprint: text('compare_and_set_fingerprint').notNull(),
     currentSourceId: uuid('current_source_id'),
     currentSourceTaskId: uuid('current_source_task_id'),

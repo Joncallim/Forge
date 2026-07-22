@@ -23,6 +23,8 @@ const mocks = vi.hoisted(() => ({
   loadWorkPackageExecutionContext: vi.fn(),
   loadCurrentProjectFilesystemDecision: vi.fn().mockResolvedValue(null),
   publishTaskEvent: vi.fn(),
+  projectionContributions: [] as Array<Record<string, unknown>>,
+  recordTaskLogBestEffort: vi.fn(),
   projectionScopeState: 'active' as 'active' | 'archive_pending',
   WorkPackageExecutionError: class WorkPackageExecutionError extends Error {
     failureDetails: unknown
@@ -70,6 +72,10 @@ vi.mock('@/db', () => ({
 
 vi.mock('@/worker/events', () => ({
   publishTaskEvent: mocks.publishTaskEvent,
+}))
+
+vi.mock('@/worker/task-logs', () => ({
+  recordTaskLogBestEffort: mocks.recordTaskLogBestEffort,
 }))
 
 vi.mock('@/lib/mcps/manager', () => ({
@@ -219,6 +225,9 @@ function freshLockSelectMock() {
       blockedReason: latestFreshAdmission.blockedReason ?? null,
       grantDecisionRevision: latestFreshAdmission.grantDecisionRevision ?? BigInt(0),
       harnessId: latestFreshAdmission.harnessId ?? null,
+      headFingerprint: 'head:v1:task-1:pkg-fs:operator_hold:5',
+      headRevision: BigInt(0),
+      compareAndSetFingerprint: 'head:v1:task-1:pkg-fs:operator_hold:5',
       id: latestFreshAdmission.id,
       localPath: latestFreshAdmission.localPath ?? null,
       mcpConfig: latestFreshAdmission.mcpConfig ?? null,
@@ -411,14 +420,24 @@ describe('handoffApprovedWorkPackages', () => {
     mocks.projectionScopeState = 'active'
     latestFreshAdmission = null
     mocks.dbTransaction.mockReset()
-    mocks.dbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) =>
-      callback({
-        execute: vi.fn().mockResolvedValue([{ now: '2026-07-17 00:00:00+00' }]),
+    mocks.projectionContributions.length = 0
+    mocks.dbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) => {
+      let executeCount = 0
+      return callback({
+        execute: vi.fn(async (query: { queryChunks?: unknown[] }) => {
+          executeCount += 1
+          if (executeCount === 1) return [{ now: '2026-07-17 00:00:00+00' }]
+          const serialized = query.queryChunks?.find((chunk): chunk is string => (
+            typeof chunk === 'string' && chunk.startsWith('{"authoritativeDecisionId"')
+          ))
+          if (serialized) mocks.projectionContributions.push(JSON.parse(serialized))
+          return [{ advanced: true }]
+        }),
         insert: vi.fn(),
         select: freshLockSelectMock(),
         update: mocks.dbUpdate,
-      }),
-    )
+      })
+    })
     mocks.dbUpdate.mockReset()
     mocks.executeWorkPackage.mockReset()
     mocks.loadWorkPackageExecutionContext.mockReset()
@@ -760,7 +779,12 @@ describe('handoffApprovedWorkPackages', () => {
       id: 'pkg-fs', assignedRole: 'backend', harnessId: 'harness-1',
       mcpRequirements: [{
         mcpId: 'filesystem', requirement: 'required',
-        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        capabilities: [
+          'filesystem.project.search',
+          'filesystem.project.read',
+          'filesystem.project.list',
+          'filesystem.project.read',
+        ],
       }],
       metadata: {}, sequence: 1, status: 'pending', title: 'Read project files',
     }
@@ -792,6 +816,29 @@ describe('handoffApprovedWorkPackages', () => {
     }))
     expect(failedTaskUpdate.set).not.toHaveBeenCalled()
     expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
+    const marker = jsonbMarkerFromUpdate(failedPackageUpdate)
+    expect(marker.requestedCapabilities).toEqual([
+      'filesystem.project.list',
+      'filesystem.project.read',
+      'filesystem.project.search',
+    ])
+    expect(marker.blockFingerprint).toMatch(/^sha256:[0-9a-f]{64}$/)
+    expect(mocks.publishTaskEvent).toHaveBeenCalledWith(
+      'task-1',
+      'work_package:status',
+      expect.objectContaining({ mcpGrantBlock: marker }),
+    )
+    expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({ mcpGrantBlock: marker }),
+    }))
+    expect(mocks.projectionContributions).toEqual([
+      expect.objectContaining({
+        mcpGrantBlock: marker,
+        operatorHold: true,
+        priorBlockFingerprint: null,
+        transition: 'hold',
+      }),
+    ])
   })
 
   it('holds a stale project-level filesystem grant when the project grant was revoked', async () => {

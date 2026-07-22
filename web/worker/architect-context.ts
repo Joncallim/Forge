@@ -1,6 +1,6 @@
-import type { projects, tasks } from '../db/schema'
+import type { projects, Task } from '../db/schema'
 
-type TaskRow = typeof tasks.$inferSelect
+type TaskRow = Task
 type ProjectRow = typeof projects.$inferSelect
 
 type SearchResult = {

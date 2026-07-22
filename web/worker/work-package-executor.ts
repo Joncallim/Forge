@@ -5,7 +5,7 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 import { and, eq, sql } from 'drizzle-orm'
 import { db } from '../db'
-import { agentConfigs, filesystemMcpRuntimeAudits, projects, tasks, workPackages } from '../db/schema'
+import { agentConfigs, filesystemMcpRuntimeAudits, projects, tasks, type Task, workPackages } from '../db/schema'
 import { getModel, getProvider } from '../lib/providers/registry'
 import { resolveDefaultProvider } from '../lib/providers/default'
 import { assertProjectLocalPathForExecution } from '../lib/projects/local-path'
@@ -52,7 +52,7 @@ const ALLOWED_COMMANDS = new Set([
   'npm run lint',
 ])
 
-type TaskRow = typeof tasks.$inferSelect
+type TaskRow = Task
 type ProjectRow = typeof projects.$inferSelect
 type WorkPackageRow = typeof workPackages.$inferSelect
 type AgentConfigRow = typeof agentConfigs.$inferSelect

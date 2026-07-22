@@ -24,6 +24,7 @@ import { buildMcpBrokerBlockMetadata } from './blocked-handoff-retry'
 import {
   canonicalFilesystemProjectCapabilities,
   isProjectFilesystemEffectivePhase,
+  readFilesystemGrantBlockFromMetadata,
   requiresFilesystemGrantApproval,
 } from '../lib/mcps/filesystem-grants'
 import {
@@ -31,6 +32,7 @@ import {
   type FilesystemGrantHoldState,
 } from '../lib/mcps/filesystem-grant-lifecycle'
 import {
+  advanceFilesystemGrantOperatorHoldProjection,
   convergeOperatorHeldTask,
   loadCurrentProjectFilesystemDecision,
 } from '../lib/mcps/filesystem-grant-reconciliation'
@@ -1059,8 +1061,14 @@ async function failWorkPackageForFilesystemGrant(input: {
   | { blockedReason: string; status: 'blocked'; taskDisposition: 'operator_hold' }
   | { pkg: HandoffPackage; status: 'conflict' }
 > {
+  const requestedCapabilities = canonicalFilesystemProjectCapabilities(input.requestedCapabilities)
   const failedResult = await db.transaction(async (tx) => {
-    assertMcpAdmissionLockSequence(['project', 'tasks:id-ascending', 'work-packages:id-ascending'])
+    assertMcpAdmissionLockSequence([
+      'project',
+      'tasks:id-ascending',
+      'work-packages:id-ascending',
+      'local-run-evidence-task-projection-heads:id-ascending',
+    ])
     const [lockedProject] = await tx
       .select({
         id: projects.id,
@@ -1091,9 +1099,16 @@ async function failWorkPackageForFilesystemGrant(input: {
       blockedAt: failedAt,
       hold: input.holdState,
       requirementKeys: input.requirementKeys,
-      requestedCapabilities: canonicalFilesystemProjectCapabilities(input.missingCapabilities),
+      requestedCapabilities,
       rootBindingRevision: input.project.rootBindingRevision.toString(),
     })
+    const priorMarker = readFilesystemGrantBlockFromMetadata(lockedPackage.metadata)
+    if (
+      lockedPackage.status === 'blocked' &&
+      priorMarker?.blockFingerprint === grantBlockMarker.blockFingerprint
+    ) {
+      return { failedAt, grantBlockMarker: priorMarker, row: lockedPackage, transitioned: false }
+    }
     const [row] = await tx
       .update(workPackages)
       .set({
@@ -1105,26 +1120,54 @@ async function failWorkPackageForFilesystemGrant(input: {
       .where(and(...handoffFreshnessConditions(input)))
       .returning()
     if (!row) return null
+    const metadata = isRecord(lockedPackage.metadata) ? lockedPackage.metadata : {}
+    const phases = isRecord(metadata.mcpGrantPhases) ? metadata.mcpGrantPhases : {}
+    const effective = isRecord(phases.effective) ? phases.effective : {}
+    const packageAuthority = (
+      grantBlockMarker.grantDecisionRevision !== null &&
+      typeof effective.grantApprovalId === 'string' &&
+      effective.grantDecisionRevision === grantBlockMarker.grantDecisionRevision
+    ) ? {
+        decisionId: effective.grantApprovalId,
+        grantDecisionRevision: grantBlockMarker.grantDecisionRevision,
+      }
+      : null
+    const projectAuthority = (
+      input.project.filesystemGrantDecision &&
+      input.project.filesystemGrantDecision.grantDecisionRevision === grantBlockMarker.grantDecisionRevision
+    ) ? {
+        decisionId: input.project.filesystemGrantDecision.decisionId,
+        grantDecisionRevision: input.project.filesystemGrantDecision.grantDecisionRevision,
+      }
+      : null
+    await advanceFilesystemGrantOperatorHoldProjection({
+      authority: packageAuthority ?? projectAuthority,
+      marker: grantBlockMarker,
+      priorBlockFingerprint: priorMarker?.blockFingerprint ?? null,
+      taskId: input.taskId,
+      transition: priorMarker ? 'refresh' : 'hold',
+      tx,
+      workPackageId: row.id,
+    })
     await convergeOperatorHeldTask(
       tx,
       lockedTask,
       siblings.map((pkg) => pkg.id === row.id ? row : pkg),
       failedAt,
     )
-    return { failedAt, row }
+    return { failedAt, grantBlockMarker, row, transitioned: true }
   })
 
   if (!failedResult) return { pkg: input.pkg, status: 'conflict' }
-  const { failedAt } = failedResult
+  const { failedAt, grantBlockMarker, transitioned } = failedResult
+
+  if (!transitioned) {
+    return { blockedReason: input.blockedReason, status: 'blocked', taskDisposition: 'operator_hold' }
+  }
 
   await publishTaskEvent(input.taskId, 'work_package:status', {
     blockedReason: input.blockedReason,
-    mcpGrantBlock: {
-      holdKind: input.holdState.holdKind,
-      requestedCapabilities: input.requestedCapabilities,
-      source: 'filesystem-grant-approval',
-      taskDisposition: 'operator_hold',
-    },
+    mcpGrantBlock: grantBlockMarker,
     status: 'blocked',
     updatedAt: failedAt.toISOString(),
     workPackageId: input.pkg.id,
@@ -1134,8 +1177,9 @@ async function failWorkPackageForFilesystemGrant(input: {
     level: 'warning',
     message: `"${input.pkg.title}" needs filesystem grant approval before it can run: ${input.blockedReason}`,
     metadata: {
+      mcpGrantBlock: grantBlockMarker,
       missingCapabilities: input.missingCapabilities,
-      requestedCapabilities: input.requestedCapabilities,
+      requestedCapabilities,
       workPackageId: input.pkg.id,
     },
     source: 'mcp',

@@ -38,6 +38,23 @@ function metadataString(metadata: unknown, key: string): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value : null
 }
 
+function taskDetailWorkPackageMetadata(metadata: unknown): unknown {
+  if (!isRecord(metadata)) return metadata
+  const phases = metadata.mcpGrantPhases
+  if (!isRecord(phases) || !isRecord(phases.effective) || !Object.hasOwn(phases.effective, 'grantNonce')) {
+    return metadata
+  }
+  const safeEffective = { ...phases.effective }
+  delete safeEffective.grantNonce
+  return {
+    ...metadata,
+    mcpGrantPhases: {
+      ...phases,
+      effective: safeEffective,
+    },
+  }
+}
+
 function errorCode(err: unknown): string | null {
   if (!isRecord(err)) return null
   if (typeof err.code === 'string') return err.code
@@ -211,6 +228,7 @@ export async function GET(
       const harness = pkg.harnessId ? harnessById.get(pkg.harnessId) : undefined
       return {
         ...pkg,
+        metadata: taskDetailWorkPackageMetadata(pkg.metadata),
         harnessRole: harness?.role ?? null,
         harnessDisplayName: harness?.displayName ?? null,
         harnessDescription: harness?.description ?? null,
