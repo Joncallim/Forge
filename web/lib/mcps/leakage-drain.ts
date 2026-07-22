@@ -17,6 +17,14 @@ export const SENSITIVE_PAYLOAD_KEY_ALIASES = [
       'promptInput',
       'promptOverlay',
       'promptOverlays',
+      'requirementContext',
+      'requirementContexts',
+      'mcpAwareSubtask',
+      'mcpAwareSubtasks',
+      'architectPlanEntryReference',
+      'architectPlanEntryReferences',
+      'architectReplanReference',
+      'architectReplanReferences',
       'systemPrompt',
       'userPrompt',
       'assistantPrompt',
@@ -155,6 +163,15 @@ export function unknownLegacyDigest(value: unknown): UnknownLegacyDigest {
   }
 }
 
+export function isUnknownLegacyDigest(value: unknown): value is UnknownLegacyDigest {
+  return isRecord(value)
+    && Object.keys(value).length === 2
+    && value.kind === 'unknown_legacy_digest'
+    && typeof value.byteCount === 'number'
+    && Number.isSafeInteger(value.byteCount)
+    && value.byteCount >= 0
+}
+
 export type SanitizeSensitivePayloadOptions = {
   maxArrayItems?: number
   maxDepth?: number
@@ -209,7 +226,7 @@ export function sanitizeSensitivePayload(
     const kind = classifySensitivePayloadKey(key)
     if (kind === 'prompt' || kind === 'secret' || kind === 'unkeyed_digest') continue
     if (kind === 'snapshot') {
-      result[key] = unknownLegacyDigest(item)
+      result[key] = isUnknownLegacyDigest(item) ? item : unknownLegacyDigest(item)
       continue
     }
     result[key] = sanitizeSensitivePayload(item, options, depth + 1)
@@ -219,4 +236,13 @@ export function sanitizeSensitivePayload(
 
 export function sanitizePromptPayload(payload: Record<string, unknown>): Record<string, unknown> {
   return sanitizeSensitivePayload(payload) as Record<string, unknown>
+}
+
+/**
+ * Work-package metadata is returned by authenticated task APIs and may contain
+ * rows created before the protected Architect-context boundary existed. Keep
+ * this wrapper as the one public-output policy for those legacy rows.
+ */
+export function sanitizeWorkPackageMetadata(metadata: unknown): unknown {
+  return sanitizeSensitivePayload(metadata)
 }

@@ -27,6 +27,26 @@ BEGIN
     RAISE EXCEPTION '0027 did not preserve nullable expansion with the omitted-value default';
   END IF;
 
+  IF (SELECT attnotnull FROM pg_catalog.pg_attribute
+      WHERE attrelid = 'public.sessions'::pg_catalog.regclass
+        AND attname = 'credential_digest_v1')
+     OR (SELECT attnotnull FROM pg_catalog.pg_attribute
+         WHERE attrelid = 'public.sessions'::pg_catalog.regclass
+           AND attname = 'expires_at')
+     OR NOT EXISTS (
+       SELECT 1 FROM public.sessions
+       WHERE id = '27000000-0000-4000-8000-000000000099'
+         AND credential_storage_version = 0
+         AND credential_digest_v1 IS NULL
+         AND expires_at IS NULL
+     )
+     OR NOT EXISTS (
+       SELECT 1 FROM public.session_credential_reconciliation
+       WHERE singleton AND state = 'expansion'
+     ) THEN
+    RAISE EXCEPTION '0027 did not preserve the additive legacy-session expansion state';
+  END IF;
+
   IF (SELECT count(*) FROM public.projects
       WHERE id IN ('27000000-0000-4000-8000-000000000010', '27000000-0000-4000-8000-000000000020')
         AND root_ref IS NULL) <> 2 THEN

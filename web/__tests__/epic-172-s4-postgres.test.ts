@@ -2,12 +2,12 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import postgres from 'postgres'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
-  architectReplanReferenceForEntry,
   bindArchitectReplanEntry,
   executableReferenceForEntry,
   recordArchitectPlanVersion,
   resolveArchitectPlanEntry,
 } from '@/lib/mcps/s4-protocol-store'
+import { architectReplanReferenceForEntry } from '@/lib/mcps/architect-plan-entries'
 import { computeCredentialDigest } from '@/lib/session-credential-digest'
 import { readArchitectPlanHistory } from '@/lib/mcps/history-reader'
 
@@ -120,13 +120,16 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         where work_package_id = ${ids.package}::uuid
       `
       await tx`
-        insert into work_package_local_run_evidence (
-          id, task_id, work_package_id, agent_run_id, claim_token, lease_expires_at
-        ) values
-          (${ids.firstEvidence}::uuid, ${ids.task}::uuid, ${ids.package}::uuid,
-           ${ids.firstRun}::uuid, ${ids.firstLocalClaim}::uuid, clock_timestamp() + interval '30 seconds'),
-          (${ids.secondEvidence}::uuid, ${ids.task}::uuid, ${ids.package}::uuid,
-           ${ids.secondRun}::uuid, ${ids.secondLocalClaim}::uuid, clock_timestamp() + interval '30 seconds')
+        update work_packages
+        set metadata = jsonb_build_object('executionLease', jsonb_build_object(
+          'acquiredAt', to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+          'attemptNumber', 1,
+          'heartbeatAt', to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+          'runId', ${ids.firstRun}::text,
+          'source', 'work-package-handoff',
+          'staleAfterSeconds', 30
+        ))
+        where id = ${ids.package}::uuid
       `
       await tx`
         insert into forge_release_signer_keys (
@@ -340,18 +343,17 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
 
     const planBody = recorded.entries.find((entry) => entry.entryKind === 'plan_body')!
     expect(() => executableReferenceForEntry(planBody)).toThrow(/ineligible Architect history/i)
-    const replanReference = architectReplanReferenceForEntry(planBody)
+    expect(architectReplanReferenceForEntry(planBody)).toEqual(expect.objectContaining({
+      entryId: 'plan_body:000000',
+    }))
     const replanReferenceId = await bindArchitectReplanEntry({
       agentRunId: ids.replanRun,
-      reference: replanReference,
       taskId: ids.task,
     })
     await expect(resolveArchitectPlanEntry({
       digestKey: key,
       expectedPurpose: 'architect_replan',
-      reference: replanReference,
       referenceId: replanReferenceId,
-      taskId: ids.task,
     })).resolves.toEqual({
       content: 'Prior protected Architect plan body.',
       entryId: 'plan_body:000000',
@@ -359,9 +361,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     await expect(resolveArchitectPlanEntry({
       digestKey: key,
       expectedPurpose: 'architect_replan',
-      reference: replanReference,
       referenceId: replanReferenceId,
-      taskId: ids.task,
     })).rejects.toMatchObject({ code: 'invalid_evidence' })
   })
 
@@ -412,13 +412,15 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
 
   it('allow-once-single-winner: atomically keeps one audit and one nonce claim', async () => {
     const attempts = await Promise.allSettled([
-      issuer`select forge.insert_packet_authorization_snapshot_v2(
-        ${ids.firstRun}::uuid, ${ids.firstEvidence}::uuid, ${ids.decision}::uuid,
-        ${ids.firstLocalClaim}::uuid, 20, array['filesystem.project.read']::text[]
+      issuer`select * from forge.claim_packet_lifecycle_v2(
+        ${ids.firstRun}::uuid, ${ids.decision}::uuid,
+        ${ids.firstLocalClaim}::uuid, ${randomUUID()}::uuid,
+        30, 20, array['filesystem.project.read']::text[]
       )`,
-      issuer`select forge.insert_packet_authorization_snapshot_v2(
-        ${ids.secondRun}::uuid, ${ids.secondEvidence}::uuid, ${ids.decision}::uuid,
-        ${ids.secondLocalClaim}::uuid, 20, array['filesystem.project.read']::text[]
+      issuer`select * from forge.claim_packet_lifecycle_v2(
+        ${ids.secondRun}::uuid, ${ids.decision}::uuid,
+        ${ids.secondLocalClaim}::uuid, ${randomUUID()}::uuid,
+        30, 20, array['filesystem.project.read']::text[]
       )`,
     ])
     expect(attempts.filter((attempt) => attempt.status === 'fulfilled')).toHaveLength(1)
@@ -439,7 +441,6 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
   it('failure-recovery-atomicity: rolls back both audit and nonce on invalid coverage', async () => {
     const packageId = randomUUID()
     const runId = randomUUID()
-    const evidenceId = randomUUID()
     const decisionId = randomUUID()
     const nonce = randomUUID()
     await admin.begin(async (tx) => {
@@ -451,6 +452,17 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       await tx`
         insert into agent_runs (id, task_id, work_package_id, agent_type, model_id_used, status)
         values (${runId}::uuid, ${ids.task}::uuid, ${packageId}::uuid, 'backend', 'test', 'running')
+      `
+      await tx`
+        update work_packages
+        set metadata = jsonb_build_object('executionLease', jsonb_build_object(
+          'acquiredAt', to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+          'attemptNumber', 1,
+          'heartbeatAt', to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+          'runId', ${runId}::text,
+          'source', 'work-package-handoff', 'staleAfterSeconds', 30
+        ))
+        where id = ${packageId}::uuid
       `
       await tx`
         insert into filesystem_mcp_grant_approvals (
@@ -472,19 +484,12 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
             pointer_fingerprint = ${SHA}, pointer_version = 1
         where work_package_id = ${packageId}::uuid
       `
-      await tx`
-        insert into work_package_local_run_evidence (
-          id, task_id, work_package_id, agent_run_id, claim_token, lease_expires_at
-        ) values (
-          ${evidenceId}::uuid, ${ids.task}::uuid, ${packageId}::uuid, ${runId}::uuid,
-          ${randomUUID()}::uuid, clock_timestamp() + interval '30 seconds'
-        )
-      `
     })
 
-    await expect(issuer`select forge.insert_packet_authorization_snapshot_v2(
-      ${runId}::uuid, ${evidenceId}::uuid, ${decisionId}::uuid,
-      ${randomUUID()}::uuid, 20, array['filesystem.project.write']::text[]
+    await expect(issuer`select * from forge.claim_packet_lifecycle_v2(
+      ${runId}::uuid, ${decisionId}::uuid,
+      ${randomUUID()}::uuid, ${randomUUID()}::uuid,
+      30, 20, array['filesystem.project.write']::text[]
     )`).rejects.toBeDefined()
     const [row] = await admin<{ audits: number; nonceClaims: number }[]>`
       select
@@ -499,7 +504,6 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
   it('always-allow-single-run-claim: fails closed without the immutable S3 project pointer', async () => {
     const packageId = randomUUID()
     const runId = randomUUID()
-    const evidenceId = randomUUID()
     const decisionId = randomUUID()
     const claimToken = randomUUID()
     await admin.begin(async (tx) => {
@@ -513,6 +517,17 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         values (${runId}::uuid, ${ids.task}::uuid, ${packageId}::uuid, 'backend', 'test', 'running')
       `
       await tx`
+        update work_packages
+        set metadata = jsonb_build_object('executionLease', jsonb_build_object(
+          'acquiredAt', to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+          'attemptNumber', 1,
+          'heartbeatAt', to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+          'runId', ${runId}::text,
+          'source', 'work-package-handoff', 'staleAfterSeconds', 30
+        ))
+        where id = ${packageId}::uuid
+      `
+      await tx`
         insert into project_filesystem_grant_decisions (
           id, project_id, decision, capabilities, grant_decision_revision,
           root_binding_revision, decision_fingerprint, decision_generation, decided_by
@@ -521,19 +536,12 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
           '["filesystem.project.read"]'::jsonb, 3, 1, ${SHA}, 1, ${ids.user}::uuid
         )
       `
-      await tx`
-        insert into work_package_local_run_evidence (
-          id, task_id, work_package_id, agent_run_id, claim_token, lease_expires_at
-        ) values (
-          ${evidenceId}::uuid, ${ids.task}::uuid, ${packageId}::uuid, ${runId}::uuid,
-          ${claimToken}::uuid, clock_timestamp() + interval '30 seconds'
-        )
-      `
     })
 
-    await expect(issuer`select forge.insert_packet_authorization_snapshot_v2(
-      ${runId}::uuid, ${evidenceId}::uuid, ${decisionId}::uuid,
-      ${claimToken}::uuid, 20, array['filesystem.project.read']::text[]
+    await expect(issuer`select * from forge.claim_packet_lifecycle_v2(
+      ${runId}::uuid, ${decisionId}::uuid,
+      ${claimToken}::uuid, ${randomUUID()}::uuid,
+      30, 20, array['filesystem.project.read']::text[]
     )`).rejects.toMatchObject({ code: '55000' })
     const [row] = await admin<{ audits: number }[]>`
       select count(*)::integer as audits from filesystem_mcp_runtime_audits
@@ -568,11 +576,26 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         insert into agent_runs (id, task_id, work_package_id, agent_type, model_id_used, status)
         values (${runId}::uuid, ${ids.task}::uuid, ${packageId}::uuid, 'backend', 'test', 'running')
       `
+      await tx`
+        update work_packages
+        set metadata = jsonb_build_object('executionLease', jsonb_build_object(
+          'acquiredAt', to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+          'attemptNumber', 1,
+          'heartbeatAt', to_char(clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+          'runId', ${runId}::text,
+          'source', 'work-package-handoff', 'staleAfterSeconds', 30
+        ))
+        where id = ${packageId}::uuid
+      `
     })
+    await expect(issuer`
+      select forge.create_local_run_evidence_v1(${runId}::uuid, ${claimToken}::uuid, 30)
+    `).rejects.toMatchObject({ code: '42501' })
     const [created] = await issuer<{ evidenceId: string }[]>`
-      select forge.create_local_run_evidence_v1(
+      select local_run_evidence_id as "evidenceId"
+      from forge.claim_local_lifecycle_v2(
         ${runId}::uuid, ${claimToken}::uuid, 30
-      ) as "evidenceId"
+      )
     `
     const [row] = await admin<{ agentRunId: string; state: string }[]>`
       select agent_run_id as "agentRunId", state

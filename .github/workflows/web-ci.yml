@@ -154,7 +154,8 @@ jobs:
           DECLARE
             table_name text;
             ordinary_tables constant text[] := ARRAY[
-              'users', 'credentials', 'sessions', 'provider_configs', 'provider_health_checks',
+              'users', 'credentials', 'sessions', 'session_credential_reconciliation',
+              'provider_configs', 'provider_health_checks',
               'projects', 'mcp_installations', 'project_mcp_status_checks', 'tasks', 'task_attempts',
               'agent_harnesses', 'work_packages', 'filesystem_mcp_grant_approvals',
               'filesystem_mcp_current_decision_pointers', 'project_filesystem_grant_decisions',

@@ -25,6 +25,7 @@
     "db:seed-providers": "npx tsx db/seed-providers.ts",
     "protocol:bootstrap-epic-172-s4-roles": "tsx scripts/bootstrap-epic-172-s4-roles.ts",
     "protocol:scrub-legacy-leakage": "tsx scripts/scrub-legacy-leakage.ts",
+    "session-credentials:reconcile": "tsx scripts/reconcile-session-credentials.ts",
     "project-roots:reconcile-expansion": "bash scripts/ci/reconcile-migration-0027-root-refs.sh",
     "project-roots:strict-cutover": "bash scripts/ci/cutover-migration-0027-root-ref.sh",
     "test:migration-0027-upgrade": "bash scripts/ci/prove-migration-0027-upgrade.sh",

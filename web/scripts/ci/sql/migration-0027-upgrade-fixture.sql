@@ -13,6 +13,13 @@ $fixture$;
 INSERT INTO public.users (id, display_name)
 VALUES ('27000000-0000-4000-8000-000000000001', 'Migration 0027 fixture user');
 
+INSERT INTO public.sessions (id, user_id, last_seen_at)
+VALUES (
+  '27000000-0000-4000-8000-000000000099',
+  '27000000-0000-4000-8000-000000000001',
+  pg_catalog.clock_timestamp()
+);
+
 INSERT INTO public.projects (id, name, submitted_by, local_path)
 VALUES
   ('27000000-0000-4000-8000-000000000010', 'Legacy root A', '27000000-0000-4000-8000-000000000001', '/tmp/forge-0027-a'),

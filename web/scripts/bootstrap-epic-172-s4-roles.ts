@@ -9,6 +9,7 @@ const LOGIN_ROLES = [
   'forge_packet_issuer',
 ] as const
 const OWNER = 'forge_s4_routines_owner'
+const PROTECTED_ROLES = [OWNER, ...LOGIN_ROLES] as const
 const OWNED_TABLES = [
   'architect_plan_versions',
   'architect_plan_entries',
@@ -60,6 +61,15 @@ async function main(): Promise<void> {
       end;
       $$;
     `)
+    const [{ protectedMembershipEdges }] = await admin<{ protectedMembershipEdges: number }[]>`
+      select count(*)::integer as "protectedMembershipEdges"
+      from pg_catalog.pg_auth_members membership
+      where membership.roleid = any(${PROTECTED_ROLES}::regrole[])
+         or membership.member = any(${PROTECTED_ROLES}::regrole[])
+    `
+    if (protectedMembershipEdges !== 0) {
+      throw new Error('An S4 protected principal has a pre-existing role membership edge; bootstrap refused to expand it.')
+    }
     await admin`create schema if not exists forge authorization ${admin(migrationRole)}`
     await admin`grant usage on schema forge to ${admin(OWNER)}`
     await admin.unsafe(`
@@ -100,6 +110,8 @@ async function main(): Promise<void> {
           perform pg_catalog.pg_advisory_xact_lock(
             pg_catalog.hashtextextended('forge:epic-172:s4-owner-bootstrap:v1', 0)
           );
+          execute 'grant create on schema public to ${OWNER}';
+          execute 'grant create on schema forge to ${OWNER}';
           execute pg_catalog.format(
             'grant ${OWNER} to %I with admin false, inherit false, set true',
             session_user
@@ -116,13 +128,30 @@ async function main(): Promise<void> {
           if (
             select pg_catalog.count(*)
             from pg_catalog.pg_auth_members membership
+            where membership.roleid = any(array[
+              '${OWNER}'::regrole,
+              'forge_architect_plan_writer'::regrole,
+              'forge_architect_plan_resolver'::regrole,
+              'forge_architect_plan_history_reader'::regrole,
+              'forge_packet_issuer'::regrole
+            ])
+               or membership.member = any(array[
+                 '${OWNER}'::regrole,
+                 'forge_architect_plan_writer'::regrole,
+                 'forge_architect_plan_resolver'::regrole,
+                 'forge_architect_plan_history_reader'::regrole,
+                 'forge_packet_issuer'::regrole
+               ])
+          ) <> 1 or (
+            select pg_catalog.count(*)
+            from pg_catalog.pg_auth_members membership
             where membership.roleid = '${OWNER}'::regrole
               and membership.member = session_user::regrole
               and not membership.admin_option
               and not membership.inherit_option
               and membership.set_option
           ) <> 1 then
-            raise exception 'The transaction-scoped S4 owner membership is not exact'
+            raise exception 'The temporary migration-to-owner edge is not the exclusive S4 membership edge'
               using errcode = '42501';
           end if;
           execute pg_catalog.format(
@@ -148,6 +177,37 @@ async function main(): Promise<void> {
             raise exception 'Only the bootstrapped migration login may finalize S4 ownership'
               using errcode = '42501';
           end if;
+          if (
+            select pg_catalog.count(*)
+            from pg_catalog.pg_auth_members membership
+            where membership.roleid = any(array[
+              '${OWNER}'::regrole,
+              'forge_architect_plan_writer'::regrole,
+              'forge_architect_plan_resolver'::regrole,
+              'forge_architect_plan_history_reader'::regrole,
+              'forge_packet_issuer'::regrole
+            ])
+               or membership.member = any(array[
+                 '${OWNER}'::regrole,
+                 'forge_architect_plan_writer'::regrole,
+                 'forge_architect_plan_resolver'::regrole,
+                 'forge_architect_plan_history_reader'::regrole,
+                 'forge_packet_issuer'::regrole
+               ])
+          ) <> 1 or (
+            select pg_catalog.count(*)
+            from pg_catalog.pg_auth_members membership
+            where membership.roleid = '${OWNER}'::regrole
+              and membership.member = session_user::regrole
+              and not membership.admin_option
+              and not membership.inherit_option
+              and membership.set_option
+          ) <> 1 then
+            raise exception 'The temporary migration-to-owner edge is not the exclusive S4 membership edge'
+              using errcode = '42501';
+          end if;
+          execute 'revoke create on schema forge from ${OWNER}';
+          execute 'revoke create on schema public from ${OWNER}';
           if (
             select pg_catalog.count(*)
             from pg_catalog.pg_class table_row
@@ -203,6 +263,27 @@ async function main(): Promise<void> {
                 ,'reconcile_project_root_refs_v1'
                 ,'s4_protected_paths_enabled_v1'
                 ,'bind_architect_replan_entry_v1'
+                ,'s4_execution_lease_live_v1'
+                ,'s4_runtime_mode_v1'
+                ,'claim_local_lifecycle_v2'
+                ,'claim_packet_lifecycle_v2'
+                ,'claim_work_package_lifecycle_v2'
+                ,'lock_live_packet_lifecycle_v2'
+                ,'lock_live_local_lifecycle_v2'
+                ,'heartbeat_local_lifecycle_v2'
+                ,'heartbeat_packet_lifecycle_v2'
+                ,'begin_packet_assembly_v2'
+                ,'complete_packet_assembly_v2'
+                ,'begin_packet_delivery_v2'
+                ,'complete_packet_delivery_v2'
+                ,'finalize_local_success_v2'
+                ,'finalize_local_failure_v2'
+                ,'finalize_packet_success_v2'
+                ,'finalize_packet_failure_v2'
+                ,'recover_stale_local_lifecycle_v2'
+                ,'recover_stale_packet_lifecycle_v2'
+                ,'recover_linked_s4_lifecycle_v2'
+                ,'cas_packet_reapproval_v2'
               ])
               and routine.proowner = '${OWNER}'::regrole
               and not exists (
@@ -215,7 +296,7 @@ async function main(): Promise<void> {
                 ) acl
                 where acl.grantee = 0 and acl.privilege_type = 'EXECUTE'
               )
-          ) <> 15 then
+          ) <> 36 then
             raise exception 'The S4 routine owner or PUBLIC boundary is incomplete'
               using errcode = '42501';
           end if;
@@ -309,6 +390,26 @@ async function main(): Promise<void> {
              or pg_catalog.has_schema_privilege('${OWNER}', 'forge', 'create')
              or pg_catalog.has_schema_privilege('${OWNER}', 'public', 'create') then
             raise exception 'The finalized S4 owner schema ACL is not exact'
+              using errcode = '42501';
+          end if;
+          if exists (
+            select 1 from pg_catalog.pg_auth_members membership
+            where membership.roleid = any(array[
+              '${OWNER}'::regrole,
+              'forge_architect_plan_writer'::regrole,
+              'forge_architect_plan_resolver'::regrole,
+              'forge_architect_plan_history_reader'::regrole,
+              'forge_packet_issuer'::regrole
+            ])
+               or membership.member = any(array[
+                 '${OWNER}'::regrole,
+                 'forge_architect_plan_writer'::regrole,
+                 'forge_architect_plan_resolver'::regrole,
+                 'forge_architect_plan_history_reader'::regrole,
+                 'forge_packet_issuer'::regrole
+               ])
+          ) then
+            raise exception 'A finalized S4 protected principal retains a membership edge'
               using errcode = '42501';
           end if;
         end;

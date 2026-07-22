@@ -217,7 +217,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     expect(lines.join('\n')).toContain('"status":"running"')
   }, 2000)
 
-  it('includes workPackageId on package-scoped artifact snapshot events', async () => {
+  it('includes package scope while reducing protected Architect snapshots to opaque history availability', async () => {
     let selectCount = 0
     mockDbSelect.mockImplementation(() => {
       selectCount += 1
@@ -271,8 +271,11 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
             id: 'artifact-task',
             agentRunId: 'run-task',
             artifactType: 'adr_text',
-            content: 'Task-level plan.',
+            content: 'Architect plan available in protected history',
             metadata: {
+              historyAvailable: true,
+              planVersion: '7',
+              entryCount: 3,
               system_prompt: 'RAW-SYSTEM-PROMPT-SENTINEL',
               apiKey: 'RAW-API-KEY-SENTINEL',
             },
@@ -288,19 +291,22 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     const res = await GET(sseRequest() as never, { params })
 
     const lines = await readLines(res.body!, 500)
-    const artifactPayloads = dataPayloads(lines).filter((payload) => payload.artifactType)
-    expect(artifactPayloads).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        id: 'artifact-package',
-        workPackageId: 'package-1',
-      }),
-      expect.objectContaining({
-        id: 'artifact-task',
-      }),
-    ]))
-    expect(artifactPayloads.find((payload) => payload.id === 'artifact-task')).not.toHaveProperty('workPackageId')
+    const payloads = dataPayloads(lines)
+    const artifactPayloads = payloads.filter((payload) => payload.artifactType)
+    expect(artifactPayloads).toContainEqual(expect.objectContaining({
+      id: 'artifact-package',
+      workPackageId: 'package-1',
+    }))
+    expect(payloads).toContainEqual({
+      agentRunId: 'run-task',
+      historyAvailable: true,
+    })
+    expect(payloads.find((payload) => payload.historyAvailable === true)).not.toHaveProperty('workPackageId')
+    expect(payloads.find((payload) => payload.historyAvailable === true)).not.toHaveProperty('planVersion')
+    expect(payloads.find((payload) => payload.historyAvailable === true)).not.toHaveProperty('entryCount')
     expect(artifactPayloads.every((payload) => !Object.hasOwn(payload, 'content'))).toBe(true)
-    expect(lines.join('\n')).not.toContain('Task-level plan.')
+    expect(lines.join('\n')).not.toContain('planVersion')
+    expect(lines.join('\n')).not.toContain('entryCount')
     expect(lines.join('\n')).not.toContain('RAW-SYSTEM-PROMPT-SENTINEL')
     expect(lines.join('\n')).not.toContain('RAW-API-KEY-SENTINEL')
   }, 2000)

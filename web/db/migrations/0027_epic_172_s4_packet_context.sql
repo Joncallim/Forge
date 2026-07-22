@@ -39,81 +39,94 @@ BEGIN
 END;
 $$;
 --> statement-breakpoint
--- S4 session credential authority. These columns remain nullable until the
--- legacy raw-id session writer and its Redis keys have been drained.
+-- Session credential expansion. Existing rows remain legacy rows until the
+-- Redis-backed reconciliation command captures their exact absolute expiry.
+-- The migration must not invent a new lifetime or erase the old Redis key.
 ALTER TABLE public.sessions
   ADD COLUMN IF NOT EXISTS credential_digest_v1 bytea,
-  ADD COLUMN IF NOT EXISTS expires_at timestamptz;
+  ADD COLUMN IF NOT EXISTS expires_at timestamptz,
+  ADD COLUMN IF NOT EXISTS credential_storage_version integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS legacy_redis_purge_pending_at timestamptz,
+  ADD COLUMN IF NOT EXISTS legacy_redis_invalidated_at timestamptz;
 --> statement-breakpoint
--- Resume-safe legacy conversion: the old row ID was the exact lowercase UUIDv4
--- cookie. Derive its v1 digest and database expiry without consulting Redis.
--- The digest write deliberately precedes the primary-key rekey. If a non-
--- transactional migration runner stops between the two statements, the second
--- statement can still recognize the old raw-cookie row by its exact digest.
-UPDATE public.sessions
-SET credential_digest_v1 = COALESCE(
-      credential_digest_v1,
-      pg_catalog.sha256(
-        pg_catalog.convert_to('forge:web-session:v1', 'UTF8')
-        || pg_catalog.decode('00', 'hex')
-        || pg_catalog.convert_to(id::text, 'UTF8')
-      )
-    ),
-    expires_at = COALESCE(expires_at, last_seen_at + interval '7 days')
-WHERE credential_digest_v1 IS NULL OR expires_at IS NULL;
---> statement-breakpoint
--- Replace every legacy raw-cookie primary key with an independent database UUID.
--- Rows already created by the v1 writer have independent IDs and therefore do
--- not match this predicate. Re-running this statement is a no-op after success.
--- No repository migration defines an inbound foreign key to sessions(id); fail
--- closed if a deployment added one instead of silently orphaning its rows.
-DO $$
-BEGIN
-  IF EXISTS (
-    SELECT 1
-    FROM pg_catalog.pg_constraint constraint_row
-    WHERE constraint_row.contype = 'f'
-      AND constraint_row.confrelid = 'public.sessions'::pg_catalog.regclass
-  ) THEN
-    RAISE EXCEPTION 'sessions(id) has an unsupported inbound foreign key; rekey dependents explicitly'
-      USING ERRCODE = '55000';
-  END IF;
-END;
-$$;
-UPDATE public.sessions
-SET id = pg_catalog.gen_random_uuid()
-WHERE credential_digest_v1 = pg_catalog.sha256(
-  pg_catalog.convert_to('forge:web-session:v1', 'UTF8')
-  || pg_catalog.decode('00', 'hex')
-  || pg_catalog.convert_to(id::text, 'UTF8')
+CREATE TABLE public.session_credential_reconciliation (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  state text NOT NULL DEFAULT 'expansion'
+    CHECK (state IN ('expansion','draining','strict')),
+  rows_migrated bigint NOT NULL DEFAULT 0 CHECK (rows_migrated >= 0),
+  rows_revoked bigint NOT NULL DEFAULT 0 CHECK (rows_revoked >= 0),
+  updated_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp()
 );
+INSERT INTO public.session_credential_reconciliation (singleton) VALUES (true);
 --> statement-breakpoint
--- Zero-scan proof: no session row may retain the raw cookie as its internal ID.
-DO $$
+CREATE OR REPLACE FUNCTION forge.guard_session_credential_cutover_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_state text;
 BEGIN
-  IF EXISTS (
-    SELECT 1
-    FROM public.sessions session_row
-    WHERE session_row.credential_digest_v1 = pg_catalog.sha256(
-      pg_catalog.convert_to('forge:web-session:v1', 'UTF8')
-      || pg_catalog.decode('00', 'hex')
-      || pg_catalog.convert_to(session_row.id::text, 'UTF8')
-    )
-  ) THEN
-    RAISE EXCEPTION 'legacy raw-cookie session primary key remains after rekey'
+  SELECT reconciliation.state INTO STRICT v_state
+  FROM public.session_credential_reconciliation reconciliation
+  WHERE reconciliation.singleton
+  FOR KEY SHARE;
+
+  IF TG_OP = 'INSERT' AND NEW.credential_storage_version < 2
+     AND v_state <> 'expansion' THEN
+    RAISE EXCEPTION 'Legacy-compatible session creation is closed for credential drain'
       USING ERRCODE = '55000';
   END IF;
+  IF TG_OP = 'UPDATE'
+     AND NEW.credential_storage_version < OLD.credential_storage_version THEN
+    RAISE EXCEPTION 'Session credential storage version cannot move backward'
+      USING ERRCODE = '55000';
+  END IF;
+  IF NEW.credential_storage_version = 0 AND (
+       NEW.credential_digest_v1 IS NOT NULL OR NEW.expires_at IS NOT NULL
+     ) THEN
+    RAISE EXCEPTION 'An unreconciled legacy session cannot claim database credential authority'
+      USING ERRCODE = '23514';
+  END IF;
+  IF NEW.credential_storage_version = 1 AND (
+       NEW.credential_digest_v1 IS NULL OR NEW.expires_at IS NULL
+       OR NEW.credential_digest_v1 <> pg_catalog.sha256(
+         pg_catalog.convert_to('forge:web-session:v1', 'UTF8')
+         || pg_catalog.decode('00', 'hex')
+         || pg_catalog.convert_to(NEW.id::text, 'UTF8')
+       )
+     ) THEN
+    RAISE EXCEPTION 'A dual-format session must bind its raw ID to the exact digest and expiry'
+      USING ERRCODE = '23514';
+  END IF;
+  IF NEW.credential_storage_version = 2 AND (
+       NEW.credential_digest_v1 IS NULL OR NEW.expires_at IS NULL
+       OR NEW.legacy_redis_purge_pending_at IS NOT NULL
+     ) THEN
+    RAISE EXCEPTION 'A digest-only session must have complete database authority and no pending legacy key'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
 END;
 $$;
+CREATE TRIGGER sessions_credential_cutover_guard_v1
+  BEFORE INSERT OR UPDATE OF id, credential_digest_v1, expires_at,
+    credential_storage_version, legacy_redis_purge_pending_at
+  ON public.sessions
+  FOR EACH ROW EXECUTE FUNCTION forge.guard_session_credential_cutover_v1();
 --> statement-breakpoint
 ALTER TABLE public.sessions
   ADD CONSTRAINT sessions_credential_digest_v1_length_chk
-  CHECK (pg_catalog.octet_length(credential_digest_v1) = 32),
-  ALTER COLUMN credential_digest_v1 SET NOT NULL,
-  ALTER COLUMN expires_at SET NOT NULL;
+  CHECK (
+    credential_digest_v1 IS NULL
+    OR pg_catalog.octet_length(credential_digest_v1) = 32
+  ) NOT VALID,
+  ADD CONSTRAINT sessions_credential_storage_version_chk
+  CHECK (credential_storage_version IN (0,1,2)) NOT VALID;
 --> statement-breakpoint
 CREATE UNIQUE INDEX sessions_credential_digest_v1_idx
-  ON public.sessions (credential_digest_v1);
+  ON public.sessions (credential_digest_v1)
+  WHERE credential_digest_v1 IS NOT NULL;
 --> statement-breakpoint
 CREATE SCHEMA IF NOT EXISTS forge;
 --> statement-breakpoint
@@ -209,7 +222,8 @@ BEGIN
       AND project.root_ref IS NULL
     RETURNING project.id
   )
-  SELECT pg_catalog.count(*)::integer, pg_catalog.max(id)
+  SELECT pg_catalog.count(*)::integer,
+    (pg_catalog.array_agg(id ORDER BY id DESC))[1]
   INTO v_rows, v_last_id
   FROM populated;
 
@@ -396,10 +410,25 @@ AS $$
     SELECT
       state.epoch = 2
       AND state.reviewed_sha ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
-      AND state.exact_builds = pg_catalog.jsonb_build_array(
-        'issue_179_s4@' || state.reviewed_sha,
-        'issue_180_s5@' || state.reviewed_sha,
-        'issue_181_s6@' || state.reviewed_sha
+      AND (
+        SELECT pg_catalog.count(*) = 3
+          AND pg_catalog.count(DISTINCT build.value) = 3
+          AND pg_catalog.count(*) FILTER (
+            WHERE build.value ~ '^issue_179_s4@[^@[:space:]]+$'
+          ) = 1
+          AND pg_catalog.count(*) FILTER (
+            WHERE build.value ~ '^issue_180_s5@[^@[:space:]]+$'
+          ) = 1
+          AND pg_catalog.count(*) FILTER (
+            WHERE build.value ~ '^issue_181_s6@[^@[:space:]]+$'
+          ) = 1
+        FROM pg_catalog.jsonb_array_elements_text(
+          CASE
+            WHEN pg_catalog.jsonb_typeof(state.exact_builds) = 'array'
+              THEN state.exact_builds
+            ELSE '[]'::jsonb
+          END
+        ) build(value)
       )
       AND (
         state.state = 'active'
@@ -528,13 +557,6 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'Task history is not accessible to this session' USING ERRCODE = '42501';
   END IF;
-  IF pg_catalog.clock_timestamp() > v_session.last_seen_at + interval '60 seconds' THEN
-    UPDATE public.sessions
-    SET last_seen_at = pg_catalog.clock_timestamp(),
-        expires_at = pg_catalog.clock_timestamp() + interval '7 days'
-    WHERE id = v_session.id;
-  END IF;
-
   SELECT version_row.* INTO STRICT v_version
   FROM public.architect_plan_versions version_row
   WHERE version_row.task_id = p_task_id
@@ -546,6 +568,21 @@ BEGIN
     v_request_id, v_session.user_id, p_task_id, p_plan_version,
     v_version.entry_count, v_version.entry_set_digest
   );
+
+  -- Re-check against database time immediately before any protected history is
+  -- returned. The first check does not authorize a response that crossed its
+  -- expiry boundary while the plan and audit rows were being prepared.
+  PERFORM 1 FROM public.sessions session_row
+  WHERE session_row.id = v_session.id
+    AND session_row.credential_digest_v1 = v_credential_digest
+    AND session_row.revoked_at IS NULL
+    AND session_row.expires_at IS NOT NULL
+    AND pg_catalog.clock_timestamp() < session_row.expires_at
+  FOR KEY SHARE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Session credential expired before history delivery'
+      USING ERRCODE = '28000';
+  END IF;
 
   RETURN QUERY
   SELECT plan_entry.entry_id, plan_entry.entry_kind, plan_entry.agent,
@@ -563,6 +600,9 @@ $$;
 CREATE OR REPLACE FUNCTION forge.resolve_architect_plan_entry_v1(p_reference_id uuid)
 RETURNS TABLE (
   purpose text,
+  task_id uuid,
+  plan_artifact_id uuid,
+  plan_version bigint,
   entry_id text,
   entry_kind text,
   agent text,
@@ -570,6 +610,7 @@ RETURNS TABLE (
   binding_fingerprint text,
   content text,
   content_digest text,
+  digest_key_id text,
   projection_eligible boolean
 )
 LANGUAGE plpgsql
@@ -594,9 +635,11 @@ BEGIN
       AND reference.resolved_at IS NULL
     FOR UPDATE
   ), authorized AS (
-    SELECT reference.id, reference.purpose, entry.entry_id, entry.entry_kind, entry.agent,
+    SELECT reference.id, reference.purpose, reference.task_id,
+      reference.plan_artifact_id, reference.plan_version,
+      entry.entry_id, entry.entry_kind, entry.agent,
       entry.requirement_key, entry.binding_fingerprint, entry.content,
-      entry.content_digest, entry.projection_eligible
+      entry.content_digest, entry.digest_key_id, entry.projection_eligible
     FROM locked_reference reference
     JOIN public.agent_runs run
       ON run.id = reference.agent_run_id
@@ -641,9 +684,10 @@ BEGIN
     WHERE reference.id = authorized.id
     RETURNING authorized.*
   )
-  SELECT marked.purpose, marked.entry_id, marked.entry_kind, marked.agent,
+  SELECT marked.purpose, marked.task_id, marked.plan_artifact_id,
+    marked.plan_version, marked.entry_id, marked.entry_kind, marked.agent,
     marked.requirement_key, marked.binding_fingerprint, marked.content,
-    marked.content_digest, marked.projection_eligible
+    marked.content_digest, marked.digest_key_id, marked.projection_eligible
   FROM marked;
 END;
 $$;
@@ -654,9 +698,13 @@ CREATE TABLE public.work_package_local_run_evidence (
   work_package_id uuid NOT NULL,
   agent_run_id uuid NOT NULL UNIQUE,
   claim_token uuid NOT NULL UNIQUE,
+  claim_generation bigint NOT NULL DEFAULT 1,
+  last_heartbeat_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
   lease_expires_at timestamptz NOT NULL,
   state text NOT NULL DEFAULT 'claimed',
   created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  terminal jsonb,
+  completion_artifact_id uuid REFERENCES public.artifacts(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
   terminal_at timestamptz,
   CONSTRAINT work_package_local_run_evidence_task_fk
     FOREIGN KEY (task_id) REFERENCES public.tasks(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
@@ -665,7 +713,12 @@ CREATE TABLE public.work_package_local_run_evidence (
   CONSTRAINT work_package_local_run_evidence_run_fk
     FOREIGN KEY (agent_run_id) REFERENCES public.agent_runs(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
   CONSTRAINT work_package_local_run_evidence_state_chk CHECK (state IN ('claimed','terminal','uncertain')),
-  CONSTRAINT work_package_local_run_evidence_terminal_chk CHECK ((state = 'claimed') = (terminal_at IS NULL)),
+  CONSTRAINT work_package_local_run_evidence_generation_chk CHECK (claim_generation > 0),
+  CONSTRAINT work_package_local_run_evidence_lease_chk CHECK (lease_expires_at > last_heartbeat_at),
+  CONSTRAINT work_package_local_run_evidence_terminal_chk CHECK (
+    (state = 'claimed' AND terminal IS NULL AND terminal_at IS NULL)
+    OR (state IN ('terminal','uncertain') AND terminal IS NOT NULL AND terminal_at IS NOT NULL)
+  ),
   CONSTRAINT work_package_local_run_evidence_identity_key
     UNIQUE (id, task_id, work_package_id, agent_run_id)
 );
@@ -688,6 +741,8 @@ ALTER TABLE public.filesystem_mcp_runtime_audits
   ADD COLUMN protocol_version integer,
   ADD COLUMN local_run_evidence_id uuid,
   ADD COLUMN claim_token uuid,
+  ADD COLUMN claim_generation bigint,
+  ADD COLUMN last_heartbeat_at timestamptz,
   ADD COLUMN lease_expires_at timestamptz,
   ADD COLUMN authorization_snapshot jsonb,
   ADD COLUMN authorization_source text,
@@ -696,6 +751,7 @@ ALTER TABLE public.filesystem_mcp_runtime_audits
   ADD COLUMN grant_decision_nonce uuid,
   ADD COLUMN authorization_root_binding_revision bigint,
   ADD COLUMN project_decision_id uuid,
+  ADD COLUMN completion_artifact_id uuid,
   ADD COLUMN assembly jsonb,
   ADD COLUMN delivery jsonb,
   ADD COLUMN terminal jsonb,
@@ -712,6 +768,9 @@ ALTER TABLE public.filesystem_mcp_runtime_audits
   ADD CONSTRAINT filesystem_mcp_runtime_audits_project_decision_fk
     FOREIGN KEY (project_decision_id) REFERENCES public.project_filesystem_grant_decisions(id)
     ON UPDATE RESTRICT ON DELETE RESTRICT,
+  ADD CONSTRAINT filesystem_mcp_runtime_audits_completion_artifact_fk
+    FOREIGN KEY (completion_artifact_id) REFERENCES public.artifacts(id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
   ADD CONSTRAINT filesystem_mcp_runtime_audits_local_identity_fk
     FOREIGN KEY (local_run_evidence_id, task_id, work_package_id, agent_run_id)
     REFERENCES public.work_package_local_run_evidence(id, task_id, work_package_id, agent_run_id)
@@ -727,7 +786,8 @@ ALTER TABLE public.filesystem_mcp_runtime_audits
     protocol_version IS DISTINCT FROM 2 OR (
       task_id IS NOT NULL AND work_package_id IS NOT NULL AND agent_run_id IS NOT NULL
       AND local_run_evidence_id IS NOT NULL AND claim_token IS NOT NULL
-      AND lease_expires_at IS NOT NULL AND authorization_snapshot IS NOT NULL
+      AND claim_generation > 0 AND last_heartbeat_at IS NOT NULL
+      AND lease_expires_at > last_heartbeat_at AND authorization_snapshot IS NOT NULL
       AND grant_decision_revision > 0 AND authorization_root_binding_revision > 0
       AND root = '' AND reason = '' AND metadata = '{}'::jsonb
       AND (
@@ -879,6 +939,65 @@ CREATE TRIGGER filesystem_mcp_runtime_audits_protocol_v2_guard
 BEFORE INSERT OR UPDATE ON public.filesystem_mcp_runtime_audits
 FOR EACH ROW EXECUTE FUNCTION forge.guard_packet_authorization_v2();
 --> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.s4_execution_lease_live_v1(
+  p_metadata jsonb,
+  p_agent_run_id uuid,
+  p_now timestamptz
+)
+RETURNS boolean
+LANGUAGE plpgsql
+STABLE
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  v_lease jsonb := p_metadata->'executionLease';
+  v_heartbeat timestamptz;
+  v_stale_after numeric;
+BEGIN
+  IF pg_catalog.jsonb_typeof(v_lease) <> 'object'
+     OR (SELECT pg_catalog.count(*) <> 6 FROM pg_catalog.jsonb_object_keys(v_lease))
+     OR v_lease->>'runId' <> p_agent_run_id::text
+     OR v_lease->>'source' <> 'work-package-handoff'
+     OR v_lease->>'attemptNumber' !~ '^[1-9][0-9]*$'
+     OR v_lease->>'staleAfterSeconds' !~ '^[1-9][0-9]*(\.[0-9]+)?$' THEN
+    RETURN false;
+  END IF;
+  v_heartbeat := (v_lease->>'heartbeatAt')::timestamptz;
+  v_stale_after := (v_lease->>'staleAfterSeconds')::numeric;
+  RETURN v_stale_after BETWEEN 1 AND 3600
+    AND (v_lease->>'acquiredAt')::timestamptz <= v_heartbeat
+    AND v_heartbeat + pg_catalog.make_interval(secs => v_stale_after::double precision) > p_now;
+EXCEPTION WHEN OTHERS THEN
+  RETURN false;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.s4_runtime_mode_v1()
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'S4 runtime-mode reads require the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  IF forge.s4_protected_paths_enabled_v1() THEN
+    RETURN 'protected';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM forge.read_epic_172_enablement_state_v1() state
+    WHERE state.state = 'disabled'
+  ) THEN
+    RETURN 'legacy';
+  END IF;
+  RAISE EXCEPTION 'S4 runtime mode is blocked by incomplete Step 0 authority'
+    USING ERRCODE = '55000';
+END;
+$$;
+--> statement-breakpoint
 CREATE OR REPLACE FUNCTION forge.create_local_run_evidence_v1(
   p_agent_run_id uuid,
   p_claim_token uuid,
@@ -895,7 +1014,8 @@ DECLARE
   v_project_id uuid;
   v_evidence_id uuid := pg_catalog.gen_random_uuid();
 BEGIN
-  IF session_user <> 'forge_packet_issuer' THEN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
     RAISE EXCEPTION 'local run evidence requires the dedicated issuer login'
       USING ERRCODE = '42501';
   END IF;
@@ -935,11 +1055,22 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'packet agent run is not running' USING ERRCODE = '40001';
   END IF;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.id = v_package_id
+    AND forge.s4_execution_lease_live_v1(
+      package.metadata, p_agent_run_id, pg_catalog.clock_timestamp()
+    );
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'S3 execution lease is absent, malformed, or expired'
+      USING ERRCODE = '40001';
+  END IF;
 
   INSERT INTO public.work_package_local_run_evidence (
-    id, task_id, work_package_id, agent_run_id, claim_token, lease_expires_at
+    id, task_id, work_package_id, agent_run_id, claim_token,
+    claim_generation, last_heartbeat_at, lease_expires_at
   ) VALUES (
     v_evidence_id, v_task_id, v_package_id, p_agent_run_id, p_claim_token,
+    1, pg_catalog.clock_timestamp(),
     pg_catalog.clock_timestamp() + pg_catalog.make_interval(secs => p_lease_seconds)
   );
   RETURN v_evidence_id;
@@ -950,7 +1081,8 @@ CREATE OR REPLACE FUNCTION forge.insert_packet_authorization_snapshot_v2(
   p_agent_run_id uuid,
   p_local_run_evidence_id uuid,
   p_decision_id uuid,
-  p_claim_token uuid,
+  p_local_claim_token uuid,
+  p_packet_claim_token uuid,
   p_lease_seconds integer,
   p_required_capabilities text[]
 )
@@ -983,7 +1115,8 @@ DECLARE
   v_snapshot jsonb;
   v_audit_id uuid := pg_catalog.gen_random_uuid();
 BEGIN
-  IF session_user <> 'forge_packet_issuer' THEN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
     RAISE EXCEPTION 'packet issuance requires the dedicated issuer login' USING ERRCODE = '42501';
   END IF;
   IF p_lease_seconds NOT BETWEEN 1 AND 45 THEN
@@ -1101,7 +1234,8 @@ BEGIN
     AND evidence.agent_run_id = v_run.id
     AND evidence.task_id = v_task.id
     AND evidence.work_package_id = v_package.id
-    AND evidence.claim_token = p_claim_token
+    AND evidence.claim_token = p_local_claim_token
+    AND evidence.claim_generation = 1
     AND evidence.state = 'claimed'
     AND pg_catalog.clock_timestamp() < evidence.lease_expires_at
   FOR UPDATE;
@@ -1126,7 +1260,8 @@ BEGIN
     grant_approval_id, project_decision_id, operation, status, capabilities,
     requested_capabilities, root, file_count, byte_count, omitted_count,
     redaction_applied, redaction_summary, omitted_summary, reason, metadata,
-    protocol_version, claim_token, lease_expires_at, authorization_snapshot,
+    protocol_version, claim_token, claim_generation, last_heartbeat_at,
+    lease_expires_at, authorization_snapshot,
     authorization_source, grant_mode, grant_decision_revision,
     grant_decision_nonce, authorization_root_binding_revision
   ) VALUES (
@@ -1134,7 +1269,8 @@ BEGIN
     v_grant_approval_id, v_project_decision_id,
     'context_packet', 'claiming', pg_catalog.to_jsonb(v_approved), pg_catalog.to_jsonb(v_required),
     '', 0, 0, 0, false, '{}'::jsonb, '{}'::jsonb, '', '{}'::jsonb,
-    2, p_claim_token, LEAST(v_local.lease_expires_at, pg_catalog.clock_timestamp() + pg_catalog.make_interval(secs => p_lease_seconds)),
+    2, p_packet_claim_token, 1, pg_catalog.clock_timestamp(),
+    LEAST(v_local.lease_expires_at, pg_catalog.clock_timestamp() + pg_catalog.make_interval(secs => p_lease_seconds)),
     v_snapshot, v_source, v_mode, v_grant_revision,
     v_grant_nonce, v_root_revision
   );
@@ -1145,6 +1281,1416 @@ BEGIN
     ) VALUES (v_grant_approval_id, v_grant_nonce, v_audit_id);
   END IF;
   RETURN v_audit_id;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.claim_local_lifecycle_v2(
+  p_agent_run_id uuid,
+  p_local_claim_token uuid,
+  p_local_lease_seconds integer
+)
+RETURNS TABLE (
+  local_run_evidence_id uuid,
+  local_claim_generation bigint,
+  local_lease_expires_at timestamptz
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'local lifecycle claim requires the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  local_run_evidence_id := forge.create_local_run_evidence_v1(
+    p_agent_run_id, p_local_claim_token, p_local_lease_seconds
+  );
+  SELECT evidence.claim_generation, evidence.lease_expires_at
+  INTO STRICT local_claim_generation, local_lease_expires_at
+  FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = local_run_evidence_id;
+  RETURN NEXT;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.claim_packet_lifecycle_v2(
+  p_agent_run_id uuid,
+  p_decision_id uuid,
+  p_local_claim_token uuid,
+  p_packet_claim_token uuid,
+  p_local_lease_seconds integer,
+  p_packet_lease_seconds integer,
+  p_required_capabilities text[]
+)
+RETURNS TABLE (
+  local_run_evidence_id uuid,
+  runtime_audit_id uuid,
+  local_claim_generation bigint,
+  packet_claim_generation bigint,
+  local_lease_expires_at timestamptz,
+  packet_lease_expires_at timestamptz
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_project_id uuid;
+  v_task_id uuid;
+  v_package_id uuid;
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'packet lifecycle claim requires the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'S4 packet producers are disabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
+
+  SELECT task.project_id, run.task_id, run.work_package_id
+  INTO STRICT v_project_id, v_task_id, v_package_id
+  FROM public.agent_runs run
+  JOIN public.tasks task ON task.id = run.task_id
+  WHERE run.id = p_agent_run_id;
+
+  PERFORM 1 FROM public.projects project WHERE project.id = v_project_id FOR UPDATE;
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id = v_task_id AND task.project_id = v_project_id FOR UPDATE;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id = v_task_id ORDER BY package.id FOR UPDATE;
+
+  PERFORM 1 FROM public.filesystem_mcp_grant_approvals decision
+  WHERE decision.id = p_decision_id FOR UPDATE;
+  IF FOUND THEN
+    PERFORM 1 FROM public.filesystem_mcp_current_decision_pointers pointer
+    WHERE pointer.work_package_id = v_package_id FOR UPDATE;
+  ELSE
+    PERFORM 1
+    FROM public.project_filesystem_current_decision_pointers pointer
+    JOIN public.project_filesystem_grant_decisions decision
+      ON decision.id = pointer.current_decision_id
+    WHERE pointer.project_id = v_project_id AND decision.id = p_decision_id
+    FOR UPDATE OF pointer, decision;
+  END IF;
+
+  local_run_evidence_id := forge.create_local_run_evidence_v1(
+    p_agent_run_id, p_local_claim_token, p_local_lease_seconds
+  );
+  runtime_audit_id := forge.insert_packet_authorization_snapshot_v2(
+    p_agent_run_id, local_run_evidence_id, p_decision_id,
+    p_local_claim_token, p_packet_claim_token, p_packet_lease_seconds,
+    p_required_capabilities
+  );
+  SELECT evidence.claim_generation, evidence.lease_expires_at
+  INTO STRICT local_claim_generation, local_lease_expires_at
+  FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = local_run_evidence_id;
+  SELECT audit.claim_generation, audit.lease_expires_at
+  INTO STRICT packet_claim_generation, packet_lease_expires_at
+  FROM public.filesystem_mcp_runtime_audits audit
+  WHERE audit.id = runtime_audit_id;
+  RETURN NEXT;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.claim_work_package_lifecycle_v2(
+  p_mode text,
+  p_task_id uuid,
+  p_work_package_id uuid,
+  p_expected_package_updated_at timestamptz,
+  p_agent_run_id uuid,
+  p_agent_type text,
+  p_harness_id uuid,
+  p_attempt_number integer,
+  p_provider_config_id uuid,
+  p_model_id_used text,
+  p_stage text,
+  p_execution_stale_seconds integer,
+  p_decision_id uuid,
+  p_local_claim_token uuid,
+  p_packet_claim_token uuid,
+  p_local_lease_seconds integer,
+  p_packet_lease_seconds integer,
+  p_required_capabilities text[]
+)
+RETURNS TABLE (
+  agent_run_id uuid,
+  local_run_evidence_id uuid,
+  runtime_audit_id uuid,
+  local_claim_generation bigint,
+  packet_claim_generation bigint,
+  local_lease_expires_at timestamptz,
+  packet_lease_expires_at timestamptz
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_project_id uuid;
+  v_package public.work_packages%ROWTYPE;
+  v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'work-package lifecycle claim requires the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'S4 work-package claims are disabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
+  IF p_mode NOT IN ('root_free_handoff', 'local_only', 'packet')
+     OR p_attempt_number <= 0
+     OR p_execution_stale_seconds NOT BETWEEN 1 AND 3600
+     OR pg_catalog.length(pg_catalog.btrim(p_agent_type)) NOT BETWEEN 1 AND 100
+     OR pg_catalog.length(pg_catalog.btrim(p_model_id_used)) NOT BETWEEN 1 AND 500
+     OR (p_mode = 'root_free_handoff' AND (
+       p_decision_id IS NOT NULL OR p_local_claim_token IS NOT NULL
+       OR p_packet_claim_token IS NOT NULL
+     ))
+     OR (p_mode = 'local_only' AND (
+       p_local_claim_token IS NULL OR p_decision_id IS NOT NULL
+       OR p_packet_claim_token IS NOT NULL
+     ))
+     OR (p_mode = 'packet' AND (
+       p_local_claim_token IS NULL OR p_packet_claim_token IS NULL
+       OR p_decision_id IS NULL
+     )) THEN
+    RAISE EXCEPTION 'work-package lifecycle claim shape is invalid'
+      USING ERRCODE = '22023';
+  END IF;
+
+  SELECT task.project_id
+  INTO STRICT v_project_id
+  FROM public.work_packages package
+  JOIN public.tasks task ON task.id = package.task_id
+  WHERE package.id = p_work_package_id AND package.task_id = p_task_id;
+  PERFORM 1 FROM public.projects project
+  WHERE project.id = v_project_id AND project.archived_at IS NULL FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'work-package project is unavailable' USING ERRCODE = '40001';
+  END IF;
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id = p_task_id AND task.project_id = v_project_id
+    AND task.status = 'running' FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'work-package task is not running' USING ERRCODE = '40001';
+  END IF;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id = p_task_id ORDER BY package.id FOR UPDATE;
+  SELECT package.* INTO STRICT v_package
+  FROM public.work_packages package
+  WHERE package.id = p_work_package_id AND package.task_id = p_task_id;
+  IF v_package.status <> 'ready'
+     OR v_package.updated_at IS DISTINCT FROM p_expected_package_updated_at
+     OR v_package.assigned_role <> p_agent_type
+     OR EXISTS (
+       SELECT 1 FROM public.work_packages sibling
+       WHERE sibling.task_id = p_task_id AND sibling.id <> p_work_package_id
+         AND (
+           sibling.status IN ('running', 'awaiting_review')
+           OR sibling.metadata ? 'executionLease'
+         )
+     )
+     OR v_package.metadata ? 'executionLease' THEN
+    RAISE EXCEPTION 'work-package claim lost its ready/sibling compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+
+  IF p_mode = 'packet' THEN
+    PERFORM 1 FROM public.filesystem_mcp_grant_approvals decision
+    WHERE decision.id = p_decision_id FOR UPDATE;
+    IF FOUND THEN
+      PERFORM 1 FROM public.filesystem_mcp_current_decision_pointers pointer
+      WHERE pointer.work_package_id = p_work_package_id FOR UPDATE;
+    ELSE
+      PERFORM 1
+      FROM public.project_filesystem_current_decision_pointers pointer
+      JOIN public.project_filesystem_grant_decisions decision
+        ON decision.id = pointer.current_decision_id
+      WHERE pointer.project_id = v_project_id AND decision.id = p_decision_id
+      FOR UPDATE OF pointer, decision;
+    END IF;
+  END IF;
+
+  INSERT INTO public.agent_runs (
+    id, task_id, work_package_id, harness_id, agent_type, stage,
+    attempt_number, provider_config_id, model_id_used, status, started_at
+  ) VALUES (
+    p_agent_run_id, p_task_id, p_work_package_id, p_harness_id, p_agent_type,
+    p_stage, p_attempt_number, p_provider_config_id, p_model_id_used,
+    'running', v_now
+  );
+  UPDATE public.work_packages package
+  SET status = 'running', blocked_reason = NULL, updated_at = v_now,
+      metadata = pg_catalog.jsonb_set(
+        COALESCE(package.metadata, '{}'::jsonb), '{executionLease}',
+        pg_catalog.jsonb_build_object(
+          'acquiredAt', pg_catalog.to_char(
+            v_now AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+          ),
+          'attemptNumber', p_attempt_number,
+          'heartbeatAt', pg_catalog.to_char(
+            v_now AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+          ),
+          'runId', p_agent_run_id::text,
+          'source', 'work-package-handoff',
+          'staleAfterSeconds', p_execution_stale_seconds
+        ), true
+      )
+  WHERE package.id = p_work_package_id AND package.status = 'ready';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'work-package execution lease compare-and-set failed'
+      USING ERRCODE = '40001';
+  END IF;
+
+  agent_run_id := p_agent_run_id;
+  IF p_mode = 'root_free_handoff' THEN
+    RETURN NEXT;
+    RETURN;
+  END IF;
+  local_run_evidence_id := forge.create_local_run_evidence_v1(
+    p_agent_run_id, p_local_claim_token, p_local_lease_seconds
+  );
+  SELECT evidence.claim_generation, evidence.lease_expires_at
+  INTO STRICT local_claim_generation, local_lease_expires_at
+  FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = local_run_evidence_id;
+  IF p_mode = 'packet' THEN
+    runtime_audit_id := forge.insert_packet_authorization_snapshot_v2(
+      p_agent_run_id, local_run_evidence_id, p_decision_id,
+      p_local_claim_token, p_packet_claim_token, p_packet_lease_seconds,
+      p_required_capabilities
+    );
+    SELECT audit.claim_generation, audit.lease_expires_at
+    INTO STRICT packet_claim_generation, packet_lease_expires_at
+    FROM public.filesystem_mcp_runtime_audits audit
+    WHERE audit.id = runtime_audit_id;
+  END IF;
+  RETURN NEXT;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.lock_live_packet_lifecycle_v2(
+  p_runtime_audit_id uuid,
+  p_local_claim_token uuid,
+  p_local_claim_generation bigint,
+  p_packet_claim_token uuid,
+  p_packet_claim_generation bigint
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_audit public.filesystem_mcp_runtime_audits%ROWTYPE;
+  v_project_id uuid;
+  v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'packet lifecycle ownership requires the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'S4 packet lifecycle is disabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
+
+  SELECT audit.* INTO STRICT v_audit
+  FROM public.filesystem_mcp_runtime_audits audit
+  WHERE audit.id = p_runtime_audit_id AND audit.protocol_version = 2;
+  SELECT task.project_id INTO STRICT v_project_id
+  FROM public.tasks task WHERE task.id = v_audit.task_id;
+  PERFORM 1 FROM public.projects project WHERE project.id = v_project_id FOR UPDATE;
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id = v_audit.task_id AND task.project_id = v_project_id FOR UPDATE;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id = v_audit.task_id ORDER BY package.id FOR UPDATE;
+  PERFORM 1 FROM public.agent_runs run
+  WHERE run.id = v_audit.agent_run_id AND run.task_id = v_audit.task_id
+    AND run.work_package_id = v_audit.work_package_id AND run.status = 'running'
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'packet agent run is not live' USING ERRCODE = '40001';
+  END IF;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.id = v_audit.work_package_id AND package.status = 'running'
+    AND forge.s4_execution_lease_live_v1(package.metadata, v_audit.agent_run_id, v_now);
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'S3 execution lease is absent, malformed, or expired'
+      USING ERRCODE = '40001';
+  END IF;
+  PERFORM 1 FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = v_audit.local_run_evidence_id
+    AND evidence.agent_run_id = v_audit.agent_run_id
+    AND evidence.claim_token = p_local_claim_token
+    AND evidence.claim_generation = p_local_claim_generation
+    AND evidence.state = 'claimed'
+    AND evidence.lease_expires_at > v_now
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'local evidence ownership is absent, stale, or expired'
+      USING ERRCODE = '40001';
+  END IF;
+  PERFORM 1 FROM public.filesystem_mcp_runtime_audits audit
+  WHERE audit.id = p_runtime_audit_id
+    AND audit.status = 'claiming'
+    AND audit.claim_token = p_packet_claim_token
+    AND audit.claim_generation = p_packet_claim_generation
+    AND audit.lease_expires_at > v_now
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'packet ownership is absent, stale, or expired'
+      USING ERRCODE = '40001';
+  END IF;
+  RETURN v_audit.agent_run_id;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.lock_live_local_lifecycle_v2(
+  p_local_run_evidence_id uuid,
+  p_local_claim_token uuid,
+  p_local_claim_generation bigint
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_local public.work_package_local_run_evidence%ROWTYPE;
+  v_project_id uuid;
+  v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'local lifecycle ownership requires the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'S4 local lifecycle is disabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
+  SELECT evidence.* INTO STRICT v_local
+  FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = p_local_run_evidence_id;
+  SELECT task.project_id INTO STRICT v_project_id
+  FROM public.tasks task WHERE task.id = v_local.task_id;
+  PERFORM 1 FROM public.projects project WHERE project.id = v_project_id FOR UPDATE;
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id = v_local.task_id AND task.project_id = v_project_id FOR UPDATE;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id = v_local.task_id ORDER BY package.id FOR UPDATE;
+  PERFORM 1 FROM public.agent_runs run
+  WHERE run.id = v_local.agent_run_id AND run.task_id = v_local.task_id
+    AND run.work_package_id = v_local.work_package_id AND run.status = 'running'
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'local agent run is not live' USING ERRCODE = '40001';
+  END IF;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.id = v_local.work_package_id AND package.status = 'running'
+    AND forge.s4_execution_lease_live_v1(package.metadata, v_local.agent_run_id, v_now);
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'S3 execution lease is absent, malformed, or expired'
+      USING ERRCODE = '40001';
+  END IF;
+  PERFORM 1 FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = p_local_run_evidence_id
+    AND evidence.claim_token = p_local_claim_token
+    AND evidence.claim_generation = p_local_claim_generation
+    AND evidence.state = 'claimed' AND evidence.lease_expires_at > v_now
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'local evidence ownership is absent, stale, or expired'
+      USING ERRCODE = '40001';
+  END IF;
+  RETURN v_local.agent_run_id;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.heartbeat_local_lifecycle_v2(
+  p_local_run_evidence_id uuid,
+  p_local_claim_token uuid,
+  p_local_claim_generation bigint,
+  p_local_lease_seconds integer
+)
+RETURNS timestamptz
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_agent_run_id uuid;
+  v_package_id uuid;
+  v_now timestamptz := pg_catalog.clock_timestamp();
+  v_expires_at timestamptz;
+BEGIN
+  IF p_local_lease_seconds NOT BETWEEN 1 AND 45 THEN
+    RAISE EXCEPTION 'local lease duration must be between 1 and 45 seconds'
+      USING ERRCODE = '22023';
+  END IF;
+  v_agent_run_id := forge.lock_live_local_lifecycle_v2(
+    p_local_run_evidence_id, p_local_claim_token, p_local_claim_generation
+  );
+  SELECT evidence.work_package_id INTO STRICT v_package_id
+  FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = p_local_run_evidence_id;
+  UPDATE public.work_packages package
+  SET metadata = pg_catalog.jsonb_set(
+    package.metadata, '{executionLease,heartbeatAt}',
+    pg_catalog.to_jsonb(pg_catalog.to_char(v_now AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')),
+    false
+  )
+  WHERE package.id = v_package_id
+    AND package.metadata->'executionLease'->>'runId' = v_agent_run_id::text;
+  UPDATE public.work_package_local_run_evidence evidence
+  SET last_heartbeat_at = v_now,
+      lease_expires_at = v_now + pg_catalog.make_interval(secs => p_local_lease_seconds)
+  WHERE evidence.id = p_local_run_evidence_id
+    AND evidence.claim_token = p_local_claim_token
+    AND evidence.claim_generation = p_local_claim_generation
+    AND evidence.state = 'claimed' AND evidence.lease_expires_at > v_now
+  RETURNING evidence.lease_expires_at INTO v_expires_at;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'local lifecycle expired during heartbeat' USING ERRCODE = '40001';
+  END IF;
+  RETURN v_expires_at;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.heartbeat_packet_lifecycle_v2(
+  p_runtime_audit_id uuid,
+  p_local_claim_token uuid,
+  p_local_claim_generation bigint,
+  p_packet_claim_token uuid,
+  p_packet_claim_generation bigint,
+  p_local_lease_seconds integer,
+  p_packet_lease_seconds integer
+)
+RETURNS TABLE (local_lease_expires_at timestamptz, packet_lease_expires_at timestamptz)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_agent_run_id uuid;
+  v_package_id uuid;
+  v_local_id uuid;
+  v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+  IF p_local_lease_seconds NOT BETWEEN 1 AND 45
+     OR p_packet_lease_seconds NOT BETWEEN 1 AND 45 THEN
+    RAISE EXCEPTION 'S4 lease duration must be between 1 and 45 seconds'
+      USING ERRCODE = '22023';
+  END IF;
+  v_agent_run_id := forge.lock_live_packet_lifecycle_v2(
+    p_runtime_audit_id, p_local_claim_token, p_local_claim_generation,
+    p_packet_claim_token, p_packet_claim_generation
+  );
+  SELECT audit.work_package_id, audit.local_run_evidence_id
+  INTO STRICT v_package_id, v_local_id
+  FROM public.filesystem_mcp_runtime_audits audit WHERE audit.id = p_runtime_audit_id;
+
+  UPDATE public.work_packages package
+  SET metadata = pg_catalog.jsonb_set(
+    package.metadata, '{executionLease,heartbeatAt}',
+    pg_catalog.to_jsonb(pg_catalog.to_char(v_now AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')),
+    false
+  )
+  WHERE package.id = v_package_id
+    AND package.metadata->'executionLease'->>'runId' = v_agent_run_id::text;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'execution ownership changed during heartbeat' USING ERRCODE = '40001';
+  END IF;
+
+  UPDATE public.work_package_local_run_evidence evidence
+  SET last_heartbeat_at = v_now,
+      lease_expires_at = v_now + pg_catalog.make_interval(secs => p_local_lease_seconds)
+  WHERE evidence.id = v_local_id
+    AND evidence.claim_token = p_local_claim_token
+    AND evidence.claim_generation = p_local_claim_generation
+    AND evidence.state = 'claimed'
+    AND evidence.lease_expires_at > v_now
+  RETURNING evidence.lease_expires_at INTO local_lease_expires_at;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'local evidence lease expired during heartbeat' USING ERRCODE = '40001';
+  END IF;
+
+  UPDATE public.filesystem_mcp_runtime_audits audit
+  SET last_heartbeat_at = v_now,
+      lease_expires_at = LEAST(
+        local_lease_expires_at,
+        v_now + pg_catalog.make_interval(secs => p_packet_lease_seconds)
+      )
+  WHERE audit.id = p_runtime_audit_id
+    AND audit.claim_token = p_packet_claim_token
+    AND audit.claim_generation = p_packet_claim_generation
+    AND audit.status = 'claiming'
+    AND audit.lease_expires_at > v_now
+  RETURNING audit.lease_expires_at INTO packet_lease_expires_at;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'packet lease expired during heartbeat' USING ERRCODE = '40001';
+  END IF;
+  RETURN NEXT;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.begin_packet_assembly_v2(
+  p_runtime_audit_id uuid,
+  p_local_claim_token uuid,
+  p_local_claim_generation bigint,
+  p_packet_claim_token uuid,
+  p_packet_claim_generation bigint,
+  p_assembly_attempt_id uuid
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+BEGIN
+  PERFORM forge.lock_live_packet_lifecycle_v2(
+    p_runtime_audit_id, p_local_claim_token, p_local_claim_generation,
+    p_packet_claim_token, p_packet_claim_generation
+  );
+  UPDATE public.filesystem_mcp_runtime_audits audit
+  SET assembly = pg_catalog.jsonb_build_object(
+    'state', 'assembling',
+    'assemblyAttemptId', p_assembly_attempt_id::text,
+    'intentAt', pg_catalog.to_char(
+      pg_catalog.clock_timestamp() AT TIME ZONE 'UTC',
+      'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+    )
+  )
+  WHERE audit.id = p_runtime_audit_id AND audit.status = 'claiming'
+    AND audit.assembly IS NULL;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'packet assembly intent is stale or already recorded'
+      USING ERRCODE = '40001';
+  END IF;
+  RETURN true;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.complete_packet_assembly_v2(
+  p_runtime_audit_id uuid,
+  p_local_claim_token uuid,
+  p_local_claim_generation bigint,
+  p_packet_claim_token uuid,
+  p_packet_claim_generation bigint,
+  p_assembly_attempt_id uuid,
+  p_root_ref text,
+  p_included_count integer,
+  p_byte_count integer,
+  p_omitted_count integer,
+  p_redaction_summary jsonb
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+BEGIN
+  IF p_root_ref !~ '^[A-Za-z0-9_-]{1,80}$'
+     OR p_included_count NOT BETWEEN 0 AND 50
+     OR p_byte_count NOT BETWEEN 0 AND 163840
+     OR p_omitted_count NOT BETWEEN 0 AND 5000
+     OR pg_catalog.jsonb_typeof(p_redaction_summary) <> 'object' THEN
+    RAISE EXCEPTION 'packet assembly result is outside the bounded schema'
+      USING ERRCODE = '22023';
+  END IF;
+  PERFORM forge.lock_live_packet_lifecycle_v2(
+    p_runtime_audit_id, p_local_claim_token, p_local_claim_generation,
+    p_packet_claim_token, p_packet_claim_generation
+  );
+  UPDATE public.filesystem_mcp_runtime_audits audit
+  SET assembly = pg_catalog.jsonb_build_object(
+    'state', 'assembled', 'rootRef', p_root_ref,
+    'includedCount', p_included_count, 'byteCount', p_byte_count,
+    'omittedCount', p_omitted_count, 'redactionSummary', p_redaction_summary
+  )
+  WHERE audit.id = p_runtime_audit_id AND audit.status = 'claiming'
+    AND audit.assembly->>'state' = 'assembling'
+    AND audit.assembly->>'assemblyAttemptId' = p_assembly_attempt_id::text;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'packet assembly result does not own the recorded intent'
+      USING ERRCODE = '40001';
+  END IF;
+  RETURN true;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.begin_packet_delivery_v2(
+  p_runtime_audit_id uuid,
+  p_local_claim_token uuid,
+  p_local_claim_generation bigint,
+  p_packet_claim_token uuid,
+  p_packet_claim_generation bigint,
+  p_submission_attempt_id uuid
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+BEGIN
+  PERFORM forge.lock_live_packet_lifecycle_v2(
+    p_runtime_audit_id, p_local_claim_token, p_local_claim_generation,
+    p_packet_claim_token, p_packet_claim_generation
+  );
+  UPDATE public.filesystem_mcp_runtime_audits audit
+  SET delivery = pg_catalog.jsonb_build_object(
+    'state', 'submitting',
+    'submissionAttemptId', p_submission_attempt_id::text,
+    'intentAt', pg_catalog.to_char(
+      pg_catalog.clock_timestamp() AT TIME ZONE 'UTC',
+      'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+    )
+  )
+  WHERE audit.id = p_runtime_audit_id AND audit.status = 'claiming'
+    AND audit.assembly->>'state' = 'assembled' AND audit.delivery IS NULL;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'packet delivery intent requires one completed assembly'
+      USING ERRCODE = '40001';
+  END IF;
+  RETURN true;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.complete_packet_delivery_v2(
+  p_runtime_audit_id uuid,
+  p_local_claim_token uuid,
+  p_local_claim_generation bigint,
+  p_packet_claim_token uuid,
+  p_packet_claim_generation bigint,
+  p_submission_attempt_id uuid,
+  p_outcome text
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_delivery jsonb;
+BEGIN
+  IF p_outcome NOT IN ('submission_failed', 'submitted', 'submission_uncertain') THEN
+    RAISE EXCEPTION 'packet delivery outcome is invalid' USING ERRCODE = '22023';
+  END IF;
+  PERFORM forge.lock_live_packet_lifecycle_v2(
+    p_runtime_audit_id, p_local_claim_token, p_local_claim_generation,
+    p_packet_claim_token, p_packet_claim_generation
+  );
+  v_delivery := CASE p_outcome
+    WHEN 'submitted' THEN pg_catalog.jsonb_build_object(
+      'state', 'submitted',
+      'submittedAt', pg_catalog.to_char(
+        pg_catalog.clock_timestamp() AT TIME ZONE 'UTC',
+        'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+      )
+    )
+    ELSE pg_catalog.jsonb_build_object('state', p_outcome)
+  END;
+  UPDATE public.filesystem_mcp_runtime_audits audit
+  SET delivery = v_delivery
+  WHERE audit.id = p_runtime_audit_id AND audit.status = 'claiming'
+    AND audit.delivery->>'state' = 'submitting'
+    AND audit.delivery->>'submissionAttemptId' = p_submission_attempt_id::text;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'packet delivery result does not own the recorded intent'
+      USING ERRCODE = '40001';
+  END IF;
+  RETURN true;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.finalize_local_success_v2(
+  p_local_run_evidence_id uuid,
+  p_local_claim_token uuid,
+  p_local_claim_generation bigint,
+  p_artifact_type text,
+  p_artifact_content text,
+  p_artifact_metadata jsonb
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_now timestamptz := pg_catalog.clock_timestamp();
+  v_agent_run_id uuid;
+  v_artifact_id uuid;
+BEGIN
+  IF pg_catalog.length(pg_catalog.btrim(p_artifact_type)) NOT BETWEEN 1 AND 100
+     OR pg_catalog.length(p_artifact_content) > 1048576
+     OR p_artifact_metadata IS NOT NULL
+        AND pg_catalog.jsonb_typeof(p_artifact_metadata) <> 'object' THEN
+    RAISE EXCEPTION 'completion artifact is outside the bounded schema'
+      USING ERRCODE = '22023';
+  END IF;
+  v_agent_run_id := forge.lock_live_local_lifecycle_v2(
+    p_local_run_evidence_id, p_local_claim_token, p_local_claim_generation
+  );
+  INSERT INTO public.artifacts (agent_run_id, artifact_type, content, metadata)
+  VALUES (v_agent_run_id, p_artifact_type, p_artifact_content, p_artifact_metadata)
+  RETURNING id INTO v_artifact_id;
+  UPDATE public.work_package_local_run_evidence evidence
+  SET state = 'terminal', terminal = '{"status":"succeeded"}'::jsonb,
+      completion_artifact_id = v_artifact_id, terminal_at = v_now
+  WHERE evidence.id = p_local_run_evidence_id AND evidence.state = 'claimed';
+  UPDATE public.agent_runs run
+  SET status = 'completed', completed_at = v_now, error_message = NULL
+  WHERE run.id = v_agent_run_id AND run.status = 'running';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'local success lost its running agent run'
+      USING ERRCODE = '40001';
+  END IF;
+  RETURN v_artifact_id;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.finalize_local_failure_v2(
+  p_local_run_evidence_id uuid,
+  p_local_claim_token uuid,
+  p_local_claim_generation bigint,
+  p_failure_code text
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_agent_run_id uuid;
+  v_package_id uuid;
+  v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+  IF p_failure_code NOT IN (
+    'local_execution_failed', 'local_invocation_uncertain',
+    'external_repository_change_requires_review', 'worker_stopped'
+  ) THEN
+    RAISE EXCEPTION 'local failure is outside the closed terminal vocabulary'
+      USING ERRCODE = '22023';
+  END IF;
+  v_agent_run_id := forge.lock_live_local_lifecycle_v2(
+    p_local_run_evidence_id, p_local_claim_token, p_local_claim_generation
+  );
+  SELECT evidence.work_package_id INTO STRICT v_package_id
+  FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = p_local_run_evidence_id;
+  UPDATE public.work_package_local_run_evidence evidence
+  SET state = CASE WHEN p_failure_code = 'local_invocation_uncertain'
+    THEN 'uncertain' ELSE 'terminal' END,
+      terminal = pg_catalog.jsonb_build_object(
+        'status', 'failed', 'failureCode', p_failure_code
+      ),
+      terminal_at = v_now
+  WHERE evidence.id = p_local_run_evidence_id AND evidence.state = 'claimed';
+  UPDATE public.agent_runs run
+  SET status = 'failed', completed_at = v_now,
+      error_message = 'Protected local execution failed: ' || p_failure_code
+  WHERE run.id = v_agent_run_id AND run.status = 'running';
+  UPDATE public.work_packages package
+  SET status = 'blocked', metadata = pg_catalog.jsonb_set(
+    package.metadata - 'executionLease', '{local_effect_recovery}',
+    pg_catalog.jsonb_build_object(
+      'schemaVersion', 2, 'kind', 'local_lifecycle',
+      'localRunEvidenceId', p_local_run_evidence_id::text,
+      'failureCode', p_failure_code, 'autoRetryable', false
+    ), true
+  )
+  WHERE package.id = v_package_id AND package.status = 'running'
+    AND package.metadata->'executionLease'->>'runId' = v_agent_run_id::text;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'local failure lost its execution lease during finalization'
+      USING ERRCODE = '40001';
+  END IF;
+  RETURN true;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.finalize_packet_success_v2(
+  p_runtime_audit_id uuid,
+  p_local_claim_token uuid,
+  p_local_claim_generation bigint,
+  p_packet_claim_token uuid,
+  p_packet_claim_generation bigint,
+  p_artifact_type text,
+  p_artifact_content text,
+  p_artifact_metadata jsonb
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_audit public.filesystem_mcp_runtime_audits%ROWTYPE;
+  v_now timestamptz := pg_catalog.clock_timestamp();
+  v_artifact_id uuid;
+BEGIN
+  IF pg_catalog.length(pg_catalog.btrim(p_artifact_type)) NOT BETWEEN 1 AND 100
+     OR pg_catalog.length(p_artifact_content) > 1048576
+     OR p_artifact_metadata IS NOT NULL
+        AND pg_catalog.jsonb_typeof(p_artifact_metadata) <> 'object' THEN
+    RAISE EXCEPTION 'completion artifact is outside the bounded schema'
+      USING ERRCODE = '22023';
+  END IF;
+  PERFORM forge.lock_live_packet_lifecycle_v2(
+    p_runtime_audit_id, p_local_claim_token, p_local_claim_generation,
+    p_packet_claim_token, p_packet_claim_generation
+  );
+  SELECT audit.* INTO STRICT v_audit
+  FROM public.filesystem_mcp_runtime_audits audit WHERE audit.id = p_runtime_audit_id;
+  IF v_audit.assembly->>'state' <> 'assembled'
+     OR v_audit.delivery->>'state' <> 'submitted' THEN
+    RAISE EXCEPTION 'packet success requires assembled and submitted evidence'
+      USING ERRCODE = '55000';
+  END IF;
+  INSERT INTO public.artifacts (agent_run_id, artifact_type, content, metadata)
+  VALUES (v_audit.agent_run_id, p_artifact_type, p_artifact_content, p_artifact_metadata)
+  RETURNING id INTO v_artifact_id;
+  UPDATE public.filesystem_mcp_runtime_audits audit
+  SET status = 'succeeded', terminal = '{"status":"succeeded"}'::jsonb,
+      completion_artifact_id = v_artifact_id, terminal_at = v_now
+  WHERE audit.id = p_runtime_audit_id AND audit.status = 'claiming';
+  UPDATE public.work_package_local_run_evidence evidence
+  SET state = 'terminal', terminal = '{"status":"succeeded"}'::jsonb,
+      completion_artifact_id = v_artifact_id, terminal_at = v_now
+  WHERE evidence.id = v_audit.local_run_evidence_id
+    AND evidence.claim_token = p_local_claim_token
+    AND evidence.claim_generation = p_local_claim_generation
+    AND evidence.state = 'claimed';
+  UPDATE public.agent_runs run
+  SET status = 'completed', completed_at = v_now, error_message = NULL
+  WHERE run.id = v_audit.agent_run_id AND run.status = 'running';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'packet success lost its running agent run'
+      USING ERRCODE = '40001';
+  END IF;
+  RETURN v_artifact_id;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.finalize_packet_failure_v2(
+  p_runtime_audit_id uuid,
+  p_local_claim_token uuid,
+  p_local_claim_generation bigint,
+  p_packet_claim_token uuid,
+  p_packet_claim_generation bigint,
+  p_failure_code text,
+  p_failure_stage text DEFAULT NULL
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_audit public.filesystem_mcp_runtime_audits%ROWTYPE;
+  v_now timestamptz := pg_catalog.clock_timestamp();
+  v_terminal jsonb;
+  v_marker jsonb;
+  v_disposition text;
+  v_delivery_state text;
+  v_coverage text;
+BEGIN
+  IF p_failure_code NOT IN (
+    'authorization_changed', 'execution_lease_expired',
+    'local_evidence_lease_expired', 'issuance_lease_expired',
+    'worker_stopped', 'preflight_failed', 'assembly_failed',
+    'submission_rejected', 'submission_uncertain', 'provider_response_invalid',
+    'external_repository_change_requires_review', 'post_submission_execution_failed'
+  ) OR (
+    p_failure_code = 'post_submission_execution_failed'
+    AND p_failure_stage NOT IN (
+      'sandbox_apply', 'validation', 'host_apply', 'repository_evidence',
+      'completion_preparation'
+    )
+  ) OR (p_failure_code <> 'post_submission_execution_failed' AND p_failure_stage IS NOT NULL) THEN
+    RAISE EXCEPTION 'packet failure is outside the closed terminal vocabulary'
+      USING ERRCODE = '22023';
+  END IF;
+  PERFORM forge.lock_live_packet_lifecycle_v2(
+    p_runtime_audit_id, p_local_claim_token, p_local_claim_generation,
+    p_packet_claim_token, p_packet_claim_generation
+  );
+  SELECT audit.* INTO STRICT v_audit
+  FROM public.filesystem_mcp_runtime_audits audit WHERE audit.id = p_runtime_audit_id;
+
+  IF v_audit.assembly IS NULL THEN
+    v_audit.assembly := pg_catalog.jsonb_build_object(
+      'state', 'not_assembled',
+      'failureStage', CASE
+        WHEN p_failure_code IN (
+          'authorization_changed', 'execution_lease_expired',
+          'local_evidence_lease_expired', 'issuance_lease_expired'
+        ) THEN 'claim' ELSE 'preflight' END
+    );
+  ELSIF v_audit.assembly->>'state' = 'assembling' THEN
+    v_audit.assembly := pg_catalog.jsonb_build_object(
+      'state', 'assembly_unconfirmed', 'failureStage', 'assembly',
+      'assemblyAttemptId', v_audit.assembly->>'assemblyAttemptId'
+    );
+  END IF;
+  IF v_audit.delivery IS NULL THEN
+    v_audit.delivery := '{"state":"not_exposed"}'::jsonb;
+  ELSIF v_audit.delivery->>'state' = 'submitting' THEN
+    v_audit.delivery := '{"state":"submission_uncertain"}'::jsonb;
+    p_failure_code := 'submission_uncertain';
+    p_failure_stage := NULL;
+  END IF;
+  v_terminal := pg_catalog.jsonb_build_object('status', 'failed', 'failureCode', p_failure_code);
+  IF p_failure_stage IS NOT NULL THEN
+    v_terminal := v_terminal || pg_catalog.jsonb_build_object('failureStage', p_failure_stage);
+  END IF;
+  v_delivery_state := v_audit.delivery->>'state';
+  v_coverage := v_audit.authorization_snapshot->>'coverageFingerprint';
+  v_disposition := CASE
+    WHEN v_audit.grant_mode = 'allow_once'
+      AND v_delivery_state IN ('not_exposed', 'submission_failed') THEN 'reapprove_allow_once'
+    WHEN v_audit.grant_mode = 'allow_once' THEN 'review_then_reapprove_allow_once'
+    WHEN v_delivery_state IN ('not_exposed', 'submission_failed') THEN 'retry_execution'
+    ELSE 'review_submission'
+  END;
+  v_marker := pg_catalog.jsonb_build_object(
+    'schemaVersion', 2, 'kind', 'packet_issuance',
+    'priorAgentRunId', v_audit.agent_run_id::text,
+    'priorRuntimeAuditId', v_audit.id::text,
+    'recoveryFailure', v_terminal, 'deliveryState', v_delivery_state,
+    'grantMode', v_audit.grant_mode, 'disposition', v_disposition,
+    'acknowledgedAt', NULL, 'acknowledgedByUserId', NULL,
+    'combinedRepositoryReviewFingerprint', v_coverage,
+    'markerFingerprint', v_coverage, 'policyFingerprint', v_coverage,
+    'coverageFingerprint', v_coverage, 'autoRetryable', false
+  );
+
+  UPDATE public.filesystem_mcp_runtime_audits audit
+  SET status = 'failed', assembly = v_audit.assembly, delivery = v_audit.delivery,
+      terminal = v_terminal, terminal_at = v_now
+  WHERE audit.id = p_runtime_audit_id AND audit.status = 'claiming';
+  UPDATE public.work_package_local_run_evidence evidence
+  SET state = 'terminal', terminal = v_terminal, terminal_at = v_now
+  WHERE evidence.id = v_audit.local_run_evidence_id
+    AND evidence.claim_token = p_local_claim_token
+    AND evidence.claim_generation = p_local_claim_generation
+    AND evidence.state = 'claimed';
+  UPDATE public.agent_runs run
+  SET status = 'failed', completed_at = v_now,
+      error_message = 'Protected packet execution failed: ' || p_failure_code
+  WHERE run.id = v_audit.agent_run_id AND run.status = 'running';
+  UPDATE public.work_packages package
+  SET status = 'blocked', metadata = pg_catalog.jsonb_set(
+    package.metadata - 'executionLease', '{packet_issuance}', v_marker, true
+  )
+  WHERE package.id = v_audit.work_package_id AND package.status = 'running'
+    AND package.metadata->'executionLease'->>'runId' = v_audit.agent_run_id::text;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'packet failure lost its execution lease during finalization'
+      USING ERRCODE = '40001';
+  END IF;
+  RETURN true;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.recover_stale_local_lifecycle_v2(
+  p_local_run_evidence_id uuid
+)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_local public.work_package_local_run_evidence%ROWTYPE;
+  v_package public.work_packages%ROWTYPE;
+  v_project_id uuid;
+  v_now timestamptz := pg_catalog.clock_timestamp();
+  v_failure_code text;
+  v_terminal jsonb;
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'local recovery requires the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'S4 local recovery is disabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
+  SELECT evidence.* INTO STRICT v_local
+  FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = p_local_run_evidence_id;
+  IF EXISTS (
+    SELECT 1 FROM public.filesystem_mcp_runtime_audits audit
+    WHERE audit.protocol_version = 2 AND audit.local_run_evidence_id = v_local.id
+  ) THEN
+    RAISE EXCEPTION 'packet-linked local evidence must delegate to packet recovery'
+      USING ERRCODE = '55000';
+  END IF;
+  SELECT task.project_id INTO STRICT v_project_id
+  FROM public.tasks task WHERE task.id = v_local.task_id;
+  PERFORM 1 FROM public.projects project WHERE project.id = v_project_id FOR UPDATE;
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id = v_local.task_id AND task.project_id = v_project_id FOR UPDATE;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id = v_local.task_id ORDER BY package.id FOR UPDATE;
+  PERFORM 1 FROM public.agent_runs run
+  WHERE run.id = v_local.agent_run_id FOR UPDATE;
+  SELECT evidence.* INTO STRICT v_local
+  FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = p_local_run_evidence_id FOR UPDATE;
+  SELECT package.* INTO STRICT v_package
+  FROM public.work_packages package WHERE package.id = v_local.work_package_id;
+
+  IF v_local.state = 'claimed' THEN
+    IF forge.s4_execution_lease_live_v1(v_package.metadata, v_local.agent_run_id, v_now)
+       AND v_local.lease_expires_at > v_now THEN
+      RETURN 'not_stale';
+    END IF;
+    v_failure_code := CASE
+      WHEN NOT forge.s4_execution_lease_live_v1(
+        v_package.metadata, v_local.agent_run_id, v_now
+      ) THEN 'execution_lease_expired'
+      ELSE 'local_evidence_lease_expired'
+    END;
+    v_terminal := pg_catalog.jsonb_build_object(
+      'status', 'failed', 'failureCode', v_failure_code
+    );
+    UPDATE public.work_package_local_run_evidence evidence
+    SET state = 'uncertain', terminal = v_terminal, terminal_at = v_now
+    WHERE evidence.id = v_local.id AND evidence.state = 'claimed';
+    v_local.terminal := v_terminal;
+  ELSIF v_local.terminal IS NULL THEN
+    RAISE EXCEPTION 'terminal local evidence is incomplete' USING ERRCODE = '55000';
+  END IF;
+
+  IF v_local.terminal->>'status' = 'succeeded' THEN
+    IF EXISTS (
+      SELECT 1 FROM public.agent_runs run
+      JOIN public.work_packages package ON package.id = run.work_package_id
+      WHERE run.id = v_local.agent_run_id
+        AND (run.status = 'running' OR package.status = 'running')
+    ) THEN
+      RETURN 'terminal_success_pending_handoff';
+    END IF;
+    RETURN 'repaired_terminal_success';
+  END IF;
+  UPDATE public.agent_runs run
+  SET status = 'failed', completed_at = COALESCE(run.completed_at, v_now),
+      error_message = 'Protected local execution failed: ' || (v_local.terminal->>'failureCode')
+  WHERE run.id = v_local.agent_run_id AND run.status = 'running';
+  UPDATE public.work_packages package
+  SET status = 'blocked', metadata = pg_catalog.jsonb_set(
+    package.metadata - 'executionLease', '{local_effect_recovery}',
+    pg_catalog.jsonb_build_object(
+      'schemaVersion', 2, 'kind', 'local_lifecycle',
+      'localRunEvidenceId', v_local.id::text,
+      'failureCode', v_local.terminal->>'failureCode', 'autoRetryable', false
+    ), true
+  )
+  WHERE package.id = v_local.work_package_id AND package.status = 'running'
+    AND (
+      package.metadata->'executionLease'->>'runId' = v_local.agent_run_id::text
+      OR NOT package.metadata ? 'executionLease'
+    );
+  RETURN CASE WHEN v_local.state = 'claimed'
+    THEN 'recovered_stale_failure' ELSE 'repaired_terminal_failure' END;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.recover_stale_packet_lifecycle_v2(
+  p_runtime_audit_id uuid
+)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_audit public.filesystem_mcp_runtime_audits%ROWTYPE;
+  v_local public.work_package_local_run_evidence%ROWTYPE;
+  v_project_id uuid;
+  v_package public.work_packages%ROWTYPE;
+  v_now timestamptz := pg_catalog.clock_timestamp();
+  v_failure_code text;
+  v_terminal jsonb;
+  v_marker jsonb;
+  v_delivery_state text;
+  v_disposition text;
+  v_coverage text;
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'packet recovery requires the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'S4 packet recovery is disabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
+  SELECT audit.* INTO STRICT v_audit
+  FROM public.filesystem_mcp_runtime_audits audit
+  WHERE audit.id = p_runtime_audit_id AND audit.protocol_version = 2;
+  SELECT task.project_id INTO STRICT v_project_id
+  FROM public.tasks task WHERE task.id = v_audit.task_id;
+
+  PERFORM 1 FROM public.projects project WHERE project.id = v_project_id FOR UPDATE;
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id = v_audit.task_id AND task.project_id = v_project_id FOR UPDATE;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id = v_audit.task_id ORDER BY package.id FOR UPDATE;
+  PERFORM 1 FROM public.agent_runs run
+  WHERE run.id = v_audit.agent_run_id AND run.task_id = v_audit.task_id
+    AND run.work_package_id = v_audit.work_package_id FOR UPDATE;
+  SELECT evidence.* INTO STRICT v_local
+  FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = v_audit.local_run_evidence_id
+    AND evidence.agent_run_id = v_audit.agent_run_id
+  FOR UPDATE;
+  SELECT audit.* INTO STRICT v_audit
+  FROM public.filesystem_mcp_runtime_audits audit
+  WHERE audit.id = p_runtime_audit_id FOR UPDATE;
+  SELECT package.* INTO STRICT v_package
+  FROM public.work_packages package WHERE package.id = v_audit.work_package_id;
+
+  IF v_audit.status IN ('succeeded', 'failed') THEN
+    IF v_audit.terminal IS NULL OR v_audit.terminal_at IS NULL THEN
+      RAISE EXCEPTION 'terminal packet audit is incomplete' USING ERRCODE = '55000';
+    END IF;
+    IF v_local.state = 'claimed' THEN
+      UPDATE public.work_package_local_run_evidence evidence
+      SET state = CASE WHEN v_audit.status = 'succeeded' THEN 'terminal' ELSE 'uncertain' END,
+          terminal = v_audit.terminal,
+          terminal_at = v_now
+      WHERE evidence.id = v_local.id AND evidence.state = 'claimed';
+    END IF;
+    IF v_audit.status = 'succeeded' THEN
+      IF v_audit.terminal <> '{"status":"succeeded"}'::jsonb
+         OR v_audit.assembly->>'state' <> 'assembled'
+         OR v_audit.delivery->>'state' <> 'submitted' THEN
+        RAISE EXCEPTION 'terminal success evidence is incoherent' USING ERRCODE = '55000';
+      END IF;
+      IF EXISTS (
+        SELECT 1 FROM public.agent_runs run
+        JOIN public.work_packages package ON package.id = run.work_package_id
+        WHERE run.id = v_audit.agent_run_id
+          AND (run.status = 'running' OR package.status = 'running')
+      ) THEN
+        RETURN 'terminal_success_pending_handoff';
+      END IF;
+      RETURN 'repaired_terminal_success';
+    END IF;
+    v_terminal := v_audit.terminal;
+  ELSE
+    IF v_audit.status <> 'claiming' THEN
+      RAISE EXCEPTION 'packet audit is outside the recoverable lifecycle'
+        USING ERRCODE = '55000';
+    END IF;
+    IF forge.s4_execution_lease_live_v1(v_package.metadata, v_audit.agent_run_id, v_now)
+       AND v_local.state = 'claimed' AND v_local.lease_expires_at > v_now
+       AND v_audit.lease_expires_at > v_now THEN
+      RETURN 'not_stale';
+    END IF;
+    v_failure_code := CASE
+      WHEN NOT forge.s4_execution_lease_live_v1(
+        v_package.metadata, v_audit.agent_run_id, v_now
+      ) THEN 'execution_lease_expired'
+      WHEN v_local.state <> 'claimed' OR v_local.lease_expires_at <= v_now
+        THEN 'local_evidence_lease_expired'
+      WHEN v_audit.lease_expires_at <= v_now THEN 'issuance_lease_expired'
+      ELSE 'worker_stopped'
+    END;
+    IF v_audit.assembly IS NULL THEN
+      v_audit.assembly := pg_catalog.jsonb_build_object(
+        'state', 'not_assembled', 'failureStage', 'claim'
+      );
+    ELSIF v_audit.assembly->>'state' = 'assembling' THEN
+      v_audit.assembly := pg_catalog.jsonb_build_object(
+        'state', 'assembly_unconfirmed', 'failureStage', 'assembly',
+        'assemblyAttemptId', v_audit.assembly->>'assemblyAttemptId'
+      );
+    END IF;
+    IF v_audit.delivery IS NULL THEN
+      v_audit.delivery := '{"state":"not_exposed"}'::jsonb;
+    ELSIF v_audit.delivery->>'state' = 'submitting' THEN
+      v_audit.delivery := '{"state":"submission_uncertain"}'::jsonb;
+      v_failure_code := 'submission_uncertain';
+    END IF;
+    v_terminal := pg_catalog.jsonb_build_object(
+      'status', 'failed', 'failureCode', v_failure_code
+    );
+    UPDATE public.filesystem_mcp_runtime_audits audit
+    SET status = 'failed', assembly = v_audit.assembly, delivery = v_audit.delivery,
+        terminal = v_terminal, terminal_at = v_now
+    WHERE audit.id = p_runtime_audit_id AND audit.status = 'claiming';
+    UPDATE public.work_package_local_run_evidence evidence
+    SET state = 'uncertain', terminal = v_terminal, terminal_at = v_now
+    WHERE evidence.id = v_local.id AND evidence.state = 'claimed';
+  END IF;
+
+  v_delivery_state := v_audit.delivery->>'state';
+  v_coverage := v_audit.authorization_snapshot->>'coverageFingerprint';
+  v_disposition := CASE
+    WHEN v_audit.grant_mode = 'allow_once'
+      AND v_delivery_state IN ('not_exposed', 'submission_failed') THEN 'reapprove_allow_once'
+    WHEN v_audit.grant_mode = 'allow_once' THEN 'review_then_reapprove_allow_once'
+    WHEN v_delivery_state IN ('not_exposed', 'submission_failed') THEN 'retry_execution'
+    ELSE 'review_submission'
+  END;
+  v_marker := pg_catalog.jsonb_build_object(
+    'schemaVersion', 2, 'kind', 'packet_issuance',
+    'priorAgentRunId', v_audit.agent_run_id::text,
+    'priorRuntimeAuditId', v_audit.id::text,
+    'recoveryFailure', v_terminal, 'deliveryState', v_delivery_state,
+    'grantMode', v_audit.grant_mode, 'disposition', v_disposition,
+    'acknowledgedAt', NULL, 'acknowledgedByUserId', NULL,
+    'combinedRepositoryReviewFingerprint', v_coverage,
+    'markerFingerprint', v_coverage, 'policyFingerprint', v_coverage,
+    'coverageFingerprint', v_coverage, 'autoRetryable', false
+  );
+  UPDATE public.agent_runs run
+  SET status = 'failed', completed_at = COALESCE(run.completed_at, v_now),
+      error_message = 'Protected packet execution failed: ' || (v_terminal->>'failureCode')
+  WHERE run.id = v_audit.agent_run_id AND run.status = 'running';
+  UPDATE public.work_packages package
+  SET status = 'blocked', metadata = pg_catalog.jsonb_set(
+    package.metadata - 'executionLease', '{packet_issuance}', v_marker, true
+  )
+  WHERE package.id = v_audit.work_package_id AND package.status = 'running'
+    AND (
+      package.metadata->'executionLease'->>'runId' = v_audit.agent_run_id::text
+      OR NOT package.metadata ? 'executionLease'
+    );
+  RETURN CASE WHEN v_audit.status = 'failed'
+    THEN 'repaired_terminal_failure' ELSE 'recovered_stale_failure' END;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.recover_linked_s4_lifecycle_v2(p_agent_run_id uuid)
+RETURNS TABLE (result text, completion_artifact_id uuid)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_audit_id uuid;
+  v_local_id uuid;
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'linked-v2 cleanup requires the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  SELECT evidence.id INTO v_local_id
+  FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.agent_run_id = p_agent_run_id;
+  IF v_local_id IS NULL THEN
+    result := 'not_linked_v2';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+  SELECT audit.id INTO v_audit_id
+  FROM public.filesystem_mcp_runtime_audits audit
+  WHERE audit.protocol_version = 2 AND audit.local_run_evidence_id = v_local_id
+    AND audit.operation = 'context_packet';
+  IF v_audit_id IS NULL THEN
+    result := forge.recover_stale_local_lifecycle_v2(v_local_id);
+  ELSE
+    result := forge.recover_stale_packet_lifecycle_v2(v_audit_id);
+  END IF;
+  SELECT evidence.completion_artifact_id INTO completion_artifact_id
+  FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = v_local_id;
+  RETURN NEXT;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.cas_packet_reapproval_v2(
+  p_task_id uuid,
+  p_work_package_id uuid,
+  p_prior_runtime_audit_id uuid,
+  p_expected_marker_fingerprint text,
+  p_new_decision_id uuid
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_project_id uuid;
+  v_prior public.filesystem_mcp_runtime_audits%ROWTYPE;
+  v_decision public.filesystem_mcp_grant_approvals%ROWTYPE;
+  v_pointer public.filesystem_mcp_current_decision_pointers%ROWTYPE;
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'packet reapproval requires the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  IF p_expected_marker_fingerprint !~ '^sha256:[0-9a-f]{64}$'
+     OR NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'packet reapproval input or Step 0 authority is invalid'
+      USING ERRCODE = '55000';
+  END IF;
+  SELECT task.project_id INTO STRICT v_project_id
+  FROM public.tasks task WHERE task.id = p_task_id;
+  PERFORM 1 FROM public.projects project WHERE project.id = v_project_id FOR UPDATE;
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id = p_task_id AND task.project_id = v_project_id FOR UPDATE;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id = p_task_id ORDER BY package.id FOR UPDATE;
+  SELECT decision.* INTO STRICT v_decision
+  FROM public.filesystem_mcp_grant_approvals decision
+  WHERE decision.id = p_new_decision_id FOR UPDATE;
+  SELECT pointer.* INTO STRICT v_pointer
+  FROM public.filesystem_mcp_current_decision_pointers pointer
+  WHERE pointer.work_package_id = p_work_package_id FOR UPDATE;
+  SELECT audit.* INTO STRICT v_prior
+  FROM public.filesystem_mcp_runtime_audits audit
+  WHERE audit.id = p_prior_runtime_audit_id
+    AND audit.task_id = p_task_id AND audit.work_package_id = p_work_package_id
+    AND audit.protocol_version = 2 AND audit.status = 'failed'
+  FOR UPDATE;
+  IF v_prior.grant_mode <> 'allow_once'
+     OR v_decision.project_id <> v_project_id
+     OR v_decision.task_id <> p_task_id
+     OR v_decision.work_package_id <> p_work_package_id
+     OR v_decision.decision_scope <> 'package'
+     OR v_decision.decision <> 'approved'
+     OR v_decision.grant_nonce IS NULL
+     OR v_decision.grant_decision_revision <= v_prior.grant_decision_revision
+     OR v_pointer.current_decision_id <> v_decision.id
+     OR v_pointer.current_decision_revision <> v_decision.grant_decision_revision
+     OR v_pointer.current_decision_fingerprint <> v_decision.pointer_fingerprint
+     OR EXISTS (
+       SELECT 1 FROM public.filesystem_mcp_decision_nonce_claims claim
+       WHERE claim.grant_decision_nonce = v_decision.grant_nonce
+     ) THEN
+    RAISE EXCEPTION 'fresh allow-once reapproval is not the exact current authority'
+      USING ERRCODE = '40001';
+  END IF;
+  UPDATE public.work_packages package
+  SET status = 'ready', metadata = package.metadata - 'packet_issuance'
+  WHERE package.id = p_work_package_id AND package.task_id = p_task_id
+    AND package.status = 'blocked'
+    AND package.metadata->'packet_issuance'->>'priorRuntimeAuditId' = p_prior_runtime_audit_id::text
+    AND package.metadata->'packet_issuance'->>'markerFingerprint' = p_expected_marker_fingerprint;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'packet recovery marker changed before reapproval compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+  RETURN true;
 END;
 $$;
 --> statement-breakpoint
@@ -1300,12 +2846,7 @@ $$;
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION forge.bind_architect_replan_entry_v1(
   p_task_id uuid,
-  p_agent_run_id uuid,
-  p_plan_artifact_id uuid,
-  p_plan_version bigint,
-  p_entry_id text,
-  p_content_digest text,
-  p_digest_key_id text
+  p_agent_run_id uuid
 )
 RETURNS uuid
 LANGUAGE plpgsql
@@ -1314,6 +2855,10 @@ SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_reference_id uuid := pg_catalog.gen_random_uuid();
+  v_plan_artifact_id uuid;
+  v_plan_version bigint;
+  v_content_digest text;
+  v_digest_key_id text;
 BEGIN
   IF session_user <> 'forge_architect_plan_writer' THEN
     RAISE EXCEPTION 'Architect replan binding requires the protected plan writer login'
@@ -1339,7 +2884,16 @@ BEGIN
       USING ERRCODE = '40001';
   END IF;
 
-  PERFORM 1
+  SELECT
+    entry.plan_artifact_id,
+    entry.plan_version,
+    entry.content_digest,
+    entry.digest_key_id
+  INTO
+    v_plan_artifact_id,
+    v_plan_version,
+    v_content_digest,
+    v_digest_key_id
   FROM public.architect_plan_entries entry
   JOIN public.architect_plan_versions version
     ON version.task_id = entry.task_id
@@ -1352,22 +2906,20 @@ BEGIN
    AND source_run.agent_type = 'architect'
    AND source_run.status = 'completed'
   WHERE entry.task_id = p_task_id
-    AND entry.plan_artifact_id = p_plan_artifact_id
-    AND entry.plan_version = p_plan_version
     AND entry.entry_id = 'plan_body:000000'
-    AND p_entry_id = 'plan_body:000000'
     AND entry.entry_kind = 'plan_body'
     AND entry.agent IS NULL
     AND entry.requirement_key IS NULL
     AND entry.binding_fingerprint IS NULL
     AND NOT entry.projection_eligible
-    AND entry.content_digest = p_content_digest
-    AND entry.digest_key_id = p_digest_key_id
     AND source_run.id <> p_agent_run_id
     AND NOT EXISTS (
       SELECT 1 FROM public.architect_plan_versions newer
-      WHERE newer.task_id = p_task_id AND newer.plan_version > p_plan_version
+      WHERE newer.task_id = p_task_id
+        AND newer.plan_version > entry.plan_version
     )
+  ORDER BY entry.plan_version DESC
+  LIMIT 1
   FOR KEY SHARE OF entry, version, artifact, source_run;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'Architect replan source is not the exact latest protected plan body'
@@ -1380,8 +2932,8 @@ BEGIN
     content_digest, digest_key_id
   ) VALUES (
     v_reference_id, 'architect_replan', p_task_id, NULL, p_agent_run_id,
-    p_plan_artifact_id, p_plan_version, p_entry_id, 'architect', NULL, NULL,
-    p_content_digest, p_digest_key_id
+    v_plan_artifact_id, v_plan_version, 'plan_body:000000', 'architect', NULL, NULL,
+    v_content_digest, v_digest_key_id
   );
   RETURN v_reference_id;
 END;
@@ -1397,12 +2949,13 @@ GRANT SELECT ON public.tasks, public.projects, public.work_packages,
   public.project_filesystem_current_decision_pointers,
   public.filesystem_mcp_runtime_audits TO forge_s4_routines_owner;
 GRANT SELECT, UPDATE ON public.sessions TO forge_s4_routines_owner;
+GRANT UPDATE ON public.filesystem_mcp_runtime_audits TO forge_s4_routines_owner;
 GRANT UPDATE ON public.tasks, public.projects, public.work_packages,
   public.agent_runs, public.filesystem_mcp_grant_approvals,
   public.filesystem_mcp_current_decision_pointers,
   public.project_filesystem_grant_decisions,
   public.project_filesystem_current_decision_pointers TO forge_s4_routines_owner;
-GRANT INSERT ON public.artifacts, public.filesystem_mcp_runtime_audits
+GRANT INSERT ON public.agent_runs, public.artifacts, public.filesystem_mcp_runtime_audits
   TO forge_s4_routines_owner;
 --> statement-breakpoint
 REVOKE ALL ON public.architect_plan_versions, public.architect_plan_entries,
@@ -1419,20 +2972,56 @@ REVOKE ALL ON FUNCTION forge.guard_architect_plan_public_artifact_v1() FROM PUBL
 REVOKE ALL ON FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.resolve_architect_plan_entry_v1(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.create_local_run_evidence_v1(uuid,uuid,integer) FROM PUBLIC;
-REVOKE ALL ON FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,integer,text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,uuid,integer,text[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.validate_packet_authorization_snapshot_v2(jsonb,text,text,uuid,bigint,uuid,bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.guard_packet_authorization_v2() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.s4_execution_lease_live_v1(jsonb,uuid,timestamptz) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.s4_runtime_mode_v1() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.claim_local_lifecycle_v2(uuid,uuid,integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.claim_packet_lifecycle_v2(uuid,uuid,uuid,uuid,integer,integer,text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.claim_work_package_lifecycle_v2(text,uuid,uuid,timestamptz,uuid,text,uuid,integer,uuid,text,text,integer,uuid,uuid,uuid,integer,integer,text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.lock_live_packet_lifecycle_v2(uuid,uuid,bigint,uuid,bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.lock_live_local_lifecycle_v2(uuid,uuid,bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.heartbeat_local_lifecycle_v2(uuid,uuid,bigint,integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.heartbeat_packet_lifecycle_v2(uuid,uuid,bigint,uuid,bigint,integer,integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.begin_packet_assembly_v2(uuid,uuid,bigint,uuid,bigint,uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.complete_packet_assembly_v2(uuid,uuid,bigint,uuid,bigint,uuid,text,integer,integer,integer,jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.begin_packet_delivery_v2(uuid,uuid,bigint,uuid,bigint,uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.complete_packet_delivery_v2(uuid,uuid,bigint,uuid,bigint,uuid,text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.finalize_local_success_v2(uuid,uuid,bigint,text,text,jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.finalize_local_failure_v2(uuid,uuid,bigint,text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.finalize_packet_success_v2(uuid,uuid,bigint,uuid,bigint,text,text,jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.finalize_packet_failure_v2(uuid,uuid,bigint,uuid,bigint,text,text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.recover_stale_local_lifecycle_v2(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.recover_stale_packet_lifecycle_v2(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.recover_linked_s4_lifecycle_v2(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.cas_packet_reapproval_v2(uuid,uuid,uuid,text,uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) FROM PUBLIC;
-REVOKE ALL ON FUNCTION forge.bind_architect_replan_entry_v1(uuid,uuid,uuid,bigint,text,text,text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.bind_architect_replan_entry_v1(uuid,uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) TO forge_architect_plan_writer;
 GRANT EXECUTE ON FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) TO forge_architect_plan_history_reader;
 GRANT EXECUTE ON FUNCTION forge.resolve_architect_plan_entry_v1(uuid) TO forge_architect_plan_resolver;
-GRANT EXECUTE ON FUNCTION forge.create_local_run_evidence_v1(uuid,uuid,integer) TO forge_packet_issuer;
-GRANT EXECUTE ON FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,integer,text[]) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.s4_runtime_mode_v1() TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.claim_work_package_lifecycle_v2(text,uuid,uuid,timestamptz,uuid,text,uuid,integer,uuid,text,text,integer,uuid,uuid,uuid,integer,integer,text[]) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.heartbeat_local_lifecycle_v2(uuid,uuid,bigint,integer) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.heartbeat_packet_lifecycle_v2(uuid,uuid,bigint,uuid,bigint,integer,integer) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.begin_packet_assembly_v2(uuid,uuid,bigint,uuid,bigint,uuid) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.complete_packet_assembly_v2(uuid,uuid,bigint,uuid,bigint,uuid,text,integer,integer,integer,jsonb) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.begin_packet_delivery_v2(uuid,uuid,bigint,uuid,bigint,uuid) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.complete_packet_delivery_v2(uuid,uuid,bigint,uuid,bigint,uuid,text) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.finalize_local_success_v2(uuid,uuid,bigint,text,text,jsonb) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.finalize_local_failure_v2(uuid,uuid,bigint,text) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.finalize_packet_success_v2(uuid,uuid,bigint,uuid,bigint,text,text,jsonb) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.finalize_packet_failure_v2(uuid,uuid,bigint,uuid,bigint,text,text) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.recover_linked_s4_lifecycle_v2(uuid) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.cas_packet_reapproval_v2(uuid,uuid,uuid,text,uuid) TO forge_packet_issuer;
 GRANT EXECUTE ON FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) TO forge_packet_issuer;
-GRANT EXECUTE ON FUNCTION forge.bind_architect_replan_entry_v1(uuid,uuid,uuid,bigint,text,text,text) TO forge_architect_plan_writer;
+GRANT EXECUTE ON FUNCTION forge.bind_architect_replan_entry_v1(uuid,uuid) TO forge_architect_plan_writer;
 --> statement-breakpoint
+-- The bootstrap fence temporarily gives the incoming owner CREATE on the two
+-- containing schemas because PostgreSQL requires it for SET OWNER. The
+-- finalizer revokes both grants before it verifies the permanent boundary.
 ALTER TABLE public.architect_plan_versions OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.architect_plan_entries OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.architect_plan_execution_references OWNER TO forge_s4_routines_owner;
@@ -1450,10 +3039,31 @@ ALTER FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) OWNER TO 
 ALTER FUNCTION forge.resolve_architect_plan_entry_v1(uuid) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.create_local_run_evidence_v1(uuid,uuid,integer) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.validate_packet_authorization_snapshot_v2(jsonb,text,text,uuid,bigint,uuid,bigint) OWNER TO forge_s4_routines_owner;
-ALTER FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,integer,text[]) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,uuid,integer,text[]) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.guard_packet_authorization_v2() OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.s4_execution_lease_live_v1(jsonb,uuid,timestamptz) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.s4_runtime_mode_v1() OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.claim_local_lifecycle_v2(uuid,uuid,integer) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.claim_packet_lifecycle_v2(uuid,uuid,uuid,uuid,integer,integer,text[]) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.claim_work_package_lifecycle_v2(text,uuid,uuid,timestamptz,uuid,text,uuid,integer,uuid,text,text,integer,uuid,uuid,uuid,integer,integer,text[]) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.lock_live_packet_lifecycle_v2(uuid,uuid,bigint,uuid,bigint) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.lock_live_local_lifecycle_v2(uuid,uuid,bigint) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.heartbeat_local_lifecycle_v2(uuid,uuid,bigint,integer) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.heartbeat_packet_lifecycle_v2(uuid,uuid,bigint,uuid,bigint,integer,integer) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.begin_packet_assembly_v2(uuid,uuid,bigint,uuid,bigint,uuid) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.complete_packet_assembly_v2(uuid,uuid,bigint,uuid,bigint,uuid,text,integer,integer,integer,jsonb) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.begin_packet_delivery_v2(uuid,uuid,bigint,uuid,bigint,uuid) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.complete_packet_delivery_v2(uuid,uuid,bigint,uuid,bigint,uuid,text) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.finalize_local_success_v2(uuid,uuid,bigint,text,text,jsonb) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.finalize_local_failure_v2(uuid,uuid,bigint,text) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.finalize_packet_success_v2(uuid,uuid,bigint,uuid,bigint,text,text,jsonb) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.finalize_packet_failure_v2(uuid,uuid,bigint,uuid,bigint,text,text) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.recover_stale_local_lifecycle_v2(uuid) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.recover_stale_packet_lifecycle_v2(uuid) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.recover_linked_s4_lifecycle_v2(uuid) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.cas_packet_reapproval_v2(uuid,uuid,uuid,text,uuid) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) OWNER TO forge_s4_routines_owner;
-ALTER FUNCTION forge.bind_architect_replan_entry_v1(uuid,uuid,uuid,bigint,text,text,text) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.bind_architect_replan_entry_v1(uuid,uuid) OWNER TO forge_s4_routines_owner;
 --> statement-breakpoint
 SELECT public.forge_finalize_epic_172_s4_owner_bootstrap_v1();

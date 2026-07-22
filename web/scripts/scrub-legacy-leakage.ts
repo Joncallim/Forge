@@ -22,7 +22,7 @@ const MAX_REDIS_SCAN_ITERATIONS = 10_000
 
 export type LegacyLeakageScrubCli = Readonly<{
   actor: string
-  authorizationReceiptId?: string
+  authorizationReceiptId: string
   batchSize: number
   maxBatches: number
   mode: LegacyLeakageScrubMode
@@ -34,7 +34,8 @@ export function legacyLeakageScrubUsage(): string {
   return `Legacy task-log, artifact, and Redis leakage scrub
 
 Dry-run (read-only):
-  npm run protocol:scrub-legacy-leakage -- --actor OPERATOR
+  npm run protocol:scrub-legacy-leakage -- --actor OPERATOR \\
+    --authorization-receipt RECEIPT_ID
 
 First apply (requires the signed S4 producers-disabled receipt):
   npm run protocol:scrub-legacy-leakage -- --actor OPERATOR --apply \\
@@ -49,9 +50,9 @@ Options:
   --max-batches N      Phase batches processed per invocation (default 10, maximum 1000)
   --sentinel TEXT      Fail the v2 Redis scan if TEXT appears; may be repeated
 
-Apply and resume mutate only task_logs, artifacts, the operation checkpoint in
-app_settings, and legacy forge:task:{taskId}:history/:seq Redis keys. Protected
-Architect plan entries are never selected or updated.
+Apply and resume mutate only task_logs, artifacts, work_packages, the operation
+checkpoint in app_settings, and legacy forge:task:{taskId}:history/:seq Redis
+keys. Protected Architect plan entries are never selected or updated.
 
 Environment:
   FORGE_DATABASE_ADMIN_URL  privileged PostgreSQL connection for the scrub
@@ -95,8 +96,11 @@ export function parseLegacyLeakageScrubArgs(argv: readonly string[]): LegacyLeak
   }
 
   if (actor.trim() === '') throw new Error(`--actor is required.\n\n${legacyLeakageScrubUsage()}`)
-  if (mode !== 'dry-run' && (!operationId || !authorizationReceiptId)) {
-    throw new Error('--operation and --authorization-receipt are required for apply and resume.')
+  if (!authorizationReceiptId) {
+    throw new Error('--authorization-receipt is required for dry-run, apply, and resume.')
+  }
+  if (mode !== 'dry-run' && !operationId) {
+    throw new Error('--operation is required for apply and resume.')
   }
 
   return {
@@ -152,6 +156,14 @@ function artifactRow(row: Record<string, unknown>): LegacyLeakageScrubRow {
   }
 }
 
+function workPackageRow(row: Record<string, unknown>): LegacyLeakageScrubRow {
+  return {
+    id: String(row.id),
+    kind: 'work_package',
+    metadata: row.metadata as Record<string, unknown>,
+  }
+}
+
 export function createLegacyLeakagePostgresAdapter(
   sql: ReturnType<typeof postgres>,
 ): LegacyLeakageScrubDatabase {
@@ -165,11 +177,44 @@ export function createLegacyLeakagePostgresAdapter(
 
     async verifyDrainAuthorization(receiptId) {
       const rows = await sql`
-        select id
-        from forge_epic_172_release_evidence
-        where id::text = ${receiptId}
-          and evidence_kind = 's4_producers_disabled'
-          and owner_slice = 's4'
+        select receipt.id
+        from forge_epic_172_release_evidence receipt
+        join forge_epic_172_release_evidence predecessor
+          on receipt.predecessor_receipt_ids = jsonb_build_array(predecessor.id::text)
+        join forge_epic_172_enablement_state enablement
+          on enablement.singleton_id = 'epic-172'
+        where receipt.id::text = ${receiptId}
+          and receipt.manifest_version = 1
+          and receipt.evidence_kind = 's4_producers_disabled'
+          and receipt.owner_issue = 179
+          and receipt.owner_slice = 's4'
+          and jsonb_typeof(receipt.exact_builds) = 'array'
+          and jsonb_array_length(receipt.exact_builds) > 0
+          and receipt.reviewed_sha ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+          and receipt.epoch > 0
+          and receipt.signature_domain = 'forge:epic-172-release-evidence:v1'
+          and receipt.envelope_version = 1
+          and receipt.envelope_digest ~ '^[0-9a-f]{64}$'
+          and octet_length(receipt.detached_signature) = 64
+          and predecessor.evidence_kind = 's4_expand'
+          and predecessor.owner_issue = 179
+          and predecessor.owner_slice = 's4'
+          and predecessor.exact_builds = receipt.exact_builds
+          and predecessor.reviewed_sha = receipt.reviewed_sha
+          and predecessor.epoch = receipt.epoch
+          and enablement.state = 'disabled'
+          and (
+            select array_agg(claim.value ->> 'name' order by claim.ordinal)
+            from jsonb_array_elements(receipt.required_evidence)
+              with ordinality as claim(value, ordinal)
+          ) = array[
+            's4_expand_receipt',
+            'legacy_credentials_publishers_and_sessions_drained',
+            'expansion_journal_reconciled_through_watermark',
+            'project_root_bindings_complete',
+            'legacy_prompt_and_event_data_zero_scan_green',
+            'all_v2_producers_disabled'
+          ]::text[]
         limit 1
       `
       return rows.length === 1
@@ -208,6 +253,18 @@ export function createLegacyLeakagePostgresAdapter(
             `
         return rows.map(taskLogRow)
       }
+      if (phase === 'work_packages') {
+        const rows = afterId === null
+          ? await sql<Record<string, unknown>[]>`
+              select id::text as id, metadata
+              from work_packages order by id limit ${limit}
+            `
+          : await sql<Record<string, unknown>[]>`
+              select id::text as id, metadata
+              from work_packages where id > ${afterId}::uuid order by id limit ${limit}
+            `
+        return rows.map(workPackageRow)
+      }
       const rows = afterId === null
         ? await sql<Record<string, unknown>[]>`
             select a.id::text as id, a.content, a.metadata,
@@ -215,10 +272,13 @@ export function createLegacyLeakagePostgresAdapter(
                 a.artifact_type = 'adr_text'
                 and r.agent_type = 'architect'
                 and a.content <> ${ARCHITECT_PLAN_HEADER}
-                and not (coalesce(a.metadata, '{}'::jsonb) @> '{"historyAvailable":true}'::jsonb)
+                and version.plan_artifact_id is null
               ) as "replaceContent"
             from artifacts a
             join agent_runs r on r.id = a.agent_run_id
+            left join (
+              select distinct plan_artifact_id from architect_plan_versions
+            ) version on version.plan_artifact_id = a.id
             order by a.id limit ${limit}
           `
         : await sql<Record<string, unknown>[]>`
@@ -227,10 +287,13 @@ export function createLegacyLeakagePostgresAdapter(
                 a.artifact_type = 'adr_text'
                 and r.agent_type = 'architect'
                 and a.content <> ${ARCHITECT_PLAN_HEADER}
-                and not (coalesce(a.metadata, '{}'::jsonb) @> '{"historyAvailable":true}'::jsonb)
+                and version.plan_artifact_id is null
               ) as "replaceContent"
             from artifacts a
             join agent_runs r on r.id = a.agent_run_id
+            left join (
+              select distinct plan_artifact_id from architect_plan_versions
+            ) version on version.plan_artifact_id = a.id
             where a.id > ${afterId}::uuid order by a.id limit ${limit}
           `
       return rows.map(artifactRow)
@@ -250,21 +313,33 @@ export function createLegacyLeakagePostgresAdapter(
               select id::text as id, message, front_matter as "frontMatter", metadata
               from task_logs where id = ${input.row.id}::uuid for update
             `
+          : input.row.kind === 'work_package'
+            ? await transaction<Record<string, unknown>[]>`
+                select id::text as id, metadata
+                from work_packages where id = ${input.row.id}::uuid for update
+              `
           : await transaction<Record<string, unknown>[]>`
               select a.id::text as id, a.content, a.metadata,
                 (
                   a.artifact_type = 'adr_text'
                   and r.agent_type = 'architect'
                   and a.content <> ${ARCHITECT_PLAN_HEADER}
-                  and not (coalesce(a.metadata, '{}'::jsonb) @> '{"historyAvailable":true}'::jsonb)
+                  and version.plan_artifact_id is null
                 ) as "replaceContent"
               from artifacts a
               join agent_runs r on r.id = a.agent_run_id
+              left join (
+                select distinct plan_artifact_id from architect_plan_versions
+              ) version on version.plan_artifact_id = a.id
               where a.id = ${input.row.id}::uuid
               for update of a
             `
         if (sourceRows.length !== 1) return 'row_conflict' as const
-        const source = input.row.kind === 'task_log' ? taskLogRow(sourceRows[0]) : artifactRow(sourceRows[0])
+        const source = input.row.kind === 'task_log'
+          ? taskLogRow(sourceRows[0])
+          : input.row.kind === 'work_package'
+            ? workPackageRow(sourceRows[0])
+            : artifactRow(sourceRows[0])
         if (legacyLeakageRowFingerprint(source) !== input.expectedRowFingerprint) return 'row_conflict' as const
 
         if (input.row.kind === 'task_log') {
@@ -275,11 +350,18 @@ export function createLegacyLeakagePostgresAdapter(
                 metadata = ${transaction.json(input.row.metadata as never)}
             where id = ${input.row.id}::uuid
           `
-        } else {
+        } else if (input.row.kind === 'artifact') {
           await transaction`
             update artifacts
             set content = ${input.row.content},
                 metadata = ${input.row.metadata === null ? null : transaction.json(input.row.metadata as never)}
+            where id = ${input.row.id}::uuid
+          `
+        } else {
+          await transaction`
+            update work_packages
+            set metadata = ${transaction.json(input.row.metadata as never)},
+                updated_at = now()
             where id = ${input.row.id}::uuid
           `
         }

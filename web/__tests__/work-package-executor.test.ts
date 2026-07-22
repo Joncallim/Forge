@@ -15,6 +15,13 @@ const mocks = vi.hoisted(() => ({
   publishTaskEvent: vi.fn(),
   recordTaskLogBestEffort: vi.fn(),
   claimPacketAuthorization: vi.fn(),
+  beginPacketAssemblyV2: vi.fn(),
+  completePacketAssemblyV2: vi.fn(),
+  beginPacketDeliveryV2: vi.fn(),
+  completePacketDeliveryV2: vi.fn(),
+  architectPlanStorageConfiguration: vi.fn(),
+  bindArchitectPlanEntry: vi.fn(),
+  resolveArchitectPlanEntry: vi.fn(),
 }))
 
 vi.mock('ai', () => ({
@@ -42,7 +49,17 @@ vi.mock('@/worker/task-logs', () => ({
 }))
 
 vi.mock('@/lib/mcps/s4-protocol-store', () => ({
-  claimPacketAuthorization: mocks.claimPacketAuthorization,
+  architectPlanStorageConfiguration: mocks.architectPlanStorageConfiguration,
+  bindArchitectPlanEntry: mocks.bindArchitectPlanEntry,
+  resolveArchitectPlanEntry: mocks.resolveArchitectPlanEntry,
+}))
+
+vi.mock('@/lib/mcps/s4-lease', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/s4-lease')>(),
+  beginPacketAssemblyV2: mocks.beginPacketAssemblyV2,
+  completePacketAssemblyV2: mocks.completePacketAssemblyV2,
+  beginPacketDeliveryV2: mocks.beginPacketDeliveryV2,
+  completePacketDeliveryV2: mocks.completePacketDeliveryV2,
 }))
 
 vi.mock('@/worker/execution-context-packet', async (importOriginal) => {
@@ -58,14 +75,32 @@ import {
   executeWorkPackage,
   hasLocalConflictCopyPathSegment,
   parseWorkPackageExecutionPlan,
+  resolveProtectedArchitectPlanContext,
   resolveExecutionProviderConfigId,
   WorkPackageExecutionError,
   type WorkPackageExecutionContext,
+  type WorkPackageExecutionPreflight,
 } from '@/worker/work-package-executor'
 import { sanitizeWorkerMessage } from '@/worker/redaction'
 
 const now = new Date('2026-06-26T00:00:00.000Z')
 let tempRoot = ''
+
+function packetLifecycle(): NonNullable<WorkPackageExecutionContext['s4Lifecycle']> {
+  return {
+    kind: 'packet',
+    localRunEvidenceId: '00000000-0000-4000-8000-000000000032',
+    localClaimToken: '00000000-0000-4000-8000-000000000033',
+    localClaimGeneration: '1',
+    packet: {
+      runtimeAuditId: '00000000-0000-4000-8000-000000000030',
+      localClaimToken: '00000000-0000-4000-8000-000000000033',
+      localClaimGeneration: '1',
+      packetClaimToken: '00000000-0000-4000-8000-000000000031',
+      packetClaimGeneration: '1',
+    },
+  }
+}
 
 function immutableProjectAuthorityFromConfig(mcpConfig: unknown) {
   const config = mcpConfig && typeof mcpConfig === 'object' ? mcpConfig as Record<string, unknown> : {}
@@ -431,11 +466,111 @@ describe('executeWorkPackage', () => {
       claimToken: '00000000-0000-4000-8000-000000000031',
       localRunEvidenceId: '00000000-0000-4000-8000-000000000032',
     })
+    mocks.beginPacketAssemblyV2.mockResolvedValue(true)
+    mocks.completePacketAssemblyV2.mockResolvedValue(true)
+    mocks.beginPacketDeliveryV2.mockResolvedValue(true)
+    mocks.completePacketDeliveryV2.mockResolvedValue(true)
+    mocks.architectPlanStorageConfiguration.mockReturnValue({
+      mode: 'protected',
+      digestKey: Buffer.alloc(32, 7),
+      digestKeyId: 'test-key-v1',
+    })
+    mocks.bindArchitectPlanEntry.mockResolvedValue('00000000-0000-4000-8000-000000000040')
     tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-executor-test-'))
   })
 
   afterEach(async () => {
     if (tempRoot) await fs.rm(tempRoot, { recursive: true, force: true })
+  })
+
+  it('resolves protected prompt fragments only into the claimed run in memory', async () => {
+    const bindingFingerprint = `sha256:${'a'.repeat(64)}`
+    const references = [{
+      schemaVersion: 1 as const,
+      planArtifactId: '00000000-0000-4000-8000-000000000041',
+      planVersion: '1',
+      entryId: 'overlay:mcp-requirement-v1-test-1:frontend',
+      digestKeyId: 'test-key-v1',
+      contentDigest: `hmac-sha256:${'b'.repeat(64)}`,
+      requirementKey: 'mcp-requirement-v1-test-1',
+      bindingFingerprint,
+    }, {
+      schemaVersion: 1 as const,
+      planArtifactId: '00000000-0000-4000-8000-000000000041',
+      planVersion: '1',
+      entryId: 'subtask:inspect:frontend',
+      digestKeyId: 'test-key-v1',
+      contentDigest: `hmac-sha256:${'c'.repeat(64)}`,
+      requirementKey: 'mcp-requirement-v1-test-1',
+      bindingFingerprint,
+    }]
+    mocks.bindArchitectPlanEntry
+      .mockResolvedValueOnce('00000000-0000-4000-8000-000000000042')
+      .mockResolvedValueOnce('00000000-0000-4000-8000-000000000043')
+    mocks.resolveArchitectPlanEntry
+      .mockResolvedValueOnce({ entryId: references[0].entryId, content: 'Use the approved issue summary only.' })
+      .mockResolvedValueOnce({
+        entryId: references[1].entryId,
+        content: JSON.stringify({ id: 'inspect', agent: 'frontend', mcpCapabilities: ['github.issues.read'] }),
+      })
+    const fullContext = context({
+      workPackage: {
+        ...context().workPackage,
+        metadata: {
+          repositoryWrites: false,
+          architectPlanEntryReferences: references,
+          mcpPromptContextPolicy: { schemaVersion: 1, state: 'protected_references_available' },
+        },
+      },
+    })
+    const preflight = {
+      ...fullContext,
+      filesystemRuntime: { schemaVersion: 1, runtimeIssued: false, status: 'not_requested' },
+      projectFilesystemDecision: fullContext.projectFilesystemDecision ?? null,
+    } as WorkPackageExecutionPreflight & { validatedProjectRoot?: string }
+    delete preflight.validatedProjectRoot
+    const assertOwned = vi.fn().mockResolvedValue(undefined)
+
+    const resolved = await resolveProtectedArchitectPlanContext(preflight, {
+      agentRunId: fullContext.agentRunId!,
+      assertS4LifecycleOwned: assertOwned,
+    })
+
+    expect(assertOwned).toHaveBeenCalledTimes(5)
+    expect(mocks.bindArchitectPlanEntry).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      agentRunId: fullContext.agentRunId,
+      entryId: references[0].entryId,
+      workPackageId: fullContext.workPackage.id,
+    }))
+    expect(resolved.workPackage.metadata).toMatchObject({
+      promptOverlay: 'Use the approved issue summary only.',
+      mcpAwareSubtasks: [expect.objectContaining({ id: 'inspect' })],
+    })
+    expect(resolved.workPackage.metadata).not.toHaveProperty('architectPlanEntryReferences')
+    expect(resolved.workPackage.metadata).not.toHaveProperty('mcpPromptContextPolicy')
+    expect(fullContext.workPackage.metadata).toHaveProperty('architectPlanEntryReferences')
+  })
+
+  it('fails closed before binding malformed protected prompt references', async () => {
+    const fullContext = context({
+      workPackage: {
+        ...context().workPackage,
+        metadata: {
+          architectPlanEntryReferences: [{ entryId: 'not-a-closed-reference' }],
+        },
+      },
+    })
+    const preflight = {
+      ...fullContext,
+      filesystemRuntime: { schemaVersion: 1, runtimeIssued: false, status: 'not_requested' },
+      projectFilesystemDecision: fullContext.projectFilesystemDecision ?? null,
+    } as WorkPackageExecutionPreflight & { validatedProjectRoot?: string }
+    delete preflight.validatedProjectRoot
+
+    await expect(resolveProtectedArchitectPlanContext(preflight, {
+      agentRunId: fullContext.agentRunId!,
+    })).rejects.toThrow(/malformed or ineligible/i)
+    expect(mocks.bindArchitectPlanEntry).not.toHaveBeenCalled()
   })
 
   it('writes generated files into the task sandbox and runs allowed commands', async () => {
@@ -634,6 +769,7 @@ describe('executeWorkPackage', () => {
     })
 
     const result = await executeWorkPackage(context({
+      s4Lifecycle: packetLifecycle(),
       workPackage: {
         ...context().workPackage,
         assignedRole: 'backend',
@@ -768,6 +904,7 @@ describe('executeWorkPackage', () => {
     })
 
     const result = await executeWorkPackage(context({
+      s4Lifecycle: packetLifecycle(),
       workPackage: {
         ...context().workPackage,
         assignedRole: 'backend',
@@ -815,7 +952,7 @@ describe('executeWorkPackage', () => {
     })
   })
 
-  it('consumes allow-once filesystem grants after issuing context', async () => {
+  it('does not re-consume the allow-once grant after the atomic packet claim', async () => {
     await fs.writeFile(path.join(tempRoot, 'README.md'), 'project context\n')
     mocks.generateText.mockResolvedValue({
       text: JSON.stringify({
@@ -829,6 +966,7 @@ describe('executeWorkPackage', () => {
     await executeWorkPackage(context({
       agentRunId: 'run-1',
       attemptNumber: 2,
+      s4Lifecycle: packetLifecycle(),
       workPackage: {
         ...context().workPackage,
         assignedRole: 'backend',
@@ -861,28 +999,11 @@ describe('executeWorkPackage', () => {
       },
     }))
 
-    const consumedUpdate = mocks.dbUpdateSet.mock.calls
-      .map(([value]) => value as { metadata?: { queryChunks?: unknown[] } })
-      .find((value) => value.metadata?.queryChunks?.some((chunk) => (
-        typeof chunk === 'string' && chunk.includes('"status":"consumed"')
-      )))
-    expect(consumedUpdate).toBeDefined()
-    const consumedSql = consumedUpdate?.metadata?.queryChunks?.find((chunk) => (
-      typeof chunk === 'string' && chunk.includes('"status":"consumed"')
-    ))
-    expect(consumedSql).toContain('"consumedByAgentRunId":"run-1"')
-    expect(consumedSql).toContain('"consumedOnAttempt":2')
-    expect(mocks.publishTaskEvent).toHaveBeenCalledWith(
-      'task-1',
-      'work_package:status',
-      expect.objectContaining({
-        filesystemGrantStatus: 'consumed',
-        workPackageId: 'pkg-1',
-      }),
-    )
-    expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
-      eventType: 'mcp.filesystem.grant_consumed',
-      workPackageId: 'pkg-1',
+    expect(mocks.claimPacketAuthorization).not.toHaveBeenCalled()
+    expect(mocks.beginPacketAssemblyV2).toHaveBeenCalledOnce()
+    expect(mocks.beginPacketDeliveryV2).toHaveBeenCalledOnce()
+    expect(mocks.completePacketDeliveryV2).toHaveBeenCalledWith(expect.objectContaining({
+      outcome: 'submitted',
     }))
   })
 
@@ -1049,6 +1170,7 @@ describe('executeWorkPackage', () => {
     })
 
     const result = await executeWorkPackage(context({
+      s4Lifecycle: packetLifecycle(),
       workPackage: {
         ...context().workPackage,
         assignedRole: 'backend',
@@ -1090,9 +1212,8 @@ describe('executeWorkPackage', () => {
         status: 'issued',
       }),
     })
-    expect(mocks.claimPacketAuthorization).toHaveBeenCalledWith(expect.objectContaining({
-      requiredCapabilities: ['filesystem.project.read'],
-    }))
+    expect(mocks.claimPacketAuthorization).not.toHaveBeenCalled()
+    expect(mocks.beginPacketAssemblyV2).toHaveBeenCalledOnce()
     expect(result.executionContextArtifactMetadata).toMatchObject({
       packetAuthorizationAuditId: '00000000-0000-4000-8000-000000000030',
     })
@@ -1111,6 +1232,7 @@ describe('executeWorkPackage', () => {
     })
 
     const result = await executeWorkPackage(context({
+      s4Lifecycle: packetLifecycle(),
       workPackage: {
         ...context().workPackage,
         assignedRole: 'backend',
@@ -1780,6 +1902,7 @@ describe('executeWorkPackage', () => {
 
     const result = await executeWorkPackage(context({
       attemptNumber: 2,
+      s4Lifecycle: packetLifecycle(),
       workPackage: {
         ...context().workPackage,
         mcpRequirements: [{
@@ -1843,8 +1966,9 @@ describe('executeWorkPackage', () => {
       }),
       redaction: expect.objectContaining({ applied: true }),
     })
-    expect(mocks.claimPacketAuthorization).toHaveBeenCalledWith(expect.objectContaining({
-      requiredCapabilities: ['filesystem.project.read'],
+    expect(mocks.claimPacketAuthorization).not.toHaveBeenCalled()
+    expect(mocks.completePacketAssemblyV2).toHaveBeenCalledWith(expect.objectContaining({
+      rootRef: '00000000-0000-4000-8000-000000000001',
     }))
     expect(result.executionContextArtifactMetadata).toMatchObject({
       packetAuthorizationAuditId: '00000000-0000-4000-8000-000000000030',

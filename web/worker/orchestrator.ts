@@ -44,7 +44,6 @@ import {
 import { completeTaskIfReviewGatesSatisfied } from './review-gates'
 import { sanitizeWorkerMessage } from './redaction'
 import {
-  architectReplanReferenceForEntry,
   architectPlanStorageConfiguration,
   bindArchitectReplanEntry,
   recordArchitectPlanVersion,
@@ -52,8 +51,6 @@ import {
 } from '../lib/mcps/s4-protocol-store'
 import {
   ARCHITECT_PLAN_HEADER,
-  parseArchitectPlanEntryReference,
-  type ArchitectPlanEntryReference,
 } from '../lib/mcps/architect-plan-entries'
 
 type TaskRow = Task
@@ -532,22 +529,15 @@ export async function createArchitectPlanArtifact(
       planVersion,
       taskId,
     })
-    const planBody = protectedPlan.entries.find((entry) => entry.entryKind === 'plan_body')
-    if (!planBody) throw new Error('Protected Architect history did not retain its plan body entry.')
-    const architectReplanReference = architectReplanReferenceForEntry(planBody)
     const [protectedArtifact] = await db
       .update(artifacts)
       .set({
         metadata: {
-          ...metadataExtra,
+          schemaVersion: 1,
           stage: 'architect_plan',
-          generatedBy: 'forge-worker',
           historyAvailable: true,
           planVersion,
           entryCount: protectedPlan.entries.length,
-          entrySetDigest: protectedPlan.entrySetDigest,
-          storageMode: 'protected',
-          architectReplanReference,
         },
       })
       .where(eq(artifacts.id, protectedPlan.artifactId))
@@ -561,15 +551,21 @@ export async function createArchitectPlanArtifact(
 
   if (!artifact) throw new Error('Architect artifact was not persisted.')
 
-  await publishTaskEvent(taskId, 'artifact:created', {
-    id: artifact.id,
-    artifactId: artifact.id,
-    agentRunId,
-    artifactType: artifact.artifactType,
-    content: artifact.content,
-    metadata: artifact.metadata,
-    createdAt: artifact.createdAt,
-  })
+  const protectedHistory = storage.mode === 'protected'
+  await publishTaskEvent(taskId, 'artifact:created', protectedHistory
+    ? {
+        agentRunId,
+        historyAvailable: true,
+      }
+    : {
+        id: artifact.id,
+        artifactId: artifact.id,
+        agentRunId,
+        artifactType: artifact.artifactType,
+        content: artifact.content,
+        metadata: artifact.metadata,
+        createdAt: artifact.createdAt,
+      })
 
   await recordTaskLogBestEffort({
     agentRunId,
@@ -579,7 +575,7 @@ export async function createArchitectPlanArtifact(
     message: `Created ${artifact.artifactType} artifact ${artifact.id}.`,
     metadata: {
       artifactType: artifact.artifactType,
-      metadata: artifact.metadata,
+      metadata: protectedHistory ? { historyAvailable: true } : artifact.metadata,
     },
     source: 'worker',
     taskId,
@@ -613,16 +609,6 @@ export function previousPlanForReplan(
   return planTextFromCheckpoint(checkpoint)
 }
 
-function protectedArchitectReplanReference(
-  artifact: LatestPlanArtifact,
-): ArchitectPlanEntryReference {
-  const reference = parseArchitectPlanEntryReference(artifact.metadata.architectReplanReference)
-  if (!reference || reference.entryId !== 'plan_body:000000') {
-    throw new Error('Protected Architect replan metadata is missing or invalid. Replan failed closed.')
-  }
-  return reference
-}
-
 export async function previousPlanForArchitectRun(input: {
   agentRunId: string
   artifact: LatestPlanArtifact | null
@@ -639,18 +625,14 @@ export async function previousPlanForArchitectRun(input: {
   if (storage.mode !== 'protected') {
     throw new Error('Protected Architect history is present but its resolver configuration is missing. Replan failed closed.')
   }
-  const reference = protectedArchitectReplanReference(input.artifact!)
   const referenceId = await bindArchitectReplanEntry({
     agentRunId: input.agentRunId,
-    reference,
     taskId: input.taskId,
   })
   const resolved = await resolveArchitectPlanEntry({
     digestKey: storage.digestKey,
     expectedPurpose: 'architect_replan',
-    reference,
     referenceId,
-    taskId: input.taskId,
   })
   const previousPlan = resolved.content.trim()
   if (!previousPlan) throw new Error('Protected Architect replan resolved an empty plan. Replan failed closed.')

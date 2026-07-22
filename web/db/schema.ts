@@ -92,18 +92,31 @@ export const sessions = pgTable(
     revokedAt: timestamp('revoked_at', tsOpts),
     userAgent: text('user_agent'),
     ipAddress: inet('ip_address'),
-    credentialDigestV1: bytea('credential_digest_v1').notNull(),
-    expiresAt: timestamp('expires_at', tsOpts).notNull(),
+    credentialDigestV1: bytea('credential_digest_v1'),
+    expiresAt: timestamp('expires_at', tsOpts),
+    credentialStorageVersion: integer('credential_storage_version').notNull().default(0),
+    legacyRedisPurgePendingAt: timestamp('legacy_redis_purge_pending_at', tsOpts),
+    legacyRedisInvalidatedAt: timestamp('legacy_redis_invalidated_at', tsOpts),
   },
   (t) => [
     index('sessions_user_id_idx').on(t.userId),
     index('sessions_revoked_at_idx').on(t.revokedAt),
-    uniqueIndex('sessions_credential_digest_v1_idx').on(t.credentialDigestV1),
+    uniqueIndex('sessions_credential_digest_v1_idx')
+      .on(t.credentialDigestV1)
+      .where(sql`${t.credentialDigestV1} is not null`),
   ],
 )
 
 export type Session = InferSelectModel<typeof sessions>
 export type NewSession = InferInsertModel<typeof sessions>
+
+export const sessionCredentialReconciliation = pgTable('session_credential_reconciliation', {
+  singleton: boolean('singleton').primaryKey().default(true),
+  state: text('state').notNull().default('expansion'),
+  rowsMigrated: bigint('rows_migrated', { mode: 'bigint' }).notNull().default(sql`0`),
+  rowsRevoked: bigint('rows_revoked', { mode: 'bigint' }).notNull().default(sql`0`),
+  updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+})
 
 // ---------------------------------------------------------------------------
 // providerConfigs
@@ -1434,9 +1447,15 @@ export const workPackageLocalRunEvidence = pgTable(
     workPackageId: uuid('work_package_id').notNull().references(() => workPackages.id, { onDelete: 'restrict' }),
     agentRunId: uuid('agent_run_id').notNull().references(() => agentRuns.id, { onDelete: 'restrict' }).unique(),
     claimToken: uuid('claim_token').notNull().unique(),
+    claimGeneration: bigint('claim_generation', { mode: 'bigint' }).notNull().default(sql`1`),
+    lastHeartbeatAt: timestamp('last_heartbeat_at', tsOpts).defaultNow().notNull(),
     leaseExpiresAt: timestamp('lease_expires_at', tsOpts).notNull(),
     state: text('state').notNull().default('claimed'),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    terminal: jsonb('terminal').$type<Record<string, unknown>>(),
+    completionArtifactId: uuid('completion_artifact_id').references(() => artifacts.id, {
+      onDelete: 'restrict',
+    }),
     terminalAt: timestamp('terminal_at', tsOpts),
   },
   (t) => [index('work_package_local_run_evidence_package_idx').on(t.workPackageId, t.agentRunId)],
@@ -1489,6 +1508,8 @@ export const filesystemMcpRuntimeAudits = pgTable(
       onDelete: 'restrict',
     }),
     claimToken: uuid('claim_token'),
+    claimGeneration: bigint('claim_generation', { mode: 'bigint' }),
+    lastHeartbeatAt: timestamp('last_heartbeat_at', tsOpts),
     leaseExpiresAt: timestamp('lease_expires_at', tsOpts),
     authorizationSnapshot: jsonb('authorization_snapshot').$type<Record<string, unknown>>(),
     authorizationSource: text('authorization_source'),
@@ -1497,6 +1518,9 @@ export const filesystemMcpRuntimeAudits = pgTable(
     grantDecisionNonce: uuid('grant_decision_nonce'),
     authorizationRootBindingRevision: bigint('authorization_root_binding_revision', { mode: 'bigint' }),
     projectDecisionId: uuid('project_decision_id').references(() => projectFilesystemGrantDecisions.id, {
+      onDelete: 'restrict',
+    }),
+    completionArtifactId: uuid('completion_artifact_id').references(() => artifacts.id, {
       onDelete: 'restrict',
     }),
     assembly: jsonb('assembly').$type<Record<string, unknown>>(),

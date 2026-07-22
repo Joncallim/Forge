@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import {
   LEGACY_TASK_LOG_UNAVAILABLE,
   classifySensitivePayloadKey,
+  isUnknownLegacyDigest,
   sanitizeSensitivePayload,
 } from '@/lib/mcps/leakage-drain'
 
@@ -12,7 +13,13 @@ export const LEGACY_TASK_EVENT_PATTERNS = [
 ] as const
 export const V2_TASK_EVENT_HISTORY_PATTERN = 'forge:task-events:v2:*:history'
 
-export type LegacyLeakageScrubPhase = 'task_logs' | 'artifacts' | 'redis_legacy' | 'redis_v2_verify' | 'complete'
+export type LegacyLeakageScrubPhase =
+  | 'task_logs'
+  | 'artifacts'
+  | 'work_packages'
+  | 'redis_legacy'
+  | 'redis_v2_verify'
+  | 'complete'
 export type LegacyLeakageScrubState = 'running' | 'paused_conflict' | 'complete'
 
 export type LegacyTaskLogScrubRow = Readonly<{
@@ -31,7 +38,16 @@ export type LegacyArtifactScrubRow = Readonly<{
   replaceContent: boolean
 }>
 
-export type LegacyLeakageScrubRow = LegacyTaskLogScrubRow | LegacyArtifactScrubRow
+export type LegacyWorkPackageScrubRow = Readonly<{
+  id: string
+  kind: 'work_package'
+  metadata: Record<string, unknown>
+}>
+
+export type LegacyLeakageScrubRow =
+  | LegacyTaskLogScrubRow
+  | LegacyArtifactScrubRow
+  | LegacyWorkPackageScrubRow
 
 export type LegacyLeakageScrubCheckpoint = Readonly<{
   schemaVersion: 1
@@ -66,13 +82,19 @@ export type RedisScanEvidence = Readonly<{
   violations: number
 }>
 
+export type DatabaseScanEvidence = Readonly<{
+  complete: boolean
+  rowsExamined: number
+  violations: number
+}>
+
 export interface LegacyLeakageScrubDatabase {
   databaseTime(): Promise<string>
   verifyDrainAuthorization(receiptId: string): Promise<boolean>
   loadCheckpoint(operationId: string): Promise<LoadedLegacyLeakageCheckpoint | null>
   createCheckpoint(checkpoint: LegacyLeakageScrubCheckpoint): Promise<LoadedLegacyLeakageCheckpoint | null>
   scanRows(
-    phase: 'task_logs' | 'artifacts',
+    phase: 'task_logs' | 'artifacts' | 'work_packages',
     afterId: string | null,
     limit: number,
   ): Promise<LegacyLeakageScrubRow[]>
@@ -97,7 +119,7 @@ export type LegacyLeakageScrubMode = 'dry-run' | 'apply' | 'resume'
 
 export type LegacyLeakageScrubOptions = Readonly<{
   actor: string
-  authorizationReceiptId?: string
+  authorizationReceiptId: string
   batchSize?: number
   maxBatches?: number
   mode: LegacyLeakageScrubMode
@@ -113,6 +135,8 @@ export type LegacyLeakageScrubResult = Readonly<{
     artifactRowsChanged: number
     taskLogRowsExamined: number
     taskLogRowsChanged: number
+    workPackageRowsExamined: number
+    workPackageRowsChanged: number
     redis: RedisScanEvidence
     redisV2: RedisScanEvidence
   }> | null
@@ -145,12 +169,17 @@ export function sanitizeLegacyLeakageRow(row: LegacyLeakageScrubRow): LegacyLeak
     }
   }
 
-  return {
+  if (row.kind === 'artifact') return {
     ...row,
     content: row.replaceContent ? LEGACY_TASK_LOG_UNAVAILABLE : row.content,
     metadata: row.metadata === null
       ? null
       : sanitizeSensitivePayload(row.metadata) as Record<string, unknown>,
+  }
+
+  return {
+    ...row,
+    metadata: sanitizeSensitivePayload(row.metadata) as Record<string, unknown>,
   }
 }
 
@@ -158,19 +187,60 @@ export function legacyLeakageRowChanged(row: LegacyLeakageScrubRow): boolean {
   return legacyLeakageRowFingerprint(row) !== legacyLeakageRowFingerprint(sanitizeLegacyLeakageRow(row))
 }
 
-export function containsForbiddenV2EventData(value: unknown, sentinels: readonly string[] = []): boolean {
+const V2_EVENT_TYPES = new Set([
+  'artifact:created',
+  'approval_gate:created',
+  'approval_gate:decided',
+  'questions:created',
+  'run:completed',
+  'run:failed',
+  'run:progress',
+  'run:started',
+  'task:handoff',
+  'task:log',
+  'task:status',
+  'work_package:handoff',
+  'work_package:status',
+])
+
+const V2_EVENT_DATA_KEYS = new Set([
+  'agentRunId', 'agentType', 'artifactId', 'artifactType', 'assignedRole', 'attemptNumber',
+  'blocked', 'blockedReason', 'capability', 'capabilityClass', 'checkedAt', 'claimedPackageId',
+  'completedAt', 'costUsd', 'createdAt', 'decision', 'enabled', 'error', 'errorMessage',
+  'eventType', 'gateId', 'gateType', 'health', 'historyAvailable', 'hostRepositoryWrites', 'id', 'inputTokens',
+  'installState', 'level', 'maxAttempts', 'mcpBroker', 'mcpGrantBlock', 'mcpId', 'metadata',
+  'mode', 'modelIdUsed', 'nextAttemptNumber', 'occurredAt', 'outputBytes', 'outputTokens',
+  'primaryMode', 'primaryRecoveryAction', 'progress', 'readyPackageIds', 'repositoryWrites',
+  'reviewBlockReason', 'reviewStatus', 'runId', 'sandboxWrites', 'sequence', 'source', 'stage',
+  'staleRunningRecovery', 'status', 'taskDisposition', 'terminalBlock', 'timestamp', 'title',
+  'type', 'updatedAt', 'warnings', 'workPackageId',
+])
+
+function containsForbiddenV2DataNode(value: unknown, sentinels: readonly string[]): boolean {
   if (typeof value === 'string') {
     return sentinels.some((sentinel) => sentinel.length > 0 && value.includes(sentinel))
   }
-  if (Array.isArray(value)) return value.some((item) => containsForbiddenV2EventData(item, sentinels))
+  if (Array.isArray(value)) return value.some((item) => containsForbiddenV2DataNode(item, sentinels))
   if (value === null || typeof value !== 'object') return false
 
   for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    if (classifySensitivePayloadKey(key) !== null) return true
-    if (/^(?:path|paths|locator|storageLocator|selectedPath)$/i.test(key)) return true
-    if (containsForbiddenV2EventData(item, sentinels)) return true
+    if (!V2_EVENT_DATA_KEYS.has(key)) return true
+    const sensitiveKind = classifySensitivePayloadKey(key)
+    if (sensitiveKind === 'snapshot' && isUnknownLegacyDigest(item)) continue
+    if (sensitiveKind !== null) return true
+    if (containsForbiddenV2DataNode(item, sentinels)) return true
   }
   return false
+}
+
+/** A fixed structural allowlist for the persisted v2 Redis event envelope. */
+export function containsForbiddenV2EventData(value: unknown, sentinels: readonly string[] = []): boolean {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return true
+  const envelope = value as Record<string, unknown>
+  if (Object.keys(envelope).some((key) => key !== 'type' && key !== 'data')) return true
+  if (typeof envelope.type !== 'string' || !V2_EVENT_TYPES.has(envelope.type)) return true
+  if (envelope.data === null || typeof envelope.data !== 'object' || Array.isArray(envelope.data)) return true
+  return containsForbiddenV2DataNode(envelope.data, sentinels)
 }
 
 function validateBoundedInteger(name: string, value: number, maximum: number): void {
@@ -213,6 +283,7 @@ async function dryRun(
 ): Promise<LegacyLeakageScrubResult> {
   const taskLogRows = await database.scanRows('task_logs', null, options.batchSize)
   const artifactRows = await database.scanRows('artifacts', null, options.batchSize)
+  const workPackageRows = await database.scanRows('work_packages', null, options.batchSize)
   const redisEvidence = await redis.purgeLegacyTaskEventKeys({ apply: false })
   const redisV2Evidence = await redis.scanV2TaskEventHistory(options.sentinels)
 
@@ -224,10 +295,59 @@ async function dryRun(
       artifactRowsChanged: artifactRows.filter(legacyLeakageRowChanged).length,
       taskLogRowsExamined: taskLogRows.length,
       taskLogRowsChanged: taskLogRows.filter(legacyLeakageRowChanged).length,
+      workPackageRowsExamined: workPackageRows.length,
+      workPackageRowsChanged: workPackageRows.filter(legacyLeakageRowChanged).length,
       redis: redisEvidence,
       redisV2: redisV2Evidence,
     },
   }
+}
+
+const MAX_FINAL_DATABASE_SCAN_BATCHES = 10_000
+
+async function scanDatabaseForLeakage(
+  database: LegacyLeakageScrubDatabase,
+  batchSize: number,
+): Promise<DatabaseScanEvidence> {
+  let rowsExamined = 0
+  let violations = 0
+  let batches = 0
+  for (const phase of ['task_logs', 'artifacts', 'work_packages'] as const) {
+    let afterId: string | null = null
+    while (batches < MAX_FINAL_DATABASE_SCAN_BATCHES) {
+      const rows = await database.scanRows(phase, afterId, batchSize)
+      batches += 1
+      rowsExamined += rows.length
+      violations += rows.filter(legacyLeakageRowChanged).length
+      if (rows.length === 0) break
+      afterId = rows.at(-1)?.id ?? null
+    }
+    if (batches >= MAX_FINAL_DATABASE_SCAN_BATCHES) {
+      return { complete: false, rowsExamined, violations }
+    }
+  }
+  return { complete: true, rowsExamined, violations }
+}
+
+async function finalZeroScan(
+  database: LegacyLeakageScrubDatabase,
+  redis: LegacyLeakageScrubRedis,
+  batchSize: number,
+  sentinels: readonly string[],
+): Promise<Readonly<{ database: DatabaseScanEvidence; legacy: RedisScanEvidence; v2: RedisScanEvidence }>> {
+  const databaseEvidence = await scanDatabaseForLeakage(database, batchSize)
+  const legacy = await redis.purgeLegacyTaskEventKeys({ apply: false })
+  const v2 = await redis.scanV2TaskEventHistory(sentinels)
+  return { database: databaseEvidence, legacy, v2 }
+}
+
+function zeroScanPassed(evidence: Awaited<ReturnType<typeof finalZeroScan>>): boolean {
+  return evidence.database.complete
+    && evidence.database.violations === 0
+    && evidence.legacy.complete
+    && evidence.legacy.remainingKeys === 0
+    && evidence.v2.complete
+    && evidence.v2.violations === 0
 }
 
 export async function runLegacyLeakageScrub(
@@ -244,16 +364,16 @@ export async function runLegacyLeakageScrub(
   validateBoundedInteger('batchSize', batchSize, 1_000)
   validateBoundedInteger('maxBatches', maxBatches, 1_000)
 
+  const authorizationReceiptId = validateIdentity('authorizationReceiptId', options.authorizationReceiptId)
+  if (!await dependencies.database.verifyDrainAuthorization(authorizationReceiptId)) {
+    throw new Error('The supplied authorization receipt does not satisfy the fixed S4 producers-disabled drain contract.')
+  }
+
   if (options.mode === 'dry-run') {
     return dryRun({ batchSize, sentinels }, dependencies.database, dependencies.redis)
   }
 
   const operationId = validateIdentity('operationId', options.operationId)
-  const authorizationReceiptId = validateIdentity('authorizationReceiptId', options.authorizationReceiptId)
-  if (!await dependencies.database.verifyDrainAuthorization(authorizationReceiptId)) {
-    throw new Error('The supplied authorization receipt is not an S4 producers-disabled receipt.')
-  }
-
   let current = await dependencies.database.loadCheckpoint(operationId)
   if (options.mode === 'apply') {
     if (current) throw new Error('This operation already exists; use --resume.')
@@ -287,10 +407,9 @@ export async function runLegacyLeakageScrub(
   }
 
   if (current.checkpoint.state === 'complete') {
-    const legacy = await dependencies.redis.purgeLegacyTaskEventKeys({ apply: false })
-    const v2 = await dependencies.redis.scanV2TaskEventHistory(sentinels)
-    if (!legacy.complete || legacy.remainingKeys !== 0 || !v2.complete || v2.violations !== 0) {
-      throw new Error('Completed leakage scrub verification failed; a legacy key or unsafe v2 value reappeared.')
+    const final = await finalZeroScan(dependencies.database, dependencies.redis, batchSize, sentinels)
+    if (!zeroScanPassed(final)) {
+      throw new Error('Completed leakage scrub verification failed; database or Redis leakage reappeared.')
     }
     return { checkpoint: current.checkpoint, dryRun: false, preview: null }
   }
@@ -302,12 +421,16 @@ export async function runLegacyLeakageScrub(
   let batches = 0
   while (batches < maxBatches && current.checkpoint.phase !== 'complete') {
     const phase = current.checkpoint.phase
-    if (phase === 'task_logs' || phase === 'artifacts') {
+    if (phase === 'task_logs' || phase === 'artifacts' || phase === 'work_packages') {
       const rows = await dependencies.database.scanRows(phase, current.checkpoint.lastKey, batchSize)
       batches += 1
       if (rows.length === 0) {
         current = await moveCheckpoint(dependencies.database, current, {
-          phase: phase === 'task_logs' ? 'artifacts' : 'redis_legacy',
+          phase: phase === 'task_logs'
+            ? 'artifacts'
+            : phase === 'artifacts'
+              ? 'work_packages'
+              : 'redis_legacy',
           lastKey: null,
           lastPreFingerprint: null,
           lastPostFingerprint: null,
@@ -371,11 +494,19 @@ export async function runLegacyLeakageScrub(
 
     if (phase === 'redis_v2_verify') {
       batches += 1
-      const evidence = await dependencies.redis.scanV2TaskEventHistory(sentinels)
+      const final = await finalZeroScan(dependencies.database, dependencies.redis, batchSize, sentinels)
+      const passed = zeroScanPassed(final)
+      const retryPhase: LegacyLeakageScrubPhase = !final.database.complete || final.database.violations > 0
+        ? 'task_logs'
+        : !final.legacy.complete || final.legacy.remainingKeys > 0
+          ? 'redis_legacy'
+          : 'redis_v2_verify'
       current = await moveCheckpoint(dependencies.database, current, {
-        phase: evidence.complete && evidence.violations === 0 ? 'complete' : phase,
-        state: evidence.complete && evidence.violations === 0 ? 'complete' : 'paused_conflict',
-        redisV2ValuesExamined: current.checkpoint.redisV2ValuesExamined + evidence.valuesExamined,
+        phase: passed ? 'complete' : retryPhase,
+        state: passed ? 'complete' : 'paused_conflict',
+        lastKey: null,
+        redisKeysExamined: current.checkpoint.redisKeysExamined + final.legacy.keysExamined,
+        redisV2ValuesExamined: current.checkpoint.redisV2ValuesExamined + final.v2.valuesExamined,
       })
       return { checkpoint: current.checkpoint, dryRun: false, preview: null }
     }

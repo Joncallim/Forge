@@ -2483,7 +2483,7 @@ describe('GET /api/projects/:id — 404 when project not found', () => {
 describe('GET /api/tasks/:id — task details', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
-  it('hydrates work-package harness prompts and package-scoped artifacts in task details', async () => {
+  it('hydrates harness and artifact details without returning private work-package context', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const task = {
       id: 'task-work-packages',
@@ -2513,7 +2513,11 @@ describe('GET /api/tasks/:id — task details', () => {
       targetAreas: ['Providers'],
       mcpRequirements: {},
       metadata: {
-        promptOverlay: 'Keep the Providers list synced after local detection.',
+        promptOverlay: 'RAW-FRONTEND-OVERLAY-SENTINEL',
+        requirementContexts: [{ promptOverlay: 'RAW-FRONTEND-CONTEXT-SENTINEL' }],
+        mcpAwareSubtasks: [{ inputs: ['RAW-FRONTEND-SUBTASK-SENTINEL'] }],
+        architectPlanEntryReferences: [{ entryId: 'RAW-PRIVATE-REFERENCE-SENTINEL' }],
+        safeCount: 1,
       },
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -2525,7 +2529,8 @@ describe('GET /api/tasks/:id — task details', () => {
       title: 'QA verification',
       sequence: 2,
       metadata: {
-        promptOverlay: 'Verify the Providers list after local detection.',
+        promptOverlay: 'RAW-QA-OVERLAY-SENTINEL',
+        safeCount: 2,
       },
     }
     const packageRun = {
@@ -2584,8 +2589,19 @@ describe('GET /api/tasks/:id — task details', () => {
       id: 'artifact-task',
       agentRunId: 'run-task',
       artifactType: 'adr_text',
-      content: 'Task-level plan.',
-      metadata: { revision: 1 },
+      content: 'Architect plan available in protected history',
+      metadata: {
+        historyAvailable: true,
+        planVersion: '7',
+        entryCount: 3,
+        architectReplanReference: { entryId: 'RAW-REPLAN-REFERENCE-SENTINEL' },
+        mcpExecutionDesign: {
+          promptOverlays: { backend: 'RAW-ARTIFACT-OVERLAY-SENTINEL' },
+          requirementContexts: [{ promptOverlay: 'RAW-ARTIFACT-CONTEXT-SENTINEL' }],
+          mcpAwareSubtasks: [{ inputs: ['RAW-ARTIFACT-SUBTASK-SENTINEL'] }],
+          validationStatus: 'valid',
+        },
+      },
       createdAt: new Date(),
     }
     mockDbSelect
@@ -2626,7 +2642,7 @@ describe('GET /api/tasks/:id — task details', () => {
       harnessRole: 'frontend',
       harnessDisplayName: 'Frontend',
       harnessDescription: 'Dashboard UI specialist.',
-      promptOverlay: 'Keep the Providers list synced after local detection.',
+      metadata: { safeCount: 1 },
       artifacts: [{
         id: 'artifact-1',
         agentRunId: 'run-1',
@@ -2638,7 +2654,7 @@ describe('GET /api/tasks/:id — task details', () => {
       harnessRole: 'qa',
       harnessDisplayName: 'QA',
       harnessDescription: 'Regression specialist.',
-      promptOverlay: 'Verify the Providers list after local detection.',
+      metadata: { safeCount: 2 },
       artifacts: [{
         id: 'artifact-2',
         agentRunId: 'run-2',
@@ -2651,9 +2667,17 @@ describe('GET /api/tasks/:id — task details', () => {
       'artifact-2',
       'artifact-task',
     ])
+    expect(body.artifacts.find((artifact: { id: string }) => artifact.id === 'artifact-task').metadata).toEqual({
+      historyAvailable: true,
+    })
+    expect(JSON.stringify(body.artifacts)).not.toContain('planVersion')
+    expect(JSON.stringify(body.artifacts)).not.toContain('entryCount')
+    expect(JSON.stringify(body.artifacts)).not.toContain('RAW-')
     expect(body.workPackages.flatMap(
       (pkg: { artifacts: Array<{ id: string }> }) => pkg.artifacts.map((artifact) => artifact.id),
     )).toEqual(['artifact-1', 'artifact-2'])
+    expect(JSON.stringify(body.workPackages)).not.toContain('RAW-')
+    expect(body.workPackages[0]).not.toHaveProperty('promptOverlay')
   })
 
   it('omits an effective filesystem grant nonce without mutating persisted package metadata', async () => {
@@ -3537,7 +3561,10 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     expect((materialized.metadata as { mcpNormalizationErrors: string[] }).mcpNormalizationErrors)
       .toEqual(expect.arrayContaining([expect.any(String)]))
     if (_label.startsWith('overflowing ')) {
-      expect(materialized.metadata).toMatchObject({ mcpAwareSubtasks: [] })
+      expect(materialized.metadata).toMatchObject({
+        mcpPromptContextPolicy: expect.objectContaining({ mcpAwareSubtaskCount: 0 }),
+      })
+      expect(materialized.metadata).not.toHaveProperty('mcpAwareSubtasks')
     }
 
     const awaitingTask = {

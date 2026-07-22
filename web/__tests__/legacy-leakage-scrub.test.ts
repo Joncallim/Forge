@@ -37,7 +37,9 @@ class FakeDatabase implements LegacyLeakageScrubDatabase {
   checkpoint: LoadedLegacyLeakageCheckpoint | null = null
   taskLogs: LegacyLeakageScrubRow[] = []
   artifacts: LegacyLeakageScrubRow[] = []
+  workPackages: LegacyLeakageScrubRow[] = []
   protectedPlanEntries = [{ id: 'protected-entry', content: 'PROTECTED-PLAN-SENTINEL' }]
+  authorizationChecks = 0
   updates = 0
   checkpointWrites = 0
   conflictOnceFor: string | null = null
@@ -50,6 +52,7 @@ class FakeDatabase implements LegacyLeakageScrubDatabase {
   }
 
   async verifyDrainAuthorization(receiptId: string): Promise<boolean> {
+    this.authorizationChecks += 1
     return receiptId === RECEIPT
   }
 
@@ -65,11 +68,15 @@ class FakeDatabase implements LegacyLeakageScrubDatabase {
   }
 
   async scanRows(
-    phase: 'task_logs' | 'artifacts',
+    phase: 'task_logs' | 'artifacts' | 'work_packages',
     afterId: string | null,
     limit: number,
   ): Promise<LegacyLeakageScrubRow[]> {
-    const source = phase === 'task_logs' ? this.taskLogs : this.artifacts
+    const source = phase === 'task_logs'
+      ? this.taskLogs
+      : phase === 'artifacts'
+        ? this.artifacts
+        : this.workPackages
     return source.filter((row) => afterId === null || row.id > afterId).slice(0, limit)
   }
 
@@ -80,7 +87,11 @@ class FakeDatabase implements LegacyLeakageScrubDatabase {
     row: LegacyLeakageScrubRow
   }): Promise<'committed' | 'row_conflict' | 'checkpoint_conflict'> {
     if (this.checkpoint?.token !== input.current.token) return 'checkpoint_conflict'
-    const rows = input.row.kind === 'task_log' ? this.taskLogs : this.artifacts
+    const rows = input.row.kind === 'task_log'
+      ? this.taskLogs
+      : input.row.kind === 'artifact'
+        ? this.artifacts
+        : this.workPackages
     const index = rows.findIndex((row) => row.id === input.row.id)
     if (index < 0) return 'row_conflict'
     if (this.conflictOnceFor === input.row.id) {
@@ -188,26 +199,58 @@ function protectedHistoryArtifact(id = '00000000-0000-4000-8000-000000000004'): 
   }
 }
 
+function spoofedHistoryArtifact(id = '00000000-0000-4000-8000-000000000005'): LegacyLeakageScrubRow {
+  return {
+    id,
+    kind: 'artifact',
+    content: 'RAW-SPOOFED-HISTORY-SENTINEL',
+    metadata: { historyAvailable: true },
+    // The PostgreSQL adapter derives this from architect_plan_versions, not metadata.
+    replaceContent: true,
+  }
+}
+
+function workPackage(id = '00000000-0000-4000-8000-000000000006'): LegacyLeakageScrubRow {
+  return {
+    id,
+    kind: 'work_package',
+    metadata: {
+      status: 'pending',
+      promptOverlay: 'RAW-WORK-PACKAGE-OVERLAY-SENTINEL',
+      requirementContexts: [{ promptOverlay: 'RAW-WORK-PACKAGE-CONTEXT-SENTINEL' }],
+      mcpAwareSubtasks: [{ inputs: ['RAW-WORK-PACKAGE-SUBTASK-SENTINEL'] }],
+      hostileMetadata: { apiKey: 'RAW-WORK-PACKAGE-KEY-SENTINEL' },
+    },
+  }
+}
+
 describe('legacy leakage scrub', () => {
   it('keeps dry-run actionless while reporting bounded database and Redis work', async () => {
     const database = new FakeDatabase()
     const redis = new FakeRedis()
     database.taskLogs = [taskLog()]
-    database.artifacts = [artifact(), ordinaryArtifact(), protectedHistoryArtifact()]
+    database.artifacts = [artifact(), ordinaryArtifact(), protectedHistoryArtifact(), spoofedHistoryArtifact()]
+    database.workPackages = [workPackage()]
 
-    const result = await runLegacyLeakageScrub({ actor: 'operator', mode: 'dry-run' }, { database, redis })
+    const result = await runLegacyLeakageScrub({
+      actor: 'operator',
+      authorizationReceiptId: RECEIPT,
+      mode: 'dry-run',
+    }, { database, redis })
 
     expect(result).toMatchObject({
       checkpoint: null,
       dryRun: true,
       preview: {
-        artifactRowsChanged: 2,
+        artifactRowsChanged: 3,
         taskLogRowsChanged: 1,
+        workPackageRowsChanged: 1,
         redis: { keysDeleted: 0, remainingKeys: 2 },
       },
     })
     expect(database.checkpointWrites).toBe(0)
     expect(database.updates).toBe(0)
+    expect(database.authorizationChecks).toBe(1)
     expect(redis.applyCalls).toEqual([false])
     expect(database.taskLogs[0]).toEqual(taskLog())
   })
@@ -216,7 +259,8 @@ describe('legacy leakage scrub', () => {
     const database = new FakeDatabase()
     const redis = new FakeRedis()
     database.taskLogs = [taskLog()]
-    database.artifacts = [artifact(), ordinaryArtifact(), protectedHistoryArtifact()]
+    database.artifacts = [artifact(), ordinaryArtifact(), protectedHistoryArtifact(), spoofedHistoryArtifact()]
+    database.workPackages = [workPackage()]
     database.conflictOnceFor = database.taskLogs[0].id
 
     const first = await runLegacyLeakageScrub({
@@ -233,7 +277,7 @@ describe('legacy leakage scrub', () => {
       mode: 'resume',
       operationId: 'leakage-operation',
     }, { database, redis })
-    expect(resumed.checkpoint).toMatchObject({ phase: 'complete', state: 'complete', rowsChanged: 3 })
+    expect(resumed.checkpoint).toMatchObject({ phase: 'complete', state: 'complete', rowsChanged: 5 })
 
     const cleanedLog = database.taskLogs[0]
     expect(cleanedLog).toMatchObject({
@@ -261,6 +305,17 @@ describe('legacy leakage scrub', () => {
       replaceContent: false,
     })
     expect(database.artifacts[2]).toEqual(protectedHistoryArtifact())
+    expect(database.artifacts[3]).toMatchObject({
+      content: LEGACY_TASK_LOG_UNAVAILABLE,
+      metadata: { historyAvailable: true },
+      replaceContent: true,
+    })
+    expect(database.workPackages[0]).toEqual({
+      id: '00000000-0000-4000-8000-000000000006',
+      kind: 'work_package',
+      metadata: { status: 'pending', hostileMetadata: {} },
+    })
+    expect(JSON.stringify(database.workPackages[0])).not.toContain('RAW-')
     expect(database.protectedPlanEntries).toEqual([
       { id: 'protected-entry', content: 'PROTECTED-PLAN-SENTINEL' },
     ])
@@ -271,6 +326,7 @@ describe('legacy leakage scrub', () => {
     const database = new FakeDatabase()
     const redis = new FakeRedis()
     database.taskLogs = [taskLog()]
+    database.workPackages = [workPackage()]
     database.throwAfterCommitOnce = true
 
     await expect(runLegacyLeakageScrub({
@@ -299,6 +355,8 @@ describe('legacy leakage scrub', () => {
     expect(verifiedAgain.checkpoint?.state).toBe('complete')
     expect(database.updates).toBe(updateCount)
     expect(redis.applyCalls.at(-1)).toBe(false)
+    expect(JSON.stringify(database.workPackages)).not.toContain('RAW-')
+    expect(database.authorizationChecks).toBe(3)
   })
 
   it('requires the recorded S4 drain authorization before creating a checkpoint', async () => {
@@ -309,17 +367,41 @@ describe('legacy leakage scrub', () => {
       authorizationReceiptId: 'wrong-receipt',
       mode: 'apply',
       operationId: 'unauthorized-operation',
-    }, { database, redis })).rejects.toThrow('not an S4 producers-disabled receipt')
+    }, { database, redis })).rejects.toThrow('fixed S4 producers-disabled drain contract')
     expect(database.checkpoint).toBeNull()
     expect(redis.applyCalls).toEqual([])
   })
 
-  it('detects nested aliases, paths, legacy digests, and rollout sentinels in v2 event values', () => {
-    expect(containsForbiddenV2EventData({ metadata: { prompt_overlay: 'x' } })).toBe(true)
-    expect(containsForbiddenV2EventData({ metadata: { storageLocator: 'opaque' } })).toBe(true)
-    expect(containsForbiddenV2EventData({ metadata: { prompt_sha256: 'abc' } })).toBe(true)
-    expect(containsForbiddenV2EventData({ status: 'SAFE-ROLLOUT-SENTINEL' }, ['ROLLOUT-SENTINEL'])).toBe(true)
-    expect(containsForbiddenV2EventData({ type: 'task:status', status: 'running', progress: 3 })).toBe(false)
+  it('requires the fixed v2 event allowlist and detects hostile metadata and rollout sentinels', () => {
+    expect(containsForbiddenV2EventData({ type: 'task:status', data: { metadata: { prompt_overlay: 'x' } } })).toBe(true)
+    expect(containsForbiddenV2EventData({ type: 'task:status', data: { metadata: { storageLocator: 'opaque' } } })).toBe(true)
+    expect(containsForbiddenV2EventData({ type: 'task:status', data: { metadata: { prompt_sha256: 'abc' } } })).toBe(true)
+    expect(containsForbiddenV2EventData({ type: 'task:status', data: { status: 'SAFE-ROLLOUT-SENTINEL' } }, ['ROLLOUT-SENTINEL'])).toBe(true)
+    expect(containsForbiddenV2EventData({ type: 'unknown:event', data: { status: 'running' } })).toBe(true)
+    expect(containsForbiddenV2EventData({ type: 'task:status', data: { unexpectedSafeLookingField: true } })).toBe(true)
+    expect(containsForbiddenV2EventData({
+      type: 'task:status',
+      data: { errorMessage: { kind: 'unknown_legacy_digest', byteCount: 12 }, status: 'failed' },
+    })).toBe(false)
+    expect(containsForbiddenV2EventData({ type: 'task:status', data: { status: 'running', progress: 3 } })).toBe(false)
+  })
+
+  it('rechecks database and Redis zero scans before trusting a completed checkpoint', async () => {
+    const database = new FakeDatabase()
+    const redis = new FakeRedis()
+    const options = {
+      actor: 'operator',
+      authorizationReceiptId: RECEIPT,
+      mode: 'apply' as const,
+      operationId: 'completion-zero-scan',
+    }
+    const completed = await runLegacyLeakageScrub(options, { database, redis })
+    expect(completed.checkpoint?.state).toBe('complete')
+
+    database.workPackages = [workPackage()]
+    await expect(runLegacyLeakageScrub({ ...options, mode: 'resume' }, { database, redis }))
+      .rejects.toThrow('database or Redis leakage reappeared')
+    expect(database.authorizationChecks).toBe(2)
   })
 })
 
@@ -363,7 +445,9 @@ describe('legacy leakage Redis adapter', () => {
 
 describe('legacy leakage CLI and operator guide', () => {
   it('keeps dry-run, apply, resume, package command, and runbook examples in parity', async () => {
-    expect(parseLegacyLeakageScrubArgs(['--actor', 'operator'])).toMatchObject({ mode: 'dry-run' })
+    expect(parseLegacyLeakageScrubArgs([
+      '--actor', 'operator', '--authorization-receipt', RECEIPT,
+    ])).toMatchObject({ mode: 'dry-run', authorizationReceiptId: RECEIPT })
     expect(parseLegacyLeakageScrubArgs([
       '--actor', 'operator', '--apply', '--operation', 'operation-1',
       '--authorization-receipt', RECEIPT, '--sentinel', 'SENTINEL-A', '--sentinel', 'SENTINEL-B',
@@ -371,9 +455,10 @@ describe('legacy leakage CLI and operator guide', () => {
     expect(parseLegacyLeakageScrubArgs([
       '--actor', 'operator', '--resume', '--operation', 'operation-1', '--authorization-receipt', RECEIPT,
     ])).toMatchObject({ mode: 'resume' })
-    expect(() => parseLegacyLeakageScrubArgs(['--actor', 'operator', '--apply'])).toThrow(
-      '--operation and --authorization-receipt',
-    )
+    expect(() => parseLegacyLeakageScrubArgs(['--actor', 'operator'])).toThrow('--authorization-receipt')
+    expect(() => parseLegacyLeakageScrubArgs([
+      '--actor', 'operator', '--authorization-receipt', RECEIPT, '--apply',
+    ])).toThrow('--operation')
 
     const packageJson = JSON.parse(await readFile('package.json', 'utf8')) as { scripts: Record<string, string> }
     const runbook = await readFile('../docs/operators/legacy-leakage-scrub-v1.md', 'utf8')
@@ -386,6 +471,8 @@ describe('legacy leakage CLI and operator guide', () => {
       '--apply',
       '--resume',
       'architect_plan_entries',
+      'architect_plan_versions',
+      'work_packages',
       'forge:task-events:v2:{taskId}:history',
       'FORGE_DATABASE_ADMIN_URL',
     ]) {
@@ -393,5 +480,11 @@ describe('legacy leakage CLI and operator guide', () => {
     }
     expect(commandSource).toContain('process.env.FORGE_DATABASE_ADMIN_URL')
     expect(commandSource).not.toContain("getRequiredEnv('DATABASE_URL')")
+    expect(commandSource).toContain("receipt.owner_issue = 179")
+    expect(commandSource).toContain("predecessor.evidence_kind = 's4_expand'")
+    expect(commandSource).toContain("enablement.state = 'disabled'")
+    expect(commandSource).toContain("'legacy_prompt_and_event_data_zero_scan_green'")
+    expect(commandSource).toContain('select distinct plan_artifact_id from architect_plan_versions')
+    expect(commandSource).not.toContain('historyAvailable":true')
   })
 })

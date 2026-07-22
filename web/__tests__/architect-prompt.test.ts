@@ -313,7 +313,9 @@ describe('buildArchitectPrompt checkpoint resume context', () => {
     // previous plan even when it includes explanatory prose, and is excluded
     // from the revision guard.
     expect(source).toContain("prepared.questions.length > 0 && prepared.agentBreakdownSource !== 'fence'")
-    expect(source).toContain('preservePreviousPlan ? previousPlan : prepared.planText')
+    expect(source).toMatch(
+      /artifactPlanText\s*=\s*preservePreviousPlan\s*&&\s*previousPlan\s*!==\s*null\s*\?\s*previousPlan\s*:\s*prepared\.planText/,
+    )
     expect(source).toContain("previousPlan !== null && prepared.questions.length === 0 && prepared.planText.trim() === ''")
     expect(source).toContain('!isClarificationRound && prepared.planText.trim()')
   })

@@ -21,6 +21,7 @@ import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
 import { validateMcpOperatorReviewHistory } from '@/worker/mcp-plan-review'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
+import { sanitizeWorkPackageMetadata } from '@/lib/mcps/leakage-drain'
 
 // ---------------------------------------------------------------------------
 // GET /api/tasks/:id
@@ -32,26 +33,32 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function metadataString(metadata: unknown, key: string): string | null {
-  if (!isRecord(metadata)) return null
-  const value = metadata[key]
-  return typeof value === 'string' && value.trim().length > 0 ? value : null
-}
-
 function taskDetailWorkPackageMetadata(metadata: unknown): unknown {
-  if (!isRecord(metadata)) return metadata
-  const phases = metadata.mcpGrantPhases
+  const sanitized = sanitizeWorkPackageMetadata(metadata)
+  if (!isRecord(sanitized)) return sanitized
+  const phases = sanitized.mcpGrantPhases
   if (!isRecord(phases) || !isRecord(phases.effective) || !Object.hasOwn(phases.effective, 'grantNonce')) {
-    return metadata
+    return sanitized
   }
   const safeEffective = { ...phases.effective }
   delete safeEffective.grantNonce
   return {
-    ...metadata,
+    ...sanitized,
     mcpGrantPhases: {
       ...phases,
       effective: safeEffective,
     },
+  }
+}
+
+function taskDetailArtifact<T extends { artifactType: string; metadata: unknown }>(artifact: T): T {
+  const sanitized = sanitizeWorkPackageMetadata(artifact.metadata)
+  const protectedArchitectHistory = artifact.artifactType === 'adr_text'
+    && isRecord(sanitized)
+    && sanitized.historyAvailable === true
+  return {
+    ...artifact,
+    metadata: protectedArchitectHistory ? { historyAvailable: true } : sanitized,
   }
 }
 
@@ -177,8 +184,9 @@ export async function GET(
         .where(inArray(artifacts.agentRunId, runIds))
         .orderBy(asc(artifacts.createdAt))
     }
+    const safeTaskArtifacts = taskArtifacts.map(taskDetailArtifact)
     const artifactsByWorkPackageId = new Map<string, typeof taskArtifacts>()
-    for (const artifact of taskArtifacts) {
+    for (const artifact of safeTaskArtifacts) {
       const workPackageId = workPackageIdByRunId.get(artifact.agentRunId)
       if (!workPackageId) continue
       const existing = artifactsByWorkPackageId.get(workPackageId) ?? []
@@ -232,7 +240,6 @@ export async function GET(
         harnessRole: harness?.role ?? null,
         harnessDisplayName: harness?.displayName ?? null,
         harnessDescription: harness?.description ?? null,
-        promptOverlay: metadataString(pkg.metadata, 'promptOverlay'),
         artifacts: artifactsByWorkPackageId.get(pkg.id) ?? [],
       }
     })
@@ -248,7 +255,7 @@ export async function GET(
     return NextResponse.json({
       task,
       runs,
-      artifacts: taskArtifacts,
+      artifacts: safeTaskArtifacts,
       attempts,
       questions,
       workPackages: taskWorkPackagesWithPrompts,

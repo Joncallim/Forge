@@ -12,6 +12,10 @@ import { sanitizeLogStructuredValue } from '@/lib/task-log-sanitization'
 // SSE stream — GET /api/tasks/:id/runs
 // ---------------------------------------------------------------------------
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
@@ -76,13 +80,25 @@ export async function GET(
       const safeEventType = (type: string): string =>
         /^[a-z][a-z0-9:_-]{0,99}$/.test(type) ? type : 'event:unavailable'
 
-      const safeEventData = (data: unknown): unknown =>
-        sanitizeLogStructuredValue(data, {
+      const safeEventData = (type: string, data: unknown): unknown => {
+        const sanitized = sanitizeLogStructuredValue(data, {
           maxArrayItems: 100,
           maxDepth: 6,
           maxObjectKeys: 100,
           stringByteLimit: 16 * 1024,
         })
+        const protectedArchitectHistory = type === 'artifact:created'
+          && isRecord(sanitized)
+          && (
+            sanitized.historyAvailable === true
+            || (isRecord(sanitized.metadata) && sanitized.metadata.historyAvailable === true)
+          )
+        if (!protectedArchitectHistory) return sanitized
+        return {
+          ...(typeof sanitized.agentRunId === 'string' ? { agentRunId: sanitized.agentRunId } : {}),
+          historyAvailable: true,
+        }
+      }
 
       const eventHistoryKey = `forge:task-events:v2:${taskId}:history`
       const eventSequenceKey = `forge:task-events:v2:${taskId}:seq`
@@ -94,7 +110,7 @@ export async function GET(
       const persistAndSend = async (type: string, data: unknown) => {
         if (closed) return
         const safeType = safeEventType(type)
-        const safeData = safeEventData(data)
+        const safeData = safeEventData(safeType, data)
         const seq = await redis.incr(eventSequenceKey)
         const line = `id: ${seq}\nevent: ${safeType}\ndata: ${JSON.stringify(safeData)}\n\n`
         redis
@@ -107,12 +123,14 @@ export async function GET(
       // replaySend: enqueues the SSE line directly WITHOUT writing to the sorted set.
       // Used only during the replay loop to avoid re-persisting already-stored events.
       const replaySend = (seqId: number, type: string, data: unknown) => {
-        const line = `id: ${seqId}\nevent: ${safeEventType(type)}\ndata: ${JSON.stringify(safeEventData(data))}\n\n`
+        const safeType = safeEventType(type)
+        const line = `id: ${seqId}\nevent: ${safeType}\ndata: ${JSON.stringify(safeEventData(safeType, data))}\n\n`
         enqueue(line)
       }
 
       const sendSnapshotEvent = (type: string, data: unknown) => {
-        enqueue(`event: ${safeEventType(type)}\ndata: ${JSON.stringify(safeEventData(data))}\n\n`)
+        const safeType = safeEventType(type)
+        enqueue(`event: ${safeType}\ndata: ${JSON.stringify(safeEventData(safeType, data))}\n\n`)
       }
 
       const sendCurrentSnapshot = async () => {
@@ -187,16 +205,24 @@ export async function GET(
           .orderBy(asc(artifacts.createdAt))
 
         for (const artifact of existingArtifacts) {
-          sendSnapshotEvent('artifact:created', {
-            id: artifact.id,
-            artifactId: artifact.id,
-            agentRunId: artifact.agentRunId,
-            artifactType: artifact.artifactType,
-            content: artifact.content,
-            metadata: artifact.metadata,
-            createdAt: artifact.createdAt,
-            workPackageId: workPackageIdByRunId.get(artifact.agentRunId),
-          })
+          const protectedArchitectHistory = artifact.artifactType === 'adr_text'
+            && isRecord(artifact.metadata)
+            && artifact.metadata.historyAvailable === true
+          sendSnapshotEvent('artifact:created', protectedArchitectHistory
+            ? {
+                agentRunId: artifact.agentRunId,
+                historyAvailable: true,
+              }
+            : {
+                id: artifact.id,
+                artifactId: artifact.id,
+                agentRunId: artifact.agentRunId,
+                artifactType: artifact.artifactType,
+                content: artifact.content,
+                metadata: artifact.metadata,
+                createdAt: artifact.createdAt,
+                workPackageId: workPackageIdByRunId.get(artifact.agentRunId),
+              })
         }
 
         const existingQuestions = await db

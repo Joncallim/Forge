@@ -20,11 +20,23 @@ const mocks = vi.hoisted(() => ({
   materializeReviewGatesForWorkPackageCompletion: vi.fn(),
   completeTaskIfReviewGatesSatisfied: vi.fn(),
   executeWorkPackage: vi.fn(),
+  activateWorkPackageExecutionContext: vi.fn(),
   loadWorkPackageExecutionContext: vi.fn(),
+  loadWorkPackageExecutionPreflight: vi.fn(),
+  resolveProtectedArchitectPlanContext: vi.fn(),
   loadCurrentProjectFilesystemDecision: vi.fn().mockResolvedValue(null),
   publishTaskEvent: vi.fn(),
   projectionContributions: [] as Array<Record<string, unknown>>,
   recordTaskLogBestEffort: vi.fn(),
+  readS4RuntimeModeV1: vi.fn(),
+  recoverLinkedS4LifecycleV2: vi.fn(),
+  claimWorkPackageLifecycleV2: vi.fn(),
+  heartbeatLocalLifecycleV2: vi.fn(),
+  heartbeatPacketLifecycleV2: vi.fn(),
+  finalizeLocalFailureV2: vi.fn(),
+  finalizeLocalSuccessV2: vi.fn(),
+  finalizePacketFailureV2: vi.fn(),
+  finalizePacketSuccessV2: vi.fn(),
   projectionScopeState: 'active' as 'active' | 'archive_pending',
   WorkPackageExecutionError: class WorkPackageExecutionError extends Error {
     failureDetails: unknown
@@ -92,8 +104,11 @@ vi.mock('@/worker/review-gates', () => ({
 }))
 
 vi.mock('@/worker/work-package-executor', () => ({
+  activateWorkPackageExecutionContext: mocks.activateWorkPackageExecutionContext,
   executeWorkPackage: mocks.executeWorkPackage,
   loadWorkPackageExecutionContext: mocks.loadWorkPackageExecutionContext,
+  loadWorkPackageExecutionPreflight: mocks.loadWorkPackageExecutionPreflight,
+  resolveProtectedArchitectPlanContext: mocks.resolveProtectedArchitectPlanContext,
   MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS: 3,
   WorkPackageExecutionError: mocks.WorkPackageExecutionError,
   isArchitectReservedExecutionRole: (role: string) =>
@@ -103,6 +118,19 @@ vi.mock('@/worker/work-package-executor', () => ({
 vi.mock('@/lib/mcps/filesystem-grant-reconciliation', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/mcps/filesystem-grant-reconciliation')>(),
   loadCurrentProjectFilesystemDecision: mocks.loadCurrentProjectFilesystemDecision,
+}))
+
+vi.mock('@/lib/mcps/s4-lease', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/s4-lease')>(),
+  claimWorkPackageLifecycleV2: mocks.claimWorkPackageLifecycleV2,
+  heartbeatLocalLifecycleV2: mocks.heartbeatLocalLifecycleV2,
+  heartbeatPacketLifecycleV2: mocks.heartbeatPacketLifecycleV2,
+  finalizeLocalFailureV2: mocks.finalizeLocalFailureV2,
+  finalizeLocalSuccessV2: mocks.finalizeLocalSuccessV2,
+  finalizePacketFailureV2: mocks.finalizePacketFailureV2,
+  finalizePacketSuccessV2: mocks.finalizePacketSuccessV2,
+  readS4RuntimeModeV1: mocks.readS4RuntimeModeV1,
+  recoverLinkedS4LifecycleV2: mocks.recoverLinkedS4LifecycleV2,
 }))
 
 function fixtureSecret(...parts: string[]) {
@@ -440,7 +468,32 @@ describe('handoffApprovedWorkPackages', () => {
     })
     mocks.dbUpdate.mockReset()
     mocks.executeWorkPackage.mockReset()
+    mocks.activateWorkPackageExecutionContext.mockReset()
     mocks.loadWorkPackageExecutionContext.mockReset()
+    mocks.loadWorkPackageExecutionPreflight.mockReset()
+    mocks.resolveProtectedArchitectPlanContext.mockReset()
+    mocks.resolveProtectedArchitectPlanContext.mockImplementation(async (preflight) => preflight)
+    mocks.readS4RuntimeModeV1.mockReset()
+    mocks.readS4RuntimeModeV1.mockResolvedValue('legacy')
+    mocks.recoverLinkedS4LifecycleV2.mockReset()
+    mocks.recoverLinkedS4LifecycleV2.mockResolvedValue({
+      result: 'not_linked_v2',
+      completionArtifactId: null,
+    })
+    mocks.claimWorkPackageLifecycleV2.mockReset()
+    mocks.heartbeatLocalLifecycleV2.mockReset()
+    mocks.heartbeatLocalLifecycleV2.mockResolvedValue({ localLeaseExpiresAt: new Date() })
+    mocks.heartbeatPacketLifecycleV2.mockReset()
+    mocks.heartbeatPacketLifecycleV2.mockResolvedValue({
+      localLeaseExpiresAt: new Date(),
+      packetLeaseExpiresAt: new Date(),
+    })
+    mocks.finalizeLocalFailureV2.mockReset()
+    mocks.finalizeLocalFailureV2.mockResolvedValue(true)
+    mocks.finalizeLocalSuccessV2.mockReset()
+    mocks.finalizePacketFailureV2.mockReset()
+    mocks.finalizePacketFailureV2.mockResolvedValue(true)
+    mocks.finalizePacketSuccessV2.mockReset()
     mocks.loadCurrentProjectFilesystemDecision.mockReset()
     mocks.loadCurrentProjectFilesystemDecision.mockResolvedValue(null)
     mocks.getProjectMcpOverview.mockResolvedValue({
@@ -587,6 +640,50 @@ describe('handoffApprovedWorkPackages', () => {
       stage: 'handoff',
       status: 'awaiting_review',
       workPackageId: 'pkg-1',
+    }))
+  })
+
+  it('uses the atomic root-free protocol-v2 claim for a protected no-op handoff', async () => {
+    const runId = '00000000-0000-4000-8000-000000000101'
+    mocks.readS4RuntimeModeV1.mockResolvedValue('protected')
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'pkg-1',
+        assignedRole: 'backend',
+        harnessId: '00000000-0000-4000-8000-000000000102',
+        sequence: 1,
+        status: 'pending',
+        title: 'Backend package',
+      }]))
+      .mockReturnValueOnce(chain([]))
+    mocks.dbUpdate.mockReturnValueOnce(updateChain([{ id: 'pkg-1' }]))
+    mocks.claimWorkPackageLifecycleV2.mockResolvedValue({
+      mode: 'root_free_handoff',
+      agentRunId: runId,
+      localRunEvidenceId: null,
+      runtimeAuditId: null,
+      localClaimToken: null,
+      packetClaimToken: null,
+      localClaimGeneration: null,
+      packetClaimGeneration: null,
+      localLeaseExpiresAt: null,
+      packetLeaseExpiresAt: null,
+    })
+
+    const result = await handoffApprovedWorkPackages('task-1')
+
+    expect(result).toMatchObject({ status: 'handed_off', claimedPackageId: 'pkg-1' })
+    expect(mocks.claimWorkPackageLifecycleV2).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'root_free_handoff',
+      taskId: 'task-1',
+      workPackageId: 'pkg-1',
+      agentType: 'backend',
+      modelIdUsed: 'forge-handoff/no-op',
+    }))
+    expect(mocks.materializeReviewGatesForWorkPackageCompletion).toHaveBeenCalledWith(expect.objectContaining({
+      completeSourceRun: expect.objectContaining({ artifactType: 'log_output' }),
+      requireExecutionLease: true,
+      sourceAgentRunId: runId,
     }))
   })
 
@@ -1127,11 +1224,12 @@ describe('handoffApprovedWorkPackages', () => {
       ]),
     })
     expect(pkg.metadata).toMatchObject({
-      mcpAwareSubtasks: [],
+      mcpPromptContextPolicy: expect.objectContaining({ mcpAwareSubtaskCount: 0 }),
       mcpNormalizationErrors: expect.arrayContaining([
         expect.stringMatching(/mcpCapabilities exceeds the maximum raw count of 30/),
       ]),
     })
+    expect(pkg.metadata).not.toHaveProperty('mcpAwareSubtasks')
     const broker = evaluateWorkPackageMcpBroker({
       assignedRole: pkg.assignedRole,
       mcpOverview: overview,
@@ -2091,6 +2189,84 @@ describe('handoffApprovedWorkPackages', () => {
         process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
       }
     }
+  })
+
+  it('acquires atomic local lifecycle ownership before project-path activation', async () => {
+    process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    const order: string[] = []
+    const runId = '00000000-0000-4000-8000-000000000111'
+    mocks.readS4RuntimeModeV1.mockResolvedValue('protected')
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'pkg-1',
+        assignedRole: 'backend',
+        harnessId: null,
+        mcpRequirements: [],
+        metadata: {},
+        sequence: 1,
+        status: 'pending',
+        title: 'Backend package',
+      }]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+    mocks.dbUpdate.mockReturnValueOnce(updateChain([{ id: 'pkg-1' }]))
+    const preflight = {
+      agentConfig: null,
+      filesystemRuntime: { schemaVersion: 1, runtimeIssued: false, status: 'not_requested' },
+      modelIdUsed: 'test-model',
+      providerConfigId: '00000000-0000-4000-8000-000000000112',
+      project: {
+        id: 'project-1',
+        localPath: '/must-not-read-before-claim',
+        rootRef: 'root-ref-1',
+      },
+      projectFilesystemDecision: null,
+      task: { id: 'task-1' },
+      workPackage: {
+        id: 'pkg-1',
+        assignedRole: 'backend',
+        metadata: {},
+        mcpRequirements: [],
+        title: 'Backend package',
+      },
+    }
+    mocks.loadWorkPackageExecutionPreflight.mockImplementation(async () => {
+      order.push('preflight')
+      return preflight
+    })
+    mocks.resolveProtectedArchitectPlanContext.mockImplementation(async (value) => {
+      order.push('protected-context')
+      return value
+    })
+    mocks.claimWorkPackageLifecycleV2.mockImplementation(async () => {
+      order.push('claim')
+      return {
+        mode: 'local_only',
+        agentRunId: runId,
+        localRunEvidenceId: '00000000-0000-4000-8000-000000000113',
+        runtimeAuditId: null,
+        localClaimToken: '00000000-0000-4000-8000-000000000114',
+        packetClaimToken: null,
+        localClaimGeneration: '1',
+        packetClaimGeneration: null,
+        localLeaseExpiresAt: new Date(),
+        packetLeaseExpiresAt: null,
+      }
+    })
+    mocks.activateWorkPackageExecutionContext.mockImplementation(async () => {
+      order.push('path-activation')
+      throw new Error('synthetic realpath failure')
+    })
+
+    await expect(handoffApprovedWorkPackages('task-1')).rejects.toThrow('synthetic realpath failure')
+
+    expect(order).toEqual(['preflight', 'claim', 'protected-context', 'path-activation'])
+    expect(mocks.finalizeLocalFailureV2).toHaveBeenCalledWith(expect.objectContaining({
+      failureCode: 'local_execution_failed',
+      localRunEvidenceId: '00000000-0000-4000-8000-000000000113',
+    }))
+    expect(mocks.loadWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
   })
 
   it('keeps package execution failures retryable before the final approval attempt', async () => {

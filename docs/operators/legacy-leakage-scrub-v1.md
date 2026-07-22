@@ -1,8 +1,8 @@
 # Remove old task-log and event payloads
 
 This command removes historical text that older Forge versions may have copied
-into task logs, artifacts, or Redis event history. It does not change protected
-Architect plan history.
+into task logs, artifacts, work-package metadata, or Redis event history. It
+does not change protected Architect plan history.
 
 Run it only after the old web, worker, and event-publisher processes have stopped,
 their database and Redis write credentials have been revoked, and Forge has
@@ -21,31 +21,38 @@ The apply command:
   `legacy_task_log_unavailable` marker;
 - replaces content only for legacy `adr_text` artifacts owned by an Architect
   run; ordinary code, diff, test, review, and log artifact content is preserved;
-- leaves existing protected Architect history headers unchanged;
+- treats an Architect artifact as protected only when its ID is present in the
+  authoritative `architect_plan_versions` table; metadata such as
+  `historyAvailable` cannot claim this exemption;
 - recursively removes prompt and secret aliases from task-log front matter and
-  task-log or artifact metadata;
+  task-log, artifact, or `work_packages.metadata` values, including the old
+  `promptOverlay`, `requirementContexts`, and `mcpAwareSubtasks` producer fields;
 - keeps only count-only `unknown_legacy_digest` records for legacy output-like
   snapshots;
 - deletes old `forge:task:{taskId}:history` and
   `forge:task:{taskId}:seq` Redis keys;
-- checks that `forge:task-events:v2:{taskId}:history` values contain no forbidden
-  prompt, content, path, locator, digest, secret, or operator-provided sentinel;
+- checks that `forge:task-events:v2:{taskId}:history` values match the fixed
+  event-envelope allowlist and contain no forbidden prompt, content, path,
+  locator, digest, secret, or operator-provided sentinel;
 - saves a path-free checkpoint in `app_settings`, so a stopped command can resume.
 
-It never selects or updates `architect_plan_entries` or
-`architect_plan_versions`. It also does not change the database schema.
+It joins `architect_plan_versions` only to identify protected artifact IDs. It
+never reads protected entry content and never updates `architect_plan_entries`
+or `architect_plan_versions`. It also does not change the database schema.
 
 ## 1. Preview without changing anything
 
 From the `web/` directory, run:
 
 ```sh
-npm run protocol:scrub-legacy-leakage -- --actor <operator-id>
+npm run protocol:scrub-legacy-leakage -- --actor <operator-id> \
+  --authorization-receipt <s4-producers-disabled-receipt-id>
 ```
 
-The preview reads at most 100 rows from each database table unless you set a
-different `--batch-size`. It performs complete bounded Redis cursor scans. No
-checkpoint is created, no row is updated, and no Redis key is deleted.
+The preview verifies the same fixed signed receipt as apply and resume. It reads
+at most 100 rows from each database table unless you set a different
+`--batch-size`. It performs complete bounded Redis cursor scans. No checkpoint
+is created, no row is updated, and no Redis key is deleted.
 
 You may add the unique test strings used during rollout. Repeat `--sentinel` for
 more than one value:
@@ -53,6 +60,7 @@ more than one value:
 ```sh
 npm run protocol:scrub-legacy-leakage -- \
   --actor <operator-id> \
+  --authorization-receipt <s4-producers-disabled-receipt-id> \
   --sentinel <task-prompt-sentinel> \
   --sentinel <path-sentinel>
 ```
@@ -73,9 +81,12 @@ npm run protocol:scrub-legacy-leakage -- \
   --sentinel <task-prompt-sentinel>
 ```
 
-Apply is rejected if the receipt is missing or is not the S4
-`s4_producers_disabled` receipt. The actor and receipt are stored in the
-checkpoint and must remain identical on every resume.
+Every mode is rejected unless the receipt satisfies the fixed drain contract:
+the canonical issue 179 `s4_producers_disabled` manifest, its exact `s4_expand`
+predecessor and build bindings, its expected evidence names and signed-envelope
+shape, and the current authoritative enablement state of `disabled`. The actor
+and receipt are stored in the checkpoint and must remain identical on every
+resume.
 
 Each row is locked and compared with the fingerprint seen by the scanner. The row
 update and checkpoint update commit together. If another writer changes the row,
@@ -109,9 +120,11 @@ per invocation. Both default to bounded values. Repeat resume until the output h
 
 ## 4. Verify completion
 
-Run the same resume command once more. A completed operation performs read-only
-Redis verification. It fails if an old namespace key has reappeared or a v2 value
-contains a forbidden field or sentinel.
+Run the same resume command once more. A completed operation revalidates its
+authorization and performs read-only zero scans over all three database sources,
+both legacy Redis namespaces, and every v2 history value. It fails if database
+leakage or an old namespace key has reappeared, or if a v2 value is outside the
+fixed allowlist or contains a forbidden field or sentinel.
 
 Also verify the web route writes only these keys:
 
@@ -129,6 +142,10 @@ find zero old history or sequence keys.
   conflicts mean another writer is still active; stop and investigate it.
 - If a v2 Redis violation is found, do not delete the v2 key with this command.
   Identify and stop the producer, then repair through a separately reviewed path.
+- If a protected prompt context is required for a new work package, do not put
+  raw text back into metadata. The package remains blocked until the server-side
+  protected Architect-entry projection/resolution path provides an eligible
+  reference. That API is a separate implementation dependency.
 - If a completed operation later detects an old key, treat that as a revoked or
   undrained publisher recreating data. The command fails closed and does not hide
   the recurrence by deleting it automatically.

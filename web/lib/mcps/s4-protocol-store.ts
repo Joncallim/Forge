@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import postgres from 'postgres'
 import {
-  architectReplanReferenceForEntry,
   architectPlanEntryReference,
   materializeArchitectPlanEntries,
   parseArchitectPlanEntryReference,
@@ -138,27 +137,46 @@ export async function recordArchitectPlanVersion(input: {
 
 export async function resolveArchitectPlanEntry(input: {
   digestKey: Buffer
-  expectedPurpose?: 'package_specialist' | 'architect_replan'
-  reference: ArchitectPlanEntryReference
   referenceId: string
-  taskId: string
-}): Promise<{ content: string; entryId: string }> {
-  const reference = parseArchitectPlanEntryReference(input.reference)
-  if (!reference) throw new S4ProtocolStoreError('invalid_evidence', 'The Architect plan reference is malformed.')
+} & (
+  | {
+      expectedPurpose?: 'package_specialist'
+      reference: ArchitectPlanEntryReference
+      taskId: string
+    }
+  | {
+      expectedPurpose: 'architect_replan'
+      reference?: never
+      taskId?: never
+    }
+)): Promise<{ content: string; entryId: string }> {
+  const suppliedReference = input.expectedPurpose === 'architect_replan'
+    ? null
+    : parseArchitectPlanEntryReference(input.reference)
+  if (input.expectedPurpose !== 'architect_replan' && !suppliedReference) {
+    throw new S4ProtocolStoreError('invalid_evidence', 'The Architect plan reference is malformed.')
+  }
   return withDedicatedClient('FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL', async (sql) => {
     const rows = await sql<{
       agent: string | null
       bindingFingerprint: string | null
       content: string
       contentDigest: string
+      digestKeyId: string
       entryId: string
       entryKind: ArchitectPlanEntryEnvelope['entryKind']
+      planArtifactId: string
+      planVersion: string
       projectionEligible: boolean
       purpose: 'package_specialist' | 'architect_replan'
       requirementKey: string | null
+      taskId: string
     }[]>`
       select
         purpose,
+        task_id as "taskId",
+        plan_artifact_id as "planArtifactId",
+        plan_version::text as "planVersion",
         entry_id as "entryId",
         entry_kind as "entryKind",
         agent,
@@ -166,6 +184,7 @@ export async function resolveArchitectPlanEntry(input: {
         binding_fingerprint as "bindingFingerprint",
         content,
         content_digest as "contentDigest",
+        digest_key_id as "digestKeyId",
         projection_eligible as "projectionEligible"
       from forge.resolve_architect_plan_entry_v1(${input.referenceId}::uuid)
     `
@@ -175,11 +194,24 @@ export async function resolveArchitectPlanEntry(input: {
     if (row.purpose !== expectedPurpose) {
       throw new S4ProtocolStoreError('invalid_evidence', 'The Architect plan reference purpose did not match its consumer.')
     }
+    const returnedReference = parseArchitectPlanEntryReference({
+      schemaVersion: 1,
+      planArtifactId: row.planArtifactId,
+      planVersion: row.planVersion,
+      entryId: row.entryId,
+      digestKeyId: row.digestKeyId,
+      contentDigest: row.contentDigest,
+      requirementKey: row.requirementKey,
+      bindingFingerprint: row.bindingFingerprint,
+    })
+    if (!returnedReference) {
+      throw new S4ProtocolStoreError('invalid_evidence', 'The resolved Architect plan identity was malformed.')
+    }
     const envelope: ArchitectPlanEntryEnvelope = {
       schemaVersion: 1,
-      taskId: input.taskId,
-      planArtifactId: reference.planArtifactId,
-      planVersion: reference.planVersion,
+      taskId: row.taskId,
+      planArtifactId: returnedReference.planArtifactId,
+      planVersion: returnedReference.planVersion,
       entryId: row.entryId,
       entryKind: row.entryKind,
       agent: row.agent,
@@ -187,12 +219,14 @@ export async function resolveArchitectPlanEntry(input: {
       bindingFingerprint: row.bindingFingerprint,
       content: row.content,
       contentDigest: row.contentDigest,
-      digestKeyId: reference.digestKeyId,
+      digestKeyId: returnedReference.digestKeyId,
       projectionEligible: row.projectionEligible,
     }
     if (
-      row.entryId !== reference.entryId ||
-      row.contentDigest !== reference.contentDigest ||
+      (suppliedReference !== null && (
+        row.taskId !== input.taskId
+        || JSON.stringify(returnedReference) !== JSON.stringify(suppliedReference)
+      )) ||
       (expectedPurpose === 'package_specialist' && !row.projectionEligible) ||
       (expectedPurpose === 'architect_replan' && (
         row.entryKind !== 'plan_body'
@@ -214,32 +248,15 @@ export function executableReferenceForEntry(entry: ArchitectPlanEntryEnvelope): 
   return architectPlanEntryReference(entry)
 }
 
-export { architectReplanReferenceForEntry }
-
 export async function bindArchitectReplanEntry(input: {
   agentRunId: string
-  reference: ArchitectPlanEntryReference
   taskId: string
 }): Promise<string> {
-  const reference = parseArchitectPlanEntryReference(input.reference)
-  if (
-    !reference
-    || reference.entryId !== 'plan_body:000000'
-    || reference.requirementKey !== null
-    || reference.bindingFingerprint !== null
-  ) {
-    throw new S4ProtocolStoreError('invalid_evidence', 'The Architect replan source reference is malformed.')
-  }
   return withDedicatedClient('FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL', async (sql) => {
     const rows = await sql<{ referenceId: string }[]>`
       select forge.bind_architect_replan_entry_v1(
         ${input.taskId}::uuid,
-        ${input.agentRunId}::uuid,
-        ${reference.planArtifactId}::uuid,
-        ${reference.planVersion}::bigint,
-        ${reference.entryId}::text,
-        ${reference.contentDigest}::text,
-        ${reference.digestKeyId}::text
+        ${input.agentRunId}::uuid
       ) as "referenceId"
     `
     if (rows.length !== 1) {

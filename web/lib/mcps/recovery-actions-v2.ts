@@ -62,3 +62,14 @@ export function parsePacketIssuanceRecoveryRequest(value: unknown): PacketIssuan
   ) return null
   return value as PacketIssuanceRecoveryRequestV2
 }
+
+/** Generic stale-package cleanup delegates every linked local-v2 run here. */
+export async function delegateLinkedV2Cleanup(input: {
+  agentRunId: string
+}): Promise<{ result: S4LinkedRecoveryResult; completionArtifactId: string | null }> {
+  return recoverLinkedS4LifecycleV2(input)
+}
+import {
+  recoverLinkedS4LifecycleV2,
+  type S4LinkedRecoveryResult,
+} from './s4-lease'

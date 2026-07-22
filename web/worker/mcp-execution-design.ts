@@ -2,6 +2,10 @@ import { createHash } from 'crypto'
 import { MCP_EXECUTION_DESIGN_FENCE, findFence, isMcpExecutionDesignShape } from '@/lib/plan-fences'
 import { canonicalAgentPackageIdentity } from '@/lib/mcps/agent-package-identity'
 import {
+  parseArchitectPlanEntryReference,
+  type ArchitectPlanEntryReference,
+} from '@/lib/mcps/architect-plan-entries'
+import {
   capabilityMcpId,
   coverageKeysForGrant,
   mcpDeliveryKind,
@@ -195,6 +199,17 @@ const MAX_BROKER_GRANTS = 40
 const MAX_BROKER_NORMALIZATION_ITEMS = 200
 const MAX_BROKER_NESTED_ITEMS = 30
 const MAX_EXECUTOR_PROMPT_OVERLAY_LENGTH = 2_000
+const MAX_PROTECTED_PLAN_ENTRY_REFERENCES = 160
+
+type ProtectedPromptContextPolicy = {
+  schemaVersion: 1
+  state: 'not_required' | 'safe_policy_only' | 'protected_references_available'
+  promptOverlayPresent: boolean
+  requirementContextCount: number
+  mcpAwareSubtaskCount: number
+  eligibleReferenceCount: number
+  protectedCoverageComplete: boolean
+}
 
 function normalizeExecutorPromptOverlay(values: readonly unknown[]): string {
   return values
@@ -1279,6 +1294,106 @@ function boundedObjectArray(value: unknown, maxItems: number): Record<string, un
   return Array.isArray(value) && value.length <= maxItems ? value.filter(isRecord) : []
 }
 
+function protectedPromptContextState(metadata: unknown): {
+  errors: string[]
+  policy: ProtectedPromptContextPolicy | null
+  references: ArchitectPlanEntryReference[]
+} {
+  if (!isRecord(metadata)) return { errors: [], policy: null, references: [] }
+  const hasPolicy = Object.hasOwn(metadata, 'mcpPromptContextPolicy')
+  const hasReferences = Object.hasOwn(metadata, 'architectPlanEntryReferences')
+  if (!hasPolicy && !hasReferences) return { errors: [], policy: null, references: [] }
+
+  const errors: string[] = []
+  const rawPolicy = isRecord(metadata.mcpPromptContextPolicy)
+    ? metadata.mcpPromptContextPolicy
+    : null
+  const allowedPolicyKeys = new Set([
+    'schemaVersion', 'state', 'promptOverlayPresent', 'requirementContextCount',
+    'mcpAwareSubtaskCount', 'eligibleReferenceCount', 'protectedCoverageComplete',
+  ])
+  const boundedCount = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= MAX_PROTECTED_PLAN_ENTRY_REFERENCES
+  if (
+    !rawPolicy ||
+    Object.keys(rawPolicy).some((key) => !allowedPolicyKeys.has(key)) ||
+    rawPolicy.schemaVersion !== 1 ||
+    !['not_required', 'safe_policy_only', 'protected_references_available'].includes(String(rawPolicy.state)) ||
+    typeof rawPolicy.promptOverlayPresent !== 'boolean' ||
+    !boundedCount(rawPolicy.requirementContextCount) ||
+    !boundedCount(rawPolicy.mcpAwareSubtaskCount) ||
+    !boundedCount(rawPolicy.eligibleReferenceCount) ||
+    (rawPolicy.protectedCoverageComplete !== undefined && typeof rawPolicy.protectedCoverageComplete !== 'boolean')
+  ) {
+    errors.push('MCP schema v2 protected prompt-context policy is malformed.')
+  }
+  const policy: ProtectedPromptContextPolicy | null = errors.length === 0 && rawPolicy
+    ? {
+        schemaVersion: 1,
+        state: rawPolicy.state as ProtectedPromptContextPolicy['state'],
+        promptOverlayPresent: rawPolicy.promptOverlayPresent as boolean,
+        requirementContextCount: rawPolicy.requirementContextCount as number,
+        mcpAwareSubtaskCount: rawPolicy.mcpAwareSubtaskCount as number,
+        eligibleReferenceCount: rawPolicy.eligibleReferenceCount as number,
+        protectedCoverageComplete: rawPolicy.protectedCoverageComplete === true,
+      }
+    : null
+
+  const rawReferences = metadata.architectPlanEntryReferences
+  const references: ArchitectPlanEntryReference[] = []
+  if (hasReferences && (!Array.isArray(rawReferences) || rawReferences.length > MAX_PROTECTED_PLAN_ENTRY_REFERENCES)) {
+    errors.push(`MCP schema v2 protected Architect references must be an array of at most ${MAX_PROTECTED_PLAN_ENTRY_REFERENCES} entries.`)
+  } else if (Array.isArray(rawReferences)) {
+    rawReferences.forEach((value, index) => {
+      const parsed = parseArchitectPlanEntryReference(value)
+      if (!parsed) {
+        errors.push(`MCP schema v2 protected Architect reference ${index} is malformed.`)
+      } else {
+        references.push(parsed)
+      }
+    })
+  }
+
+  const identities = references.map((reference) => [
+    reference.planArtifactId,
+    reference.planVersion,
+    reference.entryId,
+    reference.contentDigest,
+  ].join('\0'))
+  if (new Set(identities).size !== identities.length) {
+    errors.push('MCP schema v2 protected Architect references contain a duplicate identity.')
+  }
+  const planIdentities = new Set(references.map((reference) => `${reference.planArtifactId}\0${reference.planVersion}`))
+  if (planIdentities.size > 1) {
+    errors.push('MCP schema v2 protected Architect references are ambiguous across plan versions.')
+  }
+  if (references.some((reference) => reference.requirementKey === null || reference.bindingFingerprint === null)) {
+    errors.push('MCP schema v2 protected Architect references include an ineligible package projection.')
+  }
+
+  if (policy) {
+    const overlayReferences = references.filter((reference) =>
+      reference.entryId.startsWith('overlay:') || reference.entryId.startsWith('requirement:'))
+    const subtaskReferences = references.filter((reference) => reference.entryId.startsWith('subtask:'))
+    if (policy.eligibleReferenceCount !== references.length) {
+      errors.push('MCP schema v2 protected prompt-context reference count does not match its policy.')
+    }
+    if (policy.state === 'protected_references_available') {
+      if (
+        !policy.protectedCoverageComplete ||
+        references.length === 0 ||
+        overlayReferences.length < policy.requirementContextCount ||
+        subtaskReferences.length < policy.mcpAwareSubtaskCount
+      ) {
+        errors.push('MCP schema v2 protected prompt-context references do not cover the declared policy.')
+      }
+    } else if (references.length > 0 || policy.protectedCoverageComplete) {
+      errors.push('MCP schema v2 ineligible protected prompt context cannot carry executable references.')
+    }
+  }
+
+  return { errors: [...new Set(errors)], policy, references }
+}
+
 function brokerEntries(input: { assignedRole?: string; mcpRequirements?: unknown; metadata?: unknown }): Record<string, unknown>[] {
   const fallbackAgent = cleanAgent(input.assignedRole) ?? 'unknown'
   const currentSchema = isRecord(input.metadata) && input.metadata.mcpGrantsSchemaVersion === 2
@@ -1325,6 +1440,7 @@ function brokerSchemaErrors(input: { mcpRequirements?: unknown; metadata?: unkno
   const currentSchema = metadata?.mcpGrantsSchemaVersion === 2
   const schemaLabel = currentSchema ? 'MCP schema v2' : 'Legacy MCP'
   const errors: string[] = []
+  errors.push(...protectedPromptContextState(input.metadata).errors)
   if (input.metadata !== undefined && input.metadata !== null && metadata === null) {
     errors.push('Legacy MCP metadata must be stored as a record.')
   }
@@ -1495,14 +1611,22 @@ function brokerSchemaErrors(input: { mcpRequirements?: unknown; metadata?: unkno
     }
     grants.filter(isRecord).forEach((grant, index) => {
       if (typeof grant.promptOverlayPresent !== 'boolean') return
-      const hasMatchingContext = validContexts.some((context) =>
+      const hasInlineContext = validContexts.some((context) =>
         context.requirementKey === grant.requirementKey &&
         context.sourceRequirementIndex === grant.sourceRequirementIndex &&
         context.agent === grant.agent &&
         context.mcpId === grant.mcpId &&
         cleanText(context.promptOverlay, 2_000) !== '',
       )
-      if (grant.promptOverlayPresent !== hasMatchingContext) {
+      const hasProtectedContext = brokerHasProtectedPromptContext(metadata, {
+        requirementKey: cleanText(grant.requirementKey, 200),
+        agent: cleanAgent(grant.agent) ?? '',
+        mcpId: cleanText(grant.mcpId, 80),
+      })
+      if (
+        (hasProtectedContext && grant.promptOverlayPresent !== false) ||
+        (!hasProtectedContext && grant.promptOverlayPresent !== hasInlineContext)
+      ) {
         errors.push(`MCP schema v2 grant envelope ${index} prompt evidence does not match its scoped requirement context.`)
       }
     })
@@ -1511,12 +1635,15 @@ function brokerSchemaErrors(input: { mcpRequirements?: unknown; metadata?: unkno
 }
 
 function brokerHasPromptInstructions(metadata: unknown): boolean {
+  const protectedContext = protectedPromptContextState(metadata)
   return isRecord(metadata) && (
     cleanText(metadata.promptOverlay, 200) !== '' ||
     boundedObjectArray(metadata.requirementContexts, MAX_REQUIREMENT_CONTEXTS).length > 0 ||
     brokerSubtasks(metadata).length > 0 ||
     brokerNormalizationErrors(metadata).length > 0 ||
     (Array.isArray(metadata.mcpNormalizationEvidence) && metadata.mcpNormalizationEvidence.length > 0)
+    || protectedContext.policy !== null
+    || protectedContext.references.length > 0
   )
 }
 
@@ -1535,6 +1662,22 @@ export function hasWorkPackageMcpRuntimeInputs(input: WorkPackageMcpRuntimeInput
   }
 }
 
+function brokerHasProtectedPromptContext(
+  metadata: unknown,
+  entry: { requirementKey: string; agent: string; mcpId: string },
+): boolean {
+  const protectedContext = protectedPromptContextState(metadata)
+  if (
+    protectedContext.errors.length > 0 ||
+    protectedContext.policy?.state !== 'protected_references_available' ||
+    !protectedContext.policy.protectedCoverageComplete
+  ) return false
+  const matches = protectedContext.references.filter((reference) =>
+    reference.requirementKey === entry.requirementKey &&
+    (reference.entryId.startsWith('overlay:') || reference.entryId.startsWith('requirement:')))
+  return matches.length === 1
+}
+
 function brokerHasPromptContext(metadata: unknown, entry: { requirementKey: string; agent: string; mcpId: string }, entries: Record<string, unknown>[]): boolean {
   const meta = isRecord(metadata) ? metadata : {}
   if (boundedObjectArray(meta.requirementContexts, MAX_REQUIREMENT_CONTEXTS).some((context) =>
@@ -1543,6 +1686,7 @@ function brokerHasPromptContext(metadata: unknown, entry: { requirementKey: stri
     context.mcpId === entry.mcpId &&
     cleanText(context.promptOverlay, 2_000) !== '',
   )) return true
+  if (brokerHasProtectedPromptContext(metadata, entry)) return true
   const rawPolicies = entries.filter((candidate) => !Object.hasOwn(candidate, 'decisionId'))
   const legacyCandidates = rawPolicies.filter((candidate) => cleanText(candidate.mcpId, 80) === entry.mcpId && mcpDeliveryKind(entry.mcpId) === 'planning_context_only')
   return !Object.hasOwn(rawPolicies.find((candidate) => candidate.requirementKey === entry.requirementKey) ?? {}, 'requirementKey') && legacyCandidates.length === 1 && cleanText(meta.promptOverlay, 2_000) !== ''

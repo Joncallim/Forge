@@ -20,6 +20,12 @@ import { canonicalAgentPackageIdentity } from '../lib/mcps/agent-package-identit
 import type { PreparedArchitectArtifact } from './architect-artifact'
 import type { ReviewRequirement } from './agent-breakdown'
 import { isImplementationPackageRole } from './review-gates'
+import {
+  architectPlanEntryReference,
+  parseArchitectPlanEntryReference,
+  type ArchitectPlanEntryEnvelope,
+  type ArchitectPlanEntryReference,
+} from '../lib/mcps/architect-plan-entries'
 
 type JsonObject = Record<string, unknown>
 type AgentHarnessInsert = typeof agentHarnesses.$inferInsert & { id: string; slug: string; role: string }
@@ -38,6 +44,7 @@ export type WorkforceMaterializationInput = {
   architectRunId: string
   artifactId: string
   prepared: PreparedArchitectArtifact
+  protectedArchitectPlanEntries?: ArchitectPlanEntryEnvelope[]
 }
 
 export type WorkforceMaterializationResult = {
@@ -180,7 +187,10 @@ function mcpGrantsForAgent(prepared: PreparedArchitectArtifact, agentType: strin
       assignment: decision.assignment,
       fallback: decision.fallback,
       health: decision.health,
-      promptOverlayPresent: decision.promptOverlayPresent,
+      // Protected prompt text is represented by one-use content-free references,
+      // not by an inline grant-envelope overlay. The protected policy below owns
+      // the separate indication that prompt context exists.
+      promptOverlayPresent: false,
     }))
 }
 
@@ -220,38 +230,76 @@ function requirementAgentsForMaterialization(
   return [...agents]
 }
 
-function mcpRequirementContextsForAgent(
+function mcpPromptContextForAgent(
   prepared: PreparedArchitectArtifact,
+  protectedEntries: readonly ArchitectPlanEntryEnvelope[],
+  taskId: string,
+  artifactId: string,
   agentType: string,
   aliases: string[],
-): JsonObject[] {
+): Readonly<{ policy: JsonObject; references: ArchitectPlanEntryReference[] }> {
   const design = prepared.mcpExecutionDesign.proposed
-  if (!design) return []
-  return (design.requirementContexts ?? [])
+  if (!design) {
+    return {
+      policy: {
+        schemaVersion: 1,
+        state: 'not_required',
+        promptOverlayPresent: false,
+        requirementContextCount: 0,
+        mcpAwareSubtaskCount: 0,
+        eligibleReferenceCount: 0,
+      },
+      references: [],
+    }
+  }
+
+  const contexts = (design.requirementContexts ?? [])
     .filter((context) => roleMatches(context.agent, agentType, aliases))
-    .map((context) => ({ ...context, agent: agentType }))
-}
-
-function mcpSubtasksForAgent(prepared: PreparedArchitectArtifact, agentType: string, aliases: string[]): JsonObject[] {
-  const design = prepared.mcpExecutionDesign.proposed
-  if (!design) return []
-
-  return design.mcpAwareSubtasks
+  const legacyOverlays = matchingObjectValues(design.promptOverlays, agentType, aliases)
+  const subtasks = design.mcpAwareSubtasks
     .filter((subtask) => roleMatches(subtask.agent, agentType, aliases))
-    .map((subtask) => ({
-      id: subtask.id,
-      agent: agentType,
-      scope: subtask.scope ?? { kind: 'project' },
-      accessMode: subtask.accessMode ?? 'planning_instruction',
-      dependsOn: subtask.dependsOn,
-      mcpCapabilities: subtask.mcpCapabilities,
-      capabilityBindings: subtask.capabilityBindings ?? [],
-      inputs: subtask.inputs,
-      outputs: subtask.outputs,
-      verification: subtask.verification,
-      stoppingCondition: subtask.stoppingCondition,
-      fallback: subtask.fallback,
-    }))
+  const promptOverlayPresent = contexts.some((context) => context.promptOverlay.trim() !== '')
+    || legacyOverlays.some((overlay) => overlay.trim() !== '')
+  const matchingEntries = protectedEntries.filter((entry) =>
+    entry.taskId === taskId
+      && entry.planArtifactId === artifactId
+      && entry.projectionEligible
+      && entry.agent !== null
+      && roleMatches(entry.agent, agentType, aliases)
+  )
+  const referencePairs = matchingEntries.flatMap((entry) => {
+    const reference = architectPlanEntryReference(entry)
+    return parseArchitectPlanEntryReference(reference) ? [{ entry, reference }] : []
+  })
+  const referencedEntries = referencePairs.map(({ entry }) => entry)
+  const references: ArchitectPlanEntryReference[] = referencePairs.map(({ reference }) => reference)
+  const contextCoverageComplete = contexts.every((context) => referencedEntries.some((entry) =>
+    (entry.entryKind === 'overlay' || entry.entryKind === 'requirement')
+      && entry.requirementKey === context.requirementKey
+  ))
+  const subtaskCoverageComplete = referencedEntries.filter((entry) => entry.entryKind === 'subtask').length >= subtasks.length
+  const protectedContextRequired = promptOverlayPresent || contexts.length > 0 || subtasks.length > 0
+  const protectedCoverageComplete = protectedContextRequired
+    && references.length > 0
+    && contextCoverageComplete
+    && subtaskCoverageComplete
+
+  return {
+    policy: {
+      schemaVersion: 1,
+      state: protectedCoverageComplete
+        ? 'protected_references_available'
+        : protectedContextRequired
+          ? 'safe_policy_only'
+          : 'not_required',
+      promptOverlayPresent,
+      requirementContextCount: contexts.length,
+      mcpAwareSubtaskCount: subtasks.length,
+      eligibleReferenceCount: references.length,
+      protectedCoverageComplete,
+    },
+    references,
+  }
 }
 
 function planningOnlyHarnessMetadata(): JsonObject {
@@ -390,11 +438,14 @@ export function buildWorkforceMaterializationRows(
     const aliases = roleAliases(agent.role, agentType)
     const mcpGrants = mcpGrantsForAgent(input.prepared, agentType, aliases)
     const mcpRequirements = mcpRequirementsForAgent(input.prepared, agentType, aliases)
-    const mcpSubtasks = mcpSubtasksForAgent(input.prepared, agentType, aliases)
-    const requirementContexts = mcpRequirementContextsForAgent(input.prepared, agentType, aliases)
-    const promptOverlay = requirementContexts.length > 0
-      ? requirementContexts.map((context) => context.promptOverlay).filter((value): value is string => typeof value === 'string').join('\n\n') || null
-      : null
+    const mcpPromptContext = mcpPromptContextForAgent(
+      input.prepared,
+      input.protectedArchitectPlanEntries ?? [],
+      input.taskId,
+      input.artifactId,
+      agentType,
+      aliases,
+    )
 
     harnesses.push({
       id: harnessId,
@@ -429,10 +480,11 @@ export function buildWorkforceMaterializationRows(
         validationStatus: input.prepared.mcpExecutionDesign.validation.status,
       }),
       harnessSemantics: planningOnlyHarnessMetadata(),
-      promptOverlay,
-      requirementContexts,
+      mcpPromptContextPolicy: mcpPromptContext.policy,
+      ...(mcpPromptContext.references.length > 0
+        ? { architectPlanEntryReferences: mcpPromptContext.references }
+        : {}),
       plannedTasks: agent.tasks,
-      mcpAwareSubtasks: mcpSubtasks,
     }
     const projectGrant = projectFilesystemGrantCovers({
       mcpConfig: options.projectMcpConfig,

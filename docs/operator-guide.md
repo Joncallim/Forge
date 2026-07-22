@@ -335,6 +335,7 @@ Set these for both the web process and worker:
 | `DATABASE_URL` | PostgreSQL connection string |
 | `REDIS_URL` | Redis connection string |
 | `SESSION_SECRET` | Secret value used for local session material |
+| `FORGE_SESSION_CREDENTIAL_MODE` | Session rollout mode. Keep `strict` on fresh installs; use `dual` only while old web processes are still draining. |
 | `NEXT_PUBLIC_APP_URL` | Public browser URL for Forge |
 
 Passkey deployments also need:
@@ -450,6 +451,61 @@ npm run db:migrate
 
 If you changed the schema, follow the developer workflow in
 [developer-guide.md](developer-guide.md).
+
+### Session credential upgrade in migration 0027
+
+Migration 0027 adds the new session fields but deliberately leaves old rows
+and old Redis keys unchanged. Old sessions get their expiry from Redis, so a
+database migration cannot safely guess that lifetime.
+
+For a rolling deployment, use this order:
+
+1. Set `FORGE_SESSION_CREDENTIAL_MODE=dual` on the new web processes. New
+   processes then write both the old and new Redis key formats while old web
+   processes finish their requests.
+2. Stop or drain every old web process. Set the mode back to `strict` and
+   restart the new processes. Do this before reconciliation.
+3. Preview the database state. This command changes nothing:
+
+   ```bash
+   cd web
+   npm run session-credentials:reconcile
+   ```
+
+4. Reconcile and purge old keys:
+
+   ```bash
+   npm run session-credentials:reconcile -- --apply
+   ```
+
+   The command reads Redis `PEXPIRETIME`, copies that exact absolute expiry to
+   PostgreSQL, writes the digest-keyed cache, records a pending purge, deletes
+   the old key, and only then replaces the raw-cookie database ID. A malformed,
+   missing, expired, or non-expiring legacy key is revoked instead of receiving
+   a guessed lifetime.
+5. Rerun the same command until it reports zero remaining rows. It is designed
+   to resume after a process or network failure.
+6. Apply the strict cutover only after the drain is complete:
+
+   ```bash
+   npm run session-credentials:reconcile -- --apply --finalize
+   ```
+
+   Finalization performs a zero scan before making the digest and expiry
+   columns required. It refuses to continue if a raw-cookie ID or pending Redis
+   purge remains.
+
+If reconciliation fails, leave the web processes in `strict` mode, fix the
+PostgreSQL or Redis problem, and rerun it. Before any row has been processed,
+you may return the reconciliation state to `expansion` and temporarily restore
+`dual` mode. After an old key has been purged, do not roll back to old web code:
+that code cannot read the new key, and affected users would need to sign in
+again. After `--finalize`, rollback means restoring the new application and
+database together from a pre-cutover backup; do not drop the strict constraints
+or recreate raw-cookie keys by hand.
+
+The command requires PostgreSQL 16 or newer and Redis 7 or newer on both macOS
+and Linux. `--help` is safe to run without either service configured.
 
 ## Runtime Health
 

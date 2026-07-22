@@ -77,17 +77,6 @@ function artifact(content: string, metadata: Record<string, unknown> = {}) {
   }
 }
 
-const protectedReplanReference = {
-  schemaVersion: 1,
-  planArtifactId: '33333333-3333-4333-8333-333333333333',
-  planVersion: '2',
-  entryId: 'plan_body:000000',
-  digestKeyId: 'test-key-v1',
-  contentDigest: `hmac-sha256:${'c'.repeat(64)}`,
-  requirementKey: null,
-  bindingFingerprint: null,
-} as const
-
 function configureProtectedReplan(): void {
   process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL = 'postgresql://writer/test'
   process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX = 'a'.repeat(64)
@@ -101,7 +90,6 @@ function protectedArtifact() {
     metadata: {
       historyAvailable: true,
       planVersion: '2',
-      architectReplanReference: protectedReplanReference,
     },
   }
 }
@@ -187,17 +175,11 @@ describe('Architect plan storage compatibility', () => {
     mockDbUpdate.mockReturnValue(chain([artifact(
       'Architect plan available in protected history',
       {
+        schemaVersion: 1,
+        stage: 'architect_plan',
         historyAvailable: true,
-        architectReplanReference: {
-          schemaVersion: 1,
-          planArtifactId: artifactId,
-          planVersion: '1',
-          entryId: 'plan_body:000000',
-          digestKeyId: 'test-key-v1',
-          contentDigest: `hmac-sha256:${'c'.repeat(64)}`,
-          requirementKey: null,
-          bindingFingerprint: null,
-        },
+        planVersion: '1',
+        entryCount: 1,
       },
     )], undefined, (value) => updatedValues.push(value)))
 
@@ -212,15 +194,24 @@ describe('Architect plan storage compatibility', () => {
     }))
     expect(mockDbInsert).not.toHaveBeenCalled()
     expect(updatedValues).toEqual([expect.objectContaining({
-      metadata: expect.objectContaining({
-        architectReplanReference: expect.objectContaining({
-          entryId: 'plan_body:000000',
-          contentDigest: `hmac-sha256:${'c'.repeat(64)}`,
-        }),
-      }),
+      metadata: {
+        schemaVersion: 1,
+        stage: 'architect_plan',
+        historyAvailable: true,
+        planVersion: '1',
+        entryCount: 1,
+      },
     })])
+    expect(JSON.stringify(updatedValues)).not.toContain('contentDigest')
+    expect(JSON.stringify(updatedValues)).not.toContain('architectReplanReference')
     expect(JSON.stringify(updatedValues)).not.toContain('# Protected plan')
     expect(JSON.stringify(mockPublishTaskEvent.mock.calls)).not.toContain('# Protected plan')
+    expect(mockPublishTaskEvent).toHaveBeenCalledWith(taskId, 'artifact:created', {
+      agentRunId: runId,
+      historyAvailable: true,
+    })
+    expect(JSON.stringify(mockPublishTaskEvent.mock.calls)).not.toContain('planVersion')
+    expect(JSON.stringify(mockPublishTaskEvent.mock.calls)).not.toContain('entryCount')
   })
 })
 
@@ -281,6 +272,10 @@ describe('Architect durable replan source', () => {
       expectedPurpose: 'architect_replan',
       referenceId: '44444444-4444-4444-8444-444444444444',
     }))
+    expect(mockBindArchitectReplanEntry).toHaveBeenCalledWith({
+      agentRunId: '22222222-2222-4222-8222-222222222222',
+      taskId: '11111111-1111-4111-8111-111111111111',
+    })
   })
 
   it('resolves protected history ahead of a truncated checkpoint', async () => {
@@ -303,7 +298,7 @@ describe('Architect durable replan source', () => {
     expect(mockResolveArchitectPlanEntry).toHaveBeenCalledOnce()
   })
 
-  it('fails closed when protected configuration or reference metadata is missing', async () => {
+  it('fails closed when protected configuration is missing and needs no public replan locator', async () => {
     const { previousPlanForArchitectRun } = await import('@/worker/orchestrator')
     await expect(previousPlanForArchitectRun({
       agentRunId: '22222222-2222-4222-8222-222222222222',
@@ -322,8 +317,8 @@ describe('Architect durable replan source', () => {
       },
       checkpoint: null,
       taskId: '11111111-1111-4111-8111-111111111111',
-    })).rejects.toThrow(/metadata is missing or invalid.*failed closed/i)
-    expect(mockBindArchitectReplanEntry).not.toHaveBeenCalled()
+    })).resolves.toBe('# Prior protected plan\n\nKeep this.')
+    expect(mockBindArchitectReplanEntry).toHaveBeenCalledOnce()
   })
 
   it('does not retry or fall back when the one-use protected resolver fails', async () => {
