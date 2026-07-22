@@ -2,7 +2,7 @@ import { streamText } from 'ai'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { db } from '../db'
-import { agentConfigs, agentRuns, artifacts, projects, taskQuestions, tasks } from '../db/schema'
+import { agentConfigs, agentRuns, artifacts, projects, taskQuestions, tasks, type Task } from '../db/schema'
 import { getModel, getProvider } from '../lib/providers/registry'
 import { resolveDefaultProvider } from '../lib/providers/default'
 import { and, asc, desc, eq } from 'drizzle-orm'
@@ -17,6 +17,7 @@ import {
 } from './architect-context'
 import type { OpenQuestion } from './open-questions'
 import { getProjectMcpOverview } from '../lib/mcps/manager'
+import { loadCurrentProjectFilesystemDecision } from '../lib/mcps/filesystem-grant-reconciliation'
 import type { ProjectMcpOverview } from '../lib/mcps/types'
 import {
   assertTargetedPlanRevision,
@@ -43,7 +44,7 @@ import {
 import { completeTaskIfReviewGatesSatisfied } from './review-gates'
 import { sanitizeWorkerMessage } from './redaction'
 
-type TaskRow = typeof tasks.$inferSelect
+type TaskRow = Task
 type ProjectRow = typeof projects.$inferSelect
 type AgentConfigRow = typeof agentConfigs.$inferSelect
 
@@ -661,7 +662,8 @@ async function runArchitect(
   let text = ''
 
   try {
-    const mcpOverview = await getProjectMcpOverview(project)
+    const projectFilesystemDecision = await loadCurrentProjectFilesystemDecision(project.id)
+    const mcpOverview = await getProjectMcpOverview(project, projectFilesystemDecision)
     let usage: { inputTokens: number | null; outputTokens: number | null } = {
       inputTokens: null,
       outputTokens: null,
@@ -1315,6 +1317,7 @@ async function publishHandoffResult(
     claimedPackageId: handoff.claimedPackageId,
     readyPackageIds: handoff.readyPackageIds,
     blockedReason: handoff.status === 'blocked' ? handoff.blockedReason : undefined,
+    taskDisposition: handoff.status === 'blocked' ? handoff.taskDisposition : undefined,
     status: handoff.status,
     terminalBlock: handoff.status === 'blocked' ? handoff.terminalBlock : undefined,
   })

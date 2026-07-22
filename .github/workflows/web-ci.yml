@@ -48,6 +48,13 @@ jobs:
       NEXT_PUBLIC_APP_URL: http://localhost:3000
     steps:
       - uses: actions/checkout@v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Reject whitespace errors in the pull-request diff
+        if: github.event_name == 'pull_request'
+        working-directory: .
+        run: git diff --check "${{ github.event.pull_request.base.sha }}...HEAD"
 
       - uses: actions/setup-node@v6.4.0
         with:
@@ -69,13 +76,24 @@ jobs:
             LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
             PASSWORD 'forge_app_test';
           CREATE DATABASE forge_epic_172_ci_test OWNER forge_migration_test;
+          CREATE DATABASE forge_migration_0026_upgrade_test OWNER forge_migration_test;
           SQL
+      - name: Prove populated migration 0025 to 0026 upgrade
+        run: bash scripts/ci/prove-migration-0026-upgrade.sh
+        env:
+          FORGE_MIGRATION_0026_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_migration_0026_upgrade_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_migration_0026_upgrade_test
       - name: Bootstrap Epic 172 release roles
         run: npm run protocol:bootstrap-epic-172-release-roles
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
           # The disposable CI database login owns this isolated PostgreSQL
           # service and is therefore the short-lived administrator here.
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+      - name: Bootstrap migration-0026 S3 release ownership
+        run: npm run protocol:bootstrap-epic-172-s3-release-owner
+        env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
       - name: Configure disposable release-principal passwords
         working-directory: .
@@ -118,7 +136,10 @@ jobs:
                   'forge_epic_172_transition_authorizations',
                   'forge_epic_172_release_evidence_consumptions',
                   'forge_epic_172_enablement_state',
-                  'forge_epic_172_enablement_transition_audits'
+                  'forge_epic_172_enablement_transition_audits',
+                  'forge_epic_172_s3_release_state',
+                  'work_package_local_projection_sources',
+                  'work_package_local_projection_heads'
                 ])
             LOOP
               EXECUTE format(
@@ -174,6 +195,39 @@ jobs:
                 END IF;
               END LOOP;
             END LOOP;
+            IF NOT has_table_privilege(
+              current_user,
+              'public.forge_epic_172_s3_release_state',
+              'SELECT'
+            ) THEN
+              RAISE EXCEPTION 'ordinary app cannot read the S3 release projection';
+            END IF;
+            FOREACH release_privilege IN ARRAY ARRAY[
+              'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
+            ] LOOP
+              IF has_table_privilege(
+                current_user,
+                'public.forge_epic_172_s3_release_state',
+                release_privilege
+              ) THEN
+                RAISE EXCEPTION 'ordinary app unexpectedly has % on the S3 release projection', release_privilege;
+              END IF;
+            END LOOP;
+            FOREACH release_table IN ARRAY ARRAY[
+              'public.work_package_local_projection_sources',
+              'public.work_package_local_projection_heads'
+            ] LOOP
+              IF NOT has_table_privilege(current_user, release_table, 'SELECT') THEN
+                RAISE EXCEPTION 'ordinary app cannot read local projection table %', release_table;
+              END IF;
+              FOREACH release_privilege IN ARRAY ARRAY[
+                'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
+              ] LOOP
+                IF has_table_privilege(current_user, release_table, release_privilege) THEN
+                  RAISE EXCEPTION 'ordinary app unexpectedly has % on %', release_privilege, release_table;
+                END IF;
+              END LOOP;
+            END LOOP;
             IF EXISTS (
               SELECT 1
               FROM pg_catalog.pg_tables
@@ -189,17 +243,19 @@ jobs:
               JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
               WHERE n.nspname = 'forge'
                 AND has_function_privilege(current_user, p.oid, 'EXECUTE')
-            ) IS DISTINCT FROM ARRAY['read_epic_172_enablement_state_v1']::name[] THEN
+            ) IS DISTINCT FROM ARRAY[
+              'advance_local_projection_head_v1',
+              'read_epic_172_enablement_state_v1'
+            ]::name[] THEN
               RAISE EXCEPTION 'ordinary app has an unexpected Epic 172 routine ACL';
             END IF;
           END;
           $verify_application_acl$;
           SQL
-      - run: npm run lint
+      - run: npm run lint -- --max-warnings=0
       - run: npx tsc --noEmit
-      - run: npm test
-      - name: Prove Epic 172 writer, transition, and ordinary-app PostgreSQL boundaries
-        run: npx vitest run __tests__/epic-172-release-recorder.postgres.test.ts
+      - name: Run the complete zero-skip unit suite
+        run: npm test
         env:
           FORGE_EPIC_172_REQUIRE_POSTGRES_TEST: '1'
           FORGE_EPIC_172_TEST_APP_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_epic_172_ci_test
@@ -207,6 +263,22 @@ jobs:
           FORGE_EPIC_172_TEST_TRANSITION_DATABASE_URL: postgresql://forge_release_transition:forge_transition_test@localhost:5432/forge_epic_172_ci_test
       - run: npm run build
       - run: npx playwright install chromium
+      - name: Run mandatory S3 PostgreSQL concurrency proof
+        env:
+          RUN_FORGE_POSTGRES_TESTS: '1'
+        run: |
+          set -o pipefail
+          report="$(mktemp)"
+          npx playwright test e2e/filesystem-grant-lifecycle-concurrency.spec.ts \
+            --project=chromium-desktop --workers=1 --retries=0 --reporter=line | tee "$report"
+          if grep -Eq '[1-9][0-9]* skipped' "$report"; then
+            echo 'The mandatory S3 PostgreSQL concurrency proof was skipped.' >&2
+            exit 1
+          fi
+          if ! grep -Eq '[1-9][0-9]* passed' "$report"; then
+            echo 'The mandatory S3 PostgreSQL concurrency proof did not report a passing test.' >&2
+            exit 1
+          fi
       - name: Prove Epic 172 Step 0 disabled ingress and mixed-lock recovery
         run: npm run e2e:epic-172-disabled-ingress
       - name: Run the fail-closed Epic 172 Step 0 E2E bridge suite

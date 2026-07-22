@@ -5,6 +5,7 @@ const mockGetAccessibleTask = vi.fn()
 const mockSelect = vi.fn()
 const mockUpdate = vi.fn()
 const mockGetProjectMcpOverview = vi.fn()
+const mockLoadCurrentProjectFilesystemDecision = vi.fn()
 const mockRedisLpush = vi.fn()
 const mockRedisPublish = vi.fn()
 const mockGuardEpic172ProjectManagementIngress = vi.fn().mockResolvedValue(null)
@@ -31,6 +32,10 @@ vi.mock('@/db', () => ({
 vi.mock('@/lib/mcps/manager', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/mcps/manager')>(),
   getProjectMcpOverview: mockGetProjectMcpOverview,
+}))
+vi.mock('@/lib/mcps/filesystem-grant-reconciliation', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/filesystem-grant-reconciliation')>(),
+  loadCurrentProjectFilesystemDecision: mockLoadCurrentProjectFilesystemDecision,
 }))
 vi.mock('@/lib/redis', () => ({
   redis: { lpush: mockRedisLpush, publish: mockRedisPublish },
@@ -72,6 +77,7 @@ describe('POST /api/tasks/:id/mcp-plan-review', () => {
     mockUpdate.mockReset()
     mockGetSession.mockResolvedValue({ userId: 'user-1' })
     mockGetAccessibleTask.mockResolvedValue({ id: 'task-1', status: 'awaiting_approval' })
+    mockLoadCurrentProjectFilesystemDecision.mockResolvedValue(null)
     mockUpdate.mockReturnValue(chain([]))
     mockRedisLpush.mockResolvedValue(1)
     mockRedisPublish.mockResolvedValue(1)

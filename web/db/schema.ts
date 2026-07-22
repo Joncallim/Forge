@@ -11,6 +11,7 @@ import {
   bigint,
   customType,
   check,
+  foreignKey,
   index,
   uniqueIndex,
 } from 'drizzle-orm/pg-core'
@@ -190,6 +191,16 @@ export const projects = pgTable('projects', {
     .$type<ProjectMcpConfig>()
     .notNull()
     .default(sql`'{"profile":"default","requiredMcps":["filesystem","github"],"overrides":{}}'::jsonb`),
+  // S3 serializes this BIGINT as a canonical decimal string at every JSON/API
+  // boundary. Database order, never timestamps, decides grant precedence.
+  grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' })
+    .notNull()
+    .default(sql`0`),
+  // Zero is the explicit unbound state. S4 binds a project root by advancing
+  // this counter; S3 never upgrades a legacy decision implicitly.
+  rootBindingRevision: bigint('root_binding_revision', { mode: 'bigint' })
+    .notNull()
+    .default(sql`0`),
   defaultBranch: text('default_branch').notNull().default('main'),
   createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
@@ -445,6 +456,51 @@ export const forgeEpic172ReleaseEvidenceConsumptions = pgTable(
 export type ForgeEpic172ReleaseEvidenceConsumption = InferSelectModel<typeof forgeEpic172ReleaseEvidenceConsumptions>
 export type NewForgeEpic172ReleaseEvidenceConsumption = InferInsertModel<typeof forgeEpic172ReleaseEvidenceConsumptions>
 
+export const forgeEpic172S3ReleaseState = pgTable(
+  'forge_epic_172_s3_release_state',
+  {
+    singletonId: text('singleton_id').primaryKey(),
+    state: text('state').notNull(),
+    stateFingerprint: text('state_fingerprint').notNull(),
+    predecessorReceiptId: uuid('predecessor_receipt_id')
+      .references(() => forgeEpic172ReleaseEvidence.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    authorizationId: uuid('authorization_id')
+      .references(() => forgeEpic172TransitionAuthorizations.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    evidenceReceiptId: uuid('evidence_receipt_id')
+      .references(() => forgeEpic172ReleaseEvidence.id, { onDelete: 'restrict', onUpdate: 'restrict' }),
+    transitionIdentityDigest: text('transition_identity_digest'),
+    completedAt: timestamp('completed_at', tsOpts),
+  },
+  (t) => [
+    check('forge_epic_172_s3_release_state_singleton_chk', sql`${t.singletonId} = 's3_issue_178'`),
+    check('forge_epic_172_s3_release_state_state_chk', sql`${t.state} in ('pending', 'complete')`),
+    check('forge_epic_172_s3_release_state_fingerprint_chk', sql`${t.stateFingerprint} ~ '^[0-9a-f]{64}$'`),
+    check('forge_epic_172_s3_release_state_tuple_chk', sql`
+      (
+        ${t.state} = 'pending'
+        and ${t.stateFingerprint} = '7a97eed28629c7d0d7c11a48d3509f1c479d614882dc61a7e2c1891f32c3a5dc'
+        and ${t.predecessorReceiptId} is null
+        and ${t.authorizationId} is null
+        and ${t.evidenceReceiptId} is null
+        and ${t.transitionIdentityDigest} is null
+        and ${t.completedAt} is null
+      ) or (
+        ${t.state} = 'complete'
+        and ${t.predecessorReceiptId} is not null
+        and ${t.authorizationId} is not null
+        and ${t.evidenceReceiptId} is not null
+        and ${t.evidenceReceiptId} <> ${t.predecessorReceiptId}
+        and ${t.transitionIdentityDigest} ~ '^[0-9a-f]{64}$'
+        and ${t.stateFingerprint} = ${t.transitionIdentityDigest}
+        and ${t.completedAt} is not null
+      )
+    `),
+  ],
+)
+
+export type ForgeEpic172S3ReleaseState = InferSelectModel<typeof forgeEpic172S3ReleaseState>
+export type NewForgeEpic172S3ReleaseState = InferInsertModel<typeof forgeEpic172S3ReleaseState>
+
 export const forgeEpic172EnablementState = pgTable(
   'forge_epic_172_enablement_state',
   {
@@ -627,6 +683,8 @@ export const tasks = pgTable(
     githubBranch: text('github_branch'),
     githubPrUrl: text('github_pr_url'),
     errorMessage: text('error_message'),
+    localProjectionScopeState: text('local_projection_scope_state').notNull().default('active'),
+    localProjectionOverlimitPackageCount: integer('local_projection_overlimit_package_count'),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
     completedAt: timestamp('completed_at', tsOpts),
@@ -639,8 +697,17 @@ export const tasks = pgTable(
   ],
 )
 
-export type Task = InferSelectModel<typeof tasks>
-export type NewTask = InferInsertModel<typeof tasks>
+type TaskRow = InferSelectModel<typeof tasks>
+type NewTaskRow = InferInsertModel<typeof tasks>
+type TaskProjectionScopeFields = 'localProjectionScopeState' | 'localProjectionOverlimitPackageCount'
+
+export type Task = Omit<TaskRow, TaskProjectionScopeFields>
+export type NewTask = Omit<NewTaskRow, TaskProjectionScopeFields>
+
+// Keep the focused protocol query surface without registering a second,
+// partial Drizzle definition for the same physical table. Duplicate table
+// definitions make migration snapshot generation discard one of the shapes.
+export const taskLocalProjectionScopes = tasks
 
 // ---------------------------------------------------------------------------
 // taskAttempts
@@ -787,12 +854,14 @@ export const filesystemMcpGrantApprovals = pgTable(
   'filesystem_mcp_grant_approvals',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    taskId: uuid('task_id')
+    projectId: uuid('project_id')
       .notNull()
+      .references(() => projects.id, { onDelete: 'restrict' }),
+    taskId: uuid('task_id')
       .references(() => tasks.id, { onDelete: 'restrict' }),
     workPackageId: uuid('work_package_id')
-      .notNull()
       .references(() => workPackages.id, { onDelete: 'restrict' }),
+    decisionScope: text('decision_scope').notNull().default('package'),
     decidedBy: uuid('decided_by').references(() => users.id, {
       onDelete: 'set null',
     }),
@@ -804,18 +873,342 @@ export const filesystemMcpGrantApprovals = pgTable(
       .$type<Record<string, unknown>>()
       .notNull()
       .default(sql`'{}'::jsonb`),
+    grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' }),
+    rootBindingRevision: bigint('root_binding_revision', { mode: 'bigint' }),
+    // Fresh only for allow_once approvals. It is immutable with the decision
+    // row and may never be reused after an S4 consumer records issuance.
+    grantNonce: uuid('grant_nonce'),
+    pointerFingerprint: text('pointer_fingerprint'),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
   },
   (t) => [
-    uniqueIndex('filesystem_mcp_grant_approvals_work_package_id_idx').on(t.workPackageId),
+    index('filesystem_mcp_grant_approvals_work_package_id_idx').on(t.workPackageId),
+    index('filesystem_mcp_grant_approvals_project_id_idx').on(t.projectId),
+    uniqueIndex('filesystem_mcp_grant_approvals_grant_nonce_idx').on(t.grantNonce),
     index('filesystem_mcp_grant_approvals_task_id_idx').on(t.taskId),
     index('filesystem_mcp_grant_approvals_decision_idx').on(t.decision),
+    index('filesystem_mcp_grant_approvals_revision_idx').on(t.grantDecisionRevision),
+    uniqueIndex('filesystem_mcp_grant_approvals_pointer_parent_idx').on(
+      t.id,
+      t.taskId,
+      t.workPackageId,
+      t.grantDecisionRevision,
+      t.pointerFingerprint,
+    ),
   ],
 )
 
 export type FilesystemMcpGrantApproval = InferSelectModel<typeof filesystemMcpGrantApprovals>
 export type NewFilesystemMcpGrantApproval = InferInsertModel<typeof filesystemMcpGrantApprovals>
+
+// ---------------------------------------------------------------------------
+// filesystemMcpCurrentDecisionPointers
+// ---------------------------------------------------------------------------
+// Exactly one authority slot is preallocated for each package. Immutable
+// decisions are appended above; this pointer advances with an exact compare and
+// set, so concurrent reapprovals have one winner.
+export const filesystemMcpCurrentDecisionPointers = pgTable(
+  'filesystem_mcp_current_decision_pointers',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id')
+      .notNull()
+      .references(() => tasks.id, { onDelete: 'cascade' }),
+    workPackageId: uuid('work_package_id')
+      .notNull()
+      .references(() => workPackages.id, { onDelete: 'cascade' }),
+    currentDecisionId: uuid('current_decision_id'),
+    currentDecisionTaskId: uuid('current_decision_task_id'),
+    currentDecisionWorkPackageId: uuid('current_decision_work_package_id'),
+    currentDecisionRevision: bigint('current_decision_revision', { mode: 'bigint' }),
+    currentDecisionFingerprint: text('current_decision_fingerprint'),
+    pointerFingerprint: text('pointer_fingerprint').notNull(),
+    pointerVersion: bigint('pointer_version', { mode: 'bigint' }).notNull().default(sql`0`),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('filesystem_mcp_current_decision_pointers_work_package_idx').on(t.workPackageId),
+    index('filesystem_mcp_current_decision_pointers_task_idx').on(t.taskId),
+    uniqueIndex('filesystem_mcp_current_decision_pointers_current_decision_idx').on(t.currentDecisionId),
+    foreignKey({
+      columns: [
+        t.currentDecisionId,
+        t.currentDecisionTaskId,
+        t.currentDecisionWorkPackageId,
+        t.currentDecisionRevision,
+        t.currentDecisionFingerprint,
+      ],
+      foreignColumns: [
+        filesystemMcpGrantApprovals.id,
+        filesystemMcpGrantApprovals.taskId,
+        filesystemMcpGrantApprovals.workPackageId,
+        filesystemMcpGrantApprovals.grantDecisionRevision,
+        filesystemMcpGrantApprovals.pointerFingerprint,
+      ],
+      name: 'filesystem_mcp_current_decision_pointers_parent_fk',
+    }),
+  ],
+)
+
+export type FilesystemMcpCurrentDecisionPointer = InferSelectModel<typeof filesystemMcpCurrentDecisionPointers>
+export type NewFilesystemMcpCurrentDecisionPointer = InferInsertModel<typeof filesystemMcpCurrentDecisionPointers>
+
+// ---------------------------------------------------------------------------
+// projectFilesystemGrantDecisions / projectFilesystemCurrentDecisionPointers
+// ---------------------------------------------------------------------------
+// Project always-allow authority is not stored in projects.mcp_config. Every
+// decision is immutable; exactly one preallocated project-owned pointer names
+// the current retained decision through an exact compare-and-set boundary.
+export const projectFilesystemGrantDecisions = pgTable(
+  'project_filesystem_grant_decisions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    projectId: uuid('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'restrict' }),
+    decision: text('decision').notNull(),
+    capabilities: jsonb('capabilities').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' }).notNull(),
+    rootBindingRevision: bigint('root_binding_revision', { mode: 'bigint' }).notNull(),
+    decisionFingerprint: text('decision_fingerprint').notNull(),
+    decisionGeneration: bigint('decision_generation', { mode: 'bigint' }).notNull(),
+    priorDecisionId: uuid('prior_decision_id'),
+    priorDecisionProjectId: uuid('prior_decision_project_id'),
+    priorDecisionRevision: bigint('prior_decision_revision', { mode: 'bigint' }),
+    priorRootBindingRevision: bigint('prior_root_binding_revision', { mode: 'bigint' }),
+    priorDecisionFingerprint: text('prior_decision_fingerprint'),
+    priorDecisionGeneration: bigint('prior_decision_generation', { mode: 'bigint' }),
+    revocationReason: text('revocation_reason'),
+    reason: text('reason').notNull().default(''),
+    decidedBy: uuid('decided_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    decidedAt: timestamp('decided_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('project_filesystem_grant_decisions_project_revision_idx')
+      .on(t.projectId, t.grantDecisionRevision),
+    uniqueIndex('project_filesystem_grant_decisions_project_generation_idx')
+      .on(t.projectId, t.decisionGeneration),
+    uniqueIndex('project_filesystem_grant_decisions_parent_tuple_idx')
+      .on(
+        t.id,
+        t.projectId,
+        t.grantDecisionRevision,
+        t.rootBindingRevision,
+        t.decisionFingerprint,
+        t.decisionGeneration,
+      ),
+    foreignKey({
+      columns: [
+        t.priorDecisionId,
+        t.priorDecisionProjectId,
+        t.priorDecisionRevision,
+        t.priorRootBindingRevision,
+        t.priorDecisionFingerprint,
+        t.priorDecisionGeneration,
+      ],
+      foreignColumns: [
+        t.id,
+        t.projectId,
+        t.grantDecisionRevision,
+        t.rootBindingRevision,
+        t.decisionFingerprint,
+        t.decisionGeneration,
+      ],
+      name: 'project_filesystem_grant_decisions_prior_fk',
+    }),
+  ],
+)
+
+export type ProjectFilesystemGrantDecision = InferSelectModel<typeof projectFilesystemGrantDecisions>
+export type NewProjectFilesystemGrantDecision = InferInsertModel<typeof projectFilesystemGrantDecisions>
+
+export const projectFilesystemCurrentDecisionPointers = pgTable(
+  'project_filesystem_current_decision_pointers',
+  {
+    projectId: uuid('project_id')
+      .primaryKey()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    currentDecisionId: uuid('current_decision_id'),
+    currentDecisionProjectId: uuid('current_decision_project_id'),
+    currentDecisionRevision: bigint('current_decision_revision', { mode: 'bigint' }),
+    currentRootBindingRevision: bigint('current_root_binding_revision', { mode: 'bigint' }),
+    currentDecisionFingerprint: text('current_decision_fingerprint'),
+    currentDecisionGeneration: bigint('current_decision_generation', { mode: 'bigint' }),
+    pointerGeneration: bigint('pointer_generation', { mode: 'bigint' }).notNull().default(sql`0`),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('project_filesystem_current_decision_pointers_decision_idx').on(t.currentDecisionId),
+  ],
+)
+
+export type ProjectFilesystemCurrentDecisionPointer = InferSelectModel<typeof projectFilesystemCurrentDecisionPointers>
+export type NewProjectFilesystemCurrentDecisionPointer = InferInsertModel<typeof projectFilesystemCurrentDecisionPointers>
+
+// ---------------------------------------------------------------------------
+// workPackageLocalProjectionSources / workPackageLocalProjectionHeads
+// ---------------------------------------------------------------------------
+// Preallocated per-package projection heads for the S3→S4 protocol surface.
+// Eight immutable heads are created on work_package INSERT. The package limit
+// of 256 ensures at most 2,048 heads. Sources are append-only; heads may advance
+// only through the fixed compare-and-set routine installed by migration 0026.
+export const workPackageLocalProjectionSources = pgTable(
+  'work_package_local_projection_sources',
+  {
+    id: uuid('id').primaryKey(),
+    taskId: uuid('task_id')
+      .notNull()
+      .references(() => tasks.id, { onDelete: 'restrict' }),
+    workPackageId: uuid('work_package_id')
+      .notNull()
+      .references(() => workPackages.id, { onDelete: 'restrict' }),
+    sourceKind: text('source_kind').notNull(),
+    sourceRevision: bigint('source_revision', { mode: 'bigint' }).notNull(),
+    sourceFingerprint: text('source_fingerprint').notNull(),
+    contribution: jsonb('contribution').notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('work_package_local_projection_sources_identity_idx').on(
+      t.id,
+      t.taskId,
+      t.workPackageId,
+      t.sourceKind,
+      t.sourceRevision,
+      t.sourceFingerprint,
+    ),
+    uniqueIndex('work_package_local_projection_sources_package_kind_revision_idx').on(
+      t.workPackageId,
+      t.sourceKind,
+      t.sourceRevision,
+    ),
+    check('work_package_projection_source_revision_chk', sql`${t.sourceRevision} > 0`),
+    check('work_package_projection_source_fingerprint_chk', sql`
+      ${t.sourceFingerprint} ~ '^sha256:[0-9a-f]{64}$'
+    `),
+    check('work_package_projection_source_contribution_chk', sql`
+      jsonb_typeof(${t.contribution}) = 'object'
+      and octet_length(${t.contribution}::text) <= 4096
+    `),
+  ],
+)
+
+export type WorkPackageLocalProjectionSource = InferSelectModel<typeof workPackageLocalProjectionSources>
+export type NewWorkPackageLocalProjectionSource = InferInsertModel<typeof workPackageLocalProjectionSources>
+
+export const workPackageLocalProjectionHeads = pgTable(
+  'work_package_local_projection_heads',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id')
+      .notNull()
+      .references(() => tasks.id, { onDelete: 'restrict' }),
+    workPackageId: uuid('work_package_id')
+      .notNull()
+      .references(() => workPackages.id, { onDelete: 'restrict' }),
+    headKind: text('head_kind').notNull(),
+    headIndex: bigint('head_index', { mode: 'bigint' }).notNull(),
+    headFingerprint: text('head_fingerprint').notNull(),
+    headRevision: bigint('head_revision', { mode: 'bigint' }).notNull().default(sql`0`),
+    compareAndSetFingerprint: text('compare_and_set_fingerprint').notNull(),
+    currentSourceId: uuid('current_source_id'),
+    currentSourceTaskId: uuid('current_source_task_id'),
+    currentSourceWorkPackageId: uuid('current_source_work_package_id'),
+    currentSourceKind: text('current_source_kind'),
+    currentSourceRevision: bigint('current_source_revision', { mode: 'bigint' }),
+    currentSourceFingerprint: text('current_source_fingerprint'),
+    contribution: jsonb('contribution').notNull().default({}),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('work_package_local_projection_heads_package_kind_idx')
+      .on(t.workPackageId, t.headKind),
+    index('work_package_local_projection_heads_kind_idx').on(t.headKind),
+    index('work_package_local_projection_heads_task_id_idx').on(t.taskId),
+    uniqueIndex('work_package_local_projection_heads_fingerprint_idx')
+      .on(t.headFingerprint),
+    uniqueIndex('work_package_local_projection_heads_cas_fingerprint_idx')
+      .on(t.compareAndSetFingerprint),
+    foreignKey({
+      columns: [
+        t.currentSourceId,
+        t.currentSourceTaskId,
+        t.currentSourceWorkPackageId,
+        t.currentSourceKind,
+        t.currentSourceRevision,
+        t.currentSourceFingerprint,
+      ],
+      foreignColumns: [
+        workPackageLocalProjectionSources.id,
+        workPackageLocalProjectionSources.taskId,
+        workPackageLocalProjectionSources.workPackageId,
+        workPackageLocalProjectionSources.sourceKind,
+        workPackageLocalProjectionSources.sourceRevision,
+        workPackageLocalProjectionSources.sourceFingerprint,
+      ],
+      name: 'work_package_projection_heads_current_source_fk',
+    }).onDelete('restrict').onUpdate('restrict'),
+    check('work_package_projection_head_kind_chk', sql`
+      ${t.headKind} in (
+        'local_run',
+        'local_recovery',
+        'packet_recovery',
+        'repository_review',
+        'host_apply_review',
+        'operator_hold',
+        'integrity',
+        'terminal_disposition'
+      )
+    `),
+    check('work_package_projection_head_index_chk', sql`
+      ${t.headIndex} >= 0 and ${t.headIndex} < 8
+    `),
+    check('work_package_projection_head_revision_chk', sql`
+      ${t.headRevision} >= 0
+    `),
+    check('work_package_projection_head_fingerprint_chk', sql`
+      ${t.headFingerprint} ~ '^head:v1:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[a-z_]+:[0-7]$'
+    `),
+    check('work_package_projection_head_cas_fingerprint_chk', sql`
+      ${t.compareAndSetFingerprint} ~ '^(head:v1:[0-9a-f:-]+:[a-z_]+:[0-7]|sha256:[0-9a-f]{64})$'
+    `),
+    check('work_package_projection_head_contribution_chk', sql`
+      jsonb_typeof(${t.contribution}) = 'object'
+      and octet_length(${t.contribution}::text) <= 4096
+    `),
+    check('work_package_projection_head_source_tuple_chk', sql`
+      (
+        ${t.headRevision} = 0
+        and ${t.currentSourceId} is null
+        and ${t.currentSourceTaskId} is null
+        and ${t.currentSourceWorkPackageId} is null
+        and ${t.currentSourceKind} is null
+        and ${t.currentSourceRevision} is null
+        and ${t.currentSourceFingerprint} is null
+        and ${t.contribution} = '{}'::jsonb
+        and ${t.compareAndSetFingerprint} = ${t.headFingerprint}
+      ) or (
+        ${t.headRevision} > 0
+        and ${t.currentSourceId} is not null
+        and ${t.currentSourceTaskId} = ${t.taskId}
+        and ${t.currentSourceWorkPackageId} = ${t.workPackageId}
+        and ${t.currentSourceKind} = ${t.headKind}
+        and ${t.currentSourceRevision} = ${t.headRevision}
+        and ${t.currentSourceFingerprint} is not null
+        and ${t.compareAndSetFingerprint} ~ '^sha256:[0-9a-f]{64}$'
+      )
+    `),
+  ],
+)
+
+export type WorkPackageLocalProjectionHead = InferSelectModel<typeof workPackageLocalProjectionHeads>
+export type NewWorkPackageLocalProjectionHead = InferInsertModel<typeof workPackageLocalProjectionHeads>
 
 // ---------------------------------------------------------------------------
 // workPackageDependencies

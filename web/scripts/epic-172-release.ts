@@ -10,6 +10,16 @@ import {
   retireEpic172ReleaseSigner,
 } from '../lib/mcps/epic-172-release-recorder'
 import {
+  createEpic172S3PostgresTransitionAdapter,
+  completeEpic172S3Release,
+} from '../lib/mcps/epic-172-s3-release'
+import {
+  epic172ReleaseOrder,
+  getEpic172ReleaseOrderEdges,
+  getEpic172ReleaseOrderNode,
+  validateEpic172ReleaseOrder,
+} from '../lib/mcps/epic-172-release-order'
+import {
   epic172EnvelopeDigest,
   epic172ReleaseEvidenceSignedBytes,
   epic172TransitionAuthorizationSignedBytes,
@@ -18,6 +28,7 @@ import {
 } from '../lib/mcps/epic-172-release-verifier'
 
 const WRITER_DATABASE_URL = 'FORGE_EPIC_172_EVIDENCE_DATABASE_URL'
+const TRANSITION_DATABASE_URL = 'FORGE_EPIC_172_TRANSITION_DATABASE_URL'
 const ADMIN_DATABASE_URL = 'FORGE_EPIC_172_ADMIN_DATABASE_URL'
 const MAX_INPUT_BYTES = 128 * 1024
 
@@ -65,6 +76,9 @@ export const EPIC_172_REQUIRED_RETENTION_FOREIGN_KEYS = Object.freeze([
   'forge_epic_172_release_evidence_consumptions_authorization_id_forge_epic_172_transition_authorizations_id_fk',
   'forge_epic_172_transition_authorizations_signer_key_id_forge_release_signer_keys_id_fk',
   'forge_release_signer_key_lifecycle_audits_signer_key_id_forge_release_signer_keys_id_fk',
+  'forge_epic_172_s3_release_state_predecessor_receipt_id_forge_epic_172_release_evidence_id_fk',
+  'forge_epic_172_s3_release_state_authorization_id_forge_epic_172_transition_authorizations_id_fk',
+  'forge_epic_172_s3_release_state_evidence_receipt_id_forge_epic_172_release_evidence_id_fk',
 ] as const)
 
 const EPIC_172_REQUIRED_RETENTION_PHYSICAL_KEYS = Object.freeze(
@@ -73,6 +87,7 @@ const EPIC_172_REQUIRED_RETENTION_PHYSICAL_KEYS = Object.freeze(
 
 type Command =
   | 'activate-signer'
+  | 'complete-s3'
   | 'inspect'
   | 'install-signer'
   | 'prepare-authorization'
@@ -95,6 +110,14 @@ type SignedEnvelopeFile = Readonly<{
 
 const commandOptions: Readonly<Record<Command, readonly string[]>> = {
   'activate-signer': ['actor', 'key-id', 'reason'],
+  'complete-s3': [
+    'authorization-id',
+    'build-sha',
+    'controller-id',
+    'input',
+    'operation-id',
+    'reviewed-sha',
+  ],
   inspect: [],
   'install-signer': [
     'actor',
@@ -128,6 +151,8 @@ Commands:
   rotate-signer --key-id UUID --expected-active-key-id UUID \
     --expected-active-generation N --actor ID --reason TEXT
   retire-signer --key-id UUID --generation N --actor ID --reason TEXT
+  complete-s3 --authorization-id UUID --build-sha ID --controller-id ID \
+    --operation-id ID --reviewed-sha SHA --input SIGNED_S3_JSON
   prepare-evidence --input ENVELOPE_JSON
   prepare-authorization --input ENVELOPE_JSON
   record-evidence --input SIGNED_JSON
@@ -135,6 +160,7 @@ Commands:
 
 Environment:
   ${WRITER_DATABASE_URL}   dedicated forge_release_evidence_writer URL
+  ${TRANSITION_DATABASE_URL} dedicated forge_release_transition URL
   ${ADMIN_DATABASE_URL}     administrative read-only inspection URL
 
 SIGNED_JSON has exactly: envelope, envelopeDigest, detachedSignatureBase64.`
@@ -389,6 +415,29 @@ export async function runEpic172ReleaseCli(cli: Epic172ReleaseCli): Promise<numb
       envelopeDigest: epic172EnvelopeDigest(envelope),
       signingPayloadBase64: signedBytes.toString('base64'),
     }, null, 2)}\n`)
+    return 0
+  }
+  if (cli.command === 'complete-s3') {
+    const signed = await readSignedEnvelope(cli.options.input)
+    const result = await completeEpic172S3Release({
+      authorizationAttemptId: cli.options['authorization-id'],
+      buildSha: cli.options['build-sha'],
+      controllerIdentity: cli.options['controller-id'],
+      operationId: cli.options['operation-id'],
+      order: {
+        validateEpic172ReleaseOrder: () => { validateEpic172ReleaseOrder(epic172ReleaseOrder) },
+        getEpic172ReleaseOrderNode: (nodeId) => (
+          nodeId === 's3_issue_178' ? getEpic172ReleaseOrderNode(nodeId) : null
+        ),
+        getEpic172ReleaseOrderEdges,
+      },
+      reviewedSha: cli.options['reviewed-sha'],
+      transition: createEpic172S3PostgresTransitionAdapter({
+        databaseUrl: requiredEnvironment(TRANSITION_DATABASE_URL),
+        ...signed,
+      }),
+    })
+    process.stdout.write(`${JSON.stringify(result)}\n`)
     return 0
   }
   const databaseUrl = requiredEnvironment(WRITER_DATABASE_URL)

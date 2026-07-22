@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   dbSelect: vi.fn(),
   dbTransaction: vi.fn(async (callback: (tx: unknown) => unknown) =>
     callback({
+      execute: vi.fn().mockResolvedValue([{ now: '2026-07-17 00:00:00+00' }]),
       insert: vi.fn(),
       update: vi.fn(),
     }),
@@ -20,7 +21,11 @@ const mocks = vi.hoisted(() => ({
   completeTaskIfReviewGatesSatisfied: vi.fn(),
   executeWorkPackage: vi.fn(),
   loadWorkPackageExecutionContext: vi.fn(),
+  loadCurrentProjectFilesystemDecision: vi.fn().mockResolvedValue(null),
   publishTaskEvent: vi.fn(),
+  projectionContributions: [] as Array<Record<string, unknown>>,
+  recordTaskLogBestEffort: vi.fn(),
+  projectionScopeState: 'active' as 'active' | 'archive_pending',
   WorkPackageExecutionError: class WorkPackageExecutionError extends Error {
     failureDetails: unknown
 
@@ -35,14 +40,42 @@ const mocks = vi.hoisted(() => ({
 vi.mock('@/db', () => ({
   db: {
     insert: mocks.dbInsert,
-    select: mocks.dbSelect,
-    transaction: mocks.dbTransaction,
+    select: (selection?: Record<string, unknown>) => {
+      if (selection && 'localProjectionScopeState' in selection) {
+        return chain([{ localProjectionScopeState: mocks.projectionScopeState }])
+      }
+      const selected = mocks.dbSelect(selection)
+      if (selected !== undefined) return selected
+      if (selection && 'assignedRole' in selection && latestFreshAdmission) {
+        return chain([latestFreshAdmission])
+      }
+      return chain([])
+    },
+    transaction: (callback: (tx: Record<string, unknown>) => unknown) =>
+      mocks.dbTransaction((tx: unknown) => {
+        const txRecord = tx && typeof tx === 'object'
+          ? tx as Record<string, unknown>
+          : {}
+        return callback({
+          ...txRecord,
+          execute: typeof txRecord.execute === 'function'
+            ? txRecord.execute
+            : vi.fn().mockResolvedValue([{
+                now: '2026-07-17 00:00:00+00',
+                pid: 4242,
+              }]),
+        })
+      }),
     update: mocks.dbUpdate,
   },
 }))
 
 vi.mock('@/worker/events', () => ({
   publishTaskEvent: mocks.publishTaskEvent,
+}))
+
+vi.mock('@/worker/task-logs', () => ({
+  recordTaskLogBestEffort: mocks.recordTaskLogBestEffort,
 }))
 
 vi.mock('@/lib/mcps/manager', () => ({
@@ -65,6 +98,11 @@ vi.mock('@/worker/work-package-executor', () => ({
   WorkPackageExecutionError: mocks.WorkPackageExecutionError,
   isArchitectReservedExecutionRole: (role: string) =>
     ['architect', 'security', 'security-review', 'security_review'].includes(role.trim().toLowerCase()),
+}))
+
+vi.mock('@/lib/mcps/filesystem-grant-reconciliation', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/filesystem-grant-reconciliation')>(),
+  loadCurrentProjectFilesystemDecision: mocks.loadCurrentProjectFilesystemDecision,
 }))
 
 function fixtureSecret(...parts: string[]) {
@@ -94,11 +132,24 @@ async function initDirtyGitRepo(dir: string) {
 function chain(resolveValue: unknown) {
   const captureFreshAdmission = () => {
     if (!Array.isArray(resolveValue)) return
-    const fresh = resolveValue.find((row) => (
+    const freshAdmission = resolveValue.find((row) => (
       row && typeof row === 'object' &&
       'projectId' in row && 'mcpConfig' in row && 'assignedRole' in row && 'status' in row
     ))
-    if (fresh) latestFreshAdmission = { ...(fresh as Record<string, unknown>) }
+    const claimablePackage = resolveValue.find((row) => (
+      row && typeof row === 'object' &&
+      'assignedRole' in row && 'id' in row && 'status' in row &&
+      ['blocked', 'needs_rework', 'pending', 'ready'].includes(String((row as { status: unknown }).status))
+    ))
+    const fresh = freshAdmission ?? claimablePackage
+    if (fresh) {
+      latestFreshAdmission = {
+        localPath: null,
+        mcpConfig: null,
+        projectId: 'project-1',
+        ...fresh as Record<string, unknown>,
+      }
+    }
   }
   const thenable: Record<string, unknown> = {
     then: (onFulfilled: (v: unknown) => unknown, onRejected?: (e: unknown) => unknown) =>
@@ -146,27 +197,44 @@ function updateChain(returnValue: unknown) {
 }
 
 function freshLockSelectMock() {
-  let call = 0
-  return vi.fn(() => {
-    call += 1
+  return vi.fn((selection?: Record<string, unknown>) => {
     if (!latestFreshAdmission) return chain([])
-    if (call === 1) {
+    if (selection && Object.keys(selection).length === 1 && 'projectId' in selection) {
+      return chain([{ projectId: latestFreshAdmission.projectId }])
+    }
+    if (selection && 'grantDecisionRevision' in selection) {
       return chain([{
         id: latestFreshAdmission.projectId,
+        grantDecisionRevision: latestFreshAdmission.grantDecisionRevision ?? BigInt(0),
         localPath: latestFreshAdmission.localPath ?? null,
         mcpConfig: latestFreshAdmission.mcpConfig ?? null,
+        rootBindingRevision: latestFreshAdmission.rootBindingRevision ?? BigInt(0),
       }])
     }
-    if (call === 2) {
+    if (selection && 'state' in selection) {
+      return chain([{ state: mocks.projectionScopeState }])
+    }
+    if (selection && Object.keys(selection).length === 2 && 'id' in selection && 'projectId' in selection) {
       return chain([{ id: 'task-1', projectId: latestFreshAdmission.projectId }])
+    }
+    if (selection && Object.keys(selection).length === 1 && 'id' in selection) {
+      return chain([])
     }
     return chain([{
       assignedRole: latestFreshAdmission.assignedRole,
       blockedReason: latestFreshAdmission.blockedReason ?? null,
+      grantDecisionRevision: latestFreshAdmission.grantDecisionRevision ?? BigInt(0),
       harnessId: latestFreshAdmission.harnessId ?? null,
+      headFingerprint: 'head:v1:task-1:pkg-fs:operator_hold:5',
+      headRevision: BigInt(0),
+      compareAndSetFingerprint: 'head:v1:task-1:pkg-fs:operator_hold:5',
       id: latestFreshAdmission.id,
+      localPath: latestFreshAdmission.localPath ?? null,
+      mcpConfig: latestFreshAdmission.mcpConfig ?? null,
       mcpRequirements: latestFreshAdmission.mcpRequirements,
       metadata: latestFreshAdmission.metadata,
+      projectId: latestFreshAdmission.projectId,
+      rootBindingRevision: latestFreshAdmission.rootBindingRevision ?? BigInt(0),
       sequence: latestFreshAdmission.sequence,
       status: latestFreshAdmission.status,
       title: latestFreshAdmission.title,
@@ -202,6 +270,7 @@ function freshAdmissionRow(
     projectId: project.id,
     localPath: project.localPath ?? null,
     mcpConfig: project.mcpConfig ?? null,
+    rootBindingRevision: project.rootBindingRevision ?? BigInt(0),
   }
 }
 
@@ -348,18 +417,32 @@ describe('handoffApprovedWorkPackages', () => {
     vi.clearAllMocks()
     mocks.dbInsert.mockReset()
     mocks.dbSelect.mockReset()
+    mocks.projectionScopeState = 'active'
     latestFreshAdmission = null
     mocks.dbTransaction.mockReset()
-    mocks.dbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) =>
-      callback({
+    mocks.projectionContributions.length = 0
+    mocks.dbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) => {
+      let executeCount = 0
+      return callback({
+        execute: vi.fn(async (query: { queryChunks?: unknown[] }) => {
+          executeCount += 1
+          if (executeCount === 1) return [{ now: '2026-07-17 00:00:00+00' }]
+          const serialized = query.queryChunks?.find((chunk): chunk is string => (
+            typeof chunk === 'string' && chunk.startsWith('{"authoritativeDecisionId"')
+          ))
+          if (serialized) mocks.projectionContributions.push(JSON.parse(serialized))
+          return [{ advanced: true }]
+        }),
         insert: vi.fn(),
         select: freshLockSelectMock(),
         update: mocks.dbUpdate,
-      }),
-    )
+      })
+    })
     mocks.dbUpdate.mockReset()
     mocks.executeWorkPackage.mockReset()
     mocks.loadWorkPackageExecutionContext.mockReset()
+    mocks.loadCurrentProjectFilesystemDecision.mockReset()
+    mocks.loadCurrentProjectFilesystemDecision.mockResolvedValue(null)
     mocks.getProjectMcpOverview.mockResolvedValue({
       projectId: 'project-1',
       config: { profile: 'default', requiredMcps: [], overrides: {} },
@@ -393,6 +476,27 @@ describe('handoffApprovedWorkPackages', () => {
       process.env.FORGE_WORK_PACKAGE_EXECUTION = originalExecutionFlag
     }
     await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
+  })
+
+  it('keeps archive-pending projection scopes non-claimable', async () => {
+    mocks.projectionScopeState = 'archive_pending'
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'pkg-legacy-overlimit',
+        assignedRole: 'backend',
+        harnessId: null,
+        sequence: 1,
+        status: 'pending',
+        title: 'Legacy over-limit package',
+      }]))
+
+    await expect(handoffApprovedWorkPackages('task-1')).resolves.toEqual({
+      status: 'no_ready_packages',
+      readyPackageIds: [],
+      claimedPackageId: null,
+    })
+    expect(mocks.dbUpdate).not.toHaveBeenCalled()
+    expect(mocks.dbTransaction).not.toHaveBeenCalled()
   })
 
   it('marks root packages ready, claims the first package, and records a no-op handoff run', async () => {
@@ -675,7 +779,12 @@ describe('handoffApprovedWorkPackages', () => {
       id: 'pkg-fs', assignedRole: 'backend', harnessId: 'harness-1',
       mcpRequirements: [{
         mcpId: 'filesystem', requirement: 'required',
-        capabilities: ['filesystem.project.read', 'filesystem.project.search'],
+        capabilities: [
+          'filesystem.project.search',
+          'filesystem.project.read',
+          'filesystem.project.list',
+          'filesystem.project.read',
+        ],
       }],
       metadata: {}, sequence: 1, status: 'pending', title: 'Read project files',
     }
@@ -697,25 +806,46 @@ describe('handoffApprovedWorkPackages', () => {
       blockedReason: expect.stringContaining('requires filesystem grant approval'),
       claimedPackageId: null,
       status: 'blocked',
-      terminalBlock: true,
+      taskDisposition: 'operator_hold',
     })
-    // Failed at the gate: the package carries the grant-block marker and no
+    // Held at the gate: the package carries the grant-block marker and no
     // implementation run/transaction was ever started, so no attempt is spent.
     expect(failedPackageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      status: 'failed',
+      status: 'blocked',
       metadata: expect.anything(),
     }))
-    expect(failedTaskUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      errorMessage: expect.stringContaining('requires filesystem grant approval'),
-      status: 'failed',
-    }))
+    expect(failedTaskUpdate.set).not.toHaveBeenCalled()
     expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
+    const marker = jsonbMarkerFromUpdate(failedPackageUpdate)
+    expect(marker.requestedCapabilities).toEqual([
+      'filesystem.project.list',
+      'filesystem.project.read',
+      'filesystem.project.search',
+    ])
+    expect(marker.blockFingerprint).toMatch(/^sha256:[0-9a-f]{64}$/)
+    expect(mocks.publishTaskEvent).toHaveBeenCalledWith(
+      'task-1',
+      'work_package:status',
+      expect.objectContaining({ mcpGrantBlock: marker }),
+    )
+    expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({ mcpGrantBlock: marker }),
+    }))
+    expect(mocks.projectionContributions).toEqual([
+      expect.objectContaining({
+        mcpGrantBlock: marker,
+        operatorHold: true,
+        priorBlockFingerprint: null,
+        transition: 'hold',
+      }),
+    ])
   })
 
   it('holds a stale project-level filesystem grant when the project grant was revoked', async () => {
     const project = {
       id: 'project-1',
       mcpConfig: { profile: 'default', requiredMcps: [], overrides: {} },
+      rootBindingRevision: BigInt(1),
     }
     const pkg = {
       id: 'pkg-fs-project', assignedRole: 'backend', harnessId: 'harness-1',
@@ -724,8 +854,9 @@ describe('handoffApprovedWorkPackages', () => {
       }],
       metadata: {
         mcpGrantPhases: { effective: {
-          schemaVersion: 1, phase: 'effective', source: 'project-filesystem-approval',
+          schemaVersion: 2, phase: 'effective', source: 'project-filesystem-approval',
           runtimeEnforcement: 'bounded_context_packet', status: 'approved',
+          grantDecisionRevision: '1', rootBindingRevision: '1',
           grants: [{
             mcpId: 'filesystem', status: 'approved', capabilities: ['filesystem.project.read'],
           }],
@@ -751,10 +882,10 @@ describe('handoffApprovedWorkPackages', () => {
       blockedReason: expect.stringContaining('project-level filesystem grant'),
       claimedPackageId: null,
       status: 'blocked',
-      terminalBlock: true,
+      taskDisposition: 'operator_hold',
     })
     expect(failedPackageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      status: 'failed',
+      status: 'blocked',
       metadata: expect.anything(),
     }))
     expect(mocks.dbTransaction).toHaveBeenCalledTimes(1)
@@ -762,7 +893,7 @@ describe('handoffApprovedWorkPackages', () => {
 
   it('uses a current approved project filesystem grant even when the package has no persisted project-effective phase', async () => {
     const projectGrant = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       mcpId: 'filesystem',
       status: 'approved',
       grantMode: 'always_allow',
@@ -771,9 +902,12 @@ describe('handoffApprovedWorkPackages', () => {
       approvedAt: '2026-07-14T00:00:00.000Z',
       approvedBy: 'user-1',
       reason: 'Approved project context.',
+      grantDecisionRevision: '1',
+      rootBindingRevision: '1',
     }
     const project = {
       id: 'project-1',
+      rootBindingRevision: BigInt(1),
       mcpConfig: {
         profile: 'default',
         requiredMcps: ['filesystem'],
@@ -781,6 +915,21 @@ describe('handoffApprovedWorkPackages', () => {
         grants: { filesystem: projectGrant },
       },
     }
+    mocks.loadCurrentProjectFilesystemDecision.mockResolvedValue({
+      schemaVersion: 2,
+      decisionId: projectGrant.grantApprovalId,
+      projectId: project.id,
+      decision: 'approved',
+      capabilities: projectGrant.capabilities,
+      grantDecisionRevision: projectGrant.grantDecisionRevision,
+      rootBindingRevision: projectGrant.rootBindingRevision,
+      decisionFingerprint: `sha256:${'1'.repeat(64)}`,
+      decisionGeneration: '1',
+      decidedAt: projectGrant.approvedAt,
+      decidedBy: projectGrant.approvedBy,
+      reason: projectGrant.reason,
+      revocationReason: null,
+    })
     const pkg = {
       id: 'pkg-fs-project',
       assignedRole: 'backend',
@@ -1555,6 +1704,8 @@ describe('handoffApprovedWorkPackages', () => {
             attemptNumber: 2,
             heartbeatAt: '2026-06-25T00:00:00.000Z',
             runId: 'run-2',
+            source: 'work-package-handoff',
+            staleAfterSeconds: 900,
           },
         },
         status: 'running',
@@ -1766,6 +1917,8 @@ describe('handoffApprovedWorkPackages', () => {
             attemptNumber: 1,
             heartbeatAt: '2026-06-25T00:00:00.000Z',
             runId: 'run-1',
+            source: 'work-package-handoff',
+            staleAfterSeconds: 900,
           },
         },
         status: 'running',
@@ -1964,6 +2117,8 @@ describe('handoffApprovedWorkPackages', () => {
             attemptNumber: 1,
             heartbeatAt: '2026-06-25T00:00:00.000Z',
             runId: 'run-1',
+            source: 'work-package-handoff',
+            staleAfterSeconds: 900,
           },
         },
         status: 'running',
@@ -2118,6 +2273,8 @@ describe('handoffApprovedWorkPackages', () => {
               attemptNumber: 1,
               heartbeatAt: '2026-06-25T00:00:00.000Z',
               runId: 'run-1',
+              source: 'work-package-handoff',
+              staleAfterSeconds: 900,
             },
           },
           status: 'running',
@@ -2306,7 +2463,7 @@ describe('handoffApprovedWorkPackages', () => {
       insert: vi.fn(() => ({
         values: vi.fn((values: Record<string, unknown>) => insertForValues(values)),
       })),
-      select: vi.fn(() => chain([])),
+      select: freshLockSelectMock(),
       update: vi.fn(() => updateChain([{ id: 'pkg-1' }])),
     })
 
@@ -2335,6 +2492,8 @@ describe('handoffApprovedWorkPackages', () => {
               attemptNumber: 1,
               heartbeatAt: '2026-06-25T00:00:00.000Z',
               runId: 'run-1',
+              source: 'work-package-handoff',
+              staleAfterSeconds: 900,
             },
           },
           status: 'running',
@@ -2524,7 +2683,7 @@ describe('handoffApprovedWorkPackages', () => {
       insert: vi.fn(() => ({
         values: vi.fn((values: Record<string, unknown>) => insertForValues(values)),
       })),
-      select: vi.fn(() => chain([])),
+      select: freshLockSelectMock(),
       update: vi.fn(() => updateChain([{ id: 'pkg-1' }])),
     })
 
@@ -2553,6 +2712,8 @@ describe('handoffApprovedWorkPackages', () => {
               attemptNumber: 1,
               heartbeatAt: '2026-06-25T00:00:00.000Z',
               runId: 'run-1',
+              source: 'work-package-handoff',
+              staleAfterSeconds: 900,
             },
           },
           status: 'running',

@@ -34,9 +34,9 @@ export default defineConfig({
   },
   globalTeardown: './e2e/global-teardown.ts',
   timeout: 60_000,
-  // Tests share one dev Postgres/Redis instance and each does a global
-  // truncate in beforeEach, so concurrent workers race on each other's data.
-  // Force fully sequential execution across all files and projects.
+  // Tests share one PostgreSQL/Redis instance. Some fixtures update shared
+  // settings and queues even though retained records use random identities, so
+  // force sequential execution across all files and projects.
   workers: 1,
   // Absorb environmental E2E flake in CI (slow Postgres/Redis under load).
   retries: process.env.CI ? 2 : 0,

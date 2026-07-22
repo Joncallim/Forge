@@ -210,6 +210,7 @@ describe('Epic 172 project route ingress sentinel', () => {
     const mutationPatterns = [
       /\.(?:insert|update|delete)\s*\(\s*projects\s*\)/g,
       /await\s+(?:registerProjectPath|setProjectMcpConfig|unregisterProjectPath)\s*\(/g,
+      /await\s+(?:mutateProjectFilesystemGrant|mutateTaskFilesystemGrants)\s*\(/g,
     ]
     const observedMutations: string[] = []
 
@@ -228,7 +229,7 @@ describe('Epic 172 project route ingress sentinel', () => {
       }
     }
     expect(observedMutations).toContain(
-      '../app/api/tasks/[id]/filesystem-grants/route.ts:PUT:.update(projects)',
+      '../app/api/tasks/[id]/filesystem-grants/route.ts:PUT:await mutateTaskFilesystemGrants(',
     )
   })
 
@@ -236,7 +237,7 @@ describe('Epic 172 project route ingress sentinel', () => {
     const mutationPatterns = [
       /\.(?:insert|update|delete)\s*\(\s*(?:tasks|workPackages|approvalGates|taskQuestions|filesystemMcpGrantApprovals|projects)\s*\)/g,
       /redis\.(?:lpush|rpush)\s*\(\s*['"]forge:(?:tasks|approvals|answers)['"]/g,
-      /\b(?:decideReviewGate|enqueueBlockedHandoffRetry)\s*\(/g,
+      /\b(?:decideReviewGate|enqueueBlockedHandoffRetry|mutateProjectFilesystemGrant|mutateTaskFilesystemGrants)\s*\(/g,
     ]
     const guardedHandlers = new Set<string>()
     const observedMutations: string[] = []

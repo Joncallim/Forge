@@ -311,6 +311,11 @@ and recovery live in the shared decision instead of a second filesystem-only
 policy:
 
 ```ts
+export type FilesystemGrantRevocationReason =
+  | 'project_grant_removed'
+  | 'project_grant_narrowed'
+  | 'project_root_repoint'
+
 export type EffectiveGrantState = {
   phase: 'none' | 'proposed' | 'approved' | 'denied' | 'revoked' | 'not_issued'
   source: 'none' | 'package-local' | 'project-level'
@@ -319,7 +324,7 @@ export type EffectiveGrantState = {
   consumed?: boolean            // allow_once already issued -> treat as none for a retry
   coveredCapabilities: string[] // canonical filesystem.project.*
   grantApprovalId?: string
-  revocationReason?: string      // set only when phase === 'revoked'
+  revocationReason?: FilesystemGrantRevocationReason // set only when phase === 'revoked'
 }
 // `requiredCapabilities` is REQUIRED: revocation and coverage are defined relative
 // to what THIS package needs. The requested capabilities live on
@@ -383,7 +388,7 @@ export type McpAdmissionDecision = {
   grantState?: {
     phase: EffectiveGrantState['phase']
     consumed?: boolean
-    revocationReason?: string
+    revocationReason?: FilesystemGrantRevocationReason
   }                         // present for bounded filesystem decisions; structured UI discriminator
   evidenceRefs: string[]   // PLANNED scope only pre-run (root + capability set); run evidence added later, see S4
 }
@@ -437,7 +442,7 @@ so the fallback matrix is total across all three fallback actions.
      (subject to the health overlay, step 8).
    - `effectiveGrant.phase === 'denied'` & blocking (`!canProceed`) →
      `mode:'bounded_context_required'`, `status:'blocked'`,
-     `recoveryAction:'approve_project_filesystem_context'` (**deniedRequired** — the
+     `recoveryAction:'approve_project_filesystem_context'` (**denied-required hold** — the
      handoff gate must HOLD, see S3).
    - `effectiveGrant.phase === 'revoked'` & blocking → `mode:'bounded_context_required'`,
      `status:'blocked'`, `recoveryAction:'approve_project_filesystem_context'`, and
@@ -783,9 +788,46 @@ keep a **transitional re-export** until their callers migrate in the owning slic
 
 ## Implementation slices
 
-Dependency order: **S1 → S2 → {S3, S4} → S5 → S6.** S3 and S4 both depend on S2's
-canonical evaluation + persisted shape. **S5 depends on S4** (it renders the
-run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
+Code-slice dependency order is **S1 → S2 → Step 0 → S3/#178 → S4 → S5 → S6.**
+#179 Step 0 is the sole creator and version owner of the data-only
+`web/lib/mcps/epic-172-release-order-v1.json` and its one validator,
+`web/lib/mcps/epic-172-release-order.ts`. The JSON has one shared node registry
+that stores each node's owner, required-evidence contract, and exact build identity
+once. It has two separately named edge sets with fixed meanings:
+
+- `codeDependencyGraph` records implementation and import prerequisites. Step 0 follows
+  S2 but remains independent of S3; S3 requires S2 plus Step 0; remaining S4
+  requires S2 plus S3; S5 requires S2 plus remaining S4; and S6 requires S2 through
+  S5. This graph cannot authorize deployment, cutover, ingress, or issuance.
+- `runtimeActivationGraph` records operational release transitions and contains the
+  complete required chain
+  `step0_retention_bridge → s3_issue_178 → s4_expand →
+  s4_producers_disabled → s5_compatible_consumers_deployed →
+  s6_pre_activation_green → s4_controlled_activation →
+  s6_post_activation_green → ingress_and_issuance_enabled →
+  s5_s6_release_ready`. This graph cannot satisfy a missing code prerequisite.
+
+The validator imports the data-only JSON and no S3 or remaining-S4 symbol. It
+validates each graph only under its named meaning and exposes read-only node/edge
+access. #178/S3 and remaining S4–S6 import the Step 0 validator, use and record only
+their owned nodes, and never create, regenerate, rewrite, copy, fork, shadow, or add
+a second release-order file, graph, metadata registry, or helper. The Step 0 fixture
+proves both files exist and validates the first node's route, full-ingress-close,
+drain, retention-FK, hard-delete-guard, and exact-build postconditions before S3.
+
+Ownership is resolved per shared-registry node, never from a whole-issue header:
+`owner:{issue:179,slice:'step0'}` for `step0_retention_bridge`;
+`owner:{issue:178,slice:'s3'}` for `s3_issue_178`;
+`owner:{issue:179,slice:'s4'}` for `s4_expand`, `s4_producers_disabled`,
+`s4_controlled_activation`, and `ingress_and_issuance_enabled`;
+`owner:{issue:180,slice:'s5'}` for `s5_compatible_consumers_deployed`; and
+`owner:{issue:181,slice:'s6'}` for `s6_pre_activation_green`,
+`s6_post_activation_green`, and `s5_s6_release_ready`. The S6 entries are
+controller attestations and do not own #179's activation or enablement. Exact
+static ownership/import/parity sentinels reject a missing or mismatched owner;
+missing, reordered, duplicated, or copied node/edge/metadata; the obsolete
+`s4_activate` alias; any second file/helper; any slice recording another owner's
+node; and any substitution of one graph, edge set, or evidence for the other.
 
 ### S1 — Contract and terminology
 
@@ -908,65 +950,375 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   `requiresFilesystemGrantApproval` is tested only as the *filesystem projection* of
   the same evaluation.
 
+### Step 0 — Separately landable retention bridge
+
+- Before #178/S3 lands, #179 owns and deploys the archive-or-reject project-
+  removal bridge before filesystem work, disables **all project-management
+  ingress**, drains every pre-bridge process/session, converts evidence-bearing
+  foreign keys to `RESTRICT|NO ACTION`, and installs the hard-delete guard. Project-
+  management ingress stays closed through S3 and remaining S4's `root_ref` default,
+  explicit-null insert bridge, non-null-to-null guard, journal, and database tests.
+  This node has no S3 dependency.
+- Step 0 is also the sole creator/version owner of the data-only
+  `web/lib/mcps/epic-172-release-order-v1.json` and its one validator,
+  `web/lib/mcps/epic-172-release-order.ts`. Neither imports an S3 or remaining-S4
+  symbol. The Step 0 fixture proves both files exist and validates the first node's
+  exact owner, build identity, and route/full-ingress-close/drain/foreign-key/guard
+  evidence before permitting `s3_issue_178`.
+- Before recording its own graph receipt, Step 0 also solely installs the generic
+  pinned Ed25519 signer policy/key and audit, append-only immutable durable-release-
+  evidence store, separate append-only short-lived
+  `forge_epic_172_transition_authorizations` attempts in a distinct Ed25519
+  signature domain, append-only consumption ledger, checked-in verifier/recorder/
+  consumer, dedicated certificate-authenticated `NOINHERIT` recorder/consumer/
+  transition principals, canonical transition-identity uniqueness, and the
+  disabled enablement singleton. The bootstrap is not a graph node and creates no
+  unsigned receipt. Once validly recorded, graph-node and required-evidence
+  receipts are immutable durable predecessors and do not expire; state transitions
+  separately require a fresh exact unexpired authorization attempt with lifetime
+  greater than zero and at most 30 minutes. S3 and remaining S4 import this
+  substrate unchanged and do not create or widen it.
+
 ### S3 — Filesystem grant recovery (deterministic, recoverable)
 
-- `requiresFilesystemGrantApproval` (`filesystem-grants.ts:315-322`) must stop
-  returning `{blocked:false}` for a `denied` effective phase when blocking
-  capabilities are non-empty and no `continue_without_mcp` fallback applies.
-  Return a distinct `deniedRequired:true` so handoff HOLDS the package pre-claim
-  (zero attempts) instead of letting the executor throw at
-  `work-package-executor.ts:1790`.
-- **Recoverable held state, not a crash.** `failWorkPackageForFilesystemGrant`
-  (`work-package-handoff.ts:807`) sets the package to **`blocked`** (in the
-  recovery set) with the `mcpGrantBlock` marker and does **not** drive the task to
-  `failed`; `progressWorkforce` (`:1165-1193`) must treat a filesystem-grant
-  terminal block as *held* (task stays operator-actionable), not as task failure.
-  Both never-approved-required and denied-required take this held path.
-- `filesystemGrantHandoffBlock` (`work-package-handoff.ts:876-906`): pass
-  `project?.mcpConfig` into `requiresFilesystemGrantApproval` in **both** branches
-  (the default branch at `:896-899` currently omits it), closing the
-  approval-vs-handoff project-coverage divergence.
-- **One project-wide reconciliation routine.** Extract
-  `reconcileFilesystemGrantsForProject(projectId, tx)` and call it from **both**
-  the per-task `always_allow` path (`tasks/[id]/filesystem-grants/route.ts:411-446`,
-  which currently reconciles only current-task standard-status siblings) and the
-  project route (`projects/[id]/filesystem-grant/route.ts:166-244`). Both endpoints
-  recover the identical package set for identical grant state.
-- **One lock order and no whole-JSON lost updates.** Both grant endpoints begin the
-  transaction by selecting the project row `FOR UPDATE`, then derive `nextMcpConfig`
-  from that locked, freshly read value. They must not compute a full replacement
-  from the project object fetched for authorization before the transaction. The
-  reconciliation routine then locks affected tasks `FOR UPDATE` in ascending ID
-  order and candidate work packages `FOR UPDATE` in ascending ID order. All callers
-  use the same global project-then-task-then-package lock order. Package updates use `jsonb_set`/`#-` only for the owned
-  `mcpGrantPhases` and `mcpGrantBlock` paths (or an `updatedAt` compare-and-set and
-  retry); they never replace `metadata` from a stale JavaScript spread. This
-  preserves concurrent broker, lease, audit, and evidence fields. Add two
-  concurrency tests: disjoint simultaneous `always_allow` grants retain the union
-  plus unrelated `mcpConfig` keys, and a simultaneous broker metadata update
-  survives reconciliation.
-- **Reuse the S1 reader — do not re-implement.** `filesystem-grants.ts` **imports**
-  `readEffectiveGrantState` from `admission.ts` (S1 owns it); S3 adds no second
-  copy. S3's job is to pass the required-capability set and the recovery/precedence
-  behavior *through* that one reader, and to make `requiresFilesystemGrantApproval`
-  a projection over it.
-- **Precedence.** A later project-level `always_allow` grant covering a capability
-  supersedes an earlier package-local `denied` effective phase for that capability
-  (operator's later, broader decision wins). Document and test this precedence in
-  the S1-owned `readEffectiveGrantState` (evaluated against the package's
-  `requiredCapabilities`).
-- **Revoked project grant is distinct from never-approved.** When
-  `readEffectiveGrantState` returns `phase:'revoked'` (a project grant that
-  previously covered the package no longer does), the held-block `reason` and the S5
-  copy say "project filesystem context was removed — approve it again", carrying
-  `revocationReason`, separate from the first-time "needs project context" copy.
-  Test the two recovery messages separately; a revoked grant must not read as a
-  brand-new request.
-- **Acceptance tests assert exact transitions** (package `pending/ready →
-  blocked`, task not `failed`, zero new `agentRuns`; then grant approval →
-  package `ready`, task re-driven), not just attempt counts.
-- Preserve: a filesystem block is never auto-retried
-  (`shouldAutoRetryBlockedHandoff`, `blocked-handoff-retry.ts:67-79`).
+- **Canonical projection and operator hold.**
+  `requiresFilesystemGrantApproval` imports the S1-owned
+  `readEffectiveGrantState`; S3 adds no second reader and never parses human
+  text. It evaluates both handoff branches with fresh project MCP configuration
+  and the exact required capability set. Required `none`, `denied`, `revoked`,
+  and consumed-one-time decisions hold before claim when
+  `continue_without_mcp` does not apply:
+
+  ```text
+  package pending | ready → blocked
+  task    running         → approved only with no live sibling lease or `awaiting_review`
+  task    running         → running while either task-wide barrier remains
+  ```
+
+  The projection and filesystem-only v2 marker import one closed
+  `FilesystemGrantHoldState` union; the marker writer persists the selected arm
+  rather than independently rebuilding its fields:
+
+  | `holdKind` | `grantPhase` | `grantConsumed` | `grantDecisionRevision` | `revocationReason` |
+  |---|---|---:|---|---|
+  | `approval_required` | `none`, `proposed`, or `not_issued` | `false` | `null` | `null` |
+  | `denied_required` | `denied` | `false` | canonical positive decimal, or `null` only from the exact legacy adapter | `null` |
+  | `revoked_required` | `revoked` | `false` | canonical positive decimal | `project_grant_removed`, `project_grant_narrowed`, or `project_root_repoint` |
+  | `consumed_once` | `approved` | `true` | canonical positive decimal | `null` |
+
+  There is no independently writable `deniedRequired` boolean, and
+  `grantConsumed` is a literal in each union arm rather than a free boolean. The
+  strict parser rejects unknown keys and every tuple not in this table. The
+  TypeScript type, SQL JSON-field `CHECK`, and parser use the same exhaustive
+  cross-product fixtures. The marker creates no `agent_runs` and consumes no
+  attempt. Its explicit handoff disposition is
+  `{taskDisposition:'operator_hold', autoRetryable:false,
+  terminalFailure:false}`. It must not reuse the existing `terminalBlock` flag,
+  which current orchestrator paths interpret as task failure. The task returns to
+  the grant endpoint's operator-actionable `approved` state only when no sibling
+  has a live execution lease or `awaiting_review`. Either task-wide barrier keeps
+  the task `running`. S3 and S4 use one database-owned operator-hold task-
+  convergence service whose closed recognized-marker union includes S3
+  `filesystem_grant` and S4 `packet_issuance`/integrity holds. Under project →
+  task → all sibling package locks, it requires at least one recognized hold,
+  proves both task-wide barriers clear, and changes only task `running → approved`
+  while preserving package markers/blocks and creating no run or attempt. It is
+  invoked after sibling completion/review resolution and by startup/periodic
+  database discovery; Redis is only a wake hint. An S3-only task never depends on
+  the presence of an S4 marker. S3 may wrap the service but must not duplicate its
+  predicate or treat the held package as failure.
+- **Database-ordered precedence.** Every filesystem decision mutation increments
+  a project-scoped PostgreSQL `BIGINT` counter while the project row is locked.
+  JSON/evidence serializes the positive `grantDecisionRevision` as a canonical
+  decimal string; comparisons use database integers, never JavaScript number
+  precision or lexical string order. A project `always_allow` supersedes a package denial only when it
+  covers the complete required set and its revision is greater. A denial wins at
+  an equal or greater revision. `approvedAt`/`deniedAt` are display evidence only,
+  never authority. Legacy rows without comparable revisions fail closed until an
+  explicit operator decision assigns one; migration must not manufacture order
+  from timestamps. Removed or narrowed project coverage is `revoked`, not
+  first-time `none`, and retains the latest revision and a bounded reason code.
+  Every decision also stores the locked project's internal root-binding revision.
+  A root repoint increments that separate revision and calls the same negative
+  reconciler, so old-root project/package decisions become `revoked` and the new
+  repository requires explicit reapproval. Stable packet `rootRef` correlation is
+  never authority. An unbound project has internal root-binding revision `0`,
+  which is never issuable. Initial backfill compare-and-sets the counter to its
+  next positive value (normally revision 1) and never resets or decrements it; it
+  never upgrades an existing approval because no legacy row contains immutable
+  root-at-decision evidence. Every legacy decision without a stored binding
+  revision remains non-issuable until explicit reapproval on the current locked
+  binding. A current-path comparison cannot manufacture historical authority;
+  unbound or duplicate roots fail closed.
+- **Package-local `allow_once`.** An unconsumed one-time decision can approve only
+  its package. Denial, one-time approval, nonce rotation/consumption, and
+  reapproval reevaluate and mutate only that target package; they never run a
+  project grant scan. If the target can change task status, however, the path must
+  lock the task, discover every sibling, and prelock the complete sibling set once
+  in ascending package ID order before locking any package. Package scope limits
+  evaluation and writes, not the lock footprint of the task-wide predicate. If a
+  covering project grant already wins, do not create a shadow one-time decision.
+  #179 owns the per-run claim and nonce-fenced issuance.
+- **One positive and negative project reconciler.** Equivalent
+  `always_allow` decisions from the task and project endpoints call one service
+  with the caller's `lockedProject`, fresh `nextMcpConfig`, allocated revision,
+  and closed trigger (`task_always_allow|project_always_allow|project_grant_revocation|project_root_repoint`). It must not reacquire or reread the project. Grant removal or
+  narrowing also calls it: eligible `pending`/`ready` packages that lose exact
+  coverage proactively become held, while still-covered subsets remain eligible.
+  A running, already-claimed package is not retroactively stripped; #179 fences
+  the current run and the new decision governs future claims. A root repoint uses
+  `project_root_repoint`, carries the incremented root-binding revision, and revokes
+  old-root coverage without changing unrelated grant-decision ordering.
+<a id="canonical-cross-slice-database-lock-order"></a>
+
+- **Canonical cross-slice database lock order.** The following JSON list is the
+  one normative row-family order for S3 and #179. Other documents and code import
+  its version; they do not maintain a shorter copy. A mutation acquires only the
+  families applicable to its state as an ordered subsequence. An absent optional
+  row is skipped, never used to justify moving a later family earlier.
+
+  ```json
+  {
+    "contract": "forge-cross-slice-database-lock-order",
+    "version": 2,
+    "applicableRows": "ordered-subsequence",
+    "families": [
+      "project",
+      "tasks:id-ascending",
+      "work-packages:id-ascending",
+      "grant-approval-decision-rows:id-ascending",
+      "worker-protocol-epoch",
+      "authenticated-worker-root-writer-instance-rows:id-ascending",
+      "host-binding-generation-rotation-row",
+      "host-root-hierarchy-guard-row",
+      "agent-runs:id-ascending",
+      "local-run-evidence-task-projection-heads:id-ascending",
+      "optional-runtime-audits:id-ascending",
+      "host-apply-ledgers:run-id-then-entry-ordinal",
+      "artifacts:agent-run-id-artifact-type-artifact-id",
+      "local-issuance-recovery-actions:local-evidence-or-audit-id-action-marker-fingerprint",
+      "integrity-alerts:local-evidence-or-audit-id-reason-evidence-fingerprint",
+      "integrity-resolutions:alert-id-expected-fingerprint-resolution",
+      "review-gates:id-ascending"
+    ]
+  }
+  ```
+
+  Immediately after Step 0, before any S3 state writer, S3 materializes this exact
+  object at `web/lib/mcps/mcp-admission-lock-order-v2.json` and adds the one shared
+  ordered-subsequence validator in
+  `web/lib/mcps/mcp-admission-lock-order.ts`. A parity test parses this ADR block
+  and requires exact object equality. The helper imports only that JSON and
+  standard-library types, derives its family type from the object—never an S4
+  audit, packet, evidence, producer, or recovery symbol—and rejects unknown/
+  duplicate families and reverse edges.
+  #179 imports the S3-owned object/helper and owns no generator, copy, or second
+  sequence.
+
+  S3 normally stops after the fourth family and does not acquire the epoch row.
+  #179 owns the remaining families, including authenticated worker/root-writer
+  instance rows and local-run-evidence/task-projection source rows. Candidate
+  discovery may happen without retained package locks. After the project and
+  complete affected-task set are locked, every transaction that may change task
+  status expands to every sibling for those tasks **before its first package
+  lock**, then locks that complete union once in ascending package ID order.
+  Package creation takes its task lock; reparenting takes old/new task locks in
+  ascending ID order. Reconciliation may not add a newly discovered lower-ID
+  sibling after locking a higher-ID target; membership or candidate drift causes a
+  full compare-and-set retry. Every later applicable family follows the checked-in
+  order. Rows within one family use the stable key named above. No endpoint nests
+  the project lock or performs Redis/network work in the transaction.
+- **Bounded marker and JSON ownership.** The v2 filesystem marker remains outside
+  `metadata.mcpBroker` and contains only structured filesystem kind/source, the
+  exact canonical hold-state union arm above, normalized requirement keys/
+  capabilities, operator-hold disposition, and `blockFingerprint`. It has no
+  separately writable denial/consumption flags. The fingerprint is a versioned
+  digest of policy inputs, not human text or timestamps. Recovery clears it only
+  with a matching fingerprint. Reconciliation owns narrow
+  `metadata.mcpGrantPhases` and filesystem-marker `jsonb_set`/`#-` patches (or a
+  metadata-version compare-and-retry), never a stale whole-JSON replacement.
+- **Exact recovery.** A matching filesystem-held package moves
+  `blocked → ready` after full coverage and its task is woken after commit.
+  Changed-fingerprint and generic MCP/security/dependency/reviewer blocks remain.
+  Historical `failed` recovery is allowed only through the v2 marker, the exact
+  v1 `{source:'filesystem-grant-approval'}` marker, or a versioned,
+  fixture-backed, time-bounded legacy adapter that cannot match generic failure.
+  The adapter upgrades state on the next safe mutation and never infers from
+  requirements or error prose alone.
+- **One-time reapproval handoff to S4.** S3 never clears S4's
+  `packet_issuance` marker in its project reconciler. After a package-local
+  reapproval rotates a fresh nonce under project → task → packages in ID order →
+  approval locks, it calls S4's package-scoped resolver in the same transaction.
+  Package scope limits grant evaluation; the caller prelocks every sibling for the
+  task-wide review barrier. The resolver continues through the applicable ordered
+  subsequence of the canonical version-2 list above. For this route that includes
+  the applicable authenticated worker/root-writer claim/recovery instances,
+  binding generation/rotation, hierarchy guard, prior run, local-run evidence and
+  the locked task-projection source set before any optional audit, ledger,
+  artifact, action, alert/resolution, or review-gate row. It proves generic
+  evidence, both repository-review fingerprints,
+  host review, task projection, and any packet audit/artifact terminal tuple before
+  verifying the exact `reapprove_allow_once` marker/fingerprint, changed nonce,
+  current policy, inactive lease, and no sibling `awaiting_review`. It clears only
+  its packet marker. An unresolved local-effect marker/review/projection keeps the
+  package blocked and creates no wake; only a barrier-free state may move
+  `blocked → ready`. Stale/double/policy-drift/active-review/generic-evidence races
+  are compare-and-set misses; Redis wakes only after commit.
+- **PostgreSQL truth and failure behavior.** PostgreSQL commits decision,
+  revision, marker, package, and task transitions atomically. Redis is post-commit
+  wake-up only; a failed wake leaves recovered `ready` work for the periodic
+  sweep. A failed transaction leaves no partial hold/recovery. Policy or
+  fingerprint races retry from locked state. A revocation/handoff race has one
+  serialized result: either #179 claims first under its fence, or S3 holds before
+  claim. Generic packet/execution failure never burns or recreates an approval.
+- **Authorized S3 completion.** S3's final installation/state transaction locks
+  and reverifies the durable `step0_retention_bridge` receipt, signer policy/key,
+  canonical transition identity, exact predecessor set, consumption keys, and one
+  fresh exact signed `forge_epic_172_transition_authorizations` attempt in its
+  distinct Ed25519 signature domain. The attempt binds target `s3_issue_178`,
+  source receipt, exact owner/build/reviewed SHA/epoch-or-none, operation/controller
+  identity, nonce, and expiry. At its final state-changing statement,
+  `clock_timestamp()` must prove the attempt unexpired and unconsumed. The
+  transaction atomically appends predecessor consumption, commits S3 final state,
+  and records the canonically unique durable signed `s3_issue_178` receipt; rollback
+  removes all three. An expired unused
+  attempt remains audit-only and may be replaced by a newly signed exact attempt
+  without rewriting durable evidence. A consumed/replayed attempt or a different
+  attempt for the same completed canonical transition cannot advance state.
+- **Mixed-version rollout.** The `runtimeActivationGraph` graph is the complete ten-node
+  chain above; it does not stop at producer disablement or activation and cannot be
+  replaced by `codeDependencyGraph`. #179 Step 0 is separately landable. It disables
+  **all project-management ingress**, drains every pre-bridge process/database
+  session, deploys the project-removal bridge that rejects or archives before
+  filesystem work, converts evidence foreign keys to retention-safe form, and
+  installs the database hard-delete guard. It also solely creates and versions the
+  data-only `web/lib/mcps/epic-172-release-order-v1.json` and the one
+  `web/lib/mcps/epic-172-release-order.ts` validator. Neither file imports S3 or
+  remaining-S4 symbols. The Step 0 fixture proves the files and first-node route,
+  full-ingress-close, drain, retention-FK, hard-delete-guard, owner, and exact-build
+  postconditions before permitting `s3_issue_178`. Before that first receipt, Step
+  0 also installs the generic pinned-signer durable-evidence store, separate
+  append-only short-lived `forge_epic_172_transition_authorizations` store in its
+  distinct Ed25519 signature domain, consumption ledger, verifier/principal,
+  transition-identity, and disabled-enablement substrate described above.
+
+  Project-management ingress remains closed while #178 imports the validator,
+  ships additive nullable decision/root-binding fields and the dual v1/v2 reader,
+  and passes S3 database tests. S3 then uses the one authorized final transaction
+  above to consume the durable Step 0 predecessor with a fresh exact unexpired
+  attempt and record only `s3_issue_178`. It remains
+  closed while remaining S4 first adds nullable `root_ref` with no default, then the
+  database-owned explicit-null insert bridge, omitted-value default, non-null-to-
+  null update guard, and expand-phase monotonic project-root change journal/trigger,
+  and passes their database tests. The journal operation enum is exactly
+  `insert|root_update|archive`; schema and parser reject `root-update`. Unbound
+  projects use revision `0`, and every approval without a stored binding revision
+  is non-issuable. Only after all these safeguards and tests pass may compatible
+  project-management ingress reopen exactly once for the mixed-version journal
+  window. An early or second reopen is forbidden.
+
+  Later cutover disables packet issuance and **all** project-management ingress
+  again, revokes/terminates v1 web credentials and sessions, and drains old web,
+  worker, and root-management services. Only after credential revocation/session
+  termination may it capture the journal generation and run exactly
+  `npm run project-roots:reconcile-expansion -- --through <generation> --actor <operator-id> --apply`.
+  The command must record exactly one audited S3 outcome from the closed
+  `insert|root_update|archive` vocabulary for every generation through the
+  watermark; hard delete is already impossible. Any gap, duplicate/incoherent
+  outcome, later legacy commit, or crash blocks progress. Then #179's
+  `npm run project-roots:bind-v2 -- --actor <operator-id> --apply` procedure
+  compare-and-sets each live local project to the next positive revision and never
+  upgrades a legacy approval. After collision/unbound rows are held, install the
+  protocol-v2 root barrier while every writer, ingress path, and packet producer
+  remains disabled. Deploy #180's compatible S5 consumers and #181's disabled S6
+  controller/harness. Only an exact-build `s6_pre_activation_green` receipt allows
+  #179's controlled activation to run exactly
+  `npm run protocol:activate-work-package-v2 -- --actor <operator-id> --apply`.
+  The binding command never advances the epoch, and activation commits with ingress/
+  issuance disabled. Only #181's exact-epoch/build `s6_post_activation_green`
+  receipt allows #179 to enable registered S3/root writers and queue/project
+  ingress; packet issuance is enabled last in the same audited operation.
+  `s5_s6_release_ready` follows that enablement evidence. PostgreSQL triggers never
+  call or reimplement the S3 TypeScript reconciler. Rollback disables writers/new
+  claims but retains schema and the dual reader; it does not guess or downgrade
+  revisions or restart v1 services against v2 state. Remove v1 support only after
+  the bounded window.
+- **Required PostgreSQL tests.** Prove exact hold and recovery transitions,
+  barrier-aware `running → approved`, including direct and startup/periodic
+  convergence for S3-only, S4-only, and mixed recognized holds after sibling
+  lease/review release, zero runs/attempts, monotonic revision precedence under
+  equal/reversed timestamps, legacy fail-closed behavior, grant narrowing/removal,
+  exact capability subsets, package-local one-time boundaries, fingerprint
+  compare-and-set, JSONB coexistence, endpoint equivalence, Redis-wake loss,
+  root-repoint revocation/reapproval and alias equivalence, old/new worker gating
+  and rollback, grant mutation/revocation against
+  `awaiting_review` and both review decisions, and deadlock freedom across the
+  canonical version-2 order. The TypeScript type fixtures, strict parser, and SQL
+  `CHECK` exhaust the hold-kind × phase × consumed × revision × revocation-reason
+  cross-product and accept only the four rows above; malformed-but-enum-valid
+  tuples and unknown keys fail before an S3 mutation. A contract-parity mutation sentinel fails for every
+  deleted, renamed, duplicated, or swapped family. Opposing-order transactions
+  force contention at worker/root-writer instance → binding-generation and local-
+  run-evidence → task-projection-source boundaries and finish with bounded waits
+  and no deadlock. An exact real-PostgreSQL fixture gives one task a lower-ID
+  unaffected sibling `P1` and higher-ID affected target `P2`, races the S3 target
+  mutation against an opposing claim/review from `P1`, observes contention through
+  `pg_blocking_pids`, and requires bounded completion/no deadlock under the winning
+  serial state. It fails if `P2` is locked before S3 discovers/prelocks `P1`.
+  Journal schema/writer/parser fixtures accept exactly
+  `insert|root_update|archive` and reject `root-update`. Rollout fixtures prove all
+  project-management ingress is closed at Step 0 and remains closed throughout S3
+  and remaining S4's nullable `root_ref`, omitted-value default, explicit-null
+  insert bridge, non-null-to-null guard, journal, and database tests. Omitted and
+  explicit-null inserts receive generated references; unrelated updates may retain
+  a legacy null, while a bound reference cannot be cleared. Only after these proofs
+  may ingress reopen exactly once for the mixed-version journal window. An early or
+  second reopen fails. The later full close, credential/session drain, and only-
+  after-drain watermark are also mandatory.
+
+  A release-order fixture first proves #179 Step 0 solely owns and has checked in
+  the data-only `web/lib/mcps/epic-172-release-order-v1.json` and the one
+  `web/lib/mcps/epic-172-release-order.ts` validator, with no S3 or remaining-S4
+  import. It also proves Step 0 installs the generic signer/durable-evidence store,
+  separate append-only short-lived `forge_epic_172_transition_authorizations`
+  store in its distinct Ed25519 signature domain, consumption ledger, checked-in
+  verifier/recorder/consumer, dedicated principals, canonical transition identity,
+  and disabled enablement singleton before its own receipt and S3. It validates the
+  first node's full Step 0 postconditions before S3. It
+  proves one shared node registry stores owner, required evidence, and exact build
+  identity once; separately named `codeDependencyGraph` and `runtimeActivationGraph` edges
+  preserve their fixed meanings; and only `runtimeActivationGraph` contains the complete
+  chain `step0_retention_bridge → s3_issue_178 → s4_expand →
+  s4_producers_disabled → s5_compatible_consumers_deployed →
+  s6_pre_activation_green → s4_controlled_activation →
+  s6_post_activation_green → ingress_and_issuance_enabled →
+  s5_s6_release_ready`. Exact static ownership/import/parity sentinels verify the
+  Step 0/S3/downstream owner mapping; require S3 and later slices to import the one
+  validator and use and record only their owned nodes; and reject a second file,
+  graph, helper, metadata copy, or direct rewrite. Mutation sentinels delete,
+  duplicate, or reorder every registry node and named edge; reject the obsolete/
+  truncated `s4_activate` chain; reject activation before S5 compatibility/pre-
+  activation green; reject enablement before post-activation green; reject release
+  readiness before enablement; and reject substituting either graph, edge set,
+  evidence, or build identity for the other.
+  A delayed-transition fixture waits more than 30 minutes after valid Step 0
+  receipt recording and rotates the signer policy/key: durable predecessor evidence
+  remains valid, but an expired authorization attempt cannot advance S3. It proves
+  a newly signed exact replacement attempt can authorize the still-pending S3
+  transition without duplicating either durable node; replay, wrong binding/domain,
+  final-statement expiry, and concurrent double consumption fail closed. Failure
+  injection after every verification/consumption/state/receipt write rolls back all
+  S3 effects and leaves retry possible only with a still-valid or newly signed exact
+  attempt.
+  #181 owns
+  the cross-slice failure and rollout regression matrix;
+  #180 renders historical decision, current effective state, and packet evidence
+  separately. A filesystem hold remains excluded from automatic retry.
+
+The detailed S3 design is
+`docs/architecture/issue-178-filesystem-grant-recovery.md`. #179 owns issuance
+and evidence, #180 owns presentation, and #181 owns the integrated regression;
+none of those slices may weaken this state, precedence, or lock contract.
 
 ### S4 — Prompt/context assembly and bounded-context packet evidence (builds on #43)
 
@@ -1022,8 +1374,11 @@ run-evidence schema S4 defines) and on S2. S6 depends on S2–S5.
   nonce in the approval row and effective-grant snapshot. Reapproval must replace
   the nonce, so it represents a new issuable decision without reusing the burned
   issuance key. Before assembling or exposing a packet for an `allow_once` grant,
-  S4 follows the global lock order—project, task, work package, grant approval,
-  then audit claim—verifies the effective grant and nonce are still
+  S4 follows the applicable ordered subsequence of the canonical version-2 lock
+  list above. It locks project, task, work package, and grant approval first, then
+  every applicable epoch, authenticated worker/root-writer instance, binding-
+  generation, hierarchy, run, and local-run-evidence/task-projection source family
+  before the runtime-audit claim. It verifies the effective grant and nonce are still
   approved/unconsumed, inserts a `filesystem_mcp_runtime_audits` claim keyed
   uniquely by `(grantApprovalId, grantDecisionNonce)` for
   `operation:'context_packet'`, and marks the grant consumed with an approved-state

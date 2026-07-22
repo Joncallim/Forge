@@ -212,6 +212,34 @@ describe('Epic 172 release envelope verifier', () => {
     }))).not.toThrow()
   })
 
+  it('requires the exact enabled S3 through S6 build tuple for enabled-build evidence', () => {
+    const reviewedSha = 'b'.repeat(40)
+    const exactBuilds = [
+      `issue_178_s3@${reviewedSha}`,
+      `issue_179_s4@${reviewedSha}`,
+      `issue_180_s5@${reviewedSha}`,
+      `issue_181_s6@${reviewedSha}`,
+    ]
+    const envelope = releaseEnvelope({
+      evidenceKind: 'enabled_build_tests_green',
+      owner: { issue: 181, slice: 's6' },
+      exactBuilds,
+      reviewedSha,
+      epoch: 7,
+      predecessorReceiptIds: ['00000000-0000-4000-8000-000000000006'],
+      requiredEvidence: getEpic172RequiredEvidenceNames('enabled_build_tests_green').map((name, index) => ({
+        name,
+        measurementDigest: (index + 1).toString(16).padStart(64, '0'),
+      })),
+    })
+
+    expect(() => epic172ReleaseEvidenceSignedBytes(envelope)).not.toThrow()
+    expect(() => epic172ReleaseEvidenceSignedBytes({
+      ...envelope,
+      exactBuilds: exactBuilds.slice(1),
+    })).toThrow(/expected exactly 4 build identities/)
+  })
+
   it('cryptographically binds the exact ordered postcondition measurements', () => {
     const envelope = releaseEnvelope()
     const keys = keyPair()

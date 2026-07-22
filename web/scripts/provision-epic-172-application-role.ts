@@ -17,6 +17,12 @@ const RELEASE_TABLES = [
   'public.forge_epic_172_enablement_transition_audits',
 ] as const
 
+const PROJECTION_TABLES = [
+  'public.forge_epic_172_s3_release_state',
+  'public.work_package_local_projection_sources',
+  'public.work_package_local_projection_heads',
+] as const
+
 const TABLE_PRIVILEGES = [
   'SELECT',
   'INSERT',
@@ -120,6 +126,9 @@ async function main(): Promise<void> {
 
       await client`grant usage on schema forge to ${client(applicationRole)}`
       await client`grant execute on function forge.read_epic_172_enablement_state_v1() to ${client(applicationRole)}`
+      await client`grant execute on function forge.advance_local_projection_head_v1(uuid,uuid,text,uuid,bigint,text,jsonb,bigint,text,text) to ${client(applicationRole)}`
+      await client`grant select on table public.work_package_local_projection_sources to ${client(applicationRole)}`
+      await client`grant select on table public.work_package_local_projection_heads to ${client(applicationRole)}`
 
       const [schemaBoundary] = await client<{
         hasUsage: boolean
@@ -146,6 +155,23 @@ async function main(): Promise<void> {
         throw new Error('The ordinary Forge application role has a forbidden release-table privilege.')
       }
 
+      const unexpectedProjectionDml = await client<{ tableName: string; privilege: string }[]>`
+        select projection_table as "tableName", privilege
+        from unnest(${client.array([...PROJECTION_TABLES])}::text[]) projection_table
+        cross join unnest(array['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER']) privilege
+        where pg_catalog.has_table_privilege(${applicationRole}, projection_table, privilege)
+        order by projection_table, privilege
+      `
+      if (unexpectedProjectionDml.length !== 0) {
+        throw new Error('The ordinary Forge application role has forbidden direct projection-table DML.')
+      }
+      for (const projectionTable of PROJECTION_TABLES) {
+        const [{ canRead }] = await client<{ canRead: boolean }[]>`
+          select pg_catalog.has_table_privilege(${applicationRole}, ${projectionTable}, 'SELECT') as "canRead"
+        `
+        if (!canRead) throw new Error('The ordinary Forge application role cannot read projection state.')
+      }
+
       const executableForgeFunctions = await client<{ functionName: string }[]>`
         select p.proname as "functionName"
         from pg_catalog.pg_proc p
@@ -155,10 +181,11 @@ async function main(): Promise<void> {
         order by p.proname
       `
       if (
-        executableForgeFunctions.length !== 1
-        || executableForgeFunctions[0].functionName !== 'read_epic_172_enablement_state_v1'
+        executableForgeFunctions.length !== 2
+        || executableForgeFunctions[0].functionName !== 'advance_local_projection_head_v1'
+        || executableForgeFunctions[1].functionName !== 'read_epic_172_enablement_state_v1'
       ) {
-        throw new Error('The ordinary Forge application role must execute only forge.read_epic_172_enablement_state_v1().')
+        throw new Error('The ordinary Forge application role must execute only the fixed enablement-read and projection-advance functions.')
       }
 
       const [{ ownedObjectCount }] = await client<{ ownedObjectCount: number }[]>`
@@ -174,7 +201,7 @@ async function main(): Promise<void> {
     })
 
     console.log(`✓ Provisioned and verified the fixed Epic 172 release-reader boundary for ${applicationRole} as ${authority.currentUser}.`)
-    console.log('  Granted only forge schema USAGE and execution of forge.read_epic_172_enablement_state_v1().')
+    console.log('  Granted projection SELECT plus only the fixed enablement-read and projection-advance functions.')
   } finally {
     await adminClient.end({ timeout: 5 })
   }

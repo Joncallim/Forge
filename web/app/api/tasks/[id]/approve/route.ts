@@ -26,6 +26,7 @@ import {
   projectFilesystemGrantCovers,
 } from '@/lib/mcps/filesystem-grants'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
+import { loadCurrentProjectFilesystemDecision } from '@/lib/mcps/filesystem-grant-reconciliation'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -45,8 +46,10 @@ function admissionForLockedPackage(input: {
   assignedRole: string
   mcpOverview: ProjectMcpOverview
   mcpConfig: unknown
+  projectFilesystemDecision: unknown
   mcpRequirements: unknown
   metadata: unknown
+  rootBindingRevision: unknown
   title: string
 }): McpWorkPackageAdmission {
   return admitWorkPackageMcpBroker({
@@ -55,6 +58,8 @@ function admissionForLockedPackage(input: {
     mcpRequirements: input.mcpRequirements,
     metadata: input.metadata,
     projectMcpConfig: input.mcpConfig,
+    projectFilesystemDecision: input.projectFilesystemDecision,
+    projectRootBindingRevision: input.rootBindingRevision,
     title: input.title,
   })
 }
@@ -71,13 +76,22 @@ function approvalHealthSnapshot(admissions: McpWorkPackageAdmission[]): McpHealt
 
 function healthSnapshotMatchesLockedPolicy(
   overview: ProjectMcpOverview,
+  capturedGrantDecisionRevision: unknown,
   capturedLocalPath: unknown,
-  lockedProject: { localPath?: unknown; mcpConfig: ProjectMcpOverview['config'] },
+  lockedProject: {
+    grantDecisionRevision?: unknown
+    localPath?: unknown
+    mcpConfig: ProjectMcpOverview['config']
+    rootBindingRevision?: unknown
+  },
 ): boolean {
   // The overview is captured before the transaction because probing MCP health
   // may write cache rows. Approval may consume it only while the normalized
   // project policy it was captured for is still the locked project policy.
   return capturedLocalPath === lockedProject.localPath &&
+    String(capturedGrantDecisionRevision ?? 0) === String(lockedProject.grantDecisionRevision ?? 0) &&
+    (overview.rootBindingRevision === undefined ||
+      overview.rootBindingRevision === String(lockedProject.rootBindingRevision ?? 0)) &&
     isDeepStrictEqual(
       normalizeProjectMcpConfig(overview.config),
       normalizeProjectMcpConfig(lockedProject.mcpConfig),
@@ -217,7 +231,8 @@ export async function POST(
     }
     // Live MCP checks may update cached status rows, so they must complete
     // before the status-flip transaction acquires any project/task locks.
-    const mcpOverview = await getProjectMcpOverview(projectForHealth)
+    const projectFilesystemDecision = await loadCurrentProjectFilesystemDecision(projectForHealth.id)
+    const mcpOverview = await getProjectMcpOverview(projectForHealth, projectFilesystemDecision)
 
     const approvedAt = new Date()
     const { task, approvedGates, approvalBlock } = await db.transaction(async (tx) => {
@@ -230,7 +245,12 @@ export async function POST(
         return { task: null, approvedGates: [] as { id: string }[], approvalBlock: null }
       }
 
-      if (!healthSnapshotMatchesLockedPolicy(mcpOverview, projectForHealth.localPath, lockedProject)) {
+      if (!healthSnapshotMatchesLockedPolicy(
+        mcpOverview,
+        projectForHealth.grantDecisionRevision,
+        projectForHealth.localPath,
+        lockedProject,
+      )) {
         const reason = 'Project MCP health inputs changed while approval health was being checked (configuration or local path). Review the latest project settings and approve again.'
         return {
           task: null,
@@ -322,8 +342,10 @@ export async function POST(
         assignedRole: pkg.assignedRole,
         mcpOverview,
         mcpConfig: lockedProject.mcpConfig,
+        projectFilesystemDecision,
         mcpRequirements: pkg.mcpRequirements,
         metadata: pkg.metadata,
+        rootBindingRevision: lockedProject.rootBindingRevision,
         title: pkg.title,
       }))
       const blockedIndex = admissions.findIndex((admission) => admission.aggregate.status === 'blocked')
@@ -358,6 +380,8 @@ export async function POST(
           mcpConfig: lockedProject.mcpConfig,
           mcpRequirements: pkg.mcpRequirements,
           metadata: pkg.metadata,
+          projectFilesystemDecision,
+          projectRootBindingRevision: lockedProject.rootBindingRevision,
         })
         if (!grant) return pkg
         const metadata = isFilesystemGrantRecord(pkg.metadata) ? pkg.metadata : {}
@@ -368,7 +392,7 @@ export async function POST(
             ...metadata,
             mcpGrantPhases: {
               ...phases,
-              schemaVersion: 1,
+              schemaVersion: 2,
               effective: projectFilesystemEffectivePhase(grant),
             },
           },

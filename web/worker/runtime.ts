@@ -182,11 +182,13 @@ async function startWorkerOnce(
         { db },
         { tasks, workPackages },
         { enqueueDueBlockedHandoffRetries },
+        { convergeRecognizedOperatorHolds },
         { and, eq },
       ] = await Promise.all([
         import('../db'),
         import('../db/schema'),
         import('./blocked-handoff-retry'),
+        import('../lib/mcps/filesystem-grant-reconciliation'),
         import('drizzle-orm'),
       ])
       const stuck = await db
@@ -199,8 +201,12 @@ async function startWorkerOnce(
         .where(and(eq(workPackages.status, 'blocked'), eq(tasks.status, 'approved')))
 
       const enqueued = await enqueueDueBlockedHandoffRetries(stuck)
+      const converged = await convergeRecognizedOperatorHolds()
       if (enqueued > 0) {
         console.info('[worker] Re-enqueued blocked handoffs for retry', { count: enqueued, workerId })
+      }
+      if (converged > 0) {
+        console.info('[worker] Converged running tasks with operator holds', { count: converged, workerId })
       }
     } catch (err) {
       console.warn('[worker] Blocked-handoff sweep failed', { err: errorMessage(err), workerId })
@@ -237,6 +243,7 @@ async function startWorkerOnce(
       }
 
       if (blockedHandoffSweepIntervalSeconds > 0) {
+        void sweepBlockedHandoffs()
         blockedHandoffSweepTimer = setInterval(
           () => void sweepBlockedHandoffs(),
           blockedHandoffSweepIntervalSeconds * 1000,

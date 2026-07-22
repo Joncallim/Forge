@@ -35,8 +35,8 @@ export function getBaseUrl(): string {
 
 function installedE2EEnvironment() {
   const environment = resolveDestructiveE2EEnvironment()
-  // Some Playwright hooks and dynamically imported seed modules run in a
-  // separate process. Install only the already-validated dedicated identities.
+  // Playwright hooks and dynamically imported seed modules can run in separate
+  // processes. Install only the already validated, dedicated test identities.
   process.env.DATABASE_URL = environment.databaseUrl
   process.env.REDIS_URL = environment.redisUrl
   return environment
@@ -128,10 +128,10 @@ export async function resetState(): Promise<void> {
   const redis = redisClient()
 
   try {
-    // Epic 172 retains project, task, and execution history even in the
-    // dedicated E2E database. Hide prior fixtures through the same archive
-    // boundary as the product, and clear only non-retained setup/session state.
-    // Random fixture identities keep retained rows isolated between tests.
+    // Epic 172 retains project, task, execution, and immutable grant history in
+    // the dedicated E2E database. Hide prior project fixtures through the same
+    // archive boundary as the product. Random fixture identities isolate all
+    // retained S3 authority rows, so reset never needs elevated TRUNCATE rights.
     await sql.begin(async (tx) => {
       await tx`
         update projects

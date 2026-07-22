@@ -19,6 +19,7 @@ import {
   canDeleteTaskStatus,
   canRetryHandoffForTaskStatus,
   canStopTaskStatus,
+  filesystemGrantExpectedPointerFromState,
   mergeTaskRuns,
   reviewDecisionSuggestionFromArtifact,
   retryHandoffMessage,
@@ -31,6 +32,33 @@ import {
 } from '@/app/dashboard/tasks/[id]/page'
 
 describe('task page retry handoff controls', () => {
+  it('omits a pointer for D1 and preserves the exact D1 tuple for D2 reapproval', () => {
+    expect(filesystemGrantExpectedPointerFromState({
+      currentDecision: null,
+      pointerFingerprint: null,
+      pointerVersion: '0',
+      workPackageId: 'package-1',
+    })).toBeNull()
+
+    expect(filesystemGrantExpectedPointerFromState({
+      currentDecision: {
+        capabilities: ['filesystem.project.read'],
+        decision: 'approved',
+        grantDecisionRevision: '17',
+        id: 'decision-d1',
+        reason: 'Reviewed D1',
+      },
+      pointerFingerprint: 'sha256:d1',
+      pointerVersion: '1',
+      workPackageId: 'package-1',
+    })).toEqual({
+      currentDecisionId: 'decision-d1',
+      currentDecisionRevision: '17',
+      pointerFingerprint: 'sha256:d1',
+      pointerVersion: '1',
+    })
+  })
+
   it('distinguishes newly queued and already queued retry responses', () => {
     expect(retryHandoffMessage('retry_enqueued')).toBe('Recovery queued. The worker will re-evaluate this handoff.')
     expect(retryHandoffMessage('retry_already_queued')).toBe('Recovery is already queued. The worker will re-evaluate this handoff.')
@@ -43,12 +71,11 @@ describe('task page retry handoff controls', () => {
     expect(canRetryHandoffForTaskStatus('awaiting_review', false)).toBe(false)
   })
 
-  it('shows stop for active tasks and retains every task history', () => {
+  it('shows stop only for active tasks and never offers deletion', () => {
     expect(canStopTaskStatus('running')).toBe(true)
     expect(canStopTaskStatus('approved')).toBe(true)
     expect(canStopTaskStatus('failed')).toBe(false)
     expect(canStopTaskStatus('cancelled')).toBe(false)
-
     expect(canDeleteTaskStatus('running')).toBe(false)
     expect(canDeleteTaskStatus('approved')).toBe(false)
     expect(canDeleteTaskStatus('failed')).toBe(false)

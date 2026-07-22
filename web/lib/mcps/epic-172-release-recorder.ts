@@ -12,11 +12,13 @@ import {
 const EVIDENCE_WRITER = 'forge_release_evidence_writer'
 const RELEASE_TRANSITION = 'forge_release_transition'
 
-type SignedEnvelopeInput = Readonly<{
+export type Epic172SignedEnvelopeInput = Readonly<{
   envelope: unknown
   envelopeDigest: string
   detachedSignature: Uint8Array
 }>
+
+type SignedEnvelopeInput = Epic172SignedEnvelopeInput
 
 type SignerRow = Readonly<{
   id: string
@@ -528,7 +530,10 @@ function verifyStoredTransition(
     operationId: string
     transitionIdentityDigest: string
   },
-): void {
+): Readonly<{
+  authorization: Epic172TransitionAuthorizationEnvelope
+  receipts: readonly Epic172ReleaseEvidenceEnvelope[]
+}> {
   const authorizationSigner = locked.signerById.get(locked.authorization.signerKeyId)
   if (!authorizationSigner) {
     throw new Epic172ReleaseTransactionError('The transition signer lock was lost.')
@@ -568,6 +573,184 @@ function verifyStoredTransition(
   ) {
     throw new Epic172ReleaseTransactionError('The receipt and authorization do not bind the exact requested transition.')
   }
+  return { authorization, receipts }
+}
+
+export type Epic172S3ReleaseCompletion = Readonly<{
+  receiptId: string
+  consumptionId: string
+  completedAt: Date
+}>
+
+const EPIC_172_S3_PENDING_STATE_FINGERPRINT =
+  '7a97eed28629c7d0d7c11a48d3509f1c479d614882dc61a7e2c1891f32c3a5dc'
+
+async function lockEpic172S3Completion(
+  tx: postgres.TransactionSql,
+  input: Readonly<{
+    predecessorReceiptId: string
+    authorizationId: string
+    outputSignerKeyId: string
+  }>,
+): Promise<Awaited<ReturnType<typeof lockStoredTransition>>> {
+  await tx`
+    select forge.lock_epic_172_s3_completion_v1(
+      ${input.predecessorReceiptId}::uuid,
+      ${input.authorizationId}::uuid,
+      ${input.outputSignerKeyId}::uuid
+    )
+  `
+  const [predecessor] = await tx<StoredReleaseRow[]>`
+    select
+      id::text as "receiptId",
+      envelope,
+      envelope_digest as "envelopeDigest",
+      detached_signature as "detachedSignature",
+      signer_key_id::text as "signerKeyId",
+      transition_identity_digest as "transitionIdentityDigest"
+    from public.forge_epic_172_release_evidence
+    where id = ${input.predecessorReceiptId}::uuid
+  `
+  const [authorization] = await tx<StoredAuthorizationRow[]>`
+    select
+      envelope,
+      envelope_digest as "envelopeDigest",
+      detached_signature as "detachedSignature",
+      signer_key_id::text as "signerKeyId",
+      transition_identity_digest as "transitionIdentityDigest",
+      operation_id as "operationId",
+      target_node as "targetNode"
+    from public.forge_epic_172_transition_authorizations
+    where id = ${input.authorizationId}::uuid
+  `
+  if (!predecessor || !authorization) {
+    throw new Epic172ReleaseTransactionError('The exact S3 predecessor and authorization are required.')
+  }
+  const signerIds = [...new Set([
+    predecessor.signerKeyId,
+    authorization.signerKeyId,
+    input.outputSignerKeyId,
+  ])].sort()
+  const signers = await tx<SignerRow[]>`
+    select
+      id::text as id,
+      generation::text as generation,
+      public_key_spki as "publicKeySpki"
+    from public.forge_release_signer_keys
+    where id = any(${tx.array(signerIds)}::uuid[])
+    order by id
+  `
+  if (signers.length !== signerIds.length) {
+    throw new Epic172ReleaseTransactionError('An S3 completion signer key is missing.')
+  }
+  return {
+    receipts: [predecessor],
+    authorization,
+    signerById: new Map(signers.map((signer) => [signer.id, signer])),
+  }
+}
+
+/**
+ * Completes issue 178 through the dedicated transition login. PostgreSQL owns
+ * the atomic consumption, S3-state compare-and-set, and receipt append; Node
+ * verifies every Ed25519 signature while the database locks are held.
+ */
+export async function completeEpic172S3ReleaseTransition(
+  input: Epic172SignedEnvelopeInput & Readonly<{
+    databaseUrl: string
+    authorizationId: string
+    buildSha: string
+    controllerIdentity: string
+    operationId: string
+    reviewedSha: string
+  }>,
+): Promise<Epic172S3ReleaseCompletion> {
+  const parsedOutput = parseEpic172ReleaseEvidenceEnvelope(input.envelope)
+  if (parsedOutput.evidenceKind !== 's3_issue_178' || parsedOutput.predecessorReceiptIds.length !== 1) {
+    throw new Epic172ReleaseTransactionError('S3 completion requires one signed s3_issue_178 receipt over Step 0.')
+  }
+  const predecessorReceiptId = parsedOutput.predecessorReceiptIds[0]
+  const client = releaseClient(input.databaseUrl)
+  try {
+    return await client.begin('isolation level serializable', async (tx) => {
+      const databaseNow = await assertPrincipal(tx, RELEASE_TRANSITION)
+      const locked = await lockEpic172S3Completion(tx, {
+        predecessorReceiptId,
+        authorizationId: input.authorizationId,
+        outputSignerKeyId: parsedOutput.signerKeyId,
+      })
+      const verified = verifyStoredTransition(locked, databaseNow, {
+        receiptIds: [predecessorReceiptId],
+        consumerNode: 's3_issue_178',
+        operationId: input.operationId,
+        transitionIdentityDigest: parsedOutput.transitionIdentityDigest,
+      })
+      const outputSigner = locked.signerById.get(parsedOutput.signerKeyId)
+      if (!outputSigner) throw new Epic172ReleaseTransactionError('The S3 output signer lock was lost.')
+      const output = requireVerified(verifyEpic172ReleaseEvidence({
+        envelope: input.envelope,
+        envelopeDigest: input.envelopeDigest,
+        detachedSignature: input.detachedSignature,
+        publicKeySpki: outputSigner.publicKeySpki,
+        databaseNow,
+      }))
+      assertSignerGeneration(outputSigner, output.signerGeneration)
+      const authorization = verified.authorization
+      const predecessor = verified.receipts[0]
+      if (
+        predecessor.evidenceKind !== 'step0_retention_bridge'
+        || output.receiptId !== parsedOutput.receiptId
+        || output.transitionIdentityDigest !== authorization.transitionIdentityDigest
+        || output.predecessorSetDigest !== authorization.sourceReceiptSetDigest
+        || output.predecessorReceiptIds[0] !== authorization.sourceReceiptIds[0]
+        || output.exactBuilds.length !== 1
+        || output.exactBuilds[0] !== `issue_178_s3@${input.buildSha}`
+        || output.reviewedSha !== input.reviewedSha
+        || output.controllerRunId !== authorization.controllerRunId
+        || authorization.controllerLoginId !== input.controllerIdentity
+        || authorization.operationId !== input.operationId
+      ) {
+        throw new Epic172ReleaseTransactionError(
+          'The signed S3 receipt, predecessor, authorization, build, and controller are not one exact transition.',
+        )
+      }
+
+      const [completed] = await tx<Epic172S3ReleaseCompletion[]>`
+        select
+          receipt_id::text as "receiptId",
+          consumption_id::text as "consumptionId",
+          completed_at as "completedAt"
+        from forge.complete_epic_172_s3_release_v1(
+          ${input.authorizationId}::uuid,
+          ${EPIC_172_S3_PENDING_STATE_FINGERPRINT}::text,
+          ${output.receiptId}::uuid,
+          ${output.owner.issue}::integer,
+          ${output.owner.slice}::text,
+          ${tx.json([...output.exactBuilds])}::jsonb,
+          ${tx.json(output.requiredEvidence.map((claim) => ({ ...claim })))}::jsonb,
+          ${output.reviewedSha}::text,
+          ${output.epoch}::bigint,
+          ${tx.json([...output.predecessorReceiptIds])}::jsonb,
+          ${output.predecessorSetDigest}::text,
+          ${output.transitionIdentityDigest}::text,
+          ${output.signerKeyId}::uuid,
+          ${output.signerGeneration}::bigint,
+          ${output.githubAppId}::text,
+          ${output.controllerRunId}::text,
+          ${output.controllerJobId}::text,
+          ${input.envelopeDigest}::text,
+          ${Buffer.from(input.detachedSignature)}::bytea,
+          ${output.nonce}::uuid,
+          ${output.issuedAt}::timestamptz,
+          ${tx.json(output)}::jsonb
+        )
+      `
+      if (!completed) throw new Epic172ReleaseTransactionError('The S3 release completion did not commit.')
+      return completed
+    })
+  } finally {
+    await client.end({ timeout: 5 })
+  }
 }
 
 type Epic172AuthorizedTransitionReceiptInput =
@@ -598,6 +781,11 @@ export async function runEpic172AuthorizedTransition<Result>(input: Readonly<{
   consumptions: readonly Epic172EvidenceConsumption[]
   result: Result
 }> {
+  if (input.consumerNode === 's3_issue_178') {
+    throw new Epic172ReleaseTransactionError(
+      's3_issue_178 requires the dedicated S3 completion transaction.',
+    )
+  }
   const receiptIds = canonicalTransitionReceiptIds(input)
   const client = releaseClient(input.databaseUrl)
   try {
