@@ -190,11 +190,13 @@ export async function resolveArchitectPlanEntry(input: {
       projectionEligible: boolean
       clarificationQuestionId: string | null
       purpose: 'package_specialist' | 'architect_replan'
+      sourceKind: 'architect_plan_entry' | 'clarification_answer'
       requirementKey: string | null
       taskId: string
     }[]>`
       select
         purpose,
+        source_kind as "sourceKind",
         task_id as "taskId",
         plan_artifact_id as "planArtifactId",
         plan_version::text as "planVersion",
@@ -216,7 +218,10 @@ export async function resolveArchitectPlanEntry(input: {
     if (row.purpose !== expectedPurpose) {
       throw new S4ProtocolStoreError('invalid_evidence', 'The Architect plan reference purpose did not match its consumer.')
     }
-    if (row.entryKind === 'clarification_answer') {
+    if (row.sourceKind === 'clarification_answer') {
+      if (row.entryKind !== 'clarification_answer') {
+        throw new S4ProtocolStoreError('invalid_evidence', 'The resolved clarification answer source was malformed.')
+      }
       const answerId = row.entryId.slice('clarification_answer:'.length)
       if (!row.clarificationQuestionId || !verifyArchitectClarificationAnswer({
         schemaVersion: 1,
@@ -241,6 +246,9 @@ export async function resolveArchitectPlanEntry(input: {
         projectionEligible: false,
         requirementKey: null,
       }
+    }
+    if (row.sourceKind !== 'architect_plan_entry') {
+      throw new S4ProtocolStoreError('invalid_evidence', 'The resolved Architect plan source was malformed.')
     }
     const returnedReference = parseArchitectPlanEntryReference({
       schemaVersion: 1,
@@ -305,12 +313,12 @@ export async function resolveArchitectReplanEntry(input: {
 }): Promise<ResolvedArchitectReplanEntry> {
   return withDedicatedClient('FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL', async (sql) => {
     const [row] = await sql<{
-      purpose: string; taskId: string; planArtifactId: string; planVersion: string
+      purpose: string; sourceKind: 'architect_plan_entry' | 'clarification_answer'; taskId: string; planArtifactId: string; planVersion: string
       entryId: string; entryKind: ArchitectPlanEntryEnvelope['entryKind']; content: string
       contentDigest: string; digestKeyId: string; clarificationQuestionId: string | null
       agent: string | null; requirementKey: string | null; bindingFingerprint: string | null; projectionEligible: boolean
     }[]>`
-      select purpose, task_id as "taskId", plan_artifact_id as "planArtifactId",
+      select purpose, source_kind as "sourceKind", task_id as "taskId", plan_artifact_id as "planArtifactId",
         plan_version::text as "planVersion", entry_id as "entryId", entry_kind as "entryKind",
         agent, requirement_key as "requirementKey", binding_fingerprint as "bindingFingerprint",
         projection_eligible as "projectionEligible", content, content_digest as "contentDigest", digest_key_id as "digestKeyId",
@@ -320,7 +328,7 @@ export async function resolveArchitectReplanEntry(input: {
     if (!row || row.purpose !== 'architect_replan') {
       throw new S4ProtocolStoreError('invalid_evidence', 'Architect replan reference was unavailable.')
     }
-    if (row.entryKind !== 'clarification_answer') {
+    if (row.sourceKind === 'architect_plan_entry') {
       const envelope: ArchitectPlanEntryEnvelope = { schemaVersion: 1, taskId: row.taskId,
         planArtifactId: row.planArtifactId, planVersion: row.planVersion, entryId: row.entryId,
         entryKind: row.entryKind, agent: row.agent, requirementKey: row.requirementKey,
@@ -332,6 +340,9 @@ export async function resolveArchitectReplanEntry(input: {
       return { agent: row.agent, bindingFingerprint: row.bindingFingerprint, content: row.content,
         entryId: row.entryId, entryKind: row.entryKind, projectionEligible: row.projectionEligible,
         requirementKey: row.requirementKey, sourceKind: 'architect_plan_entry' }
+    }
+    if (row.sourceKind !== 'clarification_answer' || row.entryKind !== 'clarification_answer') {
+      throw new S4ProtocolStoreError('invalid_evidence', 'Clarification answer source was malformed.')
     }
     const answerId = row.entryId.slice('clarification_answer:'.length)
     if (!row.clarificationQuestionId || !verifyArchitectClarificationAnswer({

@@ -68,6 +68,7 @@ export function clarificationQuestionsFromHistory(
     if (entry.entryKind !== 'clarification_question') return []
     const content = clarificationContent(entry)
     if (!content) return []
+    if (entry.entryId !== `clarification_question:${content.questionId}`) return []
     const suggestions = Array.isArray(content.suggestions)
       ? content.suggestions.filter((value): value is string => typeof value === 'string').slice(0, 4)
       : []
@@ -77,7 +78,9 @@ export function clarificationQuestionsFromHistory(
   for (const entry of entries) {
     if (entry.entryKind !== 'clarification_answer') continue
     const content = clarificationContent(entry)
-    if (!content || typeof content.answer !== 'string' || typeof content.questionId !== 'string') continue
+    if (!content || typeof content.answer !== 'string' || typeof content.questionId !== 'string'
+      || typeof content.answerId !== 'string'
+      || entry.entryId !== `clarification_answer:${content.answerId}`) continue
     if (answers.has(content.questionId)) throw new Error('Duplicate protected clarification answer.')
     answers.set(content.questionId, content.answer)
   }

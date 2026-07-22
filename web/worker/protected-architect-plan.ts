@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import {
   canonicalArchitectPlanJson,
   type ArchitectPlanEntryInput,
@@ -193,6 +193,8 @@ export function buildProtectedArchitectPlanEntries(input: {
 }
 
 export type ProtectedClarificationAnswer = {
+  questionId: string
+  answerId: string
   question: string
   answer: string
 }
@@ -234,9 +236,11 @@ export function appendProtectedArchitectClarifications(input: {
       'clarification_answer',
       canonicalArchitectPlanJson({
         schemaVersion: 1,
+        questionId: answer.questionId,
+        answerId: answer.answerId,
         question: answer.question,
         answer: answer.answer,
-      }), `clarification_answer:${randomUUID()}`),
+      }), `clarification_answer:${answer.answerId}`),
     ),
   ]
 }

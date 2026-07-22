@@ -74,4 +74,36 @@ describe('audited clarification history projection', () => {
       answeredAt: null,
     }])).toEqual([])
   })
+
+  it('fails closed when protected entry identities do not match their envelopes', () => {
+    expect(clarificationQuestionsFromHistory([{
+      entryId: 'clarification_question:11111111-1111-4111-8111-111111111111',
+      entryKind: 'clarification_question',
+      content: JSON.stringify({
+        schemaVersion: 1,
+        questionId: '33333333-3333-4333-8333-333333333333',
+        question: 'Which branch?',
+      }),
+    }], [])).toEqual([])
+
+    expect(clarificationQuestionsFromHistory([{
+      entryId: 'clarification_question:11111111-1111-4111-8111-111111111111',
+      entryKind: 'clarification_question',
+      content: JSON.stringify({
+        schemaVersion: 1,
+        questionId: '11111111-1111-4111-8111-111111111111',
+        question: 'Which branch?',
+      }),
+    }, {
+      entryId: 'clarification_answer:22222222-2222-4222-8222-222222222222',
+      entryKind: 'clarification_answer',
+      content: JSON.stringify({
+        schemaVersion: 1,
+        questionId: '11111111-1111-4111-8111-111111111111',
+        answerId: '44444444-4444-4444-8444-444444444444',
+        question: 'Which branch?',
+        answer: 'main',
+      }),
+    }], [])).toEqual([])
+  })
 })

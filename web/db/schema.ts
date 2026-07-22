@@ -14,7 +14,9 @@ import {
   foreignKey,
   index,
   primaryKey,
+  unique,
   uniqueIndex,
+  type AnyPgColumn,
 } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
 import type { InferSelectModel, InferInsertModel } from 'drizzle-orm'
@@ -2100,6 +2102,12 @@ export type NewAppSetting = InferInsertModel<typeof appSettings>
 // ---------------------------------------------------------------------------
 // taskQuestions
 // ---------------------------------------------------------------------------
+const clarificationAnswerReferenceColumns = (): [AnyPgColumn, AnyPgColumn, AnyPgColumn] => [
+  architectClarificationAnswers.taskId,
+  architectClarificationAnswers.questionId,
+  architectClarificationAnswers.id,
+]
+
 export const taskQuestions = pgTable(
   'task_questions',
   {
@@ -2123,23 +2131,39 @@ export const taskQuestions = pgTable(
   (t) => [
     index('task_questions_task_id_idx').on(t.taskId),
     index('task_questions_task_id_status_idx').on(t.taskId, t.status),
+    unique('task_questions_task_id_id_key').on(t.taskId, t.id),
+    foreignKey({
+      name: 'task_questions_answer_reference_task_question_fk',
+      columns: [t.taskId, t.id, t.answerReferenceId],
+      foreignColumns: clarificationAnswerReferenceColumns(),
+    }).onUpdate('restrict').onDelete('restrict'),
   ],
 )
 
 export type TaskQuestion = InferSelectModel<typeof taskQuestions>
 export type NewTaskQuestion = InferInsertModel<typeof taskQuestions>
 
-/** Protected append-only text for answered clarifications. Public question
- * rows intentionally do not reference this table until the B2 cutover. */
-export const architectClarificationAnswers = pgTable('architect_clarification_answers', {
-  id: uuid('id').primaryKey(),
-  taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
-  questionId: uuid('question_id').notNull().references(() => taskQuestions.id, { onDelete: 'restrict' }),
-  sourcePlanArtifactId: uuid('source_plan_artifact_id').notNull(),
-  sourcePlanVersion: bigint('source_plan_version', { mode: 'number' }).notNull(),
-  answer: text('answer').notNull(),
-  contentDigest: text('content_digest').notNull(),
-  digestKeyId: text('digest_key_id').notNull(),
-  actorUserId: uuid('actor_user_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
-  createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
-})
+/** Protected append-only text for answered clarifications. */
+export const architectClarificationAnswers = pgTable(
+  'architect_clarification_answers',
+  {
+    id: uuid('id').primaryKey(),
+    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    questionId: uuid('question_id').notNull(),
+    sourcePlanArtifactId: uuid('source_plan_artifact_id').notNull(),
+    sourcePlanVersion: bigint('source_plan_version', { mode: 'number' }).notNull(),
+    answer: text('answer').notNull(),
+    contentDigest: text('content_digest').notNull(),
+    digestKeyId: text('digest_key_id').notNull(),
+    actorUserId: uuid('actor_user_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    foreignKey({
+      name: 'architect_clarification_answers_task_question_fk',
+      columns: [t.taskId, t.questionId],
+      foreignColumns: [taskQuestions.taskId, taskQuestions.id],
+    }).onUpdate('restrict').onDelete('restrict'),
+    unique('architect_clarification_answers_task_question_id_key').on(t.taskId, t.questionId, t.id),
+  ],
+)

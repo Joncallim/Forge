@@ -186,7 +186,12 @@ describe('production protected Architect entry materialization', () => {
     const secondEntries = appendProtectedArchitectClarifications({
       entries: first.entries,
       openQuestions: [],
-      answeredQuestions: [{ question: 'Which branch?', answer: 'main' }],
+      answeredQuestions: [{
+        questionId: '00000000-0000-4000-8000-000000000001',
+        answerId: '00000000-0000-4000-8000-000000000002',
+        question: 'Which branch?',
+        answer: 'main',
+      }],
     })
     const common = {
       digestKey: Buffer.alloc(32, 7),
@@ -208,9 +213,11 @@ describe('production protected Architect entry materialization', () => {
     expect(second.entries.filter((entry) => entry.entryKind === 'clarification_question')).toHaveLength(1)
     expect(second.entries.filter((entry) => entry.entryKind === 'clarification_answer')).toHaveLength(1)
     const answer = second.entries.find((entry) => entry.entryKind === 'clarification_answer')!
-    expect(answer.entryId).toMatch(/^clarification_answer:[0-9a-f-]{36}$/)
+    expect(answer.entryId).toBe('clarification_answer:00000000-0000-4000-8000-000000000002')
     expect(JSON.parse(answer.content)).toEqual({
       answer: 'main',
+      answerId: '00000000-0000-4000-8000-000000000002',
+      questionId: '00000000-0000-4000-8000-000000000001',
       question: 'Which branch?',
       schemaVersion: 1,
     })

@@ -6,7 +6,7 @@ import { db } from '../db'
 import { agentConfigs, agentRuns, artifacts, projects, taskQuestions, tasks, type Task } from '../db/schema'
 import { getModel, getProvider } from '../lib/providers/registry'
 import { resolveDefaultProvider } from '../lib/providers/default'
-import { and, asc, desc, eq } from 'drizzle-orm'
+import { and, asc, desc, eq, isNull } from 'drizzle-orm'
 import { publishTaskEvent } from './events'
 import { updateTaskStatus, updateTaskStatusIfCurrent, type TaskStatus } from './task-state'
 import { recordTaskLogBestEffort } from './task-logs'
@@ -16,7 +16,6 @@ import {
   buildWebResearchContext,
   detectSoftwareProfile,
 } from './architect-context'
-import type { OpenQuestion } from './open-questions'
 import { getProjectMcpOverview } from '../lib/mcps/manager'
 import { loadCurrentProjectFilesystemDecision } from '../lib/mcps/filesystem-grant-reconciliation'
 import type { ProjectMcpOverview } from '../lib/mcps/types'
@@ -49,7 +48,6 @@ import {
   bindArchitectReplanContext,
   recordArchitectPlanVersion,
   resolveArchitectReplanEntry,
-  resolveArchitectPlanEntry,
 } from '../lib/mcps/s4-protocol-store'
 import {
   ARCHITECT_PLAN_HEADER,
@@ -175,6 +173,8 @@ async function prepareArchitectAcpSessionCwd(taskId: string): Promise<string> {
 }
 
 export interface AnsweredQuestion {
+  questionId: string
+  answerId: string
   question: string
   answer: string
 }
@@ -201,7 +201,12 @@ function protectedAnsweredQuestions(input: PreviousArchitectPlanContext): Answer
       throw new Error('Protected clarification answer identity is invalid.')
     }
     answers.add(answer.questionId)
-    return { question: questions.get(answer.questionId)!, answer: answer.content }
+    return {
+      questionId: answer.questionId,
+      answerId: answer.answerId,
+      question: questions.get(answer.questionId)!,
+      answer: answer.content,
+    }
   })
 }
 
@@ -718,7 +723,13 @@ export async function previousPlanContextForArchitectRun(input: {
   return {
     planText: previousPlan,
     planEntries,
-    clarificationAnswers: resolved.filter((entry): entry is Extract<typeof entry, { sourceKind: 'clarification_answer' }> => entry.sourceKind === 'clarification_answer').map(({ expectedEntryId, ...entry }) => entry),
+    clarificationAnswers: resolved
+      .filter((entry): entry is Extract<typeof entry, { sourceKind: 'clarification_answer' }> => entry.sourceKind === 'clarification_answer')
+      .map((entry) => {
+        const { expectedEntryId, ...answer } = entry
+        void expectedEntryId
+        return answer
+      }),
     protectedComparableEntries: protectedComparableEntries(planEntries),
   }
 }
@@ -738,10 +749,12 @@ export async function previousPlanForArchitectRun(input: {
  * stored with each question. Returns the number of open questions persisted.
  */
 async function persistOpenQuestions(taskId: string, questions: readonly ProtectedOpenQuestion[], artifactId: string, planVersion: string): Promise<number> {
-  // Clear any prior questions from an earlier architect run for this task —
-  // each run represents the current/latest plan, so stale questions from a
-  // previous round should not linger.
-  await db.delete(taskQuestions).where(eq(taskQuestions.taskId, taskId))
+  // Answered rows are the opaque durable projection of protected subledger
+  // evidence. Only an unanswered round can be replaced by a newer plan.
+  await db.delete(taskQuestions).where(and(
+    eq(taskQuestions.taskId, taskId),
+    isNull(taskQuestions.answerReferenceId),
+  ))
 
   if (questions.length === 0) {
     // Still notify connected clients — a replan that resolves every open
@@ -1066,9 +1079,6 @@ async function runArchitect(
     const planVersion = typeof previousVersion === 'string' && /^[1-9][0-9]*$/.test(previousVersion)
       ? (BigInt(previousVersion) + BigInt(1)).toString()
       : '1'
-    const previousClarifications = previousProtectedEntries?.filter((entry) =>
-      entry.entryKind === 'clarification_question'
-      || entry.entryKind === 'clarification_answer') ?? []
     const protectedStructuralEntries = preservePreviousPlan && previousProtectedEntries
       ? previousProtectedEntries.filter((entry) =>
           entry.entryKind !== 'clarification_question'
@@ -1079,9 +1089,11 @@ async function runArchitect(
         })
     const protectedOpenQuestions: ProtectedOpenQuestion[] = prepared.questions.map((question) => ({ ...question, questionId: randomUUID() }))
     const protectedEntries = appendProtectedArchitectClarifications({
-      entries: [...protectedStructuralEntries, ...previousClarifications],
+      entries: protectedStructuralEntries,
       openQuestions: protectedOpenQuestions,
-      answeredQuestions,
+      // The append-only answer subledger remains the durable answer history.
+      // Revised plans carry only their current protected open-question entries.
+      answeredQuestions: [],
     })
     const artifact = await createArchitectPlanArtifact(task.id, run.id, artifactPlanText, planVersion, {
       openQuestionCount: prepared.questions.length,

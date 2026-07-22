@@ -1067,16 +1067,42 @@ BEGIN
       USING ERRCODE = '28000';
   END IF;
 
-  RETURN QUERY
-  SELECT plan_entry.entry_id, plan_entry.entry_kind, plan_entry.agent,
-    plan_entry.requirement_key, plan_entry.binding_fingerprint,
-    plan_entry.content, plan_entry.content_digest, plan_entry.digest_key_id,
-    plan_entry.projection_eligible
-  FROM public.architect_plan_entries plan_entry
-  WHERE plan_entry.task_id = p_task_id
-    AND plan_entry.plan_version = p_plan_version
-  ORDER BY plan_entry.entry_id
-  LIMIT 256;
+  -- The clarification subledger is created later in this unshipped migration.
+  -- Keep this query dynamic so the function can be installed before that table
+  -- exists, while every invocation sees the completed protected schema.
+  RETURN QUERY EXECUTE $history$
+    WITH protected_entries AS (
+      SELECT plan_entry.entry_id, plan_entry.entry_kind, plan_entry.agent,
+        plan_entry.requirement_key, plan_entry.binding_fingerprint,
+        plan_entry.content, plan_entry.content_digest, plan_entry.digest_key_id,
+        plan_entry.projection_eligible
+      FROM public.architect_plan_entries plan_entry
+      WHERE plan_entry.task_id = $1
+        AND plan_entry.plan_version = $2
+        AND plan_entry.entry_kind <> 'clarification_answer'
+      UNION ALL
+      SELECT 'clarification_answer:' || answer.id::text, 'clarification_answer',
+        NULL::text, NULL::text, NULL::text,
+        pg_catalog.jsonb_build_object(
+          'schemaVersion', 1,
+          'questionId', answer.question_id,
+          'answerId', answer.id,
+          'question', question.content::jsonb->>'question',
+          'answer', answer.answer
+        )::text,
+        answer.content_digest, answer.digest_key_id, false
+      FROM public.architect_clarification_answers answer
+      JOIN public.architect_plan_entries question ON question.task_id = answer.task_id
+        AND question.plan_artifact_id = answer.source_plan_artifact_id
+        AND question.plan_version = answer.source_plan_version
+        AND question.entry_id = 'clarification_question:' || answer.question_id::text
+        AND question.entry_kind = 'clarification_question'
+      WHERE answer.task_id = $1
+        AND answer.source_plan_artifact_id = $3
+        AND answer.source_plan_version = $2
+    )
+    SELECT * FROM protected_entries ORDER BY entry_id LIMIT 256
+  $history$ USING p_task_id, p_plan_version, v_version.plan_artifact_id;
 END;
 $$;
 --> statement-breakpoint
@@ -6603,10 +6629,12 @@ $$;
 --> statement-breakpoint
 -- B1A protected clarification subledger. It is deliberately separate from
 -- finalized Architect plan versions and has no public-table text projection.
+ALTER TABLE public.task_questions
+  ADD CONSTRAINT task_questions_task_id_id_key UNIQUE (task_id, id);
 CREATE TABLE public.architect_clarification_answers (
   id uuid PRIMARY KEY,
   task_id uuid NOT NULL REFERENCES public.tasks(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
-  question_id uuid NOT NULL REFERENCES public.task_questions(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  question_id uuid NOT NULL,
   source_plan_artifact_id uuid NOT NULL,
   source_plan_version bigint NOT NULL,
   answer text NOT NULL CHECK (pg_catalog.octet_length(answer) BETWEEN 1 AND 65536),
@@ -6616,6 +6644,9 @@ CREATE TABLE public.architect_clarification_answers (
   created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
   FOREIGN KEY (source_plan_artifact_id, source_plan_version)
     REFERENCES public.architect_plan_versions(plan_artifact_id, plan_version)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  FOREIGN KEY (task_id, question_id)
+    REFERENCES public.task_questions(task_id, id)
     ON UPDATE RESTRICT ON DELETE RESTRICT,
   UNIQUE (task_id, question_id, id)
 );
@@ -6632,8 +6663,10 @@ ALTER TABLE public.task_questions
   ADD CONSTRAINT task_questions_opaque_source_fk FOREIGN KEY (source_plan_artifact_id, source_plan_version)
     REFERENCES public.architect_plan_versions(plan_artifact_id, plan_version)
     ON UPDATE RESTRICT ON DELETE RESTRICT,
-  ADD CONSTRAINT task_questions_answer_reference_fk FOREIGN KEY (answer_reference_id)
-    REFERENCES public.architect_clarification_answers(id) ON UPDATE RESTRICT ON DELETE RESTRICT;
+  ADD CONSTRAINT task_questions_answer_reference_task_question_fk
+    FOREIGN KEY (task_id, id, answer_reference_id)
+    REFERENCES public.architect_clarification_answers(task_id, question_id, id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT;
 ALTER TABLE public.task_questions
   ALTER COLUMN question DROP NOT NULL,
   ALTER COLUMN suggestions DROP NOT NULL,
@@ -6724,7 +6757,7 @@ BEGIN
 END;
 $$;
 CREATE OR REPLACE FUNCTION forge.resolve_architect_plan_entry_v2(p_reference_id uuid)
-RETURNS TABLE (purpose text, task_id uuid, plan_artifact_id uuid, plan_version bigint,
+RETURNS TABLE (purpose text, source_kind text, task_id uuid, plan_artifact_id uuid, plan_version bigint,
   entry_id text, entry_kind text, agent text, requirement_key text,
   binding_fingerprint text, content text, content_digest text, digest_key_id text,
   projection_eligible boolean, clarification_question_id uuid)
@@ -6738,7 +6771,7 @@ BEGIN
     SELECT reference.* FROM public.architect_plan_execution_references reference
     WHERE reference.id = p_reference_id AND reference.resolved_at IS NULL FOR UPDATE
   ), eligible AS (
-    SELECT r.id, r.purpose, r.task_id, r.plan_artifact_id, r.plan_version,
+    SELECT r.id, r.purpose, r.source_kind, r.task_id, r.plan_artifact_id, r.plan_version,
       entry.entry_id, entry.entry_kind, entry.agent, entry.requirement_key,
       entry.binding_fingerprint, entry.content, entry.content_digest, entry.digest_key_id,
       entry.projection_eligible, NULL::uuid
@@ -6751,7 +6784,7 @@ BEGIN
     WHERE (r.purpose = 'architect_replan' AND run.agent_type = 'architect' AND run.work_package_id IS NULL)
        OR (r.purpose = 'package_specialist' AND entry.projection_eligible)
     UNION ALL
-    SELECT r.id, r.purpose, r.task_id, r.plan_artifact_id, r.plan_version,
+    SELECT r.id, r.purpose, r.source_kind, r.task_id, r.plan_artifact_id, r.plan_version,
       'clarification_answer:' || answer.id::text, 'clarification_answer', NULL, NULL, NULL,
       answer.answer, answer.content_digest, answer.digest_key_id, false, answer.question_id
     FROM locked r JOIN public.agent_runs run ON run.id = r.agent_run_id
@@ -6765,7 +6798,7 @@ BEGIN
   ), consumed AS (
     UPDATE public.architect_plan_execution_references r SET resolved_at = pg_catalog.clock_timestamp()
     FROM eligible WHERE r.id = eligible.id RETURNING eligible.*
-  ) SELECT purpose, task_id, plan_artifact_id, plan_version, entry_id, entry_kind,
+  ) SELECT purpose, source_kind, task_id, plan_artifact_id, plan_version, entry_id, entry_kind,
     agent, requirement_key, binding_fingerprint, content, content_digest, digest_key_id,
     projection_eligible, clarification_question_id FROM consumed;
 END;
@@ -6800,6 +6833,9 @@ BEGIN
     AND entry.entry_id = 'clarification_question:' || p_question_id::text AND entry.entry_kind = 'clarification_question' FOR KEY SHARE;
   IF NOT FOUND THEN RAISE EXCEPTION 'Clarification source is stale or unavailable' USING ERRCODE = '40001'; END IF;
   PERFORM 1 FROM public.task_questions question WHERE question.id = p_question_id AND question.task_id = p_task_id
+    AND question.question_entry_id = 'clarification_question:' || p_question_id::text
+    AND question.source_plan_artifact_id = p_source_plan_artifact_id
+    AND question.source_plan_version = p_source_plan_version
     AND question.status = 'open' AND question.answer_reference_id IS NULL FOR UPDATE;
   IF NOT FOUND THEN RAISE EXCEPTION 'Clarification question is no longer open' USING ERRCODE = '40001'; END IF;
   INSERT INTO public.architect_clarification_answers (id, task_id, question_id, source_plan_artifact_id, source_plan_version, answer, content_digest, digest_key_id, actor_user_id)
@@ -6825,6 +6861,7 @@ GRANT SELECT ON public.tasks, public.projects, public.work_packages,
   public.filesystem_mcp_runtime_audits,
   public.approval_gates TO forge_s4_routines_owner;
 GRANT SELECT, UPDATE ON public.sessions TO forge_s4_routines_owner;
+GRANT SELECT, UPDATE ON public.task_questions TO forge_s4_routines_owner;
 GRANT UPDATE ON public.filesystem_mcp_runtime_audits TO forge_s4_routines_owner;
 GRANT UPDATE ON public.tasks, public.projects, public.work_packages,
   public.agent_runs, public.artifacts, public.approval_gates,
@@ -6838,6 +6875,7 @@ GRANT INSERT ON public.agent_runs, public.artifacts, public.filesystem_mcp_runti
 --> statement-breakpoint
 REVOKE ALL ON public.architect_plan_versions, public.architect_plan_entries,
   public.architect_plan_execution_references, public.architect_plan_history_reads,
+  public.task_questions,
   public.protected_package_entry_registrations,
   public.protected_entry_capability_bindings,
   public.mcp_operator_review_versions, public.mcp_operator_review_entries,

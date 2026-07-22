@@ -267,6 +267,13 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(s4Migration).toMatch(/GRANT EXECUTE ON FUNCTION forge\.append_architect_clarification_answer_v1\([^;]+TO forge_architect_plan_history_reader;/)
     expect(s4Migration).toContain('source_kind = \'clarification_answer\'')
     expect(s4Migration).toContain('answer_reference_id')
+    expect(s4Migration).toContain('task_questions_task_id_id_key UNIQUE (task_id, id)')
+    expect(s4Migration).toContain('REFERENCES public.task_questions(task_id, id)')
+    expect(s4Migration).toContain('REFERENCES public.architect_clarification_answers(task_id, question_id, id)')
+    expect(s4Migration).toContain('GRANT SELECT, UPDATE ON public.task_questions TO forge_s4_routines_owner;')
+    expect(s4Migration).toContain('REVOKE ALL ON public.architect_plan_versions, public.architect_plan_entries,')
+    expect(s4Migration).toContain('public.task_questions,')
+    expect(s4Migration).toMatch(/RETURNS TABLE \(purpose text, source_kind text, task_id uuid/)
   })
 
   it('exposes only atomic S4 lifecycle entry points to the packet issuer', () => {
