@@ -72,10 +72,9 @@ describe('task log writer', () => {
 
     expect(chain.values).toHaveBeenCalledWith(expect.objectContaining({
       frontMatter: expect.not.objectContaining({ prompt: expect.anything() }),
+      message: 'legacy_task_log_unavailable',
       metadata: expect.objectContaining({
-        nested: expect.objectContaining({
-          token: '[REDACTED_TOKEN]',
-        }),
+        nested: expect.not.objectContaining({ token: expect.anything() }),
       }),
     }))
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:log', expect.objectContaining({
@@ -98,6 +97,8 @@ describe('task log writer', () => {
         prompt: {
           messages: [{ content: 'Bearer ghp_secret12345' }],
         },
+        system_prompt: 'RAW-SYSTEM-PROMPT-SENTINEL',
+        apiKey: 'RAW-API-KEY-SENTINEL',
       },
       feedback: {
         text: 'Retry with the original user prompt copied here',
@@ -123,6 +124,8 @@ describe('task log writer', () => {
 
     expect(sanitized.mcpExecutionDesign).not.toHaveProperty('promptOverlays')
     expect(sanitized.nested).not.toHaveProperty('prompt')
+    expect(sanitized.nested).not.toHaveProperty('system_prompt')
+    expect(sanitized.nested).not.toHaveProperty('apiKey')
     expect(sanitized.feedback).toEqual({ kind: 'unknown_legacy_digest', byteCount: expect.any(Number) })
     expect(sanitized.commandResults[0].stderr).toEqual({ kind: 'unknown_legacy_digest', byteCount: expect.any(Number) })
     expect(sanitized.commandResults[0].stdout).toEqual({ kind: 'unknown_legacy_digest', byteCount: expect.any(Number) })
@@ -131,6 +134,8 @@ describe('task log writer', () => {
     expect(JSON.stringify(sanitized)).not.toContain('ghp_secret12345')
     expect(JSON.stringify(sanitized)).not.toContain('original user prompt')
     expect(JSON.stringify(sanitized)).not.toContain('failing test printed')
+    expect(JSON.stringify(sanitized)).not.toContain('RAW-SYSTEM-PROMPT-SENTINEL')
+    expect(JSON.stringify(sanitized)).not.toContain('RAW-API-KEY-SENTINEL')
   })
 
   it('keeps prompt aliases out of every checked-in task-log front-matter producer', () => {

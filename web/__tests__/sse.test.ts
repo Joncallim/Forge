@@ -272,7 +272,10 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
             agentRunId: 'run-task',
             artifactType: 'adr_text',
             content: 'Task-level plan.',
-            metadata: {},
+            metadata: {
+              system_prompt: 'RAW-SYSTEM-PROMPT-SENTINEL',
+              apiKey: 'RAW-API-KEY-SENTINEL',
+            },
             createdAt: new Date('2026-06-25T00:00:03.000Z'),
           },
         ])
@@ -296,6 +299,38 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
       }),
     ]))
     expect(artifactPayloads.find((payload) => payload.id === 'artifact-task')).not.toHaveProperty('workPackageId')
+    expect(artifactPayloads.every((payload) => !Object.hasOwn(payload, 'content'))).toBe(true)
+    expect(lines.join('\n')).not.toContain('Task-level plan.')
+    expect(lines.join('\n')).not.toContain('RAW-SYSTEM-PROMPT-SENTINEL')
+    expect(lines.join('\n')).not.toContain('RAW-API-KEY-SENTINEL')
+  }, 2000)
+
+  it('strips nested prompt, delta, and secret aliases before live publish and replay persistence', async () => {
+    const { GET } = await import('@/app/api/tasks/[id]/runs/route')
+    const params = Promise.resolve({ id: 'task-sse-1' })
+    const res = await GET(sseRequest() as never, { params })
+
+    setTimeout(() => {
+      state.mockSub?.emit(
+        'message',
+        'forge:task:task-sse-1',
+        JSON.stringify({
+          type: 'run:chunk',
+          delta: 'RAW-DELTA-SENTINEL',
+          metadata: {
+            promptOverlay: 'RAW-OVERLAY-SENTINEL',
+            api_key: 'RAW-KEY-SENTINEL',
+            status: 'streaming',
+          },
+        }),
+      )
+    }, 100)
+
+    const lines = await readLines(res.body!, 500)
+    const payload = dataPayloads(lines).find((candidate) => candidate.type === 'run:chunk')
+    expect(payload).toMatchObject({ type: 'run:chunk', metadata: { status: 'streaming' } })
+    expect(payload).not.toHaveProperty('delta')
+    expect(JSON.stringify(payload)).not.toContain('RAW-')
   }, 2000)
 
   it('emits event: run:started within 500ms when a run:started message is published', async () => {

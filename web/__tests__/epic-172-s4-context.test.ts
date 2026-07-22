@@ -187,13 +187,7 @@ describe('Epic 172 S4 protected Architect plan history', () => {
       architect_plan: 'raw plan',
       private_key: 'raw key',
       message: 'architect_plan: raw plan',
-    })).toEqual({
-      plan_body: '[prompt content drained by S4 leakage barrier]',
-      fullPlan: '[prompt content drained by S4 leakage barrier]',
-      architect_plan: '[prompt content drained by S4 leakage barrier]',
-      private_key: '[redacted: 7 bytes]',
-      message: '[secret value drained]',
-    })
+    })).toEqual({})
   })
 
   it('materializes deterministic NFC HMAC envelopes and text-free executable references', () => {

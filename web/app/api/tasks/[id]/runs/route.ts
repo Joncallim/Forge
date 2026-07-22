@@ -6,6 +6,7 @@ import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 import type RedisClient from 'ioredis'
 import { getAccessibleTask } from '@/lib/task-access'
+import { sanitizeLogStructuredValue } from '@/lib/task-log-sanitization'
 
 // ---------------------------------------------------------------------------
 // SSE stream — GET /api/tasks/:id/runs
@@ -72,16 +73,29 @@ export async function GET(
         }
       }
 
+      const safeEventType = (type: string): string =>
+        /^[a-z][a-z0-9:_-]{0,99}$/.test(type) ? type : 'event:unavailable'
+
+      const safeEventData = (data: unknown): unknown =>
+        sanitizeLogStructuredValue(data, {
+          maxArrayItems: 100,
+          maxDepth: 6,
+          maxObjectKeys: 100,
+          stringByteLimit: 16 * 1024,
+        })
+
       // persistAndSend: allocates a global monotonic sequence number, writes to the
       // sorted set using that number as the score, then enqueues the SSE line.
       // The score is the canonical event ID — Last-Event-ID from the client maps
       // directly to the sorted set score, so replay is exact.
       const persistAndSend = async (type: string, data: unknown) => {
         if (closed) return
+        const safeType = safeEventType(type)
+        const safeData = safeEventData(data)
         const seq = await redis.incr(`forge:task:${taskId}:seq`)
-        const line = `id: ${seq}\nevent: ${type}\ndata: ${JSON.stringify(data)}\n\n`
+        const line = `id: ${seq}\nevent: ${safeType}\ndata: ${JSON.stringify(safeData)}\n\n`
         redis
-          .zadd(`forge:task:${taskId}:history`, seq, JSON.stringify({ type, data }))
+          .zadd(`forge:task:${taskId}:history`, seq, JSON.stringify({ type: safeType, data: safeData }))
           .then(() => redis.expire(`forge:task:${taskId}:history`, 86400))
           .catch((err) => console.error('SSE history write failed:', err))
         enqueue(line)
@@ -90,12 +104,12 @@ export async function GET(
       // replaySend: enqueues the SSE line directly WITHOUT writing to the sorted set.
       // Used only during the replay loop to avoid re-persisting already-stored events.
       const replaySend = (seqId: number, type: string, data: unknown) => {
-        const line = `id: ${seqId}\nevent: ${type}\ndata: ${JSON.stringify(data)}\n\n`
+        const line = `id: ${seqId}\nevent: ${safeEventType(type)}\ndata: ${JSON.stringify(safeEventData(data))}\n\n`
         enqueue(line)
       }
 
       const sendSnapshotEvent = (type: string, data: unknown) => {
-        enqueue(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`)
+        enqueue(`event: ${safeEventType(type)}\ndata: ${JSON.stringify(safeEventData(data))}\n\n`)
       }
 
       const sendCurrentSnapshot = async () => {
