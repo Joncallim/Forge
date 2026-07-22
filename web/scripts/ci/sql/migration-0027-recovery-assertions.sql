@@ -432,7 +432,7 @@ INSERT INTO public.work_package_local_run_evidence (
   '27000000-0000-4000-8000-00000000e311', 1,
   pg_catalog.clock_timestamp() - interval '3 minutes',
   pg_catalog.clock_timestamp() - interval '2 minutes', 'uncertain',
-  '{"status":"failed","failureCode":"execution_lease_expired"}'::jsonb,
+  '{"status":"failed","failureCode":"local_execution_failed"}'::jsonb,
   pg_catalog.clock_timestamp() - interval '2 minutes'
 );
 UPDATE public.work_packages package
@@ -444,13 +444,18 @@ SET metadata = pg_catalog.jsonb_set(
     'priorAgentRunId', '27000000-0000-4000-8000-00000000e201',
     'localRunEvidenceId', '27000000-0000-4000-8000-00000000e301',
     'evidenceFingerprint',
-      'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+      'sha256:' || pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+        'forge:local-run-evidence:v1:' || evidence.id::text || ':' || evidence.terminal::text,
+        'UTF8'
+      )), 'hex'),
     'taskDisposition', 'operator_hold', 'autoRetryable', false,
     'reason', 'local_execution_interrupted',
     'disposition', 'retry_local_execution', 'reviewState', 'not_applicable'
   ), true
 )
-WHERE package.id = '27000000-0000-4000-8000-00000000e101';
+FROM public.work_package_local_run_evidence evidence
+WHERE package.id = '27000000-0000-4000-8000-00000000e101'
+  AND evidence.id = '27000000-0000-4000-8000-00000000e301';
 
 CREATE FUNCTION public.forge_proof_expect_local_retry_rejected_v1()
 RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, forge AS $$
@@ -702,23 +707,41 @@ END;
 $local_recovery_rejection_zero_mutation$;
 
 SET SESSION AUTHORIZATION forge_s4_recovery_operator;
+WITH canonical_evidence AS (
+  SELECT 'sha256:' || pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+    'forge:local-run-evidence:v1:' || evidence.id::text || ':' || evidence.terminal::text,
+    'UTF8'
+  )), 'hex') AS fingerprint
+  FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = '27000000-0000-4000-8000-00000000e301'
+)
 SELECT result, package_status
-FROM forge.apply_local_effect_recovery_action_v2(
-  '27000000-0000-4000-8000-00000000e001',
-  '27000000-0000-4000-8000-00000000e101',
-  '27000000-0000-4000-8000-00000000e301', 'retry_local_execution',
-  'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
-  '27000000-0000-4000-8000-000000000001'
-);
+FROM canonical_evidence,
+  forge.apply_local_effect_recovery_action_v2(
+    '27000000-0000-4000-8000-00000000e001',
+    '27000000-0000-4000-8000-00000000e101',
+    '27000000-0000-4000-8000-00000000e301', 'retry_local_execution',
+    canonical_evidence.fingerprint,
+    '27000000-0000-4000-8000-000000000001'
+  );
 -- Exact ledger-first replay succeeds after the local marker was cleared.
+WITH canonical_evidence AS (
+  SELECT 'sha256:' || pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+    'forge:local-run-evidence:v1:' || evidence.id::text || ':' || evidence.terminal::text,
+    'UTF8'
+  )), 'hex') AS fingerprint
+  FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = '27000000-0000-4000-8000-00000000e301'
+)
 SELECT result, package_status
-FROM forge.apply_local_effect_recovery_action_v2(
-  '27000000-0000-4000-8000-00000000e001',
-  '27000000-0000-4000-8000-00000000e101',
-  '27000000-0000-4000-8000-00000000e301', 'retry_local_execution',
-  'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
-  '27000000-0000-4000-8000-000000000001'
-);
+FROM canonical_evidence,
+  forge.apply_local_effect_recovery_action_v2(
+    '27000000-0000-4000-8000-00000000e001',
+    '27000000-0000-4000-8000-00000000e101',
+    '27000000-0000-4000-8000-00000000e301', 'retry_local_execution',
+    canonical_evidence.fingerprint,
+    '27000000-0000-4000-8000-000000000001'
+  );
 RESET SESSION AUTHORIZATION;
 DO $local_recovery_success_assertions$
 BEGIN
