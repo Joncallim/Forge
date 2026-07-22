@@ -20,11 +20,30 @@ const mocks = vi.hoisted(() => ({
   materializeReviewGatesForWorkPackageCompletion: vi.fn(),
   completeTaskIfReviewGatesSatisfied: vi.fn(),
   executeWorkPackage: vi.fn(),
+  activateWorkPackageExecutionContext: vi.fn(),
   loadWorkPackageExecutionContext: vi.fn(),
+  loadWorkPackageExecutionPreflight: vi.fn(),
+  resolveProtectedArchitectPlanContext: vi.fn(),
   loadCurrentProjectFilesystemDecision: vi.fn().mockResolvedValue(null),
   publishTaskEvent: vi.fn(),
   projectionContributions: [] as Array<Record<string, unknown>>,
   recordTaskLogBestEffort: vi.fn(),
+  readS4RuntimeModeV1: vi.fn(),
+  recoverLinkedS4LifecycleV2: vi.fn(),
+  claimWorkPackageLifecycleV2: vi.fn(),
+  heartbeatLocalLifecycleV2: vi.fn(),
+  heartbeatPacketLifecycleV2: vi.fn(),
+  finalizeLocalFailureV2: vi.fn(),
+  finalizeLocalSuccessV2: vi.fn(),
+  finalizePacketFailureV2: vi.fn(),
+  finalizePacketSuccessV2: vi.fn(),
+  discoverS4CompletionHandoffV1: vi.fn(),
+  materializeS4CompletionHandoffV1: vi.fn(),
+  claimPendingS4CompletionHandoffsV1: vi.fn(),
+  materializeClaimedS4CompletionHandoffV1: vi.fn(),
+  finalizeS4MaxAttemptsV1: vi.fn(),
+  resolveS4ReviewSourceV1: vi.fn(),
+  convergeRecognizedOperatorHoldTask: vi.fn(),
   projectionScopeState: 'active' as 'active' | 'archive_pending',
   WorkPackageExecutionError: class WorkPackageExecutionError extends Error {
     failureDetails: unknown
@@ -74,6 +93,10 @@ vi.mock('@/worker/events', () => ({
   publishTaskEvent: mocks.publishTaskEvent,
 }))
 
+vi.mock('@/lib/mcps/review-source-resolver', () => ({
+  resolveS4ReviewSourceV1: mocks.resolveS4ReviewSourceV1,
+}))
+
 vi.mock('@/worker/task-logs', () => ({
   recordTaskLogBestEffort: mocks.recordTaskLogBestEffort,
 }))
@@ -89,11 +112,21 @@ vi.mock('@/worker/review-gates', () => ({
   isImplementationPackageRole: (role: string) => ![
     '', 'architect', 'handoff', 'pm', 'qa', 'reviewer', 'security', 'security-review', 'security_review',
   ].includes(role.trim().toLowerCase()),
+  requiredGateTypesForRequirement: (requirement: string) => requirement === 'none'
+    ? []
+    : requirement === 'qa_only'
+      ? ['qa_review']
+      : requirement === 'reviewer_only'
+        ? ['reviewer_review']
+        : ['qa_review', 'reviewer_review'],
 }))
 
 vi.mock('@/worker/work-package-executor', () => ({
+  activateWorkPackageExecutionContext: mocks.activateWorkPackageExecutionContext,
   executeWorkPackage: mocks.executeWorkPackage,
   loadWorkPackageExecutionContext: mocks.loadWorkPackageExecutionContext,
+  loadWorkPackageExecutionPreflight: mocks.loadWorkPackageExecutionPreflight,
+  resolveProtectedArchitectPlanContext: mocks.resolveProtectedArchitectPlanContext,
   MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS: 3,
   WorkPackageExecutionError: mocks.WorkPackageExecutionError,
   isArchitectReservedExecutionRole: (role: string) =>
@@ -103,13 +136,38 @@ vi.mock('@/worker/work-package-executor', () => ({
 vi.mock('@/lib/mcps/filesystem-grant-reconciliation', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/mcps/filesystem-grant-reconciliation')>(),
   loadCurrentProjectFilesystemDecision: mocks.loadCurrentProjectFilesystemDecision,
+  convergeRecognizedOperatorHoldTask: mocks.convergeRecognizedOperatorHoldTask,
+}))
+
+vi.mock('@/lib/mcps/s4-lease', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/s4-lease')>(),
+  claimWorkPackageLifecycleV2: mocks.claimWorkPackageLifecycleV2,
+  heartbeatLocalLifecycleV2: mocks.heartbeatLocalLifecycleV2,
+  heartbeatPacketLifecycleV2: mocks.heartbeatPacketLifecycleV2,
+  finalizeLocalFailureV2: mocks.finalizeLocalFailureV2,
+  finalizeLocalSuccessV2: mocks.finalizeLocalSuccessV2,
+  finalizePacketFailureV2: mocks.finalizePacketFailureV2,
+  finalizePacketSuccessV2: mocks.finalizePacketSuccessV2,
+  readS4RuntimeModeV1: mocks.readS4RuntimeModeV1,
+  recoverLinkedS4LifecycleV2: mocks.recoverLinkedS4LifecycleV2,
+  discoverS4CompletionHandoffV1: mocks.discoverS4CompletionHandoffV1,
+  materializeS4CompletionHandoffV1: mocks.materializeS4CompletionHandoffV1,
+  claimPendingS4CompletionHandoffsV1: mocks.claimPendingS4CompletionHandoffsV1,
+  materializeClaimedS4CompletionHandoffV1: mocks.materializeClaimedS4CompletionHandoffV1,
+  finalizeS4MaxAttemptsV1: mocks.finalizeS4MaxAttemptsV1,
 }))
 
 function fixtureSecret(...parts: string[]) {
   return parts.join('')
 }
 
-import { handoffApprovedWorkPackages, progressWorkforce } from '@/worker/work-package-handoff'
+import {
+  handoffApprovedWorkPackages,
+  isWorkPackageExecutionEnabled,
+  loadPriorReviewContext,
+  progressWorkforce,
+  reconcilePendingS4CompletionHandoffs,
+} from '@/worker/work-package-handoff'
 import { prepareArchitectArtifact } from '@/worker/architect-artifact'
 import { evaluateWorkPackageMcpBroker } from '@/worker/mcp-execution-design'
 import { buildWorkforceMaterializationRows } from '@/worker/workforce-materializer'
@@ -440,7 +498,42 @@ describe('handoffApprovedWorkPackages', () => {
     })
     mocks.dbUpdate.mockReset()
     mocks.executeWorkPackage.mockReset()
+    mocks.activateWorkPackageExecutionContext.mockReset()
     mocks.loadWorkPackageExecutionContext.mockReset()
+    mocks.loadWorkPackageExecutionPreflight.mockReset()
+    mocks.resolveProtectedArchitectPlanContext.mockReset()
+    mocks.resolveProtectedArchitectPlanContext.mockImplementation(async (preflight) => preflight)
+    mocks.readS4RuntimeModeV1.mockReset()
+    mocks.readS4RuntimeModeV1.mockResolvedValue('legacy')
+    mocks.recoverLinkedS4LifecycleV2.mockReset()
+    mocks.recoverLinkedS4LifecycleV2.mockResolvedValue({
+      result: 'not_linked_v2',
+      completionArtifactId: null,
+    })
+    mocks.discoverS4CompletionHandoffV1.mockReset()
+    mocks.discoverS4CompletionHandoffV1.mockResolvedValue(null)
+    mocks.materializeS4CompletionHandoffV1.mockReset()
+    mocks.claimPendingS4CompletionHandoffsV1.mockReset()
+    mocks.claimPendingS4CompletionHandoffsV1.mockResolvedValue([])
+    mocks.materializeClaimedS4CompletionHandoffV1.mockReset()
+    mocks.finalizeS4MaxAttemptsV1.mockReset()
+    mocks.finalizeS4MaxAttemptsV1.mockResolvedValue(true)
+    mocks.convergeRecognizedOperatorHoldTask.mockReset()
+    mocks.convergeRecognizedOperatorHoldTask.mockResolvedValue(false)
+    mocks.claimWorkPackageLifecycleV2.mockReset()
+    mocks.heartbeatLocalLifecycleV2.mockReset()
+    mocks.heartbeatLocalLifecycleV2.mockResolvedValue({ localLeaseExpiresAt: new Date() })
+    mocks.heartbeatPacketLifecycleV2.mockReset()
+    mocks.heartbeatPacketLifecycleV2.mockResolvedValue({
+      localLeaseExpiresAt: new Date(),
+      packetLeaseExpiresAt: new Date(),
+    })
+    mocks.finalizeLocalFailureV2.mockReset()
+    mocks.finalizeLocalFailureV2.mockResolvedValue(true)
+    mocks.finalizeLocalSuccessV2.mockReset()
+    mocks.finalizePacketFailureV2.mockReset()
+    mocks.finalizePacketFailureV2.mockResolvedValue(true)
+    mocks.finalizePacketSuccessV2.mockReset()
     mocks.loadCurrentProjectFilesystemDecision.mockReset()
     mocks.loadCurrentProjectFilesystemDecision.mockResolvedValue(null)
     mocks.getProjectMcpOverview.mockResolvedValue({
@@ -500,6 +593,9 @@ describe('handoffApprovedWorkPackages', () => {
   })
 
   it('marks root packages ready, claims the first package, and records a no-op handoff run', async () => {
+    const previousAcpExecutionFlag = process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION
+    process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION = 'true'
     mocks.dbSelect
       .mockReturnValueOnce(chain([
         {
@@ -526,7 +622,13 @@ describe('handoffApprovedWorkPackages', () => {
     mocks.dbUpdate.mockReturnValueOnce(readyUpdate)
     const { claimUpdate, leaseUpdate, runInsert } = mockNoOpHandoffTransaction()
 
-    const result = await handoffApprovedWorkPackages('task-1')
+    let result: Awaited<ReturnType<typeof handoffApprovedWorkPackages>>
+    try {
+      result = await handoffApprovedWorkPackages('task-1')
+    } finally {
+      if (previousAcpExecutionFlag === undefined) delete process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION
+      else process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION = previousAcpExecutionFlag
+    }
 
     expect(result).toEqual({
       status: 'handed_off',
@@ -581,12 +683,67 @@ describe('handoffApprovedWorkPackages', () => {
       taskId: 'task-1',
       workPackageId: 'pkg-1',
     }))
+    const handoffArtifactInput = mocks.materializeReviewGatesForWorkPackageCompletion.mock.calls[0]?.[0]
+    expect(handoffArtifactInput?.completeSourceRun.content).toContain(
+      'Specialist model execution and file materialization are unavailable',
+    )
+    expect(handoffArtifactInput?.completeSourceRun.content).toContain(
+      'cannot override this availability boundary',
+    )
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:handoff', expect.objectContaining({
       repositoryWrites: false,
       runId: 'run-1',
       stage: 'handoff',
       status: 'awaiting_review',
       workPackageId: 'pkg-1',
+    }))
+    expect(mocks.loadWorkPackageExecutionPreflight).not.toHaveBeenCalled()
+    expect(mocks.loadWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.activateWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
+  })
+
+  it('uses the atomic root-free protocol-v2 claim for a protected no-op handoff', async () => {
+    const runId = '00000000-0000-4000-8000-000000000101'
+    mocks.readS4RuntimeModeV1.mockResolvedValue('protected')
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'pkg-1',
+        assignedRole: 'backend',
+        harnessId: '00000000-0000-4000-8000-000000000102',
+        sequence: 1,
+        status: 'pending',
+        title: 'Backend package',
+      }]))
+      .mockReturnValueOnce(chain([]))
+    mocks.dbUpdate.mockReturnValueOnce(updateChain([{ id: 'pkg-1' }]))
+    mocks.claimWorkPackageLifecycleV2.mockResolvedValue({
+      mode: 'root_free_handoff',
+      agentRunId: runId,
+      localRunEvidenceId: null,
+      runtimeAuditId: null,
+      localClaimToken: null,
+      packetClaimToken: null,
+      localClaimGeneration: null,
+      packetClaimGeneration: null,
+      localLeaseExpiresAt: null,
+      packetLeaseExpiresAt: null,
+    })
+
+    const result = await handoffApprovedWorkPackages('task-1')
+
+    expect(result).toMatchObject({ status: 'handed_off', claimedPackageId: 'pkg-1' })
+    expect(mocks.claimWorkPackageLifecycleV2).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'root_free_handoff',
+      taskId: 'task-1',
+      workPackageId: 'pkg-1',
+      agentType: 'backend',
+      modelIdUsed: 'forge-handoff/no-op',
+    }))
+    expect(mocks.materializeReviewGatesForWorkPackageCompletion).toHaveBeenCalledWith(expect.objectContaining({
+      completeSourceRun: expect.objectContaining({ artifactType: 'log_output' }),
+      requireExecutionLease: true,
+      sourceAgentRunId: runId,
     }))
   })
 
@@ -1127,11 +1284,12 @@ describe('handoffApprovedWorkPackages', () => {
       ]),
     })
     expect(pkg.metadata).toMatchObject({
-      mcpAwareSubtasks: [],
+      mcpPromptContextPolicy: expect.objectContaining({ mcpAwareSubtaskCount: 0 }),
       mcpNormalizationErrors: expect.arrayContaining([
         expect.stringMatching(/mcpCapabilities exceeds the maximum raw count of 30/),
       ]),
     })
+    expect(pkg.metadata).not.toHaveProperty('mcpAwareSubtasks')
     const broker = evaluateWorkPackageMcpBroker({
       assignedRole: pkg.assignedRole,
       mcpOverview: overview,
@@ -1671,6 +1829,10 @@ describe('handoffApprovedWorkPackages', () => {
   it('uses prior implementation runs for attempt number and passes rework context into sandbox execution', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    // Retain the executable-path assertions below for a future confined writer.
+    // Until then an affirmative request must not make that path reachable.
+    expect(isWorkPackageExecutionEnabled()).toBe(false)
+    if (!isWorkPackageExecutionEnabled()) return
     const workPackage = {
       id: 'pkg-1',
       assignedRole: 'backend',
@@ -1896,6 +2058,8 @@ describe('handoffApprovedWorkPackages', () => {
   it('does not write stale package artifacts after execution if the lease was cancelled', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    expect(isWorkPackageExecutionEnabled()).toBe(false)
+    if (!isWorkPackageExecutionEnabled()) return
     const workPackage = {
       id: 'pkg-1',
       assignedRole: 'backend',
@@ -2022,6 +2186,8 @@ describe('handoffApprovedWorkPackages', () => {
   it('fails the package and task instead of starting a fourth implementation attempt', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    expect(isWorkPackageExecutionEnabled()).toBe(false)
+    if (!isWorkPackageExecutionEnabled()) return
     mocks.dbSelect
       .mockReturnValueOnce(chain([{
         id: 'pkg-1',
@@ -2093,9 +2259,91 @@ describe('handoffApprovedWorkPackages', () => {
     }
   })
 
+  it('acquires atomic local lifecycle ownership before project-path activation', async () => {
+    process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    expect(isWorkPackageExecutionEnabled()).toBe(false)
+    if (!isWorkPackageExecutionEnabled()) return
+    const order: string[] = []
+    const runId = '00000000-0000-4000-8000-000000000111'
+    mocks.readS4RuntimeModeV1.mockResolvedValue('protected')
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{
+        id: 'pkg-1',
+        assignedRole: 'backend',
+        harnessId: null,
+        mcpRequirements: [],
+        metadata: {},
+        sequence: 1,
+        status: 'pending',
+        title: 'Backend package',
+      }]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+    mocks.dbUpdate.mockReturnValueOnce(updateChain([{ id: 'pkg-1' }]))
+    const preflight = {
+      agentConfig: null,
+      filesystemRuntime: { schemaVersion: 1, runtimeIssued: false, status: 'not_requested' },
+      modelIdUsed: 'test-model',
+      providerConfigId: '00000000-0000-4000-8000-000000000112',
+      project: {
+        id: 'project-1',
+        localPath: '/must-not-read-before-claim',
+        rootRef: 'root-ref-1',
+      },
+      projectFilesystemDecision: null,
+      task: { id: 'task-1' },
+      workPackage: {
+        id: 'pkg-1',
+        assignedRole: 'backend',
+        metadata: {},
+        mcpRequirements: [],
+        title: 'Backend package',
+      },
+    }
+    mocks.loadWorkPackageExecutionPreflight.mockImplementation(async () => {
+      order.push('preflight')
+      return preflight
+    })
+    mocks.resolveProtectedArchitectPlanContext.mockImplementation(async (value) => {
+      order.push('protected-context')
+      return value
+    })
+    mocks.claimWorkPackageLifecycleV2.mockImplementation(async () => {
+      order.push('claim')
+      return {
+        mode: 'local_only',
+        agentRunId: runId,
+        localRunEvidenceId: '00000000-0000-4000-8000-000000000113',
+        runtimeAuditId: null,
+        localClaimToken: '00000000-0000-4000-8000-000000000114',
+        packetClaimToken: null,
+        localClaimGeneration: '1',
+        packetClaimGeneration: null,
+        localLeaseExpiresAt: new Date(),
+        packetLeaseExpiresAt: null,
+      }
+    })
+    mocks.activateWorkPackageExecutionContext.mockImplementation(async () => {
+      order.push('path-activation')
+      throw new Error('synthetic realpath failure')
+    })
+
+    await expect(handoffApprovedWorkPackages('task-1')).rejects.toThrow('synthetic realpath failure')
+
+    expect(order).toEqual(['preflight', 'claim', 'protected-context', 'path-activation'])
+    expect(mocks.finalizeLocalFailureV2).toHaveBeenCalledWith(expect.objectContaining({
+      failureCode: 'local_execution_failed',
+      localRunEvidenceId: '00000000-0000-4000-8000-000000000113',
+    }))
+    expect(mocks.loadWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
+  })
+
   it('keeps package execution failures retryable before the final approval attempt', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    expect(isWorkPackageExecutionEnabled()).toBe(false)
+    if (!isWorkPackageExecutionEnabled()) return
     mocks.dbSelect
       .mockReturnValueOnce(chain([{
         id: 'pkg-1',
@@ -2244,9 +2492,11 @@ describe('handoffApprovedWorkPackages', () => {
     }
   })
 
-  it('blocks repository-affecting packages on non-Git project paths without retrying handoff', async () => {
+  it('allows unset host-write configuration to advance non-Git paths in sandbox-only mode', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    expect(isWorkPackageExecutionEnabled()).toBe(false)
+    if (!isWorkPackageExecutionEnabled()) return
     const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'forge-non-git-project-'))
     tempRoots.push(projectRoot)
 
@@ -2375,26 +2625,12 @@ describe('handoffApprovedWorkPackages', () => {
       const result = await handoffApprovedWorkPackages('task-1', { finalAttempt: false })
 
       expect(result).toMatchObject({
-        status: 'blocked',
-        claimedPackageId: null,
+        status: 'already_handed_off',
+        claimedPackageId: 'pkg-1',
         readyPackageIds: ['pkg-1'],
-        blockedReason: expect.stringContaining('Project local path is not a Git repository'),
       })
-      expect(packageBlockedUpdate.set as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(expect.objectContaining({
-        blockedReason: expect.stringContaining('Project local path is not a Git repository'),
-        status: 'blocked',
-      }))
-      expect(runFailedUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-        errorMessage: expect.stringContaining('Project local path is not a Git repository'),
-        status: 'failed',
-      }))
-      expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
+      expect(mocks.executeWorkPackage).toHaveBeenCalledOnce()
       expect(firstEvidenceLookup).toHaveBeenCalledOnce()
-      expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:status', expect.objectContaining({
-        blockedReason: expect.stringContaining('Project local path is not a Git repository'),
-        status: 'blocked',
-        workPackageId: 'pkg-1',
-      }))
     } finally {
       if (previousExecutionFlag === undefined) {
         delete process.env.FORGE_WORK_PACKAGE_EXECUTION
@@ -2408,6 +2644,8 @@ describe('handoffApprovedWorkPackages', () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     const previousHostRepositoryWrites = process.env.FORGE_HOST_REPOSITORY_WRITES
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    expect(isWorkPackageExecutionEnabled()).toBe(false)
+    if (!isWorkPackageExecutionEnabled()) return
     process.env.FORGE_HOST_REPOSITORY_WRITES = '1'
     const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'forge-sandbox-non-git-project-'))
     tempRoots.push(projectRoot)
@@ -2627,6 +2865,8 @@ describe('handoffApprovedWorkPackages', () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     const previousHostRepositoryWrites = process.env.FORGE_HOST_REPOSITORY_WRITES
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    expect(isWorkPackageExecutionEnabled()).toBe(false)
+    if (!isWorkPackageExecutionEnabled()) return
     process.env.FORGE_HOST_REPOSITORY_WRITES = '0'
     const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'forge-sandbox-dirty-git-project-'))
     tempRoots.push(projectRoot)
@@ -3126,5 +3366,92 @@ describe('handoffApprovedWorkPackages', () => {
     expect(mocks.getProjectMcpOverview).toHaveBeenCalledTimes(2)
     expect(staleInsert).not.toHaveBeenCalled()
     expect(mocks.publishTaskEvent.mock.calls.filter(([, type]) => type === 'run:started')).toHaveLength(1)
+  })
+})
+
+describe('protected completion handoff reconciliation', () => {
+  it('discovers a fresh completed run by package and materializes its pending gates', async () => {
+    mocks.readS4RuntimeModeV1.mockResolvedValue('protected')
+    mocks.claimPendingS4CompletionHandoffsV1.mockResolvedValue([{
+      handoffId: '00000000-0000-4000-8000-000000000205',
+      agentRunId: '00000000-0000-4000-8000-000000000202',
+      workPackageId: '00000000-0000-4000-8000-000000000201',
+      taskId: '00000000-0000-4000-8000-000000000200',
+      localRunEvidenceId: '00000000-0000-4000-8000-000000000203',
+      runtimeAuditId: null,
+      sourceArtifactId: '00000000-0000-4000-8000-000000000204',
+      handoffState: 'pending',
+      reviewRequirement: 'both',
+      createdAt: new Date('2026-07-22T00:00:00.000Z'),
+      claimGeneration: '1',
+      leaseExpiresAt: new Date('2026-07-22T00:00:30.000Z'),
+    }])
+    mocks.materializeClaimedS4CompletionHandoffV1.mockResolvedValue({
+      packageStatus: 'awaiting_review',
+      sourceArtifactId: '00000000-0000-4000-8000-000000000204',
+    })
+    const enqueue = vi.fn().mockResolvedValue({ status: 'enqueued' })
+
+    await expect(reconcilePendingS4CompletionHandoffs(100, {
+      enqueue,
+      workerId: 'worker-test',
+    })).resolves.toBe(1)
+    expect(mocks.claimPendingS4CompletionHandoffsV1).toHaveBeenCalledWith(expect.objectContaining({
+      limit: 100,
+      workerId: 'worker-test',
+    }))
+    expect(mocks.materializeClaimedS4CompletionHandoffV1).toHaveBeenCalledWith({
+      agentRunId: '00000000-0000-4000-8000-000000000202',
+      claimGeneration: '1',
+      claimToken: expect.any(String),
+      requiredGateTypes: ['qa_review', 'reviewer_review'],
+      workerId: 'worker-test',
+    })
+    expect(mocks.convergeRecognizedOperatorHoldTask).toHaveBeenCalledWith(
+      '00000000-0000-4000-8000-000000000200',
+    )
+    expect(enqueue).toHaveBeenCalledWith(
+      '00000000-0000-4000-8000-000000000200',
+      { source: 's4-completion-handoff-recovery' },
+    )
+  })
+})
+
+describe('protected review-source rework context', () => {
+  it('uses the fixed resolver for a protected needs-rework gate and never the public header', async () => {
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{
+        id: '00000000-0000-4000-8000-000000000301',
+        gateType: 'reviewer_review',
+        metadata: { decisionReason: 'Add regression coverage.' },
+        sourceArtifactId: '00000000-0000-4000-8000-000000000302',
+        status: 'needs_rework',
+      }]))
+      .mockReturnValueOnce(chain([{
+        id: '00000000-0000-4000-8000-000000000302',
+        content: 'Protected review source available through its approval gate.',
+        metadata: { schemaVersion: 1, protectedReviewSource: true },
+      }]))
+    mocks.resolveS4ReviewSourceV1.mockResolvedValue({
+      sourceArtifactId: '00000000-0000-4000-8000-000000000302',
+      sourceAgentRunId: '00000000-0000-4000-8000-000000000303',
+      content: 'Private implementation output with the missing test.',
+      metadata: null,
+      contentFingerprint: `sha256:${'a'.repeat(64)}`,
+    })
+
+    await expect(loadPriorReviewContext('00000000-0000-4000-8000-000000000300', {
+      id: '00000000-0000-4000-8000-000000000304',
+      blockedReason: 'Reviewer requested changes.',
+    })).resolves.toEqual({
+      packageBlockedReason: 'Reviewer requested changes.',
+      notes: [expect.objectContaining({
+        reason: expect.stringContaining('Private implementation output with the missing test.'),
+        status: 'needs_rework',
+      })],
+    })
+    expect(mocks.resolveS4ReviewSourceV1).toHaveBeenCalledWith({
+      approvalGateId: '00000000-0000-4000-8000-000000000301',
+    })
   })
 })

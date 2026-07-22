@@ -68,6 +68,12 @@ describe('Epic 172 S3 release seam', () => {
     expect(workflow).toContain("RUN_FORGE_POSTGRES_TESTS: '1'")
     expect(workflow).toContain('e2e/filesystem-grant-lifecycle-concurrency.spec.ts')
     expect(workflow).toContain('--project=chromium-desktop --workers=1 --retries=0')
+    const proofStep = workflow.slice(
+      workflow.indexOf('name: Run mandatory S3 PostgreSQL concurrency proof'),
+      workflow.indexOf('name: Prove Epic 172 Step 0 disabled ingress'),
+    )
+    expect(proofStep).toContain('FORGE_S4_POSTGRES_TEST_DATABASE_URL:')
+    expect(proofStep).toContain('FORGE_PACKET_ISSUER_DATABASE_URL:')
     expect(workflow).toContain("grep -Eq '[1-9][0-9]* skipped'")
     expect(workflow).toContain("if ! grep -Eq '[1-9][0-9]* passed'")
     const concurrencyProof = readFileSync(
@@ -91,7 +97,7 @@ describe('Epic 172 S3 release seam', () => {
     )
     expect(workflow).toContain('npm run lint -- --max-warnings=0')
     expect(workflow).toContain('name: Run the complete zero-skip unit suite')
-    expect(workflow).toContain('run: npm test')
+    expect(workflow).toContain('run: npm run test:unit:zero-skip')
     expect(workflow).toContain("FORGE_EPIC_172_REQUIRE_POSTGRES_TEST: '1'")
     expect(workflow).toContain('FORGE_EPIC_172_TEST_APP_DATABASE_URL:')
     expect(workflow).toContain('FORGE_EPIC_172_TEST_WRITER_DATABASE_URL:')

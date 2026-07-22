@@ -1,9 +1,18 @@
-import { defaultOnFeatureFlagEnabled } from './feature-flags'
+import { defaultOnFeatureFlagState } from './feature-flags'
 
 export type RepositoryWritePolicyWorkPackage = {
   assignedRole: string
   metadata: Record<string, unknown>
   requiredCapabilities: Record<string, unknown>
+}
+
+export type HostRepositoryWritePolicyState = {
+  available: false
+  enabled: false
+  rawValue: string | null
+  recognized: boolean
+  requested: boolean
+  source: 'FORGE_HOST_REPOSITORY_WRITES' | 'FORGE_REPOSITORY_EDITS' | null
 }
 
 const HOST_REPOSITORY_WRITE_EXEMPT_ROLES = new Set([
@@ -24,7 +33,38 @@ function canonicalRoleSlug(value: string): string {
 export function isHostRepositoryWritesEnabled(
   env: Record<string, string | undefined> = process.env,
 ): boolean {
-  return defaultOnFeatureFlagEnabled(env.FORGE_HOST_REPOSITORY_WRITES ?? env.FORGE_REPOSITORY_EDITS)
+  return hostRepositoryWritePolicyState(env).enabled
+}
+
+export function hostRepositoryWritePolicyState(
+  env: Record<string, string | undefined> = process.env,
+): HostRepositoryWritePolicyState {
+  const source = env.FORGE_HOST_REPOSITORY_WRITES !== undefined
+    ? 'FORGE_HOST_REPOSITORY_WRITES'
+    : env.FORGE_REPOSITORY_EDITS !== undefined
+      ? 'FORGE_REPOSITORY_EDITS'
+      : null
+  const rawValue = source === null ? undefined : env[source]
+  if (rawValue === undefined || rawValue.trim() === '') {
+    return {
+      available: false,
+      enabled: false,
+      rawValue: rawValue ?? null,
+      recognized: true,
+      requested: false,
+      source,
+    }
+  }
+
+  const state = defaultOnFeatureFlagState(rawValue)
+  return {
+    available: false,
+    enabled: false,
+    rawValue,
+    recognized: state.recognized,
+    requested: state.recognized && state.enabled,
+    source,
+  }
 }
 
 export function isRepositoryWritePackage(workPackage: RepositoryWritePolicyWorkPackage): boolean {
@@ -42,5 +82,8 @@ export function shouldApplyHostRepositoryWrites(
   workPackage: RepositoryWritePolicyWorkPackage,
   env: Record<string, string | undefined> = process.env,
 ): boolean {
-  return isHostRepositoryWritesEnabled(env) && isRepositoryWritePackage(workPackage)
+  // Compatibility signal for the executor's typed fail-closed path. A true
+  // result means the operator explicitly requested the unavailable feature;
+  // it never authorizes host writes.
+  return hostRepositoryWritePolicyState(env).requested && isRepositoryWritePackage(workPackage)
 }

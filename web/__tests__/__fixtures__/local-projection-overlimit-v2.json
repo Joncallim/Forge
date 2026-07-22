@@ -1,0 +1,169 @@
+{
+  "ordinary256": {
+    "schemaVersion": 2,
+    "taskId": "00000000-0000-4000-8000-000000000256",
+    "scopeState": "active",
+    "packageCount": 256,
+    "overlimitPackageCount": null,
+    "replacement": null,
+    "projection": {
+      "expectedHeadKindCount": 8,
+      "expectedHeadCount": 2048,
+      "actualHeadCount": 2048,
+      "distinctPackageCount": 256,
+      "headsFingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "aggregateFingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "integrityState": "coherent"
+    },
+    "taskFingerprint": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "claimable": true
+  },
+  "legacy257": {
+    "schemaVersion": 2,
+    "taskId": "00000000-0000-4000-8000-000000000257",
+    "scopeState": "archive_pending",
+    "packageCount": 257,
+    "overlimitPackageCount": 257,
+    "replacement": null,
+    "projection": {
+      "expectedHeadKindCount": 8,
+      "expectedHeadCount": 2056,
+      "actualHeadCount": 0,
+      "distinctPackageCount": 0,
+      "headsFingerprint": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "aggregateFingerprint": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "integrityState": "missing_heads"
+    },
+    "taskFingerprint": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "claimable": false
+  },
+  "partialLegacy257": {
+    "schemaVersion": 2,
+    "taskId": "00000000-0000-4000-8000-000000000257",
+    "scopeState": "archive_pending",
+    "packageCount": 257,
+    "overlimitPackageCount": 257,
+    "replacement": null,
+    "projection": {
+      "expectedHeadKindCount": 8,
+      "expectedHeadCount": 2056,
+      "actualHeadCount": 8,
+      "distinctPackageCount": 1,
+      "headsFingerprint": "sha256:1010101010101010101010101010101010101010101010101010101010101010",
+      "aggregateFingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "integrityState": "missing_heads"
+    },
+    "taskFingerprint": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+    "claimable": false
+  },
+  "replacement256": {
+    "schemaVersion": 2,
+    "taskId": "00000000-0000-4000-8000-000000000258",
+    "scopeState": "active",
+    "packageCount": 256,
+    "overlimitPackageCount": null,
+    "replacement": null,
+    "projection": {
+      "expectedHeadKindCount": 8,
+      "expectedHeadCount": 2048,
+      "actualHeadCount": 2048,
+      "distinctPackageCount": 256,
+      "headsFingerprint": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "aggregateFingerprint": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "integrityState": "coherent"
+    },
+    "taskFingerprint": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "claimable": true
+  },
+  "replacementPending256": {
+    "schemaVersion": 2,
+    "taskId": "00000000-0000-4000-8000-000000000258",
+    "scopeState": "active",
+    "packageCount": 256,
+    "overlimitPackageCount": null,
+    "replacement": {
+      "sourceTaskId": "00000000-0000-4000-8000-000000000257",
+      "state": "pending",
+      "version": 1,
+      "fingerprint": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+    },
+    "projection": {
+      "expectedHeadKindCount": 8,
+      "expectedHeadCount": 2048,
+      "actualHeadCount": 2048,
+      "distinctPackageCount": 256,
+      "headsFingerprint": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "aggregateFingerprint": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "integrityState": "coherent"
+    },
+    "taskFingerprint": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+    "claimable": false
+  },
+  "sourceArchived257": {
+    "schemaVersion": 2,
+    "taskId": "00000000-0000-4000-8000-000000000257",
+    "scopeState": "legacy_archived",
+    "packageCount": 257,
+    "overlimitPackageCount": 257,
+    "replacement": null,
+    "projection": {
+      "expectedHeadKindCount": 8,
+      "expectedHeadCount": 2056,
+      "actualHeadCount": 0,
+      "distinctPackageCount": 0,
+      "headsFingerprint": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "aggregateFingerprint": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "integrityState": "missing_heads"
+    },
+    "taskFingerprint": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "claimable": false
+  },
+  "replacementEligible256": {
+    "schemaVersion": 2,
+    "taskId": "00000000-0000-4000-8000-000000000258",
+    "scopeState": "active",
+    "packageCount": 256,
+    "overlimitPackageCount": null,
+    "replacement": {
+      "sourceTaskId": "00000000-0000-4000-8000-000000000257",
+      "state": "eligible",
+      "version": 2,
+      "fingerprint": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+    },
+    "projection": {
+      "expectedHeadKindCount": 8,
+      "expectedHeadCount": 2048,
+      "actualHeadCount": 2048,
+      "distinctPackageCount": 256,
+      "headsFingerprint": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "aggregateFingerprint": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "integrityState": "coherent"
+    },
+    "taskFingerprint": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+    "claimable": false
+  },
+  "replacementCancelled256": {
+    "schemaVersion": 2,
+    "taskId": "00000000-0000-4000-8000-000000000258",
+    "scopeState": "active",
+    "packageCount": 256,
+    "overlimitPackageCount": null,
+    "replacement": {
+      "sourceTaskId": "00000000-0000-4000-8000-000000000257",
+      "state": "cancelled",
+      "version": 2,
+      "fingerprint": "sha256:abababababababababababababababababababababababababababababababab"
+    },
+    "projection": {
+      "expectedHeadKindCount": 8,
+      "expectedHeadCount": 2048,
+      "actualHeadCount": 2048,
+      "distinctPackageCount": 256,
+      "headsFingerprint": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "aggregateFingerprint": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "integrityState": "coherent"
+    },
+    "taskFingerprint": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+    "claimable": false
+  }
+}

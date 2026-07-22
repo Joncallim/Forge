@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   computeReadyWorkPackageIds,
   isWorkPackageExecutionEnabled,
+  isWorkPackageExecutionRequested,
   isWorkPackageHandoffEnabled,
 } from '@/worker/work-package-handoff'
 
@@ -45,6 +46,15 @@ describe('computeReadyWorkPackageIds', () => {
       { ...packageBase, id: 'blocked', sequence: 6, status: 'blocked' },
     ], [])).toEqual(['pending', 'needs-rework', 'blocked'])
   })
+
+  it('never promotes a package carrying a packet recovery or malformed packet marker', () => {
+    expect(computeReadyWorkPackageIds([
+      { ...packageBase, id: 'plain' },
+      { ...packageBase, id: 'recovering', status: 'blocked', metadata: { packet_issuance: { schemaVersion: 2 } } },
+      { ...packageBase, id: 'integrity', status: 'blocked', metadata: { packet_integrity_hold: { schemaVersion: 2 } } },
+      { ...packageBase, id: 'local', status: 'blocked', metadata: { local_effect_recovery: { schemaVersion: 1 } } },
+    ], [])).toEqual(['plain'])
+  })
 })
 
 describe('isWorkPackageHandoffEnabled', () => {
@@ -57,14 +67,23 @@ describe('isWorkPackageHandoffEnabled', () => {
 })
 
 describe('isWorkPackageExecutionEnabled', () => {
-  it('defaults on and supports explicit disable values', () => {
-    expect(isWorkPackageExecutionEnabled({})).toBe(true)
-    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: '1' })).toBe(true)
-    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'true' })).toBe(true)
-    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: '0' })).toBe(false)
-    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'false' })).toBe(false)
-    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'off' })).toBe(false)
-    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'no' })).toBe(false)
-    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'disabled' })).toBe(false)
+  it.each([undefined, '', 'unexpected', '0', '1'])(
+    'remains unavailable when the main execution flag is %j',
+    (setting) => {
+      expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: setting })).toBe(false)
+    },
+  )
+
+  it.each([undefined, '', 'unexpected', '0', '1'])(
+    'remains unavailable when the ACP execution flag is %j',
+    (setting) => {
+      expect(isWorkPackageExecutionEnabled({ FORGE_ACP_WORK_PACKAGE_EXECUTION: setting })).toBe(false)
+    },
+  )
+
+  it('reports an affirmative main-flag request separately from availability', () => {
+    expect(isWorkPackageExecutionRequested({ FORGE_WORK_PACKAGE_EXECUTION: '1' })).toBe(true)
+    expect(isWorkPackageExecutionRequested({ FORGE_WORK_PACKAGE_EXECUTION: 'unexpected' })).toBe(false)
+    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: '1' })).toBe(false)
   })
 })

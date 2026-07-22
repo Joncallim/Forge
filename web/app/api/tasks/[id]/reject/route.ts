@@ -5,7 +5,7 @@ import { db } from '@/db'
 import { tasks } from '@/db/schema'
 import { and, eq } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
-import { redis } from '@/lib/redis'
+import { publishTaskEvent } from '@/worker/events'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
@@ -95,12 +95,11 @@ export async function POST(
       title: 'Task rejected',
     })
 
-    await redis.publish('forge:task:' + taskId, JSON.stringify({
-      type: 'task:status',
+    await publishTaskEvent(taskId, 'task:status', {
       status: 'rejected',
       errorMessage: task.errorMessage,
       updatedAt: task.updatedAt.toISOString(),
-    }))
+    })
 
     console.info('[POST /api/tasks/:id/reject] Rejected task', { id: taskId, reason })
     return NextResponse.json({ task })

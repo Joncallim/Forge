@@ -54,6 +54,10 @@ import {
   type WorkforceRecord,
 } from '@/lib/task-artifacts'
 import { acpProviderDisplay } from '@/lib/providers/acp/catalog'
+import {
+  clarificationQuestionsFromHistory,
+  type TaskQuestionSummary,
+} from '@/lib/mcps/clarification-projection'
 
 interface Task {
   id: string
@@ -137,7 +141,13 @@ interface TaskDetailResponse {
   task?: Task | null
   runs?: AgentRun[]
   artifacts?: Artifact[]
-  questions?: TaskQuestion[]
+  questions?: TaskQuestionSummary[]
+  clarification?: {
+    planVersion: string | null
+    questionCount: number
+    openCount: number
+    answeredCount: number
+  }
   attempts?: TaskAttempt[]
   workPackages?: WorkPackage[]
   approvalGates?: ApprovalGate[]
@@ -524,8 +534,6 @@ type SandboxOutputSummary = {
   commandCount: number
   fileCount: number
   files: string[]
-  hostRepositoryWritePaths: string[]
-  hostRepositoryWrites: boolean
   sandboxPath: string
   validationStatus: string
 }
@@ -537,8 +545,6 @@ function sandboxOutputFromArtifact(artifact: Artifact): SandboxOutputSummary | n
   const sandboxPath = stringField(metadata, ['sandboxPath', 'sandboxRoot', 'outputPath'])
   const files = stringArrayField(metadata, ['files', 'generatedFiles', 'paths'])
   const generatedBy = stringField(metadata, ['generatedBy'])
-  const hostRepositoryWritePaths = stringArrayField(metadata, ['hostRepositoryWritePaths'])
-  const hostRepositoryWrites = booleanField(metadata, ['hostRepositoryWrites', 'repositoryWrites']) === true
   const commandResults = jsonArrayField(metadata, ['commandResults', 'commands'])
   const fileCount = Math.max(0, numberField(metadata, ['fileCount']) ?? files.length)
   const validationStatus = stringField(metadata, ['validationStatus'])
@@ -550,8 +556,6 @@ function sandboxOutputFromArtifact(artifact: Artifact): SandboxOutputSummary | n
     commandCount: commandResults.length,
     fileCount,
     files,
-    hostRepositoryWritePaths,
-    hostRepositoryWrites,
     sandboxPath,
     validationStatus,
   }
@@ -633,7 +637,7 @@ export function workforceExecutionSummary(input: {
   })
   if (runningPackage || runningImplementationRun) {
     return {
-      detail: 'A package execution run is active. Forge writes sandbox artifacts first and may apply successful output to the local project.',
+      detail: 'A package execution run is active. Forge keeps generated files under .forge/task-runs for review and manual application.',
       label: 'Running sandbox package',
       mode: 'running_package',
       status: 'running',
@@ -646,7 +650,7 @@ export function workforceExecutionSummary(input: {
   )
   if (sandboxOutputCount > 0) {
     return {
-      detail: `${pluralize(sandboxOutputCount, 'sandbox output')} generated under .forge/task-runs. Review generated files, host-write metadata, and validation artifacts before approving gates.`,
+      detail: `${pluralize(sandboxOutputCount, 'sandbox output')} generated under .forge/task-runs. Review the files and validation artifacts, then apply accepted changes manually.`,
       label: 'Sandbox output generated',
       mode: 'sandbox_output',
       status: 'completed',
@@ -654,7 +658,7 @@ export function workforceExecutionSummary(input: {
   }
 
   return {
-    detail: 'Ready packages execute by default. Forge keeps generated files under .forge/task-runs and applies successful repository-affecting output to the local project unless host repository writes are disabled.',
+    detail: 'Ready packages execute in sandbox-only mode. Forge keeps generated files under .forge/task-runs for review and manual application; direct host repository writes are unavailable.',
     label: 'Executable packages',
     mode: 'opt_in_sandbox',
     status: 'ready',
@@ -1641,7 +1645,6 @@ function RetryHandoffControls({
 
 function SandboxOutputList({ outputs }: { outputs: SandboxOutputSummary[] }) {
   if (outputs.length === 0) return null
-  const hostWriteCount = outputs.reduce((count, output) => count + output.hostRepositoryWritePaths.length, 0)
 
   return (
     <div className="mt-3 rounded-md border border-border bg-muted/20 px-3 py-2">
@@ -1650,10 +1653,8 @@ function SandboxOutputList({ outputs }: { outputs: SandboxOutputSummary[] }) {
         <Badge variant="outline" className={statusBadgeClass('completed')}>{outputs.length}</Badge>
       </div>
       <p className="mt-1 text-xs text-muted-foreground">
-        Forge keeps package output under <span className="font-mono">.forge/task-runs</span>
-        {hostWriteCount > 0
-          ? ' and applied the listed host repository files to the local project.'
-          : '. No host repository files were recorded for these artifacts.'}
+        Forge keeps package output under <span className="font-mono">.forge/task-runs</span> for
+        review and manual application. Direct host repository writes are unavailable.
       </p>
       <ul className="mt-2 grid gap-2">
         {outputs.map((output) => (
@@ -1666,9 +1667,6 @@ function SandboxOutputList({ outputs }: { outputs: SandboxOutputSummary[] }) {
                   Validation: {statusLabel(output.validationStatus)}
                 </Badge>
               )}
-              {output.hostRepositoryWrites && (
-                <Badge variant="outline" className={statusBadgeClass('completed')}>host writes</Badge>
-              )}
             </div>
             {output.sandboxPath !== '' && (
               <p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{output.sandboxPath}</p>
@@ -1676,11 +1674,6 @@ function SandboxOutputList({ outputs }: { outputs: SandboxOutputSummary[] }) {
             {output.files.length > 0 && (
               <p className="mt-1 break-words font-mono text-[11px] text-muted-foreground">
                 {previewList(output.files, 5)}
-              </p>
-            )}
-            {output.hostRepositoryWritePaths.length > 0 && (
-              <p className="mt-1 break-words font-mono text-[11px] text-foreground">
-                Host: {previewList(output.hostRepositoryWritePaths, 5)}
               </p>
             )}
           </li>
@@ -2636,7 +2629,9 @@ function QuestionsPanel({
               {answeredQuestions.map((q) => (
                 <li key={q.id} className="border-b border-border px-4 py-3 last:border-0">
                   <p className="text-sm font-medium text-foreground">{q.question}</p>
-                  <p className="mt-1 text-sm text-muted-foreground">{q.answer}</p>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    {q.answer ?? 'Answer submitted; protected history update pending.'}
+                  </p>
                 </li>
               ))}
             </ul>
@@ -4018,7 +4013,7 @@ export function taskProgressSummary(input: {
       nextAction: 'Review package output, then approve, request changes, or reject it.',
       detail: executionDisabled
         ? 'Execution is disabled; this review covers handoff output and no repository files were changed.'
-        : 'Review gates cover generated output, host-write metadata, and validation evidence.',
+        : 'Review gates cover generated sandbox output and validation evidence before manual application.',
     }
   }
 
@@ -4036,7 +4031,7 @@ export function taskProgressSummary(input: {
       nextAction: 'Wait for output and review gates.',
       detail: executionDisabled
         ? 'Execution is disabled; Forge is creating reviewable handoff output without sandbox files or host repository writes.'
-        : 'A specialist package is running. Forge will keep sandbox artifacts and apply successful local repository edits when enabled.',
+        : 'A specialist package is running. Forge will keep generated files under .forge/task-runs for review and manual application.',
     }
   }
 
@@ -4183,7 +4178,7 @@ export default function TaskDetailPage() {
   const [task, setTask] = useState<Task | null>(null)
   const [initialRuns, setInitialRuns] = useState<AgentRun[]>([])
   const [initialArtifacts, setInitialArtifacts] = useState<Artifact[]>([])
-  const [initialQuestions, setInitialQuestions] = useState<TaskQuestion[]>([])
+  const [clarificationQuestions, setClarificationQuestions] = useState<TaskQuestion[]>([])
   const [attempts, setAttempts] = useState<TaskAttempt[]>([])
   const [workPackages, setWorkPackages] = useState<WorkPackage[]>([])
   const [approvalGates, setApprovalGates] = useState<ApprovalGate[]>([])
@@ -4222,7 +4217,6 @@ export default function TaskDetailPage() {
     artifacts: streamArtifacts,
     taskStatus,
     error: streamError,
-    questions: streamQuestions,
     refreshRevision: streamRefreshRevision,
     taskLogRevision,
   } = useTaskStream(taskId)
@@ -4230,11 +4224,7 @@ export default function TaskDetailPage() {
   // Merge initial data with live stream data
   const mergedRuns: AgentRun[] = mergeTaskRuns(initialRuns, streamRuns)
   const mergedArtifacts: Artifact[] = mergeArtifacts(initialArtifacts, streamArtifacts)
-  // streamQuestions is null until the SSE layer has reported a definitive
-  // question set (even an empty one); only fall back to the once-fetched
-  // initialQuestions while that hasn't happened yet, so an explicitly-empty
-  // stream result isn't overridden by stale data from a prior plan round.
-  const mergedQuestions: TaskQuestion[] = streamQuestions ?? initialQuestions
+  const mergedQuestions: TaskQuestion[] = clarificationQuestions
   const currentStatus = optimisticTaskStatus ?? taskStatus ?? task?.status ?? null
 
   const loadProjectFilesystemGrant = useCallback(async (projectId: string | null | undefined) => {
@@ -4259,6 +4249,24 @@ export default function TaskDetailPage() {
     }
   }, [])
 
+  const loadClarificationHistory = useCallback(async (
+    planVersion: string | null | undefined,
+    summaries: TaskQuestionSummary[],
+  ) => {
+    if (!planVersion) {
+      setClarificationQuestions([])
+      return
+    }
+    try {
+      const response = await fetch(`/api/tasks/${taskId}/architect-plan-history/${planVersion}`)
+      if (!response.ok) throw new Error('Protected clarification history is unavailable')
+      const body = await response.json() as { entries?: Array<{ entryId: string; entryKind: string; content: string }> }
+      setClarificationQuestions(clarificationQuestionsFromHistory(body.entries ?? [], summaries))
+    } catch {
+      setClarificationQuestions([])
+    }
+  }, [taskId])
+
   const loadTask = useCallback(async () => {
     setLoading(true)
     setFetchError(null)
@@ -4274,7 +4282,7 @@ export default function TaskDetailPage() {
       setRetryProviderId(data.task?.pmProviderConfigId ?? null)
       setInitialRuns(data.runs ?? [])
       setInitialArtifacts(data.artifacts ?? [])
-      setInitialQuestions(data.questions ?? [])
+      void loadClarificationHistory(data.clarification?.planVersion, data.questions ?? [])
       setAttempts(data.attempts ?? [])
       setWorkPackages(data.workPackages ?? [])
       setApprovalGates(data.approvalGates ?? [])
@@ -4286,7 +4294,7 @@ export default function TaskDetailPage() {
     } finally {
       setLoading(false)
     }
-  }, [loadProjectFilesystemGrant, taskId])
+  }, [loadClarificationHistory, loadProjectFilesystemGrant, taskId])
 
   const loadProviders = useCallback(async () => {
     try {

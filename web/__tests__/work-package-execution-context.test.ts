@@ -4,6 +4,15 @@ const mocks = vi.hoisted(() => ({
   dbSelect: vi.fn(),
   getProvider: vi.fn(),
   getModel: vi.fn(),
+  providerExecutionSnapshot: vi.fn((config: Record<string, unknown>) => ({
+    acpExecutionMode: config.providerType === 'acp' ? 'unconfined_host_process' : 'not_applicable',
+    configId: String(config.id ?? 'provider-task'),
+    fingerprint: 'a'.repeat(64),
+    isLocal: config.isLocal === true,
+    modelId: String(config.modelId),
+    providerType: String(config.providerType),
+    updatedAt: new Date('2026-07-22T00:00:00.000Z'),
+  })),
   loadCurrentProjectFilesystemDecision: vi.fn().mockResolvedValue(null),
   resolveDefaultProvider: vi.fn(),
   assertProjectLocalPathForExecution: vi.fn(),
@@ -16,6 +25,7 @@ vi.mock('@/db', () => ({
 vi.mock('@/lib/providers/registry', () => ({
   getProvider: mocks.getProvider,
   getModel: mocks.getModel,
+  providerExecutionSnapshot: mocks.providerExecutionSnapshot,
 }))
 
 vi.mock('@/lib/providers/default', () => ({
@@ -110,12 +120,13 @@ describe('loadWorkPackageExecutionContext', () => {
     expect(context.validatedProjectRoot).toBe('/workspace/real-project')
   })
 
-  it.each(['0', 'flase'])(
+  it.each([undefined, '', 'flase', '0'])(
     'blocks ACP-backed executable work packages when the setting is %s',
     async (setting) => {
       vi.clearAllMocks()
       const previous = process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION
-      process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION = setting
+      if (setting === undefined) delete process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION
+      else process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION = setting
       const project = { id: 'project-1', localPath: '/workspace/project' }
       const task = { id: 'task-1', projectId: 'project-1', pmProviderConfigId: 'provider-task' }
       const workPackage = { id: 'pkg-1', assignedRole: 'backend' }
@@ -139,10 +150,10 @@ describe('loadWorkPackageExecutionContext', () => {
     },
   )
 
-  it('allows ACP-backed executable work packages by default', async () => {
+  it('allows ACP-backed executable work packages only after an affirmative request', async () => {
     vi.clearAllMocks()
     const previous = process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION
-    delete process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION
+    process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION = '1'
     const project = { id: 'project-1', localPath: '/workspace/project' }
     const task = { id: 'task-1', projectId: 'project-1', pmProviderConfigId: 'provider-task' }
     const workPackage = { id: 'pkg-1', assignedRole: 'backend' }

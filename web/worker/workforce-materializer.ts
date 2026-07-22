@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto'
+import { createHmac, randomUUID } from 'crypto'
 import { and, eq, inArray, or } from 'drizzle-orm'
 import { sql } from 'drizzle-orm'
 import { db } from '../db'
@@ -20,6 +20,15 @@ import { canonicalAgentPackageIdentity } from '../lib/mcps/agent-package-identit
 import type { PreparedArchitectArtifact } from './architect-artifact'
 import type { ReviewRequirement } from './agent-breakdown'
 import { isImplementationPackageRole } from './review-gates'
+import {
+  canonicalArchitectPlanJson,
+  type ArchitectPlanEntryEnvelope,
+} from '../lib/mcps/architect-plan-entries'
+import {
+  architectPlanStorageConfiguration,
+  registerPackagePlanEntries,
+  type ProtectedPackageEntryRegistrationInput,
+} from '../lib/mcps/s4-protocol-store'
 
 type JsonObject = Record<string, unknown>
 type AgentHarnessInsert = typeof agentHarnesses.$inferInsert & { id: string; slug: string; role: string }
@@ -37,7 +46,9 @@ export type WorkforceMaterializationInput = {
   taskId: string
   architectRunId: string
   artifactId: string
+  planVersion?: string
   prepared: PreparedArchitectArtifact
+  protectedArchitectPlanEntries?: ArchitectPlanEntryEnvelope[]
 }
 
 export type WorkforceMaterializationResult = {
@@ -157,7 +168,7 @@ function matchingObjectValues<T>(
     .map(([, value]) => value)
 }
 
-function mcpGrantsForAgent(prepared: PreparedArchitectArtifact, agentType: string, aliases: string[]): JsonObject[] {
+function mcpGrantsForAgent(prepared: PreparedArchitectArtifact, agentType: string, aliases: string[], protectedMode: boolean): JsonObject[] {
   return prepared.mcpExecutionDesign.grantDecisions.decisions
     .filter((decision) => roleMatches(decision.agent, agentType, aliases))
     .map((decision) => ({
@@ -176,15 +187,20 @@ function mcpGrantsForAgent(prepared: PreparedArchitectArtifact, agentType: strin
       recoveryAction: decision.recoveryAction,
       grantState: decision.grantState ?? { phase: 'not_issued' },
       evidenceRefs: decision.evidenceRefs ?? [],
-      reason: decision.reason,
+      reason: protectedMode ? 'Protected Architect requirement.' : decision.reason,
       assignment: decision.assignment,
-      fallback: decision.fallback,
+      fallback: protectedMode && typeof decision.fallback === 'object' && decision.fallback !== null
+        ? { action: decision.fallback.action, message: 'Protected Architect fallback instructions.' }
+        : decision.fallback,
       health: decision.health,
-      promptOverlayPresent: decision.promptOverlayPresent,
+      // Protected prompt text is represented by one-use content-free references,
+      // not by an inline grant-envelope overlay. The protected policy below owns
+      // the separate indication that prompt context exists.
+      promptOverlayPresent: false,
     }))
 }
 
-function mcpRequirementsForAgent(prepared: PreparedArchitectArtifact, agentType: string, aliases: string[]): JsonObject[] {
+function mcpRequirementsForAgent(prepared: PreparedArchitectArtifact, agentType: string, aliases: string[], protectedMode: boolean): JsonObject[] {
   const design = prepared.mcpExecutionDesign.proposed
   if (!design) return []
 
@@ -200,14 +216,16 @@ function mcpRequirementsForAgent(prepared: PreparedArchitectArtifact, agentType:
       agent: agentType,
       mcpId: requirement.mcpId,
       requirement: requirement.requirement,
-      reason: requirement.reason,
+      reason: protectedMode ? 'Protected Architect requirement.' : requirement.reason,
       confidence: requirement.confidence ?? 'medium',
       scope: requirement.scope ?? { kind: 'project' },
       accessMode: requirement.accessMode ?? 'planning_instruction',
       assignment: requirement.assignment,
       permissions: [...new Set(matchingObjectValues(requirement.agentPermissions, agentType, aliases).flat())].sort(),
       prohibitedCapabilities: requirement.prohibitedCapabilities,
-      fallback: requirement.fallback,
+      fallback: protectedMode
+        ? { action: requirement.fallback.action, message: 'Protected Architect fallback instructions.' }
+        : requirement.fallback,
     }))
 }
 
@@ -220,38 +238,178 @@ function requirementAgentsForMaterialization(
   return [...agents]
 }
 
-function mcpRequirementContextsForAgent(
+function mcpPromptContextForAgent(
   prepared: PreparedArchitectArtifact,
+  protectedEntries: readonly ArchitectPlanEntryEnvelope[],
+  taskId: string,
+  artifactId: string,
   agentType: string,
   aliases: string[],
-): JsonObject[] {
+): Readonly<{ policy: JsonObject; entries: ArchitectPlanEntryEnvelope[] }> {
   const design = prepared.mcpExecutionDesign.proposed
-  if (!design) return []
-  return (design.requirementContexts ?? [])
+  if (!design) {
+    return {
+      policy: {
+        schemaVersion: 1,
+        state: 'not_required',
+        promptOverlayPresent: false,
+        requirementContextCount: 0,
+        mcpAwareSubtaskCount: 0,
+        eligibleReferenceCount: 0,
+      },
+      entries: [],
+    }
+  }
+
+  const contexts = (design.requirementContexts ?? [])
     .filter((context) => roleMatches(context.agent, agentType, aliases))
-    .map((context) => ({ ...context, agent: agentType }))
+  const legacyOverlays = matchingObjectValues(design.promptOverlays, agentType, aliases)
+  const subtasks = design.mcpAwareSubtasks
+    .filter((subtask) => roleMatches(subtask.agent, agentType, aliases))
+  const promptOverlayPresent = contexts.some((context) => context.promptOverlay.trim() !== '')
+    || legacyOverlays.some((overlay) => overlay.trim() !== '')
+  const matchingEntries = protectedEntries.filter((entry) =>
+    entry.taskId === taskId
+      && entry.planArtifactId === artifactId
+      && entry.projectionEligible
+      && entry.agent !== null
+      && roleMatches(entry.agent, agentType, aliases)
+  )
+  const contextCoverageComplete = contexts.every((context) => matchingEntries.some((entry) =>
+    (entry.entryKind === 'overlay' || entry.entryKind === 'requirement')
+      && entry.requirementKey === context.requirementKey
+  ))
+  const subtaskCoverageComplete = matchingEntries.filter((entry) => entry.entryKind === 'subtask').length >= subtasks.length
+  const protectedContextRequired = promptOverlayPresent || contexts.length > 0 || subtasks.length > 0
+  const protectedCoverageComplete = protectedContextRequired
+    && matchingEntries.length > 0
+    && contextCoverageComplete
+    && subtaskCoverageComplete
+
+  return {
+    policy: {
+      schemaVersion: 1,
+      state: protectedCoverageComplete
+        ? 'protected_references_available'
+        : protectedContextRequired
+          ? 'safe_policy_only'
+          : 'not_required',
+      promptOverlayPresent,
+      requirementContextCount: contexts.length,
+      mcpAwareSubtaskCount: subtasks.length,
+      eligibleReferenceCount: matchingEntries.length,
+      protectedCoverageComplete,
+    },
+    entries: matchingEntries,
+  }
 }
 
-function mcpSubtasksForAgent(prepared: PreparedArchitectArtifact, agentType: string, aliases: string[]): JsonObject[] {
-  const design = prepared.mcpExecutionDesign.proposed
-  if (!design) return []
+type PlannedProtectedRegistration = ProtectedPackageEntryRegistrationInput & {
+  projectionEligible: boolean
+}
 
-  return design.mcpAwareSubtasks
-    .filter((subtask) => roleMatches(subtask.agent, agentType, aliases))
-    .map((subtask) => ({
-      id: subtask.id,
-      agent: agentType,
-      scope: subtask.scope ?? { kind: 'project' },
-      accessMode: subtask.accessMode ?? 'planning_instruction',
-      dependsOn: subtask.dependsOn,
-      mcpCapabilities: subtask.mcpCapabilities,
-      capabilityBindings: subtask.capabilityBindings ?? [],
-      inputs: subtask.inputs,
-      outputs: subtask.outputs,
-      verification: subtask.verification,
-      stoppingCondition: subtask.stoppingCondition,
-      fallback: subtask.fallback,
-    }))
+const PACKAGE_BINDING_SET_DOMAIN_V1 = Buffer.from('forge:protected-package-entry-binding-set:v1\0', 'utf8')
+
+export function buildProtectedPackageEntryRegistrations(input: {
+  taskId: string
+  sourceArtifactId: string
+  sourcePlanVersion: string
+  digestKey: Buffer
+  packages: readonly WorkPackageInsert[]
+  entries: readonly ArchitectPlanEntryEnvelope[]
+  prepared: PreparedArchitectArtifact
+}): PlannedProtectedRegistration[] {
+  const design = input.prepared.mcpExecutionDesign.proposed
+  if (!design) return []
+  const requirementByKey = new Map(design.requirements.flatMap((requirement) =>
+    requirement.requirementKey ? [[requirement.requirementKey, requirement] as const] : [],
+  ))
+  const routingFingerprint = new Map(input.entries.flatMap((entry) =>
+    entry.entryKind === 'routing' && entry.agent && entry.requirementKey && entry.bindingFingerprint
+      ? [[`${entry.requirementKey}\0${normalizeRoleLookup(entry.agent)}`, entry.bindingFingerprint] as const]
+      : [],
+  ))
+  const registrations: PlannedProtectedRegistration[] = []
+  for (const pkg of input.packages) {
+    const agent = normalizeRoleLookup(pkg.assignedRole)
+    const packageEntries = input.entries.filter((entry) =>
+      entry.agent !== null
+      && normalizeRoleLookup(entry.agent) === agent
+      && ['routing', 'overlay', 'subtask'].includes(entry.entryKind)
+      && (entry.projectionEligible || entry.entryKind === 'routing')
+    )
+    for (const entry of packageEntries) {
+      const capabilityBindings: Array<{
+        capability: string
+        requirementKey: string
+        routingFingerprint: string
+      }> = []
+      if (entry.entryKind === 'subtask') {
+        let parsed: unknown = null
+        try { parsed = JSON.parse(entry.content) as unknown } catch { parsed = null }
+        const raw = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? (parsed as { capabilityBindings?: unknown }).capabilityBindings
+          : null
+        if (!Array.isArray(raw)) {
+          throw new Error(`Protected subtask ${entry.entryId} has no complete capability binding set.`)
+        }
+        for (const binding of raw) {
+          if (!binding || typeof binding !== 'object' || Array.isArray(binding)) {
+            throw new Error(`Protected subtask ${entry.entryId} has a malformed capability binding.`)
+          }
+          const capability = (binding as { capability?: unknown }).capability
+          const requirementKey = (binding as { requirementKey?: unknown }).requirementKey
+          if (typeof capability !== 'string' || typeof requirementKey !== 'string') {
+            throw new Error(`Protected subtask ${entry.entryId} has a malformed capability binding.`)
+          }
+          const fingerprint = routingFingerprint.get(`${requirementKey}\0${agent}`)
+          if (!fingerprint) {
+            throw new Error(`Protected subtask ${entry.entryId} is missing routing for ${requirementKey}.`)
+          }
+          capabilityBindings.push({ capability, requirementKey, routingFingerprint: fingerprint })
+        }
+        if (capabilityBindings.length !== raw.length) {
+          throw new Error(`Protected subtask ${entry.entryId} did not retain every capability binding.`)
+        }
+      } else if (entry.requirementKey) {
+        const requirement = requirementByKey.get(entry.requirementKey)
+        const fingerprint = routingFingerprint.get(`${entry.requirementKey}\0${agent}`)
+        if (requirement && fingerprint) {
+          for (const capability of matchingObjectValues(requirement.agentPermissions, pkg.assignedRole, [pkg.assignedRole]).flat()) {
+            capabilityBindings.push({ capability, requirementKey: entry.requirementKey, routingFingerprint: fingerprint })
+          }
+        }
+      }
+      const capabilities = [...new Map(capabilityBindings
+        .map((binding) => [`${binding.capability}\0${binding.requirementKey}\0${binding.routingFingerprint}`, binding] as const)).values()]
+        .sort((left, right) => `${left.capability}\0${left.requirementKey}\0${left.routingFingerprint}`
+          .localeCompare(`${right.capability}\0${right.requirementKey}\0${right.routingFingerprint}`, 'en'))
+      if (entry.entryKind === 'subtask' && capabilities.length !== capabilityBindings.length) {
+        throw new Error(`Protected subtask ${entry.entryId} has duplicate capability bindings.`)
+      }
+      const bindingSetDigest = `hmac-sha256:${createHmac('sha256', input.digestKey)
+        .update(PACKAGE_BINDING_SET_DOMAIN_V1)
+        .update(canonicalArchitectPlanJson({
+          taskId: input.taskId,
+          workPackageId: pkg.id,
+          sourceArtifactId: input.sourceArtifactId,
+          sourcePlanVersion: input.sourcePlanVersion,
+          entryId: entry.entryId,
+          contentDigest: entry.contentDigest,
+          capabilities,
+        }), 'utf8')
+        .digest('hex')}`
+      registrations.push({
+        workPackageId: pkg.id,
+        entryId: entry.entryId,
+        bindingSetDigest,
+        capabilities,
+        projectionEligible: entry.projectionEligible,
+      })
+    }
+  }
+  return registrations.sort((left, right) =>
+    `${left.workPackageId}\0${left.entryId}`.localeCompare(`${right.workPackageId}\0${right.entryId}`, 'en'))
 }
 
 function planningOnlyHarnessMetadata(): JsonObject {
@@ -341,6 +499,7 @@ export function buildWorkforceMaterializationRows(
   const idFactory = options.idFactory ?? randomUUID
   const harnesses: AgentHarnessInsert[] = []
   const packages: WorkPackageInsert[] = []
+  const protectedMode = (input.protectedArchitectPlanEntries?.length ?? 0) > 0
 
   input.prepared.agents.forEach((agent, index) => {
     const agentType = resolveCanonicalAgentType(agent.role, options.activeAgents)
@@ -376,8 +535,8 @@ export function buildWorkforceMaterializationRows(
           architectRunId: input.architectRunId,
           artifactId: input.artifactId,
           mcpGrantsSchemaVersion: 2,
-          mcpNormalizationErrors: [...(input.prepared.mcpExecutionDesign.proposed?.normalizationErrors ?? [])],
-          mcpNormalizationEvidence: mcpNormalizationEvidence(input.prepared),
+          mcpNormalizationErrors: protectedMode ? [] : [...(input.prepared.mcpExecutionDesign.proposed?.normalizationErrors ?? [])],
+          mcpNormalizationEvidence: protectedMode ? [] : mcpNormalizationEvidence(input.prepared),
           unresolvedAgentRole: agent.role,
           requiresAgentConfiguration: true,
         },
@@ -388,13 +547,16 @@ export function buildWorkforceMaterializationRows(
     const harnessId = idFactory()
     const workPackageId = idFactory()
     const aliases = roleAliases(agent.role, agentType)
-    const mcpGrants = mcpGrantsForAgent(input.prepared, agentType, aliases)
-    const mcpRequirements = mcpRequirementsForAgent(input.prepared, agentType, aliases)
-    const mcpSubtasks = mcpSubtasksForAgent(input.prepared, agentType, aliases)
-    const requirementContexts = mcpRequirementContextsForAgent(input.prepared, agentType, aliases)
-    const promptOverlay = requirementContexts.length > 0
-      ? requirementContexts.map((context) => context.promptOverlay).filter((value): value is string => typeof value === 'string').join('\n\n') || null
-      : null
+    const mcpGrants = mcpGrantsForAgent(input.prepared, agentType, aliases, protectedMode)
+    const mcpRequirements = mcpRequirementsForAgent(input.prepared, agentType, aliases, protectedMode)
+    const mcpPromptContext = mcpPromptContextForAgent(
+      input.prepared,
+      input.protectedArchitectPlanEntries ?? [],
+      input.taskId,
+      input.artifactId,
+      agentType,
+      aliases,
+    )
 
     harnesses.push({
       id: harnessId,
@@ -422,17 +584,15 @@ export function buildWorkforceMaterializationRows(
       artifactId: input.artifactId,
       mcpGrants,
       mcpGrantsSchemaVersion: 2,
-      mcpNormalizationErrors: [...(input.prepared.mcpExecutionDesign.proposed?.normalizationErrors ?? [])],
-      mcpNormalizationEvidence: mcpNormalizationEvidence(input.prepared),
+      mcpNormalizationErrors: protectedMode ? [] : [...(input.prepared.mcpExecutionDesign.proposed?.normalizationErrors ?? [])],
+      mcpNormalizationEvidence: protectedMode ? [] : mcpNormalizationEvidence(input.prepared),
       mcpGrantPhases: mcpGrantPhaseMetadata({
         grants: mcpGrants,
         validationStatus: input.prepared.mcpExecutionDesign.validation.status,
       }),
       harnessSemantics: planningOnlyHarnessMetadata(),
-      promptOverlay,
-      requirementContexts,
+      mcpPromptContextPolicy: mcpPromptContext.policy,
       plannedTasks: agent.tasks,
-      mcpAwareSubtasks: mcpSubtasks,
     }
     const projectGrant = projectFilesystemGrantCovers({
       mcpConfig: options.projectMcpConfig,
@@ -489,14 +649,15 @@ export function buildWorkforceMaterializationRows(
       metadata: {
         source: 'workforce-materializer',
         artifactId: input.artifactId,
+        ...(input.planVersion ? { planVersion: input.planVersion } : {}),
         architectRunId: input.architectRunId,
         harnessSemantics: planningOnlyHarnessMetadata(),
         workPackageIds: packages.map((pkg) => pkg.id),
         harnessIds: harnesses.map((harness) => harness.id),
         mcpExecutionStatus: input.prepared.mcpExecutionDesign.validation.status,
         mcpOperatorReviewRequired: (input.prepared.mcpExecutionDesign.proposed?.requirements.length ?? 0) > 0,
-        mcpNormalizationErrors: [...(input.prepared.mcpExecutionDesign.proposed?.normalizationErrors ?? [])],
-        mcpNormalizationEvidence: mcpNormalizationEvidence(input.prepared),
+        mcpNormalizationErrors: protectedMode ? [] : [...(input.prepared.mcpExecutionDesign.proposed?.normalizationErrors ?? [])],
+        mcpNormalizationEvidence: protectedMode ? [] : mcpNormalizationEvidence(input.prepared),
       },
     },
   }
@@ -639,6 +800,53 @@ export async function materializeWorkforceFromArchitectArtifact(
       workPackageCount: 0,
       dependencyCount: 0,
       approvalGateCount: 0,
+    }
+  }
+
+  if (input.protectedArchitectPlanEntries?.length && input.planVersion) {
+    const storage = architectPlanStorageConfiguration(process.env, 'protected')
+    if (storage.mode !== 'protected') {
+      throw new Error('Protected package registration requires the protected Architect writer configuration.')
+    }
+    try {
+      const registrations = buildProtectedPackageEntryRegistrations({
+        taskId: input.taskId,
+        sourceArtifactId: input.artifactId,
+        sourcePlanVersion: input.planVersion,
+        digestKey: storage.digestKey,
+        packages: rows.workPackages,
+        entries: input.protectedArchitectPlanEntries,
+        prepared: input.prepared,
+      })
+      if (registrations.length > 0) {
+        const registrationIds = await registerPackagePlanEntries({
+          taskId: input.taskId,
+          sourceArtifactId: input.artifactId,
+          sourcePlanVersion: input.planVersion,
+          registrations,
+        })
+        const registrationsByPackage = new Map<string, string[]>()
+        registrations.forEach((registration, index) => {
+          if (!registration.projectionEligible) return
+          const packageRegistrations = registrationsByPackage.get(registration.workPackageId) ?? []
+          packageRegistrations.push(registrationIds[index])
+          registrationsByPackage.set(registration.workPackageId, packageRegistrations)
+        })
+        for (const [workPackageId, packageRegistrations] of registrationsByPackage) {
+          await db.update(workPackages).set({
+            metadata: sql`jsonb_set(
+              coalesce(${workPackages.metadata}, '{}'::jsonb)
+                - 'architectPlanEntryReferences' - 'architectPlanEntryRegistrations',
+              '{architectPlanEntryRegistrationIds}',
+              ${JSON.stringify(packageRegistrations.sort())}::jsonb,
+              true
+            )`,
+            updatedAt: new Date(),
+          }).where(and(eq(workPackages.id, workPackageId), eq(workPackages.taskId, input.taskId)))
+        }
+      }
+    } finally {
+      storage.digestKey.fill(0)
     }
   }
 

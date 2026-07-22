@@ -6,10 +6,22 @@ import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 import type RedisClient from 'ioredis'
 import { getAccessibleTask } from '@/lib/task-access'
+import {
+  parseTaskEventEnvelopeV2,
+  safeTaskEventData,
+  safeTaskEventType,
+  type TaskEventEnvelopeV2,
+} from '@/worker/events'
+import { taskEventRedisConfiguration } from '@/lib/task-event-redis'
+import { taskQuestionSummary } from '@/lib/mcps/clarification-projection'
 
 // ---------------------------------------------------------------------------
 // SSE stream — GET /api/tasks/:id/runs
 // ---------------------------------------------------------------------------
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
 
 export async function GET(
   request: NextRequest,
@@ -43,6 +55,8 @@ export async function GET(
       let heartbeat: ReturnType<typeof setInterval> | null = null
       let maxAgeTimer: ReturnType<typeof setTimeout> | null = null
       let sub: RedisClient | null = null
+      let historyRedis: RedisClient = redis
+      let ownsHistoryRedis = false
 
       const cleanup = () => {
         if (closed) return
@@ -54,6 +68,7 @@ export async function GET(
           clearTimeout(maxAgeTimer)
         }
         sub?.disconnect()
+        if (ownsHistoryRedis) historyRedis.disconnect()
         try {
           controller.close()
         } catch {
@@ -72,30 +87,20 @@ export async function GET(
         }
       }
 
-      // persistAndSend: allocates a global monotonic sequence number, writes to the
-      // sorted set using that number as the score, then enqueues the SSE line.
-      // The score is the canonical event ID — Last-Event-ID from the client maps
-      // directly to the sorted set score, so replay is exact.
-      const persistAndSend = async (type: string, data: unknown) => {
-        if (closed) return
-        const seq = await redis.incr(`forge:task:${taskId}:seq`)
-        const line = `id: ${seq}\nevent: ${type}\ndata: ${JSON.stringify(data)}\n\n`
-        redis
-          .zadd(`forge:task:${taskId}:history`, seq, JSON.stringify({ type, data }))
-          .then(() => redis.expire(`forge:task:${taskId}:history`, 86400))
-          .catch((err) => console.error('SSE history write failed:', err))
-        enqueue(line)
-      }
+      const eventHistoryKey = `forge:task-events:v2:${taskId}:history`
+      const eventSequenceKey = `forge:task-events:v2:${taskId}:seq`
 
       // replaySend: enqueues the SSE line directly WITHOUT writing to the sorted set.
       // Used only during the replay loop to avoid re-persisting already-stored events.
       const replaySend = (seqId: number, type: string, data: unknown) => {
-        const line = `id: ${seqId}\nevent: ${type}\ndata: ${JSON.stringify(data)}\n\n`
+        const safeType = safeTaskEventType(type)
+        const line = `id: ${seqId}\nevent: ${safeType}\ndata: ${JSON.stringify(safeTaskEventData(safeType, data))}\n\n`
         enqueue(line)
       }
 
       const sendSnapshotEvent = (type: string, data: unknown) => {
-        enqueue(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`)
+        const safeType = safeTaskEventType(type)
+        enqueue(`event: ${safeType}\ndata: ${JSON.stringify(safeTaskEventData(safeType, data))}\n\n`)
       }
 
       const sendCurrentSnapshot = async () => {
@@ -170,64 +175,149 @@ export async function GET(
           .orderBy(asc(artifacts.createdAt))
 
         for (const artifact of existingArtifacts) {
-          sendSnapshotEvent('artifact:created', {
-            id: artifact.id,
-            artifactId: artifact.id,
-            agentRunId: artifact.agentRunId,
-            artifactType: artifact.artifactType,
-            content: artifact.content,
-            metadata: artifact.metadata,
-            createdAt: artifact.createdAt,
-            workPackageId: workPackageIdByRunId.get(artifact.agentRunId),
-          })
+          const protectedArchitectHistory = artifact.artifactType === 'adr_text'
+            && isRecord(artifact.metadata)
+            && artifact.metadata.historyAvailable === true
+          sendSnapshotEvent('artifact:created', protectedArchitectHistory
+            ? {
+                agentRunId: artifact.agentRunId,
+                historyAvailable: true,
+              }
+            : {
+                id: artifact.id,
+                artifactId: artifact.id,
+                agentRunId: artifact.agentRunId,
+                artifactType: artifact.artifactType,
+                content: artifact.content,
+                metadata: artifact.metadata,
+                createdAt: artifact.createdAt,
+                workPackageId: workPackageIdByRunId.get(artifact.agentRunId),
+              })
         }
 
         const existingQuestions = await db
-          .select()
+          .select({
+            id: taskQuestions.id,
+            status: taskQuestions.status,
+            createdAt: taskQuestions.createdAt,
+            answeredAt: taskQuestions.answeredAt,
+          })
           .from(taskQuestions)
           .where(eq(taskQuestions.taskId, taskId))
           .orderBy(asc(taskQuestions.createdAt))
 
         if (existingQuestions.length > 0) {
+          const questions = existingQuestions.map(taskQuestionSummary)
           sendSnapshotEvent('questions:created', {
-            questions: existingQuestions.map((q) => ({
-              id: q.id,
-              question: q.question,
-              suggestions: q.suggestions,
-              answer: q.answer,
-              status: q.status,
-            })),
+            questionSummaries: questions,
+            questionCount: questions.length,
+            openCount: questions.filter((question) => question.status !== 'answered').length,
+            answeredCount: questions.filter((question) => question.status === 'answered').length,
           })
         }
       }
 
       enqueue('retry: 5000\n\n')
 
-      // Replay missed events if Last-Event-ID was provided
       const lastId = parseInt(request.headers.get('last-event-id') ?? '0', 10)
-      if (lastId > 0) {
-        try {
-          // zrangebyscore with WITHSCORES returns a flat string[] alternating [value, score, value, score, ...]
-          const missed = await redis.zrangebyscore(
-            `forge:task:${taskId}:history`,
-            lastId + 1,
-            '+inf',
-            'WITHSCORES',
-          )
-          for (let i = 0; i < missed.length; i += 2) {
-            const value = missed[i]
-            const score = parseInt(missed[i + 1], 10)
-            const { type, data } = JSON.parse(value) as { type: string; data: unknown }
-            replaySend(score, type, data)
+      let lastDeliveredId = Number.isSafeInteger(lastId) && lastId > 0 ? lastId : 0
+      let replaying = true
+      const buffered: TaskEventEnvelopeV2[] = []
+      const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'rejected'])
+
+      const signalHistoryReset = (nextAvailableId: number) => {
+        sendSnapshotEvent('stream:reset', {
+          type: 'stream:reset',
+          reason: 'retention_gap',
+          requestedAfterId: lastDeliveredId,
+          nextAvailableId,
+        })
+      }
+
+      const replayRange = async (afterId: number, throughId: number): Promise<boolean> => {
+        if (throughId <= afterId) return true
+        const values = await historyRedis.zrangebyscore(
+          eventHistoryKey,
+          afterId + 1,
+          throughId,
+          'WITHSCORES',
+        )
+        let expectedId = afterId + 1
+        for (let index = 0; index < values.length; index += 2) {
+          const score = Number(values[index + 1])
+          let parsed: TaskEventEnvelopeV2 | null = null
+          try {
+            parsed = parseTaskEventEnvelopeV2(JSON.parse(values[index]))
+          } catch {
+            parsed = null
           }
-        } catch (err) {
-          console.error('[SSE /api/tasks/:id/runs] Error replaying missed events', err)
+          if (!parsed || parsed.id === null || parsed.id !== score || score !== expectedId) return false
+          replaySend(score, parsed.type, parsed.data)
+          lastDeliveredId = score
+          expectedId += 1
+        }
+        return expectedId > throughId
+      }
+
+      const deliverPublished = async (event: TaskEventEnvelopeV2) => {
+        if (closed) return
+        const safeType = safeTaskEventType(event.type)
+        const safeData = safeTaskEventData(safeType, event.data)
+        if (event.id !== null) {
+          if (!Number.isSafeInteger(event.id) || event.id < 1 || event.id <= lastDeliveredId) return
+          if (event.id > lastDeliveredId + 1) {
+            const filled = await replayRange(lastDeliveredId, event.id - 1).catch(() => false)
+            if (!filled) {
+              signalHistoryReset(event.id)
+              lastDeliveredId = event.id - 1
+            }
+          }
+          lastDeliveredId = event.id
+          replaySend(event.id, safeType, safeData)
+        } else {
+          enqueue(`event: ${safeType}\ndata: ${JSON.stringify(safeData)}\n\n`)
+        }
+        const status = isRecord(safeData) && typeof safeData.status === 'string'
+          ? safeData.status
+          : undefined
+        if (safeType === 'task:status' && TERMINAL.has(status ?? '')) {
+          enqueue('data: [DONE]\n\n')
+          cleanup()
         }
       }
 
-      // Create a DEDICATED subscriber client (cannot reuse the singleton for pub/sub)
+      // Subscribe and buffer first. Anything published before or during replay
+      // is either present in durable history or retained here, then de-duplicated
+      // by the producer-assigned event ID.
       const { default: Redis } = await import('ioredis')
-      sub = new Redis(process.env.REDIS_URL!)
+      let eventRedisConfiguration
+      try {
+        eventRedisConfiguration = taskEventRedisConfiguration()
+      } catch (error) {
+        console.error('[SSE /api/tasks/:id/runs] Invalid task-event Redis configuration', error)
+        cleanup()
+        return
+      }
+      sub = new Redis(eventRedisConfiguration.subscriberUrl)
+      if (eventRedisConfiguration.dedicated) {
+        historyRedis = new Redis(eventRedisConfiguration.subscriberUrl)
+        ownsHistoryRedis = true
+      }
+      let publishedQueue = Promise.resolve()
+      sub.on('message', (_channel: string, message: string) => {
+        try {
+          const event = parseTaskEventEnvelopeV2(JSON.parse(message))
+          if (!event) return
+          if (replaying) buffered.push(event)
+          else publishedQueue = publishedQueue.then(() => deliverPublished(event))
+        } catch (err) {
+          console.error('[SSE /api/tasks/:id/runs] Error processing message', err)
+        }
+      })
+      sub.on('error', (err) => {
+        console.error('[SSE /api/tasks/:id/runs] Redis subscriber error', err)
+        cleanup()
+      })
 
       try {
         await sub.subscribe(`forge:task:${taskId}`)
@@ -237,6 +327,35 @@ export async function GET(
         return
       }
 
+      if (lastDeliveredId > 0) {
+        try {
+          const rawSequence = await historyRedis.get(eventSequenceKey)
+          const replayUpperBound = Number(rawSequence)
+          if (Number.isSafeInteger(replayUpperBound) && replayUpperBound > lastDeliveredId) {
+            const filled = await replayRange(lastDeliveredId, replayUpperBound)
+            if (!filled) {
+              signalHistoryReset(replayUpperBound)
+              lastDeliveredId = replayUpperBound
+            }
+          }
+        } catch (err) {
+          console.error('[SSE /api/tasks/:id/runs] Error replaying missed events', err)
+        }
+      } else {
+        try {
+          const rawSequence = await historyRedis.get(eventSequenceKey)
+          const currentSequence = Number(rawSequence)
+          if (Number.isSafeInteger(currentSequence) && currentSequence > 0) {
+            lastDeliveredId = currentSequence
+          }
+        } catch (err) {
+          console.error('[SSE /api/tasks/:id/runs] Error reading the event baseline', err)
+        }
+      }
+      replaying = false
+      for (const event of buffered) await deliverPublished(event)
+      buffered.length = 0
+
       try {
         await sendCurrentSnapshot()
       } catch (err) {
@@ -245,31 +364,6 @@ export async function GET(
         }
       }
       if (closed) return
-
-      const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'rejected'])
-
-      sub.on('message', (_channel: string, message: string) => {
-        // Guard: if the controller is already closed, discard the event
-        if (closed) return
-        try {
-          const event = JSON.parse(message) as { type: string; status?: string }
-          void persistAndSend(event.type, event).then(() => {
-            if (event.type === 'task:status' && TERMINAL.has(event.status ?? '')) {
-              enqueue('data: [DONE]\n\n')
-              cleanup()
-            }
-          }).catch((err) => {
-            console.error('[SSE /api/tasks/:id/runs] Error processing message', err)
-          })
-        } catch (err) {
-          console.error('[SSE /api/tasks/:id/runs] Error processing message', err)
-        }
-      })
-
-      sub.on('error', (err) => {
-        console.error('[SSE /api/tasks/:id/runs] Redis subscriber error', err)
-        cleanup()
-      })
 
       heartbeat = setInterval(() => {
         if (closed) return

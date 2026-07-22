@@ -1,5 +1,6 @@
 import { sanitizeWorkerMessage } from './redaction'
-import { defaultOnFeatureFlagState } from './feature-flags'
+import { defaultOnFeatureFlagState, explicitOptInFeatureFlagEnabled } from './feature-flags'
+import { hostRepositoryWritePolicyState } from './repository-edit-policy'
 
 const DEFAULT_CLAIM_TIMEOUT_SECONDS = 5
 const APPROVAL_CLAIM_TIMEOUT_SECONDS = 1
@@ -174,8 +175,8 @@ async function startWorkerOnce(
   // (e.g. a transiently-unhealthy MCP). The task is left at `approved`, so we
   // re-enqueue an approval job and let processApproval re-run the broker — if the
   // block still applies it simply re-blocks, so this never bypasses the gate.
-  const sweepBlockedHandoffs = async (): Promise<void> => {
-    if (blockedHandoffSweepIntervalSeconds === 0 || blockedHandoffSweepRunning) return
+  const sweepBlockedHandoffs = async (options: { startup?: boolean } = {}): Promise<void> => {
+    if ((!options.startup && blockedHandoffSweepIntervalSeconds === 0) || blockedHandoffSweepRunning) return
     blockedHandoffSweepRunning = true
     try {
       const [
@@ -183,12 +184,14 @@ async function startWorkerOnce(
         { tasks, workPackages },
         { enqueueDueBlockedHandoffRetries },
         { convergeRecognizedOperatorHolds },
+        { reconcilePendingS4CompletionHandoffs },
         { and, eq },
       ] = await Promise.all([
         import('../db'),
         import('../db/schema'),
         import('./blocked-handoff-retry'),
         import('../lib/mcps/filesystem-grant-reconciliation'),
+        import('./work-package-handoff'),
         import('drizzle-orm'),
       ])
       const stuck = await db
@@ -200,6 +203,10 @@ async function startWorkerOnce(
         .innerJoin(tasks, eq(tasks.id, workPackages.taskId))
         .where(and(eq(workPackages.status, 'blocked'), eq(tasks.status, 'approved')))
 
+      const recoveredS4Handoffs = await reconcilePendingS4CompletionHandoffs(100, {
+        drain: options.startup === true,
+        workerId,
+      })
       const enqueued = await enqueueDueBlockedHandoffRetries(stuck)
       const converged = await convergeRecognizedOperatorHolds()
       if (enqueued > 0) {
@@ -207,6 +214,9 @@ async function startWorkerOnce(
       }
       if (converged > 0) {
         console.info('[worker] Converged running tasks with operator holds', { count: converged, workerId })
+      }
+      if (recoveredS4Handoffs > 0) {
+        console.info('[worker] Recovered protected completion handoffs', { count: recoveredS4Handoffs, workerId })
       }
     } catch (err) {
       console.warn('[worker] Blocked-handoff sweep failed', { err: errorMessage(err), workerId })
@@ -216,22 +226,35 @@ async function startWorkerOnce(
   }
 
   const run = async (): Promise<void> => {
-    const executionMode = defaultOnFeatureFlagState(process.env.FORGE_WORK_PACKAGE_EXECUTION)
-    const hostWriteMode = defaultOnFeatureFlagState(
-      process.env.FORGE_HOST_REPOSITORY_WRITES ?? process.env.FORGE_REPOSITORY_EDITS,
-    )
+    const executionRequestFlag = defaultOnFeatureFlagState(process.env.FORGE_WORK_PACKAGE_EXECUTION)
+    const executionMode = {
+      enabled: false,
+      recognized: executionRequestFlag.recognized,
+      requested: explicitOptInFeatureFlagEnabled(process.env.FORGE_WORK_PACKAGE_EXECUTION),
+    }
+    const hostWriteMode = hostRepositoryWritePolicyState()
     console.info('[worker] Started', {
       claimTimeoutSeconds,
+      hostRepositoryWritesAvailable: hostWriteMode.available,
       hostRepositoryWritesEnabled: hostWriteMode.enabled,
       hostRepositoryWritesFlagRecognized: hostWriteMode.recognized,
+      hostRepositoryWritesRequested: hostWriteMode.requested,
       maxAttempts,
       providerHealthIntervalSeconds,
       source,
       stuckJobRecoveryMs,
       workPackageExecutionEnabled: executionMode.enabled,
       workPackageExecutionFlagRecognized: executionMode.recognized,
+      workPackageExecutionRequested: executionMode.requested,
       workerId,
     })
+
+    if (hostWriteMode.requested) {
+      console.warn('[worker] Host repository writes are unavailable; enabled requests fail closed after sandbox output is preserved', {
+        flag: hostWriteMode.source,
+        workerId,
+      })
+    }
 
     try {
       if (providerHealthIntervalSeconds > 0) {
@@ -242,8 +265,8 @@ async function startWorkerOnce(
         )
       }
 
+      void sweepBlockedHandoffs({ startup: true })
       if (blockedHandoffSweepIntervalSeconds > 0) {
-        void sweepBlockedHandoffs()
         blockedHandoffSweepTimer = setInterval(
           () => void sweepBlockedHandoffs(),
           blockedHandoffSweepIntervalSeconds * 1000,

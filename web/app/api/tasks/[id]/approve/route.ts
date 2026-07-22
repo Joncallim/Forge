@@ -4,7 +4,7 @@ import { isDeepStrictEqual } from 'node:util'
 import { db } from '@/db'
 import { approvalGates, projects, tasks, workPackages } from '@/db/schema'
 import { and, asc, eq, sql } from 'drizzle-orm'
-import { getSession } from '@/lib/session'
+import { getSession, readSessionCredential } from '@/lib/session'
 import { redis } from '@/lib/redis'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
@@ -27,6 +27,17 @@ import {
 } from '@/lib/mcps/filesystem-grants'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
 import { loadCurrentProjectFilesystemDecision } from '@/lib/mcps/filesystem-grant-reconciliation'
+import { publishTaskEvent } from '@/worker/events'
+import {
+  listApprovedPackagePlanRegistrations,
+  readProtectedMcpOperatorReview,
+} from '@/lib/mcps/history-reader'
+import {
+  parseProtectedMcpReviewHead,
+  protectedReviewDecisions,
+  type ProtectedMcpReviewHead,
+} from '@/lib/mcps/protected-mcp-review'
+import { loadProtectedApprovalReviewPreflight } from '@/lib/mcps/protected-review-preflight'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -36,6 +47,65 @@ function recordArray(value: unknown): Record<string, unknown>[] {
   return Array.isArray(value)
     ? value.filter((item): item is Record<string, unknown> => isRecord(item))
     : []
+}
+
+type ProtectedApprovalReview = {
+  approvalGateId: string
+  approvedRegistrationIdsByPackage: ReadonlyMap<string, readonly string[]>
+  decisions: Map<string, 'approved' | 'denied'>
+  head: ProtectedMcpReviewHead
+}
+
+function projectProtectedMcpReviewToPackages<T extends {
+  id: string
+  mcpRequirements: unknown
+  metadata: unknown
+}>(packages: T[], review: ProtectedApprovalReview): T[] {
+  return packages.map((pkg) => {
+    const metadata = isRecord(pkg.metadata) ? { ...pkg.metadata } : {}
+    const approved = (value: unknown) => isRecord(value)
+      && typeof value.requirementKey === 'string'
+      && review.decisions.get(value.requirementKey) === 'approved'
+    const mcpRequirements = Array.isArray(pkg.mcpRequirements) ? pkg.mcpRequirements.filter(approved) : []
+    const mcpGrants = Array.isArray(metadata.mcpGrants) ? metadata.mcpGrants.filter(approved) : []
+    const approvedRegistrationIds = [...(review.approvedRegistrationIdsByPackage.get(pkg.id) ?? [])]
+    delete metadata.promptOverlay
+    delete metadata.requirementContexts
+    delete metadata.mcpAwareSubtasks
+    delete metadata.mcpOperatorReviews
+    metadata.mcpGrants = mcpGrants
+    delete metadata.architectPlanEntryRegistrations
+    if (approvedRegistrationIds.length > 0) {
+      metadata.architectPlanEntryRegistrationIds = approvedRegistrationIds
+      const priorPolicy = isRecord(metadata.mcpPromptContextPolicy)
+        ? metadata.mcpPromptContextPolicy
+        : {}
+      metadata.mcpPromptContextPolicy = {
+        schemaVersion: 1,
+        state: 'protected_references_available',
+        promptOverlayPresent: priorPolicy.promptOverlayPresent === true,
+        requirementContextCount: 0,
+        mcpAwareSubtaskCount: 0,
+        eligibleReferenceCount: approvedRegistrationIds.length,
+        protectedCoverageComplete: true,
+      }
+    } else {
+      delete metadata.architectPlanEntryRegistrationIds
+      delete metadata.mcpPromptContextPolicy
+    }
+    metadata.mcpOperatorReview = {
+      schemaVersion: 2,
+      sourceArtifactId: review.head.sourceArtifactId,
+      sourcePlanVersion: review.head.sourcePlanVersion,
+      revision: review.head.revision,
+      reviewSetDigest: review.head.reviewSetDigest,
+      itemCount: review.head.itemCount,
+      approvedCount: review.head.approvedCount,
+      deniedCount: review.head.deniedCount,
+      blockerCodes: review.head.blockerCodes,
+    }
+    return { ...pkg, mcpRequirements, metadata }
+  })
 }
 
 function approvedStatusForGrant(status: unknown): string {
@@ -234,6 +304,81 @@ export async function POST(
     const projectFilesystemDecision = await loadCurrentProjectFilesystemDecision(projectForHealth.id)
     const mcpOverview = await getProjectMcpOverview(projectForHealth, projectFilesystemDecision)
 
+    let protectedApprovalReview: ProtectedApprovalReview | null = null
+    const protectedReviewPreflight = await loadProtectedApprovalReviewPreflight({ taskId })
+    if (protectedReviewPreflight) {
+      const gateMetadata = isRecord(protectedReviewPreflight.gate.metadata)
+        ? protectedReviewPreflight.gate.metadata
+        : {}
+      const head = parseProtectedMcpReviewHead(
+        gateMetadata.protectedMcpReview,
+        protectedReviewPreflight.gate.sourceArtifactId,
+      )
+      if (gateMetadata.mcpOperatorReviewRequired === true && !head) {
+        return NextResponse.json({
+          error: 'Review and save every proposed MCP requirement before approving this plan.',
+        }, { status: 409 })
+      }
+      if (head) {
+        const sessionCredential = readSessionCredential(request)
+        if (!sessionCredential || head.sourcePlanVersion !== protectedReviewPreflight.sourcePlanVersion) {
+          return NextResponse.json({ error: 'The protected MCP review is not available for approval.' }, { status: 409 })
+        }
+        let entries
+        try {
+          entries = await readProtectedMcpOperatorReview({
+            approvalGateId: protectedReviewPreflight.gate.id,
+            revision: head.revision,
+            sessionCredential,
+            taskId,
+          })
+        } catch {
+          return NextResponse.json({ error: 'The protected MCP review is not available for approval.' }, { status: 409 })
+        }
+        if (entries.length === 0
+          || entries.some((entry) => entry.reviewSetDigest !== head.reviewSetDigest)) {
+          return NextResponse.json({ error: 'The protected MCP review changed before approval.' }, { status: 409 })
+        }
+        const decisions = protectedReviewDecisions(entries)
+        const approvedCount = decisions
+          ? [...decisions.values()].filter((decision) => decision === 'approved').length
+          : -1
+        if (!decisions || decisions.size !== head.itemCount
+          || approvedCount !== head.approvedCount
+          || decisions.size - approvedCount !== head.deniedCount) {
+          return NextResponse.json({ error: 'The protected MCP review failed its cardinality check.' }, { status: 409 })
+        }
+        let approvedRegistrations
+        try {
+          approvedRegistrations = await listApprovedPackagePlanRegistrations({
+            approvalGateId: protectedReviewPreflight.gate.id,
+            reviewRevision: head.revision,
+            reviewSetDigest: head.reviewSetDigest,
+            sessionCredential,
+            sourcePlanVersion: head.sourcePlanVersion,
+          })
+        } catch {
+          return NextResponse.json({ error: 'The protected MCP review changed before approval.' }, { status: 409 })
+        }
+        const approvedRegistrationIdsByPackage = new Map<string, string[]>()
+        for (const registration of approvedRegistrations) {
+          const existingIds = approvedRegistrationIdsByPackage.get(registration.workPackageId) ?? []
+          if (existingIds.includes(registration.registrationId)) {
+            return NextResponse.json({ error: 'The protected registration projection was not unique.' }, { status: 409 })
+          }
+          existingIds.push(registration.registrationId)
+          approvedRegistrationIdsByPackage.set(registration.workPackageId, existingIds)
+        }
+        for (const ids of approvedRegistrationIdsByPackage.values()) ids.sort()
+        protectedApprovalReview = {
+          approvalGateId: protectedReviewPreflight.gate.id,
+          approvedRegistrationIdsByPackage,
+          decisions,
+          head,
+        }
+      }
+    }
+
     const approvedAt = new Date()
     const { task, approvedGates, approvalBlock } = await db.transaction(async (tx) => {
       const [lockedProject] = await tx
@@ -308,10 +453,32 @@ export async function POST(
       const planGateSourceArtifactId = storedPackageRows[0]?.planGateSourceArtifactId
       const reviewValidation = validateMcpOperatorReviewHistory(gateMetadata, planGateSourceArtifactId)
       const operatorReview = reviewValidation.valid ? reviewValidation.head : null
-      const reviewBlockReason = !reviewValidation.valid
+      const lockedProtectedHead = parseProtectedMcpReviewHead(
+        gateMetadata.protectedMcpReview,
+        planGateSourceArtifactId,
+      )
+      const protectedReview = protectedApprovalReview
+        && lockedProtectedHead
+        && lockedProtectedHead.sourceArtifactId === protectedApprovalReview.head.sourceArtifactId
+        && lockedProtectedHead.sourcePlanVersion === protectedApprovalReview.head.sourcePlanVersion
+        && lockedProtectedHead.revision === protectedApprovalReview.head.revision
+        && lockedProtectedHead.reviewSetDigest === protectedApprovalReview.head.reviewSetDigest
+        ? protectedApprovalReview
+        : null
+      const forbiddenProtectedMetadata = [
+        'protectedMcpOperatorReviews',
+        'protectedMcpOperatorReview',
+      ].some((key) => Object.hasOwn(gateMetadata, key))
+      const reviewBlockReason = forbiddenProtectedMetadata
+        ? 'Legacy protected MCP review metadata is not approval authority. Save the review again or replan.'
+        : lockedProtectedHead && !protectedReview
+          ? 'The protected MCP review changed while approval was being prepared. Reload and approve again.'
+          : !reviewValidation.valid
         ? reviewValidation.error
-        : gateMetadata.mcpOperatorReviewRequired === true && !operatorReview
+        : gateMetadata.mcpOperatorReviewRequired === true && !operatorReview && !protectedReview
           ? 'Review and save every proposed MCP requirement before approving this plan.'
+          : protectedReview && protectedReview.head.blockerCodes.length > 0
+            ? 'The protected MCP review denied one or more required requirements. Revise the plan before approval.'
           : operatorReview?.blockers.join(' ') || null
       if (reviewBlockReason) {
         return {
@@ -319,7 +486,9 @@ export async function POST(
           approvedGates: [] as { id: string }[],
           approvalBlock: {
             error: reviewBlockReason,
-            evidenceRefs: operatorReview ? [`mcp-review:${operatorReview.digest}`] : [] as string[],
+            evidenceRefs: operatorReview
+              ? [`mcp-review:${operatorReview.digest}`]
+              : protectedReview ? [`mcp-review:${protectedReview.head.reviewSetDigest}`] : [] as string[],
             primaryDecision: null,
             primaryMode: 'blocked' as const,
             reason: reviewBlockReason,
@@ -330,7 +499,9 @@ export async function POST(
           },
         }
       }
-      const rawPackageRows = operatorReview
+      const rawPackageRows = protectedReview
+        ? projectProtectedMcpReviewToPackages(storedPackageRows, protectedReview)
+        : operatorReview
         ? projectReviewedMcpPlanToPackages({
             review: operatorReview,
             overview: mcpOverview,
@@ -421,7 +592,7 @@ export async function POST(
           approvedBy: session.userId,
           metadata: pkg.metadata,
         })
-        const update = operatorReview
+        const update = operatorReview || protectedReview
           ? {
               mcpRequirements: pkg.mcpRequirements,
               metadata: { ...(isRecord(pkg.metadata) ? pkg.metadata : {}), mcpGrantPhases: phases },
@@ -510,19 +681,17 @@ export async function POST(
       )
     }
     try {
-      await redis.publish('forge:task:' + taskId, JSON.stringify({
-        type: 'task:status',
+      await publishTaskEvent(taskId, 'task:status', {
         status: 'approved',
         updatedAt: task.updatedAt.toISOString(),
-      }))
+      })
       for (const gate of approvedGates) {
-        await redis.publish('forge:task:' + taskId, JSON.stringify({
-          type: 'approval_gate:decided',
+        await publishTaskEvent(taskId, 'approval_gate:decided', {
           gateId: gate.id,
           gateType: 'plan_approval',
           status: 'approved',
           updatedAt: approvedAt.toISOString(),
-        }))
+        })
       }
     } catch (err) {
       console.error('[POST /api/tasks/:id/approve] Failed to publish approval progress event', err)

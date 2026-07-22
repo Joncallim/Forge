@@ -45,15 +45,19 @@ Human intent
   -> durable work packages
   -> capability and Model Context Protocol (MCP) admission
   -> bounded context
-  -> sandboxed specialist execution
+  -> specialist handoff artifacts
   -> quality assurance (QA) / Reviewer / Security gates
   -> evidence, recovery, and GitHub handoff
 ```
 
-FORGE is currently a **single-operator beta**. It can plan and execute approved
-specialist packages, apply guarded local repository changes, and preserve the
-evidence needed for review. It deliberately stops short of general autonomous
-commits, merges, broad live MCP authority, or unrestricted host control.
+FORGE is currently a **single-operator beta**. It can plan approved specialist
+packages and produce handoff artifacts for review. Specialist execution and
+file materialization are currently unavailable because Forge does not yet have
+an operating-system-enforced confined writer. The work-package and ACP flags
+are reserved settings; they cannot enable execution today. Direct host
+repository writes remain unavailable.
+It also stops short of autonomous commits, merges, broad live MCP authority, or
+unrestricted host control.
 
 ## Why FORGE
 
@@ -79,11 +83,8 @@ commits, merges, broad live MCP authority, or unrestricted host control.
 ### Execute within policy
 
 - Queue work through Redis and persist orchestration truth in PostgreSQL.
-- Execute eligible specialist packages sequentially.
-- Build bounded repository context packets.
-- Write generated output into per-attempt sandboxes under `.forge/task-runs`.
-- Apply validated repository-affecting files through guarded local-write policy.
-- Enforce command, file-count, byte, timeout, validation, and retry limits.
+- Prepare specialist handoff artifacts for review after approval.
+- Build bounded repository context packets for planning and handoff evidence.
 - Broker MCP requirements through explicit admission and approval state.
 
 ### Review and preserve evidence
@@ -104,8 +105,8 @@ Create task
   -> FORGE materializes packages and gates
   -> operator reviews the plan
   -> capability/MCP admission runs
-  -> specialist executes in a bounded attempt sandbox
-  -> validated output may be applied to the local project
+  -> specialist handoff artifacts are prepared for operator review
+  -> operator reviews and manually applies any separately supplied files
   -> QA / Reviewer / Security evidence is collected
   -> operator accepts, requests rework, or stops
 ```
@@ -200,15 +201,20 @@ Not built or intentionally deferred:
 - earned autonomy without verified historical evidence;
 - the full dockable Forge Workspace shell and link graph.
 
-Current execution paths can be disabled with explicit flags including:
+Specialist execution is currently unavailable. These reserved settings do not
+override the missing confined writer; leave them unset or disabled:
 
 ```text
 FORGE_WORKFORCE_MATERIALIZATION=0
 FORGE_WORK_PACKAGE_HANDOFF=0
 FORGE_WORK_PACKAGE_EXECUTION=0
-FORGE_HOST_REPOSITORY_WRITES=0
 FORGE_ACP_WORK_PACKAGE_EXECUTION=0
 ```
+
+Host repository writes are not an available execution path. Leave
+`FORGE_HOST_REPOSITORY_WRITES` unset or disabled. Setting it to an enable value
+does not make file materialization available; the request fails closed because
+path validation is not an operating-system sandbox.
 
 ## Roadmap
 

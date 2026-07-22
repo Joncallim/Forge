@@ -22,8 +22,10 @@ Forge distinguishes three kinds of MCP involvement, and the whole epic exists
 because the code does not distinguish them in one place:
 
 1. **Planning-only MCP context** — the Architect says an MCP would help. Forge
-   records it as run-scoped prompt instructions (`promptOverlay`,
-   `mcpAwareSubtasks`). It grants nothing.
+   retains the raw text only in ACL-protected, append-only versioned Architect plan
+   entries under a non-text artifact header. Runtime packages record normalized policy/bindings and eligible
+   projection references, not raw `promptOverlay`, `requirementContexts`, or
+   `mcpAwareSubtasks` text. It grants nothing.
 2. **Bounded read-only context grants** — Forge assembles a project-scoped,
    inspectable read-only context packet after an explicit operator grant.
    Capabilities: `filesystem.project.read`, `filesystem.project.list`,
@@ -46,7 +48,7 @@ not share one producer:
 |---|------|-----------------------------------|----------|---------|
 | 1 | `validateMcpExecutionDesign` | `web/worker/mcp-execution-design.ts` · 326 | parsed `McpExecutionDesign` fence | approval-time validation of the Architect design |
 | 2 | `deriveMcpGrantDecisions` / `decisionStatus` | `mcp-execution-design.ts` · 803 / 753 | same design | grant-decision preview |
-| 3 | `evaluateWorkPackageMcpBroker` | `mcp-execution-design.ts` · 599 | persisted `workPackages.mcpRequirements` + `metadata.mcpGrants` + `mcpAwareSubtasks` | handoff-time broker |
+| 3 | `evaluateWorkPackageMcpBroker` | `mcp-execution-design.ts` · 599 | persisted normalized `workPackages.mcpRequirements` + `metadata.mcpGrants` + subtask bindings/projection refs | handoff-time broker |
 | 4 | `requiresFilesystemGrantApproval` / `summarizeFilesystemCapabilities` | `web/lib/mcps/filesystem-grants.ts` · 303 / 90 | `mcpRequirements` + `metadata` | filesystem grant gate (a *filesystem-only projection*) |
 | 5 | client re-implementation | `web/app/dashboard/tasks/[id]/page.tsx` · `filesystemPackageCapabilitySummary` 369, `canonicalFilesystemCapability` 354, `unresolvedRequiredFilesystemGrants` 420 | yet another requirement field set | UI badges/blocking |
 
@@ -524,25 +526,142 @@ sides must carry a stable per-requirement identity:
   `sourceRequirementIndex`, `agent`, `assignment`, and `promptOverlayPresent` on each
   `metadata.mcpGrants` entry (see the schema-bump rows in the consolidation map).
 
-Prompt context needs the same identity. The Architect fence therefore adds
-`requirementContexts: Array<{ sourceRequirementIndex: number; agent: string;
-promptOverlay: string }>`; the index addresses the raw requirement in that fence
-only. During `normalizeDesign`, Forge validates the index and agent assignment,
-then replaces the positional reference with the generated `requirementKey` before
-the design is persisted or materialized. The persisted normalized entry is
-`{requirementKey, agent, mcpId, promptOverlay}`. `metadata.promptOverlay` remains a
-package-level rendering assembled from those entries for executor compatibility,
-but it is **not** evidence that every same-agent requirement has context.
-`promptOverlayPresent` is computed separately for each grant by exact
-`requirementKey` membership. Raw `mcpAwareSubtasks` keep their flat
-`mcpCapabilities[]` for compatibility and add parallel
-`capabilityRequirements: Array<{capability:string; sourceRequirementIndex:number}>`.
-Normalization validates every pair and persists
-`capabilityBindings: Array<{capability:string; requirementKey:string}>`, so one
-multi-MCP subtask can bind each capability to a different requirement. A legacy
-subtask may infer a binding only when exactly one same-agent/same-MCP requirement
-matches that capability; any missing, duplicate, or conflicting binding fails
-closed with `revise_plan`.
+Prompt context needs the same identity, but raw Architect text has exactly one
+durable home: append-only `architect_plan_entries` attached to a versioned,
+non-text Architect artifact header. The artifact `content` is fixed safe copy and
+its metadata contains only version/count/digest fields. `architect_plan_versions`
+binds task, artifact, monotonic `BIGINT` plan version, digest-key ID, and entry-set
+digest. JSON/runtime references encode the version as canonical unsigned base-10
+text and order/compare only through PostgreSQL `BIGINT`, never a JavaScript number
+or lexical comparison. Entry IDs are 1..256 ASCII `[a-z0-9._:-]`; canonical agent
+and subtask components are at most 64 characters and invalid/over-limit input
+rejects rather than truncates. Entries are keyed inside `{taskId,planVersion}` and use stable
+`plan_body:000000`, `requirement:<requirementKey>`,
+`overlay:<requirementKey>:<canonical-agent>`, or
+`subtask:<validated-subtask-id>:<canonical-agent>` IDs. They are insert-only with
+exact `ON DELETE RESTRICT`; update/delete guards protect versions, entries, and
+their artifact header.
+
+A non-login migration owner alone owns the plan version, entry, and text-bearing
+columns. `PUBLIC`, web, worker, application, reporting, migration, and maintenance
+roles have direct `SELECT` and DML revoked. There are exactly two schema-qualified,
+fixed-`search_path=pg_catalog,forge` SECURITY DEFINER readers, both with `PUBLIC`
+execution revoked: `forge.read_architect_plan_history_v1(...)` is the audited
+human-history reader, and `forge.resolve_architect_plan_entry_v1(...)` is the
+package-bound one-entry resolver. Neither accepts free-form SQL, enumerates text,
+or exposes a locator; no other view/function/role may read plan text. Each reader is
+executable only by its exact certificate-authenticated non-superuser `NOINHERIT`
+login, which has no cross-role membership, `SET ROLE`, or session-authorization
+privilege. Immutable `session_user` proves the calling boundary, but the shared
+human-history web login is never treated as an end-user identity. That reader
+has the exact signature
+`forge.read_architect_plan_history_v1(p_session_credential bytea, p_task_id uuid,
+p_plan_version bigint)`, not a user-ID argument. The current session table is
+`public.sessions`, not `forge_sessions`: today `sessions.id uuid` is both the raw
+lowercase-UUID `forge_session` cookie and `session:<uuid>` Redis key,
+`revoked_at` exists, and no database expiry exists. S4 makes `id` an independent
+internal UUID and adds `credential_digest_v1 bytea NOT NULL CHECK
+(octet_length(credential_digest_v1) = 32)` with a unique index and
+`expires_at timestamptz NOT NULL`; existing `user_id` and `revoked_at` remain the
+identity and revocation authority, and existing `last_seen_at` becomes the
+database activity clock.
+
+`SESSION_CREDENTIAL_DOMAIN_V1` is exactly UTF-8
+`forge:web-session:v1\0` (21 bytes; hex
+`666f7267653a7765622d73657373696f6e3a763100`). The credential input is exactly
+the current cookie's 36 lowercase ASCII UUID-v4 bytes, including hyphens and valid
+variant, with no case fold, percent decode, UUID-binary conversion, normalization,
+or hex/base64/text round trip. The database stores
+`SHA-256(domain_bytes || credential_bytes)` as a 32-byte `bytea`, with no added
+delimiter or length prefix. The fixed vector cookie
+`00000000-0000-4000-8000-000000000000` yields
+`a4a6fe7265a6d2ec096cb0d31bb6b79d91a3d9a36537827009cb01f22e1f58e4`.
+The function receives the credential through a prepared binary bind, validates it,
+locks the digest-matched row `FOR UPDATE`, then requires `revoked_at IS NULL` and
+`clock_timestamp() < expires_at`; equality is expired. That locked row derives
+the user. To preserve today's sliding seven-day lifetime, a valid authentication
+strictly more than 60 seconds after `last_seen_at` synchronously sets
+`last_seen_at = db_now` and `expires_at = db_now + interval '7 days'` under the
+same lock; more frequent reads do not extend it. ACL is rechecked, expiry/revocation
+is checked once more with database time, and the text-free audit and text return
+commit together.
+
+Redis is only a cache. The v2 key is
+`session:v2:<lowercase credential-digest hex>`, never the cookie. Creation commits
+PostgreSQL first with one `db_now`, `last_seen_at = db_now`, and
+`expires_at = db_now + interval '7 days'`, then writes Redis with `PXAT` no later
+than the committed `expires_at`; every
+authentication rechecks PostgreSQL. A threshold refresh commits the database
+expiry first, and only its after-commit action may advance Redis `PXAT`, never past
+that returned expiry. Database refresh failure denies the request and cannot
+extend Redis; Redis refresh failure cannot revoke a database-valid session and the
+next database-authorized read repairs it. Revocation commits `revoked_at` and a
+digest-keyed durable invalidation item first, then deletes Redis; retry/
+reconciliation handles deletion failure, and a stale cache entry cannot authorize.
+The migration first adds nullable columns
+and a dual reader/writer. New sessions use separate row IDs, unchanged UUID
+cookies, digests, database expiry, and v2 cache keys. After the legacy sliding-TTL
+writer is stopped and its processes drained, each locked legacy row uses Redis 7
+`PEXPIRETIME session:<legacy-id>` plus cached `lastSeenAt`: missing, malformed,
+non-expiring, or elapsed entries are revoked; a live row gets that exact absolute
+`expires_at`, reconciled `last_seen_at`, its digest, a fresh independent ID, and a
+v2 `PXAT` no later than that expiry before the raw-key entry is deleted.
+The resumable migrator rejects collisions and never extends expiry. Only after all
+live rows, binaries, and credentials are drained may S4 remove the raw-ID fallback,
+validate and make the columns strict, purge/zero-scan old `session:*` keys and all
+sinks, and enable the history route.
+
+The raw credential exists only in the cookie, bounded request buffer, and prepared
+binary argument until hashing. Argument-one bind logging/tracing is redacted; it is
+never persisted after the migration fence, returned, logged, audited, placed in
+SQL text, or included in Redis/invalidation. The bounded legacy-ID migration read
+is the sole temporary exception and cannot coexist with the enabled history route.
+Required tests cover valid, exact-expiry, expired, revoked, swapped-user/task,
+fabricated/malformed, wrong-domain/re-encoded/bit-flipped, simultaneous two-user,
+read-versus-revoke, and read-versus-expiry cases; denials return zero bytes and no
+read audit. Migration crash/resume, collision, exact expiry/activity backfill,
+60-second threshold/seven-day refresh, database-failure/no-Redis-extension,
+Redis-failure/database-valid repair, stale-cache/lost-delete, purge, and fixed-
+vector tests are mandatory. The package resolver continues
+to derive its exact worker identity directly from its distinct `session_user`.
+Wrong-login/cross-reader, hostile `SET ROLE`, and catalog tests prove zero-byte/
+zero-forged-audit denial and the production role attributes/lack of membership.
+
+Every entry string is NFC normalized. Its canonical bytes are RFC 8785 JSON
+Canonicalization Scheme serialization of the complete scoped entry tuple encoded
+as UTF-8. `contentDigest` is
+`HMAC-SHA-256(K_plan_v1, "forge:architect-plan-entry:v1\0" || canonicalBytes)`;
+the row stores only the non-secret key ID and digest, and old keys remain
+verification-only while retained references use them. Legacy migration orders
+versions by architect run time/run ID/artifact ID and maps recognized fields to
+the same stable IDs. Ambiguous input becomes one ordered
+`legacy_full_plan` history entry with `projectionEligible:false`; it requires plan
+recomputation. Entry insertion and raw artifact content/metadata removal commit in
+one transaction, so there is never a second durable text copy.
+
+During `normalizeDesign`, Forge validates each source requirement index, agent
+assignment, and subtask capability reference, then writes only normalized policy,
+`requirementKey`, capability bindings, and server-private eligible references
+`{planArtifactId,planVersion,entryId,contentDigest}` to the runtime package.
+Generic APIs never serialize those locators. The task-bound resolver verifies ACL,
+task/package/type/stage/version/key/digest, package agent, requirement, and every
+binding after admission. Only the eligible verified fragment may exist
+ephemerally in that run's executor prompt and provider/Agent Client Protocol (ACP)
+wire request. The whole plan row and every rejected/ineligible/unrelated fragment
+never enters either wire or a persisted sink.
+
+S4 creates the sole human route,
+`GET /api/tasks/{taskId}/architect-plan-history/{planVersion}`, and append-only
+`architect_plan_history_reads`. The route verifies current task/project ACL plus
+exact task/version/artifact/type/stage and commits a bounded text-free read-audit
+tuple before calling only `forge.read_architect_plan_history_v1(...)` and returning
+entries. The internal package resolver calls only
+`forge.resolve_architect_plan_entry_v1(...)` after admission. Unauthorized/cross-
+task/wrong-stage/missing reads return no bytes. Normal task/project/package/artifact APIs, SSE live/snapshot/
+replay, task logs/exports, queues, diagnostics, and errors expose neither plan text
+nor a locator. Architect output is buffered; raw `run:chunk`/delta and plan
+`artifact:created` payloads are deleted. Events contain only opaque run/event IDs,
+fixed progress, and `historyAvailable:true`.
 
 For a legacy fence that has only `promptOverlays: Record<agent,string>`, the
 adapter may associate that overlay only when the agent has exactly one
@@ -661,7 +780,7 @@ export type McpWorkPackageAdmission = {
 
 export function admitWorkPackageMcp(input: {
   entries: Array<Record<string, unknown>>       // brokerEntries(): mcpRequirements ∪ metadata.mcpGrants
-  subtasks: Array<Record<string, unknown>>      // metadata.mcpAwareSubtasks; each carries `id` + `agent` + flat `mcpCapabilities[]`; MCP identity is derived per capability
+  subtasks: Array<Record<string, unknown>>      // normalized subtask policy/bindings + eligible plan-artifact projection refs; no raw subtask text
   label: string
   statusFor: (mcpId: string) => ProjectMcpStatus | null   // may return null (unconfigured/unknown MCP)
   effectiveGrantFor: (entry: { requirementKey: string; mcpId: string; requiredCapabilities: string[] }) => EffectiveGrantState
@@ -780,9 +899,9 @@ keep a **transitional re-export** until their callers migrate in the owning slic
 | `requiresFilesystemGrantApproval` / `summarizeFilesystemCapabilities` (`filesystem-grants.ts:303/90`) | S2 makes both the filesystem-specific **projection** of `admitWorkPackageMcp`, imports shared normalization/reader policy, and keeps the nominal/persistence types. S3 owns only the new denied/revoked held-state and reconciliation behavior after that projection exists | S2 projection / S3 recovery behavior |
 | `readEffectiveGrantState` (`EffectiveGrantState` reader) | **canonical home is `web/lib/mcps/admission.ts` (Layer 1), created and owned by S1.** S3's `filesystem-grants.ts` imports it (or transitional-re-exports it for existing callers); there is exactly one implementation of this policy | S1 own / S3 import |
 | `isRetryableMcpBrokerBlock` (`:90`) + `buildMcpBrokerBlockMetadata` (`blocked-handoff-retry.ts:32`) | consume `aggregate.retryable`/`primaryRecoveryAction`; **persist the full versioned `metadata.mcpBroker` here**; S5 reads it only | S2 |
-| `normalizeDesign` + `mcpRequirementsForAgent` | `normalizeDesign` assigns/persists a versioned canonical-payload digest `requirementKey` (with duplicate occurrence suffix; not an Architect-supplied key or bare array index), converts validated `requirementContexts[].sourceRequirementIndex` references to that key, and fails closed on ambiguous legacy agent overlays. The materializer preserves the key plus source index and `agent`, so Layer 3a can join collision-safely across reorderings | S2 |
+| `normalizeDesign` + `mcpRequirementsForAgent` | `normalizeDesign` assigns/persists a versioned canonical-payload digest `requirementKey` (with duplicate occurrence suffix; not an Architect-supplied key or bare array index), validates `requirementContexts[].sourceRequirementIndex` against it, and fails closed on ambiguous legacy agent overlays. Append-only `architect_plan_entries` under a non-text version header are the only raw-text store. The materializer preserves normalized policy, key, source index, `agent`, and server-private opaque entry references only, so Layer 3a can join collision-safely without copying text into runtime metadata or generic APIs | S2/S4 boundary |
 | `mcpGrantsForAgent` (`workforce-materializer.ts:157`) | persists the matching `requirementKey`, `sourceRequirementIndex`, `agent`, `assignment`, `promptOverlayPresent`, plus `mode`, `recoveryAction`, structured `grantState`, `normalizedCapabilities`, `evidenceRefs` on each grant (schema bump) — not just id/mcp/caps/requirement/status/reason/fallback/health | S2 |
-| `mcpSubtasksForAgent` (`workforce-materializer.ts`) | retains the existing `id`, `agent`, and flat `mcpCapabilities[]`, plus normalized per-capability `capabilityBindings[{capability,requirementKey}]`, on each persisted `metadata.mcpAwareSubtasks` entry (currently `agent` is stripped). Shared `capabilityMcpId` derives the MCP independently for each capability, so one subtask can safely span several MCPs without a synthetic singleton `mcpId`; missing/ambiguous/conflicting bindings block | S2 |
+| `mcpSubtasksForAgent` (`workforce-materializer.ts`) | replaces raw persisted `metadata.mcpAwareSubtasks` text with normalized `id`, `agent`, flat `mcpCapabilities[]`, per-capability `capabilityBindings[{capability,requirementKey}]`, and opaque eligible plan-artifact projection references. Shared `capabilityMcpId` derives the MCP independently for each capability, so one subtask can safely span several MCPs without a synthetic singleton `mcpId`; missing/ambiguous/conflicting references or bindings block | S2/S4 boundary |
 | `mcpCapabilityList` (`work-package-executor.ts:1527`) | imports `mergeCapabilityFields`; executor filesystem gating uses shared `coverageKeysForGrant`/`classifyCapability` | S4 |
 | client helpers (`tasks/[id]/page.tsx:348-444`) | import shared helpers OR consume a server-computed grant-state payload; render `mode`+`recoveryAction` via `admission-copy.ts` | S5 |
 
@@ -964,20 +1083,27 @@ node; and any substitution of one graph, edge set, or evidence for the other.
   `web/lib/mcps/epic-172-release-order.ts`. Neither imports an S3 or remaining-S4
   symbol. The Step 0 fixture proves both files exist and validates the first node's
   exact owner, build identity, and route/full-ingress-close/drain/foreign-key/guard
-  evidence before permitting `s3_issue_178`.
+  evidence before permitting `s3_issue_178`. A static wording-parity sentinel
+  rejects any Step 0 contract, fixture, or release check that narrows the
+  prerequisite to delete ingress; only its own denylist fixture may contain that
+  stale phrase.
 - Before recording its own graph receipt, Step 0 also solely installs the generic
   pinned Ed25519 signer policy/key and audit, append-only immutable durable-release-
   evidence store, separate append-only short-lived
   `forge_epic_172_transition_authorizations` attempts in a distinct Ed25519
-  signature domain, append-only consumption ledger, checked-in verifier/recorder/
-  consumer, dedicated certificate-authenticated `NOINHERIT` recorder/consumer/
-  transition principals, canonical transition-identity uniqueness, and the
-  disabled enablement singleton. The bootstrap is not a graph node and creates no
-  unsigned receipt. Once validly recorded, graph-node and required-evidence
-  receipts are immutable durable predecessors and do not expire; state transitions
-  separately require a fresh exact unexpired authorization attempt with lifetime
-  greater than zero and at most 30 minutes. S3 and remaining S4 import this
-  substrate unchanged and do not create or widen it.
+  signature domain, append-only consumption ledger, checked-in Node verifier/
+  recorder/consumer, dedicated certificate-authenticated `NOINHERIT` evidence-
+  writer/consumer/transition principals, canonical transition-identity uniqueness,
+  the sole authoritative `disabled|provisional|active` enablement singleton
+  initialized to `disabled`, and append-only non-authoritative enablement-transition
+  audit. The bootstrap is not a graph node and creates no unsigned receipt. An
+  external lifecycle-valid Ed25519 signer records the empty-predecessor
+  `step0_retention_bridge` receipt through that substrate before S3 may proceed.
+  Once validly recorded, graph-node and required-evidence receipts are immutable
+  durable predecessors and do not expire; state transitions separately require a
+  fresh exact unexpired authorization attempt with lifetime greater than zero and
+  at most 30 minutes. S3 and remaining S4 import this substrate unchanged and do
+  not create or widen it.
 
 ### S3 — Filesystem grant recovery (deterministic, recoverable)
 
@@ -1072,10 +1198,17 @@ node; and any substitution of one graph, edge set, or evidence for the other.
 <a id="canonical-cross-slice-database-lock-order"></a>
 
 - **Canonical cross-slice database lock order.** The following JSON list is the
-  one normative row-family order for S3 and #179. Other documents and code import
-  its version; they do not maintain a shorter copy. A mutation acquires only the
+  normative design contract for S3-S6 delivery, review, and recovery mutations.
+  #178/S3 owns and materializes this exact object at
+  `web/lib/mcps/mcp-admission-lock-order-v2.json` and owns the one shared database
+  lock helper. Remaining S4 imports both and has no generator, local copy, or second
+  helper. All production path declarations import that one runtime manifest. A parity
+  sentinel compares its contract name, version, policy, and complete ordered
+  family list with this JSON, so neither copy can drift. Other prose references
+  the contract and does not maintain a shorter list. A mutation acquires only the
   families applicable to its state as an ordered subsequence. An absent optional
-  row is skipped, never used to justify moving a later family earlier.
+  row is skipped, never used to justify moving a later family earlier or acquiring
+  a synthetic filler row.
 
   ```json
   {
@@ -1117,7 +1250,7 @@ node; and any substitution of one graph, edge set, or evidence for the other.
 
   S3 normally stops after the fourth family and does not acquire the epoch row.
   #179 owns the remaining families, including authenticated worker/root-writer
-  instance rows and local-run-evidence/task-projection source rows. Candidate
+  instance rows and local-run-evidence/task-projection current-head rows. Candidate
   discovery may happen without retained package locks. After the project and
   complete affected-task set are locked, every transaction that may change task
   status expands to every sibling for those tasks **before its first package
@@ -1128,6 +1261,13 @@ node; and any substitution of one graph, edge set, or evidence for the other.
   full compare-and-set retry. Every later applicable family follows the checked-in
   order. Rows within one family use the stable key named above. No endpoint nests
   the project lock or performs Redis/network work in the transaction.
+
+  Namespace-reservation transitions are the explicitly disjoint root-lifecycle
+  path: a reservation is a terminal row after hierarchy, and no such transaction
+  then acquires a run or later delivery/recovery family. #179 selects every
+  applicable suffix through the S3-owned shared helper. Static checks reject a
+  reverse edge, undeclared acquisition, manifest/ADR mismatch, or second runtime
+  sequence.
 - **Bounded marker and JSON ownership.** The v2 filesystem marker remains outside
   `metadata.mcpBroker` and contains only structured filesystem kind/source, the
   exact canonical hold-state union arm above, normalized requirement keys/
@@ -1147,16 +1287,19 @@ node; and any substitution of one graph, edge set, or evidence for the other.
   requirements or error prose alone.
 - **One-time reapproval handoff to S4.** S3 never clears S4's
   `packet_issuance` marker in its project reconciler. After a package-local
-  reapproval rotates a fresh nonce under project → task → packages in ID order →
-  approval locks, it calls S4's package-scoped resolver in the same transaction.
+  reapproval appends a fresh decision/nonce under project → task → packages in ID
+  order → `grant-approval-decision-rows:id-ascending` (decisions then preallocated
+  `filesystem_mcp_current_decision_pointers`), compare-and-sets only that pointer,
+  and calls S4's package-scoped resolver in the same transaction. Concurrent
+  approval/deny/revoke/reapprove retains immutable prior decisions and one pointer
+  winner; old audits never resolve through the new pointer.
   Package scope limits grant evaluation; the caller prelocks every sibling for the
-  task-wide review barrier. The resolver continues through the applicable ordered
-  subsequence of the canonical version-2 list above. For this route that includes
-  the applicable authenticated worker/root-writer claim/recovery instances,
-  binding generation/rotation, hierarchy guard, prior run, local-run evidence and
-  the locked task-projection source set before any optional audit, ledger,
-  artifact, action, alert/resolution, or review-gate row. It proves generic
-  evidence, both repository-review fingerprints,
+  task-wide review barrier. The resolver continues through protocol epoch →
+  authenticated worker/recovery instances ascending → active binding generation/
+  rotation → hierarchy guard → prior run → generic local-run evidence and the
+  locked task projection current-head set → optional audit → host ledger/entries → all
+  artifacts → generic local/issuance actions → integrity alerts/resolutions →
+  review gates. It proves generic evidence, every repository-review fingerprint,
   host review, task projection, and any packet audit/artifact terminal tuple before
   verifying the exact `reapprove_allow_once` marker/fingerprint, changed nonce,
   current policy, inactive lease, and no sibling `awaiting_review`. It clears only
@@ -1231,14 +1374,40 @@ node; and any substitution of one graph, edge set, or evidence for the other.
   upgrades a legacy approval. After collision/unbound rows are held, install the
   protocol-v2 root barrier while every writer, ingress path, and packet producer
   remains disabled. Deploy #180's compatible S5 consumers and #181's disabled S6
-  controller/harness. Only an exact-build `s6_pre_activation_green` receipt allows
+  controller/harness; Step 0's pinned-signer, immutable durable-release-evidence/
+  short-lived-transition-authorization/consumption stores, checked-in Node verifier,
+  and dedicated principals are
+  already present and are only imported. Only an
+  exact-build durable `s6_pre_activation_green` receipt recorded under the locked
+  signature/domain/nonce/predecessor contract plus a separate exact signed
+  at-most-30-minute unexpired transition authorization allows
   #179's controlled activation to run exactly
   `npm run protocol:activate-work-package-v2 -- --actor <operator-id> --apply`.
   The binding command never advances the epoch, and activation commits with ingress/
   issuance disabled. Only #181's exact-epoch/build `s6_post_activation_green`
-  receipt allows #179 to enable registered S3/root writers and queue/project
-  ingress; packet issuance is enabled last in the same audited operation.
-  `s5_s6_release_ready` follows that enablement evidence. PostgreSQL triggers never
+  receipt allows #179 to open one exact database-time provisional window. That
+  operation atomically consumes the receipt, compare-and-sets the Step 0 singleton
+  from `disabled` to `provisional`, writes the exact owner/build/SHA/epoch,
+  `started_at`, deadline `started_at + interval '1560 seconds'`, exact controller
+  login/run/transition-authorization and the digest of the initial secret generated
+  and retained by that external controller before opening, and an at-most-45-second
+  database lease, then enables
+  registered S3/root writers and queue/project ingress, then packet issuance last.
+  It records but does not consume the separately signed, canonically unique
+  `ingress_and_issuance_enabled` receipt for final readiness. Every ingress/issuance
+  boundary gates on the exact overall deadline and live lease. The controller
+  heartbeats every 10 seconds using immutable `session_user`; failure changes the
+  same singleton to `disabled`, and lease expiry closes it within 45 seconds. The controller
+  then records separate signed
+  `enabled_build_tests_green` required evidence for the enabled build/epoch and
+  exact no-retry 660-second enabled-run DAG (60 seconds orchestration, 30 preflight,
+  five isolated suites concurrently within 420, 120 teardown/destruction/Checks,
+  30 evidence/final commit), leaving 900 seconds of deadline margin. One final transaction verifies the controller's
+  signed readiness envelope, atomically consumes both the enablement and enabled-
+  build receipts, appends the uniquely identified signed retained
+  `s5_s6_release_ready`, and promotes the same provisional owner to `active`; the required-
+  evidence kind is not an eleventh graph node.
+  PostgreSQL triggers never
   call or reimplement the S3 TypeScript reconciler. Rollback disables writers/new
   claims but retains schema and the dual reader; it does not guess or downgrade
   revisions or restart v1 services against v2 state. Remove v1 support only after
@@ -1283,8 +1452,10 @@ node; and any substitution of one graph, edge set, or evidence for the other.
   separate append-only short-lived `forge_epic_172_transition_authorizations`
   store in its distinct Ed25519 signature domain, consumption ledger, checked-in
   verifier/recorder/consumer, dedicated principals, canonical transition identity,
-  and disabled enablement singleton before its own receipt and S3. It validates the
-  first node's full Step 0 postconditions before S3. It
+  recorder, sole authoritative disabled enablement singleton, and append-only
+  enablement-transition audit before recording its signed first-node receipt; S3
+  and remaining S4 only import that substrate. It validates the first node's full
+  Step 0 postconditions before S3. It
   proves one shared node registry stores owner, required evidence, and exact build
   identity once; separately named `codeDependencyGraph` and `runtimeActivationGraph` edges
   preserve their fixed meanings; and only `runtimeActivationGraph` contains the complete
@@ -1322,24 +1493,47 @@ none of those slices may weaken this state, precedence, or lock contract.
 
 ### S4 — Prompt/context assembly and bounded-context packet evidence (builds on #43)
 
+Step 0 of issue #179 depends only on #176/#177. Every remaining S4 item below
+depends on #178/S3's decision, hold, reconciliation, and lock-manifest/helper
+contract. This split must match the per-step release manifest metadata above.
+
 - Specialist prompts receive only context whose owning decision either has
   `status:'allowed'` and mode `planning_only|bounded_context_approved`, or is the
   explicit pure-planning exception: `status:'warning'`, mode `planning_only`,
   `capabilityClasses.length > 0`, and **every** capability class `planning_only` (for example
-  `filesystem.project.write`, which is an instruction for Forge's sandbox JSON
-  path, not permission). No missing-context, unhealthy, deferred, unknown, or mixed
-  warning qualifies:
-  requirement-scoped `promptOverlay` entries, admitted `mcpAwareSubtasks`, and the
-  matching safe/planning `mcpRequirements` subset as **instructions**, never as tool grants (executor prompt
-  assembly around `work-package-executor.ts:1527-1583`). No live MCP handle is
-  ever issued. A subtask is emitted only when **every** per-capability binding is
+  `filesystem.project.write`, which would be an instruction for a future
+  confined execution JSON path, not permission). No missing-context, unhealthy, deferred, unknown, or mixed
+  warning qualifies. The runtime package contains only normalized policy/bindings
+  plus eligible references into the one ACL-protected versioned Architect plan
+  artifact; the task-bound internal resolver obtains requirement/overlay/subtask
+  text only after admission as **instructions**, never as tool grants (executor
+  prompt assembly around `work-package-executor.ts:1527-1583`). Raw
+  `promptOverlay`, `requirementContexts`, and `mcpAwareSubtasks` text is absent from
+  `work_packages.metadata` and normal APIs. No live MCP handle is ever issued. A
+  subtask is emitted only when **every** per-capability binding is
   eligible; if one binding is deferred, unknown, blocked, or otherwise
   non-deliverable, omit the entire Architect-authored subtask text so a mixed
   subtask cannot smuggle the disallowed instruction through an allowed binding.
+- **Architect source/history boundary.** The `artifacts` row is a non-text version
+  header; append-only `architect_plan_entries` is the only text-bearing store and
+  uses the exact task/version-scoped IDs, NFC/RFC-8785 canonical bytes,
+  domain-separated keyed digest, deterministic legacy mapping, and immutability
+  guards defined above. S4 creates the task-bound history route plus append-only
+  bounded read audit. Generic task/package/artifact APIs, logs/exports, queues,
+  diagnostics/errors, live events, SSE snapshots/replay, and both Redis event
+  namespaces expose no plan text or locator. Raw `run:chunk`/delta and plan
+  `artifact:created` producers are deleted. The task-bound resolver alone may put
+  one eligible verified fragment ephemerally into one executor/provider/ACP
+  request; the whole row and rejected/ineligible fragments never enter either
+  wire or persistence. Before `s4_producers_disabled`, revoke/drain legacy Redis
+  publishers/subscribers, purge all `forge:task:{taskId}:history`/`:seq` keys,
+  rotate to schema-allowlisted `forge:task-events:v2:{taskId}:history`/`:seq`, and
+  prove zero old keys plus zero seeded text/locator values. TTL expiry is not
+  erasure.
 - **Security boundary: MCP-channel admission is not an ACP sandbox.** An Agent
   Client Protocol (ACP) adapter is a local process and Forge explicitly does not
-  OS-confine it (`FORGE_ACP_WORK_PACKAGE_EXECUTION=1` is operator acceptance of
-  that risk). It may inherit `HOME`, `CODEX_HOME`, `PATH`, and XDG configuration,
+  OS-confine it. The reserved `FORGE_ACP_WORK_PACKAGE_EXECUTION` setting cannot
+  enable the currently unavailable specialist path. It may inherit `HOME`, `CODEX_HOME`, `PATH`, and XDG configuration,
   and prompt instructions cannot prevent shell, network, or credential access.
   Therefore `deferred_live_mcp`, “no live MCP handle”, and the S5 badges describe
   only capabilities issued through Forge's MCP channel; they must not claim that
@@ -1348,8 +1542,8 @@ none of those slices may weaken this state, precedence, or lock contract.
   text for every deferred, unknown, blocked, or non-deliverable warning decision—not only its
   structured capability name—from the executable prompt (retaining only a static,
   Forge-authored boundary warning), and S5 displays
-  “MCP access deferred — ACP runtimes are not a security sandbox” wherever ACP
-  execution is enabled. Real process/network/credential/filesystem isolation is a
+  “MCP access deferred — ACP runtimes are not a security sandbox” wherever a
+  future ACP execution surface is enabled. Real process/network/credential/filesystem isolation is a
   prerequisite of any later security-bound capability guarantee and remains in
   the #40/#60 security epic. Tests prove that no deferred tool is issued or
   rendered as an allowed MCP instruction. A positive fixture proves a pure
@@ -1358,85 +1552,980 @@ none of those slices may weaken this state, precedence, or lock contract.
   merge through `gh`; the executable prompt contains the static warning but none
   of that overlay/subtask/requirement text. Tests do not mislabel prompt compliance
   as OS-level enforcement.
-- **Prompt-injection boundary.** Forge's immutable system message states that
-  bounded packet contents are untrusted data and that requirement overlays are
-  subordinate run instructions; neither can override tool, credential, repository,
-  or admission policy. Serialize each section as length-bounded JSON with explicit
+- **Prompt-injection boundary.** For providers that preserve roles, Forge's actual
+  system-role wire input states that bounded packet contents are untrusted data and
+  requirement overlays are subordinate run instructions; tests capture that real
+  role separation. The current ACP adapter flattens all roles into one
+  `session/prompt` string, so it receives a bounded Forge-authored guidance section
+  before quoted data and makes no immutable-role or enforcement claim. Serialize
+  each section as length-bounded JSON with explicit
   `{kind, requirementKey, content}` fields rather than concatenating raw delimiter
   text; reject/escape invalid encoding and truncate only at documented boundaries.
-  Re-assert the immutable policy after the serialized context. Adversarial tests
-  include a repository file and an allowed overlay containing fake system markers,
+  A Forge-authored reminder may appear after serialized user-role context to aid
+  model attention, but that reminder is not immutable and is not an enforcement
+  boundary. Adversarial tests assert actual system/user role separation only for
+  adapters that preserve it; the ACP fake asserts the flattened wire representation and
+  includes a repository file and an allowed overlay containing fake system markers,
   closing fences, and instructions to use `gh`/read credentials; the bytes remain
-  quoted data and do not alter the issued tool surface or policy section.
-- **Atomic one-time issuance claim.** Every operator approval generates a new
-  immutable `grantDecisionNonce` (UUID) even though the existing
-  `filesystem_mcp_grant_approvals` row is upserted by `work_package_id`; persist the
-  nonce in the approval row and effective-grant snapshot. Reapproval must replace
-  the nonce, so it represents a new issuable decision without reusing the burned
-  issuance key. Before assembling or exposing a packet for an `allow_once` grant,
-  S4 follows the applicable ordered subsequence of the canonical version-2 lock
-  list above. It locks project, task, work package, and grant approval first, then
-  every applicable epoch, authenticated worker/root-writer instance, binding-
-  generation, hierarchy, run, and local-run-evidence/task-projection source family
-  before the runtime-audit claim. It verifies the effective grant and nonce are still
-  approved/unconsumed, inserts a `filesystem_mcp_runtime_audits` claim keyed
-  uniquely by `(grantApprovalId, grantDecisionNonce)` for
-  `operation:'context_packet'`, and marks the grant consumed with an approved-state
-  compare-and-set. Add the matching partial unique index in the SQL migration and
-  `web/db/schema.ts`. Grant/reapproval endpoints use the identical lock order before
-  rotating the nonce. Only the winning claim may assemble/deliver the packet;
-  duplicate cooperative workers block before reading packet contents. The hard
-  guarantee is one winning claim per decision nonce: a crash after the claim burns
-  that nonce, records the audit as failed on recovery, and requires explicit
-  reapproval. Claims persist `{status:'claiming', claimToken,
-  claimedByAgentRunId, leaseExpiresAt}`. S4 owns
-  `reconcileStaleFilesystemIssuanceClaims(now)`, invoked at worker startup and by
-  the periodic recovery sweep; it locks expired `claiming` rows with `FOR UPDATE
-  SKIP LOCKED`, marks them `failed` with a crash/lease-expired reason, and never
-  reopens the same nonce. `claimToken` is a fencing token, not audit decoration:
-  the owner heartbeats/renews the lease with an ownership compare-and-set during
-  assembly; immediately before every packet-content read, prompt exposure/submission,
-  and finalization it must atomically verify
-  `(status='claiming', claimToken, claimedByAgentRunId, leaseExpiresAt > now)`.
-  Finalization also compares that tuple. The reconciler's `claiming → failed`
-  transition invalidates the token, so an expired/stale worker cannot begin a new
-  Forge-governed read or persist/finalize after recovery. This is database/audit
-  fencing, not revocation of bytes already in process memory or cancellation of an
-  in-flight ACP submission: a lease can expire after the final check and external
-  I/O is not atomic with PostgreSQL. The beta therefore promises one winning claim
-  and best-effort at-most-once delivery by cooperative workers, not cryptographic
-  exactly-once disclosure. Hard revocation/idempotent external submission requires
-  a cancellable fenced delivery broker in the later #40/#60 security epic, and UI/
-  operator copy must preserve this boundary. Immediately after assembly and **before any exposure**,
-  the owner CAS-persists the immutable packet metadata snapshot on the audit claim
-  under the fencing token. That snapshot is a discriminated union:
-  `{packetAssembled:true, root, includedCount, byteCount, omittedCount,
-  redactionSummary}` or, when assembly never completed,
-  `{packetAssembled:false, failureStage, reason}`. Recovery/finalization upserts the
-  run artifact from this durable snapshot; it never re-reads or reassembles a burned
-  one-time packet and never invents zero counts. A crash after assembly but before
-  artifact creation therefore still produces truthful failed-run evidence, while a
-  pre-assembly crash is explicitly represented as no packet assembled. A later explicit approval rotates the nonce and creates a
-  new claim. The packet-metadata artifact upsert is tied to the winning
-  `agentRunId`; success and failure finalization are idempotent. Tests race two
-  workers, race claim versus reapproval, race a delayed live worker against lease
-  expiry/reconciliation, restart after an expired claim, and inject failures before assembly, after
-  assembly, and after prompt submission, proving one claim/packet per decision nonce
-  at most, successful explicit reapproval with a fresh nonce, no deadlock, and an
-  auditable recovery state. The delayed-worker test asserts that a stale token
-  cannot start a subsequent governed read or write/finalize state; it does not make
-  the unrealizable claim that PostgreSQL can recall an already-started ACP request.
+  quoted data and do not alter the issued MCP surface. S4 explicitly removes all
+  current `frontMatter.prompt` producers (normal, no-command, stderr-warning, no-op
+  handoff start, and no-op handoff completion) and downstream aliases. A
+  repository-wide source sentinel rejects `prompt`, `promptInput`, `promptOverlay`,
+  and equivalent executable-prompt keys at every task-log/front-matter producer
+  outside its one denylist fixture. A producer allowlist permits only a versioned domain-
+  separated keyed digest, byte count, section counts, and omission counters.
+  Task/debug logs, exports, APIs, server-sent events, diagnostics, errors, and
+  generic front matter never retain prompt/packet bytes, names, paths, rejected
+  Architect text, or credential-like content; there is no assumed pre-existing
+  sanitization path. Before writer drain, one historical task-log compatibility
+  reader recursively removes every key in the shared closed
+  `LEGACY_TASK_LOG_PROMPT_KEYS` tuple—`prompt`, `promptInput`, `promptOverlay`,
+  `systemPrompt`, `userPrompt`, `sessionPrompt`, `executablePrompt`, `messages`,
+  and snake-case spellings—at every object depth. It hides the whole value whether
+  string, object, array, nested message list, or malformed, returns only a safe
+  versioned event/count/time allowlist, and maps an unknown container to static
+  `legacy_task_log_unavailable`; DB-facing history/API/export/SSE/diagnostic readers
+  cannot parse the raw column independently. Compatible readers suppress every legacy unkeyed `sha256`
+  prompt snapshot from DB/API/export/event/diagnostic output, exposing at most
+  count-only `{kind:'unknown_legacy_digest',byteCount}`. After old writer
+  credentials/sessions drain, a checkpointed S4 migration deletes the old digest
+  or rewrites it to that count-only arm. It cannot re-key without plaintext and
+  may never treat the public digest as keyed material. That arm or absence is the
+  complete legacy output vocabulary: `legacyDigestSuppressed`, truncation flags,
+  digest prefixes/surrogates, and combined boolean/count shapes are forbidden.
+  After old database/Redis writer credentials and sessions drain, a bounded
+  primary-key-checkpointed scrub records operation/last key/counts/pre/post row
+  fingerprints/state/actor/database time, recursively deletes all closed aliases
+  and unkeyed digests, and compare-and-sets the original fingerprint. Crash/resume
+  is idempotent, a pre-commit rollback changes nothing, a concurrent mismatch
+  pauses, and committed sanitized rows are never reconstructed. Completion scans
+  DB plus API/export/live-SSE/snapshot/replay for zero aliases at any depth and zero
+  seeded prompt bytes.
+- **Every packet has an atomic run claim; `allow_once` adds a decision fence.** S3
+  assigns a project-serialized `grantDecisionRevision` to every package/project
+  filesystem decision. Every packet run has one claim unique on
+  `(agentRunId, operation)` for protocol-v2 `operation:'context_packet'`. A package
+  `allow_once` decision also has an immutable UUID `grantDecisionNonce`, rotated by
+  explicit reapproval, and an additional unique claim on
+  `(grantApprovalId, grantDecisionNonce, operation)` where the nonce is non-null.
+  `filesystem_mcp_grant_approvals` is append-only: approve/deny/revoke/reapprove
+  inserts a new immutable decision with a strictly greater project-serialized
+  positive revision and, for `allow_once`, a fresh nonce. The migration explicitly
+  drops/replaces the current history table's package-unique index; package
+  uniqueness moves to the preallocated package-keyed
+  `filesystem_mcp_current_decision_pointers` stores only current decision ID/
+  revision/fingerprint and positive generation. Under canonical lock family
+  `grant-approval-decision-rows:id-ascending`, writers lock decision rows then the
+  pointer and compare-and-set the exact prior tuple; decisions and pointer commit
+  or roll back together. Project `always_allow` likewise uses append-only
+  `project_filesystem_grant_decisions` plus one project CAS pointer. No route
+  updates/deletes a decision, and old audits keep their exact parent while new
+  claims must match the locked pointer/root binding.
+  Project `always_allow` claims have no nonce or package approval FK; they snapshot
+  the exact already-locked project configuration decision revision, root-binding
+  revision, covered capabilities, actor/time, and coverage fingerprint. Each claim stores immutable actor,
+  decision time/revision, mode, required/approved capability sets, and a canonical
+  policy fingerprint plus the locked root-binding revision so later approval-row
+  or project-path updates cannot rewrite history. Old-root decisions are revoked
+  and require explicit reapproval. Authoritative
+  `authorization_snapshot JSONB NOT NULL` is a closed two-arm union. Its only
+  scalar relational mirrors are source, mode, approval ID, decision revision,
+  decision nonce, and root-binding revision. Schema-qualified, fixed-search-path
+  `IMMUTABLE` `forge.validate_packet_authorization_snapshot_v2(...)` rejects
+  malformed/unknown/over-limit JSON and requires
+  exact canonical equality between every mirrored JSON/scalar field. It validates
+  already-canonical JSONB and therefore does not claim to detect duplicate object
+  keys after a JSONB cast. Every raw legacy/external UTF-8 text ingress first runs a
+  duplicate-key-aware streaming parser before `JSON.parse`, PostgreSQL `json`, or
+  JSONB conversion; a retained legacy JSONB value with no original raw bytes is
+  `unknown_legacy`, never newly trusted authority. An update
+  guard makes snapshot and mirrors immutable while lifecycle fields terminalize.
+
+  Protocol-v2 `task_id`, `work_package_id`, `agent_run_id`, and
+  `local_run_evidence_id` are independently non-null and exactly equal to the
+  locked audit/run/local-evidence identity. This CHECK precedes the composite
+  `MATCH SIMPLE` FK and partial unique indexes, so null cannot bypass either.
+  Direct table DML is denied. Only the schema-qualified fixed-search-path
+  `forge.insert_packet_authorization_snapshot_v2(...)` function may insert: it
+  accepts typed relational IDs/enums, locks and revalidates the rows, constructs
+  canonical JSONB and scalar mirrors itself, and accepts no JSON/text authority
+  input.
+
+  The package writer locks the matching
+  `filesystem_mcp_current_decision_pointers` row after the decision rows and proves
+  its ID/revision/fingerprint parent. The project arm locks the project pointer and
+  retains a composite reference to
+  `project_filesystem_grant_decisions(project_id,grantDecisionRevision)`. Database
+  guards reject decision update/delete or a mismatched pointer target.
+
+  `package_allow_once` requires `grantMode:'allow_once'`, non-null approval/nonce,
+  and a composite child key
+  `(grantApprovalId,taskId,workPackageId,grantDecisionRevision,
+  grantDecisionNonce)` referencing the retained immutable approval's matching
+  unique key with exact `ON DELETE RESTRICT` and `ON UPDATE RESTRICT`.
+  `project_always_allow` requires `grantMode:'always_allow'` and null approval/
+  nonce, so it does not manufacture package authority. SQL validator/CHECK/FK,
+  Drizzle parsing, task/project/artifact APIs, and S5 share one two-row fixture
+  table and reject every other source × mode × FK-nullability × nonce-nullability
+  cross-product, every JSON/scalar mismatch, and otherwise valid cross-package,
+  cross-task, or cross-project approval substitution. Task-scoped and project-
+  detail always-allow readers call the same canonical locked project-decision
+  loader and return byte-equivalent revision/root/capability/fingerprint fields.
+
+  Structured serialization reuses the producer ceilings (20 requirements, 40
+  subtasks, 2,000 characters per overlay), caps the full executable MCP JSON block
+  at 128 KiB, and omits only whole documented optional fields. Packet assembly keeps
+  the current 50-file, 160 KiB total, 24 KiB-per-file, depth-6, 500-entry, and
+  5,000-traversal ceilings. Typed evidence also bounds `rootRef` to 80 ASCII
+  characters. `PacketRedactionCategory` is the closed literal union
+  `private_key_blocks|authorization_bearer|docker_auth|netrc_credentials|
+  pgpass_credentials|secret_like_assignments|structured_secret_keys|database_urls|
+  url_userinfo|well_known_token_prefixes|cloud_api_tokens|jwt`;
+  `PacketRedactionSummary` is a partial record over only those keys, at most once
+  each, with integer counts `0..5,000`. Artifact text is capped at 16 KiB.
+  Packet-owned evidence has no arbitrary
+  failure-detail field; it is enum-only.
+
+  One exported `PACKET_REDACTION_CATEGORIES` array owns this union. The S4 producer,
+  schema-qualified database JSON validator, Drizzle parser, finalizer/repair, API
+  serializer, S5 presenter, and parity fixtures import it. Unknown/duplicate
+  semantic keys, non-object summaries, and out-of-bound counts fail before commit
+  or rendering; no layer sanitizes or echoes an unknown key. Configured-pattern
+  lists and arbitrary producer strings are not packet evidence.
+
+  Extend the existing package claim transaction instead of creating a second run
+  lifecycle. Every S4 transaction imports #178/S3's
+  `web/lib/mcps/mcp-admission-lock-order-v2.json` through #178/S3's shared helper,
+  declares its applicable rows, and acquires that ordered subsequence. A package
+  claim therefore uses the applicable project/task/package/decision prefix and the
+  applicable epoch/instance/binding/hierarchy/run/evidence/audit/ledger/artifact/
+  action/integrity/review tail; absent audit, packet, or review rows are omitted
+  rather than locked synthetically. Namespace reservations remain in the disjoint
+  root-lifecycle family and are never synthetic claim locks. One shared package-claim
+  primitive locks project, task, and every sibling package in stable order,
+  recomputes dependencies/candidate eligibility, rejects an archived project,
+  proves no sibling is running/leased or `awaiting_review`, then locks the epoch,
+  connection-authenticated instance, active binding generation/rotation, hierarchy
+  guard, and exact sibling run/evidence/review current-head set. Projection input is
+  the closed shared `CURRENT_LOCAL_PROJECTION_HEAD_KINDS` list with exactly eight
+  preallocated current-authority heads per protocol-v2 package, never the growing
+  append-only history tail. Each transition appends immutable history outside the
+  cap, then count-neutrally advances the applicable head with exact source FK,
+  positive revision, fingerprint, and compare-and-set identity. One PostgreSQL
+  aggregate must reproduce the task's versioned zero/null local-change projection
+  from at most 256 sibling packages; at exactly 256 it reads 2,048 fixed heads.
+  The canonical lock family is
+  `local-run-evidence-task-projection-heads:id-ascending`. Task package 257 enters
+  typed `local_projection_package_limit` and moves the whole legacy task through
+  authoritative `active|archive_pending|legacy_archived`. Packages/evidence are
+  never reparented, split in place, or deleted. A separately planned replacement
+  has new IDs, at most 256 packages, and all eight heads each. It also stores exact
+  source-task ID, `pending|eligible|cancelled` replacement state, positive version,
+  and source/replacement fingerprint. It starts pending, and every claim/wake/
+  ingress/root-mutation gate rejects it before I/O. The exact read-only
+  inspect, archive dry-run/apply, and guide are:
+
+  ```text
+  npm run protocol:inspect-local-projection-overlimit -- --task <legacy-task-id>
+  npm run protocol:archive-local-projection-overlimit -- --task <legacy-task-id> --replacement <replacement-task-id> --actor <operator-id>
+  npm run protocol:archive-local-projection-overlimit -- --task <legacy-task-id> --replacement <replacement-task-id> --actor <operator-id> --apply
+  docs/operators/local-projection-overlimit-archive-v2.md
+  ```
+
+  Apply records source/replacement fingerprints and bounded
+  `validated|quiesced|archived` checkpoints, rejects live claims/reviews and an
+  over-limit replacement, locks source/replacement tasks in ID order followed by
+  all package/head rows in ID order, closes ingress, and resumes idempotently. Before final
+  CAS, rollback may restore `archive_pending → active` while retaining the hold;
+  final archive preserves every source relationship and atomically changes source
+  `archive_pending → legacy_archived` plus replacement `pending → eligible` under
+  exact versions/fingerprints. Rollback leaves replacement pending; cancellation
+  retains its evidence. No path truncates history. Immediate source triggers increment a
+  transaction-local per-task mutation generation. Deferred constraints assert once
+  for each final `{taskId,mutationGeneration}` through a transaction-local dedup map;
+  later DML increments the generation and re-arms the check. Application roles lack
+  projection-column DML, and a guard permits updates only from the dedicated non-
+  login owner of the fixed-search-path SECURITY DEFINER aggregate writer, so direct
+  DML cannot borrow dedup state. Missing, stale, wrong-version, over-cap, or
+  mismatched state—including a coherent-looking stale zero—is an integrity hold.
+  The release-pinned PostgreSQL 16 maximum-cardinality benchmark runs 1,000 warmed
+  validations excluding deliberate lock wait and requires p95 <= 40 ms and p99 <=
+  100 ms. It sets transaction-local
+  protocol 2, and
+  claims exactly one package. This
+  applies to packet-bearing, packet-free, and handoff-only execution. A
+  packet-bearing transaction then creates the agent
+  run and existing execution lease plus one generic local-run evidence row before
+  any repository read, inserts the packet claim referencing that row and authorization
+  snapshot, and—only for `allow_once`—consumes the exact nonce. Any failure rolls all
+  of those writes and the attempt back. A local-root run needing no packet creates
+  no packet audit/artifact but still creates generic effect/repository evidence;
+  only a truly root-free/no-effect handoff omits both.
+
+  Mixed-worker cutover uses a durable database barrier. A singleton
+  `forge_runtime_protocol_epochs` row starts with the work-package execution
+  minimum at 1 and no active host. It also has nullable active host, minimum root-
+  management protocol, host-fence-service/containment-adapter versions, and active
+  host-binding-key fingerprint. An expand-phase PostgreSQL trigger runs on the existing package
+  transition to `running`, reads transaction-local worker protocol (`1` when absent
+  for legacy binaries), takes a shared epoch lock, rejects a lower writer, and
+  records `work_packages.claim_protocol_version`. At epoch 1 it rejects protocol-2
+  claims in packet, packet-free, and handoff modes; v2 processes remain
+  `candidate`. At epoch 2 it also requires a
+  transaction-local worker-instance ID, locks that exact registry row after the
+  epoch, and verifies active/fresh state, host, protocol, fence/containment
+  versions, active binding generation, and binding-key fingerprint. Each process
+  incarnation has a never-reused, independently revocable `NOINHERIT` PostgreSQL
+  login/certificate principal; the trigger requires `current_user` to equal the
+  named row. A caller GUC/shared credential generation cannot authenticate it. It
+  pins the instance on the package/run; caller-supplied host/version strings cannot substitute. The shared claim sets
+  protocol and the registered instance ID locally. That transition is the pre-read
+  boundary every current executor traverses; an audit-insert trigger would be too
+  late. Activation is a privileged maintenance action using `READ COMMITTED`:
+  statement one locks the epoch exclusively; statement two, after any lock wait,
+  uses a fresh command snapshot and aborts if any running package has
+  null/protocol-1 evidence, unbound live project, or any worker/root-writer
+  capability/heartbeat/drain row violates the single-active-host/key rule;
+  statement three atomically advances to 2, flips the active binding-generation
+  pointer, promotes only the audited candidates to `active` (a hard maximum of 64), and audits the exact
+  package/project/instance/principal snapshot. Queue/root/project ingress remains
+  disabled until commit. A v1
+  shared-lock winner commits and forces activation to abort; activation winning
+  first rejects the later v1 transition. Single-statement or pre-wait snapshots
+  are forbidden. Activation updates only the bounded epoch/candidate set in
+  epoch → instance order, so it cannot reverse entity locks, and the epoch is never lowered. This fences Forge's
+  cooperative packet producer, not independent ACP host access.
+
+  Initial protocol-v2 local-root execution is single-active-host. Every worker and
+  web/root-management process has a typed durable
+  `candidate|active|draining|drained|retired`
+  capability/heartbeat registration
+  containing its operator-controlled stable host ID, maximum worker/root-writer
+  protocol, fence-service/containment versions, binding-key fingerprint, dedicated
+  database principal, last-seen time, and drain state. Activation additionally
+  requires one distinct fresh candidate host, equal key fingerprint and compatible
+  capabilities/principals for every selected instance, and audited drain evidence
+  for every stale, legacy, incompatible,
+  divergent-key, or other-host
+  row. Candidate/active instances heartbeat every 10 seconds and are fresh for 30 seconds by
+  PostgreSQL time; older non-drained rows block. Activation pins the one host and
+  minimum service/adapter versions and key fingerprint on the epoch row. Its immutable audit snapshots that
+  exact set. Missing/unreachable evidence
+  blocks activation. Multi-host local effects require a later host-affine routing
+  architecture; the package/root-mutation triggers reject a later unregistered,
+  revoked-principal, stale, draining, divergent-key, or other-host process—and any
+  caller naming another good row—before repository access. Drain revokes the exact
+  principal and terminates all its sessions before acknowledgement; IDs/principals
+  are never reused.
+
+  A database unique constraint covers normalized `database_principal` and the
+  never-reused incarnation ID. Process principals receive no direct registry
+  `INSERT|UPDATE|DELETE`. Operator/bootstrap code owns immutable identity,
+  capability, host/key/generation, and lifecycle state. A `SECURITY DEFINER`
+  `forge_heartbeat_current_instance()` owned by a non-login role, with fixed
+  `pg_catalog, forge` search path and `PUBLIC` execution revoked, derives exactly
+  one row from immutable `session_user` (not the definer-valued `current_user`). It
+  locks epoch → exact instance → applicable binding generation/rotation, then
+  revalidates the epoch pointer, principal, lifecycle state, and active-or-pending
+  generation/token before compare-and-setting only `last_seen_at` for an allowed
+  `candidate|active` row. An
+  exact pending K2 candidate may attest only its rotation-bound pending generation;
+  that heartbeat grants no claim or root-mutation authority. The function cannot
+  register, promote, revive, or cross rows. Process roles are non-superuser and
+  cannot change session authorization. Drain revokes heartbeat/claim access and
+  terminates sessions before acknowledgement.
+
+  Epoch 2 uses a separate, checked-in ongoing membership command; initial
+  activation is never replayed for restart. The Release/DevOps maintenance
+  principal disables the affected queue/root ingress, provisions a never-reused
+  same-host/current-generation candidate, locks epoch then old/new instances
+  ascending, proves old-principal revocation/session termination and drain or W2
+  eligibility, and atomically writes one append-only membership audit while
+  promoting a bounded replacement set (still at most 64). Root-writer replacement
+  keeps the old writer `draining` until external fences are held, then atomically
+  transfers each exact pinned reservation and maintenance intent to the new writer
+  or to `cleanup_required`; a durable takeover ledger binds old/new instance,
+  credential generation, object identity, and outcome. Ingress stays disabled
+  throughout, and a normal writer cannot transfer its own pins. Failure leaves the
+  new row candidate and ingress disabled; it never revives the old principal. A
+  separately provisioned standby W2 can therefore be promoted when W1—or every
+  active worker—has died, after which the normal W2 election still owns the run.
+  Candidate credentials expire after a bounded database-time provisioning window;
+  at most 64 unpromoted candidates per host/generation retain live credentials.
+  Expired/rolled-back candidates and drained instances follow revoke → terminate
+  sessions → retire → certificate destruction/login drop. A restartable GC handles
+  at most 64 tombstoned identities per transaction only after proving no membership,
+  recovery ownership, transition pin, role ownership/grant, or session remains;
+  immutable instance/principal/certificate fingerprints and destroy/drop evidence
+  remain append-only and identities are never reused. A locked installation-wide
+  budget has a hard maximum of 256 undestroyed credential-resource slots (operators
+  may configure less): every candidate and retired login/certificate counts, as does
+  one pre-reserved retirement slot for each active principal. Promotion/retirement
+  transfer slots instead of exceeding the cap. At the cap, the transaction writes/
+  rereads one deduplicated `worker_principal_lifecycle_capacity_exhausted` alert and
+  rejects new provisioning or any activation/replacement without reserved slots;
+  revoke, drain, count-neutral recovery, and GC remain available. Only verified
+  certificate destruction and login drop release capacity. Hard-bounded candidate/
+  retirement backlog blocks provisioning. The exact commands and guides are:
+
+  ```text
+  npm run protocol:replace-work-package-instance -- --candidate <new-instance-id> --replaces <old-instance-id> --actor <operator-id>
+  npm run protocol:replace-work-package-instance -- --candidate <new-instance-id> --replaces <old-instance-id> --actor <operator-id> --apply
+  docs/operators/work-package-instance-replacement-v2.md
+  npm run protocol:gc-work-package-principals -- --actor <operator-id>
+  npm run protocol:gc-work-package-principals -- --actor <operator-id> --apply
+  docs/operators/work-package-principal-lifecycle-v2.md
+  ```
+
+  Release Step 0 is a separately landable bridge before #178/S3 and before any S4
+  expansion schema that retains project evidence. It replaces the legacy
+  filesystem-first hard-delete route with archive-or-reject behavior, disables all
+  project-management create/update/repoint/archive/delete ingress, drains all
+  older routes and sessions, removes
+  cascading project foreign keys in favor of retention-safe `RESTRICT|NO ACTION`,
+  and installs a database hard-delete guard. Only then may the project-root journal
+  and retained evidence schema expand. The project-root trigger is enabled only
+  inside the post-drain cutover window,
+  after v1 project ingress/credentials/sessions are disabled and S3's canonical
+  TypeScript reconciler has processed every row in the expand-phase monotonic
+  project-root change journal through a post-session-termination drain watermark.
+  A simple PostgreSQL row trigger journals the closed
+  `insert|root_update|archive` outcome vocabulary
+  without paths, TypeScript calls, or reverse locks; hard delete is already
+  impossible. Gaps or unprocessed outcomes block binding/activation. The root trigger never
+  calls or duplicates S3. While epoch 1 it rejects root-bearing mutation and hard
+  delete. At epoch 2 it covers root-bearing insert, root/path/revision/maintenance/
+  archive update, and hard delete. A rootless insert is allowed only when every
+  local binding/maintenance field remains null/none; attaching a root later uses
+  the full protocol. Hard delete is rejected; every governed mutation requires protocol 2, a fresh exact
+  registered root-writer instance whose dedicated principal equals `current_user`,
+  host/key/active-generation equality, and a maintenance/reservation token plus the
+  active root-writer database-credential generation. Activation's fresh statement-two snapshot
+  therefore serializes with stale web writers. Old web/root processes already past
+  the trigger must be drained; rollback never restores them. The host binding key
+  is operator-controlled secret material and only its fingerprint is stored.
+  Backup is mandatory. Loss/rotation uses a privileged two-phase row/token with
+  active K1 and pending K2: disable ingress/issuance, revoke the old credential,
+  drain and prove all claims/effects/reservations empty and all K1 task projections,
+  local/packet markers, reviews, integrity holds, and terminal evidence coherent,
+  then write restartable
+  owner-level K2 generation/shadow rows under old/new hierarchy fences. Each shadow
+  stores owner/source revision/K1 generation, K2 full/ancestor references, and
+  verification fingerprint. After bounded complete-set verification, one constant-
+  size transaction flips only the epoch's active generation/key/credential pointer,
+  rotation status, and a hard-bounded authenticated K2 candidate set; it rewrites
+  no owner row. Every reader/constraint resolves
+  exactly that generation. Normal writers cannot cross keys; pre-promotion crash
+  resumes/discards inactive shadows in bounded batches, while post-promotion
+  recovery keeps K2 authoritative and cleans K1 later. Root revisions/decisions
+  remain unchanged only when physical identity matches. Silent replacement is
+  forbidden. Operators use only these literal checked-in commands and guide:
+
+  ```text
+  npm run protocol:rotate-host-binding-key-v2 -- --pending-key-ref <opaque-secret-ref> --actor <operator-id>
+  npm run protocol:rotate-host-binding-key-v2 -- --pending-key-ref <opaque-secret-ref> --actor <operator-id> --apply
+  npm run protocol:inspect-host-binding-key-rotation-v2 -- --rotation <rotation-id>
+  npm run protocol:rotate-host-binding-key-v2 -- --rotation <rotation-id> --discard --actor <operator-id> --apply
+  docs/operators/host-binding-key-rotation-v2.md
+  ```
+
+  Because an old DELETE route can touch the filesystem before its database write,
+  cutover disables project-management ingress, revokes the v1 web database
+  role/credential and terminates its sessions, drains/disables old service units,
+  activates a new root-writer credential generation, then enables ingress only to
+  the exact registered v2 owner. A restarted old binary cannot authenticate/read a
+  project path before filesystem work. The audit binds all of this evidence. This
+  governs Forge services, not unrelated processes with direct host access.
+
+  The generic local-evidence lease is subordinate to the execution lease; packet
+  audit ownership is an optional third predicate. One database-time heartbeat
+  compare-and-sets execution plus generic ownership and the packet lease only when
+  `packetAuditId` exists. Every heartbeat first locks the protocol epoch and exact
+  run/package-pinned instance, then revalidates epoch 2, active host/key/generation,
+  instance ID/state/freshness, and `current_user === database_principal`. The generic row stores live claim token/expiry separately
+  from W2 recovery token/expiry; neither credential substitutes for or refreshes
+  the other. Every governed repository read, assembly transition/read, prompt
+  exposure, ACP submission, post-response local stage, per-file host replacement,
+  and live or recovery finalization locks and revalidates the epoch → exact pinned
+  live/recovery instance → `current_user` prefix before verifying the execution
+  lease and generic evidence token/lease/nonterminal state. Packet runs additionally verify the exact linked claiming
+  audit token/run/lease; packet-free/handoff runs never fabricate it. A truly root-
+  free/no-effect handoff is the only arm without generic evidence. An
+  `always_allow` boundary also reruns the
+  canonical S1 `readEffectiveGrantState` and requires `phase:'approved'`,
+  `source:'project-level'`, and `grantMode:'always_allow'`; the locked project
+  decision supplies the revision/coverage stored under snapshot source
+  `project_always_allow`. An equal/newer package denial therefore still wins.
+  Revocation or override stops
+  a later Forge-governed boundary but cannot recall bytes or cancel external I/O
+  already started. Execution, generic, packet, and W2 tokens are database-only;
+  they never enter ACP, the bounded exchange, post-claim queue payloads, logs,
+  APIs, server-sent events, exports, diagnostics, errors, or artifacts. A copied
+  still-live token used under another dedicated principal therefore fails before
+  renewal, read, assembly, exposure, or finalization.
+
+  Packet-free/handoff local execution has its own durable generic invocation
+  intent: `not_started|invoking|returned|definitive_not_started|uncertain`, with a
+  random attempt ID and database timestamps. The owner compare-and-sets
+  `not_started → invoking` before any ACP input/output operation. Only the same
+  still-live exact owner/attempt may compare-and-set
+  `invoking → definitive_not_started`, and only from a trusted typed
+  `pre_io_refusal` proving no adapter child, serialization, socket/network write,
+  credential use, or repository operation began. Restart never resumes `invoking`
+  as a fresh call: orphan/stale recovery always records `uncertain` and can never
+  infer `definitive_not_started`; a live durable return records `returned`. Uncertain/returned work
+  requires explicit local acknowledgement before retry; ordinary decline remains
+  available without coercing that acknowledgement.
+
+  Under every resource fence, the first governed repository read persists three
+  versioned opaque baselines in the generic local-run record. The bounded working-
+  tree scanner detects tracked, ignored, untracked, renamed, and deleted changes;
+  it uses `lstat`, never follows links or opens FIFO/socket/device entries, and
+  reads content only from regular files. A separate bounded Git-control snapshot
+  covers resolved gitdir/common-dir config, hooks, `HEAD`/refs, index, worktree
+  administration, submodule control, packed refs/reflogs, replace/grafts, shallow,
+  maintenance, and alternates. A third Git-storage snapshot covers loose objects,
+  packs/indexes/MIDX, commit graph, alternate stores, and every object-resolution/
+  integrity file; additions of unreachable objects count as change. Git discovery
+  runs through a sterile checked-in environment builder (`env -i`, fixed protected
+  `HOME`/XDG directories, system/global config disabled, and Git path/config/object
+  environment variables cleared). The one no-lazy-fetch predicate requires exact
+  `GIT_NO_LAZY_FETCH=1` on **every** Git child, including the capability probe. An
+  operational child additionally receives global `--no-lazy-fetch` immediately
+  after the binary if and only if a checked release-pinned probe for that exact Git
+  binary digest reports support. The probe performs no repository discovery,
+  configuration, object access, or network access and records immutable
+  `{gitBinaryDigest,supportsNoLazyFetch}` evidence. A missing, mismatched, or
+  ambiguous probe disables local execution rather than guessing unsupported. Every
+  probe and operational child runs inside a network-denied namespace with prompts
+  and every Git transport disabled; the builder refuses any argument vector or
+  environment that disagrees with the predicate. The non-Git parser rejects partial-clone extensions,
+  promisor remotes/filters, `.promisor` packs, missing reachable promisor objects,
+  and any state that could trigger lazy fetch; the first release fails such a clone
+  at preflight and never contacts a remote. The first release rejects external includes,
+  hooks, attributes, executable filters/diff drivers, and unresolved symlink
+  targets rather than letting host configuration affect the snapshot. Linked/
+  external gitdir/common directories and allowlisted alternates require ordered
+  resource fences; unsupported/unbounded stores disable local execution. All three
+  enforce file/byte/depth/time ceilings and matching scans/equivalent snapshot
+  proof, with only narrow versioned volatile exclusions. Version 1 defaults/hard
+  maxima are: working tree 100,000/500,000 files, 32 MiB/256 MiB hashed bytes,
+  4/32 GiB observed bytes, depth 128/256, 60/300 seconds; Git control
+  100,000/500,000 files, 64 MiB/1 GiB hashed, 4/32 GiB observed, depth 64/128,
+  60/300 seconds; and Git storage 500,000/2,000,000 files, 8/64 GiB hashed,
+  64/512 GiB observed, depth 32/64, 120/600 seconds. Lower configured values are
+  allowed; values above the maxima are rejected. Their combined fingerprint
+  feeds comparison, review, task aggregate, and success; no path/control content
+  is exposed. Pre-exposure incompleteness is `preflight_failed`; post-exposure
+  incompleteness is `unverifiable`. A live owner
+  waits for the separately addressable ACP containment subtree to become empty and,
+  before any Forge response-driven stage, computes the comparison; recovery waits
+  for the complete lease group empty. A changed or unverifiable result requires
+  exact fingerprint-bound repository review after a valid response, failure, or
+  submission uncertainty, even with `effectIntent:not_started` and no Forge host
+  ledger. A valid response with such a result starts no later local stage and uses
+  bounded `external_repository_change_requires_review`. The barrier blocks retry,
+  reapproval, new work, and root management until reviewed or separately
+  quarantined as abandoned. Only the exact fingerprint-bound
+  `review_local_changes` transition and privileged quarantine may cross their own
+  barrier. This lifecycle is packet-independent: packet-free and handoff-only
+  local-root runs create/recover/review the same generic record without inventing
+  packet audit, artifact, delivery, or CTA. Generic legacy stale recovery is
+  allowed only for a truly root-free/no-effect run.
+
+  Each project stores an internal opaque host-resource reference, authoritative
+  host ID, and monotonic root-binding revision. The reference is an installation-
+  keyed digest of stable host identity plus platform-normalized canonical physical
+  root; alias/symlink/case variants converge, a live-project-only partial database
+  uniqueness constraint uses the existing `archived_at IS NULL` lifecycle and
+  rejects duplicate ownership. Durable installation-keyed hierarchy claims plus a
+  deferred host-guard constraint reject ancestor/descendant live roots while
+  allowing siblings, and hosts unable to prove
+  identity equivalence fail closed. The binding and instance/epoch carry one
+  host-binding-key fingerprint. The all-mode claim pins these values on the work
+  package, including packet-free/handoff-only execution; any agent run carries an
+  equality-checked internal copy, while the packet authorization snapshot carries
+  only the safe root-binding revision and never the resource reference. After claim and
+  before the first repository read/context assembly, the worker acquires the
+  corresponding advisory resource fence with no database locks, revalidates the
+  pin top-down, and retains the fence through submission, local effects, atomic
+  finalization, and descendant quiescence. A dedicated host fence service under a
+  separate protected operating-system principal owns the lock/durable local lease,
+  protected state and socket. It authenticates kernel peer credentials plus an
+  unguessable run/worker/root/group-bound capability and independently proves
+  kernel group emptiness; tamper, corruption, replay, peer mismatch, service death,
+  or unverifiable state becomes orphaned/disabled. The long-lived queue worker
+  stays outside containment. Durable Forge control/run state moves out of project
+  `.forge/task-runs` into protected service-owned host state; same-worker mode 0700
+  is not protection. The service allocates a bounded pool of distinct
+  `{trustedShimUser,untrustedRunUser}` pairs (default 32, configurable 1–256) and
+  binds every capability to `{slotRef,slotGeneration,runId}` plus the shim UID; ACP
+  never receives it. A slot is reused only after cgroup/PID-namespace emptiness,
+  process/session termination, descriptor cleanup, protected-state removal, and
+  credential/capability revocation have been attested; otherwise it remains
+  quarantined and capacity backpressure stops new work. It creates
+  a bounded non-sibling-traversable exchange directory and a non-dumpable trusted
+  shim under the paired shim principal; only the shim launches the already-validated
+  adapter under the untrusted run user. Inputs/outputs use
+  allowlisted one-way handoff and the exchange manifest/final digest is bound to
+  generic local evidence. Service lifecycle capabilities/state handles never enter
+  ACP environment, arguments, inherited descriptors, or readable storage. The run
+  mount namespace exposes project/exchange as `nosuid,nodev`; preflight rejects
+  setuid/setgid entries and `security.capability`. Private PID/procfs, ptrace/signal
+  policy, distinct UIDs, and the non-dumpable shim prevent ACP from reading or
+  signalling trusted processes. A supported adapter places that shim/child, ACP, validation, response-driven work, and
+  every descendant in one non-escapable group before repository access. Normal
+  success exits that child and releases without terminating the queue worker.
+  Inherited descriptors or process-tree guesses are insufficient, and unsupported
+  or unprotected hosts disable protocol-v2 local-root execution. This containment
+  proves liveness/exclusion only; ACP remains explicitly unconfined for shell,
+  network, credential, and filesystem security.
+
+  The initial supported boundary is Ubuntu 24.04/Linux 6.8+ with unified cgroup v2,
+  systemd transient per-run scopes, separate service/worker/paired shim/run user IDs,
+  restricted PID/mount/procfs views, `nosuid,nodev` project/exchange mounts, and Unix-
+  domain-socket `SO_PEERCRED`. A checked-in preflight proves cgroup delegation,
+  descendant containment/kill/emptiness, distinct identities, peer credentials,
+  protected state/socket permissions, setid/capability rejection, proc/ptrace/
+  signal isolation, non-dumpable shim, and restart recovery before the instance may
+  advertise the adapter. macOS, Windows, non-delegated containers, and same-user
+  development mode remain protocol-v2 local-root disabled pending an equivalent
+  reviewed adapter.
+
+  Reservation transactions are disjoint from the entity order. With no database
+  locks, they acquire shared locks on every strict canonical ancestor and an
+  exclusive candidate-root hierarchy lock. Then every plan/materialize/cleanup/
+  new-project bind transaction locks epoch → connection-authenticated fresh root-
+  writer instance → active binding generation/rotation → host hierarchy guard →
+  reservation, validates/pins writer credential generation, and fails stale/
+  draining/wrong-principal/key writers before filesystem work. Final new-project
+  bind inserts the project and promotes the hierarchy claim, with no task/package/
+  run locks. Existing rootless attachment or repoint to a missing destination is a
+  distinct entity-first branch: after external fences it locks existing project →
+  affected tasks/packages/decisions in S3 order → epoch → authenticated writer →
+  generation/rotation → hierarchy guard → reservation, then atomically advances
+  the root revision, performs S3 negative reconciliation for repoint, promotes the
+  binding, and marks the reservation bound. Reservation-only plan/materialize/
+  cleanup never request a project row; no other entity-first path acquires one.
+
+  Existing-root create, repoint, tombstone, recursive cleanup, and every filesystem-
+  management path use the same fence. A nonexistent destination first uses a
+  durable reservation and prefix-aware hierarchy fence derived from authoritative host +
+  binding-key fingerprint + canonical existing parent identity + normalized
+  missing suffix. The route holds it across `planned|materialized`, physical fence
+  acquisition, and atomic binding. Loser/crash cleanup requires both reservation
+  token and created-object identity plus proof of no descendant reservation/
+  binding; mismatch becomes `cleanup_required`, never recursive deletion of a
+  reused or nested root. Repoint takes old/new references in canonical hierarchy
+  order, revalidates top-down, and cannot commit during a pinned claim, live lease,
+  `awaiting_review`, active effect, unproven containment quiescence, any recognized
+  S3/S4/local-effect hold, stale/mismatched task aggregate, host review, or working-
+  tree/Git-control/Git-storage review on terminal or nonterminal tasks.
+  Root cleanup uses typed maintenance intent. Repoint advances the binding and
+  invokes S3's `project_root_repoint` negative reconciler before commit. Deletion
+  reuses `projects.archived_at` as the sole tombstone, atomically cancels every
+  nonterminal task/package with bounded `project_removed`, clears only the live
+  path/hierarchy binding, and retains rootRef, tasks, packages, runs, audits,
+  artifacts, actions, alerts, and resolutions. Queue/progression/all-mode claims
+  reject archived projects; normal queries hide tombstones and hard purge is forbidden pending separate
+  retention/export architecture. No code waits for an external fence while holding
+  database locks.
+
+  A submitted response then activates monotonic effect intent/stage under the
+  already-held fence. Ownership and root binding are rechecked before sandbox,
+  validation, host apply, repository/completion preparation, and every atomic file
+  replacement. A run-scoped host-apply ledger records each validated output entry
+  `planned → applying → applied`; recovery maps crash-left `applying` to `unknown`.
+  A live owner whose replacement may have succeeded but whose `applied` persistence
+  fails must also durably map to `unknown` under the fence before terminalizing; if
+  PostgreSQL is unavailable it remains active for recovery.
+  Same-host recovery retains stale W1 as immutable claim history. The protected
+  service first mints a single-use signed/MACed challenge bound to run/evidence,
+  W1, proposed W2, root/group, recovery epoch, and expiry after kernel-peer
+  authentication. A top-down transaction locks W1/W2 ascending after the epoch,
+  requires W2's dedicated database principal to equal `current_user`, proves its
+  host/key/protocol/service/adapter generation equals the run and (for
+  `active|quiesced`) intent host, and stores only challenge digest plus election
+  lease; same-ID/principal takeover is forbidden and `not_started` has no intent
+  host. After commit the service verifies the database election through the single
+  selected trust path: a service-only, separately revocable `NOINHERIT` certificate
+  principal with `SELECT` only on a fixed security-barrier committed-election view.
+  It uses pinned TLS, fixed `search_path`, read-only `READ COMMITTED`, and an exact
+  election-ID/challenge-digest query; workers/maintenance cannot access the
+  credential or view. The view returns only the matching committed, unexpired
+  election tuple plus a nullable committed receipt fingerprint/version; it does
+  not claim to observe protected-service burn state. Reader outage/revocation
+  fails closed without burning. The service atomically test-and-burns its protected
+  challenge while durably storing one replayable tuple-bound receipt, then returns
+  it. A second database compare-and-set stores the fingerprint; the service
+  re-queries that exact committed receipt fingerprint/version and checks its own
+  unexpired receipt before idempotently granting takeover once. Crash/replay
+  boundaries resume that exact election and never grant DB-only or service-only
+  authority. If both database recovery lease and committed receipt expire before
+  takeover, the service may first prove no takeover was granted, atomically retain
+  an `expired_ungranted` protected receipt tombstone, and mint a challenge bound to
+  that tombstone and a greater recovery epoch. A top-down compare-and-set appends the
+  matching database election tombstone and installs the greater-epoch candidate;
+  the view and service reject the old receipt/owner. Already-granted takeover cannot
+  be tombstoned or re-elected, so expiry permits progress without concurrent W2s.
+  Wrong/missing/stale/draining/divergent-key/insufficient-containment/unreachable
+  W2 or fabricated/cross-run/expired/replayed challenge is alert-only.
+  Underlying lock acquisition alone is insufficient, and state remains actionless
+  until the adapter proves the complete per-run group empty and W2 revalidates its
+  pin in the top-down transaction.
+  A separately credentialed non-worker watchdog periodically finds expired local
+  evidence leases with zero eligible recovery worker and writes one deduplicated
+  bounded alert; worker heartbeats are not the only producer. Its only mutation is
+  zero-argument `forge.forge_alert_unavailable_recovery_worker()`, a non-login-owned
+  `SECURITY DEFINER` function with fixed `pg_catalog,forge,pg_temp` search path,
+  fully qualified objects, `PUBLIC` revoked, and no caller IDs. Immutable
+  `session_user` plus database state select the row; the watchdog cannot SET ROLE/
+  session authorization and has only bounded-view SELECT/function EXECUTE, with no
+  direct DML, heartbeat, claim, fence, repair, credential, or repository access.
+  Failure records one
+  bounded quiescence alert. Ledger paths/errors/resource
+  references never enter packet-owned evidence. A submitted crash may retain a
+  lease/worker failure code while host-ledger or repository-change evidence forces
+  fingerprint-bound working-tree review.
+
+  A valid or known-but-incoherent `metadata.packet_issuance` or
+  `metadata.packet_integrity_hold` marker is an absolute S4-owned guard before
+  generic candidate selection, admission refresh, readiness promotion, and
+  package claim. Direct progress, sibling continuation, and
+  periodic sweeps cannot clear or bypass it even when current grant coverage is
+  allowed. Only S4's exact recovery route or the S3→S4 one-time resolver may
+  clear `packet_issuance`; both reject `packet_integrity_hold`. Only the separately
+  authorized fingerprint-bound privileged repair command may clear an integrity
+  hold.
+  Packet-independent `metadata.local_effect_recovery` is guarded at the same seam
+  and carries only generic local-evidence identity/fingerprint plus
+  `review_local_changes|acknowledge_possible_local_invocation|retry_local_execution|
+  decline_local_retry`. The generic local route or
+  privileged quarantine is its only owner; packet actions and generic readiness
+  cannot clear it. Packet and local markers may coexist without either owner
+  clearing the other.
+
+  Stale recovery first discovers candidate generic local-run evidence and optional
+  packet-audit IDs without retained row locks. Each
+  candidate is then processed in a fresh top-down transaction; it never locks an
+  audit/approval and reaches backward. The transaction compare-and-sets a still-
+  expired local claim and optional packet claim, invalidates the tokens, fails the
+  linked run and clears only that run's execution lease. Changed/unverifiable
+  evidence creates local review whose next disposition is derived from the locked
+  generic invocation state. Exact unchanged/not-applicable packet-free/handoff
+  evidence creates explicit `retry_local_execution` only for
+  `definitive_not_started`; `invoking|returned|uncertain` creates
+  `local_invocation_uncertain` with `acknowledge_possible_local_invocation`.
+  Packet-bearing work
+  with no local barrier creates only its issuance block. Pre-quiescence remains
+  running/actionless behind the resource fence. The transaction
+  atomically persists terminal generic evidence plus optional audit/artifact. One
+  database-owned aggregate recomputes the task's versioned local-change projection
+  from the eight fixed current-authority heads per sibling package; immutable local-
+  run/review/hold history is outside input cardinality. A deferred cross-row
+  constraint validates every head/task mutation, and every all-mode claim relocks/
+  recomputes the exact head set so stale zero/null cannot pass. It locks every sibling
+  package in ascending order and returns task `running → approved` only
+  when no sibling has a live execution lease or `awaiting_review`; otherwise the task remains `running`
+  and recovery has no action until the shared S3/S4
+  `reconcileOperatorHoldTaskDisposition`, invoked after sibling lease/review release
+  and at startup/periodically, validates at least one recognized filesystem/packet/
+  integrity/local-effect marker and moves only `running → approved` without
+  promoting any marker. An S3-only task never requires an S4 marker. An
+  `allow_once` nonce stays burned; an `always_allow` run claim can
+  start a new operator-requested run only under current project coverage. Every
+  existing generic stale-package path first checks for a linked v2 issuance claim;
+  packet-bearing runs delegate by audit ID to this top-down transaction and never
+  clear leases, write generic stale markers, or publish terminal events separately.
+  A compare-and-set miss is handled only after proving run/package terminal and the
+  lease cleared. A seeded terminal-audit/live-package split first requires exact
+  typed audit/artifact tuple equality. Terminal failure repair copies the immutable
+  failure object/delivery into the marker. Terminal success creates no failure
+  marker and may reconstruct success only from matching completion,
+  repository-evidence, and every required review-gate materialization (or proof no
+  gate is required); missing/mismatched evidence
+  enters typed packet or generic-local integrity hold that fails only the live run, clears its
+  lease, blocks the package, exposes no recovery action, and requires separately
+  authorized privileged repair. Release/DevOps owns one deduplicated bounded
+  integrity alert, `docs/operators/local-execution-integrity-repair.md`, privileged
+  `local-execution-integrity:inspect|resolve -- --alert <id>` commands, fingerprint compare-and-set, and
+  append-only resolution evidence. Resolution never rewrites immutable packet
+  evidence. The privileged interface is exactly:
+
+  ```text
+  npm run local-execution-integrity:inspect -- --alert <id>
+  npm run local-execution-integrity:resolve -- --alert <id> --actor <operator-id> --expected-fingerprint <digest> --resolution verified_success
+  npm run local-execution-integrity:resolve -- --alert <id> --actor <operator-id> --expected-fingerprint <digest> --resolution verified_failure
+  npm run local-execution-integrity:resolve -- --alert <id> --actor <operator-id> --expected-fingerprint <digest> --resolution projection_recomputed
+  npm run local-execution-integrity:resolve -- --alert <id> --actor <operator-id> --expected-fingerprint <digest> --resolution generic_failure_reconstructed
+  npm run local-execution-integrity:resolve -- --alert <id> --actor <operator-id> --expected-fingerprint <digest> --resolution quarantined_abandoned --expected-sibling-evidence-set-fingerprint <digest> --repository-disposition reviewed
+  npm run local-execution-integrity:resolve -- --alert <id> --actor <operator-id> --expected-fingerprint <digest> --resolution quarantined_abandoned --expected-sibling-evidence-set-fingerprint <digest> --repository-disposition abandoned
+  ```
+
+  No optional `--apply`, implicit resolution, or omitted fingerprint form exists.
+  The two quarantine commands require both the complete alert/hold fingerprint and
+  canonical sibling-evidence-set fingerprint plus an explicit literal
+  `reviewed|abandoned` disposition; the command cannot derive those inputs from
+  mutable current state. Packet audit is optional. Evidence-present alerts require the exact
+  generic row; `missing_local_evidence` instead stores a nullable generic foreign
+  key plus immutable run/package/task/project claim identity and an expected non-FK
+  evidence ID, so absence itself can be persisted without inventing a row.
+  Owning-host W2 terminalization writes service-authored `quiescence_proven` bound
+  to its receipt/recovery epoch/final fingerprint, so packetless alerts close
+  truthfully. Verified success/failure requires the exact coherent predicate. A
+  proven immutable audit/artifact mismatch that can satisfy neither has one
+  privileged `quarantined_abandoned` adjudication: under the complete order and
+  only with no live lease/review/effect, bind every affected sibling marker,
+  baseline/change fingerprint, host-ledger fingerprint, and review disposition
+  into one sibling-evidence-set fingerprint. Each review is complete or the
+  privileged resolution explicitly records repository disposition `abandoned`.
+  Then append the resolution, cancel the held package and remaining nonterminal
+  siblings, and close the task as cancelled. It retains alert/hold/audit/artifact/
+  run evidence and creates no retry action. Terminal task state alone never clears
+  the repository-management barrier; unresolved evidence continues to block
+  every packet, packet-free, and handoff-only sibling claim plus
+  repoint/tombstone/reuse. Normal exact review or privileged quarantine recomputes
+  the task barrier under the same locks.
+  Reason-specific resolution permits projection recomputation only from a complete
+  coherent source set, generic failure reconstruction only from an evidence-present
+  immutable tuple, and quiescence closure only from service-authored proof;
+  missing evidence or irreconcilable immutable state requires evidence-preserving
+  quarantine. Other unproven state remains held. Repair never resubmits or turns immutable
+  success into retryable failure.
+  Only truly root-free/no-effect runs may retain legacy generic recovery; packet-
+  free/handoff local-root runs use the same authenticated W2/quiescence/comparison/
+  review lifecycle without packet evidence. Review-required no-packet work advances
+  after review to the stored invocation-dependent disposition. Unchanged
+  `definitive_not_started` work starts at explicit retry; unchanged
+  `invoking|returned|uncertain` work starts at possible-invocation acknowledgement.
+  Neither branch is automatic. Every
+  versioned `packet_issuance` marker has `autoRetryable:false`, immutable terminal
+  delivery, separate disposition/acknowledgement fields, fingerprints, and bounded
+  failure code. The normative matrix is: one-time +
+  `not_exposed|submission_failed` → `reapprove_allow_once`; one-time +
+  `submission_uncertain|submitted` → `review_then_reapprove_allow_once`;
+  always-allow + `not_exposed|submission_failed` → `retry_execution`; and
+  always-allow + `submission_uncertain|submitted` → `review_submission`.
+  Review precedence is independent: any host/repository `review_required` marker,
+  including definitive `submission_failed`, first exposes only
+  `review_local_changes` with a deterministic next disposition. That exact action
+  completes matched local reviews without changing delivery; uncertain/submitted
+  work then separately requires `acknowledge_possible_submission`.
+  Every marker reader/action joins the exact prior audit/artifact and generic
+  local-run record, proves their typed terminal tuples equal, joins working-tree/
+  Git-control/Git-storage comparison/review plus host-ledger fingerprints, and binds the marker identity to
+  that failed tuple. Missing, mismatched, or success-plus-failure-marker evidence is neutral,
+  non-retryable, and actionless. A marker carries independent fingerprinted
+  `not_applicable|review_required|reviewed` host-apply, working-tree, Git-control,
+  and Git-storage review unions plus their combined action fingerprint; audit-level
+  repository review has no `abandoned` state. Local-change
+  review and possible-submission acknowledgement never change delivery and are
+  separate append-only actions. Retry/reapproval cannot enable a
+  new claim while review is required or the ledger fingerprint changed.
+
+  S4's generic local-effect route is the sole owner of local review,
+  possible-invocation acknowledgement, retry, and ordinary decline, keyed by
+  `{localRunEvidenceId,evidenceFingerprint}` and the generic action ledger. It uses
+  the full order through generic evidence before optional audit. Before any action
+  it proves routed task/package ownership of the exact run/evidence, task
+  `approved`, package `blocked`, the exact marker/fingerprint, no live sibling
+  lease or `awaiting_review`, no integrity hold, and the canonical task projection.
+  Only exact review may consume the nonzero projection made solely from the reviews
+  it owns; every other action requires zero. Exact replay for all four actions is
+  ledger-first and returns the recorded result before requiring a still-present
+  marker. Exact packet review
+  atomically clears only the local marker and advances the dependent packet marker
+  to its stored next disposition; exact no-packet review rotates to its stored
+  `retry_local_execution|acknowledge_possible_local_invocation` disposition.
+  The local marker union has separate pending-acknowledgement and acknowledged-
+  retry `local_invocation_uncertain` arms. Both retain the immutable invocation
+  attempt ID; the latter alone requires non-null acknowledgement actor/time.
+  Fingerprints commit to reason/disposition/review, invocation state/attempt, every
+  local review, and the acknowledgement null-or-actor/time tuple. Acknowledgement
+  preserves uncertain invocation evidence, rotates into that schema-valid
+  acknowledged arm, and only enables the later retry choice; invalid mixed fields
+  fail closed. Retry moves `blocked → ready` only under a
+  server-computed eligible ordinary retry policy revision/fingerprint. The decline
+  action may close coherent reviewed work—including uncertain invocation—without
+  forcing acknowledgement; it cancels the package through sibling-aware terminal
+  policy, preserves evidence, and creates no run or wake. No local action writes
+  the issuance ledger.
+
+  S4 owns a packet-recovery route and append-only
+  `filesystem_mcp_issuance_recovery_actions` table. The route locks project → task
+  → every sibling package in ID order → decision → protocol epoch → historical
+  claim/current recovery worker instances ascending → active binding generation/
+  rotation → hierarchy guard → prior run → generic local-run evidence/task source
+  set → audit → host-apply ledger/entries → all applicable artifacts by stable key
+  (including the exact packet artifact) → generic then packet action rows → integrity
+  alerts/resolutions → review gates, accepts a version-2 request carrying
+  `{action, priorRuntimeAuditId, markerFingerprint}`, binds that identity to the
+  routed task/package, CAS-validates the marker/prior audit, and records only
+  `acknowledge_possible_submission|retry_execution|decline_packet_recovery`;
+  acknowledgement remains available even if current grant coverage was later
+  revoked. Ordinary decline requires quiescent local evidence and completed exact
+  reviews, but neither current grant coverage nor possible-submission
+  acknowledgement; it cancels the package, preserves delivery/evidence, and
+  creates no run or wake.
+  A separate always-allow `retry_execution` transition accepts either the same
+  revision/coverage or a greater effective decision revision that exactly covers
+  an unchanged package policy, but only when that decision's root-binding revision
+  equals the locked project. A repoint revokes state one; only explicit reapproval
+  can authorize a new run on the new root, and the action records prior/current
+  root revisions. The canonical S1
+  `readEffectiveGrantState` returns `phase:'approved'`, `source:'project-level'`,
+  and `grantMode:'always_allow'`, with the locked matching project decision
+  supplying the revision/fingerprint. Snapshot source `project_always_allow` is a
+  separate historical vocabulary. This
+  preserves the S3 denial-wins rule for equal/newer package denials. The latter is explicit operator reauthorization after
+  grant replacement, never automatic retry. It records prior and authorizing
+  revision/fingerprint evidence in the append-only action row, clears only the
+  packet marker, moves `blocked → ready`, commits, then wakes Redis; the normal new
+  claim snapshots the current decision. Missing, older, unknown, narrower, or
+  policy-changed decisions fail closed. For one-time reapproval, S3 rotates
+  the fresh nonce after locking every sibling package and calls S4's package-
+  scoped resolver in the same transaction; package scope limits grant evaluation,
+  while sibling locks enforce mandatory review. The resolver continues to prior
+  protocol epoch → authenticated instances → active binding generation/rotation →
+  hierarchy guard → run → generic local evidence/task current-head set → audit → host
+  ledger/entries → all applicable artifacts by stable key (including the exact
+  packet artifact) → generic then packet recovery actions → integrity alerts/
+  resolutions → review gates, proves
+  canonical typed audit/artifact equality, verifies the prior terminal marker, and writes append-only
+  `resolve_after_allow_once_reapproval` evidence for the new approval decision,
+  and clears only packet state atomically. Unresolved generic local evidence/
+  review/task projection keeps the package blocked and creates no wake. It requires
+  no active lease or sibling `awaiting_review`.
+  Generic local review/retry writes only the generic ledger; possible-submission
+  acknowledgement, packet retry, and one-time resolution write only the issuance
+  ledger. Each ledger is checked before requiring a still-present
+  marker. An exact replay of the same routed version-2
+  `(audit, action, marker fingerprint)` request returns the recorded HTTP 200 result
+  with no second mutation/wake; only a changed
+  fingerprint or unmatched durable state returns 409. Double/stale/policy/lease
+  races are compare-and-set or idempotency-ledger outcomes. The marker never
+  reuses `mcpGrantBlock`/`mcpBroker` or persists a path/reason.
+
+  Before the first packet-selection or repository-content read, the live exact
+  owner persists `state:'assembling'` with a random attempt ID and database time.
+  Immediately after assembly and **before any exposure**, that same owner
+  compare-and-sets an immutable `state:'assembled'` snapshot with opaque non-path
+  `rootRef`, bounded counts, and closed-category redaction counts. A terminal
+  `state:'not_assembled'` is allowed only with a definitely pre-assembly
+  `claim|preflight` stage. Crash, owner loss, or database failure while
+  `assembling` becomes terminal `state:'assembly_unconfirmed'` with stage
+  `assembly`, the same attempt ID, no counts or `rootRef`, and no reassembly. Live
+  `assembling` never appears in a terminal artifact. Store delivery
+  separately as
+  `not_exposed|submitting|submission_failed|submitted|submission_uncertain`.
+  Immediately before ACP I/O, ownership-CAS `not_exposed → submitting` with a
+  random attempt ID and database time. Expired/crashed `submitting` becomes
+  `submission_uncertain` and is never automatically replayed. A submission failure
+  never rewrites an assembled packet as unassembled, and recovery never rewrites
+  `assembling` as `not_assembled`. Audit/artifact adds a
+  terminal discriminant: `{status:'succeeded'}` is valid only with
+  `assembled+submitted`; `{status:'failed',failureCode}` uses the closed shared enum
+  `authorization_changed|execution_lease_expired|local_evidence_lease_expired|
+  issuance_lease_expired|worker_stopped|preflight_failed|assembly_failed|
+  submission_rejected|submission_uncertain|provider_response_invalid|
+  external_repository_change_requires_review|post_submission_execution_failed`.
+  An already persisted bounded stage or delivery cause is primary and is never
+  replaced by a later ownership loss. Otherwise the deterministic precedence is
+  `authorization_changed → execution_lease_expired → local_evidence_lease_expired →
+  issuance_lease_expired → delivery/stage-specific cause → worker_stopped`, where
+  `worker_stopped` is residual only. All three leases are independent and no
+  heartbeat may infer one from another.
+  The external-change code uses assembled/submitted plus `not_started`, no host
+  ledger, and required repository review; no Forge local stage begins. The last
+  code is valid only with assembled/submitted evidence and exactly one
+  closed stage:
+  `sandbox_apply|validation|host_apply|repository_evidence|completion_preparation`.
+  A normative compatibility table constrains assembly stage, delivery, terminal
+  status, failure code, and conditional stage; known-invalid cross-products fail
+  closed. In that table `assembly_unconfirmed/assembly + not_exposed` accepts only
+  authorization/lease causes, `worker_stopped`, or `assembly_failed`, and accepts no
+  counts/`rootRef`; success still requires `assembled+submitted`. A second normative effect table requires `active` only on a nonterminal
+  submitted claim; permits terminal `not_started` only when no local stage/ledger
+  exists; requires `quiesced` after a stage begins; requires
+  `post_submission_execution_failed.failureStage` to equal the quiesced last stage;
+  forbids `applying` in quiesced state; and defines two disjoint success rows:
+  no local stage is `not_started` with no ledger, while local-stage success is
+  `quiesced(actualLastStage)` with every declared host-write entry `applied` and no
+  `planned|applying|unknown`. Both success rows require repository comparison
+  `unchanged` and review `not_applicable`; changed/unverifiable evidence always
+  fails as `external_repository_change_requires_review`, even after review. Intent,
+  ledger, host-review, all repository baseline/change-review fingerprints, and
+  task projection must match. Same-row checks plus deferred PostgreSQL cross-row
+  constraints enforce the generic-evidence/optional-packet/task predicate used by
+  live/recovery finalizers, repair, backfill, and every all-mode claim; Drizzle/
+  parser fixtures and S6 import the same table.
+  Definitive `submission_failed` is staged atomically with
+  `submission_rejected` and is not later reclassified as lease expiry. There is no
+  `terminalization_interrupted` code because a rolled-back atomic terminalizer
+  leaves no durable evidence distinguishing it from a worker/lease failure.
+  Packet-owned persistence accepts no raw/sanitized exception detail; operator copy
+  is enum-derived. One packet claim
+  permits one external model/ACP submission: packet-bearing AI SDK calls set
+  `maxRetries:0`, adapter/provider replay after possible acceptance is disabled,
+  and after an accepted but Forge-invalid response, the
+  run fails with `submitted` evidence and does not use the executor's automatic
+  correction loop. Every local-root ACP invocation, including packet-free and
+  handoff-only execution, is also at most once per generic local-run evidence row;
+  adapter retries and the validation correction loop are disabled because the
+  unconfined ACP may already have changed repository state. A later call requires
+  a new explicit generic retry/new run after quiescence and comparison. `rootRef` is a
+  dedicated, unique project UUID. Migration adds it nullable with no default, sets
+  database `DEFAULT gen_random_uuid()` in a separate bounded-lock step, then installs
+  a database-owned insert bridge that fills any remaining null and a guard that
+  rejects only non-null → null. Unrelated updates to legacy null rows remain legal
+  during checkpointed backfill. After zero nulls, migration adds/validates the non-
+  null proof and uniqueness before `SET NOT NULL`; the default and temporary guards
+  remain through that mixed-version window. It is never path-derived; preview, approval, claim,
+  and artifact read the same lifetime-stable value. Rotation is out of scope
+  because approved-but-unclaimed snapshots would require invalidation/reapproval.
+  This public packet identity is separate from the internal host-resource/root-
+  binding revision pinned by a run; permitted path edits keep `rootRef`, while
+  duplicate canonical host roots fail the internal uniqueness constraint.
+  Free-text repository errors, file names,
+  paths, host-resource references, excerpts, and contents are excluded from packet-owned audits, artifacts,
+  logs, events, queues, and APIs. Live finalization, while still holding the host
+  resource fence, extends the existing ownership/root-fenced run/package terminal transaction and atomically updates
+  run/package/lease, audit, artifact, recovery marker, and task disposition. A
+  post-submission stage failure is not auto-resubmitted; host apply may be partial,
+  so separate typed actions cover prior external work and possible local changes and
+  Forge never claims rollback. Review-gate materialization/decision follows the
+  complete order (decision, epoch, authenticated instances, binding generation/
+  rotation, hierarchy guard, run, generic evidence/task current-head set, optional
+  audit, host ledgers, all artifacts, generic/packet actions, integrity rows, then
+  gates) and rereads source run/artifact, package status, and lease under the
+  transaction locks before compare-and-set; gate-first locking and
+  pre-transaction-only freshness are forbidden. `completion_preparation` covers
+  only pre-transaction work; gate/finalizer database failure rolls back with no
+  such persisted cause. A v2
+  writer cannot commit terminal packet evidence with a still-running linked
+  package. The partial unique artifact index supplies idempotency, not
+  crash-consistency by itself. This is cooperative database fencing, not
+  cryptographic exactly-once disclosure; hard cancellation still belongs to #40/#60.
 - **Evidence lifecycle — planned scope vs issued evidence.** Pre-run,
-  `McpAdmissionDecision.evidenceRefs` carries only *planned scope* (root path +
-  capability set), never file contents. The bounded read-only context packet is
-  assembled during execution and requires an `agentRunId`; after the run (including
-  **failed** runs) insert exactly one idempotent `artifacts` row for the attempt:
+  `McpAdmissionDecision.evidenceRefs` carries only opaque planned-scope identifiers
+  plus capability set, never paths or file contents. The bounded read-only context
+  packet is assembled during execution and requires an `agentRunId`. At most one
+  packet artifact may exist for a claimed run while it remains live or unquiesced;
+  exactly one exists only after coherent atomic terminalization, or after an
+  authorized repair proves the complete predicate. An unavailable-host claim has
+  zero terminal artifacts, and this contract makes no liveness promise when
+  containment emptiness or an authoritative same-host recovery worker cannot be
+  proven. The idempotent terminal artifact is an `artifacts` row with:
   `artifactType:'mcp_bounded_context_packet_metadata'`, linked by
   `artifacts.agentRunId`, with `content` containing the versioned, human-readable
-  metadata summary and `metadata` containing the staged discriminated union plus
-  `{schemaVersion:1, workPackageId}`: assembled runs carry
-  `{packetAssembled:true,root,includedCount,byteCount,omittedCount,redactionSummary}`;
-  pre-assembly failures carry `{packetAssembled:false,failureStage,reason}`.
+  metadata summary and `metadata` containing `{schemaVersion:2, workPackageId}` plus
+  immutable authorization, assembly, terminal delivery, and terminal
+  success/failure snapshots. A live
+  `submitting` value exists only on the current audit and is converted to
+  `submission_uncertain` before terminal artifact finalization. Assembled runs carry
+  opaque `rootRef`, included/byte/omitted counts, and closed redaction counts;
+  pre-assembly failures carry a bounded stage plus the terminal failure code and no
+  fabricated counts.
   `(agentRunId, artifactType)` is the stable lookup contract; retry/upsert behavior
   must not create duplicates for one run. S4 owns a database migration adding a
   partial unique index on `(agent_run_id, artifact_type)` where
@@ -1447,16 +2536,327 @@ none of those slices may weaken this state, precedence, or lock contract.
   `web/db/schema.ts` declares the same partial unique index. A concurrent-finalizer
   test proves one row survives. S5 queries this artifact relationship directly—no
   `agent_runs` metadata column or migration is introduced. The artifact
-  contains packet **metadata** only (root, included file count, byte count, omitted
-  count, and redaction summary—the exact ADR 0008 audit vocabulary). File names and
+  contains packet **metadata** only (opaque root reference, included file count, byte
+  count, omitted count, and redaction summary—the ADR 0008 audit vocabulary without
+  a persisted host path). File names and
   relative/absolute paths are not persisted because they can disclose sensitive
   structure even without contents.
   **File contents stay prompt-only and are not persisted**; "selected excerpts" are
   not written to an inspectable artifact. `mcpCapabilityList` imports
   `mergeCapabilityFields`; executor filesystem gating uses shared
   `coverageKeysForGrant`/`classifyCapability`.
-- Sandbox-generated files (`.forge/task-runs/...`) stay clearly separated from
-  host-repository writes in artifacts.
+- **Additive rollout is part of the guarantee.** First deploy the separately
+  landable Step 0 bridge project-removal route that rejects hard delete (or archives
+  safely) before filesystem work, disable project-management ingress, and drain every pre-
+  bridge process/session. The Step 0 retention migration replaces evidence-bearing project cascades with
+  `RESTRICT|NO ACTION` and installs the database hard-delete guard. Only after those
+  postconditions may #178/S3 land. Keep project-management ingress closed. Only
+  after #178/S3 passes may remaining S4 expansion begin. Add nullable project
+  `root_ref` with no default; set `DEFAULT gen_random_uuid()` separately under a
+  measured lock while ingress remains closed;
+  install a narrow database-owned `BEFORE INSERT` bridge that fills any remaining
+  null (including explicit null) and a `BEFORE UPDATE OF root_ref` guard rejecting
+  only non-null → null. The guard allows unrelated updates to existing null rows.
+  Install the expansion journal/trigger while ingress is still closed. Only after
+  the default, insert bridge, re-null guard, journal, and their database tests are
+  committed may legacy project ingress reopen exactly once and the mixed-version
+  journal window begin.
+  Build the unique non-null index concurrently, then use a durable primary-key
+  checkpoint for bounded restartable backfill that changes only still-null
+  `root_ref`, with lock/statement timeouts plus disk/WAL preflight. After zero nulls,
+  add/validate the non-null proof and uniqueness before a short final `SET NOT NULL`;
+  only then remove temporary triggers/proof. Omitted and explicit-null inserts,
+  unrelated updates before their batch, re-null attempts, and concurrent old-writer
+  crash/races are mandatory. Also add explicit
+  unbound root revision `0`, host/key/maintenance/archive audit fields, the live
+  `archived_at IS NULL` exact-root index, hierarchy claims/guard, writer-pinned
+  missing-root reservations, database-maintained task local-change projection
+  (`version INTEGER NOT NULL DEFAULT 0` plus nullable source-set fingerprint, where
+  version 0/null is non-authoritative until aggregate backfill),
+  generic local-run evidence, recovery-instance/service-receipt fields, versioned
+  key-generation/owner-shadow rotation rows, monotonic expansion-window project-
+  root journal, per-incarnation worker/root-writer principal registry with unique
+  principals/protected heartbeat, epoch-2 membership audit, service-only committed-
+  election read view/principal, host ledger, recovery/integrity tables, working-
+  tree/Git-control/Git-storage evidence, epoch
+  singleton, package claim pins, and the
+  `running` transition trigger. The additive schema also owns authoritative
+  authorization JSON/scalar mirrors plus immutable validator/guard and retained
+  scoped approval FK; append-only Architect plan versions/entries/history-read
+  audits plus the non-text artifact-header guard; exactly eight preallocated heads
+  from shared `CURRENT_LOCAL_PROJECTION_HEAD_KINDS` per package, the 256-package/
+  2,048-fixed-head cap, migration hold/remediation, and mutation-generation dedup/
+  direct-DML guard. The generic pinned signer/durable-evidence/short-lived-
+  transition-authorization/consumption substrate,
+  checked-in verifier, dedicated principals, recorder, transition-identity guard,
+  and disabled enablement singleton are already installed by Step 0 and are imported
+  unchanged. Every Step 0/S3/S4/S5/S6/enablement graph or required-evidence row uses
+  non-null lifecycle-valid Ed25519 key/generation/domain/envelope/signature fields;
+  there is no database-derived, maintenance, or nullable-signature arm. Canonical
+  transition identity is unique over manifest version, node-or-evidence kind,
+  owner, exact builds, reviewed SHA, epoch-or-none, and canonical predecessor-set
+  digest, so alternate receipt IDs/nonces cannot duplicate one transition.
+  Keep the root default for old writers through the
+  mixed window, backfill/verify every task projection through the database
+  aggregate, and finish `s4_expand` only after `root_ref` is unique and NOT NULL.
+  Add the two and only two database-owned plan-text readers—the audited human
+  history reader and package-bound one-entry resolver—plus the dedicated ACL
+  history route/read audit, non-text artifact headers, generic API/SSE/event/log
+  filters, and dual application-level compatibility readers that make
+  `architect_plan_entries` the only plan-text source and suppress
+  legacy unkeyed prompt digests to exact count-only
+  `{kind:'unknown_legacy_digest',byteCount}` or absence. No second text store is
+  created. The release-pinned PostgreSQL 16 aggregate benchmark must retain p95 <=
+  40 ms and p99 <= 100 ms over 1,000 warmed maximum-cardinality validations.
+  Every v2 producer remains disabled through S5 deployment and both S6 gates. Do **not** enable the
+  project-root trigger while legacy project routes remain live.
+
+  Deploy dual S4 readers that keep legacy approvals non-issuable and legacy audit
+  defaults `unknown_legacy`; deploy v2 processes as authenticated `candidate`,
+  protected fence/containment service, and root routes disabled at epoch 1. The
+  database rejects all three protocol-2 package modes before activation; a process
+  flag is insufficient. The `s4_producers_disabled` step keeps every v2 writer,
+  queue/project ingress, and packet issuer disabled, revokes the v1 web/root-writer
+  database credential, terminates sessions, revokes legacy Redis publish/write
+  credentials, closes old SSE subscriptions, and drains old web, worker, root,
+  event-publisher/subscriber, and genuine pre-trigger processes. Capture the journal watermark only after credential
+  revocation/session termination, then run exactly
+  `npm run project-roots:reconcile-expansion -- --through <generation> --actor <operator-id> --apply`;
+  binding/activation rejects any missing generation, missing outcome, or outcome
+  outside the closed `insert|root_update|archive` vocabulary. Next run
+  `npm run project-roots:bind-v2 -- --actor <operator-id>` and inspect its exact
+  dry-run result, then run
+  `npm run project-roots:bind-v2 -- --actor <operator-id> --apply`; with no database
+  locks it acquires hierarchy/resource fences and compare-and-sets positive,
+  non-overlapping bindings without upgrading legacy approvals. Duplicate, alias,
+  ancestor/descendant, unbound, or maintenance rows remain audited blockers. With
+  ingress still disabled, enable the project-root trigger; at epoch 1 it rejects
+  root mutations and never calls S3. Before the `s4_producers_disabled` receipt,
+  run the deterministic plan-version/entry migration. In each transaction it
+  writes protected entries and replaces raw artifact content/metadata with the
+  non-text header; ambiguous input becomes history-only and blocks recomputation.
+  Then remove raw `promptOverlay`, `requirementContexts`, and `mcpAwareSubtasks`
+  from runtime work-package metadata/API projections and create eligible references
+  only from exact protected entries plus canonical bindings. Before drain, the sole
+  compatibility reader recursively hides every closed prompt alias whether its
+  value is a string, object, array, or nested message structure. After drain, the
+  same bounded checkpointed fingerprint-CAS scrub deletes those alias/value pairs
+  and legacy unkeyed `sha256` prompt snapshots or maps them only to
+  `{kind:'unknown_legacy_digest',byteCount}`; it never re-keys without plaintext.
+  Delete every legacy `forge:task:{taskId}:history`/`:seq` key, rotate to only the
+  schema-allowlisted `forge:task-events:v2:{taskId}:history`/`:seq` namespace, and
+  cursor-scan for zero old keys and zero plan/prompt/content/locator/sentinel values
+  in v2. A revoked publisher must fail to recreate a key. The receipt requires
+  zero raw artifact/runtime text, zero old event keys/unkeyed digests, and mixed-
+  version DB/API/export/live-SSE/snapshot/replay evidence; TTL expiry is not erasure.
+
+  Only after that exact-build S4 receipt exists may #180's compatible S5 consumers
+  and #181's disabled external controller/supported-host harness deploy. Neither may
+  enable ingress or issuance. They import Step 0's pinned Ed25519 key/policy,
+  checked-in Node verifier, and dedicated certificate-authenticated `NOINHERIT`
+  `forge_release_evidence_writer` and `forge_release_transition` principals;
+  remaining S4 does not deploy or widen them. General application roles
+  receive no release-table/sequence DML or recorder/consumer execution. The Node
+  verifier uses one PostgreSQL 16 transaction/connection to lock/read signer policy,
+  key, canonical transition identity, nonce, receipt, and predecessor rows,
+  reconstruct RFC-8785/NFC canonical
+  UTF-8 bytes under domain `forge:epic-172-release-evidence:v1\0`, and call Node
+  `crypto.verify` for Ed25519 while locks remain held. Only then may the fixed-
+  search-path SECURITY DEFINER routine recheck every non-cryptographic predicate
+  and append the immutable row before the same commit. Its unique identity covers
+  manifest version, node-or-evidence kind, owner, exact builds, reviewed SHA,
+  epoch-or-none, and canonical predecessor-set digest, so a distinct receipt ID or
+  nonce cannot duplicate the transition. No PostgreSQL crypto
+  extension or network read is assumed. A graph node or required-evidence receipt
+  must be recorded while its signer key/policy is valid, but after commit it is
+  durable predecessor evidence and never expires. Each state transition separately
+  consumes an append-only signed `forge_epic_172_transition_authorizations` attempt
+  in its distinct domain, bound to exact target/source receipts, owner/build/SHA/
+  epoch/operation/controller identity, nonce, issued-at, and expires-at with lifetime
+  `0 < lifetime <= 30 minutes`. An expired unused attempt stays audit-only and may
+  be replaced by a newly signed exact attempt without rewriting the node; it is not
+  a graph node/predecessor. The consuming transaction uses `clock_timestamp()` at
+  its final statement and records the authorization ID in the consumption. The controller must then produce a fresh signed
+  `s6_pre_activation_green` receipt bound to the exact S4/S5 builds and predecessor
+  evidence. Missing, stale, cross-build, skipped, retried, or runner-self-attested
+  evidence blocks activation.
+
+  Verify no v1 claim remains, keep every registered S3/root writer plus queue/project
+  ingress and packet issuance disabled, then run these literal commands in order:
+
+  ```text
+  npm run protocol:activate-work-package-v2 -- --actor <operator-id>
+  npm run protocol:activate-work-package-v2 -- --actor <operator-id> --apply
+  ```
+
+  The first reports blockers without mutation; the second uses the privileged `READ COMMITTED`
+  transaction, verifies postconditions, is idempotent, and retains the activation
+  audit. Activation requires one fresh candidate host/key/principal set, protected
+  fence service and non-escapable per-run containment, exact root-writer credential/ingress owner, all
+  live local projects positively/hierarchically bound, no reservation/rotation/
+  maintenance blocker, verified task aggregates and journal/binding audit, drained
+  incompatible rows, and installed integrity runbook/commands. Its final statement
+  advances the epoch/active binding-generation pointer and promotes only the audited
+  candidate principals. `project-roots:bind-v2` never advances the epoch. Activation
+  locks/reverifies the exact pre-activation receipt and signer state, inserts a
+  unique append-only consumption, and commits `s4_controlled_activation` in the
+  same transaction while every writer and ingress/issuance path remains
+  disabled. With that exact epoch/build still closed, #181 must produce a fresh
+  signed `s6_post_activation_green` receipt bound to the exact controller run,
+  S4/S5 builds, epoch, and pre-activation receipt. Only then may one #179-owned
+  audited transaction lock/reverify it plus a fresh at-most-30-minute transition
+  authorization and uniquely consume it, compare-and-set the
+  Step 0 singleton from `disabled` to `provisional`, store the exact operation owner,
+  build, SHA, epoch, database `started_at`, and exact deadline
+  `started_at + interval '1560 seconds'`, opening authorization ID/digest,
+  controller login/run identity, digest of the random initial token generated and
+  retained locally by that controller before the opening request, lease
+  generation 1, and
+  `lease_expires_at = least(started_at + interval '45 seconds', expires_at)`, then enable the registered S3/root-writer
+  principals from the activation snapshot, queue/project ingress, and packet
+  issuance last. Every queue claim, project route, grant wake, worker claim, root
+  writer, and packet issuance boundary admits only `active`, or this exact
+  provisional owner while both the database deadline and controller lease are
+  live, before mutation or I/O. Receipt consumption and
+  enablement roll back together; a committed receipt cannot replay. Database error,
+  lease/deadline expiry, or controller death denies new ingress/issuance without lowering epoch.
+
+  Controller leases have one byte-level construction. The external controller
+  generates every raw secret as exactly 32 operating-system CSPRNG bytes.
+  `CONTROLLER_LEASE_DIGEST_DOMAIN_V1` is exactly the 35 UTF-8 bytes of
+  `forge:epic-172-controller-lease:v1\0` (hex
+  `666f7267653a657069632d3137322d636f6e74726f6c6c65722d6c656173653a763100`).
+  The stored digest is the fixed 32-byte
+  `SHA-256(domain_bytes || raw_secret_bytes)`, with raw concatenation and no added
+  delimiter, length prefix, conversion, normalization, or hex/base64/text round
+  trip. Digest/secret function arguments and the stored digest are binary `bytea`.
+  The fixed non-production vector is secret hex
+  `000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f` to digest
+  hex `9889482e88c98806a17cded064e203c3dd4108af93acb8db66a5a699d87b5947`.
+  `web/__tests__/__fixtures__/epic-172-controller-lease-v1.json` is the single
+  language-neutral constants/vector fixture for the controller, S4 database
+  helper/migration, and S6 verifier; production rejects its fixture secret.
+
+  The owner-only fixed-search-path
+  `forge.epic_172_controller_lease_digest_v1(bytea)` rejects lengths other than 32
+  and returns exactly 32 bytes. Every comparison calls
+  `forge.constant_time_equal_32_v1(bytea, bytea)` after locking the singleton. The
+  helper rejects non-32-byte operands, scans and XOR-accumulates all 32 byte
+  positions, and decides only after the loop, with no data-dependent early return.
+  Opening validates a 32-byte digest. A heartbeat accepts the 32-byte raw current
+  secret and 32-byte next digest only as prepared binary parameters, hashes and
+  constant-time-compares the current secret, rejects `next == current`, and then
+  performs its generation compare-and-set. Tests share the fixed vector and reject
+  wrong domain, 0/31/33-byte secret, non-32-byte digest, bit flip, re-encoding,
+  fixture-secret production use, stale/replay, swapped controller, delayed/out-of-
+  order, wrong binding/generation, and `next == current`. Two concurrent identical
+  heartbeats prove exactly one advances or extends the lease. Secret scans cover
+  bind capture, SQL/application logs, traces, errors, audit, inspect output, Redis,
+  and database state.
+
+  The exact controller certificate login is non-superuser `NOINHERIT` with no
+  `SET ROLE`/session-authorization authority. Every 10 seconds it invokes the
+  fixed-search-path, `PUBLIC`-revoked heartbeat, which derives immutable
+  `session_user`, locks the singleton, and verifies operation/run/opening-
+  authorization digest/controller-token digest/fingerprint/generation before
+  extending only to `least(clock_timestamp()+45 seconds, expires_at)`. For each
+  call, the external controller generates the fresh next token locally and sends
+  the current raw secret plus only the next canonical v1 digest as prepared/
+  binary parameters over its direct mutually authenticated database connection.
+  The heartbeat hashes and constant-time-compares the current secret and
+  compare-and-sets its digest plus lease generation to the supplied next digest/
+  generation; it returns no raw token. The
+  presented token is consumed; reuse, theft after rotation, delay, or out-of-order
+  generation cannot extend the lease. Raw current/next tokens are never durably
+  stored, audited, logged, interpolated into SQL, returned by inspect, or exposed
+  to worker/writer principals. Every
+  provisional boundary calls the same database gate. Lease/deadline expiry lets the
+  first boundary or separately credentialed watchdog atomically change the sole
+  singleton to `disabled`, clear all flags, and append one non-authoritative
+  `expired_disabled` transition audit. Suite/evidence/Checks failure or cancellation
+  uses the exact authenticated failure transition to append `failed_disabled`; if
+  it cannot commit, the lease closes within 45 seconds. The append-only audit's
+  only dispositions are
+  `opened|heartbeat|failed_disabled|expired_disabled|manually_disabled|promoted_active`
+  and none is gate authority.
+
+  Operators use only these provisional-window commands and the layman-readable
+  `docs/operators/epic-172-provisional-enablement-v1.md` procedure:
+
+  ```text
+  npm run protocol:inspect-epic-172-provisional-enablement -- --operation <operation-id>
+  npm run protocol:disable-epic-172-provisional-enablement -- --actor <operator-id> --expected-operation <operation-id>
+  npm run protocol:disable-epic-172-provisional-enablement -- --actor <operator-id> --expected-operation <operation-id> --apply
+  ```
+
+  Disable compare-and-sets only that provisional owner/fingerprint to `disabled`,
+  closes every ingress/issuance flag atomically, appends `manually_disabled`,
+  retains epoch/evidence, and cannot disable another owner or active readiness.
+
+  After durable `ingress_and_issuance_enabled`, the controller runs the separate
+  host preflight plus exact `test:mcp:contract`, `test:mcp:postgres`,
+  `test:mcp:issuance`, `e2e:mcp-operator`, and `test:mcp:host-boundary` suites for
+  the enabled S4/S5 builds and epoch. The no-retry enabled DAG is bounded to 660
+  seconds: 60 orchestration/scheduling, 30 preflight, all five suites concurrently
+  in isolated namespaces within 420, 120 teardown/out-of-band destruction-reimage/
+  authoritative Checks conclusion, and 30 evidence/final transition. Ten-second
+  heartbeats continue throughout; the 1,560-second deadline leaves 900 seconds of
+  failure/cleanup margin. It records a separate append-only signed
+  required-evidence row of kind `enabled_build_tests_green`, bound to exact
+  App/key/run/job, post-activation receipt, enablement evidence, manifest/executed-
+  ID/result/output-scan, teardown, and destruction/reimage digests, with no skip,
+  retry, or missing ID. This evidence kind is not an eleventh graph node. One final-
+  readiness transaction locks/reverifies it, the enablement row, a fresh exact
+  at-most-30-minute final transition authorization, and the
+  controller's signed final-readiness envelope, atomically and uniquely consumes
+  both the enabled-build and `ingress_and_issuance_enabled` receipts, then appends the unique
+  signed retained `s5_s6_release_ready` linking both and promotes the same unexpired
+  owner from `provisional` to `active` with null expiry, clears lease/token fields,
+  and appends `promoted_active`. Rollback removes both
+  consumptions/readiness/promotion; absent, failed, stale, expired, or mismatched
+  evidence leaves readiness absent and ingress/issuance closed. No compatible-reader deployment occurs after
+  activation. The checked-in procedures are
+  `docs/operators/project-root-binding-v2.md` and
+  `docs/operators/work-package-protocol-v2-cutover.md`; ad hoc SQL is forbidden.
+  Before routine restarts, install
+  `docs/operators/work-package-instance-replacement-v2.md` and run the literal dry-run
+  `npm run protocol:replace-work-package-instance -- --candidate <new-instance-id> --replaces <old-instance-id> --actor <operator-id>` followed, after inspection,
+  by literal apply
+  `npm run protocol:replace-work-package-instance -- --candidate <new-instance-id> --replaces <old-instance-id> --actor <operator-id> --apply`. The separate
+  maintenance principal performs bounded audited epoch-2 replacement without
+  replaying activation or lowering the epoch.
+
+  After final readiness, #179 owns the separately gated restartable post-drain
+  operation/later migration exposed only through these literal commands and guide:
+
+  ```text
+  npm run protocol:scrub-legacy-runtime-roots -- --actor <operator-id>
+  npm run protocol:scrub-legacy-runtime-roots -- --actor <operator-id> --apply
+  npm run protocol:inspect-legacy-runtime-root-scrub -- --operation <operation-id>
+  docs/operators/legacy-runtime-root-scrub-v2.md
+  ```
+
+  A path-free checkpoint retains
+  operation/last-key/count/state/actor/time; applied batches are intentionally not
+  rolled back, and column drop requires the support window plus a zero-remaining
+  inspect result. The operation clears legacy audit paths and records only
+  aggregate counts; it is not an ordinary expansion migration and never derives
+  `rootRef` from a path. Dry-run, first apply, every later batch, and resume lock/
+  revalidate retained `s5_s6_release_ready`, its linked consumed
+  `enabled_build_tests_green` receipt, exact builds/epoch/controller identity, and
+  predecessor/enablement rows; absent, failed, stale, cross-bound, or incomplete
+  evidence is actionless and creates no operation/checkpoint. SQL, Drizzle, and conflict predicates must match. Rollback
+  keeps additive schema/v2 data and the monotonic epoch, disables ingress/issuance,
+  proves every per-run containment group empty and intent terminal/held, and never
+  restarts a legacy issuer/root writer. Binding-key rotation follows the privileged
+  pending-key protocol, never direct rebind. #180 reads this v2 evidence and #181
+  owns mixed-version, migration, discriminated multi-lease, failure-injection, finalization, and
+  rollback sentinels.
+- Durable Forge control/run state and ACP working exchange move out of project
+  `.forge/task-runs`. Protected service-owned state is inaccessible to ACP; the
+  bounded per-run exchange has a manifest/final digest in generic local evidence.
+  Sandbox-generated outputs remain distinct from host-repository writes in
+  artifacts without treating same-owner mode `0700` as a security boundary.
 
 ### S5 — UI and copy hardening
 
@@ -1526,8 +2926,189 @@ none of those slices may weaken this state, precedence, or lock contract.
   grant union, preservation of concurrent package metadata, one packet-metadata
   artifact per run on success/failure, and that deferred/unknown capabilities are
   absent from the executable MCP instruction block. ACP copy explicitly preserves
-  the non-sandbox warning.
+  the non-sandbox warning. Assembly crash fixtures stop before intent, after
+  `assembling` but before the first read, during assembly, after the final byte but
+  before the immutable snapshot, and after that snapshot. Every indeterminate pre-
+  snapshot case terminalizes as `assembly_unconfirmed` with no counts/`rootRef`
+  and no reassembly. Packet-free and handoff-only fixtures prove exactly one ACP
+  call per generic row, no validation retry, the live exact-owner typed-
+  `pre_io_refusal` exception, and orphan recovery to `uncertain`. Failure-selection
+  fixtures prove that an already persisted stage/delivery cause wins; without one,
+  selection is exactly `authorization_changed → execution_lease_expired →
+  local_evidence_lease_expired → issuance_lease_expired → delivery/stage-specific
+  cause → worker_stopped`, with `worker_stopped` residual. Redaction
+  fixtures pass every closed category through producer, database, parser, API, and
+  S5, and reject an unknown key carrying a path/content/prompt/credential sentinel
+  before persistence or rendering. Authorization fixtures exhaust the two valid
+  snapshot arms and every invalid source/mode/approval-FK/nonce cross-product in
+  PostgreSQL, Drizzle, task/project/artifact APIs, and S5; task and project
+  `always_allow` readers return byte-equivalent locked project-decision revision/
+  root/capability/fingerprint fields. They also reject every JSON/scalar mismatch,
+  authorization update, and otherwise valid cross-package/task/project approval
+  tuple through the retained composite FK. Protocol-v2 fixtures require non-null,
+  exact-equality task/package/run/local-evidence IDs and prove null cannot bypass
+  `MATCH SIMPLE` or either partial unique index. Direct table DML is denied; only
+  the typed relational constructor builds JSONB/scalars. Raw duplicate object keys
+  fail before JSON/JSONB conversion, and retained JSONB still must equal every
+  mirror. A second dedicated principal copies still-
+  live execution/local/packet/W2 tokens and attempts heartbeat, governed read,
+  assembly, exposure, submission, and finalization before expiry and before/after
+  original-principal revocation; every attempt fails epoch → pinned instance →
+  `current_user`, and token sentinels are absent from ACP/exchange/queue/log/API/
+  export/error sinks. Accepted/rejected plan-text sentinels remain only in insert-
+  only protected plan entries; the artifact header is non-text. Tests cover stable
+  IDs, canonical base-10 plan version, 1..256-character ID bounds, NFC/RFC-8785
+  bytes, keyed domain digest, duplicate/reordered/Unicode input, deterministic and
+  ambiguous legacy mapping, key rotation, and update/delete rejection. Authorized
+  history commits its bounded read audit; unauthorized/cross-task/wrong-stage
+  history and stale/digest/key/agent/requirement/binding references return no text.
+  Real-role database tests prove only the non-login owner can directly read plan
+  tables: web/worker/application/reporting/migration/maintenance direct `SELECT`,
+  copied-query, catalog/view discovery, hostile search-path, and temp-shadow
+  attempts fail. Exactly the fixed-search-path, `PUBLIC`-revoked audited human-
+  history and package-bound one-entry resolver functions remain executable; neither
+  enumerates text or accepts free-form SQL.
+  Generic task/artifact APIs, live events, SSE snapshot/replay, queues/logs/exports/
+  diagnostics/errors expose only allowlisted IDs/progress. A seeded legacy Redis
+  history key is purged after publisher credential revocation/drain, zero-scanned,
+  and cannot be recreated; v2 history contains no sentinel. Only eligible fragments
+  appear ephemerally in provider/ACP capture; whole/rejected/ineligible text does
+  not. Normal, no-command, stderr-warning, no-op
+  handoff start, and no-op handoff completion prompt producers are covered by one
+  repository-wide alias sentinel. Seeded legacy unkeyed prompt hashes are exact
+  count-only `{kind:'unknown_legacy_digest',byteCount}` or absent before drain and
+  removed by the checkpoint afterward; boolean/truncation/prefix/surrogate shapes
+  fail, and mixed-version database/API/export/SSE fixtures prove no hash is re-
+  keyed or exposed. String/object/array/nested-message values under every closed
+  prompt alias are hidden by the sole compatible reader; crash/resume/fingerprint-
+  conflict tests prove the post-drain scrub removes them without lost updates.
+  Projection fixtures prove final-generation transaction-local
+  dedup, direct-DML abort, exact parity with the eight-value
+  `CURRENT_LOCAL_PROJECTION_HEAD_KINDS`, one preallocated head per kind/package,
+  count-neutral revision/FK/fingerprint/CAS advancement, immutable history outside
+  the cap, exactly 256 packages/2,048 heads, and typed package-257 whole-task
+  `active → archive_pending → legacy_archived` inspect/archive/checkpoint path.
+  It rejects reparent/delete and an over-limit replacement, and retains all source
+  evidence while a separate at-most-256 replacement has exact heads. The PostgreSQL 16 maximum-
+  cardinality p95 <= 40 ms/p99 <= 100 ms budgets remain unchanged.
 - Plus the S2 preview==approval==handoff invariant suite.
+- Approval PostgreSQL fixtures race package approve/deny/revoke/reapprove and
+  project grant changes in both lock orderings. They prove every committed decision
+  row is immutable, exactly one preallocated current pointer CAS wins, losing
+  decision/pointer transactions roll back together, and historical audits still
+  resolve their original parent rather than the new pointer.
+- A static release-order suite imports Step 0's data-only
+  `web/lib/mcps/epic-172-release-order-v1.json` through its sole
+  `web/lib/mcps/epic-172-release-order.ts` validator, checks the shared node registry
+  plus separately named `codeDependencyGraph` and `runtimeActivationGraph` graphs, and rejects
+  cycles, missing
+  `step0_retention_bridge → s3_issue_178 → s4_expand →
+  s4_producers_disabled → s5_compatible_consumers_deployed →
+  s6_pre_activation_green → s4_controlled_activation →
+  s6_post_activation_green → ingress_and_issuance_enabled →
+  s5_s6_release_ready` edges, obsolete `s4_activate`, every truncated chain,
+  graph/evidence substitution, a copied graph/helper, and any Step 0 import of S3/#178 or
+  S4 expansion/producer symbols. It refuses #178 until all project-management
+  create/update/repoint/archive/delete ingress is closed and drained and without
+  route/retention-FK/hard-delete-guard evidence. A wording-parity sentinel rejects
+  a narrowed "delete ingress" prerequisite outside its own denylist fixture. It
+  refuses remaining S4 expansion or producers without predecessor
+  evidence. It also proves Step 0 installed the generic signer/durable-evidence/
+  short-lived-transition-authorization/consumption stores, verifier, dedicated
+  principals, recorder, transition-identity uniqueness, sole authoritative disabled
+  enablement singleton, and append-only transition audit before its signed empty-predecessor receipt and
+  before S3; downstream slices only import that substrate. It validates dependencies per manifest step: exact
+  `owner:{issue:179,slice:'step0'}` plus `[176,177]` issue dependencies for
+  `step0_retention_bridge`, and exact `owner:{issue:178,slice:'s3'}` plus the Step 0
+  postcondition dependency for `s3_issue_178`; exact
+  `owner:{issue:179,slice:'s4'}` for `s4_expand`, `s4_producers_disabled`,
+  `s4_controlled_activation`, and `ingress_and_issuance_enabled`; exact
+  `owner:{issue:180,slice:'s5'}` for `s5_compatible_consumers_deployed`; and exact
+  `owner:{issue:181,slice:'s6'}` for `s6_pre_activation_green`,
+  `s6_post_activation_green`, and `s5_s6_release_ready`. A joint-owner shape,
+  header/manifest drift, or remaining-slice attempt to generate, rewrite, fork,
+  shadow, or extend Step 0's files fails. A lock-order suite imports #178/S3's
+  `web/lib/mcps/mcp-admission-lock-order-v2.json` through its one helper, proves exact parity with the
+  canonical ADR JSON, and proves every declared transaction path is an applicable-
+  row ordered subsequence with no reverse edge, synthetic filler lock, or second
+  runtime sequence. Release-evidence fixtures reject unknown fields, wrong owner/
+  graph/build/SHA/epoch/predecessor/controller identity, duplicate nonce, future
+  node issue/recording outside signer validity, wrong domain/key/signature, retired-key new
+  evidence, cross-node/kind substitution, and any unsigned/null-signature or
+  database-maintenance arm for every Step 0/S3/S4/S5/S6/enablement row. It proves
+  Step 0 installed the generic store/verifier/principals/recorder before its signed
+  first receipt and S3. Distinct receipt IDs/nonces with one canonical manifest,
+  node-or-kind, owner, builds, SHA, epoch, and predecessor-set identity conflict.
+  Durable-node fixtures wait over 30 minutes and still consume the exact retained
+  node using a separate fresh authorization. Transition-authorization fixtures
+  reject zero/over-30-minute lifetime, expiry, wrong source/target/operation/
+  controller/domain and replay, and permit a newly signed attempt after expiry
+  without duplicating the durable node.
+  Two consumers race one transition
+  receipt and exactly one wins; failure after every verification/consumption/state
+  write rolls back consumption and leaves the durable receipt retryable with a
+  still-valid or newly signed transition authorization. General
+  application roles cannot record/consume. The checked-in Node verifier is tested
+  on stock PostgreSQL 16 with locked signer rows and no crypto extension/network.
+  `enabled_build_tests_green` is a separate signed required-evidence kind, not a
+  graph node; missing/failed/stale/cross-bound preflight or any of the exact five
+  suites prevents final readiness. One transaction uniquely consumes both the
+  enabled-build and `ingress_and_issuance_enabled` receipts, appends one uniquely
+  identified `s5_s6_release_ready`, and promotes only the same unexpired
+  provisional owner to `active`; rollback removes both consumptions and promotion.
+  Database-time fixtures require the exact 1,560-second deadline, exact controller
+  login/run/authorization/token digest, 10-second heartbeats, and lease capped at
+  45 seconds and the overall deadline. They gate every ingress/issuance boundary,
+  race heartbeat with failure/watchdog/disable/expiry/promotion, prove one
+  authoritative singleton winner plus append-only non-authoritative audit, reject
+  reused/stolen-after-rotation/delayed/out-of-order token generations while only
+  the authenticated controller receives the raw next token, and fail
+  closed on expiry/controller death within 45 seconds/suite/evidence/PostgreSQL
+  failure without epoch lowering. A near-cap no-retry fixture completes the exact
+  660-second DAG and promotes with 900 seconds remaining. It exercises the canonical inspect and
+  dry-run/apply disable commands plus
+  `docs/operators/epic-172-provisional-enablement-v1.md`. Scrub dry-run/apply/batch/resume are actionless for every
+  invalid readiness/evidence variant.
+- #179's release gate also runs the real PostgreSQL and host-boundary suites, not
+  mocks: heartbeat must visibly wait in epoch → exact instance → generation/
+  rotation order and revalidate after each barrier. Deterministic W2 barriers run
+  before and after database recovery-lease expiry, committed-receipt expiry, the
+  protected service's no-grant proof, the protected `expired_ungranted` tombstone,
+  new-challenge creation, the database compare-and-set of the exact old owner/
+  election/receipt, the append-only database election tombstone, the greater
+  recovery-epoch/candidate commit, and service verification of that greater epoch
+  plus both tombstones followed by new-challenge burn. They also run after both
+  expiries but before no-grant proof. Every boundary injects crash/rollback and a
+  delayed old W2/receipt before and after each commit. No-grant without both
+  expiries, either tombstone alone, an uncommitted/unchanged epoch, or an already
+  granted takeover is actionless; only the exact greater-epoch protected and
+  database tombstones permit a new owner. The watchdog login may invoke only its zero-argument, fixed-path,
+  non-login-owned function. Migration fixtures prove nullable/no-default
+  `root_ref`, the separate default, insert-time null filling, re-null rejection,
+  unrelated updates to still-null rows, concurrent uniqueness, checkpointed bounded
+  backfill, zero-null proof validation, and the final short `SET NOT NULL` under old-
+  writer, crash, lock, and disk/WAL pressure. Journal fixtures require exactly one
+  `insert|root_update|archive` outcome per generation; a static parity sentinel
+  rejects stale `deleted_row`, `deleted-row`, or generic delete outcomes in schema,
+  reconciler, activation, fixtures, and architecture contracts; the sentinel's own
+  denylist fixture is the only allowlisted occurrence. Network-listener
+  partial-clone fixtures exercise release-pinned supported and unsupported Git
+  binaries (or digest-bound deterministic shims), inspect the exact environment and
+  argument vector of every probe and operational child, and require
+  `GIT_NO_LAZY_FETCH=1` everywhere. Supported probes require global
+  `--no-lazy-fetch` on operational children; unsupported probes forbid it; missing,
+  mismatched, or ambiguous probe evidence fails closed. The suite proves zero
+  network connections, zero object-storage write syscalls, and unchanged loose-
+  object, pack, index, multi-pack-index, and commit-graph bytes. Linux fixtures prove
+  paired trusted-shim/untrusted-run principals,
+  `nosuid,nodev`, setid/capability rejection, and proc/ptrace/signal isolation.
+  Principal-lifecycle fixtures exhaust per-host and hard 256-slot installation
+  bounds, assert the deduplicated capacity alert and blocked unreserved additions,
+  and crash every
+  revoke, session-termination, tombstone, certificate-destruction, role-drop, and
+  bounded-GC boundary without identity reuse. Marker fixtures exhaust the pending
+  and acknowledged `local_invocation_uncertain` union arms, fingerprint rotation,
+  exact replay, and rejection of mixed fields.
 
 ## <a id="43-re-scope"></a>#43 re-scope
 

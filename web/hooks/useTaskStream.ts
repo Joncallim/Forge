@@ -46,10 +46,8 @@ interface UseTaskStreamResult {
   error: string | null
   refreshRevision: number
   taskLogRevision: number
-  // null means no questions:created/questions:answered event has been
-  // received yet this session — callers should fall back to initial data
-  // fetched on mount. Once an event arrives (even with an empty array), this
-  // is trusted as the definitive current state.
+  // Clarification text is intentionally never sourced from Redis. Callers
+  // refresh generic summaries, then read text through audited history.
   questions: TaskQuestion[] | null
 }
 
@@ -180,7 +178,6 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
   const [taskStatus, setTaskStatus] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [questions, setQuestions] = useState<TaskQuestion[] | null>(null)
   const [refreshRevision, setRefreshRevision] = useState(0)
   const [taskLogRevision, setTaskLogRevision] = useState(0)
 
@@ -350,28 +347,8 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
       setTaskLogRevision((revision) => revision + 1)
     })
 
-    es.addEventListener('questions:created', (e) => {
-      try {
-        const data = JSON.parse((e as MessageEvent).data)
-        const incoming: TaskQuestion[] = Array.isArray(data.questions) ? data.questions : []
-        // A fresh architect run replaces the prior question set for the task.
-        setQuestions(incoming)
-      } catch {
-        // Ignore malformed event
-      }
-    })
-
-    es.addEventListener('questions:answered', (e) => {
-      try {
-        const data = JSON.parse((e as MessageEvent).data)
-        const answered: TaskQuestion[] = Array.isArray(data.questions) ? data.questions : []
-        setQuestions((prev) =>
-          (prev ?? []).map((q) => answered.find((a) => a.id === q.id) ?? q),
-        )
-      } catch {
-        // Ignore malformed event
-      }
-    })
+    es.addEventListener('questions:created', requestDetailRefresh)
+    es.addEventListener('questions:answered', requestDetailRefresh)
 
     es.addEventListener('task:status', (e) => {
       try {
@@ -416,5 +393,5 @@ export function useTaskStream(taskId: string): UseTaskStreamResult {
     }
   }, [taskId, flushChunks, requestDetailRefresh, requestGlobalTaskStatusRefresh])
 
-  return { runs, artifacts, taskStatus, error, questions, refreshRevision, taskLogRevision }
+  return { runs, artifacts, taskStatus, error, questions: null, refreshRevision, taskLogRevision }
 }

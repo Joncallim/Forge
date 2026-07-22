@@ -190,6 +190,13 @@
       "when": 1784266800000,
       "tag": "0026_epic_172_s3_grant_lifecycle",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1784270400000,
+      "tag": "0027_epic_172_s4_packet_context",
+      "breakpoints": true
     }
   ]
 }

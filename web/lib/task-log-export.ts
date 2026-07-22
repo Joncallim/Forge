@@ -62,9 +62,8 @@ function taskErrorSnapshot(errorMessage: string): string {
   const snapshot = sanitizePromptSnapshot(errorMessage)
   return [
     'Task error snapshot:',
-    `byte_length=${snapshot.byteLength}`,
-    `sha256=${snapshot.sha256}`,
-    `truncated=${snapshot.truncated ? 'true' : 'false'}`,
+    `kind=${snapshot.kind}`,
+    `byte_count=${snapshot.byteCount}`,
   ].join(' ')
 }
 
@@ -72,19 +71,11 @@ function entryFrontMatter(log: TaskLog): string[] {
   const frontMatter = isRecord(log.frontMatter) ? log.frontMatter : {}
   const model = firstString([frontMatter.model, frontMatter.modelId, frontMatter.modelIdUsed])
   const connector = firstString([frontMatter.connector, frontMatter.providerType, frontMatter.provider])
-  const promptSnapshot = isRecord(frontMatter.prompt)
-    ? frontMatter.prompt
-    : isRecord(frontMatter.promptInput)
-      ? frontMatter.promptInput
-      : null
   return [
     `event_type: ${yamlString(log.eventType)}`,
     `source: ${yamlString(log.source)}`,
     `model: ${yamlString(model)}`,
     `connector: ${yamlString(connector)}`,
-    `prompt_byte_length: ${typeof promptSnapshot?.byteLength === 'number' ? promptSnapshot.byteLength : 'null'}`,
-    `prompt_sha256: ${yamlString(typeof promptSnapshot?.sha256 === 'string' ? promptSnapshot.sha256 : null)}`,
-    `prompt_truncated: ${promptSnapshot?.truncated === true ? 'true' : 'false'}`,
   ]
 }
 
@@ -98,7 +89,6 @@ export function formatTaskLogsMarkdown(input: TaskLogExportInput): string {
   const logs = input.logs.map((log) => sanitizeLogRecordForOutput(log))
   const model = latestFrontMatterValue(logs, 'model')
   const connector = latestFrontMatterValue(logs, 'connector')
-  const prompt = sanitizePromptSnapshot(input.task.prompt)
   const taskTitle = sanitizeWorkerMessage(input.task.title)
   const lines = [
     '---',
@@ -112,9 +102,6 @@ export function formatTaskLogsMarkdown(input: TaskLogExportInput): string {
     `completed_at: ${yamlString(iso(input.task.completedAt))}`,
     `model: ${yamlString(model)}`,
     `connector: ${yamlString(connector)}`,
-    `prompt_byte_length: ${prompt.byteLength}`,
-    `prompt_sha256: ${yamlString(prompt.sha256)}`,
-    `prompt_truncated: ${prompt.truncated ? 'true' : 'false'}`,
     '---',
     '',
     `# Task Log: ${taskTitle}`,

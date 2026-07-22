@@ -159,7 +159,6 @@ export async function POST(request: NextRequest) {
       frontMatter: {
         model: data.pmProviderConfigId ?? null,
         connector: 'task-default',
-        prompt: data.prompt,
       },
       level: 'info',
       message: `Task "${task.title}" was created and queued for planning.`,

@@ -51,10 +51,14 @@ same project when they ask for the same or narrower capabilities.
   stay visible near the `Always allow` action because that choice reduces future
   prompts for the same project.
 
-Every filesystem packet decision is auditable by task, work package, optional
-agent run, optional grant approval id, status, requested capabilities, approved
-capabilities, root, included file count, byte count, omitted count, and redaction
-summary. Audit rows must not persist raw file contents.
+Every filesystem packet decision is auditable by task, work package, run, grant
+decision, and bounded typed evidence. The privacy-safe packet vocabulary is an
+opaque project `rootRef`; bounded included/byte/omitted/redaction counts; separate
+assembly, delivery, and terminal outcome; and a closed failure code/stage. An
+audit, artifact, log, event, queue payload, or API response must not persist or
+display an absolute/relative path, selected name, excerpt, file content, prompt,
+or raw/free-text error. ADR 0009 owns the detailed claim, evidence, recovery, and
+compatibility schema; this ADR owns the read-only/no-live-handle boundary.
 
 Project-level approval does not widen the beta security boundary. It only saves
 the operator's decision for the same project and covered capabilities. It still
@@ -64,9 +68,12 @@ allowlist.
 
 ## Consequences
 
-This closes the MCP Filesystem epic for the safe beta path: installation/status,
-approval, runtime enforcement, and auditability are implemented without exposing
-arbitrary host filesystem access to agents.
+When the ADR 0009 S3–S6 slices are implemented and their release evidence passes,
+this decision completes the Forge-issued MCP-channel beta path for setup,
+approval, cooperative enforcement, and auditability without issuing arbitrary
+filesystem access through that MCP channel. It does **not** confine an Agent
+Client Protocol (ACP) process: ACP may still have shell, network, environment,
+credential, or equivalent host-filesystem access outside Forge's MCP channel.
 
 Future live filesystem MCP execution needs a separate design for hard process
 sandboxing, path-scoped tool brokering, write approval, and adversarial prompt

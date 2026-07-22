@@ -9,6 +9,7 @@ import { redis } from '@/lib/redis'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
+import { publishTaskEvent } from '@/worker/events'
 
 const retrySchema = z.object({
   pmProviderConfigId: z.string().uuid().nullable().optional(),
@@ -104,19 +105,17 @@ export async function POST(
     }
 
     await redis.lpush(queueName, JSON.stringify(queuePayload))
-    await redis.publish('forge:task:' + taskId, JSON.stringify({
-      type: 'task:status',
+    await publishTaskEvent(taskId, 'task:status', {
       status: nextStatus,
       errorMessage: null,
       updatedAt: task.updatedAt.toISOString(),
-    }))
+    })
 
     await recordTaskLogBestEffort({
       eventType: 'task.retried',
       frontMatter: {
         model: providerId ?? null,
         connector: providerId ? 'provider-override' : 'task-default',
-        prompt: task.prompt,
       },
       level: 'info',
       message: retryHandoff

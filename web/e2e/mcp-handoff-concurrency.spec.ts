@@ -13,6 +13,7 @@ import {
   mutateTaskFilesystemGrants,
 } from '../lib/mcps/filesystem-grant-reconciliation'
 import { applyEpic172Step0E2EBridge } from './epic-172-step0-bridge'
+import { computeCredentialDigest } from '../lib/session-credential-digest'
 
 const databaseUrl = process.env.DATABASE_URL
 if (!databaseUrl) throw new Error('DATABASE_URL is required for MCP handoff concurrency tests.')
@@ -265,7 +266,9 @@ test.describe('MCP handoff optimistic concurrency', () => {
 
   test.afterEach(async () => {
     if (!sql || !writer) return
-    await Promise.all(sessionsToDelete.splice(0).map((sessionId) => redis.del(`session:${sessionId}`)))
+    await Promise.all(sessionsToDelete.splice(0).map((sessionId) => (
+      redis.del(`session:v2:${computeCredentialDigest(sessionId).digest.toString('hex')}`)
+    )))
     // Grant decisions and runtime audits are retained evidence. The fixtures
     // use random identities, so archive their projects instead of requiring the
     // ordinary application role to truncate protected history.

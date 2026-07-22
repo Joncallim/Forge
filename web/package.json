@@ -23,6 +23,14 @@
     "protocol:epic-172-release": "tsx scripts/epic-172-release.ts",
     "db:seed-agents": "npx tsx db/seed-agents.ts",
     "db:seed-providers": "npx tsx db/seed-providers.ts",
+    "protocol:bootstrap-epic-172-s4-roles": "tsx scripts/bootstrap-epic-172-s4-roles.ts",
+    "protocol:scrub-legacy-leakage": "tsx scripts/scrub-legacy-leakage.ts",
+    "protocol:inspect-local-projection-overlimit": "tsx scripts/inspect-local-projection-overlimit.ts",
+    "protocol:archive-local-projection-overlimit": "tsx scripts/archive-local-projection-overlimit.ts",
+    "session-credentials:reconcile": "tsx scripts/reconcile-session-credentials.ts",
+    "project-roots:reconcile-expansion": "bash scripts/ci/reconcile-migration-0027-root-refs.sh",
+    "project-roots:strict-cutover": "bash scripts/ci/cutover-migration-0027-root-ref.sh",
+    "test:migration-0027-upgrade": "bash scripts/ci/prove-migration-0027-upgrade.sh",
     "auth:reset-password": "tsx scripts/reset-password.ts",
     "worker": "tsx worker/index.ts",
     "worker:dev": "tsx watch worker/index.ts",
@@ -41,7 +49,10 @@
     "e2e:epic-172-disabled-ingress": "playwright test e2e/mcp-handoff-concurrency.spec.ts --project=chromium-desktop --grep @epic172-disabled-ingress",
     "e2e:ui": "playwright test --ui",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:unit:zero-skip": "vitest run --exclude __tests__/epic-172-s4-postgres.test.ts",
+    "test:mcp:s4-postgres": "FORGE_S4_REQUIRE_POSTGRES_TEST=1 vitest run __tests__/epic-172-s4-postgres.test.ts",
+    "test:watch": "vitest",
+    "test:mcp:issuance": "vitest run __tests__/epic-172-s4-context.test.ts __tests__/epic-172-s4-postgres.test.ts __tests__/work-package-handoff.test.ts"
   },
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.54.1",
