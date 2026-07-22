@@ -392,7 +392,7 @@ jobs:
         run: |
           set -o pipefail
           report="$(mktemp)"
-          npm run test:mcp:s4-postgres -- --reporter=line | tee "$report"
+          npm run test:mcp:s4-postgres -- --reporter=default | tee "$report"
           if grep -Eq '[1-9][0-9]* skipped' "$report"; then
             echo 'The mandatory S4 PostgreSQL proof was skipped.' >&2
             exit 1
