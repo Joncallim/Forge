@@ -172,7 +172,7 @@ describe('production protected Architect entry materialization', () => {
     })
     const firstEntries = appendProtectedArchitectClarifications({
       entries: structuralEntries,
-      openQuestions: [{ question: 'Which branch?', suggestions: ['main', 'release'] }],
+      openQuestions: [{ questionId: '00000000-0000-4000-8000-000000000001', question: 'Which branch?', suggestions: ['main', 'release'] }],
       answeredQuestions: [],
     })
     const first = materializeArchitectPlanEntries({

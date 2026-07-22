@@ -6634,6 +6634,10 @@ ALTER TABLE public.task_questions
     ON UPDATE RESTRICT ON DELETE RESTRICT,
   ADD CONSTRAINT task_questions_answer_reference_fk FOREIGN KEY (answer_reference_id)
     REFERENCES public.architect_clarification_answers(id) ON UPDATE RESTRICT ON DELETE RESTRICT;
+ALTER TABLE public.task_questions
+  ALTER COLUMN question DROP NOT NULL,
+  ALTER COLUMN suggestions DROP NOT NULL,
+  ALTER COLUMN suggestions DROP DEFAULT;
 CREATE TABLE public.architect_clarification_answer_writes (
   id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
   answer_id uuid NOT NULL REFERENCES public.architect_clarification_answers(id) ON UPDATE RESTRICT ON DELETE RESTRICT,

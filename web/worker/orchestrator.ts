@@ -1,4 +1,5 @@
 import { streamText } from 'ai'
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { db } from '../db'
@@ -56,6 +57,7 @@ import { readS4RuntimeModeV1 } from '../lib/mcps/s4-lease'
 import {
   appendProtectedArchitectClarifications,
   buildProtectedArchitectPlanEntries,
+  type ProtectedOpenQuestion,
 } from './protected-architect-plan'
 import type { ArchitectPlanEntryEnvelope, ArchitectPlanEntryInput } from '../lib/mcps/architect-plan-entries'
 
@@ -709,7 +711,7 @@ export async function previousPlanForArchitectRun(input: {
  * previously stored questions for the task. Suggested answers are optional and
  * stored with each question. Returns the number of open questions persisted.
  */
-async function persistOpenQuestions(taskId: string, questions: OpenQuestion[]): Promise<number> {
+async function persistOpenQuestions(taskId: string, questions: readonly ProtectedOpenQuestion[], artifactId: string, planVersion: string): Promise<number> {
   // Clear any prior questions from an earlier architect run for this task —
   // each run represents the current/latest plan, so stale questions from a
   // previous round should not linger.
@@ -727,9 +729,9 @@ async function persistOpenQuestions(taskId: string, questions: OpenQuestion[]): 
     .insert(taskQuestions)
     .values(
       questions.map((question) => ({
-        taskId,
-        question: question.question,
-        suggestions: question.suggestions,
+        id: question.questionId, taskId,
+        questionEntryId: `clarification_question:${question.questionId}`,
+        sourcePlanArtifactId: artifactId, sourcePlanVersion: Number(planVersion),
         status: 'open' as const,
       })),
     )
@@ -738,8 +740,6 @@ async function persistOpenQuestions(taskId: string, questions: OpenQuestion[]): 
   await publishTaskEvent(taskId, 'questions:created', {
     questions: rows.map((row) => ({
       id: row.id,
-      question: row.question,
-      suggestions: row.suggestions,
       status: row.status,
     })),
   })
@@ -783,7 +783,7 @@ function answeredQuestionSnapshot(
   questions: Array<typeof taskQuestions.$inferSelect>,
 ): AnsweredQuestion[] {
   return questions.map((q) => ({
-    question: q.question,
+    question: q.question ?? '',
     answer: q.answer ?? '',
   }))
 }
@@ -1072,9 +1072,10 @@ async function runArchitect(
           planText: artifactPlanText,
           prepared,
         })
+    const protectedOpenQuestions: ProtectedOpenQuestion[] = prepared.questions.map((question) => ({ ...question, questionId: randomUUID() }))
     const protectedEntries = appendProtectedArchitectClarifications({
       entries: [...protectedStructuralEntries, ...previousClarifications],
-      openQuestions: prepared.questions,
+      openQuestions: protectedOpenQuestions,
       answeredQuestions,
     })
     const artifact = await createArchitectPlanArtifact(task.id, run.id, artifactPlanText, planVersion, {
@@ -1092,7 +1093,7 @@ async function runArchitect(
         ? previousPlanArtifact.metadata.mcpExecutionDesign
         : prepared.mcpExecutionDesign,
     }, protectedEntries)
-    const openQuestionCount = await persistOpenQuestions(task.id, prepared.questions)
+    const openQuestionCount = await persistOpenQuestions(task.id, protectedOpenQuestions, artifact.id, planVersion)
 
     if (openQuestionCount === 0) {
       await materializeWorkforceFromArchitectArtifact({

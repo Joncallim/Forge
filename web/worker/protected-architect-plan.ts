@@ -196,6 +196,7 @@ export type ProtectedClarificationAnswer = {
   question: string
   answer: string
 }
+export type ProtectedOpenQuestion = OpenQuestion & { questionId: string }
 
 /**
  * Appends immutable, self-contained clarification evidence to one complete
@@ -204,17 +205,17 @@ export type ProtectedClarificationAnswer = {
  */
 export function appendProtectedArchitectClarifications(input: {
   entries: readonly ArchitectPlanEntryInput[]
-  openQuestions: readonly OpenQuestion[]
+  openQuestions: readonly ProtectedOpenQuestion[]
   answeredQuestions: readonly ProtectedClarificationAnswer[]
 }): ArchitectPlanEntryInput[] {
   const clarificationEntry = (
     entryKind: 'clarification_question' | 'clarification_answer',
-    content: string,
+    content: string, entryId: string,
   ): ArchitectPlanEntryInput => ({
     agent: null,
     bindingFingerprint: null,
     content,
-    entryId: `${entryKind}:${randomUUID()}`,
+    entryId,
     entryKind,
     projectionEligible: false,
     requirementKey: null,
@@ -225,17 +226,17 @@ export function appendProtectedArchitectClarifications(input: {
       'clarification_question',
       canonicalArchitectPlanJson({
         schemaVersion: 1,
-        question: question.question,
+        questionId: question.questionId, question: question.question,
         suggestions: question.suggestions,
-      }),
-    )),
+      }), `clarification_question:${question.questionId}`),
+    ),
     ...input.answeredQuestions.map((answer) => clarificationEntry(
       'clarification_answer',
       canonicalArchitectPlanJson({
         schemaVersion: 1,
         question: answer.question,
         answer: answer.answer,
-      }),
-    )),
+      }), `clarification_answer:${randomUUID()}`),
+    ),
   ]
 }
