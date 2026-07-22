@@ -43,12 +43,28 @@ vi.mock('@/lib/session', () => ({
 const mockLoadProtectedApprovalReviewPreflight = vi.fn().mockResolvedValue(null)
 const mockReadProtectedMcpOperatorReview = vi.fn().mockResolvedValue([])
 const mockListApprovedPackagePlanRegistrations = vi.fn().mockResolvedValue([])
+const { mockAppendArchitectClarificationAnswer, mockReadS4RuntimeModeV1, mockArchitectPlanStorageConfiguration } = vi.hoisted(() => ({
+  mockAppendArchitectClarificationAnswer: vi.fn(),
+  mockReadS4RuntimeModeV1: vi.fn().mockResolvedValue('protected'),
+  mockArchitectPlanStorageConfiguration: vi.fn().mockReturnValue({
+    mode: 'protected', digestKey: Buffer.alloc(32, 7), digestKeyId: 'test-v1',
+  }),
+}))
 vi.mock('@/lib/mcps/protected-review-preflight', () => ({
   loadProtectedApprovalReviewPreflight: mockLoadProtectedApprovalReviewPreflight,
 }))
 vi.mock('@/lib/mcps/history-reader', () => ({
   listApprovedPackagePlanRegistrations: mockListApprovedPackagePlanRegistrations,
   readProtectedMcpOperatorReview: mockReadProtectedMcpOperatorReview,
+  appendArchitectClarificationAnswer: mockAppendArchitectClarificationAnswer,
+}))
+vi.mock('@/lib/mcps/s4-lease', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/s4-lease')>(),
+  readS4RuntimeModeV1: mockReadS4RuntimeModeV1,
+}))
+vi.mock('@/lib/mcps/s4-protocol-store', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/s4-protocol-store')>(),
+  architectPlanStorageConfiguration: mockArchitectPlanStorageConfiguration,
 }))
 
 // Existing route-contract cases exercise behavior behind the release gate.
@@ -7150,20 +7166,18 @@ describe('POST /api/tasks/:id/questions', () => {
     const answer = 'RAW-OPERATOR-ANSWER-SENTINEL'
     mockDbSelect
       .mockReturnValueOnce(chain([{ id: 'task-1', status: 'awaiting_answers' }]))
-      .mockReturnValueOnce(chain([{ id: questionId }]))
-      .mockReturnValueOnce(chain([{ status: 'answered' }]))
-    const update = chain([{
-      id: questionId,
-      status: 'answered',
-      createdAt: new Date('2026-07-22T00:00:00.000Z'),
-      answeredAt: new Date('2026-07-22T00:01:00.000Z'),
-      question: 'RAW-QUESTION-SENTINEL',
-      suggestions: ['RAW-SUGGESTION-SENTINEL'],
-      answer,
-    }])
-    const setAnswer = vi.fn(() => update)
-    update.set = setAnswer
-    mockDbUpdate.mockReturnValue(update)
+      .mockReturnValueOnce(chain([{
+        id: questionId,
+        sourcePlanArtifactId: '88888888-8888-4888-8888-888888888888',
+        sourcePlanVersion: 1,
+      }]))
+      .mockReturnValueOnce(chain([{
+        id: questionId,
+        status: 'answered',
+        createdAt: new Date('2026-07-22T00:00:00.000Z'),
+        answeredAt: new Date('2026-07-22T00:01:00.000Z'),
+      }]))
+    mockAppendArchitectClarificationAnswer.mockResolvedValue({ answerId: 'answer-1', allAnswered: true })
     mockRedisLpush.mockResolvedValue(1)
     mockRedisEval.mockResolvedValue(1)
 
@@ -7186,7 +7200,11 @@ describe('POST /api/tasks/:id/questions', () => {
       allAnswered: true,
     })
     expect(JSON.stringify(body)).not.toContain('RAW-')
-    expect(setAnswer).toHaveBeenCalledWith(expect.objectContaining({ answer }))
+    expect(mockAppendArchitectClarificationAnswer).toHaveBeenCalledWith(expect.objectContaining({
+      answer, questionId, taskId: 'task-1',
+    }))
+    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockRedisPublish).not.toHaveBeenCalled()
     const answeredEvent = mockRedisEval.mock.calls.find((call) => call[4] === 'questions:answered')
     expect(JSON.parse(answeredEvent?.[5] as string)).toEqual({ answeredCount: 1, allAnswered: true })
     expect(JSON.stringify(mockRedisEval.mock.calls)).not.toContain('RAW-')

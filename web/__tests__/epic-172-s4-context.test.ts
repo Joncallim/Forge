@@ -238,8 +238,33 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
       'register_package_plan_entries_v1',
       'bind_architect_plan_entry_v2',
       'bind_architect_replan_context_v2',
+      'resolve_architect_plan_entry_v2',
+      'append_architect_clarification_answer_v1',
     ])
     for (const caller of predicateCallers) expect(caller).toContain('SECURITY DEFINER')
+  })
+
+  it('keeps clarification ledger and replan routines behind the protected owner boundary', () => {
+    for (const table of [
+      'architect_clarification_answers',
+      'architect_clarification_answer_writes',
+    ]) {
+      expect(s4Migration).toContain(`public.${table}`)
+      expect(s4Migration).toContain(`ALTER TABLE public.${table} OWNER TO forge_s4_routines_owner;`)
+    }
+    for (const routine of [
+      'bind_architect_replan_context_v3',
+      'resolve_architect_plan_entry_v2',
+      'append_architect_clarification_answer_v1',
+    ]) {
+      expect(s4Migration).toContain(`CREATE OR REPLACE FUNCTION forge.${routine}(`)
+      expect(s4Migration).toContain(`ALTER FUNCTION forge.${routine}`)
+    }
+    expect(s4Migration).toMatch(/GRANT EXECUTE ON FUNCTION forge\.bind_architect_replan_context_v3\([^;]+TO forge_architect_plan_writer;/)
+    expect(s4Migration).toMatch(/GRANT EXECUTE ON FUNCTION forge\.resolve_architect_plan_entry_v2\([^;]+TO forge_architect_plan_resolver;/)
+    expect(s4Migration).toMatch(/GRANT EXECUTE ON FUNCTION forge\.append_architect_clarification_answer_v1\([^;]+TO forge_architect_plan_history_reader;/)
+    expect(s4Migration).toContain('source_kind = \'clarification_answer\'')
+    expect(s4Migration).toContain('answer_reference_id')
   })
 
   it('exposes only atomic S4 lifecycle entry points to the packet issuer', () => {

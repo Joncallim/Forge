@@ -295,7 +295,7 @@ describe('answered-question retry contract', () => {
       }],
       restoredRows,
     )
-    deleteResults.push(undefined, undefined)
+    deleteResults.push(undefined)
 
     const { processAnsweredQuestions } = await import('@/worker/orchestrator')
 
@@ -304,22 +304,12 @@ describe('answered-question retry contract', () => {
     )
 
     expect(mockMaterializeWorkforce).toHaveBeenCalledOnce()
-    expect(mockDbDelete).toHaveBeenCalledTimes(2)
-    expect(insertValues).toEqual(
-      expect.arrayContaining([
-        expect.arrayContaining([
-          expect.objectContaining({
-            taskId: task.id,
-            question: 'Which branch?',
-            answer: 'main',
-            status: 'answered',
-          }),
-        ]),
-      ]),
-    )
+    expect(mockDbDelete).toHaveBeenCalledOnce()
+    expect(JSON.stringify(insertValues)).not.toContain('Which branch?')
+    expect(JSON.stringify(insertValues)).not.toContain('main')
     expect(updateSets).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ status: 'awaiting_answers' }),
+        expect.objectContaining({ status: 'failed' }),
       ]),
     )
     expect(mockWriteArchitectCheckpointSafely).toHaveBeenCalledWith(
@@ -329,18 +319,14 @@ describe('answered-question retry contract', () => {
         errorMessage: 'materialize failed',
       }),
     )
-    expect(mockPublishTaskEvent).toHaveBeenCalledWith(
+    expect(mockPublishTaskEvent.mock.calls).not.toContainEqual(expect.arrayContaining([
       task.id,
       'questions:created',
       expect.objectContaining({
-        questions: [
-          expect.objectContaining({
-            question: 'Which branch?',
-            answer: 'main',
-            status: 'answered',
-          }),
-        ],
+        questions: expect.arrayContaining([
+          expect.objectContaining({ question: 'Which branch?', answer: 'main' }),
+        ]),
       }),
-    )
+    ]))
   })
 })

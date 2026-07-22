@@ -9,7 +9,7 @@ const {
   mockBindArchitectReplanContext,
   mockRecordArchitectPlanVersion,
   mockReadS4RuntimeModeV1,
-  mockResolveArchitectPlanEntry,
+  mockResolveArchitectReplanEntry,
 } = vi.hoisted(() => ({
   mockDbInsert: vi.fn(),
   mockDbUpdate: vi.fn(),
@@ -17,7 +17,7 @@ const {
   mockBindArchitectReplanContext: vi.fn(),
   mockRecordArchitectPlanVersion: vi.fn(),
   mockReadS4RuntimeModeV1: vi.fn(),
-  mockResolveArchitectPlanEntry: vi.fn(),
+  mockResolveArchitectReplanEntry: vi.fn(),
 }))
 
 function chain(
@@ -57,7 +57,7 @@ vi.mock('@/lib/mcps/s4-protocol-store', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/mcps/s4-protocol-store')>(),
   bindArchitectReplanContext: mockBindArchitectReplanContext,
   recordArchitectPlanVersion: mockRecordArchitectPlanVersion,
-  resolveArchitectPlanEntry: mockResolveArchitectPlanEntry,
+  resolveArchitectReplanEntry: mockResolveArchitectReplanEntry,
 }))
 vi.mock('@/lib/mcps/s4-lease', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/mcps/s4-lease')>(),
@@ -113,7 +113,8 @@ describe('Architect plan storage compatibility', () => {
       entryId: 'plan_body:000000',
       entryKind: 'plan_body',
     }])
-    mockResolveArchitectPlanEntry.mockResolvedValue({
+    mockResolveArchitectReplanEntry.mockResolvedValue({
+      sourceKind: 'architect_plan_entry',
       agent: null,
       bindingFingerprint: null,
       content: '# Prior protected plan\n\nKeep this.',
@@ -245,7 +246,8 @@ describe('Architect durable replan source', () => {
       entryKind: 'plan_body',
     }])
     mockReadS4RuntimeModeV1.mockResolvedValue('legacy')
-    mockResolveArchitectPlanEntry.mockResolvedValue({
+    mockResolveArchitectReplanEntry.mockResolvedValue({
+      sourceKind: 'architect_plan_entry',
       agent: null,
       bindingFingerprint: null,
       content: '# Prior protected plan\n\nKeep this.',
@@ -298,8 +300,7 @@ describe('Architect durable replan source', () => {
       taskId: '11111111-1111-4111-8111-111111111111',
     })).resolves.toBe('# Prior protected plan\n\nKeep this.')
     expect(mockBindArchitectReplanContext).toHaveBeenCalledOnce()
-    expect(mockResolveArchitectPlanEntry).toHaveBeenCalledWith(expect.objectContaining({
-      expectedPurpose: 'architect_replan',
+    expect(mockResolveArchitectReplanEntry).toHaveBeenCalledWith(expect.objectContaining({
       referenceId: '44444444-4444-4444-8444-444444444444',
     }))
     expect(mockBindArchitectReplanContext).toHaveBeenCalledWith({
@@ -325,7 +326,7 @@ describe('Architect durable replan source', () => {
       },
       taskId: '11111111-1111-4111-8111-111111111111',
     })).resolves.toBe('# Prior protected plan\n\nKeep this.')
-    expect(mockResolveArchitectPlanEntry).toHaveBeenCalledOnce()
+    expect(mockResolveArchitectReplanEntry).toHaveBeenCalledOnce()
   })
 
   it('binds and resolves the protected plan body and hidden routing set together', async () => {
@@ -342,8 +343,9 @@ describe('Architect durable replan source', () => {
         entryKind: 'routing',
       },
     ])
-    mockResolveArchitectPlanEntry
+    mockResolveArchitectReplanEntry
       .mockResolvedValueOnce({
+        sourceKind: 'architect_plan_entry',
         agent: null,
         bindingFingerprint: null,
         content: '# Prior protected plan',
@@ -353,6 +355,7 @@ describe('Architect durable replan source', () => {
         requirementKey: null,
       })
       .mockResolvedValueOnce({
+        sourceKind: 'architect_plan_entry',
         agent: 'backend',
         bindingFingerprint: `sha256:${'b'.repeat(64)}`,
         content: '{"agent":"backend","requirementKey":"mcp-requirement-v1-test-1","schemaVersion":1}',
@@ -369,7 +372,9 @@ describe('Architect durable replan source', () => {
       taskId: '11111111-1111-4111-8111-111111111111',
     })).resolves.toEqual({
       planText: '# Prior protected plan',
-      protectedEntries: [{
+      planEntries: [{
+        sourceKind: 'architect_plan_entry',
+        expectedEntryId: 'plan_body:000000',
         agent: null,
         bindingFingerprint: null,
         content: '# Prior protected plan',
@@ -378,6 +383,8 @@ describe('Architect durable replan source', () => {
         projectionEligible: false,
         requirementKey: null,
       }, {
+        sourceKind: 'architect_plan_entry',
+        expectedEntryId: 'routing:mcp-requirement-v1-test-1:backend',
         agent: 'backend',
         bindingFingerprint: `sha256:${'b'.repeat(64)}`,
         entryId: 'routing:mcp-requirement-v1-test-1:backend',
@@ -386,6 +393,7 @@ describe('Architect durable replan source', () => {
         projectionEligible: false,
         requirementKey: 'mcp-requirement-v1-test-1',
       }],
+      clarificationAnswers: [],
       protectedComparableEntries: [{
         agent: 'backend',
         bindingFingerprint: `sha256:${'b'.repeat(64)}`,
@@ -396,7 +404,7 @@ describe('Architect durable replan source', () => {
         requirementKey: 'mcp-requirement-v1-test-1',
       }],
     })
-    expect(mockResolveArchitectPlanEntry).toHaveBeenCalledTimes(2)
+    expect(mockResolveArchitectReplanEntry).toHaveBeenCalledTimes(2)
   })
 
   it('fails closed when protected configuration is missing and needs no public replan locator', async () => {
@@ -425,7 +433,7 @@ describe('Architect durable replan source', () => {
 
   it('does not retry or fall back when the one-use protected resolver fails', async () => {
     configureProtectedReplan()
-    mockResolveArchitectPlanEntry.mockRejectedValueOnce(new Error('reference already consumed'))
+    mockResolveArchitectReplanEntry.mockRejectedValueOnce(new Error('reference already consumed'))
     const { previousPlanForArchitectRun } = await import('@/worker/orchestrator')
     await expect(previousPlanForArchitectRun({
       agentRunId: '22222222-2222-4222-8222-222222222222',
@@ -434,7 +442,7 @@ describe('Architect durable replan source', () => {
       taskId: '11111111-1111-4111-8111-111111111111',
     })).rejects.toThrow('reference already consumed')
     expect(mockBindArchitectReplanContext).toHaveBeenCalledOnce()
-    expect(mockResolveArchitectPlanEntry).toHaveBeenCalledOnce()
+    expect(mockResolveArchitectReplanEntry).toHaveBeenCalledOnce()
   })
 })
 
