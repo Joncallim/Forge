@@ -83,12 +83,18 @@ jobs:
             PASSWORD 'forge_app_test';
           CREATE DATABASE forge_epic_172_ci_test OWNER forge_migration_test;
           CREATE DATABASE forge_migration_0026_upgrade_test OWNER forge_migration_test;
+          CREATE DATABASE forge_migration_0027_upgrade_test OWNER forge_migration_test;
           SQL
       - name: Prove populated migration 0025 to 0026 upgrade
         run: bash scripts/ci/prove-migration-0026-upgrade.sh
         env:
           FORGE_MIGRATION_0026_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_migration_0026_upgrade_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_migration_0026_upgrade_test
+      - name: Prove populated migration 0026 to 0027 upgrade and strict cutover
+        run: npm run test:migration-0027-upgrade
+        env:
+          FORGE_MIGRATION_0027_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_migration_0027_upgrade_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_migration_0027_upgrade_test
       - name: Bootstrap Epic 172 release roles
         run: npm run protocol:bootstrap-epic-172-release-roles
         env:
@@ -123,6 +129,14 @@ jobs:
         run: npm run db:migrate
         env:
           DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_epic_172_ci_test
+      - name: Reconcile fresh-install root references with zero-scan proof
+        run: npm run project-roots:reconcile-expansion
+        env:
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+      - name: Apply the separately gated strict root-reference cutover
+        run: npm run project-roots:strict-cutover -- --apply
+        env:
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
       - name: Provision the ordinary app release-reader boundary
         run: npm run protocol:provision-epic-172-application-role
         env:
@@ -138,51 +152,47 @@ jobs:
           GRANT USAGE ON SCHEMA public TO forge_app_test;
           DO $grant_application_acl$
           DECLARE
-            object_row record;
+            table_name text;
+            ordinary_tables constant text[] := ARRAY[
+              'users', 'credentials', 'sessions', 'provider_configs', 'provider_health_checks',
+              'projects', 'mcp_installations', 'project_mcp_status_checks', 'tasks', 'task_attempts',
+              'agent_harnesses', 'work_packages', 'filesystem_mcp_grant_approvals',
+              'filesystem_mcp_current_decision_pointers', 'project_filesystem_grant_decisions',
+              'project_filesystem_current_decision_pointers', 'work_package_dependencies',
+              'agent_runs', 'artifacts', 'approval_gates', 'task_logs', 'vcs_changes',
+              'repository_command_audits', 'agent_configs', 'workforces', 'workforce_agents',
+              'app_settings', 'task_questions'
+            ];
+            protected_tables constant text[] := ARRAY[
+              'forge_release_signer_keys', 'forge_release_signer_key_lifecycle_audits',
+              'forge_epic_172_release_evidence', 'forge_epic_172_transition_authorizations',
+              'forge_epic_172_release_evidence_consumptions', 'forge_epic_172_enablement_state',
+              'forge_epic_172_enablement_transition_audits', 'architect_plan_versions',
+              'architect_plan_entries', 'architect_plan_execution_references',
+              'architect_plan_history_reads', 'epic_172_s4_protocol_state',
+              'work_package_local_run_evidence', 'filesystem_mcp_runtime_audits',
+              'filesystem_mcp_decision_nonce_claims', 'project_root_ref_reconciliation'
+            ];
+            projection_tables constant text[] := ARRAY[
+              'forge_epic_172_s3_release_state', 'work_package_local_projection_sources',
+              'work_package_local_projection_heads'
+            ];
           BEGIN
-            FOR object_row IN
-              SELECT schemaname, tablename
-              FROM pg_catalog.pg_tables
+            IF EXISTS (
+              SELECT 1 FROM pg_catalog.pg_tables
               WHERE schemaname = 'public'
-                AND tablename <> ALL (ARRAY[
-                  'forge_release_signer_keys',
-                  'forge_release_signer_key_lifecycle_audits',
-                  'forge_epic_172_release_evidence',
-                  'forge_epic_172_transition_authorizations',
-                  'forge_epic_172_release_evidence_consumptions',
-                  'forge_epic_172_enablement_state',
-                  'forge_epic_172_enablement_transition_audits',
-                  'forge_epic_172_s3_release_state',
-                  'work_package_local_projection_sources',
-                  'work_package_local_projection_heads',
-                  'architect_plan_versions',
-                  'architect_plan_entries',
-                  'architect_plan_execution_references',
-                  'architect_plan_history_reads',
-                  'epic_172_s4_protocol_state',
-                  'work_package_local_run_evidence',
-                  'filesystem_mcp_decision_nonce_claims'
-                ])
-            LOOP
-              EXECUTE format(
-                'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE %I.%I TO forge_app_test',
-                object_row.schemaname,
-                object_row.tablename
-              );
+                AND tablename <> ALL (ordinary_tables || protected_tables || projection_tables)
+            ) THEN
+              RAISE EXCEPTION 'A public table is missing from the closed application ACL inventory';
+            END IF;
+            FOREACH table_name IN ARRAY ordinary_tables LOOP
+              EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO forge_app_test', table_name);
             END LOOP;
-            FOR object_row IN
-              SELECT sequence_schema, sequence_name
-              FROM information_schema.sequences
-              WHERE sequence_schema = 'public'
-                AND sequence_name NOT LIKE 'forge_release_%'
-                AND sequence_name NOT LIKE 'forge_epic_172_%'
-            LOOP
-              EXECUTE format(
-                'GRANT USAGE, SELECT ON SEQUENCE %I.%I TO forge_app_test',
-                object_row.sequence_schema,
-                object_row.sequence_name
-              );
+            FOREACH table_name IN ARRAY protected_tables LOOP
+              EXECUTE format('REVOKE ALL ON TABLE public.%I FROM forge_app_test', table_name);
             END LOOP;
+            REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM forge_app_test;
+            GRANT USAGE, SELECT ON SEQUENCE public.task_logs_sequence_seq TO forge_app_test;
           END;
           $grant_application_acl$;
           SQL
@@ -214,7 +224,9 @@ jobs:
               'public.architect_plan_history_reads',
               'public.epic_172_s4_protocol_state',
               'public.work_package_local_run_evidence',
-              'public.filesystem_mcp_decision_nonce_claims'
+              'public.filesystem_mcp_runtime_audits',
+              'public.filesystem_mcp_decision_nonce_claims',
+              'public.project_root_ref_reconciliation'
             ]) LOOP
               FOREACH release_privilege IN ARRAY ARRAY[
                 'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
@@ -261,10 +273,19 @@ jobs:
               SELECT 1
               FROM pg_catalog.pg_tables
               WHERE schemaname = 'public'
-                AND tablename LIKE 'forge%'
                 AND tableowner = current_user
             ) THEN
-              RAISE EXCEPTION 'ordinary app unexpectedly owns a Forge table';
+              RAISE EXCEPTION 'ordinary app unexpectedly owns a public table';
+            END IF;
+            IF EXISTS (
+              SELECT 1 FROM information_schema.sequences
+              WHERE sequence_schema = 'public'
+                AND sequence_name <> 'task_logs_sequence_seq'
+                AND (has_sequence_privilege(current_user, format('public.%I', sequence_name), 'USAGE')
+                  OR has_sequence_privilege(current_user, format('public.%I', sequence_name), 'SELECT')
+                  OR has_sequence_privilege(current_user, format('public.%I', sequence_name), 'UPDATE'))
+            ) THEN
+              RAISE EXCEPTION 'ordinary app unexpectedly has a non-allowlisted sequence privilege';
             END IF;
             IF (
               SELECT array_agg(p.proname ORDER BY p.proname)

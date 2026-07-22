@@ -1,0 +1,23 @@
+DO $assertions$
+BEGIN
+  IF NOT (SELECT attnotnull FROM pg_catalog.pg_attribute
+          WHERE attrelid = 'public.projects'::pg_catalog.regclass AND attname = 'root_ref')
+     OR EXISTS (SELECT 1 FROM public.projects WHERE root_ref IS NULL)
+     OR NOT EXISTS (
+       SELECT 1 FROM public.project_root_ref_reconciliation
+       WHERE singleton AND state = 'complete'
+     )
+     OR NOT EXISTS (
+       SELECT 1 FROM pg_catalog.pg_constraint
+       WHERE conrelid = 'public.projects'::pg_catalog.regclass
+         AND conname = 'projects_root_ref_not_null_proof'
+         AND convalidated
+     ) THEN
+    RAISE EXCEPTION 'The strict 0027 root_ref cutover postconditions are incomplete';
+  END IF;
+  IF (SELECT state FROM public.forge_epic_172_enablement_state WHERE singleton_id = 'epic-172') <> 'disabled'
+     OR (SELECT producers_enabled FROM public.epic_172_s4_protocol_state WHERE singleton) THEN
+    RAISE EXCEPTION 'The 0027 proof changed existing Step 0 or S4 activation authority';
+  END IF;
+END;
+$assertions$;

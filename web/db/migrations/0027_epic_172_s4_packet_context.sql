@@ -117,10 +117,121 @@ CREATE UNIQUE INDEX sessions_credential_digest_v1_idx
 --> statement-breakpoint
 CREATE SCHEMA IF NOT EXISTS forge;
 --> statement-breakpoint
+-- Expand first without a default or table rewrite. Existing 0026 rows remain
+-- nullable until the separately invoked reconciliation command processes them.
 ALTER TABLE public.projects
-  ADD COLUMN root_ref uuid DEFAULT pg_catalog.gen_random_uuid() NOT NULL;
+  ADD COLUMN root_ref uuid;
+--> statement-breakpoint
+-- Omitted values are safe for new writers. The insert bridge also handles an
+-- explicitly supplied NULL during the mixed-version window.
+ALTER TABLE public.projects
+  ALTER COLUMN root_ref SET DEFAULT pg_catalog.gen_random_uuid();
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.fill_project_root_ref_on_insert_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+BEGIN
+  IF NEW.root_ref IS NULL THEN
+    NEW.root_ref := pg_catalog.gen_random_uuid();
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER projects_root_ref_insert_bridge_v1
+  BEFORE INSERT ON public.projects
+  FOR EACH ROW EXECUTE FUNCTION forge.fill_project_root_ref_on_insert_v1();
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.guard_project_root_ref_renull_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+BEGIN
+  IF OLD.root_ref IS NOT NULL AND NEW.root_ref IS NULL THEN
+    RAISE EXCEPTION 'A populated project root reference cannot be cleared'
+      USING ERRCODE = '23502';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER projects_root_ref_renull_guard_v1
+  BEFORE UPDATE OF root_ref ON public.projects
+  FOR EACH ROW EXECUTE FUNCTION forge.guard_project_root_ref_renull_v1();
 --> statement-breakpoint
 CREATE UNIQUE INDEX projects_root_ref_idx ON public.projects (root_ref);
+--> statement-breakpoint
+CREATE TABLE public.project_root_ref_reconciliation (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  last_project_id uuid,
+  rows_updated bigint NOT NULL DEFAULT 0 CHECK (rows_updated >= 0),
+  state text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','running','complete')),
+  updated_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp()
+);
+INSERT INTO public.project_root_ref_reconciliation (singleton) VALUES (true);
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.reconcile_project_root_refs_v1(p_batch_size integer)
+RETURNS TABLE (batch_rows integer, remaining_nulls bigint, reconciliation_state text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_checkpoint public.project_root_ref_reconciliation%ROWTYPE;
+  v_rows integer;
+  v_remaining bigint;
+  v_last_id uuid;
+BEGIN
+  IF p_batch_size NOT BETWEEN 1 AND 1000 THEN
+    RAISE EXCEPTION 'root-reference batch size must be between 1 and 1000'
+      USING ERRCODE = '22023';
+  END IF;
+
+  SELECT checkpoint.* INTO STRICT v_checkpoint
+  FROM public.project_root_ref_reconciliation checkpoint
+  WHERE checkpoint.singleton
+  FOR UPDATE;
+
+  WITH candidates AS (
+    SELECT project.id
+    FROM public.projects project
+    WHERE project.root_ref IS NULL
+      AND (v_checkpoint.last_project_id IS NULL OR project.id > v_checkpoint.last_project_id)
+    ORDER BY project.id
+    LIMIT p_batch_size
+    FOR UPDATE
+  ), populated AS (
+    UPDATE public.projects project
+    SET root_ref = pg_catalog.gen_random_uuid()
+    FROM candidates
+    WHERE project.id = candidates.id
+      AND project.root_ref IS NULL
+    RETURNING project.id
+  )
+  SELECT pg_catalog.count(*)::integer, pg_catalog.max(id)
+  INTO v_rows, v_last_id
+  FROM populated;
+
+  SELECT pg_catalog.count(*) INTO v_remaining
+  FROM public.projects project
+  WHERE project.root_ref IS NULL;
+
+  UPDATE public.project_root_ref_reconciliation checkpoint
+  SET last_project_id = CASE
+        WHEN v_remaining = 0 THEN checkpoint.last_project_id
+        WHEN v_rows > 0 THEN v_last_id
+        ELSE NULL
+      END,
+      rows_updated = checkpoint.rows_updated + v_rows,
+      state = CASE WHEN v_remaining = 0 THEN 'complete' ELSE 'running' END,
+      updated_at = pg_catalog.clock_timestamp()
+  WHERE checkpoint.singleton;
+
+  RETURN QUERY SELECT v_rows, v_remaining,
+    CASE WHEN v_remaining = 0 THEN 'complete'::text ELSE 'running'::text END;
+END;
+$$;
 --> statement-breakpoint
 CREATE TABLE public.architect_plan_versions (
   task_id uuid NOT NULL,
@@ -1124,7 +1235,11 @@ GRANT INSERT ON public.artifacts, public.filesystem_mcp_runtime_audits
 REVOKE ALL ON public.architect_plan_versions, public.architect_plan_entries,
   public.architect_plan_execution_references, public.architect_plan_history_reads,
   public.epic_172_s4_protocol_state, public.work_package_local_run_evidence,
-  public.filesystem_mcp_decision_nonce_claims FROM PUBLIC;
+  public.filesystem_mcp_decision_nonce_claims,
+  public.project_root_ref_reconciliation FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.fill_project_root_ref_on_insert_v1() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.guard_project_root_ref_renull_v1() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.reconcile_project_root_refs_v1(integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.reject_s4_retained_mutation_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.guard_architect_plan_public_artifact_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) FROM PUBLIC;
@@ -1149,6 +1264,10 @@ ALTER TABLE public.architect_plan_history_reads OWNER TO forge_s4_routines_owner
 ALTER TABLE public.epic_172_s4_protocol_state OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.work_package_local_run_evidence OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.filesystem_mcp_decision_nonce_claims OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.project_root_ref_reconciliation OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.fill_project_root_ref_on_insert_v1() OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.guard_project_root_ref_renull_v1() OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.reconcile_project_root_refs_v1(integer) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.reject_s4_retained_mutation_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.guard_architect_plan_public_artifact_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) OWNER TO forge_s4_routines_owner;

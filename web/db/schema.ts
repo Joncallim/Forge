@@ -195,7 +195,9 @@ export const projects = pgTable('projects', {
     .notNull()
     .default(sql`'{"profile":"default","requiredMcps":["filesystem","github"],"overrides":{}}'::jsonb`),
   // Opaque packet identity. It is random and never derived from localPath.
-  rootRef: uuid('root_ref').notNull().defaultRandom(),
+  // This remains nullable during the restartable 0027 expansion; a separately
+  // gated cutover adds NOT NULL only after a durable zero-null scan.
+  rootRef: uuid('root_ref').defaultRandom(),
   // S3 serializes this BIGINT as a canonical decimal string at every JSON/API
   // boundary. Database order, never timestamps, decides grant precedence.
   grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' })
@@ -216,6 +218,14 @@ export const projects = pgTable('projects', {
 
 export type Project = InferSelectModel<typeof projects>
 export type NewProject = InferInsertModel<typeof projects>
+
+export const projectRootRefReconciliation = pgTable('project_root_ref_reconciliation', {
+  singleton: boolean('singleton').primaryKey().default(true),
+  lastProjectId: uuid('last_project_id'),
+  rowsUpdated: bigint('rows_updated', { mode: 'bigint' }).notNull().default(sql`0`),
+  state: text('state').notNull().default('pending'),
+  updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+})
 
 // ---------------------------------------------------------------------------
 // Epic 172 release authentication and transition substrate

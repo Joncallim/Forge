@@ -17,6 +17,7 @@ const OWNED_TABLES = [
   'epic_172_s4_protocol_state',
   'work_package_local_run_evidence',
   'filesystem_mcp_decision_nonce_claims',
+  'project_root_ref_reconciliation',
 ] as const
 
 function literal(value: string): string {
@@ -35,11 +36,17 @@ async function main(): Promise<void> {
 
   const admin = postgres(adminUrl, { max: 1, onnotice: () => {} })
   try {
-    const [{ canCreateRole, isSuperuser }] = await admin<{ canCreateRole: boolean; isSuperuser: boolean }[]>`
-      select rolcreaterole as "canCreateRole", rolsuper as "isSuperuser"
+    const [{ canCreateRole, isSuperuser, serverVersion }] = await admin<{
+      canCreateRole: boolean
+      isSuperuser: boolean
+      serverVersion: number
+    }[]>`
+      select rolcreaterole as "canCreateRole", rolsuper as "isSuperuser",
+        current_setting('server_version_num')::integer as "serverVersion"
       from pg_catalog.pg_roles where rolname = current_user
     `
     if (!canCreateRole && !isSuperuser) throw new Error('The supplied database administrator cannot create S4 roles.')
+    if (serverVersion < 160000) throw new Error('The S4 ownership bootstrap requires PostgreSQL 16 or newer.')
 
     await admin.unsafe(`
       do $$
@@ -55,7 +62,7 @@ async function main(): Promise<void> {
       $$;
     `)
     await admin`create schema if not exists forge authorization ${admin(migrationRole)}`
-    await admin`grant usage, create on schema forge to ${admin(OWNER)}`
+    await admin`grant usage on schema forge to ${admin(OWNER)}`
     await admin.unsafe(`
       grant usage on schema forge to
         forge_architect_plan_writer,
@@ -63,7 +70,8 @@ async function main(): Promise<void> {
         forge_architect_plan_history_reader,
         forge_packet_issuer
     `)
-    await admin`grant create on schema public to ${admin(OWNER)}`
+    await admin`revoke create on schema forge from ${admin(OWNER)}`
+    await admin`revoke create on schema public from ${admin(OWNER)}`
 
     const [{ ownedTables }] = await admin<{ ownedTables: number }[]>`
       select count(*)::integer as "ownedTables"
@@ -92,7 +100,10 @@ async function main(): Promise<void> {
           perform pg_catalog.pg_advisory_xact_lock(
             pg_catalog.hashtextextended('forge:epic-172:s4-owner-bootstrap:v1', 0)
           );
-          execute pg_catalog.format('grant ${OWNER} to %I', session_user);
+          execute pg_catalog.format(
+            'grant ${OWNER} to %I with admin false, inherit false, set true',
+            session_user
+          );
           if (select nspowner <> 'forge_release_routines_owner'::regrole
               from pg_catalog.pg_namespace where nspname = 'forge') is not false then
             raise exception 'The Step 0 forge schema owner is missing or incorrect'
@@ -100,6 +111,18 @@ async function main(): Promise<void> {
           end if;
           if not pg_catalog.pg_has_role(session_user, '${OWNER}', 'MEMBER') then
             raise exception 'The transaction-scoped S4 owner membership could not be installed'
+              using errcode = '42501';
+          end if;
+          if (
+            select pg_catalog.count(*)
+            from pg_catalog.pg_auth_members membership
+            where membership.roleid = '${OWNER}'::regrole
+              and membership.member = session_user::regrole
+              and not membership.admin_option
+              and not membership.inherit_option
+              and membership.set_option
+          ) <> 1 then
+            raise exception 'The transaction-scoped S4 owner membership is not exact'
               using errcode = '42501';
           end if;
           execute pg_catalog.format(
@@ -175,6 +198,9 @@ async function main(): Promise<void> {
                 'insert_packet_authorization_snapshot_v2',
                 'insert_architect_plan_version_v1',
                 'bind_architect_plan_entry_v1'
+                ,'fill_project_root_ref_on_insert_v1'
+                ,'guard_project_root_ref_renull_v1'
+                ,'reconcile_project_root_refs_v1'
               ])
               and routine.proowner = '${OWNER}'::regrole
               and not exists (
@@ -187,13 +213,14 @@ async function main(): Promise<void> {
                 ) acl
                 where acl.grantee = 0 and acl.privilege_type = 'EXECUTE'
               )
-          ) <> 10 then
+          ) <> 13 then
             raise exception 'The S4 routine owner or PUBLIC boundary is incomplete'
               using errcode = '42501';
           end if;
           if not pg_catalog.has_schema_privilege('${OWNER}', 'forge', 'usage')
-             or not pg_catalog.has_schema_privilege('${OWNER}', 'forge', 'create') then
-            raise exception 'The S4 owner schema ACL is missing before finalization'
+             or pg_catalog.has_schema_privilege('${OWNER}', 'forge', 'create')
+             or pg_catalog.has_schema_privilege('${OWNER}', 'public', 'create') then
+            raise exception 'The S4 owner schema ACL is expanded before finalization'
               using errcode = '42501';
           end if;
           if exists (
@@ -214,6 +241,8 @@ async function main(): Promise<void> {
             'revoke usage, create on schema forge from %I',
             session_user
           );
+          execute 'revoke create on schema forge from ${OWNER}';
+          execute 'revoke create on schema public from ${OWNER}';
           execute pg_catalog.format('revoke ${OWNER} from %I', session_user);
           execute pg_catalog.format(
             'revoke execute on function public.forge_begin_epic_172_s4_owner_bootstrap_v1() from %I',
@@ -240,8 +269,9 @@ async function main(): Promise<void> {
               using errcode = '42501';
           end if;
           if not pg_catalog.has_schema_privilege('${OWNER}', 'forge', 'usage')
-             or not pg_catalog.has_schema_privilege('${OWNER}', 'forge', 'create') then
-            raise exception 'Finalization removed the S4 owner schema ACL'
+             or pg_catalog.has_schema_privilege('${OWNER}', 'forge', 'create')
+             or pg_catalog.has_schema_privilege('${OWNER}', 'public', 'create') then
+            raise exception 'The finalized S4 owner schema ACL is not exact'
               using errcode = '42501';
           end if;
         end;
@@ -251,6 +281,29 @@ async function main(): Promise<void> {
       await admin`revoke all on function public.forge_finalize_epic_172_s4_owner_bootstrap_v1() from public`
       await admin`grant execute on function public.forge_begin_epic_172_s4_owner_bootstrap_v1() to ${admin(migrationRole)}`
       await admin`grant execute on function public.forge_finalize_epic_172_s4_owner_bootstrap_v1() to ${admin(migrationRole)}`
+    }
+    if (transferComplete) {
+      await admin`revoke create on schema forge from ${admin(OWNER)}`
+      await admin`revoke create on schema public from ${admin(OWNER)}`
+      await admin`revoke usage, create on schema forge from ${admin(migrationRole)}`
+      await admin.unsafe(`
+        do $cleanup$
+        begin
+          if pg_catalog.to_regprocedure('public.forge_begin_epic_172_s4_owner_bootstrap_v1()') is not null then
+            execute pg_catalog.format(
+              'revoke execute on function public.forge_begin_epic_172_s4_owner_bootstrap_v1() from %I',
+              ${literal(migrationRole)}
+            );
+          end if;
+          if pg_catalog.to_regprocedure('public.forge_finalize_epic_172_s4_owner_bootstrap_v1()') is not null then
+            execute pg_catalog.format(
+              'revoke execute on function public.forge_finalize_epic_172_s4_owner_bootstrap_v1() from %I',
+              ${literal(migrationRole)}
+            );
+          end if;
+        end;
+        $cleanup$;
+      `)
     }
 
     const roles = await admin<{
@@ -295,6 +348,16 @@ async function main(): Promise<void> {
     if (!owner || owner.canLogin || owner.inherits || owner.isSuperuser
         || owner.canCreateDb || owner.canCreateRole || owner.isReplication || owner.bypassRls) {
       throw new Error('The S4 routines owner must remain an unprivileged NOLOGIN NOINHERIT role.')
+    }
+
+    const [{ membershipCount }] = await admin<{ membershipCount: number }[]>`
+      select count(*)::integer as "membershipCount"
+      from pg_catalog.pg_auth_members membership
+      where membership.roleid = any(${[OWNER, ...LOGIN_ROLES]}::regrole[])
+         or membership.member = any(${[OWNER, ...LOGIN_ROLES]}::regrole[])
+    `
+    if (membershipCount !== 0 && transferComplete) {
+      throw new Error('A finalized S4 principal has an unexpected role membership.')
     }
 
     console.log(`✓ Verified ${roles.length} dedicated S4 logins and ${OWNER}.`)
