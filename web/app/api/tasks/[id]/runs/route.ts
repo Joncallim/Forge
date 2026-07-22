@@ -84,6 +84,9 @@ export async function GET(
           stringByteLimit: 16 * 1024,
         })
 
+      const eventHistoryKey = `forge:task-events:v2:${taskId}:history`
+      const eventSequenceKey = `forge:task-events:v2:${taskId}:seq`
+
       // persistAndSend: allocates a global monotonic sequence number, writes to the
       // sorted set using that number as the score, then enqueues the SSE line.
       // The score is the canonical event ID — Last-Event-ID from the client maps
@@ -92,11 +95,11 @@ export async function GET(
         if (closed) return
         const safeType = safeEventType(type)
         const safeData = safeEventData(data)
-        const seq = await redis.incr(`forge:task:${taskId}:seq`)
+        const seq = await redis.incr(eventSequenceKey)
         const line = `id: ${seq}\nevent: ${safeType}\ndata: ${JSON.stringify(safeData)}\n\n`
         redis
-          .zadd(`forge:task:${taskId}:history`, seq, JSON.stringify({ type: safeType, data: safeData }))
-          .then(() => redis.expire(`forge:task:${taskId}:history`, 86400))
+          .zadd(eventHistoryKey, seq, JSON.stringify({ type: safeType, data: safeData }))
+          .then(() => redis.expire(eventHistoryKey, 86400))
           .catch((err) => console.error('SSE history write failed:', err))
         enqueue(line)
       }
@@ -223,7 +226,7 @@ export async function GET(
         try {
           // zrangebyscore with WITHSCORES returns a flat string[] alternating [value, score, value, score, ...]
           const missed = await redis.zrangebyscore(
-            `forge:task:${taskId}:history`,
+            eventHistoryKey,
             lastId + 1,
             '+inf',
             'WITHSCORES',

@@ -331,6 +331,13 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     expect(payload).toMatchObject({ type: 'run:chunk', metadata: { status: 'streaming' } })
     expect(payload).not.toHaveProperty('delta')
     expect(JSON.stringify(payload)).not.toContain('RAW-')
+    const { redis } = await import('@/lib/redis')
+    expect(redis.incr).toHaveBeenCalledWith('forge:task-events:v2:task-sse-1:seq')
+    expect(redis.zadd).toHaveBeenCalledWith(
+      'forge:task-events:v2:task-sse-1:history',
+      expect.any(Number),
+      expect.not.stringContaining('RAW-'),
+    )
   }, 2000)
 
   it('emits event: run:started within 500ms when a run:started message is published', async () => {

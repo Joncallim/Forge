@@ -32,6 +32,11 @@ export const SENSITIVE_PAYLOAD_KEY_ALIASES = [
       'planBody',
       'fullPlan',
       'architectPlan',
+      'path',
+      'paths',
+      'locator',
+      'storageLocator',
+      'selectedPath',
     ],
   },
   {
@@ -131,7 +136,8 @@ export function byteCount(input: string): number {
 function snapshotSource(value: unknown): string {
   if (typeof value === 'string') return value
   try {
-    return JSON.stringify(value)
+    const serialized = JSON.stringify(value)
+    return typeof serialized === 'string' ? serialized : String(value)
   } catch {
     return String(value)
   }
