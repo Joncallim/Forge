@@ -21,6 +21,22 @@ export class S4ProtocolStoreError extends Error {
   }
 }
 
+export type ResolvedArchitectReplanEntry =
+  | (ArchitectPlanEntryInput & { sourceKind: 'architect_plan_entry' })
+  | {
+    sourceKind: 'clarification_answer'
+    entryKind: 'clarification_answer'
+    entryId: string
+    questionId: string
+    answerId: string
+    taskId: string
+    sourcePlanArtifactId: string
+    sourcePlanVersion: string
+    content: string
+    contentDigest: string
+    digestKeyId: string
+  }
+
 const ARCHITECT_PLAN_PROTECTION_ENV = [
   'FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL',
   'FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX',
@@ -279,6 +295,56 @@ export async function resolveArchitectPlanEntry(input: {
 
 export function executableReferenceForEntry(entry: ArchitectPlanEntryEnvelope): ArchitectPlanEntryReference {
   return architectPlanEntryReference(entry)
+}
+
+/** Replan-only adapter retaining the protected answer identity which the
+ * public package-specialist entry shape intentionally does not expose. */
+export async function resolveArchitectReplanEntry(input: {
+  digestKey: Buffer
+  referenceId: string
+}): Promise<ResolvedArchitectReplanEntry> {
+  return withDedicatedClient('FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL', async (sql) => {
+    const [row] = await sql<{
+      purpose: string; taskId: string; planArtifactId: string; planVersion: string
+      entryId: string; entryKind: ArchitectPlanEntryEnvelope['entryKind']; content: string
+      contentDigest: string; digestKeyId: string; clarificationQuestionId: string | null
+      agent: string | null; requirementKey: string | null; bindingFingerprint: string | null; projectionEligible: boolean
+    }[]>`
+      select purpose, task_id as "taskId", plan_artifact_id as "planArtifactId",
+        plan_version::text as "planVersion", entry_id as "entryId", entry_kind as "entryKind",
+        agent, requirement_key as "requirementKey", binding_fingerprint as "bindingFingerprint",
+        projection_eligible as "projectionEligible", content, content_digest as "contentDigest", digest_key_id as "digestKeyId",
+        clarification_question_id as "clarificationQuestionId"
+      from forge.resolve_architect_plan_entry_v2(${input.referenceId}::uuid)
+    `
+    if (!row || row.purpose !== 'architect_replan') {
+      throw new S4ProtocolStoreError('invalid_evidence', 'Architect replan reference was unavailable.')
+    }
+    if (row.entryKind !== 'clarification_answer') {
+      const envelope: ArchitectPlanEntryEnvelope = { schemaVersion: 1, taskId: row.taskId,
+        planArtifactId: row.planArtifactId, planVersion: row.planVersion, entryId: row.entryId,
+        entryKind: row.entryKind, agent: row.agent, requirementKey: row.requirementKey,
+        bindingFingerprint: row.bindingFingerprint, content: row.content, contentDigest: row.contentDigest,
+        digestKeyId: row.digestKeyId, projectionEligible: row.projectionEligible }
+      if (!verifyArchitectPlanEntry({ digestKey: input.digestKey, entry: envelope })) {
+        throw new S4ProtocolStoreError('invalid_evidence', 'Architect replan entry did not verify.')
+      }
+      return { agent: row.agent, bindingFingerprint: row.bindingFingerprint, content: row.content,
+        entryId: row.entryId, entryKind: row.entryKind, projectionEligible: row.projectionEligible,
+        requirementKey: row.requirementKey, sourceKind: 'architect_plan_entry' }
+    }
+    const answerId = row.entryId.slice('clarification_answer:'.length)
+    if (!row.clarificationQuestionId || !verifyArchitectClarificationAnswer({
+      schemaVersion: 1, taskId: row.taskId, answerId, questionId: row.clarificationQuestionId,
+      sourcePlanArtifactId: row.planArtifactId, sourcePlanVersion: row.planVersion,
+      answer: row.content, contentDigest: row.contentDigest, digestKeyId: row.digestKeyId,
+      digestKey: input.digestKey,
+    })) throw new S4ProtocolStoreError('invalid_evidence', 'Clarification answer identity did not verify.')
+    return { sourceKind: 'clarification_answer', entryKind: 'clarification_answer', entryId: row.entryId,
+      questionId: row.clarificationQuestionId, answerId, taskId: row.taskId,
+      sourcePlanArtifactId: row.planArtifactId, sourcePlanVersion: row.planVersion,
+      content: row.content, contentDigest: row.contentDigest, digestKeyId: row.digestKeyId }
+  })
 }
 
 export async function bindArchitectReplanEntry(input: {
