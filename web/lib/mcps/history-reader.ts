@@ -1,5 +1,7 @@
 import postgres from 'postgres'
+import { randomUUID } from 'node:crypto'
 import type { ProtectedMcpReviewEntryInput, ProtectedMcpReviewHead } from './protected-mcp-review'
+import { materializeArchitectClarificationAnswer } from './architect-plan-entries'
 
 export class HistoryReaderError extends Error {
   readonly code: 'configuration' | 'conflict' | 'invalid_evidence'
@@ -64,6 +66,46 @@ export async function readArchitectPlanHistory(input: {
       'invalid_evidence',
       'The protected history read failed closed.',
     )
+  } finally {
+    credentialBytes.fill(0)
+    await sql.end({ timeout: 5 })
+  }
+}
+
+/** Dormant B2A writer: callers must opt in explicitly during the route cutover. */
+export async function appendArchitectClarificationAnswer(input: {
+  answer: string
+  answerId?: string
+  digestKey: Buffer
+  digestKeyId: string
+  questionId: string
+  sessionCredential: string
+  sourcePlanArtifactId: string
+  sourcePlanVersion: string
+  taskId: string
+}): Promise<{ answerId: string; allAnswered: boolean }> {
+  const answerId = input.answerId ?? randomUUID()
+  const envelope = materializeArchitectClarificationAnswer({
+    answer: input.answer, answerId, digestKey: input.digestKey, digestKeyId: input.digestKeyId,
+    questionId: input.questionId, sourcePlanArtifactId: input.sourcePlanArtifactId,
+    sourcePlanVersion: input.sourcePlanVersion, taskId: input.taskId,
+  })
+  const credentialBytes = Buffer.from(input.sessionCredential, 'ascii')
+  const sql = postgres(historyReaderUrl(), { max: 1, prepare: true, onnotice: () => {}, transform: { undefined: null } })
+  try {
+    const [row] = await sql<{ answerId: string; allAnswered: boolean }[]>`
+      select answer_id as "answerId", all_answered as "allAnswered"
+      from forge.append_architect_clarification_answer_v1(
+        ${credentialBytes}::bytea, ${input.taskId}::uuid, ${input.questionId}::uuid,
+        ${input.sourcePlanArtifactId}::uuid, ${input.sourcePlanVersion}::bigint,
+        ${answerId}::uuid, ${envelope.answer}::text, ${envelope.contentDigest}::text,
+        ${envelope.digestKeyId}::text
+      )
+    `
+    if (!row || row.answerId !== answerId) throw new Error('missing answer append result')
+    return row
+  } catch {
+    throw new HistoryReaderError('invalid_evidence', 'The protected clarification append failed closed.')
   } finally {
     credentialBytes.fill(0)
     await sql.end({ timeout: 5 })

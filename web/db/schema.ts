@@ -2110,6 +2110,11 @@ export const taskQuestions = pgTable(
     question: text('question').notNull(),
     suggestions: jsonb('suggestions').$type<string[]>().notNull().default([]),
     answer: text('answer'),
+    // Dormant B2A opaque bindings. Existing routes do not use these yet.
+    questionEntryId: text('question_entry_id'),
+    sourcePlanArtifactId: uuid('source_plan_artifact_id'),
+    sourcePlanVersion: bigint('source_plan_version', { mode: 'number' }),
+    answerReferenceId: uuid('answer_reference_id'),
     // 'open'|'answered'
     status: text('status').notNull().default('open'),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),

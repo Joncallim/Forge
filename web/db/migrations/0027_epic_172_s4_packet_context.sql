@@ -6619,6 +6619,21 @@ CREATE TABLE public.architect_clarification_answers (
     ON UPDATE RESTRICT ON DELETE RESTRICT,
   UNIQUE (task_id, question_id, id)
 );
+ALTER TABLE public.task_questions
+  ADD COLUMN question_entry_id text,
+  ADD COLUMN source_plan_artifact_id uuid,
+  ADD COLUMN source_plan_version bigint,
+  ADD COLUMN answer_reference_id uuid,
+  ADD CONSTRAINT task_questions_opaque_source_chk CHECK (
+    (question_entry_id IS NULL AND source_plan_artifact_id IS NULL AND source_plan_version IS NULL)
+    OR (question_entry_id = 'clarification_question:' || id::text
+      AND source_plan_artifact_id IS NOT NULL AND source_plan_version > 0)
+  ),
+  ADD CONSTRAINT task_questions_opaque_source_fk FOREIGN KEY (source_plan_artifact_id, source_plan_version)
+    REFERENCES public.architect_plan_versions(plan_artifact_id, plan_version)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  ADD CONSTRAINT task_questions_answer_reference_fk FOREIGN KEY (answer_reference_id)
+    REFERENCES public.architect_clarification_answers(id) ON UPDATE RESTRICT ON DELETE RESTRICT;
 CREATE TABLE public.architect_clarification_answer_writes (
   id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
   answer_id uuid NOT NULL REFERENCES public.architect_clarification_answers(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
@@ -6736,6 +6751,50 @@ BEGIN
     projection_eligible, clarification_question_id FROM consumed;
 END;
 $$;
+CREATE OR REPLACE FUNCTION forge.append_architect_clarification_answer_v1(
+  p_session_credential bytea, p_task_id uuid, p_question_id uuid,
+  p_source_plan_artifact_id uuid, p_source_plan_version bigint, p_answer_id uuid,
+  p_answer text, p_content_digest text, p_digest_key_id text
+) RETURNS TABLE (answer_id uuid, all_answered boolean)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public
+AS $$
+DECLARE v_session public.sessions%ROWTYPE; v_digest bytea; v_user_id uuid;
+BEGIN
+  IF session_user <> 'forge_architect_plan_history_reader' OR NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'Clarification append is unavailable' USING ERRCODE = '42501';
+  END IF;
+  IF pg_catalog.octet_length(p_session_credential) <> 36 OR p_content_digest !~ '^hmac-sha256:[0-9a-f]{64}$'
+     OR p_digest_key_id !~ '^[a-z0-9._-]{1,64}$' OR pg_catalog.octet_length(p_answer) NOT BETWEEN 1 AND 65536
+     OR p_answer <> pg_catalog.normalize(p_answer, 'NFC') THEN
+    RAISE EXCEPTION 'Clarification append envelope is invalid' USING ERRCODE = '22023';
+  END IF;
+  v_digest := pg_catalog.sha256(pg_catalog.decode('666f7267653a7765622d73657373696f6e3a763100', 'hex') || p_session_credential);
+  SELECT session_row.* INTO STRICT v_session FROM public.sessions session_row WHERE session_row.credential_digest_v1 = v_digest FOR UPDATE;
+  IF v_session.revoked_at IS NOT NULL OR v_session.expires_at IS NULL OR pg_catalog.clock_timestamp() >= v_session.expires_at THEN
+    RAISE EXCEPTION 'Session credential is revoked or expired' USING ERRCODE = '28000';
+  END IF;
+  v_user_id := v_session.user_id;
+  PERFORM 1 FROM public.tasks task WHERE task.id = p_task_id AND task.submitted_by = v_user_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Task history is not accessible to this session' USING ERRCODE = '42501'; END IF;
+  PERFORM 1 FROM public.architect_plan_entries entry WHERE entry.task_id = p_task_id
+    AND entry.plan_artifact_id = p_source_plan_artifact_id AND entry.plan_version = p_source_plan_version
+    AND entry.entry_id = 'clarification_question:' || p_question_id::text AND entry.entry_kind = 'clarification_question' FOR KEY SHARE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Clarification source is stale or unavailable' USING ERRCODE = '40001'; END IF;
+  PERFORM 1 FROM public.task_questions question WHERE question.id = p_question_id AND question.task_id = p_task_id
+    AND question.status = 'open' AND question.answer_reference_id IS NULL FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Clarification question is no longer open' USING ERRCODE = '40001'; END IF;
+  INSERT INTO public.architect_clarification_answers (id, task_id, question_id, source_plan_artifact_id, source_plan_version, answer, content_digest, digest_key_id, actor_user_id)
+  VALUES (p_answer_id, p_task_id, p_question_id, p_source_plan_artifact_id, p_source_plan_version, p_answer, p_content_digest, p_digest_key_id, v_user_id);
+  INSERT INTO public.architect_clarification_answer_writes (answer_id, task_id, actor_user_id) VALUES (p_answer_id, p_task_id, v_user_id);
+  UPDATE public.task_questions question SET status = 'answered', answer_reference_id = p_answer_id,
+    answered_at = pg_catalog.clock_timestamp(), answered_by = v_user_id
+  WHERE question.id = p_question_id AND question.task_id = p_task_id AND question.status = 'open' AND question.answer_reference_id IS NULL;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Clarification projection changed before append' USING ERRCODE = '40001'; END IF;
+  answer_id := p_answer_id;
+  SELECT NOT EXISTS (SELECT 1 FROM public.task_questions q WHERE q.task_id = p_task_id AND q.status <> 'answered') INTO all_answered;
+  RETURN NEXT;
+END;
+$$;
 -- The NOLOGIN owner receives only the existing-table privileges required by
 -- the fixed-path functions above. Interactive and application logins receive
 -- no equivalent table access.
@@ -6780,6 +6839,7 @@ REVOKE ALL ON FUNCTION forge.guard_s4_approval_gate_review_head_v1() FROM PUBLIC
 REVOKE ALL ON FUNCTION forge.reject_s4_retained_mutation_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.guard_architect_plan_public_artifact_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.append_architect_clarification_answer_v1(bytea,uuid,uuid,uuid,bigint,uuid,text,text,text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.append_mcp_operator_review_version_v1(bytea,uuid,bigint,integer,text,text,integer,integer,integer,text[],text[],text[],text[],text[],text[],text[],text[],boolean[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.read_mcp_operator_review_history_v1(bytea,uuid,uuid,integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.list_approved_package_plan_registrations_v1(bytea,uuid,bigint,integer,text) FROM PUBLIC;
@@ -6837,6 +6897,7 @@ GRANT EXECUTE ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigin
 GRANT EXECUTE ON FUNCTION forge.register_package_plan_entries_v1(uuid,uuid,bigint,uuid[],text[],text[],integer[],text[],text[],text[]) TO forge_architect_plan_writer;
 GRANT EXECUTE ON FUNCTION forge.append_mcp_operator_review_version_v1(bytea,uuid,bigint,integer,text,text,integer,integer,integer,text[],text[],text[],text[],text[],text[],text[],text[],boolean[]) TO forge_architect_plan_history_reader;
 GRANT EXECUTE ON FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) TO forge_architect_plan_history_reader;
+GRANT EXECUTE ON FUNCTION forge.append_architect_clarification_answer_v1(bytea,uuid,uuid,uuid,bigint,uuid,text,text,text) TO forge_architect_plan_history_reader;
 GRANT EXECUTE ON FUNCTION forge.read_mcp_operator_review_history_v1(bytea,uuid,uuid,integer) TO forge_architect_plan_history_reader;
 GRANT EXECUTE ON FUNCTION forge.list_approved_package_plan_registrations_v1(bytea,uuid,bigint,integer,text) TO forge_architect_plan_history_reader;
 GRANT EXECUTE ON FUNCTION forge.resolve_architect_plan_entry_v1(uuid) TO forge_architect_plan_resolver;
@@ -6906,6 +6967,7 @@ ALTER FUNCTION forge.guard_s4_approval_gate_review_head_v1() OWNER TO forge_s4_r
 ALTER FUNCTION forge.reject_s4_retained_mutation_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.guard_architect_plan_public_artifact_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.append_architect_clarification_answer_v1(bytea,uuid,uuid,uuid,bigint,uuid,text,text,text) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.append_mcp_operator_review_version_v1(bytea,uuid,bigint,integer,text,text,integer,integer,integer,text[],text[],text[],text[],text[],text[],text[],text[],boolean[]) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.read_mcp_operator_review_history_v1(bytea,uuid,uuid,integer) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.list_approved_package_plan_registrations_v1(bytea,uuid,bigint,integer,text) OWNER TO forge_s4_routines_owner;
