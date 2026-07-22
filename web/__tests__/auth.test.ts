@@ -223,6 +223,7 @@ describe('register/start — registration gating', () => {
 describe('createSession', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mockDbSelect.mockReturnValue(chain([{ state: 'strict' }]))
     mockRedisSet.mockResolvedValue('OK')
     mockDbInsert.mockReturnValue(createdSessionChain())
   })
@@ -263,6 +264,7 @@ describe('createSession', () => {
 
   it('dual-writes the legacy Redis key with the same absolute expiry when explicitly enabled', async () => {
     process.env.FORGE_SESSION_CREDENTIAL_MODE = 'dual'
+    mockDbSelect.mockReturnValue(chain([{ state: 'expansion' }]))
     const credential = await createSession('user-1', null, {})
 
     expect(mockRedisSet).toHaveBeenCalledTimes(2)
@@ -442,7 +444,9 @@ describe('getSession', () => {
       (redisNowMs % 1000) * 1000,
     ])
     mockRedisSet.mockResolvedValue('OK')
-    mockDbSelect.mockReturnValue(chain([{
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ state: 'expansion' }]))
+      .mockReturnValueOnce(chain([{
       sessionId: credential,
       userId: 'user-abc',
       lastSeenAt: new Date(redisNowMs - 1_000),

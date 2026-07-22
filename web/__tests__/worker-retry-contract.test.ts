@@ -61,6 +61,11 @@ vi.mock('@/lib/mcps/s4-protocol-store', async (importOriginal) => ({
   recordArchitectPlanVersion: mockRecordArchitectPlanVersion,
 }))
 
+vi.mock('@/lib/mcps/s4-lease', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/s4-lease')>(),
+  readS4RuntimeModeV1: vi.fn().mockResolvedValue('protected'),
+}))
+
 vi.mock('@/worker/checkpoints', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/worker/checkpoints')>()
   return {

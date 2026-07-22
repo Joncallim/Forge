@@ -174,8 +174,8 @@ async function startWorkerOnce(
   // (e.g. a transiently-unhealthy MCP). The task is left at `approved`, so we
   // re-enqueue an approval job and let processApproval re-run the broker — if the
   // block still applies it simply re-blocks, so this never bypasses the gate.
-  const sweepBlockedHandoffs = async (): Promise<void> => {
-    if (blockedHandoffSweepIntervalSeconds === 0 || blockedHandoffSweepRunning) return
+  const sweepBlockedHandoffs = async (options: { startup?: boolean } = {}): Promise<void> => {
+    if ((!options.startup && blockedHandoffSweepIntervalSeconds === 0) || blockedHandoffSweepRunning) return
     blockedHandoffSweepRunning = true
     try {
       const [
@@ -183,12 +183,14 @@ async function startWorkerOnce(
         { tasks, workPackages },
         { enqueueDueBlockedHandoffRetries },
         { convergeRecognizedOperatorHolds },
+        { reconcilePendingS4CompletionHandoffs },
         { and, eq },
       ] = await Promise.all([
         import('../db'),
         import('../db/schema'),
         import('./blocked-handoff-retry'),
         import('../lib/mcps/filesystem-grant-reconciliation'),
+        import('./work-package-handoff'),
         import('drizzle-orm'),
       ])
       const stuck = await db
@@ -200,6 +202,10 @@ async function startWorkerOnce(
         .innerJoin(tasks, eq(tasks.id, workPackages.taskId))
         .where(and(eq(workPackages.status, 'blocked'), eq(tasks.status, 'approved')))
 
+      const recoveredS4Handoffs = await reconcilePendingS4CompletionHandoffs(100, {
+        drain: options.startup === true,
+        workerId,
+      })
       const enqueued = await enqueueDueBlockedHandoffRetries(stuck)
       const converged = await convergeRecognizedOperatorHolds()
       if (enqueued > 0) {
@@ -207,6 +213,9 @@ async function startWorkerOnce(
       }
       if (converged > 0) {
         console.info('[worker] Converged running tasks with operator holds', { count: converged, workerId })
+      }
+      if (recoveredS4Handoffs > 0) {
+        console.info('[worker] Recovered protected completion handoffs', { count: recoveredS4Handoffs, workerId })
       }
     } catch (err) {
       console.warn('[worker] Blocked-handoff sweep failed', { err: errorMessage(err), workerId })
@@ -242,8 +251,8 @@ async function startWorkerOnce(
         )
       }
 
+      void sweepBlockedHandoffs({ startup: true })
       if (blockedHandoffSweepIntervalSeconds > 0) {
-        void sweepBlockedHandoffs()
         blockedHandoffSweepTimer = setInterval(
           () => void sweepBlockedHandoffs(),
           blockedHandoffSweepIntervalSeconds * 1000,

@@ -183,22 +183,34 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(predicateCallers.map((definition) => definition.match(
       /CREATE OR REPLACE FUNCTION forge\.([a-z0-9_]+)/,
     )?.[1])).toEqual([
+      'append_mcp_operator_review_version_v1',
       'guard_architect_plan_public_artifact_v1',
       'read_architect_plan_history_v1',
+      'read_mcp_operator_review_history_v1',
+      'list_approved_package_plan_registrations_v1',
       'resolve_architect_plan_entry_v1',
       's4_runtime_mode_v1',
+      'read_s4_runtime_mode_for_application_v1',
       'create_local_run_evidence_v1',
       'insert_packet_authorization_snapshot_v2',
       'claim_packet_lifecycle_v2',
       'claim_work_package_lifecycle_v2',
       'lock_live_packet_lifecycle_v2',
       'lock_live_local_lifecycle_v2',
+      'list_pending_s4_completion_handoffs_v1',
+      'claim_pending_s4_completion_handoffs_v1',
+      'finalize_s4_max_attempts_v1',
       'recover_stale_local_lifecycle_v2',
       'recover_stale_packet_lifecycle_v2',
       'cas_packet_reapproval_v2',
+      'apply_local_effect_recovery_action_v2',
+      'apply_packet_issuance_recovery_action_v2',
       'insert_architect_plan_version_v1',
       'bind_architect_plan_entry_v1',
       'bind_architect_replan_entry_v1',
+      'register_package_plan_entries_v1',
+      'bind_architect_plan_entry_v2',
+      'bind_architect_replan_context_v2',
     ])
     for (const caller of predicateCallers) expect(caller).toContain('SECURITY DEFINER')
   })
@@ -220,7 +232,7 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
       )
     }
     for (const entryPoint of [
-      'claim_work_package_lifecycle_v2(text,uuid,uuid,timestamptz,uuid,text,uuid,integer,uuid,text,text,integer,uuid,uuid,uuid,integer,integer,text[])',
+      'claim_work_package_lifecycle_v2(text,uuid,uuid,timestamptz,uuid,text,uuid,integer,uuid,text,timestamptz,text,text,integer,uuid,uuid,uuid,integer,integer,text[])',
       'heartbeat_local_lifecycle_v2(uuid,uuid,bigint,integer)',
       'heartbeat_packet_lifecycle_v2(uuid,uuid,bigint,uuid,bigint,integer,integer)',
       'recover_linked_s4_lifecycle_v2(uuid)',
@@ -267,7 +279,10 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(s4RoleBootstrap).toContain('security definer')
     expect(s4RoleBootstrap).toContain('if session_user <> ${migrationLiteral}')
     expect(s4RoleBootstrap).toContain("'grant usage, create on schema forge to %I'")
-    expect(s4RoleBootstrap).toContain("'revoke usage, create on schema forge from %I'")
+    // The migration login keeps schema USAGE for the application reader but
+    // loses its temporary CREATE authority at finalization.
+    expect(s4RoleBootstrap).toContain("'revoke create on schema forge from %I'")
+    expect(s4RoleBootstrap).not.toContain("'revoke usage, create on schema forge from %I'")
     expect(s4RoleBootstrap).toContain(
       "'revoke execute on function public.forge_begin_epic_172_s4_owner_bootstrap_v1() from %I'",
     )

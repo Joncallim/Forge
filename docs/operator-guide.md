@@ -452,6 +452,18 @@ npm run db:migrate
 If you changed the schema, follow the developer workflow in
 [developer-guide.md](developer-guide.md).
 
+### Legacy tasks with more than 256 work packages
+
+Forge deliberately holds an older task if it has more than 256 work packages.
+Do not split, move, or delete its packages. Use the fixed-principal archive
+commands to preserve the whole source task as history and enable a separately
+reviewed replacement task.
+
+The procedure includes read-only inspection, dry-run, apply, crash-safe resume,
+rollback that detaches the replacement for a fresh attempt, and cancellation that
+permanently marks a bound replacement unused.
+See [Archive a legacy task with more than 256 work packages](operators/local-projection-overlimit-archive-v2.md).
+
 ### Session credential upgrade in migration 0027
 
 Migration 0027 adds the new session fields but deliberately leaves old rows

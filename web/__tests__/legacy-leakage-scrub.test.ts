@@ -1,11 +1,13 @@
 import { readFile } from 'node:fs/promises'
 import { describe, expect, it, vi } from 'vitest'
+import safeV2TaskEvents from './__fixtures__/safe-v2-task-events.json'
 import {
   LEGACY_TASK_LOG_UNAVAILABLE,
 } from '@/lib/mcps/leakage-drain'
 import {
   containsForbiddenV2EventData,
   legacyLeakageRowFingerprint,
+  projectV2TaskEventData,
   runLegacyLeakageScrub,
   type LegacyLeakageScrubCheckpoint,
   type LegacyLeakageScrubDatabase,
@@ -372,18 +374,112 @@ describe('legacy leakage scrub', () => {
     expect(redis.applyCalls).toEqual([])
   })
 
-  it('requires the fixed v2 event allowlist and detects hostile metadata and rollout sentinels', () => {
+  it('requires closed per-event shapes and rejects free-form diagnostic strings without sentinels', () => {
     expect(containsForbiddenV2EventData({ type: 'task:status', data: { metadata: { prompt_overlay: 'x' } } })).toBe(true)
     expect(containsForbiddenV2EventData({ type: 'task:status', data: { metadata: { storageLocator: 'opaque' } } })).toBe(true)
     expect(containsForbiddenV2EventData({ type: 'task:status', data: { metadata: { prompt_sha256: 'abc' } } })).toBe(true)
-    expect(containsForbiddenV2EventData({ type: 'task:status', data: { status: 'SAFE-ROLLOUT-SENTINEL' } }, ['ROLLOUT-SENTINEL'])).toBe(true)
+    for (const field of ['blockedReason', 'error', 'errorMessage', 'metadata', 'title']) {
+      expect(containsForbiddenV2EventData({
+        type: field === 'blockedReason' ? 'work_package:status' : 'task:status',
+        data: {
+          status: 'failed',
+          updatedAt: '2026-07-22T00:00:00.000Z',
+          workPackageId: '00000000-0000-4000-8000-000000000001',
+          [field]: 'safe-looking but still free-form',
+        },
+      })).toBe(true)
+    }
+    for (const hostile of [
+      '/private/project/SECRET.md',
+      '/workspace/project/SECRET.md',
+      'C:\\Users\\operator\\project\\secret.txt',
+      'api_key=not-allowed-in-history',
+      'Bearer not-allowed-in-history',
+      'postgresql://operator:password@database/forge',
+      'storageLocator=opaque-but-resolvable',
+    ]) {
+      expect(containsForbiddenV2EventData({
+        type: 'run:started',
+        data: { runId: '00000000-0000-4000-8000-000000000001', modelIdUsed: hostile },
+      })).toBe(true)
+    }
     expect(containsForbiddenV2EventData({ type: 'unknown:event', data: { status: 'running' } })).toBe(true)
     expect(containsForbiddenV2EventData({ type: 'task:status', data: { unexpectedSafeLookingField: true } })).toBe(true)
     expect(containsForbiddenV2EventData({
-      type: 'task:status',
-      data: { errorMessage: { kind: 'unknown_legacy_digest', byteCount: 12 }, status: 'failed' },
+      type: 'run:failed',
+      data: {
+        errorMessage: { kind: 'unknown_legacy_digest', byteCount: 12 },
+        runId: '00000000-0000-4000-8000-000000000001',
+      },
     })).toBe(false)
-    expect(containsForbiddenV2EventData({ type: 'task:status', data: { status: 'running', progress: 3 } })).toBe(false)
+    expect(containsForbiddenV2EventData({
+      type: 'task:status',
+      data: { errorMessage: null, status: 'running', updatedAt: '2026-07-22T00:00:00.000Z' },
+    })).toBe(false)
+    expect(containsForbiddenV2EventData({
+      type: 'artifact:created',
+      data: { agentRunId: '00000000-0000-4000-8000-000000000001', historyAvailable: true },
+    })).toBe(false)
+  })
+
+  it('accepts the closed durable-history fixture for every current v2 producer type', () => {
+    const expectedTypes = [
+      'artifact:created',
+      'approval_gate:created',
+      'approval_gate:decided',
+      'questions:created',
+      'run:completed',
+      'run:failed',
+      'run:progress',
+      'run:started',
+      'task:handoff',
+      'task:log',
+      'task:status',
+      'work_package:handoff',
+      'work_package:status',
+    ]
+    expect([...new Set(safeV2TaskEvents.map(({ type }) => type))].sort()).toEqual(expectedTypes.sort())
+    for (const event of safeV2TaskEvents) {
+      expect(containsForbiddenV2EventData(event), JSON.stringify(event)).toBe(false)
+    }
+    const ordinaryArtifact = safeV2TaskEvents.find((event) => (
+      event.type === 'artifact:created' && 'artifactId' in event.data
+    ))
+    expect(ordinaryArtifact?.data).not.toHaveProperty('content')
+    expect(ordinaryArtifact?.data).not.toHaveProperty('metadata')
+  })
+
+  it('projects every current producer type before the scrub inspects durable history', () => {
+    for (const event of safeV2TaskEvents) {
+      const richProducerData: Record<string, unknown> = {
+        type: event.type,
+        ...event.data,
+        metadata: { storageLocator: '/workspace/operator/project' },
+        title: 'Operator-facing title that is not durable history',
+      }
+      if (event.type === 'artifact:created' && 'artifactId' in event.data) {
+        richProducerData.content = 'unprotected artifact content'
+      }
+      if (event.type === 'questions:created') {
+        richProducerData.questions = [{ question: 'private prompt?', answer: 'private answer' }]
+      }
+      if (event.type === 'task:status' || event.type === 'run:failed') {
+        richProducerData.errorMessage = 'failed at /workspace/operator/project with api_key=secret'
+      }
+      if (event.type === 'task:handoff' || event.type === 'work_package:status') {
+        richProducerData.blockedReason = 'blocked at /workspace/operator/project'
+      }
+      if (event.type === 'task:handoff') richProducerData.reviewBlockReason = 'private review feedback'
+
+      const projected = projectV2TaskEventData(event.type, richProducerData)
+      expect(containsForbiddenV2EventData({ type: event.type, data: projected }), event.type).toBe(false)
+      expect(projected).not.toHaveProperty('type')
+      expect(projected).not.toHaveProperty('metadata')
+      expect(projected).not.toHaveProperty('title')
+      expect(projected).not.toHaveProperty('content')
+    }
+    expect(projectV2TaskEventData('run:chunk', { delta: 'private output' })).toBeNull()
+    expect(projectV2TaskEventData('questions:answered', { answers: ['private answer'] })).toBeNull()
   })
 
   it('rechecks database and Redis zero scans before trusting a completed checkpoint', async () => {
@@ -411,7 +507,10 @@ describe('legacy leakage Redis adapter', () => {
       ['forge:task:one:history', []],
       ['forge:task:one:seq', []],
       ['forge:task-events:v2:one:history', [
-        JSON.stringify({ type: 'task:status', data: { status: 'running' } }),
+        JSON.stringify({
+          type: 'task:status',
+          data: { errorMessage: null, status: 'running', updatedAt: '2026-07-22T00:00:00.000Z' },
+        }),
         JSON.stringify({ type: 'run:chunk', data: { delta: 'RAW-DELTA-SENTINEL' } }),
       ]],
     ])

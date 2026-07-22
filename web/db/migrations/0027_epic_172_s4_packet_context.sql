@@ -32,6 +32,15 @@ BEGIN
   ) OR NOT EXISTS (
     SELECT 1 FROM pg_catalog.pg_roles
     WHERE rolname = 'forge_architect_plan_history_reader' AND rolcanlogin AND NOT rolinherit AND NOT rolsuper
+  ) OR NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles
+    WHERE rolname = 'forge_review_source_resolver' AND rolcanlogin AND NOT rolinherit AND NOT rolsuper
+  ) OR NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles
+    WHERE rolname = 'forge_s4_recovery_operator' AND rolcanlogin AND NOT rolinherit AND NOT rolsuper
+  ) OR NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles
+    WHERE rolname = 'forge_local_projection_archiver' AND rolcanlogin AND NOT rolinherit AND NOT rolsuper
   ) THEN
     RAISE EXCEPTION 'dedicated S4 logins must be bootstrapped before migration'
       USING ERRCODE = '42501';
@@ -48,6 +57,145 @@ ALTER TABLE public.sessions
   ADD COLUMN IF NOT EXISTS credential_storage_version integer NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS legacy_redis_purge_pending_at timestamptz,
   ADD COLUMN IF NOT EXISTS legacy_redis_invalidated_at timestamptz;
+--> statement-breakpoint
+ALTER TABLE public.agent_runs
+  ADD COLUMN provider_type_used text,
+  ADD COLUMN provider_is_local_used boolean,
+  ADD COLUMN provider_config_updated_at_used timestamptz,
+  ADD COLUMN acp_execution_mode text NOT NULL DEFAULT 'not_applicable',
+  ADD CONSTRAINT agent_runs_acp_execution_mode_chk CHECK (
+    acp_execution_mode IN ('not_applicable', 'unconfined_host_process')
+  ),
+  ADD CONSTRAINT agent_runs_provider_snapshot_shape_chk CHECK (
+    (provider_config_id IS NULL
+      AND provider_type_used IS NULL
+      AND provider_is_local_used IS NULL
+      AND provider_config_updated_at_used IS NULL
+      AND acp_execution_mode = 'not_applicable')
+    OR
+    (provider_config_id IS NOT NULL
+      AND provider_type_used IS NOT NULL
+      AND provider_is_local_used IS NOT NULL
+      AND provider_config_updated_at_used IS NOT NULL
+      AND ((provider_type_used = 'acp' AND acp_execution_mode = 'unconfined_host_process')
+        OR (provider_type_used <> 'acp' AND acp_execution_mode = 'not_applicable')))
+  ) NOT VALID;
+--> statement-breakpoint
+UPDATE public.agent_runs run
+SET provider_type_used = provider.provider_type,
+    provider_is_local_used = provider.is_local,
+    provider_config_updated_at_used = provider.updated_at,
+    acp_execution_mode = CASE WHEN provider.provider_type = 'acp'
+      THEN 'unconfined_host_process' ELSE 'not_applicable' END
+FROM public.provider_configs provider
+WHERE provider.id = run.provider_config_id;
+--> statement-breakpoint
+ALTER TABLE public.approval_gates
+  ADD COLUMN protected_review_revision integer,
+  ADD COLUMN protected_review_set_digest text,
+  ADD COLUMN protected_review_item_count integer,
+  ADD COLUMN protected_review_approved_count integer,
+  ADD COLUMN protected_review_denied_count integer,
+  ADD COLUMN protected_review_blocker_codes text[],
+  ADD CONSTRAINT approval_gates_protected_review_head_chk CHECK (
+    (
+      protected_review_revision IS NULL
+      AND protected_review_set_digest IS NULL
+      AND protected_review_item_count IS NULL
+      AND protected_review_approved_count IS NULL
+      AND protected_review_denied_count IS NULL
+      AND protected_review_blocker_codes IS NULL
+    ) OR (
+      protected_review_revision > 0
+      AND protected_review_set_digest ~ '^hmac-sha256:[0-9a-f]{64}$'
+      AND protected_review_item_count BETWEEN 1 AND 256
+      AND protected_review_approved_count BETWEEN 0 AND protected_review_item_count
+      AND protected_review_denied_count BETWEEN 0 AND protected_review_item_count
+      AND protected_review_approved_count + protected_review_denied_count
+        <= protected_review_item_count
+      AND pg_catalog.cardinality(protected_review_blocker_codes) <= 64
+    )
+  );
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.guard_s4_approval_gate_review_head_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF current_user <> 'forge_s4_routines_owner'
+       AND COALESCE(
+         NEW.protected_review_revision IS NOT NULL
+         OR NEW.protected_review_set_digest IS NOT NULL
+         OR NEW.protected_review_item_count IS NOT NULL
+         OR NEW.protected_review_approved_count IS NOT NULL
+         OR NEW.protected_review_denied_count IS NOT NULL
+         OR NEW.protected_review_blocker_codes IS NOT NULL,
+         false
+       ) THEN
+      RAISE EXCEPTION 'The protected operator-review head is owner-managed'
+        USING ERRCODE = '42501';
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF (
+    NEW.protected_review_revision,
+    NEW.protected_review_set_digest,
+    NEW.protected_review_item_count,
+    NEW.protected_review_approved_count,
+    NEW.protected_review_denied_count,
+    NEW.protected_review_blocker_codes
+  ) IS DISTINCT FROM (
+    OLD.protected_review_revision,
+    OLD.protected_review_set_digest,
+    OLD.protected_review_item_count,
+    OLD.protected_review_approved_count,
+    OLD.protected_review_denied_count,
+    OLD.protected_review_blocker_codes
+  ) AND current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'The protected operator-review head is owner-managed'
+      USING ERRCODE = '42501';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER approval_gates_s4_review_head_guard
+  BEFORE INSERT OR UPDATE ON public.approval_gates
+  FOR EACH ROW EXECUTE FUNCTION forge.guard_s4_approval_gate_review_head_v1();
+--> statement-breakpoint
+ALTER TABLE public.tasks
+  DROP CONSTRAINT tasks_local_projection_overlimit_check,
+  ADD COLUMN local_projection_source_task_id uuid,
+  ADD COLUMN local_projection_replacement_state text,
+  ADD COLUMN local_projection_replacement_version bigint,
+  ADD COLUMN local_projection_replacement_fingerprint text,
+  ADD CONSTRAINT tasks_local_projection_source_task_fk
+    FOREIGN KEY (local_projection_source_task_id) REFERENCES public.tasks(id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  ADD CONSTRAINT tasks_local_projection_replacement_state_chk CHECK (
+    local_projection_replacement_state IS NULL
+    OR local_projection_replacement_state IN ('pending','eligible','cancelled')
+  ),
+  ADD CONSTRAINT tasks_local_projection_replacement_shape_chk CHECK (
+    (local_projection_source_task_id IS NULL
+      AND local_projection_replacement_state IS NULL
+      AND local_projection_replacement_version IS NULL
+      AND local_projection_replacement_fingerprint IS NULL)
+    OR
+    (local_projection_source_task_id IS NOT NULL
+      AND local_projection_replacement_state IS NOT NULL
+      AND local_projection_replacement_version > 0
+      AND local_projection_replacement_fingerprint ~ '^sha256:[0-9a-f]{64}$')
+  ),
+  ADD CONSTRAINT tasks_local_projection_overlimit_check CHECK (
+    (local_projection_scope_state = 'active'
+      AND (local_projection_overlimit_package_count IS NULL
+        OR local_projection_overlimit_package_count > 256))
+    OR
+    (local_projection_scope_state IN ('archive_pending','legacy_archived')
+      AND local_projection_overlimit_package_count > 256)
+  );
 --> statement-breakpoint
 CREATE TABLE public.session_credential_reconciliation (
   singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
@@ -114,6 +262,7 @@ CREATE TRIGGER sessions_credential_cutover_guard_v1
     credential_storage_version, legacy_redis_purge_pending_at
   ON public.sessions
   FOR EACH ROW EXECUTE FUNCTION forge.guard_session_credential_cutover_v1();
+REVOKE ALL ON FUNCTION forge.guard_session_credential_cutover_v1() FROM PUBLIC;
 --> statement-breakpoint
 ALTER TABLE public.sessions
   ADD CONSTRAINT sessions_credential_digest_v1_length_chk
@@ -254,6 +403,7 @@ CREATE TABLE public.architect_plan_versions (
   digest_key_id text NOT NULL,
   entry_count integer NOT NULL,
   entry_set_digest text NOT NULL,
+  structural_set_digest text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
   PRIMARY KEY (task_id, plan_version),
   UNIQUE (plan_artifact_id, plan_version),
@@ -264,7 +414,10 @@ CREATE TABLE public.architect_plan_versions (
   CONSTRAINT architect_plan_versions_version_chk CHECK (plan_version > 0),
   CONSTRAINT architect_plan_versions_key_chk CHECK (digest_key_id ~ '^[a-z0-9._-]{1,64}$'),
   CONSTRAINT architect_plan_versions_count_chk CHECK (entry_count BETWEEN 1 AND 256),
-  CONSTRAINT architect_plan_versions_digest_chk CHECK (entry_set_digest ~ '^hmac-sha256:[0-9a-f]{64}$')
+  CONSTRAINT architect_plan_versions_digest_chk CHECK (
+    entry_set_digest ~ '^hmac-sha256:[0-9a-f]{64}$'
+    AND structural_set_digest ~ '^hmac-sha256:[0-9a-f]{64}$'
+  )
 );
 --> statement-breakpoint
 CREATE TABLE public.architect_plan_entries (
@@ -293,14 +446,45 @@ CREATE TABLE public.architect_plan_entries (
   CONSTRAINT architect_plan_entries_id_chk CHECK (
     pg_catalog.length(entry_id) BETWEEN 1 AND 256 AND entry_id ~ '^[a-z0-9._:-]+$'
   ),
-  CONSTRAINT architect_plan_entries_kind_chk CHECK (entry_kind IN ('plan_body','requirement','overlay','subtask','legacy_full_plan')),
+  CONSTRAINT architect_plan_entries_kind_chk CHECK (entry_kind IN (
+    'plan_body','requirement','routing','overlay','subtask',
+    'clarification_question','clarification_answer','legacy_full_plan'
+  )),
   CONSTRAINT architect_plan_entries_agent_chk CHECK (agent IS NULL OR agent ~ '^[a-z0-9._-]{1,64}$'),
   CONSTRAINT architect_plan_entries_requirement_chk CHECK (requirement_key IS NULL OR requirement_key ~ '^[a-z0-9._-]{1,64}$'),
   CONSTRAINT architect_plan_entries_binding_chk CHECK (binding_fingerprint IS NULL OR binding_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
   CONSTRAINT architect_plan_entries_content_chk CHECK (pg_catalog.octet_length(content) BETWEEN 1 AND 65536),
   CONSTRAINT architect_plan_entries_digest_chk CHECK (content_digest ~ '^hmac-sha256:[0-9a-f]{64}$'),
   CONSTRAINT architect_plan_entries_key_chk CHECK (digest_key_id ~ '^[a-z0-9._-]{1,64}$'),
-  CONSTRAINT architect_plan_entries_legacy_chk CHECK (entry_kind <> 'legacy_full_plan' OR NOT projection_eligible)
+  CONSTRAINT architect_plan_entries_legacy_chk CHECK (entry_kind <> 'legacy_full_plan' OR NOT projection_eligible),
+  CONSTRAINT architect_plan_entries_plan_body_chk CHECK (
+    entry_kind <> 'plan_body' OR (
+      entry_id = 'plan_body:000000' AND agent IS NULL
+      AND requirement_key IS NULL AND binding_fingerprint IS NULL
+      AND NOT projection_eligible
+    )
+  ),
+  CONSTRAINT architect_plan_entries_requirement_shape_chk CHECK (
+    entry_kind <> 'requirement' OR (
+      requirement_key IS NOT NULL AND entry_id = 'requirement:' || requirement_key
+      AND agent IS NULL AND binding_fingerprint IS NULL AND NOT projection_eligible
+    )
+  ),
+  CONSTRAINT architect_plan_entries_clarification_chk CHECK (
+    entry_kind NOT IN ('clarification_question','clarification_answer') OR (
+      entry_id ~ ('^' || entry_kind ||
+        ':[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+      AND agent IS NULL AND requirement_key IS NULL
+      AND binding_fingerprint IS NULL AND NOT projection_eligible
+    )
+  ),
+  CONSTRAINT architect_plan_entries_routing_chk CHECK (
+    entry_kind <> 'routing' OR (
+      agent IS NOT NULL AND requirement_key IS NOT NULL
+      AND binding_fingerprint IS NOT NULL AND NOT projection_eligible
+      AND entry_id = 'routing:' || requirement_key || ':' || agent
+    )
+  )
 );
 --> statement-breakpoint
 CREATE TABLE public.architect_plan_execution_references (
@@ -346,9 +530,6 @@ CREATE TABLE public.architect_plan_execution_references (
       purpose = 'architect_replan'
       AND work_package_id IS NULL
       AND agent = 'architect'
-      AND entry_id = 'plan_body:000000'
-      AND requirement_key IS NULL
-      AND binding_fingerprint IS NULL
     )
   ),
   UNIQUE (agent_run_id, entry_id)
@@ -356,6 +537,92 @@ CREATE TABLE public.architect_plan_execution_references (
 --> statement-breakpoint
 CREATE INDEX architect_plan_execution_references_package_idx
   ON public.architect_plan_execution_references (work_package_id, agent_run_id);
+--> statement-breakpoint
+CREATE TABLE public.protected_package_entry_registrations (
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  task_id uuid NOT NULL REFERENCES public.tasks(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  work_package_id uuid NOT NULL REFERENCES public.work_packages(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  source_kind text NOT NULL CHECK (source_kind IN ('architect_plan','operator_review')),
+  source_id uuid NOT NULL,
+  source_version bigint NOT NULL CHECK (source_version > 0),
+  entry_id text NOT NULL CHECK (
+    pg_catalog.length(entry_id) BETWEEN 1 AND 256 AND entry_id ~ '^[a-z0-9._:-]+$'
+  ),
+  entry_kind text NOT NULL CHECK (entry_kind IN ('requirement','routing','overlay','subtask','decision')),
+  binding_set_digest text NOT NULL CHECK (binding_set_digest ~ '^hmac-sha256:[0-9a-f]{64}$'),
+  content_digest text NOT NULL CHECK (content_digest ~ '^hmac-sha256:[0-9a-f]{64}$'),
+  digest_key_id text NOT NULL CHECK (digest_key_id ~ '^[a-z0-9._-]{1,64}$'),
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  UNIQUE (task_id, work_package_id, source_kind, source_id, source_version, entry_id)
+);
+--> statement-breakpoint
+CREATE TABLE public.protected_entry_capability_bindings (
+  source_kind text NOT NULL CHECK (source_kind IN ('architect_plan','operator_review')),
+  source_id uuid NOT NULL,
+  source_version bigint NOT NULL CHECK (source_version > 0),
+  entry_id text NOT NULL CHECK (
+    pg_catalog.length(entry_id) BETWEEN 1 AND 256 AND entry_id ~ '^[a-z0-9._:-]+$'
+  ),
+  ordinal integer NOT NULL CHECK (ordinal BETWEEN 0 AND 255),
+  capability text NOT NULL CHECK (
+    pg_catalog.length(capability) BETWEEN 1 AND 240
+    AND capability = pg_catalog.lower(pg_catalog.btrim(capability))
+    AND capability ~ '^[a-z0-9._:-]+$'
+  ),
+  requirement_key text NOT NULL CHECK (requirement_key ~ '^[a-z0-9._-]{1,64}$'),
+  routing_fingerprint text NOT NULL CHECK (routing_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+  PRIMARY KEY (source_kind, source_id, source_version, entry_id, ordinal),
+  UNIQUE (source_kind, source_id, source_version, entry_id, capability, requirement_key)
+);
+--> statement-breakpoint
+CREATE TABLE public.mcp_operator_review_versions (
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  task_id uuid NOT NULL REFERENCES public.tasks(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  approval_gate_id uuid NOT NULL REFERENCES public.approval_gates(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  source_artifact_id uuid NOT NULL,
+  source_plan_version bigint NOT NULL CHECK (source_plan_version > 0),
+  revision integer NOT NULL CHECK (revision > 0),
+  previous_review_set_digest text CHECK (
+    previous_review_set_digest IS NULL
+    OR previous_review_set_digest ~ '^hmac-sha256:[0-9a-f]{64}$'
+  ),
+  review_set_digest text NOT NULL CHECK (review_set_digest ~ '^hmac-sha256:[0-9a-f]{64}$'),
+  item_count integer NOT NULL CHECK (item_count BETWEEN 1 AND 256),
+  entry_count integer NOT NULL CHECK (entry_count BETWEEN 1 AND 256),
+  approved_count integer NOT NULL CHECK (approved_count >= 0),
+  denied_count integer NOT NULL CHECK (denied_count >= 0),
+  blocker_codes text[] NOT NULL DEFAULT ARRAY[]::text[],
+  created_by_user_id uuid NOT NULL REFERENCES public.users(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  CONSTRAINT mcp_operator_review_versions_source_fk
+    FOREIGN KEY (source_artifact_id, source_plan_version)
+    REFERENCES public.architect_plan_versions(plan_artifact_id, plan_version)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CONSTRAINT mcp_operator_review_versions_counts_chk CHECK (
+    approved_count <= item_count AND denied_count <= item_count
+      AND approved_count + denied_count = item_count
+  ),
+  CONSTRAINT mcp_operator_review_versions_blockers_chk CHECK (
+    pg_catalog.cardinality(blocker_codes) <= 64
+  ),
+  UNIQUE (approval_gate_id, revision),
+  UNIQUE (approval_gate_id, review_set_digest)
+);
+--> statement-breakpoint
+CREATE TABLE public.mcp_operator_review_entries (
+  review_version_id uuid NOT NULL REFERENCES public.mcp_operator_review_versions(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  entry_id text NOT NULL CHECK (
+    pg_catalog.length(entry_id) BETWEEN 1 AND 256 AND entry_id ~ '^[a-z0-9._:-]+$'
+  ),
+  entry_kind text NOT NULL CHECK (entry_kind IN ('decision','overlay')),
+  agent text NOT NULL CHECK (agent ~ '^[a-z0-9._-]{1,64}$'),
+  requirement_key text NOT NULL CHECK (requirement_key ~ '^[a-z0-9._-]{1,64}$'),
+  content text NOT NULL CHECK (pg_catalog.octet_length(content) BETWEEN 1 AND 65536),
+  content_digest text NOT NULL CHECK (content_digest ~ '^hmac-sha256:[0-9a-f]{64}$'),
+  digest_key_id text NOT NULL CHECK (digest_key_id ~ '^[a-z0-9._-]{1,64}$'),
+  projection_eligible boolean NOT NULL,
+  PRIMARY KEY (review_version_id, entry_id)
+);
 --> statement-breakpoint
 CREATE TABLE public.architect_plan_history_reads (
   id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
@@ -392,9 +659,225 @@ CREATE TRIGGER architect_plan_versions_append_only
 CREATE TRIGGER architect_plan_entries_append_only
   BEFORE UPDATE OR DELETE ON public.architect_plan_entries
   FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
+CREATE TRIGGER protected_package_entry_registrations_append_only
+  BEFORE UPDATE OR DELETE ON public.protected_package_entry_registrations
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
+CREATE TRIGGER protected_entry_capability_bindings_append_only
+  BEFORE UPDATE OR DELETE ON public.protected_entry_capability_bindings
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
+CREATE TRIGGER mcp_operator_review_versions_append_only
+  BEFORE UPDATE OR DELETE ON public.mcp_operator_review_versions
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
+CREATE TRIGGER mcp_operator_review_entries_append_only
+  BEFORE UPDATE OR DELETE ON public.mcp_operator_review_entries
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
 CREATE TRIGGER architect_plan_history_reads_append_only
   BEFORE UPDATE OR DELETE ON public.architect_plan_history_reads
   FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.append_mcp_operator_review_version_v1(
+  p_session_credential bytea,
+  p_approval_gate_id uuid,
+  p_source_plan_version bigint,
+  p_revision integer,
+  p_previous_review_set_digest text,
+  p_review_set_digest text,
+  p_item_count integer,
+  p_approved_count integer,
+  p_denied_count integer,
+  p_blocker_codes text[],
+  p_entry_ids text[],
+  p_entry_kinds text[],
+  p_agents text[],
+  p_requirement_keys text[],
+  p_contents text[],
+  p_content_digests text[],
+  p_digest_key_ids text[],
+  p_projection_eligible boolean[]
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_credential_text text;
+  v_credential_digest bytea;
+  v_session public.sessions%ROWTYPE;
+  v_gate public.approval_gates%ROWTYPE;
+  v_review_version_id uuid := pg_catalog.gen_random_uuid();
+  v_expected_revision integer;
+  v_expected_previous_digest text;
+  v_entry_count integer := pg_catalog.cardinality(p_entry_ids);
+BEGIN
+  IF session_user <> 'forge_architect_plan_history_reader'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'MCP operator review append requires the credential-bound history principal'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'Protected MCP operator reviews are not enabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
+  IF pg_catalog.octet_length(p_session_credential) <> 36 THEN
+    RAISE EXCEPTION 'Session credential is malformed' USING ERRCODE = '22023';
+  END IF;
+  v_credential_text := pg_catalog.convert_from(p_session_credential, 'UTF8');
+  IF v_credential_text !~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+     OR pg_catalog.convert_to(v_credential_text, 'UTF8') <> p_session_credential THEN
+    RAISE EXCEPTION 'Session credential is malformed' USING ERRCODE = '22023';
+  END IF;
+  v_credential_digest := pg_catalog.sha256(
+    pg_catalog.decode('666f7267653a7765622d73657373696f6e3a763100', 'hex') || p_session_credential
+  );
+  SELECT session_row.* INTO STRICT v_session
+  FROM public.sessions session_row
+  WHERE session_row.credential_digest_v1 = v_credential_digest
+    AND session_row.revoked_at IS NULL
+    AND session_row.expires_at IS NOT NULL
+    AND pg_catalog.clock_timestamp() < session_row.expires_at
+  FOR UPDATE;
+
+  SELECT gate.* INTO STRICT v_gate
+  FROM public.approval_gates gate
+  JOIN public.tasks task
+    ON task.id = gate.task_id AND task.submitted_by = v_session.user_id
+  WHERE gate.id = p_approval_gate_id
+    AND gate.gate_type = 'plan_approval'
+    AND gate.status IN ('pending','needs_rework')
+    AND gate.source_artifact_id IS NOT NULL
+  FOR UPDATE OF gate;
+  PERFORM 1
+  FROM public.architect_plan_versions version
+  WHERE version.task_id = v_gate.task_id
+    AND version.plan_artifact_id = v_gate.source_artifact_id
+    AND version.plan_version = p_source_plan_version
+    AND NOT EXISTS (
+      SELECT 1 FROM public.architect_plan_versions newer
+      WHERE newer.task_id = v_gate.task_id
+        AND newer.plan_version > version.plan_version
+    )
+  FOR KEY SHARE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'MCP operator review source is not the exact latest protected plan'
+      USING ERRCODE = '40001';
+  END IF;
+
+  v_expected_revision := COALESCE(v_gate.protected_review_revision, 0) + 1;
+  v_expected_previous_digest := v_gate.protected_review_set_digest;
+  IF p_revision <> v_expected_revision
+     OR p_previous_review_set_digest IS DISTINCT FROM v_expected_previous_digest
+     OR p_review_set_digest !~ '^hmac-sha256:[0-9a-f]{64}$'
+     OR p_item_count NOT BETWEEN 1 AND 256
+     OR p_approved_count NOT BETWEEN 0 AND p_item_count
+     OR p_denied_count NOT BETWEEN 0 AND p_item_count
+     OR p_approved_count + p_denied_count <> p_item_count
+     OR v_entry_count NOT BETWEEN p_item_count AND 256
+     OR pg_catalog.cardinality(p_entry_kinds) <> v_entry_count
+     OR pg_catalog.cardinality(p_agents) <> v_entry_count
+     OR pg_catalog.cardinality(p_requirement_keys) <> v_entry_count
+     OR pg_catalog.cardinality(p_contents) <> v_entry_count
+     OR pg_catalog.cardinality(p_content_digests) <> v_entry_count
+     OR pg_catalog.cardinality(p_digest_key_ids) <> v_entry_count
+     OR pg_catalog.cardinality(p_projection_eligible) <> v_entry_count
+     OR pg_catalog.cardinality(p_blocker_codes) > 64
+     OR p_blocker_codes <> COALESCE((
+       SELECT pg_catalog.array_agg(DISTINCT code ORDER BY code)
+       FROM pg_catalog.unnest(p_blocker_codes) code
+     ), ARRAY[]::text[])
+     OR EXISTS (
+       SELECT 1 FROM pg_catalog.unnest(p_blocker_codes) code
+       WHERE code !~ '^[a-z0-9._:-]{1,100}$'
+     ) THEN
+    RAISE EXCEPTION 'MCP operator review version or array shape is invalid'
+      USING ERRCODE = '22023';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.generate_subscripts(p_entry_ids, 1) ordinal
+    WHERE p_entry_ids[ordinal] !~ '^[a-z0-9._:-]{1,256}$'
+      OR p_entry_kinds[ordinal] NOT IN ('decision','overlay')
+      OR p_agents[ordinal] !~ '^[a-z0-9._-]{1,64}$'
+      OR p_requirement_keys[ordinal] !~ '^[a-z0-9._-]{1,64}$'
+      OR pg_catalog.octet_length(p_contents[ordinal]) NOT BETWEEN 1 AND 65536
+      OR p_content_digests[ordinal] !~ '^hmac-sha256:[0-9a-f]{64}$'
+      OR p_digest_key_ids[ordinal] !~ '^[a-z0-9._-]{1,64}$'
+  ) OR (
+    SELECT pg_catalog.count(DISTINCT entry_id) FROM pg_catalog.unnest(p_entry_ids) entry_id
+  ) <> v_entry_count OR (
+    SELECT pg_catalog.count(*) FROM pg_catalog.unnest(p_entry_kinds) entry_kind
+    WHERE entry_kind = 'decision'
+  ) <> p_item_count OR EXISTS (
+    SELECT 1
+    FROM pg_catalog.generate_subscripts(p_entry_ids, 1) overlay_ordinal
+    WHERE p_entry_kinds[overlay_ordinal] = 'overlay'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.generate_subscripts(p_entry_ids, 1) decision_ordinal
+        WHERE p_entry_kinds[decision_ordinal] = 'decision'
+          AND p_agents[decision_ordinal] = p_agents[overlay_ordinal]
+          AND p_requirement_keys[decision_ordinal] = p_requirement_keys[overlay_ordinal]
+      )
+  ) THEN
+    RAISE EXCEPTION 'MCP operator review entry is invalid or duplicated'
+      USING ERRCODE = '22023';
+  END IF;
+
+  INSERT INTO public.mcp_operator_review_versions (
+    id, task_id, approval_gate_id, source_artifact_id, source_plan_version,
+    revision, previous_review_set_digest, review_set_digest, item_count, entry_count,
+    approved_count, denied_count, blocker_codes, created_by_user_id
+  ) VALUES (
+    v_review_version_id, v_gate.task_id, v_gate.id, v_gate.source_artifact_id,
+    p_source_plan_version, p_revision, p_previous_review_set_digest,
+    p_review_set_digest, p_item_count, v_entry_count, p_approved_count, p_denied_count,
+    p_blocker_codes, v_session.user_id
+  );
+  INSERT INTO public.mcp_operator_review_entries (
+    review_version_id, entry_id, entry_kind, agent, requirement_key,
+    content, content_digest, digest_key_id, projection_eligible
+  )
+  SELECT v_review_version_id, p_entry_ids[ordinal], p_entry_kinds[ordinal],
+    p_agents[ordinal], p_requirement_keys[ordinal], p_contents[ordinal],
+    p_content_digests[ordinal], p_digest_key_ids[ordinal],
+    p_projection_eligible[ordinal]
+  FROM pg_catalog.generate_subscripts(p_entry_ids, 1) ordinal
+  ORDER BY p_entry_ids[ordinal];
+  UPDATE public.approval_gates gate
+  SET protected_review_revision = p_revision,
+      protected_review_set_digest = p_review_set_digest,
+      protected_review_item_count = p_item_count,
+      protected_review_approved_count = p_approved_count,
+      protected_review_denied_count = p_denied_count,
+      protected_review_blocker_codes = p_blocker_codes,
+      metadata = pg_catalog.jsonb_set(
+        COALESCE(gate.metadata, '{}'::jsonb) - ARRAY[
+          'mcpOperatorReviews','mcpOperatorReview',
+          'protectedMcpOperatorReviews','protectedMcpOperatorReview'
+        ], '{protectedMcpReview}',
+        pg_catalog.jsonb_build_object(
+          'schemaVersion', 2,
+          'sourceArtifactId', v_gate.source_artifact_id::text,
+          'sourcePlanVersion', p_source_plan_version::text,
+          'revision', p_revision,
+          'reviewSetDigest', p_review_set_digest,
+          'itemCount', p_item_count,
+          'approvedCount', p_approved_count,
+          'deniedCount', p_denied_count,
+          'blockerCodes', p_blocker_codes
+        ), true
+      ),
+      updated_at = pg_catalog.clock_timestamp()
+  WHERE gate.id = v_gate.id
+    AND gate.protected_review_revision IS NOT DISTINCT FROM v_gate.protected_review_revision
+    AND gate.protected_review_set_digest IS NOT DISTINCT FROM v_gate.protected_review_set_digest;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'MCP operator review gate head lost its compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+  RETURN v_review_version_id;
+END;
+$$;
 --> statement-breakpoint
 -- This is a predicate over the sole Step 0 enablement authority, not a second
 -- state machine. Missing/malformed rows fail closed. Provisional state must
@@ -597,6 +1080,266 @@ BEGIN
 END;
 $$;
 --> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.read_mcp_operator_review_history_v1(
+  p_session_credential bytea,
+  p_task_id uuid,
+  p_approval_gate_id uuid,
+  p_revision integer
+)
+RETURNS TABLE (
+  review_version_id uuid,
+  review_set_digest text,
+  entry_id text,
+  entry_kind text,
+  agent text,
+  requirement_key text,
+  content text,
+  content_digest text,
+  digest_key_id text,
+  projection_eligible boolean
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_credential_text text;
+  v_credential_digest bytea;
+  v_session public.sessions%ROWTYPE;
+  v_version public.mcp_operator_review_versions%ROWTYPE;
+BEGIN
+  IF session_user <> 'forge_architect_plan_history_reader'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'MCP operator review history requires the credential-bound history principal'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'Protected MCP operator review history is not enabled'
+      USING ERRCODE = '55000';
+  END IF;
+  IF pg_catalog.octet_length(p_session_credential) <> 36 THEN
+    RAISE EXCEPTION 'Session credential is malformed' USING ERRCODE = '22023';
+  END IF;
+  v_credential_text := pg_catalog.convert_from(p_session_credential, 'UTF8');
+  IF v_credential_text !~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+     OR pg_catalog.convert_to(v_credential_text, 'UTF8') <> p_session_credential THEN
+    RAISE EXCEPTION 'Session credential is malformed' USING ERRCODE = '22023';
+  END IF;
+  v_credential_digest := pg_catalog.sha256(
+    pg_catalog.decode('666f7267653a7765622d73657373696f6e3a763100', 'hex') || p_session_credential
+  );
+  SELECT session_row.* INTO STRICT v_session
+  FROM public.sessions session_row
+  WHERE session_row.credential_digest_v1 = v_credential_digest
+    AND session_row.revoked_at IS NULL
+    AND session_row.expires_at IS NOT NULL
+    AND pg_catalog.clock_timestamp() < session_row.expires_at
+  FOR UPDATE;
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id = p_task_id AND task.submitted_by = v_session.user_id
+  FOR KEY SHARE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'MCP operator review history is not accessible to this session'
+      USING ERRCODE = '42501';
+  END IF;
+  SELECT version.* INTO STRICT v_version
+  FROM public.mcp_operator_review_versions version
+  WHERE version.task_id = p_task_id
+    AND version.approval_gate_id = p_approval_gate_id
+    AND version.revision = p_revision;
+  INSERT INTO public.architect_plan_history_reads (
+    request_id, user_id, task_id, plan_version, returned_entry_count, entry_set_digest
+  ) VALUES (
+    pg_catalog.gen_random_uuid(), v_session.user_id, p_task_id,
+    v_version.source_plan_version, v_version.entry_count, v_version.review_set_digest
+  );
+  PERFORM 1 FROM public.sessions session_row
+  WHERE session_row.id = v_session.id
+    AND session_row.credential_digest_v1 = v_credential_digest
+    AND session_row.revoked_at IS NULL
+    AND session_row.expires_at IS NOT NULL
+    AND pg_catalog.clock_timestamp() < session_row.expires_at
+  FOR KEY SHARE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Session credential expired before MCP review history delivery'
+      USING ERRCODE = '28000';
+  END IF;
+  RETURN QUERY
+  SELECT v_version.id, v_version.review_set_digest, entry.entry_id,
+    entry.entry_kind, entry.agent, entry.requirement_key, entry.content,
+    entry.content_digest, entry.digest_key_id, entry.projection_eligible
+  FROM public.mcp_operator_review_entries entry
+  WHERE entry.review_version_id = v_version.id
+  ORDER BY entry.entry_id
+  LIMIT 256;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.list_approved_package_plan_registrations_v1(
+  p_session_credential bytea,
+  p_approval_gate_id uuid,
+  p_source_plan_version bigint,
+  p_expected_review_revision integer,
+  p_expected_review_set_digest text
+)
+RETURNS TABLE (work_package_id uuid, registration_id uuid)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_credential_text text;
+  v_credential_digest bytea;
+  v_session public.sessions%ROWTYPE;
+  v_gate public.approval_gates%ROWTYPE;
+  v_review_version_id uuid;
+BEGIN
+  IF session_user <> 'forge_architect_plan_history_reader'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'approved package registration projection requires the credential-bound history principal'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'Approved package registration projection is not enabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
+  IF pg_catalog.octet_length(p_session_credential) <> 36
+     OR p_source_plan_version <= 0
+     OR p_expected_review_revision <= 0
+     OR p_expected_review_set_digest !~ '^hmac-sha256:[0-9a-f]{64}$' THEN
+    RAISE EXCEPTION 'approved package registration projection input is invalid'
+      USING ERRCODE = '22023';
+  END IF;
+  v_credential_text := pg_catalog.convert_from(p_session_credential, 'UTF8');
+  IF v_credential_text !~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+     OR pg_catalog.convert_to(v_credential_text, 'UTF8') <> p_session_credential THEN
+    RAISE EXCEPTION 'Session credential is malformed' USING ERRCODE = '22023';
+  END IF;
+  v_credential_digest := pg_catalog.sha256(
+    pg_catalog.decode('666f7267653a7765622d73657373696f6e3a763100', 'hex')
+      || p_session_credential
+  );
+  SELECT session_row.* INTO STRICT v_session
+  FROM public.sessions session_row
+  WHERE session_row.credential_digest_v1 = v_credential_digest
+    AND session_row.revoked_at IS NULL
+    AND session_row.expires_at IS NOT NULL
+    AND pg_catalog.clock_timestamp() < session_row.expires_at
+  FOR UPDATE;
+
+  SELECT gate.* INTO STRICT v_gate
+  FROM public.approval_gates gate
+  JOIN public.tasks task
+    ON task.id = gate.task_id AND task.submitted_by = v_session.user_id
+  WHERE gate.id = p_approval_gate_id
+    AND gate.gate_type = 'plan_approval'
+    AND gate.status IN ('pending','needs_rework')
+    AND gate.source_artifact_id IS NOT NULL
+    AND gate.protected_review_revision = p_expected_review_revision
+    AND gate.protected_review_set_digest = p_expected_review_set_digest
+  FOR UPDATE OF gate;
+
+  SELECT review.id INTO STRICT v_review_version_id
+  FROM public.mcp_operator_review_versions review
+  WHERE review.approval_gate_id = v_gate.id
+    AND review.task_id = v_gate.task_id
+    AND review.source_artifact_id = v_gate.source_artifact_id
+    AND review.source_plan_version = p_source_plan_version
+    AND review.revision = v_gate.protected_review_revision
+    AND review.review_set_digest = v_gate.protected_review_set_digest
+    AND review.item_count = v_gate.protected_review_item_count
+    AND review.approved_count = v_gate.protected_review_approved_count
+    AND review.denied_count = v_gate.protected_review_denied_count
+    AND review.blocker_codes = v_gate.protected_review_blocker_codes
+  FOR KEY SHARE;
+  PERFORM 1
+  FROM public.architect_plan_versions version
+  WHERE version.task_id = v_gate.task_id
+    AND version.plan_artifact_id = v_gate.source_artifact_id
+    AND version.plan_version = p_source_plan_version
+    AND NOT EXISTS (
+      SELECT 1 FROM public.architect_plan_versions newer
+      WHERE newer.task_id = v_gate.task_id
+        AND newer.plan_version > version.plan_version
+    )
+  FOR KEY SHARE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'approved package registration projection source is stale'
+      USING ERRCODE = '40001';
+  END IF;
+
+  PERFORM 1 FROM public.sessions session_row
+  WHERE session_row.id = v_session.id
+    AND session_row.credential_digest_v1 = v_credential_digest
+    AND session_row.revoked_at IS NULL
+    AND session_row.expires_at IS NOT NULL
+    AND pg_catalog.clock_timestamp() < session_row.expires_at
+  FOR KEY SHARE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Session credential expired before registration projection delivery'
+      USING ERRCODE = '28000';
+  END IF;
+
+  RETURN QUERY
+  SELECT registration.work_package_id, registration.id
+  FROM public.protected_package_entry_registrations registration
+  JOIN public.work_packages package
+    ON package.id = registration.work_package_id
+   AND package.task_id = registration.task_id
+  JOIN public.architect_plan_entries entry
+    ON entry.task_id = registration.task_id
+   AND entry.plan_artifact_id = registration.source_id
+   AND entry.plan_version = registration.source_version
+   AND entry.entry_id = registration.entry_id
+   AND entry.entry_kind = registration.entry_kind
+   AND entry.content_digest = registration.content_digest
+   AND entry.digest_key_id = registration.digest_key_id
+   AND entry.projection_eligible
+  WHERE registration.task_id = v_gate.task_id
+    AND registration.source_kind = 'architect_plan'
+    AND registration.source_id = v_gate.source_artifact_id
+    AND registration.source_version = p_source_plan_version
+    AND NOT EXISTS (
+      SELECT 1
+      FROM (
+        SELECT entry.requirement_key AS requirement_key
+        WHERE entry.requirement_key IS NOT NULL
+        UNION
+        SELECT binding.requirement_key
+        FROM public.protected_entry_capability_bindings binding
+        WHERE binding.source_kind = registration.source_kind
+          AND binding.source_id = registration.source_id
+          AND binding.source_version = registration.source_version
+          AND binding.entry_id = registration.entry_id
+      ) required_key
+      WHERE (
+        SELECT pg_catalog.count(*)
+        FROM public.mcp_operator_review_entries decision
+        WHERE decision.review_version_id = v_review_version_id
+          AND decision.entry_kind = 'decision'
+          AND decision.requirement_key = required_key.requirement_key
+      ) <> 1
+      OR (
+        SELECT pg_catalog.count(*)
+        FROM public.mcp_operator_review_entries decision
+        WHERE decision.review_version_id = v_review_version_id
+          AND decision.entry_kind = 'decision'
+          AND decision.requirement_key = required_key.requirement_key
+          AND decision.projection_eligible
+          AND CASE
+            WHEN pg_catalog.pg_input_is_valid(decision.content, 'pg_catalog.jsonb') THEN
+              decision.content::pg_catalog.jsonb->'schemaVersion' = '2'::pg_catalog.jsonb
+              AND decision.content::pg_catalog.jsonb->>'requirementKey'
+                = required_key.requirement_key
+              AND decision.content::pg_catalog.jsonb->>'decision' = 'approved'
+            ELSE false
+          END
+      ) <> 1
+    )
+  ORDER BY registration.work_package_id, registration.id;
+END;
+$$;
+--> statement-breakpoint
 CREATE OR REPLACE FUNCTION forge.resolve_architect_plan_entry_v1(p_reference_id uuid)
 RETURNS TABLE (
   purpose text,
@@ -670,12 +1413,10 @@ BEGIN
       AND run.work_package_id IS NULL
       AND run.agent_type = 'architect'
       AND reference.agent = 'architect'
-      AND entry.entry_kind = 'plan_body'
-      AND entry.entry_id = 'plan_body:000000'
-      AND entry.agent IS NULL
-      AND entry.requirement_key IS NULL
-      AND entry.binding_fingerprint IS NULL
-      AND NOT entry.projection_eligible
+      AND entry.entry_kind IN (
+        'plan_body','requirement','routing','overlay','subtask',
+        'clarification_question','clarification_answer'
+      )
     )
   ), marked AS (
     UPDATE public.architect_plan_execution_references reference
@@ -722,6 +1463,167 @@ CREATE TABLE public.work_package_local_run_evidence (
   CONSTRAINT work_package_local_run_evidence_identity_key
     UNIQUE (id, task_id, work_package_id, agent_run_id)
 );
+--> statement-breakpoint
+CREATE TABLE public.s4_completion_handoffs (
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  task_id uuid NOT NULL REFERENCES public.tasks(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  work_package_id uuid NOT NULL REFERENCES public.work_packages(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  agent_run_id uuid NOT NULL UNIQUE REFERENCES public.agent_runs(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  local_run_evidence_id uuid NOT NULL UNIQUE REFERENCES public.work_package_local_run_evidence(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  runtime_audit_id uuid UNIQUE REFERENCES public.filesystem_mcp_runtime_audits(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  completion_artifact_id uuid NOT NULL UNIQUE REFERENCES public.artifacts(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  state text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','materialized')),
+  required_gate_types text[],
+  reconciliation_claim_token uuid,
+  reconciliation_claimed_by text,
+  reconciliation_claim_generation bigint NOT NULL DEFAULT 0,
+  reconciliation_lease_expires_at timestamptz,
+  reconcile_attempt_count integer NOT NULL DEFAULT 0,
+  next_reconcile_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  materialized_at timestamptz,
+  CONSTRAINT s4_completion_handoffs_state_chk CHECK (
+    (state = 'pending' AND required_gate_types IS NULL AND materialized_at IS NULL)
+    OR (state = 'materialized' AND required_gate_types IS NOT NULL AND materialized_at IS NOT NULL)
+  ),
+  CONSTRAINT s4_completion_handoffs_reconciliation_claim_chk CHECK (
+    reconciliation_claim_generation >= 0
+    AND reconcile_attempt_count >= 0
+    AND (
+      (reconciliation_claim_token IS NULL AND reconciliation_claimed_by IS NULL
+        AND reconciliation_lease_expires_at IS NULL)
+      OR (state = 'pending' AND reconciliation_claim_token IS NOT NULL
+        AND pg_catalog.length(reconciliation_claimed_by) BETWEEN 1 AND 128
+        AND reconciliation_claim_generation > 0
+        AND reconciliation_lease_expires_at IS NOT NULL)
+    )
+  ),
+  CONSTRAINT s4_completion_handoffs_identity_key
+    UNIQUE (id, task_id, work_package_id, agent_run_id)
+);
+--> statement-breakpoint
+CREATE TABLE public.s4_protected_review_sources (
+  source_artifact_id uuid PRIMARY KEY REFERENCES public.artifacts(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  task_id uuid NOT NULL REFERENCES public.tasks(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  work_package_id uuid NOT NULL REFERENCES public.work_packages(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  source_agent_run_id uuid NOT NULL UNIQUE REFERENCES public.agent_runs(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  content text NOT NULL CHECK (pg_catalog.octet_length(content) BETWEEN 0 AND 1048576),
+  metadata jsonb,
+  content_fingerprint text NOT NULL UNIQUE CHECK (content_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  CONSTRAINT s4_protected_review_sources_metadata_chk CHECK (
+    metadata IS NULL OR pg_catalog.jsonb_typeof(metadata) = 'object'
+  )
+);
+--> statement-breakpoint
+CREATE TABLE public.s4_protected_review_source_reads (
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  approval_gate_id uuid NOT NULL REFERENCES public.approval_gates(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  source_artifact_id uuid NOT NULL REFERENCES public.s4_protected_review_sources(source_artifact_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  source_agent_run_id uuid NOT NULL REFERENCES public.agent_runs(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  content_fingerprint text NOT NULL CHECK (content_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+  read_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp()
+);
+--> statement-breakpoint
+CREATE TABLE public.filesystem_mcp_issuance_recovery_actions (
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  task_id uuid NOT NULL REFERENCES public.tasks(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  work_package_id uuid NOT NULL REFERENCES public.work_packages(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  prior_runtime_audit_id uuid NOT NULL REFERENCES public.filesystem_mcp_runtime_audits(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  action text NOT NULL CHECK (action IN (
+    'acknowledge_possible_submission','retry_execution',
+    'decline_packet_recovery','resolve_after_allow_once_reapproval'
+  )),
+  expected_marker_fingerprint text NOT NULL CHECK (expected_marker_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+  actor_user_id uuid NOT NULL REFERENCES public.users(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  authorizing_decision_id uuid REFERENCES public.filesystem_mcp_grant_approvals(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  result text NOT NULL CHECK (result IN ('acknowledged','ready','cancelled','reapproved')),
+  result_marker_fingerprint text CHECK (result_marker_fingerprint IS NULL OR result_marker_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+  package_status text NOT NULL CHECK (package_status IN ('ready','blocked','cancelled')),
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  UNIQUE (prior_runtime_audit_id, action, expected_marker_fingerprint, actor_user_id)
+);
+--> statement-breakpoint
+CREATE TABLE public.local_effect_recovery_actions (
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  task_id uuid NOT NULL REFERENCES public.tasks(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  work_package_id uuid NOT NULL REFERENCES public.work_packages(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  local_run_evidence_id uuid NOT NULL REFERENCES public.work_package_local_run_evidence(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  action text NOT NULL CHECK (action IN (
+    'review_local_changes','acknowledge_possible_local_invocation',
+    'retry_local_execution','decline_local_retry'
+  )),
+  expected_marker_fingerprint text NOT NULL CHECK (expected_marker_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+  actor_user_id uuid NOT NULL REFERENCES public.users(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  result text NOT NULL,
+  result_marker_fingerprint text CHECK (result_marker_fingerprint IS NULL OR result_marker_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+  package_status text NOT NULL CHECK (package_status IN ('ready','blocked','cancelled')),
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  UNIQUE (local_run_evidence_id, action, expected_marker_fingerprint, actor_user_id)
+);
+--> statement-breakpoint
+CREATE TABLE public.s4_max_attempt_finalizations (
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  task_id uuid NOT NULL REFERENCES public.tasks(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  work_package_id uuid NOT NULL UNIQUE REFERENCES public.work_packages(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  transition_code text NOT NULL CHECK (transition_code = 'max_implementation_attempts_exceeded'),
+  max_attempts integer NOT NULL CHECK (max_attempts = 3),
+  next_attempt_number integer NOT NULL CHECK (next_attempt_number > max_attempts),
+  expected_package_updated_at timestamptz NOT NULL,
+  package_updated_at timestamptz NOT NULL,
+  task_disposition text NOT NULL CHECK (task_disposition = 'failed'),
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp()
+);
+CREATE TRIGGER s4_max_attempt_finalizations_append_only
+  BEFORE UPDATE OR DELETE ON public.s4_max_attempt_finalizations
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
+--> statement-breakpoint
+CREATE TABLE public.local_projection_archive_operations (
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  source_task_id uuid NOT NULL REFERENCES public.tasks(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  replacement_task_id uuid NOT NULL REFERENCES public.tasks(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  actor_user_id uuid NOT NULL REFERENCES public.users(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  state text NOT NULL CHECK (state IN ('validated','quiesced','archived','rolled_back','cancelled')),
+  source_scope_version bigint NOT NULL CHECK (source_scope_version > 0),
+  replacement_version bigint NOT NULL CHECK (replacement_version > 0),
+  source_fingerprint text NOT NULL CHECK (source_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+  replacement_fingerprint text NOT NULL CHECK (replacement_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+  operation_fingerprint text NOT NULL UNIQUE CHECK (operation_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  updated_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  completed_at timestamptz
+);
+--> statement-breakpoint
+CREATE UNIQUE INDEX local_projection_archive_operations_live_source_unique
+  ON public.local_projection_archive_operations (source_task_id)
+  WHERE state IN ('validated','quiesced','archived');
+CREATE UNIQUE INDEX local_projection_archive_operations_live_replacement_unique
+  ON public.local_projection_archive_operations (replacement_task_id)
+  WHERE state IN ('validated','quiesced','archived');
+--> statement-breakpoint
+CREATE TABLE public.local_projection_archive_operation_checkpoints (
+  operation_id uuid NOT NULL REFERENCES public.local_projection_archive_operations(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  ordinal integer NOT NULL CHECK (ordinal BETWEEN 1 AND 5),
+  state text NOT NULL CHECK (state IN ('validated','quiesced','archived','rolled_back','cancelled')),
+  operation_fingerprint text NOT NULL CHECK (operation_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+  actor_user_id uuid NOT NULL REFERENCES public.users(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  recorded_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  PRIMARY KEY (operation_id, ordinal),
+  UNIQUE (operation_id, state)
+);
+--> statement-breakpoint
+CREATE TRIGGER filesystem_mcp_issuance_recovery_actions_append_only
+  BEFORE UPDATE OR DELETE ON public.filesystem_mcp_issuance_recovery_actions
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
+CREATE TRIGGER local_effect_recovery_actions_append_only
+  BEFORE UPDATE OR DELETE ON public.local_effect_recovery_actions
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
+CREATE TRIGGER s4_protected_review_source_reads_append_only
+  BEFORE UPDATE OR DELETE ON public.s4_protected_review_source_reads
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
+CREATE TRIGGER local_projection_archive_checkpoints_append_only
+  BEFORE UPDATE OR DELETE ON public.local_projection_archive_operation_checkpoints
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
 --> statement-breakpoint
 CREATE TABLE public.filesystem_mcp_decision_nonce_claims (
   id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
@@ -996,6 +1898,73 @@ BEGIN
   RAISE EXCEPTION 'S4 runtime mode is blocked by incomplete Step 0 authority'
     USING ERRCODE = '55000';
 END;
+$$;
+--> statement-breakpoint
+-- Startup must consult database authority before constructing any protected
+-- issuer client. This coarse reader is the only S4 routine granted to the
+-- ordinary application login and returns no protected row identity.
+CREATE OR REPLACE FUNCTION forge.read_s4_runtime_mode_for_application_v1()
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+BEGIN
+  IF forge.s4_protected_paths_enabled_v1() THEN
+    RETURN 'protected';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM forge.read_epic_172_enablement_state_v1() state
+    WHERE state.state = 'disabled'
+  ) THEN
+    RETURN 'legacy';
+  END IF;
+  RAISE EXCEPTION 'S4 runtime mode is blocked by incomplete Step 0 authority'
+    USING ERRCODE = '55000';
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.packet_recovery_marker_token_v2(p_value text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+  SELECT CASE WHEN p_value IS NULL THEN '-1:'
+    ELSE pg_catalog.octet_length(pg_catalog.convert_to(p_value, 'UTF8'))::text || ':' || p_value
+  END
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.packet_recovery_marker_fingerprint_v2(p_marker jsonb)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+SET search_path = pg_catalog, forge
+AS $$
+  SELECT 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+    pg_catalog.convert_to('forge:packet-recovery-marker:v2', 'UTF8')
+    || pg_catalog.decode('00', 'hex')
+    || pg_catalog.convert_to(pg_catalog.concat_ws('|',
+      forge.packet_recovery_marker_token_v2(p_marker->>'schemaVersion'),
+      forge.packet_recovery_marker_token_v2(p_marker->>'kind'),
+      forge.packet_recovery_marker_token_v2(p_marker->>'priorAgentRunId'),
+      forge.packet_recovery_marker_token_v2(p_marker->>'priorRuntimeAuditId'),
+      forge.packet_recovery_marker_token_v2(p_marker->'recoveryFailure'->>'status'),
+      forge.packet_recovery_marker_token_v2(p_marker->'recoveryFailure'->>'failureCode'),
+      forge.packet_recovery_marker_token_v2(p_marker->'recoveryFailure'->>'failureStage'),
+      forge.packet_recovery_marker_token_v2(p_marker->>'deliveryState'),
+      forge.packet_recovery_marker_token_v2(p_marker->>'grantMode'),
+      forge.packet_recovery_marker_token_v2(p_marker->>'disposition'),
+      forge.packet_recovery_marker_token_v2(p_marker->>'nextDisposition'),
+      forge.packet_recovery_marker_token_v2(p_marker->>'acknowledgedAt'),
+      forge.packet_recovery_marker_token_v2(p_marker->>'acknowledgedByUserId'),
+      forge.packet_recovery_marker_token_v2(p_marker->>'combinedRepositoryReviewFingerprint'),
+      forge.packet_recovery_marker_token_v2(p_marker->>'policyFingerprint'),
+      forge.packet_recovery_marker_token_v2(p_marker->>'coverageFingerprint'),
+      forge.packet_recovery_marker_token_v2(p_marker->>'autoRetryable')
+    ), 'UTF8')
+  ), 'hex')
 $$;
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION forge.create_local_run_evidence_v1(
@@ -1408,6 +2377,8 @@ CREATE OR REPLACE FUNCTION forge.claim_work_package_lifecycle_v2(
   p_attempt_number integer,
   p_provider_config_id uuid,
   p_model_id_used text,
+  p_expected_provider_updated_at timestamptz,
+  p_acp_execution_mode text,
   p_stage text,
   p_execution_stale_seconds integer,
   p_decision_id uuid,
@@ -1433,6 +2404,10 @@ AS $$
 DECLARE
   v_project_id uuid;
   v_package public.work_packages%ROWTYPE;
+  v_provider public.provider_configs%ROWTYPE;
+  v_package_count integer;
+  v_projection_head_count integer;
+  v_expected_attempt integer;
   v_now timestamptz := pg_catalog.clock_timestamp();
 BEGIN
   IF session_user <> 'forge_packet_issuer'
@@ -1449,6 +2424,7 @@ BEGIN
      OR p_execution_stale_seconds NOT BETWEEN 1 AND 3600
      OR pg_catalog.length(pg_catalog.btrim(p_agent_type)) NOT BETWEEN 1 AND 100
      OR pg_catalog.length(pg_catalog.btrim(p_model_id_used)) NOT BETWEEN 1 AND 500
+     OR p_acp_execution_mode NOT IN ('not_applicable', 'unconfined_host_process')
      OR (p_mode = 'root_free_handoff' AND (
        p_decision_id IS NOT NULL OR p_local_claim_token IS NOT NULL
        OR p_packet_claim_token IS NOT NULL
@@ -1477,12 +2453,61 @@ BEGIN
   END IF;
   PERFORM 1 FROM public.tasks task
   WHERE task.id = p_task_id AND task.project_id = v_project_id
-    AND task.status = 'running' FOR UPDATE;
+    AND task.status = 'running'
+    AND task.local_projection_scope_state = 'active'
+    AND task.local_projection_overlimit_package_count IS NULL
+  FOR UPDATE;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'work-package task is not running' USING ERRCODE = '40001';
   END IF;
   PERFORM 1 FROM public.work_packages package
   WHERE package.task_id = p_task_id ORDER BY package.id FOR UPDATE;
+  GET DIAGNOSTICS v_package_count = ROW_COUNT;
+  IF v_package_count < 1 OR v_package_count > 256 THEN
+    RAISE EXCEPTION 'work-package claim is outside the bounded projection scope'
+      USING ERRCODE = 'P1726';
+  END IF;
+  -- The fixed heads are the complete current-authority projection input. Lock
+  -- them after sibling packages, in the shared canonical order, and reject a
+  -- missing/duplicate/misindexed set before creating a run.
+  PERFORM 1 FROM public.work_package_local_projection_heads head
+  WHERE head.task_id = p_task_id ORDER BY head.id FOR UPDATE;
+  GET DIAGNOSTICS v_projection_head_count = ROW_COUNT;
+  IF v_projection_head_count <> v_package_count * 8
+     OR EXISTS (
+       SELECT 1
+       FROM public.work_package_local_projection_heads head
+       WHERE head.task_id = p_task_id
+       GROUP BY head.work_package_id
+       HAVING pg_catalog.count(*) <> 8
+          OR pg_catalog.count(DISTINCT head.head_kind) <> 8
+          OR pg_catalog.min(head.head_index) <> 0
+          OR pg_catalog.max(head.head_index) <> 7
+     ) THEN
+    RAISE EXCEPTION 'work-package projection head aggregate is incomplete or divergent'
+      USING ERRCODE = 'P1726';
+  END IF;
+  IF p_provider_config_id IS NULL THEN
+    IF p_expected_provider_updated_at IS NOT NULL
+       OR p_acp_execution_mode <> 'not_applicable' THEN
+      RAISE EXCEPTION 'provider-free claims cannot carry a provider snapshot'
+        USING ERRCODE = '22023';
+    END IF;
+  ELSE
+    SELECT provider.* INTO STRICT v_provider
+    FROM public.provider_configs provider
+    WHERE provider.id = p_provider_config_id
+      AND provider.updated_at = p_expected_provider_updated_at
+      AND provider.is_active
+    FOR UPDATE;
+    IF (v_provider.provider_type = 'acp'
+          AND p_acp_execution_mode <> 'unconfined_host_process')
+       OR (v_provider.provider_type <> 'acp'
+          AND p_acp_execution_mode <> 'not_applicable') THEN
+      RAISE EXCEPTION 'provider snapshot and ACP execution mode disagree'
+        USING ERRCODE = '22023';
+    END IF;
+  END IF;
   SELECT package.* INTO STRICT v_package
   FROM public.work_packages package
   WHERE package.id = p_work_package_id AND package.task_id = p_task_id;
@@ -1499,6 +2524,18 @@ BEGIN
      )
      OR v_package.metadata ? 'executionLease' THEN
     RAISE EXCEPTION 'work-package claim lost its ready/sibling compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+
+  SELECT COALESCE(pg_catalog.max(run.attempt_number), 0) + 1
+  INTO v_expected_attempt
+  FROM public.agent_runs run
+  WHERE run.task_id = p_task_id
+    AND run.work_package_id = p_work_package_id
+    AND run.stage = p_stage
+    AND run.attempt_number IS NOT NULL;
+  IF v_expected_attempt <> p_attempt_number THEN
+    RAISE EXCEPTION 'work-package attempt number is not the next retained attempt'
       USING ERRCODE = '40001';
   END IF;
 
@@ -1520,10 +2557,17 @@ BEGIN
 
   INSERT INTO public.agent_runs (
     id, task_id, work_package_id, harness_id, agent_type, stage,
-    attempt_number, provider_config_id, model_id_used, status, started_at
+    attempt_number, provider_config_id, model_id_used,
+    provider_type_used, provider_is_local_used,
+    provider_config_updated_at_used, acp_execution_mode,
+    status, started_at
   ) VALUES (
     p_agent_run_id, p_task_id, p_work_package_id, p_harness_id, p_agent_type,
     p_stage, p_attempt_number, p_provider_config_id, p_model_id_used,
+    CASE WHEN p_provider_config_id IS NULL THEN NULL ELSE v_provider.provider_type END,
+    CASE WHEN p_provider_config_id IS NULL THEN NULL ELSE v_provider.is_local END,
+    CASE WHEN p_provider_config_id IS NULL THEN NULL ELSE v_provider.updated_at END,
+    p_acp_execution_mode,
     'running', v_now
   );
   UPDATE public.work_packages package
@@ -2028,6 +3072,8 @@ AS $$
 DECLARE
   v_now timestamptz := pg_catalog.clock_timestamp();
   v_agent_run_id uuid;
+  v_task_id uuid;
+  v_work_package_id uuid;
   v_artifact_id uuid;
 BEGIN
   IF pg_catalog.length(pg_catalog.btrim(p_artifact_type)) NOT BETWEEN 1 AND 100
@@ -2041,8 +3087,27 @@ BEGIN
     p_local_run_evidence_id, p_local_claim_token, p_local_claim_generation
   );
   INSERT INTO public.artifacts (agent_run_id, artifact_type, content, metadata)
-  VALUES (v_agent_run_id, p_artifact_type, p_artifact_content, p_artifact_metadata)
+  VALUES (
+    v_agent_run_id, p_artifact_type,
+    'Protected review source available through its approval gate.',
+    pg_catalog.jsonb_build_object('schemaVersion', 1, 'protectedReviewSource', true)
+  )
   RETURNING id INTO v_artifact_id;
+  SELECT evidence.task_id, evidence.work_package_id
+  INTO STRICT v_task_id, v_work_package_id
+  FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = p_local_run_evidence_id;
+  INSERT INTO public.s4_protected_review_sources (
+    source_artifact_id, task_id, work_package_id, source_agent_run_id,
+    content, metadata, content_fingerprint
+  ) VALUES (
+    v_artifact_id, v_task_id, v_work_package_id, v_agent_run_id,
+    p_artifact_content, p_artifact_metadata,
+    'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+      pg_catalog.convert_to('forge:protected-review-source:v1:' || v_agent_run_id::text || ':' ||
+        p_artifact_content || ':' || COALESCE(p_artifact_metadata::text, 'null'), 'UTF8')
+    ), 'hex')
+  );
   UPDATE public.work_package_local_run_evidence evidence
   SET state = 'terminal', terminal = '{"status":"succeeded"}'::jsonb,
       completion_artifact_id = v_artifact_id, terminal_at = v_now
@@ -2054,6 +3119,13 @@ BEGIN
     RAISE EXCEPTION 'local success lost its running agent run'
       USING ERRCODE = '40001';
   END IF;
+  INSERT INTO public.s4_completion_handoffs (
+    task_id, work_package_id, agent_run_id, local_run_evidence_id,
+    completion_artifact_id
+  ) VALUES (
+    v_task_id, v_work_package_id, v_agent_run_id,
+    p_local_run_evidence_id, v_artifact_id
+  );
   RETURN v_artifact_id;
 END;
 $$;
@@ -2073,6 +3145,9 @@ DECLARE
   v_agent_run_id uuid;
   v_package_id uuid;
   v_now timestamptz := pg_catalog.clock_timestamp();
+  v_terminal jsonb;
+  v_marker jsonb;
+  v_evidence_fingerprint text;
 BEGIN
   IF p_failure_code NOT IN (
     'local_execution_failed', 'local_invocation_uncertain',
@@ -2087,12 +3162,47 @@ BEGIN
   SELECT evidence.work_package_id INTO STRICT v_package_id
   FROM public.work_package_local_run_evidence evidence
   WHERE evidence.id = p_local_run_evidence_id;
+  v_terminal := pg_catalog.jsonb_build_object(
+    'status', 'failed', 'failureCode', p_failure_code
+  );
+  v_evidence_fingerprint := 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+    pg_catalog.convert_to(
+      'forge:local-run-evidence:v1:' || p_local_run_evidence_id::text || ':' || v_terminal::text,
+      'UTF8'
+    )
+  ), 'hex');
+  v_marker := pg_catalog.jsonb_build_object(
+    'schemaVersion', 1, 'kind', 'local_effect_recovery',
+    'source', 'local-run-evidence', 'priorAgentRunId', v_agent_run_id::text,
+    'localRunEvidenceId', p_local_run_evidence_id::text,
+    'evidenceFingerprint', v_evidence_fingerprint,
+    'taskDisposition', 'operator_hold', 'autoRetryable', false,
+    'reason', CASE p_failure_code
+      WHEN 'local_invocation_uncertain' THEN 'local_invocation_uncertain'
+      WHEN 'external_repository_change_requires_review' THEN 'repository_change_requires_review'
+      ELSE 'local_execution_interrupted' END,
+    'disposition', CASE p_failure_code
+      WHEN 'local_invocation_uncertain' THEN 'acknowledge_possible_local_invocation'
+      WHEN 'external_repository_change_requires_review' THEN 'review_local_changes'
+      ELSE 'retry_local_execution' END,
+    'reviewState', CASE p_failure_code
+      WHEN 'external_repository_change_requires_review' THEN 'review_required'
+      ELSE 'not_applicable' END
+  );
+  IF p_failure_code = 'local_invocation_uncertain' THEN
+    v_marker := v_marker || pg_catalog.jsonb_build_object(
+      'invocationAttemptId', p_local_run_evidence_id::text,
+      'acknowledgedAt', NULL, 'acknowledgedByUserId', NULL
+    );
+  ELSIF p_failure_code = 'external_repository_change_requires_review' THEN
+    v_marker := v_marker || pg_catalog.jsonb_build_object(
+      'nextDisposition', 'retry_local_execution'
+    );
+  END IF;
   UPDATE public.work_package_local_run_evidence evidence
   SET state = CASE WHEN p_failure_code = 'local_invocation_uncertain'
     THEN 'uncertain' ELSE 'terminal' END,
-      terminal = pg_catalog.jsonb_build_object(
-        'status', 'failed', 'failureCode', p_failure_code
-      ),
+      terminal = v_terminal,
       terminal_at = v_now
   WHERE evidence.id = p_local_run_evidence_id AND evidence.state = 'claimed';
   UPDATE public.agent_runs run
@@ -2101,12 +3211,7 @@ BEGIN
   WHERE run.id = v_agent_run_id AND run.status = 'running';
   UPDATE public.work_packages package
   SET status = 'blocked', metadata = pg_catalog.jsonb_set(
-    package.metadata - 'executionLease', '{local_effect_recovery}',
-    pg_catalog.jsonb_build_object(
-      'schemaVersion', 2, 'kind', 'local_lifecycle',
-      'localRunEvidenceId', p_local_run_evidence_id::text,
-      'failureCode', p_failure_code, 'autoRetryable', false
-    ), true
+    package.metadata - 'executionLease', '{local_effect_recovery}', v_marker, true
   )
   WHERE package.id = v_package_id AND package.status = 'running'
     AND package.metadata->'executionLease'->>'runId' = v_agent_run_id::text;
@@ -2157,8 +3262,23 @@ BEGIN
       USING ERRCODE = '55000';
   END IF;
   INSERT INTO public.artifacts (agent_run_id, artifact_type, content, metadata)
-  VALUES (v_audit.agent_run_id, p_artifact_type, p_artifact_content, p_artifact_metadata)
+  VALUES (
+    v_audit.agent_run_id, p_artifact_type,
+    'Protected review source available through its approval gate.',
+    pg_catalog.jsonb_build_object('schemaVersion', 1, 'protectedReviewSource', true)
+  )
   RETURNING id INTO v_artifact_id;
+  INSERT INTO public.s4_protected_review_sources (
+    source_artifact_id, task_id, work_package_id, source_agent_run_id,
+    content, metadata, content_fingerprint
+  ) VALUES (
+    v_artifact_id, v_audit.task_id, v_audit.work_package_id, v_audit.agent_run_id,
+    p_artifact_content, p_artifact_metadata,
+    'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+      pg_catalog.convert_to('forge:protected-review-source:v1:' || v_audit.agent_run_id::text || ':' ||
+        p_artifact_content || ':' || COALESCE(p_artifact_metadata::text, 'null'), 'UTF8')
+    ), 'hex')
+  );
   UPDATE public.filesystem_mcp_runtime_audits audit
   SET status = 'succeeded', terminal = '{"status":"succeeded"}'::jsonb,
       completion_artifact_id = v_artifact_id, terminal_at = v_now
@@ -2177,7 +3297,598 @@ BEGIN
     RAISE EXCEPTION 'packet success lost its running agent run'
       USING ERRCODE = '40001';
   END IF;
+  INSERT INTO public.s4_completion_handoffs (
+    task_id, work_package_id, agent_run_id, local_run_evidence_id,
+    runtime_audit_id, completion_artifact_id
+  ) VALUES (
+    v_audit.task_id, v_audit.work_package_id, v_audit.agent_run_id,
+    v_audit.local_run_evidence_id, v_audit.id, v_artifact_id
+  );
   RETURN v_artifact_id;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.materialize_s4_completion_handoff_v1(
+  p_agent_run_id uuid,
+  p_required_gate_types text[]
+)
+RETURNS TABLE (package_status text, source_artifact_id uuid)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_handoff public.s4_completion_handoffs%ROWTYPE;
+  v_package public.work_packages%ROWTYPE;
+  v_project_id uuid;
+  v_gate_type text;
+  v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'completion handoff requires the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  IF p_required_gate_types IS NULL
+     OR NOT p_required_gate_types <@ ARRAY['qa_review','reviewer_review','security_review']::text[]
+     OR pg_catalog.cardinality(p_required_gate_types) > 3
+     OR p_required_gate_types <> COALESCE((
+       SELECT pg_catalog.array_agg(DISTINCT gate ORDER BY gate)
+       FROM pg_catalog.unnest(p_required_gate_types) gate
+     ), ARRAY[]::text[]) THEN
+    RAISE EXCEPTION 'completion handoff gate set is invalid'
+      USING ERRCODE = '22023';
+  END IF;
+
+  SELECT handoff.* INTO STRICT v_handoff
+  FROM public.s4_completion_handoffs handoff
+  WHERE handoff.agent_run_id = p_agent_run_id;
+  SELECT task.project_id INTO STRICT v_project_id
+  FROM public.tasks task WHERE task.id = v_handoff.task_id;
+  PERFORM 1 FROM public.projects project
+  WHERE project.id = v_project_id AND project.archived_at IS NULL FOR UPDATE;
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id = v_handoff.task_id AND task.project_id = v_project_id FOR UPDATE;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id = v_handoff.task_id ORDER BY package.id FOR UPDATE;
+  PERFORM 1 FROM public.agent_runs run
+  WHERE run.id = p_agent_run_id AND run.status = 'completed' FOR UPDATE;
+  PERFORM 1 FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = v_handoff.local_run_evidence_id
+    AND evidence.terminal = '{"status":"succeeded"}'::jsonb
+    AND evidence.completion_artifact_id = v_handoff.completion_artifact_id
+  FOR UPDATE;
+  IF v_handoff.runtime_audit_id IS NOT NULL THEN
+    PERFORM 1 FROM public.filesystem_mcp_runtime_audits audit
+    WHERE audit.id = v_handoff.runtime_audit_id
+      AND audit.status = 'succeeded'
+      AND audit.terminal = '{"status":"succeeded"}'::jsonb
+      AND audit.completion_artifact_id = v_handoff.completion_artifact_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'completion handoff packet evidence is incoherent'
+        USING ERRCODE = '55000';
+    END IF;
+  END IF;
+  SELECT handoff.* INTO STRICT v_handoff
+  FROM public.s4_completion_handoffs handoff
+  WHERE handoff.agent_run_id = p_agent_run_id FOR UPDATE;
+  SELECT package.* INTO STRICT v_package
+  FROM public.work_packages package
+  WHERE package.id = v_handoff.work_package_id;
+
+  IF v_handoff.state = 'materialized' THEN
+    IF v_handoff.required_gate_types <> p_required_gate_types THEN
+      RAISE EXCEPTION 'completion handoff replay changed the gate set'
+        USING ERRCODE = '40001';
+    END IF;
+    package_status := v_package.status;
+    source_artifact_id := v_handoff.completion_artifact_id;
+    RETURN NEXT;
+    RETURN;
+  END IF;
+  IF v_handoff.reconciliation_claim_token IS NOT NULL THEN
+    RAISE EXCEPTION 'completion handoff has an active reconciliation claim'
+      USING ERRCODE = '40001';
+  END IF;
+  IF (v_package.review_requirement = 'qa_only'
+        AND NOT p_required_gate_types @> ARRAY['qa_review']::text[])
+     OR (v_package.review_requirement = 'reviewer_only'
+        AND NOT p_required_gate_types @> ARRAY['reviewer_review']::text[])
+     OR (v_package.review_requirement = 'both'
+        AND NOT p_required_gate_types @> ARRAY['qa_review','reviewer_review']::text[])
+     OR v_package.review_requirement NOT IN ('none','qa_only','reviewer_only','both') THEN
+    RAISE EXCEPTION 'completion handoff omitted a package-required review gate'
+      USING ERRCODE = '55000';
+  END IF;
+  IF v_package.status <> 'running'
+     OR v_package.metadata->'executionLease'->>'runId' <> p_agent_run_id::text THEN
+    RAISE EXCEPTION 'completion handoff no longer owns the package lease'
+      USING ERRCODE = '40001';
+  END IF;
+
+  FOREACH v_gate_type IN ARRAY p_required_gate_types LOOP
+    INSERT INTO public.approval_gates (
+      task_id, work_package_id, gate_type, status, source_agent_run_id,
+      source_artifact_id, title, instructions, metadata
+    ) VALUES (
+      v_handoff.task_id, v_handoff.work_package_id, v_gate_type, 'pending',
+      p_agent_run_id, v_handoff.completion_artifact_id,
+      CASE v_gate_type
+        WHEN 'qa_review' THEN 'QA review: ' || v_package.title
+        WHEN 'reviewer_review' THEN 'Reviewer review: ' || v_package.title
+        ELSE 'Security review: ' || v_package.title
+      END,
+      CASE v_gate_type
+        WHEN 'qa_review' THEN 'QA must verify the output for "' || v_package.title || '" before reviewer approval.'
+        WHEN 'reviewer_review' THEN 'Reviewer must approve the output for "' || v_package.title || '" after QA completion.'
+        ELSE 'Security review must inspect high-risk implementation output from "' || v_package.title || '" and record structured findings or explicit no-findings evidence.'
+      END,
+      pg_catalog.jsonb_build_object(
+        'schemaVersion', 1,
+        'requiredRole', CASE v_gate_type
+          WHEN 'qa_review' THEN 'qa'
+          WHEN 'reviewer_review' THEN 'reviewer'
+          ELSE 'security'
+        END,
+        'source', 'review-gates',
+        'sourcePackageId', v_handoff.work_package_id::text,
+        'sourceRunId', p_agent_run_id::text
+      )
+    );
+  END LOOP;
+
+  UPDATE public.work_packages package
+  SET status = CASE WHEN pg_catalog.cardinality(p_required_gate_types) = 0
+      THEN 'completed' ELSE 'awaiting_review' END,
+      blocked_reason = NULL,
+      metadata = package.metadata - 'executionLease',
+      updated_at = v_now
+  WHERE package.id = v_handoff.work_package_id
+    AND package.status = 'running'
+    AND package.metadata->'executionLease'->>'runId' = p_agent_run_id::text;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'completion handoff lost its package lease'
+      USING ERRCODE = '40001';
+  END IF;
+  UPDATE public.s4_completion_handoffs handoff
+  SET state = 'materialized', required_gate_types = p_required_gate_types,
+      materialized_at = v_now,
+      reconciliation_claim_token = NULL,
+      reconciliation_claimed_by = NULL,
+      reconciliation_lease_expires_at = NULL
+  WHERE handoff.id = v_handoff.id AND handoff.state = 'pending'
+    AND handoff.reconciliation_claim_token IS NULL;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'completion handoff lost its materialization compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+
+  package_status := CASE WHEN pg_catalog.cardinality(p_required_gate_types) = 0
+    THEN 'completed' ELSE 'awaiting_review' END;
+  source_artifact_id := v_handoff.completion_artifact_id;
+  RETURN NEXT;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.discover_s4_completion_handoff_v1(
+  p_work_package_id uuid
+)
+RETURNS TABLE (
+  agent_run_id uuid,
+  local_run_evidence_id uuid,
+  runtime_audit_id uuid,
+  source_artifact_id uuid,
+  handoff_state text
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'completion discovery requires the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  RETURN QUERY
+  SELECT handoff.agent_run_id, handoff.local_run_evidence_id,
+    handoff.runtime_audit_id, handoff.completion_artifact_id, handoff.state
+  FROM public.s4_completion_handoffs handoff
+  JOIN public.agent_runs run ON run.id = handoff.agent_run_id
+  JOIN public.work_packages package ON package.id = handoff.work_package_id
+  WHERE handoff.work_package_id = p_work_package_id
+    AND handoff.state = 'pending'
+    AND run.status = 'completed'
+    AND package.status = 'running'
+    AND package.metadata->'executionLease'->>'runId' = handoff.agent_run_id::text
+  ORDER BY handoff.created_at, handoff.id
+  LIMIT 2;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.list_pending_s4_completion_handoffs_v1(
+  p_limit integer,
+  p_after_created_at timestamptz,
+  p_after_id uuid
+)
+RETURNS TABLE (
+  handoff_id uuid,
+  agent_run_id uuid,
+  work_package_id uuid,
+  task_id uuid,
+  local_run_evidence_id uuid,
+  runtime_audit_id uuid,
+  source_artifact_id uuid,
+  handoff_state text,
+  review_requirement text,
+  created_at timestamptz
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'completion handoff listing requires the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'S4 completion handoff listing is disabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
+  IF p_limit NOT BETWEEN 1 AND 100
+     OR (p_after_created_at IS NULL) <> (p_after_id IS NULL) THEN
+    RAISE EXCEPTION 'completion handoff list limit or cursor is invalid'
+      USING ERRCODE = '22023';
+  END IF;
+  RETURN QUERY
+  SELECT handoff.id, handoff.agent_run_id, handoff.work_package_id,
+    handoff.task_id, handoff.local_run_evidence_id, handoff.runtime_audit_id,
+    handoff.completion_artifact_id, handoff.state, package.review_requirement,
+    handoff.created_at
+  FROM public.s4_completion_handoffs handoff
+  JOIN public.agent_runs run
+    ON run.id = handoff.agent_run_id
+   AND run.task_id = handoff.task_id
+   AND run.work_package_id = handoff.work_package_id
+  JOIN public.work_packages package
+    ON package.id = handoff.work_package_id
+   AND package.task_id = handoff.task_id
+  WHERE handoff.state = 'pending'
+    AND run.status = 'completed'
+    AND package.status = 'running'
+    AND package.metadata->'executionLease'->>'runId' = handoff.agent_run_id::text
+    AND (
+      p_after_created_at IS NULL
+      OR (handoff.created_at, handoff.id) > (p_after_created_at, p_after_id)
+    )
+  ORDER BY handoff.created_at, handoff.id
+  LIMIT p_limit;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.claim_pending_s4_completion_handoffs_v1(
+  p_worker_id text,
+  p_claim_token uuid,
+  p_lease_seconds integer,
+  p_limit integer
+)
+RETURNS TABLE (
+  handoff_id uuid,
+  agent_run_id uuid,
+  work_package_id uuid,
+  task_id uuid,
+  local_run_evidence_id uuid,
+  runtime_audit_id uuid,
+  source_artifact_id uuid,
+  handoff_state text,
+  review_requirement text,
+  created_at timestamptz,
+  claim_generation bigint,
+  lease_expires_at timestamptz
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'completion handoff claim requires the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'S4 completion handoff claims are disabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
+  IF pg_catalog.length(p_worker_id) NOT BETWEEN 1 AND 128
+     OR p_worker_id !~ '^[A-Za-z0-9._:-]+$'
+     OR p_claim_token IS NULL
+     OR p_lease_seconds NOT BETWEEN 1 AND 300
+     OR p_limit NOT BETWEEN 1 AND 100 THEN
+    RAISE EXCEPTION 'completion handoff claim input is invalid'
+      USING ERRCODE = '22023';
+  END IF;
+  RETURN QUERY
+  WITH candidates AS (
+    SELECT handoff.id
+    FROM public.s4_completion_handoffs handoff
+    JOIN public.agent_runs run
+      ON run.id = handoff.agent_run_id AND run.status = 'completed'
+    JOIN public.work_packages package
+      ON package.id = handoff.work_package_id
+     AND package.task_id = handoff.task_id
+    WHERE handoff.state = 'pending'
+      AND package.status = 'running'
+      AND package.metadata->'executionLease'->>'runId' = handoff.agent_run_id::text
+      AND (
+        handoff.reconciliation_claim_token IS NULL
+        OR handoff.reconciliation_lease_expires_at <= v_now
+      )
+      AND handoff.next_reconcile_at <= v_now
+    ORDER BY handoff.created_at, handoff.id
+    FOR UPDATE OF handoff SKIP LOCKED
+    LIMIT p_limit
+  ), claimed AS (
+    UPDATE public.s4_completion_handoffs handoff
+    SET reconciliation_claim_token = p_claim_token,
+        reconciliation_claimed_by = p_worker_id,
+        reconciliation_claim_generation = handoff.reconciliation_claim_generation + 1,
+        reconciliation_lease_expires_at = v_now + pg_catalog.make_interval(secs => p_lease_seconds),
+        reconcile_attempt_count = handoff.reconcile_attempt_count + 1,
+        next_reconcile_at = v_now + pg_catalog.make_interval(
+          secs => p_lease_seconds + LEAST(
+            300, pg_catalog.power(2, LEAST(handoff.reconcile_attempt_count, 8))::integer
+          )
+        )
+    FROM candidates
+    WHERE handoff.id = candidates.id
+    RETURNING handoff.*
+  )
+  SELECT claimed.id, claimed.agent_run_id, claimed.work_package_id,
+    claimed.task_id, claimed.local_run_evidence_id, claimed.runtime_audit_id,
+    claimed.completion_artifact_id, claimed.state, package.review_requirement,
+    claimed.created_at, claimed.reconciliation_claim_generation,
+    claimed.reconciliation_lease_expires_at
+  FROM claimed
+  JOIN public.work_packages package ON package.id = claimed.work_package_id
+  ORDER BY claimed.created_at, claimed.id;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.materialize_claimed_s4_completion_handoff_v1(
+  p_agent_run_id uuid,
+  p_required_gate_types text[],
+  p_worker_id text,
+  p_claim_token uuid,
+  p_claim_generation bigint
+)
+RETURNS TABLE (package_status text, source_artifact_id uuid)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'claimed completion materialization requires the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  UPDATE public.s4_completion_handoffs handoff
+  SET reconciliation_claim_token = NULL,
+      reconciliation_claimed_by = NULL,
+      reconciliation_lease_expires_at = NULL
+  WHERE handoff.agent_run_id = p_agent_run_id
+    AND handoff.state = 'pending'
+    AND handoff.reconciliation_claimed_by = p_worker_id
+    AND handoff.reconciliation_claim_token = p_claim_token
+    AND handoff.reconciliation_claim_generation = p_claim_generation
+    AND handoff.reconciliation_lease_expires_at > v_now;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'completion handoff reconciliation lease is stale or not owned'
+      USING ERRCODE = '40001';
+  END IF;
+  RETURN QUERY
+  SELECT materialized.package_status, materialized.source_artifact_id
+  FROM forge.materialize_s4_completion_handoff_v1(
+    p_agent_run_id, p_required_gate_types
+  ) materialized;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.finalize_s4_max_attempts_v1(
+  p_task_id uuid,
+  p_work_package_id uuid,
+  p_expected_package_updated_at timestamptz,
+  p_max_attempts integer
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_project_id uuid;
+  v_task public.tasks%ROWTYPE;
+  v_package public.work_packages%ROWTYPE;
+  v_package_count integer;
+  v_projection_head_count integer;
+  v_expected_attempt integer;
+  v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'max-attempt finalization requires the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'S4 max-attempt finalization is disabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
+  IF p_expected_package_updated_at IS NULL
+     OR p_max_attempts <> 3 THEN
+    RAISE EXCEPTION 'max-attempt finalization input is invalid'
+      USING ERRCODE = '22023';
+  END IF;
+
+  SELECT task.project_id INTO STRICT v_project_id
+  FROM public.work_packages package
+  JOIN public.tasks task ON task.id = package.task_id
+  WHERE package.id = p_work_package_id AND package.task_id = p_task_id;
+  PERFORM 1 FROM public.projects project
+  WHERE project.id = v_project_id AND project.archived_at IS NULL FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'max-attempt project is unavailable' USING ERRCODE = '40001';
+  END IF;
+  SELECT task.* INTO STRICT v_task FROM public.tasks task
+  WHERE task.id = p_task_id AND task.project_id = v_project_id FOR UPDATE;
+  IF EXISTS (
+    SELECT 1 FROM public.s4_max_attempt_finalizations finalization
+    WHERE finalization.work_package_id = p_work_package_id
+  ) THEN
+    RETURN false;
+  END IF;
+  IF v_task.status <> 'running'
+     OR v_task.local_projection_scope_state <> 'active'
+     OR v_task.local_projection_overlimit_package_count IS NOT NULL THEN
+    RAISE EXCEPTION 'max-attempt task is outside the active protected scope'
+      USING ERRCODE = '40001';
+  END IF;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id = p_task_id ORDER BY package.id FOR UPDATE;
+  GET DIAGNOSTICS v_package_count = ROW_COUNT;
+  IF v_package_count < 1 OR v_package_count > 256 THEN
+    RAISE EXCEPTION 'max-attempt finalization is outside the bounded projection scope'
+      USING ERRCODE = 'P1726';
+  END IF;
+  PERFORM 1 FROM public.work_package_local_projection_heads head
+  WHERE head.task_id = p_task_id ORDER BY head.id FOR UPDATE;
+  GET DIAGNOSTICS v_projection_head_count = ROW_COUNT;
+  IF v_projection_head_count <> v_package_count * 8
+     OR EXISTS (
+       SELECT 1
+       FROM public.work_package_local_projection_heads head
+       WHERE head.task_id = p_task_id
+       GROUP BY head.work_package_id
+       HAVING pg_catalog.count(*) <> 8
+          OR pg_catalog.count(DISTINCT head.head_kind) <> 8
+          OR pg_catalog.min(head.head_index) <> 0
+          OR pg_catalog.max(head.head_index) <> 7
+     ) THEN
+    RAISE EXCEPTION 'max-attempt projection aggregate is incomplete or divergent'
+      USING ERRCODE = 'P1726';
+  END IF;
+
+  SELECT package.* INTO STRICT v_package
+  FROM public.work_packages package
+  WHERE package.id = p_work_package_id AND package.task_id = p_task_id;
+  IF v_package.status <> 'ready'
+     OR v_package.updated_at IS DISTINCT FROM p_expected_package_updated_at THEN
+    RETURN false;
+  END IF;
+  SELECT COALESCE(pg_catalog.max(run.attempt_number), 0) + 1
+  INTO v_expected_attempt
+  FROM public.agent_runs run
+  WHERE run.task_id = p_task_id
+    AND run.work_package_id = p_work_package_id
+    AND run.stage = 'implementation'
+    AND run.attempt_number IS NOT NULL;
+  IF v_expected_attempt <= p_max_attempts THEN
+    RAISE EXCEPTION 'max-attempt threshold has not been reached in retained run history'
+      USING ERRCODE = '40001';
+  END IF;
+
+  UPDATE public.work_packages package
+  SET status = 'failed', blocked_reason = 'Maximum implementation attempts exceeded.',
+      metadata = pg_catalog.jsonb_set(
+        package.metadata, '{executionAttempts}',
+        pg_catalog.jsonb_build_object(
+          'schemaVersion', 2,
+          'code', 'max_implementation_attempts_exceeded',
+          'maxAttempts', p_max_attempts,
+          'nextAttemptNumber', v_expected_attempt,
+          'status', 'failed'
+        ), true
+      ),
+      updated_at = v_now
+  WHERE package.id = p_work_package_id
+    AND package.task_id = p_task_id
+    AND package.status = 'ready'
+    AND package.updated_at = p_expected_package_updated_at;
+  IF NOT FOUND THEN RETURN false; END IF;
+  UPDATE public.tasks task
+  SET status = 'failed', error_message = 'Maximum implementation attempts exceeded.',
+      completed_at = v_now, updated_at = v_now
+  WHERE task.id = p_task_id AND task.status = 'running';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'max-attempt task lost its terminal disposition compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+  INSERT INTO public.s4_max_attempt_finalizations (
+    task_id, work_package_id, transition_code, max_attempts,
+    next_attempt_number, expected_package_updated_at, package_updated_at,
+    task_disposition
+  ) VALUES (
+    p_task_id, p_work_package_id, 'max_implementation_attempts_exceeded',
+    p_max_attempts, v_expected_attempt, p_expected_package_updated_at,
+    v_now, 'failed'
+  );
+  RETURN true;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.resolve_s4_review_source_v1(
+  p_approval_gate_id uuid
+)
+RETURNS TABLE (
+  source_artifact_id uuid,
+  source_agent_run_id uuid,
+  content text,
+  metadata jsonb,
+  content_fingerprint text
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+BEGIN
+  IF session_user <> 'forge_review_source_resolver'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'protected review source requires the fixed-path resolver'
+      USING ERRCODE = '42501';
+  END IF;
+  RETURN QUERY
+  WITH authorized AS (
+    SELECT source.*
+    FROM public.approval_gates gate
+    JOIN public.s4_protected_review_sources source
+      ON source.source_artifact_id = gate.source_artifact_id
+     AND source.source_agent_run_id = gate.source_agent_run_id
+     AND source.task_id = gate.task_id
+     AND source.work_package_id = gate.work_package_id
+    WHERE gate.id = p_approval_gate_id
+      AND gate.status IN ('pending','needs_rework')
+      AND gate.gate_type IN ('qa_review','reviewer_review','security_review')
+    FOR UPDATE OF gate
+  ), recorded AS (
+    INSERT INTO public.s4_protected_review_source_reads (
+      approval_gate_id, source_artifact_id, source_agent_run_id,
+      content_fingerprint
+    )
+    SELECT p_approval_gate_id, authorized.source_artifact_id,
+      authorized.source_agent_run_id, authorized.content_fingerprint
+    FROM authorized
+    RETURNING source_artifact_id
+  )
+  SELECT authorized.source_artifact_id, authorized.source_agent_run_id,
+    authorized.content, authorized.metadata, authorized.content_fingerprint
+  FROM authorized JOIN recorded USING (source_artifact_id);
 END;
 $$;
 --> statement-breakpoint
@@ -2203,6 +3914,8 @@ DECLARE
   v_disposition text;
   v_delivery_state text;
   v_coverage text;
+  v_policy text;
+  v_repository_review text;
 BEGIN
   IF p_failure_code NOT IN (
     'authorization_changed', 'execution_lease_expired',
@@ -2255,6 +3968,18 @@ BEGIN
   END IF;
   v_delivery_state := v_audit.delivery->>'state';
   v_coverage := v_audit.authorization_snapshot->>'coverageFingerprint';
+  v_policy := 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+    pg_catalog.convert_to(
+      'forge:packet-policy:v2:' || (v_audit.authorization_snapshot->'requiredCapabilities')::text,
+      'UTF8'
+    )
+  ), 'hex');
+  v_repository_review := 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+    pg_catalog.convert_to(
+      'forge:packet-repository-review:none:v2:' || v_audit.id::text,
+      'UTF8'
+    )
+  ), 'hex');
   v_disposition := CASE
     WHEN v_audit.grant_mode = 'allow_once'
       AND v_delivery_state IN ('not_exposed', 'submission_failed') THEN 'reapprove_allow_once'
@@ -2269,9 +3994,13 @@ BEGIN
     'recoveryFailure', v_terminal, 'deliveryState', v_delivery_state,
     'grantMode', v_audit.grant_mode, 'disposition', v_disposition,
     'acknowledgedAt', NULL, 'acknowledgedByUserId', NULL,
-    'combinedRepositoryReviewFingerprint', v_coverage,
-    'markerFingerprint', v_coverage, 'policyFingerprint', v_coverage,
+    'combinedRepositoryReviewFingerprint', v_repository_review,
+    'policyFingerprint', v_policy,
     'coverageFingerprint', v_coverage, 'autoRetryable', false
+  );
+  v_marker := pg_catalog.jsonb_set(
+    v_marker, '{markerFingerprint}',
+    pg_catalog.to_jsonb(forge.packet_recovery_marker_fingerprint_v2(v_marker)), true
   );
 
   UPDATE public.filesystem_mcp_runtime_audits audit
@@ -2317,6 +4046,8 @@ DECLARE
   v_now timestamptz := pg_catalog.clock_timestamp();
   v_failure_code text;
   v_terminal jsonb;
+  v_marker jsonb;
+  v_evidence_fingerprint text;
 BEGIN
   IF session_user <> 'forge_packet_issuer'
      OR current_user <> 'forge_s4_routines_owner' THEN
@@ -2389,14 +4120,28 @@ BEGIN
   SET status = 'failed', completed_at = COALESCE(run.completed_at, v_now),
       error_message = 'Protected local execution failed: ' || (v_local.terminal->>'failureCode')
   WHERE run.id = v_local.agent_run_id AND run.status = 'running';
+  v_evidence_fingerprint := 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+    pg_catalog.convert_to(
+      'forge:local-run-evidence:v1:' || v_local.id::text || ':' || v_local.terminal::text,
+      'UTF8'
+    )
+  ), 'hex');
+  v_marker := pg_catalog.jsonb_build_object(
+    'schemaVersion', 1, 'kind', 'local_effect_recovery',
+    'source', 'local-run-evidence', 'priorAgentRunId', v_local.agent_run_id::text,
+    'localRunEvidenceId', v_local.id::text,
+    'evidenceFingerprint', v_evidence_fingerprint,
+    'taskDisposition', 'operator_hold', 'autoRetryable', false,
+    'reason', 'local_invocation_uncertain',
+    'disposition', 'acknowledge_possible_local_invocation',
+    'reviewState', 'not_applicable',
+    'invocationAttemptId', v_local.id::text,
+    'acknowledgedAt', NULL, 'acknowledgedByUserId', NULL
+  );
   UPDATE public.work_packages package
   SET status = 'blocked', metadata = pg_catalog.jsonb_set(
     package.metadata - 'executionLease', '{local_effect_recovery}',
-    pg_catalog.jsonb_build_object(
-      'schemaVersion', 2, 'kind', 'local_lifecycle',
-      'localRunEvidenceId', v_local.id::text,
-      'failureCode', v_local.terminal->>'failureCode', 'autoRetryable', false
-    ), true
+    v_marker, true
   )
   WHERE package.id = v_local.work_package_id AND package.status = 'running'
     AND (
@@ -2428,6 +4173,8 @@ DECLARE
   v_delivery_state text;
   v_disposition text;
   v_coverage text;
+  v_policy text;
+  v_repository_review text;
 BEGIN
   IF session_user <> 'forge_packet_issuer'
      OR current_user <> 'forge_s4_routines_owner' THEN
@@ -2540,6 +4287,18 @@ BEGIN
 
   v_delivery_state := v_audit.delivery->>'state';
   v_coverage := v_audit.authorization_snapshot->>'coverageFingerprint';
+  v_policy := 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+    pg_catalog.convert_to(
+      'forge:packet-policy:v2:' || (v_audit.authorization_snapshot->'requiredCapabilities')::text,
+      'UTF8'
+    )
+  ), 'hex');
+  v_repository_review := 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+    pg_catalog.convert_to(
+      'forge:packet-repository-review:none:v2:' || v_audit.id::text,
+      'UTF8'
+    )
+  ), 'hex');
   v_disposition := CASE
     WHEN v_audit.grant_mode = 'allow_once'
       AND v_delivery_state IN ('not_exposed', 'submission_failed') THEN 'reapprove_allow_once'
@@ -2554,9 +4313,13 @@ BEGIN
     'recoveryFailure', v_terminal, 'deliveryState', v_delivery_state,
     'grantMode', v_audit.grant_mode, 'disposition', v_disposition,
     'acknowledgedAt', NULL, 'acknowledgedByUserId', NULL,
-    'combinedRepositoryReviewFingerprint', v_coverage,
-    'markerFingerprint', v_coverage, 'policyFingerprint', v_coverage,
+    'combinedRepositoryReviewFingerprint', v_repository_review,
+    'policyFingerprint', v_policy,
     'coverageFingerprint', v_coverage, 'autoRetryable', false
+  );
+  v_marker := pg_catalog.jsonb_set(
+    v_marker, '{markerFingerprint}',
+    pg_catalog.to_jsonb(forge.packet_recovery_marker_fingerprint_v2(v_marker)), true
   );
   UPDATE public.agent_runs run
   SET status = 'failed', completed_at = COALESCE(run.completed_at, v_now),
@@ -2632,6 +4395,7 @@ DECLARE
   v_prior public.filesystem_mcp_runtime_audits%ROWTYPE;
   v_decision public.filesystem_mcp_grant_approvals%ROWTYPE;
   v_pointer public.filesystem_mcp_current_decision_pointers%ROWTYPE;
+  v_marker jsonb;
 BEGIN
   IF session_user <> 'forge_packet_issuer'
      OR current_user <> 'forge_s4_routines_owner' THEN
@@ -2642,6 +4406,18 @@ BEGIN
      OR NOT forge.s4_protected_paths_enabled_v1() THEN
     RAISE EXCEPTION 'packet reapproval input or Step 0 authority is invalid'
       USING ERRCODE = '55000';
+  END IF;
+  -- Exact retry is immutable-ledger first. It remains replayable after the
+  -- marker was correctly cleared by the original transaction.
+  IF EXISTS (
+    SELECT 1 FROM public.filesystem_mcp_issuance_recovery_actions action
+    WHERE action.prior_runtime_audit_id = p_prior_runtime_audit_id
+      AND action.action = 'resolve_after_allow_once_reapproval'
+      AND action.expected_marker_fingerprint = p_expected_marker_fingerprint
+      AND action.authorizing_decision_id = p_new_decision_id
+      AND action.result = 'reapproved'
+  ) THEN
+    RETURN true;
   END IF;
   SELECT task.project_id INTO STRICT v_project_id
   FROM public.tasks task WHERE task.id = p_task_id;
@@ -2663,6 +4439,7 @@ BEGIN
     AND audit.protocol_version = 2 AND audit.status = 'failed'
   FOR UPDATE;
   IF v_prior.grant_mode <> 'allow_once'
+     OR v_decision.decided_by IS NULL
      OR v_decision.project_id <> v_project_id
      OR v_decision.task_id <> p_task_id
      OR v_decision.work_package_id <> p_work_package_id
@@ -2680,17 +4457,1068 @@ BEGIN
     RAISE EXCEPTION 'fresh allow-once reapproval is not the exact current authority'
       USING ERRCODE = '40001';
   END IF;
+  SELECT package.metadata->'packet_issuance' INTO v_marker
+  FROM public.work_packages package
+  WHERE package.id = p_work_package_id;
+  IF v_marker IS NULL
+     OR v_marker->>'markerFingerprint' <> p_expected_marker_fingerprint
+     OR forge.packet_recovery_marker_fingerprint_v2(v_marker - 'markerFingerprint')
+        <> p_expected_marker_fingerprint THEN
+    RAISE EXCEPTION 'packet recovery marker fingerprint is not canonical'
+      USING ERRCODE = '40001';
+  END IF;
+  INSERT INTO public.filesystem_mcp_issuance_recovery_actions (
+    task_id, work_package_id, prior_runtime_audit_id, action,
+    expected_marker_fingerprint, actor_user_id, authorizing_decision_id,
+    result, result_marker_fingerprint, package_status
+  ) VALUES (
+    p_task_id, p_work_package_id, p_prior_runtime_audit_id,
+    'resolve_after_allow_once_reapproval', p_expected_marker_fingerprint,
+    v_decision.decided_by, p_new_decision_id, 'reapproved', NULL, 'ready'
+  );
   UPDATE public.work_packages package
   SET status = 'ready', metadata = package.metadata - 'packet_issuance'
   WHERE package.id = p_work_package_id AND package.task_id = p_task_id
     AND package.status = 'blocked'
     AND package.metadata->'packet_issuance'->>'priorRuntimeAuditId' = p_prior_runtime_audit_id::text
-    AND package.metadata->'packet_issuance'->>'markerFingerprint' = p_expected_marker_fingerprint;
+    AND package.metadata->'packet_issuance'->>'markerFingerprint' = p_expected_marker_fingerprint
+    AND forge.packet_recovery_marker_fingerprint_v2(
+      package.metadata->'packet_issuance' - 'markerFingerprint'
+    ) = p_expected_marker_fingerprint;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'packet recovery marker changed before reapproval compare-and-set'
       USING ERRCODE = '40001';
   END IF;
   RETURN true;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.apply_local_effect_recovery_action_v2(
+  p_task_id uuid,
+  p_work_package_id uuid,
+  p_local_run_evidence_id uuid,
+  p_action text,
+  p_expected_marker_fingerprint text,
+  p_actor_user_id uuid
+)
+RETURNS TABLE (
+  action_id uuid,
+  result text,
+  result_marker_fingerprint text,
+  package_status text
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_project_id uuid;
+  v_package public.work_packages%ROWTYPE;
+  v_evidence public.work_package_local_run_evidence%ROWTYPE;
+  v_marker jsonb;
+  v_next_marker jsonb;
+  v_action_id uuid;
+  v_result text;
+  v_status text;
+BEGIN
+  IF session_user <> 'forge_s4_recovery_operator'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'local recovery action requires the fixed recovery login'
+      USING ERRCODE = '42501';
+  END IF;
+  IF p_action NOT IN (
+    'review_local_changes','acknowledge_possible_local_invocation',
+    'retry_local_execution','decline_local_retry'
+  ) OR p_expected_marker_fingerprint !~ '^sha256:[0-9a-f]{64}$'
+     OR NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'local recovery action input or authority is invalid'
+      USING ERRCODE = '22023';
+  END IF;
+  RETURN QUERY
+  SELECT action.id, action.result, action.result_marker_fingerprint,
+    action.package_status
+  FROM public.local_effect_recovery_actions action
+  WHERE action.task_id = p_task_id
+    AND action.work_package_id = p_work_package_id
+    AND action.local_run_evidence_id = p_local_run_evidence_id
+    AND action.action = p_action
+    AND action.expected_marker_fingerprint = p_expected_marker_fingerprint
+    AND action.actor_user_id = p_actor_user_id;
+  IF FOUND THEN RETURN; END IF;
+
+  SELECT task.project_id INTO STRICT v_project_id
+  FROM public.tasks task WHERE task.id = p_task_id;
+  PERFORM 1 FROM public.projects project
+  WHERE project.id = v_project_id AND project.archived_at IS NULL FOR UPDATE;
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id = p_task_id AND task.project_id = v_project_id
+    AND task.status = 'approved'
+    AND task.local_projection_scope_state = 'active'
+  FOR UPDATE;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id = p_task_id ORDER BY package.id FOR UPDATE;
+  SELECT evidence.* INTO STRICT v_evidence
+  FROM public.work_package_local_run_evidence evidence
+  WHERE evidence.id = p_local_run_evidence_id
+    AND evidence.task_id = p_task_id
+    AND evidence.work_package_id = p_work_package_id
+    AND evidence.state IN ('terminal','uncertain')
+  FOR UPDATE;
+  SELECT package.* INTO STRICT v_package
+  FROM public.work_packages package
+  WHERE package.id = p_work_package_id AND package.status = 'blocked';
+  v_marker := v_package.metadata->'local_effect_recovery';
+  IF v_marker IS NULL
+     OR v_marker->>'localRunEvidenceId' <> p_local_run_evidence_id::text
+     OR v_marker->>'evidenceFingerprint' <> p_expected_marker_fingerprint
+     OR v_marker->>'disposition' <> p_action THEN
+    RAISE EXCEPTION 'local recovery marker changed before action compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+
+  v_next_marker := NULL;
+  IF p_action = 'review_local_changes' THEN
+    v_next_marker := (v_marker - 'nextDisposition')
+      || pg_catalog.jsonb_build_object(
+        'disposition', v_marker->>'nextDisposition', 'reviewState', 'reviewed'
+      );
+    v_result := 'reviewed';
+    v_status := 'blocked';
+  ELSIF p_action = 'acknowledge_possible_local_invocation' THEN
+    v_next_marker := v_marker || pg_catalog.jsonb_build_object(
+      'disposition', 'retry_local_execution',
+      'acknowledgedAt', pg_catalog.to_char(
+        pg_catalog.clock_timestamp() AT TIME ZONE 'UTC',
+        'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+      ),
+      'acknowledgedByUserId', p_actor_user_id::text
+    );
+    v_result := 'acknowledged';
+    v_status := 'blocked';
+  ELSIF p_action = 'retry_local_execution' THEN
+    v_result := 'ready';
+    v_status := 'ready';
+  ELSE
+    v_result := 'cancelled';
+    v_status := 'cancelled';
+  END IF;
+  v_action_id := pg_catalog.gen_random_uuid();
+  INSERT INTO public.local_effect_recovery_actions (
+    id, task_id, work_package_id, local_run_evidence_id, action,
+    expected_marker_fingerprint, actor_user_id, result,
+    result_marker_fingerprint, package_status
+  ) VALUES (
+    v_action_id, p_task_id, p_work_package_id, p_local_run_evidence_id,
+    p_action, p_expected_marker_fingerprint, p_actor_user_id, v_result,
+    CASE WHEN v_next_marker IS NULL THEN NULL
+      ELSE v_next_marker->>'evidenceFingerprint' END,
+    v_status
+  );
+  UPDATE public.work_packages package
+  SET status = v_status,
+      metadata = CASE WHEN v_next_marker IS NULL
+        THEN package.metadata - 'local_effect_recovery'
+        ELSE pg_catalog.jsonb_set(
+          package.metadata, '{local_effect_recovery}', v_next_marker, true
+        ) END,
+      updated_at = pg_catalog.clock_timestamp()
+  WHERE package.id = p_work_package_id
+    AND package.status = 'blocked'
+    AND package.metadata->'local_effect_recovery' = v_marker;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'local recovery action lost its marker compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+  action_id := v_action_id;
+  result := v_result;
+  result_marker_fingerprint := CASE WHEN v_next_marker IS NULL THEN NULL
+    ELSE v_next_marker->>'evidenceFingerprint' END;
+  package_status := v_status;
+  RETURN NEXT;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.apply_packet_issuance_recovery_action_v2(
+  p_task_id uuid,
+  p_work_package_id uuid,
+  p_prior_runtime_audit_id uuid,
+  p_action text,
+  p_expected_marker_fingerprint text,
+  p_actor_user_id uuid,
+  p_authorizing_decision_id uuid
+)
+RETURNS TABLE (
+  action_id uuid,
+  result text,
+  result_marker_fingerprint text,
+  package_status text
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_project_id uuid;
+  v_package public.work_packages%ROWTYPE;
+  v_audit public.filesystem_mcp_runtime_audits%ROWTYPE;
+  v_marker jsonb;
+  v_next_marker jsonb;
+  v_action_id uuid;
+  v_result text;
+  v_status text;
+BEGIN
+  IF session_user <> 'forge_s4_recovery_operator'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'packet recovery action requires the fixed recovery login'
+      USING ERRCODE = '42501';
+  END IF;
+  IF p_action NOT IN (
+    'acknowledge_possible_submission','retry_execution','decline_packet_recovery'
+  ) OR p_expected_marker_fingerprint !~ '^sha256:[0-9a-f]{64}$'
+     OR NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'packet recovery action input or authority is invalid'
+      USING ERRCODE = '22023';
+  END IF;
+  RETURN QUERY
+  SELECT action.id, action.result, action.result_marker_fingerprint,
+    action.package_status
+  FROM public.filesystem_mcp_issuance_recovery_actions action
+  WHERE action.task_id = p_task_id
+    AND action.work_package_id = p_work_package_id
+    AND action.prior_runtime_audit_id = p_prior_runtime_audit_id
+    AND action.action = p_action
+    AND action.expected_marker_fingerprint = p_expected_marker_fingerprint
+    AND action.actor_user_id = p_actor_user_id
+    AND action.authorizing_decision_id IS NOT DISTINCT FROM p_authorizing_decision_id;
+  IF FOUND THEN RETURN; END IF;
+
+  SELECT task.project_id INTO STRICT v_project_id
+  FROM public.tasks task WHERE task.id = p_task_id;
+  PERFORM 1 FROM public.projects project
+  WHERE project.id = v_project_id AND project.archived_at IS NULL FOR UPDATE;
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id = p_task_id AND task.project_id = v_project_id
+    AND task.status = 'approved'
+    AND task.local_projection_scope_state = 'active'
+  FOR UPDATE;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id = p_task_id ORDER BY package.id FOR UPDATE;
+  SELECT audit.* INTO STRICT v_audit
+  FROM public.filesystem_mcp_runtime_audits audit
+  WHERE audit.id = p_prior_runtime_audit_id
+    AND audit.task_id = p_task_id
+    AND audit.work_package_id = p_work_package_id
+    AND audit.protocol_version = 2 AND audit.status = 'failed'
+  FOR UPDATE;
+  SELECT package.* INTO STRICT v_package
+  FROM public.work_packages package
+  WHERE package.id = p_work_package_id AND package.status = 'blocked';
+  v_marker := v_package.metadata->'packet_issuance';
+  IF v_marker IS NULL
+     OR v_marker->>'priorRuntimeAuditId' <> p_prior_runtime_audit_id::text
+     OR v_marker->>'markerFingerprint' <> p_expected_marker_fingerprint
+     OR forge.packet_recovery_marker_fingerprint_v2(v_marker - 'markerFingerprint')
+        <> p_expected_marker_fingerprint
+     OR v_marker->>'disposition' <> p_action THEN
+    RAISE EXCEPTION 'packet recovery marker changed before action compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+  IF p_action = 'retry_execution' THEN
+    IF p_authorizing_decision_id IS NULL OR NOT EXISTS (
+      SELECT 1 FROM public.project_filesystem_grant_decisions decision
+      JOIN public.project_filesystem_current_decision_pointers pointer
+        ON pointer.project_id = decision.project_id
+       AND pointer.current_decision_id = decision.id
+       AND pointer.current_decision_revision = decision.grant_decision_revision
+       AND pointer.current_root_binding_revision = decision.root_binding_revision
+       AND pointer.current_decision_fingerprint = decision.decision_fingerprint
+      WHERE decision.id = p_authorizing_decision_id
+        AND decision.project_id = v_project_id
+        AND decision.decision = 'approved'
+    ) THEN
+      RAISE EXCEPTION 'packet retry lacks an exact current always-allow authority'
+        USING ERRCODE = '40001';
+    END IF;
+  ELSIF p_authorizing_decision_id IS NOT NULL THEN
+    RAISE EXCEPTION 'only packet retry accepts an authorizing decision'
+      USING ERRCODE = '22023';
+  END IF;
+
+  v_next_marker := NULL;
+  IF p_action = 'acknowledge_possible_submission' THEN
+    v_next_marker := v_marker || pg_catalog.jsonb_build_object(
+      'disposition', CASE WHEN v_marker->>'grantMode' = 'allow_once'
+        THEN 'reapprove_allow_once' ELSE 'reviewed_submission' END,
+      'acknowledgedAt', pg_catalog.to_char(
+        pg_catalog.clock_timestamp() AT TIME ZONE 'UTC',
+        'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+      ),
+      'acknowledgedByUserId', p_actor_user_id::text
+    );
+    v_next_marker := pg_catalog.jsonb_set(
+      v_next_marker, '{markerFingerprint}',
+      pg_catalog.to_jsonb(forge.packet_recovery_marker_fingerprint_v2(
+        v_next_marker - 'markerFingerprint'
+      )), true
+    );
+    v_result := 'acknowledged';
+    v_status := 'blocked';
+  ELSIF p_action = 'retry_execution' THEN
+    v_result := 'ready';
+    v_status := 'ready';
+  ELSE
+    v_result := 'cancelled';
+    v_status := 'cancelled';
+  END IF;
+  v_action_id := pg_catalog.gen_random_uuid();
+  INSERT INTO public.filesystem_mcp_issuance_recovery_actions (
+    id, task_id, work_package_id, prior_runtime_audit_id, action,
+    expected_marker_fingerprint, actor_user_id, authorizing_decision_id,
+    result, result_marker_fingerprint, package_status
+  ) VALUES (
+    v_action_id, p_task_id, p_work_package_id, p_prior_runtime_audit_id,
+    p_action, p_expected_marker_fingerprint, p_actor_user_id,
+    p_authorizing_decision_id, v_result,
+    CASE WHEN v_next_marker IS NULL THEN NULL
+      ELSE v_next_marker->>'markerFingerprint' END,
+    v_status
+  );
+  UPDATE public.work_packages package
+  SET status = v_status,
+      metadata = CASE WHEN v_next_marker IS NULL
+        THEN package.metadata - 'packet_issuance'
+        ELSE pg_catalog.jsonb_set(
+          package.metadata, '{packet_issuance}', v_next_marker, true
+        ) END,
+      updated_at = pg_catalog.clock_timestamp()
+  WHERE package.id = p_work_package_id
+    AND package.status = 'blocked'
+    AND package.metadata->'packet_issuance' = v_marker;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'packet recovery action lost its marker compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+  action_id := v_action_id;
+  result := v_result;
+  result_marker_fingerprint := CASE WHEN v_next_marker IS NULL THEN NULL
+    ELSE v_next_marker->>'markerFingerprint' END;
+  package_status := v_status;
+  RETURN NEXT;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.local_projection_archive_operation_fingerprint_v2(
+  p_operation_id uuid,
+  p_state text,
+  p_prior_fingerprint text
+)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+SET search_path = pg_catalog
+AS $$
+  SELECT 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+    pg_catalog.convert_to(
+      'forge:local-projection-archive-operation:v2:' || p_operation_id::text ||
+      ':' || p_state || ':' || p_prior_fingerprint,
+      'UTF8'
+    )
+  ), 'hex')
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.inspect_local_projection_overlimit_v2(
+  p_task_id uuid
+)
+RETURNS TABLE (snapshot jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_task public.tasks%ROWTYPE;
+  v_package_count integer;
+  v_head_count integer;
+  v_distinct_package_count integer;
+  v_heads_fingerprint text;
+  v_aggregate_fingerprint text;
+  v_task_fingerprint text;
+  v_integrity_state text;
+BEGIN
+  IF session_user <> 'forge_local_projection_archiver'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'projection archive inspection requires the fixed archiver login'
+      USING ERRCODE = '42501';
+  END IF;
+  SELECT task.* INTO STRICT v_task FROM public.tasks task WHERE task.id = p_task_id;
+  SELECT pg_catalog.count(*)::integer INTO v_package_count
+  FROM public.work_packages package WHERE package.task_id = p_task_id;
+  SELECT pg_catalog.count(*)::integer,
+    pg_catalog.count(DISTINCT head.work_package_id)::integer,
+    'sha256:' || pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+      COALESCE(pg_catalog.string_agg(
+        head.id::text || ':' || head.work_package_id::text || ':' ||
+        head.head_kind || ':' || head.head_index::text || ':' ||
+        head.head_revision::text || ':' || head.compare_and_set_fingerprint,
+        '|' ORDER BY head.id
+      ), ''), 'UTF8')), 'hex'),
+    'sha256:' || pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+      COALESCE(pg_catalog.string_agg(
+        head.work_package_id::text || ':' || head.head_kind || ':' ||
+        head.contribution::text,
+        '|' ORDER BY head.work_package_id, head.head_index
+      ), ''), 'UTF8')), 'hex')
+  INTO v_head_count, v_distinct_package_count,
+    v_heads_fingerprint, v_aggregate_fingerprint
+  FROM public.work_package_local_projection_heads head
+  WHERE head.task_id = p_task_id;
+  v_integrity_state := CASE
+    WHEN v_head_count <> v_package_count * 8 THEN 'missing_heads'
+    WHEN v_distinct_package_count <> v_package_count OR EXISTS (
+      SELECT 1 FROM public.work_package_local_projection_heads head
+      WHERE head.task_id = p_task_id
+      GROUP BY head.work_package_id
+      HAVING pg_catalog.count(*) <> 8
+        OR pg_catalog.count(DISTINCT head.head_kind) <> 8
+        OR pg_catalog.min(head.head_index) <> 0
+        OR pg_catalog.max(head.head_index) <> 7
+    ) THEN 'mismatched_heads'
+    WHEN v_package_count > 256 THEN 'over_limit'
+    ELSE 'coherent'
+  END;
+  v_task_fingerprint := 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+    pg_catalog.convert_to(
+      'forge:local-projection-task:v2:' || p_task_id::text || ':' ||
+      v_task.local_projection_scope_state || ':' || v_package_count::text || ':' ||
+      COALESCE(v_task.local_projection_overlimit_package_count::text, 'null') || ':' ||
+      v_heads_fingerprint || ':' || v_aggregate_fingerprint || ':' ||
+      COALESCE(v_task.local_projection_source_task_id::text, 'null') || ':' ||
+      COALESCE(v_task.local_projection_replacement_state, 'null') || ':' ||
+      COALESCE(v_task.local_projection_replacement_version::text, 'null') || ':' ||
+      COALESCE(v_task.local_projection_replacement_fingerprint, 'null'),
+      'UTF8'
+    )
+  ), 'hex');
+  snapshot := pg_catalog.jsonb_build_object(
+    'schemaVersion', 2,
+    'taskId', p_task_id::text,
+    'scopeState', v_task.local_projection_scope_state,
+    'packageCount', v_package_count,
+    'overlimitPackageCount', v_task.local_projection_overlimit_package_count,
+    'replacement', CASE WHEN v_task.local_projection_source_task_id IS NULL
+      THEN NULL ELSE pg_catalog.jsonb_build_object(
+        'sourceTaskId', v_task.local_projection_source_task_id::text,
+        'state', v_task.local_projection_replacement_state,
+        'version', v_task.local_projection_replacement_version,
+        'fingerprint', v_task.local_projection_replacement_fingerprint
+      ) END,
+    'projection', pg_catalog.jsonb_build_object(
+      'expectedHeadKindCount', 8,
+      'expectedHeadCount', v_package_count * 8,
+      'actualHeadCount', v_head_count,
+      'distinctPackageCount', v_distinct_package_count,
+      'headsFingerprint', v_heads_fingerprint,
+      'aggregateFingerprint', v_aggregate_fingerprint,
+      'integrityState', v_integrity_state
+    ),
+    'taskFingerprint', v_task_fingerprint,
+    'claimable', v_task.local_projection_scope_state = 'active'
+      AND v_task.local_projection_overlimit_package_count IS NULL
+      AND v_package_count <= 256 AND v_integrity_state = 'coherent'
+      AND v_task.local_projection_source_task_id IS NULL
+  );
+  RETURN NEXT;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.apply_local_projection_overlimit_archive_v2(
+  p_source_task_id uuid,
+  p_replacement_task_id uuid,
+  p_actor_user_id uuid,
+  p_expected_source_fingerprint text,
+  p_expected_replacement_fingerprint text
+)
+RETURNS TABLE (
+  operation_id uuid,
+  state text,
+  operation_fingerprint text,
+  snapshot jsonb
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_source jsonb;
+  v_replacement jsonb;
+  v_operation_id uuid := pg_catalog.gen_random_uuid();
+  v_operation_fingerprint text;
+  v_relation_fingerprint text;
+  v_existing public.local_projection_archive_operations%ROWTYPE;
+  v_updated integer;
+BEGIN
+  IF session_user <> 'forge_local_projection_archiver'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'projection archive apply requires the fixed archiver login'
+      USING ERRCODE = '42501';
+  END IF;
+  IF p_source_task_id = p_replacement_task_id
+     OR p_expected_source_fingerprint !~ '^sha256:[0-9a-f]{64}$'
+     OR p_expected_replacement_fingerprint !~ '^sha256:[0-9a-f]{64}$' THEN
+    RAISE EXCEPTION 'projection archive apply input is invalid' USING ERRCODE = '22023';
+  END IF;
+  SELECT operation.* INTO v_existing
+  FROM public.local_projection_archive_operations operation
+  WHERE operation.source_task_id = p_source_task_id
+    AND operation.state IN ('validated','quiesced','archived');
+  IF FOUND THEN
+    IF v_existing.replacement_task_id <> p_replacement_task_id
+       OR v_existing.actor_user_id <> p_actor_user_id
+       OR v_existing.source_fingerprint <> p_expected_source_fingerprint
+       OR v_existing.replacement_fingerprint <> p_expected_replacement_fingerprint THEN
+      RAISE EXCEPTION 'projection archive apply replay changed its identity'
+        USING ERRCODE = '40001';
+    END IF;
+    operation_id := v_existing.id;
+    state := v_existing.state;
+    operation_fingerprint := v_existing.operation_fingerprint;
+    SELECT inspect.snapshot INTO v_source
+    FROM forge.inspect_local_projection_overlimit_v2(p_source_task_id) inspect;
+    SELECT inspect.snapshot INTO v_replacement
+    FROM forge.inspect_local_projection_overlimit_v2(p_replacement_task_id) inspect;
+    snapshot := pg_catalog.jsonb_build_object(
+      'schemaVersion', 2, 'source', v_source, 'replacement', v_replacement,
+      'checkpoint', v_existing.state
+    );
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id IN (p_source_task_id, p_replacement_task_id)
+  ORDER BY task.id FOR UPDATE;
+  IF (SELECT pg_catalog.count(DISTINCT task.project_id) FROM public.tasks task
+      WHERE task.id IN (p_source_task_id, p_replacement_task_id)) <> 1 THEN
+    RAISE EXCEPTION 'source and replacement tasks must share one project'
+      USING ERRCODE = '40001';
+  END IF;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id IN (p_source_task_id, p_replacement_task_id)
+  ORDER BY package.id FOR UPDATE;
+  PERFORM 1 FROM public.work_package_local_projection_heads head
+  WHERE head.task_id IN (p_source_task_id, p_replacement_task_id)
+  ORDER BY head.id FOR UPDATE;
+  SELECT inspect.snapshot INTO STRICT v_source
+  FROM forge.inspect_local_projection_overlimit_v2(p_source_task_id) inspect;
+  SELECT inspect.snapshot INTO STRICT v_replacement
+  FROM forge.inspect_local_projection_overlimit_v2(p_replacement_task_id) inspect;
+  IF v_source->>'taskFingerprint' <> p_expected_source_fingerprint
+     OR v_replacement->>'taskFingerprint' <> p_expected_replacement_fingerprint
+     OR (v_source->>'packageCount')::integer <= 256
+     OR v_source->>'scopeState' <> 'archive_pending'
+     OR NOT (
+       v_source->'projection'->>'integrityState' = 'over_limit'
+       OR (
+         v_source->'projection'->>'integrityState' = 'missing_heads'
+         AND (v_source->'projection'->>'actualHeadCount')::integer = 0
+         AND (v_source->'projection'->>'distinctPackageCount')::integer = 0
+       )
+     )
+     OR v_source->>'overlimitPackageCount' IS NULL
+     OR (v_source->>'overlimitPackageCount')::integer <> (v_source->>'packageCount')::integer
+     OR (v_replacement->>'packageCount')::integer > 256
+     OR v_replacement->'projection'->>'integrityState' <> 'coherent'
+     OR v_replacement->>'scopeState' <> 'active'
+     OR v_replacement->>'overlimitPackageCount' IS NOT NULL
+     OR v_replacement->'replacement' <> 'null'::jsonb
+     OR (v_replacement->>'claimable')::boolean IS NOT TRUE THEN
+    RAISE EXCEPTION 'source or replacement projection snapshot is not archive-eligible'
+      USING ERRCODE = '40001';
+  END IF;
+  v_relation_fingerprint := 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+    pg_catalog.convert_to(
+      'forge:local-projection-replacement:v2:' || p_source_task_id::text || ':' ||
+      p_replacement_task_id::text || ':1:' || p_expected_source_fingerprint || ':' ||
+      p_expected_replacement_fingerprint,
+      'UTF8'
+    )
+  ), 'hex');
+  UPDATE public.tasks task
+  SET local_projection_source_task_id = p_source_task_id,
+      local_projection_replacement_state = 'pending',
+      local_projection_replacement_version = 1,
+      local_projection_replacement_fingerprint = v_relation_fingerprint
+  WHERE task.id = p_replacement_task_id
+    AND task.local_projection_scope_state = 'active'
+    AND task.local_projection_overlimit_package_count IS NULL
+    AND task.local_projection_source_task_id IS NULL
+    AND task.local_projection_replacement_state IS NULL
+    AND task.local_projection_replacement_version IS NULL
+    AND task.local_projection_replacement_fingerprint IS NULL;
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+  IF v_updated <> 1 THEN
+    RAISE EXCEPTION 'replacement task lost its unbound compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+  v_operation_fingerprint := forge.local_projection_archive_operation_fingerprint_v2(
+    v_operation_id, 'validated',
+    p_expected_source_fingerprint || ':' || p_expected_replacement_fingerprint
+  );
+  INSERT INTO public.local_projection_archive_operations (
+    id, source_task_id, replacement_task_id, actor_user_id, state,
+    source_scope_version, replacement_version, source_fingerprint,
+    replacement_fingerprint, operation_fingerprint
+  ) VALUES (
+    v_operation_id, p_source_task_id, p_replacement_task_id, p_actor_user_id,
+    'validated', 1, 1, p_expected_source_fingerprint,
+    p_expected_replacement_fingerprint, v_operation_fingerprint
+  );
+  INSERT INTO public.local_projection_archive_operation_checkpoints (
+    operation_id, ordinal, state, operation_fingerprint, actor_user_id
+  ) VALUES (v_operation_id, 1, 'validated', v_operation_fingerprint, p_actor_user_id);
+  SELECT inspect.snapshot INTO v_source
+  FROM forge.inspect_local_projection_overlimit_v2(p_source_task_id) inspect;
+  SELECT inspect.snapshot INTO v_replacement
+  FROM forge.inspect_local_projection_overlimit_v2(p_replacement_task_id) inspect;
+  operation_id := v_operation_id;
+  state := 'validated';
+  operation_fingerprint := v_operation_fingerprint;
+  snapshot := pg_catalog.jsonb_build_object(
+    'schemaVersion', 2, 'source', v_source, 'replacement', v_replacement,
+    'checkpoint', 'validated'
+  );
+  RETURN NEXT;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.resume_local_projection_overlimit_archive_v2(
+  p_operation_id uuid,
+  p_actor_user_id uuid,
+  p_expected_operation_fingerprint text
+)
+RETURNS TABLE (
+  operation_id uuid,
+  state text,
+  operation_fingerprint text,
+  snapshot jsonb
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_operation public.local_projection_archive_operations%ROWTYPE;
+  v_source jsonb;
+  v_replacement jsonb;
+  v_next_state text;
+  v_next_fingerprint text;
+  v_next_ordinal integer;
+  v_relation_fingerprint text;
+  v_next_relation_fingerprint text;
+  v_updated integer;
+BEGIN
+  IF session_user <> 'forge_local_projection_archiver'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'projection archive resume requires the fixed archiver login'
+      USING ERRCODE = '42501';
+  END IF;
+  SELECT operation.* INTO STRICT v_operation
+  FROM public.local_projection_archive_operations operation
+  WHERE operation.id = p_operation_id;
+  IF v_operation.state = 'archived'
+     AND v_operation.operation_fingerprint = p_expected_operation_fingerprint THEN
+    SELECT inspect.snapshot INTO v_source
+    FROM forge.inspect_local_projection_overlimit_v2(v_operation.source_task_id) inspect;
+    SELECT inspect.snapshot INTO v_replacement
+    FROM forge.inspect_local_projection_overlimit_v2(v_operation.replacement_task_id) inspect;
+    operation_id := v_operation.id; state := v_operation.state;
+    operation_fingerprint := v_operation.operation_fingerprint;
+    snapshot := pg_catalog.jsonb_build_object(
+      'schemaVersion', 2, 'source', v_source, 'replacement', v_replacement,
+      'checkpoint', v_operation.state
+    );
+    RETURN NEXT; RETURN;
+  END IF;
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id IN (v_operation.source_task_id, v_operation.replacement_task_id)
+  ORDER BY task.id FOR UPDATE;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id IN (v_operation.source_task_id, v_operation.replacement_task_id)
+  ORDER BY package.id FOR UPDATE;
+  PERFORM 1 FROM public.work_package_local_projection_heads head
+  WHERE head.task_id IN (v_operation.source_task_id, v_operation.replacement_task_id)
+  ORDER BY head.id FOR UPDATE;
+  SELECT operation.* INTO STRICT v_operation
+  FROM public.local_projection_archive_operations operation
+  WHERE operation.id = p_operation_id FOR UPDATE;
+  IF v_operation.actor_user_id <> p_actor_user_id
+     OR v_operation.operation_fingerprint <> p_expected_operation_fingerprint
+     OR v_operation.state NOT IN ('validated','quiesced') THEN
+    RAISE EXCEPTION 'projection archive resume lost its operation compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM public.work_packages package
+    WHERE package.task_id IN (v_operation.source_task_id, v_operation.replacement_task_id)
+      AND (package.status IN ('running','awaiting_review')
+        OR package.metadata ? 'executionLease')
+  ) THEN
+    RAISE EXCEPTION 'projection archive cannot advance while claims or reviews are live'
+      USING ERRCODE = '40001';
+  END IF;
+  SELECT inspect.snapshot INTO STRICT v_source
+  FROM forge.inspect_local_projection_overlimit_v2(v_operation.source_task_id) inspect;
+  IF v_source->>'scopeState' <> 'archive_pending'
+     OR NOT (
+       v_source->'projection'->>'integrityState' = 'over_limit'
+       OR (
+         v_source->'projection'->>'integrityState' = 'missing_heads'
+         AND (v_source->'projection'->>'actualHeadCount')::integer = 0
+         AND (v_source->'projection'->>'distinctPackageCount')::integer = 0
+       )
+     )
+     OR v_source->>'overlimitPackageCount' IS NULL
+     OR (v_source->>'overlimitPackageCount')::integer <> (v_source->>'packageCount')::integer
+     OR v_source->>'taskFingerprint' <> v_operation.source_fingerprint THEN
+    RAISE EXCEPTION 'source projection changed before archive advancement'
+      USING ERRCODE = '40001';
+  END IF;
+  IF v_operation.state = 'validated' THEN
+    UPDATE public.tasks task SET local_projection_scope_state = 'archive_pending'
+    WHERE task.id = v_operation.source_task_id
+      AND task.local_projection_scope_state = 'archive_pending'
+      AND task.local_projection_overlimit_package_count = (v_source->>'packageCount')::integer;
+    GET DIAGNOSTICS v_updated = ROW_COUNT;
+    IF v_updated <> 1 THEN
+      RAISE EXCEPTION 'source task lost its archive hold compare-and-set'
+        USING ERRCODE = '40001';
+    END IF;
+    v_next_state := 'quiesced';
+    v_next_ordinal := 2;
+  ELSE
+    SELECT inspect.snapshot INTO STRICT v_replacement
+    FROM forge.inspect_local_projection_overlimit_v2(v_operation.replacement_task_id) inspect;
+    IF (v_replacement->>'packageCount')::integer > 256
+       OR v_replacement->'projection'->>'integrityState' <> 'coherent'
+       OR v_replacement->>'scopeState' <> 'active'
+       OR v_replacement->>'overlimitPackageCount' IS NOT NULL
+       OR v_replacement->'replacement'->>'sourceTaskId' <> v_operation.source_task_id::text
+       OR v_replacement->'replacement'->>'state' <> 'pending'
+       OR (v_replacement->'replacement'->>'version')::bigint <> v_operation.replacement_version THEN
+      RAISE EXCEPTION 'replacement projection changed before final archive'
+        USING ERRCODE = '40001';
+    END IF;
+    v_relation_fingerprint := 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+      pg_catalog.convert_to(
+        'forge:local-projection-replacement:v2:' || v_operation.source_task_id::text || ':' ||
+        v_operation.replacement_task_id::text || ':' || v_operation.replacement_version::text ||
+        ':' || v_operation.source_fingerprint || ':' || v_operation.replacement_fingerprint,
+        'UTF8'
+      )
+    ), 'hex');
+    IF v_replacement->'replacement'->>'fingerprint' <> v_relation_fingerprint THEN
+      RAISE EXCEPTION 'replacement binding fingerprint changed before final archive'
+        USING ERRCODE = '40001';
+    END IF;
+    UPDATE public.tasks task SET local_projection_scope_state = 'legacy_archived'
+    WHERE task.id = v_operation.source_task_id
+      AND task.local_projection_scope_state = 'archive_pending'
+      AND task.local_projection_overlimit_package_count = (v_source->>'packageCount')::integer;
+    GET DIAGNOSTICS v_updated = ROW_COUNT;
+    IF v_updated <> 1 THEN
+      RAISE EXCEPTION 'source task lost its final archive compare-and-set'
+        USING ERRCODE = '40001';
+    END IF;
+    v_next_relation_fingerprint := 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+      pg_catalog.convert_to(
+        'forge:local-projection-replacement:v2:' || v_operation.source_task_id::text || ':' ||
+        v_operation.replacement_task_id::text || ':' ||
+        (v_operation.replacement_version + 1)::text || ':eligible', 'UTF8'
+      )
+    ), 'hex');
+    UPDATE public.tasks task
+    SET local_projection_replacement_state = 'eligible',
+        local_projection_replacement_version = v_operation.replacement_version + 1,
+        local_projection_replacement_fingerprint = v_next_relation_fingerprint
+    WHERE task.id = v_operation.replacement_task_id
+      AND task.local_projection_scope_state = 'active'
+      AND task.local_projection_overlimit_package_count IS NULL
+      AND task.local_projection_source_task_id = v_operation.source_task_id
+      AND task.local_projection_replacement_state = 'pending'
+      AND task.local_projection_replacement_version = v_operation.replacement_version
+      AND task.local_projection_replacement_fingerprint = v_relation_fingerprint;
+    GET DIAGNOSTICS v_updated = ROW_COUNT;
+    IF v_updated <> 1 THEN
+      RAISE EXCEPTION 'replacement task lost its final eligibility compare-and-set'
+        USING ERRCODE = '40001';
+    END IF;
+    v_next_state := 'archived';
+    v_next_ordinal := 3;
+  END IF;
+  v_next_fingerprint := forge.local_projection_archive_operation_fingerprint_v2(
+    v_operation.id, v_next_state, v_operation.operation_fingerprint
+  );
+  UPDATE public.local_projection_archive_operations operation
+  SET state = v_next_state, operation_fingerprint = v_next_fingerprint,
+      updated_at = pg_catalog.clock_timestamp(),
+      completed_at = CASE WHEN v_next_state = 'archived'
+        THEN pg_catalog.clock_timestamp() ELSE NULL END,
+      replacement_version = CASE WHEN v_next_state = 'archived'
+        THEN operation.replacement_version + 1 ELSE operation.replacement_version END
+  WHERE operation.id = v_operation.id
+    AND operation.state = v_operation.state
+    AND operation.operation_fingerprint = p_expected_operation_fingerprint;
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+  IF v_updated <> 1 THEN
+    RAISE EXCEPTION 'archive operation lost its checkpoint compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+  INSERT INTO public.local_projection_archive_operation_checkpoints (
+    operation_id, ordinal, state, operation_fingerprint, actor_user_id
+  ) VALUES (
+    v_operation.id, v_next_ordinal, v_next_state, v_next_fingerprint, p_actor_user_id
+  );
+  SELECT inspect.snapshot INTO v_source
+  FROM forge.inspect_local_projection_overlimit_v2(v_operation.source_task_id) inspect;
+  SELECT inspect.snapshot INTO v_replacement
+  FROM forge.inspect_local_projection_overlimit_v2(v_operation.replacement_task_id) inspect;
+  operation_id := v_operation.id; state := v_next_state;
+  operation_fingerprint := v_next_fingerprint;
+  snapshot := pg_catalog.jsonb_build_object(
+    'schemaVersion', 2, 'source', v_source, 'replacement', v_replacement,
+    'checkpoint', v_next_state
+  );
+  RETURN NEXT;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.rollback_local_projection_overlimit_archive_v2(
+  p_operation_id uuid,
+  p_actor_user_id uuid,
+  p_expected_operation_fingerprint text
+)
+RETURNS TABLE (operation_id uuid, state text, operation_fingerprint text, snapshot jsonb)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_operation public.local_projection_archive_operations%ROWTYPE;
+  v_source jsonb; v_replacement jsonb; v_next_fingerprint text; v_ordinal integer;
+  v_relation_fingerprint text; v_updated integer;
+BEGIN
+  IF session_user <> 'forge_local_projection_archiver'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'projection archive rollback requires the fixed archiver login' USING ERRCODE = '42501';
+  END IF;
+  SELECT operation.* INTO STRICT v_operation FROM public.local_projection_archive_operations operation
+  WHERE operation.id = p_operation_id FOR UPDATE;
+  IF v_operation.actor_user_id <> p_actor_user_id
+     OR v_operation.operation_fingerprint <> p_expected_operation_fingerprint
+     OR v_operation.state NOT IN ('validated','quiesced') THEN
+    RAISE EXCEPTION 'projection archive rollback is no longer eligible' USING ERRCODE = '40001';
+  END IF;
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id IN (v_operation.source_task_id, v_operation.replacement_task_id)
+  ORDER BY task.id FOR UPDATE;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id IN (v_operation.source_task_id, v_operation.replacement_task_id)
+  ORDER BY package.id FOR UPDATE;
+  IF EXISTS (SELECT 1 FROM public.work_packages package
+    WHERE package.task_id IN (v_operation.source_task_id, v_operation.replacement_task_id)
+      AND (package.status IN ('running','awaiting_review') OR package.metadata ? 'executionLease')) THEN
+    RAISE EXCEPTION 'projection archive rollback requires quiescent tasks' USING ERRCODE = '40001';
+  END IF;
+  SELECT inspect.snapshot INTO STRICT v_source
+  FROM forge.inspect_local_projection_overlimit_v2(v_operation.source_task_id) inspect;
+  IF v_source->>'scopeState' <> 'archive_pending'
+     OR NOT (
+       v_source->'projection'->>'integrityState' = 'over_limit'
+       OR (
+         v_source->'projection'->>'integrityState' = 'missing_heads'
+         AND (v_source->'projection'->>'actualHeadCount')::integer = 0
+         AND (v_source->'projection'->>'distinctPackageCount')::integer = 0
+       )
+     )
+     OR v_source->>'overlimitPackageCount' IS NULL
+     OR (v_source->>'overlimitPackageCount')::integer <> (v_source->>'packageCount')::integer
+     OR v_source->>'taskFingerprint' <> v_operation.source_fingerprint THEN
+    RAISE EXCEPTION 'source projection changed before rollback'
+      USING ERRCODE = '40001';
+  END IF;
+  v_relation_fingerprint := 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+    pg_catalog.convert_to(
+      'forge:local-projection-replacement:v2:' || v_operation.source_task_id::text || ':' ||
+      v_operation.replacement_task_id::text || ':' || v_operation.replacement_version::text ||
+      ':' || v_operation.source_fingerprint || ':' || v_operation.replacement_fingerprint,
+      'UTF8'
+    )
+  ), 'hex');
+  UPDATE public.tasks task SET local_projection_scope_state = 'archive_pending'
+  WHERE task.id = v_operation.source_task_id
+    AND task.local_projection_scope_state = 'archive_pending'
+    AND task.local_projection_overlimit_package_count = (v_source->>'packageCount')::integer;
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+  IF v_updated <> 1 THEN
+    RAISE EXCEPTION 'source task lost its rollback compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+  UPDATE public.tasks task
+  SET local_projection_source_task_id = NULL,
+      local_projection_replacement_state = NULL,
+      local_projection_replacement_version = NULL,
+      local_projection_replacement_fingerprint = NULL
+  WHERE task.id = v_operation.replacement_task_id
+    AND task.local_projection_scope_state = 'active'
+    AND task.local_projection_overlimit_package_count IS NULL
+    AND task.local_projection_source_task_id = v_operation.source_task_id
+    AND task.local_projection_replacement_state = 'pending'
+    AND task.local_projection_replacement_version = v_operation.replacement_version
+    AND task.local_projection_replacement_fingerprint = v_relation_fingerprint;
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+  IF v_updated <> 1 THEN
+    RAISE EXCEPTION 'replacement task lost its rollback detach compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+  v_next_fingerprint := forge.local_projection_archive_operation_fingerprint_v2(
+    v_operation.id, 'rolled_back', v_operation.operation_fingerprint
+  );
+  SELECT COALESCE(pg_catalog.max(checkpoint.ordinal), 0) + 1 INTO v_ordinal
+  FROM public.local_projection_archive_operation_checkpoints checkpoint
+  WHERE checkpoint.operation_id = v_operation.id;
+  UPDATE public.local_projection_archive_operations operation
+  SET state = 'rolled_back', operation_fingerprint = v_next_fingerprint,
+      updated_at = pg_catalog.clock_timestamp(), completed_at = pg_catalog.clock_timestamp()
+  WHERE operation.id = v_operation.id
+    AND operation.state = v_operation.state
+    AND operation.operation_fingerprint = p_expected_operation_fingerprint;
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+  IF v_updated <> 1 THEN
+    RAISE EXCEPTION 'archive operation lost its rollback compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+  INSERT INTO public.local_projection_archive_operation_checkpoints
+    (operation_id, ordinal, state, operation_fingerprint, actor_user_id)
+  VALUES (v_operation.id, v_ordinal, 'rolled_back', v_next_fingerprint, p_actor_user_id);
+  SELECT inspect.snapshot INTO v_source FROM forge.inspect_local_projection_overlimit_v2(v_operation.source_task_id) inspect;
+  SELECT inspect.snapshot INTO v_replacement FROM forge.inspect_local_projection_overlimit_v2(v_operation.replacement_task_id) inspect;
+  operation_id := v_operation.id; state := 'rolled_back'; operation_fingerprint := v_next_fingerprint;
+  snapshot := pg_catalog.jsonb_build_object('schemaVersion',2,'source',v_source,'replacement',v_replacement,'checkpoint','rolled_back');
+  RETURN NEXT;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.cancel_local_projection_overlimit_archive_v2(
+  p_operation_id uuid,
+  p_actor_user_id uuid,
+  p_expected_operation_fingerprint text
+)
+RETURNS TABLE (operation_id uuid, state text, operation_fingerprint text, snapshot jsonb)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, forge
+AS $$
+DECLARE
+  v_operation public.local_projection_archive_operations%ROWTYPE;
+  v_source jsonb; v_replacement jsonb; v_next_fingerprint text; v_ordinal integer;
+  v_relation_fingerprint text; v_updated integer;
+BEGIN
+  IF session_user <> 'forge_local_projection_archiver'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'projection archive cancellation requires the fixed archiver login' USING ERRCODE = '42501';
+  END IF;
+  SELECT operation.* INTO STRICT v_operation FROM public.local_projection_archive_operations operation
+  WHERE operation.id = p_operation_id FOR UPDATE;
+  IF v_operation.actor_user_id <> p_actor_user_id
+     OR v_operation.operation_fingerprint <> p_expected_operation_fingerprint
+     OR v_operation.state NOT IN ('validated','quiesced') THEN
+    RAISE EXCEPTION 'projection archive cancellation is no longer eligible' USING ERRCODE = '40001';
+  END IF;
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id IN (v_operation.source_task_id, v_operation.replacement_task_id)
+  ORDER BY task.id FOR UPDATE;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id IN (v_operation.source_task_id, v_operation.replacement_task_id)
+  ORDER BY package.id FOR UPDATE;
+  IF EXISTS (SELECT 1 FROM public.work_packages package
+    WHERE package.task_id IN (v_operation.source_task_id, v_operation.replacement_task_id)
+      AND (package.status IN ('running','awaiting_review') OR package.metadata ? 'executionLease')) THEN
+    RAISE EXCEPTION 'projection archive cancellation requires quiescent tasks' USING ERRCODE = '40001';
+  END IF;
+  SELECT inspect.snapshot INTO STRICT v_source
+  FROM forge.inspect_local_projection_overlimit_v2(v_operation.source_task_id) inspect;
+  IF v_source->>'scopeState' <> 'archive_pending'
+     OR NOT (
+       v_source->'projection'->>'integrityState' = 'over_limit'
+       OR (
+         v_source->'projection'->>'integrityState' = 'missing_heads'
+         AND (v_source->'projection'->>'actualHeadCount')::integer = 0
+         AND (v_source->'projection'->>'distinctPackageCount')::integer = 0
+       )
+     )
+     OR v_source->>'overlimitPackageCount' IS NULL
+     OR (v_source->>'overlimitPackageCount')::integer <> (v_source->>'packageCount')::integer
+     OR v_source->>'taskFingerprint' <> v_operation.source_fingerprint THEN
+    RAISE EXCEPTION 'source projection changed before cancellation'
+      USING ERRCODE = '40001';
+  END IF;
+  v_relation_fingerprint := 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+    pg_catalog.convert_to(
+      'forge:local-projection-replacement:v2:' || v_operation.source_task_id::text || ':' ||
+      v_operation.replacement_task_id::text || ':' || v_operation.replacement_version::text ||
+      ':' || v_operation.source_fingerprint || ':' || v_operation.replacement_fingerprint,
+      'UTF8'
+    )
+  ), 'hex');
+  UPDATE public.tasks task SET local_projection_scope_state = 'archive_pending'
+  WHERE task.id = v_operation.source_task_id
+    AND task.local_projection_scope_state = 'archive_pending'
+    AND task.local_projection_overlimit_package_count = (v_source->>'packageCount')::integer;
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+  IF v_updated <> 1 THEN
+    RAISE EXCEPTION 'source task lost its cancellation compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+  UPDATE public.tasks task
+  SET local_projection_replacement_state = 'cancelled',
+      local_projection_replacement_version = task.local_projection_replacement_version + 1,
+      local_projection_replacement_fingerprint = 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+        pg_catalog.convert_to('forge:local-projection-replacement:v2:' || task.id::text || ':cancelled:' ||
+          (task.local_projection_replacement_version + 1)::text, 'UTF8')), 'hex')
+  WHERE task.id = v_operation.replacement_task_id
+    AND task.local_projection_scope_state = 'active'
+    AND task.local_projection_overlimit_package_count IS NULL
+    AND task.local_projection_source_task_id = v_operation.source_task_id
+    AND task.local_projection_replacement_state = 'pending'
+    AND task.local_projection_replacement_version = v_operation.replacement_version
+    AND task.local_projection_replacement_fingerprint = v_relation_fingerprint;
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+  IF v_updated <> 1 THEN
+    RAISE EXCEPTION 'replacement task lost its cancellation compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+  v_next_fingerprint := forge.local_projection_archive_operation_fingerprint_v2(
+    v_operation.id, 'cancelled', v_operation.operation_fingerprint
+  );
+  SELECT COALESCE(pg_catalog.max(checkpoint.ordinal), 0) + 1 INTO v_ordinal
+  FROM public.local_projection_archive_operation_checkpoints checkpoint
+  WHERE checkpoint.operation_id = v_operation.id;
+  UPDATE public.local_projection_archive_operations operation
+  SET state = 'cancelled', operation_fingerprint = v_next_fingerprint,
+      updated_at = pg_catalog.clock_timestamp(), completed_at = pg_catalog.clock_timestamp(),
+      replacement_version = operation.replacement_version + 1
+  WHERE operation.id = v_operation.id
+    AND operation.state = v_operation.state
+    AND operation.operation_fingerprint = p_expected_operation_fingerprint;
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+  IF v_updated <> 1 THEN
+    RAISE EXCEPTION 'archive operation lost its cancellation compare-and-set'
+      USING ERRCODE = '40001';
+  END IF;
+  INSERT INTO public.local_projection_archive_operation_checkpoints
+    (operation_id, ordinal, state, operation_fingerprint, actor_user_id)
+  VALUES (v_operation.id, v_ordinal, 'cancelled', v_next_fingerprint, p_actor_user_id);
+  SELECT inspect.snapshot INTO v_source FROM forge.inspect_local_projection_overlimit_v2(v_operation.source_task_id) inspect;
+  SELECT inspect.snapshot INTO v_replacement FROM forge.inspect_local_projection_overlimit_v2(v_operation.replacement_task_id) inspect;
+  operation_id := v_operation.id; state := 'cancelled'; operation_fingerprint := v_next_fingerprint;
+  snapshot := pg_catalog.jsonb_build_object('schemaVersion',2,'source',v_source,'replacement',v_replacement,'checkpoint','cancelled');
+  RETURN NEXT;
 END;
 $$;
 --> statement-breakpoint
@@ -2700,6 +5528,7 @@ CREATE OR REPLACE FUNCTION forge.insert_architect_plan_version_v1(
   p_plan_version bigint,
   p_digest_key_id text,
   p_entry_set_digest text,
+  p_structural_set_digest text,
   p_entry_ids text[],
   p_entry_kinds text[],
   p_agents text[],
@@ -2757,8 +5586,12 @@ BEGIN
     )
   );
   INSERT INTO public.architect_plan_versions (
-    task_id, plan_artifact_id, plan_version, digest_key_id, entry_count, entry_set_digest
-  ) VALUES (v_task_id, p_plan_artifact_id, p_plan_version, p_digest_key_id, v_count, p_entry_set_digest);
+    task_id, plan_artifact_id, plan_version, digest_key_id, entry_count,
+    entry_set_digest, structural_set_digest
+  ) VALUES (
+    v_task_id, p_plan_artifact_id, p_plan_version, p_digest_key_id, v_count,
+    p_entry_set_digest, p_structural_set_digest
+  );
 
   FOR v_ordinal IN 1..v_count LOOP
     INSERT INTO public.architect_plan_entries (
@@ -2777,6 +5610,20 @@ BEGIN
       END
     );
   END LOOP;
+  IF NOT EXISTS (
+    SELECT 1 FROM public.architect_plan_entries entry
+    WHERE entry.task_id = v_task_id AND entry.plan_version = p_plan_version
+      AND entry.entry_kind = 'plan_body' AND entry.entry_id = 'plan_body:000000'
+  ) OR NOT EXISTS (
+    SELECT 1 FROM public.architect_plan_entries entry
+    WHERE entry.task_id = v_task_id AND entry.plan_version = p_plan_version
+      AND entry.entry_kind = 'requirement'
+      AND entry.entry_id = 'requirement:plan-policy'
+      AND entry.requirement_key = 'plan-policy'
+  ) THEN
+    RAISE EXCEPTION 'Architect plan version lacks its self-contained plan and policy structural base'
+      USING ERRCODE = '22023';
+  END IF;
   RETURN p_plan_artifact_id;
 END;
 $$;
@@ -2939,6 +5786,506 @@ BEGIN
 END;
 $$;
 --> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.register_package_plan_entries_v1(
+  p_task_id uuid,
+  p_source_artifact_id uuid,
+  p_source_plan_version bigint,
+  p_work_package_ids uuid[],
+  p_entry_ids text[],
+  p_binding_set_digests text[],
+  p_capability_offsets integer[],
+  p_capabilities text[],
+  p_capability_requirement_keys text[],
+  p_routing_fingerprints text[]
+)
+RETURNS uuid[]
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_count integer := pg_catalog.cardinality(p_work_package_ids);
+  v_capability_count integer := pg_catalog.cardinality(p_capabilities);
+  v_registration_ids uuid[] := ARRAY[]::uuid[];
+  v_registration_id uuid;
+  v_entry public.architect_plan_entries%ROWTYPE;
+  v_package public.work_packages%ROWTYPE;
+  v_index integer;
+  v_capability_index integer;
+  v_start integer;
+  v_end integer;
+BEGIN
+  IF session_user <> 'forge_architect_plan_writer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'package plan registration requires the protected plan writer'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'Package plan registration is not enabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
+  IF v_count NOT BETWEEN 1 AND 256
+     OR pg_catalog.cardinality(p_entry_ids) <> v_count
+     OR pg_catalog.cardinality(p_binding_set_digests) <> v_count
+     OR pg_catalog.cardinality(p_capability_offsets) <> v_count + 1
+     OR pg_catalog.cardinality(p_capability_requirement_keys) <> v_capability_count
+     OR pg_catalog.cardinality(p_routing_fingerprints) <> v_capability_count
+     OR p_capability_offsets[1] <> 0
+     OR p_capability_offsets[v_count + 1] <> v_capability_count
+     OR (SELECT pg_catalog.count(DISTINCT (package_id, entry_id))
+         FROM pg_catalog.unnest(p_work_package_ids, p_entry_ids)
+           pair(package_id, entry_id)) <> v_count THEN
+    RAISE EXCEPTION 'package plan registration arrays are invalid or duplicated'
+      USING ERRCODE = '22023';
+  END IF;
+  PERFORM 1 FROM public.tasks task WHERE task.id = p_task_id FOR UPDATE;
+  PERFORM 1 FROM public.work_packages package
+  WHERE package.task_id = p_task_id ORDER BY package.id FOR UPDATE;
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.unnest(p_work_package_ids) requested(package_id)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM public.work_packages package
+      WHERE package.id = requested.package_id
+        AND package.task_id = p_task_id
+    )
+  ) THEN
+    RAISE EXCEPTION 'package plan registration contains a stale or cross-task package'
+      USING ERRCODE = '40001';
+  END IF;
+  PERFORM 1
+  FROM public.architect_plan_versions version
+  JOIN public.artifacts artifact ON artifact.id = version.plan_artifact_id
+  JOIN public.agent_runs source_run
+    ON source_run.id = artifact.agent_run_id
+   AND source_run.task_id = version.task_id
+   AND source_run.agent_type = 'architect'
+   AND source_run.status = 'completed'
+  WHERE version.task_id = p_task_id
+    AND version.plan_artifact_id = p_source_artifact_id
+    AND version.plan_version = p_source_plan_version
+    AND NOT EXISTS (
+      SELECT 1 FROM public.architect_plan_versions newer
+      WHERE newer.task_id = p_task_id
+        AND newer.plan_version > version.plan_version
+    )
+  FOR KEY SHARE OF version, artifact, source_run;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'package registration source is not the exact latest protected plan'
+      USING ERRCODE = '40001';
+  END IF;
+
+  FOR v_index IN 1..v_count LOOP
+    IF p_binding_set_digests[v_index] !~ '^hmac-sha256:[0-9a-f]{64}$'
+       OR p_capability_offsets[v_index] < 0
+       OR p_capability_offsets[v_index] > p_capability_offsets[v_index + 1] THEN
+      RAISE EXCEPTION 'package entry binding digest or capability offset is invalid'
+        USING ERRCODE = '22023';
+    END IF;
+    SELECT package.* INTO STRICT v_package
+    FROM public.work_packages package
+    WHERE package.id = p_work_package_ids[v_index]
+      AND package.task_id = p_task_id;
+    SELECT entry.* INTO STRICT v_entry
+    FROM public.architect_plan_entries entry
+    WHERE entry.task_id = p_task_id
+      AND entry.plan_artifact_id = p_source_artifact_id
+      AND entry.plan_version = p_source_plan_version
+      AND entry.entry_id = p_entry_ids[v_index]
+      AND entry.entry_kind IN ('requirement','routing','overlay','subtask')
+      AND (entry.projection_eligible OR entry.entry_kind = 'routing')
+    FOR KEY SHARE;
+    IF v_entry.agent IS NOT NULL AND v_entry.agent <> v_package.assigned_role THEN
+      RAISE EXCEPTION 'package registration copied an entry across assigned agents'
+        USING ERRCODE = '40001';
+    END IF;
+    v_start := p_capability_offsets[v_index] + 1;
+    v_end := p_capability_offsets[v_index + 1];
+    IF v_end >= v_start AND EXISTS (
+      SELECT 1 FROM pg_catalog.generate_series(v_start, v_end) capability_index
+      WHERE p_capabilities[capability_index] !~ '^[a-z0-9._:-]{1,240}$'
+         OR p_capabilities[capability_index]
+              <> pg_catalog.lower(pg_catalog.btrim(p_capabilities[capability_index]))
+         OR p_capability_requirement_keys[capability_index] !~ '^[a-z0-9._-]{1,64}$'
+         OR p_routing_fingerprints[capability_index] !~ '^sha256:[0-9a-f]{64}$'
+         OR (
+           v_entry.entry_kind IN ('routing','overlay')
+           AND (
+             p_capability_requirement_keys[capability_index]
+               <> v_entry.requirement_key
+             OR p_routing_fingerprints[capability_index]
+               <> v_entry.binding_fingerprint
+           )
+         )
+         OR (
+           v_entry.entry_kind = 'requirement'
+           AND p_capability_requirement_keys[capability_index]
+             <> v_entry.requirement_key
+         )
+         OR (
+           v_entry.entry_kind = 'subtask'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM public.architect_plan_entries routing
+             WHERE routing.task_id = p_task_id
+               AND routing.plan_artifact_id = p_source_artifact_id
+               AND routing.plan_version = p_source_plan_version
+               AND routing.entry_kind = 'routing'
+               AND routing.agent = v_package.assigned_role
+               AND routing.requirement_key
+                 = p_capability_requirement_keys[capability_index]
+               AND routing.binding_fingerprint
+                 = p_routing_fingerprints[capability_index]
+               AND NOT routing.projection_eligible
+           )
+         )
+    ) THEN
+      RAISE EXCEPTION 'package registration capability binding is not normalized or entry-bound'
+        USING ERRCODE = '22023';
+    END IF;
+    IF v_end >= v_start AND EXISTS (
+      SELECT 1
+      FROM pg_catalog.generate_series(v_start, v_end) left_index
+      JOIN pg_catalog.generate_series(v_start, v_end) right_index
+        ON right_index > left_index
+      WHERE (p_capabilities[left_index], p_capability_requirement_keys[left_index],
+             p_routing_fingerprints[left_index])
+          >= (p_capabilities[right_index], p_capability_requirement_keys[right_index],
+              p_routing_fingerprints[right_index])
+    ) THEN
+      RAISE EXCEPTION 'package registration capability bindings are not strictly sorted and unique'
+        USING ERRCODE = '22023';
+    END IF;
+
+    IF v_end >= v_start THEN
+      FOR v_capability_index IN v_start..v_end LOOP
+        INSERT INTO public.protected_entry_capability_bindings (
+          source_kind, source_id, source_version, entry_id, ordinal,
+          capability, requirement_key, routing_fingerprint
+        ) VALUES (
+          'architect_plan', p_source_artifact_id, p_source_plan_version,
+          v_entry.entry_id, v_capability_index - v_start,
+          p_capabilities[v_capability_index],
+          p_capability_requirement_keys[v_capability_index],
+          p_routing_fingerprints[v_capability_index]
+        ) ON CONFLICT (source_kind, source_id, source_version, entry_id, ordinal)
+          DO NOTHING;
+        IF NOT EXISTS (
+          SELECT 1 FROM public.protected_entry_capability_bindings binding
+          WHERE binding.source_kind = 'architect_plan'
+            AND binding.source_id = p_source_artifact_id
+            AND binding.source_version = p_source_plan_version
+            AND binding.entry_id = v_entry.entry_id
+            AND binding.ordinal = v_capability_index - v_start
+            AND binding.capability = p_capabilities[v_capability_index]
+            AND binding.requirement_key = p_capability_requirement_keys[v_capability_index]
+            AND binding.routing_fingerprint = p_routing_fingerprints[v_capability_index]
+        ) THEN
+          RAISE EXCEPTION 'package registration capability binding conflicts with retained authority'
+            USING ERRCODE = '40001';
+        END IF;
+      END LOOP;
+    END IF;
+    IF (
+      SELECT pg_catalog.count(*)
+      FROM public.protected_entry_capability_bindings binding
+      WHERE binding.source_kind = 'architect_plan'
+        AND binding.source_id = p_source_artifact_id
+        AND binding.source_version = p_source_plan_version
+        AND binding.entry_id = v_entry.entry_id
+    ) <> GREATEST(v_end - v_start + 1, 0) THEN
+      RAISE EXCEPTION 'package registration capability set is incomplete or widened'
+        USING ERRCODE = '40001';
+    END IF;
+    v_registration_id := pg_catalog.gen_random_uuid();
+    INSERT INTO public.protected_package_entry_registrations (
+      id, task_id, work_package_id, source_kind, source_id, source_version,
+      entry_id, entry_kind, binding_set_digest, content_digest, digest_key_id
+    ) VALUES (
+      v_registration_id, p_task_id, v_package.id, 'architect_plan',
+      p_source_artifact_id, p_source_plan_version, v_entry.entry_id,
+      v_entry.entry_kind, p_binding_set_digests[v_index],
+      v_entry.content_digest, v_entry.digest_key_id
+    );
+    v_registration_ids := pg_catalog.array_append(v_registration_ids, v_registration_id);
+  END LOOP;
+  RETURN v_registration_ids;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.bind_architect_plan_entry_v2(
+  p_registration_id uuid,
+  p_agent_run_id uuid
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_reference_id uuid := pg_catalog.gen_random_uuid();
+  v_registration public.protected_package_entry_registrations%ROWTYPE;
+  v_package public.work_packages%ROWTYPE;
+  v_entry public.architect_plan_entries%ROWTYPE;
+  v_gate public.approval_gates%ROWTYPE;
+  v_review_version_id uuid;
+  v_review_required boolean;
+BEGIN
+  IF session_user <> 'forge_packet_issuer'
+     OR current_user <> 'forge_s4_routines_owner' THEN
+    RAISE EXCEPTION 'registered Architect plan binding requires the fixed-path issuer'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'Registered Architect plan binding is not enabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
+  SELECT registration.* INTO STRICT v_registration
+  FROM public.protected_package_entry_registrations registration
+  WHERE registration.id = p_registration_id
+    AND registration.source_kind = 'architect_plan'
+  FOR KEY SHARE;
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id = v_registration.task_id FOR UPDATE;
+  SELECT package.* INTO STRICT v_package
+  FROM public.work_packages package
+  WHERE package.id = v_registration.work_package_id
+    AND package.task_id = v_registration.task_id
+  FOR UPDATE;
+  PERFORM 1 FROM public.agent_runs run
+  WHERE run.id = p_agent_run_id
+    AND run.task_id = v_registration.task_id
+    AND run.work_package_id = v_registration.work_package_id
+    AND run.status = 'running'
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'registered Architect plan run is stale or cross-package'
+      USING ERRCODE = '40001';
+  END IF;
+  SELECT entry.* INTO STRICT v_entry
+  FROM public.architect_plan_entries entry
+  WHERE entry.task_id = v_registration.task_id
+    AND entry.plan_artifact_id = v_registration.source_id
+    AND entry.plan_version = v_registration.source_version
+    AND entry.entry_id = v_registration.entry_id
+    AND entry.entry_kind = v_registration.entry_kind
+    AND entry.content_digest = v_registration.content_digest
+    AND entry.digest_key_id = v_registration.digest_key_id
+    AND entry.projection_eligible
+    AND (entry.agent IS NULL OR entry.agent = v_package.assigned_role)
+    AND NOT EXISTS (
+      SELECT 1 FROM public.architect_plan_versions newer
+      WHERE newer.task_id = v_registration.task_id
+        AND newer.plan_version > entry.plan_version
+    )
+  FOR KEY SHARE;
+  SELECT gate.* INTO STRICT v_gate
+  FROM public.approval_gates gate
+  WHERE gate.task_id = v_registration.task_id
+    AND gate.gate_type = 'plan_approval'
+    AND gate.source_artifact_id = v_registration.source_id
+    AND gate.status = 'approved'
+  FOR KEY SHARE;
+
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.architect_plan_entries routing
+    WHERE routing.task_id = v_registration.task_id
+      AND routing.plan_artifact_id = v_registration.source_id
+      AND routing.plan_version = v_registration.source_version
+      AND routing.entry_kind = 'routing'
+  ) OR EXISTS (
+    SELECT 1
+    FROM (
+      SELECT v_entry.requirement_key AS requirement_key
+      WHERE v_entry.requirement_key IS NOT NULL
+      UNION
+      SELECT binding.requirement_key
+      FROM public.protected_entry_capability_bindings binding
+      WHERE binding.source_kind = v_registration.source_kind
+        AND binding.source_id = v_registration.source_id
+        AND binding.source_version = v_registration.source_version
+        AND binding.entry_id = v_registration.entry_id
+    ) required_key
+  ) INTO v_review_required;
+
+  IF v_gate.protected_review_revision IS NULL THEN
+    IF v_review_required THEN
+      RAISE EXCEPTION 'registered Architect plan entry lacks its protected operator review'
+        USING ERRCODE = '42501';
+    END IF;
+  ELSE
+    SELECT review.id INTO STRICT v_review_version_id
+    FROM public.mcp_operator_review_versions review
+    WHERE review.approval_gate_id = v_gate.id
+      AND review.task_id = v_registration.task_id
+      AND review.source_artifact_id = v_registration.source_id
+      AND review.source_plan_version = v_registration.source_version
+      AND review.revision = v_gate.protected_review_revision
+      AND review.review_set_digest = v_gate.protected_review_set_digest
+      AND review.item_count = v_gate.protected_review_item_count
+      AND review.approved_count = v_gate.protected_review_approved_count
+      AND review.denied_count = v_gate.protected_review_denied_count
+      AND review.blocker_codes = v_gate.protected_review_blocker_codes
+    FOR KEY SHARE;
+
+    IF EXISTS (
+      SELECT 1
+      FROM (
+        SELECT v_entry.requirement_key AS requirement_key
+        WHERE v_entry.requirement_key IS NOT NULL
+        UNION
+        SELECT binding.requirement_key
+        FROM public.protected_entry_capability_bindings binding
+        WHERE binding.source_kind = v_registration.source_kind
+          AND binding.source_id = v_registration.source_id
+          AND binding.source_version = v_registration.source_version
+          AND binding.entry_id = v_registration.entry_id
+      ) required_key
+      WHERE (
+        SELECT pg_catalog.count(*)
+        FROM public.mcp_operator_review_entries decision
+        WHERE decision.review_version_id = v_review_version_id
+          AND decision.entry_kind = 'decision'
+          AND decision.requirement_key = required_key.requirement_key
+      ) <> 1
+      OR (
+        SELECT pg_catalog.count(*)
+        FROM public.mcp_operator_review_entries decision
+        WHERE decision.review_version_id = v_review_version_id
+          AND decision.entry_kind = 'decision'
+          AND decision.requirement_key = required_key.requirement_key
+          AND decision.projection_eligible
+          AND CASE
+            WHEN pg_catalog.pg_input_is_valid(
+              decision.content, 'pg_catalog.jsonb'
+            ) THEN
+              decision.content::pg_catalog.jsonb->'schemaVersion' = '2'::pg_catalog.jsonb
+              AND decision.content::pg_catalog.jsonb->>'requirementKey'
+                = required_key.requirement_key
+              AND decision.content::pg_catalog.jsonb->>'decision' = 'approved'
+            ELSE false
+          END
+      ) <> 1
+    ) THEN
+      RAISE EXCEPTION 'registered Architect plan entry has a denied, missing, or stale protected decision'
+        USING ERRCODE = '42501';
+    END IF;
+  END IF;
+  INSERT INTO public.architect_plan_execution_references (
+    id, purpose, task_id, work_package_id, agent_run_id, plan_artifact_id,
+    plan_version, entry_id, agent, requirement_key, binding_fingerprint,
+    content_digest, digest_key_id
+  ) VALUES (
+    v_reference_id, 'package_specialist', v_registration.task_id,
+    v_registration.work_package_id, p_agent_run_id, v_registration.source_id,
+    v_registration.source_version, v_registration.entry_id,
+    v_package.assigned_role, v_entry.requirement_key, v_entry.binding_fingerprint,
+    v_registration.content_digest, v_registration.digest_key_id
+  );
+  RETURN v_reference_id;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.bind_architect_replan_context_v2(
+  p_agent_run_id uuid,
+  p_prior_plan_artifact_id uuid
+)
+RETURNS TABLE (reference_id uuid, entry_id text, entry_kind text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_task_id uuid;
+  v_plan_version bigint;
+  v_entry_count integer;
+BEGIN
+  IF session_user <> 'forge_architect_plan_writer' THEN
+    RAISE EXCEPTION 'Architect replan context binding requires the protected plan writer login'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'Architect replan context binding is not enabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
+  SELECT run.task_id INTO STRICT v_task_id
+  FROM public.agent_runs run
+  WHERE run.id = p_agent_run_id AND run.work_package_id IS NULL
+    AND run.agent_type = 'architect' AND run.status = 'running'
+  FOR UPDATE;
+  PERFORM 1 FROM public.tasks task WHERE task.id = v_task_id FOR UPDATE;
+  SELECT version.plan_version, version.entry_count
+  INTO STRICT v_plan_version, v_entry_count
+  FROM public.architect_plan_versions version
+  JOIN public.artifacts artifact ON artifact.id = version.plan_artifact_id
+  JOIN public.agent_runs source_run ON source_run.id = artifact.agent_run_id
+  WHERE version.task_id = v_task_id
+    AND version.plan_artifact_id = p_prior_plan_artifact_id
+    AND source_run.task_id = v_task_id
+    AND source_run.agent_type = 'architect'
+    AND source_run.status = 'completed'
+    AND source_run.id <> p_agent_run_id
+    AND NOT EXISTS (
+      SELECT 1 FROM public.architect_plan_versions newer
+      WHERE newer.task_id = v_task_id
+        AND newer.plan_version > version.plan_version
+    )
+  FOR KEY SHARE OF version, artifact, source_run;
+
+  IF (
+    SELECT pg_catalog.count(*)
+    FROM public.architect_plan_entries entry
+    WHERE entry.task_id = v_task_id
+      AND entry.plan_artifact_id = p_prior_plan_artifact_id
+      AND entry.plan_version = v_plan_version
+      AND entry.entry_kind IN (
+        'plan_body','requirement','routing','overlay','subtask',
+        'clarification_question','clarification_answer'
+      )
+  ) <> v_entry_count THEN
+    RAISE EXCEPTION 'Architect replan source contains a non-canonical or incomplete entry set'
+      USING ERRCODE = '40001';
+  END IF;
+
+  RETURN QUERY
+  WITH eligible AS (
+    SELECT entry.*
+    FROM public.architect_plan_entries entry
+    WHERE entry.task_id = v_task_id
+      AND entry.plan_artifact_id = p_prior_plan_artifact_id
+      AND entry.plan_version = v_plan_version
+      AND entry.entry_kind IN (
+        'plan_body','requirement','routing','overlay','subtask',
+        'clarification_question','clarification_answer'
+      )
+    ORDER BY entry.entry_id
+    FOR KEY SHARE
+  ), inserted AS (
+    INSERT INTO public.architect_plan_execution_references (
+      id, purpose, task_id, work_package_id, agent_run_id, plan_artifact_id,
+      plan_version, entry_id, agent, requirement_key, binding_fingerprint,
+      content_digest, digest_key_id
+    )
+    SELECT pg_catalog.gen_random_uuid(), 'architect_replan', v_task_id, NULL,
+      p_agent_run_id, eligible.plan_artifact_id, eligible.plan_version,
+      eligible.entry_id, 'architect', eligible.requirement_key,
+      eligible.binding_fingerprint, eligible.content_digest, eligible.digest_key_id
+    FROM eligible
+    RETURNING id, architect_plan_execution_references.entry_id
+  )
+  SELECT inserted.id, inserted.entry_id, entry.entry_kind
+  FROM inserted
+  JOIN public.architect_plan_entries entry
+    ON entry.task_id = v_task_id
+   AND entry.plan_artifact_id = p_prior_plan_artifact_id
+   AND entry.plan_version = v_plan_version
+   AND entry.entry_id = inserted.entry_id
+  ORDER BY inserted.entry_id;
+END;
+$$;
+--> statement-breakpoint
 -- The NOLOGIN owner receives only the existing-table privileges required by
 -- the fixed-path functions above. Interactive and application logins receive
 -- no equivalent table access.
@@ -2947,29 +6294,45 @@ GRANT SELECT ON public.tasks, public.projects, public.work_packages,
   public.filesystem_mcp_current_decision_pointers,
   public.project_filesystem_grant_decisions,
   public.project_filesystem_current_decision_pointers,
-  public.filesystem_mcp_runtime_audits TO forge_s4_routines_owner;
+  public.filesystem_mcp_runtime_audits,
+  public.approval_gates TO forge_s4_routines_owner;
 GRANT SELECT, UPDATE ON public.sessions TO forge_s4_routines_owner;
 GRANT UPDATE ON public.filesystem_mcp_runtime_audits TO forge_s4_routines_owner;
 GRANT UPDATE ON public.tasks, public.projects, public.work_packages,
-  public.agent_runs, public.filesystem_mcp_grant_approvals,
+  public.agent_runs, public.approval_gates,
+  public.filesystem_mcp_grant_approvals,
   public.filesystem_mcp_current_decision_pointers,
   public.project_filesystem_grant_decisions,
   public.project_filesystem_current_decision_pointers TO forge_s4_routines_owner;
-GRANT INSERT ON public.agent_runs, public.artifacts, public.filesystem_mcp_runtime_audits
+GRANT INSERT ON public.agent_runs, public.artifacts, public.filesystem_mcp_runtime_audits,
+  public.approval_gates
   TO forge_s4_routines_owner;
 --> statement-breakpoint
 REVOKE ALL ON public.architect_plan_versions, public.architect_plan_entries,
   public.architect_plan_execution_references, public.architect_plan_history_reads,
-  public.work_package_local_run_evidence,
+  public.protected_package_entry_registrations,
+  public.protected_entry_capability_bindings,
+  public.mcp_operator_review_versions, public.mcp_operator_review_entries,
+  public.work_package_local_run_evidence, public.s4_completion_handoffs,
+  public.s4_protected_review_sources, public.s4_protected_review_source_reads,
+  public.s4_max_attempt_finalizations,
+  public.filesystem_mcp_issuance_recovery_actions,
+  public.local_effect_recovery_actions,
+  public.local_projection_archive_operations,
+  public.local_projection_archive_operation_checkpoints,
   public.filesystem_mcp_decision_nonce_claims,
   public.project_root_ref_reconciliation FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.fill_project_root_ref_on_insert_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.guard_project_root_ref_renull_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.reconcile_project_root_refs_v1(integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.s4_protected_paths_enabled_v1() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.guard_s4_approval_gate_review_head_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.reject_s4_retained_mutation_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.guard_architect_plan_public_artifact_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.append_mcp_operator_review_version_v1(bytea,uuid,bigint,integer,text,text,integer,integer,integer,text[],text[],text[],text[],text[],text[],text[],text[],boolean[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.read_mcp_operator_review_history_v1(bytea,uuid,uuid,integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.list_approved_package_plan_registrations_v1(bytea,uuid,bigint,integer,text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.resolve_architect_plan_entry_v1(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.create_local_run_evidence_v1(uuid,uuid,integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,uuid,integer,text[]) FROM PUBLIC;
@@ -2977,9 +6340,12 @@ REVOKE ALL ON FUNCTION forge.validate_packet_authorization_snapshot_v2(jsonb,tex
 REVOKE ALL ON FUNCTION forge.guard_packet_authorization_v2() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.s4_execution_lease_live_v1(jsonb,uuid,timestamptz) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.s4_runtime_mode_v1() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.read_s4_runtime_mode_for_application_v1() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.packet_recovery_marker_token_v2(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.packet_recovery_marker_fingerprint_v2(jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.claim_local_lifecycle_v2(uuid,uuid,integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.claim_packet_lifecycle_v2(uuid,uuid,uuid,uuid,integer,integer,text[]) FROM PUBLIC;
-REVOKE ALL ON FUNCTION forge.claim_work_package_lifecycle_v2(text,uuid,uuid,timestamptz,uuid,text,uuid,integer,uuid,text,text,integer,uuid,uuid,uuid,integer,integer,text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.claim_work_package_lifecycle_v2(text,uuid,uuid,timestamptz,uuid,text,uuid,integer,uuid,text,timestamptz,text,text,integer,uuid,uuid,uuid,integer,integer,text[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.lock_live_packet_lifecycle_v2(uuid,uuid,bigint,uuid,bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.lock_live_local_lifecycle_v2(uuid,uuid,bigint) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.heartbeat_local_lifecycle_v2(uuid,uuid,bigint,integer) FROM PUBLIC;
@@ -2991,19 +6357,41 @@ REVOKE ALL ON FUNCTION forge.complete_packet_delivery_v2(uuid,uuid,bigint,uuid,b
 REVOKE ALL ON FUNCTION forge.finalize_local_success_v2(uuid,uuid,bigint,text,text,jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.finalize_local_failure_v2(uuid,uuid,bigint,text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.finalize_packet_success_v2(uuid,uuid,bigint,uuid,bigint,text,text,jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.materialize_s4_completion_handoff_v1(uuid,text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.discover_s4_completion_handoff_v1(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.list_pending_s4_completion_handoffs_v1(integer,timestamptz,uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.claim_pending_s4_completion_handoffs_v1(text,uuid,integer,integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.materialize_claimed_s4_completion_handoff_v1(uuid,text[],text,uuid,bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.finalize_s4_max_attempts_v1(uuid,uuid,timestamptz,integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.resolve_s4_review_source_v1(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.finalize_packet_failure_v2(uuid,uuid,bigint,uuid,bigint,text,text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.recover_stale_local_lifecycle_v2(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.recover_stale_packet_lifecycle_v2(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.recover_linked_s4_lifecycle_v2(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.cas_packet_reapproval_v2(uuid,uuid,uuid,text,uuid) FROM PUBLIC;
-REVOKE ALL ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.apply_local_effect_recovery_action_v2(uuid,uuid,uuid,text,text,uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.apply_packet_issuance_recovery_action_v2(uuid,uuid,uuid,text,text,uuid,uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.register_package_plan_entries_v1(uuid,uuid,bigint,uuid[],text[],text[],integer[],text[],text[],text[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.bind_architect_plan_entry_v2(uuid,uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.bind_architect_replan_entry_v1(uuid,uuid) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) TO forge_architect_plan_writer;
+REVOKE ALL ON FUNCTION forge.bind_architect_replan_context_v2(uuid,uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.local_projection_archive_operation_fingerprint_v2(uuid,text,text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.inspect_local_projection_overlimit_v2(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.apply_local_projection_overlimit_archive_v2(uuid,uuid,uuid,text,text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.resume_local_projection_overlimit_archive_v2(uuid,uuid,text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.rollback_local_projection_overlimit_archive_v2(uuid,uuid,text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.cancel_local_projection_overlimit_archive_v2(uuid,uuid,text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) TO forge_architect_plan_writer;
+GRANT EXECUTE ON FUNCTION forge.register_package_plan_entries_v1(uuid,uuid,bigint,uuid[],text[],text[],integer[],text[],text[],text[]) TO forge_architect_plan_writer;
+GRANT EXECUTE ON FUNCTION forge.append_mcp_operator_review_version_v1(bytea,uuid,bigint,integer,text,text,integer,integer,integer,text[],text[],text[],text[],text[],text[],text[],text[],boolean[]) TO forge_architect_plan_history_reader;
 GRANT EXECUTE ON FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) TO forge_architect_plan_history_reader;
+GRANT EXECUTE ON FUNCTION forge.read_mcp_operator_review_history_v1(bytea,uuid,uuid,integer) TO forge_architect_plan_history_reader;
+GRANT EXECUTE ON FUNCTION forge.list_approved_package_plan_registrations_v1(bytea,uuid,bigint,integer,text) TO forge_architect_plan_history_reader;
 GRANT EXECUTE ON FUNCTION forge.resolve_architect_plan_entry_v1(uuid) TO forge_architect_plan_resolver;
 GRANT EXECUTE ON FUNCTION forge.s4_runtime_mode_v1() TO forge_packet_issuer;
-GRANT EXECUTE ON FUNCTION forge.claim_work_package_lifecycle_v2(text,uuid,uuid,timestamptz,uuid,text,uuid,integer,uuid,text,text,integer,uuid,uuid,uuid,integer,integer,text[]) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.claim_work_package_lifecycle_v2(text,uuid,uuid,timestamptz,uuid,text,uuid,integer,uuid,text,timestamptz,text,text,integer,uuid,uuid,uuid,integer,integer,text[]) TO forge_packet_issuer;
 GRANT EXECUTE ON FUNCTION forge.heartbeat_local_lifecycle_v2(uuid,uuid,bigint,integer) TO forge_packet_issuer;
 GRANT EXECUTE ON FUNCTION forge.heartbeat_packet_lifecycle_v2(uuid,uuid,bigint,uuid,bigint,integer,integer) TO forge_packet_issuer;
 GRANT EXECUTE ON FUNCTION forge.begin_packet_assembly_v2(uuid,uuid,bigint,uuid,bigint,uuid) TO forge_packet_issuer;
@@ -3013,12 +6401,27 @@ GRANT EXECUTE ON FUNCTION forge.complete_packet_delivery_v2(uuid,uuid,bigint,uui
 GRANT EXECUTE ON FUNCTION forge.finalize_local_success_v2(uuid,uuid,bigint,text,text,jsonb) TO forge_packet_issuer;
 GRANT EXECUTE ON FUNCTION forge.finalize_local_failure_v2(uuid,uuid,bigint,text) TO forge_packet_issuer;
 GRANT EXECUTE ON FUNCTION forge.finalize_packet_success_v2(uuid,uuid,bigint,uuid,bigint,text,text,jsonb) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.materialize_s4_completion_handoff_v1(uuid,text[]) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.discover_s4_completion_handoff_v1(uuid) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.list_pending_s4_completion_handoffs_v1(integer,timestamptz,uuid) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.claim_pending_s4_completion_handoffs_v1(text,uuid,integer,integer) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.materialize_claimed_s4_completion_handoff_v1(uuid,text[],text,uuid,bigint) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.finalize_s4_max_attempts_v1(uuid,uuid,timestamptz,integer) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.resolve_s4_review_source_v1(uuid) TO forge_review_source_resolver;
 GRANT EXECUTE ON FUNCTION forge.finalize_packet_failure_v2(uuid,uuid,bigint,uuid,bigint,text,text) TO forge_packet_issuer;
 GRANT EXECUTE ON FUNCTION forge.recover_linked_s4_lifecycle_v2(uuid) TO forge_packet_issuer;
 GRANT EXECUTE ON FUNCTION forge.cas_packet_reapproval_v2(uuid,uuid,uuid,text,uuid) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.apply_local_effect_recovery_action_v2(uuid,uuid,uuid,text,text,uuid) TO forge_s4_recovery_operator;
+GRANT EXECUTE ON FUNCTION forge.apply_packet_issuance_recovery_action_v2(uuid,uuid,uuid,text,text,uuid,uuid) TO forge_s4_recovery_operator;
 GRANT EXECUTE ON FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.bind_architect_plan_entry_v2(uuid,uuid) TO forge_packet_issuer;
 GRANT EXECUTE ON FUNCTION forge.bind_architect_replan_entry_v1(uuid,uuid) TO forge_architect_plan_writer;
---> statement-breakpoint
+GRANT EXECUTE ON FUNCTION forge.bind_architect_replan_context_v2(uuid,uuid) TO forge_architect_plan_writer;
+GRANT EXECUTE ON FUNCTION forge.inspect_local_projection_overlimit_v2(uuid) TO forge_local_projection_archiver;
+GRANT EXECUTE ON FUNCTION forge.apply_local_projection_overlimit_archive_v2(uuid,uuid,uuid,text,text) TO forge_local_projection_archiver;
+GRANT EXECUTE ON FUNCTION forge.resume_local_projection_overlimit_archive_v2(uuid,uuid,text) TO forge_local_projection_archiver;
+GRANT EXECUTE ON FUNCTION forge.rollback_local_projection_overlimit_archive_v2(uuid,uuid,text) TO forge_local_projection_archiver;
+GRANT EXECUTE ON FUNCTION forge.cancel_local_projection_overlimit_archive_v2(uuid,uuid,text) TO forge_local_projection_archiver;
 -- The bootstrap fence temporarily gives the incoming owner CREATE on the two
 -- containing schemas because PostgreSQL requires it for SET OWNER. The
 -- finalizer revokes both grants before it verifies the permanent boundary.
@@ -3026,16 +6429,32 @@ ALTER TABLE public.architect_plan_versions OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.architect_plan_entries OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.architect_plan_execution_references OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.architect_plan_history_reads OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.protected_package_entry_registrations OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.protected_entry_capability_bindings OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.mcp_operator_review_versions OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.mcp_operator_review_entries OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.work_package_local_run_evidence OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.s4_completion_handoffs OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.s4_protected_review_sources OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.s4_protected_review_source_reads OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.s4_max_attempt_finalizations OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.filesystem_mcp_issuance_recovery_actions OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.local_effect_recovery_actions OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.local_projection_archive_operations OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.local_projection_archive_operation_checkpoints OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.filesystem_mcp_decision_nonce_claims OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.project_root_ref_reconciliation OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.fill_project_root_ref_on_insert_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.guard_project_root_ref_renull_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.reconcile_project_root_refs_v1(integer) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.s4_protected_paths_enabled_v1() OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.guard_s4_approval_gate_review_head_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.reject_s4_retained_mutation_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.guard_architect_plan_public_artifact_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.append_mcp_operator_review_version_v1(bytea,uuid,bigint,integer,text,text,integer,integer,integer,text[],text[],text[],text[],text[],text[],text[],text[],boolean[]) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.read_mcp_operator_review_history_v1(bytea,uuid,uuid,integer) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.list_approved_package_plan_registrations_v1(bytea,uuid,bigint,integer,text) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.resolve_architect_plan_entry_v1(uuid) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.create_local_run_evidence_v1(uuid,uuid,integer) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.validate_packet_authorization_snapshot_v2(jsonb,text,text,uuid,bigint,uuid,bigint) OWNER TO forge_s4_routines_owner;
@@ -3043,9 +6462,12 @@ ALTER FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid
 ALTER FUNCTION forge.guard_packet_authorization_v2() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.s4_execution_lease_live_v1(jsonb,uuid,timestamptz) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.s4_runtime_mode_v1() OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.read_s4_runtime_mode_for_application_v1() OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.packet_recovery_marker_token_v2(text) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.packet_recovery_marker_fingerprint_v2(jsonb) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.claim_local_lifecycle_v2(uuid,uuid,integer) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.claim_packet_lifecycle_v2(uuid,uuid,uuid,uuid,integer,integer,text[]) OWNER TO forge_s4_routines_owner;
-ALTER FUNCTION forge.claim_work_package_lifecycle_v2(text,uuid,uuid,timestamptz,uuid,text,uuid,integer,uuid,text,text,integer,uuid,uuid,uuid,integer,integer,text[]) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.claim_work_package_lifecycle_v2(text,uuid,uuid,timestamptz,uuid,text,uuid,integer,uuid,text,timestamptz,text,text,integer,uuid,uuid,uuid,integer,integer,text[]) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.lock_live_packet_lifecycle_v2(uuid,uuid,bigint,uuid,bigint) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.lock_live_local_lifecycle_v2(uuid,uuid,bigint) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.heartbeat_local_lifecycle_v2(uuid,uuid,bigint,integer) OWNER TO forge_s4_routines_owner;
@@ -3057,13 +6479,44 @@ ALTER FUNCTION forge.complete_packet_delivery_v2(uuid,uuid,bigint,uuid,bigint,uu
 ALTER FUNCTION forge.finalize_local_success_v2(uuid,uuid,bigint,text,text,jsonb) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.finalize_local_failure_v2(uuid,uuid,bigint,text) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.finalize_packet_success_v2(uuid,uuid,bigint,uuid,bigint,text,text,jsonb) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.materialize_s4_completion_handoff_v1(uuid,text[]) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.discover_s4_completion_handoff_v1(uuid) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.list_pending_s4_completion_handoffs_v1(integer,timestamptz,uuid) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.claim_pending_s4_completion_handoffs_v1(text,uuid,integer,integer) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.materialize_claimed_s4_completion_handoff_v1(uuid,text[],text,uuid,bigint) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.finalize_s4_max_attempts_v1(uuid,uuid,timestamptz,integer) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.resolve_s4_review_source_v1(uuid) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.finalize_packet_failure_v2(uuid,uuid,bigint,uuid,bigint,text,text) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.recover_stale_local_lifecycle_v2(uuid) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.recover_stale_packet_lifecycle_v2(uuid) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.recover_linked_s4_lifecycle_v2(uuid) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.cas_packet_reapproval_v2(uuid,uuid,uuid,text,uuid) OWNER TO forge_s4_routines_owner;
-ALTER FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.apply_local_effect_recovery_action_v2(uuid,uuid,uuid,text,text,uuid) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.apply_packet_issuance_recovery_action_v2(uuid,uuid,uuid,text,text,uuid,uuid) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.register_package_plan_entries_v1(uuid,uuid,bigint,uuid[],text[],text[],integer[],text[],text[],text[]) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.bind_architect_plan_entry_v2(uuid,uuid) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.bind_architect_replan_entry_v1(uuid,uuid) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.bind_architect_replan_context_v2(uuid,uuid) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.local_projection_archive_operation_fingerprint_v2(uuid,text,text) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.inspect_local_projection_overlimit_v2(uuid) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.apply_local_projection_overlimit_archive_v2(uuid,uuid,uuid,text,text) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.resume_local_projection_overlimit_archive_v2(uuid,uuid,text) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.rollback_local_projection_overlimit_archive_v2(uuid,uuid,text) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.cancel_local_projection_overlimit_archive_v2(uuid,uuid,text) OWNER TO forge_s4_routines_owner;
+--> statement-breakpoint
+SET ROLE forge_s4_routines_owner;
+DO $$
+DECLARE
+  v_application_role name := session_user;
+BEGIN
+  EXECUTE pg_catalog.format(
+    'GRANT EXECUTE ON FUNCTION forge.read_s4_runtime_mode_for_application_v1() TO %I',
+    v_application_role
+  );
+END;
+$$;
+RESET ROLE;
 --> statement-breakpoint
 SELECT public.forge_finalize_epic_172_s4_owner_bootstrap_v1();

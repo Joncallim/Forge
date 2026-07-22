@@ -1,5 +1,5 @@
 import { db } from '@/db'
-import { sessions } from '@/db/schema'
+import { sessionCredentialReconciliation, sessions } from '@/db/schema'
 import { and, eq, isNull, or, sql } from 'drizzle-orm'
 import { redis } from '@/lib/redis'
 import { isIP } from 'node:net'
@@ -87,6 +87,24 @@ type LegacyRedisAuthority = {
   lastSeenAt: Date
 }
 
+async function writeLegacySessionCache(
+  credential: string,
+  session: Pick<AuthorizedSession, 'userId' | 'lastSeenAt' | 'expiresAt'>,
+): Promise<void> {
+  await redis.set(
+    legacyRedisKey(credential),
+    JSON.stringify({
+      userId: session.userId,
+      credentialId: null,
+      userAgent: null,
+      ip: null,
+      lastSeenAt: session.lastSeenAt.getTime(),
+    }),
+    'PXAT',
+    session.expiresAt.getTime(),
+  )
+}
+
 async function readLegacyRedisAuthority(
   credential: string,
   expectedUserId: string,
@@ -125,6 +143,18 @@ async function authorizeSession(
   digest: Buffer,
 ): Promise<AuthorizedSession | null> {
   return db.transaction(async (tx) => {
+    // Hold this row until every legacy Redis write in this request has
+    // finished. The reconciler takes FOR UPDATE before entering draining, so
+    // it cannot zero-scan old keys and then have an expansion request recreate
+    // one behind it.
+    const [reconciliation] = await tx
+      .select({ state: sessionCredentialReconciliation.state })
+      .from(sessionCredentialReconciliation)
+      .where(eq(sessionCredentialReconciliation.singleton, true))
+      .limit(1)
+      .for('key share')
+    if (!reconciliation) throw new Error('Session credential reconciliation authority is unavailable')
+
     const [row] = await tx
       .select({
         sessionId: sessions.id,
@@ -196,8 +226,9 @@ async function authorizeSession(
       return null
     }
 
+    let authorized: AuthorizedSession
     if (databaseNow.getTime() - lastSeenAt.getTime() <= WRITE_BEHIND_INTERVAL_MS) {
-      return {
+      authorized = {
         sessionId: row.sessionId,
         userId: row.userId,
         lastSeenAt,
@@ -205,36 +236,42 @@ async function authorizeSession(
         refreshed: false,
         credentialStorageVersion: storageVersion,
       }
+    } else {
+      const [refreshed] = await tx
+        .update(sessions)
+        .set({
+          lastSeenAt: sql`pg_catalog.date_trunc('milliseconds', pg_catalog.clock_timestamp())`,
+          expiresAt: sql`pg_catalog.date_trunc('milliseconds', pg_catalog.clock_timestamp() + interval '7 days')`,
+        })
+        .where(eq(sessions.id, row.sessionId))
+        .returning({
+          lastSeenAt: sessions.lastSeenAt,
+          expiresAt: sessions.expiresAt,
+        })
+
+      if (!refreshed?.lastSeenAt || !refreshed.expiresAt) {
+        throw new Error('Session refresh did not return authoritative timestamps')
+      }
+      authorized = {
+        sessionId: row.sessionId,
+        userId: row.userId,
+        lastSeenAt: parseDatabaseTimestamp(refreshed.lastSeenAt, 'refreshed last-seen'),
+        expiresAt: parseDatabaseTimestamp(refreshed.expiresAt, 'refreshed expiry'),
+        refreshed: true,
+        credentialStorageVersion: storageVersion,
+      }
     }
 
-    const [refreshed] = await tx
-      .update(sessions)
-      .set({
-        lastSeenAt: sql`pg_catalog.date_trunc('milliseconds', pg_catalog.clock_timestamp())`,
-        expiresAt: sql`pg_catalog.date_trunc('milliseconds', pg_catalog.clock_timestamp() + interval '7 days')`,
-      })
-      .where(eq(sessions.id, row.sessionId))
-      .returning({
-        lastSeenAt: sessions.lastSeenAt,
-        expiresAt: sessions.expiresAt,
-      })
-
-    if (!refreshed?.lastSeenAt || !refreshed.expiresAt) {
-      throw new Error('Session refresh did not return authoritative timestamps')
+    if (authorized.credentialStorageVersion === 1 && reconciliation.state === 'expansion') {
+      // Cache failure is non-authoritative, but the attempted write must occur
+      // before this transaction releases the reconciliation lock.
+      await writeLegacySessionCache(credential, authorized).catch(() => {})
     }
-    return {
-      sessionId: row.sessionId,
-      userId: row.userId,
-      lastSeenAt: parseDatabaseTimestamp(refreshed.lastSeenAt, 'refreshed last-seen'),
-      expiresAt: parseDatabaseTimestamp(refreshed.expiresAt, 'refreshed expiry'),
-      refreshed: true,
-      credentialStorageVersion: storageVersion,
-    }
+    return authorized
   })
 }
 
 async function cacheAuthorizedSession(
-  credential: string,
   digest: Buffer,
   session: AuthorizedSession,
 ): Promise<void> {
@@ -249,20 +286,6 @@ async function cacheAuthorizedSession(
     'PXAT',
     session.expiresAt.getTime(),
   )
-  if (session.credentialStorageVersion === 1) {
-    await redis.set(
-      legacyRedisKey(credential),
-      JSON.stringify({
-        userId: session.userId,
-        credentialId: null,
-        userAgent: null,
-        ip: null,
-        lastSeenAt: session.lastSeenAt.getTime(),
-      }),
-      'PXAT',
-      session.expiresAt.getTime(),
-    )
-  }
 }
 
 export async function getSession(
@@ -287,7 +310,7 @@ export async function getSession(
 
   // Redis is a repairable cache only. Failure never turns a database-valid
   // session into an authorization failure and never extends database expiry.
-  await cacheAuthorizedSession(credential, digest, authorized).catch(() => {})
+  await cacheAuthorizedSession(digest, authorized).catch(() => {})
   return { sessionId: authorized.sessionId, userId: authorized.userId }
 }
 
@@ -299,30 +322,48 @@ export async function createSession(
   const credential = crypto.randomUUID()
   const digest = computeCredentialDigest(credential).digest
   const ip = sessionIp(meta.ip)
-  const dualWrite = dualWriteSessions()
+  const dualWriteRequested = dualWriteSessions()
 
-  const [created] = await db
-    .insert(sessions)
-    .values({
-      id: dualWrite ? credential : crypto.randomUUID(),
-      userId,
-      credentialId: credentialId ?? undefined,
-      credentialDigestV1: digest,
-      credentialStorageVersion: dualWrite ? 1 : 2,
-      createdAt: sql`pg_catalog.clock_timestamp()`,
-      lastSeenAt: sql`pg_catalog.clock_timestamp()`,
-      expiresAt: sql`pg_catalog.date_trunc('milliseconds', pg_catalog.clock_timestamp() + interval '7 days')`,
-      userAgent: meta.userAgent ?? undefined,
-      ipAddress: ip ?? undefined,
-    })
-    .returning({
-      sessionId: sessions.id,
-      lastSeenAt: sessions.lastSeenAt,
-      expiresAt: sessions.expiresAt,
-    })
+  const { created, dualWrite } = await db.transaction(async (tx) => {
+    const [reconciliation] = await tx
+      .select({ state: sessionCredentialReconciliation.state })
+      .from(sessionCredentialReconciliation)
+      .where(eq(sessionCredentialReconciliation.singleton, true))
+      .limit(1)
+      .for('key share')
+    if (!reconciliation) throw new Error('Session credential reconciliation authority is unavailable')
+    const dualWrite = dualWriteRequested && reconciliation.state === 'expansion'
+    const [created] = await tx
+      .insert(sessions)
+      .values({
+        id: dualWrite ? credential : crypto.randomUUID(),
+        userId,
+        credentialId: credentialId ?? undefined,
+        credentialDigestV1: digest,
+        credentialStorageVersion: dualWrite ? 1 : 2,
+        createdAt: sql`pg_catalog.clock_timestamp()`,
+        lastSeenAt: sql`pg_catalog.clock_timestamp()`,
+        expiresAt: sql`pg_catalog.date_trunc('milliseconds', pg_catalog.clock_timestamp() + interval '7 days')`,
+        userAgent: meta.userAgent ?? undefined,
+        ipAddress: ip ?? undefined,
+      })
+      .returning({
+        sessionId: sessions.id,
+        lastSeenAt: sessions.lastSeenAt,
+        expiresAt: sessions.expiresAt,
+      })
+    if (created?.expiresAt && dualWrite) {
+      await writeLegacySessionCache(credential, {
+        userId,
+        lastSeenAt: created.lastSeenAt,
+        expiresAt: created.expiresAt,
+      }).catch(() => {})
+    }
+    return { created, dualWrite }
+  })
 
   if (!created?.expiresAt) throw new Error('Session creation did not return an expiry')
-  await cacheAuthorizedSession(credential, digest, {
+  await cacheAuthorizedSession(digest, {
     sessionId: created.sessionId,
     userId,
     lastSeenAt: created.lastSeenAt,

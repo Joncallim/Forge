@@ -25,6 +25,8 @@ const state = vi.hoisted(() => ({
     subscribe: ReturnType<typeof vi.fn>
     disconnect: ReturnType<typeof vi.fn>
   }) | null,
+  historyGet: vi.fn().mockResolvedValue('0'),
+  historyRange: vi.fn().mockResolvedValue([]),
 }))
 
 // ---------------------------------------------------------------------------
@@ -71,7 +73,8 @@ vi.mock('@/lib/redis', () => ({
     incr: vi.fn().mockResolvedValue(1),
     zadd: vi.fn().mockResolvedValue(0),
     expire: vi.fn().mockResolvedValue(1),
-    zrangebyscore: vi.fn().mockResolvedValue([]),
+    get: state.historyGet,
+    zrangebyscore: state.historyRange,
   },
 }))
 
@@ -161,6 +164,8 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     state.mockSub = null
+    state.historyGet.mockResolvedValue('0')
+    state.historyRange.mockResolvedValue([])
     mockGetSession.mockResolvedValue({ sessionId: 'sess-abc', userId: 'user-1' })
     let selectCount = 0
     mockDbSelect.mockImplementation(() => {
@@ -311,7 +316,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     expect(lines.join('\n')).not.toContain('RAW-API-KEY-SENTINEL')
   }, 2000)
 
-  it('strips nested prompt, delta, and secret aliases before live publish and replay persistence', async () => {
+  it('keeps run chunks sanitized and live-only instead of storing an invalid empty history event', async () => {
     const { GET } = await import('@/app/api/tasks/[id]/runs/route')
     const params = Promise.resolve({ id: 'task-sse-1' })
     const res = await GET(sseRequest() as never, { params })
@@ -321,12 +326,17 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
         'message',
         'forge:task:task-sse-1',
         JSON.stringify({
+          schemaVersion: 2,
+          id: null,
           type: 'run:chunk',
-          delta: 'RAW-DELTA-SENTINEL',
-          metadata: {
-            promptOverlay: 'RAW-OVERLAY-SENTINEL',
-            api_key: 'RAW-KEY-SENTINEL',
-            status: 'streaming',
+          data: {
+            type: 'run:chunk',
+            delta: 'RAW-DELTA-SENTINEL',
+            metadata: {
+              promptOverlay: 'RAW-OVERLAY-SENTINEL',
+              api_key: 'RAW-KEY-SENTINEL',
+              status: 'streaming',
+            },
           },
         }),
       )
@@ -338,12 +348,36 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     expect(payload).not.toHaveProperty('delta')
     expect(JSON.stringify(payload)).not.toContain('RAW-')
     const { redis } = await import('@/lib/redis')
-    expect(redis.incr).toHaveBeenCalledWith('forge:task-events:v2:task-sse-1:seq')
-    expect(redis.zadd).toHaveBeenCalledWith(
-      'forge:task-events:v2:task-sse-1:history',
-      expect.any(Number),
-      expect.not.stringContaining('RAW-'),
-    )
+    expect(redis.incr).not.toHaveBeenCalled()
+    expect(redis.zadd).not.toHaveBeenCalled()
+  }, 2000)
+
+  it('keeps question answers live-only instead of storing prompt-bearing history', async () => {
+    const { GET } = await import('@/app/api/tasks/[id]/runs/route')
+    const params = Promise.resolve({ id: 'task-sse-1' })
+    const res = await GET(sseRequest() as never, { params })
+
+    setTimeout(() => {
+      state.mockSub?.emit(
+        'message',
+        'forge:task:task-sse-1',
+        JSON.stringify({
+          schemaVersion: 2,
+          id: null,
+          type: 'questions:answered',
+          data: {
+            type: 'questions:answered',
+            questions: [{ id: 'question-1', answer: 'operator answer' }],
+          },
+        }),
+      )
+    }, 100)
+
+    const lines = await readLines(res.body!, 500)
+    expect(lines).toContain('event: questions:answered')
+    const { redis } = await import('@/lib/redis')
+    expect(redis.incr).not.toHaveBeenCalled()
+    expect(redis.zadd).not.toHaveBeenCalled()
   }, 2000)
 
   it('emits event: run:started within 500ms when a run:started message is published', async () => {
@@ -356,7 +390,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
       state.mockSub?.emit(
         'message',
         'forge:task:task-sse-1',
-        JSON.stringify({ type: 'run:started' }),
+        JSON.stringify({ schemaVersion: 2, id: 1, type: 'run:started', data: { type: 'run:started' } }),
       )
     }, 100)
 
@@ -375,7 +409,12 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
       state.mockSub?.emit(
         'message',
         'forge:task:task-sse-1',
-        JSON.stringify({ type: 'task:status', status: 'completed' }),
+        JSON.stringify({
+          schemaVersion: 2,
+          id: 1,
+          type: 'task:status',
+          data: { type: 'task:status', status: 'completed' },
+        }),
       )
     }, 100)
 
@@ -383,6 +422,67 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     const allText = lines.join('\n')
     expect(allText).toContain('[DONE]')
   }, 3000)
+
+  it('fills a live producer-ID gap from durable history before delivering the new event', async () => {
+    state.historyGet.mockResolvedValue('1')
+    state.historyRange.mockResolvedValue([
+      JSON.stringify({
+        schemaVersion: 2,
+        id: 2,
+        type: 'run:started',
+        data: { type: 'run:started', runId: 'run-2' },
+      }),
+      '2',
+    ])
+    const { GET } = await import('@/app/api/tasks/[id]/runs/route')
+    const res = await GET(sseRequest() as never, { params: Promise.resolve({ id: 'task-sse-1' }) })
+
+    setTimeout(() => {
+      state.mockSub?.emit('message', 'forge:task:task-sse-1', JSON.stringify({
+        schemaVersion: 2,
+        id: 3,
+        type: 'run:completed',
+        data: { type: 'run:completed', runId: 'run-2' },
+      }))
+    }, 100)
+
+    const lines = await readLines(res.body!, 500)
+    expect(lines).toContain('id: 2')
+    expect(lines).toContain('id: 3')
+    expect(lines.indexOf('id: 2')).toBeLessThan(lines.indexOf('id: 3'))
+  }, 2000)
+
+  it('signals a reset when reconnect history has been trimmed past the requested event ID', async () => {
+    state.historyGet.mockResolvedValue('4')
+    state.historyRange.mockResolvedValue([
+      JSON.stringify({
+        schemaVersion: 2,
+        id: 3,
+        type: 'run:started',
+        data: { type: 'run:started', runId: 'run-3' },
+      }),
+      '3',
+      JSON.stringify({
+        schemaVersion: 2,
+        id: 4,
+        type: 'run:completed',
+        data: { type: 'run:completed', runId: 'run-3' },
+      }),
+      '4',
+    ])
+    const request = new Request('http://localhost/api/tasks/task-sse-1/runs', {
+      headers: {
+        cookie: 'forge_session=sess-abc',
+        'last-event-id': '1',
+      },
+    })
+    const { GET } = await import('@/app/api/tasks/[id]/runs/route')
+    const res = await GET(request as never, { params: Promise.resolve({ id: 'task-sse-1' }) })
+
+    const lines = await readLines(res.body!, 500)
+    expect(lines).toContain('event: stream:reset')
+    expect(lines.join('\n')).toContain('"reason":"retention_gap"')
+  }, 2000)
 
   it('drops pub/sub messages after the client stream closes without logging controller errors', async () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -398,7 +498,12 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
       state.mockSub?.emit(
         'message',
         'forge:task:task-sse-1',
-        JSON.stringify({ type: 'run:chunk', delta: 'late chunk' }),
+        JSON.stringify({
+          schemaVersion: 2,
+          id: null,
+          type: 'run:chunk',
+          data: { type: 'run:chunk', delta: 'late chunk' },
+        }),
       )
       await new Promise((resolve) => setTimeout(resolve, 20))
 

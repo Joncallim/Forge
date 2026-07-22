@@ -3,14 +3,18 @@ import { createHmac, timingSafeEqual } from 'node:crypto'
 export const ARCHITECT_PLAN_HEADER = 'Architect plan available in protected history'
 export const ARCHITECT_PLAN_ENTRY_DOMAIN_V1 = Buffer.from('forge:architect-plan-entry:v1\0', 'utf8')
 export const ARCHITECT_PLAN_SET_DOMAIN_V1 = Buffer.from('forge:architect-plan-entry-set:v1\0', 'utf8')
+export const ARCHITECT_PLAN_STRUCTURAL_SET_DOMAIN_V1 = Buffer.from('forge:architect-plan-structural-set:v1\0', 'utf8')
 export const MAX_ARCHITECT_PLAN_ENTRIES = 256
 export const MAX_ARCHITECT_PLAN_ENTRY_BYTES = 64 * 1024
 
 export type ArchitectPlanEntryKind =
   | 'plan_body'
   | 'requirement'
+  | 'routing'
   | 'overlay'
   | 'subtask'
+  | 'clarification_question'
+  | 'clarification_answer'
   | 'legacy_full_plan'
 
 export type ArchitectPlanEntryInput = {
@@ -112,11 +116,31 @@ function validateEntryIdentity(input: ArchitectPlanEntryInput): void {
   if (input.entryKind === 'requirement' && input.entryId !== `requirement:${requirementKey}`) {
     throw new Error('Architect requirement entry ID does not match its requirement key')
   }
+  if (input.entryKind === 'routing') {
+    if (
+      input.entryId !== `routing:${requirementKey}:${agent}`
+      || agent === null
+      || requirementKey === null
+      || input.bindingFingerprint === null
+      || input.projectionEligible
+    ) {
+      throw new Error('Architect routing entry does not match its executable binding')
+    }
+  }
   if (input.entryKind === 'overlay' && input.entryId !== `overlay:${requirementKey}:${agent}`) {
     throw new Error('Architect overlay entry ID does not match its binding')
   }
   if (input.entryKind === 'subtask' && !input.entryId.endsWith(`:${agent}`)) {
     throw new Error('Architect subtask entry ID does not match its agent')
+  }
+  if (input.entryKind === 'clarification_question' || input.entryKind === 'clarification_answer') {
+    const expectedPrefix = `${input.entryKind}:`
+    if (!input.entryId.startsWith(expectedPrefix)
+      || !UUID.test(input.entryId.slice(expectedPrefix.length))
+      || input.agent !== null || input.requirementKey !== null
+      || input.bindingFingerprint !== null || input.projectionEligible) {
+      throw new Error('Architect clarification entry does not match its protected identity')
+    }
   }
   if (input.entryKind === 'legacy_full_plan') {
     if (!/^legacy_full_plan:[0-9]{6}$/.test(input.entryId) || input.projectionEligible) {
@@ -157,7 +181,7 @@ export function materializeArchitectPlanEntries(input: {
   planArtifactId: string
   planVersion: string
   taskId: string
-}): { entries: ArchitectPlanEntryEnvelope[]; entrySetDigest: string } {
+}): { entries: ArchitectPlanEntryEnvelope[]; entrySetDigest: string; structuralSetDigest: string } {
   if (!UUID.test(input.taskId) || !UUID.test(input.planArtifactId)) {
     throw new Error('Architect plan task and artifact IDs must be canonical UUIDs')
   }
@@ -170,10 +194,12 @@ export function materializeArchitectPlanEntries(input: {
   const ids = new Set<string>()
   const entries = input.entries.map((rawEntry) => {
     const entry: ArchitectPlanEntryInput = {
-      ...rawEntry,
       agent: rawEntry.agent?.normalize('NFC') ?? null,
+      bindingFingerprint: rawEntry.bindingFingerprint,
       content: rawEntry.content.normalize('NFC'),
       entryId: rawEntry.entryId.normalize('NFC'),
+      entryKind: rawEntry.entryKind,
+      projectionEligible: rawEntry.projectionEligible,
       requirementKey: rawEntry.requirementKey?.normalize('NFC') ?? null,
     }
     validateEntryIdentity(entry)
@@ -200,7 +226,61 @@ export function materializeArchitectPlanEntries(input: {
     input.digestKey,
     entries.map(({ entryId, contentDigest }) => ({ entryId, contentDigest })),
   )
-  return { entries, entrySetDigest }
+  const structuralEntries = entries.filter((entry) => [
+    'plan_body', 'requirement', 'routing', 'overlay', 'subtask',
+  ].includes(entry.entryKind))
+  const routingByRequirementAgent = new Map(structuralEntries.flatMap((entry) =>
+    entry.entryKind === 'routing' && entry.requirementKey && entry.agent && entry.bindingFingerprint
+      ? [[`${entry.requirementKey}\0${entry.agent}`, entry.bindingFingerprint] as const]
+      : [],
+  ))
+  const completeBindings = structuralEntries.flatMap((entry) => {
+    if (entry.entryKind !== 'subtask') {
+      return entry.bindingFingerprint && entry.agent && entry.requirementKey
+        ? [{ entryId: entry.entryId, agent: entry.agent, requirementKey: entry.requirementKey, bindingFingerprint: entry.bindingFingerprint }]
+        : []
+    }
+    try {
+      const parsed = JSON.parse(entry.content) as { capabilityBindings?: unknown }
+      if (!Array.isArray(parsed.capabilityBindings) || !entry.agent) throw new Error('missing bindings')
+      return parsed.capabilityBindings.map((binding) => {
+        if (!isRecord(binding) || typeof binding.capability !== 'string' || typeof binding.requirementKey !== 'string') {
+          throw new Error('invalid binding')
+        }
+        const bindingFingerprint = routingByRequirementAgent.get(`${binding.requirementKey}\0${entry.agent}`)
+        if (!bindingFingerprint) throw new Error('missing routing')
+        return {
+          entryId: entry.entryId,
+          agent: entry.agent!,
+          requirementKey: binding.requirementKey,
+          capability: binding.capability,
+          bindingFingerprint,
+        }
+      })
+    } catch {
+      throw new Error(`Architect subtask ${entry.entryId} has an incomplete structural binding set`)
+    }
+  }).sort((left, right) => canonicalArchitectPlanJson(left).localeCompare(canonicalArchitectPlanJson(right), 'en'))
+  const structuralSetDigest = hmacDigest(
+    ARCHITECT_PLAN_STRUCTURAL_SET_DOMAIN_V1,
+    input.digestKey,
+    {
+      entries: structuralEntries.map(({
+        agent, bindingFingerprint, content, entryId, entryKind,
+        projectionEligible, requirementKey,
+      }) => ({
+        agent,
+        bindingFingerprint,
+        content,
+        entryId,
+        entryKind,
+        projectionEligible,
+        requirementKey,
+      })),
+      completeBindings,
+    },
+  )
+  return { entries, entrySetDigest, structuralSetDigest }
 }
 
 export function verifyArchitectPlanEntry(input: {

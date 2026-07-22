@@ -187,60 +187,213 @@ export function legacyLeakageRowChanged(row: LegacyLeakageScrubRow): boolean {
   return legacyLeakageRowFingerprint(row) !== legacyLeakageRowFingerprint(sanitizeLegacyLeakageRow(row))
 }
 
-const V2_EVENT_TYPES = new Set([
-  'artifact:created',
-  'approval_gate:created',
-  'approval_gate:decided',
-  'questions:created',
-  'run:completed',
-  'run:failed',
-  'run:progress',
-  'run:started',
-  'task:handoff',
-  'task:log',
-  'task:status',
-  'work_package:handoff',
-  'work_package:status',
-])
+type V2EventFieldValidator = (value: unknown) => boolean
+type V2EventSchema = Readonly<{
+  required: readonly string[]
+  fields: Readonly<Record<string, V2EventFieldValidator>>
+}>
 
-const V2_EVENT_DATA_KEYS = new Set([
-  'agentRunId', 'agentType', 'artifactId', 'artifactType', 'assignedRole', 'attemptNumber',
-  'blocked', 'blockedReason', 'capability', 'capabilityClass', 'checkedAt', 'claimedPackageId',
-  'completedAt', 'costUsd', 'createdAt', 'decision', 'enabled', 'error', 'errorMessage',
-  'eventType', 'gateId', 'gateType', 'health', 'historyAvailable', 'hostRepositoryWrites', 'id', 'inputTokens',
-  'installState', 'level', 'maxAttempts', 'mcpBroker', 'mcpGrantBlock', 'mcpId', 'metadata',
-  'mode', 'modelIdUsed', 'nextAttemptNumber', 'occurredAt', 'outputBytes', 'outputTokens',
-  'primaryMode', 'primaryRecoveryAction', 'progress', 'readyPackageIds', 'repositoryWrites',
-  'reviewBlockReason', 'reviewStatus', 'runId', 'sandboxWrites', 'sequence', 'source', 'stage',
-  'staleRunningRecovery', 'status', 'taskDisposition', 'terminalBlock', 'timestamp', 'title',
-  'type', 'updatedAt', 'warnings', 'workPackageId',
-])
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const SAFE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/
+const WINDOWS_ABSOLUTE_PATH = /(?:^|[\s"'(`])(?:[A-Za-z]:[\\/]|\\\\[A-Za-z0-9._-]+[\\/])/u
+const UNIX_ABSOLUTE_PATH = /(?:^|[\s"'(`])\/(?!\/)(?:[A-Za-z0-9._~-]+\/)+[A-Za-z0-9._~!$&'()+,;=:@%-]+/u
+const RELATIVE_TRAVERSAL = /(?:^|[\s"'(`])\.\.?[\\/][A-Za-z0-9._-]+/u
+const SECRET_TEXT = /(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\bBearer\s+[A-Za-z0-9._~+\/-]+=*|\b(?:api[_-]?key|access[_-]?token|password|passwd|secret)\s*[:=]\s*\S+|\b(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{12,})/iu
+const LOCATOR_TEXT = /(?:\b(?:https?|file|s3|gs|redis|rediss|postgres|postgresql|ssh):\/\/|\barn:aws:|\b(?:storage|host[_-]?resource|root|artifact|plan)[_-]?(?:locator|ref)\s*[:=])/iu
 
-function containsForbiddenV2DataNode(value: unknown, sentinels: readonly string[]): boolean {
-  if (typeof value === 'string') {
-    return sentinels.some((sentinel) => sentinel.length > 0 && value.includes(sentinel))
-  }
-  if (Array.isArray(value)) return value.some((item) => containsForbiddenV2DataNode(item, sentinels))
-  if (value === null || typeof value !== 'object') return false
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
 
-  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    if (!V2_EVENT_DATA_KEYS.has(key)) return true
+function stringContainsForbiddenEvidence(value: string, sentinels: readonly string[]): boolean {
+  return sentinels.some((sentinel) => sentinel.length > 0 && value.includes(sentinel))
+    || WINDOWS_ABSOLUTE_PATH.test(value)
+    || UNIX_ABSOLUTE_PATH.test(value)
+    || RELATIVE_TRAVERSAL.test(value)
+    || SECRET_TEXT.test(value)
+    || LOCATOR_TEXT.test(value)
+}
+
+function containsUnconditionalForbiddenEvidence(value: unknown, sentinels: readonly string[]): boolean {
+  if (typeof value === 'string') return stringContainsForbiddenEvidence(value, sentinels)
+  if (Array.isArray(value)) return value.some((item) => containsUnconditionalForbiddenEvidence(item, sentinels))
+  if (!isRecord(value)) return false
+  return Object.entries(value).some(([key, item]) => {
     const sensitiveKind = classifySensitivePayloadKey(key)
-    if (sensitiveKind === 'snapshot' && isUnknownLegacyDigest(item)) continue
+    if (sensitiveKind !== null && (item === null || isUnknownLegacyDigest(item))) return false
     if (sensitiveKind !== null) return true
-    if (containsForbiddenV2DataNode(item, sentinels)) return true
+    return containsUnconditionalForbiddenEvidence(item, sentinels)
+  })
+}
+
+const uuid: V2EventFieldValidator = (value) => typeof value === 'string' && UUID.test(value)
+const nullableUuid: V2EventFieldValidator = (value) => value === null || uuid(value)
+const token: V2EventFieldValidator = (value) => typeof value === 'string' && SAFE_TOKEN.test(value)
+const timestamp: V2EventFieldValidator = (value) => (
+  typeof value === 'string'
+  && Number.isFinite(Date.parse(value))
+  && new Date(value).toISOString() === value
+)
+const nonNegativeInteger: V2EventFieldValidator = (value) => Number.isSafeInteger(value) && Number(value) >= 0
+const nullableNumber: V2EventFieldValidator = (value) => value === null || (typeof value === 'number' && Number.isFinite(value))
+const boolean: V2EventFieldValidator = (value) => typeof value === 'boolean'
+const nullableBoundedDigest: V2EventFieldValidator = (value) => value === null || isUnknownLegacyDigest(value)
+const uuidArray: V2EventFieldValidator = (value) => Array.isArray(value) && value.length <= 256 && value.every(uuid)
+const emptyArray: V2EventFieldValidator = (value) => Array.isArray(value) && value.length === 0
+
+const V2_ARTIFACT_EVENT_SCHEMAS: readonly V2EventSchema[] = [
+  {
+    required: ['historyAvailable'],
+    fields: { agentRunId: uuid, historyAvailable: (value) => value === true },
+  },
+  {
+    required: ['agentRunId', 'artifactId', 'artifactType', 'createdAt'],
+    // Ordinary artifacts remain available from the authenticated task-detail
+    // route. Durable event history retains only a content-free notification.
+    fields: { agentRunId: uuid, artifactId: uuid, artifactType: token, createdAt: timestamp, workPackageId: uuid },
+  },
+]
+
+const V2_EVENT_SCHEMAS: Readonly<Record<string, V2EventSchema>> = {
+  'approval_gate:created': {
+    required: ['gateId', 'status', 'updatedAt', 'workPackageId'],
+    fields: { gateId: uuid, gateType: token, requiredRole: token, status: token, updatedAt: timestamp, workPackageId: uuid },
+  },
+  'approval_gate:decided': {
+    required: ['gateId', 'status', 'updatedAt', 'workPackageId'],
+    fields: { decision: token, gateId: uuid, gateType: token, requiredRole: token, status: token, updatedAt: timestamp, workPackageId: uuid },
+  },
+  'questions:created': {
+    required: ['questions'],
+    // Prompt/question text is not an allowed durable v2-history field. An empty
+    // array is the only safe notification shape.
+    fields: { questions: emptyArray },
+  },
+  'run:completed': {
+    required: ['runId'],
+    fields: {
+      attemptNumber: nonNegativeInteger, completedAt: timestamp, costUsd: nullableNumber,
+      inputTokens: nullableNumber, outputTokens: nullableNumber, runId: uuid, stage: token,
+      status: token, workPackageId: uuid,
+    },
+  },
+  'run:failed': {
+    required: ['runId'],
+    fields: {
+      attemptNumber: nonNegativeInteger, completedAt: timestamp, errorMessage: nullableBoundedDigest,
+      runId: uuid, stage: token, workPackageId: uuid,
+    },
+  },
+  'run:progress': {
+    required: ['runId', 'outputBytes'],
+    fields: { outputBytes: nonNegativeInteger, runId: uuid },
+  },
+  'run:started': {
+    required: ['runId'],
+    fields: {
+      agentType: token, attemptNumber: nonNegativeInteger, modelIdUsed: token,
+      runId: uuid, stage: token, startedAt: timestamp, workPackageId: uuid,
+    },
+  },
+  'task:handoff': {
+    required: ['status'],
+    fields: {
+      blockedReason: nullableBoundedDigest, claimedPackageId: nullableUuid, readyPackageIds: uuidArray,
+      reviewBlockReason: nullableBoundedDigest, reviewStatus: token, status: token,
+      taskDisposition: token, terminalBlock: boolean,
+    },
+  },
+  'task:log': {
+    required: ['id', 'eventType', 'level', 'sequence'],
+    fields: {
+      createdAt: timestamp, eventType: token, id: uuid, level: token, occurredAt: timestamp,
+      sequence: nonNegativeInteger, source: token,
+    },
+  },
+  'task:status': {
+    required: ['status', 'updatedAt'],
+    fields: { errorMessage: nullableBoundedDigest, status: token, updatedAt: timestamp },
+  },
+  'work_package:handoff': {
+    required: ['runId', 'status', 'workPackageId'],
+    fields: {
+      assignedRole: token, harnessId: nullableUuid, hostRepositoryWrites: boolean,
+      repositoryWrites: boolean, runId: uuid, sandboxWrites: boolean, stage: token,
+      status: token, updatedAt: timestamp, workPackageId: uuid,
+    },
+  },
+  'work_package:status': {
+    required: ['status', 'workPackageId'],
+    fields: {
+      blockedReason: nullableBoundedDigest, status: token, updatedAt: timestamp, workPackageId: uuid,
+    },
+  },
+}
+
+function normalizedEventField(value: unknown): unknown {
+  return value instanceof Date && Number.isFinite(value.getTime())
+    ? value.toISOString()
+    : value
+}
+
+/**
+ * Closed projection used only for durable v2 Redis history. Live SSE may keep
+ * its richer sanitized payload, while replay deliberately carries enough
+ * identity for the UI to refetch current state and no free-form text.
+ */
+export function projectV2TaskEventData(type: string, value: unknown): Record<string, unknown> | null {
+  const source = isRecord(value) ? value : {}
+  if (type === 'questions:created') return { questions: [] }
+  if (type === 'artifact:created') {
+    if (source.historyAvailable === true) {
+      const projected = {
+        ...(uuid(source.agentRunId) ? { agentRunId: source.agentRunId } : {}),
+        historyAvailable: true,
+      }
+      return matchesClosedV2EventSchema(type, projected) ? projected : null
+    }
+    const artifactId = source.artifactId ?? source.id
+    const projected = {
+      ...(uuid(source.agentRunId) ? { agentRunId: source.agentRunId } : {}),
+      ...(uuid(artifactId) ? { artifactId } : {}),
+      ...(token(source.artifactType) ? { artifactType: source.artifactType } : {}),
+      ...(timestamp(normalizedEventField(source.createdAt))
+        ? { createdAt: normalizedEventField(source.createdAt) }
+        : {}),
+      ...(uuid(source.workPackageId) ? { workPackageId: source.workPackageId } : {}),
+    }
+    return matchesClosedV2EventSchema(type, projected) ? projected : null
   }
-  return false
+
+  const schema = V2_EVENT_SCHEMAS[type]
+  if (!schema) return null
+  const projected = Object.fromEntries(Object.entries(schema.fields).flatMap(([key, validate]) => {
+    const candidate = normalizedEventField(source[key])
+    return validate(candidate) ? [[key, candidate]] : []
+  }))
+  return matchesClosedV2EventSchema(type, projected) ? projected : null
+}
+
+function matchesClosedV2EventSchema(type: string, data: Record<string, unknown>): boolean {
+  const schemas = type === 'artifact:created'
+    ? V2_ARTIFACT_EVENT_SCHEMAS
+    : V2_EVENT_SCHEMAS[type] ? [V2_EVENT_SCHEMAS[type]] : []
+  return schemas.some((schema) => {
+    const keys = Object.keys(data)
+    if (keys.some((key) => !Object.hasOwn(schema.fields, key))) return false
+    if (schema.required.some((key) => !Object.hasOwn(data, key))) return false
+    return keys.every((key) => schema.fields[key](data[key]))
+  })
 }
 
 /** A fixed structural allowlist for the persisted v2 Redis event envelope. */
 export function containsForbiddenV2EventData(value: unknown, sentinels: readonly string[] = []): boolean {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return true
-  const envelope = value as Record<string, unknown>
+  if (!isRecord(value)) return true
+  const envelope = value
   if (Object.keys(envelope).some((key) => key !== 'type' && key !== 'data')) return true
-  if (typeof envelope.type !== 'string' || !V2_EVENT_TYPES.has(envelope.type)) return true
-  if (envelope.data === null || typeof envelope.data !== 'object' || Array.isArray(envelope.data)) return true
-  return containsForbiddenV2DataNode(envelope.data, sentinels)
+  if (typeof envelope.type !== 'string' || !isRecord(envelope.data)) return true
+  if (containsUnconditionalForbiddenEvidence(envelope.data, sentinels)) return true
+  return !matchesClosedV2EventSchema(envelope.type, envelope.data)
 }
 
 function validateBoundedInteger(name: string, value: number, maximum: number): void {

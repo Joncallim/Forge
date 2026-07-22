@@ -921,6 +921,12 @@ describe('MCP execution design normalization', () => {
       const pkg = rows.workPackages.find((candidate) => candidate.assignedRole === 'backend')
       expect(pkg).toBeDefined()
       const metadata = pkg!.metadata as Record<string, unknown>
+      if (!blocked) {
+        metadata.architectPlanEntryRegistrationIds = [
+          '00000000-0000-4000-8000-000000000204',
+          '00000000-0000-4000-8000-000000000205',
+        ]
+      }
       const broker = evaluateWorkPackageMcpBroker({
         assignedRole: pkg!.assignedRole,
         mcpOverview,
@@ -964,7 +970,8 @@ describe('MCP execution design normalization', () => {
           eligibleReferenceCount: 2,
           protectedCoverageComplete: true,
         })
-        expect(metadata.architectPlanEntryReferences).toHaveLength(2)
+        expect(metadata).not.toHaveProperty('architectPlanEntryReferences')
+        expect(metadata.architectPlanEntryRegistrationIds).toHaveLength(2)
         expect(metadata).not.toHaveProperty('promptOverlay')
         expect(metadata).not.toHaveProperty('requirementContexts')
         expect(firstOverlay.length + 1 + secondOverlay.length).toBe(expectedLength)

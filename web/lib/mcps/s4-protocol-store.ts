@@ -38,9 +38,11 @@ export type ArchitectPlanStorageConfiguration =
  */
 export function architectPlanStorageConfiguration(
   environment: NodeJS.ProcessEnv = process.env,
+  authoritativeMode?: 'legacy' | 'protected',
 ): ArchitectPlanStorageConfiguration {
+  if (authoritativeMode === 'legacy') return { mode: 'legacy' }
   const configured = ARCHITECT_PLAN_PROTECTION_ENV.filter((name) => Boolean(environment[name]?.trim()))
-  if (configured.length === 0) return { mode: 'legacy' }
+  if (configured.length === 0 && authoritativeMode !== 'protected') return { mode: 'legacy' }
   if (configured.length !== ARCHITECT_PLAN_PROTECTION_ENV.length) {
     const missing = ARCHITECT_PLAN_PROTECTION_ENV.filter((name) => !environment[name]?.trim())
     throw new S4ProtocolStoreError(
@@ -103,7 +105,7 @@ export async function recordArchitectPlanVersion(input: {
   entries: readonly ArchitectPlanEntryInput[]
   planVersion: string
   taskId: string
-}): Promise<{ artifactId: string; entries: ArchitectPlanEntryEnvelope[]; entrySetDigest: string }> {
+}): Promise<{ artifactId: string; entries: ArchitectPlanEntryEnvelope[]; entrySetDigest: string; structuralSetDigest: string }> {
   const artifactId = randomUUID()
   const materialized = materializeArchitectPlanEntries({
     digestKey: input.digestKey,
@@ -121,6 +123,7 @@ export async function recordArchitectPlanVersion(input: {
         ${input.planVersion}::bigint,
         ${input.digestKeyId}::text,
         ${materialized.entrySetDigest}::text,
+        ${materialized.structuralSetDigest}::text,
         ${sql.array(materialized.entries.map((entry) => entry.entryId), 1009)}::text[],
         ${sql.array(materialized.entries.map((entry) => entry.entryKind), 1009)}::text[],
         ${sql.array(materialized.entries.map((entry) => entry.agent), 1009)}::text[],
@@ -149,7 +152,7 @@ export async function resolveArchitectPlanEntry(input: {
       reference?: never
       taskId?: never
     }
-)): Promise<{ content: string; entryId: string }> {
+)): Promise<ArchitectPlanEntryInput> {
   const suppliedReference = input.expectedPurpose === 'architect_replan'
     ? null
     : parseArchitectPlanEntryReference(input.reference)
@@ -228,19 +231,20 @@ export async function resolveArchitectPlanEntry(input: {
         || JSON.stringify(returnedReference) !== JSON.stringify(suppliedReference)
       )) ||
       (expectedPurpose === 'package_specialist' && !row.projectionEligible) ||
-      (expectedPurpose === 'architect_replan' && (
-        row.entryKind !== 'plan_body'
-        || row.entryId !== 'plan_body:000000'
-        || row.agent !== null
-        || row.requirementKey !== null
-        || row.bindingFingerprint !== null
-        || row.projectionEligible
-      )) ||
+      (expectedPurpose === 'architect_replan' && row.entryKind === 'legacy_full_plan') ||
       !verifyArchitectPlanEntry({ digestKey: input.digestKey, entry: envelope })
     ) {
       throw new S4ProtocolStoreError('invalid_evidence', 'The resolved Architect plan entry did not match its protected digest.')
     }
-    return { entryId: row.entryId, content: row.content }
+    return {
+      agent: row.agent,
+      bindingFingerprint: row.bindingFingerprint,
+      content: row.content,
+      entryId: row.entryId,
+      entryKind: row.entryKind,
+      projectionEligible: row.projectionEligible,
+      requirementKey: row.requirementKey,
+    }
   })
 }
 
@@ -263,6 +267,55 @@ export async function bindArchitectReplanEntry(input: {
       throw new S4ProtocolStoreError('conflict', 'Architect replan binding failed closed.')
     }
     return rows[0].referenceId
+  })
+}
+
+export type ArchitectReplanContextReference = {
+  referenceId: string
+  entryId: string
+  entryKind: Exclude<ArchitectPlanEntryEnvelope['entryKind'], 'legacy_full_plan'>
+}
+
+export async function bindArchitectReplanContext(input: {
+  agentRunId: string
+  priorPlanArtifactId: string
+}): Promise<ArchitectReplanContextReference[]> {
+  return withDedicatedClient('FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL', async (sql) => {
+    const rows = await sql<{ referenceId: string; entryId: string; entryKind: string }[]>`
+      select reference_id as "referenceId", entry_id as "entryId", entry_kind as "entryKind"
+      from forge.bind_architect_replan_context_v2(
+        ${input.agentRunId}::uuid,
+        ${input.priorPlanArtifactId}::uuid
+      )
+    `
+    const sorted = [...rows].sort((left, right) => left.entryId.localeCompare(right.entryId, 'en'))
+    const ids = new Set<string>()
+    let planBodies = 0
+    for (const row of sorted) {
+      const valid = row.entryKind === 'plan_body'
+        ? row.entryId === 'plan_body:000000'
+        : row.entryKind === 'requirement'
+          ? row.entryId.startsWith('requirement:')
+          : row.entryKind === 'routing'
+            ? row.entryId.startsWith('routing:')
+            : row.entryKind === 'overlay'
+              ? row.entryId.startsWith('overlay:')
+              : row.entryKind === 'subtask'
+                ? row.entryId.startsWith('subtask:')
+                : row.entryKind === 'clarification_question'
+                  ? /^clarification_question:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(row.entryId)
+                  : row.entryKind === 'clarification_answer'
+                    && /^clarification_answer:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(row.entryId)
+      if (!valid || ids.has(row.entryId)) {
+        throw new S4ProtocolStoreError('invalid_evidence', 'Architect replan context binding returned an invalid entry set.')
+      }
+      ids.add(row.entryId)
+      if (row.entryKind === 'plan_body') planBodies += 1
+    }
+    if (planBodies !== 1) {
+      throw new S4ProtocolStoreError('conflict', 'Architect replan context binding did not return one plan body.')
+    }
+    return sorted as ArchitectReplanContextReference[]
   })
 }
 
@@ -297,6 +350,130 @@ export async function bindArchitectPlanEntry(input: {
       throw new S4ProtocolStoreError('conflict', 'Claim binding failed: the entry reference could not be created.')
     }
     return rows[0].referenceId
+  })
+}
+
+export type ProtectedPackageEntryRegistrationInput = {
+  workPackageId: string
+  entryId: string
+  bindingSetDigest: string
+  capabilities: readonly {
+    capability: string
+    requirementKey: string
+    routingFingerprint: string
+  }[]
+}
+
+export async function registerPackagePlanEntries(input: {
+  taskId: string
+  sourceArtifactId: string
+  sourcePlanVersion: string
+  registrations: readonly ProtectedPackageEntryRegistrationInput[]
+}): Promise<string[]> {
+  if (input.registrations.length === 0) return []
+  const capabilities = input.registrations.flatMap((registration) => registration.capabilities)
+  const offsets = [0]
+  for (const registration of input.registrations) {
+    offsets.push(offsets.at(-1)! + registration.capabilities.length)
+  }
+  return withDedicatedClient('FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL', async (sql) => {
+    const [row] = await sql<{ registrationIds: string[] }[]>`
+      select forge.register_package_plan_entries_v1(
+        ${input.taskId}::uuid, ${input.sourceArtifactId}::uuid,
+        ${input.sourcePlanVersion}::bigint,
+        ${sql.array(input.registrations.map((entry) => entry.workPackageId), 2950)}::uuid[],
+        ${sql.array(input.registrations.map((entry) => entry.entryId), 1009)}::text[],
+        ${sql.array(input.registrations.map((entry) => entry.bindingSetDigest), 1009)}::text[],
+        ${sql.array(offsets, 1007)}::integer[],
+        ${sql.array(capabilities.map((binding) => binding.capability), 1009)}::text[],
+        ${sql.array(capabilities.map((binding) => binding.requirementKey), 1009)}::text[],
+        ${sql.array(capabilities.map((binding) => binding.routingFingerprint), 1009)}::text[]
+      ) as "registrationIds"
+    `
+    if (!row || row.registrationIds.length !== input.registrations.length) {
+      throw new S4ProtocolStoreError('conflict', 'Protected package entry registration was incomplete.')
+    }
+    return row.registrationIds
+  })
+}
+
+export async function bindRegisteredArchitectPlanEntry(input: {
+  registrationId: string
+  agentRunId: string
+}): Promise<string> {
+  return withDedicatedClient('FORGE_PACKET_ISSUER_DATABASE_URL', async (sql) => {
+    const [row] = await sql<{ referenceId: string }[]>`
+      select forge.bind_architect_plan_entry_v2(
+        ${input.registrationId}::uuid, ${input.agentRunId}::uuid
+      ) as "referenceId"
+    `
+    if (!row?.referenceId) {
+      throw new S4ProtocolStoreError('conflict', 'Registered Architect entry binding failed closed.')
+    }
+    return row.referenceId
+  })
+}
+
+export async function resolveRegisteredArchitectPlanEntry(input: {
+  digestKey: Buffer
+  referenceId: string
+  taskId: string
+}): Promise<ArchitectPlanEntryInput> {
+  return withDedicatedClient('FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL', async (sql) => {
+    const [row] = await sql<{
+      agent: string | null
+      bindingFingerprint: string | null
+      content: string
+      contentDigest: string
+      digestKeyId: string
+      entryId: string
+      entryKind: ArchitectPlanEntryEnvelope['entryKind']
+      planArtifactId: string
+      planVersion: string
+      projectionEligible: boolean
+      purpose: string
+      requirementKey: string | null
+      taskId: string
+    }[]>`
+      select purpose, task_id as "taskId", plan_artifact_id as "planArtifactId",
+        plan_version::text as "planVersion", entry_id as "entryId",
+        entry_kind as "entryKind", agent, requirement_key as "requirementKey",
+        binding_fingerprint as "bindingFingerprint", content,
+        content_digest as "contentDigest", digest_key_id as "digestKeyId",
+        projection_eligible as "projectionEligible"
+      from forge.resolve_architect_plan_entry_v1(${input.referenceId}::uuid)
+    `
+    if (!row || row.purpose !== 'package_specialist' || row.taskId !== input.taskId
+      || !row.projectionEligible || !['overlay', 'subtask'].includes(row.entryKind)) {
+      throw new S4ProtocolStoreError('invalid_evidence', 'Registered Architect plan content was unavailable or ineligible.')
+    }
+    const envelope: ArchitectPlanEntryEnvelope = {
+      schemaVersion: 1,
+      taskId: row.taskId,
+      planArtifactId: row.planArtifactId,
+      planVersion: row.planVersion,
+      entryId: row.entryId,
+      entryKind: row.entryKind,
+      agent: row.agent,
+      requirementKey: row.requirementKey,
+      bindingFingerprint: row.bindingFingerprint,
+      content: row.content,
+      contentDigest: row.contentDigest,
+      digestKeyId: row.digestKeyId,
+      projectionEligible: row.projectionEligible,
+    }
+    if (!verifyArchitectPlanEntry({ digestKey: input.digestKey, entry: envelope })) {
+      throw new S4ProtocolStoreError('invalid_evidence', 'Registered Architect plan content failed its protected digest.')
+    }
+    return {
+      agent: row.agent,
+      bindingFingerprint: row.bindingFingerprint,
+      content: row.content,
+      entryId: row.entryId,
+      entryKind: row.entryKind,
+      projectionEligible: row.projectionEligible,
+      requirementKey: row.requirementKey,
+    }
   })
 }
 

@@ -1,11 +1,27 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { sql as drizzleSql } from 'drizzle-orm'
 import postgres from 'postgres'
+import { db } from '@/db'
 import type {
   PacketRedactionSummary,
   PacketTerminalOutcome,
 } from './packet-issuance-v2'
+import { fixedDatabaseRoleUrl } from './fixed-database-url'
 
 export type S4LeaseLeaseKind = 'execution' | 'local_evidence' | 'issuance'
+
+export const S4_PROTECTED_RUNTIME_ENV = [
+  'FORGE_PACKET_ISSUER_DATABASE_URL',
+  'FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL',
+  'FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL',
+  'FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL',
+  'FORGE_REVIEW_SOURCE_RESOLVER_DATABASE_URL',
+  'FORGE_S4_RECOVERY_OPERATOR_DATABASE_URL',
+  'FORGE_TASK_EVENT_PUBLISHER_REDIS_URL',
+  'FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL',
+  'FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX',
+  'FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID',
+] as const
 
 export const S4_LEASE_DEFAULTS: Record<S4LeaseLeaseKind, {
   ttlSeconds: number
@@ -54,6 +70,31 @@ export type S4LinkedRecoveryResult =
   | 'repaired_terminal_success'
   | 'repaired_terminal_failure'
 
+export type S4CompletionHandoffDiscovery = {
+  agentRunId: string
+  localRunEvidenceId: string
+  runtimeAuditId: string | null
+  sourceArtifactId: string
+  handoffState: string
+}
+
+export type S4CompletionHandoffClaim = S4CompletionHandoffDiscovery & {
+  handoffId: string
+  workPackageId: string
+  taskId: string
+  reviewRequirement: string
+  createdAt: Date
+  claimGeneration: string
+  leaseExpiresAt: Date
+}
+
+export type S4OperatorRecoveryResult = {
+  actionId: string
+  result: string
+  resultMarkerFingerprint: string | null
+  packageStatus: string
+}
+
 export function claimS4LeaseToken(input: {
   kind: S4LeaseLeaseKind
   workPackageId: string
@@ -83,6 +124,8 @@ type WorkPackageClaimBase = {
   harnessId: string | null
   attemptNumber: number
   providerConfigId: string | null
+  providerConfigUpdatedAt: Date | null
+  acpExecutionMode: 'not_applicable' | 'unconfined_host_process'
   modelIdUsed: string
   stage: string | null
   executionStaleSeconds: number
@@ -147,14 +190,76 @@ async function withIssuer<T>(operation: (sql: ReturnType<typeof postgres>) => Pr
   }
 }
 
-export async function readS4RuntimeModeV1(): Promise<'legacy' | 'protected'> {
-  return withIssuer(async (sql) => {
-    const [row] = await sql<{ mode: 'legacy' | 'protected' }[]>`
-      select forge.s4_runtime_mode_v1() as mode
-    `
-    if (!row) throw new S4LifecycleError('invalid_evidence', 'The S4 runtime mode was unavailable.')
-    return row.mode
+function recoveryOperatorUrl(): string {
+  try {
+    return fixedDatabaseRoleUrl({
+      environmentName: 'FORGE_S4_RECOVERY_OPERATOR_DATABASE_URL',
+      expectedUsername: 'forge_s4_recovery_operator',
+      value: process.env.FORGE_S4_RECOVERY_OPERATOR_DATABASE_URL,
+    })
+  } catch {
+    throw new S4LifecycleError('configuration', 'The S4 recovery-operator database URL is not configured safely.')
+  }
+}
+
+async function withRecoveryOperator<T>(operation: (sql: ReturnType<typeof postgres>) => Promise<T>): Promise<T> {
+  const sql = postgres(recoveryOperatorUrl(), {
+    max: 1,
+    prepare: true,
+    onnotice: () => {},
+    transform: { undefined: null },
   })
+  try {
+    return await operation(sql)
+  } catch (error) {
+    if (error instanceof S4LifecycleError) throw error
+    const databaseCode = typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as { code?: unknown }).code)
+      : ''
+    throw new S4LifecycleError(
+      databaseCode === '40001' || databaseCode === '23505' ? 'conflict' : 'invalid_evidence',
+      'The protected S4 recovery operation failed closed.',
+    )
+  } finally {
+    await sql.end({ timeout: 5 })
+  }
+}
+
+export async function readS4RuntimeModeV1(): Promise<'legacy' | 'protected'> {
+  const configured = S4_PROTECTED_RUNTIME_ENV.filter((name) => Boolean(process.env[name]?.trim()))
+  let rows: { mode: string }[]
+  try {
+    rows = await db.execute<{ mode: string }>(drizzleSql`
+      select forge.read_s4_runtime_mode_for_application_v1() as mode
+    `)
+  } catch (error) {
+    // Old databases with no S4 authority reader remain compatible only when no
+    // protected credential has been provisioned. Once provisioning starts, an
+    // unavailable authority is ambiguous and must fail closed.
+    const code = typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as { code?: unknown }).code)
+      : ''
+    if (configured.length === 0 && code === '42883') return 'legacy'
+    throw new S4LifecycleError(
+      configured.length > 0 ? 'configuration' : 'invalid_evidence',
+      'The authoritative S4 runtime mode is unavailable.',
+    )
+  }
+
+  const mode = rows.length === 1 ? rows[0]?.mode : null
+  if (mode === 'legacy') return 'legacy'
+  if (mode !== 'protected') {
+    throw new S4LifecycleError('invalid_evidence', 'The authoritative S4 runtime mode was invalid.')
+  }
+
+  if (configured.length !== S4_PROTECTED_RUNTIME_ENV.length) {
+    const missing = S4_PROTECTED_RUNTIME_ENV.filter((name) => !process.env[name]?.trim())
+    throw new S4LifecycleError(
+      'configuration',
+      `Protected S4 runtime is active but its credential set is incomplete; missing ${missing.join(', ')}.`,
+    )
+  }
+  return 'protected'
 }
 
 /**
@@ -197,7 +302,9 @@ export async function claimWorkPackageLifecycleV2(
         ${input.mode}::text, ${input.taskId}::uuid, ${input.workPackageId}::uuid,
         ${input.expectedPackageUpdatedAt}::timestamptz, ${input.agentRunId}::uuid,
         ${input.agentType}::text, ${input.harnessId}::uuid, ${input.attemptNumber}::integer,
-        ${input.providerConfigId}::uuid, ${input.modelIdUsed}::text, ${input.stage}::text,
+        ${input.providerConfigId}::uuid, ${input.modelIdUsed}::text,
+        ${input.providerConfigUpdatedAt}::timestamptz, ${input.acpExecutionMode}::text,
+        ${input.stage}::text,
         ${input.executionStaleSeconds}::integer, ${decisionId}::uuid,
         ${localClaimToken}::uuid, ${packetClaimToken}::uuid,
         ${localLeaseSeconds}::integer, ${packetLeaseSeconds}::integer,
@@ -406,6 +513,156 @@ export async function recoverLinkedS4LifecycleV2(input: {
       from forge.recover_linked_s4_lifecycle_v2(${input.agentRunId}::uuid)
     `
     if (!row) throw new S4LifecycleError('conflict', 'The linked S4 recovery had no result.')
+    return row
+  })
+}
+
+export async function discoverS4CompletionHandoffV1(input: {
+  workPackageId: string
+}): Promise<S4CompletionHandoffDiscovery | null> {
+  return withIssuer(async (sql) => {
+    const rows = await sql<S4CompletionHandoffDiscovery[]>`
+      select agent_run_id as "agentRunId",
+        local_run_evidence_id as "localRunEvidenceId",
+        runtime_audit_id as "runtimeAuditId",
+        source_artifact_id as "sourceArtifactId",
+        handoff_state as "handoffState"
+      from forge.discover_s4_completion_handoff_v1(${input.workPackageId}::uuid)
+    `
+    if (rows.length > 1) {
+      throw new S4LifecycleError('invalid_evidence', 'The S4 completion handoff discovery was ambiguous.')
+    }
+    return rows[0] ?? null
+  })
+}
+
+export async function materializeS4CompletionHandoffV1(input: {
+  agentRunId: string
+  requiredGateTypes: readonly string[]
+}): Promise<{ packageStatus: string; sourceArtifactId: string }> {
+  const requiredGateTypes = [...new Set(input.requiredGateTypes)].sort()
+  return withIssuer(async (sql) => {
+    const [row] = await sql<{ packageStatus: string; sourceArtifactId: string }[]>`
+      select package_status as "packageStatus", source_artifact_id as "sourceArtifactId"
+      from forge.materialize_s4_completion_handoff_v1(
+        ${input.agentRunId}::uuid,
+        ${sql.array(requiredGateTypes, 1009)}::text[]
+      )
+    `
+    if (!row) throw new S4LifecycleError('conflict', 'The S4 completion handoff was not materialized.')
+    return row
+  })
+}
+
+export async function claimPendingS4CompletionHandoffsV1(input: {
+  workerId: string
+  claimToken: string
+  leaseSeconds?: number
+  limit?: number
+}): Promise<S4CompletionHandoffClaim[]> {
+  const leaseSeconds = input.leaseSeconds ?? 30
+  const limit = input.limit ?? 100
+  return withIssuer(async (sql) => sql<S4CompletionHandoffClaim[]>`
+    select handoff_id as "handoffId", agent_run_id as "agentRunId",
+      work_package_id as "workPackageId", task_id as "taskId",
+      local_run_evidence_id as "localRunEvidenceId",
+      runtime_audit_id as "runtimeAuditId", source_artifact_id as "sourceArtifactId",
+      handoff_state as "handoffState", review_requirement as "reviewRequirement",
+      created_at as "createdAt", claim_generation::text as "claimGeneration",
+      lease_expires_at as "leaseExpiresAt"
+    from forge.claim_pending_s4_completion_handoffs_v1(
+      ${input.workerId}::text, ${input.claimToken}::uuid,
+      ${leaseSeconds}::integer, ${limit}::integer
+    )
+  `)
+}
+
+export async function materializeClaimedS4CompletionHandoffV1(input: {
+  agentRunId: string
+  requiredGateTypes: readonly string[]
+  workerId: string
+  claimToken: string
+  claimGeneration: string
+}): Promise<{ packageStatus: string; sourceArtifactId: string }> {
+  const requiredGateTypes = [...new Set(input.requiredGateTypes)].sort()
+  return withIssuer(async (sql) => {
+    const [row] = await sql<{ packageStatus: string; sourceArtifactId: string }[]>`
+      select package_status as "packageStatus", source_artifact_id as "sourceArtifactId"
+      from forge.materialize_claimed_s4_completion_handoff_v1(
+        ${input.agentRunId}::uuid, ${sql.array(requiredGateTypes, 1009)}::text[],
+        ${input.workerId}::text, ${input.claimToken}::uuid,
+        ${input.claimGeneration}::bigint
+      )
+    `
+    if (!row) throw new S4LifecycleError('conflict', 'The claimed S4 completion handoff was not materialized.')
+    return row
+  })
+}
+
+export async function finalizeS4MaxAttemptsV1(input: {
+  taskId: string
+  workPackageId: string
+  expectedPackageUpdatedAt: Date
+  maxAttempts: number
+}): Promise<boolean> {
+  return withIssuer(async (sql) => {
+    const [row] = await sql<{ finalized: boolean }[]>`
+      select forge.finalize_s4_max_attempts_v1(
+        ${input.taskId}::uuid, ${input.workPackageId}::uuid,
+        ${input.expectedPackageUpdatedAt}::timestamptz,
+        ${input.maxAttempts}::integer
+      ) as finalized
+    `
+    return row?.finalized === true
+  })
+}
+
+export async function applyLocalEffectRecoveryActionV2(input: {
+  taskId: string
+  workPackageId: string
+  localRunEvidenceId: string
+  action: string
+  expectedMarkerFingerprint: string
+  actorUserId: string
+}): Promise<S4OperatorRecoveryResult> {
+  return withRecoveryOperator(async (sql) => {
+    const [row] = await sql<S4OperatorRecoveryResult[]>`
+      select action_id as "actionId", result,
+        result_marker_fingerprint as "resultMarkerFingerprint",
+        package_status as "packageStatus"
+      from forge.apply_local_effect_recovery_action_v2(
+        ${input.taskId}::uuid, ${input.workPackageId}::uuid,
+        ${input.localRunEvidenceId}::uuid, ${input.action}::text,
+        ${input.expectedMarkerFingerprint}::text, ${input.actorUserId}::uuid
+      )
+    `
+    if (!row) throw new S4LifecycleError('conflict', 'The local-effect recovery action had no result.')
+    return row
+  })
+}
+
+export async function applyPacketIssuanceRecoveryActionV2(input: {
+  taskId: string
+  workPackageId: string
+  priorRuntimeAuditId: string
+  action: string
+  expectedMarkerFingerprint: string
+  actorUserId: string
+  authorizingDecisionId?: string | null
+}): Promise<S4OperatorRecoveryResult> {
+  return withRecoveryOperator(async (sql) => {
+    const [row] = await sql<S4OperatorRecoveryResult[]>`
+      select action_id as "actionId", result,
+        result_marker_fingerprint as "resultMarkerFingerprint",
+        package_status as "packageStatus"
+      from forge.apply_packet_issuance_recovery_action_v2(
+        ${input.taskId}::uuid, ${input.workPackageId}::uuid,
+        ${input.priorRuntimeAuditId}::uuid, ${input.action}::text,
+        ${input.expectedMarkerFingerprint}::text, ${input.actorUserId}::uuid,
+        ${input.authorizingDecisionId ?? null}::uuid
+      )
+    `
+    if (!row) throw new S4LifecycleError('conflict', 'The packet recovery action had no result.')
     return row
   })
 }

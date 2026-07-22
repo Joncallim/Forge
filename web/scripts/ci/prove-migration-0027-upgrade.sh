@@ -30,6 +30,8 @@ npm run db:migrate
 psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 \
   --set migration_principal="${migration_principal}" \
   --file scripts/ci/sql/migration-0027-expansion-assertions.sql
+psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 \
+  --file scripts/ci/sql/migration-0027-archive-assertions.sql
 
 echo 'Reconciling the legacy Redis session with its exact absolute expiry.'
 npm run session-credentials:reconcile

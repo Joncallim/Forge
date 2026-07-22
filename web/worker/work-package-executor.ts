@@ -7,7 +7,12 @@ import { promisify } from 'node:util'
 import { and, eq } from 'drizzle-orm'
 import { db } from '../db'
 import { agentConfigs, filesystemMcpRuntimeAudits, projects, tasks, type Task, workPackages } from '../db/schema'
-import { getModel, getProvider } from '../lib/providers/registry'
+import {
+  getModel,
+  getProvider,
+  providerExecutionSnapshot,
+  type ProviderExecutionSnapshot,
+} from '../lib/providers/registry'
 import { resolveDefaultProvider } from '../lib/providers/default'
 import { assertProjectLocalPathForExecution } from '../lib/projects/local-path'
 import {
@@ -30,13 +35,9 @@ import {
 import type { PacketTerminalOutcome } from '../lib/mcps/packet-issuance-v2'
 import {
   architectPlanStorageConfiguration,
-  bindArchitectPlanEntry,
-  resolveArchitectPlanEntry,
+  bindRegisteredArchitectPlanEntry,
+  resolveRegisteredArchitectPlanEntry,
 } from '../lib/mcps/s4-protocol-store'
-import {
-  parseArchitectPlanEntryReference,
-  type ArchitectPlanEntryReference,
-} from '../lib/mcps/architect-plan-entries'
 import {
   buildEmptyExecutionContextPacket,
   buildExecutionContextPacket,
@@ -105,6 +106,7 @@ export type WorkPackageExecutionContext = {
   modelIdUsed: string
   providerConnector?: string
   providerConfigId?: string | null
+  providerExecutionSnapshot?: ProviderExecutionSnapshot
   project: ProjectRow
   projectFilesystemDecision?: ProjectFilesystemDecisionAuthority | null
   priorReviewContext?: WorkPackagePriorReviewContext
@@ -1867,6 +1869,7 @@ export async function loadWorkPackageExecutionPreflight(
     modelIdUsed: provider.config.modelId,
     providerConnector: `${provider.config.displayName} (${provider.config.providerType})`,
     providerConfigId,
+    providerExecutionSnapshot: providerExecutionSnapshot(provider.config),
     project: row.project,
     projectFilesystemDecision,
     filesystemRuntime,
@@ -1892,33 +1895,31 @@ export async function activateWorkPackageExecutionContext(
   }
 }
 
-function protectedPlanEntryReferences(metadata: unknown): ArchitectPlanEntryReference[] {
-  if (!isRecord(metadata) || !Object.hasOwn(metadata, 'architectPlanEntryReferences')) return []
-  const rawReferences = metadata.architectPlanEntryReferences
-  if (!Array.isArray(rawReferences) || rawReferences.length === 0 || rawReferences.length > MAX_PROTECTED_PLAN_ENTRY_REFERENCES) {
-    throw new Error('Protected Architect prompt context has an invalid reference set.')
+function protectedPlanEntryRegistrationIds(metadata: unknown): string[] {
+  if (!isRecord(metadata)) return []
+  if (Object.hasOwn(metadata, 'architectPlanEntryReferences')) {
+    throw new Error('Legacy mutable Architect plan references are not protected execution authority.')
   }
-
-  const references = rawReferences.map((rawReference, index) => {
-    const reference = parseArchitectPlanEntryReference(rawReference)
-    if (!reference || reference.requirementKey === null || reference.bindingFingerprint === null) {
-      throw new Error(`Protected Architect prompt context reference ${index} is malformed or ineligible.`)
+  if (Object.hasOwn(metadata, 'architectPlanEntryRegistrations')) {
+    throw new Error('Mutable Architect plan registration requirements are not protected execution authority.')
+  }
+  if (!Object.hasOwn(metadata, 'architectPlanEntryRegistrationIds')) return []
+  const rawRegistrationIds = metadata.architectPlanEntryRegistrationIds
+  if (!Array.isArray(rawRegistrationIds) || rawRegistrationIds.length === 0
+    || rawRegistrationIds.length > MAX_PROTECTED_PLAN_ENTRY_REFERENCES) {
+    throw new Error('Protected Architect prompt context has an invalid registration set.')
+  }
+  const ids = rawRegistrationIds.map((registrationId) => {
+    if (typeof registrationId !== 'string'
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(registrationId)) {
+      throw new Error('Protected Architect prompt context has an invalid registration set.')
     }
-    return reference
+    return registrationId
   })
-  const identities = references.map((reference) => [
-    reference.planArtifactId,
-    reference.planVersion,
-    reference.entryId,
-    reference.contentDigest,
-  ].join('\0'))
-  if (new Set(identities).size !== identities.length) {
-    throw new Error('Protected Architect prompt context contains duplicate references.')
+  if (new Set(ids).size !== ids.length) {
+    throw new Error('Protected Architect prompt context has an invalid registration set.')
   }
-  if (new Set(references.map((reference) => `${reference.planArtifactId}\0${reference.planVersion}`)).size !== 1) {
-    throw new Error('Protected Architect prompt context spans multiple plan versions.')
-  }
-  return references
+  return ids.sort()
 }
 
 function parseProtectedSubtask(content: string, entryId: string): Record<string, unknown> {
@@ -1949,52 +1950,35 @@ export async function resolveProtectedArchitectPlanContext(
   const metadata = isRecord(preflight.workPackage.metadata)
     ? preflight.workPackage.metadata
     : {}
-  const references = protectedPlanEntryReferences(metadata)
-  if (references.length === 0) return preflight
+  const registrationIds = protectedPlanEntryRegistrationIds(metadata)
+  if (registrationIds.length === 0) return preflight
 
-  const storage = architectPlanStorageConfiguration()
+  const storage = architectPlanStorageConfiguration(process.env, 'protected')
   if (storage.mode !== 'protected') {
     throw new Error('Protected Architect prompt context is present but its resolver configuration is missing.')
   }
-  if (references.some((reference) => reference.digestKeyId !== storage.digestKeyId)) {
-    throw new Error('Protected Architect prompt context requires an unavailable digest key.')
-  }
-
   const overlayFragments: string[] = []
   const subtasks: Record<string, unknown>[] = []
-  for (const reference of references) {
+  for (const registrationId of registrationIds) {
     await input.assertS4LifecycleOwned?.()
-    const referenceId = await bindArchitectPlanEntry({
+    const referenceId = await bindRegisteredArchitectPlanEntry({
       agentRunId: input.agentRunId,
-      bindingFingerprint: reference.bindingFingerprint!,
-      contentDigest: reference.contentDigest,
-      digestKeyId: reference.digestKeyId,
-      entryId: reference.entryId,
-      planArtifactId: reference.planArtifactId,
-      planVersion: reference.planVersion,
-      requirementKey: reference.requirementKey!,
-      taskId: preflight.task.id,
-      workPackageId: preflight.workPackage.id,
+      registrationId,
     })
     await input.assertS4LifecycleOwned?.()
-    const resolved = await resolveArchitectPlanEntry({
+    const resolved = await resolveRegisteredArchitectPlanEntry({
       digestKey: storage.digestKey,
-      expectedPurpose: 'package_specialist',
-      reference,
       referenceId,
       taskId: preflight.task.id,
     })
-    if (resolved.entryId !== reference.entryId) {
-      throw new Error('Protected Architect prompt context resolved the wrong entry.')
-    }
-    if (reference.entryId.startsWith('subtask:')) {
-      subtasks.push(parseProtectedSubtask(resolved.content, reference.entryId))
-    } else if (reference.entryId.startsWith('overlay:') || reference.entryId.startsWith('requirement:')) {
+    if (resolved.entryId.startsWith('subtask:')) {
+      subtasks.push(parseProtectedSubtask(resolved.content, resolved.entryId))
+    } else if (resolved.entryId.startsWith('overlay:')) {
       const fragment = resolved.content.trim()
-      if (fragment === '') throw new Error(`Protected Architect prompt context ${reference.entryId} resolved empty content.`)
+      if (fragment === '') throw new Error(`Protected Architect prompt context ${resolved.entryId} resolved empty content.`)
       overlayFragments.push(fragment)
     } else {
-      throw new Error(`Protected Architect prompt context reference ${reference.entryId} has an unsupported entry kind.`)
+      throw new Error(`Protected Architect prompt context registration resolved unsupported entry ${resolved.entryId}.`)
     }
   }
   await input.assertS4LifecycleOwned?.()
@@ -2004,7 +1988,7 @@ export async function resolveProtectedArchitectPlanContext(
     throw new Error('Protected Architect prompt context exceeds the executor overlay limit.')
   }
   const safeMetadata = { ...metadata }
-  delete safeMetadata.architectPlanEntryReferences
+  delete safeMetadata.architectPlanEntryRegistrationIds
   delete safeMetadata.mcpPromptContextPolicy
   return {
     ...preflight,
@@ -2195,11 +2179,46 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
   const sandboxRoot = await prepareSandboxRoot(hostProjectRoot, context.task.id, context.workPackage.id, attemptNumber)
   try {
     const providerConfigId = context.providerConfigId ?? null
-    const model = context.model ?? (
-      providerConfigId
-        ? await getModel(providerConfigId, { cwd: sandboxRoot })
+    let model = context.model ?? null
+    if (!model && providerConfigId) {
+      const controller = new AbortController()
+      let ownershipError: unknown = null
+      let ownershipCheck: Promise<void> | null = null
+      const checkOwnership = (): Promise<void> => {
+        if (ownershipError) return Promise.resolve()
+        if (ownershipCheck) return ownershipCheck
+        ownershipCheck = (async () => {
+          try {
+            await context.assertS4LifecycleOwned?.()
+          } catch (error) {
+            ownershipError = error
+            controller.abort(error)
+          }
+        })().finally(() => {
+          ownershipCheck = null
+        })
+        return ownershipCheck
+      }
+      await checkOwnership()
+      if (ownershipError) throw ownershipError
+      const ownershipTimer = context.assertS4LifecycleOwned
+        ? setInterval(() => { void checkOwnership() }, 250)
         : null
-    )
+      try {
+        model = await getModel(providerConfigId, {
+          cwd: sandboxRoot,
+          expectedExecutionSnapshot: context.providerExecutionSnapshot,
+          signal: controller.signal,
+        })
+      } catch (error) {
+        if (ownershipError) throw ownershipError
+        throw error
+      } finally {
+        if (ownershipTimer) clearInterval(ownershipTimer)
+      }
+      await checkOwnership()
+      if (ownershipError) throw ownershipError
+    }
     if (!model) throw new Error(`Provider config ${providerConfigId ?? '(unknown)'} is missing or inactive.`)
     const system = context.agentConfig?.systemPrompt || defaultSystemPrompt(context.workPackage.assignedRole)
     const providerConnector = context.providerConnector ?? context.providerConfigId ?? 'unknown-provider'

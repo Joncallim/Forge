@@ -32,6 +32,10 @@ const task = {
   githubBranch: null,
   githubPrUrl: null,
   errorMessage: null,
+  localProjectionSourceTaskId: null,
+  localProjectionReplacementState: null,
+  localProjectionReplacementVersion: null,
+  localProjectionReplacementFingerprint: null,
   createdAt: new Date('2026-06-24T00:00:00.000Z'),
   updatedAt: new Date('2026-06-24T00:00:00.000Z'),
   completedAt: null,
@@ -317,7 +321,7 @@ describe('buildArchitectPrompt checkpoint resume context', () => {
       /artifactPlanText\s*=\s*preservePreviousPlan\s*&&\s*previousPlan\s*!==\s*null\s*\?\s*previousPlan\s*:\s*prepared\.planText/,
     )
     expect(source).toContain("previousPlan !== null && prepared.questions.length === 0 && prepared.planText.trim() === ''")
-    expect(source).toContain('!isClarificationRound && prepared.planText.trim()')
+    expect(source).toMatch(/!isClarificationRound\s*&&\s*prepared\.planText\.trim\(\)/)
   })
 
   it('regenerates unsafe request-changes revisions with an explicit warning', () => {
@@ -337,7 +341,7 @@ describe('buildArchitectPrompt checkpoint resume context', () => {
     expect(source).not.toContain('canonicalPlanRevisionText')
     // The revision guard keys on a 'fence' breakdown so question-only rounds
     // keep it active and clarify-then-plan does not falsely trip it.
-    expect(source).toContain("previousComparableMetadata.agentBreakdownSource === 'fence'")
+    expect(source).toContain("previousComparableMetadata?.agentBreakdownSource === 'fence'")
     expect(source).toContain('planRevisionComparableFromPrepared(prepared)')
     expect(source).toContain('planRevisionComparableFromMetadata(previousPlanArtifact.metadata)')
     expect(source).toContain("agentBreakdownSource: prepared.agentBreakdownSource")

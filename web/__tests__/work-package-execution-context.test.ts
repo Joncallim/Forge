@@ -4,6 +4,15 @@ const mocks = vi.hoisted(() => ({
   dbSelect: vi.fn(),
   getProvider: vi.fn(),
   getModel: vi.fn(),
+  providerExecutionSnapshot: vi.fn((config: Record<string, unknown>) => ({
+    acpExecutionMode: config.providerType === 'acp' ? 'unconfined_host_process' : 'not_applicable',
+    configId: String(config.id ?? 'provider-task'),
+    fingerprint: 'a'.repeat(64),
+    isLocal: config.isLocal === true,
+    modelId: String(config.modelId),
+    providerType: String(config.providerType),
+    updatedAt: new Date('2026-07-22T00:00:00.000Z'),
+  })),
   loadCurrentProjectFilesystemDecision: vi.fn().mockResolvedValue(null),
   resolveDefaultProvider: vi.fn(),
   assertProjectLocalPathForExecution: vi.fn(),
@@ -16,6 +25,7 @@ vi.mock('@/db', () => ({
 vi.mock('@/lib/providers/registry', () => ({
   getProvider: mocks.getProvider,
   getModel: mocks.getModel,
+  providerExecutionSnapshot: mocks.providerExecutionSnapshot,
 }))
 
 vi.mock('@/lib/providers/default', () => ({

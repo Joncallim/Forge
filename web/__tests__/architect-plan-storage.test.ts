@@ -6,15 +6,17 @@ const {
   mockDbInsert,
   mockDbUpdate,
   mockPublishTaskEvent,
-  mockBindArchitectReplanEntry,
+  mockBindArchitectReplanContext,
   mockRecordArchitectPlanVersion,
+  mockReadS4RuntimeModeV1,
   mockResolveArchitectPlanEntry,
 } = vi.hoisted(() => ({
   mockDbInsert: vi.fn(),
   mockDbUpdate: vi.fn(),
   mockPublishTaskEvent: vi.fn(),
-  mockBindArchitectReplanEntry: vi.fn(),
+  mockBindArchitectReplanContext: vi.fn(),
   mockRecordArchitectPlanVersion: vi.fn(),
+  mockReadS4RuntimeModeV1: vi.fn(),
   mockResolveArchitectPlanEntry: vi.fn(),
 }))
 
@@ -53,9 +55,13 @@ vi.mock('@/worker/architect-context', () => ({
 vi.mock('@/lib/mcps/manager', () => ({ getProjectMcpOverview: vi.fn() }))
 vi.mock('@/lib/mcps/s4-protocol-store', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/mcps/s4-protocol-store')>(),
-  bindArchitectReplanEntry: mockBindArchitectReplanEntry,
+  bindArchitectReplanContext: mockBindArchitectReplanContext,
   recordArchitectPlanVersion: mockRecordArchitectPlanVersion,
   resolveArchitectPlanEntry: mockResolveArchitectPlanEntry,
+}))
+vi.mock('@/lib/mcps/s4-lease', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/mcps/s4-lease')>(),
+  readS4RuntimeModeV1: mockReadS4RuntimeModeV1,
 }))
 
 const protectedEnvNames = [
@@ -78,6 +84,7 @@ function artifact(content: string, metadata: Record<string, unknown> = {}) {
 }
 
 function configureProtectedReplan(): void {
+  mockReadS4RuntimeModeV1.mockResolvedValue('protected')
   process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL = 'postgresql://writer/test'
   process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX = 'a'.repeat(64)
   process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID = 'test-key-v1'
@@ -86,6 +93,7 @@ function configureProtectedReplan(): void {
 
 function protectedArtifact() {
   return {
+    id: '99999999-9999-4999-8999-999999999999',
     content: 'Architect plan available in protected history',
     metadata: {
       historyAvailable: true,
@@ -99,10 +107,20 @@ describe('Architect plan storage compatibility', () => {
     vi.clearAllMocks()
     for (const name of protectedEnvNames) delete process.env[name]
     mockPublishTaskEvent.mockResolvedValue(undefined)
-    mockBindArchitectReplanEntry.mockResolvedValue('44444444-4444-4444-8444-444444444444')
+    mockReadS4RuntimeModeV1.mockResolvedValue('legacy')
+    mockBindArchitectReplanContext.mockResolvedValue([{
+      referenceId: '44444444-4444-4444-8444-444444444444',
+      entryId: 'plan_body:000000',
+      entryKind: 'plan_body',
+    }])
     mockResolveArchitectPlanEntry.mockResolvedValue({
+      agent: null,
+      bindingFingerprint: null,
       content: '# Prior protected plan\n\nKeep this.',
       entryId: 'plan_body:000000',
+      entryKind: 'plan_body',
+      projectionEligible: false,
+      requirementKey: null,
     })
   })
 
@@ -134,6 +152,7 @@ describe('Architect plan storage compatibility', () => {
   })
 
   it('fails closed for partial protected configuration instead of writing a legacy artifact', async () => {
+    mockReadS4RuntimeModeV1.mockResolvedValue('protected')
     process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL = 'postgresql://writer/test'
     const { createArchitectPlanArtifact } = await import('@/worker/orchestrator')
 
@@ -145,6 +164,7 @@ describe('Architect plan storage compatibility', () => {
   })
 
   it('keeps the protected writer path when all protected settings are configured', async () => {
+    mockReadS4RuntimeModeV1.mockResolvedValue('protected')
     process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL = 'postgresql://writer/test'
     process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX = 'a'.repeat(64)
     process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID = 'test-key-v1'
@@ -219,10 +239,20 @@ describe('Architect durable replan source', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     for (const name of protectedEnvNames) delete process.env[name]
-    mockBindArchitectReplanEntry.mockResolvedValue('44444444-4444-4444-8444-444444444444')
+    mockBindArchitectReplanContext.mockResolvedValue([{
+      referenceId: '44444444-4444-4444-8444-444444444444',
+      entryId: 'plan_body:000000',
+      entryKind: 'plan_body',
+    }])
+    mockReadS4RuntimeModeV1.mockResolvedValue('legacy')
     mockResolveArchitectPlanEntry.mockResolvedValue({
+      agent: null,
+      bindingFingerprint: null,
       content: '# Prior protected plan\n\nKeep this.',
       entryId: 'plan_body:000000',
+      entryKind: 'plan_body',
+      projectionEligible: false,
+      requirementKey: null,
     })
   })
 
@@ -267,14 +297,14 @@ describe('Architect durable replan source', () => {
       checkpoint: null,
       taskId: '11111111-1111-4111-8111-111111111111',
     })).resolves.toBe('# Prior protected plan\n\nKeep this.')
-    expect(mockBindArchitectReplanEntry).toHaveBeenCalledOnce()
+    expect(mockBindArchitectReplanContext).toHaveBeenCalledOnce()
     expect(mockResolveArchitectPlanEntry).toHaveBeenCalledWith(expect.objectContaining({
       expectedPurpose: 'architect_replan',
       referenceId: '44444444-4444-4444-8444-444444444444',
     }))
-    expect(mockBindArchitectReplanEntry).toHaveBeenCalledWith({
+    expect(mockBindArchitectReplanContext).toHaveBeenCalledWith({
       agentRunId: '22222222-2222-4222-8222-222222222222',
-      taskId: '11111111-1111-4111-8111-111111111111',
+      priorPlanArtifactId: '99999999-9999-4999-8999-999999999999',
     })
   })
 
@@ -298,6 +328,77 @@ describe('Architect durable replan source', () => {
     expect(mockResolveArchitectPlanEntry).toHaveBeenCalledOnce()
   })
 
+  it('binds and resolves the protected plan body and hidden routing set together', async () => {
+    configureProtectedReplan()
+    mockBindArchitectReplanContext.mockResolvedValue([
+      {
+        referenceId: '44444444-4444-4444-8444-444444444444',
+        entryId: 'plan_body:000000',
+        entryKind: 'plan_body',
+      },
+      {
+        referenceId: '55555555-5555-4555-8555-555555555555',
+        entryId: 'routing:mcp-requirement-v1-test-1:backend',
+        entryKind: 'routing',
+      },
+    ])
+    mockResolveArchitectPlanEntry
+      .mockResolvedValueOnce({
+        agent: null,
+        bindingFingerprint: null,
+        content: '# Prior protected plan',
+        entryId: 'plan_body:000000',
+        entryKind: 'plan_body',
+        projectionEligible: false,
+        requirementKey: null,
+      })
+      .mockResolvedValueOnce({
+        agent: 'backend',
+        bindingFingerprint: `sha256:${'b'.repeat(64)}`,
+        content: '{"agent":"backend","requirementKey":"mcp-requirement-v1-test-1","schemaVersion":1}',
+        entryId: 'routing:mcp-requirement-v1-test-1:backend',
+        entryKind: 'routing',
+        projectionEligible: false,
+        requirementKey: 'mcp-requirement-v1-test-1',
+      })
+    const { previousPlanContextForArchitectRun } = await import('@/worker/orchestrator')
+    await expect(previousPlanContextForArchitectRun({
+      agentRunId: '22222222-2222-4222-8222-222222222222',
+      artifact: protectedArtifact(),
+      checkpoint: null,
+      taskId: '11111111-1111-4111-8111-111111111111',
+    })).resolves.toEqual({
+      planText: '# Prior protected plan',
+      protectedEntries: [{
+        agent: null,
+        bindingFingerprint: null,
+        content: '# Prior protected plan',
+        entryId: 'plan_body:000000',
+        entryKind: 'plan_body',
+        projectionEligible: false,
+        requirementKey: null,
+      }, {
+        agent: 'backend',
+        bindingFingerprint: `sha256:${'b'.repeat(64)}`,
+        entryId: 'routing:mcp-requirement-v1-test-1:backend',
+        content: '{"agent":"backend","requirementKey":"mcp-requirement-v1-test-1","schemaVersion":1}',
+        entryKind: 'routing',
+        projectionEligible: false,
+        requirementKey: 'mcp-requirement-v1-test-1',
+      }],
+      protectedComparableEntries: [{
+        agent: 'backend',
+        bindingFingerprint: `sha256:${'b'.repeat(64)}`,
+        entryId: 'routing:mcp-requirement-v1-test-1:backend',
+        content: '{"agent":"backend","requirementKey":"mcp-requirement-v1-test-1","schemaVersion":1}',
+        entryKind: 'routing',
+        projectionEligible: false,
+        requirementKey: 'mcp-requirement-v1-test-1',
+      }],
+    })
+    expect(mockResolveArchitectPlanEntry).toHaveBeenCalledTimes(2)
+  })
+
   it('fails closed when protected configuration is missing and needs no public replan locator', async () => {
     const { previousPlanForArchitectRun } = await import('@/worker/orchestrator')
     await expect(previousPlanForArchitectRun({
@@ -306,19 +407,20 @@ describe('Architect durable replan source', () => {
       checkpoint: null,
       taskId: '11111111-1111-4111-8111-111111111111',
     })).rejects.toThrow(/resolver configuration is missing.*failed closed/i)
-    expect(mockBindArchitectReplanEntry).not.toHaveBeenCalled()
+    expect(mockBindArchitectReplanContext).not.toHaveBeenCalled()
 
     configureProtectedReplan()
     await expect(previousPlanForArchitectRun({
       agentRunId: '22222222-2222-4222-8222-222222222222',
       artifact: {
+        id: '99999999-9999-4999-8999-999999999999',
         content: 'Architect plan available in protected history',
         metadata: { historyAvailable: true },
       },
       checkpoint: null,
       taskId: '11111111-1111-4111-8111-111111111111',
     })).resolves.toBe('# Prior protected plan\n\nKeep this.')
-    expect(mockBindArchitectReplanEntry).toHaveBeenCalledOnce()
+    expect(mockBindArchitectReplanContext).toHaveBeenCalledOnce()
   })
 
   it('does not retry or fall back when the one-use protected resolver fails', async () => {
@@ -331,7 +433,7 @@ describe('Architect durable replan source', () => {
       checkpoint: null,
       taskId: '11111111-1111-4111-8111-111111111111',
     })).rejects.toThrow('reference already consumed')
-    expect(mockBindArchitectReplanEntry).toHaveBeenCalledOnce()
+    expect(mockBindArchitectReplanContext).toHaveBeenCalledOnce()
     expect(mockResolveArchitectPlanEntry).toHaveBeenCalledOnce()
   })
 })
@@ -349,7 +451,7 @@ describe('Architect event leakage boundary', () => {
     const source = fs.readFileSync(path.join(process.cwd(), 'worker', 'orchestrator.ts'), 'utf8')
     const runArchitect = source.indexOf('async function runArchitect(')
     const createRun = source.indexOf('.insert(agentRuns)', runArchitect)
-    const resolvePrior = source.indexOf('previousPlanForArchitectRun({', runArchitect)
+    const resolvePrior = source.indexOf('previousPlanContextForArchitectRun({', runArchitect)
     expect(runArchitect).toBeGreaterThan(-1)
     expect(createRun).toBeGreaterThan(runArchitect)
     expect(resolvePrior).toBeGreaterThan(createRun)

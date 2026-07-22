@@ -20,8 +20,8 @@ const mocks = vi.hoisted(() => ({
   beginPacketDeliveryV2: vi.fn(),
   completePacketDeliveryV2: vi.fn(),
   architectPlanStorageConfiguration: vi.fn(),
-  bindArchitectPlanEntry: vi.fn(),
-  resolveArchitectPlanEntry: vi.fn(),
+  bindRegisteredArchitectPlanEntry: vi.fn(),
+  resolveRegisteredArchitectPlanEntry: vi.fn(),
 }))
 
 vi.mock('ai', () => ({
@@ -50,8 +50,8 @@ vi.mock('@/worker/task-logs', () => ({
 
 vi.mock('@/lib/mcps/s4-protocol-store', () => ({
   architectPlanStorageConfiguration: mocks.architectPlanStorageConfiguration,
-  bindArchitectPlanEntry: mocks.bindArchitectPlanEntry,
-  resolveArchitectPlanEntry: mocks.resolveArchitectPlanEntry,
+  bindRegisteredArchitectPlanEntry: mocks.bindRegisteredArchitectPlanEntry,
+  resolveRegisteredArchitectPlanEntry: mocks.resolveRegisteredArchitectPlanEntry,
 }))
 
 vi.mock('@/lib/mcps/s4-lease', async (importOriginal) => ({
@@ -211,6 +211,10 @@ function context(overrides: Partial<WorkPackageExecutionContext> = {}): WorkPack
       githubBranch: null,
       githubPrUrl: null,
       errorMessage: null,
+      localProjectionSourceTaskId: null,
+      localProjectionReplacementState: null,
+      localProjectionReplacementVersion: null,
+      localProjectionReplacementFingerprint: null,
       createdAt: now,
       updatedAt: now,
       completedAt: null,
@@ -401,7 +405,10 @@ describe('ACP execution cwd boundary', () => {
       }))
       expect(mocks.getModel).toHaveBeenCalledWith(
         'provider-1',
-        { cwd: path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'attempt-1') },
+        expect.objectContaining({
+          cwd: path.join(tempRoot, '.forge', 'task-runs', 'task-1', 'pkg-1', 'attempt-1'),
+          signal: expect.any(AbortSignal),
+        }),
       )
     } finally {
       await fs.rm(tempRoot, { recursive: true, force: true })
@@ -475,7 +482,7 @@ describe('executeWorkPackage', () => {
       digestKey: Buffer.alloc(32, 7),
       digestKeyId: 'test-key-v1',
     })
-    mocks.bindArchitectPlanEntry.mockResolvedValue('00000000-0000-4000-8000-000000000040')
+    mocks.bindRegisteredArchitectPlanEntry.mockResolvedValue('00000000-0000-4000-8000-000000000040')
     tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-executor-test-'))
   })
 
@@ -504,10 +511,14 @@ describe('executeWorkPackage', () => {
       requirementKey: 'mcp-requirement-v1-test-1',
       bindingFingerprint,
     }]
-    mocks.bindArchitectPlanEntry
+    const registrationIds = [
+      '00000000-0000-4000-8000-000000000052',
+      '00000000-0000-4000-8000-000000000053',
+    ]
+    mocks.bindRegisteredArchitectPlanEntry
       .mockResolvedValueOnce('00000000-0000-4000-8000-000000000042')
       .mockResolvedValueOnce('00000000-0000-4000-8000-000000000043')
-    mocks.resolveArchitectPlanEntry
+    mocks.resolveRegisteredArchitectPlanEntry
       .mockResolvedValueOnce({ entryId: references[0].entryId, content: 'Use the approved issue summary only.' })
       .mockResolvedValueOnce({
         entryId: references[1].entryId,
@@ -518,7 +529,7 @@ describe('executeWorkPackage', () => {
         ...context().workPackage,
         metadata: {
           repositoryWrites: false,
-          architectPlanEntryReferences: references,
+          architectPlanEntryRegistrationIds: registrationIds,
           mcpPromptContextPolicy: { schemaVersion: 1, state: 'protected_references_available' },
         },
       },
@@ -537,18 +548,17 @@ describe('executeWorkPackage', () => {
     })
 
     expect(assertOwned).toHaveBeenCalledTimes(5)
-    expect(mocks.bindArchitectPlanEntry).toHaveBeenNthCalledWith(1, expect.objectContaining({
+    expect(mocks.bindRegisteredArchitectPlanEntry).toHaveBeenNthCalledWith(1, expect.objectContaining({
       agentRunId: fullContext.agentRunId,
-      entryId: references[0].entryId,
-      workPackageId: fullContext.workPackage.id,
+      registrationId: registrationIds[0],
     }))
     expect(resolved.workPackage.metadata).toMatchObject({
       promptOverlay: 'Use the approved issue summary only.',
       mcpAwareSubtasks: [expect.objectContaining({ id: 'inspect' })],
     })
-    expect(resolved.workPackage.metadata).not.toHaveProperty('architectPlanEntryReferences')
+    expect(resolved.workPackage.metadata).not.toHaveProperty('architectPlanEntryRegistrationIds')
     expect(resolved.workPackage.metadata).not.toHaveProperty('mcpPromptContextPolicy')
-    expect(fullContext.workPackage.metadata).toHaveProperty('architectPlanEntryReferences')
+    expect(fullContext.workPackage.metadata).toHaveProperty('architectPlanEntryRegistrationIds')
   })
 
   it('fails closed before binding malformed protected prompt references', async () => {
@@ -556,7 +566,7 @@ describe('executeWorkPackage', () => {
       workPackage: {
         ...context().workPackage,
         metadata: {
-          architectPlanEntryReferences: [{ entryId: 'not-a-closed-reference' }],
+          architectPlanEntryRegistrationIds: ['not-a-registration-id'],
         },
       },
     })
@@ -569,8 +579,68 @@ describe('executeWorkPackage', () => {
 
     await expect(resolveProtectedArchitectPlanContext(preflight, {
       agentRunId: fullContext.agentRunId!,
-    })).rejects.toThrow(/malformed or ineligible/i)
-    expect(mocks.bindArchitectPlanEntry).not.toHaveBeenCalled()
+    })).rejects.toThrow(/invalid registration set/i)
+    expect(mocks.bindRegisteredArchitectPlanEntry).not.toHaveBeenCalled()
+  })
+
+  it('treats a package with no approved registration property as having no protected context', async () => {
+    const fullContext = context({
+      workPackage: {
+        ...context().workPackage,
+        metadata: { repositoryWrites: false },
+      },
+    })
+    const preflight = {
+      ...fullContext,
+      filesystemRuntime: { schemaVersion: 1, runtimeIssued: false, status: 'not_requested' },
+      projectFilesystemDecision: fullContext.projectFilesystemDecision ?? null,
+    } as WorkPackageExecutionPreflight & { validatedProjectRoot?: string }
+    delete preflight.validatedProjectRoot
+
+    await expect(resolveProtectedArchitectPlanContext(preflight, {
+      agentRunId: fullContext.agentRunId!,
+    })).resolves.toBe(preflight)
+    expect(mocks.bindRegisteredArchitectPlanEntry).not.toHaveBeenCalled()
+    expect(mocks.resolveRegisteredArchitectPlanEntry).not.toHaveBeenCalled()
+  })
+
+  it('awaits an in-flight ownership assertion when provider acquisition finishes', async () => {
+    let acquisitionStarted = false
+    let ownershipCheckStarted = false
+    let resolveModel!: (model: { provider: string; modelId: string }) => void
+    let rejectOwnership!: (error: Error) => void
+    const modelResult = new Promise<{ provider: string; modelId: string }>((resolve) => {
+      resolveModel = resolve
+    })
+    const ownershipResult = new Promise<void>((_resolve, reject) => {
+      rejectOwnership = reject
+    })
+    const assertOwned = vi.fn(() => {
+      if (!acquisitionStarted) return Promise.resolve()
+      ownershipCheckStarted = true
+      return ownershipResult
+    })
+    mocks.getModel.mockImplementation(() => {
+      acquisitionStarted = true
+      return modelResult
+    })
+
+    const execution = executeWorkPackage(context({
+      assertS4LifecycleOwned: assertOwned,
+      model: undefined,
+      providerConfigId: 'provider-1',
+    }))
+    await vi.waitFor(() => expect(mocks.getModel).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(ownershipCheckStarted).toBe(true), { timeout: 1_000 })
+    resolveModel({ provider: 'test', modelId: 'resolved-model' })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(mocks.generateText).not.toHaveBeenCalled()
+    rejectOwnership(new Error('execution lease was lost during provider acquisition'))
+
+    await expect(execution).rejects.toThrow(/lease was lost during provider acquisition/i)
+    const acquisitionOptions = mocks.getModel.mock.calls[0][1] as { signal: AbortSignal }
+    expect(acquisitionOptions.signal.aborted).toBe(true)
+    expect(mocks.generateText).not.toHaveBeenCalled()
   })
 
   it('writes generated files into the task sandbox and runs allowed commands', async () => {

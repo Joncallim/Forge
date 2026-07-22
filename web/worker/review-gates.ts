@@ -5,6 +5,7 @@ import { publishTaskEvent, type TaskEventPayload } from './events'
 import { sanitizeWorkerMessage } from './redaction'
 import { updateTaskStatusIfCurrent } from './task-state'
 import { convergeRecognizedOperatorHoldTask } from '../lib/mcps/filesystem-grant-reconciliation'
+import { resolveS4ReviewSourceV1 } from '../lib/mcps/review-source-resolver'
 
 export const REVIEW_GATE_TYPES = ['qa_review', 'reviewer_review', 'security_review'] as const
 export type ReviewGateType = typeof REVIEW_GATE_TYPES[number]
@@ -870,7 +871,7 @@ export async function decideReviewGate(input: {
   const requiredGateTypes = requiredGateTypesForPackage(workPackage ?? null)
 
   const [sourceArtifact] = await db
-    .select({ id: artifacts.id })
+    .select({ id: artifacts.id, content: artifacts.content, metadata: artifacts.metadata })
     .from(artifacts)
     .where(
       and(
@@ -884,6 +885,32 @@ export async function decideReviewGate(input: {
     return {
       status: 'source_artifact_mismatch',
       message: 'Review gate source artifact is not available. Reload the task before deciding this review.',
+    }
+  }
+
+  const protectedReviewSource = sourceArtifact.content === 'Protected review source available through its approval gate.'
+    || (metadataRecord(sourceArtifact.metadata).protectedReviewSource === true)
+  let protectedReviewSourceFingerprint: string | null = null
+  if (protectedReviewSource) {
+    try {
+      const resolved = await resolveS4ReviewSourceV1({ approvalGateId: gate.id })
+      if (
+        resolved.sourceArtifactId !== gate.sourceArtifactId
+        || resolved.sourceAgentRunId !== sourceAgentRunId
+      ) {
+        return {
+          status: 'source_artifact_mismatch',
+          message: 'Review gate source artifact changed. Reload the task before deciding this review.',
+        }
+      }
+      // Content and metadata are purpose-bound and deliberately discarded at
+      // this boundary. Only the safe digest is retained on the gate decision.
+      protectedReviewSourceFingerprint = resolved.contentFingerprint
+    } catch {
+      return {
+        status: 'source_artifact_mismatch',
+        message: 'Review gate source artifact is not available. Reload the task before deciding this review.',
+      }
     }
   }
 
@@ -944,6 +971,7 @@ export async function decideReviewGate(input: {
       decidedAt: now.toISOString(),
       decidedBy: input.userId,
       ...(stampedSecurityReviewPayload ? { securityReview: stampedSecurityReviewPayload } : {}),
+      ...(protectedReviewSourceFingerprint ? { protectedReviewSourceFingerprint } : {}),
       source: 'review-gates',
     }
 

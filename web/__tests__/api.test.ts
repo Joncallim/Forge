@@ -24,8 +24,10 @@ import { canonicalS3Marker } from '../test-support/filesystem-grant-marker-fixtu
 
 // Session mock
 const mockGetSession = vi.fn()
+const mockReadSessionCredential = vi.fn().mockReturnValue('00000000-0000-4000-8000-000000000000')
 vi.mock('@/lib/session', () => ({
   getSession: mockGetSession,
+  readSessionCredential: mockReadSessionCredential,
   createSession: vi.fn(),
   destroySession: vi.fn(),
   sessionCookieOptions: vi.fn().mockReturnValue({
@@ -36,6 +38,17 @@ vi.mock('@/lib/session', () => ({
     maxAge: 604800,
     path: '/',
   }),
+}))
+
+const mockLoadProtectedApprovalReviewPreflight = vi.fn().mockResolvedValue(null)
+const mockReadProtectedMcpOperatorReview = vi.fn().mockResolvedValue([])
+const mockListApprovedPackagePlanRegistrations = vi.fn().mockResolvedValue([])
+vi.mock('@/lib/mcps/protected-review-preflight', () => ({
+  loadProtectedApprovalReviewPreflight: mockLoadProtectedApprovalReviewPreflight,
+}))
+vi.mock('@/lib/mcps/history-reader', () => ({
+  listApprovedPackagePlanRegistrations: mockListApprovedPackagePlanRegistrations,
+  readProtectedMcpOperatorReview: mockReadProtectedMcpOperatorReview,
 }))
 
 // Existing route-contract cases exercise behavior behind the release gate.
@@ -103,6 +116,7 @@ const mockRedisSet = vi.fn()
 const mockRedisZadd = vi.fn()
 const mockRedisExpire = vi.fn()
 const mockRedisPublish = vi.fn()
+const mockRedisEval = vi.fn().mockResolvedValue(1)
 const mockRedisDel = vi.fn()
 
 vi.mock('@/lib/redis', () => ({
@@ -112,6 +126,7 @@ vi.mock('@/lib/redis', () => ({
     set: mockRedisSet,
     zadd: mockRedisZadd,
     expire: mockRedisExpire,
+    eval: mockRedisEval,
     publish: mockRedisPublish,
   },
 }))
@@ -2857,9 +2872,14 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
     const body = await res.json()
     expect(body).toEqual({ ok: true, mode: 'cancel' })
     expect(mockDbUpdate).toHaveBeenCalledTimes(4)
-    expect(mockRedisPublish).toHaveBeenCalledWith(
-      'forge:task:task-1',
+    expect(mockRedisEval).toHaveBeenCalledWith(
+      expect.any(String), 2,
+      'forge:task-events:v2:task-1:seq',
+      'forge:task-events:v2:task-1:history',
+      'task:status',
       expect.stringContaining('"status":"cancelled"'),
+      'forge:task:task-1',
+      '4096',
     )
   })
 
@@ -3053,6 +3073,145 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       .toBeLessThan((lockedTaskChain.for as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
     expect((lockedTaskChain.for as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
       .toBeLessThan((lockedPackagesChain.for as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
+  })
+
+  it('replaces package registration IDs with the owner-only approved projection', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const taskId = 'task-protected-registration-approval'
+    const sourceArtifactId = '00000000-0000-4000-8000-000000000101'
+    const approvalGateId = '00000000-0000-4000-8000-000000000102'
+    const approvedRegistrationId = '00000000-0000-4000-8000-000000000103'
+    const deniedRegistrationId = '00000000-0000-4000-8000-000000000104'
+    const reviewSetDigest = `hmac-sha256:${'a'.repeat(64)}`
+    const protectedHead = {
+      schemaVersion: 2,
+      sourceArtifactId,
+      sourcePlanVersion: '7',
+      revision: 1,
+      reviewSetDigest,
+      itemCount: 1,
+      approvedCount: 1,
+      deniedCount: 0,
+      blockerCodes: [],
+    }
+    const awaitingTask = { id: taskId, projectId: 'project-1', status: 'awaiting_approval' }
+    const project = {
+      id: 'project-1', localPath: null, mcpConfig: {},
+      grantDecisionRevision: BigInt(0), rootBindingRevision: BigInt(0),
+    }
+    const storedPackage = {
+      id: 'pkg-1', assignedRole: 'backend', title: 'Backend package', mcpRequirements: [],
+      metadata: {
+        architectPlanEntryRegistrationIds: [approvedRegistrationId, deniedRegistrationId],
+        mcpPromptContextPolicy: {
+          schemaVersion: 1, state: 'protected_references_available',
+          promptOverlayPresent: true, requirementContextCount: 1,
+          mcpAwareSubtaskCount: 1, eligibleReferenceCount: 2,
+          protectedCoverageComplete: true,
+        },
+      },
+      planGateMetadata: {
+        mcpOperatorReviewRequired: true,
+        protectedMcpReview: protectedHead,
+      },
+      planGateSourceArtifactId: sourceArtifactId,
+    }
+    const deniedOnlyPackage = {
+      ...storedPackage,
+      id: 'pkg-2',
+      title: 'Optional denied context package',
+      metadata: {
+        architectPlanEntryRegistrationIds: [deniedRegistrationId],
+        mcpPromptContextPolicy: {
+          schemaVersion: 1, state: 'protected_references_available',
+          promptOverlayPresent: true, requirementContextCount: 1,
+          mcpAwareSubtaskCount: 0, eligibleReferenceCount: 1,
+          protectedCoverageComplete: true,
+        },
+      },
+    }
+    mockLoadProtectedApprovalReviewPreflight.mockResolvedValueOnce({
+      gate: {
+        id: approvalGateId,
+        sourceArtifactId,
+        metadata: { planVersion: '7', mcpOperatorReviewRequired: true, protectedMcpReview: protectedHead },
+      },
+      sourcePlanVersion: '7',
+    })
+    mockReadProtectedMcpOperatorReview.mockResolvedValueOnce([{
+      reviewVersionId: '00000000-0000-4000-8000-000000000105',
+      reviewSetDigest,
+      entryId: 'decision:mcp-requirement-v1-approved',
+      entryKind: 'decision',
+      agent: 'backend',
+      requirementKey: 'mcp-requirement-v1-approved',
+      content: JSON.stringify({
+        schemaVersion: 2,
+        requirementKey: 'mcp-requirement-v1-approved',
+        decision: 'approved',
+      }),
+      contentDigest: `hmac-sha256:${'b'.repeat(64)}`,
+      digestKeyId: 'test-key-v1',
+      projectionEligible: true,
+    }])
+    mockListApprovedPackagePlanRegistrations.mockResolvedValueOnce([{
+      workPackageId: 'pkg-1',
+      registrationId: approvedRegistrationId,
+    }])
+    mockGetProjectMcpOverview.mockResolvedValueOnce({
+      projectId: 'project-1', config: {}, catalog: [], mcpsRoot: '/tmp/mcps', statuses: [],
+      summary: { label: 'Healthy', status: 'healthy', missing: 0, authRequired: 0, unhealthy: 0, disabled: 0 },
+    })
+    mockDbSelect
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([project]))
+      .mockReturnValueOnce(chain([awaitingTask]))
+      .mockReturnValueOnce(chain([storedPackage, deniedOnlyPackage]))
+    const taskUpdate = chain([{
+      ...awaitingTask,
+      status: 'approved',
+      updatedAt: new Date('2026-07-22T00:00:00.000Z'),
+    }])
+    taskUpdate.set = vi.fn(() => taskUpdate)
+    const packageUpdate = chain([{ id: 'pkg-1' }])
+    packageUpdate.set = vi.fn(() => packageUpdate)
+    const deniedPackageUpdate = chain([{ id: 'pkg-2' }])
+    deniedPackageUpdate.set = vi.fn(() => deniedPackageUpdate)
+    const gateUpdate = chain([{ id: approvalGateId }])
+    gateUpdate.set = vi.fn(() => gateUpdate)
+    mockDbUpdate
+      .mockReturnValueOnce(taskUpdate)
+      .mockReturnValueOnce(packageUpdate)
+      .mockReturnValueOnce(deniedPackageUpdate)
+      .mockReturnValueOnce(gateUpdate)
+    mockRedisLpush.mockResolvedValue(1)
+    mockRedisPublish.mockResolvedValue(1)
+
+    const { POST } = await import('@/app/api/tasks/[id]/approve/route')
+    const response = await POST(authRequest(`/api/tasks/${taskId}/approve`, { method: 'POST' }) as never, {
+      params: Promise.resolve({ id: taskId }),
+    })
+
+    expect(response.status, JSON.stringify(await response.clone().json())).toBe(200)
+    expect(mockListApprovedPackagePlanRegistrations).toHaveBeenCalledWith({
+      approvalGateId,
+      reviewRevision: 1,
+      reviewSetDigest,
+      sessionCredential: '00000000-0000-4000-8000-000000000000',
+      sourcePlanVersion: '7',
+    })
+    expect(packageUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({
+        architectPlanEntryRegistrationIds: [approvedRegistrationId],
+      }),
+    }))
+    expect(JSON.stringify((packageUpdate.set as ReturnType<typeof vi.fn>).mock.calls))
+      .not.toContain(deniedRegistrationId)
+    const deniedPackageMetadata = (deniedPackageUpdate.set as ReturnType<typeof vi.fn>).mock.calls[0][0].metadata
+    expect(deniedPackageMetadata).not.toHaveProperty('architectPlanEntryRegistrationIds')
+    expect(deniedPackageMetadata).not.toHaveProperty('mcpPromptContextPolicy')
+    expect(JSON.stringify(deniedPackageMetadata)).not.toContain(deniedRegistrationId)
   })
 
   it.each([
@@ -4198,9 +4357,13 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       .map(([, payload]) => JSON.parse(payload as string))
       .find((payload) => payload.type === 'approval_gate:decided')
     expect(gateEvent).toMatchObject({
-      gateId: 'gate-1',
-      gateType: 'plan_approval',
-      status: 'approved',
+      schemaVersion: 2,
+      id: null,
+      data: {
+        gateId: 'gate-1',
+        gateType: 'plan_approval',
+        status: 'approved',
+      },
     })
     expect(mockRedisPublish).toHaveBeenCalledWith(
       'forge:task:task-approval',
@@ -8178,9 +8341,14 @@ describe('POST /api/tasks/:id/retry', () => {
     const [queueKey, payload] = mockRedisLpush.mock.calls[0]
     expect(queueKey).toBe('forge:tasks')
     expect(JSON.parse(payload as string)).toMatchObject({ taskId: 'task-failed' })
-    expect(mockRedisPublish).toHaveBeenCalledWith(
-      'forge:task:task-failed',
+    expect(mockRedisEval).toHaveBeenCalledWith(
+      expect.any(String), 2,
+      'forge:task-events:v2:task-failed:seq',
+      'forge:task-events:v2:task-failed:history',
+      'task:status',
       expect.stringContaining('"status":"pending"'),
+      'forge:task:task-failed',
+      '4096',
     )
   })
 
@@ -8218,9 +8386,14 @@ describe('POST /api/tasks/:id/retry', () => {
     const [queueKey, payload] = mockRedisLpush.mock.calls[0]
     expect(queueKey).toBe('forge:approvals')
     expect(JSON.parse(payload as string)).toMatchObject({ taskId: 'task-failed', action: 'approve' })
-    expect(mockRedisPublish).toHaveBeenCalledWith(
-      'forge:task:task-failed',
+    expect(mockRedisEval).toHaveBeenCalledWith(
+      expect.any(String), 2,
+      'forge:task-events:v2:task-failed:seq',
+      'forge:task-events:v2:task-failed:history',
+      'task:status',
       expect.stringContaining('"status":"approved"'),
+      'forge:task:task-failed',
+      '4096',
     )
   })
 

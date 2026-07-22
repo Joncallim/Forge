@@ -45,13 +45,19 @@ import { completeTaskIfReviewGatesSatisfied } from './review-gates'
 import { sanitizeWorkerMessage } from './redaction'
 import {
   architectPlanStorageConfiguration,
-  bindArchitectReplanEntry,
+  bindArchitectReplanContext,
   recordArchitectPlanVersion,
   resolveArchitectPlanEntry,
 } from '../lib/mcps/s4-protocol-store'
 import {
   ARCHITECT_PLAN_HEADER,
 } from '../lib/mcps/architect-plan-entries'
+import { readS4RuntimeModeV1 } from '../lib/mcps/s4-lease'
+import {
+  appendProtectedArchitectClarifications,
+  buildProtectedArchitectPlanEntries,
+} from './protected-architect-plan'
+import type { ArchitectPlanEntryEnvelope, ArchitectPlanEntryInput } from '../lib/mcps/architect-plan-entries'
 
 type TaskRow = Task
 type ProjectRow = typeof projects.$inferSelect
@@ -403,6 +409,7 @@ function mockArchitectPlan(task: TaskRow, project: ProjectRow): string {
 }
 
 export type LatestPlanArtifact = {
+  id?: string
   content: string
   metadata: Record<string, unknown>
 }
@@ -471,7 +478,7 @@ function regeneratedPlanText(planText: string): string {
 
 async function loadLatestPlanArtifact(taskId: string): Promise<LatestPlanArtifact | null> {
   const [artifact] = await db
-    .select({ content: artifacts.content, metadata: artifacts.metadata })
+    .select({ id: artifacts.id, content: artifacts.content, metadata: artifacts.metadata })
     .from(artifacts)
     .innerJoin(agentRuns, eq(artifacts.agentRunId, agentRuns.id))
     .where(and(eq(agentRuns.taskId, taskId), eq(artifacts.artifactType, 'adr_text')))
@@ -480,9 +487,14 @@ async function loadLatestPlanArtifact(taskId: string): Promise<LatestPlanArtifac
 
   if (!artifact) return null
   return {
+    id: artifact.id,
     content: artifact.content,
     metadata: isRecord(artifact.metadata) ? artifact.metadata : {},
   }
+}
+
+export type CreatedArchitectPlanArtifact = typeof artifacts.$inferSelect & {
+  protectedArchitectPlanEntries: ArchitectPlanEntryEnvelope[]
 }
 
 export async function createArchitectPlanArtifact(
@@ -491,9 +503,20 @@ export async function createArchitectPlanArtifact(
   content: string,
   planVersion: string,
   metadataExtra: Record<string, unknown> = {},
-): Promise<typeof artifacts.$inferSelect> {
-  const storage = architectPlanStorageConfiguration()
+  protectedEntries: readonly ArchitectPlanEntryInput[] = [{
+    agent: null,
+    bindingFingerprint: null,
+    content,
+    entryId: 'plan_body:000000',
+    entryKind: 'plan_body',
+    projectionEligible: false,
+    requirementKey: null,
+  }],
+): Promise<CreatedArchitectPlanArtifact> {
+  const runtimeMode = await readS4RuntimeModeV1()
+  const storage = architectPlanStorageConfiguration(process.env, runtimeMode)
   let artifact: typeof artifacts.$inferSelect | undefined
+  let protectedArchitectPlanEntries: ArchitectPlanEntryEnvelope[] = []
   if (storage.mode === 'legacy') {
     const [legacyArtifact] = await db
       .insert(artifacts)
@@ -517,18 +540,11 @@ export async function createArchitectPlanArtifact(
       agentRunId,
       digestKey: storage.digestKey,
       digestKeyId: storage.digestKeyId,
-      entries: [{
-        agent: null,
-        bindingFingerprint: null,
-        content,
-        entryId: 'plan_body:000000',
-        entryKind: 'plan_body',
-        projectionEligible: false,
-        requirementKey: null,
-      }],
+      entries: protectedEntries,
       planVersion,
       taskId,
     })
+    protectedArchitectPlanEntries = protectedPlan.entries
     const [protectedArtifact] = await db
       .update(artifacts)
       .set({
@@ -582,7 +598,7 @@ export async function createArchitectPlanArtifact(
     title: 'Artifact created',
   })
 
-  return artifact
+  return Object.assign(artifact, { protectedArchitectPlanEntries })
 }
 
 function planTextFromCheckpoint(checkpoint: ArchitectResumeCheckpoint | null): string | null {
@@ -609,34 +625,80 @@ export function previousPlanForReplan(
   return planTextFromCheckpoint(checkpoint)
 }
 
+type PreviousArchitectPlanContext = {
+  planText: string | null
+  protectedEntries: ArchitectPlanEntryInput[] | null
+  protectedComparableEntries: Array<Pick<ArchitectPlanEntryInput,
+    'agent' | 'bindingFingerprint' | 'content' | 'entryId' | 'entryKind' | 'projectionEligible' | 'requirementKey'
+  >> | null
+}
+
+function protectedComparableEntries(entries: readonly ArchitectPlanEntryInput[]) {
+  return entries
+    .filter((entry) => ![
+      'plan_body', 'clarification_question', 'clarification_answer',
+    ].includes(entry.entryKind))
+    .map(({ agent, bindingFingerprint, content, entryId, entryKind, projectionEligible, requirementKey }) => ({
+      agent, bindingFingerprint, content, entryId, entryKind, projectionEligible, requirementKey,
+    }))
+    .sort((left, right) => left.entryId.localeCompare(right.entryId, 'en'))
+}
+
+export async function previousPlanContextForArchitectRun(input: {
+  agentRunId: string
+  artifact: LatestPlanArtifact | null
+  checkpoint: ArchitectResumeCheckpoint | null
+  taskId: string
+}): Promise<PreviousArchitectPlanContext> {
+  const protectedArtifact = input.artifact !== null && (
+    input.artifact.content === ARCHITECT_PLAN_HEADER
+    || input.artifact.metadata.historyAvailable === true
+  )
+  if (!protectedArtifact) {
+    return {
+      planText: previousPlanForReplan(input.artifact, input.checkpoint),
+      protectedEntries: null,
+      protectedComparableEntries: null,
+    }
+  }
+
+  const runtimeMode = await readS4RuntimeModeV1()
+  const storage = architectPlanStorageConfiguration(process.env, runtimeMode)
+  if (storage.mode !== 'protected') {
+    throw new Error('Protected Architect history is present but its resolver configuration is missing. Replan failed closed.')
+  }
+  if (!input.artifact?.id) {
+    throw new Error('Protected Architect history has no source artifact identity. Replan failed closed.')
+  }
+  const references = await bindArchitectReplanContext({
+    agentRunId: input.agentRunId,
+    priorPlanArtifactId: input.artifact.id,
+  })
+  const resolved = await Promise.all(references.map((reference) => resolveArchitectPlanEntry({
+      digestKey: storage.digestKey,
+      expectedPurpose: 'architect_replan',
+      referenceId: reference.referenceId,
+    }).then((entry) => ({ ...entry, expectedEntryId: reference.entryId }))))
+  if (resolved.some((entry) => entry.entryId !== entry.expectedEntryId)) {
+    throw new Error('Protected Architect replan context did not match its bound entry set. Replan failed closed.')
+  }
+  const planBody = resolved.find((entry) => entry.entryId === 'plan_body:000000')
+  const previousPlan = planBody?.content.trim() ?? ''
+  if (!previousPlan) throw new Error('Protected Architect replan resolved an empty plan. Replan failed closed.')
+  return {
+    planText: previousPlan,
+    protectedEntries: resolved.map(({ expectedEntryId: _expectedEntryId, ...entry }) => entry),
+    protectedComparableEntries: protectedComparableEntries(resolved),
+  }
+}
+
 export async function previousPlanForArchitectRun(input: {
   agentRunId: string
   artifact: LatestPlanArtifact | null
   checkpoint: ArchitectResumeCheckpoint | null
   taskId: string
 }): Promise<string | null> {
-  const protectedArtifact = input.artifact !== null && (
-    input.artifact.content === ARCHITECT_PLAN_HEADER
-    || input.artifact.metadata.historyAvailable === true
-  )
-  if (!protectedArtifact) return previousPlanForReplan(input.artifact, input.checkpoint)
-
-  const storage = architectPlanStorageConfiguration()
-  if (storage.mode !== 'protected') {
-    throw new Error('Protected Architect history is present but its resolver configuration is missing. Replan failed closed.')
-  }
-  const referenceId = await bindArchitectReplanEntry({
-    agentRunId: input.agentRunId,
-    taskId: input.taskId,
-  })
-  const resolved = await resolveArchitectPlanEntry({
-    digestKey: storage.digestKey,
-    expectedPurpose: 'architect_replan',
-    referenceId,
-  })
-  const previousPlan = resolved.content.trim()
-  if (!previousPlan) throw new Error('Protected Architect replan resolved an empty plan. Replan failed closed.')
-  return previousPlan
+  return (await previousPlanContextForArchitectRun(input)).planText
 }
 
 /**
@@ -776,14 +838,21 @@ async function runArchitect(
   let text = ''
   let outputBytes = 0
   let previousPlan: string | null = null
+  let previousProtectedEntries: ArchitectPlanEntryInput[] | null = null
+  let previousProtectedComparableEntries: ReturnType<typeof protectedComparableEntries> | null = null
+  let s4RuntimeMode: 'legacy' | 'protected' | null = null
 
   try {
-    previousPlan = await previousPlanForArchitectRun({
+    s4RuntimeMode = await readS4RuntimeModeV1()
+    const previousPlanContext = await previousPlanContextForArchitectRun({
       agentRunId: run.id,
       artifact: previousPlanArtifact,
       checkpoint: resumeCheckpoint,
       taskId: task.id,
     })
+    previousPlan = previousPlanContext.planText
+    previousProtectedEntries = previousPlanContext.protectedEntries
+    previousProtectedComparableEntries = previousPlanContext.protectedComparableEntries
     const projectFilesystemDecision = await loadCurrentProjectFilesystemDecision(project.id)
     const mcpOverview = await getProjectMcpOverview(project, projectFilesystemDecision)
     let usage: { inputTokens: number | null; outputTokens: number | null } = {
@@ -903,37 +972,55 @@ async function runArchitect(
 
     const prepared = prepareArchitectArtifact(text, mcpOverview)
     assertUsableArchitectPlan(text, prepared)
-    const previousComparableMetadata = previousPlanArtifact
+    const previousComparableMetadata = previousPlanArtifact && previousProtectedComparableEntries === null
       ? planRevisionComparableFromMetadata(previousPlanArtifact.metadata)
       : null
     const preparedComparableMetadata = planRevisionComparableFromPrepared(prepared)
+    const preparedProtectedComparableEntries = protectedComparableEntries(buildProtectedArchitectPlanEntries({
+      planText: prepared.planText,
+      prepared,
+    }))
     // A clarification round = the architect asked follow-up questions without
     // producing a structured (fenced) plan revision. Such a round — with or
     // without explanatory prose outside the questions fence — must preserve the
     // prior approved plan/metadata and route to awaiting_answers, not be treated
     // as a revision and tripped by the routing guard.
     const isClarificationRound = prepared.questions.length > 0 && prepared.agentBreakdownSource !== 'fence'
-    const preservePreviousPlan = previousPlan !== null && previousComparableMetadata !== null && isClarificationRound
+    const preservePreviousPlan = previousPlan !== null
+      && (previousComparableMetadata !== null || previousProtectedComparableEntries !== null)
+      && isClarificationRound
     let artifactPlanText = preservePreviousPlan && previousPlan !== null
       ? previousPlan
       : prepared.planText
-    let artifactComparableMetadata = preservePreviousPlan ? previousComparableMetadata : preparedComparableMetadata
+    let artifactComparableMetadata = preservePreviousPlan
+      ? previousComparableMetadata ?? preparedComparableMetadata
+      : preparedComparableMetadata
     let regeneratedPlanReason: string | null = null
     if (previousPlan !== null && prepared.questions.length === 0 && prepared.planText.trim() === '') {
       throw new UnusableArchitectPlanError(
         'The revised plan did not include visible plan text. Request visible targeted plan changes only, or restart the task for a new plan.',
       )
     }
-    if (previousPlan !== null && previousComparableMetadata !== null && !isClarificationRound && prepared.planText.trim() !== '') {
+    if (
+      previousPlan !== null
+      && (previousComparableMetadata !== null || previousProtectedComparableEntries !== null)
+      && !isClarificationRound
+      && prepared.planText.trim() !== ''
+    ) {
       // Only guard genuine revisions of an approvable structured plan, keyed on a
       // 'fence' agent breakdown. Clarification rounds are preserved above; a
       // question-only revision of an approved plan carries the previous 'fence'
       // source forward onto the preserved artifact, so the guard stays active
       // across the answer round and the plan cannot be rewritten. Pre-field
       // artifacts report 'unknown' and are skipped.
-      const previousWasApprovablePlan = previousComparableMetadata.agentBreakdownSource === 'fence'
+      const previousWasApprovablePlan = previousProtectedComparableEntries !== null
+        || previousComparableMetadata?.agentBreakdownSource === 'fence'
       if (previousWasApprovablePlan) {
-        if (stableJson(hiddenRoutingComparable(previousComparableMetadata)) !== stableJson(hiddenRoutingComparable(preparedComparableMetadata))) {
+        const routingChanged = previousProtectedComparableEntries !== null
+          ? stableJson(previousProtectedComparableEntries) !== stableJson(preparedProtectedComparableEntries)
+          : previousComparableMetadata !== null
+            && stableJson(hiddenRoutingComparable(previousComparableMetadata)) !== stableJson(hiddenRoutingComparable(preparedComparableMetadata))
+        if (routingChanged) {
           regeneratedPlanReason =
             'The revised plan changed machine-readable routing metadata. Request visible targeted plan changes only, or restart the task for a new plan.'
         } else {
@@ -971,6 +1058,22 @@ async function runArchitect(
     const planVersion = typeof previousVersion === 'string' && /^[1-9][0-9]*$/.test(previousVersion)
       ? (BigInt(previousVersion) + BigInt(1)).toString()
       : '1'
+    const previousClarifications = previousProtectedEntries?.filter((entry) =>
+      entry.entryKind === 'clarification_question'
+      || entry.entryKind === 'clarification_answer') ?? []
+    const protectedStructuralEntries = preservePreviousPlan && previousProtectedEntries
+      ? previousProtectedEntries.filter((entry) =>
+          entry.entryKind !== 'clarification_question'
+          && entry.entryKind !== 'clarification_answer')
+      : buildProtectedArchitectPlanEntries({
+          planText: artifactPlanText,
+          prepared,
+        })
+    const protectedEntries = appendProtectedArchitectClarifications({
+      entries: [...protectedStructuralEntries, ...previousClarifications],
+      openQuestions: prepared.questions,
+      answeredQuestions,
+    })
     const artifact = await createArchitectPlanArtifact(task.id, run.id, artifactPlanText, planVersion, {
       openQuestionCount: prepared.questions.length,
       regeneratedFromPlan: regeneratedPlanReason !== null,
@@ -985,7 +1088,7 @@ async function runArchitect(
       mcpExecutionDesign: previousPlan !== null && artifactComparableMetadata === previousComparableMetadata && isRecord(previousPlanArtifact?.metadata.mcpExecutionDesign)
         ? previousPlanArtifact.metadata.mcpExecutionDesign
         : prepared.mcpExecutionDesign,
-    })
+    }, protectedEntries)
     const openQuestionCount = await persistOpenQuestions(task.id, prepared.questions)
 
     if (openQuestionCount === 0) {
@@ -993,7 +1096,9 @@ async function runArchitect(
         taskId: task.id,
         architectRunId: run.id,
         artifactId: artifact.id,
+        planVersion,
         prepared,
+        protectedArchitectPlanEntries: artifact.protectedArchitectPlanEntries,
       })
     }
 
@@ -1060,6 +1165,7 @@ async function runArchitect(
       openQuestions: prepared.questions.map((question) => question.question),
       revisedFromAnswers: answeredQuestions.length > 0,
       revisedFromPlan: previousPlan !== null,
+      protectedHistory: isRecord(artifact.metadata) && artifact.metadata.historyAvailable === true,
       planText: artifactPlanText,
     }
 
@@ -1067,6 +1173,14 @@ async function runArchitect(
   } catch (err) {
     const message = errorMessage(err)
     const completedAt = new Date()
+    let protectFailureContent = s4RuntimeMode !== 'legacy'
+    try {
+      protectFailureContent ||= await readS4RuntimeModeV1() === 'protected'
+    } catch {
+      // An unavailable authority is ambiguous, so failure evidence remains
+      // content-free instead of risking a protected-plan leak.
+      protectFailureContent = true
+    }
 
     await db
       .update(agentRuns)
@@ -1094,7 +1208,9 @@ async function runArchitect(
       message: 'Architect run failed.',
       metadata: {
         errorMessage: sanitizePromptSnapshot(message),
-        partialOutput: sanitizePromptSnapshot(text),
+        partialOutput: protectFailureContent
+          ? 'Protected Architect partial output was not persisted to the ordinary task log.'
+          : sanitizePromptSnapshot(text),
         revisedFromAnswers: answeredQuestions.length > 0,
         revisedFromPlan: previousPlan !== null,
       },
@@ -1119,8 +1235,9 @@ async function runArchitect(
       openQuestions: [],
       revisedFromAnswers: answeredQuestions.length > 0,
       revisedFromPlan: previousPlan !== null,
+      protectedHistory: protectFailureContent,
       errorMessage: message,
-      partialOutput: text,
+      partialOutput: protectFailureContent ? undefined : text,
     }
 
     throw new ArchitectRunFailedError(err, checkpoint)

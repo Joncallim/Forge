@@ -8,6 +8,7 @@ import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
 import { getAccessibleTask } from '@/lib/task-access'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
+import { publishTaskEvent } from '@/worker/events'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -140,19 +141,15 @@ export async function POST(
     )
     const updatedQuestions = updated.flat()
 
-    await redis.publish(
-      'forge:task:' + taskId,
-      JSON.stringify({
-        type: 'questions:answered',
-        questions: updatedQuestions.map((q) => ({
+    await publishTaskEvent(taskId, 'questions:answered', {
+      questions: updatedQuestions.map((q) => ({
           id: q.id,
           question: q.question,
           suggestions: q.suggestions,
           answer: q.answer,
           status: q.status,
         })),
-      }),
-    )
+    })
 
     // Check whether every question for this task is now answered. If so,
     // enqueue a re-plan job so the architect re-runs with the answers in

@@ -86,7 +86,7 @@ function chain(resolveValue: unknown) {
 // Import SUT after mocks
 // ---------------------------------------------------------------------------
 
-import { getProvider, getModel } from '@/lib/providers/registry'
+import { getProvider, getModel, providerExecutionSnapshot } from '@/lib/providers/registry'
 import { checkProviderHealth } from '@/lib/providers/health'
 import { ACP_AGENTS, ACP_AGENTS_SOURCE_URL, getAcpAgent } from '@/lib/providers/acp/catalog'
 import { PROVIDER_CATALOG, providerCategory } from '@/lib/providers/catalog'
@@ -399,6 +399,35 @@ describe('getModel', () => {
     // The anthropic factory instance was called with the modelId
     expect(mockAnthropicInstance).toHaveBeenCalledWith('claude-opus-4-5')
     expect(model).toEqual({ _tag: 'anthropic-model' })
+  })
+
+  it('constructs a model only when the claimed provider snapshot is unchanged', async () => {
+    const timestamp = new Date('2026-07-22T08:00:00.000Z')
+    const config = makeRow({ modelId: 'claude-opus-4-5', updatedAt: timestamp })
+    const snapshot = providerExecutionSnapshot(config)
+    mockDbSelect.mockReturnValue(chain([config]))
+
+    await expect(getModel('config-id', { expectedExecutionSnapshot: snapshot }))
+      .resolves.toEqual({ _tag: 'anthropic-model' })
+  })
+
+  it('fails closed before use when provider configuration changes after claim', async () => {
+    const original = makeRow({
+      baseUrl: null,
+      modelId: 'claude-opus-4-5',
+      updatedAt: new Date('2026-07-22T08:00:00.000Z'),
+    })
+    const changed = makeRow({
+      baseUrl: 'https://changed.example.test',
+      modelId: 'claude-opus-4-5',
+      updatedAt: new Date('2026-07-22T08:00:01.000Z'),
+    })
+    mockDbSelect.mockReturnValue(chain([changed]))
+
+    await expect(getModel('config-id', {
+      expectedExecutionSnapshot: providerExecutionSnapshot(original),
+    })).rejects.toThrow(/changed after the protected work-package claim/i)
+    expect(mockAnthropicInstance).not.toHaveBeenCalled()
   })
 
   it('uses chat completions for LM Studio models instead of the Responses API', async () => {

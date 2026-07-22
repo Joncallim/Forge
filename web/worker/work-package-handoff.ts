@@ -21,7 +21,7 @@ import {
   hasWorkPackageMcpRuntimeInputs,
 } from './mcp-execution-design'
 import type { McpBrokerAdmissionCheck } from '../lib/mcps/admission'
-import { buildMcpBrokerBlockMetadata } from './blocked-handoff-retry'
+import { buildMcpBrokerBlockMetadata, enqueueBlockedHandoffRetry } from './blocked-handoff-retry'
 import {
   canonicalFilesystemProjectCapabilities,
   isProjectFilesystemEffectivePhase,
@@ -34,15 +34,18 @@ import {
 } from '../lib/mcps/filesystem-grant-lifecycle'
 import {
   advanceFilesystemGrantOperatorHoldProjection,
+  convergeRecognizedOperatorHoldTask,
   convergeOperatorHeldTask,
   loadCurrentProjectFilesystemDecision,
 } from '../lib/mcps/filesystem-grant-reconciliation'
+import { resolveS4ReviewSourceV1 } from '../lib/mcps/review-source-resolver'
 import type { ProjectFilesystemDecisionAuthority } from '../lib/mcps/filesystem-project-authority'
 import { assertMcpAdmissionLockSequence } from '../lib/mcps/mcp-admission-lock-order'
 import { updateTaskStatusIfCurrent } from './task-state'
 import {
   completeTaskIfReviewGatesSatisfied,
   materializeReviewGatesForWorkPackageCompletion,
+  requiredGateTypesForRequirement,
   REVIEW_GATE_TYPES,
 } from './review-gates'
 import {
@@ -78,12 +81,17 @@ import {
 } from './execution-lease'
 import {
   claimWorkPackageLifecycleV2,
+  claimPendingS4CompletionHandoffsV1,
   finalizeLocalFailureV2,
   finalizeLocalSuccessV2,
   finalizePacketFailureV2,
   finalizePacketSuccessV2,
   heartbeatLocalLifecycleV2,
   heartbeatPacketLifecycleV2,
+  discoverS4CompletionHandoffV1,
+  materializeS4CompletionHandoffV1,
+  materializeClaimedS4CompletionHandoffV1,
+  finalizeS4MaxAttemptsV1,
   readS4RuntimeModeV1,
   recoverLinkedS4LifecycleV2,
   S4LifecycleError,
@@ -100,6 +108,7 @@ type HandoffPackage = {
   mcpRequirements?: unknown
   metadata?: unknown
   sequence: number
+  reviewRequirement?: string
   status: string
   title: string
   updatedAt?: Date | null
@@ -259,6 +268,7 @@ async function rereadMcpHandoffInputs(taskId: string, packageId: string): Promis
       localPath: projects.localPath,
       mcpConfig: projects.mcpConfig,
       mcpRequirements: workPackages.mcpRequirements,
+      reviewRequirement: workPackages.reviewRequirement,
       metadata: workPackages.metadata,
       projectId: projects.id,
       rootBindingRevision: projects.rootBindingRevision,
@@ -363,6 +373,7 @@ async function lockFreshMcpHandoffInputs(
       id: workPackages.id,
       mcpRequirements: workPackages.mcpRequirements,
       metadata: workPackages.metadata,
+      reviewRequirement: workPackages.reviewRequirement,
       sequence: workPackages.sequence,
       status: workPackages.status,
       title: workPackages.title,
@@ -751,6 +762,7 @@ async function loadHandoffState(taskId: string): Promise<HandoffState> {
       harnessId: workPackages.harnessId,
       mcpRequirements: workPackages.mcpRequirements,
       metadata: workPackages.metadata,
+      reviewRequirement: workPackages.reviewRequirement,
       sequence: workPackages.sequence,
       status: workPackages.status,
       title: workPackages.title,
@@ -809,6 +821,17 @@ async function loadTaskProjectForMcpBroker(taskId: string) {
 
 async function recoverStaleRunningPackage(taskId: string, pkg: HandoffPackage): Promise<boolean> {
   if (!isStaleRunningPackage(pkg)) return false
+
+  if (await readS4RuntimeModeV1() === 'protected') {
+    const pendingHandoff = await discoverS4CompletionHandoffV1({ workPackageId: pkg.id })
+    if (pendingHandoff) {
+      await materializeS4CompletionHandoffV1({
+        agentRunId: pendingHandoff.agentRunId,
+        requiredGateTypes: requiredGateTypesForRequirement(pkg.reviewRequirement ?? 'both'),
+      })
+      return true
+    }
+  }
 
   const recoveredAt = new Date()
   const cutoff = staleRunningPackageCutoff(recoveredAt)
@@ -913,6 +936,57 @@ async function recoverStaleRunningPackage(taskId: string, pkg: HandoffPackage): 
   })
 
   return true
+}
+
+/**
+ * Repairs the crash window between a protected success finalizer and review-
+ * gate handoff. Discovery keys from the package, so it also finds an S4 run
+ * whose agent_runs row is already completed and therefore invisible to the
+ * legacy stale-running query.
+ */
+export async function reconcilePendingS4CompletionHandoffs(
+  limit = 100,
+  options: {
+    drain?: boolean
+    enqueue?: typeof enqueueBlockedHandoffRetry
+    workerId?: string
+  } = {},
+): Promise<number> {
+  if (await readS4RuntimeModeV1() !== 'protected') return 0
+  const enqueue = options.enqueue ?? enqueueBlockedHandoffRetry
+  const workerId = options.workerId ?? `manual-${process.pid}`
+  const wokenTaskIds = new Set<string>()
+  let reconciled = 0
+  do {
+    const claimToken = randomUUID()
+    const claimed = await claimPendingS4CompletionHandoffsV1({
+      claimToken,
+      limit,
+      workerId,
+    })
+    for (const handoff of claimed) {
+      try {
+        await materializeClaimedS4CompletionHandoffV1({
+          agentRunId: handoff.agentRunId,
+          claimGeneration: handoff.claimGeneration,
+          claimToken,
+          requiredGateTypes: requiredGateTypesForRequirement(handoff.reviewRequirement ?? 'both'),
+          workerId,
+        })
+      } catch (error) {
+        if (error instanceof S4LifecycleError && error.code === 'conflict') continue
+        throw error
+      }
+      reconciled += 1
+      await convergeRecognizedOperatorHoldTask(handoff.taskId)
+      if (!wokenTaskIds.has(handoff.taskId)) {
+        wokenTaskIds.add(handoff.taskId)
+        await enqueue(handoff.taskId, { source: 's4-completion-handoff-recovery' })
+      }
+    }
+    if (!options.drain || claimed.length < limit) break
+  } while (true)
+  return reconciled
 }
 
 async function executionLeaseOwned(workPackageId: string, runId: string): Promise<boolean> {
@@ -1556,9 +1630,9 @@ function cleanPriorReviewSourceArtifactContent(value: unknown): string {
   return normalized.slice(0, MAX_PRIOR_REVIEW_SOURCE_ARTIFACT_BYTES)
 }
 
-async function loadPriorReviewContext(
+export async function loadPriorReviewContext(
   taskId: string,
-  pkg: HandoffPackage,
+  pkg: Pick<HandoffPackage, 'id' | 'blockedReason'>,
 ): Promise<WorkPackagePriorReviewContext> {
   const rows = await db
     .select({
@@ -1589,15 +1663,40 @@ async function loadPriorReviewContext(
       .select({
         content: artifacts.content,
         id: artifacts.id,
+        metadata: artifacts.metadata,
       })
       .from(artifacts)
       .where(inArray(artifacts.id, sourceArtifactIds))
-  const sourceArtifactContentById = new Map(
+  const sourceArtifactById = new Map(
     sourceArtifactRows.map((artifact) => [
       artifact.id,
-      cleanPriorReviewSourceArtifactContent(artifact.content),
+      {
+        content: cleanPriorReviewSourceArtifactContent(artifact.content),
+        protected: artifact.content === 'Protected review source available through its approval gate.'
+          || (isRecord(artifact.metadata) && artifact.metadata.protectedReviewSource === true),
+      },
     ]),
   )
+
+  const sourceArtifactContentByGateId = new Map<string, string>()
+  for (const row of rows) {
+    if (!row.sourceArtifactId) continue
+    const sourceArtifact = sourceArtifactById.get(row.sourceArtifactId)
+    if (!sourceArtifact) continue
+    if (!sourceArtifact.protected) {
+      sourceArtifactContentByGateId.set(row.id, sourceArtifact.content)
+      continue
+    }
+    if (row.status !== 'needs_rework') continue
+    const protectedSource = await resolveS4ReviewSourceV1({ approvalGateId: row.id })
+    if (protectedSource.sourceArtifactId !== row.sourceArtifactId) {
+      throw new Error('Protected review-source identity changed. Rework execution failed closed.')
+    }
+    sourceArtifactContentByGateId.set(
+      row.id,
+      cleanPriorReviewSourceArtifactContent(protectedSource.content),
+    )
+  }
 
   return {
     packageBlockedReason: pkg.blockedReason ?? null,
@@ -1605,9 +1704,7 @@ async function loadPriorReviewContext(
       .map((row) => {
         const metadata = isRecord(row.metadata) ? row.metadata : {}
         const reason = cleanReviewReason(metadata.decisionReason ?? metadata.cancelledReason)
-        const sourceArtifactContent = row.sourceArtifactId
-          ? sourceArtifactContentById.get(row.sourceArtifactId) ?? ''
-          : ''
+        const sourceArtifactContent = sourceArtifactContentByGateId.get(row.id) ?? ''
         return {
           gateId: row.id,
           gateType: row.gateType,
@@ -2117,6 +2214,8 @@ export async function handoffApprovedWorkPackages(
         harnessId: nextPackage.harnessId,
         attemptNumber: 1,
         providerConfigId: null,
+        providerConfigUpdatedAt: null,
+        acpExecutionMode: 'not_applicable',
         modelIdUsed: 'forge-handoff/no-op',
         stage: 'handoff',
         executionStaleSeconds: staleRunningPackageSeconds(),
@@ -2468,8 +2567,33 @@ async function executeReadyWorkPackage(
     return { run, status: 'claimed' as const }
   })
 
+  const protectedAttemptLimit = async () => {
+    if (!nextPackage.updatedAt) {
+      throw new Error('Protected max-attempt finalization requires the package freshness timestamp.')
+    }
+    const attemptLimit = attemptLimitFailureDetails({ attemptNumber, pkg: nextPackage })
+    const finalized = await finalizeS4MaxAttemptsV1({
+      expectedPackageUpdatedAt: nextPackage.updatedAt,
+      maxAttempts: MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS,
+      taskId,
+      workPackageId: nextPackage.id,
+    })
+    if (!finalized) return null
+    return {
+      ...attemptLimit,
+      failedPackageId: nextPackage.id,
+      status: 'attempt_limit' as const,
+    }
+  }
+
   let claim: Awaited<ReturnType<typeof legacyClaim>>
-  if (protectedPreflight && attemptNumber <= MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS) {
+  if (protectedPreflight && attemptNumber > MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS) {
+    const attemptLimitClaim = await protectedAttemptLimit()
+    if (!attemptLimitClaim) {
+      return retryAfterHandoffFreshnessConflict(taskId, nextPackage, options)
+    }
+    claim = attemptLimitClaim
+  } else if (protectedPreflight) {
     if (!nextPackage.updatedAt) {
       throw new Error('Protected work-package claim requires the package freshness timestamp.')
     }
@@ -2491,6 +2615,8 @@ async function executeReadyWorkPackage(
         harnessId: nextPackage.harnessId,
         attemptNumber,
         providerConfigId: protectedPreflight.providerConfigId ?? null,
+        providerConfigUpdatedAt: protectedPreflight.providerExecutionSnapshot?.updatedAt ?? null,
+        acpExecutionMode: protectedPreflight.providerExecutionSnapshot?.acpExecutionMode ?? 'not_applicable',
         modelIdUsed: protectedPreflight.modelIdUsed,
         stage: 'implementation',
         executionStaleSeconds: staleRunningPackageSeconds(),
@@ -2905,16 +3031,23 @@ async function executeReadyWorkPackage(
       await currentS4Heartbeat()?.stop()
     }
 
-    const reviewGates = await materializeReviewGatesForWorkPackageCompletion({
-      completeSourceRun: s4Lifecycle
-        ? undefined
-        : { ...completionArtifact, completedAt },
-      requireExecutionLease: true,
-      sourceAgentRunId: run.id,
-      sourceArtifactId: protectedSourceArtifactId,
-      taskId,
-      workPackageId: nextPackage.id,
-    })
+    const reviewGates = s4Lifecycle
+      ? await materializeS4CompletionHandoffV1({
+          agentRunId: run.id,
+          requiredGateTypes: requiredGateTypesForRequirement(nextPackage.reviewRequirement ?? 'both'),
+        }).then((result) => ({
+          status: 'materialized' as const,
+          packageStatus: result.packageStatus,
+          sourceArtifact: null,
+        }))
+      : await materializeReviewGatesForWorkPackageCompletion({
+          completeSourceRun: { ...completionArtifact, completedAt },
+          requireExecutionLease: true,
+          sourceAgentRunId: run.id,
+          sourceArtifactId: protectedSourceArtifactId,
+          taskId,
+          workPackageId: nextPackage.id,
+        })
 
     if (reviewGates.status === 'not_owned') {
       if (s4Lifecycle) {
@@ -2944,7 +3077,9 @@ async function executeReadyWorkPackage(
       artifact = protectedArtifact ?? null
     }
     if (!artifact) throw new Error('Work package completion did not create a source artifact.')
-    const packageStatus = reviewGates.packageStatus
+    const packageStatus = reviewGates.packageStatus === 'awaiting_review' || reviewGates.packageStatus === 'completed'
+      ? reviewGates.packageStatus
+      : null
     executionLeaseReleased = true
     heartbeat.stop()
 

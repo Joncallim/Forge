@@ -37,6 +37,13 @@ const mocks = vi.hoisted(() => ({
   finalizeLocalSuccessV2: vi.fn(),
   finalizePacketFailureV2: vi.fn(),
   finalizePacketSuccessV2: vi.fn(),
+  discoverS4CompletionHandoffV1: vi.fn(),
+  materializeS4CompletionHandoffV1: vi.fn(),
+  claimPendingS4CompletionHandoffsV1: vi.fn(),
+  materializeClaimedS4CompletionHandoffV1: vi.fn(),
+  finalizeS4MaxAttemptsV1: vi.fn(),
+  resolveS4ReviewSourceV1: vi.fn(),
+  convergeRecognizedOperatorHoldTask: vi.fn(),
   projectionScopeState: 'active' as 'active' | 'archive_pending',
   WorkPackageExecutionError: class WorkPackageExecutionError extends Error {
     failureDetails: unknown
@@ -86,6 +93,10 @@ vi.mock('@/worker/events', () => ({
   publishTaskEvent: mocks.publishTaskEvent,
 }))
 
+vi.mock('@/lib/mcps/review-source-resolver', () => ({
+  resolveS4ReviewSourceV1: mocks.resolveS4ReviewSourceV1,
+}))
+
 vi.mock('@/worker/task-logs', () => ({
   recordTaskLogBestEffort: mocks.recordTaskLogBestEffort,
 }))
@@ -101,6 +112,13 @@ vi.mock('@/worker/review-gates', () => ({
   isImplementationPackageRole: (role: string) => ![
     '', 'architect', 'handoff', 'pm', 'qa', 'reviewer', 'security', 'security-review', 'security_review',
   ].includes(role.trim().toLowerCase()),
+  requiredGateTypesForRequirement: (requirement: string) => requirement === 'none'
+    ? []
+    : requirement === 'qa_only'
+      ? ['qa_review']
+      : requirement === 'reviewer_only'
+        ? ['reviewer_review']
+        : ['qa_review', 'reviewer_review'],
 }))
 
 vi.mock('@/worker/work-package-executor', () => ({
@@ -118,6 +136,7 @@ vi.mock('@/worker/work-package-executor', () => ({
 vi.mock('@/lib/mcps/filesystem-grant-reconciliation', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/mcps/filesystem-grant-reconciliation')>(),
   loadCurrentProjectFilesystemDecision: mocks.loadCurrentProjectFilesystemDecision,
+  convergeRecognizedOperatorHoldTask: mocks.convergeRecognizedOperatorHoldTask,
 }))
 
 vi.mock('@/lib/mcps/s4-lease', async (importOriginal) => ({
@@ -131,13 +150,23 @@ vi.mock('@/lib/mcps/s4-lease', async (importOriginal) => ({
   finalizePacketSuccessV2: mocks.finalizePacketSuccessV2,
   readS4RuntimeModeV1: mocks.readS4RuntimeModeV1,
   recoverLinkedS4LifecycleV2: mocks.recoverLinkedS4LifecycleV2,
+  discoverS4CompletionHandoffV1: mocks.discoverS4CompletionHandoffV1,
+  materializeS4CompletionHandoffV1: mocks.materializeS4CompletionHandoffV1,
+  claimPendingS4CompletionHandoffsV1: mocks.claimPendingS4CompletionHandoffsV1,
+  materializeClaimedS4CompletionHandoffV1: mocks.materializeClaimedS4CompletionHandoffV1,
+  finalizeS4MaxAttemptsV1: mocks.finalizeS4MaxAttemptsV1,
 }))
 
 function fixtureSecret(...parts: string[]) {
   return parts.join('')
 }
 
-import { handoffApprovedWorkPackages, progressWorkforce } from '@/worker/work-package-handoff'
+import {
+  handoffApprovedWorkPackages,
+  loadPriorReviewContext,
+  progressWorkforce,
+  reconcilePendingS4CompletionHandoffs,
+} from '@/worker/work-package-handoff'
 import { prepareArchitectArtifact } from '@/worker/architect-artifact'
 import { evaluateWorkPackageMcpBroker } from '@/worker/mcp-execution-design'
 import { buildWorkforceMaterializationRows } from '@/worker/workforce-materializer'
@@ -480,6 +509,16 @@ describe('handoffApprovedWorkPackages', () => {
       result: 'not_linked_v2',
       completionArtifactId: null,
     })
+    mocks.discoverS4CompletionHandoffV1.mockReset()
+    mocks.discoverS4CompletionHandoffV1.mockResolvedValue(null)
+    mocks.materializeS4CompletionHandoffV1.mockReset()
+    mocks.claimPendingS4CompletionHandoffsV1.mockReset()
+    mocks.claimPendingS4CompletionHandoffsV1.mockResolvedValue([])
+    mocks.materializeClaimedS4CompletionHandoffV1.mockReset()
+    mocks.finalizeS4MaxAttemptsV1.mockReset()
+    mocks.finalizeS4MaxAttemptsV1.mockResolvedValue(true)
+    mocks.convergeRecognizedOperatorHoldTask.mockReset()
+    mocks.convergeRecognizedOperatorHoldTask.mockResolvedValue(false)
     mocks.claimWorkPackageLifecycleV2.mockReset()
     mocks.heartbeatLocalLifecycleV2.mockReset()
     mocks.heartbeatLocalLifecycleV2.mockResolvedValue({ localLeaseExpiresAt: new Date() })
@@ -3302,5 +3341,92 @@ describe('handoffApprovedWorkPackages', () => {
     expect(mocks.getProjectMcpOverview).toHaveBeenCalledTimes(2)
     expect(staleInsert).not.toHaveBeenCalled()
     expect(mocks.publishTaskEvent.mock.calls.filter(([, type]) => type === 'run:started')).toHaveLength(1)
+  })
+})
+
+describe('protected completion handoff reconciliation', () => {
+  it('discovers a fresh completed run by package and materializes its pending gates', async () => {
+    mocks.readS4RuntimeModeV1.mockResolvedValue('protected')
+    mocks.claimPendingS4CompletionHandoffsV1.mockResolvedValue([{
+      handoffId: '00000000-0000-4000-8000-000000000205',
+      agentRunId: '00000000-0000-4000-8000-000000000202',
+      workPackageId: '00000000-0000-4000-8000-000000000201',
+      taskId: '00000000-0000-4000-8000-000000000200',
+      localRunEvidenceId: '00000000-0000-4000-8000-000000000203',
+      runtimeAuditId: null,
+      sourceArtifactId: '00000000-0000-4000-8000-000000000204',
+      handoffState: 'pending',
+      reviewRequirement: 'both',
+      createdAt: new Date('2026-07-22T00:00:00.000Z'),
+      claimGeneration: '1',
+      leaseExpiresAt: new Date('2026-07-22T00:00:30.000Z'),
+    }])
+    mocks.materializeClaimedS4CompletionHandoffV1.mockResolvedValue({
+      packageStatus: 'awaiting_review',
+      sourceArtifactId: '00000000-0000-4000-8000-000000000204',
+    })
+    const enqueue = vi.fn().mockResolvedValue({ status: 'enqueued' })
+
+    await expect(reconcilePendingS4CompletionHandoffs(100, {
+      enqueue,
+      workerId: 'worker-test',
+    })).resolves.toBe(1)
+    expect(mocks.claimPendingS4CompletionHandoffsV1).toHaveBeenCalledWith(expect.objectContaining({
+      limit: 100,
+      workerId: 'worker-test',
+    }))
+    expect(mocks.materializeClaimedS4CompletionHandoffV1).toHaveBeenCalledWith({
+      agentRunId: '00000000-0000-4000-8000-000000000202',
+      claimGeneration: '1',
+      claimToken: expect.any(String),
+      requiredGateTypes: ['qa_review', 'reviewer_review'],
+      workerId: 'worker-test',
+    })
+    expect(mocks.convergeRecognizedOperatorHoldTask).toHaveBeenCalledWith(
+      '00000000-0000-4000-8000-000000000200',
+    )
+    expect(enqueue).toHaveBeenCalledWith(
+      '00000000-0000-4000-8000-000000000200',
+      { source: 's4-completion-handoff-recovery' },
+    )
+  })
+})
+
+describe('protected review-source rework context', () => {
+  it('uses the fixed resolver for a protected needs-rework gate and never the public header', async () => {
+    mocks.dbSelect
+      .mockReturnValueOnce(chain([{
+        id: '00000000-0000-4000-8000-000000000301',
+        gateType: 'reviewer_review',
+        metadata: { decisionReason: 'Add regression coverage.' },
+        sourceArtifactId: '00000000-0000-4000-8000-000000000302',
+        status: 'needs_rework',
+      }]))
+      .mockReturnValueOnce(chain([{
+        id: '00000000-0000-4000-8000-000000000302',
+        content: 'Protected review source available through its approval gate.',
+        metadata: { schemaVersion: 1, protectedReviewSource: true },
+      }]))
+    mocks.resolveS4ReviewSourceV1.mockResolvedValue({
+      sourceArtifactId: '00000000-0000-4000-8000-000000000302',
+      sourceAgentRunId: '00000000-0000-4000-8000-000000000303',
+      content: 'Private implementation output with the missing test.',
+      metadata: null,
+      contentFingerprint: `sha256:${'a'.repeat(64)}`,
+    })
+
+    await expect(loadPriorReviewContext('00000000-0000-4000-8000-000000000300', {
+      id: '00000000-0000-4000-8000-000000000304',
+      blockedReason: 'Reviewer requested changes.',
+    })).resolves.toEqual({
+      packageBlockedReason: 'Reviewer requested changes.',
+      notes: [expect.objectContaining({
+        reason: expect.stringContaining('Private implementation output with the missing test.'),
+        status: 'needs_rework',
+      })],
+    })
+    expect(mocks.resolveS4ReviewSourceV1).toHaveBeenCalledWith({
+      approvalGateId: '00000000-0000-4000-8000-000000000301',
+    })
   })
 })
