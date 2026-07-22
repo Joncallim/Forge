@@ -228,6 +228,10 @@ export function verifyArchitectPlanEntry(input: {
 
 export function architectPlanEntryReference(entry: ArchitectPlanEntryEnvelope): ArchitectPlanEntryReference {
   if (!entry.projectionEligible) throw new Error('Ineligible Architect history cannot become an executable reference')
+  return referenceFromEntry(entry)
+}
+
+function referenceFromEntry(entry: ArchitectPlanEntryEnvelope): ArchitectPlanEntryReference {
   return {
     schemaVersion: 1,
     planArtifactId: entry.planArtifactId,
@@ -238,6 +242,32 @@ export function architectPlanEntryReference(entry: ArchitectPlanEntryEnvelope): 
     requirementKey: entry.requirementKey,
     bindingFingerprint: entry.bindingFingerprint,
   }
+}
+
+/**
+ * Creates the purpose-bound reference used only to let a later Architect run
+ * read the prior protected plan body once. This is deliberately separate from
+ * executable package references: plan_body remains projection-ineligible.
+ */
+export function architectReplanReferenceForEntry(
+  entry: ArchitectPlanEntryEnvelope,
+): ArchitectPlanEntryReference {
+  validateEntryIdentity(entry)
+  if (
+    entry.entryKind !== 'plan_body'
+    || entry.entryId !== 'plan_body:000000'
+    || entry.agent !== null
+    || entry.requirementKey !== null
+    || entry.bindingFingerprint !== null
+    || entry.projectionEligible
+    || !DIGEST.test(entry.contentDigest)
+    || !COMPONENT.test(entry.digestKeyId)
+    || !UUID.test(entry.planArtifactId)
+    || !canonicalPlanVersion(entry.planVersion)
+  ) {
+    throw new Error('Only a protected non-projection plan body can become an Architect replan reference')
+  }
+  return referenceFromEntry(entry)
 }
 
 export function parseArchitectPlanEntryReference(value: unknown): ArchitectPlanEntryReference | null {

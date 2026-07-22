@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import postgres from 'postgres'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
+  architectReplanReferenceForEntry,
   bindArchitectReplanEntry,
   executableReferenceForEntry,
   recordArchitectPlanVersion,
@@ -338,7 +339,8 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     })).rejects.toMatchObject({ code: 'invalid_evidence' })
 
     const planBody = recorded.entries.find((entry) => entry.entryKind === 'plan_body')!
-    const replanReference = executableReferenceForEntry(planBody)
+    expect(() => executableReferenceForEntry(planBody)).toThrow(/ineligible Architect history/i)
+    const replanReference = architectReplanReferenceForEntry(planBody)
     const replanReferenceId = await bindArchitectReplanEntry({
       agentRunId: ids.replanRun,
       reference: replanReference,

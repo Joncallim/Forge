@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import postgres from 'postgres'
 import {
+  architectReplanReferenceForEntry,
   architectPlanEntryReference,
   materializeArchitectPlanEntries,
   parseArchitectPlanEntryReference,
@@ -212,6 +213,8 @@ export async function resolveArchitectPlanEntry(input: {
 export function executableReferenceForEntry(entry: ArchitectPlanEntryEnvelope): ArchitectPlanEntryReference {
   return architectPlanEntryReference(entry)
 }
+
+export { architectReplanReferenceForEntry }
 
 export async function bindArchitectReplanEntry(input: {
   agentRunId: string

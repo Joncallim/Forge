@@ -44,10 +44,17 @@ import {
 import { completeTaskIfReviewGatesSatisfied } from './review-gates'
 import { sanitizeWorkerMessage } from './redaction'
 import {
+  architectReplanReferenceForEntry,
   architectPlanStorageConfiguration,
+  bindArchitectReplanEntry,
   recordArchitectPlanVersion,
+  resolveArchitectPlanEntry,
 } from '../lib/mcps/s4-protocol-store'
-import { ARCHITECT_PLAN_HEADER } from '../lib/mcps/architect-plan-entries'
+import {
+  ARCHITECT_PLAN_HEADER,
+  parseArchitectPlanEntryReference,
+  type ArchitectPlanEntryReference,
+} from '../lib/mcps/architect-plan-entries'
 
 type TaskRow = Task
 type ProjectRow = typeof projects.$inferSelect
@@ -525,10 +532,14 @@ export async function createArchitectPlanArtifact(
       planVersion,
       taskId,
     })
+    const planBody = protectedPlan.entries.find((entry) => entry.entryKind === 'plan_body')
+    if (!planBody) throw new Error('Protected Architect history did not retain its plan body entry.')
+    const architectReplanReference = architectReplanReferenceForEntry(planBody)
     const [protectedArtifact] = await db
       .update(artifacts)
       .set({
         metadata: {
+          ...metadataExtra,
           stage: 'architect_plan',
           generatedBy: 'forge-worker',
           historyAvailable: true,
@@ -536,7 +547,7 @@ export async function createArchitectPlanArtifact(
           entryCount: protectedPlan.entries.length,
           entrySetDigest: protectedPlan.entrySetDigest,
           storageMode: 'protected',
-          ...metadataExtra,
+          architectReplanReference,
         },
       })
       .where(eq(artifacts.id, protectedPlan.artifactId))
@@ -600,6 +611,50 @@ export function previousPlanForReplan(
     if (durablePlan) return durablePlan
   }
   return planTextFromCheckpoint(checkpoint)
+}
+
+function protectedArchitectReplanReference(
+  artifact: LatestPlanArtifact,
+): ArchitectPlanEntryReference {
+  const reference = parseArchitectPlanEntryReference(artifact.metadata.architectReplanReference)
+  if (!reference || reference.entryId !== 'plan_body:000000') {
+    throw new Error('Protected Architect replan metadata is missing or invalid. Replan failed closed.')
+  }
+  return reference
+}
+
+export async function previousPlanForArchitectRun(input: {
+  agentRunId: string
+  artifact: LatestPlanArtifact | null
+  checkpoint: ArchitectResumeCheckpoint | null
+  taskId: string
+}): Promise<string | null> {
+  const protectedArtifact = input.artifact !== null && (
+    input.artifact.content === ARCHITECT_PLAN_HEADER
+    || input.artifact.metadata.historyAvailable === true
+  )
+  if (!protectedArtifact) return previousPlanForReplan(input.artifact, input.checkpoint)
+
+  const storage = architectPlanStorageConfiguration()
+  if (storage.mode !== 'protected') {
+    throw new Error('Protected Architect history is present but its resolver configuration is missing. Replan failed closed.')
+  }
+  const reference = protectedArchitectReplanReference(input.artifact!)
+  const referenceId = await bindArchitectReplanEntry({
+    agentRunId: input.agentRunId,
+    reference,
+    taskId: input.taskId,
+  })
+  const resolved = await resolveArchitectPlanEntry({
+    digestKey: storage.digestKey,
+    expectedPurpose: 'architect_replan',
+    reference,
+    referenceId,
+    taskId: input.taskId,
+  })
+  const previousPlan = resolved.content.trim()
+  if (!previousPlan) throw new Error('Protected Architect replan resolved an empty plan. Replan failed closed.')
+  return previousPlan
 }
 
 /**
@@ -716,7 +771,6 @@ async function runArchitect(
   }
   const resumeCheckpoint = await readLatestArchitectCheckpointSafely(task.id)
   const previousPlanArtifact = await loadLatestPlanArtifact(task.id)
-  const previousPlan = previousPlanForReplan(previousPlanArtifact, resumeCheckpoint)
   const startedAt = new Date()
   const [run] = await db
     .insert(agentRuns)
@@ -739,8 +793,15 @@ async function runArchitect(
 
   let text = ''
   let outputBytes = 0
+  let previousPlan: string | null = null
 
   try {
+    previousPlan = await previousPlanForArchitectRun({
+      agentRunId: run.id,
+      artifact: previousPlanArtifact,
+      checkpoint: resumeCheckpoint,
+      taskId: task.id,
+    })
     const projectFilesystemDecision = await loadCurrentProjectFilesystemDecision(project.id)
     const mcpOverview = await getProjectMcpOverview(project, projectFilesystemDecision)
     let usage: { inputTokens: number | null; outputTokens: number | null } = {
@@ -871,7 +932,9 @@ async function runArchitect(
     // as a revision and tripped by the routing guard.
     const isClarificationRound = prepared.questions.length > 0 && prepared.agentBreakdownSource !== 'fence'
     const preservePreviousPlan = previousPlan !== null && previousComparableMetadata !== null && isClarificationRound
-    let artifactPlanText = preservePreviousPlan ? previousPlan : prepared.planText
+    let artifactPlanText = preservePreviousPlan && previousPlan !== null
+      ? previousPlan
+      : prepared.planText
     let artifactComparableMetadata = preservePreviousPlan ? previousComparableMetadata : preparedComparableMetadata
     let regeneratedPlanReason: string | null = null
     if (previousPlan !== null && prepared.questions.length === 0 && prepared.planText.trim() === '') {

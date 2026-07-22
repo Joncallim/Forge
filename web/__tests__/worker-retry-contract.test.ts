@@ -120,8 +120,22 @@ describe('answered-question retry contract', () => {
     process.env.FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID = 'test-v1'
     process.env.FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL = 'postgresql://writer/test'
     mockRecordArchitectPlanVersion.mockResolvedValue({
-      artifactId: 'artifact-1',
-      entries: [{ entryId: 'plan_body:000000' }],
+      artifactId: '33333333-3333-4333-8333-333333333333',
+      entries: [{
+        schemaVersion: 1,
+        taskId: '11111111-1111-4111-8111-111111111111',
+        planArtifactId: '33333333-3333-4333-8333-333333333333',
+        planVersion: '1',
+        entryId: 'plan_body:000000',
+        entryKind: 'plan_body',
+        agent: null,
+        requirementKey: null,
+        bindingFingerprint: null,
+        content: 'Protected Architect plan.',
+        contentDigest: `hmac-sha256:${'b'.repeat(64)}`,
+        digestKeyId: 'test-v1',
+        projectionEligible: false,
+      }],
       entrySetDigest: `hmac-sha256:${'a'.repeat(64)}`,
     })
     vi.resetModules()
