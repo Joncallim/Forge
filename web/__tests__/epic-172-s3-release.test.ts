@@ -97,7 +97,7 @@ describe('Epic 172 S3 release seam', () => {
     )
     expect(workflow).toContain('npm run lint -- --max-warnings=0')
     expect(workflow).toContain('name: Run the complete zero-skip unit suite')
-    expect(workflow).toContain('run: npm test')
+    expect(workflow).toContain('run: npm run test:unit:zero-skip')
     expect(workflow).toContain("FORGE_EPIC_172_REQUIRE_POSTGRES_TEST: '1'")
     expect(workflow).toContain('FORGE_EPIC_172_TEST_APP_DATABASE_URL:')
     expect(workflow).toContain('FORGE_EPIC_172_TEST_WRITER_DATABASE_URL:')

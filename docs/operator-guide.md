@@ -18,8 +18,8 @@ split deployments, the worker can still run separately.
 The most important beta boundary: Forge may write plans, approval records,
 work-package records, handoff/review-gate state, and generated sandbox files,
 but it does not write directly into the host repository. Workforce
-materialization, handoff, and specialist package execution are enabled unless
-explicitly disabled. Forge may give a specialist bounded read-only
+materialization and handoff are available after approval; specialist package
+execution is opt-in with `FORGE_WORK_PACKAGE_EXECUTION=1`. Forge may give a specialist bounded read-only
 host-repository context. Generated files remain under
 `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/` for
 review and manual application. Direct host writes, branches, commits, pull
@@ -163,10 +163,10 @@ For the currently wired ACP adapters:
 - The local CLI must already be installed and logged in.
 - The Forge project must have a local folder so Forge can validate and bound
   repository context. Architect planning uses an isolated runtime directory.
-  Executable work-package ACP sessions are enabled after task approval, but the
-  local adapter is not OS-confined by Forge. Set
-  `FORGE_ACP_WORK_PACKAGE_EXECUTION=0` where that local process access is not
-  acceptable.
+  Executable work-package ACP sessions are opt-in with
+  `FORGE_ACP_WORK_PACKAGE_EXECUTION=1`. The local adapter is not OS-confined by
+  Forge, so enable it only where a real external confinement boundary is
+  present.
 - Installing the Zed editor is not required; Forge uses Agent Client Protocol
   adapter packages, not the editor itself.
 
@@ -213,30 +213,48 @@ npm run test:providers
 npm run test:providers -- --provider "Provider Name"
 ```
 
+### PostgreSQL proof commands
+
+For the CI-style database boundary checks, run the general unit suite with the
+S4 PostgreSQL file excluded:
+
+```bash
+cd web
+npm run test:unit:zero-skip
+```
+
+Run `npm run test:mcp:s4-postgres` only against a freshly migrated, isolated
+database with the S4 administrator, ordinary application, packet issuer, and
+Architect writer/resolver/history-reader URLs configured. CI sets
+`FORGE_S4_REQUIRE_POSTGRES_TEST=1` and fails if the command reports a skipped S4
+test or no passing test. This proves the configured database boundary and test
+fixture; it is not a complete proof of production safety.
+
 ## Executable Workforce Beta
 
-Workforce materialization, handoff, and package execution are default-on. To
-keep the older handoff-artifact-only behavior, set one of the disable values
-(`0`, `false`, `off`, `no`, or `disabled`) in the worker environment. If
+Workforce materialization and handoff are available after approval. Package
+execution is disabled by default; set `FORGE_WORK_PACKAGE_EXECUTION=1` in the
+worker environment to opt in. If
 `FORGE_EMBED_WORKER` is enabled, that is the web process because it hosts the
 worker loop; in split deployments, do not set it on the web-only process.
 
 ```bash
-FORGE_WORK_PACKAGE_EXECUTION=0
+FORGE_WORK_PACKAGE_EXECUTION=1
 ```
 
-Package models already run sandbox-only when this setting is absent. You may
-also make that boundary explicit:
+Package models run sandbox-only when enabled. You may also make that boundary
+explicit:
 
 ```bash
 FORGE_HOST_REPOSITORY_WRITES=0
 ```
 
 Do not set this flag to `1` or `true`. Direct host repository writes are
-unavailable, so an enable request fails closed after Forge preserves the
-generated sandbox files. The legacy `FORGE_REPOSITORY_EDITS` alias follows the
-same rule. Review files under `.forge/task-runs`, then apply accepted changes
-manually until Forge has a hardened repository-write adapter.
+unavailable, so file materialization fails closed after Forge preserves the
+generated sandbox files. Path validation is not an operating-system sandbox; a
+real confined writer is required before Forge can apply files automatically.
+The legacy `FORGE_REPOSITORY_EDITS` alias follows the same rule. Review files
+under `.forge/task-runs`, then apply accepted changes manually.
 
 Deployments adopting the Epic #172 retention and signed-release substrate must
 use the [Step 0 retention bridge runbook](operators/epic-172-step0-retention-bridge.md).

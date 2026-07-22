@@ -10,8 +10,8 @@ operator wants. The worker does the queued work and saves evidence for review.
 
 The current worker starts with the Architect planning stage. Workforce data
 structures now exist for work packages, harnesses, approval gates, and version
-control summaries. Work-package handoff and sequential specialist execution are
-enabled by default. Executable packages may receive bounded read-only
+control summaries. Work-package handoff is available after approval; sequential
+specialist execution is opt-in with `FORGE_WORK_PACKAGE_EXECUTION=1`. Executable packages may receive bounded read-only
 host-repository context. Generated files remain in per-package sandboxes under
 `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/` for
 review and manual application. Direct host repository writes are unavailable.
@@ -55,9 +55,9 @@ back through the same provider interface used by the worker. The currently wired
 Agent Client Protocol adapters wrap local tools such as Codex CLI and Claude
 Code; the underlying CLI must already be installed, authenticated, and runnable
 on the worker host. Architect ACP calls run in an isolated runtime directory.
-Executable work-package ACP calls are enabled after task approval. ACP adapters
-are local processes, not OS-confined sandboxes. Operators can opt out with
-`FORGE_ACP_WORK_PACKAGE_EXECUTION=0` when that risk is not acceptable. See [ACP
+Executable work-package ACP calls are opt-in after task approval. ACP adapters
+are local processes, not OS-confined sandboxes; enable them only when a real
+external confinement boundary is present. See [ACP
 and the Zed connector](acp-zed-connector.md).
 
 ## Local Development
@@ -70,6 +70,31 @@ npm run db:migrate
 npm run db:seed-agents
 npm run dev
 ```
+
+### PostgreSQL proof commands
+
+The ordinary zero-skip unit command excludes the database-backed S4 file so it
+does not reuse the release-recorder database:
+
+```bash
+npm run test:unit:zero-skip
+```
+
+The mandatory S4 proof must use a freshly migrated database and all six
+dedicated URLs (`FORGE_S4_POSTGRES_TEST_DATABASE_URL`,
+`FORGE_EPIC_172_TEST_APP_DATABASE_URL`, `FORGE_PACKET_ISSUER_DATABASE_URL`,
+`FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL`,
+`FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL`, and
+`FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL`). CI runs:
+
+```bash
+FORGE_S4_REQUIRE_POSTGRES_TEST=1 npm run test:mcp:s4-postgres -- --reporter=line
+```
+
+The command fails when required URLs are missing. CI also fails if the Vitest
+report contains a skipped S4 test or does not report a passing test. This is a
+database-boundary regression proof, not proof that every production path is
+safe.
 
 Common commands:
 
@@ -173,20 +198,19 @@ Feature flag defaults:
 |---|---|---|
 | `FORGE_WORKFORCE_MATERIALIZATION` | enabled | Set `0` or `false` to skip durable work-package/gate records. |
 | `FORGE_WORK_PACKAGE_HANDOFF` | enabled | Set `0` or `false` to stop package handoff claims. |
-| `FORGE_WORK_PACKAGE_EXECUTION` | enabled | Set `0`, `false`, `off`, `no`, or `disabled` to stop specialist package execution and create handoff artifacts only. |
+| `FORGE_WORK_PACKAGE_EXECUTION` | disabled | Set `1` to explicitly enable specialist package execution; otherwise create handoff artifacts only. |
 | `FORGE_HOST_REPOSITORY_WRITES` | unavailable | Leave unset, or set `0`, `false`, `off`, `no`, or `disabled`, for successful sandbox-only execution. Enable values fail closed after preserving sandbox output. The legacy `FORGE_REPOSITORY_EDITS` alias follows the same rule. |
-| `FORGE_ACP_WORK_PACKAGE_EXECUTION` | enabled | Set `0`, `false`, `off`, `no`, or `disabled` to block ACP package execution when local adapter process access is not acceptable. |
+| `FORGE_ACP_WORK_PACKAGE_EXECUTION` | disabled | Set `1` only when a real external confinement boundary protects the local ACP adapter process. |
 | `FORGE_RUNNING_WORK_PACKAGE_STALE_SECONDS` | `900` | Recovery window before a retry marks an interrupted running work package blocked and starts the next eligible attempt. |
 
 ### Executable Workforce Beta
 
-`FORGE_WORK_PACKAGE_EXECUTION=0` changes only the final package execution step:
+`FORGE_WORK_PACKAGE_EXECUTION=0` (the default) changes only the final package execution step:
 approval records reviewable handoff artifacts but does not call a specialist
 package model. With host-write configuration unset or explicitly disabled,
 package models run successfully and keep generated files under
 `.forge/task-runs` for review and manual application. An enable value such as
-`1` or `true` is an unsupported request and fails closed; it never authorizes a
-host write.
+`1` explicitly enables package execution; it never authorizes a host write.
 
 When execution is enabled:
 

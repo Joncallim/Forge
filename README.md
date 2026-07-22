@@ -50,9 +50,12 @@ Human intent
   -> evidence, recovery, and GitHub handoff
 ```
 
-FORGE is currently a **single-operator beta**. It can plan and execute approved
-specialist packages, keep generated files in reviewable sandboxes, and preserve
-the evidence needed for review. Direct host repository writes are unavailable.
+FORGE is currently a **single-operator beta**. It can plan and, when explicitly
+enabled, execute approved specialist packages, keep generated files in
+reviewable sandboxes, and preserve the evidence needed for review. Work-package
+and ACP execution are opt-in. Direct host repository writes are unavailable;
+path validation is not an operating-system sandbox, and file materialization
+requires a real confined writer that Forge does not yet provide.
 It also stops short of autonomous commits, merges, broad live MCP authority, or
 unrestricted host control.
 
@@ -80,7 +83,8 @@ unrestricted host control.
 ### Execute within policy
 
 - Queue work through Redis and persist orchestration truth in PostgreSQL.
-- Execute eligible specialist packages sequentially.
+- Execute eligible specialist packages sequentially when work-package execution
+  is explicitly enabled.
 - Build bounded repository context packets.
 - Write generated output into per-attempt sandboxes under `.forge/task-runs`.
 - Keep generated files there for review and manual application.
@@ -105,7 +109,7 @@ Create task
   -> FORGE materializes packages and gates
   -> operator reviews the plan
   -> capability/MCP admission runs
-  -> specialist executes in a bounded attempt sandbox
+  -> specialist executes in a bounded attempt sandbox when explicitly enabled
   -> operator reviews and manually applies accepted files
   -> QA / Reviewer / Security evidence is collected
   -> operator accepts, requests rework, or stops
@@ -201,7 +205,8 @@ Not built or intentionally deferred:
 - earned autonomy without verified historical evidence;
 - the full dockable Forge Workspace shell and link graph.
 
-Current execution paths can be disabled with explicit flags including:
+Optional execution paths remain disabled unless explicitly enabled. For example,
+set these flags to `0` to keep them disabled:
 
 ```text
 FORGE_WORKFORCE_MATERIALIZATION=0

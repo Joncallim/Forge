@@ -69,6 +69,12 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - run: npm install
+      - name: Install redis-cli for migration proof
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes redis-tools
+          redis-cli --version
       - name: Create disposable migration and ordinary app logins
         working-directory: .
         env:
@@ -84,6 +90,7 @@ jobs:
           CREATE DATABASE forge_epic_172_ci_test OWNER forge_migration_test;
           CREATE DATABASE forge_migration_0026_upgrade_test OWNER forge_migration_test;
           CREATE DATABASE forge_migration_0027_upgrade_test OWNER forge_migration_test;
+          CREATE DATABASE forge_s4_ci_test OWNER forge_migration_test;
           SQL
       - name: Prove populated migration 0025 to 0026 upgrade
         run: bash scripts/ci/prove-migration-0026-upgrade.sh
@@ -95,6 +102,61 @@ jobs:
         env:
           FORGE_MIGRATION_0027_DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_migration_0027_upgrade_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_migration_0027_upgrade_test
+      - name: Create the freshly migrated isolated S4 PostgreSQL proof database
+        run: |
+          npm run protocol:bootstrap-epic-172-release-roles
+          npx tsx scripts/ci/migrate-through-0025.ts
+          npm run protocol:bootstrap-epic-172-s3-release-owner
+          npx tsx scripts/ci/migrate-through-0026.ts
+          npm run protocol:bootstrap-epic-172-s4-roles
+          npm run db:migrate
+        env:
+          DATABASE_URL: postgresql://forge_migration_test:forge_migration_test@localhost:5432/forge_s4_ci_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_s4_ci_test
+      - name: Configure isolated S4 proof principal passwords
+        working-directory: .
+        env:
+          PGPASSWORD: forge
+        run: |
+          psql --host localhost --username forge_e2e --dbname forge_s4_ci_test --set ON_ERROR_STOP=1 <<'SQL'
+          ALTER ROLE forge_release_evidence_writer PASSWORD 'forge_writer_test';
+          ALTER ROLE forge_release_transition PASSWORD 'forge_transition_test';
+          ALTER ROLE forge_architect_plan_writer PASSWORD 'forge_plan_writer_test';
+          ALTER ROLE forge_architect_plan_resolver PASSWORD 'forge_plan_resolver_test';
+          ALTER ROLE forge_architect_plan_history_reader PASSWORD 'forge_plan_history_reader_test';
+          ALTER ROLE forge_packet_issuer PASSWORD 'forge_packet_issuer_test';
+          SQL
+      - name: Provision the isolated S4 ordinary application boundary
+        run: npm run protocol:provision-epic-172-application-role
+        env:
+          FORGE_APPLICATION_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_s4_ci_test
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_s4_ci_test
+      - name: Grant isolated S4 ordinary application tables
+        working-directory: .
+        env:
+          PGPASSWORD: forge
+        run: |
+          psql --host localhost --username forge_e2e --dbname forge_s4_ci_test --set ON_ERROR_STOP=1 <<'SQL'
+          DO $grant_s4_application_acl$
+          DECLARE table_name text;
+          BEGIN
+            FOREACH table_name IN ARRAY ARRAY[
+              'users', 'credentials', 'sessions', 'session_credential_reconciliation',
+              'provider_configs', 'provider_health_checks', 'projects', 'mcp_installations',
+              'project_mcp_status_checks', 'tasks', 'task_attempts', 'agent_harnesses',
+              'work_packages', 'filesystem_mcp_grant_approvals',
+              'filesystem_mcp_current_decision_pointers', 'project_filesystem_grant_decisions',
+              'project_filesystem_current_decision_pointers', 'work_package_dependencies',
+              'agent_runs', 'artifacts', 'approval_gates', 'task_logs', 'vcs_changes',
+              'repository_command_audits', 'agent_configs', 'workforces', 'workforce_agents',
+              'app_settings', 'task_questions'
+            ] LOOP
+              EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO forge_app_test', table_name);
+            END LOOP;
+            GRANT USAGE, SELECT ON SEQUENCE public.task_logs_sequence_seq TO forge_app_test;
+          END;
+          $grant_s4_application_acl$;
+          SQL
       - name: Bootstrap Epic 172 release roles
         run: npm run protocol:bootstrap-epic-172-release-roles
         env:
@@ -307,18 +369,37 @@ jobs:
       - run: npm run lint -- --max-warnings=0
       - run: npx tsc --noEmit
       - name: Run the complete zero-skip unit suite
-        run: npm test
+        run: npm run test:unit:zero-skip
         env:
           FORGE_EPIC_172_REQUIRE_POSTGRES_TEST: '1'
           FORGE_EPIC_172_TEST_APP_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_WRITER_DATABASE_URL: postgresql://forge_release_evidence_writer:forge_writer_test@localhost:5432/forge_epic_172_ci_test
           FORGE_EPIC_172_TEST_TRANSITION_DATABASE_URL: postgresql://forge_release_transition:forge_transition_test@localhost:5432/forge_epic_172_ci_test
-          FORGE_S4_REQUIRE_POSTGRES_TEST: '1'
-          FORGE_S4_POSTGRES_TEST_DATABASE_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
           FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL: postgresql://forge_architect_plan_writer:forge_plan_writer_test@localhost:5432/forge_epic_172_ci_test
           FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL: postgresql://forge_architect_plan_resolver:forge_plan_resolver_test@localhost:5432/forge_epic_172_ci_test
           FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL: postgresql://forge_architect_plan_history_reader:forge_plan_history_reader_test@localhost:5432/forge_epic_172_ci_test
           FORGE_PACKET_ISSUER_DATABASE_URL: postgresql://forge_packet_issuer:forge_packet_issuer_test@localhost:5432/forge_epic_172_ci_test
+      - name: Run mandatory S4 PostgreSQL zero-skip proof
+        env:
+          FORGE_S4_REQUIRE_POSTGRES_TEST: '1'
+          FORGE_S4_POSTGRES_TEST_DATABASE_URL: postgresql://forge_e2e:forge@localhost:5432/forge_s4_ci_test
+          FORGE_EPIC_172_TEST_APP_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_s4_ci_test
+          FORGE_PACKET_ISSUER_DATABASE_URL: postgresql://forge_packet_issuer:forge_packet_issuer_test@localhost:5432/forge_s4_ci_test
+          FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL: postgresql://forge_architect_plan_writer:forge_plan_writer_test@localhost:5432/forge_s4_ci_test
+          FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL: postgresql://forge_architect_plan_resolver:forge_plan_resolver_test@localhost:5432/forge_s4_ci_test
+          FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL: postgresql://forge_architect_plan_history_reader:forge_plan_history_reader_test@localhost:5432/forge_s4_ci_test
+        run: |
+          set -o pipefail
+          report="$(mktemp)"
+          npm run test:mcp:s4-postgres -- --reporter=line | tee "$report"
+          if grep -Eq '[1-9][0-9]* skipped' "$report"; then
+            echo 'The mandatory S4 PostgreSQL proof was skipped.' >&2
+            exit 1
+          fi
+          if ! grep -Eq '[1-9][0-9]* passed' "$report"; then
+            echo 'The mandatory S4 PostgreSQL proof did not report a passing test.' >&2
+            exit 1
+          fi
       - run: npm run build
       - run: npx playwright install chromium
       - name: Run mandatory S3 PostgreSQL concurrency proof
