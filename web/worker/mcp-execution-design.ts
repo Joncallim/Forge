@@ -1650,6 +1650,7 @@ function brokerHasProtectedPromptContext(
   metadata: unknown,
   _entry: { requirementKey: string; agent: string; mcpId: string },
 ): boolean {
+  void _entry
   const protectedContext = protectedPromptContextState(metadata)
   if (
     protectedContext.errors.length > 0 ||

@@ -80,6 +80,7 @@ type AuthorizedSession = {
   expiresAt: Date
   refreshed: boolean
   credentialStorageVersion: number
+  writeLegacyCacheAfterCommit: boolean
 }
 
 type LegacyRedisAuthority = {
@@ -143,10 +144,8 @@ async function authorizeSession(
   digest: Buffer,
 ): Promise<AuthorizedSession | null> {
   return db.transaction(async (tx) => {
-    // Hold this row until every legacy Redis write in this request has
-    // finished. The reconciler takes FOR UPDATE before entering draining, so
-    // it cannot zero-scan old keys and then have an expansion request recreate
-    // one behind it.
+    // This lock makes the database decision and any sliding refresh atomic.
+    // Redis remains a repairable cache and is written only after commit.
     const [reconciliation] = await tx
       .select({ state: sessionCredentialReconciliation.state })
       .from(sessionCredentialReconciliation)
@@ -235,6 +234,7 @@ async function authorizeSession(
         expiresAt: liveExpiresAt,
         refreshed: false,
         credentialStorageVersion: storageVersion,
+        writeLegacyCacheAfterCommit: storageVersion === 1 && reconciliation.state === 'expansion',
       }
     } else {
       const [refreshed] = await tx
@@ -259,13 +259,8 @@ async function authorizeSession(
         expiresAt: parseDatabaseTimestamp(refreshed.expiresAt, 'refreshed expiry'),
         refreshed: true,
         credentialStorageVersion: storageVersion,
+        writeLegacyCacheAfterCommit: storageVersion === 1 && reconciliation.state === 'expansion',
       }
-    }
-
-    if (authorized.credentialStorageVersion === 1 && reconciliation.state === 'expansion') {
-      // Cache failure is non-authoritative, but the attempted write must occur
-      // before this transaction releases the reconciliation lock.
-      await writeLegacySessionCache(credential, authorized).catch(() => {})
     }
     return authorized
   })
@@ -310,6 +305,9 @@ export async function getSession(
 
   // Redis is a repairable cache only. Failure never turns a database-valid
   // session into an authorization failure and never extends database expiry.
+  if (authorized.writeLegacyCacheAfterCommit) {
+    await writeLegacySessionCache(credential, authorized).catch(() => {})
+  }
   await cacheAuthorizedSession(digest, authorized).catch(() => {})
   return { sessionId: authorized.sessionId, userId: authorized.userId }
 }
@@ -352,17 +350,17 @@ export async function createSession(
         lastSeenAt: sessions.lastSeenAt,
         expiresAt: sessions.expiresAt,
       })
-    if (created?.expiresAt && dualWrite) {
-      await writeLegacySessionCache(credential, {
-        userId,
-        lastSeenAt: created.lastSeenAt,
-        expiresAt: created.expiresAt,
-      }).catch(() => {})
-    }
     return { created, dualWrite }
   })
 
   if (!created?.expiresAt) throw new Error('Session creation did not return an expiry')
+  if (dualWrite) {
+    await writeLegacySessionCache(credential, {
+      userId,
+      lastSeenAt: created.lastSeenAt,
+      expiresAt: created.expiresAt,
+    }).catch(() => {})
+  }
   await cacheAuthorizedSession(digest, {
     sessionId: created.sessionId,
     userId,
@@ -370,6 +368,7 @@ export async function createSession(
     expiresAt: created.expiresAt,
     refreshed: true,
     credentialStorageVersion: dualWrite ? 1 : 2,
+    writeLegacyCacheAfterCommit: false,
   }).catch(() => {})
 
   return credential

@@ -142,6 +142,10 @@ function createdSessionChain() {
   }])
 }
 
+function transactionClient() {
+  return { select: mockDbSelect, insert: mockDbInsert, update: mockDbUpdate }
+}
+
 // ---------------------------------------------------------------------------
 // Fake request builder
 // ---------------------------------------------------------------------------
@@ -277,6 +281,37 @@ describe('createSession', () => {
     expect(mockDbInsert.mock.results[0].value.values).toHaveBeenCalledWith(
       expect.objectContaining({ id: credential, credentialStorageVersion: 1 }),
     )
+  })
+
+  it('does not write either Redis session key when the database commit fails', async () => {
+    process.env.FORGE_SESSION_CREDENTIAL_MODE = 'dual'
+    mockDbSelect.mockReturnValue(chain([{ state: 'expansion' }]))
+    mockDbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) => {
+      await callback(transactionClient())
+      throw new Error('commit failed')
+    })
+
+    await expect(createSession('user-1', null, {})).rejects.toThrow('commit failed')
+    expect(mockDbInsert).toHaveBeenCalledOnce()
+    expect(mockRedisSet).not.toHaveBeenCalled()
+  })
+
+  it('writes the dual legacy cache only after the transaction has committed', async () => {
+    process.env.FORGE_SESSION_CREDENTIAL_MODE = 'dual'
+    mockDbSelect.mockReturnValue(chain([{ state: 'expansion' }]))
+    let committed = false
+    mockDbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) => {
+      const result = await callback(transactionClient())
+      committed = true
+      return result
+    })
+    mockRedisSet.mockImplementation(async () => {
+      expect(committed).toBe(true)
+      return 'OK'
+    })
+
+    await createSession('user-1', null, {})
+    expect(mockRedisSet).toHaveBeenCalledTimes(2)
   })
 })
 
@@ -557,6 +592,66 @@ describe('getSession — write-behind logic', () => {
     expect(mockDbUpdate).toHaveBeenCalledOnce()
     // Redis was also refreshed
     expect(mockRedisSet).toHaveBeenCalledOnce()
+  })
+
+  it('does not write a legacy cache when the sliding-refresh transaction fails to commit', async () => {
+    const now = Date.now()
+    vi.setSystemTime(now)
+    process.env.FORGE_SESSION_CREDENTIAL_MODE = 'dual'
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ state: 'expansion' }]))
+      .mockReturnValueOnce(chain([{
+        sessionId: '00000000-0000-4000-8000-000000000010',
+        userId: 'user-1',
+        lastSeenAt: new Date(now - 61_000),
+        expiresAt: new Date(now + 60_000),
+        revokedAt: null,
+        credentialStorageVersion: 1,
+        databaseNow: new Date(now),
+      }]))
+    mockDbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) => {
+      await callback(transactionClient())
+      throw new Error('commit failed')
+    })
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    await expect(getSession(fakeRequest('00000000-0000-4000-8000-000000000000'))).resolves.toBeNull()
+    expect(mockDbUpdate).toHaveBeenCalledOnce()
+    expect(mockRedisSet).not.toHaveBeenCalled()
+    consoleError.mockRestore()
+  })
+
+  it('writes the sliding-refresh legacy cache only after commit', async () => {
+    const now = Date.now()
+    vi.setSystemTime(now)
+    process.env.FORGE_SESSION_CREDENTIAL_MODE = 'dual'
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ state: 'expansion' }]))
+      .mockReturnValueOnce(chain([{
+        sessionId: '00000000-0000-4000-8000-000000000010',
+        userId: 'user-1',
+        lastSeenAt: new Date(now - 61_000),
+        expiresAt: new Date(now + 60_000),
+        revokedAt: null,
+        credentialStorageVersion: 1,
+        databaseNow: new Date(now),
+      }]))
+    let committed = false
+    mockDbTransaction.mockImplementationOnce(async (callback: (tx: unknown) => unknown) => {
+      const result = await callback(transactionClient())
+      committed = true
+      return result
+    })
+    mockRedisSet.mockImplementation(async () => {
+      expect(committed).toBe(true)
+      return 'OK'
+    })
+
+    await expect(getSession(fakeRequest('00000000-0000-4000-8000-000000000000'))).resolves.toEqual({
+      sessionId: '00000000-0000-4000-8000-000000000010',
+      userId: 'user-1',
+    })
+    expect(mockRedisSet).toHaveBeenCalledTimes(2)
   })
 })
 

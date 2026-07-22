@@ -11,7 +11,10 @@ import {
   applyPacketIssuanceRecoveryActionV2,
   S4LifecycleError,
 } from '@/lib/mcps/s4-lease'
-import { convergeRecognizedOperatorHoldTask } from '@/lib/mcps/filesystem-grant-reconciliation'
+import {
+  convergeRecognizedOperatorHoldTask,
+  loadCurrentProjectFilesystemDecision,
+} from '@/lib/mcps/filesystem-grant-reconciliation'
 import { getSession } from '@/lib/session'
 import { getAccessibleTask } from '@/lib/task-access'
 import { enqueueBlockedHandoffRetry } from '@/worker/blocked-handoff-retry'
@@ -43,6 +46,15 @@ export async function POST(
     if (!body) {
       return NextResponse.json({ error: 'Invalid packet-issuance recovery payload.' }, { status: 400 })
     }
+    if (task.status !== 'approved' || task.localProjectionScopeState !== 'active') {
+      return NextResponse.json({ error: 'Recovery state changed. Reload and retry.' }, { status: 409 })
+    }
+    const authorizingDecision = body.action === 'retry_execution'
+      ? await loadCurrentProjectFilesystemDecision(task.projectId)
+      : null
+    if (body.action === 'retry_execution' && authorizingDecision?.decision !== 'approved') {
+      return NextResponse.json({ error: 'Recovery state changed. Reload and retry.' }, { status: 409 })
+    }
 
     const result = await applyPacketIssuanceRecoveryActionV2({
       taskId,
@@ -51,6 +63,7 @@ export async function POST(
       action: body.action,
       expectedMarkerFingerprint: body.markerFingerprint,
       actorUserId: session.userId,
+      authorizingDecisionId: authorizingDecision?.decisionId ?? null,
     })
 
     let continuationStatus: 'not_required' | 'enqueued' | 'already_queued' | 'pending' = 'not_required'

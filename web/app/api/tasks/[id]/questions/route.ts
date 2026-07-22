@@ -141,16 +141,6 @@ export async function POST(
     )
     const updatedQuestions = updated.flat()
 
-    await publishTaskEvent(taskId, 'questions:answered', {
-      questions: updatedQuestions.map((q) => ({
-          id: q.id,
-          question: q.question,
-          suggestions: q.suggestions,
-          answer: q.answer,
-          status: q.status,
-        })),
-    })
-
     // Check whether every question for this task is now answered. If so,
     // enqueue a re-plan job so the architect re-runs with the answers in
     // context and the task can move on to awaiting_approval.
@@ -160,6 +150,11 @@ export async function POST(
       .where(eq(taskQuestions.taskId, taskId))
 
     const allAnswered = allQuestions.length > 0 && allQuestions.every((q) => q.status === 'answered')
+
+    await publishTaskEvent(taskId, 'questions:answered', {
+      answeredCount: updatedQuestions.length,
+      allAnswered,
+    })
 
     if (allAnswered) {
       await redis.lpush('forge:answers', JSON.stringify({ taskId }))

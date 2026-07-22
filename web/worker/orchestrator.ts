@@ -687,7 +687,10 @@ export async function previousPlanContextForArchitectRun(input: {
   if (!previousPlan) throw new Error('Protected Architect replan resolved an empty plan. Replan failed closed.')
   return {
     planText: previousPlan,
-    protectedEntries: resolved.map(({ expectedEntryId: _expectedEntryId, ...entry }) => entry),
+    protectedEntries: resolved.map(({ expectedEntryId, ...entry }) => {
+      void expectedEntryId
+      return entry
+    }),
     protectedComparableEntries: protectedComparableEntries(resolved),
   }
 }

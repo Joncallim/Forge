@@ -48,23 +48,44 @@ describe('task-event publisher authority', () => {
     expect(mockPublish).not.toHaveBeenCalled()
   })
 
-  it('publishes live-only events through the publisher client without mutating history', async () => {
+  it('rejects run chunks before Redis so raw model output has no live bypass', async () => {
     const { publishTaskEvent } = await import('@/worker/events')
-    await publishTaskEvent('task-1', 'run:chunk', {
+    await expect(publishTaskEvent('task-1', 'run:chunk', {
       delta: 'secret model output',
       metadata: { status: 'streaming' },
-    })
+    })).rejects.toThrow("does not match the closed v2 schema")
 
     expect(mockEval).not.toHaveBeenCalled()
-    expect(mockPublish).toHaveBeenCalledOnce()
-    const [channel, rawEnvelope] = mockPublish.mock.calls[0]
-    expect(channel).toBe('forge:task:task-1')
-    expect(JSON.parse(rawEnvelope as string)).toEqual({
-      schemaVersion: 2,
-      id: null,
-      type: 'run:chunk',
-      data: { type: 'run:chunk', metadata: { status: 'streaming' } },
+    expect(mockPublish).not.toHaveBeenCalled()
+  })
+
+  it('persists only a bounded content-free question-answer projection', async () => {
+    const { publishTaskEvent } = await import('@/worker/events')
+    await publishTaskEvent('task-1', 'questions:answered', {
+      answeredCount: 2,
+      allAnswered: true,
+      questions: [{
+        question: 'RAW-QUESTION-SENTINEL',
+        suggestions: ['RAW-SUGGESTION-SENTINEL'],
+        answer: 'RAW-ANSWER-SENTINEL',
+      }],
     })
+
+    expect(mockEval).toHaveBeenCalledOnce()
+    const data = mockEval.mock.calls[0][5]
+    expect(JSON.parse(data as string)).toEqual({ answeredCount: 2, allAnswered: true })
+    expect(String(data)).not.toContain('RAW-')
+    expect(mockPublish).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['unknown type', 'provider:raw', { status: 'streaming' }],
+    ['malformed known type', 'task:status', { status: 'running' }],
+  ])('rejects %s before any Redis call', async (_label, type, payload) => {
+    const { publishTaskEvent } = await import('@/worker/events')
+    await expect(publishTaskEvent('task-1', type, payload)).rejects.toThrow(/closed v2 schema/)
+    expect(mockEval).not.toHaveBeenCalled()
+    expect(mockPublish).not.toHaveBeenCalled()
   })
 
   it('fails before any separate publish when the atomic durable write fails', async () => {

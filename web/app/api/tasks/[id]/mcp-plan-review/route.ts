@@ -6,7 +6,6 @@ import { approvalGates, artifacts, tasks, workPackages } from '@/db/schema'
 import { getSession, readSessionCredential } from '@/lib/session'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
 import type { McpExecutionDesign } from '@/worker/mcp-execution-design'
-import { parseMcpExecutionDesign } from '@/worker/mcp-execution-design'
 import { ARCHITECT_PLAN_HEADER } from '@/lib/mcps/architect-plan-entries'
 import { appendProtectedMcpOperatorReview, readArchitectPlanHistory } from '@/lib/mcps/history-reader'
 import type { ArchitectPlanHistoryEntry } from '@/lib/mcps/history-reader'
@@ -34,7 +33,8 @@ function protectedMcpDesignFromHistory(entries: readonly ArchitectPlanHistoryEnt
       .map((entry) => {
         const parsed = JSON.parse(entry.content) as unknown
         if (!isRecord(parsed) || parsed.schemaVersion !== 1 || parsed.requirementKey !== entry.requirementKey) throw new Error('invalid requirement')
-        const { schemaVersion: _schemaVersion, ...requirement } = parsed
+        const requirement = { ...parsed }
+        delete requirement.schemaVersion
         return requirement
       })
     const requirementByKey = new Map(requirements.flatMap((requirement) =>
@@ -60,7 +60,8 @@ function protectedMcpDesignFromHistory(entries: readonly ArchitectPlanHistoryEnt
       .map((entry) => {
         const parsed = JSON.parse(entry.content) as unknown
         if (!isRecord(parsed) || parsed.schemaVersion !== 1) throw new Error('invalid subtask')
-        const { schemaVersion: _schemaVersion, ...subtask } = parsed
+        const subtask = { ...parsed }
+        delete subtask.schemaVersion
         return subtask
       })
     return {

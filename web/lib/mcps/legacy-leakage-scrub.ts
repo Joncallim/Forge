@@ -17,6 +17,7 @@ export type LegacyLeakageScrubPhase =
   | 'task_logs'
   | 'artifacts'
   | 'work_packages'
+  | 'approval_gates'
   | 'redis_legacy'
   | 'redis_v2_verify'
   | 'complete'
@@ -44,10 +45,17 @@ export type LegacyWorkPackageScrubRow = Readonly<{
   metadata: Record<string, unknown>
 }>
 
+export type LegacyApprovalGateScrubRow = Readonly<{
+  id: string
+  kind: 'approval_gate'
+  metadata: Record<string, unknown>
+}>
+
 export type LegacyLeakageScrubRow =
   | LegacyTaskLogScrubRow
   | LegacyArtifactScrubRow
   | LegacyWorkPackageScrubRow
+  | LegacyApprovalGateScrubRow
 
 export type LegacyLeakageScrubCheckpoint = Readonly<{
   schemaVersion: 1
@@ -94,7 +102,7 @@ export interface LegacyLeakageScrubDatabase {
   loadCheckpoint(operationId: string): Promise<LoadedLegacyLeakageCheckpoint | null>
   createCheckpoint(checkpoint: LegacyLeakageScrubCheckpoint): Promise<LoadedLegacyLeakageCheckpoint | null>
   scanRows(
-    phase: 'task_logs' | 'artifacts' | 'work_packages',
+    phase: 'task_logs' | 'artifacts' | 'work_packages' | 'approval_gates',
     afterId: string | null,
     limit: number,
   ): Promise<LegacyLeakageScrubRow[]>
@@ -137,6 +145,8 @@ export type LegacyLeakageScrubResult = Readonly<{
     taskLogRowsChanged: number
     workPackageRowsExamined: number
     workPackageRowsChanged: number
+    approvalGateRowsExamined: number
+    approvalGateRowsChanged: number
     redis: RedisScanEvidence
     redisV2: RedisScanEvidence
   }> | null
@@ -256,11 +266,11 @@ const V2_ARTIFACT_EVENT_SCHEMAS: readonly V2EventSchema[] = [
 
 const V2_EVENT_SCHEMAS: Readonly<Record<string, V2EventSchema>> = {
   'approval_gate:created': {
-    required: ['gateId', 'status', 'updatedAt', 'workPackageId'],
+    required: ['gateId', 'status', 'updatedAt'],
     fields: { gateId: uuid, gateType: token, requiredRole: token, status: token, updatedAt: timestamp, workPackageId: uuid },
   },
   'approval_gate:decided': {
-    required: ['gateId', 'status', 'updatedAt', 'workPackageId'],
+    required: ['gateId', 'status', 'updatedAt'],
     fields: { decision: token, gateId: uuid, gateType: token, requiredRole: token, status: token, updatedAt: timestamp, workPackageId: uuid },
   },
   'questions:created': {
@@ -268,6 +278,10 @@ const V2_EVENT_SCHEMAS: Readonly<Record<string, V2EventSchema>> = {
     // Prompt/question text is not an allowed durable v2-history field. An empty
     // array is the only safe notification shape.
     fields: { questions: emptyArray },
+  },
+  'questions:answered': {
+    required: ['answeredCount', 'allAnswered'],
+    fields: { answeredCount: nonNegativeInteger, allAnswered: boolean },
   },
   'run:completed': {
     required: ['runId'],
@@ -437,6 +451,7 @@ async function dryRun(
   const taskLogRows = await database.scanRows('task_logs', null, options.batchSize)
   const artifactRows = await database.scanRows('artifacts', null, options.batchSize)
   const workPackageRows = await database.scanRows('work_packages', null, options.batchSize)
+  const approvalGateRows = await database.scanRows('approval_gates', null, options.batchSize)
   const redisEvidence = await redis.purgeLegacyTaskEventKeys({ apply: false })
   const redisV2Evidence = await redis.scanV2TaskEventHistory(options.sentinels)
 
@@ -450,6 +465,8 @@ async function dryRun(
       taskLogRowsChanged: taskLogRows.filter(legacyLeakageRowChanged).length,
       workPackageRowsExamined: workPackageRows.length,
       workPackageRowsChanged: workPackageRows.filter(legacyLeakageRowChanged).length,
+      approvalGateRowsExamined: approvalGateRows.length,
+      approvalGateRowsChanged: approvalGateRows.filter(legacyLeakageRowChanged).length,
       redis: redisEvidence,
       redisV2: redisV2Evidence,
     },
@@ -465,7 +482,7 @@ async function scanDatabaseForLeakage(
   let rowsExamined = 0
   let violations = 0
   let batches = 0
-  for (const phase of ['task_logs', 'artifacts', 'work_packages'] as const) {
+  for (const phase of ['task_logs', 'artifacts', 'work_packages', 'approval_gates'] as const) {
     let afterId: string | null = null
     while (batches < MAX_FINAL_DATABASE_SCAN_BATCHES) {
       const rows = await database.scanRows(phase, afterId, batchSize)
@@ -574,7 +591,7 @@ export async function runLegacyLeakageScrub(
   let batches = 0
   while (batches < maxBatches && current.checkpoint.phase !== 'complete') {
     const phase = current.checkpoint.phase
-    if (phase === 'task_logs' || phase === 'artifacts' || phase === 'work_packages') {
+    if (phase === 'task_logs' || phase === 'artifacts' || phase === 'work_packages' || phase === 'approval_gates') {
       const rows = await dependencies.database.scanRows(phase, current.checkpoint.lastKey, batchSize)
       batches += 1
       if (rows.length === 0) {
@@ -583,7 +600,9 @@ export async function runLegacyLeakageScrub(
             ? 'artifacts'
             : phase === 'artifacts'
               ? 'work_packages'
-              : 'redis_legacy',
+              : phase === 'work_packages'
+                ? 'approval_gates'
+                : 'redis_legacy',
           lastKey: null,
           lastPreFingerprint: null,
           lastPostFingerprint: null,

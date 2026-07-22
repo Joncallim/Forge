@@ -40,6 +40,7 @@ class FakeDatabase implements LegacyLeakageScrubDatabase {
   taskLogs: LegacyLeakageScrubRow[] = []
   artifacts: LegacyLeakageScrubRow[] = []
   workPackages: LegacyLeakageScrubRow[] = []
+  approvalGates: LegacyLeakageScrubRow[] = []
   protectedPlanEntries = [{ id: 'protected-entry', content: 'PROTECTED-PLAN-SENTINEL' }]
   authorizationChecks = 0
   updates = 0
@@ -70,7 +71,7 @@ class FakeDatabase implements LegacyLeakageScrubDatabase {
   }
 
   async scanRows(
-    phase: 'task_logs' | 'artifacts' | 'work_packages',
+    phase: 'task_logs' | 'artifacts' | 'work_packages' | 'approval_gates',
     afterId: string | null,
     limit: number,
   ): Promise<LegacyLeakageScrubRow[]> {
@@ -78,7 +79,9 @@ class FakeDatabase implements LegacyLeakageScrubDatabase {
       ? this.taskLogs
       : phase === 'artifacts'
         ? this.artifacts
-        : this.workPackages
+        : phase === 'work_packages'
+          ? this.workPackages
+          : this.approvalGates
     return source.filter((row) => afterId === null || row.id > afterId).slice(0, limit)
   }
 
@@ -93,7 +96,9 @@ class FakeDatabase implements LegacyLeakageScrubDatabase {
       ? this.taskLogs
       : input.row.kind === 'artifact'
         ? this.artifacts
-        : this.workPackages
+        : input.row.kind === 'work_package'
+          ? this.workPackages
+          : this.approvalGates
     const index = rows.findIndex((row) => row.id === input.row.id)
     if (index < 0) return 'row_conflict'
     if (this.conflictOnceFor === input.row.id) {
@@ -226,6 +231,22 @@ function workPackage(id = '00000000-0000-4000-8000-000000000006'): LegacyLeakage
   }
 }
 
+function approvalGate(id = '00000000-0000-4000-8000-000000000007'): LegacyLeakageScrubRow {
+  return {
+    id,
+    kind: 'approval_gate',
+    metadata: {
+      mcpOperatorReviewRequired: true,
+      s4State: 'activated',
+      mcpOperatorReviews: [{
+        schemaVersion: 1,
+        items: [{ promptOverlays: { backend: 'RAW-ACTIVATED-S4-PROMPT-SENTINEL' } }],
+        reviewedDesign: { systemPrompt: 'RAW-ACTIVATED-S4-SYSTEM-SENTINEL' },
+      }],
+    },
+  }
+}
+
 describe('legacy leakage scrub', () => {
   it('keeps dry-run actionless while reporting bounded database and Redis work', async () => {
     const database = new FakeDatabase()
@@ -233,6 +254,7 @@ describe('legacy leakage scrub', () => {
     database.taskLogs = [taskLog()]
     database.artifacts = [artifact(), ordinaryArtifact(), protectedHistoryArtifact(), spoofedHistoryArtifact()]
     database.workPackages = [workPackage()]
+    database.approvalGates = [approvalGate()]
 
     const result = await runLegacyLeakageScrub({
       actor: 'operator',
@@ -247,6 +269,7 @@ describe('legacy leakage scrub', () => {
         artifactRowsChanged: 3,
         taskLogRowsChanged: 1,
         workPackageRowsChanged: 1,
+        approvalGateRowsChanged: 1,
         redis: { keysDeleted: 0, remainingKeys: 2 },
       },
     })
@@ -263,6 +286,7 @@ describe('legacy leakage scrub', () => {
     database.taskLogs = [taskLog()]
     database.artifacts = [artifact(), ordinaryArtifact(), protectedHistoryArtifact(), spoofedHistoryArtifact()]
     database.workPackages = [workPackage()]
+    database.approvalGates = [approvalGate()]
     database.conflictOnceFor = database.taskLogs[0].id
 
     const first = await runLegacyLeakageScrub({
@@ -279,7 +303,7 @@ describe('legacy leakage scrub', () => {
       mode: 'resume',
       operationId: 'leakage-operation',
     }, { database, redis })
-    expect(resumed.checkpoint).toMatchObject({ phase: 'complete', state: 'complete', rowsChanged: 5 })
+    expect(resumed.checkpoint).toMatchObject({ phase: 'complete', state: 'complete', rowsChanged: 6 })
 
     const cleanedLog = database.taskLogs[0]
     expect(cleanedLog).toMatchObject({
@@ -318,6 +342,16 @@ describe('legacy leakage scrub', () => {
       metadata: { status: 'pending', hostileMetadata: {} },
     })
     expect(JSON.stringify(database.workPackages[0])).not.toContain('RAW-')
+    expect(database.approvalGates[0]).toEqual({
+      id: '00000000-0000-4000-8000-000000000007',
+      kind: 'approval_gate',
+      metadata: {
+        mcpOperatorReviewRequired: true,
+        s4State: 'activated',
+        mcpOperatorReviews: [{ schemaVersion: 1, items: [{}], reviewedDesign: {} }],
+      },
+    })
+    expect(JSON.stringify(database.approvalGates[0])).not.toContain('RAW-')
     expect(database.protectedPlanEntries).toEqual([
       { id: 'protected-entry', content: 'PROTECTED-PLAN-SENTINEL' },
     ])
@@ -428,6 +462,7 @@ describe('legacy leakage scrub', () => {
       'approval_gate:created',
       'approval_gate:decided',
       'questions:created',
+      'questions:answered',
       'run:completed',
       'run:failed',
       'run:progress',
@@ -463,6 +498,13 @@ describe('legacy leakage scrub', () => {
       if (event.type === 'questions:created') {
         richProducerData.questions = [{ question: 'private prompt?', answer: 'private answer' }]
       }
+      if (event.type === 'questions:answered') {
+        richProducerData.questions = [{
+          question: 'RAW-QUESTION-SENTINEL',
+          suggestions: ['RAW-SUGGESTION-SENTINEL'],
+          answer: 'RAW-ANSWER-SENTINEL',
+        }]
+      }
       if (event.type === 'task:status' || event.type === 'run:failed') {
         richProducerData.errorMessage = 'failed at /workspace/operator/project with api_key=secret'
       }
@@ -479,7 +521,11 @@ describe('legacy leakage scrub', () => {
       expect(projected).not.toHaveProperty('content')
     }
     expect(projectV2TaskEventData('run:chunk', { delta: 'private output' })).toBeNull()
-    expect(projectV2TaskEventData('questions:answered', { answers: ['private answer'] })).toBeNull()
+    expect(projectV2TaskEventData('questions:answered', {
+      answeredCount: 1,
+      allAnswered: false,
+      questions: [{ question: 'private question', suggestions: ['private suggestion'], answer: 'private answer' }],
+    })).toEqual({ answeredCount: 1, allAnswered: false })
   })
 
   it('rechecks database and Redis zero scans before trusting a completed checkpoint', async () => {

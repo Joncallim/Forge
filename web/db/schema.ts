@@ -1763,6 +1763,10 @@ export const filesystemMcpIssuanceRecoveryActions = pgTable(
     expectedMarkerFingerprint: text('expected_marker_fingerprint').notNull(),
     actorUserId: uuid('actor_user_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
     authorizingDecisionId: uuid('authorizing_decision_id').references(() => filesystemMcpGrantApprovals.id, { onDelete: 'restrict' }),
+    authorizingProjectDecisionId: uuid('authorizing_project_decision_id').references(
+      () => projectFilesystemGrantDecisions.id,
+      { onDelete: 'restrict', onUpdate: 'restrict' },
+    ),
     result: text('result').notNull(),
     resultMarkerFingerprint: text('result_marker_fingerprint'),
     packageStatus: text('package_status').notNull(),

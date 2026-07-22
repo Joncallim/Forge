@@ -695,6 +695,112 @@ describe('executeWorkPackage', () => {
     })
   })
 
+  it('writes valid nested host files and removes atomic-write helper files', async () => {
+    mocks.generateText.mockResolvedValue({
+      text: JSON.stringify({
+        schemaVersion: 1,
+        summary: 'Built a nested app.',
+        files: [
+          { path: 'src/lib/app.js', content: 'module.exports = { ready: true };\n' },
+          {
+            path: 'package.json',
+            content: JSON.stringify({ scripts: { build: 'node --check src/lib/app.js' } }),
+          },
+        ],
+        commands: [['npm', 'run', 'build']],
+      }),
+    })
+
+    const result = await executeWorkPackage(hostWriteContext())
+
+    await expect(fs.readFile(path.join(tempRoot, 'src', 'lib', 'app.js'), 'utf8'))
+      .resolves.toBe('module.exports = { ready: true };\n')
+    await expect(fs.readdir(path.join(tempRoot, 'src', 'lib'))).resolves.toEqual(['app.js'])
+    expect(result.hostRepositoryWritePaths).toEqual(['src/lib/app.js', 'package.json'])
+    expect((await fs.readdir(tempRoot)).some((entry) => entry.includes('.forge-write-') || entry.includes('.forge-backup-')))
+      .toBe(false)
+  })
+
+  it('rejects a symlinked parent before creating its missing descendants', async () => {
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-executor-outside-'))
+    try {
+      await fs.symlink(outsideRoot, path.join(tempRoot, 'linked'))
+      mocks.generateText.mockResolvedValue({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Attempt a nested symlink escape.',
+          files: [
+            { path: 'linked/missing/app.js', content: 'module.exports = true;\n' },
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { build: 'node --check linked/missing/app.js' } }),
+            },
+          ],
+          commands: [['npm', 'run', 'build']],
+        }),
+      })
+
+      await expect(executeWorkPackage(hostWriteContext())).rejects.toThrow(/symbolic link/i)
+      await expect(fs.readdir(outsideRoot)).resolves.toEqual([])
+      await expect(fs.stat(path.join(tempRoot, 'package.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await fs.rm(outsideRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a validated host parent swapped to an external symlink before replacement', async () => {
+    const outsideRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'forge-executor-swap-outside-'))
+    const hostParent = path.join(tempRoot, 'src')
+    const movedParent = path.join(tempRoot, 'src-before-swap')
+    const hostTarget = path.join(hostParent, 'app.js')
+    let swapped = false
+    await fs.mkdir(hostParent)
+    await fs.writeFile(hostTarget, 'original project content\n')
+    await fs.writeFile(path.join(outsideRoot, 'app.js'), 'outside sentinel\n')
+    const realLstat = fs.lstat.bind(fs)
+    const lstatSpy = vi.spyOn(fs, 'lstat').mockImplementation(async (filePath, options) => {
+      const stat = await realLstat(filePath, options as never)
+      if (!swapped && path.resolve(String(filePath)) === hostTarget) {
+        swapped = true
+        await fs.rename(hostParent, movedParent)
+        await fs.symlink(outsideRoot, hostParent)
+      }
+      return stat as never
+    })
+
+    try {
+      mocks.generateText.mockResolvedValue({
+        text: JSON.stringify({
+          schemaVersion: 1,
+          summary: 'Attempt a parent-swap replacement.',
+          files: [
+            { path: 'src/app.js', content: 'module.exports = { replaced: true };\n' },
+            {
+              path: 'package.json',
+              content: JSON.stringify({ scripts: { build: 'node --check src/app.js' } }),
+            },
+          ],
+          commands: [['npm', 'run', 'build']],
+        }),
+      })
+
+      await expect(executeWorkPackage(hostWriteContext())).rejects.toThrow(/parent directory identity changed/i)
+    } finally {
+      lstatSpy.mockRestore()
+    }
+
+    try {
+      expect(swapped).toBe(true)
+      await expect(fs.readFile(path.join(outsideRoot, 'app.js'), 'utf8')).resolves.toBe('outside sentinel\n')
+      await expect(fs.readdir(outsideRoot)).resolves.toEqual(['app.js'])
+      await expect(fs.readFile(path.join(movedParent, 'app.js'), 'utf8'))
+        .resolves.toBe('original project content\n')
+      await expect(fs.stat(path.join(tempRoot, 'package.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await fs.rm(outsideRoot, { recursive: true, force: true })
+    }
+  })
+
   it('does not include host file contents when filesystem runtime was not approved', async () => {
     await fs.writeFile(path.join(tempRoot, 'README.md'), 'project context should stay private\n')
     mocks.generateText.mockResolvedValue({

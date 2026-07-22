@@ -2747,6 +2747,114 @@ describe('GET /api/tasks/:id — task details', () => {
     expect(JSON.stringify(body)).not.toContain(grantNonce)
   })
 
+  it('returns approval gates through a closed text-free projection', async () => {
+    mockGetSession.mockResolvedValue(FAKE_SESSION)
+    const { parseMcpExecutionDesign } = await import('@/worker/mcp-execution-design')
+    const { buildMcpOperatorReview, mcpOperatorReviewSummary } = await import('@/worker/mcp-plan-review')
+    const sourceArtifactId = '11111111-1111-4111-8111-111111111111'
+    const rawDesign = {
+      schemaVersion: 1,
+      requirements: [{
+        mcpId: 'github',
+        requirement: 'required',
+        reason: 'RAW-REASON-SENTINEL',
+        assignment: { type: 'agent', targetAgents: ['backend'], targetId: null },
+        agentPermissions: { backend: ['github.issues.read'] },
+        prohibitedCapabilities: [],
+        fallback: { action: 'ask_user', message: 'RAW-FALLBACK-SENTINEL' },
+      }],
+      promptOverlays: {},
+      requirementContexts: [],
+      mcpAwareSubtasks: [],
+    }
+    const design = parseMcpExecutionDesign(
+      `\`\`\`mcp_execution_design_json\n${JSON.stringify(rawDesign)}\n\`\`\``,
+    ).design!
+    const requirement = design.requirements[0]
+    const review = buildMcpOperatorReview({
+      proposedDesign: design,
+      plannedAgents: ['backend'],
+      previous: null,
+      createdBy: FAKE_SESSION.userId,
+      createdAt: new Date('2026-07-22T00:00:00.000Z'),
+      review: {
+        sourceArtifactId,
+        baseRevision: 0,
+        baseDigest: null,
+        items: [{
+          requirementKey: requirement.requirementKey!,
+          decision: 'approved',
+          assignment: requirement.assignment,
+          agentPermissions: requirement.agentPermissions,
+          promptOverlays: { backend: 'RAW-REVIEW-PROMPT-SENTINEL' },
+        }],
+      },
+    })
+    const task = { id: 'task-gate-projection', projectId: 'project-1', submittedBy: FAKE_SESSION.userId }
+    const gate = {
+      id: '22222222-2222-4222-8222-222222222222',
+      taskId: task.id,
+      workPackageId: null,
+      gateType: 'plan_approval',
+      status: 'pending',
+      sourceAgentRunId: null,
+      sourceArtifactId,
+      title: 'RAW-GATE-TITLE-SENTINEL',
+      instructions: 'RAW-GATE-INSTRUCTIONS-SENTINEL',
+      metadata: {
+        planVersion: '7',
+        mcpOperatorReviewRequired: true,
+        privateNote: 'RAW-METADATA-SENTINEL',
+        mcpOperatorReviews: [review],
+        mcpOperatorReview: mcpOperatorReviewSummary(review),
+      },
+      protectedReviewRevision: null,
+      protectedReviewSetDigest: null,
+      protectedReviewItemCount: null,
+      protectedReviewApprovedCount: null,
+      protectedReviewDeniedCount: null,
+      protectedReviewBlockerCodes: null,
+      decidedAt: null,
+      decidedBy: null,
+      createdAt: new Date('2026-07-22T00:00:00.000Z'),
+      updatedAt: new Date('2026-07-22T00:00:00.000Z'),
+    }
+    mockDbSelect
+      .mockReturnValueOnce(chain([task]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([gate]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([]))
+
+    const { GET } = await import('@/app/api/tasks/[id]/route')
+    const response = await GET(authRequest(`/api/tasks/${task.id}`) as never, {
+      params: Promise.resolve({ id: task.id }),
+    })
+    expect(response.status).toBe(200)
+    const body = await response.json()
+    expect(body.approvalGates[0]).toMatchObject({
+      id: gate.id,
+      metadata: { planVersion: '7', mcpOperatorReviewRequired: true },
+      mcpOperatorReviewIntegrity: 'valid',
+      validatedMcpOperatorReview: {
+        revision: 1,
+        digest: review.digest,
+        itemCount: 1,
+        approvedCount: 1,
+        deniedCount: 0,
+      },
+    })
+    expect(body.approvalGates[0]).not.toHaveProperty('title')
+    expect(body.approvalGates[0]).not.toHaveProperty('instructions')
+    expect(body.approvalGates[0].validatedMcpOperatorReview).not.toHaveProperty('items')
+    expect(body.approvalGates[0].validatedMcpOperatorReview).not.toHaveProperty('reviewedDesign')
+    expect(JSON.stringify(body.approvalGates)).not.toContain('RAW-')
+  })
+
   it('returns task details when the optional repository command audit table has not been migrated yet', async () => {
     mockGetSession.mockResolvedValue(FAKE_SESSION)
     const task = {
@@ -4257,7 +4365,7 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
     taskUpdate.set = vi.fn(() => taskUpdate)
     const packageUpdate = chain([{ id: 'pkg-1' }])
     packageUpdate.set = vi.fn(() => packageUpdate)
-    const gateUpdate = chain([{ id: 'gate-1' }])
+    const gateUpdate = chain([{ id: '33333333-3333-4333-8333-333333333333' }])
     gateUpdate.set = vi.fn(() => gateUpdate)
     mockDbSelect
       .mockReturnValueOnce(chain([awaitingTask]))
@@ -4353,22 +4461,14 @@ describe('POST /api/tasks/:id/approve — 409 when status is pending', () => {
       'forge:approvals',
       JSON.stringify({ taskId: 'task-approval', action: 'approve' }),
     )
-    const gateEvent = mockRedisPublish.mock.calls
-      .map(([, payload]) => JSON.parse(payload as string))
-      .find((payload) => payload.type === 'approval_gate:decided')
-    expect(gateEvent).toMatchObject({
-      schemaVersion: 2,
-      id: null,
-      data: {
-        gateId: 'gate-1',
-        gateType: 'plan_approval',
-        status: 'approved',
-      },
+    const gateEventCall = mockRedisEval.mock.calls.find((call) => call[4] === 'approval_gate:decided')
+    expect(gateEventCall).toBeDefined()
+    expect(JSON.parse(gateEventCall?.[5] as string)).toMatchObject({
+      gateId: '33333333-3333-4333-8333-333333333333',
+      gateType: 'plan_approval',
+      status: 'approved',
     })
-    expect(mockRedisPublish).toHaveBeenCalledWith(
-      'forge:task:task-approval',
-      expect.stringContaining('"type":"approval_gate:decided"'),
-    )
+    expect(mockRedisPublish).not.toHaveBeenCalled()
   })
 
   it('preserves explicit filesystem effective grants when approving the plan', async () => {

@@ -1,5 +1,5 @@
 import { sanitizeLogStructuredValue } from '../lib/task-log-sanitization'
-import { projectV2TaskEventData } from '../lib/mcps/legacy-leakage-scrub'
+import { containsForbiddenV2EventData, projectV2TaskEventData } from '../lib/mcps/legacy-leakage-scrub'
 import { taskEventPublisherRedis } from '../lib/task-event-redis'
 
 export type TaskEventPayload = Record<string, unknown>
@@ -44,7 +44,9 @@ export function parseTaskEventEnvelopeV2(value: unknown): TaskEventEnvelopeV2 | 
     || safeTaskEventType(value.type) !== value.type || !Object.hasOwn(value, 'data')) return null
   const id = value.id
   if (id !== null && (!Number.isSafeInteger(id) || (id as number) < 1)) return null
-  return { schemaVersion: 2, id: id as number | null, type: value.type, data: value.data }
+  const projected = projectV2TaskEventData(value.type, value.data)
+  if (projected === null || containsForbiddenV2EventData({ type: value.type, data: value.data })) return null
+  return { schemaVersion: 2, id: id as number | null, type: value.type, data: projected }
 }
 
 const PERSIST_TASK_EVENT_V2 = `
@@ -73,28 +75,25 @@ export async function publishTaskEvent(
   payload: TaskEventPayload = {},
 ): Promise<void> {
   const safeType = safeTaskEventType(type)
+  if (safeType !== type) throw new Error('The task-event type is invalid.')
   const safeData = safeTaskEventData(safeType, { type: safeType, ...payload })
   const durableData = projectV2TaskEventData(safeType, safeData)
-  const redis = taskEventPublisherRedis()
-  if (durableData !== null) {
-    const rawId = await redis.eval(
-      PERSIST_TASK_EVENT_V2,
-      2,
-      `forge:task-events:v2:${taskId}:seq`,
-      `forge:task-events:v2:${taskId}:history`,
-      safeType,
-      JSON.stringify(durableData),
-      `forge:task:${taskId}`,
-      String(TASK_EVENT_HISTORY_LIMIT),
-    )
-    const id = Number(rawId)
-    if (!Number.isSafeInteger(id) || id < 1) {
-      throw new Error('The durable task-event sequence was invalid.')
-    }
-    return
+  if (durableData === null) {
+    throw new Error(`Task event '${safeType}' does not match the closed v2 schema.`)
   }
-  await redis.publish(
+  const redis = taskEventPublisherRedis()
+  const rawId = await redis.eval(
+    PERSIST_TASK_EVENT_V2,
+    2,
+    `forge:task-events:v2:${taskId}:seq`,
+    `forge:task-events:v2:${taskId}:history`,
+    safeType,
+    JSON.stringify(durableData),
     `forge:task:${taskId}`,
-    JSON.stringify({ schemaVersion: 2, id: null, type: safeType, data: safeData }),
+    String(TASK_EVENT_HISTORY_LIMIT),
   )
+  const id = Number(rawId)
+  if (!Number.isSafeInteger(id) || id < 1) {
+    throw new Error('The durable task-event sequence was invalid.')
+  }
 }

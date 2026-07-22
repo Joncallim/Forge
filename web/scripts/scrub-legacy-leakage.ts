@@ -164,6 +164,14 @@ function workPackageRow(row: Record<string, unknown>): LegacyLeakageScrubRow {
   }
 }
 
+function approvalGateRow(row: Record<string, unknown>): LegacyLeakageScrubRow {
+  return {
+    id: String(row.id),
+    kind: 'approval_gate',
+    metadata: row.metadata as Record<string, unknown>,
+  }
+}
+
 export function createLegacyLeakagePostgresAdapter(
   sql: ReturnType<typeof postgres>,
 ): LegacyLeakageScrubDatabase {
@@ -265,6 +273,18 @@ export function createLegacyLeakagePostgresAdapter(
             `
         return rows.map(workPackageRow)
       }
+      if (phase === 'approval_gates') {
+        const rows = afterId === null
+          ? await sql<Record<string, unknown>[]>`
+              select id::text as id, metadata
+              from approval_gates order by id limit ${limit}
+            `
+          : await sql<Record<string, unknown>[]>`
+              select id::text as id, metadata
+              from approval_gates where id > ${afterId}::uuid order by id limit ${limit}
+            `
+        return rows.map(approvalGateRow)
+      }
       const rows = afterId === null
         ? await sql<Record<string, unknown>[]>`
             select a.id::text as id, a.content, a.metadata,
@@ -318,6 +338,11 @@ export function createLegacyLeakagePostgresAdapter(
                 select id::text as id, metadata
                 from work_packages where id = ${input.row.id}::uuid for update
               `
+            : input.row.kind === 'approval_gate'
+              ? await transaction<Record<string, unknown>[]>`
+                  select id::text as id, metadata
+                  from approval_gates where id = ${input.row.id}::uuid for update
+                `
           : await transaction<Record<string, unknown>[]>`
               select a.id::text as id, a.content, a.metadata,
                 (
@@ -339,7 +364,9 @@ export function createLegacyLeakagePostgresAdapter(
           ? taskLogRow(sourceRows[0])
           : input.row.kind === 'work_package'
             ? workPackageRow(sourceRows[0])
-            : artifactRow(sourceRows[0])
+            : input.row.kind === 'approval_gate'
+              ? approvalGateRow(sourceRows[0])
+              : artifactRow(sourceRows[0])
         if (legacyLeakageRowFingerprint(source) !== input.expectedRowFingerprint) return 'row_conflict' as const
 
         if (input.row.kind === 'task_log') {
@@ -357,9 +384,16 @@ export function createLegacyLeakagePostgresAdapter(
                 metadata = ${input.row.metadata === null ? null : transaction.json(input.row.metadata as never)}
             where id = ${input.row.id}::uuid
           `
-        } else {
+        } else if (input.row.kind === 'work_package') {
           await transaction`
             update work_packages
+            set metadata = ${transaction.json(input.row.metadata as never)},
+                updated_at = now()
+            where id = ${input.row.id}::uuid
+          `
+        } else {
+          await transaction`
+            update approval_gates
             set metadata = ${transaction.json(input.row.metadata as never)},
                 updated_at = now()
             where id = ${input.row.id}::uuid

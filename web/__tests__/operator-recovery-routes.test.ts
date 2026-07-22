@@ -7,6 +7,7 @@ const mockSelect = vi.fn()
 const mockApplyLocal = vi.fn()
 const mockApplyPacket = vi.fn()
 const mockConverge = vi.fn()
+const mockLoadCurrentProjectFilesystemDecision = vi.fn()
 const mockEnqueue = vi.fn()
 
 class MockS4LifecycleError extends Error {
@@ -36,6 +37,7 @@ vi.mock('@/lib/mcps/s4-lease', () => ({
 }))
 vi.mock('@/lib/mcps/filesystem-grant-reconciliation', () => ({
   convergeRecognizedOperatorHoldTask: mockConverge,
+  loadCurrentProjectFilesystemDecision: mockLoadCurrentProjectFilesystemDecision,
 }))
 vi.mock('@/worker/blocked-handoff-retry', () => ({
   enqueueBlockedHandoffRetry: mockEnqueue,
@@ -46,6 +48,7 @@ const packageId = '22222222-2222-4222-8222-222222222222'
 const evidenceId = '33333333-3333-4333-8333-333333333333'
 const auditId = '44444444-4444-4444-8444-444444444444'
 const fingerprint = `sha256:${'a'.repeat(64)}`
+const projectDecisionId = '88888888-8888-4888-8888-888888888888'
 
 function localRequest(action: string, extra: Record<string, unknown> = {}) {
   return new Request(`http://localhost/api/tasks/${taskId}/work-packages/${packageId}/local-effect-recovery`, {
@@ -67,10 +70,19 @@ describe('protected S4 operator recovery routes', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mockGetSession.mockResolvedValue({ userId: '55555555-5555-4555-8555-555555555555' })
-    mockGetAccessibleTask.mockResolvedValue({ id: taskId, status: 'approved' })
+    mockGetAccessibleTask.mockResolvedValue({
+      id: taskId,
+      projectId: 'project-1',
+      status: 'approved',
+      localProjectionScopeState: 'active',
+    })
     mockGuardIngress.mockResolvedValue(null)
     mockSelect.mockReturnValue(chain([{ id: packageId }]))
     mockConverge.mockResolvedValue(false)
+    mockLoadCurrentProjectFilesystemDecision.mockResolvedValue({
+      decisionId: projectDecisionId,
+      decision: 'approved',
+    })
     mockEnqueue.mockResolvedValue({ status: 'enqueued' })
     mockApplyLocal.mockResolvedValue({
       actionId: '66666666-6666-4666-8666-666666666666',
@@ -116,7 +128,9 @@ describe('protected S4 operator recovery routes', () => {
       expect(mockApplyPacket).toHaveBeenCalledWith(expect.objectContaining({
         action, priorRuntimeAuditId: auditId, expectedMarkerFingerprint: fingerprint,
         taskId, workPackageId: packageId,
+        authorizingDecisionId: action === 'retry_execution' ? projectDecisionId : null,
       }))
+      expect(mockLoadCurrentProjectFilesystemDecision).toHaveBeenCalledTimes(action === 'retry_execution' ? 1 : 0)
       expect(mockConverge).toHaveBeenCalledWith(taskId)
     })
   }
@@ -128,6 +142,54 @@ describe('protected S4 operator recovery routes', () => {
     })
     expect(response.status).toBe(400)
     expect(mockApplyLocal).not.toHaveBeenCalled()
+  })
+
+  it('rejects a client-supplied filesystem authority id', async () => {
+    const request = new Request(`http://localhost/api/tasks/${taskId}/work-packages/${packageId}/packet-issuance-recovery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        schemaVersion: 2,
+        action: 'retry_execution',
+        priorRuntimeAuditId: auditId,
+        markerFingerprint: fingerprint,
+        authorizingDecisionId: projectDecisionId,
+      }),
+    })
+    const { POST } = await import('@/app/api/tasks/[id]/work-packages/[packageId]/packet-issuance-recovery/route')
+    const response = await POST(request as never, { params: Promise.resolve({ id: taskId, packageId }) })
+    expect(response.status).toBe(400)
+    expect(mockLoadCurrentProjectFilesystemDecision).not.toHaveBeenCalled()
+    expect(mockApplyPacket).not.toHaveBeenCalled()
+  })
+
+  it('rejects retry when the task is outside the exact approved active state', async () => {
+    mockGetAccessibleTask.mockResolvedValue({
+      id: taskId,
+      projectId: 'project-1',
+      status: 'running',
+      localProjectionScopeState: 'active',
+    })
+    const { POST } = await import('@/app/api/tasks/[id]/work-packages/[packageId]/packet-issuance-recovery/route')
+    const response = await POST(packetRequest('retry_execution') as never, {
+      params: Promise.resolve({ id: taskId, packageId }),
+    })
+    expect(response.status).toBe(409)
+    expect(mockLoadCurrentProjectFilesystemDecision).not.toHaveBeenCalled()
+    expect(mockApplyPacket).not.toHaveBeenCalled()
+  })
+
+  it('rejects retry without an exact current approved project filesystem decision', async () => {
+    mockLoadCurrentProjectFilesystemDecision.mockResolvedValue({
+      decisionId: projectDecisionId,
+      decision: 'revoked',
+    })
+    const { POST } = await import('@/app/api/tasks/[id]/work-packages/[packageId]/packet-issuance-recovery/route')
+    const response = await POST(packetRequest('retry_execution') as never, {
+      params: Promise.resolve({ id: taskId, packageId }),
+    })
+    expect(response.status).toBe(409)
+    expect(mockApplyPacket).not.toHaveBeenCalled()
   })
 
   it('does not reveal whether a package belongs to another task', async () => {

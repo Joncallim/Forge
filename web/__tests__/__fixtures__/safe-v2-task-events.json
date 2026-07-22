@@ -44,6 +44,10 @@
     "data": { "questions": [] }
   },
   {
+    "type": "questions:answered",
+    "data": { "answeredCount": 2, "allAnswered": true }
+  },
+  {
     "type": "run:completed",
     "data": {
       "attemptNumber": 1,

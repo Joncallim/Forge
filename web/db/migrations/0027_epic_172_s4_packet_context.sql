@@ -1537,10 +1537,22 @@ CREATE TABLE public.filesystem_mcp_issuance_recovery_actions (
   expected_marker_fingerprint text NOT NULL CHECK (expected_marker_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
   actor_user_id uuid NOT NULL REFERENCES public.users(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
   authorizing_decision_id uuid REFERENCES public.filesystem_mcp_grant_approvals(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  authorizing_project_decision_id uuid REFERENCES public.project_filesystem_grant_decisions(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
   result text NOT NULL CHECK (result IN ('acknowledged','ready','cancelled','reapproved')),
   result_marker_fingerprint text CHECK (result_marker_fingerprint IS NULL OR result_marker_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
   package_status text NOT NULL CHECK (package_status IN ('ready','blocked','cancelled')),
   created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  CONSTRAINT filesystem_mcp_issuance_recovery_authorizer_chk CHECK (
+    (action = 'retry_execution'
+      AND authorizing_decision_id IS NULL
+      AND authorizing_project_decision_id IS NOT NULL)
+    OR (action = 'resolve_after_allow_once_reapproval'
+      AND authorizing_decision_id IS NOT NULL
+      AND authorizing_project_decision_id IS NULL)
+    OR (action IN ('acknowledge_possible_submission','decline_packet_recovery')
+      AND authorizing_decision_id IS NULL
+      AND authorizing_project_decision_id IS NULL)
+  ),
   UNIQUE (prior_runtime_audit_id, action, expected_marker_fingerprint, actor_user_id)
 );
 --> statement-breakpoint
@@ -4554,6 +4566,7 @@ BEGIN
   WHERE task.id = p_task_id AND task.project_id = v_project_id
     AND task.status = 'approved'
     AND task.local_projection_scope_state = 'active'
+    AND task.local_projection_overlimit_package_count IS NULL
   FOR UPDATE;
   PERFORM 1 FROM public.work_packages package
   WHERE package.task_id = p_task_id ORDER BY package.id FOR UPDATE;
@@ -4659,13 +4672,23 @@ SET search_path = pg_catalog, forge
 AS $$
 DECLARE
   v_project_id uuid;
+  v_project public.projects%ROWTYPE;
+  v_task public.tasks%ROWTYPE;
   v_package public.work_packages%ROWTYPE;
   v_audit public.filesystem_mcp_runtime_audits%ROWTYPE;
+  v_decision public.project_filesystem_grant_decisions%ROWTYPE;
   v_marker jsonb;
   v_next_marker jsonb;
   v_action_id uuid;
   v_result text;
   v_status text;
+  v_package_count integer;
+  v_projection_head_count integer;
+  v_required_capabilities text[];
+  v_approved_capabilities text[];
+  v_policy_fingerprint text;
+  v_decision_found boolean := false;
+  v_now timestamptz := pg_catalog.clock_timestamp();
 BEGIN
   IF session_user <> 'forge_s4_recovery_operator'
      OR current_user <> 'forge_s4_routines_owner' THEN
@@ -4689,20 +4712,96 @@ BEGIN
     AND action.action = p_action
     AND action.expected_marker_fingerprint = p_expected_marker_fingerprint
     AND action.actor_user_id = p_actor_user_id
-    AND action.authorizing_decision_id IS NOT DISTINCT FROM p_authorizing_decision_id;
+    AND action.authorizing_decision_id IS NOT DISTINCT FROM
+      CASE WHEN p_action = 'retry_execution' THEN NULL
+        ELSE p_authorizing_decision_id END
+    AND action.authorizing_project_decision_id IS NOT DISTINCT FROM
+      CASE WHEN p_action = 'retry_execution' THEN p_authorizing_decision_id
+        ELSE NULL END;
   IF FOUND THEN RETURN; END IF;
 
   SELECT task.project_id INTO STRICT v_project_id
   FROM public.tasks task WHERE task.id = p_task_id;
-  PERFORM 1 FROM public.projects project
+  SELECT project.* INTO v_project
+  FROM public.projects project
   WHERE project.id = v_project_id AND project.archived_at IS NULL FOR UPDATE;
-  PERFORM 1 FROM public.tasks task
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'packet recovery project is unavailable'
+      USING ERRCODE = '40001';
+  END IF;
+  SELECT task.* INTO v_task
+  FROM public.tasks task
   WHERE task.id = p_task_id AND task.project_id = v_project_id
     AND task.status = 'approved'
     AND task.local_projection_scope_state = 'active'
+    AND task.local_projection_overlimit_package_count IS NULL
   FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'packet recovery requires an approved active task'
+      USING ERRCODE = '40001';
+  END IF;
   PERFORM 1 FROM public.work_packages package
   WHERE package.task_id = p_task_id ORDER BY package.id FOR UPDATE;
+  GET DIAGNOSTICS v_package_count = ROW_COUNT;
+  IF v_package_count NOT BETWEEN 1 AND 256 THEN
+    RAISE EXCEPTION 'packet recovery is outside the bounded projection scope'
+      USING ERRCODE = 'P1726';
+  END IF;
+  -- Recovery and normal claims share task -> sibling package -> projection-head
+  -- lock order. This makes a concurrent sibling transition elect one winner
+  -- instead of letting recovery validate a mixture of pre/post-transition rows.
+  PERFORM 1 FROM public.work_package_local_projection_heads head
+  WHERE head.task_id = p_task_id ORDER BY head.id FOR UPDATE;
+  GET DIAGNOSTICS v_projection_head_count = ROW_COUNT;
+  IF v_projection_head_count <> v_package_count * 8
+     OR EXISTS (
+       SELECT 1
+       FROM public.work_package_local_projection_heads head
+       WHERE head.task_id = p_task_id
+       GROUP BY head.work_package_id
+       HAVING pg_catalog.count(*) <> 8
+          OR pg_catalog.count(DISTINCT head.head_kind) <> 8
+          OR pg_catalog.min(head.head_index) <> 0
+          OR pg_catalog.max(head.head_index) <> 7
+     ) THEN
+    RAISE EXCEPTION 'packet recovery projection is incomplete or divergent'
+      USING ERRCODE = 'P1726';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM public.work_packages sibling
+    WHERE sibling.task_id = p_task_id
+      AND (
+        sibling.status IN ('running','awaiting_review')
+        OR sibling.metadata ? 'packet_integrity_hold'
+        OR sibling.metadata ? 'local_effect_integrity_hold'
+        OR sibling.metadata ? 'local_effect_recovery'
+      )
+  ) OR EXISTS (
+    SELECT 1
+    FROM public.work_packages sibling
+    JOIN public.agent_runs run
+      ON run.work_package_id = sibling.id
+     AND run.id::text = sibling.metadata->'executionLease'->>'runId'
+    WHERE sibling.task_id = p_task_id
+      AND forge.s4_execution_lease_live_v1(sibling.metadata, run.id, v_now)
+  ) OR EXISTS (
+    SELECT 1
+    FROM public.work_package_local_run_evidence evidence
+    WHERE evidence.task_id = p_task_id
+      AND evidence.state = 'claimed'
+      AND evidence.lease_expires_at > v_now
+  ) OR EXISTS (
+    SELECT 1
+    FROM public.filesystem_mcp_runtime_audits audit
+    WHERE audit.task_id = p_task_id
+      AND audit.protocol_version = 2
+      AND audit.status = 'claiming'
+      AND audit.lease_expires_at > v_now
+  ) THEN
+    RAISE EXCEPTION 'packet recovery requires quiescent siblings and evidence'
+      USING ERRCODE = '40001';
+  END IF;
   SELECT audit.* INTO STRICT v_audit
   FROM public.filesystem_mcp_runtime_audits audit
   WHERE audit.id = p_prior_runtime_audit_id
@@ -4719,23 +4818,124 @@ BEGIN
      OR v_marker->>'markerFingerprint' <> p_expected_marker_fingerprint
      OR forge.packet_recovery_marker_fingerprint_v2(v_marker - 'markerFingerprint')
         <> p_expected_marker_fingerprint
-     OR v_marker->>'disposition' <> p_action THEN
+     OR (
+       p_action = 'retry_execution'
+       AND v_marker->>'disposition' NOT IN ('retry_execution','reviewed_submission')
+     )
+     OR (
+       p_action = 'acknowledge_possible_submission'
+       AND v_marker->>'disposition' NOT IN (
+         'review_then_reapprove_allow_once','review_submission'
+       )
+     )
+     OR (
+       p_action = 'decline_packet_recovery'
+       AND v_marker->>'disposition' NOT IN (
+         'reapprove_allow_once','review_then_reapprove_allow_once',
+         'retry_execution','review_submission','reviewed_submission'
+       )
+     ) THEN
     RAISE EXCEPTION 'packet recovery marker changed before action compare-and-set'
       USING ERRCODE = '40001';
   END IF;
   IF p_action = 'retry_execution' THEN
-    IF p_authorizing_decision_id IS NULL OR NOT EXISTS (
-      SELECT 1 FROM public.project_filesystem_grant_decisions decision
-      JOIN public.project_filesystem_current_decision_pointers pointer
-        ON pointer.project_id = decision.project_id
-       AND pointer.current_decision_id = decision.id
-       AND pointer.current_decision_revision = decision.grant_decision_revision
-       AND pointer.current_root_binding_revision = decision.root_binding_revision
-       AND pointer.current_decision_fingerprint = decision.decision_fingerprint
-      WHERE decision.id = p_authorizing_decision_id
-        AND decision.project_id = v_project_id
-        AND decision.decision = 'approved'
-    ) THEN
+    SELECT decision.* INTO v_decision
+    FROM public.project_filesystem_current_decision_pointers pointer
+    JOIN public.project_filesystem_grant_decisions decision
+      ON decision.id = pointer.current_decision_id
+     AND decision.project_id = pointer.current_decision_project_id
+     AND decision.grant_decision_revision = pointer.current_decision_revision
+     AND decision.root_binding_revision = pointer.current_root_binding_revision
+     AND decision.decision_fingerprint = pointer.current_decision_fingerprint
+     AND decision.decision_generation = pointer.current_decision_generation
+    WHERE pointer.project_id = v_project_id
+      AND decision.id = p_authorizing_decision_id
+    FOR UPDATE OF pointer, decision;
+    v_decision_found := FOUND;
+    -- The package pointer is preallocated. Lock it even when it is empty so a
+    -- concurrent denial cannot appear after the retry authority was checked.
+    PERFORM 1
+    FROM public.filesystem_mcp_current_decision_pointers pointer
+    WHERE pointer.work_package_id = p_work_package_id
+    FOR UPDATE;
+    SELECT ARRAY(
+      SELECT capability
+      FROM pg_catalog.jsonb_array_elements_text(
+        CASE
+          WHEN pg_catalog.jsonb_typeof(
+            v_audit.authorization_snapshot->'requiredCapabilities'
+          ) = 'array' THEN v_audit.authorization_snapshot->'requiredCapabilities'
+          ELSE '[]'::jsonb
+        END
+      ) capability
+      ORDER BY capability
+    ) INTO v_required_capabilities;
+    SELECT ARRAY(
+      SELECT capability
+      FROM pg_catalog.jsonb_array_elements_text(v_decision.capabilities) capability
+      ORDER BY capability
+    ) INTO v_approved_capabilities;
+    v_policy_fingerprint := 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+      pg_catalog.convert_to(
+        'forge:packet-policy:v2:' ||
+        (v_audit.authorization_snapshot->'requiredCapabilities')::text,
+        'UTF8'
+      )
+    ), 'hex');
+    IF NOT v_decision_found
+       OR p_authorizing_decision_id IS NULL
+       OR v_decision.decision <> 'approved'
+       OR v_decision.root_binding_revision <> v_project.root_binding_revision
+       OR v_decision.grant_decision_revision < v_audit.grant_decision_revision
+       OR v_audit.authorization_source <> 'project_always_allow'
+       OR v_audit.grant_mode <> 'always_allow'
+       OR v_marker->>'grantMode' <> 'always_allow'
+       OR v_marker->>'deliveryState' IS DISTINCT FROM v_audit.delivery->>'state'
+       OR v_marker->>'coverageFingerprint' IS DISTINCT FROM
+          v_audit.authorization_snapshot->>'coverageFingerprint'
+       OR v_marker->>'policyFingerprint' IS DISTINCT FROM v_policy_fingerprint
+       OR pg_catalog.cardinality(v_required_capabilities) NOT BETWEEN 1 AND 3
+       OR v_required_capabilities IS DISTINCT FROM ARRAY(
+         SELECT DISTINCT capability
+         FROM pg_catalog.unnest(v_required_capabilities) capability
+         ORDER BY capability
+       )
+       OR v_required_capabilities <@ ARRAY[
+         'filesystem.project.list','filesystem.project.read',
+         'filesystem.project.search'
+       ]::text[] IS NOT TRUE
+       OR v_required_capabilities <@ v_approved_capabilities IS NOT TRUE
+       OR (
+         v_decision.grant_decision_revision = v_audit.grant_decision_revision
+         AND (
+           v_decision.id <> v_audit.project_decision_id
+           OR v_decision.root_binding_revision <>
+              v_audit.authorization_root_binding_revision
+           OR v_decision.decision_fingerprint <>
+              v_audit.authorization_snapshot->>'coverageFingerprint'
+         )
+       )
+       OR EXISTS (
+         SELECT 1
+         FROM public.filesystem_mcp_current_decision_pointers pointer
+         JOIN public.filesystem_mcp_grant_approvals decision
+           ON decision.id = pointer.current_decision_id
+          AND decision.task_id = pointer.current_decision_task_id
+          AND decision.work_package_id = pointer.current_decision_work_package_id
+          AND decision.grant_decision_revision = pointer.current_decision_revision
+          AND decision.pointer_fingerprint = pointer.current_decision_fingerprint
+         WHERE pointer.work_package_id = p_work_package_id
+           AND decision.project_id = v_project_id
+           AND decision.decision = 'denied'
+           AND (
+             decision.grant_decision_revision IS NULL
+             OR decision.root_binding_revision IS NULL
+             OR (
+               decision.root_binding_revision = v_project.root_binding_revision
+               AND decision.grant_decision_revision >= v_decision.grant_decision_revision
+             )
+           )
+       ) THEN
       RAISE EXCEPTION 'packet retry lacks an exact current always-allow authority'
         USING ERRCODE = '40001';
     END IF;
@@ -4774,11 +4974,16 @@ BEGIN
   INSERT INTO public.filesystem_mcp_issuance_recovery_actions (
     id, task_id, work_package_id, prior_runtime_audit_id, action,
     expected_marker_fingerprint, actor_user_id, authorizing_decision_id,
-    result, result_marker_fingerprint, package_status
+    authorizing_project_decision_id, result, result_marker_fingerprint,
+    package_status
   ) VALUES (
     v_action_id, p_task_id, p_work_package_id, p_prior_runtime_audit_id,
     p_action, p_expected_marker_fingerprint, p_actor_user_id,
-    p_authorizing_decision_id, v_result,
+    CASE WHEN p_action = 'retry_execution' THEN NULL
+      ELSE p_authorizing_decision_id END,
+    CASE WHEN p_action = 'retry_execution' THEN p_authorizing_decision_id
+      ELSE NULL END,
+    v_result,
     CASE WHEN v_next_marker IS NULL THEN NULL
       ELSE v_next_marker->>'markerFingerprint' END,
     v_status

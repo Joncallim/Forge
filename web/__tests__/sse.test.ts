@@ -316,7 +316,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     expect(lines.join('\n')).not.toContain('RAW-API-KEY-SENTINEL')
   }, 2000)
 
-  it('keeps run chunks sanitized and live-only instead of storing an invalid empty history event', async () => {
+  it('rejects legacy live run chunks so model output cannot bypass the closed Redis schema', async () => {
     const { GET } = await import('@/app/api/tasks/[id]/runs/route')
     const params = Promise.resolve({ id: 'task-sse-1' })
     const res = await GET(sseRequest() as never, { params })
@@ -343,16 +343,14 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     }, 100)
 
     const lines = await readLines(res.body!, 500)
-    const payload = dataPayloads(lines).find((candidate) => candidate.type === 'run:chunk')
-    expect(payload).toMatchObject({ type: 'run:chunk', metadata: { status: 'streaming' } })
-    expect(payload).not.toHaveProperty('delta')
-    expect(JSON.stringify(payload)).not.toContain('RAW-')
+    expect(lines).not.toContain('event: run:chunk')
+    expect(lines.join('\n')).not.toContain('RAW-')
     const { redis } = await import('@/lib/redis')
     expect(redis.incr).not.toHaveBeenCalled()
     expect(redis.zadd).not.toHaveBeenCalled()
   }, 2000)
 
-  it('keeps question answers live-only instead of storing prompt-bearing history', async () => {
+  it('rejects legacy prompt-bearing question answer envelopes', async () => {
     const { GET } = await import('@/app/api/tasks/[id]/runs/route')
     const params = Promise.resolve({ id: 'task-sse-1' })
     const res = await GET(sseRequest() as never, { params })
@@ -374,7 +372,8 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     }, 100)
 
     const lines = await readLines(res.body!, 500)
-    expect(lines).toContain('event: questions:answered')
+    expect(lines).not.toContain('event: questions:answered')
+    expect(lines.join('\n')).not.toContain('operator answer')
     const { redis } = await import('@/lib/redis')
     expect(redis.incr).not.toHaveBeenCalled()
     expect(redis.zadd).not.toHaveBeenCalled()
@@ -390,7 +389,12 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
       state.mockSub?.emit(
         'message',
         'forge:task:task-sse-1',
-        JSON.stringify({ schemaVersion: 2, id: 1, type: 'run:started', data: { type: 'run:started' } }),
+        JSON.stringify({
+          schemaVersion: 2,
+          id: 1,
+          type: 'run:started',
+          data: { runId: '00000000-0000-4000-8000-000000000001' },
+        }),
       )
     }, 100)
 
@@ -413,7 +417,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
           schemaVersion: 2,
           id: 1,
           type: 'task:status',
-          data: { type: 'task:status', status: 'completed' },
+          data: { status: 'completed', updatedAt: '2026-07-22T00:00:00.000Z' },
         }),
       )
     }, 100)
@@ -430,7 +434,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
         schemaVersion: 2,
         id: 2,
         type: 'run:started',
-        data: { type: 'run:started', runId: 'run-2' },
+        data: { runId: '00000000-0000-4000-8000-000000000002' },
       }),
       '2',
     ])
@@ -442,7 +446,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
         schemaVersion: 2,
         id: 3,
         type: 'run:completed',
-        data: { type: 'run:completed', runId: 'run-2' },
+        data: { runId: '00000000-0000-4000-8000-000000000002' },
       }))
     }, 100)
 

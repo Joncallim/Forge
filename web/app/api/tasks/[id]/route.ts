@@ -62,6 +62,90 @@ function taskDetailArtifact<T extends { artifactType: string; metadata: unknown 
   }
 }
 
+function taskDetailApprovalGateMetadata(metadata: unknown): Record<string, unknown> {
+  if (!isRecord(metadata)) return {}
+  const projected: Record<string, unknown> = {}
+  if (typeof metadata.mcpOperatorReviewRequired === 'boolean') {
+    projected.mcpOperatorReviewRequired = metadata.mcpOperatorReviewRequired
+  }
+  if (typeof metadata.required === 'boolean') projected.required = metadata.required
+  if (typeof metadata.planVersion === 'string' && /^\d{1,20}$/.test(metadata.planVersion)) {
+    projected.planVersion = metadata.planVersion
+  }
+  for (const key of ['requiredRole', 'sourcePackageId', 'sourceRunId', 'sourceArtifactId'] as const) {
+    const value = metadata[key]
+    if (typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(value)) {
+      projected[key] = value
+    }
+  }
+  return projected
+}
+
+const TASK_DETAIL_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/
+const TASK_DETAIL_DIGEST = /^(?:(?:hmac-)?sha256:)?[0-9a-f]{64}$/
+
+function taskDetailToken(value: unknown): string | null {
+  return typeof value === 'string' && TASK_DETAIL_TOKEN.test(value) ? value : null
+}
+
+function taskDetailDigest(value: unknown): string | null {
+  return typeof value === 'string' && TASK_DETAIL_DIGEST.test(value) ? value : null
+}
+
+function taskDetailValidatedReview(head: unknown): Record<string, unknown> | null {
+  if (!isRecord(head)) return null
+  const items = Array.isArray(head.items) ? head.items : []
+  return {
+    schemaVersion: head.schemaVersion === 1 ? 1 : null,
+    sourceArtifactId: typeof head.sourceArtifactId === 'string' ? head.sourceArtifactId : null,
+    revision: typeof head.revision === 'number' ? head.revision : null,
+    previousDigest: taskDetailDigest(head.previousDigest),
+    digest: taskDetailDigest(head.digest),
+    createdAt: typeof head.createdAt === 'string' && Number.isFinite(Date.parse(head.createdAt))
+      ? head.createdAt
+      : null,
+    createdBy: taskDetailToken(head.createdBy),
+    accessMode: taskDetailToken(head.accessMode),
+    itemCount: items.length,
+    approvedCount: items.filter((item) => isRecord(item) && item.decision === 'approved').length,
+    deniedCount: items.filter((item) => isRecord(item) && item.decision === 'denied').length,
+    blockerCount: Array.isArray(head.blockers) ? head.blockers.length : 0,
+  }
+}
+
+function taskDetailApprovalGate(gate: typeof approvalGates.$inferSelect): Record<string, unknown> {
+  const validation = validateMcpOperatorReviewHistory(gate.metadata, gate.sourceArtifactId)
+  return {
+    id: gate.id,
+    taskId: gate.taskId,
+    workPackageId: gate.workPackageId,
+    gateType: gate.gateType,
+    status: gate.status,
+    sourceAgentRunId: gate.sourceAgentRunId,
+    sourceArtifactId: gate.sourceArtifactId,
+    metadata: taskDetailApprovalGateMetadata(gate.metadata),
+    protectedReviewRevision: gate.protectedReviewRevision,
+    protectedReviewSetDigest: taskDetailDigest(gate.protectedReviewSetDigest),
+    protectedReviewItemCount: gate.protectedReviewItemCount,
+    protectedReviewApprovedCount: gate.protectedReviewApprovedCount,
+    protectedReviewDeniedCount: gate.protectedReviewDeniedCount,
+    protectedReviewBlockerCodes: Array.isArray(gate.protectedReviewBlockerCodes)
+      ? gate.protectedReviewBlockerCodes.slice(0, 256).flatMap((code) => {
+        const token = taskDetailToken(code)
+        return token === null ? [] : [token]
+      })
+      : null,
+    decidedAt: gate.decidedAt,
+    decidedBy: gate.decidedBy,
+    createdAt: gate.createdAt,
+    updatedAt: gate.updatedAt,
+    validatedMcpOperatorReview: validation.valid
+      ? taskDetailValidatedReview(validation.head)
+      : null,
+    mcpOperatorReviewIntegrity: validation.valid ? 'valid' : 'invalid',
+  }
+}
+
 function errorCode(err: unknown): string | null {
   if (!isRecord(err)) return null
   if (typeof err.code === 'string') return err.code
@@ -243,14 +327,7 @@ export async function GET(
         artifacts: artifactsByWorkPackageId.get(pkg.id) ?? [],
       }
     })
-    const taskApprovalGatesWithValidatedReviews = taskApprovalGates.map((gate) => {
-      const validation = validateMcpOperatorReviewHistory(gate.metadata, gate.sourceArtifactId)
-      return {
-        ...gate,
-        validatedMcpOperatorReview: validation.valid ? validation.head : null,
-        mcpOperatorReviewIntegrity: validation.valid ? 'valid' : 'invalid',
-      }
-    })
+    const taskApprovalGatesWithValidatedReviews = taskApprovalGates.map(taskDetailApprovalGate)
 
     return NextResponse.json({
       task,

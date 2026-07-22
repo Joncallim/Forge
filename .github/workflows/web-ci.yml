@@ -153,6 +153,7 @@ jobs:
           DO $grant_application_acl$
           DECLARE
             table_name text;
+            table_privilege text;
             ordinary_tables constant text[] := ARRAY[
               'users', 'credentials', 'sessions', 'session_credential_reconciliation',
               'provider_configs', 'provider_health_checks',
@@ -170,8 +171,16 @@ jobs:
               'forge_epic_172_release_evidence_consumptions', 'forge_epic_172_enablement_state',
               'forge_epic_172_enablement_transition_audits', 'architect_plan_versions',
               'architect_plan_entries', 'architect_plan_execution_references',
-              'architect_plan_history_reads',
+              'architect_plan_history_reads', 'protected_package_entry_registrations',
+              'protected_entry_capability_bindings', 'mcp_operator_review_versions',
+              'mcp_operator_review_entries',
               'work_package_local_run_evidence', 'filesystem_mcp_runtime_audits',
+              's4_completion_handoffs', 's4_protected_review_sources',
+              's4_protected_review_source_reads',
+              'filesystem_mcp_issuance_recovery_actions',
+              'local_effect_recovery_actions', 's4_max_attempt_finalizations',
+              'local_projection_archive_operations',
+              'local_projection_archive_operation_checkpoints',
               'filesystem_mcp_decision_nonce_claims', 'project_root_ref_reconciliation'
             ];
             projection_tables constant text[] := ARRAY[
@@ -191,6 +200,16 @@ jobs:
             END LOOP;
             FOREACH table_name IN ARRAY protected_tables LOOP
               EXECUTE format('REVOKE ALL ON TABLE public.%I FROM forge_app_test', table_name);
+              FOREACH table_privilege IN ARRAY ARRAY[
+                'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
+              ] LOOP
+                IF has_table_privilege(
+                  'forge_app_test', format('public.%I', table_name), table_privilege
+                ) THEN
+                  RAISE EXCEPTION 'ordinary app unexpectedly has % on public.%',
+                    table_privilege, table_name;
+                END IF;
+              END LOOP;
             END LOOP;
             REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM forge_app_test;
             GRANT USAGE, SELECT ON SEQUENCE public.task_logs_sequence_seq TO forge_app_test;
@@ -211,31 +230,6 @@ jobs:
               OR has_schema_privilege(current_user, 'forge', 'CREATE') THEN
               RAISE EXCEPTION 'ordinary app may not create objects in public or forge';
             END IF;
-            FOR release_table IN SELECT unnest(ARRAY[
-              'public.forge_release_signer_keys',
-              'public.forge_release_signer_key_lifecycle_audits',
-              'public.forge_epic_172_release_evidence',
-              'public.forge_epic_172_transition_authorizations',
-              'public.forge_epic_172_release_evidence_consumptions',
-              'public.forge_epic_172_enablement_state',
-              'public.forge_epic_172_enablement_transition_audits',
-              'public.architect_plan_versions',
-              'public.architect_plan_entries',
-              'public.architect_plan_execution_references',
-              'public.architect_plan_history_reads',
-              'public.work_package_local_run_evidence',
-              'public.filesystem_mcp_runtime_audits',
-              'public.filesystem_mcp_decision_nonce_claims',
-              'public.project_root_ref_reconciliation'
-            ]) LOOP
-              FOREACH release_privilege IN ARRAY ARRAY[
-                'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
-              ] LOOP
-                IF has_table_privilege(current_user, release_table, release_privilege) THEN
-                  RAISE EXCEPTION 'ordinary app unexpectedly has % on %', release_privilege, release_table;
-                END IF;
-              END LOOP;
-            END LOOP;
             IF NOT has_table_privilege(
               current_user,
               'public.forge_epic_172_s3_release_state',

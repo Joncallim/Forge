@@ -131,16 +131,34 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
   })
 
   it('keeps every S4-owned table outside the ordinary application grant loop', () => {
+    const ordinaryInventory = webCiWorkflow.match(
+      /ordinary_tables constant text\[\] := ARRAY\[([\s\S]*?)\];/,
+    )?.[1] ?? ''
+    const protectedInventory = webCiWorkflow.match(
+      /protected_tables constant text\[\] := ARRAY\[([\s\S]*?)\];/,
+    )?.[1] ?? ''
     for (const table of [
       'architect_plan_versions',
       'architect_plan_entries',
       'architect_plan_execution_references',
       'architect_plan_history_reads',
+      'protected_package_entry_registrations',
+      'protected_entry_capability_bindings',
+      'mcp_operator_review_versions',
+      'mcp_operator_review_entries',
       'work_package_local_run_evidence',
+      's4_completion_handoffs',
+      's4_protected_review_sources',
+      's4_protected_review_source_reads',
+      'filesystem_mcp_issuance_recovery_actions',
+      'local_effect_recovery_actions',
+      's4_max_attempt_finalizations',
+      'local_projection_archive_operations',
+      'local_projection_archive_operation_checkpoints',
       'filesystem_mcp_decision_nonce_claims',
     ]) {
-      expect(webCiWorkflow.match(new RegExp(`'public\\.${table}'`, 'g'))).toHaveLength(1)
-      expect(webCiWorkflow.match(new RegExp(`'${table}'`, 'g'))).toHaveLength(1)
+      expect(ordinaryInventory).not.toContain(`'${table}'`)
+      expect(protectedInventory).toContain(`'${table}'`)
     }
   })
 

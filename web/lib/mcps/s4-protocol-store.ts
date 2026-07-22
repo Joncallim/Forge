@@ -481,37 +481,42 @@ export async function claimPacketAuthorization(input: {
   agentRunId: string
   decisionId: string
   leaseSeconds?: number
+  localLeaseSeconds?: number
+  packetLeaseSeconds?: number
   requiredCapabilities: readonly string[]
-}): Promise<{ auditId: string; claimToken: string; localRunEvidenceId: string }> {
-  const claimToken = randomUUID()
-  const leaseSeconds = input.leaseSeconds ?? 45
-  return withDedicatedClient('FORGE_PACKET_ISSUER_DATABASE_URL', async (sql) => sql.begin(async (tx) => {
-    const evidenceRows = await tx<{ localRunEvidenceId: string }[]>`
-      select forge.create_local_run_evidence_v1(
+}): Promise<{
+  auditId: string
+  localClaimToken: string
+  localRunEvidenceId: string
+  packetClaimToken: string
+}> {
+  const localClaimToken = randomUUID()
+  let packetClaimToken = randomUUID()
+  while (packetClaimToken === localClaimToken) packetClaimToken = randomUUID()
+  const localLeaseSeconds = input.localLeaseSeconds ?? input.leaseSeconds ?? 45
+  const packetLeaseSeconds = input.packetLeaseSeconds ?? input.leaseSeconds ?? 45
+  return withDedicatedClient('FORGE_PACKET_ISSUER_DATABASE_URL', async (sql) => {
+    const rows = await sql<{ localRunEvidenceId: string; auditId: string }[]>`
+      select local_run_evidence_id as "localRunEvidenceId",
+        runtime_audit_id as "auditId"
+      from forge.claim_packet_lifecycle_v2(
         ${input.agentRunId}::uuid,
-        ${claimToken}::uuid,
-        ${leaseSeconds}::integer
-      ) as "localRunEvidenceId"
-    `
-    if (evidenceRows.length !== 1) {
-      throw new S4ProtocolStoreError('conflict', 'Local run evidence could not be claimed.')
-    }
-    const localRunEvidenceId = evidenceRows[0].localRunEvidenceId
-    const auditRows = await tx<{ auditId: string }[]>`
-      select forge.insert_packet_authorization_snapshot_v2(
-        ${input.agentRunId}::uuid,
-        ${localRunEvidenceId}::uuid,
         ${input.decisionId}::uuid,
-        ${claimToken}::uuid,
-        ${leaseSeconds}::integer,
-        ${tx.array([...input.requiredCapabilities], 1009)}::text[]
-      ) as "auditId"
+        ${localClaimToken}::uuid,
+        ${packetClaimToken}::uuid,
+        ${localLeaseSeconds}::integer,
+        ${packetLeaseSeconds}::integer,
+        ${sql.array([...input.requiredCapabilities], 1009)}::text[]
+      )
     `
-    if (auditRows.length !== 1) {
-      throw new S4ProtocolStoreError('conflict', 'Packet authorization could not be claimed.')
+    if (rows.length !== 1) {
+      throw new S4ProtocolStoreError('conflict', 'Packet lifecycle could not be claimed.')
     }
-    return { auditId: auditRows[0].auditId, claimToken, localRunEvidenceId }
-  }))
+    return {
+      auditId: rows[0].auditId,
+      localClaimToken,
+      localRunEvidenceId: rows[0].localRunEvidenceId,
+      packetClaimToken,
+    }
+  })
 }
-
-export const bindClaim = claimPacketAuthorization
