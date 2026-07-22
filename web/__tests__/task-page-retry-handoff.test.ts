@@ -71,15 +71,17 @@ describe('task page retry handoff controls', () => {
     expect(canRetryHandoffForTaskStatus('awaiting_review', false)).toBe(false)
   })
 
-  it('shows stop only for active tasks and never offers deletion', () => {
+  it('shows stop only for active tasks and never offers deletion for non-terminal', () => {
     expect(canStopTaskStatus('running')).toBe(true)
     expect(canStopTaskStatus('approved')).toBe(true)
     expect(canStopTaskStatus('failed')).toBe(false)
     expect(canStopTaskStatus('cancelled')).toBe(false)
     expect(canDeleteTaskStatus('running')).toBe(false)
     expect(canDeleteTaskStatus('approved')).toBe(false)
-    expect(canDeleteTaskStatus('failed')).toBe(false)
-    expect(canDeleteTaskStatus('cancelled')).toBe(false)
+    // Terminal tasks (including failed/cancelled) are deletable in S5
+    expect(canDeleteTaskStatus('failed')).toBe(true)
+    expect(canDeleteTaskStatus('cancelled')).toBe(true)
+    expect(canDeleteTaskStatus('completed')).toBe(true)
   })
 
   it('finds required filesystem grants that still need explicit approval', () => {

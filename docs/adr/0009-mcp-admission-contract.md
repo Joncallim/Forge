@@ -2020,7 +2020,7 @@ contract. This split must match the per-step release manifest metadata above.
   incompleteness is `unverifiable`. A live owner
   waits for the separately addressable ACP containment subtree to become empty and,
   before any Forge response-driven stage, computes the comparison; recovery waits
-  for the complete lease group empty. A changed or unverifiable result requires
+  for the complete per-run execution group empty. A changed or unverifiable result requires
   exact fingerprint-bound repository review after a valid response, failure, or
   submission uncertainty, even with `effectIntent:not_started` and no Forge host
   ledger. A valid response with such a result starts no later local stage and uses
@@ -2860,35 +2860,54 @@ contract. This split must match the per-step release manifest metadata above.
 
 ### S5 — UI and copy hardening
 
-- New `web/lib/mcps/admission-copy.ts`: pure map from `mode`+`recoveryAction`+
-  `status`+structured `grantState` → `{ statusKey, badgeText, headline, body, cta? }`. Every surface reads
-  it. Mapping:
-  - `planning_only` → neutral "Planning context", no CTA.
-  - `bounded_context_required` with `grantState.phase:'none'|'proposed'|'not_issued'`
-    → amber "Needs project context"; `phase:'denied'` → amber "Context was denied";
-    `phase:'revoked'` → amber "Project context was removed" and includes the
-    persisted `revocationReason`. All link to the package's filesystem grant control.
-    `phase:'approved'` with `consumed:true` → amber "One-time context approval was
-    already used" and the same re-approval control; an unconsumed approved grant
-    cannot reach `bounded_context_required` and is treated as invalid persisted state.
-  - `bounded_context_approved` → green "Context approved".
-  - `blocked`+`install_or_fix_mcp` → red, CTA deep-link
-    `/dashboard/projects/{projectId}#project-mcps-heading`.
-  - `blocked`+`revise_plan` → red, CTA "Request changes / regenerate plan".
-  - `deferred_live_mcp` → **neutral slate** "Deferred — MCP boundary", body "Forge
-    did not issue this MCP capability. This is not a broken install. ACP workers
-    are local processes and are not security-sandboxed by this MCP decision."
-    **When it is a *required* (blocking) deferred requirement, it
-    still carries the `revise_plan` CTA** so the operator can remove/regenerate the
-    offending requirement instead of being stuck with an unapprovable plan and no
-    action; an *optional* deferred requirement is warning-only and approvable.
-  - `unknown_legacy` → neutral "Re-open plan to recompute"; grant state read live
-    from package metadata, never invented.
+- New `web/lib/mcps/admission-copy.ts` contains four pure, exhaustive surface
+  presenters—`admissionPresentation`, `projectMcpPresentation`,
+  `catalogMcpPresentation`, and actionless `packetArtifactPresentation`—plus typed
+  `packetCurrentStatePresentation` and `localRunRecoveryPresentation` current-state
+  presenters for S4's live audit/packet marker and packet-independent local
+  evidence. They
+  share copy primitives but accept distinct truth sources; history, health,
+  catalog facts, and current packet recovery are never forced into one optional
+  input shape.
+- The task page presents three separate facts: historical canonical decision,
+  current actionable grant/broker/live-audit/lease state, and immutable terminal
+  packet evidence tied
+  to one exact `agentRunId` and package attempt. Current state may show that history
+  is stale; it may not relabel an older decision or artifact.
+- The admission presenter validates the complete tuple before mapping it. Unknown
+  legacy admission values become neutral `unknown_legacy` with no retry; this
+  historical compatibility state is distinct from current-state corruption.
+  Then precedence is `revise_plan` → `approve_project_filesystem_context` →
+  `install_or_fix_mcp` → warning-only deferred/planning → positive allowed state.
+  In particular, `bounded_context_approved` plus `status:'blocked'|'warning'` and
+  `install_or_fix_mcp` is unhealthy/remediation copy, not green. Green "Context
+  approved" requires `status:'allowed'`, coherent unconsumed approved grant state,
+  no recovery action, and `retryable:false`.
+- Phase copy imports S3's closed `FilesystemGrantHoldState` rather than accepting
+  optional phase/consumed/reason fields. Never-approved/proposed/not-issued →
+  "Needs project context"; denied → "Context was denied"; approved+consumed →
+  "One-time context approval was already used". The exact imported
+  `FilesystemGrantRevocationReason` enum maps to static copy:
+  `project_grant_removed` → "Project context was removed",
+  `project_grant_narrowed` → "Project context no longer covers this package", and
+  `project_root_repoint` → "Project root changed — approve context again". Unknown,
+  raw, path-like, credential-like, or control-text reasons become actionless
+  unavailable/legacy state and are never echoed. No branch parses human reason
+  text.
+- `planning_only` is neutral and has no CTA. Required deferred is neutral boundary
+  copy plus `revise_plan`; optional deferred is neutral with no retry. All ACP copy
+  says only that Forge issued no MCP handle through its channel and does not claim
+  the local ACP process lacks shell, network, or credential access.
 - Add `deferred`/`planning`/`legacy` neutral buckets to `statusBadgeClass`
   (`tasks/[id]/page.tsx:1203`).
 - Extend `execution-design-metadata.ts` decision type/normalizer to carry `mode`,
-  `recoveryAction`, structured `grantState`, `normalizedCapabilities`, `capabilityClasses`, `evidenceRefs`
-  (`unknown_legacy` for old artifacts).
+  `recoveryAction`, the closed imported S3 hold/effective grant-state union,
+  `normalizedCapabilities`, `capabilityClasses`, `evidenceRefs`
+  (`unknown_legacy` for old artifacts). Validate tuple coherence and bound arrays,
+  labels, identifiers, the exact closed revocation enum, and MCP errors before
+  rendering. Strip
+  control/bidirectional formatting characters and secret/path detail. Untrusted
+  copy is rendered only as React text, never Markdown, raw HTML, routes, or DOM IDs.
 - Replace the status-only ternary, split planning-only warnings from degradation
   warnings, stop rendering deferred capabilities as destructive alerts, gate
   `RetryHandoffControls` on `aggregate.retryable`, surface the bounded-context
@@ -2907,6 +2926,258 @@ contract. This split must match the per-step release manifest metadata above.
   approve_project_filesystem_context > install_or_fix_mcp > defer_live_mcp_feature`).
   Because the producer/persistence contract lives in S2, retry/recovery is
   deployable before this UI slice ships.
+- Broker retry additionally requires current compatibility: task exactly
+  `approved`,
+  package still blocked by the same versioned marker and policy fingerprint, no
+  execution, local-evidence, or issuance lease, and primary action exactly
+  `install_or_fix_mcp`.
+  The route locks and rechecks this predicate and returns a stale-action `409`
+  without enqueueing when it changed. Setup, grant, revise-plan, and issuance
+  reapproval remain different actions.
+- S4 issuance recovery remains separate from broker retry. One-time
+  `reapprove_allow_once` targets the package grant control; post-intent
+  `review_then_reapprove_allow_once` requires acknowledgement first.
+  Independent review precedence applies first: any exact host/working-tree/Git-
+  control/Git-storage
+  `review_required` marker—including `submission_failed`—offers only
+  `review_local_changes`. That action completes matched local evidence and advances
+  to the deterministic delivery/grant disposition without changing delivery.
+  `submission_failed` copy says “The request was not accepted”; it never says a
+  provider rejected it because local adapter/TLS/transport refusal proves no such
+  actor. Local-change copy is a separate sentence.
+  Possible-submission acknowledgement remains a separate later action. Every
+  coherent quiescent fully reviewed packet marker also offers ordinary
+  `decline_packet_recovery`, including from uncertain submission without forcing
+  acknowledgement; it preserves evidence and creates no run or wake.
+  Always-allow `retry_execution` is available from delivery
+  `not_exposed|submission_failed` with disposition `retry_execution`, or from
+  delivery `submission_uncertain|submitted` only after acknowledgement changes the
+  separate disposition to `reviewed_submission`. In both cases the task is
+  `approved`, package policy is unchanged, execution/local-evidence/issuance leases
+  are all inactive, and the server has
+  classified current authorization through canonical S1 `readEffectiveGrantState`
+  as the same effective project decision or a greater effective project decision
+  that exactly covers the required set. S3 denial-wins still applies to an
+  equal/newer package denial. Newer coverage is explicit
+  reauthorization and the action records that revision; a new run snapshots it.
+  Missing/narrower/unknown coverage exposes the grant control, not retry.
+  A root-binding mismatch is a structured `root_changed` revocation and says
+  “Project root changed — approve context again”; S5 never compares revisions or
+  displays either path.
+  `review_submission` records acknowledgement actor/time without changing the
+  immutable delivery after local review is complete; the later retry still
+  rechecks current coverage, requires every applicable host/working-tree/Git-
+  control/Git-storage review `not_applicable|reviewed`, and
+  requires the verified current-version task local-change projection zero/null
+  with matching source fingerprint. Every
+  marker has `autoRetryable:false`; unknown/stale markers expose no action and
+  S4's route rechecks under the global order.
+- Every mutation control carries authoritative identity. Packet retry, possible-
+  submission acknowledgement, and packet decline carry S4's version-2
+  `{priorRuntimeAuditId, markerFingerprint}`; generic local review, possible-
+  invocation acknowledgement, retry, and decline carry
+  `{localRunEvidenceId,evidenceFingerprint}` for packet and no-packet runs.
+  Components never synthesize an action-only request, and all seven handlers reject
+  stale/substituted identity without mutation. A recovery marker on a task that remains
+  `running` because another sibling package has a live lease renders neutral
+  “Waiting for active package” without an action until the shared operator-hold
+  reconciler reaches exactly `approved`. An `awaiting_review` sibling
+  renders “Waiting for required review” and preserves the same action suppression.
+  A sibling local-change barrier suppresses every new-run/reapproval action; only
+  the marker owning the exact fingerprint may expose its applicable local review,
+  acknowledgement, retry, or decline action.
+- S5 imports S4's packet and generic local-effect recovery-marker unions. Every known-invalid
+  grant-mode/delivery/disposition/acknowledgement/failure combination is neutral
+  and actionless before presentation. The server joins the exact prior audit, all
+  applicable run artifacts, required generic local-run record, host ledger, and
+  all working-tree/Git-control/Git-storage comparison reviews; proves typed
+  terminal tuple
+  equality plus every marker/host/repository/task-projection version/source
+  fingerprint; and
+  validates assembly/delivery/terminal/failure-stage together; the browser never
+  composes independent fields into an action. Normal audit/marker repository review is exactly
+  `not_applicable|review_required|reviewed`; `abandoned` exists only on the joined
+  privileged quarantine resolution. A typed packet integrity hold is
+  neutral, non-retryable, and has no web CTA. Incomplete success says evidence
+  needs operator repair; true audit/artifact mismatch says evidence conflicts and
+  is quarantined, never promising repair. Copy names Release/DevOps and the
+  checked-in integrity runbook, while privileged resolution remains outside S5.
+  Generic local integrity copy consumes one server-computed, fingerprinted closed
+  classification from S4's exact repair predicates. Missing evidence is always
+  `quarantine_only`, uses S4's nullable local row plus expected non-FK identity, and
+  is never described as reconstructable. A local-evidence mismatch is either
+  `reconstructable` with the one server-selected repair resolution or
+  `irreconcilable` with quarantine as the remaining path; S5 never infers
+  quarantine from the mismatch reason alone. Projection mismatch similarly
+  distinguishes a coherent recompute predicate from irreconcilable sources, while
+  quiescence incoherence distinguishes waiting for service-authored proof from an
+  irreconcilable tuple. Every open integrity state is actionless and names the
+  checked-in Release/DevOps runbook without exposing its command as a browser CTA.
+  `local_integrity_quarantine_closed` requires one exact joined
+  `quarantined_abandoned` resolution whose alert, reason, local/expected evidence
+  identity, hold/classification/resolution fingerprint, quarantine-only or
+  irreconcilable classification, routed project/task/package/run/optional-audit
+  identity, complete sibling-evidence-set fingerprint, and
+  `reviewed|abandoned` repository disposition all match, plus cancelled task and
+  package. It renders “Task closed — evidence quarantined,” preserves the records,
+  and returns zero actions. Missing/stale/cross-project/wrong-reason/incomplete-
+  sibling/status-only state never implies closure: a coherent original hold remains
+  open, and an invalid base route becomes actionless unavailable state.
+  Authorized evidence/history routes render a tombstoned project as “Project
+  removed — evidence retained,” preserve its original opaque rootRef/run evidence,
+  expose no former path, live-root, execution, retry, reapproval, review-gate, or
+  root-management control, and never relabel it when the physical
+  root is reused; normal project lists hide tombstones.
+- A live audit with `status:'claiming'` and **server-computed PostgreSQL-time**
+  execution, generic local-evidence, and packet-issuance leases all active is first
+  normalized into one discriminated claim-state union:
+  preparing=`not_assembled/not_exposed`, live-only
+  assembling=`assembling/not_exposed`, assembled=`assembled/not_exposed`,
+  submitting=`assembled/submitting`, accepted-finalizing=`assembled/submitted`, and
+  rejected-finalizing=`assembled/submission_failed`. Local failure intent is not a
+  durable live phase; preflight, assembly, provider-validation, and
+  post-submission failures remain on their last persisted copy until terminal
+  commit. Impossible phase/assembly/delivery cross-products fail closed. Valid current phases render actionlessly. The browser never compares lease
+  timestamps or derives phase itself. An expired packet or no-packet local run with an active or
+  orphaned containment lease/quiescence alert renders “Waiting for worker changes
+  to stop” and no action until the protected authoritative owning-host service and
+  operating-system adapter prove the complete per-run execution group empty; the
+  long-lived queue worker is outside that group;
+  wrong/stale/divergent-key/insufficient-containment/unreachable host evidence remains
+  waiting. Schema-valid expired/partial observations use typed
+  `state_pending_reconciliation` and neutral “Refreshing run state” copy until S4
+  persists terminal evidence. Unknown persisted status, unsupported schema, or a
+  corrupt tuple uses actionless `state_unavailable`: “State unavailable—Forge
+  update or operator repair required.” A no-packet local run has the same pending/
+  unavailable distinction and otherwise renders only generic quiescence/review/
+  possible-invocation acknowledgement/retry/decline state: no packet counts,
+  audit/artifact, assembly/delivery claim, packet retry/reapproval, or submission
+  acknowledgement is invented. Direct local retry additionally requires immutable
+  invocation `definitive_not_started` written by the still-live exact owner/attempt
+  from the trusted typed pre-I/O refusal, plus unchanged/not-applicable working-tree,
+  Git-control, and Git-storage evidence. Recovery never manufactures that state.
+  `invoking|returned|uncertain` always uses `local_invocation_uncertain` and requires
+  exact possible-invocation acknowledgement before retry. Every local retry also
+  requires task `approved`, package `blocked`, no sibling or execution/local/packet
+  lease barrier, current zero task projection, and a server-computed eligible policy
+  revision/fingerprint. Exhausted or disabled policy has no retry. Coherent reviewed
+  state may be declined without forcing possible-invocation acknowledgement;
+  evidence remains retained.
+- S4 evidence uses opaque `rootRef` or the phrase "this project", never a host
+  filesystem root. S5 ignores generic artifact prose and legacy path-valued `root`
+  fields and renders only validated counts, byte count, omission/redaction summary,
+  and discriminated assembly, terminal delivery, and terminal success/failure from
+  the run-linked artifact. Success is valid only for `assembled+submitted`,
+  unchanged/not-applicable working-tree, Git-control, **and** Git-storage evidence,
+  and S4's no-local-stage
+  `not_started` or with-local-stage `quiesced(actualLastStage)` branch; failed
+  tuples must match S4's exact stage/delivery/code table. Terminal delivery is exhaustive over
+  `not_exposed|submission_failed|submitted|submission_uncertain`; live
+  `assembling|submitting` never appears in the artifact, terminal `not_assembled`
+  accepts only `claim|preflight`, and `assembly_unconfirmed/assembly` is the sole
+  post-intent terminal uncertainty. Assembly never implies ACP
+  acceptance. It never
+  shows selected names, root paths, relative/absolute paths, excerpts, or contents.
+- `PacketTerminalDisplayProjection` is the sole input to
+  `packetArtifactPresentation`. The server constructs it only after joining the
+  exact run-linked artifact to its independently identified runtime audit and exact
+  terminal generic local evidence ID/fingerprint,
+  host-ledger review, and independent working-tree, Git-control, and Git-storage
+  reviews and validating S4's complete compatibility predicate. The projection
+  imports S4's exact immutable terminal assembly, terminal delivery, terminal outcome and
+  failure-code/conditional-stage types, and derives only bounded terminal effect,
+  host-ledger-review, and repository-review facts from S4's closed unions. It has
+  no action identity, path, selected name, content, ledger entry, exception detail,
+  or free-text field; fingerprints validate joins but are not copy. Invalid or
+  mismatched assembly, delivery, outcome, failure stage, effect, ledger, or review
+  facts become static actionless evidence-unavailable copy. The presenter always
+  returns `actions:[]` and cannot authorize any S4 mutation. Mutable packet-
+  recovery marker, acknowledgement, disposition, and action-ledger state remains
+  exclusively in `PacketCurrentStatePresentationInput`; it is never copied into
+  the immutable terminal projection.
+- When terminal artifact and current recovery are loaded together, a `server-only`
+  loader performs one database observation and is the sole constructor of a
+  provenance-branded joined tuple. The brand and constructor are not exported to
+  Client Components, request schemas, action payloads, or presenters. The tuple
+  carries the immutable terminal artifact and independently loaded exact agent-run,
+  runtime-audit ID, generic local-evidence ID/fingerprint, plus the separately
+  validated current projection and marker-relationship values. Browser input cannot
+  supply or select any of those identities.
+- The relationship validator accepts only that branded tuple. A current marker must
+  match exact agent run, runtime-audit ID, generic local-evidence ID, and generic
+  local-evidence fingerprint before recovery failure/delivery, host review, all
+  three repository reviews, and combined review fingerprint are compared. Same-run/
+  different-audit, same-run/different-evidence-ID, and same-evidence-ID/different-
+  fingerprint fail closed. An absent, stale, repaired, success-incompatible, or
+  otherwise mismatched marker returns terminal-only: the valid immutable artifact
+  still renders through actionless `packetArtifactPresentation`, but no current
+  relationship, combined copy, or request identity is emitted. A separately valid
+  mutable projection remains exclusively an input to
+  `packetCurrentStatePresentation`; it can render independently but cannot relabel
+  immutable terminal history. Only server-produced presenter outputs cross the
+  browser boundary. Loader/request-boundary and mutation tests cover direct brand
+  construction, browser-supplied identities, same-run/different-audit, same-run/
+  different-evidence-ID, same-ID/different-fingerprint, stale, repaired, no-marker,
+  and immutable tuple mismatch cases.
+- S5 imports S4's closed `PacketFailureCode` enum and maps only those values to
+  bounded static copy. Unknown/future codes are neutral legacy/unknown evidence,
+  never untrusted free-text operator copy. Packet evidence accepts no raw or
+  sanitized exception detail. A post-submission failure additionally requires its
+  closed stage; copy warns about prior external work and possible repository-state
+  changes, requires exact inspection of the applicable working-tree, Git-control/
+  configuration, and Git-storage/history categories, and never offers automatic resubmission
+  or claims rollback. `completion_preparation` is pre-transaction only; atomic
+  gate/finalizer rollback never renders that cause. Packet UI consumes only the
+  host ledger and every repository comparison evidence's bounded review state and
+  fingerprints, never entry paths or diffs.
+  `external_repository_change_requires_review` says the Agent Communication
+  Protocol runtime is not a filesystem sandbox, Forge stopped before its local
+  apply stages, and exact review of the affected repository-state categories is
+  required; it never says the
+  provider caused the detected change, exposes no path or
+  raw error and no automatic resubmission.
+- S5's redaction-label and parser parity tests import
+  `PACKET_REDACTION_CATEGORIES`; they render every current member and derive the
+  maximum key count only from `.length`. With the current 12 members, a thirteenth
+  unknown-key sentinel fails closed. No fixed category ceiling may diverge from
+  S4's exported array. Terminal-projection mutation fixtures independently
+  vary artifact/run binding, assembly, delivery, terminal status, every failure
+  code and conditional stage, bounded effect and ledger facts, and every field of
+  all three repository-review domains. Each invalid cross-product returns
+  actionless unavailable copy without echoing the mutated value; type-parity tests
+  fail when an S4 union grows without an S5 mapping.
+- Project health action precedence is total: missing→install, disabled→enable,
+  auth-required→connect, configuration-required→configure, unhealthy→fix,
+  unknown→refresh, healthy→no CTA, and incoherent/future→neutral unavailable. The
+  catalog presenter is static and never consumes task or project action state.
+- CTA outputs are discriminated unions with required action-specific handlers or
+  validated targets; setup is never encoded as retry, and invalid status/action
+  pairings are unrepresentable after fail-closed normalization.
+  `AdmissionPresentation.actions` is a bounded zero/one/two tuple. Two actions are
+  type-restricted to packet-primary + packet-decline or local-primary + local-
+  decline, always in that order; cross-family, decline-first, review-plus-decline,
+  setup-plus-decline, recovery-primary-only, mismatched primary/decline request
+  identity, and three-action outputs are invalid. Review-required state has review
+  alone, and exhausted local retry has decline alone. Packet reapproval uses its own
+  exact-identity `reapprove_packet_context` focus action rather than a generic
+  approval scroll. Components render one headline-labelled action group in stable
+  DOM/visual/tab order on desktop and mobile, omit the group for zero actions, and
+  preserve each exact request identity.
+- The project remediation fragment moves focus to a programmatically focusable
+  heading. Presenter tests exhaust zero/one/two action tuples and reconstructable/
+  irreconcilable/missing classifications. Current-state API/loader tests prove exact
+  local closure plus stale, cross-project, incomplete-sibling, missing-disposition,
+  and status-only nonclosure. Playwright tests prove primary/decline coexistence,
+  labelled keyboard order, mobile order, and stale-click suppression. Runbook
+  fixtures prove missing evidence is quarantine-only, reconstructable mismatch uses
+  only its selected repair, and irreconcilable mismatch reaches closure only with
+  the exact fingerprint/sibling evidence. Tests also cover hostile and oversized
+  persisted text, future enums, and multiple attempts with separate history/current/
+  evidence.
+- During rollout S5 dual-reads old and new producer schemas but old/incoherent
+  records remain neutral and non-actionable. Rollback removes UI code only; it does
+  not reinterpret or drop S2/S4 schema, and legacy path-valued evidence remains
+  suppressed.
 
 ### S6 — End-to-end regression
 

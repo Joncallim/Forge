@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { ExternalLinkIcon, HammerIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { McpPresentation } from '@/components/mcps/McpPresentation'
 import {
   Select,
   SelectContent,
@@ -11,6 +12,7 @@ import {
   SelectTrigger,
 } from '@/components/ui/select'
 import { MCP_CATALOG } from '@/lib/mcps/catalog'
+import { catalogMcpPresentation } from '@/lib/mcps/admission-copy'
 
 type WorkspaceSettings = {
   workspaceRoot: string
@@ -36,10 +38,6 @@ function sourceLabel(source: WorkspaceSettings['source']): string {
   if (source === 'env') return 'Environment'
   if (source === 'setting') return 'Custom'
   return 'Default'
-}
-
-function workspaceMcpRootLabel(workspace: WorkspaceSettings): string {
-  return workspace.displayPaths?.mcpsRoot ?? workspace.mcpsRoot
 }
 
 function installerPrompt(source: string): string {
@@ -156,8 +154,8 @@ export default function McpsPage() {
         <div>
           <h1 className="text-xl font-semibold text-foreground">MCP tools</h1>
           {workspace && (
-            <p className="mt-1 font-mono text-sm text-muted-foreground break-all">
-              {workspaceMcpRootLabel(workspace)}
+            <p className="mt-1 text-sm text-muted-foreground">
+              Shared MCP catalog and project setup
             </p>
           )}
         </div>
@@ -195,9 +193,11 @@ export default function McpsPage() {
               </Button>
             </div>
             <ul className="divide-y divide-border rounded-lg border border-border" role="list">
-              {catalogEntries.map((entry) => (
-                <li key={entry.id} className="flex flex-col gap-2 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
-                  <div className="min-w-0">
+              {catalogEntries.map((entry) => {
+                const presentation = catalogMcpPresentation(entry)
+                return (
+                <li key={entry.id} className="grid gap-3 px-3 py-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-start">
+                  <div className="min-w-0 space-y-2">
                     <div className="flex flex-wrap items-center gap-2">
                       <p className="text-sm font-medium text-foreground">{entry.displayName}</p>
                       {entry.recommended && (
@@ -212,6 +212,7 @@ export default function McpsPage() {
                       )}
                     </div>
                     <p className="mt-1 text-xs text-muted-foreground">{entry.description}</p>
+                    <McpPresentation presentation={presentation} />
                   </div>
                   <Button
                     type="button"
@@ -224,7 +225,8 @@ export default function McpsPage() {
                     Project tools
                   </Button>
                 </li>
-              ))}
+                )
+              })}
             </ul>
           </section>
 

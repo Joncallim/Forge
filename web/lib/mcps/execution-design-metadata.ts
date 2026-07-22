@@ -65,6 +65,8 @@ export type McpExecutionDesignMetadata = {
       warning: number
       blocked: number
     }
+    retryable: boolean
+    primaryDecision?: { decisionId?: string }
     decisions: Array<{
       requirementKey?: string
       decisionId: string
@@ -97,7 +99,7 @@ export type McpExecutionDesignMetadata = {
       admissionStatus?: 'allowed' | 'warning' | 'blocked'
       mode: 'planning_only' | 'bounded_context_required' | 'bounded_context_approved' | 'blocked' | 'deferred_live_mcp' | 'unknown_legacy'
       recoveryAction?: string
-      grantState?: { phase: string; consumed?: boolean; revocationReason?: string }
+      grantState?: Record<string, unknown>
       normalizedCapabilities: string[]
       capabilityClasses: Array<{ capability: string; class: string; deliveryKind: string | null }>
       evidenceRefs: string[]
@@ -120,6 +122,50 @@ function normalizeStringArray(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === 'string')
 }
 
+function normalizeGrantPresentationState(value: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(value)) return undefined
+  if (value.kind === 'not_applicable' && Object.keys(value).length === 1) {
+    return { kind: 'not_applicable' }
+  }
+
+  const revision = value.grantDecisionRevision
+  const validRevision = revision === null || (typeof revision === 'string' && /^[1-9][0-9]*$/u.test(revision))
+  const validReason = value.revocationReason === null || [
+    'project_grant_removed',
+    'project_grant_narrowed',
+    'project_root_repoint',
+  ].includes(String(value.revocationReason))
+  if (
+    (value.kind === 'effective_approved' || value.kind === 'operator_hold') &&
+    typeof value.grantPhase === 'string' &&
+    typeof value.grantConsumed === 'boolean' &&
+    validRevision &&
+    validReason
+  ) {
+    return {
+      kind: value.kind,
+      ...(typeof value.holdKind === 'string' ? { holdKind: value.holdKind } : {}),
+      grantPhase: value.grantPhase,
+      grantConsumed: value.grantConsumed,
+      grantDecisionRevision: revision,
+      revocationReason: value.revocationReason,
+    }
+  }
+
+  // Version-1 decisions remain readable as history but cannot become a current
+  // positive or actionable grant presentation without S3 lifecycle identity.
+  if (typeof value.phase === 'string') {
+    return {
+      phase: value.phase.slice(0, 32),
+      ...(typeof value.consumed === 'boolean' ? { consumed: value.consumed } : {}),
+      ...(validReason && value.revocationReason !== null
+        ? { revocationReason: value.revocationReason }
+        : {}),
+    }
+  }
+  return undefined
+}
+
 function artifactTime(artifact: McpExecutionDesignArtifact): number {
   if (!artifact.createdAt) return 0
   const timestamp = new Date(artifact.createdAt).getTime()
@@ -137,18 +183,16 @@ function normalizeGrantDecisions(raw: unknown): McpExecutionDesignMetadata['gran
       warning: typeof summary.warning === 'number' ? summary.warning : 0,
       blocked: typeof summary.blocked === 'number' ? summary.blocked : 0,
     },
+    retryable: raw.retryable === true,
+    ...(isRecord(raw.primaryDecision) && typeof raw.primaryDecision.decisionId === 'string'
+      ? { primaryDecision: { decisionId: raw.primaryDecision.decisionId.slice(0, 80) } }
+      : {}),
     decisions: Array.isArray(raw.decisions)
       ? raw.decisions.filter(isRecord).map((item) => {
           const assignment = isRecord(item.assignment) ? item.assignment : {}
           const fallback = isRecord(item.fallback) ? item.fallback : {}
           const health = isRecord(item.health) ? item.health : {}
-          const grantState = isRecord(item.grantState) && typeof item.grantState.phase === 'string'
-            ? {
-                phase: item.grantState.phase,
-                ...(typeof item.grantState.consumed === 'boolean' ? { consumed: item.grantState.consumed } : {}),
-                ...(typeof item.grantState.revocationReason === 'string' ? { revocationReason: item.grantState.revocationReason } : {}),
-              }
-            : undefined
+          const grantState = normalizeGrantPresentationState(item.grantState)
           const validModes = new Set(['planning_only', 'bounded_context_required', 'bounded_context_approved', 'blocked', 'deferred_live_mcp'])
           return {
             ...(typeof item.requirementKey === 'string' ? { requirementKey: item.requirementKey } : {}),

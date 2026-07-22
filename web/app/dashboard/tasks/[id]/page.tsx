@@ -16,6 +16,7 @@ import {
   InfoIcon,
   DownloadIcon,
   SquareIcon,
+  Trash2Icon,
   LoaderCircleIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -27,6 +28,7 @@ import {
   SelectTrigger,
 } from '@/components/ui/select'
 import { MarkdownView } from '@/components/MarkdownView'
+import { McpPresentation } from '@/components/mcps/McpPresentation'
 import { PlanDiffView } from '@/components/PlanDiffView'
 import { mergeAgentRun, useTaskStream } from '@/hooks/useTaskStream'
 import type { AgentRun, Artifact, TaskQuestion } from '@/hooks/useTaskStream'
@@ -40,13 +42,9 @@ import {
   type McpExecutionDesignMetadata,
 } from '@/lib/mcps/execution-design-metadata'
 import {
-  approvedGrantsForDisplay,
-  latestMcpPlanReviewForDisplay,
-  mcpCapabilityCeilingForAgent,
-  mcpPlanOverlayCount,
-  mcpRequirementDisplayKey,
-  type McpPlanReviewDisplayItem,
-} from '@/lib/mcps/plan-review-metadata'
+  admissionPresentationFromUnknown,
+  type PresentationCta,
+} from '@/lib/mcps/admission-copy'
 import {
   artifactArrayField,
   mergeArtifacts,
@@ -1567,8 +1565,7 @@ export function canStopTaskStatus(status: string): boolean {
 }
 
 export function canDeleteTaskStatus(status: string): boolean {
-  void status
-  return false
+  return TERMINAL_TASK_STATUSES.has(status)
 }
 
 // ---------------------------------------------------------------------------
@@ -1715,36 +1712,64 @@ function BrokerRetrySummary({ broker }: { broker: WorkforceRecord | null }) {
   )
 }
 
-function McpGrantCards({ grants }: { grants: WorkforceRecord[] }) {
+function PresentationActionButton({
+  action,
+  onActivate,
+}: {
+  action: PresentationCta
+  onActivate: (action: PresentationCta) => void
+}) {
+  const decline = action.kind === 'decline_packet_recovery' || action.kind === 'decline_local_retry'
+  return (
+    <Button
+      type="button"
+      size="sm"
+      variant={decline ? 'outline' : 'secondary'}
+      className="w-full sm:w-auto"
+      onClick={() => onActivate(action)}
+    >
+      {action.label}
+    </Button>
+  )
+}
+
+function McpGrantCards({
+  grants,
+  onAction,
+  packageId,
+  projectId,
+}: {
+  grants: WorkforceRecord[]
+  onAction: (action: PresentationCta) => void
+  packageId: string
+  projectId: string
+}) {
   if (grants.length === 0) return null
+  const packageGrantTargetId = packageId === '' ? undefined : `filesystem-grant-${packageId}`
 
   return (
     <div>
-      <p className="font-medium text-muted-foreground">Brokered MCP grant decisions</p>
+      <p className="font-medium text-muted-foreground">Current MCP admission</p>
       <p className="mt-1 text-muted-foreground">
-        No live MCP tool handles are issued in beta. These brokered decisions only shape run-scoped package instructions.
+        Current package admission is separate from plan history and run evidence. No live MCP tool handles are issued in beta.
       </p>
       <div className="mt-2 grid gap-2">
         {grants.map((grant, index) => {
-          const mcpId = stringField(grant, ['mcpId', 'id']) || 'MCP'
-          const status = stringField(grant, ['status', 'state']) || 'proposed'
-          const requirement = stringField(grant, ['requirement'])
-          const reason = stringField(grant, ['reason'])
-          const capabilities = stringArrayField(grant, ['capabilities', 'permissions'])
-          const fallback = describeMcpFallback(grant.fallback)
+          const presentation = admissionPresentationFromUnknown({
+            ...grant,
+            retryable: booleanField(grant, ['retryable']) ?? false,
+          }, {
+            projectId,
+            ...(packageGrantTargetId ? { packageGrantTargetId } : {}),
+          })
           return (
-            <div key={recordKey(grant, 'mcp-grant', index)} className="rounded-md border border-border bg-background px-2 py-1.5">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-mono text-xs font-medium text-foreground">{mcpId}</span>
-                <Badge variant="outline" className={statusBadgeClass(status)}>{statusLabel(status)}</Badge>
-                {requirement !== '' && <Badge variant="secondary">{requirement}</Badge>}
-              </div>
-              {reason !== '' && <p className="mt-1 text-muted-foreground">{reason}</p>}
-              {capabilities.length > 0 && (
-                <p className="mt-1 break-words font-mono text-[11px] text-muted-foreground">{capabilities.join(', ')}</p>
+            <McpPresentation
+              key={recordKey(grant, 'mcp-grant', index)}
+              presentation={presentation}
+              renderAction={(action) => (
+                <PresentationActionButton action={action} onActivate={onAction} />
               )}
-              {fallback !== '' && <p className="mt-1 text-muted-foreground">Fallback: {fallback}</p>}
-            </div>
+            />
           )
         })}
       </div>
@@ -1775,115 +1800,6 @@ function filesystemEffectiveState(pkg: WorkPackage): {
   }
 }
 
-type TaskFilesystemGrantDecision = {
-  capabilities: string[]
-  decision: 'approved' | 'denied'
-  grantDecisionRevision: string | null
-  id: string
-  reason: string | null
-}
-
-type TaskFilesystemGrantState = {
-  currentDecision: TaskFilesystemGrantDecision | null
-  pointerFingerprint: string | null
-  pointerVersion: string
-  workPackageId: string
-}
-
-export type FilesystemGrantExpectedPointer = {
-  currentDecisionId: string
-  currentDecisionRevision: string | null
-  pointerFingerprint: string
-  pointerVersion: string
-}
-
-/**
- * A reapproval is valid only against the exact package decision the operator
- * reviewed. An empty package has no prior decision, so its first decision (D1)
- * intentionally has no expected pointer.
- */
-export function filesystemGrantExpectedPointerFromState(
-  state: TaskFilesystemGrantState | null,
-): FilesystemGrantExpectedPointer | null {
-  if (!state?.currentDecision || !state.pointerFingerprint) return null
-  return {
-    currentDecisionId: state.currentDecision.id,
-    currentDecisionRevision: state.currentDecision.grantDecisionRevision,
-    pointerFingerprint: state.pointerFingerprint,
-    pointerVersion: state.pointerVersion,
-  }
-}
-
-function sameFilesystemGrantPointer(
-  left: FilesystemGrantExpectedPointer | null,
-  right: FilesystemGrantExpectedPointer | null,
-): boolean {
-  if (left === null || right === null) return left === right
-  return left.currentDecisionId === right.currentDecisionId &&
-    left.currentDecisionRevision === right.currentDecisionRevision &&
-    left.pointerFingerprint === right.pointerFingerprint &&
-    left.pointerVersion === right.pointerVersion
-}
-
-function taskFilesystemGrantStateFromResponse(
-  value: unknown,
-  workPackageId: string,
-): TaskFilesystemGrantState {
-  if (!isRecord(value) || !Array.isArray(value.grants)) {
-    throw new Error('Forge returned an invalid filesystem grant state.')
-  }
-  const rawState = value.grants.find((grant) => isRecord(grant) && grant.workPackageId === workPackageId)
-  if (!isRecord(rawState)) {
-    throw new Error('Forge did not return filesystem grant state for this work package.')
-  }
-  if (typeof rawState.pointerVersion !== 'string' || !/^(0|[1-9][0-9]*)$/.test(rawState.pointerVersion)) {
-    throw new Error('Forge returned an invalid filesystem grant pointer version.')
-  }
-  if (rawState.pointerFingerprint !== null && typeof rawState.pointerFingerprint !== 'string') {
-    throw new Error('Forge returned an invalid filesystem grant pointer fingerprint.')
-  }
-
-  if (rawState.currentDecision === null) {
-    return {
-      currentDecision: null,
-      pointerFingerprint: rawState.pointerFingerprint,
-      pointerVersion: rawState.pointerVersion,
-      workPackageId,
-    }
-  }
-  if (!isRecord(rawState.currentDecision)) {
-    throw new Error('Forge returned an invalid current filesystem decision.')
-  }
-  const decision = rawState.currentDecision
-  if (
-    typeof decision.id !== 'string' || decision.id === '' ||
-    (decision.decision !== 'approved' && decision.decision !== 'denied') ||
-    !Array.isArray(decision.capabilities) ||
-    !decision.capabilities.every((capability) => typeof capability === 'string') ||
-    (decision.reason !== null && typeof decision.reason !== 'string') ||
-    (decision.grantDecisionRevision !== null && (
-      typeof decision.grantDecisionRevision !== 'string' ||
-      !/^[1-9][0-9]*$/.test(decision.grantDecisionRevision)
-    )) ||
-    typeof rawState.pointerFingerprint !== 'string' || rawState.pointerFingerprint === ''
-  ) {
-    throw new Error('Forge returned an incomplete current filesystem decision pointer.')
-  }
-
-  return {
-    currentDecision: {
-      capabilities: [...decision.capabilities],
-      decision: decision.decision,
-      grantDecisionRevision: decision.grantDecisionRevision,
-      id: decision.id,
-      reason: decision.reason,
-    },
-    pointerFingerprint: rawState.pointerFingerprint,
-    pointerVersion: rawState.pointerVersion,
-    workPackageId,
-  }
-}
-
 function FilesystemGrantControls({
   onUpdated,
   pkg,
@@ -1901,10 +1817,6 @@ function FilesystemGrantControls({
   const [reason, setReason] = useState(effective.reason)
   const [saving, setSaving] = useState<'allow_once' | 'always_allow' | 'denied' | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [grantState, setGrantState] = useState<TaskFilesystemGrantState | null>(null)
-  const [grantStateLoading, setGrantStateLoading] = useState(true)
-  const [grantStateError, setGrantStateError] = useState<string | null>(null)
-  const [requiresReconfirmation, setRequiresReconfirmation] = useState(false)
   const packageId = stringField(pkg, ['id'])
   const packageStatus = stringField(pkg, ['status'])
 
@@ -1912,51 +1824,6 @@ function FilesystemGrantControls({
     setSelected(effective.capabilities.length > 0 ? effective.capabilities : summary.requestedCapabilities)
     setReason(effective.reason)
   }, [effective, summary])
-
-  const applyGrantState = useCallback((nextState: TaskFilesystemGrantState) => {
-    setGrantState(nextState)
-    const current = nextState.currentDecision
-    if (!current) return
-    setSelected(current.decision === 'approved' ? current.capabilities : summary.requestedCapabilities)
-    setReason(current.reason ?? '')
-  }, [summary.requestedCapabilities])
-
-  const loadGrantState = useCallback(async (signal?: AbortSignal) => {
-    setGrantStateLoading(true)
-    setGrantStateError(null)
-    try {
-      const response = await fetch(`/api/tasks/${taskId}/filesystem-grants`, {
-        cache: 'no-store',
-        signal,
-      })
-      const body: unknown = await response.json().catch(() => null)
-      if (!response.ok) {
-        const message = isRecord(body) && typeof body.error === 'string'
-          ? body.error
-          : 'Failed to load the current filesystem decision.'
-        throw new Error(message)
-      }
-      const nextState = taskFilesystemGrantStateFromResponse(body, packageId)
-      if (!signal?.aborted) applyGrantState(nextState)
-      return nextState
-    } catch (loadError) {
-      if (signal?.aborted) return null
-      const message = loadError instanceof Error
-        ? loadError.message
-        : 'Failed to load the current filesystem decision.'
-      setGrantStateError(message)
-      throw loadError
-    } finally {
-      if (!signal?.aborted) setGrantStateLoading(false)
-    }
-  }, [applyGrantState, packageId, taskId])
-
-  useEffect(() => {
-    if (packageId === '') return
-    const controller = new AbortController()
-    void loadGrantState(controller.signal).catch(() => undefined)
-    return () => controller.abort()
-  }, [loadGrantState, packageId])
 
   if (summary.requestedCapabilities.length === 0 || packageId === '') return null
 
@@ -1968,14 +1835,9 @@ function FilesystemGrantControls({
   const deniedRequired = effective.status === 'denied' && summary.blockingCapabilities.length > 0
 
   async function submit(decision: 'approved' | 'denied', grantMode: 'allow_once' | 'always_allow' = 'always_allow') {
-    if (!grantState || grantStateLoading) {
-      setError('Wait for Forge to load the current filesystem decision before confirming.')
-      return
-    }
     setSaving(decision === 'approved' ? grantMode : 'denied')
     setError(null)
     try {
-      const expectedPointer = filesystemGrantExpectedPointerFromState(grantState)
       const res = await fetch(`/api/tasks/${taskId}/filesystem-grants`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -1987,49 +1849,16 @@ function FilesystemGrantControls({
             capabilities: decision === 'approved' ? selected : [],
             grantMode,
             reason: reason.trim() || undefined,
-            ...(expectedPointer ? { expectedPointer } : {}),
           }],
         }),
       })
-      const body: unknown = await res.json().catch(() => ({}))
-      if (res.status === 409) {
-        try {
-          const refreshedState = await loadGrantState()
-          const refreshedPointer = filesystemGrantExpectedPointerFromState(refreshedState)
-          if (!sameFilesystemGrantPointer(expectedPointer, refreshedPointer)) {
-            setRequiresReconfirmation(true)
-            setError('The filesystem decision changed while you were reviewing it. Forge refreshed the current decision; review it and choose an action again to confirm.')
-          } else {
-            setRequiresReconfirmation(false)
-            setError(isRecord(body) && typeof body.error === 'string'
-              ? body.error
-              : 'Forge could not save this filesystem decision.')
-          }
-        } catch {
-          setRequiresReconfirmation(false)
-          setError('Forge rejected this filesystem decision and could not refresh the current pointer. Reload the task before confirming another decision.')
-        }
-        return
-      }
+      const body = await res.json().catch(() => ({}))
       if (!res.ok) {
-        throw new Error(isRecord(body) && typeof body.error === 'string'
-          ? body.error
-          : 'Failed to save filesystem grant')
-      }
-      setRequiresReconfirmation(false)
-      let refreshError: string | null = null
-      try {
-        await loadGrantState()
-      } catch {
-        refreshError = 'The decision was saved, but Forge could not refresh its current pointer. Reload the task before making another decision.'
+        throw new Error(body.error ?? 'Failed to save filesystem grant')
       }
       await onUpdated()
       if (res.status === 202) {
-        setError(isRecord(body) && typeof body.error === 'string'
-          ? body.error
-          : 'Filesystem grant saved, but Forge could not requeue the recovered task. Retry handoff manually.')
-      } else if (refreshError) {
-        setError(refreshError)
+        setError(body.error ?? 'Filesystem grant saved, but Forge could not requeue the recovered task. Retry handoff manually.')
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An unexpected error occurred')
@@ -2039,25 +1868,17 @@ function FilesystemGrantControls({
   }
 
   return (
-    <div className="rounded-md border border-border bg-background px-2.5 py-2">
+    <div
+      id={`filesystem-grant-${packageId}`}
+      tabIndex={-1}
+      className="scroll-mt-24 rounded-md border border-border bg-background px-2.5 py-2 outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+    >
       <div className="flex flex-wrap items-center gap-2">
         <p className="font-medium text-muted-foreground">Filesystem context grant</p>
-        <Badge variant="outline" className={statusBadgeClass(grantState?.currentDecision?.decision ?? effective.status)}>
-          {statusLabel(grantState?.currentDecision?.decision ?? effective.status)}
-        </Badge>
+        <Badge variant="outline" className={statusBadgeClass(effective.status)}>{statusLabel(effective.status)}</Badge>
         {effective.grantMode !== '' && <Badge variant="secondary">{statusLabel(effective.grantMode)}</Badge>}
         {summary.blockingCapabilities.length > 0 && <Badge variant="secondary">required</Badge>}
       </div>
-      {grantStateLoading && <p role="status" className="mt-2 text-xs text-muted-foreground">Loading current filesystem decision…</p>}
-      {grantState?.currentDecision && (
-        <p className="mt-2 break-all font-mono text-[11px] text-muted-foreground">
-          Current decision {grantState.currentDecision.id}
-          {grantState.currentDecision.grantDecisionRevision
-            ? ` · revision ${grantState.currentDecision.grantDecisionRevision}`
-            : ''}
-          {` · pointer ${grantState.pointerVersion}`}
-        </p>
-      )}
       <div className="mt-2 flex flex-wrap gap-2">
         {FILESYSTEM_CAPABILITY_OPTIONS.filter((capability) => summary.requestedCapabilities.includes(capability)).map((capability) => (
           <label key={capability} className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 font-mono text-[11px] text-foreground">
@@ -2098,31 +1919,31 @@ function FilesystemGrantControls({
           />
           <div className="flex flex-wrap gap-2">
             <Button
-              disabled={saving !== null || grantStateLoading || grantState === null || grantStateError !== null || approveDisabled}
+              disabled={saving !== null || approveDisabled}
               onClick={() => void submit('approved', 'allow_once')}
               size="sm"
               type="button"
               variant="outline"
             >
-              {saving === 'allow_once' ? 'Saving...' : requiresReconfirmation ? 'Confirm allow once' : 'Allow once'}
+              {saving === 'allow_once' ? 'Saving...' : 'Allow once'}
             </Button>
             <Button
-              disabled={saving !== null || grantStateLoading || grantState === null || grantStateError !== null || approveDisabled}
+              disabled={saving !== null || approveDisabled}
               onClick={() => void submit('approved', 'always_allow')}
               size="sm"
               type="button"
               variant="outline"
             >
-              {saving === 'always_allow' ? 'Saving...' : requiresReconfirmation ? 'Confirm always allow' : 'Always allow'}
+              {saving === 'always_allow' ? 'Saving...' : 'Always allow'}
             </Button>
             <Button
-              disabled={saving !== null || grantStateLoading || grantState === null || grantStateError !== null}
+              disabled={saving !== null}
               onClick={() => void submit('denied')}
               size="sm"
               type="button"
               variant="outline"
             >
-              {saving === 'denied' ? 'Saving...' : requiresReconfirmation ? 'Confirm deny' : 'Deny'}
+              {saving === 'denied' ? 'Saving...' : 'Deny'}
             </Button>
           </div>
         </div>
@@ -2130,7 +1951,6 @@ function FilesystemGrantControls({
       {effective.grantApprovalId !== '' && (
         <p className="mt-2 break-all font-mono text-[11px] text-muted-foreground">Grant {effective.grantApprovalId}</p>
       )}
-      {grantStateError !== null && <p role="alert" className="mt-2 text-xs text-destructive">{grantStateError}</p>}
       {error !== null && <p role="alert" className="mt-2 text-xs text-destructive">{error}</p>}
     </div>
   )
@@ -2149,17 +1969,17 @@ function ApprovedGrantSnapshot({ packages }: { packages: WorkforceRecord[] }) {
         {packages.map((pkg, index) => {
           const packageId = stringField(pkg, ['workPackageId', 'id']) || `Package ${index + 1}`
           const assignedRole = stringField(pkg, ['assignedRole', 'role'])
-          const approvedGrants = approvedGrantsForDisplay(pkg)
-          const proposedRequirements = jsonArrayField(pkg, ['approvedRequirements', 'proposedRequirements', 'requirements'])
+          const proposedGrants = jsonArrayField(pkg, ['proposedGrants', 'grants'])
+          const proposedRequirements = jsonArrayField(pkg, ['proposedRequirements', 'requirements'])
           return (
             <div key={recordKey(pkg, 'approved-grant-package', index)} className="rounded-md border border-border bg-background px-2 py-1.5">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="break-all font-mono text-[11px] text-foreground">{packageId}</span>
                 {assignedRole !== '' && <Badge variant="secondary">{assignedRole}</Badge>}
               </div>
-              {approvedGrants.length > 0 && (
+              {proposedGrants.length > 0 && (
                 <p className="mt-1 text-muted-foreground">
-                  Grants: {approvedGrants.map((grant) => stringField(grant, ['mcpId', 'id']) || 'MCP').join(', ')}
+                  Grants: {proposedGrants.map((grant) => stringField(grant, ['mcpId', 'id']) || 'MCP').join(', ')}
                 </p>
               )}
               {proposedRequirements.length > 0 && (
@@ -2656,6 +2476,8 @@ function WorkforcePanel({
   filesystemAudits,
   fallbackAgents,
   onGateDecided,
+  onMcpAction,
+  projectId,
   taskId,
   taskStatus,
   artifacts,
@@ -2668,6 +2490,8 @@ function WorkforcePanel({
   filesystemAudits: FilesystemAudit[]
   fallbackAgents: PlannedAgent[]
   onGateDecided: () => Promise<void>
+  onMcpAction: (action: PresentationCta) => void
+  projectId: string
   taskId: string
   taskStatus: string | null
   artifacts: Artifact[]
@@ -2928,7 +2752,12 @@ function WorkforcePanel({
                             taskId={taskId}
                             taskStatus={taskStatus}
                           />
-                          <McpGrantCards grants={mcpGrants} />
+                          <McpGrantCards
+                            grants={mcpGrants}
+                            onAction={onMcpAction}
+                            packageId={pkgId}
+                            projectId={projectId}
+                          />
                           <McpSubtaskCards subtasks={mcpSubtasks} />
                           {packageArtifacts.length > 0 && (
                             <div>
@@ -3304,93 +3133,22 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
   )
 }
 
-function initialMcpReviewItems(
-  design: McpExecutionDesignMetadata | null,
-  existing: ReturnType<typeof latestMcpPlanReviewForDisplay>,
-): McpPlanReviewDisplayItem[] {
-  if (existing && existing.items.length > 0) {
-    return existing.items.map((item) => ({
-      ...item,
-      assignment: { ...item.assignment, targetAgents: [...item.assignment.targetAgents] },
-      agentPermissions: Object.fromEntries(Object.entries(item.agentPermissions).map(([agent, capabilities]) => [agent, [...capabilities]])),
-      promptOverlays: { ...item.promptOverlays },
-    }))
-  }
-  const proposed = design?.proposed
-  if (!proposed) return []
-  return proposed.requirements.map((requirement, index) => {
-    const key = mcpRequirementDisplayKey(requirement, index)
-    const promptOverlays = Object.fromEntries(proposed.requirementContexts
-      .filter((context) => context.requirementKey === key)
-      .map((context) => [context.agent, context.promptOverlay]))
-    return {
-      requirementKey: key,
-      decision: 'approved',
-      assignment: { ...requirement.assignment, targetAgents: [...requirement.assignment.targetAgents] },
-      agentPermissions: Object.fromEntries(Object.entries(requirement.agentPermissions).map(([agent, capabilities]) => [agent, [...capabilities]])),
-      promptOverlays,
-    }
-  })
-}
-
 function McpAccessPlanPanel({
-  approvalGate,
   design,
-  onSaved,
-  status,
-  workPackages,
+  onAction,
+  projectId,
 }: {
-  approvalGate: ApprovalGate | null
   design: McpExecutionDesignMetadata | null
-  onSaved: () => Promise<void>
-  status: string
-  workPackages: WorkPackage[]
+  onAction: (action: PresentationCta) => void
+  projectId: string
 }) {
-  const proposed = design?.proposed
-  const requirements = proposed?.requirements ?? []
-  const overlayCount = mcpPlanOverlayCount(design)
-  const subtaskCount = proposed?.mcpAwareSubtasks.length ?? 0
-  const grantPreview = design?.grantDecisions
-  const existingReview = useMemo(() => latestMcpPlanReviewForDisplay(approvalGate), [approvalGate])
-  const [draftItems, setDraftItems] = useState<McpPlanReviewDisplayItem[]>(() => initialMcpReviewItems(design, existingReview))
-  const [reviewSaving, setReviewSaving] = useState(false)
-  const [reviewError, setReviewError] = useState<string | null>(null)
-  const sourceArtifactId = approvalGate ? stringField(approvalGate, ['sourceArtifactId']) : ''
-  const packageAgents = [...new Set(workPackages.map((pkg) => stringField(pkg, ['assignedRole'])).filter(Boolean))].sort()
-  const reviewEnabled = status === 'awaiting_approval' && sourceArtifactId !== '' && requirements.length > 0
-
-  useEffect(() => {
-    setDraftItems(initialMcpReviewItems(design, existingReview))
-  }, [design, existingReview])
-
-  const updateDraft = (index: number, update: (item: McpPlanReviewDisplayItem) => McpPlanReviewDisplayItem) => {
-    setDraftItems((items) => items.map((item, itemIndex) => itemIndex === index ? update(item) : item))
-  }
-
-  const saveReview = async () => {
-    setReviewSaving(true)
-    setReviewError(null)
-    try {
-      const response = await fetch(`/api/tasks/${stringField(approvalGate ?? {}, ['taskId'])}/mcp-plan-review`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sourceArtifactId,
-          baseRevision: existingReview?.revision ?? 0,
-          baseDigest: existingReview?.digest ?? null,
-          items: draftItems,
-        }),
-      })
-      const body = await response.json().catch(() => ({}))
-      if (!response.ok) throw new Error(typeof body.error === 'string' ? body.error : 'Failed to save MCP access review.')
-      await onSaved()
-    } catch (error) {
-      setReviewError(error instanceof Error ? error.message : 'Failed to save MCP access review.')
-    } finally {
-      setReviewSaving(false)
-    }
-  }
   if (!design) return null
+
+  const proposed = design.proposed
+  const requirements = proposed?.requirements ?? []
+  const overlayCount = proposed ? Object.keys(proposed.promptOverlays).length : 0
+  const subtaskCount = proposed?.mcpAwareSubtasks.length ?? 0
+  const grantPreview = design.grantDecisions
   const missingDesignOnly =
     requirements.length === 0 &&
     design.validation.blocked.length === 0 &&
@@ -3422,18 +3180,6 @@ function McpAccessPlanPanel({
           MCP access is beta-planned only. Forge records proposed requirements and brokered decisions, but no live MCP tool handles are issued to package runs; approved inputs become run-scoped prompt instructions.
         </p>
       </div>
-
-      {existingReview && (
-        <div className="mb-3 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
-          <p className="font-medium text-foreground">Operator review revision {existingReview.revision}</p>
-          <p className="mt-1 break-all font-mono text-[11px]">{existingReview.digest}</p>
-          {existingReview.blockers.length > 0 && (
-            <ul role="alert" className="mt-2 list-disc pl-4 text-destructive">
-              {existingReview.blockers.map((blocker, index) => <li key={duplicateSafeKey('mcp-review-blocker', blocker, index)}>{blocker}</li>)}
-            </ul>
-          )}
-        </div>
-      )}
 
       {design.validation.blocked.length > 0 && (
         <div role="alert" className="mb-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
@@ -3471,31 +3217,27 @@ function McpAccessPlanPanel({
           </div>
           <ul className="grid gap-2 text-xs">
             {grantPreview.decisions.map((decision) => {
-              const statusText = decision.status === 'blocked'
-                ? 'Do not assign MCP-backed work until this MCP issue is resolved.'
-                : decision.status === 'warning'
-                  ? 'Optional MCP access is unavailable. Continue using the Architect fallback.'
-                  : 'Plan-approved for prompt context only. Forge does not attach live MCP tools in beta.'
+              const primaryDecisionId = grantPreview.primaryDecision?.decisionId
+              const presentationGrantState = (
+                decision.mode === 'planning_only' ||
+                decision.mode === 'blocked' ||
+                decision.mode === 'deferred_live_mcp' ||
+                decision.mode === 'unknown_legacy'
+              ) ? { kind: 'not_applicable' } : decision.grantState
+              const presentation = admissionPresentationFromUnknown({
+                ...decision,
+                grantState: presentationGrantState,
+                retryable: grantPreview.retryable && primaryDecisionId === decision.decisionId,
+              }, { projectId })
 
               return (
-                <li key={decision.decisionId} className="rounded-md border border-border bg-muted/20 px-2.5 py-2">
-                  <div className="mb-1 flex flex-wrap items-center gap-2">
-                    <Badge variant="outline" className={statusBadgeClass(decision.status)}>{decision.status}</Badge>
-                    <span className="font-medium text-foreground">{decision.agent}</span>
-                    <span className="text-muted-foreground">{decision.mcpId}</span>
-                  </div>
-                  <p className="text-muted-foreground">{statusText}</p>
-                  {decision.capabilities.length > 0 && (
-                    <p className="mt-1 break-words text-muted-foreground">
-                      Proposed capabilities: {decision.capabilities.join(', ')}
-                    </p>
-                  )}
-                  {decision.health.status !== 'healthy' && (
-                    <p className="mt-1 text-muted-foreground">
-                      Status: {decision.health.installState}/{decision.health.status}
-                      {decision.health.error ? `: ${decision.health.error}` : ''}
-                    </p>
-                  )}
+                <li key={decision.decisionId}>
+                  <McpPresentation
+                    presentation={presentation}
+                    renderAction={(action) => (
+                      <PresentationActionButton action={action} onActivate={onAction} />
+                    )}
+                  />
                 </li>
               )
             })}
@@ -3511,12 +3253,6 @@ function McpAccessPlanPanel({
         <ul className="flex flex-col gap-3" aria-label="MCP requirements">
           {requirements.map((requirement, index) => {
             const permissionEntries = Object.entries(requirement.agentPermissions)
-            const draft = draftItems[index]
-            const selectedAgents = draft?.assignment.type === 'architect_only'
-              ? ['architect']
-              : draft?.assignment.type === 'reviewer_only'
-                ? ['reviewer']
-                : draft?.assignment.targetAgents ?? []
             return (
               <li key={`${requirement.mcpId}-${requirement.assignment.type}-${index}`} className="border-t border-border pt-3 first:border-t-0 first:pt-0">
                 <div className="mb-1 flex flex-wrap items-center gap-2">
@@ -3524,8 +3260,6 @@ function McpAccessPlanPanel({
                   <Badge variant={requirement.requirement === 'required' ? 'outline' : 'secondary'}>
                     {requirement.requirement}
                   </Badge>
-                  <Badge variant="outline">Confidence: {requirement.confidence}</Badge>
-                  <Badge variant="secondary">Project scope · planning instruction</Badge>
                 </div>
                 {requirement.reason && (
                   <p className="text-sm text-muted-foreground">{requirement.reason}</p>
@@ -3562,180 +3296,10 @@ function McpAccessPlanPanel({
                     <dd>{requirement.fallback.action}: {requirement.fallback.message}</dd>
                   </div>
                 </dl>
-                {reviewEnabled && draft && (
-                  <div className="mt-3 grid gap-3 rounded-md border border-border bg-muted/20 p-3 text-xs">
-                    <div className="flex flex-wrap gap-2">
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant={draft.decision === 'approved' ? 'default' : 'outline'}
-                        onClick={() => updateDraft(index, (item) => ({ ...item, decision: 'approved' }))}
-                      >Approve requirement</Button>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant={draft.decision === 'denied' ? 'destructive' : 'outline'}
-                        onClick={() => updateDraft(index, (item) => ({ ...item, decision: 'denied' }))}
-                      >Deny requirement</Button>
-                    </div>
-                    {draft.decision === 'approved' && (
-                      <>
-                        <label className="grid gap-1 font-medium text-foreground">
-                          Assignment
-                          <select
-                            className="h-9 rounded-md border border-input bg-background px-2 font-normal"
-                            value={draft.assignment.type}
-                            onChange={(event) => updateDraft(index, (item) => {
-                              const type = event.target.value
-                              const targets = type === 'architect_only'
-                                ? ['architect']
-                                : type === 'reviewer_only'
-                                  ? ['reviewer']
-                                  : item.assignment.targetAgents.filter((agent) => packageAgents.includes(agent))
-                              const fallbackTargets = targets.length > 0 ? targets : packageAgents.slice(0, type === 'multiple_agents' ? 2 : 1)
-                              return {
-                                ...item,
-                                assignment: { ...item.assignment, type, targetAgents: fallbackTargets },
-                                agentPermissions: Object.fromEntries(fallbackTargets.map((agent) => [agent, item.agentPermissions[agent] ?? []])),
-                                promptOverlays: Object.fromEntries(fallbackTargets.flatMap((agent) => item.promptOverlays[agent] ? [[agent, item.promptOverlays[agent]]] : [])),
-                              }
-                            })}
-                          >
-                            <option value="agent">Single agent</option>
-                            <option value="multiple_agents">Multiple agents</option>
-                            <option value="workforce">Workforce</option>
-                            <option value="architect_only">Architect only</option>
-                            <option value="reviewer_only">Reviewer only</option>
-                          </select>
-                        </label>
-                        {draft.assignment.type === 'workforce' && (
-                          <label className="grid gap-1 font-medium text-foreground">
-                            Workforce id
-                            <input
-                              className="h-9 rounded-md border border-input bg-background px-2 font-normal"
-                              value={draft.assignment.targetId ?? ''}
-                              onChange={(event) => updateDraft(index, (item) => ({ ...item, assignment: { ...item.assignment, targetId: event.target.value } }))}
-                            />
-                          </label>
-                        )}
-                        {!['architect_only', 'reviewer_only'].includes(draft.assignment.type) && (
-                          <fieldset className="grid gap-1">
-                            <legend className="font-medium text-foreground">Assigned package agents</legend>
-                            <div className="flex flex-wrap gap-3">
-                              {packageAgents.map((agent) => (
-                                <label key={agent} className="flex items-center gap-1.5">
-                                  <input
-                                    type="checkbox"
-                                    checked={selectedAgents.includes(agent)}
-                                    onChange={(event) => updateDraft(index, (item) => {
-                                      const nextTargets = event.target.checked
-                                        ? item.assignment.type === 'agent' ? [agent] : [...new Set([...item.assignment.targetAgents, agent])]
-                                        : item.assignment.targetAgents.filter((candidate) => candidate !== agent)
-                                      return {
-                                        ...item,
-                                        assignment: { ...item.assignment, targetAgents: nextTargets },
-                                        agentPermissions: Object.fromEntries(nextTargets.map((target) => [target, item.agentPermissions[target] ?? []])),
-                                        promptOverlays: Object.fromEntries(nextTargets.flatMap((target) => item.promptOverlays[target] ? [[target, item.promptOverlays[target]]] : [])),
-                                      }
-                                    })}
-                                  />
-                                  {agent}
-                                </label>
-                              ))}
-                            </div>
-                          </fieldset>
-                        )}
-                        {selectedAgents.map((agent) => (
-                          <fieldset key={agent} className="grid gap-2 rounded-md border border-border bg-background p-2">
-                            <legend className="px-1 font-medium text-foreground">{agent}</legend>
-                            <div className="flex flex-wrap gap-3">
-                              {mcpCapabilityCeilingForAgent(requirement, agent).map((capability) => (
-                                <label key={capability} className="flex items-center gap-1.5 font-mono text-[11px]">
-                                  <input
-                                    type="checkbox"
-                                    checked={(draft.agentPermissions[agent] ?? []).includes(capability)}
-                                    onChange={(event) => updateDraft(index, (item) => ({
-                                      ...item,
-                                      agentPermissions: {
-                                        ...item.agentPermissions,
-                                        [agent]: event.target.checked
-                                          ? [...new Set([...(item.agentPermissions[agent] ?? []), capability])].sort()
-                                          : (item.agentPermissions[agent] ?? []).filter((candidate) => candidate !== capability),
-                                      },
-                                    }))}
-                                  />
-                                  {capability}
-                                </label>
-                              ))}
-                              {mcpCapabilityCeilingForAgent(requirement, agent).length === 0 && (
-                                <span className="text-muted-foreground">No Architect-proposed capabilities are available for this assignee.</span>
-                              )}
-                            </div>
-                            <label className="grid gap-1 font-medium text-foreground">
-                              Package prompt overlay
-                              <textarea
-                                className="min-h-20 rounded-md border border-input bg-background px-2 py-1.5 font-normal"
-                                maxLength={1000}
-                                value={draft.promptOverlays[agent] ?? ''}
-                                onChange={(event) => updateDraft(index, (item) => ({ ...item, promptOverlays: { ...item.promptOverlays, [agent]: event.target.value } }))}
-                              />
-                            </label>
-                          </fieldset>
-                        ))}
-                      </>
-                    )}
-                  </div>
-                )}
               </li>
             )
           })}
         </ul>
-      )}
-
-      {proposed && proposed.requirementContexts.length > 0 && (
-        <div className="mt-3 border-t border-border pt-3 text-xs">
-          <p className="font-medium text-foreground">Requirement-scoped package context</p>
-          <ul className="mt-2 grid gap-2">
-            {proposed.requirementContexts.map((context, index) => (
-              <li key={duplicateSafeKey('mcp-context', `${context.requirementKey}-${context.agent}`, index)} className="rounded-md border border-border px-2 py-1.5">
-                <p className="font-medium text-foreground">{context.agent} · {context.mcpId}</p>
-                <p className="mt-1 text-muted-foreground">{context.promptOverlay}</p>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {proposed && proposed.mcpAwareSubtasks.length > 0 && (
-        <div className="mt-3 border-t border-border pt-3 text-xs">
-          <p className="font-medium text-foreground">Full MCP-aware subtask instructions</p>
-          <ul className="mt-2 grid gap-2">
-            {proposed.mcpAwareSubtasks.map((subtask) => (
-              <li key={subtask.id} className="rounded-md border border-border px-2 py-2">
-                <p className="font-medium text-foreground">{subtask.id} · {subtask.agent}</p>
-                <p className="mt-1 font-mono text-[11px] text-muted-foreground">{subtask.mcpCapabilities.join(', ')}</p>
-                <dl className="mt-2 grid gap-1 text-muted-foreground">
-                  <div><dt className="font-medium text-foreground">Depends on</dt><dd>{subtask.dependsOn.join(', ') || 'None'}</dd></div>
-                  <div><dt className="font-medium text-foreground">Inputs</dt><dd>{subtask.inputs.join(', ') || 'None'}</dd></div>
-                  <div><dt className="font-medium text-foreground">Outputs</dt><dd>{subtask.outputs.join(', ') || 'None'}</dd></div>
-                  <div><dt className="font-medium text-foreground">Verification</dt><dd>{subtask.verification.join(', ') || 'None'}</dd></div>
-                  <div><dt className="font-medium text-foreground">Stopping condition</dt><dd>{subtask.stoppingCondition || 'Not specified'}</dd></div>
-                  <div><dt className="font-medium text-foreground">Fallback</dt><dd>{subtask.fallback || 'Not specified'}</dd></div>
-                </dl>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {reviewEnabled && (
-        <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-border pt-3">
-          <Button type="button" size="sm" disabled={reviewSaving} onClick={() => void saveReview()}>
-            {reviewSaving ? 'Saving review…' : existingReview ? 'Save new review revision' : 'Save MCP access review'}
-          </Button>
-          <p className="text-xs text-muted-foreground">Saving records a new immutable revision. Task approval admits this reviewed version.</p>
-          {reviewError && <p role="alert" className="w-full text-xs text-destructive">{reviewError}</p>}
-        </div>
       )}
 
       {(overlayCount > 0 || subtaskCount > 0) && (
@@ -4550,6 +4114,49 @@ export default function TaskDetailPage() {
     }
   }
 
+  async function handleDeleteTask() {
+    if (!window.confirm('Delete this task and its run history? This cannot be undone.')) return
+    setActionLoading(true)
+    setActionError(null)
+    try {
+      const res = await fetch(`/api/tasks/${taskId}?mode=delete`, { method: 'DELETE' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to delete task')
+      }
+      router.push('/dashboard/tasks')
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'An unexpected error occurred')
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
+  function handleMcpPresentationAction(action: PresentationCta) {
+    if (action.kind === 'link') {
+      router.push(action.href)
+      return
+    }
+    const targetId = action.kind === 'scroll'
+      ? action.targetId
+      : action.kind === 'request_changes'
+        ? 'task-plan-actions'
+        : action.kind === 'reapprove_packet_context'
+          ? action.targetId
+          : null
+    if (action.kind === 'request_changes') {
+      setActionMode('replan')
+      setActionError(null)
+    }
+    if (targetId) {
+      window.requestAnimationFrame(() => {
+        const target = document.getElementById(targetId)
+        target?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        target?.focus({ preventScroll: true })
+      })
+    }
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center px-4 py-16" role="status" aria-live="polite">
@@ -4594,17 +4201,10 @@ export default function TaskDetailPage() {
   const canRetryTask = ['failed', 'cancelled', 'rejected'].includes(effectiveTaskStatus)
   const canShowRetryTask = canRetryTask || retryCardCollapsing
   const canStopTask = canStopTaskStatus(effectiveTaskStatus)
+  const canDeleteTask = canDeleteTaskStatus(effectiveTaskStatus)
   const plannedAgents = plannedAgentsFromArtifacts(mergedArtifacts)
   const capabilityClassification = latestCapabilityClassificationFromArtifacts(mergedArtifacts)
-  const planApprovalGate = approvalGates.find((gate) => (
-    stringField(gate, ['gateType', 'type']) === 'plan_approval' &&
-    stringField(gate, ['status', 'state']) === 'pending'
-  )) ?? approvalGates.find((gate) => stringField(gate, ['gateType', 'type']) === 'plan_approval') ?? null
-  const planSourceArtifactId = planApprovalGate ? stringField(planApprovalGate, ['sourceArtifactId']) : ''
-  const planSourceArtifact = planSourceArtifactId === ''
-    ? null
-    : mergedArtifacts.find((artifact) => artifact.id === planSourceArtifactId) ?? null
-  const mcpExecutionDesign = latestMcpExecutionDesignFromArtifacts(planSourceArtifact ? [planSourceArtifact] : mergedArtifacts)
+  const mcpExecutionDesign = latestMcpExecutionDesignFromArtifacts(mergedArtifacts)
 
   const taskLevelArtifacts = taskLevelArtifactsForWorkPackages(mergedArtifacts, workPackages)
   const adrArtifacts = taskLevelArtifacts.filter((artifact) => artifact.artifactType === 'adr_text')
@@ -4665,10 +4265,17 @@ export default function TaskDetailPage() {
                 Stop
               </Button>
             )}
-            {TERMINAL_TASK_STATUSES.has(effectiveTaskStatus) && (
-              <p className="text-xs text-muted-foreground">
-                Task history is retained for audit.
-              </p>
+            {canDeleteTask && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void handleDeleteTask()}
+                disabled={actionLoading}
+                aria-busy={actionLoading}
+              >
+                <Trash2Icon aria-hidden="true" />
+                Delete
+              </Button>
             )}
           </div>
         </div>
@@ -4817,7 +4424,11 @@ export default function TaskDetailPage() {
 
           {/* Approve / Change plan / Restart actions */}
           {isAwaitingApproval && (
-            <div className="mb-6 rounded-lg border border-border bg-card p-4">
+            <div
+              id="task-plan-actions"
+              tabIndex={-1}
+              className="mb-6 scroll-mt-24 rounded-lg border border-border bg-card p-4 outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+            >
               <p className="mb-3 text-sm font-medium text-foreground">
                 Review the plan. You can approve it, request changes, or restart the task.
               </p>
@@ -5039,11 +4650,9 @@ export default function TaskDetailPage() {
           <div className="mb-6 grid gap-6">
             <CapabilityClassificationPanel classification={capabilityClassification} />
             <McpAccessPlanPanel
-              approvalGate={planApprovalGate}
               design={mcpExecutionDesign}
-              onSaved={loadTask}
-              status={effectiveTaskStatus}
-              workPackages={workPackages}
+              onAction={handleMcpPresentationAction}
+              projectId={task.projectId}
             />
           </div>
 
@@ -5097,6 +4706,8 @@ export default function TaskDetailPage() {
             commandAudits={commandAudits}
             filesystemAudits={filesystemAudits}
             fallbackAgents={plannedAgents}
+            onMcpAction={handleMcpPresentationAction}
+            projectId={task.projectId}
             taskId={taskId}
             taskStatus={currentStatus}
             onGateDecided={loadTask}
@@ -5123,4 +4734,20 @@ export default function TaskDetailPage() {
       </div>
     </div>
   )
+}
+
+
+export function filesystemGrantExpectedPointerFromState(state: {
+  currentDecision?: Record<string, unknown> | null
+  pointerFingerprint?: string | null
+  pointerVersion?: string | null
+  workPackageId?: string
+}): { currentDecisionId: string | null; currentDecisionRevision: string | null; pointerFingerprint: string; pointerVersion: string } | null {
+  if (!state?.currentDecision && !state?.pointerFingerprint) return null
+  return {
+    currentDecisionId: typeof state?.currentDecision?.id === 'string' ? state.currentDecision.id : null,
+    currentDecisionRevision: typeof state?.currentDecision?.grantDecisionRevision === 'string' ? state.currentDecision.grantDecisionRevision : null,
+    pointerFingerprint: (state?.pointerFingerprint as string) ?? '',
+    pointerVersion: (state?.pointerVersion as string) ?? '0',
+  }
 }
