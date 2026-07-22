@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   computeReadyWorkPackageIds,
   isWorkPackageExecutionEnabled,
+  isWorkPackageExecutionRequested,
   isWorkPackageHandoffEnabled,
 } from '@/worker/work-package-handoff'
 
@@ -66,16 +67,23 @@ describe('isWorkPackageHandoffEnabled', () => {
 })
 
 describe('isWorkPackageExecutionEnabled', () => {
-  it('requires an explicit recognized opt-in and fails closed otherwise', () => {
-    expect(isWorkPackageExecutionEnabled({})).toBe(false)
-    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: '1' })).toBe(true)
-    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'true' })).toBe(true)
-    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: '0' })).toBe(false)
-    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'false' })).toBe(false)
-    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'off' })).toBe(false)
-    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'no' })).toBe(false)
-    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'disabled' })).toBe(false)
-    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: '' })).toBe(false)
-    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'unexpected' })).toBe(false)
+  it.each([undefined, '', 'unexpected', '0', '1'])(
+    'remains unavailable when the main execution flag is %j',
+    (setting) => {
+      expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: setting })).toBe(false)
+    },
+  )
+
+  it.each([undefined, '', 'unexpected', '0', '1'])(
+    'remains unavailable when the ACP execution flag is %j',
+    (setting) => {
+      expect(isWorkPackageExecutionEnabled({ FORGE_ACP_WORK_PACKAGE_EXECUTION: setting })).toBe(false)
+    },
+  )
+
+  it('reports an affirmative main-flag request separately from availability', () => {
+    expect(isWorkPackageExecutionRequested({ FORGE_WORK_PACKAGE_EXECUTION: '1' })).toBe(true)
+    expect(isWorkPackageExecutionRequested({ FORGE_WORK_PACKAGE_EXECUTION: 'unexpected' })).toBe(false)
+    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: '1' })).toBe(false)
   })
 })

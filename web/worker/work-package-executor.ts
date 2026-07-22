@@ -30,7 +30,7 @@ import {
   formatExecutionContextPacket,
   type ExecutionContextPacket,
 } from './execution-context-packet'
-import { defaultOnFeatureFlagState } from './feature-flags'
+import { explicitOptInFeatureFlagEnabled } from './feature-flags'
 
 const MAX_FILES = 50
 const MAX_FILE_BYTES = 512 * 1024
@@ -454,8 +454,7 @@ export function hasLocalConflictCopyPathSegment(filePath: string): boolean {
 }
 
 function isAcpWorkPackageExecutionEnabled(env: Record<string, string | undefined> = process.env): boolean {
-  const state = defaultOnFeatureFlagState(env.FORGE_ACP_WORK_PACKAGE_EXECUTION)
-  return state.recognized && state.enabled
+  return explicitOptInFeatureFlagEnabled(env.FORGE_ACP_WORK_PACKAGE_EXECUTION)
 }
 
 function cleanPromptText(value: unknown, maxLength: number): string {

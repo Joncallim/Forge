@@ -226,9 +226,11 @@ async function startWorkerOnce(
   }
 
   const run = async (): Promise<void> => {
+    const executionRequestFlag = defaultOnFeatureFlagState(process.env.FORGE_WORK_PACKAGE_EXECUTION)
     const executionMode = {
-      ...defaultOnFeatureFlagState(process.env.FORGE_WORK_PACKAGE_EXECUTION),
-      enabled: explicitOptInFeatureFlagEnabled(process.env.FORGE_WORK_PACKAGE_EXECUTION),
+      enabled: false,
+      recognized: executionRequestFlag.recognized,
+      requested: explicitOptInFeatureFlagEnabled(process.env.FORGE_WORK_PACKAGE_EXECUTION),
     }
     const hostWriteMode = hostRepositoryWritePolicyState()
     console.info('[worker] Started', {
@@ -243,6 +245,7 @@ async function startWorkerOnce(
       stuckJobRecoveryMs,
       workPackageExecutionEnabled: executionMode.enabled,
       workPackageExecutionFlagRecognized: executionMode.recognized,
+      workPackageExecutionRequested: executionMode.requested,
       workerId,
     })
 

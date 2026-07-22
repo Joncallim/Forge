@@ -163,6 +163,7 @@ function fixtureSecret(...parts: string[]) {
 
 import {
   handoffApprovedWorkPackages,
+  isWorkPackageExecutionEnabled,
   loadPriorReviewContext,
   progressWorkforce,
   reconcilePendingS4CompletionHandoffs,
@@ -592,6 +593,9 @@ describe('handoffApprovedWorkPackages', () => {
   })
 
   it('marks root packages ready, claims the first package, and records a no-op handoff run', async () => {
+    const previousAcpExecutionFlag = process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION
+    process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION = 'true'
     mocks.dbSelect
       .mockReturnValueOnce(chain([
         {
@@ -618,7 +622,13 @@ describe('handoffApprovedWorkPackages', () => {
     mocks.dbUpdate.mockReturnValueOnce(readyUpdate)
     const { claimUpdate, leaseUpdate, runInsert } = mockNoOpHandoffTransaction()
 
-    const result = await handoffApprovedWorkPackages('task-1')
+    let result: Awaited<ReturnType<typeof handoffApprovedWorkPackages>>
+    try {
+      result = await handoffApprovedWorkPackages('task-1')
+    } finally {
+      if (previousAcpExecutionFlag === undefined) delete process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION
+      else process.env.FORGE_ACP_WORK_PACKAGE_EXECUTION = previousAcpExecutionFlag
+    }
 
     expect(result).toEqual({
       status: 'handed_off',
@@ -673,6 +683,13 @@ describe('handoffApprovedWorkPackages', () => {
       taskId: 'task-1',
       workPackageId: 'pkg-1',
     }))
+    const handoffArtifactInput = mocks.materializeReviewGatesForWorkPackageCompletion.mock.calls[0]?.[0]
+    expect(handoffArtifactInput?.completeSourceRun.content).toContain(
+      'Specialist model execution and file materialization are unavailable',
+    )
+    expect(handoffArtifactInput?.completeSourceRun.content).toContain(
+      'cannot override this availability boundary',
+    )
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'work_package:handoff', expect.objectContaining({
       repositoryWrites: false,
       runId: 'run-1',
@@ -680,6 +697,10 @@ describe('handoffApprovedWorkPackages', () => {
       status: 'awaiting_review',
       workPackageId: 'pkg-1',
     }))
+    expect(mocks.loadWorkPackageExecutionPreflight).not.toHaveBeenCalled()
+    expect(mocks.loadWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.activateWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
   })
 
   it('uses the atomic root-free protocol-v2 claim for a protected no-op handoff', async () => {
@@ -1808,6 +1829,10 @@ describe('handoffApprovedWorkPackages', () => {
   it('uses prior implementation runs for attempt number and passes rework context into sandbox execution', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    // Retain the executable-path assertions below for a future confined writer.
+    // Until then an affirmative request must not make that path reachable.
+    expect(isWorkPackageExecutionEnabled()).toBe(false)
+    if (!isWorkPackageExecutionEnabled()) return
     const workPackage = {
       id: 'pkg-1',
       assignedRole: 'backend',
@@ -2033,6 +2058,8 @@ describe('handoffApprovedWorkPackages', () => {
   it('does not write stale package artifacts after execution if the lease was cancelled', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    expect(isWorkPackageExecutionEnabled()).toBe(false)
+    if (!isWorkPackageExecutionEnabled()) return
     const workPackage = {
       id: 'pkg-1',
       assignedRole: 'backend',
@@ -2159,6 +2186,8 @@ describe('handoffApprovedWorkPackages', () => {
   it('fails the package and task instead of starting a fourth implementation attempt', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    expect(isWorkPackageExecutionEnabled()).toBe(false)
+    if (!isWorkPackageExecutionEnabled()) return
     mocks.dbSelect
       .mockReturnValueOnce(chain([{
         id: 'pkg-1',
@@ -2232,6 +2261,8 @@ describe('handoffApprovedWorkPackages', () => {
 
   it('acquires atomic local lifecycle ownership before project-path activation', async () => {
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    expect(isWorkPackageExecutionEnabled()).toBe(false)
+    if (!isWorkPackageExecutionEnabled()) return
     const order: string[] = []
     const runId = '00000000-0000-4000-8000-000000000111'
     mocks.readS4RuntimeModeV1.mockResolvedValue('protected')
@@ -2311,6 +2342,8 @@ describe('handoffApprovedWorkPackages', () => {
   it('keeps package execution failures retryable before the final approval attempt', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    expect(isWorkPackageExecutionEnabled()).toBe(false)
+    if (!isWorkPackageExecutionEnabled()) return
     mocks.dbSelect
       .mockReturnValueOnce(chain([{
         id: 'pkg-1',
@@ -2462,6 +2495,8 @@ describe('handoffApprovedWorkPackages', () => {
   it('allows unset host-write configuration to advance non-Git paths in sandbox-only mode', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    expect(isWorkPackageExecutionEnabled()).toBe(false)
+    if (!isWorkPackageExecutionEnabled()) return
     const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'forge-non-git-project-'))
     tempRoots.push(projectRoot)
 
@@ -2609,6 +2644,8 @@ describe('handoffApprovedWorkPackages', () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     const previousHostRepositoryWrites = process.env.FORGE_HOST_REPOSITORY_WRITES
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    expect(isWorkPackageExecutionEnabled()).toBe(false)
+    if (!isWorkPackageExecutionEnabled()) return
     process.env.FORGE_HOST_REPOSITORY_WRITES = '1'
     const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'forge-sandbox-non-git-project-'))
     tempRoots.push(projectRoot)
@@ -2828,6 +2865,8 @@ describe('handoffApprovedWorkPackages', () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     const previousHostRepositoryWrites = process.env.FORGE_HOST_REPOSITORY_WRITES
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
+    expect(isWorkPackageExecutionEnabled()).toBe(false)
+    if (!isWorkPackageExecutionEnabled()) return
     process.env.FORGE_HOST_REPOSITORY_WRITES = '0'
     const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'forge-sandbox-dirty-git-project-'))
     tempRoots.push(projectRoot)

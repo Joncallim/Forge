@@ -662,6 +662,21 @@ export function isWorkPackageHandoffEnabled(
 export function isWorkPackageExecutionEnabled(
   env: Record<string, string | undefined> = process.env,
 ): boolean {
+  // Keep the environment parameter for callers that inspect availability in a
+  // supplied runtime environment. The request flags are intentionally unable
+  // to open this boundary until an OS-enforced confined writer exists.
+  void env
+  return false
+}
+
+/**
+ * Reports the operator's explicit request separately from actual availability.
+ * This is useful for diagnostics without implying that specialist execution can
+ * currently be reached.
+ */
+export function isWorkPackageExecutionRequested(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
   return explicitOptInFeatureFlagEnabled(env.FORGE_WORK_PACKAGE_EXECUTION)
 }
 
@@ -2120,8 +2135,8 @@ export async function handoffApprovedWorkPackages(
   const handoffArtifactContent = [
     `Forge handed off work package "${nextPackage.title}" to ${nextPackage.assignedRole}.`,
     '',
-    'Specialist model execution is disabled for this handoff slice.',
-    'Set FORGE_WORK_PACKAGE_EXECUTION=1 or true to request specialist package execution after approval.',
+    'Specialist model execution and file materialization are unavailable until Forge has an OS-enforced confined writer.',
+    'FORGE_WORK_PACKAGE_EXECUTION and FORGE_ACP_WORK_PACKAGE_EXECUTION can record an operator request but cannot override this availability boundary.',
   ].join('\n')
   const handoffArtifactMetadata = {
     hostRepositoryWrites: false,
