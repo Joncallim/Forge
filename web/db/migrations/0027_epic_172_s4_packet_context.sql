@@ -6644,6 +6644,98 @@ ALTER TABLE public.architect_plan_execution_references
   ),
   ADD CONSTRAINT architect_plan_execution_references_answer_fk FOREIGN KEY (clarification_answer_id)
     REFERENCES public.architect_clarification_answers(id) ON UPDATE RESTRICT ON DELETE RESTRICT;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.bind_architect_replan_context_v3(
+  p_agent_run_id uuid, p_prior_plan_artifact_id uuid
+)
+RETURNS TABLE (reference_id uuid, entry_id text, entry_kind text)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public
+AS $$
+DECLARE v_task_id uuid; v_plan_version bigint;
+BEGIN
+  -- Retain the established plan-entry arm, including its run/task/source locks.
+  RETURN QUERY SELECT * FROM forge.bind_architect_replan_context_v2(p_agent_run_id, p_prior_plan_artifact_id);
+  SELECT run.task_id INTO STRICT v_task_id FROM public.agent_runs run
+  WHERE run.id = p_agent_run_id AND run.agent_type = 'architect'
+    AND run.work_package_id IS NULL AND run.status = 'running' FOR KEY SHARE;
+  SELECT version.plan_version INTO STRICT v_plan_version
+  FROM public.architect_plan_versions version
+  WHERE version.task_id = v_task_id AND version.plan_artifact_id = p_prior_plan_artifact_id;
+  RETURN QUERY
+  WITH answers AS (
+    SELECT answer.* FROM public.architect_clarification_answers answer
+    JOIN public.architect_plan_entries question ON question.task_id = answer.task_id
+      AND question.plan_artifact_id = answer.source_plan_artifact_id
+      AND question.plan_version = answer.source_plan_version
+      AND question.entry_id = 'clarification_question:' || answer.question_id::text
+      AND question.entry_kind = 'clarification_question'
+    WHERE answer.task_id = v_task_id
+      AND answer.source_plan_artifact_id = p_prior_plan_artifact_id
+      AND answer.source_plan_version = v_plan_version
+    FOR KEY SHARE OF answer, question
+  ), inserted AS (
+    INSERT INTO public.architect_plan_execution_references (
+      id, purpose, task_id, work_package_id, agent_run_id, plan_artifact_id,
+      plan_version, entry_id, agent, requirement_key, binding_fingerprint,
+      content_digest, digest_key_id, source_kind, clarification_answer_id
+    ) SELECT pg_catalog.gen_random_uuid(), 'architect_replan', v_task_id, NULL,
+      p_agent_run_id, answer.source_plan_artifact_id, answer.source_plan_version,
+      'clarification_question:' || answer.question_id::text, 'architect', NULL, NULL,
+      answer.content_digest, answer.digest_key_id, 'clarification_answer', answer.id
+    FROM answers answer
+    RETURNING id, clarification_answer_id
+  )
+  SELECT inserted.id, 'clarification_answer:' || inserted.clarification_answer_id::text,
+    'clarification_answer'::text FROM inserted;
+END;
+$$;
+CREATE OR REPLACE FUNCTION forge.resolve_architect_plan_entry_v2(p_reference_id uuid)
+RETURNS TABLE (purpose text, task_id uuid, plan_artifact_id uuid, plan_version bigint,
+  entry_id text, entry_kind text, agent text, requirement_key text,
+  binding_fingerprint text, content text, content_digest text, digest_key_id text,
+  projection_eligible boolean, clarification_question_id uuid)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public
+AS $$
+BEGIN
+  IF session_user <> 'forge_architect_plan_resolver' OR NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'Protected Architect plan resolution is unavailable' USING ERRCODE = '42501';
+  END IF;
+  RETURN QUERY WITH locked AS (
+    SELECT reference.* FROM public.architect_plan_execution_references reference
+    WHERE reference.id = p_reference_id AND reference.resolved_at IS NULL FOR UPDATE
+  ), eligible AS (
+    SELECT r.id, r.purpose, r.task_id, r.plan_artifact_id, r.plan_version,
+      entry.entry_id, entry.entry_kind, entry.agent, entry.requirement_key,
+      entry.binding_fingerprint, entry.content, entry.content_digest, entry.digest_key_id,
+      entry.projection_eligible, NULL::uuid
+    FROM locked r JOIN public.agent_runs run ON run.id = r.agent_run_id
+      AND run.task_id = r.task_id AND run.status = 'running'
+    JOIN public.architect_plan_entries entry ON r.source_kind = 'architect_plan_entry'
+      AND entry.task_id = r.task_id AND entry.plan_artifact_id = r.plan_artifact_id
+      AND entry.plan_version = r.plan_version AND entry.entry_id = r.entry_id
+      AND entry.content_digest = r.content_digest AND entry.digest_key_id = r.digest_key_id
+    WHERE (r.purpose = 'architect_replan' AND run.agent_type = 'architect' AND run.work_package_id IS NULL)
+       OR (r.purpose = 'package_specialist' AND entry.projection_eligible)
+    UNION ALL
+    SELECT r.id, r.purpose, r.task_id, r.plan_artifact_id, r.plan_version,
+      'clarification_answer:' || answer.id::text, 'clarification_answer', NULL, NULL, NULL,
+      answer.answer, answer.content_digest, answer.digest_key_id, false, answer.question_id
+    FROM locked r JOIN public.agent_runs run ON run.id = r.agent_run_id
+      AND run.task_id = r.task_id AND run.status = 'running'
+    JOIN public.architect_clarification_answers answer ON r.source_kind = 'clarification_answer'
+      AND r.clarification_answer_id = answer.id AND answer.task_id = r.task_id
+      AND answer.source_plan_artifact_id = r.plan_artifact_id AND answer.source_plan_version = r.plan_version
+      AND answer.content_digest = r.content_digest AND answer.digest_key_id = r.digest_key_id
+    WHERE r.purpose = 'architect_replan' AND r.work_package_id IS NULL
+      AND r.agent = 'architect' AND run.agent_type = 'architect' AND run.work_package_id IS NULL
+  ), consumed AS (
+    UPDATE public.architect_plan_execution_references r SET resolved_at = pg_catalog.clock_timestamp()
+    FROM eligible WHERE r.id = eligible.id RETURNING eligible.*
+  ) SELECT purpose, task_id, plan_artifact_id, plan_version, entry_id, entry_kind,
+    agent, requirement_key, binding_fingerprint, content, content_digest, digest_key_id,
+    projection_eligible, clarification_question_id FROM consumed;
+END;
+$$;
 -- The NOLOGIN owner receives only the existing-table privileges required by
 -- the fixed-path functions above. Interactive and application logins receive
 -- no equivalent table access.
@@ -6775,6 +6867,8 @@ GRANT EXECUTE ON FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid
 GRANT EXECUTE ON FUNCTION forge.bind_architect_plan_entry_v2(uuid,uuid) TO forge_packet_issuer;
 GRANT EXECUTE ON FUNCTION forge.bind_architect_replan_entry_v1(uuid,uuid) TO forge_architect_plan_writer;
 GRANT EXECUTE ON FUNCTION forge.bind_architect_replan_context_v2(uuid,uuid) TO forge_architect_plan_writer;
+GRANT EXECUTE ON FUNCTION forge.bind_architect_replan_context_v3(uuid,uuid) TO forge_architect_plan_writer;
+GRANT EXECUTE ON FUNCTION forge.resolve_architect_plan_entry_v2(uuid) TO forge_architect_plan_resolver;
 GRANT EXECUTE ON FUNCTION forge.inspect_local_projection_overlimit_v2(uuid) TO forge_local_projection_archiver;
 GRANT EXECUTE ON FUNCTION forge.apply_local_projection_overlimit_archive_v2(uuid,uuid,uuid,text,text) TO forge_local_projection_archiver;
 GRANT EXECUTE ON FUNCTION forge.resume_local_projection_overlimit_archive_v2(uuid,uuid,text) TO forge_local_projection_archiver;
@@ -6859,6 +6953,8 @@ ALTER FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,tex
 ALTER FUNCTION forge.bind_architect_plan_entry_v2(uuid,uuid) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.bind_architect_replan_entry_v1(uuid,uuid) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.bind_architect_replan_context_v2(uuid,uuid) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.bind_architect_replan_context_v3(uuid,uuid) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.resolve_architect_plan_entry_v2(uuid) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.local_projection_archive_operation_fingerprint_v2(uuid,text,text) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.inspect_local_projection_overlimit_v2(uuid) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.apply_local_projection_overlimit_archive_v2(uuid,uuid,uuid,text,text) OWNER TO forge_s4_routines_owner;

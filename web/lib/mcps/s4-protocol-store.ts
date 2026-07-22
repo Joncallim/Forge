@@ -4,6 +4,7 @@ import {
   architectPlanEntryReference,
   materializeArchitectPlanEntries,
   parseArchitectPlanEntryReference,
+  verifyArchitectClarificationAnswer,
   verifyArchitectPlanEntry,
   type ArchitectPlanEntryEnvelope,
   type ArchitectPlanEntryInput,
@@ -171,6 +172,7 @@ export async function resolveArchitectPlanEntry(input: {
       planArtifactId: string
       planVersion: string
       projectionEligible: boolean
+      clarificationQuestionId: string | null
       purpose: 'package_specialist' | 'architect_replan'
       requirementKey: string | null
       taskId: string
@@ -189,13 +191,40 @@ export async function resolveArchitectPlanEntry(input: {
         content_digest as "contentDigest",
         digest_key_id as "digestKeyId",
         projection_eligible as "projectionEligible"
-      from forge.resolve_architect_plan_entry_v1(${input.referenceId}::uuid)
+        , clarification_question_id as "clarificationQuestionId"
+      from forge.resolve_architect_plan_entry_v2(${input.referenceId}::uuid)
     `
     if (rows.length !== 1) throw new S4ProtocolStoreError('invalid_evidence', 'The Architect plan reference was stale or unavailable.')
     const row = rows[0]
     const expectedPurpose = input.expectedPurpose ?? 'package_specialist'
     if (row.purpose !== expectedPurpose) {
       throw new S4ProtocolStoreError('invalid_evidence', 'The Architect plan reference purpose did not match its consumer.')
+    }
+    if (row.entryKind === 'clarification_answer') {
+      const answerId = row.entryId.slice('clarification_answer:'.length)
+      if (!row.clarificationQuestionId || !verifyArchitectClarificationAnswer({
+        schemaVersion: 1,
+        taskId: row.taskId,
+        answerId,
+        questionId: row.clarificationQuestionId,
+        sourcePlanArtifactId: row.planArtifactId,
+        sourcePlanVersion: row.planVersion,
+        answer: row.content,
+        contentDigest: row.contentDigest,
+        digestKeyId: row.digestKeyId,
+        digestKey: input.digestKey,
+      })) {
+        throw new S4ProtocolStoreError('invalid_evidence', 'The resolved clarification answer failed its protected digest.')
+      }
+      return {
+        agent: null,
+        bindingFingerprint: null,
+        content: row.content,
+        entryId: row.entryId,
+        entryKind: row.entryKind,
+        projectionEligible: false,
+        requirementKey: null,
+      }
     }
     const returnedReference = parseArchitectPlanEntryReference({
       schemaVersion: 1,
@@ -283,7 +312,7 @@ export async function bindArchitectReplanContext(input: {
   return withDedicatedClient('FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL', async (sql) => {
     const rows = await sql<{ referenceId: string; entryId: string; entryKind: string }[]>`
       select reference_id as "referenceId", entry_id as "entryId", entry_kind as "entryKind"
-      from forge.bind_architect_replan_context_v2(
+      from forge.bind_architect_replan_context_v3(
         ${input.agentRunId}::uuid,
         ${input.priorPlanArtifactId}::uuid
       )
