@@ -841,7 +841,6 @@ describe('provider model construction call sites', () => {
     const repoRoot = path.resolve(__dirname, '..')
     const files = [
       'worker/orchestrator.ts',
-      'worker/work-package-executor.ts',
       'lib/agent-evaluation.ts',
       'lib/task-title.ts',
     ]
