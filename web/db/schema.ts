@@ -2107,9 +2107,6 @@ export const taskQuestions = pgTable(
     taskId: uuid('task_id')
       .notNull()
       .references(() => tasks.id, { onDelete: 'restrict' }),
-    question: text('question'),
-    suggestions: jsonb('suggestions').$type<string[]>(),
-    answer: text('answer'),
     // Dormant B2A opaque bindings. Existing routes do not use these yet.
     questionEntryId: text('question_entry_id'),
     sourcePlanArtifactId: uuid('source_plan_artifact_id'),

@@ -6638,6 +6638,21 @@ ALTER TABLE public.task_questions
   ALTER COLUMN question DROP NOT NULL,
   ALTER COLUMN suggestions DROP NOT NULL,
   ALTER COLUMN suggestions DROP DEFAULT;
+UPDATE public.task_questions SET question = NULL, suggestions = NULL, answer = NULL
+WHERE question IS NOT NULL OR suggestions IS NOT NULL OR answer IS NOT NULL;
+UPDATE public.task_questions SET status = 'legacy_unavailable', answered_at = NULL,
+  answered_by = NULL, answer_reference_id = NULL
+WHERE question_entry_id IS NULL OR source_plan_artifact_id IS NULL OR source_plan_version IS NULL;
+ALTER TABLE public.task_questions
+  ADD CONSTRAINT task_questions_no_public_plaintext_chk CHECK (
+    question IS NULL AND suggestions IS NULL AND answer IS NULL
+  ),
+  ADD CONSTRAINT task_questions_opaque_status_chk CHECK (
+    (question_entry_id IS NOT NULL AND source_plan_artifact_id IS NOT NULL AND source_plan_version IS NOT NULL
+      AND ((status = 'open' AND answer_reference_id IS NULL) OR (status = 'answered' AND answer_reference_id IS NOT NULL)))
+    OR (question_entry_id IS NULL AND source_plan_artifact_id IS NULL AND source_plan_version IS NULL
+      AND answer_reference_id IS NULL AND status = 'legacy_unavailable')
+  );
 CREATE TABLE public.architect_clarification_answer_writes (
   id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
   answer_id uuid NOT NULL REFERENCES public.architect_clarification_answers(id) ON UPDATE RESTRICT ON DELETE RESTRICT,

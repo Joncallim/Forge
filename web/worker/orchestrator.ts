@@ -777,41 +777,17 @@ async function restoreAnsweredQuestionsSnapshot(
   taskId: string,
   answeredQuestions: AnsweredQuestion[],
 ): Promise<void> {
-  if (answeredQuestions.length === 0) return
-
-  await db.delete(taskQuestions).where(eq(taskQuestions.taskId, taskId))
-  const rows = await db
-    .insert(taskQuestions)
-    .values(
-      answeredQuestions.map((question) => ({
-        taskId,
-        question: question.question,
-        suggestions: [],
-        answer: question.answer,
-        status: 'answered' as const,
-        answeredAt: new Date(),
-      })),
-    )
-    .returning()
-
-  await publishTaskEvent(taskId, 'questions:created', {
-    questions: rows.map((row) => ({
-      id: row.id,
-      question: row.question,
-      suggestions: row.suggestions,
-      status: row.status,
-      answer: row.answer,
-    })),
-  })
+  // Answers are durable protected subledger evidence; retries never recreate
+  // public plaintext projections.
+  void taskId
+  void answeredQuestions
 }
 
 function answeredQuestionSnapshot(
   questions: Array<typeof taskQuestions.$inferSelect>,
 ): AnsweredQuestion[] {
-  return questions.map((q) => ({
-    question: q.question ?? '',
-    answer: q.answer ?? '',
-  }))
+  void questions
+  return []
 }
 
 async function runArchitect(
