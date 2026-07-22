@@ -706,40 +706,29 @@ BEGIN
 END;
 $local_recovery_rejection_zero_mutation$;
 
+SELECT 'sha256:' || pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+  'forge:local-run-evidence:v1:' || evidence.id::text || ':' || evidence.terminal::text,
+  'UTF8'
+)), 'hex') AS fingerprint
+FROM public.work_package_local_run_evidence evidence
+WHERE evidence.id = '27000000-0000-4000-8000-00000000e301'
+\gset local_recovery_
 SET SESSION AUTHORIZATION forge_s4_recovery_operator;
-WITH canonical_evidence AS (
-  SELECT 'sha256:' || pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
-    'forge:local-run-evidence:v1:' || evidence.id::text || ':' || evidence.terminal::text,
-    'UTF8'
-  )), 'hex') AS fingerprint
-  FROM public.work_package_local_run_evidence evidence
-  WHERE evidence.id = '27000000-0000-4000-8000-00000000e301'
-)
 SELECT result, package_status
-FROM canonical_evidence,
-  forge.apply_local_effect_recovery_action_v2(
+FROM forge.apply_local_effect_recovery_action_v2(
     '27000000-0000-4000-8000-00000000e001',
     '27000000-0000-4000-8000-00000000e101',
     '27000000-0000-4000-8000-00000000e301', 'retry_local_execution',
-    canonical_evidence.fingerprint,
+    :'local_recovery_fingerprint',
     '27000000-0000-4000-8000-000000000001'
   );
 -- Exact ledger-first replay succeeds after the local marker was cleared.
-WITH canonical_evidence AS (
-  SELECT 'sha256:' || pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
-    'forge:local-run-evidence:v1:' || evidence.id::text || ':' || evidence.terminal::text,
-    'UTF8'
-  )), 'hex') AS fingerprint
-  FROM public.work_package_local_run_evidence evidence
-  WHERE evidence.id = '27000000-0000-4000-8000-00000000e301'
-)
 SELECT result, package_status
-FROM canonical_evidence,
-  forge.apply_local_effect_recovery_action_v2(
+FROM forge.apply_local_effect_recovery_action_v2(
     '27000000-0000-4000-8000-00000000e001',
     '27000000-0000-4000-8000-00000000e101',
     '27000000-0000-4000-8000-00000000e301', 'retry_local_execution',
-    canonical_evidence.fingerprint,
+    :'local_recovery_fingerprint',
     '27000000-0000-4000-8000-000000000001'
   );
 RESET SESSION AUTHORIZATION;
