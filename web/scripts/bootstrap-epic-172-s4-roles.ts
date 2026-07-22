@@ -14,7 +14,6 @@ const OWNED_TABLES = [
   'architect_plan_entries',
   'architect_plan_execution_references',
   'architect_plan_history_reads',
-  'epic_172_s4_protocol_state',
   'work_package_local_run_evidence',
   'filesystem_mcp_decision_nonce_claims',
   'project_root_ref_reconciliation',
@@ -72,6 +71,7 @@ async function main(): Promise<void> {
     `)
     await admin`revoke create on schema forge from ${admin(OWNER)}`
     await admin`revoke create on schema public from ${admin(OWNER)}`
+    await admin`grant execute on function forge.read_epic_172_enablement_state_v1() to ${admin(OWNER)}`
 
     const [{ ownedTables }] = await admin<{ ownedTables: number }[]>`
       select count(*)::integer as "ownedTables"
@@ -201,6 +201,8 @@ async function main(): Promise<void> {
                 ,'fill_project_root_ref_on_insert_v1'
                 ,'guard_project_root_ref_renull_v1'
                 ,'reconcile_project_root_refs_v1'
+                ,'s4_protected_paths_enabled_v1'
+                ,'bind_architect_replan_entry_v1'
               ])
               and routine.proowner = '${OWNER}'::regrole
               and not exists (
@@ -213,8 +215,25 @@ async function main(): Promise<void> {
                 ) acl
                 where acl.grantee = 0 and acl.privilege_type = 'EXECUTE'
               )
-          ) <> 13 then
+          ) <> 15 then
             raise exception 'The S4 routine owner or PUBLIC boundary is incomplete'
+              using errcode = '42501';
+          end if;
+          if not pg_catalog.has_function_privilege(
+               '${OWNER}', 'forge.read_epic_172_enablement_state_v1()', 'execute'
+             ) or exists (
+               select 1
+               from pg_catalog.pg_proc routine
+               join pg_catalog.pg_namespace namespace_row on namespace_row.oid = routine.pronamespace
+               cross join lateral pg_catalog.aclexplode(
+                 coalesce(routine.proacl, pg_catalog.acldefault('f', routine.proowner))
+               ) acl
+               where namespace_row.nspname = 'forge'
+                 and routine.proname = 'read_epic_172_enablement_state_v1'
+                 and acl.grantee = 0
+                 and acl.privilege_type = 'EXECUTE'
+             ) then
+            raise exception 'The Step 0 enablement reader grant to the S4 owner is not exact'
               using errcode = '42501';
           end if;
           if not pg_catalog.has_schema_privilege('${OWNER}', 'forge', 'usage')
@@ -358,6 +377,30 @@ async function main(): Promise<void> {
     `
     if (membershipCount !== 0 && transferComplete) {
       throw new Error('A finalized S4 principal has an unexpected role membership.')
+    }
+    const [enablementReaderGrant] = await admin<{
+      canExecute: boolean
+      publicCanExecute: boolean
+    }[]>`
+      select
+        pg_catalog.has_function_privilege(
+          ${OWNER}, 'forge.read_epic_172_enablement_state_v1()', 'execute'
+        ) as "canExecute",
+        exists (
+          select 1
+          from pg_catalog.pg_proc routine
+          join pg_catalog.pg_namespace namespace_row on namespace_row.oid = routine.pronamespace
+          cross join lateral pg_catalog.aclexplode(
+            coalesce(routine.proacl, pg_catalog.acldefault('f', routine.proowner))
+          ) acl
+          where namespace_row.nspname = 'forge'
+            and routine.proname = 'read_epic_172_enablement_state_v1'
+            and acl.grantee = 0
+            and acl.privilege_type = 'EXECUTE'
+        ) as "publicCanExecute"
+    `
+    if (!enablementReaderGrant?.canExecute || enablementReaderGrant.publicCanExecute) {
+      throw new Error('The S4 owner must use the non-PUBLIC Step 0 enablement reader boundary.')
     }
 
     console.log(`✓ Verified ${roles.length} dedicated S4 logins and ${OWNER}.`)

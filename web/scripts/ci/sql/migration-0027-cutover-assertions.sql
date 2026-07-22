@@ -15,9 +15,8 @@ BEGIN
      ) THEN
     RAISE EXCEPTION 'The strict 0027 root_ref cutover postconditions are incomplete';
   END IF;
-  IF (SELECT state FROM public.forge_epic_172_enablement_state WHERE singleton_id = 'epic-172') <> 'disabled'
-     OR (SELECT producers_enabled FROM public.epic_172_s4_protocol_state WHERE singleton) THEN
-    RAISE EXCEPTION 'The 0027 proof changed existing Step 0 or S4 activation authority';
+  IF (SELECT state FROM public.forge_epic_172_enablement_state WHERE singleton_id = 'epic-172') <> 'disabled' THEN
+    RAISE EXCEPTION 'The 0027 proof changed the existing Step 0 activation authority';
   END IF;
 END;
 $assertions$;

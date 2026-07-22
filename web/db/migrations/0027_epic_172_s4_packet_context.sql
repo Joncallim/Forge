@@ -291,8 +291,9 @@ CREATE TABLE public.architect_plan_entries (
 --> statement-breakpoint
 CREATE TABLE public.architect_plan_execution_references (
   id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  purpose text NOT NULL DEFAULT 'package_specialist',
   task_id uuid NOT NULL,
-  work_package_id uuid NOT NULL,
+  work_package_id uuid,
   agent_run_id uuid NOT NULL,
   plan_artifact_id uuid NOT NULL,
   plan_version bigint NOT NULL,
@@ -322,6 +323,20 @@ CREATE TABLE public.architect_plan_execution_references (
   CONSTRAINT architect_plan_execution_references_binding_chk CHECK (binding_fingerprint IS NULL OR binding_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
   CONSTRAINT architect_plan_execution_references_digest_chk CHECK (content_digest ~ '^hmac-sha256:[0-9a-f]{64}$'),
   CONSTRAINT architect_plan_execution_references_key_chk CHECK (digest_key_id ~ '^[a-z0-9._-]{1,64}$'),
+  CONSTRAINT architect_plan_execution_references_purpose_chk CHECK (
+    purpose IN ('package_specialist', 'architect_replan')
+  ),
+  CONSTRAINT architect_plan_execution_references_purpose_shape_chk CHECK (
+    (purpose = 'package_specialist' AND work_package_id IS NOT NULL)
+    OR (
+      purpose = 'architect_replan'
+      AND work_package_id IS NULL
+      AND agent = 'architect'
+      AND entry_id = 'plan_body:000000'
+      AND requirement_key IS NULL
+      AND binding_fingerprint IS NULL
+    )
+  ),
   UNIQUE (agent_run_id, entry_id)
 );
 --> statement-breakpoint
@@ -367,6 +382,37 @@ CREATE TRIGGER architect_plan_history_reads_append_only
   BEFORE UPDATE OR DELETE ON public.architect_plan_history_reads
   FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
 --> statement-breakpoint
+-- This is a predicate over the sole Step 0 enablement authority, not a second
+-- state machine. Missing/malformed rows fail closed. Provisional state must
+-- still hold its database-time lease; active state has no lease requirement.
+CREATE OR REPLACE FUNCTION forge.s4_protected_paths_enabled_v1()
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+  SELECT COALESCE((
+    SELECT
+      state.epoch = 2
+      AND state.reviewed_sha ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+      AND state.exact_builds = pg_catalog.jsonb_build_array(
+        'issue_179_s4@' || state.reviewed_sha,
+        'issue_180_s5@' || state.reviewed_sha,
+        'issue_181_s6@' || state.reviewed_sha
+      )
+      AND (
+        state.state = 'active'
+        OR (
+          state.state = 'provisional'
+          AND pg_catalog.clock_timestamp() < state.expires_at
+          AND pg_catalog.clock_timestamp() < state.lease_expires_at
+        )
+      )
+    FROM forge.read_epic_172_enablement_state_v1() state
+  ), false)
+$$;
+--> statement-breakpoint
 CREATE OR REPLACE FUNCTION forge.guard_architect_plan_public_artifact_v1()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -378,12 +424,26 @@ BEGIN
     SELECT 1 FROM public.agent_runs run
     WHERE run.id = NEW.agent_run_id AND run.agent_type = 'architect'
   ) THEN
-    IF session_user <> 'forge_architect_plan_writer'
-       OR current_user <> 'forge_s4_routines_owner'
-       OR NEW.artifact_type <> 'adr_text'
-       OR NEW.content <> 'Architect plan available in protected history' THEN
-      RAISE EXCEPTION 'Architect artifacts require the protected plan writer'
-        USING ERRCODE = '42501';
+    IF forge.s4_protected_paths_enabled_v1() THEN
+      IF session_user <> 'forge_architect_plan_writer'
+         OR current_user <> 'forge_s4_routines_owner'
+         OR NEW.artifact_type <> 'adr_text'
+         OR NEW.content <> 'Architect plan available in protected history' THEN
+        RAISE EXCEPTION 'Architect artifacts require the protected plan writer'
+          USING ERRCODE = '42501';
+      END IF;
+    ELSIF EXISTS (
+      SELECT 1 FROM forge.read_epic_172_enablement_state_v1() state
+      WHERE state.state = 'disabled'
+    ) THEN
+      IF session_user = 'forge_architect_plan_writer'
+         OR NEW.artifact_type <> 'adr_text' THEN
+        RAISE EXCEPTION 'Protected Architect history is disabled; only legacy adr_text planning is available'
+          USING ERRCODE = '55000';
+      END IF;
+    ELSE
+      RAISE EXCEPTION 'Architect plan storage is blocked by incomplete Epic 172 enablement authority'
+        USING ERRCODE = '55000';
     END IF;
   ELSIF TG_OP = 'UPDATE' AND EXISTS (
     SELECT 1 FROM public.architect_plan_versions version
@@ -433,6 +493,10 @@ BEGIN
   IF session_user <> 'forge_architect_plan_history_reader' THEN
     RAISE EXCEPTION 'Architect plan history requires the dedicated reader login'
       USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'Protected Architect history is not enabled by the Step 0 authority'
+      USING ERRCODE = '55000';
   END IF;
   IF pg_catalog.octet_length(p_session_credential) <> 36 THEN
     RAISE EXCEPTION 'Session credential is malformed' USING ERRCODE = '22023';
@@ -496,13 +560,15 @@ $$;
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION forge.resolve_architect_plan_entry_v1(p_reference_id uuid)
 RETURNS TABLE (
+  purpose text,
   entry_id text,
   entry_kind text,
   agent text,
   requirement_key text,
   binding_fingerprint text,
   content text,
-  content_digest text
+  content_digest text,
+  projection_eligible boolean
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -513,6 +579,10 @@ BEGIN
     RAISE EXCEPTION 'Architect plan resolution requires the dedicated resolver login'
       USING ERRCODE = '42501';
   END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'Protected Architect plan resolution is not enabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
 
   RETURN QUERY
   WITH locked_reference AS (
@@ -522,30 +592,46 @@ BEGIN
       AND reference.resolved_at IS NULL
     FOR UPDATE
   ), authorized AS (
-    SELECT reference.id, entry.entry_id, entry.entry_kind, entry.agent,
+    SELECT reference.id, reference.purpose, entry.entry_id, entry.entry_kind, entry.agent,
       entry.requirement_key, entry.binding_fingerprint, entry.content,
-      entry.content_digest
+      entry.content_digest, entry.projection_eligible
     FROM locked_reference reference
-    JOIN public.work_packages package
-      ON package.id = reference.work_package_id
-     AND package.task_id = reference.task_id
-     AND package.assigned_role = reference.agent
     JOIN public.agent_runs run
       ON run.id = reference.agent_run_id
      AND run.task_id = reference.task_id
-     AND run.work_package_id = reference.work_package_id
      AND run.status = 'running'
+    LEFT JOIN public.work_packages package
+      ON package.id = reference.work_package_id
+     AND package.task_id = reference.task_id
     JOIN public.architect_plan_entries entry
       ON entry.task_id = reference.task_id
      AND entry.plan_artifact_id = reference.plan_artifact_id
      AND entry.plan_version = reference.plan_version
      AND entry.entry_id = reference.entry_id
-     AND entry.agent IS NOT DISTINCT FROM reference.agent
      AND entry.requirement_key IS NOT DISTINCT FROM reference.requirement_key
      AND entry.binding_fingerprint IS NOT DISTINCT FROM reference.binding_fingerprint
      AND entry.content_digest = reference.content_digest
      AND entry.digest_key_id = reference.digest_key_id
-     AND entry.projection_eligible
+    WHERE (
+      reference.purpose = 'package_specialist'
+      AND reference.work_package_id IS NOT NULL
+      AND run.work_package_id = reference.work_package_id
+      AND package.assigned_role = reference.agent
+      AND entry.agent IS NOT DISTINCT FROM reference.agent
+      AND entry.projection_eligible
+    ) OR (
+      reference.purpose = 'architect_replan'
+      AND reference.work_package_id IS NULL
+      AND run.work_package_id IS NULL
+      AND run.agent_type = 'architect'
+      AND reference.agent = 'architect'
+      AND entry.entry_kind = 'plan_body'
+      AND entry.entry_id = 'plan_body:000000'
+      AND entry.agent IS NULL
+      AND entry.requirement_key IS NULL
+      AND entry.binding_fingerprint IS NULL
+      AND NOT entry.projection_eligible
+    )
   ), marked AS (
     UPDATE public.architect_plan_execution_references reference
     SET resolved_at = pg_catalog.clock_timestamp()
@@ -553,22 +639,12 @@ BEGIN
     WHERE reference.id = authorized.id
     RETURNING authorized.*
   )
-  SELECT marked.entry_id, marked.entry_kind, marked.agent,
+  SELECT marked.purpose, marked.entry_id, marked.entry_kind, marked.agent,
     marked.requirement_key, marked.binding_fingerprint, marked.content,
-    marked.content_digest
+    marked.content_digest, marked.projection_eligible
   FROM marked;
 END;
 $$;
---> statement-breakpoint
-CREATE TABLE public.epic_172_s4_protocol_state (
-  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
-  producers_enabled boolean NOT NULL DEFAULT false,
-  protocol_epoch integer NOT NULL DEFAULT 1 CHECK (protocol_epoch BETWEEN 1 AND 2),
-  enabled_build_sha text,
-  updated_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
-  CHECK (NOT producers_enabled OR (protocol_epoch = 2 AND enabled_build_sha ~ '^[0-9a-f]{40}$'))
-);
-INSERT INTO public.epic_172_s4_protocol_state (singleton) VALUES (true);
 --> statement-breakpoint
 CREATE TABLE public.work_package_local_run_evidence (
   id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
@@ -825,9 +901,8 @@ BEGIN
     RAISE EXCEPTION 'local evidence lease must be between 1 and 45 seconds'
       USING ERRCODE = '22023';
   END IF;
-  IF NOT (SELECT state.producers_enabled AND state.protocol_epoch = 2
-          FROM public.epic_172_s4_protocol_state state WHERE state.singleton) THEN
-    RAISE EXCEPTION 'S4 packet producers are disabled' USING ERRCODE = '55000';
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'S4 packet producers are disabled by the Step 0 authority' USING ERRCODE = '55000';
   END IF;
 
   SELECT run.task_id, run.work_package_id, task.project_id
@@ -912,9 +987,8 @@ BEGIN
   IF p_lease_seconds NOT BETWEEN 1 AND 45 THEN
     RAISE EXCEPTION 'packet lease must be between 1 and 45 seconds' USING ERRCODE = '22023';
   END IF;
-  IF NOT (SELECT state.producers_enabled AND state.protocol_epoch = 2
-          FROM public.epic_172_s4_protocol_state state WHERE state.singleton) THEN
-    RAISE EXCEPTION 'S4 packet producers are disabled' USING ERRCODE = '55000';
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'S4 packet producers are disabled by the Step 0 authority' USING ERRCODE = '55000';
   END IF;
 
   SELECT run.* INTO STRICT v_run FROM public.agent_runs run WHERE run.id = p_agent_run_id;
@@ -1101,6 +1175,10 @@ BEGIN
   IF session_user <> 'forge_architect_plan_writer' THEN
     RAISE EXCEPTION 'Architect plan writes require the dedicated writer login' USING ERRCODE = '42501';
   END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'Protected Architect plan writes are not enabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
   IF v_count NOT BETWEEN 1 AND 256
      OR ARRAY[
        pg_catalog.cardinality(p_entry_kinds), pg_catalog.cardinality(p_agents),
@@ -1179,6 +1257,10 @@ BEGIN
   IF session_user <> 'forge_packet_issuer' THEN
     RAISE EXCEPTION 'Architect plan binding requires the dedicated package issuer login' USING ERRCODE = '42501';
   END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'Protected Architect plan binding is not enabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
   SELECT package.assigned_role INTO STRICT v_agent
   FROM public.work_packages package
   JOIN public.agent_runs run
@@ -1203,12 +1285,101 @@ BEGIN
     RAISE EXCEPTION 'Architect plan reference is stale, cross-task, or ineligible' USING ERRCODE = '40001';
   END IF;
   INSERT INTO public.architect_plan_execution_references (
-    id, task_id, work_package_id, agent_run_id, plan_artifact_id, plan_version,
+    id, purpose, task_id, work_package_id, agent_run_id, plan_artifact_id, plan_version,
     entry_id, agent, requirement_key, binding_fingerprint, content_digest, digest_key_id
   ) VALUES (
-    v_reference_id, p_task_id, p_work_package_id, p_agent_run_id,
+    v_reference_id, 'package_specialist', p_task_id, p_work_package_id, p_agent_run_id,
     p_plan_artifact_id, p_plan_version, p_entry_id, v_agent, p_requirement_key,
     p_binding_fingerprint, p_content_digest, p_digest_key_id
+  );
+  RETURN v_reference_id;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.bind_architect_replan_entry_v1(
+  p_task_id uuid,
+  p_agent_run_id uuid,
+  p_plan_artifact_id uuid,
+  p_plan_version bigint,
+  p_entry_id text,
+  p_content_digest text,
+  p_digest_key_id text
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_reference_id uuid := pg_catalog.gen_random_uuid();
+BEGIN
+  IF session_user <> 'forge_architect_plan_writer' THEN
+    RAISE EXCEPTION 'Architect replan binding requires the protected plan writer login'
+      USING ERRCODE = '42501';
+  END IF;
+  IF NOT forge.s4_protected_paths_enabled_v1() THEN
+    RAISE EXCEPTION 'Architect replan binding is not enabled by the Step 0 authority'
+      USING ERRCODE = '55000';
+  END IF;
+
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id = p_task_id
+  FOR UPDATE;
+  PERFORM 1 FROM public.agent_runs run
+  WHERE run.id = p_agent_run_id
+    AND run.task_id = p_task_id
+    AND run.work_package_id IS NULL
+    AND run.agent_type = 'architect'
+    AND run.status = 'running'
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Architect replan run is stale, cross-task, or not running'
+      USING ERRCODE = '40001';
+  END IF;
+
+  PERFORM 1
+  FROM public.architect_plan_entries entry
+  JOIN public.architect_plan_versions version
+    ON version.task_id = entry.task_id
+   AND version.plan_artifact_id = entry.plan_artifact_id
+   AND version.plan_version = entry.plan_version
+  JOIN public.artifacts artifact ON artifact.id = version.plan_artifact_id
+  JOIN public.agent_runs source_run
+    ON source_run.id = artifact.agent_run_id
+   AND source_run.task_id = entry.task_id
+   AND source_run.agent_type = 'architect'
+   AND source_run.status = 'completed'
+  WHERE entry.task_id = p_task_id
+    AND entry.plan_artifact_id = p_plan_artifact_id
+    AND entry.plan_version = p_plan_version
+    AND entry.entry_id = 'plan_body:000000'
+    AND p_entry_id = 'plan_body:000000'
+    AND entry.entry_kind = 'plan_body'
+    AND entry.agent IS NULL
+    AND entry.requirement_key IS NULL
+    AND entry.binding_fingerprint IS NULL
+    AND NOT entry.projection_eligible
+    AND entry.content_digest = p_content_digest
+    AND entry.digest_key_id = p_digest_key_id
+    AND source_run.id <> p_agent_run_id
+    AND NOT EXISTS (
+      SELECT 1 FROM public.architect_plan_versions newer
+      WHERE newer.task_id = p_task_id AND newer.plan_version > p_plan_version
+    )
+  FOR KEY SHARE OF entry, version, artifact, source_run;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Architect replan source is not the exact latest protected plan body'
+      USING ERRCODE = '40001';
+  END IF;
+
+  INSERT INTO public.architect_plan_execution_references (
+    id, purpose, task_id, work_package_id, agent_run_id, plan_artifact_id,
+    plan_version, entry_id, agent, requirement_key, binding_fingerprint,
+    content_digest, digest_key_id
+  ) VALUES (
+    v_reference_id, 'architect_replan', p_task_id, NULL, p_agent_run_id,
+    p_plan_artifact_id, p_plan_version, p_entry_id, 'architect', NULL, NULL,
+    p_content_digest, p_digest_key_id
   );
   RETURN v_reference_id;
 END;
@@ -1234,12 +1405,13 @@ GRANT INSERT ON public.artifacts, public.filesystem_mcp_runtime_audits
 --> statement-breakpoint
 REVOKE ALL ON public.architect_plan_versions, public.architect_plan_entries,
   public.architect_plan_execution_references, public.architect_plan_history_reads,
-  public.epic_172_s4_protocol_state, public.work_package_local_run_evidence,
+  public.work_package_local_run_evidence,
   public.filesystem_mcp_decision_nonce_claims,
   public.project_root_ref_reconciliation FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.fill_project_root_ref_on_insert_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.guard_project_root_ref_renull_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.reconcile_project_root_refs_v1(integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.s4_protected_paths_enabled_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.reject_s4_retained_mutation_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.guard_architect_plan_public_artifact_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) FROM PUBLIC;
@@ -1250,24 +1422,26 @@ REVOKE ALL ON FUNCTION forge.validate_packet_authorization_snapshot_v2(jsonb,tex
 REVOKE ALL ON FUNCTION forge.guard_packet_authorization_v2() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.bind_architect_replan_entry_v1(uuid,uuid,uuid,bigint,text,text,text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) TO forge_architect_plan_writer;
 GRANT EXECUTE ON FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) TO forge_architect_plan_history_reader;
 GRANT EXECUTE ON FUNCTION forge.resolve_architect_plan_entry_v1(uuid) TO forge_architect_plan_resolver;
 GRANT EXECUTE ON FUNCTION forge.create_local_run_evidence_v1(uuid,uuid,integer) TO forge_packet_issuer;
 GRANT EXECUTE ON FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,integer,text[]) TO forge_packet_issuer;
 GRANT EXECUTE ON FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) TO forge_packet_issuer;
+GRANT EXECUTE ON FUNCTION forge.bind_architect_replan_entry_v1(uuid,uuid,uuid,bigint,text,text,text) TO forge_architect_plan_writer;
 --> statement-breakpoint
 ALTER TABLE public.architect_plan_versions OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.architect_plan_entries OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.architect_plan_execution_references OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.architect_plan_history_reads OWNER TO forge_s4_routines_owner;
-ALTER TABLE public.epic_172_s4_protocol_state OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.work_package_local_run_evidence OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.filesystem_mcp_decision_nonce_claims OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.project_root_ref_reconciliation OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.fill_project_root_ref_on_insert_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.guard_project_root_ref_renull_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.reconcile_project_root_refs_v1(integer) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.s4_protected_paths_enabled_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.reject_s4_retained_mutation_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.guard_architect_plan_public_artifact_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.read_architect_plan_history_v1(bytea,uuid,bigint) OWNER TO forge_s4_routines_owner;
@@ -1278,5 +1452,6 @@ ALTER FUNCTION forge.insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid
 ALTER FUNCTION forge.guard_packet_authorization_v2() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.insert_architect_plan_version_v1(uuid,uuid,bigint,text,text,text[],text[],text[],text[],text[],text[],text[],text[]) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.bind_architect_plan_entry_v1(uuid,uuid,uuid,uuid,bigint,text,text,text,text,text) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.bind_architect_replan_entry_v1(uuid,uuid,uuid,bigint,text,text,text) OWNER TO forge_s4_routines_owner;
 --> statement-breakpoint
 SELECT public.forge_finalize_epic_172_s4_owner_bootstrap_v1();

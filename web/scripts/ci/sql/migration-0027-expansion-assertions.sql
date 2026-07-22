@@ -4,6 +4,9 @@ DO $assertions$
 DECLARE
   migration_principal name := current_setting('forge.fixture_migration_principal')::name;
 BEGIN
+  IF pg_catalog.to_regclass('public.epic_172_s4_protocol_state') IS NOT NULL THEN
+    RAISE EXCEPTION '0027 created a competing S4 protocol authority';
+  END IF;
   IF NOT EXISTS (
     SELECT 1 FROM drizzle.__drizzle_migrations
     WHERE created_at = 1784270400000

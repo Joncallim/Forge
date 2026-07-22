@@ -9,12 +9,10 @@ if [[ ! "${batch_size}" =~ ^[0-9]+$ ]] || (( batch_size < 1 || batch_size > 1000
 fi
 
 preflight="$(psql "${FORGE_DATABASE_ADMIN_URL}" --no-align --tuples-only --set ON_ERROR_STOP=1 --command "
-  SELECT
-    (SELECT state FROM public.forge_epic_172_enablement_state WHERE singleton_id = 'epic-172'),
-    (SELECT producers_enabled FROM public.epic_172_s4_protocol_state WHERE singleton);
+  SELECT state FROM public.forge_epic_172_enablement_state WHERE singleton_id = 'epic-172';
 ")"
-if [[ "${preflight}" != 'disabled|f' ]]; then
-  echo "Root-reference reconciliation requires the existing Step 0 state disabled and S4 producers disabled; got ${preflight}." >&2
+if [[ "${preflight}" != 'disabled' ]]; then
+  echo "Root-reference reconciliation requires the existing Step 0 state disabled; got ${preflight}." >&2
   exit 1
 fi
 

@@ -12,9 +12,8 @@ BEGIN;
 SET LOCAL lock_timeout = '5s';
 DO $cutover$
 BEGIN
-  IF (SELECT state FROM public.forge_epic_172_enablement_state WHERE singleton_id = 'epic-172') <> 'disabled'
-     OR (SELECT producers_enabled FROM public.epic_172_s4_protocol_state WHERE singleton) THEN
-    RAISE EXCEPTION 'strict root-reference cutover requires Step 0 and S4 producers to remain disabled'
+  IF (SELECT state FROM public.forge_epic_172_enablement_state WHERE singleton_id = 'epic-172') <> 'disabled' THEN
+    RAISE EXCEPTION 'strict root-reference cutover requires Step 0 to remain disabled'
       USING ERRCODE = '55000';
   END IF;
   IF NOT EXISTS (

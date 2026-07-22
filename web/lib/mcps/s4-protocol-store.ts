@@ -137,6 +137,7 @@ export async function recordArchitectPlanVersion(input: {
 
 export async function resolveArchitectPlanEntry(input: {
   digestKey: Buffer
+  expectedPurpose?: 'package_specialist' | 'architect_replan'
   reference: ArchitectPlanEntryReference
   referenceId: string
   taskId: string
@@ -151,20 +152,28 @@ export async function resolveArchitectPlanEntry(input: {
       contentDigest: string
       entryId: string
       entryKind: ArchitectPlanEntryEnvelope['entryKind']
+      projectionEligible: boolean
+      purpose: 'package_specialist' | 'architect_replan'
       requirementKey: string | null
     }[]>`
       select
+        purpose,
         entry_id as "entryId",
         entry_kind as "entryKind",
         agent,
         requirement_key as "requirementKey",
         binding_fingerprint as "bindingFingerprint",
         content,
-        content_digest as "contentDigest"
+        content_digest as "contentDigest",
+        projection_eligible as "projectionEligible"
       from forge.resolve_architect_plan_entry_v1(${input.referenceId}::uuid)
     `
     if (rows.length !== 1) throw new S4ProtocolStoreError('invalid_evidence', 'The Architect plan reference was stale or unavailable.')
     const row = rows[0]
+    const expectedPurpose = input.expectedPurpose ?? 'package_specialist'
+    if (row.purpose !== expectedPurpose) {
+      throw new S4ProtocolStoreError('invalid_evidence', 'The Architect plan reference purpose did not match its consumer.')
+    }
     const envelope: ArchitectPlanEntryEnvelope = {
       schemaVersion: 1,
       taskId: input.taskId,
@@ -178,11 +187,20 @@ export async function resolveArchitectPlanEntry(input: {
       content: row.content,
       contentDigest: row.contentDigest,
       digestKeyId: reference.digestKeyId,
-      projectionEligible: true,
+      projectionEligible: row.projectionEligible,
     }
     if (
       row.entryId !== reference.entryId ||
       row.contentDigest !== reference.contentDigest ||
+      (expectedPurpose === 'package_specialist' && !row.projectionEligible) ||
+      (expectedPurpose === 'architect_replan' && (
+        row.entryKind !== 'plan_body'
+        || row.entryId !== 'plan_body:000000'
+        || row.agent !== null
+        || row.requirementKey !== null
+        || row.bindingFingerprint !== null
+        || row.projectionEligible
+      )) ||
       !verifyArchitectPlanEntry({ digestKey: input.digestKey, entry: envelope })
     ) {
       throw new S4ProtocolStoreError('invalid_evidence', 'The resolved Architect plan entry did not match its protected digest.')
@@ -193,6 +211,39 @@ export async function resolveArchitectPlanEntry(input: {
 
 export function executableReferenceForEntry(entry: ArchitectPlanEntryEnvelope): ArchitectPlanEntryReference {
   return architectPlanEntryReference(entry)
+}
+
+export async function bindArchitectReplanEntry(input: {
+  agentRunId: string
+  reference: ArchitectPlanEntryReference
+  taskId: string
+}): Promise<string> {
+  const reference = parseArchitectPlanEntryReference(input.reference)
+  if (
+    !reference
+    || reference.entryId !== 'plan_body:000000'
+    || reference.requirementKey !== null
+    || reference.bindingFingerprint !== null
+  ) {
+    throw new S4ProtocolStoreError('invalid_evidence', 'The Architect replan source reference is malformed.')
+  }
+  return withDedicatedClient('FORGE_ARCHITECT_PLAN_WRITER_DATABASE_URL', async (sql) => {
+    const rows = await sql<{ referenceId: string }[]>`
+      select forge.bind_architect_replan_entry_v1(
+        ${input.taskId}::uuid,
+        ${input.agentRunId}::uuid,
+        ${reference.planArtifactId}::uuid,
+        ${reference.planVersion}::bigint,
+        ${reference.entryId}::text,
+        ${reference.contentDigest}::text,
+        ${reference.digestKeyId}::text
+      ) as "referenceId"
+    `
+    if (rows.length !== 1) {
+      throw new S4ProtocolStoreError('conflict', 'Architect replan binding failed closed.')
+    }
+    return rows[0].referenceId
+  })
 }
 
 export async function bindArchitectPlanEntry(input: {

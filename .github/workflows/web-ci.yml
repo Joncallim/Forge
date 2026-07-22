@@ -169,7 +169,7 @@ jobs:
               'forge_epic_172_release_evidence_consumptions', 'forge_epic_172_enablement_state',
               'forge_epic_172_enablement_transition_audits', 'architect_plan_versions',
               'architect_plan_entries', 'architect_plan_execution_references',
-              'architect_plan_history_reads', 'epic_172_s4_protocol_state',
+              'architect_plan_history_reads',
               'work_package_local_run_evidence', 'filesystem_mcp_runtime_audits',
               'filesystem_mcp_decision_nonce_claims', 'project_root_ref_reconciliation'
             ];
@@ -222,7 +222,6 @@ jobs:
               'public.architect_plan_entries',
               'public.architect_plan_execution_references',
               'public.architect_plan_history_reads',
-              'public.epic_172_s4_protocol_state',
               'public.work_package_local_run_evidence',
               'public.filesystem_mcp_runtime_audits',
               'public.filesystem_mcp_decision_nonce_claims',

@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import postgres from 'postgres'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
+  bindArchitectReplanEntry,
   executableReferenceForEntry,
   recordArchitectPlanVersion,
   resolveArchitectPlanEntry,
@@ -31,6 +32,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     task: randomUUID(),
     package: randomUUID(),
     architectRun: randomUUID(),
+    replanRun: randomUUID(),
     firstRun: randomUUID(),
     secondRun: randomUUID(),
     firstEvidence: randomUUID(),
@@ -39,6 +41,10 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     secondLocalClaim: randomUUID(),
     decision: randomUUID(),
     nonce: randomUUID(),
+    signerKey: randomUUID(),
+    enablementReceipt: randomUUID(),
+    readinessReceipt: randomUUID(),
+    legacyArchitectRun: randomUUID(),
   }
   const key = randomBytes(32)
   const sessionCredential = randomUUID()
@@ -82,6 +88,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         insert into agent_runs (id, task_id, work_package_id, agent_type, model_id_used, status)
         values
           (${ids.architectRun}::uuid, ${ids.task}::uuid, null, 'architect', 'test', 'completed'),
+          (${ids.replanRun}::uuid, ${ids.task}::uuid, null, 'architect', 'test', 'running'),
           (${ids.firstRun}::uuid, ${ids.task}::uuid, ${ids.package}::uuid, 'backend', 'test', 'running'),
           (${ids.secondRun}::uuid, ${ids.task}::uuid, ${ids.package}::uuid, 'backend', 'test', 'running')
       `
@@ -118,16 +125,137 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
            ${ids.secondRun}::uuid, ${ids.secondLocalClaim}::uuid, clock_timestamp() + interval '30 seconds')
       `
       await tx`
-        update epic_172_s4_protocol_state
-        set producers_enabled = true, protocol_epoch = 2,
-            enabled_build_sha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-        where singleton
+        insert into forge_release_signer_keys (
+          id, generation, public_key_spki, github_app_id, ruleset_fingerprint,
+          status, valid_from, valid_until
+        ) values (
+          ${ids.signerKey}::uuid, 1, decode('00', 'hex'), 's4-postgres-test',
+          ${'b'.repeat(64)}, 'staged', clock_timestamp() - interval '1 minute',
+          clock_timestamp() + interval '1 hour'
+        )
+      `
+      await tx`
+        insert into forge_epic_172_release_evidence (
+          id, evidence_kind, owner_issue, owner_slice, exact_builds,
+          required_evidence, reviewed_sha, epoch, predecessor_receipt_ids,
+          predecessor_set_digest, transition_identity_digest, signer_key_id,
+          signer_generation, github_app_id, controller_run_id, controller_job_id,
+          envelope_digest, detached_signature, nonce, issued_at, envelope
+        ) values
+        (
+          ${ids.enablementReceipt}::uuid, 'ingress_and_issuance_enabled', 179, 's4',
+          ${JSON.stringify([
+            `issue_179_s4@${'a'.repeat(40)}`,
+            `issue_180_s5@${'a'.repeat(40)}`,
+            `issue_181_s6@${'a'.repeat(40)}`,
+          ])}::jsonb,
+          '[{"name":"postgres_fixture","measurementDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]'::jsonb,
+          ${'a'.repeat(40)}, 2, '[]'::jsonb, ${'0'.repeat(64)}, ${'c'.repeat(64)},
+          ${ids.signerKey}::uuid, 1, 's4-postgres-test', 's4-postgres-test', 'enablement',
+          ${'e'.repeat(64)}, decode(repeat('aa', 64), 'hex'), ${randomUUID()}::uuid,
+          clock_timestamp(), '{}'::jsonb
+        ),
+        (
+          ${ids.readinessReceipt}::uuid, 's5_s6_release_ready', 181, 's6',
+          ${JSON.stringify([
+            `issue_179_s4@${'a'.repeat(40)}`,
+            `issue_180_s5@${'a'.repeat(40)}`,
+            `issue_181_s6@${'a'.repeat(40)}`,
+          ])}::jsonb,
+          '[{"name":"postgres_fixture","measurementDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]'::jsonb,
+          ${'a'.repeat(40)}, 2, '[]'::jsonb, ${'1'.repeat(64)}, ${'d'.repeat(64)},
+          ${ids.signerKey}::uuid, 1, 's4-postgres-test', 's4-postgres-test', 'readiness',
+          ${'f'.repeat(64)}, decode(repeat('bb', 64), 'hex'), ${randomUUID()}::uuid,
+          clock_timestamp(), '{}'::jsonb
+        )
+      `
+      await tx`
+        update forge_epic_172_enablement_state
+        set state = 'active', owner_operation_id = 's4-postgres-test',
+            exact_builds = ${JSON.stringify([
+              `issue_179_s4@${'a'.repeat(40)}`,
+              `issue_180_s5@${'a'.repeat(40)}`,
+              `issue_181_s6@${'a'.repeat(40)}`,
+            ])}::jsonb,
+            reviewed_sha = ${'a'.repeat(40)}, epoch = 2,
+            enablement_receipt_id = ${ids.enablementReceipt}::uuid,
+            final_readiness_receipt_id = ${ids.readinessReceipt}::uuid,
+            state_fingerprint = ${'9'.repeat(64)}, updated_at = clock_timestamp()
+        where singleton_id = 'epic-172'
       `
     })
   })
 
   afterAll(async () => {
+    if (admin) {
+      await admin`
+        update forge_epic_172_enablement_state
+        set state = 'disabled', owner_operation_id = null, exact_builds = null,
+            reviewed_sha = null, epoch = null, started_at = null, expires_at = null,
+            enablement_receipt_id = null, final_readiness_receipt_id = null,
+            opening_authorization_id = null, controller_login_id = null,
+            controller_run_id = null, controller_token_digest = null,
+            lease_generation = null, last_heartbeat_at = null, lease_expires_at = null,
+            state_fingerprint = 'b0789177e07f4a9307f3397a938999b6fcc8c835a97e03d2770f83e4978c2585',
+            updated_at = clock_timestamp()
+        where singleton_id = 'epic-172'
+      `
+    }
     await Promise.all([admin?.end({ timeout: 5 }), issuer?.end({ timeout: 5 })])
+  })
+
+  it('permits only legacy adr_text planning while Step 0 is disabled', async () => {
+    await admin`
+      update forge_epic_172_enablement_state
+      set state = 'disabled', owner_operation_id = null, exact_builds = null,
+          reviewed_sha = null, epoch = null, started_at = null, expires_at = null,
+          enablement_receipt_id = null, final_readiness_receipt_id = null,
+          opening_authorization_id = null, controller_login_id = null,
+          controller_run_id = null, controller_token_digest = null,
+          lease_generation = null, last_heartbeat_at = null, lease_expires_at = null,
+          state_fingerprint = 'b0789177e07f4a9307f3397a938999b6fcc8c835a97e03d2770f83e4978c2585'
+      where singleton_id = 'epic-172'
+    `
+    try {
+      await admin`
+        insert into agent_runs (id, task_id, work_package_id, agent_type, model_id_used, status)
+        values (${ids.legacyArchitectRun}::uuid, ${ids.task}::uuid, null, 'architect', 'test', 'completed')
+      `
+      await expect(admin`
+        insert into artifacts (agent_run_id, artifact_type, content, metadata)
+        values (
+          ${ids.legacyArchitectRun}::uuid, 'adr_text', 'Legacy Architect plan body',
+          '{"storageMode":"legacy"}'::jsonb
+        )
+      `).resolves.toBeDefined()
+      await expect(recordArchitectPlanVersion({
+        agentRunId: ids.architectRun,
+        digestKey: key,
+        digestKeyId: 's4-test-key',
+        planVersion: '1',
+        taskId: ids.task,
+        entries: [{
+          agent: null, bindingFingerprint: null, content: 'Must remain blocked',
+          entryId: 'plan_body:000000', entryKind: 'plan_body',
+          projectionEligible: false, requirementKey: null,
+        }],
+      })).rejects.toMatchObject({ code: 'invalid_evidence' })
+    } finally {
+      await admin`
+        update forge_epic_172_enablement_state
+        set state = 'active', owner_operation_id = 's4-postgres-test',
+            exact_builds = ${JSON.stringify([
+              `issue_179_s4@${'a'.repeat(40)}`,
+              `issue_180_s5@${'a'.repeat(40)}`,
+              `issue_181_s6@${'a'.repeat(40)}`,
+            ])}::jsonb,
+            reviewed_sha = ${'a'.repeat(40)}, epoch = 2,
+            enablement_receipt_id = ${ids.enablementReceipt}::uuid,
+            final_readiness_receipt_id = ${ids.readinessReceipt}::uuid,
+            state_fingerprint = ${'9'.repeat(64)}
+        where singleton_id = 'epic-172'
+      `
+    }
   })
 
   it('protects task-bound Architect source and burns each execution reference once', async () => {
@@ -138,6 +266,14 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       planVersion: '1',
       taskId: ids.task,
       entries: [{
+        agent: null,
+        bindingFingerprint: null,
+        content: 'Prior protected Architect plan body.',
+        entryId: 'plan_body:000000',
+        entryKind: 'plan_body',
+        projectionEligible: false,
+        requirementKey: null,
+      }, {
         agent: 'backend',
         bindingFingerprint: SHA,
         content: 'Read only the approved bounded project context.',
@@ -165,7 +301,8 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       where task_id = ${ids.task}::uuid and user_id = ${ids.user}::uuid
     `
     expect(historyAudit.reads).toBe(1)
-    const reference = executableReferenceForEntry(recorded.entries[0])
+    const packageEntry = recorded.entries.find((entry) => entry.entryKind === 'subtask')!
+    const reference = executableReferenceForEntry(packageEntry)
     const [bound] = await issuer<{ referenceId: string }[]>`
       select forge.bind_architect_plan_entry_v1(
         ${ids.task}::uuid, ${ids.package}::uuid, ${ids.firstRun}::uuid,
@@ -187,6 +324,31 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       digestKey: key,
       reference,
       referenceId: bound.referenceId,
+      taskId: ids.task,
+    })).rejects.toMatchObject({ code: 'invalid_evidence' })
+
+    const planBody = recorded.entries.find((entry) => entry.entryKind === 'plan_body')!
+    const replanReference = executableReferenceForEntry(planBody)
+    const replanReferenceId = await bindArchitectReplanEntry({
+      agentRunId: ids.replanRun,
+      reference: replanReference,
+      taskId: ids.task,
+    })
+    await expect(resolveArchitectPlanEntry({
+      digestKey: key,
+      expectedPurpose: 'architect_replan',
+      reference: replanReference,
+      referenceId: replanReferenceId,
+      taskId: ids.task,
+    })).resolves.toEqual({
+      content: 'Prior protected Architect plan body.',
+      entryId: 'plan_body:000000',
+    })
+    await expect(resolveArchitectPlanEntry({
+      digestKey: key,
+      expectedPurpose: 'architect_replan',
+      reference: replanReference,
+      referenceId: replanReferenceId,
       taskId: ids.task,
     })).rejects.toMatchObject({ code: 'invalid_evidence' })
   })

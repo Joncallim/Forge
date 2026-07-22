@@ -1379,8 +1379,9 @@ export const architectPlanExecutionReferences = pgTable(
   'architect_plan_execution_references',
   {
     id: uuid('id').primaryKey().defaultRandom(),
+    purpose: text('purpose').notNull().default('package_specialist'),
     taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
-    workPackageId: uuid('work_package_id').notNull().references(() => workPackages.id, { onDelete: 'restrict' }),
+    workPackageId: uuid('work_package_id').references(() => workPackages.id, { onDelete: 'restrict' }),
     agentRunId: uuid('agent_run_id').notNull().references(() => agentRuns.id, { onDelete: 'restrict' }),
     planArtifactId: uuid('plan_artifact_id').notNull(),
     planVersion: bigint('plan_version', { mode: 'bigint' }).notNull(),
@@ -1396,6 +1397,17 @@ export const architectPlanExecutionReferences = pgTable(
   (t) => [
     uniqueIndex('architect_plan_execution_references_run_entry_idx').on(t.agentRunId, t.entryId),
     index('architect_plan_execution_references_package_idx').on(t.workPackageId, t.agentRunId),
+    check(
+      'architect_plan_execution_references_purpose_chk',
+      sql`${t.purpose} in ('package_specialist', 'architect_replan')`,
+    ),
+    check(
+      'architect_plan_execution_references_purpose_shape_chk',
+      sql`(${t.purpose} = 'package_specialist' and ${t.workPackageId} is not null)
+        or (${t.purpose} = 'architect_replan' and ${t.workPackageId} is null
+          and ${t.agent} = 'architect' and ${t.entryId} = 'plan_body:000000'
+          and ${t.requirementKey} is null and ${t.bindingFingerprint} is null)`,
+    ),
   ],
 )
 
@@ -1413,14 +1425,6 @@ export const architectPlanHistoryReads = pgTable(
   },
   (t) => [index('architect_plan_history_reads_task_version_idx').on(t.taskId, t.planVersion)],
 )
-
-export const epic172S4ProtocolState = pgTable('epic_172_s4_protocol_state', {
-  singleton: boolean('singleton').primaryKey().default(true),
-  producersEnabled: boolean('producers_enabled').notNull().default(false),
-  protocolEpoch: integer('protocol_epoch').notNull().default(1),
-  enabledBuildSha: text('enabled_build_sha'),
-  updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
-})
 
 export const workPackageLocalRunEvidence = pgTable(
   'work_package_local_run_evidence',

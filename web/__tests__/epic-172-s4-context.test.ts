@@ -130,13 +130,31 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
       'architect_plan_entries',
       'architect_plan_execution_references',
       'architect_plan_history_reads',
-      'epic_172_s4_protocol_state',
       'work_package_local_run_evidence',
       'filesystem_mcp_decision_nonce_claims',
     ]) {
       expect(webCiWorkflow.match(new RegExp(`'public\\.${table}'`, 'g'))).toHaveLength(1)
       expect(webCiWorkflow.match(new RegExp(`'${table}'`, 'g'))).toHaveLength(1)
     }
+  })
+
+  it('uses only the Step 0 enablement authority for protected S4 paths', () => {
+    expect(s4Migration).not.toContain('CREATE TABLE public.epic_172_s4_protocol_state')
+    expect(s4Migration).not.toContain('FROM public.epic_172_s4_protocol_state')
+    expect(s4Migration).toContain('FROM forge.read_epic_172_enablement_state_v1() state')
+    expect(s4Migration).toContain("'issue_179_s4@' || state.reviewed_sha")
+    expect(s4Migration).toContain("'issue_180_s5@' || state.reviewed_sha")
+    expect(s4Migration).toContain("'issue_181_s6@' || state.reviewed_sha")
+  })
+
+  it('keeps the Architect replan arm purpose-discriminated and one-reader-only', () => {
+    expect(s4Migration).toContain("purpose IN ('package_specialist', 'architect_replan')")
+    expect(s4Migration).toContain("purpose = 'architect_replan'")
+    expect(s4Migration).toContain("entry.entry_id = 'plan_body:000000'")
+    expect(s4Migration).toContain('AND NOT entry.projection_eligible')
+    expect(s4Migration).toContain('CREATE OR REPLACE FUNCTION forge.bind_architect_replan_entry_v1(')
+    expect(s4Migration.match(/CREATE OR REPLACE FUNCTION forge\.resolve_architect_plan_entry_v1/g))
+      .toHaveLength(1)
   })
 
   it('opens and closes one migration-session-bound S4 schema authority fence', () => {
