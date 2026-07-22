@@ -6601,6 +6601,49 @@ BEGIN
 END;
 $$;
 --> statement-breakpoint
+-- B1A protected clarification subledger. It is deliberately separate from
+-- finalized Architect plan versions and has no public-table text projection.
+CREATE TABLE public.architect_clarification_answers (
+  id uuid PRIMARY KEY,
+  task_id uuid NOT NULL REFERENCES public.tasks(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  question_id uuid NOT NULL REFERENCES public.task_questions(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  source_plan_artifact_id uuid NOT NULL,
+  source_plan_version bigint NOT NULL,
+  answer text NOT NULL CHECK (pg_catalog.octet_length(answer) BETWEEN 1 AND 65536),
+  content_digest text NOT NULL CHECK (content_digest ~ '^hmac-sha256:[0-9a-f]{64}$'),
+  digest_key_id text NOT NULL CHECK (digest_key_id ~ '^[a-z0-9._-]{1,64}$'),
+  actor_user_id uuid NOT NULL REFERENCES public.users(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  FOREIGN KEY (source_plan_artifact_id, source_plan_version)
+    REFERENCES public.architect_plan_versions(plan_artifact_id, plan_version)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  UNIQUE (task_id, question_id, id)
+);
+CREATE TABLE public.architect_clarification_answer_writes (
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  answer_id uuid NOT NULL REFERENCES public.architect_clarification_answers(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  task_id uuid NOT NULL REFERENCES public.tasks(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  actor_user_id uuid NOT NULL REFERENCES public.users(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  written_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  UNIQUE (answer_id)
+);
+CREATE TRIGGER architect_clarification_answers_append_only
+  BEFORE UPDATE OR DELETE ON public.architect_clarification_answers
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
+CREATE TRIGGER architect_clarification_answer_writes_append_only
+  BEFORE UPDATE OR DELETE ON public.architect_clarification_answer_writes
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
+REVOKE ALL ON public.architect_clarification_answers, public.architect_clarification_answer_writes FROM PUBLIC;
+ALTER TABLE public.architect_plan_execution_references
+  ADD COLUMN source_kind text NOT NULL DEFAULT 'architect_plan_entry',
+  ADD COLUMN clarification_answer_id uuid,
+  ADD CONSTRAINT architect_plan_execution_references_source_kind_chk CHECK (
+    (source_kind = 'architect_plan_entry' AND clarification_answer_id IS NULL)
+    OR (source_kind = 'clarification_answer' AND clarification_answer_id IS NOT NULL
+      AND purpose = 'architect_replan' AND work_package_id IS NULL AND agent = 'architect')
+  ),
+  ADD CONSTRAINT architect_plan_execution_references_answer_fk FOREIGN KEY (clarification_answer_id)
+    REFERENCES public.architect_clarification_answers(id) ON UPDATE RESTRICT ON DELETE RESTRICT;
 -- The NOLOGIN owner receives only the existing-table privileges required by
 -- the fixed-path functions above. Interactive and application logins receive
 -- no equivalent table access.
@@ -6744,6 +6787,8 @@ ALTER TABLE public.architect_plan_versions OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.architect_plan_entries OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.architect_plan_execution_references OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.architect_plan_history_reads OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.architect_clarification_answers OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.architect_clarification_answer_writes OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.protected_package_entry_registrations OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.protected_entry_capability_bindings OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.mcp_operator_review_versions OWNER TO forge_s4_routines_owner;

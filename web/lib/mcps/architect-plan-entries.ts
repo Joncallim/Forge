@@ -4,6 +4,7 @@ export const ARCHITECT_PLAN_HEADER = 'Architect plan available in protected hist
 export const ARCHITECT_PLAN_ENTRY_DOMAIN_V1 = Buffer.from('forge:architect-plan-entry:v1\0', 'utf8')
 export const ARCHITECT_PLAN_SET_DOMAIN_V1 = Buffer.from('forge:architect-plan-entry-set:v1\0', 'utf8')
 export const ARCHITECT_PLAN_STRUCTURAL_SET_DOMAIN_V1 = Buffer.from('forge:architect-plan-structural-set:v1\0', 'utf8')
+export const ARCHITECT_CLARIFICATION_ANSWER_DOMAIN_V1 = Buffer.from('forge:architect-clarification-answer:v1\0', 'utf8')
 export const MAX_ARCHITECT_PLAN_ENTRIES = 256
 export const MAX_ARCHITECT_PLAN_ENTRY_BYTES = 64 * 1024
 
@@ -156,7 +157,7 @@ function entryDigestPayload(input: {
   taskId: string
 }): Record<string, unknown> {
   return {
-    schemaVersion: 1,
+    schemaVersion: 1 as const,
     taskId: input.taskId,
     planArtifactId: input.planArtifactId,
     planVersion: input.planVersion,
@@ -172,6 +173,49 @@ function entryDigestPayload(input: {
 function hmacDigest(domain: Buffer, key: Buffer, value: unknown): string {
   if (key.byteLength < 32) throw new Error('Architect plan HMAC key must be at least 32 bytes')
   return `hmac-sha256:${createHmac('sha256', key).update(domain).update(canonicalArchitectPlanJson(value), 'utf8').digest('hex')}`
+}
+
+export type ArchitectClarificationAnswerEnvelope = {
+  schemaVersion: 1
+  taskId: string
+  answerId: string
+  questionId: string
+  sourcePlanArtifactId: string
+  sourcePlanVersion: string
+  answer: string
+  digestKeyId: string
+  contentDigest: string
+}
+
+export function materializeArchitectClarificationAnswer(input: Omit<ArchitectClarificationAnswerEnvelope, 'contentDigest' | 'schemaVersion'> & { digestKey: Buffer }): ArchitectClarificationAnswerEnvelope {
+  if (!UUID.test(input.taskId) || !UUID.test(input.answerId) || !UUID.test(input.questionId)
+    || !UUID.test(input.sourcePlanArtifactId) || !canonicalPlanVersion(input.sourcePlanVersion)
+    || !COMPONENT.test(input.digestKeyId)) {
+    throw new Error('Architect clarification answer identity is invalid')
+  }
+  const answer = input.answer.normalize('NFC')
+  if (Buffer.byteLength(answer, 'utf8') === 0 || Buffer.byteLength(answer, 'utf8') > MAX_ARCHITECT_PLAN_ENTRY_BYTES) {
+    throw new Error('Architect clarification answer is outside the bounded size')
+  }
+  const payload = {
+    schemaVersion: 1 as const,
+    taskId: input.taskId,
+    answerId: input.answerId,
+    questionId: input.questionId,
+    sourcePlanArtifactId: input.sourcePlanArtifactId,
+    sourcePlanVersion: input.sourcePlanVersion,
+    answer,
+  }
+  return { ...payload, digestKeyId: input.digestKeyId, contentDigest: hmacDigest(ARCHITECT_CLARIFICATION_ANSWER_DOMAIN_V1, input.digestKey, payload) }
+}
+
+export function verifyArchitectClarificationAnswer(input: ArchitectClarificationAnswerEnvelope & { digestKey: Buffer }): boolean {
+  try {
+    const materialized = materializeArchitectClarificationAnswer(input)
+    const left = Buffer.from(materialized.contentDigest, 'utf8')
+    const right = Buffer.from(input.contentDigest, 'utf8')
+    return left.length === right.length && timingSafeEqual(left, right)
+  } catch { return false }
 }
 
 export function materializeArchitectPlanEntries(input: {

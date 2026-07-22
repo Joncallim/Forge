@@ -2126,3 +2126,18 @@ export const taskQuestions = pgTable(
 
 export type TaskQuestion = InferSelectModel<typeof taskQuestions>
 export type NewTaskQuestion = InferInsertModel<typeof taskQuestions>
+
+/** Protected append-only text for answered clarifications. Public question
+ * rows intentionally do not reference this table until the B2 cutover. */
+export const architectClarificationAnswers = pgTable('architect_clarification_answers', {
+  id: uuid('id').primaryKey(),
+  taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+  questionId: uuid('question_id').notNull().references(() => taskQuestions.id, { onDelete: 'restrict' }),
+  sourcePlanArtifactId: uuid('source_plan_artifact_id').notNull(),
+  sourcePlanVersion: bigint('source_plan_version', { mode: 'number' }).notNull(),
+  answer: text('answer').notNull(),
+  contentDigest: text('content_digest').notNull(),
+  digestKeyId: text('digest_key_id').notNull(),
+  actorUserId: uuid('actor_user_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+  createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+})
