@@ -242,6 +242,7 @@ jobs:
               'forge_epic_172_enablement_transition_audits', 'architect_plan_versions',
               'architect_plan_entries', 'architect_plan_execution_references',
               'architect_plan_history_reads', 'protected_package_entry_registrations',
+              'architect_clarification_answers', 'architect_clarification_answer_writes',
               'protected_entry_capability_bindings', 'mcp_operator_review_versions',
               'mcp_operator_review_entries',
               'work_package_local_run_evidence', 'filesystem_mcp_runtime_audits',

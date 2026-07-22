@@ -151,6 +151,8 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
       'architect_plan_entries',
       'architect_plan_execution_references',
       'architect_plan_history_reads',
+      'architect_clarification_answers',
+      'architect_clarification_answer_writes',
       'protected_package_entry_registrations',
       'protected_entry_capability_bindings',
       'mcp_operator_review_versions',
