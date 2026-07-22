@@ -16,13 +16,11 @@ For normal local use, `forge` starts both the dashboard and the worker. For
 split deployments, the worker can still run separately.
 
 The most important beta boundary: Forge may write plans, approval records,
-work-package records, handoff/review-gate state, and generated sandbox files,
-but it does not write directly into the host repository. Workforce
-materialization and handoff are available after approval; specialist package
-execution is opt-in with `FORGE_WORK_PACKAGE_EXECUTION=1`. Forge may give a specialist bounded read-only
-host-repository context. Generated files remain under
-`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/` for
-review and manual application. Direct host writes, branches, commits, pull
+work-package records, and handoff/review-gate state, but specialist execution
+and file materialization are currently unavailable. Workforce materialization
+and handoff are available after approval. `FORGE_WORK_PACKAGE_EXECUTION` is a
+reserved setting and cannot enable execution today. Direct host writes,
+branches, commits, pull
 requests, merges, live specialist MCP grants, autonomous reviewer agents, and
 parallel specialists are still future work.
 
@@ -163,10 +161,10 @@ For the currently wired ACP adapters:
 - The local CLI must already be installed and logged in.
 - The Forge project must have a local folder so Forge can validate and bound
   repository context. Architect planning uses an isolated runtime directory.
-  Executable work-package ACP sessions are opt-in with
-  `FORGE_ACP_WORK_PACKAGE_EXECUTION=1`. The local adapter is not OS-confined by
-  Forge, so enable it only where a real external confinement boundary is
-  present.
+  Specialist ACP sessions are currently unavailable. The
+  `FORGE_ACP_WORK_PACKAGE_EXECUTION` setting is reserved and cannot override
+  the missing confined writer; ACP adapters are local processes and are not
+  OS-confined by Forge.
 - Installing the Zed editor is not required; Forge uses Agent Client Protocol
   adapter packages, not the editor itself.
 
@@ -233,26 +231,22 @@ fixture; it is not a complete proof of production safety.
 ## Executable Workforce Beta
 
 Workforce materialization and handoff are available after approval. Package
-execution is disabled by default; set `FORGE_WORK_PACKAGE_EXECUTION=1` in the
-worker environment to opt in. If
+execution and file materialization are currently unavailable. Do not set
+`FORGE_WORK_PACKAGE_EXECUTION=1` expecting it to enable execution. If
 `FORGE_EMBED_WORKER` is enabled, that is the web process because it hosts the
 worker loop; in split deployments, do not set it on the web-only process.
 
-```bash
-FORGE_WORK_PACKAGE_EXECUTION=1
-```
-
-Package models run sandbox-only when enabled. You may also make that boundary
-explicit:
+The normal path produces handoff artifacts only. You may make the unavailable
+host-write setting explicit:
 
 ```bash
 FORGE_HOST_REPOSITORY_WRITES=0
 ```
 
-Do not set this flag to `1` or `true`. Direct host repository writes are
-unavailable, so file materialization fails closed after Forge preserves the
-generated sandbox files. Path validation is not an operating-system sandbox; a
-real confined writer is required before Forge can apply files automatically.
+Do not set this flag to `1` or `true`. Direct host repository writes and file
+materialization are unavailable, so the request fails closed before provider or
+filesystem work. Path validation is not an operating-system sandbox; a real
+confined writer is required before Forge can apply files automatically.
 The legacy `FORGE_REPOSITORY_EDITS` alias follows the same rule. Review files
 under `.forge/task-runs`, then apply accepted changes manually.
 
@@ -276,13 +270,12 @@ With the default execution path:
 2. Forge releases ready work packages and runs the MCP/capability broker.
 3. Required blocked MCP/tool grants stop the package before execution. Optional
    grants can continue only when the approved fallback is non-blocking.
-4. Forge executes one eligible specialist package at a time.
-5. The specialist receives bounded read-only project context and run-scoped
-   instructions. This is not a live MCP grant or an unbounded filesystem view.
-6. Generated output is written under the project folder at
-   `.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/`.
-7. Review the generated files and apply accepted changes manually. Direct host
-   repository application is unavailable.
+4. Forge prepares handoff artifacts for the eligible specialist package.
+5. The package receives reviewable planning context and run-scoped instructions;
+   no specialist provider or ACP process is called.
+6. There is no generated execution sandbox while the confined writer is
+   unavailable.
+7. Review the handoff artifacts and apply any accepted changes manually.
 8. QA, Reviewer, and Security gates appear when required. In this beta, those
    are manual operator decisions, not proof that separate reviewer agents ran.
 
@@ -382,9 +375,9 @@ Worker and workspace options:
 | `FORGE_PROMPT_UPGRADE_MODE` | `keep` or `overwrite` local workspace prompts during install/upgrade |
 | `FORGE_WORKFORCE_MATERIALIZATION` | Set `0` or `false` to disable default Workforce record materialization |
 | `FORGE_WORK_PACKAGE_HANDOFF` | Set `0` or `false` to disable default work-package handoff claims |
-| `FORGE_WORK_PACKAGE_EXECUTION` | Set `0`, `false`, `off`, `no`, or `disabled` to disable default package execution and create handoff artifacts only |
-| `FORGE_HOST_REPOSITORY_WRITES` | Leave unset, or set `0`, `false`, `off`, `no`, or `disabled`, for successful sandbox-only execution. Enable values fail closed after preserving sandbox output; the legacy `FORGE_REPOSITORY_EDITS` alias behaves the same way. |
-| `FORGE_ACP_WORK_PACKAGE_EXECUTION` | Set `0`, `false`, `off`, `no`, or `disabled` to block ACP package execution when local adapter process access is not acceptable |
+| `FORGE_WORK_PACKAGE_EXECUTION` | Reserved and currently unavailable; it cannot enable specialist execution or change the handoff-only path |
+| `FORGE_HOST_REPOSITORY_WRITES` | Leave unset or disabled; enable values fail closed because path validation is not an operating-system sandbox |
+| `FORGE_ACP_WORK_PACKAGE_EXECUTION` | Reserved and currently unavailable; it cannot enable ACP package execution |
 | `FORGE_RUNNING_WORK_PACKAGE_STALE_SECONDS` | Defaults to `900`; retry handoff treats older running package rows as interrupted and recovers them before continuing |
 | `FORGE_WORKSPACE_ROOT` | Fixed workspace root override |
 | `FORGE_MCPS_ROOT` | Fixed shared MCP root override |

@@ -10,11 +10,11 @@ operator wants. The worker does the queued work and saves evidence for review.
 
 The current worker starts with the Architect planning stage. Workforce data
 structures now exist for work packages, harnesses, approval gates, and version
-control summaries. Work-package handoff is available after approval; sequential
-specialist execution is opt-in with `FORGE_WORK_PACKAGE_EXECUTION=1`. Executable packages may receive bounded read-only
-host-repository context. Generated files remain in per-package sandboxes under
-`.forge/task-runs/<task-id>/<work-package-id>/attempt-<attempt-number>/` for
-review and manual application. Direct host repository writes are unavailable.
+control summaries. Work-package handoff is available after approval.
+Specialist execution and file materialization are currently unavailable because
+Forge does not yet have an operating-system-enforced confined writer. The
+normal path produces handoff artifacts for review only. Direct host repository
+writes remain unavailable.
 Forge still does not grant MCP runtime access to specialists, create branches or
 commits, open pull requests, merge work, run autonomous reviewer agents, or run
 specialists in parallel.
@@ -55,9 +55,9 @@ back through the same provider interface used by the worker. The currently wired
 Agent Client Protocol adapters wrap local tools such as Codex CLI and Claude
 Code; the underlying CLI must already be installed, authenticated, and runnable
 on the worker host. Architect ACP calls run in an isolated runtime directory.
-Executable work-package ACP calls are opt-in after task approval. ACP adapters
-are local processes, not OS-confined sandboxes; enable them only when a real
-external confinement boundary is present. See [ACP
+Specialist ACP execution is currently unavailable. The ACP flag is reserved
+and cannot override the missing confined writer. ACP adapters are local
+processes, not OS-confined sandboxes. See [ACP
 and the Zed connector](acp-zed-connector.md).
 
 ## Local Development
@@ -198,21 +198,20 @@ Feature flag defaults:
 |---|---|---|
 | `FORGE_WORKFORCE_MATERIALIZATION` | enabled | Set `0` or `false` to skip durable work-package/gate records. |
 | `FORGE_WORK_PACKAGE_HANDOFF` | enabled | Set `0` or `false` to stop package handoff claims. |
-| `FORGE_WORK_PACKAGE_EXECUTION` | disabled | Set `1` to explicitly enable specialist package execution; otherwise create handoff artifacts only. |
-| `FORGE_HOST_REPOSITORY_WRITES` | unavailable | Leave unset, or set `0`, `false`, `off`, `no`, or `disabled`, for successful sandbox-only execution. Enable values fail closed after preserving sandbox output. The legacy `FORGE_REPOSITORY_EDITS` alias follows the same rule. |
-| `FORGE_ACP_WORK_PACKAGE_EXECUTION` | disabled | Set `1` only when a real external confinement boundary protects the local ACP adapter process. |
+| `FORGE_WORK_PACKAGE_EXECUTION` | reserved/unavailable | Does not enable specialist execution today; the normal path creates handoff artifacts only. |
+| `FORGE_HOST_REPOSITORY_WRITES` | unavailable | Leave unset or disabled. Enable values still fail closed because path validation is not an operating-system sandbox. |
+| `FORGE_ACP_WORK_PACKAGE_EXECUTION` | reserved/unavailable | Does not enable ACP package execution today; a real confined writer is required first. |
 | `FORGE_RUNNING_WORK_PACKAGE_STALE_SECONDS` | `900` | Recovery window before a retry marks an interrupted running work package blocked and starts the next eligible attempt. |
 
 ### Executable Workforce Beta
 
-`FORGE_WORK_PACKAGE_EXECUTION=0` (the default) changes only the final package execution step:
-approval records reviewable handoff artifacts but does not call a specialist
-package model. With host-write configuration unset or explicitly disabled,
-package models run successfully and keep generated files under
-`.forge/task-runs` for review and manual application. An enable value such as
-`1` explicitly enables package execution; it never authorizes a host write.
+The current final package step is handoff-only. Approval records reviewable
+handoff artifacts and does not call a specialist package model. An enable value
+such as `FORGE_WORK_PACKAGE_EXECUTION=1` is reserved and cannot override the
+unavailable materialization boundary.
 
-When execution is enabled:
+When a real confined writer is available in a future release, the intended
+execution flow is:
 
 1. Forge claims at most one eligible non-review specialist package at a time
    after plan approval and broker admission.
@@ -298,12 +297,17 @@ forge:approvals:dead
 The worker uses PostgreSQL as the source of truth. Redis carries wake-up jobs,
 retry timing, and dead-letter transport.
 
-## ACP Provider Path
+## ACP Provider Path (planned execution surface)
 
 ACP is the Agent Client Protocol. Forge uses it to call local coding agents
 through adapter processes instead of direct cloud API calls.
 
-Current ACP flow:
+The provider and health-check code exists, but specialist ACP execution is
+currently unavailable. The following is the planned flow after Forge has a
+real operating-system-enforced confined writer; the current task path remains
+handoff-only.
+
+Planned ACP flow:
 
 ```text
 getModel(providerConfigId, { cwd })

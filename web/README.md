@@ -78,11 +78,10 @@ the source of truth for development and split-process workflows. See
 8. The task becomes `awaiting_approval`.
 9. The user approves or rejects the plan.
 10. Approval releases ready work packages for handoff.
-11. Forge runs one eligible package at a time only when
-    `FORGE_WORK_PACKAGE_EXECUTION=1` is explicitly set. It keeps generated files
-    in a per-package attempt sandbox. Direct host repository application is
-    unavailable: file materialization needs a real confined writer, and path
-    validation alone is not an operating-system sandbox.
+11. Specialist execution and file materialization are currently unavailable.
+    `FORGE_WORK_PACKAGE_EXECUTION` is a reserved setting and cannot override
+    the missing operating-system-enforced confined writer. The normal path
+    produces handoff artifacts for review only.
 12. Implementation package output remains pending until manual QA and Reviewer
     gates pass. High-risk packages also require a manual Security gate.
 13. Only tasks without materialized Workforce packages follow the older
@@ -122,11 +121,11 @@ docker compose --profile worker up worker
 
 By default, the worker runs the Architect planning stage and waits for explicit
 plan approval. Workforce materialization and handoff are available after
-approval. Specialist package execution is opt-in with
-`FORGE_WORK_PACKAGE_EXECUTION=1`; generated output is kept under
-`.forge/task-runs`. Direct host repository writes remain unavailable because
-Forge has no real confined writer, so accepted files must be applied manually
-after review.
+approval. Specialist package execution and file materialization are currently
+unavailable because Forge has no operating-system-enforced confined writer. The
+normal path produces handoff artifacts only; accepted files must be applied
+manually after review. `FORGE_WORK_PACKAGE_EXECUTION` is reserved and cannot
+change this.
 Branches, commits, pull requests, merges, live specialist MCP grants, and
 parallel specialist execution remain future work.
 
