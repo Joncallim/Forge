@@ -66,8 +66,8 @@ describe('isWorkPackageHandoffEnabled', () => {
 })
 
 describe('isWorkPackageExecutionEnabled', () => {
-  it('defaults on and supports explicit disable values', () => {
-    expect(isWorkPackageExecutionEnabled({})).toBe(true)
+  it('requires an explicit recognized opt-in and fails closed otherwise', () => {
+    expect(isWorkPackageExecutionEnabled({})).toBe(false)
     expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: '1' })).toBe(true)
     expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'true' })).toBe(true)
     expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: '0' })).toBe(false)
@@ -75,5 +75,7 @@ describe('isWorkPackageExecutionEnabled', () => {
     expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'off' })).toBe(false)
     expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'no' })).toBe(false)
     expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'disabled' })).toBe(false)
+    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: '' })).toBe(false)
+    expect(isWorkPackageExecutionEnabled({ FORGE_WORK_PACKAGE_EXECUTION: 'unexpected' })).toBe(false)
   })
 })

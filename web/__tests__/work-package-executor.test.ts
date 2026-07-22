@@ -72,6 +72,7 @@ vi.mock('@/worker/execution-context-packet', async (importOriginal) => {
 
 import {
   executeWorkPackage,
+  ConfinedMaterializationUnavailableError,
   hasLocalConflictCopyPathSegment,
   HostRepositoryWriteUnavailableError,
   parseWorkPackageExecutionPlan,
@@ -380,6 +381,19 @@ describe('hasLocalConflictCopyPathSegment', () => {
     expect(hasLocalConflictCopyPathSegment('web/__tests__/repository-evidence.test 2.ts')).toBe(true)
     expect(hasLocalConflictCopyPathSegment('web/.next/server/chunks 2')).toBe(true)
     expect(hasLocalConflictCopyPathSegment('docs/chapter-2.md')).toBe(false)
+  })
+})
+
+describe('confined materialization boundary', () => {
+  it('fails before creating a sandbox or launching a provider when no OS writer exists', async () => {
+    const unavailableRoot = path.join(os.tmpdir(), `forge-no-writer-${Date.now()}`)
+
+    await expect(executeWorkPackage(context({ validatedProjectRoot: unavailableRoot })))
+      .rejects.toBeInstanceOf(ConfinedMaterializationUnavailableError)
+
+    await expect(fs.stat(unavailableRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(mocks.getModel).not.toHaveBeenCalled()
+    expect(mocks.generateText).not.toHaveBeenCalled()
   })
 })
 

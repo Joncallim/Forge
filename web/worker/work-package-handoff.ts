@@ -68,7 +68,7 @@ import {
   type RepositoryExecutionContext,
   type ScopedCommandResult,
 } from './repository-evidence'
-import { defaultOnFeatureFlagEnabled } from './feature-flags'
+import { explicitOptInFeatureFlagEnabled } from './feature-flags'
 import { sanitizeWorkerMessage } from './redaction'
 import { recordTaskLogBestEffort } from './task-logs'
 import { packetCandidateGuard } from '../lib/mcps/packet-issuance-v2'
@@ -662,7 +662,7 @@ export function isWorkPackageHandoffEnabled(
 export function isWorkPackageExecutionEnabled(
   env: Record<string, string | undefined> = process.env,
 ): boolean {
-  return defaultOnFeatureFlagEnabled(env.FORGE_WORK_PACKAGE_EXECUTION)
+  return explicitOptInFeatureFlagEnabled(env.FORGE_WORK_PACKAGE_EXECUTION)
 }
 
 function executionLeaseHeartbeatSeconds(
@@ -2121,7 +2121,7 @@ export async function handoffApprovedWorkPackages(
     `Forge handed off work package "${nextPackage.title}" to ${nextPackage.assignedRole}.`,
     '',
     'Specialist model execution is disabled for this handoff slice.',
-    'Unset FORGE_WORK_PACKAGE_EXECUTION=0 or set it to 1/true to run specialist package execution after approval.',
+    'Set FORGE_WORK_PACKAGE_EXECUTION=1 or true to request specialist package execution after approval.',
   ].join('\n')
   const handoffArtifactMetadata = {
     hostRepositoryWrites: false,

@@ -4531,6 +4531,7 @@ DECLARE
   v_evidence public.work_package_local_run_evidence%ROWTYPE;
   v_marker jsonb;
   v_next_marker jsonb;
+  v_evidence_fingerprint text;
   v_action_id uuid;
   v_result text;
   v_status text;
@@ -4654,6 +4655,32 @@ BEGIN
     AND evidence.work_package_id = p_work_package_id
     AND evidence.state IN ('terminal','uncertain')
   FOR UPDATE;
+  -- The recovery marker is public, mutable projection state.  Rebuild the
+  -- evidence identity only after locking the canonical evidence row; never
+  -- authorize recovery from the marker's copied fingerprint.
+  IF v_evidence.terminal IS NULL
+     OR v_evidence.terminal->>'status' <> 'failed'
+     OR v_evidence.terminal->>'failureCode' NOT IN (
+       'local_execution_failed', 'local_invocation_uncertain',
+       'external_repository_change_requires_review', 'worker_stopped'
+     ) THEN
+    RAISE EXCEPTION 'local recovery requires complete non-success terminal evidence'
+      USING ERRCODE = '40001';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM public.filesystem_mcp_runtime_audits audit
+    WHERE audit.protocol_version = 2
+      AND audit.local_run_evidence_id = v_evidence.id
+  ) THEN
+    RAISE EXCEPTION 'packet-linked local evidence must use packet recovery'
+      USING ERRCODE = '40001';
+  END IF;
+  v_evidence_fingerprint := 'sha256:' || pg_catalog.encode(pg_catalog.sha256(
+    pg_catalog.convert_to(
+      'forge:local-run-evidence:v1:' || v_evidence.id::text || ':' || v_evidence.terminal::text,
+      'UTF8'
+    )
+  ), 'hex');
   SELECT package.* INTO STRICT v_package
   FROM public.work_packages package
   WHERE package.id = p_work_package_id AND package.status = 'blocked';
@@ -4663,7 +4690,10 @@ BEGIN
      OR v_package.metadata ? 'packet_integrity_hold'
      OR v_package.metadata ? 'local_effect_integrity_hold'
      OR v_marker->>'localRunEvidenceId' <> p_local_run_evidence_id::text
-     OR v_marker->>'evidenceFingerprint' <> p_expected_marker_fingerprint
+     OR v_marker->>'evidenceFingerprint' <> v_evidence_fingerprint
+     -- The supplied value is a public-marker CAS token only. It must match the
+     -- current projection but is never used as the authoritative evidence ID.
+     OR p_expected_marker_fingerprint <> v_evidence_fingerprint
      OR v_marker->>'disposition' <> p_action THEN
     RAISE EXCEPTION 'local recovery marker changed before action compare-and-set'
       USING ERRCODE = '40001';

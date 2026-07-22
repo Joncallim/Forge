@@ -1,5 +1,5 @@
 import { sanitizeWorkerMessage } from './redaction'
-import { defaultOnFeatureFlagState } from './feature-flags'
+import { defaultOnFeatureFlagState, explicitOptInFeatureFlagEnabled } from './feature-flags'
 import { hostRepositoryWritePolicyState } from './repository-edit-policy'
 
 const DEFAULT_CLAIM_TIMEOUT_SECONDS = 5
@@ -226,7 +226,10 @@ async function startWorkerOnce(
   }
 
   const run = async (): Promise<void> => {
-    const executionMode = defaultOnFeatureFlagState(process.env.FORGE_WORK_PACKAGE_EXECUTION)
+    const executionMode = {
+      ...defaultOnFeatureFlagState(process.env.FORGE_WORK_PACKAGE_EXECUTION),
+      enabled: explicitOptInFeatureFlagEnabled(process.env.FORGE_WORK_PACKAGE_EXECUTION),
+    }
     const hostWriteMode = hostRepositoryWritePolicyState()
     console.info('[worker] Started', {
       claimTimeoutSeconds,

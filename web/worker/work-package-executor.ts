@@ -66,6 +66,23 @@ const DEFAULT_GENERATION_MAX_OUTPUT_TOKENS = 8000
 const MAX_PROTECTED_PLAN_ENTRY_REFERENCES = 160
 export const MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS = 3
 
+/**
+ * Node's path checks cannot provide a stable filesystem confinement boundary:
+ * a parent directory can be swapped after validation and before open/write.
+ * Do not materialize model output until Forge has a real OS-enforced writer
+ * (for example an fd-relative, no-follow sandbox helper) to delegate to.
+ */
+export class ConfinedMaterializationUnavailableError extends Error {
+  constructor() {
+    super('Model output materialization is unavailable: this Forge runtime has no OS-enforced confined writer.')
+    this.name = 'ConfinedMaterializationUnavailableError'
+  }
+}
+
+function assertConfinedMaterializationAvailable(): void {
+  throw new ConfinedMaterializationUnavailableError()
+}
+
 const ALLOWED_COMMANDS = new Set([
   'npm test',
   'npm run build',
@@ -2013,6 +2030,11 @@ function packetFailureForExecutionStage(
 }
 
 export async function executeWorkPackage(context: WorkPackageExecutionContext): Promise<WorkPackageExecutionResult> {
+  // Fail before preparing a sandbox, launching ACP, or accepting model output.
+  // The in-process Node writer below is deliberately unreachable pending an
+  // OS-enforced materialization capability.
+  assertConfinedMaterializationAvailable()
+
   const hostProjectRoot = context.validatedProjectRoot
   const attemptNumber = context.attemptNumber ?? 1
   if (!Number.isInteger(attemptNumber) || attemptNumber < 1) {
