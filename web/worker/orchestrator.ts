@@ -179,6 +179,32 @@ export interface AnsweredQuestion {
   answer: string
 }
 
+function protectedAnsweredQuestions(input: PreviousArchitectPlanContext): AnsweredQuestion[] {
+  if (input.clarificationAnswers.length === 0) return []
+  const questions = new Map<string, string>()
+  for (const entry of input.planEntries ?? []) {
+    if (entry.entryKind !== 'clarification_question') continue
+    let content: unknown
+    try { content = JSON.parse(entry.content) } catch { throw new Error('Protected clarification question is malformed.') }
+    if (!content || typeof content !== 'object') throw new Error('Protected clarification question is malformed.')
+    const value = content as { schemaVersion?: unknown; questionId?: unknown; question?: unknown }
+    if (value.schemaVersion !== 1 || typeof value.questionId !== 'string' || typeof value.question !== 'string'
+      || entry.entryId !== `clarification_question:${value.questionId}` || questions.has(value.questionId)) {
+      throw new Error('Protected clarification question identity is invalid.')
+    }
+    questions.set(value.questionId, value.question)
+  }
+  const answers = new Set<string>()
+  return input.clarificationAnswers.map((answer) => {
+    if (answers.has(answer.questionId) || !questions.has(answer.questionId)
+      || answer.entryId !== `clarification_answer:${answer.answerId}`) {
+      throw new Error('Protected clarification answer identity is invalid.')
+    }
+    answers.add(answer.questionId)
+    return { question: questions.get(answer.questionId)!, answer: answer.content }
+  })
+}
+
 export function buildArchitectPrompt(
   task: TaskRow,
   project: ProjectRow,
@@ -856,6 +882,9 @@ async function runArchitect(
     previousPlan = previousPlanContext.planText
     previousProtectedEntries = previousPlanContext.planEntries
     previousProtectedComparableEntries = previousPlanContext.protectedComparableEntries
+    if (previousPlanContext.clarificationAnswers.length > 0) {
+      answeredQuestions = protectedAnsweredQuestions(previousPlanContext)
+    }
     const projectFilesystemDecision = await loadCurrentProjectFilesystemDecision(project.id)
     const mcpOverview = await getProjectMcpOverview(project, projectFilesystemDecision)
     let usage: { inputTokens: number | null; outputTokens: number | null } = {

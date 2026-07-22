@@ -49,7 +49,7 @@ function clarificationContent(entry: ProtectedHistoryEntry): Record<string, unkn
   if (!['clarification_question', 'clarification_answer'].includes(entry.entryKind)) return null
   try {
     const parsed = record(JSON.parse(entry.content))
-    return parsed?.schemaVersion === 1 && typeof parsed.question === 'string' ? parsed : null
+    return parsed?.schemaVersion === 1 && typeof parsed.questionId === 'string' && typeof parsed.question === 'string' ? parsed : null
   } catch {
     return null
   }
@@ -77,14 +77,17 @@ export function clarificationQuestionsFromHistory(
   for (const entry of entries) {
     if (entry.entryKind !== 'clarification_answer') continue
     const content = clarificationContent(entry)
-    if (!content || typeof content.answer !== 'string') continue
-    answers.set(content.question as string, content.answer)
+    if (!content || typeof content.answer !== 'string' || typeof content.questionId !== 'string') continue
+    if (answers.has(content.questionId)) throw new Error('Duplicate protected clarification answer.')
+    answers.set(content.questionId, content.answer)
   }
 
-  const currentOffset = Math.max(0, questions.length - current.length)
-  return questions.flatMap(({ entry, question, suggestions }, index) => {
-    const summary = index >= currentOffset ? current[index - currentOffset] : null
-    const answer = answers.get(question) ?? null
+  const summaries = new Map(current.map((summary) => [summary.id, summary]))
+  return questions.flatMap(({ entry, question, suggestions }) => {
+    const content = clarificationContent(entry)!
+    const questionId = content.questionId as string
+    const summary = summaries.get(questionId)
+    const answer = answers.get(questionId) ?? null
     if (!summary && answer === null) return []
     return [{
       id: summary?.id ?? entry.entryId,
