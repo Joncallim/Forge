@@ -2033,7 +2033,7 @@ export async function executeWorkPackage(context: WorkPackageExecutionContext): 
   // Fail before preparing a sandbox, launching ACP, or accepting model output.
   // The in-process Node writer below is deliberately unreachable pending an
   // OS-enforced materialization capability.
-  assertConfinedMaterializationAvailable()
+  throw new ConfinedMaterializationUnavailableError()
 
   const hostProjectRoot = context.validatedProjectRoot
   const attemptNumber = context.attemptNumber ?? 1
