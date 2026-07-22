@@ -48,6 +48,7 @@ import {
   architectPlanStorageConfiguration,
   bindArchitectReplanContext,
   recordArchitectPlanVersion,
+  resolveArchitectReplanEntry,
   resolveArchitectPlanEntry,
 } from '../lib/mcps/s4-protocol-store'
 import {
@@ -629,7 +630,8 @@ export function previousPlanForReplan(
 
 type PreviousArchitectPlanContext = {
   planText: string | null
-  protectedEntries: ArchitectPlanEntryInput[] | null
+  planEntries: ArchitectPlanEntryInput[] | null
+  clarificationAnswers: Array<Extract<Awaited<ReturnType<typeof resolveArchitectReplanEntry>>, { sourceKind: 'clarification_answer' }>>
   protectedComparableEntries: Array<Pick<ArchitectPlanEntryInput,
     'agent' | 'bindingFingerprint' | 'content' | 'entryId' | 'entryKind' | 'projectionEligible' | 'requirementKey'
   >> | null
@@ -659,7 +661,8 @@ export async function previousPlanContextForArchitectRun(input: {
   if (!protectedArtifact) {
     return {
       planText: previousPlanForReplan(input.artifact, input.checkpoint),
-      protectedEntries: null,
+      planEntries: null,
+      clarificationAnswers: [],
       protectedComparableEntries: null,
     }
   }
@@ -676,24 +679,21 @@ export async function previousPlanContextForArchitectRun(input: {
     agentRunId: input.agentRunId,
     priorPlanArtifactId: input.artifact.id,
   })
-  const resolved = await Promise.all(references.map((reference) => resolveArchitectPlanEntry({
-      digestKey: storage.digestKey,
-      expectedPurpose: 'architect_replan',
-      referenceId: reference.referenceId,
-    }).then((entry) => ({ ...entry, expectedEntryId: reference.entryId }))))
+  const resolved = await Promise.all(references.map((reference) => resolveArchitectReplanEntry({
+    digestKey: storage.digestKey, referenceId: reference.referenceId,
+  }).then((entry) => ({ ...entry, expectedEntryId: reference.entryId }))))
   if (resolved.some((entry) => entry.entryId !== entry.expectedEntryId)) {
     throw new Error('Protected Architect replan context did not match its bound entry set. Replan failed closed.')
   }
-  const planBody = resolved.find((entry) => entry.entryId === 'plan_body:000000')
+  const planEntries = resolved.filter((entry): entry is Extract<typeof entry, { sourceKind: 'architect_plan_entry' }> => entry.sourceKind === 'architect_plan_entry')
+  const planBody = planEntries.find((entry) => entry.entryId === 'plan_body:000000')
   const previousPlan = planBody?.content.trim() ?? ''
   if (!previousPlan) throw new Error('Protected Architect replan resolved an empty plan. Replan failed closed.')
   return {
     planText: previousPlan,
-    protectedEntries: resolved.map(({ expectedEntryId, ...entry }) => {
-      void expectedEntryId
-      return entry
-    }),
-    protectedComparableEntries: protectedComparableEntries(resolved),
+    planEntries,
+    clarificationAnswers: resolved.filter((entry): entry is Extract<typeof entry, { sourceKind: 'clarification_answer' }> => entry.sourceKind === 'clarification_answer').map(({ expectedEntryId, ...entry }) => entry),
+    protectedComparableEntries: protectedComparableEntries(planEntries),
   }
 }
 
@@ -854,7 +854,7 @@ async function runArchitect(
       taskId: task.id,
     })
     previousPlan = previousPlanContext.planText
-    previousProtectedEntries = previousPlanContext.protectedEntries
+    previousProtectedEntries = previousPlanContext.planEntries
     previousProtectedComparableEntries = previousPlanContext.protectedComparableEntries
     const projectFilesystemDecision = await loadCurrentProjectFilesystemDecision(project.id)
     const mcpOverview = await getProjectMcpOverview(project, projectFilesystemDecision)
