@@ -59,6 +59,9 @@ fi
 # Assertions and index recovery are read/DDL-only after that completed operation.
 bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh --prepare
 bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh --prepare
+# This creates (but never advances) the exact live operation. The shim resumes
+# it below after its now-empty materialization pass.
+bash scripts/ci/prove-migration-0027-root-reconciliation-negative.sh
 bash scripts/ci/reconcile-migration-0027-root-refs.sh
 bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh --assert
 bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh --recover

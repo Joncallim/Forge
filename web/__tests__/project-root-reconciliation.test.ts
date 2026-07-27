@@ -19,6 +19,7 @@ const rootAuthorityProjectFixture = readFileSync(fileURLToPath(new URL('../scrip
 const rootAuthorityPackageFixture = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-authority-package-fixture.sql', import.meta.url)), 'utf8')
 const rootAuthorityProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-authority-reconciliation.sh', import.meta.url)), 'utf8')
 const rootAuthorityAssertions = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-authority-reconciliation-assertions.sql', import.meta.url)), 'utf8')
+const negativeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-reconciliation-negative.sh', import.meta.url)), 'utf8')
 const cutoverScript = readFileSync(fileURLToPath(new URL('../scripts/ci/cutover-migration-0027-root-ref.sh', import.meta.url)), 'utf8')
 const webCi = readFileSync(fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)), 'utf8')
 
@@ -184,6 +185,19 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(rootAuthorityAssertions).toContain('root authority reconciliation mutated protected decision or pointer authority directly')
     expect(rootAuthorityAssertions).toContain('root authority task convergence did not recover running and failed tasks')
     expect(rootAuthorityAssertions).toContain('the single root reconciliation operation does not cover every prepared journal generation')
+  })
+
+  it('keeps the dedicated pre-reconciliation rollback proof bounded and resumable', () => {
+    expect(negativeProof).toContain('forge.begin_project_root_reconciliation_v1')
+    expect(negativeProof).toContain('forge.enter_project_root_reconciliation_generation_v1')
+    expect(negativeProof).toContain('SELECT 1/0')
+    expect(negativeProof).toContain('project-root operation identity cannot be hijacked')
+    expect(negativeProof).toContain('project-root authority lock has no active write context')
+    expect(negativeProof).toContain('migration-0027-root-reconciliation-negative-assertions.sql')
+    expect(negativeProof).not.toContain('reconcile-migration-0027-root-refs.sh')
+    expect(upgradeProof.indexOf('prove-migration-0027-root-reconciliation-negative.sh')).toBeLessThan(
+      upgradeProof.indexOf('reconcile-migration-0027-root-refs.sh'),
+    )
   })
 
   it('selects phase suppression only in the internal root-journal caller', () => {
