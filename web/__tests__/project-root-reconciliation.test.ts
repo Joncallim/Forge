@@ -7,6 +7,7 @@ import {
 } from '@/lib/mcps/project-root-reconciliation'
 
 const migration = readFileSync(fileURLToPath(new URL('../db/migrations/0027_epic_172_s4_packet_context.sql', import.meta.url)), 'utf8')
+const s3Migration = readFileSync(fileURLToPath(new URL('../db/migrations/0026_epic_172_s3_grant_lifecycle.sql', import.meta.url)), 'utf8')
 const schema = readFileSync(fileURLToPath(new URL('../db/schema.ts', import.meta.url)), 'utf8')
 const bootstrap = readFileSync(fileURLToPath(new URL('../scripts/bootstrap-epic-172-s4-roles.ts', import.meta.url)), 'utf8')
 const reconcileScript = readFileSync(fileURLToPath(new URL('../scripts/reconcile-project-root-expansion.ts', import.meta.url)), 'utf8')
@@ -16,6 +17,11 @@ const cutoverScript = readFileSync(fileURLToPath(new URL('../scripts/ci/cutover-
 const webCi = readFileSync(fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)), 'utf8')
 
 describe('project-root expansion reconciliation boundary', () => {
+  it('defines the pure reusable canonical filesystem grant-block validator', () => {
+    expect(s3Migration).toContain('CREATE FUNCTION forge_is_canonical_filesystem_grant_block_v2(p_block jsonb)')
+    expect(s3Migration).toContain('RETURNS boolean LANGUAGE sql IMMUTABLE PARALLEL SAFE')
+    expect(s3Migration).toContain("'project_grant_removed','project_grant_narrowed','project_root_repoint'")
+  })
   it('parses only the literal actor/watermark/apply command and keeps dry-run actionless', () => {
     const actor = '123e4567-e89b-42d3-a456-426614174000'
     expect(parseProjectRootReconciliationCommand(['--through', '0', '--actor', actor])).toEqual({

@@ -411,6 +411,19 @@ BEFORE UPDATE OR DELETE ON "project_filesystem_grant_decisions"
 FOR EACH ROW EXECUTE FUNCTION "forge_reject_project_filesystem_decision_mutation"();
 
 -- SQL mirrors the closed TypeScript S3 hold-state union. Older marker-shaped
+-- Pure reusable validator; the table constraint below preserves the legacy
+-- status/absence semantics while this predicate owns the marker grammar.
+CREATE FUNCTION forge_is_canonical_filesystem_grant_block_v2(p_block jsonb)
+RETURNS boolean LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT (jsonb_typeof(p_block)='object'
+    AND p_block ?& ARRAY['schemaVersion','kind','source','taskDisposition','autoRetryable','terminalFailure','requirementKeys','requestedCapabilities','recoveryAction','blockFingerprint','blockedAt','holdKind','grantPhase','grantConsumed','grantDecisionRevision','revocationReason']
+    AND p_block - ARRAY['schemaVersion','kind','source','taskDisposition','autoRetryable','terminalFailure','requirementKeys','requestedCapabilities','recoveryAction','blockFingerprint','blockedAt','holdKind','grantPhase','grantConsumed','grantDecisionRevision','revocationReason']='{}'::jsonb
+    AND p_block->'schemaVersion'='2'::jsonb AND p_block->>'kind'='filesystem_grant' AND p_block->>'source'='filesystem-grant-approval' AND p_block->>'taskDisposition'='operator_hold' AND p_block->'autoRetryable'='false'::jsonb AND p_block->'terminalFailure'='false'::jsonb
+    AND forge_is_canonical_bounded_string_set(p_block->'requirementKeys',256,240) AND forge_is_canonical_bounded_string_set(p_block->'requestedCapabilities',3,240) AND forge_is_canonical_filesystem_capability_set(p_block->'requestedCapabilities')
+    AND p_block->>'recoveryAction'='approve_project_filesystem_context' AND (p_block->>'blockFingerprint') ~ '^sha256:[0-9a-f]{64}$' AND forge_is_canonical_utc_timestamp(p_block->>'blockedAt')
+    AND ((p_block->>'holdKind'='approval_required' AND p_block->>'grantPhase' IN ('none','proposed','not_issued') AND p_block->'grantConsumed'='false'::jsonb AND p_block->'grantDecisionRevision'='null'::jsonb AND p_block->'revocationReason'='null'::jsonb) OR (p_block->>'holdKind'='denied_required' AND p_block->>'grantPhase'='denied' AND p_block->'grantConsumed'='false'::jsonb AND (p_block->'grantDecisionRevision'='null'::jsonb OR (p_block->>'grantDecisionRevision') ~ '^[1-9][0-9]*$') AND p_block->'revocationReason'='null'::jsonb) OR (p_block->>'holdKind'='revoked_required' AND p_block->>'grantPhase'='revoked' AND p_block->'grantConsumed'='false'::jsonb AND (p_block->>'grantDecisionRevision') ~ '^[1-9][0-9]*$' AND p_block->>'revocationReason' IN ('project_grant_removed','project_grant_narrowed','project_root_repoint')) OR (p_block->>'holdKind'='consumed_once' AND p_block->>'grantPhase'='approved' AND p_block->'grantConsumed'='true'::jsonb AND (p_block->>'grantDecisionRevision') ~ '^[1-9][0-9]*$' AND p_block->'revocationReason'='null'::jsonb))
+  ) IS TRUE
+$$;
 -- JSON remains retained as data but is not S3 recovery authority; every
 -- version-2 writer is constrained to exact S3 keys, bounds, and blocked status.
 ALTER TABLE "work_packages"
