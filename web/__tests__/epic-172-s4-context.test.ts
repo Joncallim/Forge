@@ -293,7 +293,7 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
   it('rejects non-canonical protected clarification question text before auditing it', () => {
     const historyReader = s4Migration.match(
       /CREATE OR REPLACE FUNCTION forge\.read_architect_plan_history_v1\([\s\S]*?\n\$\$;/,
-    )?.[0]
+    )?.[0] ?? ''
 
     expect(historyReader).toBeDefined()
     expect(historyReader).toContain("jsonb_array_length(question.content::jsonb->'suggestions') > 4")
@@ -303,6 +303,11 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(historyReader).toContain("GROUP BY normalized_suggestions.normalized")
     expect(historyReader).toContain("question.content::jsonb->>'question' IS DISTINCT FROM pg_catalog.btrim(question.content::jsonb->>'question')")
     expect(historyReader).toContain('CASE prevents jsonb_array_elements from evaluating malformed non-array JSON')
+    expect(historyReader).toContain("AND projection.status = 'open'")
+    expect(historyReader).toContain("OR projection.status IS DISTINCT FROM 'answered'")
+    const answerLinkedValidation = historyReader.slice(historyReader.indexOf('FROM public.architect_clarification_answers answer'))
+    expect(answerLinkedValidation).toContain("jsonb_array_length(question.content::jsonb->'suggestions') > 4")
+    expect(answerLinkedValidation).toContain("GROUP BY normalized_suggestions.normalized")
   })
 
   it('exposes only atomic S4 lifecycle entry points to the packet issuer', () => {
