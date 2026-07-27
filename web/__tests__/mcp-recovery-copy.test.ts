@@ -28,7 +28,7 @@ const fingerprint = `sha256:${'a'.repeat(64)}`
 // has to seal itself the same way a real writer does. Overrides are applied
 // before sealing so each case gets a genuinely valid marker.
 function packetMarker(overrides: Partial<PacketIssuanceRecoveryMarkerV2> = {}): PacketIssuanceRecoveryMarkerV2 {
-  const { markerFingerprint: _ignored, ...sealed } = {
+  const draft: PacketIssuanceRecoveryMarkerV2 = {
     schemaVersion: 2,
     kind: 'packet_issuance',
     priorAgentRunId: ids.run,
@@ -46,10 +46,9 @@ function packetMarker(overrides: Partial<PacketIssuanceRecoveryMarkerV2> = {}): 
     autoRetryable: false,
     ...overrides,
   } as PacketIssuanceRecoveryMarkerV2
-  return {
-    ...sealed,
-    markerFingerprint: packetRecoveryMarkerFingerprint(sealed),
-  } as PacketIssuanceRecoveryMarkerV2
+  const sealed: Omit<PacketIssuanceRecoveryMarkerV2, 'markerFingerprint'> = { ...draft }
+  delete (sealed as Partial<PacketIssuanceRecoveryMarkerV2>).markerFingerprint
+  return { ...sealed, markerFingerprint: packetRecoveryMarkerFingerprint(sealed) }
 }
 
 function packetRecovery(
