@@ -214,4 +214,32 @@ describe('task log writer', () => {
 
     expect(violations).toEqual([])
   })
+
+  it('keeps compatibility readers on the closed projection and task diagnostics free of caught-error payloads', () => {
+    const taskApiRoot = path.resolve(process.cwd(), 'app/api/tasks')
+    const compatibilityReader = fs.readFileSync(path.join(taskApiRoot, '[id]', 'route.ts'), 'utf8')
+    const streamReader = fs.readFileSync(path.join(taskApiRoot, '[id]', 'runs', 'route.ts'), 'utf8')
+    const taskApiFiles: string[] = []
+    const visitDirectory = (directory: string) => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const target = path.join(directory, entry.name)
+        if (entry.isDirectory()) visitDirectory(target)
+        else if (entry.isFile() && target.endsWith('.ts')) taskApiFiles.push(target)
+      }
+    }
+    visitDirectory(taskApiRoot)
+
+    expect(compatibilityReader).toContain('projectTaskCompatibilityTask(task)')
+    expect(compatibilityReader).toContain('projectTaskCompatibilityRun')
+    expect(compatibilityReader).toContain('projectTaskCompatibilityAttempt')
+    expect(compatibilityReader).toContain('projectTaskCompatibilityArtifact')
+    expect(streamReader).toContain('projectTaskCompatibilityArtifact')
+    expect(streamReader).toContain('taskCompatibilityError(run.errorMessage)')
+    expect(taskApiFiles.flatMap((file) => {
+      const source = fs.readFileSync(file, 'utf8')
+      return /console\.(?:error|warn)\([^\n]*,\s*(?:err|error)\)/.test(source)
+        ? [path.relative(process.cwd(), file)]
+        : []
+    })).toEqual([])
+  })
 })

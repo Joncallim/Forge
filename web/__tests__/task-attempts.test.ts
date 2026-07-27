@@ -73,7 +73,7 @@ describe('task attempt logs', () => {
 
     expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
       eventType: 'queue.attempt.failed',
-      message: 'Forge Answers Worker finished answers attempt 2 as failed: replan failed',
+      message: 'Forge Answers Worker finished answers attempt 2 as failed: legacy_task_log_unavailable',
       metadata: expect.objectContaining({
         workerName: 'Forge Answers Worker',
         workerRole: expect.stringContaining('follow-up questions'),

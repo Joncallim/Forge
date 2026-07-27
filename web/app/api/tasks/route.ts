@@ -13,6 +13,7 @@ import {
   getAccessibleProject,
 } from '@/lib/project-access'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
+import { projectTaskCompatibilityTask } from '@/lib/mcps/leakage-drain'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -94,9 +95,16 @@ export async function GET(request: NextRequest) {
 
     const total = Number(totalResult[0]?.total ?? 0)
 
-    return NextResponse.json({ tasks: rows, total, page })
-  } catch (err) {
-    console.error('[GET /api/tasks] Unexpected error', err)
+    return NextResponse.json({
+      tasks: rows.map((row) => ({
+        ...projectTaskCompatibilityTask(row),
+        projectName: row.projectName,
+      })),
+      total,
+      page,
+    })
+  } catch {
+    console.error('[GET /api/tasks] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
@@ -173,8 +181,8 @@ export async function POST(request: NextRequest) {
 
     console.info('[POST /api/tasks] Created task', { id: task.id, projectId: task.projectId })
     return NextResponse.json({ task }, { status: 201 })
-  } catch (err) {
-    console.error('[POST /api/tasks] Unexpected error', err)
+  } catch {
+    console.error('[POST /api/tasks] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

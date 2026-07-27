@@ -670,8 +670,8 @@ export async function POST(
 
     try {
       await redis.lpush('forge:approvals', JSON.stringify({ taskId, action: 'approve' }))
-    } catch (err) {
-      console.error('[POST /api/tasks/:id/approve] Failed to enqueue approval worker job', err)
+    } catch {
+      console.error('[POST /api/tasks/:id/approve] Failed to enqueue approval worker job')
       return NextResponse.json(
         {
           error: 'Approval worker queue result could not be confirmed; approval was saved and can be retried from the task.',
@@ -693,14 +693,14 @@ export async function POST(
           updatedAt: approvedAt.toISOString(),
         })
       }
-    } catch (err) {
-      console.error('[POST /api/tasks/:id/approve] Failed to publish approval progress event', err)
+    } catch {
+      console.error('[POST /api/tasks/:id/approve] Failed to publish approval progress event')
     }
 
     console.info('[POST /api/tasks/:id/approve] Approved task', { id: taskId })
     return NextResponse.json({ task })
-  } catch (err) {
-    console.error('[POST /api/tasks/:id/approve] Unexpected error', err)
+  } catch {
+    console.error('[POST /api/tasks/:id/approve] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

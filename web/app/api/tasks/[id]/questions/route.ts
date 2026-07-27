@@ -63,8 +63,8 @@ export async function GET(
       .orderBy(asc(taskQuestions.createdAt))
 
     return NextResponse.json({ questions: questions.map(taskQuestionSummary) })
-  } catch (err) {
-    console.error('[GET /api/tasks/:id/questions] Unexpected error', err)
+  } catch {
+    console.error('[GET /api/tasks/:id/questions] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
@@ -175,8 +175,8 @@ export async function POST(
       questions: updatedQuestions.map(taskQuestionSummary),
       allAnswered,
     })
-  } catch (err) {
-    console.error('[POST /api/tasks/:id/questions] Unexpected error', err)
+  } catch {
+    console.error('[POST /api/tasks/:id/questions] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

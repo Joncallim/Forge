@@ -103,8 +103,8 @@ export async function POST(
 
     console.info('[POST /api/tasks/:id/reject] Rejected task', { id: taskId, reason })
     return NextResponse.json({ task })
-  } catch (err) {
-    console.error('[POST /api/tasks/:id/reject] Unexpected error', err)
+  } catch {
+    console.error('[POST /api/tasks/:id/reject] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

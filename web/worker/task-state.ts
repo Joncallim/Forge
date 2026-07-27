@@ -2,8 +2,8 @@ import { db } from '../db'
 import { tasks } from '../db/schema'
 import { and, eq, notInArray } from 'drizzle-orm'
 import { publishTaskEvent } from './events'
-import { sanitizeWorkerMessage } from './redaction'
 import { recordTaskLogBestEffort, type TaskLogLevel } from './task-logs'
+import { taskCompatibilityError } from '@/lib/mcps/leakage-drain'
 
 export type TaskStatus =
   | 'pending'
@@ -36,7 +36,7 @@ export async function updateTaskStatus(
   errorMessage: string | null = null,
 ): Promise<boolean> {
   const now = new Date()
-  const sanitizedErrorMessage = errorMessage === null ? null : sanitizeWorkerMessage(errorMessage)
+  const sanitizedErrorMessage = taskCompatibilityError(errorMessage)
 
   const [updated] = await db
     .update(tasks)
@@ -79,7 +79,7 @@ export async function updateTaskStatusIfCurrent(
   errorMessage: string | null = null,
 ): Promise<boolean> {
   const now = new Date()
-  const sanitizedErrorMessage = errorMessage === null ? null : sanitizeWorkerMessage(errorMessage)
+  const sanitizedErrorMessage = taskCompatibilityError(errorMessage)
 
   const [updated] = await db
     .update(tasks)

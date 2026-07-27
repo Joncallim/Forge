@@ -2526,7 +2526,7 @@ describe('GET /api/tasks/:id — task details', () => {
       pmProviderConfigId: null,
       githubBranch: null,
       githubPrUrl: null,
-      errorMessage: null,
+      errorMessage: 'RAW-TASK-ERROR-SENTINEL /private/secret',
       createdAt: new Date(),
       updatedAt: new Date(),
       completedAt: null,
@@ -2580,7 +2580,7 @@ describe('GET /api/tasks/:id — task details', () => {
       costUsd: null,
       startedAt: new Date(),
       completedAt: new Date(),
-      errorMessage: null,
+      errorMessage: 'RAW-RUN-ERROR-SENTINEL prompt text',
       createdAt: new Date(),
     }
     const qaPackageRun = {
@@ -2712,9 +2712,15 @@ describe('GET /api/tasks/:id — task details', () => {
     expect(body.artifacts.find((artifact: { id: string }) => artifact.id === 'artifact-task').metadata).toEqual({
       historyAvailable: true,
     })
+    expect(body.artifacts.find((artifact: { id: string }) => artifact.id === 'artifact-task').content).toBe(
+      'Protected Architect history is available through the protected history reader.',
+    )
+    expect(body.task.errorMessage).toBe('legacy_task_log_unavailable')
+    expect(body.runs.find((run: { id: string }) => run.id === 'run-1').errorMessage).toBe('legacy_task_log_unavailable')
     expect(JSON.stringify(body.artifacts)).not.toContain('planVersion')
     expect(JSON.stringify(body.artifacts)).not.toContain('entryCount')
     expect(JSON.stringify(body.artifacts)).not.toContain('RAW-')
+    expect(JSON.stringify(body)).not.toContain('/private/secret')
     expect(body.workPackages.flatMap(
       (pkg: { artifacts: Array<{ id: string }> }) => pkg.artifacts.map((artifact) => artifact.id),
     )).toEqual(['artifact-1', 'artifact-2'])

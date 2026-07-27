@@ -136,7 +136,7 @@ describe('processApproval handoff', () => {
 
     expect(runningUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
     expect(restoreUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      errorMessage: 'Retrying handoff after error: handoff insert failed',
+      errorMessage: 'legacy_task_log_unavailable',
       status: 'approved',
     }))
     expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith('task-1', { claimEnabled: true, finalAttempt: false })
@@ -160,7 +160,7 @@ describe('processApproval handoff', () => {
 
     expect(runningUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
     expect(failUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      errorMessage: 'handoff insert failed',
+      errorMessage: 'legacy_task_log_unavailable',
       status: 'failed',
     }))
     expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith('task-1', { claimEnabled: true, finalAttempt: true })
@@ -189,7 +189,7 @@ describe('processApproval handoff', () => {
 
     expect(runningUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
     expect(restoreUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      errorMessage: 'MCP/capability broker blocked "Backend package": Connect GitHub.',
+      errorMessage: 'legacy_task_log_unavailable',
       status: 'approved',
     }))
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
@@ -224,7 +224,7 @@ describe('processApproval handoff', () => {
 
     expect(runningUpdate.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
     expect(failUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      errorMessage: 'Architect-assigned "security" work packages are reserved for review gates and cannot execute.',
+      errorMessage: 'legacy_task_log_unavailable',
       status: 'failed',
     }))
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
@@ -344,7 +344,7 @@ describe('processApproval handoff', () => {
     await processApproval('task-1')
 
     expect(restoreUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      errorMessage: 'MCP/capability broker blocked this work package.',
+      errorMessage: 'legacy_task_log_unavailable',
       status: 'approved',
     }))
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:handoff', expect.objectContaining({
@@ -363,7 +363,7 @@ describe('processApproval handoff', () => {
     await expect(processApproval('task-1', { finalAttempt: true })).rejects.toThrow('handoff insert failed')
 
     expect(failUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      errorMessage: 'handoff insert failed',
+      errorMessage: 'legacy_task_log_unavailable',
       status: 'failed',
     }))
     expect(mocks.progressWorkforce).toHaveBeenCalledWith('task-1', { claimEnabled: true, finalAttempt: true })
@@ -390,7 +390,7 @@ describe('processApproval handoff', () => {
     await processApproval('task-1')
 
     expect(failUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      errorMessage: 'Architect-assigned "security" work packages are reserved for review gates and cannot execute.',
+      errorMessage: 'legacy_task_log_unavailable',
       status: 'failed',
     }))
     expect(mocks.handoffApprovedWorkPackages).toHaveBeenCalledWith('task-1', { claimEnabled: false })

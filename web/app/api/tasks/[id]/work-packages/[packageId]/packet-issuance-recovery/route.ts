@@ -73,9 +73,9 @@ export async function POST(
         const retry = await enqueueBlockedHandoffRetry(taskId, { source: 'packet-issuance-recovery' })
         continuationStatus = retry.status
       }
-    } catch (error) {
+    } catch {
       continuationStatus = 'pending'
-      console.error('[POST packet-issuance-recovery] Recovery committed but continuation is pending', error)
+      console.error('[POST packet-issuance-recovery] Recovery committed but continuation is pending')
     }
 
     return NextResponse.json({ result: { ...result, continuationStatus } }, {
@@ -88,7 +88,7 @@ export async function POST(
         { status: error.code === 'configuration' ? 503 : 409 },
       )
     }
-    console.error('[POST packet-issuance-recovery] Unexpected error', error)
+    console.error('[POST packet-issuance-recovery] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

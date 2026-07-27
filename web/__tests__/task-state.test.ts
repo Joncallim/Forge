@@ -37,7 +37,7 @@ describe('task status updates', () => {
     await expect(updateTaskStatus('task-1', 'failed', 'model failed')).resolves.toBe(true)
 
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:status', expect.objectContaining({
-      errorMessage: 'model failed',
+      errorMessage: 'legacy_task_log_unavailable',
       status: 'failed',
     }))
   })
