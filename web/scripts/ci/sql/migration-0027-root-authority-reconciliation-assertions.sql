@@ -1,4 +1,13 @@
 \set ON_ERROR_STOP on
+BEGIN;
+CREATE TEMP TABLE root_authority_assertion_inputs (
+  actor_id uuid NOT NULL,
+  operation_id uuid NOT NULL,
+  authority_generation bigint NOT NULL CHECK (authority_generation > 0),
+  through_generation bigint NOT NULL CHECK (through_generation > 0)
+) ON COMMIT DROP;
+INSERT INTO root_authority_assertion_inputs (actor_id, operation_id, authority_generation, through_generation)
+VALUES (:'actor_id'::uuid, :'operation_id'::uuid, :'authority_generation'::bigint, :'through_generation'::bigint);
 
 DO $assertions$
 DECLARE
@@ -8,11 +17,16 @@ DECLARE
   v_add uuid := '27000000-0000-4000-8000-000000000711'::uuid;
   v_refresh uuid := '27000000-0000-4000-8000-000000000712'::uuid;
   v_recover uuid := '27000000-0000-4000-8000-000000000721'::uuid;
-  v_actor uuid := :'actor_id'::uuid;
-  v_operation_id uuid := :'operation_id'::uuid;
-  v_authority_generation bigint := :'authority_generation'::bigint;
-  v_through_generation bigint := :'through_generation'::bigint;
+  v_actor uuid;
+  v_operation_id uuid;
+  v_authority_generation bigint;
+  v_through_generation bigint;
+  v_package_actual jsonb;
+  v_task_actual jsonb;
 BEGIN
+  SELECT actor_id, operation_id, authority_generation, through_generation
+    INTO STRICT v_actor, v_operation_id, v_authority_generation, v_through_generation
+    FROM root_authority_assertion_inputs;
   IF NOT EXISTS (
     SELECT 1
     FROM public.project_root_change_journal journal_row
@@ -77,7 +91,20 @@ BEGIN
           '{"fixturePeer":{"case":"addition","retain":true},"mcpGrantPhases":{"filesystem":{"phase":"preexisting-add","revision":"1"}}}'::jsonb
         OR package_row.metadata->'mcpGrantBlock'->'requestedCapabilities' <> '["filesystem.project.read","filesystem.project.search"]'::jsonb
       )
-  ) OR EXISTS (
+  ) THEN
+    SELECT jsonb_build_object(
+      'blockedReason', package_row.blocked_reason,
+      'marker', package_row.metadata->'mcpGrantBlock',
+      'peer', package_row.metadata->'fixturePeer',
+      'phases', package_row.metadata->'mcpGrantPhases',
+      'requirements', package_row.mcp_requirements,
+      'status', package_row.status
+    ) INTO STRICT v_package_actual
+    FROM public.work_packages package_row WHERE package_row.id = v_add;
+    RAISE EXCEPTION 'root authority addition package convergence is not canonical: %', v_package_actual;
+  END IF;
+
+  IF EXISTS (
     SELECT 1 FROM public.work_packages package_row
     WHERE package_row.id = v_refresh
       AND (
@@ -88,7 +115,20 @@ BEGIN
           '{"fixturePeer":{"case":"replacement","retain":true},"mcpGrantPhases":{"filesystem":{"phase":"preexisting-replace","revision":"1"}}}'::jsonb
         OR package_row.metadata->'mcpGrantBlock'->'requestedCapabilities' <> '["filesystem.project.read","filesystem.project.search"]'::jsonb
       )
-  ) OR EXISTS (
+  ) THEN
+    SELECT jsonb_build_object(
+      'blockedReason', package_row.blocked_reason,
+      'marker', package_row.metadata->'mcpGrantBlock',
+      'peer', package_row.metadata->'fixturePeer',
+      'phases', package_row.metadata->'mcpGrantPhases',
+      'requirements', package_row.mcp_requirements,
+      'status', package_row.status
+    ) INTO STRICT v_package_actual
+    FROM public.work_packages package_row WHERE package_row.id = v_refresh;
+    RAISE EXCEPTION 'root authority refresh package convergence is not canonical: %', v_package_actual;
+  END IF;
+
+  IF EXISTS (
     SELECT 1 FROM public.work_packages package_row
     WHERE package_row.id = v_recover
       AND (
@@ -99,7 +139,16 @@ BEGIN
           '{"fixturePeer":{"case":"removal","retain":true},"mcpGrantPhases":{"filesystem":{"phase":"preexisting-remove","revision":"1"}}}'::jsonb
       )
   ) THEN
-    RAISE EXCEPTION 'root authority package marker, phase, or peer metadata convergence is not canonical';
+    SELECT jsonb_build_object(
+      'blockedReason', package_row.blocked_reason,
+      'marker', package_row.metadata->'mcpGrantBlock',
+      'peer', package_row.metadata->'fixturePeer',
+      'phases', package_row.metadata->'mcpGrantPhases',
+      'requirements', package_row.mcp_requirements,
+      'status', package_row.status
+    ) INTO STRICT v_package_actual
+    FROM public.work_packages package_row WHERE package_row.id = v_recover;
+    RAISE EXCEPTION 'root authority recovery package convergence is not canonical: %', v_package_actual;
   END IF;
 
   IF EXISTS (
@@ -107,7 +156,14 @@ BEGIN
     WHERE (task_row.id = v_task_running OR task_row.id = v_task_failed)
       AND (task_row.status <> 'approved' OR task_row.error_message IS NOT NULL)
   ) THEN
-    RAISE EXCEPTION 'root authority task convergence did not recover running and failed tasks';
+    SELECT jsonb_agg(jsonb_build_object(
+      'errorMessage', task_row.error_message,
+      'id', task_row.id,
+      'status', task_row.status
+    ) ORDER BY task_row.id) INTO STRICT v_task_actual
+    FROM public.tasks task_row
+    WHERE task_row.id = v_task_running OR task_row.id = v_task_failed;
+    RAISE EXCEPTION 'root authority task convergence did not recover running and failed tasks: %', v_task_actual;
   END IF;
 
   IF (SELECT count(*) FROM public.work_package_local_projection_heads head
@@ -153,3 +209,4 @@ BEGIN
   END IF;
 END;
 $assertions$;
+COMMIT;
