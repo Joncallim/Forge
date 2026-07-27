@@ -11,11 +11,32 @@ import {
 import { architectReplanReferenceForEntry } from '@/lib/mcps/architect-plan-entries'
 import { computeCredentialDigest } from '@/lib/session-credential-digest'
 import { appendArchitectClarificationAnswer, readArchitectPlanHistory } from '@/lib/mcps/history-reader'
+import { hashPassword } from '@/lib/password'
 import { closeDb } from '@/db'
 
-const { mockRedisDel, mockRedisSet } = vi.hoisted(() => ({ mockRedisDel: vi.fn(), mockRedisSet: vi.fn() }))
+const {
+  mockRedisDel,
+  mockRedisEval,
+  mockRedisExpire,
+  mockRedisIncr,
+  mockRedisSet,
+} = vi.hoisted(() => ({
+  mockRedisDel: vi.fn(),
+  mockRedisEval: vi.fn(),
+  mockRedisExpire: vi.fn(),
+  mockRedisIncr: vi.fn(),
+  mockRedisSet: vi.fn(),
+}))
 
-vi.mock('@/lib/redis', () => ({ redis: { del: mockRedisDel, set: mockRedisSet } }))
+vi.mock('@/lib/redis', () => ({
+  redis: {
+    del: mockRedisDel,
+    eval: mockRedisEval,
+    expire: mockRedisExpire,
+    incr: mockRedisIncr,
+    set: mockRedisSet,
+  },
+}))
 
 const adminUrl = process.env.FORGE_S4_POSTGRES_TEST_DATABASE_URL?.trim()
 const issuerUrl = process.env.FORGE_PACKET_ISSUER_DATABASE_URL?.trim()
@@ -835,6 +856,199 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       referenceId: answerReferenceId,
     })).rejects.toMatchObject({ code: 'invalid_evidence' })
     await runStatefulHistoryProof()
+  })
+
+  it('serves protected Architect history through the real password session route with PostgreSQL as authority', async () => {
+    const ownerPassword = 'route-history-password'
+    const routeProject = randomUUID()
+    const routeTask = randomUUID()
+    const routeRun = randomUUID()
+    const otherUser = randomUUID()
+    const otherProject = randomUUID()
+    const otherTask = randomUUID()
+    const otherRun = randomUUID()
+    const digestKey = randomBytes(32)
+
+    // Redis is unavailable and contains forged-looking state. The route must
+    // still use only the locked PostgreSQL session decision.
+    mockRedisDel.mockResolvedValue(0)
+    mockRedisEval.mockResolvedValue(['{"userId":"forged"}', Date.now() + 60_000, 0, 0])
+    mockRedisExpire.mockResolvedValue(1)
+    mockRedisIncr.mockResolvedValue(1)
+    mockRedisSet.mockRejectedValue(new Error('Redis unavailable for route proof'))
+
+    const [firstUser] = await admin<{ id: string }[]>`select id::text as id from users limit 1`
+    expect(firstUser?.id).toBeTruthy()
+    await admin`update users set password_hash = ${await hashPassword(ownerPassword)} where id = ${firstUser!.id}::uuid`
+    await admin.begin(async (tx) => {
+      await tx`insert into projects (id, name, submitted_by, grant_decision_revision, root_binding_revision)
+        values (${routeProject}::uuid, 'Route history project', ${firstUser!.id}::uuid, 1, 1)`
+      await tx`insert into tasks (id, project_id, submitted_by, title, prompt, status)
+        values (${routeTask}::uuid, ${routeProject}::uuid, ${firstUser!.id}::uuid,
+          'Route history task', 'protected route fixture', 'running')`
+      await tx`insert into agent_runs (id, task_id, agent_type, model_id_used, status)
+        values (${routeRun}::uuid, ${routeTask}::uuid, 'architect', 'test', 'completed')`
+      await tx`insert into users (id, display_name) values (${otherUser}::uuid, 'Route history other user')`
+      await tx`insert into projects (id, name, submitted_by, grant_decision_revision, root_binding_revision)
+        values (${otherProject}::uuid, 'Route history other project', ${otherUser}::uuid, 1, 1)`
+      await tx`insert into tasks (id, project_id, submitted_by, title, prompt, status)
+        values (${otherTask}::uuid, ${otherProject}::uuid, ${otherUser}::uuid,
+          'Route history other task', 'protected other-user fixture', 'running')`
+      await tx`insert into agent_runs (id, task_id, agent_type, model_id_used, status)
+        values (${otherRun}::uuid, ${otherTask}::uuid, 'architect', 'test', 'completed')`
+    })
+    await recordArchitectPlanVersion({
+      agentRunId: routeRun,
+      digestKey,
+      digestKeyId: 'route-history-key',
+      planVersion: '1',
+      taskId: routeTask,
+      entries: [{
+        agent: null, bindingFingerprint: null, content: 'Route-visible protected plan.',
+        entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null,
+      }, {
+        agent: null, bindingFingerprint: null,
+        content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }),
+        entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy',
+      }],
+    })
+    await recordArchitectPlanVersion({
+      agentRunId: otherRun,
+      digestKey,
+      digestKeyId: 'route-history-key',
+      planVersion: '1',
+      taskId: otherTask,
+      entries: [{
+        agent: null, bindingFingerprint: null, content: 'Other-user protected plan.',
+        entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null,
+      }, {
+        agent: null, bindingFingerprint: null,
+        content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }),
+        entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy',
+      }],
+    })
+
+    const { POST: passwordLogin } = await import('@/app/api/auth/login/password/route')
+    const { GET: protectedHistory } = await import('@/app/api/tasks/[id]/architect-plan-history/[planVersion]/route')
+    const { createSession } = await import('@/lib/session')
+    const passwordSession = async (): Promise<string> => {
+      const response = await passwordLogin(new Request('http://localhost/api/auth/login/password', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: ownerPassword }),
+      }) as never)
+      expect(response.status).toBe(200)
+      const match = response.headers.get('set-cookie')?.match(/(?:^|,\s*)forge_session=([^;]+)/)
+      expect(match?.[1]).toMatch(/^[0-9a-f-]{36}$/)
+      return match![1]
+    }
+    const routeRead = async (credential: string, taskId: string, planVersion: string) => protectedHistory(
+      new Request(`http://localhost/api/tasks/${taskId}/architect-plan-history/${planVersion}`, {
+        headers: { cookie: `forge_session=${credential}` },
+      }) as never,
+      { params: Promise.resolve({ id: taskId, planVersion }) },
+    )
+    const auditCount = async (taskId: string) => {
+      const [row] = await admin<{ count: number }[]>`
+        select count(*)::integer as count from architect_plan_history_reads where task_id = ${taskId}::uuid
+      `
+      return row.count
+    }
+
+    const liveCredential = await passwordSession()
+    const successful = await routeRead(liveCredential, routeTask, '1')
+    expect(successful.status).toBe(200)
+    const successfulBody = await successful.json() as { taskId: string; planVersion: string; entries: Array<{ entryId: string; content: string }> }
+    expect(successfulBody).toEqual(expect.objectContaining({ taskId: routeTask, planVersion: '1' }))
+    expect(successfulBody.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ entryId: 'plan_body:000000', content: 'Route-visible protected plan.' }),
+    ]))
+    const responseText = JSON.stringify(successfulBody)
+    expect(responseText).not.toContain(liveCredential)
+    expect(responseText).not.toMatch(/credential|storage|session(?:_|-)?id/i)
+    const [successAudit] = await admin<{ count: number; digest: string; returned: number }[]>`
+      select count(*)::integer as count, max(entry_set_digest) as digest,
+        max(returned_entry_count)::integer as returned
+      from architect_plan_history_reads where task_id = ${routeTask}::uuid
+    `
+    expect(successAudit).toEqual({
+      count: 1,
+      digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+      returned: successfulBody.entries.length,
+    })
+    const [auditTextColumns] = await admin<{ count: number }[]>`
+      select count(*)::integer as count
+      from information_schema.columns
+      where table_schema = 'public' and table_name = 'architect_plan_history_reads'
+        and column_name in ('content', 'credential', 'credential_digest', 'storage_locator')
+    `
+    expect(auditTextColumns).toEqual({ count: 0 })
+
+    const assertSessionDenied = async (credential: string) => {
+      const before = await auditCount(routeTask)
+      const response = await routeRead(credential, routeTask, '1')
+      expect(response.status).toBe(401)
+      await expect(response.json()).resolves.toEqual({ error: 'Unauthorized' })
+      expect(await auditCount(routeTask)).toBe(before)
+    }
+    const revokedCredential = await passwordSession()
+    await admin`update sessions set revoked_at = clock_timestamp()
+      where credential_digest_v1 = ${computeCredentialDigest(revokedCredential).digest}::bytea`
+    await assertSessionDenied(revokedCredential)
+
+    const expiryBoundaryCredential = await passwordSession()
+    await admin`update sessions set expires_at = clock_timestamp()
+      where credential_digest_v1 = ${computeCredentialDigest(expiryBoundaryCredential).digest}::bytea`
+    await assertSessionDenied(expiryBoundaryCredential)
+
+    const rotatedOldCredential = await passwordSession()
+    const rotatedCurrentCredential = await passwordSession()
+    await admin`update sessions set revoked_at = clock_timestamp()
+      where credential_digest_v1 = ${computeCredentialDigest(rotatedOldCredential).digest}::bytea`
+    await assertSessionDenied(rotatedOldCredential)
+    const [rotatedCurrent] = await admin<{ live: boolean }[]>`
+      select revoked_at is null and expires_at > clock_timestamp() as live from sessions
+      where credential_digest_v1 = ${computeCredentialDigest(rotatedCurrentCredential).digest}::bytea
+    `
+    expect(rotatedCurrent).toEqual({ live: true })
+
+    await assertSessionDenied(randomUUID())
+
+    // The password route is intentionally single-user today, so create the
+    // second user's canonical database-authoritative session through the same
+    // production session boundary that the route later validates.
+    const otherCredential = await createSession(otherUser, null, { ip: null, userAgent: null })
+    const otherSuccessful = await routeRead(otherCredential, otherTask, '1')
+    expect(otherSuccessful.status).toBe(200)
+    const otherSuccessfulBody = await otherSuccessful.json() as { taskId: string; planVersion: string; entries: Array<{ entryId: string; content: string }> }
+    expect(otherSuccessfulBody).toEqual(expect.objectContaining({ taskId: otherTask, planVersion: '1' }))
+    expect(otherSuccessfulBody.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ entryId: 'plan_body:000000', content: 'Other-user protected plan.' }),
+    ]))
+    const [otherSuccessAudit] = await admin<{ count: number; digest: string; returned: number }[]>`
+      select count(*)::integer as count, max(entry_set_digest) as digest,
+        max(returned_entry_count)::integer as returned
+      from architect_plan_history_reads where task_id = ${otherTask}::uuid
+    `
+    expect(otherSuccessAudit).toEqual({
+      count: 1,
+      digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+      returned: otherSuccessfulBody.entries.length,
+    })
+
+    const crossTaskCredential = await passwordSession()
+    const beforeCrossTaskOwner = await auditCount(routeTask)
+    const beforeCrossTaskOther = await auditCount(otherTask)
+    const crossTask = await routeRead(crossTaskCredential, otherTask, '1')
+    expect(crossTask.status).toBe(404)
+    await expect(crossTask.json()).resolves.toEqual({ error: 'Architect plan history not found.' })
+    expect(await auditCount(routeTask)).toBe(beforeCrossTaskOwner)
+    expect(await auditCount(otherTask)).toBe(beforeCrossTaskOther)
+
+    const beforeWrongVersion = await auditCount(routeTask)
+    const wrongVersion = await routeRead(crossTaskCredential, routeTask, '2')
+    expect(wrongVersion.status).toBe(404)
+    await expect(wrongVersion.json()).resolves.toEqual({ error: 'Architect plan history not found.' })
+    expect(await auditCount(routeTask)).toBe(beforeWrongVersion)
+    expect(mockRedisSet).toHaveBeenCalled()
   })
 
   it('resume-safely rekeys a crash-window legacy session and leaves no raw-id lookup target', async () => {
