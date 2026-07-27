@@ -148,6 +148,12 @@ async function main(): Promise<void> {
       // canonical S3 helper.  PostgreSQL requires an UPDATE privilege for
       // that lock mode; grant only the immutable primary key column.
       await admin`grant update (id) on table public.work_package_local_projection_heads to forge_project_root_reconciler`
+      await admin`grant select on table public.projects, public.tasks, public.work_packages, public.filesystem_mcp_grant_approvals, public.filesystem_mcp_current_decision_pointers, public.project_filesystem_grant_decisions, public.project_filesystem_current_decision_pointers, public.work_package_local_projection_heads to forge_project_root_reconciler`
+      await admin`grant update (id) on table public.projects, public.filesystem_mcp_grant_approvals, public.project_filesystem_grant_decisions to forge_project_root_reconciler`
+      await admin`grant update (project_id) on table public.project_filesystem_current_decision_pointers to forge_project_root_reconciler`
+      await admin`grant update (work_package_id) on table public.filesystem_mcp_current_decision_pointers to forge_project_root_reconciler`
+      await admin`grant update (status, error_message, updated_at) on table public.tasks to forge_project_root_reconciler`
+      await admin`grant update (status, blocked_reason, metadata, updated_at) on table public.work_packages to forge_project_root_reconciler`
       const [{ protectedOwnershipCount }] = await admin<{ protectedOwnershipCount: number }[]>`
         select ((
           select count(*) from pg_catalog.pg_class relation
