@@ -664,17 +664,25 @@ END;
 $$;
 --> statement-breakpoint
 CREATE TABLE public.project_root_reconciliation_write_contexts (
-  operation_id uuid NOT NULL REFERENCES public.project_root_reconciliation_operations(operation_id) ON DELETE RESTRICT,
-  generation bigint NOT NULL REFERENCES public.project_root_change_journal(generation) ON DELETE RESTRICT,
+  operation_id uuid NOT NULL,
+  generation bigint NOT NULL,
   actor_id uuid NOT NULL,
-  project_id uuid NOT NULL REFERENCES public.projects(id) ON DELETE RESTRICT,
-  backend_pid integer NOT NULL CHECK (backend_pid > 0),
-  transaction_id bigint NOT NULL CHECK (transaction_id > 0),
+  project_id uuid NOT NULL,
+  backend_pid integer NOT NULL CONSTRAINT project_root_reconciliation_write_context_backend_pid_chk CHECK (backend_pid > 0),
+  transaction_id bigint NOT NULL CONSTRAINT project_root_reconciliation_write_context_transaction_id_chk CHECK (transaction_id > 0),
+  -- Record wall-clock entry time; a long root reconciliation transaction must
+  -- not collapse every context timestamp to its transaction start.
   entered_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
   completed_at timestamptz,
-  PRIMARY KEY (operation_id, generation),
-  UNIQUE (generation),
-  CONSTRAINT project_root_reconciliation_write_context_shape_chk CHECK ((completed_at IS NULL) OR completed_at >= entered_at)
+  CONSTRAINT project_root_reconciliation_write_contexts_pkey PRIMARY KEY (operation_id, generation),
+  CONSTRAINT project_root_reconciliation_write_context_generation_unique UNIQUE (generation),
+  CONSTRAINT project_root_reconciliation_write_context_shape_chk CHECK ((completed_at IS NULL) OR completed_at >= entered_at),
+  CONSTRAINT project_root_reconciliation_write_contexts_operation_id_fkey
+    FOREIGN KEY (operation_id) REFERENCES public.project_root_reconciliation_operations(operation_id) ON DELETE RESTRICT,
+  CONSTRAINT project_root_reconciliation_write_contexts_generation_fkey
+    FOREIGN KEY (generation) REFERENCES public.project_root_change_journal(generation) ON DELETE RESTRICT,
+  CONSTRAINT project_root_reconciliation_write_contexts_project_id_fkey
+    FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE RESTRICT
 );
 CREATE OR REPLACE FUNCTION forge.enter_project_root_reconciliation_generation_v1(p_operation_id uuid, p_actor_id uuid, p_generation bigint, p_project_id uuid)
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$

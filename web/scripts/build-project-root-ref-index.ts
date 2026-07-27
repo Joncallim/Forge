@@ -1,6 +1,13 @@
 import '../lib/load-env'
 import postgres from 'postgres'
 
+type IndexState = {
+  exists: boolean
+  canonical: boolean
+  valid: boolean
+  ready: boolean
+}
+
 async function main(): Promise<void> {
   if (process.argv.slice(2).join(' ') !== '--apply') {
     throw new Error('Concurrent root-reference index creation is actionless without --apply.')
@@ -10,7 +17,7 @@ async function main(): Promise<void> {
   const admin = postgres(adminUrl, { max: 1, onnotice: () => {} })
   try {
     await admin`select pg_catalog.pg_advisory_lock(pg_catalog.hashtext('forge:projects_root_ref_idx:v1'))`
-    const inspect = async () => admin<{ exists: boolean; canonical: boolean; valid: boolean; ready: boolean }[]>`
+    const inspect = async () => admin<IndexState[]>`
       with candidate as (select pg_catalog.to_regclass('public.projects_root_ref_idx') as index_oid)
       select (candidate.index_oid is not null) as exists,
         coalesce(idx.indisvalid, false) as valid, coalesce(idx.indisready, false) as ready,
@@ -18,7 +25,7 @@ async function main(): Promise<void> {
           and pg_catalog.pg_get_indexdef(idx.indexrelid) = 'CREATE UNIQUE INDEX projects_root_ref_idx ON public.projects USING btree (root_ref) WHERE (root_ref IS NOT NULL)', false) as canonical
       from candidate left join pg_catalog.pg_index idx on idx.indexrelid = candidate.index_oid
     `
-    let [index] = await inspect()
+    let index: IndexState | undefined = (await inspect())[0]
     if (index?.exists && !index.canonical && index.valid && index.ready) throw new Error('projects_root_ref_idx exists with a noncanonical definition.')
     if (index?.exists && (!index.valid || !index.ready)) {
       await admin.unsafe('DROP INDEX CONCURRENTLY public.projects_root_ref_idx')
