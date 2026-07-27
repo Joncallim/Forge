@@ -180,6 +180,8 @@ describe('project-root expansion reconciliation boundary', () => {
       upgradeProof.indexOf('bash scripts/ci/cutover-migration-0027-root-ref.sh --apply'),
     )
     expect(indexLifecycleProof).toContain("expect_failure \"$canonical_index_refusal\"")
+    expect(indexLifecycleProof).toContain('grep -F -- "$expected_message" "$output" >/dev/null')
+    expect(indexLifecycleProof).not.toContain('rg --fixed-strings')
     expect(indexLifecycleProof).toContain('assert_cutover_not_started')
     expect(indexLifecycleProof).toContain('CREATE UNIQUE INDEX CONCURRENTLY projects_root_ref_idx ON public.projects(id) WHERE root_ref IS NOT NULL')
     expect(indexLifecycleProof).toContain('projects_root_ref_idx exists with a noncanonical definition.')

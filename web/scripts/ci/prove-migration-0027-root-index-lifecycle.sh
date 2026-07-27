@@ -16,7 +16,7 @@ expect_failure() {
     echo "Expected command to fail: $*" >&2
     exit 1
   fi
-  if ! rg --fixed-strings --quiet "$expected_message" "$output"; then
+  if ! grep -F -- "$expected_message" "$output" >/dev/null; then
     cat "$output" >&2
     rm -f "$output"
     echo "Expected failure message was absent: $expected_message" >&2
