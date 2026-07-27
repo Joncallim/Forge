@@ -203,7 +203,7 @@ async function main(): Promise<void> {
     })
 
     console.log(`✓ Provisioned and verified the fixed Epic 172 release-reader boundary for ${applicationRole} as ${authority.currentUser}.`)
-    console.log('  Granted projection SELECT plus only the fixed enablement-read and projection-advance functions.')
+    console.log('  Granted projection SELECT plus only the enablement reader, coarse S4 mode reader, and projection-advance function.')
   } finally {
     await adminClient.end({ timeout: 5 })
   }
