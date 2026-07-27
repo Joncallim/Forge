@@ -59,6 +59,14 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(migration).toContain('operation_row.through_generation = p_through_generation')
     expect(migration).toContain('project-root completion compare-and-set failed')
     expect(migration).toContain('project-root generation already has an immutable outcome')
+    const claimRoutine = migration.slice(
+      migration.indexOf('CREATE OR REPLACE FUNCTION forge.claim_project_root_reconciliation_batch_v1'),
+      migration.indexOf('CREATE TABLE public.project_root_reconciliation_write_contexts'),
+    )
+    expect(claimRoutine).toContain('coalesce(max(journal_row.generation), 0)')
+    expect(claimRoutine).toContain('FROM public.project_root_change_journal AS journal_row')
+    expect(claimRoutine).not.toContain('coalesce(max(generation), 0)')
+    expect(claimRoutine).toContain('SELECT journal_row.generation, journal_row.project_id, journal_row.outcome, journal_row.root_binding_revision, journal_row.grant_decision_revision')
     expect(migration).toContain('forge.materialize_project_root_ref_expansion_v1')
     expect(migration).toContain('CREATE TABLE public.project_root_reconciliation_write_contexts')
     expect(migration).toContain('backend_pid integer NOT NULL')

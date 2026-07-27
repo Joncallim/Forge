@@ -645,21 +645,21 @@ DECLARE v_operation public.project_root_reconciliation_operations%ROWTYPE;
 BEGIN
   PERFORM forge.assert_project_root_reconciler_v1();
   IF p_batch_size NOT BETWEEN 1 AND 100 THEN RAISE EXCEPTION 'project-root reconciliation batch must be 1 through 100' USING ERRCODE = '22023'; END IF;
-  SELECT * INTO STRICT v_operation FROM public.project_root_reconciliation_operations
-    WHERE operation_id = p_operation_id;
-  IF (SELECT last_generation FROM public.project_root_change_journal_counter WHERE singleton) <> v_operation.through_generation
-     OR (SELECT coalesce(max(generation), 0) FROM public.project_root_change_journal) <> v_operation.through_generation
-     OR (SELECT count(*) FROM public.project_root_change_journal) <> v_operation.through_generation THEN
+  SELECT * INTO STRICT v_operation FROM public.project_root_reconciliation_operations AS operation_row
+    WHERE operation_row.operation_id = p_operation_id;
+  IF (SELECT counter_row.last_generation FROM public.project_root_change_journal_counter AS counter_row WHERE counter_row.singleton) <> v_operation.through_generation
+     OR (SELECT coalesce(max(journal_row.generation), 0) FROM public.project_root_change_journal AS journal_row) <> v_operation.through_generation
+     OR (SELECT count(*) FROM public.project_root_change_journal AS journal_row) <> v_operation.through_generation THEN
     RAISE EXCEPTION 'project-root journal changed before batch claim' USING ERRCODE = '55000';
   END IF;
-  SELECT * INTO STRICT v_operation FROM public.project_root_reconciliation_operations
-    WHERE operation_id = p_operation_id FOR UPDATE;
+  SELECT * INTO STRICT v_operation FROM public.project_root_reconciliation_operations AS operation_row
+    WHERE operation_row.operation_id = p_operation_id FOR UPDATE;
   IF v_operation.actor_id <> p_actor_id OR v_operation.state <> 'running' THEN RAISE EXCEPTION 'project-root operation is not claimable by this actor' USING ERRCODE = '42501'; END IF;
   RETURN QUERY
-    SELECT journal.generation, journal.project_id, journal.outcome, journal.root_binding_revision, journal.grant_decision_revision
-    FROM public.project_root_change_journal journal
-    WHERE journal.generation > v_operation.last_processed_generation AND journal.generation <= v_operation.through_generation
-    ORDER BY journal.generation LIMIT p_batch_size FOR UPDATE;
+    SELECT journal_row.generation, journal_row.project_id, journal_row.outcome, journal_row.root_binding_revision, journal_row.grant_decision_revision
+    FROM public.project_root_change_journal AS journal_row
+    WHERE journal_row.generation > v_operation.last_processed_generation AND journal_row.generation <= v_operation.through_generation
+    ORDER BY journal_row.generation LIMIT p_batch_size FOR UPDATE;
 END;
 $$;
 --> statement-breakpoint
@@ -774,36 +774,36 @@ DECLARE v_operation public.project_root_reconciliation_operations%ROWTYPE; v_jou
 BEGIN
   PERFORM forge.assert_project_root_reconciler_v1();
   IF NOT EXISTS (SELECT 1 FROM public.project_root_reconciliation_write_contexts context WHERE context.operation_id=p_operation_id AND context.generation=p_generation AND context.actor_id=p_actor_id AND context.project_id=p_project_id AND context.backend_pid=pg_catalog.pg_backend_pid() AND context.transaction_id=pg_catalog.txid_current() AND context.completed_at IS NULL) THEN RAISE EXCEPTION 'project-root write context is absent or stale' USING ERRCODE='42501'; END IF;
-  SELECT * INTO STRICT v_operation FROM public.project_root_reconciliation_operations WHERE operation_id = p_operation_id;
+  SELECT * INTO STRICT v_operation FROM public.project_root_reconciliation_operations AS operation_row WHERE operation_row.operation_id = p_operation_id;
   PERFORM forge.assert_project_root_journal_window_v1(v_operation.through_generation);
-  SELECT * INTO STRICT v_operation FROM public.project_root_reconciliation_operations WHERE operation_id = p_operation_id FOR UPDATE;
+  SELECT * INTO STRICT v_operation FROM public.project_root_reconciliation_operations AS operation_row WHERE operation_row.operation_id = p_operation_id FOR UPDATE;
   IF v_operation.actor_id <> p_actor_id OR v_operation.state <> 'running' OR p_generation <> v_operation.last_processed_generation + 1 THEN
     RAISE EXCEPTION 'project-root completion compare-and-set failed' USING ERRCODE = '40001';
   END IF;
-  SELECT * INTO STRICT v_journal FROM public.project_root_change_journal WHERE generation = p_generation FOR UPDATE;
+  SELECT * INTO STRICT v_journal FROM public.project_root_change_journal AS journal_row WHERE journal_row.generation = p_generation FOR UPDATE;
   IF v_journal.project_id <> p_project_id OR v_journal.outcome <> p_outcome OR p_generation > v_operation.through_generation THEN
     RAISE EXCEPTION 'project-root journal outcome changed or is incoherent' USING ERRCODE = '22023';
   END IF;
-  IF EXISTS (SELECT 1 FROM public.project_root_reconciliation_outcomes WHERE generation = p_generation) THEN
+  IF EXISTS (SELECT 1 FROM public.project_root_reconciliation_outcomes AS outcome_row WHERE outcome_row.generation = p_generation) THEN
     RAISE EXCEPTION 'project-root generation already has an immutable outcome' USING ERRCODE = '23505';
   END IF;
   INSERT INTO public.project_root_reconciliation_outcomes(generation, operation_id, actor_id, project_id, outcome)
   VALUES (p_generation, p_operation_id, p_actor_id, p_project_id, p_outcome);
-  UPDATE public.project_root_reconciliation_operations
+  UPDATE public.project_root_reconciliation_operations AS operation_row
   SET last_processed_generation = p_generation, last_project_id = p_project_id,
-      batch_count = batch_count + 1, cumulative_count = cumulative_count + 1,
-      state = CASE WHEN p_generation = through_generation THEN 'complete' ELSE 'running' END,
-      completed_at = CASE WHEN p_generation = through_generation THEN pg_catalog.clock_timestamp() ELSE NULL END,
+      batch_count = operation_row.batch_count + 1, cumulative_count = operation_row.cumulative_count + 1,
+      state = CASE WHEN p_generation = operation_row.through_generation THEN 'complete' ELSE 'running' END,
+      completed_at = CASE WHEN p_generation = operation_row.through_generation THEN pg_catalog.clock_timestamp() ELSE NULL END,
       updated_at = pg_catalog.clock_timestamp()
-  WHERE operation_id = p_operation_id RETURNING * INTO v_operation;
+  WHERE operation_row.operation_id = p_operation_id RETURNING operation_row.* INTO v_operation;
   INSERT INTO public.project_root_reconciliation_checkpoints(
     operation_id, checkpoint_generation, actor_id, through_generation, last_processed_generation,
     last_project_id, batch_count, cumulative_count, state
   ) VALUES (v_operation.operation_id, v_operation.last_processed_generation, v_operation.actor_id,
     v_operation.through_generation, v_operation.last_processed_generation, v_operation.last_project_id,
     v_operation.batch_count, v_operation.cumulative_count, v_operation.state);
-  UPDATE public.project_root_reconciliation_write_contexts SET completed_at=pg_catalog.clock_timestamp()
-    WHERE operation_id=p_operation_id AND generation=p_generation AND backend_pid=pg_catalog.pg_backend_pid() AND transaction_id=pg_catalog.txid_current() AND completed_at IS NULL;
+  UPDATE public.project_root_reconciliation_write_contexts AS context_row SET completed_at=pg_catalog.clock_timestamp()
+    WHERE context_row.operation_id=p_operation_id AND context_row.generation=p_generation AND context_row.backend_pid=pg_catalog.pg_backend_pid() AND context_row.transaction_id=pg_catalog.txid_current() AND context_row.completed_at IS NULL;
   RETURN QUERY SELECT v_operation.state, v_operation.last_processed_generation;
 END;
 $$;
