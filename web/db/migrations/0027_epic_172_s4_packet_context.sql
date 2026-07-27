@@ -1008,6 +1008,17 @@ DECLARE
   v_returned_set_digest text;
   v_invalid_clarification boolean;
   v_duplicate_entry_id boolean;
+  -- ECMAScript String.prototype.trim whitespace and line terminators. Keep
+  -- this explicit rather than relying on PostgreSQL regex locale semantics.
+  v_ecmascript_trim_characters text := pg_catalog.chr(9) || pg_catalog.chr(10)
+    || pg_catalog.chr(11) || pg_catalog.chr(12) || pg_catalog.chr(13)
+    || pg_catalog.chr(32) || pg_catalog.chr(160) || pg_catalog.chr(5760)
+    || pg_catalog.chr(8192) || pg_catalog.chr(8193) || pg_catalog.chr(8194)
+    || pg_catalog.chr(8195) || pg_catalog.chr(8196) || pg_catalog.chr(8197)
+    || pg_catalog.chr(8198) || pg_catalog.chr(8199) || pg_catalog.chr(8200)
+    || pg_catalog.chr(8201) || pg_catalog.chr(8202) || pg_catalog.chr(8232)
+    || pg_catalog.chr(8233) || pg_catalog.chr(8239) || pg_catalog.chr(8287)
+    || pg_catalog.chr(12288) || pg_catalog.chr(65279);
   v_history_query text := $history$
     WITH protected_entries AS (
       -- The requested immutable plan supplies structural context only. The
@@ -1146,8 +1157,8 @@ BEGIN
           OR pg_catalog.jsonb_typeof(question.content::jsonb->'question') IS DISTINCT FROM 'string'
           OR CASE
             WHEN pg_catalog.jsonb_typeof(question.content::jsonb->'question') = 'string' THEN
-              question.content::jsonb->>'question' IS DISTINCT FROM pg_catalog.btrim(question.content::jsonb->>'question')
-              OR pg_catalog.btrim(question.content::jsonb->>'question') = ''
+              question.content::jsonb->>'question' IS DISTINCT FROM pg_catalog.btrim(question.content::jsonb->>'question', $3)
+              OR pg_catalog.btrim(question.content::jsonb->>'question', $3) = ''
             ELSE true
           END
           -- CASE prevents jsonb_array_elements from evaluating malformed non-array JSON.
@@ -1158,13 +1169,13 @@ BEGIN
                 SELECT 1
                 FROM pg_catalog.jsonb_array_elements(question.content::jsonb->'suggestions') AS suggestion(value)
                 WHERE pg_catalog.jsonb_typeof(suggestion.value) IS DISTINCT FROM 'string'
-                  OR suggestion.value #>> '{}' IS DISTINCT FROM pg_catalog.btrim(suggestion.value #>> '{}')
-                  OR pg_catalog.btrim(suggestion.value #>> '{}') = ''
+                  OR suggestion.value #>> '{}' IS DISTINCT FROM pg_catalog.btrim(suggestion.value #>> '{}', $3)
+                  OR pg_catalog.btrim(suggestion.value #>> '{}', $3) = ''
               )
               OR EXISTS (
                 SELECT 1
                 FROM (
-                  SELECT pg_catalog.btrim(suggestion.value #>> '{}') AS normalized
+                  SELECT pg_catalog.btrim(suggestion.value #>> '{}', $3) AS normalized
                   FROM pg_catalog.jsonb_array_elements(question.content::jsonb->'suggestions') AS suggestion(value)
                 ) AS normalized_suggestions
                 GROUP BY normalized_suggestions.normalized
@@ -1199,8 +1210,8 @@ BEGIN
           OR pg_catalog.jsonb_typeof(question.content::jsonb->'question') IS DISTINCT FROM 'string'
           OR CASE
             WHEN pg_catalog.jsonb_typeof(question.content::jsonb->'question') = 'string' THEN
-              question.content::jsonb->>'question' IS DISTINCT FROM pg_catalog.btrim(question.content::jsonb->>'question')
-              OR pg_catalog.btrim(question.content::jsonb->>'question') = ''
+              question.content::jsonb->>'question' IS DISTINCT FROM pg_catalog.btrim(question.content::jsonb->>'question', $3)
+              OR pg_catalog.btrim(question.content::jsonb->>'question', $3) = ''
             ELSE true
           END
           -- CASE prevents jsonb_array_elements from evaluating malformed non-array JSON.
@@ -1211,13 +1222,13 @@ BEGIN
                 SELECT 1
                 FROM pg_catalog.jsonb_array_elements(question.content::jsonb->'suggestions') AS suggestion(value)
                 WHERE pg_catalog.jsonb_typeof(suggestion.value) IS DISTINCT FROM 'string'
-                  OR suggestion.value #>> '{}' IS DISTINCT FROM pg_catalog.btrim(suggestion.value #>> '{}')
-                  OR pg_catalog.btrim(suggestion.value #>> '{}') = ''
+                  OR suggestion.value #>> '{}' IS DISTINCT FROM pg_catalog.btrim(suggestion.value #>> '{}', $3)
+                  OR pg_catalog.btrim(suggestion.value #>> '{}', $3) = ''
               )
               OR EXISTS (
                 SELECT 1
                 FROM (
-                  SELECT pg_catalog.btrim(suggestion.value #>> '{}') AS normalized
+                  SELECT pg_catalog.btrim(suggestion.value #>> '{}', $3) AS normalized
                   FROM pg_catalog.jsonb_array_elements(question.content::jsonb->'suggestions') AS suggestion(value)
                 ) AS normalized_suggestions
                 GROUP BY normalized_suggestions.normalized
@@ -1230,7 +1241,7 @@ BEGIN
       WHERE answer.task_id = $1 AND answer.source_plan_version <= $2
       GROUP BY answer.question_id HAVING pg_catalog.count(*) > 1
     )
-  $validation$ INTO v_invalid_clarification USING p_task_id, p_plan_version;
+  $validation$ INTO v_invalid_clarification USING p_task_id, p_plan_version, v_ecmascript_trim_characters;
   IF v_invalid_clarification THEN
     RAISE EXCEPTION 'Protected clarification history is malformed or inconsistent'
       USING ERRCODE = '40001';
