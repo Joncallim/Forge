@@ -84,12 +84,18 @@ async function main(): Promise<void> {
               trigger: 'project_root_repoint',
             })
           }
-          await tx.execute(sql`
+          const completionRows = await tx.execute(sql`
             select * from forge.complete_project_root_reconciliation_generation_v1(
               ${operation.operationId}::uuid, ${command.actorId}::uuid,
               ${change.generation.toString()}::bigint, ${change.projectId}::uuid, ${change.outcome}
             )
           `)
+          const completion = (completionRows as unknown as Array<{ state?: unknown; last_processed_generation?: unknown }>)[0]
+          if (!completion || (completion.state !== 'running' && completion.state !== 'complete')
+            || String(completion.last_processed_generation) !== change.generation.toString()) {
+            throw new Error('Project-root completion returned an invalid state.')
+          }
+          if (completion.state === 'complete') return { completed: true, processed: claimed.length }
         }
         return { completed: false, processed: claimed.length }
       })
