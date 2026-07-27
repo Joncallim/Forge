@@ -155,7 +155,6 @@ BEGIN
            '27000000-0000-4000-8000-000000000712'::uuid,
            '27000000-0000-4000-8000-000000000721'::uuid
          )) <> 2
-     )
   THEN
     RAISE EXCEPTION 'root authority package fixture has invalid marker or baseline metadata';
   END IF;
