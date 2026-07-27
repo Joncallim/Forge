@@ -32,6 +32,7 @@ psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 \
   --file scripts/ci/sql/migration-0027-expansion-assertions.sql
 psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 \
   --file scripts/ci/sql/migration-0027-archive-assertions.sql
+bash scripts/ci/prove-migration-0027-ordinary-app-trigger-writes.sh
 
 echo 'Reconciling the legacy Redis session with its exact absolute expiry.'
 npm run session-credentials:reconcile
@@ -55,8 +56,23 @@ if [[ "$(redis-cli -u "${REDIS_URL}" exists 'session:orphan-migration-0027')" !=
   exit 1
 fi
 
+# Prepare every journal-producing fixture before the only post-drain reconcile.
+# Assertions and index recovery are read/DDL-only after that completed operation.
+bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh --prepare
+bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh --prepare
+psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 --file scripts/ci/sql/migration-0027-root-reconciler-privileges-assertions.sql
+echo 'ROOT_RECONCILER_PRIVILEGE_MUTATIONS_PHASE_START'
+bash scripts/ci/prove-migration-0027-root-reconciler-privilege-mutations.sh
+echo 'ROOT_RECONCILER_PRIVILEGE_MUTATIONS_PHASE_SUCCESS'
+# This creates (but never advances) the exact live operation. The shim resumes
+# it below after its now-empty materialization pass.
+bash scripts/ci/prove-migration-0027-root-reconciliation-negative.sh
+bash scripts/ci/prove-migration-0027-root-stale-context.sh
+bash scripts/ci/prove-migration-0027-root-contention.sh
 bash scripts/ci/reconcile-migration-0027-root-refs.sh
-npm run project-roots:build-concurrent-index -- --apply
+bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh --assert
+bash scripts/ci/prove-migration-0027-root-reconciliation-replay.sh
+bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh --recover
 bash scripts/ci/cutover-migration-0027-root-ref.sh --apply
 psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 \
   --file scripts/ci/sql/migration-0027-cutover-assertions.sql
