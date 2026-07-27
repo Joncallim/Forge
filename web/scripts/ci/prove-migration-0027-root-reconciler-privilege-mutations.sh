@@ -73,6 +73,50 @@ SQL
   fi
 }
 
+expect_grant_option_rejection() {
+  local phase='relation grant option mutation'
+  local output_file="${proof_tmpdir}/${phase}.log"
+  local status=0 identity_line mutation_session_user mutation_current_user expected_entry
+
+  set +e
+  psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 >"${output_file}" 2>&1 <<SQL
+BEGIN;
+SELECT session_user AS mutation_session_user, current_user AS mutation_current_user \gset
+\echo ROOT_GRANT_OPTION_MUTATION_IDENTITY session=:mutation_session_user current=:mutation_current_user
+GRANT SELECT ON TABLE public.projects TO forge_project_root_reconciler WITH GRANT OPTION;
+\i ${assertion_file}
+ROLLBACK;
+SQL
+  status=$?
+  set -e
+
+  identity_line="$(grep -F -- 'ROOT_GRANT_OPTION_MUTATION_IDENTITY session=' "${output_file}" || true)"
+  [[ "${identity_line}" =~ ^ROOT_GRANT_OPTION_MUTATION_IDENTITY\ session=([^[:space:]]+)\ current=([^[:space:]]+)$ ]] || {
+    fail_with_output "${phase}: mutation connection did not emit its exact session/current role identity" "${output_file}"
+  }
+  mutation_session_user="${BASH_REMATCH[1]}"
+  mutation_current_user="${BASH_REMATCH[2]}"
+  [[ "${mutation_session_user}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "${mutation_current_user}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+    fail_with_output "${phase}: mutation connection emitted an unsafe role identity" "${output_file}"
+  }
+  # PostgreSQL records ACL grantors as current_user. Retain session_user in the
+  # evidence so an unexpected SET ROLE path is visible rather than sampled away.
+  if [[ "${mutation_session_user}" != "${mutation_current_user}" ]]; then
+    echo "Root reconciler privilege mutation observed SET ROLE in the grant session: session=${mutation_session_user} current=${mutation_current_user}" >&2
+  fi
+  expected_entry="public.projects:SELECT:grantor=${mutation_current_user}:grantee=forge_project_root_reconciler"
+
+  if [[ "${status}" -ne 3 ]]; then
+    fail_with_output "${phase}: expected psql script rejection status 3, received ${status}" "${output_file}"
+  fi
+  if ! grep -F -- 'root reconciler effective privilege allowlist mismatch' "${output_file}" >/dev/null; then
+    fail_with_output "${phase}: exact allowlist rejection was absent" "${output_file}"
+  fi
+  if ! grep -F -- "${expected_entry}" "${output_file}" >/dev/null; then
+    fail_with_output "${phase}: expected exact unexpected-set entry ${expected_entry} was absent" "${output_file}"
+  fi
+}
+
 # Every mutation is uncommitted. The assertion failure closes that psql session,
 # which rolls the transaction back before the following fresh-session probe.
 baseline_acl="$(snapshot_application_acls)"
@@ -93,12 +137,7 @@ expect_allowlist_rejection \
   'public.project_root_reconciliation_write_contexts.actor_id' \
   'GRANT SELECT (actor_id) ON TABLE public.project_root_reconciliation_write_contexts TO forge_project_root_reconciler;'
 
-grantor="$(psql "${FORGE_DATABASE_ADMIN_URL}" --no-align --tuples-only --set ON_ERROR_STOP=1 --command 'SELECT current_user')"
-[[ "${grantor}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo 'root reconciler privilege mutation proof received an unsafe grantor identity' >&2; exit 1; }
-expect_allowlist_rejection \
-  'relation grant option mutation' \
-  "public.projects:SELECT:grantor=${grantor}:grantee=forge_project_root_reconciler" \
-  'GRANT SELECT ON TABLE public.projects TO forge_project_root_reconciler WITH GRANT OPTION;'
+expect_grant_option_rejection
 
 # This intentionally exercises an effective privilege inherited from PUBLIC,
 # rather than only a direct grant to the dedicated login.
