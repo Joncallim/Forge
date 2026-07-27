@@ -619,6 +619,8 @@ async function applyCanonicalProjection(input: {
   taskProjectionScopeById: ReadonlyMap<string, string>
   transitionAuthorityByPackageId?: ReadonlyMap<string, OperatorHoldProjectionAuthority>
   forcePackageIds?: ReadonlySet<string>
+  /** Internal root-journal mode; never sourced from an operator request. */
+  suppressPhasePersistence?: boolean
   tx: GrantTransaction
 }): Promise<Set<string>> {
   const recoveredTaskIds = new Set<string>()
@@ -641,9 +643,11 @@ async function applyCanonicalProjection(input: {
     if (!check.blocked) {
       if (!parsedMarker && !forcePersist) continue
       const grant = projectFilesystemGrantFromAuthority(input.projectAuthority)
-      const effective = grant
-        ? phasesWithEffective(pkg.metadata, projectFilesystemEffectivePhase(grant))
-        : forcePersist ? currentPhases : undefined
+      const effective = input.suppressPhasePersistence
+        ? undefined
+        : grant
+          ? phasesWithEffective(pkg.metadata, projectFilesystemEffectivePhase(grant))
+          : forcePersist ? currentPhases : undefined
       const recovering = Boolean(parsedMarker)
       const [updated] = await input.tx
         .update(workPackages)
@@ -806,6 +810,7 @@ async function reconcileLockedProjectRows(input: {
   projectAuthority: ProjectFilesystemDecisionAuthority | null
   taskRows: readonly LockedTask[]
   transitionAuthorityByPackageId?: ReadonlyMap<string, OperatorHoldProjectionAuthority>
+  suppressPhasePersistence?: boolean
   trigger: FilesystemGrantProjectReconciliationTrigger
   tx: GrantTransaction
   now: Date
@@ -830,6 +835,7 @@ async function reconcileLockedProjectRows(input: {
       input.taskRows.map((task) => [task.id, task.localProjectionScopeState]),
     ),
     transitionAuthorityByPackageId: input.transitionAuthorityByPackageId,
+    suppressPhasePersistence: input.suppressPhasePersistence,
     tx: input.tx,
   })
   for (const task of input.taskRows) {
@@ -864,6 +870,7 @@ export async function reconcileFilesystemGrantsForProject(
     lockedProject: LockedProject
     nextMcpConfig: ProjectMcpConfig
     trigger: FilesystemGrantProjectReconciliationTrigger
+    suppressPhasePersistence?: boolean
   },
 ): Promise<FilesystemGrantProjectReconciliationResult> {
   if (!input.actorId.trim()) throw new Error('Grant reconciliation requires an actor.')
@@ -961,6 +968,7 @@ export async function reconcileFilesystemGrantsForProject(
     projectAuthority: currentProjectDecision ? projectDecisionAuthority(currentProjectDecision) : null,
     taskRows,
     transitionAuthorityByPackageId,
+    suppressPhasePersistence: input.suppressPhasePersistence,
     trigger: input.trigger,
     tx,
   })

@@ -78,6 +78,7 @@ async function main(): Promise<void> {
                 mcpConfig: project.mcpConfig,
                 rootBindingRevision: project.rootBindingRevision,
               }),
+              suppressPhasePersistence: true,
               trigger: 'project_root_repoint',
             })
           }

@@ -10,6 +10,7 @@ const migration = readFileSync(fileURLToPath(new URL('../db/migrations/0027_epic
 const schema = readFileSync(fileURLToPath(new URL('../db/schema.ts', import.meta.url)), 'utf8')
 const bootstrap = readFileSync(fileURLToPath(new URL('../scripts/bootstrap-epic-172-s4-roles.ts', import.meta.url)), 'utf8')
 const reconcileScript = readFileSync(fileURLToPath(new URL('../scripts/reconcile-project-root-expansion.ts', import.meta.url)), 'utf8')
+const reconciliation = readFileSync(fileURLToPath(new URL('../lib/mcps/filesystem-grant-reconciliation.ts', import.meta.url)), 'utf8')
 const indexScript = readFileSync(fileURLToPath(new URL('../scripts/build-project-root-ref-index.ts', import.meta.url)), 'utf8')
 const cutoverScript = readFileSync(fileURLToPath(new URL('../scripts/ci/cutover-migration-0027-root-ref.sh', import.meta.url)), 'utf8')
 const webCi = readFileSync(fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)), 'utf8')
@@ -70,6 +71,13 @@ describe('project-root expansion reconciliation boundary', () => {
       'project_root_reconciliation_checkpoints',
       'project_root_reconciliation_outcomes',
     ]) expect(webCi).toContain(`'${table}'`)
+  })
+
+  it('selects phase suppression only in the internal root-journal caller', () => {
+    expect(reconcileScript).toContain('suppressPhasePersistence: true')
+    expect(reconciliation).toContain('suppressPhasePersistence?: boolean')
+    expect(reconciliation).toContain('input.suppressPhasePersistence ? undefined : grant')
+    expect(reconcileScript).not.toContain('--suppress')
   })
 
   it('keeps concurrent index DDL separate and strict cutover watermark-fenced', () => {
