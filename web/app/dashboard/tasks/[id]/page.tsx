@@ -1992,14 +1992,21 @@ function FilesystemGrantControls({
     }
   }, [applyGrantState, packageId, taskId])
 
+  // Only packages that actually render this control need the task's grant
+  // state. Without the capability guard every work package on the task fetched
+  // the same endpoint on mount and then failed normalization, because the
+  // server omits packages that have neither requested capabilities nor prior
+  // decisions.
+  const rendersGrantControl = summary.requestedCapabilities.length > 0 && packageId !== ''
+
   useEffect(() => {
-    if (packageId === '') return
+    if (!rendersGrantControl) return
     const controller = new AbortController()
     void loadGrantState(controller.signal).catch(() => undefined)
     return () => controller.abort()
-  }, [loadGrantState, packageId])
+  }, [loadGrantState, rendersGrantControl])
 
-  if (summary.requestedCapabilities.length === 0 || packageId === '') return null
+  if (!rendersGrantControl) return null
 
   const canEdit = (
     (taskStatus === 'awaiting_approval' || taskStatus === 'approved') &&
@@ -2184,7 +2191,22 @@ function FilesystemGrantControls({
       {effective.grantApprovalId !== '' && (
         <p className="mt-2 break-all font-mono text-[11px] text-muted-foreground">Grant {effective.grantApprovalId}</p>
       )}
-      {grantStateError !== null && <p role="alert" className="mt-2 text-xs text-destructive">{grantStateError}</p>}
+      {grantStateError !== null && (
+        <div role="alert" className="mt-2 flex flex-wrap items-center gap-2 text-xs text-destructive">
+          <span>
+            {grantStateError} Forge will not submit a decision without the current pointer, so the controls stay disabled until this loads.
+          </span>
+          <Button
+            disabled={grantStateLoading}
+            onClick={() => void loadGrantState().catch(() => undefined)}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            {grantStateLoading ? 'Retrying…' : 'Retry loading the decision'}
+          </Button>
+        </div>
+      )}
       {error !== null && <p role="alert" className="mt-2 text-xs text-destructive">{error}</p>}
     </div>
   )

@@ -95,10 +95,11 @@ async function main(): Promise<void> {
     }
 
     const [database] = await admin<{ name: string }[]>`select current_database() as name`
-    await admin.unsafe(`grant connect on database ${admin(database.name).toString()} to ${READER_ROLE}`)
-      .catch(async () => {
-        await admin`grant connect on database ${admin(database.name)} to ${admin(READER_ROLE)}`
-      })
+    // Identifiers go through postgres.js's identifier helper in a tagged
+    // template, which quotes them. Do not build this with `unsafe` and
+    // string interpolation: the helper stringifies to "[object Object]", so an
+    // interpolated form is always invalid SQL.
+    await admin`grant connect on database ${admin(database.name)} to ${admin(READER_ROLE)}`
     await admin`grant usage on schema public to ${admin(READER_ROLE)}`
     await admin.unsafe(
       `grant select (${READABLE_COLUMNS.join(', ')}) on ${EVIDENCE_TABLE} to ${READER_ROLE}`,
