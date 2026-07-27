@@ -6774,7 +6774,7 @@ BEGIN
     SELECT r.id, r.purpose, r.source_kind, r.task_id, r.plan_artifact_id, r.plan_version,
       entry.entry_id, entry.entry_kind, entry.agent, entry.requirement_key,
       entry.binding_fingerprint, entry.content, entry.content_digest, entry.digest_key_id,
-      entry.projection_eligible, NULL::uuid
+      entry.projection_eligible, NULL::uuid AS clarification_question_id
     FROM locked r JOIN public.agent_runs run ON run.id = r.agent_run_id
       AND run.task_id = r.task_id AND run.status = 'running'
     JOIN public.architect_plan_entries entry ON r.source_kind = 'architect_plan_entry'
@@ -6798,9 +6798,12 @@ BEGIN
   ), consumed AS (
     UPDATE public.architect_plan_execution_references r SET resolved_at = pg_catalog.clock_timestamp()
     FROM eligible WHERE r.id = eligible.id RETURNING eligible.*
-  ) SELECT purpose, source_kind, task_id, plan_artifact_id, plan_version, entry_id, entry_kind,
-    agent, requirement_key, binding_fingerprint, content, content_digest, digest_key_id,
-    projection_eligible, clarification_question_id FROM consumed;
+  ) SELECT consumed.purpose, consumed.source_kind, consumed.task_id,
+    consumed.plan_artifact_id, consumed.plan_version, consumed.entry_id,
+    consumed.entry_kind, consumed.agent, consumed.requirement_key,
+    consumed.binding_fingerprint, consumed.content, consumed.content_digest,
+    consumed.digest_key_id, consumed.projection_eligible,
+    consumed.clarification_question_id FROM consumed;
 END;
 $$;
 CREATE OR REPLACE FUNCTION forge.append_architect_clarification_answer_v1(
