@@ -15,6 +15,7 @@ const reconciliation = readFileSync(fileURLToPath(new URL('../lib/mcps/filesyste
 const indexScript = readFileSync(fileURLToPath(new URL('../scripts/build-project-root-ref-index.ts', import.meta.url)), 'utf8')
 const upgradeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-upgrade.sh', import.meta.url)), 'utf8')
 const indexLifecycleProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-index-lifecycle.sh', import.meta.url)), 'utf8')
+const rootAuthorityProjectFixture = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-authority-project-fixture.sql', import.meta.url)), 'utf8')
 const cutoverScript = readFileSync(fileURLToPath(new URL('../scripts/ci/cutover-migration-0027-root-ref.sh', import.meta.url)), 'utf8')
 const webCi = readFileSync(fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)), 'utf8')
 
@@ -129,6 +130,17 @@ describe('project-root expansion reconciliation boundary', () => {
       'project_root_reconciliation_checkpoints',
       'project_root_reconciliation_outcomes',
     ]) expect(webCi).toContain(`'${table}'`)
+  })
+
+  it('keeps the admin-only root-authority project fixture self-validating and incomplete', () => {
+    expect(rootAuthorityProjectFixture).toContain('root authority fixture must not run as the reconciler login')
+    expect(rootAuthorityProjectFixture).toContain("'27000000-0000-4000-8000-000000000700'")
+    expect(rootAuthorityProjectFixture).toContain("'27000000-0000-4000-8000-000000000702'")
+    expect(rootAuthorityProjectFixture).toContain('"requiredMcps":["filesystem","github"]')
+    expect(rootAuthorityProjectFixture).toContain('project_filesystem_current_decision_pointers')
+    expect(rootAuthorityProjectFixture).toContain("'^sha256:[0-9a-f]{64}$'")
+    expect(rootAuthorityProjectFixture).toContain('duplicate or ambiguous current authority')
+    expect(rootAuthorityProjectFixture).not.toContain('reconcile-project-root-expansion.ts')
   })
 
   it('selects phase suppression only in the internal root-journal caller', () => {
