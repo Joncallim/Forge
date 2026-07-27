@@ -76,35 +76,45 @@ SQL
 expect_grant_option_rejection() {
   local phase='relation grant option mutation'
   local output_file="${proof_tmpdir}/${phase}.log"
-  local status=0 identity_line mutation_session_user mutation_current_user expected_entry
+  local status=0 identity_line mutation_owner_role mutation_session_user mutation_current_user mutation_can_set_owner expected_entry
 
   set +e
   psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 >"${output_file}" 2>&1 <<SQL
 BEGIN;
-SELECT session_user AS mutation_session_user, current_user AS mutation_current_user \gset
-\echo ROOT_GRANT_OPTION_MUTATION_IDENTITY session=:mutation_session_user current=:mutation_current_user
+SELECT pg_catalog.pg_get_userbyid(relation.relowner) AS mutation_owner_role,
+  session_user AS mutation_session_user,
+  pg_catalog.pg_has_role(session_user, pg_catalog.pg_get_userbyid(relation.relowner), 'SET') AS mutation_can_set_owner
+FROM pg_catalog.pg_class relation
+JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+WHERE namespace_row.nspname = 'public' AND relation.relname = 'projects' AND relation.relkind = 'r' \gset
+SET LOCAL ROLE :"mutation_owner_role";
+SELECT current_user AS mutation_current_user \gset
+\echo ROOT_GRANT_OPTION_MUTATION_IDENTITY owner=:mutation_owner_role session=:mutation_session_user current=:mutation_current_user can_set=:mutation_can_set_owner
 GRANT SELECT ON TABLE public.projects TO forge_project_root_reconciler WITH GRANT OPTION;
+RESET ROLE;
 \i ${assertion_file}
 ROLLBACK;
 SQL
   status=$?
   set -e
 
-  identity_line="$(grep -F -- 'ROOT_GRANT_OPTION_MUTATION_IDENTITY session=' "${output_file}" || true)"
-  [[ "${identity_line}" =~ ^ROOT_GRANT_OPTION_MUTATION_IDENTITY\ session=([^[:space:]]+)\ current=([^[:space:]]+)$ ]] || {
-    fail_with_output "${phase}: mutation connection did not emit its exact session/current role identity" "${output_file}"
+  identity_line="$(grep -F -- 'ROOT_GRANT_OPTION_MUTATION_IDENTITY owner=' "${output_file}" || true)"
+  [[ "${identity_line}" =~ ^ROOT_GRANT_OPTION_MUTATION_IDENTITY\ owner=([^[:space:]]+)\ session=([^[:space:]]+)\ current=([^[:space:]]+)\ can_set=([tf])$ ]] || {
+    fail_with_output "${phase}: mutation connection did not emit its exact owner/session/current role identity" "${output_file}"
   }
-  mutation_session_user="${BASH_REMATCH[1]}"
-  mutation_current_user="${BASH_REMATCH[2]}"
-  [[ "${mutation_session_user}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "${mutation_current_user}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+  mutation_owner_role="${BASH_REMATCH[1]}"
+  mutation_session_user="${BASH_REMATCH[2]}"
+  mutation_current_user="${BASH_REMATCH[3]}"
+  mutation_can_set_owner="${BASH_REMATCH[4]}"
+  [[ "${mutation_owner_role}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "${mutation_session_user}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "${mutation_current_user}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
     fail_with_output "${phase}: mutation connection emitted an unsafe role identity" "${output_file}"
   }
-  # PostgreSQL records ACL grantors as current_user. Retain session_user in the
-  # evidence so an unexpected SET ROLE path is visible rather than sampled away.
-  if [[ "${mutation_session_user}" != "${mutation_current_user}" ]]; then
-    echo "Root reconciler privilege mutation observed SET ROLE in the grant session: session=${mutation_session_user} current=${mutation_current_user}" >&2
-  fi
-  expected_entry="public.projects:SELECT:grantor=${mutation_current_user}:grantee=forge_project_root_reconciler"
+  [[ "${mutation_can_set_owner}" == t && "${mutation_current_user}" == "${mutation_owner_role}" ]] || {
+    fail_with_output "${phase}: mutation session could not assume the catalog-derived owner role" "${output_file}"
+  }
+  # PostgreSQL records the ACL grantor as the owner role that issued GRANT.
+  # session_user remains in the proof output so inherited authority is visible.
+  expected_entry="public.projects:SELECT:grantor=${mutation_owner_role}:grantee=forge_project_root_reconciler"
 
   if [[ "${status}" -ne 3 ]]; then
     fail_with_output "${phase}: expected psql script rejection status 3, received ${status}" "${output_file}"
