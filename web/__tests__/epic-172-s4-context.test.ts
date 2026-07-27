@@ -290,6 +290,21 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(s4Migration).toContain("entry_set_digest ~ '^(hmac-sha256|sha256):[0-9a-f]{64}$'")
   })
 
+  it('rejects non-canonical protected clarification question text before auditing it', () => {
+    const historyReader = s4Migration.match(
+      /CREATE OR REPLACE FUNCTION forge\.read_architect_plan_history_v1\([\s\S]*?\n\$\$;/,
+    )?.[0]
+
+    expect(historyReader).toBeDefined()
+    expect(historyReader).toContain("jsonb_array_length(question.content::jsonb->'suggestions') > 4")
+    expect(historyReader).toContain("jsonb_array_elements(question.content::jsonb->'suggestions')")
+    expect(historyReader).toContain("pg_catalog.jsonb_typeof(suggestion.value) IS DISTINCT FROM 'string'")
+    expect(historyReader).toContain("suggestion.value #>> '{}' IS DISTINCT FROM pg_catalog.btrim(suggestion.value #>> '{}')")
+    expect(historyReader).toContain("GROUP BY normalized_suggestions.normalized")
+    expect(historyReader).toContain("question.content::jsonb->>'question' IS DISTINCT FROM pg_catalog.btrim(question.content::jsonb->>'question')")
+    expect(historyReader).toContain('CASE prevents jsonb_array_elements from evaluating malformed non-array JSON')
+  })
+
   it('exposes only atomic S4 lifecycle entry points to the packet issuer', () => {
     for (const helper of [
       'create_local_run_evidence_v1(uuid,uuid,integer)',

@@ -1141,7 +1141,34 @@ BEGIN
           OR pg_catalog.jsonb_typeof(question.content::jsonb->'questionId') IS DISTINCT FROM 'string'
           OR question.content::jsonb->>'questionId' IS DISTINCT FROM projection.id::text
           OR pg_catalog.jsonb_typeof(question.content::jsonb->'question') IS DISTINCT FROM 'string'
-          OR pg_catalog.jsonb_typeof(question.content::jsonb->'suggestions') IS DISTINCT FROM 'array'
+          OR CASE
+            WHEN pg_catalog.jsonb_typeof(question.content::jsonb->'question') = 'string' THEN
+              question.content::jsonb->>'question' IS DISTINCT FROM pg_catalog.btrim(question.content::jsonb->>'question')
+              OR pg_catalog.btrim(question.content::jsonb->>'question') = ''
+            ELSE true
+          END
+          -- CASE prevents jsonb_array_elements from evaluating malformed non-array JSON.
+          OR CASE
+            WHEN pg_catalog.jsonb_typeof(question.content::jsonb->'suggestions') = 'array' THEN
+              pg_catalog.jsonb_array_length(question.content::jsonb->'suggestions') > 4
+              OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.jsonb_array_elements(question.content::jsonb->'suggestions') AS suggestion(value)
+                WHERE pg_catalog.jsonb_typeof(suggestion.value) IS DISTINCT FROM 'string'
+                  OR suggestion.value #>> '{}' IS DISTINCT FROM pg_catalog.btrim(suggestion.value #>> '{}')
+                  OR pg_catalog.btrim(suggestion.value #>> '{}') = ''
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM (
+                  SELECT pg_catalog.btrim(suggestion.value #>> '{}') AS normalized
+                  FROM pg_catalog.jsonb_array_elements(question.content::jsonb->'suggestions') AS suggestion(value)
+                ) AS normalized_suggestions
+                GROUP BY normalized_suggestions.normalized
+                HAVING pg_catalog.count(*) > 1
+              )
+            ELSE true
+          END
         )
     ) OR EXISTS (
       SELECT 1
@@ -1165,7 +1192,34 @@ BEGIN
           OR pg_catalog.jsonb_typeof(question.content::jsonb->'questionId') IS DISTINCT FROM 'string'
           OR question.content::jsonb->>'questionId' IS DISTINCT FROM answer.question_id::text
           OR pg_catalog.jsonb_typeof(question.content::jsonb->'question') IS DISTINCT FROM 'string'
-          OR pg_catalog.jsonb_typeof(question.content::jsonb->'suggestions') IS DISTINCT FROM 'array')
+          OR CASE
+            WHEN pg_catalog.jsonb_typeof(question.content::jsonb->'question') = 'string' THEN
+              question.content::jsonb->>'question' IS DISTINCT FROM pg_catalog.btrim(question.content::jsonb->>'question')
+              OR pg_catalog.btrim(question.content::jsonb->>'question') = ''
+            ELSE true
+          END
+          -- CASE prevents jsonb_array_elements from evaluating malformed non-array JSON.
+          OR CASE
+            WHEN pg_catalog.jsonb_typeof(question.content::jsonb->'suggestions') = 'array' THEN
+              pg_catalog.jsonb_array_length(question.content::jsonb->'suggestions') > 4
+              OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.jsonb_array_elements(question.content::jsonb->'suggestions') AS suggestion(value)
+                WHERE pg_catalog.jsonb_typeof(suggestion.value) IS DISTINCT FROM 'string'
+                  OR suggestion.value #>> '{}' IS DISTINCT FROM pg_catalog.btrim(suggestion.value #>> '{}')
+                  OR pg_catalog.btrim(suggestion.value #>> '{}') = ''
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM (
+                  SELECT pg_catalog.btrim(suggestion.value #>> '{}') AS normalized
+                  FROM pg_catalog.jsonb_array_elements(question.content::jsonb->'suggestions') AS suggestion(value)
+                ) AS normalized_suggestions
+                GROUP BY normalized_suggestions.normalized
+                HAVING pg_catalog.count(*) > 1
+              )
+            ELSE true
+          END)
     ) OR EXISTS (
       SELECT 1 FROM public.architect_clarification_answers answer
       WHERE answer.task_id = $1 AND answer.source_plan_version <= $2
