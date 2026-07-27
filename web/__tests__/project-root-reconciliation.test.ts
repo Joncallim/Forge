@@ -64,6 +64,10 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(migration).toContain('CREATE CONSTRAINT TRIGGER project_root_reconciliation_write_contexts_commit_v1')
     expect(migration).toContain('DEFERRABLE INITIALLY DEFERRED')
     expect(migration).toContain('project-root write context must complete before commit')
+    expect(migration).toContain('forge.lock_project_root_reconciliation_authority_v1')
+    expect(migration).toContain('approval_row.project_id=p_project_id ORDER BY approval_row.id FOR UPDATE')
+    expect(migration).toContain('decision_row.project_id=p_project_id ORDER BY decision_row.id FOR UPDATE')
+    expect(migration).toContain('project-root authority lock has no active write context')
   })
 
   it('uses the dedicated login with only canonical helper state columns and fixed routines', () => {

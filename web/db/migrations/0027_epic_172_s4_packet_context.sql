@@ -732,6 +732,18 @@ REVOKE ALL ON FUNCTION forge.assert_project_root_reconciliation_write_context_co
 REVOKE ALL ON FUNCTION forge.reject_project_root_reconciliation_write_context_mutation_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.enter_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION forge.enter_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid) TO forge_project_root_reconciler;
+CREATE OR REPLACE FUNCTION forge.lock_project_root_reconciliation_authority_v1(p_operation_id uuid, p_actor_id uuid, p_generation bigint, p_project_id uuid)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+BEGIN
+  PERFORM forge.assert_project_root_reconciler_v1();
+  IF NOT EXISTS (SELECT 1 FROM public.project_root_reconciliation_write_contexts context_row WHERE context_row.operation_id=p_operation_id AND context_row.actor_id=p_actor_id AND context_row.generation=p_generation AND context_row.project_id=p_project_id AND context_row.backend_pid=pg_catalog.pg_backend_pid() AND context_row.transaction_id=pg_catalog.txid_current() AND context_row.completed_at IS NULL) THEN RAISE EXCEPTION 'project-root authority lock has no active write context' USING ERRCODE='42501'; END IF;
+  PERFORM 1 FROM public.filesystem_mcp_grant_approvals approval_row WHERE approval_row.project_id=p_project_id ORDER BY approval_row.id FOR UPDATE;
+  PERFORM 1 FROM public.project_filesystem_grant_decisions decision_row WHERE decision_row.project_id=p_project_id ORDER BY decision_row.id FOR UPDATE;
+  PERFORM 1 FROM public.project_filesystem_current_decision_pointers pointer_row WHERE pointer_row.project_id=p_project_id FOR UPDATE;
+  PERFORM 1 FROM public.filesystem_mcp_current_decision_pointers pointer_row JOIN public.work_packages package_row ON package_row.id=pointer_row.work_package_id JOIN public.tasks task_row ON task_row.id=package_row.task_id WHERE task_row.project_id=p_project_id ORDER BY pointer_row.work_package_id FOR UPDATE;
+END; $$;
+REVOKE ALL ON FUNCTION forge.lock_project_root_reconciliation_authority_v1(uuid,uuid,bigint,uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION forge.lock_project_root_reconciliation_authority_v1(uuid,uuid,bigint,uuid) TO forge_project_root_reconciler;
 CREATE OR REPLACE FUNCTION forge.complete_project_root_reconciliation_generation_v1(p_operation_id uuid, p_actor_id uuid, p_generation bigint, p_project_id uuid, p_outcome text)
 RETURNS TABLE(state text, last_processed_generation bigint)
 LANGUAGE plpgsql
