@@ -3,6 +3,8 @@ set -euo pipefail
 
 : "${FORGE_DATABASE_ADMIN_URL:?Set the short-lived PostgreSQL administrator URL.}"
 
+echo 'ROOT_RECONCILER_PRIVILEGE_MUTATIONS_START'
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 assertion_file="${script_dir}/sql/migration-0027-root-reconciler-privileges-assertions.sql"
 proof_tmpdir="$(mktemp -d)"
@@ -71,6 +73,9 @@ SQL
   if ! grep -F -- "${expected_entry}" "${output_file}" >/dev/null; then
     fail_with_output "${phase}: expected unexpected-set entry ${expected_entry} was absent" "${output_file}"
   fi
+  grep -F -- 'root reconciler effective privilege allowlist mismatch' "${output_file}"
+  grep -F -- "${expected_entry}" "${output_file}"
+  echo "ROOT_RECONCILER_PRIVILEGE_MUTATION_REJECTION phase=${phase} entry=${expected_entry}"
 }
 
 expect_grant_option_rejection() {
@@ -125,6 +130,10 @@ SQL
   if ! grep -F -- "${expected_entry}" "${output_file}" >/dev/null; then
     fail_with_output "${phase}: expected exact unexpected-set entry ${expected_entry} was absent" "${output_file}"
   fi
+  printf '%s\n' "${identity_line}"
+  grep -F -- 'root reconciler effective privilege allowlist mismatch' "${output_file}"
+  grep -F -- "${expected_entry}" "${output_file}"
+  echo "ROOT_RECONCILER_PRIVILEGE_MUTATION_REJECTION phase=${phase} entry=${expected_entry}"
 }
 
 # Every mutation is uncommitted. The assertion failure closes that psql session,
@@ -162,3 +171,4 @@ if ! psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 --file "${assertio
 fi
 
 [[ "$(snapshot_application_acls)" == "${baseline_acl}" ]] || { echo 'root reconciler privilege mutation proof left application ACL bytes changed after rollback' >&2; exit 1; }
+echo 'ROOT_RECONCILER_PRIVILEGE_MUTATIONS_SUCCESS'
