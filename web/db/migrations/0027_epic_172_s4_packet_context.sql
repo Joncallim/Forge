@@ -509,10 +509,6 @@ CREATE TABLE public.architect_plan_execution_references (
     FOREIGN KEY (work_package_id) REFERENCES public.work_packages(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
   CONSTRAINT architect_plan_execution_references_run_fk
     FOREIGN KEY (agent_run_id) REFERENCES public.agent_runs(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
-  CONSTRAINT architect_plan_execution_references_entry_fk
-    FOREIGN KEY (task_id, plan_version, entry_id)
-    REFERENCES public.architect_plan_entries(task_id, plan_version, entry_id)
-    ON UPDATE RESTRICT ON DELETE RESTRICT,
   CONSTRAINT architect_plan_execution_references_id_chk CHECK (
     pg_catalog.length(entry_id) BETWEEN 1 AND 256 AND entry_id ~ '^[a-z0-9._:-]+$'
   ),
@@ -6022,10 +6018,10 @@ BEGIN
   END IF;
   INSERT INTO public.architect_plan_execution_references (
     id, purpose, task_id, work_package_id, agent_run_id, plan_artifact_id, plan_version,
-    entry_id, agent, requirement_key, binding_fingerprint, content_digest, digest_key_id
+    entry_id, architect_plan_entry_id, agent, requirement_key, binding_fingerprint, content_digest, digest_key_id
   ) VALUES (
     v_reference_id, 'package_specialist', p_task_id, p_work_package_id, p_agent_run_id,
-    p_plan_artifact_id, p_plan_version, p_entry_id, v_agent, p_requirement_key,
+    p_plan_artifact_id, p_plan_version, p_entry_id, p_entry_id, v_agent, p_requirement_key,
     p_binding_fingerprint, p_content_digest, p_digest_key_id
   );
   RETURN v_reference_id;
@@ -6116,11 +6112,11 @@ BEGIN
 
   INSERT INTO public.architect_plan_execution_references (
     id, purpose, task_id, work_package_id, agent_run_id, plan_artifact_id,
-    plan_version, entry_id, agent, requirement_key, binding_fingerprint,
+    plan_version, entry_id, architect_plan_entry_id, agent, requirement_key, binding_fingerprint,
     content_digest, digest_key_id
   ) VALUES (
     v_reference_id, 'architect_replan', p_task_id, NULL, p_agent_run_id,
-    v_plan_artifact_id, v_plan_version, 'plan_body:000000', 'architect', NULL, NULL,
+    v_plan_artifact_id, v_plan_version, 'plan_body:000000', 'plan_body:000000', 'architect', NULL, NULL,
     v_content_digest, v_digest_key_id
   );
   RETURN v_reference_id;
@@ -6516,12 +6512,12 @@ BEGIN
   END IF;
   INSERT INTO public.architect_plan_execution_references (
     id, purpose, task_id, work_package_id, agent_run_id, plan_artifact_id,
-    plan_version, entry_id, agent, requirement_key, binding_fingerprint,
+    plan_version, entry_id, architect_plan_entry_id, agent, requirement_key, binding_fingerprint,
     content_digest, digest_key_id
   ) VALUES (
     v_reference_id, 'package_specialist', v_registration.task_id,
     v_registration.work_package_id, p_agent_run_id, v_registration.source_id,
-    v_registration.source_version, v_registration.entry_id,
+    v_registration.source_version, v_registration.entry_id, v_registration.entry_id,
     v_package.assigned_role, v_entry.requirement_key, v_entry.binding_fingerprint,
     v_registration.content_digest, v_registration.digest_key_id
   );
@@ -6606,12 +6602,12 @@ BEGIN
   ), inserted AS (
     INSERT INTO public.architect_plan_execution_references (
       id, purpose, task_id, work_package_id, agent_run_id, plan_artifact_id,
-      plan_version, entry_id, agent, requirement_key, binding_fingerprint,
+      plan_version, entry_id, architect_plan_entry_id, agent, requirement_key, binding_fingerprint,
       content_digest, digest_key_id
     )
     SELECT pg_catalog.gen_random_uuid(), 'architect_replan', v_task_id, NULL,
       p_agent_run_id, eligible.plan_artifact_id, eligible.plan_version,
-      eligible.entry_id, 'architect', eligible.requirement_key,
+      eligible.entry_id, eligible.entry_id, 'architect', eligible.requirement_key,
       eligible.binding_fingerprint, eligible.content_digest, eligible.digest_key_id
     FROM eligible
     RETURNING id, architect_plan_execution_references.entry_id
@@ -6648,7 +6644,8 @@ CREATE TABLE public.architect_clarification_answers (
   FOREIGN KEY (task_id, question_id)
     REFERENCES public.task_questions(task_id, id)
     ON UPDATE RESTRICT ON DELETE RESTRICT,
-  UNIQUE (task_id, question_id, id)
+  UNIQUE (task_id, question_id, id),
+  UNIQUE (task_id, source_plan_artifact_id, source_plan_version, id)
 );
 ALTER TABLE public.task_questions
   ADD COLUMN question_entry_id text,
@@ -6703,14 +6700,28 @@ CREATE TRIGGER architect_clarification_answer_writes_append_only
 REVOKE ALL ON public.architect_clarification_answers, public.architect_clarification_answer_writes FROM PUBLIC;
 ALTER TABLE public.architect_plan_execution_references
   ADD COLUMN source_kind text NOT NULL DEFAULT 'architect_plan_entry',
+  ADD COLUMN architect_plan_entry_id text,
   ADD COLUMN clarification_answer_id uuid,
   ADD CONSTRAINT architect_plan_execution_references_source_kind_chk CHECK (
-    (source_kind = 'architect_plan_entry' AND clarification_answer_id IS NULL)
-    OR (source_kind = 'clarification_answer' AND clarification_answer_id IS NOT NULL
+    (source_kind = 'architect_plan_entry'
+      AND architect_plan_entry_id IS NOT NULL
+      AND architect_plan_entry_id = entry_id
+      AND clarification_answer_id IS NULL)
+    OR (source_kind = 'clarification_answer'
+      AND architect_plan_entry_id IS NULL
+      AND clarification_answer_id IS NOT NULL
+      AND entry_id = 'clarification_answer:' || clarification_answer_id::text
       AND purpose = 'architect_replan' AND work_package_id IS NULL AND agent = 'architect')
   ),
-  ADD CONSTRAINT architect_plan_execution_references_answer_fk FOREIGN KEY (clarification_answer_id)
-    REFERENCES public.architect_clarification_answers(id) ON UPDATE RESTRICT ON DELETE RESTRICT;
+  ADD CONSTRAINT architect_plan_execution_references_plan_source_fk
+    FOREIGN KEY (task_id, plan_version, architect_plan_entry_id)
+    REFERENCES public.architect_plan_entries(task_id, plan_version, entry_id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  ADD CONSTRAINT architect_plan_execution_references_answer_source_fk
+    FOREIGN KEY (task_id, plan_artifact_id, plan_version, clarification_answer_id)
+    REFERENCES public.architect_clarification_answers(
+      task_id, source_plan_artifact_id, source_plan_version, id
+    ) ON UPDATE RESTRICT ON DELETE RESTRICT;
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION forge.bind_architect_replan_context_v3(
   p_agent_run_id uuid, p_prior_plan_artifact_id uuid
@@ -6744,11 +6755,12 @@ BEGIN
     INSERT INTO public.architect_plan_execution_references (
       id, purpose, task_id, work_package_id, agent_run_id, plan_artifact_id,
       plan_version, entry_id, agent, requirement_key, binding_fingerprint,
-      content_digest, digest_key_id, source_kind, clarification_answer_id
+      content_digest, digest_key_id, source_kind, architect_plan_entry_id,
+      clarification_answer_id
     ) SELECT pg_catalog.gen_random_uuid(), 'architect_replan', v_task_id, NULL,
       p_agent_run_id, answer.source_plan_artifact_id, answer.source_plan_version,
-      'clarification_question:' || answer.question_id::text, 'architect', NULL, NULL,
-      answer.content_digest, answer.digest_key_id, 'clarification_answer', answer.id
+      'clarification_answer:' || answer.id::text, 'architect', NULL, NULL,
+      answer.content_digest, answer.digest_key_id, 'clarification_answer', NULL, answer.id
     FROM answers answer
     RETURNING id, clarification_answer_id
   )
@@ -6774,7 +6786,7 @@ BEGIN
     SELECT r.id, r.purpose, r.source_kind, r.task_id, r.plan_artifact_id, r.plan_version,
       entry.entry_id, entry.entry_kind, entry.agent, entry.requirement_key,
       entry.binding_fingerprint, entry.content, entry.content_digest, entry.digest_key_id,
-      entry.projection_eligible, NULL::uuid
+      entry.projection_eligible, NULL::uuid AS clarification_question_id
     FROM locked r JOIN public.agent_runs run ON run.id = r.agent_run_id
       AND run.task_id = r.task_id AND run.status = 'running'
     JOIN public.architect_plan_entries entry ON r.source_kind = 'architect_plan_entry'
@@ -6786,7 +6798,8 @@ BEGIN
     UNION ALL
     SELECT r.id, r.purpose, r.source_kind, r.task_id, r.plan_artifact_id, r.plan_version,
       'clarification_answer:' || answer.id::text, 'clarification_answer', NULL, NULL, NULL,
-      answer.answer, answer.content_digest, answer.digest_key_id, false, answer.question_id
+      answer.answer, answer.content_digest, answer.digest_key_id, false,
+      answer.question_id AS clarification_question_id
     FROM locked r JOIN public.agent_runs run ON run.id = r.agent_run_id
       AND run.task_id = r.task_id AND run.status = 'running'
     JOIN public.architect_clarification_answers answer ON r.source_kind = 'clarification_answer'
@@ -6798,9 +6811,13 @@ BEGIN
   ), consumed AS (
     UPDATE public.architect_plan_execution_references r SET resolved_at = pg_catalog.clock_timestamp()
     FROM eligible WHERE r.id = eligible.id RETURNING eligible.*
-  ) SELECT purpose, source_kind, task_id, plan_artifact_id, plan_version, entry_id, entry_kind,
-    agent, requirement_key, binding_fingerprint, content, content_digest, digest_key_id,
-    projection_eligible, clarification_question_id FROM consumed;
+  ) SELECT consumed.purpose, consumed.source_kind, consumed.task_id,
+    consumed.plan_artifact_id, consumed.plan_version, consumed.entry_id,
+    consumed.entry_kind, consumed.agent, consumed.requirement_key,
+    consumed.binding_fingerprint, consumed.content, consumed.content_digest,
+    consumed.digest_key_id, consumed.projection_eligible,
+    consumed.clarification_question_id
+  FROM consumed;
 END;
 $$;
 CREATE OR REPLACE FUNCTION forge.append_architect_clarification_answer_v1(
