@@ -367,6 +367,18 @@ export function createLegacyLeakagePostgresAdapter(
         `
         if (checkpointRows[0]?.value !== input.current.token) return 'checkpoint_conflict' as const
 
+        if (input.row.kind === 'artifact') {
+          // Lock identity without projecting protected bytes. A subsequent READ COMMITTED
+          // statement observes a plan-version link that committed while this lock waited.
+          const artifactIdentityRows = await transaction<{ id: string }[]>`
+            select a.id::text as id
+            from artifacts a
+            where a.id = ${input.row.id}::uuid
+            for update
+          `
+          if (artifactIdentityRows.length !== 1) return 'row_conflict' as const
+        }
+
         const sourceRows = input.row.kind === 'task_log'
           ? await transaction<Record<string, unknown>[]>`
               select id::text as id, message, front_matter as "frontMatter", metadata
@@ -388,16 +400,15 @@ export function createLegacyLeakagePostgresAdapter(
                   a.artifact_type = 'adr_text'
                   and r.agent_type = 'architect'
                   and a.content <> ${ARCHITECT_PLAN_HEADER}
-                  and version.plan_artifact_id is null
                 ) as "replaceContent"
               from artifacts a
               join agent_runs r on r.id = a.agent_run_id
-              left join (
-                select distinct plan_artifact_id from architect_plan_versions
-              ) version on version.plan_artifact_id = a.id
               where a.id = ${input.row.id}::uuid
-                and version.plan_artifact_id is null
-              for update of a
+                and not exists (
+                  select 1
+                  from architect_plan_versions version
+                  where version.plan_artifact_id = a.id
+                )
             `
         if (sourceRows.length !== 1) return 'row_conflict' as const
         const source = input.row.kind === 'task_log'

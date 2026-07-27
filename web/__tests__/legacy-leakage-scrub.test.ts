@@ -6,6 +6,7 @@ import {
 } from '@/lib/mcps/leakage-drain'
 import {
   containsForbiddenV2EventData,
+  compareCanonicalCodeUnits,
   LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY,
   legacyLeakageRowFingerprint,
   legacyLeakageSentinelSetFingerprint,
@@ -452,6 +453,35 @@ describe('legacy leakage scrub', () => {
     expect(JSON.stringify(database.checkpoint)).not.toContain(FINGERPRINT_KEY.toString('hex'))
   })
 
+  it('uses explicit code-unit HMAC ordering for non-ASCII object keys and sentinels', () => {
+    expect(['é', 'z', 'a', 'ä', '𝌆'].sort(compareCanonicalCodeUnits)).toEqual(['a', 'z', 'ä', 'é', '𝌆'])
+    expect(legacyLeakageSentinelSetFingerprint(['é', 'z', 'a', 'ä', '𝌆', 'a'], FINGERPRINT_KEY))
+      .toBe('f57d110257c9a31528c0b6d85f2072c524203b96551abb5afe6185a25ba9a33c')
+    const first = { ...taskLog(), metadata: { 'é': 1, z: 2, a: 3, 'ä': 4, '𝌆': 5 } }
+    const second = { ...taskLog(), metadata: { '𝌆': 5, 'ä': 4, a: 3, z: 2, 'é': 1 } }
+    expect(legacyLeakageRowFingerprint(first, FINGERPRINT_KEY)).toBe(legacyLeakageRowFingerprint(second, FINGERPRINT_KEY))
+  })
+
+  it('rejects a checkpoint whose embedded operation identity differs from the requested storage key', async () => {
+    const database = new FakeDatabase()
+    const redis = new FakeRedis()
+    await runLegacyLeakageScrub({
+      actor: 'operator', authorizationReceiptId: RECEIPT, fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID, mode: 'apply', operationId: 'stored-operation',
+    }, { database, redis })
+    const checkpoint = database.checkpoint!
+    database.checkpoint = {
+      checkpoint: { ...checkpoint.checkpoint, operationId: 'embedded-other-operation' },
+      token: checkpoint.token,
+    }
+    const writesBefore = database.checkpointWrites
+    await expect(runLegacyLeakageScrub({
+      actor: 'operator', authorizationReceiptId: RECEIPT, fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID, mode: 'resume', operationId: 'stored-operation',
+    }, { database, redis })).rejects.toThrow('operation identity does not match its storage key')
+    expect(database.checkpointWrites).toBe(writesBefore)
+  })
+
   it('fails closed instead of resuming an unsafe v1 checkpoint and exposes a closed sink policy', () => {
     expect(() => parseLegacyLeakageScrubCheckpoint(JSON.stringify({ schemaVersion: 1, operationId: 'old' })))
       .toThrow('unsafe legacy format; start a new --apply operation')
@@ -688,6 +718,15 @@ describe('legacy leakage CLI and operator guide', () => {
     expect(commandSource).toContain('select distinct plan_artifact_id from architect_plan_versions')
     expect(commandSource).toContain('where version.plan_artifact_id is null')
     expect(commandSource).toContain('and version.plan_artifact_id is null')
+    expect(commandSource).toContain('select a.id::text as id')
+    expect(commandSource).toContain('for update')
+    expect(commandSource).toContain('and not exists (')
+    const identityStart = commandSource.indexOf("if (input.row.kind === 'artifact')")
+    const reloadStart = commandSource.indexOf('const sourceRows =', identityStart)
+    expect(identityStart).toBeGreaterThan(-1)
+    expect(reloadStart).toBeGreaterThan(identityStart)
+    expect(commandSource.slice(identityStart, reloadStart)).not.toContain('a.content')
+    expect(commandSource.slice(reloadStart)).toContain('and not exists (')
     expect(commandSource).toContain('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY')
     expect(commandSource).not.toContain('createHash')
     expect(commandSource).not.toContain('historyAvailable":true')

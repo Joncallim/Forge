@@ -187,11 +187,18 @@ function canonicalize(value: unknown): unknown {
   if (value !== null && typeof value === 'object') {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
-        .sort(([left], [right]) => left.localeCompare(right))
+        .sort(([left], [right]) => compareCanonicalCodeUnits(left, right))
         .map(([key, item]) => [key, canonicalize(item)]),
     )
   }
   return value
+}
+
+/** Stable UTF-16 code-unit ordering: independent of host locale and ICU version. */
+export function compareCanonicalCodeUnits(left: string, right: string): number {
+  if (left < right) return -1
+  if (left > right) return 1
+  return 0
 }
 
 function validateFingerprintKey(key: Buffer): Buffer {
@@ -224,7 +231,7 @@ export function legacyLeakageRowFingerprint(row: LegacyLeakageScrubRow, key: Buf
 }
 
 export function legacyLeakageSentinelSetFingerprint(sentinels: readonly string[], key: Buffer): string {
-  const canonicalSet = [...new Set(sentinels)].sort((left, right) => left.localeCompare(right))
+  const canonicalSet = [...new Set(sentinels)].sort(compareCanonicalCodeUnits)
   return keyedFingerprint(LEGACY_LEAKAGE_SCRUB_SENTINEL_DOMAIN, canonicalSet, key)
 }
 
@@ -614,6 +621,9 @@ export async function runLegacyLeakageScrub(
 
   const operationId = validateIdentity('operationId', options.operationId)
   let current = await dependencies.database.loadCheckpoint(operationId)
+  if (current && current.checkpoint.operationId !== operationId) {
+    throw new Error('Loaded leakage scrub checkpoint operation identity does not match its storage key.')
+  }
   if (options.mode === 'apply') {
     if (current) throw new Error('This operation already exists; use --resume.')
     const databaseTime = await dependencies.database.databaseTime()
