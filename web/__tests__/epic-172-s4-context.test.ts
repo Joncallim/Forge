@@ -276,6 +276,19 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(s4Migration).toMatch(/RETURNS TABLE \(purpose text, source_kind text, task_id uuid/)
   })
 
+  it('audits the complete protected clarification history set without truncation', () => {
+    const historyReader = s4Migration.match(
+      /CREATE OR REPLACE FUNCTION forge\.read_architect_plan_history_v1\([\s\S]*?\n\$\$;/,
+    )?.[0] ?? ''
+    expect(historyReader).toContain("'sha256:' || pg_catalog.encode(pg_catalog.sha256")
+    expect(historyReader).toContain("entry_kind IN ('plan_body','requirement','routing','overlay','subtask')")
+    expect(historyReader).toContain('projection.source_plan_version <= $2')
+    expect(historyReader).toContain('answer.source_plan_version <= $2')
+    expect(historyReader).toContain('v_returned_entry_count > 256')
+    expect(historyReader).not.toMatch(/LIMIT\s+256/i)
+    expect(s4Migration).toContain("entry_set_digest ~ '^(hmac-sha256|sha256):[0-9a-f]{64}$'")
+  })
+
   it('exposes only atomic S4 lifecycle entry points to the packet issuer', () => {
     for (const helper of [
       'create_local_run_evidence_v1(uuid,uuid,integer)',
