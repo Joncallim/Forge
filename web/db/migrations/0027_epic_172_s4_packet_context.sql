@@ -1130,8 +1130,11 @@ BEGIN
         AND question.entry_id = projection.question_entry_id
         AND question.entry_kind = 'clarification_question'
       WHERE projection.task_id = $1
+        AND projection.status = 'open'
         AND projection.source_plan_version <= $2
+        AND projection.source_plan_version IS NOT NULL
         AND projection.question_entry_id IS NOT NULL
+        AND projection.source_plan_artifact_id IS NOT NULL
         AND (
           projection.question_entry_id <> 'clarification_question:' || projection.id::text
           OR question.entry_id IS NULL
@@ -1185,7 +1188,9 @@ BEGIN
         AND question.entry_kind = 'clarification_question'
       WHERE answer.task_id = $1
         AND answer.source_plan_version <= $2
-        AND (projection.id IS NULL OR question.entry_id IS NULL
+        AND (projection.id IS NULL
+          OR projection.status IS DISTINCT FROM 'answered'
+          OR question.entry_id IS NULL
           OR pg_catalog.jsonb_typeof(question.content::jsonb) IS DISTINCT FROM 'object'
           OR (SELECT pg_catalog.count(*) FROM pg_catalog.jsonb_object_keys(question.content::jsonb)) IS DISTINCT FROM 4
           OR question.content::jsonb->'schemaVersion' IS DISTINCT FROM '1'::jsonb
