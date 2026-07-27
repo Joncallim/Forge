@@ -13,7 +13,10 @@ import {
   check,
   foreignKey,
   index,
+  primaryKey,
+  unique,
   uniqueIndex,
+  type AnyPgColumn,
 } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
 import type { InferSelectModel, InferInsertModel } from 'drizzle-orm'
@@ -92,18 +95,31 @@ export const sessions = pgTable(
     revokedAt: timestamp('revoked_at', tsOpts),
     userAgent: text('user_agent'),
     ipAddress: inet('ip_address'),
-    credentialDigestV1: bytea('credential_digest_v1').notNull(),
-    expiresAt: timestamp('expires_at', tsOpts).notNull(),
+    credentialDigestV1: bytea('credential_digest_v1'),
+    expiresAt: timestamp('expires_at', tsOpts),
+    credentialStorageVersion: integer('credential_storage_version').notNull().default(0),
+    legacyRedisPurgePendingAt: timestamp('legacy_redis_purge_pending_at', tsOpts),
+    legacyRedisInvalidatedAt: timestamp('legacy_redis_invalidated_at', tsOpts),
   },
   (t) => [
     index('sessions_user_id_idx').on(t.userId),
     index('sessions_revoked_at_idx').on(t.revokedAt),
-    uniqueIndex('sessions_credential_digest_v1_idx').on(t.credentialDigestV1),
+    uniqueIndex('sessions_credential_digest_v1_idx')
+      .on(t.credentialDigestV1)
+      .where(sql`${t.credentialDigestV1} is not null`),
   ],
 )
 
 export type Session = InferSelectModel<typeof sessions>
 export type NewSession = InferInsertModel<typeof sessions>
+
+export const sessionCredentialReconciliation = pgTable('session_credential_reconciliation', {
+  singleton: boolean('singleton').primaryKey().default(true),
+  state: text('state').notNull().default('expansion'),
+  rowsMigrated: bigint('rows_migrated', { mode: 'bigint' }).notNull().default(sql`0`),
+  rowsRevoked: bigint('rows_revoked', { mode: 'bigint' }).notNull().default(sql`0`),
+  updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+})
 
 // ---------------------------------------------------------------------------
 // providerConfigs
@@ -195,17 +211,19 @@ export const projects = pgTable('projects', {
     .notNull()
     .default(sql`'{"profile":"default","requiredMcps":["filesystem","github"],"overrides":{}}'::jsonb`),
   // Opaque packet identity. It is random and never derived from localPath.
-  rootRef: uuid('root_ref').notNull().defaultRandom(),
+  // This remains nullable during the restartable 0027 expansion; a separately
+  // gated cutover adds NOT NULL only after a durable zero-null scan.
+  rootRef: uuid('root_ref').defaultRandom(),
   // S3 serializes this BIGINT as a canonical decimal string at every JSON/API
   // boundary. Database order, never timestamps, decides grant precedence.
   grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' })
     .notNull()
-    .default(BigInt(0)),
+    .default(sql`0`),
   // Zero is the explicit unbound state. S4 binds a project root by advancing
   // this counter; S3 never upgrades a legacy decision implicitly.
   rootBindingRevision: bigint('root_binding_revision', { mode: 'bigint' })
     .notNull()
-    .default(BigInt(0)),
+    .default(sql`0`),
   defaultBranch: text('default_branch').notNull().default('main'),
   createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
@@ -216,6 +234,14 @@ export const projects = pgTable('projects', {
 
 export type Project = InferSelectModel<typeof projects>
 export type NewProject = InferInsertModel<typeof projects>
+
+export const projectRootRefReconciliation = pgTable('project_root_ref_reconciliation', {
+  singleton: boolean('singleton').primaryKey().default(true),
+  lastProjectId: uuid('last_project_id'),
+  rowsUpdated: bigint('rows_updated', { mode: 'bigint' }).notNull().default(sql`0`),
+  state: text('state').notNull().default('pending'),
+  updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+})
 
 // ---------------------------------------------------------------------------
 // Epic 172 release authentication and transition substrate
@@ -690,6 +716,12 @@ export const tasks = pgTable(
     githubBranch: text('github_branch'),
     githubPrUrl: text('github_pr_url'),
     errorMessage: text('error_message'),
+    localProjectionScopeState: text('local_projection_scope_state').notNull().default('active'),
+    localProjectionOverlimitPackageCount: integer('local_projection_overlimit_package_count'),
+    localProjectionSourceTaskId: uuid('local_projection_source_task_id'),
+    localProjectionReplacementState: text('local_projection_replacement_state'),
+    localProjectionReplacementVersion: bigint('local_projection_replacement_version', { mode: 'bigint' }),
+    localProjectionReplacementFingerprint: text('local_projection_replacement_fingerprint'),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
     completedAt: timestamp('completed_at', tsOpts),
@@ -702,16 +734,17 @@ export const tasks = pgTable(
   ],
 )
 
-export type Task = InferSelectModel<typeof tasks>
-export type NewTask = InferInsertModel<typeof tasks>
+type TaskRow = InferSelectModel<typeof tasks>
+type NewTaskRow = InferInsertModel<typeof tasks>
+type TaskProjectionScopeFields = 'localProjectionScopeState' | 'localProjectionOverlimitPackageCount'
 
-// Narrow mapping for the migration-0026 claimability boundary. Keeping this
-// separate avoids making protocol-only upgrade metadata part of every Task DTO.
-export const taskLocalProjectionScopes = pgTable('tasks', {
-  id: uuid('id').primaryKey(),
-  localProjectionScopeState: text('local_projection_scope_state').notNull(),
-  localProjectionOverlimitPackageCount: integer('local_projection_overlimit_package_count'),
-})
+export type Task = Omit<TaskRow, TaskProjectionScopeFields>
+export type NewTask = Omit<NewTaskRow, TaskProjectionScopeFields>
+
+// Keep the focused protocol query surface without registering a second,
+// partial Drizzle definition for the same physical table. Duplicate table
+// definitions make migration snapshot generation discard one of the shapes.
+export const taskLocalProjectionScopes = tasks
 
 // ---------------------------------------------------------------------------
 // taskAttempts
@@ -928,7 +961,7 @@ export const filesystemMcpCurrentDecisionPointers = pgTable(
     currentDecisionRevision: bigint('current_decision_revision', { mode: 'bigint' }),
     currentDecisionFingerprint: text('current_decision_fingerprint'),
     pointerFingerprint: text('pointer_fingerprint').notNull(),
-    pointerVersion: bigint('pointer_version', { mode: 'bigint' }).notNull().default(BigInt(0)),
+    pointerVersion: bigint('pointer_version', { mode: 'bigint' }).notNull().default(sql`0`),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
   },
@@ -1042,7 +1075,7 @@ export const projectFilesystemCurrentDecisionPointers = pgTable(
     currentRootBindingRevision: bigint('current_root_binding_revision', { mode: 'bigint' }),
     currentDecisionFingerprint: text('current_decision_fingerprint'),
     currentDecisionGeneration: bigint('current_decision_generation', { mode: 'bigint' }),
-    pointerGeneration: bigint('pointer_generation', { mode: 'bigint' }).notNull().default(BigInt(0)),
+    pointerGeneration: bigint('pointer_generation', { mode: 'bigint' }).notNull().default(sql`0`),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
   },
@@ -1118,7 +1151,7 @@ export const workPackageLocalProjectionHeads = pgTable(
     headKind: text('head_kind').notNull(),
     headIndex: bigint('head_index', { mode: 'bigint' }).notNull(),
     headFingerprint: text('head_fingerprint').notNull(),
-    headRevision: bigint('head_revision', { mode: 'bigint' }).notNull().default(BigInt(0)),
+    headRevision: bigint('head_revision', { mode: 'bigint' }).notNull().default(sql`0`),
     compareAndSetFingerprint: text('compare_and_set_fingerprint').notNull(),
     currentSourceId: uuid('current_source_id'),
     currentSourceTaskId: uuid('current_source_task_id'),
@@ -1272,6 +1305,10 @@ export const agentRuns = pgTable(
       { onDelete: 'set null' },
     ),
     modelIdUsed: text('model_id_used').notNull(), // snapshot at run time
+    providerTypeUsed: text('provider_type_used'),
+    providerIsLocalUsed: boolean('provider_is_local_used'),
+    providerConfigUpdatedAtUsed: timestamp('provider_config_updated_at_used', tsOpts),
+    acpExecutionMode: text('acp_execution_mode').notNull().default('not_applicable'),
     // 'pending'|'running'|'completed'|'failed'
     status: text('status').notNull().default('pending'),
     inputTokens: integer('input_tokens'),
@@ -1331,6 +1368,7 @@ export const architectPlanVersions = pgTable(
     digestKeyId: text('digest_key_id').notNull(),
     entryCount: integer('entry_count').notNull(),
     entrySetDigest: text('entry_set_digest').notNull(),
+    structuralSetDigest: text('structural_set_digest').notNull(),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
   },
   (t) => [
@@ -1366,8 +1404,9 @@ export const architectPlanExecutionReferences = pgTable(
   'architect_plan_execution_references',
   {
     id: uuid('id').primaryKey().defaultRandom(),
+    purpose: text('purpose').notNull().default('package_specialist'),
     taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
-    workPackageId: uuid('work_package_id').notNull().references(() => workPackages.id, { onDelete: 'restrict' }),
+    workPackageId: uuid('work_package_id').references(() => workPackages.id, { onDelete: 'restrict' }),
     agentRunId: uuid('agent_run_id').notNull().references(() => agentRuns.id, { onDelete: 'restrict' }),
     planArtifactId: uuid('plan_artifact_id').notNull(),
     planVersion: bigint('plan_version', { mode: 'bigint' }).notNull(),
@@ -1383,7 +1422,97 @@ export const architectPlanExecutionReferences = pgTable(
   (t) => [
     uniqueIndex('architect_plan_execution_references_run_entry_idx').on(t.agentRunId, t.entryId),
     index('architect_plan_execution_references_package_idx').on(t.workPackageId, t.agentRunId),
+    check(
+      'architect_plan_execution_references_purpose_chk',
+      sql`${t.purpose} in ('package_specialist', 'architect_replan')`,
+    ),
+    check(
+      'architect_plan_execution_references_purpose_shape_chk',
+      sql`(${t.purpose} = 'package_specialist' and ${t.workPackageId} is not null)
+        or (${t.purpose} = 'architect_replan' and ${t.workPackageId} is null
+          and ${t.agent} = 'architect')`,
+    ),
   ],
+)
+
+export const protectedPackageEntryRegistrations = pgTable(
+  'protected_package_entry_registrations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    workPackageId: uuid('work_package_id').notNull().references(() => workPackages.id, { onDelete: 'restrict' }),
+    sourceKind: text('source_kind').notNull(),
+    sourceId: uuid('source_id').notNull(),
+    sourceVersion: bigint('source_version', { mode: 'bigint' }).notNull(),
+    entryId: text('entry_id').notNull(),
+    entryKind: text('entry_kind').notNull(),
+    bindingSetDigest: text('binding_set_digest').notNull(),
+    contentDigest: text('content_digest').notNull(),
+    digestKeyId: text('digest_key_id').notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('protected_package_entry_registrations_identity_idx').on(
+      t.taskId, t.workPackageId, t.sourceKind, t.sourceId, t.sourceVersion, t.entryId,
+    ),
+  ],
+)
+
+export const protectedEntryCapabilityBindings = pgTable(
+  'protected_entry_capability_bindings',
+  {
+    sourceKind: text('source_kind').notNull(),
+    sourceId: uuid('source_id').notNull(),
+    sourceVersion: bigint('source_version', { mode: 'bigint' }).notNull(),
+    entryId: text('entry_id').notNull(),
+    ordinal: integer('ordinal').notNull(),
+    capability: text('capability').notNull(),
+    requirementKey: text('requirement_key').notNull(),
+    routingFingerprint: text('routing_fingerprint').notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.sourceKind, t.sourceId, t.sourceVersion, t.entryId, t.ordinal] }),
+  ],
+)
+
+export const mcpOperatorReviewVersions = pgTable(
+  'mcp_operator_review_versions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    approvalGateId: uuid('approval_gate_id').notNull(),
+    sourceArtifactId: uuid('source_artifact_id').notNull(),
+    sourcePlanVersion: bigint('source_plan_version', { mode: 'bigint' }).notNull(),
+    revision: integer('revision').notNull(),
+    previousReviewSetDigest: text('previous_review_set_digest'),
+    reviewSetDigest: text('review_set_digest').notNull(),
+    itemCount: integer('item_count').notNull(),
+    entryCount: integer('entry_count').notNull(),
+    approvedCount: integer('approved_count').notNull(),
+    deniedCount: integer('denied_count').notNull(),
+    blockerCodes: text('blocker_codes').array().notNull().default(sql`ARRAY[]::text[]`),
+    createdByUserId: uuid('created_by_user_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('mcp_operator_review_versions_gate_revision_idx').on(t.approvalGateId, t.revision),
+  ],
+)
+
+export const mcpOperatorReviewEntries = pgTable(
+  'mcp_operator_review_entries',
+  {
+    reviewVersionId: uuid('review_version_id').notNull().references(() => mcpOperatorReviewVersions.id, { onDelete: 'restrict' }),
+    entryId: text('entry_id').notNull(),
+    entryKind: text('entry_kind').notNull(),
+    agent: text('agent').notNull(),
+    requirementKey: text('requirement_key').notNull(),
+    content: text('content').notNull(),
+    contentDigest: text('content_digest').notNull(),
+    digestKeyId: text('digest_key_id').notNull(),
+    projectionEligible: boolean('projection_eligible').notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.reviewVersionId, t.entryId] })],
 )
 
 export const architectPlanHistoryReads = pgTable(
@@ -1401,14 +1530,6 @@ export const architectPlanHistoryReads = pgTable(
   (t) => [index('architect_plan_history_reads_task_version_idx').on(t.taskId, t.planVersion)],
 )
 
-export const epic172S4ProtocolState = pgTable('epic_172_s4_protocol_state', {
-  singleton: boolean('singleton').primaryKey().default(true),
-  producersEnabled: boolean('producers_enabled').notNull().default(false),
-  protocolEpoch: integer('protocol_epoch').notNull().default(1),
-  enabledBuildSha: text('enabled_build_sha'),
-  updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
-})
-
 export const workPackageLocalRunEvidence = pgTable(
   'work_package_local_run_evidence',
   {
@@ -1417,9 +1538,15 @@ export const workPackageLocalRunEvidence = pgTable(
     workPackageId: uuid('work_package_id').notNull().references(() => workPackages.id, { onDelete: 'restrict' }),
     agentRunId: uuid('agent_run_id').notNull().references(() => agentRuns.id, { onDelete: 'restrict' }).unique(),
     claimToken: uuid('claim_token').notNull().unique(),
+    claimGeneration: bigint('claim_generation', { mode: 'bigint' }).notNull().default(sql`1`),
+    lastHeartbeatAt: timestamp('last_heartbeat_at', tsOpts).defaultNow().notNull(),
     leaseExpiresAt: timestamp('lease_expires_at', tsOpts).notNull(),
     state: text('state').notNull().default('claimed'),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    terminal: jsonb('terminal').$type<Record<string, unknown>>(),
+    completionArtifactId: uuid('completion_artifact_id').references(() => artifacts.id, {
+      onDelete: 'restrict',
+    }),
     terminalAt: timestamp('terminal_at', tsOpts),
   },
   (t) => [index('work_package_local_run_evidence_package_idx').on(t.workPackageId, t.agentRunId)],
@@ -1472,6 +1599,8 @@ export const filesystemMcpRuntimeAudits = pgTable(
       onDelete: 'restrict',
     }),
     claimToken: uuid('claim_token'),
+    claimGeneration: bigint('claim_generation', { mode: 'bigint' }),
+    lastHeartbeatAt: timestamp('last_heartbeat_at', tsOpts),
     leaseExpiresAt: timestamp('lease_expires_at', tsOpts),
     authorizationSnapshot: jsonb('authorization_snapshot').$type<Record<string, unknown>>(),
     authorizationSource: text('authorization_source'),
@@ -1480,6 +1609,9 @@ export const filesystemMcpRuntimeAudits = pgTable(
     grantDecisionNonce: uuid('grant_decision_nonce'),
     authorizationRootBindingRevision: bigint('authorization_root_binding_revision', { mode: 'bigint' }),
     projectDecisionId: uuid('project_decision_id').references(() => projectFilesystemGrantDecisions.id, {
+      onDelete: 'restrict',
+    }),
+    completionArtifactId: uuid('completion_artifact_id').references(() => artifacts.id, {
       onDelete: 'restrict',
     }),
     assembly: jsonb('assembly').$type<Record<string, unknown>>(),
@@ -1546,6 +1678,12 @@ export const approvalGates = pgTable(
       .$type<Record<string, unknown>>()
       .notNull()
       .default(sql`'{}'::jsonb`),
+    protectedReviewRevision: integer('protected_review_revision'),
+    protectedReviewSetDigest: text('protected_review_set_digest'),
+    protectedReviewItemCount: integer('protected_review_item_count'),
+    protectedReviewApprovedCount: integer('protected_review_approved_count'),
+    protectedReviewDeniedCount: integer('protected_review_denied_count'),
+    protectedReviewBlockerCodes: text('protected_review_blocker_codes').array(),
     decidedAt: timestamp('decided_at', tsOpts),
     decidedBy: uuid('decided_by').references(() => users.id, {
       onDelete: 'set null',
@@ -1567,6 +1705,144 @@ export const approvalGates = pgTable(
 
 export type ApprovalGate = InferSelectModel<typeof approvalGates>
 export type NewApprovalGate = InferInsertModel<typeof approvalGates>
+
+export const s4CompletionHandoffs = pgTable(
+  's4_completion_handoffs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    workPackageId: uuid('work_package_id').notNull().references(() => workPackages.id, { onDelete: 'restrict' }),
+    agentRunId: uuid('agent_run_id').notNull().references(() => agentRuns.id, { onDelete: 'restrict' }).unique(),
+    localRunEvidenceId: uuid('local_run_evidence_id').notNull().references(() => workPackageLocalRunEvidence.id, { onDelete: 'restrict' }).unique(),
+    runtimeAuditId: uuid('runtime_audit_id').references(() => filesystemMcpRuntimeAudits.id, { onDelete: 'restrict' }).unique(),
+    completionArtifactId: uuid('completion_artifact_id').notNull().references(() => artifacts.id, { onDelete: 'restrict' }).unique(),
+    state: text('state').notNull().default('pending'),
+    requiredGateTypes: text('required_gate_types').array(),
+    reconciliationClaimToken: uuid('reconciliation_claim_token'),
+    reconciliationClaimedBy: text('reconciliation_claimed_by'),
+    reconciliationClaimGeneration: bigint('reconciliation_claim_generation', { mode: 'bigint' }).notNull().default(sql`0`),
+    reconciliationLeaseExpiresAt: timestamp('reconciliation_lease_expires_at', tsOpts),
+    reconcileAttemptCount: integer('reconcile_attempt_count').notNull().default(0),
+    nextReconcileAt: timestamp('next_reconcile_at', tsOpts).defaultNow().notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    materializedAt: timestamp('materialized_at', tsOpts),
+  },
+  (t) => [index('s4_completion_handoffs_package_state_idx').on(t.workPackageId, t.state)],
+)
+
+export const s4ProtectedReviewSources = pgTable('s4_protected_review_sources', {
+  sourceArtifactId: uuid('source_artifact_id').primaryKey().references(() => artifacts.id, { onDelete: 'restrict' }),
+  taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+  workPackageId: uuid('work_package_id').notNull().references(() => workPackages.id, { onDelete: 'restrict' }),
+  sourceAgentRunId: uuid('source_agent_run_id').notNull().references(() => agentRuns.id, { onDelete: 'restrict' }).unique(),
+  content: text('content').notNull(),
+  metadata: jsonb('metadata').$type<Record<string, unknown> | null>(),
+  contentFingerprint: text('content_fingerprint').notNull().unique(),
+  createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+})
+
+export const s4ProtectedReviewSourceReads = pgTable(
+  's4_protected_review_source_reads',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    approvalGateId: uuid('approval_gate_id').notNull().references(() => approvalGates.id, { onDelete: 'restrict' }),
+    sourceArtifactId: uuid('source_artifact_id').notNull().references(() => s4ProtectedReviewSources.sourceArtifactId, { onDelete: 'restrict' }),
+    sourceAgentRunId: uuid('source_agent_run_id').notNull().references(() => agentRuns.id, { onDelete: 'restrict' }),
+    contentFingerprint: text('content_fingerprint').notNull(),
+    readAt: timestamp('read_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [index('s4_protected_review_source_reads_gate_idx').on(t.approvalGateId, t.readAt)],
+)
+
+export const filesystemMcpIssuanceRecoveryActions = pgTable(
+  'filesystem_mcp_issuance_recovery_actions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    workPackageId: uuid('work_package_id').notNull().references(() => workPackages.id, { onDelete: 'restrict' }),
+    priorRuntimeAuditId: uuid('prior_runtime_audit_id').notNull().references(() => filesystemMcpRuntimeAudits.id, { onDelete: 'restrict' }),
+    action: text('action').notNull(),
+    expectedMarkerFingerprint: text('expected_marker_fingerprint').notNull(),
+    actorUserId: uuid('actor_user_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+    authorizingDecisionId: uuid('authorizing_decision_id').references(() => filesystemMcpGrantApprovals.id, { onDelete: 'restrict' }),
+    authorizingProjectDecisionId: uuid('authorizing_project_decision_id').references(
+      () => projectFilesystemGrantDecisions.id,
+      { onDelete: 'restrict', onUpdate: 'restrict' },
+    ),
+    result: text('result').notNull(),
+    resultMarkerFingerprint: text('result_marker_fingerprint'),
+    packageStatus: text('package_status').notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [index('filesystem_mcp_issuance_recovery_actions_audit_idx').on(t.priorRuntimeAuditId, t.createdAt)],
+)
+
+export const localEffectRecoveryActions = pgTable(
+  'local_effect_recovery_actions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    workPackageId: uuid('work_package_id').notNull().references(() => workPackages.id, { onDelete: 'restrict' }),
+    localRunEvidenceId: uuid('local_run_evidence_id').notNull().references(() => workPackageLocalRunEvidence.id, { onDelete: 'restrict' }),
+    action: text('action').notNull(),
+    expectedMarkerFingerprint: text('expected_marker_fingerprint').notNull(),
+    actorUserId: uuid('actor_user_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+    result: text('result').notNull(),
+    resultMarkerFingerprint: text('result_marker_fingerprint'),
+    packageStatus: text('package_status').notNull(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [index('local_effect_recovery_actions_evidence_idx').on(t.localRunEvidenceId, t.createdAt)],
+)
+
+export const s4MaxAttemptFinalizations = pgTable('s4_max_attempt_finalizations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+  workPackageId: uuid('work_package_id').notNull().references(() => workPackages.id, { onDelete: 'restrict' }).unique(),
+  transitionCode: text('transition_code').notNull(),
+  maxAttempts: integer('max_attempts').notNull(),
+  nextAttemptNumber: integer('next_attempt_number').notNull(),
+  expectedPackageUpdatedAt: timestamp('expected_package_updated_at', tsOpts).notNull(),
+  packageUpdatedAt: timestamp('package_updated_at', tsOpts).notNull(),
+  taskDisposition: text('task_disposition').notNull(),
+  createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+})
+
+export const localProjectionArchiveOperations = pgTable(
+  'local_projection_archive_operations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    sourceTaskId: uuid('source_task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    replacementTaskId: uuid('replacement_task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    actorUserId: uuid('actor_user_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+    state: text('state').notNull(),
+    sourceScopeVersion: bigint('source_scope_version', { mode: 'bigint' }).notNull(),
+    replacementVersion: bigint('replacement_version', { mode: 'bigint' }).notNull(),
+    sourceFingerprint: text('source_fingerprint').notNull(),
+    replacementFingerprint: text('replacement_fingerprint').notNull(),
+    operationFingerprint: text('operation_fingerprint').notNull().unique(),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+    completedAt: timestamp('completed_at', tsOpts),
+  },
+  (t) => [uniqueIndex('local_projection_archive_operations_task_pair_idx').on(t.sourceTaskId, t.replacementTaskId)],
+)
+
+export const localProjectionArchiveOperationCheckpoints = pgTable(
+  'local_projection_archive_operation_checkpoints',
+  {
+    operationId: uuid('operation_id').notNull().references(() => localProjectionArchiveOperations.id, { onDelete: 'restrict' }),
+    ordinal: integer('ordinal').notNull(),
+    state: text('state').notNull(),
+    operationFingerprint: text('operation_fingerprint').notNull(),
+    actorUserId: uuid('actor_user_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+    recordedAt: timestamp('recorded_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    uniqueIndex('local_projection_archive_operation_checkpoints_ordinal_idx').on(t.operationId, t.ordinal),
+    uniqueIndex('local_projection_archive_operation_checkpoints_state_idx').on(t.operationId, t.state),
+  ],
+)
 
 // ---------------------------------------------------------------------------
 // taskLogs
@@ -1826,6 +2102,12 @@ export type NewAppSetting = InferInsertModel<typeof appSettings>
 // ---------------------------------------------------------------------------
 // taskQuestions
 // ---------------------------------------------------------------------------
+const clarificationAnswerReferenceColumns = (): [AnyPgColumn, AnyPgColumn, AnyPgColumn] => [
+  architectClarificationAnswers.taskId,
+  architectClarificationAnswers.questionId,
+  architectClarificationAnswers.id,
+]
+
 export const taskQuestions = pgTable(
   'task_questions',
   {
@@ -1833,9 +2115,11 @@ export const taskQuestions = pgTable(
     taskId: uuid('task_id')
       .notNull()
       .references(() => tasks.id, { onDelete: 'restrict' }),
-    question: text('question').notNull(),
-    suggestions: jsonb('suggestions').$type<string[]>().notNull().default([]),
-    answer: text('answer'),
+    // Dormant B2A opaque bindings. Existing routes do not use these yet.
+    questionEntryId: text('question_entry_id'),
+    sourcePlanArtifactId: uuid('source_plan_artifact_id'),
+    sourcePlanVersion: bigint('source_plan_version', { mode: 'number' }),
+    answerReferenceId: uuid('answer_reference_id'),
     // 'open'|'answered'
     status: text('status').notNull().default('open'),
     createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
@@ -1847,8 +2131,39 @@ export const taskQuestions = pgTable(
   (t) => [
     index('task_questions_task_id_idx').on(t.taskId),
     index('task_questions_task_id_status_idx').on(t.taskId, t.status),
+    unique('task_questions_task_id_id_key').on(t.taskId, t.id),
+    foreignKey({
+      name: 'task_questions_answer_reference_task_question_fk',
+      columns: [t.taskId, t.id, t.answerReferenceId],
+      foreignColumns: clarificationAnswerReferenceColumns(),
+    }).onUpdate('restrict').onDelete('restrict'),
   ],
 )
 
 export type TaskQuestion = InferSelectModel<typeof taskQuestions>
 export type NewTaskQuestion = InferInsertModel<typeof taskQuestions>
+
+/** Protected append-only text for answered clarifications. */
+export const architectClarificationAnswers = pgTable(
+  'architect_clarification_answers',
+  {
+    id: uuid('id').primaryKey(),
+    taskId: uuid('task_id').notNull().references(() => tasks.id, { onDelete: 'restrict' }),
+    questionId: uuid('question_id').notNull(),
+    sourcePlanArtifactId: uuid('source_plan_artifact_id').notNull(),
+    sourcePlanVersion: bigint('source_plan_version', { mode: 'number' }).notNull(),
+    answer: text('answer').notNull(),
+    contentDigest: text('content_digest').notNull(),
+    digestKeyId: text('digest_key_id').notNull(),
+    actorUserId: uuid('actor_user_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+    createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  },
+  (t) => [
+    foreignKey({
+      name: 'architect_clarification_answers_task_question_fk',
+      columns: [t.taskId, t.questionId],
+      foreignColumns: [taskQuestions.taskId, taskQuestions.id],
+    }).onUpdate('restrict').onDelete('restrict'),
+    unique('architect_clarification_answers_task_question_id_key').on(t.taskId, t.questionId, t.id),
+  ],
+)

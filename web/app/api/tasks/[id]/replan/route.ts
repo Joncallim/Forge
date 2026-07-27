@@ -10,6 +10,7 @@ import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
 import { sanitizePromptSnapshot } from '@/lib/task-log-sanitization'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
+import { publishTaskEvent } from '@/worker/events'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -100,11 +101,10 @@ export async function POST(
 
     // Re-queue for the architect stage, the same way new tasks are enqueued.
     await redis.lpush('forge:tasks', JSON.stringify({ taskId: task.id }))
-    await redis.publish('forge:task:' + taskId, JSON.stringify({
-      type: 'task:status',
+    await publishTaskEvent(taskId, 'task:status', {
       status: 'pending',
       updatedAt: task.updatedAt.toISOString(),
-    }))
+    })
 
     await recordTaskLogBestEffort({
       eventType: 'task.replan_requested',

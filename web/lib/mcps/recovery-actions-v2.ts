@@ -62,3 +62,10 @@ export function parsePacketIssuanceRecoveryRequest(value: unknown): PacketIssuan
   ) return null
   return value as PacketIssuanceRecoveryRequestV2
 }
+
+// `delegateLinkedV2Cleanup` deliberately does not live here. This module is
+// imported by `admission-copy.ts`, which is imported by the task page as a
+// Client Component, so anything reachable from here is bundled for the browser.
+// The delegator pulls in `./s4-lease`, which imports `postgres` and `@/db`, and
+// that broke the client build with unresolvable `fs`/`net`/`perf_hooks`. It now
+// lives in `./s4-lease` next to the routine it wraps; import it from there.

@@ -38,7 +38,15 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
     classification: 'signed-activation-required',
   },
   {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::initial handoff persists one full canonical marker across package and operator-hold projection',
+    classification: 'run-disabled-safe',
+  },
+  {
     id: 'filesystem-grant-lifecycle-concurrency.spec.ts::mcp-admission.real-approval-route: concurrent reapproval has one CAS winner and immutable history',
+    classification: 'run-disabled-safe',
+  },
+  {
+    id: 'filesystem-grant-lifecycle-concurrency.spec.ts::package decisions advance operator-hold exactly once for hold, refresh, and recovery',
     classification: 'run-disabled-safe',
   },
   {

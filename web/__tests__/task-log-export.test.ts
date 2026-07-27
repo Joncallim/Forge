@@ -69,15 +69,15 @@ describe('task log export formatting', () => {
       frontMatter: Record<string, unknown>
       message: string
       metadata: {
-        nested: { authorization: string }
+        nested: Record<string, unknown>
         stderr: { kind: string; byteCount: number }
         stdout: { kind: string; byteCount: number }
       }
     }
 
     expect(row.frontMatter).not.toHaveProperty('prompt')
-    expect(row.message).toContain('[REDACTED_TOKEN]')
-    expect(row.metadata.nested.authorization).toContain('[REDACTED_TOKEN]')
+    expect(row.message).toBe('legacy_task_log_unavailable')
+    expect(row.metadata.nested).not.toHaveProperty('authorization')
     expect(row.metadata.stderr).toEqual({ kind: 'unknown_legacy_digest', byteCount: expect.any(Number) })
     expect(row.metadata.stdout).toEqual({ kind: 'unknown_legacy_digest', byteCount: expect.any(Number) })
     expect(jsonl).not.toContain('sha256')

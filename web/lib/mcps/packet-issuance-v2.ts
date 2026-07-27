@@ -292,7 +292,36 @@ export function packetTerminalTupleIsValid(input: {
 }
 
 export function packetRecoveryMarkerFingerprint(value: Omit<PacketIssuanceRecoveryMarkerV2, 'markerFingerprint'>): string {
-  return `sha256:${createHash('sha256').update(JSON.stringify(value)).digest('hex')}`
+  const failure = value.recoveryFailure
+  const token = (item: string | number | boolean | null | undefined): string => {
+    if (item === null || item === undefined) return '-1:'
+    const text = String(item)
+    return `${Buffer.byteLength(text, 'utf8')}:${text}`
+  }
+  const tuple = [
+    value.schemaVersion,
+    value.kind,
+    value.priorAgentRunId,
+    value.priorRuntimeAuditId,
+    failure.status,
+    failure.failureCode,
+    'failureStage' in failure ? failure.failureStage : null,
+    value.deliveryState,
+    value.grantMode,
+    value.disposition,
+    value.nextDisposition ?? null,
+    value.acknowledgedAt,
+    value.acknowledgedByUserId,
+    value.combinedRepositoryReviewFingerprint,
+    value.policyFingerprint,
+    value.coverageFingerprint,
+    value.autoRetryable,
+  ].map(token).join('|')
+  return `sha256:${createHash('sha256')
+    .update('forge:packet-recovery-marker:v2', 'utf8')
+    .update(Buffer.from([0]))
+    .update(tuple, 'utf8')
+    .digest('hex')}`
 }
 
 export function parsePacketIntegrityHold(value: unknown): PacketIntegrityHoldV2 | null {
@@ -345,7 +374,11 @@ export function parsePacketIssuanceRecoveryMarker(value: unknown): PacketIssuanc
     (mode === 'always_allow' && ['not_exposed', 'submission_failed'].includes(delivery as string) && disposition === 'retry_execution' && unacknowledged) ||
     (mode === 'always_allow' && ['submission_uncertain', 'submitted'].includes(delivery as string) && disposition === 'review_submission' && unacknowledged) ||
     (mode === 'always_allow' && ['submission_uncertain', 'submitted'].includes(delivery as string) && disposition === 'reviewed_submission' && acknowledged)
-  return coherent ? value as PacketIssuanceRecoveryMarkerV2 : null
+  if (!coherent) return null
+  const { markerFingerprint, ...fingerprinted } = value as PacketIssuanceRecoveryMarkerV2
+  return packetRecoveryMarkerFingerprint(fingerprinted) === markerFingerprint
+    ? value as PacketIssuanceRecoveryMarkerV2
+    : null
 }
 
 export type PacketCandidateGuard =
