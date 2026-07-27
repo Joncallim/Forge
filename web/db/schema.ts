@@ -265,9 +265,7 @@ export const projects = pgTable('projects', {
   createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
   archivedAt: timestamp('archived_at', tsOpts),
-}, (t) => [
-  uniqueIndex('projects_root_ref_idx').on(t.rootRef),
-])
+})
 
 export type Project = InferSelectModel<typeof projects>
 export type NewProject = InferInsertModel<typeof projects>
@@ -279,6 +277,31 @@ export const projectRootRefReconciliation = pgTable('project_root_ref_reconcilia
   state: text('state').notNull().default('pending'),
   updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
 })
+
+export const projectRootChangeJournalCounter = pgTable('project_root_change_journal_counter', {
+  singleton: boolean('singleton').primaryKey().default(true),
+  lastGeneration: bigint('last_generation', { mode: 'bigint' }).notNull().default(sql`0`),
+}, (t) => [
+  check('project_root_change_journal_counter_generation_chk', sql`${t.lastGeneration} >= 0`),
+])
+
+export const projectRootChangeJournal = pgTable('project_root_change_journal', {
+  generation: bigint('generation', { mode: 'bigint' }).primaryKey(),
+  operationId: uuid('operation_id').notNull().defaultRandom().unique(),
+  projectId: uuid('project_id').notNull().references(() => projects.id, {
+    onDelete: 'restrict',
+    onUpdate: 'restrict',
+  }),
+  outcome: text('outcome').notNull(),
+  rootBindingRevision: bigint('root_binding_revision', { mode: 'bigint' }),
+  grantDecisionRevision: bigint('grant_decision_revision', { mode: 'bigint' }),
+  occurredAt: timestamp('occurred_at', tsOpts).defaultNow().notNull(),
+}, (t) => [
+  check('project_root_change_journal_generation_chk', sql`${t.generation} > 0`),
+  check('project_root_change_journal_outcome_chk', sql`${t.outcome} in ('insert','root_update','archive')`),
+  check('project_root_change_journal_root_binding_revision_chk', sql`${t.rootBindingRevision} is null or ${t.rootBindingRevision} > 0`),
+  check('project_root_change_journal_grant_decision_revision_chk', sql`${t.grantDecisionRevision} is null or ${t.grantDecisionRevision} > 0`),
+])
 
 // ---------------------------------------------------------------------------
 // Epic 172 release authentication and transition substrate

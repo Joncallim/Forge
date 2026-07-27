@@ -360,8 +360,6 @@ CREATE TRIGGER projects_root_ref_renull_guard_v1
   BEFORE UPDATE OF root_ref ON public.projects
   FOR EACH ROW EXECUTE FUNCTION forge.guard_project_root_ref_renull_v1();
 --> statement-breakpoint
-CREATE UNIQUE INDEX projects_root_ref_idx ON public.projects (root_ref);
---> statement-breakpoint
 CREATE TABLE public.project_root_ref_reconciliation (
   singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
   last_project_id uuid,
@@ -433,6 +431,85 @@ BEGIN
     CASE WHEN v_remaining = 0 THEN 'complete'::text ELSE 'running'::text END;
 END;
 $$;
+--> statement-breakpoint
+-- C5 records only bounded root-change identities during the expand window.
+-- C6 owns watermark/reconciliation and the later concurrent unique index.
+CREATE TABLE public.project_root_change_journal_counter (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  last_generation bigint NOT NULL DEFAULT 0 CHECK (last_generation >= 0)
+);
+INSERT INTO public.project_root_change_journal_counter (singleton) VALUES (true);
+--> statement-breakpoint
+CREATE TABLE public.project_root_change_journal (
+  generation bigint PRIMARY KEY CHECK (generation > 0),
+  operation_id uuid NOT NULL UNIQUE DEFAULT pg_catalog.gen_random_uuid(),
+  project_id uuid NOT NULL REFERENCES public.projects(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+  outcome text NOT NULL CHECK (outcome IN ('insert','root_update','archive')),
+  root_binding_revision bigint CHECK (root_binding_revision IS NULL OR root_binding_revision > 0),
+  grant_decision_revision bigint CHECK (grant_decision_revision IS NULL OR grant_decision_revision > 0),
+  occurred_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp()
+);
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.append_project_root_change_journal_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+  v_generation bigint;
+  v_outcome text;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    v_outcome := 'insert';
+  ELSIF NEW.archived_at IS NOT NULL AND OLD.archived_at IS NULL THEN
+    -- Archive wins if the same update also repoints a root-bearing field.
+    v_outcome := 'archive';
+  ELSIF NEW.local_path IS DISTINCT FROM OLD.local_path
+     OR NEW.root_ref IS DISTINCT FROM OLD.root_ref
+     OR NEW.root_binding_revision IS DISTINCT FROM OLD.root_binding_revision THEN
+    v_outcome := 'root_update';
+  ELSE
+    RETURN NEW;
+  END IF;
+
+  -- This UPDATE locks only the singleton counter. It and the append insert
+  -- share the caller transaction, so rollback cannot leave a generation gap.
+  UPDATE public.project_root_change_journal_counter counter
+  SET last_generation = counter.last_generation + 1
+  WHERE counter.singleton
+  RETURNING counter.last_generation INTO STRICT v_generation;
+
+  INSERT INTO public.project_root_change_journal (
+    generation, operation_id, project_id, outcome,
+    root_binding_revision, grant_decision_revision, occurred_at
+  ) VALUES (
+    v_generation, pg_catalog.gen_random_uuid(), NEW.id, v_outcome,
+    NULLIF(NEW.root_binding_revision, 0), NULLIF(NEW.grant_decision_revision, 0),
+    pg_catalog.clock_timestamp()
+  );
+  RETURN NEW;
+END;
+$$;
+--> statement-breakpoint
+CREATE TRIGGER projects_root_change_journal_v1
+  AFTER INSERT OR UPDATE ON public.projects
+  FOR EACH ROW EXECUTE FUNCTION forge.append_project_root_change_journal_v1();
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.reject_project_root_change_journal_mutation_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+BEGIN
+  RAISE EXCEPTION 'project root change journal is append-only'
+    USING ERRCODE = '55000';
+END;
+$$;
+CREATE TRIGGER project_root_change_journal_append_only_v1
+  BEFORE UPDATE OR DELETE ON public.project_root_change_journal
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_project_root_change_journal_mutation_v1();
 --> statement-breakpoint
 CREATE TABLE public.architect_plan_versions (
   task_id uuid NOT NULL,
@@ -7128,10 +7205,14 @@ REVOKE ALL ON public.architect_plan_versions, public.architect_plan_entries,
   public.local_projection_archive_operations,
   public.local_projection_archive_operation_checkpoints,
   public.filesystem_mcp_decision_nonce_claims,
-  public.project_root_ref_reconciliation FROM PUBLIC;
+  public.project_root_ref_reconciliation,
+  public.project_root_change_journal_counter,
+  public.project_root_change_journal FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.fill_project_root_ref_on_insert_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.guard_project_root_ref_renull_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.reconcile_project_root_refs_v1(integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.append_project_root_change_journal_v1() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.reject_project_root_change_journal_mutation_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.s4_protected_paths_enabled_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.guard_s4_approval_gate_review_head_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.reject_s4_retained_mutation_v1() FROM PUBLIC;
@@ -7261,9 +7342,13 @@ ALTER TABLE public.local_projection_archive_operations OWNER TO forge_s4_routine
 ALTER TABLE public.local_projection_archive_operation_checkpoints OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.filesystem_mcp_decision_nonce_claims OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.project_root_ref_reconciliation OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.project_root_change_journal_counter OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.project_root_change_journal OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.fill_project_root_ref_on_insert_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.guard_project_root_ref_renull_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.reconcile_project_root_refs_v1(integer) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.append_project_root_change_journal_v1() OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.reject_project_root_change_journal_mutation_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.s4_protected_paths_enabled_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.guard_s4_approval_gate_review_head_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.reject_s4_retained_mutation_v1() OWNER TO forge_s4_routines_owner;

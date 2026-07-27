@@ -25,6 +25,8 @@ const OWNED_TABLES = [
   'work_package_local_run_evidence',
   'filesystem_mcp_decision_nonce_claims',
   'project_root_ref_reconciliation',
+  'project_root_change_journal_counter',
+  'project_root_change_journal',
   's4_completion_handoffs',
   's4_protected_review_sources',
   's4_protected_review_source_reads',
@@ -340,6 +342,8 @@ async function main(): Promise<void> {
                 ,'fill_project_root_ref_on_insert_v1'
                 ,'guard_project_root_ref_renull_v1'
                 ,'reconcile_project_root_refs_v1'
+                ,'append_project_root_change_journal_v1'
+                ,'reject_project_root_change_journal_mutation_v1'
                 ,'s4_protected_paths_enabled_v1'
                 ,'guard_s4_approval_gate_review_head_v1'
                 ,'bind_architect_replan_entry_v1'
@@ -395,7 +399,7 @@ async function main(): Promise<void> {
                 ) acl
                 where acl.grantee = 0 and acl.privilege_type = 'EXECUTE'
               )
-          ) <> 61 then
+          ) <> 63 then
             raise exception 'The S4 routine owner or PUBLIC boundary is incomplete'
               using errcode = '42501';
           end if;
