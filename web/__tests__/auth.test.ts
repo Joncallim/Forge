@@ -559,7 +559,7 @@ describe('getSession — write-behind logic', () => {
     vi.useRealTimers()
   })
 
-  it('does NOT trigger a DB write when lastSeenAt is less than 60 seconds old', async () => {
+  it('writes no sliding refresh when lastSeenAt is recent, but still fences the cache write', async () => {
     const now = Date.now()
     vi.setSystemTime(now)
 
@@ -572,7 +572,7 @@ describe('getSession — write-behind logic', () => {
     const req = fakeRequest('00000000-0000-4000-8000-000000000000')
     await getSession(req)
 
-    expect(mockDbUpdate).not.toHaveBeenCalled()
+    expect(mockDbUpdate).toHaveBeenCalledOnce()
   })
 
   it('triggers a fire-and-forget DB write when lastSeenAt is older than 60 seconds', async () => {
@@ -588,10 +588,67 @@ describe('getSession — write-behind logic', () => {
     const req = fakeRequest('00000000-0000-4000-8000-000000000000')
     await getSession(req)
 
-    // DB update is kicked off fire-and-forget; the mock should have been invoked
-    expect(mockDbUpdate).toHaveBeenCalledOnce()
+    // One authoritative refresh plus one post-cache-write authority fence.
+    expect(mockDbUpdate).toHaveBeenCalledTimes(2)
     // Redis was also refreshed
     expect(mockRedisSet).toHaveBeenCalledOnce()
+  })
+
+  it('requeues and deletes a v2 cache key when logout wins after the cache write', async () => {
+    const now = Date.now()
+    vi.setSystemTime(now)
+    const credential = '00000000-0000-4000-8000-000000000000'
+    mockDbSelect.mockReturnValue(chain([{
+      sessionId: '00000000-0000-4000-8000-000000000010', userId: 'user-1',
+      lastSeenAt: new Date(now - 30_000), expiresAt: new Date(now + 60_000),
+      revokedAt: null, credentialStorageVersion: 2, databaseNow: new Date(now),
+    }]))
+    mockDbUpdate
+      .mockReturnValueOnce(chain([{
+        attemptCount: 1,
+        claimToken: '00000000-0000-4000-8000-000000000011',
+        credentialDigest: Buffer.alloc(32, 1),
+        generation: '00000000-0000-4000-8000-000000000012',
+        legacyCredential: null,
+        sessionId: '00000000-0000-4000-8000-000000000010',
+      }]))
+      .mockReturnValueOnce(chain([{ id: '00000000-0000-4000-8000-000000000010' }]))
+
+    await expect(getSession(fakeRequest(credential))).resolves.toEqual({
+      sessionId: '00000000-0000-4000-8000-000000000010', userId: 'user-1',
+    })
+
+    expect(mockRedisSet.mock.invocationCallOrder[0]).toBeLessThan(mockRedisDel.mock.invocationCallOrder[0])
+    expect(mockRedisDel).toHaveBeenCalledWith(expect.stringMatching(/^session:v2:/))
+  })
+
+  it('fences both dual-write keys when revocation races the post-commit cache write', async () => {
+    const now = Date.now()
+    vi.setSystemTime(now)
+    const credential = '00000000-0000-4000-8000-000000000000'
+    mockDbSelect
+      .mockReturnValueOnce(chain([{ state: 'expansion' }]))
+      .mockReturnValueOnce(chain([{
+        sessionId: credential, userId: 'user-1',
+        lastSeenAt: new Date(now - 30_000), expiresAt: new Date(now + 60_000),
+        revokedAt: null, credentialStorageVersion: 1, databaseNow: new Date(now),
+      }]))
+    mockDbUpdate
+      .mockReturnValueOnce(chain([{
+        attemptCount: 1,
+        claimToken: '00000000-0000-4000-8000-000000000011',
+        credentialDigest: Buffer.alloc(32, 1),
+        generation: '00000000-0000-4000-8000-000000000012',
+        legacyCredential: credential,
+        sessionId: credential,
+      }]))
+      .mockReturnValueOnce(chain([{ id: credential }]))
+
+    await getSession(fakeRequest(credential))
+
+    expect(mockRedisSet).toHaveBeenCalledTimes(2)
+    expect(mockRedisSet.mock.invocationCallOrder[1]).toBeLessThan(mockRedisDel.mock.invocationCallOrder[0])
+    expect(mockRedisDel).toHaveBeenCalledWith(expect.stringMatching(/^session:v2:/), `session:${credential}`)
   })
 
   it('does not write a legacy cache when the sliding-refresh transaction fails to commit', async () => {

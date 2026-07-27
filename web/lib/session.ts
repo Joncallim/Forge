@@ -72,38 +72,93 @@ function cachePurgeTarget(row: {
   }
 }
 
-async function completeSessionCachePurge(target: SessionCachePurgeTarget): Promise<void> {
+async function completeSessionCachePurge(target: SessionCachePurgeTarget): Promise<boolean> {
   const conditions = [
     eq(sessions.id, target.sessionId),
     eq(sessions.cachePurgeGeneration, target.generation),
     isNotNull(sessions.cachePurgePendingAt),
   ]
   if (target.claimToken) conditions.push(eq(sessions.cachePurgeClaimToken, target.claimToken))
-  await db.update(sessions).set({
+  const completed = await db.update(sessions).set({
+    cachePurgeCredentialDigestV1: null,
     cachePurgeClaimExpiresAt: null,
     cachePurgeClaimToken: null,
     cachePurgeCompletedAt: sql`pg_catalog.clock_timestamp()`,
     cachePurgeNextAttemptAt: null,
     cachePurgePendingAt: null,
-  }).where(and(...conditions))
+  }).where(and(...conditions)).returning({ id: sessions.id })
+  return Array.isArray(completed) && completed.length === 1
 }
 
-async function deferSessionCachePurge(target: SessionCachePurgeTarget): Promise<void> {
+async function deferSessionCachePurge(target: SessionCachePurgeTarget): Promise<boolean> {
   const conditions = [
     eq(sessions.id, target.sessionId),
     eq(sessions.cachePurgeGeneration, target.generation),
     isNotNull(sessions.cachePurgePendingAt),
   ]
   if (target.claimToken) conditions.push(eq(sessions.cachePurgeClaimToken, target.claimToken))
-  await db.update(sessions).set({
+  const deferred = await db.update(sessions).set({
     cachePurgeClaimExpiresAt: null,
     cachePurgeClaimToken: null,
     cachePurgeNextAttemptAt: sql`pg_catalog.clock_timestamp() + ${sessionCachePurgeBackoffSeconds(target.attemptCount)} * interval '1 second'`,
-  }).where(and(...conditions))
+  }).where(and(...conditions)).returning({ id: sessions.id })
+  return Array.isArray(deferred) && deferred.length === 1
 }
 
 async function deleteSessionCacheTarget(target: SessionCachePurgeTarget): Promise<void> {
   await redis.del(...sessionCachePurgeKeys(target))
+}
+
+/**
+ * Runs after a cache write. If logout/expiry won the race after the original
+ * database authorization, this locked compare-and-set creates a fresh purge
+ * claim before deleting the just-written keys.
+ */
+async function fenceSessionCacheWrite(digest: Buffer, sessionId: string): Promise<void> {
+  const generation = crypto.randomUUID()
+  const claimToken = crypto.randomUUID()
+  const fenced = await db.update(sessions).set({
+    cachePurgeAttemptCount: 1,
+    cachePurgeClaimExpiresAt: sql`pg_catalog.clock_timestamp() + ${SESSION_CACHE_PURGE_CLAIM_SECONDS} * interval '1 second'`,
+    cachePurgeClaimToken: claimToken,
+    cachePurgeCompletedAt: null,
+    cachePurgeCredentialDigestV1: digest,
+    cachePurgeGeneration: generation,
+    cachePurgeNextAttemptAt: sql`pg_catalog.clock_timestamp()`,
+    cachePurgePendingAt: sql`pg_catalog.clock_timestamp()`,
+  }).where(and(
+    eq(sessions.id, sessionId),
+    eq(sessions.credentialDigestV1, digest),
+    or(
+      isNotNull(sessions.revokedAt),
+      isNull(sessions.expiresAt),
+      sql`${sessions.expiresAt} <= pg_catalog.clock_timestamp()`,
+    ),
+  )).returning({
+    attemptCount: sessions.cachePurgeAttemptCount,
+    credentialDigest: sessions.cachePurgeCredentialDigestV1,
+    claimToken: sessions.cachePurgeClaimToken,
+    generation: sessions.cachePurgeGeneration,
+    legacyCredential: sql<string | null>`CASE WHEN ${sessions.credentialStorageVersion} < 2 THEN ${sessions.id}::text ELSE NULL END`,
+    sessionId: sessions.id,
+  })
+  const target = Array.isArray(fenced) ? fenced[0] : undefined
+  if (!target?.credentialDigest || !target.claimToken || !target.generation) return
+  const purge = cachePurgeTarget({
+    attemptCount: target.attemptCount,
+    claimToken: target.claimToken,
+    credentialDigest: target.credentialDigest,
+    generation: target.generation,
+    legacyCredential: target.legacyCredential,
+    sessionId: target.sessionId,
+  })
+  if (!purge) return
+  try {
+    await deleteSessionCacheTarget(purge)
+    await completeSessionCachePurge(purge)
+  } catch {
+    await deferSessionCachePurge(purge).catch(() => {})
+  }
 }
 
 /**
@@ -113,7 +168,7 @@ async function deleteSessionCacheTarget(target: SessionCachePurgeTarget): Promis
  */
 export async function reconcilePendingSessionCacheInvalidations(
   limit = SESSION_CACHE_PURGE_BATCH_LIMIT,
-): Promise<{ claimed: number; completed: number; deferred: number }> {
+): Promise<{ claimed: number; completed: number; deferred: number; stale: number }> {
   if (!Number.isInteger(limit) || limit < 1 || limit > SESSION_CACHE_PURGE_BATCH_LIMIT) {
     throw new Error(`Session cache purge limit must be an integer from 1 to ${SESSION_CACHE_PURGE_BATCH_LIMIT}.`)
   }
@@ -134,7 +189,7 @@ export async function reconcilePendingSessionCacheInvalidations(
             SELECT session.id
             FROM public.sessions session
             WHERE session.cache_purge_pending_at IS NOT NULL
-              AND pg_catalog.octet_length(session.credential_digest_v1) = 32
+              AND pg_catalog.octet_length(session.cache_purge_credential_digest_v1) = 32
               AND (session.cache_purge_next_attempt_at IS NULL
                 OR session.cache_purge_next_attempt_at <= pg_catalog.clock_timestamp())
               AND (session.cache_purge_claim_expires_at IS NULL
@@ -154,8 +209,8 @@ export async function reconcilePendingSessionCacheInvalidations(
             session.cache_purge_generation::text AS generation,
             session.cache_purge_claim_token::text AS "claimToken",
             session.cache_purge_attempt_count AS "attemptCount",
-            pg_catalog.encode(session.credential_digest_v1, 'hex') AS "credentialDigestHex",
-            CASE WHEN session.credential_storage_version = 1 THEN session.id::text ELSE NULL END AS "legacyCredential"
+            pg_catalog.encode(session.cache_purge_credential_digest_v1, 'hex') AS "credentialDigestHex",
+            CASE WHEN session.credential_storage_version < 2 THEN session.id::text ELSE NULL END AS "legacyCredential"
         `)
         return rows.flatMap((row): SessionCachePurgeTarget[] => {
           if (
@@ -452,6 +507,7 @@ export async function getSession(
     await writeLegacySessionCache(credential, authorized).catch(() => {})
   }
   await cacheAuthorizedSession(digest, authorized).catch(() => {})
+  await fenceSessionCacheWrite(digest, authorized.sessionId).catch(() => {})
   return { sessionId: authorized.sessionId, userId: authorized.userId }
 }
 
@@ -529,6 +585,7 @@ export async function destroySession(sessionCredential: string): Promise<void> {
     .set({
       revokedAt: sql`pg_catalog.clock_timestamp()`,
       cachePurgeAttemptCount: 1,
+      cachePurgeCredentialDigestV1: digest,
       cachePurgeClaimExpiresAt: sql`pg_catalog.clock_timestamp() + ${SESSION_CACHE_PURGE_CLAIM_SECONDS} * interval '1 second'`,
       cachePurgeClaimToken: claimToken,
       cachePurgeCompletedAt: null,
@@ -545,15 +602,18 @@ export async function destroySession(sessionCredential: string): Promise<void> {
       eq(sessions.credentialDigestV1, digest),
       and(
         eq(sessions.id, sessionCredential),
-        eq(sessions.credentialStorageVersion, 1),
+        or(
+          eq(sessions.credentialStorageVersion, 0),
+          eq(sessions.credentialStorageVersion, 1),
+        ),
       ),
     ))
     .returning({
       attemptCount: sessions.cachePurgeAttemptCount,
-      credentialDigest: sessions.credentialDigestV1,
+      credentialDigest: sessions.cachePurgeCredentialDigestV1,
       claimToken: sessions.cachePurgeClaimToken,
       generation: sessions.cachePurgeGeneration,
-      legacyCredential: sql<string | null>`CASE WHEN ${sessions.credentialStorageVersion} = 1 THEN ${sessions.id}::text ELSE NULL END`,
+      legacyCredential: sql<string | null>`CASE WHEN ${sessions.credentialStorageVersion} < 2 THEN ${sessions.id}::text ELSE NULL END`,
       sessionId: sessions.id,
     })
 

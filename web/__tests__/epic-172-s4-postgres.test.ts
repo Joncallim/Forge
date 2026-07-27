@@ -1055,70 +1055,81 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     expect(proof).toEqual({ digestRows: 1, rawIdRows: 0, retainedRawIds: 0 })
   })
 
-  it('records a revoked session cache purge through pending, claimed, and completed durable states', async () => {
-    const sessionId = randomUUID()
-    const generation = randomUUID()
-    const claimToken = randomUUID()
+  it('uses production logout and claim paths for v0, v1, and v2 session cache purges', async () => {
+    const { destroySession, reconcilePendingSessionCacheInvalidations } = await import('@/lib/session')
+    for (const storageVersion of [0, 1, 2] as const) {
+      const credential = randomUUID()
+      const digest = computeCredentialDigest(credential).digest
+      const sessionId = storageVersion < 2 ? credential : randomUUID()
+      if (storageVersion === 0) {
+        await admin`insert into sessions (id, user_id, credential_storage_version)
+          values (${sessionId}::uuid, ${ids.user}::uuid, 0)`
+      } else {
+        await admin`
+          insert into sessions (id, user_id, credential_digest_v1, expires_at, credential_storage_version)
+          values (${sessionId}::uuid, ${ids.user}::uuid, ${digest}::bytea,
+            clock_timestamp() + interval '7 days', ${storageVersion})
+        `
+      }
+
+      mockRedisDel.mockRejectedValueOnce(new Error('test redis outage'))
+      await destroySession(credential)
+      const [pending] = await admin<{
+        digestMatches: boolean
+        legacy: boolean
+        pending: boolean
+        revoked: boolean
+      }[]>`
+        select cache_purge_credential_digest_v1 = ${digest}::bytea as "digestMatches",
+          credential_storage_version < 2 as legacy,
+          cache_purge_pending_at is not null as pending,
+          revoked_at is not null as revoked
+        from sessions where id = ${sessionId}::uuid
+      `
+      expect(pending).toEqual({ digestMatches: true, legacy: storageVersion < 2, pending: true, revoked: true })
+
+      await admin`update sessions set cache_purge_next_attempt_at = clock_timestamp()
+        where id = ${sessionId}::uuid`
+      mockRedisDel.mockResolvedValueOnce(0)
+      await expect(reconcilePendingSessionCacheInvalidations(1)).resolves.toEqual({
+        claimed: 1, completed: 1, deferred: 0, stale: 0,
+      })
+      const [completed] = await admin<{
+        completed: boolean
+        digestCleared: boolean
+        pending: boolean
+      }[]>`
+        select cache_purge_completed_at is not null as completed,
+          cache_purge_credential_digest_v1 is null as "digestCleared",
+          cache_purge_pending_at is not null as pending
+        from sessions where id = ${sessionId}::uuid
+      `
+      expect(completed).toEqual({ completed: true, digestCleared: true, pending: false })
+    }
+
+    const expiredClaimCredential = randomUUID()
+    const expiredClaimDigest = computeCredentialDigest(expiredClaimCredential).digest
+    const expiredClaimSession = randomUUID()
     await admin`
       insert into sessions (id, user_id, credential_digest_v1, expires_at, credential_storage_version)
-      values (
-        ${sessionId}::uuid, ${ids.user}::uuid, ${randomBytes(32)}::bytea,
-        clock_timestamp() + interval '7 days', 2
-      )
+      values (${expiredClaimSession}::uuid, ${ids.user}::uuid, ${expiredClaimDigest}::bytea,
+        clock_timestamp() + interval '7 days', 2)
     `
-    await expect(admin`
-      update sessions
-      set cache_purge_pending_at = clock_timestamp(), cache_purge_attempt_count = 1
-      where id = ${sessionId}::uuid
-    `).rejects.toMatchObject({ code: '23514' })
-
+    mockRedisDel.mockRejectedValueOnce(new Error('test redis outage'))
+    await destroySession(expiredClaimCredential)
     await admin`
-      update sessions
-      set revoked_at = clock_timestamp(),
-          cache_purge_pending_at = clock_timestamp(),
-          cache_purge_generation = ${generation}::uuid,
-          cache_purge_claim_token = ${claimToken}::uuid,
-          cache_purge_claim_expires_at = clock_timestamp() + interval '30 seconds',
-          cache_purge_next_attempt_at = clock_timestamp(),
-          cache_purge_attempt_count = 1
-      where id = ${sessionId}::uuid
+      update sessions set cache_purge_claim_token = gen_random_uuid(),
+        cache_purge_claim_expires_at = clock_timestamp() - interval '1 second',
+        cache_purge_next_attempt_at = clock_timestamp()
+      where id = ${expiredClaimSession}::uuid
     `
-    const [claimed] = await admin<{
-      attempts: number
-      claimToken: string
-      generation: string
-      pending: boolean
-    }[]>`
-      select cache_purge_attempt_count::integer as attempts,
-        cache_purge_claim_token::text as "claimToken",
-        cache_purge_generation::text as generation,
-        cache_purge_pending_at is not null as pending
-      from sessions where id = ${sessionId}::uuid
-    `
-    expect(claimed).toEqual({ attempts: 1, claimToken, generation, pending: true })
-
-    await admin`
-      update sessions
-      set cache_purge_pending_at = null,
-          cache_purge_claim_token = null,
-          cache_purge_claim_expires_at = null,
-          cache_purge_next_attempt_at = null,
-          cache_purge_completed_at = clock_timestamp()
-      where id = ${sessionId}::uuid
-        and cache_purge_generation = ${generation}::uuid
-        and cache_purge_claim_token = ${claimToken}::uuid
-    `
-    const [completed] = await admin<{
-      completed: boolean
-      pending: boolean
-      tokenCleared: boolean
-    }[]>`
-      select cache_purge_completed_at is not null as completed,
-        cache_purge_pending_at is not null as pending,
-        cache_purge_claim_token is null as "tokenCleared"
-      from sessions where id = ${sessionId}::uuid
-    `
-    expect(completed).toEqual({ completed: true, pending: false, tokenCleared: true })
+    mockRedisDel.mockResolvedValueOnce(0)
+    const [first, second] = await Promise.all([
+      reconcilePendingSessionCacheInvalidations(1),
+      reconcilePendingSessionCacheInvalidations(1),
+    ])
+    expect([first.claimed, second.claimed].sort()).toEqual([0, 1])
+    expect(first.completed + second.completed).toBe(1)
   })
 
   it('allow-once-single-winner: atomically keeps one audit and one nonce claim', async () => {

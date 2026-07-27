@@ -58,6 +58,7 @@ ALTER TABLE public.sessions
   ADD COLUMN IF NOT EXISTS legacy_redis_purge_pending_at timestamptz,
   ADD COLUMN IF NOT EXISTS legacy_redis_invalidated_at timestamptz,
   ADD COLUMN IF NOT EXISTS cache_purge_pending_at timestamptz,
+  ADD COLUMN IF NOT EXISTS cache_purge_credential_digest_v1 bytea,
   ADD COLUMN IF NOT EXISTS cache_purge_generation uuid,
   ADD COLUMN IF NOT EXISTS cache_purge_claim_token uuid,
   ADD COLUMN IF NOT EXISTS cache_purge_claim_expires_at timestamptz,
@@ -283,6 +284,7 @@ ALTER TABLE public.sessions
     cache_purge_attempt_count >= 0
     AND (
       (cache_purge_pending_at IS NULL
+        AND cache_purge_credential_digest_v1 IS NULL
         AND cache_purge_generation IS NULL
         AND cache_purge_claim_token IS NULL
         AND cache_purge_claim_expires_at IS NULL
@@ -290,10 +292,12 @@ ALTER TABLE public.sessions
         AND cache_purge_completed_at IS NULL)
       OR
       (cache_purge_pending_at IS NOT NULL
+        AND pg_catalog.octet_length(cache_purge_credential_digest_v1) = 32
         AND cache_purge_generation IS NOT NULL
         AND cache_purge_completed_at IS NULL)
       OR
       (cache_purge_pending_at IS NULL
+        AND cache_purge_credential_digest_v1 IS NULL
         AND cache_purge_generation IS NOT NULL
         AND cache_purge_claim_token IS NULL
         AND cache_purge_claim_expires_at IS NULL
