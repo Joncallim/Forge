@@ -8,7 +8,7 @@ operation="$(psql "$FORGE_DATABASE_ADMIN_URL" -At --field-separator='|' --set ON
 operation_id="${operation%%|*}"
 project="$(psql "$FORGE_DATABASE_ADMIN_URL" -At --set ON_ERROR_STOP=1 --command 'SELECT project_id FROM public.project_root_change_journal WHERE generation=1')"
 [[ "$operation_id" =~ ^[0-9a-f-]{36}$ && "$project" =~ ^[0-9a-f-]{36}$ ]] || { echo 'stale context proof lacks the prepared operation' >&2; exit 1; }
-expect_failure() { local text="$1"; shift; local out; out="$(mktemp)"; if "$@" >"$out" 2>&1; then cat "$out"; unlink "$out"; exit 1; fi; grep -F -- "$text" "$out" >/dev/null || { cat "$out"; unlink "$out"; exit 1; }; unlink "$out"; }
+expect_failure() { local text="$1"; shift; local out status; out="$(mktemp)"; if "$@" >"$out" 2>&1; then echo "stale reconciliation proof expected psql failure: ${text}" >&2; cat "$out" >&2; unlink "$out"; exit 1; else status=$?; fi; [[ "$status" == 3 ]] || { echo "stale reconciliation proof expected psql exit 3 for ${text}, got ${status}" >&2; cat "$out" >&2; unlink "$out"; exit 1; }; grep -F -- "$text" "$out" >/dev/null || { echo "stale reconciliation proof received the wrong psql error for ${text}" >&2; cat "$out" >&2; unlink "$out"; exit 1; }; unlink "$out"; }
 # A valid context permits the fenced task transition only in this transaction;
 # its deliberate abort makes the subsequent backend/session attempts stale.
 expect_failure 'division by zero' psql "$url" --set ON_ERROR_STOP=1 <<SQL

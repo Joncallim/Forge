@@ -248,7 +248,15 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(contentionProof).toContain('forge.enter_project_root_reconciliation_generation_v1')
     expect(contentionProof).toContain("lock_timeout='250ms'")
     expect(contentionProof).toContain('canceling statement due to lock timeout')
+    expect(contentionProof).toContain("[[ \"$loser_status\" == 3 ]]")
+    expect(contentionProof).toContain("'${outcome}'")
+    expect(contentionProof).not.toContain('FROM public.project_root_change_journal WHERE generation=1));')
     expect(upgradeProof.indexOf('prove-migration-0027-root-contention.sh')).toBeLessThan(upgradeProof.indexOf('reconcile-migration-0027-root-refs.sh'))
+  })
+
+  it('requires every deliberate negative psql probe to return SQL-error exit status three', () => {
+    expect(negativeProof).toContain('expected psql exit 3')
+    expect(staleContextProof).toContain('expected psql exit 3')
   })
 
   it('selects phase suppression only in the internal root-journal caller', () => {
