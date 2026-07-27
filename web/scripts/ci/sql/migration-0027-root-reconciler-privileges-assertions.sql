@@ -10,6 +10,22 @@ CREATE TEMP TABLE root_reconciler_actual_privileges (
   entry text NOT NULL,
   PRIMARY KEY (category, entry)
 );
+CREATE TEMP TABLE root_reconciler_privilege_categories (
+  category text PRIMARY KEY
+);
+
+INSERT INTO root_reconciler_privilege_categories (category) VALUES
+  ('relation'),
+  ('column_select'),
+  ('column_insert'),
+  ('column_update'),
+  ('column_references'),
+  ('routine'),
+  ('schema'),
+  ('database'),
+  ('sequence'),
+  ('ownership'),
+  ('membership');
 
 INSERT INTO root_reconciler_expected_privileges (category, entry) VALUES
   ('relation', 'public.projects:SELECT'),
@@ -65,16 +81,20 @@ WHERE namespace_row.nspname IN ('public', 'forge')
 -- public.project_root_reconciliation_write_contexts: absent from the allowlist
 -- means every effective direct relation privilege is rejected.
 
+-- Record only column-specific effective grants. A table-level privilege of the
+-- same class applies to every column and is already represented above.
 INSERT INTO root_reconciler_actual_privileges (category, entry)
-SELECT 'column_update', namespace_row.nspname || '.' || relation.relname || '.' || attribute_row.attname
+SELECT 'column_' || lower(privilege.privilege), namespace_row.nspname || '.' || relation.relname || '.' || attribute_row.attname
 FROM pg_catalog.pg_class relation
 JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
 JOIN pg_catalog.pg_attribute attribute_row ON attribute_row.attrelid = relation.oid
+CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('REFERENCES')) AS privilege(privilege)
 WHERE namespace_row.nspname IN ('public', 'forge')
   AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
   AND attribute_row.attnum > 0
   AND NOT attribute_row.attisdropped
-  AND pg_catalog.has_column_privilege('forge_project_root_reconciler', relation.oid, attribute_row.attnum, 'UPDATE');
+  AND pg_catalog.has_column_privilege('forge_project_root_reconciler', relation.oid, attribute_row.attnum, privilege.privilege)
+  AND NOT pg_catalog.has_table_privilege('forge_project_root_reconciler', relation.oid, privilege.privilege);
 
 INSERT INTO root_reconciler_actual_privileges (category, entry)
 SELECT 'routine', namespace_row.nspname || '.' || routine.proname || '(' || replace(pg_catalog.oidvectortypes(routine.proargtypes), ', ', ',') || ')'
@@ -182,6 +202,8 @@ BEGIN
         WHERE expected.category = categories.category
       ) unexpected_rows), '[]'::jsonb) AS unexpected
     FROM (
+      SELECT category FROM root_reconciler_privilege_categories
+      UNION
       SELECT category FROM root_reconciler_expected_privileges
       UNION
       SELECT category FROM root_reconciler_actual_privileges
@@ -197,3 +219,4 @@ $proof$;
 
 DROP TABLE root_reconciler_actual_privileges;
 DROP TABLE root_reconciler_expected_privileges;
+DROP TABLE root_reconciler_privilege_categories;

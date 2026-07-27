@@ -60,6 +60,11 @@ expect_allowlist_rejection \
   'public.tasks.title' \
   'GRANT UPDATE (title) ON TABLE public.tasks TO forge_project_root_reconciler;'
 
+expect_allowlist_rejection \
+  'column select privilege mutation' \
+  'public.project_root_reconciliation_write_contexts.actor_id' \
+  'GRANT SELECT (actor_id) ON TABLE public.project_root_reconciliation_write_contexts TO forge_project_root_reconciler;'
+
 # This intentionally exercises an effective privilege inherited from PUBLIC,
 # rather than only a direct grant to the dedicated login.
 expect_allowlist_rejection \
