@@ -748,6 +748,22 @@ END; $$;
 REVOKE ALL ON FUNCTION forge.lock_project_root_reconciliation_authority_v1(uuid,uuid,bigint,uuid) FROM PUBLIC;
 ALTER FUNCTION forge.lock_project_root_reconciliation_authority_v1(uuid,uuid,bigint,uuid) OWNER TO forge_s4_routines_owner;
 GRANT EXECUTE ON FUNCTION forge.lock_project_root_reconciliation_authority_v1(uuid,uuid,bigint,uuid) TO forge_project_root_reconciler;
+CREATE OR REPLACE FUNCTION forge.guard_project_root_reconciler_task_update_v1()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+BEGIN
+  IF session_user <> 'forge_project_root_reconciler' THEN RETURN NEW; END IF;
+  IF NOT EXISTS (SELECT 1 FROM public.project_root_reconciliation_write_contexts context_row WHERE context_row.project_id=OLD.project_id AND context_row.backend_pid=pg_catalog.pg_backend_pid() AND context_row.transaction_id=pg_catalog.txid_current() AND context_row.completed_at IS NULL) THEN RAISE EXCEPTION 'project-root task update has no active write context' USING ERRCODE='42501'; END IF;
+  IF OLD.status NOT IN ('running','failed') OR NEW.status <> 'approved' OR NEW.error_message IS NOT NULL
+     OR (to_jsonb(NEW) - ARRAY['status','error_message','updated_at']) IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['status','error_message','updated_at']) THEN
+    RAISE EXCEPTION 'project-root task update is outside canonical convergence' USING ERRCODE='42501';
+  END IF;
+  NEW.updated_at := pg_catalog.transaction_timestamp();
+  RETURN NEW;
+END; $$;
+REVOKE ALL ON FUNCTION forge.guard_project_root_reconciler_task_update_v1() FROM PUBLIC;
+CREATE TRIGGER project_root_reconciler_task_update_guard_v1
+BEFORE UPDATE ON public.tasks FOR EACH ROW EXECUTE FUNCTION forge.guard_project_root_reconciler_task_update_v1();
+ALTER FUNCTION forge.guard_project_root_reconciler_task_update_v1() OWNER TO forge_s4_routines_owner;
 CREATE OR REPLACE FUNCTION forge.complete_project_root_reconciliation_generation_v1(p_operation_id uuid, p_actor_id uuid, p_generation bigint, p_project_id uuid, p_outcome text)
 RETURNS TABLE(state text, last_processed_generation bigint)
 LANGUAGE plpgsql
