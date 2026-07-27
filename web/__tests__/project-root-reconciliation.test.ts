@@ -218,6 +218,11 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(negativeProof).toContain('project-root authority lock has no active write context')
     expect(negativeProof).toContain("'correct-next-generation wrong-project binding'")
     expect(negativeProof).toContain("'wrong-generation correct-journal-project binding'")
+    expect(negativeProof).toContain("'valid-entry wrong-actor ownership'")
+    expect(negativeProof).toContain("'composite completion wrong-actor context identity'")
+    expect(negativeProof).toContain("actor_b='44444444-4444-4444-8444-444444444444'")
+    expect(negativeProof).toContain('project-root write context is absent or stale')
+    expect(negativeProof).toContain('leave a context row behind')
     expect(negativeProof).toContain("WHERE project_id <> '${project}'::uuid")
     expect(negativeProof).toContain('WHERE generation > ${generation} AND generation <= ${through}')
     expect(negativeProof).toContain('snapshot_reconciliation_state')
@@ -228,6 +233,22 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(negativeProof).not.toContain('reconcile-migration-0027-root-refs.sh')
     expect(upgradeProof.indexOf('prove-migration-0027-root-reconciliation-negative.sh')).toBeLessThan(
       upgradeProof.indexOf('reconcile-migration-0027-root-refs.sh'),
+    )
+  })
+
+  it('keeps completion context identity actor-bound before the non-disclosing operation CAS', () => {
+    const completionRoutine = migration.slice(
+      migration.indexOf('CREATE OR REPLACE FUNCTION forge.complete_project_root_reconciliation_generation_v1'),
+      migration.indexOf(
+        'CREATE OR REPLACE FUNCTION',
+        migration.indexOf('CREATE OR REPLACE FUNCTION forge.complete_project_root_reconciliation_generation_v1') + 1,
+      ),
+    )
+    // Actor is intentionally part of the active-context lookup. Moving it to a
+    // later actor-specific check would disclose another actor's live context.
+    expect(completionRoutine).toContain('context.operation_id=p_operation_id AND context.generation=p_generation AND context.actor_id=p_actor_id AND context.project_id=p_project_id AND context.backend_pid=pg_catalog.pg_backend_pid() AND context.transaction_id=pg_catalog.txid_current() AND context.completed_at IS NULL')
+    expect(completionRoutine.indexOf('context.actor_id=p_actor_id')).toBeLessThan(
+      completionRoutine.indexOf('v_operation.actor_id <> p_actor_id'),
     )
   })
 
