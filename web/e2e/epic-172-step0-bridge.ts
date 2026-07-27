@@ -159,11 +159,15 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
   },
   {
     id: 'task-detail-controls.spec.ts::loads the package pointer and carries D1 into an explicit D2 reapproval',
-    classification: 'signed-activation-required',
+    // Fully route-mocked: it never calls an ingress-gated endpoint, so the
+    // pointer compare-and-set contract is provable while ingress is disabled.
+    classification: 'run-disabled-safe',
   },
   {
     id: 'task-detail-controls.spec.ts::refreshes a stale pointer and waits for a second explicit confirmation',
-    classification: 'signed-activation-required',
+    // Fully route-mocked: it never calls an ingress-gated endpoint, so the
+    // pointer compare-and-set contract is provable while ingress is disabled.
+    classification: 'run-disabled-safe',
   },
 ] as const satisfies readonly Epic172Step0E2EEntry[]
 

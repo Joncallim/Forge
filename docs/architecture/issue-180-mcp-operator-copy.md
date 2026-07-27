@@ -1399,6 +1399,28 @@ audits normalize to `unavailable`, evidence-dependent recovery markers normalize
 to `invalid`, and `localEvidenceAvailable:false` is carried on every projection.
 S5 never falls back to the ordinary application connection for this table.
 
+That principal is `forge_local_evidence_reader`, bootstrapped alongside the
+other dedicated S4 logins and granted a **column-scoped** `SELECT` after
+migrations by `protocol:provision-epic-172-local-evidence-reader`. The grant
+names only `id`, `task_id`, `work_package_id`, `agent_run_id`, `state`,
+`lease_expires_at`, `terminal_at`, and `created_at`. PostgreSQL — not
+application code — refuses a query that reaches for `claim_token`, so the
+redaction is a property of the database boundary and a future careless SELECT
+fails closed rather than leaking. The principal holds no write privilege and no
+`CREATE` on `public`. CI proves all three: the safe columns read, the token
+select fails, and the delete fails.
+
+### Browser coverage
+
+The pointer compare-and-set cases are fully route-mocked and never call an
+ingress-gated endpoint, so they are classified `run-disabled-safe` and run in CI
+while Step 0 keeps project-management ingress disabled. They prove D1→D2 pointer
+carry, the stale-409 reload, and that a changed grant requires a second explicit
+confirmation — the control relabels to `Confirm allow once`/`Confirm always
+allow`/`Confirm deny` and submits nothing until the operator acts again. The
+grant control refuses to submit at all until the authoritative pointer has
+loaded, and distinguishes a pointer that actually moved from any other 409.
+
 ### Packet evidence
 
 Read S4 artifact by `(agentRunId, artifactType='mcp_bounded_context_packet_metadata')`.

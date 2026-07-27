@@ -1816,6 +1816,115 @@ function filesystemEffectiveState(pkg: WorkPackage): {
   }
 }
 
+type TaskFilesystemGrantDecision = {
+  capabilities: string[]
+  decision: 'approved' | 'denied'
+  grantDecisionRevision: string | null
+  id: string
+  reason: string | null
+}
+
+type TaskFilesystemGrantState = {
+  currentDecision: TaskFilesystemGrantDecision | null
+  pointerFingerprint: string | null
+  pointerVersion: string
+  workPackageId: string
+}
+
+export type FilesystemGrantExpectedPointer = {
+  currentDecisionId: string
+  currentDecisionRevision: string | null
+  pointerFingerprint: string
+  pointerVersion: string
+}
+
+/**
+ * A reapproval is valid only against the exact package decision the operator
+ * reviewed. An empty package has no prior decision, so its first decision (D1)
+ * intentionally has no expected pointer.
+ */
+export function filesystemGrantExpectedPointerFromState(
+  state: TaskFilesystemGrantState | null,
+): FilesystemGrantExpectedPointer | null {
+  if (!state?.currentDecision || !state.pointerFingerprint) return null
+  return {
+    currentDecisionId: state.currentDecision.id,
+    currentDecisionRevision: state.currentDecision.grantDecisionRevision,
+    pointerFingerprint: state.pointerFingerprint,
+    pointerVersion: state.pointerVersion,
+  }
+}
+
+function sameFilesystemGrantPointer(
+  left: FilesystemGrantExpectedPointer | null,
+  right: FilesystemGrantExpectedPointer | null,
+): boolean {
+  if (left === null || right === null) return left === right
+  return left.currentDecisionId === right.currentDecisionId &&
+    left.currentDecisionRevision === right.currentDecisionRevision &&
+    left.pointerFingerprint === right.pointerFingerprint &&
+    left.pointerVersion === right.pointerVersion
+}
+
+function taskFilesystemGrantStateFromResponse(
+  value: unknown,
+  workPackageId: string,
+): TaskFilesystemGrantState {
+  if (!isRecord(value) || !Array.isArray(value.grants)) {
+    throw new Error('Forge returned an invalid filesystem grant state.')
+  }
+  const rawState = value.grants.find((grant) => isRecord(grant) && grant.workPackageId === workPackageId)
+  if (!isRecord(rawState)) {
+    throw new Error('Forge did not return filesystem grant state for this work package.')
+  }
+  if (typeof rawState.pointerVersion !== 'string' || !/^(0|[1-9][0-9]*)$/.test(rawState.pointerVersion)) {
+    throw new Error('Forge returned an invalid filesystem grant pointer version.')
+  }
+  if (rawState.pointerFingerprint !== null && typeof rawState.pointerFingerprint !== 'string') {
+    throw new Error('Forge returned an invalid filesystem grant pointer fingerprint.')
+  }
+
+  if (rawState.currentDecision === null) {
+    return {
+      currentDecision: null,
+      pointerFingerprint: rawState.pointerFingerprint,
+      pointerVersion: rawState.pointerVersion,
+      workPackageId,
+    }
+  }
+  if (!isRecord(rawState.currentDecision)) {
+    throw new Error('Forge returned an invalid current filesystem decision.')
+  }
+  const decision = rawState.currentDecision
+  if (
+    typeof decision.id !== 'string' || decision.id === '' ||
+    (decision.decision !== 'approved' && decision.decision !== 'denied') ||
+    !Array.isArray(decision.capabilities) ||
+    !decision.capabilities.every((capability) => typeof capability === 'string') ||
+    (decision.reason !== null && typeof decision.reason !== 'string') ||
+    (decision.grantDecisionRevision !== null && (
+      typeof decision.grantDecisionRevision !== 'string' ||
+      !/^[1-9][0-9]*$/.test(decision.grantDecisionRevision)
+    )) ||
+    typeof rawState.pointerFingerprint !== 'string' || rawState.pointerFingerprint === ''
+  ) {
+    throw new Error('Forge returned an incomplete current filesystem decision pointer.')
+  }
+
+  return {
+    currentDecision: {
+      capabilities: [...decision.capabilities],
+      decision: decision.decision,
+      grantDecisionRevision: decision.grantDecisionRevision,
+      id: decision.id,
+      reason: decision.reason,
+    },
+    pointerFingerprint: rawState.pointerFingerprint,
+    pointerVersion: rawState.pointerVersion,
+    workPackageId,
+  }
+}
+
 function FilesystemGrantControls({
   onUpdated,
   pkg,
@@ -1833,12 +1942,10 @@ function FilesystemGrantControls({
   const [reason, setReason] = useState(effective.reason)
   const [saving, setSaving] = useState<'allow_once' | 'always_allow' | 'denied' | null>(null)
   const [error, setError] = useState<string | null>(null)
-  // The exact current-decision pointer the operator is acting against. The
-  // server rejects a mutation without it once a decision exists, and a stale
-  // one must never be auto-retried: the operator has to see the decision that
-  // replaced theirs and confirm again.
-  const [pointer, setPointer] = useState<FilesystemGrantPointer | null>(null)
-  const [staleConflict, setStaleConflict] = useState<string | null>(null)
+  const [grantState, setGrantState] = useState<TaskFilesystemGrantState | null>(null)
+  const [grantStateLoading, setGrantStateLoading] = useState(true)
+  const [grantStateError, setGrantStateError] = useState<string | null>(null)
+  const [requiresReconfirmation, setRequiresReconfirmation] = useState(false)
   const packageId = stringField(pkg, ['id'])
   const packageStatus = stringField(pkg, ['status'])
 
@@ -1847,28 +1954,59 @@ function FilesystemGrantControls({
     setReason(effective.reason)
   }, [effective, summary])
 
-  const loadPointer = useCallback(async () => {
-    if (packageId === '') return null
+  const applyGrantState = useCallback((nextState: TaskFilesystemGrantState) => {
+    setGrantState(nextState)
+    const current = nextState.currentDecision
+    if (!current) return
+    setSelected(current.decision === 'approved' ? current.capabilities : summary.requestedCapabilities)
+    setReason(current.reason ?? '')
+  }, [summary.requestedCapabilities])
+
+  const loadGrantState = useCallback(async (signal?: AbortSignal) => {
+    setGrantStateLoading(true)
+    setGrantStateError(null)
     try {
-      const res = await fetch(`/api/tasks/${taskId}/filesystem-grants`)
-      if (!res.ok) return null
-      const body = await res.json().catch(() => null)
-      const grants: unknown = body?.grants
-      if (!Array.isArray(grants)) return null
-      const match = grants.find((grant) => isRecord(grant) && grant.workPackageId === packageId)
-      const next = isRecord(match) ? filesystemGrantExpectedPointerFromState(match) : null
-      setPointer(next)
-      return next
-    } catch {
-      return null
+      const response = await fetch(`/api/tasks/${taskId}/filesystem-grants`, {
+        cache: 'no-store',
+        signal,
+      })
+      const body: unknown = await response.json().catch(() => null)
+      if (!response.ok) {
+        const message = isRecord(body) && typeof body.error === 'string'
+          ? body.error
+          : 'Failed to load the current filesystem decision.'
+        throw new Error(message)
+      }
+      const nextState = taskFilesystemGrantStateFromResponse(body, packageId)
+      if (!signal?.aborted) applyGrantState(nextState)
+      return nextState
+    } catch (loadError) {
+      if (signal?.aborted) return null
+      const message = loadError instanceof Error
+        ? loadError.message
+        : 'Failed to load the current filesystem decision.'
+      setGrantStateError(message)
+      throw loadError
+    } finally {
+      if (!signal?.aborted) setGrantStateLoading(false)
     }
-  }, [packageId, taskId])
+  }, [applyGrantState, packageId, taskId])
+
+  // Only packages that actually render this control need the task's grant
+  // state. Without the capability guard every work package on the task fetched
+  // the same endpoint on mount and then failed normalization, because the
+  // server omits packages that have neither requested capabilities nor prior
+  // decisions.
+  const rendersGrantControl = summary.requestedCapabilities.length > 0 && packageId !== ''
 
   useEffect(() => {
-    void loadPointer()
-  }, [loadPointer, effective])
+    if (!rendersGrantControl) return
+    const controller = new AbortController()
+    void loadGrantState(controller.signal).catch(() => undefined)
+    return () => controller.abort()
+  }, [loadGrantState, rendersGrantControl])
 
-  if (summary.requestedCapabilities.length === 0 || packageId === '') return null
+  if (!rendersGrantControl) return null
 
   const canEdit = (
     (taskStatus === 'awaiting_approval' || taskStatus === 'approved') &&
@@ -1878,10 +2016,14 @@ function FilesystemGrantControls({
   const deniedRequired = effective.status === 'denied' && summary.blockingCapabilities.length > 0
 
   async function submit(decision: 'approved' | 'denied', grantMode: 'allow_once' | 'always_allow' = 'always_allow') {
+    if (!grantState || grantStateLoading) {
+      setError('Wait for Forge to load the current filesystem decision before confirming.')
+      return
+    }
     setSaving(decision === 'approved' ? grantMode : 'denied')
     setError(null)
     try {
-      const expectedPointer = pointer ?? await loadPointer()
+      const expectedPointer = filesystemGrantExpectedPointerFromState(grantState)
       const res = await fetch(`/api/tasks/${taskId}/filesystem-grants`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -1897,26 +2039,45 @@ function FilesystemGrantControls({
           }],
         }),
       })
-      const body = await res.json().catch(() => ({}))
+      const body: unknown = await res.json().catch(() => ({}))
       if (res.status === 409) {
-        // Someone else decided this package first. Reload the authoritative
-        // pointer and stop: the operator must review what is now current and
-        // press the control again. Never silently resubmit.
-        await loadPointer()
-        await onUpdated()
-        setStaleConflict(typeof body.error === 'string'
-          ? body.error
-          : 'This grant changed while you were reviewing it.')
+        try {
+          const refreshedState = await loadGrantState()
+          const refreshedPointer = filesystemGrantExpectedPointerFromState(refreshedState)
+          if (!sameFilesystemGrantPointer(expectedPointer, refreshedPointer)) {
+            setRequiresReconfirmation(true)
+            setError('The filesystem decision changed while you were reviewing it. Forge refreshed the current decision; review it and choose an action again to confirm.')
+          } else {
+            setRequiresReconfirmation(false)
+            setError(isRecord(body) && typeof body.error === 'string'
+              ? body.error
+              : 'Forge could not save this filesystem decision.')
+          }
+        } catch {
+          setRequiresReconfirmation(false)
+          setError('Forge rejected this filesystem decision and could not refresh the current pointer. Reload the task before confirming another decision.')
+        }
         return
       }
       if (!res.ok) {
-        throw new Error(body.error ?? 'Failed to save filesystem grant')
+        throw new Error(isRecord(body) && typeof body.error === 'string'
+          ? body.error
+          : 'Failed to save filesystem grant')
       }
-      setStaleConflict(null)
-      await loadPointer()
+      setRequiresReconfirmation(false)
+      let refreshError: string | null = null
+      try {
+        await loadGrantState()
+      } catch {
+        refreshError = 'The decision was saved, but Forge could not refresh its current pointer. Reload the task before making another decision.'
+      }
       await onUpdated()
       if (res.status === 202) {
-        setError(body.error ?? 'Filesystem grant saved, but Forge could not requeue the recovered task. Retry handoff manually.')
+        setError(isRecord(body) && typeof body.error === 'string'
+          ? body.error
+          : 'Filesystem grant saved, but Forge could not requeue the recovered task. Retry handoff manually.')
+      } else if (refreshError) {
+        setError(refreshError)
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An unexpected error occurred')
@@ -1933,10 +2094,31 @@ function FilesystemGrantControls({
     >
       <div className="flex flex-wrap items-center gap-2">
         <p className="font-medium text-muted-foreground">Filesystem context grant</p>
-        <Badge variant="outline" className={statusBadgeClass(effective.status)}>{statusLabel(effective.status)}</Badge>
+        {/*
+          The badge shows the reconciled effective phase, never the pointer's
+          raw decision. A pointer only records approved/denied, so a consumed
+          allow-once grant or one revoked by a project change still points at an
+          "approved" decision while access is gone — and a package denial that a
+          later project-wide always-allow supersedes still points at "denied".
+          Current grant phases are the display authority; the pointer identity
+          is rendered separately below as evidence of what is being acted on.
+        */}
+        <Badge variant="outline" className={statusBadgeClass(effective.status)}>
+          {statusLabel(effective.status)}
+        </Badge>
         {effective.grantMode !== '' && <Badge variant="secondary">{statusLabel(effective.grantMode)}</Badge>}
         {summary.blockingCapabilities.length > 0 && <Badge variant="secondary">required</Badge>}
       </div>
+      {grantStateLoading && <p role="status" className="mt-2 text-xs text-muted-foreground">Loading current filesystem decision…</p>}
+      {grantState?.currentDecision && (
+        <p className="mt-2 break-all font-mono text-[11px] text-muted-foreground">
+          Current decision {grantState.currentDecision.id}
+          {grantState.currentDecision.grantDecisionRevision
+            ? ` · revision ${grantState.currentDecision.grantDecisionRevision}`
+            : ''}
+          {` · pointer ${grantState.pointerVersion}`}
+        </p>
+      )}
       <div className="mt-2 flex flex-wrap gap-2">
         {FILESYSTEM_CAPABILITY_OPTIONS.filter((capability) => summary.requestedCapabilities.includes(capability)).map((capability) => (
           <label key={capability} className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 font-mono text-[11px] text-foreground">
@@ -1959,19 +2141,6 @@ function FilesystemGrantControls({
           Required filesystem access is denied; this package will block at execution.
         </p>
       )}
-      {staleConflict !== null && (
-        <div
-          role="alert"
-          aria-live="assertive"
-          className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 px-2 py-1.5 text-xs text-destructive"
-        >
-          <p className="font-medium">This grant changed while you were reviewing it</p>
-          <p className="mt-1">{staleConflict}</p>
-          <p className="mt-1">
-            The current decision above has been reloaded. Nothing was saved. Review it and choose again to confirm.
-          </p>
-        </div>
-      )}
       {canEdit && (
         <div className="mt-2 grid gap-2">
           <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs text-muted-foreground">
@@ -1990,37 +2159,53 @@ function FilesystemGrantControls({
           />
           <div className="flex flex-wrap gap-2">
             <Button
-              disabled={saving !== null || approveDisabled}
+              disabled={saving !== null || grantStateLoading || grantState === null || grantStateError !== null || approveDisabled}
               onClick={() => void submit('approved', 'allow_once')}
               size="sm"
               type="button"
               variant="outline"
             >
-              {saving === 'allow_once' ? 'Saving...' : 'Allow once'}
+              {saving === 'allow_once' ? 'Saving...' : requiresReconfirmation ? 'Confirm allow once' : 'Allow once'}
             </Button>
             <Button
-              disabled={saving !== null || approveDisabled}
+              disabled={saving !== null || grantStateLoading || grantState === null || grantStateError !== null || approveDisabled}
               onClick={() => void submit('approved', 'always_allow')}
               size="sm"
               type="button"
               variant="outline"
             >
-              {saving === 'always_allow' ? 'Saving...' : 'Always allow'}
+              {saving === 'always_allow' ? 'Saving...' : requiresReconfirmation ? 'Confirm always allow' : 'Always allow'}
             </Button>
             <Button
-              disabled={saving !== null}
+              disabled={saving !== null || grantStateLoading || grantState === null || grantStateError !== null}
               onClick={() => void submit('denied')}
               size="sm"
               type="button"
               variant="outline"
             >
-              {saving === 'denied' ? 'Saving...' : 'Deny'}
+              {saving === 'denied' ? 'Saving...' : requiresReconfirmation ? 'Confirm deny' : 'Deny'}
             </Button>
           </div>
         </div>
       )}
       {effective.grantApprovalId !== '' && (
         <p className="mt-2 break-all font-mono text-[11px] text-muted-foreground">Grant {effective.grantApprovalId}</p>
+      )}
+      {grantStateError !== null && (
+        <div role="alert" className="mt-2 flex flex-wrap items-center gap-2 text-xs text-destructive">
+          <span>
+            {grantStateError} Forge will not submit a decision without the current pointer, so the controls stay disabled until this loads.
+          </span>
+          <Button
+            disabled={grantStateLoading}
+            onClick={() => void loadGrantState().catch(() => undefined)}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            {grantStateLoading ? 'Retrying…' : 'Retry loading the decision'}
+          </Button>
+        </div>
       )}
       {error !== null && <p role="alert" className="mt-2 text-xs text-destructive">{error}</p>}
     </div>
@@ -3202,7 +3387,7 @@ function CapabilityClassificationPanel({ classification }: { classification: Cap
   )
 }
 
-function initialMcpReviewItems(
+export function initialMcpReviewItems(
   design: McpExecutionDesignMetadata | null,
   existing: ReturnType<typeof latestMcpPlanReviewForDisplay>,
 ): McpPlanReviewDisplayItem[] {
@@ -4631,7 +4816,7 @@ export default function TaskDetailPage() {
             )}
             {isTerminalTaskStatus && (
               <p className="text-xs text-muted-foreground">
-                Retained in history. Forge keeps task, run, review, and filesystem-grant evidence; terminal tasks are not deleted.
+                Task history is retained for audit.
               </p>
             )}
           </div>
@@ -5105,35 +5290,4 @@ export default function TaskDetailPage() {
       </div>
     </div>
   )
-}
-
-
-export type FilesystemGrantPointer = {
-  currentDecisionId: string | null
-  currentDecisionRevision: string | null
-  pointerFingerprint: string
-  pointerVersion: string
-}
-
-/**
- * Builds the exact expected-pointer tuple from an authoritative grant-state
- * row. Returns `null` when the package has no current pointer at all — the
- * server only demands the tuple once a pointer names a decision, and sending
- * an empty fingerprint would be rejected as malformed rather than treated as
- * "no decision yet".
- */
-export function filesystemGrantExpectedPointerFromState(state: {
-  currentDecision?: Record<string, unknown> | null
-  pointerFingerprint?: string | null
-  pointerVersion?: string | null
-  workPackageId?: string
-}): FilesystemGrantPointer | null {
-  const pointerFingerprint = typeof state?.pointerFingerprint === 'string' ? state.pointerFingerprint : ''
-  if (pointerFingerprint === '') return null
-  return {
-    currentDecisionId: typeof state?.currentDecision?.id === 'string' ? state.currentDecision.id : null,
-    currentDecisionRevision: typeof state?.currentDecision?.grantDecisionRevision === 'string' ? state.currentDecision.grantDecisionRevision : null,
-    pointerFingerprint,
-    pointerVersion: typeof state?.pointerVersion === 'string' ? state.pointerVersion : '0',
-  }
 }

@@ -7,6 +7,11 @@ const LOGIN_ROLES = [
   'forge_architect_plan_resolver',
   'forge_architect_plan_history_reader',
   'forge_packet_issuer',
+  // Read-only S5 presentation principal. It is deliberately absent from the
+  // `forge` schema grants below: it never executes an S4 routine, and its only
+  // access is a column-scoped SELECT on work_package_local_run_evidence issued
+  // after migrations by provision-epic-172-local-evidence-reader.
+  'forge_local_evidence_reader',
 ] as const
 const OWNER = 'forge_s4_routines_owner'
 const OWNED_TABLES = [
