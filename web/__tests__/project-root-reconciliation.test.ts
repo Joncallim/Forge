@@ -129,7 +129,10 @@ describe('project-root expansion reconciliation boundary', () => {
   it('selects phase suppression only in the internal root-journal caller', () => {
     expect(reconcileScript).toContain('suppressPhasePersistence: true')
     expect(reconciliation).toContain('suppressPhasePersistence?: boolean')
-    expect(reconciliation).toContain('input.suppressPhasePersistence ? undefined : grant')
+    const normalizedReconciliation = reconciliation.replace(/\s+/g, ' ')
+    expect(normalizedReconciliation).toMatch(
+      /const effective = input\.suppressPhasePersistence \? undefined : grant \? phasesWithEffective\(pkg\.metadata, projectFilesystemEffectivePhase\(grant\)\) : forcePersist \? currentPhases : undefined/,
+    )
     expect(reconcileScript).not.toContain('--suppress')
     expect(reconcileScript).toContain('forge.enter_project_root_reconciliation_generation_v1')
     expect(reconcileScript).toContain('rootReconciliationContext:')
