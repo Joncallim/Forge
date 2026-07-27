@@ -1447,6 +1447,7 @@ export const architectPlanExecutionReferences = pgTable(
     check(
       'architect_plan_execution_references_source_kind_chk',
       sql`(${t.sourceKind} = 'architect_plan_entry'
+          and ${t.architectPlanEntryId} is not null
           and ${t.architectPlanEntryId} = ${t.entryId}
           and ${t.clarificationAnswerId} is null)
         or (${t.sourceKind} = 'clarification_answer'

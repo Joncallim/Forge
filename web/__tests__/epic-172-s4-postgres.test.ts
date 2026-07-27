@@ -357,6 +357,18 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         clarification_answer_id, agent, content_digest, digest_key_id
       ) values (
         'architect_replan', ${ids.task}::uuid, null, ${ids.replanRun}::uuid,
+        ${recorded.artifactId}::uuid, 1, 'plan_body:000000',
+        'architect_plan_entry', null, null, 'architect',
+        ${`hmac-sha256:${'a'.repeat(64)}`}, 's4-test-key'
+      )
+    `).rejects.toMatchObject({ code: '23514', constraint_name: 'architect_plan_execution_references_source_kind_chk' })
+    await expect(admin`
+      insert into architect_plan_execution_references (
+        purpose, task_id, work_package_id, agent_run_id, plan_artifact_id,
+        plan_version, entry_id, source_kind, architect_plan_entry_id,
+        clarification_answer_id, agent, content_digest, digest_key_id
+      ) values (
+        'architect_replan', ${ids.task}::uuid, null, ${ids.replanRun}::uuid,
         ${recorded.artifactId}::uuid, 1, 'plan_body:missing',
         'architect_plan_entry', 'plan_body:missing', null, 'architect',
         ${`hmac-sha256:${'a'.repeat(64)}`}, 's4-test-key'

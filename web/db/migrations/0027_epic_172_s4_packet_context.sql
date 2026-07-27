@@ -6699,12 +6699,12 @@ CREATE TRIGGER architect_clarification_answer_writes_append_only
   FOR EACH ROW EXECUTE FUNCTION forge.reject_s4_retained_mutation_v1();
 REVOKE ALL ON public.architect_clarification_answers, public.architect_clarification_answer_writes FROM PUBLIC;
 ALTER TABLE public.architect_plan_execution_references
-  DROP CONSTRAINT architect_plan_execution_references_entry_fk,
   ADD COLUMN source_kind text NOT NULL DEFAULT 'architect_plan_entry',
   ADD COLUMN architect_plan_entry_id text,
   ADD COLUMN clarification_answer_id uuid,
   ADD CONSTRAINT architect_plan_execution_references_source_kind_chk CHECK (
     (source_kind = 'architect_plan_entry'
+      AND architect_plan_entry_id IS NOT NULL
       AND architect_plan_entry_id = entry_id
       AND clarification_answer_id IS NULL)
     OR (source_kind = 'clarification_answer'
