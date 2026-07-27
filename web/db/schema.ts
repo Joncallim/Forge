@@ -1902,6 +1902,40 @@ export const s4ProtectedReviewSources = pgTable('s4_protected_review_sources', {
   createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
 })
 
+export const projectRootReconciliationWriteContexts = pgTable('project_root_reconciliation_write_contexts', {
+  operationId: uuid('operation_id').notNull(),
+  generation: bigint('generation', { mode: 'bigint' }).notNull(),
+  actorId: uuid('actor_id').notNull(),
+  projectId: uuid('project_id').notNull(),
+  backendPid: integer('backend_pid').notNull(),
+  transactionId: bigint('transaction_id', { mode: 'bigint' }).notNull(),
+  // Match the protected write-context DDL: this is wall-clock entry time,
+  // rather than PostgreSQL's transaction-start timestamp.
+  enteredAt: timestamp('entered_at', tsOpts).default(sql`pg_catalog.clock_timestamp()`).notNull(),
+  completedAt: timestamp('completed_at', tsOpts),
+}, (t) => [
+  primaryKey({ name: 'project_root_reconciliation_write_contexts_pkey', columns: [t.operationId, t.generation] }),
+  unique('project_root_reconciliation_write_context_generation_unique').on(t.generation),
+  check('project_root_reconciliation_write_context_backend_pid_chk', sql`${t.backendPid} > 0`),
+  check('project_root_reconciliation_write_context_transaction_id_chk', sql`${t.transactionId} > 0`),
+  check('project_root_reconciliation_write_context_shape_chk', sql`${t.completedAt} is null or ${t.completedAt} >= ${t.enteredAt}`),
+  foreignKey({
+    name: 'project_root_reconciliation_write_contexts_operation_id_fkey',
+    columns: [t.operationId],
+    foreignColumns: [projectRootReconciliationOperations.operationId],
+  }).onDelete('restrict'),
+  foreignKey({
+    name: 'project_root_reconciliation_write_contexts_generation_fkey',
+    columns: [t.generation],
+    foreignColumns: [projectRootChangeJournal.generation],
+  }).onDelete('restrict'),
+  foreignKey({
+    name: 'project_root_reconciliation_write_contexts_project_id_fkey',
+    columns: [t.projectId],
+    foreignColumns: [projects.id],
+  }).onDelete('restrict'),
+])
+
 export const s4ProtectedReviewSourceReads = pgTable(
   's4_protected_review_source_reads',
   {

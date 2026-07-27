@@ -61,8 +61,9 @@ async function main(): Promise<void> {
         const claimed = (claimedRows as unknown as Array<Record<string, unknown>>).map(parseClaimedProjectRootChange)
         if (claimed.length === 0) return { completed: true, processed: 0 }
         for (const change of claimed) {
+          await tx.execute(sql`select forge.enter_project_root_reconciliation_generation_v1(${operation.operationId}::uuid, ${command.actorId}::uuid, ${change.generation.toString()}::bigint, ${change.projectId}::uuid)`)
           const [project] = await tx.select().from(schema.projects)
-            .where(eq(schema.projects.id, change.projectId)).for('update')
+            .where(eq(schema.projects.id, change.projectId))
           if (!project) throw new Error('Journal project disappeared before reconciliation.')
           const hasBoundFilesystemAuthority = project.rootBindingRevision > BigInt(0)
             || project.grantDecisionRevision > BigInt(0)
@@ -79,15 +80,22 @@ async function main(): Promise<void> {
                 rootBindingRevision: project.rootBindingRevision,
               }),
               suppressPhasePersistence: true,
+              rootReconciliationContext: { operationId: operation.operationId, actorId: command.actorId, generation: change.generation.toString(), projectId: change.projectId },
               trigger: 'project_root_repoint',
             })
           }
-          await tx.execute(sql`
+          const completionRows = await tx.execute(sql`
             select * from forge.complete_project_root_reconciliation_generation_v1(
               ${operation.operationId}::uuid, ${command.actorId}::uuid,
               ${change.generation.toString()}::bigint, ${change.projectId}::uuid, ${change.outcome}
             )
           `)
+          const completion = (completionRows as unknown as Array<{ state?: unknown; last_processed_generation?: unknown }>)[0]
+          if (!completion || (completion.state !== 'running' && completion.state !== 'complete')
+            || String(completion.last_processed_generation) !== change.generation.toString()) {
+            throw new Error('Project-root completion returned an invalid state.')
+          }
+          if (completion.state === 'complete') return { completed: true, processed: claimed.length }
         }
         return { completed: false, processed: claimed.length }
       })
