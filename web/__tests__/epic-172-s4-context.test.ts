@@ -119,9 +119,6 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(webCiWorkflow).toContain('npm run protocol:bootstrap-epic-172-s4-roles')
     expect(webCiWorkflow).toContain('name: Create the freshly migrated isolated S4 PostgreSQL proof database')
     expect(webCiWorkflow).toContain('CREATE DATABASE forge_s4_ci_test OWNER forge_migration_test;')
-    // vitest has no `line` reporter (that is Playwright's); `--reporter=default`
-    // is what the workflow runs after b1feac3 fixed it. The sentinel kept
-    // asserting the unsupported flag, so it failed on this branch by itself.
     expect(webCiWorkflow).toContain('npm run test:mcp:s4-postgres -- --reporter=default | tee "$report"')
     expect(webCiWorkflow).toContain('run: npm run test:unit:zero-skip')
     const zeroSkipStep = webCiWorkflow.slice(

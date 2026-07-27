@@ -92,8 +92,17 @@ evidence, and the external signer private key must never enter Forge.
    npm run protocol:provision-epic-172-application-role
    ```
 
-   Its only release-specific grants are `USAGE` on schema `forge` and `EXECUTE`
-   on `forge.read_epic_172_enablement_state_v1()`.
+   Its only permitted `forge` functions are:
+
+   - `forge.read_epic_172_enablement_state_v1()` to read the release gate;
+   - `forge.read_s4_runtime_mode_for_application_v1()` to read only whether S4
+     is in legacy or protected mode. It returns no protected rows; and
+   - `forge.advance_local_projection_head_v1(...)` to advance the local
+     projection through its fixed validation routine.
+
+   The command also grants `USAGE` on schema `forge` and read-only access to
+   the two local projection tables. It grants no other `forge` function,
+   protected-table, or sequence access.
 6. Deploy the Step 0 web and worker build. Keep project ingress and release
    enablement closed. Do not start an older binary against the migrated database.
 7. Inspect the live database using a short-lived administrator URL:

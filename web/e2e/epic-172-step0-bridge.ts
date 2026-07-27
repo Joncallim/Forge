@@ -126,7 +126,7 @@ export const EPIC_172_STEP0_E2E_INVENTORY = [
     classification: 'run-disabled-safe',
   },
   {
-    id: 'mcp-handoff-concurrency.spec.ts::post-claim context failure removes only the owned lease from current metadata',
+    id: 'mcp-handoff-concurrency.spec.ts::an execution request remains a handoff when a path-mutating hook cannot activate execution',
     classification: 'run-disabled-safe',
   },
   {

@@ -362,6 +362,8 @@ describe('confined materialization boundary', () => {
     expect(mocks.completePacketAssemblyV2).not.toHaveBeenCalled()
     expect(mocks.beginPacketDeliveryV2).not.toHaveBeenCalled()
     expect(mocks.completePacketDeliveryV2).not.toHaveBeenCalled()
+    expect(mocks.bindRegisteredArchitectPlanEntry).not.toHaveBeenCalled()
+    expect(mocks.resolveRegisteredArchitectPlanEntry).not.toHaveBeenCalled()
   })
 })
 
