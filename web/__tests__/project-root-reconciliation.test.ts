@@ -24,6 +24,7 @@ const replayProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migr
 const privilegeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-reconciler-privileges-assertions.sql', import.meta.url)), 'utf8')
 const staleContextProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-stale-context.sh', import.meta.url)), 'utf8')
 const negativeAssertions = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-reconciliation-negative-assertions.sql', import.meta.url)), 'utf8')
+const contentionProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-contention.sh', import.meta.url)), 'utf8')
 const cutoverScript = readFileSync(fileURLToPath(new URL('../scripts/ci/cutover-migration-0027-root-ref.sh', import.meta.url)), 'utf8')
 const webCi = readFileSync(fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)), 'utf8')
 
@@ -238,6 +239,14 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(negativeAssertions).toContain("VALUES (:'operation_id'::uuid, :'task_id'::uuid, :'generation'::bigint)")
     expect(negativeAssertions).toContain('FROM root_negative_assertion_inputs')
     expect(negativeAssertions).not.toContain("id=:'task_id'")
+  })
+
+  it('uses two dedicated sessions and bounded lock-timeout contention before the CLI resumes', () => {
+    expect(contentionProof).toContain('forge.claim_project_root_reconciliation_batch_v1')
+    expect(contentionProof).toContain('forge.enter_project_root_reconciliation_generation_v1')
+    expect(contentionProof).toContain("lock_timeout='250ms'")
+    expect(contentionProof).toContain('canceling statement due to lock timeout')
+    expect(upgradeProof.indexOf('prove-migration-0027-root-contention.sh')).toBeLessThan(upgradeProof.indexOf('reconcile-migration-0027-root-refs.sh'))
   })
 
   it('selects phase suppression only in the internal root-journal caller', () => {
