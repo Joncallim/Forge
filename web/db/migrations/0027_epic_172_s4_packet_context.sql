@@ -7533,7 +7533,6 @@ GRANT EXECUTE ON FUNCTION forge.materialize_project_root_ref_expansion_v1(intege
 -- PostgreSQL also requires an UPDATE privilege for the canonical helper's
 -- FOR UPDATE lock on the current projection-head rows.  The immutable key is
 -- sufficient; this login receives no mutable head-column privilege.
-GRANT EXECUTE ON FUNCTION forge.advance_local_projection_head_v1(uuid,uuid,text,uuid,bigint,text,jsonb,bigint,text,text) TO forge_project_root_reconciler;
 -- The bootstrap fence temporarily gives the incoming owner CREATE on the two
 -- containing schemas because PostgreSQL requires it for SET OWNER. The
 -- finalizer revokes both grants before it verifies the permanent boundary.

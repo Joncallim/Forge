@@ -154,6 +154,7 @@ async function main(): Promise<void> {
       await admin`grant update (work_package_id) on table public.filesystem_mcp_current_decision_pointers to forge_project_root_reconciler`
       await admin`grant update (status, error_message, updated_at) on table public.tasks to forge_project_root_reconciler`
       await admin`grant update (status, blocked_reason, metadata, updated_at) on table public.work_packages to forge_project_root_reconciler`
+      await admin`grant execute on function forge.advance_local_projection_head_v1(uuid,uuid,text,uuid,bigint,text,jsonb,bigint,text,text) to forge_project_root_reconciler`
       const [{ protectedOwnershipCount }] = await admin<{ protectedOwnershipCount: number }[]>`
         select ((
           select count(*) from pg_catalog.pg_class relation
