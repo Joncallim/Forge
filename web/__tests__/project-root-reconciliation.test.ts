@@ -13,6 +13,7 @@ const bootstrap = readFileSync(fileURLToPath(new URL('../scripts/bootstrap-epic-
 const reconcileScript = readFileSync(fileURLToPath(new URL('../scripts/reconcile-project-root-expansion.ts', import.meta.url)), 'utf8')
 const reconciliation = readFileSync(fileURLToPath(new URL('../lib/mcps/filesystem-grant-reconciliation.ts', import.meta.url)), 'utf8')
 const indexScript = readFileSync(fileURLToPath(new URL('../scripts/build-project-root-ref-index.ts', import.meta.url)), 'utf8')
+const upgradeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-upgrade.sh', import.meta.url)), 'utf8')
 const cutoverScript = readFileSync(fileURLToPath(new URL('../scripts/ci/cutover-migration-0027-root-ref.sh', import.meta.url)), 'utf8')
 const webCi = readFileSync(fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)), 'utf8')
 
@@ -152,6 +153,14 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(cutoverScript).toContain('DECLARE v_through bigint := ${through}::bigint;')
     expect(cutoverScript).toContain('project_root_reconciliation_operations')
     expect(cutoverScript).toContain('projects_root_ref_idx')
+    expect(cutoverScript).toContain("pg_catalog.to_regclass('public.projects_root_ref_idx')")
+    expect(cutoverScript).toContain('strict root-reference cutover requires a valid concurrent projects(root_ref) index')
+    expect(upgradeProof.indexOf('bash scripts/ci/reconcile-migration-0027-root-refs.sh')).toBeLessThan(
+      upgradeProof.indexOf('npm run project-roots:build-concurrent-index -- --apply'),
+    )
+    expect(upgradeProof.indexOf('npm run project-roots:build-concurrent-index -- --apply')).toBeLessThan(
+      upgradeProof.indexOf('bash scripts/ci/cutover-migration-0027-root-ref.sh --apply'),
+    )
     expect(webCi).toContain('FORGE_PROJECT_ROOT_RECONCILER_DATABASE_URL')
     expect(webCi).toContain('Capture the post-drain root journal watermark')
   })

@@ -33,7 +33,7 @@ BEGIN
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM pg_catalog.pg_index index_row
-    WHERE index_row.indexrelid = 'public.projects_root_ref_idx'::pg_catalog.regclass AND index_row.indisvalid
+    WHERE index_row.indexrelid = pg_catalog.to_regclass('public.projects_root_ref_idx') AND index_row.indisvalid
   ) THEN RAISE EXCEPTION 'strict root-reference cutover requires a valid concurrent projects(root_ref) index' USING ERRCODE = '55000'; END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint WHERE conrelid = 'public.projects'::regclass AND conname = 'projects_root_ref_not_null_proof') THEN
     ALTER TABLE public.projects ADD CONSTRAINT projects_root_ref_not_null_proof CHECK (root_ref IS NOT NULL) NOT VALID;
