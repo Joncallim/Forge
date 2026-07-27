@@ -41,6 +41,9 @@ BEGIN
   ) OR NOT EXISTS (
     SELECT 1 FROM pg_catalog.pg_roles
     WHERE rolname = 'forge_local_projection_archiver' AND rolcanlogin AND NOT rolinherit AND NOT rolsuper
+  ) OR NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles
+    WHERE rolname = 'forge_project_root_reconciler' AND rolcanlogin AND NOT rolinherit AND NOT rolsuper
   ) THEN
     RAISE EXCEPTION 'dedicated S4 logins must be bootstrapped before migration'
       USING ERRCODE = '42501';
@@ -360,75 +363,28 @@ CREATE TRIGGER projects_root_ref_renull_guard_v1
   BEFORE UPDATE OF root_ref ON public.projects
   FOR EACH ROW EXECUTE FUNCTION forge.guard_project_root_ref_renull_v1();
 --> statement-breakpoint
+-- Kept as a protected compatibility tombstone for the C5 expansion window.
+-- C6 never invokes it; durable operation rows below replace its singleton use.
 CREATE TABLE public.project_root_ref_reconciliation (
   singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
   last_project_id uuid,
   rows_updated bigint NOT NULL DEFAULT 0 CHECK (rows_updated >= 0),
-  state text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','running','complete')),
+  state text NOT NULL DEFAULT 'superseded' CHECK (state IN ('superseded','complete')),
   updated_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp()
 );
 INSERT INTO public.project_root_ref_reconciliation (singleton) VALUES (true);
 --> statement-breakpoint
+-- Retained only so an upgraded operator receives an explicit refusal instead
+-- of silently running the superseded singleton algorithm.
 CREATE OR REPLACE FUNCTION forge.reconcile_project_root_refs_v1(p_batch_size integer)
 RETURNS TABLE (batch_rows integer, remaining_nulls bigint, reconciliation_state text)
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, public
+SET search_path = pg_catalog
 AS $$
-DECLARE
-  v_checkpoint public.project_root_ref_reconciliation%ROWTYPE;
-  v_rows integer;
-  v_remaining bigint;
-  v_last_id uuid;
 BEGIN
-  IF p_batch_size NOT BETWEEN 1 AND 1000 THEN
-    RAISE EXCEPTION 'root-reference batch size must be between 1 and 1000'
-      USING ERRCODE = '22023';
-  END IF;
-
-  SELECT checkpoint.* INTO STRICT v_checkpoint
-  FROM public.project_root_ref_reconciliation checkpoint
-  WHERE checkpoint.singleton
-  FOR UPDATE;
-
-  WITH candidates AS (
-    SELECT project.id
-    FROM public.projects project
-    WHERE project.root_ref IS NULL
-      AND (v_checkpoint.last_project_id IS NULL OR project.id > v_checkpoint.last_project_id)
-    ORDER BY project.id
-    LIMIT p_batch_size
-    FOR UPDATE
-  ), populated AS (
-    UPDATE public.projects project
-    SET root_ref = pg_catalog.gen_random_uuid()
-    FROM candidates
-    WHERE project.id = candidates.id
-      AND project.root_ref IS NULL
-    RETURNING project.id
-  )
-  SELECT pg_catalog.count(*)::integer,
-    (pg_catalog.array_agg(id ORDER BY id DESC))[1]
-  INTO v_rows, v_last_id
-  FROM populated;
-
-  SELECT pg_catalog.count(*) INTO v_remaining
-  FROM public.projects project
-  WHERE project.root_ref IS NULL;
-
-  UPDATE public.project_root_ref_reconciliation checkpoint
-  SET last_project_id = CASE
-        WHEN v_remaining = 0 THEN checkpoint.last_project_id
-        WHEN v_rows > 0 THEN v_last_id
-        ELSE NULL
-      END,
-      rows_updated = checkpoint.rows_updated + v_rows,
-      state = CASE WHEN v_remaining = 0 THEN 'complete' ELSE 'running' END,
-      updated_at = pg_catalog.clock_timestamp()
-  WHERE checkpoint.singleton;
-
-  RETURN QUERY SELECT v_rows, v_remaining,
-    CASE WHEN v_remaining = 0 THEN 'complete'::text ELSE 'running'::text END;
+  RAISE EXCEPTION 'singleton root-reference reconciliation is superseded; use project-roots:reconcile-expansion with an actor and watermark'
+    USING ERRCODE = '55000';
 END;
 $$;
 --> statement-breakpoint
@@ -510,6 +466,243 @@ $$;
 CREATE TRIGGER project_root_change_journal_append_only_v1
   BEFORE UPDATE OR DELETE ON public.project_root_change_journal
   FOR EACH ROW EXECUTE FUNCTION forge.reject_project_root_change_journal_mutation_v1();
+--> statement-breakpoint
+-- C6 keeps the expansion journal authoritative while a bounded external
+-- reconciler applies the existing TypeScript S3 projection in the same
+-- transaction. These rows deliberately contain identities and counters only.
+CREATE TABLE public.project_root_reconciliation_operations (
+  operation_id uuid PRIMARY KEY,
+  actor_id uuid NOT NULL,
+  through_generation bigint NOT NULL CHECK (through_generation >= 0),
+  last_processed_generation bigint NOT NULL DEFAULT 0 CHECK (last_processed_generation >= 0),
+  last_project_id uuid,
+  batch_count bigint NOT NULL DEFAULT 0 CHECK (batch_count >= 0),
+  cumulative_count bigint NOT NULL DEFAULT 0 CHECK (cumulative_count >= 0),
+  state text NOT NULL DEFAULT 'running' CHECK (state IN ('running','complete')),
+  created_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  completed_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  CONSTRAINT project_root_reconciliation_operation_progress_chk CHECK (
+    last_processed_generation <= through_generation
+    AND cumulative_count = last_processed_generation
+    AND ((state = 'running' AND completed_at IS NULL) OR (state = 'complete' AND completed_at IS NOT NULL)
+  )
+);
+CREATE UNIQUE INDEX project_root_reconciliation_one_live_idx
+  ON public.project_root_reconciliation_operations ((true)) WHERE state = 'running';
+--> statement-breakpoint
+CREATE TABLE public.project_root_reconciliation_checkpoints (
+  operation_id uuid NOT NULL REFERENCES public.project_root_reconciliation_operations(operation_id) ON DELETE RESTRICT,
+  checkpoint_generation bigint NOT NULL CHECK (checkpoint_generation >= 0),
+  actor_id uuid NOT NULL,
+  through_generation bigint NOT NULL CHECK (through_generation >= 0),
+  last_processed_generation bigint NOT NULL CHECK (last_processed_generation >= 0),
+  last_project_id uuid,
+  batch_count bigint NOT NULL CHECK (batch_count >= 0),
+  cumulative_count bigint NOT NULL CHECK (cumulative_count >= 0),
+  state text NOT NULL CHECK (state IN ('running','complete')),
+  checkpointed_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  PRIMARY KEY (operation_id, checkpoint_generation),
+  CONSTRAINT project_root_reconciliation_checkpoint_shape_chk CHECK (
+    last_processed_generation <= through_generation
+    AND cumulative_count = last_processed_generation
+  )
+);
+CREATE TABLE public.project_root_reconciliation_outcomes (
+  generation bigint PRIMARY KEY REFERENCES public.project_root_change_journal(generation) ON DELETE RESTRICT,
+  operation_id uuid NOT NULL REFERENCES public.project_root_reconciliation_operations(operation_id) ON DELETE RESTRICT,
+  actor_id uuid NOT NULL,
+  project_id uuid NOT NULL REFERENCES public.projects(id) ON DELETE RESTRICT,
+  outcome text NOT NULL CHECK (outcome IN ('insert','root_update','archive')),
+  recorded_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp()
+);
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.reject_project_root_reconciliation_history_mutation_v1()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+BEGIN
+  RAISE EXCEPTION 'project-root reconciliation history is append-only' USING ERRCODE = '55000';
+END;
+$$;
+CREATE TRIGGER project_root_reconciliation_checkpoints_append_only_v1
+  BEFORE UPDATE OR DELETE ON public.project_root_reconciliation_checkpoints
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_project_root_reconciliation_history_mutation_v1();
+CREATE TRIGGER project_root_reconciliation_outcomes_append_only_v1
+  BEFORE UPDATE OR DELETE ON public.project_root_reconciliation_outcomes
+  FOR EACH ROW EXECUTE FUNCTION forge.reject_project_root_reconciliation_history_mutation_v1();
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.assert_project_root_reconciler_v1()
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE v_role pg_catalog.pg_roles%ROWTYPE;
+BEGIN
+  IF session_user <> 'forge_project_root_reconciler' THEN
+    RAISE EXCEPTION 'project-root reconciliation requires its fixed login' USING ERRCODE = '42501';
+  END IF;
+  SELECT * INTO STRICT v_role FROM pg_catalog.pg_roles WHERE rolname = session_user;
+  IF NOT v_role.rolcanlogin OR v_role.rolinherit OR v_role.rolsuper OR v_role.rolcreatedb
+     OR v_role.rolcreaterole OR v_role.rolreplication OR v_role.rolbypassrls THEN
+    RAISE EXCEPTION 'project-root reconciler role attributes are unsafe' USING ERRCODE = '42501';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m WHERE m.member = session_user::regrole OR m.roleid = session_user::regrole) THEN
+    RAISE EXCEPTION 'project-root reconciler must not have role memberships' USING ERRCODE = '42501';
+  END IF;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.assert_project_root_journal_window_v1(p_through_generation bigint)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE v_counter bigint; v_max bigint; v_count bigint;
+BEGIN
+  IF p_through_generation < 0 THEN RAISE EXCEPTION 'root journal watermark must be non-negative' USING ERRCODE = '22023'; END IF;
+  SELECT last_generation INTO STRICT v_counter FROM public.project_root_change_journal_counter WHERE singleton FOR UPDATE;
+  SELECT coalesce(max(generation), 0), count(*) INTO v_max, v_count FROM public.project_root_change_journal;
+  IF v_counter <> p_through_generation OR v_max <> p_through_generation OR v_count <> p_through_generation THEN
+    RAISE EXCEPTION 'root journal watermark is not contiguous and exact' USING ERRCODE = '55000';
+  END IF;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.materialize_project_root_ref_expansion_v1(p_batch_size integer)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE v_rows integer;
+BEGIN
+  PERFORM forge.assert_project_root_reconciler_v1();
+  IF p_batch_size NOT BETWEEN 1 AND 100 THEN RAISE EXCEPTION 'root-reference materialization batch must be 1 through 100' USING ERRCODE = '22023'; END IF;
+  WITH candidates AS (
+    SELECT project.id FROM public.projects project WHERE project.root_ref IS NULL
+    ORDER BY project.id LIMIT p_batch_size FOR UPDATE
+  ), populated AS (
+    UPDATE public.projects project SET root_ref = pg_catalog.gen_random_uuid()
+    FROM candidates WHERE project.id = candidates.id AND project.root_ref IS NULL
+    RETURNING project.id
+  ) SELECT count(*)::integer INTO v_rows FROM populated;
+  RETURN v_rows;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.begin_project_root_reconciliation_v1(p_operation_id uuid, p_actor_id uuid, p_through_generation bigint)
+RETURNS TABLE(operation_id uuid, actor_id uuid, through_generation bigint, state text, last_processed_generation bigint)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE v_operation public.project_root_reconciliation_operations%ROWTYPE;
+BEGIN
+  PERFORM forge.assert_project_root_reconciler_v1();
+  PERFORM forge.assert_project_root_journal_window_v1(p_through_generation);
+  IF p_operation_id IS NULL THEN
+    SELECT * INTO v_operation FROM public.project_root_reconciliation_operations
+      WHERE actor_id = p_actor_id AND through_generation = p_through_generation
+      ORDER BY created_at DESC LIMIT 1 FOR UPDATE;
+  ELSE
+    SELECT * INTO v_operation FROM public.project_root_reconciliation_operations
+      WHERE operation_id = p_operation_id FOR UPDATE;
+  END IF;
+  IF FOUND THEN
+    IF v_operation.actor_id <> p_actor_id OR v_operation.through_generation <> p_through_generation THEN
+      RAISE EXCEPTION 'project-root operation identity cannot be hijacked' USING ERRCODE = '42501';
+    END IF;
+  ELSE
+    IF EXISTS (SELECT 1 FROM public.project_root_reconciliation_operations WHERE state = 'running') THEN
+      RAISE EXCEPTION 'a project-root reconciliation operation is already live' USING ERRCODE = '55P03';
+    END IF;
+    INSERT INTO public.project_root_reconciliation_operations(operation_id, actor_id, through_generation, state, completed_at)
+    VALUES (coalesce(p_operation_id, pg_catalog.gen_random_uuid()), p_actor_id, p_through_generation,
+      CASE WHEN p_through_generation = 0 THEN 'complete' ELSE 'running' END,
+      CASE WHEN p_through_generation = 0 THEN pg_catalog.clock_timestamp() ELSE NULL END)
+    RETURNING * INTO v_operation;
+    INSERT INTO public.project_root_reconciliation_checkpoints(
+      operation_id, checkpoint_generation, actor_id, through_generation, last_processed_generation,
+      last_project_id, batch_count, cumulative_count, state
+    ) VALUES (v_operation.operation_id, 0, v_operation.actor_id, v_operation.through_generation, 0, NULL, 0, 0, v_operation.state);
+  END IF;
+  RETURN QUERY SELECT v_operation.operation_id, v_operation.actor_id, v_operation.through_generation, v_operation.state, v_operation.last_processed_generation;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.claim_project_root_reconciliation_batch_v1(p_operation_id uuid, p_actor_id uuid, p_batch_size integer)
+RETURNS TABLE(generation bigint, project_id uuid, outcome text, root_binding_revision bigint, grant_decision_revision bigint)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE v_operation public.project_root_reconciliation_operations%ROWTYPE;
+BEGIN
+  PERFORM forge.assert_project_root_reconciler_v1();
+  IF p_batch_size NOT BETWEEN 1 AND 100 THEN RAISE EXCEPTION 'project-root reconciliation batch must be 1 through 100' USING ERRCODE = '22023'; END IF;
+  SELECT * INTO STRICT v_operation FROM public.project_root_reconciliation_operations
+    WHERE operation_id = p_operation_id;
+  IF (SELECT last_generation FROM public.project_root_change_journal_counter WHERE singleton) <> v_operation.through_generation
+     OR (SELECT coalesce(max(generation), 0) FROM public.project_root_change_journal) <> v_operation.through_generation
+     OR (SELECT count(*) FROM public.project_root_change_journal) <> v_operation.through_generation THEN
+    RAISE EXCEPTION 'project-root journal changed before batch claim' USING ERRCODE = '55000';
+  END IF;
+  SELECT * INTO STRICT v_operation FROM public.project_root_reconciliation_operations
+    WHERE operation_id = p_operation_id FOR UPDATE;
+  IF v_operation.actor_id <> p_actor_id OR v_operation.state <> 'running' THEN RAISE EXCEPTION 'project-root operation is not claimable by this actor' USING ERRCODE = '42501'; END IF;
+  RETURN QUERY
+    SELECT journal.generation, journal.project_id, journal.outcome, journal.root_binding_revision, journal.grant_decision_revision
+    FROM public.project_root_change_journal journal
+    WHERE journal.generation > v_operation.last_processed_generation AND journal.generation <= v_operation.through_generation
+    ORDER BY journal.generation LIMIT p_batch_size FOR UPDATE;
+END;
+$$;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION forge.complete_project_root_reconciliation_generation_v1(p_operation_id uuid, p_actor_id uuid, p_generation bigint, p_project_id uuid, p_outcome text)
+RETURNS TABLE(state text, last_processed_generation bigint)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE v_operation public.project_root_reconciliation_operations%ROWTYPE; v_journal public.project_root_change_journal%ROWTYPE;
+BEGIN
+  PERFORM forge.assert_project_root_reconciler_v1();
+  SELECT * INTO STRICT v_operation FROM public.project_root_reconciliation_operations WHERE operation_id = p_operation_id;
+  PERFORM forge.assert_project_root_journal_window_v1(v_operation.through_generation);
+  SELECT * INTO STRICT v_operation FROM public.project_root_reconciliation_operations WHERE operation_id = p_operation_id FOR UPDATE;
+  IF v_operation.actor_id <> p_actor_id OR v_operation.state <> 'running' OR p_generation <> v_operation.last_processed_generation + 1 THEN
+    RAISE EXCEPTION 'project-root completion compare-and-set failed' USING ERRCODE = '40001';
+  END IF;
+  SELECT * INTO STRICT v_journal FROM public.project_root_change_journal WHERE generation = p_generation FOR UPDATE;
+  IF v_journal.project_id <> p_project_id OR v_journal.outcome <> p_outcome OR p_generation > v_operation.through_generation THEN
+    RAISE EXCEPTION 'project-root journal outcome changed or is incoherent' USING ERRCODE = '22023';
+  END IF;
+  IF EXISTS (SELECT 1 FROM public.project_root_reconciliation_outcomes WHERE generation = p_generation) THEN
+    RAISE EXCEPTION 'project-root generation already has an immutable outcome' USING ERRCODE = '23505';
+  END IF;
+  INSERT INTO public.project_root_reconciliation_outcomes(generation, operation_id, actor_id, project_id, outcome)
+  VALUES (p_generation, p_operation_id, p_actor_id, p_project_id, p_outcome);
+  UPDATE public.project_root_reconciliation_operations
+  SET last_processed_generation = p_generation, last_project_id = p_project_id,
+      batch_count = batch_count + 1, cumulative_count = cumulative_count + 1,
+      state = CASE WHEN p_generation = through_generation THEN 'complete' ELSE 'running' END,
+      completed_at = CASE WHEN p_generation = through_generation THEN pg_catalog.clock_timestamp() ELSE NULL END,
+      updated_at = pg_catalog.clock_timestamp()
+  WHERE operation_id = p_operation_id RETURNING * INTO v_operation;
+  INSERT INTO public.project_root_reconciliation_checkpoints(
+    operation_id, checkpoint_generation, actor_id, through_generation, last_processed_generation,
+    last_project_id, batch_count, cumulative_count, state
+  ) VALUES (v_operation.operation_id, v_operation.last_processed_generation, v_operation.actor_id,
+    v_operation.through_generation, v_operation.last_processed_generation, v_operation.last_project_id,
+    v_operation.batch_count, v_operation.cumulative_count, v_operation.state);
+  RETURN QUERY SELECT v_operation.state, v_operation.last_processed_generation;
+END;
+$$;
 --> statement-breakpoint
 CREATE TABLE public.architect_plan_versions (
   task_id uuid NOT NULL,
@@ -7207,12 +7400,23 @@ REVOKE ALL ON public.architect_plan_versions, public.architect_plan_entries,
   public.filesystem_mcp_decision_nonce_claims,
   public.project_root_ref_reconciliation,
   public.project_root_change_journal_counter,
-  public.project_root_change_journal FROM PUBLIC;
+  public.project_root_change_journal,
+  public.project_root_reconciliation_operations,
+  public.project_root_reconciliation_checkpoints,
+  public.project_root_reconciliation_outcomes FROM PUBLIC;
+REVOKE ALL ON public.project_root_change_journal FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.fill_project_root_ref_on_insert_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.guard_project_root_ref_renull_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.reconcile_project_root_refs_v1(integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.append_project_root_change_journal_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.reject_project_root_change_journal_mutation_v1() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.assert_project_root_reconciler_v1() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.assert_project_root_journal_window_v1(bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.materialize_project_root_ref_expansion_v1(integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.begin_project_root_reconciliation_v1(uuid,uuid,bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.claim_project_root_reconciliation_batch_v1(uuid,uuid,integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.complete_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid,text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.reject_project_root_reconciliation_history_mutation_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.s4_protected_paths_enabled_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.guard_s4_approval_gate_review_head_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.reject_s4_retained_mutation_v1() FROM PUBLIC;
@@ -7318,6 +7522,25 @@ GRANT EXECUTE ON FUNCTION forge.apply_local_projection_overlimit_archive_v2(uuid
 GRANT EXECUTE ON FUNCTION forge.resume_local_projection_overlimit_archive_v2(uuid,uuid,text) TO forge_local_projection_archiver;
 GRANT EXECUTE ON FUNCTION forge.rollback_local_projection_overlimit_archive_v2(uuid,uuid,text) TO forge_local_projection_archiver;
 GRANT EXECUTE ON FUNCTION forge.cancel_local_projection_overlimit_archive_v2(uuid,uuid,text) TO forge_local_projection_archiver;
+GRANT EXECUTE ON FUNCTION forge.begin_project_root_reconciliation_v1(uuid,uuid,bigint) TO forge_project_root_reconciler;
+GRANT EXECUTE ON FUNCTION forge.claim_project_root_reconciliation_batch_v1(uuid,uuid,integer) TO forge_project_root_reconciler;
+GRANT EXECUTE ON FUNCTION forge.complete_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid,text) TO forge_project_root_reconciler;
+GRANT EXECUTE ON FUNCTION forge.materialize_project_root_ref_expansion_v1(integer) TO forge_project_root_reconciler;
+-- Canonical TypeScript S3 reconciliation needs these exact ordinary state
+-- columns. It receives no insert/delete nor any protected journal authority.
+GRANT SELECT ON public.projects, public.tasks, public.work_packages,
+  public.filesystem_mcp_grant_approvals, public.filesystem_mcp_current_decision_pointers,
+  public.project_filesystem_grant_decisions, public.project_filesystem_current_decision_pointers,
+  public.work_package_local_projection_heads TO forge_project_root_reconciler;
+-- PostgreSQL requires UPDATE privilege to acquire FOR UPDATE locks. These are
+-- immutable/key columns only; the reconciler never writes them.
+GRANT UPDATE (id) ON public.projects, public.filesystem_mcp_grant_approvals,
+  public.project_filesystem_grant_decisions TO forge_project_root_reconciler;
+GRANT UPDATE (project_id) ON public.project_filesystem_current_decision_pointers TO forge_project_root_reconciler;
+GRANT UPDATE (work_package_id) ON public.filesystem_mcp_current_decision_pointers TO forge_project_root_reconciler;
+GRANT UPDATE (status, error_message, updated_at) ON public.tasks TO forge_project_root_reconciler;
+GRANT UPDATE (status, blocked_reason, metadata, updated_at) ON public.work_packages TO forge_project_root_reconciler;
+GRANT EXECUTE ON FUNCTION forge.advance_local_projection_head_v1(uuid,uuid,text,uuid,bigint,text,jsonb,bigint,text,text) TO forge_project_root_reconciler;
 -- The bootstrap fence temporarily gives the incoming owner CREATE on the two
 -- containing schemas because PostgreSQL requires it for SET OWNER. The
 -- finalizer revokes both grants before it verifies the permanent boundary.
@@ -7341,14 +7564,24 @@ ALTER TABLE public.local_effect_recovery_actions OWNER TO forge_s4_routines_owne
 ALTER TABLE public.local_projection_archive_operations OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.local_projection_archive_operation_checkpoints OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.filesystem_mcp_decision_nonce_claims OWNER TO forge_s4_routines_owner;
-ALTER TABLE public.project_root_ref_reconciliation OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.project_root_change_journal_counter OWNER TO forge_s4_routines_owner;
 ALTER TABLE public.project_root_change_journal OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.project_root_ref_reconciliation OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.project_root_reconciliation_operations OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.project_root_reconciliation_checkpoints OWNER TO forge_s4_routines_owner;
+ALTER TABLE public.project_root_reconciliation_outcomes OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.fill_project_root_ref_on_insert_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.guard_project_root_ref_renull_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.reconcile_project_root_refs_v1(integer) OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.append_project_root_change_journal_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.reject_project_root_change_journal_mutation_v1() OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.assert_project_root_reconciler_v1() OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.assert_project_root_journal_window_v1(bigint) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.materialize_project_root_ref_expansion_v1(integer) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.begin_project_root_reconciliation_v1(uuid,uuid,bigint) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.claim_project_root_reconciliation_batch_v1(uuid,uuid,integer) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.complete_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid,text) OWNER TO forge_s4_routines_owner;
+ALTER FUNCTION forge.reject_project_root_reconciliation_history_mutation_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.s4_protected_paths_enabled_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.guard_s4_approval_gate_review_head_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.reject_s4_retained_mutation_v1() OWNER TO forge_s4_routines_owner;

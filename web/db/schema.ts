@@ -270,11 +270,12 @@ export const projects = pgTable('projects', {
 export type Project = InferSelectModel<typeof projects>
 export type NewProject = InferInsertModel<typeof projects>
 
+/** C5 compatibility tombstone; C6 never uses this singleton. */
 export const projectRootRefReconciliation = pgTable('project_root_ref_reconciliation', {
   singleton: boolean('singleton').primaryKey().default(true),
   lastProjectId: uuid('last_project_id'),
   rowsUpdated: bigint('rows_updated', { mode: 'bigint' }).notNull().default(sql`0`),
-  state: text('state').notNull().default('pending'),
+  state: text('state').notNull().default('superseded'),
   updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
 })
 
@@ -301,6 +302,60 @@ export const projectRootChangeJournal = pgTable('project_root_change_journal', {
   check('project_root_change_journal_outcome_chk', sql`${t.outcome} in ('insert','root_update','archive')`),
   check('project_root_change_journal_root_binding_revision_chk', sql`${t.rootBindingRevision} is null or ${t.rootBindingRevision} > 0`),
   check('project_root_change_journal_grant_decision_revision_chk', sql`${t.grantDecisionRevision} is null or ${t.grantDecisionRevision} > 0`),
+])
+
+export const projectRootReconciliationOperations = pgTable('project_root_reconciliation_operations', {
+  operationId: uuid('operation_id').primaryKey(),
+  actorId: uuid('actor_id').notNull(),
+  throughGeneration: bigint('through_generation', { mode: 'bigint' }).notNull(),
+  lastProcessedGeneration: bigint('last_processed_generation', { mode: 'bigint' }).notNull().default(sql`0`),
+  lastProjectId: uuid('last_project_id'),
+  batchCount: bigint('batch_count', { mode: 'bigint' }).notNull().default(sql`0`),
+  cumulativeCount: bigint('cumulative_count', { mode: 'bigint' }).notNull().default(sql`0`),
+  state: text('state').notNull().default('running'),
+  createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
+  completedAt: timestamp('completed_at', tsOpts),
+  updatedAt: timestamp('updated_at', tsOpts).defaultNow().notNull(),
+}, (t) => [
+  uniqueIndex('project_root_reconciliation_one_live_idx').on(sql`(true)`).where(sql`${t.state} = 'running'`),
+  check('project_root_reconciliation_operation_progress_chk', sql`
+    ${t.throughGeneration} >= 0 and ${t.lastProcessedGeneration} >= 0
+    and ${t.lastProcessedGeneration} <= ${t.throughGeneration}
+    and ${t.cumulativeCount} = ${t.lastProcessedGeneration}
+    and ${t.state} in ('running','complete')
+    and ((${t.state} = 'running' and ${t.completedAt} is null) or (${t.state} = 'complete' and ${t.completedAt} is not null))
+  `),
+])
+
+export const projectRootReconciliationCheckpoints = pgTable('project_root_reconciliation_checkpoints', {
+  operationId: uuid('operation_id').notNull().references(() => projectRootReconciliationOperations.operationId, { onDelete: 'restrict' }),
+  checkpointGeneration: bigint('checkpoint_generation', { mode: 'bigint' }).notNull(),
+  actorId: uuid('actor_id').notNull(),
+  throughGeneration: bigint('through_generation', { mode: 'bigint' }).notNull(),
+  lastProcessedGeneration: bigint('last_processed_generation', { mode: 'bigint' }).notNull(),
+  lastProjectId: uuid('last_project_id'),
+  batchCount: bigint('batch_count', { mode: 'bigint' }).notNull(),
+  cumulativeCount: bigint('cumulative_count', { mode: 'bigint' }).notNull(),
+  state: text('state').notNull(),
+  checkpointedAt: timestamp('checkpointed_at', tsOpts).defaultNow().notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.operationId, t.checkpointGeneration] }),
+  check('project_root_reconciliation_checkpoint_shape_chk', sql`
+    ${t.checkpointGeneration} >= 0 and ${t.throughGeneration} >= 0
+    and ${t.lastProcessedGeneration} >= 0 and ${t.lastProcessedGeneration} <= ${t.throughGeneration}
+    and ${t.cumulativeCount} = ${t.lastProcessedGeneration} and ${t.state} in ('running','complete')
+  `),
+])
+
+export const projectRootReconciliationOutcomes = pgTable('project_root_reconciliation_outcomes', {
+  generation: bigint('generation', { mode: 'bigint' }).primaryKey().references(() => projectRootChangeJournal.generation, { onDelete: 'restrict' }),
+  operationId: uuid('operation_id').notNull().references(() => projectRootReconciliationOperations.operationId, { onDelete: 'restrict' }),
+  actorId: uuid('actor_id').notNull(),
+  projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'restrict' }),
+  outcome: text('outcome').notNull(),
+  recordedAt: timestamp('recorded_at', tsOpts).defaultNow().notNull(),
+}, (t) => [
+  check('project_root_reconciliation_outcome_kind_chk', sql`${t.outcome} in ('insert','root_update','archive')`),
 ])
 
 // ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ const LOGIN_ROLES = [
   'forge_review_source_resolver',
   'forge_s4_recovery_operator',
   'forge_local_projection_archiver',
+  'forge_project_root_reconciler',
 ] as const
 const OWNER = 'forge_s4_routines_owner'
 const PROTECTED_ROLES = [OWNER, ...LOGIN_ROLES] as const
@@ -27,6 +28,9 @@ const OWNED_TABLES = [
   'project_root_ref_reconciliation',
   'project_root_change_journal_counter',
   'project_root_change_journal',
+  'project_root_reconciliation_operations',
+  'project_root_reconciliation_checkpoints',
+  'project_root_reconciliation_outcomes',
   's4_completion_handoffs',
   's4_protected_review_sources',
   's4_protected_review_source_reads',
@@ -102,7 +106,8 @@ async function main(): Promise<void> {
         forge_packet_issuer,
         forge_review_source_resolver,
         forge_s4_recovery_operator,
-        forge_local_projection_archiver
+        forge_local_projection_archiver,
+        forge_project_root_reconciler
     `)
     await admin`revoke create on schema forge from ${admin(OWNER)}`
     await admin`revoke create on schema public from ${admin(OWNER)}`
@@ -200,7 +205,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer'::regrole,
               'forge_review_source_resolver'::regrole,
               'forge_s4_recovery_operator'::regrole,
-              'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
             ])
                or membership.member = any(array[
                  '${OWNER}'::regrole,
@@ -210,7 +216,8 @@ async function main(): Promise<void> {
                  'forge_packet_issuer'::regrole,
                  'forge_review_source_resolver'::regrole,
                  'forge_s4_recovery_operator'::regrole,
-                 'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
                ])
           ) <> 1 or (
             select pg_catalog.count(*)
@@ -258,7 +265,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer'::regrole,
               'forge_review_source_resolver'::regrole,
               'forge_s4_recovery_operator'::regrole,
-              'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
             ])
                or membership.member = any(array[
                  '${OWNER}'::regrole,
@@ -268,7 +276,8 @@ async function main(): Promise<void> {
                  'forge_packet_issuer'::regrole,
                  'forge_review_source_resolver'::regrole,
                  'forge_s4_recovery_operator'::regrole,
-                 'forge_local_projection_archiver'::regrole
+                 'forge_local_projection_archiver'::regrole,
+                 'forge_project_root_reconciler'::regrole
                ])
           ) <> 1 or (
             select pg_catalog.count(*)
@@ -344,6 +353,13 @@ async function main(): Promise<void> {
                 ,'reconcile_project_root_refs_v1'
                 ,'append_project_root_change_journal_v1'
                 ,'reject_project_root_change_journal_mutation_v1'
+                ,'assert_project_root_reconciler_v1'
+                ,'assert_project_root_journal_window_v1'
+                ,'materialize_project_root_ref_expansion_v1'
+                ,'begin_project_root_reconciliation_v1'
+                ,'claim_project_root_reconciliation_batch_v1'
+                ,'complete_project_root_reconciliation_generation_v1'
+                ,'reject_project_root_reconciliation_history_mutation_v1'
                 ,'s4_protected_paths_enabled_v1'
                 ,'guard_s4_approval_gate_review_head_v1'
                 ,'bind_architect_replan_entry_v1'
@@ -399,7 +415,7 @@ async function main(): Promise<void> {
                 ) acl
                 where acl.grantee = 0 and acl.privilege_type = 'EXECUTE'
               )
-          ) <> 63 then
+          ) <> 70 then
             raise exception 'The S4 routine owner or PUBLIC boundary is incomplete'
               using errcode = '42501';
           end if;
@@ -453,7 +469,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer',
               'forge_review_source_resolver',
               'forge_s4_recovery_operator',
-              'forge_local_projection_archiver'
+              'forge_local_projection_archiver',
+              'forge_project_root_reconciler'
             ]) role_name
             where not pg_catalog.has_schema_privilege(role_name, 'forge', 'usage')
                or pg_catalog.has_schema_privilege(role_name, 'forge', 'create')
@@ -505,7 +522,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer'::regrole,
               'forge_review_source_resolver'::regrole,
               'forge_s4_recovery_operator'::regrole,
-              'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
             ])
                or membership.member = any(array[
                  '${OWNER}'::regrole,
@@ -515,7 +533,8 @@ async function main(): Promise<void> {
                  'forge_packet_issuer'::regrole,
                  'forge_review_source_resolver'::regrole,
                  'forge_s4_recovery_operator'::regrole,
-                 'forge_local_projection_archiver'::regrole
+                 'forge_local_projection_archiver'::regrole,
+                 'forge_project_root_reconciler'::regrole
                ])
           ) then
             raise exception 'A finalized S4 protected principal retains a membership edge'
@@ -532,7 +551,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer',
               'forge_review_source_resolver',
               'forge_s4_recovery_operator',
-              'forge_local_projection_archiver'
+              'forge_local_projection_archiver',
+              'forge_project_root_reconciler'
             ])
               and role.rolpassword is not null
           ) or exists (
@@ -545,7 +565,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer'::regrole,
               'forge_review_source_resolver'::regrole,
               'forge_s4_recovery_operator'::regrole,
-              'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
             ])
           ) then
             raise exception 'A finalized S4 principal retains a password or role setting'
@@ -560,7 +581,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer'::regrole,
               'forge_review_source_resolver'::regrole,
               'forge_s4_recovery_operator'::regrole,
-              'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
             ])
           ) or exists (
             select 1 from pg_catalog.pg_proc routine
@@ -571,7 +593,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer'::regrole,
               'forge_review_source_resolver'::regrole,
               'forge_s4_recovery_operator'::regrole,
-              'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
             ])
           ) or exists (
             select 1 from pg_catalog.pg_namespace namespace_row
@@ -582,7 +605,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer'::regrole,
               'forge_review_source_resolver'::regrole,
               'forge_s4_recovery_operator'::regrole,
-              'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
             ])
           ) or exists (
             select 1 from pg_catalog.pg_database database_row
@@ -593,7 +617,8 @@ async function main(): Promise<void> {
               'forge_packet_issuer'::regrole,
               'forge_review_source_resolver'::regrole,
               'forge_s4_recovery_operator'::regrole,
-              'forge_local_projection_archiver'::regrole
+              'forge_local_projection_archiver'::regrole,
+              'forge_project_root_reconciler'::regrole
             ])
           ) then
             raise exception 'A dedicated S4 login owns a database object'
