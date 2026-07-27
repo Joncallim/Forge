@@ -764,6 +764,23 @@ REVOKE ALL ON FUNCTION forge.guard_project_root_reconciler_task_update_v1() FROM
 CREATE TRIGGER project_root_reconciler_task_update_guard_v1
 BEFORE UPDATE ON public.tasks FOR EACH ROW EXECUTE FUNCTION forge.guard_project_root_reconciler_task_update_v1();
 ALTER FUNCTION forge.guard_project_root_reconciler_task_update_v1() OWNER TO forge_s4_routines_owner;
+CREATE OR REPLACE FUNCTION forge.guard_project_root_reconciler_package_update_v1()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE v_old_marker jsonb := OLD.metadata->'mcpGrantBlock'; v_new_marker jsonb := NEW.metadata->'mcpGrantBlock';
+BEGIN
+  IF session_user <> 'forge_project_root_reconciler' THEN RETURN NEW; END IF;
+  IF NOT EXISTS (SELECT 1 FROM public.project_root_reconciliation_write_contexts context_row JOIN public.tasks task_row ON task_row.project_id=context_row.project_id WHERE task_row.id=OLD.task_id AND context_row.backend_pid=pg_catalog.pg_backend_pid() AND context_row.transaction_id=pg_catalog.txid_current() AND context_row.completed_at IS NULL) THEN RAISE EXCEPTION 'project-root package update has no active write context' USING ERRCODE='42501'; END IF;
+  IF (to_jsonb(NEW)-ARRAY['status','blocked_reason','metadata','updated_at']) IS DISTINCT FROM (to_jsonb(OLD)-ARRAY['status','blocked_reason','metadata','updated_at']) OR (NEW.metadata-'mcpGrantBlock') IS DISTINCT FROM (OLD.metadata-'mcpGrantBlock') THEN RAISE EXCEPTION 'project-root package update changed protected fields' USING ERRCODE='42501'; END IF;
+  IF v_new_marker IS NOT NULL THEN
+    IF NOT forge_is_canonical_filesystem_grant_block_v2(v_new_marker) OR (v_old_marker IS NOT NULL AND NOT forge_is_canonical_filesystem_grant_block_v2(v_old_marker)) OR NEW.status <> 'blocked' OR NEW.blocked_reason <> 'Filesystem context requires an operator decision before execution.' THEN RAISE EXCEPTION 'project-root package marker is not canonical' USING ERRCODE='42501'; END IF;
+  ELSIF v_old_marker IS NOT NULL THEN
+    IF NOT forge_is_canonical_filesystem_grant_block_v2(v_old_marker) OR OLD.status NOT IN ('blocked','failed') OR NEW.status <> 'ready' OR NEW.blocked_reason IS NOT NULL THEN RAISE EXCEPTION 'project-root package marker removal is not canonical' USING ERRCODE='42501'; END IF;
+  ELSE RAISE EXCEPTION 'project-root package update must change a canonical marker' USING ERRCODE='42501'; END IF;
+  NEW.updated_at := pg_catalog.transaction_timestamp(); RETURN NEW;
+END; $$;
+REVOKE ALL ON FUNCTION forge.guard_project_root_reconciler_package_update_v1() FROM PUBLIC;
+CREATE TRIGGER project_root_reconciler_package_update_guard_v1 BEFORE UPDATE ON public.work_packages FOR EACH ROW EXECUTE FUNCTION forge.guard_project_root_reconciler_package_update_v1();
+ALTER FUNCTION forge.guard_project_root_reconciler_package_update_v1() OWNER TO forge_s4_routines_owner;
 CREATE OR REPLACE FUNCTION forge.complete_project_root_reconciliation_generation_v1(p_operation_id uuid, p_actor_id uuid, p_generation bigint, p_project_id uuid, p_outcome text)
 RETURNS TABLE(state text, last_processed_generation bigint)
 LANGUAGE plpgsql
