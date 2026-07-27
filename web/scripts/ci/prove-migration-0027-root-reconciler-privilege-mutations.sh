@@ -20,6 +20,31 @@ fail_with_output() {
   exit 1
 }
 
+snapshot_application_acls() {
+  psql "${FORGE_DATABASE_ADMIN_URL}" --no-align --tuples-only --set ON_ERROR_STOP=1 --command "
+    WITH acl_rows AS (
+      SELECT 'relation:' || namespace_row.nspname || '.' || relation.relname || ':' || coalesce(relation.relacl::text, '') AS entry
+      FROM pg_catalog.pg_class relation JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+      WHERE namespace_row.nspname IN ('public', 'forge')
+      UNION ALL
+      SELECT 'column:' || namespace_row.nspname || '.' || relation.relname || '.' || attribute_row.attname || ':' || coalesce(attribute_row.attacl::text, '')
+      FROM pg_catalog.pg_class relation JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+      JOIN pg_catalog.pg_attribute attribute_row ON attribute_row.attrelid = relation.oid
+      WHERE namespace_row.nspname IN ('public', 'forge') AND attribute_row.attnum > 0 AND NOT attribute_row.attisdropped
+      UNION ALL
+      SELECT 'routine:' || namespace_row.nspname || '.' || routine.proname || '(' || pg_catalog.oidvectortypes(routine.proargtypes) || '):' || coalesce(routine.proacl::text, '')
+      FROM pg_catalog.pg_proc routine JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = routine.pronamespace
+      WHERE namespace_row.nspname IN ('public', 'forge')
+      UNION ALL
+      SELECT 'schema:' || namespace_row.nspname || ':' || coalesce(namespace_row.nspacl::text, '')
+      FROM pg_catalog.pg_namespace namespace_row WHERE namespace_row.nspname IN ('public', 'forge')
+      UNION ALL
+      SELECT 'database:' || database_row.datname || ':' || coalesce(database_row.datacl::text, '')
+      FROM pg_catalog.pg_database database_row WHERE database_row.datname = pg_catalog.current_database()
+    )
+    SELECT md5(coalesce(string_agg(entry, E'\\n' ORDER BY entry), '')) FROM acl_rows"
+}
+
 expect_allowlist_rejection() {
   local phase="$1"
   local expected_entry="$2"
@@ -50,6 +75,9 @@ SQL
 
 # Every mutation is uncommitted. The assertion failure closes that psql session,
 # which rolls the transaction back before the following fresh-session probe.
+baseline_acl="$(snapshot_application_acls)"
+[[ "${baseline_acl}" =~ ^[0-9a-f]{32}$ ]] || { echo 'root reconciler privilege mutation proof could not fingerprint baseline ACLs' >&2; exit 1; }
+
 expect_allowlist_rejection \
   'relation privilege mutation' \
   'public.projects:INSERT' \
@@ -65,6 +93,13 @@ expect_allowlist_rejection \
   'public.project_root_reconciliation_write_contexts.actor_id' \
   'GRANT SELECT (actor_id) ON TABLE public.project_root_reconciliation_write_contexts TO forge_project_root_reconciler;'
 
+grantor="$(psql "${FORGE_DATABASE_ADMIN_URL}" --no-align --tuples-only --set ON_ERROR_STOP=1 --command 'SELECT current_user')"
+[[ "${grantor}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo 'root reconciler privilege mutation proof received an unsafe grantor identity' >&2; exit 1; }
+expect_allowlist_rejection \
+  'relation grant option mutation' \
+  "public.projects:SELECT:grantor=${grantor}:grantee=forge_project_root_reconciler" \
+  'GRANT SELECT ON TABLE public.projects TO forge_project_root_reconciler WITH GRANT OPTION;'
+
 # This intentionally exercises an effective privilege inherited from PUBLIC,
 # rather than only a direct grant to the dedicated login.
 expect_allowlist_rejection \
@@ -76,3 +111,5 @@ clean_output="${proof_tmpdir}/clean.log"
 if ! psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 --file "${assertion_file}" >"${clean_output}" 2>&1; then
   fail_with_output 'fresh clean allowlist assertion' "${clean_output}"
 fi
+
+[[ "$(snapshot_application_acls)" == "${baseline_acl}" ]] || { echo 'root reconciler privilege mutation proof left application ACL bytes changed after rollback' >&2; exit 1; }

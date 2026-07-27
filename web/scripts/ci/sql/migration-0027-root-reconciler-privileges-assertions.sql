@@ -20,6 +20,12 @@ INSERT INTO root_reconciler_privilege_categories (category) VALUES
   ('column_insert'),
   ('column_update'),
   ('column_references'),
+  ('grant_option_relation'),
+  ('grant_option_column'),
+  ('grant_option_routine'),
+  ('grant_option_schema'),
+  ('grant_option_database'),
+  ('grant_option_sequence'),
   ('routine'),
   ('schema'),
   ('database'),
@@ -95,6 +101,102 @@ WHERE namespace_row.nspname IN ('public', 'forge')
   AND NOT attribute_row.attisdropped
   AND pg_catalog.has_column_privilege('forge_project_root_reconciler', relation.oid, attribute_row.attnum, privilege.privilege)
   AND NOT pg_catalog.has_table_privilege('forge_project_root_reconciler', relation.oid, privilege.privilege);
+
+-- Grant options are delegation authority. ACL rows identify their source; the
+-- role has no memberships and owns no application objects (checked below), so
+-- direct/PUBLIC ACL rows are the complete effective grant-option surface.
+INSERT INTO root_reconciler_actual_privileges (category, entry)
+SELECT 'grant_option_relation',
+  namespace_row.nspname || '.' || relation.relname || ':' || acl_row.privilege_type ||
+  ':grantor=' || pg_catalog.pg_get_userbyid(acl_row.grantor) ||
+  ':grantee=' || CASE WHEN acl_row.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(acl_row.grantee) END
+FROM pg_catalog.pg_class relation
+JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+CROSS JOIN LATERAL pg_catalog.aclexplode(coalesce(relation.relacl, pg_catalog.acldefault('r', relation.relowner)))
+  AS acl_row(grantor, grantee, privilege_type, is_grantable)
+WHERE namespace_row.nspname IN ('public', 'forge')
+  AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+  AND acl_row.grantee IN (0, 'forge_project_root_reconciler'::regrole)
+  AND acl_row.is_grantable
+  AND (
+    acl_row.privilege_type IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER')
+    OR (acl_row.privilege_type = 'MAINTAIN'
+      AND pg_catalog.current_setting('server_version_num')::integer >= 170000)
+  );
+
+INSERT INTO root_reconciler_actual_privileges (category, entry)
+SELECT 'grant_option_column',
+  namespace_row.nspname || '.' || relation.relname || '.' || attribute_row.attname || ':' || acl_row.privilege_type ||
+  ':grantor=' || pg_catalog.pg_get_userbyid(acl_row.grantor) ||
+  ':grantee=' || CASE WHEN acl_row.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(acl_row.grantee) END
+FROM pg_catalog.pg_class relation
+JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
+JOIN pg_catalog.pg_attribute attribute_row ON attribute_row.attrelid = relation.oid
+CROSS JOIN LATERAL pg_catalog.aclexplode(coalesce(attribute_row.attacl, pg_catalog.acldefault('c', relation.relowner)))
+  AS acl_row(grantor, grantee, privilege_type, is_grantable)
+WHERE namespace_row.nspname IN ('public', 'forge')
+  AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+  AND attribute_row.attnum > 0
+  AND NOT attribute_row.attisdropped
+  AND acl_row.grantee IN (0, 'forge_project_root_reconciler'::regrole)
+  AND acl_row.is_grantable
+  AND acl_row.privilege_type IN ('SELECT', 'INSERT', 'UPDATE', 'REFERENCES');
+
+INSERT INTO root_reconciler_actual_privileges (category, entry)
+SELECT 'grant_option_routine',
+  namespace_row.nspname || '.' || routine.proname || '(' || replace(pg_catalog.oidvectortypes(routine.proargtypes), ', ', ',') || '):EXECUTE' ||
+  ':grantor=' || pg_catalog.pg_get_userbyid(acl_row.grantor) ||
+  ':grantee=' || CASE WHEN acl_row.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(acl_row.grantee) END
+FROM pg_catalog.pg_proc routine
+JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = routine.pronamespace
+CROSS JOIN LATERAL pg_catalog.aclexplode(coalesce(routine.proacl, pg_catalog.acldefault('f', routine.proowner)))
+  AS acl_row(grantor, grantee, privilege_type, is_grantable)
+WHERE namespace_row.nspname IN ('public', 'forge')
+  AND routine.prokind IN ('f', 'p')
+  AND acl_row.grantee IN (0, 'forge_project_root_reconciler'::regrole)
+  AND acl_row.is_grantable
+  AND acl_row.privilege_type = 'EXECUTE';
+
+INSERT INTO root_reconciler_actual_privileges (category, entry)
+SELECT 'grant_option_schema',
+  namespace_row.nspname || ':' || acl_row.privilege_type ||
+  ':grantor=' || pg_catalog.pg_get_userbyid(acl_row.grantor) ||
+  ':grantee=' || CASE WHEN acl_row.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(acl_row.grantee) END
+FROM pg_catalog.pg_namespace namespace_row
+CROSS JOIN LATERAL pg_catalog.aclexplode(coalesce(namespace_row.nspacl, pg_catalog.acldefault('n', namespace_row.nspowner)))
+  AS acl_row(grantor, grantee, privilege_type, is_grantable)
+WHERE namespace_row.nspname IN ('public', 'forge')
+  AND acl_row.grantee IN (0, 'forge_project_root_reconciler'::regrole)
+  AND acl_row.is_grantable
+  AND acl_row.privilege_type IN ('USAGE', 'CREATE');
+
+INSERT INTO root_reconciler_actual_privileges (category, entry)
+SELECT 'grant_option_database',
+  database_row.datname || ':' || acl_row.privilege_type ||
+  ':grantor=' || pg_catalog.pg_get_userbyid(acl_row.grantor) ||
+  ':grantee=' || CASE WHEN acl_row.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(acl_row.grantee) END
+FROM pg_catalog.pg_database database_row
+CROSS JOIN LATERAL pg_catalog.aclexplode(coalesce(database_row.datacl, pg_catalog.acldefault('d', database_row.datdba)))
+  AS acl_row(grantor, grantee, privilege_type, is_grantable)
+WHERE database_row.datname = pg_catalog.current_database()
+  AND acl_row.grantee IN (0, 'forge_project_root_reconciler'::regrole)
+  AND acl_row.is_grantable
+  AND acl_row.privilege_type IN ('CONNECT', 'CREATE', 'TEMPORARY');
+
+INSERT INTO root_reconciler_actual_privileges (category, entry)
+SELECT 'grant_option_sequence',
+  namespace_row.nspname || '.' || sequence_row.relname || ':' || acl_row.privilege_type ||
+  ':grantor=' || pg_catalog.pg_get_userbyid(acl_row.grantor) ||
+  ':grantee=' || CASE WHEN acl_row.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(acl_row.grantee) END
+FROM pg_catalog.pg_class sequence_row
+JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = sequence_row.relnamespace
+CROSS JOIN LATERAL pg_catalog.aclexplode(coalesce(sequence_row.relacl, pg_catalog.acldefault('s', sequence_row.relowner)))
+  AS acl_row(grantor, grantee, privilege_type, is_grantable)
+WHERE namespace_row.nspname IN ('public', 'forge')
+  AND sequence_row.relkind = 'S'
+  AND acl_row.grantee IN (0, 'forge_project_root_reconciler'::regrole)
+  AND acl_row.is_grantable
+  AND acl_row.privilege_type IN ('USAGE', 'SELECT', 'UPDATE');
 
 INSERT INTO root_reconciler_actual_privileges (category, entry)
 SELECT 'routine', namespace_row.nspname || '.' || routine.proname || '(' || replace(pg_catalog.oidvectortypes(routine.proargtypes), ', ', ',') || ')'
