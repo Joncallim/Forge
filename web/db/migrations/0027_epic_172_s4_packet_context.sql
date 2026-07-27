@@ -485,7 +485,7 @@ CREATE TABLE public.project_root_reconciliation_operations (
   CONSTRAINT project_root_reconciliation_operation_progress_chk CHECK (
     last_processed_generation <= through_generation
     AND cumulative_count = last_processed_generation
-    AND ((state = 'running' AND completed_at IS NULL) OR (state = 'complete' AND completed_at IS NOT NULL)
+    AND ((state = 'running' AND completed_at IS NULL) OR (state = 'complete' AND completed_at IS NOT NULL))
   )
 );
 CREATE UNIQUE INDEX project_root_reconciliation_one_live_idx
