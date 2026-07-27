@@ -394,17 +394,27 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       content: 'Architect plan available in protected history',
       metadata: { schemaVersion: 1, stage: 'architect_plan', historyAvailable: true },
     })
-    await expect(readArchitectPlanHistory({
+    const firstHistory = await readArchitectPlanHistory({
       planVersion: '1', sessionCredential, taskId: ids.task,
-    })).resolves.toEqual(expect.arrayContaining([expect.objectContaining({
+    })
+    expect(firstHistory).toEqual(expect.arrayContaining([expect.objectContaining({
       entryId: 'subtask:000001:backend',
       content: expect.stringContaining('filesystem.project.read'),
     })]))
-    const [historyAudit] = await admin<{ reads: number }[]>`
-      select count(*)::integer as reads from architect_plan_history_reads
+    expect(firstHistory).toEqual(expect.arrayContaining([
+      expect.objectContaining({ entryId: `clarification_question:${ids.clarificationQuestion}` }),
+      expect.objectContaining({ entryId: `clarification_answer:${ids.clarificationAnswer}` }),
+    ]))
+    const [historyAudit] = await admin<{ reads: number; returnedEntryCount: number; entrySetDigest: string }[]>`
+      select count(*)::integer as reads,
+        max(returned_entry_count)::integer as "returnedEntryCount",
+        max(entry_set_digest) as "entrySetDigest"
+      from architect_plan_history_reads
       where task_id = ${ids.task}::uuid and user_id = ${ids.user}::uuid
     `
     expect(historyAudit.reads).toBe(1)
+    expect(historyAudit.returnedEntryCount).toBe(firstHistory.length)
+    expect(historyAudit.entrySetDigest).toMatch(/^sha256:[0-9a-f]{64}$/)
     const packageEntry = recorded.entries.find((entry) => entry.entryKind === 'subtask')!
     const reference = executableReferenceForEntry(packageEntry)
     const [bound] = await issuer<{ referenceId: string }[]>`

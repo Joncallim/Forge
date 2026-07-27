@@ -1176,7 +1176,7 @@ BEGIN
   EXECUTE v_history_query || $count$
     SELECT pg_catalog.count(*)::integer,
       'sha256:' || pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
-        pg_catalog.coalesce(pg_catalog.jsonb_agg(
+        COALESCE(pg_catalog.jsonb_agg(
           pg_catalog.jsonb_build_object('entryId', entry_id, 'contentDigest', content_digest)
           ORDER BY entry_id
         )::text, '[]'), 'UTF8'

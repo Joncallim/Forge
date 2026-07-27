@@ -286,6 +286,7 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(historyReader).toContain('answer.source_plan_version <= $2')
     expect(historyReader).toContain('v_returned_entry_count > 256')
     expect(historyReader).not.toMatch(/LIMIT\s+256/i)
+    expect(historyReader).not.toContain('pg_catalog.coalesce')
     expect(s4Migration).toContain("entry_set_digest ~ '^(hmac-sha256|sha256):[0-9a-f]{64}$'")
   })
 
