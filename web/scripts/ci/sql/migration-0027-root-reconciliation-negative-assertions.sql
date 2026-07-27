@@ -1,4 +1,5 @@
 \set ON_ERROR_STOP on
+BEGIN;
 CREATE TEMP TABLE root_negative_assertion_inputs (
   operation_id uuid NOT NULL,
   task_id uuid NOT NULL,
@@ -21,3 +22,4 @@ BEGIN
   END IF;
 END;
 $proof$;
+COMMIT;
