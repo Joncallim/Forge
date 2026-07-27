@@ -7,7 +7,10 @@ import {
   type PacketArtifactPresentationInput,
   type PacketCurrentStatePresentationInput,
 } from '@/lib/mcps/admission-copy'
-import { PACKET_REDACTION_CATEGORIES } from '@/lib/mcps/packet-issuance-v2'
+import {
+  PACKET_REDACTION_CATEGORIES,
+  packetRecoveryMarkerFingerprint,
+} from '@/lib/mcps/packet-issuance-v2'
 import type { LocalEffectRecoveryMarkerV1 } from '@/lib/mcps/local-run-evidence-v2'
 import type { PacketIssuanceRecoveryMarkerV2 } from '@/lib/mcps/packet-issuance-v2'
 
@@ -20,8 +23,12 @@ const ids = {
 }
 const fingerprint = `sha256:${'a'.repeat(64)}`
 
+// The S4 parser recomputes the marker digest over every other field and
+// rejects a mismatch, so a fixture cannot carry a placeholder fingerprint: it
+// has to seal itself the same way a real writer does. Overrides are applied
+// before sealing so each case gets a genuinely valid marker.
 function packetMarker(overrides: Partial<PacketIssuanceRecoveryMarkerV2> = {}): PacketIssuanceRecoveryMarkerV2 {
-  return {
+  const { markerFingerprint: _ignored, ...sealed } = {
     schemaVersion: 2,
     kind: 'packet_issuance',
     priorAgentRunId: ids.run,
@@ -38,6 +45,10 @@ function packetMarker(overrides: Partial<PacketIssuanceRecoveryMarkerV2> = {}): 
     coverageFingerprint: fingerprint,
     autoRetryable: false,
     ...overrides,
+  } as PacketIssuanceRecoveryMarkerV2
+  return {
+    ...sealed,
+    markerFingerprint: packetRecoveryMarkerFingerprint(sealed),
   } as PacketIssuanceRecoveryMarkerV2
 }
 
@@ -201,17 +212,20 @@ describe('packet artifact presentation', () => {
 
 describe('packet current-state presentation', () => {
   it('orders submission acknowledgement before packet decline with the same v2 identity', () => {
-    const presentation = packetCurrentStatePresentation(packetRecovery())
+    const marker = packetMarker()
+    const presentation = packetCurrentStatePresentation(packetRecovery({ marker }))
     expect(presentation.actions.map((action) => action.kind)).toEqual([
       'review_submission',
       'decline_packet_recovery',
     ])
+    // Both actions must carry the marker's own sealed digest, so a decline can
+    // never be paired with a different marker than the primary action.
     expect(presentation.actions[0]).toMatchObject({
       handler: 'acknowledge_possible_submission',
-      request: { priorRuntimeAuditId: ids.audit, markerFingerprint: fingerprint },
+      request: { priorRuntimeAuditId: ids.audit, markerFingerprint: marker.markerFingerprint },
     })
     expect(presentation.actions[1]).toMatchObject({
-      request: { priorRuntimeAuditId: ids.audit, markerFingerprint: fingerprint },
+      request: { priorRuntimeAuditId: ids.audit, markerFingerprint: marker.markerFingerprint },
     })
   })
 
