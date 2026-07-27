@@ -905,8 +905,8 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null,
       }, {
         agent: null, bindingFingerprint: null,
-        content: JSON.stringify({ requirementKey: 'route-policy', schemaVersion: 1 }),
-        entryId: 'requirement:route-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'route-policy',
+        content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }),
+        entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy',
       }],
     })
 
