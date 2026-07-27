@@ -64,6 +64,7 @@ bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh --prepare
 bash scripts/ci/prove-migration-0027-root-reconciliation-negative.sh
 bash scripts/ci/reconcile-migration-0027-root-refs.sh
 bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh --assert
+bash scripts/ci/prove-migration-0027-root-reconciliation-replay.sh
 bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh --recover
 bash scripts/ci/cutover-migration-0027-root-ref.sh --apply
 psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 \

@@ -20,6 +20,7 @@ const rootAuthorityPackageFixture = readFileSync(fileURLToPath(new URL('../scrip
 const rootAuthorityProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-authority-reconciliation.sh', import.meta.url)), 'utf8')
 const rootAuthorityAssertions = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-authority-reconciliation-assertions.sql', import.meta.url)), 'utf8')
 const negativeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-reconciliation-negative.sh', import.meta.url)), 'utf8')
+const replayProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-reconciliation-replay.sh', import.meta.url)), 'utf8')
 const cutoverScript = readFileSync(fileURLToPath(new URL('../scripts/ci/cutover-migration-0027-root-ref.sh', import.meta.url)), 'utf8')
 const webCi = readFileSync(fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)), 'utf8')
 
@@ -196,6 +197,17 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(negativeProof).toContain('migration-0027-root-reconciliation-negative-assertions.sql')
     expect(negativeProof).not.toContain('reconcile-migration-0027-root-refs.sh')
     expect(upgradeProof.indexOf('prove-migration-0027-root-reconciliation-negative.sh')).toBeLessThan(
+      upgradeProof.indexOf('reconcile-migration-0027-root-refs.sh'),
+    )
+  })
+
+  it('replays the completed reconciliation through the exact dedicated CLI without mutation', () => {
+    expect(replayProof).toContain('"mode":"complete-replay"')
+    expect(replayProof).toContain('FORGE_PROJECT_ROOT_RECONCILER_DATABASE_URL')
+    expect(replayProof).toContain('project_root_reconciliation_write_contexts')
+    expect(replayProof).toContain('work_package_local_projection_heads')
+    expect(replayProof).toContain('Completed root reconciliation replay mutated protected state.')
+    expect(upgradeProof.indexOf('prove-migration-0027-root-reconciliation-replay.sh')).toBeGreaterThan(
       upgradeProof.indexOf('reconcile-migration-0027-root-refs.sh'),
     )
   })
