@@ -288,7 +288,7 @@ CREATE TABLE "project_filesystem_grant_decisions" (
   CONSTRAINT "project_filesystem_grant_decisions_fingerprint_check"
     CHECK ("decision_fingerprint" ~ '^sha256:[0-9a-f]{64}$'),
   CONSTRAINT "project_filesystem_grant_decisions_capabilities_check"
-    CHECK (forge_is_canonical_filesystem_capability_set("capabilities")),
+    CHECK (public.forge_is_canonical_filesystem_capability_set("capabilities")),
   CONSTRAINT "project_filesystem_grant_decisions_prior_tuple_check"
     CHECK (
       (
@@ -419,8 +419,8 @@ RETURNS boolean LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
     AND p_block ?& ARRAY['schemaVersion','kind','source','taskDisposition','autoRetryable','terminalFailure','requirementKeys','requestedCapabilities','recoveryAction','blockFingerprint','blockedAt','holdKind','grantPhase','grantConsumed','grantDecisionRevision','revocationReason']
     AND p_block - ARRAY['schemaVersion','kind','source','taskDisposition','autoRetryable','terminalFailure','requirementKeys','requestedCapabilities','recoveryAction','blockFingerprint','blockedAt','holdKind','grantPhase','grantConsumed','grantDecisionRevision','revocationReason']='{}'::jsonb
     AND p_block->'schemaVersion'='2'::jsonb AND p_block->>'kind'='filesystem_grant' AND p_block->>'source'='filesystem-grant-approval' AND p_block->>'taskDisposition'='operator_hold' AND p_block->'autoRetryable'='false'::jsonb AND p_block->'terminalFailure'='false'::jsonb
-    AND forge_is_canonical_bounded_string_set(p_block->'requirementKeys',256,240) AND forge_is_canonical_bounded_string_set(p_block->'requestedCapabilities',3,240) AND forge_is_canonical_filesystem_capability_set(p_block->'requestedCapabilities')
-    AND p_block->>'recoveryAction'='approve_project_filesystem_context' AND (p_block->>'blockFingerprint') ~ '^sha256:[0-9a-f]{64}$' AND forge_is_canonical_utc_timestamp(p_block->>'blockedAt')
+    AND public.forge_is_canonical_bounded_string_set(p_block->'requirementKeys',256,240) AND public.forge_is_canonical_bounded_string_set(p_block->'requestedCapabilities',3,240) AND public.forge_is_canonical_filesystem_capability_set(p_block->'requestedCapabilities')
+    AND p_block->>'recoveryAction'='approve_project_filesystem_context' AND (p_block->>'blockFingerprint') ~ '^sha256:[0-9a-f]{64}$' AND public.forge_is_canonical_utc_timestamp(p_block->>'blockedAt')
     AND ((p_block->>'holdKind'='approval_required' AND p_block->>'grantPhase' IN ('none','proposed','not_issued') AND p_block->'grantConsumed'='false'::jsonb AND p_block->'grantDecisionRevision'='null'::jsonb AND p_block->'revocationReason'='null'::jsonb) OR (p_block->>'holdKind'='denied_required' AND p_block->>'grantPhase'='denied' AND p_block->'grantConsumed'='false'::jsonb AND (p_block->'grantDecisionRevision'='null'::jsonb OR (p_block->>'grantDecisionRevision') ~ '^[1-9][0-9]*$') AND p_block->'revocationReason'='null'::jsonb) OR (p_block->>'holdKind'='revoked_required' AND p_block->>'grantPhase'='revoked' AND p_block->'grantConsumed'='false'::jsonb AND (p_block->>'grantDecisionRevision') ~ '^[1-9][0-9]*$' AND p_block->>'revocationReason' IN ('project_grant_removed','project_grant_narrowed','project_root_repoint')) OR (p_block->>'holdKind'='consumed_once' AND p_block->>'grantPhase'='approved' AND p_block->'grantConsumed'='true'::jsonb AND (p_block->>'grantDecisionRevision') ~ '^[1-9][0-9]*$' AND p_block->'revocationReason'='null'::jsonb))
   ) IS TRUE
 $$;
@@ -431,74 +431,7 @@ ALTER TABLE "work_packages"
   CHECK (
     NOT ("metadata" ? 'mcpGrantBlock')
     OR COALESCE("metadata"->'mcpGrantBlock'->>'schemaVersion', '') <> '2'
-    OR (
-      (
-      jsonb_typeof("metadata"->'mcpGrantBlock') = 'object'
-      AND "status" = 'blocked'
-      AND ("metadata"->'mcpGrantBlock') ?& ARRAY[
-        'schemaVersion','kind','source','taskDisposition','autoRetryable',
-        'terminalFailure','requirementKeys','requestedCapabilities',
-        'recoveryAction','blockFingerprint','blockedAt','holdKind',
-        'grantPhase','grantConsumed','grantDecisionRevision','revocationReason'
-      ]
-      AND ("metadata"->'mcpGrantBlock') - ARRAY[
-        'schemaVersion','kind','source','taskDisposition','autoRetryable',
-        'terminalFailure','requirementKeys','requestedCapabilities',
-        'recoveryAction','blockFingerprint','blockedAt','holdKind',
-        'grantPhase','grantConsumed','grantDecisionRevision','revocationReason'
-      ] = '{}'::jsonb
-      AND "metadata"->'mcpGrantBlock'->'schemaVersion' = '2'::jsonb
-      AND "metadata"->'mcpGrantBlock'->>'kind' = 'filesystem_grant'
-      AND "metadata"->'mcpGrantBlock'->>'source' = 'filesystem-grant-approval'
-      AND "metadata"->'mcpGrantBlock'->>'taskDisposition' = 'operator_hold'
-      AND "metadata"->'mcpGrantBlock'->'autoRetryable' = 'false'::jsonb
-      AND "metadata"->'mcpGrantBlock'->'terminalFailure' = 'false'::jsonb
-      AND forge_is_canonical_bounded_string_set(
-        "metadata"->'mcpGrantBlock'->'requirementKeys', 256, 240
-      )
-      AND forge_is_canonical_bounded_string_set(
-        "metadata"->'mcpGrantBlock'->'requestedCapabilities', 3, 240
-      )
-      AND forge_is_canonical_filesystem_capability_set(
-        "metadata"->'mcpGrantBlock'->'requestedCapabilities'
-      )
-      AND "metadata"->'mcpGrantBlock'->>'recoveryAction' = 'approve_project_filesystem_context'
-      AND ("metadata"->'mcpGrantBlock'->>'blockFingerprint') ~ '^sha256:[0-9a-f]{64}$'
-      AND forge_is_canonical_utc_timestamp("metadata"->'mcpGrantBlock'->>'blockedAt')
-      AND (
-        (
-          "metadata"->'mcpGrantBlock'->>'holdKind' = 'approval_required'
-          AND "metadata"->'mcpGrantBlock'->>'grantPhase' IN ('none','proposed','not_issued')
-          AND "metadata"->'mcpGrantBlock'->'grantConsumed' = 'false'::jsonb
-          AND "metadata"->'mcpGrantBlock'->'grantDecisionRevision' = 'null'::jsonb
-          AND "metadata"->'mcpGrantBlock'->'revocationReason' = 'null'::jsonb
-        ) OR (
-          "metadata"->'mcpGrantBlock'->>'holdKind' = 'denied_required'
-          AND "metadata"->'mcpGrantBlock'->>'grantPhase' = 'denied'
-          AND "metadata"->'mcpGrantBlock'->'grantConsumed' = 'false'::jsonb
-          AND (
-            "metadata"->'mcpGrantBlock'->'grantDecisionRevision' = 'null'::jsonb
-            OR ("metadata"->'mcpGrantBlock'->>'grantDecisionRevision') ~ '^[1-9][0-9]*$'
-          )
-          AND "metadata"->'mcpGrantBlock'->'revocationReason' = 'null'::jsonb
-        ) OR (
-          "metadata"->'mcpGrantBlock'->>'holdKind' = 'revoked_required'
-          AND "metadata"->'mcpGrantBlock'->>'grantPhase' = 'revoked'
-          AND "metadata"->'mcpGrantBlock'->'grantConsumed' = 'false'::jsonb
-          AND ("metadata"->'mcpGrantBlock'->>'grantDecisionRevision') ~ '^[1-9][0-9]*$'
-          AND "metadata"->'mcpGrantBlock'->>'revocationReason' IN (
-            'project_grant_removed','project_grant_narrowed','project_root_repoint'
-          )
-        ) OR (
-          "metadata"->'mcpGrantBlock'->>'holdKind' = 'consumed_once'
-          AND "metadata"->'mcpGrantBlock'->>'grantPhase' = 'approved'
-          AND "metadata"->'mcpGrantBlock'->'grantConsumed' = 'true'::jsonb
-          AND ("metadata"->'mcpGrantBlock'->>'grantDecisionRevision') ~ '^[1-9][0-9]*$'
-          AND "metadata"->'mcpGrantBlock'->'revocationReason' = 'null'::jsonb
-        )
-      )
-      ) IS TRUE
-    )
+    OR ("status" = 'blocked' AND public.forge_is_canonical_filesystem_grant_block_v2("metadata"->'mcpGrantBlock') IS TRUE)
   );
 --> statement-breakpoint
 -- The release ledger is owned by a separate NOLOGIN role. The administrator-
