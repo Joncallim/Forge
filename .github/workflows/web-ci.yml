@@ -275,7 +275,8 @@ jobs:
               'local_effect_recovery_actions', 's4_max_attempt_finalizations',
               'local_projection_archive_operations',
               'local_projection_archive_operation_checkpoints',
-              'filesystem_mcp_decision_nonce_claims', 'project_root_ref_reconciliation'
+              'filesystem_mcp_decision_nonce_claims', 'project_root_ref_reconciliation',
+              'project_root_change_journal_counter', 'project_root_change_journal'
             ] LOOP
               FOREACH table_privilege IN ARRAY ARRAY[
                 'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
@@ -340,7 +341,8 @@ jobs:
               'local_effect_recovery_actions', 's4_max_attempt_finalizations',
               'local_projection_archive_operations',
               'local_projection_archive_operation_checkpoints',
-              'filesystem_mcp_decision_nonce_claims', 'project_root_ref_reconciliation'
+              'filesystem_mcp_decision_nonce_claims', 'project_root_ref_reconciliation',
+              'project_root_change_journal_counter', 'project_root_change_journal'
             ];
             projection_tables constant text[] := ARRAY[
               'forge_epic_172_s3_release_state', 'work_package_local_projection_sources',
