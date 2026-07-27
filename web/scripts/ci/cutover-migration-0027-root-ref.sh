@@ -22,17 +22,6 @@ BEGIN
     RAISE EXCEPTION 'strict root-reference cutover requires Step 0 to remain disabled' USING ERRCODE = '55000';
   END IF;
   IF NOT EXISTS (
-    SELECT 1 FROM public.project_root_reconciliation_operations operation
-    WHERE operation.through_generation = v_through AND operation.state = 'complete'
-      AND operation.last_processed_generation = v_through AND operation.cumulative_count = v_through
-  ) OR (SELECT last_generation FROM public.project_root_change_journal_counter WHERE singleton) <> v_through
-    OR (SELECT coalesce(max(generation), 0) FROM public.project_root_change_journal) <> v_through
-    OR (SELECT count(*) FROM public.project_root_change_journal) <> v_through
-    OR (SELECT count(*) FROM public.project_root_reconciliation_outcomes) <> v_through
-    OR EXISTS (SELECT 1 FROM public.projects WHERE root_ref IS NULL) THEN
-    RAISE EXCEPTION 'strict root-reference cutover requires exact completed watermark coverage' USING ERRCODE = '55000';
-  END IF;
-  IF NOT EXISTS (
     SELECT 1 FROM pg_catalog.pg_index index_row
     JOIN pg_catalog.pg_class index_class ON index_class.oid = index_row.indexrelid
     JOIN pg_catalog.pg_am access_method ON access_method.oid = index_class.relam
@@ -43,6 +32,17 @@ BEGIN
       AND index_row.indexprs IS NULL AND index_row.indkey[0] = attribute_row.attnum
       AND pg_catalog.pg_get_expr(index_row.indpred, index_row.indrelid) = '(root_ref IS NOT NULL)'
   ) THEN RAISE EXCEPTION 'strict root-reference cutover requires the exact canonical concurrent projects(root_ref) index' USING ERRCODE = '55000'; END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM public.project_root_reconciliation_operations operation
+    WHERE operation.through_generation = v_through AND operation.state = 'complete'
+      AND operation.last_processed_generation = v_through AND operation.cumulative_count = v_through
+  ) OR (SELECT last_generation FROM public.project_root_change_journal_counter WHERE singleton) <> v_through
+    OR (SELECT coalesce(max(generation), 0) FROM public.project_root_change_journal) <> v_through
+    OR (SELECT count(*) FROM public.project_root_change_journal) <> v_through
+    OR (SELECT count(*) FROM public.project_root_reconciliation_outcomes) <> v_through
+    OR EXISTS (SELECT 1 FROM public.projects WHERE root_ref IS NULL) THEN
+    RAISE EXCEPTION 'strict root-reference cutover requires exact completed watermark coverage' USING ERRCODE = '55000';
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint WHERE conrelid = 'public.projects'::regclass AND conname = 'projects_root_ref_not_null_proof') THEN
     ALTER TABLE public.projects ADD CONSTRAINT projects_root_ref_not_null_proof CHECK (root_ref IS NOT NULL) NOT VALID;
   END IF;
