@@ -1,15 +1,7 @@
 import { type LanguageModel } from 'ai'
 import path from 'node:path'
-import { and, eq } from 'drizzle-orm'
-import { db } from '../db'
-import { agentConfigs, projects, tasks, type Task, workPackages } from '../db/schema'
-import {
-  getProvider,
-  providerExecutionSnapshot,
-  type ProviderExecutionSnapshot,
-} from '../lib/providers/registry'
-import { resolveDefaultProvider } from '../lib/providers/default'
-import { assertProjectLocalPathForExecution } from '../lib/projects/local-path'
+import { agentConfigs, projects, type Task, workPackages } from '../db/schema'
+import type { ProviderExecutionSnapshot } from '../lib/providers/registry'
 import {
   canonicalFilesystemProjectCapability,
   filesystemEffectiveGrantApprovalId,
@@ -17,7 +9,6 @@ import {
   summarizeFilesystemCapabilities,
 } from '../lib/mcps/filesystem-grants'
 import { readEffectiveGrantState } from '../lib/mcps/admission'
-import { loadCurrentProjectFilesystemDecision } from '../lib/mcps/filesystem-grant-reconciliation'
 import type { ProjectFilesystemDecisionAuthority } from '../lib/mcps/filesystem-project-authority'
 import type { S4LifecycleOwnership, S4LocalLifecycleOwnership } from '../lib/mcps/s4-lease'
 import type { PacketTerminalOutcome } from '../lib/mcps/packet-issuance-v2'
@@ -30,7 +21,6 @@ import {
   formatExecutionContextPacket,
   type ExecutionContextPacket,
 } from './execution-context-packet'
-import { explicitOptInFeatureFlagEnabled } from './feature-flags'
 
 const MAX_FILES = 50
 const MAX_FILE_BYTES = 512 * 1024
@@ -453,10 +443,6 @@ export function hasLocalConflictCopyPathSegment(filePath: string): boolean {
     .some((part) => / 2(?:\.[^./\\]+)?$/.test(part))
 }
 
-function isAcpWorkPackageExecutionEnabled(env: Record<string, string | undefined> = process.env): boolean {
-  return explicitOptInFeatureFlagEnabled(env.FORGE_ACP_WORK_PACKAGE_EXECUTION)
-}
-
 function cleanPromptText(value: unknown, maxLength: number): string {
   if (typeof value !== 'string') return ''
   return value.trim().replace(/\s+/g, ' ').slice(0, maxLength)
@@ -589,7 +575,7 @@ function effectiveFilesystemGrant(
   }
 }
 
-function filesystemRuntimeMetadata(
+export function filesystemRuntimeMetadata(
   workPackage: WorkPackageRow,
   projectMcpConfig: unknown,
   projectFilesystemDecision: unknown,
@@ -930,10 +916,14 @@ export function buildExecutionPrompt(input: {
   ].join('\n')
 }
 
+/* eslint-disable @typescript-eslint/no-unused-vars -- availability fails before inputs may be inspected. */
 export async function loadWorkPackageExecutionPreflight(
-  taskId: string,
-  workPackageId: string,
+  _taskId: string,
+  _workPackageId: string,
 ): Promise<WorkPackageExecutionPreflight> {
+  throw new ConfinedMaterializationUnavailableError()
+
+  /*
   const [row] = await db
     .select({
       task: tasks,
@@ -987,9 +977,7 @@ export async function loadWorkPackageExecutionPreflight(
   const provider = await getProvider(providerConfigId)
   if (!provider) throw new Error(`Provider config ${providerConfigId} is missing or inactive.`)
   if (provider.config.providerType === 'acp' && !isAcpWorkPackageExecutionEnabled()) {
-    throw new Error(
-      'ACP work-package execution is disabled by FORGE_ACP_WORK_PACKAGE_EXECUTION. Remove the setting or set it to 1 after accepting that ACP adapters are local processes and are not OS-confined by Forge.',
-    )
+    throw new ConfinedMaterializationUnavailableError()
   }
 
   const projectFilesystemDecision = await loadCurrentProjectFilesystemDecision(row.project.id)
@@ -1011,15 +999,19 @@ export async function loadWorkPackageExecutionPreflight(
     task: row.task,
     workPackage: row.workPackage,
   }
+  */
 }
 
 export async function activateWorkPackageExecutionContext(
-  preflight: WorkPackageExecutionPreflight,
-  options: {
+  _preflight: WorkPackageExecutionPreflight,
+  _options?: {
     assertS4LifecycleOwned?: () => Promise<void>
     s4Lifecycle?: WorkPackageS4Lifecycle | null
-  } = {},
+  },
 ): Promise<WorkPackageExecutionContext> {
+  throw new ConfinedMaterializationUnavailableError()
+
+  /*
   await options.assertS4LifecycleOwned?.()
   const validatedProjectRoot = await assertProjectLocalPathForExecution(preflight.project)
   return {
@@ -1028,6 +1020,7 @@ export async function activateWorkPackageExecutionContext(
     s4Lifecycle: options.s4Lifecycle ?? null,
     validatedProjectRoot,
   }
+  */
 }
 
 function protectedPlanEntryRegistrationIds(metadata: unknown): string[] {
@@ -1139,10 +1132,13 @@ export async function resolveProtectedArchitectPlanContext(
 }
 
 export async function loadWorkPackageExecutionContext(
-  taskId: string,
-  workPackageId: string,
-  options: WorkPackageExecutionContextLoadOptions = {},
+  _taskId: string,
+  _workPackageId: string,
+  _options?: WorkPackageExecutionContextLoadOptions,
 ): Promise<WorkPackageExecutionContext> {
+  throw new ConfinedMaterializationUnavailableError()
+
+  /*
   const preflight = await loadWorkPackageExecutionPreflight(taskId, workPackageId)
   const s4Lifecycle = await options.beforeProjectPathValidation?.({
     filesystemRuntime: preflight.filesystemRuntime,
@@ -1152,13 +1148,14 @@ export async function loadWorkPackageExecutionContext(
     workPackage: preflight.workPackage,
   }) ?? null
   return activateWorkPackageExecutionContext(preflight, { s4Lifecycle })
+  */
 }
 
 
-export async function executeWorkPackage(context: WorkPackageExecutionContext): Promise<WorkPackageExecutionResult> {
+export async function executeWorkPackage(_context: WorkPackageExecutionContext): Promise<WorkPackageExecutionResult> {
   // Fail before preparing a sandbox, launching ACP, or accepting model output.
   // No provider, command runner, or filesystem writer is available here until
   // an OS-enforced materialization capability is supplied.
-  void context
   throw new ConfinedMaterializationUnavailableError()
 }
+/* eslint-enable @typescript-eslint/no-unused-vars */

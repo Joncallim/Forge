@@ -1400,6 +1400,15 @@ export const architectPlanEntries = pgTable(
   ],
 )
 
+function executionReferenceAnswerColumns(): [AnyPgColumn, AnyPgColumn, AnyPgColumn, AnyPgColumn] {
+  return [
+    architectClarificationAnswers.taskId,
+    architectClarificationAnswers.sourcePlanArtifactId,
+    architectClarificationAnswers.sourcePlanVersion,
+    architectClarificationAnswers.id,
+  ]
+}
+
 export const architectPlanExecutionReferences = pgTable(
   'architect_plan_execution_references',
   {
@@ -1411,6 +1420,9 @@ export const architectPlanExecutionReferences = pgTable(
     planArtifactId: uuid('plan_artifact_id').notNull(),
     planVersion: bigint('plan_version', { mode: 'bigint' }).notNull(),
     entryId: text('entry_id').notNull(),
+    sourceKind: text('source_kind').notNull().default('architect_plan_entry'),
+    architectPlanEntryId: text('architect_plan_entry_id'),
+    clarificationAnswerId: uuid('clarification_answer_id'),
     agent: text('agent').notNull(),
     requirementKey: text('requirement_key'),
     bindingFingerprint: text('binding_fingerprint'),
@@ -1432,6 +1444,30 @@ export const architectPlanExecutionReferences = pgTable(
         or (${t.purpose} = 'architect_replan' and ${t.workPackageId} is null
           and ${t.agent} = 'architect')`,
     ),
+    check(
+      'architect_plan_execution_references_source_kind_chk',
+      sql`(${t.sourceKind} = 'architect_plan_entry'
+          and ${t.architectPlanEntryId} is not null
+          and ${t.architectPlanEntryId} = ${t.entryId}
+          and ${t.clarificationAnswerId} is null)
+        or (${t.sourceKind} = 'clarification_answer'
+          and ${t.architectPlanEntryId} is null
+          and ${t.clarificationAnswerId} is not null
+          and ${t.entryId} = 'clarification_answer:' || ${t.clarificationAnswerId}::text
+          and ${t.purpose} = 'architect_replan'
+          and ${t.workPackageId} is null
+          and ${t.agent} = 'architect')`,
+    ),
+    foreignKey({
+      name: 'architect_plan_execution_references_plan_source_fk',
+      columns: [t.taskId, t.planVersion, t.architectPlanEntryId],
+      foreignColumns: [architectPlanEntries.taskId, architectPlanEntries.planVersion, architectPlanEntries.entryId],
+    }).onUpdate('restrict').onDelete('restrict'),
+    foreignKey({
+      name: 'architect_plan_execution_references_answer_source_fk',
+      columns: [t.taskId, t.planArtifactId, t.planVersion, t.clarificationAnswerId],
+      foreignColumns: executionReferenceAnswerColumns(),
+    }).onUpdate('restrict').onDelete('restrict'),
   ],
 )
 
@@ -2165,5 +2201,8 @@ export const architectClarificationAnswers = pgTable(
       foreignColumns: [taskQuestions.taskId, taskQuestions.id],
     }).onUpdate('restrict').onDelete('restrict'),
     unique('architect_clarification_answers_task_question_id_key').on(t.taskId, t.questionId, t.id),
+    unique('architect_clarification_answers_task_source_id_key').on(
+      t.taskId, t.sourcePlanArtifactId, t.sourcePlanVersion, t.id,
+    ),
   ],
 )

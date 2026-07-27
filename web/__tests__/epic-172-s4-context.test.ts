@@ -119,7 +119,7 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(webCiWorkflow).toContain('npm run protocol:bootstrap-epic-172-s4-roles')
     expect(webCiWorkflow).toContain('name: Create the freshly migrated isolated S4 PostgreSQL proof database')
     expect(webCiWorkflow).toContain('CREATE DATABASE forge_s4_ci_test OWNER forge_migration_test;')
-    expect(webCiWorkflow).toContain('npm run test:mcp:s4-postgres -- --reporter=line | tee "$report"')
+    expect(webCiWorkflow).toContain('npm run test:mcp:s4-postgres -- --reporter=default | tee "$report"')
     expect(webCiWorkflow).toContain('run: npm run test:unit:zero-skip')
     const zeroSkipStep = webCiWorkflow.slice(
       webCiWorkflow.indexOf('name: Run the complete zero-skip unit suite'),
