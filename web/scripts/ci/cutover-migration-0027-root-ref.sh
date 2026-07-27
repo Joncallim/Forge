@@ -14,7 +14,7 @@ fi
 psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 <<SQL
 BEGIN;
 SET LOCAL lock_timeout = '5s';
-DO $cutover$
+DO \$cutover\$
 DECLARE v_through bigint := ${through}::bigint;
 BEGIN
   IF (SELECT state FROM public.forge_epic_172_enablement_state WHERE singleton_id = 'epic-172') <> 'disabled' THEN
@@ -41,7 +41,7 @@ BEGIN
   -- Compatibility marker only; C6 authority is the exact operation/outcome set above.
   UPDATE public.project_root_ref_reconciliation SET state = 'complete', updated_at = pg_catalog.clock_timestamp() WHERE singleton;
 END;
-$cutover$;
+\$cutover\$;
 ALTER TABLE public.projects VALIDATE CONSTRAINT projects_root_ref_not_null_proof;
 ALTER TABLE public.projects ALTER COLUMN root_ref SET NOT NULL;
 COMMIT;
