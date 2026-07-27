@@ -245,7 +245,7 @@ test.describe('MCP handoff optimistic concurrency', () => {
     }
     const [{ count }] = await auditObserver<{ count: number }[]>`
       select count(*)::int as count
-      from filesystem_mcp_runtime_audits
+      from public.filesystem_mcp_runtime_audits
       where work_package_id = ${workPackageId}
         and operation = 'context_packet'
     `
