@@ -427,6 +427,8 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       planVersion: '2', taskId: ids.task,
       entries: [{ agent: null, bindingFingerprint: null, content: 'Second protected plan.',
         entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null }, {
+        agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }),
+        entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' }, {
         agent: null, bindingFingerprint: null, entryId: `clarification_question:${ids.secondClarificationQuestion}`,
         entryKind: 'clarification_question', projectionEligible: false, requirementKey: null,
         content: JSON.stringify({ schemaVersion: 1, questionId: ids.secondClarificationQuestion,
@@ -444,7 +446,8 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       agentRunId: ids.thirdArchitectRun, digestKey: key, digestKeyId: 's4-test-key',
       planVersion: '3', taskId: ids.task,
       entries: [{ agent: null, bindingFingerprint: null, content: 'Third protected plan.',
-        entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null }],
+        entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null },
+      { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' }],
     })
     const latestHistory = await readArchitectPlanHistory({ planVersion: '3', sessionCredential, taskId: ids.task })
     expect(latestHistory.map((entry) => entry.entryId)).toEqual([
@@ -453,6 +456,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       `clarification_question:${ids.clarificationQuestion}`,
       `clarification_question:${ids.secondClarificationQuestion}`,
       'plan_body:000000',
+      'requirement:plan-policy',
     ])
     const [latestAudit] = await admin<{ returnedEntryCount: number; entrySetDigest: string }[]>`
       select returned_entry_count::integer as "returnedEntryCount", entry_set_digest as "entrySetDigest"
@@ -460,13 +464,13 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       order by read_at desc limit 1
     `
     const canonicalSet = latestHistory.map(({ entryId, contentDigest }) => ({ entryId, contentDigest }))
-    expect(latestAudit.returnedEntryCount).toBe(5)
+    expect(latestAudit.returnedEntryCount).toBe(6)
     expect(latestAudit.entrySetDigest).toBe(`sha256:${createHash('sha256').update(JSON.stringify(canonicalSet)).digest('hex')}`)
     const lockRun = randomUUID()
     const lockQuestion = randomUUID()
     await admin`insert into agent_runs (id, task_id, agent_type, model_id_used, status) values (${lockRun}::uuid, ${ids.task}::uuid, 'architect', 'test', 'completed')`
     const lockPlan = await recordArchitectPlanVersion({ agentRunId: lockRun, digestKey: key, digestKeyId: 's4-test-key', planVersion: '4', taskId: ids.task,
-      entries: [{ agent: null, bindingFingerprint: null, content: 'Lock source.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null }, {
+      entries: [{ agent: null, bindingFingerprint: null, content: 'Lock source.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null }, { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' }, {
         agent: null, bindingFingerprint: null, entryId: `clarification_question:${lockQuestion}`, entryKind: 'clarification_question', projectionEligible: false, requirementKey: null,
         content: JSON.stringify({ schemaVersion: 1, questionId: lockQuestion, question: 'Lock?', suggestions: ['yes'] }) }] })
     await admin`insert into task_questions (id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status)
@@ -533,7 +537,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     const overrunQuestions = Array.from({ length: 128 }, () => randomUUID())
     const overrunPlan = await recordArchitectPlanVersion({
       agentRunId: overrunRun, digestKey: key, digestKeyId: 's4-test-key', planVersion: '5', taskId: ids.task,
-      entries: [{ agent: null, bindingFingerprint: null, content: 'Overrun source.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null },
+      entries: [{ agent: null, bindingFingerprint: null, content: 'Overrun source.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null }, { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' },
         ...overrunQuestions.map((questionId) => ({ agent: null, bindingFingerprint: null,
           content: JSON.stringify({ schemaVersion: 1, questionId, question: 'Bounded?', suggestions: ['yes'] }),
           entryId: `clarification_question:${questionId}`, entryKind: 'clarification_question' as const,
@@ -547,7 +551,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         sourcePlanVersion: '5', taskId: ids.task })
     }
     await recordArchitectPlanVersion({ agentRunId: overrunReadRun, digestKey: key, digestKeyId: 's4-test-key', planVersion: '6', taskId: ids.task,
-      entries: [{ agent: null, bindingFingerprint: null, content: 'Overrun read.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null }] })
+      entries: [{ agent: null, bindingFingerprint: null, content: 'Overrun read.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null }, { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' }] })
     const [auditBeforeOverrun] = await admin<{ count: number }[]>`select count(*)::integer as count from architect_plan_history_reads where task_id = ${ids.task}::uuid`
     await expect(readArchitectPlanHistory({ planVersion: '6', sessionCredential, taskId: ids.task })).rejects.toMatchObject({ code: 'invalid_evidence' })
     const [auditAfterOverrun] = await admin<{ count: number }[]>`select count(*)::integer as count from architect_plan_history_reads where task_id = ${ids.task}::uuid`
