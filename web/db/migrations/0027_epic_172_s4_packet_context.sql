@@ -705,6 +705,30 @@ END; $$;
 CREATE TRIGGER project_root_reconciliation_write_contexts_append_only_v1
 BEFORE UPDATE OR DELETE ON public.project_root_reconciliation_write_contexts
 FOR EACH ROW EXECUTE FUNCTION forge.reject_project_root_reconciliation_write_context_mutation_v1();
+CREATE OR REPLACE FUNCTION forge.assert_project_root_reconciliation_write_context_committed_v1()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE v_context public.project_root_reconciliation_write_contexts%ROWTYPE;
+BEGIN
+  SELECT * INTO STRICT v_context FROM public.project_root_reconciliation_write_contexts context_row
+  WHERE context_row.operation_id = NEW.operation_id AND context_row.generation = NEW.generation;
+  IF v_context.completed_at IS NULL OR NOT EXISTS (
+    SELECT 1 FROM public.project_root_reconciliation_outcomes outcome_row
+    JOIN public.project_root_change_journal journal_row ON journal_row.generation = outcome_row.generation
+    JOIN public.project_root_reconciliation_operations operation_row ON operation_row.operation_id = outcome_row.operation_id
+    WHERE outcome_row.generation = v_context.generation AND outcome_row.operation_id = v_context.operation_id
+      AND outcome_row.actor_id = v_context.actor_id AND outcome_row.project_id = v_context.project_id
+      AND outcome_row.outcome = journal_row.outcome AND journal_row.project_id = v_context.project_id
+      AND operation_row.last_processed_generation >= v_context.generation
+  ) THEN
+    RAISE EXCEPTION 'project-root write context must complete before commit' USING ERRCODE = '55000';
+  END IF;
+  RETURN NULL;
+END; $$;
+CREATE CONSTRAINT TRIGGER project_root_reconciliation_write_contexts_commit_v1
+AFTER INSERT OR UPDATE ON public.project_root_reconciliation_write_contexts
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+EXECUTE FUNCTION forge.assert_project_root_reconciliation_write_context_committed_v1();
+REVOKE ALL ON FUNCTION forge.assert_project_root_reconciliation_write_context_committed_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.reject_project_root_reconciliation_write_context_mutation_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.enter_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION forge.enter_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid) TO forge_project_root_reconciler;
