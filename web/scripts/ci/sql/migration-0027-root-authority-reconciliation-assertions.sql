@@ -1,4 +1,13 @@
 \set ON_ERROR_STOP on
+BEGIN;
+CREATE TEMP TABLE root_authority_assertion_inputs (
+  actor_id uuid NOT NULL,
+  operation_id uuid NOT NULL,
+  authority_generation bigint NOT NULL CHECK (authority_generation > 0),
+  through_generation bigint NOT NULL CHECK (through_generation > 0)
+) ON COMMIT DROP;
+INSERT INTO root_authority_assertion_inputs (actor_id, operation_id, authority_generation, through_generation)
+VALUES (:'actor_id'::uuid, :'operation_id'::uuid, :'authority_generation'::bigint, :'through_generation'::bigint);
 
 DO $assertions$
 DECLARE
@@ -8,11 +17,14 @@ DECLARE
   v_add uuid := '27000000-0000-4000-8000-000000000711'::uuid;
   v_refresh uuid := '27000000-0000-4000-8000-000000000712'::uuid;
   v_recover uuid := '27000000-0000-4000-8000-000000000721'::uuid;
-  v_actor uuid := :'actor_id'::uuid;
-  v_operation_id uuid := :'operation_id'::uuid;
-  v_authority_generation bigint := :'authority_generation'::bigint;
-  v_through_generation bigint := :'through_generation'::bigint;
+  v_actor uuid;
+  v_operation_id uuid;
+  v_authority_generation bigint;
+  v_through_generation bigint;
 BEGIN
+  SELECT actor_id, operation_id, authority_generation, through_generation
+    INTO STRICT v_actor, v_operation_id, v_authority_generation, v_through_generation
+    FROM root_authority_assertion_inputs;
   IF NOT EXISTS (
     SELECT 1
     FROM public.project_root_change_journal journal_row
@@ -153,3 +165,4 @@ BEGIN
   END IF;
 END;
 $assertions$;
+COMMIT;

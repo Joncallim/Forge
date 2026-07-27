@@ -181,6 +181,12 @@ describe('project-root expansion reconciliation boundary', () => {
   })
 
   it('asserts canonical package/task/head effects without direct protected authority mutation', () => {
+    expect(rootAuthorityAssertions).toContain('BEGIN;')
+    expect(rootAuthorityAssertions).toContain('CREATE TEMP TABLE root_authority_assertion_inputs')
+    expect(rootAuthorityAssertions).toContain("VALUES (:'actor_id'::uuid, :'operation_id'::uuid, :'authority_generation'::bigint, :'through_generation'::bigint)")
+    expect(rootAuthorityAssertions).toContain('FROM root_authority_assertion_inputs')
+    expect(rootAuthorityAssertions).toContain('COMMIT;')
+    expect(rootAuthorityAssertions).not.toContain("v_actor uuid := :'actor_id'::uuid")
     expect(rootAuthorityAssertions).toContain('project_root_reconciliation_write_contexts')
     expect(rootAuthorityAssertions).toContain("source_row.contribution->>'transition'")
     expect(rootAuthorityAssertions).toContain("WHEN v_add THEN 'hold' WHEN v_refresh THEN 'refresh' WHEN v_recover THEN 'recovery'")
