@@ -21,6 +21,8 @@ DECLARE
   v_operation_id uuid;
   v_authority_generation bigint;
   v_through_generation bigint;
+  v_package_actual jsonb;
+  v_task_actual jsonb;
 BEGIN
   SELECT actor_id, operation_id, authority_generation, through_generation
     INTO STRICT v_actor, v_operation_id, v_authority_generation, v_through_generation
@@ -89,7 +91,20 @@ BEGIN
           '{"fixturePeer":{"case":"addition","retain":true},"mcpGrantPhases":{"filesystem":{"phase":"preexisting-add","revision":"1"}}}'::jsonb
         OR package_row.metadata->'mcpGrantBlock'->'requestedCapabilities' <> '["filesystem.project.read","filesystem.project.search"]'::jsonb
       )
-  ) OR EXISTS (
+  ) THEN
+    SELECT jsonb_build_object(
+      'blockedReason', package_row.blocked_reason,
+      'marker', package_row.metadata->'mcpGrantBlock',
+      'peer', package_row.metadata->'fixturePeer',
+      'phases', package_row.metadata->'mcpGrantPhases',
+      'requirements', package_row.mcp_requirements,
+      'status', package_row.status
+    ) INTO STRICT v_package_actual
+    FROM public.work_packages package_row WHERE package_row.id = v_add;
+    RAISE EXCEPTION 'root authority addition package convergence is not canonical: %', v_package_actual;
+  END IF;
+
+  IF EXISTS (
     SELECT 1 FROM public.work_packages package_row
     WHERE package_row.id = v_refresh
       AND (
@@ -100,7 +115,20 @@ BEGIN
           '{"fixturePeer":{"case":"replacement","retain":true},"mcpGrantPhases":{"filesystem":{"phase":"preexisting-replace","revision":"1"}}}'::jsonb
         OR package_row.metadata->'mcpGrantBlock'->'requestedCapabilities' <> '["filesystem.project.read","filesystem.project.search"]'::jsonb
       )
-  ) OR EXISTS (
+  ) THEN
+    SELECT jsonb_build_object(
+      'blockedReason', package_row.blocked_reason,
+      'marker', package_row.metadata->'mcpGrantBlock',
+      'peer', package_row.metadata->'fixturePeer',
+      'phases', package_row.metadata->'mcpGrantPhases',
+      'requirements', package_row.mcp_requirements,
+      'status', package_row.status
+    ) INTO STRICT v_package_actual
+    FROM public.work_packages package_row WHERE package_row.id = v_refresh;
+    RAISE EXCEPTION 'root authority refresh package convergence is not canonical: %', v_package_actual;
+  END IF;
+
+  IF EXISTS (
     SELECT 1 FROM public.work_packages package_row
     WHERE package_row.id = v_recover
       AND (
@@ -111,7 +139,16 @@ BEGIN
           '{"fixturePeer":{"case":"removal","retain":true},"mcpGrantPhases":{"filesystem":{"phase":"preexisting-remove","revision":"1"}}}'::jsonb
       )
   ) THEN
-    RAISE EXCEPTION 'root authority package marker, phase, or peer metadata convergence is not canonical';
+    SELECT jsonb_build_object(
+      'blockedReason', package_row.blocked_reason,
+      'marker', package_row.metadata->'mcpGrantBlock',
+      'peer', package_row.metadata->'fixturePeer',
+      'phases', package_row.metadata->'mcpGrantPhases',
+      'requirements', package_row.mcp_requirements,
+      'status', package_row.status
+    ) INTO STRICT v_package_actual
+    FROM public.work_packages package_row WHERE package_row.id = v_recover;
+    RAISE EXCEPTION 'root authority recovery package convergence is not canonical: %', v_package_actual;
   END IF;
 
   IF EXISTS (
@@ -119,7 +156,14 @@ BEGIN
     WHERE (task_row.id = v_task_running OR task_row.id = v_task_failed)
       AND (task_row.status <> 'approved' OR task_row.error_message IS NOT NULL)
   ) THEN
-    RAISE EXCEPTION 'root authority task convergence did not recover running and failed tasks';
+    SELECT jsonb_agg(jsonb_build_object(
+      'errorMessage', task_row.error_message,
+      'id', task_row.id,
+      'status', task_row.status
+    ) ORDER BY task_row.id) INTO STRICT v_task_actual
+    FROM public.tasks task_row
+    WHERE task_row.id = v_task_running OR task_row.id = v_task_failed;
+    RAISE EXCEPTION 'root authority task convergence did not recover running and failed tasks: %', v_task_actual;
   END IF;
 
   IF (SELECT count(*) FROM public.work_package_local_projection_heads head
