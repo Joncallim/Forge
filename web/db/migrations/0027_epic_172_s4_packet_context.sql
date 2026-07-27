@@ -689,7 +689,6 @@ BEGIN
   VALUES(p_operation_id,p_generation,p_actor_id,p_project_id,pg_catalog.pg_backend_pid(),pg_catalog.txid_current());
 END; $$;
 REVOKE ALL ON TABLE public.project_root_reconciliation_write_contexts FROM PUBLIC;
-ALTER TABLE public.project_root_reconciliation_write_contexts OWNER TO forge_s4_routines_owner;
 CREATE OR REPLACE FUNCTION forge.reject_project_root_reconciliation_write_context_mutation_v1()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 BEGIN
@@ -728,6 +727,7 @@ CREATE CONSTRAINT TRIGGER project_root_reconciliation_write_contexts_commit_v1
 AFTER INSERT OR UPDATE ON public.project_root_reconciliation_write_contexts
 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
 EXECUTE FUNCTION forge.assert_project_root_reconciliation_write_context_committed_v1();
+ALTER TABLE public.project_root_reconciliation_write_contexts OWNER TO forge_s4_routines_owner;
 REVOKE ALL ON FUNCTION forge.assert_project_root_reconciliation_write_context_committed_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.reject_project_root_reconciliation_write_context_mutation_v1() FROM PUBLIC;
 REVOKE ALL ON FUNCTION forge.enter_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid) FROM PUBLIC;
