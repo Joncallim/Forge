@@ -3,9 +3,8 @@ import { describe, expect, it, vi } from 'vitest'
 vi.mock('server-only', () => ({ default: {} }))
 
 import {
-  assertCasRecheckValid,
-  computeCasRecheckToken,
   computeFreshnessFingerprint,
+  isS5FreshnessFingerprint,
   normalizeS5RecoveryMarkers,
   normalizeS5TerminalAudit,
 } from '@/lib/mcps/s5-server-reader'
@@ -27,13 +26,15 @@ describe('S5 authoritative reader identities', () => {
     expect(after).not.toBe(before)
   })
 
-  it('binds the deterministic CAS identity to task and operator', () => {
+  it('exposes a plain digest rather than a browser-minted recheck token', () => {
     const fingerprint = computeFreshnessFingerprint({ status: 'blocked' })
-    const token = computeCasRecheckToken({ fingerprint, taskId: 'task-1', userId: 'user-1' })
-    expect(computeCasRecheckToken({ fingerprint, taskId: 'task-1', userId: 'user-1' })).toBe(token)
-    expect(assertCasRecheckValid({ fingerprint, taskId: 'task-1', token, userId: 'user-1' })).toBe(true)
-    expect(assertCasRecheckValid({ fingerprint, taskId: 'task-2', token, userId: 'user-1' })).toBe(false)
-    expect(assertCasRecheckValid({ fingerprint, taskId: 'task-1', token, userId: 'user-2' })).toBe(false)
+    // Deterministic: no random nonce, so a previously issued fingerprint can
+    // actually be revalidated by re-reading the same state.
+    expect(computeFreshnessFingerprint({ status: 'blocked' })).toBe(fingerprint)
+    expect(isS5FreshnessFingerprint(fingerprint)).toBe(true)
+    expect(isS5FreshnessFingerprint('recheck:deadbeef')).toBe(false)
+    expect(isS5FreshnessFingerprint(`sha256:${'z'.repeat(64)}`)).toBe(false)
+    expect(isS5FreshnessFingerprint(null)).toBe(false)
   })
 
   it.each([
@@ -67,7 +68,7 @@ describe('S5 authoritative reader identities', () => {
         state: 'assembled', rootRef: 'opaque-root', includedCount: 1,
         byteCount: 12, omittedCount: 0, redactionSummary: {},
       },
-      delivery: { state: 'submitted' },
+      delivery: { state: 'submitted', submittedAt: '2026-07-18T00:00:00.000Z' },
       terminal: { status: 'succeeded' },
       terminalAt: new Date('2026-07-18T00:00:00.000Z'),
     }
@@ -83,11 +84,31 @@ describe('S5 authoritative reader identities', () => {
       deliveryOutcome: 'submitted',
       terminalOutcome: 'succeeded',
     })
+    // A submitted delivery carries exactly one extra field, its timestamp.
+    // Anything else — an unexpected key, a missing or unparsable timestamp —
+    // is not the persisted shape and must not present as terminal.
     expect(normalizeS5TerminalAudit({ ...audit, delivery: { state: 'submitted', extra: true } }, evidence)).toMatchObject({
       state: 'unavailable',
       assemblyState: null,
       deliveryOutcome: null,
       terminalOutcome: null,
+    })
+    expect(normalizeS5TerminalAudit({ ...audit, delivery: { state: 'submitted' } }, evidence)).toMatchObject({
+      state: 'unavailable',
+      deliveryOutcome: null,
+    })
+    expect(normalizeS5TerminalAudit({ ...audit, delivery: { state: 'submitted', submittedAt: 'not-a-date' } }, evidence)).toMatchObject({
+      state: 'unavailable',
+      deliveryOutcome: null,
+    })
+    // A non-submitted outcome is exactly `{ state }`; a stray timestamp there
+    // is not the persisted shape either.
+    expect(normalizeS5TerminalAudit({
+      ...audit,
+      delivery: { state: 'not_exposed', submittedAt: '2026-07-18T00:00:00.000Z' },
+    }, evidence)).toMatchObject({
+      state: 'unavailable',
+      deliveryOutcome: null,
     })
     expect(normalizeS5TerminalAudit(audit, [{ ...evidence[0], state: 'uncertain' }])).toMatchObject({
       state: 'unavailable',

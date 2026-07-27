@@ -6,11 +6,16 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   try {
     const { taskId } = await params
     const { state } = await readAuthorizedS5State(request, taskId)
+    // The age is the real elapsed time between observing the rows and
+    // serialising them, measured on the server. It is deliberately not a
+    // second `Date.now()` difference taken against itself, and there is no
+    // browser-visible recheck token: currency is proven by echoing
+    // `fingerprint` back and having the server re-read the same rows.
     return NextResponse.json({
       computedAt: state.computedAt,
       fingerprint: state.freshnessFingerprint,
-      casRecheckToken: state.freshnessFingerprint,
-      freshnessAgeMs: 0,
+      freshnessAgeMs: Math.max(0, Date.now() - state.observedAtMs),
+      localEvidenceAvailable: state.localEvidenceAvailable,
       taskId,
     })
   } catch (error) {
