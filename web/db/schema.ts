@@ -1902,6 +1902,23 @@ export const s4ProtectedReviewSources = pgTable('s4_protected_review_sources', {
   createdAt: timestamp('created_at', tsOpts).defaultNow().notNull(),
 })
 
+export const projectRootReconciliationWriteContexts = pgTable('project_root_reconciliation_write_contexts', {
+  operationId: uuid('operation_id').notNull().references(() => projectRootReconciliationOperations.operationId, { onDelete: 'restrict' }),
+  generation: bigint('generation', { mode: 'bigint' }).notNull().references(() => projectRootChangeJournal.generation, { onDelete: 'restrict' }),
+  actorId: uuid('actor_id').notNull(),
+  projectId: uuid('project_id').notNull().references(() => projects.id, { onDelete: 'restrict' }),
+  backendPid: integer('backend_pid').notNull(),
+  transactionId: bigint('transaction_id', { mode: 'bigint' }).notNull(),
+  enteredAt: timestamp('entered_at', tsOpts).defaultNow().notNull(),
+  completedAt: timestamp('completed_at', tsOpts),
+}, (t) => [
+  primaryKey({ columns: [t.operationId, t.generation] }),
+  unique('project_root_reconciliation_write_context_generation_unique').on(t.generation),
+  check('project_root_reconciliation_write_context_backend_pid_chk', sql`${t.backendPid} > 0`),
+  check('project_root_reconciliation_write_context_transaction_id_chk', sql`${t.transactionId} > 0`),
+  check('project_root_reconciliation_write_context_shape_chk', sql`${t.completedAt} is null or ${t.completedAt} >= ${t.enteredAt}`),
+])
+
 export const s4ProtectedReviewSourceReads = pgTable(
   's4_protected_review_source_reads',
   {

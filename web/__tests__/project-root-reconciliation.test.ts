@@ -56,6 +56,8 @@ describe('project-root expansion reconciliation boundary', () => {
     )
     expect(reconciliationSchema).not.toMatch(/(?:local_path|root_ref|reason|jsonb)/i)
     expect(schema).toContain("export const projectRootReconciliationOperations")
+    expect(schema).toContain("export const projectRootReconciliationWriteContexts")
+    expect(schema).toContain("project_root_reconciliation_write_context_generation_unique")
     expect(schema).toContain("project_root_reconciliation_one_live_idx")
     expect(PROJECT_ROOT_RECONCILIATION_STATES).toEqual(['running', 'complete'])
   })
