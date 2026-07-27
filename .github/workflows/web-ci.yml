@@ -205,13 +205,38 @@ jobs:
           ALTER ROLE forge_architect_plan_resolver PASSWORD 'forge_plan_resolver_test';
           ALTER ROLE forge_architect_plan_history_reader PASSWORD 'forge_plan_history_reader_test';
           ALTER ROLE forge_packet_issuer PASSWORD 'forge_packet_issuer_test';
+          ALTER ROLE forge_project_root_reconciler PASSWORD 'forge_project_root_reconciler_test';
           SQL
-      - name: Reconcile fresh-install root references with zero-scan proof
-        run: npm run project-roots:reconcile-expansion
+      - name: Materialize legacy root references through the dedicated principal
+        env:
+          FORGE_PROJECT_ROOT_RECONCILER_DATABASE_URL: postgresql://forge_project_root_reconciler:forge_project_root_reconciler_test@localhost:5432/forge_epic_172_ci_test
+        run: |
+          while :; do
+            rows="$(psql "$FORGE_PROJECT_ROOT_RECONCILER_DATABASE_URL" --no-align --tuples-only --set ON_ERROR_STOP=1 --command "SELECT forge.materialize_project_root_ref_expansion_v1(100);")"
+            [[ "$rows" =~ ^[0-9]+$ ]] || { echo 'Root materialization returned an invalid row count.' >&2; exit 1; }
+            [[ "$rows" == '0' ]] && break
+          done
+      - name: Capture the post-drain root journal watermark
+        id: root_journal_watermark
+        env:
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+        run: |
+          watermark="$(psql "$FORGE_DATABASE_ADMIN_URL" --no-align --tuples-only --set ON_ERROR_STOP=1 --command "SELECT last_generation FROM public.project_root_change_journal_counter WHERE singleton;")"
+          if [[ ! "$watermark" =~ ^(0|[1-9][0-9]*)$ ]]; then
+            echo 'The post-drain root journal watermark is malformed.' >&2
+            exit 1
+          fi
+          echo "FORGE_ROOT_REF_CUTOVER_WATERMARK=$watermark" >> "$GITHUB_ENV"
+      - name: Reconcile fresh-install root references through the dedicated principal
+        run: npm run project-roots:reconcile-expansion -- --through "$FORGE_ROOT_REF_CUTOVER_WATERMARK" --actor 11111111-1111-4111-8111-111111111111 --apply
+        env:
+          FORGE_PROJECT_ROOT_RECONCILER_DATABASE_URL: postgresql://forge_project_root_reconciler:forge_project_root_reconciler_test@localhost:5432/forge_epic_172_ci_test
+      - name: Build the separately gated concurrent root-reference index
+        run: npm run project-roots:build-concurrent-index -- --apply
         env:
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
       - name: Apply the separately gated strict root-reference cutover
-        run: npm run project-roots:strict-cutover -- --apply
+        run: npm run project-roots:strict-cutover -- --through "$FORGE_ROOT_REF_CUTOVER_WATERMARK" --apply
         env:
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
       - name: Provision the ordinary app release-reader boundary
@@ -275,7 +300,10 @@ jobs:
               'local_effect_recovery_actions', 's4_max_attempt_finalizations',
               'local_projection_archive_operations',
               'local_projection_archive_operation_checkpoints',
-              'filesystem_mcp_decision_nonce_claims', 'project_root_ref_reconciliation'
+              'filesystem_mcp_decision_nonce_claims', 'project_root_ref_reconciliation',
+              'project_root_change_journal_counter', 'project_root_change_journal',
+              'project_root_reconciliation_operations', 'project_root_reconciliation_checkpoints',
+              'project_root_reconciliation_outcomes', 'project_root_reconciliation_write_contexts'
             ] LOOP
               FOREACH table_privilege IN ARRAY ARRAY[
                 'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'
@@ -340,7 +368,10 @@ jobs:
               'local_effect_recovery_actions', 's4_max_attempt_finalizations',
               'local_projection_archive_operations',
               'local_projection_archive_operation_checkpoints',
-              'filesystem_mcp_decision_nonce_claims', 'project_root_ref_reconciliation'
+              'filesystem_mcp_decision_nonce_claims', 'project_root_ref_reconciliation',
+              'project_root_change_journal_counter', 'project_root_change_journal',
+              'project_root_reconciliation_operations', 'project_root_reconciliation_checkpoints',
+              'project_root_reconciliation_outcomes', 'project_root_reconciliation_write_contexts'
             ];
             projection_tables constant text[] := ARRAY[
               'forge_epic_172_s3_release_state', 'work_package_local_projection_sources',
