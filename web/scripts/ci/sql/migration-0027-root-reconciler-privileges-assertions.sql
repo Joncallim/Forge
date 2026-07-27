@@ -1,16 +1,15 @@
 \set ON_ERROR_STOP on
-BEGIN;
 
 CREATE TEMP TABLE root_reconciler_expected_privileges (
   category text NOT NULL,
   entry text NOT NULL,
   PRIMARY KEY (category, entry)
-) ON COMMIT DROP;
+);
 CREATE TEMP TABLE root_reconciler_actual_privileges (
   category text NOT NULL,
   entry text NOT NULL,
   PRIMARY KEY (category, entry)
-) ON COMMIT DROP;
+);
 
 INSERT INTO root_reconciler_expected_privileges (category, entry) VALUES
   ('relation', 'public.projects:SELECT'),
@@ -181,4 +180,6 @@ BEGIN
   END IF;
 END;
 $proof$;
-COMMIT;
+
+DROP TABLE root_reconciler_actual_privileges;
+DROP TABLE root_reconciler_expected_privileges;

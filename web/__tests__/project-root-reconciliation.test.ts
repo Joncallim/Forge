@@ -22,6 +22,7 @@ const rootAuthorityAssertions = readFileSync(fileURLToPath(new URL('../scripts/c
 const negativeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-reconciliation-negative.sh', import.meta.url)), 'utf8')
 const replayProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-reconciliation-replay.sh', import.meta.url)), 'utf8')
 const privilegeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-reconciler-privileges-assertions.sql', import.meta.url)), 'utf8')
+const privilegeMutationProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-reconciler-privilege-mutations.sh', import.meta.url)), 'utf8')
 const staleContextProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-stale-context.sh', import.meta.url)), 'utf8')
 const negativeAssertions = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-reconciliation-negative-assertions.sql', import.meta.url)), 'utf8')
 const contentionProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-contention.sh', import.meta.url)), 'utf8')
@@ -246,6 +247,20 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(privilegeProof).toContain('root reconciler effective privilege allowlist mismatch')
     expect(privilegeProof).toContain('project_root_reconciliation_write_contexts')
     expect(upgradeProof).toContain('migration-0027-root-reconciler-privileges-assertions.sql')
+  })
+
+  it('proves the exact closed privilege allowlist rejects direct, column, and PUBLIC-effective mutations', () => {
+    expect(privilegeMutationProof).toContain('GRANT INSERT ON TABLE public.projects TO forge_project_root_reconciler;')
+    expect(privilegeMutationProof).toContain('GRANT UPDATE (title) ON TABLE public.tasks TO forge_project_root_reconciler;')
+    expect(privilegeMutationProof).toContain('GRANT EXECUTE ON FUNCTION forge.read_epic_172_enablement_state_v1() TO PUBLIC;')
+    expect(privilegeMutationProof).toContain('root reconciler effective privilege allowlist mismatch')
+    expect(privilegeMutationProof).toContain('public.projects:INSERT')
+    expect(privilegeMutationProof).toContain('public.tasks.title')
+    expect(privilegeMutationProof).toContain('forge.read_epic_172_enablement_state_v1()')
+    expect(privilegeMutationProof).toContain('\\i ${assertion_file}')
+    expect(privilegeMutationProof).not.toContain('has_table_privilege')
+    expect(privilegeMutationProof).toContain('fresh clean allowlist assertion')
+    expect(upgradeProof).toContain('prove-migration-0027-root-reconciler-privilege-mutations.sh')
   })
 
   it('rejects stale and fabricated root reconciliation context reuse before the CLI resumes', () => {
