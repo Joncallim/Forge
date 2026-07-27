@@ -1,5 +1,6 @@
 import 'server-only'
 import { NextResponse, type NextRequest } from 'next/server'
+import { safeLocalEvidencePresenter } from '@/lib/mcps/s5-server-reader'
 import { readAuthorizedS5State, S5RouteAuthorizationError } from '@/lib/mcps/s5-route'
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ taskId: string }> }) {
@@ -10,7 +11,8 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       computedAt: state.computedAt,
       freshnessFingerprint: state.freshnessFingerprint,
       taskId,
-      evidenceRecords: state.evidenceRecords,
+      localEvidenceAvailable: state.localEvidenceAvailable,
+      evidenceRecords: state.evidenceRecords.map(safeLocalEvidencePresenter),
     })
   } catch (error) {
     if (error instanceof S5RouteAuthorizationError) return NextResponse.json({ error: error.message }, { status: error.status })

@@ -76,12 +76,9 @@ describe('task page retry handoff controls', () => {
     expect(canStopTaskStatus('approved')).toBe(true)
     expect(canStopTaskStatus('failed')).toBe(false)
     expect(canStopTaskStatus('cancelled')).toBe(false)
-    expect(canDeleteTaskStatus('running')).toBe(false)
-    expect(canDeleteTaskStatus('approved')).toBe(false)
-    // Terminal tasks (including failed/cancelled) are deletable in S5
-    expect(canDeleteTaskStatus('failed')).toBe(true)
-    expect(canDeleteTaskStatus('cancelled')).toBe(true)
-    expect(canDeleteTaskStatus('completed')).toBe(true)
+    // Deletion is never offered, for any status: the retention contract answers
+    // 409 for terminal tasks too, so a Delete control could only ever fail.
+    expect(canDeleteTaskStatus()).toBe(false)
   })
 
   it('finds required filesystem grants that still need explicit approval', () => {
