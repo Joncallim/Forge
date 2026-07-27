@@ -20,6 +20,7 @@ INSERT INTO root_reconciler_expected_privileges (category, entry) VALUES
   ('relation', 'public.project_filesystem_grant_decisions:SELECT'),
   ('relation', 'public.project_filesystem_current_decision_pointers:SELECT'),
   ('relation', 'public.work_package_local_projection_heads:SELECT'),
+  ('relation', 'public.forge_epic_172_s3_release_state:SELECT'),
   ('column_update', 'public.tasks.status'),
   ('column_update', 'public.tasks.error_message'),
   ('column_update', 'public.tasks.updated_at'),
@@ -34,6 +35,12 @@ INSERT INTO root_reconciler_expected_privileges (category, entry) VALUES
   ('routine', 'forge.enter_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid)'),
   ('routine', 'forge.lock_project_root_reconciliation_authority_v1(uuid,uuid,bigint,uuid)'),
   ('routine', 'forge.materialize_project_root_ref_expansion_v1(integer)'),
+  -- These four functions are pure, immutable input validators. PUBLIC
+  -- execution is intentional and does not read or mutate reconciliation state.
+  ('routine', 'public.forge_is_canonical_bounded_string_set(jsonb,integer,integer)'),
+  ('routine', 'public.forge_is_canonical_filesystem_capability_set(jsonb)'),
+  ('routine', 'public.forge_is_canonical_filesystem_grant_block_v2(jsonb)'),
+  ('routine', 'public.forge_is_canonical_utc_timestamp(text)'),
   ('schema', 'public:USAGE'),
   ('schema', 'forge:USAGE'),
   ('database', 'CONNECT'),
@@ -70,7 +77,7 @@ WHERE namespace_row.nspname IN ('public', 'forge')
   AND pg_catalog.has_column_privilege('forge_project_root_reconciler', relation.oid, attribute_row.attnum, 'UPDATE');
 
 INSERT INTO root_reconciler_actual_privileges (category, entry)
-SELECT 'routine', namespace_row.nspname || '.' || routine.proname || '(' || replace(pg_catalog.pg_get_function_identity_arguments(routine.oid), ', ', ',') || ')'
+SELECT 'routine', namespace_row.nspname || '.' || routine.proname || '(' || replace(pg_catalog.oidvectortypes(routine.proargtypes), ', ', ',') || ')'
 FROM pg_catalog.pg_proc routine
 JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = routine.pronamespace
 WHERE namespace_row.nspname IN ('public', 'forge')
