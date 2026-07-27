@@ -130,6 +130,7 @@ export const sessions = pgTable(
           and ${t.cachePurgeCompletedAt} is null)
         or
         (${t.cachePurgePendingAt} is not null
+          and ${t.cachePurgeCredentialDigestV1} is not null
           and octet_length(${t.cachePurgeCredentialDigestV1}) = 32
           and ${t.cachePurgeGeneration} is not null
           and ${t.cachePurgeCompletedAt} is null)

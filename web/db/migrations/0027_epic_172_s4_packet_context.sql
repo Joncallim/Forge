@@ -292,6 +292,7 @@ ALTER TABLE public.sessions
         AND cache_purge_completed_at IS NULL)
       OR
       (cache_purge_pending_at IS NOT NULL
+        AND cache_purge_credential_digest_v1 IS NOT NULL
         AND pg_catalog.octet_length(cache_purge_credential_digest_v1) = 32
         AND cache_purge_generation IS NOT NULL
         AND cache_purge_completed_at IS NULL)
