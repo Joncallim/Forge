@@ -23,6 +23,7 @@ const negativeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-mi
 const replayProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-reconciliation-replay.sh', import.meta.url)), 'utf8')
 const privilegeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-reconciler-privileges-assertions.sql', import.meta.url)), 'utf8')
 const privilegeMutationProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-reconciler-privilege-mutations.sh', import.meta.url)), 'utf8')
+const ordinaryAppTriggerProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-ordinary-app-trigger-writes.sh', import.meta.url)), 'utf8')
 const staleContextProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-stale-context.sh', import.meta.url)), 'utf8')
 const negativeAssertions = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-reconciliation-negative-assertions.sql', import.meta.url)), 'utf8')
 const contentionProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-contention.sh', import.meta.url)), 'utf8')
@@ -72,6 +73,38 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(schema).toContain("project_root_reconciliation_write_context_generation_unique")
     expect(schema).toContain("project_root_reconciliation_one_live_idx")
     expect(PROJECT_ROOT_RECONCILIATION_STATES).toEqual(['running', 'complete'])
+  })
+
+  it('keeps protected write-context physical metadata aligned with Drizzle', () => {
+    const writeContextDdl = migration.slice(
+      migration.indexOf('CREATE TABLE public.project_root_reconciliation_write_contexts'),
+      migration.indexOf('CREATE OR REPLACE FUNCTION forge.enter_project_root_reconciliation_generation_v1'),
+    )
+    const writeContextSchema = schema.slice(
+      schema.indexOf("export const projectRootReconciliationWriteContexts"),
+      schema.indexOf('export const s4ProtectedReviewSourceReads'),
+    )
+    expect(writeContextDdl).toContain('DEFAULT pg_catalog.clock_timestamp()')
+    expect(writeContextSchema).toContain('default(sql`pg_catalog.clock_timestamp()`)')
+    for (const constraint of [
+      'project_root_reconciliation_write_contexts_pkey',
+      'project_root_reconciliation_write_context_generation_unique',
+      'project_root_reconciliation_write_context_backend_pid_chk',
+      'project_root_reconciliation_write_context_transaction_id_chk',
+      'project_root_reconciliation_write_context_shape_chk',
+      'project_root_reconciliation_write_contexts_operation_id_fkey',
+      'project_root_reconciliation_write_contexts_generation_fkey',
+      'project_root_reconciliation_write_contexts_project_id_fkey',
+    ]) {
+      expect(writeContextDdl).toContain(constraint)
+      expect(writeContextSchema).toContain(constraint)
+    }
+    expect(writeContextDdl).toContain('FOREIGN KEY (operation_id) REFERENCES public.project_root_reconciliation_operations(operation_id) ON DELETE RESTRICT')
+    expect(writeContextDdl).toContain('FOREIGN KEY (generation) REFERENCES public.project_root_change_journal(generation) ON DELETE RESTRICT')
+    expect(writeContextDdl).toContain('FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE RESTRICT')
+    expect(writeContextSchema).toContain("foreignColumns: [projectRootReconciliationOperations.operationId]")
+    expect(writeContextSchema).toContain('foreignColumns: [projectRootChangeJournal.generation]')
+    expect(writeContextSchema).toContain('foreignColumns: [projects.id]')
   })
 
   it('fences operation creation and completion against gaps, later commits, and hijack', () => {
@@ -215,10 +248,39 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(negativeProof).toContain('SELECT 1/0')
     expect(negativeProof).toContain('project-root operation identity cannot be hijacked')
     expect(negativeProof).toContain('project-root authority lock has no active write context')
+    expect(negativeProof).toContain("'correct-next-generation wrong-project binding'")
+    expect(negativeProof).toContain("'wrong-generation correct-journal-project binding'")
+    expect(negativeProof).toContain("'valid-entry wrong-actor ownership'")
+    expect(negativeProof).toContain("'composite completion wrong-actor context identity'")
+    expect(negativeProof).toContain("actor_b='44444444-4444-4444-8444-444444444444'")
+    expect(negativeProof).toContain('project-root write context is absent or stale')
+    expect(negativeProof).toContain('leave a context row behind')
+    expect(negativeProof).toContain("WHERE project_id <> '${project}'::uuid")
+    expect(negativeProof).toContain('WHERE generation > ${generation} AND generation <= ${through}')
+    expect(negativeProof).toContain('snapshot_reconciliation_state')
+    expect(negativeProof).toContain("'runtime_audits'")
+    expect(negativeProof).toContain("'projection_heads'")
+    expect(negativeProof).toContain("'packages'")
     expect(negativeProof).toContain('migration-0027-root-reconciliation-negative-assertions.sql')
     expect(negativeProof).not.toContain('reconcile-migration-0027-root-refs.sh')
     expect(upgradeProof.indexOf('prove-migration-0027-root-reconciliation-negative.sh')).toBeLessThan(
       upgradeProof.indexOf('reconcile-migration-0027-root-refs.sh'),
+    )
+  })
+
+  it('keeps completion context identity actor-bound before the non-disclosing operation CAS', () => {
+    const completionRoutine = migration.slice(
+      migration.indexOf('CREATE OR REPLACE FUNCTION forge.complete_project_root_reconciliation_generation_v1'),
+      migration.indexOf(
+        'CREATE OR REPLACE FUNCTION',
+        migration.indexOf('CREATE OR REPLACE FUNCTION forge.complete_project_root_reconciliation_generation_v1') + 1,
+      ),
+    )
+    // Actor is intentionally part of the active-context lookup. Moving it to a
+    // later actor-specific check would disclose another actor's live context.
+    expect(completionRoutine).toContain('context.operation_id=p_operation_id AND context.generation=p_generation AND context.actor_id=p_actor_id AND context.project_id=p_project_id AND context.backend_pid=pg_catalog.pg_backend_pid() AND context.transaction_id=pg_catalog.txid_current() AND context.completed_at IS NULL')
+    expect(completionRoutine.indexOf('context.actor_id=p_actor_id')).toBeLessThan(
+      completionRoutine.indexOf('v_operation.actor_id <> p_actor_id'),
     )
   })
 
@@ -241,12 +303,58 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(privilegeProof).toContain("SELECT 'MAINTAIN'")
     expect(privilegeProof).toContain("current_setting('server_version_num')::integer >= 170000")
     expect(privilegeProof).toContain('has_column_privilege')
+    expect(privilegeProof).toContain("VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('REFERENCES')")
+    expect(privilegeProof).toContain("'column_' || lower(privilege.privilege)")
+    expect(privilegeProof).toContain("NOT pg_catalog.has_table_privilege('forge_project_root_reconciler', relation.oid, privilege.privilege)")
+    expect(privilegeProof).toContain("('column_select')")
+    expect(privilegeProof).toContain("('column_insert')")
+    expect(privilegeProof).toContain("('column_update')")
+    expect(privilegeProof).toContain("('column_references')")
+    expect(privilegeProof).toContain("('grant_option_relation')")
+    expect(privilegeProof).toContain("('grant_option_column')")
+    expect(privilegeProof).toContain("('grant_option_routine')")
+    expect(privilegeProof).toContain("('grant_option_schema')")
+    expect(privilegeProof).toContain("('grant_option_database')")
+    expect(privilegeProof).toContain("('grant_option_sequence')")
+    expect(privilegeProof).toContain('pg_catalog.aclexplode')
+    expect(privilegeProof).toContain("pg_catalog.acldefault('r', relation.relowner)")
+    expect(privilegeProof).toContain("pg_catalog.acldefault('c', relation.relowner)")
+    expect(privilegeProof).toContain("pg_catalog.acldefault('f', routine.proowner)")
+    expect(privilegeProof).toContain("pg_catalog.acldefault('n', namespace_row.nspowner)")
+    expect(privilegeProof).toContain("pg_catalog.acldefault('d', database_row.datdba)")
+    expect(privilegeProof).toContain("pg_catalog.acldefault('s', sequence_row.relowner)")
+    expect(privilegeProof).toContain('acl_row.is_grantable')
+    expect(privilegeProof).toContain("CASE WHEN acl_row.grantee = 0 THEN 'PUBLIC'")
+    expect(privilegeProof).toContain('direct/PUBLIC ACL rows are the complete effective grant-option surface')
     expect(privilegeProof).toContain('has_function_privilege')
     expect(privilegeProof).toContain('has_sequence_privilege')
     expect(privilegeProof).toContain('has_schema_privilege')
     expect(privilegeProof).toContain('has_database_privilege')
     expect(privilegeProof).toContain('pg_auth_members')
-    expect(privilegeProof).toContain('pg_get_function_identity_arguments')
+    expect(privilegeProof).toContain('oidvectortypes(routine.proargtypes)')
+    expect(privilegeProof).toContain('public.forge_epic_172_s3_release_state:SELECT')
+    expect(privilegeProof).toContain('public.forge_is_canonical_bounded_string_set(jsonb,integer,integer)')
+    expect(privilegeProof).toContain('public.forge_is_canonical_filesystem_capability_set(jsonb)')
+    expect(privilegeProof).toContain('public.forge_is_canonical_filesystem_grant_block_v2(jsonb)')
+    expect(privilegeProof).toContain('public.forge_is_canonical_utc_timestamp(text)')
+    expect(privilegeProof).toContain('pure, immutable input validators')
+    expect(bootstrap).toContain('public.forge_preallocate_filesystem_decision_pointer()')
+    expect(bootstrap).toContain('public.forge_preallocate_project_filesystem_decision_pointer()')
+    expect(bootstrap).toContain('public.forge_reject_filesystem_grant_history_mutation()')
+    expect(bootstrap).toContain('public.forge_reject_project_filesystem_decision_mutation()')
+    expect(bootstrap).toContain('These six routines are trigger-only')
+    expect(bootstrap).toContain('publicTriggerExecuteCount')
+    expect(bootstrap).toContain('Trigger-only S3 helpers retain an unsafe PUBLIC EXECUTE grant.')
+    expect(ordinaryAppTriggerProof).toContain('postgresql://forge_app_test:forge_app_test@')
+    expect(ordinaryAppTriggerProof).toContain("--set project_id=\"${project_id}\"")
+    expect(ordinaryAppTriggerProof).toContain("--set package_id=\"${package_id}\" <<'SQL'")
+    expect(ordinaryAppTriggerProof).toContain("WHERE project_id = :'project_id'::uuid")
+    expect(ordinaryAppTriggerProof).toContain("WHERE work_package_id = :'package_id'::uuid")
+    expect(ordinaryAppTriggerProof).not.toContain('--set package_id="${package_id}" --command')
+    expect(ordinaryAppTriggerProof).toContain('public.project_filesystem_current_decision_pointers')
+    expect(ordinaryAppTriggerProof).toContain('public.filesystem_mcp_current_decision_pointers')
+    expect(ordinaryAppTriggerProof).toContain('work_package_local_projection_heads')
+    expect(upgradeProof).toContain('prove-migration-0027-ordinary-app-trigger-writes.sh')
     expect(privilegeProof).toContain('root reconciler effective privilege allowlist mismatch')
     expect(privilegeProof).toContain('project_root_reconciliation_write_contexts')
     expect(upgradeProof).toContain('migration-0027-root-reconciler-privileges-assertions.sql')
@@ -255,15 +363,39 @@ describe('project-root expansion reconciliation boundary', () => {
   it('proves the exact closed privilege allowlist rejects direct, column, and PUBLIC-effective mutations', () => {
     expect(privilegeMutationProof).toContain('GRANT INSERT ON TABLE public.projects TO forge_project_root_reconciler;')
     expect(privilegeMutationProof).toContain('GRANT UPDATE (title) ON TABLE public.tasks TO forge_project_root_reconciler;')
+    expect(privilegeMutationProof).toContain('GRANT SELECT (actor_id) ON TABLE public.project_root_reconciliation_write_contexts TO forge_project_root_reconciler;')
+    expect(privilegeMutationProof).toContain('GRANT SELECT ON TABLE public.projects TO forge_project_root_reconciler WITH GRANT OPTION;')
+    expect(privilegeMutationProof).toContain('pg_catalog.pg_get_userbyid(relation.relowner) AS mutation_owner_role')
+    expect(privilegeMutationProof).toContain("pg_catalog.pg_has_role(session_user, pg_catalog.pg_get_userbyid(relation.relowner), 'SET')")
+    expect(privilegeMutationProof).toContain('SET LOCAL ROLE :"mutation_owner_role";')
+    expect(privilegeMutationProof).toContain('RESET ROLE;')
+    expect(privilegeMutationProof).toContain('ROOT_GRANT_OPTION_MUTATION_IDENTITY owner=:mutation_owner_role session=:mutation_session_user current=:mutation_current_user can_set=:mutation_can_set_owner')
+    expect(privilegeMutationProof).toContain('PostgreSQL records the ACL grantor as the owner role that issued GRANT')
+    expect(privilegeMutationProof).not.toContain("grantor=\"$(psql")
     expect(privilegeMutationProof).toContain('GRANT EXECUTE ON FUNCTION forge.read_epic_172_enablement_state_v1() TO PUBLIC;')
     expect(privilegeMutationProof).toContain('root reconciler effective privilege allowlist mismatch')
     expect(privilegeMutationProof).toContain('public.projects:INSERT')
     expect(privilegeMutationProof).toContain('public.tasks.title')
+    expect(privilegeMutationProof).toContain('public.project_root_reconciliation_write_contexts.actor_id')
+    expect(privilegeMutationProof).toContain('public.projects:SELECT:grantor=${mutation_owner_role}:grantee=forge_project_root_reconciler')
     expect(privilegeMutationProof).toContain('forge.read_epic_172_enablement_state_v1()')
     expect(privilegeMutationProof).toContain('\\i ${assertion_file}')
     expect(privilegeMutationProof).not.toContain('has_table_privilege')
     expect(privilegeMutationProof).toContain('fresh clean allowlist assertion')
+    expect(privilegeMutationProof).toContain('snapshot_application_acls')
+    expect(privilegeMutationProof).toContain("echo 'ROOT_RECONCILER_PRIVILEGE_MUTATIONS_START'")
+    expect(privilegeMutationProof).toContain('ROOT_GRANT_OPTION_MUTATION_IDENTITY owner=')
+    expect(privilegeMutationProof).toContain('ROOT_RECONCILER_PRIVILEGE_MUTATION_REJECTION phase=${phase} entry=${expected_entry}')
+    expect(privilegeMutationProof).toContain("echo 'ROOT_RECONCILER_PRIVILEGE_MUTATIONS_SUCCESS'")
     expect(upgradeProof).toContain('prove-migration-0027-root-reconciler-privilege-mutations.sh')
+    const mutationStart = upgradeProof.indexOf("echo 'ROOT_RECONCILER_PRIVILEGE_MUTATIONS_PHASE_START'")
+    const mutationInvocation = upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-reconciler-privilege-mutations.sh')
+    const mutationSuccess = upgradeProof.indexOf("echo 'ROOT_RECONCILER_PRIVILEGE_MUTATIONS_PHASE_SUCCESS'")
+    const negativeProofStart = upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-reconciliation-negative.sh')
+    expect(mutationStart).toBeGreaterThanOrEqual(0)
+    expect(mutationStart).toBeLessThan(mutationInvocation)
+    expect(mutationInvocation).toBeLessThan(mutationSuccess)
+    expect(mutationSuccess).toBeLessThan(negativeProofStart)
   })
 
   it('rejects stale and fabricated root reconciliation context reuse before the CLI resumes', () => {
