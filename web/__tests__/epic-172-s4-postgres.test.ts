@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import postgres from 'postgres'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
@@ -52,6 +52,10 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     legacyArchitectRun: randomUUID(),
     clarificationQuestion: randomUUID(),
     clarificationAnswer: randomUUID(),
+    secondArchitectRun: randomUUID(),
+    thirdArchitectRun: randomUUID(),
+    secondClarificationQuestion: randomUUID(),
+    secondClarificationAnswer: randomUUID(),
   }
   const key = randomBytes(32)
   const sessionCredential = randomUUID()
@@ -102,6 +106,8 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
           (${ids.replanRun}::uuid, ${ids.task}::uuid, null, 'architect', 'test', 'running'),
           (${ids.firstRun}::uuid, ${ids.task}::uuid, ${ids.package}::uuid, 'backend', 'test', 'running'),
           (${ids.secondRun}::uuid, ${ids.task}::uuid, ${ids.package}::uuid, 'backend', 'test', 'running')
+          ,(${ids.secondArchitectRun}::uuid, ${ids.task}::uuid, null, 'architect', 'test', 'completed')
+          ,(${ids.thirdArchitectRun}::uuid, ${ids.task}::uuid, null, 'architect', 'test', 'completed')
       `
       await tx`
         insert into filesystem_mcp_grant_approvals (
@@ -415,6 +421,137 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     expect(historyAudit.reads).toBe(1)
     expect(historyAudit.returnedEntryCount).toBe(firstHistory.length)
     expect(historyAudit.entrySetDigest).toMatch(/^sha256:[0-9a-f]{64}$/)
+
+    const second = await recordArchitectPlanVersion({
+      agentRunId: ids.secondArchitectRun, digestKey: key, digestKeyId: 's4-test-key',
+      planVersion: '2', taskId: ids.task,
+      entries: [{ agent: null, bindingFingerprint: null, content: 'Second protected plan.',
+        entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null }, {
+        agent: null, bindingFingerprint: null, entryId: `clarification_question:${ids.secondClarificationQuestion}`,
+        entryKind: 'clarification_question', projectionEligible: false, requirementKey: null,
+        content: JSON.stringify({ schemaVersion: 1, questionId: ids.secondClarificationQuestion,
+          question: 'Which environment?', suggestions: ['staging'] }) }],
+    })
+    await admin`
+      insert into task_questions (id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status)
+      values (${ids.secondClarificationQuestion}::uuid, ${ids.task}::uuid,
+        ${`clarification_question:${ids.secondClarificationQuestion}`}, ${second.artifactId}::uuid, 2, 'open')
+    `
+    await appendArchitectClarificationAnswer({ answer: 'staging', answerId: ids.secondClarificationAnswer,
+      digestKey: key, digestKeyId: 's4-test-key', questionId: ids.secondClarificationQuestion,
+      sessionCredential, sourcePlanArtifactId: second.artifactId, sourcePlanVersion: '2', taskId: ids.task })
+    await recordArchitectPlanVersion({
+      agentRunId: ids.thirdArchitectRun, digestKey: key, digestKeyId: 's4-test-key',
+      planVersion: '3', taskId: ids.task,
+      entries: [{ agent: null, bindingFingerprint: null, content: 'Third protected plan.',
+        entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null }],
+    })
+    const latestHistory = await readArchitectPlanHistory({ planVersion: '3', sessionCredential, taskId: ids.task })
+    expect(latestHistory.map((entry) => entry.entryId)).toEqual([
+      `clarification_answer:${ids.clarificationAnswer}`,
+      `clarification_answer:${ids.secondClarificationAnswer}`,
+      `clarification_question:${ids.clarificationQuestion}`,
+      `clarification_question:${ids.secondClarificationQuestion}`,
+      'plan_body:000000',
+    ])
+    const [latestAudit] = await admin<{ returnedEntryCount: number; entrySetDigest: string }[]>`
+      select returned_entry_count::integer as "returnedEntryCount", entry_set_digest as "entrySetDigest"
+      from architect_plan_history_reads where task_id = ${ids.task}::uuid and plan_version = 3
+      order by read_at desc limit 1
+    `
+    const canonicalSet = latestHistory.map(({ entryId, contentDigest }) => ({ entryId, contentDigest }))
+    expect(latestAudit.returnedEntryCount).toBe(5)
+    expect(latestAudit.entrySetDigest).toBe(`sha256:${createHash('sha256').update(JSON.stringify(canonicalSet)).digest('hex')}`)
+    const lockRun = randomUUID()
+    const lockQuestion = randomUUID()
+    await admin`insert into agent_runs (id, task_id, agent_type, model_id_used, status) values (${lockRun}::uuid, ${ids.task}::uuid, 'architect', 'test', 'completed')`
+    const lockPlan = await recordArchitectPlanVersion({ agentRunId: lockRun, digestKey: key, digestKeyId: 's4-test-key', planVersion: '4', taskId: ids.task,
+      entries: [{ agent: null, bindingFingerprint: null, content: 'Lock source.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null }, {
+        agent: null, bindingFingerprint: null, entryId: `clarification_question:${lockQuestion}`, entryKind: 'clarification_question', projectionEligible: false, requirementKey: null,
+        content: JSON.stringify({ schemaVersion: 1, questionId: lockQuestion, question: 'Lock?', suggestions: ['yes'] }) }] })
+    await admin`insert into task_questions (id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status)
+      values (${lockQuestion}::uuid, ${ids.task}::uuid, ${`clarification_question:${lockQuestion}`}, ${lockPlan.artifactId}::uuid, 4, 'open')`
+    const appName = `pr198-history-append-${randomUUID()}`
+    const lockAnswer = randomUUID()
+    const appendUrl = new URL(historyReaderUrl!)
+    appendUrl.searchParams.set('application_name', appName)
+    const savedHistoryUrl = process.env.FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL
+    const directReader = postgres(historyReaderUrl!, { max: 1, onnotice: () => {} })
+    let appendPromise: Promise<{ answerId: string; allAnswered: boolean }> | null = null
+    let appendSettled = false
+    let lockedRows: Array<{ entry_id: string; content_digest: string }> = []
+    try {
+      process.env.FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL = appendUrl.toString()
+      await directReader.begin(async (tx) => {
+        const credentialBytes = Buffer.from(sessionCredential, 'ascii')
+        try {
+          lockedRows = await tx<{ entry_id: string; content_digest: string }[]>`
+            select entry_id, content_digest from forge.read_architect_plan_history_v1(
+              ${credentialBytes}::bytea, ${ids.task}::uuid, 4::bigint
+            )
+          `
+        } finally { credentialBytes.fill(0) }
+        appendPromise = appendArchitectClarificationAnswer({ answer: 'yes', answerId: lockAnswer, digestKey: key, digestKeyId: 's4-test-key', questionId: lockQuestion,
+          sessionCredential, sourcePlanArtifactId: lockPlan.artifactId, sourcePlanVersion: '4', taskId: ids.task })
+          .finally(() => { appendSettled = true })
+        let waiting: { pid: number; state: string; waitEvent: string | null } | undefined
+        for (let attempt = 0; attempt < 40 && !waiting; attempt += 1) {
+          const [row] = await admin<{ pid: number; state: string; waitEvent: string | null; waitEventType: string | null }[]>`
+            select pid, state, wait_event as "waitEvent", wait_event_type as "waitEventType"
+            from pg_stat_activity where application_name = ${appName}
+          `
+          if (row?.waitEventType === 'Lock') waiting = row
+          else await new Promise((resolve) => setTimeout(resolve, 50))
+        }
+        expect(waiting).toEqual(expect.objectContaining({ state: expect.any(String), waitEvent: expect.anything() }))
+        expect(appendSettled).toBe(false)
+      })
+      await expect(Promise.race([
+        appendPromise!,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('append did not finish after reader commit')), 5_000)),
+      ])).resolves.toMatchObject({ allAnswered: true })
+    } finally {
+      if (savedHistoryUrl === undefined) delete process.env.FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL
+      else process.env.FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL = savedHistoryUrl
+      await directReader.end({ timeout: 5 })
+    }
+    expect(lockedRows.some((row) => row.entry_id === `clarification_answer:${lockAnswer}`)).toBe(false)
+    const [lockedAudit] = await admin<{ returnedEntryCount: number; entrySetDigest: string }[]>`
+      select returned_entry_count::integer as "returnedEntryCount", entry_set_digest as "entrySetDigest"
+      from architect_plan_history_reads where task_id = ${ids.task}::uuid and plan_version = 4
+      order by read_at desc limit 1
+    `
+    const lockedSet = lockedRows.map((row) => ({ entryId: row.entry_id, contentDigest: row.content_digest }))
+    expect(lockedAudit.returnedEntryCount).toBe(lockedRows.length)
+    expect(lockedAudit.entrySetDigest).toBe(`sha256:${createHash('sha256').update(JSON.stringify(lockedSet)).digest('hex')}`)
+    // The reader must reject a complete 257-row union rather than truncating it.
+    const overrunRun = randomUUID()
+    const overrunReadRun = randomUUID()
+    await admin`insert into agent_runs (id, task_id, agent_type, model_id_used, status) values
+      (${overrunRun}::uuid, ${ids.task}::uuid, 'architect', 'test', 'completed'),
+      (${overrunReadRun}::uuid, ${ids.task}::uuid, 'architect', 'test', 'completed')`
+    const overrunQuestions = Array.from({ length: 128 }, () => randomUUID())
+    const overrunPlan = await recordArchitectPlanVersion({
+      agentRunId: overrunRun, digestKey: key, digestKeyId: 's4-test-key', planVersion: '5', taskId: ids.task,
+      entries: [{ agent: null, bindingFingerprint: null, content: 'Overrun source.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null },
+        ...overrunQuestions.map((questionId) => ({ agent: null, bindingFingerprint: null,
+          content: JSON.stringify({ schemaVersion: 1, questionId, question: 'Bounded?', suggestions: ['yes'] }),
+          entryId: `clarification_question:${questionId}`, entryKind: 'clarification_question' as const,
+          projectionEligible: false, requirementKey: null }))],
+    })
+    for (const questionId of overrunQuestions) {
+      await admin`insert into task_questions (id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status)
+        values (${questionId}::uuid, ${ids.task}::uuid, ${`clarification_question:${questionId}`}, ${overrunPlan.artifactId}::uuid, 5, 'open')`
+      await appendArchitectClarificationAnswer({ answer: 'yes', answerId: randomUUID(), digestKey: key,
+        digestKeyId: 's4-test-key', questionId, sessionCredential, sourcePlanArtifactId: overrunPlan.artifactId,
+        sourcePlanVersion: '5', taskId: ids.task })
+    }
+    await recordArchitectPlanVersion({ agentRunId: overrunReadRun, digestKey: key, digestKeyId: 's4-test-key', planVersion: '6', taskId: ids.task,
+      entries: [{ agent: null, bindingFingerprint: null, content: 'Overrun read.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null }] })
+    const [auditBeforeOverrun] = await admin<{ count: number }[]>`select count(*)::integer as count from architect_plan_history_reads where task_id = ${ids.task}::uuid`
+    await expect(readArchitectPlanHistory({ planVersion: '6', sessionCredential, taskId: ids.task })).rejects.toMatchObject({ code: 'invalid_evidence' })
+    const [auditAfterOverrun] = await admin<{ count: number }[]>`select count(*)::integer as count from architect_plan_history_reads where task_id = ${ids.task}::uuid`
+    expect(auditAfterOverrun.count).toBe(auditBeforeOverrun.count)
     const packageEntry = recorded.entries.find((entry) => entry.entryKind === 'subtask')!
     const reference = executableReferenceForEntry(packageEntry)
     const [bound] = await issuer<{ referenceId: string }[]>`
