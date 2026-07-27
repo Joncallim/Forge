@@ -75,6 +75,38 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(PROJECT_ROOT_RECONCILIATION_STATES).toEqual(['running', 'complete'])
   })
 
+  it('keeps protected write-context physical metadata aligned with Drizzle', () => {
+    const writeContextDdl = migration.slice(
+      migration.indexOf('CREATE TABLE public.project_root_reconciliation_write_contexts'),
+      migration.indexOf('CREATE OR REPLACE FUNCTION forge.enter_project_root_reconciliation_generation_v1'),
+    )
+    const writeContextSchema = schema.slice(
+      schema.indexOf("export const projectRootReconciliationWriteContexts"),
+      schema.indexOf('export const s4ProtectedReviewSourceReads'),
+    )
+    expect(writeContextDdl).toContain('DEFAULT pg_catalog.clock_timestamp()')
+    expect(writeContextSchema).toContain('default(sql`pg_catalog.clock_timestamp()`)')
+    for (const constraint of [
+      'project_root_reconciliation_write_contexts_pkey',
+      'project_root_reconciliation_write_context_generation_unique',
+      'project_root_reconciliation_write_context_backend_pid_chk',
+      'project_root_reconciliation_write_context_transaction_id_chk',
+      'project_root_reconciliation_write_context_shape_chk',
+      'project_root_reconciliation_write_contexts_operation_id_fkey',
+      'project_root_reconciliation_write_contexts_generation_fkey',
+      'project_root_reconciliation_write_contexts_project_id_fkey',
+    ]) {
+      expect(writeContextDdl).toContain(constraint)
+      expect(writeContextSchema).toContain(constraint)
+    }
+    expect(writeContextDdl).toContain('FOREIGN KEY (operation_id) REFERENCES public.project_root_reconciliation_operations(operation_id) ON DELETE RESTRICT')
+    expect(writeContextDdl).toContain('FOREIGN KEY (generation) REFERENCES public.project_root_change_journal(generation) ON DELETE RESTRICT')
+    expect(writeContextDdl).toContain('FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE RESTRICT')
+    expect(writeContextSchema).toContain("foreignColumns: [projectRootReconciliationOperations.operationId]")
+    expect(writeContextSchema).toContain('foreignColumns: [projectRootChangeJournal.generation]')
+    expect(writeContextSchema).toContain('foreignColumns: [projects.id]')
+  })
+
   it('fences operation creation and completion against gaps, later commits, and hijack', () => {
     expect(migration).toContain('forge.assert_project_root_journal_window_v1')
     expect(migration).toContain('v_counter <> p_through_generation OR v_max <> p_through_generation OR v_count <> p_through_generation')
