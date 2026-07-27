@@ -196,6 +196,12 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(rootAuthorityAssertions).toContain('root authority reconciliation mutated protected decision or pointer authority directly')
     expect(rootAuthorityAssertions).toContain('root authority task convergence did not recover running and failed tasks')
     expect(rootAuthorityAssertions).toContain('the single root reconciliation operation does not cover every prepared journal generation')
+    expect(rootAuthorityAssertions).toContain('root authority addition package convergence is not canonical')
+    expect(rootAuthorityAssertions).toContain('root authority refresh package convergence is not canonical')
+    expect(rootAuthorityAssertions).toContain('root authority recovery package convergence is not canonical')
+    expect(rootAuthorityAssertions).toContain("'phases', package_row.metadata->'mcpGrantPhases'")
+    expect(rootAuthorityAssertions).toContain("'errorMessage', task_row.error_message")
+    expect(rootAuthorityPackageFixture).toContain("'[]'::jsonb")
   })
 
   it('keeps the dedicated pre-reconciliation rollback proof bounded and resumable', () => {

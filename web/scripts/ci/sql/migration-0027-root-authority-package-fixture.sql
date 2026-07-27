@@ -84,7 +84,10 @@ INSERT INTO public.work_packages (
     'A valid prior marker that later clears through recovery.',
     'blocked',
     1,
-    '[{"mcpId":"filesystem","required":true,"capabilities":["filesystem.project.read"]}]'::jsonb,
+    -- A prior filesystem marker can only recover after the package no longer
+    -- has a blocking filesystem requirement. A root repoint revokes every
+    -- still-required filesystem capability and therefore refreshes its hold.
+    '[]'::jsonb,
     'Filesystem context requires an operator decision before execution.',
     '{"fixturePeer":{"case":"removal","retain":true},"mcpGrantPhases":{"filesystem":{"phase":"preexisting-remove","revision":"1"}},"mcpGrantBlock":{"schemaVersion":2,"kind":"filesystem_grant","source":"filesystem-grant-approval","taskDisposition":"operator_hold","autoRetryable":false,"terminalFailure":false,"requirementKeys":["requirement:root-removal"],"requestedCapabilities":["filesystem.project.read"],"recoveryAction":"approve_project_filesystem_context","blockFingerprint":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","blockedAt":"2026-07-28T00:00:02.000Z","holdKind":"consumed_once","grantPhase":"approved","grantConsumed":true,"grantDecisionRevision":"1","revocationReason":null}}'::jsonb
   );
