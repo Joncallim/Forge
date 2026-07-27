@@ -871,6 +871,7 @@ export async function reconcileFilesystemGrantsForProject(
     nextMcpConfig: ProjectMcpConfig
     trigger: FilesystemGrantProjectReconciliationTrigger
     suppressPhasePersistence?: boolean
+    rootReconciliationContext?: { operationId: string; actorId: string; generation: string; projectId: string }
   },
 ): Promise<FilesystemGrantProjectReconciliationResult> {
   if (!input.actorId.trim()) throw new Error('Grant reconciliation requires an actor.')
@@ -903,6 +904,11 @@ export async function reconcileFilesystemGrantsForProject(
       .where(inArray(workPackages.taskId, taskRows.map((task) => task.id)))
       .orderBy(workPackages.id)
       .for('update')
+  if (input.rootReconciliationContext) {
+    const context = input.rootReconciliationContext
+    if (context.projectId !== input.lockedProject.id) throw httpError('Root reconciliation context project changed.', 409)
+    await tx.execute(sql`select forge.lock_project_root_reconciliation_authority_v1(${context.operationId}::uuid, ${context.actorId}::uuid, ${context.generation}::bigint, ${context.projectId}::uuid)`)
+  }
   const packageDecisionRows = await tx.select()
     .from(filesystemMcpGrantApprovals)
     .where(eq(filesystemMcpGrantApprovals.projectId, input.lockedProject.id))

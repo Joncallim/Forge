@@ -61,8 +61,9 @@ async function main(): Promise<void> {
         const claimed = (claimedRows as unknown as Array<Record<string, unknown>>).map(parseClaimedProjectRootChange)
         if (claimed.length === 0) return { completed: true, processed: 0 }
         for (const change of claimed) {
+          await tx.execute(sql`select forge.enter_project_root_reconciliation_generation_v1(${operation.operationId}::uuid, ${command.actorId}::uuid, ${change.generation.toString()}::bigint, ${change.projectId}::uuid)`)
           const [project] = await tx.select().from(schema.projects)
-            .where(eq(schema.projects.id, change.projectId)).for('update')
+            .where(eq(schema.projects.id, change.projectId))
           if (!project) throw new Error('Journal project disappeared before reconciliation.')
           const hasBoundFilesystemAuthority = project.rootBindingRevision > BigInt(0)
             || project.grantDecisionRevision > BigInt(0)
@@ -79,6 +80,7 @@ async function main(): Promise<void> {
                 rootBindingRevision: project.rootBindingRevision,
               }),
               suppressPhasePersistence: true,
+              rootReconciliationContext: { operationId: operation.operationId, actorId: command.actorId, generation: change.generation.toString(), projectId: change.projectId },
               trigger: 'project_root_repoint',
             })
           }

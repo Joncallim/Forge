@@ -103,6 +103,9 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(reconciliation).toContain('suppressPhasePersistence?: boolean')
     expect(reconciliation).toContain('input.suppressPhasePersistence ? undefined : grant')
     expect(reconcileScript).not.toContain('--suppress')
+    expect(reconcileScript).toContain('forge.enter_project_root_reconciliation_generation_v1')
+    expect(reconcileScript).toContain('rootReconciliationContext:')
+    expect(reconciliation).toContain('forge.lock_project_root_reconciliation_authority_v1')
   })
 
   it('keeps concurrent index DDL separate and strict cutover watermark-fenced', () => {
