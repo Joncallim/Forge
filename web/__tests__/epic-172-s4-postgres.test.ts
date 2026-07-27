@@ -422,6 +422,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     expect(historyAudit.returnedEntryCount).toBe(firstHistory.length)
     expect(historyAudit.entrySetDigest).toMatch(/^sha256:[0-9a-f]{64}$/)
 
+    const runStatefulHistoryProof = async () => {
     const second = await recordArchitectPlanVersion({
       agentRunId: ids.secondArchitectRun, digestKey: key, digestKeyId: 's4-test-key',
       planVersion: '2', taskId: ids.task,
@@ -562,6 +563,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     await expect(readArchitectPlanHistory({ planVersion: '6', sessionCredential, taskId: ids.task })).rejects.toMatchObject({ code: 'invalid_evidence' })
     const [auditAfterOverrun] = await admin<{ count: number }[]>`select count(*)::integer as count from architect_plan_history_reads where task_id = ${ids.task}::uuid`
     expect(auditAfterOverrun.count).toBe(auditBeforeOverrun.count)
+    }
     const packageEntry = recorded.entries.find((entry) => entry.entryKind === 'subtask')!
     const reference = executableReferenceForEntry(packageEntry)
     const [bound] = await issuer<{ referenceId: string }[]>`
@@ -650,6 +652,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       digestKey: key,
       referenceId: answerReferenceId,
     })).rejects.toMatchObject({ code: 'invalid_evidence' })
+    await runStatefulHistoryProof()
   })
 
   it('resume-safely rekeys a crash-window legacy session and leaves no raw-id lookup target', async () => {
