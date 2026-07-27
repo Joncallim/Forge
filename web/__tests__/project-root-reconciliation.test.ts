@@ -22,6 +22,7 @@ const rootAuthorityAssertions = readFileSync(fileURLToPath(new URL('../scripts/c
 const negativeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-reconciliation-negative.sh', import.meta.url)), 'utf8')
 const replayProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-reconciliation-replay.sh', import.meta.url)), 'utf8')
 const privilegeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-reconciler-privileges-assertions.sql', import.meta.url)), 'utf8')
+const staleContextProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-stale-context.sh', import.meta.url)), 'utf8')
 const cutoverScript = readFileSync(fileURLToPath(new URL('../scripts/ci/cutover-migration-0027-root-ref.sh', import.meta.url)), 'utf8')
 const webCi = readFileSync(fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)), 'utf8')
 
@@ -219,6 +220,16 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(privilegeProof).toContain('has_function_privilege')
     expect(privilegeProof).toContain('project_root_reconciliation_write_contexts')
     expect(upgradeProof).toContain('migration-0027-root-reconciler-privileges-assertions.sql')
+  })
+
+  it('rejects stale and fabricated root reconciliation context reuse before the CLI resumes', () => {
+    expect(staleContextProof).toContain('forge.enter_project_root_reconciliation_generation_v1')
+    expect(staleContextProof).toContain('forge.complete_project_root_reconciliation_generation_v1')
+    expect(staleContextProof).toContain("set_config('forge.project_root_context','forged',true)")
+    expect(staleContextProof).toContain('project-root write context is absent or stale')
+    expect(upgradeProof.indexOf('prove-migration-0027-root-stale-context.sh')).toBeLessThan(
+      upgradeProof.indexOf('reconcile-migration-0027-root-refs.sh'),
+    )
   })
 
   it('selects phase suppression only in the internal root-journal caller', () => {
