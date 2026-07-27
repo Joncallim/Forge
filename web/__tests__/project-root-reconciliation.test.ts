@@ -235,9 +235,11 @@ describe('project-root expansion reconciliation boundary', () => {
   })
 
   it('binds negative assertion inputs outside the dollar-quoted PL/pgSQL body', () => {
+    expect(negativeAssertions).toContain('BEGIN;')
     expect(negativeAssertions).toContain('CREATE TEMP TABLE root_negative_assertion_inputs')
     expect(negativeAssertions).toContain("VALUES (:'operation_id'::uuid, :'task_id'::uuid, :'generation'::bigint)")
     expect(negativeAssertions).toContain('FROM root_negative_assertion_inputs')
+    expect(negativeAssertions).toContain('COMMIT;')
     expect(negativeAssertions).not.toContain("id=:'task_id'")
   })
 
