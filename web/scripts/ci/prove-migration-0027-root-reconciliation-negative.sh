@@ -26,7 +26,9 @@ expect_failure 'project-root operation identity cannot be hijacked' psql "$url" 
 expect_failure 'query returned no rows' psql "$url" --set ON_ERROR_STOP=1 --command "SELECT forge.enter_project_root_reconciliation_generation_v1('33333333-3333-4333-8333-333333333333'::uuid,'${actor}'::uuid,1,'${project}'::uuid)"
 expect_failure 'project-root write context is not claimable' psql "$url" --set ON_ERROR_STOP=1 --command "SELECT forge.enter_project_root_reconciliation_generation_v1('${operation_id}'::uuid,'${actor}'::uuid,2,'${project}'::uuid)"
 expect_failure 'project-root authority lock has no active write context' psql "$url" --set ON_ERROR_STOP=1 --command "SELECT forge.lock_project_root_reconciliation_authority_v1('${operation_id}'::uuid,'${actor}'::uuid,1,'${project}'::uuid)"
-expect_failure 'rollback sentinel' psql "$url" --set ON_ERROR_STOP=1 <<SQL
+# psql must stop on this exact server error. The following admin psql command
+# is a fresh session and proves the aborted transaction left no durable state.
+expect_failure 'division by zero' psql "$url" --set ON_ERROR_STOP=1 <<SQL
 BEGIN;
 SELECT forge.enter_project_root_reconciliation_generation_v1('${operation_id}'::uuid,'${actor}'::uuid,1,'${project}'::uuid);
 UPDATE public.tasks SET status='approved', error_message=NULL WHERE id='${task}'::uuid AND status='running';
