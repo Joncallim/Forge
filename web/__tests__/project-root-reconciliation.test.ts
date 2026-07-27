@@ -186,6 +186,14 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(cutoverScript).toContain('projects_root_ref_idx')
     expect(cutoverScript).toContain("pg_catalog.to_regclass('public.projects_root_ref_idx')")
     expect(cutoverScript).toContain('strict root-reference cutover requires a valid concurrent projects(root_ref) index')
+    const advisoryLock = cutoverScript.indexOf("pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('forge:projects_root_ref_idx:v1'))")
+    const indexGuard = cutoverScript.indexOf('strict root-reference cutover requires the exact canonical concurrent projects(root_ref) index')
+    const coverageGuard = cutoverScript.indexOf('strict root-reference cutover requires exact completed watermark coverage')
+    const proofConstraint = cutoverScript.indexOf('ALTER TABLE public.projects ADD CONSTRAINT projects_root_ref_not_null_proof')
+    expect(advisoryLock).toBeGreaterThanOrEqual(0)
+    expect(advisoryLock).toBeLessThan(indexGuard)
+    expect(indexGuard).toBeLessThan(coverageGuard)
+    expect(coverageGuard).toBeLessThan(proofConstraint)
     expect(upgradeProof.indexOf('bash scripts/ci/reconcile-migration-0027-root-refs.sh')).toBeLessThan(
       upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh'),
     )
