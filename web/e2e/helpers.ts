@@ -169,9 +169,9 @@ export async function seedSession(displayName = 'E2E Operator'): Promise<SeededS
     `
     await sql`
       insert into sessions (
-        id, user_id, user_agent, credential_digest_v1, expires_at
+        id, user_id, user_agent, credential_digest_v1, credential_storage_version, expires_at
       ) values (
-        ${sessionRowId}, ${userId}, 'Playwright E2E', ${digest},
+        ${sessionRowId}, ${userId}, 'Playwright E2E', ${digest}, 2,
         ${new Date(expiresAt)}
       )
     `
