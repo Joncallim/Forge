@@ -664,17 +664,25 @@ END;
 $$;
 --> statement-breakpoint
 CREATE TABLE public.project_root_reconciliation_write_contexts (
-  operation_id uuid NOT NULL REFERENCES public.project_root_reconciliation_operations(operation_id) ON DELETE RESTRICT,
-  generation bigint NOT NULL REFERENCES public.project_root_change_journal(generation) ON DELETE RESTRICT,
+  operation_id uuid NOT NULL,
+  generation bigint NOT NULL,
   actor_id uuid NOT NULL,
-  project_id uuid NOT NULL REFERENCES public.projects(id) ON DELETE RESTRICT,
-  backend_pid integer NOT NULL CHECK (backend_pid > 0),
-  transaction_id bigint NOT NULL CHECK (transaction_id > 0),
+  project_id uuid NOT NULL,
+  backend_pid integer NOT NULL CONSTRAINT project_root_reconciliation_write_context_backend_pid_chk CHECK (backend_pid > 0),
+  transaction_id bigint NOT NULL CONSTRAINT project_root_reconciliation_write_context_transaction_id_chk CHECK (transaction_id > 0),
+  -- Record wall-clock entry time; a long root reconciliation transaction must
+  -- not collapse every context timestamp to its transaction start.
   entered_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
   completed_at timestamptz,
-  PRIMARY KEY (operation_id, generation),
-  UNIQUE (generation),
-  CONSTRAINT project_root_reconciliation_write_context_shape_chk CHECK ((completed_at IS NULL) OR completed_at >= entered_at)
+  CONSTRAINT project_root_reconciliation_write_contexts_pkey PRIMARY KEY (operation_id, generation),
+  CONSTRAINT project_root_reconciliation_write_context_generation_unique UNIQUE (generation),
+  CONSTRAINT project_root_reconciliation_write_context_shape_chk CHECK ((completed_at IS NULL) OR completed_at >= entered_at),
+  CONSTRAINT project_root_reconciliation_write_contexts_operation_id_fkey
+    FOREIGN KEY (operation_id) REFERENCES public.project_root_reconciliation_operations(operation_id) ON DELETE RESTRICT,
+  CONSTRAINT project_root_reconciliation_write_contexts_generation_fkey
+    FOREIGN KEY (generation) REFERENCES public.project_root_change_journal(generation) ON DELETE RESTRICT,
+  CONSTRAINT project_root_reconciliation_write_contexts_project_id_fkey
+    FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE RESTRICT
 );
 CREATE OR REPLACE FUNCTION forge.enter_project_root_reconciliation_generation_v1(p_operation_id uuid, p_actor_id uuid, p_generation bigint, p_project_id uuid)
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
@@ -772,9 +780,9 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM public.project_root_reconciliation_write_contexts context_row JOIN public.tasks task_row ON task_row.project_id=context_row.project_id WHERE task_row.id=OLD.task_id AND context_row.backend_pid=pg_catalog.pg_backend_pid() AND context_row.transaction_id=pg_catalog.txid_current() AND context_row.completed_at IS NULL) THEN RAISE EXCEPTION 'project-root package update has no active write context' USING ERRCODE='42501'; END IF;
   IF (to_jsonb(NEW)-ARRAY['status','blocked_reason','metadata','updated_at']) IS DISTINCT FROM (to_jsonb(OLD)-ARRAY['status','blocked_reason','metadata','updated_at']) OR (NEW.metadata-'mcpGrantBlock') IS DISTINCT FROM (OLD.metadata-'mcpGrantBlock') THEN RAISE EXCEPTION 'project-root package update changed protected fields' USING ERRCODE='42501'; END IF;
   IF v_new_marker IS NOT NULL THEN
-    IF NOT forge_is_canonical_filesystem_grant_block_v2(v_new_marker) OR (v_old_marker IS NOT NULL AND NOT forge_is_canonical_filesystem_grant_block_v2(v_old_marker)) OR NEW.status <> 'blocked' OR NEW.blocked_reason <> 'Filesystem context requires an operator decision before execution.' THEN RAISE EXCEPTION 'project-root package marker is not canonical' USING ERRCODE='42501'; END IF;
+    IF NOT public.forge_is_canonical_filesystem_grant_block_v2(v_new_marker) OR (v_old_marker IS NOT NULL AND NOT public.forge_is_canonical_filesystem_grant_block_v2(v_old_marker)) OR NEW.status <> 'blocked' OR NEW.blocked_reason <> 'Filesystem context requires an operator decision before execution.' THEN RAISE EXCEPTION 'project-root package marker is not canonical' USING ERRCODE='42501'; END IF;
   ELSIF v_old_marker IS NOT NULL THEN
-    IF NOT forge_is_canonical_filesystem_grant_block_v2(v_old_marker) OR OLD.status NOT IN ('blocked','failed') OR NEW.status <> 'ready' OR NEW.blocked_reason IS NOT NULL THEN RAISE EXCEPTION 'project-root package marker removal is not canonical' USING ERRCODE='42501'; END IF;
+    IF NOT public.forge_is_canonical_filesystem_grant_block_v2(v_old_marker) OR OLD.status NOT IN ('blocked','failed') OR NEW.status <> 'ready' OR NEW.blocked_reason IS NOT NULL THEN RAISE EXCEPTION 'project-root package marker removal is not canonical' USING ERRCODE='42501'; END IF;
   ELSE RAISE EXCEPTION 'project-root package update must change a canonical marker' USING ERRCODE='42501'; END IF;
   NEW.updated_at := pg_catalog.transaction_timestamp(); RETURN NEW;
 END; $$;
