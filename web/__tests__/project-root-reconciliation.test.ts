@@ -21,6 +21,7 @@ const rootAuthorityProof = readFileSync(fileURLToPath(new URL('../scripts/ci/pro
 const rootAuthorityAssertions = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-authority-reconciliation-assertions.sql', import.meta.url)), 'utf8')
 const negativeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-reconciliation-negative.sh', import.meta.url)), 'utf8')
 const replayProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-reconciliation-replay.sh', import.meta.url)), 'utf8')
+const privilegeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-reconciler-privileges-assertions.sql', import.meta.url)), 'utf8')
 const cutoverScript = readFileSync(fileURLToPath(new URL('../scripts/ci/cutover-migration-0027-root-ref.sh', import.meta.url)), 'utf8')
 const webCi = readFileSync(fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)), 'utf8')
 
@@ -210,6 +211,14 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(upgradeProof.indexOf('prove-migration-0027-root-reconciliation-replay.sh')).toBeGreaterThan(
       upgradeProof.indexOf('reconcile-migration-0027-root-refs.sh'),
     )
+  })
+
+  it('keeps the dedicated reconciler privilege proof catalog-driven and mandatory', () => {
+    expect(privilegeProof).toContain('has_table_privilege')
+    expect(privilegeProof).toContain('has_column_privilege')
+    expect(privilegeProof).toContain('has_function_privilege')
+    expect(privilegeProof).toContain('project_root_reconciliation_write_contexts')
+    expect(upgradeProof).toContain('migration-0027-root-reconciler-privileges-assertions.sql')
   })
 
   it('selects phase suppression only in the internal root-journal caller', () => {

@@ -59,6 +59,7 @@ fi
 # Assertions and index recovery are read/DDL-only after that completed operation.
 bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh --prepare
 bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh --prepare
+psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 --file scripts/ci/sql/migration-0027-root-reconciler-privileges-assertions.sql
 # This creates (but never advances) the exact live operation. The shim resumes
 # it below after its now-empty materialization pass.
 bash scripts/ci/prove-migration-0027-root-reconciliation-negative.sh
