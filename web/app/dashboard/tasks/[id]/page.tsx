@@ -2087,8 +2087,17 @@ function FilesystemGrantControls({
     >
       <div className="flex flex-wrap items-center gap-2">
         <p className="font-medium text-muted-foreground">Filesystem context grant</p>
-        <Badge variant="outline" className={statusBadgeClass(grantState?.currentDecision?.decision ?? effective.status)}>
-          {statusLabel(grantState?.currentDecision?.decision ?? effective.status)}
+        {/*
+          The badge shows the reconciled effective phase, never the pointer's
+          raw decision. A pointer only records approved/denied, so a consumed
+          allow-once grant or one revoked by a project change still points at an
+          "approved" decision while access is gone — and a package denial that a
+          later project-wide always-allow supersedes still points at "denied".
+          Current grant phases are the display authority; the pointer identity
+          is rendered separately below as evidence of what is being acted on.
+        */}
+        <Badge variant="outline" className={statusBadgeClass(effective.status)}>
+          {statusLabel(effective.status)}
         </Badge>
         {effective.grantMode !== '' && <Badge variant="secondary">{statusLabel(effective.grantMode)}</Badge>}
         {summary.blockingCapabilities.length > 0 && <Badge variant="secondary">required</Badge>}

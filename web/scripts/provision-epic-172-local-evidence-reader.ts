@@ -65,6 +65,35 @@ async function main(): Promise<void> {
       throw new Error(`${READER_ROLE} must be an unprivileged login role.`)
     }
 
+    // Role membership defeats every column check below. The reader is
+    // NOINHERIT, so `has_column_privilege` reports false for claim_token even
+    // when the reader is a member of the table owner — but `SET ROLE` still
+    // works, and the session then reads the token and writes the table. A
+    // membership in either direction is therefore disqualifying: outbound lets
+    // the reader assume a stronger role, inbound lets a stronger role assume
+    // the reader. Verified against PostgreSQL 16: without this check the script
+    // reported the boundary intact while `SET ROLE` read claim_token.
+    const memberships = await admin<{ direction: string; other: string }[]>`
+      select 'reader_is_member_of' as "direction", grantee.rolname as "other"
+      from pg_catalog.pg_auth_members membership
+      join pg_catalog.pg_roles member on member.oid = membership.member
+      join pg_catalog.pg_roles grantee on grantee.oid = membership.roleid
+      where member.rolname = ${READER_ROLE}
+      union all
+      select 'is_member_of_reader' as "direction", member.rolname as "other"
+      from pg_catalog.pg_auth_members membership
+      join pg_catalog.pg_roles member on member.oid = membership.member
+      join pg_catalog.pg_roles grantee on grantee.oid = membership.roleid
+      where grantee.rolname = ${READER_ROLE}
+    `
+    if (memberships.length > 0) {
+      throw new Error(
+        `${READER_ROLE} must hold no role memberships; found ${
+          memberships.map((row) => `${row.direction}=${row.other}`).join(', ')
+        }. A membership grants SET ROLE, which bypasses the column-scoped boundary.`,
+      )
+    }
+
     const [database] = await admin<{ name: string }[]>`select current_database() as name`
     await admin.unsafe(`grant connect on database ${admin(database.name).toString()} to ${READER_ROLE}`)
       .catch(async () => {
