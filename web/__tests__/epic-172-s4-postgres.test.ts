@@ -866,6 +866,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     const otherUser = randomUUID()
     const otherProject = randomUUID()
     const otherTask = randomUUID()
+    const otherRun = randomUUID()
     const digestKey = randomBytes(32)
 
     // Redis is unavailable and contains forged-looking state. The route must
@@ -892,7 +893,9 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         values (${otherProject}::uuid, 'Route history other project', ${otherUser}::uuid, 1, 1)`
       await tx`insert into tasks (id, project_id, submitted_by, title, prompt, status)
         values (${otherTask}::uuid, ${otherProject}::uuid, ${otherUser}::uuid,
-          'Route history other task', 'not accessible', 'running')`
+          'Route history other task', 'protected other-user fixture', 'running')`
+      await tx`insert into agent_runs (id, task_id, agent_type, model_id_used, status)
+        values (${otherRun}::uuid, ${otherTask}::uuid, 'architect', 'test', 'completed')`
     })
     await recordArchitectPlanVersion({
       agentRunId: routeRun,
@@ -909,9 +912,25 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy',
       }],
     })
+    await recordArchitectPlanVersion({
+      agentRunId: otherRun,
+      digestKey,
+      digestKeyId: 'route-history-key',
+      planVersion: '1',
+      taskId: otherTask,
+      entries: [{
+        agent: null, bindingFingerprint: null, content: 'Other-user protected plan.',
+        entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null,
+      }, {
+        agent: null, bindingFingerprint: null,
+        content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }),
+        entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy',
+      }],
+    })
 
     const { POST: passwordLogin } = await import('@/app/api/auth/login/password/route')
     const { GET: protectedHistory } = await import('@/app/api/tasks/[id]/architect-plan-history/[planVersion]/route')
+    const { createSession } = await import('@/lib/session')
     const passwordSession = async (): Promise<string> => {
       const response = await passwordLogin(new Request('http://localhost/api/auth/login/password', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: ownerPassword }),
@@ -927,9 +946,9 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       }) as never,
       { params: Promise.resolve({ id: taskId, planVersion }) },
     )
-    const auditCount = async () => {
+    const auditCount = async (taskId: string) => {
       const [row] = await admin<{ count: number }[]>`
-        select count(*)::integer as count from architect_plan_history_reads where task_id = ${routeTask}::uuid
+        select count(*)::integer as count from architect_plan_history_reads where task_id = ${taskId}::uuid
       `
       return row.count
     }
@@ -964,11 +983,11 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     expect(auditTextColumns).toEqual({ count: 0 })
 
     const assertSessionDenied = async (credential: string) => {
-      const before = await auditCount()
+      const before = await auditCount(routeTask)
       const response = await routeRead(credential, routeTask, '1')
       expect(response.status).toBe(401)
       await expect(response.json()).resolves.toEqual({ error: 'Unauthorized' })
-      expect(await auditCount()).toBe(before)
+      expect(await auditCount(routeTask)).toBe(before)
     }
     const revokedCredential = await passwordSession()
     await admin`update sessions set revoked_at = clock_timestamp()
@@ -993,18 +1012,42 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
 
     await assertSessionDenied(randomUUID())
 
+    // The password route is intentionally single-user today, so create the
+    // second user's canonical database-authoritative session through the same
+    // production session boundary that the route later validates.
+    const otherCredential = await createSession(otherUser, null, { ip: null, userAgent: null })
+    const otherSuccessful = await routeRead(otherCredential, otherTask, '1')
+    expect(otherSuccessful.status).toBe(200)
+    const otherSuccessfulBody = await otherSuccessful.json() as { taskId: string; planVersion: string; entries: Array<{ entryId: string; content: string }> }
+    expect(otherSuccessfulBody).toEqual(expect.objectContaining({ taskId: otherTask, planVersion: '1' }))
+    expect(otherSuccessfulBody.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ entryId: 'plan_body:000000', content: 'Other-user protected plan.' }),
+    ]))
+    const [otherSuccessAudit] = await admin<{ count: number; digest: string; returned: number }[]>`
+      select count(*)::integer as count, max(entry_set_digest) as digest,
+        max(returned_entry_count)::integer as returned
+      from architect_plan_history_reads where task_id = ${otherTask}::uuid
+    `
+    expect(otherSuccessAudit).toEqual({
+      count: 1,
+      digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+      returned: otherSuccessfulBody.entries.length,
+    })
+
     const crossTaskCredential = await passwordSession()
-    const beforeCrossTask = await auditCount()
+    const beforeCrossTaskOwner = await auditCount(routeTask)
+    const beforeCrossTaskOther = await auditCount(otherTask)
     const crossTask = await routeRead(crossTaskCredential, otherTask, '1')
     expect(crossTask.status).toBe(404)
     await expect(crossTask.json()).resolves.toEqual({ error: 'Architect plan history not found.' })
-    expect(await auditCount()).toBe(beforeCrossTask)
+    expect(await auditCount(routeTask)).toBe(beforeCrossTaskOwner)
+    expect(await auditCount(otherTask)).toBe(beforeCrossTaskOther)
 
-    const beforeWrongVersion = await auditCount()
+    const beforeWrongVersion = await auditCount(routeTask)
     const wrongVersion = await routeRead(crossTaskCredential, routeTask, '2')
     expect(wrongVersion.status).toBe(404)
     await expect(wrongVersion.json()).resolves.toEqual({ error: 'Architect plan history not found.' })
-    expect(await auditCount()).toBe(beforeWrongVersion)
+    expect(await auditCount(routeTask)).toBe(beforeWrongVersion)
     expect(mockRedisSet).toHaveBeenCalled()
   })
 
