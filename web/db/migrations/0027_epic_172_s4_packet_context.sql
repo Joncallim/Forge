@@ -606,19 +606,19 @@ BEGIN
   PERFORM forge.assert_project_root_reconciler_v1();
   PERFORM forge.assert_project_root_journal_window_v1(p_through_generation);
   IF p_operation_id IS NULL THEN
-    SELECT * INTO v_operation FROM public.project_root_reconciliation_operations
-      WHERE actor_id = p_actor_id AND through_generation = p_through_generation
-      ORDER BY created_at DESC LIMIT 1 FOR UPDATE;
+    SELECT * INTO v_operation FROM public.project_root_reconciliation_operations AS operation_row
+      WHERE operation_row.actor_id = p_actor_id AND operation_row.through_generation = p_through_generation
+      ORDER BY operation_row.created_at DESC LIMIT 1 FOR UPDATE;
   ELSE
-    SELECT * INTO v_operation FROM public.project_root_reconciliation_operations
-      WHERE operation_id = p_operation_id FOR UPDATE;
+    SELECT * INTO v_operation FROM public.project_root_reconciliation_operations AS operation_row
+      WHERE operation_row.operation_id = p_operation_id FOR UPDATE;
   END IF;
   IF FOUND THEN
     IF v_operation.actor_id <> p_actor_id OR v_operation.through_generation <> p_through_generation THEN
       RAISE EXCEPTION 'project-root operation identity cannot be hijacked' USING ERRCODE = '42501';
     END IF;
   ELSE
-    IF EXISTS (SELECT 1 FROM public.project_root_reconciliation_operations WHERE state = 'running') THEN
+    IF EXISTS (SELECT 1 FROM public.project_root_reconciliation_operations AS operation_row WHERE operation_row.state = 'running') THEN
       RAISE EXCEPTION 'a project-root reconciliation operation is already live' USING ERRCODE = '55P03';
     END IF;
     INSERT INTO public.project_root_reconciliation_operations(operation_id, actor_id, through_generation, state, completed_at)

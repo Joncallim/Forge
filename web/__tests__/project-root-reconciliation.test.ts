@@ -49,6 +49,8 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(migration).toContain('forge.assert_project_root_journal_window_v1')
     expect(migration).toContain('v_counter <> p_through_generation OR v_max <> p_through_generation OR v_count <> p_through_generation')
     expect(migration).toContain('project-root operation identity cannot be hijacked')
+    expect(migration).toContain('operation_row.actor_id = p_actor_id')
+    expect(migration).toContain('operation_row.through_generation = p_through_generation')
     expect(migration).toContain('project-root completion compare-and-set failed')
     expect(migration).toContain('project-root generation already has an immutable outcome')
     expect(migration).toContain('forge.materialize_project_root_ref_expansion_v1')
