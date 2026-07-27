@@ -126,6 +126,7 @@ async function main(): Promise<void> {
 
       await client`grant usage on schema forge to ${client(applicationRole)}`
       await client`grant execute on function forge.read_epic_172_enablement_state_v1() to ${client(applicationRole)}`
+      await client`grant execute on function forge.read_s4_runtime_mode_for_application_v1() to ${client(applicationRole)}`
       await client`grant execute on function forge.advance_local_projection_head_v1(uuid,uuid,text,uuid,bigint,text,jsonb,bigint,text,text) to ${client(applicationRole)}`
       await client`grant select on table public.work_package_local_projection_sources to ${client(applicationRole)}`
       await client`grant select on table public.work_package_local_projection_heads to ${client(applicationRole)}`
@@ -181,11 +182,12 @@ async function main(): Promise<void> {
         order by p.proname
       `
       if (
-        executableForgeFunctions.length !== 2
+        executableForgeFunctions.length !== 3
         || executableForgeFunctions[0].functionName !== 'advance_local_projection_head_v1'
         || executableForgeFunctions[1].functionName !== 'read_epic_172_enablement_state_v1'
+        || executableForgeFunctions[2].functionName !== 'read_s4_runtime_mode_for_application_v1'
       ) {
-        throw new Error('The ordinary Forge application role must execute only the fixed enablement-read and projection-advance functions.')
+        throw new Error('The ordinary Forge application role must execute only the fixed enablement-read, runtime-mode-read, and projection-advance functions.')
       }
 
       const [{ ownedObjectCount }] = await client<{ ownedObjectCount: number }[]>`

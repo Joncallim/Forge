@@ -67,17 +67,22 @@ describe('Epic 172 signed release recorder boundary', () => {
       'grant execute on function forge.read_epic_172_enablement_state_v1()',
     )
     expect(provisionApplicationRole).toContain(
+      'grant execute on function forge.read_s4_runtime_mode_for_application_v1()',
+    )
+    expect(provisionApplicationRole).toContain(
       'grant execute on function forge.advance_local_projection_head_v1(',
     )
     expect(provisionApplicationRole).toContain('unexpectedTablePrivileges.length !== 0')
-    expect(provisionApplicationRole).toContain('executableForgeFunctions.length !== 2')
+    expect(provisionApplicationRole).toContain('executableForgeFunctions.length !== 3')
     expect(provisionApplicationRole).toContain("!== 'advance_local_projection_head_v1'")
     expect(provisionApplicationRole).toContain("!== 'read_epic_172_enablement_state_v1'")
+    expect(provisionApplicationRole).toContain("!== 'read_s4_runtime_mode_for_application_v1'")
     expect(operatorRunbook).toContain('npm run protocol:provision-epic-172-application-role')
     expect(webCi).toContain('run: npm run protocol:provision-epic-172-application-role')
     expect(webCi).not.toContain(
       'GRANT EXECUTE ON FUNCTION forge.read_epic_172_enablement_state_v1() TO forge_app_test;',
     )
+    expect(webCi).toContain("'read_s4_runtime_mode_for_application_v1'")
   })
 
   it('documents the immutable Step 0 build suffix required by the verifier', () => {

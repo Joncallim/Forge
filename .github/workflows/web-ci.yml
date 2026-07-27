@@ -360,7 +360,8 @@ jobs:
                 AND has_function_privilege(current_user, p.oid, 'EXECUTE')
             ) IS DISTINCT FROM ARRAY[
               'advance_local_projection_head_v1',
-              'read_epic_172_enablement_state_v1'
+              'read_epic_172_enablement_state_v1',
+              'read_s4_runtime_mode_for_application_v1'
             ]::name[] THEN
               RAISE EXCEPTION 'ordinary app has an unexpected Epic 172 routine ACL';
             END IF;
