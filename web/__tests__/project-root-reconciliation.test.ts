@@ -16,6 +16,7 @@ const indexScript = readFileSync(fileURLToPath(new URL('../scripts/build-project
 const upgradeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-upgrade.sh', import.meta.url)), 'utf8')
 const indexLifecycleProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-index-lifecycle.sh', import.meta.url)), 'utf8')
 const rootAuthorityProjectFixture = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-authority-project-fixture.sql', import.meta.url)), 'utf8')
+const rootAuthorityPackageFixture = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-authority-package-fixture.sql', import.meta.url)), 'utf8')
 const cutoverScript = readFileSync(fileURLToPath(new URL('../scripts/ci/cutover-migration-0027-root-ref.sh', import.meta.url)), 'utf8')
 const webCi = readFileSync(fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)), 'utf8')
 
@@ -141,6 +142,20 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(rootAuthorityProjectFixture).toContain("'^sha256:[0-9a-f]{64}$'")
     expect(rootAuthorityProjectFixture).toContain('duplicate or ambiguous current authority')
     expect(rootAuthorityProjectFixture).not.toContain('reconcile-project-root-expansion.ts')
+  })
+
+  it('keeps the admin-only root-authority package fixture bounded to seed state', () => {
+    expect(rootAuthorityPackageFixture).toContain('requires the exact R2A1a project authority')
+    expect(rootAuthorityPackageFixture).toContain("'27000000-0000-4000-8000-000000000711'")
+    expect(rootAuthorityPackageFixture).toContain("'27000000-0000-4000-8000-000000000712'")
+    expect(rootAuthorityPackageFixture).toContain("'27000000-0000-4000-8000-000000000721'")
+    expect(rootAuthorityPackageFixture).toContain('public.forge_is_canonical_filesystem_grant_block_v2')
+    expect(rootAuthorityPackageFixture).toContain('mcpGrantPhases')
+    expect(rootAuthorityPackageFixture).toContain("metadata - 'mcpGrantBlock'")
+    expect(rootAuthorityPackageFixture).toContain('count(DISTINCT metadata->\'mcpGrantBlock\'->>\'blockFingerprint\')')
+    expect(rootAuthorityPackageFixture).toContain("head_kind = 'operator_hold'")
+    expect(rootAuthorityPackageFixture).toContain('invalid projection heads or sources')
+    expect(rootAuthorityPackageFixture).not.toContain('reconcile-project-root-expansion.ts')
   })
 
   it('selects phase suppression only in the internal root-journal caller', () => {
