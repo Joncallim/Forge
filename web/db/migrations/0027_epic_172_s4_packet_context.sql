@@ -1176,10 +1176,11 @@ BEGIN
   EXECUTE v_history_query || $count$
     SELECT pg_catalog.count(*)::integer,
       'sha256:' || pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
-        COALESCE(pg_catalog.jsonb_agg(
-          pg_catalog.jsonb_build_object('entryId', entry_id, 'contentDigest', content_digest)
-          ORDER BY entry_id
-        )::text, '[]'), 'UTF8'
+        '[' || COALESCE(pg_catalog.string_agg(
+          '{"contentDigest":' || pg_catalog.to_json(content_digest)::text
+            || ',"entryId":' || pg_catalog.to_json(entry_id)::text || '}',
+          ',' ORDER BY entry_id
+        ), '') || ']', 'UTF8'
       )), 'hex')
     FROM protected_entries
   $count$ INTO v_returned_entry_count, v_returned_set_digest
