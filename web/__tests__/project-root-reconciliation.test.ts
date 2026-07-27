@@ -68,6 +68,8 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(migration).toContain('approval_row.project_id=p_project_id ORDER BY approval_row.id FOR UPDATE')
     expect(migration).toContain('decision_row.project_id=p_project_id ORDER BY decision_row.id FOR UPDATE')
     expect(migration).toContain('project-root authority lock has no active write context')
+    expect(migration.indexOf('REVOKE ALL ON TABLE public.project_root_reconciliation_write_contexts FROM PUBLIC')).toBeLessThan(migration.indexOf('ALTER TABLE public.project_root_reconciliation_write_contexts OWNER TO forge_s4_routines_owner'))
+    expect(migration).toContain('ALTER FUNCTION forge.enter_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid) OWNER TO forge_s4_routines_owner')
   })
 
   it('uses the dedicated login with only canonical helper state columns and fixed routines', () => {
