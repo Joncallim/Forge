@@ -233,9 +233,17 @@ describe('project-root expansion reconciliation boundary', () => {
   })
 
   it('keeps the dedicated reconciler privilege proof catalog-driven and mandatory', () => {
+    expect(privilegeProof).toContain('root_reconciler_expected_privileges')
+    expect(privilegeProof).toContain('root_reconciler_actual_privileges')
     expect(privilegeProof).toContain('has_table_privilege')
     expect(privilegeProof).toContain('has_column_privilege')
     expect(privilegeProof).toContain('has_function_privilege')
+    expect(privilegeProof).toContain('has_sequence_privilege')
+    expect(privilegeProof).toContain('has_schema_privilege')
+    expect(privilegeProof).toContain('has_database_privilege')
+    expect(privilegeProof).toContain('pg_auth_members')
+    expect(privilegeProof).toContain('pg_get_function_identity_arguments')
+    expect(privilegeProof).toContain('root reconciler effective privilege allowlist mismatch')
     expect(privilegeProof).toContain('project_root_reconciliation_write_contexts')
     expect(upgradeProof).toContain('migration-0027-root-reconciler-privileges-assertions.sql')
   })
