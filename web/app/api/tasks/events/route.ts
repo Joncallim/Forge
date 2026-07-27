@@ -30,8 +30,8 @@ export async function GET(request: NextRequest) {
       let eventRedisConfiguration
       try {
         eventRedisConfiguration = taskEventRedisConfiguration()
-      } catch (error) {
-        console.error('[SSE /api/tasks/events] Invalid task-event Redis configuration', error)
+      } catch {
+        console.error('[SSE /api/tasks/events] Invalid task-event Redis configuration')
         controller.close()
         return
       }
@@ -75,21 +75,21 @@ export async function GET(request: NextRequest) {
             status: data.status ?? null,
             updatedAt: data.updatedAt ?? null,
           })
-          } catch (err) {
-            console.error('[SSE /api/tasks/events] Error processing task event', err)
+          } catch {
+            console.error('[SSE /api/tasks/events] Error processing task event')
           }
         })()
       })
 
-      sub.on('error', (err) => {
-        console.error('[SSE /api/tasks/events] Redis subscriber error', err)
+      sub.on('error', () => {
+        console.error('[SSE /api/tasks/events] Redis subscriber error')
         cleanup()
       })
 
       try {
         await sub.psubscribe(TASK_EVENT_V2_LIVE_PATTERN)
-      } catch (err) {
-        console.error('[SSE /api/tasks/events] Failed to subscribe to Redis task channels', err)
+      } catch {
+        console.error('[SSE /api/tasks/events] Failed to subscribe to Redis task channels')
         cleanup()
         return
       }

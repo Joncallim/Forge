@@ -2,8 +2,8 @@ import { db } from '../db'
 import { tasks } from '../db/schema'
 import { and, eq, notInArray } from 'drizzle-orm'
 import { publishTaskEvent } from './events'
-import { sanitizeWorkerMessage } from './redaction'
 import { recordTaskLogBestEffort, type TaskLogLevel } from './task-logs'
+import { taskCompatibilityError } from '@/lib/mcps/leakage-drain'
 
 export type TaskStatus =
   | 'pending'
@@ -36,13 +36,13 @@ export async function updateTaskStatus(
   errorMessage: string | null = null,
 ): Promise<boolean> {
   const now = new Date()
-  const sanitizedErrorMessage = errorMessage === null ? null : sanitizeWorkerMessage(errorMessage)
+  const safeDiagnostic = taskCompatibilityError(errorMessage)
 
   const [updated] = await db
     .update(tasks)
     .set({
       status,
-      errorMessage: sanitizedErrorMessage,
+      errorMessage,
       updatedAt: now,
       completedAt: TERMINAL_STATUSES.has(status) ? now : null,
     })
@@ -54,8 +54,8 @@ export async function updateTaskStatus(
   await recordTaskLogBestEffort({
     eventType: 'task.status_changed',
     level: taskStatusLogLevel(status),
-    message: sanitizedErrorMessage
-      ? `Task status changed to ${status}: ${sanitizedErrorMessage}`
+    message: safeDiagnostic
+      ? `Task status changed to ${status}: ${safeDiagnostic}`
       : `Task status changed to ${status}.`,
     metadata: { status, updatedAt: now.toISOString() },
     source: 'worker',
@@ -65,7 +65,7 @@ export async function updateTaskStatus(
 
   await publishTaskEvent(taskId, 'task:status', {
     status,
-    errorMessage: sanitizedErrorMessage,
+    errorMessage: safeDiagnostic,
     updatedAt: now.toISOString(),
   })
 
@@ -79,13 +79,13 @@ export async function updateTaskStatusIfCurrent(
   errorMessage: string | null = null,
 ): Promise<boolean> {
   const now = new Date()
-  const sanitizedErrorMessage = errorMessage === null ? null : sanitizeWorkerMessage(errorMessage)
+  const safeDiagnostic = taskCompatibilityError(errorMessage)
 
   const [updated] = await db
     .update(tasks)
     .set({
       status: nextStatus,
-      errorMessage: sanitizedErrorMessage,
+      errorMessage,
       updatedAt: now,
       completedAt: TERMINAL_STATUSES.has(nextStatus) ? now : null,
     })
@@ -97,8 +97,8 @@ export async function updateTaskStatusIfCurrent(
   await recordTaskLogBestEffort({
     eventType: 'task.status_changed',
     level: taskStatusLogLevel(nextStatus),
-    message: sanitizedErrorMessage
-      ? `Task status changed from ${currentStatus} to ${nextStatus}: ${sanitizedErrorMessage}`
+    message: safeDiagnostic
+      ? `Task status changed from ${currentStatus} to ${nextStatus}: ${safeDiagnostic}`
       : `Task status changed from ${currentStatus} to ${nextStatus}.`,
     metadata: { currentStatus, nextStatus, updatedAt: now.toISOString() },
     source: 'worker',
@@ -108,7 +108,7 @@ export async function updateTaskStatusIfCurrent(
 
   await publishTaskEvent(taskId, 'task:status', {
     status: nextStatus,
-    errorMessage: sanitizedErrorMessage,
+    errorMessage: safeDiagnostic,
     updatedAt: now.toISOString(),
   })
 

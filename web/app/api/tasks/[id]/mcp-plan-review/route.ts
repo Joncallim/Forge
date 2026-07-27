@@ -371,8 +371,8 @@ export async function POST(
     return result.status === 200
       ? NextResponse.json({ review: result.review })
       : NextResponse.json({ error: result.error }, { status: result.status })
-  } catch (error) {
-    console.error('[POST /api/tasks/:id/mcp-plan-review] Unexpected error', error)
+  } catch {
+    console.error('[POST /api/tasks/:id/mcp-plan-review] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

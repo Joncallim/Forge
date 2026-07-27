@@ -14,6 +14,10 @@ import {
 } from '@/worker/events'
 import { taskEventRedisConfiguration, taskEventRedisKeys } from '@/lib/task-event-redis'
 import { taskQuestionSummary } from '@/lib/mcps/clarification-projection'
+import {
+  projectTaskCompatibilityArtifact,
+  taskCompatibilityError,
+} from '@/lib/mcps/leakage-drain'
 
 // ---------------------------------------------------------------------------
 // SSE stream — GET /api/tasks/:id/runs
@@ -153,7 +157,7 @@ export async function GET(
               id: run.id,
               runId: run.id,
               completedAt: run.completedAt,
-              errorMessage: run.errorMessage,
+              errorMessage: taskCompatibilityError(run.errorMessage),
               attemptNumber: run.attemptNumber,
               stage: run.stage,
               workPackageId: run.workPackageId,
@@ -175,25 +179,14 @@ export async function GET(
           .where(inArray(artifacts.agentRunId, runIds))
           .orderBy(asc(artifacts.createdAt))
 
+        const runById = new Map(runs.map((run) => [run.id, run]))
         for (const artifact of existingArtifacts) {
-          const protectedArchitectHistory = artifact.artifactType === 'adr_text'
-            && isRecord(artifact.metadata)
-            && artifact.metadata.historyAvailable === true
-          sendSnapshotEvent('artifact:created', protectedArchitectHistory
-            ? {
-                agentRunId: artifact.agentRunId,
-                historyAvailable: true,
-              }
-            : {
-                id: artifact.id,
-                artifactId: artifact.id,
-                agentRunId: artifact.agentRunId,
-                artifactType: artifact.artifactType,
-                content: artifact.content,
-                metadata: artifact.metadata,
-                createdAt: artifact.createdAt,
-                workPackageId: workPackageIdByRunId.get(artifact.agentRunId),
-              })
+          const compatibleArtifact = projectTaskCompatibilityArtifact(artifact, runById.get(artifact.agentRunId))
+          sendSnapshotEvent('artifact:created', {
+            ...compatibleArtifact,
+            artifactId: compatibleArtifact.id,
+            workPackageId: workPackageIdByRunId.get(artifact.agentRunId),
+          })
         }
 
         const existingQuestions = await db
@@ -294,8 +287,8 @@ export async function GET(
       let eventRedisConfiguration
       try {
         eventRedisConfiguration = taskEventRedisConfiguration()
-      } catch (error) {
-        console.error('[SSE /api/tasks/:id/runs] Invalid task-event Redis configuration', error)
+      } catch {
+        console.error('[SSE /api/tasks/:id/runs] Invalid task-event Redis configuration')
         cleanup()
         return
       }
@@ -311,19 +304,19 @@ export async function GET(
           if (!event) return
           if (replaying) buffered.push(event)
           else publishedQueue = publishedQueue.then(() => deliverPublished(event))
-        } catch (err) {
-          console.error('[SSE /api/tasks/:id/runs] Error processing message', err)
+        } catch {
+          console.error('[SSE /api/tasks/:id/runs] Error processing message')
         }
       })
-      sub.on('error', (err) => {
-        console.error('[SSE /api/tasks/:id/runs] Redis subscriber error', err)
+      sub.on('error', () => {
+        console.error('[SSE /api/tasks/:id/runs] Redis subscriber error')
         cleanup()
       })
 
       try {
         await sub.subscribe(eventRedisKeys.live)
-      } catch (err) {
-        console.error('[SSE /api/tasks/:id/runs] Failed to subscribe to Redis channel', err)
+      } catch {
+        console.error('[SSE /api/tasks/:id/runs] Failed to subscribe to Redis channel')
         cleanup()
         return
       }
@@ -339,8 +332,8 @@ export async function GET(
               lastDeliveredId = replayUpperBound
             }
           }
-        } catch (err) {
-          console.error('[SSE /api/tasks/:id/runs] Error replaying missed events', err)
+        } catch {
+          console.error('[SSE /api/tasks/:id/runs] Error replaying missed events')
         }
       } else {
         try {
@@ -349,8 +342,8 @@ export async function GET(
           if (Number.isSafeInteger(currentSequence) && currentSequence > 0) {
             lastDeliveredId = currentSequence
           }
-        } catch (err) {
-          console.error('[SSE /api/tasks/:id/runs] Error reading the event baseline', err)
+        } catch {
+          console.error('[SSE /api/tasks/:id/runs] Error reading the event baseline')
         }
       }
       replaying = false
@@ -359,9 +352,9 @@ export async function GET(
 
       try {
         await sendCurrentSnapshot()
-      } catch (err) {
+      } catch {
         if (!closed) {
-          console.error('[SSE /api/tasks/:id/runs] Error sending current snapshot', err)
+          console.error('[SSE /api/tasks/:id/runs] Error sending current snapshot')
         }
       }
       if (closed) return

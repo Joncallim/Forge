@@ -2,6 +2,7 @@ import { db } from '../db'
 import { taskAttempts } from '../db/schema'
 import { eq } from 'drizzle-orm'
 import { recordTaskLogBestEffort } from './task-logs'
+import { taskCompatibilityError } from '@/lib/mcps/leakage-drain'
 
 type QueueName = 'tasks' | 'approvals' | 'answers'
 type AttemptStatus = 'running' | 'completed' | 'failed' | 'dead_lettered'
@@ -115,7 +116,7 @@ export async function finishTaskAttempt({
       eventType: status === 'dead_lettered' ? 'queue.attempt.dead_lettered' : `queue.attempt.${status}`,
       level: statusLevel(status),
       message: errorMessage
-        ? `${worker.name} finished ${attempt.queueName} attempt ${attempt.attemptNumber} as ${status}: ${errorMessage}`
+        ? `${worker.name} finished ${attempt.queueName} attempt ${attempt.attemptNumber} as ${status}: ${taskCompatibilityError(errorMessage)}`
         : `${worker.name} finished ${attempt.queueName} attempt ${attempt.attemptNumber} as ${status}.`,
       metadata: {
         attemptNumber: attempt.attemptNumber,

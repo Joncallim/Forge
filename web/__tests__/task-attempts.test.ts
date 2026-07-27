@@ -58,12 +58,13 @@ describe('task attempt logs', () => {
   })
 
   it('keeps friendly worker context on finished attempts', async () => {
-    mocks.dbUpdate.mockReturnValueOnce(chain([{
+    const update = chain([{
       attemptNumber: 2,
       queueName: 'answers',
       taskId: 'task-1',
       workerId: 'embedded-20008-mr48e1f1',
-    }]))
+    }])
+    mocks.dbUpdate.mockReturnValueOnce(update)
 
     await finishTaskAttempt({
       attemptId: 'attempt-1',
@@ -71,9 +72,11 @@ describe('task attempt logs', () => {
       status: 'failed',
     })
 
+    expect(update.set).toHaveBeenCalledWith(expect.objectContaining({ errorMessage: 'replan failed' }))
+
     expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
       eventType: 'queue.attempt.failed',
-      message: 'Forge Answers Worker finished answers attempt 2 as failed: replan failed',
+      message: 'Forge Answers Worker finished answers attempt 2 as failed: legacy_task_log_unavailable',
       metadata: expect.objectContaining({
         workerName: 'Forge Answers Worker',
         workerRole: expect.stringContaining('follow-up questions'),

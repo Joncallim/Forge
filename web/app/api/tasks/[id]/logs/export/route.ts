@@ -90,7 +90,7 @@ export async function GET(
     if (unavailableMessage) {
       return NextResponse.json({ error: unavailableMessage }, { status: 503 })
     }
-    console.error('[GET /api/tasks/:id/logs/export] Unexpected error', err)
+    console.error('[GET /api/tasks/:id/logs/export] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

@@ -32,12 +32,15 @@ describe('task status updates', () => {
   })
 
   it('publishes when a non-terminal task is updated', async () => {
-    mocks.dbUpdate.mockReturnValueOnce(updateChain([{ id: 'task-1' }]))
+    const update = updateChain([{ id: 'task-1' }])
+    mocks.dbUpdate.mockReturnValueOnce(update)
 
     await expect(updateTaskStatus('task-1', 'failed', 'model failed')).resolves.toBe(true)
 
+    expect(update.set).toHaveBeenCalledWith(expect.objectContaining({ errorMessage: 'model failed' }))
+
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:status', expect.objectContaining({
-      errorMessage: 'model failed',
+      errorMessage: 'legacy_task_log_unavailable',
       status: 'failed',
     }))
   })
