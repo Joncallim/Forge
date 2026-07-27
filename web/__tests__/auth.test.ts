@@ -571,6 +571,8 @@ describe('getSession — write-behind logic', () => {
 
   afterEach(() => {
     vi.useRealTimers()
+    mockDbTransaction.mockReset()
+    mockDbTransaction.mockImplementation(async (callback: (tx: unknown) => unknown) => callback(transactionClient()))
   })
 
   it('writes cache entries inside a second locked transaction when lastSeenAt is recent', async () => {
@@ -818,7 +820,7 @@ describe('login/finish — clone detection', () => {
     mockDbUpdate.mockReturnValue(chain([]))
   })
 
-  it('does NOT return 403 when newCounter=0 and storedCounter=0 (counter-0 passkeys are exempt)', async () => {
+  it('creates a session when newCounter=0 and storedCounter=0 (counter-0 passkeys are exempt)', async () => {
     const storedCredential = {
       id: 'cred-row-id',
       credentialId: 'abc123',
@@ -832,6 +834,7 @@ describe('login/finish — clone detection', () => {
     mockDbSelect
       .mockReturnValueOnce(chain([storedCredential]))
       .mockReturnValueOnce(chain([user]))
+      .mockReturnValueOnce(chain([{ state: 'expansion' }]))
 
     mockVerifyAuthenticationResponse.mockResolvedValue({
       verified: true,
@@ -850,8 +853,9 @@ describe('login/finish — clone detection', () => {
     })
 
     const res = await POST(req as never)
-    // Counter-0 passkeys are exempt — must NOT be 403
-    expect(res.status).not.toBe(403)
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toEqual({ userId: 'user-1', displayName: 'Alice' })
+    expect(res.headers.get('set-cookie')).toMatch(/^forge_session=[0-9a-f-]{36};/)
   })
 
   it('returns 403 when newCounter < storedCounter and storedCounter > 0', async () => {
