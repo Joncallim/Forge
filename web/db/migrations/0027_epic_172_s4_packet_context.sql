@@ -733,8 +733,8 @@ REVOKE ALL ON FUNCTION forge.reject_project_root_reconciliation_write_context_mu
 REVOKE ALL ON FUNCTION forge.enter_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid) FROM PUBLIC;
 ALTER FUNCTION forge.assert_project_root_reconciliation_write_context_committed_v1() OWNER TO forge_s4_routines_owner;
 ALTER FUNCTION forge.reject_project_root_reconciliation_write_context_mutation_v1() OWNER TO forge_s4_routines_owner;
-ALTER FUNCTION forge.enter_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid) OWNER TO forge_s4_routines_owner;
 GRANT EXECUTE ON FUNCTION forge.enter_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid) TO forge_project_root_reconciler;
+ALTER FUNCTION forge.enter_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid) OWNER TO forge_s4_routines_owner;
 CREATE OR REPLACE FUNCTION forge.lock_project_root_reconciliation_authority_v1(p_operation_id uuid, p_actor_id uuid, p_generation bigint, p_project_id uuid)
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 BEGIN
@@ -746,8 +746,8 @@ BEGIN
   PERFORM 1 FROM public.filesystem_mcp_current_decision_pointers pointer_row JOIN public.work_packages package_row ON package_row.id=pointer_row.work_package_id JOIN public.tasks task_row ON task_row.id=package_row.task_id WHERE task_row.project_id=p_project_id ORDER BY pointer_row.work_package_id FOR UPDATE;
 END; $$;
 REVOKE ALL ON FUNCTION forge.lock_project_root_reconciliation_authority_v1(uuid,uuid,bigint,uuid) FROM PUBLIC;
-ALTER FUNCTION forge.lock_project_root_reconciliation_authority_v1(uuid,uuid,bigint,uuid) OWNER TO forge_s4_routines_owner;
 GRANT EXECUTE ON FUNCTION forge.lock_project_root_reconciliation_authority_v1(uuid,uuid,bigint,uuid) TO forge_project_root_reconciler;
+ALTER FUNCTION forge.lock_project_root_reconciliation_authority_v1(uuid,uuid,bigint,uuid) OWNER TO forge_s4_routines_owner;
 CREATE OR REPLACE FUNCTION forge.guard_project_root_reconciler_task_update_v1()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 BEGIN

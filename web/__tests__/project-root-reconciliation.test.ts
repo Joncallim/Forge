@@ -73,6 +73,7 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(migration).toContain('project-root task update has no active write context')
     expect(migration.indexOf('project_root_reconciliation_write_contexts_commit_v1')).toBeLessThan(migration.indexOf('ALTER TABLE public.project_root_reconciliation_write_contexts OWNER TO forge_s4_routines_owner'))
     expect(migration).toContain('ALTER FUNCTION forge.enter_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid) OWNER TO forge_s4_routines_owner')
+    expect(migration.indexOf('GRANT EXECUTE ON FUNCTION forge.enter_project_root_reconciliation_generation_v1')).toBeLessThan(migration.indexOf('ALTER FUNCTION forge.enter_project_root_reconciliation_generation_v1'))
   })
 
   it('uses the dedicated login with only canonical helper state columns and fixed routines', () => {
