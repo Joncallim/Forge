@@ -200,8 +200,12 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(rootAuthorityAssertions).toContain('root authority refresh package convergence is not canonical')
     expect(rootAuthorityAssertions).toContain('root authority recovery package convergence is not canonical')
     expect(rootAuthorityAssertions).toContain("'phases', package_row.metadata->'mcpGrantPhases'")
+    expect(rootAuthorityAssertions).toContain("'requirements', package_row.mcp_requirements")
     expect(rootAuthorityAssertions).toContain("'errorMessage', task_row.error_message")
     expect(rootAuthorityPackageFixture).toContain("'[]'::jsonb")
+    expect(rootAuthorityPackageFixture).toContain('"requirement":"required"')
+    expect(rootAuthorityPackageFixture).toContain('"assignedRole":"backend"')
+    expect(rootAuthorityPackageFixture).toContain('"fallback":{"action":"block","message":""}')
   })
 
   it('keeps the dedicated pre-reconciliation rollback proof bounded and resumable', () => {

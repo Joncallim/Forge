@@ -97,6 +97,7 @@ BEGIN
       'marker', package_row.metadata->'mcpGrantBlock',
       'peer', package_row.metadata->'fixturePeer',
       'phases', package_row.metadata->'mcpGrantPhases',
+      'requirements', package_row.mcp_requirements,
       'status', package_row.status
     ) INTO STRICT v_package_actual
     FROM public.work_packages package_row WHERE package_row.id = v_add;
@@ -120,6 +121,7 @@ BEGIN
       'marker', package_row.metadata->'mcpGrantBlock',
       'peer', package_row.metadata->'fixturePeer',
       'phases', package_row.metadata->'mcpGrantPhases',
+      'requirements', package_row.mcp_requirements,
       'status', package_row.status
     ) INTO STRICT v_package_actual
     FROM public.work_packages package_row WHERE package_row.id = v_refresh;
@@ -142,6 +144,7 @@ BEGIN
       'marker', package_row.metadata->'mcpGrantBlock',
       'peer', package_row.metadata->'fixturePeer',
       'phases', package_row.metadata->'mcpGrantPhases',
+      'requirements', package_row.mcp_requirements,
       'status', package_row.status
     ) INTO STRICT v_package_actual
     FROM public.work_packages package_row WHERE package_row.id = v_recover;
