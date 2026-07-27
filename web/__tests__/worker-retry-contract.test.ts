@@ -214,6 +214,17 @@ describe('answered-question retry contract', () => {
     )
   })
 
+  it('schedules session cache purges independently of blocked handoff recovery', () => {
+    const runtimeSource = fs.readFileSync(path.join(repoRoot, 'worker/runtime.ts'), 'utf8')
+
+    expect(runtimeSource).toContain('FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS')
+    expect(runtimeSource).toContain('const sweepSessionCachePurges')
+    expect(runtimeSource).toContain("import('../lib/session')")
+    expect(runtimeSource).toContain("void sweepSessionCachePurges({ startup: true })")
+    expect(runtimeSource).toContain('Session cache purge sweep failed')
+    expect(runtimeSource).toContain('clearInterval(sessionCachePurgeTimer)')
+  })
+
   it('restores answered rows and awaiting_answers status on retryable re-plan failure', async () => {
     const task = {
       id: 'task-answers',

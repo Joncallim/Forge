@@ -100,6 +100,14 @@ export const sessions = pgTable(
     credentialStorageVersion: integer('credential_storage_version').notNull().default(0),
     legacyRedisPurgePendingAt: timestamp('legacy_redis_purge_pending_at', tsOpts),
     legacyRedisInvalidatedAt: timestamp('legacy_redis_invalidated_at', tsOpts),
+    cachePurgePendingAt: timestamp('cache_purge_pending_at', tsOpts),
+    cachePurgeCredentialDigestV1: bytea('cache_purge_credential_digest_v1'),
+    cachePurgeGeneration: uuid('cache_purge_generation'),
+    cachePurgeClaimToken: uuid('cache_purge_claim_token'),
+    cachePurgeClaimExpiresAt: timestamp('cache_purge_claim_expires_at', tsOpts),
+    cachePurgeAttemptCount: integer('cache_purge_attempt_count').notNull().default(0),
+    cachePurgeNextAttemptAt: timestamp('cache_purge_next_attempt_at', tsOpts),
+    cachePurgeCompletedAt: timestamp('cache_purge_completed_at', tsOpts),
   },
   (t) => [
     index('sessions_user_id_idx').on(t.userId),
@@ -107,6 +115,35 @@ export const sessions = pgTable(
     uniqueIndex('sessions_credential_digest_v1_idx')
       .on(t.credentialDigestV1)
       .where(sql`${t.credentialDigestV1} is not null`),
+    index('sessions_cache_purge_due_idx')
+      .on(t.cachePurgeNextAttemptAt, t.cachePurgePendingAt, t.id)
+      .where(sql`${t.cachePurgePendingAt} is not null`),
+    check('sessions_cache_purge_state_chk', sql`
+      ${t.cachePurgeAttemptCount} >= 0
+      and (
+        (${t.cachePurgePendingAt} is null
+          and ${t.cachePurgeCredentialDigestV1} is null
+          and ${t.cachePurgeGeneration} is null
+          and ${t.cachePurgeClaimToken} is null
+          and ${t.cachePurgeClaimExpiresAt} is null
+          and ${t.cachePurgeNextAttemptAt} is null
+          and ${t.cachePurgeCompletedAt} is null)
+        or
+        (${t.cachePurgePendingAt} is not null
+          and ${t.cachePurgeCredentialDigestV1} is not null
+          and octet_length(${t.cachePurgeCredentialDigestV1}) = 32
+          and ${t.cachePurgeGeneration} is not null
+          and ${t.cachePurgeCompletedAt} is null)
+        or
+        (${t.cachePurgePendingAt} is null
+          and ${t.cachePurgeCredentialDigestV1} is null
+          and ${t.cachePurgeGeneration} is not null
+          and ${t.cachePurgeClaimToken} is null
+          and ${t.cachePurgeClaimExpiresAt} is null
+          and ${t.cachePurgeNextAttemptAt} is null
+          and ${t.cachePurgeCompletedAt} is not null)
+      )
+    `),
   ],
 )
 

@@ -316,6 +316,7 @@ async function main(): Promise<void> {
         }
         await tx`alter table sessions validate constraint sessions_credential_digest_v1_length_chk`
         await tx`alter table sessions validate constraint sessions_credential_storage_version_chk`
+        await tx`alter table sessions validate constraint sessions_cache_purge_state_chk`
         await tx`alter table sessions alter column credential_digest_v1 set not null`
         await tx`alter table sessions alter column expires_at set not null`
         await tx`

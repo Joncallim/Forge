@@ -8,6 +8,7 @@ const DEFAULT_MAX_ATTEMPTS = 3
 const DEFAULT_STUCK_JOB_RECOVERY_SECONDS = 15 * 60
 const DEFAULT_PROVIDER_HEALTH_INTERVAL_SECONDS = 5 * 60
 const DEFAULT_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS = 5 * 60
+const DEFAULT_SESSION_CACHE_PURGE_INTERVAL_SECONDS = 60
 
 type WorkerSource = 'standalone' | 'embedded'
 
@@ -120,12 +121,18 @@ async function startWorkerOnce(
     'FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS',
     DEFAULT_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS,
   )
+  const sessionCachePurgeIntervalSeconds = getNonNegativeIntegerEnv(
+    'FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS',
+    DEFAULT_SESSION_CACHE_PURGE_INTERVAL_SECONDS,
+  )
   const workerId = `${source}-${process.pid}-${Date.now().toString(36)}`
   let shuttingDown = false
   let providerHealthTimer: ReturnType<typeof setInterval> | null = null
   let providerHealthRunning = false
   let blockedHandoffSweepTimer: ReturnType<typeof setInterval> | null = null
   let blockedHandoffSweepRunning = false
+  let sessionCachePurgeTimer: ReturnType<typeof setInterval> | null = null
+  let sessionCachePurgeRunning = false
 
   const taskExists = async (taskId: string): Promise<boolean> => {
     const [row] = await db
@@ -225,6 +232,24 @@ async function startWorkerOnce(
     }
   }
 
+  // This maintenance path is deliberately independent of handoff/S4 recovery:
+  // a failed handoff sweep must never strand a revoked session cache key.
+  const sweepSessionCachePurges = async (options: { startup?: boolean } = {}): Promise<void> => {
+    if ((!options.startup && sessionCachePurgeIntervalSeconds === 0) || sessionCachePurgeRunning) return
+    sessionCachePurgeRunning = true
+    try {
+      const { reconcilePendingSessionCacheInvalidations } = await import('../lib/session')
+      const reconciled = await reconcilePendingSessionCacheInvalidations(100)
+      if (reconciled.claimed > 0) {
+        console.info('[worker] Reconciled revoked session caches', { ...reconciled, workerId })
+      }
+    } catch (err) {
+      console.warn('[worker] Session cache purge sweep failed', { err: errorMessage(err), workerId })
+    } finally {
+      sessionCachePurgeRunning = false
+    }
+  }
+
   const run = async (): Promise<void> => {
     const executionRequestFlag = defaultOnFeatureFlagState(process.env.FORGE_WORK_PACKAGE_EXECUTION)
     const executionMode = {
@@ -241,6 +266,7 @@ async function startWorkerOnce(
       hostRepositoryWritesRequested: hostWriteMode.requested,
       maxAttempts,
       providerHealthIntervalSeconds,
+      sessionCachePurgeIntervalSeconds,
       source,
       stuckJobRecoveryMs,
       workPackageExecutionEnabled: executionMode.enabled,
@@ -270,6 +296,13 @@ async function startWorkerOnce(
         blockedHandoffSweepTimer = setInterval(
           () => void sweepBlockedHandoffs(),
           blockedHandoffSweepIntervalSeconds * 1000,
+        )
+      }
+      void sweepSessionCachePurges({ startup: true })
+      if (sessionCachePurgeIntervalSeconds > 0) {
+        sessionCachePurgeTimer = setInterval(
+          () => void sweepSessionCachePurges(),
+          sessionCachePurgeIntervalSeconds * 1000,
         )
       }
 
@@ -568,6 +601,10 @@ async function startWorkerOnce(
       if (blockedHandoffSweepTimer !== null) {
         clearInterval(blockedHandoffSweepTimer)
         blockedHandoffSweepTimer = null
+      }
+      if (sessionCachePurgeTimer !== null) {
+        clearInterval(sessionCachePurgeTimer)
+        sessionCachePurgeTimer = null
       }
       taskQueue.disconnect()
       approvalQueue.disconnect()
