@@ -56,6 +56,9 @@ if [[ "$(redis-cli -u "${REDIS_URL}" exists 'session:orphan-migration-0027')" !=
 fi
 
 bash scripts/ci/reconcile-migration-0027-root-refs.sh
+if [[ "${FORGE_ROOT_INDEX_LIFECYCLE_PROOF:-0}" == '1' ]]; then
+  bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh
+fi
 npm run project-roots:build-concurrent-index -- --apply
 bash scripts/ci/cutover-migration-0027-root-ref.sh --apply
 psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 \
