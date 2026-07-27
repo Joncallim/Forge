@@ -52,6 +52,13 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(migration).toContain('project-root completion compare-and-set failed')
     expect(migration).toContain('project-root generation already has an immutable outcome')
     expect(migration).toContain('forge.materialize_project_root_ref_expansion_v1')
+    expect(migration).toContain('CREATE TABLE public.project_root_reconciliation_write_contexts')
+    expect(migration).toContain('backend_pid integer NOT NULL')
+    expect(migration).toContain('transaction_id bigint NOT NULL')
+    expect(migration).toContain('forge.enter_project_root_reconciliation_generation_v1')
+    expect(migration).toContain('project-root write context is absent or stale')
+    expect(migration).toContain('project_root_reconciliation_write_contexts_append_only_v1')
+    expect(migration).toContain('project-root write context is immutable outside fixed completion')
   })
 
   it('uses the dedicated login with only canonical helper state columns and fixed routines', () => {

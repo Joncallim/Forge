@@ -663,6 +663,51 @@ BEGIN
 END;
 $$;
 --> statement-breakpoint
+CREATE TABLE public.project_root_reconciliation_write_contexts (
+  operation_id uuid NOT NULL REFERENCES public.project_root_reconciliation_operations(operation_id) ON DELETE RESTRICT,
+  generation bigint NOT NULL REFERENCES public.project_root_change_journal(generation) ON DELETE RESTRICT,
+  actor_id uuid NOT NULL,
+  project_id uuid NOT NULL REFERENCES public.projects(id) ON DELETE RESTRICT,
+  backend_pid integer NOT NULL CHECK (backend_pid > 0),
+  transaction_id bigint NOT NULL CHECK (transaction_id > 0),
+  entered_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  completed_at timestamptz,
+  PRIMARY KEY (operation_id, generation),
+  UNIQUE (generation),
+  CONSTRAINT project_root_reconciliation_write_context_shape_chk CHECK ((completed_at IS NULL) OR completed_at >= entered_at)
+);
+CREATE OR REPLACE FUNCTION forge.enter_project_root_reconciliation_generation_v1(p_operation_id uuid, p_actor_id uuid, p_generation bigint, p_project_id uuid)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE v_operation public.project_root_reconciliation_operations%ROWTYPE; v_journal public.project_root_change_journal%ROWTYPE;
+BEGIN
+  PERFORM forge.assert_project_root_reconciler_v1();
+  SELECT * INTO STRICT v_operation FROM public.project_root_reconciliation_operations WHERE operation_id=p_operation_id FOR UPDATE;
+  SELECT * INTO STRICT v_journal FROM public.project_root_change_journal WHERE generation=p_generation FOR UPDATE;
+  PERFORM 1 FROM public.projects WHERE id=p_project_id FOR UPDATE;
+  IF v_operation.actor_id <> p_actor_id OR v_operation.state <> 'running' OR p_generation <> v_operation.last_processed_generation + 1 OR p_generation > v_operation.through_generation OR v_journal.project_id <> p_project_id OR EXISTS (SELECT 1 FROM public.project_root_reconciliation_outcomes WHERE generation=p_generation) THEN RAISE EXCEPTION 'project-root write context is not claimable' USING ERRCODE='42501'; END IF;
+  INSERT INTO public.project_root_reconciliation_write_contexts(operation_id,generation,actor_id,project_id,backend_pid,transaction_id)
+  VALUES(p_operation_id,p_generation,p_actor_id,p_project_id,pg_catalog.pg_backend_pid(),pg_catalog.txid_current());
+END; $$;
+ALTER TABLE public.project_root_reconciliation_write_contexts OWNER TO forge_s4_routines_owner;
+REVOKE ALL ON TABLE public.project_root_reconciliation_write_contexts FROM PUBLIC;
+CREATE OR REPLACE FUNCTION forge.reject_project_root_reconciliation_write_context_mutation_v1()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+BEGIN
+  IF TG_OP = 'DELETE' OR NEW.operation_id IS DISTINCT FROM OLD.operation_id
+     OR NEW.generation IS DISTINCT FROM OLD.generation OR NEW.actor_id IS DISTINCT FROM OLD.actor_id
+     OR NEW.project_id IS DISTINCT FROM OLD.project_id OR NEW.backend_pid IS DISTINCT FROM OLD.backend_pid
+     OR NEW.transaction_id IS DISTINCT FROM OLD.transaction_id OR NEW.entered_at IS DISTINCT FROM OLD.entered_at
+     OR OLD.completed_at IS NOT NULL OR NEW.completed_at IS NULL THEN
+    RAISE EXCEPTION 'project-root write context is immutable outside fixed completion' USING ERRCODE='55000';
+  END IF;
+  RETURN NEW;
+END; $$;
+CREATE TRIGGER project_root_reconciliation_write_contexts_append_only_v1
+BEFORE UPDATE OR DELETE ON public.project_root_reconciliation_write_contexts
+FOR EACH ROW EXECUTE FUNCTION forge.reject_project_root_reconciliation_write_context_mutation_v1();
+REVOKE ALL ON FUNCTION forge.reject_project_root_reconciliation_write_context_mutation_v1() FROM PUBLIC;
+REVOKE ALL ON FUNCTION forge.enter_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION forge.enter_project_root_reconciliation_generation_v1(uuid,uuid,bigint,uuid) TO forge_project_root_reconciler;
 CREATE OR REPLACE FUNCTION forge.complete_project_root_reconciliation_generation_v1(p_operation_id uuid, p_actor_id uuid, p_generation bigint, p_project_id uuid, p_outcome text)
 RETURNS TABLE(state text, last_processed_generation bigint)
 LANGUAGE plpgsql
@@ -672,6 +717,7 @@ AS $$
 DECLARE v_operation public.project_root_reconciliation_operations%ROWTYPE; v_journal public.project_root_change_journal%ROWTYPE;
 BEGIN
   PERFORM forge.assert_project_root_reconciler_v1();
+  IF NOT EXISTS (SELECT 1 FROM public.project_root_reconciliation_write_contexts context WHERE context.operation_id=p_operation_id AND context.generation=p_generation AND context.actor_id=p_actor_id AND context.project_id=p_project_id AND context.backend_pid=pg_catalog.pg_backend_pid() AND context.transaction_id=pg_catalog.txid_current() AND context.completed_at IS NULL) THEN RAISE EXCEPTION 'project-root write context is absent or stale' USING ERRCODE='42501'; END IF;
   SELECT * INTO STRICT v_operation FROM public.project_root_reconciliation_operations WHERE operation_id = p_operation_id;
   PERFORM forge.assert_project_root_journal_window_v1(v_operation.through_generation);
   SELECT * INTO STRICT v_operation FROM public.project_root_reconciliation_operations WHERE operation_id = p_operation_id FOR UPDATE;
@@ -700,6 +746,8 @@ BEGIN
   ) VALUES (v_operation.operation_id, v_operation.last_processed_generation, v_operation.actor_id,
     v_operation.through_generation, v_operation.last_processed_generation, v_operation.last_project_id,
     v_operation.batch_count, v_operation.cumulative_count, v_operation.state);
+  UPDATE public.project_root_reconciliation_write_contexts SET completed_at=pg_catalog.clock_timestamp()
+    WHERE operation_id=p_operation_id AND generation=p_generation AND backend_pid=pg_catalog.pg_backend_pid() AND transaction_id=pg_catalog.txid_current() AND completed_at IS NULL;
   RETURN QUERY SELECT v_operation.state, v_operation.last_processed_generation;
 END;
 $$;
