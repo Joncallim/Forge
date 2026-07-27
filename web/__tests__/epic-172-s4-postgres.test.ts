@@ -467,6 +467,60 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       expect(audit.count).toBe(0)
     }
 
+    // The open-only projection arm must not hide malformed question content once
+    // the authoritative append routine has advanced the opaque row to answered.
+    const answeredMalformedTask = randomUUID()
+    const answeredMalformedRun = randomUUID()
+    const answeredMalformedQuestion = randomUUID()
+    const answeredMalformedAnswer = randomUUID()
+    await admin`insert into tasks (id, project_id, submitted_by, title, prompt, status)
+      values (${answeredMalformedTask}::uuid, ${ids.project}::uuid, ${ids.user}::uuid, 'Answered malformed', 'protected', 'running')`
+    await admin`insert into agent_runs (id, task_id, agent_type, model_id_used, status)
+      values (${answeredMalformedRun}::uuid, ${answeredMalformedTask}::uuid, 'architect', 'test', 'completed')`
+    const answeredMalformedSource = await recordArchitectPlanVersion({
+      agentRunId: answeredMalformedRun,
+      digestKey: key,
+      digestKeyId: 's4-test-key',
+      planVersion: '1',
+      taskId: answeredMalformedTask,
+      entries: [{ agent: null, bindingFingerprint: null, content: 'body', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null },
+        { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' },
+        { agent: null, bindingFingerprint: null, content: JSON.stringify({ ...canonicalQuestion(answeredMalformedQuestion), suggestions: [7] }), entryId: `clarification_question:${answeredMalformedQuestion}`, entryKind: 'clarification_question', projectionEligible: false, requirementKey: null }],
+    })
+    await admin`insert into task_questions (id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status)
+      values (${answeredMalformedQuestion}::uuid, ${answeredMalformedTask}::uuid,
+        ${`clarification_question:${answeredMalformedQuestion}`}, ${answeredMalformedSource.artifactId}::uuid, 1, 'open')`
+    await appendArchitectClarificationAnswer({
+      answer: 'main',
+      answerId: answeredMalformedAnswer,
+      digestKey: key,
+      digestKeyId: 's4-test-key',
+      questionId: answeredMalformedQuestion,
+      sessionCredential,
+      sourcePlanArtifactId: answeredMalformedSource.artifactId,
+      sourcePlanVersion: '1',
+      taskId: answeredMalformedTask,
+    })
+    const [answeredMalformedProjection] = await admin<{
+      answerReferenceId: string | null
+      status: string
+    }[]>`select status, answer_reference_id::text as "answerReferenceId"
+      from task_questions where task_id = ${answeredMalformedTask}::uuid and id = ${answeredMalformedQuestion}::uuid`
+    const [answeredMalformedLedger] = await admin<{ count: number }[]>`
+      select count(*)::integer as count from architect_clarification_answers
+      where task_id = ${answeredMalformedTask}::uuid and id = ${answeredMalformedAnswer}::uuid
+    `
+    expect(answeredMalformedProjection).toEqual({ answerReferenceId: answeredMalformedAnswer, status: 'answered' })
+    expect(answeredMalformedLedger.count).toBe(1)
+    await expect(readArchitectPlanHistory({
+      planVersion: '1', sessionCredential, taskId: answeredMalformedTask,
+    })).rejects.toMatchObject({ code: 'invalid_evidence' })
+    const [answeredMalformedAudit] = await admin<{ count: number }[]>`
+      select count(*)::integer as count from architect_plan_history_reads
+      where task_id = ${answeredMalformedTask}::uuid
+    `
+    expect(answeredMalformedAudit.count).toBe(0)
+
     const runStatefulHistoryProof = async () => {
     const second = await recordArchitectPlanVersion({
       agentRunId: ids.secondArchitectRun, digestKey: key, digestKeyId: 's4-test-key',
