@@ -64,16 +64,20 @@ export function clarificationQuestionsFromHistory(
   entries: readonly ProtectedHistoryEntry[],
   current: readonly TaskQuestionSummary[],
 ): DisplayClarification[] {
-  const questions = entries.flatMap((entry) => {
-    if (entry.entryKind !== 'clarification_question') return []
+  const questions = new Map<string, { entry: ProtectedHistoryEntry; question: string; suggestions: string[] }>()
+  for (const entry of entries) {
+    if (entry.entryKind !== 'clarification_question') continue
     const content = clarificationContent(entry)
-    if (!content) return []
-    if (entry.entryId !== `clarification_question:${content.questionId}`) return []
+    if (!content) continue
+    if (entry.entryId !== `clarification_question:${content.questionId}`) continue
     const suggestions = Array.isArray(content.suggestions)
       ? content.suggestions.filter((value): value is string => typeof value === 'string').slice(0, 4)
       : []
-    return [{ entry, question: content.question as string, suggestions }]
-  })
+    if (questions.has(content.questionId as string)) {
+      throw new Error('Duplicate protected clarification question.')
+    }
+    questions.set(content.questionId as string, { entry, question: content.question as string, suggestions })
+  }
   const answers = new Map<string, string>()
   for (const entry of entries) {
     if (entry.entryKind !== 'clarification_answer') continue
@@ -86,7 +90,7 @@ export function clarificationQuestionsFromHistory(
   }
 
   const summaries = new Map(current.map((summary) => [summary.id, summary]))
-  return questions.flatMap(({ entry, question, suggestions }) => {
+  return [...questions.values()].flatMap(({ entry, question, suggestions }) => {
     const content = clarificationContent(entry)!
     const questionId = content.questionId as string
     const summary = summaries.get(questionId)

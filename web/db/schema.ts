@@ -1563,7 +1563,17 @@ export const architectPlanHistoryReads = pgTable(
     entrySetDigest: text('entry_set_digest').notNull(),
     readAt: timestamp('read_at', tsOpts).defaultNow().notNull(),
   },
-  (t) => [index('architect_plan_history_reads_task_version_idx').on(t.taskId, t.planVersion)],
+  (t) => [
+    index('architect_plan_history_reads_task_version_idx').on(t.taskId, t.planVersion),
+    check(
+      'architect_plan_history_reads_count_chk',
+      sql`${t.returnedEntryCount} between 0 and 256`,
+    ),
+    check(
+      'architect_plan_history_reads_digest_chk',
+      sql`${t.entrySetDigest} ~ '^(hmac-sha256|sha256):[0-9a-f]{64}$'`,
+    ),
+  ],
 )
 
 export const workPackageLocalRunEvidence = pgTable(

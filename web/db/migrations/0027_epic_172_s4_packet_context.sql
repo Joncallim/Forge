@@ -636,7 +636,12 @@ CREATE TABLE public.architect_plan_history_reads (
     REFERENCES public.architect_plan_versions(task_id, plan_version)
     ON UPDATE RESTRICT ON DELETE RESTRICT,
   CONSTRAINT architect_plan_history_reads_count_chk CHECK (returned_entry_count BETWEEN 0 AND 256),
-  CONSTRAINT architect_plan_history_reads_digest_chk CHECK (entry_set_digest ~ '^hmac-sha256:[0-9a-f]{64}$')
+  -- Architect plan reads attest a dynamic union of individually authenticated
+  -- row digests with an unkeyed SHA-256 set digest. MCP review reads retain
+  -- their existing immutable HMAC set digest in this shared audit table.
+  CONSTRAINT architect_plan_history_reads_digest_chk CHECK (
+    entry_set_digest ~ '^(hmac-sha256|sha256):[0-9a-f]{64}$'
+  )
 );
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION forge.reject_s4_retained_mutation_v1()
@@ -999,6 +1004,74 @@ DECLARE
   v_session public.sessions%ROWTYPE;
   v_version public.architect_plan_versions%ROWTYPE;
   v_request_id uuid := pg_catalog.gen_random_uuid();
+  v_returned_entry_count integer;
+  v_returned_set_digest text;
+  v_invalid_clarification boolean;
+  v_duplicate_entry_id boolean;
+  -- ECMAScript String.prototype.trim whitespace and line terminators. Keep
+  -- this explicit rather than relying on PostgreSQL regex locale semantics.
+  v_ecmascript_trim_characters text := pg_catalog.chr(9) || pg_catalog.chr(10)
+    || pg_catalog.chr(11) || pg_catalog.chr(12) || pg_catalog.chr(13)
+    || pg_catalog.chr(32) || pg_catalog.chr(160) || pg_catalog.chr(5760)
+    || pg_catalog.chr(8192) || pg_catalog.chr(8193) || pg_catalog.chr(8194)
+    || pg_catalog.chr(8195) || pg_catalog.chr(8196) || pg_catalog.chr(8197)
+    || pg_catalog.chr(8198) || pg_catalog.chr(8199) || pg_catalog.chr(8200)
+    || pg_catalog.chr(8201) || pg_catalog.chr(8202) || pg_catalog.chr(8232)
+    || pg_catalog.chr(8233) || pg_catalog.chr(8239) || pg_catalog.chr(8287)
+    || pg_catalog.chr(12288) || pg_catalog.chr(65279);
+  v_history_query text := $history$
+    WITH protected_entries AS (
+      -- The requested immutable plan supplies structural context only. The
+      -- clarification ledger is selected below through its source bindings,
+      -- rather than through carried-forward plan-entry snapshots.
+      SELECT plan_entry.entry_id, plan_entry.entry_kind, plan_entry.agent,
+        plan_entry.requirement_key, plan_entry.binding_fingerprint,
+        plan_entry.content, plan_entry.content_digest, plan_entry.digest_key_id,
+        plan_entry.projection_eligible
+      FROM public.architect_plan_entries plan_entry
+      WHERE plan_entry.task_id = $1
+        AND plan_entry.plan_version = $2
+        AND plan_entry.entry_kind IN ('plan_body','requirement','routing','overlay','subtask')
+      UNION ALL
+      SELECT question.entry_id, question.entry_kind, question.agent,
+        question.requirement_key, question.binding_fingerprint,
+        question.content, question.content_digest, question.digest_key_id,
+        question.projection_eligible
+      FROM public.task_questions projection
+      JOIN public.architect_plan_entries question ON question.task_id = projection.task_id
+        AND question.plan_artifact_id = projection.source_plan_artifact_id
+        AND question.plan_version = projection.source_plan_version
+        AND question.entry_id = projection.question_entry_id
+        AND question.entry_kind = 'clarification_question'
+      WHERE projection.task_id = $1
+        AND projection.source_plan_version <= $2
+        AND projection.question_entry_id = 'clarification_question:' || projection.id::text
+      UNION ALL
+      SELECT 'clarification_answer:' || answer.id::text, 'clarification_answer',
+        NULL::text, NULL::text, NULL::text,
+        pg_catalog.jsonb_build_object(
+          'schemaVersion', 1,
+          'questionId', answer.question_id,
+          'answerId', answer.id,
+          'question', question.content::jsonb->>'question',
+          'answer', answer.answer
+        )::text,
+        answer.content_digest, answer.digest_key_id, false
+      FROM public.architect_clarification_answers answer
+      JOIN public.task_questions projection ON projection.task_id = answer.task_id
+        AND projection.id = answer.question_id
+        AND projection.answer_reference_id = answer.id
+        AND projection.source_plan_artifact_id = answer.source_plan_artifact_id
+        AND projection.source_plan_version = answer.source_plan_version
+      JOIN public.architect_plan_entries question ON question.task_id = answer.task_id
+        AND question.plan_artifact_id = answer.source_plan_artifact_id
+        AND question.plan_version = answer.source_plan_version
+        AND question.entry_id = 'clarification_question:' || answer.question_id::text
+        AND question.entry_kind = 'clarification_question'
+      WHERE answer.task_id = $1
+        AND answer.source_plan_version <= $2
+    )
+  $history$;
 BEGIN
   IF session_user <> 'forge_architect_plan_history_reader' THEN
     RAISE EXCEPTION 'Architect plan history requires the dedicated reader login'
@@ -1029,24 +1102,16 @@ BEGIN
      OR pg_catalog.clock_timestamp() >= v_session.expires_at THEN
     RAISE EXCEPTION 'Session credential is revoked or expired' USING ERRCODE = '28000';
   END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM public.tasks task
-    WHERE task.id = p_task_id AND task.submitted_by = v_session.user_id
-    FOR KEY SHARE
-  ) THEN
+  PERFORM 1 FROM public.tasks task
+  WHERE task.id = p_task_id AND task.submitted_by = v_session.user_id
+  FOR KEY SHARE;
+  IF NOT FOUND THEN
     RAISE EXCEPTION 'Task history is not accessible to this session' USING ERRCODE = '42501';
   END IF;
   SELECT version_row.* INTO STRICT v_version
   FROM public.architect_plan_versions version_row
   WHERE version_row.task_id = p_task_id
     AND version_row.plan_version = p_plan_version;
-
-  INSERT INTO public.architect_plan_history_reads (
-    request_id, user_id, task_id, plan_version, returned_entry_count, entry_set_digest
-  ) VALUES (
-    v_request_id, v_session.user_id, p_task_id, p_plan_version,
-    v_version.entry_count, v_version.entry_set_digest
-  );
 
   -- Re-check against database time immediately before any protected history is
   -- returned. The first check does not authorize a response that crossed its
@@ -1063,42 +1128,163 @@ BEGIN
       USING ERRCODE = '28000';
   END IF;
 
-  -- The clarification subledger is created later in this unshipped migration.
-  -- Keep this query dynamic so the function can be installed before that table
-  -- exists, while every invocation sees the completed protected schema.
-  RETURN QUERY EXECUTE $history$
-    WITH protected_entries AS (
-      SELECT plan_entry.entry_id, plan_entry.entry_kind, plan_entry.agent,
-        plan_entry.requirement_key, plan_entry.binding_fingerprint,
-        plan_entry.content, plan_entry.content_digest, plan_entry.digest_key_id,
-        plan_entry.projection_eligible
-      FROM public.architect_plan_entries plan_entry
-      WHERE plan_entry.task_id = $1
-        AND plan_entry.plan_version = $2
-        AND plan_entry.entry_kind <> 'clarification_answer'
-      UNION ALL
-      SELECT 'clarification_answer:' || answer.id::text, 'clarification_answer',
-        NULL::text, NULL::text, NULL::text,
-        pg_catalog.jsonb_build_object(
-          'schemaVersion', 1,
-          'questionId', answer.question_id,
-          'answerId', answer.id,
-          'question', question.content::jsonb->>'question',
-          'answer', answer.answer
-        )::text,
-        answer.content_digest, answer.digest_key_id, false
+  -- Public rows are opaque source bindings, never a text fallback. Any broken
+  -- binding, malformed canonical question, or non-authoritative answer link
+  -- invalidates the whole response rather than silently dropping evidence.
+  EXECUTE $validation$
+    SELECT EXISTS (
+      SELECT 1
+      FROM public.task_questions projection
+      LEFT JOIN public.architect_plan_entries question ON question.task_id = projection.task_id
+        AND question.plan_artifact_id = projection.source_plan_artifact_id
+        AND question.plan_version = projection.source_plan_version
+        AND question.entry_id = projection.question_entry_id
+        AND question.entry_kind = 'clarification_question'
+      WHERE projection.task_id = $1
+        AND projection.status = 'open'
+        AND projection.source_plan_version <= $2
+        AND projection.source_plan_version IS NOT NULL
+        AND projection.question_entry_id IS NOT NULL
+        AND projection.source_plan_artifact_id IS NOT NULL
+        AND (
+          projection.question_entry_id <> 'clarification_question:' || projection.id::text
+          OR question.entry_id IS NULL
+          OR pg_catalog.jsonb_typeof(question.content::jsonb) IS DISTINCT FROM 'object'
+          OR (SELECT pg_catalog.count(*) FROM pg_catalog.jsonb_object_keys(question.content::jsonb)) IS DISTINCT FROM 4
+          OR question.content::jsonb->'schemaVersion' IS DISTINCT FROM '1'::jsonb
+          OR pg_catalog.jsonb_typeof(question.content::jsonb->'questionId') IS DISTINCT FROM 'string'
+          OR question.content::jsonb->>'questionId' IS DISTINCT FROM projection.id::text
+          OR pg_catalog.jsonb_typeof(question.content::jsonb->'question') IS DISTINCT FROM 'string'
+          OR CASE
+            WHEN pg_catalog.jsonb_typeof(question.content::jsonb->'question') = 'string' THEN
+              question.content::jsonb->>'question' IS DISTINCT FROM pg_catalog.btrim(question.content::jsonb->>'question', $3)
+              OR pg_catalog.btrim(question.content::jsonb->>'question', $3) = ''
+            ELSE true
+          END
+          -- CASE prevents jsonb_array_elements from evaluating malformed non-array JSON.
+          OR CASE
+            WHEN pg_catalog.jsonb_typeof(question.content::jsonb->'suggestions') = 'array' THEN
+              pg_catalog.jsonb_array_length(question.content::jsonb->'suggestions') > 4
+              OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.jsonb_array_elements(question.content::jsonb->'suggestions') AS suggestion(value)
+                WHERE pg_catalog.jsonb_typeof(suggestion.value) IS DISTINCT FROM 'string'
+                  OR suggestion.value #>> '{}' IS DISTINCT FROM pg_catalog.btrim(suggestion.value #>> '{}', $3)
+                  OR pg_catalog.btrim(suggestion.value #>> '{}', $3) = ''
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM (
+                  SELECT pg_catalog.btrim(suggestion.value #>> '{}', $3) AS normalized
+                  FROM pg_catalog.jsonb_array_elements(question.content::jsonb->'suggestions') AS suggestion(value)
+                ) AS normalized_suggestions
+                GROUP BY normalized_suggestions.normalized
+                HAVING pg_catalog.count(*) > 1
+              )
+            ELSE true
+          END
+        )
+    ) OR EXISTS (
+      SELECT 1
       FROM public.architect_clarification_answers answer
-      JOIN public.architect_plan_entries question ON question.task_id = answer.task_id
+      LEFT JOIN public.task_questions projection ON projection.task_id = answer.task_id
+        AND projection.id = answer.question_id
+        AND projection.answer_reference_id = answer.id
+        AND projection.source_plan_artifact_id = answer.source_plan_artifact_id
+        AND projection.source_plan_version = answer.source_plan_version
+      LEFT JOIN public.architect_plan_entries question ON question.task_id = answer.task_id
         AND question.plan_artifact_id = answer.source_plan_artifact_id
         AND question.plan_version = answer.source_plan_version
         AND question.entry_id = 'clarification_question:' || answer.question_id::text
         AND question.entry_kind = 'clarification_question'
       WHERE answer.task_id = $1
-        AND answer.source_plan_artifact_id = $3
-        AND answer.source_plan_version = $2
+        AND answer.source_plan_version <= $2
+        AND (projection.id IS NULL
+          OR projection.status IS DISTINCT FROM 'answered'
+          OR question.entry_id IS NULL
+          OR pg_catalog.jsonb_typeof(question.content::jsonb) IS DISTINCT FROM 'object'
+          OR (SELECT pg_catalog.count(*) FROM pg_catalog.jsonb_object_keys(question.content::jsonb)) IS DISTINCT FROM 4
+          OR question.content::jsonb->'schemaVersion' IS DISTINCT FROM '1'::jsonb
+          OR pg_catalog.jsonb_typeof(question.content::jsonb->'questionId') IS DISTINCT FROM 'string'
+          OR question.content::jsonb->>'questionId' IS DISTINCT FROM answer.question_id::text
+          OR pg_catalog.jsonb_typeof(question.content::jsonb->'question') IS DISTINCT FROM 'string'
+          OR CASE
+            WHEN pg_catalog.jsonb_typeof(question.content::jsonb->'question') = 'string' THEN
+              question.content::jsonb->>'question' IS DISTINCT FROM pg_catalog.btrim(question.content::jsonb->>'question', $3)
+              OR pg_catalog.btrim(question.content::jsonb->>'question', $3) = ''
+            ELSE true
+          END
+          -- CASE prevents jsonb_array_elements from evaluating malformed non-array JSON.
+          OR CASE
+            WHEN pg_catalog.jsonb_typeof(question.content::jsonb->'suggestions') = 'array' THEN
+              pg_catalog.jsonb_array_length(question.content::jsonb->'suggestions') > 4
+              OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.jsonb_array_elements(question.content::jsonb->'suggestions') AS suggestion(value)
+                WHERE pg_catalog.jsonb_typeof(suggestion.value) IS DISTINCT FROM 'string'
+                  OR suggestion.value #>> '{}' IS DISTINCT FROM pg_catalog.btrim(suggestion.value #>> '{}', $3)
+                  OR pg_catalog.btrim(suggestion.value #>> '{}', $3) = ''
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM (
+                  SELECT pg_catalog.btrim(suggestion.value #>> '{}', $3) AS normalized
+                  FROM pg_catalog.jsonb_array_elements(question.content::jsonb->'suggestions') AS suggestion(value)
+                ) AS normalized_suggestions
+                GROUP BY normalized_suggestions.normalized
+                HAVING pg_catalog.count(*) > 1
+              )
+            ELSE true
+          END)
+    ) OR EXISTS (
+      SELECT 1 FROM public.architect_clarification_answers answer
+      WHERE answer.task_id = $1 AND answer.source_plan_version <= $2
+      GROUP BY answer.question_id HAVING pg_catalog.count(*) > 1
     )
-    SELECT * FROM protected_entries ORDER BY entry_id LIMIT 256
-  $history$ USING p_task_id, p_plan_version, v_version.plan_artifact_id;
+  $validation$ INTO v_invalid_clarification USING p_task_id, p_plan_version, v_ecmascript_trim_characters;
+  IF v_invalid_clarification THEN
+    RAISE EXCEPTION 'Protected clarification history is malformed or inconsistent'
+      USING ERRCODE = '40001';
+  END IF;
+
+  EXECUTE v_history_query || $duplicates$
+    SELECT EXISTS (SELECT 1 FROM protected_entries GROUP BY entry_id HAVING pg_catalog.count(*) > 1)
+  $duplicates$ INTO v_duplicate_entry_id USING p_task_id, p_plan_version;
+  IF v_duplicate_entry_id THEN
+    RAISE EXCEPTION 'Protected Architect history contains duplicate entry identities' USING ERRCODE = '40001';
+  END IF;
+
+  -- The clarification subledger is created later in this unshipped migration.
+  -- Dynamic SQL keeps installation order valid while all invocations see the
+  -- complete protected schema. Count the complete set before auditing or
+  -- returning it: a LIMIT would make the audit attest a different response.
+  EXECUTE v_history_query || $count$
+    SELECT pg_catalog.count(*)::integer,
+      'sha256:' || pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+        '[' || COALESCE(pg_catalog.string_agg(
+          '{"contentDigest":' || pg_catalog.to_json(content_digest)::text
+            || ',"entryId":' || pg_catalog.to_json(entry_id)::text || '}',
+          ',' ORDER BY entry_id
+        ), '') || ']', 'UTF8'
+      )), 'hex')
+    FROM protected_entries
+  $count$ INTO v_returned_entry_count, v_returned_set_digest
+  USING p_task_id, p_plan_version;
+  IF v_returned_entry_count > 256 THEN
+    RAISE EXCEPTION 'Protected Architect history exceeds the 256 entry limit'
+      USING ERRCODE = '54000';
+  END IF;
+
+  INSERT INTO public.architect_plan_history_reads (
+    request_id, user_id, task_id, plan_version, returned_entry_count, entry_set_digest
+  ) VALUES (
+    v_request_id, v_session.user_id, p_task_id, p_plan_version,
+    v_returned_entry_count, v_returned_set_digest
+  );
+
+  RETURN QUERY EXECUTE v_history_query || $return$
+    SELECT * FROM protected_entries ORDER BY entry_id
+  $return$ USING p_task_id, p_plan_version;
 END;
 $$;
 --> statement-breakpoint

@@ -276,6 +276,46 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(s4Migration).toMatch(/RETURNS TABLE \(purpose text, source_kind text, task_id uuid/)
   })
 
+  it('audits the complete protected clarification history set without truncation', () => {
+    const historyReader = s4Migration.match(
+      /CREATE OR REPLACE FUNCTION forge\.read_architect_plan_history_v1\([\s\S]*?\n\$\$;/,
+    )?.[0] ?? ''
+    expect(historyReader).toContain("'sha256:' || pg_catalog.encode(pg_catalog.sha256")
+    expect(historyReader).toContain("entry_kind IN ('plan_body','requirement','routing','overlay','subtask')")
+    expect(historyReader).toContain('projection.source_plan_version <= $2')
+    expect(historyReader).toContain('answer.source_plan_version <= $2')
+    expect(historyReader).toContain('v_returned_entry_count > 256')
+    expect(historyReader).not.toMatch(/LIMIT\s+256/i)
+    expect(historyReader).not.toContain('pg_catalog.coalesce')
+    expect(s4Migration).toContain("entry_set_digest ~ '^(hmac-sha256|sha256):[0-9a-f]{64}$'")
+  })
+
+  it('rejects non-canonical protected clarification question text before auditing it', () => {
+    const historyReader = s4Migration.match(
+      /CREATE OR REPLACE FUNCTION forge\.read_architect_plan_history_v1\([\s\S]*?\n\$\$;/,
+    )?.[0] ?? ''
+
+    expect(historyReader).toBeDefined()
+    expect(historyReader).toContain("jsonb_array_length(question.content::jsonb->'suggestions') > 4")
+    expect(historyReader).toContain("jsonb_array_elements(question.content::jsonb->'suggestions')")
+    expect(historyReader).toContain("pg_catalog.jsonb_typeof(suggestion.value) IS DISTINCT FROM 'string'")
+    expect(historyReader).toContain('v_ecmascript_trim_characters text := pg_catalog.chr(9)')
+    expect(historyReader).toContain('pg_catalog.chr(5760)')
+    expect(historyReader).toContain('pg_catalog.chr(8192)')
+    expect(historyReader).toContain('pg_catalog.chr(8202)')
+    expect(historyReader).toContain('pg_catalog.chr(65279)')
+    expect(historyReader).toContain("suggestion.value #>> '{}' IS DISTINCT FROM pg_catalog.btrim(suggestion.value #>> '{}', $3)")
+    expect(historyReader).toContain('USING p_task_id, p_plan_version, v_ecmascript_trim_characters')
+    expect(historyReader).toContain("GROUP BY normalized_suggestions.normalized")
+    expect(historyReader).toContain("question.content::jsonb->>'question' IS DISTINCT FROM pg_catalog.btrim(question.content::jsonb->>'question', $3)")
+    expect(historyReader).toContain('CASE prevents jsonb_array_elements from evaluating malformed non-array JSON')
+    expect(historyReader).toContain("AND projection.status = 'open'")
+    expect(historyReader).toContain("OR projection.status IS DISTINCT FROM 'answered'")
+    const answerLinkedValidation = historyReader.slice(historyReader.indexOf('FROM public.architect_clarification_answers answer'))
+    expect(answerLinkedValidation).toContain("jsonb_array_length(question.content::jsonb->'suggestions') > 4")
+    expect(answerLinkedValidation).toContain("GROUP BY normalized_suggestions.normalized")
+  })
+
   it('exposes only atomic S4 lifecycle entry points to the packet issuer', () => {
     for (const helper of [
       'create_local_run_evidence_v1(uuid,uuid,integer)',

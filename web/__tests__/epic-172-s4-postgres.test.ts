@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import postgres from 'postgres'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import {
@@ -52,6 +52,10 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     legacyArchitectRun: randomUUID(),
     clarificationQuestion: randomUUID(),
     clarificationAnswer: randomUUID(),
+    secondArchitectRun: randomUUID(),
+    thirdArchitectRun: randomUUID(),
+    secondClarificationQuestion: randomUUID(),
+    secondClarificationAnswer: randomUUID(),
   }
   const key = randomBytes(32)
   const sessionCredential = randomUUID()
@@ -102,6 +106,8 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
           (${ids.replanRun}::uuid, ${ids.task}::uuid, null, 'architect', 'test', 'running'),
           (${ids.firstRun}::uuid, ${ids.task}::uuid, ${ids.package}::uuid, 'backend', 'test', 'running'),
           (${ids.secondRun}::uuid, ${ids.task}::uuid, ${ids.package}::uuid, 'backend', 'test', 'running')
+          ,(${ids.secondArchitectRun}::uuid, ${ids.task}::uuid, null, 'architect', 'test', 'completed')
+          ,(${ids.thirdArchitectRun}::uuid, ${ids.task}::uuid, null, 'architect', 'test', 'completed')
       `
       await tx`
         insert into filesystem_mcp_grant_approvals (
@@ -394,17 +400,342 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       content: 'Architect plan available in protected history',
       metadata: { schemaVersion: 1, stage: 'architect_plan', historyAvailable: true },
     })
-    await expect(readArchitectPlanHistory({
+    const firstHistory = await readArchitectPlanHistory({
       planVersion: '1', sessionCredential, taskId: ids.task,
-    })).resolves.toEqual(expect.arrayContaining([expect.objectContaining({
+    })
+    expect(firstHistory).toEqual(expect.arrayContaining([expect.objectContaining({
       entryId: 'subtask:000001:backend',
       content: expect.stringContaining('filesystem.project.read'),
     })]))
-    const [historyAudit] = await admin<{ reads: number }[]>`
-      select count(*)::integer as reads from architect_plan_history_reads
+    expect(firstHistory).toEqual(expect.arrayContaining([
+      expect.objectContaining({ entryId: `clarification_question:${ids.clarificationQuestion}` }),
+      expect.objectContaining({ entryId: `clarification_answer:${ids.clarificationAnswer}` }),
+    ]))
+    const [historyAudit] = await admin<{ reads: number; returnedEntryCount: number; entrySetDigest: string }[]>`
+      select count(*)::integer as reads,
+        max(returned_entry_count)::integer as "returnedEntryCount",
+        max(entry_set_digest) as "entrySetDigest"
+      from architect_plan_history_reads
       where task_id = ${ids.task}::uuid and user_id = ${ids.user}::uuid
     `
     expect(historyAudit.reads).toBe(1)
+    expect(historyAudit.returnedEntryCount).toBe(firstHistory.length)
+    expect(historyAudit.entrySetDigest).toMatch(/^sha256:[0-9a-f]{64}$/)
+    const canonicalQuestion = (questionId: string) => ({
+      schemaVersion: 1,
+      questionId,
+      question: 'Which branch?',
+      suggestions: ['main'],
+    })
+    const malformedQuestions: Array<{
+      name: string
+      payload: (questionId: string) => Record<string, unknown>
+    }> = [
+      { name: 'missing schemaVersion', payload: (questionId) => ({ questionId, question: 'Which branch?', suggestions: ['main'] }) },
+      { name: 'missing questionId', payload: () => ({ schemaVersion: 1, question: 'Which branch?', suggestions: ['main'] }) },
+      { name: 'missing question', payload: (questionId) => ({ schemaVersion: 1, questionId, suggestions: ['main'] }) },
+      { name: 'missing suggestions', payload: (questionId) => ({ schemaVersion: 1, questionId, question: 'Which branch?' }) },
+      { name: 'string schemaVersion', payload: (questionId) => ({ ...canonicalQuestion(questionId), schemaVersion: '1' }) },
+      { name: 'wrong numeric schemaVersion', payload: (questionId) => ({ ...canonicalQuestion(questionId), schemaVersion: 2 }) },
+      { name: 'non-string questionId', payload: (questionId) => ({ ...canonicalQuestion(questionId), questionId: 7 }) },
+      { name: 'mismatched questionId', payload: (questionId) => ({ ...canonicalQuestion(questionId), questionId: randomUUID() }) },
+      { name: 'non-string question', payload: (questionId) => ({ ...canonicalQuestion(questionId), question: 7 }) },
+      { name: 'empty question', payload: (questionId) => ({ ...canonicalQuestion(questionId), question: '' }) },
+      { name: 'untrimmed question', payload: (questionId) => ({ ...canonicalQuestion(questionId), question: ' Which branch? ' }) },
+      { name: 'tab-only question', payload: (questionId) => ({ ...canonicalQuestion(questionId), question: '\t' }) },
+      { name: 'newline-only question', payload: (questionId) => ({ ...canonicalQuestion(questionId), question: '\n' }) },
+      { name: 'tab-padded question', payload: (questionId) => ({ ...canonicalQuestion(questionId), question: '\tWhich branch?\t' }) },
+      { name: 'CRLF-padded question', payload: (questionId) => ({ ...canonicalQuestion(questionId), question: '\r\nWhich branch?\r\n' }) },
+      { name: 'NBSP-padded question', payload: (questionId) => ({ ...canonicalQuestion(questionId), question: '\u00a0Which branch?\u00a0' }) },
+      { name: 'non-array suggestions', payload: (questionId) => ({ ...canonicalQuestion(questionId), suggestions: 'main' }) },
+      { name: 'non-string suggestion', payload: (questionId) => ({ ...canonicalQuestion(questionId), suggestions: [7] }) },
+      { name: 'empty suggestion', payload: (questionId) => ({ ...canonicalQuestion(questionId), suggestions: [''] }) },
+      { name: 'untrimmed suggestion', payload: (questionId) => ({ ...canonicalQuestion(questionId), suggestions: [' main '] }) },
+      { name: 'tab-padded suggestion', payload: (questionId) => ({ ...canonicalQuestion(questionId), suggestions: ['\tmain\t'] }) },
+      { name: 'newline-padded suggestion', payload: (questionId) => ({ ...canonicalQuestion(questionId), suggestions: ['\nmain\n'] }) },
+      { name: 'BOM-padded suggestion', payload: (questionId) => ({ ...canonicalQuestion(questionId), suggestions: ['\uFEFFmain\uFEFF'] }) },
+      { name: 'duplicate suggestions', payload: (questionId) => ({ ...canonicalQuestion(questionId), suggestions: ['main', 'main'] }) },
+      { name: 'too many suggestions', payload: (questionId) => ({ ...canonicalQuestion(questionId), suggestions: ['one', 'two', 'three', 'four', 'five'] }) },
+      { name: 'extra key', payload: (questionId) => ({ ...canonicalQuestion(questionId), extra: true }) },
+    ]
+    for (const { name, payload } of malformedQuestions) {
+      const taskId = randomUUID(); const runId = randomUUID(); const questionId = randomUUID()
+      await admin`insert into tasks (id, project_id, submitted_by, title, prompt, status)
+        values (${taskId}::uuid, ${ids.project}::uuid, ${ids.user}::uuid, ${`Malformed: ${name}`}, 'protected', 'running')`
+      await admin`insert into agent_runs (id, task_id, agent_type, model_id_used, status)
+        values (${runId}::uuid, ${taskId}::uuid, 'architect', 'test', 'completed')`
+      const source = await recordArchitectPlanVersion({ agentRunId: runId, digestKey: key, digestKeyId: 's4-test-key', planVersion: '1', taskId,
+        entries: [{ agent: null, bindingFingerprint: null, content: 'body', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null },
+          { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' },
+          { agent: null, bindingFingerprint: null, content: JSON.stringify(payload(questionId)), entryId: `clarification_question:${questionId}`, entryKind: 'clarification_question', projectionEligible: false, requirementKey: null }] })
+      await admin`insert into task_questions (id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status)
+        values (${questionId}::uuid, ${taskId}::uuid, ${`clarification_question:${questionId}`}, ${source.artifactId}::uuid, 1, 'open')`
+      await expect(readArchitectPlanHistory({ planVersion: '1', sessionCredential, taskId })).rejects.toMatchObject({ code: 'invalid_evidence' })
+      const [audit] = await admin<{ count: number }[]>`select count(*)::integer as count from architect_plan_history_reads where task_id = ${taskId}::uuid`
+      expect(audit.count).toBe(0)
+    }
+
+    // The open-only projection arm must not hide malformed question content once
+    // the authoritative append routine has advanced the opaque row to answered.
+    for (const { name, suggestions } of [
+      { name: 'non-string suggestion', suggestions: [7] },
+      { name: 'tab-padded suggestion', suggestions: ['\tmain\t'] },
+      { name: 'newline-padded suggestion', suggestions: ['\nmain\n'] },
+    ]) {
+      const answeredMalformedTask = randomUUID()
+      const answeredMalformedRun = randomUUID()
+      const answeredMalformedQuestion = randomUUID()
+      const answeredMalformedAnswer = randomUUID()
+      await admin`insert into tasks (id, project_id, submitted_by, title, prompt, status)
+        values (${answeredMalformedTask}::uuid, ${ids.project}::uuid, ${ids.user}::uuid, ${`Answered malformed: ${name}`}, 'protected', 'running')`
+      await admin`insert into agent_runs (id, task_id, agent_type, model_id_used, status)
+        values (${answeredMalformedRun}::uuid, ${answeredMalformedTask}::uuid, 'architect', 'test', 'completed')`
+      const answeredMalformedSource = await recordArchitectPlanVersion({
+        agentRunId: answeredMalformedRun,
+        digestKey: key,
+        digestKeyId: 's4-test-key',
+        planVersion: '1',
+        taskId: answeredMalformedTask,
+        entries: [{ agent: null, bindingFingerprint: null, content: 'body', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null },
+          { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' },
+          { agent: null, bindingFingerprint: null, content: JSON.stringify({ ...canonicalQuestion(answeredMalformedQuestion), suggestions }), entryId: `clarification_question:${answeredMalformedQuestion}`, entryKind: 'clarification_question', projectionEligible: false, requirementKey: null }],
+      })
+      await admin`insert into task_questions (id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status)
+        values (${answeredMalformedQuestion}::uuid, ${answeredMalformedTask}::uuid,
+          ${`clarification_question:${answeredMalformedQuestion}`}, ${answeredMalformedSource.artifactId}::uuid, 1, 'open')`
+      await appendArchitectClarificationAnswer({
+        answer: 'main',
+        answerId: answeredMalformedAnswer,
+        digestKey: key,
+        digestKeyId: 's4-test-key',
+        questionId: answeredMalformedQuestion,
+        sessionCredential,
+        sourcePlanArtifactId: answeredMalformedSource.artifactId,
+        sourcePlanVersion: '1',
+        taskId: answeredMalformedTask,
+      })
+      const [answeredMalformedProjection] = await admin<{
+        answerReferenceId: string | null
+        status: string
+      }[]>`select status, answer_reference_id::text as "answerReferenceId"
+        from task_questions where task_id = ${answeredMalformedTask}::uuid and id = ${answeredMalformedQuestion}::uuid`
+      const [answeredMalformedLedger] = await admin<{ count: number }[]>`
+        select count(*)::integer as count from architect_clarification_answers
+        where task_id = ${answeredMalformedTask}::uuid and id = ${answeredMalformedAnswer}::uuid
+      `
+      expect(answeredMalformedProjection).toEqual({ answerReferenceId: answeredMalformedAnswer, status: 'answered' })
+      expect(answeredMalformedLedger.count).toBe(1)
+      await expect(readArchitectPlanHistory({
+        planVersion: '1', sessionCredential, taskId: answeredMalformedTask,
+      })).rejects.toMatchObject({ code: 'invalid_evidence' })
+      const [answeredMalformedAudit] = await admin<{ count: number }[]>`
+        select count(*)::integer as count from architect_plan_history_reads
+        where task_id = ${answeredMalformedTask}::uuid
+      `
+      expect(answeredMalformedAudit.count).toBe(0)
+    }
+
+    const runStatefulHistoryProof = async () => {
+    const second = await recordArchitectPlanVersion({
+      agentRunId: ids.secondArchitectRun, digestKey: key, digestKeyId: 's4-test-key',
+      planVersion: '2', taskId: ids.task,
+      entries: [{ agent: null, bindingFingerprint: null, content: 'Second protected plan.',
+        entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null }, {
+        agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }),
+        entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' }, {
+        agent: null, bindingFingerprint: null, entryId: `clarification_question:${ids.secondClarificationQuestion}`,
+        entryKind: 'clarification_question', projectionEligible: false, requirementKey: null,
+        content: JSON.stringify({ schemaVersion: 1, questionId: ids.secondClarificationQuestion,
+          question: 'Which environment?', suggestions: ['staging'] }) }],
+    })
+    const duplicateTask = randomUUID(); const duplicateRun1 = randomUUID(); const duplicateRun2 = randomUUID(); const duplicateQuestion = randomUUID()
+    await admin`insert into tasks (id, project_id, submitted_by, title, prompt, status) values (${duplicateTask}::uuid, ${ids.project}::uuid, ${ids.user}::uuid, 'Duplicate', 'protected', 'running')`
+    await admin`insert into agent_runs (id, task_id, agent_type, model_id_used, status) values
+      (${duplicateRun1}::uuid, ${duplicateTask}::uuid, 'architect', 'test', 'completed'), (${duplicateRun2}::uuid, ${duplicateTask}::uuid, 'architect', 'test', 'completed')`
+    const duplicateV1 = await recordArchitectPlanVersion({ agentRunId: duplicateRun1, digestKey: key, digestKeyId: 's4-test-key', planVersion: '1', taskId: duplicateTask, entries: [
+      { agent: null, bindingFingerprint: null, content: 'body', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null },
+      { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' },
+      { agent: null, bindingFingerprint: null, content: JSON.stringify({ schemaVersion: 1, questionId: duplicateQuestion, question: 'Q?', suggestions: [] }), entryId: `clarification_question:${duplicateQuestion}`, entryKind: 'clarification_question', projectionEligible: false, requirementKey: null }] })
+    await admin`insert into task_questions (id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status) values (${duplicateQuestion}::uuid, ${duplicateTask}::uuid, ${`clarification_question:${duplicateQuestion}`}, ${duplicateV1.artifactId}::uuid, 1, 'open')`
+    const duplicateWriter = postgres(writerUrl!, { max: 1, onnotice: () => {} })
+    try {
+      const artifactId = randomUUID(); const digest = `hmac-sha256:${'c'.repeat(64)}`
+      await duplicateWriter`select forge.insert_architect_plan_version_v1(
+        ${duplicateRun2}::uuid, ${artifactId}::uuid, 2::bigint, 's4-test-key', ${digest}, ${digest},
+        ${['plan_body:000000', 'requirement:plan-policy', `clarification_question:${duplicateQuestion}`]}::text[],
+        ${['plan_body', 'requirement', 'subtask']}::text[],
+        ${[null, null, null]}::text[], ${[null, 'plan-policy', null]}::text[], ${[null, null, null]}::text[],
+        ${['body', JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), '{"schemaVersion":1}']}::text[],
+        ${[digest, digest, digest]}::text[], ${['false', 'false', 'false']}::text[]
+      )`
+    } finally { await duplicateWriter.end({ timeout: 5 }) }
+    const [duplicateIdentity] = await admin<{ count: number }[]>`
+      select count(*)::integer as count from architect_plan_entries
+      where task_id = ${duplicateTask}::uuid and entry_id = ${`clarification_question:${duplicateQuestion}`}
+        and plan_version in (1, 2)
+    `
+    expect(duplicateIdentity.count).toBe(2)
+    const [auditBeforeDuplicate] = await admin<{ count: number }[]>`select count(*)::integer as count from architect_plan_history_reads where task_id = ${duplicateTask}::uuid`
+    await expect(readArchitectPlanHistory({ planVersion: '2', sessionCredential, taskId: duplicateTask })).rejects.toMatchObject({ code: 'invalid_evidence' })
+    const [auditAfterDuplicate] = await admin<{ count: number }[]>`select count(*)::integer as count from architect_plan_history_reads where task_id = ${duplicateTask}::uuid`
+    expect(auditAfterDuplicate.count).toBe(auditBeforeDuplicate.count)
+    await admin`
+      insert into task_questions (id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status)
+      values (${ids.secondClarificationQuestion}::uuid, ${ids.task}::uuid,
+        ${`clarification_question:${ids.secondClarificationQuestion}`}, ${second.artifactId}::uuid, 2, 'open')
+    `
+    await appendArchitectClarificationAnswer({ answer: 'staging', answerId: ids.secondClarificationAnswer,
+      digestKey: key, digestKeyId: 's4-test-key', questionId: ids.secondClarificationQuestion,
+      sessionCredential, sourcePlanArtifactId: second.artifactId, sourcePlanVersion: '2', taskId: ids.task })
+    await recordArchitectPlanVersion({
+      agentRunId: ids.thirdArchitectRun, digestKey: key, digestKeyId: 's4-test-key',
+      planVersion: '3', taskId: ids.task,
+      entries: [{ agent: null, bindingFingerprint: null, content: 'Third protected plan.',
+        entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null },
+      { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' }],
+    })
+    const latestHistory = await readArchitectPlanHistory({ planVersion: '3', sessionCredential, taskId: ids.task })
+    expect(latestHistory.map((entry) => entry.entryId)).toEqual([
+      `clarification_answer:${ids.clarificationAnswer}`,
+      `clarification_answer:${ids.secondClarificationAnswer}`,
+      `clarification_question:${ids.clarificationQuestion}`,
+      `clarification_question:${ids.secondClarificationQuestion}`,
+      'plan_body:000000',
+      'requirement:plan-policy',
+    ].sort((left, right) => left.localeCompare(right, 'en')))
+    const [latestAudit] = await admin<{ returnedEntryCount: number; entrySetDigest: string }[]>`
+      select returned_entry_count::integer as "returnedEntryCount", entry_set_digest as "entrySetDigest"
+      from architect_plan_history_reads where task_id = ${ids.task}::uuid and plan_version = 3
+      order by read_at desc limit 1
+    `
+    // canonicalArchitectPlanJson sorts object keys; PostgreSQL jsonb emits the
+    // same canonical object order. Keep this literal byte representation in
+    // the proof so an ordering or whitespace drift is diagnosable.
+    const canonicalSet = latestHistory.map(({ entryId, contentDigest }) => ({ contentDigest, entryId }))
+    const canonicalSerialized = JSON.stringify(canonicalSet)
+    expect(canonicalSerialized).toMatch(/^\[{"contentDigest":"hmac-sha256:[0-9a-f]{64}","entryId":"clarification_answer:/)
+    expect(latestAudit.returnedEntryCount).toBe(6)
+    expect(latestAudit.entrySetDigest).toBe(`sha256:${createHash('sha256').update(canonicalSerialized).digest('hex')}`)
+    const lockRun = randomUUID()
+    const lockQuestion = randomUUID()
+    await admin`insert into agent_runs (id, task_id, agent_type, model_id_used, status) values (${lockRun}::uuid, ${ids.task}::uuid, 'architect', 'test', 'completed')`
+    const lockPlan = await recordArchitectPlanVersion({ agentRunId: lockRun, digestKey: key, digestKeyId: 's4-test-key', planVersion: '4', taskId: ids.task,
+      entries: [{ agent: null, bindingFingerprint: null, content: 'Lock source.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null }, { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' }, {
+        agent: null, bindingFingerprint: null, entryId: `clarification_question:${lockQuestion}`, entryKind: 'clarification_question', projectionEligible: false, requirementKey: null,
+        content: JSON.stringify({ schemaVersion: 1, questionId: lockQuestion, question: 'Lock?', suggestions: ['yes'] }) }] })
+    await admin`insert into task_questions (id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status)
+      values (${lockQuestion}::uuid, ${ids.task}::uuid, ${`clarification_question:${lockQuestion}`}, ${lockPlan.artifactId}::uuid, 4, 'open')`
+    const appName = `pr198-history-append-${randomUUID()}`
+    const lockAnswer = randomUUID()
+    const appendCredential = randomUUID()
+    await admin`insert into sessions (id, user_id, credential_digest_v1, expires_at, credential_storage_version)
+      values (${randomUUID()}::uuid, ${ids.user}::uuid, ${computeCredentialDigest(appendCredential).digest}::bytea,
+        clock_timestamp() + interval '7 days', 2)`
+    const appendUrl = new URL(historyReaderUrl!)
+    appendUrl.searchParams.set('application_name', appName)
+    const savedHistoryUrl = process.env.FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL
+    const directReader = postgres(historyReaderUrl!, { max: 1, onnotice: () => {} })
+    let appendPromise: Promise<{ answerId: string; allAnswered: boolean }> | null = null
+    let appendSettled = false
+    let readerPid = 0
+    let lockedRows: Array<{ entry_id: string; content_digest: string }> = []
+    try {
+      process.env.FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL = appendUrl.toString()
+      await directReader.begin(async (tx) => {
+        const [reader] = await tx<{ pid: number }[]>`select pg_backend_pid()::integer as pid`
+        readerPid = reader.pid
+        const credentialBytes = Buffer.from(sessionCredential, 'ascii')
+        try {
+          lockedRows = await tx<{ entry_id: string; content_digest: string }[]>`
+            select entry_id, content_digest from forge.read_architect_plan_history_v1(
+              ${credentialBytes}::bytea, ${ids.task}::uuid, 4::bigint
+            )
+          `
+        } finally { credentialBytes.fill(0) }
+        appendPromise = appendArchitectClarificationAnswer({ answer: 'yes', answerId: lockAnswer, digestKey: key, digestKeyId: 's4-test-key', questionId: lockQuestion,
+          sessionCredential: appendCredential, sourcePlanArtifactId: lockPlan.artifactId, sourcePlanVersion: '4', taskId: ids.task })
+          .finally(() => { appendSettled = true })
+        let waiting: { pid: number; state: string; waitEvent: string | null } | undefined
+        for (let attempt = 0; attempt < 40 && !waiting; attempt += 1) {
+          const [row] = await admin<{ pid: number; state: string; waitEvent: string | null; waitEventType: string | null; blockingPids: number[] }[]>`
+            select pid, state, wait_event as "waitEvent", wait_event_type as "waitEventType",
+              pg_blocking_pids(pid) as "blockingPids"
+            from pg_stat_activity where application_name = ${appName}
+          `
+          if (row?.waitEventType === 'Lock' && row.blockingPids.includes(readerPid)) waiting = row
+          else await new Promise((resolve) => setTimeout(resolve, 50))
+        }
+        expect(waiting).toEqual(expect.objectContaining({ state: expect.any(String), waitEvent: expect.anything() }))
+        expect(appendSettled).toBe(false)
+      })
+      await expect(Promise.race([
+        appendPromise!,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('append did not finish after reader commit')), 5_000)),
+      ])).resolves.toMatchObject({ allAnswered: true })
+    } finally {
+      if (savedHistoryUrl === undefined) delete process.env.FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL
+      else process.env.FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL = savedHistoryUrl
+      await directReader.end({ timeout: 5 })
+    }
+    expect(lockedRows.some((row) => row.entry_id === `clarification_answer:${lockAnswer}`)).toBe(false)
+    const [lockedAudit] = await admin<{ returnedEntryCount: number; entrySetDigest: string }[]>`
+      select returned_entry_count::integer as "returnedEntryCount", entry_set_digest as "entrySetDigest"
+      from architect_plan_history_reads where task_id = ${ids.task}::uuid and plan_version = 4
+      order by read_at desc limit 1
+    `
+    const lockedSet = lockedRows.map((row) => ({ contentDigest: row.content_digest, entryId: row.entry_id }))
+    const lockedSerialized = JSON.stringify(lockedSet)
+    expect(lockedAudit.returnedEntryCount).toBe(lockedRows.length)
+    expect(lockedAudit.entrySetDigest).toBe(`sha256:${createHash('sha256').update(lockedSerialized).digest('hex')}`)
+    // Dedicated exact-boundary fixture: 128 questions + 126 answers + two V2 structural rows.
+    const boundaryTask = randomUUID()
+    const overrunRun = randomUUID()
+    const overrunReadRun = randomUUID()
+    await admin`insert into tasks (id, project_id, submitted_by, title, prompt, status)
+      values (${boundaryTask}::uuid, ${ids.project}::uuid, ${ids.user}::uuid, 'Boundary', 'protected', 'running')`
+    await admin`insert into agent_runs (id, task_id, agent_type, model_id_used, status) values
+      (${overrunRun}::uuid, ${boundaryTask}::uuid, 'architect', 'test', 'completed'),
+      (${overrunReadRun}::uuid, ${boundaryTask}::uuid, 'architect', 'test', 'completed')`
+    const overrunQuestions = Array.from({ length: 128 }, () => randomUUID())
+    const overrunPlan = await recordArchitectPlanVersion({
+      agentRunId: overrunRun, digestKey: key, digestKeyId: 's4-test-key', planVersion: '1', taskId: boundaryTask,
+      entries: [{ agent: null, bindingFingerprint: null, content: 'Overrun source.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null }, { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' },
+        ...overrunQuestions.map((questionId) => ({ agent: null, bindingFingerprint: null,
+          content: JSON.stringify({ schemaVersion: 1, questionId, question: 'Bounded?', suggestions: ['yes'] }),
+          entryId: `clarification_question:${questionId}`, entryKind: 'clarification_question' as const,
+          projectionEligible: false, requirementKey: null }))],
+    })
+    for (const questionId of overrunQuestions) {
+      await admin`insert into task_questions (id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status)
+        values (${questionId}::uuid, ${boundaryTask}::uuid, ${`clarification_question:${questionId}`}, ${overrunPlan.artifactId}::uuid, 1, 'open')`
+      if (overrunQuestions.indexOf(questionId) >= 126) continue
+      await appendArchitectClarificationAnswer({ answer: 'yes', answerId: randomUUID(), digestKey: key,
+        digestKeyId: 's4-test-key', questionId, sessionCredential, sourcePlanArtifactId: overrunPlan.artifactId,
+        sourcePlanVersion: '1', taskId: boundaryTask })
+    }
+    const boundaryV2 = await recordArchitectPlanVersion({ agentRunId: overrunReadRun, digestKey: key, digestKeyId: 's4-test-key', planVersion: '2', taskId: boundaryTask,
+      entries: [{ agent: null, bindingFingerprint: null, content: 'Overrun read.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null }, { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' }] })
+    void boundaryV2
+    const [boundaryCount] = await admin<{ count: number }[]>`select (2 + count(*) filter (where true) + (select count(*) from architect_clarification_answers where task_id = ${boundaryTask}::uuid))::integer as count from task_questions where task_id = ${boundaryTask}::uuid`
+    expect(boundaryCount.count).toBe(256)
+    const boundaryHistory = await readArchitectPlanHistory({ planVersion: '2', sessionCredential, taskId: boundaryTask })
+    expect(boundaryHistory).toHaveLength(256)
+    const [boundaryAudit] = await admin<{ count: number; returnedEntryCount: number; entrySetDigest: string }[]>`
+      select count(*)::integer as count, max(returned_entry_count)::integer as "returnedEntryCount", max(entry_set_digest) as "entrySetDigest"
+      from architect_plan_history_reads where task_id = ${boundaryTask}::uuid`
+    const boundarySerialized = JSON.stringify(boundaryHistory.map(({ entryId, contentDigest }) => ({ contentDigest, entryId })))
+    expect(boundaryAudit.count).toBe(1)
+    expect(boundaryAudit.returnedEntryCount).toBe(256)
+    expect(boundaryAudit.entrySetDigest).toBe(`sha256:${createHash('sha256').update(boundarySerialized).digest('hex')}`)
+    await appendArchitectClarificationAnswer({ answer: 'yes', answerId: randomUUID(), digestKey: key,
+      digestKeyId: 's4-test-key', questionId: overrunQuestions[126], sessionCredential,
+      sourcePlanArtifactId: overrunPlan.artifactId, sourcePlanVersion: '1', taskId: boundaryTask })
+    const [overBoundaryCount] = await admin<{ count: number }[]>`select (2 + count(*) + (select count(*) from architect_clarification_answers where task_id = ${boundaryTask}::uuid))::integer as count from task_questions where task_id = ${boundaryTask}::uuid`
+    expect(overBoundaryCount.count).toBe(257)
+    await expect(readArchitectPlanHistory({ planVersion: '2', sessionCredential, taskId: boundaryTask })).rejects.toMatchObject({ code: 'invalid_evidence' })
+    const [boundaryAuditAfter] = await admin<{ count: number }[]>`select count(*)::integer as count from architect_plan_history_reads where task_id = ${boundaryTask}::uuid`
+    expect(boundaryAuditAfter.count).toBe(1)
+    }
     const packageEntry = recorded.entries.find((entry) => entry.entryKind === 'subtask')!
     const reference = executableReferenceForEntry(packageEntry)
     const [bound] = await issuer<{ referenceId: string }[]>`
@@ -493,6 +824,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       digestKey: key,
       referenceId: answerReferenceId,
     })).rejects.toMatchObject({ code: 'invalid_evidence' })
+    await runStatefulHistoryProof()
   })
 
   it('resume-safely rekeys a crash-window legacy session and leaves no raw-id lookup target', async () => {
