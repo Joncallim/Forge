@@ -6,7 +6,10 @@ import {
 } from '@/lib/mcps/leakage-drain'
 import {
   containsForbiddenV2EventData,
+  compareCanonicalCodeUnits,
+  LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY,
   legacyLeakageRowFingerprint,
+  legacyLeakageSentinelSetFingerprint,
   projectV2TaskEventData,
   runLegacyLeakageScrub,
   type LegacyLeakageScrubCheckpoint,
@@ -18,10 +21,37 @@ import {
 } from '@/lib/mcps/legacy-leakage-scrub'
 import {
   createLegacyLeakageRedisAdapter,
+  parseLegacyLeakageScrubCheckpoint,
   parseLegacyLeakageScrubArgs,
 } from '@/scripts/scrub-legacy-leakage'
 
 const RECEIPT = '11111111-1111-4111-8111-111111111111'
+const FINGERPRINT_KEY = Buffer.alloc(32, 7)
+const FINGERPRINT_KEY_ID = 'test-scrub-key-v2'
+
+function validCheckpointJson(changes: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    schemaVersion: 2,
+    operationId: 'checkpoint-operation',
+    actor: 'operator',
+    authorizationReceiptId: RECEIPT,
+    fingerprintKeyId: FINGERPRINT_KEY_ID,
+    sentinelSetFingerprint: 'a'.repeat(64),
+    phase: 'task_logs',
+    state: 'running',
+    lastKey: null,
+    rowsExamined: 0,
+    rowsChanged: 0,
+    conflicts: 0,
+    redisKeysExamined: 0,
+    redisKeysDeleted: 0,
+    redisV2ValuesExamined: 0,
+    lastPreFingerprint: null,
+    lastPostFingerprint: null,
+    databaseTime: '2026-07-28T00:00:00.000Z',
+    ...changes,
+  })
+}
 
 function evidence(changes: Partial<RedisScanEvidence> = {}): RedisScanEvidence {
   return {
@@ -112,7 +142,7 @@ class FakeDatabase implements LegacyLeakageScrubDatabase {
       this.conflictOnceFor = null
       return 'row_conflict'
     }
-    if (legacyLeakageRowFingerprint(rows[index]) !== input.expectedRowFingerprint) return 'row_conflict'
+    if (legacyLeakageRowFingerprint(rows[index], FINGERPRINT_KEY) !== input.expectedRowFingerprint) return 'row_conflict'
     rows[index] = input.row
     this.updates += 1
     this.checkpointWrites += 1
@@ -259,6 +289,8 @@ describe('legacy leakage scrub', () => {
     const result = await runLegacyLeakageScrub({
       actor: 'operator',
       authorizationReceiptId: RECEIPT,
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
       mode: 'dry-run',
     }, { database, redis })
 
@@ -292,6 +324,8 @@ describe('legacy leakage scrub', () => {
     const first = await runLegacyLeakageScrub({
       actor: 'operator',
       authorizationReceiptId: RECEIPT,
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
       mode: 'apply',
       operationId: 'leakage-operation',
     }, { database, redis })
@@ -300,6 +334,8 @@ describe('legacy leakage scrub', () => {
     const resumed = await runLegacyLeakageScrub({
       actor: 'operator',
       authorizationReceiptId: RECEIPT,
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
       mode: 'resume',
       operationId: 'leakage-operation',
     }, { database, redis })
@@ -368,6 +404,8 @@ describe('legacy leakage scrub', () => {
     await expect(runLegacyLeakageScrub({
       actor: 'operator',
       authorizationReceiptId: RECEIPT,
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
       mode: 'apply',
       operationId: 'crash-operation',
     }, { database, redis })).rejects.toThrow('injected disconnect after commit')
@@ -376,6 +414,8 @@ describe('legacy leakage scrub', () => {
     const resumed = await runLegacyLeakageScrub({
       actor: 'operator',
       authorizationReceiptId: RECEIPT,
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
       mode: 'resume',
       operationId: 'crash-operation',
     }, { database, redis })
@@ -385,6 +425,8 @@ describe('legacy leakage scrub', () => {
     const verifiedAgain = await runLegacyLeakageScrub({
       actor: 'operator',
       authorizationReceiptId: RECEIPT,
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
       mode: 'resume',
       operationId: 'crash-operation',
     }, { database, redis })
@@ -401,10 +443,121 @@ describe('legacy leakage scrub', () => {
     await expect(runLegacyLeakageScrub({
       actor: 'operator',
       authorizationReceiptId: 'wrong-receipt',
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
       mode: 'apply',
       operationId: 'unauthorized-operation',
     }, { database, redis })).rejects.toThrow('fixed S4 producers-disabled drain contract')
     expect(database.checkpoint).toBeNull()
+    expect(redis.applyCalls).toEqual([])
+  })
+
+  it('uses domain-separated keyed fingerprints and binds resume to key and order-independent sentinels', async () => {
+    const row = taskLog()
+    const otherKey = Buffer.alloc(32, 8)
+    expect(legacyLeakageRowFingerprint(row, FINGERPRINT_KEY)).not.toBe(legacyLeakageRowFingerprint(row, otherKey))
+    expect(legacyLeakageSentinelSetFingerprint(['B', 'A', 'A'], FINGERPRINT_KEY))
+      .toBe(legacyLeakageSentinelSetFingerprint(['A', 'B'], FINGERPRINT_KEY))
+
+    const database = new FakeDatabase()
+    const redis = new FakeRedis()
+    await runLegacyLeakageScrub({
+      actor: 'operator', authorizationReceiptId: RECEIPT, fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID, sentinels: ['B', 'A'], mode: 'apply', operationId: 'bound-operation',
+    }, { database, redis })
+    await expect(runLegacyLeakageScrub({
+      actor: 'operator', authorizationReceiptId: RECEIPT, fingerprintKey: otherKey,
+      fingerprintKeyId: 'rotated-key-v3', sentinels: ['A', 'B'], mode: 'resume', operationId: 'bound-operation',
+    }, { database, redis })).rejects.toThrow('fingerprint key ID')
+    await expect(runLegacyLeakageScrub({
+      actor: 'operator', authorizationReceiptId: RECEIPT, fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID, sentinels: ['A', 'C'], mode: 'resume', operationId: 'bound-operation',
+    }, { database, redis })).rejects.toThrow('sentinel set')
+    expect(JSON.stringify(database.checkpoint)).not.toContain('A')
+    expect(JSON.stringify(database.checkpoint)).not.toContain(FINGERPRINT_KEY.toString('hex'))
+  })
+
+  it('uses explicit code-unit HMAC ordering for non-ASCII object keys and sentinels', () => {
+    expect(['é', 'z', 'a', 'ä', '𝌆'].sort(compareCanonicalCodeUnits)).toEqual(['a', 'z', 'ä', 'é', '𝌆'])
+    expect(legacyLeakageSentinelSetFingerprint(['é', 'z', 'a', 'ä', '𝌆', 'a'], FINGERPRINT_KEY))
+      .toBe('f57d110257c9a31528c0b6d85f2072c524203b96551abb5afe6185a25ba9a33c')
+    const first = { ...taskLog(), metadata: { 'é': 1, z: 2, a: 3, 'ä': 4, '𝌆': 5 } }
+    const second = { ...taskLog(), metadata: { '𝌆': 5, 'ä': 4, a: 3, z: 2, 'é': 1 } }
+    expect(legacyLeakageRowFingerprint(first, FINGERPRINT_KEY)).toBe(legacyLeakageRowFingerprint(second, FINGERPRINT_KEY))
+  })
+
+  it('rejects a checkpoint whose embedded operation identity differs from the requested storage key', async () => {
+    const database = new FakeDatabase()
+    const redis = new FakeRedis()
+    await runLegacyLeakageScrub({
+      actor: 'operator', authorizationReceiptId: RECEIPT, fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID, mode: 'apply', operationId: 'stored-operation',
+    }, { database, redis })
+    const checkpoint = database.checkpoint!
+    database.checkpoint = {
+      checkpoint: { ...checkpoint.checkpoint, operationId: 'embedded-other-operation' },
+      token: checkpoint.token,
+    }
+    const writesBefore = database.checkpointWrites
+    await expect(runLegacyLeakageScrub({
+      actor: 'operator', authorizationReceiptId: RECEIPT, fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID, mode: 'resume', operationId: 'stored-operation',
+    }, { database, redis })).rejects.toThrow('operation identity does not match its storage key')
+    expect(database.checkpointWrites).toBe(writesBefore)
+  })
+
+  it('fails closed instead of resuming an unsafe v1 checkpoint and exposes a closed sink policy', () => {
+    expect(() => parseLegacyLeakageScrubCheckpoint(JSON.stringify({ schemaVersion: 1, operationId: 'old' })))
+      .toThrow('unsafe legacy format; start a new --apply operation')
+    expect(LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY.task_logs.updated).toEqual(['message', 'front_matter', 'metadata'])
+    expect(LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY.artifacts.excluded).toContain('architect_plan_entries.content')
+    expect(LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY.retainedAuthorities).toEqual(expect.arrayContaining([
+      'tasks.prompt', 'architect_plan_versions', 'architect_plan_entries', 'ordinary_non_plan_artifact.content',
+    ]))
+  })
+
+  it('accepts only the complete closed v2 checkpoint shape', () => {
+    expect(parseLegacyLeakageScrubCheckpoint(validCheckpointJson())).toMatchObject({ schemaVersion: 2, phase: 'task_logs' })
+    const invalid = [
+      validCheckpointJson({ phase: 'unknown_phase' }),
+      validCheckpointJson({ state: 'unknown_state' }),
+      validCheckpointJson({ operationId: '' }),
+      validCheckpointJson({ actor: ' operator ' }),
+      validCheckpointJson({ authorizationReceiptId: 'not-a-uuid' }),
+      validCheckpointJson({ fingerprintKeyId: 'bad key id' }),
+      validCheckpointJson({ sentinelSetFingerprint: 'not-a-fingerprint' }),
+      validCheckpointJson({ lastKey: 'not-a-uuid' }),
+      validCheckpointJson({ lastPreFingerprint: 'short' }),
+      validCheckpointJson({ rowsExamined: -1 }),
+      validCheckpointJson({ rowsChanged: 1.5 }),
+      validCheckpointJson({ conflicts: Number.MAX_SAFE_INTEGER + 1 }),
+      validCheckpointJson({ rowsExamined: 0, rowsChanged: 1 }),
+      validCheckpointJson({ redisKeysExamined: 0, redisKeysDeleted: 1 }),
+      validCheckpointJson({ databaseTime: 'not-a-date' }),
+      validCheckpointJson({ phase: 'complete', state: 'running' }),
+      validCheckpointJson({ phase: 'complete', state: 'complete', lastKey: '00000000-0000-4000-8000-000000000001' }),
+      validCheckpointJson({ unexpected: true }),
+      JSON.stringify(Object.fromEntries(Object.entries(JSON.parse(validCheckpointJson())).filter(([key]) => key !== 'actor'))),
+      '{not json}',
+    ]
+    for (const malformed of invalid) {
+      expect(() => parseLegacyLeakageScrubCheckpoint(malformed)).toThrow('Stored leakage scrub checkpoint is malformed')
+    }
+  })
+
+  it('does not mutate a loaded checkpoint when a runtime phase is impossible', async () => {
+    const database = new FakeDatabase()
+    const redis = new FakeRedis()
+    database.checkpoint = {
+      checkpoint: JSON.parse(validCheckpointJson({ operationId: 'runtime-corrupt', phase: 'unknown_phase' })) as LegacyLeakageScrubCheckpoint,
+      token: validCheckpointJson({ operationId: 'runtime-corrupt', phase: 'unknown_phase' }),
+    }
+    await expect(runLegacyLeakageScrub({
+      actor: 'operator', authorizationReceiptId: RECEIPT, fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID, mode: 'resume', operationId: 'runtime-corrupt',
+    }, { database, redis })).rejects.toThrow('unknown phase')
+    expect(database.checkpointWrites).toBe(0)
+    expect(database.updates).toBe(0)
     expect(redis.applyCalls).toEqual([])
   })
 
@@ -534,6 +687,8 @@ describe('legacy leakage scrub', () => {
     const options = {
       actor: 'operator',
       authorizationReceiptId: RECEIPT,
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
       mode: 'apply' as const,
       operationId: 'completion-zero-scan',
     }
@@ -630,6 +785,35 @@ describe('legacy leakage CLI and operator guide', () => {
     expect(commandSource).toContain("enablement.state = 'disabled'")
     expect(commandSource).toContain("'legacy_prompt_and_event_data_zero_scan_green'")
     expect(commandSource).toContain('select distinct plan_artifact_id from architect_plan_versions')
+    expect(commandSource).toContain('where version.plan_artifact_id is null')
+    expect(commandSource).toContain('and version.plan_artifact_id is null')
+    expect(commandSource).toContain('select a.id::text as id')
+    expect(commandSource).toContain('for update')
+    expect(commandSource).toContain('and not exists (')
+    const identityStart = commandSource.indexOf("if (input.row.kind === 'artifact')")
+    const reloadStart = commandSource.indexOf('const sourceRows =', identityStart)
+    expect(identityStart).toBeGreaterThan(-1)
+    expect(reloadStart).toBeGreaterThan(identityStart)
+    expect(commandSource.slice(identityStart, reloadStart)).not.toContain('a.content')
+    expect(commandSource.slice(reloadStart)).toContain('and not exists (')
+    expect(commandSource).toContain('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY')
+    expect(commandSource).not.toContain('createHash')
     expect(commandSource).not.toContain('historyAvailable":true')
+  })
+
+  it('keeps the PostgreSQL adapter selection and mutation surface aligned with the closed policy', async () => {
+    const commandSource = await readFile('scripts/scrub-legacy-leakage.ts', 'utf8')
+    const contractSource = await readFile('lib/mcps/legacy-leakage-scrub.ts', 'utf8')
+    for (const column of LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY.task_logs.updated) {
+      expect(commandSource).toContain(column)
+    }
+    for (const column of LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY.artifacts.updated) {
+      expect(commandSource).toContain(`a.${column}`)
+    }
+    expect(commandSource).toContain('update work_packages')
+    expect(commandSource).toContain('update approval_gates')
+    expect(commandSource).not.toContain('from architect_plan_entries')
+    expect(contractSource).toContain("createHmac('sha256'")
+    expect(contractSource).not.toContain("createHash('sha256'")
   })
 })

@@ -30,6 +30,27 @@ export type LegacyLeakageScrubCli = Readonly<{
   sentinels: readonly string[]
 }>
 
+function requiredFingerprintKey(): Buffer {
+  const encoded = process.env.FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY?.trim()
+  if (!encoded) throw new Error('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY is required.')
+  const key = /^[0-9a-f]{64}$/iu.test(encoded)
+    ? Buffer.from(encoded, 'hex')
+    : Buffer.from(encoded, 'base64')
+  if (key.length !== 32) {
+    throw new Error('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY must encode exactly 32 bytes.')
+  }
+  return key
+}
+
+function requiredFingerprintKeyId(): string {
+  const keyId = process.env.FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID?.trim()
+  if (!keyId) throw new Error('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID is required.')
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(keyId)) {
+    throw new Error('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID must be a bounded non-secret key identifier.')
+  }
+  return keyId
+}
+
 export function legacyLeakageScrubUsage(): string {
   return `Legacy task-log, artifact, and Redis leakage scrub
 
@@ -56,7 +77,11 @@ keys. Protected Architect plan entries are never selected or updated.
 
 Environment:
   FORGE_DATABASE_ADMIN_URL  privileged PostgreSQL connection for the scrub
-  REDIS_URL                 Redis connection whose legacy task history is purged`
+  REDIS_URL                 Redis connection whose legacy task history is purged
+  FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY
+                            dedicated 32-byte server-private HMAC key
+  FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID
+                            bounded non-secret key identifier`
 }
 
 function positiveInteger(flag: string, value: string | undefined, fallback: number): number {
@@ -128,12 +153,88 @@ function requiredAdminDatabaseUrl(): string {
   return value
 }
 
-function parseCheckpoint(value: string): LegacyLeakageScrubCheckpoint {
-  const parsed = JSON.parse(value) as Partial<LegacyLeakageScrubCheckpoint>
-  if (parsed.schemaVersion !== 1 || typeof parsed.operationId !== 'string' || typeof parsed.phase !== 'string') {
-    throw new Error('Stored leakage scrub checkpoint is malformed.')
+export function parseLegacyLeakageScrubCheckpoint(value: string): LegacyLeakageScrubCheckpoint {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    throw new Error('Stored leakage scrub checkpoint is malformed; start a new --apply operation.')
   }
-  return parsed as LegacyLeakageScrubCheckpoint
+  if (!isCheckpointRecord(parsed)) {
+    throw new Error('Stored leakage scrub checkpoint is malformed; start a new --apply operation.')
+  }
+  if (parsed.schemaVersion === 1) {
+    throw new Error('Stored leakage scrub checkpoint uses an unsafe legacy format; start a new --apply operation.')
+  }
+  if (parsed.schemaVersion !== 2 || !isClosedCheckpointRecord(parsed)) {
+    throw new Error('Stored leakage scrub checkpoint is malformed; start a new --apply operation.')
+  }
+  if (!isValidCheckpointV2(parsed)) {
+    throw new Error('Stored leakage scrub checkpoint is malformed; start a new --apply operation.')
+  }
+  return parsed
+}
+
+const CHECKPOINT_V2_KEYS = [
+  'schemaVersion', 'operationId', 'actor', 'authorizationReceiptId', 'fingerprintKeyId', 'sentinelSetFingerprint',
+  'phase', 'state', 'lastKey', 'rowsExamined', 'rowsChanged', 'conflicts', 'redisKeysExamined', 'redisKeysDeleted',
+  'redisV2ValuesExamined', 'lastPreFingerprint', 'lastPostFingerprint', 'databaseTime',
+] as const
+const CHECKPOINT_PHASES = new Set(['task_logs', 'artifacts', 'work_packages', 'approval_gates', 'redis_legacy', 'redis_v2_verify', 'complete'])
+const CHECKPOINT_STATES = new Set(['running', 'paused_conflict', 'complete'])
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu
+const HEX_FINGERPRINT = /^[0-9a-f]{64}$/iu
+
+function isCheckpointRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null
+    && typeof value === 'object'
+    && !Array.isArray(value)
+}
+
+function isClosedCheckpointRecord(value: unknown): value is Record<string, unknown> {
+  return isCheckpointRecord(value)
+    && Object.keys(value).length === CHECKPOINT_V2_KEYS.length
+    && Object.keys(value).every((key) => (CHECKPOINT_V2_KEYS as readonly string[]).includes(key))
+}
+
+function isBoundedIdentity(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= 1 && value.length <= 200 && value.trim() === value
+}
+
+function isNullableFingerprint(value: unknown): value is string | null {
+  return value === null || (typeof value === 'string' && HEX_FINGERPRINT.test(value))
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+function isValidCheckpointV2(value: Record<string, unknown>): value is LegacyLeakageScrubCheckpoint {
+  const phase = value.phase
+  const state = value.state
+  const timestamp = value.databaseTime
+  const counters = ['rowsExamined', 'rowsChanged', 'conflicts', 'redisKeysExamined', 'redisKeysDeleted', 'redisV2ValuesExamined']
+  return value.schemaVersion === 2
+    && isBoundedIdentity(value.operationId)
+    && isBoundedIdentity(value.actor)
+    && typeof value.authorizationReceiptId === 'string' && UUID.test(value.authorizationReceiptId)
+    && typeof value.fingerprintKeyId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(value.fingerprintKeyId)
+    && typeof value.sentinelSetFingerprint === 'string' && HEX_FINGERPRINT.test(value.sentinelSetFingerprint)
+    && typeof phase === 'string' && CHECKPOINT_PHASES.has(phase)
+    && typeof state === 'string' && CHECKPOINT_STATES.has(state)
+    && ((phase === 'complete') === (state === 'complete'))
+    && (value.lastKey === null || (typeof value.lastKey === 'string' && UUID.test(value.lastKey)))
+    && isNullableFingerprint(value.lastPreFingerprint)
+    && isNullableFingerprint(value.lastPostFingerprint)
+    && counters.every((counter) => isNonNegativeSafeInteger(value[counter]))
+    && (value.rowsChanged as number) <= (value.rowsExamined as number)
+    && (value.redisKeysDeleted as number) <= (value.redisKeysExamined as number)
+    && (phase !== 'complete' || value.lastKey === null)
+    && typeof timestamp === 'string'
+    && timestamp.length >= 1
+    && timestamp.length <= 128
+    && timestamp.trim() === timestamp
+    && Number.isFinite(Date.parse(timestamp))
 }
 
 function taskLogRow(row: Record<string, unknown>): LegacyLeakageScrubRow {
@@ -174,6 +275,7 @@ function approvalGateRow(row: Record<string, unknown>): LegacyLeakageScrubRow {
 
 export function createLegacyLeakagePostgresAdapter(
   sql: ReturnType<typeof postgres>,
+  fingerprintKey: Buffer,
 ): LegacyLeakageScrubDatabase {
   return {
     async databaseTime() {
@@ -234,7 +336,7 @@ export function createLegacyLeakagePostgresAdapter(
         from app_settings
         where key = ${checkpointKey(operationId)}
       `
-      return row ? { checkpoint: parseCheckpoint(row.value), token: row.value } : null
+      return row ? { checkpoint: parseLegacyLeakageScrubCheckpoint(row.value), token: row.value } : null
     },
 
     async createCheckpoint(checkpoint) {
@@ -299,6 +401,7 @@ export function createLegacyLeakagePostgresAdapter(
             left join (
               select distinct plan_artifact_id from architect_plan_versions
             ) version on version.plan_artifact_id = a.id
+            where version.plan_artifact_id is null
             order by a.id limit ${limit}
           `
         : await sql<Record<string, unknown>[]>`
@@ -314,7 +417,9 @@ export function createLegacyLeakagePostgresAdapter(
             left join (
               select distinct plan_artifact_id from architect_plan_versions
             ) version on version.plan_artifact_id = a.id
-            where a.id > ${afterId}::uuid order by a.id limit ${limit}
+            where a.id > ${afterId}::uuid
+              and version.plan_artifact_id is null
+            order by a.id limit ${limit}
           `
       return rows.map(artifactRow)
     },
@@ -327,6 +432,18 @@ export function createLegacyLeakagePostgresAdapter(
           for update
         `
         if (checkpointRows[0]?.value !== input.current.token) return 'checkpoint_conflict' as const
+
+        if (input.row.kind === 'artifact') {
+          // Lock identity without projecting protected bytes. A subsequent READ COMMITTED
+          // statement observes a plan-version link that committed while this lock waited.
+          const artifactIdentityRows = await transaction<{ id: string }[]>`
+            select a.id::text as id
+            from artifacts a
+            where a.id = ${input.row.id}::uuid
+            for update
+          `
+          if (artifactIdentityRows.length !== 1) return 'row_conflict' as const
+        }
 
         const sourceRows = input.row.kind === 'task_log'
           ? await transaction<Record<string, unknown>[]>`
@@ -349,15 +466,15 @@ export function createLegacyLeakagePostgresAdapter(
                   a.artifact_type = 'adr_text'
                   and r.agent_type = 'architect'
                   and a.content <> ${ARCHITECT_PLAN_HEADER}
-                  and version.plan_artifact_id is null
                 ) as "replaceContent"
               from artifacts a
               join agent_runs r on r.id = a.agent_run_id
-              left join (
-                select distinct plan_artifact_id from architect_plan_versions
-              ) version on version.plan_artifact_id = a.id
               where a.id = ${input.row.id}::uuid
-              for update of a
+                and not exists (
+                  select 1
+                  from architect_plan_versions version
+                  where version.plan_artifact_id = a.id
+                )
             `
         if (sourceRows.length !== 1) return 'row_conflict' as const
         const source = input.row.kind === 'task_log'
@@ -367,7 +484,7 @@ export function createLegacyLeakagePostgresAdapter(
             : input.row.kind === 'approval_gate'
               ? approvalGateRow(sourceRows[0])
               : artifactRow(sourceRows[0])
-        if (legacyLeakageRowFingerprint(source) !== input.expectedRowFingerprint) return 'row_conflict' as const
+        if (legacyLeakageRowFingerprint(source, fingerprintKey) !== input.expectedRowFingerprint) return 'row_conflict' as const
 
         if (input.row.kind === 'task_log') {
           await transaction`
@@ -542,8 +659,13 @@ export async function runLegacyLeakageScrubCli(cli: LegacyLeakageScrubCli): Prom
   const sql = postgres(requiredAdminDatabaseUrl(), { max: 1 })
   const redis = new Redis(getRequiredEnv('REDIS_URL'), { lazyConnect: true, maxRetriesPerRequest: 3 })
   try {
-    const result = await runLegacyLeakageScrub(cli, {
-      database: createLegacyLeakagePostgresAdapter(sql),
+    const fingerprintKey = requiredFingerprintKey()
+    const result = await runLegacyLeakageScrub({
+      ...cli,
+      fingerprintKey,
+      fingerprintKeyId: requiredFingerprintKeyId(),
+    }, {
+      database: createLegacyLeakagePostgresAdapter(sql, fingerprintKey),
       redis: createLegacyLeakageRedisAdapter(redis),
     })
     process.stdout.write(`${JSON.stringify(result)}\n`)
