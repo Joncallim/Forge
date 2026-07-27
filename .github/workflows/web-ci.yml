@@ -87,10 +87,10 @@ jobs:
           CREATE ROLE forge_app_test
             LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
             PASSWORD 'forge_app_test';
-          # CI-only observer. PostgreSQL's default PUBLIC CONNECT/TEMPORARY
-          # privileges can still cover other disposable runner databases; this
-          # role is constrained by its direct attributes, memberships, and the
-          # object-level boundary verified after migration below.
+          -- CI-only observer. PostgreSQL's default PUBLIC CONNECT/TEMPORARY
+          -- privileges can still cover other disposable runner databases; this
+          -- role is constrained by its direct attributes, memberships, and the
+          -- object-level boundary verified after migration below.
           CREATE ROLE forge_e2e_audit_observer
             LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
             PASSWORD 'forge_e2e_audit_observer_test';
