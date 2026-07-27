@@ -21,6 +21,57 @@ operation="$(psql "$url" -At --field-separator='|' --set ON_ERROR_STOP=1 --comma
 operation_id="${operation%%|*}"
 [[ "$operation" == *'|running|0' && "$operation_id" =~ ^[0-9a-f-]{36}$ ]] || { echo 'negative proof did not create the exact live operation' >&2; exit 1; }
 
+snapshot_reconciliation_state() {
+  psql "$FORGE_DATABASE_ADMIN_URL" -At --set ON_ERROR_STOP=1 --command "
+    WITH snapshots AS (
+      SELECT 'operations' AS category, coalesce(jsonb_agg(to_jsonb(operation_row) ORDER BY operation_row.operation_id)::text, '[]') AS payload FROM public.project_root_reconciliation_operations operation_row
+      UNION ALL SELECT 'checkpoints', coalesce(jsonb_agg(to_jsonb(checkpoint_row) ORDER BY checkpoint_row.operation_id, checkpoint_row.checkpoint_generation)::text, '[]') FROM public.project_root_reconciliation_checkpoints checkpoint_row
+      UNION ALL SELECT 'outcomes', coalesce(jsonb_agg(to_jsonb(outcome_row) ORDER BY outcome_row.generation)::text, '[]') FROM public.project_root_reconciliation_outcomes outcome_row
+      UNION ALL SELECT 'contexts', coalesce(jsonb_agg(to_jsonb(context_row) ORDER BY context_row.operation_id, context_row.generation)::text, '[]') FROM public.project_root_reconciliation_write_contexts context_row
+      UNION ALL SELECT 'journal', coalesce(jsonb_agg(to_jsonb(journal_row) ORDER BY journal_row.generation)::text, '[]') FROM public.project_root_change_journal journal_row
+      UNION ALL SELECT 'runtime_audits', coalesce(jsonb_agg(to_jsonb(audit_row) ORDER BY audit_row.id)::text, '[]') FROM public.filesystem_mcp_runtime_audits audit_row
+      UNION ALL SELECT 'project_pointers', coalesce(jsonb_agg(to_jsonb(pointer_row) ORDER BY pointer_row.project_id)::text, '[]') FROM public.project_filesystem_current_decision_pointers pointer_row
+      UNION ALL SELECT 'package_pointers', coalesce(jsonb_agg(to_jsonb(pointer_row) ORDER BY pointer_row.work_package_id)::text, '[]') FROM public.filesystem_mcp_current_decision_pointers pointer_row
+      UNION ALL SELECT 'projection_heads', coalesce(jsonb_agg(to_jsonb(head_row) ORDER BY head_row.id)::text, '[]') FROM public.work_package_local_projection_heads head_row
+      UNION ALL SELECT 'tasks', coalesce(jsonb_agg(to_jsonb(task_row) ORDER BY task_row.id)::text, '[]') FROM public.tasks task_row
+      UNION ALL SELECT 'packages', coalesce(jsonb_agg(to_jsonb(package_row) ORDER BY package_row.id)::text, '[]') FROM public.work_packages package_row
+    )
+    SELECT md5(string_agg(category || ':' || payload, E'\\n' ORDER BY category)) FROM snapshots"
+}
+
+expect_isolated_rejection() {
+  local phase="$1" expected_text="$2" generation_input="$3" project_input="$4" output status before after
+  before="$(snapshot_reconciliation_state)"
+  output="$(mktemp)"
+  if psql "$url" --set ON_ERROR_STOP=1 --command "SELECT forge.enter_project_root_reconciliation_generation_v1('${operation_id}'::uuid,'${actor}'::uuid,${generation_input}::bigint,'${project_input}'::uuid)" >"$output" 2>&1; then
+    echo "negative reconciliation proof ${phase} unexpectedly succeeded" >&2
+    cat "$output" >&2
+    unlink "$output"
+    exit 1
+  else
+    status=$?
+  fi
+  if [[ "$status" != 1 ]] || ! grep -F -- "$expected_text" "$output" >/dev/null; then
+    echo "negative reconciliation proof ${phase} received an unexpected psql status/error (status=${status})" >&2
+    cat "$output" >&2
+    unlink "$output"
+    exit 1
+  fi
+  unlink "$output"
+  after="$(snapshot_reconciliation_state)"
+  [[ "$before" == "$after" && "$after" =~ ^[0-9a-f]{32}$ ]] || { echo "negative reconciliation proof ${phase} changed protected reconciliation state" >&2; exit 1; }
+}
+
+wrong_project="$(psql "$FORGE_DATABASE_ADMIN_URL" -At --set ON_ERROR_STOP=1 --command "SELECT project_id FROM public.project_root_change_journal WHERE project_id <> '${project}'::uuid ORDER BY generation LIMIT 1")"
+[[ "$wrong_project" =~ ^[0-9a-f-]{36}$ && "$wrong_project" != "$project" ]] || { echo 'negative proof lacks a distinct journal project for project-binding isolation' >&2; exit 1; }
+expect_isolated_rejection 'correct-next-generation wrong-project binding' 'project-root write context is not claimable' "$generation" "$wrong_project"
+
+wrong_generation_project="$(psql "$FORGE_DATABASE_ADMIN_URL" -At --field-separator='|' --set ON_ERROR_STOP=1 --command "SELECT generation, project_id FROM public.project_root_change_journal WHERE generation > ${generation} AND generation <= ${through} ORDER BY generation LIMIT 1")"
+wrong_generation="${wrong_generation_project%%|*}"
+wrong_generation_project_id="${wrong_generation_project#*|}"
+[[ "$wrong_generation" =~ ^[1-9][0-9]*$ && "$wrong_generation" != "$generation" && "$wrong_generation_project_id" =~ ^[0-9a-f-]{36}$ ]] || { echo 'negative proof lacks a later journal generation for generation-sequence isolation' >&2; exit 1; }
+expect_isolated_rejection 'wrong-generation correct-journal-project binding' 'project-root write context is not claimable' "$wrong_generation" "$wrong_generation_project_id"
+
 expect_failure() { local expected_status="$1" text="$2"; shift 2; local output status; output="$(mktemp)"; if "$@" >"$output" 2>&1; then echo "negative reconciliation proof expected psql failure: ${text}" >&2; cat "$output" >&2; unlink "$output"; exit 1; else status=$?; fi; [[ "$status" == "$expected_status" ]] || { echo "negative reconciliation proof expected psql exit ${expected_status} for ${text}, got ${status}" >&2; cat "$output" >&2; unlink "$output"; exit 1; }; grep -F -- "$text" "$output" >/dev/null || { echo "negative reconciliation proof received the wrong psql error for ${text}" >&2; cat "$output" >&2; unlink "$output"; exit 1; }; unlink "$output"; }
 expect_failure 1 'project-root operation identity cannot be hijacked' psql "$url" --set ON_ERROR_STOP=1 --command "SELECT * FROM forge.begin_project_root_reconciliation_v1('${operation_id}'::uuid,'22222222-2222-4222-8222-222222222222'::uuid,${through}::bigint)"
 expect_failure 1 'query returned no rows' psql "$url" --set ON_ERROR_STOP=1 --command "SELECT forge.enter_project_root_reconciliation_generation_v1('33333333-3333-4333-8333-333333333333'::uuid,'${actor}'::uuid,1,'${project}'::uuid)"
