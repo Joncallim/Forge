@@ -1829,10 +1829,8 @@ describe('handoffApprovedWorkPackages', () => {
   it('uses prior implementation runs for attempt number and passes rework context into sandbox execution', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
-    // Retain the executable-path assertions below for a future confined writer.
-    // Until then an affirmative request must not make that path reachable.
     expect(isWorkPackageExecutionEnabled()).toBe(false)
-    if (!isWorkPackageExecutionEnabled()) return
+    if (isWorkPackageExecutionEnabled()) {
     const workPackage = {
       id: 'pkg-1',
       assignedRole: 'backend',
@@ -2053,13 +2051,18 @@ describe('handoffApprovedWorkPackages', () => {
         process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
       }
     }
+    }
+    expect(mocks.loadWorkPackageExecutionPreflight).not.toHaveBeenCalled()
+    expect(mocks.loadWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.activateWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
   })
 
   it('does not write stale package artifacts after execution if the lease was cancelled', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
     expect(isWorkPackageExecutionEnabled()).toBe(false)
-    if (!isWorkPackageExecutionEnabled()) return
+    if (isWorkPackageExecutionEnabled()) {
     const workPackage = {
       id: 'pkg-1',
       assignedRole: 'backend',
@@ -2181,13 +2184,18 @@ describe('handoffApprovedWorkPackages', () => {
         process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
       }
     }
+    }
+    expect(mocks.loadWorkPackageExecutionPreflight).not.toHaveBeenCalled()
+    expect(mocks.loadWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.activateWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
   })
 
   it('fails the package and task instead of starting a fourth implementation attempt', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
     expect(isWorkPackageExecutionEnabled()).toBe(false)
-    if (!isWorkPackageExecutionEnabled()) return
+    if (isWorkPackageExecutionEnabled()) {
     mocks.dbSelect
       .mockReturnValueOnce(chain([{
         id: 'pkg-1',
@@ -2257,12 +2265,17 @@ describe('handoffApprovedWorkPackages', () => {
         process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
       }
     }
+    }
+    expect(mocks.loadWorkPackageExecutionPreflight).not.toHaveBeenCalled()
+    expect(mocks.loadWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.activateWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
   })
 
   it('acquires atomic local lifecycle ownership before project-path activation', async () => {
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
     expect(isWorkPackageExecutionEnabled()).toBe(false)
-    if (!isWorkPackageExecutionEnabled()) return
+    if (isWorkPackageExecutionEnabled()) {
     const order: string[] = []
     const runId = '00000000-0000-4000-8000-000000000111'
     mocks.readS4RuntimeModeV1.mockResolvedValue('protected')
@@ -2337,13 +2350,18 @@ describe('handoffApprovedWorkPackages', () => {
     }))
     expect(mocks.loadWorkPackageExecutionContext).not.toHaveBeenCalled()
     expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
+    }
+    expect(mocks.loadWorkPackageExecutionPreflight).not.toHaveBeenCalled()
+    expect(mocks.loadWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.activateWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
   })
 
   it('keeps package execution failures retryable before the final approval attempt', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
     expect(isWorkPackageExecutionEnabled()).toBe(false)
-    if (!isWorkPackageExecutionEnabled()) return
+    if (isWorkPackageExecutionEnabled()) {
     mocks.dbSelect
       .mockReturnValueOnce(chain([{
         id: 'pkg-1',
@@ -2490,13 +2508,18 @@ describe('handoffApprovedWorkPackages', () => {
         process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
       }
     }
+    }
+    expect(mocks.loadWorkPackageExecutionPreflight).not.toHaveBeenCalled()
+    expect(mocks.loadWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.activateWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
   })
 
   it('allows unset host-write configuration to advance non-Git paths in sandbox-only mode', async () => {
     const previousExecutionFlag = process.env.FORGE_WORK_PACKAGE_EXECUTION
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
     expect(isWorkPackageExecutionEnabled()).toBe(false)
-    if (!isWorkPackageExecutionEnabled()) return
+    if (isWorkPackageExecutionEnabled()) {
     const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'forge-non-git-project-'))
     tempRoots.push(projectRoot)
 
@@ -2638,6 +2661,11 @@ describe('handoffApprovedWorkPackages', () => {
         process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
       }
     }
+    }
+    expect(mocks.loadWorkPackageExecutionPreflight).not.toHaveBeenCalled()
+    expect(mocks.loadWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.activateWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
   })
 
   it('advances local-only non-Git project paths without Git-only evidence', async () => {
@@ -2645,7 +2673,7 @@ describe('handoffApprovedWorkPackages', () => {
     const previousHostRepositoryWrites = process.env.FORGE_HOST_REPOSITORY_WRITES
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
     expect(isWorkPackageExecutionEnabled()).toBe(false)
-    if (!isWorkPackageExecutionEnabled()) return
+    if (isWorkPackageExecutionEnabled()) {
     process.env.FORGE_HOST_REPOSITORY_WRITES = '1'
     const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'forge-sandbox-non-git-project-'))
     tempRoots.push(projectRoot)
@@ -2859,6 +2887,11 @@ describe('handoffApprovedWorkPackages', () => {
         process.env.FORGE_HOST_REPOSITORY_WRITES = previousHostRepositoryWrites
       }
     }
+    }
+    expect(mocks.loadWorkPackageExecutionPreflight).not.toHaveBeenCalled()
+    expect(mocks.loadWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.activateWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
   })
 
   it('skips dirty Git diff evidence for sandbox-only project paths without host writes', async () => {
@@ -2866,7 +2899,7 @@ describe('handoffApprovedWorkPackages', () => {
     const previousHostRepositoryWrites = process.env.FORGE_HOST_REPOSITORY_WRITES
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
     expect(isWorkPackageExecutionEnabled()).toBe(false)
-    if (!isWorkPackageExecutionEnabled()) return
+    if (isWorkPackageExecutionEnabled()) {
     process.env.FORGE_HOST_REPOSITORY_WRITES = '0'
     const projectRoot = await mkdtemp(path.join(os.tmpdir(), 'forge-sandbox-dirty-git-project-'))
     tempRoots.push(projectRoot)
@@ -3081,6 +3114,11 @@ describe('handoffApprovedWorkPackages', () => {
         process.env.FORGE_HOST_REPOSITORY_WRITES = previousHostRepositoryWrites
       }
     }
+    }
+    expect(mocks.loadWorkPackageExecutionPreflight).not.toHaveBeenCalled()
+    expect(mocks.loadWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.activateWorkPackageExecutionContext).not.toHaveBeenCalled()
+    expect(mocks.executeWorkPackage).not.toHaveBeenCalled()
   })
 
   it('recovers a stale running package before retrying the next implementation attempt', async () => {

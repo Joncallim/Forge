@@ -57,32 +57,6 @@ const unknownMcpRequirement = [{
   fallback: { action: 'block', message: 'Revise the invalid MCP policy.' },
 }]
 
-function explicitFilesystemGrant(grantApprovalId = crypto.randomUUID()) {
-  return {
-    schemaVersion: 1,
-    phase: 'effective',
-    source: 'explicit-grant-approval',
-    grantApprovalId,
-    grantMode: 'allow_once',
-    scope: 'work_package',
-    mcpId: 'filesystem',
-    approvedAt: new Date().toISOString(),
-    approvedBy: crypto.randomUUID(),
-    grants: [{
-      mcpId: 'filesystem',
-      status: 'approved',
-      capabilities: ['filesystem.project.read'],
-      grantApprovalId,
-      grantMode: 'allow_once',
-      reason: 'Concurrency integration fixture.',
-    }],
-    reason: 'Concurrency integration fixture.',
-    runtimeIssued: false,
-    runtimeEnforcement: 'bounded_context_packet',
-    status: 'approved',
-  }
-}
-
 async function seedPackage(sql: Sql, input: {
   metadata: JsonObject
   mcpConfig?: JsonObject
@@ -776,7 +750,7 @@ test.describe('MCP handoff optimistic concurrency', () => {
     expect(conflictRuns).toBe(0)
   })
 
-  test('post-claim context failure removes only the owned lease from current metadata', async () => {
+  test('an execution request remains a handoff when a path-mutating hook cannot activate execution', async () => {
     process.env.FORGE_WORK_PACKAGE_EXECUTION = '1'
     const seeded = await seedPackage(sql, {
       metadata: { ownerNote: 'before-claim' },
@@ -785,44 +759,44 @@ test.describe('MCP handoff optimistic concurrency', () => {
     })
     usersToDelete.push(seeded.userId)
     projectsToDelete.push(seeded.projectId)
-    const effective = explicitFilesystemGrant()
 
-    await expect(handoffApprovedWorkPackages(seeded.taskId, {
+    let pathMutatingHookCalled = false
+    const result = await handoffApprovedWorkPackages(seeded.taskId, {
       afterWorkPackageClaimed: async ({ attempt, packageId }) => {
+        pathMutatingHookCalled = true
         expect(attempt).toBe(1)
         expect(packageId).toBe(seeded.packageId)
-        // This is a separate connection committing after the claim transaction.
-        // Nulling localPath makes the subsequent real context load fail before
-        // executor/context-packet issuance, exercising lease-owned cleanup.
         await writer`
           update work_packages
           set metadata = jsonb_set(
-            jsonb_set(metadata, '{mcpGrantPhases}', ${writer.json({ effective })}, true),
+            jsonb_set(metadata, '{mcpGrantPhases}', ${writer.json({ ignored: true })}, true),
             '{postClaimWriter}', ${writer.json('survives-failure')}, true
           ), updated_at = now()
           where id = ${seeded.packageId}
         `
         await writer`update projects set local_path = null, updated_at = now() where id = ${seeded.projectId}`
       },
-    })).rejects.toThrow('Project localPath is required')
+    })
 
+    expect(result).toMatchObject({ status: 'handed_off', claimedPackageId: seeded.packageId })
+    expect(pathMutatingHookCalled).toBe(false)
     const [pkg] = await sql`select status, metadata from work_packages where id = ${seeded.packageId}`
-    expect(pkg.status).toBe('failed')
+    expect(pkg.status).toBe('awaiting_review')
     expect(pkg.metadata.ownerNote).toBe('before-claim')
-    expect(pkg.metadata.postClaimWriter).toBe('survives-failure')
-    expect(pkg.metadata.mcpGrantPhases.effective.grantApprovalId).toBe(effective.grantApprovalId)
-    expect(pkg.metadata.executionLease).toBeUndefined()
+    expect(pkg.metadata.postClaimWriter).toBeUndefined()
+    expect(pkg.metadata.mcpGrantPhases).toBeUndefined()
     const [run] = await sql`
-      select id, status, error_message
+      select id, status, error_message, agent_type, stage
       from agent_runs
       where work_package_id = ${seeded.packageId}
     `
-    expect(run.status).toBe('failed')
-    expect(run.error_message).toContain('Project localPath is required')
+    expect(run).toMatchObject({ agent_type: 'handoff', stage: 'handoff', status: 'completed' })
+    expect(run.error_message).toBeNull()
     const [{ count: contextArtifacts }] = await sql`
       select count(*)::int as count
       from artifacts
       where agent_run_id = ${run.id}
+        and metadata->>'source' = 'execution-context-packet'
     `
     expect(contextArtifacts).toBe(0)
   })
