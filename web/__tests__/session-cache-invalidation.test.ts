@@ -33,14 +33,14 @@ describe('session cache invalidation', () => {
   it('completes a claimed invalidation after idempotent Redis deletion', async () => {
     const claimed = target({ legacyCredential: 'legacy-id' })
     const deleteKeys = vi.fn().mockResolvedValue(2)
-    const complete = vi.fn().mockResolvedValue(undefined)
-    const defer = vi.fn().mockResolvedValue(undefined)
+    const complete = vi.fn().mockResolvedValue(true)
+    const defer = vi.fn().mockResolvedValue(true)
 
     await expect(reconcileSessionCacheInvalidations({
       limit: 100,
       deleteKeys,
       store: { claimDue: vi.fn().mockResolvedValue([claimed]), complete, defer },
-    })).resolves.toEqual({ claimed: 1, completed: 1, deferred: 0 })
+    })).resolves.toEqual({ claimed: 1, completed: 1, deferred: 0, stale: 0 })
 
     expect(deleteKeys).toHaveBeenCalledWith([`session:v2:${digest}`, 'session:legacy-id'])
     expect(complete).toHaveBeenCalledWith(claimed)
@@ -53,8 +53,8 @@ describe('session cache invalidation', () => {
     const deleteKeys = vi.fn()
       .mockRejectedValueOnce(new Error('redis unavailable'))
       .mockResolvedValueOnce(0)
-    const complete = vi.fn().mockResolvedValue(undefined)
-    const defer = vi.fn().mockResolvedValue(undefined)
+    const complete = vi.fn().mockResolvedValue(true)
+    const defer = vi.fn().mockResolvedValue(true)
     const claimDue = vi.fn()
       .mockResolvedValueOnce([first])
       .mockResolvedValueOnce([recovered])
@@ -63,7 +63,7 @@ describe('session cache invalidation', () => {
       limit: 1,
       deleteKeys,
       store: { claimDue, complete, defer },
-    })).resolves.toEqual({ claimed: 1, completed: 0, deferred: 1 })
+    })).resolves.toEqual({ claimed: 1, completed: 0, deferred: 1, stale: 0 })
     expect(defer).toHaveBeenCalledWith(first)
     expect(complete).not.toHaveBeenCalled()
 
@@ -71,7 +71,7 @@ describe('session cache invalidation', () => {
       limit: 1,
       deleteKeys,
       store: { claimDue, complete, defer },
-    })).resolves.toEqual({ claimed: 1, completed: 1, deferred: 0 })
+    })).resolves.toEqual({ claimed: 1, completed: 1, deferred: 0, stale: 0 })
     expect(complete).toHaveBeenCalledWith(recovered)
     expect(deleteKeys).toHaveBeenCalledTimes(2)
   })
@@ -87,16 +87,45 @@ describe('session cache invalidation', () => {
     const malformed = target({ credentialDigestHex: 'not-a-digest' })
     const deleteKeys = vi.fn()
     const complete = vi.fn()
-    const defer = vi.fn().mockResolvedValue(undefined)
+    const defer = vi.fn().mockResolvedValue(true)
 
     await expect(reconcileSessionCacheInvalidations({
       limit: 1,
       deleteKeys,
       store: { claimDue: vi.fn().mockResolvedValue([malformed]), complete, defer },
-    })).resolves.toEqual({ claimed: 1, completed: 0, deferred: 1 })
+    })).resolves.toEqual({ claimed: 1, completed: 0, deferred: 1, stale: 0 })
 
     expect(deleteKeys).not.toHaveBeenCalled()
     expect(complete).not.toHaveBeenCalled()
     expect(defer).toHaveBeenCalledWith(malformed)
+  })
+
+  it('reports a reclaimed claim as stale instead of inventing completion', async () => {
+    const claimed = target({ claimToken: 'expired-claim' })
+    const deleteKeys = vi.fn().mockResolvedValue(0)
+    const complete = vi.fn().mockResolvedValue(false)
+    const defer = vi.fn().mockResolvedValue(false)
+
+    await expect(reconcileSessionCacheInvalidations({
+      limit: 1,
+      deleteKeys,
+      store: { claimDue: vi.fn().mockResolvedValue([claimed]), complete, defer },
+    })).resolves.toEqual({ claimed: 1, completed: 0, deferred: 0, stale: 1 })
+    expect(defer).not.toHaveBeenCalled()
+  })
+
+  it('reports a late failed worker as stale when its defer claim was reclaimed', async () => {
+    const claimed = target({ claimToken: 'expired-claim' })
+    const deleteKeys = vi.fn().mockRejectedValue(new Error('redis unavailable'))
+    const complete = vi.fn()
+    const defer = vi.fn().mockResolvedValue(false)
+
+    await expect(reconcileSessionCacheInvalidations({
+      limit: 1,
+      deleteKeys,
+      store: { claimDue: vi.fn().mockResolvedValue([claimed]), complete, defer },
+    })).resolves.toEqual({ claimed: 1, completed: 0, deferred: 0, stale: 1 })
+    expect(complete).not.toHaveBeenCalled()
+    expect(defer).toHaveBeenCalledWith(claimed)
   })
 })
