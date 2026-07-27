@@ -55,7 +55,9 @@ if [[ "$(redis-cli -u "${REDIS_URL}" exists 'session:orphan-migration-0027')" !=
   exit 1
 fi
 
-bash scripts/ci/reconcile-migration-0027-root-refs.sh
+# The authority proof arranges its protected graph under the disposable admin,
+# then invokes the existing reconciler shim once through its dedicated login.
+bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh
 bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh
 bash scripts/ci/cutover-migration-0027-root-ref.sh --apply
 psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 \

@@ -17,6 +17,8 @@ const upgradeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-mig
 const indexLifecycleProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-index-lifecycle.sh', import.meta.url)), 'utf8')
 const rootAuthorityProjectFixture = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-authority-project-fixture.sql', import.meta.url)), 'utf8')
 const rootAuthorityPackageFixture = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-authority-package-fixture.sql', import.meta.url)), 'utf8')
+const rootAuthorityProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-authority-reconciliation.sh', import.meta.url)), 'utf8')
+const rootAuthorityAssertions = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-authority-reconciliation-assertions.sql', import.meta.url)), 'utf8')
 const cutoverScript = readFileSync(fileURLToPath(new URL('../scripts/ci/cutover-migration-0027-root-ref.sh', import.meta.url)), 'utf8')
 const webCi = readFileSync(fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)), 'utf8')
 
@@ -133,7 +135,7 @@ describe('project-root expansion reconciliation boundary', () => {
     ]) expect(webCi).toContain(`'${table}'`)
   })
 
-  it('keeps the admin-only root-authority project fixture self-validating and incomplete', () => {
+  it('keeps the admin-only root-authority project fixture self-validating', () => {
     expect(rootAuthorityProjectFixture).toContain('root authority fixture must not run as the reconciler login')
     expect(rootAuthorityProjectFixture).toContain("'27000000-0000-4000-8000-000000000700'")
     expect(rootAuthorityProjectFixture).toContain("'27000000-0000-4000-8000-000000000702'")
@@ -156,6 +158,34 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(rootAuthorityPackageFixture).toContain("head_kind = 'operator_hold'")
     expect(rootAuthorityPackageFixture).toContain('invalid projection heads or sources')
     expect(rootAuthorityPackageFixture).not.toContain('reconcile-project-root-expansion.ts')
+    expect(rootAuthorityPackageFixture).toContain('filesystem.project.search')
+  })
+
+  it('runs the bound-authority fixture through the real dedicated reconciler once', () => {
+    expect(rootAuthorityProof).toContain('migration-0027-root-authority-project-fixture.sql')
+    expect(rootAuthorityProof).toContain('migration-0027-root-authority-package-fixture.sql')
+    expect(rootAuthorityProof).toContain("UPDATE public.projects SET root_ref")
+    expect(rootAuthorityProof).toContain("outcome = 'root_update'")
+    expect(rootAuthorityProof).toContain("SELECT session_user")
+    expect(rootAuthorityProof).toContain('forge_project_root_reconciler')
+    expect(rootAuthorityProof.match(/bash scripts\/ci\/reconcile-migration-0027-root-refs\.sh/g)).toHaveLength(1)
+    expect(rootAuthorityProof).toContain('migration-0027-root-authority-reconciliation-assertions.sql')
+    expect(upgradeProof).toContain('bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh')
+    expect(upgradeProof).not.toContain('bash scripts/ci/reconcile-migration-0027-root-refs.sh')
+    expect(upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh')).toBeLessThan(
+      upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh'),
+    )
+  })
+
+  it('asserts canonical package/task/head effects without direct protected authority mutation', () => {
+    expect(rootAuthorityAssertions).toContain('project_root_reconciliation_write_contexts')
+    expect(rootAuthorityAssertions).toContain("source_row.contribution->>'transition'")
+    expect(rootAuthorityAssertions).toContain("WHEN v_add THEN 'hold' WHEN v_refresh THEN 'refresh' WHEN v_recover THEN 'recovery'")
+    expect(rootAuthorityAssertions).toContain('forge_is_canonical_filesystem_grant_block_v2')
+    expect(rootAuthorityAssertions).toContain("metadata - 'mcpGrantBlock'")
+    expect(rootAuthorityAssertions).toContain('mcpGrantPhases')
+    expect(rootAuthorityAssertions).toContain('root authority reconciliation mutated protected decision or pointer authority directly')
+    expect(rootAuthorityAssertions).toContain('root authority task convergence did not recover running and failed tasks')
   })
 
   it('selects phase suppression only in the internal root-journal caller', () => {
@@ -185,7 +215,7 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(cutoverScript).toContain('project_root_reconciliation_operations')
     expect(cutoverScript).toContain('projects_root_ref_idx')
     expect(cutoverScript).toContain("pg_catalog.to_regclass('public.projects_root_ref_idx')")
-    expect(cutoverScript).toContain('strict root-reference cutover requires a valid concurrent projects(root_ref) index')
+    expect(cutoverScript).toContain('strict root-reference cutover requires the exact canonical concurrent projects(root_ref) index')
     const advisoryLock = cutoverScript.indexOf("pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('forge:projects_root_ref_idx:v1'))")
     const indexGuard = cutoverScript.indexOf('strict root-reference cutover requires the exact canonical concurrent projects(root_ref) index')
     const coverageGuard = cutoverScript.indexOf('strict root-reference cutover requires exact completed watermark coverage')
@@ -194,7 +224,7 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(advisoryLock).toBeLessThan(indexGuard)
     expect(indexGuard).toBeLessThan(coverageGuard)
     expect(coverageGuard).toBeLessThan(proofConstraint)
-    expect(upgradeProof.indexOf('bash scripts/ci/reconcile-migration-0027-root-refs.sh')).toBeLessThan(
+    expect(upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh')).toBeLessThan(
       upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh'),
     )
     expect(upgradeProof).not.toContain('FORGE_ROOT_INDEX_LIFECYCLE_PROOF')

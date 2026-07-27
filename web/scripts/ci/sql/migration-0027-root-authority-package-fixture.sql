@@ -60,7 +60,7 @@ INSERT INTO public.work_packages (
     'A ready package that later receives the canonical root hold.',
     'ready',
     1,
-    '[{"mcpId":"filesystem","required":true,"capabilities":["filesystem.project.read"]}]'::jsonb,
+    '[{"mcpId":"filesystem","required":true,"capabilities":["filesystem.project.read","filesystem.project.search"]}]'::jsonb,
     NULL,
     '{"fixturePeer":{"case":"addition","retain":true},"mcpGrantPhases":{"filesystem":{"phase":"preexisting-add","revision":"1"}}}'::jsonb
   ),
@@ -72,7 +72,7 @@ INSERT INTO public.work_packages (
     'A valid prior marker that later refreshes under the root change.',
     'blocked',
     2,
-    '[{"mcpId":"filesystem","required":true,"capabilities":["filesystem.project.read"]}]'::jsonb,
+    '[{"mcpId":"filesystem","required":true,"capabilities":["filesystem.project.read","filesystem.project.search"]}]'::jsonb,
     'Filesystem context requires an operator decision before execution.',
     '{"fixturePeer":{"case":"replacement","retain":true},"mcpGrantPhases":{"filesystem":{"phase":"preexisting-replace","revision":"1"}},"mcpGrantBlock":{"schemaVersion":2,"kind":"filesystem_grant","source":"filesystem-grant-approval","taskDisposition":"operator_hold","autoRetryable":false,"terminalFailure":false,"requirementKeys":["requirement:root-replacement"],"requestedCapabilities":["filesystem.project.read"],"recoveryAction":"approve_project_filesystem_context","blockFingerprint":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","blockedAt":"2026-07-28T00:00:01.000Z","holdKind":"approval_required","grantPhase":"none","grantConsumed":false,"grantDecisionRevision":null,"revocationReason":null}}'::jsonb
   ),
