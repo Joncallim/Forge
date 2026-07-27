@@ -43,7 +43,14 @@ INSERT INTO root_reconciler_actual_privileges (category, entry)
 SELECT 'relation', namespace_row.nspname || '.' || relation.relname || ':' || privilege.privilege
 FROM pg_catalog.pg_class relation
 JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
-CROSS JOIN (VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE'), ('TRUNCATE'), ('REFERENCES'), ('TRIGGER'), ('MAINTAIN')) AS privilege(privilege)
+CROSS JOIN (
+  SELECT privilege
+  FROM unnest(ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER']::text[]) AS supported(privilege)
+  UNION ALL
+  -- MAINTAIN is a PostgreSQL 17 relation privilege; PostgreSQL 16 rejects it.
+  SELECT 'MAINTAIN'
+  WHERE pg_catalog.current_setting('server_version_num')::integer >= 170000
+) AS privilege
 WHERE namespace_row.nspname IN ('public', 'forge')
   AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
   AND pg_catalog.has_table_privilege('forge_project_root_reconciler', relation.oid, privilege.privilege);
