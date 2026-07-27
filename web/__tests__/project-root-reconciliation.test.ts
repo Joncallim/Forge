@@ -204,6 +204,8 @@ describe('project-root expansion reconciliation boundary', () => {
 
   it('keeps concurrent index DDL separate and strict cutover watermark-fenced', () => {
     expect(indexScript).toContain('CREATE UNIQUE INDEX CONCURRENTLY')
+    expect(indexScript).toContain('type IndexState =')
+    expect(indexScript).toContain('let index: IndexState | undefined = (await inspect())[0]')
     expect(indexScript).toContain('FORGE_DATABASE_ADMIN_URL')
     expect(reconcileScript).not.toContain('FORGE_DATABASE_ADMIN_URL')
     expect(cutoverScript).toContain('--through <nonnegative-generation> --apply')
