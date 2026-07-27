@@ -161,20 +161,17 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(rootAuthorityPackageFixture).toContain('filesystem.project.search')
   })
 
-  it('runs the bound-authority fixture through the real dedicated reconciler once', () => {
+  it('splits bound-authority fixture preparation from post-drain assertions', () => {
     expect(rootAuthorityProof).toContain('migration-0027-root-authority-project-fixture.sql')
     expect(rootAuthorityProof).toContain('migration-0027-root-authority-package-fixture.sql')
     expect(rootAuthorityProof).toContain("UPDATE public.projects SET root_ref")
     expect(rootAuthorityProof).toContain("outcome = 'root_update'")
-    expect(rootAuthorityProof).toContain("SELECT session_user")
-    expect(rootAuthorityProof).toContain('forge_project_root_reconciler')
-    expect(rootAuthorityProof.match(/bash scripts\/ci\/reconcile-migration-0027-root-refs\.sh/g)).toHaveLength(1)
+    expect(rootAuthorityProof).toContain('--prepare|--assert')
+    expect(rootAuthorityProof).toContain('case "$phase" in')
+    expect(rootAuthorityProof).not.toContain('reconcile-migration-0027-root-refs.sh')
     expect(rootAuthorityProof).toContain('migration-0027-root-authority-reconciliation-assertions.sql')
-    expect(upgradeProof).toContain('bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh')
-    expect(upgradeProof).not.toContain('bash scripts/ci/reconcile-migration-0027-root-refs.sh')
-    expect(upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh')).toBeLessThan(
-      upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh'),
-    )
+    expect(upgradeProof).toContain('bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh --prepare')
+    expect(upgradeProof).toContain('bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh --assert')
   })
 
   it('asserts canonical package/task/head effects without direct protected authority mutation', () => {
@@ -186,6 +183,7 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(rootAuthorityAssertions).toContain('mcpGrantPhases')
     expect(rootAuthorityAssertions).toContain('root authority reconciliation mutated protected decision or pointer authority directly')
     expect(rootAuthorityAssertions).toContain('root authority task convergence did not recover running and failed tasks')
+    expect(rootAuthorityAssertions).toContain('the single root reconciliation operation does not cover every prepared journal generation')
   })
 
   it('selects phase suppression only in the internal root-journal caller', () => {
@@ -224,14 +222,21 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(advisoryLock).toBeLessThan(indexGuard)
     expect(indexGuard).toBeLessThan(coverageGuard)
     expect(coverageGuard).toBeLessThan(proofConstraint)
-    expect(upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh')).toBeLessThan(
-      upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh'),
-    )
+    const authorityPrepare = upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh --prepare')
+    const indexPrepare = upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh --prepare')
+    const reconcile = upgradeProof.indexOf('bash scripts/ci/reconcile-migration-0027-root-refs.sh')
+    const authorityAssert = upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-authority-reconciliation.sh --assert')
+    const indexRecover = upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh --recover')
+    const cutover = upgradeProof.indexOf('bash scripts/ci/cutover-migration-0027-root-ref.sh --apply')
+    expect(authorityPrepare).toBeGreaterThanOrEqual(0)
+    expect(authorityPrepare).toBeLessThan(indexPrepare)
+    expect(indexPrepare).toBeLessThan(reconcile)
+    expect(reconcile).toBeLessThan(authorityAssert)
+    expect(authorityAssert).toBeLessThan(indexRecover)
+    expect(indexRecover).toBeLessThan(cutover)
+    expect(upgradeProof.match(/bash scripts\/ci\/reconcile-migration-0027-root-refs\.sh/g)).toHaveLength(1)
     expect(upgradeProof).not.toContain('FORGE_ROOT_INDEX_LIFECYCLE_PROOF')
-    expect(upgradeProof.match(/bash scripts\/ci\/prove-migration-0027-root-index-lifecycle\.sh/g)).toHaveLength(1)
-    expect(upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh')).toBeLessThan(
-      upgradeProof.indexOf('bash scripts/ci/cutover-migration-0027-root-ref.sh --apply'),
-    )
+    expect(upgradeProof.match(/bash scripts\/ci\/prove-migration-0027-root-index-lifecycle\.sh/g)).toHaveLength(2)
     expect(indexLifecycleProof).toContain("expect_failure \"$canonical_index_refusal\"")
     expect(indexLifecycleProof).toContain('grep -F -- "$expected_message" "$output" >/dev/null')
     expect(indexLifecycleProof).not.toContain('rg --fixed-strings')
@@ -240,6 +245,14 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(indexLifecycleProof).toContain('projects_root_ref_idx exists with a noncanonical definition.')
     expect(indexLifecycleProof).toContain('could not create unique index "projects_root_ref_idx"')
     expect(indexLifecycleProof).toContain('DROP INDEX CONCURRENTLY public.projects_root_ref_idx')
+    expect(indexLifecycleProof).toContain('--prepare|--recover')
+    expect(indexLifecycleProof).not.toContain('reconcile-migration-0027-root-refs.sh')
+    const authorityAssertBody = rootAuthorityProof.slice(rootAuthorityProof.indexOf('  --assert)'))
+    const indexRecoverBody = indexLifecycleProof.slice(indexLifecycleProof.indexOf('  --recover)'))
+    expect(authorityAssertBody).not.toContain('UPDATE public.projects')
+    expect(authorityAssertBody).not.toContain('INSERT INTO public.projects')
+    expect(indexRecoverBody).not.toContain('UPDATE public.projects')
+    expect(indexRecoverBody).not.toContain('INSERT INTO public.projects')
     expect(webCi).toContain('FORGE_PROJECT_ROOT_RECONCILER_DATABASE_URL')
     expect(webCi).toContain('Capture the post-drain root journal watermark')
   })

@@ -9,6 +9,7 @@ DECLARE
   v_refresh uuid := '27000000-0000-4000-8000-000000000712'::uuid;
   v_recover uuid := '27000000-0000-4000-8000-000000000721'::uuid;
   v_actor uuid := :'actor_id'::uuid;
+  v_operation_id uuid := :'operation_id'::uuid;
   v_authority_generation bigint := :'authority_generation'::bigint;
   v_through_generation bigint := :'through_generation'::bigint;
 BEGIN
@@ -37,7 +38,8 @@ BEGIN
      AND context_row.actor_id = v_actor
      AND context_row.project_id = v_project_id
      AND context_row.completed_at IS NOT NULL
-    WHERE operation_row.actor_id = v_actor
+    WHERE operation_row.operation_id = v_operation_id
+      AND operation_row.actor_id = v_actor
       AND operation_row.through_generation = v_through_generation
       AND operation_row.last_processed_generation = v_through_generation
       AND operation_row.cumulative_count = v_through_generation
@@ -45,6 +47,23 @@ BEGIN
       AND operation_row.completed_at IS NOT NULL
   ) THEN
     RAISE EXCEPTION 'root authority generation was not completed by the dedicated operation/context lifecycle';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM public.project_root_reconciliation_operations operation_row
+    WHERE operation_row.operation_id = v_operation_id
+      AND operation_row.through_generation = (SELECT last_generation FROM public.project_root_change_journal_counter WHERE singleton)
+      AND operation_row.last_processed_generation = operation_row.through_generation
+      AND operation_row.cumulative_count = operation_row.through_generation
+      AND operation_row.state = 'complete'
+  ) OR EXISTS (
+    SELECT 1 FROM public.project_root_change_journal journal_row
+    LEFT JOIN public.project_root_reconciliation_outcomes outcome_row
+      ON outcome_row.generation = journal_row.generation
+     AND outcome_row.operation_id = v_operation_id
+    WHERE outcome_row.generation IS NULL
+  ) THEN
+    RAISE EXCEPTION 'the single root reconciliation operation does not cover every prepared journal generation';
   END IF;
 
   IF EXISTS (
