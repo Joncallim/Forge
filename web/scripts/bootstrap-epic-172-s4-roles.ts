@@ -31,6 +31,7 @@ const OWNED_TABLES = [
   'project_root_reconciliation_operations',
   'project_root_reconciliation_checkpoints',
   'project_root_reconciliation_outcomes',
+  'project_root_reconciliation_write_contexts',
   's4_completion_handoffs',
   's4_protected_review_sources',
   's4_protected_review_source_reads',

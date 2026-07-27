@@ -44,6 +44,7 @@ describe('project-root expansion reconciliation boundary', () => {
       'project_root_reconciliation_operations',
       'project_root_reconciliation_checkpoints',
       'project_root_reconciliation_outcomes',
+      'project_root_reconciliation_write_contexts',
     ]) expect(migration).toContain(`CREATE TABLE public.${table}`)
     expect(migration).toContain('generation bigint PRIMARY KEY REFERENCES public.project_root_change_journal(generation)')
     expect(migration).toContain('project_root_reconciliation_checkpoints_append_only_v1')
