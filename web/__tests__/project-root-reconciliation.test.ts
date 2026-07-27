@@ -69,6 +69,8 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(bootstrap).not.toContain('grant update (id) on table public.projects, public.filesystem_mcp_grant_approvals')
     expect(bootstrap).not.toContain('grant update (project_id) on table public.project_filesystem_current_decision_pointers')
     expect(bootstrap).not.toContain('grant update (work_package_id) on table public.filesystem_mcp_current_decision_pointers')
+    expect(migration).not.toContain('GRANT EXECUTE ON FUNCTION forge.advance_local_projection_head_v1')
+    expect(bootstrap).toContain('grant execute on function forge.advance_local_projection_head_v1(uuid,uuid,text,uuid,bigint,text,jsonb,bigint,text,text) to forge_project_root_reconciler')
     expect(migration).toContain('public.project_root_reconciliation_operations')
     expect(migration).toContain('REVOKE ALL ON FUNCTION forge.begin_project_root_reconciliation_v1')
     for (const table of [
