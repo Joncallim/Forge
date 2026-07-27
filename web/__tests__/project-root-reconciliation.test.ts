@@ -134,6 +134,8 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(reconcileScript).toContain('forge.enter_project_root_reconciliation_generation_v1')
     expect(reconcileScript).toContain('rootReconciliationContext:')
     expect(reconciliation).toContain('forge.lock_project_root_reconciliation_authority_v1')
+    expect(reconcileScript).toContain("completion.state === 'complete'")
+    expect(reconcileScript).toContain('Project-root completion returned an invalid state.')
     expect(reconciliation).toContain('input.rootReconciliationContext ? packageDecisionQuery : packageDecisionQuery.for(\'update\')')
   })
 
