@@ -14,12 +14,24 @@ fi
 psql "${FORGE_DATABASE_ADMIN_URL}" --set ON_ERROR_STOP=1 <<SQL
 BEGIN;
 SET LOCAL lock_timeout = '5s';
+SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('forge:projects_root_ref_idx:v1'));
 DO \$cutover\$
 DECLARE v_through bigint := ${through}::bigint;
 BEGIN
   IF (SELECT state FROM public.forge_epic_172_enablement_state WHERE singleton_id = 'epic-172') <> 'disabled' THEN
     RAISE EXCEPTION 'strict root-reference cutover requires Step 0 to remain disabled' USING ERRCODE = '55000';
   END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_index index_row
+    JOIN pg_catalog.pg_class index_class ON index_class.oid = index_row.indexrelid
+    JOIN pg_catalog.pg_am access_method ON access_method.oid = index_class.relam
+    JOIN pg_catalog.pg_attribute attribute_row ON attribute_row.attrelid = 'public.projects'::regclass AND attribute_row.attname = 'root_ref'
+    WHERE index_row.indexrelid = pg_catalog.to_regclass('public.projects_root_ref_idx')
+      AND index_row.indrelid = 'public.projects'::regclass AND index_row.indisunique AND index_row.indisvalid AND index_row.indisready
+      AND access_method.amname = 'btree' AND index_row.indnkeyatts = 1 AND index_row.indnatts = 1
+      AND index_row.indexprs IS NULL AND index_row.indkey[0] = attribute_row.attnum
+      AND pg_catalog.pg_get_expr(index_row.indpred, index_row.indrelid) = '(root_ref IS NOT NULL)'
+  ) THEN RAISE EXCEPTION 'strict root-reference cutover requires the exact canonical concurrent projects(root_ref) index' USING ERRCODE = '55000'; END IF;
   IF NOT EXISTS (
     SELECT 1 FROM public.project_root_reconciliation_operations operation
     WHERE operation.through_generation = v_through AND operation.state = 'complete'
@@ -31,10 +43,6 @@ BEGIN
     OR EXISTS (SELECT 1 FROM public.projects WHERE root_ref IS NULL) THEN
     RAISE EXCEPTION 'strict root-reference cutover requires exact completed watermark coverage' USING ERRCODE = '55000';
   END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_catalog.pg_index index_row
-    WHERE index_row.indexrelid = 'public.projects_root_ref_idx'::pg_catalog.regclass AND index_row.indisvalid
-  ) THEN RAISE EXCEPTION 'strict root-reference cutover requires a valid concurrent projects(root_ref) index' USING ERRCODE = '55000'; END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint WHERE conrelid = 'public.projects'::regclass AND conname = 'projects_root_ref_not_null_proof') THEN
     ALTER TABLE public.projects ADD CONSTRAINT projects_root_ref_not_null_proof CHECK (root_ref IS NOT NULL) NOT VALID;
   END IF;
