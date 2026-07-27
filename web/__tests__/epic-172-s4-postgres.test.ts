@@ -457,7 +457,7 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       `clarification_question:${ids.secondClarificationQuestion}`,
       'plan_body:000000',
       'requirement:plan-policy',
-    ])
+    ].sort((left, right) => left.localeCompare(right, 'en')))
     const [latestAudit] = await admin<{ returnedEntryCount: number; entrySetDigest: string }[]>`
       select returned_entry_count::integer as "returnedEntryCount", entry_set_digest as "entrySetDigest"
       from architect_plan_history_reads where task_id = ${ids.task}::uuid and plan_version = 3
