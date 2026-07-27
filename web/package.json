@@ -20,6 +20,7 @@
     "protocol:bootstrap-epic-172-release-roles": "tsx scripts/bootstrap-epic-172-release-roles.ts",
     "protocol:bootstrap-epic-172-s3-release-owner": "tsx scripts/bootstrap-epic-172-s3-release-owner.ts",
     "protocol:provision-epic-172-application-role": "tsx scripts/provision-epic-172-application-role.ts",
+    "protocol:provision-epic-172-local-evidence-reader": "tsx scripts/provision-epic-172-local-evidence-reader.ts",
     "protocol:epic-172-release": "tsx scripts/epic-172-release.ts",
     "db:seed-agents": "npx tsx db/seed-agents.ts",
     "db:seed-providers": "npx tsx db/seed-providers.ts",

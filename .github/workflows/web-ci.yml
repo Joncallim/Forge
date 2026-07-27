@@ -50,6 +50,7 @@ jobs:
       FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL: postgresql://forge_architect_plan_resolver:forge_plan_resolver_test@localhost:5432/forge_epic_172_ci_test
       FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL: postgresql://forge_architect_plan_history_reader:forge_plan_history_reader_test@localhost:5432/forge_epic_172_ci_test
       FORGE_PACKET_ISSUER_DATABASE_URL: postgresql://forge_packet_issuer:forge_packet_issuer_test@localhost:5432/forge_epic_172_ci_test
+      FORGE_LOCAL_RUN_EVIDENCE_READER_DATABASE_URL: postgresql://forge_local_evidence_reader:forge_local_evidence_reader_test@localhost:5432/forge_epic_172_ci_test
       FORGE_ARCHITECT_PLAN_DIGEST_KEY_HEX: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       FORGE_ARCHITECT_PLAN_DIGEST_KEY_ID: ci-v1
     steps:
@@ -112,6 +113,7 @@ jobs:
           ALTER ROLE forge_architect_plan_resolver PASSWORD 'forge_plan_resolver_test';
           ALTER ROLE forge_architect_plan_history_reader PASSWORD 'forge_plan_history_reader_test';
           ALTER ROLE forge_packet_issuer PASSWORD 'forge_packet_issuer_test';
+          ALTER ROLE forge_local_evidence_reader PASSWORD 'forge_local_evidence_reader_test';
           SQL
       - name: Apply migrations as the disposable migration owner
         run: npm run db:migrate
@@ -122,6 +124,32 @@ jobs:
         env:
           FORGE_APPLICATION_DATABASE_URL: postgresql://forge_app_test:forge_app_test@localhost:5432/forge_epic_172_ci_test
           FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+      - name: Provision the S5 local-evidence read boundary
+        run: npm run protocol:provision-epic-172-local-evidence-reader
+        env:
+          FORGE_DATABASE_ADMIN_URL: postgresql://forge_e2e:forge@localhost:5432/forge_epic_172_ci_test
+      - name: Prove the S5 reader can read presentation columns but never the claim token
+        working-directory: .
+        run: |
+          set -o pipefail
+          PGPASSWORD=forge_local_evidence_reader_test psql \
+            --host localhost --username forge_local_evidence_reader \
+            --dbname forge_epic_172_ci_test --set ON_ERROR_STOP=1 \
+            -c 'select id, task_id, work_package_id, agent_run_id, state, lease_expires_at, terminal_at from public.work_package_local_run_evidence limit 1'
+          if PGPASSWORD=forge_local_evidence_reader_test psql \
+            --host localhost --username forge_local_evidence_reader \
+            --dbname forge_epic_172_ci_test --set ON_ERROR_STOP=1 \
+            -c 'select claim_token from public.work_package_local_run_evidence limit 1' 2>/dev/null; then
+            echo 'The S5 local-evidence reader must never be able to select claim_token.' >&2
+            exit 1
+          fi
+          if PGPASSWORD=forge_local_evidence_reader_test psql \
+            --host localhost --username forge_local_evidence_reader \
+            --dbname forge_epic_172_ci_test --set ON_ERROR_STOP=1 \
+            -c 'delete from public.work_package_local_run_evidence' 2>/dev/null; then
+            echo 'The S5 local-evidence reader must never be able to write evidence.' >&2
+            exit 1
+          fi
       - name: Grant and verify the ordinary app boundary
         working-directory: .
         env:
@@ -290,6 +318,7 @@ jobs:
           FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL: postgresql://forge_architect_plan_resolver:forge_plan_resolver_test@localhost:5432/forge_epic_172_ci_test
           FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL: postgresql://forge_architect_plan_history_reader:forge_plan_history_reader_test@localhost:5432/forge_epic_172_ci_test
           FORGE_PACKET_ISSUER_DATABASE_URL: postgresql://forge_packet_issuer:forge_packet_issuer_test@localhost:5432/forge_epic_172_ci_test
+          FORGE_LOCAL_RUN_EVIDENCE_READER_DATABASE_URL: postgresql://forge_local_evidence_reader:forge_local_evidence_reader_test@localhost:5432/forge_epic_172_ci_test
       - run: npm run build
       - run: npx playwright install chromium
       - name: Run mandatory S3 PostgreSQL concurrency proof
