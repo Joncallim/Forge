@@ -18,8 +18,10 @@ import {
   type RepositoryEvidenceWorkPackage,
 } from '@/worker/repository-evidence'
 import {
+  hostRepositoryWritePolicyState,
   isHostRepositoryWritesEnabled,
   isRepositoryWritePackage,
+  shouldApplyHostRepositoryWrites,
 } from '@/worker/repository-edit-policy'
 
 const execFile = promisify(execFileCallback)
@@ -138,7 +140,7 @@ describe('repository execution context', () => {
     })
   })
 
-  it('blocks non-Git directories', async () => {
+  it('allows non-Git directories because execution is sandbox-only by default', async () => {
     const context = await buildRepositoryExecutionContext({
       project: project(tempRoot),
       task: task(),
@@ -146,10 +148,10 @@ describe('repository execution context', () => {
     })
 
     expect(context).toMatchObject({
-      status: 'blocked',
+      status: 'ready',
       pathExists: true,
       isGitRepository: false,
-      blockedReason: expect.stringMatching(/not a Git repository/i),
+      blockedReason: null,
     })
   })
 
@@ -173,7 +175,7 @@ describe('repository execution context', () => {
     })
   })
 
-  it('blocks dirty working trees before local repository edits while ignoring no-remote and branch collision in host-write mode', async () => {
+  it('does not gate sandbox execution on dirty trees, missing remotes, or branch collisions', async () => {
     await initRepo(tempRoot)
     await execFile('git', ['remote', 'remove', 'origin'], { cwd: tempRoot })
     await fs.writeFile(path.join(tempRoot, 'dirty.txt'), 'dirty\n')
@@ -187,11 +189,11 @@ describe('repository execution context', () => {
       workPackage: pkg,
     })
 
-    expect(context.status).toBe('blocked')
+    expect(context.status).toBe('ready')
     expect(context.isDirty).toBe(true)
     expect(context.hasRemote).toBe(false)
     expect(context.branchCollision).toBe(true)
-    expect(context.blockedReason).toMatch(/dirty/i)
+    expect(context.blockedReason).toBeNull()
 
     await execFile('git', ['add', 'dirty.txt'], { cwd: tempRoot })
     await execFile('git', ['commit', '-m', 'clean dirty fixture'], { cwd: tempRoot })
@@ -386,13 +388,48 @@ describe('repository execution context', () => {
 })
 
 describe('repository edit policy', () => {
-  it('recognizes expanded default-on disable values for host repository writes', () => {
-    expect(isHostRepositoryWritesEnabled({})).toBe(true)
-    expect(isHostRepositoryWritesEnabled({ FORGE_HOST_REPOSITORY_WRITES: '1' })).toBe(true)
-    expect(isHostRepositoryWritesEnabled({ FORGE_HOST_REPOSITORY_WRITES: 'true' })).toBe(true)
-    expect(isHostRepositoryWritesEnabled({ FORGE_HOST_REPOSITORY_WRITES: 'off' })).toBe(false)
-    expect(isHostRepositoryWritesEnabled({ FORGE_HOST_REPOSITORY_WRITES: 'no' })).toBe(false)
-    expect(isHostRepositoryWritesEnabled({ FORGE_HOST_REPOSITORY_WRITES: 'disabled' })).toBe(false)
+  it('keeps host writes unavailable while distinguishing explicit enable requests', () => {
+    expect(hostRepositoryWritePolicyState({})).toMatchObject({
+      available: false,
+      enabled: false,
+      recognized: true,
+      requested: false,
+      source: null,
+    })
+
+    for (const value of ['0', 'false', 'off', 'no', 'disabled']) {
+      expect(hostRepositoryWritePolicyState({ FORGE_HOST_REPOSITORY_WRITES: value })).toMatchObject({
+        enabled: false,
+        recognized: true,
+        requested: false,
+      })
+    }
+
+    for (const value of ['1', 'true', 'on', 'yes', 'enabled']) {
+      expect(hostRepositoryWritePolicyState({ FORGE_HOST_REPOSITORY_WRITES: value })).toMatchObject({
+        available: false,
+        enabled: false,
+        recognized: true,
+        requested: true,
+        source: 'FORGE_HOST_REPOSITORY_WRITES',
+      })
+    }
+
+    expect(hostRepositoryWritePolicyState({ FORGE_REPOSITORY_EDITS: 'true' })).toMatchObject({
+      enabled: false,
+      requested: true,
+      source: 'FORGE_REPOSITORY_EDITS',
+    })
+    expect(hostRepositoryWritePolicyState({ FORGE_HOST_REPOSITORY_WRITES: 'maybe' })).toMatchObject({
+      enabled: false,
+      recognized: false,
+      requested: false,
+    })
+    expect(isHostRepositoryWritesEnabled({ FORGE_HOST_REPOSITORY_WRITES: 'true' })).toBe(false)
+    expect(shouldApplyHostRepositoryWrites(workPackage(), {
+      FORGE_HOST_REPOSITORY_WRITES: 'true',
+    })).toBe(true)
+    expect(shouldApplyHostRepositoryWrites(workPackage(), {})).toBe(false)
   })
 
   it('normalizes display-style review and security roles as non-writing packages', () => {

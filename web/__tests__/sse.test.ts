@@ -25,6 +25,8 @@ const state = vi.hoisted(() => ({
     subscribe: ReturnType<typeof vi.fn>
     disconnect: ReturnType<typeof vi.fn>
   }) | null,
+  historyGet: vi.fn().mockResolvedValue('0'),
+  historyRange: vi.fn().mockResolvedValue([]),
 }))
 
 // ---------------------------------------------------------------------------
@@ -71,7 +73,8 @@ vi.mock('@/lib/redis', () => ({
     incr: vi.fn().mockResolvedValue(1),
     zadd: vi.fn().mockResolvedValue(0),
     expire: vi.fn().mockResolvedValue(1),
-    zrangebyscore: vi.fn().mockResolvedValue([]),
+    get: state.historyGet,
+    zrangebyscore: state.historyRange,
   },
 }))
 
@@ -161,6 +164,8 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     state.mockSub = null
+    state.historyGet.mockResolvedValue('0')
+    state.historyRange.mockResolvedValue([])
     mockGetSession.mockResolvedValue({ sessionId: 'sess-abc', userId: 'user-1' })
     let selectCount = 0
     mockDbSelect.mockImplementation(() => {
@@ -217,7 +222,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     expect(lines.join('\n')).toContain('"status":"running"')
   }, 2000)
 
-  it('includes workPackageId on package-scoped artifact snapshot events', async () => {
+  it('includes package scope while reducing protected Architect snapshots to opaque history availability', async () => {
     let selectCount = 0
     mockDbSelect.mockImplementation(() => {
       selectCount += 1
@@ -271,8 +276,14 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
             id: 'artifact-task',
             agentRunId: 'run-task',
             artifactType: 'adr_text',
-            content: 'Task-level plan.',
-            metadata: {},
+            content: 'Architect plan available in protected history',
+            metadata: {
+              historyAvailable: true,
+              planVersion: '7',
+              entryCount: 3,
+              system_prompt: 'RAW-SYSTEM-PROMPT-SENTINEL',
+              apiKey: 'RAW-API-KEY-SENTINEL',
+            },
             createdAt: new Date('2026-06-25T00:00:03.000Z'),
           },
         ])
@@ -285,17 +296,152 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     const res = await GET(sseRequest() as never, { params })
 
     const lines = await readLines(res.body!, 500)
-    const artifactPayloads = dataPayloads(lines).filter((payload) => payload.artifactType)
-    expect(artifactPayloads).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        id: 'artifact-package',
-        workPackageId: 'package-1',
-      }),
-      expect.objectContaining({
-        id: 'artifact-task',
-      }),
-    ]))
-    expect(artifactPayloads.find((payload) => payload.id === 'artifact-task')).not.toHaveProperty('workPackageId')
+    const payloads = dataPayloads(lines)
+    const artifactPayloads = payloads.filter((payload) => payload.artifactType)
+    expect(artifactPayloads).toContainEqual(expect.objectContaining({
+      id: 'artifact-package',
+      workPackageId: 'package-1',
+    }))
+    expect(payloads).toContainEqual({
+      agentRunId: 'run-task',
+      historyAvailable: true,
+    })
+    expect(payloads.find((payload) => payload.historyAvailable === true)).not.toHaveProperty('workPackageId')
+    expect(payloads.find((payload) => payload.historyAvailable === true)).not.toHaveProperty('planVersion')
+    expect(payloads.find((payload) => payload.historyAvailable === true)).not.toHaveProperty('entryCount')
+    expect(artifactPayloads.every((payload) => !Object.hasOwn(payload, 'content'))).toBe(true)
+    expect(lines.join('\n')).not.toContain('planVersion')
+    expect(lines.join('\n')).not.toContain('entryCount')
+    expect(lines.join('\n')).not.toContain('RAW-SYSTEM-PROMPT-SENTINEL')
+    expect(lines.join('\n')).not.toContain('RAW-API-KEY-SENTINEL')
+  }, 2000)
+
+  it('reduces reconnect question snapshots to opaque status and timestamp summaries', async () => {
+    let selectCount = 0
+    mockDbSelect.mockImplementation(() => {
+      selectCount += 1
+      if (selectCount === 1) return dbChain([fakeTask()])
+      if (selectCount === 2) return dbChain([{ status: fakeTask().status }])
+      if (selectCount === 3) {
+        return dbChain([{
+          id: 'run-task',
+          taskId: 'task-sse-1',
+          workPackageId: null,
+          agentType: 'architect',
+          modelIdUsed: 'openrouter/architect',
+          status: 'completed',
+          inputTokens: null,
+          outputTokens: null,
+          costUsd: null,
+          startedAt: new Date('2026-07-22T00:00:00.000Z'),
+          completedAt: new Date('2026-07-22T00:00:01.000Z'),
+          errorMessage: null,
+          createdAt: new Date('2026-07-22T00:00:00.000Z'),
+        }])
+      }
+      if (selectCount === 4) return dbChain([])
+      if (selectCount === 5) {
+        return dbChain([{
+          id: '00000000-0000-4000-8000-000000000001',
+          status: 'open',
+          createdAt: new Date('2026-07-22T00:00:02.000Z'),
+          answeredAt: null,
+          question: 'RAW-QUESTION-SENTINEL',
+          suggestions: ['RAW-SUGGESTION-SENTINEL'],
+          answer: 'RAW-ANSWER-SENTINEL',
+        }])
+      }
+      return dbChain([])
+    })
+
+    const { GET } = await import('@/app/api/tasks/[id]/runs/route')
+    const params = Promise.resolve({ id: 'task-sse-1' })
+    const res = await GET(sseRequest() as never, { params })
+
+    const lines = await readLines(res.body!, 500)
+    const questionPayload = dataPayloads(lines).find((payload) => (
+      Array.isArray(payload.questionSummaries)
+    ))
+    const questionSummaries = questionPayload?.questionSummaries as Array<Record<string, unknown>> | undefined
+    expect(lines).toContain('event: questions:created')
+    expect(questionPayload).toEqual({
+      questionSummaries: [{
+        id: '00000000-0000-4000-8000-000000000001',
+        status: 'open',
+        createdAt: '2026-07-22T00:00:02.000Z',
+        answeredAt: null,
+      }],
+      questionCount: 1,
+      openCount: 1,
+      answeredCount: 0,
+    })
+    expect(questionSummaries?.[0]).not.toHaveProperty('question')
+    expect(questionSummaries?.[0]).not.toHaveProperty('suggestions')
+    expect(questionSummaries?.[0]).not.toHaveProperty('answer')
+    expect(lines.join('\n')).not.toContain('RAW-')
+  }, 2000)
+
+  it('rejects legacy live run chunks so model output cannot bypass the closed Redis schema', async () => {
+    const { GET } = await import('@/app/api/tasks/[id]/runs/route')
+    const params = Promise.resolve({ id: 'task-sse-1' })
+    const res = await GET(sseRequest() as never, { params })
+
+    setTimeout(() => {
+      state.mockSub?.emit(
+        'message',
+        'forge:task:task-sse-1',
+        JSON.stringify({
+          schemaVersion: 2,
+          id: null,
+          type: 'run:chunk',
+          data: {
+            type: 'run:chunk',
+            delta: 'RAW-DELTA-SENTINEL',
+            metadata: {
+              promptOverlay: 'RAW-OVERLAY-SENTINEL',
+              api_key: 'RAW-KEY-SENTINEL',
+              status: 'streaming',
+            },
+          },
+        }),
+      )
+    }, 100)
+
+    const lines = await readLines(res.body!, 500)
+    expect(lines).not.toContain('event: run:chunk')
+    expect(lines.join('\n')).not.toContain('RAW-')
+    const { redis } = await import('@/lib/redis')
+    expect(redis.incr).not.toHaveBeenCalled()
+    expect(redis.zadd).not.toHaveBeenCalled()
+  }, 2000)
+
+  it('rejects legacy prompt-bearing question answer envelopes', async () => {
+    const { GET } = await import('@/app/api/tasks/[id]/runs/route')
+    const params = Promise.resolve({ id: 'task-sse-1' })
+    const res = await GET(sseRequest() as never, { params })
+
+    setTimeout(() => {
+      state.mockSub?.emit(
+        'message',
+        'forge:task:task-sse-1',
+        JSON.stringify({
+          schemaVersion: 2,
+          id: null,
+          type: 'questions:answered',
+          data: {
+            type: 'questions:answered',
+            questions: [{ id: 'question-1', answer: 'operator answer' }],
+          },
+        }),
+      )
+    }, 100)
+
+    const lines = await readLines(res.body!, 500)
+    expect(lines).not.toContain('event: questions:answered')
+    expect(lines.join('\n')).not.toContain('operator answer')
+    const { redis } = await import('@/lib/redis')
+    expect(redis.incr).not.toHaveBeenCalled()
+    expect(redis.zadd).not.toHaveBeenCalled()
   }, 2000)
 
   it('emits event: run:started within 500ms when a run:started message is published', async () => {
@@ -308,7 +454,12 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
       state.mockSub?.emit(
         'message',
         'forge:task:task-sse-1',
-        JSON.stringify({ type: 'run:started' }),
+        JSON.stringify({
+          schemaVersion: 2,
+          id: 1,
+          type: 'run:started',
+          data: { runId: '00000000-0000-4000-8000-000000000001' },
+        }),
       )
     }, 100)
 
@@ -327,7 +478,12 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
       state.mockSub?.emit(
         'message',
         'forge:task:task-sse-1',
-        JSON.stringify({ type: 'task:status', status: 'completed' }),
+        JSON.stringify({
+          schemaVersion: 2,
+          id: 1,
+          type: 'task:status',
+          data: { status: 'completed', updatedAt: '2026-07-22T00:00:00.000Z' },
+        }),
       )
     }, 100)
 
@@ -335,6 +491,67 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     const allText = lines.join('\n')
     expect(allText).toContain('[DONE]')
   }, 3000)
+
+  it('fills a live producer-ID gap from durable history before delivering the new event', async () => {
+    state.historyGet.mockResolvedValue('1')
+    state.historyRange.mockResolvedValue([
+      JSON.stringify({
+        schemaVersion: 2,
+        id: 2,
+        type: 'run:started',
+        data: { runId: '00000000-0000-4000-8000-000000000002' },
+      }),
+      '2',
+    ])
+    const { GET } = await import('@/app/api/tasks/[id]/runs/route')
+    const res = await GET(sseRequest() as never, { params: Promise.resolve({ id: 'task-sse-1' }) })
+
+    setTimeout(() => {
+      state.mockSub?.emit('message', 'forge:task:task-sse-1', JSON.stringify({
+        schemaVersion: 2,
+        id: 3,
+        type: 'run:completed',
+        data: { runId: '00000000-0000-4000-8000-000000000002' },
+      }))
+    }, 100)
+
+    const lines = await readLines(res.body!, 500)
+    expect(lines).toContain('id: 2')
+    expect(lines).toContain('id: 3')
+    expect(lines.indexOf('id: 2')).toBeLessThan(lines.indexOf('id: 3'))
+  }, 2000)
+
+  it('signals a reset when reconnect history has been trimmed past the requested event ID', async () => {
+    state.historyGet.mockResolvedValue('4')
+    state.historyRange.mockResolvedValue([
+      JSON.stringify({
+        schemaVersion: 2,
+        id: 3,
+        type: 'run:started',
+        data: { type: 'run:started', runId: 'run-3' },
+      }),
+      '3',
+      JSON.stringify({
+        schemaVersion: 2,
+        id: 4,
+        type: 'run:completed',
+        data: { type: 'run:completed', runId: 'run-3' },
+      }),
+      '4',
+    ])
+    const request = new Request('http://localhost/api/tasks/task-sse-1/runs', {
+      headers: {
+        cookie: 'forge_session=sess-abc',
+        'last-event-id': '1',
+      },
+    })
+    const { GET } = await import('@/app/api/tasks/[id]/runs/route')
+    const res = await GET(request as never, { params: Promise.resolve({ id: 'task-sse-1' }) })
+
+    const lines = await readLines(res.body!, 500)
+    expect(lines).toContain('event: stream:reset')
+    expect(lines.join('\n')).toContain('"reason":"retention_gap"')
+  }, 2000)
 
   it('drops pub/sub messages after the client stream closes without logging controller errors', async () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -350,7 +567,12 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
       state.mockSub?.emit(
         'message',
         'forge:task:task-sse-1',
-        JSON.stringify({ type: 'run:chunk', delta: 'late chunk' }),
+        JSON.stringify({
+          schemaVersion: 2,
+          id: null,
+          type: 'run:chunk',
+          data: { type: 'run:chunk', delta: 'late chunk' },
+        }),
       )
       await new Promise((resolve) => setTimeout(resolve, 20))
 

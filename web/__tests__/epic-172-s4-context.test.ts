@@ -6,6 +6,7 @@ import type { McpWorkPackageAdmission } from '@/lib/mcps/admission'
 import {
   ARCHITECT_PLAN_HEADER,
   architectPlanEntryReference,
+  architectReplanReferenceForEntry,
   materializeArchitectPlanEntries,
   parseArchitectPlanEntryReference,
   verifyArchitectPlanEntry,
@@ -51,6 +52,10 @@ const s4RoleBootstrap = readFileSync(
 )
 const s4Migration = readFileSync(
   fileURLToPath(new URL('../db/migrations/0027_epic_172_s4_packet_context.sql', import.meta.url)),
+  'utf8',
+)
+const sessionReconciliation = readFileSync(
+  fileURLToPath(new URL('../scripts/reconcile-session-credentials.ts', import.meta.url)),
   'utf8',
 )
 
@@ -112,6 +117,15 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(bootstrapIndex).toBeGreaterThan(-1)
     expect(migrateIndex).toBeGreaterThan(bootstrapIndex)
     expect(webCiWorkflow).toContain('npm run protocol:bootstrap-epic-172-s4-roles')
+    expect(webCiWorkflow).toContain('name: Create the freshly migrated isolated S4 PostgreSQL proof database')
+    expect(webCiWorkflow).toContain('CREATE DATABASE forge_s4_ci_test OWNER forge_migration_test;')
+    expect(webCiWorkflow).toContain('npm run test:mcp:s4-postgres -- --reporter=default | tee "$report"')
+    expect(webCiWorkflow).toContain('run: npm run test:unit:zero-skip')
+    const zeroSkipStep = webCiWorkflow.slice(
+      webCiWorkflow.indexOf('name: Run the complete zero-skip unit suite'),
+      webCiWorkflow.indexOf('name: Run mandatory S4 PostgreSQL zero-skip proof'),
+    )
+    expect(zeroSkipStep).not.toContain('FORGE_S4_POSTGRES_TEST_DATABASE_URL:')
     expect(webCiWorkflow).toContain("FORGE_S4_REQUIRE_POSTGRES_TEST: '1'")
     for (const variable of [
       'FORGE_S4_POSTGRES_TEST_DATABASE_URL',
@@ -119,24 +133,202 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
       'FORGE_ARCHITECT_PLAN_RESOLVER_DATABASE_URL',
       'FORGE_ARCHITECT_PLAN_HISTORY_READER_DATABASE_URL',
       'FORGE_PACKET_ISSUER_DATABASE_URL',
+      'FORGE_EPIC_172_TEST_APP_DATABASE_URL',
     ]) {
       expect(webCiWorkflow).toContain(`${variable}:`)
     }
   })
 
   it('keeps every S4-owned table outside the ordinary application grant loop', () => {
+    const ordinaryInventory = webCiWorkflow.match(
+      /ordinary_tables constant text\[\] := ARRAY\[([\s\S]*?)\];/,
+    )?.[1] ?? ''
+    const protectedInventory = webCiWorkflow.match(
+      /protected_tables constant text\[\] := ARRAY\[([\s\S]*?)\];/,
+    )?.[1] ?? ''
     for (const table of [
       'architect_plan_versions',
       'architect_plan_entries',
       'architect_plan_execution_references',
       'architect_plan_history_reads',
-      'epic_172_s4_protocol_state',
+      'architect_clarification_answers',
+      'architect_clarification_answer_writes',
+      'protected_package_entry_registrations',
+      'protected_entry_capability_bindings',
+      'mcp_operator_review_versions',
+      'mcp_operator_review_entries',
       'work_package_local_run_evidence',
+      's4_completion_handoffs',
+      's4_protected_review_sources',
+      's4_protected_review_source_reads',
+      'filesystem_mcp_issuance_recovery_actions',
+      'local_effect_recovery_actions',
+      's4_max_attempt_finalizations',
+      'local_projection_archive_operations',
+      'local_projection_archive_operation_checkpoints',
       'filesystem_mcp_decision_nonce_claims',
     ]) {
-      expect(webCiWorkflow.match(new RegExp(`'public\\.${table}'`, 'g'))).toHaveLength(1)
-      expect(webCiWorkflow.match(new RegExp(`'${table}'`, 'g'))).toHaveLength(1)
+      expect(ordinaryInventory).not.toContain(`'${table}'`)
+      expect(protectedInventory).toContain(`'${table}'`)
     }
+  })
+
+  it('uses only the Step 0 enablement authority for protected S4 paths', () => {
+    expect(s4Migration).not.toContain('CREATE TABLE public.epic_172_s4_protocol_state')
+    expect(s4Migration).not.toContain('FROM public.epic_172_s4_protocol_state')
+    expect(s4Migration).toContain('FROM forge.read_epic_172_enablement_state_v1() state')
+    expect(s4Migration).not.toContain("'issue_179_s4@' || state.reviewed_sha")
+    expect(s4Migration).toContain('pg_catalog.count(DISTINCT build.value) = 3')
+    expect(s4Migration).toContain("'^issue_179_s4@[^@[:space:]]+$'")
+    expect(s4Migration).toContain("'^issue_180_s5@[^@[:space:]]+$'")
+    expect(s4Migration).toContain("'^issue_181_s6@[^@[:space:]]+$'")
+  })
+
+  it('keeps the ordinary-app Architect trigger on an S4-owned security-definer bridge', () => {
+    const definitions = s4Migration.match(/CREATE OR REPLACE FUNCTION[\s\S]*?\$\$;/g) ?? []
+    const predicate = definitions.find((definition) => definition.startsWith(
+      'CREATE OR REPLACE FUNCTION forge.s4_protected_paths_enabled_v1()',
+    ))
+    const guard = definitions.find((definition) => definition.startsWith(
+      'CREATE OR REPLACE FUNCTION forge.guard_architect_plan_public_artifact_v1()',
+    ))
+
+    expect(predicate).toMatch(/SECURITY DEFINER\s+SET search_path = pg_catalog, public/)
+    expect(guard).toMatch(/SECURITY DEFINER\s+SET search_path = pg_catalog, forge/)
+    for (const routine of [
+      's4_protected_paths_enabled_v1',
+      'guard_architect_plan_public_artifact_v1',
+    ]) {
+      expect(s4Migration).toContain(`REVOKE ALL ON FUNCTION forge.${routine}() FROM PUBLIC;`)
+      expect(s4Migration).toContain(
+        `ALTER FUNCTION forge.${routine}() OWNER TO forge_s4_routines_owner;`,
+      )
+    }
+
+    const predicateCallers = definitions.filter((definition) => (
+      definition.includes('forge.s4_protected_paths_enabled_v1()')
+      && !definition.startsWith('CREATE OR REPLACE FUNCTION forge.s4_protected_paths_enabled_v1()')
+    ))
+    expect(predicateCallers.map((definition) => definition.match(
+      /CREATE OR REPLACE FUNCTION forge\.([a-z0-9_]+)/,
+    )?.[1])).toEqual([
+      'append_mcp_operator_review_version_v1',
+      'guard_architect_plan_public_artifact_v1',
+      'read_architect_plan_history_v1',
+      'read_mcp_operator_review_history_v1',
+      'list_approved_package_plan_registrations_v1',
+      'resolve_architect_plan_entry_v1',
+      's4_runtime_mode_v1',
+      'read_s4_runtime_mode_for_application_v1',
+      'create_local_run_evidence_v1',
+      'insert_packet_authorization_snapshot_v2',
+      'claim_packet_lifecycle_v2',
+      'claim_work_package_lifecycle_v2',
+      'lock_live_packet_lifecycle_v2',
+      'lock_live_local_lifecycle_v2',
+      'list_pending_s4_completion_handoffs_v1',
+      'claim_pending_s4_completion_handoffs_v1',
+      'finalize_s4_max_attempts_v1',
+      'recover_stale_local_lifecycle_v2',
+      'recover_stale_packet_lifecycle_v2',
+      'cas_packet_reapproval_v2',
+      'apply_local_effect_recovery_action_v2',
+      'apply_packet_issuance_recovery_action_v2',
+      'insert_architect_plan_version_v1',
+      'bind_architect_plan_entry_v1',
+      'bind_architect_replan_entry_v1',
+      'register_package_plan_entries_v1',
+      'bind_architect_plan_entry_v2',
+      'bind_architect_replan_context_v2',
+      'resolve_architect_plan_entry_v2',
+      'append_architect_clarification_answer_v1',
+    ])
+    for (const caller of predicateCallers) expect(caller).toContain('SECURITY DEFINER')
+  })
+
+  it('keeps clarification ledger and replan routines behind the protected owner boundary', () => {
+    for (const table of [
+      'architect_clarification_answers',
+      'architect_clarification_answer_writes',
+    ]) {
+      expect(s4Migration).toContain(`public.${table}`)
+      expect(s4Migration).toContain(`ALTER TABLE public.${table} OWNER TO forge_s4_routines_owner;`)
+    }
+    for (const routine of [
+      'bind_architect_replan_context_v3',
+      'resolve_architect_plan_entry_v2',
+      'append_architect_clarification_answer_v1',
+    ]) {
+      expect(s4Migration).toContain(`CREATE OR REPLACE FUNCTION forge.${routine}(`)
+      expect(s4Migration).toContain(`ALTER FUNCTION forge.${routine}`)
+    }
+    expect(s4Migration).toMatch(/GRANT EXECUTE ON FUNCTION forge\.bind_architect_replan_context_v3\([^;]+TO forge_architect_plan_writer;/)
+    expect(s4Migration).toMatch(/GRANT EXECUTE ON FUNCTION forge\.resolve_architect_plan_entry_v2\([^;]+TO forge_architect_plan_resolver;/)
+    expect(s4Migration).toMatch(/GRANT EXECUTE ON FUNCTION forge\.append_architect_clarification_answer_v1\([^;]+TO forge_architect_plan_history_reader;/)
+    expect(s4Migration).toContain('source_kind = \'clarification_answer\'')
+    expect(s4Migration).toContain('answer_reference_id')
+    expect(s4Migration).toContain('task_questions_task_id_id_key UNIQUE (task_id, id)')
+    expect(s4Migration).toContain('REFERENCES public.task_questions(task_id, id)')
+    expect(s4Migration).toContain('REFERENCES public.architect_clarification_answers(task_id, question_id, id)')
+    expect(s4Migration).toContain('GRANT SELECT, UPDATE ON public.task_questions TO forge_s4_routines_owner;')
+    expect(s4Migration).toContain('REVOKE ALL ON public.architect_plan_versions, public.architect_plan_entries,')
+    expect(s4Migration).toContain('public.task_questions,')
+    expect(s4Migration).toMatch(/RETURNS TABLE \(purpose text, source_kind text, task_id uuid/)
+  })
+
+  it('exposes only atomic S4 lifecycle entry points to the packet issuer', () => {
+    for (const helper of [
+      'create_local_run_evidence_v1(uuid,uuid,integer)',
+      'insert_packet_authorization_snapshot_v2(uuid,uuid,uuid,uuid,uuid,integer,text[])',
+      'claim_local_lifecycle_v2(uuid,uuid,integer)',
+      'claim_packet_lifecycle_v2(uuid,uuid,uuid,uuid,integer,integer,text[])',
+      'lock_live_packet_lifecycle_v2(uuid,uuid,bigint,uuid,bigint)',
+      'lock_live_local_lifecycle_v2(uuid,uuid,bigint)',
+      'recover_stale_local_lifecycle_v2(uuid)',
+      'recover_stale_packet_lifecycle_v2(uuid)',
+    ]) {
+      expect(s4Migration).toContain(`REVOKE ALL ON FUNCTION forge.${helper} FROM PUBLIC;`)
+      expect(s4Migration).not.toContain(
+        `GRANT EXECUTE ON FUNCTION forge.${helper} TO forge_packet_issuer;`,
+      )
+    }
+    for (const entryPoint of [
+      'claim_work_package_lifecycle_v2(text,uuid,uuid,timestamptz,uuid,text,uuid,integer,uuid,text,timestamptz,text,text,integer,uuid,uuid,uuid,integer,integer,text[])',
+      'heartbeat_local_lifecycle_v2(uuid,uuid,bigint,integer)',
+      'heartbeat_packet_lifecycle_v2(uuid,uuid,bigint,uuid,bigint,integer,integer)',
+      'recover_linked_s4_lifecycle_v2(uuid)',
+    ]) {
+      expect(s4Migration).toContain(
+        `GRANT EXECUTE ON FUNCTION forge.${entryPoint} TO forge_packet_issuer;`,
+      )
+    }
+    expect(s4Migration).toContain('evidence.lease_expires_at > v_now')
+    expect(s4Migration).toContain('audit.lease_expires_at > v_now')
+    expect(s4Migration).not.toContain('Date.now()')
+  })
+
+  it('keeps the Architect replan arm purpose-discriminated and one-reader-only', () => {
+    expect(s4Migration).toContain("purpose IN ('package_specialist', 'architect_replan')")
+    expect(s4Migration).toContain("purpose = 'architect_replan'")
+    expect(s4Migration).toContain("entry.entry_id = 'plan_body:000000'")
+    expect(s4Migration).toContain('AND NOT entry.projection_eligible')
+    expect(s4Migration).toContain('CREATE OR REPLACE FUNCTION forge.bind_architect_replan_entry_v1(')
+    expect(s4Migration).toContain(
+      'GRANT EXECUTE ON FUNCTION forge.bind_architect_replan_entry_v1(uuid,uuid) TO forge_architect_plan_writer;',
+    )
+    expect(s4Migration).not.toContain(
+      'forge.bind_architect_replan_entry_v1(uuid,uuid,uuid,bigint,text,text,text)',
+    )
+    const binder = (s4Migration.match(/CREATE OR REPLACE FUNCTION[\s\S]*?\$\$;/g) ?? [])
+      .find((definition) => definition.startsWith(
+        'CREATE OR REPLACE FUNCTION forge.bind_architect_replan_entry_v1(',
+      ))
+    expect(binder).toContain('p_task_id uuid,\n  p_agent_run_id uuid')
+    expect(binder).not.toMatch(/p_(?:plan_artifact_id|plan_version|entry_id|content_digest|digest_key_id)/)
+    expect(binder).toContain('ORDER BY entry.plan_version DESC')
+    expect(binder).toContain('FOR KEY SHARE OF entry, version, artifact, source_run')
+    expect(s4Migration.match(/CREATE OR REPLACE FUNCTION forge\.resolve_architect_plan_entry_v1/g))
+      .toHaveLength(1)
   })
 
   it('opens and closes one migration-session-bound S4 schema authority fence', () => {
@@ -148,7 +340,10 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(s4RoleBootstrap).toContain('security definer')
     expect(s4RoleBootstrap).toContain('if session_user <> ${migrationLiteral}')
     expect(s4RoleBootstrap).toContain("'grant usage, create on schema forge to %I'")
-    expect(s4RoleBootstrap).toContain("'revoke usage, create on schema forge from %I'")
+    // The migration login keeps schema USAGE for the application reader but
+    // loses its temporary CREATE authority at finalization.
+    expect(s4RoleBootstrap).toContain("'revoke create on schema forge from %I'")
+    expect(s4RoleBootstrap).not.toContain("'revoke usage, create on schema forge from %I'")
     expect(s4RoleBootstrap).toContain(
       "'revoke execute on function public.forge_begin_epic_172_s4_owner_bootstrap_v1() from %I'",
     )
@@ -156,19 +351,59 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
       "'revoke execute on function public.forge_finalize_epic_172_s4_owner_bootstrap_v1() from %I'",
     )
     expect(s4RoleBootstrap).toContain("has_schema_privilege('${OWNER}', 'forge', 'create')")
+    expect(s4RoleBootstrap).toContain('protectedMembershipEdges !== 0')
+    expect(s4RoleBootstrap).toContain('An S4 protected principal has a pre-existing role membership edge')
+    expect(s4RoleBootstrap).toContain(
+      'The temporary migration-to-owner edge is not the exclusive S4 membership edge',
+    )
+    expect(s4RoleBootstrap).toContain('A finalized S4 protected principal retains a membership edge')
+    expect(s4RoleBootstrap).toContain("'${OWNER}'::regrole")
+    for (const role of [
+      'forge_architect_plan_writer',
+      'forge_architect_plan_resolver',
+      'forge_architect_plan_history_reader',
+      'forge_packet_issuer',
+    ]) {
+      expect(s4RoleBootstrap).toContain(`'${role}'::regrole`)
+    }
+    const beginHelper = s4RoleBootstrap.slice(
+      s4RoleBootstrap.indexOf('create or replace function public.forge_begin_epic_172_s4_owner_bootstrap_v1()'),
+      s4RoleBootstrap.indexOf('create or replace function public.forge_finalize_epic_172_s4_owner_bootstrap_v1()'),
+    )
+    expect(beginHelper.indexOf("'grant ${OWNER} to %I with admin false, inherit false, set true'"))
+      .toBeLessThan(beginHelper.indexOf(
+        'The temporary migration-to-owner edge is not the exclusive S4 membership edge',
+      ))
   })
 
-  it('resumably upgrades legacy raw-id sessions into database authority', () => {
+  it('keeps session cutover additive until exact Redis expiry and key drain are proven', () => {
     expect(s4Migration).toContain("pg_catalog.convert_to('forge:web-session:v1', 'UTF8')")
     expect(s4Migration).toContain("|| pg_catalog.decode('00', 'hex')")
-    expect(s4Migration).toContain("|| pg_catalog.convert_to(id::text, 'UTF8')")
-    expect(s4Migration).toContain('credential_digest_v1 = COALESCE(')
-    expect(s4Migration).toContain("expires_at = COALESCE(expires_at, last_seen_at + interval '7 days')")
-    expect(s4Migration).toContain('SET id = pg_catalog.gen_random_uuid()')
-    expect(s4Migration).toContain("legacy raw-cookie session primary key remains after rekey")
-    expect(s4Migration).not.toMatch(/WHERE\s+(?:session_row\.)?id\s*=\s*(?:p_)?session_credential/i)
-    expect(s4Migration).toContain('ALTER COLUMN credential_digest_v1 SET NOT NULL')
-    expect(s4Migration).toContain('ALTER COLUMN expires_at SET NOT NULL')
+    expect(s4Migration).toContain('credential_storage_version integer NOT NULL DEFAULT 0')
+    expect(s4Migration).toContain('legacy_redis_purge_pending_at timestamptz')
+    expect(s4Migration).toContain('session_credential_reconciliation')
+    expect(s4Migration).toContain("state IN ('expansion','draining','strict')")
+    expect(s4Migration).toContain('sessions_credential_cutover_guard_v1')
+    expect(s4Migration).not.toContain("last_seen_at + interval '7 days'")
+    expect(s4Migration).not.toContain('ALTER COLUMN credential_digest_v1 SET NOT NULL')
+    expect(s4Migration).not.toContain('ALTER COLUMN expires_at SET NOT NULL')
+    expect(s4Migration).toContain('Session credential expired before history delivery')
+    expect(sessionReconciliation).toContain("redis.call('PEXPIRETIME', KEYS[1])")
+    expect(sessionReconciliation).toContain("redis.scan(cursor, 'MATCH', 'session:*'")
+    expect(sessionReconciliation).toContain("if (!key.startsWith('session:v2:'))")
+    expect(sessionReconciliation).not.toContain('Date.now()')
+    expect(sessionReconciliation).toContain(
+      'PostgreSQL did not preserve the exact Redis PEXPIRETIME value',
+    )
+    expect(sessionReconciliation).toContain('legacy_redis_purge_pending_at = pg_catalog.clock_timestamp()')
+    expect(sessionReconciliation).toContain('await redis.del(legacyKey)')
+    expect(sessionReconciliation.indexOf('await redis.del(legacyKey)')).toBeLessThan(
+      sessionReconciliation.indexOf('credential_storage_version = 2'),
+    )
+    expect(sessionReconciliation).toContain('Strict session cutover zero-scan failed')
+    expect(sessionReconciliation).toContain('Strict session cutover Redis zero-scan failed')
+    expect(sessionReconciliation).toContain('alter column credential_digest_v1 set not null')
+    expect(sessionReconciliation).toContain('alter column expires_at set not null')
   })
 })
 
@@ -187,13 +422,7 @@ describe('Epic 172 S4 protected Architect plan history', () => {
       architect_plan: 'raw plan',
       private_key: 'raw key',
       message: 'architect_plan: raw plan',
-    })).toEqual({
-      plan_body: '[prompt content drained by S4 leakage barrier]',
-      fullPlan: '[prompt content drained by S4 leakage barrier]',
-      architect_plan: '[prompt content drained by S4 leakage barrier]',
-      private_key: '[redacted: 7 bytes]',
-      message: '[secret value drained]',
-    })
+    })).toEqual({})
   })
 
   it('materializes deterministic NFC HMAC envelopes and text-free executable references', () => {
@@ -251,6 +480,26 @@ describe('Epic 172 S4 protected Architect plan history', () => {
         content: 'Retained legacy plan', projectionEligible: true,
       }],
     })).toThrow(/never executable/)
+  })
+
+  it('keeps non-projection plan-body replan references distinct from executable references', () => {
+    const protectedPlan = materializeArchitectPlanEntries({
+      digestKey: randomBytes(32), digestKeyId: 'plan-key-1', taskId: TASK_ID,
+      planArtifactId: ARTIFACT_ID, planVersion: '1',
+      entries: [{
+        entryId: 'plan_body:000000', entryKind: 'plan_body', agent: null,
+        requirementKey: null, bindingFingerprint: null, content: 'Protected previous plan.',
+        projectionEligible: false,
+      }],
+    })
+    const planBody = protectedPlan.entries[0]
+    expect(() => architectPlanEntryReference(planBody)).toThrow(/ineligible Architect history/i)
+    const replanReference = architectReplanReferenceForEntry(planBody)
+    expect(replanReference).toEqual(expect.objectContaining({
+      entryId: 'plan_body:000000',
+      contentDigest: planBody.contentDigest,
+    }))
+    expect(JSON.stringify(replanReference)).not.toContain('Protected previous plan.')
   })
 })
 

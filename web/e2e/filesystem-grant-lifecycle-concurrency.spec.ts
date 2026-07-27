@@ -122,6 +122,68 @@ function expectedPointer(pointer: Awaited<ReturnType<typeof seed>>['pointer']) {
   }
 }
 
+async function operatorHoldHead(
+  sql: ReturnType<typeof sqlClient>,
+  workPackageId: string,
+) {
+  const [head] = await sql<{
+    contribution: Record<string, unknown>
+    head_revision: string
+  }[]>`
+    select contribution, head_revision::text
+    from work_package_local_projection_heads
+    where work_package_id = ${workPackageId} and head_kind = 'operator_hold'
+  `
+  return head
+}
+
+test('initial handoff persists one full canonical marker across package and operator-hold projection', async () => {
+  const fixture = await seed()
+  const sql = sqlClient()
+  try {
+    await sql`update work_packages set status = 'completed' where id = ${fixture.lowerPackageId}`
+    await sql`
+      update work_packages
+      set mcp_requirements = ${sql.json([{
+        mcpId: 'filesystem',
+        agent: 'backend',
+        requirement: 'required',
+        capabilities: [
+          'filesystem.project.search',
+          'filesystem.project.read',
+          'filesystem.project.list',
+          'filesystem.project.read',
+        ],
+        fallback: { action: 'block', message: '' },
+      }])}
+      where id = ${fixture.targetPackageId}
+    `
+    const result = await handoffApprovedWorkPackages(fixture.taskId, { claimEnabled: false })
+    expect(result).toMatchObject({ status: 'blocked', taskDisposition: 'operator_hold' })
+    const [held] = await sql<{ marker: Record<string, unknown> }[]>`
+      select metadata->'mcpGrantBlock' as marker
+      from work_packages where id = ${fixture.targetPackageId}
+    `
+    expect(held.marker.requestedCapabilities).toEqual([
+      'filesystem.project.list',
+      'filesystem.project.read',
+      'filesystem.project.search',
+    ])
+    expect(held.marker.blockFingerprint).toMatch(/^sha256:[0-9a-f]{64}$/)
+    expect(await operatorHoldHead(sql, fixture.targetPackageId)).toEqual({
+      contribution: expect.objectContaining({
+        mcpGrantBlock: held.marker,
+        operatorHold: true,
+        priorBlockFingerprint: null,
+        transition: 'hold',
+      }),
+      head_revision: '1',
+    })
+  } finally {
+    await sql.end()
+  }
+})
+
 test('mcp-admission.real-approval-route: concurrent reapproval has one CAS winner and immutable history', async () => {
   const fixture = await seed()
   const mutation = {
@@ -243,6 +305,117 @@ test('mcp-admission.real-approval-route: concurrent reapproval has one CAS winne
       update filesystem_mcp_grant_approvals set reason = 'mutated'
       where work_package_id = ${fixture.targetPackageId}
     `).rejects.toMatchObject({ code: '55000' })
+  } finally {
+    await sql.end()
+  }
+})
+
+test('package decisions advance operator-hold exactly once for hold, refresh, and recovery', async () => {
+  const fixture = await seed()
+  const sql = sqlClient()
+  try {
+    const deny = async (pointer: typeof fixture.pointer, reason: string) => {
+      await mutateTaskFilesystemGrants({
+        actorId: fixture.userId,
+        mutations: [{
+          capabilities: [],
+          decision: 'denied',
+          grantMode: 'allow_once',
+          reason,
+          workPackageId: fixture.targetPackageId,
+          expectedPointer: expectedPointer(pointer),
+        }],
+        projectId: fixture.projectId,
+        taskId: fixture.taskId,
+      })
+    }
+    await deny(fixture.pointer, 'initial denial')
+    const [firstHeld] = await sql<{ marker: Record<string, unknown> }[]>`
+      select metadata->'mcpGrantBlock' as marker from work_packages
+      where id = ${fixture.targetPackageId}
+    `
+    let head = await operatorHoldHead(sql, fixture.targetPackageId)
+    expect(head).toEqual({
+      contribution: expect.objectContaining({
+        mcpGrantBlock: firstHeld.marker,
+        priorBlockFingerprint: null,
+        transition: 'hold',
+      }),
+      head_revision: '1',
+    })
+
+    let [pointer] = await sql<{
+      current_decision_id: string
+      current_decision_revision: string
+      pointer_fingerprint: string
+      pointer_version: string
+    }[]>`
+      select current_decision_id, current_decision_revision::text,
+             pointer_fingerprint, pointer_version::text
+      from filesystem_mcp_current_decision_pointers
+      where work_package_id = ${fixture.targetPackageId}
+    `
+    await deny(pointer, 'refreshed denial')
+    const [refreshed] = await sql<{ marker: Record<string, unknown> }[]>`
+      select metadata->'mcpGrantBlock' as marker from work_packages
+      where id = ${fixture.targetPackageId}
+    `
+    expect(refreshed.marker.blockFingerprint).not.toBe(firstHeld.marker.blockFingerprint)
+    head = await operatorHoldHead(sql, fixture.targetPackageId)
+    expect(head).toEqual({
+      contribution: expect.objectContaining({
+        mcpGrantBlock: refreshed.marker,
+        priorBlockFingerprint: firstHeld.marker.blockFingerprint,
+        transition: 'refresh',
+      }),
+      head_revision: '2',
+    })
+
+    ;[pointer] = await sql<{
+      current_decision_id: string
+      current_decision_revision: string
+      pointer_fingerprint: string
+      pointer_version: string
+    }[]>`
+      select current_decision_id, current_decision_revision::text,
+             pointer_fingerprint, pointer_version::text
+      from filesystem_mcp_current_decision_pointers
+      where work_package_id = ${fixture.targetPackageId}
+    `
+    await mutateTaskFilesystemGrants({
+      actorId: fixture.userId,
+      mutations: [{
+        capabilities: ['filesystem.project.read'],
+        decision: 'approved',
+        grantMode: 'allow_once',
+        reason: 'recover package hold',
+        workPackageId: fixture.targetPackageId,
+        expectedPointer: expectedPointer(pointer),
+      }],
+      projectId: fixture.projectId,
+      taskId: fixture.taskId,
+    })
+    head = await operatorHoldHead(sql, fixture.targetPackageId)
+    expect(head).toEqual({
+      contribution: expect.objectContaining({
+        authoritativeDecisionId: expect.any(String),
+        grantDecisionRevision: '3',
+        mcpGrantBlock: null,
+        operatorHold: false,
+        priorBlockFingerprint: refreshed.marker.blockFingerprint,
+        transition: 'recovery',
+      }),
+      head_revision: '3',
+    })
+
+    await mutateProjectFilesystemGrant({
+      actorId: fixture.userId,
+      capabilities: ['filesystem.project.read'],
+      enabled: true,
+      projectId: fixture.projectId,
+      reason: 'already clear project authority',
+    })
+    expect((await operatorHoldHead(sql, fixture.targetPackageId)).head_revision).toBe('3')
   } finally {
     await sql.end()
   }
@@ -631,6 +804,8 @@ test('narrowing and removal append retained decisions and negatively reconcile f
       projectId: fixture.projectId,
       reason: 'broad project approval',
     })
+    expect((await operatorHoldHead(sql, fixture.lowerPackageId)).head_revision).toBe('0')
+    expect((await operatorHoldHead(sql, fixture.targetPackageId)).head_revision).toBe('0')
     await mutateProjectFilesystemGrant({
       actorId: fixture.userId,
       capabilities: ['filesystem.project.read'],
@@ -647,6 +822,16 @@ test('narrowing and removal append retained decisions and negatively reconcile f
     expect(rows.find((pkg) => pkg.id === fixture.targetPackageId)).toMatchObject({
       status: 'blocked',
       marker: { revocationReason: 'project_grant_narrowed' },
+    })
+    const narrowedMarker = rows.find((pkg) => pkg.id === fixture.targetPackageId)?.marker
+    expect(await operatorHoldHead(sql, fixture.lowerPackageId)).toMatchObject({ head_revision: '0' })
+    expect(await operatorHoldHead(sql, fixture.targetPackageId)).toEqual({
+      contribution: expect.objectContaining({
+        mcpGrantBlock: narrowedMarker,
+        priorBlockFingerprint: null,
+        transition: 'hold',
+      }),
+      head_revision: '1',
     })
 
     await mutateProjectFilesystemGrant({
@@ -665,6 +850,24 @@ test('narrowing and removal append retained decisions and negatively reconcile f
       expect.objectContaining({ status: 'blocked', marker: expect.objectContaining({ revocationReason: 'project_grant_removed' }) }),
       expect.objectContaining({ status: 'blocked', marker: expect.objectContaining({ revocationReason: 'project_grant_removed' }) }),
     ]))
+    const removedLowerMarker = rows.find((pkg) => pkg.id === fixture.lowerPackageId)?.marker
+    const removedTargetMarker = rows.find((pkg) => pkg.id === fixture.targetPackageId)?.marker
+    expect(await operatorHoldHead(sql, fixture.lowerPackageId)).toEqual({
+      contribution: expect.objectContaining({
+        mcpGrantBlock: removedLowerMarker,
+        priorBlockFingerprint: null,
+        transition: 'hold',
+      }),
+      head_revision: '1',
+    })
+    expect(await operatorHoldHead(sql, fixture.targetPackageId)).toEqual({
+      contribution: expect.objectContaining({
+        mcpGrantBlock: removedTargetMarker,
+        priorBlockFingerprint: narrowedMarker?.blockFingerprint,
+        transition: 'refresh',
+      }),
+      head_revision: '2',
+    })
     const decisions = await sql<{
       decision: string
       grant_decision_revision: string
@@ -941,6 +1144,16 @@ test('root repoint keeps the retained project decision and pointer unchanged whi
         revocationReason: 'project_root_repoint',
       },
     })
+    expect(await operatorHoldHead(sql, fixture.targetPackageId)).toEqual({
+      contribution: expect.objectContaining({
+        authoritativeDecisionId: before.current_decision_id,
+        grantDecisionRevision: before.grant_decision_revision,
+        mcpGrantBlock: held.marker,
+        priorBlockFingerprint: null,
+        transition: 'hold',
+      }),
+      head_revision: '1',
+    })
   } finally {
     await sql.end()
   }
@@ -1008,6 +1221,7 @@ test('root repoint retains decision authority and requires explicit approval aft
       holdKind: 'revoked_required',
       revocationReason: 'project_root_repoint',
     })
+    expect((await operatorHoldHead(sql, fixture.targetPackageId)).head_revision).toBe('1')
     const [{ count }] = await sql<{ count: number }[]>`
       select count(*)::int as count from filesystem_mcp_grant_approvals
       where project_id = ${fixture.projectId}
@@ -1057,6 +1271,16 @@ test('root repoint retains decision authority and requires explicit approval aft
       from work_packages where id = ${fixture.targetPackageId}
     `
     expect(recovered).toEqual({ marker: null, status: 'ready' })
+    expect(await operatorHoldHead(sql, fixture.targetPackageId)).toEqual({
+      contribution: expect.objectContaining({
+        authoritativeDecisionId: expect.any(String),
+        grantDecisionRevision: '2',
+        mcpGrantBlock: null,
+        priorBlockFingerprint: held.marker.blockFingerprint,
+        transition: 'recovery',
+      }),
+      head_revision: '2',
+    })
 
     await db.transaction(async (tx) => {
       const [locked] = await tx.select().from(projects)
@@ -1094,6 +1318,16 @@ test('root repoint retains decision authority and requires explicit approval aft
         holdKind: 'revoked_required',
         revocationReason: 'project_root_repoint',
       },
+    })
+    expect(await operatorHoldHead(sql, fixture.targetPackageId)).toEqual({
+      contribution: expect.objectContaining({
+        authoritativeDecisionId: expect.any(String),
+        grantDecisionRevision: '2',
+        mcpGrantBlock: heldAgain.marker,
+        priorBlockFingerprint: null,
+        transition: 'hold',
+      }),
+      head_revision: '3',
     })
     const [repointedAgain] = await sql<{
       grant_decision_revision: string
