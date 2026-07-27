@@ -12,7 +12,7 @@ import {
   safeTaskEventType,
   type TaskEventEnvelopeV2,
 } from '@/worker/events'
-import { taskEventRedisConfiguration } from '@/lib/task-event-redis'
+import { taskEventRedisConfiguration, taskEventRedisKeys } from '@/lib/task-event-redis'
 import { taskQuestionSummary } from '@/lib/mcps/clarification-projection'
 
 // ---------------------------------------------------------------------------
@@ -87,8 +87,9 @@ export async function GET(
         }
       }
 
-      const eventHistoryKey = `forge:task-events:v2:${taskId}:history`
-      const eventSequenceKey = `forge:task-events:v2:${taskId}:seq`
+      const eventRedisKeys = taskEventRedisKeys(taskId)
+      const eventHistoryKey = eventRedisKeys.history
+      const eventSequenceKey = eventRedisKeys.sequence
 
       // replaySend: enqueues the SSE line directly WITHOUT writing to the sorted set.
       // Used only during the replay loop to avoid re-persisting already-stored events.
@@ -320,7 +321,7 @@ export async function GET(
       })
 
       try {
-        await sub.subscribe(`forge:task:${taskId}`)
+        await sub.subscribe(eventRedisKeys.live)
       } catch (err) {
         console.error('[SSE /api/tasks/:id/runs] Failed to subscribe to Redis channel', err)
         cleanup()

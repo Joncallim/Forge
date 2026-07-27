@@ -1,7 +1,11 @@
 import type { NextRequest } from 'next/server'
 import { getSession } from '@/lib/session'
 import { getAccessibleTask } from '@/lib/task-access'
-import { taskEventRedisConfiguration } from '@/lib/task-event-redis'
+import {
+  TASK_EVENT_V2_LIVE_PATTERN,
+  taskEventRedisConfiguration,
+  taskIdFromTaskEventLiveChannel,
+} from '@/lib/task-event-redis'
 import { parseTaskEventEnvelopeV2 } from '@/worker/events'
 
 // ---------------------------------------------------------------------------
@@ -64,7 +68,7 @@ export async function GET(request: NextRequest) {
           const data = event.data && typeof event.data === 'object' && !Array.isArray(event.data)
             ? event.data as { status?: string; updatedAt?: string }
             : {}
-          const taskId = channel.startsWith('forge:task:') ? channel.slice('forge:task:'.length) : null
+          const taskId = taskIdFromTaskEventLiveChannel(channel)
           if (!taskId || !(await getAccessibleTask(taskId, session.userId))) return
           send('task:status', {
             taskId,
@@ -83,7 +87,7 @@ export async function GET(request: NextRequest) {
       })
 
       try {
-        await sub.psubscribe('forge:task:*')
+        await sub.psubscribe(TASK_EVENT_V2_LIVE_PATTERN)
       } catch (err) {
         console.error('[SSE /api/tasks/events] Failed to subscribe to Redis task channels', err)
         cleanup()

@@ -1,6 +1,6 @@
 import { sanitizeLogStructuredValue } from '../lib/task-log-sanitization'
 import { containsForbiddenV2EventData, projectV2TaskEventData } from '../lib/mcps/legacy-leakage-scrub'
-import { taskEventPublisherRedis } from '../lib/task-event-redis'
+import { taskEventPublisherRedis, taskEventRedisKeys } from '../lib/task-event-redis'
 
 export type TaskEventPayload = Record<string, unknown>
 
@@ -82,14 +82,15 @@ export async function publishTaskEvent(
     throw new Error(`Task event '${safeType}' does not match the closed v2 schema.`)
   }
   const redis = taskEventPublisherRedis()
+  const redisKeys = taskEventRedisKeys(taskId)
   const rawId = await redis.eval(
     PERSIST_TASK_EVENT_V2,
     2,
-    `forge:task-events:v2:${taskId}:seq`,
-    `forge:task-events:v2:${taskId}:history`,
+    redisKeys.sequence,
+    redisKeys.history,
     safeType,
     JSON.stringify(durableData),
-    `forge:task:${taskId}`,
+    redisKeys.live,
     String(TASK_EVENT_HISTORY_LIMIT),
   )
   const id = Number(rawId)

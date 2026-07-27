@@ -389,7 +389,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     setTimeout(() => {
       state.mockSub?.emit(
         'message',
-        'forge:task:task-sse-1',
+        'forge:task-events:v2:task-sse-1:live',
         JSON.stringify({
           schemaVersion: 2,
           id: null,
@@ -423,7 +423,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     setTimeout(() => {
       state.mockSub?.emit(
         'message',
-        'forge:task:task-sse-1',
+        'forge:task-events:v2:task-sse-1:live',
         JSON.stringify({
           schemaVersion: 2,
           id: null,
@@ -453,7 +453,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     setTimeout(() => {
       state.mockSub?.emit(
         'message',
-        'forge:task:task-sse-1',
+        'forge:task-events:v2:task-sse-1:live',
         JSON.stringify({
           schemaVersion: 2,
           id: 1,
@@ -477,7 +477,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     setTimeout(() => {
       state.mockSub?.emit(
         'message',
-        'forge:task:task-sse-1',
+        'forge:task-events:v2:task-sse-1:live',
         JSON.stringify({
           schemaVersion: 2,
           id: 1,
@@ -507,7 +507,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
     const res = await GET(sseRequest() as never, { params: Promise.resolve({ id: 'task-sse-1' }) })
 
     setTimeout(() => {
-      state.mockSub?.emit('message', 'forge:task:task-sse-1', JSON.stringify({
+      state.mockSub?.emit('message', 'forge:task-events:v2:task-sse-1:live', JSON.stringify({
         schemaVersion: 2,
         id: 3,
         type: 'run:completed',
@@ -566,7 +566,7 @@ describe('GET /api/tasks/:id/runs — SSE stream', () => {
 
       state.mockSub?.emit(
         'message',
-        'forge:task:task-sse-1',
+        'forge:task-events:v2:task-sse-1:live',
         JSON.stringify({
           schemaVersion: 2,
           id: null,

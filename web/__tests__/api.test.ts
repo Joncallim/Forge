@@ -3026,7 +3026,7 @@ describe('DELETE /api/tasks/:id — stop or delete a task', () => {
       'forge:task-events:v2:task-1:history',
       'task:status',
       expect.stringContaining('"status":"cancelled"'),
-      'forge:task:task-1',
+      'forge:task-events:v2:task-1:live',
       '4096',
     )
   })
@@ -8566,7 +8566,7 @@ describe('POST /api/tasks/:id/retry', () => {
       'forge:task-events:v2:task-failed:history',
       'task:status',
       expect.stringContaining('"status":"pending"'),
-      'forge:task:task-failed',
+      'forge:task-events:v2:task-failed:live',
       '4096',
     )
   })
@@ -8611,7 +8611,7 @@ describe('POST /api/tasks/:id/retry', () => {
       'forge:task-events:v2:task-failed:history',
       'task:status',
       expect.stringContaining('"status":"approved"'),
-      'forge:task:task-failed',
+      'forge:task-events:v2:task-failed:live',
       '4096',
     )
   })
