@@ -874,6 +874,72 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     expect(proof).toEqual({ digestRows: 1, rawIdRows: 0, retainedRawIds: 0 })
   })
 
+  it('records a revoked session cache purge through pending, claimed, and completed durable states', async () => {
+    const sessionId = randomUUID()
+    const generation = randomUUID()
+    const claimToken = randomUUID()
+    await admin`
+      insert into sessions (id, user_id, credential_digest_v1, expires_at, credential_storage_version)
+      values (
+        ${sessionId}::uuid, ${ids.user}::uuid, ${randomBytes(32)}::bytea,
+        clock_timestamp() + interval '7 days', 2
+      )
+    `
+    await expect(admin`
+      update sessions
+      set cache_purge_pending_at = clock_timestamp(), cache_purge_attempt_count = 1
+      where id = ${sessionId}::uuid
+    `).rejects.toMatchObject({ code: '23514' })
+
+    await admin`
+      update sessions
+      set revoked_at = clock_timestamp(),
+          cache_purge_pending_at = clock_timestamp(),
+          cache_purge_generation = ${generation}::uuid,
+          cache_purge_claim_token = ${claimToken}::uuid,
+          cache_purge_claim_expires_at = clock_timestamp() + interval '30 seconds',
+          cache_purge_next_attempt_at = clock_timestamp(),
+          cache_purge_attempt_count = 1
+      where id = ${sessionId}::uuid
+    `
+    const [claimed] = await admin<{
+      attempts: number
+      claimToken: string
+      generation: string
+      pending: boolean
+    }[]>`
+      select cache_purge_attempt_count::integer as attempts,
+        cache_purge_claim_token::text as "claimToken",
+        cache_purge_generation::text as generation,
+        cache_purge_pending_at is not null as pending
+      from sessions where id = ${sessionId}::uuid
+    `
+    expect(claimed).toEqual({ attempts: 1, claimToken, generation, pending: true })
+
+    await admin`
+      update sessions
+      set cache_purge_pending_at = null,
+          cache_purge_claim_token = null,
+          cache_purge_claim_expires_at = null,
+          cache_purge_next_attempt_at = null,
+          cache_purge_completed_at = clock_timestamp()
+      where id = ${sessionId}::uuid
+        and cache_purge_generation = ${generation}::uuid
+        and cache_purge_claim_token = ${claimToken}::uuid
+    `
+    const [completed] = await admin<{
+      completed: boolean
+      pending: boolean
+      tokenCleared: boolean
+    }[]>`
+      select cache_purge_completed_at is not null as completed,
+        cache_purge_pending_at is not null as pending,
+        cache_purge_claim_token is null as "tokenCleared"
+      from sessions where id = ${sessionId}::uuid
+    `
+    expect(completed).toEqual({ completed: true, pending: false, tokenCleared: true })
+  })
+
   it('allow-once-single-winner: atomically keeps one audit and one nonce claim', async () => {
     const packageId = randomUUID()
     const decisionId = randomUUID()

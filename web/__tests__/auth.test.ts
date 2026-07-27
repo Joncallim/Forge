@@ -663,7 +663,14 @@ describe('destroySession', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mockRedisDel.mockResolvedValue(1)
-    mockDbUpdate.mockReturnValue(chain(undefined))
+    mockDbUpdate.mockReturnValue(chain([{
+      attemptCount: 1,
+      claimToken: '00000000-0000-4000-8000-000000000011',
+      credentialDigest: Buffer.alloc(32, 1),
+      generation: '00000000-0000-4000-8000-000000000012',
+      legacyCredential: '00000000-0000-4000-8000-000000000000',
+      sessionId: '00000000-0000-4000-8000-000000000010',
+    }]))
   })
 
   it('deletes both digest and legacy Redis keys after DB revocation', async () => {
@@ -677,7 +684,16 @@ describe('destroySession', () => {
 
   it('sets revokedAt in the DB', async () => {
     await destroySession('00000000-0000-4000-8000-000000000000')
-    expect(mockDbUpdate).toHaveBeenCalledOnce()
+    expect(mockDbUpdate).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the durable purge pending when Redis deletion fails', async () => {
+    mockRedisDel.mockRejectedValueOnce(new Error('redis unavailable'))
+
+    await expect(destroySession('00000000-0000-4000-8000-000000000000')).resolves.toBeUndefined()
+
+    expect(mockDbUpdate).toHaveBeenCalledTimes(2)
+    expect(mockRedisDel).toHaveBeenCalledOnce()
   })
 })
 

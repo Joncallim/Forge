@@ -184,6 +184,7 @@ async function startWorkerOnce(
         { tasks, workPackages },
         { enqueueDueBlockedHandoffRetries },
         { convergeRecognizedOperatorHolds },
+        { reconcilePendingSessionCacheInvalidations },
         { reconcilePendingS4CompletionHandoffs },
         { and, eq },
       ] = await Promise.all([
@@ -191,6 +192,7 @@ async function startWorkerOnce(
         import('../db/schema'),
         import('./blocked-handoff-retry'),
         import('../lib/mcps/filesystem-grant-reconciliation'),
+        import('../lib/session'),
         import('./work-package-handoff'),
         import('drizzle-orm'),
       ])
@@ -207,6 +209,7 @@ async function startWorkerOnce(
         drain: options.startup === true,
         workerId,
       })
+      const reconciledSessionCaches = await reconcilePendingSessionCacheInvalidations(100)
       const enqueued = await enqueueDueBlockedHandoffRetries(stuck)
       const converged = await convergeRecognizedOperatorHolds()
       if (enqueued > 0) {
@@ -217,6 +220,9 @@ async function startWorkerOnce(
       }
       if (recoveredS4Handoffs > 0) {
         console.info('[worker] Recovered protected completion handoffs', { count: recoveredS4Handoffs, workerId })
+      }
+      if (reconciledSessionCaches.claimed > 0) {
+        console.info('[worker] Reconciled revoked session caches', { ...reconciledSessionCaches, workerId })
       }
     } catch (err) {
       console.warn('[worker] Blocked-handoff sweep failed', { err: errorMessage(err), workerId })

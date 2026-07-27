@@ -1,12 +1,18 @@
 import { db } from '@/db'
 import { sessionCredentialReconciliation, sessions } from '@/db/schema'
-import { and, eq, isNull, or, sql } from 'drizzle-orm'
+import { and, eq, isNotNull, isNull, or, sql } from 'drizzle-orm'
 import { redis } from '@/lib/redis'
 import { isIP } from 'node:net'
 import {
   computeCredentialDigest,
   isCanonicalSessionCredential,
 } from '@/lib/session-credential-digest'
+import {
+  reconcileSessionCacheInvalidations,
+  sessionCachePurgeBackoffSeconds,
+  sessionCachePurgeKeys,
+  type SessionCachePurgeTarget,
+} from '@/lib/session-cache-invalidation'
 
 export type SessionData = {
   userId: string
@@ -31,6 +37,8 @@ type SessionMeta = {
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 const SESSION_TTL_MS = SESSION_TTL_SECONDS * 1000
 const WRITE_BEHIND_INTERVAL_MS = 60 * 1000
+const SESSION_CACHE_PURGE_CLAIM_SECONDS = 30
+const SESSION_CACHE_PURGE_BATCH_LIMIT = 100
 
 function redisKey(digest: Buffer): string {
   return `session:v2:${digest.toString('hex')}`
@@ -38,6 +46,141 @@ function redisKey(digest: Buffer): string {
 
 function legacyRedisKey(credential: string): string {
   return `session:${credential}`
+}
+
+type StoredSessionCachePurge = SessionCachePurgeTarget & {
+  credentialDigest: Buffer
+}
+
+function cachePurgeTarget(row: {
+  attemptCount: number
+  claimToken: string | null
+  credentialDigest: Buffer
+  generation: string
+  legacyCredential: string | null
+  sessionId: string
+}): StoredSessionCachePurge | null {
+  if (!Buffer.isBuffer(row.credentialDigest) || row.credentialDigest.length !== 32) return null
+  return {
+    attemptCount: row.attemptCount,
+    claimToken: row.claimToken,
+    credentialDigest: row.credentialDigest,
+    credentialDigestHex: row.credentialDigest.toString('hex'),
+    generation: row.generation,
+    legacyCredential: row.legacyCredential,
+    sessionId: row.sessionId,
+  }
+}
+
+async function completeSessionCachePurge(target: SessionCachePurgeTarget): Promise<void> {
+  const conditions = [
+    eq(sessions.id, target.sessionId),
+    eq(sessions.cachePurgeGeneration, target.generation),
+    isNotNull(sessions.cachePurgePendingAt),
+  ]
+  if (target.claimToken) conditions.push(eq(sessions.cachePurgeClaimToken, target.claimToken))
+  await db.update(sessions).set({
+    cachePurgeClaimExpiresAt: null,
+    cachePurgeClaimToken: null,
+    cachePurgeCompletedAt: sql`pg_catalog.clock_timestamp()`,
+    cachePurgeNextAttemptAt: null,
+    cachePurgePendingAt: null,
+  }).where(and(...conditions))
+}
+
+async function deferSessionCachePurge(target: SessionCachePurgeTarget): Promise<void> {
+  const conditions = [
+    eq(sessions.id, target.sessionId),
+    eq(sessions.cachePurgeGeneration, target.generation),
+    isNotNull(sessions.cachePurgePendingAt),
+  ]
+  if (target.claimToken) conditions.push(eq(sessions.cachePurgeClaimToken, target.claimToken))
+  await db.update(sessions).set({
+    cachePurgeClaimExpiresAt: null,
+    cachePurgeClaimToken: null,
+    cachePurgeNextAttemptAt: sql`pg_catalog.clock_timestamp() + ${sessionCachePurgeBackoffSeconds(target.attemptCount)} * interval '1 second'`,
+  }).where(and(...conditions))
+}
+
+async function deleteSessionCacheTarget(target: SessionCachePurgeTarget): Promise<void> {
+  await redis.del(...sessionCachePurgeKeys(target))
+}
+
+/**
+ * Bounded worker maintenance for already-revoked sessions. It never reads Redis
+ * to authorize a request and only derives cache keys from persisted digest/legacy
+ * identity fields returned by the locked database row.
+ */
+export async function reconcilePendingSessionCacheInvalidations(
+  limit = SESSION_CACHE_PURGE_BATCH_LIMIT,
+): Promise<{ claimed: number; completed: number; deferred: number }> {
+  if (!Number.isInteger(limit) || limit < 1 || limit > SESSION_CACHE_PURGE_BATCH_LIMIT) {
+    throw new Error(`Session cache purge limit must be an integer from 1 to ${SESSION_CACHE_PURGE_BATCH_LIMIT}.`)
+  }
+  return reconcileSessionCacheInvalidations({
+    limit,
+    deleteKeys: async (keys) => redis.del(...keys),
+    store: {
+      claimDue: async (batchLimit) => db.transaction(async (tx) => {
+        const rows = await tx.execute(sql<{
+          attemptCount: number
+          claimToken: string
+          credentialDigestHex: string
+          generation: string
+          legacyCredential: string | null
+          sessionId: string
+        }>`
+          WITH candidates AS (
+            SELECT session.id
+            FROM public.sessions session
+            WHERE session.cache_purge_pending_at IS NOT NULL
+              AND pg_catalog.octet_length(session.credential_digest_v1) = 32
+              AND (session.cache_purge_next_attempt_at IS NULL
+                OR session.cache_purge_next_attempt_at <= pg_catalog.clock_timestamp())
+              AND (session.cache_purge_claim_expires_at IS NULL
+                OR session.cache_purge_claim_expires_at <= pg_catalog.clock_timestamp())
+            ORDER BY session.cache_purge_pending_at, session.id
+            LIMIT ${batchLimit}
+            FOR UPDATE SKIP LOCKED
+          )
+          UPDATE public.sessions session
+          SET cache_purge_claim_token = pg_catalog.gen_random_uuid(),
+              cache_purge_claim_expires_at = pg_catalog.clock_timestamp()
+                + ${SESSION_CACHE_PURGE_CLAIM_SECONDS} * interval '1 second',
+              cache_purge_attempt_count = session.cache_purge_attempt_count + 1
+          FROM candidates
+          WHERE session.id = candidates.id
+          RETURNING session.id::text AS "sessionId",
+            session.cache_purge_generation::text AS generation,
+            session.cache_purge_claim_token::text AS "claimToken",
+            session.cache_purge_attempt_count AS "attemptCount",
+            pg_catalog.encode(session.credential_digest_v1, 'hex') AS "credentialDigestHex",
+            CASE WHEN session.credential_storage_version = 1 THEN session.id::text ELSE NULL END AS "legacyCredential"
+        `)
+        return rows.flatMap((row): SessionCachePurgeTarget[] => {
+          if (
+            typeof row.sessionId !== 'string'
+            || typeof row.generation !== 'string'
+            || typeof row.claimToken !== 'string'
+            || typeof row.attemptCount !== 'number'
+            || typeof row.credentialDigestHex !== 'string'
+            || !/^[0-9a-f]{64}$/.test(row.credentialDigestHex)
+            || (row.legacyCredential !== null && typeof row.legacyCredential !== 'string')
+          ) return []
+          return [{
+            sessionId: row.sessionId,
+            generation: row.generation,
+            claimToken: row.claimToken,
+            attemptCount: row.attemptCount,
+            credentialDigestHex: row.credentialDigestHex,
+            legacyCredential: row.legacyCredential,
+          }]
+        })
+      }),
+      complete: completeSessionCachePurge,
+      defer: deferSessionCachePurge,
+    },
+  })
 }
 
 function dualWriteSessions(): boolean {
@@ -377,12 +520,21 @@ export async function createSession(
 export async function destroySession(sessionCredential: string): Promise<void> {
   if (!isCanonicalSessionCredential(sessionCredential)) return
   const digest = computeCredentialDigest(sessionCredential).digest
+  const generation = crypto.randomUUID()
+  const claimToken = crypto.randomUUID()
 
   // PostgreSQL revocation is authoritative and commits before cache deletion.
-  await db
+  const revoked = await db
     .update(sessions)
     .set({
       revokedAt: sql`pg_catalog.clock_timestamp()`,
+      cachePurgeAttemptCount: 1,
+      cachePurgeClaimExpiresAt: sql`pg_catalog.clock_timestamp() + ${SESSION_CACHE_PURGE_CLAIM_SECONDS} * interval '1 second'`,
+      cachePurgeClaimToken: claimToken,
+      cachePurgeCompletedAt: null,
+      cachePurgeGeneration: generation,
+      cachePurgeNextAttemptAt: sql`pg_catalog.clock_timestamp()`,
+      cachePurgePendingAt: sql`pg_catalog.clock_timestamp()`,
       legacyRedisPurgePendingAt: sql`CASE
         WHEN ${sessions.credentialStorageVersion} < 2
           THEN pg_catalog.clock_timestamp()
@@ -391,10 +543,38 @@ export async function destroySession(sessionCredential: string): Promise<void> {
     })
     .where(or(
       eq(sessions.credentialDigestV1, digest),
-      eq(sessions.id, sessionCredential),
+      and(
+        eq(sessions.id, sessionCredential),
+        eq(sessions.credentialStorageVersion, 1),
+      ),
     ))
+    .returning({
+      attemptCount: sessions.cachePurgeAttemptCount,
+      credentialDigest: sessions.credentialDigestV1,
+      claimToken: sessions.cachePurgeClaimToken,
+      generation: sessions.cachePurgeGeneration,
+      legacyCredential: sql<string | null>`CASE WHEN ${sessions.credentialStorageVersion} = 1 THEN ${sessions.id}::text ELSE NULL END`,
+      sessionId: sessions.id,
+    })
 
-  await redis.del(redisKey(digest), legacyRedisKey(sessionCredential))
+  const target = Array.isArray(revoked) ? revoked[0] : undefined
+  if (!target?.generation || !target.credentialDigest || !target.claimToken) return
+  const stored = cachePurgeTarget({
+    attemptCount: target.attemptCount,
+    claimToken: target.claimToken,
+    credentialDigest: target.credentialDigest,
+    generation: target.generation,
+    legacyCredential: target.legacyCredential,
+    sessionId: target.sessionId,
+  })
+  if (!stored) return
+  try {
+    await deleteSessionCacheTarget(stored)
+    await completeSessionCachePurge(stored)
+  } catch {
+    // Revocation already committed. Preserve only bounded retry metadata.
+    await deferSessionCachePurge(stored).catch(() => {})
+  }
 }
 
 export function sessionCookieOptions(): CookieOptions {

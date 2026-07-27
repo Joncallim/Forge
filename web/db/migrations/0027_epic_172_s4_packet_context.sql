@@ -56,7 +56,14 @@ ALTER TABLE public.sessions
   ADD COLUMN IF NOT EXISTS expires_at timestamptz,
   ADD COLUMN IF NOT EXISTS credential_storage_version integer NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS legacy_redis_purge_pending_at timestamptz,
-  ADD COLUMN IF NOT EXISTS legacy_redis_invalidated_at timestamptz;
+  ADD COLUMN IF NOT EXISTS legacy_redis_invalidated_at timestamptz,
+  ADD COLUMN IF NOT EXISTS cache_purge_pending_at timestamptz,
+  ADD COLUMN IF NOT EXISTS cache_purge_generation uuid,
+  ADD COLUMN IF NOT EXISTS cache_purge_claim_token uuid,
+  ADD COLUMN IF NOT EXISTS cache_purge_claim_expires_at timestamptz,
+  ADD COLUMN IF NOT EXISTS cache_purge_attempt_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS cache_purge_next_attempt_at timestamptz,
+  ADD COLUMN IF NOT EXISTS cache_purge_completed_at timestamptz;
 --> statement-breakpoint
 ALTER TABLE public.agent_runs
   ADD COLUMN provider_type_used text,
@@ -271,7 +278,33 @@ ALTER TABLE public.sessions
     OR pg_catalog.octet_length(credential_digest_v1) = 32
   ) NOT VALID,
   ADD CONSTRAINT sessions_credential_storage_version_chk
-  CHECK (credential_storage_version IN (0,1,2)) NOT VALID;
+  CHECK (credential_storage_version IN (0,1,2)) NOT VALID,
+  ADD CONSTRAINT sessions_cache_purge_state_chk CHECK (
+    cache_purge_attempt_count >= 0
+    AND (
+      (cache_purge_pending_at IS NULL
+        AND cache_purge_generation IS NULL
+        AND cache_purge_claim_token IS NULL
+        AND cache_purge_claim_expires_at IS NULL
+        AND cache_purge_next_attempt_at IS NULL
+        AND cache_purge_completed_at IS NULL)
+      OR
+      (cache_purge_pending_at IS NOT NULL
+        AND cache_purge_generation IS NOT NULL
+        AND cache_purge_completed_at IS NULL)
+      OR
+      (cache_purge_pending_at IS NULL
+        AND cache_purge_generation IS NOT NULL
+        AND cache_purge_claim_token IS NULL
+        AND cache_purge_claim_expires_at IS NULL
+        AND cache_purge_next_attempt_at IS NULL
+        AND cache_purge_completed_at IS NOT NULL)
+    )
+  ) NOT VALID;
+--> statement-breakpoint
+CREATE INDEX sessions_cache_purge_due_idx ON public.sessions
+  (cache_purge_next_attempt_at, cache_purge_pending_at, id)
+  WHERE cache_purge_pending_at IS NOT NULL;
 --> statement-breakpoint
 CREATE UNIQUE INDEX sessions_credential_digest_v1_idx
   ON public.sessions (credential_digest_v1)
