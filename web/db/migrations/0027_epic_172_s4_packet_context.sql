@@ -7538,6 +7538,10 @@ GRANT UPDATE (id) ON public.projects, public.filesystem_mcp_grant_approvals,
   public.project_filesystem_grant_decisions TO forge_project_root_reconciler;
 GRANT UPDATE (project_id) ON public.project_filesystem_current_decision_pointers TO forge_project_root_reconciler;
 GRANT UPDATE (work_package_id) ON public.filesystem_mcp_current_decision_pointers TO forge_project_root_reconciler;
+-- PostgreSQL also requires an UPDATE privilege for the canonical helper's
+-- FOR UPDATE lock on the current projection-head rows.  The immutable key is
+-- sufficient; this login receives no mutable head-column privilege.
+GRANT UPDATE (id) ON public.work_package_local_projection_heads TO forge_project_root_reconciler;
 GRANT UPDATE (status, error_message, updated_at) ON public.tasks TO forge_project_root_reconciler;
 GRANT UPDATE (status, blocked_reason, metadata, updated_at) ON public.work_packages TO forge_project_root_reconciler;
 GRANT EXECUTE ON FUNCTION forge.advance_local_projection_head_v1(uuid,uuid,text,uuid,bigint,text,jsonb,bigint,text,text) TO forge_project_root_reconciler;

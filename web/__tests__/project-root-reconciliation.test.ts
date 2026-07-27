@@ -61,6 +61,8 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(bootstrap).toContain("'forge_project_root_reconciler'")
     expect(migration).toContain('GRANT UPDATE (status, error_message, updated_at) ON public.tasks TO forge_project_root_reconciler')
     expect(migration).toContain('GRANT UPDATE (status, blocked_reason, metadata, updated_at) ON public.work_packages TO forge_project_root_reconciler')
+    expect(migration).toContain('GRANT UPDATE (id) ON public.work_package_local_projection_heads TO forge_project_root_reconciler')
+    expect(bootstrap).toContain('grant update (id) on table public.work_package_local_projection_heads to forge_project_root_reconciler')
     expect(migration).toContain('public.project_root_reconciliation_operations')
     expect(migration).toContain('REVOKE ALL ON FUNCTION forge.begin_project_root_reconciliation_v1')
     for (const table of [

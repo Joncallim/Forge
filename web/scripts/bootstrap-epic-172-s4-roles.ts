@@ -144,6 +144,10 @@ async function main(): Promise<void> {
       await admin.unsafe(`grant usage on schema forge to ${LOGIN_ROLES.join(', ')}`)
       await admin`grant execute on function forge.read_epic_172_enablement_state_v1() to ${admin(OWNER)}`
       await admin`grant select, update on table public.work_package_local_projection_heads to ${admin(OWNER)}`
+      // The dedicated reconciler acquires FOR UPDATE locks through the
+      // canonical S3 helper.  PostgreSQL requires an UPDATE privilege for
+      // that lock mode; grant only the immutable primary key column.
+      await admin`grant update (id) on table public.work_package_local_projection_heads to forge_project_root_reconciler`
       const [{ protectedOwnershipCount }] = await admin<{ protectedOwnershipCount: number }[]>`
         select ((
           select count(*) from pg_catalog.pg_class relation
