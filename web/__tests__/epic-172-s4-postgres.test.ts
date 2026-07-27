@@ -471,10 +471,18 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' },
       { agent: null, bindingFingerprint: null, content: JSON.stringify({ schemaVersion: 1, questionId: duplicateQuestion, question: 'Q?', suggestions: [] }), entryId: `clarification_question:${duplicateQuestion}`, entryKind: 'clarification_question', projectionEligible: false, requirementKey: null }] })
     await admin`insert into task_questions (id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status) values (${duplicateQuestion}::uuid, ${duplicateTask}::uuid, ${`clarification_question:${duplicateQuestion}`}, ${duplicateV1.artifactId}::uuid, 1, 'open')`
-    await recordArchitectPlanVersion({ agentRunId: duplicateRun2, digestKey: key, digestKeyId: 's4-test-key', planVersion: '2', taskId: duplicateTask, entries: [
-      { agent: null, bindingFingerprint: null, content: 'body', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null },
-      { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' },
-      { agent: null, bindingFingerprint: null, content: '{"schemaVersion":1}', entryId: `clarification_question:${duplicateQuestion}`, entryKind: 'subtask', projectionEligible: false, requirementKey: null }] })
+    const duplicateWriter = postgres(writerUrl!, { max: 1, onnotice: () => {} })
+    try {
+      const artifactId = randomUUID(); const digest = `hmac-sha256:${'c'.repeat(64)}`
+      await duplicateWriter`select forge.insert_architect_plan_version_v1(
+        ${duplicateRun2}::uuid, ${artifactId}::uuid, 2::bigint, 's4-test-key', ${digest}, ${digest},
+        ${['plan_body:000000', 'requirement:plan-policy', `clarification_question:${duplicateQuestion}`]}::text[],
+        ${['plan_body', 'requirement', 'subtask']}::text[],
+        ${[null, null, null]}::text[], ${[null, 'plan-policy', null]}::text[], ${[null, null, null]}::text[],
+        ${['body', JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), '{"schemaVersion":1}']}::text[],
+        ${[digest, digest, digest]}::text[], ${['false', 'false', 'false']}::text[]
+      )`
+    } finally { await duplicateWriter.end({ timeout: 5 }) }
     const [duplicateIdentity] = await admin<{ count: number }[]>`
       select count(*)::integer as count from architect_plan_entries
       where task_id = ${duplicateTask}::uuid and entry_id = ${`clarification_question:${duplicateQuestion}`}
