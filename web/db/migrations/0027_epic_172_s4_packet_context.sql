@@ -1007,6 +1007,7 @@ DECLARE
   v_returned_entry_count integer;
   v_returned_set_digest text;
   v_invalid_clarification boolean;
+  v_duplicate_entry_id boolean;
   v_history_query text := $history$
     WITH protected_entries AS (
       -- The requested immutable plan supplies structural context only. The
@@ -1134,10 +1135,13 @@ BEGIN
         AND (
           projection.question_entry_id <> 'clarification_question:' || projection.id::text
           OR question.entry_id IS NULL
-          OR question.content::jsonb->>'schemaVersion' <> '1'
-          OR question.content::jsonb->>'questionId' <> projection.id::text
-          OR pg_catalog.jsonb_typeof(question.content::jsonb->'question') <> 'string'
-          OR pg_catalog.jsonb_typeof(question.content::jsonb->'suggestions') <> 'array'
+          OR pg_catalog.jsonb_typeof(question.content::jsonb) IS DISTINCT FROM 'object'
+          OR (SELECT pg_catalog.count(*) FROM pg_catalog.jsonb_object_keys(question.content::jsonb)) IS DISTINCT FROM 4
+          OR question.content::jsonb->'schemaVersion' IS DISTINCT FROM '1'::jsonb
+          OR pg_catalog.jsonb_typeof(question.content::jsonb->'questionId') IS DISTINCT FROM 'string'
+          OR question.content::jsonb->>'questionId' IS DISTINCT FROM projection.id::text
+          OR pg_catalog.jsonb_typeof(question.content::jsonb->'question') IS DISTINCT FROM 'string'
+          OR pg_catalog.jsonb_typeof(question.content::jsonb->'suggestions') IS DISTINCT FROM 'array'
         )
     ) OR EXISTS (
       SELECT 1
@@ -1155,9 +1159,13 @@ BEGIN
       WHERE answer.task_id = $1
         AND answer.source_plan_version <= $2
         AND (projection.id IS NULL OR question.entry_id IS NULL
-          OR question.content::jsonb->>'schemaVersion' <> '1'
-          OR question.content::jsonb->>'questionId' <> answer.question_id::text
-          OR pg_catalog.jsonb_typeof(question.content::jsonb->'question') <> 'string')
+          OR pg_catalog.jsonb_typeof(question.content::jsonb) IS DISTINCT FROM 'object'
+          OR (SELECT pg_catalog.count(*) FROM pg_catalog.jsonb_object_keys(question.content::jsonb)) IS DISTINCT FROM 4
+          OR question.content::jsonb->'schemaVersion' IS DISTINCT FROM '1'::jsonb
+          OR pg_catalog.jsonb_typeof(question.content::jsonb->'questionId') IS DISTINCT FROM 'string'
+          OR question.content::jsonb->>'questionId' IS DISTINCT FROM answer.question_id::text
+          OR pg_catalog.jsonb_typeof(question.content::jsonb->'question') IS DISTINCT FROM 'string'
+          OR pg_catalog.jsonb_typeof(question.content::jsonb->'suggestions') IS DISTINCT FROM 'array')
     ) OR EXISTS (
       SELECT 1 FROM public.architect_clarification_answers answer
       WHERE answer.task_id = $1 AND answer.source_plan_version <= $2
@@ -1167,6 +1175,13 @@ BEGIN
   IF v_invalid_clarification THEN
     RAISE EXCEPTION 'Protected clarification history is malformed or inconsistent'
       USING ERRCODE = '40001';
+  END IF;
+
+  EXECUTE v_history_query || $duplicates$
+    SELECT EXISTS (SELECT 1 FROM protected_entries GROUP BY entry_id HAVING pg_catalog.count(*) > 1)
+  $duplicates$ INTO v_duplicate_entry_id USING p_task_id, p_plan_version;
+  IF v_duplicate_entry_id THEN
+    RAISE EXCEPTION 'Protected Architect history contains duplicate entry identities' USING ERRCODE = '40001';
   END IF;
 
   -- The clarification subledger is created later in this unshipped migration.
