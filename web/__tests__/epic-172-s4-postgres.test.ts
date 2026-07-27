@@ -421,27 +421,45 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     expect(historyAudit.reads).toBe(1)
     expect(historyAudit.returnedEntryCount).toBe(firstHistory.length)
     expect(historyAudit.entrySetDigest).toMatch(/^sha256:[0-9a-f]{64}$/)
-    const malformedQuestions = [
-      {}, { schemaVersion: 1 }, { schemaVersion: 1, questionId: ids.clarificationQuestion },
-      { schemaVersion: 1, questionId: ids.clarificationQuestion, question: 'Which branch?' },
-      { schemaVersion: '1', questionId: ids.clarificationQuestion, question: 'Which branch?', suggestions: [] },
-      { schemaVersion: 2, questionId: ids.clarificationQuestion, question: 'Which branch?', suggestions: [] },
-      { schemaVersion: 1, questionId: 7, question: 'Which branch?', suggestions: [] },
-      { schemaVersion: 1, questionId: randomUUID(), question: 'Which branch?', suggestions: [] },
-      { schemaVersion: 1, questionId: ids.clarificationQuestion, question: 7, suggestions: [] },
-      { schemaVersion: 1, questionId: ids.clarificationQuestion, question: 'Which branch?', suggestions: 'main' },
-      { schemaVersion: 1, questionId: ids.clarificationQuestion, question: 'Which branch?', suggestions: [], extra: true },
+    const canonicalQuestion = (questionId: string) => ({
+      schemaVersion: 1,
+      questionId,
+      question: 'Which branch?',
+      suggestions: ['main'],
+    })
+    const malformedQuestions: Array<{
+      name: string
+      payload: (questionId: string) => Record<string, unknown>
+    }> = [
+      { name: 'missing schemaVersion', payload: (questionId) => ({ questionId, question: 'Which branch?', suggestions: ['main'] }) },
+      { name: 'missing questionId', payload: () => ({ schemaVersion: 1, question: 'Which branch?', suggestions: ['main'] }) },
+      { name: 'missing question', payload: (questionId) => ({ schemaVersion: 1, questionId, suggestions: ['main'] }) },
+      { name: 'missing suggestions', payload: (questionId) => ({ schemaVersion: 1, questionId, question: 'Which branch?' }) },
+      { name: 'string schemaVersion', payload: (questionId) => ({ ...canonicalQuestion(questionId), schemaVersion: '1' }) },
+      { name: 'wrong numeric schemaVersion', payload: (questionId) => ({ ...canonicalQuestion(questionId), schemaVersion: 2 }) },
+      { name: 'non-string questionId', payload: (questionId) => ({ ...canonicalQuestion(questionId), questionId: 7 }) },
+      { name: 'mismatched questionId', payload: (questionId) => ({ ...canonicalQuestion(questionId), questionId: randomUUID() }) },
+      { name: 'non-string question', payload: (questionId) => ({ ...canonicalQuestion(questionId), question: 7 }) },
+      { name: 'empty question', payload: (questionId) => ({ ...canonicalQuestion(questionId), question: '' }) },
+      { name: 'untrimmed question', payload: (questionId) => ({ ...canonicalQuestion(questionId), question: ' Which branch? ' }) },
+      { name: 'non-array suggestions', payload: (questionId) => ({ ...canonicalQuestion(questionId), suggestions: 'main' }) },
+      { name: 'non-string suggestion', payload: (questionId) => ({ ...canonicalQuestion(questionId), suggestions: [7] }) },
+      { name: 'empty suggestion', payload: (questionId) => ({ ...canonicalQuestion(questionId), suggestions: [''] }) },
+      { name: 'untrimmed suggestion', payload: (questionId) => ({ ...canonicalQuestion(questionId), suggestions: [' main '] }) },
+      { name: 'duplicate suggestions', payload: (questionId) => ({ ...canonicalQuestion(questionId), suggestions: ['main', 'main'] }) },
+      { name: 'too many suggestions', payload: (questionId) => ({ ...canonicalQuestion(questionId), suggestions: ['one', 'two', 'three', 'four', 'five'] }) },
+      { name: 'extra key', payload: (questionId) => ({ ...canonicalQuestion(questionId), extra: true }) },
     ]
-    for (const malformed of malformedQuestions) {
+    for (const { name, payload } of malformedQuestions) {
       const taskId = randomUUID(); const runId = randomUUID(); const questionId = randomUUID()
       await admin`insert into tasks (id, project_id, submitted_by, title, prompt, status)
-        values (${taskId}::uuid, ${ids.project}::uuid, ${ids.user}::uuid, 'Malformed', 'protected', 'running')`
+        values (${taskId}::uuid, ${ids.project}::uuid, ${ids.user}::uuid, ${`Malformed: ${name}`}, 'protected', 'running')`
       await admin`insert into agent_runs (id, task_id, agent_type, model_id_used, status)
         values (${runId}::uuid, ${taskId}::uuid, 'architect', 'test', 'completed')`
       const source = await recordArchitectPlanVersion({ agentRunId: runId, digestKey: key, digestKeyId: 's4-test-key', planVersion: '1', taskId,
         entries: [{ agent: null, bindingFingerprint: null, content: 'body', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null },
           { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' },
-          { agent: null, bindingFingerprint: null, content: JSON.stringify(malformed), entryId: `clarification_question:${questionId}`, entryKind: 'clarification_question', projectionEligible: false, requirementKey: null }] })
+          { agent: null, bindingFingerprint: null, content: JSON.stringify(payload(questionId)), entryId: `clarification_question:${questionId}`, entryKind: 'clarification_question', projectionEligible: false, requirementKey: null }] })
       await admin`insert into task_questions (id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status)
         values (${questionId}::uuid, ${taskId}::uuid, ${`clarification_question:${questionId}`}, ${source.artifactId}::uuid, 1, 'open')`
       await expect(readArchitectPlanHistory({ planVersion: '1', sessionCredential, taskId })).rejects.toMatchObject({ code: 'invalid_evidence' })
