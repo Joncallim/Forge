@@ -463,9 +463,14 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       from architect_plan_history_reads where task_id = ${ids.task}::uuid and plan_version = 3
       order by read_at desc limit 1
     `
-    const canonicalSet = latestHistory.map(({ entryId, contentDigest }) => ({ entryId, contentDigest }))
+    // canonicalArchitectPlanJson sorts object keys; PostgreSQL jsonb emits the
+    // same canonical object order. Keep this literal byte representation in
+    // the proof so an ordering or whitespace drift is diagnosable.
+    const canonicalSet = latestHistory.map(({ entryId, contentDigest }) => ({ contentDigest, entryId }))
+    const canonicalSerialized = JSON.stringify(canonicalSet)
+    expect(canonicalSerialized).toMatch(/^\[{"contentDigest":"hmac-sha256:[0-9a-f]{64}","entryId":"clarification_answer:/)
     expect(latestAudit.returnedEntryCount).toBe(6)
-    expect(latestAudit.entrySetDigest).toBe(`sha256:${createHash('sha256').update(JSON.stringify(canonicalSet)).digest('hex')}`)
+    expect(latestAudit.entrySetDigest).toBe(`sha256:${createHash('sha256').update(canonicalSerialized).digest('hex')}`)
     const lockRun = randomUUID()
     const lockQuestion = randomUUID()
     await admin`insert into agent_runs (id, task_id, agent_type, model_id_used, status) values (${lockRun}::uuid, ${ids.task}::uuid, 'architect', 'test', 'completed')`
@@ -525,9 +530,10 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       from architect_plan_history_reads where task_id = ${ids.task}::uuid and plan_version = 4
       order by read_at desc limit 1
     `
-    const lockedSet = lockedRows.map((row) => ({ entryId: row.entry_id, contentDigest: row.content_digest }))
+    const lockedSet = lockedRows.map((row) => ({ contentDigest: row.content_digest, entryId: row.entry_id }))
+    const lockedSerialized = JSON.stringify(lockedSet)
     expect(lockedAudit.returnedEntryCount).toBe(lockedRows.length)
-    expect(lockedAudit.entrySetDigest).toBe(`sha256:${createHash('sha256').update(JSON.stringify(lockedSet)).digest('hex')}`)
+    expect(lockedAudit.entrySetDigest).toBe(`sha256:${createHash('sha256').update(lockedSerialized).digest('hex')}`)
     // The reader must reject a complete 257-row union rather than truncating it.
     const overrunRun = randomUUID()
     const overrunReadRun = randomUUID()
