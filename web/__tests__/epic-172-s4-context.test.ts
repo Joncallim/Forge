@@ -427,6 +427,8 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
     expect(s4Migration).toContain('sessions_cache_purge_state_chk')
     expect(s4Migration).toContain('sessions_cache_purge_due_idx')
     expect(s4Migration).toContain('cache_purge_credential_digest_v1 bytea')
+    expect(s4Migration).toContain('cache_purge_credential_digest_v1 IS NOT NULL')
+    expect(s4Migration).toContain('pg_catalog.octet_length(cache_purge_credential_digest_v1) = 32')
     expect(s4Migration).not.toContain("last_seen_at + interval '7 days'")
     expect(s4Migration).not.toContain('ALTER COLUMN credential_digest_v1 SET NOT NULL')
     expect(s4Migration).not.toContain('ALTER COLUMN expires_at SET NOT NULL')

@@ -1100,6 +1100,22 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
 
   it('uses production logout and claim paths for v0, v1, and v2 session cache purges', async () => {
     const { destroySession, reconcilePendingSessionCacheInvalidations } = await import('@/lib/session')
+    for (const invalidDigest of [null, Buffer.alloc(31, 1)]) {
+      const invalidSession = randomUUID()
+      const liveDigest = computeCredentialDigest(randomUUID()).digest
+      await admin`
+        insert into sessions (id, user_id, credential_digest_v1, expires_at, credential_storage_version)
+        values (${invalidSession}::uuid, ${ids.user}::uuid, ${liveDigest}::bytea,
+          clock_timestamp() + interval '7 days', 2)
+      `
+      await expect(admin`
+        update sessions
+        set cache_purge_pending_at = clock_timestamp(),
+          cache_purge_credential_digest_v1 = ${invalidDigest}::bytea,
+          cache_purge_generation = gen_random_uuid()
+        where id = ${invalidSession}::uuid
+      `).rejects.toMatchObject({ code: '23514' })
+    }
     for (const storageVersion of [0, 1, 2] as const) {
       const credential = randomUUID()
       const digest = computeCredentialDigest(credential).digest
@@ -1173,6 +1189,69 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     ])
     expect([first.claimed, second.claimed].sort()).toEqual([0, 1])
     expect(first.completed + second.completed).toBe(1)
+  })
+
+  it.each([
+    ['v2', 2],
+    ['dual-write v1', 1],
+  ])('holds the %s session row through cache population so logout waits and then purges it', async (
+    _label,
+    credentialStorageVersion,
+  ) => {
+    const { destroySession, getSession } = await import('@/lib/session')
+    const credential = randomUUID()
+    const digest = computeCredentialDigest(credential).digest
+    const sessionId = credentialStorageVersion === 1 ? credential : randomUUID()
+    mockRedisDel.mockClear()
+    mockRedisSet.mockClear()
+    await admin`
+      insert into sessions (id, user_id, credential_digest_v1, expires_at, credential_storage_version)
+      values (${sessionId}::uuid, ${ids.user}::uuid, ${digest}::bytea,
+        clock_timestamp() + interval '7 days', ${credentialStorageVersion})
+    `
+
+    let releaseCacheWrite: (() => void) | undefined
+    const cacheWriteStarted = new Promise<void>((resolve) => {
+      mockRedisSet.mockImplementationOnce(async () => {
+        resolve()
+        await new Promise<void>((release) => { releaseCacheWrite = release })
+        return 'OK'
+      })
+    })
+    mockRedisDel.mockResolvedValueOnce(0)
+    const read = getSession(new Request('http://localhost/', {
+      headers: { cookie: `forge_session=${credential}` },
+    }))
+    await cacheWriteStarted
+    let revokeSettled = false
+    const revoke = destroySession(credential).then(() => { revokeSettled = true })
+    const waitForBlockedLogout = async () => {
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const [blocked] = await admin<{ count: number }[]>`
+          select count(*)::integer as count
+          from pg_catalog.pg_stat_activity
+          where datname = current_database()
+            and wait_event_type = 'Lock'
+            and query like 'update "sessions" set%'
+        `
+        if (blocked?.count === 1) return
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      throw new Error('logout did not block on the cache-write session row lock')
+    }
+    try {
+      await waitForBlockedLogout()
+      expect(revokeSettled).toBe(false)
+    } finally {
+      releaseCacheWrite?.()
+    }
+    await expect(read).resolves.toEqual({ sessionId, userId: ids.user })
+    await expect(revoke).resolves.toBeUndefined()
+    expect(mockRedisSet).toHaveBeenCalledTimes(credentialStorageVersion === 1 ? 2 : 1)
+    expect(mockRedisDel).toHaveBeenCalledWith(
+      expect.stringMatching(/^session:v2:/),
+      ...(credentialStorageVersion === 1 ? [`session:${credential}`] : []),
+    )
   })
 
   it('allow-once-single-winner: atomically keeps one audit and one nonce claim', async () => {

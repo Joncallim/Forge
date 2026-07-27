@@ -110,58 +110,6 @@ async function deleteSessionCacheTarget(target: SessionCachePurgeTarget): Promis
 }
 
 /**
- * Runs after a cache write. If logout/expiry won the race after the original
- * database authorization, this locked compare-and-set creates a fresh purge
- * claim before deleting the just-written keys.
- */
-async function fenceSessionCacheWrite(digest: Buffer, sessionId: string): Promise<void> {
-  const generation = crypto.randomUUID()
-  const claimToken = crypto.randomUUID()
-  const fenced = await db.update(sessions).set({
-    cachePurgeAttemptCount: 1,
-    cachePurgeClaimExpiresAt: sql`pg_catalog.clock_timestamp() + ${SESSION_CACHE_PURGE_CLAIM_SECONDS} * interval '1 second'`,
-    cachePurgeClaimToken: claimToken,
-    cachePurgeCompletedAt: null,
-    cachePurgeCredentialDigestV1: digest,
-    cachePurgeGeneration: generation,
-    cachePurgeNextAttemptAt: sql`pg_catalog.clock_timestamp()`,
-    cachePurgePendingAt: sql`pg_catalog.clock_timestamp()`,
-  }).where(and(
-    eq(sessions.id, sessionId),
-    eq(sessions.credentialDigestV1, digest),
-    or(
-      isNotNull(sessions.revokedAt),
-      isNull(sessions.expiresAt),
-      sql`${sessions.expiresAt} <= pg_catalog.clock_timestamp()`,
-    ),
-  )).returning({
-    attemptCount: sessions.cachePurgeAttemptCount,
-    credentialDigest: sessions.cachePurgeCredentialDigestV1,
-    claimToken: sessions.cachePurgeClaimToken,
-    generation: sessions.cachePurgeGeneration,
-    legacyCredential: sql<string | null>`CASE WHEN ${sessions.credentialStorageVersion} < 2 THEN ${sessions.id}::text ELSE NULL END`,
-    sessionId: sessions.id,
-  })
-  const target = Array.isArray(fenced) ? fenced[0] : undefined
-  if (!target?.credentialDigest || !target.claimToken || !target.generation) return
-  const purge = cachePurgeTarget({
-    attemptCount: target.attemptCount,
-    claimToken: target.claimToken,
-    credentialDigest: target.credentialDigest,
-    generation: target.generation,
-    legacyCredential: target.legacyCredential,
-    sessionId: target.sessionId,
-  })
-  if (!purge) return
-  try {
-    await deleteSessionCacheTarget(purge)
-    await completeSessionCachePurge(purge)
-  } catch {
-    await deferSessionCachePurge(purge).catch(() => {})
-  }
-}
-
-/**
  * Bounded worker maintenance for already-revoked sessions. It never reads Redis
  * to authorize a request and only derives cache keys from persisted digest/legacy
  * identity fields returned by the locked database row.
@@ -481,6 +429,62 @@ async function cacheAuthorizedSession(
   )
 }
 
+/**
+ * Redis is not an authority, but its writes must be ordered with revocation.
+ * The exact live session row stays locked while these one or two cache writes
+ * run: a competing logout either committed first (so this skips), or waits and
+ * deletes the completed keys after this transaction releases its lock.
+ */
+async function cacheAuthorizedSessionWhileLocked(
+  credential: string,
+  digest: Buffer,
+  authorized: AuthorizedSession,
+): Promise<void> {
+  await db.transaction(async (tx) => {
+    const [row] = await tx
+      .select({
+        credentialStorageVersion: sessions.credentialStorageVersion,
+        databaseNow: sql<Date | string>`pg_catalog.clock_timestamp()`,
+        expiresAt: sessions.expiresAt,
+        lastSeenAt: sessions.lastSeenAt,
+        revokedAt: sessions.revokedAt,
+        sessionId: sessions.id,
+        userId: sessions.userId,
+      })
+      .from(sessions)
+      .where(and(
+        eq(sessions.id, authorized.sessionId),
+        eq(sessions.credentialDigestV1, digest),
+      ))
+      .limit(1)
+      .for('update')
+    if (!row || row.revokedAt || row.userId !== authorized.userId || !row.expiresAt) return
+
+    const expiresAt = parseDatabaseTimestamp(row.expiresAt, 'locked expiry')
+    if (parseDatabaseTimestamp(row.databaseNow, 'locked clock') >= expiresAt) return
+    const lastSeenAt = parseDatabaseTimestamp(row.lastSeenAt, 'locked last-seen')
+    const [reconciliation] = await tx
+      .select({ state: sessionCredentialReconciliation.state })
+      .from(sessionCredentialReconciliation)
+      .where(eq(sessionCredentialReconciliation.singleton, true))
+      .limit(1)
+      .for('key share')
+    if (!reconciliation) throw new Error('Session credential reconciliation authority is unavailable')
+
+    const locked: AuthorizedSession = {
+      sessionId: row.sessionId,
+      userId: row.userId,
+      lastSeenAt,
+      expiresAt,
+      refreshed: authorized.refreshed,
+      credentialStorageVersion: row.credentialStorageVersion,
+      writeLegacyCacheAfterCommit: row.credentialStorageVersion === 1 && reconciliation.state === 'expansion',
+    }
+    if (locked.writeLegacyCacheAfterCommit) await writeLegacySessionCache(credential, locked)
+    await cacheAuthorizedSession(digest, locked)
+  })
+}
+
 export async function getSession(
   request: Request,
 ): Promise<{ sessionId: string; userId: string } | null> {
@@ -501,13 +505,9 @@ export async function getSession(
     return null
   }
 
-  // Redis is a repairable cache only. Failure never turns a database-valid
-  // session into an authorization failure and never extends database expiry.
-  if (authorized.writeLegacyCacheAfterCommit) {
-    await writeLegacySessionCache(credential, authorized).catch(() => {})
-  }
-  await cacheAuthorizedSession(digest, authorized).catch(() => {})
-  await fenceSessionCacheWrite(digest, authorized.sessionId).catch(() => {})
+  // Redis is a repairable cache only. A failed lock or cache write never turns
+  // an already-authorized database session into a denial.
+  await cacheAuthorizedSessionWhileLocked(credential, digest, authorized).catch(() => {})
   return { sessionId: authorized.sessionId, userId: authorized.userId }
 }
 
