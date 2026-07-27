@@ -23,6 +23,7 @@ const negativeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-mi
 const replayProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-reconciliation-replay.sh', import.meta.url)), 'utf8')
 const privilegeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-reconciler-privileges-assertions.sql', import.meta.url)), 'utf8')
 const staleContextProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-stale-context.sh', import.meta.url)), 'utf8')
+const negativeAssertions = readFileSync(fileURLToPath(new URL('../scripts/ci/sql/migration-0027-root-reconciliation-negative-assertions.sql', import.meta.url)), 'utf8')
 const cutoverScript = readFileSync(fileURLToPath(new URL('../scripts/ci/cutover-migration-0027-root-ref.sh', import.meta.url)), 'utf8')
 const webCi = readFileSync(fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)), 'utf8')
 
@@ -230,6 +231,13 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(upgradeProof.indexOf('prove-migration-0027-root-stale-context.sh')).toBeLessThan(
       upgradeProof.indexOf('reconcile-migration-0027-root-refs.sh'),
     )
+  })
+
+  it('binds negative assertion inputs outside the dollar-quoted PL/pgSQL body', () => {
+    expect(negativeAssertions).toContain('CREATE TEMP TABLE root_negative_assertion_inputs')
+    expect(negativeAssertions).toContain("VALUES (:'operation_id'::uuid, :'task_id'::uuid, :'generation'::bigint)")
+    expect(negativeAssertions).toContain('FROM root_negative_assertion_inputs')
+    expect(negativeAssertions).not.toContain("id=:'task_id'")
   })
 
   it('selects phase suppression only in the internal root-journal caller', () => {
