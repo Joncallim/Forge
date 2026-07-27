@@ -909,18 +909,18 @@ export async function reconcileFilesystemGrantsForProject(
     if (context.projectId !== input.lockedProject.id) throw httpError('Root reconciliation context project changed.', 409)
     await tx.execute(sql`select forge.lock_project_root_reconciliation_authority_v1(${context.operationId}::uuid, ${context.actorId}::uuid, ${context.generation}::bigint, ${context.projectId}::uuid)`)
   }
-  const packageDecisionRows = await tx.select()
+  const packageDecisionQuery = tx.select()
     .from(filesystemMcpGrantApprovals)
     .where(eq(filesystemMcpGrantApprovals.projectId, input.lockedProject.id))
     .orderBy(filesystemMcpGrantApprovals.id)
-    .for('update')
-  const projectDecisionRows = await tx.select().from(projectFilesystemGrantDecisions)
+  const packageDecisionRows = await (input.rootReconciliationContext ? packageDecisionQuery : packageDecisionQuery.for('update'))
+  const projectDecisionQuery = tx.select().from(projectFilesystemGrantDecisions)
     .where(eq(projectFilesystemGrantDecisions.projectId, input.lockedProject.id))
     .orderBy(projectFilesystemGrantDecisions.id)
-    .for('update')
-  const [projectPointer] = await tx.select().from(projectFilesystemCurrentDecisionPointers)
+  const projectDecisionRows = await (input.rootReconciliationContext ? projectDecisionQuery : projectDecisionQuery.for('update'))
+  const projectPointerQuery = tx.select().from(projectFilesystemCurrentDecisionPointers)
     .where(eq(projectFilesystemCurrentDecisionPointers.projectId, input.lockedProject.id))
-    .for('update')
+  const [projectPointer] = await (input.rootReconciliationContext ? projectPointerQuery : projectPointerQuery.for('update'))
   if (!projectPointer) throw httpError('Project filesystem decision authority is not initialized.', 409)
   const currentProjectDecision = projectDecisionPointerParent(projectPointer, projectDecisionRows)
   if (currentProjectDecision === undefined) {
@@ -928,14 +928,19 @@ export async function reconcileFilesystemGrantsForProject(
   }
   const pointerRows = packageRows.length === 0
     ? []
-    : await tx.select()
+    : await (input.rootReconciliationContext
+      ? tx.select()
       .from(filesystemMcpCurrentDecisionPointers)
       .where(inArray(
         filesystemMcpCurrentDecisionPointers.workPackageId,
         packageRows.map((pkg) => pkg.id),
       ))
       .orderBy(filesystemMcpCurrentDecisionPointers.workPackageId)
-      .for('update')
+      : tx.select()
+      .from(filesystemMcpCurrentDecisionPointers)
+      .where(inArray(filesystemMcpCurrentDecisionPointers.workPackageId, packageRows.map((pkg) => pkg.id)))
+      .orderBy(filesystemMcpCurrentDecisionPointers.workPackageId)
+      .for('update'))
   if (pointerRows.length !== packageRows.length) {
     throw httpError('Filesystem decision authority is not initialized for every package.', 409)
   }
