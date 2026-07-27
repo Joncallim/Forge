@@ -28,7 +28,7 @@ SQL
 for _ in $(seq 1 100); do [[ -f "$ready" ]] && break; sleep 0.05; done
 [[ -f "$ready" ]] || fail_phase 'wait for winner context barrier' "$winner_out"
 if psql "$url" --set ON_ERROR_STOP=1 --command "BEGIN; SET LOCAL lock_timeout='250ms'; SET LOCAL statement_timeout='1s'; SELECT * FROM forge.claim_project_root_reconciliation_batch_v1('${op}'::uuid,'${actor}'::uuid,1); COMMIT;" >"$loser_out" 2>&1; then fail_phase 'require loser lock-timeout rejection' "$loser_out"; else loser_status=$?; fi
-[[ "$loser_status" == 3 ]] || { echo "root contention proof expected loser psql exit 3, got ${loser_status}" >&2; fail_phase 'require loser lock-timeout rejection' "$loser_out"; }
+[[ "$loser_status" == 1 ]] || { echo "root contention proof expected command-mode loser psql exit 1, got ${loser_status}" >&2; fail_phase 'require loser lock-timeout rejection' "$loser_out"; }
 grep -F -- 'canceling statement due to lock timeout' "$loser_out" >/dev/null || fail_phase 'require loser lock-timeout rejection' "$loser_out"
 touch "$release"
 if wait "$winner_pid"; then unset winner_pid; else winner_status=$?; echo "root contention proof winner psql exited ${winner_status}" >&2; fail_phase 'complete winner reconciliation' "$winner_out"; fi
