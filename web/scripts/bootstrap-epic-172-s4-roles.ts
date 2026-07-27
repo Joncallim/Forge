@@ -113,6 +113,40 @@ async function main(): Promise<void> {
     await admin`revoke create on schema forge from ${admin(OWNER)}`
     await admin`revoke create on schema public from ${admin(OWNER)}`
     await admin`grant execute on function forge.read_epic_172_enablement_state_v1() to ${admin(OWNER)}`
+    // These six routines are trigger-only: migrations create their triggers
+    // before this bootstrap runs, and the owning trigger tables invoke them.
+    // No runtime login needs direct EXECUTE, so remove PostgreSQL's default
+    // PUBLIC function grant without opening a reconciler capability.
+    await admin.unsafe(`
+      revoke execute on function
+        public.forge_epic_172_reject_mutation_v1(),
+        public.forge_epic_172_reject_project_hard_delete_v1(),
+        public.forge_preallocate_filesystem_decision_pointer(),
+        public.forge_preallocate_project_filesystem_decision_pointer(),
+        public.forge_reject_filesystem_grant_history_mutation(),
+        public.forge_reject_project_filesystem_decision_mutation()
+      from public
+    `)
+    const [{ publicTriggerExecuteCount }] = await admin<{ publicTriggerExecuteCount: number }[]>`
+      select count(*)::integer as "publicTriggerExecuteCount"
+      from pg_catalog.pg_proc routine
+      cross join lateral pg_catalog.aclexplode(
+        coalesce(routine.proacl, pg_catalog.acldefault('f', routine.proowner))
+      ) acl
+      where routine.oid = any(array[
+        'public.forge_epic_172_reject_mutation_v1()'::pg_catalog.regprocedure,
+        'public.forge_epic_172_reject_project_hard_delete_v1()'::pg_catalog.regprocedure,
+        'public.forge_preallocate_filesystem_decision_pointer()'::pg_catalog.regprocedure,
+        'public.forge_preallocate_project_filesystem_decision_pointer()'::pg_catalog.regprocedure,
+        'public.forge_reject_filesystem_grant_history_mutation()'::pg_catalog.regprocedure,
+        'public.forge_reject_project_filesystem_decision_mutation()'::pg_catalog.regprocedure
+      ])
+        and acl.grantee = 0
+        and acl.privilege_type = 'EXECUTE'
+    `
+    if (publicTriggerExecuteCount !== 0) {
+      throw new Error('Trigger-only S3 helpers retain an unsafe PUBLIC EXECUTE grant.')
+    }
     // S4 claims and archive transitions take row locks on the bounded S3
     // current-head set. PostgreSQL requires UPDATE privilege for SELECT ...
     // FOR UPDATE even though these routines never modify the head rows.
