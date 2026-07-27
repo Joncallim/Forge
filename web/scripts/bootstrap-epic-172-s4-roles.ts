@@ -31,6 +31,7 @@ const OWNED_TABLES = [
   'project_root_reconciliation_operations',
   'project_root_reconciliation_checkpoints',
   'project_root_reconciliation_outcomes',
+  'project_root_reconciliation_write_contexts',
   's4_completion_handoffs',
   's4_protected_review_sources',
   's4_protected_review_source_reads',
@@ -112,6 +113,40 @@ async function main(): Promise<void> {
     await admin`revoke create on schema forge from ${admin(OWNER)}`
     await admin`revoke create on schema public from ${admin(OWNER)}`
     await admin`grant execute on function forge.read_epic_172_enablement_state_v1() to ${admin(OWNER)}`
+    // These six routines are trigger-only: migrations create their triggers
+    // before this bootstrap runs, and the owning trigger tables invoke them.
+    // No runtime login needs direct EXECUTE, so remove PostgreSQL's default
+    // PUBLIC function grant without opening a reconciler capability.
+    await admin.unsafe(`
+      revoke execute on function
+        public.forge_epic_172_reject_mutation_v1(),
+        public.forge_epic_172_reject_project_hard_delete_v1(),
+        public.forge_preallocate_filesystem_decision_pointer(),
+        public.forge_preallocate_project_filesystem_decision_pointer(),
+        public.forge_reject_filesystem_grant_history_mutation(),
+        public.forge_reject_project_filesystem_decision_mutation()
+      from public
+    `)
+    const [{ publicTriggerExecuteCount }] = await admin<{ publicTriggerExecuteCount: number }[]>`
+      select count(*)::integer as "publicTriggerExecuteCount"
+      from pg_catalog.pg_proc routine
+      cross join lateral pg_catalog.aclexplode(
+        coalesce(routine.proacl, pg_catalog.acldefault('f', routine.proowner))
+      ) acl
+      where routine.oid = any(array[
+        'public.forge_epic_172_reject_mutation_v1()'::pg_catalog.regprocedure,
+        'public.forge_epic_172_reject_project_hard_delete_v1()'::pg_catalog.regprocedure,
+        'public.forge_preallocate_filesystem_decision_pointer()'::pg_catalog.regprocedure,
+        'public.forge_preallocate_project_filesystem_decision_pointer()'::pg_catalog.regprocedure,
+        'public.forge_reject_filesystem_grant_history_mutation()'::pg_catalog.regprocedure,
+        'public.forge_reject_project_filesystem_decision_mutation()'::pg_catalog.regprocedure
+      ])
+        and acl.grantee = 0
+        and acl.privilege_type = 'EXECUTE'
+    `
+    if (publicTriggerExecuteCount !== 0) {
+      throw new Error('Trigger-only S3 helpers retain an unsafe PUBLIC EXECUTE grant.')
+    }
     // S4 claims and archive transitions take row locks on the bounded S3
     // current-head set. PostgreSQL requires UPDATE privilege for SELECT ...
     // FOR UPDATE even though these routines never modify the head rows.
@@ -144,14 +179,7 @@ async function main(): Promise<void> {
       await admin.unsafe(`grant usage on schema forge to ${LOGIN_ROLES.join(', ')}`)
       await admin`grant execute on function forge.read_epic_172_enablement_state_v1() to ${admin(OWNER)}`
       await admin`grant select, update on table public.work_package_local_projection_heads to ${admin(OWNER)}`
-      // The dedicated reconciler acquires FOR UPDATE locks through the
-      // canonical S3 helper.  PostgreSQL requires an UPDATE privilege for
-      // that lock mode; grant only the immutable primary key column.
-      await admin`grant update (id) on table public.work_package_local_projection_heads to forge_project_root_reconciler`
       await admin`grant select on table public.projects, public.tasks, public.work_packages, public.filesystem_mcp_grant_approvals, public.filesystem_mcp_current_decision_pointers, public.project_filesystem_grant_decisions, public.project_filesystem_current_decision_pointers, public.work_package_local_projection_heads to forge_project_root_reconciler`
-      await admin`grant update (id) on table public.projects, public.filesystem_mcp_grant_approvals, public.project_filesystem_grant_decisions to forge_project_root_reconciler`
-      await admin`grant update (project_id) on table public.project_filesystem_current_decision_pointers to forge_project_root_reconciler`
-      await admin`grant update (work_package_id) on table public.filesystem_mcp_current_decision_pointers to forge_project_root_reconciler`
       await admin`grant update (status, error_message, updated_at) on table public.tasks to forge_project_root_reconciler`
       await admin`grant update (status, blocked_reason, metadata, updated_at) on table public.work_packages to forge_project_root_reconciler`
       await admin`grant execute on function forge.advance_local_projection_head_v1(uuid,uuid,text,uuid,bigint,text,jsonb,bigint,text,text) to forge_project_root_reconciler`
