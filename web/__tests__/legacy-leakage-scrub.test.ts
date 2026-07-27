@@ -6,7 +6,9 @@ import {
 } from '@/lib/mcps/leakage-drain'
 import {
   containsForbiddenV2EventData,
+  LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY,
   legacyLeakageRowFingerprint,
+  legacyLeakageSentinelSetFingerprint,
   projectV2TaskEventData,
   runLegacyLeakageScrub,
   type LegacyLeakageScrubCheckpoint,
@@ -18,10 +20,13 @@ import {
 } from '@/lib/mcps/legacy-leakage-scrub'
 import {
   createLegacyLeakageRedisAdapter,
+  parseLegacyLeakageScrubCheckpoint,
   parseLegacyLeakageScrubArgs,
 } from '@/scripts/scrub-legacy-leakage'
 
 const RECEIPT = '11111111-1111-4111-8111-111111111111'
+const FINGERPRINT_KEY = Buffer.alloc(32, 7)
+const FINGERPRINT_KEY_ID = 'test-scrub-key-v2'
 
 function evidence(changes: Partial<RedisScanEvidence> = {}): RedisScanEvidence {
   return {
@@ -112,7 +117,7 @@ class FakeDatabase implements LegacyLeakageScrubDatabase {
       this.conflictOnceFor = null
       return 'row_conflict'
     }
-    if (legacyLeakageRowFingerprint(rows[index]) !== input.expectedRowFingerprint) return 'row_conflict'
+    if (legacyLeakageRowFingerprint(rows[index], FINGERPRINT_KEY) !== input.expectedRowFingerprint) return 'row_conflict'
     rows[index] = input.row
     this.updates += 1
     this.checkpointWrites += 1
@@ -259,6 +264,8 @@ describe('legacy leakage scrub', () => {
     const result = await runLegacyLeakageScrub({
       actor: 'operator',
       authorizationReceiptId: RECEIPT,
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
       mode: 'dry-run',
     }, { database, redis })
 
@@ -292,6 +299,8 @@ describe('legacy leakage scrub', () => {
     const first = await runLegacyLeakageScrub({
       actor: 'operator',
       authorizationReceiptId: RECEIPT,
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
       mode: 'apply',
       operationId: 'leakage-operation',
     }, { database, redis })
@@ -300,6 +309,8 @@ describe('legacy leakage scrub', () => {
     const resumed = await runLegacyLeakageScrub({
       actor: 'operator',
       authorizationReceiptId: RECEIPT,
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
       mode: 'resume',
       operationId: 'leakage-operation',
     }, { database, redis })
@@ -368,6 +379,8 @@ describe('legacy leakage scrub', () => {
     await expect(runLegacyLeakageScrub({
       actor: 'operator',
       authorizationReceiptId: RECEIPT,
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
       mode: 'apply',
       operationId: 'crash-operation',
     }, { database, redis })).rejects.toThrow('injected disconnect after commit')
@@ -376,6 +389,8 @@ describe('legacy leakage scrub', () => {
     const resumed = await runLegacyLeakageScrub({
       actor: 'operator',
       authorizationReceiptId: RECEIPT,
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
       mode: 'resume',
       operationId: 'crash-operation',
     }, { database, redis })
@@ -385,6 +400,8 @@ describe('legacy leakage scrub', () => {
     const verifiedAgain = await runLegacyLeakageScrub({
       actor: 'operator',
       authorizationReceiptId: RECEIPT,
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
       mode: 'resume',
       operationId: 'crash-operation',
     }, { database, redis })
@@ -401,11 +418,48 @@ describe('legacy leakage scrub', () => {
     await expect(runLegacyLeakageScrub({
       actor: 'operator',
       authorizationReceiptId: 'wrong-receipt',
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
       mode: 'apply',
       operationId: 'unauthorized-operation',
     }, { database, redis })).rejects.toThrow('fixed S4 producers-disabled drain contract')
     expect(database.checkpoint).toBeNull()
     expect(redis.applyCalls).toEqual([])
+  })
+
+  it('uses domain-separated keyed fingerprints and binds resume to key and order-independent sentinels', async () => {
+    const row = taskLog()
+    const otherKey = Buffer.alloc(32, 8)
+    expect(legacyLeakageRowFingerprint(row, FINGERPRINT_KEY)).not.toBe(legacyLeakageRowFingerprint(row, otherKey))
+    expect(legacyLeakageSentinelSetFingerprint(['B', 'A', 'A'], FINGERPRINT_KEY))
+      .toBe(legacyLeakageSentinelSetFingerprint(['A', 'B'], FINGERPRINT_KEY))
+
+    const database = new FakeDatabase()
+    const redis = new FakeRedis()
+    await runLegacyLeakageScrub({
+      actor: 'operator', authorizationReceiptId: RECEIPT, fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID, sentinels: ['B', 'A'], mode: 'apply', operationId: 'bound-operation',
+    }, { database, redis })
+    await expect(runLegacyLeakageScrub({
+      actor: 'operator', authorizationReceiptId: RECEIPT, fingerprintKey: otherKey,
+      fingerprintKeyId: 'rotated-key-v3', sentinels: ['A', 'B'], mode: 'resume', operationId: 'bound-operation',
+    }, { database, redis })).rejects.toThrow('fingerprint key ID')
+    await expect(runLegacyLeakageScrub({
+      actor: 'operator', authorizationReceiptId: RECEIPT, fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID, sentinels: ['A', 'C'], mode: 'resume', operationId: 'bound-operation',
+    }, { database, redis })).rejects.toThrow('sentinel set')
+    expect(JSON.stringify(database.checkpoint)).not.toContain('A')
+    expect(JSON.stringify(database.checkpoint)).not.toContain(FINGERPRINT_KEY.toString('hex'))
+  })
+
+  it('fails closed instead of resuming an unsafe v1 checkpoint and exposes a closed sink policy', () => {
+    expect(() => parseLegacyLeakageScrubCheckpoint(JSON.stringify({ schemaVersion: 1, operationId: 'old' })))
+      .toThrow('unsafe legacy format; start a new --apply operation')
+    expect(LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY.task_logs.updated).toEqual(['message', 'front_matter', 'metadata'])
+    expect(LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY.artifacts.excluded).toContain('architect_plan_entries.content')
+    expect(LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY.retainedAuthorities).toEqual(expect.arrayContaining([
+      'tasks.prompt', 'architect_plan_versions', 'architect_plan_entries', 'ordinary_non_plan_artifact.content',
+    ]))
   })
 
   it('requires closed per-event shapes and rejects free-form diagnostic strings without sentinels', () => {
@@ -534,6 +588,8 @@ describe('legacy leakage scrub', () => {
     const options = {
       actor: 'operator',
       authorizationReceiptId: RECEIPT,
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
       mode: 'apply' as const,
       operationId: 'completion-zero-scan',
     }
@@ -630,6 +686,26 @@ describe('legacy leakage CLI and operator guide', () => {
     expect(commandSource).toContain("enablement.state = 'disabled'")
     expect(commandSource).toContain("'legacy_prompt_and_event_data_zero_scan_green'")
     expect(commandSource).toContain('select distinct plan_artifact_id from architect_plan_versions')
+    expect(commandSource).toContain('where version.plan_artifact_id is null')
+    expect(commandSource).toContain('and version.plan_artifact_id is null')
+    expect(commandSource).toContain('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY')
+    expect(commandSource).not.toContain('createHash')
     expect(commandSource).not.toContain('historyAvailable":true')
+  })
+
+  it('keeps the PostgreSQL adapter selection and mutation surface aligned with the closed policy', async () => {
+    const commandSource = await readFile('scripts/scrub-legacy-leakage.ts', 'utf8')
+    const contractSource = await readFile('lib/mcps/legacy-leakage-scrub.ts', 'utf8')
+    for (const column of LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY.task_logs.updated) {
+      expect(commandSource).toContain(column)
+    }
+    for (const column of LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY.artifacts.updated) {
+      expect(commandSource).toContain(`a.${column}`)
+    }
+    expect(commandSource).toContain('update work_packages')
+    expect(commandSource).toContain('update approval_gates')
+    expect(commandSource).not.toContain('from architect_plan_entries')
+    expect(contractSource).toContain("createHmac('sha256'")
+    expect(contractSource).not.toContain("createHash('sha256'")
   })
 })

@@ -30,6 +30,27 @@ export type LegacyLeakageScrubCli = Readonly<{
   sentinels: readonly string[]
 }>
 
+function requiredFingerprintKey(): Buffer {
+  const encoded = process.env.FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY?.trim()
+  if (!encoded) throw new Error('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY is required.')
+  const key = /^[0-9a-f]{64}$/iu.test(encoded)
+    ? Buffer.from(encoded, 'hex')
+    : Buffer.from(encoded, 'base64')
+  if (key.length !== 32) {
+    throw new Error('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY must encode exactly 32 bytes.')
+  }
+  return key
+}
+
+function requiredFingerprintKeyId(): string {
+  const keyId = process.env.FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID?.trim()
+  if (!keyId) throw new Error('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID is required.')
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(keyId)) {
+    throw new Error('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID must be a bounded non-secret key identifier.')
+  }
+  return keyId
+}
+
 export function legacyLeakageScrubUsage(): string {
   return `Legacy task-log, artifact, and Redis leakage scrub
 
@@ -56,7 +77,11 @@ keys. Protected Architect plan entries are never selected or updated.
 
 Environment:
   FORGE_DATABASE_ADMIN_URL  privileged PostgreSQL connection for the scrub
-  REDIS_URL                 Redis connection whose legacy task history is purged`
+  REDIS_URL                 Redis connection whose legacy task history is purged
+  FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY
+                            dedicated 32-byte server-private HMAC key
+  FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID
+                            bounded non-secret key identifier`
 }
 
 function positiveInteger(flag: string, value: string | undefined, fallback: number): number {
@@ -128,9 +153,19 @@ function requiredAdminDatabaseUrl(): string {
   return value
 }
 
-function parseCheckpoint(value: string): LegacyLeakageScrubCheckpoint {
+export function parseLegacyLeakageScrubCheckpoint(value: string): LegacyLeakageScrubCheckpoint {
   const parsed = JSON.parse(value) as Partial<LegacyLeakageScrubCheckpoint>
-  if (parsed.schemaVersion !== 1 || typeof parsed.operationId !== 'string' || typeof parsed.phase !== 'string') {
+  if (parsed.schemaVersion !== 2) {
+    throw new Error('Stored leakage scrub checkpoint uses an unsafe legacy format; start a new --apply operation.')
+  }
+  if (
+    typeof parsed.operationId !== 'string'
+    || typeof parsed.phase !== 'string'
+    || typeof parsed.fingerprintKeyId !== 'string'
+    || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(parsed.fingerprintKeyId)
+    || typeof parsed.sentinelSetFingerprint !== 'string'
+    || !/^[0-9a-f]{64}$/iu.test(parsed.sentinelSetFingerprint)
+  ) {
     throw new Error('Stored leakage scrub checkpoint is malformed.')
   }
   return parsed as LegacyLeakageScrubCheckpoint
@@ -174,6 +209,7 @@ function approvalGateRow(row: Record<string, unknown>): LegacyLeakageScrubRow {
 
 export function createLegacyLeakagePostgresAdapter(
   sql: ReturnType<typeof postgres>,
+  fingerprintKey: Buffer,
 ): LegacyLeakageScrubDatabase {
   return {
     async databaseTime() {
@@ -234,7 +270,7 @@ export function createLegacyLeakagePostgresAdapter(
         from app_settings
         where key = ${checkpointKey(operationId)}
       `
-      return row ? { checkpoint: parseCheckpoint(row.value), token: row.value } : null
+      return row ? { checkpoint: parseLegacyLeakageScrubCheckpoint(row.value), token: row.value } : null
     },
 
     async createCheckpoint(checkpoint) {
@@ -299,6 +335,7 @@ export function createLegacyLeakagePostgresAdapter(
             left join (
               select distinct plan_artifact_id from architect_plan_versions
             ) version on version.plan_artifact_id = a.id
+            where version.plan_artifact_id is null
             order by a.id limit ${limit}
           `
         : await sql<Record<string, unknown>[]>`
@@ -314,7 +351,9 @@ export function createLegacyLeakagePostgresAdapter(
             left join (
               select distinct plan_artifact_id from architect_plan_versions
             ) version on version.plan_artifact_id = a.id
-            where a.id > ${afterId}::uuid order by a.id limit ${limit}
+            where a.id > ${afterId}::uuid
+              and version.plan_artifact_id is null
+            order by a.id limit ${limit}
           `
       return rows.map(artifactRow)
     },
@@ -357,6 +396,7 @@ export function createLegacyLeakagePostgresAdapter(
                 select distinct plan_artifact_id from architect_plan_versions
               ) version on version.plan_artifact_id = a.id
               where a.id = ${input.row.id}::uuid
+                and version.plan_artifact_id is null
               for update of a
             `
         if (sourceRows.length !== 1) return 'row_conflict' as const
@@ -367,7 +407,7 @@ export function createLegacyLeakagePostgresAdapter(
             : input.row.kind === 'approval_gate'
               ? approvalGateRow(sourceRows[0])
               : artifactRow(sourceRows[0])
-        if (legacyLeakageRowFingerprint(source) !== input.expectedRowFingerprint) return 'row_conflict' as const
+        if (legacyLeakageRowFingerprint(source, fingerprintKey) !== input.expectedRowFingerprint) return 'row_conflict' as const
 
         if (input.row.kind === 'task_log') {
           await transaction`
@@ -542,8 +582,13 @@ export async function runLegacyLeakageScrubCli(cli: LegacyLeakageScrubCli): Prom
   const sql = postgres(requiredAdminDatabaseUrl(), { max: 1 })
   const redis = new Redis(getRequiredEnv('REDIS_URL'), { lazyConnect: true, maxRetriesPerRequest: 3 })
   try {
-    const result = await runLegacyLeakageScrub(cli, {
-      database: createLegacyLeakagePostgresAdapter(sql),
+    const fingerprintKey = requiredFingerprintKey()
+    const result = await runLegacyLeakageScrub({
+      ...cli,
+      fingerprintKey,
+      fingerprintKeyId: requiredFingerprintKeyId(),
+    }, {
+      database: createLegacyLeakagePostgresAdapter(sql, fingerprintKey),
       redis: createLegacyLeakageRedisAdapter(redis),
     })
     process.stdout.write(`${JSON.stringify(result)}\n`)
