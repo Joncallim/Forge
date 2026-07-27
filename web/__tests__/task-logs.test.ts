@@ -241,5 +241,24 @@ describe('task log writer', () => {
         ? [path.relative(process.cwd(), file)]
         : []
     })).toEqual([])
+
+    const rejectRoute = fs.readFileSync(path.join(taskApiRoot, '[id]', 'reject', 'route.ts'), 'utf8')
+    const source = ts.createSourceFile('reject-route.ts', rejectRoute, ts.ScriptTarget.Latest, true)
+    const consoleViolations: string[] = []
+    const inspect = (node: ts.Node) => {
+      if (ts.isCallExpression(node)
+        && ts.isPropertyAccessExpression(node.expression)
+        && ts.isIdentifier(node.expression.expression)
+        && node.expression.expression.text === 'console') {
+        for (const argument of node.arguments) {
+          if (/\breason\b/.test(argument.getText(source))) {
+            consoleViolations.push(`${node.expression.name.text}:raw-rejection-reason`)
+          }
+        }
+      }
+      ts.forEachChild(node, inspect)
+    }
+    inspect(source)
+    expect(consoleViolations).toEqual([])
   })
 })

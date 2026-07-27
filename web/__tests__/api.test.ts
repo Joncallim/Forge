@@ -2654,7 +2654,23 @@ describe('GET /api/tasks/:id — task details', () => {
       .mockReturnValueOnce(chain([packageArtifact, qaPackageArtifact, taskLevelArtifact]))
       .mockReturnValueOnce(chain([workPackage, qaWorkPackage]))
       .mockReturnValueOnce(chain([]))
-      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{
+        id: 'vcs-local-path',
+        taskId: task.id,
+        workPackageId: 'package-1',
+        agentRunId: 'run-1',
+        changeType: 'branch',
+        status: 'created',
+        repository: '/private/forge/RAW-LOCAL-PATH-SENTINEL',
+        branchName: 'safe-branch',
+        baseBranch: 'main',
+        commitSha: null,
+        pullRequestUrl: null,
+        diffSummary: 'RAW-DIFF-SENTINEL',
+        metadata: { selectedPath: '/private/forge/RAW-METADATA-PATH-SENTINEL' },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([]))
       .mockReturnValueOnce(chain([
@@ -2713,7 +2729,7 @@ describe('GET /api/tasks/:id — task details', () => {
       historyAvailable: true,
     })
     expect(body.artifacts.find((artifact: { id: string }) => artifact.id === 'artifact-task').content).toBe(
-      'Protected Architect history is available through the protected history reader.',
+      'Architect plan available in protected history',
     )
     expect(body.task.errorMessage).toBe('legacy_task_log_unavailable')
     expect(body.runs.find((run: { id: string }) => run.id === 'run-1').errorMessage).toBe('legacy_task_log_unavailable')
@@ -2721,6 +2737,12 @@ describe('GET /api/tasks/:id — task details', () => {
     expect(JSON.stringify(body.artifacts)).not.toContain('entryCount')
     expect(JSON.stringify(body.artifacts)).not.toContain('RAW-')
     expect(JSON.stringify(body)).not.toContain('/private/secret')
+    expect(body.vcsChanges[0]).toMatchObject({
+      repository: 'legacy_task_log_unavailable',
+      diffSummary: 'legacy_task_log_unavailable',
+      metadata: {},
+    })
+    expect(JSON.stringify(body.vcsChanges)).not.toContain('RAW-LOCAL-PATH-SENTINEL')
     expect(body.workPackages.flatMap(
       (pkg: { artifacts: Array<{ id: string }> }) => pkg.artifacts.map((artifact) => artifact.id),
     )).toEqual(['artifact-1', 'artifact-2'])

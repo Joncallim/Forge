@@ -9,6 +9,7 @@ import { publishTaskEvent } from '@/worker/events'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import { accessibleTaskCondition, getAccessibleTask } from '@/lib/task-access'
 import { guardEpic172ProjectManagementIngress } from '@/lib/projects/epic-172-project-ingress'
+import { projectTaskCompatibilityTask, taskCompatibilityError } from '@/lib/mcps/leakage-drain'
 
 // ---------------------------------------------------------------------------
 // Validation schema
@@ -88,7 +89,7 @@ export async function POST(
     await recordTaskLogBestEffort({
       eventType: 'task.rejected',
       level: 'error',
-      message: reason ? `Task was rejected: ${reason}` : 'Task was rejected.',
+      message: reason ? `Task was rejected: ${taskCompatibilityError(reason)}` : 'Task was rejected.',
       metadata: { rejectedBy: session.userId, updatedAt: task.updatedAt.toISOString() },
       source: 'api',
       taskId,
@@ -97,12 +98,16 @@ export async function POST(
 
     await publishTaskEvent(taskId, 'task:status', {
       status: 'rejected',
-      errorMessage: task.errorMessage,
+      errorMessage: taskCompatibilityError(task.errorMessage),
       updatedAt: task.updatedAt.toISOString(),
     })
 
-    console.info('[POST /api/tasks/:id/reject] Rejected task', { id: taskId, reason })
-    return NextResponse.json({ task })
+    const rejectionCategory = reason ? 'operator_reason_recorded' : 'operator_reason_absent'
+    console.info('[POST /api/tasks/:id/reject] Rejected task', {
+      taskId,
+      category: rejectionCategory,
+    })
+    return NextResponse.json({ task: projectTaskCompatibilityTask(task) })
   } catch {
     console.error('[POST /api/tasks/:id/reject] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

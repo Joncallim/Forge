@@ -893,7 +893,7 @@ describe('handoffApprovedWorkPackages', () => {
       status: 'failed',
     }))
     expect(failedTaskUpdate.set).toHaveBeenCalledWith(expect.objectContaining({
-      errorMessage: 'legacy_task_log_unavailable',
+      errorMessage: expect.stringContaining('reserved for review gates'),
       status: 'failed',
     }))
     expect(mocks.publishTaskEvent).toHaveBeenCalledWith('task-1', 'task:status', expect.objectContaining({

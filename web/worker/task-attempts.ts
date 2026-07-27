@@ -98,7 +98,7 @@ export async function finishTaskAttempt({
     .update(taskAttempts)
     .set({
       status,
-      errorMessage: taskCompatibilityError(errorMessage),
+      errorMessage,
       nextRetryAt,
       completedAt: new Date(),
     })

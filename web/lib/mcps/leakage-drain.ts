@@ -1,7 +1,7 @@
 import { sanitizeWorkerMessage } from '@/worker/redaction'
+import { ARCHITECT_PLAN_HEADER } from '@/lib/mcps/architect-plan-entries'
 
 export const LEGACY_TASK_LOG_UNAVAILABLE = 'legacy_task_log_unavailable' as const
-export const PROTECTED_ARCHITECT_HISTORY_HEADER = 'Protected Architect history is available through the protected history reader.' as const
 
 export type SensitivePayloadKeyKind = 'prompt' | 'secret' | 'snapshot' | 'unkeyed_digest'
 
@@ -309,7 +309,7 @@ export function projectTaskCompatibilityArtifact(
   if (protectedHistory) {
     return {
       ...common,
-      content: PROTECTED_ARCHITECT_HISTORY_HEADER,
+      content: ARCHITECT_PLAN_HEADER,
       metadata: { historyAvailable: true },
     }
   }
@@ -405,7 +405,7 @@ export function projectTaskCompatibilityVcsChange(change: CompatibilityRecord): 
     agentRunId: compatibleField(change, 'agentRunId'),
     changeType: compatibleField(change, 'changeType'),
     status: compatibleField(change, 'status'),
-    repository: compatibleField(change, 'repository'),
+    repository: LEGACY_TASK_LOG_UNAVAILABLE,
     branchName: compatibleField(change, 'branchName'),
     baseBranch: compatibleField(change, 'baseBranch'),
     commitSha: compatibleField(change, 'commitSha'),

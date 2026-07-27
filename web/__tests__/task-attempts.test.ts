@@ -58,18 +58,21 @@ describe('task attempt logs', () => {
   })
 
   it('keeps friendly worker context on finished attempts', async () => {
-    mocks.dbUpdate.mockReturnValueOnce(chain([{
+    const update = chain([{
       attemptNumber: 2,
       queueName: 'answers',
       taskId: 'task-1',
       workerId: 'embedded-20008-mr48e1f1',
-    }]))
+    }])
+    mocks.dbUpdate.mockReturnValueOnce(update)
 
     await finishTaskAttempt({
       attemptId: 'attempt-1',
       errorMessage: 'replan failed',
       status: 'failed',
     })
+
+    expect(update.set).toHaveBeenCalledWith(expect.objectContaining({ errorMessage: 'replan failed' }))
 
     expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
       eventType: 'queue.attempt.failed',
