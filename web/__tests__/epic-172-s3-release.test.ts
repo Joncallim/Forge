@@ -90,6 +90,30 @@ describe('Epic 172 S3 release seam', () => {
     expect(concurrencyProof).toContain("'production claim and grant mutation contention'")
   })
 
+  it('uses a disposable read-only observer for protected runtime audit assertions', () => {
+    const workflow = readFileSync(
+      fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)),
+      'utf8',
+    )
+    const bridgeStep = workflow.slice(
+      workflow.indexOf('name: Run the fail-closed Epic 172 Step 0 E2E bridge suite'),
+      workflow.indexOf('uses: actions/upload-artifact'),
+    )
+    const handoffConcurrency = readFileSync(
+      fileURLToPath(new URL('../e2e/mcp-handoff-concurrency.spec.ts', import.meta.url)),
+      'utf8',
+    )
+    expect(workflow).toContain('CREATE ROLE forge_e2e_audit_observer')
+    expect(workflow).toContain('REVOKE ALL ON TABLE public.filesystem_mcp_runtime_audits FROM forge_e2e_audit_observer;')
+    expect(workflow).toContain('GRANT SELECT ON TABLE public.filesystem_mcp_runtime_audits TO forge_e2e_audit_observer;')
+    expect(workflow).toContain('The protected-audit observer must not execute Forge routines')
+    expect(bridgeStep).toContain('FORGE_E2E_AUDIT_OBSERVER_DATABASE_URL:')
+    expect(handoffConcurrency).toContain('FORGE_E2E_AUDIT_OBSERVER_DATABASE_URL is required')
+    expect(handoffConcurrency).toContain("currentUser: 'forge_e2e_audit_observer'")
+    expect(handoffConcurrency).toContain('contextPacketAuditCount(seeded.packageId)')
+    expect(handoffConcurrency).not.toMatch(/from filesystem_mcp_runtime_audits[\s\S]{0,200}where work_package_id = \$\{seeded\.packageId\}/i)
+  })
+
   it('runs the primary unit suite with mandatory release PostgreSQL fixtures and zero lint warnings', () => {
     const workflow = readFileSync(
       fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)),

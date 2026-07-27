@@ -216,6 +216,8 @@ test.describe('MCP handoff optimistic concurrency', () => {
   test.describe.configure({ mode: 'serial' })
   let sql: Sql
   let writer: Sql
+  let auditObserver: Sql | undefined
+  let auditObserverIdentityVerified = false
   let workspaceRoot: string
   let previousExecutionFlag: string | undefined
   let previousWorkspaceRoot: string | undefined
@@ -224,6 +226,31 @@ test.describe('MCP handoff optimistic concurrency', () => {
   const usersToDelete: string[] = []
   const projectsToDelete: string[] = []
   const sessionsToDelete: string[] = []
+
+  async function contextPacketAuditCount(workPackageId: string): Promise<number> {
+    const auditObserverDatabaseUrl = process.env.FORGE_E2E_AUDIT_OBSERVER_DATABASE_URL?.trim()
+    if (!auditObserverDatabaseUrl) {
+      throw new Error('FORGE_E2E_AUDIT_OBSERVER_DATABASE_URL is required to inspect protected runtime audit evidence.')
+    }
+    auditObserver ??= postgres(auditObserverDatabaseUrl, { max: 1 })
+    if (!auditObserverIdentityVerified) {
+      const [identity] = await auditObserver<{ currentUser: string; sessionUser: string }[]>`
+        select current_user as "currentUser", session_user as "sessionUser"
+      `
+      expect(identity).toEqual({
+        currentUser: 'forge_e2e_audit_observer',
+        sessionUser: 'forge_e2e_audit_observer',
+      })
+      auditObserverIdentityVerified = true
+    }
+    const [{ count }] = await auditObserver<{ count: number }[]>`
+      select count(*)::int as count
+      from filesystem_mcp_runtime_audits
+      where work_package_id = ${workPackageId}
+        and operation = 'context_packet'
+    `
+    return count
+  }
 
   test.beforeEach(async ({}, testInfo) => {
     applyEpic172Step0E2EBridge(testInfo, 'mcp-handoff-concurrency.spec.ts')
@@ -288,7 +315,13 @@ test.describe('MCP handoff optimistic concurrency', () => {
         on conflict (key) do update set value = excluded.value, updated_at = now()
       `
     }
-    await Promise.all([sql.end(), writer.end()])
+    const clientsToClose = [sql.end(), writer.end()]
+    if (auditObserver) {
+      clientsToClose.push(auditObserver.end())
+      auditObserver = undefined
+      auditObserverIdentityVerified = false
+    }
+    await Promise.all(clientsToClose)
     await rm(workspaceRoot, { recursive: true, force: true })
     if (previousExecutionFlag === undefined) delete process.env.FORGE_WORK_PACKAGE_EXECUTION
     else process.env.FORGE_WORK_PACKAGE_EXECUTION = previousExecutionFlag
@@ -388,12 +421,7 @@ test.describe('MCP handoff optimistic concurrency', () => {
     })
     const [{ count }] = await sql`select count(*)::int as count from agent_runs where work_package_id = ${seeded.packageId}`
     expect(count).toBe(0)
-    const [{ count: contextPacketAudits }] = await sql`
-      select count(*)::int as count
-      from filesystem_mcp_runtime_audits
-      where work_package_id = ${seeded.packageId}
-        and operation = 'context_packet'
-    `
+    const contextPacketAudits = await contextPacketAuditCount(seeded.packageId)
     expect(contextPacketAudits).toBe(0)
   })
 
@@ -450,12 +478,7 @@ test.describe('MCP handoff optimistic concurrency', () => {
       select count(*)::int as count from agent_runs where work_package_id = ${seeded.packageId}
     `
     expect(runs).toBe(0)
-    const [{ count: contextPacketAudits }] = await sql`
-      select count(*)::int as count
-      from filesystem_mcp_runtime_audits
-      where work_package_id = ${seeded.packageId}
-        and operation = 'context_packet'
-    `
+    const contextPacketAudits = await contextPacketAuditCount(seeded.packageId)
     expect(contextPacketAudits).toBe(0)
   })
 
