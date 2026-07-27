@@ -154,21 +154,87 @@ function requiredAdminDatabaseUrl(): string {
 }
 
 export function parseLegacyLeakageScrubCheckpoint(value: string): LegacyLeakageScrubCheckpoint {
-  const parsed = JSON.parse(value) as Partial<LegacyLeakageScrubCheckpoint>
-  if (parsed.schemaVersion !== 2) {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    throw new Error('Stored leakage scrub checkpoint is malformed; start a new --apply operation.')
+  }
+  if (!isCheckpointRecord(parsed)) {
+    throw new Error('Stored leakage scrub checkpoint is malformed; start a new --apply operation.')
+  }
+  if (parsed.schemaVersion === 1) {
     throw new Error('Stored leakage scrub checkpoint uses an unsafe legacy format; start a new --apply operation.')
   }
-  if (
-    typeof parsed.operationId !== 'string'
-    || typeof parsed.phase !== 'string'
-    || typeof parsed.fingerprintKeyId !== 'string'
-    || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(parsed.fingerprintKeyId)
-    || typeof parsed.sentinelSetFingerprint !== 'string'
-    || !/^[0-9a-f]{64}$/iu.test(parsed.sentinelSetFingerprint)
-  ) {
-    throw new Error('Stored leakage scrub checkpoint is malformed.')
+  if (parsed.schemaVersion !== 2 || !isClosedCheckpointRecord(parsed)) {
+    throw new Error('Stored leakage scrub checkpoint is malformed; start a new --apply operation.')
   }
-  return parsed as LegacyLeakageScrubCheckpoint
+  if (!isValidCheckpointV2(parsed)) {
+    throw new Error('Stored leakage scrub checkpoint is malformed; start a new --apply operation.')
+  }
+  return parsed
+}
+
+const CHECKPOINT_V2_KEYS = [
+  'schemaVersion', 'operationId', 'actor', 'authorizationReceiptId', 'fingerprintKeyId', 'sentinelSetFingerprint',
+  'phase', 'state', 'lastKey', 'rowsExamined', 'rowsChanged', 'conflicts', 'redisKeysExamined', 'redisKeysDeleted',
+  'redisV2ValuesExamined', 'lastPreFingerprint', 'lastPostFingerprint', 'databaseTime',
+] as const
+const CHECKPOINT_PHASES = new Set(['task_logs', 'artifacts', 'work_packages', 'approval_gates', 'redis_legacy', 'redis_v2_verify', 'complete'])
+const CHECKPOINT_STATES = new Set(['running', 'paused_conflict', 'complete'])
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu
+const HEX_FINGERPRINT = /^[0-9a-f]{64}$/iu
+
+function isCheckpointRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null
+    && typeof value === 'object'
+    && !Array.isArray(value)
+}
+
+function isClosedCheckpointRecord(value: unknown): value is Record<string, unknown> {
+  return isCheckpointRecord(value)
+    && Object.keys(value).length === CHECKPOINT_V2_KEYS.length
+    && Object.keys(value).every((key) => (CHECKPOINT_V2_KEYS as readonly string[]).includes(key))
+}
+
+function isBoundedIdentity(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= 1 && value.length <= 200 && value.trim() === value
+}
+
+function isNullableFingerprint(value: unknown): value is string | null {
+  return value === null || (typeof value === 'string' && HEX_FINGERPRINT.test(value))
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+function isValidCheckpointV2(value: Record<string, unknown>): value is LegacyLeakageScrubCheckpoint {
+  const phase = value.phase
+  const state = value.state
+  const timestamp = value.databaseTime
+  const counters = ['rowsExamined', 'rowsChanged', 'conflicts', 'redisKeysExamined', 'redisKeysDeleted', 'redisV2ValuesExamined']
+  return value.schemaVersion === 2
+    && isBoundedIdentity(value.operationId)
+    && isBoundedIdentity(value.actor)
+    && typeof value.authorizationReceiptId === 'string' && UUID.test(value.authorizationReceiptId)
+    && typeof value.fingerprintKeyId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(value.fingerprintKeyId)
+    && typeof value.sentinelSetFingerprint === 'string' && HEX_FINGERPRINT.test(value.sentinelSetFingerprint)
+    && typeof phase === 'string' && CHECKPOINT_PHASES.has(phase)
+    && typeof state === 'string' && CHECKPOINT_STATES.has(state)
+    && ((phase === 'complete') === (state === 'complete'))
+    && (value.lastKey === null || (typeof value.lastKey === 'string' && UUID.test(value.lastKey)))
+    && isNullableFingerprint(value.lastPreFingerprint)
+    && isNullableFingerprint(value.lastPostFingerprint)
+    && counters.every((counter) => isNonNegativeSafeInteger(value[counter]))
+    && (value.rowsChanged as number) <= (value.rowsExamined as number)
+    && (value.redisKeysDeleted as number) <= (value.redisKeysExamined as number)
+    && (phase !== 'complete' || value.lastKey === null)
+    && typeof timestamp === 'string'
+    && timestamp.length >= 1
+    && timestamp.length <= 128
+    && timestamp.trim() === timestamp
+    && Number.isFinite(Date.parse(timestamp))
 }
 
 function taskLogRow(row: Record<string, unknown>): LegacyLeakageScrubRow {

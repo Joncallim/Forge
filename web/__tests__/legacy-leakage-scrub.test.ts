@@ -29,6 +29,30 @@ const RECEIPT = '11111111-1111-4111-8111-111111111111'
 const FINGERPRINT_KEY = Buffer.alloc(32, 7)
 const FINGERPRINT_KEY_ID = 'test-scrub-key-v2'
 
+function validCheckpointJson(changes: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    schemaVersion: 2,
+    operationId: 'checkpoint-operation',
+    actor: 'operator',
+    authorizationReceiptId: RECEIPT,
+    fingerprintKeyId: FINGERPRINT_KEY_ID,
+    sentinelSetFingerprint: 'a'.repeat(64),
+    phase: 'task_logs',
+    state: 'running',
+    lastKey: null,
+    rowsExamined: 0,
+    rowsChanged: 0,
+    conflicts: 0,
+    redisKeysExamined: 0,
+    redisKeysDeleted: 0,
+    redisV2ValuesExamined: 0,
+    lastPreFingerprint: null,
+    lastPostFingerprint: null,
+    databaseTime: '2026-07-28T00:00:00.000Z',
+    ...changes,
+  })
+}
+
 function evidence(changes: Partial<RedisScanEvidence> = {}): RedisScanEvidence {
   return {
     complete: true,
@@ -490,6 +514,51 @@ describe('legacy leakage scrub', () => {
     expect(LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY.retainedAuthorities).toEqual(expect.arrayContaining([
       'tasks.prompt', 'architect_plan_versions', 'architect_plan_entries', 'ordinary_non_plan_artifact.content',
     ]))
+  })
+
+  it('accepts only the complete closed v2 checkpoint shape', () => {
+    expect(parseLegacyLeakageScrubCheckpoint(validCheckpointJson())).toMatchObject({ schemaVersion: 2, phase: 'task_logs' })
+    const invalid = [
+      validCheckpointJson({ phase: 'unknown_phase' }),
+      validCheckpointJson({ state: 'unknown_state' }),
+      validCheckpointJson({ operationId: '' }),
+      validCheckpointJson({ actor: ' operator ' }),
+      validCheckpointJson({ authorizationReceiptId: 'not-a-uuid' }),
+      validCheckpointJson({ fingerprintKeyId: 'bad key id' }),
+      validCheckpointJson({ sentinelSetFingerprint: 'not-a-fingerprint' }),
+      validCheckpointJson({ lastKey: 'not-a-uuid' }),
+      validCheckpointJson({ lastPreFingerprint: 'short' }),
+      validCheckpointJson({ rowsExamined: -1 }),
+      validCheckpointJson({ rowsChanged: 1.5 }),
+      validCheckpointJson({ conflicts: Number.MAX_SAFE_INTEGER + 1 }),
+      validCheckpointJson({ rowsExamined: 0, rowsChanged: 1 }),
+      validCheckpointJson({ redisKeysExamined: 0, redisKeysDeleted: 1 }),
+      validCheckpointJson({ databaseTime: 'not-a-date' }),
+      validCheckpointJson({ phase: 'complete', state: 'running' }),
+      validCheckpointJson({ phase: 'complete', state: 'complete', lastKey: '00000000-0000-4000-8000-000000000001' }),
+      validCheckpointJson({ unexpected: true }),
+      JSON.stringify(Object.fromEntries(Object.entries(JSON.parse(validCheckpointJson())).filter(([key]) => key !== 'actor'))),
+      '{not json}',
+    ]
+    for (const malformed of invalid) {
+      expect(() => parseLegacyLeakageScrubCheckpoint(malformed)).toThrow('Stored leakage scrub checkpoint is malformed')
+    }
+  })
+
+  it('does not mutate a loaded checkpoint when a runtime phase is impossible', async () => {
+    const database = new FakeDatabase()
+    const redis = new FakeRedis()
+    database.checkpoint = {
+      checkpoint: JSON.parse(validCheckpointJson({ operationId: 'runtime-corrupt', phase: 'unknown_phase' })) as LegacyLeakageScrubCheckpoint,
+      token: validCheckpointJson({ operationId: 'runtime-corrupt', phase: 'unknown_phase' }),
+    }
+    await expect(runLegacyLeakageScrub({
+      actor: 'operator', authorizationReceiptId: RECEIPT, fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID, mode: 'resume', operationId: 'runtime-corrupt',
+    }, { database, redis })).rejects.toThrow('unknown phase')
+    expect(database.checkpointWrites).toBe(0)
+    expect(database.updates).toBe(0)
+    expect(redis.applyCalls).toEqual([])
   })
 
   it('requires closed per-event shapes and rejects free-form diagnostic strings without sentinels', () => {

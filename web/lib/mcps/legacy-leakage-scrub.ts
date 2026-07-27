@@ -495,6 +495,32 @@ function validateIdentity(name: string, value: string | undefined): string {
   return normalized
 }
 
+function assertCheckpointLifecycle(checkpoint: LegacyLeakageScrubCheckpoint): void {
+  switch (checkpoint.phase) {
+    case 'task_logs':
+    case 'artifacts':
+    case 'work_packages':
+    case 'approval_gates':
+    case 'redis_legacy':
+    case 'redis_v2_verify':
+    case 'complete':
+      break
+    default:
+      throw new Error('Stored leakage scrub checkpoint has an unknown phase; start a new --apply operation.')
+  }
+  switch (checkpoint.state) {
+    case 'running':
+    case 'paused_conflict':
+    case 'complete':
+      break
+    default:
+      throw new Error('Stored leakage scrub checkpoint has an unknown state; start a new --apply operation.')
+  }
+  if ((checkpoint.phase === 'complete') !== (checkpoint.state === 'complete')) {
+    throw new Error('Stored leakage scrub checkpoint has an incoherent lifecycle; start a new --apply operation.')
+  }
+}
+
 function checkpointWith(
   checkpoint: LegacyLeakageScrubCheckpoint,
   changes: Partial<LegacyLeakageScrubCheckpoint>,
@@ -624,6 +650,7 @@ export async function runLegacyLeakageScrub(
   if (current && current.checkpoint.operationId !== operationId) {
     throw new Error('Loaded leakage scrub checkpoint operation identity does not match its storage key.')
   }
+  if (current) assertCheckpointLifecycle(current.checkpoint)
   if (options.mode === 'apply') {
     if (current) throw new Error('This operation already exists; use --resume.')
     const databaseTime = await dependencies.database.databaseTime()
@@ -768,6 +795,8 @@ export async function runLegacyLeakageScrub(
       })
       return { checkpoint: current.checkpoint, dryRun: false, preview: null }
     }
+
+    throw new Error('Stored leakage scrub checkpoint has an unknown phase; start a new --apply operation.')
   }
 
   return { checkpoint: current.checkpoint, dryRun: false, preview: null }
