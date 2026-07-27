@@ -5,11 +5,12 @@ import {
   bindArchitectReplanContext,
   executableReferenceForEntry,
   recordArchitectPlanVersion,
+  resolveArchitectReplanEntry,
   resolveArchitectPlanEntry,
 } from '@/lib/mcps/s4-protocol-store'
 import { architectReplanReferenceForEntry } from '@/lib/mcps/architect-plan-entries'
 import { computeCredentialDigest } from '@/lib/session-credential-digest'
-import { readArchitectPlanHistory } from '@/lib/mcps/history-reader'
+import { appendArchitectClarificationAnswer, readArchitectPlanHistory } from '@/lib/mcps/history-reader'
 
 const adminUrl = process.env.FORGE_S4_POSTGRES_TEST_DATABASE_URL?.trim()
 const issuerUrl = process.env.FORGE_PACKET_ISSUER_DATABASE_URL?.trim()
@@ -49,6 +50,8 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     enablementReceipt: randomUUID(),
     readinessReceipt: randomUUID(),
     legacyArchitectRun: randomUUID(),
+    clarificationQuestion: randomUUID(),
+    clarificationAnswer: randomUUID(),
   }
   const key = randomBytes(32)
   const sessionCredential = randomUUID()
@@ -311,8 +314,42 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
         entryKind: 'routing',
         projectionEligible: false,
         requirementKey: 'filesystem-context',
+      }, {
+        agent: null,
+        bindingFingerprint: null,
+        content: JSON.stringify({
+          schemaVersion: 1,
+          questionId: ids.clarificationQuestion,
+          question: 'Which branch?',
+          suggestions: ['main'],
+        }),
+        entryId: `clarification_question:${ids.clarificationQuestion}`,
+        entryKind: 'clarification_question',
+        projectionEligible: false,
+        requirementKey: null,
       }],
     })
+    await admin`
+      insert into task_questions (
+        id, task_id, question_entry_id, source_plan_artifact_id,
+        source_plan_version, status
+      ) values (
+        ${ids.clarificationQuestion}::uuid, ${ids.task}::uuid,
+        ${`clarification_question:${ids.clarificationQuestion}`},
+        ${recorded.artifactId}::uuid, 1, 'open'
+      )
+    `
+    await expect(appendArchitectClarificationAnswer({
+      answer: 'main',
+      answerId: ids.clarificationAnswer,
+      digestKey: key,
+      digestKeyId: 's4-test-key',
+      questionId: ids.clarificationQuestion,
+      sessionCredential,
+      sourcePlanArtifactId: recorded.artifactId,
+      sourcePlanVersion: '1',
+      taskId: ids.task,
+    })).resolves.toEqual({ answerId: ids.clarificationAnswer, allAnswered: true })
     const [artifact] = await admin<{ content: string; metadata: Record<string, unknown> }[]>`
       select content, metadata from artifacts where id = ${recorded.artifactId}::uuid
     `
@@ -370,6 +407,8 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       'plan_body:000000',
       'requirement:plan-policy',
       'routing:filesystem-context:backend',
+      `clarification_question:${ids.clarificationQuestion}`,
+      `clarification_answer:${ids.clarificationAnswer}`,
     ]))
     const replanReferenceId = replanContext.find(
       (entry) => entry.entryId === 'plan_body:000000',
@@ -386,6 +425,36 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
       digestKey: key,
       expectedPurpose: 'architect_replan',
       referenceId: replanReferenceId,
+    })).rejects.toMatchObject({ code: 'invalid_evidence' })
+    const questionReferenceId = replanContext.find(
+      (entry) => entry.entryId === `clarification_question:${ids.clarificationQuestion}`,
+    )!.referenceId
+    const answerReferenceId = replanContext.find(
+      (entry) => entry.entryId === `clarification_answer:${ids.clarificationAnswer}`,
+    )!.referenceId
+    await expect(resolveArchitectReplanEntry({
+      digestKey: key,
+      referenceId: questionReferenceId,
+    })).resolves.toMatchObject({
+      sourceKind: 'architect_plan_entry',
+      entryId: `clarification_question:${ids.clarificationQuestion}`,
+    })
+    await expect(resolveArchitectReplanEntry({
+      digestKey: key,
+      referenceId: answerReferenceId,
+    })).resolves.toMatchObject({
+      sourceKind: 'clarification_answer',
+      entryId: `clarification_answer:${ids.clarificationAnswer}`,
+      questionId: ids.clarificationQuestion,
+      answerId: ids.clarificationAnswer,
+    })
+    await expect(resolveArchitectReplanEntry({
+      digestKey: key,
+      referenceId: questionReferenceId,
+    })).rejects.toMatchObject({ code: 'invalid_evidence' })
+    await expect(resolveArchitectReplanEntry({
+      digestKey: key,
+      referenceId: answerReferenceId,
     })).rejects.toMatchObject({ code: 'invalid_evidence' })
   })
 

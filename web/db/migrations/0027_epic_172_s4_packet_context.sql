@@ -6747,7 +6747,7 @@ BEGIN
       content_digest, digest_key_id, source_kind, clarification_answer_id
     ) SELECT pg_catalog.gen_random_uuid(), 'architect_replan', v_task_id, NULL,
       p_agent_run_id, answer.source_plan_artifact_id, answer.source_plan_version,
-      'clarification_question:' || answer.question_id::text, 'architect', NULL, NULL,
+      'clarification_answer:' || answer.id::text, 'architect', NULL, NULL,
       answer.content_digest, answer.digest_key_id, 'clarification_answer', answer.id
     FROM answers answer
     RETURNING id, clarification_answer_id
@@ -6798,9 +6798,13 @@ BEGIN
   ), consumed AS (
     UPDATE public.architect_plan_execution_references r SET resolved_at = pg_catalog.clock_timestamp()
     FROM eligible WHERE r.id = eligible.id RETURNING eligible.*
-  ) SELECT purpose, source_kind, task_id, plan_artifact_id, plan_version, entry_id, entry_kind,
-    agent, requirement_key, binding_fingerprint, content, content_digest, digest_key_id,
-    projection_eligible, clarification_question_id FROM consumed;
+  ) SELECT consumed.purpose, consumed.source_kind, consumed.task_id,
+    consumed.plan_artifact_id, consumed.plan_version, consumed.entry_id,
+    consumed.entry_kind, consumed.agent, consumed.requirement_key,
+    consumed.binding_fingerprint, consumed.content, consumed.content_digest,
+    consumed.digest_key_id, consumed.projection_eligible,
+    consumed.clarification_question_id
+  FROM consumed;
 END;
 $$;
 CREATE OR REPLACE FUNCTION forge.append_architect_clarification_answer_v1(
