@@ -21,14 +21,14 @@ operation="$(psql "$url" -At --field-separator='|' --set ON_ERROR_STOP=1 --comma
 operation_id="${operation%%|*}"
 [[ "$operation" == *'|running|0' && "$operation_id" =~ ^[0-9a-f-]{36}$ ]] || { echo 'negative proof did not create the exact live operation' >&2; exit 1; }
 
-expect_failure() { local text="$1"; shift; local output status; output="$(mktemp)"; if "$@" >"$output" 2>&1; then echo "negative reconciliation proof expected psql failure: ${text}" >&2; cat "$output" >&2; unlink "$output"; exit 1; else status=$?; fi; [[ "$status" == 3 ]] || { echo "negative reconciliation proof expected psql exit 3 for ${text}, got ${status}" >&2; cat "$output" >&2; unlink "$output"; exit 1; }; grep -F -- "$text" "$output" >/dev/null || { echo "negative reconciliation proof received the wrong psql error for ${text}" >&2; cat "$output" >&2; unlink "$output"; exit 1; }; unlink "$output"; }
-expect_failure 'project-root operation identity cannot be hijacked' psql "$url" --set ON_ERROR_STOP=1 --command "SELECT * FROM forge.begin_project_root_reconciliation_v1('${operation_id}'::uuid,'22222222-2222-4222-8222-222222222222'::uuid,${through}::bigint)"
-expect_failure 'query returned no rows' psql "$url" --set ON_ERROR_STOP=1 --command "SELECT forge.enter_project_root_reconciliation_generation_v1('33333333-3333-4333-8333-333333333333'::uuid,'${actor}'::uuid,1,'${project}'::uuid)"
-expect_failure 'project-root write context is not claimable' psql "$url" --set ON_ERROR_STOP=1 --command "SELECT forge.enter_project_root_reconciliation_generation_v1('${operation_id}'::uuid,'${actor}'::uuid,2,'${project}'::uuid)"
-expect_failure 'project-root authority lock has no active write context' psql "$url" --set ON_ERROR_STOP=1 --command "SELECT forge.lock_project_root_reconciliation_authority_v1('${operation_id}'::uuid,'${actor}'::uuid,1,'${project}'::uuid)"
+expect_failure() { local expected_status="$1" text="$2"; shift 2; local output status; output="$(mktemp)"; if "$@" >"$output" 2>&1; then echo "negative reconciliation proof expected psql failure: ${text}" >&2; cat "$output" >&2; unlink "$output"; exit 1; else status=$?; fi; [[ "$status" == "$expected_status" ]] || { echo "negative reconciliation proof expected psql exit ${expected_status} for ${text}, got ${status}" >&2; cat "$output" >&2; unlink "$output"; exit 1; }; grep -F -- "$text" "$output" >/dev/null || { echo "negative reconciliation proof received the wrong psql error for ${text}" >&2; cat "$output" >&2; unlink "$output"; exit 1; }; unlink "$output"; }
+expect_failure 1 'project-root operation identity cannot be hijacked' psql "$url" --set ON_ERROR_STOP=1 --command "SELECT * FROM forge.begin_project_root_reconciliation_v1('${operation_id}'::uuid,'22222222-2222-4222-8222-222222222222'::uuid,${through}::bigint)"
+expect_failure 1 'query returned no rows' psql "$url" --set ON_ERROR_STOP=1 --command "SELECT forge.enter_project_root_reconciliation_generation_v1('33333333-3333-4333-8333-333333333333'::uuid,'${actor}'::uuid,1,'${project}'::uuid)"
+expect_failure 1 'project-root write context is not claimable' psql "$url" --set ON_ERROR_STOP=1 --command "SELECT forge.enter_project_root_reconciliation_generation_v1('${operation_id}'::uuid,'${actor}'::uuid,2,'${project}'::uuid)"
+expect_failure 1 'project-root authority lock has no active write context' psql "$url" --set ON_ERROR_STOP=1 --command "SELECT forge.lock_project_root_reconciliation_authority_v1('${operation_id}'::uuid,'${actor}'::uuid,1,'${project}'::uuid)"
 # psql must stop on this exact server error. The following admin psql command
 # is a fresh session and proves the aborted transaction left no durable state.
-expect_failure 'division by zero' psql "$url" --set ON_ERROR_STOP=1 <<SQL
+expect_failure 3 'division by zero' psql "$url" --set ON_ERROR_STOP=1 <<SQL
 BEGIN;
 SELECT forge.enter_project_root_reconciliation_generation_v1('${operation_id}'::uuid,'${actor}'::uuid,1,'${project}'::uuid);
 UPDATE public.tasks SET status='approved', error_message=NULL WHERE id='${task}'::uuid AND status='running';
