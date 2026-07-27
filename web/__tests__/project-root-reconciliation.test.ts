@@ -14,6 +14,7 @@ const reconcileScript = readFileSync(fileURLToPath(new URL('../scripts/reconcile
 const reconciliation = readFileSync(fileURLToPath(new URL('../lib/mcps/filesystem-grant-reconciliation.ts', import.meta.url)), 'utf8')
 const indexScript = readFileSync(fileURLToPath(new URL('../scripts/build-project-root-ref-index.ts', import.meta.url)), 'utf8')
 const upgradeProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-upgrade.sh', import.meta.url)), 'utf8')
+const indexLifecycleProof = readFileSync(fileURLToPath(new URL('../scripts/ci/prove-migration-0027-root-index-lifecycle.sh', import.meta.url)), 'utf8')
 const cutoverScript = readFileSync(fileURLToPath(new URL('../scripts/ci/cutover-migration-0027-root-ref.sh', import.meta.url)), 'utf8')
 const webCi = readFileSync(fileURLToPath(new URL('../../.github/workflows/web-ci.yml', import.meta.url)), 'utf8')
 
@@ -159,11 +160,19 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(cutoverScript).toContain("pg_catalog.to_regclass('public.projects_root_ref_idx')")
     expect(cutoverScript).toContain('strict root-reference cutover requires a valid concurrent projects(root_ref) index')
     expect(upgradeProof.indexOf('bash scripts/ci/reconcile-migration-0027-root-refs.sh')).toBeLessThan(
-      upgradeProof.indexOf('npm run project-roots:build-concurrent-index -- --apply'),
+      upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh'),
     )
-    expect(upgradeProof.indexOf('npm run project-roots:build-concurrent-index -- --apply')).toBeLessThan(
+    expect(upgradeProof).not.toContain('FORGE_ROOT_INDEX_LIFECYCLE_PROOF')
+    expect(upgradeProof.match(/bash scripts\/ci\/prove-migration-0027-root-index-lifecycle\.sh/g)).toHaveLength(1)
+    expect(upgradeProof.indexOf('bash scripts/ci/prove-migration-0027-root-index-lifecycle.sh')).toBeLessThan(
       upgradeProof.indexOf('bash scripts/ci/cutover-migration-0027-root-ref.sh --apply'),
     )
+    expect(indexLifecycleProof).toContain("expect_failure \"$canonical_index_refusal\"")
+    expect(indexLifecycleProof).toContain('assert_cutover_not_started')
+    expect(indexLifecycleProof).toContain('CREATE UNIQUE INDEX CONCURRENTLY projects_root_ref_idx ON public.projects(id) WHERE root_ref IS NOT NULL')
+    expect(indexLifecycleProof).toContain('projects_root_ref_idx exists with a noncanonical definition.')
+    expect(indexLifecycleProof).toContain('could not create unique index "projects_root_ref_idx"')
+    expect(indexLifecycleProof).toContain('DROP INDEX CONCURRENTLY public.projects_root_ref_idx')
     expect(webCi).toContain('FORGE_PROJECT_ROOT_RECONCILER_DATABASE_URL')
     expect(webCi).toContain('Capture the post-drain root journal watermark')
   })
