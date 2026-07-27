@@ -71,10 +71,10 @@ describe('dashboard task-event stream', () => {
     const response = await GET(new Request('http://localhost/api/tasks/events') as never)
 
     setTimeout(() => {
-      state.sub?.emit('pmessage', 'forge:task:*', 'forge:task:task-1', JSON.stringify({
+      state.sub?.emit('pmessage', 'forge:task-events:v2:*:live', 'forge:task-events:v2:task-1:live', JSON.stringify({
         type: 'task:status', status: 'failed',
       }))
-      state.sub?.emit('pmessage', 'forge:task:*', 'forge:task:task-1', JSON.stringify({
+      state.sub?.emit('pmessage', 'forge:task-events:v2:*:live', 'forge:task-events:v2:task-1:live', JSON.stringify({
         schemaVersion: 2,
         id: 9,
         type: 'task:status',
@@ -84,7 +84,7 @@ describe('dashboard task-event stream', () => {
 
     const output = await readUntil(response.body!, '"status":"running"')
     expect(state.constructorUrls).toEqual(['redis://event-subscriber@localhost/0'])
-    expect(state.sub?.psubscribe).toHaveBeenCalledWith('forge:task:*')
+    expect(state.sub?.psubscribe).toHaveBeenCalledWith('forge:task-events:v2:*:live')
     expect(output).toContain('event: task:status')
     expect(output).toContain('"taskId":"task-1"')
     expect(output).not.toContain('"status":"failed"')

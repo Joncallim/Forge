@@ -8,6 +8,31 @@ export type TaskEventRedisConfiguration = {
 }
 
 /**
+ * The only task-event Redis names used by current producers and subscribers.
+ * Legacy `forge:task:*` names deliberately do not appear here: an installation
+ * without dedicated credentials may share a Redis connection temporarily, but
+ * it still speaks only the v2 namespace.
+ */
+export function taskEventRedisKeys(taskId: string): Readonly<{
+  history: string
+  live: string
+  sequence: string
+}> {
+  return {
+    history: `forge:task-events:v2:${taskId}:history`,
+    live: `forge:task-events:v2:${taskId}:live`,
+    sequence: `forge:task-events:v2:${taskId}:seq`,
+  }
+}
+
+export const TASK_EVENT_V2_LIVE_PATTERN = 'forge:task-events:v2:*:live'
+
+export function taskIdFromTaskEventLiveChannel(channel: string): string | null {
+  const match = /^forge:task-events:v2:([^:]+):live$/.exec(channel)
+  return match?.[1] ?? null
+}
+
+/**
  * Protected task-event traffic uses two Redis principals. The publisher owns
  * sequence/history mutation and PUBLISH; the subscriber can only read history
  * and subscribe. Legacy installations retain the shared REDIS_URL path.

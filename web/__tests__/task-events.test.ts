@@ -12,6 +12,11 @@ const { mockEval, mockPublish, mockPublisherRedis } = vi.hoisted(() => {
 
 vi.mock('@/lib/task-event-redis', () => ({
   taskEventPublisherRedis: vi.fn(() => mockPublisherRedis),
+  taskEventRedisKeys: (taskId: string) => ({
+    history: `forge:task-events:v2:${taskId}:history`,
+    live: `forge:task-events:v2:${taskId}:live`,
+    sequence: `forge:task-events:v2:${taskId}:seq`,
+  }),
 }))
 
 describe('task-event publisher authority', () => {
@@ -43,7 +48,7 @@ describe('task-event publisher authority', () => {
       status: 'running',
       updatedAt: '2026-07-22T00:00:00.000Z',
     })
-    expect(channel).toBe('forge:task:task-1')
+    expect(channel).toBe('forge:task-events:v2:task-1:live')
     expect(limit).toBe('4096')
     expect(mockPublish).not.toHaveBeenCalled()
   })

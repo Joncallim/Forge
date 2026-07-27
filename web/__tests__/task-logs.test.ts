@@ -163,6 +163,9 @@ describe('task log writer', () => {
             violations.push(`${path.relative(process.cwd(), file)}:${source.getLineAndCharacterOfPosition(node.getStart()).line + 1}:dynamic-front-matter`)
           } else {
             const inspectKey = (candidate: ts.Node) => {
+              if (ts.isSpreadAssignment(candidate)) {
+                violations.push(`${path.relative(process.cwd(), file)}:${source.getLineAndCharacterOfPosition(candidate.getStart()).line + 1}:spread-front-matter`)
+              }
               if (ts.isPropertyAssignment(candidate) || ts.isShorthandPropertyAssignment(candidate)) {
                 const key = propertyName(candidate.name)
                 if (key && (/prompt/i.test(key) || key === 'messages')) {
@@ -177,6 +180,36 @@ describe('task log writer', () => {
         ts.forEachChild(node, inspectFrontMatter)
       }
       inspectFrontMatter(source)
+    }
+
+    expect(violations).toEqual([])
+  })
+
+  it('keeps task producers on the canonical task-log/event writers and out of the legacy Redis namespace', () => {
+    const roots = [path.resolve(process.cwd(), 'worker'), path.resolve(process.cwd(), 'app/api/tasks')]
+    const files: string[] = []
+    const visitDirectory = (directory: string) => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const target = path.join(directory, entry.name)
+        if (entry.isDirectory()) visitDirectory(target)
+        else if (entry.isFile() && target.endsWith('.ts')) files.push(target)
+      }
+    }
+    roots.forEach(visitDirectory)
+
+    const directRedisWriter = path.resolve(process.cwd(), 'worker/events.ts')
+    const directTaskLogWriter = path.resolve(process.cwd(), 'worker/task-logs.ts')
+    const violations: string[] = []
+    for (const file of files) {
+      const source = fs.readFileSync(file, 'utf8')
+      const relative = path.relative(process.cwd(), file)
+      if (source.includes('forge:task:')) violations.push(`${relative}:legacy-task-namespace`)
+      if (file !== directRedisWriter && /\.(?:eval|publish)\s*\(/.test(source)) {
+        violations.push(`${relative}:direct-redis-publish`)
+      }
+      if (file !== directTaskLogWriter && /\.insert\s*\(\s*taskLogs\s*\)/.test(source)) {
+        violations.push(`${relative}:direct-task-log-insert`)
+      }
     }
 
     expect(violations).toEqual([])

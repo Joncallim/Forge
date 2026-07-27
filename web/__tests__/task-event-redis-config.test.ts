@@ -50,4 +50,22 @@ describe('task-event Redis credential boundary', () => {
     process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = 'redis://event@localhost/0'
     expect(() => taskEventRedisConfiguration()).toThrow(/separate credentials/i)
   })
+
+  it('uses v2-only live and durable names even while shared legacy compatibility is configured', async () => {
+    process.env.REDIS_URL = 'redis://legacy@localhost/0'
+    const {
+      TASK_EVENT_V2_LIVE_PATTERN,
+      taskEventRedisKeys,
+      taskIdFromTaskEventLiveChannel,
+    } = await import('@/lib/task-event-redis')
+
+    expect(taskEventRedisKeys('task-1')).toEqual({
+      history: 'forge:task-events:v2:task-1:history',
+      live: 'forge:task-events:v2:task-1:live',
+      sequence: 'forge:task-events:v2:task-1:seq',
+    })
+    expect(TASK_EVENT_V2_LIVE_PATTERN).toBe('forge:task-events:v2:*:live')
+    expect(taskIdFromTaskEventLiveChannel('forge:task-events:v2:task-1:live')).toBe('task-1')
+    expect(taskIdFromTaskEventLiveChannel('forge:task:task-1')).toBeNull()
+  })
 })
