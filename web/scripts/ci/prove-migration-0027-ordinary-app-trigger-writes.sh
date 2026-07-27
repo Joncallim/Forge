@@ -33,14 +33,15 @@ SQL
 
 trigger_state="$(psql "${FORGE_DATABASE_ADMIN_URL}" --no-align --tuples-only --set ON_ERROR_STOP=1 \
   --set project_id="${project_id}" \
-  --set package_id="${package_id}" --command "
-    SELECT EXISTS (
-      SELECT 1 FROM public.project_filesystem_current_decision_pointers
-      WHERE project_id = :'project_id'::uuid
-    ) AND EXISTS (
-      SELECT 1 FROM public.filesystem_mcp_current_decision_pointers
-      WHERE work_package_id = :'package_id'::uuid
-    ) AND (SELECT count(*) FROM public.work_package_local_projection_heads
-           WHERE work_package_id = :'package_id'::uuid) = 8
-  ")"
+  --set package_id="${package_id}" <<'SQL'
+SELECT EXISTS (
+  SELECT 1 FROM public.project_filesystem_current_decision_pointers
+  WHERE project_id = :'project_id'::uuid
+) AND EXISTS (
+  SELECT 1 FROM public.filesystem_mcp_current_decision_pointers
+  WHERE work_package_id = :'package_id'::uuid
+) AND (SELECT count(*) FROM public.work_package_local_projection_heads
+       WHERE work_package_id = :'package_id'::uuid) = 8;
+SQL
+)"
 [[ "${trigger_state}" == 't' ]] || { echo 'ordinary application writes did not fire the S3 pointer and projection-head triggers' >&2; exit 1; }
