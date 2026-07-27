@@ -167,6 +167,8 @@ describe('Epic 172 S4 PostgreSQL CI contract', () => {
       'local_projection_archive_operations',
       'local_projection_archive_operation_checkpoints',
       'filesystem_mcp_decision_nonce_claims',
+      'project_root_change_journal_counter',
+      'project_root_change_journal',
     ]) {
       expect(ordinaryInventory).not.toContain(`'${table}'`)
       expect(protectedInventory).toContain(`'${table}'`)
