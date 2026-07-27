@@ -21,6 +21,13 @@ describe('project-root expansion reconciliation boundary', () => {
     expect(s3Migration).toContain('CREATE FUNCTION forge_is_canonical_filesystem_grant_block_v2(p_block jsonb)')
     expect(s3Migration).toContain('RETURNS boolean LANGUAGE sql IMMUTABLE PARALLEL SAFE')
     expect(s3Migration).toContain("'project_grant_removed','project_grant_narrowed','project_root_repoint'")
+    expect(s3Migration).toContain('public.forge_is_canonical_bounded_string_set(p_block->\'requirementKeys\',256,240)')
+    expect(s3Migration).toContain('public.forge_is_canonical_filesystem_capability_set(p_block->\'requestedCapabilities\')')
+    expect(s3Migration).toContain("public.forge_is_canonical_utc_timestamp(p_block->>'blockedAt')")
+    expect(s3Migration).toContain('CHECK (public.forge_is_canonical_filesystem_capability_set("capabilities"))')
+    expect(s3Migration).toContain('public.forge_is_canonical_filesystem_grant_block_v2("metadata"->\'mcpGrantBlock\')')
+    expect(migration).toContain('public.forge_is_canonical_filesystem_grant_block_v2(v_new_marker)')
+    expect(migration).toContain('public.forge_is_canonical_filesystem_grant_block_v2(v_old_marker)')
   })
   it('parses only the literal actor/watermark/apply command and keeps dry-run actionless', () => {
     const actor = '123e4567-e89b-42d3-a456-426614174000'
