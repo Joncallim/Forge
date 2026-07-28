@@ -2,7 +2,7 @@ import { createHmac, randomBytes, randomUUID } from 'node:crypto'
 import Redis from 'ioredis'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { createLegacyLeakageRedisAdapter } from '@/scripts/scrub-legacy-leakage'
-import { taskEventRedisConfiguration, taskEventRedisKeys } from '@/lib/task-event-redis'
+import { TASK_EVENT_V2_LIVE_PATTERN, taskEventRedisConfiguration, taskEventRedisKeys } from '@/lib/task-event-redis'
 import { publishTaskEvent } from '@/worker/events'
 
 vi.mock('@/lib/mcps/s4-lease', () => ({
@@ -13,7 +13,7 @@ const required = process.env.FORGE_S4_REDIS_ACL_TEST_REQUIRED === '1'
 const destructive = process.env.FORGE_S4_REDIS_ACL_DESTRUCTIVE_TEST === '1'
 const adminUrl = process.env.FORGE_S4_REDIS_ACL_TEST_ADMIN_URL
 
-function validateDestructiveRedisUrl(value: string): string {
+function validateDestructiveRedisUrl(value: string): Readonly<{ url: string; database: number }> {
   let parsed: URL
   try {
     parsed = new URL(value)
@@ -27,26 +27,29 @@ function validateDestructiveRedisUrl(value: string): string {
   if (!Number.isSafeInteger(database) || database < 1) {
     throw new Error('S4 Redis ACL proof requires an unambiguous redis: or rediss: URL with an explicit nonzero database.')
   }
-  return value
+  return { url: value, database }
 }
 
 if (required && (!destructive || !adminUrl)) {
   throw new Error('The mandatory S4 Redis ACL proof requires FORGE_S4_REDIS_ACL_DESTRUCTIVE_TEST=1 and FORGE_S4_REDIS_ACL_TEST_ADMIN_URL; it may not skip.')
 }
 
-const destructiveAdminUrl = adminUrl && destructive ? validateDestructiveRedisUrl(adminUrl) : null
-const enabled = Boolean(destructiveAdminUrl)
+const destructiveTarget = adminUrl && destructive ? validateDestructiveRedisUrl(adminUrl) : null
+const destructiveAdminUrl = destructiveTarget?.url ?? null
+const destructiveDatabase = destructiveTarget?.database ?? -1
+const enabled = Boolean(destructiveTarget)
 const fingerprintKey = Buffer.alloc(32, 59)
 const legacyFixtureTaskId = randomUUID()
+const selectRule = `+select|${destructiveDatabase}`
 const publisherRules = [
   '~forge:task-events:v2:*:history', '~forge:task-events:v2:*:seq', '&forge:task-events:v2:*:live',
-  '+select', '+ping', '+info', '+client|setinfo', '+eval', '+incr', '+zadd', '+zcard', '+zremrangebyrank', '+publish',
+  selectRule, '+ping', '+info', '+client|setinfo', '+eval', '+incr', '+zadd', '+zcard', '+zremrangebyrank', '+publish',
 ] as const
 const aclGetUserFields = ['flags', 'passwords', 'commands', 'keys', 'channels', 'selectors'] as const
 const safeAclFlags = ['on', 'sanitize-payload'] as const
 const subscriberRules = [
   '~forge:task-events:v2:*:history', '~forge:task-events:v2:*:seq', '&forge:task-events:v2:*:live',
-  '+select', '+ping', '+info', '+client|setinfo', '+get', '+zrangebyscore', '+subscribe', '+unsubscribe', '+psubscribe', '+punsubscribe',
+  selectRule, '+ping', '+info', '+client|setinfo', '+get', '+zrangebyscore', '+subscribe', '+unsubscribe', '+psubscribe', '+punsubscribe',
 ] as const
 
 function opaque(value: Buffer | null): string {
@@ -64,6 +67,7 @@ function eventEnvelope(id: number): string {
 
 describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
   let admin: Redis
+  let otherDatabaseAdmin: Redis
   let publisherUrl: string
   let subscriberUrl: string
   let legacyUrl: string
@@ -73,6 +77,7 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
   const ownedKeys = new Set<string>()
   const ownedUsers = new Set<string>()
   const clients = new Set<Redis>()
+  let otherDatabaseBaseline: Readonly<{ count: number; fingerprint: string }>
 
   function client(url: string): Redis {
     const instance = new Redis(url, { lazyConnect: true, maxRetriesPerRequest: 1, retryStrategy: () => null })
@@ -101,9 +106,15 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
     return parsed.toString()
   }
 
+  function adminUrlForDatabase(database: number): string {
+    const parsed = new URL(destructiveAdminUrl!)
+    parsed.pathname = `/${database}`
+    return parsed.toString()
+  }
+
   async function setUser(user: string, password: string, rules: readonly string[]): Promise<void> {
-    await admin.call('ACL', 'SETUSER', user, 'reset', 'on', `>${password}`, ...rules)
     ownedUsers.add(user)
+    await admin.call('ACL', 'SETUSER', user, 'reset', 'on', `>${password}`, ...rules)
   }
 
   function aclTokens(value: unknown): readonly string[] {
@@ -138,7 +149,7 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
   }
 
   function hasOneOpaquePassword(value: unknown): boolean {
-    return Array.isArray(value) && value.length === 1
+    return Array.isArray(value) && value.length === 1 && typeof value[0] === 'string' && /^[0-9a-f]{64}$/.test(value[0])
   }
 
   async function assertAclIdentity(user: string, expected: Readonly<{ keys: readonly string[]; channels: readonly string[]; commands: readonly string[] }>): Promise<void> {
@@ -168,6 +179,32 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
     }
   }
 
+  async function databaseEvidence(connection: Redis): Promise<Readonly<{ count: number; fingerprint: string }>> {
+    const [count, keyspace] = await Promise.all([connection.dbsize(), connection.info('keyspace')])
+    if (!Number.isSafeInteger(count) || count < 0 || typeof keyspace !== 'string') {
+      throw new Error('S4 Redis ACL proof could not read the disposable database evidence.')
+    }
+    return { count, fingerprint: opaque(Buffer.from(keyspace, 'utf8')) }
+  }
+
+  function assertDatabaseEvidence(actual: Readonly<{ count: number; fingerprint: string }>, expected: Readonly<{ count: number; fingerprint: string }>): void {
+    if (actual.count !== expected.count || actual.fingerprint !== expected.fingerprint) {
+      throw new Error('S4 Redis ACL proof found an unexpected database mutation.')
+    }
+  }
+
+  function isExpectedTaskEventMessage(value: string): boolean {
+    try {
+      const parsed: unknown = JSON.parse(value)
+      return typeof parsed === 'object' && parsed !== null
+        && (parsed as { schemaVersion?: unknown }).schemaVersion === 2
+        && (parsed as { id?: unknown }).id === 1
+        && (parsed as { type?: unknown }).type === 'task:status'
+    } catch {
+      return false
+    }
+  }
+
   async function dumpFingerprint(key: string): Promise<Readonly<{ type: string; dump: string }>> {
     const [type, dumped] = await Promise.all([admin.type(key), admin.callBuffer('DUMP', key)])
     if (dumped !== null && !Buffer.isBuffer(dumped)) throw new Error('S4 Redis ACL proof requires binary DUMP replies.')
@@ -175,7 +212,30 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
   }
 
   async function expectNoPerm(action: () => Promise<unknown>): Promise<void> {
-    await expect(action()).rejects.toThrow(/NOPERM/)
+    try {
+      await action()
+    } catch (error) {
+      if (error instanceof Error && (/^NOPERM\b/.test(error.message) || /^ERR ACL failure\b/.test(error.message))) return
+    }
+    throw new Error('S4 Redis ACL proof expected an exact Redis permission denial.')
+  }
+
+  async function expectRejected(action: () => Promise<unknown>): Promise<void> {
+    try {
+      await action()
+    } catch {
+      return
+    }
+    throw new Error('S4 Redis ACL proof expected the revoked Redis client to be rejected.')
+  }
+
+  async function expectRevokedCredentialConnection(action: () => Promise<unknown>): Promise<void> {
+    try {
+      await action()
+    } catch (error) {
+      if (error instanceof Error && /WRONGPASS|NOAUTH|NOPERM|Connection is closed/.test(error.message)) return
+    }
+    throw new Error('S4 Redis ACL proof expected the revoked Redis credentials to be denied.')
   }
 
   beforeAll(async () => {
@@ -185,6 +245,9 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
     const major = /^redis_version:(\d+)/m.exec(info)?.[1]
     if (!major || Number(major) < 7) throw new Error('S4 Redis ACL proof requires Redis major version 7 or newer.')
     if (await admin.dbsize() !== 0) throw new Error('S4 Redis ACL proof requires an empty dedicated disposable database.')
+    otherDatabaseAdmin = client(adminUrlForDatabase(destructiveDatabase + 1))
+    await otherDatabaseAdmin.connect()
+    otherDatabaseBaseline = await databaseEvidence(otherDatabaseAdmin)
 
     publisherUser = `s4pub_${randomUUID().replaceAll('-', '')}`
     subscriberUser = `s4sub_${randomUUID().replaceAll('-', '')}`
@@ -200,7 +263,7 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
     await setUser(subscriberUser, subscriberPassword, subscriberRules)
     const legacyRules = [
       `~forge:task:${legacyFixtureTaskId}:history`, `~forge:task:${legacyFixtureTaskId}:seq`,
-      '+select', '+ping', '+info', '+client|setinfo', '+zadd', '+set',
+      selectRule, '+ping', '+info', '+client|setinfo', '+zadd', '+set',
     ] as const
     await setUser(legacyUser, legacyPassword, legacyRules)
     await assertAclIdentity(publisherUser, { keys: publisherRules.filter((rule) => rule.startsWith('~')), channels: publisherRules.filter((rule) => rule.startsWith('&')), commands: publisherRules.filter((rule) => rule.startsWith('+')) })
@@ -210,12 +273,13 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
 
   afterAll(async () => {
     try {
-      for (const instance of clients) if (instance !== admin) instance.disconnect()
       for (const user of ownedUsers) await admin.call('ACL', 'DELUSER', user)
       if (ownedKeys.size > 0) await admin.del(...ownedKeys)
       expect(await admin.dbsize()).toBe(0)
+      assertDatabaseEvidence(await databaseEvidence(otherDatabaseAdmin), otherDatabaseBaseline)
       for (const user of ownedUsers) await assertAclAbsent(user)
     } finally {
+      for (const instance of clients) if (instance !== admin) instance.disconnect()
       admin?.disconnect()
     }
   })
@@ -237,13 +301,36 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
         else process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = previousSubscriber
       }
     })()
-    expect(configuration).toMatchObject({ dedicated: true, publisherUrl, subscriberUrl })
+    if (!configuration.dedicated || configuration.publisherUrl !== publisherUrl || configuration.subscriberUrl !== subscriberUrl) {
+      throw new Error('S4 Redis ACL proof could not verify the protected Redis configuration.')
+    }
+    const safeMismatchFailure = (() => {
+      const previousPublisher = process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL
+      const previousSubscriber = process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL
+      process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = publisherUrl
+      process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = publisherUrl
+      try {
+        taskEventRedisConfiguration('protected')
+        return false
+      } catch (error) {
+        return error instanceof Error && error.message === 'Task-event publisher and subscriber Redis URLs must use distinct ACL principals.'
+      } finally {
+        if (previousPublisher === undefined) delete process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL
+        else process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = previousPublisher
+        if (previousSubscriber === undefined) delete process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL
+        else process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = previousSubscriber
+      }
+    })()
+    if (!safeMismatchFailure) throw new Error('S4 Redis ACL proof did not receive the fixed protected Redis configuration failure.')
 
     const live = client(subscriberUrl)
+    const patternLive = client(subscriberUrl)
     const replay = client(subscriberUrl)
-    await Promise.all([live.connect(), replay.connect()])
+    await Promise.all([live.connect(), patternLive.connect(), replay.connect()])
     const delivered = new Promise<string>((resolve) => live.once('message', (_channel, message) => resolve(message)))
+    const patternDelivered = new Promise<Readonly<{ channel: string; message: string }>>((resolve) => patternLive.once('pmessage', (_pattern, channel, message) => resolve({ channel, message })))
     await live.subscribe(keys.live)
+    await patternLive.psubscribe(TASK_EVENT_V2_LIVE_PATTERN)
 
     const previousPublisher = process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL
     const previousSubscriber = process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL
@@ -258,11 +345,15 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
       else process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = previousSubscriber
     }
     const message = await delivered
+    const patterned = await patternDelivered
     const replayRows = await replay.zrangebyscore(keys.history, 1, '+inf', 'WITHSCORES')
     const sequence = await replay.get(keys.sequence)
-    expect(JSON.parse(message)).toMatchObject({ schemaVersion: 2, id: 1, type: 'task:status' })
+    if (!isExpectedTaskEventMessage(message) || patterned.channel !== keys.live || !isExpectedTaskEventMessage(patterned.message)) {
+      throw new Error('S4 Redis ACL proof did not receive the expected protected task event.')
+    }
     expect(replayRows).toHaveLength(2)
     expect(sequence).toBe('1')
+    await Promise.all([live.unsubscribe(keys.live), patternLive.punsubscribe(TASK_EVENT_V2_LIVE_PATTERN)])
     const publisherClient = (globalThis as { forgeTaskEventPublisherRedis?: Redis }).forgeTaskEventPublisherRedis
     if (publisherClient) clients.add(publisherClient)
     await assertActiveClientUsers([publisherUser, subscriberUser])
@@ -277,17 +368,36 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
     const beforeSequence = await dumpFingerprint(keys.sequence)
     const unrelatedChannel = `forge:unrelated:${randomUUID()}:live`
     const legacy = legacyKeys(legacyFixtureTaskId)
+    const nonCanonicalV2Key = `forge:task-events:v2:${randomUUID()}:live`
+    ownedKeys.add(nonCanonicalV2Key)
+    await admin.zadd(legacy.history, 1, 'legacy-fixture')
+    await admin.zadd(nonCanonicalV2Key, 1, 'noncanonical-fixture')
     const publisher = client(publisherUrl)
     const subscriber = client(subscriberUrl)
     const oldWriter = client(legacyUrl)
     await Promise.all([publisher.connect(), subscriber.connect(), oldWriter.connect()])
     await assertActiveClientUsers([publisherUser, subscriberUser, legacyUser])
+    const beforeConfiguredDatabase = await databaseEvidence(admin)
+    const beforeOtherDatabase = await databaseEvidence(otherDatabaseAdmin)
+    const deniedDatabase = destructiveDatabase === 15 ? 14 : 15
     await Promise.all([
+      publisher.select(destructiveDatabase),
+      subscriber.select(destructiveDatabase),
+      oldWriter.select(destructiveDatabase),
+    ])
+    await Promise.all([
+      expectNoPerm(() => publisher.select(deniedDatabase)),
+      expectNoPerm(() => subscriber.select(deniedDatabase)),
+      expectNoPerm(() => oldWriter.select(deniedDatabase)),
       expectNoPerm(() => publisher.zrangebyscore(keys.history, 1, '+inf')),
       expectNoPerm(() => publisher.subscribe(keys.live)),
       expectNoPerm(() => publisher.del(keys.history)),
       expectNoPerm(() => publisher.set(legacy.sequence, '1')),
       expectNoPerm(() => publisher.publish(unrelatedChannel, 'x')),
+      expectNoPerm(() => publisher.eval("return redis.call('DEL', KEYS[1])", 1, keys.history)),
+      expectNoPerm(() => publisher.eval("return redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])", 1, legacy.history, '2', 'legacy-probe')),
+      expectNoPerm(() => publisher.eval("return redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])", 1, nonCanonicalV2Key, '2', 'v2-probe')),
+      expectNoPerm(() => publisher.eval("return redis.call('PUBLISH', ARGV[1], ARGV[2])", 0, unrelatedChannel, 'lua-probe')),
       expectNoPerm(() => subscriber.publish(keys.live, 'x')),
       expectNoPerm(() => subscriber.eval('return 1', 0)),
       expectNoPerm(() => subscriber.zadd(keys.history, 2, eventEnvelope(2))),
@@ -297,6 +407,9 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
     ])
     expect(await dumpFingerprint(keys.history)).toEqual(beforeHistory)
     expect(await dumpFingerprint(keys.sequence)).toEqual(beforeSequence)
+    assertDatabaseEvidence(await databaseEvidence(admin), beforeConfiguredDatabase)
+    assertDatabaseEvidence(await databaseEvidence(otherDatabaseAdmin), beforeOtherDatabase)
+    await admin.del(legacy.history, nonCanonicalV2Key)
     console.info('S4_REDIS_ACL_DENIALS_OK')
   })
 
@@ -319,11 +432,11 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
     await assertAclAbsent(legacyUser)
     const ended = await Promise.race([terminated, new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_000))])
     expect(ended).toBe(true)
-    await expect(oldWriter.set(legacy.sequence, '1')).rejects.toThrow()
+    await expectRejected(() => oldWriter.set(legacy.sequence, '1'))
 
     const staleConnection = client(legacyUrl)
     staleConnection.on('error', () => undefined)
-    await expect(staleConnection.connect()).rejects.toThrow(/WRONGPASS|NOAUTH|NOPERM|Connection is closed/)
+    await expectRevokedCredentialConnection(() => staleConnection.connect())
     expect(await admin.exists(legacy.history, legacy.sequence)).toBe(0)
     expect(await createLegacyLeakageRedisAdapter(admin).scanV2TaskEventHistory([])).toMatchObject({ complete: true, violations: 0 })
     expect(await Promise.all([dumpFingerprint(v2Task.history), dumpFingerprint(v2Task.sequence)])).toEqual(beforeV2)
