@@ -312,6 +312,16 @@ async function startWorkerOnce(
           retryResult = await queue.retry(raw, job, retryDelayMs)
         } catch {
           logQueueInfrastructureFailure('retry_reconciliation', queueName, job.taskId)
+          try {
+            await finishTaskAttempt({
+              attemptId,
+              errorMessage: message,
+              nextRetryAt: null,
+              status: 'indeterminate',
+            })
+          } catch {
+            logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
+          }
           return
         }
       }

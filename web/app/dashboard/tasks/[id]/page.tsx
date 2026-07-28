@@ -166,6 +166,7 @@ function statusLabel(status: string): string {
     awaiting_answers: 'Needs answers',
     awaiting_approval: 'Needs approval',
     dead_lettered: 'Stopped after retries',
+    indeterminate: 'Retry status unknown',
     pending: 'Pending execution',
   }
   if (labels[status]) return labels[status]
@@ -1230,6 +1231,7 @@ function statusBadgeClass(status: string): string {
     case 'skipped':
     case 'validation_skipped':
     case 'warning':
+    case 'indeterminate':
       return 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200'
     case 'completed':
     case 'success':
