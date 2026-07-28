@@ -38,6 +38,14 @@ if (required && (!destructive || !redisUrl || !databaseUrl)) {
 
 const enabled = Boolean(destructive && redisUrl && databaseUrl)
 const proofRedisUrl = enabled ? validatedRedisUrl(redisUrl!) : null
+
+// DB and queue modules cache their connections at import time. Bind the
+// dedicated proof endpoints before any production worker module is imported;
+// this makes CI's DB 12 proof unable to observe the shared worker Redis URL.
+if (enabled) {
+  process.env.DATABASE_URL = databaseUrl!
+  process.env.REDIS_URL = proofRedisUrl!
+}
 const QUEUE_KEYS = [
   'forge:tasks',
   'forge:tasks:processing',
@@ -177,6 +185,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     'FORGE_WORKER_MOCK_ARCHITECT',
     'FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS',
     'FORGE_WORKFORCE_MATERIALIZATION',
+    'DATABASE_URL',
     'REDIS_URL',
   ] as const
 
