@@ -165,16 +165,33 @@ vi.mock('ioredis', () => {
         } else {
           result = 2
         }
-      } else if (script.includes('forge:queue:retry-v2')) {
+      } else if (script.includes('forge:queue:retry-v3')) {
+        const delayMs = Number(args[3])
+        if (!/^[0-9]+$/.test(args[3])
+          || !Number.isSafeInteger(delayMs)
+          || delayMs < 0) {
+          throw new Error('forge_queue_retry_delay_invalid')
+        }
         if (hash(keys[1]).get(args[1]) === args[2] && list(keys[0]).includes(args[0])) {
-          zset(keys[2]).set(args[4], Number(args[3]))
+          if (zset(keys[2]).has(args[4])) {
+            result = [0, '']
+            return result
+          }
+          const deadlineMs = redisHarness.nowMs + delayMs
+          if (!Number.isSafeInteger(deadlineMs)
+            || deadlineMs > 8_640_000_000_000_000) {
+            throw new Error('forge_queue_retry_timestamp_invalid')
+          }
+          zset(keys[2]).set(args[4], deadlineMs)
           hash(keys[1]).delete(args[1])
           removeFirst(list(keys[0]), args[0])
-          result = 1
+          result = [1, String(deadlineMs)]
         } else if (!list(keys[0]).includes(args[0])
           && !hash(keys[1]).has(args[1])
           && zset(keys[2]).has(args[4])) {
-          result = 2
+          result = [2, String(zset(keys[2]).get(args[4]))]
+        } else {
+          result = [0, '']
         }
       } else if (script.includes('forge:queue:dead-letter-v2')) {
         if (hash(keys[1]).get(args[1]) === args[2] && list(keys[0]).includes(args[0])) {
@@ -627,6 +644,248 @@ describe('core operational output closure', () => {
     expect(retryClient.hdel).not.toHaveBeenCalled()
   })
 
+  it('anchors retry deadlines to Redis time across queues, replay, skew, and bounds', async () => {
+    const { AnswersQueue, ApprovalQueue, TaskQueue } = await import('@/worker/queue')
+    const queueCases = [
+      {
+        create: () => new TaskQueue('redis://localhost:6379/0') as unknown as AtomicQueue,
+        job: (attempt: number): AtomicQueueJob => ({ taskId: TASK_ID, attempt }),
+        readyKey: 'forge:tasks',
+        retryKey: 'forge:tasks:retry',
+      },
+      {
+        create: () => new ApprovalQueue('redis://localhost:6379/0') as unknown as AtomicQueue,
+        job: (attempt: number): AtomicQueueJob => ({
+          taskId: TASK_ID,
+          action: 'approve',
+          attempt,
+        }),
+        readyKey: 'forge:approvals',
+        retryKey: 'forge:approvals:retry',
+      },
+      {
+        create: () => new AnswersQueue('redis://localhost:6379/0') as unknown as AtomicQueue,
+        job: (attempt: number): AtomicQueueJob => ({ taskId: TASK_ID, attempt }),
+        readyKey: 'forge:answers',
+        retryKey: 'forge:answers:retry',
+      },
+    ]
+    const skewedScenarios = [
+      { delayMs: 0, loseResponse: false, workerSkewMs: 120_000 },
+      { delayMs: 60_000, loseResponse: true, workerSkewMs: -120_000 },
+    ] as const
+    const dateNow = vi.spyOn(Date, 'now')
+
+    for (const [caseIndex, queueCase] of queueCases.entries()) {
+      for (const [scenarioIndex, scenario] of skewedScenarios.entries()) {
+        redisHarness.hashes.clear()
+        redisHarness.lists.clear()
+        redisHarness.zsets.clear()
+        redisHarness.nowMs = 1_800_000_000_000 + (caseIndex * 10_000) + scenarioIndex
+        dateNow.mockReturnValue(redisHarness.nowMs + scenario.workerSkewMs)
+        const queue = queueCase.create()
+        const job = queueCase.job(10 + (caseIndex * 10) + scenarioIndex)
+        redisHarness.claimPayloads.push(JSON.stringify(job))
+        const claimed = await queue.claim(1)
+        if (!claimed) throw new Error('Expected a retry clock fixture claim.')
+        const [client] = redisHarness.instances.slice(-1)
+        const expectedDeadline = redisHarness.nowMs + scenario.delayMs
+
+        if (scenario.loseResponse) {
+          redisHarness.failures.push({ marker: 'forge:queue:retry-v3', stage: 'after' })
+          await expect(queue.retry(claimed.raw, claimed.job, scenario.delayMs))
+            .rejects.toThrow('Queue transition failed')
+        }
+        const result = await queue.retry(claimed.raw, claimed.job, scenario.delayMs)
+        expect(result).toEqual({
+          nextRetryAt: new Date(expectedDeadline),
+          outcome: scenario.loseResponse ? 'already_applied' : 'applied',
+        })
+
+        const scheduled = [...(redisHarness.zsets.get(queueCase.retryKey) ?? new Map())]
+          .find(([raw]) => parsedOccurrence(raw).occurrenceId === claimed.occurrenceId)
+        expect(scheduled?.[1]).toBe(expectedDeadline)
+        expect(result.nextRetryAt.getTime()).toBe(scheduled?.[1])
+
+        const retryCalls = client.call.mock.calls.filter((args) =>
+          String(args[1]).includes('forge:queue:retry-v3'))
+        expect(retryCalls.at(-1)?.[9]).toBe(String(scenario.delayMs))
+        const rawReply = await client.call.mock.results.at(-1)?.value
+        expect(rawReply).toEqual([
+          scenario.loseResponse ? 2 : 1,
+          String(expectedDeadline),
+        ])
+
+        if (scenario.delayMs === 60_000) {
+          if (!scheduled) throw new Error('Expected the owned delayed retry member.')
+          await expect(queue.promoteDueRetries()).resolves.toBe(0)
+          expect(redisHarness.zsets.get(queueCase.retryKey)?.get(scheduled[0]))
+            .toBe(expectedDeadline)
+
+          redisHarness.nowMs = expectedDeadline
+          await expect(queue.promoteDueRetries()).resolves.toBe(1)
+          expect(redisHarness.zsets.get(queueCase.retryKey)?.has(scheduled[0]) ?? false)
+            .toBe(false)
+          expect(redisHarness.lists.get(queueCase.readyKey)?.filter(
+            (raw) => raw === scheduled[0],
+          )).toEqual([scheduled[0]])
+        }
+      }
+
+      redisHarness.nowMs += 1
+      dateNow.mockReturnValue(redisHarness.nowMs + 120_000)
+      const staleOwner = queueCase.create()
+      const staleJob = queueCase.job(40 + caseIndex)
+      redisHarness.claimPayloads.push(JSON.stringify(staleJob))
+      const staleClaim = await staleOwner.claim(1)
+      if (!staleClaim) throw new Error('Expected a stale retry clock fixture claim.')
+      const [staleClient] = redisHarness.instances.slice(-1)
+      const laterOwner = queueCase.create()
+      await expect(laterOwner.recoverStuckJobs(0)).resolves.toBe(1)
+      await expect(staleOwner.retry(staleClaim.raw, staleClaim.job, 60_000))
+        .rejects.toThrow('Queue transition stale_not_owner')
+      const staleReply = await staleClient.call.mock.results.at(-1)?.value
+      expect(staleReply).toEqual([0, ''])
+    }
+
+    redisHarness.nowMs = 1_800_000_000_000
+    dateNow.mockReturnValue(redisHarness.nowMs - 120_000)
+    const maxDateMs = 8_640_000_000_000_000
+    const maxValidDelayMs = maxDateMs - redisHarness.nowMs
+    const maxQueue = new TaskQueue('redis://localhost:6379/0')
+    redisHarness.claimPayloads.push(JSON.stringify({ taskId: TASK_ID, attempt: 80 }))
+    const maxClaim = await maxQueue.claim(1)
+    if (!maxClaim) throw new Error('Expected a maximum retry delay fixture claim.')
+    await expect(maxQueue.retry(maxClaim.raw, maxClaim.job, maxValidDelayMs)).resolves.toEqual({
+      nextRetryAt: new Date(maxDateMs),
+      outcome: 'applied',
+    })
+
+    const overflowQueue = new TaskQueue('redis://localhost:6379/0')
+    redisHarness.claimPayloads.push(JSON.stringify({ taskId: TASK_ID, attempt: 81 }))
+    const overflowClaim = await overflowQueue.claim(1)
+    if (!overflowClaim) throw new Error('Expected an overflowing retry delay fixture claim.')
+    await expect(overflowQueue.retry(
+      overflowClaim.raw,
+      overflowClaim.job,
+      maxValidDelayMs + 1,
+    )).rejects.toThrow('Queue transition failed')
+    expect(redisHarness.lists.get('forge:tasks:processing')).toContain(overflowClaim.raw)
+    expect(
+      [...(redisHarness.zsets.get('forge:tasks:retry') ?? new Map()).keys()]
+        .some((raw) => parsedOccurrence(raw).occurrenceId === overflowClaim.occurrenceId),
+    ).toBe(false)
+
+    for (const invalidDelay of [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53]) {
+      await expect(maxQueue.retry('', { taskId: TASK_ID, attempt: 1 }, invalidDelay))
+        .rejects.toThrow('Queue retry delay must be a non-negative safe integer')
+    }
+
+    const malformedResultQueue = new TaskQueue('redis://localhost:6379/0')
+    redisHarness.claimPayloads.push(JSON.stringify({ taskId: TASK_ID, attempt: 82 }))
+    const malformedResultClaim = await malformedResultQueue.claim(1)
+    if (!malformedResultClaim) throw new Error('Expected a malformed retry result fixture claim.')
+    const [malformedResultClient] = redisHarness.instances.slice(-1)
+    const malformedResults = [
+      null,
+      [1],
+      [3, String(redisHarness.nowMs)],
+      [1, ''],
+      [1, '01'],
+      [1, '1e3'],
+      [1, '1000.0'],
+      [1, ' 1000'],
+      [1, String(8_640_000_000_000_001)],
+      [0, String(redisHarness.nowMs)],
+    ]
+    for (const malformedResult of malformedResults) {
+      malformedResultClient.call.mockResolvedValueOnce(malformedResult)
+      await expect(malformedResultQueue.retry(
+        malformedResultClaim.raw,
+        malformedResultClaim.job,
+        0,
+      )).rejects.toThrow('Queue retry transition returned an invalid result')
+    }
+  })
+
+  it('fails retry closed on an exact live destination without disturbing neighboring state', async () => {
+    const { AnswersQueue, ApprovalQueue, TaskQueue } = await import('@/worker/queue')
+    const queueCases = [
+      {
+        claimsKey: 'forge:tasks:claims',
+        create: () => new TaskQueue('redis://localhost:6379/0') as unknown as AtomicQueue,
+        job: { taskId: TASK_ID, attempt: 7 } satisfies AtomicQueueJob,
+        processingKey: 'forge:tasks:processing',
+        retryKey: 'forge:tasks:retry',
+      },
+      {
+        claimsKey: 'forge:approvals:claims',
+        create: () => new ApprovalQueue('redis://localhost:6379/0') as unknown as AtomicQueue,
+        job: { taskId: TASK_ID, action: 'approve', attempt: 7 } satisfies AtomicQueueJob,
+        processingKey: 'forge:approvals:processing',
+        retryKey: 'forge:approvals:retry',
+      },
+      {
+        claimsKey: 'forge:answers:claims',
+        create: () => new AnswersQueue('redis://localhost:6379/0') as unknown as AtomicQueue,
+        job: { taskId: TASK_ID, attempt: 7 } satisfies AtomicQueueJob,
+        processingKey: 'forge:answers:processing',
+        retryKey: 'forge:answers:retry',
+      },
+    ]
+
+    for (const [caseIndex, queueCase] of queueCases.entries()) {
+      redisHarness.hashes.clear()
+      redisHarness.lists.clear()
+      redisHarness.zsets.clear()
+      const queue = queueCase.create()
+      redisHarness.claimPayloads.push(JSON.stringify(queueCase.job))
+      const claimed = await queue.claim(1)
+      if (!claimed) throw new Error('Expected a retry destination conflict fixture claim.')
+      const marker = redisHarness.hashes.get(queueCase.claimsKey)?.get(claimed.occurrenceId)
+      if (!marker) throw new Error('Expected a live retry destination conflict marker.')
+      const retryEnvelope = JSON.stringify({
+        schemaVersion: 1,
+        occurrenceId: claimed.occurrenceId,
+        job: { ...queueCase.job, attempt: queueCase.job.attempt + 1 },
+      })
+      const neighboringEnvelope = JSON.stringify({
+        schemaVersion: 1,
+        occurrenceId: `00000000-0000-4000-8000-${String(caseIndex + 1).padStart(12, '0')}`,
+        job: { ...queueCase.job, attempt: queueCase.job.attempt + 20 },
+      })
+      const existingScore = redisHarness.nowMs + 60_000
+      const neighboringScore = redisHarness.nowMs + 120_000
+      redisHarness.zsets.set(queueCase.retryKey, new Map([
+        [retryEnvelope, existingScore],
+        [neighboringEnvelope, neighboringScore],
+      ]))
+      const [client] = redisHarness.instances.slice(-1)
+
+      await expect(queue.retry(claimed.raw, claimed.job, 60_000))
+        .rejects.toThrow('Queue transition stale_not_owner')
+      expect(await client.call.mock.results.at(-1)?.value).toEqual([0, ''])
+      expect(redisHarness.lists.get(queueCase.processingKey)).toEqual([claimed.raw])
+      expect(redisHarness.hashes.get(queueCase.claimsKey)?.get(claimed.occurrenceId))
+        .toBe(marker)
+      expect(redisHarness.zsets.get(queueCase.retryKey)).toEqual(new Map([
+        [retryEnvelope, existingScore],
+        [neighboringEnvelope, neighboringScore],
+      ]))
+
+      redisHarness.zsets.get(queueCase.retryKey)?.delete(retryEnvelope)
+      const applied = await queue.retry(claimed.raw, claimed.job, 60_000)
+      const appliedScore = redisHarness.zsets.get(queueCase.retryKey)?.get(retryEnvelope)
+      expect(applied).toEqual({
+        nextRetryAt: new Date(redisHarness.nowMs + 60_000),
+        outcome: 'applied',
+      })
+      expect(appliedScore).toBe(redisHarness.nowMs + 60_000)
+      expect(redisHarness.zsets.get(queueCase.retryKey)?.get(neighboringEnvelope))
+        .toBe(neighboringScore)
+    }
+  })
+
   it('rejects non-canonical identifiers and extra fields before claim storage', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const invalidPayloads = [
@@ -826,13 +1085,13 @@ describe('core operational output closure', () => {
       redisHarness.claimPayloads.push(retryRaw)
       const retryClaim = await queue.claim(1)
       if (!retryClaim) throw new Error('Expected a retry fixture claim.')
-      redisHarness.failures.push({ marker: 'forge:queue:retry-v2', stage: 'before' })
+      redisHarness.failures.push({ marker: 'forge:queue:retry-v3', stage: 'before' })
       await expect(queue.retry(retryClaim.raw, retryClaim.job, 0))
         .rejects.toThrow('Queue transition failed')
       expect(redisHarness.lists.get(queueCase.processing)).toContain(retryClaim.raw)
       expect(redisHarness.zsets.get(queueCase.retry)?.size ?? 0).toBe(0)
 
-      redisHarness.failures.push({ marker: 'forge:queue:retry-v2', stage: 'after' })
+      redisHarness.failures.push({ marker: 'forge:queue:retry-v3', stage: 'after' })
       await expect(queue.retry(retryClaim.raw, retryClaim.job, 0))
         .rejects.toThrow('Queue transition failed')
       const retryState = new Map(redisHarness.zsets.get(queueCase.retry))
@@ -1467,6 +1726,204 @@ describe('core operational output closure', () => {
     }
   })
 
+  it('persists only the queue-authoritative retry deadline after worker failure', async () => {
+    const workerEnvNames = [
+      'FORGE_WORKER_MAX_ATTEMPTS',
+      'FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS',
+      'FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS',
+      'FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS',
+    ] as const
+    const workerEnv = Object.fromEntries(workerEnvNames.map((name) => [name, process.env[name]]))
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.spyOn(console, 'info').mockImplementation(() => {})
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_120_000)
+    const queueDeadlines = {
+      answers: new Date(1_800_000_060_122),
+      approvals: new Date(1_800_000_060_121),
+      tasks: new Date(1_800_000_060_123),
+    }
+    const approvalRetry = vi.fn().mockResolvedValue({
+      nextRetryAt: queueDeadlines.approvals,
+      outcome: 'applied',
+    })
+    const answersRetry = vi.fn().mockResolvedValue({
+      nextRetryAt: queueDeadlines.answers,
+      outcome: 'applied',
+    })
+    const taskRetry = vi.fn()
+      .mockResolvedValueOnce({ nextRetryAt: queueDeadlines.tasks, outcome: 'applied' })
+      .mockRejectedValueOnce(new Error('redis_retry_unavailable'))
+    const finishTaskAttempt = vi.fn().mockResolvedValue(undefined)
+    const attemptCounts = { answers: 0, approvals: 0, tasks: 0 }
+    const startTaskAttempt = vi.fn(async (input: {
+      queueName: keyof typeof attemptCounts
+    }) => {
+      attemptCounts[input.queueName] += 1
+      return `${input.queueName}-retry-clock-${attemptCounts[input.queueName]}`
+    })
+    let approvalClaimCount = 0
+    let answersClaimCount = 0
+    let taskClaimCount = 0
+
+    class PassiveQueue {
+      ack = vi.fn().mockResolvedValue('applied')
+      claim = vi.fn().mockResolvedValue(null)
+      deadLetter = vi.fn().mockResolvedValue('applied')
+      disconnect = vi.fn()
+      promoteDueRetries = vi.fn().mockResolvedValue(0)
+      recoverStuckJobs = vi.fn().mockResolvedValue(0)
+      release = vi.fn().mockResolvedValue('applied')
+      retry = vi.fn()
+    }
+
+    class RuntimeApprovalQueue extends PassiveQueue {
+      override retry = approvalRetry
+      override claim = vi.fn(async () => {
+        approvalClaimCount += 1
+        if (approvalClaimCount > 1) return null
+        const job = { taskId: TASK_ID, action: 'approve' as const, attempt: 1 }
+        return { job, raw: JSON.stringify(job) }
+      })
+    }
+
+    class RuntimeAnswersQueue extends PassiveQueue {
+      override retry = answersRetry
+      override claim = vi.fn(async () => {
+        answersClaimCount += 1
+        if (answersClaimCount > 1) return null
+        const job = { taskId: TASK_ID, attempt: 1 }
+        return { job, raw: JSON.stringify(job) }
+      })
+    }
+
+    class RuntimeTaskQueue extends PassiveQueue {
+      override retry = taskRetry
+      override claim = vi.fn(async () => {
+        taskClaimCount += 1
+        if (taskClaimCount <= 2) {
+          const job = { taskId: TASK_ID, attempt: 1 }
+          return { job, raw: JSON.stringify(job) }
+        }
+        return await new Promise<null>((resolve) => {
+          setTimeout(() => resolve(null), 10)
+        })
+      })
+    }
+
+    const query = (rows: unknown[]) => {
+      const chain: Record<string, unknown> = {
+        then: (resolve: (value: unknown[]) => unknown, reject?: (reason: unknown) => unknown) =>
+          Promise.resolve(rows).then(resolve, reject),
+      }
+      for (const method of ['from', 'innerJoin', 'where', 'limit']) chain[method] = () => chain
+      return chain
+    }
+
+    vi.resetModules()
+    delete (globalThis as typeof globalThis & { forgeWorkerRuntime?: unknown }).forgeWorkerRuntime
+    vi.doMock('@/worker/queue', () => ({
+      AnswersQueue: RuntimeAnswersQueue,
+      ApprovalQueue: RuntimeApprovalQueue,
+      TaskQueue: RuntimeTaskQueue,
+    }))
+    vi.doMock('@/worker/orchestrator', () => ({
+      processAnsweredQuestions: vi.fn().mockRejectedValue(new Error('business_failure')),
+      processApproval: vi.fn().mockRejectedValue(new Error('business_failure')),
+      processTask: vi.fn().mockRejectedValue(new Error('business_failure')),
+    }))
+    vi.doMock('@/worker/task-attempts', () => ({ finishTaskAttempt, startTaskAttempt }))
+    vi.doMock('@/db', () => ({
+      db: { select: vi.fn(() => query([{ id: TASK_ID }])) },
+    }))
+    vi.doMock('@/db/schema', () => ({
+      tasks: { id: 'tasks.id', status: 'tasks.status' },
+      workPackages: {
+        metadata: 'work_packages.metadata',
+        status: 'work_packages.status',
+        taskId: 'work_packages.task_id',
+      },
+    }))
+    vi.doMock('drizzle-orm', () => ({ and: vi.fn(), eq: vi.fn() }))
+    vi.doMock('@/worker/blocked-handoff-retry', () => ({
+      enqueueDueBlockedHandoffRetries: vi.fn().mockResolvedValue(0),
+    }))
+    vi.doMock('@/lib/mcps/filesystem-grant-reconciliation', () => ({
+      convergeRecognizedOperatorHolds: vi.fn().mockResolvedValue(0),
+    }))
+    vi.doMock('@/worker/work-package-handoff', () => ({
+      reconcilePendingS4CompletionHandoffs: vi.fn().mockResolvedValue(0),
+    }))
+    vi.doMock('@/lib/session', () => ({
+      reconcilePendingSessionCacheInvalidations: vi.fn().mockResolvedValue({
+        claimed: 0,
+        completed: 0,
+        deferred: 0,
+        stale: 0,
+      }),
+    }))
+
+    process.env.FORGE_WORKER_MAX_ATTEMPTS = '3'
+    process.env.FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS = '0'
+    process.env.FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS = '0'
+    process.env.FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS = '0'
+
+    try {
+      const { startWorker } = await import('@/worker/runtime')
+      const handle = await startWorker('standalone')
+      await vi.waitFor(() => {
+        expect(finishTaskAttempt).toHaveBeenCalledTimes(4)
+      })
+      await handle.stop()
+
+      expect(approvalRetry).toHaveBeenCalledOnce()
+      expect(answersRetry).toHaveBeenCalledOnce()
+      expect(taskRetry).toHaveBeenCalledTimes(2)
+      expect(finishTaskAttempt.mock.calls).toEqual([
+        [{
+          attemptId: 'approvals-retry-clock-1',
+          errorMessage: 'business_failure',
+          nextRetryAt: queueDeadlines.approvals,
+          status: 'failed',
+        }],
+        [{
+          attemptId: 'answers-retry-clock-1',
+          errorMessage: 'business_failure',
+          nextRetryAt: queueDeadlines.answers,
+          status: 'failed',
+        }],
+        [{
+          attemptId: 'tasks-retry-clock-1',
+          errorMessage: 'business_failure',
+          nextRetryAt: queueDeadlines.tasks,
+          status: 'failed',
+        }],
+        [{
+          attemptId: 'tasks-retry-clock-2',
+          errorMessage: 'business_failure',
+          nextRetryAt: null,
+          status: 'failed',
+        }],
+      ])
+      expect(finishTaskAttempt.mock.calls.slice(0, 3).map((call) =>
+        (call[0] as { nextRetryAt: Date }).nextRetryAt.getTime())).toEqual([
+        queueDeadlines.approvals.getTime(),
+        queueDeadlines.answers.getTime(),
+        queueDeadlines.tasks.getTime(),
+      ])
+      expect(consoleError).toHaveBeenCalledWith(
+        '[worker] Queue infrastructure failure',
+        expect.objectContaining({ phase: 'retry', queueName: 'task', taskId: TASK_ID }),
+      )
+    } finally {
+      for (const name of workerEnvNames) {
+        const value = workerEnv[name]
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+    }
+  })
+
   it('retains authoritative attempt diagnostics while projecting worker failure output', async () => {
     const workerEnvNames = [
       'FORGE_WORKER_MAX_ATTEMPTS',
@@ -1950,6 +2407,15 @@ describe('core output source sentinel', () => {
   it('keeps queue failures projected while retaining internal attempt diagnostics', () => {
     const queueSource = fs.readFileSync(path.join(repoRoot, 'worker/queue.ts'), 'utf8')
     const runtimeSource = fs.readFileSync(path.join(repoRoot, 'worker/runtime.ts'), 'utf8')
+    const retryScript = queueSource.match(
+      /const RETRY_JOB_SCRIPT = `([\s\S]*?)`\n\nconst DEAD_LETTER_JOB_SCRIPT/,
+    )?.[1] ?? ''
+    const dueScanScript = queueSource.match(
+      /const LIST_DUE_RETRIES_SCRIPT = `([\s\S]*?)`\n\nconst PROMOTE_RETRY_SCRIPT/,
+    )?.[1] ?? ''
+    const retryMethod = queueSource.match(
+      /  async retry\([\s\S]*?\n  async deadLetter\(/,
+    )?.[0] ?? ''
 
     expect(queueSource).toContain("failureCategory: DEAD_LETTER_FAILURE_CATEGORY")
     expect(queueSource).toContain('schemaVersion: QUEUE_ENVELOPE_SCHEMA_VERSION')
@@ -1965,6 +2431,38 @@ describe('core output source sentinel', () => {
     expect(queueSource).toContain('const TRANSITION_RECEIPT_PRUNE_LIMIT = 100')
     expect(queueSource).toContain('-- forge:queue:list-due-retries-v1')
     expect(queueSource).toContain("'WITHSCORES'")
+    expect(dueScanScript).toContain("local now = redis.call('TIME')")
+    expect(dueScanScript).toContain('now_ms')
+    expect(dueScanScript).not.toContain('Date.now')
+    expect(retryScript).toContain('-- forge:queue:retry-v3')
+    expect(retryScript).toContain('local delay_ms = tonumber(delay_ms_raw)')
+    expect(retryScript).toContain('local now_ms = redis_now_ms()')
+    expect(retryScript).toContain(
+      "redis.call('ZADD', KEYS[3], now_ms + delay_ms, ARGV[5])",
+    )
+    expect(retryScript).toContain(
+      "return {1, redis.call('ZSCORE', KEYS[3], ARGV[5])}",
+    )
+    expect(retryScript).toMatch(
+      /local existing_score = redis\.call\('ZSCORE', KEYS\[3\], ARGV\[5\]\)[\s\S]{0,120}return \{2, existing_score\}/,
+    )
+    expect(retryScript).toContain(
+      "if not current_marker and not redis.call('LPOS', KEYS[1], ARGV[1]) then",
+    )
+    expect(retryScript).toMatch(
+      /if current_marker ~= ARGV\[3\] then[\s\S]*?redis\.call\('ZSCORE', KEYS\[3\], ARGV\[5\]\)[\s\S]*?redis\.call\('LREM', KEYS\[1\], 1, ARGV\[1\]\)/,
+    )
+    expect(retryScript.indexOf("redis.call('ZSCORE', KEYS[3], ARGV[5])"))
+      .toBeLessThan(retryScript.indexOf("redis.call('LREM', KEYS[1], 1, ARGV[1])"))
+    expect(retryScript).toContain("return {0, ''}")
+    expect(retryMethod).toContain('String(intent.delayMs)')
+    expect(retryMethod).not.toContain('Date.now')
+    expect(queueSource).toMatch(
+      /export type QueueRetryResult = \{[\s\S]{0,120}nextRetryAt: Date[\s\S]{0,40}\}/,
+    )
+    expect(queueSource).toMatch(
+      /private decodeRetryTransition[\s\S]{0,1300}const nextRetryAt = new Date\(score\)[\s\S]{0,300}return \{ outcome, nextRetryAt \}/,
+    )
     expect(queueSource).toContain('-- forge:queue:promote-retry-v4')
     expect(queueSource).toContain('const PROMOTION_DISPOSITION_TTL_MS = 15 * 60 * 1000')
     expect(queueSource).toContain('const PROMOTION_DISPOSITION_CAP = 50_000')
@@ -2024,6 +2522,15 @@ describe('core output source sentinel', () => {
     expect(queueSource).not.toMatch(/this\.client\.lpush\(this\.deadQueueKey,[\s\S]{0,300}\berrorMessage\b/)
     expect(runtimeSource).toContain('errorMessage: message')
     expect(runtimeSource).toContain('const message = retainedErrorMessage(err)')
+    expect(runtimeSource).toMatch(
+      /retryResult = await queue\.retry\([\s\S]{0,650}nextRetryAt: retryResult\.nextRetryAt/,
+    )
+    expect(runtimeSource).toMatch(
+      /logQueueInfrastructureFailure\('retry'[\s\S]{0,500}nextRetryAt: null/,
+    )
+    expect(runtimeSource).not.toMatch(
+      /nextRetryAt\s*=\s*[\s\S]{0,80}Date\.now\(\)/,
+    )
     expect(runtimeSource).toContain('await queue.deadLetter(raw, job)')
     expect(runtimeSource).toContain('await recoverQueueWork({ drain: true })')
     expect(runtimeSource).toContain('queueRecoveryTimer = setInterval(')
