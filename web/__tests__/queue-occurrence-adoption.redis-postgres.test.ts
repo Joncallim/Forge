@@ -681,6 +681,14 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
   it('lets only the recovered production approval runtime complete running work', async () => {
     configureRuntimeEnvironment()
     const taskId = await insertTask('running')
+    await sql`
+      INSERT INTO work_packages (id, task_id, assigned_role, title, summary, sequence, status, review_requirement)
+      VALUES (
+        ${randomUUID()}::uuid, ${taskId}::uuid, 'backend',
+        'Recovered approval package', 'A completed package for continuation recovery.',
+        1, 'completed', 'none'
+      )
+    `
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const streamText = vi.fn(() => {
       throw new Error('Approval adoption proof must not launch an Architect provider.')
