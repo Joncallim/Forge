@@ -42,6 +42,8 @@ const publisherRules = [
   '~forge:task-events:v2:*:history', '~forge:task-events:v2:*:seq', '&forge:task-events:v2:*:live',
   '+select', '+ping', '+info', '+client|setinfo', '+eval', '+incr', '+zadd', '+zcard', '+zremrangebyrank', '+publish',
 ] as const
+const aclGetUserFields = ['flags', 'passwords', 'commands', 'keys', 'channels', 'selectors'] as const
+const safeAclFlags = ['on', 'sanitize-payload'] as const
 const subscriberRules = [
   '~forge:task-events:v2:*:history', '~forge:task-events:v2:*:seq', '&forge:task-events:v2:*:live',
   '+select', '+ping', '+info', '+client|setinfo', '+get', '+zrangebyscore', '+subscribe', '+unsubscribe', '+psubscribe', '+punsubscribe',
@@ -119,7 +121,24 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
       if (typeof value[index] !== 'string') throw new Error('S4 Redis ACL proof could not verify the configured ACL identity.')
       fields.set(value[index], value[index + 1])
     }
+    if (fields.size !== aclGetUserFields.length || !aclGetUserFields.every((field) => fields.has(field))) {
+      throw new Error('S4 Redis ACL proof received an unexpected ACL identity field.')
+    }
     return fields
+  }
+
+  function sameTokenSet(actual: readonly string[], expected: readonly string[]): boolean {
+    const actualSet = new Set(actual)
+    const expectedSet = new Set(expected)
+    return actual.length === actualSet.size && expected.length === expectedSet.size && actualSet.size === expectedSet.size && [...actualSet].every((token) => expectedSet.has(token))
+  }
+
+  function isEmptySelectorList(value: unknown): boolean {
+    return Array.isArray(value) && value.length === 0
+  }
+
+  function hasOneOpaquePassword(value: unknown): boolean {
+    return Array.isArray(value) && value.length === 1
   }
 
   async function assertAclIdentity(user: string, expected: Readonly<{ keys: readonly string[]; channels: readonly string[]; commands: readonly string[] }>): Promise<void> {
@@ -130,8 +149,8 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
     const keys = aclTokens(fields.get('keys'))
     const channels = aclTokens(fields.get('channels'))
     const commands = aclTokens(fields.get('commands'))
-    if (!flags.includes('on') || !expected.keys.every((rule) => keys.includes(rule)) || !expected.channels.every((rule) => channels.includes(rule)) || !expected.commands.every((rule) => commands.includes(rule))) {
-      throw new Error('S4 Redis ACL proof found an inconsistent configured ACL identity.')
+    if (!sameTokenSet(flags, safeAclFlags) || !sameTokenSet(keys, expected.keys) || !sameTokenSet(channels, expected.channels) || !sameTokenSet(commands, ['-@all', ...expected.commands]) || !isEmptySelectorList(fields.get('selectors')) || !hasOneOpaquePassword(fields.get('passwords'))) {
+      throw new Error('S4 Redis ACL proof found an inconsistent closed-world ACL identity.')
     }
   }
 
