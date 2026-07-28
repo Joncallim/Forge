@@ -2178,7 +2178,7 @@ describe('core operational output closure', () => {
           renewalsInFlight += 1
           maxRenewalsInFlight = Math.max(maxRenewalsInFlight, renewalsInFlight)
           try {
-            if (position === 'approval' && renewalCalls === 2) return 'stale_not_owner'
+            if (position === 'approval' && renewalCalls === 2) throw hostileError()
             if (renewalCalls === (position === 'approval' ? 3 : 2)) {
               return await periodicRenewal
             }
@@ -2329,15 +2329,18 @@ describe('core operational output closure', () => {
         const targetRenewal = vi.fn()
           .mockRejectedValueOnce(hostileError())
           .mockResolvedValue('renewed')
+        const targetAck = vi.fn()
+        const targetDeadLetter = vi.fn()
+        const targetRetry = vi.fn()
         const queueClass = (kind: typeof position) => class {
-          ack = vi.fn()
+          ack = kind === position ? targetAck : vi.fn()
           claim = vi.fn(async () => {
             if (kind !== position) return null
             claimCount += 1
             if (claimCount === 1) return { job: targetJob, raw: targetRaw }
             return await new Promise<null>((resolve) => setTimeout(() => resolve(null), 10))
           })
-          deadLetter = vi.fn()
+          deadLetter = kind === position ? targetDeadLetter : vi.fn()
           disconnect = vi.fn()
           promoteDueRetries = vi.fn().mockResolvedValue(0)
           recoverStuckJobs = vi.fn().mockResolvedValue(0)
@@ -2345,7 +2348,7 @@ describe('core operational output closure', () => {
           renewClaim = kind === position
             ? targetRenewal
             : vi.fn().mockResolvedValue('renewed')
-          retry = vi.fn()
+          retry = kind === position ? targetRetry : vi.fn()
         }
         vi.doMock('@/worker/queue', () => ({
           AnswersQueue: queueClass('answers'),
@@ -2418,6 +2421,9 @@ describe('core operational output closure', () => {
         expect(processApproval).not.toHaveBeenCalled()
         expect(processAnsweredQuestions).not.toHaveBeenCalled()
         expect(processTask).not.toHaveBeenCalled()
+        expect(targetAck).not.toHaveBeenCalled()
+        expect(targetRetry).not.toHaveBeenCalled()
+        expect(targetDeadLetter).not.toHaveBeenCalled()
         assertNoSentinels(consoleError.mock.calls)
         await handle.stop()
       }
@@ -3413,7 +3419,7 @@ describe('core output source sentinel', () => {
     expect(runtimeSource).toMatch(
       /finally \{\s+await stopClaimRenewal\(\)\s+\}/,
     )
-    expect(runtimeSource.match(/await stopClaimRenewal\(\)[\s\S]{0,100}queue\.(?:ack|retry|deadLetter)/g))
+    expect(runtimeSource.match(/await stopClaimRenewal\(\)[\s\S]{0,180}queue\.(?:ack|retry|deadLetter)/g))
       .toHaveLength(4)
     expect(queueSource).not.toMatch(
       /promoteDueRetries[\s\S]{0,300}this\.client\.zrangebyscore/,

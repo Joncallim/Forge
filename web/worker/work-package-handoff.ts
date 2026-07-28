@@ -99,6 +99,10 @@ import {
   type WorkPackageLifecycleClaim,
 } from '../lib/mcps/s4-lease'
 import type { PacketTerminalOutcome } from '../lib/mcps/packet-issuance-v2'
+import {
+  isClaimLeaseLostError,
+  type ClaimLeaseFence,
+} from './claim-lease-fence'
 
 type HandoffPackage = {
   id: string
@@ -159,10 +163,22 @@ type HandoffOptions = {
   /** Integration seam for a policy writer that acquires its project lock immediately before claim persistence. */
   beforeWorkPackageClaimPersisted?: (input: { attempt: number; packageId: string; projectId: string }) => Promise<void>
   claimEnabled?: boolean
+  claimLeaseFence?: ClaimLeaseFence
   finalAttempt?: boolean
   freshnessAttempt?: number
   priorBlockedContext?: { packageId: string; reason: string | null }
   staleRecoveryAttempted?: boolean
+}
+
+function assertQueueClaimOwned(options: HandoffOptions): void {
+  options.claimLeaseFence?.assertOwned()
+}
+
+function rethrowQueueClaimLoss(error: unknown, options: HandoffOptions): void {
+  if (options.claimLeaseFence?.lost || isClaimLeaseLostError(error)) {
+    options.claimLeaseFence?.throwIfLost()
+    throw error
+  }
 }
 
 type McpProjectFreshnessSnapshot = {
@@ -1876,15 +1892,19 @@ async function admitWorkPackageForHandoff(
   candidate: HandoffPackage,
   options: HandoffOptions,
 ): Promise<HandoffAdmissionResult> {
+  assertQueueClaimOwned(options)
   const health = await captureMcpHealth(taskId)
+  assertQueueClaimOwned(options)
   if (!health) return { pkg: candidate, status: 'conflict' }
   await options.afterMcpHealthCaptured?.({
     attempt: (options.freshnessAttempt ?? 0) + 1,
     packageId: candidate.id,
     projectId: health.project.id,
   })
+  assertQueueClaimOwned(options)
 
   const fresh = await rereadMcpHandoffInputs(taskId, candidate.id)
+  assertQueueClaimOwned(options)
   if (!fresh || !mcpProjectSnapshotsMatch(health.project, fresh.project)) {
     return { pkg: fresh?.pkg ?? candidate, status: 'conflict' }
   }
@@ -1902,6 +1922,7 @@ async function admitWorkPackageForHandoff(
     packageId: candidate.id,
     status: 'status' in decision ? 'allowed' : 'blocked',
   })
+  assertQueueClaimOwned(options)
   if ('status' in decision) {
     return { pkg: fresh.pkg, project: fresh.project, status: 'allowed' }
   }
@@ -1917,15 +1938,20 @@ export async function progressWorkforce(
   taskId: string,
   options: HandoffOptions = {},
 ): Promise<WorkPackageHandoffResult> {
+  assertQueueClaimOwned(options)
   const result = await handoffApprovedWorkPackages(taskId, options)
+  assertQueueClaimOwned(options)
   if (result.status === 'blocked' && result.terminalBlock) {
     const reason = result.blockedReason ?? 'Work package failed a terminal handoff safety check.'
+    assertQueueClaimOwned(options)
     const failedRunning = await updateTaskStatusIfCurrent(taskId, 'running', 'failed', reason)
     if (!failedRunning) {
+      assertQueueClaimOwned(options)
       await updateTaskStatusIfCurrent(taskId, 'approved', 'failed', reason)
     }
   }
   if (result.status === 'no_ready_packages' || result.status === 'no_work_packages') {
+    assertQueueClaimOwned(options)
     await completeTaskIfReviewGatesSatisfied(taskId)
   }
   return result
@@ -1977,7 +2003,9 @@ export async function handoffApprovedWorkPackages(
   taskId: string,
   options: HandoffOptions = {},
 ): Promise<WorkPackageHandoffResult> {
+  assertQueueClaimOwned(options)
   const state = await loadHandoffState(taskId)
+  assertQueueClaimOwned(options)
   const retainPromotedPackageContext = state.nextPackage?.status === 'ready' &&
     state.nextPackage.blockedReason === null &&
     options.priorBlockedContext?.packageId === state.nextPackage.id
@@ -1990,7 +2018,9 @@ export async function handoffApprovedWorkPackages(
       : options.priorBlockedContext,
   }
   if (state.alreadyRunningPackage && !options.staleRecoveryAttempted) {
+    assertQueueClaimOwned(options)
     const recovered = await recoverStaleRunningPackage(taskId, state.alreadyRunningPackage)
+    assertQueueClaimOwned(options)
     if (recovered) {
       return handoffApprovedWorkPackages(taskId, {
         ...options,
@@ -2020,6 +2050,7 @@ export async function handoffApprovedWorkPackages(
         continue
       }
       const admission = await admitWorkPackageForHandoff(taskId, readyPackage, options)
+      assertQueueClaimOwned(options)
       if (admission.status === 'conflict') {
         return retryAfterHandoffFreshnessConflict(taskId, admission.pkg, options)
       }
@@ -2038,6 +2069,7 @@ export async function handoffApprovedWorkPackages(
         project: admission.project,
         taskId,
       })
+      assertQueueClaimOwned(options)
       if (!promoted) {
         return retryAfterHandoffFreshnessConflict(taskId, admission.pkg, options)
       }
@@ -2045,6 +2077,7 @@ export async function handoffApprovedWorkPackages(
       allowedReadyPackageIds.push(admission.pkg.id)
     }
 
+    assertQueueClaimOwned(options)
     await promoteReadyPackages(
       taskId,
       allowedReadyPackageIds.filter((id) =>
@@ -2081,6 +2114,7 @@ export async function handoffApprovedWorkPackages(
   let projectSnapshot: McpProjectFreshnessSnapshot | undefined
   if (hasWorkPackageMcpRuntimeInputs(nextPackage) || architectReservedHandoffBlockedReason(nextPackage)) {
     const admission = await admitWorkPackageForHandoff(taskId, nextPackage, options)
+    assertQueueClaimOwned(options)
     if (admission.status === 'conflict') {
       return retryAfterHandoffFreshnessConflict(taskId, admission.pkg, options)
     }
@@ -2101,13 +2135,16 @@ export async function handoffApprovedWorkPackages(
       project: admission.project,
       taskId,
     })
+    assertQueueClaimOwned(options)
     if (!freshPackage) {
       return retryAfterHandoffFreshnessConflict(taskId, nextPackage, options)
     }
     nextPackage = freshPackage
   } else {
     const newlyPromotedPackageIds = allowedReadyPackageIds.filter((id) => newlyReadyPackageIds.has(id))
+    assertQueueClaimOwned(options)
     await promoteReadyPackages(taskId, newlyPromotedPackageIds, now)
+    assertQueueClaimOwned(options)
     if (newlyPromotedPackageIds.includes(nextPackage.id)) {
       nextPackage = {
         ...nextPackage,
@@ -2124,6 +2161,7 @@ export async function handoffApprovedWorkPackages(
       afterWorkPackageClaimRowsLocked: options.afterWorkPackageClaimRowsLocked,
       beforeWorkPackageClaimPersisted: options.beforeWorkPackageClaimPersisted,
       claimEnabled,
+      claimLeaseFence: options.claimLeaseFence,
       finalAttempt: options.finalAttempt,
       freshnessAttempt: options.freshnessAttempt,
       priorBlockedContext: options.priorBlockedContext,
@@ -2146,6 +2184,7 @@ export async function handoffApprovedWorkPackages(
     workPackageId: nextPackage.id,
   }
   if (projectSnapshot) {
+    assertQueueClaimOwned(options)
     await options.beforeWorkPackageClaimPersisted?.({
       attempt: (options.freshnessAttempt ?? 0) + 1,
       packageId: nextPackage.id,
@@ -2153,17 +2192,20 @@ export async function handoffApprovedWorkPackages(
     })
   }
   const legacyHandoff = () => db.transaction(async (tx) => {
+    assertQueueClaimOwned(options)
     if (!await lockFreshMcpHandoffInputs(
       tx,
       taskId,
       nextPackage,
       projectSnapshot,
     )) return null
+    assertQueueClaimOwned(options)
     const [claimBackend] = await tx.execute(sql<{ pid: number }>`select pg_backend_pid()::integer as pid`)
     await options.afterWorkPackageClaimRowsLocked?.({
       backendPid: Number((claimBackend as { pid: number }).pid),
       packageId: nextPackage.id,
     })
+    assertQueueClaimOwned(options)
 
     const [claimed] = await tx
       .update(workPackages)
@@ -2182,6 +2224,7 @@ export async function handoffApprovedWorkPackages(
 
     if (!claimed) return null
 
+    assertQueueClaimOwned(options)
     const [run] = await tx
       .insert(agentRuns)
       .values({
@@ -2197,6 +2240,7 @@ export async function handoffApprovedWorkPackages(
       })
       .returning()
 
+    assertQueueClaimOwned(options)
     await tx
       .update(workPackages)
       .set({
@@ -2214,11 +2258,14 @@ export async function handoffApprovedWorkPackages(
   })
 
   let handoff: Awaited<ReturnType<typeof legacyHandoff>>
-  if (await readS4RuntimeModeV1() === 'protected') {
+  const runtimeMode = await readS4RuntimeModeV1()
+  assertQueueClaimOwned(options)
+  if (runtimeMode === 'protected') {
     if (!nextPackage.updatedAt) {
       throw new Error('Protected root-free handoff requires the package freshness timestamp.')
     }
     try {
+      assertQueueClaimOwned(options)
       const protectedClaim = await claimWorkPackageLifecycleV2({
         mode: 'root_free_handoff',
         taskId,
@@ -2235,8 +2282,10 @@ export async function handoffApprovedWorkPackages(
         stage: 'handoff',
         executionStaleSeconds: staleRunningPackageSeconds(),
       })
+      assertQueueClaimOwned(options)
       handoff = { run: { id: protectedClaim.agentRunId } as typeof agentRuns.$inferSelect }
     } catch (error) {
+      rethrowQueueClaimLoss(error, options)
       if (error instanceof S4LifecycleError && error.code === 'conflict') {
         return retryAfterHandoffFreshnessConflict(taskId, nextPackage, options)
       }
@@ -2244,12 +2293,14 @@ export async function handoffApprovedWorkPackages(
     }
   } else {
     handoff = await legacyHandoff()
+    assertQueueClaimOwned(options)
   }
 
   if (!handoff) {
     return retryAfterHandoffFreshnessConflict(taskId, nextPackage, options)
   }
 
+  assertQueueClaimOwned(options)
   await publishTaskEvent(taskId, 'run:started', {
     attemptNumber: 1,
     agentType: 'handoff',
@@ -2257,6 +2308,7 @@ export async function handoffApprovedWorkPackages(
     stage: 'handoff',
     workPackageId: nextPackage.id,
   })
+  assertQueueClaimOwned(options)
   await recordTaskLogBestEffort({
     agentRunId: handoff.run.id,
     eventType: 'run.started',
@@ -2272,6 +2324,7 @@ export async function handoffApprovedWorkPackages(
     title: 'Handoff run started',
     workPackageId: nextPackage.id,
   })
+  assertQueueClaimOwned(options)
   const reviewGates = await materializeReviewGatesForWorkPackageCompletion({
     completeSourceRun: {
       artifactType: 'log_output',
@@ -2285,6 +2338,7 @@ export async function handoffApprovedWorkPackages(
     taskId,
     workPackageId: nextPackage.id,
   })
+  assertQueueClaimOwned(options)
   if (reviewGates.status === 'not_owned') {
     return abandonLostExecutionLease({
       attemptNumber: 1,
@@ -2297,6 +2351,7 @@ export async function handoffApprovedWorkPackages(
   const handoffArtifact = reviewGates.sourceArtifact
   if (!handoffArtifact) throw new Error('No-op handoff completion did not create a source artifact.')
   const packageStatus = reviewGates.packageStatus
+  assertQueueClaimOwned(options)
   await publishTaskEvent(taskId, 'artifact:created', {
     id: handoffArtifact.id,
     artifactId: handoffArtifact.id,
@@ -2307,6 +2362,7 @@ export async function handoffApprovedWorkPackages(
     createdAt: handoffArtifact.createdAt,
     workPackageId: nextPackage.id,
   })
+  assertQueueClaimOwned(options)
   await publishTaskEvent(taskId, 'run:completed', {
     attemptNumber: 1,
     runId: handoff.run.id,
@@ -2314,6 +2370,7 @@ export async function handoffApprovedWorkPackages(
     status: 'completed',
     workPackageId: nextPackage.id,
   })
+  assertQueueClaimOwned(options)
   await recordTaskLogBestEffort({
     agentRunId: handoff.run.id,
     eventType: 'run.completed',
@@ -2330,6 +2387,7 @@ export async function handoffApprovedWorkPackages(
     workPackageId: nextPackage.id,
   })
 
+  assertQueueClaimOwned(options)
   await publishTaskEvent(taskId, 'work_package:handoff', {
     assignedRole: nextPackage.assignedRole,
     hostRepositoryWrites: false,
@@ -2346,6 +2404,7 @@ export async function handoffApprovedWorkPackages(
 
   const continuation = await continueWorkforceAfterPackageCompletion(taskId, packageStatus, {
     claimEnabled,
+    claimLeaseFence: options.claimLeaseFence,
     finalAttempt: options.finalAttempt,
   })
   if (continuation) return continuation
@@ -2487,32 +2546,41 @@ async function executeReadyWorkPackage(
   options: HandoffOptions = {},
   projectSnapshot?: McpProjectFreshnessSnapshot,
 ): Promise<WorkPackageHandoffResult> {
+  assertQueueClaimOwned(options)
   const attemptNumber = await nextImplementationAttemptNumber(taskId, nextPackage.id)
+  assertQueueClaimOwned(options)
   const claimedAt = new Date()
   if (projectSnapshot) {
+    assertQueueClaimOwned(options)
     await options.beforeWorkPackageClaimPersisted?.({
       attempt: (options.freshnessAttempt ?? 0) + 1,
       packageId: nextPackage.id,
       projectId: projectSnapshot.id,
     })
+    assertQueueClaimOwned(options)
   }
   const s4RuntimeMode = await readS4RuntimeModeV1()
+  assertQueueClaimOwned(options)
   const protectedPreflight = s4RuntimeMode === 'protected'
     ? await loadWorkPackageExecutionPreflight(taskId, nextPackage.id)
     : null
+  assertQueueClaimOwned(options)
   let protectedLifecycle: WorkPackageS4Lifecycle | null = null
   const legacyClaim = () => db.transaction(async (tx) => {
+    assertQueueClaimOwned(options)
     if (!await lockFreshMcpHandoffInputs(
       tx,
       taskId,
       nextPackage,
       projectSnapshot,
     )) return { status: 'already_handed_off' as const }
+    assertQueueClaimOwned(options)
     const [claimBackend] = await tx.execute(sql<{ pid: number }>`select pg_backend_pid()::integer as pid`)
     await options.afterWorkPackageClaimRowsLocked?.({
       backendPid: Number((claimBackend as { pid: number }).pid),
       packageId: nextPackage.id,
     })
+    assertQueueClaimOwned(options)
 
     const [claimed] = await tx
       .update(workPackages)
@@ -2532,6 +2600,7 @@ async function executeReadyWorkPackage(
     if (!claimed) return { status: 'already_handed_off' as const }
 
     if (attemptNumber > MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS) {
+      assertQueueClaimOwned(options)
       const attemptLimit = attemptLimitFailureDetails({ attemptNumber, pkg: nextPackage })
       const [failedPackage] = await tx
         .update(workPackages)
@@ -2551,6 +2620,7 @@ async function executeReadyWorkPackage(
       }
     }
 
+    assertQueueClaimOwned(options)
     const [run] = await tx
       .insert(agentRuns)
       .values({
@@ -2566,6 +2636,7 @@ async function executeReadyWorkPackage(
       })
       .returning()
 
+    assertQueueClaimOwned(options)
     await tx
       .update(workPackages)
       .set({
@@ -2603,7 +2674,9 @@ async function executeReadyWorkPackage(
 
   let claim: Awaited<ReturnType<typeof legacyClaim>>
   if (protectedPreflight && attemptNumber > MAX_WORK_PACKAGE_EXECUTION_ATTEMPTS) {
+    assertQueueClaimOwned(options)
     const attemptLimitClaim = await protectedAttemptLimit()
+    assertQueueClaimOwned(options)
     if (!attemptLimitClaim) {
       return retryAfterHandoffFreshnessConflict(taskId, nextPackage, options)
     }
@@ -2620,6 +2693,7 @@ async function executeReadyWorkPackage(
       workPackage: protectedPreflight.workPackage,
     })
     try {
+      assertQueueClaimOwned(options)
       const protectedClaim = await claimWorkPackageLifecycleV2({
         ...claimMode,
         taskId,
@@ -2636,12 +2710,14 @@ async function executeReadyWorkPackage(
         stage: 'implementation',
         executionStaleSeconds: staleRunningPackageSeconds(),
       })
+      assertQueueClaimOwned(options)
       protectedLifecycle = lifecycleFromProtectedClaim(protectedClaim)
       claim = {
         run: { id: protectedClaim.agentRunId } as typeof agentRuns.$inferSelect,
         status: 'claimed',
       }
     } catch (error) {
+      rethrowQueueClaimLoss(error, options)
       if (error instanceof S4LifecycleError && error.code === 'conflict') {
         return retryAfterHandoffFreshnessConflict(taskId, nextPackage, options)
       }
@@ -2649,6 +2725,7 @@ async function executeReadyWorkPackage(
     }
   } else {
     claim = await legacyClaim()
+    assertQueueClaimOwned(options)
   }
 
   if (claim.status === 'already_handed_off') {
@@ -2656,6 +2733,7 @@ async function executeReadyWorkPackage(
   }
 
   if (claim.status === 'attempt_limit') {
+    assertQueueClaimOwned(options)
     if (claim.failedPackageId) {
       await publishTaskEvent(taskId, 'work_package:status', {
         blockedReason: claim.blockedReason,
@@ -2669,7 +2747,9 @@ async function executeReadyWorkPackage(
         workPackageId: nextPackage.id,
       })
     }
+    assertQueueClaimOwned(options)
     await updateTaskStatusIfCurrent(taskId, 'running', 'failed', claim.blockedReason)
+    assertQueueClaimOwned(options)
     await updateTaskStatusIfCurrent(taskId, 'approved', 'failed', claim.blockedReason)
     return {
       blockedReason: claim.blockedReason,
@@ -2703,6 +2783,7 @@ async function executeReadyWorkPackage(
   try {
   let context: Awaited<ReturnType<typeof loadWorkPackageExecutionContext>>
   try {
+    assertQueueClaimOwned(options)
     if (protectedPreflight) {
       await currentS4Heartbeat()?.assertOwned()
       const resolvedPreflight = await resolveProtectedArchitectPlanContext(protectedPreflight, {
@@ -2716,29 +2797,36 @@ async function executeReadyWorkPackage(
     } else {
       context = await loadWorkPackageExecutionContext(taskId, nextPackage.id)
     }
+    assertQueueClaimOwned(options)
     await options.afterWorkPackageClaimed?.({
       attempt: attemptNumber,
       packageId: nextPackage.id,
       runId: run.id,
     })
+    assertQueueClaimOwned(options)
     await publishTaskEventBestEffort(taskId, 'work_package:status', {
       status: 'running',
       updatedAt: new Date().toISOString(),
       workPackageId: nextPackage.id,
     })
   } catch (err) {
+    rethrowQueueClaimLoss(err, options)
     if (s4Lifecycle) {
+      assertQueueClaimOwned(options)
       await finalizeWorkPackageS4Failure({
         agentRunId: run.id,
         lifecycle: s4Lifecycle,
         packetFailure: { status: 'failed', failureCode: 'preflight_failed' },
       })
+      assertQueueClaimOwned(options)
       await currentS4Heartbeat()?.stop()
       heartbeat.stop()
       packageFailureHandled = true
       throw err
     }
-    if (!(await executionLeaseOwned(nextPackage.id, run.id))) {
+    const ownsExecutionLease = await executionLeaseOwned(nextPackage.id, run.id)
+    assertQueueClaimOwned(options)
+    if (!ownsExecutionLease) {
       heartbeat.stop()
       return abandonLostExecutionLease({
         attemptNumber,
@@ -2755,6 +2843,7 @@ async function executeReadyWorkPackage(
     const blockedReason = finalAttempt
       ? message
       : `Retrying package execution after error: ${message}`
+    assertQueueClaimOwned(options)
     const [failedPackage] = await db
       .update(workPackages)
       .set({
@@ -2772,6 +2861,7 @@ async function executeReadyWorkPackage(
         sql`${workPackages.metadata}->'executionLease'->>'runId' = ${run.id}`,
       ))
       .returning({ id: workPackages.id })
+    assertQueueClaimOwned(options)
     if (!failedPackage) {
       heartbeat.stop()
       return abandonLostExecutionLease({
@@ -2782,12 +2872,14 @@ async function executeReadyWorkPackage(
         workPackageId: nextPackage.id,
       })
     }
+    assertQueueClaimOwned(options)
     await publishTaskEventBestEffort(taskId, 'work_package:status', {
       blockedReason,
       status: packageStatus,
       updatedAt: failedAt.toISOString(),
       workPackageId: nextPackage.id,
     })
+    assertQueueClaimOwned(options)
     await db
       .update(agentRuns)
       .set({
@@ -2796,6 +2888,7 @@ async function executeReadyWorkPackage(
         status: 'failed',
       })
       .where(eq(agentRuns.id, run.id))
+    assertQueueClaimOwned(options)
     await publishTaskEventBestEffort(taskId, 'run:failed', {
       attemptNumber,
       errorMessage: message,
@@ -2809,15 +2902,18 @@ async function executeReadyWorkPackage(
   }
 
   try {
+    assertQueueClaimOwned(options)
     await db
       .update(agentRuns)
       .set({ modelIdUsed: context.modelIdUsed })
       .where(eq(agentRuns.id, run.id))
+    assertQueueClaimOwned(options)
   } catch (err) {
     heartbeat.stop()
     throw err
   }
 
+  assertQueueClaimOwned(options)
   await publishTaskEventBestEffort(taskId, 'run:started', {
     attemptNumber,
     agentType: nextPackage.assignedRole,
@@ -2825,6 +2921,7 @@ async function executeReadyWorkPackage(
     stage: 'implementation',
     workPackageId: nextPackage.id,
   })
+  assertQueueClaimOwned(options)
   await recordTaskLogBestEffort({
     agentRunId: run.id,
     eventType: 'run.started',
@@ -2851,6 +2948,7 @@ async function executeReadyWorkPackage(
   try {
     repositoryAffecting = isRepositoryAffectingWorkPackage(context.workPackage)
     if (repositoryAffecting) {
+      assertQueueClaimOwned(options)
       await currentS4Heartbeat()?.assertOwned()
       repositoryContext = await buildRepositoryExecutionContext({
         project: context.project,
@@ -2858,8 +2956,10 @@ async function executeReadyWorkPackage(
         validatedProjectRoot: context.validatedProjectRoot,
         workPackage: context.workPackage,
       })
+      assertQueueClaimOwned(options)
 
       await assertActiveExecutionLease()
+      assertQueueClaimOwned(options)
       await upsertRepositoryEvidenceRecord({
         agentRunId: run.id,
         context: repositoryContext,
@@ -2868,6 +2968,7 @@ async function executeReadyWorkPackage(
         workPackageId: nextPackage.id,
       })
 
+      assertQueueClaimOwned(options)
       await createPackageArtifact({
         agentRunId: run.id,
         artifactType: 'log_output',
@@ -2894,15 +2995,18 @@ async function executeReadyWorkPackage(
         ? options.priorBlockedContext.reason
         : nextPackage.blockedReason,
     })
+    assertQueueClaimOwned(options)
     const execution = await executeWorkPackage({
       ...context,
       agentRunId: run.id,
       attemptNumber,
       priorReviewContext,
     })
+    assertQueueClaimOwned(options)
     executionCompleted = true
     let diffSummary: string | null = null
 
+    assertQueueClaimOwned(options)
     await createPackageArtifact({
       agentRunId: run.id,
       artifactType: 'log_output',
@@ -2925,11 +3029,13 @@ async function executeReadyWorkPackage(
       execution.hostRepositoryWrites
     ) {
       await assertActiveExecutionLease()
+      assertQueueClaimOwned(options)
       const diffResult = await runScopedRepositoryCommand({
         cwd: repositoryContext.projectLocalPath,
         command: 'git',
         argv: ['diff', '--stat', 'HEAD', '--'],
       })
+      assertQueueClaimOwned(options)
       diffSummary = diffResult.outputSummary || 'No tracked-file diff detected.'
       const diffArtifact = await createPackageArtifact({
         agentRunId: run.id,
@@ -2947,6 +3053,7 @@ async function executeReadyWorkPackage(
         taskId,
         workPackageId: nextPackage.id,
       })
+      assertQueueClaimOwned(options)
       await recordScopedCommandAuditWithLease({
         result: diffResult,
         taskId,
@@ -2968,6 +3075,7 @@ async function executeReadyWorkPackage(
         : validationStatus === 'skipped'
           ? 'validation_skipped'
           : 'failed'
+      assertQueueClaimOwned(options)
       await createPackageArtifact({
         agentRunId: run.id,
         artifactType: 'test_report',
@@ -2982,6 +3090,7 @@ async function executeReadyWorkPackage(
         taskId,
         workPackageId: nextPackage.id,
       })
+      assertQueueClaimOwned(options)
       await createPackageArtifact({
         agentRunId: run.id,
         artifactType: 'log_output',
@@ -2997,6 +3106,7 @@ async function executeReadyWorkPackage(
         workPackageId: nextPackage.id,
       })
       validationStatusForPackage = validationStatus
+      assertQueueClaimOwned(options)
       await upsertRepositoryEvidenceRecord({
         agentRunId: run.id,
         context: { ...repositoryContext, status: repositoryEvidenceStatus },
@@ -3010,6 +3120,7 @@ async function executeReadyWorkPackage(
     }
 
     if (repositoryAffecting && validationStatusForPackage === 'skipped') {
+      assertQueueClaimOwned(options)
       await recordTaskLogBestEffort({
         agentRunId: run.id,
         eventType: 'validation.warning',
@@ -3024,6 +3135,7 @@ async function executeReadyWorkPackage(
     }
 
     await assertActiveExecutionLease()
+    assertQueueClaimOwned(options)
 
     const completedAt = new Date()
     const completionArtifact = {
@@ -3042,6 +3154,7 @@ async function executeReadyWorkPackage(
         s4Lifecycle,
         completionArtifact,
       )
+      assertQueueClaimOwned(options)
       s4SuccessTerminalized = true
       await currentS4Heartbeat()?.stop()
     }
@@ -3063,6 +3176,7 @@ async function executeReadyWorkPackage(
           taskId,
           workPackageId: nextPackage.id,
         })
+    assertQueueClaimOwned(options)
 
     if (reviewGates.status === 'not_owned') {
       if (s4Lifecycle) {
@@ -3089,6 +3203,7 @@ async function executeReadyWorkPackage(
           eq(artifacts.agentRunId, run.id),
         ))
         .limit(1)
+      assertQueueClaimOwned(options)
       artifact = protectedArtifact ?? null
     }
     if (!artifact) throw new Error('Work package completion did not create a source artifact.')
@@ -3098,6 +3213,7 @@ async function executeReadyWorkPackage(
     executionLeaseReleased = true
     heartbeat.stop()
 
+    assertQueueClaimOwned(options)
     await publishTaskEventBestEffort(taskId, 'artifact:created', {
       id: artifact.id,
       artifactId: artifact.id,
@@ -3109,6 +3225,7 @@ async function executeReadyWorkPackage(
       workPackageId: nextPackage.id,
     })
 
+    assertQueueClaimOwned(options)
     await publishTaskEventBestEffort(taskId, 'run:completed', {
       attemptNumber,
       runId: run.id,
@@ -3116,6 +3233,7 @@ async function executeReadyWorkPackage(
       status: 'completed',
       workPackageId: nextPackage.id,
     })
+    assertQueueClaimOwned(options)
     await recordTaskLogBestEffort({
       agentRunId: run.id,
       eventType: 'run.completed',
@@ -3134,6 +3252,7 @@ async function executeReadyWorkPackage(
       workPackageId: nextPackage.id,
     })
 
+    assertQueueClaimOwned(options)
     await publishTaskEventBestEffort(taskId, 'work_package:handoff', {
       assignedRole: nextPackage.assignedRole,
       hostRepositoryWrites: execution.hostRepositoryWrites,
@@ -3149,7 +3268,9 @@ async function executeReadyWorkPackage(
       workPackageId: nextPackage.id,
     })
 
+    assertQueueClaimOwned(options)
     const continuation = await continueWorkforceAfterPackageCompletionOrThrow(taskId, packageStatus, options)
+    assertQueueClaimOwned(options)
     if (continuation) return continuation
 
     return {
@@ -3158,6 +3279,7 @@ async function executeReadyWorkPackage(
       claimedPackageId: nextPackage.id,
     }
   } catch (err) {
+    rethrowQueueClaimLoss(err, options)
     if (packageFailureHandled) {
       // An inner catch already recorded the failure and moved the package out of
       // 'running'; propagate the error instead of misreading the status change
@@ -3176,6 +3298,7 @@ async function executeReadyWorkPackage(
                 failureStage: 'repository_evidence' as const,
               }
             : { status: 'failed' as const, failureCode: 'preflight_failed' as const }
+        assertQueueClaimOwned(options)
         await finalizeWorkPackageS4Failure({
           agentRunId: run.id,
           lifecycle: s4Lifecycle,
@@ -3184,13 +3307,19 @@ async function executeReadyWorkPackage(
             ? 'local_invocation_uncertain'
             : 'local_execution_failed',
         })
+        assertQueueClaimOwned(options)
       }
       await currentS4Heartbeat()?.stop()
       heartbeat.stop()
       packageFailureHandled = true
       throw err
     }
-    if (!executionLeaseReleased && (err instanceof ExecutionLeaseLostError || !(await executionLeaseOwned(nextPackage.id, run.id)))) {
+    let ownsExecutionLease = true
+    if (!executionLeaseReleased && !(err instanceof ExecutionLeaseLostError)) {
+      ownsExecutionLease = await executionLeaseOwned(nextPackage.id, run.id)
+      assertQueueClaimOwned(options)
+    }
+    if (!executionLeaseReleased && (err instanceof ExecutionLeaseLostError || !ownsExecutionLease)) {
       heartbeat.stop()
       return abandonLostExecutionLease({
         attemptNumber,
@@ -3217,6 +3346,7 @@ async function executeReadyWorkPackage(
       : finalAttempt
         ? message
         : `Retrying package execution after error: ${message}`
+    assertQueueClaimOwned(options)
     const [failedPackage] = await db
       .update(workPackages)
       .set({
@@ -3231,6 +3361,7 @@ async function executeReadyWorkPackage(
         sql`${workPackages.metadata}->'executionLease'->>'runId' = ${run.id}`,
       ))
       .returning({ id: workPackages.id })
+    assertQueueClaimOwned(options)
     if (!failedPackage) {
       heartbeat.stop()
       return abandonLostExecutionLease({
@@ -3246,6 +3377,7 @@ async function executeReadyWorkPackage(
         ? 'blocked'
         : 'failed'
       const validationStatus = validationStatusForPackage ?? 'failed'
+      assertQueueClaimOwned(options)
       await upsertRepositoryEvidenceRecord({
         agentRunId: run.id,
         context: { ...repositoryContext, blockedReason: message, status: evidenceStatus },
@@ -3254,6 +3386,7 @@ async function executeReadyWorkPackage(
         validationStatus,
         workPackageId: nextPackage.id,
       })
+      assertQueueClaimOwned(options)
       await createPackageArtifact({
         agentRunId: run.id,
         artifactType: 'log_output',
@@ -3268,6 +3401,7 @@ async function executeReadyWorkPackage(
         workPackageId: nextPackage.id,
       })
     }
+    assertQueueClaimOwned(options)
     await db
       .update(agentRuns)
       .set({
@@ -3277,6 +3411,7 @@ async function executeReadyWorkPackage(
       })
       .where(eq(agentRuns.id, run.id))
 
+    assertQueueClaimOwned(options)
     const [artifact] = await db
       .insert(artifacts)
       .values({
@@ -3296,6 +3431,7 @@ async function executeReadyWorkPackage(
       })
       .returning()
 
+    assertQueueClaimOwned(options)
     await publishTaskEventBestEffort(taskId, 'run:failed', {
       attemptNumber,
       errorMessage: message,
@@ -3303,6 +3439,7 @@ async function executeReadyWorkPackage(
       stage: 'implementation',
       workPackageId: nextPackage.id,
     })
+    assertQueueClaimOwned(options)
     await publishTaskEventBestEffort(taskId, 'artifact:created', {
       id: artifact.id,
       artifactId: artifact.id,
@@ -3313,6 +3450,7 @@ async function executeReadyWorkPackage(
       createdAt: artifact.createdAt,
       workPackageId: nextPackage.id,
     })
+    assertQueueClaimOwned(options)
     await recordTaskLogBestEffort({
       agentRunId: run.id,
       artifactId: artifact.id,
@@ -3328,6 +3466,7 @@ async function executeReadyWorkPackage(
       title: 'Failure artifact created',
       workPackageId: nextPackage.id,
     })
+    assertQueueClaimOwned(options)
     await recordTaskLogBestEffort({
       agentRunId: run.id,
       eventType: 'run.failed',
@@ -3343,6 +3482,7 @@ async function executeReadyWorkPackage(
       title: 'Implementation run failed',
       workPackageId: nextPackage.id,
     })
+    assertQueueClaimOwned(options)
     await publishTaskEventBestEffort(taskId, 'work_package:status', {
       blockedReason,
       status: packageStatus,

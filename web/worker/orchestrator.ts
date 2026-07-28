@@ -59,6 +59,10 @@ import {
   type ProtectedOpenQuestion,
 } from './protected-architect-plan'
 import type { ArchitectPlanEntryEnvelope, ArchitectPlanEntryInput } from '../lib/mcps/architect-plan-entries'
+import {
+  ClaimLeaseFence,
+  isClaimLeaseLostError,
+} from './claim-lease-fence'
 
 type TaskRow = Task
 type ProjectRow = typeof projects.$inferSelect
@@ -73,6 +77,10 @@ const REGENERATED_PLAN_NOTICE = [
 ].join('\n')
 
 type PendingArchitectCheckpoint = Omit<ArchitectCheckpointInput, 'taskStatus'>
+type QueueClaimProcessOptions = {
+  claimLeaseFence?: ClaimLeaseFence
+  finalAttempt?: boolean
+}
 
 class ArchitectRunFailedError extends Error {
   readonly checkpoint: PendingArchitectCheckpoint
@@ -165,10 +173,15 @@ async function isTaskCancelled(taskId: string): Promise<boolean> {
   return task !== undefined
 }
 
-async function prepareArchitectAcpSessionCwd(taskId: string): Promise<string> {
+async function prepareArchitectAcpSessionCwd(
+  taskId: string,
+  claimLeaseFence: ClaimLeaseFence,
+): Promise<string> {
   const workspace = await getWorkspaceSettings()
+  claimLeaseFence.assertOwned()
   const cwd = path.join(/*turbopackIgnore: true*/ workspace.runtimeRoot, 'acp-architect-sessions', taskId)
   await fs.mkdir(cwd, { recursive: true, mode: 0o700 })
+  claimLeaseFence.assertOwned()
   return cwd
 }
 
@@ -546,12 +559,15 @@ export async function createArchitectPlanArtifact(
     projectionEligible: false,
     requirementKey: null,
   }],
+  claimLeaseFence?: ClaimLeaseFence,
 ): Promise<CreatedArchitectPlanArtifact> {
   const runtimeMode = await readS4RuntimeModeV1()
+  claimLeaseFence?.assertOwned()
   const storage = architectPlanStorageConfiguration(process.env, runtimeMode)
   let artifact: typeof artifacts.$inferSelect | undefined
   let protectedArchitectPlanEntries: ArchitectPlanEntryEnvelope[] = []
   if (storage.mode === 'legacy') {
+    claimLeaseFence?.assertOwned()
     const [legacyArtifact] = await db
       .insert(artifacts)
       .values({
@@ -568,8 +584,10 @@ export async function createArchitectPlanArtifact(
         },
       })
       .returning()
+    claimLeaseFence?.assertOwned()
     artifact = legacyArtifact
   } else {
+    claimLeaseFence?.assertOwned()
     const protectedPlan = await recordArchitectPlanVersion({
       agentRunId,
       digestKey: storage.digestKey,
@@ -578,6 +596,7 @@ export async function createArchitectPlanArtifact(
       planVersion,
       taskId,
     })
+    claimLeaseFence?.assertOwned()
     protectedArchitectPlanEntries = protectedPlan.entries
     const [protectedArtifact] = await db
       .update(artifacts)
@@ -592,6 +611,7 @@ export async function createArchitectPlanArtifact(
       })
       .where(eq(artifacts.id, protectedPlan.artifactId))
       .returning()
+    claimLeaseFence?.assertOwned()
     artifact = protectedArtifact
 
     if (!artifact || artifact.content !== ARCHITECT_PLAN_HEADER) {
@@ -602,6 +622,7 @@ export async function createArchitectPlanArtifact(
   if (!artifact) throw new Error('Architect artifact was not persisted.')
 
   const protectedHistory = storage.mode === 'protected'
+  claimLeaseFence?.assertOwned()
   await publishTaskEvent(taskId, 'artifact:created', protectedHistory
     ? {
         agentRunId,
@@ -617,6 +638,7 @@ export async function createArchitectPlanArtifact(
         createdAt: artifact.createdAt,
       })
 
+  claimLeaseFence?.assertOwned()
   await recordTaskLogBestEffort({
     agentRunId,
     artifactId: artifact.id,
@@ -682,6 +704,7 @@ function protectedComparableEntries(entries: readonly ArchitectPlanEntryInput[])
 export async function previousPlanContextForArchitectRun(input: {
   agentRunId: string
   artifact: LatestPlanArtifact | null
+  claimLeaseFence?: ClaimLeaseFence
   checkpoint: ArchitectResumeCheckpoint | null
   taskId: string
 }): Promise<PreviousArchitectPlanContext> {
@@ -699,6 +722,7 @@ export async function previousPlanContextForArchitectRun(input: {
   }
 
   const runtimeMode = await readS4RuntimeModeV1()
+  input.claimLeaseFence?.assertOwned()
   const storage = architectPlanStorageConfiguration(process.env, runtimeMode)
   if (storage.mode !== 'protected') {
     throw new Error('Protected Architect history is present but its resolver configuration is missing. Replan failed closed.')
@@ -706,13 +730,16 @@ export async function previousPlanContextForArchitectRun(input: {
   if (!input.artifact?.id) {
     throw new Error('Protected Architect history has no source artifact identity. Replan failed closed.')
   }
+  input.claimLeaseFence?.assertOwned()
   const references = await bindArchitectReplanContext({
     agentRunId: input.agentRunId,
     priorPlanArtifactId: input.artifact.id,
   })
+  input.claimLeaseFence?.assertOwned()
   const resolved = await Promise.all(references.map((reference) => resolveArchitectReplanEntry({
     digestKey: storage.digestKey, referenceId: reference.referenceId,
   }).then((entry) => ({ ...entry, expectedEntryId: reference.entryId }))))
+  input.claimLeaseFence?.assertOwned()
   if (resolved.some((entry) => entry.entryId !== entry.expectedEntryId)) {
     throw new Error('Protected Architect replan context did not match its bound entry set. Replan failed closed.')
   }
@@ -748,22 +775,32 @@ export async function previousPlanForArchitectRun(input: {
  * previously stored questions for the task. Suggested answers are optional and
  * stored with each question. Returns the number of open questions persisted.
  */
-async function persistOpenQuestions(taskId: string, questions: readonly ProtectedOpenQuestion[], artifactId: string, planVersion: string): Promise<number> {
+async function persistOpenQuestions(
+  taskId: string,
+  questions: readonly ProtectedOpenQuestion[],
+  artifactId: string,
+  planVersion: string,
+  claimLeaseFence: ClaimLeaseFence,
+): Promise<number> {
   // Answered rows are the opaque durable projection of protected subledger
   // evidence. Only an unanswered round can be replaced by a newer plan.
+  claimLeaseFence.assertOwned()
   await db.delete(taskQuestions).where(and(
     eq(taskQuestions.taskId, taskId),
     isNull(taskQuestions.answerReferenceId),
   ))
+  claimLeaseFence.assertOwned()
 
   if (questions.length === 0) {
     // Still notify connected clients — a replan that resolves every open
     // question must clear a stale carousel from the previous round, not just
     // silently skip the event.
     await publishTaskEvent(taskId, 'questions:created', { questions: [] })
+    claimLeaseFence.assertOwned()
     return 0
   }
 
+  claimLeaseFence.assertOwned()
   const rows = await db
     .insert(taskQuestions)
     .values(
@@ -776,12 +813,14 @@ async function persistOpenQuestions(taskId: string, questions: readonly Protecte
     )
     .returning()
 
+  claimLeaseFence.assertOwned()
   await publishTaskEvent(taskId, 'questions:created', {
     questions: rows.map((row) => ({
       id: row.id,
       status: row.status,
     })),
   })
+  claimLeaseFence.assertOwned()
 
   return rows.length
 }
@@ -806,8 +845,10 @@ function answeredQuestionSnapshot(
 async function runArchitect(
   task: TaskRow,
   project: ProjectRow,
+  claimLeaseFence: ClaimLeaseFence,
   answeredQuestions: AnsweredQuestion[] = [],
 ): Promise<{ openQuestionCount: number; checkpoint: PendingArchitectCheckpoint }> {
+  claimLeaseFence.assertOwned()
   const config = await loadAgentConfig(ARCHITECT_AGENT)
   if (!config) {
     throw new Error('Architect agent config is missing or archived')
@@ -824,9 +865,11 @@ async function runArchitect(
     throw new Error(`Provider config ${providerConfigId} is missing or inactive`)
   }
 
+  claimLeaseFence.assertOwned()
   const executionCwd = providerResult.config.providerType === 'acp'
-    ? await prepareArchitectAcpSessionCwd(task.id)
+    ? await prepareArchitectAcpSessionCwd(task.id, claimLeaseFence)
     : project.localPath
+  claimLeaseFence.assertOwned()
   const model = await getModel(providerConfigId, { cwd: executionCwd })
   if (!model) {
     throw new Error(`Provider config ${providerConfigId} is missing or inactive`)
@@ -834,6 +877,7 @@ async function runArchitect(
   const resumeCheckpoint = await readLatestArchitectCheckpointSafely(task.id)
   const previousPlanArtifact = await loadLatestPlanArtifact(task.id)
   const startedAt = new Date()
+  claimLeaseFence.assertOwned()
   const [run] = await db
     .insert(agentRuns)
     .values({
@@ -846,6 +890,7 @@ async function runArchitect(
     })
     .returning()
 
+  claimLeaseFence.assertOwned()
   await publishTaskEvent(task.id, 'run:started', {
     runId: run.id,
     agentType: ARCHITECT_AGENT,
@@ -862,12 +907,15 @@ async function runArchitect(
 
   try {
     s4RuntimeMode = await readS4RuntimeModeV1()
+    claimLeaseFence.assertOwned()
     const previousPlanContext = await previousPlanContextForArchitectRun({
       agentRunId: run.id,
       artifact: previousPlanArtifact,
+      claimLeaseFence,
       checkpoint: resumeCheckpoint,
       taskId: task.id,
     })
+    claimLeaseFence.assertOwned()
     previousPlan = previousPlanContext.planText
     previousProtectedEntries = previousPlanContext.planEntries
     previousProtectedComparableEntries = previousPlanContext.protectedComparableEntries
@@ -875,7 +923,9 @@ async function runArchitect(
       answeredQuestions = protectedAnsweredQuestions(previousPlanContext)
     }
     const projectFilesystemDecision = await loadCurrentProjectFilesystemDecision(project.id)
+    claimLeaseFence.assertOwned()
     const mcpOverview = await getProjectMcpOverview(project, projectFilesystemDecision)
+    claimLeaseFence.assertOwned()
     let usage: { inputTokens: number | null; outputTokens: number | null } = {
       inputTokens: null,
       outputTokens: null,
@@ -884,6 +934,7 @@ async function runArchitect(
     if (process.env.FORGE_WORKER_MOCK_ARCHITECT === '1') {
       text = mockArchitectPlan(task, project)
       outputBytes = Buffer.byteLength(text, 'utf8')
+      claimLeaseFence.assertOwned()
       await recordTaskLogBestEffort({
         agentRunId: run.id,
         eventType: 'run.started',
@@ -898,6 +949,7 @@ async function runArchitect(
         taskId: task.id,
         title: 'Architect run started',
       })
+      claimLeaseFence.assertOwned()
       await publishTaskEvent(task.id, 'run:progress', {
         runId: run.id,
         outputBytes,
@@ -925,6 +977,7 @@ async function runArchitect(
         displayLocalPath,
         mcpOverview,
       )
+      claimLeaseFence.assertOwned()
       await recordTaskLogBestEffort({
         agentRunId: run.id,
         eventType: 'run.started',
@@ -945,8 +998,21 @@ async function runArchitect(
       })
       const controller = new AbortController()
       const timeoutMs = architectGenerationTimeoutMs()
-      const timeout = setTimeout(() => controller.abort(), timeoutMs)
+      let timedOut = false
+      const abortForClaimLoss = (): void => {
+        controller.abort(claimLeaseFence.signal.reason)
+      }
+      if (claimLeaseFence.signal.aborted) {
+        abortForClaimLoss()
+      } else {
+        claimLeaseFence.signal.addEventListener('abort', abortForClaimLoss, { once: true })
+      }
+      const timeout = setTimeout(() => {
+        timedOut = true
+        controller.abort()
+      }, timeoutMs)
       try {
+        claimLeaseFence.assertOwned()
         const result = streamText({
           abortSignal: controller.signal,
           maxOutputTokens: architectMaxOutputTokens(),
@@ -957,8 +1023,10 @@ async function runArchitect(
         })
 
         for await (const delta of result.textStream) {
+          claimLeaseFence.assertOwned()
           text += delta
           outputBytes += Buffer.byteLength(delta, 'utf8')
+          claimLeaseFence.assertOwned()
           await publishTaskEvent(task.id, 'run:progress', {
             runId: run.id,
             outputBytes,
@@ -966,6 +1034,7 @@ async function runArchitect(
         }
 
         const finishReason = await result.finishReason
+        claimLeaseFence.assertOwned()
         if (finishReason === 'length') {
           throw new Error(
             `Architect model stopped at the configured output limit (${architectMaxOutputTokens()} tokens) before producing a complete plan.`,
@@ -973,17 +1042,22 @@ async function runArchitect(
         }
 
         const streamUsage = await result.usage
+        claimLeaseFence.assertOwned()
         usage = {
           inputTokens: typeof streamUsage.inputTokens === 'number' ? streamUsage.inputTokens : null,
           outputTokens: typeof streamUsage.outputTokens === 'number' ? streamUsage.outputTokens : null,
         }
       } catch (err) {
-        if (controller.signal.aborted) {
+        if (claimLeaseFence.lost || isClaimLeaseLostError(err)) {
+          claimLeaseFence.throwIfLost()
+        }
+        if (timedOut) {
           throw new Error(`Architect model generation timed out after ${timeoutMs}ms.`)
         }
         throw err
       } finally {
         clearTimeout(timeout)
+        claimLeaseFence.signal.removeEventListener('abort', abortForClaimLoss)
       }
     }
 
@@ -1061,6 +1135,7 @@ async function runArchitect(
     if (regeneratedPlanReason) {
       artifactPlanText = regeneratedPlanText(prepared.planText)
       artifactComparableMetadata = preparedComparableMetadata
+      claimLeaseFence.assertOwned()
       await recordTaskLogBestEffort({
         agentRunId: run.id,
         eventType: 'architect.replan.regenerated',
@@ -1095,6 +1170,7 @@ async function runArchitect(
       // Revised plans carry only their current protected open-question entries.
       answeredQuestions: [],
     })
+    claimLeaseFence.assertOwned()
     const artifact = await createArchitectPlanArtifact(task.id, run.id, artifactPlanText, planVersion, {
       openQuestionCount: prepared.questions.length,
       regeneratedFromPlan: regeneratedPlanReason !== null,
@@ -1109,11 +1185,20 @@ async function runArchitect(
       mcpExecutionDesign: previousPlan !== null && artifactComparableMetadata === previousComparableMetadata && isRecord(previousPlanArtifact?.metadata.mcpExecutionDesign)
         ? previousPlanArtifact.metadata.mcpExecutionDesign
         : prepared.mcpExecutionDesign,
-    }, protectedEntries)
-    const openQuestionCount = await persistOpenQuestions(task.id, protectedOpenQuestions, artifact.id, planVersion)
+    }, protectedEntries, claimLeaseFence)
+    claimLeaseFence.assertOwned()
+    const openQuestionCount = await persistOpenQuestions(
+      task.id,
+      protectedOpenQuestions,
+      artifact.id,
+      planVersion,
+      claimLeaseFence,
+    )
 
     if (openQuestionCount === 0) {
+      claimLeaseFence.assertOwned()
       await materializeWorkforceFromArchitectArtifact({
+        assertClaimOwned: () => claimLeaseFence.assertOwned(),
         taskId: task.id,
         architectRunId: run.id,
         artifactId: artifact.id,
@@ -1128,6 +1213,7 @@ async function runArchitect(
     // flips this run to 'cancelled'. Only complete the run if it is still
     // 'running' so we do not resurrect a cancelled run (or publish a
     // run:completed event contradicting the cancelled task).
+    claimLeaseFence.assertOwned()
     const [completedRun] = await db
       .update(agentRuns)
       .set({
@@ -1140,6 +1226,7 @@ async function runArchitect(
       .returning({ id: agentRuns.id })
 
     if (completedRun) {
+      claimLeaseFence.assertOwned()
       await publishTaskEvent(task.id, 'run:completed', {
         runId: run.id,
         inputTokens: usage.inputTokens,
@@ -1147,6 +1234,7 @@ async function runArchitect(
         costUsd: null,
         completedAt: completedAt.toISOString(),
       })
+      claimLeaseFence.assertOwned()
       await recordTaskLogBestEffort({
         agentRunId: run.id,
         eventType: 'run.completed',
@@ -1192,6 +1280,9 @@ async function runArchitect(
 
     return { openQuestionCount, checkpoint }
   } catch (err) {
+    if (claimLeaseFence.lost || isClaimLeaseLostError(err)) {
+      claimLeaseFence.throwIfLost()
+    }
     const message = errorMessage(err)
     const completedAt = new Date()
     let protectFailureContent = s4RuntimeMode !== 'legacy'
@@ -1203,6 +1294,7 @@ async function runArchitect(
       protectFailureContent = true
     }
 
+    claimLeaseFence.assertOwned()
     await db
       .update(agentRuns)
       .set({
@@ -1212,12 +1304,14 @@ async function runArchitect(
       })
       .where(eq(agentRuns.id, run.id))
 
+    claimLeaseFence.assertOwned()
     await publishTaskEvent(task.id, 'run:failed', {
       runId: run.id,
       errorMessage: message,
       completedAt: completedAt.toISOString(),
     })
 
+    claimLeaseFence.assertOwned()
     await recordTaskLogBestEffort({
       agentRunId: run.id,
       eventType: 'run.failed',
@@ -1267,9 +1361,12 @@ async function runArchitect(
 
 export async function processTask(
   taskId: string,
-  options: { finalAttempt?: boolean } = {},
+  options: QueueClaimProcessOptions = {},
 ): Promise<void> {
+  const claimLeaseFence = options.claimLeaseFence ?? new ClaimLeaseFence()
+  claimLeaseFence.assertOwned()
   const context = await loadTaskContext(taskId)
+  claimLeaseFence.assertOwned()
   if (!context) {
     console.warn('[worker/orchestrator] Task not found', { taskId })
     return
@@ -1285,6 +1382,7 @@ export async function processTask(
   }
 
   try {
+    claimLeaseFence.assertOwned()
     const claimed = await updateTaskStatusIfCurrent(task.id, 'pending', 'running')
     if (!claimed) {
       console.info('[worker/orchestrator] Skipping task that was claimed by another worker', {
@@ -1293,30 +1391,44 @@ export async function processTask(
       return
     }
 
-    const { openQuestionCount, checkpoint } = await runArchitect(task, project)
+    const { openQuestionCount, checkpoint } = await runArchitect(
+      task,
+      project,
+      claimLeaseFence,
+    )
 
     if (await isTaskCancelled(task.id)) {
       return
     }
+    claimLeaseFence.assertOwned()
 
     const nextStatus: TaskStatus = openQuestionCount > 0 ? 'awaiting_answers' : 'awaiting_approval'
     // CAS from 'running' so a cancel landing between the isTaskCancelled read
     // and this write cannot resurrect a cancelled task.
     const advanced = await updateTaskStatusIfCurrent(task.id, 'running', nextStatus)
     if (!advanced) return
+    claimLeaseFence.assertOwned()
     await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: nextStatus })
   } catch (err) {
+    if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
     const message = safeTaskFailureMessage(err)
     const checkpoint = architectCheckpointFromError(err)
     if (options.finalAttempt ?? true) {
+      claimLeaseFence.assertOwned()
       await updateTaskStatus(task.id, 'failed', message)
       if (checkpoint) {
+        claimLeaseFence.assertOwned()
         await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: 'failed' })
       }
-    } else if (!(await isTaskCancelled(task.id))) {
-      await updateTaskStatus(task.id, 'pending', `Retrying after error: ${message}`)
-      if (checkpoint) {
-        await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: 'pending' })
+    } else {
+      const cancelled = await isTaskCancelled(task.id)
+      claimLeaseFence.assertOwned()
+      if (!cancelled) {
+        await updateTaskStatus(task.id, 'pending', `Retrying after error: ${message}`)
+        if (checkpoint) {
+          claimLeaseFence.assertOwned()
+          await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: 'pending' })
+        }
       }
     }
     throw err
@@ -1335,9 +1447,12 @@ export async function processTask(
  */
 export async function processAnsweredQuestions(
   taskId: string,
-  options: { finalAttempt?: boolean } = {},
+  options: QueueClaimProcessOptions = {},
 ): Promise<void> {
+  const claimLeaseFence = options.claimLeaseFence ?? new ClaimLeaseFence()
+  claimLeaseFence.assertOwned()
   const context = await loadTaskContext(taskId)
+  claimLeaseFence.assertOwned()
   if (!context) {
     console.warn('[worker/orchestrator] Task not found', { taskId })
     return
@@ -1356,6 +1471,7 @@ export async function processAnsweredQuestions(
     .select()
     .from(taskQuestions)
     .where(eq(taskQuestions.taskId, taskId))
+  claimLeaseFence.assertOwned()
 
   const unanswered = existingQuestions.filter((q) => q.status !== 'answered')
   if (unanswered.length > 0) {
@@ -1370,12 +1486,14 @@ export async function processAnsweredQuestions(
     console.warn('[worker/orchestrator] Refusing answered-question re-plan with no question rows', {
       taskId,
     })
+    claimLeaseFence.assertOwned()
     await updateTaskStatus(taskId, 'failed', message)
     return
   }
 
   const answeredQuestions = answeredQuestionSnapshot(existingQuestions)
 
+  claimLeaseFence.assertOwned()
   const claimed = await updateTaskStatusIfCurrent(taskId, 'awaiting_answers', 'running')
   if (!claimed) {
     console.info('[worker/orchestrator] Skipping re-plan claimed by another worker', { taskId })
@@ -1383,31 +1501,47 @@ export async function processAnsweredQuestions(
   }
 
   try {
-    const { openQuestionCount, checkpoint } = await runArchitect(task, project, answeredQuestions)
+    const { openQuestionCount, checkpoint } = await runArchitect(
+      task,
+      project,
+      claimLeaseFence,
+      answeredQuestions,
+    )
 
     if (await isTaskCancelled(taskId)) {
       return
     }
+    claimLeaseFence.assertOwned()
 
     const nextStatus: TaskStatus = openQuestionCount > 0 ? 'awaiting_answers' : 'awaiting_approval'
     // CAS from 'running' so a cancel landing between the isTaskCancelled read
     // and this write cannot resurrect a cancelled task.
     const advanced = await updateTaskStatusIfCurrent(taskId, 'running', nextStatus)
     if (!advanced) return
+    claimLeaseFence.assertOwned()
     await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: nextStatus })
   } catch (err) {
+    if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
     const message = safeTaskFailureMessage(err)
     const checkpoint = architectCheckpointFromError(err)
     if (options.finalAttempt ?? true) {
+      claimLeaseFence.assertOwned()
       await updateTaskStatus(taskId, 'failed', message)
       if (checkpoint) {
+        claimLeaseFence.assertOwned()
         await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: 'failed' })
       }
-    } else if (!(await isTaskCancelled(taskId))) {
-      await restoreAnsweredQuestionsSnapshot(taskId, answeredQuestions)
-      await updateTaskStatus(taskId, 'awaiting_answers', `Retrying after error: ${message}`)
-      if (checkpoint) {
-        await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: 'awaiting_answers' })
+    } else {
+      const cancelled = await isTaskCancelled(taskId)
+      claimLeaseFence.assertOwned()
+      if (!cancelled) {
+        await restoreAnsweredQuestionsSnapshot(taskId, answeredQuestions)
+        claimLeaseFence.assertOwned()
+        await updateTaskStatus(taskId, 'awaiting_answers', `Retrying after error: ${message}`)
+        if (checkpoint) {
+          claimLeaseFence.assertOwned()
+          await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: 'awaiting_answers' })
+        }
       }
     }
     throw err
@@ -1416,13 +1550,16 @@ export async function processAnsweredQuestions(
 
 export async function processApproval(
   taskId: string,
-  options: { finalAttempt?: boolean } = {},
+  options: QueueClaimProcessOptions = {},
 ): Promise<void> {
+  const claimLeaseFence = options.claimLeaseFence ?? new ClaimLeaseFence()
+  claimLeaseFence.assertOwned()
   const [task] = await db
     .select({ status: tasks.status })
     .from(tasks)
     .where(eq(tasks.id, taskId))
     .limit(1)
+  claimLeaseFence.assertOwned()
 
   if (!task) {
     console.warn('[worker/orchestrator] Approval target task not found', { taskId })
@@ -1443,8 +1580,10 @@ export async function processApproval(
   }
 
   const preview = await previewWorkPackageHandoff(taskId)
+  claimLeaseFence.assertOwned()
 
   if (preview.status === 'no_work_packages') {
+    claimLeaseFence.assertOwned()
     const completed = await updateTaskStatusIfCurrent(taskId, 'approved', 'completed')
     if (!completed) {
       console.info('[worker/orchestrator] Skipping approval that was changed by another actor', {
@@ -1456,8 +1595,10 @@ export async function processApproval(
 
   if (preview.status === 'no_ready_packages') {
     const completion = await completeTaskIfReviewGatesSatisfied(taskId)
+    claimLeaseFence.assertOwned()
     if (completion.status === 'completed') return
 
+    claimLeaseFence.assertOwned()
     await publishTaskEvent(taskId, 'task:handoff', {
       claimedPackageId: null,
       readyPackageIds: preview.readyPackageIds,
@@ -1470,7 +1611,11 @@ export async function processApproval(
 
   const claimEnabled = isWorkPackageHandoffEnabled()
   if (!claimEnabled) {
-    const handoff = await handoffApprovedWorkPackages(taskId, { claimEnabled: false })
+    const handoff = await handoffApprovedWorkPackages(taskId, {
+      claimEnabled: false,
+      claimLeaseFence,
+    })
+    claimLeaseFence.assertOwned()
     if (handoff.status === 'blocked' && handoff.terminalBlock) {
       await updateTaskStatusIfCurrent(
         taskId,
@@ -1479,6 +1624,7 @@ export async function processApproval(
         handoff.blockedReason ?? 'Work package failed a terminal handoff safety check.',
       )
     }
+    claimLeaseFence.assertOwned()
     await publishHandoffResult(taskId, {
       ...handoff,
       claimedPackageId: null,
@@ -1486,6 +1632,7 @@ export async function processApproval(
     return
   }
 
+  claimLeaseFence.assertOwned()
   const running = await updateTaskStatusIfCurrent(taskId, 'approved', 'running')
   if (!running) {
     console.info('[worker/orchestrator] Skipping approval handoff that was changed by another actor', {
@@ -1498,23 +1645,33 @@ export async function processApproval(
   let handoff: Awaited<ReturnType<typeof handoffApprovedWorkPackages>>
   try {
     const finalAttempt = options.finalAttempt ?? true
-    handoff = await handoffApprovedWorkPackages(taskId, { claimEnabled: true, finalAttempt })
+    handoff = await handoffApprovedWorkPackages(taskId, {
+      claimEnabled: true,
+      claimLeaseFence,
+      finalAttempt,
+    })
+    claimLeaseFence.assertOwned()
   } catch (err) {
+    if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
     const finalAttempt = options.finalAttempt ?? true
+    claimLeaseFence.assertOwned()
     if (finalAttempt) {
       await updateTaskStatusIfCurrent(taskId, 'running', 'failed', errorMessage(err))
     } else {
       await updateTaskStatusIfCurrent(taskId, 'running', 'approved', `Retrying handoff after error: ${errorMessage(err)}`)
     }
+    claimLeaseFence.assertOwned()
     throw err
   }
 
   if (handoff.claimedPackageId === null && handoff.status === 'no_ready_packages') {
+    claimLeaseFence.assertOwned()
     await updateTaskStatus(taskId, 'approved', 'No ready work packages were available for handoff.')
     return
   }
 
   if (handoff.claimedPackageId === null && handoff.status === 'blocked') {
+    claimLeaseFence.assertOwned()
     if (handoff.terminalBlock) {
       await updateTaskStatusIfCurrent(
         taskId,
@@ -1532,27 +1689,36 @@ export async function processApproval(
     }
   }
 
+  claimLeaseFence.assertOwned()
   await publishHandoffResult(taskId, handoff)
 }
 
 async function processRunningWorkforceContinuation(
   taskId: string,
-  options: { finalAttempt?: boolean },
+  options: QueueClaimProcessOptions,
 ): Promise<void> {
+  const claimLeaseFence = options.claimLeaseFence ?? new ClaimLeaseFence()
+  claimLeaseFence.assertOwned()
   let handoff: WorkPackageHandoffResult
   try {
     handoff = await progressWorkforce(taskId, {
       claimEnabled: isWorkPackageHandoffEnabled(),
+      claimLeaseFence,
       finalAttempt: options.finalAttempt ?? true,
     })
+    claimLeaseFence.assertOwned()
   } catch (err) {
+    if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
     if (options.finalAttempt ?? true) {
+      claimLeaseFence.assertOwned()
       await updateTaskStatusIfCurrent(taskId, 'running', 'failed', errorMessage(err))
+      claimLeaseFence.assertOwned()
     }
     throw err
   }
 
   if (handoff.claimedPackageId === null && handoff.status === 'blocked') {
+    claimLeaseFence.assertOwned()
     if (handoff.terminalBlock) {
       await updateTaskStatusIfCurrent(
         taskId,
@@ -1570,6 +1736,7 @@ async function processRunningWorkforceContinuation(
     }
   }
 
+  claimLeaseFence.assertOwned()
   await publishHandoffResult(taskId, handoff)
 }
 

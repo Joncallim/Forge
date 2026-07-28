@@ -2,6 +2,10 @@ import { sanitizeWorkerMessage } from './redaction'
 import { defaultOnFeatureFlagState, explicitOptInFeatureFlagEnabled } from './feature-flags'
 import { hostRepositoryWritePolicyState } from './repository-edit-policy'
 import type { QueueClaimRenewalResult, QueueRetryResult } from './queue'
+import {
+  ClaimLeaseFence,
+  isClaimLeaseLostError,
+} from './claim-lease-fence'
 
 const DEFAULT_CLAIM_TIMEOUT_SECONDS = 5
 const APPROVAL_CLAIM_TIMEOUT_SECONDS = 1
@@ -211,10 +215,23 @@ async function startWorkerOnce(
     })
   }
 
+  const logClaimLeaseLost = (
+    queueName: QueueOperation,
+    taskId: string,
+  ): void => {
+    console.warn('[worker] Queue claim lease lost', {
+      phase: 'claim_lease_lost',
+      queueName,
+      taskId,
+      workerId,
+    })
+  }
+
   const acknowledgeMissingTaskJob = async (
     queueName: QueueOperation,
     taskId: string,
     ack: () => Promise<unknown>,
+    claimLeaseFence?: ClaimLeaseFence,
   ): Promise<'acknowledged' | 'present' | 'retained'> => {
     let exists: boolean
     try {
@@ -233,7 +250,8 @@ async function startWorkerOnce(
         workerId,
       })
       return 'acknowledged'
-    } catch {
+    } catch (err) {
+      if (claimLeaseFence?.lost || isClaimLeaseLostError(err)) return 'retained'
       logQueueInfrastructureFailure('ack_missing_task', queueName, taskId)
       return 'retained'
     }
@@ -241,27 +259,45 @@ async function startWorkerOnce(
 
   const startClaimRenewal = async <TJob extends RuntimeJob>(input: {
     claimed: { job: TJob; raw: string }
+    fence: ClaimLeaseFence
     queue: RuntimeQueue<TJob>
     queueName: QueueOperation
-  }): Promise<{ stop: () => Promise<void> } | null> => {
-    const { claimed, queue, queueName } = input
+  }): Promise<{
+    startDisposition: 'established' | 'lost' | 'unavailable'
+    stop: () => Promise<void>
+  }> => {
+    const { claimed, fence, queue, queueName } = input
     let stopped = false
     let timer: ReturnType<typeof setInterval> | null = null
-    let inFlight: Promise<boolean> | null = null
+    let inFlight: Promise<'lost' | 'renewed' | 'transient_error'> | null = null
+
+    const stopScheduling = (): void => {
+      if (stopped) return
+      stopped = true
+      if (timer) {
+        clearInterval(timer)
+        timer = null
+      }
+    }
 
     const renew = async (
       phase: 'claim_renewal_initial' | 'claim_renewal_periodic',
-    ): Promise<boolean> => {
+    ): Promise<'lost' | 'renewed' | 'transient_error'> => {
       try {
-        if (await queue.renewClaim(claimed.raw) === 'renewed') return true
+        const result = await queue.renewClaim(claimed.raw)
+        if (result === 'renewed') return 'renewed'
+        fence.markLost()
+        stopScheduling()
+        logClaimLeaseLost(queueName, claimed.job.taskId)
+        return 'lost'
       } catch {
-        // The fixed diagnostic below is the only operational output from a renewal failure.
+        logQueueInfrastructureFailure(phase, queueName, claimed.job.taskId)
+        return 'transient_error'
       }
-      logQueueInfrastructureFailure(phase, queueName, claimed.job.taskId)
-      return false
     }
 
-    if (!await renew('claim_renewal_initial')) return null
+    const initialDisposition = await renew('claim_renewal_initial')
+    if (initialDisposition !== 'renewed') stopScheduling()
 
     const tick = (): void => {
       if (stopped || inFlight) return
@@ -271,17 +307,18 @@ async function startWorkerOnce(
         if (inFlight === current) inFlight = null
       })
     }
-    timer = setInterval(tick, claimRenewalIntervalMs)
+    if (initialDisposition === 'renewed') {
+      timer = setInterval(tick, claimRenewalIntervalMs)
+    }
 
     return {
+      startDisposition: initialDisposition === 'renewed'
+        ? 'established'
+        : initialDisposition === 'lost'
+          ? 'lost'
+          : 'unavailable',
       stop: async (): Promise<void> => {
-        if (!stopped) {
-          stopped = true
-          if (timer) {
-            clearInterval(timer)
-            timer = null
-          }
-        }
+        stopScheduling()
         const pending = inFlight
         if (pending) await pending
       },
@@ -291,15 +328,21 @@ async function startWorkerOnce(
   const processClaimedJob = async <TJob extends RuntimeJob>(input: {
     attemptQueueName: 'answers' | 'approvals' | 'tasks'
     claimed: { job: TJob; raw: string }
-    processBusiness: (finalAttempt: boolean) => Promise<void>
+    processBusiness: (finalAttempt: boolean, fence: ClaimLeaseFence) => Promise<void>
     queue: RuntimeQueue<TJob>
     queueName: QueueOperation
   }): Promise<void> => {
     const { claimed, queue, queueName } = input
     const { job, raw } = claimed
     const finalAttempt = job.attempt >= maxAttempts
-    const claimRenewal = await startClaimRenewal({ claimed, queue, queueName })
-    if (!claimRenewal) return
+    const claimLeaseFence = new ClaimLeaseFence()
+    const claimRenewal = await startClaimRenewal({
+      claimed,
+      fence: claimLeaseFence,
+      queue,
+      queueName,
+    })
+    if (claimRenewal.startDisposition !== 'established') return
     let claimRenewalStopped = false
     const stopClaimRenewal = async (): Promise<void> => {
       if (claimRenewalStopped) return
@@ -313,13 +356,16 @@ async function startWorkerOnce(
         job.taskId,
         async () => {
           await stopClaimRenewal()
+          claimLeaseFence.assertOwned()
           return queue.ack(raw)
         },
+        claimLeaseFence,
       )
       if (missingTaskDisposition !== 'present') return
 
       let attemptId: string
       try {
+        claimLeaseFence.assertOwned()
         attemptId = await startTaskAttempt({
           attemptNumber: job.attempt,
           jobPayload: job,
@@ -327,7 +373,8 @@ async function startWorkerOnce(
           taskId: job.taskId,
           workerId,
         })
-      } catch {
+      } catch (err) {
+        if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
         logAttemptInfrastructureFailure('start', queueName, job.taskId)
         return
       }
@@ -341,8 +388,11 @@ async function startWorkerOnce(
       })
 
       try {
-        await input.processBusiness(finalAttempt)
+        claimLeaseFence.assertOwned()
+        await input.processBusiness(finalAttempt, claimLeaseFence)
+        claimLeaseFence.assertOwned()
       } catch (err) {
+        if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
         const message = retainedErrorMessage(err)
         console.error('[worker] Job processing failed', {
           attempt: job.attempt,
@@ -353,6 +403,7 @@ async function startWorkerOnce(
         })
 
         if (finalAttempt) {
+          claimLeaseFence.assertOwned()
           try {
             await finishTaskAttempt({
               attemptId,
@@ -360,13 +411,16 @@ async function startWorkerOnce(
               nextRetryAt: null,
               status: 'dead_lettered',
             })
-          } catch {
+          } catch (err) {
+            if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
             logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
           }
           await stopClaimRenewal()
+          claimLeaseFence.assertOwned()
           try {
             await queue.deadLetter(raw, job)
-          } catch {
+          } catch (err) {
+            if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
             logQueueInfrastructureFailure('dead_letter', queueName, job.taskId)
           }
           return
@@ -374,15 +428,19 @@ async function startWorkerOnce(
 
         const retryDelayMs = backoffDelayMs(job.attempt)
         await stopClaimRenewal()
+        claimLeaseFence.assertOwned()
         let retryResult: QueueRetryResult
         try {
           retryResult = await queue.retry(raw, job, retryDelayMs)
-        } catch {
+        } catch (err) {
+          if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
           logQueueInfrastructureFailure('retry', queueName, job.taskId)
           try {
             retryResult = await queue.retry(raw, job, retryDelayMs)
-          } catch {
+          } catch (reconciliationError) {
+            if (claimLeaseFence.lost || isClaimLeaseLostError(reconciliationError)) return
             logQueueInfrastructureFailure('retry_reconciliation', queueName, job.taskId)
+            claimLeaseFence.assertOwned()
             try {
               await finishTaskAttempt({
                 attemptId,
@@ -390,12 +448,14 @@ async function startWorkerOnce(
                 nextRetryAt: null,
                 status: 'indeterminate',
               })
-            } catch {
+            } catch (finishError) {
+              if (claimLeaseFence.lost || isClaimLeaseLostError(finishError)) return
               logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
             }
             return
           }
         }
+        claimLeaseFence.assertOwned()
         try {
           await finishTaskAttempt({
             attemptId,
@@ -403,23 +463,31 @@ async function startWorkerOnce(
             nextRetryAt: retryResult.nextRetryAt,
             status: 'failed',
           })
-        } catch {
+        } catch (err) {
+          if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
           logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
         }
         return
       }
 
+      claimLeaseFence.assertOwned()
       try {
         await finishTaskAttempt({ attemptId, status: 'completed' })
-      } catch {
+      } catch (err) {
+        if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
         logAttemptInfrastructureFailure('finish_after_success', queueName, job.taskId)
       }
       await stopClaimRenewal()
+      claimLeaseFence.assertOwned()
       try {
         await queue.ack(raw)
-      } catch {
+      } catch (err) {
+        if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
         logQueueInfrastructureFailure('ack_after_success', queueName, job.taskId)
       }
+    } catch (err) {
+      if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
+      throw err
     } finally {
       await stopClaimRenewal()
     }
@@ -697,8 +765,11 @@ async function startWorkerOnce(
           await processClaimedJob({
             attemptQueueName: 'approvals',
             claimed: claimedApproval,
-            processBusiness: (finalAttempt) =>
-              processApproval(claimedApproval.job.taskId, { finalAttempt }),
+            processBusiness: (finalAttempt, claimLeaseFence) =>
+              processApproval(claimedApproval.job.taskId, {
+                claimLeaseFence,
+                finalAttempt,
+              }),
             queue: approvalQueue,
             queueName: 'approval',
           })
@@ -728,8 +799,11 @@ async function startWorkerOnce(
           await processClaimedJob({
             attemptQueueName: 'answers',
             claimed: claimedAnswers,
-            processBusiness: async (finalAttempt) =>
-              await processAnsweredQuestions(claimedAnswers.job.taskId, { finalAttempt }),
+            processBusiness: async (finalAttempt, claimLeaseFence) =>
+              await processAnsweredQuestions(claimedAnswers.job.taskId, {
+                claimLeaseFence,
+                finalAttempt,
+              }),
             queue: answersQueue,
             queueName: 'answers',
           })
@@ -761,8 +835,11 @@ async function startWorkerOnce(
         await processClaimedJob({
           attemptQueueName: 'tasks',
           claimed: claimedTask,
-          processBusiness: (finalAttempt) =>
-            processTask(claimedTask.job.taskId, { finalAttempt }),
+          processBusiness: (finalAttempt, claimLeaseFence) =>
+            processTask(claimedTask.job.taskId, {
+              claimLeaseFence,
+              finalAttempt,
+            }),
           queue: taskQueue,
           queueName: 'task',
         })

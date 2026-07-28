@@ -43,6 +43,7 @@ type MaterializerRowSet = {
 }
 
 export type WorkforceMaterializationInput = {
+  assertClaimOwned?: () => void
   taskId: string
   architectRunId: string
   artifactId: string
@@ -666,6 +667,7 @@ export function buildWorkforceMaterializationRows(
 export async function materializeWorkforceFromArchitectArtifact(
   input: WorkforceMaterializationInput,
 ): Promise<WorkforceMaterializationResult> {
+  input.assertClaimOwned?.()
   if (!isWorkforceMaterializationEnabled()) {
     return {
       status: 'disabled',
@@ -696,9 +698,11 @@ export async function materializeWorkforceFromArchitectArtifact(
       .limit(1)
       .then((rows) => rows[0] ?? null),
   ])
+  input.assertClaimOwned?.()
   const projectFilesystemDecision = taskProject
     ? await loadCurrentProjectFilesystemDecision(taskProject.id)
     : null
+  input.assertClaimOwned?.()
   const rows = buildWorkforceMaterializationRows(input, {
     activeAgents,
     projectMcpConfig: taskProject?.mcpConfig,
@@ -721,16 +725,20 @@ export async function materializeWorkforceFromArchitectArtifact(
   // task with freshly materialized pending work packages and an actionable
   // plan_approval gate.
   let cancelledDuringMaterialization = false
+  input.assertClaimOwned?.()
   await db.transaction(async (tx) => {
+    input.assertClaimOwned?.()
     const [taskRow] = await tx
       .select({ status: tasks.status })
       .from(tasks)
       .where(eq(tasks.id, input.taskId))
       .for('update')
+    input.assertClaimOwned?.()
     if (!taskRow || taskRow.status !== 'running') {
       cancelledDuringMaterialization = true
       return
     }
+    input.assertClaimOwned?.()
     await tx
       .delete(approvalGates)
       .where(
@@ -740,6 +748,7 @@ export async function materializeWorkforceFromArchitectArtifact(
           eq(approvalGates.status, 'pending'),
         ),
       )
+    input.assertClaimOwned?.()
     await tx
       .delete(workPackages)
       .where(and(
@@ -754,6 +763,7 @@ export async function materializeWorkforceFromArchitectArtifact(
       ))
 
     if (rows.harnesses.length > 0) {
+      input.assertClaimOwned?.()
       await tx
         .insert(agentHarnesses)
         .values(rows.harnesses)
@@ -771,6 +781,7 @@ export async function materializeWorkforceFromArchitectArtifact(
           },
         })
 
+      input.assertClaimOwned?.()
       const harnessRows = await tx
         .select({ id: agentHarnesses.id, slug: agentHarnesses.slug })
         .from(agentHarnesses)
@@ -783,15 +794,19 @@ export async function materializeWorkforceFromArchitectArtifact(
     }
 
     if (rows.workPackages.length > 0) {
+      input.assertClaimOwned?.()
       await tx.insert(workPackages).values(rows.workPackages)
     }
 
     if (rows.dependencies.length > 0) {
+      input.assertClaimOwned?.()
       await tx.insert(workPackageDependencies).values(rows.dependencies)
     }
 
+    input.assertClaimOwned?.()
     await tx.insert(approvalGates).values(rows.approvalGate)
   })
+  input.assertClaimOwned?.()
 
   if (cancelledDuringMaterialization) {
     return {
@@ -819,12 +834,14 @@ export async function materializeWorkforceFromArchitectArtifact(
         prepared: input.prepared,
       })
       if (registrations.length > 0) {
+        input.assertClaimOwned?.()
         const registrationIds = await registerPackagePlanEntries({
           taskId: input.taskId,
           sourceArtifactId: input.artifactId,
           sourcePlanVersion: input.planVersion,
           registrations,
         })
+        input.assertClaimOwned?.()
         const registrationsByPackage = new Map<string, string[]>()
         registrations.forEach((registration, index) => {
           if (!registration.projectionEligible) return
@@ -833,6 +850,7 @@ export async function materializeWorkforceFromArchitectArtifact(
           registrationsByPackage.set(registration.workPackageId, packageRegistrations)
         })
         for (const [workPackageId, packageRegistrations] of registrationsByPackage) {
+          input.assertClaimOwned?.()
           await db.update(workPackages).set({
             metadata: sql`jsonb_set(
               coalesce(${workPackages.metadata}, '{}'::jsonb)
@@ -843,6 +861,7 @@ export async function materializeWorkforceFromArchitectArtifact(
             )`,
             updatedAt: new Date(),
           }).where(and(eq(workPackages.id, workPackageId), eq(workPackages.taskId, input.taskId)))
+          input.assertClaimOwned?.()
         }
       }
     } finally {

@@ -13,6 +13,10 @@ import {
   type ClaimedTaskJob,
   type TaskJob,
 } from '@/worker/queue'
+import {
+  ClaimLeaseFence,
+  ClaimLeaseLostError,
+} from '@/worker/claim-lease-fence'
 
 const QUEUE_KEYS = [
   'forge:tasks',
@@ -1564,6 +1568,18 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
       await admin.lpush(renewalCase.ready, JSON.stringify(renewalCase.job))
       const claimed = await owner.claim(1)
       if (!claimed) throw new Error('Queue Redis renewal proof could not claim its job.')
+      const ownerFence = new ClaimLeaseFence()
+      const ownerMutation = vi.fn()
+      const recoveryMutation = vi.fn()
+      let releaseOwnerMutation!: () => void
+      const ownerMutationGate = new Promise<void>((resolve) => {
+        releaseOwnerMutation = resolve
+      })
+      const delayedOwnerMutation = (async () => {
+        await ownerMutationGate
+        ownerFence.assertOwned()
+        ownerMutation()
+      })()
       const originalMarker = await admin.hget(renewalCase.claims, claimed.occurrenceId)
       if (!originalMarker) throw new Error('Queue Redis renewal proof has no claim marker.')
       const originalNonce = originalMarker.split(':')[1]
@@ -1624,7 +1640,12 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
       }
       expect(await recovery.recoverStuckJobs(renewalStaleMs)).toBe(1)
       expect(await admin.lrange(renewalCase.ready, 0, -1)).toEqual([claimed.raw])
-      await expect(owner.renewClaim(claimed.raw)).resolves.toBe('stale_not_owner')
+      const ownerRenewal = await owner.renewClaim(claimed.raw)
+      expect(ownerRenewal).toBe('stale_not_owner')
+      if (ownerRenewal === 'stale_not_owner') ownerFence.markLost()
+      releaseOwnerMutation()
+      await expect(delayedOwnerMutation).rejects.toBeInstanceOf(ClaimLeaseLostError)
+      expect(ownerMutation).not.toHaveBeenCalled()
       await expect(owner.ack(claimed.raw)).rejects.toThrow('Queue transition stale_not_owner')
 
       const nextOwner = await recovery.claim(1)
@@ -1634,7 +1655,11 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
       if (!nextMarker) throw new Error('Queue Redis renewal proof has no later-owner marker.')
       await expect(recovery.renewClaim(nextOwner.raw)).resolves.toBe('renewed')
       await expect(recovery.renewClaim(nextOwner.raw)).resolves.toBe('renewed')
+      const recoveryFence = new ClaimLeaseFence()
+      recoveryFence.assertOwned()
+      recoveryMutation()
       await expect(recovery.ack(nextOwner.raw)).resolves.toBe('applied')
+      expect(recoveryMutation).toHaveBeenCalledOnce()
       expect(await admin.zrange(renewalCase.ackReceipts, 0, -1)).toContain(
         `${nextOwner.occurrenceId}:${nextMarker.split(':')[1]}`,
       )

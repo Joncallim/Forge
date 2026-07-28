@@ -199,8 +199,8 @@ describe('answered-question retry contract', () => {
   it('passes finalAttempt into answered-question processing', () => {
     const runtimeSource = fs.readFileSync(path.join(repoRoot, 'worker/runtime.ts'), 'utf8')
 
-    expect(runtimeSource).toContain(
-      'await processAnsweredQuestions(claimedAnswers.job.taskId, { finalAttempt })',
+    expect(runtimeSource).toMatch(
+      /await processAnsweredQuestions\(claimedAnswers\.job\.taskId, \{\s+claimLeaseFence,\s+finalAttempt,\s+\}\)/,
     )
   })
 
