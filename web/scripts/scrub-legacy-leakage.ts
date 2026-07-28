@@ -2,6 +2,7 @@ import { pathToFileURL } from 'node:url'
 import Redis from 'ioredis'
 import postgres from 'postgres'
 import { getRequiredEnv } from '../lib/env'
+import { scanJsonObjectKeys } from '../lib/json-object-key-scan'
 import { ARCHITECT_PLAN_HEADER } from '../lib/mcps/architect-plan-entries'
 import {
   LEGACY_TASK_EVENT_STORAGE_PATTERN,
@@ -622,6 +623,7 @@ function validateStoredV2Envelope(
 ): boolean {
   const parsedScore = Number(score)
   if (!Number.isSafeInteger(parsedScore) || parsedScore < 1) return false
+  if (scanJsonObjectKeys(raw) !== 'valid') return false
   try {
     const envelope: unknown = JSON.parse(raw)
     if (!isRecord(envelope)

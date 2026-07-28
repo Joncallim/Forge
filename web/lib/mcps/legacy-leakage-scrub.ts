@@ -618,6 +618,7 @@ function zeroScanPassed(evidence: Awaited<ReturnType<typeof finalZeroScan>>): bo
     && evidence.database.violations === 0
     && evidence.legacy.complete
     && evidence.legacy.remainingKeys === 0
+    && evidence.legacy.violations === 0
     && evidence.v2.complete
     && evidence.v2.violations === 0
 }
@@ -799,7 +800,7 @@ export async function runLegacyLeakageScrub(
       const passed = zeroScanPassed(final)
       const retryPhase: LegacyLeakageScrubPhase = !final.database.complete || final.database.violations > 0
         ? 'task_logs'
-        : !final.legacy.complete || final.legacy.remainingKeys > 0
+        : !final.legacy.complete || final.legacy.remainingKeys > 0 || final.legacy.violations > 0
           ? 'redis_legacy'
           : 'redis_v2_verify'
       current = await moveCheckpoint(dependencies.database, current, {

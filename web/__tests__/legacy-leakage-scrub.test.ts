@@ -4,6 +4,7 @@ import safeV2TaskEvents from './__fixtures__/safe-v2-task-events.json'
 import {
   LEGACY_TASK_LOG_UNAVAILABLE,
 } from '@/lib/mcps/leakage-drain'
+import { scanJsonObjectKeys } from '@/lib/json-object-key-scan'
 import {
   containsForbiddenV2EventData,
   compareCanonicalCodeUnits,
@@ -173,16 +174,23 @@ class FakeDatabase implements LegacyLeakageScrubDatabase {
 class FakeRedis implements LegacyLeakageScrubRedis {
   oldKeys = 2
   v2Violations = 0
+  legacyViolations = 0
+  legacyViolationAfterApply = false
   applyCalls: boolean[] = []
 
   async purgeLegacyTaskEventKeys({ apply }: { apply: boolean }): Promise<RedisScanEvidence> {
     this.applyCalls.push(apply)
     const found = this.oldKeys
-    if (apply) this.oldKeys = 0
+    const violations = this.legacyViolations
+    if (apply) {
+      this.oldKeys = 0
+      if (this.legacyViolationAfterApply) this.legacyViolations = 1
+    }
     return evidence({
       keysDeleted: apply ? found : 0,
       keysExamined: found,
       remainingKeys: this.oldKeys,
+      violations,
     })
   }
 
@@ -719,6 +727,39 @@ describe('legacy leakage scrub', () => {
       .rejects.toThrow('database or Redis leakage reappeared')
     expect(database.authorizationChecks).toBe(2)
   })
+
+  it('does not trust completed Redis verification when legacy evidence reports a violation', async () => {
+    const database = new FakeDatabase()
+    const redis = new FakeRedis()
+    const options = {
+      actor: 'operator', authorizationReceiptId: RECEIPT, fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID, mode: 'apply' as const, operationId: 'completion-legacy-violation',
+    }
+    const completed = await runLegacyLeakageScrub(options, { database, redis })
+    expect(completed.checkpoint?.state).toBe('complete')
+
+    redis.legacyViolations = 1
+    await expect(runLegacyLeakageScrub({ ...options, mode: 'resume' }, { database, redis }))
+      .rejects.toThrow('database or Redis leakage reappeared')
+    expect(redis.applyCalls.at(-1)).toBe(false)
+  })
+
+  it('returns final legacy violations to the redis_legacy recovery path before another delete', async () => {
+    const database = new FakeDatabase()
+    const redis = new FakeRedis()
+    redis.legacyViolationAfterApply = true
+    const options = {
+      actor: 'operator', authorizationReceiptId: RECEIPT, fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID, mode: 'apply' as const, operationId: 'final-legacy-violation',
+    }
+    const first = await runLegacyLeakageScrub(options, { database, redis })
+    expect(first.checkpoint).toMatchObject({ phase: 'redis_legacy', state: 'paused_conflict' })
+    const deletes = redis.applyCalls.filter(Boolean).length
+
+    const resumed = await runLegacyLeakageScrub({ ...options, mode: 'resume' }, { database, redis })
+    expect(resumed.checkpoint).toMatchObject({ phase: 'redis_legacy', state: 'paused_conflict' })
+    expect(redis.applyCalls.filter(Boolean)).toHaveLength(deletes)
+  })
 })
 
 describe('legacy leakage Redis adapter', () => {
@@ -739,6 +780,7 @@ describe('legacy leakage Redis adapter', () => {
     duplicate?: boolean
     loop?: boolean
     reappearLegacyAfterDelete?: boolean
+    reappearMalformedLegacyAfterDelete?: boolean
     reappearV2AfterDelete?: boolean
   }> = {}) {
     const deleted: string[] = []
@@ -763,6 +805,9 @@ describe('legacy leakage Redis adapter', () => {
         }
         if (options.reappearLegacyAfterDelete) {
           cells.set(`forge:task:${TASK_B}:seq`, { type: 'string', value: '3' })
+        }
+        if (options.reappearMalformedLegacyAfterDelete) {
+          cells.set('forge:task:not-a-uuid:history', { type: 'zset' })
         }
         if (options.reappearV2AfterDelete) {
           cells.set(`forge:task-events:v2:${TASK_B}:live`, { type: 'string', value: 'forbidden' })
@@ -823,6 +868,24 @@ describe('legacy leakage Redis adapter', () => {
         [`forge:task-events:v2:${TASK_A}:history`, { type: 'zset', entries: [[JSON.stringify({ schemaVersion: 2, id: 1, type: 'run:chunk', data: {} }), '1']] }],
         [`forge:task-events:v2:${TASK_A}:seq`, { type: 'string', value: '1' }],
       ])],
+      ['duplicate top-level data', new Map([
+        [`forge:task-events:v2:${TASK_A}:history`, { type: 'zset', entries: [[
+          '{"schemaVersion":2,"id":1,"type":"task:status","data":{},"data":{"errorMessage":null,"status":"running","updatedAt":"2026-07-22T00:00:00.000Z"}}', '1',
+        ]] }],
+        [`forge:task-events:v2:${TASK_A}:seq`, { type: 'string', value: '1' }],
+      ])],
+      ['duplicate nested key', new Map([
+        [`forge:task-events:v2:${TASK_A}:history`, { type: 'zset', entries: [[
+          '{"schemaVersion":2,"id":1,"type":"task:status","data":{"errorMessage":null,"status":"running","updatedAt":"2026-07-22T00:00:00.000Z","nested":{"a":1,"a":2}}}', '1',
+        ]] }],
+        [`forge:task-events:v2:${TASK_A}:seq`, { type: 'string', value: '1' }],
+      ])],
+      ['escaped-equivalent duplicate key hiding a sentinel', new Map([
+        [`forge:task-events:v2:${TASK_A}:history`, { type: 'zset', entries: [[
+          String.raw`{"schemaVersion":2,"id":1,"type":"task:status","data":{"errorMessage":null,"\u0065rrorMessage":"RAW-SENTINEL","status":"running","updatedAt":"2026-07-22T00:00:00.000Z"}}`, '1',
+        ]] }],
+        [`forge:task-events:v2:${TASK_A}:seq`, { type: 'string', value: '1' }],
+      ])],
       ['score mismatch', new Map([
         [`forge:task-events:v2:${TASK_A}:history`, { type: 'zset', entries: [[storedEnvelope(2), '1']] }],
         [`forge:task-events:v2:${TASK_A}:seq`, { type: 'string', value: '2' }],
@@ -871,6 +934,22 @@ describe('legacy leakage Redis adapter', () => {
     const reappearedEvidence = await createLegacyLeakageRedisAdapter(reappeared.fakeRedis as never)
       .purgeLegacyTaskEventKeys({ apply: true })
     expect(reappearedEvidence.remainingKeys).toBeGreaterThan(0)
+
+    const malformedReappeared = fakeRedisFor(new Map([
+      [`forge:task:${TASK_B}:history`, { type: 'zset' }],
+    ]), { reappearMalformedLegacyAfterDelete: true })
+    const malformedEvidence = await createLegacyLeakageRedisAdapter(malformedReappeared.fakeRedis as never)
+      .purgeLegacyTaskEventKeys({ apply: true })
+    expect(malformedEvidence).toMatchObject({ remainingKeys: 0, violations: 1 })
+  })
+
+  it('detects decoded duplicate JSON keys at every object level without conflating sibling objects', () => {
+    expect(scanJsonObjectKeys('{"data":{},"data":{}}')).toBe('duplicate-key')
+    expect(scanJsonObjectKeys('{"outer":{"key":1,"key":2}}')).toBe('duplicate-key')
+    expect(scanJsonObjectKeys(String.raw`{"data":{},"\u0064ata":{}}`)).toBe('duplicate-key')
+    expect(scanJsonObjectKeys('{"left":{"key":1},"right":{"key":2}}')).toBe('valid')
+    expect(scanJsonObjectKeys('{')).toBe('invalid')
+    expect(scanJsonObjectKeys(`${'{'.repeat(130)}${'}'.repeat(130)}`)).toBe('invalid')
   })
 })
 
