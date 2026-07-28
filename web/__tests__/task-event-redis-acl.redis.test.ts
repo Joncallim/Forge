@@ -112,9 +112,18 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
     return parsed.toString()
   }
 
-  async function setUser(user: string, password: string, rules: readonly string[]): Promise<void> {
-    ownedUsers.add(user)
+  async function sendSetUser(user: string, password: string, rules: readonly string[]): Promise<void> {
     await admin.call('ACL', 'SETUSER', user, 'reset', 'on', `>${password}`, ...rules)
+  }
+
+  async function setUser(
+    user: string,
+    password: string,
+    rules: readonly string[],
+    send: (user: string, password: string, rules: readonly string[]) => Promise<void> = sendSetUser,
+  ): Promise<void> {
+    ownedUsers.add(user)
+    await send(user, password, rules)
   }
 
   function aclTokens(value: unknown): readonly string[] {
@@ -168,6 +177,14 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
   async function assertAclAbsent(user: string): Promise<void> {
     if (await admin.call('ACL', 'GETUSER', user) !== null) {
       throw new Error('S4 Redis ACL proof found a temporary ACL identity after cleanup.')
+    }
+  }
+
+  async function cleanupTrackedUsers(users: Iterable<string>): Promise<void> {
+    for (const user of users) {
+      if (!ownedUsers.has(user)) throw new Error('S4 Redis ACL proof refused to clean an untracked ACL identity.')
+      await admin.call('ACL', 'DELUSER', user)
+      await assertAclAbsent(user)
     }
   }
 
@@ -273,11 +290,10 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
 
   afterAll(async () => {
     try {
-      for (const user of ownedUsers) await admin.call('ACL', 'DELUSER', user)
+      await cleanupTrackedUsers(ownedUsers)
       if (ownedKeys.size > 0) await admin.del(...ownedKeys)
       expect(await admin.dbsize()).toBe(0)
       assertDatabaseEvidence(await databaseEvidence(otherDatabaseAdmin), otherDatabaseBaseline)
-      for (const user of ownedUsers) await assertAclAbsent(user)
     } finally {
       for (const instance of clients) if (instance !== admin) instance.disconnect()
       admin?.disconnect()
@@ -287,6 +303,23 @@ describe.skipIf(!enabled)('S4 real Redis ACL task-event proof', () => {
   it('S4_REDIS_ACL_ROLE_ISOLATION: production publish, live delivery, and replay use distinct roles', async () => {
     const taskId = randomUUID()
     const keys = taskKeys(taskId)
+    const responseLossUser = `s4lost_${randomUUID().replaceAll('-', '')}`
+    const responseLossPassword = randomBytes(32).toString('base64url')
+    let responseWasLost = false
+    try {
+      await setUser(responseLossUser, responseLossPassword, publisherRules, async (user, password, rules) => {
+        await sendSetUser(user, password, rules)
+        throw new Error('S4 Redis ACL proof simulated a lost SETUSER response.')
+      })
+    } catch (error) {
+      responseWasLost = error instanceof Error && error.message === 'S4 Redis ACL proof simulated a lost SETUSER response.'
+    }
+    if (!responseWasLost) throw new Error('S4 Redis ACL proof did not observe the simulated SETUSER response loss.')
+    await assertAclIdentity(responseLossUser, { keys: publisherRules.filter((rule) => rule.startsWith('~')), channels: publisherRules.filter((rule) => rule.startsWith('&')), commands: publisherRules.filter((rule) => rule.startsWith('+')) })
+    await cleanupTrackedUsers([responseLossUser])
+    await assertAclAbsent(responseLossUser)
+    await cleanupTrackedUsers([responseLossUser])
+
     const configuration = (() => {
       const previousPublisher = process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL
       const previousSubscriber = process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL
