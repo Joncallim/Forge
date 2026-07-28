@@ -72,10 +72,17 @@ describe('task-event Redis credential boundary', () => {
   })
 
   it('rejects equivalent Redis ACL principals even when credentials or database differ', async () => {
-    process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = 'rediss://%65vent:publisher-password@Redis.Example.test/0'
+    process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = 'rediss://%65vent:publisher-password@Redis.Example.test./0'
     process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = 'redis://event:subscriber-password@redis.example.test:6379/15'
     const { taskEventRedisConfiguration } = await import('@/lib/task-event-redis')
     expect(() => taskEventRedisConfiguration('protected')).toThrow(/distinct ACL principals/i)
+  })
+
+  it('allows different ACL usernames on one normalized endpoint', async () => {
+    process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = 'redis://event-publisher:publisher-password@redis.example.test./0'
+    process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = 'rediss://event-subscriber:subscriber-password@REDIS.EXAMPLE.TEST:6379/15'
+    const { taskEventRedisConfiguration } = await import('@/lib/task-event-redis')
+    expect(taskEventRedisConfiguration('protected').dedicated).toBe(true)
   })
 
   it('allows distinct endpoints with the same ACL username', async () => {

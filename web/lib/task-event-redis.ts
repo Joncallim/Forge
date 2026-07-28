@@ -89,8 +89,12 @@ function taskEventRedisPrincipal(redisUrl: string): string {
   }
   // ACL usernames are case-sensitive. Endpoint DNS names are not; transport,
   // a database number, and a password never distinguish a Redis ACL principal.
+  const hostname = parsed.hostname.toLowerCase().replace(/\.+$/, '')
+  if (!hostname) {
+    throw new Error('Task-event Redis credentials must use authenticated redis:// or rediss:// URLs.')
+  }
   const effectivePort = parsed.port || '6379'
-  return JSON.stringify([parsed.hostname.toLowerCase(), effectivePort, username])
+  return JSON.stringify([hostname, effectivePort, username])
 }
 
 const globalForTaskEvents = globalThis as unknown as {
