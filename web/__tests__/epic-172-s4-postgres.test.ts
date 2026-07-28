@@ -8,11 +8,22 @@ import {
   resolveArchitectReplanEntry,
   resolveArchitectPlanEntry,
 } from '@/lib/mcps/s4-protocol-store'
-import { architectReplanReferenceForEntry } from '@/lib/mcps/architect-plan-entries'
+import { ARCHITECT_PLAN_HEADER, architectReplanReferenceForEntry } from '@/lib/mcps/architect-plan-entries'
 import { computeCredentialDigest } from '@/lib/session-credential-digest'
 import { appendArchitectClarificationAnswer, readArchitectPlanHistory } from '@/lib/mcps/history-reader'
 import { hashPassword } from '@/lib/password'
 import { closeDb } from '@/db'
+import {
+  LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX,
+  legacyLeakageRowFingerprint,
+  runLegacyLeakageScrub,
+  sanitizeLegacyLeakageRow,
+  type LegacyLeakageScrubCheckpoint,
+  type LegacyLeakageScrubRedis,
+  type LegacyLeakageScrubRow,
+  type RedisScanEvidence,
+} from '@/lib/mcps/legacy-leakage-scrub'
+import { createLegacyLeakagePostgresAdapter } from '@/scripts/scrub-legacy-leakage'
 
 const {
   mockRedisDel,
@@ -1473,4 +1484,292 @@ describe.skipIf(!enabled)('Epic 172 S4 PostgreSQL boundaries', () => {
     expect(row).toEqual({ agentRunId: runId, state: 'claimed' })
   })
 
+})
+
+describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () => {
+  const scrubKey = Buffer.alloc(32, 19)
+  const scrubKeyId = 's4-scrub-proof-v2'
+  const ids = {
+    user: randomUUID(), project: randomUUID(), task: randomUUID(), run: randomUUID(),
+    expandReceipt: randomUUID(), disabledReceipt: randomUUID(),
+  }
+  const redis: LegacyLeakageScrubRedis = {
+    async purgeLegacyTaskEventKeys(): Promise<RedisScanEvidence> {
+      return { complete: true, keysExamined: 0, keysDeleted: 0, remainingKeys: 0, valuesExamined: 0, violations: 0 }
+    },
+    async scanV2TaskEventHistory(): Promise<RedisScanEvidence> {
+      return { complete: true, keysExamined: 0, keysDeleted: 0, remainingKeys: 0, valuesExamined: 0, violations: 0 }
+    },
+  }
+  let admin: ReturnType<typeof postgres>
+  let prepared = false
+  const scrubOperationIds = new Set<string>()
+
+  function checkpointKey(operationId: string): string {
+    return `${LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX}${operationId}`
+  }
+
+  async function prepareScrubFixture(): Promise<void> {
+    if (prepared) return
+    const exactBuilds = JSON.stringify([`issue_179_s4@${'a'.repeat(40)}`])
+    const [signer] = await admin<{ id: string }[]>`
+      select id::text as id
+      from forge_release_signer_keys
+      where policy_id = 'forge-epic-172-release-signing-v1' and generation = 1
+    `
+    if (!signer) throw new Error('S4_SCRUB_POSTGRES fixture requires the shared canonical release signer generation 1.')
+    await admin.begin(async (tx) => {
+      await tx`insert into users (id, display_name) values (${ids.user}::uuid, 'S4 scrub proof')`
+      await tx`insert into projects (id, name, submitted_by, grant_decision_revision, root_binding_revision)
+        values (${ids.project}::uuid, 'S4 scrub proof', ${ids.user}::uuid, 1, 1)`
+      await tx`insert into tasks (id, project_id, submitted_by, title, prompt, status)
+        values (${ids.task}::uuid, ${ids.project}::uuid, ${ids.user}::uuid, 'S4 scrub proof', 'canonical prompt', 'running')`
+      await tx`insert into agent_runs (id, task_id, agent_type, model_id_used, status)
+        values (${ids.run}::uuid, ${ids.task}::uuid, 'architect', 'test', 'completed')`
+      await tx`insert into forge_epic_172_release_evidence (
+        id, evidence_kind, owner_issue, owner_slice, exact_builds, required_evidence, reviewed_sha, epoch,
+        predecessor_receipt_ids, predecessor_set_digest, transition_identity_digest, signer_key_id, signer_generation,
+        github_app_id, controller_run_id, controller_job_id, envelope_digest, detached_signature, nonce, issued_at, envelope
+      ) values
+        (${ids.expandReceipt}::uuid, 's4_expand', 179, 's4', ${exactBuilds}::text::jsonb,
+          '[{"name":"bootstrap","measurementDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]'::jsonb, ${'a'.repeat(40)}, 1, '[]'::jsonb, ${'0'.repeat(64)}, ${'1'.repeat(64)},
+          ${signer.id}::uuid, 1, 's4-scrub-proof', 'scrub-proof', 'expand', ${'2'.repeat(64)},
+          decode(repeat('aa', 64), 'hex'), ${randomUUID()}::uuid, transaction_timestamp(), '{}'::jsonb),
+        (${ids.disabledReceipt}::uuid, 's4_producers_disabled', 179, 's4', ${exactBuilds}::text::jsonb,
+          '[{"name":"s4_expand_receipt"},{"name":"legacy_credentials_publishers_and_sessions_drained"},{"name":"expansion_journal_reconciled_through_watermark"},{"name":"project_root_bindings_complete"},{"name":"legacy_prompt_and_event_data_zero_scan_green"},{"name":"all_v2_producers_disabled"}]'::jsonb,
+          ${'a'.repeat(40)}, 1, jsonb_build_array(${ids.expandReceipt}::text), ${'0'.repeat(64)}, ${'3'.repeat(64)},
+          ${signer.id}::uuid, 1, 's4-scrub-proof', 'scrub-proof', 'disabled', ${'4'.repeat(64)},
+          decode(repeat('bb', 64), 'hex'), ${randomUUID()}::uuid, transaction_timestamp(), '{}'::jsonb)
+      `
+      await tx`update forge_epic_172_enablement_state
+        set state = 'disabled', owner_operation_id = null, exact_builds = null, reviewed_sha = null, epoch = null,
+          enablement_receipt_id = null, final_readiness_receipt_id = null, opening_authorization_id = null,
+          controller_login_id = null, controller_run_id = null, controller_token_digest = null, lease_generation = null,
+          last_heartbeat_at = null, lease_expires_at = null, updated_at = clock_timestamp()
+        where singleton_id = 'epic-172'`
+      await tx`insert into task_logs (task_id, event_type, title, message, front_matter, metadata)
+        values (${ids.task}::uuid, 'scrub_proof', 'Scrub proof', 'RAW-SCRUB-SENTINEL',
+          '{"prompt":"RAW-SCRUB-PROMPT"}'::jsonb, '{"storageLocator":"/private/scrub-proof"}'::jsonb)`
+    })
+    prepared = true
+  }
+
+  beforeAll(() => {
+    admin = postgres(adminUrl!, { max: 3, onnotice: () => {} })
+  })
+
+  afterAll(async () => {
+    try {
+      // The protected artifact/version race intentionally commits immutable plan rows;
+      // only mutable fixture rows and operation checkpoints are removed here.
+      for (const operationId of scrubOperationIds) {
+        await admin`delete from app_settings where key = ${checkpointKey(operationId)}`
+      }
+      await admin`delete from task_logs where task_id = ${ids.task}::uuid`
+      const [rawResidue] = await admin<{ count: number }[]>`
+        select (
+          (select count(*) from task_logs
+            where task_id = ${ids.task}::uuid
+              and (message like '%RAW-SCRUB%' or message like '%RAW-REAPPEARED%'))
+          +
+          (select count(*) from artifacts
+            where agent_run_id = ${ids.run}::uuid
+              and (content like '%LEGACY-ADR-RACE-SENTINEL%' or content like '%RAW-SCRUB%'))
+        )::integer as count
+      `
+      expect(rawResidue.count).toBe(0)
+    } finally {
+      await admin?.end({ timeout: 5 })
+    }
+  })
+
+  it('S4_SCRUB_POSTGRES: authorizes, CAS-scrubs, resumes, and fails closed on reappearance', async () => {
+    await prepareScrubFixture()
+    console.info('S4_SCRUB_POSTGRES_START')
+    const adapter = createLegacyLeakagePostgresAdapter(admin, scrubKey)
+    const checkpointFor = async (operationId: string): Promise<LegacyLeakageScrubCheckpoint> => ({
+      schemaVersion: 2, operationId, actor: 'scrub-operator', authorizationReceiptId: ids.disabledReceipt,
+      fingerprintKeyId: scrubKeyId, sentinelSetFingerprint: 'a'.repeat(64), phase: 'task_logs', state: 'running',
+      lastKey: null, rowsExamined: 0, rowsChanged: 0, conflicts: 0, redisKeysExamined: 0, redisKeysDeleted: 0,
+      redisV2ValuesExamined: 0, lastPreFingerprint: null, lastPostFingerprint: null, databaseTime: await adapter.databaseTime(),
+    })
+    const before = await admin<{ count: number }[]>`select count(*)::integer as count from app_settings where key like 'epic172:s4:legacy-leakage-scrub:v1:%'`
+    await expect(runLegacyLeakageScrub({
+      actor: 'scrub-operator', authorizationReceiptId: randomUUID(), fingerprintKey: scrubKey,
+      fingerprintKeyId: scrubKeyId, mode: 'apply', operationId: `invalid-${randomUUID()}`,
+    }, { database: adapter, redis })).rejects.toThrow('fixed S4 producers-disabled drain contract')
+    const afterInvalid = await admin<{ count: number }[]>`select count(*)::integer as count from app_settings where key like 'epic172:s4:legacy-leakage-scrub:v1:%'`
+    expect(afterInvalid[0].count).toBe(before[0].count)
+
+    // Real row-CAS and checkpoint-token conflicts: neither may overwrite a concurrent value.
+    const [casLog] = await admin<{ id: string; message: string; frontMatter: Record<string, unknown>; metadata: Record<string, unknown> }[]>`
+      select id::text as id, message, front_matter as "frontMatter", metadata
+      from task_logs where task_id = ${ids.task}::uuid order by sequence desc limit 1`
+    const casRow: LegacyLeakageScrubRow = { id: casLog.id, kind: 'task_log', message: casLog.message, frontMatter: casLog.frontMatter, metadata: casLog.metadata }
+    const rowCasOperationId = `row-cas-${randomUUID()}`
+    scrubOperationIds.add(rowCasOperationId)
+    const casCheckpoint = await adapter.createCheckpoint(await checkpointFor(rowCasOperationId))
+    expect(casCheckpoint).not.toBeNull()
+    await admin`update task_logs set message = 'CONCURRENT-ROW-VALUE' where id = ${casRow.id}::uuid`
+    const rowConflict = await adapter.commitRow({
+      current: casCheckpoint!, expectedRowFingerprint: legacyLeakageRowFingerprint(casRow, scrubKey),
+      nextCheckpoint: { ...casCheckpoint!.checkpoint, lastKey: casRow.id, rowsExamined: 1, databaseTime: await adapter.databaseTime() },
+      row: sanitizeLegacyLeakageRow(casRow),
+    })
+    expect(rowConflict).toBe('row_conflict')
+    const [rowAfterConflict] = await admin<{ message: string }[]>`select message from task_logs where id = ${casRow.id}::uuid`
+    expect(rowAfterConflict.message).toBe('CONCURRENT-ROW-VALUE')
+    const [checkpointAfterRowConflict] = await admin<{ value: string }[]>`
+      select value from app_settings where key = ${checkpointKey(rowCasOperationId)}`
+    expect(checkpointAfterRowConflict.value).toBe(casCheckpoint!.token)
+
+    const checkpointCasOperationId = `checkpoint-cas-${randomUUID()}`
+    scrubOperationIds.add(checkpointCasOperationId)
+    const tokenCheckpoint = await adapter.createCheckpoint(await checkpointFor(checkpointCasOperationId))
+    expect(tokenCheckpoint).not.toBeNull()
+    const advanced = await adapter.compareAndSetCheckpoint(tokenCheckpoint!, {
+      ...tokenCheckpoint!.checkpoint, databaseTime: await adapter.databaseTime(),
+    })
+    expect(advanced).not.toBeNull()
+    const externallyAdvancedCheckpointBytes = advanced!.token
+    const tokenConflict = await adapter.commitRow({
+      current: tokenCheckpoint!, expectedRowFingerprint: legacyLeakageRowFingerprint({ ...casRow, message: 'CONCURRENT-ROW-VALUE' }, scrubKey),
+      nextCheckpoint: { ...tokenCheckpoint!.checkpoint, lastKey: casRow.id, rowsExamined: 1, databaseTime: await adapter.databaseTime() },
+      row: sanitizeLegacyLeakageRow({ ...casRow, message: 'CONCURRENT-ROW-VALUE' }),
+    })
+    expect(tokenConflict).toBe('checkpoint_conflict')
+    const [rowAfterTokenConflict] = await admin<{ message: string }[]>`select message from task_logs where id = ${casRow.id}::uuid`
+    expect(rowAfterTokenConflict.message).toBe('CONCURRENT-ROW-VALUE')
+    const [checkpointAfterTokenConflict] = await admin<{ value: string }[]>`
+      select value from app_settings where key = ${checkpointKey(checkpointCasOperationId)}`
+    expect(checkpointAfterTokenConflict.value).toBe(externallyAdvancedCheckpointBytes)
+
+    const operationId = `pg-scrub-${randomUUID()}`
+    scrubOperationIds.add(operationId)
+    const applied = await runLegacyLeakageScrub({
+      actor: 'scrub-operator', authorizationReceiptId: ids.disabledReceipt, fingerprintKey: scrubKey,
+      fingerprintKeyId: scrubKeyId, mode: 'apply', operationId, batchSize: 1_000, maxBatches: 1_000,
+    }, { database: adapter, redis })
+    expect(applied.checkpoint?.state).toBe('complete')
+    const [scrubbed] = await admin<{ message: string; metadata: Record<string, unknown> }[]>`
+      select message, metadata from task_logs where task_id = ${ids.task}::uuid order by sequence desc limit 1`
+    expect(scrubbed.message).toBe('legacy_task_log_unavailable')
+    expect(JSON.stringify(scrubbed.metadata)).not.toContain('RAW-SCRUB')
+
+    // A complete replay reads the persisted checkpoint and cannot re-scrub or double-count rows.
+    const replay = await runLegacyLeakageScrub({
+      actor: 'scrub-operator', authorizationReceiptId: ids.disabledReceipt, fingerprintKey: scrubKey,
+      fingerprintKeyId: scrubKeyId, mode: 'resume', operationId, batchSize: 1_000, maxBatches: 1_000,
+    }, { database: adapter, redis })
+    expect(replay.checkpoint).toEqual(applied.checkpoint)
+
+    await admin`update task_logs set message = 'RAW-REAPPEARED-SENTINEL' where task_id = ${ids.task}::uuid`
+    await expect(runLegacyLeakageScrub({
+      actor: 'scrub-operator', authorizationReceiptId: ids.disabledReceipt, fingerprintKey: scrubKey,
+      fingerprintKeyId: scrubKeyId, mode: 'resume', operationId, batchSize: 1_000, maxBatches: 1_000,
+    }, { database: adapter, redis })).rejects.toThrow('database or Redis leakage reappeared')
+    await admin`delete from task_logs where task_id = ${ids.task}::uuid`
+    console.info('S4_SCRUB_POSTGRES_AUTH_CAS_RESUME_OK')
+  })
+
+  it('S4_SCRUB_POSTGRES_ARTIFACT_LINK_RACE: post-lock reload refuses a newly protected artifact', async () => {
+    await prepareScrubFixture()
+    const adapterUrl = new URL(adminUrl!)
+    adapterUrl.searchParams.set('application_name', `s4-scrub-race-${randomUUID()}`)
+    const scrubSql = postgres(adapterUrl.toString(), { max: 1, onnotice: () => {} })
+    const adapter = createLegacyLeakagePostgresAdapter(scrubSql, scrubKey)
+    const artifactId = randomUUID()
+    await admin`insert into artifacts (id, agent_run_id, artifact_type, content, metadata)
+      values (${artifactId}::uuid, ${ids.run}::uuid, 'adr_text', 'LEGACY-ADR-RACE-SENTINEL', '{"legacy":true}'::jsonb)`
+    const artifactRaceOperationId = `artifact-race-${randomUUID()}`
+    scrubOperationIds.add(artifactRaceOperationId)
+    const checkpoint = await adapter.createCheckpoint({
+      schemaVersion: 2, operationId: artifactRaceOperationId, actor: 'scrub-operator', authorizationReceiptId: ids.disabledReceipt,
+      fingerprintKeyId: scrubKeyId, sentinelSetFingerprint: 'a'.repeat(64), phase: 'artifacts', state: 'running',
+      lastKey: null, rowsExamined: 0, rowsChanged: 0, conflicts: 0, redisKeysExamined: 0, redisKeysDeleted: 0,
+      redisV2ValuesExamined: 0, lastPreFingerprint: null, lastPostFingerprint: null, databaseTime: await adapter.databaseTime(),
+    })
+    expect(checkpoint).not.toBeNull()
+    const scanned = await adapter.scanRows('artifacts', null, 10_000)
+    const source = scanned.find((row) => row.id === artifactId)
+    expect(source).toEqual({
+      id: artifactId,
+      kind: 'artifact',
+      content: 'LEGACY-ADR-RACE-SENTINEL',
+      metadata: { legacy: true },
+      replaceContent: true,
+    })
+    if (!source) throw new Error('S4 scrub artifact race fixture was not returned by the production artifacts scanner.')
+    const linkerUrl = new URL(adminUrl!)
+    linkerUrl.searchParams.set('application_name', `s4-artifact-linker-${randomUUID()}`)
+    const linker = postgres(linkerUrl.toString(), { max: 1, onnotice: () => {} })
+    const [scrubBackend] = await scrubSql<{ pid: number }[]>`select pg_backend_pid() as pid`
+    const [linkerBackend] = await linker<{ pid: number }[]>`select pg_backend_pid() as pid`
+    let releaseLinker!: () => void
+    const linkerRelease = new Promise<void>((resolve) => { releaseLinker = resolve })
+    let linkerTransactionStarted!: () => void
+    const linkerTransactionStartedPromise = new Promise<void>((resolve) => { linkerTransactionStarted = resolve })
+    let linkerLocked!: () => void
+    const linkerLockedPromise = new Promise<void>((resolve) => { linkerLocked = resolve })
+    const linkerTransaction = linker.begin(async (tx) => {
+      linkerTransactionStarted()
+      await tx`select id from artifacts where id = ${artifactId}::uuid for update`
+      await tx`update artifacts set content = ${ARCHITECT_PLAN_HEADER}, metadata = '{"historyAvailable":true}'::jsonb where id = ${artifactId}::uuid`
+      await tx`insert into architect_plan_versions (task_id, plan_artifact_id, plan_version, digest_key_id, entry_count, entry_set_digest, structural_set_digest)
+        values (${ids.task}::uuid, ${artifactId}::uuid, 1, 's4-test-key', 1, ${`hmac-sha256:${'a'.repeat(64)}`}, ${`hmac-sha256:${'b'.repeat(64)}`})`
+      await tx`insert into architect_plan_entries (task_id, plan_artifact_id, plan_version, entry_id, entry_kind, content, content_digest, digest_key_id, projection_eligible)
+        values (${ids.task}::uuid, ${artifactId}::uuid, 1, 'plan_body:000000', 'plan_body', 'PROTECTED-ENTRY-NEVER-READ', ${`hmac-sha256:${'c'.repeat(64)}`}, 's4-test-key', false)`
+      linkerLocked()
+      await linkerRelease
+    })
+    let commitPromise: Promise<'committed' | 'row_conflict' | 'checkpoint_conflict'> | undefined
+    let linkerReleased = false
+    const releaseLinkerOnce = () => {
+      if (!linkerReleased) {
+        linkerReleased = true
+        releaseLinker()
+      }
+    }
+    try {
+      await linkerTransactionStartedPromise
+      await linkerLockedPromise
+      const checkpointBytesBeforeRace = checkpoint!.token
+      let scrubCommitStarted!: () => void
+      const scrubCommitStartedPromise = new Promise<void>((resolve) => { scrubCommitStarted = resolve })
+      commitPromise = Promise.resolve().then(async () => {
+        scrubCommitStarted()
+        return adapter.commitRow({
+          current: checkpoint!, expectedRowFingerprint: legacyLeakageRowFingerprint(source, scrubKey),
+          nextCheckpoint: { ...checkpoint!.checkpoint, lastKey: artifactId, rowsExamined: 1, databaseTime: await adapter.databaseTime() },
+          row: sanitizeLegacyLeakageRow(source),
+        })
+      })
+      await scrubCommitStartedPromise
+      let blockerObserved = false
+      for (let attempt = 0; attempt < 40 && !blockerObserved; attempt += 1) {
+        const [row] = await admin<{ pid: number; state: string; waitEventType: string | null; blockingPids: number[] }[]>`
+          select pid, state, wait_event_type as "waitEventType", pg_blocking_pids(pid) as "blockingPids"
+          from pg_stat_activity
+          where pid = ${scrubBackend.pid}`
+        blockerObserved = row?.waitEventType === 'Lock' && row.blockingPids.includes(linkerBackend.pid)
+        if (!blockerObserved) await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      expect(blockerObserved).toBe(true)
+      releaseLinkerOnce()
+      await linkerTransaction
+      await expect(commitPromise).resolves.toBe('row_conflict')
+      const [checkpointAfterRace] = await admin<{ value: string }[]>`
+        select value from app_settings where key = ${checkpointKey(artifactRaceOperationId)}`
+      expect(checkpointAfterRace.value).toBe(checkpointBytesBeforeRace)
+    } finally {
+      releaseLinkerOnce()
+      await Promise.allSettled([linkerTransaction, ...(commitPromise ? [commitPromise] : [])])
+      await Promise.all([linker.end({ timeout: 5 }), scrubSql.end({ timeout: 5 })])
+    }
+    const [artifact] = await admin<{ content: string; protectedVersions: number }[]>`
+      select a.content, (select count(*)::integer from architect_plan_versions where plan_artifact_id = a.id) as "protectedVersions"
+      from artifacts a where a.id = ${artifactId}::uuid`
+    expect(artifact).toEqual({ content: ARCHITECT_PLAN_HEADER, protectedVersions: 1 })
+    console.info('S4_SCRUB_POSTGRES_ARTIFACT_LINK_RACE_OK')
+  })
 })
