@@ -77,7 +77,7 @@ const TASK_ID = '11111111-1111-4111-8111-111111111111'
 type Occurrence = {
   schemaVersion: number
   occurrenceId: string
-  job: { taskId: string; attempt: number }
+  job: TaskJob | ApprovalJob | AnswersJob
 }
 
 function parseOccurrence(raw: string): Occurrence {
@@ -94,10 +94,22 @@ function occurrence(index: number): string {
 
 describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () => {
   let admin: Redis
-  const queues = new Set<TaskQueue>()
+  const queues = new Set<{ disconnect: () => void }>()
 
   function queue(): TaskQueue {
     const created = new TaskQueue(destructiveRedisUrl!)
+    queues.add(created)
+    return created
+  }
+
+  function approvalQueue(): ApprovalQueue {
+    const created = new ApprovalQueue(destructiveRedisUrl!)
+    queues.add(created)
+    return created
+  }
+
+  function answersQueue(): AnswersQueue {
+    const created = new AnswersQueue(destructiveRedisUrl!)
     queues.add(created)
     return created
   }
@@ -189,6 +201,91 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
     expect(new Set(dead.map((entry) => entry.occurrenceId))).toEqual(
       new Set([first.occurrenceId, second.occurrenceId]),
     )
+
+    await admin.del(...QUEUE_KEYS)
+    expect(await admin.dbsize()).toBe(0)
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const now = await redisTimeMs()
+    const retryUpgradeCases = [
+      {
+        currentJob: { taskId: TASK_ID, attempt: 5 },
+        legacyJob: { taskId: TASK_ID, attempt: 4 },
+        queue: queue(),
+        ready: 'forge:tasks',
+        retry: 'forge:tasks:retry',
+      },
+      {
+        currentJob: { taskId: TASK_ID, action: 'approve' as const, attempt: 7 },
+        legacyJob: { taskId: TASK_ID, action: 'approve' as const, attempt: 6 },
+        queue: approvalQueue(),
+        ready: 'forge:approvals',
+        retry: 'forge:approvals:retry',
+      },
+      {
+        currentJob: { taskId: TASK_ID, attempt: 9 },
+        legacyJob: { taskId: TASK_ID, attempt: 8 },
+        queue: answersQueue(),
+        ready: 'forge:answers',
+        retry: 'forge:answers:retry',
+      },
+    ]
+    const poisons: string[] = []
+    for (const [index, queueCase] of retryUpgradeCases.entries()) {
+      const poison = JSON.stringify({
+        taskId: TASK_ID,
+        attempt: 1,
+        prompt: `RETRY_POISON_SENTINEL_${index}_/private/token`,
+      })
+      poisons.push(poison)
+      const legacyRetry = JSON.stringify(queueCase.legacyJob)
+      const currentOccurrenceId = `00000000-0000-4000-8000-${String(800 + index)
+        .padStart(12, '0')}`
+      const currentRetry = JSON.stringify({
+        schemaVersion: 1,
+        occurrenceId: currentOccurrenceId,
+        job: queueCase.currentJob,
+      })
+      await admin.zadd(
+        queueCase.retry,
+        now - 3,
+        poison,
+        now - 2,
+        legacyRetry,
+        now - 1,
+        currentRetry,
+      )
+
+      expect(await queueCase.queue.promoteDueRetries(10)).toBe(2)
+      expect(await admin.zcard(queueCase.retry)).toBe(0)
+      const ready = (await admin.lrange(queueCase.ready, 0, -1)).map(parseOccurrence)
+      expect(ready).toHaveLength(2)
+      expect(ready.map((entry) => entry.job)).toEqual(
+        expect.arrayContaining([queueCase.legacyJob, queueCase.currentJob]),
+      )
+      expect(ready.find((entry) => entry.occurrenceId === currentOccurrenceId)?.job)
+        .toEqual(queueCase.currentJob)
+      const upgraded = ready.find((entry) => entry.occurrenceId !== currentOccurrenceId)
+      expect(upgraded?.occurrenceId).toMatch(/^[0-9a-f-]{36}$/)
+      expect(upgraded?.job).toEqual(queueCase.legacyJob)
+      for (const entry of ready) {
+        expect(Object.keys(entry).sort()).toEqual(['job', 'occurrenceId', 'schemaVersion'])
+      }
+    }
+
+    expect(warn.mock.calls).toEqual(retryUpgradeCases.map(() => [
+      '[worker/queue] Dropped invalid retry payload',
+    ]))
+    const persistedQueueValues: string[] = []
+    for (const key of QUEUE_KEYS) {
+      const type = await admin.type(key)
+      if (type === 'list') persistedQueueValues.push(...await admin.lrange(key, 0, -1))
+      if (type === 'zset') persistedQueueValues.push(...await admin.zrange(key, 0, -1))
+      if (type === 'hash') persistedQueueValues.push(...Object.values(await admin.hgetall(key)))
+    }
+    for (const poison of poisons) {
+      expect(persistedQueueValues.some((value) => value.includes(poison))).toBe(false)
+      expect(JSON.stringify(warn.mock.calls)).not.toContain(poison)
+    }
     console.info('QUEUE_OCCURRENCE_REDIS_MULTIPLICITY_OK')
   }, 20_000)
 

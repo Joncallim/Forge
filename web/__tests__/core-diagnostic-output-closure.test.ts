@@ -104,7 +104,7 @@ vi.mock('ioredis', () => {
       if (injectedFailure(script, 'before')) throw new Error('injected_redis_failure')
       const keys = values.slice(0, numberOfKeys)
       const args = values.slice(numberOfKeys)
-      let result: number | string = 0
+      let result: number | string | string[] = 0
 
       if (script.includes('forge:queue:claim-v2')) {
         const [source, envelope, occurrenceId, nonce, mode] = args
@@ -179,12 +179,21 @@ vi.mock('ioredis', () => {
           && list(keys[2]).includes(args[3])) {
           result = 2
         }
-      } else if (script.includes('forge:queue:promote-retry-v2')) {
-        if (zset(keys[0]).has(args[0])) {
-          zset(keys[0]).delete(args[0])
-          list(keys[1]).unshift(args[0])
+      } else if (script.includes('forge:queue:list-due-retries-v1')) {
+        result = [...zset(keys[0]).entries()]
+          .filter(([, score]) => score >= 0 && score <= redisHarness.nowMs)
+          .sort((left, right) => left[1] - right[1])
+          .slice(0, Number(args[0]))
+          .map(([member]) => member)
+      } else if (script.includes('forge:queue:promote-retry-v3')) {
+        const [source, destination, mode] = args
+        if (mode === 'discard') {
+          result = zset(keys[0]).delete(source) ? 3 : 2
+        } else if (zset(keys[0]).has(source)) {
+          zset(keys[0]).delete(source)
+          list(keys[1]).unshift(destination)
           result = 1
-        } else if (list(keys[1]).includes(args[0])) {
+        } else if (list(keys[1]).includes(destination)) {
           result = 2
         }
       } else if (script.includes('forge:queue:recover-stuck-v2')) {
@@ -749,7 +758,7 @@ describe('core operational output closure', () => {
       expect(retryState.size).toBe(1)
       expect(redisHarness.lists.get(queueCase.processing)).not.toContain(retryClaim.raw)
 
-      redisHarness.failures.push({ marker: 'forge:queue:promote-retry-v2', stage: 'after' })
+      redisHarness.failures.push({ marker: 'forge:queue:promote-retry-v3', stage: 'after' })
       await expect(queue.promoteDueRetries()).rejects.toThrow('Queue retry promotion failed')
       await expect(queue.promoteDueRetries()).resolves.toBe(0)
       const promotedRaw = [...retryState.keys()][0]
@@ -793,6 +802,121 @@ describe('core operational output closure', () => {
         redisHarness.hashes.get(queueCase.claims)?.has(recoveryClaim.occurrenceId) ?? false,
       ).toBe(false)
     }
+  })
+
+  it('atomically upgrades legacy retries and discards poison without blocking later work', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const { AnswersQueue, ApprovalQueue, TaskQueue } = await import('@/worker/queue')
+    const oversized = `{"taskId":"${TASK_ID}","padding":"${'x'.repeat(1_000_000)}"}`
+    const cases = [
+      {
+        create: () => new TaskQueue('redis://localhost:6379/0'),
+        currentJob: { taskId: TASK_ID, attempt: 8 },
+        legacyJob: { taskId: TASK_ID, attempt: 7 },
+        poisons: [
+          String.raw`{"taskId":"${TASK_ID}","task\u0049d":"${SENTINELS[0]}"}`,
+          JSON.stringify({ taskId: TASK_ID, attempt: 1, prompt: SENTINELS[0] }),
+        ],
+        ready: 'forge:tasks',
+        retry: 'forge:tasks:retry',
+      },
+      {
+        create: () => new ApprovalQueue('redis://localhost:6379/0'),
+        currentJob: { taskId: TASK_ID, action: 'approve' as const, attempt: 10 },
+        legacyJob: { taskId: TASK_ID, action: 'approve' as const, attempt: 9 },
+        poisons: [
+          '{"taskId":',
+          JSON.stringify({
+            taskId: TASK_ID,
+            action: 'reject',
+            attempt: 1,
+            output: SENTINELS[0],
+          }),
+        ],
+        ready: 'forge:approvals',
+        retry: 'forge:approvals:retry',
+      },
+      {
+        create: () => new AnswersQueue('redis://localhost:6379/0'),
+        currentJob: { taskId: TASK_ID, attempt: 12 },
+        legacyJob: { taskId: TASK_ID, attempt: 11 },
+        poisons: [
+          oversized,
+          JSON.stringify({ taskId: 'not-a-uuid', attempt: 1, token: SENTINELS[3] }),
+        ],
+        ready: 'forge:answers',
+        retry: 'forge:answers:retry',
+      },
+    ]
+
+    for (const [caseIndex, queueCase] of cases.entries()) {
+      const queue = queueCase.create() as unknown as AtomicQueue
+      const currentOccurrenceId = `00000000-0000-4000-8000-${String(700 + caseIndex)
+        .padStart(12, '0')}`
+      const current = JSON.stringify({
+        schemaVersion: 1,
+        occurrenceId: currentOccurrenceId,
+        job: queueCase.currentJob,
+      })
+      const legacy = JSON.stringify(queueCase.legacyJob)
+      const future = JSON.stringify({
+        schemaVersion: 1,
+        occurrenceId: `00000000-0000-4000-8000-${String(710 + caseIndex)
+          .padStart(12, '0')}`,
+        job: queueCase.currentJob,
+      })
+      redisHarness.zsets.set(queueCase.retry, new Map([
+        [queueCase.poisons[0], redisHarness.nowMs - 5],
+        [queueCase.poisons[1], redisHarness.nowMs - 4],
+        [legacy, redisHarness.nowMs - 3],
+        [current, redisHarness.nowMs - 2],
+        [future, redisHarness.nowMs + 10_000],
+      ]))
+
+      const beforeFailure = new Map(redisHarness.zsets.get(queueCase.retry))
+      redisHarness.failures.push({ marker: 'forge:queue:promote-retry-v3', stage: 'before' })
+      await expect(queue.promoteDueRetries()).rejects.toThrow('Queue retry promotion failed')
+      expect(redisHarness.zsets.get(queueCase.retry)).toEqual(beforeFailure)
+      expect(redisHarness.lists.get(queueCase.ready)?.length ?? 0).toBe(0)
+
+      await expect(queue.promoteDueRetries()).resolves.toBe(2)
+      expect(redisHarness.zsets.get(queueCase.retry)).toEqual(new Map([
+        [future, redisHarness.nowMs + 10_000],
+      ]))
+      const ready = redisHarness.lists.get(queueCase.ready) ?? []
+      expect(ready).toHaveLength(2)
+      const parsed = ready.map(parsedOccurrence)
+      expect(parsed.map((entry) => entry.job)).toEqual(
+        expect.arrayContaining([queueCase.currentJob, queueCase.legacyJob]),
+      )
+      expect(parsed.find((entry) => entry.occurrenceId === currentOccurrenceId)?.job)
+        .toEqual(queueCase.currentJob)
+      const legacyOccurrence = parsed.find((entry) => entry.occurrenceId !== currentOccurrenceId)
+      expect(legacyOccurrence?.occurrenceId).toMatch(/^[0-9a-f-]{36}$/)
+      expect(legacyOccurrence?.job).toEqual(queueCase.legacyJob)
+
+      redisHarness.lists.set(queueCase.ready, [])
+      redisHarness.zsets.set(queueCase.retry, new Map([
+        [legacy, redisHarness.nowMs - 1],
+      ]))
+      redisHarness.failures.push({ marker: 'forge:queue:promote-retry-v3', stage: 'after' })
+      await expect(queue.promoteDueRetries()).rejects.toThrow('Queue retry promotion failed')
+      expect(redisHarness.zsets.get(queueCase.retry)?.size ?? 0).toBe(0)
+      const responseLossReady = redisHarness.lists.get(queueCase.ready) ?? []
+      expect(responseLossReady).toHaveLength(1)
+      expect(parsedOccurrence(responseLossReady[0]).job).toEqual(queueCase.legacyJob)
+      await expect(queue.promoteDueRetries()).resolves.toBe(0)
+      expect(redisHarness.lists.get(queueCase.ready)).toEqual(responseLossReady)
+    }
+
+    expect(warn.mock.calls).toEqual(Array.from({ length: cases.length * 2 }, () => [
+      '[worker/queue] Dropped invalid retry payload',
+    ]))
+    assertNoSentinels({
+      lists: [...redisHarness.lists.values()],
+      logs: warn.mock.calls,
+      retry: [...redisHarness.zsets.values()].map((entries) => [...entries]),
+    })
   })
 
   it('keeps identical occurrences distinct through retry, promotion, recovery, and dead letter', async () => {
@@ -1431,6 +1555,20 @@ describe('core output source sentinel', () => {
     expect(queueSource).toContain('const TRANSITION_RECEIPT_TTL_MS = 15 * 60 * 1000')
     expect(queueSource).toContain('const TRANSITION_RECEIPT_CAP = 50_000')
     expect(queueSource).toContain('const TRANSITION_RECEIPT_PRUNE_LIMIT = 100')
+    expect(queueSource).toContain('-- forge:queue:list-due-retries-v1')
+    expect(queueSource).toContain('-- forge:queue:promote-retry-v3')
+    expect(queueSource).toContain("ARGV[3] == 'discard'")
+    expect(queueSource).toContain("return { destination: '', mode: 'discard' }")
+    expect(queueSource).toContain("console.warn('[worker/queue] Dropped invalid retry payload')")
+    expect(queueSource).toMatch(
+      /-- forge:queue:promote-retry-v3[\s\S]{0,900}redis\.call\('ZREM', KEYS\[1\], ARGV\[1\]\)[\s\S]{0,300}redis\.call\('LPUSH', KEYS\[2\], ARGV\[2\]\)/,
+    )
+    expect(queueSource).not.toMatch(
+      /promoteDueRetries[\s\S]{0,300}this\.client\.zrangebyscore/,
+    )
+    expect(queueSource).not.toMatch(
+      /promoteDueRetries[\s\S]{0,1500}this\.client\.(?:zrem|lpush)/,
+    )
     expect(queueSource).toContain("redis.call('RPUSH', KEYS[1], ARGV[1])")
     expect(queueSource).toContain('const STUCK_RECOVERY_SCAN_LIMIT = 100')
     expect(queueSource).not.toMatch(/this\.client\.lpush\(this\.deadQueueKey,[\s\S]{0,300}\braw,/)

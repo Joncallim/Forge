@@ -32,6 +32,7 @@ const STUCK_RECOVERY_SCAN_LIMIT = 100
 const TRANSITION_RECEIPT_TTL_MS = 15 * 60 * 1000
 const TRANSITION_RECEIPT_CAP = 50_000
 const TRANSITION_RECEIPT_PRUNE_LIMIT = 100
+const RETRY_PROMOTION_LIMIT_MAX = 100
 const TASK_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const CLAIM_MARKER_PATTERN = /^([1-9][0-9]*):([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/
 
@@ -48,6 +49,11 @@ type QueueEnvelope<TJob> = {
 export type QueueTransitionOutcome = 'applied' | 'already_applied'
 
 type QueueTransitionResult = QueueTransitionOutcome | 'stale_not_owner'
+
+type RetryPromotionCandidate = {
+  destination: string
+  mode: 'discard' | 'legacy' | 'occurrence'
+}
 
 type ClaimedQueueJob<TJob> = {
   raw: string
@@ -314,16 +320,39 @@ end
 return 0
 `
 
+const LIST_DUE_RETRIES_SCRIPT = `
+-- forge:queue:list-due-retries-v1
+${LUA_TYPE_HELPER}
+assert_type(KEYS[1], 'zset')
+local limit = tonumber(ARGV[1])
+if not limit or limit < 1 or limit > ${RETRY_PROMOTION_LIMIT_MAX}
+    or math.floor(limit) ~= limit then
+  error('forge_queue_retry_limit_invalid')
+end
+local now = redis.call('TIME')
+local now_ms = (tonumber(now[1]) * 1000) + math.floor(tonumber(now[2]) / 1000)
+return redis.call('ZRANGEBYSCORE', KEYS[1], 0, now_ms, 'LIMIT', 0, limit)
+`
+
 const PROMOTE_RETRY_SCRIPT = `
--- forge:queue:promote-retry-v2
+-- forge:queue:promote-retry-v3
 ${LUA_TYPE_HELPER}
 assert_type(KEYS[1], 'zset')
 assert_type(KEYS[2], 'list')
+if ARGV[3] == 'discard' then
+  if redis.call('ZREM', KEYS[1], ARGV[1]) == 1 then
+    return 3
+  end
+  return 2
+end
+if ARGV[3] ~= 'legacy' and ARGV[3] ~= 'occurrence' then
+  error('forge_queue_retry_mode_invalid')
+end
 if redis.call('ZREM', KEYS[1], ARGV[1]) == 1 then
-  redis.call('LPUSH', KEYS[2], ARGV[1])
+  redis.call('LPUSH', KEYS[2], ARGV[2])
   return 1
 end
-if redis.call('LPOS', KEYS[2], ARGV[1]) then
+if redis.call('LPOS', KEYS[2], ARGV[2]) then
   return 2
 end
 return 0
@@ -506,6 +535,23 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
         job,
       } satisfies QueueEnvelope<TJob>
       return { envelope, envelopeRaw: canonicalEnvelope(occurrenceId, job), mode: 'legacy' }
+    }
+  }
+
+  private parseRetryPromotionCandidate(raw: string): RetryPromotionCandidate {
+    try {
+      this.parseEnvelope(raw)
+      return { destination: raw, mode: 'occurrence' }
+    } catch {
+      try {
+        const job = this.parse(raw)
+        return {
+          destination: canonicalEnvelope(randomUUID(), job),
+          mode: 'legacy',
+        }
+      } catch {
+        return { destination: '', mode: 'discard' }
+      }
     }
   }
 
@@ -733,31 +779,41 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
   }
 
   async promoteDueRetries(limit = 20): Promise<number> {
-    if (!Number.isSafeInteger(limit) || limit < 1) {
-      throw new Error('Queue promotion limit must be a positive safe integer')
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > RETRY_PROMOTION_LIMIT_MAX) {
+      throw new Error('Queue promotion limit must be a bounded positive safe integer')
     }
-    const due = await this.client.zrangebyscore(
-      this.retryQueueKey,
-      0,
-      Date.now(),
-      'LIMIT',
-      0,
-      limit,
+    const dueResult = await this.evalClosed(
+      'Queue retry promotion scan failed',
+      LIST_DUE_RETRIES_SCRIPT,
+      [this.retryQueueKey],
+      [String(limit)],
     )
+    if (!Array.isArray(dueResult)
+      || dueResult.length > limit
+      || dueResult.some((member) => typeof member !== 'string')) {
+      throw new Error('Queue retry promotion scan returned an invalid result')
+    }
+    const due = dueResult as string[]
 
     let promoted = 0
     for (const raw of due) {
-      try {
-        this.parseEnvelope(raw)
-      } catch {
-        throw new Error('Queue retry occurrence is invalid')
-      }
-      const result = this.decodeTransition(await this.evalClosed(
+      const candidate = this.parseRetryPromotionCandidate(raw)
+      const rawResult = await this.evalClosed(
         'Queue retry promotion failed',
         PROMOTE_RETRY_SCRIPT,
         [this.retryQueueKey, this.queueKey],
-        [raw],
-      ))
+        [raw, candidate.destination, candidate.mode],
+      )
+      if (candidate.mode === 'discard') {
+        if (rawResult !== 2 && rawResult !== 3) {
+          throw new Error('Queue retry discard returned an invalid result')
+        }
+        if (rawResult === 3) {
+          console.warn('[worker/queue] Dropped invalid retry payload')
+        }
+        continue
+      }
+      const result = this.decodeTransition(rawResult)
       if (result === 'stale_not_owner') {
         throw new Error('Queue retry promotion ownership mismatch')
       }
