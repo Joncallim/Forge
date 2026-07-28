@@ -739,6 +739,94 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
     }
     expect(warn).toHaveBeenCalledTimes(contentionCases.length)
 
+    const dumpRedisValue = async (key: string): Promise<Buffer> => {
+      const value = await admin.callBuffer('DUMP', key)
+      if (!Buffer.isBuffer(value)) {
+        throw new Error('Queue Redis receipt proof could not fingerprint owned state.')
+      }
+      return value
+    }
+    for (const [caseIndex, queueCase] of contentionCases.entries()) {
+      const candidateOccurrenceId = `00000000-0000-4000-8000-${String(1_300 + caseIndex)
+        .padStart(12, '0')}`
+      const mismatchedOccurrenceId = `00000000-0000-4000-8000-${String(1_400 + caseIndex)
+        .padStart(12, '0')}`
+      for (const mismatch of [true, false]) {
+        await admin.del(
+          queueCase.ready,
+          queueCase.retry,
+          queueCase.receipts,
+          queueCase.receiptExpiry,
+        )
+        const raw = JSON.stringify({
+          schemaVersion: 1,
+          occurrenceId: candidateOccurrenceId,
+          job: queueCase.job,
+        })
+        await admin.zadd(queueCase.retry, (await redisTimeMs()) - 1, raw)
+        const receiptQueue = queueCase.create()
+        const receiptClient = (receiptQueue as unknown as { client: Redis }).client
+        const originalBuffer = receiptClient.callBuffer.bind(receiptClient)
+        let removeScannedSource = true
+        vi.spyOn(receiptClient, 'callBuffer').mockImplementation(async (
+          ...args: Parameters<Redis['callBuffer']>
+        ) => {
+          const result = await originalBuffer(...args)
+          if (removeScannedSource
+            && String(args[1]).includes('forge:queue:list-due-retries-v1')) {
+            removeScannedSource = false
+            await admin.zrem(queueCase.retry, raw)
+          }
+          return result
+        })
+        const originalCall = receiptClient.call.bind(receiptClient)
+        let fingerprint = ''
+        let receiptHashBefore: Buffer | undefined
+        let receiptExpiryBefore: Buffer | undefined
+        vi.spyOn(receiptClient, 'call').mockImplementation(async (
+          ...args: Parameters<Redis['call']>
+        ) => {
+          if (String(args[1]).includes('forge:queue:promote-retry-v4')) {
+            fingerprint = String(args[9])
+            expect(String(args[10])).toBe('occurrence')
+            expect(String(args[12])).toBe(candidateOccurrenceId)
+            const winner = mismatch ? mismatchedOccurrenceId : candidateOccurrenceId
+            await admin.hset(queueCase.receipts, fingerprint, `promoted:${winner}`)
+            await admin.zadd(queueCase.receiptExpiry, (await redisTimeMs()) - 1, fingerprint)
+            if (!mismatch) await admin.lpush(queueCase.ready, raw)
+            receiptHashBefore = await dumpRedisValue(queueCase.receipts)
+            receiptExpiryBefore = await dumpRedisValue(queueCase.receiptExpiry)
+          }
+          return await originalCall(...args)
+        })
+
+        if (mismatch) {
+          let failure: unknown
+          try {
+            await receiptQueue.promoteDueRetries(1)
+          } catch (error) {
+            failure = error
+          }
+          expect(failure).toBeInstanceOf(Error)
+          expect((failure as Error).message)
+            .toBe('Queue retry promotion receipt integrity failure')
+          expect(failure).not.toBeInstanceOf(RetryPromotionConflictError)
+        } else {
+          await expect(receiptQueue.promoteDueRetries(1)).resolves.toBe(0)
+        }
+
+        expect(fingerprint).toMatch(/^[0-9a-f]{64}$/)
+        expect(receiptHashBefore).toBeDefined()
+        expect(receiptExpiryBefore).toBeDefined()
+        expect((await dumpRedisValue(queueCase.receipts)).equals(receiptHashBefore!)).toBe(true)
+        expect((await dumpRedisValue(queueCase.receiptExpiry)).equals(receiptExpiryBefore!))
+          .toBe(true)
+        expect(await admin.zcard(queueCase.retry)).toBe(0)
+        expect(await admin.lrange(queueCase.ready, 0, -1))
+          .toEqual(mismatch ? [] : [raw])
+      }
+    }
+
     await admin.del(...QUEUE_KEYS)
     const lostResponseRaw = JSON.stringify({ taskId: TASK_ID, attempt: 16 })
     await admin.zadd('forge:tasks:retry', (await redisTimeMs()) - 1, lostResponseRaw)

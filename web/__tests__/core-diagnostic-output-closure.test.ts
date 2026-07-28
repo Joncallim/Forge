@@ -256,7 +256,10 @@ vi.mock('ioredis', () => {
             } else if (existing === 'discarded' && mode === 'discard') {
               result = [2, 'discarded', '']
             } else if (winningOccurrenceId !== null && mode !== 'discard') {
-              result = [2, 'promoted', winningOccurrenceId]
+              result = mode === 'occurrence'
+                && winningOccurrenceId !== candidateOccurrenceId
+                ? [0, 'receipt_integrity_failure', '']
+                : [2, 'promoted', winningOccurrenceId]
             } else {
               result = [0, 'receipt_integrity_failure', '']
             }
@@ -1418,6 +1421,7 @@ describe('core operational output closure', () => {
 
     const exercise = async (options: {
       attempt: number
+      canonicalOccurrenceId?: string
       expectOwnershipConflict?: boolean
       expectReplay?: boolean
       sourcePresent?: boolean
@@ -1428,7 +1432,14 @@ describe('core operational output closure', () => {
       redisHarness.lists.set(readyKey, [])
       redisHarness.zsets.delete(expiryKey)
       redisHarness.zsets.delete(retryKey)
-      const raw = JSON.stringify({ taskId: TASK_ID, attempt: options.attempt })
+      const job = { taskId: TASK_ID, attempt: options.attempt }
+      const raw = options.canonicalOccurrenceId
+        ? JSON.stringify({
+            schemaVersion: 1,
+            occurrenceId: options.canonicalOccurrenceId,
+            job,
+          })
+        : JSON.stringify(job)
       const score = String(redisHarness.nowMs - 1)
       if (options.sourcePresent) {
         redisHarness.zsets.set(retryKey, new Map([[raw, Number(score)]]))
@@ -1524,6 +1535,47 @@ describe('core operational output closure', () => {
           .toBe(`promoted:${winningOccurrenceId}`)
         expect(redisHarness.zsets.get(expiryKey)?.get(fingerprint))
           .toBe(redisHarness.nowMs - ttlMs + 1)
+      },
+    })
+
+    const canonicalOccurrenceId = '00000000-0000-4000-8000-000000001101'
+    await exercise({
+      attempt: 211,
+      canonicalOccurrenceId,
+      setup: (fingerprint) => {
+        redisHarness.hashes.set(receiptsKey, new Map([
+          [fingerprint, `promoted:${winningOccurrenceId}`],
+        ]))
+        redisHarness.zsets.set(expiryKey, new Map([
+          [fingerprint, redisHarness.nowMs - 1],
+        ]))
+      },
+      verify: (fingerprint) => {
+        expect(redisHarness.hashes.get(receiptsKey)?.get(fingerprint))
+          .toBe(`promoted:${winningOccurrenceId}`)
+        expect(redisHarness.zsets.get(expiryKey)?.get(fingerprint))
+          .toBe(redisHarness.nowMs - 1)
+        expect(redisHarness.lists.get(readyKey)).toEqual([])
+      },
+    })
+
+    await exercise({
+      attempt: 212,
+      canonicalOccurrenceId: winningOccurrenceId,
+      expectReplay: true,
+      setup: (fingerprint) => {
+        redisHarness.hashes.set(receiptsKey, new Map([
+          [fingerprint, `promoted:${winningOccurrenceId}`],
+        ]))
+        redisHarness.zsets.set(expiryKey, new Map([
+          [fingerprint, redisHarness.nowMs - 1],
+        ]))
+      },
+      verify: (fingerprint) => {
+        expect(redisHarness.hashes.get(receiptsKey)?.get(fingerprint))
+          .toBe(`promoted:${winningOccurrenceId}`)
+        expect(redisHarness.zsets.get(expiryKey)?.get(fingerprint))
+          .toBe(redisHarness.nowMs - 1)
       },
     })
 
@@ -2870,6 +2922,16 @@ describe('core output source sentinel', () => {
     expect(promotionScript).toContain("'LIMIT',\n  0,\n  prune_limit")
     expect(promotionScript).toContain(
       "redis.call('HLEN', KEYS[3]) >= cap or redis.call('ZCARD', KEYS[4]) >= cap",
+    )
+    const canonicalReceiptGuard =
+      "if mode == 'occurrence' and winning_occurrence_id ~= candidate_occurrence_id then"
+    const canonicalReceiptGuardIndex = promotionScript.indexOf(canonicalReceiptGuard)
+    const promotedReplayIndex =
+      promotionScript.indexOf("return {2, 'promoted', winning_occurrence_id}")
+    expect(canonicalReceiptGuardIndex).toBeGreaterThanOrEqual(0)
+    expect(canonicalReceiptGuardIndex).toBeLessThan(promotedReplayIndex)
+    expect(promotionScript.slice(canonicalReceiptGuardIndex, promotedReplayIndex)).toContain(
+      "return {0, 'receipt_integrity_failure', ''}",
     )
     expect(promotionScript).toContain("return {2, 'promoted', winning_occurrence_id}")
     expect(promotionScript).toContain("return {2, 'discarded', ''}")
