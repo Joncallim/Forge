@@ -467,19 +467,6 @@ if mode ~= 'discard' and not valid_uuid(candidate_occurrence_id) then
 end
 local now_ms = redis_now_ms()
 local cutoff = now_ms - ttl_ms
-local expired = redis.call(
-  'ZRANGEBYSCORE',
-  KEYS[4],
-  '-inf',
-  cutoff,
-  'LIMIT',
-  0,
-  prune_limit
-)
-for _, expired_fingerprint in ipairs(expired) do
-  redis.call('ZREM', KEYS[4], expired_fingerprint)
-  redis.call('HDEL', KEYS[3], expired_fingerprint)
-end
 local current_score = redis.call('ZSCORE', KEYS[1], raw_member)
 local existing = redis.call('HGET', KEYS[3], fingerprint)
 local receipt_score = redis.call('ZSCORE', KEYS[4], fingerprint)
@@ -523,6 +510,19 @@ if current_score ~= expected_score then
 end
 if existing or receipt_score then
   return {0, 'receipt_integrity_failure', ''}
+end
+local expired = redis.call(
+  'ZRANGEBYSCORE',
+  KEYS[4],
+  '-inf',
+  cutoff,
+  'LIMIT',
+  0,
+  prune_limit
+)
+for _, expired_fingerprint in ipairs(expired) do
+  redis.call('ZREM', KEYS[4], expired_fingerprint)
+  redis.call('HDEL', KEYS[3], expired_fingerprint)
 end
 if redis.call('HLEN', KEYS[3]) >= cap or redis.call('ZCARD', KEYS[4]) >= cap then
   error('forge_queue_retry_receipt_capacity_exhausted')

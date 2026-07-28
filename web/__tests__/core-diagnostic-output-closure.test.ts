@@ -228,14 +228,6 @@ vi.mock('ioredis', () => {
         const expiry = zset(keys[3])
         const receiptTtlMs = Number(receiptTtlMsRaw)
         const pruneLimit = Number(pruneLimitRaw)
-        const expired = [...expiry.entries()]
-          .filter(([, score]) => score <= redisHarness.nowMs - receiptTtlMs)
-          .sort((left, right) => left[1] - right[1])
-          .slice(0, pruneLimit)
-        for (const [expiredFingerprint] of expired) {
-          expiry.delete(expiredFingerprint)
-          dispositions.delete(expiredFingerprint)
-        }
         const existing = dispositions.get(fingerprint)
         const receiptScore = expiry.get(fingerprint)
         const currentScore = zset(keys[0]).get(source)
@@ -273,20 +265,30 @@ vi.mock('ioredis', () => {
           result = [0, 'ownership_conflict', '']
         } else if (existing !== undefined || receiptScore !== undefined) {
           result = [0, 'receipt_integrity_failure', '']
-        } else if (dispositions.size >= Number(receiptCapRaw)
-          || expiry.size >= Number(receiptCapRaw)) {
-          throw new Error('forge_queue_retry_receipt_capacity_exhausted')
         } else {
-          zset(keys[0]).delete(source)
-          if (mode === 'discard') {
-            dispositions.set(fingerprint, 'discarded')
-            expiry.set(fingerprint, redisHarness.nowMs)
-            result = [1, 'discarded', '']
+          const expired = [...expiry.entries()]
+            .filter(([, score]) => score <= redisHarness.nowMs - receiptTtlMs)
+            .sort((left, right) => left[1] - right[1])
+            .slice(0, pruneLimit)
+          for (const [expiredFingerprint] of expired) {
+            expiry.delete(expiredFingerprint)
+            dispositions.delete(expiredFingerprint)
+          }
+          if (dispositions.size >= Number(receiptCapRaw)
+            || expiry.size >= Number(receiptCapRaw)) {
+            throw new Error('forge_queue_retry_receipt_capacity_exhausted')
           } else {
-            list(keys[1]).unshift(destination)
-            dispositions.set(fingerprint, `promoted:${candidateOccurrenceId}`)
-            expiry.set(fingerprint, redisHarness.nowMs)
-            result = [1, 'promoted', candidateOccurrenceId]
+            zset(keys[0]).delete(source)
+            if (mode === 'discard') {
+              dispositions.set(fingerprint, 'discarded')
+              expiry.set(fingerprint, redisHarness.nowMs)
+              result = [1, 'discarded', '']
+            } else {
+              list(keys[1]).unshift(destination)
+              dispositions.set(fingerprint, `promoted:${candidateOccurrenceId}`)
+              expiry.set(fingerprint, redisHarness.nowMs)
+              result = [1, 'promoted', candidateOccurrenceId]
+            }
           }
         }
       } else if (script.includes('forge:queue:recover-stuck-v2')) {
@@ -1479,10 +1481,31 @@ describe('core operational output closure', () => {
       options.verify?.(fingerprint)
     }
 
+    const ownershipExpiredFingerprint = 'a'.repeat(64)
+    const ownershipLiveFingerprint = 'b'.repeat(64)
     await exercise({
       attempt: 20,
       expectOwnershipConflict: true,
-      setup: () => {},
+      setup: () => {
+        redisHarness.hashes.set(receiptsKey, new Map([
+          [ownershipExpiredFingerprint, 'discarded'],
+          [ownershipLiveFingerprint, `promoted:${winningOccurrenceId}`],
+        ]))
+        redisHarness.zsets.set(expiryKey, new Map([
+          [ownershipExpiredFingerprint, redisHarness.nowMs - ttlMs - 1],
+          [ownershipLiveFingerprint, redisHarness.nowMs - 1],
+        ]))
+      },
+      verify: () => {
+        expect(redisHarness.hashes.get(receiptsKey)).toEqual(new Map([
+          [ownershipExpiredFingerprint, 'discarded'],
+          [ownershipLiveFingerprint, `promoted:${winningOccurrenceId}`],
+        ]))
+        expect(redisHarness.zsets.get(expiryKey)).toEqual(new Map([
+          [ownershipExpiredFingerprint, redisHarness.nowMs - ttlMs - 1],
+          [ownershipLiveFingerprint, redisHarness.nowMs - 1],
+        ]))
+      },
     })
 
     await exercise({
@@ -2704,6 +2727,28 @@ describe('core output source sentinel', () => {
     expect(promotionScript).toContain('if existing or receipt_score then')
     expect(promotionScript).toContain("return {0, 'ownership_conflict', ''}")
     expect(promotionScript).toContain("return {0, 'receipt_integrity_failure', ''}")
+    const sourceReadIndex =
+      promotionScript.indexOf("local current_score = redis.call('ZSCORE', KEYS[1], raw_member)")
+    const sourceAbsentOwnershipIndex = promotionScript.indexOf(
+      "if not existing and not receipt_score then",
+    )
+    const sourceScoreOwnershipIndex =
+      promotionScript.indexOf('if current_score ~= expected_score then')
+    const exactReceiptGuardIndex = promotionScript.indexOf('if existing or receipt_score then')
+    const globalPruneIndex =
+      promotionScript.indexOf("local expired = redis.call(\n  'ZRANGEBYSCORE'")
+    const capacityIndex = promotionScript.indexOf(
+      "redis.call('HLEN', KEYS[3]) >= cap",
+    )
+    const sourceRemovalIndex =
+      promotionScript.indexOf("redis.call('ZREM', KEYS[1], raw_member)")
+    expect(sourceReadIndex).toBeGreaterThanOrEqual(0)
+    expect(sourceReadIndex).toBeLessThan(sourceAbsentOwnershipIndex)
+    expect(sourceAbsentOwnershipIndex).toBeLessThan(globalPruneIndex)
+    expect(sourceScoreOwnershipIndex).toBeLessThan(globalPruneIndex)
+    expect(exactReceiptGuardIndex).toBeLessThan(globalPruneIndex)
+    expect(globalPruneIndex).toBeLessThan(capacityIndex)
+    expect(capacityIndex).toBeLessThan(sourceRemovalIndex)
     expect(promotionScript).toContain('receipt_timestamp <= now_ms')
     expect(promotionScript).toContain('receipt_timestamp > cutoff')
     expect(promotionScript).toContain('receipt_timestamp ~= math.huge')

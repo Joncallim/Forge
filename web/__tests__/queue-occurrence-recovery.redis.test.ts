@@ -814,6 +814,23 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
     const ownershipRaw = JSON.stringify({ taskId: TASK_ID, attempt: 17 })
     const ownershipScore = (await redisTimeMs()) - 1
     await admin.zadd('forge:tasks:retry', ownershipScore, ownershipRaw)
+    const ownershipExpiredFingerprint = '8'.repeat(64)
+    const ownershipLiveFingerprint = '9'.repeat(64)
+    const ownershipReceiptTime = await redisTimeMs()
+    await admin.hset(
+      'forge:tasks:promotion-dispositions',
+      ownershipExpiredFingerprint,
+      'discarded',
+      ownershipLiveFingerprint,
+      `promoted:${randomUUID()}`,
+    )
+    await admin.zadd(
+      'forge:tasks:promotion-disposition-expiry',
+      ownershipReceiptTime - (16 * 60 * 1000),
+      ownershipExpiredFingerprint,
+      ownershipReceiptTime - 1,
+      ownershipLiveFingerprint,
+    )
     const originalOwnershipBuffer = ownershipClient.callBuffer.bind(ownershipClient)
     let mutateScore = true
     vi.spyOn(ownershipClient, 'callBuffer').mockImplementation(async (
@@ -831,6 +848,15 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
     expect(await admin.zscore('forge:tasks:retry', ownershipRaw))
       .toBe(String(ownershipScore + 1))
     expect(await admin.llen('forge:tasks')).toBe(0)
+    expect(await admin.hgetall('forge:tasks:promotion-dispositions')).toEqual({
+      [ownershipExpiredFingerprint]: 'discarded',
+      [ownershipLiveFingerprint]: expect.stringMatching(/^promoted:[0-9a-f-]{36}$/),
+    })
+    expect(await admin.zrange(
+      'forge:tasks:promotion-disposition-expiry',
+      0,
+      -1,
+    )).toEqual([ownershipExpiredFingerprint, ownershipLiveFingerprint])
 
     await admin.del(...QUEUE_KEYS)
     const unrelatedQueue = queue()
@@ -1080,6 +1106,17 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
     const mixedVersionCases = [
       {
         create: () => queue(),
+        family: [
+          'forge:tasks',
+          'forge:tasks:processing',
+          'forge:tasks:retry',
+          'forge:tasks:dead',
+          'forge:tasks:claims',
+          'forge:tasks:ack-receipts',
+          'forge:tasks:release-receipts',
+          'forge:tasks:promotion-dispositions',
+          'forge:tasks:promotion-disposition-expiry',
+        ],
         job: (attempt: number): TaskJob => ({ taskId: TASK_ID, attempt }),
         ready: 'forge:tasks',
         receiptExpiry: 'forge:tasks:promotion-disposition-expiry',
@@ -1088,6 +1125,17 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
       },
       {
         create: () => approvalQueue(),
+        family: [
+          'forge:approvals',
+          'forge:approvals:processing',
+          'forge:approvals:retry',
+          'forge:approvals:dead',
+          'forge:approvals:claims',
+          'forge:approvals:ack-receipts',
+          'forge:approvals:release-receipts',
+          'forge:approvals:promotion-dispositions',
+          'forge:approvals:promotion-disposition-expiry',
+        ],
         job: (attempt: number): ApprovalJob => ({
           taskId: TASK_ID,
           action: 'approve',
@@ -1100,6 +1148,17 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
       },
       {
         create: () => answersQueue(),
+        family: [
+          'forge:answers',
+          'forge:answers:processing',
+          'forge:answers:retry',
+          'forge:answers:dead',
+          'forge:answers:claims',
+          'forge:answers:ack-receipts',
+          'forge:answers:release-receipts',
+          'forge:answers:promotion-dispositions',
+          'forge:answers:promotion-disposition-expiry',
+        ],
         job: (attempt: number): AnswersJob => ({ taskId: TASK_ID, attempt }),
         ready: 'forge:answers',
         receiptExpiry: 'forge:answers:promotion-disposition-expiry',
@@ -1123,20 +1182,49 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
         raw,
       ))
     }
-    const mixedState = async (queueCase: typeof mixedVersionCases[number]) => ({
-      ready: await admin.lrange(queueCase.ready, 0, -1),
-      receiptExpiry: await admin.zrange(
-        queueCase.receiptExpiry,
-        0,
-        -1,
-        'WITHSCORES',
-      ),
-      receipts: await admin.hgetall(queueCase.receipts),
-      retry: await admin.zrange(queueCase.retry, 0, -1, 'WITHSCORES'),
-    })
+    const mixedState = async (queueCase: typeof mixedVersionCases[number]) => {
+      const family = Object.fromEntries(await Promise.all(queueCase.family.map(async (key) => {
+        const dump = await admin.callBuffer('DUMP', key)
+        if (dump !== null && !Buffer.isBuffer(dump)) {
+          throw new Error('Queue Redis mixed-version proof received a non-binary key dump.')
+        }
+        return [key, dump?.toString('hex') ?? null]
+      })))
+      return {
+        family,
+        ready: await admin.lrange(queueCase.ready, 0, -1),
+        receiptExpiry: await admin.zrange(
+          queueCase.receiptExpiry,
+          0,
+          -1,
+          'WITHSCORES',
+        ),
+        receipts: await admin.hgetall(queueCase.receipts),
+        retry: await admin.zrange(queueCase.retry, 0, -1, 'WITHSCORES'),
+      }
+    }
 
     for (const [caseIndex, queueCase] of mixedVersionCases.entries()) {
       await admin.del(...QUEUE_KEYS)
+      const expiredFingerprint = String(caseIndex + 1).repeat(64)
+      const liveFingerprint = String(caseIndex + 4).repeat(64)
+      const liveOccurrenceId =
+        `00000000-0000-4000-8000-${String(1_500 + caseIndex).padStart(12, '0')}`
+      const receiptSeedTime = await redisTimeMs()
+      await admin.hset(
+        queueCase.receipts,
+        expiredFingerprint,
+        'discarded',
+        liveFingerprint,
+        `promoted:${liveOccurrenceId}`,
+      )
+      await admin.zadd(
+        queueCase.receiptExpiry,
+        receiptSeedTime - (16 * 60 * 1000),
+        expiredFingerprint,
+        receiptSeedTime - 1,
+        liveFingerprint,
+      )
       const v2FirstRaw = JSON.stringify({
         schemaVersion: 1,
         occurrenceId: `00000000-0000-4000-8000-${String(1_300 + caseIndex).padStart(12, '0')}`,
@@ -1177,10 +1265,29 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
       expect(await mixedState(queueCase)).toEqual(afterHistoricalWinner)
       expect(afterHistoricalWinner.ready).toEqual([v2FirstRaw])
       expect(afterHistoricalWinner.retry).toEqual([])
-      expect(afterHistoricalWinner.receipts).toEqual({})
-      expect(afterHistoricalWinner.receiptExpiry).toEqual([])
+      expect(afterHistoricalWinner.receipts).toEqual({
+        [expiredFingerprint]: 'discarded',
+        [liveFingerprint]: `promoted:${liveOccurrenceId}`,
+      })
+      expect(new Set(afterHistoricalWinner.receiptExpiry.filter((_, index) => index % 2 === 0)))
+        .toEqual(new Set([expiredFingerprint, liveFingerprint]))
 
       await admin.del(...QUEUE_KEYS)
+      const applySeedTime = await redisTimeMs()
+      await admin.hset(
+        queueCase.receipts,
+        expiredFingerprint,
+        'discarded',
+        liveFingerprint,
+        `promoted:${liveOccurrenceId}`,
+      )
+      await admin.zadd(
+        queueCase.receiptExpiry,
+        applySeedTime - (16 * 60 * 1000),
+        expiredFingerprint,
+        applySeedTime - 1,
+        liveFingerprint,
+      )
       const newFirstRaw = JSON.stringify({
         schemaVersion: 1,
         occurrenceId: `00000000-0000-4000-8000-${String(1_400 + caseIndex).padStart(12, '0')}`,
@@ -1196,9 +1303,18 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
       const newFirstState = await mixedState(queueCase)
       expect(newFirstState.ready).toEqual([newFirstRaw])
       expect(newFirstState.retry).toEqual([])
+      expect(newFirstState.receipts[expiredFingerprint]).toBeUndefined()
+      expect(newFirstState.receipts[liveFingerprint]).toBe(`promoted:${liveOccurrenceId}`)
       expect(Object.values(newFirstState.receipts))
-        .toEqual([`promoted:${parseOccurrence(newFirstRaw).occurrenceId}`])
-      expect(newFirstState.receiptExpiry).toHaveLength(2)
+        .toContain(`promoted:${parseOccurrence(newFirstRaw).occurrenceId}`)
+      expect(Object.keys(newFirstState.receipts)).toHaveLength(2)
+      const newReceiptIndexMembers =
+        newFirstState.receiptExpiry.filter((_, index) => index % 2 === 0)
+      expect(newReceiptIndexMembers).toHaveLength(2)
+      expect(newReceiptIndexMembers).toContain(liveFingerprint)
+      expect(newReceiptIndexMembers).not.toContain(expiredFingerprint)
+      expect(newReceiptIndexMembers.every((member) => /^[0-9a-f]{64}$/.test(member)))
+        .toBe(true)
 
       await admin.del(...QUEUE_KEYS)
       const legacyRaw = JSON.stringify(queueCase.job(60 + caseIndex))
