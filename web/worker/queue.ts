@@ -427,20 +427,42 @@ for _, expired_fingerprint in ipairs(expired) do
 end
 local current_score = redis.call('ZSCORE', KEYS[1], raw_member)
 local existing = redis.call('HGET', KEYS[3], fingerprint)
+local receipt_score = redis.call('ZSCORE', KEYS[4], fingerprint)
 if not current_score then
-  if not existing then
+  if not existing or not receipt_score then
+    if existing or receipt_score then
+      redis.call('HDEL', KEYS[3], fingerprint)
+      redis.call('ZREM', KEYS[4], fingerprint)
+    end
+    return {0, 'stale', ''}
+  end
+  local receipt_timestamp = tonumber(receipt_score)
+  local receipt_timestamp_valid = receipt_timestamp
+      and receipt_timestamp == receipt_timestamp
+      and receipt_timestamp ~= math.huge
+      and receipt_timestamp ~= -math.huge
+      and receipt_timestamp <= now_ms
+      and receipt_timestamp > cutoff
+  local winning_occurrence_id = nil
+  local disposition_valid = existing == 'discarded'
+  if not disposition_valid then
+    winning_occurrence_id = string.match(existing, '^promoted:([^:]+)$')
+    disposition_valid = winning_occurrence_id and valid_uuid(winning_occurrence_id)
+  end
+  if not receipt_timestamp_valid or not disposition_valid then
+    redis.call('HDEL', KEYS[3], fingerprint)
+    redis.call('ZREM', KEYS[4], fingerprint)
     return {0, 'stale', ''}
   end
   if existing == 'discarded' and mode == 'discard' then
     return {2, 'discarded', ''}
   end
-  local winning_occurrence_id = string.match(existing, '^promoted:([^:]+)$')
-  if winning_occurrence_id and valid_uuid(winning_occurrence_id) and mode ~= 'discard' then
+  if winning_occurrence_id and mode ~= 'discard' then
     return {2, 'promoted', winning_occurrence_id}
   end
   return {0, 'stale', ''}
 end
-if current_score ~= expected_score or existing then
+if current_score ~= expected_score or existing or receipt_score then
   return {0, 'stale', ''}
 end
 if redis.call('HLEN', KEYS[3]) >= cap or redis.call('ZCARD', KEYS[4]) >= cap then

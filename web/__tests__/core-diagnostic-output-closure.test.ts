@@ -42,7 +42,7 @@ type AtomicQueue = {
     raw: string
   } | null>
   deadLetter: (raw: string, job: AtomicQueueJob) => Promise<'already_applied' | 'applied'>
-  promoteDueRetries: () => Promise<number>
+  promoteDueRetries: (limit?: number) => Promise<number>
   recoverStuckJobs: (staleMs: number, options?: { drain?: boolean }) => Promise<number>
   release: (raw: string) => Promise<'already_applied' | 'applied'>
   retry: (raw: string, job: AtomicQueueJob, delayMs: number) => Promise<{
@@ -218,16 +218,41 @@ vi.mock('ioredis', () => {
           dispositions.delete(expiredFingerprint)
         }
         const existing = dispositions.get(fingerprint)
+        const receiptScore = expiry.get(fingerprint)
         const currentScore = zset(keys[0]).get(source)
         if (currentScore === undefined) {
-          if (existing === 'discarded' && mode === 'discard') {
-            result = [2, 'discarded', '']
-          } else if (existing?.startsWith('promoted:') && mode !== 'discard') {
-            result = [2, 'promoted', existing.slice('promoted:'.length)]
-          } else {
+          if (existing === undefined || receiptScore === undefined) {
+            if (existing !== undefined || receiptScore !== undefined) {
+              dispositions.delete(fingerprint)
+              expiry.delete(fingerprint)
+            }
             result = [0, 'stale', '']
+          } else {
+            const winningOccurrenceId = existing.startsWith('promoted:')
+              ? existing.slice('promoted:'.length)
+              : null
+            const validDisposition = existing === 'discarded'
+              || (winningOccurrenceId !== null
+                && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+                  .test(winningOccurrenceId))
+            const validTimestamp = Number.isFinite(receiptScore)
+              && receiptScore <= redisHarness.nowMs
+              && receiptScore > redisHarness.nowMs - receiptTtlMs
+            if (!validDisposition || !validTimestamp) {
+              dispositions.delete(fingerprint)
+              expiry.delete(fingerprint)
+              result = [0, 'stale', '']
+            } else if (existing === 'discarded' && mode === 'discard') {
+              result = [2, 'discarded', '']
+            } else if (winningOccurrenceId !== null && mode !== 'discard') {
+              result = [2, 'promoted', winningOccurrenceId]
+            } else {
+              result = [0, 'stale', '']
+            }
           }
-        } else if (String(currentScore) !== expectedScore || existing) {
+        } else if (String(currentScore) !== expectedScore
+          || existing !== undefined
+          || receiptScore !== undefined) {
           result = [0, 'stale', '']
         } else if (dispositions.size >= Number(receiptCapRaw)
           || expiry.size >= Number(receiptCapRaw)) {
@@ -1115,6 +1140,193 @@ describe('core operational output closure', () => {
     })
   })
 
+  it('requires a coherent live disposition pair for source-absent retry replay', async () => {
+    const { TaskQueue } = await import('@/worker/queue')
+    const retryKey = 'forge:tasks:retry'
+    const readyKey = 'forge:tasks'
+    const receiptsKey = 'forge:tasks:promotion-dispositions'
+    const expiryKey = 'forge:tasks:promotion-disposition-expiry'
+    const ttlMs = 15 * 60 * 1000
+    const winningOccurrenceId = '00000000-0000-4000-8000-000000001100'
+
+    const exercise = async (options: {
+      attempt: number
+      expectReplay?: boolean
+      sourcePresent?: boolean
+      setup: (fingerprint: string) => void
+      verify?: (fingerprint: string) => void
+    }): Promise<void> => {
+      redisHarness.hashes.delete(receiptsKey)
+      redisHarness.lists.set(readyKey, [])
+      redisHarness.zsets.delete(expiryKey)
+      redisHarness.zsets.delete(retryKey)
+      const raw = JSON.stringify({ taskId: TASK_ID, attempt: options.attempt })
+      const score = String(redisHarness.nowMs - 1)
+      if (options.sourcePresent) {
+        redisHarness.zsets.set(retryKey, new Map([[raw, Number(score)]]))
+      }
+      const queue = new TaskQueue('redis://localhost:6379/0') as unknown as AtomicQueue
+      const client = redisHarness.instances.at(-1)
+      if (!client) throw new Error('Receipt authority proof did not construct a client.')
+      if (!options.sourcePresent) {
+        const originalBuffer = client.callBuffer.getMockImplementation()
+        if (!originalBuffer) throw new Error('Receipt authority proof has no scan adapter.')
+        client.callBuffer.mockImplementation(async (...args: unknown[]) => {
+          if (String(args[1]).includes('forge:queue:list-due-retries-v1')) {
+            return [Buffer.from(raw), Buffer.from(score)]
+          }
+          return await (originalBuffer as (...values: unknown[]) => unknown)(...args)
+        })
+      }
+      const originalCall = client.call.getMockImplementation()
+      if (!originalCall) throw new Error('Receipt authority proof has no command adapter.')
+      let fingerprint = ''
+      client.call.mockImplementation(async (...args: unknown[]) => {
+        if (String(args[1]).includes('forge:queue:promote-retry-v4')) {
+          fingerprint = String(args[9])
+          options.setup(fingerprint)
+        }
+        return await (originalCall as (...values: unknown[]) => unknown)(...args)
+      })
+
+      if (options.expectReplay) {
+        await expect(queue.promoteDueRetries(1)).resolves.toBe(0)
+      } else {
+        await expect(queue.promoteDueRetries(1))
+          .rejects.toThrow('Queue retry promotion ownership mismatch')
+      }
+      expect(fingerprint).toMatch(/^[0-9a-f]{64}$/)
+      options.verify?.(fingerprint)
+    }
+
+    await exercise({
+      attempt: 21,
+      expectReplay: true,
+      setup: (fingerprint) => {
+        redisHarness.hashes.set(receiptsKey, new Map([
+          [fingerprint, `promoted:${winningOccurrenceId}`],
+        ]))
+        redisHarness.zsets.set(expiryKey, new Map([
+          [fingerprint, redisHarness.nowMs - ttlMs + 1],
+        ]))
+      },
+      verify: (fingerprint) => {
+        expect(redisHarness.hashes.get(receiptsKey)?.get(fingerprint))
+          .toBe(`promoted:${winningOccurrenceId}`)
+        expect(redisHarness.zsets.get(expiryKey)?.get(fingerprint))
+          .toBe(redisHarness.nowMs - ttlMs + 1)
+      },
+    })
+
+    const liveNeighbor = 'd'.repeat(64)
+    await exercise({
+      attempt: 22,
+      setup: (fingerprint) => {
+        const dispositions = new Map<string, string>()
+        const expiry = new Map<string, number>()
+        for (let index = 0; index < 100; index += 1) {
+          const older = index.toString(16).padStart(64, '0')
+          dispositions.set(older, 'discarded')
+          expiry.set(older, redisHarness.nowMs - ttlMs - 200 - index)
+        }
+        dispositions.set(fingerprint, `promoted:${winningOccurrenceId}`)
+        expiry.set(fingerprint, redisHarness.nowMs - ttlMs - 1)
+        dispositions.set(liveNeighbor, 'discarded')
+        expiry.set(liveNeighbor, redisHarness.nowMs - 1)
+        redisHarness.hashes.set(receiptsKey, dispositions)
+        redisHarness.zsets.set(expiryKey, expiry)
+      },
+      verify: (fingerprint) => {
+        expect(redisHarness.hashes.get(receiptsKey)?.has(fingerprint) ?? false).toBe(false)
+        expect(redisHarness.zsets.get(expiryKey)?.has(fingerprint) ?? false).toBe(false)
+        expect(redisHarness.hashes.get(receiptsKey)?.get(liveNeighbor)).toBe('discarded')
+        expect(redisHarness.zsets.get(expiryKey)?.get(liveNeighbor))
+          .toBe(redisHarness.nowMs - 1)
+      },
+    })
+
+    const incoherentCases = [
+      {
+        attempt: 23,
+        setup: (fingerprint: string) => {
+          redisHarness.hashes.set(receiptsKey, new Map([
+            [fingerprint, `promoted:${winningOccurrenceId}`],
+          ]))
+        },
+      },
+      {
+        attempt: 24,
+        setup: (fingerprint: string) => {
+          redisHarness.zsets.set(expiryKey, new Map([[fingerprint, redisHarness.nowMs - 1]]))
+        },
+      },
+      {
+        attempt: 25,
+        setup: (fingerprint: string) => {
+          redisHarness.hashes.set(receiptsKey, new Map([[fingerprint, 'unknown']]))
+          redisHarness.zsets.set(expiryKey, new Map([[fingerprint, redisHarness.nowMs - 1]]))
+        },
+      },
+      {
+        attempt: 26,
+        setup: (fingerprint: string) => {
+          redisHarness.hashes.set(receiptsKey, new Map([[fingerprint, 'promoted:not-a-uuid']]))
+          redisHarness.zsets.set(expiryKey, new Map([[fingerprint, redisHarness.nowMs - 1]]))
+        },
+      },
+      {
+        attempt: 27,
+        setup: (fingerprint: string) => {
+          redisHarness.hashes.set(receiptsKey, new Map([[fingerprint, 'discarded']]))
+          redisHarness.zsets.set(expiryKey, new Map([[fingerprint, redisHarness.nowMs + 1]]))
+        },
+      },
+      {
+        attempt: 28,
+        setup: (fingerprint: string) => {
+          redisHarness.hashes.set(receiptsKey, new Map([[fingerprint, 'discarded']]))
+          redisHarness.zsets.set(expiryKey, new Map([[fingerprint, Number.POSITIVE_INFINITY]]))
+        },
+      },
+      {
+        attempt: 29,
+        setup: (fingerprint: string) => {
+          redisHarness.hashes.set(receiptsKey, new Map([[fingerprint, 'discarded']]))
+          redisHarness.zsets.set(expiryKey, new Map([[fingerprint, Number.NaN]]))
+        },
+      },
+    ]
+    for (const receiptCase of incoherentCases) {
+      await exercise({
+        ...receiptCase,
+        verify: (fingerprint) => {
+          expect(redisHarness.hashes.get(receiptsKey)?.has(fingerprint) ?? false).toBe(false)
+          expect(redisHarness.zsets.get(expiryKey)?.has(fingerprint) ?? false).toBe(false)
+        },
+      })
+    }
+
+    await exercise({
+      attempt: 30,
+      sourcePresent: true,
+      setup: (fingerprint) => {
+        redisHarness.hashes.set(receiptsKey, new Map([
+          [fingerprint, `promoted:${winningOccurrenceId}`],
+        ]))
+        redisHarness.zsets.set(expiryKey, new Map([
+          [fingerprint, redisHarness.nowMs - 1],
+        ]))
+      },
+      verify: (fingerprint) => {
+        expect(redisHarness.zsets.get(retryKey)?.size ?? 0).toBe(1)
+        expect(redisHarness.hashes.get(receiptsKey)?.get(fingerprint))
+          .toBe(`promoted:${winningOccurrenceId}`)
+        expect(redisHarness.zsets.get(expiryKey)?.get(fingerprint))
+          .toBe(redisHarness.nowMs - 1)
+      },
+    })
+  })
+
   it('keeps identical occurrences distinct through retry, promotion, recovery, and dead letter', async () => {
     const { TaskQueue } = await import('@/worker/queue')
     const legacy = JSON.stringify({ taskId: TASK_ID, attempt: 1 })
@@ -1762,6 +1974,7 @@ describe('core output source sentinel', () => {
     expect(queueSource).toContain('length.writeBigUInt64BE(BigInt(part.length))')
     expect(queueSource).toContain("redis.call('ZSCORE', KEYS[1], raw_member)")
     expect(queueSource).toContain("redis.call('HGET', KEYS[3], fingerprint)")
+    expect(queueSource).toContain("redis.call('ZSCORE', KEYS[4], fingerprint)")
     expect(queueSource).toContain("redis.call('HSET', KEYS[3], fingerprint, 'discarded')")
     expect(queueSource).toContain(
       "redis.call('HSET', KEYS[3], fingerprint, 'promoted:' .. candidate_occurrence_id)",
@@ -1773,12 +1986,22 @@ describe('core output source sentinel', () => {
     )
     expect(queueSource).toContain("console.warn('[worker/queue] Dropped invalid retry payload')")
     expect(queueSource).toMatch(
-      /-- forge:queue:promote-retry-v4[\s\S]{0,3000}redis\.call\('ZREM', KEYS\[1\], raw_member\)[\s\S]{0,500}redis\.call\('LPUSH', KEYS\[2\], destination\)/,
+      /-- forge:queue:promote-retry-v4[\s\S]{0,4200}redis\.call\('ZREM', KEYS\[1\], raw_member\)[\s\S]{0,500}redis\.call\('LPUSH', KEYS\[2\], destination\)/,
     )
     const promotionScript = queueSource.match(
       /const PROMOTE_RETRY_SCRIPT = `([\s\S]*?)`\n\nconst RECOVER_STUCK_JOB_SCRIPT/,
     )?.[1] ?? ''
-    expect(promotionScript).toContain('if current_score ~= expected_score or existing then')
+    expect(promotionScript).toContain(
+      'if current_score ~= expected_score or existing or receipt_score then',
+    )
+    expect(promotionScript).toContain('if not existing or not receipt_score then')
+    expect(promotionScript).toContain('receipt_timestamp <= now_ms')
+    expect(promotionScript).toContain('receipt_timestamp > cutoff')
+    expect(promotionScript).toContain('receipt_timestamp ~= math.huge')
+    expect(promotionScript).toContain('receipt_timestamp ~= -math.huge')
+    expect(promotionScript).toMatch(
+      /if not receipt_timestamp_valid or not disposition_valid then[\s\S]{0,220}redis\.call\('HDEL', KEYS\[3\], fingerprint\)[\s\S]{0,120}redis\.call\('ZREM', KEYS\[4\], fingerprint\)/,
+    )
     expect(promotionScript).toContain("'LIMIT',\n  0,\n  prune_limit")
     expect(promotionScript).toContain(
       "redis.call('HLEN', KEYS[3]) >= cap or redis.call('ZCARD', KEYS[4]) >= cap",

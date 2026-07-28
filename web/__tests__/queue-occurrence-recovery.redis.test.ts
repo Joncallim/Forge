@@ -593,8 +593,172 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
     expect(await admin.hlen('forge:tasks:promotion-dispositions')).toBe(1)
     expect(await admin.zcard('forge:tasks:promotion-disposition-expiry')).toBe(1)
 
+    const dispositionKey = 'forge:tasks:promotion-dispositions'
+    const dispositionExpiryKey = 'forge:tasks:promotion-disposition-expiry'
+    const receiptTtlMs = 15 * 60 * 1000
+    const receiptWinner = '00000000-0000-4000-8000-000000001200'
+    const exerciseReceiptAuthority = async (options: {
+      attempt: number
+      expectReplay?: boolean
+      sourcePresent?: boolean
+      setup: (fingerprint: string, nowMs: number) => Promise<void>
+      verify: (fingerprint: string, raw: string) => Promise<void>
+    }): Promise<void> => {
+      await admin.del(...QUEUE_KEYS)
+      const raw = JSON.stringify({ taskId: TASK_ID, attempt: options.attempt })
+      await admin.zadd('forge:tasks:retry', (await redisTimeMs()) - 1, raw)
+      const receiptQueue = queue()
+      const receiptClient = (receiptQueue as unknown as { client: Redis }).client
+      const originalBuffer = receiptClient.callBuffer.bind(receiptClient)
+      let removeScannedSource = !options.sourcePresent
+      vi.spyOn(receiptClient, 'callBuffer').mockImplementation(async (
+        ...args: Parameters<Redis['callBuffer']>
+      ) => {
+        const result = await originalBuffer(...args)
+        if (removeScannedSource
+          && String(args[1]).includes('forge:queue:list-due-retries-v1')) {
+          removeScannedSource = false
+          await admin.zrem('forge:tasks:retry', raw)
+        }
+        return result
+      })
+      const originalCall = receiptClient.call.bind(receiptClient)
+      let fingerprint = ''
+      vi.spyOn(receiptClient, 'call').mockImplementation(async (
+        ...args: Parameters<Redis['call']>
+      ) => {
+        if (String(args[1]).includes('forge:queue:promote-retry-v4')) {
+          fingerprint = String(args[9])
+          await options.setup(fingerprint, await redisTimeMs())
+        }
+        return await originalCall(...args)
+      })
+
+      if (options.expectReplay) {
+        await expect(receiptQueue.promoteDueRetries(1)).resolves.toBe(0)
+      } else {
+        await expect(receiptQueue.promoteDueRetries(1))
+          .rejects.toThrow('Queue retry promotion ownership mismatch')
+      }
+      expect(fingerprint).toMatch(/^[0-9a-f]{64}$/)
+      await options.verify(fingerprint, raw)
+    }
+
+    await exerciseReceiptAuthority({
+      attempt: 21,
+      expectReplay: true,
+      setup: async (fingerprint, nowMs) => {
+        await admin.hset(dispositionKey, fingerprint, `promoted:${receiptWinner}`)
+        await admin.zadd(dispositionExpiryKey, nowMs - receiptTtlMs + 60_000, fingerprint)
+      },
+      verify: async (fingerprint) => {
+        expect(await admin.hget(dispositionKey, fingerprint))
+          .toBe(`promoted:${receiptWinner}`)
+        expect(await admin.zscore(dispositionExpiryKey, fingerprint)).not.toBeNull()
+      },
+    })
+
+    const receiptNeighbor = 'd'.repeat(64)
+    await exerciseReceiptAuthority({
+      attempt: 22,
+      setup: async (fingerprint, nowMs) => {
+        const expiredPairs: string[] = []
+        for (let index = 0; index < 100; index += 1) {
+          const older = index.toString(16).padStart(64, '0')
+          expiredPairs.push(older, 'discarded')
+          await admin.zadd(
+            dispositionExpiryKey,
+            nowMs - receiptTtlMs - 2_000 - index,
+            older,
+          )
+        }
+        await admin.hset(dispositionKey, ...expiredPairs)
+        await admin.hset(dispositionKey, fingerprint, `promoted:${receiptWinner}`)
+        await admin.zadd(
+          dispositionExpiryKey,
+          nowMs - receiptTtlMs - 1_000,
+          fingerprint,
+        )
+        await admin.hset(dispositionKey, receiptNeighbor, 'discarded')
+        await admin.zadd(dispositionExpiryKey, nowMs - 1, receiptNeighbor)
+      },
+      verify: async (fingerprint) => {
+        expect(await admin.hexists(dispositionKey, fingerprint)).toBe(0)
+        expect(await admin.zscore(dispositionExpiryKey, fingerprint)).toBeNull()
+        expect(await admin.hget(dispositionKey, receiptNeighbor)).toBe('discarded')
+        expect(await admin.zscore(dispositionExpiryKey, receiptNeighbor)).not.toBeNull()
+      },
+    })
+
+    const authorityCases = [
+      {
+        attempt: 23,
+        setup: async (fingerprint: string) => {
+          await admin.hset(dispositionKey, fingerprint, `promoted:${receiptWinner}`)
+        },
+      },
+      {
+        attempt: 24,
+        setup: async (fingerprint: string, nowMs: number) => {
+          await admin.zadd(dispositionExpiryKey, nowMs - 1, fingerprint)
+        },
+      },
+      {
+        attempt: 25,
+        setup: async (fingerprint: string, nowMs: number) => {
+          await admin.hset(dispositionKey, fingerprint, 'unknown')
+          await admin.zadd(dispositionExpiryKey, nowMs - 1, fingerprint)
+        },
+      },
+      {
+        attempt: 26,
+        setup: async (fingerprint: string, nowMs: number) => {
+          await admin.hset(dispositionKey, fingerprint, 'promoted:not-a-uuid')
+          await admin.zadd(dispositionExpiryKey, nowMs - 1, fingerprint)
+        },
+      },
+      {
+        attempt: 27,
+        setup: async (fingerprint: string, nowMs: number) => {
+          await admin.hset(dispositionKey, fingerprint, 'discarded')
+          await admin.zadd(dispositionExpiryKey, nowMs + 60_000, fingerprint)
+        },
+      },
+      {
+        attempt: 28,
+        setup: async (fingerprint: string) => {
+          await admin.hset(dispositionKey, fingerprint, 'discarded')
+          await admin.zadd(dispositionExpiryKey, '+inf', fingerprint)
+        },
+      },
+    ]
+    for (const authorityCase of authorityCases) {
+      await exerciseReceiptAuthority({
+        ...authorityCase,
+        verify: async (fingerprint) => {
+          expect(await admin.hexists(dispositionKey, fingerprint)).toBe(0)
+          expect(await admin.zscore(dispositionExpiryKey, fingerprint)).toBeNull()
+        },
+      })
+    }
+
+    await exerciseReceiptAuthority({
+      attempt: 29,
+      sourcePresent: true,
+      setup: async (fingerprint, nowMs) => {
+        await admin.hset(dispositionKey, fingerprint, `promoted:${receiptWinner}`)
+        await admin.zadd(dispositionExpiryKey, nowMs - 1, fingerprint)
+      },
+      verify: async (fingerprint, raw) => {
+        expect(await admin.zscore('forge:tasks:retry', raw)).not.toBeNull()
+        expect(await admin.hget(dispositionKey, fingerprint))
+          .toBe(`promoted:${receiptWinner}`)
+        expect(await admin.zscore(dispositionExpiryKey, fingerprint)).not.toBeNull()
+      },
+    })
+
     console.info('QUEUE_OCCURRENCE_REDIS_MULTIPLICITY_OK')
-  }, 40_000)
+  }, 50_000)
 
   it('covers bounded rotations, response loss, ownership, replay, and strict markers', async () => {
     const taskQueue = queue()
