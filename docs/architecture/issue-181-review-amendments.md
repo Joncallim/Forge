@@ -98,3 +98,70 @@ closed.
 
 The duplicated `canonical` word is removed; the text now says “canonical version-2
 manifest.”
+
+## Integrated review round 25 findings and resolutions
+
+Round 24's five `Joncallim`-authored P0/blocker findings on
+`issue-181-e2e-admission-regression.md` were re-checked against the current PR
+head and are resolved there; they are stale against earlier revisions, not
+against the code merged at head:
+
+- **Duplicate `test:mcp:issuance` script key.** `web/package.json` now defines
+  each `test:mcp:*` / `e2e:mcp-operator` script exactly once. `playwright test
+  --list` for every manifest partition (`mcp-issuance`, `mcp-postgres`,
+  `mcp-operator-desktop`/`-mobile`) collects exactly the scenario IDs declared
+  in `test-contracts/mcp-admission-v2.json` (3 issuance, 2 postgres, 1+1
+  operator) — the counts the manifest advertises.
+- **S6 release-adapter callbacks.** The adapter no longer accepts injected
+  `recordOwnedEvidence`/`consumeOwnedTransition` callbacks; it wraps a single
+  concrete `executeEpic172S6AtomicTransition` implementation that opens the
+  transition database under the fixed `forge_release_transition` role. See the
+  known limitation recorded below for the one remaining gap in that function.
+- **CI uploads raw Playwright artifacts.** `web/.github/workflows/web-ci.yml`
+  no longer runs `actions/upload-artifact` over `playwright-report` or
+  `test-results` in any job; there is no raw-artifact upload path left to
+  restrict.
+- **Integrated suite red despite a healthy build.** At current head,
+  `tsc --noEmit`, `npm run lint`, and `npx vitest run` are clean (the full
+  suite passes; two unrelated `api.test.ts` / `workspace-storage.test.ts`
+  cases are environment-timeout flakes, not failures, and pass individually
+  with a longer timeout). The specific files named in the round-24 finding
+  (`epic-172-release-recorder`, `epic-172-s3-release`, `epic-172-s6-ci-contract`,
+  `epic-172-step0-e2e-bridge`, `task-page-retry-handoff`) all pass.
+- **External trust evidence.** Still genuinely outstanding — see below. This
+  is an operational/DevOps dependency (installing and configuring the
+  external controller GitHub App), not something this PR's code can supply.
+
+Two `chatgpt-codex-connector` findings were also triaged:
+
+- **P1 — trusted workflow accepted a moving ref.**
+  `.github/workflows/mcp-host-boundary-trusted.yml` now rejects any
+  `reviewed_sha` input that is not an exact 40-character lowercase hex commit
+  SHA before checkout, closing the branch/tag substitution path. Fixed.
+- **P2 — S6 transition adapter selects columns from the S3 completion lock.**
+  `executeEpic172S6AtomicTransition` calls
+  `forge.lock_epic_172_s3_completion_v1`, which returns `void` and belongs to
+  the S3 completion state machine, not a dedicated S6 receipt/consumption
+  routine. This is a real defect in the SQL call, confirmed against
+  `db/migrations/0026_epic_172_s3_grant_lifecycle.sql`. **Known limitation,
+  deferred rather than fixed in this PR:** the function is not called from any
+  production code path (only from its own unit test's
+  no-database-URL branch), the S6 controller defaults to
+  `mode: 'disabled'` / `externalControllerRequired: true`, and there is no
+  live path that can reach this query today. Wiring S6 to the correct generic
+  `forge.consume_epic_172_release_evidence_v1` routine (plus a matching
+  evidence-recording call) is real follow-up work, tracked against #181/#172,
+  and should land before the S6 controller is ever enabled — not before this
+  beta-scoped architecture PR merges.
+
+### Beta scope note
+
+Per project direction, this PR intentionally does not chase every
+release-grade external-trust guarantee described in the primary document
+(exact-App ruleset binding, live controller attestation, signed
+destruction receipts) before merging. Those remain real requirements before
+the S6 controller is *enabled* in production, but are not required to land
+this architecture-and-test-scaffolding PR for a beta. The primary document's
+language describing the fully-enabled target state is left as-is; this note
+only clarifies that reaching that state is out of scope for this PR's merge
+bar.

@@ -23,6 +23,13 @@ jobs:
     runs-on: [self-hosted, linux, x64, forge-host-boundary]
     timeout-minutes: 15
     steps:
+      - name: Require an immutable full-length commit SHA
+        run: |
+          if [[ ! "${{ inputs.reviewed_sha }}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::reviewed_sha must be an exact 40-character lowercase hex commit SHA, not a branch or tag." >&2
+            exit 1
+          fi
+
       - name: Check out the reviewed commit
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
