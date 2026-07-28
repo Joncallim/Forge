@@ -200,7 +200,7 @@ describe('answered-question retry contract', () => {
     const runtimeSource = fs.readFileSync(path.join(repoRoot, 'worker/runtime.ts'), 'utf8')
 
     expect(runtimeSource).toMatch(
-      /await processAnsweredQuestions\(claimedAnswers\.job\.taskId, \{\s+claimLeaseFence,\s+finalAttempt,\s+\}\)/,
+      /await processAnsweredQuestions\(claimedAnswers\.job\.taskId, \{\s+claimLeaseFence,\s+executionContext,\s+finalAttempt,\s+\}\)/,
     )
   })
 

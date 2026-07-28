@@ -2161,8 +2161,8 @@ describe('core operational output closure', () => {
           resolvePeriodicRenewal = resolve
         })
         let resolveBusiness!: () => void
-        const business = new Promise<void>((resolve) => {
-          resolveBusiness = resolve
+        const business = new Promise<'completed'>((resolve) => {
+          resolveBusiness = () => resolve('completed')
         })
         const targetJob = position === 'approval'
           ? { taskId: TASK_ID, action: 'approve' as const, attempt: 1 }
@@ -2197,7 +2197,13 @@ describe('core operational output closure', () => {
           claim = vi.fn(async () => {
             if (kind !== position) return null
             claimCount += 1
-            if (claimCount === 1) return { job: targetJob, raw: targetRaw }
+            if (claimCount === 1) {
+              return {
+                job: targetJob,
+                occurrenceId: JSON.parse(targetRaw).occurrenceId as string,
+                raw: targetRaw,
+              }
+            }
             return await new Promise<null>((resolve) => setTimeout(() => resolve(null), 10))
           })
           deadLetter = vi.fn()
@@ -2233,7 +2239,10 @@ describe('core operational output closure', () => {
           processTask,
         }))
         const finishTaskAttempt = vi.fn().mockResolvedValue(undefined)
-        const startTaskAttempt = vi.fn().mockResolvedValue(`${position}-heartbeat-attempt`)
+        const startTaskAttempt = vi.fn().mockResolvedValue({
+          attemptId: `${position}-heartbeat-attempt`,
+          recoveredOccurrence: false,
+        })
         vi.doMock('@/worker/task-attempts', () => ({ finishTaskAttempt, startTaskAttempt }))
         const taskLookup = vi.fn()
         vi.doMock('@/db', () => ({
@@ -2337,7 +2346,13 @@ describe('core operational output closure', () => {
           claim = vi.fn(async () => {
             if (kind !== position) return null
             claimCount += 1
-            if (claimCount === 1) return { job: targetJob, raw: targetRaw }
+            if (claimCount === 1) {
+              return {
+                job: targetJob,
+                occurrenceId: JSON.parse(targetRaw).occurrenceId as string,
+                raw: targetRaw,
+              }
+            }
             return await new Promise<null>((resolve) => setTimeout(() => resolve(null), 10))
           })
           deadLetter = kind === position ? targetDeadLetter : vi.fn()
@@ -2489,7 +2504,10 @@ describe('core operational output closure', () => {
       queueName: keyof typeof attemptCounts
     }) => {
       attemptCounts[input.queueName] += 1
-      return `${input.queueName}-retry-clock-${attemptCounts[input.queueName]}`
+      return {
+        attemptId: `${input.queueName}-retry-clock-${attemptCounts[input.queueName]}`,
+        recoveredOccurrence: false,
+      }
     })
     let approvalClaimCount = 0
     let answersClaimCount = 0
@@ -2513,7 +2531,7 @@ describe('core operational output closure', () => {
         approvalClaimCount += 1
         if (approvalClaimCount > 2) return null
         const job = { taskId: TASK_ID, action: 'approve' as const, attempt: 1 }
-        return { job, raw: JSON.stringify(job) }
+        return { job, occurrenceId: randomUUID(), raw: JSON.stringify(job) }
       })
     }
 
@@ -2523,7 +2541,7 @@ describe('core operational output closure', () => {
         answersClaimCount += 1
         if (answersClaimCount > 2) return null
         const job = { taskId: TASK_ID, attempt: 1 }
-        return { job, raw: JSON.stringify(job) }
+        return { job, occurrenceId: randomUUID(), raw: JSON.stringify(job) }
       })
     }
 
@@ -2533,7 +2551,7 @@ describe('core operational output closure', () => {
         taskClaimCount += 1
         if (taskClaimCount <= 3) {
           const job = { taskId: TASK_ID, attempt: 1 }
-          return { job, raw: JSON.stringify(job) }
+          return { job, occurrenceId: randomUUID(), raw: JSON.stringify(job) }
         }
         return await new Promise<null>((resolve) => {
           setTimeout(() => resolve(null), 10)
@@ -2761,7 +2779,10 @@ describe('core operational output closure', () => {
       if (input.queueName === 'answers') {
         throw new Error('attempt_start_infrastructure_failure')
       }
-      return `${input.queueName}-attempt`
+      return {
+        attemptId: `${input.queueName}-attempt`,
+        recoveredOccurrence: false,
+      }
     })
     const processFailure = hostileError()
     const taskDeadLetter = vi.fn().mockRejectedValue(new Error('dead_letter_infrastructure_failure'))
@@ -2801,7 +2822,11 @@ describe('core operational output closure', () => {
         approvalClaimCount += 1
         if (approvalClaimCount > 1) return null
         const raw = JSON.stringify({ taskId: TASK_ID, action: 'approve', attempt: 1 })
-        return { raw, job: { taskId: TASK_ID, action: 'approve' as const, attempt: 1 } }
+        return {
+          raw,
+          occurrenceId: randomUUID(),
+          job: { taskId: TASK_ID, action: 'approve' as const, attempt: 1 },
+        }
       })
     }
 
@@ -2813,7 +2838,11 @@ describe('core operational output closure', () => {
         answersClaimCount += 1
         if (answersClaimCount > 1) return null
         const raw = JSON.stringify({ taskId: TASK_ID, attempt: 1 })
-        return { raw, job: { taskId: TASK_ID, attempt: 1 } }
+        return {
+          raw,
+          occurrenceId: randomUUID(),
+          job: { taskId: TASK_ID, attempt: 1 },
+        }
       })
     }
 
@@ -2824,7 +2853,11 @@ describe('core operational output closure', () => {
         taskClaimCount += 1
         if (taskClaimCount === 1) {
           const raw = JSON.stringify({ taskId: TASK_ID, attempt: 2 })
-          return { raw, job: { taskId: TASK_ID, attempt: 2 } }
+          return {
+            raw,
+            occurrenceId: randomUUID(),
+            job: { taskId: TASK_ID, attempt: 2 },
+          }
         }
         return await new Promise<null>((resolve) => {
           setTimeout(() => resolve(null), 10)
@@ -2853,8 +2886,8 @@ describe('core operational output closure', () => {
       RetryPromotionConflictError: TestRetryPromotionConflictError,
       TaskQueue: RuntimeTaskQueue,
     }))
-    const processAnsweredQuestions = vi.fn().mockResolvedValue(undefined)
-    const processApproval = vi.fn().mockResolvedValue(undefined)
+    const processAnsweredQuestions = vi.fn().mockResolvedValue('completed')
+    const processApproval = vi.fn().mockResolvedValue('completed')
     vi.doMock('@/worker/orchestrator', () => ({
       processAnsweredQuestions,
       processApproval,

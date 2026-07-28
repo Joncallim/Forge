@@ -1710,8 +1710,8 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
     const lostClaimObserved = new Promise<void>((resolve) => {
       lostClaimGate.observed = resolve
     })
-    const processTask = vi.fn(() => new Promise<void>((resolve) => {
-      businessGate.release = resolve
+    const processTask = vi.fn(() => new Promise<'completed'>((resolve) => {
+      businessGate.release = () => resolve('completed')
     }))
     const query = (rows: unknown[]) => {
       const chain: Record<string, unknown> = {
@@ -1731,7 +1731,10 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
     }))
     vi.doMock('@/worker/task-attempts', () => ({
       finishTaskAttempt: vi.fn().mockResolvedValue(undefined),
-      startTaskAttempt: vi.fn().mockResolvedValue('queue-shutdown-attempt'),
+      startTaskAttempt: vi.fn().mockResolvedValue({
+        attemptId: 'queue-shutdown-attempt',
+        recoveredOccurrence: false,
+      }),
     }))
     vi.doMock('@/db', () => ({
       db: { select: vi.fn(() => query([{ id: TASK_ID }])) },

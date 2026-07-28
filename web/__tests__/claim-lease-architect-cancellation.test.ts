@@ -223,7 +223,7 @@ describe('Architect queue-claim cancellation', () => {
     const activeProviderSignal = providerSignal as AbortSignal | null
     expect(activeProviderSignal).not.toBeNull()
     expect(fence.markLost()).toBe(true)
-    await expect(processing).resolves.toBeUndefined()
+    await expect(processing).resolves.toBe('retained')
 
     expect(activeProviderSignal?.aborted).toBe(true)
     expect(activeProviderSignal?.reason).toBeInstanceOf(ClaimLeaseLostError)

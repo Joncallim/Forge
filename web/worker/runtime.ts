@@ -5,6 +5,8 @@ import type { QueueClaimRenewalResult, QueueRetryResult } from './queue'
 import {
   ClaimLeaseFence,
   isClaimLeaseLostError,
+  type QueueClaimBusinessDisposition,
+  type QueueClaimExecutionContext,
 } from './claim-lease-fence'
 
 const DEFAULT_CLAIM_TIMEOUT_SECONDS = 5
@@ -16,6 +18,8 @@ const MAX_QUEUE_RECOVERY_INTERVAL_MS = 60_000
 const DEFAULT_PROVIDER_HEALTH_INTERVAL_SECONDS = 5 * 60
 const DEFAULT_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS = 5 * 60
 const DEFAULT_SESSION_CACHE_PURGE_INTERVAL_SECONDS = 60
+const ADOPTION_PENDING_OCCURRENCE_MESSAGE =
+  'Queue occurrence is retained pending a verified recovery claim.'
 
 type WorkerSource = 'standalone' | 'embedded'
 
@@ -187,7 +191,11 @@ async function startWorkerOnce(
     | 'retry'
     | 'retry_reconciliation'
     | 'task_lookup'
-  type AttemptInfrastructurePhase = 'finish_after_failure' | 'finish_after_success' | 'start'
+  type AttemptInfrastructurePhase =
+    | 'finish_after_failure'
+    | 'finish_after_success'
+    | 'retain_for_adoption'
+    | 'start'
 
   const logQueueInfrastructureFailure = (
     phase: QueueInfrastructurePhase,
@@ -327,8 +335,12 @@ async function startWorkerOnce(
 
   const processClaimedJob = async <TJob extends RuntimeJob>(input: {
     attemptQueueName: 'answers' | 'approvals' | 'tasks'
-    claimed: { job: TJob; raw: string }
-    processBusiness: (finalAttempt: boolean, fence: ClaimLeaseFence) => Promise<void>
+    claimed: { job: TJob; occurrenceId: string; raw: string }
+    processBusiness: (
+      finalAttempt: boolean,
+      fence: ClaimLeaseFence,
+      executionContext: QueueClaimExecutionContext,
+    ) => Promise<QueueClaimBusinessDisposition>
     queue: RuntimeQueue<TJob>
     queueName: QueueOperation
   }): Promise<void> => {
@@ -364,15 +376,22 @@ async function startWorkerOnce(
       if (missingTaskDisposition !== 'present') return
 
       let attemptId: string
+      let executionContext: QueueClaimExecutionContext
       try {
         claimLeaseFence.assertOwned()
-        attemptId = await startTaskAttempt({
+        const startedAttempt = await startTaskAttempt({
           attemptNumber: job.attempt,
           jobPayload: job,
+          occurrenceId: claimed.occurrenceId,
           queueName: input.attemptQueueName,
           taskId: job.taskId,
           workerId,
         })
+        attemptId = startedAttempt.attemptId
+        executionContext = {
+          occurrenceId: claimed.occurrenceId,
+          recoveredOccurrence: startedAttempt.recoveredOccurrence,
+        }
       } catch (err) {
         if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
         logAttemptInfrastructureFailure('start', queueName, job.taskId)
@@ -389,8 +408,32 @@ async function startWorkerOnce(
 
       try {
         claimLeaseFence.assertOwned()
-        await input.processBusiness(finalAttempt, claimLeaseFence)
+        const businessDisposition = await input.processBusiness(
+          finalAttempt,
+          claimLeaseFence,
+          executionContext,
+        )
         claimLeaseFence.assertOwned()
+        if (businessDisposition === 'retained') {
+          // Do not leave a refused occurrence running: a later recovery of Y
+          // must not adopt Y's own prior ledger row. This follows the ownership
+          // fence so a genuine loss still preserves A for B's recovery of A.
+          try {
+            await finishTaskAttempt({
+              attemptId,
+              errorMessage: ADOPTION_PENDING_OCCURRENCE_MESSAGE,
+              status: 'indeterminate',
+            })
+          } catch (err) {
+            if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
+            logAttemptInfrastructureFailure('retain_for_adoption', queueName, job.taskId)
+          }
+          await stopClaimRenewal()
+          return
+        }
+        if (businessDisposition !== 'completed') {
+          throw new Error('Queue business disposition is invalid.')
+        }
       } catch (err) {
         if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
         const message = retainedErrorMessage(err)
@@ -765,9 +808,10 @@ async function startWorkerOnce(
           await processClaimedJob({
             attemptQueueName: 'approvals',
             claimed: claimedApproval,
-            processBusiness: (finalAttempt, claimLeaseFence) =>
+            processBusiness: (finalAttempt, claimLeaseFence, executionContext) =>
               processApproval(claimedApproval.job.taskId, {
                 claimLeaseFence,
+                executionContext,
                 finalAttempt,
               }),
             queue: approvalQueue,
@@ -799,9 +843,10 @@ async function startWorkerOnce(
           await processClaimedJob({
             attemptQueueName: 'answers',
             claimed: claimedAnswers,
-            processBusiness: async (finalAttempt, claimLeaseFence) =>
+            processBusiness: async (finalAttempt, claimLeaseFence, executionContext) =>
               await processAnsweredQuestions(claimedAnswers.job.taskId, {
                 claimLeaseFence,
+                executionContext,
                 finalAttempt,
               }),
             queue: answersQueue,
@@ -835,9 +880,10 @@ async function startWorkerOnce(
         await processClaimedJob({
           attemptQueueName: 'tasks',
           claimed: claimedTask,
-          processBusiness: (finalAttempt, claimLeaseFence) =>
+          processBusiness: (finalAttempt, claimLeaseFence, executionContext) =>
             processTask(claimedTask.job.taskId, {
               claimLeaseFence,
+              executionContext,
               finalAttempt,
             }),
           queue: taskQueue,

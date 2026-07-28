@@ -137,7 +137,13 @@ describe('queue claim lease fencing', () => {
         claim = vi.fn(async () => {
           if (kind !== position) return null
           claimCount += 1
-          if (claimCount === 1) return { job: targetJob, raw: targetRaw }
+          if (claimCount === 1) {
+            return {
+              job: targetJob,
+              occurrenceId: JSON.parse(targetRaw).occurrenceId as string,
+              raw: targetRaw,
+            }
+          }
           return await new Promise<null>((resolve) => setTimeout(() => resolve(null), 5))
         })
         deadLetter = kind === position ? targetQueueCalls.deadLetter : vi.fn()
@@ -177,7 +183,10 @@ describe('queue claim lease fencing', () => {
         processTask,
       }))
       const finishTaskAttempt = vi.fn()
-      const startTaskAttempt = vi.fn().mockResolvedValue(`${position}-attempt`)
+      const startTaskAttempt = vi.fn().mockResolvedValue({
+        attemptId: `${position}-attempt`,
+        recoveredOccurrence: false,
+      })
       vi.doMock('@/worker/task-attempts', () => ({
         finishTaskAttempt,
         startTaskAttempt,
@@ -260,7 +269,13 @@ describe('queue claim lease fencing', () => {
       ack = taskQueueCalls.ack
       claim = vi.fn(async () => {
         claimCount += 1
-        if (claimCount === 1) return { job: taskJob, raw: taskRaw }
+        if (claimCount === 1) {
+          return {
+            job: taskJob,
+            occurrenceId: JSON.parse(taskRaw).occurrenceId as string,
+            raw: taskRaw,
+          }
+        }
         return await new Promise<null>((resolve) => setTimeout(() => resolve(null), 5))
       })
       deadLetter = taskQueueCalls.deadLetter
@@ -343,7 +358,7 @@ describe('queue claim lease fencing', () => {
     expect(runtimeSource).toContain('fence.markLost()')
     expect(runtimeSource).toContain("return 'lost'")
     expect(runtimeSource).toMatch(
-      /await input\.processBusiness\(finalAttempt, claimLeaseFence\)\s+claimLeaseFence\.assertOwned\(\)/,
+      /await input\.processBusiness\(\s+finalAttempt,\s+claimLeaseFence,\s+executionContext,\s+\)\s+claimLeaseFence\.assertOwned\(\)/,
     )
     expect(runtimeSource).toMatch(
       /claimRenewal\.startDisposition !== 'established'[\s\S]{0,80}return/,

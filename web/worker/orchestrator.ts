@@ -62,6 +62,8 @@ import type { ArchitectPlanEntryEnvelope, ArchitectPlanEntryInput } from '../lib
 import {
   ClaimLeaseFence,
   isClaimLeaseLostError,
+  type QueueClaimBusinessDisposition,
+  type QueueClaimExecutionContext,
 } from './claim-lease-fence'
 
 type TaskRow = Task
@@ -79,6 +81,7 @@ const REGENERATED_PLAN_NOTICE = [
 type PendingArchitectCheckpoint = Omit<ArchitectCheckpointInput, 'taskStatus'>
 type QueueClaimProcessOptions = {
   claimLeaseFence?: ClaimLeaseFence
+  executionContext?: QueueClaimExecutionContext
   finalAttempt?: boolean
 }
 
@@ -1362,33 +1365,43 @@ async function runArchitect(
 export async function processTask(
   taskId: string,
   options: QueueClaimProcessOptions = {},
-): Promise<void> {
+): Promise<QueueClaimBusinessDisposition> {
   const claimLeaseFence = options.claimLeaseFence ?? new ClaimLeaseFence()
   claimLeaseFence.assertOwned()
   const context = await loadTaskContext(taskId)
   claimLeaseFence.assertOwned()
   if (!context) {
     console.warn('[worker/orchestrator] Task not found', { taskId })
-    return
+    return 'completed'
   }
 
   const { task, project } = context
-  if (task.status !== 'pending') {
+  const recoveredRunningOccurrence =
+    task.status === 'running' && options.executionContext?.recoveredOccurrence === true
+  if (task.status === 'running' && !recoveredRunningOccurrence) {
+    console.info('[worker/orchestrator] Retaining running task without occurrence adoption', {
+      taskId,
+    })
+    return 'retained'
+  }
+  if (task.status !== 'pending' && !recoveredRunningOccurrence) {
     console.info('[worker/orchestrator] Skipping task with non-pending status', {
       taskId,
       status: task.status,
     })
-    return
+    return 'completed'
   }
 
   try {
-    claimLeaseFence.assertOwned()
-    const claimed = await updateTaskStatusIfCurrent(task.id, 'pending', 'running')
-    if (!claimed) {
-      console.info('[worker/orchestrator] Skipping task that was claimed by another worker', {
-        taskId,
-      })
-      return
+    if (!recoveredRunningOccurrence) {
+      claimLeaseFence.assertOwned()
+      const claimed = await updateTaskStatusIfCurrent(task.id, 'pending', 'running')
+      if (!claimed) {
+        console.info('[worker/orchestrator] Skipping task that was claimed by another worker', {
+          taskId,
+        })
+        return 'completed'
+      }
     }
 
     const { openQuestionCount, checkpoint } = await runArchitect(
@@ -1398,7 +1411,7 @@ export async function processTask(
     )
 
     if (await isTaskCancelled(task.id)) {
-      return
+      return 'completed'
     }
     claimLeaseFence.assertOwned()
 
@@ -1406,11 +1419,12 @@ export async function processTask(
     // CAS from 'running' so a cancel landing between the isTaskCancelled read
     // and this write cannot resurrect a cancelled task.
     const advanced = await updateTaskStatusIfCurrent(task.id, 'running', nextStatus)
-    if (!advanced) return
+    if (!advanced) return 'completed'
     claimLeaseFence.assertOwned()
     await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: nextStatus })
+    return 'completed'
   } catch (err) {
-    if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
+    if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return 'retained'
     const message = safeTaskFailureMessage(err)
     const checkpoint = architectCheckpointFromError(err)
     if (options.finalAttempt ?? true) {
@@ -1448,23 +1462,31 @@ export async function processTask(
 export async function processAnsweredQuestions(
   taskId: string,
   options: QueueClaimProcessOptions = {},
-): Promise<void> {
+): Promise<QueueClaimBusinessDisposition> {
   const claimLeaseFence = options.claimLeaseFence ?? new ClaimLeaseFence()
   claimLeaseFence.assertOwned()
   const context = await loadTaskContext(taskId)
   claimLeaseFence.assertOwned()
   if (!context) {
     console.warn('[worker/orchestrator] Task not found', { taskId })
-    return
+    return 'completed'
   }
 
   const { task, project } = context
-  if (task.status !== 'awaiting_answers') {
+  const recoveredRunningOccurrence =
+    task.status === 'running' && options.executionContext?.recoveredOccurrence === true
+  if (task.status === 'running' && !recoveredRunningOccurrence) {
+    console.info('[worker/orchestrator] Retaining running re-plan without occurrence adoption', {
+      taskId,
+    })
+    return 'retained'
+  }
+  if (task.status !== 'awaiting_answers' && !recoveredRunningOccurrence) {
     console.info('[worker/orchestrator] Skipping re-plan for task with non-awaiting_answers status', {
       taskId,
       status: task.status,
     })
-    return
+    return 'completed'
   }
 
   const existingQuestions = await db
@@ -1479,7 +1501,7 @@ export async function processAnsweredQuestions(
       taskId,
       unanswered: unanswered.length,
     })
-    return
+    return recoveredRunningOccurrence ? 'retained' : 'completed'
   }
   if (existingQuestions.length === 0) {
     const message = 'Cannot re-plan because no answered question rows were found'
@@ -1488,16 +1510,18 @@ export async function processAnsweredQuestions(
     })
     claimLeaseFence.assertOwned()
     await updateTaskStatus(taskId, 'failed', message)
-    return
+    return 'completed'
   }
 
   const answeredQuestions = answeredQuestionSnapshot(existingQuestions)
 
-  claimLeaseFence.assertOwned()
-  const claimed = await updateTaskStatusIfCurrent(taskId, 'awaiting_answers', 'running')
-  if (!claimed) {
-    console.info('[worker/orchestrator] Skipping re-plan claimed by another worker', { taskId })
-    return
+  if (!recoveredRunningOccurrence) {
+    claimLeaseFence.assertOwned()
+    const claimed = await updateTaskStatusIfCurrent(taskId, 'awaiting_answers', 'running')
+    if (!claimed) {
+      console.info('[worker/orchestrator] Skipping re-plan claimed by another worker', { taskId })
+      return 'completed'
+    }
   }
 
   try {
@@ -1509,7 +1533,7 @@ export async function processAnsweredQuestions(
     )
 
     if (await isTaskCancelled(taskId)) {
-      return
+      return 'completed'
     }
     claimLeaseFence.assertOwned()
 
@@ -1517,11 +1541,12 @@ export async function processAnsweredQuestions(
     // CAS from 'running' so a cancel landing between the isTaskCancelled read
     // and this write cannot resurrect a cancelled task.
     const advanced = await updateTaskStatusIfCurrent(taskId, 'running', nextStatus)
-    if (!advanced) return
+    if (!advanced) return 'completed'
     claimLeaseFence.assertOwned()
     await writeArchitectCheckpointSafely({ ...checkpoint, taskStatus: nextStatus })
+    return 'completed'
   } catch (err) {
-    if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
+    if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return 'retained'
     const message = safeTaskFailureMessage(err)
     const checkpoint = architectCheckpointFromError(err)
     if (options.finalAttempt ?? true) {
@@ -1551,7 +1576,7 @@ export async function processAnsweredQuestions(
 export async function processApproval(
   taskId: string,
   options: QueueClaimProcessOptions = {},
-): Promise<void> {
+): Promise<QueueClaimBusinessDisposition> {
   const claimLeaseFence = options.claimLeaseFence ?? new ClaimLeaseFence()
   claimLeaseFence.assertOwned()
   const [task] = await db
@@ -1563,12 +1588,11 @@ export async function processApproval(
 
   if (!task) {
     console.warn('[worker/orchestrator] Approval target task not found', { taskId })
-    return
+    return 'completed'
   }
 
   if (task.status === 'running') {
-    await processRunningWorkforceContinuation(taskId, options)
-    return
+    return processRunningWorkforceContinuation(taskId, options)
   }
 
   if (task.status !== 'approved') {
@@ -1576,7 +1600,7 @@ export async function processApproval(
       taskId,
       status: task.status,
     })
-    return
+    return 'completed'
   }
 
   const preview = await previewWorkPackageHandoff(taskId)
@@ -1590,13 +1614,13 @@ export async function processApproval(
         taskId,
       })
     }
-    return
+    return 'completed'
   }
 
   if (preview.status === 'no_ready_packages') {
     const completion = await completeTaskIfReviewGatesSatisfied(taskId)
     claimLeaseFence.assertOwned()
-    if (completion.status === 'completed') return
+    if (completion.status === 'completed') return 'completed'
 
     claimLeaseFence.assertOwned()
     await publishTaskEvent(taskId, 'task:handoff', {
@@ -1606,7 +1630,7 @@ export async function processApproval(
       reviewStatus: completion.status,
       reviewBlockReason: completion.reason,
     })
-    return
+    return 'completed'
   }
 
   const claimEnabled = isWorkPackageHandoffEnabled()
@@ -1629,7 +1653,7 @@ export async function processApproval(
       ...handoff,
       claimedPackageId: null,
     })
-    return
+    return 'completed'
   }
 
   claimLeaseFence.assertOwned()
@@ -1639,7 +1663,7 @@ export async function processApproval(
       handoffStatus: preview.status,
       taskId,
     })
-    return
+    return 'completed'
   }
 
   let handoff: Awaited<ReturnType<typeof handoffApprovedWorkPackages>>
@@ -1652,7 +1676,7 @@ export async function processApproval(
     })
     claimLeaseFence.assertOwned()
   } catch (err) {
-    if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
+    if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return 'retained'
     const finalAttempt = options.finalAttempt ?? true
     claimLeaseFence.assertOwned()
     if (finalAttempt) {
@@ -1667,7 +1691,7 @@ export async function processApproval(
   if (handoff.claimedPackageId === null && handoff.status === 'no_ready_packages') {
     claimLeaseFence.assertOwned()
     await updateTaskStatus(taskId, 'approved', 'No ready work packages were available for handoff.')
-    return
+    return 'completed'
   }
 
   if (handoff.claimedPackageId === null && handoff.status === 'blocked') {
@@ -1691,12 +1715,13 @@ export async function processApproval(
 
   claimLeaseFence.assertOwned()
   await publishHandoffResult(taskId, handoff)
+  return 'completed'
 }
 
 async function processRunningWorkforceContinuation(
   taskId: string,
   options: QueueClaimProcessOptions,
-): Promise<void> {
+): Promise<QueueClaimBusinessDisposition> {
   const claimLeaseFence = options.claimLeaseFence ?? new ClaimLeaseFence()
   claimLeaseFence.assertOwned()
   let handoff: WorkPackageHandoffResult
@@ -1708,7 +1733,7 @@ async function processRunningWorkforceContinuation(
     })
     claimLeaseFence.assertOwned()
   } catch (err) {
-    if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return
+    if (claimLeaseFence.lost || isClaimLeaseLostError(err)) return 'retained'
     if (options.finalAttempt ?? true) {
       claimLeaseFence.assertOwned()
       await updateTaskStatusIfCurrent(taskId, 'running', 'failed', errorMessage(err))
@@ -1738,6 +1763,7 @@ async function processRunningWorkforceContinuation(
 
   claimLeaseFence.assertOwned()
   await publishHandoffResult(taskId, handoff)
+  return 'completed'
 }
 
 async function publishHandoffResult(

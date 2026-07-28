@@ -1,5 +1,12 @@
 const CLAIM_LEASE_LOST_MESSAGE = 'Queue claim lease ownership was lost.'
 
+export type QueueClaimBusinessDisposition = 'completed' | 'retained'
+
+export type QueueClaimExecutionContext = Readonly<{
+  occurrenceId: string
+  recoveredOccurrence: boolean
+}>
+
 export class ClaimLeaseLostError extends Error {
   readonly code = 'claim_lease_lost'
 
