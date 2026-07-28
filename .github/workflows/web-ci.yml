@@ -537,6 +537,13 @@ jobs:
           FORGE_S4_REDIS_TEST_URL: redis://localhost:6380/15
         run: |
           npm run test:mcp:s4-redis
+      - name: Run mandatory S4 Redis ACL zero-skip proof
+        env:
+          FORGE_S4_REDIS_ACL_TEST_REQUIRED: '1'
+          FORGE_S4_REDIS_ACL_DESTRUCTIVE_TEST: '1'
+          FORGE_S4_REDIS_ACL_TEST_ADMIN_URL: redis://localhost:6380/14
+        run: |
+          npm run test:mcp:s4-redis-acl
       - run: npm run build
       - run: npx playwright install chromium
       - name: Run mandatory S3 PostgreSQL concurrency proof
