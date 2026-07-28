@@ -228,6 +228,12 @@ Architect writer/resolver/history-reader URLs configured. CI sets
 test or no passing test. This proves the configured database boundary and test
 fixture; it is not a complete proof of production safety.
 
+For the separate legacy-data maintenance procedure, use the [legacy leakage
+scrub runbook](operators/legacy-leakage-scrub-v1.md). It requires a dedicated
+admin PostgreSQL connection and a private 32-byte HMAC key. The PostgreSQL
+proof, Redis credential-revocation proof, and complete cross-sink proof are
+separate gates; do not treat one as evidence for the others.
+
 ## Executable Workforce Beta
 
 Workforce materialization and handoff are available after approval. Package

@@ -763,6 +763,7 @@ describe('legacy leakage CLI and operator guide', () => {
     const packageJson = JSON.parse(await readFile('package.json', 'utf8')) as { scripts: Record<string, string> }
     const runbook = await readFile('../docs/operators/legacy-leakage-scrub-v1.md', 'utf8')
     const commandSource = await readFile('scripts/scrub-legacy-leakage.ts', 'utf8')
+    const envExample = await readFile('../.env.example', 'utf8')
     expect(packageJson.scripts['protocol:scrub-legacy-leakage']).toBe('tsx scripts/scrub-legacy-leakage.ts')
     for (const contractText of [
       'protocol:scrub-legacy-leakage',
@@ -775,9 +776,27 @@ describe('legacy leakage CLI and operator guide', () => {
       'work_packages',
       'forge:task-events:v2:{taskId}:history',
       'FORGE_DATABASE_ADMIN_URL',
+      'FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY',
+      'FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID',
+      'S4_SCRUB_POSTGRES_START',
+      'S4_SCRUB_POSTGRES_AUTH_CAS_RESUME_OK',
+      'S4_SCRUB_POSTGRES_ARTIFACT_LINK_RACE_OK',
     ]) {
       expect(runbook).toContain(contractText)
     }
+    for (const envName of [
+      'FORGE_DATABASE_ADMIN_URL',
+      'FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY',
+      'FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID',
+    ]) {
+      expect(envExample).toContain(envName)
+    }
+    expect(runbook).toContain('Redis credential-revocation/namespace proof')
+    expect(runbook).toContain('complete cross-sink production proof')
+    expect(runbook).toContain('schemaVersion: 2')
+    expect(runbook).toContain('sentinelSetFingerprint')
+    expect(runbook).toContain('legacy_task_log_unavailable')
+    expect(runbook).toContain('unknown_legacy_digest')
     expect(commandSource).toContain('process.env.FORGE_DATABASE_ADMIN_URL')
     expect(commandSource).not.toContain("getRequiredEnv('DATABASE_URL')")
     expect(commandSource).toContain("receipt.owner_issue = 179")
@@ -797,6 +816,7 @@ describe('legacy leakage CLI and operator guide', () => {
     expect(commandSource.slice(identityStart, reloadStart)).not.toContain('a.content')
     expect(commandSource.slice(reloadStart)).toContain('and not exists (')
     expect(commandSource).toContain('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY')
+    expect(commandSource).toContain('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID')
     expect(commandSource).not.toContain('createHash')
     expect(commandSource).not.toContain('historyAvailable":true')
   })
