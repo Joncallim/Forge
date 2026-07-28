@@ -45,7 +45,8 @@ vi.mock('@/db', () => ({
     update: mockDbUpdate,
   },
 }))
-vi.mock('@/lib/providers/registry', () => ({
+vi.mock('@/lib/providers/registry', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/providers/registry')>(),
   getModel: mockGetModel,
   getProvider: mockGetProvider,
 }))
@@ -159,16 +160,25 @@ describe('Architect queue-claim cancellation', () => {
       [config],
     ]
     mockDbSelect.mockImplementation(() => chain(selectResults.shift() ?? []))
-    mockDbInsert.mockImplementation(() => chain([run]))
+    const insertedRuns: unknown[] = []
+    mockDbInsert.mockImplementation(() => chain([run], (value) => insertedRuns.push(value)))
     mockDbUpdate.mockImplementation(() => chain([]))
     mockDbDelete.mockImplementation(() => chain(undefined))
     mockUpdateTaskStatusIfCurrent.mockResolvedValue(true)
     mockReadCheckpoint.mockResolvedValue(null)
     mockGetProvider.mockResolvedValue({
       config: {
+        apiKeyCiphertext: null,
+        apiKeyEnvVar: null,
+        baseUrl: null,
+        createdAt: new Date('2026-07-29T00:00:00.000Z'),
         displayName: 'Provider',
+        id: 'provider-1',
+        isActive: true,
+        isLocal: false,
         modelId: 'model-1',
         providerType: 'openai',
+        updatedAt: new Date('2026-07-29T00:00:00.000Z'),
       },
     })
     mockGetModel.mockResolvedValue({ modelId: 'model-1' })
@@ -225,6 +235,25 @@ describe('Architect queue-claim cancellation', () => {
     expect(fence.markLost()).toBe(true)
     await expect(processing).resolves.toBe('retained')
 
+    expect(mockGetModel).toHaveBeenCalledWith('provider-1', expect.objectContaining({
+      expectedExecutionSnapshot: expect.objectContaining({
+        acpExecutionMode: 'not_applicable',
+        configId: 'provider-1',
+        isLocal: false,
+        modelId: 'model-1',
+        providerType: 'openai',
+        updatedAt: new Date('2026-07-29T00:00:00.000Z'),
+      }),
+      signal: fence.signal,
+    }))
+    expect(insertedRuns[0]).toEqual(expect.objectContaining({
+      acpExecutionMode: 'not_applicable',
+      modelIdUsed: 'model-1',
+      providerConfigId: 'provider-1',
+      providerConfigUpdatedAtUsed: new Date('2026-07-29T00:00:00.000Z'),
+      providerIsLocalUsed: false,
+      providerTypeUsed: 'openai',
+    }))
     expect(activeProviderSignal?.aborted).toBe(true)
     expect(activeProviderSignal?.reason).toBeInstanceOf(ClaimLeaseLostError)
     expect(mockDbUpdate).not.toHaveBeenCalled()

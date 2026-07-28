@@ -4,7 +4,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { db } from '../db'
 import { agentConfigs, agentRuns, artifacts, projects, taskQuestions, tasks, type Task } from '../db/schema'
-import { getModel, getProvider } from '../lib/providers/registry'
+import { getModel, getProvider, providerExecutionSnapshot } from '../lib/providers/registry'
 import { resolveDefaultProvider } from '../lib/providers/default'
 import { and, asc, desc, eq, isNull } from 'drizzle-orm'
 import { publishTaskEvent } from './events'
@@ -868,12 +868,18 @@ async function runArchitect(
     throw new Error(`Provider config ${providerConfigId} is missing or inactive`)
   }
 
+  const providerSnapshot = providerExecutionSnapshot(providerResult.config)
+
   claimLeaseFence.assertOwned()
   const executionCwd = providerResult.config.providerType === 'acp'
     ? await prepareArchitectAcpSessionCwd(task.id, claimLeaseFence)
     : project.localPath
   claimLeaseFence.assertOwned()
-  const model = await getModel(providerConfigId, { cwd: executionCwd })
+  const model = await getModel(providerConfigId, {
+    cwd: executionCwd,
+    expectedExecutionSnapshot: providerSnapshot,
+    signal: claimLeaseFence.signal,
+  })
   if (!model) {
     throw new Error(`Provider config ${providerConfigId} is missing or inactive`)
   }
@@ -887,7 +893,11 @@ async function runArchitect(
       taskId: task.id,
       agentType: ARCHITECT_AGENT,
       providerConfigId,
-      modelIdUsed: providerResult.config.modelId,
+      modelIdUsed: providerSnapshot.modelId,
+      providerTypeUsed: providerSnapshot.providerType,
+      providerIsLocalUsed: providerSnapshot.isLocal,
+      providerConfigUpdatedAtUsed: providerSnapshot.updatedAt,
+      acpExecutionMode: providerSnapshot.acpExecutionMode,
       status: 'running',
       startedAt,
     })
