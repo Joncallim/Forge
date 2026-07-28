@@ -11,13 +11,35 @@ import {
 import { createLegacyLeakageRedisAdapter } from '@/scripts/scrub-legacy-leakage'
 
 const required = process.env.FORGE_S4_REQUIRE_REDIS_TEST === '1'
-const redisUrl = process.env.FORGE_S4_REDIS_TEST_URL ?? process.env.REDIS_URL
+const destructive = process.env.FORGE_S4_REDIS_DESTRUCTIVE_TEST === '1'
+const redisUrl = process.env.FORGE_S4_REDIS_TEST_URL
 
-if (required && !redisUrl) {
-  throw new Error('FORGE_S4_REQUIRE_REDIS_TEST=1 requires FORGE_S4_REDIS_TEST_URL or REDIS_URL; the mandatory Redis proof may not skip.')
+function validateDestructiveRedisUrl(value: string): string {
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    throw new Error('S4 Redis proof requires a valid dedicated Redis URL.')
+  }
+  if ((parsed.protocol !== 'redis:' && parsed.protocol !== 'rediss:') || parsed.search || parsed.hash) {
+    throw new Error('S4 Redis proof requires an unambiguous redis: or rediss: URL.')
+  }
+  if (!/^\/[1-9][0-9]*$/.test(parsed.pathname)) {
+    throw new Error('S4 Redis proof requires an explicit nonzero disposable database path.')
+  }
+  const database = Number(parsed.pathname.slice(1))
+  if (!Number.isSafeInteger(database) || database < 1) {
+    throw new Error('S4 Redis proof requires an explicit nonzero disposable database path.')
+  }
+  return value
 }
 
-const enabled = Boolean(redisUrl)
+if (required && (!redisUrl || !destructive)) {
+  throw new Error('FORGE_S4_REQUIRE_REDIS_TEST=1 requires FORGE_S4_REDIS_TEST_URL and FORGE_S4_REDIS_DESTRUCTIVE_TEST=1; the mandatory Redis proof may not skip.')
+}
+
+const destructiveRedisUrl = redisUrl && destructive ? validateDestructiveRedisUrl(redisUrl) : null
+const enabled = Boolean(destructiveRedisUrl)
 const fingerprintKey = Buffer.alloc(32, 41)
 const fingerprintKeyId = 's4-redis-proof-v1'
 const receipt = randomUUID()
@@ -71,8 +93,8 @@ function eventEnvelope(id: number): string {
   })
 }
 
-function opaque(value: string): string {
-  return createHmac('sha256', hmacKey).update(value).digest('hex')
+function opaque(value: Buffer | null): string {
+  return createHmac('sha256', hmacKey).update(value ?? Buffer.alloc(0)).digest('hex')
 }
 
 describe.skipIf(!enabled)('S4 real Redis legacy leakage scrub proof', () => {
@@ -102,16 +124,23 @@ describe.skipIf(!enabled)('S4 real Redis legacy leakage scrub proof', () => {
     return keys
   }
 
+  async function dumpBuffer(key: string): Promise<Buffer | null> {
+    const dumped = await redis.callBuffer('DUMP', key)
+    if (dumped === null) return null
+    if (!Buffer.isBuffer(dumped)) throw new Error('S4 Redis proof requires binary DUMP replies for immutable fingerprints.')
+    return dumped
+  }
+
   async function snapshotV2(keys: ReturnType<typeof taskKeys>): Promise<Readonly<{ historyType: string; sequenceType: string; history: string; sequence: string }>> {
     const [historyType, sequenceType, history, sequence] = await Promise.all([
       redis.type(keys.v2History), redis.type(keys.v2Sequence),
-      redis.dump(keys.v2History), redis.dump(keys.v2Sequence),
+      dumpBuffer(keys.v2History), dumpBuffer(keys.v2Sequence),
     ])
     return {
       historyType,
       sequenceType,
-      history: opaque(history ?? ''),
-      sequence: opaque(sequence ?? ''),
+      history: opaque(history),
+      sequence: opaque(sequence),
     }
   }
 
@@ -123,11 +152,12 @@ describe.skipIf(!enabled)('S4 real Redis legacy leakage scrub proof', () => {
   }
 
   beforeAll(async () => {
-    redis = new Redis(redisUrl!, { lazyConnect: true, maxRetriesPerRequest: 1 })
+    redis = new Redis(destructiveRedisUrl!, { lazyConnect: true, maxRetriesPerRequest: 1 })
     await redis.connect()
     const info = await redis.info('server')
     const version = /^redis_version:(\d+)/m.exec(info)?.[1]
     if (!version || Number(version) < 7) throw new Error('S4 Redis proof requires Redis major version 7 or newer.')
+    if (await redis.dbsize() !== 0) throw new Error('S4 Redis proof requires an empty dedicated disposable database.')
   })
 
   afterAll(async () => {
@@ -135,6 +165,7 @@ describe.skipIf(!enabled)('S4 real Redis legacy leakage scrub proof', () => {
       if (ownedKeys.size > 0) await redis.del(...ownedKeys)
       const remaining = await Promise.all([...ownedKeys].map((key) => redis.exists(key)))
       expect(remaining.every((count) => count === 0)).toBe(true)
+      expect(await redis.dbsize()).toBe(0)
     } finally {
       await redis?.quit()
     }
@@ -190,7 +221,7 @@ describe.skipIf(!enabled)('S4 real Redis legacy leakage scrub proof', () => {
       const taskId = randomUUID()
       const keys = await seedValid(taskId)
       if (kind === 'malformed_legacy') {
-        const malformed = 'forge:task:not-a-uuid:history'
+        const malformed = `forge:task:not-a-uuid-${randomUUID()}:history`
         ownedKeys.add(malformed)
         await redis.zadd(malformed, 1, 'legacy')
       } else if (kind === 'stored_live') {
@@ -219,14 +250,14 @@ describe.skipIf(!enabled)('S4 real Redis legacy leakage scrub proof', () => {
       expect(await snapshotV2(keys)).toEqual(before)
       del.mockRestore()
       await redis.del(keys.legacyHistory, keys.legacySequence, keys.v2History, keys.v2Sequence, keys.v2Unknown)
-      if (kind === 'malformed_legacy') await redis.del('forge:task:not-a-uuid:history')
+      if (kind === 'malformed_legacy') await redis.del(...[...ownedKeys].filter((key) => key.startsWith('forge:task:not-a-uuid-')))
     }
   })
 
   it('refuses completion when a malformed legacy key reappears at the production post-delete boundary', async () => {
     const taskId = randomUUID()
     const keys = await seedValid(taskId)
-    const malformed = `forge:task:not-a-uuid:${randomUUID()}`
+    const malformed = `forge:task:not-a-uuid-${randomUUID()}:history`
     ownedKeys.add(malformed)
     const originalDel = redis.del.bind(redis)
     const injectMalformedReappearance = async (...keysToDelete: string[]): Promise<number> => {

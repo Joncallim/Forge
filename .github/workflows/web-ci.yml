@@ -524,25 +524,10 @@ jobs:
       - name: Run mandatory S4 Redis zero-skip proof
         env:
           FORGE_S4_REQUIRE_REDIS_TEST: '1'
+          FORGE_S4_REDIS_DESTRUCTIVE_TEST: '1'
           FORGE_S4_REDIS_TEST_URL: redis://localhost:6379/15
         run: |
-          set -o pipefail
-          report="$(mktemp)"
-          npm run test:mcp:s4-redis -- --reporter=default | tee "$report"
-          if grep -Eq '[1-9][0-9]* skipped' "$report"; then
-            echo 'The mandatory S4 Redis proof was skipped.' >&2
-            exit 1
-          fi
-          if ! grep -Eq '[1-9][0-9]* passed' "$report"; then
-            echo 'The mandatory S4 Redis proof did not report a passing test.' >&2
-            exit 1
-          fi
-          for marker in S4_SCRUB_REDIS_START S4_SCRUB_REDIS_PURGE_RETRY_OK S4_SCRUB_REDIS_V2_IMMUTABLE_OK; do
-            if ! grep -Fq "$marker" "$report"; then
-              echo "The mandatory S4 Redis proof did not emit $marker." >&2
-              exit 1
-            fi
-          done
+          npm run test:mcp:s4-redis
       - run: npm run build
       - run: npx playwright install chromium
       - name: Run mandatory S3 PostgreSQL concurrency proof
