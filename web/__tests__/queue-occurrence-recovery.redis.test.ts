@@ -1,9 +1,10 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import Redis from 'ioredis'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import {
   AnswersQueue,
   ApprovalQueue,
+  RetryPromotionConflictError,
   TaskQueue,
   type AnswersJob,
   type ApprovalJob,
@@ -21,6 +22,8 @@ const QUEUE_KEYS = [
   'forge:tasks:claims',
   'forge:tasks:ack-receipts',
   'forge:tasks:release-receipts',
+  'forge:tasks:promotion-dispositions',
+  'forge:tasks:promotion-disposition-expiry',
   'forge:approvals',
   'forge:approvals:processing',
   'forge:approvals:retry',
@@ -28,6 +31,8 @@ const QUEUE_KEYS = [
   'forge:approvals:claims',
   'forge:approvals:ack-receipts',
   'forge:approvals:release-receipts',
+  'forge:approvals:promotion-dispositions',
+  'forge:approvals:promotion-disposition-expiry',
   'forge:answers',
   'forge:answers:processing',
   'forge:answers:retry',
@@ -35,6 +40,8 @@ const QUEUE_KEYS = [
   'forge:answers:claims',
   'forge:answers:ack-receipts',
   'forge:answers:release-receipts',
+  'forge:answers:promotion-dispositions',
+  'forge:answers:promotion-disposition-expiry',
 ] as const
 
 const required = process.env.CI === 'true'
@@ -74,10 +81,35 @@ const enabled = Boolean(destructive && redisUrl)
 const destructiveRedisUrl = enabled ? validateRedisUrl(redisUrl!) : null
 const TASK_ID = '11111111-1111-4111-8111-111111111111'
 
+// Frozen from web/worker/queue.ts at f589d99852441705b93e169ed3798064a6995891.
+const HISTORICAL_PROMOTE_RETRY_V2_SCRIPT = `
+-- forge:queue:promote-retry-v2
+
+local function assert_type(key, expected)
+  local actual = redis.call('TYPE', key)['ok']
+  if actual ~= 'none' and actual ~= expected then
+    error('forge_queue_type_mismatch')
+  end
+end
+
+assert_type(KEYS[1], 'zset')
+assert_type(KEYS[2], 'list')
+if redis.call('ZREM', KEYS[1], ARGV[1]) == 1 then
+  redis.call('LPUSH', KEYS[2], ARGV[1])
+  return 1
+end
+if redis.call('LPOS', KEYS[2], ARGV[1]) then
+  return 2
+end
+return 0
+`
+const HISTORICAL_PROMOTE_RETRY_V2_SHA256 =
+  '17e38f4e0bc247a2d25b801b3c46876cc84f5915c6c11a21d48ff34762c8905e'
+
 type Occurrence = {
   schemaVersion: number
   occurrenceId: string
-  job: { taskId: string; attempt: number }
+  job: TaskJob | ApprovalJob | AnswersJob
 }
 
 function parseOccurrence(raw: string): Occurrence {
@@ -92,12 +124,48 @@ function occurrence(index: number): string {
   })
 }
 
+function assertHistoricalV2Occurrence(raw: string): void {
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    throw new Error('Historical v2 retry occurrence is invalid.')
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Historical v2 retry occurrence is invalid.')
+  }
+  const record = value as Record<string, unknown>
+  if (Object.keys(record).sort().join(',') !== 'job,occurrenceId,schemaVersion'
+    || record.schemaVersion !== 1
+    || typeof record.occurrenceId !== 'string'
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+      .test(record.occurrenceId)
+    || typeof record.job !== 'object'
+    || record.job === null
+    || Array.isArray(record.job)
+    || JSON.stringify(record) !== raw) {
+    throw new Error('Historical v2 retry occurrence is invalid.')
+  }
+}
+
 describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () => {
   let admin: Redis
-  const queues = new Set<TaskQueue>()
+  const queues = new Set<{ disconnect: () => void }>()
 
   function queue(): TaskQueue {
     const created = new TaskQueue(destructiveRedisUrl!)
+    queues.add(created)
+    return created
+  }
+
+  function approvalQueue(): ApprovalQueue {
+    const created = new ApprovalQueue(destructiveRedisUrl!)
+    queues.add(created)
+    return created
+  }
+
+  function answersQueue(): AnswersQueue {
+    const created = new AnswersQueue(destructiveRedisUrl!)
     queues.add(created)
     return created
   }
@@ -147,6 +215,274 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
   })
 
   it('preserves two identical occurrences through recovery, retry, promotion, and dead letter', async () => {
+    type RetryClockJob = TaskJob | ApprovalJob | AnswersJob
+    type RetryClockQueue = {
+      claim: (timeoutSeconds: number) => Promise<{
+        job: RetryClockJob
+        occurrenceId: string
+        raw: string
+      } | null>
+      promoteDueRetries: (limit?: number) => Promise<number>
+      recoverStuckJobs: (staleMs: number) => Promise<number>
+      retry: (raw: string, job: RetryClockJob, delayMs: number) => Promise<{
+        nextRetryAt: Date
+        outcome: 'already_applied' | 'applied'
+      }>
+    }
+    const retryClockCases = [
+      {
+        create: () => queue() as unknown as RetryClockQueue,
+        job: (attempt: number): RetryClockJob => ({ taskId: TASK_ID, attempt }),
+        processing: 'forge:tasks:processing',
+        ready: 'forge:tasks',
+        retry: 'forge:tasks:retry',
+      },
+      {
+        create: () => approvalQueue() as unknown as RetryClockQueue,
+        job: (attempt: number): RetryClockJob => ({
+          taskId: TASK_ID,
+          action: 'approve',
+          attempt,
+        }),
+        processing: 'forge:approvals:processing',
+        ready: 'forge:approvals',
+        retry: 'forge:approvals:retry',
+      },
+      {
+        create: () => answersQueue() as unknown as RetryClockQueue,
+        job: (attempt: number): RetryClockJob => ({ taskId: TASK_ID, attempt }),
+        processing: 'forge:answers:processing',
+        ready: 'forge:answers',
+        retry: 'forge:answers:retry',
+      },
+    ]
+    const retryClockScenarios = [
+      { delayMs: 0, loseResponse: false, workerSkewMs: 120_000 },
+      { delayMs: 60_000, loseResponse: true, workerSkewMs: -120_000 },
+    ] as const
+    const dateNow = vi.spyOn(Date, 'now')
+
+    try {
+      for (const [caseIndex, queueCase] of retryClockCases.entries()) {
+        for (const [scenarioIndex, scenario] of retryClockScenarios.entries()) {
+          await admin.del(...QUEUE_KEYS)
+          const job = queueCase.job(100 + (caseIndex * 10) + scenarioIndex)
+          await admin.lpush(queueCase.ready, JSON.stringify(job))
+          const retryQueue = queueCase.create()
+          const claimed = await retryQueue.claim(1)
+          if (!claimed) throw new Error('Queue Redis retry clock fixture was not claimed.')
+          const retryClient = (retryQueue as unknown as { client: Redis }).client
+          const originalCall = retryClient.call.bind(retryClient)
+          let loseResponse = scenario.loseResponse
+          const call = vi.spyOn(retryClient, 'call').mockImplementation(async (
+            ...args: Parameters<Redis['call']>
+          ) => {
+            const result = await originalCall(...args)
+            if (loseResponse && String(args[1]).includes('forge:queue:retry-v3')) {
+              loseResponse = false
+              throw new Error('simulated retry response loss')
+            }
+            return result
+          })
+
+          const redisBefore = await redisTimeMs()
+          dateNow.mockReturnValue(redisBefore + scenario.workerSkewMs)
+          if (scenario.loseResponse) {
+            await expect(retryQueue.retry(claimed.raw, claimed.job, scenario.delayMs))
+              .rejects.toThrow('Queue transition failed')
+          }
+          const retryResult = await retryQueue.retry(
+            claimed.raw,
+            claimed.job,
+            scenario.delayMs,
+          )
+          const redisAfterApplied = await redisTimeMs()
+          const scheduled = await admin.zrange(queueCase.retry, 0, -1, 'WITHSCORES')
+          expect(scheduled).toHaveLength(2)
+          const scheduledScore = Number(scheduled[1])
+          expect(retryResult).toEqual({
+            nextRetryAt: new Date(scheduledScore),
+            outcome: scenario.loseResponse ? 'already_applied' : 'applied',
+          })
+          expect(retryResult.nextRetryAt.getTime()).toBe(scheduledScore)
+          expect(scheduledScore).toBeGreaterThanOrEqual(redisBefore + scenario.delayMs)
+          expect(scheduledScore).toBeLessThanOrEqual(redisAfterApplied + scenario.delayMs)
+
+          const retryCalls = call.mock.calls.filter((args) =>
+            String(args[1]).includes('forge:queue:retry-v3'))
+          expect(retryCalls.at(-1)?.[9]).toBe(String(scenario.delayMs))
+          const rawReply = await call.mock.results.at(-1)?.value
+          expect(rawReply).toEqual([
+            scenario.loseResponse ? 2 : 1,
+            String(scheduledScore),
+          ])
+
+          if (scenario.delayMs === 60_000) {
+            const scheduledMember = scheduled[0]
+            if (!scheduledMember) {
+              throw new Error('Queue Redis owned delayed retry member was not scheduled.')
+            }
+            await expect(retryQueue.promoteDueRetries()).resolves.toBe(0)
+            expect(await admin.zscore(queueCase.retry, scheduledMember))
+              .toBe(String(scheduledScore))
+
+            const fixturePromotionTime = await redisTimeMs()
+            await admin.zadd(queueCase.retry, fixturePromotionTime, scheduledMember)
+            await expect(retryQueue.promoteDueRetries()).resolves.toBe(1)
+            expect(await admin.zscore(queueCase.retry, scheduledMember)).toBeNull()
+            expect(
+              (await admin.lrange(queueCase.ready, 0, -1))
+                .filter((raw) => raw === scheduledMember),
+            ).toEqual([scheduledMember])
+          }
+        }
+
+        await admin.del(...QUEUE_KEYS)
+        const conflictJob = queueCase.job(130 + caseIndex)
+        await admin.lpush(queueCase.ready, JSON.stringify(conflictJob))
+        const conflictQueue = queueCase.create()
+        const conflictClaim = await conflictQueue.claim(1)
+        if (!conflictClaim) {
+          throw new Error('Queue Redis retry destination conflict fixture was not claimed.')
+        }
+        const claimsKey = `${queueCase.processing.replace(/:processing$/, '')}:claims`
+        const marker = await admin.hget(claimsKey, conflictClaim.occurrenceId)
+        if (!marker) throw new Error('Queue Redis retry destination conflict marker is absent.')
+        const exactDestination = JSON.stringify({
+          schemaVersion: 1,
+          occurrenceId: conflictClaim.occurrenceId,
+          job: {
+            ...conflictClaim.job,
+            attempt: (conflictClaim.job.attempt ?? 1) + 1,
+          },
+        })
+        const neighboringDestination = JSON.stringify({
+          schemaVersion: 1,
+          occurrenceId: `00000000-0000-4000-8000-${String(caseIndex + 901).padStart(12, '0')}`,
+          job: {
+            ...conflictClaim.job,
+            attempt: (conflictClaim.job.attempt ?? 1) + 20,
+          },
+        })
+        const exactDestinationScore = (await redisTimeMs()) + 60_000
+        const neighboringDestinationScore = exactDestinationScore + 60_000
+        await admin.zadd(
+          queueCase.retry,
+          exactDestinationScore,
+          exactDestination,
+          neighboringDestinationScore,
+          neighboringDestination,
+        )
+
+        await expect(conflictQueue.retry(
+          conflictClaim.raw,
+          conflictClaim.job,
+          60_000,
+        )).rejects.toThrow('Queue transition stale_not_owner')
+        expect(await admin.lrange(queueCase.processing, 0, -1))
+          .toEqual([conflictClaim.raw])
+        expect(await admin.hget(claimsKey, conflictClaim.occurrenceId)).toBe(marker)
+        expect(await admin.zscore(queueCase.retry, exactDestination))
+          .toBe(String(exactDestinationScore))
+        expect(await admin.zscore(queueCase.retry, neighboringDestination))
+          .toBe(String(neighboringDestinationScore))
+
+        await admin.del(queueCase.retry)
+        await admin.set(queueCase.retry, 'wrong-type-fixture')
+        await expect(conflictQueue.retry(
+          conflictClaim.raw,
+          conflictClaim.job,
+          60_000,
+        )).rejects.toThrow('Queue transition failed')
+        expect(await admin.lrange(queueCase.processing, 0, -1))
+          .toEqual([conflictClaim.raw])
+        expect(await admin.hget(claimsKey, conflictClaim.occurrenceId)).toBe(marker)
+        expect(await admin.get(queueCase.retry)).toBe('wrong-type-fixture')
+
+        await admin.del(queueCase.retry)
+        await admin.zadd(
+          queueCase.retry,
+          neighboringDestinationScore,
+          neighboringDestination,
+        )
+        const appliedAfterNeighbor = await conflictQueue.retry(
+          conflictClaim.raw,
+          conflictClaim.job,
+          60_000,
+        )
+        const appliedDestinationScore = Number(
+          await admin.zscore(queueCase.retry, exactDestination),
+        )
+        expect(appliedAfterNeighbor).toEqual({
+          nextRetryAt: new Date(appliedDestinationScore),
+          outcome: 'applied',
+        })
+        expect(await admin.zscore(queueCase.retry, neighboringDestination))
+          .toBe(String(neighboringDestinationScore))
+
+        await admin.del(...QUEUE_KEYS)
+        const staleJob = queueCase.job(140 + caseIndex)
+        await admin.lpush(queueCase.ready, JSON.stringify(staleJob))
+        const staleOwner = queueCase.create()
+        const staleClaim = await staleOwner.claim(1)
+        if (!staleClaim) throw new Error('Queue Redis stale retry fixture was not claimed.')
+        const staleClient = (staleOwner as unknown as { client: Redis }).client
+        const staleCall = vi.spyOn(staleClient, 'call')
+        const laterOwner = queueCase.create()
+        await expect(laterOwner.recoverStuckJobs(0)).resolves.toBe(1)
+        await expect(staleOwner.retry(staleClaim.raw, staleClaim.job, 60_000))
+          .rejects.toThrow('Queue transition stale_not_owner')
+        const rawStaleReply = await staleCall.mock.results.at(-1)?.value
+        expect(rawStaleReply).toEqual([0, ''])
+        expect(await admin.zcard(queueCase.retry)).toBe(0)
+        expect(await admin.llen(queueCase.processing)).toBe(0)
+      }
+    } finally {
+      dateNow.mockRestore()
+    }
+
+    await admin.del(...QUEUE_KEYS)
+    const maxDateMs = 8_640_000_000_000_000
+    const maxBoundaryQueue = queue()
+    const maxBoundaryJob = { taskId: TASK_ID, attempt: 180 }
+    await admin.lpush('forge:tasks', JSON.stringify(maxBoundaryJob))
+    const maxBoundaryClaim = await maxBoundaryQueue.claim(1)
+    if (!maxBoundaryClaim) throw new Error('Queue Redis maximum retry fixture was not claimed.')
+    const redisBeforeBoundary = await redisTimeMs()
+    const maxBoundaryHeadroomMs = 60_000
+    const maxValidDelayMs = maxDateMs - redisBeforeBoundary - maxBoundaryHeadroomMs
+    const maxBoundaryResult = await maxBoundaryQueue.retry(
+      maxBoundaryClaim.raw,
+      maxBoundaryClaim.job,
+      maxValidDelayMs,
+    )
+    const [maxBoundaryMember] = await admin.zrange('forge:tasks:retry', 0, 0)
+    if (!maxBoundaryMember) throw new Error('Queue Redis maximum retry was not scheduled.')
+    const maxBoundaryScore = Number(await admin.zscore(
+      'forge:tasks:retry',
+      maxBoundaryMember,
+    ))
+    expect(maxBoundaryResult.nextRetryAt.getTime()).toBe(maxBoundaryScore)
+    expect(maxBoundaryScore).toBeGreaterThanOrEqual(maxDateMs - maxBoundaryHeadroomMs)
+    expect(maxBoundaryScore).toBeLessThanOrEqual(maxDateMs)
+
+    await admin.del(...QUEUE_KEYS)
+    const overflowQueue = queue()
+    const overflowJob = { taskId: TASK_ID, attempt: 181 }
+    await admin.lpush('forge:tasks', JSON.stringify(overflowJob))
+    const overflowClaim = await overflowQueue.claim(1)
+    if (!overflowClaim) throw new Error('Queue Redis overflowing retry fixture was not claimed.')
+    await expect(overflowQueue.retry(overflowClaim.raw, overflowClaim.job, maxDateMs))
+      .rejects.toThrow('Queue transition failed')
+    expect(await admin.lrange('forge:tasks:processing', 0, -1)).toEqual([overflowClaim.raw])
+    expect(await admin.zcard('forge:tasks:retry')).toBe(0)
+
+    for (const invalidDelay of [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53]) {
+      await expect(overflowQueue.retry('', overflowJob, invalidDelay))
+        .rejects.toThrow('Queue retry delay must be a non-negative safe integer')
+    }
+
+    await admin.del(...QUEUE_KEYS)
     const taskQueue = queue()
     const legacy = JSON.stringify({ taskId: TASK_ID, attempt: 1 })
     await admin.rpush('forge:tasks', legacy, legacy)
@@ -189,8 +525,913 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
     expect(new Set(dead.map((entry) => entry.occurrenceId))).toEqual(
       new Set([first.occurrenceId, second.occurrenceId]),
     )
+
+    await admin.del(...QUEUE_KEYS)
+    expect(await admin.dbsize()).toBe(0)
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const now = await redisTimeMs()
+    const retryUpgradeCases = [
+      {
+        currentJob: { taskId: TASK_ID, attempt: 5 },
+        legacyJob: { taskId: TASK_ID, attempt: 4 },
+        queue: queue(),
+        ready: 'forge:tasks',
+        retry: 'forge:tasks:retry',
+      },
+      {
+        currentJob: { taskId: TASK_ID, action: 'approve' as const, attempt: 7 },
+        legacyJob: { taskId: TASK_ID, action: 'approve' as const, attempt: 6 },
+        queue: approvalQueue(),
+        ready: 'forge:approvals',
+        retry: 'forge:approvals:retry',
+      },
+      {
+        currentJob: { taskId: TASK_ID, attempt: 9 },
+        legacyJob: { taskId: TASK_ID, attempt: 8 },
+        queue: answersQueue(),
+        ready: 'forge:answers',
+        retry: 'forge:answers:retry',
+      },
+    ]
+    const poisons: string[] = []
+    for (const [index, queueCase] of retryUpgradeCases.entries()) {
+      const poison = JSON.stringify({
+        taskId: TASK_ID,
+        attempt: 1,
+        prompt: `RETRY_POISON_SENTINEL_${index}_/private/token`,
+      })
+      poisons.push(poison)
+      const legacyRetry = JSON.stringify(queueCase.legacyJob)
+      const currentOccurrenceId = `00000000-0000-4000-8000-${String(800 + index)
+        .padStart(12, '0')}`
+      const currentRetry = JSON.stringify({
+        schemaVersion: 1,
+        occurrenceId: currentOccurrenceId,
+        job: queueCase.currentJob,
+      })
+      await admin.zadd(
+        queueCase.retry,
+        now - 3,
+        poison,
+        now - 2,
+        legacyRetry,
+        now - 1,
+        currentRetry,
+      )
+
+      expect(await queueCase.queue.promoteDueRetries(10)).toBe(2)
+      expect(await admin.zcard(queueCase.retry)).toBe(0)
+      const ready = (await admin.lrange(queueCase.ready, 0, -1)).map(parseOccurrence)
+      expect(ready).toHaveLength(2)
+      expect(ready.map((entry) => entry.job)).toEqual(
+        expect.arrayContaining([queueCase.legacyJob, queueCase.currentJob]),
+      )
+      expect(ready.find((entry) => entry.occurrenceId === currentOccurrenceId)?.job)
+        .toEqual(queueCase.currentJob)
+      const upgraded = ready.find((entry) => entry.occurrenceId !== currentOccurrenceId)
+      expect(upgraded?.occurrenceId).toMatch(/^[0-9a-f-]{36}$/)
+      expect(upgraded?.job).toEqual(queueCase.legacyJob)
+      for (const entry of ready) {
+        expect(Object.keys(entry).sort()).toEqual(['job', 'occurrenceId', 'schemaVersion'])
+      }
+    }
+
+    expect(warn.mock.calls).toEqual(retryUpgradeCases.map(() => [
+      '[worker/queue] Dropped invalid retry payload',
+    ]))
+    const persistedQueueValues: string[] = []
+    for (const key of QUEUE_KEYS) {
+      const type = await admin.type(key)
+      if (type === 'list') persistedQueueValues.push(...await admin.lrange(key, 0, -1))
+      if (type === 'zset') persistedQueueValues.push(...await admin.zrange(key, 0, -1))
+      if (type === 'hash') persistedQueueValues.push(...Object.values(await admin.hgetall(key)))
+    }
+    for (const poison of poisons) {
+      expect(persistedQueueValues.some((value) => value.includes(poison))).toBe(false)
+      expect(JSON.stringify(warn.mock.calls)).not.toContain(poison)
+    }
+
+    await admin.del(...QUEUE_KEYS)
+    warn.mockClear()
+    const contentionCases = [
+      {
+        create: queue,
+        job: { taskId: TASK_ID, attempt: 13 },
+        ready: 'forge:tasks',
+        receipts: 'forge:tasks:promotion-dispositions',
+        receiptExpiry: 'forge:tasks:promotion-disposition-expiry',
+        retry: 'forge:tasks:retry',
+      },
+      {
+        create: approvalQueue,
+        job: { taskId: TASK_ID, action: 'approve' as const, attempt: 14 },
+        ready: 'forge:approvals',
+        receipts: 'forge:approvals:promotion-dispositions',
+        receiptExpiry: 'forge:approvals:promotion-disposition-expiry',
+        retry: 'forge:approvals:retry',
+      },
+      {
+        create: answersQueue,
+        job: { taskId: TASK_ID, attempt: 15 },
+        ready: 'forge:answers',
+        receipts: 'forge:answers:promotion-dispositions',
+        receiptExpiry: 'forge:answers:promotion-disposition-expiry',
+        retry: 'forge:answers:retry',
+      },
+    ]
+    for (const [caseIndex, queueCase] of contentionCases.entries()) {
+      const currentOccurrenceId = `00000000-0000-4000-8000-${String(900 + caseIndex)
+        .padStart(12, '0')}`
+      const scenarios = [
+        {
+          kind: 'current',
+          raw: JSON.stringify({
+            schemaVersion: 1,
+            occurrenceId: currentOccurrenceId,
+            job: queueCase.job,
+          }),
+        },
+        { kind: 'legacy', raw: JSON.stringify(queueCase.job) },
+        {
+          kind: 'poison',
+          raw: JSON.stringify({
+            ...queueCase.job,
+            prompt: `RETRY_CONTENTION_POISON_${caseIndex}`,
+          }),
+        },
+      ] as const
+
+      for (const [scenarioIndex, scenario] of scenarios.entries()) {
+        await admin.del(
+          queueCase.ready,
+          queueCase.retry,
+          queueCase.receipts,
+          queueCase.receiptExpiry,
+        )
+        const score = (await redisTimeMs()) - 10 - scenarioIndex
+        await admin.zadd(queueCase.retry, score, scenario.raw)
+        const first = queueCase.create()
+        const second = queueCase.create()
+        const firstClient = (first as unknown as { client: Redis }).client
+        const secondClient = (second as unknown as { client: Redis }).client
+        const firstCall = vi.spyOn(firstClient, 'call')
+        const secondCall = vi.spyOn(secondClient, 'call')
+        let scanCount = 0
+        let releaseScan!: () => void
+        const scanBarrier = new Promise<void>((resolve) => {
+          releaseScan = resolve
+        })
+        for (const client of [firstClient, secondClient]) {
+          const originalCallBuffer = client.callBuffer.bind(client)
+          vi.spyOn(client, 'callBuffer').mockImplementation(async (
+            ...args: Parameters<Redis['callBuffer']>
+          ) => {
+            const result = await originalCallBuffer(...args)
+            if (String(args[1]).includes('forge:queue:list-due-retries-v1')) {
+              scanCount += 1
+              if (scanCount === 2) releaseScan()
+              await scanBarrier
+            }
+            return result
+          })
+        }
+
+        const results = await Promise.all([
+          first.promoteDueRetries(1),
+          second.promoteDueRetries(1),
+        ])
+        expect([...results].sort()).toEqual(scenario.kind === 'poison' ? [0, 0] : [0, 1])
+        expect(await admin.zcard(queueCase.retry)).toBe(0)
+        expect(await admin.llen(queueCase.ready)).toBe(scenario.kind === 'poison' ? 0 : 1)
+        expect(await admin.hlen(queueCase.receipts)).toBe(1)
+        expect(await admin.zcard(queueCase.receiptExpiry)).toBe(1)
+
+        const promotions = [firstCall, secondCall].map((call) => {
+          const callIndex = call.mock.calls.findIndex((args) =>
+            String(args[1]).includes('forge:queue:promote-retry-v4'))
+          if (callIndex < 0) {
+            throw new Error('Queue Redis contention proof did not execute promotion.')
+          }
+          return {
+            args: call.mock.calls[callIndex],
+            result: call.mock.results[callIndex].value as Promise<unknown>,
+          }
+        })
+        expect(String(promotions[0].args[9])).toBe(String(promotions[1].args[9]))
+        expect(String(promotions[0].args[8])).toBe(String(promotions[1].args[8]))
+        const rawOutcomes = await Promise.all(promotions.map(({ result }) => result))
+        expect(rawOutcomes.map((raw) => Number((raw as unknown[])[0])).sort()).toEqual([1, 2])
+        if (scenario.kind === 'legacy') {
+          expect(String(promotions[0].args[12])).not.toBe(String(promotions[1].args[12]))
+          const [winningRaw] = await admin.lrange(queueCase.ready, 0, -1)
+          const winningOccurrenceId = parseOccurrence(winningRaw).occurrenceId
+          expect(Object.values(await admin.hgetall(queueCase.receipts)))
+            .toEqual([`promoted:${winningOccurrenceId}`])
+        } else if (scenario.kind === 'current') {
+          expect(parseOccurrence((await admin.lrange(queueCase.ready, 0, -1))[0]).occurrenceId)
+            .toBe(currentOccurrenceId)
+          expect(Object.values(await admin.hgetall(queueCase.receipts)))
+            .toEqual([`promoted:${currentOccurrenceId}`])
+        } else {
+          expect(Object.values(await admin.hgetall(queueCase.receipts))).toEqual(['discarded'])
+        }
+      }
+    }
+    expect(warn).toHaveBeenCalledTimes(contentionCases.length)
+
+    const dumpRedisValue = async (key: string): Promise<Buffer> => {
+      const value = await admin.callBuffer('DUMP', key)
+      if (!Buffer.isBuffer(value)) {
+        throw new Error('Queue Redis receipt proof could not fingerprint owned state.')
+      }
+      return value
+    }
+    for (const [caseIndex, queueCase] of contentionCases.entries()) {
+      const candidateOccurrenceId = `00000000-0000-4000-8000-${String(1_300 + caseIndex)
+        .padStart(12, '0')}`
+      const mismatchedOccurrenceId = `00000000-0000-4000-8000-${String(1_400 + caseIndex)
+        .padStart(12, '0')}`
+      for (const mismatch of [true, false]) {
+        await admin.del(
+          queueCase.ready,
+          queueCase.retry,
+          queueCase.receipts,
+          queueCase.receiptExpiry,
+        )
+        const raw = JSON.stringify({
+          schemaVersion: 1,
+          occurrenceId: candidateOccurrenceId,
+          job: queueCase.job,
+        })
+        await admin.zadd(queueCase.retry, (await redisTimeMs()) - 1, raw)
+        const receiptQueue = queueCase.create()
+        const receiptClient = (receiptQueue as unknown as { client: Redis }).client
+        const originalBuffer = receiptClient.callBuffer.bind(receiptClient)
+        let removeScannedSource = true
+        vi.spyOn(receiptClient, 'callBuffer').mockImplementation(async (
+          ...args: Parameters<Redis['callBuffer']>
+        ) => {
+          const result = await originalBuffer(...args)
+          if (removeScannedSource
+            && String(args[1]).includes('forge:queue:list-due-retries-v1')) {
+            removeScannedSource = false
+            await admin.zrem(queueCase.retry, raw)
+          }
+          return result
+        })
+        const originalCall = receiptClient.call.bind(receiptClient)
+        let fingerprint = ''
+        let receiptHashBefore: Buffer | undefined
+        let receiptExpiryBefore: Buffer | undefined
+        vi.spyOn(receiptClient, 'call').mockImplementation(async (
+          ...args: Parameters<Redis['call']>
+        ) => {
+          if (String(args[1]).includes('forge:queue:promote-retry-v4')) {
+            fingerprint = String(args[9])
+            expect(String(args[10])).toBe('occurrence')
+            expect(String(args[12])).toBe(candidateOccurrenceId)
+            const winner = mismatch ? mismatchedOccurrenceId : candidateOccurrenceId
+            await admin.hset(queueCase.receipts, fingerprint, `promoted:${winner}`)
+            await admin.zadd(queueCase.receiptExpiry, (await redisTimeMs()) - 1, fingerprint)
+            if (!mismatch) await admin.lpush(queueCase.ready, raw)
+            receiptHashBefore = await dumpRedisValue(queueCase.receipts)
+            receiptExpiryBefore = await dumpRedisValue(queueCase.receiptExpiry)
+          }
+          return await originalCall(...args)
+        })
+
+        if (mismatch) {
+          let failure: unknown
+          try {
+            await receiptQueue.promoteDueRetries(1)
+          } catch (error) {
+            failure = error
+          }
+          expect(failure).toBeInstanceOf(Error)
+          expect((failure as Error).message)
+            .toBe('Queue retry promotion receipt integrity failure')
+          expect(failure).not.toBeInstanceOf(RetryPromotionConflictError)
+        } else {
+          await expect(receiptQueue.promoteDueRetries(1)).resolves.toBe(0)
+        }
+
+        expect(fingerprint).toMatch(/^[0-9a-f]{64}$/)
+        expect(receiptHashBefore).toBeDefined()
+        expect(receiptExpiryBefore).toBeDefined()
+        expect((await dumpRedisValue(queueCase.receipts)).equals(receiptHashBefore!)).toBe(true)
+        expect((await dumpRedisValue(queueCase.receiptExpiry)).equals(receiptExpiryBefore!))
+          .toBe(true)
+        expect(await admin.zcard(queueCase.retry)).toBe(0)
+        expect(await admin.lrange(queueCase.ready, 0, -1))
+          .toEqual(mismatch ? [] : [raw])
+      }
+    }
+
+    await admin.del(...QUEUE_KEYS)
+    const lostResponseRaw = JSON.stringify({ taskId: TASK_ID, attempt: 16 })
+    await admin.zadd('forge:tasks:retry', (await redisTimeMs()) - 1, lostResponseRaw)
+    const lostResponseFirst = queue()
+    const lostResponseSecond = queue()
+    const lostFirstClient = (lostResponseFirst as unknown as { client: Redis }).client
+    const lostSecondClient = (lostResponseSecond as unknown as { client: Redis }).client
+    const originalLostFirstCall = lostFirstClient.call.bind(lostFirstClient)
+    const originalLostSecondCall = lostSecondClient.call.bind(lostSecondClient)
+    let firstTransitionApplied!: () => void
+    const firstTransition = new Promise<void>((resolve) => {
+      firstTransitionApplied = resolve
+    })
+    vi.spyOn(lostFirstClient, 'call').mockImplementation(async (
+      ...args: Parameters<Redis['call']>
+    ) => {
+      const result = await originalLostFirstCall(...args)
+      if (String(args[1]).includes('forge:queue:promote-retry-v4')) {
+        firstTransitionApplied()
+        throw new Error('simulated promotion response loss')
+      }
+      return result
+    })
+    let replayTransition: unknown
+    vi.spyOn(lostSecondClient, 'call').mockImplementation(async (
+      ...args: Parameters<Redis['call']>
+    ) => {
+      if (String(args[1]).includes('forge:queue:promote-retry-v4')) {
+        await firstTransition
+      }
+      const result = await originalLostSecondCall(...args)
+      if (String(args[1]).includes('forge:queue:promote-retry-v4')) {
+        replayTransition = result
+      }
+      return result
+    })
+    let lostScanCount = 0
+    let releaseLostScans!: () => void
+    const lostScanBarrier = new Promise<void>((resolve) => {
+      releaseLostScans = resolve
+    })
+    for (const client of [lostFirstClient, lostSecondClient]) {
+      const originalCallBuffer = client.callBuffer.bind(client)
+      vi.spyOn(client, 'callBuffer').mockImplementation(async (
+        ...args: Parameters<Redis['callBuffer']>
+      ) => {
+        const result = await originalCallBuffer(...args)
+        if (String(args[1]).includes('forge:queue:list-due-retries-v1')) {
+          lostScanCount += 1
+          if (lostScanCount === 2) releaseLostScans()
+          await lostScanBarrier
+        }
+        return result
+      })
+    }
+    const lostResponseResults = await Promise.allSettled([
+      lostResponseFirst.promoteDueRetries(1),
+      lostResponseSecond.promoteDueRetries(1),
+    ])
+    expect(lostResponseResults[0]).toMatchObject({
+      reason: expect.objectContaining({ message: 'Queue retry promotion failed' }),
+      status: 'rejected',
+    })
+    expect(lostResponseResults[1]).toEqual({ status: 'fulfilled', value: 0 })
+    expect(replayTransition).toEqual([2, 'promoted', expect.stringMatching(/^[0-9a-f-]{36}$/)])
+    expect(await admin.zcard('forge:tasks:retry')).toBe(0)
+    expect(await admin.llen('forge:tasks')).toBe(1)
+    expect(await admin.hlen('forge:tasks:promotion-dispositions')).toBe(1)
+
+    await admin.del(...QUEUE_KEYS)
+    const ownershipQueue = queue()
+    const ownershipClient = (ownershipQueue as unknown as { client: Redis }).client
+    const ownershipRaw = JSON.stringify({ taskId: TASK_ID, attempt: 17 })
+    const ownershipScore = (await redisTimeMs()) - 1
+    await admin.zadd('forge:tasks:retry', ownershipScore, ownershipRaw)
+    const ownershipExpiredFingerprint = '8'.repeat(64)
+    const ownershipLiveFingerprint = '9'.repeat(64)
+    const ownershipReceiptTime = await redisTimeMs()
+    await admin.hset(
+      'forge:tasks:promotion-dispositions',
+      ownershipExpiredFingerprint,
+      'discarded',
+      ownershipLiveFingerprint,
+      `promoted:${randomUUID()}`,
+    )
+    await admin.zadd(
+      'forge:tasks:promotion-disposition-expiry',
+      ownershipReceiptTime - (16 * 60 * 1000),
+      ownershipExpiredFingerprint,
+      ownershipReceiptTime - 1,
+      ownershipLiveFingerprint,
+    )
+    const originalOwnershipBuffer = ownershipClient.callBuffer.bind(ownershipClient)
+    let mutateScore = true
+    vi.spyOn(ownershipClient, 'callBuffer').mockImplementation(async (
+      ...args: Parameters<Redis['callBuffer']>
+    ) => {
+      const result = await originalOwnershipBuffer(...args)
+      if (mutateScore && String(args[1]).includes('forge:queue:list-due-retries-v1')) {
+        mutateScore = false
+        await admin.zadd('forge:tasks:retry', ownershipScore + 1, ownershipRaw)
+      }
+      return result
+    })
+    await expect(ownershipQueue.promoteDueRetries(1))
+      .rejects.toBeInstanceOf(RetryPromotionConflictError)
+    expect(await admin.zscore('forge:tasks:retry', ownershipRaw))
+      .toBe(String(ownershipScore + 1))
+    expect(await admin.llen('forge:tasks')).toBe(0)
+    expect(await admin.hgetall('forge:tasks:promotion-dispositions')).toEqual({
+      [ownershipExpiredFingerprint]: 'discarded',
+      [ownershipLiveFingerprint]: expect.stringMatching(/^promoted:[0-9a-f-]{36}$/),
+    })
+    expect(await admin.zrange(
+      'forge:tasks:promotion-disposition-expiry',
+      0,
+      -1,
+    )).toEqual([ownershipExpiredFingerprint, ownershipLiveFingerprint])
+
+    await admin.del(...QUEUE_KEYS)
+    const unrelatedQueue = queue()
+    const unrelatedClient = (unrelatedQueue as unknown as { client: Redis }).client
+    const unrelatedRaw = JSON.stringify({ taskId: TASK_ID, attempt: 18 })
+    await admin.zadd('forge:tasks:retry', (await redisTimeMs()) - 1, unrelatedRaw)
+    const originalUnrelatedBuffer = unrelatedClient.callBuffer.bind(unrelatedClient)
+    let removeSource = true
+    vi.spyOn(unrelatedClient, 'callBuffer').mockImplementation(async (
+      ...args: Parameters<Redis['callBuffer']>
+    ) => {
+      const result = await originalUnrelatedBuffer(...args)
+      if (removeSource && String(args[1]).includes('forge:queue:list-due-retries-v1')) {
+        removeSource = false
+        await admin.zrem('forge:tasks:retry', unrelatedRaw)
+        await admin.hset(
+          'forge:tasks:promotion-dispositions',
+          'a'.repeat(64),
+          `promoted:${randomUUID()}`,
+        )
+      }
+      return result
+    })
+    await expect(unrelatedQueue.promoteDueRetries(1))
+      .rejects.toBeInstanceOf(RetryPromotionConflictError)
+    expect(await admin.llen('forge:tasks')).toBe(0)
+
+    await admin.del(...QUEUE_KEYS)
+    const capacityQueue = queue()
+    const capacityClient = (capacityQueue as unknown as { client: Redis }).client
+    const capacityRaw = JSON.stringify({ taskId: TASK_ID, attempt: 19 })
+    await admin.zadd('forge:tasks:retry', (await redisTimeMs()) - 1, capacityRaw)
+    await admin.hset('forge:tasks:promotion-dispositions', 'b'.repeat(64), 'discarded')
+    await admin.zadd(
+      'forge:tasks:promotion-disposition-expiry',
+      await redisTimeMs(),
+      'b'.repeat(64),
+    )
+    const originalCapacityCall = capacityClient.call.bind(capacityClient)
+    vi.spyOn(capacityClient, 'call').mockImplementation(async (
+      ...args: Parameters<Redis['call']>
+    ) => {
+      if (String(args[1]).includes('forge:queue:promote-retry-v4')) {
+        args[14] = '1'
+      }
+      return await originalCapacityCall(...args)
+    })
+    await expect(capacityQueue.promoteDueRetries(1))
+      .rejects.toThrow('Queue retry promotion failed')
+    expect(await admin.zscore('forge:tasks:retry', capacityRaw)).not.toBeNull()
+    expect(await admin.llen('forge:tasks')).toBe(0)
+
+    await admin.del(...QUEUE_KEYS)
+    const pruningQueue = queue()
+    const pruningClient = (pruningQueue as unknown as { client: Redis }).client
+    const pruningRaw = JSON.stringify({ taskId: TASK_ID, attempt: 20 })
+    const pruningNow = await redisTimeMs()
+    await admin.zadd('forge:tasks:retry', pruningNow - 1, pruningRaw)
+    await admin.hset('forge:tasks:promotion-dispositions', 'c'.repeat(64), 'discarded')
+    await admin.zadd(
+      'forge:tasks:promotion-disposition-expiry',
+      pruningNow - (16 * 60 * 1000),
+      'c'.repeat(64),
+    )
+    const originalPruningCall = pruningClient.call.bind(pruningClient)
+    vi.spyOn(pruningClient, 'call').mockImplementation(async (
+      ...args: Parameters<Redis['call']>
+    ) => {
+      if (String(args[1]).includes('forge:queue:promote-retry-v4')) {
+        args[14] = '1'
+      }
+      return await originalPruningCall(...args)
+    })
+    await expect(pruningQueue.promoteDueRetries(1)).resolves.toBe(1)
+    expect(await admin.hexists('forge:tasks:promotion-dispositions', 'c'.repeat(64))).toBe(0)
+    expect(await admin.zscore('forge:tasks:promotion-disposition-expiry', 'c'.repeat(64)))
+      .toBeNull()
+    expect(await admin.hlen('forge:tasks:promotion-dispositions')).toBe(1)
+    expect(await admin.zcard('forge:tasks:promotion-disposition-expiry')).toBe(1)
+
+    const dispositionKey = 'forge:tasks:promotion-dispositions'
+    const dispositionExpiryKey = 'forge:tasks:promotion-disposition-expiry'
+    const receiptTtlMs = 15 * 60 * 1000
+    const receiptWinner = '00000000-0000-4000-8000-000000001200'
+    const exerciseReceiptAuthority = async (options: {
+      attempt: number
+      expectReplay?: boolean
+      sourcePresent?: boolean
+      setup: (fingerprint: string, nowMs: number) => Promise<void>
+      verify: (fingerprint: string, raw: string) => Promise<void>
+    }): Promise<void> => {
+      await admin.del(...QUEUE_KEYS)
+      const raw = JSON.stringify({ taskId: TASK_ID, attempt: options.attempt })
+      await admin.zadd('forge:tasks:retry', (await redisTimeMs()) - 1, raw)
+      const receiptQueue = queue()
+      const receiptClient = (receiptQueue as unknown as { client: Redis }).client
+      const originalBuffer = receiptClient.callBuffer.bind(receiptClient)
+      let removeScannedSource = !options.sourcePresent
+      vi.spyOn(receiptClient, 'callBuffer').mockImplementation(async (
+        ...args: Parameters<Redis['callBuffer']>
+      ) => {
+        const result = await originalBuffer(...args)
+        if (removeScannedSource
+          && String(args[1]).includes('forge:queue:list-due-retries-v1')) {
+          removeScannedSource = false
+          await admin.zrem('forge:tasks:retry', raw)
+        }
+        return result
+      })
+      const originalCall = receiptClient.call.bind(receiptClient)
+      let fingerprint = ''
+      vi.spyOn(receiptClient, 'call').mockImplementation(async (
+        ...args: Parameters<Redis['call']>
+      ) => {
+        if (String(args[1]).includes('forge:queue:promote-retry-v4')) {
+          fingerprint = String(args[9])
+          await options.setup(fingerprint, await redisTimeMs())
+        }
+        return await originalCall(...args)
+      })
+
+      if (options.expectReplay) {
+        await expect(receiptQueue.promoteDueRetries(1)).resolves.toBe(0)
+      } else {
+        await expect(receiptQueue.promoteDueRetries(1))
+          .rejects.toThrow('Queue retry promotion receipt integrity failure')
+      }
+      expect(fingerprint).toMatch(/^[0-9a-f]{64}$/)
+      await options.verify(fingerprint, raw)
+    }
+
+    await exerciseReceiptAuthority({
+      attempt: 21,
+      expectReplay: true,
+      setup: async (fingerprint, nowMs) => {
+        await admin.hset(dispositionKey, fingerprint, `promoted:${receiptWinner}`)
+        await admin.zadd(dispositionExpiryKey, nowMs - receiptTtlMs + 60_000, fingerprint)
+      },
+      verify: async (fingerprint) => {
+        expect(await admin.hget(dispositionKey, fingerprint))
+          .toBe(`promoted:${receiptWinner}`)
+        expect(await admin.zscore(dispositionExpiryKey, fingerprint)).not.toBeNull()
+      },
+    })
+
+    const receiptNeighbor = 'd'.repeat(64)
+    await exerciseReceiptAuthority({
+      attempt: 22,
+      setup: async (fingerprint, nowMs) => {
+        const expiredPairs: string[] = []
+        for (let index = 0; index < 100; index += 1) {
+          const older = index.toString(16).padStart(64, '0')
+          expiredPairs.push(older, 'discarded')
+          await admin.zadd(
+            dispositionExpiryKey,
+            nowMs - receiptTtlMs - 2_000 - index,
+            older,
+          )
+        }
+        await admin.hset(dispositionKey, ...expiredPairs)
+        await admin.hset(dispositionKey, fingerprint, `promoted:${receiptWinner}`)
+        await admin.zadd(
+          dispositionExpiryKey,
+          nowMs - receiptTtlMs - 1_000,
+          fingerprint,
+        )
+        await admin.hset(dispositionKey, receiptNeighbor, 'discarded')
+        await admin.zadd(dispositionExpiryKey, nowMs - 1, receiptNeighbor)
+      },
+      verify: async (fingerprint) => {
+        expect(await admin.hexists(dispositionKey, fingerprint)).toBe(0)
+        expect(await admin.zscore(dispositionExpiryKey, fingerprint)).toBeNull()
+        expect(await admin.hget(dispositionKey, receiptNeighbor)).toBe('discarded')
+        expect(await admin.zscore(dispositionExpiryKey, receiptNeighbor)).not.toBeNull()
+      },
+    })
+
+    const authorityCases = [
+      {
+        attempt: 23,
+        setup: async (fingerprint: string) => {
+          await admin.hset(dispositionKey, fingerprint, `promoted:${receiptWinner}`)
+        },
+      },
+      {
+        attempt: 24,
+        setup: async (fingerprint: string, nowMs: number) => {
+          await admin.zadd(dispositionExpiryKey, nowMs - 1, fingerprint)
+        },
+      },
+      {
+        attempt: 25,
+        setup: async (fingerprint: string, nowMs: number) => {
+          await admin.hset(dispositionKey, fingerprint, 'unknown')
+          await admin.zadd(dispositionExpiryKey, nowMs - 1, fingerprint)
+        },
+      },
+      {
+        attempt: 26,
+        setup: async (fingerprint: string, nowMs: number) => {
+          await admin.hset(dispositionKey, fingerprint, 'promoted:not-a-uuid')
+          await admin.zadd(dispositionExpiryKey, nowMs - 1, fingerprint)
+        },
+      },
+      {
+        attempt: 27,
+        setup: async (fingerprint: string, nowMs: number) => {
+          await admin.hset(dispositionKey, fingerprint, 'discarded')
+          await admin.zadd(dispositionExpiryKey, nowMs + 60_000, fingerprint)
+        },
+      },
+      {
+        attempt: 28,
+        setup: async (fingerprint: string) => {
+          await admin.hset(dispositionKey, fingerprint, 'discarded')
+          await admin.zadd(dispositionExpiryKey, '+inf', fingerprint)
+        },
+      },
+    ]
+    for (const authorityCase of authorityCases) {
+      await exerciseReceiptAuthority({
+        ...authorityCase,
+        verify: async (fingerprint) => {
+          expect(await admin.hexists(dispositionKey, fingerprint)).toBe(0)
+          expect(await admin.zscore(dispositionExpiryKey, fingerprint)).toBeNull()
+        },
+      })
+    }
+
+    await exerciseReceiptAuthority({
+      attempt: 29,
+      sourcePresent: true,
+      setup: async (fingerprint, nowMs) => {
+        await admin.hset(dispositionKey, fingerprint, `promoted:${receiptWinner}`)
+        await admin.zadd(dispositionExpiryKey, nowMs - 1, fingerprint)
+      },
+      verify: async (fingerprint, raw) => {
+        expect(await admin.zscore('forge:tasks:retry', raw)).not.toBeNull()
+        expect(await admin.hget(dispositionKey, fingerprint))
+          .toBe(`promoted:${receiptWinner}`)
+        expect(await admin.zscore(dispositionExpiryKey, fingerprint)).not.toBeNull()
+      },
+    })
+
+    expect(createHash('sha256').update(HISTORICAL_PROMOTE_RETRY_V2_SCRIPT).digest('hex'))
+      .toBe(HISTORICAL_PROMOTE_RETRY_V2_SHA256)
+    const mixedVersionCases = [
+      {
+        create: () => queue(),
+        family: [
+          'forge:tasks',
+          'forge:tasks:processing',
+          'forge:tasks:retry',
+          'forge:tasks:dead',
+          'forge:tasks:claims',
+          'forge:tasks:ack-receipts',
+          'forge:tasks:release-receipts',
+          'forge:tasks:promotion-dispositions',
+          'forge:tasks:promotion-disposition-expiry',
+        ],
+        job: (attempt: number): TaskJob => ({ taskId: TASK_ID, attempt }),
+        ready: 'forge:tasks',
+        receiptExpiry: 'forge:tasks:promotion-disposition-expiry',
+        receipts: 'forge:tasks:promotion-dispositions',
+        retry: 'forge:tasks:retry',
+      },
+      {
+        create: () => approvalQueue(),
+        family: [
+          'forge:approvals',
+          'forge:approvals:processing',
+          'forge:approvals:retry',
+          'forge:approvals:dead',
+          'forge:approvals:claims',
+          'forge:approvals:ack-receipts',
+          'forge:approvals:release-receipts',
+          'forge:approvals:promotion-dispositions',
+          'forge:approvals:promotion-disposition-expiry',
+        ],
+        job: (attempt: number): ApprovalJob => ({
+          taskId: TASK_ID,
+          action: 'approve',
+          attempt,
+        }),
+        ready: 'forge:approvals',
+        receiptExpiry: 'forge:approvals:promotion-disposition-expiry',
+        receipts: 'forge:approvals:promotion-dispositions',
+        retry: 'forge:approvals:retry',
+      },
+      {
+        create: () => answersQueue(),
+        family: [
+          'forge:answers',
+          'forge:answers:processing',
+          'forge:answers:retry',
+          'forge:answers:dead',
+          'forge:answers:claims',
+          'forge:answers:ack-receipts',
+          'forge:answers:release-receipts',
+          'forge:answers:promotion-dispositions',
+          'forge:answers:promotion-disposition-expiry',
+        ],
+        job: (attempt: number): AnswersJob => ({ taskId: TASK_ID, attempt }),
+        ready: 'forge:answers',
+        receiptExpiry: 'forge:answers:promotion-disposition-expiry',
+        receipts: 'forge:answers:promotion-dispositions',
+        retry: 'forge:answers:retry',
+      },
+    ] as const
+    let historicalLuaCalls = 0
+    const runHistoricalV2Promotion = async (
+      retryKey: string,
+      readyKey: string,
+      raw: string,
+    ): Promise<number> => {
+      assertHistoricalV2Occurrence(raw)
+      historicalLuaCalls += 1
+      return Number(await admin.eval(
+        HISTORICAL_PROMOTE_RETRY_V2_SCRIPT,
+        2,
+        retryKey,
+        readyKey,
+        raw,
+      ))
+    }
+    const mixedState = async (queueCase: typeof mixedVersionCases[number]) => {
+      const family = Object.fromEntries(await Promise.all(queueCase.family.map(async (key) => {
+        const dump = await admin.callBuffer('DUMP', key)
+        if (dump !== null && !Buffer.isBuffer(dump)) {
+          throw new Error('Queue Redis mixed-version proof received a non-binary key dump.')
+        }
+        return [key, dump?.toString('hex') ?? null]
+      })))
+      return {
+        family,
+        ready: await admin.lrange(queueCase.ready, 0, -1),
+        receiptExpiry: await admin.zrange(
+          queueCase.receiptExpiry,
+          0,
+          -1,
+          'WITHSCORES',
+        ),
+        receipts: await admin.hgetall(queueCase.receipts),
+        retry: await admin.zrange(queueCase.retry, 0, -1, 'WITHSCORES'),
+      }
+    }
+
+    for (const [caseIndex, queueCase] of mixedVersionCases.entries()) {
+      await admin.del(...QUEUE_KEYS)
+      const expiredFingerprint = String(caseIndex + 1).repeat(64)
+      const liveFingerprint = String(caseIndex + 4).repeat(64)
+      const liveOccurrenceId =
+        `00000000-0000-4000-8000-${String(1_500 + caseIndex).padStart(12, '0')}`
+      const receiptSeedTime = await redisTimeMs()
+      await admin.hset(
+        queueCase.receipts,
+        expiredFingerprint,
+        'discarded',
+        liveFingerprint,
+        `promoted:${liveOccurrenceId}`,
+      )
+      await admin.zadd(
+        queueCase.receiptExpiry,
+        receiptSeedTime - (16 * 60 * 1000),
+        expiredFingerprint,
+        receiptSeedTime - 1,
+        liveFingerprint,
+      )
+      const v2FirstRaw = JSON.stringify({
+        schemaVersion: 1,
+        occurrenceId: `00000000-0000-4000-8000-${String(1_300 + caseIndex).padStart(12, '0')}`,
+        job: queueCase.job(40 + caseIndex),
+      })
+      await admin.zadd(queueCase.retry, (await redisTimeMs()) - 1, v2FirstRaw)
+      const upgradedLoser = queueCase.create()
+      const upgradedClient = (upgradedLoser as unknown as { client: Redis }).client
+      const originalBuffer = upgradedClient.callBuffer.bind(upgradedClient)
+      let scanned!: () => void
+      let release!: () => void
+      const scanObserved = new Promise<void>((resolve) => {
+        scanned = resolve
+      })
+      const releaseUpgraded = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      vi.spyOn(upgradedClient, 'callBuffer').mockImplementation(async (
+        ...args: Parameters<Redis['callBuffer']>
+      ) => {
+        const result = await originalBuffer(...args)
+        if (String(args[1]).includes('forge:queue:list-due-retries-v1')) {
+          scanned()
+          await releaseUpgraded
+        }
+        return result
+      })
+      const upgradedAttempt = upgradedLoser.promoteDueRetries(1)
+      await scanObserved
+      expect(await runHistoricalV2Promotion(
+        queueCase.retry,
+        queueCase.ready,
+        v2FirstRaw,
+      )).toBe(1)
+      const afterHistoricalWinner = await mixedState(queueCase)
+      release()
+      await expect(upgradedAttempt).rejects.toBeInstanceOf(RetryPromotionConflictError)
+      expect(await mixedState(queueCase)).toEqual(afterHistoricalWinner)
+      expect(afterHistoricalWinner.ready).toEqual([v2FirstRaw])
+      expect(afterHistoricalWinner.retry).toEqual([])
+      expect(afterHistoricalWinner.receipts).toEqual({
+        [expiredFingerprint]: 'discarded',
+        [liveFingerprint]: `promoted:${liveOccurrenceId}`,
+      })
+      expect(new Set(afterHistoricalWinner.receiptExpiry.filter((_, index) => index % 2 === 0)))
+        .toEqual(new Set([expiredFingerprint, liveFingerprint]))
+
+      await admin.del(...QUEUE_KEYS)
+      const applySeedTime = await redisTimeMs()
+      await admin.hset(
+        queueCase.receipts,
+        expiredFingerprint,
+        'discarded',
+        liveFingerprint,
+        `promoted:${liveOccurrenceId}`,
+      )
+      await admin.zadd(
+        queueCase.receiptExpiry,
+        applySeedTime - (16 * 60 * 1000),
+        expiredFingerprint,
+        applySeedTime - 1,
+        liveFingerprint,
+      )
+      const newFirstRaw = JSON.stringify({
+        schemaVersion: 1,
+        occurrenceId: `00000000-0000-4000-8000-${String(1_400 + caseIndex).padStart(12, '0')}`,
+        job: queueCase.job(50 + caseIndex),
+      })
+      await admin.zadd(queueCase.retry, (await redisTimeMs()) - 1, newFirstRaw)
+      expect(await queueCase.create().promoteDueRetries(1)).toBe(1)
+      expect(await runHistoricalV2Promotion(
+        queueCase.retry,
+        queueCase.ready,
+        newFirstRaw,
+      )).toBe(2)
+      const newFirstState = await mixedState(queueCase)
+      expect(newFirstState.ready).toEqual([newFirstRaw])
+      expect(newFirstState.retry).toEqual([])
+      expect(newFirstState.receipts[expiredFingerprint]).toBeUndefined()
+      expect(newFirstState.receipts[liveFingerprint]).toBe(`promoted:${liveOccurrenceId}`)
+      expect(Object.values(newFirstState.receipts))
+        .toContain(`promoted:${parseOccurrence(newFirstRaw).occurrenceId}`)
+      expect(Object.keys(newFirstState.receipts)).toHaveLength(2)
+      const newReceiptIndexMembers =
+        newFirstState.receiptExpiry.filter((_, index) => index % 2 === 0)
+      expect(newReceiptIndexMembers).toHaveLength(2)
+      expect(newReceiptIndexMembers).toContain(liveFingerprint)
+      expect(newReceiptIndexMembers).not.toContain(expiredFingerprint)
+      expect(newReceiptIndexMembers.every((member) => /^[0-9a-f]{64}$/.test(member)))
+        .toBe(true)
+
+      await admin.del(...QUEUE_KEYS)
+      const legacyRaw = JSON.stringify(queueCase.job(60 + caseIndex))
+      const legacyScore = String((await redisTimeMs()) - 1)
+      await admin.zadd(queueCase.retry, legacyScore, legacyRaw)
+      const callsBeforeLegacy = historicalLuaCalls
+      await expect(runHistoricalV2Promotion(
+        queueCase.retry,
+        queueCase.ready,
+        legacyRaw,
+      )).rejects.toThrow('Historical v2 retry occurrence is invalid.')
+      expect(historicalLuaCalls).toBe(callsBeforeLegacy)
+      expect(await admin.zscore(queueCase.retry, legacyRaw)).toBe(legacyScore)
+      expect(await admin.llen(queueCase.ready)).toBe(0)
+      expect(await admin.hlen(queueCase.receipts)).toBe(0)
+      expect(await queueCase.create().promoteDueRetries(1)).toBe(1)
+      expect(await queueCase.create().promoteDueRetries(1)).toBe(0)
+      const upgradedLegacyState = await mixedState(queueCase)
+      expect(upgradedLegacyState.retry).toEqual([])
+      expect(upgradedLegacyState.ready).toHaveLength(1)
+      const upgradedLegacy = parseOccurrence(upgradedLegacyState.ready[0])
+      expect(upgradedLegacy.job).toEqual(queueCase.job(60 + caseIndex))
+      expect(Object.values(upgradedLegacyState.receipts))
+        .toEqual([`promoted:${upgradedLegacy.occurrenceId}`])
+      expect(upgradedLegacyState.receiptExpiry).toHaveLength(2)
+    }
+
     console.info('QUEUE_OCCURRENCE_REDIS_MULTIPLICITY_OK')
-  }, 20_000)
+  }, 50_000)
 
   it('covers bounded rotations, response loss, ownership, replay, and strict markers', async () => {
     const taskQueue = queue()
@@ -445,6 +1686,7 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
         vi.doMock('@/worker/queue', () => ({
           AnswersQueue: IdleAnswersQueue,
           ApprovalQueue: IdleApprovalQueue,
+          RetryPromotionConflictError,
           TaskQueue: IdleTaskQueue,
         }))
         const idleProcessAnsweredQuestions = vi.fn()

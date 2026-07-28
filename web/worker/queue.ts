@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import Redis from 'ioredis'
 import { getRequiredEnv } from '../lib/env'
 import { scanJsonObjectKeys } from '../lib/json-object-key-scan'
@@ -10,6 +10,8 @@ const TASK_DEAD_QUEUE_KEY = 'forge:tasks:dead'
 const TASK_CLAIMS_KEY = 'forge:tasks:claims'
 const TASK_ACK_RECEIPTS_KEY = 'forge:tasks:ack-receipts'
 const TASK_RELEASE_RECEIPTS_KEY = 'forge:tasks:release-receipts'
+const TASK_PROMOTION_DISPOSITIONS_KEY = 'forge:tasks:promotion-dispositions'
+const TASK_PROMOTION_DISPOSITION_EXPIRY_KEY = 'forge:tasks:promotion-disposition-expiry'
 const APPROVAL_QUEUE_KEY = 'forge:approvals'
 const APPROVAL_PROCESSING_QUEUE_KEY = 'forge:approvals:processing'
 const APPROVAL_RETRY_QUEUE_KEY = 'forge:approvals:retry'
@@ -17,6 +19,9 @@ const APPROVAL_DEAD_QUEUE_KEY = 'forge:approvals:dead'
 const APPROVAL_CLAIMS_KEY = 'forge:approvals:claims'
 const APPROVAL_ACK_RECEIPTS_KEY = 'forge:approvals:ack-receipts'
 const APPROVAL_RELEASE_RECEIPTS_KEY = 'forge:approvals:release-receipts'
+const APPROVAL_PROMOTION_DISPOSITIONS_KEY = 'forge:approvals:promotion-dispositions'
+const APPROVAL_PROMOTION_DISPOSITION_EXPIRY_KEY =
+  'forge:approvals:promotion-disposition-expiry'
 const ANSWERS_QUEUE_KEY = 'forge:answers'
 const ANSWERS_PROCESSING_QUEUE_KEY = 'forge:answers:processing'
 const ANSWERS_RETRY_QUEUE_KEY = 'forge:answers:retry'
@@ -24,6 +29,8 @@ const ANSWERS_DEAD_QUEUE_KEY = 'forge:answers:dead'
 const ANSWERS_CLAIMS_KEY = 'forge:answers:claims'
 const ANSWERS_ACK_RECEIPTS_KEY = 'forge:answers:ack-receipts'
 const ANSWERS_RELEASE_RECEIPTS_KEY = 'forge:answers:release-receipts'
+const ANSWERS_PROMOTION_DISPOSITIONS_KEY = 'forge:answers:promotion-dispositions'
+const ANSWERS_PROMOTION_DISPOSITION_EXPIRY_KEY = 'forge:answers:promotion-disposition-expiry'
 
 const QUEUE_ENVELOPE_SCHEMA_VERSION = 1
 const DEAD_LETTER_SCHEMA_VERSION = 1
@@ -32,6 +39,12 @@ const STUCK_RECOVERY_SCAN_LIMIT = 100
 const TRANSITION_RECEIPT_TTL_MS = 15 * 60 * 1000
 const TRANSITION_RECEIPT_CAP = 50_000
 const TRANSITION_RECEIPT_PRUNE_LIMIT = 100
+const RETRY_PROMOTION_LIMIT_MAX = 100
+const PROMOTION_DISPOSITION_TTL_MS = 15 * 60 * 1000
+const PROMOTION_DISPOSITION_CAP = 50_000
+const PROMOTION_DISPOSITION_PRUNE_LIMIT = 100
+const RETRY_PROMOTION_FINGERPRINT_DOMAIN =
+  'forge:queue:retry-promotion-disposition:v1'
 const TASK_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const CLAIM_MARKER_PATTERN = /^([1-9][0-9]*):([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/
 
@@ -47,7 +60,64 @@ type QueueEnvelope<TJob> = {
 
 export type QueueTransitionOutcome = 'applied' | 'already_applied'
 
+export type QueueRetryResult = {
+  outcome: QueueTransitionOutcome
+  nextRetryAt: Date
+}
+
+export const RETRY_PROMOTION_CONFLICT_CODE = 'queue_retry_promotion_conflict' as const
+
+export class RetryPromotionConflictError extends Error {
+  declare readonly code: typeof RETRY_PROMOTION_CONFLICT_CODE
+
+  constructor() {
+    super('Queue retry promotion conflict')
+    Object.defineProperty(this, 'name', {
+      configurable: true,
+      enumerable: false,
+      value: 'RetryPromotionConflictError',
+      writable: true,
+    })
+    Object.defineProperty(this, 'code', {
+      configurable: false,
+      enumerable: false,
+      value: RETRY_PROMOTION_CONFLICT_CODE,
+      writable: false,
+    })
+  }
+}
+
 type QueueTransitionResult = QueueTransitionOutcome | 'stale_not_owner'
+
+type RetryPromotionCandidate = {
+  destination: string
+  mode: 'discard' | 'legacy' | 'occurrence'
+  occurrenceId: string
+}
+
+type DueRetrySnapshot = {
+  fingerprint: string
+  rawBytes: Buffer
+  rawText: string | null
+  score: string
+}
+
+type RetryPromotionTransition =
+  | {
+      disposition: 'discarded'
+      outcome: QueueTransitionOutcome
+    }
+  | {
+      disposition: 'promoted'
+      occurrenceId: string
+      outcome: QueueTransitionOutcome
+    }
+  | {
+      outcome: 'ownership_conflict'
+    }
+  | {
+      outcome: 'receipt_integrity_failure'
+    }
 
 type ClaimedQueueJob<TJob> = {
   raw: string
@@ -59,7 +129,7 @@ type TerminalIntent =
   | { kind: 'ack' }
   | { kind: 'dead_letter'; record: string }
   | { kind: 'release' }
-  | { kind: 'retry'; envelope: string; nextRetryAt: Date }
+  | { kind: 'retry'; delayMs: number; envelope: string }
 
 type ActiveClaim = {
   marker: string
@@ -251,12 +321,25 @@ return 2
 `
 
 const RETRY_JOB_SCRIPT = `
--- forge:queue:retry-v2
+-- forge:queue:retry-v3
 ${LUA_TYPE_HELPER}
 ${LUA_MARKER_HELPERS}
 assert_type(KEYS[1], 'list')
 assert_type(KEYS[2], 'hash')
 assert_type(KEYS[3], 'zset')
+local max_safe_integer = 9007199254740991
+local max_date_ms = 8640000000000000
+local delay_ms_raw = ARGV[4]
+local delay_ms = tonumber(delay_ms_raw)
+if type(delay_ms_raw) ~= 'string'
+    or not string.match(delay_ms_raw, '^[0-9]+$')
+    or not delay_ms
+    or delay_ms ~= delay_ms
+    or delay_ms < 0
+    or delay_ms > max_safe_integer
+    or math.floor(delay_ms) ~= delay_ms then
+  error('forge_queue_retry_delay_invalid')
+end
 local now_ms = redis_now_ms()
 local current_marker = redis.call('HGET', KEYS[2], ARGV[2])
 if current_marker and not valid_marker(current_marker, now_ms) then
@@ -267,19 +350,31 @@ if not valid_marker(ARGV[3], now_ms) then
 end
 if redis.call('LPOS', KEYS[1], ARGV[1]) then
   if current_marker ~= ARGV[3] then
-    return 0
+    return {0, ''}
+  end
+  if redis.call('ZSCORE', KEYS[3], ARGV[5]) then
+    return {0, ''}
+  end
+  if now_ms > max_safe_integer
+      or now_ms > max_date_ms
+      or delay_ms > max_safe_integer - now_ms
+      or delay_ms > max_date_ms - now_ms then
+    error('forge_queue_retry_timestamp_invalid')
   end
   if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
-    return 0
+    return {0, ''}
   end
   redis.call('HDEL', KEYS[2], ARGV[2])
-  redis.call('ZADD', KEYS[3], ARGV[4], ARGV[5])
-  return 1
+  redis.call('ZADD', KEYS[3], now_ms + delay_ms, ARGV[5])
+  return {1, redis.call('ZSCORE', KEYS[3], ARGV[5])}
 end
-if not current_marker and redis.call('ZSCORE', KEYS[3], ARGV[5]) then
-  return 2
+if not current_marker and not redis.call('LPOS', KEYS[1], ARGV[1]) then
+  local existing_score = redis.call('ZSCORE', KEYS[3], ARGV[5])
+  if existing_score then
+    return {2, existing_score}
+  end
 end
-return 0
+return {0, ''}
 `
 
 const DEAD_LETTER_JOB_SCRIPT = `
@@ -314,19 +409,139 @@ end
 return 0
 `
 
-const PROMOTE_RETRY_SCRIPT = `
--- forge:queue:promote-retry-v2
+const LIST_DUE_RETRIES_SCRIPT = `
+-- forge:queue:list-due-retries-v1
 ${LUA_TYPE_HELPER}
 assert_type(KEYS[1], 'zset')
+local limit = tonumber(ARGV[1])
+if not limit or limit < 1 or limit > ${RETRY_PROMOTION_LIMIT_MAX}
+    or math.floor(limit) ~= limit then
+  error('forge_queue_retry_limit_invalid')
+end
+local now = redis.call('TIME')
+local now_ms = (tonumber(now[1]) * 1000) + math.floor(tonumber(now[2]) / 1000)
+return redis.call(
+  'ZRANGEBYSCORE',
+  KEYS[1],
+  0,
+  now_ms,
+  'WITHSCORES',
+  'LIMIT',
+  0,
+  limit
+)
+`
+
+const PROMOTE_RETRY_SCRIPT = `
+-- forge:queue:promote-retry-v4
+${LUA_TYPE_HELPER}
+${LUA_MARKER_HELPERS}
+assert_type(KEYS[1], 'zset')
 assert_type(KEYS[2], 'list')
-if redis.call('ZREM', KEYS[1], ARGV[1]) == 1 then
-  redis.call('LPUSH', KEYS[2], ARGV[1])
-  return 1
+assert_type(KEYS[3], 'hash')
+assert_type(KEYS[4], 'zset')
+local raw_member = ARGV[1]
+local expected_score = ARGV[2]
+local fingerprint = ARGV[3]
+local mode = ARGV[4]
+local destination = ARGV[5]
+local candidate_occurrence_id = ARGV[6]
+local ttl_ms = tonumber(ARGV[7])
+local cap = tonumber(ARGV[8])
+local prune_limit = tonumber(ARGV[9])
+if type(fingerprint) ~= 'string'
+    or string.len(fingerprint) ~= 64
+    or not string.match(fingerprint, '^[0-9a-f]+$') then
+  error('forge_queue_retry_fingerprint_invalid')
 end
-if redis.call('LPOS', KEYS[2], ARGV[1]) then
-  return 2
+if not ttl_ms or ttl_ms < 1
+    or not cap or cap < 1
+    or not prune_limit or prune_limit < 1 then
+  error('forge_queue_retry_receipt_bounds_invalid')
 end
-return 0
+if mode ~= 'discard' and mode ~= 'legacy' and mode ~= 'occurrence' then
+  error('forge_queue_retry_mode_invalid')
+end
+if mode ~= 'discard' and not valid_uuid(candidate_occurrence_id) then
+  error('forge_queue_retry_occurrence_invalid')
+end
+local now_ms = redis_now_ms()
+local cutoff = now_ms - ttl_ms
+local current_score = redis.call('ZSCORE', KEYS[1], raw_member)
+local existing = redis.call('HGET', KEYS[3], fingerprint)
+local receipt_score = redis.call('ZSCORE', KEYS[4], fingerprint)
+if not current_score then
+  if not existing and not receipt_score then
+    return {0, 'ownership_conflict', ''}
+  end
+  if not existing or not receipt_score then
+    redis.call('HDEL', KEYS[3], fingerprint)
+    redis.call('ZREM', KEYS[4], fingerprint)
+    return {0, 'receipt_integrity_failure', ''}
+  end
+  local receipt_timestamp = tonumber(receipt_score)
+  local receipt_timestamp_valid = receipt_timestamp
+      and receipt_timestamp == receipt_timestamp
+      and receipt_timestamp ~= math.huge
+      and receipt_timestamp ~= -math.huge
+      and receipt_timestamp <= now_ms
+      and receipt_timestamp > cutoff
+  local winning_occurrence_id = nil
+  local disposition_valid = existing == 'discarded'
+  if not disposition_valid then
+    winning_occurrence_id = string.match(existing, '^promoted:([^:]+)$')
+    disposition_valid = winning_occurrence_id and valid_uuid(winning_occurrence_id)
+  end
+  if not receipt_timestamp_valid or not disposition_valid then
+    redis.call('HDEL', KEYS[3], fingerprint)
+    redis.call('ZREM', KEYS[4], fingerprint)
+    return {0, 'receipt_integrity_failure', ''}
+  end
+  if existing == 'discarded' and mode == 'discard' then
+    return {2, 'discarded', ''}
+  end
+  if winning_occurrence_id and mode ~= 'discard' then
+    if mode == 'occurrence' and winning_occurrence_id ~= candidate_occurrence_id then
+      return {0, 'receipt_integrity_failure', ''}
+    end
+    return {2, 'promoted', winning_occurrence_id}
+  end
+  return {0, 'receipt_integrity_failure', ''}
+end
+if current_score ~= expected_score then
+  return {0, 'ownership_conflict', ''}
+end
+if existing or receipt_score then
+  return {0, 'receipt_integrity_failure', ''}
+end
+local expired = redis.call(
+  'ZRANGEBYSCORE',
+  KEYS[4],
+  '-inf',
+  cutoff,
+  'LIMIT',
+  0,
+  prune_limit
+)
+for _, expired_fingerprint in ipairs(expired) do
+  redis.call('ZREM', KEYS[4], expired_fingerprint)
+  redis.call('HDEL', KEYS[3], expired_fingerprint)
+end
+if redis.call('HLEN', KEYS[3]) >= cap or redis.call('ZCARD', KEYS[4]) >= cap then
+  error('forge_queue_retry_receipt_capacity_exhausted')
+end
+if redis.call('ZREM', KEYS[1], raw_member) ~= 1 then
+  return {0, 'ownership_conflict', ''}
+end
+if mode == 'discard' then
+  redis.call('HSET', KEYS[3], fingerprint, 'discarded')
+  redis.call('ZADD', KEYS[4], now_ms, fingerprint)
+  return {1, 'discarded', ''}
+end
+redis.call('LPUSH', KEYS[2], destination)
+redis.call('HSET', KEYS[3], fingerprint, 'promoted:' .. candidate_occurrence_id)
+redis.call('ZADD', KEYS[4], now_ms, fingerprint)
+return {1, 'promoted', candidate_occurrence_id}
 `
 
 const RECOVER_STUCK_JOB_SCRIPT = `
@@ -450,6 +665,35 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
     && actual.every((key, index) => key === expected[index])
 }
 
+function decodeExactUtf8(value: Buffer): string | null {
+  try {
+    const decoded = new TextDecoder('utf-8', { fatal: true }).decode(value)
+    return Buffer.from(decoded, 'utf8').equals(value) ? decoded : null
+  } catch {
+    return null
+  }
+}
+
+function promotionFingerprint(
+  queueDiscriminator: string,
+  rawMember: Buffer,
+  score: Buffer,
+): string {
+  const digest = createHash('sha256')
+  for (const part of [
+    Buffer.from(RETRY_PROMOTION_FINGERPRINT_DOMAIN, 'utf8'),
+    Buffer.from(queueDiscriminator, 'utf8'),
+    rawMember,
+    score,
+  ]) {
+    const length = Buffer.allocUnsafe(8)
+    length.writeBigUInt64BE(BigInt(part.length))
+    digest.update(length)
+    digest.update(part)
+  }
+  return digest.digest('hex')
+}
+
 abstract class RedisListQueue<TJob extends RetryableJob> {
   protected readonly client: Redis
   private readonly activeClaims = new Map<string, ActiveClaim>()
@@ -462,6 +706,8 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
     private readonly claimsKey: string,
     private readonly ackReceiptsKey: string,
     private readonly releaseReceiptsKey: string,
+    private readonly promotionDispositionsKey: string,
+    private readonly promotionDispositionExpiryKey: string,
     redisUrl = getRequiredEnv('REDIS_URL'),
   ) {
     this.client = new Redis(redisUrl, {
@@ -509,11 +755,76 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
     }
   }
 
+  private parseRetryPromotionCandidate(raw: string | null): RetryPromotionCandidate {
+    if (raw === null) {
+      return { destination: '', mode: 'discard', occurrenceId: '' }
+    }
+    try {
+      const envelope = this.parseEnvelope(raw)
+      return {
+        destination: raw,
+        mode: 'occurrence',
+        occurrenceId: envelope.occurrenceId,
+      }
+    } catch {
+      try {
+        const job = this.parse(raw)
+        const occurrenceId = randomUUID()
+        return {
+          destination: canonicalEnvelope(occurrenceId, job),
+          mode: 'legacy',
+          occurrenceId,
+        }
+      } catch {
+        return { destination: '', mode: 'discard', occurrenceId: '' }
+      }
+    }
+  }
+
+  private async listDueRetrySnapshots(limit: number): Promise<DueRetrySnapshot[]> {
+    let dueResult: unknown
+    try {
+      dueResult = await this.client.callBuffer(
+        'EVAL',
+        LIST_DUE_RETRIES_SCRIPT,
+        1,
+        this.retryQueueKey,
+        String(limit),
+      )
+    } catch {
+      throw new Error('Queue retry promotion scan failed')
+    }
+    if (!Array.isArray(dueResult)
+      || dueResult.length > limit * 2
+      || dueResult.length % 2 !== 0
+      || dueResult.some((value) => !Buffer.isBuffer(value))) {
+      throw new Error('Queue retry promotion scan returned an invalid result')
+    }
+
+    const snapshots: DueRetrySnapshot[] = []
+    for (let index = 0; index < dueResult.length; index += 2) {
+      const rawBytes = dueResult[index] as Buffer
+      const scoreBytes = dueResult[index + 1] as Buffer
+      const score = decodeExactUtf8(scoreBytes)
+      const numericScore = score === null ? Number.NaN : Number(score)
+      if (score === null || !Number.isFinite(numericScore) || numericScore < 0) {
+        throw new Error('Queue retry promotion scan returned an invalid result')
+      }
+      snapshots.push({
+        fingerprint: promotionFingerprint(this.retryQueueKey, rawBytes, scoreBytes),
+        rawBytes,
+        rawText: decodeExactUtf8(rawBytes),
+        score,
+      })
+    }
+    return snapshots
+  }
+
   private async evalClosed(
     failureMessage: string,
     script: string,
     keys: readonly string[],
-    args: readonly string[],
+    args: readonly (Buffer | string)[],
   ): Promise<unknown> {
     try {
       return await this.client.call('EVAL', script, keys.length, ...keys, ...args)
@@ -522,11 +833,80 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
     }
   }
 
+  private decodeRetryPromotionTransition(result: unknown): RetryPromotionTransition {
+    if (!Array.isArray(result) || result.length !== 3) {
+      throw new Error('Queue retry promotion returned an invalid result')
+    }
+    const [rawOutcome, rawDisposition, rawOccurrenceId] = result
+    const outcome = rawOutcome === 1
+      ? 'applied'
+      : rawOutcome === 2
+        ? 'already_applied'
+        : null
+    if (rawOutcome === 0
+      && rawDisposition === 'ownership_conflict'
+      && rawOccurrenceId === '') {
+      return { outcome: 'ownership_conflict' }
+    }
+    if (rawOutcome === 0
+      && rawDisposition === 'receipt_integrity_failure'
+      && rawOccurrenceId === '') {
+      return { outcome: 'receipt_integrity_failure' }
+    }
+    if ((outcome === 'applied' || outcome === 'already_applied')
+      && rawDisposition === 'discarded'
+      && rawOccurrenceId === '') {
+      return { disposition: rawDisposition, outcome }
+    }
+    if ((outcome === 'applied' || outcome === 'already_applied')
+      && rawDisposition === 'promoted'
+      && typeof rawOccurrenceId === 'string') {
+      return {
+        disposition: rawDisposition,
+        occurrenceId: normalizeOccurrenceId(rawOccurrenceId),
+        outcome,
+      }
+    }
+    throw new Error('Queue retry promotion returned an invalid result')
+  }
+
   private decodeTransition(result: unknown): QueueTransitionResult {
     if (result === 1) return 'applied'
     if (result === 2) return 'already_applied'
     if (result === 0) return 'stale_not_owner'
     throw new Error('Queue transition returned an invalid result')
+  }
+
+  private decodeRetryTransition(result: unknown): QueueRetryResult | 'stale_not_owner' {
+    if (!Array.isArray(result) || result.length !== 2) {
+      throw new Error('Queue retry transition returned an invalid result')
+    }
+    const [rawOutcome, rawScore] = result
+    if (rawOutcome === 0 && rawScore === '') {
+      return 'stale_not_owner'
+    }
+    const outcome = rawOutcome === 1
+      ? 'applied'
+      : rawOutcome === 2
+        ? 'already_applied'
+        : null
+    if (!outcome
+        || typeof rawScore !== 'string'
+        || !/^(?:0|[1-9][0-9]*)$/.test(rawScore)) {
+      throw new Error('Queue retry transition returned an invalid result')
+    }
+    const score = Number(rawScore)
+    if (!Number.isFinite(score)
+        || !Number.isSafeInteger(score)
+        || score < 0
+        || score > 8_640_000_000_000_000) {
+      throw new Error('Queue retry transition returned an invalid result')
+    }
+    const nextRetryAt = new Date(score)
+    if (nextRetryAt.getTime() !== score) {
+      throw new Error('Queue retry transition returned an invalid result')
+    }
+    return { outcome, nextRetryAt }
   }
 
   private activeClaim(raw: string): ActiveClaim {
@@ -670,8 +1050,8 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
     raw: string,
     job: TJob,
     delayMs: number,
-  ): Promise<{ nextRetryAt: Date; outcome: QueueTransitionOutcome }> {
-    if (!Number.isSafeInteger(delayMs) || delayMs < 0) {
+  ): Promise<QueueRetryResult> {
+    if (!Number.isFinite(delayMs) || !Number.isSafeInteger(delayMs) || delayMs < 0) {
       throw new Error('Queue retry delay must be a non-negative safe integer')
     }
     const active = this.activeClaim(raw)
@@ -685,23 +1065,32 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
         ...canonicalJob,
         attempt: (canonicalJob.attempt ?? 1) + 1,
       }))
-      const nextRetryAt = new Date(Date.now() + delayMs)
       return {
         kind: 'retry',
+        delayMs,
         envelope: canonicalEnvelope(active.occurrenceId, nextJob),
-        nextRetryAt,
       }
     })
     if (intent.kind !== 'retry') {
       throw new Error('Queue transition ownership mismatch')
     }
-    const outcome = await this.transitionClaimed(
+    const result = this.decodeRetryTransition(await this.evalClosed(
+      'Queue transition failed',
       RETRY_JOB_SCRIPT,
-      active,
       [this.processingQueueKey, this.claimsKey, this.retryQueueKey],
-      [String(intent.nextRetryAt.getTime()), intent.envelope],
-    )
-    return { nextRetryAt: intent.nextRetryAt, outcome }
+      [
+        active.raw,
+        active.occurrenceId,
+        active.marker,
+        String(intent.delayMs),
+        intent.envelope,
+      ],
+    ))
+    if (result === 'stale_not_owner') {
+      throw new Error('Queue transition stale_not_owner')
+    }
+    this.activeClaims.delete(active.occurrenceId)
+    return result
   }
 
   async deadLetter(raw: string, job: TJob): Promise<QueueTransitionOutcome> {
@@ -733,35 +1122,48 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
   }
 
   async promoteDueRetries(limit = 20): Promise<number> {
-    if (!Number.isSafeInteger(limit) || limit < 1) {
-      throw new Error('Queue promotion limit must be a positive safe integer')
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > RETRY_PROMOTION_LIMIT_MAX) {
+      throw new Error('Queue promotion limit must be a bounded positive safe integer')
     }
-    const due = await this.client.zrangebyscore(
-      this.retryQueueKey,
-      0,
-      Date.now(),
-      'LIMIT',
-      0,
-      limit,
-    )
+    const due = await this.listDueRetrySnapshots(limit)
 
     let promoted = 0
-    for (const raw of due) {
-      try {
-        this.parseEnvelope(raw)
-      } catch {
-        throw new Error('Queue retry occurrence is invalid')
-      }
-      const result = this.decodeTransition(await this.evalClosed(
+    for (const snapshot of due) {
+      const candidate = this.parseRetryPromotionCandidate(snapshot.rawText)
+      const result = this.decodeRetryPromotionTransition(await this.evalClosed(
         'Queue retry promotion failed',
         PROMOTE_RETRY_SCRIPT,
-        [this.retryQueueKey, this.queueKey],
-        [raw],
+        [
+          this.retryQueueKey,
+          this.queueKey,
+          this.promotionDispositionsKey,
+          this.promotionDispositionExpiryKey,
+        ],
+        [
+          snapshot.rawBytes,
+          snapshot.score,
+          snapshot.fingerprint,
+          candidate.mode,
+          candidate.destination,
+          candidate.occurrenceId,
+          String(PROMOTION_DISPOSITION_TTL_MS),
+          String(PROMOTION_DISPOSITION_CAP),
+          String(PROMOTION_DISPOSITION_PRUNE_LIMIT),
+        ],
       ))
-      if (result === 'stale_not_owner') {
-        throw new Error('Queue retry promotion ownership mismatch')
+      if (result.outcome === 'ownership_conflict') {
+        throw new RetryPromotionConflictError()
       }
-      if (result === 'applied') promoted += 1
+      if (result.outcome === 'receipt_integrity_failure') {
+        throw new Error('Queue retry promotion receipt integrity failure')
+      }
+      if (result.disposition === 'discarded') {
+        if (result.outcome === 'applied') {
+          console.warn('[worker/queue] Dropped invalid retry payload')
+        }
+        continue
+      }
+      if (result.outcome === 'applied') promoted += 1
     }
 
     return promoted
@@ -870,6 +1272,8 @@ export class TaskQueue extends RedisListQueue<TaskJob> {
       TASK_CLAIMS_KEY,
       TASK_ACK_RECEIPTS_KEY,
       TASK_RELEASE_RECEIPTS_KEY,
+      TASK_PROMOTION_DISPOSITIONS_KEY,
+      TASK_PROMOTION_DISPOSITION_EXPIRY_KEY,
       redisUrl,
     )
   }
@@ -894,6 +1298,8 @@ export class ApprovalQueue extends RedisListQueue<ApprovalJob> {
       APPROVAL_CLAIMS_KEY,
       APPROVAL_ACK_RECEIPTS_KEY,
       APPROVAL_RELEASE_RECEIPTS_KEY,
+      APPROVAL_PROMOTION_DISPOSITIONS_KEY,
+      APPROVAL_PROMOTION_DISPOSITION_EXPIRY_KEY,
       redisUrl,
     )
   }
@@ -925,6 +1331,8 @@ export class AnswersQueue extends RedisListQueue<AnswersJob> {
       ANSWERS_CLAIMS_KEY,
       ANSWERS_ACK_RECEIPTS_KEY,
       ANSWERS_RELEASE_RECEIPTS_KEY,
+      ANSWERS_PROMOTION_DISPOSITIONS_KEY,
+      ANSWERS_PROMOTION_DISPOSITION_EXPIRY_KEY,
       redisUrl,
     )
   }

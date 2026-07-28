@@ -864,6 +864,13 @@ export const taskLocalProjectionScopes = tasks
 // ---------------------------------------------------------------------------
 // taskAttempts
 // ---------------------------------------------------------------------------
+export type TaskAttemptStatus =
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'dead_lettered'
+  | 'indeterminate'
+
 export const taskAttempts = pgTable(
   'task_attempts',
   {
@@ -873,8 +880,9 @@ export const taskAttempts = pgTable(
       .references(() => tasks.id, { onDelete: 'restrict' }),
     queueName: text('queue_name').notNull(),
     attemptNumber: integer('attempt_number').notNull().default(1),
-    // 'running'|'completed'|'failed'|'dead_lettered'
-    status: text('status').notNull().default('running'),
+    // Terminal `indeterminate` means the business attempt failed but Redis retry
+    // scheduling could not be confirmed. This remains text in PostgreSQL.
+    status: text('status').$type<TaskAttemptStatus>().notNull().default('running'),
     workerId: text('worker_id'),
     jobPayload: jsonb('job_payload'),
     errorMessage: text('error_message'),

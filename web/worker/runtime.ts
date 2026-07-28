@@ -1,6 +1,7 @@
 import { sanitizeWorkerMessage } from './redaction'
 import { defaultOnFeatureFlagState, explicitOptInFeatureFlagEnabled } from './feature-flags'
 import { hostRepositoryWritePolicyState } from './repository-edit-policy'
+import type { QueueRetryResult } from './queue'
 
 const DEFAULT_CLAIM_TIMEOUT_SECONDS = 5
 const APPROVAL_CLAIM_TIMEOUT_SECONDS = 1
@@ -95,7 +96,16 @@ async function startWorkerOnce(
   source: WorkerSource,
   currentState: WorkerState,
 ): Promise<WorkerHandle> {
-  const [{ AnswersQueue, ApprovalQueue, TaskQueue }, { processAnsweredQuestions, processApproval, processTask }] = await Promise.all([
+  const [{
+    AnswersQueue,
+    ApprovalQueue,
+    RetryPromotionConflictError,
+    TaskQueue,
+  }, {
+    processAnsweredQuestions,
+    processApproval,
+    processTask,
+  }] = await Promise.all([
     import('./queue'),
     import('./orchestrator'),
   ])
@@ -154,7 +164,7 @@ async function startWorkerOnce(
     ack: (raw: string) => Promise<unknown>
     deadLetter: (raw: string, job: TJob) => Promise<unknown>
     release: (raw: string) => Promise<unknown>
-    retry: (raw: string, job: TJob, delayMs: number) => Promise<unknown>
+    retry: (raw: string, job: TJob, delayMs: number) => Promise<QueueRetryResult>
   }
   type QueueOperation = 'approval' | 'answers' | 'task'
   type QueueInfrastructurePhase =
@@ -163,6 +173,7 @@ async function startWorkerOnce(
     | 'dead_letter'
     | 'release_after_shutdown'
     | 'retry'
+    | 'retry_reconciliation'
     | 'task_lookup'
   type AttemptInfrastructurePhase = 'finish_after_failure' | 'finish_after_success' | 'start'
 
@@ -264,19 +275,6 @@ async function startWorkerOnce(
       await input.processBusiness(finalAttempt)
     } catch (err) {
       const message = retainedErrorMessage(err)
-      const nextRetryAt = finalAttempt
-        ? null
-        : new Date(Date.now() + backoffDelayMs(job.attempt))
-      try {
-        await finishTaskAttempt({
-          attemptId,
-          errorMessage: message,
-          nextRetryAt,
-          status: finalAttempt ? 'dead_lettered' : 'failed',
-        })
-      } catch {
-        logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
-      }
       console.error('[worker] Job processing failed', {
         attempt: job.attempt,
         finalAttempt,
@@ -284,15 +282,58 @@ async function startWorkerOnce(
         taskId: job.taskId,
         workerId,
       })
-      try {
-        if (finalAttempt) {
-          await queue.deadLetter(raw, job)
-        } else {
-          await queue.retry(raw, job, backoffDelayMs(job.attempt))
+
+      if (finalAttempt) {
+        try {
+          await finishTaskAttempt({
+            attemptId,
+            errorMessage: message,
+            nextRetryAt: null,
+            status: 'dead_lettered',
+          })
+        } catch {
+          logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
         }
-      } catch {
-        logQueueInfrastructureFailure(finalAttempt ? 'dead_letter' : 'retry', queueName, job.taskId)
+        try {
+          await queue.deadLetter(raw, job)
+        } catch {
+          logQueueInfrastructureFailure('dead_letter', queueName, job.taskId)
+        }
         return
+      }
+
+      const retryDelayMs = backoffDelayMs(job.attempt)
+      let retryResult: QueueRetryResult
+      try {
+        retryResult = await queue.retry(raw, job, retryDelayMs)
+      } catch {
+        logQueueInfrastructureFailure('retry', queueName, job.taskId)
+        try {
+          retryResult = await queue.retry(raw, job, retryDelayMs)
+        } catch {
+          logQueueInfrastructureFailure('retry_reconciliation', queueName, job.taskId)
+          try {
+            await finishTaskAttempt({
+              attemptId,
+              errorMessage: message,
+              nextRetryAt: null,
+              status: 'indeterminate',
+            })
+          } catch {
+            logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
+          }
+          return
+        }
+      }
+      try {
+        await finishTaskAttempt({
+          attemptId,
+          errorMessage: message,
+          nextRetryAt: retryResult.nextRetryAt,
+          status: 'failed',
+        })
+      } catch {
+        logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
       }
       return
     }
@@ -526,11 +567,27 @@ async function startWorkerOnce(
         Math.min(stuckJobRecoveryMs, MAX_QUEUE_RECOVERY_INTERVAL_MS),
       )
 
+      const promoteQueueRetries = async (
+        queueName: 'answers' | 'approvals' | 'tasks',
+        queue: { promoteDueRetries(): Promise<number> },
+      ): Promise<number> => {
+        try {
+          return await queue.promoteDueRetries()
+        } catch (error) {
+          if (!(error instanceof RetryPromotionConflictError)) throw error
+          console.warn('[worker] Retry promotion compatibility conflict', {
+            category: 'mixed_version_retry_promotion',
+            queue: queueName,
+          })
+          return 0
+        }
+      }
+
       while (!shuttingDown) {
         const [promotedApprovals, promotedAnswers, promotedTasks] = await Promise.all([
-          approvalQueue.promoteDueRetries(),
-          answersQueue.promoteDueRetries(),
-          taskQueue.promoteDueRetries(),
+          promoteQueueRetries('approvals', approvalQueue),
+          promoteQueueRetries('answers', answersQueue),
+          promoteQueueRetries('tasks', taskQueue),
         ])
         if (promotedApprovals > 0 || promotedAnswers > 0 || promotedTasks > 0) {
           console.info('[worker] Promoted retry jobs', {

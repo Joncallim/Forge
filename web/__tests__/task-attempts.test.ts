@@ -84,6 +84,50 @@ describe('task attempt logs', () => {
     }))
   })
 
+  it('records retry uncertainty as a terminal warning without exposing retained diagnostics', async () => {
+    const retainedError = 'retry failed with prompt=/private/repo token=secret-value'
+    const update = chain([{
+      attemptNumber: 3,
+      queueName: 'tasks',
+      taskId: 'task-1',
+      workerId: 'standalone-20008-mr48e1f1',
+    }])
+    mocks.dbUpdate.mockReturnValueOnce(update)
+
+    await finishTaskAttempt({
+      attemptId: 'attempt-indeterminate',
+      errorMessage: retainedError,
+      nextRetryAt: null,
+      status: 'indeterminate',
+    })
+
+    expect(update.set).toHaveBeenCalledWith({
+      completedAt: expect.any(Date),
+      errorMessage: retainedError,
+      nextRetryAt: null,
+      status: 'indeterminate',
+    })
+    expect(mocks.recordTaskLogBestEffort).toHaveBeenCalledWith(expect.objectContaining({
+      eventType: 'queue.attempt.indeterminate',
+      level: 'warning',
+      message: 'Forge Task Worker finished tasks attempt 3 as Retry status unknown: legacy_task_log_unavailable',
+      metadata: {
+        attemptNumber: 3,
+        nextRetryAt: null,
+        queueName: 'tasks',
+        status: 'indeterminate',
+        workerId: 'standalone-20008-mr48e1f1',
+        workerName: 'Forge Task Worker',
+        workerRole: expect.stringContaining('Architect planning'),
+      },
+      taskAttemptId: 'attempt-indeterminate',
+      title: 'Retry status unknown',
+    }))
+    const projectedLog = JSON.stringify(mocks.recordTaskLogBestEffort.mock.calls)
+    expect(projectedLog).not.toContain('/private/repo')
+    expect(projectedLog).not.toContain('secret-value')
+  })
+
   it('describes approval workers by their handoff role', () => {
     expect(describeQueueWorker('approvals')).toMatchObject({
       name: 'Forge Approval Worker',
