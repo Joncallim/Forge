@@ -23,32 +23,66 @@ describe('task-event Redis credential boundary', () => {
   it('keeps the shared URL only for legacy compatibility', async () => {
     process.env.REDIS_URL = 'redis://legacy@localhost/0'
     const { taskEventRedisConfiguration } = await import('@/lib/task-event-redis')
-    expect(taskEventRedisConfiguration()).toEqual({
+    expect(taskEventRedisConfiguration('legacy')).toEqual({
       dedicated: false,
       publisherUrl: 'redis://legacy@localhost/0',
       subscriberUrl: 'redis://legacy@localhost/0',
     })
   })
 
+  it('requires an explicit authoritative runtime mode', async () => {
+    const { taskEventRedisConfiguration } = await import('@/lib/task-event-redis')
+    expect(() => taskEventRedisConfiguration(undefined as never)).toThrow(/runtime mode is unavailable/i)
+  })
+
   it('selects distinct protected publisher and subscriber credentials without consulting REDIS_URL', async () => {
     process.env.REDIS_URL = 'redis://legacy@localhost/0'
-    process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = 'redis://event-publisher@localhost/0'
-    process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = 'redis://event-subscriber@localhost/0'
+    process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = 'redis://event-publisher:publisher-password@localhost/0'
+    process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = 'redis://event-subscriber:subscriber-password@localhost/0'
     const { taskEventRedisConfiguration } = await import('@/lib/task-event-redis')
-    expect(taskEventRedisConfiguration()).toEqual({
+    expect(taskEventRedisConfiguration('legacy')).toEqual({
       dedicated: true,
-      publisherUrl: 'redis://event-publisher@localhost/0',
-      subscriberUrl: 'redis://event-subscriber@localhost/0',
+      publisherUrl: 'redis://event-publisher:publisher-password@localhost/0',
+      subscriberUrl: 'redis://event-subscriber:subscriber-password@localhost/0',
     })
   })
 
-  it('fails closed for partial or shared protected credentials', async () => {
+  it('fails closed for partial credentials and protected shared fallback', async () => {
     const { taskEventRedisConfiguration } = await import('@/lib/task-event-redis')
-    process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = 'redis://event@localhost/0'
-    expect(() => taskEventRedisConfiguration()).toThrow(/partially configured/i)
+    process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = 'redis://event:publisher-password@localhost/0'
+    expect(() => taskEventRedisConfiguration('legacy')).toThrow(/partially configured/i)
+    expect(() => taskEventRedisConfiguration('protected')).toThrow(/partially configured/i)
 
-    process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = 'redis://event@localhost/0'
-    expect(() => taskEventRedisConfiguration()).toThrow(/separate credentials/i)
+    delete process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL
+    expect(() => taskEventRedisConfiguration('protected')).toThrow(/requires dedicated/i)
+  })
+
+  it('requires authenticated redis URLs for protected dedicated traffic', async () => {
+    const { taskEventRedisConfiguration } = await import('@/lib/task-event-redis')
+    const invalidPairs = [
+      ['http://event-publisher:publisher-password@localhost/0', 'redis://event-subscriber:subscriber-password@localhost/0'],
+      ['redis://event-publisher@localhost/0', 'redis://event-subscriber:subscriber-password@localhost/0'],
+      ['redis://:publisher-password@localhost/0', 'redis://event-subscriber:subscriber-password@localhost/0'],
+    ]
+    for (const [publisherUrl, subscriberUrl] of invalidPairs) {
+      process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = publisherUrl
+      process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = subscriberUrl
+      expect(() => taskEventRedisConfiguration('protected')).toThrow(/authenticated redis/i)
+    }
+  })
+
+  it('rejects equivalent Redis ACL principals even when credentials or database differ', async () => {
+    process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = 'rediss://%65vent:publisher-password@Redis.Example.test/0'
+    process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = 'rediss://event:subscriber-password@redis.example.test:6379/15'
+    const { taskEventRedisConfiguration } = await import('@/lib/task-event-redis')
+    expect(() => taskEventRedisConfiguration('protected')).toThrow(/distinct ACL principals/i)
+  })
+
+  it('allows distinct endpoints with the same ACL username', async () => {
+    process.env.FORGE_TASK_EVENT_PUBLISHER_REDIS_URL = 'redis://events:publisher-password@publisher.example.test/0'
+    process.env.FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL = 'redis://events:subscriber-password@subscriber.example.test/0'
+    const { taskEventRedisConfiguration } = await import('@/lib/task-event-redis')
+    expect(taskEventRedisConfiguration('protected').dedicated).toBe(true)
   })
 
   it('uses v2-only live and durable names even while shared legacy compatibility is configured', async () => {

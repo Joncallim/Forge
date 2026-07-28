@@ -6,6 +6,7 @@ import {
   taskEventRedisConfiguration,
   taskIdFromTaskEventLiveChannel,
 } from '@/lib/task-event-redis'
+import { readS4RuntimeModeV1 } from '@/lib/mcps/s4-lease'
 import { parseTaskEventEnvelopeV2 } from '@/worker/events'
 
 // ---------------------------------------------------------------------------
@@ -29,7 +30,8 @@ export async function GET(request: NextRequest) {
       const { default: Redis } = await import('ioredis')
       let eventRedisConfiguration
       try {
-        eventRedisConfiguration = taskEventRedisConfiguration()
+        const runtimeMode = await readS4RuntimeModeV1()
+        eventRedisConfiguration = taskEventRedisConfiguration(runtimeMode)
       } catch {
         console.error('[SSE /api/tasks/events] Invalid task-event Redis configuration')
         controller.close()

@@ -1,6 +1,7 @@
 import { sanitizeLogStructuredValue } from '../lib/task-log-sanitization'
 import { containsForbiddenV2EventData, projectV2TaskEventData } from '../lib/mcps/legacy-leakage-scrub'
-import { taskEventPublisherRedis, taskEventRedisKeys } from '../lib/task-event-redis'
+import { readS4RuntimeModeV1 } from '../lib/mcps/s4-lease'
+import { taskEventPublisherRedis, taskEventRedisConfiguration, taskEventRedisKeys } from '../lib/task-event-redis'
 
 export type TaskEventPayload = Record<string, unknown>
 
@@ -81,7 +82,11 @@ export async function publishTaskEvent(
   if (durableData === null) {
     throw new Error(`Task event '${safeType}' does not match the closed v2 schema.`)
   }
-  const redis = taskEventPublisherRedis()
+  // The database runtime mode is the sole cutover authority. Resolve it before
+  // selecting a Redis client so protected traffic cannot fall back to the
+  // shared pre-cutover connection.
+  const runtimeMode = await readS4RuntimeModeV1()
+  const redis = taskEventPublisherRedis(taskEventRedisConfiguration(runtimeMode))
   const redisKeys = taskEventRedisKeys(taskId)
   const rawId = await redis.eval(
     PERSIST_TASK_EVENT_V2,

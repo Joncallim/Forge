@@ -13,6 +13,7 @@ import {
   type TaskEventEnvelopeV2,
 } from '@/worker/events'
 import { taskEventRedisConfiguration, taskEventRedisKeys } from '@/lib/task-event-redis'
+import { readS4RuntimeModeV1 } from '@/lib/mcps/s4-lease'
 import { taskQuestionSummary } from '@/lib/mcps/clarification-projection'
 import {
   projectTaskCompatibilityArtifact,
@@ -59,7 +60,7 @@ export async function GET(
       let heartbeat: ReturnType<typeof setInterval> | null = null
       let maxAgeTimer: ReturnType<typeof setTimeout> | null = null
       let sub: RedisClient | null = null
-      let historyRedis: RedisClient = redis
+      let historyRedis: RedisClient | undefined = undefined
       let ownsHistoryRedis = false
 
       const cleanup = () => {
@@ -72,7 +73,7 @@ export async function GET(
           clearTimeout(maxAgeTimer)
         }
         sub?.disconnect()
-        if (ownsHistoryRedis) historyRedis.disconnect()
+        if (ownsHistoryRedis) historyRedis?.disconnect()
         try {
           controller.close()
         } catch {
@@ -230,7 +231,9 @@ export async function GET(
 
       const replayRange = async (afterId: number, throughId: number): Promise<boolean> => {
         if (throughId <= afterId) return true
-        const values = await historyRedis.zrangebyscore(
+        const activeHistoryRedis = historyRedis
+        if (!activeHistoryRedis) return false
+        const values = await activeHistoryRedis.zrangebyscore(
           eventHistoryKey,
           afterId + 1,
           throughId,
@@ -286,17 +289,19 @@ export async function GET(
       const { default: Redis } = await import('ioredis')
       let eventRedisConfiguration
       try {
-        eventRedisConfiguration = taskEventRedisConfiguration()
+        const runtimeMode = await readS4RuntimeModeV1()
+        eventRedisConfiguration = taskEventRedisConfiguration(runtimeMode)
       } catch {
         console.error('[SSE /api/tasks/:id/runs] Invalid task-event Redis configuration')
         cleanup()
         return
       }
       sub = new Redis(eventRedisConfiguration.subscriberUrl)
-      if (eventRedisConfiguration.dedicated) {
-        historyRedis = new Redis(eventRedisConfiguration.subscriberUrl)
-        ownsHistoryRedis = true
-      }
+      const activeHistoryRedis: RedisClient = eventRedisConfiguration.dedicated
+        ? new Redis(eventRedisConfiguration.subscriberUrl)
+        : redis
+      historyRedis = activeHistoryRedis
+      ownsHistoryRedis = eventRedisConfiguration.dedicated
       let publishedQueue = Promise.resolve()
       sub.on('message', (_channel: string, message: string) => {
         try {
@@ -323,7 +328,7 @@ export async function GET(
 
       if (lastDeliveredId > 0) {
         try {
-          const rawSequence = await historyRedis.get(eventSequenceKey)
+          const rawSequence = await activeHistoryRedis.get(eventSequenceKey)
           const replayUpperBound = Number(rawSequence)
           if (Number.isSafeInteger(replayUpperBound) && replayUpperBound > lastDeliveredId) {
             const filled = await replayRange(lastDeliveredId, replayUpperBound)
@@ -337,7 +342,7 @@ export async function GET(
         }
       } else {
         try {
-          const rawSequence = await historyRedis.get(eventSequenceKey)
+          const rawSequence = await activeHistoryRedis.get(eventSequenceKey)
           const currentSequence = Number(rawSequence)
           if (Number.isSafeInteger(currentSequence) && currentSequence > 0) {
             lastDeliveredId = currentSequence
