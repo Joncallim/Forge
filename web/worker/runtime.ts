@@ -6,6 +6,7 @@ const DEFAULT_CLAIM_TIMEOUT_SECONDS = 5
 const APPROVAL_CLAIM_TIMEOUT_SECONDS = 1
 const DEFAULT_MAX_ATTEMPTS = 3
 const DEFAULT_STUCK_JOB_RECOVERY_SECONDS = 15 * 60
+const MAX_QUEUE_RECOVERY_INTERVAL_MS = 60_000
 const DEFAULT_PROVIDER_HEALTH_INTERVAL_SECONDS = 5 * 60
 const DEFAULT_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS = 5 * 60
 const DEFAULT_SESSION_CACHE_PURGE_INTERVAL_SECONDS = 60
@@ -133,6 +134,8 @@ async function startWorkerOnce(
   let blockedHandoffSweepRunning = false
   let sessionCachePurgeTimer: ReturnType<typeof setInterval> | null = null
   let sessionCachePurgeRunning = false
+  let queueRecoveryTimer: ReturnType<typeof setInterval> | null = null
+  let queueRecoveryRun: Promise<void> | null = null
 
   const taskExists = async (taskId: string): Promise<boolean> => {
     const [row] = await db
@@ -148,8 +151,9 @@ async function startWorkerOnce(
     taskId: string
   }
   type RuntimeQueue<TJob extends RuntimeJob> = {
-    ack: (raw: string) => Promise<void>
-    deadLetter: (raw: string, job: TJob) => Promise<void>
+    ack: (raw: string) => Promise<unknown>
+    deadLetter: (raw: string, job: TJob) => Promise<unknown>
+    release: (raw: string) => Promise<unknown>
     retry: (raw: string, job: TJob, delayMs: number) => Promise<unknown>
   }
   type QueueOperation = 'approval' | 'answers' | 'task'
@@ -157,6 +161,7 @@ async function startWorkerOnce(
     | 'ack_after_success'
     | 'ack_missing_task'
     | 'dead_letter'
+    | 'release_after_shutdown'
     | 'retry'
     | 'task_lookup'
   type AttemptInfrastructurePhase = 'finish_after_failure' | 'finish_after_success' | 'start'
@@ -190,7 +195,7 @@ async function startWorkerOnce(
   const acknowledgeMissingTaskJob = async (
     queueName: QueueOperation,
     taskId: string,
-    ack: () => Promise<void>,
+    ack: () => Promise<unknown>,
   ): Promise<'acknowledged' | 'present' | 'retained'> => {
     let exists: boolean
     try {
@@ -304,6 +309,22 @@ async function startWorkerOnce(
     }
   }
 
+  const releaseClaimAfterShutdown = async <TJob extends RuntimeJob>(input: {
+    claimed: { job: TJob; raw: string }
+    queue: RuntimeQueue<TJob>
+    queueName: QueueOperation
+  }): Promise<void> => {
+    try {
+      await input.queue.release(input.claimed.raw)
+    } catch {
+      logQueueInfrastructureFailure(
+        'release_after_shutdown',
+        input.queueName,
+        input.claimed.job.taskId,
+      )
+    }
+  }
+
   const refreshProviderHealth = async (): Promise<void> => {
     if (providerHealthIntervalSeconds === 0 || providerHealthRunning) return
     providerHealthRunning = true
@@ -398,6 +419,51 @@ async function startWorkerOnce(
     }
   }
 
+  const recoverQueueWork = (options: { drain?: boolean } = {}): Promise<void> => {
+    if (queueRecoveryRun) return queueRecoveryRun
+    queueRecoveryRun = (async () => {
+      try {
+        const [recoveredApprovals, recoveredAnswers, recoveredTasks] = await Promise.all([
+          approvalQueue.recoverStuckJobs(stuckJobRecoveryMs, options),
+          answersQueue.recoverStuckJobs(stuckJobRecoveryMs, options),
+          taskQueue.recoverStuckJobs(stuckJobRecoveryMs, options),
+        ])
+        if (recoveredApprovals > 0 || recoveredAnswers > 0 || recoveredTasks > 0) {
+          console.warn('[worker] Recovered stuck jobs', {
+            approvals: recoveredApprovals,
+            answers: recoveredAnswers,
+            tasks: recoveredTasks,
+            workerId,
+          })
+        }
+      } catch {
+        console.error('[worker] Queue recovery fault', { workerId })
+      }
+    })().finally(() => {
+      queueRecoveryRun = null
+    })
+    return queueRecoveryRun
+  }
+
+  const clearWorkerTimers = (): void => {
+    if (providerHealthTimer !== null) {
+      clearInterval(providerHealthTimer)
+      providerHealthTimer = null
+    }
+    if (blockedHandoffSweepTimer !== null) {
+      clearInterval(blockedHandoffSweepTimer)
+      blockedHandoffSweepTimer = null
+    }
+    if (sessionCachePurgeTimer !== null) {
+      clearInterval(sessionCachePurgeTimer)
+      sessionCachePurgeTimer = null
+    }
+    if (queueRecoveryTimer !== null) {
+      clearInterval(queueRecoveryTimer)
+      queueRecoveryTimer = null
+    }
+  }
+
   const run = async (): Promise<void> => {
     const executionRequestFlag = defaultOnFeatureFlagState(process.env.FORGE_WORK_PACKAGE_EXECUTION)
     const executionMode = {
@@ -454,19 +520,11 @@ async function startWorkerOnce(
         )
       }
 
-      const [recoveredApprovals, recoveredAnswers, recoveredTasks] = await Promise.all([
-        approvalQueue.recoverStuckJobs(stuckJobRecoveryMs),
-        answersQueue.recoverStuckJobs(stuckJobRecoveryMs),
-        taskQueue.recoverStuckJobs(stuckJobRecoveryMs),
-      ])
-      if (recoveredApprovals > 0 || recoveredAnswers > 0 || recoveredTasks > 0) {
-        console.warn('[worker] Recovered stuck jobs', {
-          approvals: recoveredApprovals,
-          answers: recoveredAnswers,
-          tasks: recoveredTasks,
-          workerId,
-        })
-      }
+      await recoverQueueWork({ drain: true })
+      queueRecoveryTimer = setInterval(
+        () => void recoverQueueWork(),
+        Math.min(stuckJobRecoveryMs, MAX_QUEUE_RECOVERY_INTERVAL_MS),
+      )
 
       while (!shuttingDown) {
         const [promotedApprovals, promotedAnswers, promotedTasks] = await Promise.all([
@@ -482,6 +540,7 @@ async function startWorkerOnce(
             workerId,
           })
         }
+        if (shuttingDown) break
 
         let claimedApproval = null as Awaited<ReturnType<InstanceType<typeof ApprovalQueue>['claim']>>
 
@@ -492,6 +551,16 @@ async function startWorkerOnce(
           console.error('[worker] Failed to claim approval', { workerId })
         }
 
+        if (shuttingDown) {
+          if (claimedApproval !== null) {
+            await releaseClaimAfterShutdown({
+              claimed: claimedApproval,
+              queue: approvalQueue,
+              queueName: 'approval',
+            })
+          }
+          break
+        }
         if (claimedApproval !== null) {
           await processClaimedJob({
             attemptQueueName: 'approvals',
@@ -502,6 +571,7 @@ async function startWorkerOnce(
             queueName: 'approval',
           })
         }
+        if (shuttingDown) break
 
         let claimedAnswers = null as Awaited<ReturnType<InstanceType<typeof AnswersQueue>['claim']>>
 
@@ -512,6 +582,16 @@ async function startWorkerOnce(
           console.error('[worker] Failed to claim answers job', { workerId })
         }
 
+        if (shuttingDown) {
+          if (claimedAnswers !== null) {
+            await releaseClaimAfterShutdown({
+              claimed: claimedAnswers,
+              queue: answersQueue,
+              queueName: 'answers',
+            })
+          }
+          break
+        }
         if (claimedAnswers !== null) {
           await processClaimedJob({
             attemptQueueName: 'answers',
@@ -522,6 +602,7 @@ async function startWorkerOnce(
             queueName: 'answers',
           })
         }
+        if (shuttingDown) break
 
         let claimedTask = null as Awaited<ReturnType<InstanceType<typeof TaskQueue>['claim']>>
 
@@ -533,6 +614,16 @@ async function startWorkerOnce(
           continue
         }
 
+        if (shuttingDown) {
+          if (claimedTask !== null) {
+            await releaseClaimAfterShutdown({
+              claimed: claimedTask,
+              queue: taskQueue,
+              queueName: 'task',
+            })
+          }
+          break
+        }
         if (claimedTask === null) continue
 
         await processClaimedJob({
@@ -545,18 +636,8 @@ async function startWorkerOnce(
         })
       }
     } finally {
-      if (providerHealthTimer !== null) {
-        clearInterval(providerHealthTimer)
-        providerHealthTimer = null
-      }
-      if (blockedHandoffSweepTimer !== null) {
-        clearInterval(blockedHandoffSweepTimer)
-        blockedHandoffSweepTimer = null
-      }
-      if (sessionCachePurgeTimer !== null) {
-        clearInterval(sessionCachePurgeTimer)
-        sessionCachePurgeTimer = null
-      }
+      clearWorkerTimers()
+      await queueRecoveryRun?.catch(() => {})
       taskQueue.disconnect()
       approvalQueue.disconnect()
       answersQueue.disconnect()
@@ -573,11 +654,10 @@ async function startWorkerOnce(
   const handle: WorkerHandle = {
     done,
     stop: async () => {
-      if (shuttingDown) return
-      shuttingDown = true
-      taskQueue.disconnect()
-      approvalQueue.disconnect()
-      answersQueue.disconnect()
+      if (!shuttingDown) {
+        shuttingDown = true
+        clearWorkerTimers()
+      }
       await done.catch(() => {})
     },
   }
