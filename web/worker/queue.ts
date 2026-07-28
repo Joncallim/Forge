@@ -21,15 +21,8 @@ type RetryableJob = {
   attempt?: number
 }
 
-function redisErrorMessage(err: Error): string {
-  const aggregate = err as Error & { code?: string; errors?: { code?: string; message?: string }[] }
-  return (
-    err.message ||
-    aggregate.code ||
-    aggregate.errors?.map((nested) => nested.code ?? nested.message).filter(Boolean).join(', ') ||
-    err.name
-  )
-}
+const TASK_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const DEAD_LETTER_FAILURE_CATEGORY = 'job_processing_failed'
 
 export interface TaskJob {
   taskId: string
@@ -77,8 +70,8 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
       maxRetriesPerRequest: null,
       retryStrategy: (times) => Math.min(times * 100, 3000),
     })
-    this.client.on('error', (err) => {
-      console.warn('[worker/queue] Redis connection error:', redisErrorMessage(err))
+    this.client.on('error', () => {
+      console.warn('[worker/queue] Redis connection unavailable')
     })
   }
 
@@ -96,13 +89,9 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
       const job = this.parse(raw)
       await this.client.hset(this.claimsKey, raw, String(Date.now()))
       return { raw, job }
-    } catch (err) {
+    } catch {
       await this.ack(raw)
-      console.warn('[worker/queue] Dropped invalid job payload', {
-        queueKey: this.queueKey,
-        raw,
-        err,
-      })
+      console.warn('[worker/queue] Dropped invalid job payload')
       return null
     }
   }
@@ -115,11 +104,12 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
   }
 
   async retry(raw: string, job: TJob, delayMs: number): Promise<Date> {
-    const nextAttempt = (job.attempt ?? 1) + 1
-    const nextJob = {
-      ...job,
+    const canonicalJob = this.parse(JSON.stringify(job))
+    const nextAttempt = (canonicalJob.attempt ?? 1) + 1
+    const nextJob = this.parse(JSON.stringify({
+      ...canonicalJob,
       attempt: nextAttempt,
-    }
+    }))
     const nextRetryAt = new Date(Date.now() + delayMs)
 
     await Promise.all([
@@ -130,11 +120,12 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
     return nextRetryAt
   }
 
-  async deadLetter(raw: string, errorMessage: string): Promise<void> {
+  async deadLetter(raw: string, job: TJob): Promise<void> {
+    const canonicalJob = this.parse(JSON.stringify(job))
     await Promise.all([
       this.client.lpush(this.deadQueueKey, JSON.stringify({
-        raw,
-        errorMessage,
+        job: canonicalJob,
+        failureCategory: DEAD_LETTER_FAILURE_CATEGORY,
         deadLetteredAt: new Date().toISOString(),
       })),
       this.ack(raw),
@@ -194,9 +185,30 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
 }
 
 function normalizeAttempt(job: Partial<RetryableJob>): number {
-  return typeof job.attempt === 'number' && Number.isInteger(job.attempt) && job.attempt > 0
-    ? job.attempt
-    : 1
+  if (job.attempt === undefined) return 1
+  if (typeof job.attempt !== 'number' || !Number.isSafeInteger(job.attempt) || job.attempt < 1) {
+    throw new Error('attempt must be a positive safe integer')
+  }
+  return job.attempt
+}
+
+function normalizeTaskId(value: unknown): string {
+  if (typeof value !== 'string' || !TASK_ID_PATTERN.test(value)) {
+    throw new Error('taskId must be a canonical UUID')
+  }
+  return value
+}
+
+function parseClosedJob(raw: string, allowedKeys: readonly string[]): Record<string, unknown> {
+  const parsed = JSON.parse(raw) as unknown
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('job payload must be an object')
+  }
+  const job = parsed as Record<string, unknown>
+  if (Object.keys(job).some((key) => !allowedKeys.includes(key))) {
+    throw new Error('job payload contains unsupported fields')
+  }
+  return job
 }
 
 export class TaskQueue extends RedisListQueue<TaskJob> {
@@ -212,12 +224,8 @@ export class TaskQueue extends RedisListQueue<TaskJob> {
   }
 
   protected parse(raw: string): TaskJob {
-    const job = JSON.parse(raw) as Partial<TaskJob>
-    if (typeof job.taskId !== 'string' || job.taskId.length === 0) {
-      throw new Error('taskId is required')
-    }
-
-    return { taskId: job.taskId, attempt: normalizeAttempt(job) }
+    const job = parseClosedJob(raw, ['taskId', 'attempt']) as Partial<TaskJob>
+    return { taskId: normalizeTaskId(job.taskId), attempt: normalizeAttempt(job) }
   }
 
   override async claim(timeoutSeconds: number): Promise<ClaimedTaskJob | null> {
@@ -238,15 +246,12 @@ export class ApprovalQueue extends RedisListQueue<ApprovalJob> {
   }
 
   protected parse(raw: string): ApprovalJob {
-    const job = JSON.parse(raw) as Partial<ApprovalJob>
-    if (typeof job.taskId !== 'string' || job.taskId.length === 0) {
-      throw new Error('taskId is required')
-    }
+    const job = parseClosedJob(raw, ['taskId', 'action', 'attempt']) as Partial<ApprovalJob>
     if (job.action !== 'approve') {
       throw new Error('approval action must be approve')
     }
 
-    return { taskId: job.taskId, action: job.action, attempt: normalizeAttempt(job) }
+    return { taskId: normalizeTaskId(job.taskId), action: job.action, attempt: normalizeAttempt(job) }
   }
 
   override async claim(timeoutSeconds: number): Promise<ClaimedApprovalJob | null> {
@@ -267,12 +272,8 @@ export class AnswersQueue extends RedisListQueue<AnswersJob> {
   }
 
   protected parse(raw: string): AnswersJob {
-    const job = JSON.parse(raw) as Partial<AnswersJob>
-    if (typeof job.taskId !== 'string' || job.taskId.length === 0) {
-      throw new Error('taskId is required')
-    }
-
-    return { taskId: job.taskId, attempt: normalizeAttempt(job) }
+    const job = parseClosedJob(raw, ['taskId', 'attempt']) as Partial<AnswersJob>
+    return { taskId: normalizeTaskId(job.taskId), attempt: normalizeAttempt(job) }
   }
 
   override async claim(timeoutSeconds: number): Promise<ClaimedAnswersJob | null> {

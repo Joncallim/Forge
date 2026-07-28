@@ -71,7 +71,7 @@ function backoffDelayMs(attempt: number): number {
   return Math.min(2 ** Math.max(attempt - 1, 0) * 1000, 30_000)
 }
 
-function errorMessage(err: unknown): string {
+function retainedErrorMessage(err: unknown): string {
   return sanitizeWorkerMessage(err instanceof Error ? err.message : String(err))
 }
 
@@ -168,11 +168,8 @@ async function startWorkerOnce(
       if (checked > 0) {
         console.info('[worker] Refreshed provider health cache', { checked, workerId })
       }
-    } catch (err) {
-      console.warn('[worker] Provider health refresh failed', {
-        err: errorMessage(err),
-        workerId,
-      })
+    } catch {
+      console.warn('[worker] Provider health refresh failed', { workerId })
     } finally {
       providerHealthRunning = false
     }
@@ -225,8 +222,8 @@ async function startWorkerOnce(
       if (recoveredS4Handoffs > 0) {
         console.info('[worker] Recovered protected completion handoffs', { count: recoveredS4Handoffs, workerId })
       }
-    } catch (err) {
-      console.warn('[worker] Blocked-handoff sweep failed', { err: errorMessage(err), workerId })
+    } catch {
+      console.warn('[worker] Blocked-handoff sweep failed', { workerId })
     } finally {
       blockedHandoffSweepRunning = false
     }
@@ -241,10 +238,16 @@ async function startWorkerOnce(
       const { reconcilePendingSessionCacheInvalidations } = await import('../lib/session')
       const reconciled = await reconcilePendingSessionCacheInvalidations(100)
       if (reconciled.claimed > 0) {
-        console.info('[worker] Reconciled revoked session caches', { ...reconciled, workerId })
+        console.info('[worker] Reconciled revoked session caches', {
+          claimed: reconciled.claimed,
+          completed: reconciled.completed,
+          deferred: reconciled.deferred,
+          stale: reconciled.stale,
+          workerId,
+        })
       }
-    } catch (err) {
-      console.warn('[worker] Session cache purge sweep failed', { err: errorMessage(err), workerId })
+    } catch {
+      console.warn('[worker] Session cache purge sweep failed', { workerId })
     } finally {
       sessionCachePurgeRunning = false
     }
@@ -339,9 +342,9 @@ async function startWorkerOnce(
 
         try {
           claimedApproval = await approvalQueue.claim(APPROVAL_CLAIM_TIMEOUT_SECONDS)
-        } catch (err) {
+        } catch {
           if (shuttingDown) break
-          console.error('[worker] Failed to claim approval', { err: errorMessage(err), workerId })
+          console.error('[worker] Failed to claim approval', { workerId })
         }
 
         if (claimedApproval !== null) {
@@ -376,7 +379,7 @@ async function startWorkerOnce(
               ackedApproval = true
             }
           } catch (err) {
-            const message = errorMessage(err)
+            const message = retainedErrorMessage(err)
             const nextRetryAt = finalAttempt
               ? null
               : new Date(Date.now() + backoffDelayMs(claimedApproval.job.attempt))
@@ -389,7 +392,7 @@ async function startWorkerOnce(
               })
             }
             if (finalAttempt) {
-              await approvalQueue.deadLetter(claimedApproval.raw, message)
+              await approvalQueue.deadLetter(claimedApproval.raw, claimedApproval.job)
             } else {
               await approvalQueue.retry(
                 claimedApproval.raw,
@@ -402,17 +405,15 @@ async function startWorkerOnce(
               attempt: claimedApproval.job.attempt,
               finalAttempt,
               taskId: claimedApproval.job.taskId,
-              err: message,
               workerId,
             })
           } finally {
             if (!ackedApproval) {
               try {
                 await approvalQueue.ack(claimedApproval.raw)
-              } catch (err) {
+              } catch {
                 console.error('[worker] Failed to acknowledge approval', {
                   taskId: claimedApproval.job.taskId,
-                  err: errorMessage(err),
                   workerId,
                 })
               }
@@ -424,9 +425,9 @@ async function startWorkerOnce(
 
         try {
           claimedAnswers = await answersQueue.claim(APPROVAL_CLAIM_TIMEOUT_SECONDS)
-        } catch (err) {
+        } catch {
           if (shuttingDown) break
-          console.error('[worker] Failed to claim answers job', { err: errorMessage(err), workerId })
+          console.error('[worker] Failed to claim answers job', { workerId })
         }
 
         if (claimedAnswers !== null) {
@@ -461,7 +462,7 @@ async function startWorkerOnce(
               ackedAnswers = true
             }
           } catch (err) {
-            const message = errorMessage(err)
+            const message = retainedErrorMessage(err)
             const nextRetryAt = finalAttempt
               ? null
               : new Date(Date.now() + backoffDelayMs(claimedAnswers.job.attempt))
@@ -474,7 +475,7 @@ async function startWorkerOnce(
               })
             }
             if (finalAttempt) {
-              await answersQueue.deadLetter(claimedAnswers.raw, message)
+              await answersQueue.deadLetter(claimedAnswers.raw, claimedAnswers.job)
             } else {
               await answersQueue.retry(
                 claimedAnswers.raw,
@@ -487,17 +488,15 @@ async function startWorkerOnce(
               attempt: claimedAnswers.job.attempt,
               finalAttempt,
               taskId: claimedAnswers.job.taskId,
-              err: message,
               workerId,
             })
           } finally {
             if (!ackedAnswers) {
               try {
                 await answersQueue.ack(claimedAnswers.raw)
-              } catch (err) {
+              } catch {
                 console.error('[worker] Failed to acknowledge answers job', {
                   taskId: claimedAnswers.job.taskId,
-                  err: errorMessage(err),
                   workerId,
                 })
               }
@@ -509,9 +508,9 @@ async function startWorkerOnce(
 
         try {
           claimedTask = await taskQueue.claim(claimTimeoutSeconds)
-        } catch (err) {
+        } catch {
           if (shuttingDown) break
-          console.error('[worker] Failed to claim task', { err: errorMessage(err), workerId })
+          console.error('[worker] Failed to claim task', { workerId })
           continue
         }
 
@@ -549,7 +548,7 @@ async function startWorkerOnce(
             ackedTask = true
           }
         } catch (err) {
-          const message = errorMessage(err)
+          const message = retainedErrorMessage(err)
           const finalAttempt = claimedTask.job.attempt >= maxAttempts
           const nextRetryAt = finalAttempt
             ? null
@@ -563,7 +562,7 @@ async function startWorkerOnce(
             })
           }
           if (finalAttempt) {
-            await taskQueue.deadLetter(claimedTask.raw, message)
+            await taskQueue.deadLetter(claimedTask.raw, claimedTask.job)
           } else {
             await taskQueue.retry(
               claimedTask.raw,
@@ -576,17 +575,15 @@ async function startWorkerOnce(
             attempt: claimedTask.job.attempt,
             finalAttempt,
             taskId: claimedTask.job.taskId,
-            err: message,
             workerId,
           })
         } finally {
           if (!ackedTask) {
             try {
               await taskQueue.ack(claimedTask.raw)
-            } catch (err) {
+            } catch {
               console.error('[worker] Failed to acknowledge task', {
                 taskId: claimedTask.job.taskId,
-                err: errorMessage(err),
                 workerId,
               })
             }
@@ -615,8 +612,8 @@ async function startWorkerOnce(
   }
 
   const done = run()
-  done.catch((err) => {
-    console.error('[worker] Fatal error', { err: errorMessage(err), workerId })
+  done.catch(() => {
+    console.error('[worker] Fatal error', { workerId })
   })
 
   const handle: WorkerHandle = {
