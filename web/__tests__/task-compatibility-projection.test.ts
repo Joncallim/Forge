@@ -7,6 +7,7 @@ import {
   projectTaskCompatibilityRun,
   projectTaskCompatibilityTask,
   projectTaskCompatibilityVcsChange,
+  projectTaskCompatibilityWorkPackage,
 } from '@/lib/mcps/leakage-drain'
 import { ARCHITECT_PLAN_HEADER } from '@/lib/mcps/architect-plan-entries'
 
@@ -40,6 +41,55 @@ describe('task compatibility projection', () => {
     expect(change.repository).toBe('legacy_task_log_unavailable')
     expect(change.diffSummary).toBe('legacy_task_log_unavailable')
     expect(JSON.stringify(change)).not.toContain('local-path-sentinel')
+  })
+
+  it('closes work-package rows while preserving authorized plan and public annotations', () => {
+    const projected = projectTaskCompatibilityWorkPackage({
+      id: 'package-1',
+      taskId: 'task-1',
+      harnessId: 'harness-1',
+      assignedRole: 'backend',
+      title: 'Implement the API',
+      summary: 'Add the closed endpoint.',
+      status: 'blocked',
+      sequence: 2,
+      steps: ['Implement', 'Test'],
+      requiredCapabilities: { required: ['filesystem.read'] },
+      acceptanceCriteria: ['No raw output'],
+      mcpRequirements: [{ mcpId: 'filesystem' }],
+      reviewRequirement: 'both',
+      blockedReason: 'RAW-BLOCKED-REASON /private/secret prompt',
+      metadata: { safeCount: 3, promptOverlay: 'RAW-METADATA-PROMPT' },
+      createdAt: 'created',
+      updatedAt: 'updated',
+      futureDatabaseColumn: 'RAW-FUTURE-COLUMN',
+    }, {
+      metadata: { safeCount: 3 },
+      harnessRole: 'backend',
+      harnessDisplayName: 'Backend',
+      harnessDescription: 'API specialist.',
+      artifacts: [{ id: 'artifact-1' }],
+    })
+
+    expect(projected).toMatchObject({
+      id: 'package-1',
+      assignedRole: 'backend',
+      title: 'Implement the API',
+      summary: 'Add the closed endpoint.',
+      status: 'blocked',
+      sequence: 2,
+      steps: ['Implement', 'Test'],
+      acceptanceCriteria: ['No raw output'],
+      reviewRequirement: 'both',
+      blockedReason: 'legacy_task_log_unavailable',
+      metadata: { safeCount: 3 },
+      harnessRole: 'backend',
+      harnessDisplayName: 'Backend',
+      artifacts: [{ id: 'artifact-1' }],
+    })
+    expect(projected).not.toHaveProperty('futureDatabaseColumn')
+    expect(JSON.stringify(projected)).not.toContain('RAW-')
+    expect(projectTaskCompatibilityWorkPackage({ blockedReason: null }).blockedReason).toBeNull()
   })
 
   it('closes current and legacy Architect adr_text while preserving ordinary artifact content and sanitizing metadata', () => {

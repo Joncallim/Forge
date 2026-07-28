@@ -6,7 +6,7 @@ import { projects, tasks } from '@/db/schema'
 import { eq, desc, count, getTableColumns, type SQL } from 'drizzle-orm'
 import { getSession } from '@/lib/session'
 import { redis } from '@/lib/redis'
-import { generateTaskTitle } from '@/lib/task-title'
+import { generateTaskTitle, UNTITLED_TASK_TITLE } from '@/lib/task-title'
 import { recordTaskLogBestEffort } from '@/worker/task-logs'
 import {
   accessibleProjectOwnerCondition,
@@ -146,7 +146,14 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Project not found' }, { status: 404 })
     }
 
-    const title = data.title.trim() || (await generateTaskTitle(data.prompt, data.pmProviderConfigId))
+    const suppliedTitle = data.title.trim()
+    let title = suppliedTitle
+    if (!title) {
+      const { readS4RuntimeModeV1 } = await import('@/lib/mcps/s4-lease')
+      title = await readS4RuntimeModeV1() === 'protected'
+        ? UNTITLED_TASK_TITLE
+        : await generateTaskTitle(data.prompt, data.pmProviderConfigId)
+    }
 
     const [task] = await db
       .insert(tasks)
@@ -180,7 +187,7 @@ export async function POST(request: NextRequest) {
     })
 
     console.info('[POST /api/tasks] Created task', { id: task.id, projectId: task.projectId })
-    return NextResponse.json({ task }, { status: 201 })
+    return NextResponse.json({ task: projectTaskCompatibilityTask(task) }, { status: 201 })
   } catch {
     console.error('[POST /api/tasks] Unexpected error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
