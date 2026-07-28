@@ -1490,7 +1490,7 @@ describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () =
   const scrubKeyId = 's4-scrub-proof-v2'
   const ids = {
     user: randomUUID(), project: randomUUID(), task: randomUUID(), run: randomUUID(),
-    signer: randomUUID(), expandReceipt: randomUUID(), disabledReceipt: randomUUID(),
+    expandReceipt: randomUUID(), disabledReceipt: randomUUID(),
   }
   const redis: LegacyLeakageScrubRedis = {
     async purgeLegacyTaskEventKeys(): Promise<RedisScanEvidence> {
@@ -1501,10 +1501,17 @@ describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () =
     },
   }
   let admin: ReturnType<typeof postgres>
+  let prepared = false
 
-  beforeAll(async () => {
-    admin = postgres(adminUrl!, { max: 3, onnotice: () => {} })
+  async function prepareScrubFixture(): Promise<void> {
+    if (prepared) return
     const exactBuilds = JSON.stringify([`issue_179_s4@${'a'.repeat(40)}`])
+    const [signer] = await admin<{ id: string }[]>`
+      select id::text as id
+      from forge_release_signer_keys
+      where policy_id = 'forge-epic-172-release-signing-v1' and generation = 1
+    `
+    if (!signer) throw new Error('S4_SCRUB_POSTGRES fixture requires the shared canonical release signer generation 1.')
     await admin.begin(async (tx) => {
       await tx`insert into users (id, display_name) values (${ids.user}::uuid, 'S4 scrub proof')`
       await tx`insert into projects (id, name, submitted_by, grant_decision_revision, root_binding_revision)
@@ -1513,12 +1520,6 @@ describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () =
         values (${ids.task}::uuid, ${ids.project}::uuid, ${ids.user}::uuid, 'S4 scrub proof', 'canonical prompt', 'running')`
       await tx`insert into agent_runs (id, task_id, agent_type, model_id_used, status)
         values (${ids.run}::uuid, ${ids.task}::uuid, 'architect', 'test', 'completed')`
-      await tx`insert into forge_release_signer_keys (
-        id, generation, public_key_spki, github_app_id, ruleset_fingerprint, status, valid_from, valid_until
-      ) values (
-        ${ids.signer}::uuid, 1, decode('00', 'hex'), 's4-scrub-proof', ${'b'.repeat(64)}, 'staged',
-        clock_timestamp() - interval '1 minute', clock_timestamp() + interval '1 hour'
-      )`
       await tx`insert into forge_epic_172_release_evidence (
         id, evidence_kind, owner_issue, owner_slice, exact_builds, required_evidence, reviewed_sha, epoch,
         predecessor_receipt_ids, predecessor_set_digest, transition_identity_digest, signer_key_id, signer_generation,
@@ -1526,12 +1527,12 @@ describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () =
       ) values
         (${ids.expandReceipt}::uuid, 's4_expand', 179, 's4', ${exactBuilds}::text::jsonb,
           '[{"name":"bootstrap","measurementDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]'::jsonb, ${'a'.repeat(40)}, 1, '[]'::jsonb, ${'0'.repeat(64)}, ${'1'.repeat(64)},
-          ${ids.signer}::uuid, 1, 's4-scrub-proof', 'scrub-proof', 'expand', ${'2'.repeat(64)},
+          ${signer.id}::uuid, 1, 's4-scrub-proof', 'scrub-proof', 'expand', ${'2'.repeat(64)},
           decode(repeat('aa', 64), 'hex'), ${randomUUID()}::uuid, transaction_timestamp(), '{}'::jsonb),
         (${ids.disabledReceipt}::uuid, 's4_producers_disabled', 179, 's4', ${exactBuilds}::text::jsonb,
           '[{"name":"s4_expand_receipt"},{"name":"legacy_credentials_publishers_and_sessions_drained"},{"name":"expansion_journal_reconciled_through_watermark"},{"name":"project_root_bindings_complete"},{"name":"legacy_prompt_and_event_data_zero_scan_green"},{"name":"all_v2_producers_disabled"}]'::jsonb,
           ${'a'.repeat(40)}, 1, jsonb_build_array(${ids.expandReceipt}::text), ${'0'.repeat(64)}, ${'3'.repeat(64)},
-          ${ids.signer}::uuid, 1, 's4-scrub-proof', 'scrub-proof', 'disabled', ${'4'.repeat(64)},
+          ${signer.id}::uuid, 1, 's4-scrub-proof', 'scrub-proof', 'disabled', ${'4'.repeat(64)},
           decode(repeat('bb', 64), 'hex'), ${randomUUID()}::uuid, transaction_timestamp(), '{}'::jsonb)
       `
       await tx`update forge_epic_172_enablement_state
@@ -1544,11 +1545,17 @@ describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () =
         values (${ids.task}::uuid, 'scrub_proof', 'Scrub proof', 'RAW-SCRUB-SENTINEL',
           '{"prompt":"RAW-SCRUB-PROMPT"}'::jsonb, '{"storageLocator":"/private/scrub-proof"}'::jsonb)`
     })
+    prepared = true
+  }
+
+  beforeAll(() => {
+    admin = postgres(adminUrl!, { max: 3, onnotice: () => {} })
   })
 
   afterAll(async () => { await admin?.end({ timeout: 5 }) })
 
   it('S4_SCRUB_POSTGRES: authorizes, CAS-scrubs, resumes, and fails closed on reappearance', async () => {
+    await prepareScrubFixture()
     console.info('S4_SCRUB_POSTGRES_START')
     const adapter = createLegacyLeakagePostgresAdapter(admin, scrubKey)
     const checkpointFor = async (operationId: string): Promise<LegacyLeakageScrubCheckpoint> => ({
@@ -1623,6 +1630,7 @@ describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () =
   })
 
   it('S4_SCRUB_POSTGRES_ARTIFACT_LINK_RACE: post-lock reload refuses a newly protected artifact', async () => {
+    await prepareScrubFixture()
     const adapterUrl = new URL(adminUrl!)
     adapterUrl.searchParams.set('application_name', `s4-scrub-race-${randomUUID()}`)
     const scrubSql = postgres(adapterUrl.toString(), { max: 1, onnotice: () => {} })
