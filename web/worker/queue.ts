@@ -501,6 +501,9 @@ if not current_score then
     return {2, 'discarded', ''}
   end
   if winning_occurrence_id and mode ~= 'discard' then
+    if mode == 'occurrence' and winning_occurrence_id ~= candidate_occurrence_id then
+      return {0, 'receipt_integrity_failure', ''}
+    end
     return {2, 'promoted', winning_occurrence_id}
   end
   return {0, 'receipt_integrity_failure', ''}
