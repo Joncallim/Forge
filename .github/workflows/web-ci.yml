@@ -32,6 +32,15 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      scrub_redis:
+        image: redis:7-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     defaults:
       run:
         working-directory: web
@@ -521,6 +530,13 @@ jobs:
             echo 'The mandatory S4 PostgreSQL proof did not report a passing test.' >&2
             exit 1
           fi
+      - name: Run mandatory S4 Redis zero-skip proof
+        env:
+          FORGE_S4_REQUIRE_REDIS_TEST: '1'
+          FORGE_S4_REDIS_DESTRUCTIVE_TEST: '1'
+          FORGE_S4_REDIS_TEST_URL: redis://localhost:6380/15
+        run: |
+          npm run test:mcp:s4-redis
       - run: npm run build
       - run: npx playwright install chromium
       - name: Run mandatory S3 PostgreSQL concurrency proof
