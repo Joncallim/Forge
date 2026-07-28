@@ -96,6 +96,10 @@ describe('task-event Redis credential boundary', () => {
     process.env.REDIS_URL = 'redis://legacy@localhost/0'
     const {
       TASK_EVENT_V2_LIVE_PATTERN,
+      LEGACY_TASK_EVENT_STORAGE_PATTERN,
+      TASK_EVENT_V2_STORAGE_PATTERN,
+      parseLegacyTaskEventStorageKey,
+      parseV2TaskEventStorageKey,
       taskEventRedisKeys,
       taskIdFromTaskEventLiveChannel,
     } = await import('@/lib/task-event-redis')
@@ -106,6 +110,15 @@ describe('task-event Redis credential boundary', () => {
       sequence: 'forge:task-events:v2:task-1:seq',
     })
     expect(TASK_EVENT_V2_LIVE_PATTERN).toBe('forge:task-events:v2:*:live')
+    expect(LEGACY_TASK_EVENT_STORAGE_PATTERN).toBe('forge:task:*')
+    expect(TASK_EVENT_V2_STORAGE_PATTERN).toBe('forge:task-events:v2:*')
+    expect(parseLegacyTaskEventStorageKey('forge:task:00000000-0000-4000-8000-000000000001:history'))
+      .toEqual({ taskId: '00000000-0000-4000-8000-000000000001', kind: 'history' })
+    expect(parseLegacyTaskEventStorageKey('forge:task:not-a-uuid:history')).toBeNull()
+    expect(parseLegacyTaskEventStorageKey('forge:task:00000000-0000-4000-8000-000000000001:history:extra')).toBeNull()
+    expect(parseV2TaskEventStorageKey('forge:task-events:v2:00000000-0000-4000-8000-000000000001:seq'))
+      .toEqual({ taskId: '00000000-0000-4000-8000-000000000001', kind: 'seq' })
+    expect(parseV2TaskEventStorageKey('forge:task-events:v2:00000000-0000-4000-8000-000000000001:live')).toBeNull()
     expect(taskIdFromTaskEventLiveChannel('forge:task-events:v2:task-1:live')).toBe('task-1')
     expect(taskIdFromTaskEventLiveChannel('forge:task:task-1')).toBeNull()
   })

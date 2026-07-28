@@ -4,6 +4,7 @@ import safeV2TaskEvents from './__fixtures__/safe-v2-task-events.json'
 import {
   LEGACY_TASK_LOG_UNAVAILABLE,
 } from '@/lib/mcps/leakage-drain'
+import { scanJsonObjectKeys } from '@/lib/json-object-key-scan'
 import {
   containsForbiddenV2EventData,
   compareCanonicalCodeUnits,
@@ -173,16 +174,23 @@ class FakeDatabase implements LegacyLeakageScrubDatabase {
 class FakeRedis implements LegacyLeakageScrubRedis {
   oldKeys = 2
   v2Violations = 0
+  legacyViolations = 0
+  legacyViolationAfterApply = false
   applyCalls: boolean[] = []
 
   async purgeLegacyTaskEventKeys({ apply }: { apply: boolean }): Promise<RedisScanEvidence> {
     this.applyCalls.push(apply)
     const found = this.oldKeys
-    if (apply) this.oldKeys = 0
+    const violations = this.legacyViolations
+    if (apply) {
+      this.oldKeys = 0
+      if (this.legacyViolationAfterApply) this.legacyViolations = 1
+    }
     return evidence({
       keysDeleted: apply ? found : 0,
       keysExamined: found,
       remainingKeys: this.oldKeys,
+      violations,
     })
   }
 
@@ -454,6 +462,23 @@ describe('legacy leakage scrub', () => {
     expect(redis.applyCalls).toEqual([])
   })
 
+  it('completes a write-free v2 preflight before legacy deletion and pauses without deleting v2 evidence', async () => {
+    const database = new FakeDatabase()
+    const redis = new FakeRedis()
+    redis.v2Violations = 1
+    const result = await runLegacyLeakageScrub({
+      actor: 'operator',
+      authorizationReceiptId: RECEIPT,
+      fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID,
+      mode: 'apply',
+      operationId: 'v2-preflight-operation',
+    }, { database, redis })
+    expect(result.checkpoint).toMatchObject({ phase: 'redis_legacy', state: 'paused_conflict' })
+    expect(redis.applyCalls).toEqual([false])
+    expect(redis.oldKeys).toBe(2)
+  })
+
   it('uses domain-separated keyed fingerprints and binds resume to key and order-independent sentinels', async () => {
     const row = taskLog()
     const otherKey = Buffer.alloc(32, 8)
@@ -702,46 +727,229 @@ describe('legacy leakage scrub', () => {
       .rejects.toThrow('database or Redis leakage reappeared')
     expect(database.authorizationChecks).toBe(2)
   })
+
+  it('does not trust completed Redis verification when legacy evidence reports a violation', async () => {
+    const database = new FakeDatabase()
+    const redis = new FakeRedis()
+    const options = {
+      actor: 'operator', authorizationReceiptId: RECEIPT, fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID, mode: 'apply' as const, operationId: 'completion-legacy-violation',
+    }
+    const completed = await runLegacyLeakageScrub(options, { database, redis })
+    expect(completed.checkpoint?.state).toBe('complete')
+
+    redis.legacyViolations = 1
+    await expect(runLegacyLeakageScrub({ ...options, mode: 'resume' }, { database, redis }))
+      .rejects.toThrow('database or Redis leakage reappeared')
+    expect(redis.applyCalls.at(-1)).toBe(false)
+  })
+
+  it('returns final legacy violations to the redis_legacy recovery path before another delete', async () => {
+    const database = new FakeDatabase()
+    const redis = new FakeRedis()
+    redis.legacyViolationAfterApply = true
+    const options = {
+      actor: 'operator', authorizationReceiptId: RECEIPT, fingerprintKey: FINGERPRINT_KEY,
+      fingerprintKeyId: FINGERPRINT_KEY_ID, mode: 'apply' as const, operationId: 'final-legacy-violation',
+    }
+    const first = await runLegacyLeakageScrub(options, { database, redis })
+    expect(first.checkpoint).toMatchObject({ phase: 'redis_legacy', state: 'paused_conflict' })
+    const deletes = redis.applyCalls.filter(Boolean).length
+
+    const resumed = await runLegacyLeakageScrub({ ...options, mode: 'resume' }, { database, redis })
+    expect(resumed.checkpoint).toMatchObject({ phase: 'redis_legacy', state: 'paused_conflict' })
+    expect(redis.applyCalls.filter(Boolean)).toHaveLength(deletes)
+  })
 })
 
 describe('legacy leakage Redis adapter', () => {
-  it('deletes both legacy namespaces and rejects unsafe v2 sorted-set members', async () => {
-    const keys = new Map<string, string[]>([
-      ['forge:task:one:history', []],
-      ['forge:task:one:seq', []],
-      ['forge:task-events:v2:one:history', [
-        JSON.stringify({
-          type: 'task:status',
-          data: { errorMessage: null, status: 'running', updatedAt: '2026-07-22T00:00:00.000Z' },
-        }),
-        JSON.stringify({ type: 'run:chunk', data: { delta: 'RAW-DELTA-SENTINEL' } }),
-      ]],
-    ])
+  const TASK_A = '00000000-0000-4000-8000-000000000001'
+  const TASK_B = '00000000-0000-4000-8000-000000000002'
+
+  type RedisCell = Readonly<{ type: string; value?: string; entries?: readonly [string, string][] }>
+
+  function storedEnvelope(id: number, type = 'task:status', data: Record<string, unknown> = {
+    errorMessage: null,
+    status: 'running',
+    updatedAt: '2026-07-22T00:00:00.000Z',
+  }): string {
+    return JSON.stringify({ schemaVersion: 2, id, type, data })
+  }
+
+  function fakeRedisFor(cells: Map<string, RedisCell>, options: Readonly<{
+    duplicate?: boolean
+    loop?: boolean
+    reappearLegacyAfterDelete?: boolean
+    reappearMalformedLegacyAfterDelete?: boolean
+    reappearV2AfterDelete?: boolean
+  }> = {}) {
+    const deleted: string[] = []
     const fakeRedis = {
-      scan: vi.fn(async (_cursor: string, _match: string, pattern: string) => {
+      scan: vi.fn(async (cursor: string, _match: string, pattern: string) => {
+        if (options.loop) return [cursor === '0' ? '7' : '7', []]
         const regex = new RegExp(`^${pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replaceAll('\\*', '.*')}$`)
-        return ['0', [...keys.keys()].filter((key) => regex.test(key))]
+        const matched = [...cells.keys()].filter((key) => regex.test(key))
+        return ['0', options.duplicate ? [...matched, ...matched] : matched]
       }),
-      del: vi.fn(async (...deleted: string[]) => {
+      type: vi.fn(async (key: string) => cells.get(key)?.type ?? 'none'),
+      get: vi.fn(async (key: string) => cells.get(key)?.value ?? null),
+      zscan: vi.fn(async (key: string) => [
+        '0',
+        (cells.get(key)?.entries ?? []).flatMap(([value, score]) => [value, score]),
+      ]),
+      del: vi.fn(async (...keys: string[]) => {
         let count = 0
-        for (const key of deleted) {
-          if (keys.delete(key)) count += 1
+        for (const key of keys) {
+          deleted.push(key)
+          if (cells.delete(key)) count += 1
+        }
+        if (options.reappearLegacyAfterDelete) {
+          cells.set(`forge:task:${TASK_B}:seq`, { type: 'string', value: '3' })
+        }
+        if (options.reappearMalformedLegacyAfterDelete) {
+          cells.set('forge:task:not-a-uuid:history', { type: 'zset' })
+        }
+        if (options.reappearV2AfterDelete) {
+          cells.set(`forge:task-events:v2:${TASK_B}:live`, { type: 'string', value: 'forbidden' })
         }
         return count
       }),
-      zscan: vi.fn(async (key: string) => [
-        '0',
-        (keys.get(key) ?? []).flatMap((value, index) => [value, String(index + 1)]),
-      ]),
     }
+    return { fakeRedis, deleted }
+  }
+
+  function validV2Cells(taskId = TASK_A): Map<string, RedisCell> {
+    return new Map([
+      [`forge:task-events:v2:${taskId}:history`, { type: 'zset', entries: [[storedEnvelope(1), '1']] }],
+      [`forge:task-events:v2:${taskId}:seq`, { type: 'string', value: '1' }],
+    ])
+  }
+
+  it('deletes only exact legacy UUID history/sequence keys after a write-free v2 preflight', async () => {
+    const cells = validV2Cells()
+    cells.set(`forge:task:${TASK_B}:history`, { type: 'zset' })
+    cells.set(`forge:task:${TASK_B}:seq`, { type: 'string', value: '3' })
+    const { fakeRedis, deleted } = fakeRedisFor(cells, { duplicate: true })
     const adapter = createLegacyLeakageRedisAdapter(fakeRedis as never)
 
     const purged = await adapter.purgeLegacyTaskEventKeys({ apply: true })
-    expect(purged).toMatchObject({ complete: true, keysDeleted: 2, remainingKeys: 0 })
-    expect([...keys.keys()]).toEqual(['forge:task-events:v2:one:history'])
+    expect(purged).toMatchObject({ complete: true, keysDeleted: 2, remainingKeys: 0, violations: 0 })
+    expect(new Set(deleted)).toEqual(new Set([
+      `forge:task:${TASK_B}:history`,
+      `forge:task:${TASK_B}:seq`,
+    ]))
+    expect([...cells.keys()].sort()).toEqual([
+      `forge:task-events:v2:${TASK_A}:history`,
+      `forge:task-events:v2:${TASK_A}:seq`,
+    ])
+    const retry = await adapter.purgeLegacyTaskEventKeys({ apply: true })
+    expect(retry).toMatchObject({ keysDeleted: 0, remainingKeys: 0, violations: 0 })
+  })
 
-    const v2 = await adapter.scanV2TaskEventHistory([])
-    expect(v2).toMatchObject({ complete: true, valuesExamined: 2, violations: 1 })
+  it('treats malformed legacy matches as violations and deletes nothing', async () => {
+    const cells = validV2Cells()
+    cells.set('forge:task:not-a-uuid:history', { type: 'zset' })
+    cells.set(`forge:task:${TASK_B}:history:extra`, { type: 'zset' })
+    const { fakeRedis, deleted } = fakeRedisFor(cells)
+    const evidence = await createLegacyLeakageRedisAdapter(fakeRedis as never).purgeLegacyTaskEventKeys({ apply: true })
+    expect(evidence).toMatchObject({ violations: 2, keysDeleted: 0 })
+    expect(deleted).toEqual([])
+  })
+
+  it('exhaustively rejects unknown v2 suffixes, wrong types, malformed sequence, and unsafe envelopes without deletion', async () => {
+    const cases: Array<readonly [string, Map<string, RedisCell>]> = [
+      ['stored live channel', new Map([[`forge:task-events:v2:${TASK_A}:live`, { type: 'string', value: 'x' }]])],
+      ['history wrong type', new Map([[`forge:task-events:v2:${TASK_A}:history`, { type: 'string', value: '1' }]])],
+      ['malformed sequence', new Map([
+        [`forge:task-events:v2:${TASK_A}:history`, { type: 'zset', entries: [[storedEnvelope(1), '1']] }],
+        [`forge:task-events:v2:${TASK_A}:seq`, { type: 'string', value: '01' }],
+      ])],
+      ['invalid envelope', new Map([
+        [`forge:task-events:v2:${TASK_A}:history`, { type: 'zset', entries: [[JSON.stringify({ schemaVersion: 2, id: 1, type: 'run:chunk', data: {} }), '1']] }],
+        [`forge:task-events:v2:${TASK_A}:seq`, { type: 'string', value: '1' }],
+      ])],
+      ['duplicate top-level data', new Map([
+        [`forge:task-events:v2:${TASK_A}:history`, { type: 'zset', entries: [[
+          '{"schemaVersion":2,"id":1,"type":"task:status","data":{},"data":{"errorMessage":null,"status":"running","updatedAt":"2026-07-22T00:00:00.000Z"}}', '1',
+        ]] }],
+        [`forge:task-events:v2:${TASK_A}:seq`, { type: 'string', value: '1' }],
+      ])],
+      ['duplicate nested key', new Map([
+        [`forge:task-events:v2:${TASK_A}:history`, { type: 'zset', entries: [[
+          '{"schemaVersion":2,"id":1,"type":"task:status","data":{"errorMessage":null,"status":"running","updatedAt":"2026-07-22T00:00:00.000Z","nested":{"a":1,"a":2}}}', '1',
+        ]] }],
+        [`forge:task-events:v2:${TASK_A}:seq`, { type: 'string', value: '1' }],
+      ])],
+      ['escaped-equivalent duplicate key hiding a sentinel', new Map([
+        [`forge:task-events:v2:${TASK_A}:history`, { type: 'zset', entries: [[
+          String.raw`{"schemaVersion":2,"id":1,"type":"task:status","data":{"errorMessage":null,"\u0065rrorMessage":"RAW-SENTINEL","status":"running","updatedAt":"2026-07-22T00:00:00.000Z"}}`, '1',
+        ]] }],
+        [`forge:task-events:v2:${TASK_A}:seq`, { type: 'string', value: '1' }],
+      ])],
+      ['score mismatch', new Map([
+        [`forge:task-events:v2:${TASK_A}:history`, { type: 'zset', entries: [[storedEnvelope(2), '1']] }],
+        [`forge:task-events:v2:${TASK_A}:seq`, { type: 'string', value: '2' }],
+      ])],
+      ['non-integral score', new Map([
+        [`forge:task-events:v2:${TASK_A}:history`, { type: 'zset', entries: [[storedEnvelope(1), '1.5']] }],
+        [`forge:task-events:v2:${TASK_A}:seq`, { type: 'string', value: '1' }],
+      ])],
+      ['incomplete pair', new Map([
+        [`forge:task-events:v2:${TASK_A}:seq`, { type: 'string', value: '1' }],
+      ])],
+      ['sequence behind history', new Map([
+        [`forge:task-events:v2:${TASK_A}:history`, { type: 'zset', entries: [[storedEnvelope(2), '2']] }],
+        [`forge:task-events:v2:${TASK_A}:seq`, { type: 'string', value: '1' }],
+      ])],
+    ]
+    for (const [, cells] of cases) {
+      const { fakeRedis, deleted } = fakeRedisFor(cells)
+      const adapter = createLegacyLeakageRedisAdapter(fakeRedis as never)
+      const v2 = await adapter.scanV2TaskEventHistory(['RAW-SENTINEL'])
+      expect(v2.violations).toBeGreaterThan(0)
+      const purge = await adapter.purgeLegacyTaskEventKeys({ apply: true, sentinels: ['RAW-SENTINEL'] })
+      expect(purge.keysDeleted).toBe(0)
+      expect(deleted).toEqual([])
+    }
+  })
+
+  it('detects post-delete v2 drift and cursor loops without a v2 deletion command', async () => {
+    const cells = validV2Cells()
+    cells.set(`forge:task:${TASK_B}:history`, { type: 'zset' })
+    const drift = fakeRedisFor(cells, { reappearV2AfterDelete: true })
+    const adapter = createLegacyLeakageRedisAdapter(drift.fakeRedis as never)
+    const evidence = await adapter.purgeLegacyTaskEventKeys({ apply: true })
+    expect(evidence.violations).toBeGreaterThan(0)
+    expect(drift.deleted).toEqual([`forge:task:${TASK_B}:history`])
+    expect(drift.deleted.every((key) => !key.startsWith('forge:task-events:v2:'))).toBe(true)
+
+    const loop = fakeRedisFor(validV2Cells(), { loop: true })
+    const loopEvidence = await createLegacyLeakageRedisAdapter(loop.fakeRedis as never).scanV2TaskEventHistory([])
+    expect(loopEvidence.complete).toBe(false)
+    expect(loop.deleted).toEqual([])
+
+    const reappeared = fakeRedisFor(new Map([
+      [`forge:task:${TASK_B}:history`, { type: 'zset' }],
+    ]), { reappearLegacyAfterDelete: true })
+    const reappearedEvidence = await createLegacyLeakageRedisAdapter(reappeared.fakeRedis as never)
+      .purgeLegacyTaskEventKeys({ apply: true })
+    expect(reappearedEvidence.remainingKeys).toBeGreaterThan(0)
+
+    const malformedReappeared = fakeRedisFor(new Map([
+      [`forge:task:${TASK_B}:history`, { type: 'zset' }],
+    ]), { reappearMalformedLegacyAfterDelete: true })
+    const malformedEvidence = await createLegacyLeakageRedisAdapter(malformedReappeared.fakeRedis as never)
+      .purgeLegacyTaskEventKeys({ apply: true })
+    expect(malformedEvidence).toMatchObject({ remainingKeys: 0, violations: 1 })
+  })
+
+  it('detects decoded duplicate JSON keys at every object level without conflating sibling objects', () => {
+    expect(scanJsonObjectKeys('{"data":{},"data":{}}')).toBe('duplicate-key')
+    expect(scanJsonObjectKeys('{"outer":{"key":1,"key":2}}')).toBe('duplicate-key')
+    expect(scanJsonObjectKeys(String.raw`{"data":{},"\u0064ata":{}}`)).toBe('duplicate-key')
+    expect(scanJsonObjectKeys('{"left":{"key":1},"right":{"key":2}}')).toBe('valid')
+    expect(scanJsonObjectKeys('{')).toBe('invalid')
+    expect(scanJsonObjectKeys(`${'{'.repeat(130)}${'}'.repeat(130)}`)).toBe('invalid')
   })
 })
 
@@ -830,8 +1038,8 @@ describe('legacy leakage CLI and operator guide', () => {
 artifacts; work_packages; approval_gates; and the operation-scoped app_settings
 checkpoint key (${LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX}<operation-id>).`
     const redisBoundaries = `Redis is separate: apply/resume purge only legacy forge:task:*:history and
-forge:task:*:seq keys and scan (but never delete) v2
-forge:task-events:v2:*:history values.`
+forge:task:*:seq keys and exhaustively validate (but never delete) stored v2
+forge:task-events:v2:* keys.`
     const runbookInventoryStart = runbook.indexOf('The command has one closed database mutation inventory.')
     const runbookRedisStart = runbook.indexOf('Redis is a separate boundary, not part of that database inventory.')
     expect(runbookInventoryStart).toBeGreaterThan(-1)

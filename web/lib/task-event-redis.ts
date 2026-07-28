@@ -28,6 +28,28 @@ export function taskEventRedisKeys(taskId: string): Readonly<{
 }
 
 export const TASK_EVENT_V2_LIVE_PATTERN = 'forge:task-events:v2:*:live'
+export const LEGACY_TASK_EVENT_STORAGE_PATTERN = 'forge:task:*'
+export const TASK_EVENT_V2_STORAGE_PATTERN = 'forge:task-events:v2:*'
+
+export type TaskEventStorageKey = Readonly<{
+  taskId: string
+  kind: 'history' | 'seq'
+}>
+
+const TASK_EVENT_STORAGE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+/** Exact storage-key classifiers shared by the task-event runtime and scrubber. */
+export function parseLegacyTaskEventStorageKey(key: string): TaskEventStorageKey | null {
+  const match = /^forge:task:([0-9a-f-]+):(history|seq)$/.exec(key)
+  if (!match || !TASK_EVENT_STORAGE_UUID.test(match[1])) return null
+  return { taskId: match[1], kind: match[2] as TaskEventStorageKey['kind'] }
+}
+
+export function parseV2TaskEventStorageKey(key: string): TaskEventStorageKey | null {
+  const match = /^forge:task-events:v2:([0-9a-f-]+):(history|seq)$/.exec(key)
+  if (!match || !TASK_EVENT_STORAGE_UUID.test(match[1])) return null
+  return { taskId: match[1], kind: match[2] as TaskEventStorageKey['kind'] }
+}
 
 export function taskIdFromTaskEventLiveChannel(channel: string): string | null {
   const match = /^forge:task-events:v2:([^:]+):live$/.exec(channel)

@@ -5,15 +5,18 @@ import {
   isUnknownLegacyDigest,
   sanitizeSensitivePayload,
 } from '@/lib/mcps/leakage-drain'
+import {
+  LEGACY_TASK_EVENT_STORAGE_PATTERN,
+  TASK_EVENT_V2_STORAGE_PATTERN,
+} from '@/lib/task-event-redis'
 
 export const LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX = 'epic172:s4:legacy-leakage-scrub:v1:'
 export const LEGACY_LEAKAGE_SCRUB_FINGERPRINT_DOMAIN = 'forge:legacy-leakage-scrub:fingerprint:v2\0'
 export const LEGACY_LEAKAGE_SCRUB_SENTINEL_DOMAIN = 'forge:legacy-leakage-scrub:sentinels:v2\0'
 export const LEGACY_TASK_EVENT_PATTERNS = [
-  'forge:task:*:history',
-  'forge:task:*:seq',
+  LEGACY_TASK_EVENT_STORAGE_PATTERN,
 ] as const
-export const V2_TASK_EVENT_HISTORY_PATTERN = 'forge:task-events:v2:*:history'
+export const V2_TASK_EVENT_HISTORY_PATTERN = TASK_EVENT_V2_STORAGE_PATTERN
 
 /** The complete, closed set of durable database fields this scrub may inspect or change. */
 export const LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY = {
@@ -146,7 +149,7 @@ export interface LegacyLeakageScrubDatabase {
 }
 
 export interface LegacyLeakageScrubRedis {
-  purgeLegacyTaskEventKeys(options: Readonly<{ apply: boolean }>): Promise<RedisScanEvidence>
+  purgeLegacyTaskEventKeys(options: Readonly<{ apply: boolean; sentinels?: readonly string[] }>): Promise<RedisScanEvidence>
   scanV2TaskEventHistory(sentinels: readonly string[]): Promise<RedisScanEvidence>
 }
 
@@ -615,6 +618,7 @@ function zeroScanPassed(evidence: Awaited<ReturnType<typeof finalZeroScan>>): bo
     && evidence.database.violations === 0
     && evidence.legacy.complete
     && evidence.legacy.remainingKeys === 0
+    && evidence.legacy.violations === 0
     && evidence.v2.complete
     && evidence.v2.violations === 0
 }
@@ -760,8 +764,21 @@ export async function runLegacyLeakageScrub(
 
     if (phase === 'redis_legacy') {
       batches += 1
-      const evidence = await dependencies.redis.purgeLegacyTaskEventKeys({ apply: true })
-      if (!evidence.complete || evidence.remainingKeys !== 0) {
+      // A complete, write-free legacy and v2 preflight must finish before any
+      // legacy deletion. The adapter repeats this boundary immediately before
+      // deletion to close a scan-to-delete race without ever touching v2 keys.
+      const legacyPreflight = await dependencies.redis.purgeLegacyTaskEventKeys({ apply: false })
+      const v2Preflight = await dependencies.redis.scanV2TaskEventHistory(sentinels)
+      if (!legacyPreflight.complete || legacyPreflight.violations > 0 || !v2Preflight.complete || v2Preflight.violations > 0) {
+        const paused = await moveCheckpoint(dependencies.database, current, {
+          state: 'paused_conflict',
+          redisKeysExamined: current.checkpoint.redisKeysExamined + legacyPreflight.keysExamined,
+          redisV2ValuesExamined: current.checkpoint.redisV2ValuesExamined + v2Preflight.valuesExamined,
+        })
+        return { checkpoint: paused.checkpoint, dryRun: false, preview: null }
+      }
+      const evidence = await dependencies.redis.purgeLegacyTaskEventKeys({ apply: true, sentinels })
+      if (!evidence.complete || evidence.violations > 0 || evidence.remainingKeys !== 0) {
         current = await moveCheckpoint(dependencies.database, current, {
           state: 'paused_conflict',
           redisKeysExamined: current.checkpoint.redisKeysExamined + evidence.keysExamined,
@@ -783,7 +800,7 @@ export async function runLegacyLeakageScrub(
       const passed = zeroScanPassed(final)
       const retryPhase: LegacyLeakageScrubPhase = !final.database.complete || final.database.violations > 0
         ? 'task_logs'
-        : !final.legacy.complete || final.legacy.remainingKeys > 0
+        : !final.legacy.complete || final.legacy.remainingKeys > 0 || final.legacy.violations > 0
           ? 'redis_legacy'
           : 'redis_v2_verify'
       current = await moveCheckpoint(dependencies.database, current, {
