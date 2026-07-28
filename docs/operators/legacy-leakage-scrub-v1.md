@@ -27,10 +27,16 @@ CI output.
   ```bash
   umask 077
   key_file="$(mktemp)"
-  openssl rand 32 >"$key_file"
-  # Import the bytes into the deployment secret store; do not cat the file.
-  rm -f "$key_file"
+  openssl rand -hex 32 >"$key_file"
+  # Import the accepted text directly from the protected file; never cat or echo it.
+  export FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY="$(<"$key_file")"
+  rm -f -- "$key_file"
   ```
+
+  The parser decodes exactly 32 bytes: this example produces the accepted
+  64-character hexadecimal form. Keep the file private until it is imported
+  into the deployment secret store or the operator's private command
+  environment.
 
 - `FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID` — a bounded, non-secret
   label for that key. It must start with a letter or digit and contain only
@@ -42,14 +48,22 @@ stored in a checkpoint and is never printed by the command.
 
 ## What is scrubbed and what remains authoritative
 
-The command has a closed database policy. It may inspect and update only:
+The command has one closed database mutation inventory. It may inspect and
+update only:
 
 - `task_logs.message`, `task_logs.front_matter`, and `task_logs.metadata`;
-- legacy `artifacts.content` and `artifacts.metadata`;
-- `work_packages.metadata` and `approval_gates.metadata`;
-- legacy Redis keys matching `forge:task:*:history` and `forge:task:*:seq`;
-- v2 Redis history values matching `forge:task-events:v2:*:history`, which are
-  scanned against their fixed event schema and sentinel set.
+- eligible, unversioned legacy Architect `artifacts.content` and
+  `artifacts.metadata` only;
+- `work_packages.metadata`;
+- `approval_gates.metadata`; and
+- the operation-scoped `app_settings` checkpoint key at
+  `epic172:s4:legacy-leakage-scrub:v1:<operation-id>`.
+
+Redis is a separate boundary, not part of that database inventory. Apply and
+resume purge only legacy keys matching `forge:task:*:history` and
+`forge:task:*:seq`. They separately scan v2 history values matching
+`forge:task-events:v2:*:history` against the fixed event schema and sentinel
+set; this command does not delete v2 history.
 
 The corresponding current v2 history key shape is
 `forge:task-events:v2:{taskId}:history`.

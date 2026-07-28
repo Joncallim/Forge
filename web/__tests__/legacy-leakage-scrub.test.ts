@@ -8,6 +8,7 @@ import {
   containsForbiddenV2EventData,
   compareCanonicalCodeUnits,
   LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY,
+  LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX,
   legacyLeakageRowFingerprint,
   legacyLeakageSentinelSetFingerprint,
   projectV2TaskEventData,
@@ -819,6 +820,49 @@ describe('legacy leakage CLI and operator guide', () => {
     expect(commandSource).toContain('FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY_ID')
     expect(commandSource).not.toContain('createHash')
     expect(commandSource).not.toContain('historyAvailable":true')
+  })
+
+  it('keeps the accepted textual key generator and complete destructive inventory closed across policy, runbook, and help', async () => {
+    const runbook = await readFile('../docs/operators/legacy-leakage-scrub-v1.md', 'utf8')
+    const commandSource = await readFile('scripts/scrub-legacy-leakage.ts', 'utf8')
+    const databaseInventory = [
+      'task_logs',
+      'eligible, unversioned legacy Architect',
+      'artifacts',
+      'work_packages',
+      'approval_gates',
+      'app_settings',
+    ]
+    const redisBoundaries = [
+      'forge:task:*:history',
+      'forge:task:*:seq',
+      'forge:task-events:v2:*:history',
+    ]
+
+    expect(Object.keys(LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY)).toEqual([
+      'task_logs', 'artifacts', 'work_packages', 'approval_gates', 'retainedAuthorities',
+    ])
+    expect(runbook).toContain('openssl rand -hex 32 >"$key_file"')
+    expect(runbook).toContain('export FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY="$(<"$key_file")"')
+    expect(runbook).not.toContain('openssl rand 32')
+    for (const item of databaseInventory) {
+      expect(runbook).toContain(item)
+      expect(commandSource).toContain(item)
+    }
+    expect(runbook).toContain(`${LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX}<operation-id>`)
+    expect(commandSource).toContain('LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX')
+    for (const boundary of redisBoundaries) {
+      expect(runbook).toContain(boundary)
+      expect(commandSource).toContain(boundary)
+    }
+    expect(commandSource).toContain('scan (but never delete) v2')
+    expect(LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY).toEqual({
+      task_logs: expect.objectContaining({ updated: ['message', 'front_matter', 'metadata'] }),
+      artifacts: expect.objectContaining({ updated: ['content', 'metadata'] }),
+      work_packages: expect.objectContaining({ updated: ['metadata'] }),
+      approval_gates: expect.objectContaining({ updated: ['metadata'] }),
+      retainedAuthorities: expect.any(Array),
+    })
   })
 
   it('keeps the PostgreSQL adapter selection and mutation surface aligned with the closed policy', async () => {

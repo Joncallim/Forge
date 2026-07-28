@@ -71,9 +71,13 @@ Options:
   --max-batches N      Phase batches processed per invocation (default 10, maximum 1000)
   --sentinel TEXT      Fail the v2 Redis scan if TEXT appears; may be repeated
 
-Apply and resume mutate only task_logs, artifacts, work_packages, the operation
-checkpoint in app_settings, and legacy forge:task:{taskId}:history/:seq Redis
-keys. Protected Architect plan entries are never selected or updated.
+Database mutation inventory: task_logs; eligible, unversioned legacy Architect
+artifacts; work_packages; approval_gates; and the operation-scoped app_settings
+checkpoint key (${LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX}<operation-id>).
+Redis is separate: apply/resume purge only legacy forge:task:*:history and
+forge:task:*:seq keys and scan (but never delete) v2
+forge:task-events:v2:*:history values. Protected Architect plan entries are
+never selected or updated.
 
 Environment:
   FORGE_DATABASE_ADMIN_URL  privileged PostgreSQL connection for the scrub
