@@ -1520,6 +1520,130 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
     await expect(claimLossQueue.ack(exactReplay.raw)).rejects.toThrow('Queue transition failed')
     await expect(claimLossQueue.ack(exactReplay.raw)).resolves.toBe('already_applied')
 
+    type RenewableQueue = {
+      ack: (raw: string) => Promise<'already_applied' | 'applied'>
+      claim: (timeoutSeconds: number) => Promise<{
+        job: TaskJob | ApprovalJob | AnswersJob
+        occurrenceId: string
+        raw: string
+      } | null>
+      recoverStuckJobs: (staleMs: number) => Promise<number>
+      renewClaim: (raw: string) => Promise<'renewed' | 'stale_not_owner'>
+    }
+    const renewalCases = [
+      {
+        ackReceipts: 'forge:tasks:ack-receipts',
+        claims: 'forge:tasks:claims',
+        create: () => queue() as unknown as RenewableQueue,
+        job: { taskId: TASK_ID, attempt: 11 },
+        processing: 'forge:tasks:processing',
+        ready: 'forge:tasks',
+      },
+      {
+        ackReceipts: 'forge:approvals:ack-receipts',
+        claims: 'forge:approvals:claims',
+        create: () => approvalQueue() as unknown as RenewableQueue,
+        job: { taskId: TASK_ID, action: 'approve', attempt: 11 },
+        processing: 'forge:approvals:processing',
+        ready: 'forge:approvals',
+      },
+      {
+        ackReceipts: 'forge:answers:ack-receipts',
+        claims: 'forge:answers:claims',
+        create: () => answersQueue() as unknown as RenewableQueue,
+        job: { taskId: TASK_ID, attempt: 11 },
+        processing: 'forge:answers:processing',
+        ready: 'forge:answers',
+      },
+    ]
+    const renewalStaleMs = 1_000
+    for (const renewalCase of renewalCases) {
+      await admin.del(...QUEUE_KEYS)
+      const owner = renewalCase.create()
+      const recovery = renewalCase.create()
+      await admin.lpush(renewalCase.ready, JSON.stringify(renewalCase.job))
+      const claimed = await owner.claim(1)
+      if (!claimed) throw new Error('Queue Redis renewal proof could not claim its job.')
+      const originalMarker = await admin.hget(renewalCase.claims, claimed.occurrenceId)
+      if (!originalMarker) throw new Error('Queue Redis renewal proof has no claim marker.')
+      const originalNonce = originalMarker.split(':')[1]
+      const originalTimestamp = Number(originalMarker.split(':')[0])
+      await admin.hset(
+        renewalCase.claims,
+        claimed.occurrenceId,
+        `${originalTimestamp - 2_000}:${originalNonce}`,
+      )
+
+      const ownerClient = (owner as unknown as { client: Redis }).client
+      const originalOwnerCall = ownerClient.call.bind(ownerClient)
+      let loseRenewalResponse = true
+      const renewalCall = vi.spyOn(ownerClient, 'call').mockImplementation(
+        async (...args: Parameters<Redis['call']>) => {
+          const result = await originalOwnerCall(...args)
+          if (loseRenewalResponse && String(args[1]).includes('forge:queue:renew-claim-v1')) {
+            loseRenewalResponse = false
+            throw new Error('simulated response loss')
+          }
+          return result
+        },
+      )
+      await expect(owner.renewClaim(claimed.raw)).rejects.toThrow('Queue claim renewal failed')
+      const responseLossMarker = await admin.hget(
+        renewalCase.claims,
+        claimed.occurrenceId,
+      )
+      if (!responseLossMarker) throw new Error('Queue Redis renewal response was not applied.')
+      expect(responseLossMarker.split(':')[1]).toBe(originalNonce)
+      await expect(owner.renewClaim(claimed.raw)).resolves.toBe('renewed')
+      const renewedMarker = await admin.hget(renewalCase.claims, claimed.occurrenceId)
+      if (!renewedMarker) throw new Error('Queue Redis renewed marker is unavailable.')
+      expect(renewedMarker.split(':')[1]).toBe(originalNonce)
+      expect(Number(renewedMarker.split(':')[0])).toBeGreaterThan(originalTimestamp - 2_000)
+      expect(await recovery.recoverStuckJobs(renewalStaleMs)).toBe(0)
+      await expect(recovery.renewClaim(claimed.raw))
+        .rejects.toThrow('Queue transition ownership mismatch')
+
+      expect(await admin.lrem(renewalCase.processing, 1, claimed.raw)).toBe(1)
+      await expect(owner.renewClaim(claimed.raw)).resolves.toBe('stale_not_owner')
+      await admin.lpush(renewalCase.processing, claimed.raw)
+      await admin.hset(
+        renewalCase.claims,
+        claimed.occurrenceId,
+        `${await redisTimeMs()}:malformed`,
+      )
+      await expect(owner.renewClaim(claimed.raw)).rejects.toThrow('Queue claim renewal failed')
+      await admin.hset(renewalCase.claims, claimed.occurrenceId, renewedMarker)
+
+      const renewedAt = Number(renewedMarker.split(':')[0])
+      const ageDeadline = Date.now() + 5_000
+      while (await redisTimeMs() - renewedAt < renewalStaleMs) {
+        if (Date.now() >= ageDeadline) {
+          throw new Error('Queue Redis renewal proof did not reach the lease boundary.')
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      expect(await recovery.recoverStuckJobs(renewalStaleMs)).toBe(1)
+      expect(await admin.lrange(renewalCase.ready, 0, -1)).toEqual([claimed.raw])
+      await expect(owner.renewClaim(claimed.raw)).resolves.toBe('stale_not_owner')
+      await expect(owner.ack(claimed.raw)).rejects.toThrow('Queue transition stale_not_owner')
+
+      const nextOwner = await recovery.claim(1)
+      if (!nextOwner) throw new Error('Queue Redis renewal proof could not reclaim its job.')
+      expect(nextOwner.occurrenceId).toBe(claimed.occurrenceId)
+      const nextMarker = await admin.hget(renewalCase.claims, nextOwner.occurrenceId)
+      if (!nextMarker) throw new Error('Queue Redis renewal proof has no later-owner marker.')
+      await expect(recovery.renewClaim(nextOwner.raw)).resolves.toBe('renewed')
+      await expect(recovery.renewClaim(nextOwner.raw)).resolves.toBe('renewed')
+      await expect(recovery.ack(nextOwner.raw)).resolves.toBe('applied')
+      expect(await admin.zrange(renewalCase.ackReceipts, 0, -1)).toContain(
+        `${nextOwner.occurrenceId}:${nextMarker.split(':')[1]}`,
+      )
+      expect(await admin.zrange(renewalCase.ackReceipts, 0, -1)).not.toContain(
+        `${claimed.occurrenceId}:${originalNonce}`,
+      )
+      renewalCall.mockRestore()
+    }
+
     const markerCases = [
       '0:11111111-1111-4111-8111-111111111111',
       '9007199254740992:11111111-1111-4111-8111-111111111111',
@@ -1637,6 +1761,25 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
       expect(await admin.llen('forge:tasks:processing')).toBe(1)
       expect(await admin.hlen('forge:tasks:claims')).toBe(1)
       await vi.waitFor(() => expect(processTask).toHaveBeenCalledOnce(), { timeout: 10_000 })
+      const [activeOccurrenceId] = await admin.hkeys('forge:tasks:claims')
+      const initialLiveMarker = await admin.hget('forge:tasks:claims', activeOccurrenceId)
+      if (!initialLiveMarker) throw new Error('Queue heartbeat proof has no live claim marker.')
+      const initialLiveTimestamp = Number(initialLiveMarker.split(':')[0])
+      const liveNonce = initialLiveMarker.split(':')[1]
+      const heartbeatDeadline = Date.now() + 5_000
+      let renewedLiveMarker = initialLiveMarker
+      while (Number(renewedLiveMarker.split(':')[0]) <= initialLiveTimestamp
+        || await redisTimeMs() - initialLiveTimestamp <= 500) {
+        if (Date.now() >= heartbeatDeadline) {
+          throw new Error('Queue heartbeat proof did not renew its live claim.')
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        renewedLiveMarker = await admin.hget('forge:tasks:claims', activeOccurrenceId)
+          ?? initialLiveMarker
+      }
+      expect(renewedLiveMarker.split(':')[1]).toBe(liveNonce)
+      expect(await queue().recoverStuckJobs(500)).toBe(0)
+      expect(processTask).toHaveBeenCalledOnce()
       const stop = handle.stop()
       expect(await admin.llen('forge:tasks:processing')).toBe(1)
       expect(await admin.hlen('forge:tasks:claims')).toBe(1)

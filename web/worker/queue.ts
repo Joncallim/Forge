@@ -60,6 +60,8 @@ type QueueEnvelope<TJob> = {
 
 export type QueueTransitionOutcome = 'applied' | 'already_applied'
 
+export type QueueClaimRenewalResult = 'renewed' | 'stale_not_owner'
+
 export type QueueRetryResult = {
   outcome: QueueTransitionOutcome
   nextRetryAt: Date
@@ -146,6 +148,16 @@ local function redis_now_ms()
 end
 local function valid_uuid(value)
   return type(value) == 'string' and string.match(value, claim_uuid_pattern) ~= nil
+end
+local function marker_nonce(marker)
+  if type(marker) ~= 'string' then
+    return nil
+  end
+  local _, nonce = string.match(marker, '^([1-9][0-9]*):([^:]+)$')
+  if not valid_uuid(nonce) then
+    return nil
+  end
+  return nonce
 end
 local function valid_marker(marker, now_ms)
   if type(marker) ~= 'string' then
@@ -234,6 +246,32 @@ redis.call('HSET', KEYS[2], ARGV[3], marker)
 return marker
 `
 
+const RENEW_CLAIM_SCRIPT = `
+-- forge:queue:renew-claim-v1
+${LUA_TYPE_HELPER}
+${LUA_MARKER_HELPERS}
+assert_type(KEYS[1], 'list')
+assert_type(KEYS[2], 'hash')
+local now_ms = redis_now_ms()
+local current_marker = redis.call('HGET', KEYS[2], ARGV[2])
+if current_marker and not valid_marker(current_marker, now_ms) then
+  error('forge_queue_claim_marker_invalid')
+end
+if not valid_marker(ARGV[3], now_ms) then
+  error('forge_queue_claim_marker_invalid')
+end
+if not redis.call('LPOS', KEYS[1], ARGV[1]) or not current_marker then
+  return 0
+end
+local current_nonce = marker_nonce(current_marker)
+local caller_nonce = marker_nonce(ARGV[3])
+if not current_nonce or current_nonce ~= caller_nonce then
+  return 0
+end
+redis.call('HSET', KEYS[2], ARGV[2], tostring(now_ms) .. ':' .. current_nonce)
+return 1
+`
+
 const ACK_JOB_SCRIPT = `
 -- forge:queue:ack-v3
 ${LUA_TYPE_HELPER}
@@ -253,7 +291,7 @@ end
 local receipt = receipt_member(ARGV[2], ARGV[3])
 prune_receipts(KEYS[3], now_ms, tonumber(ARGV[4]), tonumber(ARGV[6]))
 if redis.call('LPOS', KEYS[1], ARGV[1]) then
-  if current_marker ~= ARGV[3] then
+  if marker_nonce(current_marker) ~= marker_nonce(ARGV[3]) then
     return 0
   end
   require_receipt_capacity(KEYS[3], tonumber(ARGV[5]))
@@ -290,7 +328,7 @@ end
 local receipt = receipt_member(ARGV[2], ARGV[3])
 prune_receipts(KEYS[4], now_ms, tonumber(ARGV[4]), tonumber(ARGV[6]))
 if redis.call('LPOS', KEYS[1], ARGV[1]) then
-  if current_marker ~= ARGV[3] then
+  if marker_nonce(current_marker) ~= marker_nonce(ARGV[3]) then
     return 0
   end
   require_receipt_capacity(KEYS[4], tonumber(ARGV[5]))
@@ -349,7 +387,7 @@ if not valid_marker(ARGV[3], now_ms) then
   error('forge_queue_claim_marker_invalid')
 end
 if redis.call('LPOS', KEYS[1], ARGV[1]) then
-  if current_marker ~= ARGV[3] then
+  if marker_nonce(current_marker) ~= marker_nonce(ARGV[3]) then
     return {0, ''}
   end
   if redis.call('ZSCORE', KEYS[3], ARGV[5]) then
@@ -393,7 +431,7 @@ if not valid_marker(ARGV[3], now_ms) then
   error('forge_queue_claim_marker_invalid')
 end
 if redis.call('LPOS', KEYS[1], ARGV[1]) then
-  if current_marker ~= ARGV[3] then
+  if marker_nonce(current_marker) ~= marker_nonce(ARGV[3]) then
     return 0
   end
   if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then
@@ -1021,6 +1059,19 @@ abstract class RedisListQueue<TJob extends RetryableJob> {
         String(TRANSITION_RECEIPT_PRUNE_LIMIT),
       ],
     )
+  }
+
+  async renewClaim(raw: string): Promise<QueueClaimRenewalResult> {
+    const active = this.activeClaim(raw)
+    const result = await this.evalClosed(
+      'Queue claim renewal failed',
+      RENEW_CLAIM_SCRIPT,
+      [this.processingQueueKey, this.claimsKey],
+      [active.raw, active.occurrenceId, active.marker],
+    )
+    if (result === 1) return 'renewed'
+    if (result === 0) return 'stale_not_owner'
+    throw new Error('Queue claim renewal returned an invalid result')
   }
 
   async release(raw: string): Promise<QueueTransitionOutcome> {

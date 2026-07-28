@@ -1,12 +1,13 @@
 import { sanitizeWorkerMessage } from './redaction'
 import { defaultOnFeatureFlagState, explicitOptInFeatureFlagEnabled } from './feature-flags'
 import { hostRepositoryWritePolicyState } from './repository-edit-policy'
-import type { QueueRetryResult } from './queue'
+import type { QueueClaimRenewalResult, QueueRetryResult } from './queue'
 
 const DEFAULT_CLAIM_TIMEOUT_SECONDS = 5
 const APPROVAL_CLAIM_TIMEOUT_SECONDS = 1
 const DEFAULT_MAX_ATTEMPTS = 3
 const DEFAULT_STUCK_JOB_RECOVERY_SECONDS = 15 * 60
+const MIN_CLAIM_RENEWAL_INTERVAL_MS = 100
 const MAX_QUEUE_RECOVERY_INTERVAL_MS = 60_000
 const DEFAULT_PROVIDER_HEALTH_INTERVAL_SECONDS = 5 * 60
 const DEFAULT_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS = 5 * 60
@@ -124,6 +125,10 @@ async function startWorkerOnce(
   const stuckJobRecoveryMs =
     getPositiveIntegerEnv('FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS', DEFAULT_STUCK_JOB_RECOVERY_SECONDS) *
     1000
+  const claimRenewalIntervalMs = Math.max(
+    MIN_CLAIM_RENEWAL_INTERVAL_MS,
+    Math.min(MAX_QUEUE_RECOVERY_INTERVAL_MS, Math.floor(stuckJobRecoveryMs / 3)),
+  )
   const providerHealthIntervalSeconds = getNonNegativeIntegerEnv(
     'FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS',
     DEFAULT_PROVIDER_HEALTH_INTERVAL_SECONDS,
@@ -164,12 +169,15 @@ async function startWorkerOnce(
     ack: (raw: string) => Promise<unknown>
     deadLetter: (raw: string, job: TJob) => Promise<unknown>
     release: (raw: string) => Promise<unknown>
+    renewClaim: (raw: string) => Promise<QueueClaimRenewalResult>
     retry: (raw: string, job: TJob, delayMs: number) => Promise<QueueRetryResult>
   }
   type QueueOperation = 'approval' | 'answers' | 'task'
   type QueueInfrastructurePhase =
     | 'ack_after_success'
     | 'ack_missing_task'
+    | 'claim_renewal_initial'
+    | 'claim_renewal_periodic'
     | 'dead_letter'
     | 'release_after_shutdown'
     | 'retry'
@@ -231,6 +239,55 @@ async function startWorkerOnce(
     }
   }
 
+  const startClaimRenewal = async <TJob extends RuntimeJob>(input: {
+    claimed: { job: TJob; raw: string }
+    queue: RuntimeQueue<TJob>
+    queueName: QueueOperation
+  }): Promise<{ stop: () => Promise<void> } | null> => {
+    const { claimed, queue, queueName } = input
+    let stopped = false
+    let timer: ReturnType<typeof setInterval> | null = null
+    let inFlight: Promise<boolean> | null = null
+
+    const renew = async (
+      phase: 'claim_renewal_initial' | 'claim_renewal_periodic',
+    ): Promise<boolean> => {
+      try {
+        if (await queue.renewClaim(claimed.raw) === 'renewed') return true
+      } catch {
+        // The fixed diagnostic below is the only operational output from a renewal failure.
+      }
+      logQueueInfrastructureFailure(phase, queueName, claimed.job.taskId)
+      return false
+    }
+
+    if (!await renew('claim_renewal_initial')) return null
+
+    const tick = (): void => {
+      if (stopped || inFlight) return
+      const current = renew('claim_renewal_periodic')
+      inFlight = current
+      void current.finally(() => {
+        if (inFlight === current) inFlight = null
+      })
+    }
+    timer = setInterval(tick, claimRenewalIntervalMs)
+
+    return {
+      stop: async (): Promise<void> => {
+        if (!stopped) {
+          stopped = true
+          if (timer) {
+            clearInterval(timer)
+            timer = null
+          }
+        }
+        const pending = inFlight
+        if (pending) await pending
+      },
+    }
+  }
+
   const processClaimedJob = async <TJob extends RuntimeJob>(input: {
     attemptQueueName: 'answers' | 'approvals' | 'tasks'
     claimed: { job: TJob; raw: string }
@@ -241,41 +298,41 @@ async function startWorkerOnce(
     const { claimed, queue, queueName } = input
     const { job, raw } = claimed
     const finalAttempt = job.attempt >= maxAttempts
-
-    const missingTaskDisposition = await acknowledgeMissingTaskJob(
-      queueName,
-      job.taskId,
-      () => queue.ack(raw),
-    )
-    if (missingTaskDisposition !== 'present') return
-
-    let attemptId: string
-    try {
-      attemptId = await startTaskAttempt({
-        attemptNumber: job.attempt,
-        jobPayload: job,
-        queueName: input.attemptQueueName,
-        taskId: job.taskId,
-        workerId,
-      })
-    } catch {
-      logAttemptInfrastructureFailure('start', queueName, job.taskId)
-      return
+    const claimRenewal = await startClaimRenewal({ claimed, queue, queueName })
+    if (!claimRenewal) return
+    let claimRenewalStopped = false
+    const stopClaimRenewal = async (): Promise<void> => {
+      if (claimRenewalStopped) return
+      claimRenewalStopped = true
+      await claimRenewal.stop()
     }
 
-    console.info('[worker] Processing job', {
-      attempt: job.attempt,
-      finalAttempt,
-      queueName,
-      taskId: job.taskId,
-      workerId,
-    })
-
     try {
-      await input.processBusiness(finalAttempt)
-    } catch (err) {
-      const message = retainedErrorMessage(err)
-      console.error('[worker] Job processing failed', {
+      const missingTaskDisposition = await acknowledgeMissingTaskJob(
+        queueName,
+        job.taskId,
+        async () => {
+          await stopClaimRenewal()
+          return queue.ack(raw)
+        },
+      )
+      if (missingTaskDisposition !== 'present') return
+
+      let attemptId: string
+      try {
+        attemptId = await startTaskAttempt({
+          attemptNumber: job.attempt,
+          jobPayload: job,
+          queueName: input.attemptQueueName,
+          taskId: job.taskId,
+          workerId,
+        })
+      } catch {
+        logAttemptInfrastructureFailure('start', queueName, job.taskId)
+        return
+      }
+
+      console.info('[worker] Processing job', {
         attempt: job.attempt,
         finalAttempt,
         queueName,
@@ -283,70 +340,88 @@ async function startWorkerOnce(
         workerId,
       })
 
-      if (finalAttempt) {
-        try {
-          await finishTaskAttempt({
-            attemptId,
-            errorMessage: message,
-            nextRetryAt: null,
-            status: 'dead_lettered',
-          })
-        } catch {
-          logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
-        }
-        try {
-          await queue.deadLetter(raw, job)
-        } catch {
-          logQueueInfrastructureFailure('dead_letter', queueName, job.taskId)
-        }
-        return
-      }
-
-      const retryDelayMs = backoffDelayMs(job.attempt)
-      let retryResult: QueueRetryResult
       try {
-        retryResult = await queue.retry(raw, job, retryDelayMs)
-      } catch {
-        logQueueInfrastructureFailure('retry', queueName, job.taskId)
-        try {
-          retryResult = await queue.retry(raw, job, retryDelayMs)
-        } catch {
-          logQueueInfrastructureFailure('retry_reconciliation', queueName, job.taskId)
+        await input.processBusiness(finalAttempt)
+      } catch (err) {
+        const message = retainedErrorMessage(err)
+        console.error('[worker] Job processing failed', {
+          attempt: job.attempt,
+          finalAttempt,
+          queueName,
+          taskId: job.taskId,
+          workerId,
+        })
+
+        if (finalAttempt) {
           try {
             await finishTaskAttempt({
               attemptId,
               errorMessage: message,
               nextRetryAt: null,
-              status: 'indeterminate',
+              status: 'dead_lettered',
             })
           } catch {
             logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
           }
+          await stopClaimRenewal()
+          try {
+            await queue.deadLetter(raw, job)
+          } catch {
+            logQueueInfrastructureFailure('dead_letter', queueName, job.taskId)
+          }
           return
         }
-      }
-      try {
-        await finishTaskAttempt({
-          attemptId,
-          errorMessage: message,
-          nextRetryAt: retryResult.nextRetryAt,
-          status: 'failed',
-        })
-      } catch {
-        logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
-      }
-      return
-    }
 
-    try {
-      await finishTaskAttempt({ attemptId, status: 'completed' })
-    } catch {
-      logAttemptInfrastructureFailure('finish_after_success', queueName, job.taskId)
-    }
-    try {
-      await queue.ack(raw)
-    } catch {
-      logQueueInfrastructureFailure('ack_after_success', queueName, job.taskId)
+        const retryDelayMs = backoffDelayMs(job.attempt)
+        await stopClaimRenewal()
+        let retryResult: QueueRetryResult
+        try {
+          retryResult = await queue.retry(raw, job, retryDelayMs)
+        } catch {
+          logQueueInfrastructureFailure('retry', queueName, job.taskId)
+          try {
+            retryResult = await queue.retry(raw, job, retryDelayMs)
+          } catch {
+            logQueueInfrastructureFailure('retry_reconciliation', queueName, job.taskId)
+            try {
+              await finishTaskAttempt({
+                attemptId,
+                errorMessage: message,
+                nextRetryAt: null,
+                status: 'indeterminate',
+              })
+            } catch {
+              logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
+            }
+            return
+          }
+        }
+        try {
+          await finishTaskAttempt({
+            attemptId,
+            errorMessage: message,
+            nextRetryAt: retryResult.nextRetryAt,
+            status: 'failed',
+          })
+        } catch {
+          logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
+        }
+        return
+      }
+
+      try {
+        await finishTaskAttempt({ attemptId, status: 'completed' })
+      } catch {
+        logAttemptInfrastructureFailure('finish_after_success', queueName, job.taskId)
+      }
+      await stopClaimRenewal()
+      try {
+        await queue.ack(raw)
+      } catch {
+        logQueueInfrastructureFailure('ack_after_success', queueName, job.taskId)
+      }
+    } finally {
+      await stopClaimRenewal()
     }
   }
 

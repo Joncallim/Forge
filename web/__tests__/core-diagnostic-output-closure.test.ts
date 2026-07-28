@@ -45,6 +45,7 @@ type AtomicQueue = {
   promoteDueRetries: (limit?: number) => Promise<number>
   recoverStuckJobs: (staleMs: number, options?: { drain?: boolean }) => Promise<number>
   release: (raw: string) => Promise<'already_applied' | 'applied'>
+  renewClaim: (raw: string) => Promise<'renewed' | 'stale_not_owner'>
   retry: (raw: string, job: AtomicQueueJob, delayMs: number) => Promise<{
     nextRetryAt: Date
     outcome: 'already_applied' | 'applied'
@@ -84,6 +85,12 @@ vi.mock('ioredis', () => {
     if (index < 0) return false
     values.splice(index, 1)
     return true
+  }
+  const markerNonce = (marker: string | undefined): string | null => {
+    const match = marker?.match(
+      /^[1-9][0-9]*:([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/,
+    )
+    return match?.[1] ?? null
   }
   const injectedFailure = (script: string, stage: InjectedRedisFailure['stage']): boolean => {
     const index = redisHarness.failures.findIndex(
@@ -127,6 +134,19 @@ vi.mock('ioredis', () => {
           hash(keys[1]).set(occurrenceId, marker)
           result = marker
         }
+      } else if (script.includes('forge:queue:renew-claim-v1')) {
+        const currentMarker = hash(keys[1]).get(args[1])
+        const currentNonce = markerNonce(currentMarker)
+        const callerNonce = markerNonce(args[2])
+        if ((currentMarker !== undefined && currentNonce === null) || callerNonce === null) {
+          throw new Error('forge_queue_claim_marker_invalid')
+        }
+        if (list(keys[0]).includes(args[0])
+          && currentNonce !== null
+          && currentNonce === callerNonce) {
+          hash(keys[1]).set(args[1], `${redisHarness.nowMs}:${currentNonce}`)
+          result = 1
+        }
       } else if (script.includes('forge:queue:ack-v3')) {
         const nonce = args[2].split(':')[1]
         const receipt = `${args[1]}:${nonce}`
@@ -134,7 +154,8 @@ vi.mock('ioredis', () => {
         for (const [member, score] of zset(keys[2])) {
           if (score <= redisHarness.nowMs - receiptTtlMs) zset(keys[2]).delete(member)
         }
-        if (hash(keys[1]).get(args[1]) === args[2] && removeFirst(list(keys[0]), args[0])) {
+        if (markerNonce(hash(keys[1]).get(args[1])) === markerNonce(args[2])
+          && removeFirst(list(keys[0]), args[0])) {
           hash(keys[1]).delete(args[1])
           zset(keys[2]).set(receipt, redisHarness.nowMs)
           result = 1
@@ -150,7 +171,8 @@ vi.mock('ioredis', () => {
         for (const [member, score] of zset(keys[3])) {
           if (score <= redisHarness.nowMs - receiptTtlMs) zset(keys[3]).delete(member)
         }
-        if (hash(keys[1]).get(args[1]) === args[2] && removeFirst(list(keys[0]), args[0])) {
+        if (markerNonce(hash(keys[1]).get(args[1])) === markerNonce(args[2])
+          && removeFirst(list(keys[0]), args[0])) {
           hash(keys[1]).delete(args[1])
           list(keys[2]).unshift(args[0])
           zset(keys[3]).set(receipt, redisHarness.nowMs)
@@ -174,7 +196,8 @@ vi.mock('ioredis', () => {
           || delayMs < 0) {
           throw new Error('forge_queue_retry_delay_invalid')
         }
-        if (hash(keys[1]).get(args[1]) === args[2] && list(keys[0]).includes(args[0])) {
+        if (markerNonce(hash(keys[1]).get(args[1])) === markerNonce(args[2])
+          && list(keys[0]).includes(args[0])) {
           if (zset(keys[2]).has(args[4])) {
             result = [0, '']
             return result
@@ -196,7 +219,8 @@ vi.mock('ioredis', () => {
           result = [0, '']
         }
       } else if (script.includes('forge:queue:dead-letter-v2')) {
-        if (hash(keys[1]).get(args[1]) === args[2] && list(keys[0]).includes(args[0])) {
+        if (markerNonce(hash(keys[1]).get(args[1])) === markerNonce(args[2])
+          && list(keys[0]).includes(args[0])) {
           list(keys[2]).unshift(args[3])
           hash(keys[1]).delete(args[1])
           removeFirst(list(keys[0]), args[0])
@@ -993,6 +1017,86 @@ describe('core operational output closure', () => {
     expect(warn).not.toHaveBeenCalled()
   })
 
+  it('renews stable-nonce claims and lets recovery take over only after renewed expiry', async () => {
+    const { AnswersQueue, ApprovalQueue, TaskQueue } = await import('@/worker/queue')
+    const cases = [
+      {
+        claims: 'forge:tasks:claims',
+        create: () => new TaskQueue('redis://localhost:6379/0') as unknown as AtomicQueue,
+        job: { taskId: TASK_ID, attempt: 1 } satisfies AtomicQueueJob,
+        processing: 'forge:tasks:processing',
+        ready: 'forge:tasks',
+      },
+      {
+        claims: 'forge:approvals:claims',
+        create: () => new ApprovalQueue('redis://localhost:6379/0') as unknown as AtomicQueue,
+        job: {
+          taskId: TASK_ID,
+          action: 'approve',
+          attempt: 1,
+        } satisfies AtomicQueueJob,
+        processing: 'forge:approvals:processing',
+        ready: 'forge:approvals',
+      },
+      {
+        claims: 'forge:answers:claims',
+        create: () => new AnswersQueue('redis://localhost:6379/0') as unknown as AtomicQueue,
+        job: { taskId: TASK_ID, attempt: 1 } satisfies AtomicQueueJob,
+        processing: 'forge:answers:processing',
+        ready: 'forge:answers',
+      },
+    ]
+
+    for (const queueCase of cases) {
+      redisHarness.hashes.clear()
+      redisHarness.lists.clear()
+      redisHarness.zsets.clear()
+      const owner = queueCase.create()
+      const recovery = queueCase.create()
+      redisHarness.claimPayloads.push(JSON.stringify(queueCase.job))
+      const claimed = await owner.claim(1)
+      if (!claimed) throw new Error('Expected a live-claim renewal fixture.')
+      const firstMarker = redisHarness.hashes.get(queueCase.claims)
+        ?.get(claimed.occurrenceId)
+      if (!firstMarker) throw new Error('Expected a live-claim renewal marker.')
+
+      redisHarness.nowMs += 2_000
+      await expect(owner.renewClaim(claimed.raw)).resolves.toBe('renewed')
+      const renewedMarker = redisHarness.hashes.get(queueCase.claims)
+        ?.get(claimed.occurrenceId)
+      expect(renewedMarker).toBe(`${redisHarness.nowMs}:${firstMarker.split(':')[1]}`)
+      await expect(recovery.recoverStuckJobs(1_000)).resolves.toBe(0)
+      expect(redisHarness.lists.get(queueCase.processing)).toEqual([claimed.raw])
+      await expect(recovery.renewClaim(claimed.raw))
+        .rejects.toThrow('Queue transition ownership mismatch')
+
+      redisHarness.lists.set(queueCase.processing, [])
+      await expect(owner.renewClaim(claimed.raw)).resolves.toBe('stale_not_owner')
+      redisHarness.lists.set(queueCase.processing, [claimed.raw])
+      redisHarness.hashes.get(queueCase.claims)?.set(
+        claimed.occurrenceId,
+        `${redisHarness.nowMs}:malformed`,
+      )
+      await expect(owner.renewClaim(claimed.raw)).rejects.toThrow('Queue claim renewal failed')
+      redisHarness.hashes.get(queueCase.claims)?.set(
+        claimed.occurrenceId,
+        renewedMarker ?? '',
+      )
+
+      redisHarness.nowMs += 1_001
+      await expect(recovery.recoverStuckJobs(1_000)).resolves.toBe(1)
+      expect(redisHarness.lists.get(queueCase.ready)).toEqual([claimed.raw])
+      await expect(owner.renewClaim(claimed.raw)).resolves.toBe('stale_not_owner')
+      await expect(owner.ack(claimed.raw)).rejects.toThrow('Queue transition stale_not_owner')
+
+      const nextOwner = await recovery.claim(1)
+      if (!nextOwner) throw new Error('Expected the recovered occurrence to be claimable.')
+      expect(nextOwner.occurrenceId).toBe(claimed.occurrenceId)
+      await expect(recovery.renewClaim(nextOwner.raw)).resolves.toBe('renewed')
+      await expect(recovery.ack(nextOwner.raw)).resolves.toBe('applied')
+    }
+  })
+
   it('makes every source-to-destination transition atomic and lost-response idempotent', async () => {
     const { AnswersQueue, ApprovalQueue, TaskQueue } = await import('@/worker/queue')
     const cases = [
@@ -1038,6 +1142,17 @@ describe('core operational output closure', () => {
       redisHarness.claimPayloads.push(ackRaw)
       const ackClaim = await queue.claim(1)
       if (!ackClaim) throw new Error('Expected an acknowledgement fixture claim.')
+      const originalMarker = redisHarness.hashes.get(queueCase.claims)
+        ?.get(ackClaim.occurrenceId)
+      if (!originalMarker) throw new Error('Expected an acknowledgement claim marker.')
+      redisHarness.nowMs += 500
+      redisHarness.failures.push({ marker: 'forge:queue:renew-claim-v1', stage: 'after' })
+      await expect(queue.renewClaim(ackClaim.raw)).rejects.toThrow('Queue claim renewal failed')
+      await expect(queue.renewClaim(ackClaim.raw)).resolves.toBe('renewed')
+      const renewedMarker = redisHarness.hashes.get(queueCase.claims)
+        ?.get(ackClaim.occurrenceId)
+      expect(renewedMarker).not.toBe(originalMarker)
+      expect(renewedMarker?.split(':')[1]).toBe(originalMarker.split(':')[1])
       redisHarness.failures.push({ marker: 'forge:queue:ack-v3', stage: 'after' })
       await expect(queue.ack(ackClaim.raw)).rejects.toThrow('Queue transition failed')
       await expect(queue.ack(ackClaim.raw)).resolves.toBe('already_applied')
@@ -1075,6 +1190,8 @@ describe('core operational output closure', () => {
       redisHarness.claimPayloads.push(releaseRaw)
       const releaseClaim = await queue.claim(1)
       if (!releaseClaim) throw new Error('Expected a shutdown-release fixture claim.')
+      redisHarness.nowMs += 500
+      await expect(queue.renewClaim(releaseClaim.raw)).resolves.toBe('renewed')
       redisHarness.failures.push({ marker: 'forge:queue:release-v1', stage: 'after' })
       await expect(queue.release(releaseClaim.raw)).rejects.toThrow('Queue transition failed')
       await expect(queue.release(releaseClaim.raw)).resolves.toBe('already_applied')
@@ -1092,6 +1209,8 @@ describe('core operational output closure', () => {
       redisHarness.claimPayloads.push(retryRaw)
       const retryClaim = await queue.claim(1)
       if (!retryClaim) throw new Error('Expected a retry fixture claim.')
+      redisHarness.nowMs += 500
+      await expect(queue.renewClaim(retryClaim.raw)).resolves.toBe('renewed')
       redisHarness.failures.push({ marker: 'forge:queue:retry-v3', stage: 'before' })
       await expect(queue.retry(retryClaim.raw, retryClaim.job, 0))
         .rejects.toThrow('Queue transition failed')
@@ -1122,6 +1241,8 @@ describe('core operational output closure', () => {
       redisHarness.claimPayloads.push(deadRaw)
       const deadClaim = await queue.claim(1)
       if (!deadClaim) throw new Error('Expected a dead-letter fixture claim.')
+      redisHarness.nowMs += 500
+      await expect(queue.renewClaim(deadClaim.raw)).resolves.toBe('renewed')
       redisHarness.failures.push({ marker: 'forge:queue:dead-letter-v2', stage: 'before' })
       await expect(queue.deadLetter(deadClaim.raw, deadClaim.job))
         .rejects.toThrow('Queue transition failed')
@@ -1996,6 +2117,319 @@ describe('core operational output closure', () => {
     }
   })
 
+  it('renews every active runtime claim without overlap and fails initial ownership closed', async () => {
+    const workerEnvNames = [
+      'FORGE_WORKER_CLAIM_TIMEOUT_SECONDS',
+      'FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS',
+      'FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS',
+      'FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS',
+      'FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS',
+    ] as const
+    const workerEnv = Object.fromEntries(workerEnvNames.map((name) => [name, process.env[name]]))
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.spyOn(console, 'info').mockImplementation(() => {})
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const positions = ['approval', 'answers', 'task'] as const
+    const query = (rows: unknown[]) => {
+      const chain: Record<string, unknown> = {
+        then: (resolve: (value: unknown[]) => unknown, reject?: (reason: unknown) => unknown) =>
+          Promise.resolve(rows).then(resolve, reject),
+      }
+      for (const method of ['from', 'innerJoin', 'where', 'limit']) chain[method] = () => chain
+      return chain
+    }
+
+    process.env.FORGE_WORKER_CLAIM_TIMEOUT_SECONDS = '1'
+    process.env.FORGE_WORKER_STUCK_JOB_RECOVERY_SECONDS = '1'
+    process.env.FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS = '0'
+    process.env.FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS = '0'
+    process.env.FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS = '0'
+
+    try {
+      for (const position of positions) {
+        vi.resetModules()
+        delete (globalThis as typeof globalThis & { forgeWorkerRuntime?: unknown })
+          .forgeWorkerRuntime
+        consoleError.mockClear()
+
+        let claimCount = 0
+        let renewalCalls = 0
+        let renewalsInFlight = 0
+        let maxRenewalsInFlight = 0
+        let resolvePeriodicRenewal!: (value: 'renewed') => void
+        const periodicRenewal = new Promise<'renewed'>((resolve) => {
+          resolvePeriodicRenewal = resolve
+        })
+        let resolveBusiness!: () => void
+        const business = new Promise<void>((resolve) => {
+          resolveBusiness = resolve
+        })
+        const targetJob = position === 'approval'
+          ? { taskId: TASK_ID, action: 'approve' as const, attempt: 1 }
+          : { taskId: TASK_ID, attempt: 1 }
+        const targetRaw = JSON.stringify({
+          schemaVersion: 1,
+          occurrenceId: randomUUID(),
+          job: targetJob,
+        })
+        const ack = vi.fn().mockResolvedValue('applied')
+        const renewClaim = vi.fn(async (): Promise<'renewed' | 'stale_not_owner'> => {
+          renewalCalls += 1
+          renewalsInFlight += 1
+          maxRenewalsInFlight = Math.max(maxRenewalsInFlight, renewalsInFlight)
+          try {
+            if (position === 'approval' && renewalCalls === 2) return 'stale_not_owner'
+            if (renewalCalls === (position === 'approval' ? 3 : 2)) {
+              return await periodicRenewal
+            }
+            return 'renewed'
+          } finally {
+            renewalsInFlight -= 1
+          }
+        })
+        const queueInstances: Array<{
+          ack: typeof ack
+          kind: typeof position
+          renewClaim: typeof renewClaim
+        }> = []
+        const queueClass = (kind: typeof position) => class {
+          ack = kind === position ? ack : vi.fn().mockResolvedValue('applied')
+          claim = vi.fn(async () => {
+            if (kind !== position) return null
+            claimCount += 1
+            if (claimCount === 1) return { job: targetJob, raw: targetRaw }
+            return await new Promise<null>((resolve) => setTimeout(() => resolve(null), 10))
+          })
+          deadLetter = vi.fn()
+          disconnect = vi.fn()
+          promoteDueRetries = vi.fn().mockResolvedValue(0)
+          recoverStuckJobs = vi.fn().mockResolvedValue(0)
+          release = vi.fn()
+          renewClaim = kind === position
+            ? renewClaim
+            : vi.fn().mockResolvedValue('renewed')
+          retry = vi.fn()
+
+          constructor() {
+            queueInstances.push({
+              ack: this.ack as typeof ack,
+              kind,
+              renewClaim: this.renewClaim as typeof renewClaim,
+            })
+          }
+        }
+        vi.doMock('@/worker/queue', () => ({
+          AnswersQueue: queueClass('answers'),
+          ApprovalQueue: queueClass('approval'),
+          RetryPromotionConflictError: TestRetryPromotionConflictError,
+          TaskQueue: queueClass('task'),
+        }))
+        const processAnsweredQuestions = vi.fn(async () => await business)
+        const processApproval = vi.fn(async () => await business)
+        const processTask = vi.fn(async () => await business)
+        vi.doMock('@/worker/orchestrator', () => ({
+          processAnsweredQuestions,
+          processApproval,
+          processTask,
+        }))
+        const finishTaskAttempt = vi.fn().mockResolvedValue(undefined)
+        const startTaskAttempt = vi.fn().mockResolvedValue(`${position}-heartbeat-attempt`)
+        vi.doMock('@/worker/task-attempts', () => ({ finishTaskAttempt, startTaskAttempt }))
+        const taskLookup = vi.fn()
+        vi.doMock('@/db', () => ({
+          db: {
+            select: vi.fn((selection: Record<string, unknown>) => {
+              if (Object.keys(selection).length === 1 && 'id' in selection) taskLookup()
+              return query([{ id: TASK_ID }])
+            }),
+          },
+        }))
+        vi.doMock('@/db/schema', () => ({
+          tasks: { id: 'tasks.id', status: 'tasks.status' },
+          workPackages: {
+            metadata: 'work_packages.metadata',
+            status: 'work_packages.status',
+            taskId: 'work_packages.task_id',
+          },
+        }))
+        vi.doMock('drizzle-orm', () => ({ and: vi.fn(), eq: vi.fn() }))
+        vi.doMock('@/worker/blocked-handoff-retry', () => ({
+          enqueueDueBlockedHandoffRetries: vi.fn().mockResolvedValue(0),
+        }))
+        vi.doMock('@/lib/mcps/filesystem-grant-reconciliation', () => ({
+          convergeRecognizedOperatorHolds: vi.fn().mockResolvedValue(0),
+        }))
+        vi.doMock('@/worker/work-package-handoff', () => ({
+          reconcilePendingS4CompletionHandoffs: vi.fn().mockResolvedValue(0),
+        }))
+        vi.doMock('@/lib/session', () => ({
+          reconcilePendingSessionCacheInvalidations: vi.fn().mockResolvedValue({
+            claimed: 0,
+            completed: 0,
+            deferred: 0,
+            stale: 0,
+          }),
+        }))
+
+        const { startWorker } = await import('@/worker/runtime')
+        const handle = await startWorker('standalone')
+        const expectedPendingCall = position === 'approval' ? 3 : 2
+        await vi.waitFor(() => {
+          expect(renewClaim).toHaveBeenCalledTimes(expectedPendingCall)
+        }, { timeout: 3_000 })
+        await new Promise((resolve) => setTimeout(resolve, 400))
+        expect(renewClaim).toHaveBeenCalledTimes(expectedPendingCall)
+        expect(maxRenewalsInFlight).toBe(1)
+        const process = position === 'approval'
+          ? processApproval
+          : position === 'answers'
+            ? processAnsweredQuestions
+            : processTask
+        expect(process).toHaveBeenCalledOnce()
+        expect(startTaskAttempt).toHaveBeenCalledOnce()
+        expect(taskLookup).toHaveBeenCalledOnce()
+        if (position === 'approval') {
+          expect(consoleError).toHaveBeenCalledWith(
+            '[worker] Queue infrastructure failure',
+            expect.objectContaining({
+              phase: 'claim_renewal_periodic',
+              queueName: 'approval',
+            }),
+          )
+        }
+
+        resolveBusiness()
+        await vi.waitFor(() => expect(finishTaskAttempt).toHaveBeenCalledOnce())
+        expect(ack).not.toHaveBeenCalled()
+        resolvePeriodicRenewal('renewed')
+        await vi.waitFor(() => expect(ack).toHaveBeenCalledOnce())
+        const terminalRenewalCount = renewClaim.mock.calls.length
+        await new Promise((resolve) => setTimeout(resolve, 400))
+        expect(renewClaim).toHaveBeenCalledTimes(terminalRenewalCount)
+        await handle.stop()
+        await expect(handle.done).resolves.toBeUndefined()
+        expect(queueInstances.find((entry) => entry.kind === position)?.ack)
+          .toHaveBeenCalledOnce()
+      }
+
+      for (const position of positions) {
+        vi.resetModules()
+        delete (globalThis as typeof globalThis & { forgeWorkerRuntime?: unknown })
+          .forgeWorkerRuntime
+        consoleError.mockClear()
+        let claimCount = 0
+        const targetJob = position === 'approval'
+          ? { taskId: TASK_ID, action: 'approve' as const, attempt: 1 }
+          : { taskId: TASK_ID, attempt: 1 }
+        const targetRaw = JSON.stringify({
+          schemaVersion: 1,
+          occurrenceId: randomUUID(),
+          job: targetJob,
+        })
+        const targetRenewal = vi.fn()
+          .mockRejectedValueOnce(hostileError())
+          .mockResolvedValue('renewed')
+        const queueClass = (kind: typeof position) => class {
+          ack = vi.fn()
+          claim = vi.fn(async () => {
+            if (kind !== position) return null
+            claimCount += 1
+            if (claimCount === 1) return { job: targetJob, raw: targetRaw }
+            return await new Promise<null>((resolve) => setTimeout(() => resolve(null), 10))
+          })
+          deadLetter = vi.fn()
+          disconnect = vi.fn()
+          promoteDueRetries = vi.fn().mockResolvedValue(0)
+          recoverStuckJobs = vi.fn().mockResolvedValue(0)
+          release = vi.fn()
+          renewClaim = kind === position
+            ? targetRenewal
+            : vi.fn().mockResolvedValue('renewed')
+          retry = vi.fn()
+        }
+        vi.doMock('@/worker/queue', () => ({
+          AnswersQueue: queueClass('answers'),
+          ApprovalQueue: queueClass('approval'),
+          RetryPromotionConflictError: TestRetryPromotionConflictError,
+          TaskQueue: queueClass('task'),
+        }))
+        const processAnsweredQuestions = vi.fn()
+        const processApproval = vi.fn()
+        const processTask = vi.fn()
+        vi.doMock('@/worker/orchestrator', () => ({
+          processAnsweredQuestions,
+          processApproval,
+          processTask,
+        }))
+        const finishTaskAttempt = vi.fn()
+        const startTaskAttempt = vi.fn()
+        vi.doMock('@/worker/task-attempts', () => ({ finishTaskAttempt, startTaskAttempt }))
+        const taskLookup = vi.fn()
+        vi.doMock('@/db', () => ({
+          db: {
+            select: vi.fn((selection: Record<string, unknown>) => {
+              if (Object.keys(selection).length === 1 && 'id' in selection) taskLookup()
+              return query([{ id: TASK_ID }])
+            }),
+          },
+        }))
+        vi.doMock('@/db/schema', () => ({
+          tasks: { id: 'tasks.id', status: 'tasks.status' },
+          workPackages: {
+            metadata: 'work_packages.metadata',
+            status: 'work_packages.status',
+            taskId: 'work_packages.task_id',
+          },
+        }))
+        vi.doMock('drizzle-orm', () => ({ and: vi.fn(), eq: vi.fn() }))
+        vi.doMock('@/worker/blocked-handoff-retry', () => ({
+          enqueueDueBlockedHandoffRetries: vi.fn().mockResolvedValue(0),
+        }))
+        vi.doMock('@/lib/mcps/filesystem-grant-reconciliation', () => ({
+          convergeRecognizedOperatorHolds: vi.fn().mockResolvedValue(0),
+        }))
+        vi.doMock('@/worker/work-package-handoff', () => ({
+          reconcilePendingS4CompletionHandoffs: vi.fn().mockResolvedValue(0),
+        }))
+        vi.doMock('@/lib/session', () => ({
+          reconcilePendingSessionCacheInvalidations: vi.fn().mockResolvedValue({
+            claimed: 0,
+            completed: 0,
+            deferred: 0,
+            stale: 0,
+          }),
+        }))
+
+        const { startWorker } = await import('@/worker/runtime')
+        const handle = await startWorker('standalone')
+        await vi.waitFor(() => {
+          expect(consoleError).toHaveBeenCalledWith(
+            '[worker] Queue infrastructure failure',
+            expect.objectContaining({
+              phase: 'claim_renewal_initial',
+              queueName: position,
+            }),
+          )
+        })
+        expect(targetRenewal).toHaveBeenCalledOnce()
+        expect(taskLookup).not.toHaveBeenCalled()
+        expect(startTaskAttempt).not.toHaveBeenCalled()
+        expect(finishTaskAttempt).not.toHaveBeenCalled()
+        expect(processApproval).not.toHaveBeenCalled()
+        expect(processAnsweredQuestions).not.toHaveBeenCalled()
+        expect(processTask).not.toHaveBeenCalled()
+        assertNoSentinels(consoleError.mock.calls)
+        await handle.stop()
+      }
+    } finally {
+      for (const name of workerEnvNames) {
+        const value = workerEnv[name]
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+    }
+  }, 20_000)
+
   it('reconciles one ambiguous retry before persisting the queue-authoritative deadline', async () => {
     const workerEnvNames = [
       'FORGE_WORKER_MAX_ATTEMPTS',
@@ -2063,6 +2497,7 @@ describe('core operational output closure', () => {
       promoteDueRetries = vi.fn().mockResolvedValue(0)
       recoverStuckJobs = vi.fn().mockResolvedValue(0)
       release = vi.fn().mockResolvedValue('applied')
+      renewClaim = vi.fn().mockResolvedValue('renewed')
       retry = vi.fn()
     }
 
@@ -2340,6 +2775,7 @@ describe('core operational output closure', () => {
       ack = vi.fn().mockResolvedValue(undefined)
       deadLetter = vi.fn().mockResolvedValue(undefined)
       release = vi.fn().mockResolvedValue(undefined)
+      renewClaim = vi.fn().mockResolvedValue('renewed')
       retry = vi.fn().mockResolvedValue(new Date())
       recoverStuckJobs = vi.fn().mockResolvedValue(0)
       promoteDueRetries = vi.fn().mockResolvedValue(0)
@@ -2806,7 +3242,7 @@ describe('core output source sentinel', () => {
     expect(queueSource).toContain('occurrenceId: active.occurrenceId')
     expect(queueSource).toContain("return 'stale_not_owner'")
     expect(queueSource).toContain("error('forge_queue_claim_marker_invalid')")
-    expect(queueSource.match(/error\('forge_queue_claim_marker_invalid'\)/g)).toHaveLength(10)
+    expect(queueSource.match(/error\('forge_queue_claim_marker_invalid'\)/g)).toHaveLength(12)
     expect(queueSource).toContain("local now = redis.call('TIME')")
     expect(queueSource).toContain("redis.call('ZADD', KEYS[3], now_ms, receipt)")
     expect(queueSource).toContain("redis.call('ZSCORE', KEYS[3], receipt)")
@@ -2834,7 +3270,18 @@ describe('core output source sentinel', () => {
       "if not current_marker and not redis.call('LPOS', KEYS[1], ARGV[1]) then",
     )
     expect(retryScript).toMatch(
-      /if current_marker ~= ARGV\[3\] then[\s\S]*?redis\.call\('ZSCORE', KEYS\[3\], ARGV\[5\]\)[\s\S]*?redis\.call\('LREM', KEYS\[1\], 1, ARGV\[1\]\)/,
+      /if marker_nonce\(current_marker\) ~= marker_nonce\(ARGV\[3\]\) then[\s\S]*?redis\.call\('ZSCORE', KEYS\[3\], ARGV\[5\]\)[\s\S]*?redis\.call\('LREM', KEYS\[1\], 1, ARGV\[1\]\)/,
+    )
+    expect(queueSource).toContain('-- forge:queue:renew-claim-v1')
+    expect(queueSource).toContain(
+      "redis.call('HSET', KEYS[2], ARGV[2], tostring(now_ms) .. ':' .. current_nonce)",
+    )
+    expect(queueSource.match(
+      /marker_nonce\(current_marker\) ~= marker_nonce\(ARGV\[3\]\)/g,
+    )).toHaveLength(4)
+    expect(queueSource).not.toContain('current_marker ~= ARGV[3]')
+    expect(queueSource).toMatch(
+      /async renewClaim\(raw: string\)[\s\S]{0,600}'Queue claim renewal failed'[\s\S]{0,300}return 'stale_not_owner'/,
     )
     expect(retryScript.indexOf("redis.call('ZSCORE', KEYS[3], ARGV[5])"))
       .toBeLessThan(retryScript.indexOf("redis.call('LREM', KEYS[1], 1, ARGV[1])"))
@@ -2955,6 +3402,19 @@ describe('core output source sentinel', () => {
     expect(runtimeSource).not.toMatch(
       /Retry promotion compatibility conflict[\s\S]{0,180}\b(?:error|message|stack|raw)\b/,
     )
+    expect(runtimeSource).toContain('Math.floor(stuckJobRecoveryMs / 3)')
+    expect(runtimeSource).toContain('if (stopped || inFlight) return')
+    expect(runtimeSource).toMatch(
+      /const pending = inFlight\s+if \(pending\) await pending/,
+    )
+    expect(runtimeSource).toMatch(
+      /const claimRenewal = await startClaimRenewal[\s\S]{0,500}acknowledgeMissingTaskJob/,
+    )
+    expect(runtimeSource).toMatch(
+      /finally \{\s+await stopClaimRenewal\(\)\s+\}/,
+    )
+    expect(runtimeSource.match(/await stopClaimRenewal\(\)[\s\S]{0,100}queue\.(?:ack|retry|deadLetter)/g))
+      .toHaveLength(4)
     expect(queueSource).not.toMatch(
       /promoteDueRetries[\s\S]{0,300}this\.client\.zrangebyscore/,
     )
