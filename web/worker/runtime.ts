@@ -173,6 +173,7 @@ async function startWorkerOnce(
     | 'dead_letter'
     | 'release_after_shutdown'
     | 'retry'
+    | 'retry_reconciliation'
     | 'task_lookup'
   type AttemptInfrastructurePhase = 'finish_after_failure' | 'finish_after_success' | 'start'
 
@@ -301,22 +302,18 @@ async function startWorkerOnce(
         return
       }
 
+      const retryDelayMs = backoffDelayMs(job.attempt)
       let retryResult: QueueRetryResult
       try {
-        retryResult = await queue.retry(raw, job, backoffDelayMs(job.attempt))
+        retryResult = await queue.retry(raw, job, retryDelayMs)
       } catch {
         logQueueInfrastructureFailure('retry', queueName, job.taskId)
         try {
-          await finishTaskAttempt({
-            attemptId,
-            errorMessage: message,
-            nextRetryAt: null,
-            status: 'failed',
-          })
+          retryResult = await queue.retry(raw, job, retryDelayMs)
         } catch {
-          logAttemptInfrastructureFailure('finish_after_failure', queueName, job.taskId)
+          logQueueInfrastructureFailure('retry_reconciliation', queueName, job.taskId)
+          return
         }
-        return
       }
       try {
         await finishTaskAttempt({
