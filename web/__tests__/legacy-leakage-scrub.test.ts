@@ -22,6 +22,7 @@ import {
 } from '@/lib/mcps/legacy-leakage-scrub'
 import {
   createLegacyLeakageRedisAdapter,
+  legacyLeakageScrubUsage,
   parseLegacyLeakageScrubCheckpoint,
   parseLegacyLeakageScrubArgs,
 } from '@/scripts/scrub-legacy-leakage'
@@ -824,20 +825,18 @@ describe('legacy leakage CLI and operator guide', () => {
 
   it('keeps the accepted textual key generator and complete destructive inventory closed across policy, runbook, and help', async () => {
     const runbook = await readFile('../docs/operators/legacy-leakage-scrub-v1.md', 'utf8')
-    const commandSource = await readFile('scripts/scrub-legacy-leakage.ts', 'utf8')
-    const databaseInventory = [
-      'task_logs',
-      'eligible, unversioned legacy Architect',
-      'artifacts',
-      'work_packages',
-      'approval_gates',
-      'app_settings',
-    ]
-    const redisBoundaries = [
-      'forge:task:*:history',
-      'forge:task:*:seq',
-      'forge:task-events:v2:*:history',
-    ]
+    const cliHelp = legacyLeakageScrubUsage()
+    const databaseInventory = `Database mutation inventory: task_logs; eligible, unversioned legacy Architect
+artifacts; work_packages; approval_gates; and the operation-scoped app_settings
+checkpoint key (${LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX}<operation-id>).`
+    const redisBoundaries = `Redis is separate: apply/resume purge only legacy forge:task:*:history and
+forge:task:*:seq keys and scan (but never delete) v2
+forge:task-events:v2:*:history values.`
+    const runbookInventoryStart = runbook.indexOf('The command has one closed database mutation inventory.')
+    const runbookRedisStart = runbook.indexOf('Redis is a separate boundary, not part of that database inventory.')
+    expect(runbookInventoryStart).toBeGreaterThan(-1)
+    expect(runbookRedisStart).toBeGreaterThan(runbookInventoryStart)
+    const runbookInventory = runbook.slice(runbookInventoryStart, runbookRedisStart)
 
     expect(Object.keys(LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY)).toEqual([
       'task_logs', 'artifacts', 'work_packages', 'approval_gates', 'retainedAuthorities',
@@ -845,17 +844,19 @@ describe('legacy leakage CLI and operator guide', () => {
     expect(runbook).toContain('openssl rand -hex 32 >"$key_file"')
     expect(runbook).toContain('export FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY="$(<"$key_file")"')
     expect(runbook).not.toContain('openssl rand 32')
-    for (const item of databaseInventory) {
-      expect(runbook).toContain(item)
-      expect(commandSource).toContain(item)
-    }
-    expect(runbook).toContain(`${LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX}<operation-id>`)
-    expect(commandSource).toContain('LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX')
-    for (const boundary of redisBoundaries) {
-      expect(runbook).toContain(boundary)
-      expect(commandSource).toContain(boundary)
-    }
-    expect(commandSource).toContain('scan (but never delete) v2')
+    for (const requiredInventoryTerm of [
+      'task_logs.message',
+      'eligible, unversioned legacy Architect',
+      'artifacts.content',
+      'work_packages.metadata',
+      'approval_gates.metadata',
+      'app_settings',
+      `${LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX}<operation-id>`,
+    ]) expect(runbookInventory).toContain(requiredInventoryTerm)
+    expect(cliHelp).toContain(databaseInventory)
+    expect(cliHelp).toContain(redisBoundaries)
+    expect(runbook).toContain('Redis is a separate boundary, not part of that database inventory.')
+    expect(runbook).toContain('this command does not delete v2 history')
     expect(LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY).toEqual({
       task_logs: expect.objectContaining({ updated: ['message', 'front_matter', 'metadata'] }),
       artifacts: expect.objectContaining({ updated: ['content', 'metadata'] }),
