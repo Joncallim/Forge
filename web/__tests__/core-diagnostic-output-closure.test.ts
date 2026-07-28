@@ -173,6 +173,10 @@ vi.mock('ioredis', () => {
           throw new Error('forge_queue_retry_delay_invalid')
         }
         if (hash(keys[1]).get(args[1]) === args[2] && list(keys[0]).includes(args[0])) {
+          if (zset(keys[2]).has(args[4])) {
+            result = [0, '']
+            return result
+          }
           const deadlineMs = redisHarness.nowMs + delayMs
           if (!Number.isSafeInteger(deadlineMs)
             || deadlineMs > 8_640_000_000_000_000) {
@@ -804,35 +808,82 @@ describe('core operational output closure', () => {
     }
   })
 
-  it('fails retry replay closed when the processing source and destination coexist', async () => {
-    const { TaskQueue } = await import('@/worker/queue')
-    const queue = new TaskQueue('redis://localhost:6379/0')
-    redisHarness.claimPayloads.push(JSON.stringify({ taskId: TASK_ID, attempt: 7 }))
-    const claimed = await queue.claim(1)
-    if (!claimed) throw new Error('Expected a retry replay conflict fixture claim.')
+  it('fails retry closed on an exact live destination without disturbing neighboring state', async () => {
+    const { AnswersQueue, ApprovalQueue, TaskQueue } = await import('@/worker/queue')
+    const queueCases = [
+      {
+        claimsKey: 'forge:tasks:claims',
+        create: () => new TaskQueue('redis://localhost:6379/0') as unknown as AtomicQueue,
+        job: { taskId: TASK_ID, attempt: 7 } satisfies AtomicQueueJob,
+        processingKey: 'forge:tasks:processing',
+        retryKey: 'forge:tasks:retry',
+      },
+      {
+        claimsKey: 'forge:approvals:claims',
+        create: () => new ApprovalQueue('redis://localhost:6379/0') as unknown as AtomicQueue,
+        job: { taskId: TASK_ID, action: 'approve', attempt: 7 } satisfies AtomicQueueJob,
+        processingKey: 'forge:approvals:processing',
+        retryKey: 'forge:approvals:retry',
+      },
+      {
+        claimsKey: 'forge:answers:claims',
+        create: () => new AnswersQueue('redis://localhost:6379/0') as unknown as AtomicQueue,
+        job: { taskId: TASK_ID, attempt: 7 } satisfies AtomicQueueJob,
+        processingKey: 'forge:answers:processing',
+        retryKey: 'forge:answers:retry',
+      },
+    ]
 
-    const retryEnvelope = JSON.stringify({
-      schemaVersion: 1,
-      occurrenceId: claimed.occurrenceId,
-      job: { taskId: TASK_ID, attempt: 8 },
-    })
-    const existingScore = redisHarness.nowMs + 60_000
-    redisHarness.hashes.get('forge:tasks:claims')?.delete(claimed.occurrenceId)
-    redisHarness.zsets.set(
-      'forge:tasks:retry',
-      new Map([[retryEnvelope, existingScore]]),
-    )
-    const [client] = redisHarness.instances
+    for (const [caseIndex, queueCase] of queueCases.entries()) {
+      redisHarness.hashes.clear()
+      redisHarness.lists.clear()
+      redisHarness.zsets.clear()
+      const queue = queueCase.create()
+      redisHarness.claimPayloads.push(JSON.stringify(queueCase.job))
+      const claimed = await queue.claim(1)
+      if (!claimed) throw new Error('Expected a retry destination conflict fixture claim.')
+      const marker = redisHarness.hashes.get(queueCase.claimsKey)?.get(claimed.occurrenceId)
+      if (!marker) throw new Error('Expected a live retry destination conflict marker.')
+      const retryEnvelope = JSON.stringify({
+        schemaVersion: 1,
+        occurrenceId: claimed.occurrenceId,
+        job: { ...queueCase.job, attempt: queueCase.job.attempt + 1 },
+      })
+      const neighboringEnvelope = JSON.stringify({
+        schemaVersion: 1,
+        occurrenceId: `00000000-0000-4000-8000-${String(caseIndex + 1).padStart(12, '0')}`,
+        job: { ...queueCase.job, attempt: queueCase.job.attempt + 20 },
+      })
+      const existingScore = redisHarness.nowMs + 60_000
+      const neighboringScore = redisHarness.nowMs + 120_000
+      redisHarness.zsets.set(queueCase.retryKey, new Map([
+        [retryEnvelope, existingScore],
+        [neighboringEnvelope, neighboringScore],
+      ]))
+      const [client] = redisHarness.instances.slice(-1)
 
-    await expect(queue.retry(claimed.raw, claimed.job, 60_000))
-      .rejects.toThrow('Queue transition stale_not_owner')
-    expect(await client.call.mock.results.at(-1)?.value).toEqual([0, ''])
-    expect(redisHarness.lists.get('forge:tasks:processing')).toEqual([claimed.raw])
-    expect(redisHarness.hashes.get('forge:tasks:claims')?.has(claimed.occurrenceId) ?? false)
-      .toBe(false)
-    expect(redisHarness.zsets.get('forge:tasks:retry')).toEqual(
-      new Map([[retryEnvelope, existingScore]]),
-    )
+      await expect(queue.retry(claimed.raw, claimed.job, 60_000))
+        .rejects.toThrow('Queue transition stale_not_owner')
+      expect(await client.call.mock.results.at(-1)?.value).toEqual([0, ''])
+      expect(redisHarness.lists.get(queueCase.processingKey)).toEqual([claimed.raw])
+      expect(redisHarness.hashes.get(queueCase.claimsKey)?.get(claimed.occurrenceId))
+        .toBe(marker)
+      expect(redisHarness.zsets.get(queueCase.retryKey)).toEqual(new Map([
+        [retryEnvelope, existingScore],
+        [neighboringEnvelope, neighboringScore],
+      ]))
+
+      redisHarness.zsets.get(queueCase.retryKey)?.delete(retryEnvelope)
+      const applied = await queue.retry(claimed.raw, claimed.job, 60_000)
+      const appliedScore = redisHarness.zsets.get(queueCase.retryKey)?.get(retryEnvelope)
+      expect(applied).toEqual({
+        nextRetryAt: new Date(redisHarness.nowMs + 60_000),
+        outcome: 'applied',
+      })
+      expect(appliedScore).toBe(redisHarness.nowMs + 60_000)
+      expect(redisHarness.zsets.get(queueCase.retryKey)?.get(neighboringEnvelope))
+        .toBe(neighboringScore)
+    }
   })
 
   it('rejects non-canonical identifiers and extra fields before claim storage', async () => {
@@ -2398,6 +2449,11 @@ describe('core output source sentinel', () => {
     expect(retryScript).toContain(
       "if not current_marker and not redis.call('LPOS', KEYS[1], ARGV[1]) then",
     )
+    expect(retryScript).toMatch(
+      /if current_marker ~= ARGV\[3\] then[\s\S]*?redis\.call\('ZSCORE', KEYS\[3\], ARGV\[5\]\)[\s\S]*?redis\.call\('LREM', KEYS\[1\], 1, ARGV\[1\]\)/,
+    )
+    expect(retryScript.indexOf("redis.call('ZSCORE', KEYS[3], ARGV[5])"))
+      .toBeLessThan(retryScript.indexOf("redis.call('LREM', KEYS[1], 1, ARGV[1])"))
     expect(retryScript).toContain("return {0, ''}")
     expect(retryMethod).toContain('String(intent.delayMs)')
     expect(retryMethod).not.toContain('Date.now')

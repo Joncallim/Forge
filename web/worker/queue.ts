@@ -327,6 +327,9 @@ if redis.call('LPOS', KEYS[1], ARGV[1]) then
   if current_marker ~= ARGV[3] then
     return {0, ''}
   end
+  if redis.call('ZSCORE', KEYS[3], ARGV[5]) then
+    return {0, ''}
+  end
   if now_ms > max_safe_integer
       or now_ms > max_date_ms
       or delay_ms > max_safe_integer - now_ms

@@ -288,6 +288,89 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
         }
 
         await admin.del(...QUEUE_KEYS)
+        const conflictJob = queueCase.job(130 + caseIndex)
+        await admin.lpush(queueCase.ready, JSON.stringify(conflictJob))
+        const conflictQueue = queueCase.create()
+        const conflictClaim = await conflictQueue.claim(1)
+        if (!conflictClaim) {
+          throw new Error('Queue Redis retry destination conflict fixture was not claimed.')
+        }
+        const claimsKey = `${queueCase.processing.replace(/:processing$/, '')}:claims`
+        const marker = await admin.hget(claimsKey, conflictClaim.occurrenceId)
+        if (!marker) throw new Error('Queue Redis retry destination conflict marker is absent.')
+        const exactDestination = JSON.stringify({
+          schemaVersion: 1,
+          occurrenceId: conflictClaim.occurrenceId,
+          job: {
+            ...conflictClaim.job,
+            attempt: (conflictClaim.job.attempt ?? 1) + 1,
+          },
+        })
+        const neighboringDestination = JSON.stringify({
+          schemaVersion: 1,
+          occurrenceId: `00000000-0000-4000-8000-${String(caseIndex + 901).padStart(12, '0')}`,
+          job: {
+            ...conflictClaim.job,
+            attempt: (conflictClaim.job.attempt ?? 1) + 20,
+          },
+        })
+        const exactDestinationScore = (await redisTimeMs()) + 60_000
+        const neighboringDestinationScore = exactDestinationScore + 60_000
+        await admin.zadd(
+          queueCase.retry,
+          exactDestinationScore,
+          exactDestination,
+          neighboringDestinationScore,
+          neighboringDestination,
+        )
+
+        await expect(conflictQueue.retry(
+          conflictClaim.raw,
+          conflictClaim.job,
+          60_000,
+        )).rejects.toThrow('Queue transition stale_not_owner')
+        expect(await admin.lrange(queueCase.processing, 0, -1))
+          .toEqual([conflictClaim.raw])
+        expect(await admin.hget(claimsKey, conflictClaim.occurrenceId)).toBe(marker)
+        expect(await admin.zscore(queueCase.retry, exactDestination))
+          .toBe(String(exactDestinationScore))
+        expect(await admin.zscore(queueCase.retry, neighboringDestination))
+          .toBe(String(neighboringDestinationScore))
+
+        await admin.del(queueCase.retry)
+        await admin.set(queueCase.retry, 'wrong-type-fixture')
+        await expect(conflictQueue.retry(
+          conflictClaim.raw,
+          conflictClaim.job,
+          60_000,
+        )).rejects.toThrow('Queue transition failed')
+        expect(await admin.lrange(queueCase.processing, 0, -1))
+          .toEqual([conflictClaim.raw])
+        expect(await admin.hget(claimsKey, conflictClaim.occurrenceId)).toBe(marker)
+        expect(await admin.get(queueCase.retry)).toBe('wrong-type-fixture')
+
+        await admin.del(queueCase.retry)
+        await admin.zadd(
+          queueCase.retry,
+          neighboringDestinationScore,
+          neighboringDestination,
+        )
+        const appliedAfterNeighbor = await conflictQueue.retry(
+          conflictClaim.raw,
+          conflictClaim.job,
+          60_000,
+        )
+        const appliedDestinationScore = Number(
+          await admin.zscore(queueCase.retry, exactDestination),
+        )
+        expect(appliedAfterNeighbor).toEqual({
+          nextRetryAt: new Date(appliedDestinationScore),
+          outcome: 'applied',
+        })
+        expect(await admin.zscore(queueCase.retry, neighboringDestination))
+          .toBe(String(neighboringDestinationScore))
+
+        await admin.del(...QUEUE_KEYS)
         const staleJob = queueCase.job(140 + caseIndex)
         await admin.lpush(queueCase.ready, JSON.stringify(staleJob))
         const staleOwner = queueCase.create()
