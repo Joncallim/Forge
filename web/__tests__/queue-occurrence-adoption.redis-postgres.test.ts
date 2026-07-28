@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import Redis from 'ioredis'
 import postgres from 'postgres'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import { recordArchitectPlanVersion } from '@/lib/mcps/s4-protocol-store'
+import { appendArchitectClarificationAnswer } from '@/lib/mcps/history-reader'
+import { computeCredentialDigest } from '@/lib/session-credential-digest'
 
 const required = process.env.CI === 'true'
   || process.env.FORGE_QUEUE_ADOPTION_TEST_REQUIRED === '1'
@@ -416,6 +420,51 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
     return taskId
   }
 
+  async function insertCanonicalAnsweredQuestion(taskId: string): Promise<void> {
+    const userId = randomUUID()
+    const sessionCredential = randomUUID()
+    const sessionId = randomUUID()
+    const runId = randomUUID()
+    const questionId = randomUUID()
+    const answerId = randomUUID()
+    const digestKey = randomBytes(32)
+      await sql`
+        INSERT INTO users (id, display_name) VALUES (${userId}::uuid, 'Queue adoption answer user')
+      `
+      await sql`
+        UPDATE tasks SET submitted_by = ${userId}::uuid WHERE id = ${taskId}::uuid
+      `
+      await sql`
+        INSERT INTO sessions (id, user_id, credential_digest_v1, expires_at, credential_storage_version)
+        VALUES (${sessionId}::uuid, ${userId}::uuid,
+          ${computeCredentialDigest(sessionCredential).digest}::bytea,
+          clock_timestamp() + interval '1 hour', 2)
+      `
+      await sql`
+        INSERT INTO agent_runs (id, task_id, agent_type, model_id_used, status)
+        VALUES (${runId}::uuid, ${taskId}::uuid, 'architect', 'queue-adoption', 'completed')
+      `
+      const source = await recordArchitectPlanVersion({
+        agentRunId: runId,
+        digestKey,
+        digestKeyId: 'queue-adoption-key',
+        entries: [
+          { agent: null, bindingFingerprint: null, content: 'Queue adoption plan.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null },
+          { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' },
+          { agent: null, bindingFingerprint: null, content: JSON.stringify({ schemaVersion: 1, questionId, question: 'Resume the queue adoption plan?', suggestions: [] }), entryId: `clarification_question:${questionId}`, entryKind: 'clarification_question', projectionEligible: false, requirementKey: null },
+        ],
+        planVersion: '1', taskId,
+      })
+      await sql`
+        INSERT INTO task_questions (id, task_id, question_entry_id, source_plan_artifact_id, source_plan_version, status)
+        VALUES (${questionId}::uuid, ${taskId}::uuid, ${`clarification_question:${questionId}`}, ${source.artifactId}::uuid, 1, 'open')
+      `
+      await appendArchitectClarificationAnswer({
+        answer: 'yes', answerId, digestKey, digestKeyId: 'queue-adoption-key', questionId,
+        sessionCredential, sourcePlanArtifactId: source.artifactId, sourcePlanVersion: '1', taskId,
+      })
+  }
+
   async function insertRunningTaskAttempt(taskId: string, jobPayload: unknown): Promise<void> {
     await sql`
       INSERT INTO task_attempts (
@@ -535,10 +584,7 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
       configureRuntimeEnvironment()
       const taskId = await insertTask(kind === 'task' ? 'pending' : 'awaiting_answers')
       if (kind === 'answers') {
-        await sql`
-          INSERT INTO task_questions (id, task_id, status, answered_at)
-          VALUES (${randomUUID()}::uuid, ${taskId}::uuid, 'answered', clock_timestamp())
-        `
+        await insertCanonicalAnsweredQuestion(taskId)
       }
 
       let providerCalls = 0
