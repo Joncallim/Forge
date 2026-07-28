@@ -234,6 +234,126 @@ admin PostgreSQL connection and a private 32-byte HMAC key. The PostgreSQL
 proof, Redis credential-revocation proof, and complete cross-sink proof are
 separate gates; do not treat one as evidence for the others.
 
+### Redis task-event cutover
+
+The database-authoritative S4 runtime mode is the only authority that selects
+the legacy or protected task-event path. Environment variables never activate,
+downgrade, or bypass that decision. Credential selection is a separate
+decision. In legacy mode, shared `REDIS_URL` is used only when neither
+dedicated URL is configured. A complete, distinct, authenticated dedicated
+pair takes precedence even in legacy mode. Exactly one dedicated URL is a
+partial pair and fails closed. Protected mode requires the complete dedicated
+pair and never falls back to shared `REDIS_URL`. The scrub command's private
+`REDIS_URL` is a dedicated maintenance/admin connection. It does not authorize
+a protected application to use the shared fallback.
+
+Each protected URL must use `redis://` or `rediss://`, a username, a password,
+and the same endpoint and explicit database. The publisher and subscriber
+must be different ACL users. Do not use a shared principal, an unrestricted
+`+select`, a broad command category, or a real password in a file, command
+argument, shell history, log, or test output.
+
+The closed-world Redis ACL contract proven by PR #290 is:
+
+- Both users are `reset`, `on`, and `sanitize-payload`, have exactly one
+  opaque password hash, and have no selectors.
+- Both use only these key/channel patterns:
+  `~forge:task-events:v2:*:history`,
+  `~forge:task-events:v2:*:seq`, and
+  `&forge:task-events:v2:*:live`.
+- The publisher has only `+select|<db>`, `+ping`, `+info`,
+  `+client|setinfo`, `+eval`, `+incr`, `+zadd`, `+zcard`,
+  `+zremrangebyrank`, and `+publish`.
+- The subscriber has only `+select|<db>`, `+ping`, `+info`,
+  `+client|setinfo`, `+get`, `+zrangebyscore`, `+subscribe`,
+  `+unsubscribe`, `+psubscribe`, and `+punsubscribe`.
+
+Legacy keys, cross-prefix keys, unrelated channels, extra commands, and broad
+ACL categories are outside this contract. Generate or import secrets through
+a protected file, secret manager, or administrator-controlled channel; use
+placeholders in operator documentation.
+
+#### Ordered cutover checklist
+
+1. Keep project ingress, packet issuance, and v2 producers disabled.
+2. Create the Redis ACL principals and store their secrets out of process
+   before the drain. Do not inject
+   `FORGE_TASK_EVENT_PUBLISHER_REDIS_URL` or
+   `FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL` into any running legacy web,
+   worker, publisher, or subscriber process. A complete pair switches its
+   task-event credentials immediately, even while database mode remains
+   legacy.
+3. Drain and stop every legacy process and old Server-Sent Events client
+   before configuring replacement processes. Wait through the Server-Sent
+   Events recycle window and verify that old Redis clients are absent.
+4. Revoke or disable legacy publish/write authority and terminate remaining
+   clients. Use the scrub runbook's dedicated admin connection for maintenance.
+5. Preview, apply, and resume the existing scrub exactly as documented. Never
+   edit a checkpoint.
+6. Require a complete legacy zero scan and fail-closed v2 validation. After
+   purge, permanently delete or revoke the legacy user and prove that both an
+   old live connection and a fresh connection using old credentials cannot
+   write.
+7. Configure the dedicated URLs only on replacement processes while those
+   processes remain stopped.
+8. Only after those checks pass, permit the separately authorized,
+   database-controlled protected-mode activation. Changing environment values
+   alone cannot flip the mode.
+9. Start the replacement processes with the dedicated URLs only after the
+   separately authorized database activation step permits protected mode.
+   Keep ingress and producers disabled until their separate release gates pass.
+
+Do not treat expiration as erasure. The scrub exhaustively scans the full
+`forge:task-events:v2:*` prefix, validates recognized `:history` and `:seq`
+shapes, and treats unknown or malformed keys and invalid values as violations.
+It never repairs, rewrites, expires, or deletes v2 evidence. It purges only
+exact legacy `forge:task:<uuid>:history` and `forge:task:<uuid>:seq` keys.
+
+#### Separate mandatory proof commands
+
+Run each command against its own freshly migrated or disposable target. These
+commands are destructive within their explicitly named test databases. Every
+required test must pass with zero skips; a skipped proof is a failure.
+
+```bash
+# PostgreSQL: 14/14, zero skipped
+FORGE_S4_REQUIRE_POSTGRES_TEST=1 npm run test:mcp:s4-postgres -- --reporter=default
+# S4_SCRUB_POSTGRES_START
+# S4_SCRUB_POSTGRES_AUTH_CAS_RESUME_OK
+# S4_SCRUB_POSTGRES_ARTIFACT_LINK_RACE_OK
+
+# Redis scrub: 3/3, zero skipped, disposable database 15
+FORGE_S4_REQUIRE_REDIS_TEST=1 FORGE_S4_REDIS_DESTRUCTIVE_TEST=1 \
+  FORGE_S4_REDIS_TEST_URL=redis://localhost:6380/15 \
+  npm run test:mcp:s4-redis
+# S4_SCRUB_REDIS_START
+# S4_SCRUB_REDIS_V2_IMMUTABLE_OK
+# S4_SCRUB_REDIS_PURGE_RETRY_OK
+
+# Redis ACL: 3/3, zero skipped, disposable database 14
+FORGE_S4_REDIS_ACL_TEST_REQUIRED=1 FORGE_S4_REDIS_ACL_DESTRUCTIVE_TEST=1 \
+  FORGE_S4_REDIS_ACL_TEST_ADMIN_URL=redis://localhost:6380/14 \
+  npm run test:mcp:s4-redis-acl
+# S4_REDIS_ACL_ROLE_ISOLATION_OK
+# S4_REDIS_ACL_DENIALS_OK
+# S4_REDIS_ACL_LEGACY_REVOKED_OK
+```
+
+These are separate gates. Passing them does not claim the deferred complete
+cross-sink production proof.
+
+#### Rollback-safe handling
+
+Before activation, keep the database mode legacy and do not inject the
+dedicated URLs into running legacy processes while investigating. Creating the
+ACL users and storing their secrets out of process does not select application
+credentials. Never re-enable a legacy producer or user after purge or
+revocation merely to roll back. Once the database mode is protected, missing
+or partial dedicated URLs fail closed; changing environment variables cannot
+downgrade it. Preserve the operation identity, checkpoint, and resume
+credentials required by the scrub rather than editing or recreating a
+checkpoint.
+
 ## Executable Workforce Beta
 
 Workforce materialization and handoff are available after approval. Package

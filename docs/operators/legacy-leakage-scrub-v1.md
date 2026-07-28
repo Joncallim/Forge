@@ -5,10 +5,14 @@ and legacy Redis event data that older Forge writers may have copied into
 durable storage. It is a one-way cleanup tool. It does not make old data safe to
 expose, and it does not rewrite protected Architect plan history.
 
-The command must run only after old web, worker, and event-publisher processes
-are stopped or drained, their write credentials are revoked, and Forge has
-recorded the signed `s4_producers_disabled` receipt. Use a dedicated admin
-PostgreSQL connection. The ordinary application role is rejected.
+The command must run only after old web, worker, event-publisher, and subscriber
+processes are stopped or drained, their write credentials are revoked, and Forge
+has recorded the signed `s4_producers_disabled` receipt. Close old Server-Sent
+Events connections through their recycle window and verify old Redis clients
+are absent before scrubbing. Use a dedicated admin PostgreSQL connection and a
+private Redis maintenance/admin connection. The ordinary application role is
+rejected. This receipt is an existing precondition; the scrub command does not
+invent or issue a new release receipt.
 
 ## Required secrets and connections
 
@@ -18,8 +22,10 @@ CI output.
 
 - `FORGE_DATABASE_ADMIN_URL` — the dedicated PostgreSQL admin connection for
   the scrub. It is not `DATABASE_URL`.
-- `REDIS_URL` — the Redis connection whose legacy namespaces are scanned and,
-  during apply/resume, purged.
+- `REDIS_URL` — the operator-private Redis maintenance/admin connection whose
+  legacy namespaces are scanned and, during apply/resume, purged. This is not
+  permission for a protected application to use the shared application
+  fallback.
 - `FORGE_LEGACY_LEAKAGE_SCRUB_FINGERPRINT_KEY` — a private HMAC key containing
   exactly 32 random bytes, encoded as 64 lowercase hexadecimal characters or
   base64. Generate it without printing it, for example:
@@ -60,10 +66,12 @@ update only:
   `epic172:s4:legacy-leakage-scrub:v1:<operation-id>`.
 
 Redis is a separate boundary, not part of that database inventory. Apply and
-resume purge only legacy keys matching `forge:task:*:history` and
-`forge:task:*:seq`. They separately scan v2 history values matching
-`forge:task-events:v2:*:history` against the fixed event schema and sentinel
-set; this command does not delete v2 history.
+resume purge only exact legacy keys matching
+`forge:task:<uuid>:history` and `forge:task:<uuid>:seq`. They exhaustively scan
+the full `forge:task-events:v2:*` prefix, validate recognized `:history` and
+`:seq` shapes and values against the fixed event schema and sentinel set, and
+fail closed on unknown or malformed v2 keys. The scrub never repairs, rewrites,
+expires, or deletes v2 evidence. Expiry is not erasure.
 
 The corresponding current v2 history key shape is
 `forge:task-events:v2:{taskId}:history`.
@@ -101,12 +109,16 @@ sentinel set as the original apply.
 
 Before preview or apply, confirm that:
 
-1. old writers are stopped and drained;
-2. their database and Redis credentials are revoked;
-3. the signed exact `s4_producers_disabled` receipt is present;
-4. the authoritative release state is disabled;
-5. the dedicated admin PostgreSQL connection is available; and
-6. you have a unique operation ID for apply.
+1. ingress, issuance, and v2 producers remain disabled;
+2. old web, worker, publisher, and subscriber writers are stopped and drained;
+3. old Server-Sent Events connections have passed their recycle window and old
+   Redis clients are absent;
+4. their database and Redis credentials are revoked or disabled;
+5. the signed exact `s4_producers_disabled` receipt is present;
+6. the authoritative release state is disabled;
+7. the dedicated admin PostgreSQL and private Redis maintenance connections are
+   available; and
+8. you have a unique operation ID for apply.
 
 If a row or checkpoint conflict occurs, keep old writers stopped and investigate
 before resuming. A process crash or lost response is handled by rerunning the
@@ -185,3 +197,91 @@ That proof covers the PostgreSQL authorization, row/checkpoint compare-and-set,
 resume, reappearance, and protected-artifact link-race contracts. It does not
 claim the separate Redis credential-revocation/namespace proof or the complete cross-sink production proof.
 Those are later gates and must be run and reviewed separately.
+
+## Redis ACL and protected-mode cutover
+
+The database-authoritative S4 runtime mode alone selects legacy or protected
+task-event operation. Environment variables never activate, downgrade, or
+bypass that decision. Credential selection is a separate decision. In legacy
+mode, shared `REDIS_URL` is used only when neither dedicated URL is configured.
+A complete, distinct, authenticated dedicated pair takes precedence even in
+legacy mode. Exactly one dedicated URL is a partial pair and fails closed.
+Protected mode requires the complete dedicated pair and never falls back to
+shared `REDIS_URL`.
+
+The Redis URL used by this scrub is an operator-private maintenance/admin
+connection. It is not authorization for a protected application to use the
+shared fallback. Do not put real passwords or hashes in this runbook, command
+arguments, shell history, logs, or test output; use a protected secret file,
+secret manager, or administrator-controlled import channel.
+
+Create the Redis ACL principals and store their secrets out of process before
+the drain. Do not inject `FORGE_TASK_EVENT_PUBLISHER_REDIS_URL` or
+`FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL` into any running legacy web, worker,
+publisher, or subscriber process. A complete pair switches task-event
+credentials immediately, even while database mode remains legacy.
+
+Drain and stop every legacy process and old Server-Sent Events client before
+configuring replacement processes. Revoke the legacy write authority and
+terminate remaining clients. Complete preview/apply/resume, the legacy zero
+scan, and fail-closed v2 validation. Permanently delete or revoke the legacy
+user and prove the old live connection and fresh old
+credentials cannot write. Configure the dedicated URLs only on replacement
+processes while those processes remain stopped. Only then permit the separately authorized,
+database-controlled protected-mode activation. Start the replacement processes
+with the dedicated URLs only after the separately authorized database
+activation step permits protected mode. Environment changes alone cannot flip
+the mode. Keep ingress and producers disabled until their separate release
+gates pass.
+
+The closed-world ACL contract proven by PR #290 uses `reset`, `on`,
+`sanitize-payload`, exactly one opaque password hash, no selectors, one endpoint,
+and one explicit database. Publisher keys/channels are
+`~forge:task-events:v2:*:history`, `~forge:task-events:v2:*:seq`, and
+`&forge:task-events:v2:*:live`; its only commands are
+`+select|<db>`, `+ping`, `+info`, `+client|setinfo`, `+eval`, `+incr`,
+`+zadd`, `+zcard`, `+zremrangebyrank`, and `+publish`. Subscriber keys/channels
+are the same; its only commands are `+select|<db>`, `+ping`, `+info`,
+`+client|setinfo`, `+get`, `+zrangebyscore`, `+subscribe`, `+unsubscribe`,
+`+psubscribe`, and `+punsubscribe`. Broad categories, unrestricted `+select`,
+shared principals, legacy/cross-prefix keys, unrelated channels, and extra
+commands are prohibited.
+
+## Separate mandatory proof commands
+
+Run each command against its own freshly migrated or disposable target. These
+commands are destructive within their explicitly named test databases. Each
+proof must pass with zero skips; a skipped proof is a failure.
+
+```bash
+# PostgreSQL: 14/14, zero skipped
+FORGE_S4_REQUIRE_POSTGRES_TEST=1 npm run test:mcp:s4-postgres -- --reporter=default
+# S4_SCRUB_POSTGRES_START
+# S4_SCRUB_POSTGRES_AUTH_CAS_RESUME_OK
+# S4_SCRUB_POSTGRES_ARTIFACT_LINK_RACE_OK
+
+# Redis scrub: 3/3, zero skipped, disposable database 15
+FORGE_S4_REQUIRE_REDIS_TEST=1 FORGE_S4_REDIS_DESTRUCTIVE_TEST=1 \
+  FORGE_S4_REDIS_TEST_URL=redis://localhost:6380/15 \
+  npm run test:mcp:s4-redis
+# S4_SCRUB_REDIS_START
+# S4_SCRUB_REDIS_V2_IMMUTABLE_OK
+# S4_SCRUB_REDIS_PURGE_RETRY_OK
+
+# Redis ACL: 3/3, zero skipped, disposable database 14
+FORGE_S4_REDIS_ACL_TEST_REQUIRED=1 FORGE_S4_REDIS_ACL_DESTRUCTIVE_TEST=1 \
+  FORGE_S4_REDIS_ACL_TEST_ADMIN_URL=redis://localhost:6380/14 \
+  npm run test:mcp:s4-redis-acl
+# S4_REDIS_ACL_ROLE_ISOLATION_OK
+# S4_REDIS_ACL_DENIALS_OK
+# S4_REDIS_ACL_LEGACY_REVOKED_OK
+```
+
+These are separate gates and do not claim the deferred complete cross-sink
+production proof. Before activation, keep the database mode legacy and do not
+inject the dedicated URLs into running legacy processes while investigating.
+Creating the ACL users and storing their secrets out of process does not select
+application credentials. After protected activation, missing or partial
+dedicated URLs fail closed and environment changes cannot downgrade the mode.
+Preserve checkpoint and resume identities; never edit a checkpoint or recreate
+a revoked legacy user to roll back.

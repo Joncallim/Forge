@@ -1033,7 +1033,31 @@ describe('legacy leakage CLI and operator guide', () => {
 
   it('keeps the accepted textual key generator and complete destructive inventory closed across policy, runbook, and help', async () => {
     const runbook = await readFile('../docs/operators/legacy-leakage-scrub-v1.md', 'utf8')
+    const operatorGuide = await readFile('../docs/operator-guide.md', 'utf8')
+    const environmentExample = await readFile('../.env.example', 'utf8')
     const cliHelp = legacyLeakageScrubUsage()
+    const normalizeProse = (value: string) => value.replace(/\s+/g, ' ').trim()
+    const normalizedRunbook = normalizeProse(runbook)
+    const normalizedOperatorGuide = normalizeProse(operatorGuide)
+    const normalizedEnvironmentExample = normalizeProse(
+      environmentExample
+        .split('\n')
+        .map((line) => (line.startsWith('# ') ? line.slice(2) : line))
+        .join('\n'),
+    )
+    const credentialSelectionClauses = [
+      'In legacy mode, shared `REDIS_URL` is used only when neither dedicated URL is configured.',
+      'A complete, distinct, authenticated dedicated pair takes precedence even in legacy mode.',
+      'Exactly one dedicated URL is a partial pair and fails closed.',
+      'Protected mode requires the complete dedicated pair and never falls back to shared `REDIS_URL`.',
+    ]
+    const offlineCutoverClauses = [
+      'Create the Redis ACL principals and store their secrets out of process before the drain.',
+      'Do not inject `FORGE_TASK_EVENT_PUBLISHER_REDIS_URL` or `FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL` into any running legacy web, worker, publisher, or subscriber process.',
+      'Drain and stop every legacy process and old Server-Sent Events client before configuring replacement processes.',
+      'Configure the dedicated URLs only on replacement processes while those processes remain stopped.',
+      'Start the replacement processes with the dedicated URLs only after the separately authorized database activation step permits protected mode.',
+    ]
     const databaseInventory = `Database mutation inventory: task_logs; eligible, unversioned legacy Architect
 artifacts; work_packages; approval_gates; and the operation-scoped app_settings
 checkpoint key (${LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX}<operation-id>).`
@@ -1064,7 +1088,70 @@ forge:task-events:v2:* keys.`
     expect(cliHelp).toContain(databaseInventory)
     expect(cliHelp).toContain(redisBoundaries)
     expect(runbook).toContain('Redis is a separate boundary, not part of that database inventory.')
-    expect(runbook).toContain('this command does not delete v2 history')
+    expect(runbook).toMatch(/never repairs,\s+rewrites,\s+expires,\s+or deletes v2 evidence/)
+    expect(runbook).toContain('full `forge:task-events:v2:*` prefix')
+    expect(runbook).toContain('unknown or malformed v2 keys')
+    expect(runbook).toContain('Expiry is not erasure.')
+    expect(runbook).toContain('database-authoritative S4 runtime mode')
+    expect(runbook).toContain('FORGE_TASK_EVENT_PUBLISHER_REDIS_URL')
+    expect(runbook).toContain('FORGE_TASK_EVENT_SUBSCRIBER_REDIS_URL')
+    for (const clause of credentialSelectionClauses) {
+      expect(normalizedRunbook).toContain(clause)
+      expect(normalizedOperatorGuide).toContain(clause)
+      expect(normalizedEnvironmentExample).toContain(clause)
+    }
+    for (const clause of offlineCutoverClauses) {
+      expect(normalizedRunbook).toContain(clause)
+      expect(normalizedOperatorGuide).toContain(clause)
+    }
+    const operatorCutoverPositions = offlineCutoverClauses.map((clause) => normalizedOperatorGuide.indexOf(clause))
+    const runbookCutoverPositions = offlineCutoverClauses.map((clause) => normalizedRunbook.indexOf(clause))
+    expect(operatorCutoverPositions).toEqual([...operatorCutoverPositions].sort((left, right) => left - right))
+    expect(runbookCutoverPositions).toEqual([...runbookCutoverPositions].sort((left, right) => left - right))
+    for (const unsafeForm of [
+      'While the database mode is legacy, the shared application `REDIS_URL` is the compatibility path.',
+      'While the mode is legacy, the shared application `REDIS_URL` is the compatibility path.',
+      'Keep placeholders blank until the DB authority has been activated',
+      'Preprovision separate publisher and subscriber principals and URLs while the database mode remains legacy. Do not use them yet.',
+    ]) {
+      expect(normalizedRunbook).not.toContain(unsafeForm)
+      expect(normalizedOperatorGuide).not.toContain(unsafeForm)
+      expect(normalizedEnvironmentExample).not.toContain(unsafeForm)
+    }
+    expect(runbook).toMatch(/old Redis clients\s+are absent/)
+    expect(runbook).toMatch(/old live connection and fresh old\s+credentials cannot write/)
+    expect(runbook).toContain('FORGE_S4_REQUIRE_REDIS_TEST=1')
+    expect(runbook).toContain('FORGE_S4_REDIS_ACL_TEST_REQUIRED=1')
+    for (const proofContract of [
+      'S4_SCRUB_REDIS_START',
+      'S4_SCRUB_REDIS_V2_IMMUTABLE_OK',
+      'S4_SCRUB_REDIS_PURGE_RETRY_OK',
+      'S4_REDIS_ACL_ROLE_ISOLATION_OK',
+      'S4_REDIS_ACL_DENIALS_OK',
+      'S4_REDIS_ACL_LEGACY_REVOKED_OK',
+    ]) expect(runbook).toContain(proofContract)
+    expect(runbook).toMatch(/deferred complete cross-sink\s+production proof/)
+    expect(operatorGuide).toContain('database-authoritative S4 runtime mode')
+    expect(operatorGuide).toMatch(/Changing environment values\s+alone cannot flip the mode/)
+    for (const aclToken of [
+      '~forge:task-events:v2:*:history',
+      '~forge:task-events:v2:*:seq',
+      '&forge:task-events:v2:*:live',
+      '+select|<db>',
+      '+client|setinfo',
+      '+zremrangebyrank',
+      '+zrangebyscore',
+      '+punsubscribe',
+    ]) expect(operatorGuide).toContain(aclToken)
+    for (const proofContract of [
+      'FORGE_S4_REQUIRE_POSTGRES_TEST=1',
+      'FORGE_S4_REDIS_TEST_URL=redis://localhost:6380/15',
+      'FORGE_S4_REDIS_ACL_TEST_ADMIN_URL=redis://localhost:6380/14',
+      'S4_SCRUB_POSTGRES_AUTH_CAS_RESUME_OK',
+      'S4_REDIS_ACL_LEGACY_REVOKED_OK',
+    ]) expect(operatorGuide).toContain(proofContract)
+    expect(operatorGuide).not.toMatch(/redis:\/\/[^\s`]+:[^@\s`]+@/)
+    expect(runbook).not.toMatch(/redis:\/\/[^\s`]+:[^@\s`]+@/)
     expect(LEGACY_LEAKAGE_SCRUB_DATABASE_POLICY).toEqual({
       task_logs: expect.objectContaining({ updated: ['message', 'front_matter', 'metadata'] }),
       artifacts: expect.objectContaining({ updated: ['content', 'metadata'] }),
