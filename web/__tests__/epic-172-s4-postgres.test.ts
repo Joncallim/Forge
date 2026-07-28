@@ -14,6 +14,7 @@ import { appendArchitectClarificationAnswer, readArchitectPlanHistory } from '@/
 import { hashPassword } from '@/lib/password'
 import { closeDb } from '@/db'
 import {
+  LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX,
   legacyLeakageRowFingerprint,
   runLegacyLeakageScrub,
   sanitizeLegacyLeakageRow,
@@ -1502,6 +1503,11 @@ describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () =
   }
   let admin: ReturnType<typeof postgres>
   let prepared = false
+  const scrubOperationIds = new Set<string>()
+
+  function checkpointKey(operationId: string): string {
+    return `${LEGACY_LEAKAGE_SCRUB_CHECKPOINT_PREFIX}${operationId}`
+  }
 
   async function prepareScrubFixture(): Promise<void> {
     if (prepared) return
@@ -1552,7 +1558,30 @@ describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () =
     admin = postgres(adminUrl!, { max: 3, onnotice: () => {} })
   })
 
-  afterAll(async () => { await admin?.end({ timeout: 5 }) })
+  afterAll(async () => {
+    try {
+      // The protected artifact/version race intentionally commits immutable plan rows;
+      // only mutable fixture rows and operation checkpoints are removed here.
+      for (const operationId of scrubOperationIds) {
+        await admin`delete from app_settings where key = ${checkpointKey(operationId)}`
+      }
+      await admin`delete from task_logs where task_id = ${ids.task}::uuid`
+      const [rawResidue] = await admin<{ count: number }[]>`
+        select (
+          (select count(*) from task_logs
+            where task_id = ${ids.task}::uuid
+              and (message like '%RAW-SCRUB%' or message like '%RAW-REAPPEARED%'))
+          +
+          (select count(*) from artifacts
+            where agent_run_id = ${ids.run}::uuid
+              and (content like '%LEGACY-ADR-RACE-SENTINEL%' or content like '%RAW-SCRUB%'))
+        )::integer as count
+      `
+      expect(rawResidue.count).toBe(0)
+    } finally {
+      await admin?.end({ timeout: 5 })
+    }
+  })
 
   it('S4_SCRUB_POSTGRES: authorizes, CAS-scrubs, resumes, and fails closed on reappearance', async () => {
     await prepareScrubFixture()
@@ -1577,7 +1606,9 @@ describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () =
       select id::text as id, message, front_matter as "frontMatter", metadata
       from task_logs where task_id = ${ids.task}::uuid order by sequence desc limit 1`
     const casRow: LegacyLeakageScrubRow = { id: casLog.id, kind: 'task_log', message: casLog.message, frontMatter: casLog.frontMatter, metadata: casLog.metadata }
-    const casCheckpoint = await adapter.createCheckpoint(await checkpointFor(`row-cas-${randomUUID()}`))
+    const rowCasOperationId = `row-cas-${randomUUID()}`
+    scrubOperationIds.add(rowCasOperationId)
+    const casCheckpoint = await adapter.createCheckpoint(await checkpointFor(rowCasOperationId))
     expect(casCheckpoint).not.toBeNull()
     await admin`update task_logs set message = 'CONCURRENT-ROW-VALUE' where id = ${casRow.id}::uuid`
     const rowConflict = await adapter.commitRow({
@@ -1588,12 +1619,19 @@ describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () =
     expect(rowConflict).toBe('row_conflict')
     const [rowAfterConflict] = await admin<{ message: string }[]>`select message from task_logs where id = ${casRow.id}::uuid`
     expect(rowAfterConflict.message).toBe('CONCURRENT-ROW-VALUE')
-    const tokenCheckpoint = await adapter.createCheckpoint(await checkpointFor(`checkpoint-cas-${randomUUID()}`))
+    const [checkpointAfterRowConflict] = await admin<{ value: string }[]>`
+      select value from app_settings where key = ${checkpointKey(rowCasOperationId)}`
+    expect(checkpointAfterRowConflict.value).toBe(casCheckpoint!.token)
+
+    const checkpointCasOperationId = `checkpoint-cas-${randomUUID()}`
+    scrubOperationIds.add(checkpointCasOperationId)
+    const tokenCheckpoint = await adapter.createCheckpoint(await checkpointFor(checkpointCasOperationId))
     expect(tokenCheckpoint).not.toBeNull()
     const advanced = await adapter.compareAndSetCheckpoint(tokenCheckpoint!, {
       ...tokenCheckpoint!.checkpoint, databaseTime: await adapter.databaseTime(),
     })
     expect(advanced).not.toBeNull()
+    const externallyAdvancedCheckpointBytes = advanced!.token
     const tokenConflict = await adapter.commitRow({
       current: tokenCheckpoint!, expectedRowFingerprint: legacyLeakageRowFingerprint({ ...casRow, message: 'CONCURRENT-ROW-VALUE' }, scrubKey),
       nextCheckpoint: { ...tokenCheckpoint!.checkpoint, lastKey: casRow.id, rowsExamined: 1, databaseTime: await adapter.databaseTime() },
@@ -1602,8 +1640,12 @@ describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () =
     expect(tokenConflict).toBe('checkpoint_conflict')
     const [rowAfterTokenConflict] = await admin<{ message: string }[]>`select message from task_logs where id = ${casRow.id}::uuid`
     expect(rowAfterTokenConflict.message).toBe('CONCURRENT-ROW-VALUE')
+    const [checkpointAfterTokenConflict] = await admin<{ value: string }[]>`
+      select value from app_settings where key = ${checkpointKey(checkpointCasOperationId)}`
+    expect(checkpointAfterTokenConflict.value).toBe(externallyAdvancedCheckpointBytes)
 
     const operationId = `pg-scrub-${randomUUID()}`
+    scrubOperationIds.add(operationId)
     const applied = await runLegacyLeakageScrub({
       actor: 'scrub-operator', authorizationReceiptId: ids.disabledReceipt, fingerprintKey: scrubKey,
       fingerprintKeyId: scrubKeyId, mode: 'apply', operationId, batchSize: 1_000, maxBatches: 1_000,
@@ -1626,6 +1668,7 @@ describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () =
       actor: 'scrub-operator', authorizationReceiptId: ids.disabledReceipt, fingerprintKey: scrubKey,
       fingerprintKeyId: scrubKeyId, mode: 'resume', operationId, batchSize: 1_000, maxBatches: 1_000,
     }, { database: adapter, redis })).rejects.toThrow('database or Redis leakage reappeared')
+    await admin`delete from task_logs where task_id = ${ids.task}::uuid`
     console.info('S4_SCRUB_POSTGRES_AUTH_CAS_RESUME_OK')
   })
 
@@ -1638,25 +1681,38 @@ describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () =
     const artifactId = randomUUID()
     await admin`insert into artifacts (id, agent_run_id, artifact_type, content, metadata)
       values (${artifactId}::uuid, ${ids.run}::uuid, 'adr_text', 'LEGACY-ADR-RACE-SENTINEL', '{"legacy":true}'::jsonb)`
+    const artifactRaceOperationId = `artifact-race-${randomUUID()}`
+    scrubOperationIds.add(artifactRaceOperationId)
     const checkpoint = await adapter.createCheckpoint({
-      schemaVersion: 2, operationId: `artifact-race-${randomUUID()}`, actor: 'scrub-operator', authorizationReceiptId: ids.disabledReceipt,
+      schemaVersion: 2, operationId: artifactRaceOperationId, actor: 'scrub-operator', authorizationReceiptId: ids.disabledReceipt,
       fingerprintKeyId: scrubKeyId, sentinelSetFingerprint: 'a'.repeat(64), phase: 'artifacts', state: 'running',
       lastKey: null, rowsExamined: 0, rowsChanged: 0, conflicts: 0, redisKeysExamined: 0, redisKeysDeleted: 0,
       redisV2ValuesExamined: 0, lastPreFingerprint: null, lastPostFingerprint: null, databaseTime: await adapter.databaseTime(),
     })
     expect(checkpoint).not.toBeNull()
     const scanned = await adapter.scanRows('artifacts', null, 10_000)
-    const source: LegacyLeakageScrubRow = scanned.find((row) => row.id === artifactId) ?? {
-      id: artifactId, kind: 'artifact', content: 'LEGACY-ADR-RACE-SENTINEL', metadata: { legacy: true }, replaceContent: true,
-    }
+    const source = scanned.find((row) => row.id === artifactId)
+    expect(source).toEqual({
+      id: artifactId,
+      kind: 'artifact',
+      content: 'LEGACY-ADR-RACE-SENTINEL',
+      metadata: { legacy: true },
+      replaceContent: true,
+    })
+    if (!source) throw new Error('S4 scrub artifact race fixture was not returned by the production artifacts scanner.')
     const linkerUrl = new URL(adminUrl!)
     linkerUrl.searchParams.set('application_name', `s4-artifact-linker-${randomUUID()}`)
     const linker = postgres(linkerUrl.toString(), { max: 1, onnotice: () => {} })
+    const [scrubBackend] = await scrubSql<{ pid: number }[]>`select pg_backend_pid() as pid`
+    const [linkerBackend] = await linker<{ pid: number }[]>`select pg_backend_pid() as pid`
     let releaseLinker!: () => void
     const linkerRelease = new Promise<void>((resolve) => { releaseLinker = resolve })
+    let linkerTransactionStarted!: () => void
+    const linkerTransactionStartedPromise = new Promise<void>((resolve) => { linkerTransactionStarted = resolve })
     let linkerLocked!: () => void
     const linkerLockedPromise = new Promise<void>((resolve) => { linkerLocked = resolve })
     const linkerTransaction = linker.begin(async (tx) => {
+      linkerTransactionStarted()
       await tx`select id from artifacts where id = ${artifactId}::uuid for update`
       await tx`update artifacts set content = ${ARCHITECT_PLAN_HEADER}, metadata = '{"historyAvailable":true}'::jsonb where id = ${artifactId}::uuid`
       await tx`insert into architect_plan_versions (task_id, plan_artifact_id, plan_version, digest_key_id, entry_count, entry_set_digest, structural_set_digest)
@@ -1666,26 +1722,48 @@ describe.skipIf(!enabled)('Epic 172 legacy leakage scrub PostgreSQL proof', () =
       linkerLocked()
       await linkerRelease
     })
-    try {
-      await linkerLockedPromise
-      const commitPromise = adapter.commitRow({
-        current: checkpoint!, expectedRowFingerprint: legacyLeakageRowFingerprint(source, scrubKey),
-        nextCheckpoint: { ...checkpoint!.checkpoint, lastKey: artifactId, rowsExamined: 1, databaseTime: await adapter.databaseTime() },
-        row: sanitizeLegacyLeakageRow(source),
-      })
-      let waiting = false
-      for (let attempt = 0; attempt < 40 && !waiting; attempt += 1) {
-        const [row] = await admin<{ waitEventType: string | null }[]>`
-          select wait_event_type as "waitEventType" from pg_stat_activity where application_name = ${adapterUrl.searchParams.get('application_name')!}`
-        waiting = row?.waitEventType === 'Lock'
-        if (!waiting) await new Promise((resolve) => setTimeout(resolve, 50))
+    let commitPromise: Promise<'committed' | 'row_conflict' | 'checkpoint_conflict'> | undefined
+    let linkerReleased = false
+    const releaseLinkerOnce = () => {
+      if (!linkerReleased) {
+        linkerReleased = true
+        releaseLinker()
       }
-      expect(waiting).toBe(true)
-      releaseLinker()
+    }
+    try {
+      await linkerTransactionStartedPromise
+      await linkerLockedPromise
+      const checkpointBytesBeforeRace = checkpoint!.token
+      let scrubCommitStarted!: () => void
+      const scrubCommitStartedPromise = new Promise<void>((resolve) => { scrubCommitStarted = resolve })
+      commitPromise = Promise.resolve().then(async () => {
+        scrubCommitStarted()
+        return adapter.commitRow({
+          current: checkpoint!, expectedRowFingerprint: legacyLeakageRowFingerprint(source, scrubKey),
+          nextCheckpoint: { ...checkpoint!.checkpoint, lastKey: artifactId, rowsExamined: 1, databaseTime: await adapter.databaseTime() },
+          row: sanitizeLegacyLeakageRow(source),
+        })
+      })
+      await scrubCommitStartedPromise
+      let blockerObserved = false
+      for (let attempt = 0; attempt < 40 && !blockerObserved; attempt += 1) {
+        const [row] = await admin<{ pid: number; state: string; waitEventType: string | null; blockingPids: number[] }[]>`
+          select pid, state, wait_event_type as "waitEventType", pg_blocking_pids(pid) as "blockingPids"
+          from pg_stat_activity
+          where pid = ${scrubBackend.pid}`
+        blockerObserved = row?.waitEventType === 'Lock' && row.blockingPids.includes(linkerBackend.pid)
+        if (!blockerObserved) await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      expect(blockerObserved).toBe(true)
+      releaseLinkerOnce()
       await linkerTransaction
       await expect(commitPromise).resolves.toBe('row_conflict')
+      const [checkpointAfterRace] = await admin<{ value: string }[]>`
+        select value from app_settings where key = ${checkpointKey(artifactRaceOperationId)}`
+      expect(checkpointAfterRace.value).toBe(checkpointBytesBeforeRace)
     } finally {
-      releaseLinker?.()
+      releaseLinkerOnce()
+      await Promise.allSettled([linkerTransaction, ...(commitPromise ? [commitPromise] : [])])
       await Promise.all([linker.end({ timeout: 5 }), scrubSql.end({ timeout: 5 })])
     }
     const [artifact] = await admin<{ content: string; protectedVersions: number }[]>`
