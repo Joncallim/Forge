@@ -451,6 +451,8 @@ describe.skipIf(!enabled)('queue occurrence adoption with production runtimes', 
         entries: [
           { agent: null, bindingFingerprint: null, content: 'Queue adoption plan.', entryId: 'plan_body:000000', entryKind: 'plan_body', projectionEligible: false, requirementKey: null },
           { agent: null, bindingFingerprint: null, content: JSON.stringify({ requirementKey: 'plan-policy', schemaVersion: 1 }), entryId: 'requirement:plan-policy', entryKind: 'requirement', projectionEligible: false, requirementKey: 'plan-policy' },
+          { agent: 'backend', bindingFingerprint: `sha256:${'a'.repeat(64)}`, content: JSON.stringify({ capabilityBindings: [{ capability: 'filesystem.project.read', requirementKey: 'filesystem-context' }], schemaVersion: 1 }), entryId: 'subtask:000001:backend', entryKind: 'subtask', projectionEligible: true, requirementKey: 'filesystem-context' },
+          { agent: 'backend', bindingFingerprint: `sha256:${'a'.repeat(64)}`, content: JSON.stringify({ agent: 'backend', requirementKey: 'filesystem-context', schemaVersion: 1 }), entryId: 'routing:filesystem-context:backend', entryKind: 'routing', projectionEligible: false, requirementKey: 'filesystem-context' },
           { agent: null, bindingFingerprint: null, content: JSON.stringify({ schemaVersion: 1, questionId, question: 'Resume the queue adoption plan?', suggestions: [] }), entryId: `clarification_question:${questionId}`, entryKind: 'clarification_question', projectionEligible: false, requirementKey: null },
         ],
         planVersion: '1', taskId,
