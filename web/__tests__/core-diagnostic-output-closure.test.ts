@@ -51,6 +51,8 @@ type AtomicQueue = {
   }>
 }
 
+class TestRetryPromotionConflictError extends Error {}
+
 const redisHarness = vi.hoisted(() => ({
   claimPayloads: [] as Array<string | null>,
   failures: [] as InjectedRedisFailure[],
@@ -238,12 +240,12 @@ vi.mock('ioredis', () => {
         const receiptScore = expiry.get(fingerprint)
         const currentScore = zset(keys[0]).get(source)
         if (currentScore === undefined) {
-          if (existing === undefined || receiptScore === undefined) {
-            if (existing !== undefined || receiptScore !== undefined) {
-              dispositions.delete(fingerprint)
-              expiry.delete(fingerprint)
-            }
-            result = [0, 'stale', '']
+          if (existing === undefined && receiptScore === undefined) {
+            result = [0, 'ownership_conflict', '']
+          } else if (existing === undefined || receiptScore === undefined) {
+            dispositions.delete(fingerprint)
+            expiry.delete(fingerprint)
+            result = [0, 'receipt_integrity_failure', '']
           } else {
             const winningOccurrenceId = existing.startsWith('promoted:')
               ? existing.slice('promoted:'.length)
@@ -258,19 +260,19 @@ vi.mock('ioredis', () => {
             if (!validDisposition || !validTimestamp) {
               dispositions.delete(fingerprint)
               expiry.delete(fingerprint)
-              result = [0, 'stale', '']
+              result = [0, 'receipt_integrity_failure', '']
             } else if (existing === 'discarded' && mode === 'discard') {
               result = [2, 'discarded', '']
             } else if (winningOccurrenceId !== null && mode !== 'discard') {
               result = [2, 'promoted', winningOccurrenceId]
             } else {
-              result = [0, 'stale', '']
+              result = [0, 'receipt_integrity_failure', '']
             }
           }
-        } else if (String(currentScore) !== expectedScore
-          || existing !== undefined
-          || receiptScore !== undefined) {
-          result = [0, 'stale', '']
+        } else if (String(currentScore) !== expectedScore) {
+          result = [0, 'ownership_conflict', '']
+        } else if (existing !== undefined || receiptScore !== undefined) {
+          result = [0, 'receipt_integrity_failure', '']
         } else if (dispositions.size >= Number(receiptCapRaw)
           || expiry.size >= Number(receiptCapRaw)) {
           throw new Error('forge_queue_retry_receipt_capacity_exhausted')
@@ -1400,7 +1402,11 @@ describe('core operational output closure', () => {
   })
 
   it('requires a coherent live disposition pair for source-absent retry replay', async () => {
-    const { TaskQueue } = await import('@/worker/queue')
+    const {
+      RETRY_PROMOTION_CONFLICT_CODE,
+      RetryPromotionConflictError,
+      TaskQueue,
+    } = await import('@/worker/queue')
     const retryKey = 'forge:tasks:retry'
     const readyKey = 'forge:tasks'
     const receiptsKey = 'forge:tasks:promotion-dispositions'
@@ -1410,6 +1416,7 @@ describe('core operational output closure', () => {
 
     const exercise = async (options: {
       attempt: number
+      expectOwnershipConflict?: boolean
       expectReplay?: boolean
       sourcePresent?: boolean
       setup: (fingerprint: string) => void
@@ -1450,13 +1457,33 @@ describe('core operational output closure', () => {
 
       if (options.expectReplay) {
         await expect(queue.promoteDueRetries(1)).resolves.toBe(0)
+      } else if (options.expectOwnershipConflict) {
+        let caught: unknown
+        try {
+          await queue.promoteDueRetries(1)
+        } catch (error) {
+          caught = error
+        }
+        expect(caught instanceof RetryPromotionConflictError).toBe(true)
+        if (!(caught instanceof RetryPromotionConflictError)) {
+          throw new Error('Retry promotion did not return the closed conflict type.')
+        }
+        expect(caught.code).toBe(RETRY_PROMOTION_CONFLICT_CODE)
+        expect(caught.message).toBe('Queue retry promotion conflict')
+        expect(Object.keys(caught)).toEqual([])
       } else {
         await expect(queue.promoteDueRetries(1))
-          .rejects.toThrow('Queue retry promotion ownership mismatch')
+          .rejects.toThrow('Queue retry promotion receipt integrity failure')
       }
       expect(fingerprint).toMatch(/^[0-9a-f]{64}$/)
       options.verify?.(fingerprint)
     }
+
+    await exercise({
+      attempt: 20,
+      expectOwnershipConflict: true,
+      setup: () => {},
+    })
 
     await exercise({
       attempt: 21,
@@ -1726,6 +1753,174 @@ describe('core operational output closure', () => {
     }
   })
 
+  it('contains only typed mixed-version promotion conflicts and keeps other failures fatal', async () => {
+    const workerEnvNames = [
+      'FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS',
+      'FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS',
+      'FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS',
+    ] as const
+    const workerEnv = Object.fromEntries(workerEnvNames.map((name) => [name, process.env[name]]))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.spyOn(console, 'info').mockImplementation(() => {})
+
+    const installSupportMocks = (): void => {
+      const query = () => {
+        const chain: Record<string, unknown> = {
+          then: (
+            resolve: (value: unknown[]) => unknown,
+            reject?: (reason: unknown) => unknown,
+          ) => Promise.resolve([]).then(resolve, reject),
+        }
+        for (const method of ['from', 'innerJoin', 'where', 'limit']) chain[method] = () => chain
+        return chain
+      }
+      vi.doMock('@/worker/orchestrator', () => ({
+        processAnsweredQuestions: vi.fn(),
+        processApproval: vi.fn(),
+        processTask: vi.fn(),
+      }))
+      vi.doMock('@/worker/task-attempts', () => ({
+        finishTaskAttempt: vi.fn(),
+        startTaskAttempt: vi.fn(),
+      }))
+      vi.doMock('@/db', () => ({ db: { select: vi.fn(query) } }))
+      vi.doMock('@/db/schema', () => ({
+        tasks: { id: 'tasks.id', status: 'tasks.status' },
+        workPackages: {
+          metadata: 'work_packages.metadata',
+          status: 'work_packages.status',
+          taskId: 'work_packages.task_id',
+        },
+      }))
+      vi.doMock('drizzle-orm', () => ({ and: vi.fn(), eq: vi.fn() }))
+      vi.doMock('@/worker/blocked-handoff-retry', () => ({
+        enqueueDueBlockedHandoffRetries: vi.fn().mockResolvedValue(0),
+      }))
+      vi.doMock('@/lib/mcps/filesystem-grant-reconciliation', () => ({
+        convergeRecognizedOperatorHolds: vi.fn().mockResolvedValue(0),
+      }))
+      vi.doMock('@/worker/work-package-handoff', () => ({
+        reconcilePendingS4CompletionHandoffs: vi.fn().mockResolvedValue(0),
+      }))
+      vi.doMock('@/lib/session', () => ({
+        reconcilePendingSessionCacheInvalidations: vi.fn().mockResolvedValue({
+          claimed: 0,
+          completed: 0,
+          deferred: 0,
+          stale: 0,
+        }),
+      }))
+    }
+
+    process.env.FORGE_PROVIDER_HEALTH_INTERVAL_SECONDS = '0'
+    process.env.FORGE_BLOCKED_HANDOFF_SWEEP_INTERVAL_SECONDS = '0'
+    process.env.FORGE_SESSION_CACHE_PURGE_INTERVAL_SECONDS = '0'
+
+    try {
+      for (const conflictPosition of ['approvals', 'answers', 'tasks'] as const) {
+        vi.resetModules()
+        delete (globalThis as typeof globalThis & { forgeWorkerRuntime?: unknown })
+          .forgeWorkerRuntime
+        warn.mockClear()
+        errorLog.mockClear()
+        const claims = {
+          answers: vi.fn().mockResolvedValue(null),
+          approvals: vi.fn().mockResolvedValue(null),
+          tasks: vi.fn(async () => await new Promise<null>((resolve) => {
+            setTimeout(() => resolve(null), 1)
+          })),
+        }
+
+        const queueClass = (queueName: keyof typeof claims) => class {
+          ack = vi.fn()
+          claim = claims[queueName]
+          deadLetter = vi.fn()
+          disconnect = vi.fn()
+          promoteDueRetries = queueName === conflictPosition
+            ? vi.fn()
+                .mockRejectedValueOnce(new TestRetryPromotionConflictError())
+                .mockResolvedValue(0)
+            : vi.fn().mockResolvedValue(0)
+          recoverStuckJobs = vi.fn().mockResolvedValue(0)
+          release = vi.fn()
+          retry = vi.fn()
+        }
+
+        vi.doMock('@/worker/queue', () => ({
+          AnswersQueue: queueClass('answers'),
+          ApprovalQueue: queueClass('approvals'),
+          RetryPromotionConflictError: TestRetryPromotionConflictError,
+          TaskQueue: queueClass('tasks'),
+        }))
+        installSupportMocks()
+
+        const { startWorker } = await import('@/worker/runtime')
+        const handle = await startWorker('standalone')
+        await vi.waitFor(() => {
+          expect(warn).toHaveBeenCalledWith(
+            '[worker] Retry promotion compatibility conflict',
+            {
+              category: 'mixed_version_retry_promotion',
+              queue: conflictPosition,
+            },
+          )
+          expect(claims.approvals).toHaveBeenCalled()
+          expect(claims.answers).toHaveBeenCalled()
+          expect(claims.tasks).toHaveBeenCalled()
+        })
+        await handle.stop()
+        await expect(handle.done).resolves.toBeUndefined()
+        assertNoSentinels(warn.mock.calls)
+      }
+
+      for (const fatalFailure of [
+        new Error('redis_infrastructure_failure'),
+        new Error('retry_receipt_integrity_failure'),
+        new TypeError('retry_result_decode_failure'),
+      ]) {
+        vi.resetModules()
+        delete (globalThis as typeof globalThis & { forgeWorkerRuntime?: unknown })
+          .forgeWorkerRuntime
+        errorLog.mockClear()
+
+        class FatalPromotionQueue {
+          ack = vi.fn()
+          claim = vi.fn().mockResolvedValue(null)
+          deadLetter = vi.fn()
+          disconnect = vi.fn()
+          promoteDueRetries = vi.fn().mockRejectedValue(fatalFailure)
+          recoverStuckJobs = vi.fn().mockResolvedValue(0)
+          release = vi.fn()
+          retry = vi.fn()
+        }
+
+        vi.doMock('@/worker/queue', () => ({
+          AnswersQueue: FatalPromotionQueue,
+          ApprovalQueue: FatalPromotionQueue,
+          RetryPromotionConflictError: TestRetryPromotionConflictError,
+          TaskQueue: FatalPromotionQueue,
+        }))
+        installSupportMocks()
+
+        const { startWorker } = await import('@/worker/runtime')
+        const handle = await startWorker('standalone')
+        await expect(handle.done).rejects.toBe(fatalFailure)
+        expect(errorLog).toHaveBeenCalledWith(
+          '[worker] Fatal error',
+          expect.objectContaining({ workerId: expect.any(String) }),
+        )
+        await handle.stop()
+      }
+    } finally {
+      for (const name of workerEnvNames) {
+        const value = workerEnv[name]
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+    }
+  })
+
   it('persists only the queue-authoritative retry deadline after worker failure', async () => {
     const workerEnvNames = [
       'FORGE_WORKER_MAX_ATTEMPTS',
@@ -1825,6 +2020,7 @@ describe('core operational output closure', () => {
     vi.doMock('@/worker/queue', () => ({
       AnswersQueue: RuntimeAnswersQueue,
       ApprovalQueue: RuntimeApprovalQueue,
+      RetryPromotionConflictError: TestRetryPromotionConflictError,
       TaskQueue: RuntimeTaskQueue,
     }))
     vi.doMock('@/worker/orchestrator', () => ({
@@ -2032,6 +2228,7 @@ describe('core operational output closure', () => {
     vi.doMock('@/worker/queue', () => ({
       AnswersQueue: RuntimeAnswersQueue,
       ApprovalQueue: RuntimeApprovalQueue,
+      RetryPromotionConflictError: TestRetryPromotionConflictError,
       TaskQueue: RuntimeTaskQueue,
     }))
     const processAnsweredQuestions = vi.fn().mockResolvedValue(undefined)
@@ -2237,6 +2434,7 @@ describe('core operational output closure', () => {
         vi.doMock('@/worker/queue', () => ({
           AnswersQueue: queueClass('answers'),
           ApprovalQueue: queueClass('approval'),
+          RetryPromotionConflictError: TestRetryPromotionConflictError,
           TaskQueue: queueClass('task'),
         }))
         const processAnsweredQuestions = vi.fn()
@@ -2464,6 +2662,14 @@ describe('core output source sentinel', () => {
       /private decodeRetryTransition[\s\S]{0,1300}const nextRetryAt = new Date\(score\)[\s\S]{0,300}return \{ outcome, nextRetryAt \}/,
     )
     expect(queueSource).toContain('-- forge:queue:promote-retry-v4')
+    expect(queueSource).toContain(
+      "export const RETRY_PROMOTION_CONFLICT_CODE = 'queue_retry_promotion_conflict' as const",
+    )
+    expect(queueSource).toContain('export class RetryPromotionConflictError extends Error')
+    expect(queueSource).toContain('throw new RetryPromotionConflictError()')
+    expect(queueSource).toContain(
+      "throw new Error('Queue retry promotion receipt integrity failure')",
+    )
     expect(queueSource).toContain('const PROMOTION_DISPOSITION_TTL_MS = 15 * 60 * 1000')
     expect(queueSource).toContain('const PROMOTION_DISPOSITION_CAP = 50_000')
     expect(queueSource).toContain('const PROMOTION_DISPOSITION_PRUNE_LIMIT = 100')
@@ -2489,10 +2695,15 @@ describe('core output source sentinel', () => {
     const promotionScript = queueSource.match(
       /const PROMOTE_RETRY_SCRIPT = `([\s\S]*?)`\n\nconst RECOVER_STUCK_JOB_SCRIPT/,
     )?.[1] ?? ''
-    expect(promotionScript).toContain(
-      'if current_score ~= expected_score or existing or receipt_score then',
+    expect(promotionScript).toContain('if not existing and not receipt_score then')
+    expect(promotionScript).toMatch(
+      /if not existing and not receipt_score then\s+return \{0, 'ownership_conflict', ''\}/,
     )
     expect(promotionScript).toContain('if not existing or not receipt_score then')
+    expect(promotionScript).toContain('if current_score ~= expected_score then')
+    expect(promotionScript).toContain('if existing or receipt_score then')
+    expect(promotionScript).toContain("return {0, 'ownership_conflict', ''}")
+    expect(promotionScript).toContain("return {0, 'receipt_integrity_failure', ''}")
     expect(promotionScript).toContain('receipt_timestamp <= now_ms')
     expect(promotionScript).toContain('receipt_timestamp > cutoff')
     expect(promotionScript).toContain('receipt_timestamp ~= math.huge')
@@ -2510,6 +2721,22 @@ describe('core output source sentinel', () => {
     expect(promotionScript).not.toContain("redis.call('LRANGE'")
     expect(promotionScript).not.toContain("redis.call('HSET', KEYS[3], raw_member")
     expect(promotionScript).not.toContain("redis.call('ZADD', KEYS[4], now_ms, raw_member")
+    expect(runtimeSource).toContain('error instanceof RetryPromotionConflictError')
+    expect(runtimeSource).toContain(
+      "category: 'mixed_version_retry_promotion'",
+    )
+    expect(runtimeSource).toContain(
+      "promoteQueueRetries('approvals', approvalQueue)",
+    )
+    expect(runtimeSource).toContain(
+      "promoteQueueRetries('answers', answersQueue)",
+    )
+    expect(runtimeSource).toContain(
+      "promoteQueueRetries('tasks', taskQueue)",
+    )
+    expect(runtimeSource).not.toMatch(
+      /Retry promotion compatibility conflict[\s\S]{0,180}\b(?:error|message|stack|raw)\b/,
+    )
     expect(queueSource).not.toMatch(
       /promoteDueRetries[\s\S]{0,300}this\.client\.zrangebyscore/,
     )

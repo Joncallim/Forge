@@ -1,9 +1,10 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import Redis from 'ioredis'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import {
   AnswersQueue,
   ApprovalQueue,
+  RetryPromotionConflictError,
   TaskQueue,
   type AnswersJob,
   type ApprovalJob,
@@ -80,6 +81,31 @@ const enabled = Boolean(destructive && redisUrl)
 const destructiveRedisUrl = enabled ? validateRedisUrl(redisUrl!) : null
 const TASK_ID = '11111111-1111-4111-8111-111111111111'
 
+// Frozen from web/worker/queue.ts at f589d99852441705b93e169ed3798064a6995891.
+const HISTORICAL_PROMOTE_RETRY_V2_SCRIPT = `
+-- forge:queue:promote-retry-v2
+
+local function assert_type(key, expected)
+  local actual = redis.call('TYPE', key)['ok']
+  if actual ~= 'none' and actual ~= expected then
+    error('forge_queue_type_mismatch')
+  end
+end
+
+assert_type(KEYS[1], 'zset')
+assert_type(KEYS[2], 'list')
+if redis.call('ZREM', KEYS[1], ARGV[1]) == 1 then
+  redis.call('LPUSH', KEYS[2], ARGV[1])
+  return 1
+end
+if redis.call('LPOS', KEYS[2], ARGV[1]) then
+  return 2
+end
+return 0
+`
+const HISTORICAL_PROMOTE_RETRY_V2_SHA256 =
+  '17e38f4e0bc247a2d25b801b3c46876cc84f5915c6c11a21d48ff34762c8905e'
+
 type Occurrence = {
   schemaVersion: number
   occurrenceId: string
@@ -96,6 +122,30 @@ function occurrence(index: number): string {
     occurrenceId: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
     job: { taskId: TASK_ID, attempt: 1 },
   })
+}
+
+function assertHistoricalV2Occurrence(raw: string): void {
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    throw new Error('Historical v2 retry occurrence is invalid.')
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Historical v2 retry occurrence is invalid.')
+  }
+  const record = value as Record<string, unknown>
+  if (Object.keys(record).sort().join(',') !== 'job,occurrenceId,schemaVersion'
+    || record.schemaVersion !== 1
+    || typeof record.occurrenceId !== 'string'
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+      .test(record.occurrenceId)
+    || typeof record.job !== 'object'
+    || record.job === null
+    || Array.isArray(record.job)
+    || JSON.stringify(record) !== raw) {
+    throw new Error('Historical v2 retry occurrence is invalid.')
+  }
 }
 
 describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () => {
@@ -777,7 +827,7 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
       return result
     })
     await expect(ownershipQueue.promoteDueRetries(1))
-      .rejects.toThrow('Queue retry promotion ownership mismatch')
+      .rejects.toBeInstanceOf(RetryPromotionConflictError)
     expect(await admin.zscore('forge:tasks:retry', ownershipRaw))
       .toBe(String(ownershipScore + 1))
     expect(await admin.llen('forge:tasks')).toBe(0)
@@ -805,7 +855,7 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
       return result
     })
     await expect(unrelatedQueue.promoteDueRetries(1))
-      .rejects.toThrow('Queue retry promotion ownership mismatch')
+      .rejects.toBeInstanceOf(RetryPromotionConflictError)
     expect(await admin.llen('forge:tasks')).toBe(0)
 
     await admin.del(...QUEUE_KEYS)
@@ -906,7 +956,7 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
         await expect(receiptQueue.promoteDueRetries(1)).resolves.toBe(0)
       } else {
         await expect(receiptQueue.promoteDueRetries(1))
-          .rejects.toThrow('Queue retry promotion ownership mismatch')
+          .rejects.toThrow('Queue retry promotion receipt integrity failure')
       }
       expect(fingerprint).toMatch(/^[0-9a-f]{64}$/)
       await options.verify(fingerprint, raw)
@@ -1024,6 +1074,157 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
         expect(await admin.zscore(dispositionExpiryKey, fingerprint)).not.toBeNull()
       },
     })
+
+    expect(createHash('sha256').update(HISTORICAL_PROMOTE_RETRY_V2_SCRIPT).digest('hex'))
+      .toBe(HISTORICAL_PROMOTE_RETRY_V2_SHA256)
+    const mixedVersionCases = [
+      {
+        create: () => queue(),
+        job: (attempt: number): TaskJob => ({ taskId: TASK_ID, attempt }),
+        ready: 'forge:tasks',
+        receiptExpiry: 'forge:tasks:promotion-disposition-expiry',
+        receipts: 'forge:tasks:promotion-dispositions',
+        retry: 'forge:tasks:retry',
+      },
+      {
+        create: () => approvalQueue(),
+        job: (attempt: number): ApprovalJob => ({
+          taskId: TASK_ID,
+          action: 'approve',
+          attempt,
+        }),
+        ready: 'forge:approvals',
+        receiptExpiry: 'forge:approvals:promotion-disposition-expiry',
+        receipts: 'forge:approvals:promotion-dispositions',
+        retry: 'forge:approvals:retry',
+      },
+      {
+        create: () => answersQueue(),
+        job: (attempt: number): AnswersJob => ({ taskId: TASK_ID, attempt }),
+        ready: 'forge:answers',
+        receiptExpiry: 'forge:answers:promotion-disposition-expiry',
+        receipts: 'forge:answers:promotion-dispositions',
+        retry: 'forge:answers:retry',
+      },
+    ] as const
+    let historicalLuaCalls = 0
+    const runHistoricalV2Promotion = async (
+      retryKey: string,
+      readyKey: string,
+      raw: string,
+    ): Promise<number> => {
+      assertHistoricalV2Occurrence(raw)
+      historicalLuaCalls += 1
+      return Number(await admin.eval(
+        HISTORICAL_PROMOTE_RETRY_V2_SCRIPT,
+        2,
+        retryKey,
+        readyKey,
+        raw,
+      ))
+    }
+    const mixedState = async (queueCase: typeof mixedVersionCases[number]) => ({
+      ready: await admin.lrange(queueCase.ready, 0, -1),
+      receiptExpiry: await admin.zrange(
+        queueCase.receiptExpiry,
+        0,
+        -1,
+        'WITHSCORES',
+      ),
+      receipts: await admin.hgetall(queueCase.receipts),
+      retry: await admin.zrange(queueCase.retry, 0, -1, 'WITHSCORES'),
+    })
+
+    for (const [caseIndex, queueCase] of mixedVersionCases.entries()) {
+      await admin.del(...QUEUE_KEYS)
+      const v2FirstRaw = JSON.stringify({
+        schemaVersion: 1,
+        occurrenceId: `00000000-0000-4000-8000-${String(1_300 + caseIndex).padStart(12, '0')}`,
+        job: queueCase.job(40 + caseIndex),
+      })
+      await admin.zadd(queueCase.retry, (await redisTimeMs()) - 1, v2FirstRaw)
+      const upgradedLoser = queueCase.create()
+      const upgradedClient = (upgradedLoser as unknown as { client: Redis }).client
+      const originalBuffer = upgradedClient.callBuffer.bind(upgradedClient)
+      let scanned!: () => void
+      let release!: () => void
+      const scanObserved = new Promise<void>((resolve) => {
+        scanned = resolve
+      })
+      const releaseUpgraded = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      vi.spyOn(upgradedClient, 'callBuffer').mockImplementation(async (
+        ...args: Parameters<Redis['callBuffer']>
+      ) => {
+        const result = await originalBuffer(...args)
+        if (String(args[1]).includes('forge:queue:list-due-retries-v1')) {
+          scanned()
+          await releaseUpgraded
+        }
+        return result
+      })
+      const upgradedAttempt = upgradedLoser.promoteDueRetries(1)
+      await scanObserved
+      expect(await runHistoricalV2Promotion(
+        queueCase.retry,
+        queueCase.ready,
+        v2FirstRaw,
+      )).toBe(1)
+      const afterHistoricalWinner = await mixedState(queueCase)
+      release()
+      await expect(upgradedAttempt).rejects.toBeInstanceOf(RetryPromotionConflictError)
+      expect(await mixedState(queueCase)).toEqual(afterHistoricalWinner)
+      expect(afterHistoricalWinner.ready).toEqual([v2FirstRaw])
+      expect(afterHistoricalWinner.retry).toEqual([])
+      expect(afterHistoricalWinner.receipts).toEqual({})
+      expect(afterHistoricalWinner.receiptExpiry).toEqual([])
+
+      await admin.del(...QUEUE_KEYS)
+      const newFirstRaw = JSON.stringify({
+        schemaVersion: 1,
+        occurrenceId: `00000000-0000-4000-8000-${String(1_400 + caseIndex).padStart(12, '0')}`,
+        job: queueCase.job(50 + caseIndex),
+      })
+      await admin.zadd(queueCase.retry, (await redisTimeMs()) - 1, newFirstRaw)
+      expect(await queueCase.create().promoteDueRetries(1)).toBe(1)
+      expect(await runHistoricalV2Promotion(
+        queueCase.retry,
+        queueCase.ready,
+        newFirstRaw,
+      )).toBe(2)
+      const newFirstState = await mixedState(queueCase)
+      expect(newFirstState.ready).toEqual([newFirstRaw])
+      expect(newFirstState.retry).toEqual([])
+      expect(Object.values(newFirstState.receipts))
+        .toEqual([`promoted:${parseOccurrence(newFirstRaw).occurrenceId}`])
+      expect(newFirstState.receiptExpiry).toHaveLength(2)
+
+      await admin.del(...QUEUE_KEYS)
+      const legacyRaw = JSON.stringify(queueCase.job(60 + caseIndex))
+      const legacyScore = String((await redisTimeMs()) - 1)
+      await admin.zadd(queueCase.retry, legacyScore, legacyRaw)
+      const callsBeforeLegacy = historicalLuaCalls
+      await expect(runHistoricalV2Promotion(
+        queueCase.retry,
+        queueCase.ready,
+        legacyRaw,
+      )).rejects.toThrow('Historical v2 retry occurrence is invalid.')
+      expect(historicalLuaCalls).toBe(callsBeforeLegacy)
+      expect(await admin.zscore(queueCase.retry, legacyRaw)).toBe(legacyScore)
+      expect(await admin.llen(queueCase.ready)).toBe(0)
+      expect(await admin.hlen(queueCase.receipts)).toBe(0)
+      expect(await queueCase.create().promoteDueRetries(1)).toBe(1)
+      expect(await queueCase.create().promoteDueRetries(1)).toBe(0)
+      const upgradedLegacyState = await mixedState(queueCase)
+      expect(upgradedLegacyState.retry).toEqual([])
+      expect(upgradedLegacyState.ready).toHaveLength(1)
+      const upgradedLegacy = parseOccurrence(upgradedLegacyState.ready[0])
+      expect(upgradedLegacy.job).toEqual(queueCase.job(60 + caseIndex))
+      expect(Object.values(upgradedLegacyState.receipts))
+        .toEqual([`promoted:${upgradedLegacy.occurrenceId}`])
+      expect(upgradedLegacyState.receiptExpiry).toHaveLength(2)
+    }
 
     console.info('QUEUE_OCCURRENCE_REDIS_MULTIPLICITY_OK')
   }, 50_000)
@@ -1281,6 +1482,7 @@ describe.skipIf(!enabled)('queue occurrence and recovery real Redis proof', () =
         vi.doMock('@/worker/queue', () => ({
           AnswersQueue: IdleAnswersQueue,
           ApprovalQueue: IdleApprovalQueue,
+          RetryPromotionConflictError,
           TaskQueue: IdleTaskQueue,
         }))
         const idleProcessAnsweredQuestions = vi.fn()
